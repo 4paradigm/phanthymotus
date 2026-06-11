@@ -44,19 +44,34 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code
 ## Architecture
 
 ```
-+-----------+        +----------------+        +------------------+        +---------------+
-|           |<------>|                |<------>|                  |------->|               |
-|  Hardware |SDK/DDS | Hardware       | DDS/MCP|   Agent Core     |   WS   | Web Dashboard |
-|  (Robot)  |        | Drivers        |        |   (15678)        |        |               |
-|           |<------>|                |<------>|                  |------->|               |
-+-----------+        +----------------+        +--------+---------+        +---------------+
-                                                        ^
-                                               DDS/MCP  |
-                                                        v
-                                               +------------------+
-                                               |   Perception     |
-                                               |   (15720)        |
-                                               +------------------+
++------------------+                   +--------------------+
+|                  |    SDK / DDS      |                    |
+| Hardware (Robot) | <===============> |  Hardware Drivers  |
+|                  |                   |                    |
++------------------+                   +--------------------+
+                                            ||          ||
+              [Raw data: PCM/Image]         ||          || [Sensor data w/o perception]
+              (DDS / ROS2 Topic)            ||          || (DDS direct)
+                                            \/          |
++------------------+                   +------------+   |
+|                  |                   |            |   |
+|  Web Dashboard   | <===============> | Perception |   |
+|                  |     WebSocket     |  (15720)   |   |
+|                  |                   |            |   |
++------------------+                   +------------+   |
+         ^                                  ||          |
+         |                                  || [Semantics]
+         | WebSocket                        \/          \/
+         |                             +--------------------+
+         |                             |                    |
+         +===========================> |    Agent Core      |
+                                       |     (15678)        |
+                                       |                    |
+                                       +--------------------+
+                                                ||
+                                                || [MCP commands]
+                                                \/
+                                       (Back to Drivers for execution)
 ```
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
