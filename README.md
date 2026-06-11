@@ -40,32 +40,31 @@ Hardware drivers are maintained in a separate repository: **[phanthymotus-driver
 
 ## Quick Start
 
-### Prerequisites
-
-- Docker (ARM64 or x86_64)
-- An LLM API key (OpenAI-compatible)
-
-### Deploy with Docker
+Install and run with a single command:
 
 ```bash
-# 1. Configure environment
-cp .env.example .env   # Fill in your LLM API key
-
-# 2. Build images
-cd deploy
-./build_ros_base.sh    # ROS2 base image (first time only)
-./build_core.sh        # Agent Core
-./build_perception.sh  # Perception Stack
-
-# 3. Deploy
-cd core && cp .env.example .env && ./deploy.sh
+curl -fsSL https://motus.phanthy.com/install.sh | sudo bash
 ```
 
+Or specify a version:
+
+```bash
+curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
+```
+
+The install script will automatically install Docker (if needed), pull the latest Agent Core image, and start the service.
+
 Open `http://<device-ip>:15678` to access the Web Dashboard.
+
+Browse available versions and images at the [Resource Center](https://motus.phanthy.com).
 
 ### Connect Hardware
 
 Deploy hardware drivers from **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**. Drivers automatically register with Agent Core on startup — no manual configuration needed.
+
+### Build from Source
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code.
 
 ## Web Dashboard
 

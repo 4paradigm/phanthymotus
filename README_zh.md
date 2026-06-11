@@ -40,32 +40,31 @@ Perception Stack (15720)
 
 ## 快速开始
 
-### 环境要求
-
-- Docker（ARM64 或 x86_64）
-- LLM API Key（OpenAI 兼容接口）
-
-### Docker 部署
+一行命令安装并运行：
 
 ```bash
-# 1. 配置环境变量
-cp .env.example .env   # 填写 LLM API Key
-
-# 2. 构建镜像
-cd deploy
-./build_ros_base.sh    # ROS2 基础镜像（仅首次）
-./build_core.sh        # Agent Core
-./build_perception.sh  # Perception Stack
-
-# 3. 部署
-cd core && cp .env.example .env && ./deploy.sh
+curl -fsSL https://motus.phanthy.com/install.sh | sudo bash
 ```
 
+或指定版本：
+
+```bash
+curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
+```
+
+安装脚本会自动安装 Docker（如未安装）、拉取最新 Agent Core 镜像并启动服务。
+
 打开 `http://<设备IP>:15678` 进入 Web Dashboard。
+
+在 [Resource Center](https://motus.phanthy.com) 浏览可用版本和镜像。
 
 ### 连接硬件
 
 从 **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)** 部署硬件驱动。驱动启动后会自动注册到 Agent Core，无需手动配置。
+
+### 从源码构建
+
+参见 [CONTRIBUTING.md](CONTRIBUTING.md) 了解如何从源码构建和运行。
 
 ## Web Dashboard
 
