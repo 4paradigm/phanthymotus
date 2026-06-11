@@ -13,10 +13,11 @@ if [ -f "${ENV_FILE}" ]; then
     source "${ENV_FILE}"
 fi
 
-: "${REGISTRY:?REGISTRY not set. Copy deploy/.env.example to deploy/.env and fill in values.}"
-: "${REGISTRY_USER:?REGISTRY_USER not set}"
-: "${REGISTRY_PASSWORD:?REGISTRY_PASSWORD not set}"
-: "${IMAGE_NAMESPACE:?IMAGE_NAMESPACE not set}"
+if [ -z "${REGISTRY:-}" ] || [ -z "${REGISTRY_USER:-}" ] || [ -z "${REGISTRY_PASSWORD:-}" ] || [ -z "${IMAGE_NAMESPACE:-}" ]; then
+    echo "[error] Registry not configured. This script requires a registry to push images."
+    echo "        Copy deploy/.env.example to deploy/.env and fill in values."
+    exit 1
+fi
 
 SOURCE="docker.m.daocloud.io/dustynv/ros:humble-desktop-l4t-r35.3.1"
 TARGET="${REGISTRY}/${IMAGE_NAMESPACE}/jetson-base:humble-desktop-l4t-r35.3.1"
