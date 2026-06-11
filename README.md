@@ -44,26 +44,19 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code
 ## Architecture
 
 ```
-+-------------------+        +------------------------+        +--------------+
-| Hardware Drivers  |        |   Agent Core (15678)   |        | Web Dashboard|
-|  (MCP Servers)    |        |                        |        |              |
-|                   |MCP/HTTP|  Event Collector        |   WS   |  Canvas      |
-|  camera           |------->|       |                |------->|  Sidebar     |
-|  microphone       |------->|       v                |        |  Monitor     |
-|  locomotion       |------->|  LLM Agent Loop        |        |  Activity    |
-|  arm              |------->|       |                |        |              |
-+-------------------+        |  Tool Execution        |        +--------------+
-                             |       |                |
-+-------------------+        |  DDS Bridge            |
-|    ROS2 DDS       |  DDS   |       |                |
-|  sensor topics    |------->|  WebSocket Relay       |
-|  state topics     |        |                        |
-+-------------------+        +---+--------------------+
-                                 |
-+-------------------+   MCP/DDS  |
-| Perception (15720)|<-----------+
-|  ASR / TTS        |
-+-------------------+
++-----------+        +----------------+        +------------------+        +---------------+
+|           |<------>|                |<------>|                  |------->|               |
+|  Hardware |SDK/DDS | Hardware       | DDS/MCP|   Agent Core     |   WS   | Web Dashboard |
+|  (Robot)  |        | Drivers        |        |   (15678)        |        |               |
+|           |<------>|                |<------>|                  |------->|               |
++-----------+        +----------------+        +--------+---------+        +---------------+
+                                                        ^
+                                               DDS/MCP  |
+                                                        v
+                                               +------------------+
+                                               |   Perception     |
+                                               |   (15720)        |
+                                               +------------------+
 ```
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.

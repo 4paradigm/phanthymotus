@@ -44,26 +44,19 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 ## 架构
 
 ```
-+-------------------+        +------------------------+        +--------------+
-| Hardware Drivers  |        |   Agent Core (15678)   |        | Web Dashboard|
-|  (MCP Servers)    |        |                        |        |              |
-|                   |MCP/HTTP|  Event Collector        |   WS   |  Canvas      |
-|  camera           |------->|       |                |------->|  Sidebar     |
-|  microphone       |------->|       v                |        |  Monitor     |
-|  locomotion       |------->|  LLM Agent Loop        |        |  Activity    |
-|  arm              |------->|       |                |        |              |
-+-------------------+        |  Tool Execution        |        +--------------+
-                             |       |                |
-+-------------------+        |  DDS Bridge            |
-|    ROS2 DDS       |  DDS   |       |                |
-|  sensor topics    |------->|  WebSocket Relay       |
-|  state topics     |        |                        |
-+-------------------+        +---+--------------------+
-                                 |
-+-------------------+   MCP/DDS  |
-| Perception (15720)|<-----------+
-|  ASR / TTS        |
-+-------------------+
++-----------+        +----------------+        +------------------+        +---------------+
+|           |<------>|                |<------>|                  |------->|               |
+|  Hardware |SDK/DDS | Hardware       | DDS/MCP|   Agent Core     |   WS   | Web Dashboard |
+|  (Robot)  |        | Drivers        |        |   (15678)        |        |               |
+|           |<------>|                |<------>|                  |------->|               |
++-----------+        +----------------+        +--------+---------+        +---------------+
+                                                        ^
+                                               DDS/MCP  |
+                                                        v
+                                               +------------------+
+                                               |   Perception     |
+                                               |   (15720)        |
+                                               +------------------+
 ```
 
 硬件驱动在独立仓库维护：**[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**。
