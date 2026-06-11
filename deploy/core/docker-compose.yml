@@ -1,0 +1,52 @@
+services:
+
+  # ── Agent Core（大脑层）─────────────────────────────────────────────────────
+  agent-core:
+    image: ${REGISTRY}/${IMAGE_NAMESPACE}/core:${TAG}
+    platform: linux/arm64
+    network_mode: host     # 需要访问 ROS2 DDS；0.0.0.0:15678 直接绑定到宿主机
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data/data.db:/work/resource/data.db                          # SQLite 配置
+      - ./data/prompt_memory.md:/work/resource/memory/prompt_memory.md  # LLM 长期记忆
+      - ./data/world:/work/resource/world                              # 世界模型
+    environment:
+      - DB_PATH=/work/resource/data.db
+      - CONTAINER_NETWORK=
+      - PERCEPTION_HOST=localhost
+      - MODELS_PATH=${MODELS_PATH:-/opt/embodied/models}
+      - RESTART_IMAGE=${REGISTRY}/${IMAGE_NAMESPACE}/restart:latest
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+    restart: unless-stopped
+
+  # ── Hardware Bridge（躯体层）─────────────────────────────────────────────────
+  hardware-bridge:
+    image: ${REGISTRY}/${IMAGE_NAMESPACE}/hardware:${TAG}
+    platform: linux/arm64
+    network_mode: host     # 需要访问 ROS2 DDS
+    env_file: .env
+    profiles:
+      - hardware
+    restart: unless-stopped
+
+  # ── Perception Stack（感知层 + LLM 推理）─────────────────────────────────────
+  # Jetson GPU 部署：runtime nvidia, 模型文件挂载 ./models/
+  perception-stack:
+    image: ${REGISTRY}/${IMAGE_NAMESPACE}/perception:${TAG}
+    platform: linux/arm64
+    runtime: nvidia
+    network_mode: host     # 需要访问 ROS2 DDS；15720/15721/8000 直接绑定到宿主机
+    env_file: .env
+    volumes:
+      - /opt/embodied/models:/models
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      - NVIDIA_VISIBLE_DEVICES=all
+    profiles:
+      - perception
+    restart: unless-stopped

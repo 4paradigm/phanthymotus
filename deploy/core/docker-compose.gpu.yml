@@ -1,0 +1,7 @@
+# docker-compose.gpu.yml — Jetson GPU overlay
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.gpu.yml --profile perception up -d
+services:
+  perception-stack:
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all

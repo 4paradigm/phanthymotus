@@ -1,0 +1,29 @@
+mcp_port: 15720
+
+plugins:
+  asr:
+    enabled: true
+    provider: openai    # openai | openai_omni
+    url: ""
+    key: ""
+    model: ""
+    language: zh-CN
+    vad:
+      model: silero       # silero | webrtc | ""(disabled)
+      threshold: 0.5
+      silence_ms: 400
+
+  tts:
+    enabled: true
+    provider: aliyun    # aliyun | doubao
+    # Aliyun
+    app_key: ""
+    ak_id: ""
+    ak_secret: ""
+    voice: ""
+    rate: 0
+    pitch: 0
+    # Doubao
+    api_key: ""
+    api_secret: ""
+    cluster: ""

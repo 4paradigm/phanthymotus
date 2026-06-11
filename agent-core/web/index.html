@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PhanthyMotus</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="icon" type="image/png" href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/PhanthyMotus_Final_Refined_logo.png">
+</head>
+<body>
+
+<!-- ── Main App Shell ──────────────────────────────────────────────────────── -->
+<div id="app">
+
+  <!-- Top Bar -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <img class="logo-mark" src="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/PhanthyMotus_Final_Refined_logo.png" alt="PhanthyMotus">
+      <div class="brand-wordmark">
+        <div class="brand-name-row"><span class="brand-name">Phanthy</span><span class="brand-name-accent">Motus</span></div>
+        <span class="brand-tagline">Robot Agent OS</span>
+      </div>
+    </div>
+    <!-- Mode toggle: 配置 / 监控 -->
+    <div class="mode-toggle-group" id="mode-toggle-group">
+      <div class="mode-toggle" id="mode-toggle">
+        <button class="mode-toggle-btn active" data-mode="configure">配置</button>
+        <button class="mode-toggle-btn" data-mode="monitor">监控</button>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <div id="update-banner" class="update-banner hidden">
+        <span id="update-banner-text"></span>
+        <button class="btn-update" id="btn-update">更新</button>
+      </div>
+      <button class="btn-ghost topbar-btn" id="btn-history">历史日志</button>
+      <button class="btn-ghost topbar-btn" id="btn-agent-def">智能体定义</button>
+      <button class="btn-ghost topbar-btn" id="btn-skills">技能</button>
+      <button class="btn-ghost topbar-btn" id="btn-deploy">部署 ▾</button>
+    </div>
+  </header>
+
+  <!-- Body: Drivers Sidebar + Flow + Detail Panel -->
+  <div class="body-area">
+
+    <!-- Sidebar (left) -->
+    <div class="sidebar" id="sidebar">
+      <div class="sidebar-scroll" id="sidebar-scroll">
+        <div class="sidebar-empty" id="sidebar-empty">暂无已连接的服务</div>
+      </div>
+    </div>
+
+    <!-- Tool Detail Modal -->
+    <div class="tool-detail-modal-backdrop hidden" id="tool-detail-backdrop">
+      <div class="tool-detail-modal" id="tool-detail-modal">
+        <div class="tool-detail-header">
+          <span class="tool-detail-title" id="tool-detail-title"></span>
+          <button class="tool-detail-close" id="tool-detail-close">&times;</button>
+        </div>
+        <div class="tool-detail-body" id="tool-detail-body"></div>
+      </div>
+    </div>
+
+    <!-- Canvas (main orchestration area) -->
+    <div class="canvas-area" id="canvas-area">
+      <div class="canvas-viewport" id="canvas-viewport">
+        <svg class="canvas-connectors-svg" id="canvas-connectors-svg">
+          <defs>
+            <marker id="conn-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#C4CBD6"/>
+            </marker>
+            <marker id="conn-arrow-audio" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#0891B2"/>
+            </marker>
+            <marker id="conn-arrow-json" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#6D28D9"/>
+            </marker>
+            <marker id="conn-arrow-visual" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#D97706"/>
+            </marker>
+            <marker id="exec-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L6,3 L0,6 Z" style="fill:#059669"/>
+            </marker>
+          </defs>
+        </svg>
+      </div>
+      <div class="canvas-empty" id="canvas-empty">
+        <div class="placeholder-icon">⬡</div>
+        <p>从左侧拖入能力卡片</p>
+        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">构建你的数据流编排</p>
+      </div>
+      <div class="canvas-top-control" id="canvas-top-control">
+        <button class="canvas-main-btn" id="canvas-project-toggle" title="开启智能控制">开启智能控制</button>
+      </div>
+      <div class="canvas-controls" id="canvas-controls">
+        <button class="canvas-ctrl-btn" id="canvas-zoom-out" title="缩小">−</button>
+        <span class="canvas-zoom-label" id="canvas-zoom-label">100%</span>
+        <button class="canvas-ctrl-btn" id="canvas-zoom-in" title="放大">+</button>
+        <button class="canvas-ctrl-btn" id="canvas-zoom-reset" title="重置视图">⊙</button>
+      </div>
+    </div>
+
+    <!-- Detail Panel (right side, hidden by default) -->
+    <div class="detail-panel hidden" id="detail-panel">
+      <div class="detail-header">
+        <div class="detail-title-row">
+          <div class="detail-title" id="detail-title"></div>
+          <button class="btn-icon detail-close" id="detail-close">✕</button>
+        </div>
+        <div class="detail-subtitle" id="detail-subtitle"></div>
+      </div>
+      <div class="detail-body" id="detail-body"></div>
+    </div>
+
+    <!-- Monitor Dashboard (hidden by default, shown in monitor mode) -->
+    <div class="monitor-dashboard" id="monitor-dashboard">
+      <div class="monitor-dashboard-header">
+        <span class="monitor-dashboard-title">DATA STREAMS</span>
+        <button class="btn-ghost monitor-reset-btn" id="monitor-layout-reset">重置布局</button>
+      </div>
+      <div class="monitor-dashboard-grid" id="monitor-dashboard-grid"></div>
+    </div>
+  </div>
+
+  <!-- Activity Log Strip -->
+  <div class="activity-strip" id="activity-strip">
+    <div class="activity-strip-header" id="activity-toggle">
+      <span class="activity-title">ACTIVITY</span>
+      <button class="activity-collapse-btn" id="activity-collapse-btn" title="收起">&#9660;</button>
+    </div>
+    <div class="activity-log" id="activity-log"></div>
+  </div>
+
+</div>
+
+<!-- ── Agent Definition Modal ──────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="agent-def-overlay">
+  <div class="modal agent-def-modal">
+    <div class="modal-header">
+      <span class="modal-title">智能体定义</span>
+      <button class="btn-icon" id="agent-def-close">✕</button>
+    </div>
+    <div class="agent-def-tabs">
+      <button class="agent-def-tab active" data-tab="identity">身份定义</button>
+      <button class="agent-def-tab" data-tab="system">系统提示词</button>
+      <button class="agent-def-tab" data-tab="memory">长期记忆</button>
+    </div>
+    <div class="modal-body agent-def-body">
+      <div class="agent-def-panel active" data-panel="identity">
+        <div class="agent-def-panel-hint">identity.md — 不可被智能体自行修改</div>
+        <textarea class="agent-def-textarea" id="agent-def-identity" placeholder="定义智能体的身份、性格、交互风格..."></textarea>
+      </div>
+      <div class="agent-def-panel" data-panel="system">
+        <div class="agent-def-panel-hint">prompt_system.md — 框架规则层</div>
+        <textarea class="agent-def-textarea" id="agent-def-system" placeholder="系统定义、输入输出规则、安全围栏..."></textarea>
+      </div>
+      <div class="agent-def-panel" data-panel="memory">
+        <div class="agent-def-panel-hint">prompt_memory.md — 智能体可通过 update_memory 工具自行修改</div>
+        <textarea class="agent-def-textarea" id="agent-def-memory" placeholder="智能体的长期记忆内容..."></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="agent-def-cancel">取消</button>
+      <button class="btn-primary" id="agent-def-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Deploy Confirm Modal ─────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="deploy-confirm-overlay">
+  <div class="modal deploy-confirm-modal">
+    <div class="modal-header">
+      <span class="modal-title" id="deploy-confirm-title">确认部署</span>
+    </div>
+    <div class="deploy-confirm-body" id="deploy-confirm-body">
+      <!-- 动态填充 -->
+    </div>
+    <p class="deploy-confirm-note">部署过程中相关服务将短暂中断。</p>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="deploy-confirm-cancel">取消</button>
+      <button class="btn-primary" id="deploy-confirm-ok">确认部署</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Deploy Modal ─────────────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="deploy-overlay">
+  <div class="modal deploy-modal">
+    <div class="modal-header">
+      <span class="modal-title">部署服务</span>
+      <button class="btn-icon" id="deploy-close">✕</button>
+    </div>
+    <div class="modal-body deploy-modal-body">
+      <div class="drivers-section">
+        <div class="drivers-section-label">核心服务</div>
+        <div class="drivers-grid" id="drivers-core"></div>
+      </div>
+      <div class="drivers-section">
+        <div class="drivers-section-label">硬件驱动</div>
+        <div class="hw-search-bar">
+          <input id="hw-search" type="search" placeholder="搜索驱动…" autocomplete="off" spellcheck="false">
+        </div>
+        <div id="drivers-hardware-inner"></div>
+      </div>
+      <div class="drivers-section">
+        <div class="drivers-section-label">感知服务</div>
+        <div class="drivers-grid" id="drivers-perception"></div>
+      </div>
+    </div>
+    <div class="modal-footer" id="deploy-modal-footer" style="display:none">
+      <span class="deploy-footer-hint" id="deploy-footer-hint"></span>
+      <button class="btn-primary" id="deploy-modal-confirm">确认部署</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Capability Modal ──────────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="capability-overlay">
+  <div class="modal capability-modal">
+    <div class="modal-header">
+      <span class="modal-title" id="capability-modal-title">能力详情</span>
+      <button class="btn-icon" id="capability-close">✕</button>
+    </div>
+    <div class="modal-body capability-modal-body" id="capability-modal-body"></div>
+  </div>
+</div>
+
+<!-- Tool Config Modal (per-instance) -->
+<div class="modal-overlay hidden" id="tool-config-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="tool-config-title">配置工具</span>
+      <button class="btn-icon" id="tool-config-close">✕</button>
+    </div>
+    <div class="tab-panel active" id="tool-config-body" style="display:block"></div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="tool-config-cancel">取消</button>
+      <button class="btn-primary" id="tool-config-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Skill Modal ───────────────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="skill-overlay">
+  <div class="modal skill-modal">
+    <div class="modal-header">
+      <span class="modal-title">技能管理</span>
+      <button class="btn-icon" id="skill-close">✕</button>
+    </div>
+    <div class="skill-tabs">
+      <button class="skill-tab active" data-tab="installed">已安装</button>
+      <button class="skill-tab" data-tab="browse">技能广场</button>
+    </div>
+    <div class="modal-body skill-modal-body">
+      <div class="skill-panel active" data-panel="installed" id="skill-installed-panel">
+        <div class="skill-empty" id="skill-installed-empty">暂无已安装技能</div>
+        <div class="skill-list" id="skill-installed-list"></div>
+      </div>
+      <div class="skill-panel" data-panel="browse" id="skill-browse-panel">
+        <div class="skill-search-bar">
+          <input type="text" id="skill-search" placeholder="搜索技能…" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="skill-list" id="skill-browse-list"></div>
+        <div class="skill-empty hidden" id="skill-browse-empty">未找到技能</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- History Modal -->
+<div class="modal-overlay hidden" id="history-overlay">
+  <div class="modal history-modal">
+    <div class="modal-header">
+      <span class="modal-title">历史日志</span>
+      <div class="history-header-actions">
+        <button class="btn-ghost btn-sm" id="history-clear-all">清空全部</button>
+        <button class="btn-ghost btn-sm" id="history-delete-selected" disabled>删除选中</button>
+        <button class="btn-icon" id="history-close">✕</button>
+      </div>
+    </div>
+    <div class="modal-body history-body">
+      <div class="history-list" id="history-list">
+        <div class="history-empty">暂无对话记录</div>
+      </div>
+      <div class="history-chat" id="history-chat">
+        <div class="history-placeholder">选择一个会话查看对话记录</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.164/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164/examples/jsm/"
+} }
+</script>
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

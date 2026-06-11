@@ -1,0 +1,42 @@
+# Environment
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Database
+*.db
+*.sqlite3
+
+# Runtime resources
+resource/world/
+resource/log/
+resource/frame_rgb.jpg
+
+# Media (runtime captures)
+*.jpg
+*.png
+
+# Node.js
+node_modules/
+.next/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+.docker/
