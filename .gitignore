@@ -23,6 +23,7 @@ resource/frame_rgb.jpg
 # Media (runtime captures)
 *.jpg
 *.png
+!docs/images/*.png
 
 # Node.js
 node_modules/

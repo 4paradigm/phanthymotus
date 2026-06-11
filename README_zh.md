@@ -1,50 +1,113 @@
-# Embodied AI 具身智能平台
+# Phanthy Motus
 
 [English](README.md)
 
-事件驱动的具身智能平台，通过 MCP 数据总线将 LLM 与机器人硬件连接，实现感知-思考-行动闭环。
+事件驱动的具身智能平台，通过 [MCP](https://modelcontextprotocol.io) 数据总线将 LLM 与机器人硬件连接，实现自主的感知-思考-行动闭环。
 
-## 架构概览
+## 特性
+
+- **可视化编排** — 拖拽式 Web Dashboard，在画布上连接设备、传感器和 AI 模型
+- **MCP 数据总线** — 统一的 [Model Context Protocol](https://modelcontextprotocol.io) 硬件接口
+- **事件驱动 Agent Loop** — LLM 驱动的推理引擎，支持多轮工具调用，由实时传感器事件触发
+- **ROS2 集成** — 原生 DDS Bridge，无缝中继和监控 ROS2 Topic
+- **可插拔感知栈** — 模块化 ASR/TTS，支持本地推理（Jetson）
+- **Web Dashboard** — 浏览器内实时监控设备、查看 Agent 活动流、管理配置
+
+## 架构
 
 ```
-硬件设备 (MCP Server)           Agent Core (15678)          前端 Dashboard
-┌─────────────────┐            ┌──────────────────────┐       ┌─────────────┐
-│  camera (MJPEG) │──MCP/HTTP─▶│                      │       │  canvas     │
-│  mic (PCM-16k)  │──MCP/HTTP─▶│  Collector (throttle)│       │  sidebar    │
-│  arm (joint)    │──MCP/HTTP─▶│        │             │──WS──▶│  monitor    │
-│  lidar (2D)     │──MCP/HTTP─▶│        ▼             │       │  activity   │
-└─────────────────┘            │  LLM Agent Loop      │       └─────────────┘
-                               │  (event/llm.py)      │
-ROS2 DDS                       │        │             │
-┌─────────────────┐            │  mcp_client.py       │
-│ sensor topics   │──DDS──────▶│  ros2_bridge.py      │
-│ state topics    │            │        │             │
-└─────────────────┘            │  /ws/bus/{topic}     │
-                               │  /ws/motus           │
-                               └──────────────────────┘
+硬件驱动 (MCP)                Agent Core (15678)          Web Dashboard
+┌─────────────────┐           ┌──────────────────────┐    ┌─────────────┐
+│  camera          │──MCP/HTTP─▶│  Event Collector     │    │  Canvas     │
+│  microphone      │──MCP/HTTP─▶│        │             │    │  Sidebar    │
+│  locomotion      │──MCP/HTTP─▶│        ▼             │─WS─▶│  Monitor    │
+│  arm             │──MCP/HTTP─▶│  LLM Agent Loop      │    │  Activity   │
+└─────────────────┘           │        │             │    └─────────────┘
+                               │  Tool Execution      │
+ROS2 DDS                      │        │             │
+┌─────────────────┐           │  DDS Bridge          │
+│ sensor topics   │──DDS─────▶│        │             │
+│ state topics    │           │  WebSocket Relay     │
+└─────────────────┘           └──────────────────────┘
 
-Perception Stack (15720/15721)
+Perception Stack (15720)
 ┌─────────────────┐
-│  ASR plugin     │──MCP/HTTP + WS
-│  TTS plugin     │
+│  ASR / TTS      │──MCP/HTTP + WS
 └─────────────────┘
 ```
 
-### 三层架构
+硬件驱动在独立仓库维护：**[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**。
 
-| 层级 | 组件 | 目录 |
-|------|------|------|
-| Layer 1 — 硬件驱动 | MCP HTTP Server（Unitree G1、Mac Audio 等）| `drivers/` |
-| Layer 2 — 感知栈 | ASR/TTS 插件 + LLM 本地推理（Jetson）| `perception/` |
-| Layer 3 — Agent Core | FastAPI + LLM Loop + DDS Bridge + Web UI | `agent-core/` |
+## 快速开始
 
-### 通信机制
+### 环境要求
 
-- **Data Plane**: ROS2 DDS → `ros2_bridge.py`（daemon thread）→ `inspection.py` fan-out → WebSocket `/ws/bus/{topic}`
-- **Control Plane**: MCP HTTP JSON-RPC 2.0（Agent Core → 硬件/感知）
-- **Activity Stream**: WebSocket `/ws/motus`（Agent 决策实时广播）
+- Docker（ARM64 或 x86_64）
+- LLM API Key（OpenAI 兼容接口）
 
-### 端口规范
+### Docker 部署
+
+```bash
+# 1. 配置环境变量
+cp .env.example .env   # 填写 LLM API Key
+
+# 2. 构建镜像
+cd deploy
+./build_ros_base.sh    # ROS2 基础镜像（仅首次）
+./build_core.sh        # Agent Core
+./build_perception.sh  # Perception Stack
+
+# 3. 部署
+cd core && cp .env.example .env && ./deploy.sh
+```
+
+打开 `http://<设备IP>:15678` 进入 Web Dashboard。
+
+### 连接硬件
+
+从 **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)** 部署硬件驱动。驱动启动后会自动注册到 Agent Core，无需手动配置。
+
+## Web Dashboard
+
+Dashboard（`http://<设备IP>:15678`）提供：
+
+### Canvas — 可视化编排
+
+拖拽设备和模型到画布，绘制连接定义数据流，可视化配置工具参数。
+
+![Canvas](docs/images/home.png)
+
+### 实时监控
+
+传感器数据实时可视化 — 音频波形、电池状态、3D 骨骼/点云等。
+
+![监控面板](docs/images/dashboard.png)
+
+### 智能体定义
+
+在 UI 中直接定义 Agent 的身份、系统提示词和长期记忆。
+
+![智能体定义](docs/images/agent-definition.png)
+
+### 历史日志
+
+浏览历史 Agent 会话，查看完整事件轨迹和工具调用结果。
+
+![历史日志](docs/images/history.png)
+
+### 技能管理
+
+安装、激活和管理扩展 Agent 能力的技能。
+
+![技能](docs/images/skills.png)
+
+### 服务部署
+
+从 Dashboard 部署和管理 Agent Core 及硬件驱动容器。
+
+![部署](docs/images/deploy.png)
+
+## 端口
 
 | 服务 | 端口 |
 |------|------|
@@ -52,78 +115,7 @@ Perception Stack (15720/15721)
 | Perception MCP | 15720 |
 | Perception WebSocket | 15721 |
 
-## 快速开始
-
-### 环境要求
-
-- Docker（ARM64 或 x86_64）
-- ROS2 Humble（本地开发）
-- Python 3.12+ 及 [uv](https://docs.astral.sh/uv/)
-
-### Docker 部署
-
-```bash
-cp .env.example .env  # 填写 LLM API Key 等配置
-
-# 先构建 ROS2 基础镜像
-cd deploy && ./build_ros_base.sh
-
-# 构建服务
-./build_core.sh
-./build_perception.sh
-
-# 部署
-cd core && cp .env.example .env && ./deploy.sh
-```
-
-部署后访问 `http://<设备IP>:15678` 进入 Web Dashboard。
-
-### 本地开发
-
-```bash
-# 安装依赖
-uv sync
-
-# 启动 Agent Core（需 ROS2 Humble）
-source /opt/ros/humble/setup.bash
-cd agent-core && ./run.zsh
-# 访问 http://localhost:15678
-```
-
-## MCP 协议
-
-所有设备实现 [MCP（Model Context Protocol）](https://modelcontextprotocol.io) JSON-RPC 2.0 over HTTP：
-
-| 方法 | 说明 |
-|------|------|
-| `initialize` | 握手，返回 `serverInfo.name` |
-| `tools/list` | 列出工具（含 `inputSchema` + `configSchema`）|
-| `tools/call` | 调用工具 `{name, arguments}` |
-
-### 数据总线类型
-
-格式：`category/format`
-
-| 类别 | 示例 |
-|------|------|
-| `audio/` | `pcm-16k`, `pcm-48k`, `opus` |
-| `video/` | `mjpeg`, `h264`, `depth` |
-| `sensor/` | `imu`, `lidar-2d`, `gps`, `force-torque` |
-| `control/` | `velocity`, `joint`, `gripper` |
-| `state/` | `joint`, `pose`, `power` |
-| `text/` | `asr`, `plain` |
-
-## 核心流程
-
-1. **事件收集**：Collector 从多源（MCP 设备、DDS topic、定时任务、API 推送）收集事件，按源限流
-2. **Event Bus**：事件入队，trigger interval 到达后出队
-3. **Prompt 构建**：4 层 Prompt（L1 系统规则 + L2 环境快照 + L3 对话历史 + L4 触发事件）
-4. **LLM 推理**：多轮工具调用循环（`mcp__<device_id>__<tool>` 命名）
-5. **广播**：每步通过 `/ws/motus` 推送到前端
-
-## 配置
-
-所有配置通过 Web UI 完成，持久化到 SQLite（`resource/data.db`），通过 `ConfigDB` 类访问。
+硬件驱动端口请参见 [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)。
 
 ## Resource Center（可选）
 
@@ -136,7 +128,7 @@ cd agent-core && ./run.zsh
 
 ## 贡献
 
-参见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+参见 [CONTRIBUTING.md](CONTRIBUTING.md) 了解开发环境搭建、架构细节和贡献指南。
 
 ## 许可证
 
