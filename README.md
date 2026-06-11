@@ -74,7 +74,7 @@ The dashboard at `http://<device-ip>:15678` provides:
 
 ### Canvas — Visual Orchestration
 
-Drag devices and models onto a canvas, draw connections to define data flows, and configure tool parameters visually.
+Add sensors and actuators you need onto the canvas, connect them to the core Agent Loop, and the framework handles data flow and execution automatically. Build your embodied AI agent like stacking building blocks.
 
 ![Canvas](docs/images/home.png)
 
