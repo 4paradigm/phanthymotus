@@ -24,6 +24,7 @@ resource/frame_rgb.jpg
 *.jpg
 *.png
 !docs/images/*.png
+!docs/images/*.jpg
 
 # Node.js
 node_modules/

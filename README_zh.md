@@ -43,36 +43,7 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 
 ## 架构
 
-```
-+------------------+                   +--------------------+
-|                  |    SDK / DDS      |                    |
-|  Hardware(机器人) | <===============> |  Hardware Drivers  |
-|                  |                   |   (底层驱动/传感器) |
-+------------------+                   +--------------------+
-                                            ||          ||
-              [原始数据: PCM/图像]            ||          || [无需感知的传感器数据]
-              (DDS / ROS2 Topic)            ||          || (DDS 直连)
-                                            \/          |
-+------------------+                   +------------+   |
-|                  |                   |            |   |
-|  Web Dashboard   | <===============> | Perception |   |
-|   (前端可视化)    |     WebSocket     |  (15720)   |   |
-|                  |                   |  (语义理解) |   |
-+------------------+                   +------------+   |
-         ^                                  ||          |
-         |                                  || [高维语义]
-         | WebSocket (控制/状态)             \/          \/
-         |                             +--------------------+
-         |                             |                    |
-         +===========================> |    Agent Core      |
-                                       |     (15678)        |
-                                       |   (LLM/AI决策核心) |
-                                       +--------------------+
-                                                ||
-                                                || [MCP 执行指令]
-                                                \/
-                                       (回流到 Drivers 执行动作)
-```
+![架构](docs/images/architecture.jpg)
 
 硬件驱动在独立仓库维护：**[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**。
 
