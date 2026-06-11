@@ -4,40 +4,6 @@
 
 **Give Embodied AI a Real Soul.** PhanthyMotus is a next-generation, open-source framework and platform for Embodied AI Agents. Built upon a robust ROS2 foundation, it seamlessly bridges diverse sensor inputs with advanced robot execution. By enabling flexible integration of World Models, LLMs, and VLMs, PhanthyMotus transforms traditional hardware into soulful, intelligent assistants capable of perceiving, thinking, and acting independently in the real world.
 
-## Features
-
-- **Visual Orchestration** — Drag-and-drop web dashboard for connecting devices, sensors, and AI models on a canvas
-- **MCP Data Bus** — Unified [Model Context Protocol](https://modelcontextprotocol.io) interface for all hardware devices
-- **Event-Driven Agent Loop** — LLM-powered reasoning with multi-turn tool calling, driven by real-time sensor events
-- **ROS2 Integration** — Native DDS bridge for seamless ROS2 topic relay and monitoring
-- **Pluggable Perception** — Modular ASR/TTS stack with local inference support (Jetson)
-- **Web Dashboard** — Real-time device monitoring, agent activity stream, and configuration — all from the browser
-
-## Architecture
-
-```
-Hardware Drivers (MCP)         Agent Core (15678)          Web Dashboard
-┌─────────────────┐           ┌──────────────────────┐    ┌─────────────┐
-│  camera          │──MCP/HTTP─▶│  Event Collector     │    │  Canvas     │
-│  microphone      │──MCP/HTTP─▶│        │             │    │  Sidebar    │
-│  locomotion      │──MCP/HTTP─▶│        ▼             │─WS─▶│  Monitor    │
-│  arm             │──MCP/HTTP─▶│  LLM Agent Loop      │    │  Activity   │
-└─────────────────┘           │        │             │    └─────────────┘
-                               │  Tool Execution      │
-ROS2 DDS                      │        │             │
-┌─────────────────┐           │  DDS Bridge          │
-│ sensor topics   │──DDS─────▶│        │             │
-│ state topics    │           │  WebSocket Relay     │
-└─────────────────┘           └──────────────────────┘
-
-Perception Stack (15720)
-┌─────────────────┐
-│  ASR / TTS      │──MCP/HTTP + WS
-└─────────────────┘
-```
-
-Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
-
 ## Quick Start
 
 Install and run with a single command:
@@ -65,6 +31,42 @@ Deploy hardware drivers from **[phanthymotus-driver](https://github.com/4paradig
 ### Build from Source
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code.
+
+## Features
+
+- **Visual Orchestration** — Drag-and-drop web dashboard for connecting devices, sensors, and AI models on a canvas
+- **MCP Data Bus** — Unified [Model Context Protocol](https://modelcontextprotocol.io) interface for all hardware devices
+- **Event-Driven Agent Loop** — LLM-powered reasoning with multi-turn tool calling, driven by real-time sensor events
+- **ROS2 Integration** — Native DDS bridge for seamless ROS2 topic relay and monitoring
+- **Pluggable Perception** — Modular ASR/TTS stack with local inference support (Jetson)
+- **Web Dashboard** — Real-time device monitoring, agent activity stream, and configuration — all from the browser
+
+## Architecture
+
+```
++-------------------+          +------------------------+          +--------------+
+| Hardware Drivers  |          |    Agent Core (15678)  |          | Web Dashboard|
+|  (MCP Servers)    |          |                        |          |              |
+|                   |  MCP/HTTP|  Event Collector        |    WS    |  Canvas      |
+|  camera           |--------->|       |                |--------->|  Sidebar     |
+|  microphone       |--------->|       v                |          |  Monitor     |
+|  locomotion       |--------->|  LLM Agent Loop        |          |  Activity    |
+|  arm              |--------->|       |                |          |              |
++-------------------+          |  Tool Execution        |          +--------------+
+                               |       |                |
++-------------------+          |  DDS Bridge            |
+|    ROS2 DDS       |   DDS    |       |                |
+|  sensor topics    |--------->|  WebSocket Relay       |
+|  state topics     |          |                        |
++-------------------+          +------------------------+
+
++-------------------+
+| Perception (15720)|
+|  ASR / TTS        |---MCP/HTTP + WS
++-------------------+
+```
+
+Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
 
 ## Web Dashboard
 

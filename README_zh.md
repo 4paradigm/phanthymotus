@@ -4,40 +4,6 @@
 
 **赋予具身智能真正的灵魂。** PhanthyMotus 是新一代开源具身智能 Agent 框架与平台。基于稳健的 ROS2 内核，无缝连接多模态传感器与机器人执行层，灵活集成 World Model、LLM 和 VLM，将传统硬件转化为能够自主感知、思考并行动的智能助手。
 
-## 特性
-
-- **可视化编排** — 拖拽式 Web Dashboard，在画布上连接设备、传感器和 AI 模型
-- **MCP 数据总线** — 统一的 [Model Context Protocol](https://modelcontextprotocol.io) 硬件接口
-- **事件驱动 Agent Loop** — LLM 驱动的推理引擎，支持多轮工具调用，由实时传感器事件触发
-- **ROS2 集成** — 原生 DDS Bridge，无缝中继和监控 ROS2 Topic
-- **可插拔感知栈** — 模块化 ASR/TTS，支持本地推理（Jetson）
-- **Web Dashboard** — 浏览器内实时监控设备、查看 Agent 活动流、管理配置
-
-## 架构
-
-```
-硬件驱动 (MCP)                Agent Core (15678)          Web Dashboard
-┌─────────────────┐           ┌──────────────────────┐    ┌─────────────┐
-│  camera          │──MCP/HTTP─▶│  Event Collector     │    │  Canvas     │
-│  microphone      │──MCP/HTTP─▶│        │             │    │  Sidebar    │
-│  locomotion      │──MCP/HTTP─▶│        ▼             │─WS─▶│  Monitor    │
-│  arm             │──MCP/HTTP─▶│  LLM Agent Loop      │    │  Activity   │
-└─────────────────┘           │        │             │    └─────────────┘
-                               │  Tool Execution      │
-ROS2 DDS                      │        │             │
-┌─────────────────┐           │  DDS Bridge          │
-│ sensor topics   │──DDS─────▶│        │             │
-│ state topics    │           │  WebSocket Relay     │
-└─────────────────┘           └──────────────────────┘
-
-Perception Stack (15720)
-┌─────────────────┐
-│  ASR / TTS      │──MCP/HTTP + WS
-└─────────────────┘
-```
-
-硬件驱动在独立仓库维护：**[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**。
-
 ## 快速开始
 
 一行命令安装并运行：
@@ -65,6 +31,42 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 ### 从源码构建
 
 参见 [CONTRIBUTING.md](CONTRIBUTING.md) 了解如何从源码构建和运行。
+
+## 特性
+
+- **可视化编排** — 拖拽式 Web Dashboard，在画布上连接设备、传感器和 AI 模型
+- **MCP 数据总线** — 统一的 [Model Context Protocol](https://modelcontextprotocol.io) 硬件接口
+- **事件驱动 Agent Loop** — LLM 驱动的推理引擎，支持多轮工具调用，由实时传感器事件触发
+- **ROS2 集成** — 原生 DDS Bridge，无缝中继和监控 ROS2 Topic
+- **可插拔感知栈** — 模块化 ASR/TTS，支持本地推理（Jetson）
+- **Web Dashboard** — 浏览器内实时监控设备、查看 Agent 活动流、管理配置
+
+## 架构
+
+```
++-------------------+          +------------------------+          +--------------+
+| Hardware Drivers  |          |    Agent Core (15678)  |          | Web Dashboard|
+|  (MCP Servers)    |          |                        |          |              |
+|                   |  MCP/HTTP|  Event Collector        |    WS    |  Canvas      |
+|  camera           |--------->|       |                |--------->|  Sidebar     |
+|  microphone       |--------->|       v                |          |  Monitor     |
+|  locomotion       |--------->|  LLM Agent Loop        |          |  Activity    |
+|  arm              |--------->|       |                |          |              |
++-------------------+          |  Tool Execution        |          +--------------+
+                               |       |                |
++-------------------+          |  DDS Bridge            |
+|    ROS2 DDS       |   DDS    |       |                |
+|  sensor topics    |--------->|  WebSocket Relay       |
+|  state topics     |          |                        |
++-------------------+          +------------------------+
+
++-------------------+
+| Perception (15720)|
+|  ASR / TTS        |---MCP/HTTP + WS
++-------------------+
+```
+
+硬件驱动在独立仓库维护：**[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**。
 
 ## Web Dashboard
 
