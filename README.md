@@ -44,25 +44,25 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code
 ## Architecture
 
 ```
-+-------------------+          +------------------------+          +--------------+
-| Hardware Drivers  |          |    Agent Core (15678)  |          | Web Dashboard|
-|  (MCP Servers)    |          |                        |          |              |
-|                   |  MCP/HTTP|  Event Collector        |    WS    |  Canvas      |
-|  camera           |--------->|       |                |--------->|  Sidebar     |
-|  microphone       |--------->|       v                |          |  Monitor     |
-|  locomotion       |--------->|  LLM Agent Loop        |          |  Activity    |
-|  arm              |--------->|       |                |          |              |
-+-------------------+          |  Tool Execution        |          +--------------+
-                               |       |                |
-+-------------------+          |  DDS Bridge            |
-|    ROS2 DDS       |   DDS    |       |                |
-|  sensor topics    |--------->|  WebSocket Relay       |
-|  state topics     |          |                        |
-+-------------------+          +------------------------+
-
-+-------------------+
-| Perception (15720)|
-|  ASR / TTS        |---MCP/HTTP + WS
++-------------------+        +------------------------+        +--------------+
+| Hardware Drivers  |        |   Agent Core (15678)   |        | Web Dashboard|
+|  (MCP Servers)    |        |                        |        |              |
+|                   |MCP/HTTP|  Event Collector        |   WS   |  Canvas      |
+|  camera           |------->|       |                |------->|  Sidebar     |
+|  microphone       |------->|       v                |        |  Monitor     |
+|  locomotion       |------->|  LLM Agent Loop        |        |  Activity    |
+|  arm              |------->|       |                |        |              |
++-------------------+        |  Tool Execution        |        +--------------+
+                             |       |                |
++-------------------+        |  DDS Bridge            |
+|    ROS2 DDS       |  DDS   |       |                |
+|  sensor topics    |------->|  WebSocket Relay       |
+|  state topics     |        |                        |
++-------------------+        +---+--------------------+
+                                 |
++-------------------+   MCP/DDS  |
+| Perception (15720)|<-----------+
+|  ASR / TTS        |
 +-------------------+
 ```
 
