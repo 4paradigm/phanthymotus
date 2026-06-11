@@ -98,7 +98,7 @@ Browse past agent sessions with full event traces and tool call results.
 
 ### Skill Management
 
-Install, activate, and manage skills that extend the agent's capabilities.
+A community-driven Skill Marketplace where users share and discover skills. Browse and install skills contributed by others, or teach your robot new capabilities using natural language — no coding required.
 
 ![Skills](docs/images/skills.png)
 
