@@ -2,7 +2,7 @@
 
 [English](README.md) | [官网](https://motus.phanthy.com)
 
-事件驱动的具身智能平台，通过 [MCP](https://modelcontextprotocol.io) 数据总线将 LLM 与机器人硬件连接，实现自主的感知-思考-行动闭环。
+**赋予具身智能真正的灵魂。** PhanthyMotus 是新一代开源具身智能 Agent 框架与平台。基于稳健的 ROS2 内核，无缝连接多模态传感器与机器人执行层，灵活集成 World Model、LLM 和 VLM，将传统硬件转化为能够自主感知、思考并行动的智能助手。
 
 ## 特性
 

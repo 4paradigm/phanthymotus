@@ -2,7 +2,7 @@
 
 [中文文档](README_zh.md) | [Official Website](https://motus.phanthy.com)
 
-An event-driven embodied AI platform that connects LLMs to robot hardware via the [MCP](https://modelcontextprotocol.io) data bus, enabling autonomous perception-reasoning-action loops.
+**Give Embodied AI a Real Soul.** PhanthyMotus is a next-generation, open-source framework and platform for Embodied AI Agents. Built upon a robust ROS2 foundation, it seamlessly bridges diverse sensor inputs with advanced robot execution. By enabling flexible integration of World Models, LLMs, and VLMs, PhanthyMotus transforms traditional hardware into soulful, intelligent assistants capable of perceiving, thinking, and acting independently in the real world.
 
 ## Features
 
