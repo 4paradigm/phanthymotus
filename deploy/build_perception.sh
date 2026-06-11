@@ -28,12 +28,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-: "${REGISTRY:?REGISTRY not set. Copy deploy/.env.example to deploy/.env and fill in values.}"
-: "${REGISTRY_USER:?REGISTRY_USER not set}"
-: "${REGISTRY_PASSWORD:?REGISTRY_PASSWORD not set}"
-: "${IMAGE_NAMESPACE:?IMAGE_NAMESPACE not set}"
-
 RESOURCE_CENTER_URL="${RESOURCE_CENTER_URL:-https://motus.phanthy.com}"
+
+# If registry not configured, build locally only
+PUSH_ENABLED=true
+if [ -z "${REGISTRY:-}" ] || [ -z "${REGISTRY_USER:-}" ] || [ -z "${REGISTRY_PASSWORD:-}" ] || [ -z "${IMAGE_NAMESPACE:-}" ]; then
+    echo "[info] Registry not configured — building locally only (no push)."
+    PUSH_ENABLED=false
+    REGISTRY="${REGISTRY:-local}"
+    IMAGE_NAMESPACE="${IMAGE_NAMESPACE:-phanthy-motus}"
+fi
 
 DATE="$(date +%y%m%d)"
 COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
@@ -41,13 +45,13 @@ COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
 # ── 根据 variant 选择 Dockerfile、context、tag ────────────────────────
 case "${VARIANT}" in
     cpu)
-        DOCKERFILE="${REPO_ROOT}/src/perception_stack/Dockerfile"
-        BUILD_CONTEXT="${REPO_ROOT}/src/perception_stack"
+        DOCKERFILE="${REPO_ROOT}/perception/Dockerfile"
+        BUILD_CONTEXT="${REPO_ROOT}/perception"
         TAG="release.${DATE}.${COMMIT}"
         ;;
     jetson)
-        DOCKERFILE="${REPO_ROOT}/src/perception_stack/Dockerfile.jetson"
-        BUILD_CONTEXT="${REPO_ROOT}"  # 需要访问 deploy/ros-base/audio_msgs/
+        DOCKERFILE="${REPO_ROOT}/perception/Dockerfile.jetson"
+        BUILD_CONTEXT="${REPO_ROOT}"
         TAG="release.${DATE}.${COMMIT}-jetson"
         ;;
     *)
@@ -63,21 +67,28 @@ echo "Building perception-stack image"
 echo "Variant: ${VARIANT}"
 echo "Image  : ${FULL_IMAGE}"
 echo "Arch   : ${ARCH} (native=${IS_ARM64})"
+echo "Push   : ${PUSH_ENABLED}"
 echo "============================================"
 
-echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
+if ${PUSH_ENABLED}; then
+    echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
+fi
 
 select_mirror
 
 do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}"
 
-do_push "${FULL_IMAGE}"
-
-echo ""
-echo "Done. Image pushed: ${FULL_IMAGE}"
+if ${PUSH_ENABLED}; then
+    do_push "${FULL_IMAGE}"
+    echo ""
+    echo "Done. Image pushed: ${FULL_IMAGE}"
+else
+    echo ""
+    echo "Done. Image built locally: ${FULL_IMAGE}"
+fi
 
 # ── 注册到 resource-center（可选）────────────────────────────────────────────
-if [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
+if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     SYNC_CONFIRM="y"
     if [ -t 0 ] || [ -e /dev/tty ]; then
         printf "Sync to resource-center (%s)? [Y/n]: " "${RESOURCE_CENTER_URL}" >/dev/tty

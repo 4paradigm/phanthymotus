@@ -14,40 +14,52 @@ fi
 
 eval "$(parse_mirror_arg "$@")"
 
-: "${REGISTRY:?REGISTRY not set. Copy deploy/.env.example to deploy/.env and fill in values.}"
-: "${REGISTRY_USER:?REGISTRY_USER not set}"
-: "${REGISTRY_PASSWORD:?REGISTRY_PASSWORD not set}"
-: "${IMAGE_NAMESPACE:?IMAGE_NAMESPACE not set}"
-
 RESOURCE_CENTER_URL="${RESOURCE_CENTER_URL:-https://motus.phanthy.com}"
 
 DATE="$(date +%y%m%d)"
 COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
 TAG="release.${DATE}.${COMMIT}"
+
+# If registry not configured, build locally only
+PUSH_ENABLED=true
+if [ -z "${REGISTRY:-}" ] || [ -z "${REGISTRY_USER:-}" ] || [ -z "${REGISTRY_PASSWORD:-}" ] || [ -z "${IMAGE_NAMESPACE:-}" ]; then
+    echo "[info] Registry not configured — building locally only (no push)."
+    PUSH_ENABLED=false
+    REGISTRY="${REGISTRY:-local}"
+    IMAGE_NAMESPACE="${IMAGE_NAMESPACE:-phanthy-motus}"
+fi
+
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/core:${TAG}"
 
 echo "============================================"
 echo "Building agent-core image"
 echo "Image : ${FULL_IMAGE}"
 echo "Arch  : ${ARCH} (native=${IS_ARM64})"
+echo "Push  : ${PUSH_ENABLED}"
 echo "============================================"
 
-echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
+if ${PUSH_ENABLED}; then
+    echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
+fi
 
 select_mirror
 
-do_build "${REPO_ROOT}/src/agent_core/Dockerfile" \
-         "${REPO_ROOT}/src/agent_core" \
+do_build "${REPO_ROOT}/agent-core/Dockerfile" \
+         "${REPO_ROOT}/agent-core" \
          "${FULL_IMAGE}" \
          "IMAGE_TAG=${TAG}"
 
-do_push "${FULL_IMAGE}"
-
-echo ""
-echo "Done. Image pushed: ${FULL_IMAGE}"
+if ${PUSH_ENABLED}; then
+    do_push "${FULL_IMAGE}"
+    echo ""
+    echo "Done. Image pushed: ${FULL_IMAGE}"
+else
+    echo ""
+    echo "Done. Image built locally: ${FULL_IMAGE}"
+fi
 
 # ── 注册到 resource-center（可选）────────────────────────────────────────────
-if [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
+if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     SYNC_CONFIRM="y"
     if [ -t 0 ] || [ -e /dev/tty ]; then
         printf "Sync to resource-center (%s)? [Y/n]: " "${RESOURCE_CENTER_URL}" >/dev/tty
