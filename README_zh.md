@@ -1,6 +1,6 @@
 # Phanthy Motus
 
-[English](README.md)
+[English](README.md) | [官网](https://motus.phanthy.com)
 
 事件驱动的具身智能平台，通过 [MCP](https://modelcontextprotocol.io) 数据总线将 LLM 与机器人硬件连接，实现自主的感知-思考-行动闭环。
 

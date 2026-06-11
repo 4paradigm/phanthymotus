@@ -1,6 +1,6 @@
 # Phanthy Motus
 
-[中文文档](README_zh.md)
+[中文文档](README_zh.md) | [Official Website](https://motus.phanthy.com)
 
 An event-driven embodied AI platform that connects LLMs to robot hardware via the [MCP](https://modelcontextprotocol.io) data bus, enabling autonomous perception-reasoning-action loops.
 
