@@ -59,7 +59,9 @@ select_mirror() {
 # do_build <dockerfile> <context> <full_image> [extra_build_arg...]
 #
 # ARM64 原生: docker build（无 buildx，无 binfmt）
-# x86_64:     docker buildx build --platform linux/arm64（交叉编译 + 自动 push）
+# x86_64:     docker buildx build --platform linux/arm64（交叉编译）
+#
+# 使用 PUSH_ENABLED 环境变量控制是否推送（默认 true）
 do_build() {
     local dockerfile="$1"; shift
     local context="$1"; shift
@@ -84,13 +86,17 @@ do_build() {
     else
         echo "[cross-compile x86→ARM64] docker buildx build"
         docker run --privileged --rm "${BINFMT_IMAGE}" --install arm64
+        local output_flag="--push"
+        if [ "${PUSH_ENABLED:-true}" = "false" ]; then
+            output_flag="--output=type=docker"
+        fi
         docker buildx build \
             --builder default \
             --platform linux/arm64 \
             --file "${dockerfile}" \
             "${build_args[@]}" \
             --tag "${full_image}" \
-            --push \
+            ${output_flag} \
             "${context}"
     fi
 }
