@@ -37,6 +37,9 @@ _topic_queues: dict[str, list] = {}
 # Active primary subscriptions (topic paths with live DDS sub)
 _active_primary_subs: set[str] = set()
 
+# Last frame cache per topic (for initial snapshot push on new WS connect)
+_last_frame: dict[str, bytes] = {}
+
 
 # ── Status helpers ─────────────────────────────────────────────────────────────
 
@@ -55,6 +58,8 @@ def _topic_status(topic: str) -> str:
 def _push_factory(topic: str):
     """Create a push callback for a topic that fans out to all WS consumers."""
     async def _push(data: bytes, msg_fmt: str):
+        # Cache latest frame for snapshot push on new connections
+        _last_frame[topic] = data
         queues = _topic_queues.get(topic, [])
         for q in list(queues):
             try:
@@ -185,6 +190,16 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
         'topic':  topic,
         'format': fmt,
     }))
+
+    # Push cached snapshot immediately (so page refresh shows current map)
+    snapshot = _last_frame.get(topic)
+    if snapshot:
+        if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+            await websocket.send_bytes(snapshot)
+        elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
+            await websocket.send_text(snapshot.decode('utf-8', errors='replace'))
+        else:
+            await websocket.send_bytes(snapshot)
 
     q: asyncio.Queue = asyncio.Queue(maxsize=4096)
     _topic_queues.setdefault(topic, []).append(q)
