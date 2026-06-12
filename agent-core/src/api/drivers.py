@@ -110,6 +110,8 @@ def _deploy_sync(driver: dict) -> dict:
     if network_mode == 'host' or (not network_mode and not container_network):
         # host 模式：DDS 驱动容器需要共享宿主机网络才能收发 ROS2 DDS
         run_kwargs['network_mode'] = 'host'
+        # Share host IPC namespace for FastDDS Shared Memory transport
+        run_kwargs['ipc_mode'] = 'host'
     else:
         if container_network:
             run_kwargs['network'] = container_network
