@@ -12,6 +12,7 @@
  * Legacy protocol (16-byte header) still supported for backward compatibility.
  *
  * Renders a rainbow height-colored 3D point cloud with robot position indicator.
+ * Supports free browsing (pan/rotate/zoom) and follow-robot mode toggle.
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -33,6 +34,9 @@ export const MappingRenderer = {
   _robotMesh: null,
   _raf: null,
   _ro: null,
+  _followBtn: null,
+  _followRobot: true,
+  _robotPos: new THREE.Vector3(0, 0.2, 0),
 
   mount(container) {
     this._el = document.createElement('div');
@@ -58,10 +62,18 @@ export const MappingRenderer = {
     this._renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this._el.appendChild(this._renderer.domElement);
 
-    // Controls
+    // Controls — supports pan (right-click drag), rotate (left-click), zoom (scroll)
     this._controls = new OrbitControls(this._camera, this._renderer.domElement);
     this._controls.enableDamping = true;
     this._controls.dampingFactor = 0.1;
+    this._controls.enablePan = true;
+    this._controls.screenSpacePanning = true;
+
+    // Disable follow when user interacts
+    this._controls.addEventListener('start', () => {
+      this._followRobot = false;
+      this._updateFollowBtn();
+    });
 
     // Point cloud geometry (pre-allocated)
     const geo = new THREE.BufferGeometry();
@@ -79,12 +91,28 @@ export const MappingRenderer = {
     this._points = new THREE.Points(geo, mat);
     this._scene.add(this._points);
 
-    // Robot indicator — green cone pointing forward
+    // Robot indicator — green cone pointing along +X
     const coneGeo = new THREE.ConeGeometry(0.15, 0.4, 8);
-    coneGeo.rotateX(Math.PI / 2); // point along +Z (forward)
+    coneGeo.rotateZ(-Math.PI / 2); // cone tip points along +X
     const coneMat = new THREE.MeshBasicMaterial({ color: 0x4DDB6A });
     this._robotMesh = new THREE.Mesh(coneGeo, coneMat);
     this._scene.add(this._robotMesh);
+
+    // Follow-robot toggle button
+    this._followBtn = document.createElement('button');
+    this._followBtn.style.cssText =
+      'position:absolute;top:8px;right:8px;z-index:10;' +
+      'width:28px;height:28px;border-radius:4px;border:1px solid rgba(255,255,255,0.3);' +
+      'background:rgba(77,219,106,0.8);color:#fff;font-size:14px;cursor:pointer;' +
+      'display:flex;align-items:center;justify-content:center;padding:0';
+    this._followBtn.textContent = '\u2316'; // crosshair character
+    this._followBtn.title = 'Follow robot / Free browse';
+    this._followBtn.addEventListener('click', () => {
+      this._followRobot = !this._followRobot;
+      this._updateFollowBtn();
+    });
+    this._el.appendChild(this._followBtn);
+    this._updateFollowBtn();
 
     // Resize observer
     this._ro = new ResizeObserver(() => this._resize());
@@ -93,10 +121,21 @@ export const MappingRenderer = {
     // Render loop
     const animate = () => {
       this._raf = requestAnimationFrame(animate);
+      // Smooth follow robot
+      if (this._followRobot) {
+        this._controls.target.lerp(this._robotPos, 0.05);
+      }
       this._controls.update();
       this._renderer.render(this._scene, this._camera);
     };
     animate();
+  },
+
+  _updateFollowBtn() {
+    if (!this._followBtn) return;
+    this._followBtn.style.background = this._followRobot
+      ? 'rgba(77,219,106,0.8)'
+      : 'rgba(100,100,100,0.6)';
   },
 
   _resize() {
@@ -121,9 +160,8 @@ export const MappingRenderer = {
       // Try new protocol: check if flags byte makes sense
       const possibleFlags = view.getUint8(12);
       const possibleNum = view.getUint32(13, true);
-      const expectedBodyNew = hasZ ? possibleNum * 12 : possibleNum * 8;
 
-      // Heuristic: new protocol has flags with bit0 or bit1 set
+      // Heuristic: new protocol has flags with bit1 (has_z) set
       if ((possibleFlags & 0x02) !== 0) {
         // New protocol (has_z flag set)
         robotX = view.getFloat32(0, true);
@@ -132,7 +170,7 @@ export const MappingRenderer = {
         flags = possibleFlags;
         numPoints = possibleNum;
         headerSize = 17;
-        hasZ = (flags & 0x02) !== 0;
+        hasZ = true;
       } else if (byteLen >= 16) {
         // Legacy protocol
         robotX = view.getFloat32(0, true);
@@ -175,7 +213,7 @@ export const MappingRenderer = {
       const z = hasZ ? view.getFloat32(off + 8, true) : 0;
 
       const idx = i * 3;
-      // Map coordinate: x→right, z(height)→up, y→depth (Three.js convention)
+      // Map coordinate: x→x(right), z→y(up), -y→z(into screen)
       pos[idx] = x;
       pos[idx + 1] = z;
       pos[idx + 2] = -y;
@@ -190,10 +228,9 @@ export const MappingRenderer = {
     const zScale = zRange > 0.01 ? 1.0 / zRange : 1.0;
 
     for (let i = 0; i < count; i++) {
-      const z = pos[i * 3 + 1]; // y in Three.js = z in map
-      const t = hasZ ? (z - zMin) * zScale : 0.5; // normalized [0,1]
+      const z = pos[i * 3 + 1]; // y in Three.js = height
+      const t = hasZ ? (z - zMin) * zScale : 0.5;
       const idx = i * 3;
-      // Rainbow: red → yellow → green → cyan → blue → purple
       col[idx] = this._rainbowR(t);
       col[idx + 1] = this._rainbowG(t);
       col[idx + 2] = this._rainbowB(t);
@@ -205,10 +242,14 @@ export const MappingRenderer = {
     geo.attributes.color.needsUpdate = true;
     geo.setDrawRange(0, count);
 
-    // Update robot position
+    // Update robot position and orientation
+    // Coordinate mapping: robot at (robotX, 0.2, -robotY)
+    // Yaw: in original frame yaw=0 is +X, yaw=pi/2 is +Y
+    // In Three.js: +X stays +X, +Y maps to -Z → rotation around Y axis = -yaw
     if (this._robotMesh) {
       this._robotMesh.position.set(robotX, 0.2, -robotY);
       this._robotMesh.rotation.set(0, -robotYaw, 0);
+      this._robotPos.set(robotX, 0.2, -robotY);
     }
   },
 
@@ -216,12 +257,12 @@ export const MappingRenderer = {
     this.onData(buffer);
   },
 
-  // Rainbow colormap helpers (HSV-like, 0=red, 0.25=green, 0.5=cyan, 0.75=blue, 1.0=purple)
+  // Rainbow colormap: 0=red, 0.25=yellow, 0.5=green, 0.75=cyan/blue, 1.0=purple
   _rainbowR(t) {
     if (t < 0.25) return 1.0;
     if (t < 0.5) return 1.0 - (t - 0.25) * 4;
     if (t < 0.75) return 0.0;
-    return (t - 0.75) * 4 * 0.7; // purple tint
+    return (t - 0.75) * 4 * 0.7;
   },
   _rainbowG(t) {
     if (t < 0.25) return t * 4;
@@ -245,6 +286,7 @@ export const MappingRenderer = {
     this._robotMesh?.geometry?.dispose();
     this._robotMesh?.material?.dispose();
     this._renderer?.dispose();
+    this._followBtn?.remove();
     this._el?.remove();
     this._el = null;
     this._renderer = null;
@@ -255,5 +297,6 @@ export const MappingRenderer = {
     this._robotMesh = null;
     this._positions = null;
     this._colors = null;
+    this._followBtn = null;
   },
 };

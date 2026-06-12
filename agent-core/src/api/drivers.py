@@ -128,9 +128,19 @@ def _deploy_sync(driver: dict) -> dict:
     if env:
         run_kwargs['environment'] = env
 
-    # Volume mounts from manifest
-    if driver.get('volumes'):
-        run_kwargs['volumes'] = driver['volumes']
+    # Volume mounts from manifest + auto-inject persistent data volume
+    volumes = dict(driver.get('volumes') or {})
+    # Ensure spatial data directory is always persisted to host
+    data_dir = '/opt/phanthy-motus/data'
+    has_data_mount = any(
+        (v == data_dir) or (isinstance(v, dict) and v.get('bind') == data_dir)
+        for v in volumes.values()
+    )
+    if not has_data_mount:
+        os.makedirs(data_dir, exist_ok=True)
+        volumes[data_dir] = {'bind': data_dir, 'mode': 'rw'}
+    if volumes:
+        run_kwargs['volumes'] = volumes
 
     container = client.containers.run(**run_kwargs)
     return {'status': 'starting', 'container_id': container.id[:12]}
