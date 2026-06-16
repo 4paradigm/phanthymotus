@@ -53,6 +53,7 @@ TOOLS = [
     {
         "name": "asr",
         "type": "processor",
+        "multiInstance": True,
         "description": "ASR — start/stop speech recognition or get status",
         "inputSchema": {
             "type": "object",
@@ -72,11 +73,11 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "provider": {"type": "string", "enum": ["openai", "openai_omni"], "description": "ASR 服务商"},
-                "url":      {"type": "string", "description": "API URL"},
-                "key":      {"type": "string", "description": "API Key", "format": "password"},
-                "model":    {"type": "string", "description": "模型名称"},
-                "language": {"type": "string", "description": "语言", "default": "zh-CN"},
+                "provider": {"type": "string", "enum": ["openai", "openai_omni"], "description": "ASR 服务商", "scope": "shared"},
+                "url":      {"type": "string", "description": "API URL", "scope": "shared"},
+                "key":      {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
+                "model":    {"type": "string", "description": "模型名称", "scope": "instance"},
+                "language": {"type": "string", "description": "语言", "default": "zh-CN", "scope": "instance"},
             },
             "required": ["provider"]
         },
@@ -322,8 +323,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 
 class _ASRNode(Node):
     def __init__(self, input_topic: str, adapter: Optional[ASRAdapter], language: str,
-                 vad_backend: str = 'silero', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400):
-        super().__init__("asr")
+                 vad_backend: str = 'silero', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
+                 node_suffix: str = ''):
+        node_name = f"asr_{node_suffix}" if node_suffix else "asr"
+        super().__init__(node_name)
         self._input_topic  = input_topic
         self._output_topic = f"{input_topic}/asr"
         self._adapter  = adapter
@@ -431,7 +434,8 @@ class ASRPlugin:
         self._vad_backend  = vad_cfg.get('model', 'silero') or 'silero'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
-        self._node: Optional[_ASRNode] = None
+        self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
+        self._instance_configs: dict[str, dict] = {}    # key = instance_id → per-instance config
         self._executor = executor
         log.info(f"[asr] plugin init: provider={plugin_cfg.get('provider')}, "
                  f"vad={self._vad_backend}, threshold={self._vad_threshold}, silence_ms={self._vad_silence_ms}")
@@ -443,36 +447,101 @@ class ASRPlugin:
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name == "asr" else name
+        instance_id = args.get("instance_id", "")
+
         if action == "info":
-            input_topic  = self._node._input_topic  if self._node else ""
-            output_topic = self._node._output_topic if self._node else ""
+            if instance_id and instance_id in self._nodes:
+                node = self._nodes[instance_id]
+                return {
+                    "name": "ASR", "manufacture": "Embodied", "model": "asr",
+                    "state": node.state,
+                    "topic_in":  [{"topic": node._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
+                    "topic_out": [{"topic": node._output_topic, "format": "data/json",     "desc": ""}],
+                    "desc": "ASR service — converts audio/pcm-16k to text",
+                }
+            # Aggregate info for all instances
+            if self._nodes:
+                topics_in = [{"topic": n._input_topic, "format": "audio/pcm-16k", "desc": ""} for n in self._nodes.values()]
+                topics_out = [{"topic": n._output_topic, "format": "data/json", "desc": ""} for n in self._nodes.values()]
+                states = list(set(n.state for n in self._nodes.values()))
+                state = "running" if "running" in states else states[0] if states else "idle"
+            else:
+                topics_in = [{"topic": "", "format": "audio/pcm-16k", "desc": ""}]
+                topics_out = [{"topic": "", "format": "data/json", "desc": ""}]
+                state = "idle"
             return {
-                "name":      "ASR", "manufacture": "Embodied", "model": "asr",
-                "state":     self._node.state if self._node else "idle",
-                "topic_in":  [{"topic": input_topic,  "format": "audio/pcm-16k", "desc": ""}],
-                "topic_out": [{"topic": output_topic, "format": "data/json",     "desc": ""}],
-                "desc":      "ASR service — converts audio/pcm-16k to text",
+                "name": "ASR", "manufacture": "Embodied", "model": "asr",
+                "state": state,
+                "topic_in": topics_in,
+                "topic_out": topics_out,
+                "desc": "ASR service — converts audio/pcm-16k to text",
             }
+
         elif action == "start":
             input_topic = args.get("input_topic")
             if not input_topic:
                 raise ValueError("input_topic is required")
-            if not self._node:
-                self._node = _ASRNode(input_topic, self._adapter, self._language,
-                                      self._vad_backend, self._vad_threshold, self._vad_silence_ms)
-                self._executor.add_node(self._node)
-            return self._node.start()
+            node_key = instance_id or input_topic
+            if node_key not in self._nodes:
+                # Determine adapter: use instance-specific config if available
+                adapter = self._adapter
+                language = self._language
+                if instance_id and instance_id in self._instance_configs:
+                    icfg = self._instance_configs[instance_id]
+                    inst_adapter = _build_asr_adapter(icfg)
+                    if inst_adapter:
+                        adapter = inst_adapter
+                    language = icfg.get('language', language)
+                node = _ASRNode(input_topic, adapter, language,
+                                self._vad_backend, self._vad_threshold, self._vad_silence_ms,
+                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                self._executor.add_node(node)
+                self._nodes[node_key] = node
+            return self._nodes[node_key].start()
+
         elif action == "stop":
-            return self._node.stop() if self._node else {"state": "idle"}
+            if instance_id and instance_id in self._nodes:
+                node = self._nodes[instance_id]
+                result = node.stop()
+                self._executor.remove_node(node)
+                del self._nodes[instance_id]
+                return result
+            elif not instance_id and self._nodes:
+                # Stop all instances (backward compat / project stop)
+                results = []
+                for key in list(self._nodes.keys()):
+                    node = self._nodes[key]
+                    node.stop()
+                    self._executor.remove_node(node)
+                    del self._nodes[key]
+                    results.append(key)
+                return {"state": "idle", "stopped_instances": results}
+            return {"state": "idle"}
+
         elif action == "config":
-            cfg = {k: v for k, v in args.items() if k != 'action' and v}
-            self._adapter = _build_asr_adapter(cfg)
-            self._language = cfg.get('language', self._language)
-            if self._node:
-                if self._node.state == "running":
-                    self._node.stop()
-                self._node = None
-            return {"status": "configured", "adapter_ok": self._adapter is not None}
+            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v}
+            if instance_id:
+                # Per-instance config
+                self._instance_configs[instance_id] = cfg
+                # If instance is running, restart with new config
+                if instance_id in self._nodes:
+                    node = self._nodes[instance_id]
+                    input_topic = node._input_topic
+                    node.stop()
+                    self._executor.remove_node(node)
+                    del self._nodes[instance_id]
+                return {"status": "configured", "instance_id": instance_id}
+            else:
+                # Shared/global config
+                self._adapter = _build_asr_adapter(cfg)
+                self._language = cfg.get('language', self._language)
+                # Stop all nodes (they'll use new config on next start)
+                for key in list(self._nodes.keys()):
+                    self._nodes[key].stop()
+                    self._executor.remove_node(self._nodes[key])
+                    del self._nodes[key]
+                return {"status": "configured", "adapter_ok": self._adapter is not None}
+
         return None
 
 

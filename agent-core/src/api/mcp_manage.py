@@ -661,7 +661,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             }
             await session.post(url, json=init_payload, headers=headers)
 
-            # Auto-config: start 前自动 apply 已保存的 config
+            # Auto-config: start 前自动 apply 已保存的 config (shared + instance merged)
             action = req.arguments.get('action')
             if action == 'start':
                 # Check if this tool has configSchema (requires config before start)
@@ -669,12 +669,21 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
                 has_config_schema = bool(tool_obj and tool_obj.get('configSchema'))
 
-                saved_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None)
-                if saved_cfg:
+                instance_id = req.arguments.get('instance_id', '')
+                shared_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None) or {}
+                instance_cfg = {}
+                if instance_id:
+                    instance_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}:{instance_id}', None) or {}
+                merged_cfg = {**shared_cfg, **instance_cfg}
+
+                if merged_cfg:
+                    cfg_args = {'action': 'config', **merged_cfg}
+                    if instance_id:
+                        cfg_args['instance_id'] = instance_id
                     cfg_payload = {
                         'jsonrpc': '2.0', 'id': 2,
                         'method': 'tools/call',
-                        'params': {'name': req.tool, 'arguments': {'action': 'config', **saved_cfg}},
+                        'params': {'name': req.tool, 'arguments': cfg_args},
                     }
                     async with session.post(url, json=cfg_payload, headers=headers) as resp:
                         cfg_data = await resp.json(content_type=None)

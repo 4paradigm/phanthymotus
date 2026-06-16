@@ -37,6 +37,7 @@ TOOLS = [
     {
         "name": "tts",
         "type": "processor",
+        "multiInstance": True,
         "description": "TTS — start/stop speech synthesis, speak text, or get status",
         "inputSchema": {
             "type": "object",
@@ -60,10 +61,10 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "api_key": {"type": "string", "description": "API Key", "format": "password"},
-                "model":   {"type": "string", "description": "模型名称"},
-                "voice":   {"type": "string", "description": "音色名称"},
-                "url":     {"type": "string", "description": "自定义 URL (可选)"},
+                "api_key": {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
+                "url":     {"type": "string", "description": "自定义 URL (可选)", "scope": "shared"},
+                "model":   {"type": "string", "description": "模型名称", "scope": "instance"},
+                "voice":   {"type": "string", "description": "音色名称", "scope": "instance"},
             },
             "required": ["api_key"]
         },
@@ -272,8 +273,9 @@ def _build_tts_adapter(cfg: dict) -> Optional[TTSAdapter]:
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
 
 class _TTSNode(Node):
-    def __init__(self, input_topic: Optional[str], adapter: Optional[TTSAdapter]):
-        super().__init__("tts")
+    def __init__(self, input_topic: Optional[str], adapter: Optional[TTSAdapter], node_suffix: str = ''):
+        node_name = f"tts_{node_suffix}" if node_suffix else "tts"
+        super().__init__(node_name)
         self._input_topic  = input_topic or ''
         self._output_topic = f"{input_topic}/tts" if input_topic else '/perception/tts'
         self._adapter      = adapter
@@ -425,7 +427,8 @@ class TTSPlugin:
 
     def __init__(self, plugin_cfg: dict, executor):
         self._adapter  = _build_tts_adapter(plugin_cfg)
-        self._node: Optional[_TTSNode] = None
+        self._nodes: dict[str, _TTSNode] = {}           # key = instance_id
+        self._instance_configs: dict[str, dict] = {}    # key = instance_id → per-instance config
         self._executor = executor
         log.info(f"[tts] plugin init: provider={plugin_cfg.get('provider')}, "
                  f"model={plugin_cfg.get('model','') or '(default)'}, "
@@ -438,45 +441,118 @@ class TTSPlugin:
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name == "tts" else name
+        instance_id = args.get("instance_id", "")
+
         if action == "info":
+            if instance_id and instance_id in self._nodes:
+                node = self._nodes[instance_id]
+                return {
+                    "name": "TTS", "manufacture": "Embodied", "model": "tts",
+                    "state": node.state,
+                    "topic_in":  [{"topic": node._input_topic,  "format": "data/json",     "desc": ""}],
+                    "topic_out": [{"topic": node._output_topic, "format": "audio/pcm-16k", "desc": ""}],
+                    "desc": "TTS service — converts text to audio/pcm-16k",
+                }
+            # Aggregate info
+            if self._nodes:
+                topics_in = [{"topic": n._input_topic, "format": "data/json", "desc": ""} for n in self._nodes.values()]
+                topics_out = [{"topic": n._output_topic, "format": "audio/pcm-16k", "desc": ""} for n in self._nodes.values()]
+                states = list(set(n.state for n in self._nodes.values()))
+                state = "running" if "running" in states else states[0] if states else "idle"
+            else:
+                topics_in = [{"topic": "", "format": "data/json", "desc": ""}]
+                topics_out = [{"topic": "/perception/tts", "format": "audio/pcm-16k", "desc": ""}]
+                state = "idle"
             return {
                 "name": "TTS", "manufacture": "Embodied", "model": "tts",
-                "state":     self._node.state if self._node else "idle",
-                "topic_in":  [{"topic": self._node._input_topic  if self._node else "", "format": "data/json",     "desc": ""}],
-                "topic_out": [{"topic": self._node._output_topic if self._node else "/perception/tts", "format": "audio/pcm-16k", "desc": ""}],
+                "state": state,
+                "topic_in": topics_in,
+                "topic_out": topics_out,
                 "desc": "TTS service — converts text to audio/pcm-16k",
             }
+
         elif action == "start":
             input_topic = args.get("input_topic") or ''
-            if not self._node:
-                self._node = _TTSNode(input_topic or None, self._adapter)
-                self._executor.add_node(self._node)
-            elif input_topic and self._node._input_topic != input_topic:
-                self._node.stop()
-                self._executor.remove_node(self._node)
-                self._node = _TTSNode(input_topic, self._adapter)
-                self._executor.add_node(self._node)
-            return self._node.start()
+            node_key = instance_id or input_topic or '_default'
+            if node_key not in self._nodes:
+                adapter = self._adapter
+                if instance_id and instance_id in self._instance_configs:
+                    inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
+                    if inst_adapter:
+                        adapter = inst_adapter
+                node = _TTSNode(input_topic or None, adapter,
+                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                self._executor.add_node(node)
+                self._nodes[node_key] = node
+            elif input_topic and self._nodes[node_key]._input_topic != input_topic:
+                # Input topic changed for existing instance — recreate
+                old_node = self._nodes[node_key]
+                old_node.stop()
+                self._executor.remove_node(old_node)
+                adapter = self._adapter
+                if instance_id and instance_id in self._instance_configs:
+                    inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
+                    if inst_adapter:
+                        adapter = inst_adapter
+                node = _TTSNode(input_topic, adapter,
+                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                self._executor.add_node(node)
+                self._nodes[node_key] = node
+            return self._nodes[node_key].start()
+
         elif action == "stop":
-            return self._node.stop() if self._node else {"state": "idle"}
+            if instance_id and instance_id in self._nodes:
+                node = self._nodes[instance_id]
+                result = node.stop()
+                self._executor.remove_node(node)
+                del self._nodes[instance_id]
+                return result
+            elif not instance_id and self._nodes:
+                for key in list(self._nodes.keys()):
+                    self._nodes[key].stop()
+                    self._executor.remove_node(self._nodes[key])
+                    del self._nodes[key]
+                return {"state": "idle"}
+            return {"state": "idle"}
+
         elif action == "speak":
-            text = args.get("text","")
-            if not text: raise ValueError("text is required")
-            if not self._node:
-                self._node = _TTSNode(None, self._adapter)
-                self._executor.add_node(self._node)
-            if self._node.state != "running":
-                self._node.start()
-            self._node.enqueue(text)
+            text = args.get("text", "")
+            if not text:
+                raise ValueError("text is required")
+            node_key = instance_id or '_default'
+            if node_key not in self._nodes:
+                adapter = self._adapter
+                if instance_id and instance_id in self._instance_configs:
+                    inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
+                    if inst_adapter:
+                        adapter = inst_adapter
+                node = _TTSNode(None, adapter,
+                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                self._executor.add_node(node)
+                self._nodes[node_key] = node
+            node = self._nodes[node_key]
+            if node.state != "running":
+                node.start()
+            node.enqueue(text)
             return {"status": "queued", "text": text}
+
         elif action == "config":
-            cfg = {k: v for k, v in args.items() if k != 'action' and v}
-            self._adapter = _build_tts_adapter(cfg)
-            if self._node:
-                if self._node.state == "running":
-                    self._node.stop()
-                self._node = None
-            return {"status": "configured", "adapter_ok": self._adapter is not None}
+            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v}
+            if instance_id:
+                self._instance_configs[instance_id] = cfg
+                if instance_id in self._nodes:
+                    self._nodes[instance_id].stop()
+                    self._executor.remove_node(self._nodes[instance_id])
+                    del self._nodes[instance_id]
+                return {"status": "configured", "instance_id": instance_id}
+            else:
+                self._adapter = _build_tts_adapter(cfg)
+                for key in list(self._nodes.keys()):
+                    self._nodes[key].stop()
+                    self._executor.remove_node(self._nodes[key])
+                    del self._nodes[key]
+                return {"status": "configured", "adapter_ok": self._adapter is not None}
+
         return None
 
     def synthesize_raw(self, text: str) -> bytes:

@@ -12,7 +12,7 @@
  */
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 
 let _canvasEl   = null;
@@ -267,11 +267,13 @@ function _setupDropZone() {
       return;
     }
 
-    // Prevent same tool from being added twice
-    const existing = _cards.find(c => c.mcpId === data.mcpId && c.toolName === data.toolName);
-    if (existing) {
-      _showDropReject(e, '不能两次加入同样的组件');
-      return;
+    // Prevent same tool from being added twice (unless multiInstance)
+    if (!data.multiInstance) {
+      const existing = _cards.find(c => c.mcpId === data.mcpId && c.toolName === data.toolName);
+      if (existing) {
+        _showDropReject(e, '不能两次加入同样的组件');
+        return;
+      }
     }
 
     // Convert screen coords → world coords
@@ -398,6 +400,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
   const schema  = typeof toolObj === 'object' ? toolObj.inputSchema : null;
   const toolType = (typeof toolObj === 'object' ? toolObj.type : '') || '';
+  const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
+  const hasInstanceFields = configSchema && Object.values(configSchema.properties || {}).some(d => d.scope === 'instance');
 
   // Auto-classify perception tools as processor
   // Priority: tool-level (live) > persisted card-level > single-tool MCP fallback
@@ -588,6 +592,10 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     // Processor cards get a "查看数据流" button if they have output topics
     const showViewBtn = effectiveType === 'processor' && topicOut.length > 0;
 
+    const instanceCfgBtn = hasInstanceFields
+      ? `<button class="canvas-card-instance-cfg-btn" title="实例配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
+      : '';
+
     el.innerHTML = `
       <div class="canvas-card-body-wrap">
         <div class="canvas-card-header">
@@ -595,6 +603,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
+          ${instanceCfgBtn}
           <button class="tool-card-info-btn canvas-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
           <button class="canvas-card-close" title="从画布移除">✕</button>
         </div>
@@ -643,6 +652,15 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut });
       }
     });
+
+    // Instance config button (for multiInstance tools with instance-scope fields)
+    const instanceCfgBtnEl = el.querySelector('.canvas-card-instance-cfg-btn');
+    if (instanceCfgBtnEl) {
+      instanceCfgBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openInstanceConfigModal(mcpId, toolName, id, configSchema);
+      });
+    }
 
     const execBtn = el.querySelector('.canvas-exec-btn');
     if (execBtn) {
@@ -831,7 +849,7 @@ function _setupPortDrag() {
           // Use resolved topic from the destination's in-port
           const resolvedInPort = toCard.querySelector(`.canvas-port.in[data-idx="${inPort.dataset.idx}"]`);
           const resolvedTopic = resolvedInPort?.dataset.topic || _draggingConn.topic;
-          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic });
+          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic, instance_id: toCardData.id });
         }
       }
     }
@@ -1151,7 +1169,7 @@ function _autoStopOnDisconnect(cardId, portIdx, topic) {
   if (stillConnected) return;
   const card = _cards.find(c => c.id === cardId);
   if (!card) return;
-  _triggerAction(card.mcpId, card.toolName, 'stop', topic ? { input_topic: topic } : {});
+  _triggerAction(card.mcpId, card.toolName, 'stop', topic ? { input_topic: topic, instance_id: card.id } : { instance_id: card.id });
 }
 
 async function _startProject() {
@@ -1204,6 +1222,7 @@ async function _startProject() {
     } else {
       args = {};
     }
+    args.instance_id = card.id;
     _triggerAction(card.mcpId, card.toolName, 'start', args);
   }
   // 持久化运行状态
@@ -1232,6 +1251,7 @@ function _stopProject() {
     } else {
       args = {};
     }
+    args.instance_id = card.id;
     _triggerAction(card.mcpId, card.toolName, 'stop', args);
   }
   // 持久化运行状态

@@ -92,3 +92,40 @@ async def delete_tool_config(mcp_id: str, tool_name: str):
     except Exception:
         pass
     return {'code': 200}
+
+
+# ── Per-instance config CRUD ────────────────────────────────────────────────
+
+@router.get('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
+async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
+    """Get saved config for a specific tool instance."""
+    data = config.main.get(f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}', None)
+    return {'code': 200, 'data': data}
+
+
+@router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
+async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
+    """Save config for a specific tool instance and apply it."""
+    config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}'] = body
+
+    # Apply instance config to the MCP plugin
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    try:
+        req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', 'instance_id': instance_id, **body})
+        await mcp_call_tool(mcp_id, req)
+    except Exception:
+        pass
+    return {'code': 200}
+
+
+@router.delete('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
+async def delete_instance_config(mcp_id: str, tool_name: str, instance_id: str):
+    """Delete config for a specific tool instance."""
+    try:
+        conn = config._get_conn()
+        conn.execute("DELETE FROM config WHERE key = ?",
+                     (f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}',))
+        conn.commit()
+    except Exception:
+        pass
+    return {'code': 200}

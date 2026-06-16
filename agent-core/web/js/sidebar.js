@@ -35,12 +35,17 @@ async function _loadToolConfigs() {
   } catch (e) { /* ignore */ }
 }
 
-/** Check if a tool (by mcp_id:tool_name key) is configured. */
+/** Check if a tool (by mcp_id:tool_name key) has shared config saved. */
 export function isToolConfigured(mcpId, toolName) {
   return !!_toolConfigs[`${mcpId}:${toolName}`];
 }
 
-/** Get all unconfigured tools that are on the canvas (for startProject check). */
+/** Check if a specific instance has instance config saved. */
+export function isInstanceConfigured(mcpId, toolName, instanceId) {
+  return !!_toolConfigs[`${mcpId}:${toolName}:${instanceId}`];
+}
+
+/** Get all tool configs (shared + instance). */
 export function getToolConfigs() { return _toolConfigs; }
 
 /**
@@ -235,6 +240,8 @@ function _buildToolCard(mcp, tool) {
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
       mcpId: mcp.id, toolName: tool.name, driverName: mcp.server_name || mcp.name || mcp.id,
       hasConfig: !!configSchema, configured,
+      multiInstance: !!(tool.multiInstance),
+      hasInstanceConfig: _hasInstanceFields(configSchema),
     }));
   });
   card.addEventListener('dragend', () => card.classList.remove('dragging-source'));
@@ -242,7 +249,23 @@ function _buildToolCard(mcp, tool) {
   return card;
 }
 
-// ── Tool config modal ────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+/** Check if a configSchema has any instance-scope fields. */
+function _hasInstanceFields(configSchema) {
+  if (!configSchema || !configSchema.properties) return false;
+  return Object.values(configSchema.properties).some(def => def.scope === 'instance');
+}
+
+/** Check if a configSchema has any shared-scope required fields. */
+export function hasSharedRequired(configSchema) {
+  if (!configSchema) return false;
+  const props = configSchema.properties || {};
+  const required = configSchema.required || [];
+  return required.some(k => props[k] && props[k].scope !== 'instance');
+}
+
+// ── Tool config modal (shared fields only) ────────────────────────────────────
 
 function _openToolConfigModal(mcpId, toolName, configSchema) {
   if (isProjectRunning()) {
@@ -263,6 +286,8 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   const savedValues = _toolConfigs[configKey] || {};
 
   for (const [key, def] of Object.entries(props)) {
+    // Skip instance-scope fields — those are configured per canvas card instance
+    if (def.scope === 'instance') continue;
     const label = document.createElement('label');
     label.className = 'tool-config-label';
     label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
@@ -392,6 +417,114 @@ function _showDetail(mcp, tool, opts = {}) {
 
 function _hideDetail() {
   _backdrop.classList.add('hidden');
+}
+
+// ── Instance config modal (instance-scope fields only) ────────────────────────
+
+/**
+ * Open a config modal for a specific canvas card instance.
+ * Only shows fields with scope === "instance".
+ */
+export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
+  if (isProjectRunning()) {
+    alert('请停止智能控制后修改');
+    return;
+  }
+  const overlay = document.getElementById('tool-config-overlay');
+  const titleEl = document.getElementById('tool-config-title');
+  const bodyEl  = document.getElementById('tool-config-body');
+  const saveBtn = document.getElementById('tool-config-save');
+
+  titleEl.textContent = `实例配置 ${toolName}`;
+  bodyEl.innerHTML = '';
+
+  const props = configSchema.properties || {};
+  const required = configSchema.required || [];
+  const configKey = `${mcpId}:${toolName}:${instanceId}`;
+  const savedValues = _toolConfigs[configKey] || {};
+
+  let hasFields = false;
+  for (const [key, def] of Object.entries(props)) {
+    // Only show instance-scope fields
+    if (def.scope !== 'instance') continue;
+    hasFields = true;
+
+    const label = document.createElement('label');
+    label.className = 'tool-config-label';
+    label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
+
+    let input;
+    if (def.enum && Array.isArray(def.enum)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `-- 请选择 --`;
+      input.appendChild(placeholder);
+      for (const opt of def.enum) {
+        const option = document.createElement('option');
+        option.value = opt;
+        option.textContent = opt;
+        if (savedValues[key] === opt) option.selected = true;
+        input.appendChild(option);
+      }
+      if (savedValues[key]) input.value = savedValues[key];
+    } else {
+      input = document.createElement('input');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.type = def.format === 'password' ? 'password' : 'text';
+      input.placeholder = def.default || '';
+      input.value = savedValues[key] || '';
+    }
+
+    bodyEl.appendChild(label);
+    bodyEl.appendChild(input);
+  }
+
+  if (!hasFields) {
+    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">该组件无实例配置项</p>';
+  }
+
+  const close = () => { overlay.classList.add('hidden'); };
+  const save = async () => {
+    const values = {};
+    bodyEl.querySelectorAll('[data-key]').forEach(input => {
+      const v = input.value.trim();
+      if (v) values[input.dataset.key] = v;
+    });
+
+    try {
+      await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(values),
+      });
+    } catch (err) { console.error('[config] instance save failed:', err); }
+
+    _toolConfigs[configKey] = values;
+    close();
+  };
+
+  const newSaveBtn = saveBtn.cloneNode(true);
+  saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
+  newSaveBtn.addEventListener('click', save);
+
+  const closeBtn = document.getElementById('tool-config-close');
+  if (closeBtn) {
+    const newCloseBtn = closeBtn.cloneNode(true);
+    closeBtn.parentNode.replaceChild(newCloseBtn, closeBtn);
+    newCloseBtn.addEventListener('click', close);
+  }
+  const cancelBtn = document.getElementById('tool-config-cancel');
+  if (cancelBtn) {
+    const newCancelBtn = cancelBtn.cloneNode(true);
+    cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+    newCancelBtn.addEventListener('click', close);
+  }
+
+  overlay.classList.remove('hidden');
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

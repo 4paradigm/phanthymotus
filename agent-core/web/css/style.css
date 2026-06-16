@@ -1146,6 +1146,19 @@ html, body {
 }
 .canvas-card-info-btn:hover { color: var(--accent); }
 
+.canvas-card-instance-cfg-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 4px;
+  flex-shrink: 0;
+  color: var(--text-dim);
+  transition: color 0.1s;
+}
+.canvas-card-instance-cfg-btn:hover { color: var(--accent); }
+
 .canvas-card-body {
   padding: 8px 10px;
   display: flex;
