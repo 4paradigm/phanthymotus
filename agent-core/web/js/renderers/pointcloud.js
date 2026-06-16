@@ -173,7 +173,7 @@ export const PointCloudRenderer = {
       const intensity = hasIntensity ? view.getFloat32(off + 12, true) : 0;
 
       const idx = (startIdx + i) * 3;
-      // Livox frame (inverted mount): x forward, y left, z down → Three.js: x right, y up, z forward
+      // Livox frame (inverted mount): z down → Three.js: x right, y up, z forward
       pos[idx]     = y;
       pos[idx + 1] = -z;
       pos[idx + 2] = -x;
