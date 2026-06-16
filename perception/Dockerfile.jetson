@@ -47,18 +47,23 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests websockets webrtcvad websocket-client dashscope && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
 
+# ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    kiss-icp scipy
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
-COPY src/perception_stack/main.py    /work/main.py
-COPY src/perception_stack/plugins/   /work/plugins/
-COPY src/perception_stack/config.yaml /work/config.yaml
+COPY perception/main.py    /work/main.py
+COPY perception/plugins/   /work/plugins/
+COPY perception/config.yaml /work/config.yaml
 
 EXPOSE 15720
 EXPOSE 15721
-EXPOSE 15800
+# EXPOSE 15800
 
-ENV MODEL_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/Qwen3.5-2B-Q4_K_M.gguf
-ENV MODEL_PATH=/models/Qwen3.5-2B-Q4_K_M.gguf
+# ── LLM server (disabled — uncomment to re-enable) ───────────────
+# ENV MODEL_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/Qwen3.5-2B-Q4_K_M.gguf
+# ENV MODEL_PATH=/models/Qwen3.5-2B-Q4_K_M.gguf
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
 RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.8/dist-packages/ros_ws.pth && \
@@ -68,20 +73,26 @@ RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
+# ── To re-enable llama-server, replace CMD with: ─────────────────
+# CMD ["/bin/bash", "-c", \
+#     "source /opt/ros/humble/install/setup.bash && \
+#      source /ros_ws/install/setup.bash && \
+#      if [ ! -f ${MODEL_PATH} ]; then \
+#        echo 'Downloading model...' && \
+#        mkdir -p /models && \
+#        curl -fSL -o ${MODEL_PATH} ${MODEL_URL}; \
+#      fi && \
+#      LD_PRELOAD=/usr/lib/aarch64-linux-gnu/tegra/libcuda.so.1 \
+#      llama-server \
+#        -m ${MODEL_PATH} \
+#        -ngl 99 --host 0.0.0.0 --port 15800 --alias Qwen3.5-2B \
+#        --flash-attn on \
+#        -c 32768 \
+#        --chat-template-kwargs '{\"enable_thinking\":false}' \
+#        --no-context-shift &\
+#      python3 /work/main.py"]
+
 CMD ["/bin/bash", "-c", \
     "source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
-     if [ ! -f ${MODEL_PATH} ]; then \
-       echo 'Downloading model...' && \
-       mkdir -p /models && \
-       curl -fSL -o ${MODEL_PATH} ${MODEL_URL}; \
-     fi && \
-     LD_PRELOAD=/usr/lib/aarch64-linux-gnu/tegra/libcuda.so.1 \
-     llama-server \
-       -m ${MODEL_PATH} \
-       -ngl 99 --host 0.0.0.0 --port 15800 --alias Qwen3.5-2B \
-       --flash-attn on \
-       -c 32768 \
-       --chat-template-kwargs '{\"enable_thinking\":false}' \
-       --no-context-shift &\
      python3 /work/main.py"]

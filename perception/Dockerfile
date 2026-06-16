@@ -16,6 +16,8 @@ RUN pip3 install --no-cache-dir \
     torch
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests silero-vad websockets webrtcvad websocket-client dashscope
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    kiss-icp scipy
 
 WORKDIR /work
 COPY main.py    /work/main.py

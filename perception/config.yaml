@@ -27,3 +27,17 @@ plugins:
     api_key: ""
     api_secret: ""
     cluster: ""
+
+  htmsg:
+    enabled: true
+    namespace: ""       # auto-detect from hostname if empty
+    keyframe:
+      dist_thresh: 1.0    # meters — insert keyframe when moved this far
+      angle_thresh: 0.35  # radians (~20°) — or rotated this much
+    semantic:
+      model: "mobileclip"
+      sam_model: "sam2_tiny"
+      confidence_decay: 0.95
+    graph:
+      db_path: "/opt/phanthy-motus/data/htmsg"
+      max_nodes: 500
