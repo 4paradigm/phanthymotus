@@ -61,8 +61,9 @@ export const PointCloudRenderer = {
     const grid = new THREE.GridHelper(20, 20, 0x444444, 0x333333);
     this._scene.add(grid);
 
-    // Origin axes
+    // Origin axes — rotated so blue (Z) points forward (Livox +x maps to Three.js -Z)
     const axes = new THREE.AxesHelper(1);
+    axes.rotation.y = Math.PI;  // 180° around Y to align forward direction
     this._scene.add(axes);
 
     // Points geometry (pre-allocated)
