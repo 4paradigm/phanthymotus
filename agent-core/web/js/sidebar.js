@@ -293,7 +293,23 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
-    if (def.enum && Array.isArray(def.enum)) {
+    if (def.oneOf && Array.isArray(def.oneOf)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `-- 请选择 --`;
+      input.appendChild(placeholder);
+      for (const item of def.oneOf) {
+        const option = document.createElement('option');
+        option.value = item.const ?? '';
+        option.textContent = item.title || String(item.const);
+        if (String(savedValues[key]) === String(item.const)) option.selected = true;
+        input.appendChild(option);
+      }
+      if (savedValues[key] != null) input.value = savedValues[key];
+    } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
@@ -310,6 +326,17 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
         input.appendChild(option);
       }
       if (savedValues[key]) input.value = savedValues[key];
+    } else if (def.type === 'boolean') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const optTrue = document.createElement('option');
+      optTrue.value = 'true'; optTrue.textContent = '是';
+      const optFalse = document.createElement('option');
+      optFalse.value = 'false'; optFalse.textContent = '否';
+      input.appendChild(optTrue);
+      input.appendChild(optFalse);
+      input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -329,7 +356,12 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     const values = {};
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();
-      if (v) values[input.dataset.key] = v;
+      if (!v) return;
+      const fieldDef = props[input.dataset.key];
+      if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
+      else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
+      else if (fieldDef?.type === 'boolean') values[input.dataset.key] = v === 'true';
+      else values[input.dataset.key] = v;
     });
 
     // Save to per-tool API
@@ -454,7 +486,23 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
     label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
-    if (def.enum && Array.isArray(def.enum)) {
+    if (def.oneOf && Array.isArray(def.oneOf)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `-- 请选择 --`;
+      input.appendChild(placeholder);
+      for (const item of def.oneOf) {
+        const option = document.createElement('option');
+        option.value = item.const ?? '';
+        option.textContent = item.title || String(item.const);
+        if (String(savedValues[key]) === String(item.const)) option.selected = true;
+        input.appendChild(option);
+      }
+      if (savedValues[key] != null) input.value = savedValues[key];
+    } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
@@ -470,6 +518,17 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
         input.appendChild(option);
       }
       if (savedValues[key]) input.value = savedValues[key];
+    } else if (def.type === 'boolean') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const optTrue = document.createElement('option');
+      optTrue.value = 'true'; optTrue.textContent = '是';
+      const optFalse = document.createElement('option');
+      optFalse.value = 'false'; optFalse.textContent = '否';
+      input.appendChild(optTrue);
+      input.appendChild(optFalse);
+      input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -492,7 +551,12 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
     const values = {};
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();
-      if (v) values[input.dataset.key] = v;
+      if (!v) return;
+      const fieldDef = props[input.dataset.key];
+      if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
+      else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
+      else if (fieldDef?.type === 'boolean') values[input.dataset.key] = v === 'true';
+      else values[input.dataset.key] = v;
     });
 
     try {
