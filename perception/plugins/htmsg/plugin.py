@@ -70,7 +70,7 @@ def _build_tools(namespace: str) -> list:
             ],
             "topic_out": [
                 {"topic": f"/{namespace}/htmsg/odometry", "format": "data/json"},
-                {"topic": f"/{namespace}/htmsg/graph", "format": "data/json"},
+                {"topic": f"/{namespace}/htmsg/graph", "format": "sensor/htmsg"},
                 {"topic": f"/{namespace}/htmsg/status", "format": "data/json"},
             ],
         }
@@ -116,8 +116,6 @@ class _HTMSGNode(Node):
 
     def _publish_status(self):
         """1Hz status heartbeat."""
-        from .pose_graph import PoseGraphManager
-        # Access pose graph stats via plugin reference (set after init)
         status = {
             "state": "running" if self._current_pose else "idle",
             "timestamp": time.time(),
@@ -131,6 +129,14 @@ class _HTMSGNode(Node):
         msg = String()
         msg.data = json.dumps(status)
         self._status_pub.publish(msg)
+
+        # Publish graph visualization data (sensor/htmsg format)
+        if hasattr(self, '_get_graph_data'):
+            graph_data = self._get_graph_data()
+            if graph_data:
+                gmsg = String()
+                gmsg.data = json.dumps(graph_data)
+                self._graph_pub.publish(gmsg)
 
     def get_pose(self) -> Optional[Pose6D]:
         with self._lock:
@@ -223,6 +229,7 @@ class HTMSGPlugin:
         # Create ROS2 node
         self._node = _HTMSGNode(self._namespace)
         self._node._get_stats = self._get_stats
+        self._node._get_graph_data = self._get_graph_data
         self._executor.add_node(self._node)
 
         # Start pose graph manager
@@ -282,3 +289,48 @@ class HTMSGPlugin:
         if self._pose_graph:
             stats["keyframe_count"] = self._pose_graph.keyframe_count
         return stats
+
+    def _get_graph_data(self) -> dict | None:
+        """Build graph visualization payload for the renderer.
+
+        Returns a JSON structure with keyframes, edges, robot pose, and scene nodes.
+        Published at 1Hz to /{ns}/htmsg/graph with format sensor/htmsg.
+        """
+        if not self._pose_graph or not self._node:
+            return None
+
+        pose = self._node.get_pose()
+        keyframes = self._pose_graph.get_keyframes(last_n=100)
+
+        if not keyframes and not pose:
+            return None
+
+        # Build keyframe node list
+        kf_nodes = []
+        for kf in keyframes:
+            kf_nodes.append({
+                "id": kf.id,
+                "x": round(kf.pose.x, 3),
+                "y": round(kf.pose.y, 3),
+                "z": round(kf.pose.z, 3),
+                "ts": round(kf.timestamp, 1),
+            })
+
+        # Build edges (sequential connections between keyframes)
+        edges = []
+        for i in range(1, len(kf_nodes)):
+            edges.append({"from": kf_nodes[i-1]["id"], "to": kf_nodes[i]["id"]})
+
+        # TODO Phase 3: add loop closure edges and semantic nodes
+
+        data = {
+            "type": "htmsg_graph",
+            "keyframes": kf_nodes,
+            "edges": edges,
+            "semantic_nodes": [],  # Phase 3
+        }
+
+        if pose:
+            data["robot"] = pose.to_dict()
+
+        return data

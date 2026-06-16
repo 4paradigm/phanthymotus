@@ -14,8 +14,9 @@ import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { CameraRenderer, DepthRenderer } from './renderers/camera.js';
+import { HTMSGRenderer }    from './renderers/htmsg.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 
 let _panel    = null;
 let _renderer = null;

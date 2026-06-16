@@ -15,8 +15,9 @@ import { MappingRenderer }   from './renderers/mapping.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer } from './renderers/camera.js';
+import { HTMSGRenderer }    from './renderers/htmsg.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 const CELL_SIZE = 280;  // minimum px per grid cell
 const GAP = 12;         // px gap between cells
