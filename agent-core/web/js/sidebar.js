@@ -285,9 +285,12 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   const configKey = `${mcpId}:${toolName}`;
   const savedValues = _toolConfigs[configKey] || {};
 
+  // If all fields are instance-scope, show them here too (as shared defaults)
+  const hasSharedFields = Object.values(props).some(d => d.scope !== 'instance');
+
   for (const [key, def] of Object.entries(props)) {
-    // Skip instance-scope fields — those are configured per canvas card instance
-    if (def.scope === 'instance') continue;
+    // Skip instance-scope fields only if there are also shared fields
+    if (hasSharedFields && def.scope === 'instance') continue;
     const label = document.createElement('label');
     label.className = 'tool-config-label';
     label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
