@@ -129,12 +129,33 @@ export const PointCloudRenderer = {
   },
 
   onData(buffer) {
-    if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 4) return;
+    if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 8) return;
 
     const view = new DataView(buffer);
-    const numPoints = view.getUint32(0, true);
-    const expected = 4 + numPoints * 16;
-    if (buffer.byteLength < expected) return;
+    const firstUint = view.getUint32(0, true);
+
+    let numPoints, pointOffset, pointStride, hasIntensity;
+
+    if (firstUint < 256) {
+      // New PointCloud2 passthrough: [uint32 point_step][uint32 total_points][raw bytes]
+      pointStride = firstUint;
+      numPoints = view.getUint32(4, true);
+      pointOffset = 8;
+      hasIntensity = pointStride >= 16;  // intensity at offset 12 if point_step >= 16
+    } else {
+      // Legacy format: [uint32 N][float32 x,y,z,intensity × N]
+      numPoints = firstUint;
+      pointOffset = 4;
+      pointStride = 16;
+      hasIntensity = true;
+    }
+
+    const expected = pointOffset + numPoints * pointStride;
+    if (buffer.byteLength < expected) {
+      // Adjust numPoints to what's actually available
+      numPoints = Math.floor((buffer.byteLength - pointOffset) / pointStride);
+    }
+    if (numPoints <= 0) return;
 
     const startIdx = this._accumCount;
     const available = MAX_POINTS - startIdx;
@@ -145,11 +166,11 @@ export const PointCloudRenderer = {
     const col = this._accumCol;
 
     for (let i = 0; i < count; i++) {
-      const off = 4 + i * 16;
+      const off = pointOffset + i * pointStride;
       const x = view.getFloat32(off, true);
       const y = view.getFloat32(off + 4, true);
       const z = view.getFloat32(off + 8, true);
-      const intensity = view.getFloat32(off + 12, true);
+      const intensity = hasIntensity ? view.getFloat32(off + 12, true) : 0;
 
       const idx = (startIdx + i) * 3;
       // Livox frame: x forward, y right, z up → Three.js: x right, y up, z forward

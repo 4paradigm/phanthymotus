@@ -73,14 +73,22 @@ async function _fetchAndBuild() {
 
   const topicSet = new Set();
   _topicMcpMap = {};  // reset
+  // First pass: collect all topic_out
   for (const mcp of mcps) {
     const mcpOnCanvas = canvasCards.some(c => c.mcpId === mcp.id);
     if (!mcpOnCanvas) continue;
-    // Tool-level topics only
     for (const tool of (mcp.tools || [])) {
       if (!canvasTools.has(`${mcp.id}:${tool.name}`)) continue;
       for (const t of (tool.topic_out || [])) { if (t.topic) { topicSet.add(t.topic); _topicMcpMap[t.topic] = mcp.id; } }
-      for (const t of (tool.topic_in  || [])) { if (t.topic) { topicSet.add(t.topic); _topicMcpMap[t.topic] = mcp.id; } }
+    }
+  }
+  // Second pass: add topic_in only if not already covered by topic_out (avoid duplicates)
+  for (const mcp of mcps) {
+    const mcpOnCanvas = canvasCards.some(c => c.mcpId === mcp.id);
+    if (!mcpOnCanvas) continue;
+    for (const tool of (mcp.tools || [])) {
+      if (!canvasTools.has(`${mcp.id}:${tool.name}`)) continue;
+      for (const t of (tool.topic_in || [])) { if (t.topic && !topicSet.has(t.topic)) { topicSet.add(t.topic); _topicMcpMap[t.topic] = mcp.id; } }
     }
   }
   // Dynamic topics from canvas connections
