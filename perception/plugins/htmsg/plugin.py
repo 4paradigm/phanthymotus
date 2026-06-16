@@ -33,47 +33,48 @@ _LOW_LAT_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
-TOOLS = [
-    {
-        "name": "htmsg",
-        "type": "processor",
-        "description": "Scene graph — start/stop HTMSG pipeline, query objects and spatial relations",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["start", "stop", "info", "query", "query_near"],
-                    "description": "Action to perform"
+def _build_tools(namespace: str) -> list:
+    return [
+        {
+            "name": "htmsg",
+            "type": "processor",
+            "description": "Scene graph — start/stop HTMSG pipeline, query objects and spatial relations",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "info", "query", "query_near"],
+                        "description": "Action to perform"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Natural language query for semantic search (CLIP)"
+                    },
+                    "radius": {
+                        "type": "number",
+                        "description": "Search radius in meters (for query_near)"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Max results to return",
+                        "default": 5
+                    },
                 },
-                "text": {
-                    "type": "string",
-                    "description": "Natural language query for semantic search (CLIP)"
-                },
-                "radius": {
-                    "type": "number",
-                    "description": "Search radius in meters (for query_near)"
-                },
-                "top_k": {
-                    "type": "integer",
-                    "description": "Max results to return",
-                    "default": 5
-                },
+                "required": ["action"]
             },
-            "required": ["action"]
-        },
-        "topic_in": [
-            {"format": "sensor/pointcloud", "desc": "LiDAR point cloud input"},
-            {"format": "image/jpeg", "desc": "RGB camera input"},
-            {"format": "image/depth-z16", "desc": "Depth camera input"},
-        ],
-        "topic_out": [
-            {"format": "data/json", "desc": "HTMSG odometry pose"},
-            {"format": "data/json", "desc": "Scene graph updates"},
-            {"format": "data/json", "desc": "System status"},
-        ],
-    }
-]
+            "topic_in": [
+                {"topic": f"/{namespace}/lidar/cloud", "format": "sensor/pointcloud"},
+                {"topic": f"/{namespace}/camera/rgb", "format": "image/jpeg"},
+                {"topic": f"/{namespace}/camera/depth", "format": "image/depth-z16"},
+            ],
+            "topic_out": [
+                {"topic": f"/{namespace}/htmsg/odometry", "format": "data/json"},
+                {"topic": f"/{namespace}/htmsg/graph", "format": "data/json"},
+                {"topic": f"/{namespace}/htmsg/status", "format": "data/json"},
+            ],
+        }
+    ]
 
 
 class _HTMSGNode(Node):
@@ -151,7 +152,7 @@ class HTMSGPlugin:
         log.info(f"[htmsg] plugin init: namespace={namespace}")
 
     def get_tools(self) -> list:
-        return TOOLS
+        return _build_tools(self._namespace)
 
     def start(self) -> None:
         """Auto-start on plugin load."""
