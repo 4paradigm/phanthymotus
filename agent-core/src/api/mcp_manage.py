@@ -94,7 +94,7 @@ async def _ping_mcp_http(url: str) -> dict:
             async with session.post(url, json=tools_payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)
                 tools = [
-                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'inputSchema', 'configSchema', 'topic_out', 'topic_in')}
+                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'multiInstance', 'inputSchema', 'configSchema', 'topic_out', 'topic_in')}
                     for t in data.get('result', {}).get('tools', [])
                 ]
         except Exception as e:
