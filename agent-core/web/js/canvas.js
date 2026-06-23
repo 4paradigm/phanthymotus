@@ -12,7 +12,7 @@
  */
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 
 let _canvasEl   = null;
@@ -1188,8 +1188,8 @@ async function _startProject() {
     const mcp = _allMcps.find(m => m.id === c.mcpId);
     const tools = mcp?.tools || [];
     const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === c.toolName);
-    const hasConfigSchema = typeof toolObj === 'object' && !!toolObj.configSchema;
-    return hasConfigSchema && !isToolConfigured(c.mcpId, c.toolName);
+    const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
+    return hasSharedRequired(configSchema) && !isToolConfigured(c.mcpId, c.toolName);
   });
   if (unconfigured.length) {
     const names = unconfigured.map(c => c.toolName).join(', ');
