@@ -117,6 +117,15 @@ export function updateCanvasMcps(mcps) {
     const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
     if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  { card.topicIn  = liveTopicIn;  topicsChanged = true; }
     if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) { card.topicOut = liveTopicOut; topicsChanged = true; }
+
+    // Also trigger rebuild if instance-config button presence doesn't match live configSchema
+    if (!topicsChanged) {
+      const liveConfigSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
+      const liveHasInstanceFields = liveConfigSchema &&
+        Object.values(liveConfigSchema.properties || {}).some(d => d.scope === 'instance');
+      const hasBtn = !!card.el.querySelector('.canvas-card-instance-cfg-btn');
+      if (!!liveHasInstanceFields !== hasBtn) topicsChanged = true;
+    }
   }
   if (topicsChanged) {
     // Rebuild cards that have new port counts
@@ -952,6 +961,8 @@ function _redrawConnections() {
   if (!_connSvg) return;
   _connSvg.querySelectorAll('.connector-line, .connector-hit').forEach(l => l.remove());
   _viewport.querySelectorAll('.conn-delete-btn').forEach(b => b.remove());
+  // Force synchronous layout flush so compositor layer is invalidated immediately
+  void _connSvg.getBoundingClientRect();
 
   for (const conn of _connections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
