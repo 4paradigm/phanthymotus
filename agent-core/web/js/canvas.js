@@ -68,9 +68,14 @@ export async function initCanvas(initialMcps) {
     for (const c of saved) {
       _addCard(c, false);
     }
-    // Restore connections
-    _connections = layoutJson.data?.connections || [];
-    _execConnections = layoutJson.data?.execConnections || [];
+    // Restore connections — filter out any that reference cards no longer in the layout
+    const cardIds = new Set(_cards.map(c => c.id));
+    _connections = (layoutJson.data?.connections || []).filter(
+      c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId)
+    );
+    _execConnections = (layoutJson.data?.execConnections || []).filter(
+      c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId)
+    );
     _resolveAllTopics();
     _redrawConnections();
     // Restore viewport transform if saved
@@ -384,6 +389,8 @@ function _removeCard(id) {
   _resolveAllTopics();
   _redrawConnections();
   _syncEmptyState();
+  // Cancel any pending debounced save, then save immediately with updated state
+  clearTimeout(_saveTimer);
   _saveLayout();
 }
 
