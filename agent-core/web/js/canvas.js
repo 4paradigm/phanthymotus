@@ -1459,6 +1459,7 @@ function _makeDraggable(el, cardData) {
   header.addEventListener('pointerdown', (e) => {
     if (e.target.closest('.canvas-card-close')) return;
     if (e.target.closest('.canvas-card-info-btn')) return;
+    if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
     if (_projectRunning) return;
     e.preventDefault();
     e.stopPropagation();
