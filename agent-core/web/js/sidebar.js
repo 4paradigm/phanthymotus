@@ -475,8 +475,8 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
   titleEl.textContent = `实例配置 ${toolName}`;
   bodyEl.innerHTML = '';
 
-  const props = configSchema.properties || {};
-  const required = configSchema.required || [];
+  const props = (configSchema && configSchema.properties) || {};
+  const required = (configSchema && configSchema.required) || [];
   const configKey = `${mcpId}:${toolName}:${instanceId}`;
   const savedValues = _toolConfigs[configKey] || {};
 

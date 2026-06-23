@@ -551,7 +551,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (sensorInstanceCfgBtnEl) {
       sensorInstanceCfgBtnEl.addEventListener('click', (e) => {
         e.stopPropagation();
-        openInstanceConfigModal(mcpId, toolName, id, configSchema);
+        // Re-lookup configSchema at click time to avoid stale closure
+        const liveMcp2 = _allMcps.find(m => m.id === mcpId);
+        const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
+        const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
       });
     }
 
@@ -680,7 +684,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (instanceCfgBtnEl) {
       instanceCfgBtnEl.addEventListener('click', (e) => {
         e.stopPropagation();
-        openInstanceConfigModal(mcpId, toolName, id, configSchema);
+        // Re-lookup configSchema at click time to avoid stale closure
+        const liveMcp2 = _allMcps.find(m => m.id === mcpId);
+        const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
+        const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
       });
     }
 
