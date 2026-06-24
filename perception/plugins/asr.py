@@ -122,6 +122,20 @@ def _get_silero_model():
                 _silero_model = _silero_model.to(device)
     return _silero_model
 
+_silero_available: Optional[bool] = None  # None = untested
+
+def _check_silero_available() -> bool:
+    """Test whether silero_vad can be imported (torchaudio ABI may fail on Jetson)."""
+    global _silero_available
+    if _silero_available is None:
+        try:
+            import silero_vad  # noqa: F401
+            _silero_available = True
+        except Exception as e:
+            log.warning(f"[asr] silero_vad unavailable ({e}), falling back to webrtc VAD")
+            _silero_available = False
+    return _silero_available
+
 
 class VadSession:
     """VAD session supporting 'silero' (default) and 'webrtc' backends."""
@@ -152,7 +166,14 @@ class VadSession:
             aggressiveness = min(3, int(self._threshold * 4))
             self._model.set_mode(aggressiveness)
         else:
-            self._model = _get_silero_model()
+            if not _check_silero_available():
+                # Silero unavailable (e.g. torchaudio ABI mismatch on Jetson) — fall back
+                self._backend = 'webrtc'
+                import webrtcvad
+                self._model = webrtcvad.Vad()
+                self._model.set_mode(min(3, int(self._threshold * 4)))
+            else:
+                self._model = _get_silero_model()
 
     def _chunk_size(self) -> int:
         return self.WEBRTC_FRAME_BYTES if self._backend == 'webrtc' else 512 * 2

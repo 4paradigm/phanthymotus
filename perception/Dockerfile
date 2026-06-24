@@ -15,7 +15,7 @@ RUN pip3 install --no-cache-dir \
     --extra-index-url ${PYPI_MIRROR} \
     torch
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml requests "silero-vad<5.0" websockets webrtcvad websocket-client dashscope
+    pyyaml requests silero-vad websockets webrtcvad websocket-client dashscope
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 

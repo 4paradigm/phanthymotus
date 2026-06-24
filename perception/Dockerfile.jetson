@@ -42,12 +42,13 @@ RUN cd /ros_ws && \
     . /opt/ros/humble/install/setup.bash && \
     colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
 
-# ── Python deps (silero-vad --no-deps to avoid pulling CPU torch) ──
-# Pin silero-vad<5.0: v5+ imports torchaudio at module load, which is ABI-
-# incompatible with the Jetson NVIDIA torch build. v4.x uses torch directly.
+# ── Python deps ────────────────────────────────────────────────────
+# silero-vad is installed but may fail to import torchaudio on Jetson
+# (ABI mismatch with NVIDIA torch); asr.py detects this at runtime and
+# falls back to webrtcvad automatically.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests websockets webrtcvad websocket-client dashscope && \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} "silero-vad<5.0"
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
 
 # ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
