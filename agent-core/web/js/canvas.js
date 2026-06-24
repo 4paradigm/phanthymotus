@@ -1293,8 +1293,18 @@ async function _startProject() {
       args = {};
     }
     args.instance_id = card.id;
-    _triggerAction(card.mcpId, card.toolName, 'start', args);
+    const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
+    // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
+    const parsed = _parseMcpCallResult(startResult);
+    if (parsed?.topic_out?.some(t => t.topic)) {
+      card.topicOut = parsed.topic_out;
+      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+      parsed.topic_out.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      _redrawConnections();
+    }
   }
+  // Save layout after all cards started so monitor-dashboard can pick up inferred topic paths
+  _debouncedSave();
   // 持久化运行状态
   fetch('/api/config/project-running', {
     method: 'PUT', headers: {'Content-Type': 'application/json'},
@@ -1342,13 +1352,15 @@ function _syncProjectBtn() {
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
   try {
-    await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+    const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tool: toolName, arguments: { action, ...extraArgs } }),
     });
+    return await res.json();
   } catch (err) {
     console.error(`[canvas] ${action} call failed:`, err);
+    return null;
   }
 }
 
