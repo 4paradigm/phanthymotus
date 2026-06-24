@@ -122,6 +122,11 @@ export function updateCanvasMcps(mcps) {
     if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
       if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
     }
+    // Re-fetch driver-inferred topics for cards that still have no real topic path
+    // (covers the case where page loaded before driver came online)
+    if (!card.topicOut?.some(t => t.topic) && (liveTopicOut?.length || toolObj?.multiInstance)) {
+      _fetchTopicsFromDriver(card, '');
+    }
 
     // Also trigger rebuild if instance-config button presence doesn't match live configSchema
     if (!topicsChanged) {
@@ -377,10 +382,12 @@ function _addCard(data, save = true) {
   _cards.push(cardData);
   _makeDraggable(el, cardData);
 
-  // For multiInstance tools, call info(instance_id) to get inferred topics from driver
+  // Call info(instance_id) to get driver-inferred topics for ALL tools with topic_out.
+  // Static tools return their fixed topic; dynamic/multiInstance tools return instance-specific paths.
+  // This ensures card.topicOut always reflects the driver's authoritative topic path.
   const _mcp2 = _allMcps.find(m => m.id === mcpId);
   const _toolObj2 = (_mcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
-  if (_toolObj2?.multiInstance) {
+  if (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length || _toolObj2?.multiInstance) {
     _fetchTopicsFromDriver(cardData, '');
   }
 
@@ -432,14 +439,18 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
   const hasInstanceFields = configSchema && Object.values(configSchema.properties || {}).some(d => d.scope === 'instance');
 
-  // Auto-classify perception tools as processor
-  // Priority: tool-level (live) > persisted card-level > single-tool MCP fallback
-  // For bundle MCPs (multiple tools), never fall back to MCP aggregate topics.
+  // Priority: card saved topics (driver-inferred, real paths) > static tool definition > MCP fallback
+  // Static tool.topic_out may have empty topic paths for multiInstance/dynamic tools,
+  // so prefer savedTopicOut when it has real paths.
   const toolTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
   const toolTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
   const isBundleMcp = (mcp?.tools || []).length > 1;
-  const topicIn  = toolTopicIn  || (savedTopicIn?.length  ? savedTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
-  const topicOut = toolTopicOut || (savedTopicOut?.length ? savedTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
+  const savedOutHasReal = savedTopicOut?.some(t => t.topic);
+  const staticOutHasReal = toolTopicOut?.some(t => t.topic);
+  const savedInHasReal = savedTopicIn?.some(t => t.topic);
+  const staticInHasReal = toolTopicIn?.some(t => t.topic);
+  const topicIn  = (savedInHasReal  ? savedTopicIn  : null) || (staticInHasReal  ? toolTopicIn  : null) || (savedTopicIn?.length  ? savedTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
+  const topicOut = (savedOutHasReal ? savedTopicOut : null) || (staticOutHasReal ? toolTopicOut : null) || (savedTopicOut?.length ? savedTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
   const effectiveType = toolType || (topicIn.length && topicOut.length ? 'processor' : topicOut.length ? 'sensor' : topicIn.length ? 'actuator' : '');
 
   el.className = `canvas-card${effectiveType ? ' ' + effectiveType : ''}`;
@@ -1152,10 +1163,16 @@ function _resolveAllTopics() {
     const tools = mcp?.tools || [];
     const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
     const toolTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
-    // Priority: tool-level (live) > persisted card-level > single-tool MCP fallback
+    // Priority: card.topicOut (driver-inferred, has real paths) > static tool definition > MCP fallback
+    // card.topicOut is populated by _fetchTopicsFromDriver; static tool.topic_out may have empty topic paths
+    // for multiInstance tools, so only fall back to it when card has no real topics.
     const isBundleMcp = (mcp?.tools || []).length > 1;
     const toolType = (typeof toolObj === 'object' ? toolObj.type : '') || '';
-    const topicOut = toolTopicOut || (card.topicOut?.length ? card.topicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
+    const cardHasRealTopic = card.topicOut?.some(t => t.topic);
+    const staticHasRealTopic = toolTopicOut?.some(t => t.topic);
+    const topicOut = (cardHasRealTopic ? card.topicOut : null)
+      || (staticHasRealTopic ? toolTopicOut : null)
+      || (card.topicOut?.length ? card.topicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
 
     const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
     for (let i = 0; i < outPorts.length; i++) {
