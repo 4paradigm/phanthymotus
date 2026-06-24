@@ -522,7 +522,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     const sensorRequired = schema?.required || [];
     const _SENSOR_SYS_ACTIONS = new Set(['start', 'stop', 'info', 'config']);
     const sensorActionDef = sensorProps.action;
-    const hasSensorActions = sensorActionDef?.enum?.some(a => !_SENSOR_SYS_ACTIONS.has(a));
+    // Support both enum (plain list) and oneOf [{const, title}] formats
+    const _actionVals = def => def?.enum || (def?.oneOf?.map(o => o.const).filter(v => v != null)) || [];
+    const hasSensorActions = _actionVals(sensorActionDef).some(a => !_SENSOR_SYS_ACTIONS.has(a));
 
     // Instance config button (for multiInstance sensors with instance-scope fields)
     const sensorInstanceCfgBtn = hasInstanceFields
@@ -535,10 +537,15 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const isReq = sensorRequired.includes(key);
         const label = key + (isReq ? ' *' : '');
         let inputHtml;
-        if (def.enum) {
-          const enumVals = key === 'action' ? def.enum.filter(v => !_SENSOR_SYS_ACTIONS.has(v)) : def.enum;
+        const rawVals = _actionVals(def);
+        if (rawVals.length || def.enum || def.oneOf) {
+          // Build label map from oneOf titles
+          const titleMap = {};
+          (def.oneOf || []).forEach(o => { if (o.const != null) titleMap[o.const] = o.title || o.const; });
+          const allVals = rawVals.length ? rawVals : (def.enum || []);
+          const enumVals = key === 'action' ? allVals.filter(v => !_SENSOR_SYS_ACTIONS.has(v)) : allVals;
           if (!enumVals.length) return '';
-          const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(v)}</option>`).join('');
+          const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(titleMap[v] || v)}</option>`).join('');
           inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
