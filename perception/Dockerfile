@@ -13,7 +13,7 @@ RUN apt-get update && \
 RUN pip3 install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url ${PYPI_MIRROR} \
-    torch
+    torch torchaudio
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests silero-vad websockets webrtcvad websocket-client dashscope
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \

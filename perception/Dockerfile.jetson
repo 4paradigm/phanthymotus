@@ -45,7 +45,11 @@ RUN cd /ros_ws && \
 # ── Python deps (silero-vad --no-deps to avoid pulling CPU torch) ──
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests websockets webrtcvad websocket-client dashscope && \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad && \
+    pip3 install --no-cache-dir --no-deps \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url ${PYPI_MIRROR} \
+    torchaudio
 
 # ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
