@@ -486,7 +486,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
         const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
-        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut });
+        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
   } else if (effectiveType === 'sensor') {
@@ -559,7 +559,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
         const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
-        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut });
+        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
 
@@ -692,7 +692,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
         const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
-        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut });
+        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
 
@@ -1388,7 +1388,7 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
     const res = await fetch(`/api/mcp/${encodeURIComponent(mcp.id)}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool: toolName, arguments: { action: 'info' } }),
+      body: JSON.stringify({ tool: toolName, arguments: { action: 'info', instance_id: opts.instanceId || '' } }),
     });
     const json = await res.json();
     const info = _parseMcpCallResult(json);
