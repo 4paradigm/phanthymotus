@@ -485,7 +485,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       const liveMcp = _allMcps.find(m => m.id === mcpId);
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
-        const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
+        const liveCard = _cards.find(c => c.id === id);
+        const liveTopicOut = (liveCard?.topicOut?.length ? liveCard.topicOut : null)
+          || [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
         _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
@@ -558,7 +560,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       const liveMcp = _allMcps.find(m => m.id === mcpId);
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
-        const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
+        const liveCard = _cards.find(c => c.id === id);
+        const liveTopicOut = (liveCard?.topicOut?.length ? liveCard.topicOut : null)
+          || [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
         _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
@@ -691,7 +695,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       const liveMcp = _allMcps.find(m => m.id === mcpId);
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
-        const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
+        const liveCard = _cards.find(c => c.id === id);
+        const liveTopicOut = (liveCard?.topicOut?.length ? liveCard.topicOut : null)
+          || [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
         _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
