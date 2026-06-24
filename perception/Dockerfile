@@ -19,6 +19,12 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 
+# Pre-download silero VAD model via torch.hub (avoids runtime network requirement)
+RUN python3 -c "\
+import torch; \
+torch.hub.load('snakers4/silero-vad', 'silero_vad', source='github', trust_repo=True); \
+print('silero hub model cached')"
+
 WORKDIR /work
 COPY main.py    /work/main.py
 COPY plugins/   /work/plugins/

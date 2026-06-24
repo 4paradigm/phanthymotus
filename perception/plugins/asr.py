@@ -115,8 +115,22 @@ def _get_silero_model():
     global _silero_model
     with _silero_lock:
         if _silero_model is None:
-            from silero_vad import load_silero_vad
-            _silero_model = load_silero_vad()
+            import torch
+            try:
+                # Preferred: use the silero_vad package directly
+                from silero_vad import load_silero_vad
+                _silero_model = load_silero_vad()
+                log.info("[asr] silero VAD loaded via silero_vad package")
+            except Exception as e:
+                # Fallback: load via torch.hub (only requires torch, no torchaudio)
+                log.warning(f"[asr] silero_vad package unavailable ({e}), loading via torch.hub")
+                _silero_model, _ = torch.hub.load(
+                    repo_or_dir='snakers4/silero-vad',
+                    model='silero_vad',
+                    source='github',
+                    trust_repo=True,
+                )
+                log.info("[asr] silero VAD loaded via torch.hub")
             device = _get_torch_device()
             if device.type == 'cuda':
                 _silero_model = _silero_model.to(device)
@@ -125,14 +139,14 @@ def _get_silero_model():
 _silero_available: Optional[bool] = None  # None = untested
 
 def _check_silero_available() -> bool:
-    """Test whether silero_vad can be imported (torchaudio ABI may fail on Jetson)."""
+    """Test whether silero VAD (package or torch.hub) can be loaded."""
     global _silero_available
     if _silero_available is None:
         try:
-            import silero_vad  # noqa: F401
+            _get_silero_model()
             _silero_available = True
         except Exception as e:
-            log.warning(f"[asr] silero_vad unavailable ({e}), falling back to webrtc VAD")
+            log.warning(f"[asr] silero VAD unavailable ({e}), falling back to webrtc VAD")
             _silero_available = False
     return _silero_available
 

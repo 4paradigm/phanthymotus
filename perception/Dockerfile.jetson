@@ -44,11 +44,16 @@ RUN cd /ros_ws && \
 
 # ── Python deps ────────────────────────────────────────────────────
 # silero-vad is installed but may fail to import torchaudio on Jetson
-# (ABI mismatch with NVIDIA torch); asr.py detects this at runtime and
-# falls back to webrtcvad automatically.
+# (ABI mismatch with NVIDIA torch); asr.py falls back to torch.hub load.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests websockets webrtcvad websocket-client dashscope && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
+
+# ── Pre-download silero VAD model via torch.hub (avoids runtime network req) ──
+RUN python3 -c "\
+import torch; \
+torch.hub.load('snakers4/silero-vad', 'silero_vad', source='github', trust_repo=True); \
+print('silero hub model cached')"
 
 # ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
