@@ -176,9 +176,12 @@ async def _ping_mcp_http(url: str) -> dict:
                         continue
                     if t.get('name') != tool_prefix:
                         continue
-                    # Merge topic paths from info result into tool's topic_in/topic_out
-                    info_tin = result.get('topic_in', [])
-                    info_tout = result.get('topic_out', [])
+                    # Merge topic paths from info result into tool's topic_in/topic_out.
+                    # Only back-fill when info() returns real (non-empty) topic paths;
+                    # idle multiInstance tools report empty strings which must not overwrite
+                    # the static format-only schema declarations.
+                    info_tin  = [ti for ti in result.get('topic_in',  []) if ti.get('topic')]
+                    info_tout = [ti for ti in result.get('topic_out', []) if ti.get('topic')]
                     if info_tin:
                         t['topic_in'] = info_tin
                     if info_tout:
