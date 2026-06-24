@@ -122,15 +122,20 @@ def _get_silero_model():
                 _silero_model = load_silero_vad()
                 log.info("[asr] silero VAD loaded via silero_vad package")
             except Exception as e:
-                # Fallback: load via torch.hub (only requires torch, no torchaudio)
-                log.warning(f"[asr] silero_vad package unavailable ({e}), loading via torch.hub")
-                _silero_model, _ = torch.hub.load(
-                    repo_or_dir='snakers4/silero-vad',
-                    model='silero_vad',
-                    source='github',
-                    trust_repo=True,
-                )
-                log.info("[asr] silero VAD loaded via torch.hub")
+                # Fallback: load model file from silero_vad package data directory
+                # (works even when torchaudio is ABI-incompatible, as on Jetson)
+                log.warning(f"[asr] silero_vad package unavailable ({e}), loading .jit model directly")
+                import pathlib
+                try:
+                    import silero_vad as _sv
+                    data_dir = pathlib.Path(_sv.__file__).parent / 'data'
+                except Exception:
+                    data_dir = pathlib.Path('/tmp/silero_vad_data')
+                jit_file = next(data_dir.glob('*.jit'), None) or next(data_dir.glob('*.pt'), None)
+                if jit_file is None:
+                    raise RuntimeError(f"silero model file not found in {data_dir}")
+                _silero_model = torch.jit.load(str(jit_file), map_location='cpu')
+                log.info(f"[asr] silero VAD loaded from {jit_file}")
             device = _get_torch_device()
             if device.type == 'cuda':
                 _silero_model = _silero_model.to(device)
