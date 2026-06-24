@@ -114,14 +114,21 @@ export function updateCanvasMcps(mcps) {
     // Update persisted topics from live tool data (when driver comes online)
     const tools = mcp.tools || [];
     const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
-    const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
-    const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
-    if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  {
-      // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
-      if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
-    }
-    if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
-      if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
+
+    // multiInstance tools have per-card instance topics (set by connections + start()).
+    // Tool-schema-level data from pings must NOT overwrite instance-specific topics.
+    if (typeof toolObj === 'object' && toolObj.multiInstance) {
+      // (skip topic update — fall through to configSchema check below)
+    } else {
+      const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
+      const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
+      if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  {
+        // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
+        if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
+      }
+      if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
+        if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
+      }
     }
     // Re-fetch driver-inferred topics for static (non-multiInstance) cards that still have no real topic path
     // For multiInstance tools, topics are input-dependent and must be resolved after connection
