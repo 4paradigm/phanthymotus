@@ -122,9 +122,9 @@ export function updateCanvasMcps(mcps) {
     if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
       if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
     }
-    // Re-fetch driver-inferred topics for cards that still have no real topic path
-    // (covers the case where page loaded before driver came online)
-    if (!card.topicOut?.some(t => t.topic) && (liveTopicOut?.length || toolObj?.multiInstance)) {
+    // Re-fetch driver-inferred topics for static (non-multiInstance) cards that still have no real topic path
+    // For multiInstance tools, topics are input-dependent and must be resolved after connection
+    if (!card.topicOut?.some(t => t.topic) && liveTopicOut?.length && !toolObj?.multiInstance) {
       _fetchTopicsFromDriver(card, '');
     }
 
@@ -382,12 +382,12 @@ function _addCard(data, save = true) {
   _cards.push(cardData);
   _makeDraggable(el, cardData);
 
-  // Call info(instance_id) to get driver-inferred topics for ALL tools with topic_out.
-  // Static tools return their fixed topic; dynamic/multiInstance tools return instance-specific paths.
-  // This ensures card.topicOut always reflects the driver's authoritative topic path.
+  // Call info(instance_id) to get driver-inferred topics for static tools.
+  // For multiInstance tools, topics depend on the connected input_topic — skip here
+  // and let _fetchTopicsFromDriver be called after a port connection is made.
   const _mcp2 = _allMcps.find(m => m.id === mcpId);
   const _toolObj2 = (_mcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
-  if (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length || _toolObj2?.multiInstance) {
+  if (!_toolObj2?.multiInstance && (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length)) {
     _fetchTopicsFromDriver(cardData, '');
   }
 
