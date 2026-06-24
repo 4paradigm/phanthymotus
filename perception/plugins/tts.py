@@ -444,6 +444,7 @@ class TTSPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            input_topic = args.get("input_topic", "")
             if instance_id and instance_id in self._nodes:
                 node = self._nodes[instance_id]
                 return {
@@ -460,8 +461,9 @@ class TTSPlugin:
                 states = list(set(n.state for n in self._nodes.values()))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
-                topics_in = [{"topic": "", "format": "data/json", "desc": ""}]
-                topics_out = [{"topic": "/perception/tts", "format": "audio/pcm-16k", "desc": ""}]
+                inferred_out = f"{input_topic}/tts" if input_topic else ""
+                topics_in = [{"topic": input_topic, "format": "data/json", "desc": ""}]
+                topics_out = [{"topic": inferred_out, "format": "audio/pcm-16k", "desc": ""}]
                 state = "idle"
             return {
                 "name": "TTS", "manufacture": "Embodied", "model": "tts",

@@ -450,6 +450,7 @@ class ASRPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            input_topic = args.get("input_topic", "")
             if instance_id and instance_id in self._nodes:
                 node = self._nodes[instance_id]
                 return {
@@ -466,8 +467,9 @@ class ASRPlugin:
                 states = list(set(n.state for n in self._nodes.values()))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
-                topics_in = [{"topic": "", "format": "audio/pcm-16k", "desc": ""}]
-                topics_out = [{"topic": "", "format": "data/json", "desc": ""}]
+                inferred_out = f"{input_topic}/asr" if input_topic else ""
+                topics_in = [{"topic": input_topic, "format": "audio/pcm-16k", "desc": ""}]
+                topics_out = [{"topic": inferred_out, "format": "data/json", "desc": ""}]
                 state = "idle"
             return {
                 "name": "ASR", "manufacture": "Embodied", "model": "asr",

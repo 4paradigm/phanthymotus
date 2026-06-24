@@ -401,14 +401,6 @@ async def _do_ping(mcp_id: str) -> dict:
             if not t.get('topic'):
                 t['topic'] = upstream_topic
 
-    # Derive empty topic_out from topic_in; suffix is server name or mcp_id
-    in_topic = topic_in[0].get('topic', '') if topic_in else ''
-    if in_topic:
-        suffix_name = caps.get('server_name') or target.get('name') or mcp_id
-        for t in topic_out:
-            if not t.get('topic'):
-                t['topic'] = in_topic + '/' + suffix_name
-
     # Log only when tools change (first ping or tool list updated)
     current_tool_names = [t.get('name', '') if isinstance(t, dict) else t for t in caps['tools']]
     prev_tool_names = _last_tool_names.get(mcp_id)

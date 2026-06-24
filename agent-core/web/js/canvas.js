@@ -371,6 +371,14 @@ function _addCard(data, save = true) {
   const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData };
   _cards.push(cardData);
   _makeDraggable(el, cardData);
+
+  // For multiInstance tools, call info(instance_id) to get inferred topics from driver
+  const _mcp2 = _allMcps.find(m => m.id === mcpId);
+  const _toolObj2 = (_mcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
+  if (_toolObj2?.multiInstance) {
+    _fetchTopicsFromDriver(cardData, '');
+  }
+
   _syncEmptyState();
 
   if (save) _saveLayout();
@@ -890,6 +898,10 @@ function _setupPortDrag() {
           const resolvedTopic = resolvedInPort?.dataset.topic || _draggingConn.topic;
           _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic, instance_id: toCardData.id });
         }
+        // Ask driver to infer output topics for the destination card based on connected input topic
+        if (toCardData && _draggingConn.topic) {
+          _fetchTopicsFromDriver(toCardData, _draggingConn.topic);
+        }
       }
     }
 
@@ -1165,17 +1177,6 @@ function _resolveAllTopics() {
     if (visited.has(card.id)) continue;
     visited.add(card.id);
 
-    // Derive out-port topics from in-port topic (if not already static)
-    const inPorts = [...card.el.querySelectorAll('.canvas-port.in')];
-    // Use first connected in-port topic as derivation source
-    const inTopic = inPorts.find(p => p.dataset.topic)?.dataset.topic || '';
-
-    for (const outPort of card.el.querySelectorAll('.canvas-port.out')) {
-      if (!outPort.dataset.topic && inTopic) {
-        outPort.dataset.topic = inTopic + '/' + (card.toolName || 'output');
-      }
-    }
-
     // Propagate to downstream cards
     for (const conn of outgoing[card.id]) {
       const fromPort = card.el.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
@@ -1320,6 +1321,32 @@ async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
     });
   } catch (err) {
     console.error(`[canvas] ${action} call failed:`, err);
+  }
+}
+
+/**
+ * Ask the driver to infer topics for a card given an optional input topic.
+ * Used for multiInstance sensors (_addCard) and processors (after wiring).
+ * Updates card.topicOut and DOM out-ports if driver returns non-empty topics.
+ */
+async function _fetchTopicsFromDriver(card, inputTopic) {
+  try {
+    const resp = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool: card.toolName, arguments: { action: 'info', instance_id: card.id, input_topic: inputTopic } }),
+    });
+    const data = await resp.json();
+    const topicOut = data?.topic_out || data?.result?.topic_out;
+    if (topicOut?.some(t => t.topic)) {
+      card.topicOut = topicOut;
+      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+      topicOut.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      _redrawConnections();
+      _debouncedSave();
+    }
+  } catch (e) {
+    console.warn('[canvas] info fetch failed:', e);
   }
 }
 
