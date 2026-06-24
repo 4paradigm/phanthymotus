@@ -115,8 +115,13 @@ export function updateCanvasMcps(mcps) {
     const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
     const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
     const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
-    if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  { card.topicIn  = liveTopicIn;  topicsChanged = true; }
-    if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) { card.topicOut = liveTopicOut; topicsChanged = true; }
+    if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  {
+      // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
+      if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
+    }
+    if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
+      if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
+    }
 
     // Also trigger rebuild if instance-config button presence doesn't match live configSchema
     if (!topicsChanged) {
