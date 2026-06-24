@@ -269,4 +269,4 @@ app.mount('/', _HTTPOnlyStaticFiles(directory='./web', html=True), name='web')
 
 # ========== 启动服务 ==========
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=15678)
+    uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None)
