@@ -1303,8 +1303,8 @@ async function _startProject() {
       _redrawConnections();
     }
   }
-  // Save layout after all cards started so monitor-dashboard can pick up inferred topic paths
-  _debouncedSave();
+  // Immediately persist layout so monitor-dashboard can read inferred topic paths
+  await _saveLayout();
   // 持久化运行状态
   fetch('/api/config/project-running', {
     method: 'PUT', headers: {'Content-Type': 'application/json'},

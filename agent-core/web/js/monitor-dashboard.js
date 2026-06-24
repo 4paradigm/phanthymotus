@@ -73,20 +73,22 @@ async function _fetchAndBuild() {
 
   const topicSet = new Set();
   _topicMcpMap = {};  // reset
-  // First pass: collect all topic_out
+  // First pass: collect all topic_out from static tool definitions (non-multiInstance)
   for (const mcp of mcps) {
     const mcpOnCanvas = canvasCards.some(c => c.mcpId === mcp.id);
     if (!mcpOnCanvas) continue;
     for (const tool of (mcp.tools || [])) {
+      if (tool.multiInstance) continue;  // handled via card instances below
       if (!canvasTools.has(`${mcp.id}:${tool.name}`)) continue;
       for (const t of (tool.topic_out || [])) { if (t.topic) { topicSet.add(t.topic); _topicMcpMap[t.topic] = mcp.id; } }
     }
   }
-  // Second pass: add topic_in only if not already covered by topic_out (avoid duplicates)
+  // Second pass: add topic_in from static tools only if not already covered
   for (const mcp of mcps) {
     const mcpOnCanvas = canvasCards.some(c => c.mcpId === mcp.id);
     if (!mcpOnCanvas) continue;
     for (const tool of (mcp.tools || [])) {
+      if (tool.multiInstance) continue;
       if (!canvasTools.has(`${mcp.id}:${tool.name}`)) continue;
       for (const t of (tool.topic_in || [])) { if (t.topic && !topicSet.has(t.topic)) { topicSet.add(t.topic); _topicMcpMap[t.topic] = mcp.id; } }
     }
@@ -95,9 +97,12 @@ async function _fetchAndBuild() {
   for (const conn of connections) {
     if (conn.fromTopic) topicSet.add(conn.fromTopic);
   }
-  // Instance-specific topics persisted in canvas card data (e.g. multi-instance tools like ext_mic/ext_camera)
+  // Instance-specific topics from each canvas card (covers multiInstance tools like ASR/TTS)
   for (const card of canvasCards) {
     for (const t of (card.topicOut || [])) {
+      if (t.topic && !topicSet.has(t.topic)) { topicSet.add(t.topic); _topicMcpMap[t.topic] = card.mcpId; }
+    }
+    for (const t of (card.topicIn || [])) {
       if (t.topic && !topicSet.has(t.topic)) { topicSet.add(t.topic); _topicMcpMap[t.topic] = card.mcpId; }
     }
   }
