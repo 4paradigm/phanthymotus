@@ -32,6 +32,7 @@ let _draggingConn = null; // {fromCardId, fromPortEl, format, topic, tempPath, t
 let _projectRunning = false;
 
 export function isProjectRunning() { return _projectRunning; }
+export function redrawCanvas() { _redrawConnections(); }
 
 // ── Viewport transform state ──────────────────────────────────────────────────
 let _zoom = 1;
