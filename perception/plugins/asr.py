@@ -125,11 +125,12 @@ def _get_silero_model():
                 # Fallback: load model file from silero_vad package data directory
                 # (works even when torchaudio is ABI-incompatible, as on Jetson)
                 log.warning(f"[asr] silero_vad package unavailable ({e}), loading .jit model directly")
-                import pathlib
-                try:
-                    import silero_vad as _sv
-                    data_dir = pathlib.Path(_sv.__file__).parent / 'data'
-                except Exception:
+                import pathlib, importlib.util
+                # Use find_spec to locate the package without importing it (avoids torchaudio)
+                spec = importlib.util.find_spec('silero_vad')
+                if spec and spec.submodule_search_locations:
+                    data_dir = pathlib.Path(list(spec.submodule_search_locations)[0]) / 'data'
+                else:
                     data_dir = pathlib.Path('/tmp/silero_vad_data')
                 jit_file = next(data_dir.glob('*.jit'), None) or next(data_dir.glob('*.pt'), None)
                 if jit_file is None:
