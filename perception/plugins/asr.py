@@ -73,11 +73,13 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "provider": {"type": "string", "enum": ["openai", "openai_omni"], "description": "ASR 服务商", "scope": "shared"},
-                "url":      {"type": "string", "description": "API URL", "scope": "shared"},
-                "key":      {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
-                "model":    {"type": "string", "description": "模型名称", "scope": "instance"},
-                "language": {"type": "string", "description": "语言", "default": "zh-CN", "scope": "instance"},
+                "provider":      {"type": "string", "enum": ["openai", "openai_omni"], "description": "ASR 服务商", "scope": "shared"},
+                "url":           {"type": "string", "description": "API URL", "scope": "shared"},
+                "key":           {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
+                "model":         {"type": "string", "description": "模型名称", "scope": "instance"},
+                "language":      {"type": "string", "description": "语言", "default": "zh-CN", "scope": "instance"},
+                "vad_threshold": {"type": "number", "description": "VAD 语音判断阈值 (0–1，越高越严格，噪声大时调高)", "default": 0.5, "scope": "instance"},
+                "vad_silence_ms":{"type": "integer", "description": "静音判断时长 (ms)，超过此时长才认为句子结束", "default": 400, "scope": "instance"},
             },
             "required": ["provider"]
         },
@@ -534,14 +536,20 @@ class ASRPlugin:
                 # Determine adapter: use instance-specific config if available
                 adapter = self._adapter
                 language = self._language
+                vad_threshold = self._vad_threshold
+                vad_silence_ms = self._vad_silence_ms
                 if instance_id and instance_id in self._instance_configs:
                     icfg = self._instance_configs[instance_id]
                     inst_adapter = _build_asr_adapter(icfg)
                     if inst_adapter:
                         adapter = inst_adapter
                     language = icfg.get('language', language)
+                    if 'vad_threshold' in icfg:
+                        vad_threshold = float(icfg['vad_threshold'])
+                    if 'vad_silence_ms' in icfg:
+                        vad_silence_ms = int(icfg['vad_silence_ms'])
                 node = _ASRNode(input_topic, adapter, language,
-                                self._vad_backend, self._vad_threshold, self._vad_silence_ms,
+                                self._vad_backend, vad_threshold, vad_silence_ms,
                                 node_suffix=node_key.replace('/', '_').replace('-', '_'))
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
@@ -567,14 +575,13 @@ class ASRPlugin:
             return {"state": "idle"}
 
         elif action == "config":
-            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v}
+            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and v != ''}
             if instance_id:
                 # Per-instance config
                 self._instance_configs[instance_id] = cfg
                 # If instance is running, restart with new config
                 if instance_id in self._nodes:
                     node = self._nodes[instance_id]
-                    input_topic = node._input_topic
                     node.stop()
                     self._executor.remove_node(node)
                     del self._nodes[instance_id]
@@ -583,6 +590,10 @@ class ASRPlugin:
                 # Shared/global config
                 self._adapter = _build_asr_adapter(cfg)
                 self._language = cfg.get('language', self._language)
+                if 'vad_threshold' in cfg:
+                    self._vad_threshold = float(cfg['vad_threshold'])
+                if 'vad_silence_ms' in cfg:
+                    self._vad_silence_ms = int(cfg['vad_silence_ms'])
                 # Stop all nodes (they'll use new config on next start)
                 for key in list(self._nodes.keys()):
                     self._nodes[key].stop()
