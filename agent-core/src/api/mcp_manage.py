@@ -180,6 +180,10 @@ async def _ping_mcp_http(url: str) -> dict:
                     # Only back-fill when info() returns real (non-empty) topic paths;
                     # idle multiInstance tools report empty strings which must not overwrite
                     # the static format-only schema declarations.
+                    # multiInstance tools have per-instance topics tracked on canvas cards;
+                    # aggregated info() mixes all instances and must not pollute the static schema.
+                    if t.get('multiInstance'):
+                        break
                     info_tin  = [ti for ti in result.get('topic_in',  []) if ti.get('topic')]
                     info_tout = [ti for ti in result.get('topic_out', []) if ti.get('topic')]
                     if info_tin:
