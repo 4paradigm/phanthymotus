@@ -43,13 +43,11 @@ RUN cd /ros_ws && \
     colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 # ── Python deps (silero-vad --no-deps to avoid pulling CPU torch) ──
+# Pin silero-vad<5.0: v5+ imports torchaudio at module load, which is ABI-
+# incompatible with the Jetson NVIDIA torch build. v4.x uses torch directly.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests websockets webrtcvad websocket-client dashscope && \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad && \
-    pip3 install --no-cache-dir --no-deps \
-    --index-url https://download.pytorch.org/whl/cpu \
-    --extra-index-url ${PYPI_MIRROR} \
-    torchaudio
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} "silero-vad<5.0"
 
 # ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
