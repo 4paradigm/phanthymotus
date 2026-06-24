@@ -383,11 +383,12 @@ function _addCard(data, save = true) {
   _makeDraggable(el, cardData);
 
   // Call info(instance_id) to get driver-inferred topics for static tools.
-  // For multiInstance tools, topics depend on the connected input_topic — skip here
-  // and let _fetchTopicsFromDriver be called after a port connection is made.
+  // For multiInstance processors, topics depend on the connected input_topic — skip here.
+  // For multiInstance sensors (ext_mic, ext_camera), the topic is deterministic from instance_id — fetch eagerly.
   const _mcp2 = _allMcps.find(m => m.id === mcpId);
   const _toolObj2 = (_mcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
-  if (!_toolObj2?.multiInstance && (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length)) {
+  const _isMultiInstanceSensor = _toolObj2?.multiInstance && _toolObj2?.type === 'sensor';
+  if ((!_toolObj2?.multiInstance || _isMultiInstanceSensor) && (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length)) {
     _fetchTopicsFromDriver(cardData, '');
   }
 
@@ -1300,6 +1301,7 @@ async function _startProject() {
       card.topicOut = parsed.topic_out;
       const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
       parsed.topic_out.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      _resolveAllTopics();  // re-propagate updated topic paths into conn.fromTopic before next card starts
       _redrawConnections();
     }
   }
