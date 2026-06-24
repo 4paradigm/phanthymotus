@@ -454,7 +454,17 @@ class TTSPlugin:
                     "topic_out": [{"topic": node._output_topic, "format": "audio/pcm-16k", "desc": ""}],
                     "desc": "TTS service — converts text to audio/pcm-16k",
                 }
-            # Aggregate info
+            if instance_id:
+                # Instance requested but not running — return inferred topics for this instance only.
+                inferred_out = f"{input_topic}/tts" if input_topic else ""
+                return {
+                    "name": "TTS", "manufacture": "Embodied", "model": "tts",
+                    "state": "idle",
+                    "topic_in":  [{"topic": input_topic,  "format": "data/json",     "desc": ""}] if input_topic else [],
+                    "topic_out": [{"topic": inferred_out, "format": "audio/pcm-16k", "desc": ""}] if inferred_out else [],
+                    "desc": "TTS service — converts text to audio/pcm-16k",
+                }
+            # Aggregate info (no instance_id = ping/overview only)
             if self._nodes:
                 topics_in = [{"topic": n._input_topic, "format": "data/json", "desc": ""} for n in self._nodes.values()]
                 topics_out = [{"topic": n._output_topic, "format": "audio/pcm-16k", "desc": ""} for n in self._nodes.values()]
