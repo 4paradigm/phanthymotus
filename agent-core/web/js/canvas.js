@@ -623,7 +623,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (sensorExecBtn) {
       sensorExecBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        await _executeCard(el, mcpId, toolName);
+        await _executeCard(el, mcpId, toolName, cardData.id);
       });
     }
   } else {
@@ -1462,7 +1462,7 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 
 // ── Execute ───────────────────────────────────────────────────────────────────
 
-async function _executeCard(el, mcpId, toolName) {
+async function _executeCard(el, mcpId, toolName, instanceId) {
   const btn = el.querySelector('.canvas-exec-btn');
   btn.disabled = true;
   btn.textContent = '执行中…';
@@ -1478,6 +1478,9 @@ async function _executeCard(el, mcpId, toolName) {
       else args[key] = val;
     }
   });
+
+  // Inject instance_id from card identity so multiInstance tools can resolve device_path
+  if (instanceId && !args.instance_id) args.instance_id = instanceId;
 
   // Auto-inject resolved topics from connected ports (based on schema, not DOM fields)
   const inPorts = [...el.querySelectorAll('.canvas-port.in')];
@@ -1528,9 +1531,15 @@ async function _executeCard(el, mcpId, toolName) {
 }
 
 function _showResult(el, text, isError) {
-  // Remove any previous inline result (results now go to the log panel only)
   const existing = el.querySelector('.canvas-result');
   if (existing) existing.remove();
+  const wrapper = document.createElement('div');
+  wrapper.className = 'canvas-result';
+  const pre = document.createElement('pre');
+  pre.className = 'canvas-result-pre' + (isError ? ' error' : '');
+  pre.textContent = text;
+  wrapper.appendChild(pre);
+  el.appendChild(wrapper);
 }
 
 function _logActivity(type, msg) {
