@@ -1325,6 +1325,23 @@ async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
 }
 
 /**
+ * Parse the result of a /api/mcp/{id}/call response.
+ * The API wraps driver responses as MCP content arrays: {code:200, data:[{type:"text",text:"..."}]}
+ * Returns the parsed JSON object, or null on failure.
+ */
+function _parseMcpCallResult(json) {
+  if (!json || json.code !== 200) return null;
+  const data = json.data;
+  if (Array.isArray(data)) {
+    const text = data[0]?.text;
+    if (text) { try { return JSON.parse(text); } catch { return null; } }
+    return null;
+  }
+  if (typeof data === 'string') { try { return JSON.parse(data); } catch { return null; } }
+  return typeof data === 'object' && data !== null ? data : null;
+}
+
+/**
  * Ask the driver to infer topics for a card given an optional input topic.
  * Used for multiInstance sensors (_addCard) and processors (after wiring).
  * Updates card.topicOut and DOM out-ports if driver returns non-empty topics.
@@ -1337,7 +1354,8 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
       body: JSON.stringify({ tool: card.toolName, arguments: { action: 'info', instance_id: card.id, input_topic: inputTopic } }),
     });
     const data = await resp.json();
-    const topicOut = data?.topic_out || data?.result?.topic_out;
+    const parsed = _parseMcpCallResult(data);
+    const topicOut = parsed?.topic_out;
     if (topicOut?.some(t => t.topic)) {
       card.topicOut = topicOut;
       const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
@@ -1373,8 +1391,8 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
       body: JSON.stringify({ tool: toolName, arguments: { action: 'info' } }),
     });
     const json = await res.json();
-    if (json.code === 200 && json.data) {
-      const info = typeof json.data === 'string' ? JSON.parse(json.data) : json.data;
+    const info = _parseMcpCallResult(json);
+    if (info) {
       // Only override with info result if it has non-empty topic paths;
       // otherwise keep the live DOM-resolved topics passed in opts.
       if (info.topic_in && info.topic_in.some(t => t.topic)) opts.topicIn = info.topic_in;
