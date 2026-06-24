@@ -481,6 +481,11 @@ class ASRPlugin:
 
         elif action == "start":
             input_topic = args.get("input_topic")
+            # Also accept input_topics list (sent by canvas when multiple connections exist)
+            if not input_topic:
+                topics_list = args.get("input_topics") or []
+                if topics_list:
+                    input_topic = topics_list[0]
             if not input_topic:
                 raise ValueError("input_topic is required")
             node_key = instance_id or input_topic

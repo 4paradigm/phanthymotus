@@ -155,12 +155,19 @@ def _run_odometry_process(namespace: str, config: dict,
     # KISS-ICP pipeline (if available)
     kiss_pipeline = None
     if HAS_KISS_ICP:
-        kiss_cfg = KISSConfig()
-        kiss_cfg.data.max_range = 100.0
-        kiss_cfg.data.min_range = 0.5
-        kiss_cfg.data.deskew = False
-        kiss_pipeline = OdometryPipeline(config=kiss_cfg)
-        print("[htmsg:odom] KISS-ICP pipeline initialized")
+        try:
+            kiss_cfg = KISSConfig()
+            kiss_cfg.data.max_range = 100.0
+            kiss_cfg.data.min_range = 0.5
+            kiss_cfg.data.deskew = False
+            # kiss-icp >=1.0 removed the standalone OdometryPipeline constructor;
+            # use KissICP core directly instead.
+            from kiss_icp.kiss_icp import KissICP
+            kiss_pipeline = KissICP(config=kiss_cfg)
+            print("[htmsg:odom] KISS-ICP pipeline initialized (KissICP core)")
+        except Exception as _e:
+            print(f"[htmsg:odom] KISS-ICP init failed ({_e}), using simple ICP fallback")
+            kiss_pipeline = None
 
     def _matrix_to_pose(T: np.ndarray) -> tuple:
         """Extract translation + quaternion from 4x4 homogeneous matrix."""

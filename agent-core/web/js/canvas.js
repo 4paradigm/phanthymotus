@@ -1280,9 +1280,9 @@ async function _startProject() {
 
   // Start all cards on canvas, resolving input_topic(s) from connections
   for (const card of _cards) {
-    // Collect ALL inbound connections to support multiple input topics
+    // Collect ALL inbound connections to support multiple input topics (deduplicate)
     const inConns = _connections.filter(c => c.toCardId === card.id);
-    const topics = inConns.map(conn => conn.fromTopic || '').filter(Boolean);
+    const topics = [...new Set(inConns.map(conn => conn.fromTopic || '').filter(Boolean))];
 
     let args;
     if (topics.length > 1) {
