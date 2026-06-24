@@ -177,7 +177,6 @@ def publish(topic: str, data: str) -> None:
     if not _HAS_RCLPY or not _running or not _node_main:
         print(f'[ros2_bridge] publish skipped: rclpy={_HAS_RCLPY} running={_running} node={_node_main is not None}')
         return
-    print(f'[ros2_bridge] publishing to {topic}: {data[:1000]}')
     if topic not in _publishers:
         from std_msgs.msg import String
         _publishers[topic] = _node_main.create_publisher(String, topic, 10)
@@ -185,7 +184,6 @@ def publish(topic: str, data: str) -> None:
     msg = String()
     msg.data = data
     _publishers[topic].publish(msg)
-    print(f'[ros2_bridge] published to {topic} ok')
 
 
 def _resolve_msg_type(fmt: str):
