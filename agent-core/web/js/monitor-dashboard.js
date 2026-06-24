@@ -95,6 +95,12 @@ async function _fetchAndBuild() {
   for (const conn of connections) {
     if (conn.fromTopic) topicSet.add(conn.fromTopic);
   }
+  // Instance-specific topics persisted in canvas card data (e.g. multi-instance tools like ext_mic/ext_camera)
+  for (const card of canvasCards) {
+    for (const t of (card.topicOut || [])) {
+      if (t.topic && !topicSet.has(t.topic)) { topicSet.add(t.topic); _topicMcpMap[t.topic] = card.mcpId; }
+    }
+  }
 
   if (topicSet.size === 0) {
     _grid.innerHTML = `<div class="monitor-dashboard-empty">

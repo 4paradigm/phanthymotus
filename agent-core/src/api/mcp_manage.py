@@ -701,6 +701,19 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                 error  = data.get('error')
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
+                # Auto-register any instance-specific topics returned by the tool
+                content_items = result.get('content') or []
+                if isinstance(content_items, list):
+                    for item in content_items:
+                        if isinstance(item, dict) and item.get('type') == 'text':
+                            try:
+                                parsed = json.loads(item.get('text', ''))
+                                if isinstance(parsed, dict):
+                                    topics_to_reg = parsed.get('topic_out', []) + parsed.get('topic_in', [])
+                                    if any(t.get('topic') for t in topics_to_reg):
+                                        asyncio.create_task(_notify_inspector(mcp_id, topics_to_reg))
+                            except Exception:
+                                pass
                 return {'code': 200, 'data': result.get('content', result)}
     except Exception as e:
         return {'code': 500, 'message': str(e), 'data': None}
