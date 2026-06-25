@@ -812,7 +812,7 @@ html, body {
   transition: box-shadow 0.15s;
   overflow: visible;
 }
-.canvas-card *:not(input):not(select):not(textarea) {
+.canvas-card *:not(input):not(select):not(textarea):not(.canvas-result-pre) {
   -webkit-user-select: none;
   user-select: none;
 }
