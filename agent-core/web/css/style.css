@@ -40,6 +40,10 @@
   --emerald-bg:  #D1FAE5;
   --emerald-dim: #A7F3D0;
 
+  /* ── Tool type colors ── */
+  --cyan:        #0891B2;
+  --orange:      #B45309;
+
   /* ── Shape ── */
   --radius:      10px;
   --radius-sm:   6px;
