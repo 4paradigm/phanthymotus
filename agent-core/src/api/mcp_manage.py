@@ -312,9 +312,11 @@ async def mcp_list():
 async def mcp_add(req: MCPAddRequest):
     async with _mcp_write_lock:
         mcps = _get_mcp_list()
-        # Upsert: match by URL or by name (so a service restarting on a different port updates its entry)
+        # Upsert: match by URL, name, or server_name (prevents duplicate device bundles)
         existing = next(
-            (m for m in mcps if (m.get('url') == req.url and req.url) or (m.get('name') == req.name and req.name)),
+            (m for m in mcps if (m.get('url') == req.url and req.url)
+             or (m.get('name') == req.name and req.name)
+             or (m.get('server_name') and m.get('server_name') == req.name)),
             None,
         )
         if existing:

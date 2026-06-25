@@ -239,19 +239,32 @@ function _buildChip(mcp, tool) {
   chip.dataset.toolName = tool.name;
   chip.dataset.desc = (tool.description || '').toLowerCase();
   chip.title = tool.description || tool.name;
-  chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span>`;
+
+  // Config button for tools with shared fields
+  const configSchema = typeof tool === 'object' ? tool.configSchema : null;
+  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const configKey = `${mcp.id}:${tool.name}`;
+  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
+
+  const configBtnHtml = hasSharedFields
+    ? `<button class="chip-config-btn" title="配置"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
+    : '';
+  chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span>${configBtnHtml}`;
+
+  // Config button click
+  if (hasSharedFields) {
+    chip.querySelector('.chip-config-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      _openToolConfigModal(mcp.id, tool.name, configSchema);
+    });
+  }
 
   // Click to show detail
   chip.addEventListener('click', (e) => {
     if (e.defaultPrevented) return;
     _showDetail(mcp, tool);
   });
-
-  // Drag (same data format as tool cards)
-  const configSchema = typeof tool === 'object' ? tool.configSchema : null;
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
-  const configKey = `${mcp.id}:${tool.name}`;
-  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
 
   chip.addEventListener('dragstart', (e) => {
     chip.classList.add('dragging-source');

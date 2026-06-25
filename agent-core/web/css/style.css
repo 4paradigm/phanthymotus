@@ -456,18 +456,25 @@ html, body {
 
 /* Chip grid mode */
 .sidebar-tool-list.chip-mode {
-  display: flex; flex-wrap: wrap; gap: 4px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+.sidebar-tool-list.chip-mode .sidebar-subgroup-label {
+  grid-column: 1 / -1;
 }
 .sidebar-chip {
-  display: flex; align-items: center;
+  display: flex; align-items: center; gap: 4px;
   padding: 4px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  border-left: 3px solid var(--border);
+  border-left-width: 3px; border-left-style: solid;
+  border-left-color: var(--text-tertiary);
   cursor: grab; font-size: 11px;
   background: var(--bg-primary);
   transition: border-color 0.15s, box-shadow 0.15s;
   -webkit-user-select: none; user-select: none;
+  min-width: 0;
 }
 .sidebar-chip:hover {
   border-color: var(--accent);
@@ -481,8 +488,17 @@ html, body {
 .sidebar-chip.type-controller { border-left-color: var(--emerald); }
 .chip-name {
   font-family: var(--font-mono); font-weight: 500;
-  white-space: nowrap;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  flex: 1; min-width: 0;
 }
+.chip-config-btn {
+  flex-shrink: 0; width: 18px; height: 18px;
+  border: none; background: transparent; cursor: pointer;
+  color: var(--text-tertiary); padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+}
+.chip-config-btn:hover { background: var(--bg-secondary); color: var(--text-primary); }
 
 .tool-config-label {
   display: block;
