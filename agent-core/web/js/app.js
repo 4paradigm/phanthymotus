@@ -261,16 +261,17 @@ async function _pingOne(mcp) {
     const r = await fetch(`/api/mcp/${mcp.id}/ping`, { method: 'POST' });
     const j = await r.json();
     if (j.data) {
-      Object.assign(mcp, {
-        online:      j.data.online,
-        tools:       j.data.tools       ?? mcp.tools,
-        resources:   j.data.resources   ?? mcp.resources,
-        render_hint: j.data.render_hint ?? mcp.render_hint,
-        server_name: j.data.server_name ?? mcp.server_name,
-        topic_out:   j.data.topic_out   ?? mcp.topic_out,
-        topic_in:    j.data.topic_in    ?? mcp.topic_in,
-        ws_path:     j.data.ws_path     ?? mcp.ws_path,
-      });
+      mcp.online = j.data.online;
+      // Only update tools/resources from ping if online and non-empty (avoid overwriting cached data with empty response)
+      if (j.data.online && j.data.tools?.length) {
+        mcp.tools       = j.data.tools;
+        mcp.resources   = j.data.resources ?? mcp.resources;
+        mcp.render_hint = j.data.render_hint ?? mcp.render_hint;
+        mcp.topic_out   = j.data.topic_out ?? mcp.topic_out;
+        mcp.topic_in    = j.data.topic_in  ?? mcp.topic_in;
+      }
+      if (j.data.server_name) mcp.server_name = j.data.server_name;
+      if (j.data.ws_path)     mcp.ws_path     = j.data.ws_path;
     }
   } catch { /* silent */ }
 }
