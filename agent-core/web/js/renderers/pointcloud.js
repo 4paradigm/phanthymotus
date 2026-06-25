@@ -121,14 +121,9 @@ export const PointCloudRenderer = {
     const idxOf = s => ({ x: 0, y: 1, z: 2 }[s] ?? 1);
     this._axisMap = {
       xIdx: idxOf(cfg?.axis_x_source ?? 'y'), xSign: (cfg?.axis_x_negate ?? true) ? -1 : 1,
-      yIdx: idxOf(cfg?.axis_y_source ?? 'z'), ySign: (cfg?.axis_y_negate ?? true) ? -1 : 1,
+      yIdx: idxOf(cfg?.axis_y_source ?? 'z'), ySign: (cfg?.axis_y_negate ?? false) ? -1 : 1,
       zIdx: idxOf(cfg?.axis_z_source ?? 'x'), zSign: (cfg?.axis_z_negate ?? false) ? -1 : 1,
     };
-    // Pitch offset (tilt correction around X-axis)
-    const deg = cfg?.pitch_offset ?? 23;
-    const rad = deg * Math.PI / 180;
-    this._pitchCos = Math.cos(rad);
-    this._pitchSin = Math.sin(rad);
   },
 
   _resize() {
@@ -199,10 +194,9 @@ export const PointCloudRenderer = {
       const mx = am.xSign * raw[am.xIdx];
       const my = am.ySign * raw[am.yIdx];
       const mz = am.zSign * raw[am.zIdx];
-      // Apply pitch rotation around X-axis
       pos[idx]     = mx;
-      pos[idx + 1] = my * this._pitchCos - mz * this._pitchSin;
-      pos[idx + 2] = my * this._pitchSin + mz * this._pitchCos;
+      pos[idx + 1] = my;
+      pos[idx + 2] = mz;
     }
 
     // Rainbow height colormap (same as mapping renderer)
