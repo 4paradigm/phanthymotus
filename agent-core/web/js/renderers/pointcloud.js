@@ -36,7 +36,7 @@ export const PointCloudRenderer = {
     this._frames = [];
     this._displayDirty = false;
 
-    // Set default axis map (X←y, Y←z, Z←x, all positive)
+    // Set default axis map (X←-y, Y←-z, Z←x, with pitch correction)
     this._buildAxisMap(null);
 
     this._el = document.createElement('div');
@@ -120,10 +120,15 @@ export const PointCloudRenderer = {
   _buildAxisMap(cfg) {
     const idxOf = s => ({ x: 0, y: 1, z: 2 }[s] ?? 1);
     this._axisMap = {
-      xIdx: idxOf(cfg?.axis_x_source ?? 'y'), xSign: cfg?.axis_x_negate ? -1 : 1,
-      yIdx: idxOf(cfg?.axis_y_source ?? 'z'), ySign: cfg?.axis_y_negate ? -1 : 1,
-      zIdx: idxOf(cfg?.axis_z_source ?? 'x'), zSign: cfg?.axis_z_negate ? -1 : 1,
+      xIdx: idxOf(cfg?.axis_x_source ?? 'y'), xSign: (cfg?.axis_x_negate ?? true) ? -1 : 1,
+      yIdx: idxOf(cfg?.axis_y_source ?? 'z'), ySign: (cfg?.axis_y_negate ?? true) ? -1 : 1,
+      zIdx: idxOf(cfg?.axis_z_source ?? 'x'), zSign: (cfg?.axis_z_negate ?? false) ? -1 : 1,
     };
+    // Pitch offset (tilt correction around X-axis)
+    const deg = cfg?.pitch_offset ?? 0;
+    const rad = deg * Math.PI / 180;
+    this._pitchCos = Math.cos(rad);
+    this._pitchSin = Math.sin(rad);
   },
 
   _resize() {
@@ -194,9 +199,13 @@ export const PointCloudRenderer = {
 
       const raw = [raw0, raw1, raw2];
       const idx = i * 3;
-      pos[idx]     = am.xSign * raw[am.xIdx];
-      pos[idx + 1] = am.ySign * raw[am.yIdx];
-      pos[idx + 2] = am.zSign * raw[am.zIdx];
+      const mx = am.xSign * raw[am.xIdx];
+      const my = am.ySign * raw[am.yIdx];
+      const mz = am.zSign * raw[am.zIdx];
+      // Apply pitch rotation around X-axis
+      pos[idx]     = mx;
+      pos[idx + 1] = my * this._pitchCos - mz * this._pitchSin;
+      pos[idx + 2] = my * this._pitchSin + mz * this._pitchCos;
 
       // Jet colormap based on intensity (0-255 typical range)
       const t = Math.min(1, Math.max(0, intensity / 255));
