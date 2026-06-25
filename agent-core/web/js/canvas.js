@@ -623,7 +623,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (sensorExecBtn) {
       sensorExecBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        await _executeCard(el, mcpId, toolName, cardData.id);
+        await _executeCard(el, mcpId, toolName, id);
       });
     }
   } else {

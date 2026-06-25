@@ -1290,6 +1290,8 @@ html, body {
   white-space: pre-wrap;
   color: var(--text-muted);
   border: 1px solid var(--border);
+  -webkit-user-select: text;
+  user-select: text;
 }
 .canvas-result-pre.error { color: var(--red); }
 
