@@ -381,6 +381,16 @@ async def _do_ping(mcp_id: str) -> dict:
         # 标记 registry 中该设备离线
         if mcp_id in mcp_client.registry:
             mcp_client.registry[mcp_id]['online'] = False
+        # Dedup: if this offline MCP has same server_name as another entry, remove it
+        async with _mcp_write_lock:
+            mcps = _get_mcp_list()
+            this_entry = next((m for m in mcps if m.get('id') == mcp_id), None)
+            if this_entry and this_entry.get('server_name'):
+                dup = next((m for m in mcps if m.get('server_name') == this_entry['server_name'] and m.get('id') != mcp_id), None)
+                if dup:
+                    mcps = [m for m in mcps if m.get('id') != mcp_id]
+                    _save_mcp_list(mcps)
+                    print(f'[mcp/ping] dedup: removed offline {mcp_id} (same server_name as {dup["id"]})')
         return {'online': False, 'error': str(e), 'tools': [], 'resources': []}
 
     # render_hint priority:
