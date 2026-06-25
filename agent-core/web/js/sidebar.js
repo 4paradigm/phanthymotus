@@ -435,8 +435,8 @@ function _showDetail(mcp, tool, opts = {}) {
   const schema       = typeof tool === 'object' && tool.inputSchema ? JSON.stringify(tool.inputSchema, null, 2) : null;
   const description  = typeof tool === 'object' ? tool.description : null;
 
-  const topicIn  = topicInData.map(t => `<li><code>${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
-  const topicOut = topicOutData.map(t => `<li><code>${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
+  const topicIn  = topicInData.map(t => `<li><code title="${_esc(t.topic || '?')}">${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
+  const topicOut = topicOutData.map(t => `<li><code title="${_esc(t.topic || '?')}">${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
 
   body.innerHTML = `
     ${description ? `<div class="detail-section"><div class="detail-label">描述</div><div class="detail-text">${_esc(description)}</div></div>` : ''}

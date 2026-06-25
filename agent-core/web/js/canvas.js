@@ -1310,6 +1310,9 @@ async function _startProject() {
     }
     args.instance_id = card.id;
     const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
+    if (startResult && startResult.code !== 200) {
+      _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
+    }
     // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
     const parsed = _parseMcpCallResult(startResult);
     if (parsed?.topic_out?.some(t => t.topic)) {

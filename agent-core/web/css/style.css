@@ -557,6 +557,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 .detail-topics code {
   font-size: 10px;
@@ -564,6 +565,10 @@ html, body {
   background: var(--bg-input);
   padding: 2px 5px;
   border-radius: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
 }
 .detail-schema {
   font-size: 10px;
@@ -1088,7 +1093,7 @@ html, body {
 
 .canvas-card-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   padding: 10px 10px 6px 10px;
   cursor: grab;
@@ -1127,7 +1132,12 @@ html, body {
   color: var(--text-dim);
   font-size: 18px;
   line-height: 1;
-  padding: 2px 4px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   flex-shrink: 0;
   transition: color 0.1s;
 }
@@ -1139,7 +1149,12 @@ html, body {
   cursor: pointer;
   font-size: 18px;
   line-height: 1;
-  padding: 2px 4px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   flex-shrink: 0;
   color: var(--text-dim);
   transition: color 0.1s;
@@ -1152,7 +1167,12 @@ html, body {
   cursor: pointer;
   font-size: 18px;
   line-height: 1;
-  padding: 2px 4px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
   flex-shrink: 0;
   color: var(--text-dim);
   transition: color 0.1s;
@@ -2403,6 +2423,85 @@ html, body {
 
 .renderer-skeleton { width: 100%; height: 100%; position: relative; overflow: hidden; }
 .renderer-skeleton canvas { display: block; width: 100%; height: 100%; }
+
+/* ── Renderer toolbar & topic badges ─────────────────────────────────────── */
+.renderer-toolbar {
+  display: flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.renderer-toolbar-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.renderer-device-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.renderer-device-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.topic-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--bg-input);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topic-badge.topic-in  { border-left: 2px solid var(--accent); }
+.topic-badge.topic-out { border-left: 2px solid var(--green); }
+.topic-dir {
+  font-size: 9px;
+  font-weight: 700;
+  opacity: 0.6;
+  margin-right: 2px;
+  flex-shrink: 0;
+}
+.renderer-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 10px;
+  background: var(--bg-hover);
+  border-bottom: 1px solid var(--border);
+}
+.topic-dir-label {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.topic-path {
+  font-family: var(--font-mono);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.topic-fmt {
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
 
 .renderer-activity {
   padding: 12px; font-family: var(--font-mono); font-size: 12px;
