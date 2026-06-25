@@ -132,7 +132,9 @@ export function updateCanvasMcps(mcps) {
     }
     // Re-fetch driver-inferred topics for static (non-multiInstance) cards that still have no real topic path
     // For multiInstance tools, topics are input-dependent and must be resolved after connection
-    if (!card.topicOut?.some(t => t.topic) && liveTopicOut?.length && !toolObj?.multiInstance) {
+    // Only fetch once (not on every poll) — mark card to avoid repeated calls
+    if (!card.topicOut?.some(t => t.topic) && liveTopicOut?.length && !toolObj?.multiInstance && !card._topicFetched) {
+      card._topicFetched = true;
       _fetchTopicsFromDriver(card, '');
     }
 
