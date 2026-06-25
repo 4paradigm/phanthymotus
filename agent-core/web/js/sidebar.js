@@ -492,9 +492,10 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       input = document.createElement('input');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      input.type = def.format === 'password' ? 'password' : 'text';
-      input.placeholder = def.default || '';
-      input.value = savedValues[key] || '';
+      input.type = def.format === 'password' ? 'password' : (def.type === 'number' || def.type === 'integer' ? 'number' : 'text');
+      if (def.type === 'number' || def.type === 'integer') input.step = 'any';
+      input.placeholder = def.default != null ? String(def.default) : '';
+      input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
     bodyEl.appendChild(label);
@@ -687,9 +688,10 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
       input = document.createElement('input');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      input.type = def.format === 'password' ? 'password' : 'text';
-      input.placeholder = def.default || '';
-      input.value = savedValues[key] || '';
+      input.type = def.format === 'password' ? 'password' : (def.type === 'number' || def.type === 'integer' ? 'number' : 'text');
+      if (def.type === 'number' || def.type === 'integer') input.step = 'any';
+      input.placeholder = def.default != null ? String(def.default) : '';
+      input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
     bodyEl.appendChild(label);
