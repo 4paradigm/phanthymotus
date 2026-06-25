@@ -23,6 +23,12 @@ export function initSidebar() {
   document.getElementById('tool-detail-close').addEventListener('click', _hideDetail);
   _backdrop.addEventListener('click', (e) => { if (e.target === _backdrop) _hideDetail(); });
 
+  // Search filter
+  const searchInput = document.getElementById('sidebar-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', () => _onSearchInput(searchInput.value));
+  }
+
   // Load saved tool configs
   _loadToolConfigs();
 }
@@ -87,6 +93,8 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
 // ── Section builders ──────────────────────────────────────────────────────────
 
+const _TYPE_ORDER = ['sensor', 'actuator', 'processor', 'controller', ''];
+
 function _buildSection(mcp) {
   const name = mcp.server_name || mcp.name || mcp.id;
   const online = mcp.online;
@@ -104,13 +112,13 @@ function _buildSection(mcp) {
   `;
   section.appendChild(header);
 
-  const grid = document.createElement('div');
-  grid.className = 'sidebar-tool-list';
-
   const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
-  for (const tool of tools) {
-    grid.appendChild(_buildToolCard(mcp, tool));
-  }
+  const useChip = tools.length > 6;
+
+  const grid = document.createElement('div');
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
+
+  _renderGroupedTools(grid, mcp, tools, useChip);
 
   section.appendChild(grid);
   return section;
@@ -122,24 +130,40 @@ function _buildPerceptionSection(perceptions) {
 
   const header = document.createElement('div');
   header.className = 'sidebar-section-header';
-  const totalTools = perceptions.reduce((s, m) => s + (m.tools || []).length, 0);
-  header.innerHTML = `
-    <span class="sidebar-section-icon">◈</span>
-    <span class="sidebar-section-name">感知</span>
-    <span class="sidebar-section-count">${totalTools}</span>
-  `;
-  section.appendChild(header);
-
-  const grid = document.createElement('div');
-  grid.className = 'sidebar-tool-list';
-
+  const allTools = [];
   for (const mcp of perceptions) {
     const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
     for (const tool of tools) {
       if (!tool.type && (tool.topic_in || []).length && (tool.topic_out || []).length) {
         tool.type = 'processor';
       }
-      grid.appendChild(_buildToolCard(mcp, tool));
+      tool._mcp = mcp; // attach mcp ref for rendering
+      allTools.push(tool);
+    }
+  }
+  header.innerHTML = `
+    <span class="sidebar-section-icon">◈</span>
+    <span class="sidebar-section-name">感知</span>
+    <span class="sidebar-section-count">${allTools.length}</span>
+  `;
+  section.appendChild(header);
+
+  const useChip = allTools.length > 6;
+  const grid = document.createElement('div');
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
+
+  // Group and render
+  const groups = {};
+  for (const tool of allTools) {
+    const t = tool.type || '';
+    (groups[t] = groups[t] || []).push(tool);
+  }
+  for (const type of _TYPE_ORDER) {
+    if (!groups[type]?.length) continue;
+    grid.appendChild(_buildSubgroupLabel(type, groups[type].length));
+    for (const tool of groups[type]) {
+      const mcp = tool._mcp;
+      grid.appendChild(useChip ? _buildChip(mcp, tool) : _buildToolCard(mcp, tool));
     }
   }
 
@@ -161,19 +185,125 @@ function _buildControllerSection(controllers) {
   `;
   section.appendChild(header);
 
+  const useChip = totalTools > 6;
   const grid = document.createElement('div');
-  grid.className = 'sidebar-tool-list';
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
 
+  const allTools = [];
   for (const mcp of controllers) {
     const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
     for (const tool of tools) {
       if (!tool.type) tool.type = 'controller';
-      grid.appendChild(_buildToolCard(mcp, tool));
+      tool._mcp = mcp;
+      allTools.push(tool);
     }
   }
+  _renderGroupedTools(grid, null, allTools, useChip);
 
   section.appendChild(grid);
   return section;
+}
+
+// ── Grouped rendering helpers ─────────────────────────────────────────────────
+
+function _renderGroupedTools(grid, defaultMcp, tools, useChip) {
+  const groups = {};
+  for (const tool of tools) {
+    const t = tool.type || '';
+    (groups[t] = groups[t] || []).push(tool);
+  }
+  for (const type of _TYPE_ORDER) {
+    if (!groups[type]?.length) continue;
+    grid.appendChild(_buildSubgroupLabel(type, groups[type].length));
+    for (const tool of groups[type]) {
+      const mcp = tool._mcp || defaultMcp;
+      grid.appendChild(useChip ? _buildChip(mcp, tool) : _buildToolCard(mcp, tool));
+    }
+  }
+}
+
+function _buildSubgroupLabel(type, count) {
+  const label = document.createElement('div');
+  label.className = 'sidebar-subgroup-label';
+  const displayName = type ? type.toUpperCase() : 'OTHER';
+  label.textContent = `${displayName} · ${count}`;
+  return label;
+}
+
+function _buildChip(mcp, tool) {
+  const chip = document.createElement('div');
+  const toolType = tool.type || '';
+  chip.className = `sidebar-chip${toolType ? ' type-' + toolType : ''}`;
+  chip.draggable = true;
+  chip.dataset.mcpId = mcp.id;
+  chip.dataset.toolName = tool.name;
+  chip.dataset.desc = (tool.description || '').toLowerCase();
+  chip.title = tool.description || tool.name;
+  chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span>`;
+
+  // Click to show detail
+  chip.addEventListener('click', (e) => {
+    if (e.defaultPrevented) return;
+    _showDetail(mcp, tool);
+  });
+
+  // Drag (same data format as tool cards)
+  const configSchema = typeof tool === 'object' ? tool.configSchema : null;
+  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const configKey = `${mcp.id}:${tool.name}`;
+  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
+
+  chip.addEventListener('dragstart', (e) => {
+    chip.classList.add('dragging-source');
+    e.dataTransfer.effectAllowed = 'copy';
+    e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
+      mcpId: mcp.id, toolName: tool.name, driverName: mcp.server_name || mcp.name || mcp.id,
+      hasConfig: !!hasSharedFields, configured,
+      multiInstance: !!(tool.multiInstance),
+      hasInstanceConfig: _hasInstanceFields(configSchema),
+    }));
+  });
+  chip.addEventListener('dragend', () => chip.classList.remove('dragging-source'));
+
+  return chip;
+}
+
+// ── Search filter ─────────────────────────────────────────────────────────────
+
+function _onSearchInput(query) {
+  if (!_scroll) return;
+  const q = query.trim().toLowerCase();
+
+  // Filter cards and chips
+  const items = _scroll.querySelectorAll('.sidebar-tool-card, .sidebar-chip');
+  for (const el of items) {
+    const name = (el.dataset.toolName || '').toLowerCase();
+    const desc = (el.dataset.desc || '').toLowerCase();
+    const match = !q || name.includes(q) || desc.includes(q);
+    el.classList.toggle('hidden', !match);
+  }
+
+  // Hide subgroup labels if all items in that group are hidden
+  const labels = _scroll.querySelectorAll('.sidebar-subgroup-label');
+  for (const label of labels) {
+    let next = label.nextElementSibling;
+    let hasVisible = false;
+    while (next && !next.classList.contains('sidebar-subgroup-label')) {
+      if ((next.classList.contains('sidebar-tool-card') || next.classList.contains('sidebar-chip')) && !next.classList.contains('hidden')) {
+        hasVisible = true;
+        break;
+      }
+      next = next.nextElementSibling;
+    }
+    label.classList.toggle('hidden', !hasVisible);
+  }
+
+  // Hide sections if all their content is hidden
+  const sections = _scroll.querySelectorAll('.sidebar-section');
+  for (const sec of sections) {
+    const visibleItems = sec.querySelectorAll('.sidebar-tool-card:not(.hidden), .sidebar-chip:not(.hidden)');
+    sec.classList.toggle('hidden', visibleItems.length === 0);
+  }
 }
 
 // ── Tool card ─────────────────────────────────────────────────────────────────
@@ -185,6 +315,7 @@ function _buildToolCard(mcp, tool) {
   card.draggable = true;
   card.dataset.mcpId = mcp.id;
   card.dataset.toolName = tool.name;
+  card.dataset.desc = (tool.description || '').toLowerCase();
 
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const configKey = `${mcp.id}:${tool.name}`;

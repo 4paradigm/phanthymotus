@@ -74,28 +74,75 @@ async function fetchTopicStatuses() {
   } catch { /* 静默失败 */ }
 }
 
+// Priority order for update banner display
+const _UPDATE_PRIORITY = ['core', 'perception', 'driver'];
+
 async function checkForUpdate() {
   try {
-    const res  = await fetch('/api/system/update-check');
+    // Sync registry to ensure manifest has latest image tags
+    await fetch('/api/drivers/sync', { method: 'POST' });
+    const res  = await fetch('/api/drivers');
     const json = await res.json();
-    if (json.data && !json.data.up_to_date) {
-      showUpdateBanner(json.data);
-    }
+    if (json.code !== 200 || !json.data) return;
+
+    // Find services that have a newer image available vs what's running
+    const updatable = json.data.filter(d => {
+      if (!d.image || !d.running_image) return false;
+      const latestTag  = _tagFromImage(d.image);
+      const runningTag = _tagFromImage(d.running_image);
+      return latestTag && runningTag && latestTag !== runningTag;
+    }).map(d => ({
+      id:         d.id,
+      name:       d.name,
+      category:   d.category || 'driver',
+      image:      d.image,
+      currentTag: _tagFromImage(d.running_image),
+      latestTag:  _tagFromImage(d.image),
+    }));
+
+    if (!updatable.length) return;
+
+    // Sort by priority: core > perception > driver
+    updatable.sort((a, b) => {
+      const pa = _UPDATE_PRIORITY.indexOf(a.category);
+      const pb = _UPDATE_PRIORITY.indexOf(b.category);
+      return (pa === -1 ? 99 : pa) - (pb === -1 ? 99 : pb);
+    });
+
+    showUpdateBanner(updatable);
   } catch { /* 静默失败 */ }
 }
 
-function showUpdateBanner({ latest_tag, latest_image }) {
-  const banner = document.getElementById('update-banner');
-  document.getElementById('update-banner-text').textContent = `发现新版本 ${latest_tag}`;
-  banner.classList.remove('hidden');
-  document.getElementById('btn-update').onclick = () => confirmAndUpdate(latest_image, latest_tag);
+function _tagFromImage(image) {
+  return image && image.includes(':') ? image.split(':').pop() : '';
 }
 
-async function confirmAndUpdate(image, tag) {
-  showDeployConfirmModal(
-    [{ label: 'Agent Core', currentTag: '当前版本', newTag: tag }],
-    () => _doUpdate(image, tag)
-  );
+function showUpdateBanner(updatable) {
+  const banner = document.getElementById('update-banner');
+  const text   = updatable.length === 1
+    ? `${updatable[0].name} 发现新版本 ${updatable[0].latestTag}`
+    : `${updatable.length} 个服务有新版本可用`;
+  document.getElementById('update-banner-text').textContent = text;
+  banner.classList.remove('hidden');
+  document.getElementById('btn-update').onclick = () => confirmAndUpdate(updatable);
+}
+
+async function confirmAndUpdate(updatable) {
+  const items = updatable.map(u => ({
+    label:      u.name,
+    currentTag: u.currentTag,
+    newTag:     u.latestTag,
+  }));
+  // For now, only core supports self-update; others go through deploy panel
+  const coreItem = updatable.find(u => u.category === 'core');
+  if (coreItem) {
+    showDeployConfirmModal(items, () => _doUpdate(coreItem.image, coreItem.latestTag));
+  } else {
+    // Non-core services: redirect to deploy panel
+    showDeployConfirmModal(items, () => {
+      document.getElementById('btn-deploy').click();
+    });
+  }
 }
 
 async function _doUpdate(image, tag) {

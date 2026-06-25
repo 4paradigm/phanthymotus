@@ -221,6 +221,21 @@ html, body {
   overflow: hidden;
 }
 
+.sidebar-filter {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+}
+#sidebar-search {
+  width: 100%; height: 28px; padding: 0 8px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 11px; background: var(--bg-secondary);
+  color: var(--text-primary); outline: none;
+  box-sizing: border-box;
+}
+#sidebar-search:focus { border-color: var(--accent); }
+#sidebar-search::placeholder { color: var(--text-tertiary); }
+
 .sidebar-scroll {
   flex: 1;
   overflow-y: auto;
@@ -431,6 +446,43 @@ html, body {
 }
 .tool-card-config-status.configured { color: #10b981; }
 .tool-card-config-status.unconfigured { color: #f59e0b; }
+
+/* Subgroup labels (type grouping within sections) */
+.sidebar-subgroup-label {
+  font-size: 9px; font-weight: 600; text-transform: uppercase;
+  color: var(--text-tertiary); padding: 8px 2px 3px;
+  letter-spacing: 0.5px; width: 100%;
+}
+
+/* Chip grid mode */
+.sidebar-tool-list.chip-mode {
+  display: flex; flex-wrap: wrap; gap: 4px;
+}
+.sidebar-chip {
+  display: flex; align-items: center;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--border);
+  cursor: grab; font-size: 11px;
+  background: var(--bg-primary);
+  transition: border-color 0.15s, box-shadow 0.15s;
+  -webkit-user-select: none; user-select: none;
+}
+.sidebar-chip:hover {
+  border-color: var(--accent);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+.sidebar-chip:active { cursor: grabbing; }
+.sidebar-chip.dragging-source { opacity: 0.4; }
+.sidebar-chip.type-sensor    { border-left-color: var(--cyan); }
+.sidebar-chip.type-actuator  { border-left-color: var(--orange); }
+.sidebar-chip.type-processor { border-left-color: var(--purple); }
+.sidebar-chip.type-controller { border-left-color: var(--emerald); }
+.chip-name {
+  font-family: var(--font-mono); font-weight: 500;
+  white-space: nowrap;
+}
 
 .tool-config-label {
   display: block;

@@ -117,11 +117,11 @@ export function updateCanvasMcps(mcps) {
 
     // multiInstance tools have per-card instance topics (set by connections + start()).
     // Tool-schema-level data from pings must NOT overwrite instance-specific topics.
+    const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
+    const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
     if (typeof toolObj === 'object' && toolObj.multiInstance) {
       // (skip topic update — fall through to configSchema check below)
     } else {
-      const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
-      const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
       if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  {
         // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
         if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
