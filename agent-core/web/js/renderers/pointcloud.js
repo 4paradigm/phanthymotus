@@ -36,7 +36,7 @@ export const PointCloudRenderer = {
     this._frames = [];
     this._displayDirty = false;
 
-    // Set default axis map (matches previous hardcoded: X←y, Y←-z, Z←-x)
+    // Set default axis map (X←y, Y←z, Z←x, all positive)
     this._buildAxisMap(null);
 
     this._el = document.createElement('div');
@@ -71,9 +71,8 @@ export const PointCloudRenderer = {
     const grid = new THREE.GridHelper(20, 20, 0x444444, 0x333333);
     this._scene.add(grid);
 
-    // Origin axes — rotated so blue (Z) points forward (Livox +x maps to Three.js -Z)
+    // Origin axes (red X=right, green Y=up, blue Z=forward matching LiDAR +x)
     const axes = new THREE.AxesHelper(1);
-    axes.rotation.y = Math.PI;
     this._scene.add(axes);
 
     // Points geometry (pre-allocated)

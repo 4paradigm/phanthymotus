@@ -343,7 +343,7 @@ function _buildToolCard(mcp, tool) {
 
   // Config status indicator — only for tools that have shared fields to configure
   const configHtml = hasSharedFields
-    ? `<span class="tool-card-config-status ${configured ? 'configured' : 'unconfigured'}" title="${configured ? '已配置' : '未配置'}">${configured ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'}</span>`
+    ? `<span class="tool-card-config-status ${configured ? 'configured' : 'unconfigured'}" title="${configured ? 'Configured' : 'Not configured'}">${configured ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'}</span>`
     : '';
 
   // Description (truncated)
@@ -415,7 +415,7 @@ export function hasSharedRequired(configSchema) {
 
 function _openToolConfigModal(mcpId, toolName, configSchema) {
   if (isProjectRunning()) {
-    alert('请停止智能控制后修改');
+    alert('Stop agent before modifying');
     return;
   }
   const overlay = document.getElementById('tool-config-overlay');
@@ -423,7 +423,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
 
-  titleEl.textContent = `配置 ${toolName}`;
+  titleEl.textContent = `Configure ${toolName}`;
   bodyEl.innerHTML = '';
 
   const props = configSchema.properties || {};
@@ -439,7 +439,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     if (hasSharedFields && def.scope === 'instance') continue;
     const label = document.createElement('label');
     label.className = 'tool-config-label';
-    label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -448,7 +448,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       input.dataset.key = key;
       const placeholder = document.createElement('option');
       placeholder.value = '';
-      placeholder.textContent = `-- 请选择 --`;
+      placeholder.textContent = `-- Select --`;
       input.appendChild(placeholder);
       for (const item of def.oneOf) {
         const option = document.createElement('option');
@@ -462,27 +462,29 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      // Add empty placeholder option
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = `-- 请选择 --`;
-      input.appendChild(placeholder);
+      const effectiveValue = savedValues[key] ?? def.default ?? '';
+      if (!effectiveValue) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = `-- Select --`;
+        input.appendChild(placeholder);
+      }
       for (const opt of def.enum) {
         const option = document.createElement('option');
         option.value = opt;
         option.textContent = opt;
-        if (savedValues[key] === opt) option.selected = true;
+        if (effectiveValue === opt) option.selected = true;
         input.appendChild(option);
       }
-      if (savedValues[key]) input.value = savedValues[key];
+      input.value = effectiveValue;
     } else if (def.type === 'boolean') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
       const optTrue = document.createElement('option');
-      optTrue.value = 'true'; optTrue.textContent = '是';
+      optTrue.value = 'true'; optTrue.textContent = 'Yes';
       const optFalse = document.createElement('option');
-      optFalse.value = 'false'; optFalse.textContent = '否';
+      optFalse.value = 'false'; optFalse.textContent = 'No';
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
@@ -532,7 +534,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       if (statusEl) {
         statusEl.className = 'tool-card-config-status configured';
         statusEl.textContent = '✓';
-        statusEl.title = '已配置';
+        statusEl.title = 'Configured';
       }
     }
 
@@ -608,7 +610,7 @@ function _hideDetail() {
  */
 export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
   if (isProjectRunning()) {
-    alert('请停止智能控制后修改');
+    alert('Stop agent before modifying');
     return;
   }
   const overlay = document.getElementById('tool-config-overlay');
@@ -616,7 +618,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
 
-  titleEl.textContent = `实例配置 ${toolName}`;
+  titleEl.textContent = `Instance Config: ${toolName}`;
   bodyEl.innerHTML = '';
 
   const props = (configSchema && configSchema.properties) || {};
@@ -632,7 +634,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
 
     const label = document.createElement('label');
     label.className = 'tool-config-label';
-    label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -641,7 +643,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
       input.dataset.key = key;
       const placeholder = document.createElement('option');
       placeholder.value = '';
-      placeholder.textContent = `-- 请选择 --`;
+      placeholder.textContent = `-- Select --`;
       input.appendChild(placeholder);
       for (const item of def.oneOf) {
         const option = document.createElement('option');
@@ -655,26 +657,29 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = `-- 请选择 --`;
-      input.appendChild(placeholder);
+      const effectiveValue = savedValues[key] ?? def.default ?? '';
+      if (!effectiveValue) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = `-- Select --`;
+        input.appendChild(placeholder);
+      }
       for (const opt of def.enum) {
         const option = document.createElement('option');
         option.value = opt;
         option.textContent = opt;
-        if (savedValues[key] === opt) option.selected = true;
+        if (effectiveValue === opt) option.selected = true;
         input.appendChild(option);
       }
-      if (savedValues[key]) input.value = savedValues[key];
+      input.value = effectiveValue;
     } else if (def.type === 'boolean') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
       const optTrue = document.createElement('option');
-      optTrue.value = 'true'; optTrue.textContent = '是';
+      optTrue.value = 'true'; optTrue.textContent = 'Yes';
       const optFalse = document.createElement('option');
-      optFalse.value = 'false'; optFalse.textContent = '否';
+      optFalse.value = 'false'; optFalse.textContent = 'No';
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
@@ -692,7 +697,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
   }
 
   if (!hasFields) {
-    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">该组件无实例配置项</p>';
+    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">No instance config fields</p>';
   }
 
   const close = () => { overlay.classList.add('hidden'); };
