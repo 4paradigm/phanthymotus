@@ -125,7 +125,7 @@ export const PointCloudRenderer = {
       zIdx: idxOf(cfg?.axis_z_source ?? 'x'), zSign: (cfg?.axis_z_negate ?? false) ? -1 : 1,
     };
     // Pitch offset (tilt correction around X-axis)
-    const deg = cfg?.pitch_offset ?? 2.3;
+    const deg = cfg?.pitch_offset ?? 23;
     const rad = deg * Math.PI / 180;
     this._pitchCos = Math.cos(rad);
     this._pitchSin = Math.sin(rad);
