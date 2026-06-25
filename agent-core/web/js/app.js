@@ -128,21 +128,55 @@ function showUpdateBanner(updatable) {
 }
 
 async function confirmAndUpdate(updatable) {
-  const items = updatable.map(u => ({
-    label:      u.name,
-    currentTag: u.currentTag,
-    newTag:     u.latestTag,
-  }));
-  // For now, only core supports self-update; others go through deploy panel
   const coreItem = updatable.find(u => u.category === 'core');
   if (coreItem) {
+    // Core requires confirm modal since it restarts the whole page
+    const items = updatable.map(u => ({
+      label: u.name, currentTag: u.currentTag, newTag: u.latestTag,
+    }));
     showDeployConfirmModal(items, () => _doUpdate(coreItem.image, coreItem.latestTag));
   } else {
-    // Non-core services: redirect to deploy panel
-    showDeployConfirmModal(items, () => {
-      document.getElementById('btn-deploy').click();
-    });
+    // Non-core services: deploy directly, show progress in banner
+    _deployServices(updatable);
   }
+}
+
+async function _deployServices(services) {
+  const btn  = document.getElementById('btn-update');
+  const text = document.getElementById('update-banner-text');
+  btn.disabled = true;
+
+  for (let i = 0; i < services.length; i++) {
+    const svc = services[i];
+    const prefix = services.length > 1 ? `[${i + 1}/${services.length}] ` : '';
+    text.textContent = `${prefix}${svc.name} 正在升级…`;
+
+    try {
+      const res = await fetch(`/api/drivers/${svc.id}/deploy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: svc.image }),
+      });
+      const json = await res.json();
+      if (json.code !== 200) {
+        text.textContent = `${svc.name} 升级失败：${json.message || '未知错误'}`;
+        btn.disabled = false;
+        return;
+      }
+    } catch {
+      text.textContent = `${svc.name} 请求失败，请检查网络`;
+      btn.disabled = false;
+      return;
+    }
+  }
+
+  // All done
+  const names = services.map(s => s.name).join('、');
+  text.textContent = `${names} 升级完成`;
+  btn.disabled = false;
+  setTimeout(() => {
+    document.getElementById('update-banner').classList.add('hidden');
+  }, 3000);
 }
 
 async function _doUpdate(image, tag) {
