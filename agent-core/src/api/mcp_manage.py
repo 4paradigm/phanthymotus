@@ -94,7 +94,7 @@ async def _ping_mcp_http(url: str) -> dict:
             async with session.post(url, json=tools_payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)
                 tools = [
-                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'inputSchema', 'configSchema', 'topic_out', 'topic_in')}
+                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'multiInstance', 'inputSchema', 'configSchema', 'topic_out', 'topic_in')}
                     for t in data.get('result', {}).get('tools', [])
                 ]
         except Exception as e:
@@ -176,9 +176,16 @@ async def _ping_mcp_http(url: str) -> dict:
                         continue
                     if t.get('name') != tool_prefix:
                         continue
-                    # Merge topic paths from info result into tool's topic_in/topic_out
-                    info_tin = result.get('topic_in', [])
-                    info_tout = result.get('topic_out', [])
+                    # Merge topic paths from info result into tool's topic_in/topic_out.
+                    # Only back-fill when info() returns real (non-empty) topic paths;
+                    # idle multiInstance tools report empty strings which must not overwrite
+                    # the static format-only schema declarations.
+                    # multiInstance tools have per-instance topics tracked on canvas cards;
+                    # aggregated info() mixes all instances and must not pollute the static schema.
+                    if t.get('multiInstance'):
+                        break
+                    info_tin  = [ti for ti in result.get('topic_in',  []) if ti.get('topic')]
+                    info_tout = [ti for ti in result.get('topic_out', []) if ti.get('topic')]
                     if info_tin:
                         t['topic_in'] = info_tin
                     if info_tout:
@@ -400,14 +407,6 @@ async def _do_ping(mcp_id: str) -> dict:
         for t in topic_in:
             if not t.get('topic'):
                 t['topic'] = upstream_topic
-
-    # Derive empty topic_out from topic_in; suffix is server name or mcp_id
-    in_topic = topic_in[0].get('topic', '') if topic_in else ''
-    if in_topic:
-        suffix_name = caps.get('server_name') or target.get('name') or mcp_id
-        for t in topic_out:
-            if not t.get('topic'):
-                t['topic'] = in_topic + '/' + suffix_name
 
     # Log only when tools change (first ping or tool list updated)
     current_tool_names = [t.get('name', '') if isinstance(t, dict) else t for t in caps['tools']]
@@ -661,20 +660,31 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             }
             await session.post(url, json=init_payload, headers=headers)
 
-            # Auto-config: start 前自动 apply 已保存的 config
+            # Auto-config: start 前自动 apply 已保存的 config (shared + instance merged)
+            # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
-            if action == 'start':
+            _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
+            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
                 # Check if this tool has configSchema (requires config before start)
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
                 has_config_schema = bool(tool_obj and tool_obj.get('configSchema'))
 
-                saved_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None)
-                if saved_cfg:
+                instance_id = req.arguments.get('instance_id', '')
+                shared_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None) or {}
+                instance_cfg = {}
+                if instance_id:
+                    instance_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}:{instance_id}', None) or {}
+                merged_cfg = {**shared_cfg, **instance_cfg}
+
+                if merged_cfg:
+                    cfg_args = {'action': 'config', **merged_cfg}
+                    if instance_id:
+                        cfg_args['instance_id'] = instance_id
                     cfg_payload = {
                         'jsonrpc': '2.0', 'id': 2,
                         'method': 'tools/call',
-                        'params': {'name': req.tool, 'arguments': {'action': 'config', **saved_cfg}},
+                        'params': {'name': req.tool, 'arguments': cfg_args},
                     }
                     async with session.post(url, json=cfg_payload, headers=headers) as resp:
                         cfg_data = await resp.json(content_type=None)
@@ -700,6 +710,19 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                 error  = data.get('error')
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
+                # Auto-register any instance-specific topics returned by the tool
+                content_items = result.get('content') or []
+                if isinstance(content_items, list):
+                    for item in content_items:
+                        if isinstance(item, dict) and item.get('type') == 'text':
+                            try:
+                                parsed = json.loads(item.get('text', ''))
+                                if isinstance(parsed, dict):
+                                    topics_to_reg = parsed.get('topic_out', []) + parsed.get('topic_in', [])
+                                    if any(t.get('topic') for t in topics_to_reg):
+                                        asyncio.create_task(_notify_inspector(mcp_id, topics_to_reg))
+                            except Exception:
+                                pass
                 return {'code': 200, 'data': result.get('content', result)}
     except Exception as e:
         return {'code': 500, 'message': str(e), 'data': None}

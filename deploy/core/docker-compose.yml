@@ -28,6 +28,8 @@ services:
     platform: linux/arm64
     network_mode: host     # 需要访问 ROS2 DDS
     env_file: .env
+    volumes:
+      - ./data/spatial:/opt/phanthy-motus/data   # 地图PCD + 指纹DB 持久化
     profiles:
       - hardware
     restart: unless-stopped

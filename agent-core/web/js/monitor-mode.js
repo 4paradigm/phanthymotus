@@ -4,6 +4,7 @@
  */
 
 import { activate, deactivate, resetLayout } from './monitor-dashboard.js';
+import { redrawCanvas } from './canvas.js';
 
 let _active = false;
 
@@ -42,6 +43,10 @@ function _exitMonitor(btns) {
   document.getElementById('app').classList.remove('monitor-active');
 
   deactivate();
+  // canvas-area was display:none while in monitor mode; getBoundingClientRect()
+  // returns zeros for hidden elements, so connection lines are mispositioned.
+  // Redraw after the DOM is visible again (next frame ensures layout is flushed).
+  requestAnimationFrame(() => redrawCanvas());
 }
 
 function _updateToggleUI(btns, activeMode) {

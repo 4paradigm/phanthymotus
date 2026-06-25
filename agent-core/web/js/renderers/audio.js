@@ -160,6 +160,10 @@ export const AudioRenderer = {
   _scheduleChunk(buffer) {
     const ctx = this._audioCtx;
     if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      ctx.resume().then(() => this._scheduleChunk(buffer));
+      return;
+    }
 
     const pcm = new Int16Array(buffer);
     const numSamples = pcm.length;

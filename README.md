@@ -36,9 +36,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code
 
 - **Visual Orchestration** — Drag-and-drop web dashboard for connecting devices, sensors, and AI models on a canvas
 - **MCP Data Bus** — Unified [Model Context Protocol](https://modelcontextprotocol.io) interface for all hardware devices
+- **Driver-Inferred Topics** — Output ROS2 topics are declared by drivers, not computed by the core. The canvas calls each driver's `info` action (passing `instance_id` for sensors or `input_topic` for processors) to get the exact topic path before the device starts, keeping all topic naming logic inside the driver
 - **Event-Driven Agent Loop** — LLM-powered reasoning with multi-turn tool calling, driven by real-time sensor events
 - **ROS2 Integration** — Native DDS bridge for seamless ROS2 topic relay and monitoring
-- **Pluggable Perception** — Modular ASR/TTS stack with local inference support (Jetson)
+- **Pluggable Perception** — Modular ASR/TTS stack with multi-instance support and local inference (Jetson)
 - **Web Dashboard** — Real-time device monitoring, agent activity stream, and configuration — all from the browser
 
 ## Architecture

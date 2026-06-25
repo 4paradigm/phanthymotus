@@ -118,7 +118,7 @@ def _register_core_mcp(silent=False):
                     'required': ['llm_url', 'llm_key']
                 },
                 'topic_in': [
-                    {'topic': '', 'format': 'data/json'}
+                    {'format': 'data/json'}
                 ],
                 'topic_out': [
                     {'topic': '/decision_core', 'format': 'data/json'}
@@ -126,7 +126,7 @@ def _register_core_mcp(silent=False):
             }
         ],
         'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
-        'topic_in': [{'topic': '', 'format': 'data/json'}],
+        'topic_in': [{'format': 'data/json'}],
     })
     mcp_mgr._save_mcp_list(existing)
     if not silent:
@@ -269,4 +269,4 @@ app.mount('/', _HTTPOnlyStaticFiles(directory='./web', html=True), name='web')
 
 # ========== 启动服务 ==========
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=15678)
+    uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None)

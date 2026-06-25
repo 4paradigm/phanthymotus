@@ -52,7 +52,7 @@ def _build_catalog_sync() -> dict:
             full_repo = first_ref.rsplit(':', 1)[0] if ':' in first_ref else first_ref
 
         tags = []
-        for t in tags_raw[:20]:
+        for t in sorted(tags_raw, key=lambda x: x.get('publishedAt', ''), reverse=True)[:20]:
             published = t.get('publishedAt', '') or ''
             # Format publishedAt ISO string to UTC+8 readable date
             created = ''

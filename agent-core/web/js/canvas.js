@@ -12,7 +12,7 @@
  */
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 
 let _canvasEl   = null;
@@ -32,6 +32,7 @@ let _draggingConn = null; // {fromCardId, fromPortEl, format, topic, tempPath, t
 let _projectRunning = false;
 
 export function isProjectRunning() { return _projectRunning; }
+export function redrawCanvas() { _redrawConnections(); }
 
 // ── Viewport transform state ──────────────────────────────────────────────────
 let _zoom = 1;
@@ -68,9 +69,14 @@ export async function initCanvas(initialMcps) {
     for (const c of saved) {
       _addCard(c, false);
     }
-    // Restore connections
-    _connections = layoutJson.data?.connections || [];
-    _execConnections = layoutJson.data?.execConnections || [];
+    // Restore connections — filter out any that reference cards no longer in the layout
+    const cardIds = new Set(_cards.map(c => c.id));
+    _connections = (layoutJson.data?.connections || []).filter(
+      c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId)
+    );
+    _execConnections = (layoutJson.data?.execConnections || []).filter(
+      c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId)
+    );
     _resolveAllTopics();
     _redrawConnections();
     // Restore viewport transform if saved
@@ -108,10 +114,36 @@ export function updateCanvasMcps(mcps) {
     // Update persisted topics from live tool data (when driver comes online)
     const tools = mcp.tools || [];
     const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
-    const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
-    const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
-    if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  { card.topicIn  = liveTopicIn;  topicsChanged = true; }
-    if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) { card.topicOut = liveTopicOut; topicsChanged = true; }
+
+    // multiInstance tools have per-card instance topics (set by connections + start()).
+    // Tool-schema-level data from pings must NOT overwrite instance-specific topics.
+    if (typeof toolObj === 'object' && toolObj.multiInstance) {
+      // (skip topic update — fall through to configSchema check below)
+    } else {
+      const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
+      const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
+      if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  {
+        // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
+        if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
+      }
+      if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
+        if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
+      }
+    }
+    // Re-fetch driver-inferred topics for static (non-multiInstance) cards that still have no real topic path
+    // For multiInstance tools, topics are input-dependent and must be resolved after connection
+    if (!card.topicOut?.some(t => t.topic) && liveTopicOut?.length && !toolObj?.multiInstance) {
+      _fetchTopicsFromDriver(card, '');
+    }
+
+    // Also trigger rebuild if instance-config button presence doesn't match live configSchema
+    if (!topicsChanged) {
+      const liveConfigSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
+      const liveHasInstanceFields = liveConfigSchema &&
+        Object.values(liveConfigSchema.properties || {}).some(d => d.scope === 'instance');
+      const hasBtn = !!card.el.querySelector('.canvas-card-instance-cfg-btn');
+      if (!!liveHasInstanceFields !== hasBtn) topicsChanged = true;
+    }
   }
   if (topicsChanged) {
     // Rebuild cards that have new port counts
@@ -267,11 +299,13 @@ function _setupDropZone() {
       return;
     }
 
-    // Prevent same tool from being added twice
-    const existing = _cards.find(c => c.mcpId === data.mcpId && c.toolName === data.toolName);
-    if (existing) {
-      _showDropReject(e, '不能两次加入同样的组件');
-      return;
+    // Prevent same tool from being added twice (unless multiInstance)
+    if (!data.multiInstance) {
+      const existing = _cards.find(c => c.mcpId === data.mcpId && c.toolName === data.toolName);
+      if (existing) {
+        _showDropReject(e, '不能两次加入同样的组件');
+        return;
+      }
     }
 
     // Convert screen coords → world coords
@@ -355,6 +389,17 @@ function _addCard(data, save = true) {
   const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData };
   _cards.push(cardData);
   _makeDraggable(el, cardData);
+
+  // Call info(instance_id) to get driver-inferred topics for static tools.
+  // For multiInstance processors, topics depend on the connected input_topic — skip here.
+  // For multiInstance sensors (ext_mic, ext_camera), the topic is deterministic from instance_id — fetch eagerly.
+  const _mcp2 = _allMcps.find(m => m.id === mcpId);
+  const _toolObj2 = (_mcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
+  const _isMultiInstanceSensor = _toolObj2?.multiInstance && _toolObj2?.type === 'sensor';
+  if ((!_toolObj2?.multiInstance || _isMultiInstanceSensor) && (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length)) {
+    _fetchTopicsFromDriver(cardData, '');
+  }
+
   _syncEmptyState();
 
   if (save) _saveLayout();
@@ -382,6 +427,8 @@ function _removeCard(id) {
   _resolveAllTopics();
   _redrawConnections();
   _syncEmptyState();
+  // Cancel any pending debounced save, then save immediately with updated state
+  clearTimeout(_saveTimer);
   _saveLayout();
 }
 
@@ -398,15 +445,21 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
   const schema  = typeof toolObj === 'object' ? toolObj.inputSchema : null;
   const toolType = (typeof toolObj === 'object' ? toolObj.type : '') || '';
+  const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
+  const hasInstanceFields = configSchema && Object.values(configSchema.properties || {}).some(d => d.scope === 'instance');
 
-  // Auto-classify perception tools as processor
-  // Priority: tool-level (live) > persisted card-level > single-tool MCP fallback
-  // For bundle MCPs (multiple tools), never fall back to MCP aggregate topics.
+  // Priority: card saved topics (driver-inferred, real paths) > static tool definition > MCP fallback
+  // Static tool.topic_out may have empty topic paths for multiInstance/dynamic tools,
+  // so prefer savedTopicOut when it has real paths.
   const toolTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
   const toolTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
   const isBundleMcp = (mcp?.tools || []).length > 1;
-  const topicIn  = toolTopicIn  || (savedTopicIn?.length  ? savedTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
-  const topicOut = toolTopicOut || (savedTopicOut?.length ? savedTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
+  const savedOutHasReal = savedTopicOut?.some(t => t.topic);
+  const staticOutHasReal = toolTopicOut?.some(t => t.topic);
+  const savedInHasReal = savedTopicIn?.some(t => t.topic);
+  const staticInHasReal = toolTopicIn?.some(t => t.topic);
+  const topicIn  = (savedInHasReal  ? savedTopicIn  : null) || (staticInHasReal  ? toolTopicIn  : null) || (savedTopicIn?.length  ? savedTopicIn  : null) || (toolTopicIn?.length  ? toolTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
+  const topicOut = (savedOutHasReal ? savedTopicOut : null) || (staticOutHasReal ? toolTopicOut : null) || (savedTopicOut?.length ? savedTopicOut : null) || (toolTopicOut?.length ? toolTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
   const effectiveType = toolType || (topicIn.length && topicOut.length ? 'processor' : topicOut.length ? 'sensor' : topicIn.length ? 'actuator' : '');
 
   el.className = `canvas-card${effectiveType ? ' ' + effectiveType : ''}`;
@@ -457,8 +510,10 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       const liveMcp = _allMcps.find(m => m.id === mcpId);
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
-        const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
-        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut });
+        const liveCard = _cards.find(c => c.id === id);
+        const liveTopicOut = (liveCard?.topicOut?.length ? liveCard.topicOut : null)
+          || [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
+        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
   } else if (effectiveType === 'sensor') {
@@ -467,7 +522,14 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     const sensorRequired = schema?.required || [];
     const _SENSOR_SYS_ACTIONS = new Set(['start', 'stop', 'info', 'config']);
     const sensorActionDef = sensorProps.action;
-    const hasSensorActions = sensorActionDef?.enum?.some(a => !_SENSOR_SYS_ACTIONS.has(a));
+    // Support both enum (plain list) and oneOf [{const, title}] formats
+    const _actionVals = def => def?.enum || (def?.oneOf?.map(o => o.const).filter(v => v != null)) || [];
+    const hasSensorActions = _actionVals(sensorActionDef).some(a => !_SENSOR_SYS_ACTIONS.has(a));
+
+    // Instance config button (for multiInstance sensors with instance-scope fields)
+    const sensorInstanceCfgBtn = hasInstanceFields
+      ? `<button class="canvas-card-instance-cfg-btn" title="实例配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
+      : '';
 
     let sensorFieldsHtml = '';
     if (hasSensorActions) {
@@ -475,10 +537,15 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const isReq = sensorRequired.includes(key);
         const label = key + (isReq ? ' *' : '');
         let inputHtml;
-        if (def.enum) {
-          const enumVals = key === 'action' ? def.enum.filter(v => !_SENSOR_SYS_ACTIONS.has(v)) : def.enum;
+        const rawVals = _actionVals(def);
+        if (rawVals.length || def.enum || def.oneOf) {
+          // Build label map from oneOf titles
+          const titleMap = {};
+          (def.oneOf || []).forEach(o => { if (o.const != null) titleMap[o.const] = o.title || o.const; });
+          const allVals = rawVals.length ? rawVals : (def.enum || []);
+          const enumVals = key === 'action' ? allVals.filter(v => !_SENSOR_SYS_ACTIONS.has(v)) : allVals;
           if (!enumVals.length) return '';
-          const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(v)}</option>`).join('');
+          const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(titleMap[v] || v)}</option>`).join('');
           inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
@@ -500,6 +567,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
+          ${sensorInstanceCfgBtn}
           <button class="tool-card-info-btn canvas-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
           <button class="canvas-card-close" title="从画布移除">✕</button>
         </div>
@@ -524,10 +592,25 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       const liveMcp = _allMcps.find(m => m.id === mcpId);
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
-        const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
-        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut });
+        const liveCard = _cards.find(c => c.id === id);
+        const liveTopicOut = (liveCard?.topicOut?.length ? liveCard.topicOut : null)
+          || [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
+        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
+
+    // Instance config button (multiInstance sensors with instance-scope fields)
+    const sensorInstanceCfgBtnEl = el.querySelector('.canvas-card-instance-cfg-btn');
+    if (sensorInstanceCfgBtnEl) {
+      sensorInstanceCfgBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // Re-lookup configSchema at click time to avoid stale closure
+        const liveMcp2 = _allMcps.find(m => m.id === mcpId);
+        const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
+        const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
+      });
+    }
 
     el.querySelector('.canvas-view-btn').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -540,7 +623,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (sensorExecBtn) {
       sensorExecBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        await _executeCard(el, mcpId, toolName);
+        await _executeCard(el, mcpId, toolName, id);
       });
     }
   } else {
@@ -588,6 +671,10 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     // Processor cards get a "查看数据流" button if they have output topics
     const showViewBtn = effectiveType === 'processor' && topicOut.length > 0;
 
+    const instanceCfgBtn = hasInstanceFields
+      ? `<button class="canvas-card-instance-cfg-btn" title="实例配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
+      : '';
+
     el.innerHTML = `
       <div class="canvas-card-body-wrap">
         <div class="canvas-card-header">
@@ -595,6 +682,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
+          ${instanceCfgBtn}
           <button class="tool-card-info-btn canvas-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
           <button class="canvas-card-close" title="从画布移除">✕</button>
         </div>
@@ -639,10 +727,25 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       const liveMcp = _allMcps.find(m => m.id === mcpId);
       if (liveMcp) {
         const liveTopicIn  = _collectInTopics(id, el);
-        const liveTopicOut = [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
-        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut });
+        const liveCard = _cards.find(c => c.id === id);
+        const liveTopicOut = (liveCard?.topicOut?.length ? liveCard.topicOut : null)
+          || [...el.querySelectorAll('.canvas-port.out')].map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
+        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: liveTopicOut, instanceId: id });
       }
     });
+
+    // Instance config button (for multiInstance tools with instance-scope fields)
+    const instanceCfgBtnEl = el.querySelector('.canvas-card-instance-cfg-btn');
+    if (instanceCfgBtnEl) {
+      instanceCfgBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // Re-lookup configSchema at click time to avoid stale closure
+        const liveMcp2 = _allMcps.find(m => m.id === mcpId);
+        const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
+        const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
+      });
+    }
 
     const execBtn = el.querySelector('.canvas-exec-btn');
     if (execBtn) {
@@ -831,7 +934,11 @@ function _setupPortDrag() {
           // Use resolved topic from the destination's in-port
           const resolvedInPort = toCard.querySelector(`.canvas-port.in[data-idx="${inPort.dataset.idx}"]`);
           const resolvedTopic = resolvedInPort?.dataset.topic || _draggingConn.topic;
-          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic });
+          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic, instance_id: toCardData.id });
+        }
+        // Ask driver to infer output topics for the destination card based on connected input topic
+        if (toCardData && _draggingConn.topic) {
+          _fetchTopicsFromDriver(toCardData, _draggingConn.topic);
         }
       }
     }
@@ -904,6 +1011,8 @@ function _redrawConnections() {
   if (!_connSvg) return;
   _connSvg.querySelectorAll('.connector-line, .connector-hit').forEach(l => l.remove());
   _viewport.querySelectorAll('.conn-delete-btn').forEach(b => b.remove());
+  // Force synchronous layout flush so compositor layer is invalidated immediately
+  void _connSvg.getBoundingClientRect();
 
   for (const conn of _connections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
@@ -1070,10 +1179,16 @@ function _resolveAllTopics() {
     const tools = mcp?.tools || [];
     const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
     const toolTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
-    // Priority: tool-level (live) > persisted card-level > single-tool MCP fallback
+    // Priority: card.topicOut (driver-inferred, has real paths) > static tool definition > MCP fallback
+    // card.topicOut is populated by _fetchTopicsFromDriver; static tool.topic_out may have empty topic paths
+    // for multiInstance tools, so only fall back to it when card has no real topics.
     const isBundleMcp = (mcp?.tools || []).length > 1;
     const toolType = (typeof toolObj === 'object' ? toolObj.type : '') || '';
-    const topicOut = toolTopicOut || (card.topicOut?.length ? card.topicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
+    const cardHasRealTopic = card.topicOut?.some(t => t.topic);
+    const staticHasRealTopic = toolTopicOut?.some(t => t.topic);
+    const topicOut = (cardHasRealTopic ? card.topicOut : null)
+      || (staticHasRealTopic ? toolTopicOut : null)
+      || (card.topicOut?.length ? card.topicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
 
     const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
     for (let i = 0; i < outPorts.length; i++) {
@@ -1105,17 +1220,6 @@ function _resolveAllTopics() {
     const card = queue.shift();
     if (visited.has(card.id)) continue;
     visited.add(card.id);
-
-    // Derive out-port topics from in-port topic (if not already static)
-    const inPorts = [...card.el.querySelectorAll('.canvas-port.in')];
-    // Use first connected in-port topic as derivation source
-    const inTopic = inPorts.find(p => p.dataset.topic)?.dataset.topic || '';
-
-    for (const outPort of card.el.querySelectorAll('.canvas-port.out')) {
-      if (!outPort.dataset.topic && inTopic) {
-        outPort.dataset.topic = inTopic + '/' + (card.toolName || 'output');
-      }
-    }
 
     // Propagate to downstream cards
     for (const conn of outgoing[card.id]) {
@@ -1151,7 +1255,7 @@ function _autoStopOnDisconnect(cardId, portIdx, topic) {
   if (stillConnected) return;
   const card = _cards.find(c => c.id === cardId);
   if (!card) return;
-  _triggerAction(card.mcpId, card.toolName, 'stop', topic ? { input_topic: topic } : {});
+  _triggerAction(card.mcpId, card.toolName, 'stop', topic ? { input_topic: topic, instance_id: card.id } : { instance_id: card.id });
 }
 
 async function _startProject() {
@@ -1163,8 +1267,8 @@ async function _startProject() {
     const mcp = _allMcps.find(m => m.id === c.mcpId);
     const tools = mcp?.tools || [];
     const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === c.toolName);
-    const hasConfigSchema = typeof toolObj === 'object' && !!toolObj.configSchema;
-    return hasConfigSchema && !isToolConfigured(c.mcpId, c.toolName);
+    const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
+    return hasSharedRequired(configSchema) && !isToolConfigured(c.mcpId, c.toolName);
   });
   if (unconfigured.length) {
     const names = unconfigured.map(c => c.toolName).join(', ');
@@ -1192,9 +1296,9 @@ async function _startProject() {
 
   // Start all cards on canvas, resolving input_topic(s) from connections
   for (const card of _cards) {
-    // Collect ALL inbound connections to support multiple input topics
+    // Collect ALL inbound connections to support multiple input topics (deduplicate)
     const inConns = _connections.filter(c => c.toCardId === card.id);
-    const topics = inConns.map(conn => conn.fromTopic || '').filter(Boolean);
+    const topics = [...new Set(inConns.map(conn => conn.fromTopic || '').filter(Boolean))];
 
     let args;
     if (topics.length > 1) {
@@ -1204,8 +1308,23 @@ async function _startProject() {
     } else {
       args = {};
     }
-    _triggerAction(card.mcpId, card.toolName, 'start', args);
+    args.instance_id = card.id;
+    const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
+    if (startResult && startResult.code !== 200) {
+      _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
+    }
+    // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
+    const parsed = _parseMcpCallResult(startResult);
+    if (parsed?.topic_out?.some(t => t.topic)) {
+      card.topicOut = parsed.topic_out;
+      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+      parsed.topic_out.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      _resolveAllTopics();  // re-propagate updated topic paths into conn.fromTopic before next card starts
+      _redrawConnections();
+    }
   }
+  // Immediately persist layout so monitor-dashboard can read inferred topic paths
+  await _saveLayout();
   // 持久化运行状态
   fetch('/api/config/project-running', {
     method: 'PUT', headers: {'Content-Type': 'application/json'},
@@ -1232,6 +1351,7 @@ function _stopProject() {
     } else {
       args = {};
     }
+    args.instance_id = card.id;
     _triggerAction(card.mcpId, card.toolName, 'stop', args);
   }
   // 持久化运行状态
@@ -1252,13 +1372,59 @@ function _syncProjectBtn() {
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
   try {
-    await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+    const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tool: toolName, arguments: { action, ...extraArgs } }),
     });
+    return await res.json();
   } catch (err) {
     console.error(`[canvas] ${action} call failed:`, err);
+    return null;
+  }
+}
+
+/**
+ * Parse the result of a /api/mcp/{id}/call response.
+ * The API wraps driver responses as MCP content arrays: {code:200, data:[{type:"text",text:"..."}]}
+ * Returns the parsed JSON object, or null on failure.
+ */
+function _parseMcpCallResult(json) {
+  if (!json || json.code !== 200) return null;
+  const data = json.data;
+  if (Array.isArray(data)) {
+    const text = data[0]?.text;
+    if (text) { try { return JSON.parse(text); } catch { return null; } }
+    return null;
+  }
+  if (typeof data === 'string') { try { return JSON.parse(data); } catch { return null; } }
+  return typeof data === 'object' && data !== null ? data : null;
+}
+
+/**
+ * Ask the driver to infer topics for a card given an optional input topic.
+ * Used for multiInstance sensors (_addCard) and processors (after wiring).
+ * Updates card.topicOut and DOM out-ports if driver returns non-empty topics.
+ */
+async function _fetchTopicsFromDriver(card, inputTopic) {
+  try {
+    const resp = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool: card.toolName, arguments: { action: 'info', instance_id: card.id, input_topic: inputTopic } }),
+    });
+    const data = await resp.json();
+    const parsed = _parseMcpCallResult(data);
+    const topicOut = parsed?.topic_out;
+    if (topicOut?.some(t => t.topic)) {
+      card.topicOut = topicOut;
+      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+      topicOut.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      _redrawConnections();
+      _debouncedSave();
+    }
+  } catch (e) {
+    console.warn('[canvas] info fetch failed:', e);
   }
 }
 
@@ -1282,11 +1448,11 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
     const res = await fetch(`/api/mcp/${encodeURIComponent(mcp.id)}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool: toolName, arguments: { action: 'info' } }),
+      body: JSON.stringify({ tool: toolName, arguments: { action: 'info', instance_id: opts.instanceId || '' } }),
     });
     const json = await res.json();
-    if (json.code === 200 && json.data) {
-      const info = typeof json.data === 'string' ? JSON.parse(json.data) : json.data;
+    const info = _parseMcpCallResult(json);
+    if (info) {
       // Only override with info result if it has non-empty topic paths;
       // otherwise keep the live DOM-resolved topics passed in opts.
       if (info.topic_in && info.topic_in.some(t => t.topic)) opts.topicIn = info.topic_in;
@@ -1299,7 +1465,7 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 
 // ── Execute ───────────────────────────────────────────────────────────────────
 
-async function _executeCard(el, mcpId, toolName) {
+async function _executeCard(el, mcpId, toolName, instanceId) {
   const btn = el.querySelector('.canvas-exec-btn');
   btn.disabled = true;
   btn.textContent = '执行中…';
@@ -1315,6 +1481,9 @@ async function _executeCard(el, mcpId, toolName) {
       else args[key] = val;
     }
   });
+
+  // Inject instance_id from card identity so multiInstance tools can resolve device_path
+  if (instanceId && !args.instance_id) args.instance_id = instanceId;
 
   // Auto-inject resolved topics from connected ports (based on schema, not DOM fields)
   const inPorts = [...el.querySelectorAll('.canvas-port.in')];
@@ -1365,9 +1534,15 @@ async function _executeCard(el, mcpId, toolName) {
 }
 
 function _showResult(el, text, isError) {
-  // Remove any previous inline result (results now go to the log panel only)
   const existing = el.querySelector('.canvas-result');
   if (existing) existing.remove();
+  const wrapper = document.createElement('div');
+  wrapper.className = 'canvas-result';
+  const pre = document.createElement('pre');
+  pre.className = 'canvas-result-pre' + (isError ? ' error' : '');
+  pre.textContent = text;
+  wrapper.appendChild(pre);
+  el.appendChild(wrapper);
 }
 
 function _logActivity(type, msg) {
@@ -1398,6 +1573,7 @@ function _makeDraggable(el, cardData) {
   header.addEventListener('pointerdown', (e) => {
     if (e.target.closest('.canvas-card-close')) return;
     if (e.target.closest('.canvas-card-info-btn')) return;
+    if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
     if (_projectRunning) return;
     e.preventDefault();
     e.stopPropagation();

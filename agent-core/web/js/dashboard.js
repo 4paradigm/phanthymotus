@@ -379,8 +379,8 @@ function mountRenderer(skill) {
 
   // Build topic badges
   const topicBadges = [
-    hasIn  ? `<span class="topic-badge topic-in"  title="输入 topic"><span class="topic-dir">IN</span>${topicIn.topic  || topicIn.format  || ''}</span>` : '',
-    hasOut ? `<span class="topic-badge topic-out" title="输出 topic"><span class="topic-dir">OUT</span>${topicOut.topic || topicOut.format || ''}</span>` : '',
+    hasIn  ? `<span class="topic-badge topic-in"  title="${topicIn.topic  || ''}"><span class="topic-dir">IN</span>${topicIn.topic  || topicIn.format  || ''}</span>` : '',
+    hasOut ? `<span class="topic-badge topic-out" title="${topicOut.topic || ''}"><span class="topic-dir">OUT</span>${topicOut.topic || topicOut.format || ''}</span>` : '',
   ].filter(Boolean).join('');
 
   toolbar.innerHTML = `
@@ -406,7 +406,7 @@ function mountRenderer(skill) {
     inPanel.innerHTML = `
       <div class="renderer-panel-header topic-in-header">
         <span class="topic-dir-label">in_topic</span>
-        <span class="topic-path">${topicIn.topic || '—'}</span>
+        <span class="topic-path" title="${topicIn.topic || ''}">${topicIn.topic || '—'}</span>
         <span class="topic-fmt">${topicIn.format || ''}</span>
       </div>`;
     const inBody = document.createElement('div');
@@ -437,7 +437,7 @@ function mountRenderer(skill) {
     outPanel.innerHTML = `
       <div class="renderer-panel-header topic-out-header">
         <span class="topic-dir-label">out_topic</span>
-        <span class="topic-path">${topicOut.topic || '—'}</span>
+        <span class="topic-path" title="${topicOut.topic || ''}">${topicOut.topic || '—'}</span>
         <span class="topic-fmt">${topicOut.format || ''}</span>
       </div>`;
     const outBody = document.createElement('div');
@@ -456,7 +456,7 @@ function mountRenderer(skill) {
     singleHeader.className = `renderer-panel-header ${hdrCls}`;
     singleHeader.innerHTML = `
       <span class="topic-dir-label">${dir}</span>
-      <span class="topic-path">${topic}</span>
+      <span class="topic-path" title="${topic}">${topic}</span>
       <span class="topic-fmt">${fmt}</span>`;
     rendererWrap.appendChild(singleHeader);
 

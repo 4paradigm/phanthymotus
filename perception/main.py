@@ -61,7 +61,16 @@ class PerceptionBundle:
             self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
             log.info("TTSPlugin loaded")
 
-        # 未来扩展：VLM、SLAM、语义分割等插件在此添加
+        if plugins_cfg.get("htmsg", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["htmsg"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.htmsg import HTMSGPlugin
+            plugin = HTMSGPlugin(plugins_cfg["htmsg"], namespace, executor)
+            self._plugins.append(plugin)
+            plugin.start()
+            log.info("HTMSGPlugin loaded (namespace=%s)", namespace)
 
     def get_all_tools(self) -> list:
         tools = []

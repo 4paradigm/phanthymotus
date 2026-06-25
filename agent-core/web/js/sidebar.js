@@ -35,12 +35,17 @@ async function _loadToolConfigs() {
   } catch (e) { /* ignore */ }
 }
 
-/** Check if a tool (by mcp_id:tool_name key) is configured. */
+/** Check if a tool (by mcp_id:tool_name key) has shared config saved. */
 export function isToolConfigured(mcpId, toolName) {
   return !!_toolConfigs[`${mcpId}:${toolName}`];
 }
 
-/** Get all unconfigured tools that are on the canvas (for startProject check). */
+/** Check if a specific instance has instance config saved. */
+export function isInstanceConfigured(mcpId, toolName, instanceId) {
+  return !!_toolConfigs[`${mcpId}:${toolName}:${instanceId}`];
+}
+
+/** Get all tool configs (shared + instance). */
 export function getToolConfigs() { return _toolConfigs; }
 
 /**
@@ -183,15 +188,17 @@ function _buildToolCard(mcp, tool) {
 
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const configKey = `${mcp.id}:${tool.name}`;
-  const configured = !!_toolConfigs[configKey];
+  // Only tools with shared (non-instance-scope) fields need sidebar-level configuration
+  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
 
   // Badge
   const badgeHtml = toolType
     ? `<span class="cap-type-badge ${_esc(toolType)}">${_esc(toolType)}</span>`
     : '';
 
-  // Config status indicator
-  const configHtml = configSchema
+  // Config status indicator — only for tools that have shared fields to configure
+  const configHtml = hasSharedFields
     ? `<span class="tool-card-config-status ${configured ? 'configured' : 'unconfigured'}" title="${configured ? '已配置' : '未配置'}">${configured ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'}</span>`
     : '';
 
@@ -206,7 +213,7 @@ function _buildToolCard(mcp, tool) {
         <span class="tool-card-name" title="${_esc(tool.name)}">${_esc(tool.name)}</span>
       </div>
       <div class="tool-card-actions">
-        ${configSchema ? '<button class="tool-card-config-btn" title="配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>' : ''}
+        ${hasSharedFields ? '<button class="tool-card-config-btn" title="配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>' : ''}
         <button class="tool-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
       </div>
     </div>
@@ -220,8 +227,8 @@ function _buildToolCard(mcp, tool) {
     _showDetail(mcp, tool);
   });
 
-  // Config button
-  if (configSchema) {
+  // Config button (only rendered for tools with shared fields)
+  if (hasSharedFields) {
     card.querySelector('.tool-card-config-btn').addEventListener('click', (e) => {
       e.stopPropagation();
       _openToolConfigModal(mcp.id, tool.name, configSchema);
@@ -234,7 +241,9 @@ function _buildToolCard(mcp, tool) {
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
       mcpId: mcp.id, toolName: tool.name, driverName: mcp.server_name || mcp.name || mcp.id,
-      hasConfig: !!configSchema, configured,
+      hasConfig: !!hasSharedFields, configured,
+      multiInstance: !!(tool.multiInstance),
+      hasInstanceConfig: _hasInstanceFields(configSchema),
     }));
   });
   card.addEventListener('dragend', () => card.classList.remove('dragging-source'));
@@ -242,7 +251,23 @@ function _buildToolCard(mcp, tool) {
   return card;
 }
 
-// ── Tool config modal ────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+/** Check if a configSchema has any instance-scope fields. */
+function _hasInstanceFields(configSchema) {
+  if (!configSchema || !configSchema.properties) return false;
+  return Object.values(configSchema.properties).some(def => def.scope === 'instance');
+}
+
+/** Check if a configSchema has any shared-scope required fields. */
+export function hasSharedRequired(configSchema) {
+  if (!configSchema) return false;
+  const props = configSchema.properties || {};
+  const required = configSchema.required || [];
+  return required.some(k => props[k] && props[k].scope !== 'instance');
+}
+
+// ── Tool config modal (shared fields only) ────────────────────────────────────
 
 function _openToolConfigModal(mcpId, toolName, configSchema) {
   if (isProjectRunning()) {
@@ -262,13 +287,34 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   const configKey = `${mcpId}:${toolName}`;
   const savedValues = _toolConfigs[configKey] || {};
 
+  // If all fields are instance-scope, show them here too (as shared defaults)
+  const hasSharedFields = Object.values(props).some(d => d.scope !== 'instance');
+
   for (const [key, def] of Object.entries(props)) {
+    // Skip instance-scope fields only if there are also shared fields
+    if (hasSharedFields && def.scope === 'instance') continue;
     const label = document.createElement('label');
     label.className = 'tool-config-label';
     label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
-    if (def.enum && Array.isArray(def.enum)) {
+    if (def.oneOf && Array.isArray(def.oneOf)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `-- 请选择 --`;
+      input.appendChild(placeholder);
+      for (const item of def.oneOf) {
+        const option = document.createElement('option');
+        option.value = item.const ?? '';
+        option.textContent = item.title || String(item.const);
+        if (String(savedValues[key]) === String(item.const)) option.selected = true;
+        input.appendChild(option);
+      }
+      if (savedValues[key] != null) input.value = savedValues[key];
+    } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
@@ -285,6 +331,17 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
         input.appendChild(option);
       }
       if (savedValues[key]) input.value = savedValues[key];
+    } else if (def.type === 'boolean') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const optTrue = document.createElement('option');
+      optTrue.value = 'true'; optTrue.textContent = '是';
+      const optFalse = document.createElement('option');
+      optFalse.value = 'false'; optFalse.textContent = '否';
+      input.appendChild(optTrue);
+      input.appendChild(optFalse);
+      input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -304,7 +361,12 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     const values = {};
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();
-      if (v) values[input.dataset.key] = v;
+      if (!v) return;
+      const fieldDef = props[input.dataset.key];
+      if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
+      else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
+      else if (fieldDef?.type === 'boolean') values[input.dataset.key] = v === 'true';
+      else values[input.dataset.key] = v;
     });
 
     // Save to per-tool API
@@ -373,8 +435,8 @@ function _showDetail(mcp, tool, opts = {}) {
   const schema       = typeof tool === 'object' && tool.inputSchema ? JSON.stringify(tool.inputSchema, null, 2) : null;
   const description  = typeof tool === 'object' ? tool.description : null;
 
-  const topicIn  = topicInData.map(t => `<li><code>${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
-  const topicOut = topicOutData.map(t => `<li><code>${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
+  const topicIn  = topicInData.map(t => `<li><code title="${_esc(t.topic || '?')}">${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
+  const topicOut = topicOutData.map(t => `<li><code title="${_esc(t.topic || '?')}">${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
 
   body.innerHTML = `
     ${description ? `<div class="detail-section"><div class="detail-label">描述</div><div class="detail-text">${_esc(description)}</div></div>` : ''}
@@ -392,6 +454,146 @@ function _showDetail(mcp, tool, opts = {}) {
 
 function _hideDetail() {
   _backdrop.classList.add('hidden');
+}
+
+// ── Instance config modal (instance-scope fields only) ────────────────────────
+
+/**
+ * Open a config modal for a specific canvas card instance.
+ * Only shows fields with scope === "instance".
+ */
+export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
+  if (isProjectRunning()) {
+    alert('请停止智能控制后修改');
+    return;
+  }
+  const overlay = document.getElementById('tool-config-overlay');
+  const titleEl = document.getElementById('tool-config-title');
+  const bodyEl  = document.getElementById('tool-config-body');
+  const saveBtn = document.getElementById('tool-config-save');
+
+  titleEl.textContent = `实例配置 ${toolName}`;
+  bodyEl.innerHTML = '';
+
+  const props = (configSchema && configSchema.properties) || {};
+  const required = (configSchema && configSchema.required) || [];
+  const configKey = `${mcpId}:${toolName}:${instanceId}`;
+  const savedValues = _toolConfigs[configKey] || {};
+
+  let hasFields = false;
+  for (const [key, def] of Object.entries(props)) {
+    // Only show instance-scope fields
+    if (def.scope !== 'instance') continue;
+    hasFields = true;
+
+    const label = document.createElement('label');
+    label.className = 'tool-config-label';
+    label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
+
+    let input;
+    if (def.oneOf && Array.isArray(def.oneOf)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `-- 请选择 --`;
+      input.appendChild(placeholder);
+      for (const item of def.oneOf) {
+        const option = document.createElement('option');
+        option.value = item.const ?? '';
+        option.textContent = item.title || String(item.const);
+        if (String(savedValues[key]) === String(item.const)) option.selected = true;
+        input.appendChild(option);
+      }
+      if (savedValues[key] != null) input.value = savedValues[key];
+    } else if (def.enum && Array.isArray(def.enum)) {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `-- 请选择 --`;
+      input.appendChild(placeholder);
+      for (const opt of def.enum) {
+        const option = document.createElement('option');
+        option.value = opt;
+        option.textContent = opt;
+        if (savedValues[key] === opt) option.selected = true;
+        input.appendChild(option);
+      }
+      if (savedValues[key]) input.value = savedValues[key];
+    } else if (def.type === 'boolean') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const optTrue = document.createElement('option');
+      optTrue.value = 'true'; optTrue.textContent = '是';
+      const optFalse = document.createElement('option');
+      optFalse.value = 'false'; optFalse.textContent = '否';
+      input.appendChild(optTrue);
+      input.appendChild(optFalse);
+      input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
+    } else {
+      input = document.createElement('input');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.type = def.format === 'password' ? 'password' : 'text';
+      input.placeholder = def.default || '';
+      input.value = savedValues[key] || '';
+    }
+
+    bodyEl.appendChild(label);
+    bodyEl.appendChild(input);
+  }
+
+  if (!hasFields) {
+    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">该组件无实例配置项</p>';
+  }
+
+  const close = () => { overlay.classList.add('hidden'); };
+  const save = async () => {
+    const values = {};
+    bodyEl.querySelectorAll('[data-key]').forEach(input => {
+      const v = input.value.trim();
+      if (!v) return;
+      const fieldDef = props[input.dataset.key];
+      if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
+      else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
+      else if (fieldDef?.type === 'boolean') values[input.dataset.key] = v === 'true';
+      else values[input.dataset.key] = v;
+    });
+
+    try {
+      await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(values),
+      });
+    } catch (err) { console.error('[config] instance save failed:', err); }
+
+    _toolConfigs[configKey] = values;
+    close();
+  };
+
+  const newSaveBtn = saveBtn.cloneNode(true);
+  saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
+  newSaveBtn.addEventListener('click', save);
+
+  const closeBtn = document.getElementById('tool-config-close');
+  if (closeBtn) {
+    const newCloseBtn = closeBtn.cloneNode(true);
+    closeBtn.parentNode.replaceChild(newCloseBtn, closeBtn);
+    newCloseBtn.addEventListener('click', close);
+  }
+  const cancelBtn = document.getElementById('tool-config-cancel');
+  if (cancelBtn) {
+    const newCancelBtn = cancelBtn.cloneNode(true);
+    cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+    newCancelBtn.addEventListener('click', close);
+  }
+
+  overlay.classList.remove('hidden');
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
