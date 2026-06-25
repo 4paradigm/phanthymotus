@@ -661,8 +661,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             await session.post(url, json=init_payload, headers=headers)
 
             # Auto-config: start 前自动 apply 已保存的 config (shared + instance merged)
+            # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
-            if action == 'start':
+            _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
+            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
                 # Check if this tool has configSchema (requires config before start)
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)

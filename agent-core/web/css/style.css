@@ -1292,6 +1292,7 @@ html, body {
   border: 1px solid var(--border);
   -webkit-user-select: text;
   user-select: text;
+  cursor: text;
 }
 .canvas-result-pre.error { color: var(--red); }
 
