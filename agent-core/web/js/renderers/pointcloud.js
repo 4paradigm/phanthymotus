@@ -8,9 +8,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-const MAX_POINTS = 50000;
-const FRAME_WINDOW = 5;           // sliding window: keep last 5 frames
-const MAX_POINTS_PER_FRAME = 10000;
+const MAX_POINTS = 40000;
+const FRAME_WINDOW = 1;           // single frame only — no motion ghosting
+const MAX_POINTS_PER_FRAME = 40000;
 
 export const PointCloudRenderer = {
   name: 'pointcloud',
