@@ -13,6 +13,8 @@ services:
       - FASTDDS_BUILTIN_TRANSPORTS=SHM
     volumes:
       - ./src/perception_stack/config.yaml:/work/config.yaml:ro
+    logging:
+      driver: local
     restart: unless-stopped
 
   # ── Layer 3: Agent Core（大脑层）─────────────────────────────────────────
@@ -29,6 +31,8 @@ services:
       - FASTDDS_BUILTIN_TRANSPORTS=SHM
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: local
     depends_on:
       - perception-stack
     restart: unless-stopped

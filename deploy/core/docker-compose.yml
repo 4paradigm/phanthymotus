@@ -21,6 +21,8 @@ services:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - FASTDDS_BUILTIN_TRANSPORTS=SHM
+    logging:
+      driver: local
     restart: unless-stopped
 
   # ── Hardware Bridge（躯体层）─────────────────────────────────────────────────
@@ -31,6 +33,8 @@ services:
     env_file: .env
     volumes:
       - ./data/spatial:/opt/phanthy-motus/data   # 地图PCD + 指纹DB 持久化
+    logging:
+      driver: local
     profiles:
       - hardware
     restart: unless-stopped
@@ -52,6 +56,8 @@ services:
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - FASTDDS_BUILTIN_TRANSPORTS=SHM
       - NVIDIA_VISIBLE_DEVICES=all
+    logging:
+      driver: local
     profiles:
       - perception
     restart: unless-stopped

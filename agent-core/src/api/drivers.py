@@ -134,6 +134,9 @@ def _deploy_sync(driver: dict) -> dict:
     if driver.get('volumes'):
         run_kwargs['volumes'] = driver['volumes']
 
+    # Use local logging driver to handle binary DDS output without corruption
+    run_kwargs['log_config'] = {'type': 'local'}
+
     container = client.containers.run(**run_kwargs)
     return {'status': 'starting', 'container_id': container.id[:12]}
 
