@@ -120,9 +120,9 @@ export const PointCloudRenderer = {
   _buildAxisMap(cfg) {
     const idxOf = s => ({ x: 0, y: 1, z: 2 }[s] ?? 1);
     this._axisMap = {
-      xIdx: idxOf(cfg?.axis_x_source ?? 'y'), xSign: (cfg?.axis_x_negate ?? false) ? -1 : 1,
-      yIdx: idxOf(cfg?.axis_y_source ?? 'z'), ySign: (cfg?.axis_y_negate ?? true) ? -1 : 1,
-      zIdx: idxOf(cfg?.axis_z_source ?? 'x'), zSign: (cfg?.axis_z_negate ?? true) ? -1 : 1,
+      xIdx: idxOf(cfg?.axis_x_source ?? 'y'), xSign: (cfg?.axis_x_negate ?? true) ? -1 : 1,
+      yIdx: idxOf(cfg?.axis_y_source ?? 'z'), ySign: (cfg?.axis_y_negate ?? false) ? -1 : 1,
+      zIdx: idxOf(cfg?.axis_z_source ?? 'x'), zSign: (cfg?.axis_z_negate ?? false) ? -1 : 1,
     };
   },
 
