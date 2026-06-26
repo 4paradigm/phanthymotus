@@ -268,7 +268,7 @@ def _run_odometry_process(namespace: str, config: dict,
             if not running:
                 return
 
-            data = bytes(msg.data)
+            data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
             points = _parse_ros2_cloud(data)
             if points is None:
                 return

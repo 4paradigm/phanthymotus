@@ -3,5 +3,6 @@
 services:
   perception-stack:
     runtime: nvidia
+    shm_size: '512m'       # 为视觉/点云大数据 SHM 缓冲区预留空间 (Jetson /dev/shm 默认较小)
     environment:
       - NVIDIA_VISIBLE_DEVICES=all

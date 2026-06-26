@@ -6,10 +6,11 @@ services:
       context: ./src/perception_stack
       dockerfile: Dockerfile
     network_mode: host     # 需要访问 ROS2 DDS；15720/15721 直接绑定到宿主机
+    ipc: host              # FastDDS SHM transport 需要共享 IPC namespace
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      - FASTDDS_BUILTIN_TRANSPORTS=SHM
     volumes:
       - ./src/perception_stack/config.yaml:/work/config.yaml:ro
     restart: unless-stopped
@@ -20,11 +21,12 @@ services:
       context: ./src/agent_core
       dockerfile: Dockerfile
     network_mode: host     # 需要访问 ROS2 DDS；0.0.0.0:15678 直接绑定到宿主机
+    ipc: host              # FastDDS SHM transport 需要共享 IPC namespace
     env_file: .env
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      - FASTDDS_BUILTIN_TRANSPORTS=SHM
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
