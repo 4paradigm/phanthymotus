@@ -102,9 +102,10 @@ def _deploy_sync(driver: dict) -> dict:
     # Jetson GPU: add nvidia runtime for images with '-jetson' tag
     if '-jetson' in target_image:
         run_kwargs['runtime'] = 'nvidia'
-        run_kwargs['environment'] = {'NVIDIA_VISIBLE_DEVICES': 'all'}
+        env_base = {'NVIDIA_VISIBLE_DEVICES': 'all'}
     else:
         run_kwargs['privileged'] = True
+        env_base = {}
     container_network = os.environ.get('CONTAINER_NETWORK', '')
     network_mode = driver.get('network_mode', '')
     if network_mode == 'host' or (not network_mode and not container_network):
@@ -127,8 +128,10 @@ def _deploy_sync(driver: dict) -> dict:
     for key in ('ROS_DOMAIN_ID', 'RMW_IMPLEMENTATION', 'FASTDDS_BUILTIN_TRANSPORTS'):
         if key not in env and os.environ.get(key):
             env[key] = os.environ[key]
-    if env:
-        run_kwargs['environment'] = env
+    # Merge with base env (e.g. NVIDIA_VISIBLE_DEVICES for Jetson)
+    final_env = {**env_base, **env}
+    if final_env:
+        run_kwargs['environment'] = final_env
 
     # Volume mounts from manifest
     if driver.get('volumes'):
