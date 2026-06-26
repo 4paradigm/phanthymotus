@@ -20,7 +20,7 @@ services:
       - RESTART_IMAGE=${REGISTRY}/${IMAGE_NAMESPACE}/restart:latest
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=SHM
+      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     logging:
       driver: local
     restart: unless-stopped
@@ -54,7 +54,7 @@ services:
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=SHM
+      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
       - NVIDIA_VISIBLE_DEVICES=all
     logging:
       driver: local

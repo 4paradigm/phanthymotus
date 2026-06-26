@@ -10,7 +10,7 @@ services:
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=SHM
+      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     volumes:
       - ./src/perception_stack/config.yaml:/work/config.yaml:ro
     logging:
@@ -28,7 +28,7 @@ services:
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=SHM
+      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     logging:
