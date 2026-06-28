@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+plugins/vop.py — VideoObjectPerceptionPlugin: YOLOv8-World open-vocabulary object detection.
+
+Subscribes to image/jpeg topics, runs YOLOv8s-Worldv2 inference,
+publishes detected objects with center-relative normalized coordinates.
+Supports multi-instance (one instance per input topic).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import threading
+import time
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
+
+log = logging.getLogger(__name__)
+
+_LOW_LAT_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=2,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+_PUB_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+_MODEL_URLS = {
+    "yolov8s-worldv2": "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/yolov8s-worldv2.pt",
+}
+
+_COCO_80_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake",
+    "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop",
+    "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
+]
+
+TOOLS = [
+    {
+        "name": "vop",
+        "type": "processor",
+        "multiInstance": True,
+        "description": "Video Object Perception — detect objects in camera feed using open-vocabulary YOLO",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "stop", "info", "set_classes"],
+                    "description": "Action to perform"
+                },
+                "input_topic": {
+                    "type": "string",
+                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)"
+                },
+                "classes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Extra object classes to add on top of COCO-80 base (for set_classes action)"
+                },
+            },
+            "required": ["action"]
+        },
+        "configSchema": {
+            "type": "object",
+            "properties": {
+                "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "scope": "shared"},
+                "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "scope": "shared"},
+                "classes":    {"type": "array", "items": {"type": "string"}, "description": "Object classes to detect", "scope": "shared"},
+            },
+        },
+        "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
+        "topic_out": [{"format": "data/json",  "desc": "detected objects with positions"}],
+    }
+]
+
+
+# ── ROS2 Node (one per instance/topic) ────────────────────────────────────────
+
+class _VOPNode(Node):
+    """Per-topic YOLO inference node."""
+
+    def __init__(self, input_topic: str, model, confidence: float, fps: float,
+                 node_suffix: str):
+        super().__init__(f"vop_{node_suffix}")
+        self._input_topic = input_topic
+        self._output_topic = f"{input_topic}/objects"
+        self._model = model
+        self._confidence = confidence
+        self._frame_interval = 1.0 / max(fps, 0.1)
+
+        self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
+        self._sub: Optional[object] = None
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._last_inference_time = 0.0
+        self._detect_count = 0
+
+    def start(self) -> dict:
+        if self._sub is not None:
+            return {"state": "running", "input": self._input_topic, "output": self._output_topic}
+        self._stop_event.clear()
+        self._sub = self.create_subscription(
+            CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
+        )
+        self._worker = threading.Thread(target=self._inference_worker, daemon=True,
+                                        name=f"vop_worker_{self._input_topic}")
+        self._worker.start()
+        log.info(f"[vop] started: {self._input_topic} → {self._output_topic}")
+        return {"state": "running", "input": self._input_topic, "output": self._output_topic}
+
+    def stop(self) -> dict:
+        if self._sub is not None:
+            self.destroy_subscription(self._sub)
+            self._sub = None
+        self._stop_event.set()
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=3.0)
+        self._worker = None
+        log.info(f"[vop] stopped: {self._input_topic}")
+        return {"state": "idle", "input": self._input_topic}
+
+    def _image_cb(self, msg: CompressedImage):
+        now = time.monotonic()
+        if now - self._last_inference_time < self._frame_interval:
+            return
+        self._last_inference_time = now
+        # Drop old frame if queue full (no backpressure)
+        try:
+            self._frame_queue.put_nowait(msg.data)
+        except queue.Full:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frame_queue.put_nowait(msg.data)
+            except queue.Full:
+                pass
+
+    def _inference_worker(self):
+        while not self._stop_event.is_set():
+            try:
+                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                frame = cv2.imdecode(
+                    np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
+                )
+                if frame is None:
+                    continue
+                results = self._model(frame, conf=self._confidence, verbose=False)
+                objects = self._extract_objects(results[0], frame.shape)
+                self._publish_objects(objects)
+            except Exception as e:
+                log.error(f"[vop] inference error: {e}", exc_info=True)
+
+    def _extract_objects(self, result, shape) -> list:
+        H, W = shape[:2]
+        half_w, half_h = W / 2.0, H / 2.0
+        objects = []
+        for box in result.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            x_norm = round((cx - half_w) / half_w, 3)
+            y_norm = round((cy - half_h) / half_h, 3)
+            cls_id = int(box.cls[0])
+            name = result.names[cls_id]
+            conf = round(float(box.conf[0]), 2)
+            objects.append({"name": name, "position": [x_norm, y_norm], "confidence": conf})
+        return objects
+
+    def _publish_objects(self, objects: list):
+        self._detect_count += 1
+        msg = String()
+        msg.data = json.dumps({
+            "timestamp": time.time(),
+            "objects": objects,
+        }, ensure_ascii=False)
+        self._pub.publish(msg)
+
+
+# ── Plugin class ──────────────────────────────────────────────────────────────
+
+class VideoObjectPerceptionPlugin:
+    PREFIX = "vop"
+
+    def __init__(self, plugin_cfg: dict, namespace: str, executor):
+        self._namespace = namespace
+        self._executor = executor
+        self._confidence = float(plugin_cfg.get("confidence", 0.3))
+        self._fps = int(plugin_cfg.get("fps", 5))
+        self._model_name = plugin_cfg.get("model", "yolov8s-worldv2")
+        self._base_classes = list(_COCO_80_CLASSES)
+        self._extra_classes: list[str] = plugin_cfg.get("classes") or []
+        self._classes = self._base_classes + [c for c in self._extra_classes if c not in self._base_classes]
+        self._model = None  # lazy load
+        self._model_lock = threading.Lock()
+        self._nodes: dict[str, _VOPNode] = {}
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return
+        with self._model_lock:
+            if self._model is not None:
+                return
+            from ultralytics import YOLO
+
+            model_path = self._resolve_model_path()
+            log.info(f"[vop] loading model: {model_path}")
+            self._model = YOLO(model_path)
+            self._model.set_classes(self._classes)
+            log.info(f"[vop] model loaded, classes={self._classes}")
+
+    def _resolve_model_path(self) -> str:
+        """Resolve model path: local file, config path, or download from COS."""
+        # If config provides an absolute/relative path that exists, use it
+        candidate = self._model_name if self._model_name.endswith(".pt") else f"{self._model_name}.pt"
+        if os.path.isfile(candidate):
+            return candidate
+
+        # Check cache directory
+        cache_dir = os.environ.get("YOLO_MODEL_DIR", "/opt/phanthy-motus/models")
+        cached = os.path.join(cache_dir, os.path.basename(candidate))
+        if os.path.isfile(cached):
+            return cached
+
+        # Download from COS mirror
+        base_name = self._model_name.replace(".pt", "")
+        url = _MODEL_URLS.get(base_name)
+        if not url:
+            # Fallback: let ultralytics handle download
+            return candidate
+
+        os.makedirs(cache_dir, exist_ok=True)
+        log.info(f"[vop] downloading model from {url} → {cached}")
+        urllib.request.urlretrieve(url, cached)
+        log.info(f"[vop] download complete: {cached}")
+        return cached
+
+    def get_tools(self) -> list:
+        return TOOLS
+
+    def dispatch(self, name: str, args: dict) -> dict | None:
+        action = args.get("action", name)
+        instance_id = args.get("instance_id", "")
+
+        if action == "info":
+            instances = {}
+            for key, node in self._nodes.items():
+                instances[key] = {
+                    "input": node._input_topic,
+                    "output": node._output_topic,
+                    "detect_count": node._detect_count,
+                }
+            return {
+                "name": "VideoObjectPerception", "model": self._model_name,
+                "state": "running" if self._nodes else "idle",
+                "classes": self._classes,
+                "instances": instances,
+            }
+
+        elif action == "start":
+            input_topic = args.get("input_topic")
+            if not input_topic:
+                topics_list = args.get("input_topics") or []
+                if topics_list:
+                    input_topic = topics_list[0]
+            if not input_topic:
+                raise ValueError("input_topic is required")
+            node_key = instance_id or input_topic
+            if node_key not in self._nodes:
+                self._ensure_model()
+                suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
+                node = _VOPNode(input_topic, self._model, self._confidence, self._fps,
+                                node_suffix=suffix)
+                self._executor.add_node(node)
+                self._nodes[node_key] = node
+            return self._nodes[node_key].start()
+
+        elif action == "stop":
+            if instance_id and instance_id in self._nodes:
+                node = self._nodes[instance_id]
+                result = node.stop()
+                self._executor.remove_node(node)
+                del self._nodes[instance_id]
+                return result
+            elif not instance_id and self._nodes:
+                results = []
+                for key in list(self._nodes.keys()):
+                    node = self._nodes[key]
+                    node.stop()
+                    self._executor.remove_node(node)
+                    del self._nodes[key]
+                    results.append(key)
+                return {"state": "idle", "stopped_instances": results}
+            return {"state": "idle"}
+
+        elif action == "set_classes":
+            classes = args.get("classes")
+            if not classes:
+                raise ValueError("classes list is required")
+            # Additive: merge extra classes onto base COCO 80
+            self._extra_classes = classes
+            self._classes = self._base_classes + [c for c in classes if c not in self._base_classes]
+            if self._model is not None:
+                self._model.set_classes(self._classes)
+                log.info(f"[vop] classes updated: +{classes} (total {len(self._classes)})")
+            return {"base_classes": len(self._base_classes), "extra_classes": self._extra_classes, "total": len(self._classes)}
+
+        return None
