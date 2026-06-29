@@ -251,6 +251,12 @@ class VideoObjectPerceptionPlugin:
             if self._model is not None:
                 return
 
+            # Ensure model/CLIP caches use persistent volume
+            _model_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
+            os.makedirs(_model_dir, exist_ok=True)
+            os.environ.setdefault("TORCH_HOME", _model_dir)
+            os.environ.setdefault("YOLO_CONFIG_DIR", _model_dir)
+
             # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
             # and patch missing imshow for headless environments
             try:
@@ -292,8 +298,8 @@ class VideoObjectPerceptionPlugin:
         if os.path.isfile(candidate):
             return candidate
 
-        # Check cache directory
-        cache_dir = os.environ.get("YOLO_MODEL_DIR", "/opt/phanthy-motus/models")
+        # Check cache directory (mounted volume for persistence)
+        cache_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
         cached = os.path.join(cache_dir, os.path.basename(candidate))
         if os.path.isfile(cached):
             return cached
