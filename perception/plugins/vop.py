@@ -243,10 +243,12 @@ class VideoObjectPerceptionPlugin:
             return
         classes = self._get_all_classes()
         # Move model to CPU for set_classes (CLIP tokenizer outputs CPU tensors)
-        # ultralytics will move back to GPU automatically on next predict()
+        # then move back to GPU for inference
         try:
             self._model.model.cpu()
             self._model.set_classes(classes)
+            if self._device and self._device != "cpu":
+                self._model.model.to(self._device)
         except Exception as e:
             log.warning(f"[vop] set_classes failed: {e}, trying without device move")
             self._model.set_classes(classes)
@@ -305,8 +307,10 @@ class VideoObjectPerceptionPlugin:
             self._ensure_clip_weights()
 
             classes = self._get_all_classes()
-            # set_classes needs consistent device — run on CPU then move to GPU for inference
+            # set_classes on CPU (model loads on CPU by default), then move to GPU
             self._model.set_classes(classes)
+            if self._device != "cpu":
+                self._model.model.to(self._device)
             log.info(f"[vop] model loaded, {len(classes)} classes ({len(classes) - len(self._base_classes)} extra)")
 
     def _resolve_model_path(self) -> str:
