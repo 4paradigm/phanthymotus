@@ -250,6 +250,14 @@ class VideoObjectPerceptionPlugin:
         with self._model_lock:
             if self._model is not None:
                 return
+
+            # Patch cv2 for headless environments (Jetson containers without GUI)
+            import cv2
+            if not hasattr(cv2, 'imshow'):
+                cv2.imshow = lambda *a, **k: None
+                cv2.waitKey = lambda *a, **k: 0
+                cv2.destroyAllWindows = lambda *a, **k: None
+
             from ultralytics import YOLO
 
             model_path = self._resolve_model_path()
