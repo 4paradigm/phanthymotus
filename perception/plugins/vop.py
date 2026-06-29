@@ -326,23 +326,22 @@ class VideoObjectPerceptionPlugin:
     def _ensure_clip_weights(self):
         """Ensure CLIP ViT-B-32 weights exist where ultralytics expects them.
 
-        ultralytics uses WEIGHTS_DIR/clip/ which resolves to a relative path
-        "weights/clip/" from CWD (typically /work/weights/clip/).
+        ultralytics WEIGHTS_DIR = {YOLO_CONFIG_DIR}/weights, so clip.load()
+        uses {YOLO_CONFIG_DIR}/weights/clip/ as download_root.
         """
         clip_filename = "ViT-B-32.pt"
         model_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
 
-        # ultralytics WEIGHTS_DIR is relative "weights" → /work/weights/clip/
-        weights_clip_dir = os.path.join("/work", "weights", "clip")
+        # ultralytics looks at {YOLO_CONFIG_DIR}/weights/clip/
+        weights_clip_dir = os.path.join(model_dir, "weights", "clip")
         target_path = os.path.join(weights_clip_dir, clip_filename)
 
         if os.path.isfile(target_path):
             return
 
-        # Check persistent volume locations
+        # Check other persistent locations
         source_candidates = [
             os.path.join(model_dir, "clip", clip_filename),
-            os.path.join(model_dir, "weights", "clip", clip_filename),
         ]
         source_path = None
         for p in source_candidates:
@@ -355,14 +354,13 @@ class VideoObjectPerceptionPlugin:
             url = _MODEL_URLS.get("clip-vit-b-32")
             if not url:
                 return
-            persist_dir = os.path.join(model_dir, "clip")
-            os.makedirs(persist_dir, exist_ok=True)
-            source_path = os.path.join(persist_dir, clip_filename)
-            log.info(f"[vop] downloading CLIP weights from COS → {source_path}")
-            urllib.request.urlretrieve(url, source_path)
-            log.info(f"[vop] CLIP download complete: {source_path}")
+            os.makedirs(weights_clip_dir, exist_ok=True)
+            log.info(f"[vop] downloading CLIP weights from COS → {target_path}")
+            urllib.request.urlretrieve(url, target_path)
+            log.info(f"[vop] CLIP download complete: {target_path}")
+            return
 
-        # Place at /work/weights/clip/ where ultralytics actually looks
+        # Copy from source to target
         os.makedirs(weights_clip_dir, exist_ok=True)
         try:
             os.link(source_path, target_path)
