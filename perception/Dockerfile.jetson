@@ -28,9 +28,8 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
 # ── System deps ────────────────────────────────────────────────────
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated \
-        ffmpeg python3-pip build-essential cmake && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
