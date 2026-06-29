@@ -1,6 +1,5 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: dustynv/ros:humble-desktop-l4t-r35.3.1
-# Includes: ROS2 Humble + OpenCV + CUDA 11.4 + cuDNN (Ubuntu 22.04)
+# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
@@ -11,7 +10,7 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-llama
+ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
 
@@ -30,7 +29,7 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
 RUN rm -f /etc/apt/sources.list.d/* && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        ffmpeg python3-pip build-essential cmake libopenblas-base && \
+        ffmpeg python3-pip build-essential cmake && \
     rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
@@ -79,11 +78,6 @@ COPY perception/config.yaml /work/config.yaml
 
 EXPOSE 15720
 EXPOSE 15721
-# EXPOSE 15800
-
-# ── LLM server (disabled — uncomment to re-enable) ───────────────
-# ENV MODEL_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/Qwen3.5-2B-Q4_K_M.gguf
-# ENV MODEL_PATH=/models/Qwen3.5-2B-Q4_K_M.gguf
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
 RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.8/dist-packages/ros_ws.pth && \
@@ -92,25 +86,6 @@ RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.
 # ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
-
-# ── To re-enable llama-server, replace CMD with: ─────────────────
-# CMD ["/bin/bash", "-c", \
-#     "source /opt/ros/humble/install/setup.bash && \
-#      source /ros_ws/install/setup.bash && \
-#      if [ ! -f ${MODEL_PATH} ]; then \
-#        echo 'Downloading model...' && \
-#        mkdir -p /models && \
-#        curl -fSL -o ${MODEL_PATH} ${MODEL_URL}; \
-#      fi && \
-#      LD_PRELOAD=/usr/lib/aarch64-linux-gnu/tegra/libcuda.so.1 \
-#      llama-server \
-#        -m ${MODEL_PATH} \
-#        -ngl 99 --host 0.0.0.0 --port 15800 --alias Qwen3.5-2B \
-#        --flash-attn on \
-#        -c 32768 \
-#        --chat-template-kwargs '{\"enable_thinking\":false}' \
-#        --no-context-shift &\
-#      python3 /work/main.py"]
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
