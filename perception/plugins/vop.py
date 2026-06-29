@@ -259,12 +259,12 @@ class VideoObjectPerceptionPlugin:
             if self._model is not None:
                 return
 
-            # Ensure model/CLIP caches use persistent volume
+            # Ensure YOLO_CONFIG_DIR points to /work so WEIGHTS_DIR = /work/weights
+            # (CLIP weights are baked into image at /work/weights/clip/ViT-B-32.pt)
+            os.environ.setdefault("YOLO_CONFIG_DIR", "/work")
             _model_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
             os.makedirs(_model_dir, exist_ok=True)
             os.environ.setdefault("TORCH_HOME", _model_dir)
-            os.environ.setdefault("YOLO_CONFIG_DIR", _model_dir)
-            os.environ.setdefault("XDG_CACHE_HOME", _model_dir)
 
             # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
             # and patch missing imshow for headless environments
@@ -338,48 +338,24 @@ class VideoObjectPerceptionPlugin:
     def _ensure_clip_weights(self):
         """Ensure CLIP ViT-B-32 weights exist where ultralytics expects them.
 
-        ultralytics WEIGHTS_DIR = {YOLO_CONFIG_DIR}/weights, so clip.load()
-        uses {YOLO_CONFIG_DIR}/weights/clip/ as download_root.
+        With YOLO_CONFIG_DIR=/work, ultralytics WEIGHTS_DIR = /work/weights,
+        so clip.load(download_root=WEIGHTS_DIR/"clip") looks at /work/weights/clip/.
+        The file is baked into the Docker image at build time.
         """
         clip_filename = "ViT-B-32.pt"
-        model_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
-
-        # ultralytics looks at {YOLO_CONFIG_DIR}/weights/clip/
-        weights_clip_dir = os.path.join(model_dir, "weights", "clip")
-        target_path = os.path.join(weights_clip_dir, clip_filename)
+        target_path = "/work/weights/clip/" + clip_filename
 
         if os.path.isfile(target_path):
             return
 
-        # Check other persistent locations
-        source_candidates = [
-            os.path.join(model_dir, "clip", clip_filename),
-        ]
-        source_path = None
-        for p in source_candidates:
-            if os.path.isfile(p):
-                source_path = p
-                break
-
-        # Download from COS if not found
-        if source_path is None:
-            url = _MODEL_URLS.get("clip-vit-b-32")
-            if not url:
-                return
-            os.makedirs(weights_clip_dir, exist_ok=True)
-            log.info(f"[vop] downloading CLIP weights from COS → {target_path}")
-            urllib.request.urlretrieve(url, target_path)
-            log.info(f"[vop] CLIP download complete: {target_path}")
+        # Fallback: download from COS if not baked in (dev/local mode)
+        url = _MODEL_URLS.get("clip-vit-b-32")
+        if not url:
             return
-
-        # Copy from source to target
-        os.makedirs(weights_clip_dir, exist_ok=True)
-        try:
-            os.link(source_path, target_path)
-        except OSError:
-            import shutil
-            shutil.copy2(source_path, target_path)
-        log.info(f"[vop] CLIP weights placed at {target_path}")
+        os.makedirs("/work/weights/clip", exist_ok=True)
+        log.info(f"[vop] downloading CLIP weights from COS → {target_path}")
+        urllib.request.urlretrieve(url, target_path)
+        log.info(f"[vop] CLIP download complete: {target_path}")
 
     def _start_node(self, node_key: str, input_topic: str):
         """Create and start a VOPNode for the given topic."""

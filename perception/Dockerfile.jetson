@@ -69,6 +69,13 @@ RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
 RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
 
+# Pre-download CLIP weights into image (avoids 338MB download at runtime)
+RUN mkdir -p /work/weights/clip && \
+    python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt', '/work/weights/clip/ViT-B-32.pt')"
+
+# Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
+ENV YOLO_CONFIG_DIR=/work
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
