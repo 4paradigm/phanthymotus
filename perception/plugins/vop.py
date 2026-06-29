@@ -44,6 +44,7 @@ _PUB_QOS = QoSProfile(
 
 _MODEL_URLS = {
     "yolov8s-worldv2": "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/yolov8s-worldv2.pt",
+    "clip-vit-b-32": "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt",
 }
 
 _COCO_80_CLASSES = [
@@ -256,6 +257,7 @@ class VideoObjectPerceptionPlugin:
             os.makedirs(_model_dir, exist_ok=True)
             os.environ.setdefault("TORCH_HOME", _model_dir)
             os.environ.setdefault("YOLO_CONFIG_DIR", _model_dir)
+            os.environ.setdefault("XDG_CACHE_HOME", _model_dir)
 
             # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
             # and patch missing imshow for headless environments
@@ -287,6 +289,10 @@ class VideoObjectPerceptionPlugin:
             model_path = self._resolve_model_path()
             log.info(f"[vop] loading model: {model_path}")
             self._model = YOLO(model_path)
+
+            # Ensure CLIP weights are available locally before set_classes
+            self._ensure_clip_weights()
+
             classes = self._get_all_classes()
             self._model.set_classes(classes)
             log.info(f"[vop] model loaded, {len(classes)} classes ({len(classes) - len(self._base_classes)} extra)")
@@ -316,6 +322,39 @@ class VideoObjectPerceptionPlugin:
         urllib.request.urlretrieve(url, cached)
         log.info(f"[vop] download complete: {cached}")
         return cached
+
+    def _ensure_clip_weights(self):
+        """Download CLIP ViT-B-32 weights from COS if not present locally."""
+        # ultralytics CLIP looks for weights in its package dir or TORCH_HOME
+        clip_filename = "ViT-B-32.pt"
+        cache_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
+
+        # Check common locations
+        search_paths = [
+            os.path.join(cache_dir, clip_filename),
+            os.path.join(cache_dir, "clip", clip_filename),
+            "/work/weights/clip/" + clip_filename,
+        ]
+        for p in search_paths:
+            if os.path.isfile(p):
+                # Ensure TORCH_HOME/clip/ has it (where ultralytics CLIP looks)
+                torch_clip_dir = os.path.join(cache_dir, "clip")
+                torch_clip_path = os.path.join(torch_clip_dir, clip_filename)
+                if not os.path.isfile(torch_clip_path):
+                    os.makedirs(torch_clip_dir, exist_ok=True)
+                    os.symlink(p, torch_clip_path)
+                return
+
+        # Download from COS
+        url = _MODEL_URLS.get("clip-vit-b-32")
+        if not url:
+            return
+        torch_clip_dir = os.path.join(cache_dir, "clip")
+        os.makedirs(torch_clip_dir, exist_ok=True)
+        dest = os.path.join(torch_clip_dir, clip_filename)
+        log.info(f"[vop] downloading CLIP weights from COS → {dest}")
+        urllib.request.urlretrieve(url, dest)
+        log.info(f"[vop] CLIP download complete: {dest}")
 
     def get_tools(self) -> list:
         return TOOLS
