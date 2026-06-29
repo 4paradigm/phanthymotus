@@ -40,8 +40,8 @@ cat > "${TMPFILE}" <<DOCKERFILE
 FROM dustynv/l4t-pytorch:r35.3.1 AS pytorch-donor
 FROM ${BASE_IMAGE}
 RUN rm -f /etc/apt/sources.list.d/* && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends libopenblas-base libjpeg-dev libpng-dev && \
+    apt-get -o Acquire::AllowInsecureRepositories=true -o Acquire::AllowDowngradeToInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated libopenblas-base libjpeg-dev libpng-dev && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir ${TORCH_URL}
 # Copy pre-compiled torchvision (with CUDA NMS ops) from dustynv image
