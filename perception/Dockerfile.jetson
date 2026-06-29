@@ -61,11 +61,14 @@ RUN python3 -c "import cv2" 2>/dev/null || { \
     echo '_spec.loader.exec_module(_mod)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
     echo 'sys.modules["cv2"] = _mod' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py; \
     }
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    ultralytics && \
+# Install ultralytics WITHOUT replacing Jetson's CUDA torch (2.0.0+nv23.5)
+RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
+    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
 # ultralytics CLIP (GitHub via mirror, needed for set_classes)
-RUN pip3 install --no-cache-dir "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git"
+RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
