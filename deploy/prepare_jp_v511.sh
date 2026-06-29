@@ -40,9 +40,12 @@ cat > "${TMPFILE}" <<DOCKERFILE
 FROM ${BASE_IMAGE}
 RUN rm -f /etc/apt/sources.list.d/* && \
     apt-get update && \
-    apt-get install -y --no-install-recommends libopenblas-base && \
+    apt-get install -y --no-install-recommends libopenblas-base libjpeg-dev libpng-dev && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir ${TORCH_URL}
+# Build torchvision 0.15.1 from source (matches torch 2.0, includes CUDA NMS ops)
+RUN pip3 install --no-cache-dir --no-deps \
+    'git+https://github.com/pytorch/vision.git@v0.15.1'
 DOCKERFILE
 
 echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
