@@ -251,8 +251,26 @@ class VideoObjectPerceptionPlugin:
             if self._model is not None:
                 return
 
-            # Patch cv2 for headless environments (Jetson containers without GUI)
-            import cv2
+            # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
+            # and patch missing imshow for headless environments
+            try:
+                import cv2
+                # Test if cv2 is functional
+                _ = cv2.IMREAD_COLOR
+            except (ImportError, AttributeError):
+                import importlib.util, sys as _sys
+                import glob as _glob
+                # Find the .so directly
+                _so_candidates = _glob.glob("/usr/lib/python*/dist-packages/cv2/python-*/cv2.cpython-*.so")
+                if _so_candidates:
+                    _spec = importlib.util.spec_from_file_location("cv2", _so_candidates[0])
+                    _mod = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    _sys.modules["cv2"] = _mod
+                    import cv2
+                else:
+                    import cv2  # let it fail naturally
+
             if not hasattr(cv2, 'imshow'):
                 cv2.imshow = lambda *a, **k: None
                 cv2.waitKey = lambda *a, **k: 0
