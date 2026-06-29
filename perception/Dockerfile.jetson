@@ -66,7 +66,8 @@ RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
     "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} "torchvision==0.15.1" && \
+    pip3 install --no-cache-dir \
+    https://developer.download.nvidia.com/compute/redist/jp/v511/pytorch/torchvision-0.15.1a0+42759b1-cp38-cp38-linux_aarch64.whl && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
 # ultralytics CLIP (GitHub via mirror, needed for set_classes)
 RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
