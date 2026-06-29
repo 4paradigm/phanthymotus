@@ -19,7 +19,6 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -168,6 +167,7 @@ class _VOPNode(Node):
                 pass
 
     def _inference_worker(self):
+        import cv2
         while not self._stop_event.is_set():
             try:
                 jpeg_bytes = self._frame_queue.get(timeout=1.0)
