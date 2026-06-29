@@ -52,10 +52,18 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
+# Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
+RUN python3 -c "import cv2" 2>/dev/null || { \
+    echo 'import importlib.util, sys, os' > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_so = os.path.join(os.path.dirname(__file__), "python-3.8", "cv2.cpython-38-aarch64-linux-gnu.so")' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_spec = importlib.util.spec_from_file_location("cv2", _so)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_mod = importlib.util.module_from_spec(_spec)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_spec.loader.exec_module(_mod)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo 'sys.modules["cv2"] = _mod' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py; \
+    }
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     ultralytics && \
-    pip3 uninstall -y opencv-python 2>/dev/null; \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} opencv-python-headless
+    pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
