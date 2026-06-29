@@ -64,6 +64,8 @@ RUN python3 -c "import cv2" 2>/dev/null || { \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     ultralytics && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
+# ultralytics CLIP (GitHub via mirror, needed for set_classes)
+RUN pip3 install --no-cache-dir "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
@@ -107,6 +109,7 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 #      python3 /work/main.py"]
 
 CMD ["/bin/bash", "-c", \
-    "source /opt/ros/humble/install/setup.bash && \
+    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+     source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      python3 /work/main.py"]
