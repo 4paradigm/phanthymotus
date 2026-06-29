@@ -324,19 +324,24 @@ class VideoObjectPerceptionPlugin:
         return cached
 
     def _ensure_clip_weights(self):
-        """Ensure CLIP ViT-B-32 weights exist at ~/.cache/clip/ (where clip.load() looks)."""
-        clip_filename = "ViT-B-32.pt"
-        cache_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
-        clip_cache = os.path.expanduser("~/.cache/clip")
-        target_path = os.path.join(clip_cache, clip_filename)
+        """Ensure CLIP ViT-B-32 weights exist where ultralytics expects them.
 
-        # Already in place
+        ultralytics uses WEIGHTS_DIR/clip/ (typically /models/weights/clip/)
+        and also ~/.cache/clip/ as fallback.
+        """
+        clip_filename = "ViT-B-32.pt"
+        model_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
+
+        # ultralytics WEIGHTS_DIR = {config_dir}/weights
+        weights_clip_dir = os.path.join(model_dir, "weights", "clip")
+        target_path = os.path.join(weights_clip_dir, clip_filename)
+
         if os.path.isfile(target_path):
             return
 
-        # Check persistent volume
+        # Check persistent volume locations
         source_candidates = [
-            os.path.join(cache_dir, "clip", clip_filename),
+            os.path.join(model_dir, "clip", clip_filename),
             "/work/weights/clip/" + clip_filename,
         ]
         source_path = None
@@ -345,25 +350,26 @@ class VideoObjectPerceptionPlugin:
                 source_path = p
                 break
 
-        # Download from COS if not found anywhere
+        # Download from COS if not found
         if source_path is None:
             url = _MODEL_URLS.get("clip-vit-b-32")
             if not url:
                 return
-            persist_dir = os.path.join(cache_dir, "clip")
+            persist_dir = os.path.join(model_dir, "clip")
             os.makedirs(persist_dir, exist_ok=True)
             source_path = os.path.join(persist_dir, clip_filename)
             log.info(f"[vop] downloading CLIP weights from COS → {source_path}")
             urllib.request.urlretrieve(url, source_path)
             log.info(f"[vop] CLIP download complete: {source_path}")
 
-        # Place into ~/.cache/clip/ where clip.load() expects it
-        os.makedirs(clip_cache, exist_ok=True)
+        # Copy to where ultralytics expects: {YOLO_CONFIG_DIR}/weights/clip/
+        os.makedirs(weights_clip_dir, exist_ok=True)
         try:
-            os.link(source_path, target_path)  # hardlink (same filesystem)
+            os.link(source_path, target_path)
         except OSError:
             import shutil
             shutil.copy2(source_path, target_path)
+        log.info(f"[vop] CLIP weights placed at {target_path}")
 
     def _start_node(self, node_key: str, input_topic: str):
         """Create and start a VOPNode for the given topic."""
