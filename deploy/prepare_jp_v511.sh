@@ -46,7 +46,7 @@ RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/lib/apt/lists/* /var/cache/ap
 RUN pip3 install --no-cache-dir ${TORCH_URL}
 # Copy pre-compiled torchvision (with CUDA NMS ops) from dustynv image
 COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torchvision /usr/local/lib/python3.8/dist-packages/torchvision
-COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torchvision-*.dist-info /usr/local/lib/python3.8/dist-packages/
+COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torchvision-0.15.1a0+42759b1.dist-info /usr/local/lib/python3.8/dist-packages/torchvision-0.15.1a0+42759b1.dist-info
 DOCKERFILE
 
 echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin
