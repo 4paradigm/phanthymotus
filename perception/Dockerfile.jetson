@@ -53,7 +53,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    ultralytics
+    ultralytics && \
+    pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
