@@ -324,45 +324,46 @@ class VideoObjectPerceptionPlugin:
         return cached
 
     def _ensure_clip_weights(self):
-        """Download CLIP ViT-B-32 weights from COS if not present, and symlink to ~/.cache/clip/."""
+        """Ensure CLIP ViT-B-32 weights exist at ~/.cache/clip/ (where clip.load() looks)."""
         clip_filename = "ViT-B-32.pt"
         cache_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
-        clip_dir = os.path.join(cache_dir, "clip")
-        clip_path = os.path.join(clip_dir, clip_filename)
+        clip_cache = os.path.expanduser("~/.cache/clip")
+        target_path = os.path.join(clip_cache, clip_filename)
 
-        # Check if already available
-        search_paths = [
-            clip_path,
+        # Already in place
+        if os.path.isfile(target_path):
+            return
+
+        # Check persistent volume
+        source_candidates = [
+            os.path.join(cache_dir, "clip", clip_filename),
             "/work/weights/clip/" + clip_filename,
         ]
         source_path = None
-        for p in search_paths:
+        for p in source_candidates:
             if os.path.isfile(p):
                 source_path = p
                 break
 
-        # Download from COS if not found
+        # Download from COS if not found anywhere
         if source_path is None:
             url = _MODEL_URLS.get("clip-vit-b-32")
             if not url:
                 return
-            os.makedirs(clip_dir, exist_ok=True)
-            log.info(f"[vop] downloading CLIP weights from COS → {clip_path}")
-            urllib.request.urlretrieve(url, clip_path)
-            log.info(f"[vop] CLIP download complete: {clip_path}")
-            source_path = clip_path
+            persist_dir = os.path.join(cache_dir, "clip")
+            os.makedirs(persist_dir, exist_ok=True)
+            source_path = os.path.join(persist_dir, clip_filename)
+            log.info(f"[vop] downloading CLIP weights from COS → {source_path}")
+            urllib.request.urlretrieve(url, source_path)
+            log.info(f"[vop] CLIP download complete: {source_path}")
 
-        # Ensure ~/.cache/clip/ has the file (where clip.load() looks by default)
-        home_clip_dir = os.path.expanduser("~/.cache/clip")
-        home_clip_path = os.path.join(home_clip_dir, clip_filename)
-        if not os.path.isfile(home_clip_path):
-            os.makedirs(home_clip_dir, exist_ok=True)
-            try:
-                os.symlink(source_path, home_clip_path)
-            except OSError:
-                # symlink may fail on some filesystems, try copy
-                import shutil
-                shutil.copy2(source_path, home_clip_path)
+        # Place into ~/.cache/clip/ where clip.load() expects it
+        os.makedirs(clip_cache, exist_ok=True)
+        try:
+            os.link(source_path, target_path)  # hardlink (same filesystem)
+        except OSError:
+            import shutil
+            shutil.copy2(source_path, target_path)
 
     def _start_node(self, node_key: str, input_topic: str):
         """Create and start a VOPNode for the given topic."""
@@ -397,12 +398,20 @@ class VideoObjectPerceptionPlugin:
                     "extra_classes": node._extra_classes,
                     "detect_count": node._detect_count,
                 }
-            # Provide topic info even when no instances are running
+            # Determine topic info: from running instance, args, or empty
             input_topic = args.get("input_topic", "")
             if not input_topic:
                 topics_list = args.get("input_topics") or []
                 if topics_list:
                     input_topic = topics_list[0]
+            # If instance_id specified and running, use its topics
+            if instance_id and instance_id in self._nodes:
+                node = self._nodes[instance_id]
+                input_topic = node._input_topic
+            # If no explicit topic but there are running instances, use first one
+            elif not input_topic and self._nodes:
+                first_node = next(iter(self._nodes.values()))
+                input_topic = first_node._input_topic
             topics_in = [{"topic": input_topic, "format": "image/jpeg"}] if input_topic else []
             topics_out = [{"topic": f"{input_topic}/objects", "format": "data/json"}] if input_topic else []
             state = "running" if instances else "idle"
