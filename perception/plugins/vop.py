@@ -326,14 +326,14 @@ class VideoObjectPerceptionPlugin:
     def _ensure_clip_weights(self):
         """Ensure CLIP ViT-B-32 weights exist where ultralytics expects them.
 
-        ultralytics uses WEIGHTS_DIR/clip/ (typically /models/weights/clip/)
-        and also ~/.cache/clip/ as fallback.
+        ultralytics uses WEIGHTS_DIR/clip/ which resolves to a relative path
+        "weights/clip/" from CWD (typically /work/weights/clip/).
         """
         clip_filename = "ViT-B-32.pt"
         model_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
 
-        # ultralytics WEIGHTS_DIR = {config_dir}/weights
-        weights_clip_dir = os.path.join(model_dir, "weights", "clip")
+        # ultralytics WEIGHTS_DIR is relative "weights" → /work/weights/clip/
+        weights_clip_dir = os.path.join("/work", "weights", "clip")
         target_path = os.path.join(weights_clip_dir, clip_filename)
 
         if os.path.isfile(target_path):
@@ -342,7 +342,7 @@ class VideoObjectPerceptionPlugin:
         # Check persistent volume locations
         source_candidates = [
             os.path.join(model_dir, "clip", clip_filename),
-            "/work/weights/clip/" + clip_filename,
+            os.path.join(model_dir, "weights", "clip", clip_filename),
         ]
         source_path = None
         for p in source_candidates:
@@ -362,7 +362,7 @@ class VideoObjectPerceptionPlugin:
             urllib.request.urlretrieve(url, source_path)
             log.info(f"[vop] CLIP download complete: {source_path}")
 
-        # Copy to where ultralytics expects: {YOLO_CONFIG_DIR}/weights/clip/
+        # Place at /work/weights/clip/ where ultralytics actually looks
         os.makedirs(weights_clip_dir, exist_ok=True)
         try:
             os.link(source_path, target_path)
