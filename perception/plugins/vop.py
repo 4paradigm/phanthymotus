@@ -324,37 +324,60 @@ class VideoObjectPerceptionPlugin:
         return cached
 
     def _ensure_clip_weights(self):
-        """Download CLIP ViT-B-32 weights from COS if not present locally."""
-        # ultralytics CLIP looks for weights in its package dir or TORCH_HOME
+        """Download CLIP ViT-B-32 weights from COS if not present, and symlink to ~/.cache/clip/."""
         clip_filename = "ViT-B-32.pt"
         cache_dir = os.environ.get("YOLO_MODEL_DIR", "/models")
+        clip_dir = os.path.join(cache_dir, "clip")
+        clip_path = os.path.join(clip_dir, clip_filename)
 
-        # Check common locations
+        # Check if already available
         search_paths = [
-            os.path.join(cache_dir, clip_filename),
-            os.path.join(cache_dir, "clip", clip_filename),
+            clip_path,
             "/work/weights/clip/" + clip_filename,
         ]
+        source_path = None
         for p in search_paths:
             if os.path.isfile(p):
-                # Ensure TORCH_HOME/clip/ has it (where ultralytics CLIP looks)
-                torch_clip_dir = os.path.join(cache_dir, "clip")
-                torch_clip_path = os.path.join(torch_clip_dir, clip_filename)
-                if not os.path.isfile(torch_clip_path):
-                    os.makedirs(torch_clip_dir, exist_ok=True)
-                    os.symlink(p, torch_clip_path)
-                return
+                source_path = p
+                break
 
-        # Download from COS
-        url = _MODEL_URLS.get("clip-vit-b-32")
-        if not url:
-            return
-        torch_clip_dir = os.path.join(cache_dir, "clip")
-        os.makedirs(torch_clip_dir, exist_ok=True)
-        dest = os.path.join(torch_clip_dir, clip_filename)
-        log.info(f"[vop] downloading CLIP weights from COS → {dest}")
-        urllib.request.urlretrieve(url, dest)
-        log.info(f"[vop] CLIP download complete: {dest}")
+        # Download from COS if not found
+        if source_path is None:
+            url = _MODEL_URLS.get("clip-vit-b-32")
+            if not url:
+                return
+            os.makedirs(clip_dir, exist_ok=True)
+            log.info(f"[vop] downloading CLIP weights from COS → {clip_path}")
+            urllib.request.urlretrieve(url, clip_path)
+            log.info(f"[vop] CLIP download complete: {clip_path}")
+            source_path = clip_path
+
+        # Ensure ~/.cache/clip/ has the file (where clip.load() looks by default)
+        home_clip_dir = os.path.expanduser("~/.cache/clip")
+        home_clip_path = os.path.join(home_clip_dir, clip_filename)
+        if not os.path.isfile(home_clip_path):
+            os.makedirs(home_clip_dir, exist_ok=True)
+            try:
+                os.symlink(source_path, home_clip_path)
+            except OSError:
+                # symlink may fail on some filesystems, try copy
+                import shutil
+                shutil.copy2(source_path, home_clip_path)
+
+    def _start_node(self, node_key: str, input_topic: str):
+        """Create and start a VOPNode for the given topic."""
+        icfg = self._instance_configs.get(node_key, {})
+        confidence = float(icfg.get("confidence", self._confidence))
+        fps = int(icfg.get("fps", self._fps))
+        extra_classes = icfg.get("classes") or list(self._extra_classes)
+        suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
+        node = _VOPNode(input_topic, self._model, confidence, fps,
+                        extra_classes, node_suffix=suffix)
+        self._executor.add_node(node)
+        self._nodes[node_key] = node
+        self._sync_model_classes()
+        node.start()
+        log.info(f"[vop] node started (background): {input_topic}")
 
     def get_tools(self) -> list:
         return TOOLS
@@ -374,12 +397,24 @@ class VideoObjectPerceptionPlugin:
                     "extra_classes": node._extra_classes,
                     "detect_count": node._detect_count,
                 }
+            # Provide topic info even when no instances are running
+            input_topic = args.get("input_topic", "")
+            if not input_topic:
+                topics_list = args.get("input_topics") or []
+                if topics_list:
+                    input_topic = topics_list[0]
+            topics_in = [{"topic": input_topic, "format": "image/jpeg"}] if input_topic else []
+            topics_out = [{"topic": f"{input_topic}/objects", "format": "data/json"}] if input_topic else []
+            state = "running" if instances else "idle"
             return {
-                "name": "VideoObjectPerception", "model": self._model_name,
-                "state": "running" if self._nodes else "idle",
+                "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
+                "state": state,
                 "base_classes_count": len(self._base_classes),
                 "total_classes": len(self._get_all_classes()),
                 "instances": instances,
+                "topic_in": topics_in,
+                "topic_out": topics_out,
+                "desc": "YOLOv8-World open-vocabulary object detection",
             }
 
         elif action == "start":
@@ -392,19 +427,15 @@ class VideoObjectPerceptionPlugin:
                 raise ValueError("input_topic is required")
             node_key = instance_id or input_topic
             if node_key not in self._nodes:
-                self._ensure_model()
-                # Per-instance config
-                icfg = self._instance_configs.get(node_key, {})
-                confidence = float(icfg.get("confidence", self._confidence))
-                fps = int(icfg.get("fps", self._fps))
-                extra_classes = icfg.get("classes") or list(self._extra_classes)
-                suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
-                node = _VOPNode(input_topic, self._model, confidence, fps,
-                                extra_classes, node_suffix=suffix)
-                self._executor.add_node(node)
-                self._nodes[node_key] = node
-                # Sync model classes to include this instance's extras
-                self._sync_model_classes()
+                if self._model is None:
+                    # Model not loaded yet — start loading in background
+                    def _bg_start():
+                        self._ensure_model()
+                        self._start_node(node_key, input_topic)
+                    threading.Thread(target=_bg_start, daemon=True, name="vop_model_load").start()
+                    return {"state": "loading", "input": input_topic, "output": f"{input_topic}/objects",
+                            "message": "Model loading in background, will start automatically"}
+                self._start_node(node_key, input_topic)
             return self._nodes[node_key].start()
 
         elif action == "stop":
