@@ -242,7 +242,14 @@ class VideoObjectPerceptionPlugin:
         if self._model is None:
             return
         classes = self._get_all_classes()
-        self._model.set_classes(classes)
+        # Move model to CPU for set_classes (CLIP tokenizer outputs CPU tensors)
+        # ultralytics will move back to GPU automatically on next predict()
+        try:
+            self._model.model.cpu()
+            self._model.set_classes(classes)
+        except Exception as e:
+            log.warning(f"[vop] set_classes failed: {e}, trying without device move")
+            self._model.set_classes(classes)
         log.info(f"[vop] model classes synced: {len(classes)} total (+{len(classes) - len(self._base_classes)} extra)")
 
     def _ensure_model(self):
@@ -285,15 +292,20 @@ class VideoObjectPerceptionPlugin:
                 cv2.destroyAllWindows = lambda *a, **k: None
 
             from ultralytics import YOLO
+            import torch
+
+            # Determine device: prefer CUDA if available
+            self._device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
             model_path = self._resolve_model_path()
-            log.info(f"[vop] loading model: {model_path}")
+            log.info(f"[vop] loading model: {model_path} (device={self._device})")
             self._model = YOLO(model_path)
 
             # Ensure CLIP weights are available locally before set_classes
             self._ensure_clip_weights()
 
             classes = self._get_all_classes()
+            # set_classes needs consistent device — run on CPU then move to GPU for inference
             self._model.set_classes(classes)
             log.info(f"[vop] model loaded, {len(classes)} classes ({len(classes) - len(self._base_classes)} extra)")
 
