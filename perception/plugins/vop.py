@@ -71,7 +71,7 @@ TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "info", "set_classes"],
+                    "enum": ["start", "stop", "info", "set_classes", "config"],
                     "description": "Action to perform"
                 },
                 "input_topic": {
@@ -89,9 +89,9 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "scope": "shared"},
-                "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "scope": "shared"},
-                "classes":    {"type": "array", "items": {"type": "string"}, "description": "Object classes to detect", "scope": "shared"},
+                "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "scope": "instance"},
+                "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "scope": "instance"},
+                "classes":    {"type": "array", "items": {"type": "string"}, "description": "Extra object classes to add on top of COCO-80 base", "scope": "instance"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -106,13 +106,16 @@ class _VOPNode(Node):
     """Per-topic YOLO inference node."""
 
     def __init__(self, input_topic: str, model, confidence: float, fps: float,
-                 node_suffix: str):
+                 extra_classes: list[str], node_suffix: str):
         super().__init__(f"vop_{node_suffix}")
         self._input_topic = input_topic
         self._output_topic = f"{input_topic}/objects"
         self._model = model
         self._confidence = confidence
+        self._fps = fps
         self._frame_interval = 1.0 / max(fps, 0.1)
+        self._extra_classes = extra_classes
+        self._classes = list(_COCO_80_CLASSES) + [c for c in extra_classes if c not in _COCO_80_CLASSES]
 
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
         self._sub: Optional[object] = None
@@ -220,10 +223,26 @@ class VideoObjectPerceptionPlugin:
         self._model_name = plugin_cfg.get("model", "yolov8s-worldv2")
         self._base_classes = list(_COCO_80_CLASSES)
         self._extra_classes: list[str] = plugin_cfg.get("classes") or []
-        self._classes = self._base_classes + [c for c in self._extra_classes if c not in self._base_classes]
         self._model = None  # lazy load
         self._model_lock = threading.Lock()
         self._nodes: dict[str, _VOPNode] = {}
+        self._instance_configs: dict[str, dict] = {}  # per-instance config overrides
+
+    def _get_all_classes(self) -> list[str]:
+        """Merge base COCO-80 + global extra + all instance extra classes."""
+        all_extra = set(self._extra_classes)
+        for cfg in self._instance_configs.values():
+            for c in cfg.get("classes") or []:
+                all_extra.add(c)
+        return self._base_classes + [c for c in sorted(all_extra) if c not in self._base_classes]
+
+    def _sync_model_classes(self):
+        """Re-sync model classes after config change."""
+        if self._model is None:
+            return
+        classes = self._get_all_classes()
+        self._model.set_classes(classes)
+        log.info(f"[vop] model classes synced: {len(classes)} total (+{len(classes) - len(self._base_classes)} extra)")
 
     def _ensure_model(self):
         if self._model is not None:
@@ -236,8 +255,9 @@ class VideoObjectPerceptionPlugin:
             model_path = self._resolve_model_path()
             log.info(f"[vop] loading model: {model_path}")
             self._model = YOLO(model_path)
-            self._model.set_classes(self._classes)
-            log.info(f"[vop] model loaded, classes={self._classes}")
+            classes = self._get_all_classes()
+            self._model.set_classes(classes)
+            log.info(f"[vop] model loaded, {len(classes)} classes ({len(classes) - len(self._base_classes)} extra)")
 
     def _resolve_model_path(self) -> str:
         """Resolve model path: local file, config path, or download from COS."""
@@ -278,12 +298,16 @@ class VideoObjectPerceptionPlugin:
                 instances[key] = {
                     "input": node._input_topic,
                     "output": node._output_topic,
+                    "confidence": node._confidence,
+                    "fps": node._fps,
+                    "extra_classes": node._extra_classes,
                     "detect_count": node._detect_count,
                 }
             return {
                 "name": "VideoObjectPerception", "model": self._model_name,
                 "state": "running" if self._nodes else "idle",
-                "classes": self._classes,
+                "base_classes_count": len(self._base_classes),
+                "total_classes": len(self._get_all_classes()),
                 "instances": instances,
             }
 
@@ -298,11 +322,18 @@ class VideoObjectPerceptionPlugin:
             node_key = instance_id or input_topic
             if node_key not in self._nodes:
                 self._ensure_model()
+                # Per-instance config
+                icfg = self._instance_configs.get(node_key, {})
+                confidence = float(icfg.get("confidence", self._confidence))
+                fps = int(icfg.get("fps", self._fps))
+                extra_classes = icfg.get("classes") or list(self._extra_classes)
                 suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
-                node = _VOPNode(input_topic, self._model, self._confidence, self._fps,
-                                node_suffix=suffix)
+                node = _VOPNode(input_topic, self._model, confidence, fps,
+                                extra_classes, node_suffix=suffix)
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
+                # Sync model classes to include this instance's extras
+                self._sync_model_classes()
             return self._nodes[node_key].start()
 
         elif action == "stop":
@@ -327,12 +358,42 @@ class VideoObjectPerceptionPlugin:
             classes = args.get("classes")
             if not classes:
                 raise ValueError("classes list is required")
-            # Additive: merge extra classes onto base COCO 80
-            self._extra_classes = classes
-            self._classes = self._base_classes + [c for c in classes if c not in self._base_classes]
-            if self._model is not None:
-                self._model.set_classes(self._classes)
-                log.info(f"[vop] classes updated: +{classes} (total {len(self._classes)})")
-            return {"base_classes": len(self._base_classes), "extra_classes": self._extra_classes, "total": len(self._classes)}
+            if instance_id:
+                # Per-instance extra classes
+                cfg = self._instance_configs.setdefault(instance_id, {})
+                cfg["classes"] = classes
+                # Update running node if exists
+                if instance_id in self._nodes:
+                    self._nodes[instance_id]._extra_classes = classes
+                    self._nodes[instance_id]._classes = list(_COCO_80_CLASSES) + [c for c in classes if c not in _COCO_80_CLASSES]
+            else:
+                # Global extra classes
+                self._extra_classes = classes
+            self._sync_model_classes()
+            return {"base_classes": len(self._base_classes), "extra_classes": classes, "total": len(self._get_all_classes())}
+
+        elif action == "config":
+            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and v != ''}
+            if instance_id:
+                self._instance_configs[instance_id] = cfg
+                # If instance is running, restart with new config
+                if instance_id in self._nodes:
+                    node = self._nodes[instance_id]
+                    input_topic = node._input_topic
+                    node.stop()
+                    self._executor.remove_node(node)
+                    del self._nodes[instance_id]
+                    # Will be re-created on next start with new config
+                return {"status": "configured", "instance_id": instance_id, "config": cfg}
+            else:
+                # Update global defaults
+                if "confidence" in cfg:
+                    self._confidence = float(cfg["confidence"])
+                if "fps" in cfg:
+                    self._fps = int(cfg["fps"])
+                if "classes" in cfg:
+                    self._extra_classes = cfg["classes"]
+                    self._sync_model_classes()
+                return {"status": "configured", "config": cfg}
 
         return None

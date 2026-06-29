@@ -51,6 +51,10 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 
+# ── VOP deps (YOLOv8-World object detection) ─────────────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    ultralytics
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
