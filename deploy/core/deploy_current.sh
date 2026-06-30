@@ -38,6 +38,7 @@ services:
     image: ${CORE_IMAGE}
     platform: linux/arm64
     network_mode: host
+    ipc: host
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data/data.db:/work/resource/data.db
@@ -47,7 +48,7 @@ services:
       - DB_PATH=/work/resource/data.db
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     restart: unless-stopped
 COMPOSE
 

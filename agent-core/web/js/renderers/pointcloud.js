@@ -8,9 +8,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-const MAX_POINTS = 50000;
-const FRAME_WINDOW = 5;           // sliding window: keep last 5 frames
-const MAX_POINTS_PER_FRAME = 10000;
+const MAX_POINTS = 40000;
+const FRAME_WINDOW = 1;           // single frame only — no motion ghosting
+const MAX_POINTS_PER_FRAME = 40000;
 
 export const PointCloudRenderer = {
   name: 'pointcloud',
@@ -36,7 +36,7 @@ export const PointCloudRenderer = {
     this._frames = [];
     this._displayDirty = false;
 
-    // Set default axis map (matches previous hardcoded: X←y, Y←-z, Z←-x)
+    // Set default axis map (X←-y, Y←-z, Z←x, with pitch correction)
     this._buildAxisMap(null);
 
     this._el = document.createElement('div');
@@ -71,9 +71,8 @@ export const PointCloudRenderer = {
     const grid = new THREE.GridHelper(20, 20, 0x444444, 0x333333);
     this._scene.add(grid);
 
-    // Origin axes — rotated so blue (Z) points forward (Livox +x maps to Three.js -Z)
+    // Origin axes (red X=right, green Y=up, blue Z=forward matching LiDAR +x)
     const axes = new THREE.AxesHelper(1);
-    axes.rotation.y = Math.PI;
     this._scene.add(axes);
 
     // Points geometry (pre-allocated)
@@ -121,9 +120,9 @@ export const PointCloudRenderer = {
   _buildAxisMap(cfg) {
     const idxOf = s => ({ x: 0, y: 1, z: 2 }[s] ?? 1);
     this._axisMap = {
-      xIdx: idxOf(cfg?.axis_x_source ?? 'y'), xSign: cfg?.axis_x_negate ? -1 : 1,
-      yIdx: idxOf(cfg?.axis_y_source ?? 'z'), ySign: cfg?.axis_y_negate ? -1 : 1,
-      zIdx: idxOf(cfg?.axis_z_source ?? 'x'), zSign: cfg?.axis_z_negate ? -1 : 1,
+      xIdx: idxOf(cfg?.axis_x_source ?? 'y'), xSign: (cfg?.axis_x_negate ?? false) ? -1 : 1,
+      yIdx: idxOf(cfg?.axis_y_source ?? 'z'), ySign: (cfg?.axis_y_negate ?? true) ? -1 : 1,
+      zIdx: idxOf(cfg?.axis_z_source ?? 'x'), zSign: (cfg?.axis_z_negate ?? true) ? -1 : 1,
     };
   },
 
@@ -159,20 +158,18 @@ export const PointCloudRenderer = {
     const view = new DataView(buffer);
     const firstUint = view.getUint32(0, true);
 
-    let numPoints, pointOffset, pointStride, hasIntensity;
+    let numPoints, pointOffset, pointStride;
 
     if (firstUint < 256) {
       // New PointCloud2 passthrough: [uint32 point_step][uint32 total_points][raw bytes]
       pointStride = firstUint;
       numPoints = view.getUint32(4, true);
       pointOffset = 8;
-      hasIntensity = pointStride >= 16;
     } else {
       // Legacy format: [uint32 N][float32 x,y,z,intensity × N]
       numPoints = firstUint;
       pointOffset = 4;
       pointStride = 16;
-      hasIntensity = true;
     }
 
     const expected = pointOffset + numPoints * pointStride;
@@ -191,19 +188,33 @@ export const PointCloudRenderer = {
       const raw0 = view.getFloat32(off, true);      // x
       const raw1 = view.getFloat32(off + 4, true);  // y
       const raw2 = view.getFloat32(off + 8, true);  // z
-      const intensity = hasIntensity ? view.getFloat32(off + 12, true) : 0;
 
       const raw = [raw0, raw1, raw2];
       const idx = i * 3;
-      pos[idx]     = am.xSign * raw[am.xIdx];
-      pos[idx + 1] = am.ySign * raw[am.yIdx];
-      pos[idx + 2] = am.zSign * raw[am.zIdx];
+      const mx = am.xSign * raw[am.xIdx];
+      const my = am.ySign * raw[am.yIdx];
+      const mz = am.zSign * raw[am.zIdx];
+      pos[idx]     = mx;
+      pos[idx + 1] = my;
+      pos[idx + 2] = mz;
+    }
 
-      // Jet colormap based on intensity (0-255 typical range)
-      const t = Math.min(1, Math.max(0, intensity / 255));
-      col[idx]     = Math.min(1, Math.max(0, 1.5 - Math.abs(t - 0.75) * 4));
-      col[idx + 1] = Math.min(1, Math.max(0, 1.5 - Math.abs(t - 0.5) * 4));
-      col[idx + 2] = Math.min(1, Math.max(0, 1.5 - Math.abs(t - 0.25) * 4));
+    // Rainbow height colormap (same as mapping renderer)
+    let yMin = Infinity, yMax = -Infinity;
+    for (let i = 0; i < count; i++) {
+      const y = pos[i * 3 + 1];
+      if (y < yMin) yMin = y;
+      if (y > yMax) yMax = y;
+    }
+    const yRange = yMax - yMin;
+    const yScale = yRange > 0.01 ? 1.0 / yRange : 1.0;
+    for (let i = 0; i < count; i++) {
+      const t = (pos[i * 3 + 1] - yMin) * yScale;
+      const idx = i * 3;
+      // Rainbow: 0=red, 0.25=yellow, 0.5=green, 0.75=cyan/blue, 1.0=purple
+      col[idx]     = t < 0.25 ? 1.0 : t < 0.5 ? 1.0 - (t - 0.25) * 4 : t < 0.75 ? 0.0 : (t - 0.75) * 4 * 0.7;
+      col[idx + 1] = t < 0.25 ? t * 4 : t < 0.5 ? 1.0 : t < 0.75 ? 1.0 - (t - 0.5) * 4 : 0.0;
+      col[idx + 2] = t < 0.5 ? 0.0 : t < 0.75 ? (t - 0.5) * 4 : 1.0;
     }
 
     // Sliding window: push new frame, keep last FRAME_WINDOW

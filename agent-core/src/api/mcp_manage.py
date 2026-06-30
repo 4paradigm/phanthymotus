@@ -312,9 +312,11 @@ async def mcp_list():
 async def mcp_add(req: MCPAddRequest):
     async with _mcp_write_lock:
         mcps = _get_mcp_list()
-        # Upsert: match by URL or by name (so a service restarting on a different port updates its entry)
+        # Upsert: match by URL, name, or server_name (prevents duplicate device bundles)
         existing = next(
-            (m for m in mcps if (m.get('url') == req.url and req.url) or (m.get('name') == req.name and req.name)),
+            (m for m in mcps if (m.get('url') == req.url and req.url)
+             or (m.get('name') == req.name and req.name)
+             or (m.get('server_name') and m.get('server_name') == req.name)),
             None,
         )
         if existing:
@@ -379,6 +381,16 @@ async def _do_ping(mcp_id: str) -> dict:
         # 标记 registry 中该设备离线
         if mcp_id in mcp_client.registry:
             mcp_client.registry[mcp_id]['online'] = False
+        # Dedup: if this offline MCP has same server_name as another entry, remove it
+        async with _mcp_write_lock:
+            mcps = _get_mcp_list()
+            this_entry = next((m for m in mcps if m.get('id') == mcp_id), None)
+            if this_entry and this_entry.get('server_name'):
+                dup = next((m for m in mcps if m.get('server_name') == this_entry['server_name'] and m.get('id') != mcp_id), None)
+                if dup:
+                    mcps = [m for m in mcps if m.get('id') != mcp_id]
+                    _save_mcp_list(mcps)
+                    print(f'[mcp/ping] dedup: removed offline {mcp_id} (same server_name as {dup["id"]})')
         return {'online': False, 'error': str(e), 'tools': [], 'resources': []}
 
     # render_hint priority:
@@ -416,8 +428,29 @@ async def _do_ping(mcp_id: str) -> dict:
         print(f'[mcp/ping] {mcp_id}: server={caps.get("server_name", "?")} tools={current_tool_names}')
 
     # Persist on every successful ping; server_name only set once (not overwritten)
+    # Also deduplicate: if another MCP with the same server_name exists, remove this one (keep the earlier entry)
     async with _mcp_write_lock:
         mcps = _get_mcp_list()  # re-read under lock to avoid race condition
+        new_server_name = caps.get('server_name', '')
+
+        # Check for duplicate server_name — keep the first registered entry, remove this one
+        if new_server_name:
+            existing_with_same_name = next(
+                (m for m in mcps if m.get('server_name') == new_server_name and m.get('id') != mcp_id),
+                None,
+            )
+            if existing_with_same_name:
+                # This is a duplicate — remove current entry, update existing one's URL
+                target = next((m for m in mcps if m.get('id') == mcp_id), None)
+                if target:
+                    existing_with_same_name['url'] = target.get('url', existing_with_same_name.get('url', ''))
+                    mcps = [m for m in mcps if m.get('id') != mcp_id]
+                    print(f'[mcp/ping] dedup: removed {mcp_id}, merged into {existing_with_same_name["id"]} (server_name={new_server_name})')
+                    _save_mcp_list(mcps)
+                    return {'online': True, 'tools': caps['tools'], 'resources': caps['resources'],
+                            'render_hint': render_hint, 'server_name': new_server_name,
+                            'topic_out': topic_out, 'topic_in': topic_in}
+
         for m in mcps:
             if m.get('id') == mcp_id:
                 m['render_hint'] = render_hint
@@ -426,7 +459,7 @@ async def _do_ping(mcp_id: str) -> dict:
                 m['topic_out']   = topic_out
                 m['topic_in']    = topic_in
                 if not m.get('server_name'):
-                    m['server_name'] = caps.get('server_name', '')
+                    m['server_name'] = new_server_name
                 break
         _save_mcp_list(mcps)
 

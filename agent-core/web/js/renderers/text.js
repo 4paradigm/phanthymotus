@@ -171,7 +171,9 @@ function _renderTable(container, json) {
 }
 
 function _fmtCell(v) {
+  if (v == null) return '';
   if (typeof v === 'number') return v.toFixed(4);
-  if (Array.isArray(v)) return v.map(n => typeof n === 'number' ? n.toFixed(1) : String(n)).join(' ');
-  return String(v ?? '');
+  if (Array.isArray(v)) return v.map(n => typeof n === 'number' ? n.toFixed(1) : (typeof n === 'object' ? JSON.stringify(n) : String(n))).join(' ');
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
 }

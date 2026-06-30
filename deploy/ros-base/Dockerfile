@@ -9,8 +9,8 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
     fi && \
     rm -f /etc/apt/sources.list.d/*
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-pip && \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
 # Build audio_msgs ROS2 package

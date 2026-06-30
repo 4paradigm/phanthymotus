@@ -1,6 +1,5 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: dustynv/ros:humble-desktop-l4t-r35.3.1
-# Includes: ROS2 Humble + OpenCV + CUDA 11.4 + cuDNN (Ubuntu 22.04)
+# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
@@ -11,7 +10,7 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-llama
+ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
 
@@ -27,11 +26,10 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
     fi
 
 # ── System deps ────────────────────────────────────────────────────
-RUN rm -f /etc/apt/sources.list.d/* && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        ffmpeg python3-pip build-essential cmake libopenblas-base && \
-    rm -rf /var/lib/apt/lists/*
+RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
@@ -51,6 +49,33 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 
+# ── VOP deps (YOLOv8-World object detection) ─────────────────────
+# Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
+RUN python3 -c "import cv2" 2>/dev/null || { \
+    echo 'import importlib.util, sys, os' > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_so = os.path.join(os.path.dirname(__file__), "python-3.8", "cv2.cpython-38-aarch64-linux-gnu.so")' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_spec = importlib.util.spec_from_file_location("cv2", _so)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_mod = importlib.util.module_from_spec(_spec)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_spec.loader.exec_module(_mod)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo 'sys.modules["cv2"] = _mod' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py; \
+    }
+# Install ultralytics WITHOUT replacing Jetson's CUDA torch + torchvision
+RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
+    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
+    pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
+# ultralytics CLIP (GitHub via mirror, needed for set_classes)
+RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
+
+# Pre-download CLIP weights into image (avoids 338MB download at runtime)
+RUN mkdir -p /work/weights/clip && \
+    python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt', '/work/weights/clip/ViT-B-32.pt')"
+
+# Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
+ENV YOLO_CONFIG_DIR=/work
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
@@ -59,11 +84,6 @@ COPY perception/config.yaml /work/config.yaml
 
 EXPOSE 15720
 EXPOSE 15721
-# EXPOSE 15800
-
-# ── LLM server (disabled — uncomment to re-enable) ───────────────
-# ENV MODEL_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/Qwen3.5-2B-Q4_K_M.gguf
-# ENV MODEL_PATH=/models/Qwen3.5-2B-Q4_K_M.gguf
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
 RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.8/dist-packages/ros_ws.pth && \
@@ -73,26 +93,8 @@ RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
-# ── To re-enable llama-server, replace CMD with: ─────────────────
-# CMD ["/bin/bash", "-c", \
-#     "source /opt/ros/humble/install/setup.bash && \
-#      source /ros_ws/install/setup.bash && \
-#      if [ ! -f ${MODEL_PATH} ]; then \
-#        echo 'Downloading model...' && \
-#        mkdir -p /models && \
-#        curl -fSL -o ${MODEL_PATH} ${MODEL_URL}; \
-#      fi && \
-#      LD_PRELOAD=/usr/lib/aarch64-linux-gnu/tegra/libcuda.so.1 \
-#      llama-server \
-#        -m ${MODEL_PATH} \
-#        -ngl 99 --host 0.0.0.0 --port 15800 --alias Qwen3.5-2B \
-#        --flash-attn on \
-#        -c 32768 \
-#        --chat-template-kwargs '{\"enable_thinking\":false}' \
-#        --no-context-shift &\
-#      python3 /work/main.py"]
-
 CMD ["/bin/bash", "-c", \
-    "source /opt/ros/humble/install/setup.bash && \
+    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+     source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      python3 /work/main.py"]

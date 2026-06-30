@@ -3,8 +3,8 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-pip && \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -19,7 +19,7 @@ RUN uv lock && uv sync --no-dev --no-install-project
 # Link system ROS2 packages into venv so sensor_msgs/rclpy are importable
 RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/opt/ros/humble/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
-    echo "/ros_ws/install/audio_msgs/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth
+    echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth
 
 COPY web/      /work/web/
 COPY src/      /work/src/

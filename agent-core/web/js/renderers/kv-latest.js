@@ -91,8 +91,13 @@ function _formatValue(v) {
   if (typeof v === 'number') return Number.isInteger(v) ? String(v) : v.toFixed(3);
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (Array.isArray(v)) {
-    return v.map(n => typeof n === 'number' ? (Number.isInteger(n) ? String(n) : n.toFixed(2)) : String(n)).join(', ');
+    return v.map(n => {
+      if (typeof n === 'number') return Number.isInteger(n) ? String(n) : n.toFixed(2);
+      if (typeof n === 'object' && n !== null) return JSON.stringify(n);
+      return String(n);
+    }).join(', ');
   }
+  if (typeof v === 'object') return JSON.stringify(v);
   if (typeof v === 'string') return v.length > 60 ? v.slice(0, 57) + '…' : v;
   return JSON.stringify(v);
 }

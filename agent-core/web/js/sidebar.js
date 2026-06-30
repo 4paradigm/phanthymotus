@@ -23,6 +23,12 @@ export function initSidebar() {
   document.getElementById('tool-detail-close').addEventListener('click', _hideDetail);
   _backdrop.addEventListener('click', (e) => { if (e.target === _backdrop) _hideDetail(); });
 
+  // Search filter
+  const searchInput = document.getElementById('sidebar-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', () => _onSearchInput(searchInput.value));
+  }
+
   // Load saved tool configs
   _loadToolConfigs();
 }
@@ -87,6 +93,8 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
 // ── Section builders ──────────────────────────────────────────────────────────
 
+const _TYPE_ORDER = ['sensor', 'actuator', 'processor', 'controller', ''];
+
 function _buildSection(mcp) {
   const name = mcp.server_name || mcp.name || mcp.id;
   const online = mcp.online;
@@ -104,13 +112,13 @@ function _buildSection(mcp) {
   `;
   section.appendChild(header);
 
-  const grid = document.createElement('div');
-  grid.className = 'sidebar-tool-list';
-
   const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
-  for (const tool of tools) {
-    grid.appendChild(_buildToolCard(mcp, tool));
-  }
+  const useChip = tools.length > 6;
+
+  const grid = document.createElement('div');
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
+
+  _renderGroupedTools(grid, mcp, tools, useChip);
 
   section.appendChild(grid);
   return section;
@@ -122,24 +130,40 @@ function _buildPerceptionSection(perceptions) {
 
   const header = document.createElement('div');
   header.className = 'sidebar-section-header';
-  const totalTools = perceptions.reduce((s, m) => s + (m.tools || []).length, 0);
-  header.innerHTML = `
-    <span class="sidebar-section-icon">◈</span>
-    <span class="sidebar-section-name">感知</span>
-    <span class="sidebar-section-count">${totalTools}</span>
-  `;
-  section.appendChild(header);
-
-  const grid = document.createElement('div');
-  grid.className = 'sidebar-tool-list';
-
+  const allTools = [];
   for (const mcp of perceptions) {
     const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
     for (const tool of tools) {
       if (!tool.type && (tool.topic_in || []).length && (tool.topic_out || []).length) {
         tool.type = 'processor';
       }
-      grid.appendChild(_buildToolCard(mcp, tool));
+      tool._mcp = mcp; // attach mcp ref for rendering
+      allTools.push(tool);
+    }
+  }
+  header.innerHTML = `
+    <span class="sidebar-section-icon">◈</span>
+    <span class="sidebar-section-name">感知</span>
+    <span class="sidebar-section-count">${allTools.length}</span>
+  `;
+  section.appendChild(header);
+
+  const useChip = allTools.length > 6;
+  const grid = document.createElement('div');
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
+
+  // Group and render
+  const groups = {};
+  for (const tool of allTools) {
+    const t = tool.type || '';
+    (groups[t] = groups[t] || []).push(tool);
+  }
+  for (const type of _TYPE_ORDER) {
+    if (!groups[type]?.length) continue;
+    grid.appendChild(_buildSubgroupLabel(type, groups[type].length));
+    for (const tool of groups[type]) {
+      const mcp = tool._mcp;
+      grid.appendChild(useChip ? _buildChip(mcp, tool) : _buildToolCard(mcp, tool));
     }
   }
 
@@ -161,19 +185,138 @@ function _buildControllerSection(controllers) {
   `;
   section.appendChild(header);
 
+  const useChip = totalTools > 6;
   const grid = document.createElement('div');
-  grid.className = 'sidebar-tool-list';
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
 
+  const allTools = [];
   for (const mcp of controllers) {
     const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
     for (const tool of tools) {
       if (!tool.type) tool.type = 'controller';
-      grid.appendChild(_buildToolCard(mcp, tool));
+      tool._mcp = mcp;
+      allTools.push(tool);
     }
   }
+  _renderGroupedTools(grid, null, allTools, useChip);
 
   section.appendChild(grid);
   return section;
+}
+
+// ── Grouped rendering helpers ─────────────────────────────────────────────────
+
+function _renderGroupedTools(grid, defaultMcp, tools, useChip) {
+  const groups = {};
+  for (const tool of tools) {
+    const t = tool.type || '';
+    (groups[t] = groups[t] || []).push(tool);
+  }
+  for (const type of _TYPE_ORDER) {
+    if (!groups[type]?.length) continue;
+    grid.appendChild(_buildSubgroupLabel(type, groups[type].length));
+    for (const tool of groups[type]) {
+      const mcp = tool._mcp || defaultMcp;
+      grid.appendChild(useChip ? _buildChip(mcp, tool) : _buildToolCard(mcp, tool));
+    }
+  }
+}
+
+function _buildSubgroupLabel(type, count) {
+  const label = document.createElement('div');
+  label.className = 'sidebar-subgroup-label';
+  const displayName = type ? type.toUpperCase() : 'OTHER';
+  label.textContent = `${displayName} · ${count}`;
+  return label;
+}
+
+function _buildChip(mcp, tool) {
+  const chip = document.createElement('div');
+  const toolType = tool.type || '';
+  chip.className = `sidebar-chip${toolType ? ' type-' + toolType : ''}`;
+  chip.draggable = true;
+  chip.dataset.mcpId = mcp.id;
+  chip.dataset.toolName = tool.name;
+  chip.dataset.desc = (tool.description || '').toLowerCase();
+  chip.title = tool.description || tool.name;
+
+  // Config button for tools with shared fields
+  const configSchema = typeof tool === 'object' ? tool.configSchema : null;
+  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const configKey = `${mcp.id}:${tool.name}`;
+  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
+
+  const configBtnHtml = hasSharedFields
+    ? `<button class="chip-config-btn" title="配置"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
+    : '';
+  chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span>${configBtnHtml}`;
+
+  // Config button click
+  if (hasSharedFields) {
+    chip.querySelector('.chip-config-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      _openToolConfigModal(mcp.id, tool.name, configSchema);
+    });
+  }
+
+  // Click to show detail
+  chip.addEventListener('click', (e) => {
+    if (e.defaultPrevented) return;
+    _showDetail(mcp, tool);
+  });
+
+  chip.addEventListener('dragstart', (e) => {
+    chip.classList.add('dragging-source');
+    e.dataTransfer.effectAllowed = 'copy';
+    e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
+      mcpId: mcp.id, toolName: tool.name, driverName: mcp.server_name || mcp.name || mcp.id,
+      hasConfig: !!hasSharedFields, configured,
+      multiInstance: !!(tool.multiInstance),
+      hasInstanceConfig: _hasInstanceFields(configSchema),
+    }));
+  });
+  chip.addEventListener('dragend', () => chip.classList.remove('dragging-source'));
+
+  return chip;
+}
+
+// ── Search filter ─────────────────────────────────────────────────────────────
+
+function _onSearchInput(query) {
+  if (!_scroll) return;
+  const q = query.trim().toLowerCase();
+
+  // Filter cards and chips
+  const items = _scroll.querySelectorAll('.sidebar-tool-card, .sidebar-chip');
+  for (const el of items) {
+    const name = (el.dataset.toolName || '').toLowerCase();
+    const desc = (el.dataset.desc || '').toLowerCase();
+    const match = !q || name.includes(q) || desc.includes(q);
+    el.classList.toggle('hidden', !match);
+  }
+
+  // Hide subgroup labels if all items in that group are hidden
+  const labels = _scroll.querySelectorAll('.sidebar-subgroup-label');
+  for (const label of labels) {
+    let next = label.nextElementSibling;
+    let hasVisible = false;
+    while (next && !next.classList.contains('sidebar-subgroup-label')) {
+      if ((next.classList.contains('sidebar-tool-card') || next.classList.contains('sidebar-chip')) && !next.classList.contains('hidden')) {
+        hasVisible = true;
+        break;
+      }
+      next = next.nextElementSibling;
+    }
+    label.classList.toggle('hidden', !hasVisible);
+  }
+
+  // Hide sections if all their content is hidden
+  const sections = _scroll.querySelectorAll('.sidebar-section');
+  for (const sec of sections) {
+    const visibleItems = sec.querySelectorAll('.sidebar-tool-card:not(.hidden), .sidebar-chip:not(.hidden)');
+    sec.classList.toggle('hidden', visibleItems.length === 0);
+  }
 }
 
 // ── Tool card ─────────────────────────────────────────────────────────────────
@@ -185,6 +328,7 @@ function _buildToolCard(mcp, tool) {
   card.draggable = true;
   card.dataset.mcpId = mcp.id;
   card.dataset.toolName = tool.name;
+  card.dataset.desc = (tool.description || '').toLowerCase();
 
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const configKey = `${mcp.id}:${tool.name}`;
@@ -199,7 +343,7 @@ function _buildToolCard(mcp, tool) {
 
   // Config status indicator — only for tools that have shared fields to configure
   const configHtml = hasSharedFields
-    ? `<span class="tool-card-config-status ${configured ? 'configured' : 'unconfigured'}" title="${configured ? '已配置' : '未配置'}">${configured ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'}</span>`
+    ? `<span class="tool-card-config-status ${configured ? 'configured' : 'unconfigured'}" title="${configured ? 'Configured' : 'Not configured'}">${configured ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'}</span>`
     : '';
 
   // Description (truncated)
@@ -271,7 +415,7 @@ export function hasSharedRequired(configSchema) {
 
 function _openToolConfigModal(mcpId, toolName, configSchema) {
   if (isProjectRunning()) {
-    alert('请停止智能控制后修改');
+    alert('Stop agent before modifying');
     return;
   }
   const overlay = document.getElementById('tool-config-overlay');
@@ -279,7 +423,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
 
-  titleEl.textContent = `配置 ${toolName}`;
+  titleEl.textContent = `Configure ${toolName}`;
   bodyEl.innerHTML = '';
 
   const props = configSchema.properties || {};
@@ -295,7 +439,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     if (hasSharedFields && def.scope === 'instance') continue;
     const label = document.createElement('label');
     label.className = 'tool-config-label';
-    label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -304,7 +448,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       input.dataset.key = key;
       const placeholder = document.createElement('option');
       placeholder.value = '';
-      placeholder.textContent = `-- 请选择 --`;
+      placeholder.textContent = `-- Select --`;
       input.appendChild(placeholder);
       for (const item of def.oneOf) {
         const option = document.createElement('option');
@@ -318,27 +462,29 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      // Add empty placeholder option
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = `-- 请选择 --`;
-      input.appendChild(placeholder);
+      const effectiveValue = savedValues[key] ?? def.default ?? '';
+      if (!effectiveValue) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = `-- Select --`;
+        input.appendChild(placeholder);
+      }
       for (const opt of def.enum) {
         const option = document.createElement('option');
         option.value = opt;
         option.textContent = opt;
-        if (savedValues[key] === opt) option.selected = true;
+        if (effectiveValue === opt) option.selected = true;
         input.appendChild(option);
       }
-      if (savedValues[key]) input.value = savedValues[key];
+      input.value = effectiveValue;
     } else if (def.type === 'boolean') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
       const optTrue = document.createElement('option');
-      optTrue.value = 'true'; optTrue.textContent = '是';
+      optTrue.value = 'true'; optTrue.textContent = 'Yes';
       const optFalse = document.createElement('option');
-      optFalse.value = 'false'; optFalse.textContent = '否';
+      optFalse.value = 'false'; optFalse.textContent = 'No';
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
@@ -346,9 +492,10 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       input = document.createElement('input');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      input.type = def.format === 'password' ? 'password' : 'text';
-      input.placeholder = def.default || '';
-      input.value = savedValues[key] || '';
+      input.type = def.format === 'password' ? 'password' : (def.type === 'number' || def.type === 'integer' ? 'number' : 'text');
+      if (def.type === 'number' || def.type === 'integer') input.step = 'any';
+      input.placeholder = def.default != null ? String(def.default) : '';
+      input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
     bodyEl.appendChild(label);
@@ -388,7 +535,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       if (statusEl) {
         statusEl.className = 'tool-card-config-status configured';
         statusEl.textContent = '✓';
-        statusEl.title = '已配置';
+        statusEl.title = 'Configured';
       }
     }
 
@@ -464,7 +611,7 @@ function _hideDetail() {
  */
 export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
   if (isProjectRunning()) {
-    alert('请停止智能控制后修改');
+    alert('Stop agent before modifying');
     return;
   }
   const overlay = document.getElementById('tool-config-overlay');
@@ -472,7 +619,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
 
-  titleEl.textContent = `实例配置 ${toolName}`;
+  titleEl.textContent = `Instance Config: ${toolName}`;
   bodyEl.innerHTML = '';
 
   const props = (configSchema && configSchema.properties) || {};
@@ -488,7 +635,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
 
     const label = document.createElement('label');
     label.className = 'tool-config-label';
-    label.textContent = `${def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -497,7 +644,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
       input.dataset.key = key;
       const placeholder = document.createElement('option');
       placeholder.value = '';
-      placeholder.textContent = `-- 请选择 --`;
+      placeholder.textContent = `-- Select --`;
       input.appendChild(placeholder);
       for (const item of def.oneOf) {
         const option = document.createElement('option');
@@ -511,26 +658,29 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = `-- 请选择 --`;
-      input.appendChild(placeholder);
+      const effectiveValue = savedValues[key] ?? def.default ?? '';
+      if (!effectiveValue) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = `-- Select --`;
+        input.appendChild(placeholder);
+      }
       for (const opt of def.enum) {
         const option = document.createElement('option');
         option.value = opt;
         option.textContent = opt;
-        if (savedValues[key] === opt) option.selected = true;
+        if (effectiveValue === opt) option.selected = true;
         input.appendChild(option);
       }
-      if (savedValues[key]) input.value = savedValues[key];
+      input.value = effectiveValue;
     } else if (def.type === 'boolean') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
       const optTrue = document.createElement('option');
-      optTrue.value = 'true'; optTrue.textContent = '是';
+      optTrue.value = 'true'; optTrue.textContent = 'Yes';
       const optFalse = document.createElement('option');
-      optFalse.value = 'false'; optFalse.textContent = '否';
+      optFalse.value = 'false'; optFalse.textContent = 'No';
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
@@ -538,9 +688,10 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
       input = document.createElement('input');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      input.type = def.format === 'password' ? 'password' : 'text';
-      input.placeholder = def.default || '';
-      input.value = savedValues[key] || '';
+      input.type = def.format === 'password' ? 'password' : (def.type === 'number' || def.type === 'integer' ? 'number' : 'text');
+      if (def.type === 'number' || def.type === 'integer') input.step = 'any';
+      input.placeholder = def.default != null ? String(def.default) : '';
+      input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
     bodyEl.appendChild(label);
@@ -548,7 +699,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
   }
 
   if (!hasFields) {
-    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">该组件无实例配置项</p>';
+    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">No instance config fields</p>';
   }
 
   const close = () => { overlay.classList.add('hidden'); };

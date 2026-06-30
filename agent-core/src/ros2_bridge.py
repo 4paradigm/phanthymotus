@@ -123,7 +123,7 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
     def _on_msg(msg):
         try:
             raw = msg.data
-            data = raw.encode('utf-8') if isinstance(raw, str) else bytes(raw)
+            data = raw if isinstance(raw, bytes) else (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw))
             msg_fmt = getattr(msg, 'format', fmt)
         except Exception as e:
             print(f'[ros2_bridge] decode error: {e}', file=sys.stderr)

@@ -5,6 +5,7 @@ services:
     image: ${REGISTRY}/${IMAGE_NAMESPACE}/core:${TAG}
     platform: linux/arm64
     network_mode: host     # 需要访问 ROS2 DDS；0.0.0.0:15678 直接绑定到宿主机
+    ipc: host              # FastDDS SHM transport
     env_file: .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -19,7 +20,9 @@ services:
       - RESTART_IMAGE=${REGISTRY}/${IMAGE_NAMESPACE}/restart:latest
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    logging:
+      driver: local
     restart: unless-stopped
 
   # ── Hardware Bridge（躯体层）─────────────────────────────────────────────────
@@ -30,6 +33,8 @@ services:
     env_file: .env
     volumes:
       - ./data/spatial:/opt/phanthy-motus/data   # 地图PCD + 指纹DB 持久化
+    logging:
+      driver: local
     profiles:
       - hardware
     restart: unless-stopped
@@ -41,14 +46,18 @@ services:
     platform: linux/arm64
     runtime: nvidia
     network_mode: host     # 需要访问 ROS2 DDS；15720/15721/8000 直接绑定到宿主机
+    ipc: host              # FastDDS SHM transport
+    shm_size: '512m'       # 为视觉/点云大数据 SHM 缓冲区预留空间
     env_file: .env
     volumes:
       - /opt/embodied/models:/models
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
       - NVIDIA_VISIBLE_DEVICES=all
+    logging:
+      driver: local
     profiles:
       - perception
     restart: unless-stopped

@@ -37,12 +37,16 @@ echo "============================================"
 # 生成临时 Dockerfile
 TMPFILE="$(mktemp)"
 cat > "${TMPFILE}" <<DOCKERFILE
+FROM dustynv/l4t-pytorch:r35.3.1 AS pytorch-donor
 FROM ${BASE_IMAGE}
-RUN rm -f /etc/apt/sources.list.d/* && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends libopenblas-base && \
-    rm -rf /var/lib/apt/lists/*
-RUN pip3 install --no-cache-dir ${TORCH_URL}
+RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated libopenblas-base && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+RUN pip3 install --no-cache-dir --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple/ ${TORCH_URL}
+# Copy pre-compiled torchvision (with CUDA NMS ops) from dustynv image
+COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torchvision /usr/local/lib/python3.8/dist-packages/torchvision
+COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torchvision-0.15.1a0+42759b1.dist-info /usr/local/lib/python3.8/dist-packages/torchvision-0.15.1a0+42759b1.dist-info
 DOCKERFILE
 
 echo "${REGISTRY_PASSWORD}" | docker login "${REGISTRY}" -u "${REGISTRY_USER}" --password-stdin

@@ -18,6 +18,12 @@ PORT_BINDINGS=$(docker inspect "${CONTAINER_NAME}" \
     2>/dev/null || true)
 ENV_VARS=$(docker inspect "${CONTAINER_NAME}" \
     --format '{{range .Config.Env}}{{.}} {{end}}' 2>/dev/null || true)
+IPC_MODE=$(docker inspect "${CONTAINER_NAME}" \
+    --format '{{.HostConfig.IpcMode}}' 2>/dev/null || true)
+SHM_SIZE=$(docker inspect "${CONTAINER_NAME}" \
+    --format '{{.HostConfig.ShmSize}}' 2>/dev/null || true)
+RUNTIME=$(docker inspect "${CONTAINER_NAME}" \
+    --format '{{.HostConfig.Runtime}}' 2>/dev/null || true)
 
 echo "[restart] network_mode: ${NETWORK_MODE}"
 echo "[restart] binds:        ${BINDS}"
@@ -45,6 +51,21 @@ else
         ARGS="${ARGS} -p ${host_port}:${container_port%/tcp}"
     done
     ARGS="${ARGS} --network ${NETWORK_MODE}"
+fi
+
+# IPC mode (required for FastDDS SHM transport)
+if [ "${IPC_MODE}" = "host" ]; then
+    ARGS="${ARGS} --ipc host"
+fi
+
+# SHM size
+if [ -n "${SHM_SIZE}" ] && [ "${SHM_SIZE}" != "0" ]; then
+    ARGS="${ARGS} --shm-size ${SHM_SIZE}"
+fi
+
+# GPU runtime (nvidia)
+if [ -n "${RUNTIME}" ] && [ "${RUNTIME}" != "runc" ]; then
+    ARGS="${ARGS} --runtime ${RUNTIME}"
 fi
 
 for env in ${ENV_VARS}; do

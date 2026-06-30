@@ -41,3 +41,11 @@ plugins:
     graph:
       db_path: "/opt/phanthy-motus/data/htmsg"
       max_nodes: 500
+
+  vop:
+    enabled: true
+    namespace: ""       # auto-detect from hostname if empty
+    model: "yolov8s-worldv2"
+    confidence: 0.3
+    classes: []         # empty = default broad set
+    fps: 5

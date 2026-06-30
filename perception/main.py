@@ -72,6 +72,16 @@ class PerceptionBundle:
             plugin.start()
             log.info("HTMSGPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("vop", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["vop"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.vop import VideoObjectPerceptionPlugin
+            plugin = VideoObjectPerceptionPlugin(plugins_cfg["vop"], namespace, executor)
+            self._plugins.append(plugin)
+            log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
