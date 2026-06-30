@@ -1274,7 +1274,9 @@ async function _startProject() {
   });
   if (unconfigured.length) {
     const names = unconfigured.map(c => c.toolName).join(', ');
-    _logActivity('error', `无法启动：以下工具未配置: ${names}（请在侧边栏中配置）`);
+    const msg = `无法启动：以下工具未配置: ${names}（请在侧边栏中配置）`;
+    _logActivity('error', msg);
+    _flashStartError(msg);
     return;
   }
 
@@ -1283,7 +1285,9 @@ async function _startProject() {
     if (!conn.fromTopic) {
       const fromCard = _cards.find(c => c.id === conn.fromCardId);
       const toCard = _cards.find(c => c.id === conn.toCardId);
-      _logActivity('error', `连线缺少 topic: ${fromCard?.toolName || '?'} → ${toCard?.toolName || '?'}，请检查连接`);
+      const msg = `连线缺少 topic: ${fromCard?.toolName || '?'} → ${toCard?.toolName || '?'}，请删除并重新连接`;
+      _logActivity('error', msg);
+      _flashStartError(msg);
       return;
     }
   }
@@ -1313,7 +1317,9 @@ async function _startProject() {
     args.instance_id = card.id;
     const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
     if (startResult && startResult.code !== 200) {
-      _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
+      const msg = `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`;
+      _logActivity('error', msg);
+      _flashStartError(msg);
     }
     // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
     const parsed = _parseMcpCallResult(startResult);
@@ -1545,6 +1551,24 @@ function _showResult(el, text, isError) {
   pre.textContent = text;
   wrapper.appendChild(pre);
   el.appendChild(wrapper);
+}
+
+function _flashStartError(msg) {
+  const btn = document.getElementById('canvas-project-toggle');
+  if (btn) {
+    btn.classList.add('error-flash');
+    setTimeout(() => btn.classList.remove('error-flash'), 2000);
+  }
+  // Show a toast near the button
+  const ctrl = document.getElementById('canvas-top-control');
+  if (!ctrl) return;
+  let toast = ctrl.querySelector('.start-error-toast');
+  if (toast) toast.remove();
+  toast = document.createElement('div');
+  toast.className = 'start-error-toast';
+  toast.textContent = msg;
+  ctrl.appendChild(toast);
+  setTimeout(() => toast.remove(), 5000);
 }
 
 function _logActivity(type, msg) {

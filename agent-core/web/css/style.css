@@ -870,6 +870,41 @@ html, body {
   animation: btn-pulse 3s ease-in-out infinite;
 }
 
+/* Error flash on start failure */
+@keyframes btn-error-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  40% { transform: translateX(4px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(3px); }
+}
+.canvas-main-btn.error-flash {
+  animation: btn-error-shake 0.4s ease;
+  border-color: #e74c3c;
+  box-shadow: 0 0 0 2px rgba(231, 76, 60, 0.3), 0 4px 12px rgba(231, 76, 60, 0.25);
+}
+
+.start-error-toast {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #2c1810;
+  color: #f5a68e;
+  border: 1px solid rgba(231, 76, 60, 0.4);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 12px;
+  white-space: nowrap;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  animation: toast-in 0.2s ease-out;
+  z-index: 100;
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(-4px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
 
 .canvas-card {
   position: absolute;
