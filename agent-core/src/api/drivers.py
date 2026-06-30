@@ -97,6 +97,7 @@ def _deploy_sync(driver: dict) -> dict:
         hostname=ros_hostname,
         remove=False,
         restart_policy={'Name': 'unless-stopped'},
+        shm_size='512m',
     )
 
     # Jetson GPU: add nvidia runtime for images with '-jetson' tag
