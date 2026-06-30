@@ -33,4 +33,4 @@ ENV IMAGE_TAG=${IMAGE_TAG}
 RUN echo "${IMAGE_TAG}" > /work/VERSION
 
 EXPOSE 15678
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && uv run src/start.py"]
+CMD ["/bin/bash", "-c", "rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null; source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && uv run src/start.py"]
