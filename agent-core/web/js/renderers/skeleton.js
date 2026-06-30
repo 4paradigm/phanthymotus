@@ -397,9 +397,9 @@ export const SkeletonRenderer = {
       if (!Array.isArray(joints)) return;
 
       for (const j of joints) {
-        const idx = j.idx;
-        if (idx >= MOTOR_INDEX_MAP.length) continue;
-        const jointName = MOTOR_INDEX_MAP[idx];
+        // Prefer name-based matching (R1 sends joint names), fallback to index map (G1)
+        const jointName = j.name || (j.idx < MOTOR_INDEX_MAP.length ? MOTOR_INDEX_MAP[j.idx] : null);
+        if (!jointName) continue;
         const obj = this._joints[jointName];
         if (!obj) continue;
 
