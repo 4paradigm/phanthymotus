@@ -3,8 +3,8 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-pip && \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
