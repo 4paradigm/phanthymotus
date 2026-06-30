@@ -24,6 +24,8 @@ SHM_SIZE=$(docker inspect "${CONTAINER_NAME}" \
     --format '{{.HostConfig.ShmSize}}' 2>/dev/null || true)
 RUNTIME=$(docker inspect "${CONTAINER_NAME}" \
     --format '{{.HostConfig.Runtime}}' 2>/dev/null || true)
+PID_MODE=$(docker inspect "${CONTAINER_NAME}" \
+    --format '{{.HostConfig.PidMode}}' 2>/dev/null || true)
 
 echo "[restart] network_mode: ${NETWORK_MODE}"
 echo "[restart] binds:        ${BINDS}"
@@ -56,6 +58,11 @@ fi
 # IPC mode (required for FastDDS SHM transport)
 if [ "${IPC_MODE}" = "host" ]; then
     ARGS="${ARGS} --ipc host"
+fi
+
+# PID mode (required for FastDDS SHM transport across containers)
+if [ "${PID_MODE}" = "host" ]; then
+    ARGS="${ARGS} --pid host"
 fi
 
 # SHM size
