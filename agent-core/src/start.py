@@ -50,16 +50,9 @@ def _check_dds():
             '并 source /opt/ros/<版本>/setup.bash 后再启动。'
         )
 
-    try:
-        import rclpy as _rclpy
-        _rclpy.init(args=[])
-        _rclpy.shutdown()
-    except Exception as e:
-        raise RuntimeError(
-            f'[PhanthyMotus] DDS 初始化失败：{e}\n'
-            'PhanthyMotus 需要安装在具有正常运行的 ROS2 DDS 服务的系统上。\n'
-            '请检查 ROS2 环境是否正确 source，以及 DDS 中间件是否正常。'
-        ) from e
+    # Note: do NOT call rclpy.init()/shutdown() here — it corrupts the
+    # global rcl context, causing ros2_bridge.start() to fail later.
+    # The import check above is sufficient to verify DDS availability.
 
 
 def _cleanup_stale_mcps():

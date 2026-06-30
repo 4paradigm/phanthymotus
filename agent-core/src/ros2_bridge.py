@@ -74,8 +74,10 @@ def _spin_loop() -> None:
     while _running:
         try:
             _executor.spin_once(timeout_sec=0.05)
-        except Exception:
-            break
+        except Exception as e:
+            print(f'[ros2_bridge] spin error: {e}', file=sys.stderr, flush=True)
+            import time as _t
+            _t.sleep(0.1)  # avoid tight loop on persistent errors
 
 
 def stop() -> None:

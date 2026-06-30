@@ -6,6 +6,7 @@ services:
     platform: linux/arm64
     network_mode: host     # 需要访问 ROS2 DDS；0.0.0.0:15678 直接绑定到宿主机
     ipc: host              # FastDDS SHM transport
+    pid: host              # FastDDS SHM transport 需要共享 PID namespace
     env_file: .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -47,7 +48,7 @@ services:
     runtime: nvidia
     network_mode: host     # 需要访问 ROS2 DDS；15720/15721/8000 直接绑定到宿主机
     ipc: host              # FastDDS SHM transport
-    shm_size: '512m'       # 为视觉/点云大数据 SHM 缓冲区预留空间
+    pid: host              # FastDDS SHM transport 需要共享 PID namespace
     env_file: .env
     volumes:
       - /opt/embodied/models:/models
