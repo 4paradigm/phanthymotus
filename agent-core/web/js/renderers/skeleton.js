@@ -187,12 +187,17 @@ export const SkeletonRenderer = {
     this._pelvisGroup = pelvisGroup;
 
     const linkObj = {};
-    linkObj['pelvis'] = pelvisGroup;
-    this._links['pelvis'] = pelvisGroup;
+
+    // Find root link: a link that is a parent but never a child
+    const childLinks = new Set(joints.map(j => j.childLink));
+    const rootLinkName = Object.keys(linkMap).find(name => !childLinks.has(name)) || 'pelvis';
+
+    linkObj[rootLinkName] = pelvisGroup;
+    this._links[rootLinkName] = pelvisGroup;
 
     // BFS to build hierarchy
-    const queue = ['pelvis'];
-    const visited = new Set(['pelvis']);
+    const queue = [rootLinkName];
+    const visited = new Set([rootLinkName]);
 
     while (queue.length > 0) {
       const current = queue.shift();
