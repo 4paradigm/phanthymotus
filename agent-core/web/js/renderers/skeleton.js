@@ -187,12 +187,17 @@ export const SkeletonRenderer = {
     this._pelvisGroup = pelvisGroup;
 
     const linkObj = {};
-    linkObj['pelvis'] = pelvisGroup;
-    this._links['pelvis'] = pelvisGroup;
+
+    // Find root link: a link that is a parent but never a child
+    const childLinks = new Set(joints.map(j => j.childLink));
+    const rootLinkName = Object.keys(linkMap).find(name => !childLinks.has(name)) || 'pelvis';
+
+    linkObj[rootLinkName] = pelvisGroup;
+    this._links[rootLinkName] = pelvisGroup;
 
     // BFS to build hierarchy
-    const queue = ['pelvis'];
-    const visited = new Set(['pelvis']);
+    const queue = [rootLinkName];
+    const visited = new Set([rootLinkName]);
 
     while (queue.length > 0) {
       const current = queue.shift();
@@ -397,9 +402,9 @@ export const SkeletonRenderer = {
       if (!Array.isArray(joints)) return;
 
       for (const j of joints) {
-        const idx = j.idx;
-        if (idx >= MOTOR_INDEX_MAP.length) continue;
-        const jointName = MOTOR_INDEX_MAP[idx];
+        // Prefer name-based matching (R1 sends joint names), fallback to index map (G1)
+        const jointName = j.name || (j.idx < MOTOR_INDEX_MAP.length ? MOTOR_INDEX_MAP[j.idx] : null);
+        if (!jointName) continue;
         const obj = this._joints[jointName];
         if (!obj) continue;
 

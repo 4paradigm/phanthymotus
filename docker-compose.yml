@@ -7,6 +7,7 @@ services:
       dockerfile: Dockerfile
     network_mode: host     # 需要访问 ROS2 DDS；15720/15721 直接绑定到宿主机
     ipc: host              # FastDDS SHM transport 需要共享 IPC namespace
+    pid: host              # FastDDS SHM transport 需要共享 PID namespace
     environment:
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -24,6 +25,7 @@ services:
       dockerfile: Dockerfile
     network_mode: host     # 需要访问 ROS2 DDS；0.0.0.0:15678 直接绑定到宿主机
     ipc: host              # FastDDS SHM transport 需要共享 IPC namespace
+    pid: host              # FastDDS SHM transport 需要共享 PID namespace
     env_file: .env
     environment:
       - ROS_DOMAIN_ID=42
