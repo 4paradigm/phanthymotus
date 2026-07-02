@@ -372,7 +372,6 @@ class VideoObjectPerceptionPlugin:
                         extra_classes, node_suffix=suffix)
         self._executor.add_node(node)
         self._nodes[node_key] = node
-        self._sync_model_classes()
         node.start()
         log.info(f"[vop] node started (background): {input_topic}")
 
@@ -476,7 +475,8 @@ class VideoObjectPerceptionPlugin:
             else:
                 # Global extra classes
                 self._extra_classes = classes
-            self._sync_model_classes()
+            # Sync model classes in background to avoid blocking HTTP (GPU model move is slow)
+            threading.Thread(target=self._sync_model_classes, daemon=True, name="vop_sync_classes").start()
             return {"base_classes": len(self._base_classes), "extra_classes": classes, "total": len(self._get_all_classes())}
 
         elif action == "config":
@@ -500,7 +500,8 @@ class VideoObjectPerceptionPlugin:
                     self._fps = int(cfg["fps"])
                 if "classes" in cfg:
                     self._extra_classes = cfg["classes"]
-                    self._sync_model_classes()
+                    # Sync model classes in background to avoid blocking HTTP
+                    threading.Thread(target=self._sync_model_classes, daemon=True, name="vop_sync_classes").start()
                 return {"status": "configured", "config": cfg}
 
         return None
