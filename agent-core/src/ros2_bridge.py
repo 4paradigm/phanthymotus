@@ -128,7 +128,7 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
             data = raw if isinstance(raw, bytes) else (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw))
             msg_fmt = getattr(msg, 'format', fmt)
         except Exception as e:
-            print(f'[ros2_bridge] decode error: {e}', file=sys.stderr)
+            print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
             return
         _last_seen[topic] = _time.time()
         asyncio.run_coroutine_threadsafe(cb(data, msg_fmt), _cb_loop)

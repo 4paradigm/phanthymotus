@@ -24,6 +24,9 @@ services:
       - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     logging:
       driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   # ── Hardware Bridge（躯体层）─────────────────────────────────────────────────
@@ -36,6 +39,9 @@ services:
       - ./data/spatial:/opt/phanthy-motus/data   # 地图PCD + 指纹DB 持久化
     logging:
       driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     profiles:
       - hardware
     restart: unless-stopped
@@ -59,6 +65,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
     logging:
       driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     profiles:
       - perception
     restart: unless-stopped

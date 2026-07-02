@@ -16,6 +16,9 @@ services:
       - ./src/perception_stack/config.yaml:/work/config.yaml:ro
     logging:
       driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   # ── Layer 3: Agent Core（大脑层）─────────────────────────────────────────
@@ -35,6 +38,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     logging:
       driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - perception-stack
     restart: unless-stopped

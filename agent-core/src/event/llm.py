@@ -211,10 +211,8 @@ class Event:
         task_store.load_all()
         for task in task_store.active_tasks():
             _register_check(task)
-        # 创建聊天历史会话
-        import chat_history
-        self._session_id = chat_history.create_session()
-        print(f'[chat_history] session created: {self._session_id}')
+        # 聊天历史会话 — 延迟到第一次 save_turn 时创建
+        self._session_id = None
         return self
 
     async def __aexit__(self, *args):
@@ -287,16 +285,17 @@ class Event:
         """保存 _current_turn 到内存历史 + SQLite。"""
         turn = self._current_turn
         self._turns.append(turn)
-        # 持久化
-        if self._session_id:
-            import chat_history
-            try:
-                chat_history.save_turn(self._session_id, len(self._turns) - 1, turn)
-                summary_text = trigger_event.get('text', '') or trigger_event.get('source', '')
-                if summary_text:
-                    chat_history.update_summary(self._session_id, summary_text)
-            except Exception as e:
-                print(f'[chat_history] save_turn failed: {e}')
+        # 持久化（延迟创建 session）
+        import chat_history
+        try:
+            if not self._session_id:
+                self._session_id = chat_history.create_session()
+            chat_history.save_turn(self._session_id, len(self._turns) - 1, turn)
+            summary_text = trigger_event.get('text', '') or trigger_event.get('source', '')
+            if summary_text:
+                chat_history.update_summary(self._session_id, summary_text)
+        except Exception as e:
+            print(f'[chat_history] save_turn failed: {e}')
         # 裁剪
         max_turns = config.main.get('event', {}).get('llm', {}).get('history_turns', 30)
         if len(self._turns) > max_turns:
@@ -410,7 +409,6 @@ class Event:
             tool_count = len(all_tool_list)
             last_user = next((m.get('content', '')[:80] for m in reversed(messages) if m.get('role') == 'user'), '')
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} last_user={last_user}')
-            print(f'[decision] full messages:\n{json.dumps(messages, ensure_ascii=False, indent=2)}')
 
             # ── 调用 LLM（含上下文溢出恢复）───────────────────────────────
             try:

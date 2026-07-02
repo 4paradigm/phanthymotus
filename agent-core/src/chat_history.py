@@ -48,13 +48,13 @@ def update_summary(session_id: str, text: str):
 
 
 def list_sessions(limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
-    """Return recent sessions (newest first) and total count."""
+    """Return recent sessions (newest first) and total count. Excludes empty (0-turn) sessions."""
     with _get_conn() as conn:
         conn.row_factory = None
-        total = conn.execute('SELECT COUNT(*) FROM chat_sessions').fetchone()[0]
+        total = conn.execute('SELECT COUNT(*) FROM chat_sessions WHERE turn_count > 0').fetchone()[0]
         rows = conn.execute(
             'SELECT id, started_at, ended_at, summary, turn_count '
-            'FROM chat_sessions ORDER BY started_at DESC LIMIT ? OFFSET ?',
+            'FROM chat_sessions WHERE turn_count > 0 ORDER BY started_at DESC LIMIT ? OFFSET ?',
             (limit, offset)
         ).fetchall()
     sessions = [

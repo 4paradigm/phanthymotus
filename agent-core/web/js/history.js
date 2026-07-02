@@ -18,6 +18,7 @@ export function initHistory() {
   document.getElementById('history-close').addEventListener('click', hide);
   _overlay.addEventListener('click', e => { if (e.target === _overlay) hide(); });
   document.getElementById('history-clear-all').addEventListener('click', clearAll);
+  document.getElementById('history-refresh').addEventListener('click', () => _loadSessions());
   _btnDeleteSelected.addEventListener('click', deleteSelected);
 }
 
