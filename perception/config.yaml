@@ -44,3 +44,21 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  stereo:
+    enabled: true
+    matcher: "sgbm"     # sgbm (OpenCV, CPU) — future deep-learning matchers plug in here
+    fps: 5
+    sync_ms: 50         # max left/right timestamp difference (ms) to accept a pair
+    max_points: 40000   # max points per published cloud
+    max_depth: 0        # meters, 0 = no limit (only meaningful with calibration)
+    # Stereo calibration (from cv2.stereoRectify). All 0 = synthetic intrinsics:
+    # cloud shape is correct but absolute scale is arbitrary.
+    fx: 0               # focal length in pixels
+    baseline: 0         # baseline in meters
+    cx: 0               # principal point x (0 = image center)
+    cy: 0               # principal point y (0 = image center)
+    sgbm:
+      min_disparity: 16
+      num_disparities: 144   # must be a multiple of 16; larger = closer objects, slower
+      block_size: 5

@@ -87,6 +87,11 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("stereo", {}).get("enabled", False):
+            from plugins.stereo import StereoPointCloudPlugin
+            self._plugins.append(StereoPointCloudPlugin(plugins_cfg["stereo"], executor))
+            log.info("StereoPointCloudPlugin loaded")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
