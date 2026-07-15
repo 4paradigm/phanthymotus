@@ -24,6 +24,9 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("  asr:\n    enabled: true\n    mode: offline", config)
         self.assertIn("  ocr:\n    enabled: true\n    provider: rapidocr", config)
         self.assertIn("model_dir: /models/ocr/ppocrv6-tiny", config)
+        self.assertIn('    url: ""', config)
+        self.assertIn('    key: ""', config)
+        self.assertIn('    model: ""', config)
 
     def test_jetson_image_uses_external_ocr_models(self):
         dockerfile = (REPO_ROOT / "perception" / "Dockerfile.jetson").read_text(
@@ -47,15 +50,36 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("/models/ocr/ppocrv6-tiny", dockerfile)
         self.assertNotIn("COPY perception/models", dockerfile)
 
-    def test_ocr_does_not_override_process_wide_fastdds_transport(self):
+    def test_jetson_image_loads_large_message_fastdds_profile(self):
         dockerfile = (REPO_ROOT / "perception" / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
-
-        self.assertNotIn("FASTRTPS_DEFAULT_PROFILES_FILE", dockerfile)
-        self.assertFalse(
-            (REPO_ROOT / "perception" / "config" / "fastdds_large_message.xml").exists()
+        service = (REPO_ROOT / "perception" / "deploy" / "service.yml").read_text(
+            encoding="utf-8"
         )
+        profile_path = (
+            REPO_ROOT
+            / "perception"
+            / "config"
+            / "fastdds_large_message.xml"
+        )
+
+        self.assertTrue(profile_path.is_file())
+        profile = profile_path.read_text(encoding="utf-8")
+        self.assertIn("<maxMessageSize>65000</maxMessageSize>", profile)
+        self.assertIn("<sendBufferSize>8388608</sendBufferSize>", profile)
+        self.assertIn("<receiveBufferSize>8388608</receiveBufferSize>", profile)
+        self.assertIn(
+            "COPY perception/config/fastdds_large_message.xml "
+            "/opt/phanthy-motus/config/fastdds_large_message.xml",
+            dockerfile,
+        )
+        self.assertIn(
+            "FASTRTPS_DEFAULT_PROFILES_FILE="
+            "/opt/phanthy-motus/config/fastdds_large_message.xml",
+            service,
+        )
+        self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS", service)
 
 
 if __name__ == "__main__":

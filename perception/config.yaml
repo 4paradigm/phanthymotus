@@ -49,6 +49,9 @@ plugins:
   ocr:
     enabled: true
     provider: rapidocr
+    url: ""
+    key: ""
+    model: ""
     model_dir: /models/ocr/ppocrv6-tiny
     language: zh
     use_angle_cls: true
