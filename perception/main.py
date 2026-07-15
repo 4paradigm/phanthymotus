@@ -87,6 +87,11 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("ocr", {}).get("enabled", False):
+            from plugins.ocr import OCRPlugin
+            self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
+            log.info("OCRPlugin loaded")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:

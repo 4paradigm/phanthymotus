@@ -1,5 +1,7 @@
 # OCR 与最新 Main 集成实现计划
 
+> **2026-07-15 范围变更：** 当前执行只完成任务 2-7 的 OCR 部分，任务 1 的 main 合并和 SenseVoice 改动不执行。代码基线固定为 `02d1ddc`；`perception/plugins/asr.py`、`perception/utils/model_downloader.py` 和 `deploy/restart/entrypoint.sh` 保持不变。任务 5 中的 Fast DDS XML 和全局环境变量也不执行，先沿用现有 ROS2 transport，避免影响同进程其他插件。
+
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
 
 **目标：** 在 `feat/zengzhitao` 中合入最新 `origin/main`，保留 official Paraformer 离线 ASR 默认行为，并增加默认启用、模型总量小于 15 MiB 的本地 PP-OCRv6 tiny OCR 插件。

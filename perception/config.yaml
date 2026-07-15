@@ -45,3 +45,11 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: true
+    provider: rapidocr
+    model_dir: /models/ocr/ppocrv6-tiny
+    language: zh
+    use_angle_cls: true
+    num_threads: 2

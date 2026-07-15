@@ -1,10 +1,9 @@
-# OCR and Latest Main Integration
+# OCR-Only Integration
 
 ## Goal
 
 Extend `feat/zengzhitao` with an enabled, on-device OCR capability for the
-Jetson leaderboard while preserving the existing ASR benchmark behavior and
-integrating the applicable updates from the latest `origin/main`.
+Jetson leaderboard while preserving the existing ASR benchmark behavior.
 
 The OCR implementation must detect text boxes and recognize Chinese, English,
 and numeric text. Its complete model bundle must remain below 15 MiB, GPU usage
@@ -13,16 +12,9 @@ committed to Git.
 
 ## Integration Boundary
 
-Merge the latest `origin/main` into the feature branch and resolve the ASR
-conflict deliberately:
-
-- Keep `mode: offline` and the internal official Paraformer model as the ASR
-  default.
-- Add the upstream SenseVoice downloader and selectable adapter without
-  changing the default ASR model or KWS/VAD behavior.
-- When `asr_model` is `sensevoice-small`, select the SenseVoice adapter before
-  applying the regular offline-versus-streaming Paraformer mode decision.
-- Keep the upstream restart helper fix.
+Use the existing feature head `02d1ddc` as the code baseline. Do not merge
+`origin/main` in this change, and do not modify ASR selection, model download,
+VAD/KWS behavior, or restart scripts.
 
 Port only the OCR capability from `origin/feat/wanglimin-test`:
 
@@ -105,10 +97,11 @@ the package, so only the leaderboard model bundle remains in the final image.
 
 ## Image Transport
 
-Bring in the OCR branch's Fast DDS large-message profile and set
-`FASTRTPS_DEFAULT_PROFILES_FILE` to its image path. Copying the XML without the
-environment variable is insufficient because Fast DDS would not be directed to
-that profile.
+Keep the existing ROS2 middleware configuration unchanged. Standard Fast DDS
+fragmentation is used for compressed image messages. Do not activate the OCR
+branch's process-wide custom UDP profile because it would also alter ASR, TTS,
+and every other ROS2 topic in the perception process. Add a transport override
+only after Jetson testing demonstrates a reproducible image transport failure.
 
 ## Configuration
 
@@ -137,10 +130,10 @@ Automated tests cover:
 - Invalid-image and inference-error output behavior.
 - Model downloader success, partial-download cleanup, non-empty files, and the
   15 MiB aggregate limit.
-- Docker model download, dependency pinning, bundled-model removal, and Fast
-  DDS profile activation.
-- Existing ASR runtime and benchmark contract regression tests.
-- SenseVoice selection while retaining official Paraformer as the default.
+- Docker model download, dependency pinning, bundled-model removal, and absence
+  of a process-wide Fast DDS override.
+- Existing ASR runtime and benchmark contract regression tests remain green
+  without changing ASR production code.
 
 Local verification includes unit tests, Python compilation, diff checks, and a
 Git large-file audit. Final acceptance requires a Jetson no-cache Docker build,
