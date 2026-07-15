@@ -62,12 +62,17 @@ empty result plus an `error` field instead of terminating the worker.
 
 ## Local Model
 
-Use a PP-OCRv3 slim ONNX pipeline through RapidOCR on CPU:
+Use a PP-OCRv6 tiny ONNX pipeline through RapidOCR on CPU. The official
+RapidOCR model repository provides the required ONNX artifacts directly, so no
+Paddle-to-ONNX conversion is required:
 
-- Slim mobile text detector.
-- Slim Chinese-English text recognizer.
+- PP-OCRv6 tiny text detector (`1,829,618` bytes).
+- PP-OCRv6 tiny Chinese-English text recognizer (`4,489,813` bytes).
 - Mobile text-line orientation classifier.
 - Chinese-English recognition dictionary.
+
+The complete bundle is approximately 6.61 MiB, including the 585,532-byte
+classifier and 27,156-byte dictionary.
 
 The internal bundle uses stable normalized names:
 
@@ -81,13 +86,13 @@ keys.txt
 The files are hosted under:
 
 ```text
-http://172.28.4.81:34567/zengzhitao/embodied-ai/ocr/ppocrv3-slim/
+http://172.28.4.81:34567/zengzhitao/embodied-ai/ocr/ppocrv6-tiny/
 ```
 
 The Jetson image downloads them at build time into:
 
 ```text
-/models/ocr/ppocrv3-slim/
+/models/ocr/ppocrv6-tiny/
 ```
 
 The downloader uses temporary files and atomic replacement, rejects empty
@@ -113,7 +118,7 @@ Add this default configuration without changing existing ASR defaults:
 ocr:
   enabled: true
   provider: rapidocr
-  model_dir: /models/ocr/ppocrv3-slim
+  model_dir: /models/ocr/ppocrv6-tiny
   language: zh
   use_angle_cls: true
   num_threads: 2
@@ -145,6 +150,6 @@ measurement, and confirmation that GPU utilization remains below 10%.
 ## External Prerequisite
 
 Before the Jetson Docker build can pass, the four normalized OCR model files
-must be prepared from the official/RapidOCR PP-OCRv3 slim artifacts and uploaded
+must be prepared from the official RapidOCR PP-OCRv6 tiny artifacts and uploaded
 to the internal HTTP directory above. They are deployment artifacts and remain
 outside Git history.
