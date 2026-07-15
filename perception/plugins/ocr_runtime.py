@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import tempfile
 from pathlib import Path
 
 
@@ -67,32 +68,57 @@ class RapidOCRAdapter:
             )
 
         from rapidocr import RapidOCR
+        from rapidocr.main import DEFAULT_CFG_PATH
 
         self._use_angle_cls = use_angle_cls
-        self._engine = RapidOCR(
-            params={
-                "Det.engine_type": "onnxruntime",
-                "Det.lang_type": "ch",
-                "Det.model_type": "tiny",
-                "Det.ocr_version": "PP-OCRv6",
-                "Det.model_path": str(root / "det.onnx"),
-                "Cls.engine_type": "onnxruntime",
-                "Cls.lang_type": "ch",
-                "Cls.model_type": "mobile",
-                "Cls.ocr_version": "PP-OCRv4",
-                "Cls.model_path": str(root / "cls.onnx"),
-                "Rec.engine_type": "onnxruntime",
-                "Rec.lang_type": "ch",
-                "Rec.model_type": "tiny",
-                "Rec.ocr_version": "PP-OCRv6",
-                "Rec.model_path": str(root / "rec.onnx"),
-                "Rec.rec_keys_path": str(root / "keys.txt"),
-                "Global.use_cls": use_angle_cls,
-                "EngineConfig.onnxruntime.intra_op_num_threads": num_threads,
-                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-                "EngineConfig.onnxruntime.use_cuda": False,
+
+        # Load rapidocr's own default config, override model paths
+        import yaml
+        with open(DEFAULT_CFG_PATH) as f:
+            cfg = yaml.safe_load(f)
+
+        cfg["Det"].update(
+            {
+                "engine_type": "onnxruntime",
+                "lang_type": "ch",
+                "model_type": "tiny",
+                "ocr_version": "PP-OCRv6",
+                "model_path": str(root / "det.onnx"),
             }
         )
+        cfg["Cls"].update(
+            {
+                "engine_type": "onnxruntime",
+                "lang_type": "ch",
+                "model_type": "mobile",
+                "ocr_version": "PP-OCRv4",
+                "model_path": str(root / "cls.onnx"),
+            }
+        )
+        cfg["Rec"].update(
+            {
+                "engine_type": "onnxruntime",
+                "lang_type": "ch",
+                "model_type": "tiny",
+                "ocr_version": "PP-OCRv6",
+                "model_path": str(root / "rec.onnx"),
+                "rec_keys_path": str(root / "keys.txt"),
+            }
+        )
+        cfg["Global"]["use_cls"] = use_angle_cls
+
+        engine_cfg = cfg.setdefault("EngineConfig", {}).setdefault(
+            "onnxruntime", {}
+        )
+        engine_cfg["intra_op_num_threads"] = num_threads
+        engine_cfg["inter_op_num_threads"] = 1
+        engine_cfg["use_cuda"] = False
+
+        with tempfile.TemporaryDirectory(prefix="rapidocr-config-") as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            with config_path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, default_flow_style=False)
+            self._engine = RapidOCR(config_path=str(config_path))
 
     def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
         import cv2

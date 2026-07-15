@@ -32,8 +32,15 @@ from plugins.ocr_runtime import (
 
 log = logging.getLogger(__name__)
 
-_LOW_LAT_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.RELIABLE,  # 使用 RELIABLE 确保消息可靠送达
+_CAMERA_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+_RESULT_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
     depth=10,
     durability=DurabilityPolicy.VOLATILE,
@@ -448,7 +455,7 @@ class _OCRNode(Node):
         self.state = "idle"
 
         self._sub = None
-        self._pub = self.create_publisher(String, self._output_topic, _LOW_LAT_QOS)
+        self._pub = self.create_publisher(String, self._output_topic, _RESULT_QOS)
 
         self._frame_queue: queue.Queue = queue.Queue(maxsize=5)
         self._worker_thread: Optional[threading.Thread] = None
@@ -466,7 +473,7 @@ class _OCRNode(Node):
 
         self._stop_event.clear()
         self._sub = self.create_subscription(
-            CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
+            CompressedImage, self._input_topic, self._image_cb, _CAMERA_QOS
         )
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
@@ -544,18 +551,24 @@ class OCRPlugin:
     PREFIX = "ocr"
 
     def __init__(self, plugin_cfg: dict, executor):
-        self._adapter = _build_ocr_adapter(plugin_cfg)
         self._language = plugin_cfg.get('language', 'zh')
         self._nodes: dict[str, _OCRNode] = {}
         self._instance_configs: dict[str, dict] = {}
         self._executor = executor
 
-        log.info(f"[ocr] plugin init: provider={plugin_cfg.get('provider')}, "
-                 f"language={self._language}, "
-                 f"key={'set' if plugin_cfg.get('key') else 'MISSING'}")
-
-        if not self._adapter:
-            log.warning("[ocr] adapter not configured (missing key)")
+        try:
+            self._adapter = _build_ocr_adapter(plugin_cfg)
+            log.info(
+                f"[ocr] plugin init: provider={plugin_cfg.get('provider')}, "
+                f"language={self._language}, "
+                f"adapter_ok={self._adapter is not None}"
+            )
+        except Exception as exc:
+            log.error(
+                "[ocr] failed to create adapter: %s, OCR will be unavailable",
+                exc,
+            )
+            self._adapter = None
 
     def get_tools(self) -> list:
         return TOOLS

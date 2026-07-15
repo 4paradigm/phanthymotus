@@ -29,13 +29,12 @@ class OCRModelDownloaderTest(unittest.TestCase):
         from utils.ocr_model_downloader import download_model
 
         with tempfile.TemporaryDirectory() as output_tmp:
-            def empty_download(_url, destination):
-                Path(destination).write_bytes(b"")
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = b""
 
             with mock.patch(
-                "utils.ocr_model_downloader.urlretrieve",
-                side_effect=empty_download,
-            ):
+                "utils.ocr_model_downloader.urlopen", return_value=response
+            ), mock.patch("utils.ocr_model_downloader.time.sleep"):
                 with self.assertRaisesRegex(ValueError, "empty"):
                     download_model("https://models.example.test", output_tmp)
 
@@ -46,10 +45,10 @@ class OCRModelDownloaderTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output_tmp:
             def oversized_download(_url, destination):
-                Path(destination).write_bytes(b"x" * 4_000_000)
+                destination.write_bytes(b"x" * 4_000_000)
 
             with mock.patch(
-                "utils.ocr_model_downloader.urlretrieve",
+                "utils.ocr_model_downloader.download_file",
                 side_effect=oversized_download,
             ):
                 with self.assertRaisesRegex(ValueError, "15 MiB"):

@@ -32,9 +32,14 @@ class OCRPackagingTest(unittest.TestCase):
 
         self.assertIn("rapidocr==3.9.1", dockerfile)
         self.assertIn("--no-deps", dockerfile)
+        self.assertIn("onnxruntime", dockerfile)
         self.assertIn("rapidocr.__file__", dockerfile)
         self.assertIn("-name '*.onnx' -delete", dockerfile)
         self.assertIn("ocr_model_downloader.py", dockerfile)
+        self.assertIn(
+            "http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-tiny",
+            dockerfile,
+        )
         self.assertIn(
             "http://172.28.4.81:34567/zengzhitao/embodied-ai/ocr/ppocrv6-tiny",
             dockerfile,

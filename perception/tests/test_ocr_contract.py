@@ -17,7 +17,9 @@ def _install_ros_stubs():
     rclpy.node.Node = object
     rclpy.qos = types.ModuleType("rclpy.qos")
     rclpy.qos.QoSProfile = lambda **kwargs: kwargs
-    rclpy.qos.ReliabilityPolicy = types.SimpleNamespace(RELIABLE="RELIABLE")
+    rclpy.qos.ReliabilityPolicy = types.SimpleNamespace(
+        RELIABLE="RELIABLE", BEST_EFFORT="BEST_EFFORT"
+    )
     rclpy.qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST="KEEP_LAST")
     rclpy.qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE="VOLATILE")
 
@@ -63,6 +65,14 @@ class OCRContractTest(unittest.TestCase):
             tool["topic_out"],
             [{"format": "data/json", "desc": "OCR result with text boxes"}],
         )
+        self.assertEqual(
+            tool["configSchema"]["properties"]["provider"]["enum"],
+            ["rapidocr", "openai", "qwen", "tesseract"],
+        )
+
+    def test_camera_and_result_topics_use_appropriate_reliability(self):
+        self.assertEqual(self.ocr._CAMERA_QOS["reliability"], "BEST_EFFORT")
+        self.assertEqual(self.ocr._RESULT_QOS["reliability"], "RELIABLE")
 
     def test_output_topic_is_derived_from_input_topic(self):
         self.assertEqual(
@@ -88,6 +98,14 @@ class OCRContractTest(unittest.TestCase):
         adapter.assert_called_once_with(
             "/models/ocr/ppocrv6-tiny", use_angle_cls=True, num_threads=2
         )
+
+    def test_adapter_initialization_failure_does_not_stop_bundle(self):
+        with mock.patch(
+            "plugins.ocr._build_ocr_adapter", side_effect=RuntimeError("load failed")
+        ):
+            plugin = self.ocr.OCRPlugin({"provider": "rapidocr"}, object())
+
+        self.assertIsNone(plugin._adapter)
 
     def test_rapidocr_output_normalizes_polygon_to_pixel_bbox(self):
         output = types.SimpleNamespace(
@@ -132,30 +150,56 @@ class OCRContractTest(unittest.TestCase):
 
     def test_rapidocr_adapter_uses_only_external_cpu_models(self):
         fake_engine = mock.Mock()
+        captured_config = {}
+
+        def create_engine(*, config_path):
+            import yaml
+
+            captured_config.update(
+                yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+            )
+            return fake_engine
+
         rapidocr_module = types.ModuleType("rapidocr")
-        rapidocr_module.RapidOCR = mock.Mock(return_value=fake_engine)
+        rapidocr_module.RapidOCR = mock.Mock(side_effect=create_engine)
+        rapidocr_main_module = types.ModuleType("rapidocr.main")
 
         with tempfile.TemporaryDirectory() as model_dir:
             root = Path(model_dir)
             for name in ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt"):
                 (root / name).write_bytes(b"model")
-            with mock.patch.dict(sys.modules, {"rapidocr": rapidocr_module}):
+            default_config = root / "default.yaml"
+            default_config.write_text(
+                "Det: {}\nCls: {}\nRec: {}\nGlobal: {}\nEngineConfig: {}\n",
+                encoding="utf-8",
+            )
+            rapidocr_main_module.DEFAULT_CFG_PATH = str(default_config)
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "rapidocr": rapidocr_module,
+                    "rapidocr.main": rapidocr_main_module,
+                },
+            ):
                 self.ocr.RapidOCRAdapter(
                     model_dir, use_angle_cls=True, num_threads=2
                 )
 
-        params = rapidocr_module.RapidOCR.call_args.kwargs["params"]
-        self.assertEqual(Path(params["Det.model_path"]).name, "det.onnx")
-        self.assertEqual(Path(params["Cls.model_path"]).name, "cls.onnx")
-        self.assertEqual(Path(params["Rec.model_path"]).name, "rec.onnx")
-        self.assertEqual(Path(params["Rec.rec_keys_path"]).name, "keys.txt")
-        self.assertEqual(params["Det.model_type"], "tiny")
-        self.assertEqual(params["Det.ocr_version"], "PP-OCRv6")
-        self.assertEqual(params["Rec.model_type"], "tiny")
-        self.assertEqual(params["Rec.ocr_version"], "PP-OCRv6")
-        self.assertEqual(params["Cls.model_type"], "mobile")
-        self.assertEqual(params["Cls.ocr_version"], "PP-OCRv4")
-        self.assertFalse(params["EngineConfig.onnxruntime.use_cuda"])
+        self.assertEqual(Path(captured_config["Det"]["model_path"]).name, "det.onnx")
+        self.assertEqual(Path(captured_config["Cls"]["model_path"]).name, "cls.onnx")
+        self.assertEqual(Path(captured_config["Rec"]["model_path"]).name, "rec.onnx")
+        self.assertEqual(Path(captured_config["Rec"]["rec_keys_path"]).name, "keys.txt")
+        self.assertEqual(captured_config["Det"]["model_type"], "tiny")
+        self.assertEqual(captured_config["Det"]["ocr_version"], "PP-OCRv6")
+        self.assertEqual(captured_config["Cls"]["model_type"], "mobile")
+        self.assertEqual(captured_config["Cls"]["ocr_version"], "PP-OCRv4")
+        self.assertEqual(captured_config["Rec"]["model_type"], "tiny")
+        self.assertEqual(captured_config["Rec"]["ocr_version"], "PP-OCRv6")
+        self.assertTrue(captured_config["Global"]["use_cls"])
+        engine_config = captured_config["EngineConfig"]["onnxruntime"]
+        self.assertEqual(engine_config["intra_op_num_threads"], 2)
+        self.assertEqual(engine_config["inter_op_num_threads"], 1)
+        self.assertFalse(engine_config["use_cuda"])
 
     def test_rapidocr_adapter_decodes_compressed_image_before_inference(self):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)
