@@ -49,6 +49,26 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _load_host_identity(cfg: dict) -> tuple[str, str]:
+    identity = cfg.get("identity")
+    if not isinstance(identity, dict):
+        raise ValueError("identity config is required for every Perception host")
+
+    core_display_name = identity.get("core_display_name")
+    mcp_server_name = identity.get("mcp_server_name")
+    if not isinstance(core_display_name, str) or not isinstance(mcp_server_name, str):
+        raise ValueError("identity.core_display_name and identity.mcp_server_name must be strings")
+    core_display_name = core_display_name.strip()
+    mcp_server_name = mcp_server_name.strip()
+    if not core_display_name or not mcp_server_name:
+        raise ValueError("identity.core_display_name and identity.mcp_server_name are required")
+    if core_display_name.casefold() == mcp_server_name.casefold():
+        raise ValueError("Core display name and MCP server name must be different")
+    if core_display_name == "Perception Stack" or mcp_server_name == "perception-bundle":
+        raise ValueError("default Perception host identities are forbidden")
+    return core_display_name, mcp_server_name
+
+
 # ── Bundle ────────────────────────────────────────────────────────────────────
 
 class PerceptionBundle:
@@ -87,6 +107,11 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("vlapi05g1", {}).get("enabled", False):
+            from plugins.vlapi05g1 import PLUGIN_CLASS
+            self._plugins.append(PLUGIN_CLASS(plugins_cfg["vlapi05g1"], executor))
+            log.info("VLAPi05G1Plugin loaded")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -115,7 +140,7 @@ class PerceptionBundle:
 _bundle: PerceptionBundle | None = None
 
 
-def make_handler():
+def make_handler(mcp_server_name: str):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             if args and "/sse" in str(args[0]):
@@ -239,7 +264,7 @@ def make_handler():
                 if method == "initialize":
                     log.debug(f"[mcp] initialize request from client")
                     ok({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "perception-bundle", "version": "1.0.0"}})
+                        "serverInfo": {"name": mcp_server_name, "version": "1.0.0"}})
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
                 elif method == "tools/call":
@@ -393,8 +418,11 @@ def main():
     cfg      = _load_config()
     mcp_port = int(cfg.get("mcp_port", 15720))
     ws_port  = int(cfg.get("ws_port",  15721))
+    core_display_name, mcp_server_name = _load_host_identity(cfg)
 
     log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
+    log.info("host identity: core_display_name=%s, mcp_server_name=%s",
+             core_display_name, mcp_server_name)
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "
              f"plugins.tts.enabled={cfg.get('plugins',{}).get('tts',{}).get('enabled')}")
     asr_cfg = cfg.get('plugins',{}).get('asr',{})
@@ -419,9 +447,9 @@ def main():
     # Start WebSocket ASR server in a separate thread
     threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
 
-    _start_registration(mcp_port, "Perception Stack", "perception")
+    _start_registration(mcp_port, core_display_name, "perception")
 
-    server = ThreadingHTTPServer(("", mcp_port), make_handler())
+    server = ThreadingHTTPServer(("", mcp_port), make_handler(mcp_server_name))
     log.info(f"MCP server → http://0.0.0.0:{mcp_port}")
 
     def _shutdown(signum, frame):
