@@ -54,10 +54,10 @@ class OCRPackagingTest(unittest.TestCase):
 
         self.assertIn("rapidocr==3.9.1", dockerfile)
         self.assertIn("libffi8_3.4.2-4_arm64.deb", dockerfile)
-        self.assertIn(
-            "onnxruntime_gpu-1.17.0-cp38-cp38-linux_aarch64.whl",
-            dockerfile,
-        )
+        self.assertIn("ort.__version__ == '1.20.0'", dockerfile)
+        self.assertNotIn("nvidia.box.com", dockerfile)
+        self.assertNotIn("onnxruntime_gpu-1.17.0", dockerfile)
+        self.assertNotIn("pip3 uninstall -y onnxruntime", dockerfile)
         self.assertIn("numpy==1.23.5", dockerfile)
         self.assertIn("CUDAExecutionProvider", dockerfile)
         self.assertIn("--no-deps", dockerfile)
