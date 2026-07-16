@@ -134,6 +134,82 @@ class OCRTiledStrategyTest(unittest.TestCase):
         self.assertEqual(scaled[0]["bbox"], [0, 0, 4000, 3000])
         self.assertEqual(item["bbox"], [-5, -4, 2100, 1600])
 
+    def test_dedup_keeps_higher_confidence_duplicate(self):
+        strategy = self.strategy_type({}, global_max_side=1600)
+        candidates = [
+            strategy._candidate(
+                {
+                    "text": "Old Navy",
+                    "bbox": [10, 10, 110, 40],
+                    "score": 0.7,
+                },
+                from_tile=False,
+            ),
+            strategy._candidate(
+                {
+                    "text": "old   navy",
+                    "bbox": [12, 11, 112, 41],
+                    "score": 0.9,
+                },
+                from_tile=True,
+            ),
+        ]
+
+        self.assertEqual(strategy._deduplicate(candidates), [candidates[1].item])
+
+    def test_dedup_prefers_tile_when_scores_tie(self):
+        strategy = self.strategy_type({}, global_max_side=1600)
+        global_item = strategy._candidate(
+            {"text": "TEST", "bbox": [0, 0, 100, 30], "score": 0.8},
+            from_tile=False,
+        )
+        tile_item = strategy._candidate(
+            {"text": "test", "bbox": [1, 1, 101, 31], "score": 0.8},
+            from_tile=True,
+        )
+
+        self.assertEqual(
+            strategy._deduplicate([global_item, tile_item]),
+            [tile_item.item],
+        )
+
+    def test_dedup_retains_overlapping_different_text(self):
+        strategy = self.strategy_type({}, global_max_side=1600)
+        candidates = [
+            strategy._candidate(
+                {"text": "price", "bbox": [0, 0, 100, 30], "score": 0.9},
+                from_tile=False,
+            ),
+            strategy._candidate(
+                {"text": "total", "bbox": [2, 1, 102, 31], "score": 0.8},
+                from_tile=True,
+            ),
+        ]
+
+        self.assertEqual(len(strategy._deduplicate(candidates)), 2)
+
+    def test_results_are_sorted_top_to_bottom_then_left_to_right(self):
+        strategy = self.strategy_type({}, global_max_side=1600)
+        candidates = [
+            strategy._candidate(
+                {"text": "right", "bbox": [100, 10, 150, 30], "score": 0.9},
+                from_tile=True,
+            ),
+            strategy._candidate(
+                {"text": "bottom", "bbox": [0, 50, 50, 70], "score": 0.9},
+                from_tile=True,
+            ),
+            strategy._candidate(
+                {"text": "left", "bbox": [10, 10, 60, 30], "score": 0.9},
+                from_tile=False,
+            ),
+        ]
+
+        self.assertEqual(
+            [item["text"] for item in strategy._deduplicate(candidates)],
+            ["left", "right", "bottom"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

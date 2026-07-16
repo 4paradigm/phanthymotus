@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+import re
+import unicodedata
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Mapping
 
 
@@ -61,6 +64,17 @@ class DecodePlan:
     factor: int
     reduced_size: tuple[int, int]
     target_size: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    item: dict
+    from_tile: bool
+
+
+def _normalize_text(text: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text)).casefold()
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def _axis_starts(length: int, tile_size: int, stride: int) -> list[int]:
@@ -232,3 +246,59 @@ class AdaptiveTiledOCRStrategy:
                 }
             )
         return scaled_items
+
+    @staticmethod
+    def _candidate(item: dict, from_tile: bool) -> _Candidate:
+        return _Candidate(item=item, from_tile=from_tile)
+
+    @staticmethod
+    def _bbox_iou(first: list, second: list) -> float:
+        first_x1, first_y1, first_x2, first_y2 = first
+        second_x1, second_y1, second_x2, second_y2 = second
+        intersection_width = max(
+            0.0, min(first_x2, second_x2) - max(first_x1, second_x1)
+        )
+        intersection_height = max(
+            0.0, min(first_y2, second_y2) - max(first_y1, second_y1)
+        )
+        intersection = intersection_width * intersection_height
+        first_area = max(0.0, first_x2 - first_x1) * max(
+            0.0, first_y2 - first_y1
+        )
+        second_area = max(0.0, second_x2 - second_x1) * max(
+            0.0, second_y2 - second_y1
+        )
+        union = first_area + second_area - intersection
+        return intersection / union if union > 0.0 else 0.0
+
+    def _is_duplicate(self, first: _Candidate, second: _Candidate) -> bool:
+        if (
+            self._bbox_iou(first.item["bbox"], second.item["bbox"])
+            < self.config.dedup_iou
+        ):
+            return False
+        similarity = SequenceMatcher(
+            None,
+            _normalize_text(first.item.get("text", "")),
+            _normalize_text(second.item.get("text", "")),
+        ).ratio()
+        return similarity >= self.config.dedup_text_similarity
+
+    def _deduplicate(self, candidates: list[_Candidate]) -> list[dict]:
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (
+                float(candidate.item.get("score", 0.0)),
+                candidate.from_tile,
+            ),
+            reverse=True,
+        )
+        kept = []
+        for candidate in ordered:
+            if any(self._is_duplicate(candidate, other) for other in kept):
+                continue
+            kept.append(candidate)
+        return sorted(
+            (candidate.item for candidate in kept),
+            key=lambda item: (item["bbox"][1], item["bbox"][0]),
+        )
