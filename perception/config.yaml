@@ -55,4 +55,5 @@ plugins:
     model_dir: /models/ocr/ppocrv6-tiny
     language: zh
     use_angle_cls: true
-    num_threads: 2
+    num_threads: 1
+    max_side_len: 1600

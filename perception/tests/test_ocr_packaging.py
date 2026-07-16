@@ -16,14 +16,16 @@ class OCRPackagingTest(unittest.TestCase):
             'plugins_cfg.get("ocr", {}).get("enabled", False)', source
         )
 
-    def test_default_config_enables_local_ocr_without_changing_asr(self):
+    def test_default_config_is_bounded_for_ocr_leaderboard(self):
         config = (REPO_ROOT / "perception" / "config.yaml").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("  asr:\n    enabled: true\n    mode: offline", config)
+        self.assertIn("  asr:\n    enabled: false\n    mode: offline", config)
         self.assertIn("  ocr:\n    enabled: true\n    provider: rapidocr", config)
         self.assertIn("model_dir: /models/ocr/ppocrv6-tiny", config)
+        self.assertIn("    max_side_len: 1600", config)
+        self.assertIn("    num_threads: 1", config)
         self.assertIn('    url: ""', config)
         self.assertIn('    key: ""', config)
         self.assertIn('    model: ""', config)
@@ -69,6 +71,7 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("<maxMessageSize>65000</maxMessageSize>", profile)
         self.assertIn("<sendBufferSize>8388608</sendBufferSize>", profile)
         self.assertIn("<receiveBufferSize>8388608</receiveBufferSize>", profile)
+        self.assertIn("<useBuiltinTransports>true</useBuiltinTransports>", profile)
         self.assertIn(
             "COPY perception/config/fastdds_large_message.xml "
             "/opt/phanthy-motus/config/fastdds_large_message.xml",

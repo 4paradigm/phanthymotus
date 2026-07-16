@@ -33,16 +33,16 @@ from plugins.ocr_runtime import (
 log = logging.getLogger(__name__)
 
 _CAMERA_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
+    reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
-    depth=10,
+    depth=1,
     durability=DurabilityPolicy.VOLATILE,
 )
 
 _RESULT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
-    depth=10,
+    depth=1,
     durability=DurabilityPolicy.VOLATILE,
 )
 
@@ -409,6 +409,27 @@ def _ocr_output_topic(input_topic: str) -> str:
     return f"{input_topic}/ocr"
 
 
+def _adapter_signature(cfg: dict) -> tuple:
+    provider = cfg.get('provider', 'rapidocr')
+    common = (provider,)
+    if provider == 'rapidocr':
+        return common + (
+            cfg.get('model_dir', '/models/ocr/ppocrv6-tiny'),
+            bool(cfg.get('use_angle_cls', True)),
+            int(cfg.get('num_threads', 2)),
+            int(cfg.get('max_side_len', 1600)),
+        )
+    if provider in ('openai', 'qwen'):
+        return common + (
+            cfg.get('url', ''),
+            cfg.get('key', ''),
+            cfg.get('model', ''),
+        )
+    if provider == 'tesseract':
+        return common + (cfg.get('language', 'chi_sim+eng'),)
+    return common
+
+
 def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
     """根据配置创建 OCR 适配器"""
     provider = cfg.get('provider', 'rapidocr')
@@ -418,6 +439,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             cfg.get('model_dir', '/models/ocr/ppocrv6-tiny'),
             use_angle_cls=bool(cfg.get('use_angle_cls', True)),
             num_threads=int(cfg.get('num_threads', 2)),
+            max_side_len=int(cfg.get('max_side_len', 1600)),
         )
 
     elif provider == 'openai':
@@ -457,7 +479,7 @@ class _OCRNode(Node):
         self._sub = None
         self._pub = self.create_publisher(String, self._output_topic, _RESULT_QOS)
 
-        self._frame_queue: queue.Queue = queue.Queue(maxsize=5)
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._frame_count = 0  # 收到的图片帧计数
@@ -488,11 +510,20 @@ class _OCRNode(Node):
             self._sub = None
 
         self._stop_event.set()
+        while True:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
 
         self.state = "idle"
         return {"state": "idle"}
+
+    @property
+    def worker_alive(self) -> bool:
+        return bool(self._worker_thread and self._worker_thread.is_alive())
 
     def _image_cb(self, msg: CompressedImage):
         """接收图片帧，放入队列"""
@@ -504,7 +535,7 @@ class _OCRNode(Node):
         try:
             self._frame_queue.put_nowait((image_data, time.time()))
         except queue.Full:
-            log.warning(f"[ocr] frame queue full, dropping old frame (queue_size=5)")
+            log.warning("[ocr] frame queue full, dropping old frame (queue_size=1)")
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
@@ -525,6 +556,8 @@ class _OCRNode(Node):
             payload = recognize_to_payload(
                 self._adapter, image_bytes, self._language, ts
             )
+            if self._stop_event.is_set():
+                continue
             msg = String()
             msg.data = json.dumps(payload, ensure_ascii=False)
             self._pub.publish(msg)
@@ -551,9 +584,12 @@ class OCRPlugin:
     PREFIX = "ocr"
 
     def __init__(self, plugin_cfg: dict, executor):
+        self._plugin_cfg = dict(plugin_cfg)
         self._language = plugin_cfg.get('language', 'zh')
         self._nodes: dict[str, _OCRNode] = {}
         self._instance_configs: dict[str, dict] = {}
+        self._instance_adapters: dict[str, tuple[tuple, OCRAdapter]] = {}
+        self._retired_nodes: list[_OCRNode] = []
         self._executor = executor
 
         try:
@@ -573,7 +609,42 @@ class OCRPlugin:
     def get_tools(self) -> list:
         return TOOLS
 
+    def _reap_retired_nodes(self) -> None:
+        active = []
+        for node in self._retired_nodes:
+            if node.worker_alive:
+                active.append(node)
+            else:
+                node.destroy_node()
+        self._retired_nodes = active
+
+    def _remove_node(self, node_key: str) -> dict:
+        node = self._nodes.pop(node_key)
+        result = node.stop()
+        self._executor.remove_node(node)
+        if node.worker_alive:
+            self._retired_nodes.append(node)
+        else:
+            node.destroy_node()
+        return result
+
+    def _adapter_for_instance(self, instance_id: str) -> OCRAdapter | None:
+        override = self._instance_configs.get(instance_id, {})
+        cfg = {**self._plugin_cfg, **override}
+        signature = _adapter_signature(cfg)
+        if signature == _adapter_signature(self._plugin_cfg):
+            return self._adapter
+
+        cached = self._instance_adapters.get(instance_id)
+        if cached and cached[0] == signature:
+            return cached[1]
+
+        adapter = _build_ocr_adapter(cfg)
+        self._instance_adapters[instance_id] = (signature, adapter)
+        return adapter
+
     def dispatch(self, name: str, args: dict) -> dict | None:
+        self._reap_retired_nodes()
         action = args.get("action") if name == "ocr" else name
         instance_id = args.get("instance_id", "")
 
@@ -632,7 +703,7 @@ class OCRPlugin:
                 language = self._language
 
                 if instance_id and instance_id in self._instance_configs:
-                    inst_adapter = _build_ocr_adapter(self._instance_configs[instance_id])
+                    inst_adapter = self._adapter_for_instance(instance_id)
                     if inst_adapter:
                         adapter = inst_adapter
                     inst_lang = self._instance_configs[instance_id].get("language")
@@ -650,16 +721,10 @@ class OCRPlugin:
 
         elif action == "stop":
             if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                result = node.stop()
-                self._executor.remove_node(node)
-                del self._nodes[instance_id]
-                return result
+                return self._remove_node(instance_id)
             elif not instance_id and self._nodes:
                 for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
-                    del self._nodes[key]
+                    self._remove_node(key)
                 return {"state": "idle"}
             return {"state": "idle"}
 
@@ -667,19 +732,32 @@ class OCRPlugin:
             cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and v != ''}
 
             if instance_id:
-                self._instance_configs[instance_id] = cfg
+                previous = self._instance_configs.get(instance_id, {})
+                self._instance_configs[instance_id] = {**previous, **cfg}
+                self._instance_adapters.pop(instance_id, None)
                 if instance_id in self._nodes:
-                    self._nodes[instance_id].stop()
-                    self._executor.remove_node(self._nodes[instance_id])
-                    del self._nodes[instance_id]
+                    self._remove_node(instance_id)
                 return {"status": "configured", "instance_id": instance_id}
             else:
-                self._adapter = _build_ocr_adapter(cfg)
-                self._language = cfg.get('language', self._language)
-                for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
-                    del self._nodes[key]
-                return {"status": "configured", "adapter_ok": self._adapter is not None}
+                updated_cfg = {**self._plugin_cfg, **cfg}
+                rebuild = (
+                    _adapter_signature(updated_cfg)
+                    != _adapter_signature(self._plugin_cfg)
+                )
+                if rebuild:
+                    self._adapter = _build_ocr_adapter(updated_cfg)
+                    self._instance_adapters.clear()
+                    for key in list(self._nodes.keys()):
+                        self._remove_node(key)
+                self._plugin_cfg = updated_cfg
+                self._language = updated_cfg.get('language', self._language)
+                if not rebuild:
+                    for node in self._nodes.values():
+                        node._language = self._language
+                return {
+                    "status": "configured",
+                    "adapter_ok": self._adapter is not None,
+                    "reused": not rebuild,
+                }
 
         return None
