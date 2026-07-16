@@ -16,7 +16,10 @@ REQUIRED_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
 
 
 def normalize_rapidocr_output(
-    output, scale_x: float = 1.0, scale_y: float = 1.0
+    output,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    round_bbox: bool = True,
 ) -> list[dict]:
     if output is None or output.boxes is None:
         return []
@@ -25,15 +28,18 @@ def normalize_rapidocr_output(
     for polygon, text, score in zip(output.boxes, output.txts, output.scores):
         xs = [float(point[0]) * scale_x for point in polygon]
         ys = [float(point[1]) * scale_y for point in polygon]
+        bbox = [min(xs), min(ys), max(xs), max(ys)]
+        if round_bbox:
+            bbox = [
+                math.floor(min(xs)),
+                math.floor(min(ys)),
+                math.ceil(max(xs)),
+                math.ceil(max(ys)),
+            ]
         items.append(
             {
                 "text": str(text),
-                "bbox": [
-                    math.floor(min(xs)),
-                    math.floor(min(ys)),
-                    math.ceil(max(xs)),
-                    math.ceil(max(ys)),
-                ],
+                "bbox": bbox,
                 "score": float(score),
             }
         )
@@ -106,6 +112,7 @@ class RapidOCRAdapter:
 
         self._use_angle_cls = use_angle_cls
         self._max_side_len = max_side_len
+        self._request_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         strategy_config = LargeImageStrategyConfig.from_mapping(
             large_image_strategy
@@ -193,7 +200,7 @@ class RapidOCRAdapter:
                 use_cls=self._use_angle_cls,
                 use_rec=True,
             )
-        return normalize_rapidocr_output(output)
+        return normalize_rapidocr_output(output, round_bbox=False)
 
     def _recognize_single_pass(self, image_bytes: bytes) -> list[dict]:
         import cv2
@@ -231,10 +238,17 @@ class RapidOCRAdapter:
             scale_y=source_height / decoded_height,
         )
 
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
+    def _recognize_request(self, image_bytes: bytes) -> list:
         strategy = getattr(self, "_large_image_strategy", None)
         if strategy is not None:
             source_size = self._jpeg_dimensions(image_bytes)
             if strategy.should_handle(source_size):
                 return strategy.recognize(image_bytes, self._infer_image)
         return self._recognize_single_pass(image_bytes)
+
+    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
+        request_lock = getattr(self, "_request_lock", None)
+        if request_lock is None:
+            return self._recognize_request(image_bytes)
+        with request_lock:
+            return self._recognize_request(image_bytes)

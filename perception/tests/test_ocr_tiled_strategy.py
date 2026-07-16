@@ -521,6 +521,13 @@ class OCRTiledStrategyTest(unittest.TestCase):
         self.assertTrue(
             all(0 <= item["bbox"][1] < item["bbox"][3] <= 3000 for item in result)
         )
+        self.assertTrue(
+            all(
+                isinstance(coordinate, int)
+                for item in result
+                for coordinate in item["bbox"]
+            )
+        )
 
 
 if __name__ == "__main__":

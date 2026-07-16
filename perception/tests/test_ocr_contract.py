@@ -345,6 +345,54 @@ class OCRContractTest(unittest.TestCase):
             image, use_det=True, use_cls=True, use_rec=True
         )
 
+    def test_shared_adapter_serializes_complete_large_image_requests(self):
+        first_entered = threading.Event()
+        both_entered = threading.Event()
+        release = threading.Event()
+        state_lock = threading.Lock()
+        state = {"active": 0, "max_active": 0}
+
+        class TrackingStrategy:
+            @staticmethod
+            def should_handle(_source_size):
+                return True
+
+            @staticmethod
+            def recognize(_image_bytes, _infer_image):
+                with state_lock:
+                    state["active"] += 1
+                    state["max_active"] = max(
+                        state["max_active"], state["active"]
+                    )
+                    if state["active"] == 1:
+                        first_entered.set()
+                    if state["active"] == 2:
+                        both_entered.set()
+                release.wait(timeout=2)
+                with state_lock:
+                    state["active"] -= 1
+                return []
+
+        adapter = object.__new__(self.ocr.RapidOCRAdapter)
+        adapter._request_lock = threading.Lock()
+        adapter._large_image_strategy = TrackingStrategy()
+        adapter._infer_image = mock.Mock()
+        image_bytes = self._jpeg(4000, 3000)
+        first = threading.Thread(target=adapter.recognize, args=(image_bytes,))
+        second = threading.Thread(target=adapter.recognize, args=(image_bytes,))
+
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=1))
+        second.start()
+        both_entered.wait(timeout=0.1)
+        release.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(state["max_active"], 1)
+
     def test_rapidocr_adapter_decodes_compressed_image_before_inference(self):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)
         adapter._use_angle_cls = True
@@ -417,6 +465,47 @@ class OCRContractTest(unittest.TestCase):
         cv2_module.imdecode.assert_called_once_with("encoded-buffer", 4)
         cv2_module.resize.assert_not_called()
         self.assertEqual(result[0]["bbox"], [40, 80, 400, 200])
+
+    def test_single_pass_scales_float_polygon_before_rounding(self):
+        adapter = object.__new__(self.ocr.RapidOCRAdapter)
+        adapter._large_image_strategy = None
+        adapter._use_angle_cls = False
+        adapter._max_side_len = 1600
+        adapter._inference_lock = threading.Lock()
+        adapter._engine = mock.Mock(
+            return_value=types.SimpleNamespace(
+                boxes=[
+                    [
+                        [10.8, 20.8],
+                        [100.2, 20.8],
+                        [100.2, 50.2],
+                        [10.8, 50.2],
+                    ]
+                ],
+                txts=("precise",),
+                scores=(0.8,),
+            )
+        )
+        cv2_module = types.ModuleType("cv2")
+        cv2_module.IMREAD_COLOR = 1
+        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
+        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
+        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
+        cv2_module.INTER_AREA = 3
+        cv2_module.imdecode = mock.Mock(
+            return_value=types.SimpleNamespace(shape=(750, 1000, 3))
+        )
+        cv2_module.resize = mock.Mock()
+        numpy_module = types.ModuleType("numpy")
+        numpy_module.uint8 = "uint8"
+        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
+
+        with mock.patch.dict(
+            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        ):
+            result = adapter.recognize(self._jpeg(4000, 3000))
+
+        self.assertEqual(result[0]["bbox"], [43, 83, 401, 201])
 
     def test_small_jpeg_keeps_full_decode_resolution(self):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)

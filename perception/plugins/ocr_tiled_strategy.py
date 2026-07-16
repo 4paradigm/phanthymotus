@@ -355,20 +355,29 @@ class AdaptiveTiledOCRStrategy:
         scale_x: float,
         scale_y: float,
         bounds: tuple[int, int],
+        round_bbox: bool = False,
     ) -> list[dict]:
         width, height = bounds
         scaled_items = []
         for item in items:
             x1, y1, x2, y2 = item["bbox"]
+            bbox = [
+                max(0.0, min(width, x1 * scale_x)),
+                max(0.0, min(height, y1 * scale_y)),
+                max(0.0, min(width, x2 * scale_x)),
+                max(0.0, min(height, y2 * scale_y)),
+            ]
+            if round_bbox:
+                bbox = [
+                    math.floor(bbox[0]),
+                    math.floor(bbox[1]),
+                    math.ceil(bbox[2]),
+                    math.ceil(bbox[3]),
+                ]
             scaled_items.append(
                 {
                     **item,
-                    "bbox": [
-                        max(0, min(width, math.floor(x1 * scale_x))),
-                        max(0, min(height, math.floor(y1 * scale_y))),
-                        max(0, min(width, math.ceil(x2 * scale_x))),
-                        max(0, min(height, math.ceil(y2 * scale_y))),
-                    ],
+                    "bbox": bbox,
                 }
             )
         return scaled_items
@@ -485,6 +494,7 @@ class AdaptiveTiledOCRStrategy:
                 scale_x=source_width / single_width,
                 scale_y=source_height / single_height,
                 bounds=decoded.source_size,
+                round_bbox=True,
             )
 
         candidates = []
@@ -555,6 +565,7 @@ class AdaptiveTiledOCRStrategy:
             scale_x=source_width / decoded_width,
             scale_y=source_height / decoded_height,
             bounds=decoded.source_size,
+            round_bbox=True,
         )
         self._log_summary(
             decoded=decoded,
