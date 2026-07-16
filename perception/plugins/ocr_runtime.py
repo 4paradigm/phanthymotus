@@ -5,6 +5,12 @@ import tempfile
 import threading
 from pathlib import Path
 
+from plugins.ocr_tiled_strategy import (
+    AdaptiveTiledOCRStrategy,
+    LargeImageStrategyConfig,
+    jpeg_dimensions,
+)
+
 
 REQUIRED_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
 
@@ -32,6 +38,26 @@ def normalize_rapidocr_output(
             }
         )
     return items
+
+
+def scale_ocr_items(
+    items: list[dict], scale_x: float, scale_y: float
+) -> list[dict]:
+    scaled_items = []
+    for item in items:
+        x1, y1, x2, y2 = item["bbox"]
+        scaled_items.append(
+            {
+                **item,
+                "bbox": [
+                    math.floor(x1 * scale_x),
+                    math.floor(y1 * scale_y),
+                    math.ceil(x2 * scale_x),
+                    math.ceil(y2 * scale_y),
+                ],
+            }
+        )
+    return scaled_items
 
 
 def build_ocr_payload(results, timestamp, language, error=None) -> dict:
@@ -64,6 +90,7 @@ class RapidOCRAdapter:
         use_angle_cls: bool = True,
         num_threads: int = 2,
         max_side_len: int = 1600,
+        large_image_strategy: dict | None = None,
     ):
         root = Path(model_dir)
         missing = [
@@ -80,6 +107,14 @@ class RapidOCRAdapter:
         self._use_angle_cls = use_angle_cls
         self._max_side_len = max_side_len
         self._inference_lock = threading.Lock()
+        strategy_config = LargeImageStrategyConfig.from_mapping(
+            large_image_strategy
+        )
+        self._large_image_strategy = (
+            AdaptiveTiledOCRStrategy(strategy_config, max_side_len)
+            if strategy_config.enabled
+            else None
+        )
 
         # Load rapidocr's own default config, override model paths
         import yaml
@@ -132,44 +167,7 @@ class RapidOCRAdapter:
 
     @staticmethod
     def _jpeg_dimensions(image_bytes: bytes) -> tuple[int, int] | None:
-        if len(image_bytes) < 4 or image_bytes[:2] != b"\xff\xd8":
-            return None
-
-        sof_markers = {
-            0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6,
-            0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
-        }
-        offset = 2
-        while offset + 3 < len(image_bytes):
-            if image_bytes[offset] != 0xFF:
-                offset += 1
-                continue
-            while offset < len(image_bytes) and image_bytes[offset] == 0xFF:
-                offset += 1
-            if offset >= len(image_bytes):
-                break
-
-            marker = image_bytes[offset]
-            offset += 1
-            if marker in (0x01, 0xD8, 0xD9):
-                continue
-            if offset + 2 > len(image_bytes):
-                break
-
-            segment_len = int.from_bytes(image_bytes[offset:offset + 2], "big")
-            if segment_len < 2 or offset + segment_len > len(image_bytes):
-                break
-            if marker in sof_markers and segment_len >= 7:
-                height = int.from_bytes(
-                    image_bytes[offset + 3:offset + 5], "big"
-                )
-                width = int.from_bytes(
-                    image_bytes[offset + 5:offset + 7], "big"
-                )
-                if width > 0 and height > 0:
-                    return width, height
-            offset += segment_len
-        return None
+        return jpeg_dimensions(image_bytes)
 
     def _decode_flag(self, cv2, source_size: tuple[int, int] | None) -> int:
         if not source_size or self._max_side_len <= 0:
@@ -187,7 +185,17 @@ class RapidOCRAdapter:
                 return flag
         return cv2.IMREAD_REDUCED_COLOR_8
 
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
+    def _infer_image(self, image) -> list[dict]:
+        with self._inference_lock:
+            output = self._engine(
+                image,
+                use_det=True,
+                use_cls=self._use_angle_cls,
+                use_rec=True,
+            )
+        return normalize_rapidocr_output(output)
+
+    def _recognize_single_pass(self, image_bytes: bytes) -> list[dict]:
         import cv2
         import numpy as np
 
@@ -215,16 +223,18 @@ class RapidOCRAdapter:
             )
             decoded_width, decoded_height = target_width, target_height
 
-        with self._inference_lock:
-            output = self._engine(
-                image,
-                use_det=True,
-                use_cls=self._use_angle_cls,
-                use_rec=True,
-            )
+        items = self._infer_image(image)
         source_width, source_height = source_size
-        return normalize_rapidocr_output(
-            output,
+        return scale_ocr_items(
+            items,
             scale_x=source_width / decoded_width,
             scale_y=source_height / decoded_height,
         )
+
+    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
+        strategy = getattr(self, "_large_image_strategy", None)
+        if strategy is not None:
+            source_size = self._jpeg_dimensions(image_bytes)
+            if strategy.should_handle(source_size):
+                return strategy.recognize(image_bytes, self._infer_image)
+        return self._recognize_single_pass(image_bytes)

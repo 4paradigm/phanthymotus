@@ -409,6 +409,19 @@ def _ocr_output_topic(input_topic: str) -> str:
     return f"{input_topic}/ocr"
 
 
+def _freeze_config(value):
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (key, _freeze_config(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_config(item) for item in value)
+    return value
+
+
 def _adapter_signature(cfg: dict) -> tuple:
     provider = cfg.get('provider', 'rapidocr')
     common = (provider,)
@@ -418,6 +431,7 @@ def _adapter_signature(cfg: dict) -> tuple:
             bool(cfg.get('use_angle_cls', True)),
             int(cfg.get('num_threads', 2)),
             int(cfg.get('max_side_len', 1600)),
+            _freeze_config(cfg.get('large_image_strategy', {})),
         )
     if provider in ('openai', 'qwen'):
         return common + (
@@ -440,6 +454,9 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             use_angle_cls=bool(cfg.get('use_angle_cls', True)),
             num_threads=int(cfg.get('num_threads', 2)),
             max_side_len=int(cfg.get('max_side_len', 1600)),
+            large_image_strategy=dict(
+                cfg.get('large_image_strategy') or {}
+            ),
         )
 
     elif provider == 'openai':

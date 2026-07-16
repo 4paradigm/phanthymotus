@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import tempfile
 import threading
@@ -66,6 +67,15 @@ class OCRContractTest(unittest.TestCase):
         _install_ros_stubs()
         cls.ocr = importlib.import_module("plugins.ocr")
 
+    @staticmethod
+    def _jpeg(width, height):
+        return (
+            b"\xff\xd8\xff\xc0\x00\x11\x08"
+            + height.to_bytes(2, "big")
+            + width.to_bytes(2, "big")
+            + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00\xff\xd9"
+        )
+
     def test_tool_contract_uses_compressed_images_and_json_results(self):
         tool = self.ocr.TOOLS[0]
 
@@ -111,6 +121,10 @@ class OCRContractTest(unittest.TestCase):
                     "use_angle_cls": True,
                     "num_threads": 2,
                     "max_side_len": 1600,
+                    "large_image_strategy": {
+                        "enabled": True,
+                        "trigger_side": 2400,
+                    },
                 }
             )
 
@@ -120,13 +134,36 @@ class OCRContractTest(unittest.TestCase):
             use_angle_cls=True,
             num_threads=2,
             max_side_len=1600,
+            large_image_strategy={
+                "enabled": True,
+                "trigger_side": 2400,
+            },
         )
+
+    def test_adapter_signature_changes_with_large_image_strategy(self):
+        first = self.ocr._adapter_signature(
+            {
+                "provider": "rapidocr",
+                "large_image_strategy": {"enabled": True, "max_tiles": 6},
+            }
+        )
+        second = self.ocr._adapter_signature(
+            {
+                "provider": "rapidocr",
+                "large_image_strategy": {"enabled": True, "max_tiles": 4},
+            }
+        )
+
+        self.assertNotEqual(first, second)
 
     def test_adapter_initialization_failure_does_not_stop_bundle(self):
         with mock.patch(
             "plugins.ocr._build_ocr_adapter", side_effect=RuntimeError("load failed")
         ):
-            plugin = self.ocr.OCRPlugin({"provider": "rapidocr"}, object())
+            with self.assertLogs("plugins.ocr", level="ERROR"):
+                plugin = self.ocr.OCRPlugin(
+                    {"provider": "rapidocr"}, object()
+                )
 
         self.assertIsNone(plugin._adapter)
 
@@ -189,10 +226,8 @@ class OCRContractTest(unittest.TestCase):
         captured_config = {}
 
         def create_engine(*, config_path):
-            import yaml
-
             captured_config.update(
-                yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+                json.loads(Path(config_path).read_text(encoding="utf-8"))
             )
             return fake_engine
 
@@ -206,15 +241,29 @@ class OCRContractTest(unittest.TestCase):
                 (root / name).write_bytes(b"model")
             default_config = root / "default.yaml"
             default_config.write_text(
-                "Det: {}\nCls: {}\nRec: {}\nGlobal: {}\nEngineConfig: {}\n",
+                json.dumps(
+                    {
+                        "Det": {},
+                        "Cls": {},
+                        "Rec": {},
+                        "Global": {},
+                        "EngineConfig": {},
+                    }
+                ),
                 encoding="utf-8",
             )
             rapidocr_main_module.DEFAULT_CFG_PATH = str(default_config)
+            yaml_module = types.ModuleType("yaml")
+            yaml_module.safe_load = json.load
+            yaml_module.safe_dump = lambda data, stream, **_kwargs: json.dump(
+                data, stream
+            )
             with mock.patch.dict(
                 sys.modules,
                 {
                     "rapidocr": rapidocr_module,
                     "rapidocr.main": rapidocr_main_module,
+                    "yaml": yaml_module,
                 },
             ):
                 self.ocr.RapidOCRAdapter(
@@ -240,6 +289,61 @@ class OCRContractTest(unittest.TestCase):
         self.assertEqual(engine_config["inter_op_num_threads"], 1)
         self.assertFalse(engine_config["use_cuda"])
         self.assertEqual(captured_config["Global"]["max_side_len"], 1600)
+
+    def test_large_jpeg_delegates_to_strategy(self):
+        adapter = object.__new__(self.ocr.RapidOCRAdapter)
+        adapter._large_image_strategy = mock.Mock()
+        adapter._large_image_strategy.should_handle.return_value = True
+        adapter._large_image_strategy.recognize.return_value = [
+            {"text": "tile"}
+        ]
+        adapter._infer_image = mock.Mock()
+        image_bytes = self._jpeg(4000, 3000)
+
+        result = adapter.recognize(image_bytes)
+
+        self.assertEqual(result, [{"text": "tile"}])
+        adapter._large_image_strategy.should_handle.assert_called_once_with(
+            (4000, 3000)
+        )
+        adapter._large_image_strategy.recognize.assert_called_once_with(
+            image_bytes, adapter._infer_image
+        )
+
+    def test_small_image_keeps_existing_single_pass_path(self):
+        adapter = object.__new__(self.ocr.RapidOCRAdapter)
+        adapter._large_image_strategy = mock.Mock()
+        adapter._large_image_strategy.should_handle.return_value = False
+        adapter._recognize_single_pass = mock.Mock(
+            return_value=[
+                {"text": "small", "bbox": [10, 20, 100, 50]}
+            ]
+        )
+        image_bytes = self._jpeg(800, 600)
+
+        result = adapter.recognize(image_bytes)
+
+        self.assertEqual(result[0]["bbox"], [10, 20, 100, 50])
+        adapter._recognize_single_pass.assert_called_once_with(image_bytes)
+        adapter._large_image_strategy.recognize.assert_not_called()
+
+    def test_strategy_uses_same_locked_engine_callback(self):
+        adapter = object.__new__(self.ocr.RapidOCRAdapter)
+        adapter._use_angle_cls = True
+        adapter._inference_lock = mock.MagicMock()
+        adapter._engine = mock.Mock(
+            return_value=types.SimpleNamespace(boxes=[], txts=(), scores=())
+        )
+        image = object()
+
+        result = adapter._infer_image(image)
+
+        self.assertEqual(result, [])
+        adapter._inference_lock.__enter__.assert_called_once_with()
+        adapter._inference_lock.__exit__.assert_called_once()
+        adapter._engine.assert_called_once_with(
+            image, use_det=True, use_cls=True, use_rec=True
+        )
 
     def test_rapidocr_adapter_decodes_compressed_image_before_inference(self):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)
