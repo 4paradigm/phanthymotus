@@ -57,7 +57,13 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
 # JetPack 5 / Ubuntu 20.04 does not provide libffi.so.8.  Use the
 # Jetson-packaged OpenCV instead of a PyPI OpenCV wheel that requires it.
-RUN pip3 uninstall -y opencv-python opencv-python-headless || true
+RUN pip3 uninstall -y \
+        opencv-python opencv-python-headless \
+        opencv-contrib-python opencv-contrib-python-headless || true && \
+    rm -rf \
+        /usr/local/lib/python3.8/dist-packages/cv2 \
+        /usr/local/lib/python3.8/dist-packages/opencv_python*.dist-info \
+        /usr/local/lib/python3.8/dist-packages/opencv_contrib_python*.dist-info
 
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
 RUN python3 -c "import cv2" 2>/dev/null || { \
@@ -86,6 +92,9 @@ ENV YOLO_CONFIG_DIR=/work
 
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
+
+# Fail the build if a PyPI cv2 copy still shadows Jetson's system OpenCV.
+RUN python3 -c "import cv2; path = cv2.__file__; assert not path.startswith('/usr/local/'), path; print('OpenCV', cv2.__version__, path)"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work

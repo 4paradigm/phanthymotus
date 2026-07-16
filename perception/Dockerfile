@@ -19,13 +19,16 @@ RUN pip3 install --no-cache-dir \
     torch
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests silero-vad websockets webrtcvad websocket-client dashscope \
-    onnxruntime pyclipper opencv-python-headless
+    onnxruntime pyclipper "opencv-python-headless==4.7.0.72"
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     ultralytics
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     sherpa-onnx
+
+# Fail the build early if the OCR OpenCV dependency cannot be loaded.
+RUN python3 -c "import cv2; print('OpenCV', cv2.__version__, cv2.__file__)"
 
 WORKDIR /work
 COPY main.py    /work/main.py
