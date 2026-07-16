@@ -477,11 +477,13 @@ class AdaptiveTiledOCRStrategy:
         source_width, source_height = decoded.source_size
 
         if max(source_width, source_height) <= self.config.trigger_side:
-            items = infer_image(image)
+            single_image = self._resize_longest(image, self.global_max_side)
+            single_height, single_width = single_image.shape[:2]
+            items = infer_image(single_image)
             return self._scale_items(
                 items,
-                scale_x=source_width / decoded_width,
-                scale_y=source_height / decoded_height,
+                scale_x=source_width / single_width,
+                scale_y=source_height / single_height,
                 bounds=decoded.source_size,
             )
 

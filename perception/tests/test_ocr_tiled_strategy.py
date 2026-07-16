@@ -13,6 +13,39 @@ class FakeImage:
         return FakeImage(y_slice.stop - y_slice.start, x_slice.stop - x_slice.start)
 
 
+class MarkedImage(FakeImage):
+    def __init__(
+        self,
+        height,
+        width,
+        marker,
+        origin_x=0,
+        origin_y=0,
+    ):
+        super().__init__(height, width)
+        self.marker = marker
+        self.origin_x = origin_x
+        self.origin_y = origin_y
+
+    def __getitem__(self, key):
+        y_slice, x_slice = key
+        return MarkedImage(
+            height=y_slice.stop - y_slice.start,
+            width=x_slice.stop - x_slice.start,
+            marker=self.marker,
+            origin_x=self.origin_x + x_slice.start,
+            origin_y=self.origin_y + y_slice.start,
+        )
+
+    def contains_marker(self):
+        marker_x, marker_y = self.marker
+        height, width = self.shape[:2]
+        return (
+            self.origin_x <= marker_x < self.origin_x + width
+            and self.origin_y <= marker_y < self.origin_y + height
+        )
+
+
 class OCRTiledStrategyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -369,6 +402,31 @@ class OCRTiledStrategyTest(unittest.TestCase):
         self.assertEqual(result[0]["bbox"], [10, 20, 100, 50])
         infer.assert_called_once()
 
+    def test_non_jpeg_below_trigger_keeps_existing_global_resize(self):
+        strategy = self.strategy_type({"enabled": True}, global_max_side=1600)
+        strategy._decode_image = mock.Mock(
+            return_value=self._decoded_image(width=2000, height=1500)
+        )
+        strategy._resize_longest = mock.Mock(
+            return_value=FakeImage(height=1200, width=1600)
+        )
+        seen_shapes = []
+
+        def infer(image):
+            seen_shapes.append(image.shape[:2])
+            return [
+                {
+                    "text": "scaled",
+                    "bbox": [80, 40, 160, 80],
+                    "score": 0.9,
+                }
+            ]
+
+        result = strategy.recognize(b"png", infer)
+
+        self.assertEqual(seen_shapes, [(1200, 1600)])
+        self.assertEqual(result[0]["bbox"], [100, 50, 200, 100])
+
     def test_decode_4000_jpeg_keeps_3200_pixels_for_strategy(self):
         strategy = self.strategy_type({}, global_max_side=1600)
         cv2_module = types.ModuleType("cv2")
@@ -394,6 +452,75 @@ class OCRTiledStrategyTest(unittest.TestCase):
         )
         self.assertEqual(decoded.image.shape[:2], (2400, 3200))
         self.assertEqual(decoded.source_size, (4000, 3000))
+
+    def test_tiled_pipeline_recovers_small_text_without_duplicate_large_text(self):
+        strategy = self.strategy_type(
+            {
+                "enabled": True,
+                "tile_size": 1280,
+                "overlap": 192,
+                "max_tiles": 6,
+            },
+            global_max_side=1600,
+        )
+        source = MarkedImage(
+            height=3000,
+            width=4000,
+            marker=(3500, 2500),
+        )
+        strategy._decode_image = mock.Mock(
+            return_value=types.SimpleNamespace(
+                image=source,
+                source_size=(4000, 3000),
+                factor=1,
+            )
+        )
+        strategy._resize_longest = mock.Mock(
+            return_value=FakeImage(height=1200, width=1600)
+        )
+
+        def infer(image):
+            if not isinstance(image, MarkedImage):
+                return [
+                    {
+                        "text": "large text",
+                        "bbox": [100, 100, 400, 200],
+                        "score": 0.9,
+                    }
+                ]
+            if image.contains_marker():
+                local_x = 3500 - image.origin_x
+                local_y = 2500 - image.origin_y
+                return [
+                    {
+                        "text": "small text",
+                        "bbox": [
+                            local_x,
+                            local_y,
+                            local_x + 100,
+                            local_y + 40,
+                        ],
+                        "score": 0.85,
+                    }
+                ]
+            return []
+
+        result = strategy.recognize(b"jpeg", infer)
+
+        self.assertEqual(
+            [item["text"] for item in result],
+            ["large text", "small text"],
+        )
+        self.assertEqual(
+            sum(item["text"] == "large text" for item in result),
+            1,
+        )
+        self.assertTrue(
+            all(0 <= item["bbox"][0] < item["bbox"][2] <= 4000 for item in result)
+        )
+        self.assertTrue(
+            all(0 <= item["bbox"][1] < item["bbox"][3] <= 3000 for item in result)
+        )
 
 
 if __name__ == "__main__":
