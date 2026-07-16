@@ -1,5 +1,16 @@
+import sys
 import types
 import unittest
+from unittest import mock
+
+
+class FakeImage:
+    def __init__(self, height, width):
+        self.shape = (height, width, 3)
+
+    def __getitem__(self, key):
+        y_slice, x_slice = key
+        return FakeImage(y_slice.stop - y_slice.start, x_slice.stop - x_slice.start)
 
 
 class OCRTiledStrategyTest(unittest.TestCase):
@@ -19,6 +30,23 @@ class OCRTiledStrategyTest(unittest.TestCase):
             IMREAD_REDUCED_COLOR_2=2,
             IMREAD_REDUCED_COLOR_4=4,
             IMREAD_REDUCED_COLOR_8=8,
+        )
+
+    @staticmethod
+    def _decoded_image(width=2600, height=2000):
+        return types.SimpleNamespace(
+            image=FakeImage(height, width),
+            source_size=(width, height),
+            factor=1,
+        )
+
+    @staticmethod
+    def _jpeg(width, height):
+        return (
+            b"\xff\xd8\xff\xc0\x00\x11\x08"
+            + height.to_bytes(2, "big")
+            + width.to_bytes(2, "big")
+            + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00\xff\xd9"
         )
 
     def test_rejects_overlap_not_smaller_than_tile(self):
@@ -209,6 +237,163 @@ class OCRTiledStrategyTest(unittest.TestCase):
             [item["text"] for item in strategy._deduplicate(candidates)],
             ["left", "right", "bottom"],
         )
+
+    def test_large_image_runs_global_then_bounded_sequential_tiles(self):
+        strategy = self.strategy_type(
+            {"tile_size": 1280, "overlap": 192, "max_tiles": 6},
+            global_max_side=1600,
+        )
+        strategy._decode_image = mock.Mock(
+            return_value=self._decoded_image(width=4000, height=3000)
+        )
+        strategy._resize_longest = mock.Mock(
+            return_value=FakeImage(height=1200, width=1600)
+        )
+        calls = []
+
+        def infer(image):
+            calls.append(image.shape[:2])
+            return []
+
+        strategy.recognize(b"jpeg", infer)
+
+        self.assertEqual(calls[0], (1200, 1600))
+        self.assertEqual(len(calls), 7)
+        self.assertTrue(all(max(shape) <= 1280 for shape in calls[1:]))
+
+    def test_partial_tile_failure_returns_successful_passes(self):
+        strategy = self.strategy_type(
+            {"tile_size": 1280, "overlap": 192, "max_tiles": 2},
+            global_max_side=1600,
+        )
+        strategy._decode_image = mock.Mock(return_value=self._decoded_image())
+        strategy._resize_longest = mock.Mock(
+            return_value=FakeImage(height=1231, width=1600)
+        )
+        calls = 0
+
+        def infer(_image):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("tile failed")
+            if calls == 3:
+                return [
+                    {
+                        "text": "kept",
+                        "bbox": [10, 20, 110, 60],
+                        "score": 0.8,
+                    }
+                ]
+            return []
+
+        with self.assertLogs("plugins.ocr_tiled_strategy", level="WARNING"):
+            result = strategy.recognize(b"jpeg", infer)
+
+        self.assertEqual([item["text"] for item in result], ["kept"])
+        self.assertEqual(calls, 3)
+
+    def test_global_failure_still_attempts_tiles(self):
+        strategy = self.strategy_type(
+            {"tile_size": 1280, "overlap": 192, "max_tiles": 1},
+            global_max_side=1600,
+        )
+        strategy._decode_image = mock.Mock(return_value=self._decoded_image())
+        strategy._resize_longest = mock.Mock(
+            return_value=FakeImage(height=1231, width=1600)
+        )
+        infer = mock.Mock(
+            side_effect=[
+                RuntimeError("global failed"),
+                [
+                    {
+                        "text": "tile",
+                        "bbox": [5, 5, 50, 30],
+                        "score": 0.9,
+                    }
+                ],
+            ]
+        )
+
+        with self.assertLogs("plugins.ocr_tiled_strategy", level="WARNING"):
+            result = strategy.recognize(b"jpeg", infer)
+
+        self.assertEqual(result[0]["text"], "tile")
+        self.assertEqual(infer.call_count, 2)
+
+    def test_total_inference_failure_raises_first_error(self):
+        strategy = self.strategy_type(
+            {"tile_size": 1280, "overlap": 192, "max_tiles": 1},
+            global_max_side=1600,
+        )
+        strategy._decode_image = mock.Mock(return_value=self._decoded_image())
+        strategy._resize_longest = mock.Mock(
+            return_value=FakeImage(height=1231, width=1600)
+        )
+
+        with self.assertLogs("plugins.ocr_tiled_strategy", level="WARNING"):
+            with self.assertRaisesRegex(ValueError, "global failed"):
+                strategy.recognize(
+                    b"jpeg", mock.Mock(side_effect=ValueError("global failed"))
+                )
+
+    def test_empty_success_is_not_reported_as_failure(self):
+        strategy = self.strategy_type(
+            {"tile_size": 1280, "overlap": 192, "max_tiles": 1},
+            global_max_side=1600,
+        )
+        strategy._decode_image = mock.Mock(return_value=self._decoded_image())
+        strategy._resize_longest = mock.Mock(
+            return_value=FakeImage(height=1231, width=1600)
+        )
+
+        self.assertEqual(strategy.recognize(b"jpeg", lambda _image: []), [])
+
+    def test_small_non_jpeg_uses_one_single_pass(self):
+        strategy = self.strategy_type({"enabled": True}, global_max_side=1600)
+        strategy._decode_image = mock.Mock(
+            return_value=self._decoded_image(width=800, height=600)
+        )
+        infer = mock.Mock(
+            return_value=[
+                {
+                    "text": "small",
+                    "bbox": [10, 20, 100, 50],
+                    "score": 0.9,
+                }
+            ]
+        )
+
+        result = strategy.recognize(b"png", infer)
+
+        self.assertEqual(result[0]["bbox"], [10, 20, 100, 50])
+        infer.assert_called_once()
+
+    def test_decode_4000_jpeg_keeps_3200_pixels_for_strategy(self):
+        strategy = self.strategy_type({}, global_max_side=1600)
+        cv2_module = types.ModuleType("cv2")
+        cv2_module.IMREAD_COLOR = 1
+        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
+        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
+        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
+        cv2_module.INTER_AREA = 3
+        cv2_module.imdecode = mock.Mock(return_value=FakeImage(3000, 4000))
+        cv2_module.resize = mock.Mock(return_value=FakeImage(2400, 3200))
+        numpy_module = types.ModuleType("numpy")
+        numpy_module.uint8 = "uint8"
+        numpy_module.frombuffer = mock.Mock(return_value="encoded")
+
+        with mock.patch.dict(
+            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        ):
+            decoded = strategy._decode_image(self._jpeg(4000, 3000))
+
+        cv2_module.imdecode.assert_called_once_with("encoded", 1)
+        cv2_module.resize.assert_called_once_with(
+            mock.ANY, (3200, 2400), interpolation=3
+        )
+        self.assertEqual(decoded.image.shape[:2], (2400, 3200))
+        self.assertEqual(decoded.source_size, (4000, 3000))
 
 
 if __name__ == "__main__":

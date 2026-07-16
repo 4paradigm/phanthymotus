@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Mapping
+from typing import Callable, Mapping
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,13 @@ class DecodePlan:
 
 
 @dataclass(frozen=True)
+class _DecodedImage:
+    image: object
+    source_size: tuple[int, int]
+    factor: int
+
+
+@dataclass(frozen=True)
 class _Candidate:
     item: dict
     from_tile: bool
@@ -75,6 +87,58 @@ class _Candidate:
 def _normalize_text(text: object) -> str:
     normalized = unicodedata.normalize("NFKC", str(text)).casefold()
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def jpeg_dimensions(image_bytes: bytes) -> tuple[int, int] | None:
+    if len(image_bytes) < 4 or image_bytes[:2] != b"\xff\xd8":
+        return None
+
+    sof_markers = {
+        0xC0,
+        0xC1,
+        0xC2,
+        0xC3,
+        0xC5,
+        0xC6,
+        0xC7,
+        0xC9,
+        0xCA,
+        0xCB,
+        0xCD,
+        0xCE,
+        0xCF,
+    }
+    offset = 2
+    while offset + 3 < len(image_bytes):
+        if image_bytes[offset] != 0xFF:
+            offset += 1
+            continue
+        while offset < len(image_bytes) and image_bytes[offset] == 0xFF:
+            offset += 1
+        if offset >= len(image_bytes):
+            break
+
+        marker = image_bytes[offset]
+        offset += 1
+        if marker in (0x01, 0xD8, 0xD9):
+            continue
+        if offset + 2 > len(image_bytes):
+            break
+
+        segment_len = int.from_bytes(image_bytes[offset : offset + 2], "big")
+        if segment_len < 2 or offset + segment_len > len(image_bytes):
+            break
+        if marker in sof_markers and segment_len >= 7:
+            height = int.from_bytes(
+                image_bytes[offset + 3 : offset + 5], "big"
+            )
+            width = int.from_bytes(
+                image_bytes[offset + 5 : offset + 7], "big"
+            )
+            if width > 0 and height > 0:
+                return width, height
+        offset += segment_len
+    return None
 
 
 def _axis_starts(length: int, tile_size: int, stride: int) -> list[int]:
@@ -106,6 +170,12 @@ class AdaptiveTiledOCRStrategy:
             )
         self.global_max_side = global_max_side
 
+    def should_handle(self, source_size: tuple[int, int] | None) -> bool:
+        return self.config.enabled and (
+            source_size is None
+            or max(source_size) > self.config.trigger_side
+        )
+
     def _plan_jpeg_decode(
         self, cv2, source_size: tuple[int, int]
     ) -> DecodePlan:
@@ -135,6 +205,62 @@ class AdaptiveTiledOCRStrategy:
                 max(1, round(reduced_size[1] * scale)),
             )
         return DecodePlan(flag, factor, reduced_size, target_size)
+
+    @staticmethod
+    def _resize_to_size(image, target_size: tuple[int, int]):
+        import cv2
+
+        return cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+
+    def _resize_longest(self, image, max_side: int):
+        height, width = image.shape[:2]
+        longest_side = max(width, height)
+        if longest_side <= max_side:
+            return image
+        scale = max_side / longest_side
+        target_size = (
+            max(1, round(width * scale)),
+            max(1, round(height * scale)),
+        )
+        return self._resize_to_size(image, target_size)
+
+    def _decode_image(self, image_bytes: bytes) -> _DecodedImage:
+        import cv2
+        import numpy as np
+
+        encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+        source_size = jpeg_dimensions(image_bytes)
+        if source_size is not None:
+            plan = self._plan_jpeg_decode(cv2, source_size)
+            image = cv2.imdecode(encoded, plan.flag)
+            factor = plan.factor
+            target_size = plan.target_size
+        else:
+            image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            factor = 1
+            target_size = None
+        if image is None:
+            raise ValueError("invalid compressed image")
+
+        decoded_height, decoded_width = image.shape[:2]
+        if source_size is None:
+            source_size = (decoded_width, decoded_height)
+            longest_side = max(decoded_width, decoded_height)
+            if longest_side > self.config.decode_side:
+                scale = self.config.decode_side / longest_side
+                target_size = (
+                    max(1, round(decoded_width * scale)),
+                    max(1, round(decoded_height * scale)),
+                )
+
+        if target_size is not None and target_size != (
+            decoded_width,
+            decoded_height,
+        ):
+            image = self._resize_to_size(image, target_size)
+        if max(image.shape[:2]) > self.config.decode_hard_limit:
+            raise ValueError("decoded image exceeds decode_hard_limit")
+        return _DecodedImage(image=image, source_size=source_size, factor=factor)
 
     def _select_tiles(
         self, image_size: tuple[int, int]
@@ -302,3 +428,142 @@ class AdaptiveTiledOCRStrategy:
             (candidate.item for candidate in kept),
             key=lambda item: (item["bbox"][1], item["bbox"][0]),
         )
+
+    def _log_summary(
+        self,
+        decoded: _DecodedImage,
+        global_count: int,
+        selected_tiles: int,
+        successful_tiles: int,
+        before_dedup: int,
+        after_dedup: int,
+        decode_elapsed: float,
+        global_elapsed: float,
+        tile_elapsed: float,
+        started: float,
+    ) -> None:
+        decoded_height, decoded_width = decoded.image.shape[:2]
+        log.info(
+            "OCR tiled summary source=%sx%s decoded=%sx%s factor=%s "
+            "global_items=%s tiles=%s/%s items=%s/%s "
+            "elapsed_decode=%.3fs elapsed_global=%.3fs "
+            "elapsed_tiles=%.3fs elapsed_total=%.3fs",
+            decoded.source_size[0],
+            decoded.source_size[1],
+            decoded_width,
+            decoded_height,
+            decoded.factor,
+            global_count,
+            successful_tiles,
+            selected_tiles,
+            before_dedup,
+            after_dedup,
+            decode_elapsed,
+            global_elapsed,
+            tile_elapsed,
+            time.perf_counter() - started,
+        )
+
+    def recognize(
+        self,
+        image_bytes: bytes,
+        infer_image: Callable[[object], list[dict]],
+    ) -> list[dict]:
+        started = time.perf_counter()
+        decoded = self._decode_image(image_bytes)
+        decode_elapsed = time.perf_counter() - started
+        image = decoded.image
+        decoded_height, decoded_width = image.shape[:2]
+        source_width, source_height = decoded.source_size
+
+        if max(source_width, source_height) <= self.config.trigger_side:
+            items = infer_image(image)
+            return self._scale_items(
+                items,
+                scale_x=source_width / decoded_width,
+                scale_y=source_height / decoded_height,
+                bounds=decoded.source_size,
+            )
+
+        candidates = []
+        successful_passes = 0
+        first_error = None
+        global_count = 0
+        successful_tiles = 0
+        global_elapsed = 0.0
+
+        if self.config.global_pass:
+            global_image = self._resize_longest(image, self.global_max_side)
+            global_height, global_width = global_image.shape[:2]
+            global_started = time.perf_counter()
+            try:
+                global_items = infer_image(global_image)
+                successful_passes += 1
+                global_count = len(global_items)
+                global_items = self._scale_items(
+                    global_items,
+                    scale_x=decoded_width / global_width,
+                    scale_y=decoded_height / global_height,
+                    bounds=(decoded_width, decoded_height),
+                )
+                candidates.extend(
+                    self._candidate(item, from_tile=False)
+                    for item in global_items
+                )
+            except Exception as exc:
+                first_error = exc
+                log.warning("OCR global pass failed: %s", exc)
+            finally:
+                global_elapsed = time.perf_counter() - global_started
+
+        tiles = self._select_tiles((decoded_width, decoded_height))
+        tile_started = time.perf_counter()
+        for x1, y1, x2, y2 in tiles:
+            tile = image[y1:y2, x1:x2]
+            try:
+                tile_items = infer_image(tile)
+                successful_passes += 1
+                successful_tiles += 1
+                tile_items = self._offset_items(tile_items, x1, y1)
+                candidates.extend(
+                    self._candidate(item, from_tile=True)
+                    for item in tile_items
+                )
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                log.warning(
+                    "OCR tile pass failed at (%d,%d,%d,%d): %s",
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    exc,
+                )
+        tile_elapsed = time.perf_counter() - tile_started
+
+        if successful_passes == 0:
+            if first_error is not None:
+                raise first_error
+            raise RuntimeError("OCR strategy scheduled no inference passes")
+
+        merged = self._deduplicate(candidates)
+        result = self._scale_items(
+            merged,
+            scale_x=source_width / decoded_width,
+            scale_y=source_height / decoded_height,
+            bounds=decoded.source_size,
+        )
+        self._log_summary(
+            decoded=decoded,
+            global_count=global_count,
+            selected_tiles=len(tiles),
+            successful_tiles=successful_tiles,
+            before_dedup=len(candidates),
+            after_dedup=len(merged),
+            decode_elapsed=decode_elapsed,
+            global_elapsed=global_elapsed,
+            tile_elapsed=tile_elapsed,
+            started=started,
+        )
+        return result
