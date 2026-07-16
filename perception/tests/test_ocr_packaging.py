@@ -26,6 +26,20 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("model_dir: /models/ocr/ppocrv6-tiny", config)
         self.assertIn("    max_side_len: 1600", config)
         self.assertIn("    num_threads: 1", config)
+        self.assertIn(
+            "    large_image_strategy:\n"
+            "      enabled: true\n"
+            "      trigger_side: 2400\n"
+            "      decode_side: 3200\n"
+            "      decode_hard_limit: 4096\n"
+            "      tile_size: 1280\n"
+            "      overlap: 192\n"
+            "      max_tiles: 6\n"
+            "      global_pass: true\n"
+            "      dedup_iou: 0.5\n"
+            "      dedup_text_similarity: 0.8",
+            config,
+        )
         self.assertIn('    url: ""', config)
         self.assertIn('    key: ""', config)
         self.assertIn('    model: ""', config)

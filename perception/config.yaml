@@ -57,3 +57,14 @@ plugins:
     use_angle_cls: true
     num_threads: 1
     max_side_len: 1600
+    large_image_strategy:
+      enabled: true
+      trigger_side: 2400
+      decode_side: 3200
+      decode_hard_limit: 4096
+      tile_size: 1280
+      overlap: 192
+      max_tiles: 6
+      global_pass: true
+      dedup_iou: 0.5
+      dedup_text_similarity: 0.8
