@@ -31,7 +31,8 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
 # ── System deps ────────────────────────────────────────────────────
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        ffmpeg python3-opencv && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
@@ -54,6 +55,10 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
+# JetPack 5 / Ubuntu 20.04 does not provide libffi.so.8.  Use the
+# Jetson-packaged OpenCV instead of a PyPI OpenCV wheel that requires it.
+RUN pip3 uninstall -y opencv-python opencv-python-headless || true
+
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
 RUN python3 -c "import cv2" 2>/dev/null || { \
     echo 'import importlib.util, sys, os' > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
@@ -67,8 +72,7 @@ RUN python3 -c "import cv2" 2>/dev/null || { \
 RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
-    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
-    pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
+    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0"
 # ultralytics CLIP (GitHub via mirror, needed for set_classes)
 RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
