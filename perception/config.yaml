@@ -54,6 +54,9 @@ plugins:
     model: ""
     model_dir: /models/ocr/ppocrv6-tiny
     language: zh
+    device: cuda
+    device_id: 0
+    gpu_mem_mb: 512
     use_angle_cls: true
     num_threads: 1
     max_side_len: 1600

@@ -93,6 +93,9 @@ class RapidOCRAdapter:
     def __init__(
         self,
         model_dir: str,
+        device: str = "cpu",
+        device_id: int = 0,
+        gpu_mem_mb: int = 512,
         use_angle_cls: bool = True,
         num_threads: int = 2,
         max_side_len: int = 1600,
@@ -106,6 +109,20 @@ class RapidOCRAdapter:
             raise FileNotFoundError(
                 f"OCR model files missing: {', '.join(missing)}"
             )
+
+        device = str(device).strip().lower()
+        if device not in ("cpu", "cuda"):
+            raise ValueError("OCR device must be 'cpu' or 'cuda'")
+        use_cuda = device == "cuda"
+        if use_cuda:
+            import onnxruntime as ort
+
+            providers = ort.get_available_providers()
+            if "CUDAExecutionProvider" not in providers:
+                raise RuntimeError(
+                    "OCR device=cuda requires CUDAExecutionProvider; "
+                    f"available providers: {providers}"
+                )
 
         from rapidocr import RapidOCR
         from rapidocr.main import DEFAULT_CFG_PATH
@@ -164,7 +181,15 @@ class RapidOCRAdapter:
         )
         engine_cfg["intra_op_num_threads"] = num_threads
         engine_cfg["inter_op_num_threads"] = 1
-        engine_cfg["use_cuda"] = False
+        engine_cfg["use_cuda"] = use_cuda
+        if use_cuda:
+            cuda_ep_cfg = engine_cfg.setdefault("cuda_ep_cfg", {})
+            cuda_ep_cfg.update(
+                {
+                    "device_id": int(device_id),
+                    "gpu_mem": int(gpu_mem_mb),
+                }
+            )
 
         with tempfile.TemporaryDirectory(prefix="rapidocr-config-") as temp_dir:
             config_path = Path(temp_dir) / "config.yaml"

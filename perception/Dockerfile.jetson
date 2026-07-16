@@ -13,6 +13,7 @@ ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
+ARG ONNXRUNTIME_GPU_WHEEL_URL=https://nvidia.box.com/shared/static/zostg6agm00fb6t5uisw51qi6kpcuwzd.whl
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -30,6 +31,13 @@ RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# The JetPack 5 ONNX Runtime GPU wheel requires libffi.so.8, while the base
+# image still uses libffi.so.7. The two SONAMEs can coexist.
+RUN wget -q http://ports.ubuntu.com/ubuntu-ports/pool/main/libf/libffi/libffi8_3.4.2-4_arm64.deb \
+      -O /tmp/libffi8.deb && \
+    dpkg -i /tmp/libffi8.deb && \
+    rm -f /tmp/libffi8.deb
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
@@ -84,15 +92,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
-# ── RapidOCR (CPU ONNX Runtime; preserve Jetson's system cv2) ─────
+# ── RapidOCR (CUDA ONNX Runtime; preserve Jetson's system cv2) ────
+RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true
+RUN wget -q "${ONNXRUNTIME_GPU_WHEEL_URL}" \
+      -O /tmp/onnxruntime_gpu-1.17.0-cp38-cp38-linux_aarch64.whl && \
+    pip3 install --no-cache-dir \
+      /tmp/onnxruntime_gpu-1.17.0-cp38-cp38-linux_aarch64.whl && \
+    rm -f /tmp/onnxruntime_gpu-1.17.0-cp38-cp38-linux_aarch64.whl
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-      pyclipper==1.3.0.post3 six onnxruntime Shapely==2.0.5 Pillow \
+      numpy==1.23.5 pyclipper==1.3.0.post3 six Shapely==2.0.5 Pillow \
       omegaconf==2.3.0 colorlog && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
       rapidocr==3.9.1 && \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete && \
-    python3 -c "import onnxruntime as ort; assert 'CPUExecutionProvider' in ort.get_available_providers()"
+    python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert 'CUDAExecutionProvider' in providers, providers"
 
 # ── OCR model (kept outside Git) ──────────────────────────────────
 ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-tiny

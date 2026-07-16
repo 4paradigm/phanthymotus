@@ -118,6 +118,9 @@ class OCRContractTest(unittest.TestCase):
                 {
                     "provider": "rapidocr",
                     "model_dir": "/models/ocr/ppocrv6-tiny",
+                    "device": "cuda",
+                    "device_id": 0,
+                    "gpu_mem_mb": 512,
                     "use_angle_cls": True,
                     "num_threads": 2,
                     "max_side_len": 1600,
@@ -131,6 +134,9 @@ class OCRContractTest(unittest.TestCase):
         self.assertIs(result, expected)
         adapter.assert_called_once_with(
             "/models/ocr/ppocrv6-tiny",
+            device="cuda",
+            device_id=0,
+            gpu_mem_mb=512,
             use_angle_cls=True,
             num_threads=2,
             max_side_len=1600,
@@ -155,6 +161,16 @@ class OCRContractTest(unittest.TestCase):
         )
 
         self.assertNotEqual(first, second)
+
+    def test_adapter_signature_changes_with_device(self):
+        cpu = self.ocr._adapter_signature(
+            {"provider": "rapidocr", "device": "cpu"}
+        )
+        cuda = self.ocr._adapter_signature(
+            {"provider": "rapidocr", "device": "cuda", "device_id": 0}
+        )
+
+        self.assertNotEqual(cpu, cuda)
 
     def test_adapter_initialization_failure_does_not_stop_bundle(self):
         with mock.patch(
@@ -268,6 +284,7 @@ class OCRContractTest(unittest.TestCase):
             ):
                 self.ocr.RapidOCRAdapter(
                     model_dir,
+                    device="cpu",
                     use_angle_cls=True,
                     num_threads=2,
                     max_side_len=1600,
@@ -289,6 +306,86 @@ class OCRContractTest(unittest.TestCase):
         self.assertEqual(engine_config["inter_op_num_threads"], 1)
         self.assertFalse(engine_config["use_cuda"])
         self.assertEqual(captured_config["Global"]["max_side_len"], 1600)
+
+    def test_rapidocr_adapter_configures_cuda_execution_provider(self):
+        captured_config = {}
+
+        def create_engine(*, config_path):
+            captured_config.update(
+                json.loads(Path(config_path).read_text(encoding="utf-8"))
+            )
+            return mock.Mock()
+
+        rapidocr_module = types.ModuleType("rapidocr")
+        rapidocr_module.RapidOCR = mock.Mock(side_effect=create_engine)
+        rapidocr_main_module = types.ModuleType("rapidocr.main")
+        onnxruntime_module = types.ModuleType("onnxruntime")
+        onnxruntime_module.get_available_providers = mock.Mock(
+            return_value=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            root = Path(model_dir)
+            for name in ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt"):
+                (root / name).write_bytes(b"model")
+            default_config = root / "default.yaml"
+            default_config.write_text(
+                json.dumps(
+                    {
+                        "Det": {}, "Cls": {}, "Rec": {}, "Global": {},
+                        "EngineConfig": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rapidocr_main_module.DEFAULT_CFG_PATH = str(default_config)
+            yaml_module = types.ModuleType("yaml")
+            yaml_module.safe_load = json.load
+            yaml_module.safe_dump = lambda data, stream, **_kwargs: json.dump(
+                data, stream
+            )
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "rapidocr": rapidocr_module,
+                    "rapidocr.main": rapidocr_main_module,
+                    "onnxruntime": onnxruntime_module,
+                    "yaml": yaml_module,
+                },
+            ):
+                self.ocr.RapidOCRAdapter(
+                    model_dir,
+                    device="cuda",
+                    device_id=0,
+                    gpu_mem_mb=512,
+                    num_threads=1,
+                )
+
+        engine_config = captured_config["EngineConfig"]["onnxruntime"]
+        self.assertTrue(engine_config["use_cuda"])
+        self.assertEqual(engine_config["intra_op_num_threads"], 1)
+        self.assertEqual(
+            engine_config["cuda_ep_cfg"],
+            {"device_id": 0, "gpu_mem": 512},
+        )
+
+    def test_cuda_adapter_rejects_missing_cuda_execution_provider(self):
+        onnxruntime_module = types.ModuleType("onnxruntime")
+        onnxruntime_module.get_available_providers = mock.Mock(
+            return_value=["CPUExecutionProvider"]
+        )
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            root = Path(model_dir)
+            for name in ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt"):
+                (root / name).write_bytes(b"model")
+            with mock.patch.dict(
+                sys.modules, {"onnxruntime": onnxruntime_module}
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "CUDAExecutionProvider"
+                ):
+                    self.ocr.RapidOCRAdapter(model_dir, device="cuda")
 
     def test_large_jpeg_delegates_to_strategy(self):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)

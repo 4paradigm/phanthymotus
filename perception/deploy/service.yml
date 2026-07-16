@@ -1,6 +1,7 @@
 perception:
   image: __IMAGE__
   container_name: embodied-perception
+  runtime: nvidia
   network_mode: host
   ipc: host
   pid: host

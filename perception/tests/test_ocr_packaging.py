@@ -24,6 +24,9 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("  asr:\n    enabled: false\n    mode: offline", config)
         self.assertIn("  ocr:\n    enabled: true\n    provider: rapidocr", config)
         self.assertIn("model_dir: /models/ocr/ppocrv6-tiny", config)
+        self.assertIn("    device: cuda", config)
+        self.assertIn("    device_id: 0", config)
+        self.assertIn("    gpu_mem_mb: 512", config)
         self.assertIn("    max_side_len: 1600", config)
         self.assertIn("    num_threads: 1", config)
         self.assertIn(
@@ -50,6 +53,13 @@ class OCRPackagingTest(unittest.TestCase):
         )
 
         self.assertIn("rapidocr==3.9.1", dockerfile)
+        self.assertIn("libffi8_3.4.2-4_arm64.deb", dockerfile)
+        self.assertIn(
+            "onnxruntime_gpu-1.17.0-cp38-cp38-linux_aarch64.whl",
+            dockerfile,
+        )
+        self.assertIn("numpy==1.23.5", dockerfile)
+        self.assertIn("CUDAExecutionProvider", dockerfile)
         self.assertIn("--no-deps", dockerfile)
         self.assertIn("onnxruntime", dockerfile)
         self.assertIn("rapidocr.__file__", dockerfile)
@@ -65,6 +75,11 @@ class OCRPackagingTest(unittest.TestCase):
         )
         self.assertIn("/models/ocr/ppocrv6-tiny", dockerfile)
         self.assertNotIn("COPY perception/models", dockerfile)
+
+        service = (REPO_ROOT / "perception" / "deploy" / "service.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("runtime: nvidia", service)
 
     def test_jetson_image_loads_large_message_fastdds_profile(self):
         dockerfile = (REPO_ROOT / "perception" / "Dockerfile.jetson").read_text(

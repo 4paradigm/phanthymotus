@@ -70,6 +70,9 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
+                "device": {"type": "string", "enum": ["cpu", "cuda"], "default": "cpu", "scope": "shared"},
+                "device_id": {"type": "integer", "minimum": 0, "default": 0, "scope": "shared"},
+                "gpu_mem_mb": {"type": "integer", "minimum": 0, "default": 512, "scope": "shared"},
                 "provider": {"type": "string", "enum": ["rapidocr", "openai", "qwen", "tesseract"], "description": "OCR 服务商", "scope": "shared"},
                 "url":      {"type": "string", "description": "API URL (可选)", "scope": "shared"},
                 "key":      {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
@@ -428,6 +431,9 @@ def _adapter_signature(cfg: dict) -> tuple:
     if provider == 'rapidocr':
         return common + (
             cfg.get('model_dir', '/models/ocr/ppocrv6-tiny'),
+            str(cfg.get('device', 'cpu')).strip().lower(),
+            int(cfg.get('device_id', 0)),
+            int(cfg.get('gpu_mem_mb', 512)),
             bool(cfg.get('use_angle_cls', True)),
             int(cfg.get('num_threads', 2)),
             int(cfg.get('max_side_len', 1600)),
@@ -451,6 +457,9 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
     if provider == 'rapidocr':
         return RapidOCRAdapter(
             cfg.get('model_dir', '/models/ocr/ppocrv6-tiny'),
+            device=str(cfg.get('device', 'cpu')).strip().lower(),
+            device_id=int(cfg.get('device_id', 0)),
+            gpu_mem_mb=int(cfg.get('gpu_mem_mb', 512)),
             use_angle_cls=bool(cfg.get('use_angle_cls', True)),
             num_threads=int(cfg.get('num_threads', 2)),
             max_side_len=int(cfg.get('max_side_len', 1600)),
