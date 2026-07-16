@@ -11,7 +11,8 @@ perception:
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/config/fastdds_large_message.xml
+    - OCR_MODEL_BASE_URL=${OCR_MODEL_BASE_URL:-}
   logging:
     driver: local
     options:

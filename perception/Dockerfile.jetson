@@ -11,8 +11,11 @@
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
+ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/guohongjie/models/ppocr-v6-tiny
 FROM ${BASE_IMAGE}
-ARG PYPI_MIRROR APT_MIRROR
+ARG PYPI_MIRROR APT_MIRROR OCR_MODEL_BASE_URL
+
+ENV OCR_MODEL_BASE_URL=${OCR_MODEL_BASE_URL}
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -42,7 +45,8 @@ RUN cd /ros_ws && \
 
 # ── Python deps ────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml requests websockets webrtcvad websocket-client dashscope && \
+    pyyaml requests websockets webrtcvad websocket-client dashscope \
+    onnxruntime pyclipper && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
 
 # ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────

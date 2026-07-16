@@ -1,7 +1,10 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/guohongjie/models/ppocr-v6-tiny
 FROM ${ROS_BASE_IMAGE}
-ARG PYPI_MIRROR
+ARG PYPI_MIRROR OCR_MODEL_BASE_URL
+
+ENV OCR_MODEL_BASE_URL=${OCR_MODEL_BASE_URL}
 
 RUN apt-get update && \
     mv /sbin/ldconfig /sbin/ldconfig.real && \
@@ -15,7 +18,8 @@ RUN pip3 install --no-cache-dir \
     --extra-index-url ${PYPI_MIRROR} \
     torch
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml requests silero-vad websockets webrtcvad websocket-client dashscope
+    pyyaml requests silero-vad websockets webrtcvad websocket-client dashscope \
+    onnxruntime pyclipper opencv-python-headless
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
@@ -28,6 +32,7 @@ COPY main.py    /work/main.py
 COPY plugins/   /work/plugins/
 COPY utils/     /work/utils/
 COPY config.yaml /work/config.yaml
+COPY config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 COPY deploy/     /deploy/
 
 EXPOSE 15720

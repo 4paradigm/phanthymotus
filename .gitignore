@@ -19,6 +19,8 @@ build/
 resource/world/
 resource/log/
 resource/frame_rgb.jpg
+perception/models/ppocr-v6-tiny/*
+!perception/models/ppocr-v6-tiny/README.md
 
 # Media (runtime captures)
 *.jpg

@@ -45,3 +45,20 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: true
+    provider: local_ppocr
+    model_dir: /models/ppocr-v6-tiny
+    # 目录下需包含 det.onnx、rec.onnx 和 inference.yml。
+    # 优先使用环境变量 OCR_MODEL_BASE_URL。
+    model_base_url: ""
+    auto_download: true
+    language: "zh"
+    num_threads: 2
+    det_limit_side_len: 736
+    det_thresh: 0.2
+    det_box_thresh: 0.4
+    det_unclip_ratio: 1.4
+    rec_score_thresh: 0.3
+    max_candidates: 1000
