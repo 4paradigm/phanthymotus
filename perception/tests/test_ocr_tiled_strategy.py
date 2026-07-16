@@ -71,6 +71,69 @@ class OCRTiledStrategyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "JPEG dimensions exceed"):
             strategy._plan_jpeg_decode(self.cv2, (40000, 30000))
 
+    def test_tile_grid_anchors_right_and_bottom_edges(self):
+        strategy = self.strategy_type(
+            {"tile_size": 1280, "overlap": 192, "max_tiles": 20},
+            global_max_side=1600,
+        )
+
+        tiles = strategy._select_tiles((2500, 2100))
+
+        self.assertIn((1220, 820, 2500, 2100), tiles)
+        self.assertEqual(len(tiles), len(set(tiles)))
+
+    def test_tile_limit_is_deterministic_and_covers_corners(self):
+        strategy = self.strategy_type(
+            {"tile_size": 1280, "overlap": 192, "max_tiles": 6},
+            global_max_side=1600,
+        )
+
+        first = strategy._select_tiles((4000, 3000))
+        second = strategy._select_tiles((4000, 3000))
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 6)
+        self.assertIn((0, 0, 1280, 1280), first)
+        self.assertIn((2720, 1720, 4000, 3000), first)
+
+    def test_offsets_then_scales_tile_box_to_source_pixels(self):
+        strategy = self.strategy_type({}, global_max_side=1600)
+        decoded_items = strategy._offset_items(
+            [
+                {
+                    "text": "small",
+                    "bbox": [10, 20, 110, 60],
+                    "score": 0.8,
+                }
+            ],
+            offset_x=1000,
+            offset_y=500,
+        )
+
+        source_items = strategy._scale_items(
+            decoded_items,
+            scale_x=2.0,
+            scale_y=2.0,
+            bounds=(4000, 3000),
+        )
+
+        self.assertEqual(source_items[0]["bbox"], [2020, 1040, 2220, 1120])
+
+    def test_scale_clips_boxes_to_source_bounds_without_mutating_input(self):
+        strategy = self.strategy_type({}, global_max_side=1600)
+        item = {
+            "text": "edge",
+            "bbox": [-5, -4, 2100, 1600],
+            "score": 0.7,
+        }
+
+        scaled = strategy._scale_items(
+            [item], scale_x=2.0, scale_y=2.0, bounds=(4000, 3000)
+        )
+
+        self.assertEqual(scaled[0]["bbox"], [0, 0, 4000, 3000])
+        self.assertEqual(item["bbox"], [-5, -4, 2100, 1600])
+
 
 if __name__ == "__main__":
     unittest.main()
