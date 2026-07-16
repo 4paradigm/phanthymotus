@@ -187,7 +187,7 @@ class RapidOCRAdapter:
             cuda_ep_cfg.update(
                 {
                     "device_id": int(device_id),
-                    "gpu_mem": int(gpu_mem_mb),
+                    "gpu_mem_limit": int(gpu_mem_mb) * 1024 * 1024,  # ORT CUDA EP: bytes
                 }
             )
 

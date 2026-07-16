@@ -1,0 +1,138 @@
+# ── Jetson GPU variant (JetPack 6) ─────────────────────────────────
+# Base: jetson-base:jp6-torch (Ubuntu 22.04, Python 3.10, torch 2.4, CUDA 12.6)
+#
+# Why JP6: the Jetson host runs L4T r36 (JetPack 6, driver 540). JP5.1.1
+# containers cannot initialise CUDA on it — nvidia-container-runtime mounts
+# the host's r36 driver libs, which require glibc >= 2.34, while the jp511
+# base (Ubuntu 20.04) ships glibc 2.31. CPU inference is unaffected.
+#
+# Build context: repo root (phanthy-motus/) so we can access both
+# src/perception_stack/ and deploy/ros-base/audio_msgs/
+#
+# Usage:
+#   docker build -f perception/Dockerfile.jetson-jp6 --network=host \
+#     -t phanthymotus-perception-asr:jp6 .
+# ────────────────────────────────────────────────────────────────────
+
+ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG BASE_IMAGE=local/phanthy-motus/jetson-base:jp6-torch
+FROM ${BASE_IMAGE}
+ARG PYPI_MIRROR APT_MIRROR
+
+# ── APT mirror (conditional) ─────────────────────────────────────
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
+    fi
+
+# ── System deps ────────────────────────────────────────────────────
+# (build-essential + python3-dev: webrtcvad has no aarch64 wheel, builds from source)
+RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+      ffmpeg build-essential python3-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# libffi8: not needed on JP6 — Ubuntu 22.04 ships libffi.so.8 natively.
+
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
+
+# ── audio_msgs ROS2 package (Humble already in base) ──────────────
+COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
+RUN cd /ros_ws && \
+    . /opt/ros/humble/install/setup.bash && \
+    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# ── Python deps ────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    pyyaml requests websockets webrtcvad websocket-client dashscope && \
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
+
+# ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    kiss-icp scipy
+
+# ── VOP deps (YOLOv8-World object detection) ─────────────────────
+# NOTE: cv2 in the jp6 base works out of the box (the jp511 __init__ fix is
+# not needed and its python3.8 paths do not exist here).
+# Install ultralytics WITHOUT replacing Jetson's CUDA torch + torchvision
+RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
+    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
+    pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
+# CLIP: SKIPPED in the JP6 bring-up build — its GitHub build deps
+# (tiktoken/Rust toolchain) hang on aarch64. VOP set_classes needs a
+# dedicated pass before this image ships to VOP.
+RUN echo "CLIP SKIPPED (jp6 bring-up)" && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
+
+# Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
+ENV YOLO_CONFIG_DIR=/work
+
+# ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
+
+# ── ONNX Runtime GPU (CUDA 12.6 / cp310, jetson-ai-lab index) ─────
+# Wheel mirrored from https://pypi.jetson-ai-lab.io/jp6/cu126 (+simple/onnxruntime-gpu).
+# sha256 is pinned; override ORT_WHEEL_URL to a LAN mirror for fast builds.
+ARG ORT_WHEEL_URL=https://pypi.jetson-ai-lab.io/jp6/cu126/+f/d98/0b934b9a29c1a/onnxruntime_gpu-1.24.0-cp310-cp310-linux_aarch64.whl
+ARG ORT_WHEEL_SHA256=d980b934b9a29c1a9d6f39751edd7662b69fadd75556a10ff363773a58ce0950
+RUN wget -q "${ORT_WHEEL_URL}" -O /tmp/onnxruntime_gpu-1.24.0-cp310-cp310-linux_aarch64.whl && \
+    echo "${ORT_WHEEL_SHA256}  /tmp/onnxruntime_gpu-1.24.0-cp310-cp310-linux_aarch64.whl" | sha256sum -c - && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} /tmp/onnxruntime_gpu-1.24.0-cp310-cp310-linux_aarch64.whl "numpy==1.26.4" && \
+    rm -f /tmp/onnxruntime_gpu-1.24.0-cp310-cp310-linux_aarch64.whl && \
+    python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert ort.__version__ == '1.24.0', ort.__version__; assert 'CUDAExecutionProvider' in providers, providers"
+
+# ── RapidOCR (CUDA ONNX Runtime; preserve Jetson's system cv2) ────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+      "numpy==1.26.4" pyclipper==1.3.0.post3 six Shapely==2.0.5 Pillow \
+      omegaconf==2.3.0 colorlog && \
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
+      rapidocr==3.9.1 && \
+    RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
+    find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
+
+# ── Offline ASR model ─────────────────────────────────────────────
+ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/official_paraformer
+COPY perception/utils/asr_model_downloader.py /tmp/asr_model_downloader.py
+RUN python3 /tmp/asr_model_downloader.py \
+    --base-url "${ASR_OFFLINE_MODEL_BASE_URL}" \
+    --output-dir /models/sherpa-onnx/asr-offline
+
+# ── OCR model (kept outside Git) ──────────────────────────────────
+ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-tiny
+ARG OCR_MODEL_FALLBACK_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ocr/ppocrv6-tiny
+COPY perception/utils/ocr_model_downloader.py /tmp/ocr_model_downloader.py
+RUN python3 /tmp/ocr_model_downloader.py \
+    --base-url "${OCR_MODEL_BASE_URL}" \
+    --output-dir /models/ocr/ppocrv6-tiny || \
+    python3 /tmp/ocr_model_downloader.py \
+    --base-url "${OCR_MODEL_FALLBACK_BASE_URL}" \
+    --output-dir /models/ocr/ppocrv6-tiny
+
+# ── Application code ───────────────────────────────────────────────
+WORKDIR /work
+COPY perception/main.py    /work/main.py
+COPY perception/plugins/   /work/plugins/
+COPY perception/utils/     /work/utils/
+COPY perception/config.yaml /work/config.yaml
+COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
+
+EXPOSE 15720
+EXPOSE 15721
+
+# 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
+RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.10/dist-packages/ros_ws.pth && \
+    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python3.10/dist-packages/ros_ws.pth
+
+# ROS2 shared libraries（audio_msgs .so 等）
+ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+
+CMD ["/bin/bash", "-c", \
+    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+     source /opt/ros/humble/install/setup.bash && \
+     source /ros_ws/install/setup.bash && \
+     python3 /work/main.py"]
