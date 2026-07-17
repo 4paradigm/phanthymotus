@@ -78,6 +78,7 @@ TOOLS = [
                 "key":      {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
                 "model":    {"type": "string", "description": "模型名称", "scope": "instance"},
                 "language": {"type": "string", "description": "默认语言", "default": "zh", "scope": "instance"},
+                "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "shared"},
             },
             "required": ["provider"]
         },
@@ -492,7 +493,7 @@ class _OCRNode(Node):
     """订阅 image/jpeg topic，持续进行 OCR 识别"""
 
     def __init__(self, input_topic: str, adapter: OCRAdapter, language: str = "zh",
-                 node_suffix: str = ''):
+                 node_suffix: str = '', min_interval: float = 0.0):
         node_name = f"ocr_{node_suffix}" if node_suffix else "ocr"
         super().__init__(node_name)
 
@@ -500,6 +501,8 @@ class _OCRNode(Node):
         self._output_topic = _ocr_output_topic(input_topic)
         self._adapter = adapter
         self._language = language
+        # 帧处理最小间隔（秒）：限制 GPU 占用，0 = 不限
+        self._min_interval = max(0.0, float(min_interval))
         self.state = "idle"
 
         self._sub = None
@@ -579,6 +582,7 @@ class _OCRNode(Node):
             except queue.Empty:
                 continue
 
+            t_start = time.time()
             payload = recognize_to_payload(
                 self._adapter, image_bytes, self._language, ts
             )
@@ -595,6 +599,12 @@ class _OCRNode(Node):
                     self._output_topic,
                     len(payload["items"]),
                 )
+
+            # 限帧：距上一帧开始不足 min_interval 则等待（降低 GPU 占用）
+            if self._min_interval > 0:
+                remaining = self._min_interval - (time.time() - t_start)
+                if remaining > 0:
+                    self._stop_event.wait(remaining)
 
     def _status_dict(self) -> dict:
         return {
@@ -738,7 +748,12 @@ class OCRPlugin:
 
                 node = _OCRNode(
                     input_topic, adapter, language,
-                    node_suffix=node_key.replace('/', '_').replace('-', '_')
+                    node_suffix=node_key.replace('/', '_').replace('-', '_'),
+                    min_interval=float(
+                        {**self._plugin_cfg,
+                         **self._instance_configs.get(instance_id, {})}
+                        .get('min_interval_ms', 0)
+                    ) / 1000.0,
                 )
                 self._executor.add_node(node)
                 self._nodes[node_key] = node

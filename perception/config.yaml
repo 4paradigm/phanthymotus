@@ -57,9 +57,12 @@ plugins:
     device: cuda
     device_id: 0
     gpu_mem_mb: 512
-    use_angle_cls: true
+    # GPU 占用控制（实测 On Orin, tegrastats 均值）：
+    #   back-to-back(1600+cls) ~43% → side=960/cls=off + 5s 限帧 ≈ 8%
+    use_angle_cls: false       # 正立文档场景够用；旋转文字需改回 true
     num_threads: 1
-    max_side_len: 1600
+    max_side_len: 960          # 68 items 保持不变，640 会掉精度(54)
+    min_interval_ms: 5000      # 帧处理最小间隔，0=不限帧
     large_image_strategy:
       enabled: true
       trigger_side: 2400
