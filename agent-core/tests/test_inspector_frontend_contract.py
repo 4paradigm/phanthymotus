@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+
+CORE_ROOT = Path(__file__).resolve().parents[1]
+
+
+class InspectorFrontendContractTest(unittest.TestCase):
+    def test_inspection_service_has_mcp_endpoint(self) -> None:
+        source = (CORE_ROOT / "src/api/drivers.py").read_text(encoding="utf-8")
+        self.assertIn("'inspection': {'port': 15671, 'mcp_url': 'http://localhost:15671/mcp'}", source)
+
+    def test_sidebar_renders_inspection_category(self) -> None:
+        source = (CORE_ROOT / "web/js/sidebar.js").read_text(encoding="utf-8")
+        self.assertIn("m.category === 'inspection'", source)
+        self.assertIn("_buildInspectionSection", source)
+        self.assertIn("'inspector'", source)
+
+    def test_canvas_has_explicit_inspector_branch(self) -> None:
+        source = (CORE_ROOT / "web/js/canvas.js").read_text(encoding="utf-8")
+        self.assertIn("effectiveType === 'inspector'", source)
+        self.assertIn("canvas-inspector-status", source)
+
+    def test_flow_view_uses_category_instead_of_topic_direction(self) -> None:
+        source = (CORE_ROOT / "web/js/flow-view.js").read_text(encoding="utf-8")
+        self.assertIn("mcp.category === 'inspection'", source)
+        self.assertIn("inspector: 'INSPECT'", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

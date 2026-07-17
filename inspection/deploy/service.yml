@@ -1,0 +1,20 @@
+inspection:
+  image: __IMAGE__
+  container_name: embodied-inspection
+  network_mode: host
+  ipc: host
+  volumes:
+    - /opt/phanthy-motus/inspection-data:/opt/phanthy-motus/inspection-data
+    - /opt/phanthy-motus/inspection-state:/opt/phanthy-motus/inspection-state
+    - /run/secrets/phanthymotus:/run/secrets/phanthymotus:ro
+  environment:
+    - AGENT_CORE_URL=https://localhost:15678
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  stop_grace_period: 20s
+  restart: unless-stopped
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"

@@ -744,7 +744,6 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         await _executeCard(el, mcpId, toolName, id);
       });
     }
-
     // Generic file upload buttons for sensor cards (format: 'file' in schema)
     el.querySelectorAll('.canvas-file-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
@@ -781,6 +780,55 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         fileInput.click();
       });
     });
+  } else if (effectiveType === 'inspector') {
+    const inspectorInstanceCfgBtn = hasInstanceFields
+      ? `<button class="canvas-card-instance-cfg-btn" title="实例配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a1.65 1.65 0 0 0-.33-1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
+      : '';
+
+    el.innerHTML = `
+      <div class="canvas-card-body-wrap">
+        <div class="canvas-card-header">
+          <div class="canvas-card-info">
+            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
+            <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
+          </div>
+          ${inspectorInstanceCfgBtn}
+          <button class="tool-card-info-btn canvas-card-info-btn" title="采集状态"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
+          <button class="canvas-card-close" title="从画布移除">✕</button>
+        </div>
+        <div class="canvas-card-body canvas-inspector-body">
+          <div class="canvas-inspector-status idle"><span class="canvas-inspector-dot"></span><span>等待项目启动</span></div>
+          <div class="canvas-inspector-hint">输入数据将由独立采集服务异步处理</div>
+        </div>
+      </div>
+      <div class="canvas-port-col left">${inPortsHtml}</div>
+      <div class="canvas-port-col right">${outPortsHtml}</div>
+    `;
+
+    el.querySelector('.canvas-card-close').addEventListener('click', (e) => {
+      e.stopPropagation();
+      _removeCard(id);
+    });
+
+    el.querySelector('.canvas-card-info-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const liveMcp = _allMcps.find(m => m.id === mcpId);
+      if (liveMcp) {
+        const liveTopicIn = _collectInTopics(id, el);
+        _fetchInfoAndShow(liveMcp, toolObj || toolName, { topicIn: liveTopicIn, topicOut: [], instanceId: id });
+      }
+    });
+
+    const inspectorInstanceCfgBtnEl = el.querySelector('.canvas-card-instance-cfg-btn');
+    if (inspectorInstanceCfgBtnEl) {
+      inspectorInstanceCfgBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const liveMcp = _allMcps.find(m => m.id === mcpId);
+        const liveTool = (liveMcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
+        const liveSchema = typeof liveTool === 'object' ? liveTool.configSchema : null;
+        openInstanceConfigModal(mcpId, toolName, id, liveSchema || configSchema);
+      });
+    }
   } else {
     // Actuator/processor/default card
     const props   = schema?.properties || {};
@@ -1584,6 +1632,19 @@ async function _startProject() {
           const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
           parsed.topic_out.forEach((t, idx) => { if (outPorts[idx] && t.topic) outPorts[idx].dataset.topic = t.topic; });
         }
+        const cardMcp = _allMcps.find(m => m.id === card.mcpId);
+        const cardTool = (cardMcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
+        if (typeof cardTool === 'object' && cardTool.type === 'inspector') {
+          const statusEl = card.el.querySelector('.canvas-inspector-status');
+          if (statusEl) {
+            const recording = parsed?.state === 'recording';
+            statusEl.classList.toggle('recording', recording);
+            statusEl.classList.toggle('idle', !recording);
+            statusEl.querySelector('span:last-child').textContent = recording
+              ? '正在采集'
+              : (parsed?.message || parsed?.state || '启动失败');
+          }
+        }
         updateItem(i, 'ready');
       } catch (e) {
         if (!aborted) {
@@ -1647,7 +1708,18 @@ function _stopProject() {
       args = {};
     }
     args.instance_id = card.id;
-    _triggerAction(card.mcpId, card.toolName, 'stop', args);
+    const stopPromise = _triggerAction(card.mcpId, card.toolName, 'stop', args);
+    const cardMcp = _allMcps.find(m => m.id === card.mcpId);
+    const cardTool = (cardMcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
+    if (typeof cardTool === 'object' && cardTool.type === 'inspector') {
+      stopPromise.finally(() => {
+        const statusEl = card.el.querySelector('.canvas-inspector-status');
+        if (!statusEl) return;
+        statusEl.classList.remove('recording');
+        statusEl.classList.add('idle');
+        statusEl.querySelector('span:last-child').textContent = '已停止';
+      });
+    }
     // Auto-stop mic stream when remote_mic card stops
     if (card.toolName === 'remote_mic' && isMicActive()) {
       toggleMicStream('', () => {}).catch(() => {});

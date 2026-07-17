@@ -19,7 +19,7 @@ _SERVICE_ENDPOINTS: dict[str, dict] = {
     'perception': {'port': 15720, 'mcp_url': 'http://localhost:15720/mcp',
                    'volumes': {os.environ.get('MODELS_PATH', '/opt/embodied/models'):
                                {'bind': '/models', 'mode': 'rw'}}},
-    'inspection': {'port': 15671},
+    'inspection': {'port': 15671, 'mcp_url': 'http://localhost:15671/mcp'},
 }
 
 
@@ -473,4 +473,3 @@ async def driver_remove(driver_id: str):
 async def driver_status(driver_id: str):
     status = await _run_in_executor(_get_status_sync, driver_id)
     return {'code': 200, 'data': status}
-

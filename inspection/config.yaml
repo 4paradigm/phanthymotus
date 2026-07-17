@@ -1,0 +1,9 @@
+mcp_port: 15671
+server_name: inspection-bundle
+category: inspection
+
+plugins:
+  audioinspector:
+    enabled: true
+  videoinspector:
+    enabled: true

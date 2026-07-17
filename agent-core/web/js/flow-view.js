@@ -1,7 +1,7 @@
 /**
  * flow-view.js — Hardware-centric pub/sub data-flow SVG diagram.
  *
- * Nodes: topic (pill, purple), hardware nodes (sensor/actuator/processor, tech aesthetic),
+ * Nodes: topic (pill, purple), hardware nodes (sensor/actuator/processor/inspector, tech aesthetic),
  *        agentcore (rect, accent, always present).
  * Edges: topic→node and node→topic. All topics feed Agent Core.
  * Click: topic node → show live stream; hardware node → show node info.
@@ -56,6 +56,7 @@ export async function refresh() {
 // ── Classification ────────────────────────────────────────────────────────────
 
 function _classifyDriver(mcp) {
+  if (mcp.category === 'inspection') return 'inspector';
   const hasOut = (mcp.topic_out || []).filter(t => t.topic).length > 0;
   const hasIn  = (mcp.topic_in  || []).filter(t => t.topic).length > 0;
   if (hasOut && hasIn)  return 'processor';
@@ -68,6 +69,7 @@ const _HW_LABELS = {
   sensor:    'SENSOR',
   actuator:  'ACTUATOR',
   processor: 'PROC',
+  inspector: 'INSPECT',
   none:      'MCP',
 };
 
@@ -111,7 +113,7 @@ function _buildGraph(mcps) {
  * Column assignment:
  *  col 0: sensor nodes (topic_out only)
  *  col 2: processor nodes (both topic_in and topic_out) + uncategorized
- *  col 4: actuator nodes (topic_in only)
+ *  col 4: actuator and inspector nodes (topic sinks)
  *  Topics: placed between the col of their source and the col of their sinks
  *  Agent Core: far right
  */
@@ -121,6 +123,7 @@ function _layout(nodes, topics) {
     if (n.hwType === 'sensor')         n.col = 0;
     else if (n.hwType === 'processor') n.col = 2;
     else if (n.hwType === 'actuator')  n.col = 4;
+    else if (n.hwType === 'inspector') n.col = 4;
     else                               n.col = 2;
   }
 
@@ -241,6 +244,11 @@ function _render() {
     <linearGradient id="grad-processor" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#6D28D9" stop-opacity="0.12"/>
       <stop offset="100%" stop-color="#5B21B6" stop-opacity="0.04"/>
+    </linearGradient>
+    <!-- Inspector glow gradient -->
+    <linearGradient id="grad-inspector" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0284C7" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#0369A1" stop-opacity="0.04"/>
     </linearGradient>`;
   _svg.appendChild(defs);
 
@@ -371,7 +379,7 @@ function _drawHardwareNode(node) {
   g.appendChild(notchLine);
 
   // Type badge (top-left)
-  const BW = node.hwType === 'actuator' ? 58 : 48, BH = 14;
+  const BW = node.hwType === 'actuator' ? 58 : node.hwType === 'inspector' ? 62 : 48, BH = 14;
   const badgeRect = _el('rect');
   badgeRect.setAttribute('x', 6);
   badgeRect.setAttribute('y', 5);

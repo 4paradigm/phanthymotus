@@ -65,10 +65,11 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   const controllers = allMcps.filter(m => m.category === 'controller');
   const drivers = allMcps.filter(m => m.category === 'driver' && m.online === true);
   const perceptions = allMcps.filter(m => m.category === 'perception' && m.online === true);
+  const inspections = allMcps.filter(m => m.category === 'inspection' && m.online === true);
 
   _scroll.innerHTML = '';
 
-  if (!controllers.length && !drivers.length && !perceptions.length) {
+  if (!controllers.length && !drivers.length && !perceptions.length && !inspections.length) {
     _scroll.appendChild(_empty);
     return;
   }
@@ -85,6 +86,12 @@ export function renderSidebar(mcps, topicStatuses = {}) {
     _scroll.appendChild(section);
   }
 
+  // Durable recording and upload sinks
+  if (inspections.length) {
+    const section = _buildInspectionSection(inspections);
+    _scroll.appendChild(section);
+  }
+
   // Driver sections (one per driver)
   for (const mcp of drivers) {
     const section = _buildSection(mcp);
@@ -94,7 +101,7 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
 // ── Section builders ──────────────────────────────────────────────────────────
 
-const _TYPE_ORDER = ['controller', 'sensor', 'actuator', 'processor', ''];
+const _TYPE_ORDER = ['controller', 'sensor', 'actuator', 'processor', 'inspector', ''];
 
 function _buildSection(mcp) {
   const name = mcp.server_name || mcp.name || mcp.id;
@@ -168,6 +175,36 @@ function _buildPerceptionSection(perceptions) {
     }
   }
 
+  section.appendChild(grid);
+  return section;
+}
+
+function _buildInspectionSection(inspections) {
+  const section = document.createElement('div');
+  section.className = 'sidebar-section sidebar-section-inspection';
+
+  const header = document.createElement('div');
+  header.className = 'sidebar-section-header';
+  const allTools = [];
+  for (const mcp of inspections) {
+    const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
+    for (const tool of tools) {
+      if (!tool.type) tool.type = 'inspector';
+      tool._mcp = mcp;
+      allTools.push(tool);
+    }
+  }
+  header.innerHTML = `
+    <span class="sidebar-section-icon inspector">▣</span>
+    <span class="sidebar-section-name">采集与上报</span>
+    <span class="sidebar-section-count">${allTools.length}</span>
+  `;
+  section.appendChild(header);
+
+  const useChip = allTools.length > 6;
+  const grid = document.createElement('div');
+  grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
+  _renderGroupedTools(grid, null, allTools, useChip);
   section.appendChild(grid);
   return section;
 }
