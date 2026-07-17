@@ -36,10 +36,13 @@ if [ -d /models ]; then
     RUN_ARGS+=(-v /models:/models)
 fi
 
-RUN_ARGS+=(
-    -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
-    -e FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-DEFAULT}"
-)
+# ROS_DOMAIN_ID / FASTDDS: set by judgeflow at docker run (not baked into image).
+if [ -n "${ROS_DOMAIN_ID:-}" ]; then
+    RUN_ARGS+=(-e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID}")
+fi
+if [ -n "${FASTDDS_BUILTIN_TRANSPORTS:-}" ]; then
+    RUN_ARGS+=(-e "FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS}")
+fi
 
 RUN_ARGS+=("${IMAGE}")
 

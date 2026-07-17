@@ -162,8 +162,4 @@ RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
 ENV LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
-# Align with robot-tts-evaluation (ROS_DOMAIN_ID=42, FastDDS DEFAULT transport).
-ENV ROS_DOMAIN_ID=42 \
-    FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
-
 ENTRYPOINT ["/deploy/entrypoint.sh"]

@@ -7,14 +7,10 @@ log() { echo "[entrypoint] $*" >&2; }
 
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1
 
-# TTS benchmark: evaluation containers use ROS_DOMAIN_ID=42 and
-# FASTDDS_BUILTIN_TRANSPORTS=DEFAULT (see robot-tts-evaluation docker run).
-export ROS_DOMAIN_ID=42
-export FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
-unset RMW_IMPLEMENTATION
-
+# ROS DDS: do not set ROS_DOMAIN_ID in the image — judgeflow injects it at
+# docker run (must match robot-tts-evaluation). Log runtime values for debug.
 log "starting (LD_PRELOAD=${LD_PRELOAD})"
-log "ROS_DOMAIN_ID=${ROS_DOMAIN_ID} FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS}"
+log "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-<unset>} FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-<unset>}"
 
 if [ "${TTS_REQUIRE_CUDA:-1}" = "1" ]; then
     log "checking CUDA via torch..."
