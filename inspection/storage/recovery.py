@@ -12,7 +12,7 @@ def reconcile_audio_store(data_root: str | Path, ledger: SegmentLedger) -> dict[
     root = Path(data_root)
     root.mkdir(parents=True, exist_ok=True)
     stats = {
-        "uploading_reset": ledger.reset_uploading_for_recovery(),
+        "uploading_reset": ledger.reset_uploading_for_recovery(card_id="audioinspector"),
         "parts_recovered": 0,
         "finalized_rebuilt": 0,
         "corrupt_parts": 0,

@@ -34,6 +34,7 @@ class SegmentLedger:
                     sha256 TEXT NOT NULL,
                     state TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at_ns INTEGER NOT NULL DEFAULT 0,
                     created_at_ns INTEGER NOT NULL,
                     updated_at_ns INTEGER NOT NULL,
                     uploaded_at_ns INTEGER,
@@ -44,7 +45,15 @@ class SegmentLedger:
                 )
                 """
             )
-            self._db.execute("CREATE INDEX IF NOT EXISTS idx_segments_state_created ON segments(state, created_at_ns)")
+            columns = {str(row["name"]) for row in self._db.execute("PRAGMA table_info(segments)")}
+            if "next_retry_at_ns" not in columns:
+                self._db.execute(
+                    "ALTER TABLE segments ADD COLUMN next_retry_at_ns INTEGER NOT NULL DEFAULT 0"
+                )
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_segments_upload_ready "
+                "ON segments(state, next_retry_at_ns, created_at_ns)"
+            )
             self._db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS instance_state (
@@ -121,12 +130,17 @@ class SegmentLedger:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def summary(self, *, instance_id: str | None = None) -> dict[str, int]:
-        where = ""
-        values: tuple[str, ...] = ()
+    def summary(self, *, card_id: str | None = None, instance_id: str | None = None) -> dict[str, int]:
+        clauses: list[str] = []
+        values_list: list[str] = []
+        if card_id is not None:
+            clauses.append("card_id=?")
+            values_list.append(card_id)
         if instance_id is not None:
-            where = " WHERE instance_id=?"
-            values = (instance_id,)
+            clauses.append("instance_id=?")
+            values_list.append(instance_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        values = tuple(values_list)
         with self._lock:
             rows = self._db.execute(
                 f"SELECT state, COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM segments{where} GROUP BY state",
@@ -175,9 +189,12 @@ class SegmentLedger:
             )
 
     def list_desired_recording(self, *, card_id: str) -> list[dict]:
+        return [row for row in self.list_instance_states(card_id=card_id) if row["desired_state"] == "recording"]
+
+    def list_instance_states(self, *, card_id: str) -> list[dict]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT * FROM instance_state WHERE card_id=? AND desired_state='recording' ORDER BY updated_at_ns",
+                "SELECT * FROM instance_state WHERE card_id=? ORDER BY updated_at_ns",
                 (card_id,),
             ).fetchall()
         result = []
@@ -192,6 +209,94 @@ class SegmentLedger:
             result.append(item)
         return result
 
+    def claim_next_upload(self, *, card_id: str) -> dict | None:
+        now = time.time_ns()
+        with self._lock, self._db:
+            row = self._db.execute(
+                """
+                SELECT * FROM segments
+                WHERE card_id=? AND state=? AND next_retry_at_ns<=?
+                ORDER BY created_at_ns, segment_id
+                LIMIT 1
+                """,
+                (card_id, SegmentState.FINALIZED.value, now),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = self._db.execute(
+                """
+                UPDATE segments
+                SET state=?, attempts=attempts+1, next_retry_at_ns=0,
+                    updated_at_ns=?, last_error=''
+                WHERE segment_id=? AND state=? AND next_retry_at_ns<=?
+                """,
+                (
+                    SegmentState.UPLOADING.value, now, row["segment_id"],
+                    SegmentState.FINALIZED.value, now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = dict(row)
+            claimed["state"] = SegmentState.UPLOADING.value
+            claimed["attempts"] = int(claimed["attempts"]) + 1
+            return claimed
+
+    def mark_upload_verified(self, segment_id: str, *, object_key: str) -> None:
+        now = time.time_ns()
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                """
+                UPDATE segments
+                SET state=?, object_key=?, uploaded_at_ns=COALESCE(uploaded_at_ns, ?),
+                    verified_at_ns=?, next_retry_at_ns=0, updated_at_ns=?, last_error=''
+                WHERE segment_id=?
+                """,
+                (SegmentState.UPLOADED_VERIFIED.value, object_key, now, now, now, segment_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(segment_id)
+
+    def mark_upload_retry(self, segment_id: str, *, error: str, retry_after_seconds: float) -> None:
+        now = time.time_ns()
+        retry_at = now + int(max(0.0, float(retry_after_seconds)) * 1_000_000_000)
+        with self._lock, self._db:
+            cursor = self._db.execute(
+                """
+                UPDATE segments
+                SET state=?, next_retry_at_ns=?, last_error=?, updated_at_ns=?
+                WHERE segment_id=?
+                """,
+                (SegmentState.FINALIZED.value, retry_at, error, now, segment_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(segment_id)
+
+    def mark_conflict(self, segment_id: str, *, error: str) -> None:
+        self.transition(segment_id, SegmentState.CONFLICT, error=error)
+
+    def list_cleanup_candidates(self, *, card_id: str, instance_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT * FROM segments
+                WHERE card_id=? AND instance_id=? AND state IN (?, ?)
+                ORDER BY created_at_ns, segment_id
+                """,
+                (
+                    card_id, instance_id,
+                    SegmentState.RETENTION_ELIGIBLE.value,
+                    SegmentState.UPLOADED_VERIFIED.value,
+                ),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def mark_retention_eligible(self, segment_id: str) -> None:
+        self.transition(segment_id, SegmentState.RETENTION_ELIGIBLE)
+
+    def mark_purged_local(self, segment_id: str) -> None:
+        self.transition(segment_id, SegmentState.PURGED_LOCAL)
+
     def transition(self, segment_id: str, state: SegmentState, *, error: str = "") -> None:
         with self._lock, self._db:
             cursor = self._db.execute(
@@ -201,11 +306,20 @@ class SegmentLedger:
             if cursor.rowcount != 1:
                 raise KeyError(segment_id)
 
-    def reset_uploading_for_recovery(self) -> int:
+    def reset_uploading_for_recovery(self, *, card_id: str | None = None) -> int:
+        where = "state=?"
+        values = (
+            SegmentState.FINALIZED.value,
+            time.time_ns(),
+            SegmentState.UPLOADING.value,
+        )
+        if card_id is not None:
+            where += " AND card_id=?"
+            values += (card_id,)
         with self._lock, self._db:
             cursor = self._db.execute(
-                "UPDATE segments SET state=?, updated_at_ns=? WHERE state=?",
-                (SegmentState.FINALIZED.value, time.time_ns(), SegmentState.UPLOADING.value),
+                f"UPDATE segments SET state=?, next_retry_at_ns=0, updated_at_ns=? WHERE {where}",
+                values,
             )
             return int(cursor.rowcount)
 

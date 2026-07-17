@@ -8,6 +8,7 @@ from typing import Any
 
 from plugins.base import InspectorPlugin, RecordingInstance
 from storage.ledger import SegmentLedger
+from storage.services import DurableServices
 from storage.video_writer import VideoFragmentStore, reconcile_video_store
 
 
@@ -43,16 +44,56 @@ class VideoInspectorPlugin(InspectorPlugin):
         self._state_root = Path(plugin_config.get("state_root", "/opt/phanthy-motus/inspection-state"))
         self._runtimes: dict[str, Any] = {}
         self._ledger: SegmentLedger | None = None
+        self._services: DurableServices | None = None
         self._recovery_stats: dict[str, int] = {}
         self._closed = False
         if runtime_mode == "ros2-gstreamer":
             if executor is None:
                 raise RuntimeError("ROS2 executor is required for videoinspector runtime_mode=ros2-gstreamer")
             self._ledger = SegmentLedger(self._state_root / "ledger.sqlite3")
-            self._ledger.reset_uploading_for_recovery()
+            self._ledger.reset_uploading_for_recovery(card_id=self.card_id)
             self._recovery_stats = reconcile_video_store(self._data_root, self._ledger)
             log.info("video store recovery complete: %s", self._recovery_stats)
+            self._services = DurableServices(
+                ledger=self._ledger,
+                data_root=self._data_root,
+                card_id=self.card_id,
+                on_critical=self._handle_critical,
+            )
+            self._services.restore_latest()
             self._restore_desired_instances()
+
+    def _apply_config(self, args: dict[str, Any]) -> dict[str, Any]:
+        result = super()._apply_config(args)
+        if self._services is not None:
+            instance_id = str(args.get("instance_id", ""))
+            ready = self._services.configure(self._effective_config(instance_id))
+            result["adapter_ok"] = ready
+            result["upload_ready"] = ready
+            if not ready:
+                result["message"] = self._services.last_error
+        return result
+
+    def _validate_start_config(self, instance_id: str) -> None:
+        super()._validate_start_config(instance_id)
+        config = self._effective_config(instance_id)
+        estimated = (
+            float(config["target_bitrate_kbps"]) * 1000 / 8
+            * 3600 * float(config["local_retention_hours"])
+        )
+        budget = float(config["local_max_gb"]) * 1024 * 1024 * 1024
+        if estimated > budget * 0.8:
+            raise ValueError(
+                f"video retention estimate {estimated / 1024**3:.2f} GiB exceeds 80% of local_max_gb"
+            )
+        if self._services is not None:
+            self._services.retention.sweep_once()
+            if bool(config.get("upload_enabled", True)) and not self._services.configure(config):
+                raise ValueError(self._services.last_error or "COS uploader is not ready")
+        if self._ledger is not None:
+            local_bytes = self._ledger.summary(card_id=self.card_id, instance_id=instance_id)["local_bytes"]
+            if local_bytes > budget * 0.95:
+                raise ValueError("local spool is above the 95% critical watermark")
 
     def _start_runtime(self, instance: RecordingInstance, config: dict[str, Any]) -> None:
         if self._ledger is None:
@@ -123,11 +164,33 @@ class VideoInspectorPlugin(InspectorPlugin):
             )
 
     def _runtime_stats(self, instance: RecordingInstance) -> dict[str, Any]:
-        stats = self._ledger.summary(instance_id=instance.instance_id) if self._ledger is not None else {}
+        stats = self._ledger.summary(card_id=self.card_id, instance_id=instance.instance_id) if self._ledger is not None else {}
         runtime = self._runtimes.get(instance.instance_id)
         if runtime is not None:
             stats.update(runtime.stats())
+        if self._services is not None:
+            stats.update(self._services.stats())
+            if not stats.get("last_error"):
+                stats["last_error"] = stats.get("upload_last_error") or stats.get("upload_service_error", "")
         return stats
+
+    def _test_upload(self) -> dict[str, Any]:
+        if self._services is None:
+            return super()._test_upload()
+        return self._services.test_upload()
+
+    def _handle_critical(self, instance_id: str, local_bytes: int, max_bytes: int) -> None:
+        with self._lock:
+            instance = self._instances.get(instance_id)
+            if instance is None or instance.state != "recording":
+                return
+            try:
+                self._stop_runtime(instance, for_shutdown=False)
+                instance.state = "paused_disk_full"
+                instance.resume_required = True
+                instance.last_error = f"local spool critical: {local_bytes} > {max_bytes} bytes"
+            except Exception as exc:
+                instance.last_error = f"failed to pause at disk critical watermark: {exc}"
 
     def _restore_desired_instances(self) -> None:
         assert self._ledger is not None
@@ -142,8 +205,11 @@ class VideoInspectorPlugin(InspectorPlugin):
             )
             if saved["auto_resume"]:
                 try:
+                    saved_config = dict(saved.get("config") or {})
+                    self._apply_config({"action": "config", "instance_id": instance.instance_id, **saved_config})
+                    self._validate_start_config(instance.instance_id)
                     instance.state = "recording"
-                    self._start_runtime(instance, dict(saved.get("config") or {}))
+                    self._start_runtime(instance, self._effective_config(instance.instance_id))
                 except Exception as exc:
                     instance.state = "idle"
                     instance.resume_required = True
@@ -155,8 +221,11 @@ class VideoInspectorPlugin(InspectorPlugin):
         if self._closed:
             return
         super().shutdown()
-        if self._ledger is not None and not self._runtimes:
+        services_stopped = True
+        if self._services is not None:
+            services_stopped = self._services.stop()
+        if self._ledger is not None and not self._runtimes and services_stopped:
             self._ledger.close()
-        elif self._runtimes:
-            log.error("leaving ledger open because video writer threads did not stop: %s", sorted(self._runtimes))
+        elif self._runtimes or not services_stopped:
+            log.error("leaving ledger open because video storage workers did not stop cleanly")
         self._closed = True

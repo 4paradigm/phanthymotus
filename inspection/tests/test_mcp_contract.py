@@ -72,6 +72,42 @@ class InspectionContractTest(unittest.TestCase):
                 "action": "start", "instance_id": "card-2", "input_topic": "/robot/mic/audio",
             })
 
+    def test_config_is_validated_atomically(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown config field"):
+            self.bundle.dispatch("audioinspector", {
+                "action": "config",
+                "instance_id": "card-3",
+                "cos_bucket": "must-not-stick-1250000000",
+                "unknown_field": True,
+            })
+        with self.assertRaisesRegex(ValueError, "cos_bucket"):
+            self.bundle.dispatch("audioinspector", {
+                "action": "start", "instance_id": "card-3", "input_topic": "/robot/mic/audio",
+            })
+        with self.assertRaisesRegex(ValueError, ">= 5"):
+            self.bundle.dispatch("audioinspector", {
+                "action": "config", "instance_id": "card-3", "segment_seconds": 1,
+            })
+
+    def test_recording_instance_rejects_effective_config_change(self) -> None:
+        config = {
+            "action": "config",
+            "cos_bucket": "test-1250000000",
+            "instance_id": "card-4",
+            "segment_seconds": 10,
+        }
+        self.bundle.dispatch("audioinspector", config)
+        self.bundle.dispatch("audioinspector", {
+            "action": "start", "instance_id": "card-4", "input_topic": "/robot/mic/audio",
+        })
+
+        same = self.bundle.dispatch("audioinspector", config)
+        self.assertEqual("configured", same["state"])
+        with self.assertRaisesRegex(ValueError, "stop instance"):
+            self.bundle.dispatch("audioinspector", {
+                "action": "config", "instance_id": "card-4", "segment_seconds": 11,
+            })
+
 
 class InspectionHTTPTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -98,6 +134,27 @@ class InspectionHTTPTest(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=2) as response:
             payload = json.load(response)
         self.assertEqual(2, len(payload["result"]["tools"]))
+
+
+class InspectionDeployContractTest(unittest.TestCase):
+    def test_jetson_devices_and_durable_directories_are_mounted(self) -> None:
+        service_path = INSPECTION_ROOT / "deploy" / "service.yml"
+        service = service_path.read_text(encoding="utf-8")
+
+        self.assertIn("privileged: true", service)
+        self.assertIn("- /dev:/dev", service)
+        self.assertIn("/opt/phanthy-motus/inspection-data:/opt/phanthy-motus/inspection-data", service)
+        self.assertIn("/opt/phanthy-motus/inspection-state:/opt/phanthy-motus/inspection-state", service)
+        self.assertIn("/run/secrets/phanthymotus:/run/secrets/phanthymotus:ro", service)
+
+    def test_image_installs_gstreamer_python_and_supports_jetson_ros_layout(self) -> None:
+        dockerfile = (INSPECTION_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn("python3-gst-1.0", dockerfile)
+        self.assertIn("gir1.2-gstreamer-1.0", dockerfile)
+        self.assertIn("gstreamer1.0-plugins-base-apps", dockerfile)
+        self.assertIn("/opt/ros/humble/install/setup.bash", dockerfile)
+        self.assertIn("/opt/ros/humble/setup.bash", dockerfile)
 
 
 if __name__ == "__main__":

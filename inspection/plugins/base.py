@@ -92,6 +92,7 @@ class InspectorPlugin:
         self._instance_config: dict[str, dict[str, Any]] = {}
         self._shared_config = self._defaults(_SHARED_PROPERTIES)
         self._instance_properties = copy.deepcopy(instance_properties)
+        self._instance_defaults = self._defaults(self._instance_properties)
         self._runtime_mode = runtime_mode
         self._storage_ready = storage_ready
         self._tool = self._build_tool()
@@ -135,19 +136,68 @@ class InspectorPlugin:
         return [copy.deepcopy(self._tool)]
 
     def _effective_config(self, instance_id: str) -> dict[str, Any]:
-        return {**self._shared_config, **self._instance_config.get(instance_id, {})}
+        return {
+            **self._shared_config,
+            **self._instance_defaults,
+            **self._instance_config.get(instance_id, {}),
+        }
+
+    @staticmethod
+    def _validate_config_value(key: str, value: Any, spec: dict[str, Any]) -> None:
+        expected = spec.get("type")
+        valid_type = {
+            "string": isinstance(value, str),
+            "boolean": isinstance(value, bool),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        }.get(str(expected), True)
+        if not valid_type:
+            raise ValueError(f"config field {key} must be {expected}")
+        if "enum" in spec and value not in spec["enum"]:
+            raise ValueError(f"config field {key} must be one of {spec['enum']}")
+        if "minimum" in spec and value < spec["minimum"]:
+            raise ValueError(f"config field {key} must be >= {spec['minimum']}")
+        if "maximum" in spec and value > spec["maximum"]:
+            raise ValueError(f"config field {key} must be <= {spec['maximum']}")
 
     def _apply_config(self, args: dict[str, Any]) -> dict[str, Any]:
         instance_id = str(args.get("instance_id", ""))
-        applied: list[str] = []
+        staged: list[tuple[str, Any, dict[str, Any]]] = []
+        properties = self._tool["configSchema"]["properties"]
+        for key, value in args.items():
+            if key in {"action", "instance_id"}:
+                continue
+            spec = properties.get(key)
+            if not spec:
+                raise ValueError(f"unknown config field: {key}")
+            if spec.get("scope") == "instance" and not instance_id:
+                raise ValueError(f"instance_id is required for instance config field: {key}")
+            self._validate_config_value(key, value, spec)
+            staged.append((key, value, spec))
+
         with self._lock:
-            for key, value in args.items():
-                if key in {"action", "instance_id"}:
-                    continue
-                spec = self._tool["configSchema"]["properties"].get(key)
-                if not spec:
-                    raise ValueError(f"unknown config field: {key}")
-                target = self._instance_config.setdefault(instance_id, {}) if spec.get("scope") == "instance" else self._shared_config
+            changed_shared = any(
+                spec.get("scope") != "instance" and self._shared_config.get(key) != value
+                for key, value, spec in staged
+            )
+            changed_instance = any(
+                spec.get("scope") == "instance"
+                and self._effective_config(instance_id).get(key) != value
+                for key, value, spec in staged
+            )
+            if changed_shared and any(item.state == "recording" for item in self._instances.values()):
+                raise ValueError("stop all recording instances before changing shared config")
+            active = self._instances.get(instance_id)
+            if changed_instance and active is not None and active.state == "recording":
+                raise ValueError(f"stop instance {instance_id} before changing instance config")
+
+            applied: list[str] = []
+            for key, value, spec in staged:
+                target = (
+                    self._instance_config.setdefault(instance_id, {})
+                    if spec.get("scope") == "instance"
+                    else self._shared_config
+                )
                 target[key] = value
                 applied.append(key)
         return {
@@ -208,6 +258,14 @@ class InspectorPlugin:
 
     def _stop_runtime(self, instance: RecordingInstance, *, for_shutdown: bool) -> None:
         return None
+
+    def _test_upload(self) -> dict[str, Any]:
+        return {
+            "state": "unsupported",
+            "verified": False,
+            "runtime_mode": self._runtime_mode,
+            "message": "COS backend is not available in this runtime mode.",
+        }
 
     def dispatch(self, name: str, args: dict[str, Any]) -> dict[str, Any] | None:
         if name != self.card_id:
@@ -293,12 +351,7 @@ class InspectorPlugin:
                 return self._instance_info(instance_id)
 
         if action == "testupload":
-            return {
-                "state": "unsupported",
-                "verified": False,
-                "runtime_mode": "gate1-contract-only",
-                "message": "COS backend is intentionally disabled until Gate 4.",
-            }
+            return self._test_upload()
 
         raise ValueError(f"unsupported action: {action}")
 
