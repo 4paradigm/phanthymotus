@@ -174,7 +174,14 @@ class RapidOCRAdapter:
             }
         )
         cfg["Global"]["use_cls"] = use_angle_cls
-        cfg["Global"]["max_side_len"] = max_side_len
+        # Engine-level cap must NOT shrink tiles: the single-pass path already
+        # resizes to max_side_len before reaching the engine, while the tiled
+        # strategy feeds full tile_size crops through the same engine.
+        # (rapidocr crashes on max_side_len <= 0, so fall back to its default.)
+        engine_global_cap = max_side_len if max_side_len > 0 else 2000
+        if strategy_config.enabled:
+            engine_global_cap = max(engine_global_cap, strategy_config.tile_size)
+        cfg["Global"]["max_side_len"] = engine_global_cap
 
         engine_cfg = cfg.setdefault("EngineConfig", {}).setdefault(
             "onnxruntime", {}
