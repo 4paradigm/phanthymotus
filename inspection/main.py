@@ -36,7 +36,7 @@ class InspectionBundle:
         if plugins.get("audioinspector", {}).get("enabled", True):
             self._plugins.append(AudioInspectorPlugin(plugins.get("audioinspector", {}), executor))
         if plugins.get("videoinspector", {}).get("enabled", True):
-            self._plugins.append(VideoInspectorPlugin())
+            self._plugins.append(VideoInspectorPlugin(plugins.get("videoinspector", {}), executor))
 
     def get_all_tools(self) -> list[dict]:
         tools: list[dict] = []
@@ -168,8 +168,14 @@ def main() -> None:
     mcp_port = int(config.get("mcp_port", 15671))
     server_name = str(config.get("server_name", "inspection-bundle"))
     category = str(config.get("category", "inspection"))
-    audio_config = config.get("plugins", {}).get("audioinspector", {})
-    ros_enabled = audio_config.get("enabled", True) and audio_config.get("runtime_mode") == "ros2"
+    plugins_config = config.get("plugins", {})
+    audio_config = plugins_config.get("audioinspector", {})
+    video_config = plugins_config.get("videoinspector", {})
+    ros_enabled = (
+        audio_config.get("enabled", True) and audio_config.get("runtime_mode") == "ros2"
+    ) or (
+        video_config.get("enabled", True) and video_config.get("runtime_mode") == "ros2-gstreamer"
+    )
     executor = None
     rclpy_module = None
     if ros_enabled:
