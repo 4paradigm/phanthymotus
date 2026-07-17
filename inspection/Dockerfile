@@ -10,4 +10,4 @@ RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirement
 COPY . /work/
 
 EXPOSE 15671
-CMD ["python3", "/work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]

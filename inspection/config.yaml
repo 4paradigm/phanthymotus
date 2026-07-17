@@ -5,5 +5,8 @@ category: inspection
 plugins:
   audioinspector:
     enabled: true
+    runtime_mode: ros2
+    data_root: /opt/phanthy-motus/inspection-data
+    state_root: /opt/phanthy-motus/inspection-state
   videoinspector:
     enabled: true

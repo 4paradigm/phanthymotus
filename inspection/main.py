@@ -30,11 +30,11 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class InspectionBundle:
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, executor=None) -> None:
         plugins = config.get("plugins", {})
         self._plugins = []
         if plugins.get("audioinspector", {}).get("enabled", True):
-            self._plugins.append(AudioInspectorPlugin())
+            self._plugins.append(AudioInspectorPlugin(plugins.get("audioinspector", {}), executor))
         if plugins.get("videoinspector", {}).get("enabled", True):
             self._plugins.append(VideoInspectorPlugin())
 
@@ -54,6 +54,9 @@ class InspectionBundle:
     def shutdown(self) -> None:
         for plugin in self._plugins:
             plugin.shutdown()
+
+    def runtime_modes(self) -> list[str]:
+        return sorted({str(plugin._runtime_mode) for plugin in self._plugins})
 
 
 def load_config() -> dict:
@@ -80,7 +83,7 @@ def make_handler(bundle: InspectionBundle, server_name: str):
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                self._send_json(200, {"ok": True, "name": server_name, "mode": "gate1-contract-only"})
+                self._send_json(200, {"ok": True, "name": server_name, "runtime_modes": bundle.runtime_modes()})
                 return
             self._send_json(404, {"error": "not found"})
 
@@ -165,7 +168,21 @@ def main() -> None:
     mcp_port = int(config.get("mcp_port", 15671))
     server_name = str(config.get("server_name", "inspection-bundle"))
     category = str(config.get("category", "inspection"))
-    bundle = InspectionBundle(config)
+    audio_config = config.get("plugins", {}).get("audioinspector", {})
+    ros_enabled = audio_config.get("enabled", True) and audio_config.get("runtime_mode") == "ros2"
+    executor = None
+    rclpy_module = None
+    if ros_enabled:
+        import rclpy
+        import rclpy.executors
+
+        rclpy.init()
+        rclpy_module = rclpy
+        executor = rclpy.executors.MultiThreadedExecutor()
+
+    bundle = InspectionBundle(config, executor)
+    if executor is not None:
+        threading.Thread(target=executor.spin, daemon=True, name="inspection-ros-spin").start()
     server = ThreadingHTTPServer(("", mcp_port), make_handler(bundle, server_name))
 
     def shutdown(signum, _frame) -> None:
@@ -182,6 +199,10 @@ def main() -> None:
     finally:
         bundle.shutdown()
         server.server_close()
+        if executor is not None:
+            executor.shutdown()
+        if rclpy_module is not None:
+            rclpy_module.shutdown()
 
 
 if __name__ == "__main__":

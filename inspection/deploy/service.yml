@@ -11,7 +11,7 @@ inspection:
     - AGENT_CORE_URL=https://localhost:15678
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-  stop_grace_period: 20s
+  stop_grace_period: 70s
   restart: unless-stopped
   logging:
     driver: local

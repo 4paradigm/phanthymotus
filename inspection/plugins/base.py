@@ -12,7 +12,7 @@ from typing import Any
 _SHARED_PROPERTIES = {
     "storage_backend": {
         "type": "string", "enum": ["cos"], "default": "cos", "scope": "shared",
-        "description": "Storage backend. Gate 1 exposes the contract only and does not upload.",
+        "description": "Storage backend. Local durability is independent from asynchronous upload.",
     },
     "credential_profile": {
         "type": "string", "default": "default", "scope": "shared",
@@ -57,22 +57,19 @@ _SHARED_PROPERTIES = {
 
 
 @dataclass
-class FakeRecordingInstance:
+class RecordingInstance:
     instance_id: str
     input_topic: str
     session_id: str
     state: str = "recording"
     finalized_segments: int = 0
     started_monotonic: float = 0.0
+    resume_required: bool = False
+    last_error: str = ""
 
 
 class InspectorPlugin:
-    """Gate 1 Inspector contract with an explicit non-persistent fake writer.
-
-    The lifecycle and schemas are production-facing. File writers, the durable
-    ledger and COS workers intentionally arrive in later gates, so this class
-    never pretends that bytes were saved or uploaded.
-    """
+    """Shared Inspector card contract with overridable lifecycle hooks."""
 
     def __init__(
         self,
@@ -82,6 +79,8 @@ class InspectorPlugin:
         input_format: str,
         input_description: str,
         instance_properties: dict[str, dict[str, Any]],
+        runtime_mode: str = "gate1-contract-only",
+        storage_ready: bool = False,
     ) -> None:
         self.PREFIX = card_id
         self.card_id = card_id
@@ -89,10 +88,12 @@ class InspectorPlugin:
         self.input_format = input_format
         self.input_description = input_description
         self._lock = threading.RLock()
-        self._instances: dict[str, FakeRecordingInstance] = {}
+        self._instances: dict[str, RecordingInstance] = {}
         self._instance_config: dict[str, dict[str, Any]] = {}
         self._shared_config = self._defaults(_SHARED_PROPERTIES)
         self._instance_properties = copy.deepcopy(instance_properties)
+        self._runtime_mode = runtime_mode
+        self._storage_ready = storage_ready
         self._tool = self._build_tool()
 
     @staticmethod
@@ -153,7 +154,7 @@ class InspectorPlugin:
             "state": "configured",
             "instance_id": instance_id or None,
             "applied": sorted(applied),
-            "runtime_mode": "gate1-contract-only",
+            "runtime_mode": self._runtime_mode,
         }
 
     def _validate_start_config(self, instance_id: str) -> None:
@@ -168,6 +169,7 @@ class InspectorPlugin:
         instance = self._instances.get(instance_id)
         topic = instance.input_topic if instance else input_topic
         state = instance.state if instance else "idle"
+        runtime = self._runtime_stats(instance) if instance else {}
         return {
             "name": self.display_name,
             "card_id": self.card_id,
@@ -178,16 +180,34 @@ class InspectorPlugin:
             "topic_in": [{"topic": topic, "format": self.input_format, "desc": self.input_description}] if topic else [],
             "topic_out": [],
             "recording": state == "recording",
-            "local_bytes": 0,
-            "upload_backlog": 0,
-            "uploaded_verified": 0,
-            "dropped": 0,
-            "finalized_segments": instance.finalized_segments if instance else 0,
-            "resume_required": False,
-            "runtime_mode": "gate1-contract-only",
-            "storage_ready": False,
-            "desc": "Contract-only fake writer; no local files or COS objects are produced in Gate 1.",
+            "local_bytes": int(runtime.get("local_bytes", 0)),
+            "upload_backlog": int(runtime.get("upload_backlog", 0)),
+            "uploaded_verified": int(runtime.get("uploaded_verified", 0)),
+            "dropped": int(runtime.get("dropped", 0)),
+            "finalized_segments": int(runtime.get("finalized_segments", instance.finalized_segments if instance else 0)),
+            "resume_required": bool(instance.resume_required) if instance else False,
+            "last_error": runtime.get("last_error", instance.last_error if instance else ""),
+            "runtime_mode": self._runtime_mode,
+            "storage_ready": self._storage_ready,
+            "desc": (
+                "Durable local segment writer is active; COS upload may still be pending."
+                if self._storage_ready else
+                "Contract-only fake writer; no local files or COS objects are produced in Gate 1."
+            ),
         }
+
+    def _runtime_stats(self, instance: RecordingInstance) -> dict[str, Any]:
+        return {}
+
+    def _start_runtime(self, instance: RecordingInstance, config: dict[str, Any]) -> None:
+        return None
+
+    def _flush_runtime(self, instance: RecordingInstance) -> dict[str, Any] | None:
+        instance.finalized_segments += 1
+        return None
+
+    def _stop_runtime(self, instance: RecordingInstance, *, for_shutdown: bool) -> None:
+        return None
 
     def dispatch(self, name: str, args: dict[str, Any]) -> dict[str, Any] | None:
         if name != self.card_id:
@@ -212,8 +232,8 @@ class InspectorPlugin:
                     "recording_instances": running,
                     "topic_in": [],
                     "topic_out": [],
-                    "runtime_mode": "gate1-contract-only",
-                    "storage_ready": False,
+                    "runtime_mode": self._runtime_mode,
+                    "storage_ready": self._storage_ready,
                 }
 
         if action == "start":
@@ -234,12 +254,14 @@ class InspectorPlugin:
                             f"instance {instance_id} already records {existing.input_topic}; stop it before changing input_topic"
                         )
                     return self._instance_info(instance_id)
-                self._instances[instance_id] = FakeRecordingInstance(
+                instance = RecordingInstance(
                     instance_id=instance_id,
                     input_topic=input_topic,
                     session_id=f"session-{uuid.uuid4().hex}",
                     started_monotonic=time.monotonic(),
                 )
+                self._start_runtime(instance, self._effective_config(instance_id))
+                self._instances[instance_id] = instance
                 return self._instance_info(instance_id)
 
         if action == "flush":
@@ -249,13 +271,13 @@ class InspectorPlugin:
                 instance = self._instances.get(instance_id)
                 if not instance or instance.state != "recording":
                     raise ValueError(f"instance {instance_id} is not recording")
-                instance.finalized_segments += 1
+                finalized = self._flush_runtime(instance)
                 return {
                     "state": "recording",
                     "instance_id": instance_id,
-                    "finalized_segment": None,
-                    "finalized_segments": instance.finalized_segments,
-                    "runtime_mode": "gate1-contract-only",
+                    "finalized_segment": finalized,
+                    "finalized_segments": self._instance_info(instance_id)["finalized_segments"],
+                    "runtime_mode": self._runtime_mode,
                 }
 
         if action == "stop":
@@ -265,7 +287,9 @@ class InspectorPlugin:
                 instance = self._instances.get(instance_id)
                 if not instance:
                     return self._instance_info(instance_id, str(args.get("input_topic", "")))
+                self._stop_runtime(instance, for_shutdown=False)
                 instance.state = "idle"
+                instance.resume_required = False
                 return self._instance_info(instance_id)
 
         if action == "testupload":
@@ -281,4 +305,9 @@ class InspectorPlugin:
     def shutdown(self) -> None:
         with self._lock:
             for instance in self._instances.values():
+                if instance.state == "recording":
+                    try:
+                        self._stop_runtime(instance, for_shutdown=True)
+                    except Exception as exc:
+                        instance.last_error = str(exc)
                 instance.state = "idle"
