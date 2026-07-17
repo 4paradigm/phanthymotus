@@ -7,15 +7,22 @@ inspection:
   privileged: true
   volumes:
     - /dev:/dev
+    - /usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro
+    - /usr/lib/aarch64-linux-gnu/tegra-egl:/usr/lib/aarch64-linux-gnu/tegra-egl:ro
+    - /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvjpeg.so:/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvjpeg.so:ro
+    - /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvidconv.so:/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvidconv.so:ro
+    - /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvideo4linux2.so:/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvideo4linux2.so:ro
+    - /lib/aarch64-linux-gnu/libgstnvexifmeta.so:/lib/aarch64-linux-gnu/libgstnvexifmeta.so:ro
     - /opt/phanthy-motus/inspection-data:/opt/phanthy-motus/inspection-data
     - /opt/phanthy-motus/inspection-state:/opt/phanthy-motus/inspection-state
-    - /run/secrets/phanthymotus:/run/secrets/phanthymotus:ro
+    - /opt/phanthy-motus/secrets/phanthymotus:/run/secrets/phanthymotus:ro
   environment:
     - AGENT_CORE_URL=https://localhost:15678
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra-egl
   stop_grace_period: 70s
-  restart: unless-stopped
+  restart: "no"
   logging:
     driver: local
     options:

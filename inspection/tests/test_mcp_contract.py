@@ -143,9 +143,38 @@ class InspectionDeployContractTest(unittest.TestCase):
 
         self.assertIn("privileged: true", service)
         self.assertIn("- /dev:/dev", service)
+        self.assertIn(
+            "/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro",
+            service,
+        )
+        self.assertIn(
+            "/usr/lib/aarch64-linux-gnu/tegra-egl:"
+            "/usr/lib/aarch64-linux-gnu/tegra-egl:ro",
+            service,
+        )
+        for plugin in ("libgstnvjpeg.so", "libgstnvvidconv.so", "libgstnvvideo4linux2.so"):
+            self.assertIn(
+                f"/usr/lib/aarch64-linux-gnu/gstreamer-1.0/{plugin}:"
+                f"/usr/lib/aarch64-linux-gnu/gstreamer-1.0/{plugin}:ro",
+                service,
+            )
+        self.assertIn(
+            "/lib/aarch64-linux-gnu/libgstnvexifmeta.so:"
+            "/lib/aarch64-linux-gnu/libgstnvexifmeta.so:ro",
+            service,
+        )
         self.assertIn("/opt/phanthy-motus/inspection-data:/opt/phanthy-motus/inspection-data", service)
         self.assertIn("/opt/phanthy-motus/inspection-state:/opt/phanthy-motus/inspection-state", service)
-        self.assertIn("/run/secrets/phanthymotus:/run/secrets/phanthymotus:ro", service)
+        self.assertIn(
+            "/opt/phanthy-motus/secrets/phanthymotus:/run/secrets/phanthymotus:ro",
+            service,
+        )
+        self.assertIn(
+            "LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu/tegra:"
+            "/usr/lib/aarch64-linux-gnu/tegra-egl",
+            service,
+        )
+        self.assertIn('restart: "no"', service)
 
     def test_image_installs_gstreamer_python_and_supports_jetson_ros_layout(self) -> None:
         dockerfile = (INSPECTION_ROOT / "Dockerfile").read_text(encoding="utf-8")
