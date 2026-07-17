@@ -7,13 +7,14 @@ log() { echo "[entrypoint] $*" >&2; }
 
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1
 
-# TTS benchmark evaluation uses ROS domain 0. Judgeflow may still pass
-# -e ROS_DOMAIN_ID=42 from an older template; override here before rclpy init.
-unset RMW_IMPLEMENTATION FASTDDS_BUILTIN_TRANSPORTS
-export ROS_DOMAIN_ID=0
+# TTS benchmark: evaluation containers use ROS_DOMAIN_ID=42 and
+# FASTDDS_BUILTIN_TRANSPORTS=DEFAULT (see robot-tts-evaluation docker run).
+export ROS_DOMAIN_ID=42
+export FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+unset RMW_IMPLEMENTATION
 
 log "starting (LD_PRELOAD=${LD_PRELOAD})"
-log "ROS_DOMAIN_ID=${ROS_DOMAIN_ID} (forced for TTS benchmark)"
+log "ROS_DOMAIN_ID=${ROS_DOMAIN_ID} FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS}"
 
 if [ "${TTS_REQUIRE_CUDA:-1}" = "1" ]; then
     log "checking CUDA via torch..."

@@ -36,7 +36,10 @@ if [ -d /models ]; then
     RUN_ARGS+=(-v /models:/models)
 fi
 
-# ROS_DOMAIN_ID: leave unset (default 0) to match robot-tts-evaluation containers.
+RUN_ARGS+=(
+    -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
+    -e FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-DEFAULT}"
+)
 
 RUN_ARGS+=("${IMAGE}")
 
