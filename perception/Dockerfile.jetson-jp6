@@ -75,9 +75,10 @@ ENV YOLO_CONFIG_DIR=/work
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
 # ── ONNX Runtime GPU (CUDA 12.6 / cp310, jetson-ai-lab index) ─────
-# Wheel mirrored from https://pypi.jetson-ai-lab.io/jp6/cu126 (+simple/onnxruntime-gpu).
-# sha256 is pinned; override ORT_WHEEL_URL to a LAN mirror for fast builds.
-ARG ORT_WHEEL_URL=https://pypi.jetson-ai-lab.io/jp6/cu126/+f/d98/0b934b9a29c1a/onnxruntime_gpu-1.24.0-cp310-cp310-linux_aarch64.whl
+# Wheel mirrored to juicefs; sha256 verified identical to the upstream original
+# (https://pypi.jetson-ai-lab.io/jp6/cu126 onnxruntime-gpu 1.24.0).
+# sha256 is pinned; override ORT_WHEEL_URL to change source.
+ARG ORT_WHEEL_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ort124.whl
 ARG ORT_WHEEL_SHA256=d980b934b9a29c1a9d6f39751edd7662b69fadd75556a10ff363773a58ce0950
 RUN wget -q "${ORT_WHEEL_URL}" -O /tmp/onnxruntime_gpu-1.24.0-cp310-cp310-linux_aarch64.whl && \
     echo "${ORT_WHEEL_SHA256}  /tmp/onnxruntime_gpu-1.24.0-cp310-cp310-linux_aarch64.whl" | sha256sum -c - && \
