@@ -91,15 +91,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
-# ── RapidOCR (CUDA ONNX Runtime; preserve Jetson's system cv2) ────
+# ── RapidOCR (CPU ONNX Runtime; preserve Jetson's system cv2) ────
+# NOTE: on the JP6 host this jp511-based image cannot initialise CUDA
+# (host r36 driver libs need glibc>=2.34, this base has 2.31), so OCR
+# runs on CPU here. Use perception/Dockerfile.jetson-jp6 for GPU.
+# onnxruntime is pinned to 1.17.3: the newest cp38/aarch64 CPU wheel
+# (1.19.x) needs numpy>=1.26 which requires Python>=3.9.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
       numpy==1.23.5 pyclipper==1.3.0.post3 six Shapely==2.0.5 Pillow \
-      omegaconf==2.3.0 colorlog && \
+      omegaconf==2.3.0 colorlog onnxruntime==1.17.3 && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
       rapidocr==3.9.1 && \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete && \
-    python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert ort.__version__ == '1.20.0', ort.__version__; assert 'CUDAExecutionProvider' in providers, providers"
+    python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert ort.__version__ == '1.17.3', ort.__version__; assert 'CPUExecutionProvider' in providers, providers"
 
 # ── OCR model (kept outside Git) ──────────────────────────────────
 ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-tiny
@@ -111,6 +116,11 @@ RUN python3 /tmp/ocr_model_downloader.py \
     python3 /tmp/ocr_model_downloader.py \
     --base-url "${OCR_MODEL_FALLBACK_BASE_URL}" \
     --output-dir /models/ocr/ppocrv6-tiny
+
+# PP-OCRv6 det/rec are exported with ONNX IR v10; ORT 1.17.3 supports at
+# most IR v9. The models only use opset 11 ops, so patching the IR byte
+# back to 9 is lossless (verified on Orin).
+RUN python3 -c "exec('from pathlib import Path\nfor name in (\"det.onnx\", \"rec.onnx\", \"cls.onnx\"):\n    p = Path(\"/models/ocr/ppocrv6-tiny\") / name\n    b = bytearray(p.read_bytes())\n    if b[0] == 0x08 and b[1] > 9:\n        b[1] = 9\n        p.write_bytes(bytes(b))\n        print(name + \": IR patched to 9\")')"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
