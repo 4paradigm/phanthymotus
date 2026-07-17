@@ -54,11 +54,12 @@ plugins:
     model: ""
     model_dir: /models/ocr/ppocrv6-tiny
     language: zh
-    device: cuda
+    device: cpu                # 纯 CPU：工作集 350MB(CUDA 1011MB)，单帧 2.95s；要速度改回 cuda(0.83s)
     device_id: 0
     gpu_mem_mb: 512
     # GPU 占用控制（实测 On Orin, tegrastats 均值）：
     #   back-to-back(1600+cls) ~43% → side=960/cls=off + 5s 限帧 ≈ 8%
+    #   CPU 模式下 GPU 占用恒为 0，min_interval_ms 仅控制刷新频率
     use_angle_cls: false       # 正立文档场景够用；旋转文字需改回 true
     num_threads: 1
     max_side_len: 960          # 68 items 保持不变，640 会掉精度(54)
