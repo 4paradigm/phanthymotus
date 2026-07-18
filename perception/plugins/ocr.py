@@ -16,6 +16,20 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from io import BytesIO
+
+
+def _resource_snapshot() -> str:
+    """轻量资源快照：RSS + 线程数（用于定位服务慢性死亡原因）"""
+    rss_mb = -1.0
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS"):
+                    rss_mb = int(line.split()[1]) / 1024.0
+                    break
+    except OSError:
+        pass
+    return f"rss={rss_mb:.0f}MB threads={threading.active_count()}"
 from typing import Optional
 
 import rclpy
@@ -530,7 +544,7 @@ class _OCRNode(Node):
         self._worker_thread.start()
         self.state = "running"
 
-        log.info(f"[ocr] started: {self._input_topic} → {self._output_topic}")
+        log.info(f"[ocr] started: {self._input_topic} → {self._output_topic} | {_resource_snapshot()}")
         return self._status_dict()
 
     def stop(self) -> dict:
@@ -548,6 +562,7 @@ class _OCRNode(Node):
             self._worker_thread.join(timeout=3)
 
         self.state = "idle"
+        log.info(f"[ocr] stopped: {self._input_topic} | {_resource_snapshot()}")
         return {"state": "idle"}
 
     @property
@@ -606,6 +621,10 @@ class _OCRNode(Node):
                 if remaining > 0:
                     self._stop_event.wait(remaining)
 
+            # 资源监控：每 20 帧打一次快照（泄漏/线程堆积排查用）
+            if self._frame_count % 20 == 0:
+                log.info(f"[ocr] monitor | {_resource_snapshot()}")
+
     def _status_dict(self) -> dict:
         return {
             "state": self.state,
@@ -662,6 +681,11 @@ class OCRPlugin:
             self._retired_nodes.append(node)
         else:
             node.destroy_node()
+        log.info(
+            f"[ocr] node removed: {node_key} | nodes={len(self._nodes)} "
+            f"retired={len(self._retired_nodes)} "
+            f"instance_adapters={len(self._instance_adapters)} | {_resource_snapshot()}"
+        )
         return result
 
     def _adapter_for_instance(self, instance_id: str) -> OCRAdapter | None:
@@ -677,6 +701,10 @@ class OCRPlugin:
 
         adapter = _build_ocr_adapter(cfg)
         self._instance_adapters[instance_id] = (signature, adapter)
+        log.warning(
+            f"[ocr] NEW adapter built for instance={instance_id} "
+            f"(cache size={len(self._instance_adapters)}) | {_resource_snapshot()}"
+        )
         return adapter
 
     def dispatch(self, name: str, args: dict) -> dict | None:
