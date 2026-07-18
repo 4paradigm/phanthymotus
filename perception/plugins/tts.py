@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms @ 16kHz 16-bit mono
-MAX_SEGMENT_CHARS = 120
+MAX_SEGMENT_CHARS = 60
 # Local synthesis buffer. 600 frames is about 60 seconds / 1.9 MB of PCM.
 # It lets the producer synthesize the next sentence while the current one plays.
 SYNTH_QUEUE_FRAMES = 600
@@ -221,7 +221,8 @@ class TTSAdapter(ABC):
     def _synthesize_segment(self, text: str) -> bytes: ...
 
     def split_text(self, text: str) -> list[str]:
-        return _split_text_for_tts(text)
+        max_chars = getattr(self, "max_segment_chars", MAX_SEGMENT_CHARS)
+        return _split_text_for_tts(text, max_chars)
 
     def synthesize(self, text: str) -> bytes:
         """Synthesize all segments and return one concatenated PCM stream."""
@@ -313,6 +314,7 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
         self._sid = speaker_id
         self._speed = speed
         self._model_sr = self._tts.sample_rate
+        self.max_segment_chars = MAX_SEGMENT_CHARS
         mode = "espeak" if use_espeak else "lexicon"
         mem_after = _process_rss_mb()
         log.info(
@@ -390,7 +392,7 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     speed = float(cfg.get("speed", 1.0))
     backend = cfg.get("backend", "vits")
     if backend == "vits":
-        return SherpaOnnxVitsTTSAdapter(
+        adapter = SherpaOnnxVitsTTSAdapter(
             model_dir,
             speaker_id,
             speed,
@@ -398,18 +400,28 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
             hw_provider=cfg.get("hw_provider", "cpu"),
             num_threads=int(cfg.get("num_threads", 2)),
         )
-    return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
+    else:
+        adapter = SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
+    adapter.max_segment_chars = int(cfg.get("max_segment_chars", MAX_SEGMENT_CHARS))
+    return adapter
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
 
 class _TTSNode(Node):
-    def __init__(self, input_topic: Optional[str], adapter: Optional[TTSAdapter], node_suffix: str = ''):
+    def __init__(
+        self,
+        input_topic: Optional[str],
+        adapter: Optional[TTSAdapter],
+        node_suffix: str = '',
+        realtime_pacing: bool = False,
+    ):
         node_name = f"tts_{node_suffix}" if node_suffix else "tts"
         super().__init__(node_name)
         self._input_topic  = input_topic or ''
         self._output_topic = f"{input_topic}/tts" if input_topic else '/perception/tts'
         self._adapter      = adapter
+        self._realtime_pacing = realtime_pacing
         self.state         = "idle"
         self._text_queue   = queue.Queue()
         self._worker_thread: Optional[threading.Thread] = None
@@ -447,6 +459,22 @@ class _TTSNode(Node):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
         self._text_queue.put(text)
+
+    def _publish_frame(self, frame: bytes, frames_sent: int, t0: Optional[float], frame_duration: float):
+        from audio_msgs.msg import AudioChunk
+        import time as _time
+
+        if self._realtime_pacing and t0 is not None:
+            target = t0 + frames_sent * frame_duration
+            now = _time.monotonic()
+            if now < target:
+                _time.sleep(target - now)
+        msg = AudioChunk()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.format = "audio/pcm-16k"
+        msg.data = list(frame)
+        self._pub.publish(msg)
+        return frames_sent + 1
 
     def _text_cb(self, msg: String):
         if self.state != "running": return
@@ -547,52 +575,39 @@ class _TTSNode(Node):
                         if t0 is None:
                             prebuf.append(frame)
                             if len(prebuf) >= PREBUF_FRAMES:
-                                # Flush pre-buffer and start real-time clock
-                                t0 = _time.monotonic()
+                                t0 = _time.monotonic() if self._realtime_pacing else 0.0
                                 for pf in prebuf:
-                                    msg = AudioChunk()
-                                    msg.header.stamp = self.get_clock().now().to_msg()
-                                    msg.format = "audio/pcm-16k"
-                                    msg.data   = list(pf)
-                                    self._pub.publish(msg)
-                                    frames_sent += 1
+                                    frames_sent = self._publish_frame(
+                                        pf, frames_sent, t0, FRAME_DURATION
+                                    )
                                 prebuf = []
                             continue
 
-                        # Real-time pacing
-                        target = t0 + frames_sent * FRAME_DURATION
-                        now = _time.monotonic()
-                        if now < target:
-                            _time.sleep(target - now)
-                        msg = AudioChunk()
-                        msg.header.stamp = self.get_clock().now().to_msg()
-                        msg.format = "audio/pcm-16k"
-                        msg.data   = list(frame)
-                        self._pub.publish(msg)
-                        frames_sent += 1
+                        frames_sent = self._publish_frame(
+                            frame, frames_sent, t0, FRAME_DURATION
+                        )
 
                 # Flush any remaining pre-buffer (short utterances < PREBUF_FRAMES)
                 if prebuf and not self._stop_event.is_set():
-                    t0 = _time.monotonic()
+                    if t0 is None:
+                        t0 = _time.monotonic() if self._realtime_pacing else 0.0
                     for pf in prebuf:
-                        msg = AudioChunk()
-                        msg.header.stamp = self.get_clock().now().to_msg()
-                        msg.format = "audio/pcm-16k"
-                        msg.data   = list(pf)
-                        self._pub.publish(msg)
-                        frames_sent += 1
+                        frames_sent = self._publish_frame(
+                            pf, frames_sent, t0, FRAME_DURATION
+                        )
 
                 # flush remainder
                 if buf and not self._stop_event.is_set():
-                    if t0 is not None:
+                    if self._realtime_pacing and t0 is not None:
                         target = t0 + frames_sent * FRAME_DURATION
                         now = _time.monotonic()
                         if now < target:
                             _time.sleep(target - now)
+                    from audio_msgs.msg import AudioChunk
                     msg = AudioChunk()
                     msg.header.stamp = self.get_clock().now().to_msg()
                     msg.format = "audio/pcm-16k"
-                    msg.data   = list(buf)
+                    msg.data = list(buf)
                     self._pub.publish(msg)
                     frames_sent += 1
 
@@ -639,13 +654,24 @@ def _warmup_tts_adapter(adapter: TTSAdapter, text: str = "。") -> None:
     log.info(f"[tts] warmup done in {elapsed:.2f}s ({len(pcm)} bytes)")
 
 
-def _start_warmup_background(adapter: TTSAdapter, text: str = "。") -> None:
-    """Warm up in a background thread so MCP can become ready first."""
+def _run_tts_warmup(adapter: TTSAdapter, plugin_cfg: dict) -> None:
+    """Warm up ORT/CUDA before the first speak request."""
+    if not plugin_cfg.get("warmup", True):
+        return
+    text = plugin_cfg.get(
+        "warmup_text",
+        "你好，欢迎使用语音合成服务，这是一段预热测试文本。",
+    )
+    try:
+        _warmup_tts_adapter(adapter, text)
+    except Exception as e:
+        log.warning(f"[tts] warmup failed (non-fatal): {e}", exc_info=True)
+
+
+def _start_warmup_background(adapter: TTSAdapter, plugin_cfg: dict) -> None:
+    """Optional async warmup (warmup_async=true)."""
     def _run() -> None:
-        try:
-            _warmup_tts_adapter(adapter, text)
-        except Exception as e:
-            log.warning(f"[tts] warmup failed (non-fatal): {e}", exc_info=True)
+        _run_tts_warmup(adapter, plugin_cfg)
 
     threading.Thread(target=_run, daemon=True, name="tts-warmup").start()
 
@@ -659,19 +685,28 @@ class TTSPlugin:
         self._cfg      = plugin_cfg
         self._loading  = False
         self._load_error = None
+        self._realtime_pacing = bool(plugin_cfg.get("realtime_pacing", False))
         try:
             self._adapter  = _build_tts_adapter(plugin_cfg)
         except Exception as e:
             log.error(f"[tts] failed to load model: {e}", exc_info=True)
             self._adapter = None
             self._load_error = str(e)
-        if self._adapter and plugin_cfg.get("warmup", True):
-            _start_warmup_background(self._adapter, plugin_cfg.get("warmup_text", "。"))
+        if self._adapter:
+            if plugin_cfg.get("warmup_async", False):
+                _start_warmup_background(self._adapter, plugin_cfg)
+            else:
+                _run_tts_warmup(self._adapter, plugin_cfg)
         self._nodes: dict[str, _TTSNode] = {}
         self._instance_configs: dict[str, dict] = {}
         self._executor = executor
-        log.info(f"[tts] plugin init: sherpa-onnx VITS, "
-                 f"speaker_id={plugin_cfg.get('speaker_id', 0)}, speed={plugin_cfg.get('speed', 1.0)}")
+        log.info(
+            f"[tts] plugin init: sherpa-onnx VITS, "
+            f"speaker_id={plugin_cfg.get('speaker_id', 0)}, "
+            f"speed={plugin_cfg.get('speed', 1.0)}, "
+            f"max_segment_chars={plugin_cfg.get('max_segment_chars', MAX_SEGMENT_CHARS)}, "
+            f"realtime_pacing={self._realtime_pacing}"
+        )
 
     def get_tools(self) -> list:
         return TOOLS
@@ -749,8 +784,12 @@ class TTSPlugin:
                     self._executor.remove_node(default_node)
                     del self._nodes['_default']
             if node_key not in self._nodes:
-                node = _TTSNode(input_topic or None, self._adapter,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                node = _TTSNode(
+                    input_topic or None,
+                    self._adapter,
+                    node_suffix=node_key.replace('/', '_').replace('-', '_'),
+                    realtime_pacing=self._realtime_pacing,
+                )
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
             elif input_topic and self._nodes[node_key]._input_topic != input_topic:
@@ -758,8 +797,12 @@ class TTSPlugin:
                 old_node = self._nodes[node_key]
                 old_node.stop()
                 self._executor.remove_node(old_node)
-                node = _TTSNode(input_topic, self._adapter,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                node = _TTSNode(
+                    input_topic,
+                    self._adapter,
+                    node_suffix=node_key.replace('/', '_').replace('-', '_'),
+                    realtime_pacing=self._realtime_pacing,
+                )
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
             return self._nodes[node_key].start()
@@ -803,8 +846,12 @@ class TTSPlugin:
                         inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
                         if inst_adapter:
                             adapter = inst_adapter
-                    node = _TTSNode(input_topic, adapter,
-                                    node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                    node = _TTSNode(
+                        input_topic,
+                        adapter,
+                        node_suffix=node_key.replace('/', '_').replace('-', '_'),
+                        realtime_pacing=self._realtime_pacing,
+                    )
                     self._executor.add_node(node)
                     self._nodes[node_key] = node
                 else:

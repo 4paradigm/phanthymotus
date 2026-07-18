@@ -27,8 +27,11 @@ plugins:
     num_threads: 2
     speaker_id: 0
     speed: 1.0
+    max_segment_chars: 60
     warmup: true
-    warmup_text: "。"
+    warmup_async: false
+    warmup_text: "你好，欢迎使用语音合成服务，这是一段预热测试文本。"
+    realtime_pacing: false
 
   htmsg:
     enabled: false
