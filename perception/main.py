@@ -114,10 +114,48 @@ class PerceptionBundle:
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
 
+    def prepare_shutdown(self) -> None:
+        for plugin in self._plugins:
+            shutdown = getattr(plugin, "prepare_shutdown", None)
+            if shutdown is None:
+                continue
+            try:
+                shutdown()
+            except Exception:
+                log.exception(
+                    "plugin prepare_shutdown failed: %s",
+                    getattr(plugin, "PREFIX", type(plugin).__name__),
+                )
+
+    def destroy_nodes(self) -> None:
+        for plugin in self._plugins:
+            destroy = getattr(plugin, "destroy_nodes", None)
+            if destroy is None:
+                continue
+            try:
+                destroy()
+            except Exception:
+                log.exception(
+                    "plugin destroy_nodes failed: %s",
+                    getattr(plugin, "PREFIX", type(plugin).__name__),
+                )
+
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: PerceptionBundle | None = None
+
+
+def _spin_executor(executor, server, errors: list[BaseException]) -> None:
+    try:
+        executor.spin()
+    except BaseException as exc:
+        errors.append(exc)
+        log.exception("ROS executor spin failed; stopping MCP server")
+        try:
+            server.shutdown()
+        except Exception:
+            log.exception("failed to stop MCP server after ROS executor failure")
 
 
 def make_handler():
@@ -416,17 +454,21 @@ def main():
     executor = rclpy.executors.MultiThreadedExecutor()
     _bundle  = PerceptionBundle(cfg, executor)
 
-    def _spin():
-        executor.spin()
-
-    threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
+    server = ThreadingHTTPServer(("", mcp_port), make_handler())
+    spin_errors: list[BaseException] = []
+    spin_thread = threading.Thread(
+        target=_spin_executor,
+        args=(executor, server, spin_errors),
+        daemon=True,
+        name="perception_spin",
+    )
+    spin_thread.start()
 
     # Start WebSocket ASR server in a separate thread
     threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 
-    server = ThreadingHTTPServer(("", mcp_port), make_handler())
     log.info(f"MCP server → http://0.0.0.0:{mcp_port}")
 
     def _shutdown(signum, frame):
@@ -439,8 +481,15 @@ def main():
     try:
         server.serve_forever()
     finally:
+        _bundle.prepare_shutdown()
         executor.shutdown()
+        _bundle.destroy_nodes()
         rclpy.shutdown()
+        server.server_close()
+        spin_thread.join(timeout=5)
+
+    if spin_errors:
+        raise RuntimeError("ROS executor spin failed") from spin_errors[0]
 
 
 if __name__ == "__main__":

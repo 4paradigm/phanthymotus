@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -737,21 +738,204 @@ class OCRContractTest(unittest.TestCase):
         self.assertIs(plugin._adapter, shared_adapter)
         self.assertTrue(result["reused"])
 
-    def test_removing_node_stops_removes_and_destroys_it(self):
-        plugin = object.__new__(self.ocr.OCRPlugin)
-        node = mock.Mock()
-        node.worker_alive = False
-        plugin._nodes = {"case-1": node}
-        plugin._executor = mock.Mock()
-        plugin._retired_nodes = []
-        plugin._instance_adapters = {}
+    def test_repeated_start_stop_reuses_one_ros_node(self):
+        executor = mock.Mock()
+        node = mock.Mock(_input_topic="/camera", state="idle")
+        node.start.return_value = {"state": "running"}
+        node.stop.return_value = {"state": "idle"}
 
-        plugin._remove_node("case-1")
+        with mock.patch("plugins.ocr._build_ocr_adapter", return_value=object()):
+            plugin = self.ocr.OCRPlugin({"provider": "rapidocr"}, executor)
+        with mock.patch.object(self.ocr, "_OCRNode", return_value=node) as node_type:
+            for _ in range(250):
+                plugin.dispatch(
+                    "ocr",
+                    {
+                        "action": "start",
+                        "input_topic": "/camera",
+                    },
+                )
+                plugin.dispatch("ocr", {"action": "stop"})
+
+        node_type.assert_called_once()
+        executor.add_node.assert_called_once_with(node)
+        executor.remove_node.assert_not_called()
+        node.destroy_node.assert_not_called()
+        self.assertIs(plugin._nodes["/camera"], node)
+        self.assertEqual(node.start.call_count, 250)
+        self.assertEqual(node.stop.call_count, 250)
+
+    def test_concurrent_starts_create_one_ocr_node(self):
+        executor = mock.Mock()
+        first_constructor_entered = threading.Event()
+        release_first_constructor = threading.Event()
+
+        def build_node(*_args, **_kwargs):
+            first_constructor_entered.set()
+            release_first_constructor.wait(timeout=1)
+            node = mock.Mock(_input_topic="/camera", state="idle")
+            node.start.return_value = {"state": "running"}
+            return node
+
+        with mock.patch("plugins.ocr._build_ocr_adapter", return_value=object()):
+            plugin = self.ocr.OCRPlugin({"provider": "rapidocr"}, executor)
+
+        errors = []
+
+        def start():
+            try:
+                plugin.dispatch(
+                    "ocr",
+                    {
+                        "action": "start",
+                        "input_topic": "/camera",
+                    },
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(self.ocr, "_OCRNode", side_effect=build_node) as node_type:
+            first = threading.Thread(target=start)
+            second = threading.Thread(target=start)
+            first.start()
+            self.assertTrue(first_constructor_entered.wait(timeout=1))
+            second.start()
+            time.sleep(0.05)
+            release_first_constructor.set()
+            first.join(timeout=1)
+            second.join(timeout=1)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        node_type.assert_called_once()
+        executor.add_node.assert_called_once()
+
+    def test_stale_worker_cannot_publish_after_restart(self):
+        old_inference_started = threading.Event()
+        release_old_inference = threading.Event()
+
+        def recognize(_adapter, image_bytes, _language, _timestamp):
+            if image_bytes == b"old":
+                old_inference_started.set()
+                release_old_inference.wait(timeout=1)
+            return {"text": image_bytes.decode(), "items": []}
+
+        node = self.ocr._OCRNode("/camera", object())
+        with mock.patch("plugins.ocr.recognize_to_payload", side_effect=recognize):
+            node.start()
+            first_stop_event = node._stop_event
+            node._image_cb(types.SimpleNamespace(data=b"old", format="jpeg"))
+            self.assertTrue(old_inference_started.wait(timeout=1))
+
+            old_worker = node._worker_thread
+            with mock.patch.object(old_worker, "join", return_value=None):
+                node.stop()
+            node.start()
+            second_stop_event = node._stop_event
+            release_old_inference.set()
+            time.sleep(0.05)
+
+            node._image_cb(types.SimpleNamespace(data=b"new", format="jpeg"))
+            deadline = time.time() + 1
+            while node._pub.publish.call_count < 1 and time.time() < deadline:
+                time.sleep(0.01)
+            node.stop()
+
+        self.assertIsNot(first_stop_event, second_stop_event)
+        published = [json.loads(call.args[0].data)["text"] for call in node._pub.publish.call_args_list]
+        self.assertEqual(published, ["new"])
+
+    def test_topic_change_retires_node_without_destroying_it(self):
+        executor = mock.Mock()
+        old_node = mock.Mock(_input_topic="/camera/old")
+        new_node = mock.Mock(_input_topic="/camera/new")
+        old_node.start.return_value = {"state": "running"}
+        old_node.stop.return_value = {"state": "idle"}
+        new_node.start.return_value = {"state": "running"}
+
+        with mock.patch("plugins.ocr._build_ocr_adapter", return_value=object()):
+            plugin = self.ocr.OCRPlugin({"provider": "rapidocr"}, executor)
+        with mock.patch.object(
+            self.ocr, "_OCRNode", side_effect=[old_node, new_node]
+        ):
+            plugin.dispatch(
+                "ocr",
+                {
+                    "action": "start",
+                    "instance_id": "case-1",
+                    "input_topic": "/camera/old",
+                },
+            )
+            plugin.dispatch(
+                "ocr",
+                {
+                    "action": "start",
+                    "instance_id": "case-1",
+                    "input_topic": "/camera/new",
+                },
+            )
+
+        old_node.stop.assert_called_once_with()
+        executor.remove_node.assert_called_once_with(old_node)
+        old_node.destroy_node.assert_not_called()
+        self.assertEqual(plugin._retired_nodes, [old_node])
+        self.assertIs(plugin._nodes["case-1"], new_node)
+
+    def test_instance_config_updates_existing_node_without_removing_it(self):
+        executor = mock.Mock()
+        shared_adapter = object()
+        node = mock.Mock(_input_topic="/camera")
+        node.start.return_value = {"state": "running"}
+        node.stop.return_value = {"state": "idle"}
+
+        with mock.patch(
+            "plugins.ocr._build_ocr_adapter", return_value=shared_adapter
+        ):
+            plugin = self.ocr.OCRPlugin(
+                {"provider": "rapidocr", "language": "zh"}, executor
+            )
+        with mock.patch.object(self.ocr, "_OCRNode", return_value=node):
+            plugin.dispatch(
+                "ocr",
+                {
+                    "action": "start",
+                    "instance_id": "case-1",
+                    "input_topic": "/camera",
+                },
+            )
+            plugin.dispatch(
+                "ocr",
+                {"action": "config", "instance_id": "case-1", "language": "en"},
+            )
 
         node.stop.assert_called_once_with()
-        plugin._executor.remove_node.assert_called_once_with(node)
-        node.destroy_node.assert_called_once_with()
-        self.assertNotIn("case-1", plugin._nodes)
+        executor.remove_node.assert_not_called()
+        node.destroy_node.assert_not_called()
+        self.assertIs(node._adapter, shared_adapter)
+        self.assertEqual(node._language, "en")
+
+    def test_nodes_are_destroyed_only_during_final_shutdown(self):
+        plugin = object.__new__(self.ocr.OCRPlugin)
+        plugin._lifecycle_lock = threading.RLock()
+        active = mock.Mock()
+        retired = mock.Mock()
+        plugin._nodes = {"case-1": active}
+        plugin._retired_nodes = [retired, active]
+
+        plugin.prepare_shutdown()
+
+        active.stop.assert_called_once_with()
+        retired.stop.assert_called_once_with()
+        active.destroy_node.assert_not_called()
+        retired.destroy_node.assert_not_called()
+
+        plugin.destroy_nodes()
+
+        active.destroy_node.assert_called_once_with()
+        retired.destroy_node.assert_called_once_with()
+        self.assertEqual(plugin._nodes, {})
+        self.assertEqual(plugin._retired_nodes, [])
 
 
 if __name__ == "__main__":
