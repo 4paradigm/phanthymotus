@@ -21,16 +21,18 @@ plugins:
   tts:
     enabled: true
     backend: vits
-    model_name: tts_melo_int8
-    model_dir: /models/vits-melo-tts-zh_en_int8
+    model_name: tts_melo_8k
+    model_dir: /models/vits-melo-tts-zh_en-8k
     hw_provider: cuda
     num_threads: 2
     speaker_id: 0
     speed: 1.0
-    max_segment_chars: 60
+    max_segment_chars: 40
+    first_segment_chars: 20
+    prebuf_frames: 0
     warmup: true
     warmup_async: false
-    warmup_text: "你好，欢迎使用语音合成服务，这是一段预热测试文本。"
+    warmup_text: "你好，欢迎使用语音合成服务。"
     realtime_pacing: false
 
   htmsg:

@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms @ 16kHz 16-bit mono
 MAX_SEGMENT_CHARS = 60
+DEFAULT_FIRST_SEGMENT_CHARS = 20
 # Local synthesis buffer. 600 frames is about 60 seconds / 1.9 MB of PCM.
 # It lets the producer synthesize the next sentence while the current one plays.
 SYNTH_QUEUE_FRAMES = 600
@@ -222,7 +223,12 @@ class TTSAdapter(ABC):
 
     def split_text(self, text: str) -> list[str]:
         max_chars = getattr(self, "max_segment_chars", MAX_SEGMENT_CHARS)
-        return _split_text_for_tts(text, max_chars)
+        first_max = int(getattr(self, "first_segment_chars", 0) or 0)
+        segments = _split_text_for_tts(text, max_chars)
+        if first_max > 0 and segments and len(segments[0]) > first_max:
+            head_parts = _split_long_segment(segments[0], first_max)
+            return head_parts + segments[1:]
+        return segments
 
     def synthesize(self, text: str) -> bytes:
         """Synthesize all segments and return one concatenated PCM stream."""
@@ -415,6 +421,7 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     else:
         adapter = SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
     adapter.max_segment_chars = int(cfg.get("max_segment_chars", MAX_SEGMENT_CHARS))
+    adapter.first_segment_chars = int(cfg.get("first_segment_chars", 0) or 0)
     return adapter
 
 
@@ -427,6 +434,7 @@ class _TTSNode(Node):
         adapter: Optional[TTSAdapter],
         node_suffix: str = '',
         realtime_pacing: bool = False,
+        prebuf_frames: int = 0,
     ):
         node_name = f"tts_{node_suffix}" if node_suffix else "tts"
         super().__init__(node_name)
@@ -434,6 +442,7 @@ class _TTSNode(Node):
         self._output_topic = f"{input_topic}/tts" if input_topic else '/perception/tts'
         self._adapter      = adapter
         self._realtime_pacing = realtime_pacing
+        self._prebuf_frames = max(0, int(prebuf_frames))
         self.state         = "idle"
         self._text_queue   = queue.Queue()
         self._worker_thread: Optional[threading.Thread] = None
@@ -504,7 +513,7 @@ class _TTSNode(Node):
 
         # Real-time pacing: publish frames at playback rate to avoid bursts/gaps
         FRAME_DURATION = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s per 3200-byte frame
-        PREBUF_FRAMES  = 1  # 1 frame (~100ms); was 3 (~300ms) for lower judged TTFT
+        PREBUF_FRAMES  = self._prebuf_frames
 
         while not self._stop_event.is_set():
             try:
@@ -698,6 +707,7 @@ class TTSPlugin:
         self._loading  = False
         self._load_error = None
         self._realtime_pacing = bool(plugin_cfg.get("realtime_pacing", False))
+        self._prebuf_frames = int(plugin_cfg.get("prebuf_frames", 0))
         try:
             self._adapter  = _build_tts_adapter(plugin_cfg)
         except Exception as e:
@@ -717,6 +727,8 @@ class TTSPlugin:
             f"speaker_id={plugin_cfg.get('speaker_id', 0)}, "
             f"speed={plugin_cfg.get('speed', 1.0)}, "
             f"max_segment_chars={plugin_cfg.get('max_segment_chars', MAX_SEGMENT_CHARS)}, "
+            f"first_segment_chars={plugin_cfg.get('first_segment_chars', 0)}, "
+            f"prebuf_frames={self._prebuf_frames}, "
             f"realtime_pacing={self._realtime_pacing}"
         )
 
@@ -801,6 +813,7 @@ class TTSPlugin:
                     self._adapter,
                     node_suffix=node_key.replace('/', '_').replace('-', '_'),
                     realtime_pacing=self._realtime_pacing,
+                    prebuf_frames=self._prebuf_frames,
                 )
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
@@ -814,6 +827,7 @@ class TTSPlugin:
                     self._adapter,
                     node_suffix=node_key.replace('/', '_').replace('-', '_'),
                     realtime_pacing=self._realtime_pacing,
+                    prebuf_frames=self._prebuf_frames,
                 )
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
@@ -863,6 +877,7 @@ class TTSPlugin:
                         adapter,
                         node_suffix=node_key.replace('/', '_').replace('-', '_'),
                         realtime_pacing=self._realtime_pacing,
+                    prebuf_frames=self._prebuf_frames,
                     )
                     self._executor.add_node(node)
                     self._nodes[node_key] = node
