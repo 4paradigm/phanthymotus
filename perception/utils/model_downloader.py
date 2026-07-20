@@ -63,7 +63,7 @@ MODELS = {
     },
     "tts_melo_int8": {
         "url": f"{JUICEFS_BASE}/vits-melo-tts-zh_en_int8.tar.bz2",
-        "check_file": "model.onnx",
+        "check_file": "model.int8.onnx",
     },
     "tts_zh_finetuned": {
         "url": f"{JUICEFS_BASE}/zh_finetuned.tar.bz2",
