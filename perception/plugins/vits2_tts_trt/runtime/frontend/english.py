@@ -216,6 +216,18 @@ def text_normalize(text):
     return text
 
 
+def text_normalize_without_numbers(text):
+    """Normalize an English fragment without expanding Arabic numerals."""
+    text = preprocess_text(text)
+    for name, replacement in KNOWN_ACRONYMS.items():
+        text = re.sub(rf"\b{re.escape(name)}\b", replacement, text, flags=re.I)
+    text = ACRONYM_SPLIT_RE.sub(_split_acronym, text)
+    text = expand_abbreviations(text)
+    text = replace_punctuation(text)
+    text = PUNCT_SPACE_RE.sub(r"\1 \2", text)
+    return SPACE_RE.sub(" ", text).strip()
+
+
 def text_to_words(text):
     return [w for w in TOKEN_SPLIT_RE.split(text) if w.strip()]
 

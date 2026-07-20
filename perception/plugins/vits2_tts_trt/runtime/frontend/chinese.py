@@ -226,18 +226,50 @@ def text_normalize(text):
     return text
 
 
+_MIX_LATIN_SPAN_RE = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*")
+_MIX_UNIT_RANGE_RE = re.compile(r"(?<=[A-Za-z])\s*[-~～—]\s*(?=\d)")
+_MIX_NUMBER_UNIT_RE = re.compile(
+    r"(?<![\d.])(\d+(?:\.\d+)?)([A-Za-z]+(?:/[A-Za-z]+)?)"
+)
+
+
+def _normalize_unit_number(match: re.Match) -> str:
+    # A temporary measure word forces WeText to treat values such as 900 as
+    # cardinal numbers (九百), rather than digit sequences (九零零).
+    normalized = _normalizer.normalize(f"{match.group(1)}个")
+    number = normalized[:-1] if normalized.endswith("个") else normalized
+    return number + match.group(2)
+
+
+def _normalize_mixed_zh_numbers(text: str) -> str:
+    """Run Chinese TN without letting it reinterpret Latin words or units."""
+    # In Chinese technical text, ``900MB-1GB`` describes a range, not -1 GB.
+    text = _MIX_UNIT_RANGE_RE.sub("到", text)
+    # Keep number+unit together until the number has Chinese cardinal reading;
+    # the Latin unit itself remains untouched for the English G2P stage.
+    text = _MIX_NUMBER_UNIT_RE.sub(_normalize_unit_number, text)
+    parts = _MIX_LATIN_SPAN_RE.split(text)
+    latin_spans = _MIX_LATIN_SPAN_RE.findall(text)
+    normalized = []
+    for index, part in enumerate(parts):
+        if part:
+            normalized.append(_normalizer.normalize(part))
+        if index < len(latin_spans):
+            normalized.append(latin_spans[index])
+    return "".join(normalized)
+
+
 
 
 def mix_normalize(text: str) -> str:
     """Normalise text for ZH/EN mixed input.
 
-    Pipeline: WeText → _post_replace → english.replace_punctuation
-
-    WeText handles camelCase (ChatGPT→chat GPT, MacBook→Mac book) and
-    acronyms (GPT→G P T, CEO→C E O) natively, so no preprocessing is needed.
+    Latin spans are protected while Chinese WeText normalizes surrounding
+    numbers. This keeps ``900MB`` as ``九百MB`` instead of either English
+    ``nine hundred`` or WeText's erroneous ``九百米b`` interpretation.
     """
     from .english import replace_punctuation as en_replace_punct
-    text = _normalizer.normalize(text)
+    text = _normalize_mixed_zh_numbers(text)
     text = _post_replace(text)
     text = en_replace_punct(text)
     return text

@@ -15,7 +15,7 @@ def clean_text_mix(text):
     This is the single public entry for `MIX`, but internally it dispatches:
 
     - pure Chinese  -> chinese.text_normalize() + chinese.g2p()
-    - pure English  -> english.text_normalize() + english.g2p()
+    - English chunk -> number-free English normalization + english.g2p()
     - true ZH/EN mix -> chinese.mix_normalize() + unified_g2p()
 
     This keeps pure Chinese equivalent to the native `ZH` path while still
@@ -31,7 +31,11 @@ def clean_text_mix(text):
         return norm_text, phones, tones, langs, word2ph
 
     if has_en and not has_zh:
-        norm_text = english.text_normalize(text)
+        if any(char.isdigit() for char in text):
+            raise ValueError(
+                "Arabic digits reached an English-only chunk in Chinese MIX mode"
+            )
+        norm_text = english.text_normalize_without_numbers(text)
         phones, tones, word2ph = english.g2p(norm_text)
         langs = ["EN"] * len(phones)
         return norm_text, phones, tones, langs, word2ph

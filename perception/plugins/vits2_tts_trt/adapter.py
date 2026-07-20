@@ -95,8 +95,18 @@ class Vits2TensorRTAdapter(TTSAdapter):
     def _iter_text_chunks(self, text: str):
         units = re.findall(r".*?[。！？!?；;，,：:\n]+|.+$", text, flags=re.DOTALL)
         for unit in units:
-            if unit.strip():
-                yield from self._iter_unit_chunks(unit.strip())
+            unit = unit.strip()
+            if not unit:
+                continue
+            has_zh = any("\u4e00" <= char <= "\u9fff" for char in unit)
+            has_en = any(char.isascii() and char.isalpha() for char in unit)
+            if has_zh and has_en:
+                # Preserve Chinese numeric context before recursive language-
+                # boundary splitting can turn ``900MB`` into a pure-EN chunk.
+                from .runtime.frontend.chinese import mix_normalize
+
+                unit = mix_normalize(unit)
+            yield from self._iter_unit_chunks(unit)
 
     def synthesize(self, text: str) -> bytes:
         return b"".join(self.synthesize_stream(text))
