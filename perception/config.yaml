@@ -21,8 +21,8 @@ plugins:
   tts:
     enabled: true
     backend: vits
-    model_name: tts_melo_8k
-    model_dir: /models/vits-melo-tts-zh_en-8k
+    model_name: tts_melo_int8
+    model_dir: /models/vits-melo-tts-zh_en_int8
     hw_provider: cuda
     num_threads: 2
     speaker_id: 0
