@@ -65,7 +65,8 @@ plugins:
     max_side_len: 960          # 68 items 保持不变，640 会掉精度(54)
     min_interval_ms: 5000      # 帧处理最小间隔，0=不限帧
     large_image_strategy:
-      enabled: true
+      # 榜单会并发启动多个容器；默认单次缩放推理，避免分块产生内存峰值。
+      enabled: false
       trigger_side: 2400
       decode_side: 3200
       decode_hard_limit: 4096

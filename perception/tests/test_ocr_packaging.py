@@ -20,28 +20,19 @@ class OCRPackagingTest(unittest.TestCase):
         config = (REPO_ROOT / "perception" / "config.yaml").read_text(
             encoding="utf-8"
         )
-
         self.assertIn("  asr:\n    enabled: false\n    mode: offline", config)
         self.assertIn("  ocr:\n    enabled: true\n    provider: rapidocr", config)
         self.assertIn("model_dir: /models/ocr/ppocrv6-tiny", config)
-        self.assertIn("    device: cuda", config)
+        self.assertIn("    device: cpu", config)
         self.assertIn("    device_id: 0", config)
         self.assertIn("    gpu_mem_mb: 512", config)
-        self.assertIn("    max_side_len: 1600", config)
+        self.assertIn("    max_side_len: 960", config)
         self.assertIn("    num_threads: 1", config)
-        self.assertIn(
-            "    large_image_strategy:\n"
-            "      enabled: true\n"
-            "      trigger_side: 2400\n"
-            "      decode_side: 3200\n"
-            "      decode_hard_limit: 4096\n"
-            "      tile_size: 1280\n"
-            "      overlap: 192\n"
-            "      max_tiles: 6\n"
-            "      global_pass: true\n"
-            "      dedup_iou: 0.5\n"
-            "      dedup_text_similarity: 0.8",
+        self.assertRegex(
             config,
+            r"large_image_strategy:\n"
+            r"(?:      #.*\n)*"
+            r"      enabled: false",
         )
         self.assertIn('    url: ""', config)
         self.assertIn('    key: ""', config)
@@ -53,13 +44,14 @@ class OCRPackagingTest(unittest.TestCase):
         )
 
         self.assertIn("rapidocr==3.9.1", dockerfile)
-        self.assertIn("libffi8_3.4.2-4_arm64.deb", dockerfile)
-        self.assertIn("ort.__version__ == '1.20.0'", dockerfile)
+        self.assertIn("Ubuntu 22.04 ships libffi.so.8", dockerfile)
+        self.assertIn('"onnxruntime==1.23.0"', dockerfile)
         self.assertNotIn("nvidia.box.com", dockerfile)
         self.assertNotIn("onnxruntime_gpu-1.17.0", dockerfile)
-        self.assertNotIn("pip3 uninstall -y onnxruntime", dockerfile)
-        self.assertIn("numpy==1.23.5", dockerfile)
-        self.assertIn("CUDAExecutionProvider", dockerfile)
+        self.assertNotIn("ORT_WHEEL_URL", dockerfile)
+        self.assertIn(
+            "assert 'CUDAExecutionProvider' not in providers", dockerfile
+        )
         self.assertIn("--no-deps", dockerfile)
         self.assertIn("onnxruntime", dockerfile)
         self.assertIn("rapidocr.__file__", dockerfile)
@@ -80,6 +72,18 @@ class OCRPackagingTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("runtime: nvidia", service)
+
+    def test_jetson_image_caps_cpu_threads_and_allocator_arenas(self):
+        dockerfile = (REPO_ROOT / "perception" / "Dockerfile.jetson").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("OMP_NUM_THREADS=1", dockerfile)
+        self.assertIn("OPENBLAS_NUM_THREADS=1", dockerfile)
+        self.assertIn("MKL_NUM_THREADS=1", dockerfile)
+        self.assertIn("NUMEXPR_NUM_THREADS=1", dockerfile)
+        self.assertIn("OPENCV_FOR_THREADS_NUM=1", dockerfile)
+        self.assertIn("MALLOC_ARENA_MAX=2", dockerfile)
 
     def test_jetson_image_loads_large_message_fastdds_profile(self):
         dockerfile = (REPO_ROOT / "perception" / "Dockerfile.jetson").read_text(

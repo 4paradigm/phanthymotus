@@ -366,7 +366,7 @@ class OCRContractTest(unittest.TestCase):
         self.assertEqual(engine_config["intra_op_num_threads"], 1)
         self.assertEqual(
             engine_config["cuda_ep_cfg"],
-            {"device_id": 0, "gpu_mem": 512},
+            {"device_id": 0, "gpu_mem_limit": 512 * 1024 * 1024},
         )
 
     def test_cuda_adapter_rejects_missing_cuda_execution_provider(self):
@@ -716,7 +716,11 @@ class OCRContractTest(unittest.TestCase):
 
         self.assertEqual(build.call_count, 1)
         node_type.assert_called_once_with(
-            "/camera", shared_adapter, "en", node_suffix="case_1"
+            "/camera",
+            shared_adapter,
+            "en",
+            node_suffix="case_1",
+            min_interval=0.0,
         )
 
     def test_empty_shared_config_reuses_adapter(self):
@@ -740,6 +744,7 @@ class OCRContractTest(unittest.TestCase):
         plugin._nodes = {"case-1": node}
         plugin._executor = mock.Mock()
         plugin._retired_nodes = []
+        plugin._instance_adapters = {}
 
         plugin._remove_node("case-1")
 
