@@ -23,6 +23,14 @@ _task: asyncio.Task | None = None
 # Per-source throttle: source → timestamp of last accepted event
 _last_accepted: dict[str, float] = {}
 _THROTTLE_INTERVAL = 1.0  # 每个 source 最多 1 条/秒
+# Agent loop busy flag — 忙时不发射 trigger，让事件继续积累
+_busy: bool = False
+
+
+def set_busy(busy: bool):
+    """由 agent loop 调用：标记当前是否正在执行 turn。"""
+    global _busy
+    _busy = busy
 
 
 def _get_interval_ms() -> int:
@@ -78,6 +86,10 @@ async def _trigger_loop():
         await asyncio.sleep(interval)
 
         if not _buffer:
+            continue
+
+        # 防堆积：agent loop 忙时不发射，让事件继续在 buffer 中积累
+        if _busy:
             continue
 
         # 取出当前所有积累的事件

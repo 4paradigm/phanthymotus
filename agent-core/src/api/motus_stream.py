@@ -44,6 +44,12 @@ async def push_event(event: dict):
 
 @router.websocket('/ws/motus')
 async def motus_ws(websocket: fastapi.WebSocket):
+    # Token auth check
+    import auth
+    if not auth.check_ws_token(websocket):
+        await websocket.close(code=4001, reason='Unauthorized')
+        return
+
     await websocket.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)
     _clients.add(queue)

@@ -197,6 +197,7 @@ class Event:
             ('update_memory', event.memory.update),
             ('activate_skill', event.skills.activate_skill),
             ('deactivate_skill', event.skills.deactivate_skill),
+            ('channel_reply', event.channel_reply.channel_reply),
             ('task_create', event.task.task_create),
             ('task_update', event.task.task_update),
             ('task_done', event.task.task_done),
@@ -217,6 +218,24 @@ class Event:
 
     async def __aexit__(self, *args):
         return False
+
+    async def _dispatch_channel_reply(self, trigger_event: dict, args: dict) -> str:
+        """Send channel_reply to the originating channel."""
+        text = args.get('text', '').strip()
+        if not text:
+            return 'Reply text cannot be empty'
+
+        source = trigger_event.get('source', '')
+        if not source.startswith('channel:'):
+            return 'Current event is not from a messaging channel, cannot reply'
+
+        try:
+            from channel.manager import manager as channel_mgr
+            channel_mgr.sync_from_canvas()
+            await channel_mgr.route_reply(trigger_event, text)
+            return f'Reply sent ({len(text)} chars)'
+        except Exception as e:
+            return f'Reply failed: {e}'
 
     def _get_bound_tool_schemas(self) -> list[dict]:
         """从画布 executor connections 获取绑定到 decision_core 的工具 schemas。"""
@@ -264,6 +283,7 @@ class Event:
         while True:
             ev = await collector.next_trigger()
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
+            collector.set_busy(True)
             try:
                 await self._one_turn(ev)
             except asyncio.CancelledError:
@@ -277,6 +297,7 @@ class Event:
                 })
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
+                collector.set_busy(False)
                 # 无论成功失败，只要有消息就持久化
                 if self._current_turn:
                     self._save_current_turn(ev)
@@ -358,8 +379,17 @@ class Event:
 
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
+
+        # channel_reply 工具仅当 trigger 来自 channel 时暴露
+        is_channel_trigger = trigger_event.get('source', '').startswith('channel:')
+        sys_tool_list = [
+            {'type': 'function', 'function': t['schema']}
+            for name, t in self._sys_tools.items()
+            if name != 'channel_reply' or is_channel_trigger
+        ]
+
         all_tool_list = (
-            [{'type': 'function', 'function': t['schema']} for t in self._sys_tools.values()]
+            sys_tool_list
             + [{'type': 'function', 'function': s} for s in bound_schemas]
         )
         # 绑定工具全名集合，用于 L2 环境快照过滤
@@ -486,7 +516,10 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if name in self._sys_tools:
+                if name == 'channel_reply':
+                    # 特殊处理：实际发送消息到渠道
+                    result = await self._dispatch_channel_reply(trigger_event, args)
+                elif name in self._sys_tools:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     result = await mcp_client.call_tool(name, args)

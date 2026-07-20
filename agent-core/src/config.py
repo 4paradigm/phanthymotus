@@ -31,6 +31,7 @@ _DB_DEFAULTS = {
     'core': {
         'main_loop_enable': True,
         'configured': False,
+        'update_channel': 'ga',  # preview | release | ga
     },
     'services': {
         'llm': {'url': '', 'key': '', 'model': ''},
@@ -59,6 +60,12 @@ _DB_DEFAULTS = {
     },
     'scheduler': [],
     'skills': {'installed': []},
+    'channel_configs': [],
+    'channel_settings': {
+        'default_role': 'viewer',
+        'auto_approve': True,
+        'require_actuator_confirm': True,
+    },
 }
 
 
@@ -83,6 +90,18 @@ def _get_conn() -> sqlite3.Connection:
     conn.execute(
         'CREATE INDEX IF NOT EXISTS idx_cm_session ON chat_messages(session_id, turn_index)'
     )
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS channel_users (
+            platform TEXT NOT NULL,
+            platform_user_id TEXT NOT NULL,
+            display_name TEXT DEFAULT '',
+            role TEXT DEFAULT 'viewer',
+            tool_filter TEXT DEFAULT '*',
+            alert_subscriptions TEXT DEFAULT '[]',
+            created_at REAL,
+            UNIQUE(platform, platform_user_id)
+        )
+    ''')
     conn.commit()
     return conn
 

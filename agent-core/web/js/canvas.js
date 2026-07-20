@@ -34,6 +34,28 @@ let _projectRunning = false;
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
 
+/**
+ * Programmatically add a card to the canvas (used by mobile tap-to-add).
+ * Returns true if added, false if rejected.
+ */
+export function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
+  if (_projectRunning) return false;
+  if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
+  if (!multiInstance) {
+    const existing = _cards.find(c => c.mcpId === mcpId && c.toolName === toolName);
+    if (existing) return false;
+  }
+  // Position at viewport center in world coordinates
+  const rect = _canvasEl.getBoundingClientRect();
+  const cx = (rect.width / 2 - _tx) / _zoom;
+  const cy = (rect.height / 2 - _ty) / _zoom;
+  let x = cx - 130, y = cy - 70;
+  ({ x, y } = _findNonOverlappingPos(x, y));
+  const id = 'card-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  _addCard({ id, mcpId, toolName, driverName, x, y }, true);
+  return true;
+}
+
 // ── Viewport transform state ──────────────────────────────────────────────────
 let _zoom = 1;
 let _tx   = 0;
@@ -98,6 +120,11 @@ export async function initCanvas(initialMcps) {
       _tx   = layoutJson.data.transform.tx   ?? 0;
       _ty   = layoutJson.data.transform.ty   ?? 0;
       _applyTransform();
+    }
+
+    // On mobile, auto-fit cards to viewport instead of using saved desktop transform
+    if (window.innerWidth <= 768 && _cards.length > 0) {
+      _fitToViewport();
     }
   } catch { /* start empty */ }
 
@@ -181,6 +208,44 @@ function _applyTransform() {
   if (_zoomLabel) _zoomLabel.textContent = Math.round(_zoom * 100) + '%';
 }
 
+function _fitToViewport() {
+  if (!_cards.length) return;
+  const rect = _canvasEl.getBoundingClientRect();
+  const padding = 30;
+  // Find bounding box of all cards in world coords (with port margins)
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const cardW = window.innerWidth <= 768 ? 220 : 260;
+  for (const c of _cards) {
+    minX = Math.min(minX, c.x - 20); // port extends left
+    minY = Math.min(minY, c.y);
+    maxX = Math.max(maxX, c.x + cardW + 20); // port extends right
+    maxY = Math.max(maxY, c.y + 160);
+  }
+  const contentW = maxX - minX;
+  const contentH = maxY - minY;
+  const availW = rect.width - padding * 2;
+  const availH = rect.height - padding * 2;
+  _zoom = Math.min(availW / contentW, availH / contentH, 1);
+  _zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, _zoom));
+  // Center content
+  _tx = padding + (availW - contentW * _zoom) / 2 - minX * _zoom;
+  _ty = padding + (availH - contentH * _zoom) / 2 - minY * _zoom;
+  _applyTransform();
+}
+
+// ── Touch helpers ─────────────────────────────────────────────────────────────
+function _getTouchDist(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.hypot(dx, dy);
+}
+function _getTouchCenter(touches) {
+  return {
+    x: (touches[0].clientX + touches[1].clientX) / 2,
+    y: (touches[0].clientY + touches[1].clientY) / 2
+  };
+}
+
 function _zoomAt(clientX, clientY, delta) {
   const rect    = _canvasEl.getBoundingClientRect();
   const mouseX  = clientX - rect.left;
@@ -207,6 +272,41 @@ function _setupZoomPan() {
     _zoomAt(e.clientX, e.clientY, delta);
     _debouncedSave();
   }, { passive: false });
+
+  // ── Pinch-to-zoom (mobile two-finger gesture) ──
+  let _pinchDist = 0;
+  let _pinchCenter = { x: 0, y: 0 };
+  let _pinching = false;
+
+  _canvasEl.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      _pinching = true;
+      _panning = false; // cancel any single-finger pan
+      _pinchDist = _getTouchDist(e.touches);
+      _pinchCenter = _getTouchCenter(e.touches);
+    }
+  }, { passive: false });
+
+  _canvasEl.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2 && _pinching) {
+      e.preventDefault();
+      const dist = _getTouchDist(e.touches);
+      const center = _getTouchCenter(e.touches);
+      const scale = dist / _pinchDist;
+      const delta = (scale - 1) * 0.5;
+      _zoomAt(center.x, center.y, delta);
+      _pinchDist = dist;
+      _pinchCenter = center;
+    }
+  }, { passive: false });
+
+  _canvasEl.addEventListener('touchend', (e) => {
+    if (e.touches.length < 2) {
+      _pinching = false;
+      _debouncedSave();
+    }
+  });
 
   // Left-click drag on canvas background = pan (like a map)
   let _panning    = false;
@@ -828,7 +928,7 @@ function _fmtColorClass(fmt) {
 // ── Port drag-to-connect ──────────────────────────────────────────────────────
 
 function _setupPortDrag() {
-  document.addEventListener('mousemove', (e) => {
+  document.addEventListener('pointermove', (e) => {
     if (!_draggingConn) return;
     const vpRect = _viewport.getBoundingClientRect();
     const x2 = (e.clientX - vpRect.left) / _zoom;
@@ -883,7 +983,7 @@ function _setupPortDrag() {
     }
   });
 
-  document.addEventListener('mouseup', (e) => {
+  document.addEventListener('pointerup', (e) => {
     if (!_draggingConn) return;
 
     // Remove highlights
@@ -968,8 +1068,8 @@ function _setupPortDrag() {
     _draggingConn = null;
   });
 
-  // Delegate mousedown on out ports and executor ports
-  _viewport.addEventListener('mousedown', (e) => {
+  // Delegate pointerdown on out ports and executor ports
+  _viewport.addEventListener('pointerdown', (e) => {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;
@@ -1333,12 +1433,10 @@ async function _startProject() {
   // Enable execute buttons
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
 
-  // Start all cards on canvas, resolving input_topic(s) from connections
-  for (const card of _cards) {
-    // Collect ALL inbound connections to support multiple input topics (deduplicate)
+  // Collect start args for all cards
+  const startItems = _cards.map(card => {
     const inConns = _connections.filter(c => c.toCardId === card.id);
     const topics = [...new Set(inConns.map(conn => conn.fromTopic || '').filter(Boolean))];
-
     let args;
     if (topics.length > 1) {
       args = { input_topics: topics };
@@ -1348,46 +1446,105 @@ async function _startProject() {
       args = {};
     }
     args.instance_id = card.id;
-    const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
-    if (startResult && startResult.code !== 200) {
-      const msg = `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`;
-      _logActivity('error', msg);
-      _flashStartError(msg);
-    }
-    // Auto-start mic stream when remote_mic card starts
-    if (card.toolName === 'remote_mic' && !isMicActive()) {
-      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-      try {
-        await toggleMicStream(wsUrl, (active) => {
-          const micBtn = card.el?.querySelector('.canvas-mic-btn');
-          if (micBtn) {
-            micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-            micBtn.classList.toggle('recording', active);
-          }
-        });
-      } catch (err) {
-        _logActivity('error', '麦克风启动失败: ' + err.message);
-      }
-    }
-    // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
-    const parsed = _parseMcpCallResult(startResult);
-    if (parsed?.topic_out?.some(t => t.topic)) {
-      card.topicOut = parsed.topic_out;
-      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-      parsed.topic_out.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
-      _resolveAllTopics();  // re-propagate updated topic paths into conn.fromTopic before next card starts
-      _redrawConnections();
-    }
-  }
-  // Immediately persist layout so monitor-dashboard can read inferred topic paths
-  await _saveLayout();
-  // 持久化运行状态
-  fetch('/api/config/project-running', {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({running: true}),
+    return { card, args };
   });
-  _logActivity('project', '智能控制已开启');
+
+  // Show startup modal
+  const { modal, updateItem, close } = _showStartupModal(startItems);
+  let aborted = false;
+
+  modal.onCancel = () => {
+    aborted = true;
+    close();
+    _stopProject();
+  };
+
+  // Split into sources (no inbound connections) and processors (have inbound connections)
+  const sourceIndices = [];
+  const processorIndices = [];
+  startItems.forEach(({ card }, i) => {
+    const hasInbound = _connections.some(c => c.toCardId === card.id);
+    (hasInbound ? processorIndices : sourceIndices).push(i);
+  });
+
+  // Helper to start a batch of items by index
+  async function _startBatch(indices) {
+    const batch = indices.map(i => (async () => {
+      const { card, args } = startItems[i];
+      updateItem(i, 'starting');
+      try {
+        const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
+        if (aborted) return;
+        if (startResult && startResult.code !== 200) {
+          updateItem(i, 'error', startResult.message || '启动失败');
+          _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
+          if (!aborted) { aborted = true; modal.onCancel?.(); }
+          return;
+        }
+        // Auto-start mic stream for remote_mic card
+        if (card.toolName === 'remote_mic' && !isMicActive()) {
+          const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+          const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+          try {
+            await toggleMicStream(wsUrl, (active) => {
+              const micBtn = card.el?.querySelector('.canvas-mic-btn');
+              if (micBtn) {
+                micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+                micBtn.classList.toggle('recording', active);
+              }
+            });
+          } catch (err) {
+            _logActivity('error', '麦克风启动失败: ' + err.message);
+          }
+        }
+        // Update card.topicOut from start response
+        const parsed = _parseMcpCallResult(startResult);
+        if (parsed?.topic_out?.some(t => t.topic)) {
+          card.topicOut = parsed.topic_out;
+          const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+          parsed.topic_out.forEach((t, idx) => { if (outPorts[idx] && t.topic) outPorts[idx].dataset.topic = t.topic; });
+        }
+        updateItem(i, 'ready');
+      } catch (e) {
+        if (!aborted) {
+          updateItem(i, 'error', e.message || '异常');
+          aborted = true;
+          modal.onCancel?.();
+        }
+      }
+    })());
+    await Promise.allSettled(batch);
+  }
+
+  // Phase 1: start sources (data producers) first
+  await _startBatch(sourceIndices);
+  if (aborted) return;
+
+  // Re-resolve topics so processors can find source output topics
+  _resolveAllTopics();
+
+  // Phase 2: start processors (data consumers)
+  await _startBatch(processorIndices);
+  if (!aborted) {
+    // Re-resolve topics after all starts complete
+    _resolveAllTopics();
+    _redrawConnections();
+    // Ensure button shows running state
+    _syncProjectBtn();
+    document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+    // Update cancel button to close button
+    const cancelBtn = modal.querySelector('.startup-cancel-btn');
+    cancelBtn.textContent = '关闭';
+    cancelBtn.onclick = close;
+    modal.onCancel = null;
+    // Persist layout and running state
+    await _saveLayout();
+    fetch('/api/config/project-running', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({running: true}),
+    });
+    _logActivity('project', '智能控制已开启');
+  }
 }
 
 function _stopProject() {
@@ -1448,6 +1605,48 @@ async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
     console.error(`[canvas] ${action} call failed:`, err);
     return null;
   }
+}
+
+// ── Startup Modal ──────────────────────────────────────────────────────────────
+function _showStartupModal(items) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '420px';
+  modal.innerHTML = `
+    <div class="modal-header">
+      <span class="modal-title">启动智能控制</span>
+    </div>
+    <ul class="startup-modal-list"></ul>
+    <div class="startup-modal-footer">
+      <button class="startup-cancel-btn">取消启动</button>
+    </div>`;
+  overlay.appendChild(modal);
+  const list = modal.querySelector('.startup-modal-list');
+  const dots = [];
+  const statuses = [];
+  items.forEach(({ card }) => {
+    const li = document.createElement('li');
+    li.className = 'startup-modal-item';
+    li.innerHTML = `<span class="startup-dot"></span><span class="startup-name">${card.toolName}</span><span class="startup-status">等待启动</span>`;
+    list.appendChild(li);
+    dots.push(li.querySelector('.startup-dot'));
+    statuses.push(li.querySelector('.startup-status'));
+  });
+  document.body.appendChild(overlay);
+
+  const STATUS_TEXT = { starting: '启动中...', ready: '已就绪', error: '启动失败' };
+  function updateItem(i, state, msg) {
+    dots[i].className = 'startup-dot ' + state;
+    statuses[i].textContent = msg || STATUS_TEXT[state] || '';
+  }
+  function close() {
+    overlay.remove();
+  }
+  const cancelBtn = modal.querySelector('.startup-cancel-btn');
+  cancelBtn.addEventListener('click', () => { if (modal.onCancel) modal.onCancel(); });
+  return { modal, updateItem, close };
 }
 
 /**

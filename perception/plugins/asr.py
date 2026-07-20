@@ -37,6 +37,143 @@ _LOW_LAT_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+
+# ── IPA phoneme matching for asr_kws mode ────────────────────────────────────
+
+def _text_to_ipa(text: str) -> list:
+    """Convert text to IPA phoneme sequence using phonemizer (espeak-ng backend).
+    Returns a list of IPA phoneme strings (one per word/character).
+    """
+    from phonemizer import phonemize
+    from phonemizer.separator import Separator
+
+    # Separate Chinese and non-Chinese segments
+    segments = []
+    current = ''
+    current_is_cjk = None
+    for char in text:
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        if current_is_cjk is None:
+            current_is_cjk = is_cjk
+        if is_cjk != current_is_cjk:
+            if current.strip():
+                segments.append((current.strip(), current_is_cjk))
+            current = ''
+            current_is_cjk = is_cjk
+        current += char
+    if current.strip():
+        segments.append((current.strip(), current_is_cjk))
+
+    ipa_seq = []
+    sep = Separator(phone=' ', word='  ', syllable='')
+    for seg_text, is_cjk in segments:
+        lang = 'cmn' if is_cjk else 'en-us'
+        try:
+            ipa = phonemize(seg_text, language=lang, backend='espeak',
+                           separator=sep, strip=True,
+                           with_stress=False, tie=False,
+                           language_switch='remove-flags')
+            # Remove tone numbers and diacritics for fuzzy matching
+            import re
+            ipa = re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
+            phones = [p for p in ipa.split() if p]
+            ipa_seq.extend(phones)
+        except Exception:
+            # Fallback: use characters as-is
+            ipa_seq.extend(list(seg_text))
+    return ipa_seq
+
+
+def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
+    """Normalized edit distance with phoneme similarity (0=match, 1=different)."""
+    m, n = len(seq1), len(seq2)
+    if m == 0 or n == 0:
+        return 1.0
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = _phoneme_sub_cost(seq1[i - 1], seq2[j - 1])
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return dp[m][n] / max(m, n)
+
+
+# Similar phoneme groups — substitution cost 0.3 instead of 1.0
+_SIMILAR_GROUPS = [
+    {'t', 'd'},       # alveolar stops
+    {'p', 'b'},       # bilabial stops
+    {'k', 'g'},       # velar stops
+    {'f', 'v'},       # labiodental fricatives
+    {'s', 'z'},       # alveolar fricatives
+    {'s.', 'z.'},     # retroflex fricatives
+    {'ɕ', 'ʃ', 'ʂ'}, # postalveolar/retroflex sibilants
+    {'tsh', 'dz'},    # affricates
+    {'n', 'ŋ'},       # nasals
+    {'l', 'r', 'ɹ'},  # liquids
+    {'t', 'tsh'},     # stop ~ affricate
+    {'f', 't'},       # common confusion in noisy env
+    {'x', 'h'},       # velar/glottal fricatives
+    {'ɑu', 'au', 'ɑo', 'ao'},  # diphthong variants
+    {'ou', 'uo'},     # vowel variants
+    {'i', 'i.'},      # apical vowel variant
+]
+
+
+def _phoneme_sub_cost(a: str, b: str) -> float:
+    """Substitution cost: 0 if same, 0.3 if similar, 1.0 otherwise."""
+    if a == b:
+        return 0
+    for group in _SIMILAR_GROUPS:
+        if a in group and b in group:
+            return 0.3
+    return 1.0
+
+
+def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
+    """Sliding window search for keyword in text IPA. Returns (matched, end_position)."""
+    kw_len = len(keyword_ipa)
+    if kw_len == 0 or len(text_ipa) < kw_len:
+        return False, -1
+
+    best_dist = float('inf')
+    best_end = -1
+    for i in range(len(text_ipa) - kw_len + 1):
+        window = text_ipa[i:i + kw_len]
+        dist = _phoneme_edit_distance(window, keyword_ipa)
+        if dist < best_dist:
+            best_dist = dist
+            best_end = i + kw_len
+    return best_dist <= threshold, best_end
+
+
+def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
+    """Extract text after the matched keyword.
+    Uses keyword text length to determine how many characters to skip,
+    then handles the case where ASR text has slightly different char count.
+    """
+    # Count phoneme-producing characters in original text up to end_pos
+    # Simpler approach: use the keyword character length as skip count
+    kw_chars = len([c for c in keyword_text if '\u4e00' <= c <= '\u9fff' or c.isalpha()])
+
+    # Skip that many phoneme-producing characters in text
+    skipped = 0
+    cut_idx = 0
+    for i, char in enumerate(text):
+        if '\u4e00' <= char <= '\u9fff' or char.isalpha():
+            skipped += 1
+        if skipped >= kw_chars:
+            cut_idx = i + 1
+            break
+
+    if cut_idx == 0:
+        return ''
+    remaining = text[cut_idx:]
+    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
+    return remaining
+
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -68,11 +205,16 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, zipformer-en = English only, sensevoice-small = multilingual non-autoregressive)", "default": "paraformer-zh-en", "scope": "shared"},
-                "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
-                "kws_keywords":  {"type": "string", "description": "Wake word (pinyin format, e.g. 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
+                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
+                "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
+                "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
+                "asr_kws_keyword": {"type": "string", "description": "唤醒词文本（如'范式小狗'、'hello robot'）", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
+                "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
+                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": False, "scope": "shared"},
+                "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
             "required": []
         },
@@ -260,15 +402,62 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         return text.strip()
 
 
+class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
+    """Offline non-streaming Paraformer (zh+en, small).
+
+    Better accuracy than streaming version — no tail truncation.
+    Uses sherpa_onnx.OfflineRecognizer.from_paraformer.
+    """
+
+    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+        from utils.model_downloader import ensure_model
+        ensure_model("asr_paraformer_offline", model_dir)
+
+        import sherpa_onnx
+        model_path = os.path.join(model_dir, "model.int8.onnx")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(model_dir, "model.onnx")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=model_path,
+            tokens=tokens_path,
+            num_threads=num_threads,
+            provider=hw_provider,
+            sample_rate=SAMPLE_RATE,
+            decoding_method="greedy_search",
+        )
+        log.info(f"[asr] sherpa-onnx offline paraformer adapter loaded: model={model_path}, provider={hw_provider}")
+
+    def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        import io as _io, wave as _wave
+        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
+            pcm = wf.readframes(wf.getnframes())
+        n = len(pcm) // 2
+        samples = struct.unpack(f'<{n}h', pcm)
+        float_samples = [s / 32768.0 for s in samples]
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, float_samples)
+        self._recognizer.decode_streams([stream])
+        text = stream.result.text
+        return text.strip()
+
+
 # ASR model registry
 ASR_MODELS = {
     "paraformer-zh-en": {
-        "label": "Paraformer Bilingual (zh+en)",
+        "label": "Paraformer Bilingual (zh+en, streaming)",
         "adapter": SherpaOnnxASRAdapter,
         "default_model_dir": "/models/sherpa-onnx/asr",
     },
+    "paraformer-offline": {
+        "label": "Paraformer Offline (zh+en, small)",
+        "adapter": SherpaOnnxOfflineParaformerAdapter,
+        "default_model_dir": "/models/sherpa-onnx/asr-paraformer-offline",
+    },
     "zipformer-en": {
-        "label": "Zipformer English",
+        "label": "Zipformer English (streaming)",
         "adapter": SherpaOnnxZipformerAdapter,
         "default_model_dir": "/models/sherpa-onnx/asr-en",
     },
@@ -304,7 +493,8 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
 def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 stop_evt: multiprocessing.Event,
                 backend: str, threshold: float, silence_ms: int,
-                kws_cfg: dict = None):
+                kws_cfg: dict = None,
+                save_vad_segments: bool = False, max_saved_segments: int = 1000):
     """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
@@ -344,8 +534,17 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     kws_stream = None
     kws_enabled = (kws_cfg.get('trigger_mode', 'kws') == 'kws') if kws_cfg else False
     if kws_enabled:
-        kws_model_dir = kws_cfg.get('model_dir', '/models/sherpa-onnx/kws')
-        ensure_model("kws", kws_model_dir)
+        # Select KWS model based on kws_model config
+        kws_model_variant = kws_cfg.get('kws_model', 'zh')
+        if kws_model_variant == 'zh':
+            kws_model_dir = '/models/sherpa-onnx/kws_zh'
+            ensure_model("kws_zh", kws_model_dir)
+        elif kws_model_variant == 'en':
+            kws_model_dir = '/models/sherpa-onnx/kws_en'
+            ensure_model("kws_en", kws_model_dir)
+        else:  # zh-en
+            kws_model_dir = kws_cfg.get('model_dir', '/models/sherpa-onnx/kws')
+            ensure_model("kws", kws_model_dir)
         keywords = kws_cfg.get('keywords', [])
         if keywords:
             import glob as _glob
@@ -385,8 +584,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     keywords_file=kws_keywords_file,
                     num_threads=1,
                     provider="cpu",
-                    keywords_score=1.0,
-                    keywords_threshold=0.25,
+                    keywords_score=1.5,
+                    keywords_threshold=0.1,
                 )
                 kws_stream = kws_spotter.create_stream()
                 _log.info(f"[vad-worker] KWS initialized, keywords={keywords}")
@@ -408,11 +607,48 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
 
-    # Pre-buffer: keep last N frames so first word isn't cut off by VAD onset delay
-    from collections import deque
-    PREBUF_FRAMES = 5  # ~500ms at 100ms/frame — covers VAD onset lag
-    prebuf = deque(maxlen=PREBUF_FRAMES)
-    prebuf_used = False  # whether we already prepended prebuf to current utterance
+    # VAD segment saving
+    _VAD_SEG_DIR = '/models/vad_segments'
+    _seg_count = [0]
+
+    def _save_segment(float_samples_list, count_ref):
+        """Save float samples as WAV."""
+        try:
+            import wave as _wave, time as _time2
+            os.makedirs(_VAD_SEG_DIR, exist_ok=True)
+            seg_pcm = _struct.pack(f'<{len(float_samples_list)}h',
+                                   *[int(max(-32768, min(32767, s * 32768))) for s in float_samples_list])
+            fname = os.path.join(_VAD_SEG_DIR, f"seg_{int(_time2.time()*1000)}.wav")
+            with _wave.open(fname, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(seg_pcm)
+            # Enforce max segments limit
+            if count_ref[0] >= max_saved_segments:
+                files = sorted(os.listdir(_VAD_SEG_DIR))
+                for old in files[:len(files) - max_saved_segments + 1]:
+                    os.remove(os.path.join(_VAD_SEG_DIR, old))
+        except Exception:
+            pass
+
+    def _save_segment_pcm(pcm_bytes, count_ref):
+        """Save raw PCM bytes as WAV."""
+        try:
+            import wave as _wave, time as _time2
+            os.makedirs(_VAD_SEG_DIR, exist_ok=True)
+            fname = os.path.join(_VAD_SEG_DIR, f"seg_{int(_time2.time()*1000)}.wav")
+            with _wave.open(fname, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(pcm_bytes)
+            if count_ref[0] >= max_saved_segments:
+                files = sorted(os.listdir(_VAD_SEG_DIR))
+                for old in files[:len(files) - max_saved_segments + 1]:
+                    os.remove(os.path.join(_VAD_SEG_DIR, old))
+        except Exception:
+            pass
 
     while not stop_evt.is_set():
         try:
@@ -436,7 +672,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         vad.accept_waveform(float_samples)
 
         if state == 'waiting_wake':
-            # Feed KWS continuously (not gated by VAD) to avoid missing wake word onset
+            # Feed KWS with AGC-normalized audio for better detection at distance
             if kws_spotter:
                 kws_stream.accept_waveform(SAMPLE_RATE, float_samples)
                 while kws_spotter.is_ready(kws_stream):
@@ -453,32 +689,22 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         speech_buf = pcm  # include current frame (user may already be speaking)
                         start_ts = ts
                         end_ts = ts
-                        prebuf_used = True  # don't use prebuf for KWS wake (already have context)
                         # Reset KWS stream for next wake
                         kws_stream = kws_spotter.create_stream()
             # Drain any completed VAD segments (discard in wake-wait mode)
             while not vad.empty():
+                seg = vad.front
+                if save_vad_segments:
+                    _save_segment(seg.samples, _seg_count)
+                    _seg_count[0] += 1
                 vad.pop()
-            prebuf.append((pcm, ts))
 
         elif state == 'listening':
-            # Only update pre-buffer when VAD has NOT detected speech onset yet,
-            # so prebuf retains the frames *before* speech started.
-            if not vad.is_speech_detected():
-                prebuf.append((pcm, ts))
-
-            # Collect completed VAD segments (speech that ended)
+            # Collect completed VAD segments
             while not vad.empty():
                 seg = vad.front
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
-                # Prepend pre-buffer on first speech detection to recover onset audio
-                if not speech_buf and not prebuf_used:
-                    for pb_pcm, pb_ts in prebuf:
-                        speech_buf += pb_pcm
-                    if prebuf:
-                        start_ts = prebuf[0][1]
-                    prebuf_used = True
                 if not start_ts:
                     start_ts = ts
                 speech_buf += seg_pcm
@@ -488,11 +714,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 # Output the segment as an utterance
                 if len(speech_buf) > SAMPLE_RATE:  # >500ms
                     _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
+                    if save_vad_segments:
+                        _save_segment_pcm(speech_buf, _seg_count)
+                        _seg_count[0] += 1
                     result_q.put((speech_buf, start_ts or ts, end_ts or ts))
                     speech_buf = b''
                     start_ts = None
                     end_ts = None
-                    prebuf_used = False
                     # Return to waiting for wake word (if KWS enabled)
                     if kws_enabled:
                         state = 'waiting_wake'
@@ -505,7 +733,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 class _ASRNode(Node):
     def __init__(self, input_topic: str, adapter: Optional[ASRAdapter], language: str,
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
-                 kws_cfg: dict = None, node_suffix: str = ''):
+                 kws_cfg: dict = None, node_suffix: str = '',
+                 save_vad_segments: bool = False, max_saved_segments: int = 1000):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -520,20 +749,32 @@ class _ASRNode(Node):
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
         self._kws_cfg = kws_cfg or {}
+        self._save_vad_segments = save_vad_segments
+        self._max_saved_segments = max_saved_segments
         self._pcm_queue: Optional[multiprocessing.Queue] = None
         self._utterance_queue: Optional[multiprocessing.Queue] = None
         self._vad_stop: Optional[multiprocessing.Event] = None
         self._vad_proc: Optional[multiprocessing.Process] = None
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._first_chunk_event = threading.Event()
 
     def start(self) -> dict:
         if self.state == "running":
             return self._status_dict()
         if not self._adapter:
-            raise RuntimeError("ASR adapter not configured")
+            return {"state": "error", "message": "ASR adapter not configured"}
+        try:
+            return self._start_inner()
+        except Exception as e:
+            log.error(f"[asr] start failed: {e}", exc_info=True)
+            self.state = "error"
+            return {"state": "error", "message": str(e)}
+
+    def _start_inner(self) -> dict:
         from audio_msgs.msg import AudioChunk
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
+        self._first_chunk_event = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
         self._stop_event.clear()
         # Start VAD in a child process
@@ -544,7 +785,7 @@ class _ASRNode(Node):
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                  self._kws_cfg),
+                  self._kws_cfg, self._save_vad_segments, self._max_saved_segments),
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
@@ -552,8 +793,20 @@ class _ASRNode(Node):
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
+        self.state = "starting"
+        self._worker_ready = threading.Event()
+        log.info("[asr] waiting for first audio chunk...")
+        # Block until first audio chunk arrives or stop() cancels
+        self._first_chunk_event.wait()
+        if self._stop_event.is_set():
+            self.state = "idle"
+            return {"state": "idle"}
+        # Wait for worker to finish initialization (IPA precompute etc.)
+        self._worker_ready.wait()
+        if self.state == "error":
+            return {"state": "error", "message": "ASR worker failed to initialize (check logs)"}
         self.state = "running"
-        log.info("[asr] started, waiting for audio data...")
+        log.info("[asr] started, receiving audio data")
         return self._status_dict()
 
     def stop(self) -> dict:
@@ -561,6 +814,11 @@ class _ASRNode(Node):
         if self._sub:
             self.destroy_subscription(self._sub); self._sub = None
         self._stop_event.set()
+        # Unblock start() if it's waiting
+        if hasattr(self, '_first_chunk_event'):
+            self._first_chunk_event.set()
+        if hasattr(self, '_worker_ready'):
+            self._worker_ready.set()
         if self._vad_stop:
             self._vad_stop.set()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
@@ -583,6 +841,9 @@ class _ASRNode(Node):
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
             return
+        # Signal first chunk arrival to unblock start()
+        if not self._first_chunk_event.is_set():
+            self._first_chunk_event.set()
         # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder
         if self._vad_proc and not self._vad_proc.is_alive():
             log.warning(f"[asr] VAD worker died (exitcode={self._vad_proc.exitcode}), stopping ASR")
@@ -605,6 +866,32 @@ class _ASRNode(Node):
             pass  # drop if severely behind
 
     def _worker(self):
+        try:
+            self._worker_inner()
+        except Exception as e:
+            log.error(f"[asr] worker fatal error: {e}", exc_info=True)
+            self.state = "error"
+            if hasattr(self, '_worker_ready'):
+                self._worker_ready.set()
+
+    def _worker_inner(self):
+        # Pre-compute keyword IPA if in asr_kws mode
+        trigger_mode = self._kws_cfg.get('trigger_mode', 'kws')
+        keyword_ipa = None
+        asr_kws_threshold = float(self._kws_cfg.get('asr_kws_threshold', 0.3))
+        if trigger_mode == 'asr_kws':
+            kw_text = self._kws_cfg.get('asr_kws_keyword', '')
+            if kw_text:
+                keyword_ipa = _text_to_ipa(kw_text)
+                log.info(f"[asr] asr_kws mode: keyword='{kw_text}' ipa={keyword_ipa} threshold={asr_kws_threshold}")
+            else:
+                log.warning("[asr] asr_kws mode but no keyword configured, falling back to vad mode")
+                trigger_mode = 'vad'
+
+        # Signal that worker init is complete
+        if hasattr(self, '_worker_ready'):
+            self._worker_ready.set()
+
         while not self._stop_event.is_set():
             try:
                 utterance, start_ts, end_ts = self._utterance_queue.get(timeout=1)
@@ -614,6 +901,21 @@ class _ASRNode(Node):
                 wav   = _pcm16_to_wav(utterance)
                 text  = self._adapter.transcribe(wav, self._language)
                 if not text.strip(): continue
+
+                # ASR-based keyword spotting
+                if trigger_mode == 'asr_kws' and keyword_ipa:
+                    text_ipa = _text_to_ipa(text)
+                    matched, end_pos = _find_keyword_in_ipa(text_ipa, keyword_ipa, asr_kws_threshold)
+                    log.info(f"[asr] asr_kws: text='{text}' ipa={text_ipa} dist_matched={matched} end={end_pos}")
+                    if not matched:
+                        continue
+                    # Extract text after keyword
+                    remaining = _extract_after_keyword(text, kw_text, end_pos)
+                    log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
+                    if not remaining.strip():
+                        continue
+                    text = remaining
+
                 result = {"text": text, "audio_start_ts": start_ts,
                           "audio_end_ts": end_ts, "asr_complete_ts": time.time()}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
@@ -647,6 +949,8 @@ class ASRPlugin:
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
         self._kws_cfg      = plugin_cfg.get('kws', {})
+        self._save_vad_segments = False
+        self._max_saved_segments = 1000
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
         self._executor = executor
         log.info(f"[asr] plugin init: model={self._asr_model}, vad={self._vad_backend}, threshold={self._vad_threshold}, "
@@ -736,7 +1040,10 @@ class ASRPlugin:
 
         elif action == "start":
             if self._loading:
-                return {"state": "loading", "message": "Model is being downloaded, please wait..."}
+                # Wait for model to finish loading
+                import time as _time
+                while self._loading:
+                    _time.sleep(0.5)
             if self._load_error:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
             if not self._adapter:
@@ -754,9 +1061,22 @@ class ASRPlugin:
                 node = _ASRNode(input_topic, self._adapter, self._language,
                                 self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                                 kws_cfg=self._kws_cfg,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                                node_suffix=node_key.replace('/', '_').replace('-', '_'),
+                                save_vad_segments=self._save_vad_segments,
+                                max_saved_segments=self._max_saved_segments)
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
+            else:
+                # Sync latest config into existing node before restart
+                node = self._nodes[node_key]
+                node._adapter = self._adapter
+                node._language = self._language
+                node._vad_backend = self._vad_backend
+                node._vad_threshold = self._vad_threshold
+                node._vad_silence_ms = self._vad_silence_ms
+                node._kws_cfg = self._kws_cfg
+                node._save_vad_segments = self._save_vad_segments
+                node._max_saved_segments = self._max_saved_segments
             return self._nodes[node_key].start()
 
         elif action == "stop":
@@ -788,8 +1108,18 @@ class ASRPlugin:
                 self._vad_silence_ms = int(cfg['vad_silence_ms'])
             if 'trigger_mode' in cfg:
                 self._kws_cfg['trigger_mode'] = cfg['trigger_mode']
+            if 'kws_model' in cfg:
+                self._kws_cfg['kws_model'] = cfg['kws_model']
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
+            if 'asr_kws_keyword' in cfg:
+                self._kws_cfg['asr_kws_keyword'] = cfg['asr_kws_keyword']
+            if 'asr_kws_threshold' in cfg:
+                self._kws_cfg['asr_kws_threshold'] = float(cfg['asr_kws_threshold'])
+            if 'save_vad_segments' in cfg:
+                self._save_vad_segments = bool(cfg['save_vad_segments'])
+            if 'max_saved_segments' in cfg:
+                self._max_saved_segments = int(cfg['max_saved_segments'])
             # ASR model switch — load in background if changed
             if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
                 # Stop all running nodes first
@@ -803,11 +1133,10 @@ class ASRPlugin:
                 return {"status": "loading", "asr_model": self._asr_model,
                         "message": f"Switching to model '{self._asr_model}', downloading..."}
             # Stop all nodes (they'll use new config on next start)
+            # Only stop VAD internals — keep node in executor to avoid DDS re-discovery delay
             for key in list(self._nodes.keys()):
-                node = self._nodes.pop(key, None)
-                if node:
-                    node.stop()
-                    self._executor.remove_node(node)
+                node = self._nodes[key]
+                node.stop()
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None

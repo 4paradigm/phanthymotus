@@ -27,6 +27,14 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     ultralytics
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     sherpa-onnx
+RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    phonemizer
+
+# Override base image RMW (some ros-base tags ship cyclonedds by default)
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV ROS_DOMAIN_ID=42
 
 # Fail the build early if the OCR OpenCV dependency cannot be loaded.
 RUN python3 -c "import cv2; print('OpenCV', cv2.__version__, cv2.__file__)"

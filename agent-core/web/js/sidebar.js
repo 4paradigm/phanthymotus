@@ -4,7 +4,8 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar } from './canvas.js';
+import { isMobile, closeSidebarMobile } from './mobile.js';
 
 let _scroll = null;
 let _empty  = null;
@@ -249,7 +250,20 @@ function _buildChip(mcp, tool) {
   const configBtnHtml = hasSharedFields
     ? `<button class="chip-config-btn" title="配置"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
     : '';
-  chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span>${configBtnHtml}`;
+  chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span><button class="mobile-add-btn" title="添加到画布">+</button>${configBtnHtml}`;
+
+  // Mobile add-to-canvas button
+  chip.querySelector('.mobile-add-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const added = addCardFromSidebar({
+      mcpId: mcp.id, toolName: tool.name,
+      driverName: mcp.server_name || mcp.name || mcp.id,
+      hasConfig: !!hasSharedFields,
+      multiInstance: !!(tool.multiInstance),
+    });
+    if (added) closeSidebarMobile();
+  });
 
   // Config button click
   if (hasSharedFields) {
@@ -357,6 +371,7 @@ function _buildToolCard(mcp, tool) {
         <span class="tool-card-name" title="${_esc(tool.name)}">${_esc(tool.name)}</span>
       </div>
       <div class="tool-card-actions">
+        <button class="mobile-add-btn" title="添加到画布">+</button>
         ${hasSharedFields ? '<button class="tool-card-config-btn" title="配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>' : ''}
         <button class="tool-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
       </div>
@@ -369,6 +384,19 @@ function _buildToolCard(mcp, tool) {
   card.querySelector('.tool-card-info-btn').addEventListener('click', (e) => {
     e.stopPropagation();
     _showDetail(mcp, tool);
+  });
+
+  // Mobile add-to-canvas button
+  card.querySelector('.mobile-add-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const added = addCardFromSidebar({
+      mcpId: mcp.id, toolName: tool.name,
+      driverName: mcp.server_name || mcp.name || mcp.id,
+      hasConfig: !!hasSharedFields,
+      multiInstance: !!(tool.multiInstance),
+    });
+    if (added) closeSidebarMobile();
   });
 
   // Config button (only rendered for tools with shared fields)
@@ -605,12 +633,20 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
 
     // Save to per-tool API
     try {
-      await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
+      const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
-    } catch (err) { console.error('[config] save failed:', err); }
+      if (!resp.ok) {
+        alert(`配置保存失败 (HTTP ${resp.status})`);
+        return;
+      }
+    } catch (err) {
+      alert('配置保存失败: ' + err.message);
+      console.error('[config] save failed:', err);
+      return;
+    }
 
     // Update local cache
     _toolConfigs[configKey] = values;
@@ -847,12 +883,20 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
     });
 
     try {
-      await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
+      const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
-    } catch (err) { console.error('[config] instance save failed:', err); }
+      if (!resp.ok) {
+        alert(`配置保存失败 (HTTP ${resp.status})`);
+        return;
+      }
+    } catch (err) {
+      alert('配置保存失败: ' + err.message);
+      console.error('[config] instance save failed:', err);
+      return;
+    }
 
     _toolConfigs[configKey] = values;
     close();

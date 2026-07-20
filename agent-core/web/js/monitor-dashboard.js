@@ -21,20 +21,27 @@ const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, 
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 const CELL_SIZE = 280;  // minimum px per grid cell
 const GAP = 12;         // px gap between cells
-const GRID_COLS = 5;    // fixed 5 columns
+const GRID_COLS = 5;    // fixed 5 columns (desktop)
 let _topicMcpMap = {};  // topic → mcpId, populated on fetch
 
 let _grid = null;
 let _cards = new Map(); // topicPath → { el, renderer, ws, format, mode, col, row, colSpan, rowSpan }
 let _totalCols = GRID_COLS;
 
+function _getResponsiveCols() {
+  if (window.innerWidth <= 480) return 1;
+  if (window.innerWidth <= 768) return 2;
+  return GRID_COLS;
+}
+
 export function activate() {
   _grid = document.getElementById('monitor-dashboard-grid');
   _grid.innerHTML = '';
   _cards.clear();
-  _totalCols = GRID_COLS;
+  _totalCols = _getResponsiveCols();
   _applyGridStyle();
   _fetchAndBuild();
+  window.addEventListener('resize', _onResize);
 }
 
 export function deactivate() {
@@ -44,6 +51,15 @@ export function deactivate() {
   }
   _cards.clear();
   if (_grid) _grid.innerHTML = '';
+  window.removeEventListener('resize', _onResize);
+}
+
+function _onResize() {
+  const cols = _getResponsiveCols();
+  if (cols !== _totalCols) {
+    _totalCols = cols;
+    _applyGridStyle();
+  }
 }
 
 function _applyGridStyle() {

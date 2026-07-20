@@ -754,7 +754,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         raise fastapi.HTTPException(status_code=400, detail='MCP not reachable via HTTP')
 
     headers = {'Content-Type': 'application/json'}
-    timeout = aiohttp.ClientTimeout(total=10)
+    timeout = aiohttp.ClientTimeout(total=None)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Initialize first (required by MCP protocol)

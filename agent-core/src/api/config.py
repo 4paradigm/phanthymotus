@@ -81,6 +81,26 @@ class ServiceTestRequest(BaseModel):
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
+@router.get('/update-channel')
+async def get_update_channel():
+    core = config.main.get('core', {})
+    return {'code': 200, 'data': {'channel': core.get('update_channel', 'ga')}}
+
+
+class UpdateChannelRequest(BaseModel):
+    channel: str  # preview | release | ga
+
+
+@router.put('/update-channel')
+async def set_update_channel(req: UpdateChannelRequest):
+    if req.channel not in ('preview', 'release', 'ga'):
+        raise fastapi.HTTPException(status_code=422, detail='channel must be preview | release | ga')
+    core = config.main.get('core', {})
+    core['update_channel'] = req.channel
+    config.main['core'] = core
+    return {'code': 200, 'data': {'channel': req.channel}}
+
+
 @router.get('/status')
 async def config_status():
     core = config.main.get('core', {})

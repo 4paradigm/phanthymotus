@@ -54,3 +54,17 @@ function _updateToggleUI(btns, activeMode) {
     b.classList.toggle('active', b.dataset.mode === activeMode);
   });
 }
+
+/** Called by mobile tab bar to enter monitor mode */
+export function enterMonitorMode() {
+  if (_active) return;
+  const btns = document.querySelectorAll('.mode-toggle-btn');
+  _enterMonitor(btns);
+}
+
+/** Called by mobile tab bar to exit monitor mode */
+export function exitMonitorMode() {
+  if (!_active) return;
+  const btns = document.querySelectorAll('.mode-toggle-btn');
+  _exitMonitor(btns);
+}

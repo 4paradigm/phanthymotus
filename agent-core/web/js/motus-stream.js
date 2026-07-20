@@ -19,7 +19,8 @@ export function connectMotus(onStatusChange) {
   const _cb = onStatusChange || (() => {});
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    _ws = new WebSocket(`${proto}://${location.host}/ws/motus`);
+    const token = localStorage.getItem('phanthy_access_token') || '';
+    _ws = new WebSocket(`${proto}://${location.host}/ws/motus?token=${encodeURIComponent(token)}`);
 
     _ws.onopen = () => {
       _retryDelay = 1000;

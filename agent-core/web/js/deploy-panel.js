@@ -22,6 +22,45 @@ export function initDeployPanel() {
   document.getElementById('deploy-close').addEventListener('click', _close);
   document.getElementById('deploy-modal-confirm').addEventListener('click', _confirmAll);
   document.getElementById('hw-search').addEventListener('input', () => _renderHardwareSection(_catalog.driver));
+
+  // Channel selector
+  const channelSelect = document.getElementById('deploy-channel-select');
+  channelSelect.addEventListener('change', _onChannelChange);
+  _loadChannel();
+}
+
+// ── Channel management ────────────────────────────────────────────────────
+
+async function _loadChannel() {
+  try {
+    const res = await fetch('/api/config/update-channel');
+    const json = await res.json();
+    const channel = json.data?.channel || 'ga';
+    document.getElementById('deploy-channel-select').value = channel;
+  } catch { /* keep default */ }
+}
+
+async function _onChannelChange(e) {
+  const channel = e.target.value;
+  const warnings = {
+    preview: '预览版可能不稳定，仅建议用于测试环境。确定切换？',
+    release: '正式版已通过基础测试，但未经长期稳定性验证。确定切换？',
+  };
+  if (warnings[channel] && !confirm(warnings[channel])) {
+    // Revert selection
+    await _loadChannel();
+    return;
+  }
+  try {
+    await fetch('/api/config/update-channel', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel }),
+    });
+    // Reload catalog with new channel
+    await _loadCatalog(true);
+    _render();
+  } catch { /* ignore */ }
 }
 
 function _open() {
