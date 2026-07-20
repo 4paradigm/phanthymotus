@@ -1,6 +1,7 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
-ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/guohongjie/models/ppocr-v6-tiny
+# ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/guohongjie/models/ppocr-v6-tiny
+ARG OCR_MODEL_BASE_URL=http://172.28.4.81:8200/ppocr-v6-tiny
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR OCR_MODEL_BASE_URL
 
