@@ -27,6 +27,8 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("    device_id: 0", config)
         self.assertIn("    gpu_mem_mb: 512", config)
         self.assertIn("    max_side_len: 960", config)
+        self.assertIn("    max_input_mb: 16", config)
+        self.assertIn("    max_decode_mb: 64", config)
         self.assertIn("    num_threads: 1", config)
         self.assertRegex(
             config,

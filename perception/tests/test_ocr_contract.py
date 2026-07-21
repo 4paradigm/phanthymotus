@@ -67,6 +67,7 @@ class OCRContractTest(unittest.TestCase):
     def setUpClass(cls):
         _install_ros_stubs()
         cls.ocr = importlib.import_module("plugins.ocr")
+        cls.ocr_runtime = importlib.import_module("plugins.ocr_runtime")
 
     @staticmethod
     def _jpeg(width, height):
@@ -125,6 +126,8 @@ class OCRContractTest(unittest.TestCase):
                     "use_angle_cls": True,
                     "num_threads": 2,
                     "max_side_len": 1600,
+                    "max_input_mb": 16,
+                    "max_decode_mb": 64,
                     "large_image_strategy": {
                         "enabled": True,
                         "trigger_side": 2400,
@@ -141,6 +144,8 @@ class OCRContractTest(unittest.TestCase):
             use_angle_cls=True,
             num_threads=2,
             max_side_len=1600,
+            max_input_mb=16,
+            max_decode_mb=64,
             large_image_strategy={
                 "enabled": True,
                 "trigger_side": 2400,
@@ -237,6 +242,25 @@ class OCRContractTest(unittest.TestCase):
                 "language": "zh",
             },
         )
+
+    def test_image_limit_error_only_fails_current_payload(self):
+        adapter = mock.Mock()
+        adapter.recognize.side_effect = [
+            self.ocr_runtime.ImageTooLargeError("decode limit exceeded"),
+            [{"text": "next", "bbox": [1, 2, 3, 4], "score": 0.9}],
+        ]
+
+        rejected = self.ocr.recognize_to_payload(
+            adapter, b"large", "zh", 123.0
+        )
+        following = self.ocr.recognize_to_payload(
+            adapter, b"normal", "zh", 124.0
+        )
+
+        self.assertEqual(rejected["items"], [])
+        self.assertEqual(rejected["error"], "decode limit exceeded")
+        self.assertEqual(following["text"], "next")
+        self.assertNotIn("error", following)
 
     def test_rapidocr_adapter_uses_only_external_cpu_models(self):
         fake_engine = mock.Mock()
@@ -495,6 +519,9 @@ class OCRContractTest(unittest.TestCase):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)
         adapter._use_angle_cls = True
         adapter._max_side_len = 1600
+        adapter._probe_image_header = mock.Mock(
+            return_value=self.ocr_runtime.ImageHeader("JPEG", 200, 100)
+        )
         adapter._inference_lock = threading.Lock()
         adapter._engine = mock.Mock(
             return_value=types.SimpleNamespace(boxes=[], txts=(), scores=())
@@ -563,6 +590,63 @@ class OCRContractTest(unittest.TestCase):
         cv2_module.imdecode.assert_called_once_with("encoded-buffer", 4)
         cv2_module.resize.assert_not_called()
         self.assertEqual(result[0]["bbox"], [40, 80, 400, 200])
+
+    def test_oversized_non_jpeg_is_rejected_before_decode(self):
+        adapter = object.__new__(self.ocr.RapidOCRAdapter)
+        adapter._large_image_strategy = None
+        adapter._max_side_len = 960
+        adapter._max_input_bytes = 16 * 1024 * 1024
+        adapter._max_decode_bytes = 64 * 1024 * 1024
+        adapter._probe_image_header = mock.Mock(
+            return_value=self.ocr_runtime.ImageHeader("PNG", 10000, 10000)
+        )
+        cv2_module = types.ModuleType("cv2")
+        cv2_module.IMREAD_COLOR = 1
+        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
+        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
+        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
+        cv2_module.imdecode = mock.Mock()
+        numpy_module = types.ModuleType("numpy")
+        numpy_module.uint8 = "uint8"
+        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
+
+        with mock.patch.dict(
+            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        ):
+            with self.assertRaisesRegex(
+                self.ocr_runtime.ImageTooLargeError, "10000x10000"
+            ):
+                adapter.recognize(b"small-compressed-png")
+
+        cv2_module.imdecode.assert_not_called()
+        numpy_module.frombuffer.assert_not_called()
+
+    def test_jpeg_too_large_after_reduced_decode_is_rejected_before_decode(self):
+        adapter = object.__new__(self.ocr.RapidOCRAdapter)
+        adapter._large_image_strategy = None
+        adapter._max_side_len = 960
+        adapter._max_input_bytes = 16 * 1024 * 1024
+        adapter._max_decode_bytes = 64 * 1024 * 1024
+        cv2_module = types.ModuleType("cv2")
+        cv2_module.IMREAD_COLOR = 1
+        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
+        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
+        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
+        cv2_module.imdecode = mock.Mock()
+        numpy_module = types.ModuleType("numpy")
+        numpy_module.uint8 = "uint8"
+        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
+
+        with mock.patch.dict(
+            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        ):
+            with self.assertRaisesRegex(
+                self.ocr_runtime.ImageTooLargeError, "65000x65000"
+            ):
+                adapter.recognize(self._jpeg(65000, 65000))
+
+        cv2_module.imdecode.assert_not_called()
+        numpy_module.frombuffer.assert_not_called()
 
     def test_single_pass_scales_float_polygon_before_rounding(self):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)
@@ -649,6 +733,9 @@ class OCRContractTest(unittest.TestCase):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)
         adapter._use_angle_cls = True
         adapter._max_side_len = 1600
+        adapter._probe_image_header = mock.Mock(
+            return_value=self.ocr_runtime.ImageHeader("PNG", 4000, 3000)
+        )
         adapter._inference_lock = threading.Lock()
         adapter._engine = mock.Mock(
             return_value=types.SimpleNamespace(

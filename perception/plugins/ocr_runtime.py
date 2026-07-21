@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import tempfile
 import threading
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 from plugins.ocr_tiled_strategy import (
@@ -13,6 +15,42 @@ from plugins.ocr_tiled_strategy import (
 
 
 REQUIRED_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
+_MIB = 1024 * 1024
+_DECODE_CHANNELS = 3
+
+
+class ImageTooLargeError(ValueError):
+    """Raised before inference when an image would exceed a configured limit."""
+
+
+@dataclass(frozen=True)
+class ImageHeader:
+    format: str
+    width: int
+    height: int
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return self.width, self.height
+
+
+def probe_image_header(image_bytes: bytes) -> ImageHeader:
+    jpeg_size = jpeg_dimensions(image_bytes)
+    if jpeg_size is not None:
+        return ImageHeader("JPEG", *jpeg_size)
+
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(image_bytes)) as image:
+            width, height = image.size
+            image_format = str(image.format or "unknown").upper()
+    except Exception as exc:
+        raise ValueError("invalid or unsupported compressed image header") from exc
+
+    if width <= 0 or height <= 0:
+        raise ValueError("compressed image has invalid dimensions")
+    return ImageHeader(image_format, width, height)
 
 
 def normalize_rapidocr_output(
@@ -99,6 +137,8 @@ class RapidOCRAdapter:
         use_angle_cls: bool = True,
         num_threads: int = 2,
         max_side_len: int = 1600,
+        max_input_mb: int = 16,
+        max_decode_mb: int = 64,
         large_image_strategy: dict | None = None,
     ):
         root = Path(model_dir)
@@ -129,6 +169,12 @@ class RapidOCRAdapter:
 
         self._use_angle_cls = use_angle_cls
         self._max_side_len = max_side_len
+        if max_input_mb <= 0:
+            raise ValueError("max_input_mb must be positive")
+        if max_decode_mb <= 0:
+            raise ValueError("max_decode_mb must be positive")
+        self._max_input_bytes = int(max_input_mb) * _MIB
+        self._max_decode_bytes = int(max_decode_mb) * _MIB
         self._request_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         strategy_config = LargeImageStrategyConfig.from_mapping(
@@ -208,21 +254,58 @@ class RapidOCRAdapter:
     def _jpeg_dimensions(image_bytes: bytes) -> tuple[int, int] | None:
         return jpeg_dimensions(image_bytes)
 
-    def _decode_flag(self, cv2, source_size: tuple[int, int] | None) -> int:
-        if not source_size or self._max_side_len <= 0:
-            return cv2.IMREAD_COLOR
+    @staticmethod
+    def _probe_image_header(image_bytes: bytes) -> ImageHeader:
+        return probe_image_header(image_bytes)
+
+    def _jpeg_decode_factor(self, source_size: tuple[int, int]) -> int:
+        max_side_len = getattr(self, "_max_side_len", 1600)
+        if max_side_len <= 0:
+            return 1
 
         longest_side = max(source_size)
-        if longest_side <= self._max_side_len:
+        if longest_side <= max_side_len:
+            return 1
+        for factor in (2, 4, 8):
+            if math.ceil(longest_side / factor) <= max_side_len:
+                return factor
+        return 8
+
+    def _preflight_image(self, image_bytes: bytes) -> ImageHeader:
+        max_input_bytes = getattr(self, "_max_input_bytes", 16 * _MIB)
+        if len(image_bytes) > max_input_bytes:
+            raise ImageTooLargeError(
+                f"compressed image is {len(image_bytes)} bytes; "
+                f"limit is {max_input_bytes} bytes"
+            )
+
+        header = self._probe_image_header(image_bytes)
+        factor = (
+            self._jpeg_decode_factor(header.size)
+            if header.format == "JPEG"
+            else 1
+        )
+        decoded_width = math.ceil(header.width / factor)
+        decoded_height = math.ceil(header.height / factor)
+        estimated_bytes = decoded_width * decoded_height * _DECODE_CHANNELS
+        max_decode_bytes = getattr(self, "_max_decode_bytes", 64 * _MIB)
+        if estimated_bytes > max_decode_bytes:
+            raise ImageTooLargeError(
+                f"{header.format} image {header.width}x{header.height} would decode "
+                f"to about {estimated_bytes} bytes after {factor}x reduction; "
+                f"limit is {max_decode_bytes} bytes"
+            )
+        return header
+
+    def _decode_flag(self, cv2, source_size: tuple[int, int] | None) -> int:
+        if not source_size:
             return cv2.IMREAD_COLOR
-        for factor, flag in (
-            (2, cv2.IMREAD_REDUCED_COLOR_2),
-            (4, cv2.IMREAD_REDUCED_COLOR_4),
-            (8, cv2.IMREAD_REDUCED_COLOR_8),
-        ):
-            if math.ceil(longest_side / factor) <= self._max_side_len:
-                return flag
-        return cv2.IMREAD_REDUCED_COLOR_8
+        return {
+            1: cv2.IMREAD_COLOR,
+            2: cv2.IMREAD_REDUCED_COLOR_2,
+            4: cv2.IMREAD_REDUCED_COLOR_4,
+            8: cv2.IMREAD_REDUCED_COLOR_8,
+        }[self._jpeg_decode_factor(source_size)]
 
     def _infer_image(self, image) -> list[dict]:
         with self._inference_lock:
@@ -238,15 +321,26 @@ class RapidOCRAdapter:
         import cv2
         import numpy as np
 
+        header = self._preflight_image(image_bytes)
         encoded = np.frombuffer(image_bytes, dtype=np.uint8)
-        source_size = self._jpeg_dimensions(image_bytes)
-        image = cv2.imdecode(encoded, self._decode_flag(cv2, source_size))
+        source_size = header.size
+        jpeg_size = source_size if header.format == "JPEG" else None
+        image = cv2.imdecode(encoded, self._decode_flag(cv2, jpeg_size))
         if image is None:
             raise ValueError("invalid compressed image")
 
         decoded_height, decoded_width = image.shape[:2]
-        if source_size is None:
-            source_size = (decoded_width, decoded_height)
+        decoded_bytes = getattr(
+            image,
+            "nbytes",
+            decoded_width * decoded_height * _DECODE_CHANNELS,
+        )
+        max_decode_bytes = getattr(self, "_max_decode_bytes", 64 * _MIB)
+        if decoded_bytes > max_decode_bytes:
+            raise ImageTooLargeError(
+                f"decoded image uses {decoded_bytes} bytes; "
+                f"limit is {max_decode_bytes} bytes"
+            )
 
         if (
             self._max_side_len > 0
@@ -273,7 +367,8 @@ class RapidOCRAdapter:
     def _recognize_request(self, image_bytes: bytes) -> list:
         strategy = getattr(self, "_large_image_strategy", None)
         if strategy is not None:
-            source_size = self._jpeg_dimensions(image_bytes)
+            header = self._preflight_image(image_bytes)
+            source_size = header.size
             if strategy.should_handle(source_size):
                 return strategy.recognize(image_bytes, self._infer_image)
         return self._recognize_single_pass(image_bytes)
