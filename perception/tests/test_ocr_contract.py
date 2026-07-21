@@ -128,6 +128,10 @@ class OCRContractTest(unittest.TestCase):
                     "max_side_len": 1600,
                     "max_input_mb": 16,
                     "max_decode_mb": 64,
+                    "memory_guard": {
+                        "enabled": True,
+                        "expected_workers": 10,
+                    },
                     "large_image_strategy": {
                         "enabled": True,
                         "trigger_side": 2400,
@@ -146,6 +150,10 @@ class OCRContractTest(unittest.TestCase):
             max_side_len=1600,
             max_input_mb=16,
             max_decode_mb=64,
+            memory_guard={
+                "enabled": True,
+                "expected_workers": 10,
+            },
             large_image_strategy={
                 "enabled": True,
                 "trigger_side": 2400,
@@ -617,6 +625,38 @@ class OCRContractTest(unittest.TestCase):
                 self.ocr_runtime.ImageTooLargeError, "10000x10000"
             ):
                 adapter.recognize(b"small-compressed-png")
+
+        cv2_module.imdecode.assert_not_called()
+        numpy_module.frombuffer.assert_not_called()
+
+    def test_dynamic_memory_pressure_rejects_before_decode(self):
+        adapter = object.__new__(self.ocr.RapidOCRAdapter)
+        adapter._large_image_strategy = None
+        adapter._max_side_len = 960
+        adapter._max_input_bytes = 16 * 1024 * 1024
+        adapter._max_decode_bytes = 64 * 1024 * 1024
+        adapter._memory_guard = mock.Mock()
+        adapter._memory_guard.decode_limit_bytes.return_value = 8 * 1024 * 1024
+        adapter._probe_image_header = mock.Mock(
+            return_value=self.ocr_runtime.ImageHeader("PNG", 2000, 2000)
+        )
+        cv2_module = types.ModuleType("cv2")
+        cv2_module.IMREAD_COLOR = 1
+        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
+        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
+        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
+        cv2_module.imdecode = mock.Mock()
+        numpy_module = types.ModuleType("numpy")
+        numpy_module.uint8 = "uint8"
+        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
+
+        with mock.patch.dict(
+            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        ):
+            with self.assertRaisesRegex(
+                self.ocr_runtime.ImageTooLargeError, "dynamic limit"
+            ):
+                adapter.recognize(b"compressed-png")
 
         cv2_module.imdecode.assert_not_called()
         numpy_module.frombuffer.assert_not_called()

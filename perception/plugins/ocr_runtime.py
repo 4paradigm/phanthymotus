@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
+from plugins.ocr_memory_guard import MemoryGuardConfig, OCRMemoryGuard
 from plugins.ocr_tiled_strategy import (
     AdaptiveTiledOCRStrategy,
     LargeImageStrategyConfig,
@@ -139,6 +140,7 @@ class RapidOCRAdapter:
         max_side_len: int = 1600,
         max_input_mb: int = 16,
         max_decode_mb: int = 64,
+        memory_guard: dict | None = None,
         large_image_strategy: dict | None = None,
     ):
         root = Path(model_dir)
@@ -175,6 +177,9 @@ class RapidOCRAdapter:
             raise ValueError("max_decode_mb must be positive")
         self._max_input_bytes = int(max_input_mb) * _MIB
         self._max_decode_bytes = int(max_decode_mb) * _MIB
+        self._memory_guard = OCRMemoryGuard(
+            MemoryGuardConfig.from_mapping(memory_guard)
+        )
         self._request_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         strategy_config = LargeImageStrategyConfig.from_mapping(
@@ -258,8 +263,13 @@ class RapidOCRAdapter:
     def _probe_image_header(image_bytes: bytes) -> ImageHeader:
         return probe_image_header(image_bytes)
 
-    def _jpeg_decode_factor(self, source_size: tuple[int, int]) -> int:
-        max_side_len = getattr(self, "_max_side_len", 1600)
+    def _jpeg_decode_factor(
+        self,
+        source_size: tuple[int, int],
+        max_side_len: int | None = None,
+    ) -> int:
+        if max_side_len is None:
+            max_side_len = getattr(self, "_max_side_len", 1600)
         if max_side_len <= 0:
             return 1
 
@@ -271,7 +281,18 @@ class RapidOCRAdapter:
                 return factor
         return 8
 
-    def _preflight_image(self, image_bytes: bytes) -> ImageHeader:
+    def _current_decode_limit(self) -> int:
+        hard_limit = getattr(self, "_max_decode_bytes", 64 * _MIB)
+        memory_guard = getattr(self, "_memory_guard", None)
+        if memory_guard is None:
+            return hard_limit
+        return memory_guard.decode_limit_bytes(hard_limit)
+
+    def _preflight_image(
+        self,
+        image_bytes: bytes,
+        jpeg_max_side: int | None = None,
+    ) -> ImageHeader:
         max_input_bytes = getattr(self, "_max_input_bytes", 16 * _MIB)
         if len(image_bytes) > max_input_bytes:
             raise ImageTooLargeError(
@@ -281,19 +302,23 @@ class RapidOCRAdapter:
 
         header = self._probe_image_header(image_bytes)
         factor = (
-            self._jpeg_decode_factor(header.size)
+            self._jpeg_decode_factor(header.size, jpeg_max_side)
             if header.format == "JPEG"
             else 1
         )
         decoded_width = math.ceil(header.width / factor)
         decoded_height = math.ceil(header.height / factor)
         estimated_bytes = decoded_width * decoded_height * _DECODE_CHANNELS
-        max_decode_bytes = getattr(self, "_max_decode_bytes", 64 * _MIB)
+        max_decode_bytes = self._current_decode_limit()
+        if max_decode_bytes <= 0:
+            raise ImageTooLargeError(
+                "dynamic limit is unavailable because memory headroom is too low"
+            )
         if estimated_bytes > max_decode_bytes:
             raise ImageTooLargeError(
                 f"{header.format} image {header.width}x{header.height} would decode "
                 f"to about {estimated_bytes} bytes after {factor}x reduction; "
-                f"limit is {max_decode_bytes} bytes"
+                f"dynamic limit is {max_decode_bytes} bytes"
             )
         return header
 
@@ -335,7 +360,7 @@ class RapidOCRAdapter:
             "nbytes",
             decoded_width * decoded_height * _DECODE_CHANNELS,
         )
-        max_decode_bytes = getattr(self, "_max_decode_bytes", 64 * _MIB)
+        max_decode_bytes = self._current_decode_limit()
         if decoded_bytes > max_decode_bytes:
             raise ImageTooLargeError(
                 f"decoded image uses {decoded_bytes} bytes; "
@@ -370,6 +395,14 @@ class RapidOCRAdapter:
             header = self._preflight_image(image_bytes)
             source_size = header.size
             if strategy.should_handle(source_size):
+                strategy_config = getattr(strategy, "config", None)
+                decode_hard_limit = getattr(
+                    strategy_config, "decode_hard_limit", None
+                )
+                if isinstance(decode_hard_limit, int):
+                    self._preflight_image(
+                        image_bytes, jpeg_max_side=decode_hard_limit
+                    )
                 return strategy.recognize(image_bytes, self._infer_image)
         return self._recognize_single_pass(image_bytes)
 

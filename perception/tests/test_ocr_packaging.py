@@ -29,6 +29,10 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("    max_side_len: 960", config)
         self.assertIn("    max_input_mb: 16", config)
         self.assertIn("    max_decode_mb: 64", config)
+        self.assertIn("    memory_guard:", config)
+        self.assertIn("      expected_workers: 10", config)
+        self.assertIn("      min_decode_mb: 8", config)
+        self.assertIn("      headroom_ratio: 0.2", config)
         self.assertIn("    num_threads: 1", config)
         self.assertRegex(
             config,

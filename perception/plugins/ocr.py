@@ -95,6 +95,16 @@ TOOLS = [
                 "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "shared"},
                 "max_input_mb": {"type": "integer", "minimum": 1, "default": 16, "description": "压缩图片大小上限(MB)", "scope": "shared"},
                 "max_decode_mb": {"type": "integer", "minimum": 1, "default": 64, "description": "单张图片解码内存上限(MB)", "scope": "shared"},
+                "memory_guard": {
+                    "type": "object",
+                    "scope": "shared",
+                    "properties": {
+                        "enabled": {"type": "boolean", "default": True},
+                        "expected_workers": {"type": "integer", "minimum": 1, "default": 10},
+                        "min_decode_mb": {"type": "integer", "minimum": 1, "default": 8},
+                        "headroom_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.2},
+                    },
+                },
             },
             "required": ["provider"]
         },
@@ -456,6 +466,7 @@ def _adapter_signature(cfg: dict) -> tuple:
             int(cfg.get('max_side_len', 1600)),
             int(cfg.get('max_input_mb', 16)),
             int(cfg.get('max_decode_mb', 64)),
+            _freeze_config(cfg.get('memory_guard', {})),
             _freeze_config(cfg.get('large_image_strategy', {})),
         )
     if provider in ('openai', 'qwen'):
@@ -484,6 +495,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             max_side_len=int(cfg.get('max_side_len', 1600)),
             max_input_mb=int(cfg.get('max_input_mb', 16)),
             max_decode_mb=int(cfg.get('max_decode_mb', 64)),
+            memory_guard=dict(cfg.get('memory_guard') or {}),
             large_image_strategy=dict(
                 cfg.get('large_image_strategy') or {}
             ),

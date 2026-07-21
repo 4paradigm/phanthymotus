@@ -65,6 +65,11 @@ plugins:
     max_side_len: 960          # 68 items 保持不变，640 会掉精度(54)
     max_input_mb: 16           # 压缩数据超限时只拒绝当前 case
     max_decode_mb: 64          # 解码前按尺寸估算，避免异常大图触发 OOM
+    memory_guard:
+      enabled: true
+      expected_workers: 10     # 榜单观察到的并发 OCR 容器数
+      min_decode_mb: 8         # 低于该动态预算时拒绝当前 case
+      headroom_ratio: 0.2      # 每个实例最多使用可用余量的 20%
     min_interval_ms: 5000      # 帧处理最小间隔，0=不限帧
     large_image_strategy:
       # 榜单会并发启动多个容器；默认单次缩放推理，避免分块产生内存峰值。
