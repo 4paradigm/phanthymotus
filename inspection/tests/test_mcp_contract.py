@@ -186,10 +186,13 @@ class InspectionDeployContractTest(unittest.TestCase):
         self.assertIn("UBUNTU_PORTS_MIRROR=https://ports.ubuntu.com/ubuntu-ports", dockerfile)
         self.assertIn("mirrors.tencentyun.com/ubuntu-ports", dockerfile)
         self.assertIn("apt-get update -o Acquire::Retries=3", dockerfile)
+        self.assertIn("--ignore-installed", dockerfile)
+        self.assertIn("--target ${INSPECTION_PYTHON_DIR}", dockerfile)
+        self.assertIn("ENV PYTHONPATH=/opt/inspection-python:${PYTHONPATH}", dockerfile)
+        self.assertIn("isolated inspection Python dependencies PASS", dockerfile)
         self.assertIn("/opt/ros/humble/install/setup.bash", dockerfile)
         self.assertIn("/opt/ros/humble/setup.bash", dockerfile)
-        self.assertIn("pyyaml>=5.3.1,<7", requirements)
-        self.assertNotIn("pyyaml==", requirements)
+        self.assertIn("pyyaml==6.0.2", requirements)
 
 
 if __name__ == "__main__":

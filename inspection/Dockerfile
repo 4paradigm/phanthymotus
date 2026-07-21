@@ -25,7 +25,14 @@ RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|
 
 WORKDIR /work
 COPY requirements.txt /work/requirements.txt
-RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
+ENV INSPECTION_PYTHON_DIR=/opt/inspection-python
+RUN python3 -m pip install --no-cache-dir --ignore-installed \
+        --target ${INSPECTION_PYTHON_DIR} \
+        -i ${PYPI_MIRROR} \
+        -r /work/requirements.txt && \
+    PYTHONPATH=${INSPECTION_PYTHON_DIR} python3 -c \
+        'import pathlib, qcloud_cos, yaml; path = pathlib.Path(yaml.__file__).resolve(); assert str(path).startswith("/opt/inspection-python/"), path; assert yaml.__version__ == "6.0.2", yaml.__version__; print("isolated inspection Python dependencies PASS")'
+ENV PYTHONPATH=/opt/inspection-python:${PYTHONPATH}
 
 COPY . /work/
 

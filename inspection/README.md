@@ -87,7 +87,7 @@ node --check agent-core/web/js/flow-view.js
 - Jetson 管线固定为 `nvjpegdec → nvvidconv → nvv4l2h264enc → splitmuxsink`；指定硬件编码器不可用时启动失败，不做隐式 CPU 降级；
 - 上海 G1 的 Docker daemon 没有名为 `nvidia` 的 runtime，release 基础镜像中的 Jetson GStreamer 插件又是占位文件；部署契约因此从宿主只读挂载 `tegra` / `tegra-egl` 运行库、三个管线插件和 `libgstnvexifmeta.so`，并设置对应 `LD_LIBRARY_PATH`，不依赖 `runtime: nvidia`；
 - 当 release 基础镜像仍使用已无法解析的 `mirrors.tencentyun.com/ubuntu-ports` 时，Dockerfile 会在安装依赖前改用已验证可达的官方 `https://ports.ubuntu.com/ubuntu-ports`；可用 `UBUNTU_PORTS_MIRROR` build arg 显式覆盖；
-- PyYAML 约束为 `>=5.3.1,<7`：Jetson release 基础镜像已由 Ubuntu/distutils 提供 5.3.1 时直接复用，避免 pip 尝试卸载系统包；其他镜像缺失时仍会自动安装兼容版本；
+- Python 依赖通过 `pip --target /opt/inspection-python --ignore-installed` 安装到隔离目录，不卸载或覆盖 Jetson release 镜像中由 Ubuntu/distutils 管理的 PyYAML 5.3.1；镜像构建会断言运行时实际加载隔离的 PyYAML 6.0.2 和 COS SDK；
 - 写入路径：`.wav.part` / `.mp4.part` → fsync → 媒体/JSON 原子 rename → SQLite `FINALIZED`；
 - 异常退出留下的 MP4 先由 `gst-discoverer-1.0` 校验，可读才恢复，否则保留为 `CORRUPT` 诊断文件；
 - SQLite 使用 WAL 和 `synchronous=FULL`，正式文件存在但账本缺失时可扫描重建。
