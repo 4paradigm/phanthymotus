@@ -57,6 +57,8 @@ curl -s http://127.0.0.1:15671/mcp \
 
 G1 上的持久化宿主路径为 `/opt/phanthy-motus/secrets/phanthymotus/cos/default.json`，通过只读挂载映射到上述容器路径。不要把 secret 放在宿主 `/run`：该目录重启后可能被清空。部署脚本只在镜像构建和多媒体预检通过后才上传临时 secret，安装后无论成功或失败都会删除远端暂存副本。
 
+COSBrowser / coscli 的 `mode=SecretKey` 配置会将 SecretId / SecretKey 加密存储，不能把 YAML 中的 64 字符密文直接写入上述 JSON。部署工具必须通过官方 coscli 解密通道把凭据直接写入 `0600` 临时文件，且不得把 `coscli config show` 的原始输出发往终端或日志。
+
 每个 segment 的媒体文件和 JSON metadata 作为两个不可变对象上传。上传后必须通过 HEAD 同时校验 `Content-Length` 与 `x-cos-meta-sha256`，才记为 `UPLOADED_VERIFIED`。远端同名对象内容不一致时进入 `CONFLICT`，不覆盖。
 
 配置后可通过 MCP 做小对象上传 + HEAD 校验：
@@ -101,18 +103,19 @@ node --check agent-core/web/js/flow-view.js
 
 ## 当前边界
 
-- Audio Inspector 为 `runtime_mode=ros2-durable-audio`、`storage_ready=true`，已真实本地落盘；
-- Video Inspector 为 `runtime_mode=ros2-gstreamer`、`storage_ready=true`，已实现本地 MP4 落盘；
-- G1 宿主的 NVIDIA GStreamer 元素和管线解析已验证；旧 Perception 容器缺少 Python GStreamer typelib、`gst-discoverer-1.0`，且 ROS setup 路径为 `/opt/ros/humble/install/setup.bash`。本分支 Dockerfile 已补齐依赖并兼容两种 ROS 布局，但新镜像尚未在 G1 实际构建；
-- 真实相机录制、播放和长时间稳定性仍需部署后实机验收；
-- COS 上传、HEAD 校验、冲突保护、重试与本地滚动的 fake backend 测试已通过，真实 bucket 的 `testupload` 尚未执行；
+- 2026-07-21 已在上海 G1 实际构建并部署 `phanthymotus/inspection:local-7624db48f262-g1-test`；Jetson GStreamer 硬件管线预检、Core 注册和两张 Inspector 发现均通过；
+- Audio Inspector 已从 `/phanthymotus_g1_driver/mic/audio` 采集真实 `AudioChunk`，完成 WAV/JSON 成对落盘、COS 上传及 HEAD 大小/SHA-256 校验；
+- Video Inspector 已从 `/phanthymotus_g1_driver/ext_camera/card-mrnbwcls6nji/rgb` 采集真实 `CompressedImage`，使用 Jetson NVENC 完成 MP4/JSON 成对落盘、播放发现、COS 上传及 HEAD 校验；
+- 最终真实验收前缀为 `cos://embodied-ai-1252788780/inspection-acceptance/20260721-164837/`，共 12 个对象；验收后 Audio / Video Inspector 和 ext_camera 均为 `idle`，上传 backlog 为 0；
+- 首次视频尝试曾出现一次 Jetson NVENC native `exit 139`；同一真实 JPEG 的宿主、容器、Python appsrc、双线程、原样 Runtime 和真实 ROS executor 隔离测试均通过，受控重试完整通过并正确隔离了零字节 `.part`；长时间连续稳定性仍待 soak test；
+- COS 上传、HEAD 校验、冲突保护、重试与本地滚动的 fake backend 测试和真实 bucket `testupload` 均已通过；断网、强制退出后的 backlog 补传及长时间滚动删除仍待专项验收；
 - COS 凭证只能由部署 secret 提供，不进入卡片配置或日志。
 - G1 容器使用 `restart: "no"`，必须在宿主相机、音频和 ROS2 服务就绪后按顺序启动；容器启动后会自动恢复 ledger backlog，但 `auto_resume_after_reboot=false` 时不会自动恢复采集实例。
 
 ## G1 部署后验收
 
 1. 确认 `embodied-inspection` 运行，`curl http://127.0.0.1:15671/health` 返回 `ok=true`。
-2. 在 Dashboard 加入 Audio Inspector 和 Video Inspector，分别连接 `/phanthymotus_g1_driver/mic/audio` 和 `/phanthymotus_g1_driver/camera/rgb`。
+2. 在 Dashboard 加入 Audio Inspector 和 Video Inspector，分别连接 `/phanthymotus_g1_driver/mic/audio` 和当前可用的 `sensor_msgs/CompressedImage` topic；上海 G1 已验证外部相机 topic 为 `/phanthymotus_g1_driver/ext_camera/card-mrnbwcls6nji/rgb`。
 3. 配置 `cos_region`、`cos_bucket`、`cos_prefix`、`device_id`、`credential_profile`，先执行 `testupload`。
 4. 点击“开启智能控制”，等待至少一个 `segment_seconds`，再点击停止。
 5. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
