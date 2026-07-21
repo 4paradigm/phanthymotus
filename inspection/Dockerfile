@@ -20,6 +20,10 @@ RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-ugly && \
+    find /usr/lib/aarch64-linux-gnu/gstreamer-1.0 \
+        -maxdepth 1 -type f -size 0 -delete && \
+    test -z "$(find /usr/lib/aarch64-linux-gnu/gstreamer-1.0 \
+        -maxdepth 1 -type f -size 0 -print -quit)" && \
     mv /sbin/ldconfig.real /sbin/ldconfig && \
     rm -rf /var/lib/apt/lists/*
 

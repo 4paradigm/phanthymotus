@@ -152,11 +152,12 @@ class InspectionDeployContractTest(unittest.TestCase):
             "/usr/lib/aarch64-linux-gnu/tegra-egl:ro",
             service,
         )
-        self.assertIn(
-            "/usr/lib/aarch64-linux-gnu/gstreamer-1.0:"
-            "/usr/lib/aarch64-linux-gnu/gstreamer-1.0:ro",
-            service,
-        )
+        for plugin in ("libgstnvjpeg.so", "libgstnvvidconv.so", "libgstnvvideo4linux2.so"):
+            self.assertIn(
+                f"/usr/lib/aarch64-linux-gnu/gstreamer-1.0/{plugin}:"
+                f"/usr/lib/aarch64-linux-gnu/gstreamer-1.0/{plugin}:ro",
+                service,
+            )
         self.assertIn(
             "/lib/aarch64-linux-gnu/libgstnvexifmeta.so:"
             "/lib/aarch64-linux-gnu/libgstnvexifmeta.so:ro",
@@ -174,7 +175,11 @@ class InspectionDeployContractTest(unittest.TestCase):
             service,
         )
         self.assertIn('restart: "no"', service)
-        self.assertNotIn("libgstnvjpeg.so:/usr/lib", service)
+        self.assertNotIn(
+            "/usr/lib/aarch64-linux-gnu/gstreamer-1.0:"
+            "/usr/lib/aarch64-linux-gnu/gstreamer-1.0:ro",
+            service,
+        )
 
     def test_image_installs_gstreamer_python_and_supports_jetson_ros_layout(self) -> None:
         dockerfile = (INSPECTION_ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -186,6 +191,8 @@ class InspectionDeployContractTest(unittest.TestCase):
         self.assertIn("UBUNTU_PORTS_MIRROR=https://ports.ubuntu.com/ubuntu-ports", dockerfile)
         self.assertIn("mirrors.tencentyun.com/ubuntu-ports", dockerfile)
         self.assertIn("apt-get update -o Acquire::Retries=3", dockerfile)
+        self.assertIn("-maxdepth 1 -type f -size 0 -delete", dockerfile)
+        self.assertIn("-maxdepth 1 -type f -size 0 -print -quit", dockerfile)
         self.assertIn("--ignore-installed", dockerfile)
         self.assertIn("--target ${INSPECTION_PYTHON_DIR}", dockerfile)
         self.assertIn("ENV PYTHONPATH=/opt/inspection-python:${PYTHONPATH}", dockerfile)

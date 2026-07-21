@@ -9,7 +9,9 @@ inspection:
     - /dev:/dev
     - /usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro
     - /usr/lib/aarch64-linux-gnu/tegra-egl:/usr/lib/aarch64-linux-gnu/tegra-egl:ro
-    - /usr/lib/aarch64-linux-gnu/gstreamer-1.0:/usr/lib/aarch64-linux-gnu/gstreamer-1.0:ro
+    - /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvjpeg.so:/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvjpeg.so:ro
+    - /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvidconv.so:/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvidconv.so:ro
+    - /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvideo4linux2.so:/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvvideo4linux2.so:ro
     - /lib/aarch64-linux-gnu/libgstnvexifmeta.so:/lib/aarch64-linux-gnu/libgstnvexifmeta.so:ro
     - /opt/phanthy-motus/inspection-data:/opt/phanthy-motus/inspection-data
     - /opt/phanthy-motus/inspection-state:/opt/phanthy-motus/inspection-state
