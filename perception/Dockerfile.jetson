@@ -79,12 +79,41 @@ ENV YOLO_CONFIG_DIR=/work
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
+# ── RapidOCR (CPU ONNX Runtime; preserve Jetson's system cv2) ─────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+      pyclipper==1.3.0.post3 six onnxruntime Shapely==2.0.5 Pillow \
+      omegaconf==2.3.0 colorlog && \
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
+      rapidocr==3.9.1 && \
+    RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
+    find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete && \
+    python3 -c "import onnxruntime as ort; assert 'CPUExecutionProvider' in ort.get_available_providers()"
+
+# ── Offline ASR model ─────────────────────────────────────────────
+ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/official_paraformer
+COPY perception/utils/asr_model_downloader.py /tmp/asr_model_downloader.py
+RUN python3 /tmp/asr_model_downloader.py \
+    --base-url "${ASR_OFFLINE_MODEL_BASE_URL}" \
+    --output-dir /models/sherpa-onnx/asr-offline
+
+# ── OCR model (kept outside Git) ──────────────────────────────────
+ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/lizhuoju/embodied-ai/ppocrv6-small-int8
+ARG OCR_MODEL_FALLBACK_BASE_URL=http://172.28.4.81:34567/lizhuoju/embodied-ai/ocr/ppocrv6-small-int8
+COPY perception/utils/ocr_model_downloader.py /tmp/ocr_model_downloader.py
+RUN python3 /tmp/ocr_model_downloader.py \
+    --base-url "${OCR_MODEL_BASE_URL}" \
+    --output-dir /models/ocr/ppocrv6-small-int8 || \
+    python3 /tmp/ocr_model_downloader.py \
+    --base-url "${OCR_MODEL_FALLBACK_BASE_URL}" \
+    --output-dir /models/ocr/ppocrv6-small-int8
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
 
 EXPOSE 15720
 EXPOSE 15721

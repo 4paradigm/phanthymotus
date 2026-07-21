@@ -42,3 +42,8 @@ Thumbs.db
 
 # Docker
 .docker/
+
+# OCR / local model caches (do not commit models >1MB)
+perception/models/
+*.onnx
+ocr-models/

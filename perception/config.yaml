@@ -2,7 +2,8 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: true
+    enabled: false
+    mode: offline
     model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu
     num_threads: 2
@@ -18,13 +19,13 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: true
+    enabled: false
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
   htmsg:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
@@ -38,9 +39,25 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: true
+    provider: rapidocr  # rapidocr | openai | qwen | tesseract | google
+    url: ""             # API URL (empty = default endpoint, for openai/qwen)
+    key: ""             # API Key (for openai/qwen)
+    model: ""           # model name (for openai/qwen)
+    language: "zh"      # default language hint
+    # RapidOCR local model settings
+    # The model directory must contain these four files flat:
+    #   det.onnx  rec.onnx  cls.onnx  keys.txt
+    # For PP-OCRv6-small-int8, det.onnx/rec.onnx are the int8 quantized models.
+    model_dir: /models/ocr/ppocrv6-small-int8
+    use_angle_cls: true
+    num_threads: 1
+    max_side_len: 1600
