@@ -178,6 +178,7 @@ class InspectionDeployContractTest(unittest.TestCase):
 
     def test_image_installs_gstreamer_python_and_supports_jetson_ros_layout(self) -> None:
         dockerfile = (INSPECTION_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        requirements = (INSPECTION_ROOT / "requirements.txt").read_text(encoding="utf-8")
 
         self.assertIn("python3-gst-1.0", dockerfile)
         self.assertIn("gir1.2-gstreamer-1.0", dockerfile)
@@ -187,6 +188,8 @@ class InspectionDeployContractTest(unittest.TestCase):
         self.assertIn("apt-get update -o Acquire::Retries=3", dockerfile)
         self.assertIn("/opt/ros/humble/install/setup.bash", dockerfile)
         self.assertIn("/opt/ros/humble/setup.bash", dockerfile)
+        self.assertIn("pyyaml>=5.3.1,<7", requirements)
+        self.assertNotIn("pyyaml==", requirements)
 
 
 if __name__ == "__main__":
