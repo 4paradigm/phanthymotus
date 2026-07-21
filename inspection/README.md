@@ -85,7 +85,7 @@ node --check agent-core/web/js/flow-view.js
 - 音频 QoS：`BEST_EFFORT + KEEP_LAST(50) + VOLATILE`；
 - 视频输入固定为 `sensor_msgs/CompressedImage`、`image/jpeg`，QoS 为 `BEST_EFFORT + KEEP_LAST(2) + VOLATILE`；
 - Jetson 管线固定为 `nvjpegdec → nvvidconv → nvv4l2h264enc → splitmuxsink`；指定硬件编码器不可用时启动失败，不做隐式 CPU 降级；
-- 上海 G1 的 Docker daemon 没有名为 `nvidia` 的 runtime，release 基础镜像中的 Jetson GStreamer 插件又是占位文件；部署契约因此从宿主只读挂载 `tegra` / `tegra-egl` 运行库、三个管线插件和 `libgstnvexifmeta.so`，并设置对应 `LD_LIBRARY_PATH`，不依赖 `runtime: nvidia`；
+- 上海 G1 的 Docker daemon 没有名为 `nvidia` 的 runtime，release 基础镜像中的 Jetson GStreamer 插件又是零字节占位文件；部署契约因此从宿主只读挂载完整 `gstreamer-1.0` 插件目录、`tegra` / `tegra-egl` 运行库和 `libgstnvexifmeta.so`，保证插件扫描与实际管线使用同一套 Jetson 插件，不依赖 `runtime: nvidia`；
 - 当 release 基础镜像仍使用已无法解析的 `mirrors.tencentyun.com/ubuntu-ports` 时，Dockerfile 会在安装依赖前改用已验证可达的官方 `https://ports.ubuntu.com/ubuntu-ports`；可用 `UBUNTU_PORTS_MIRROR` build arg 显式覆盖；
 - Python 依赖通过 `pip --target /opt/inspection-python --ignore-installed` 安装到隔离目录，不卸载或覆盖 Jetson release 镜像中由 Ubuntu/distutils 管理的 PyYAML 5.3.1；镜像构建会断言运行时实际加载隔离的 PyYAML 6.0.2 和 COS SDK；
 - 写入路径：`.wav.part` / `.mp4.part` → fsync → 媒体/JSON 原子 rename → SQLite `FINALIZED`；

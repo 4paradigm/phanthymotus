@@ -152,12 +152,11 @@ class InspectionDeployContractTest(unittest.TestCase):
             "/usr/lib/aarch64-linux-gnu/tegra-egl:ro",
             service,
         )
-        for plugin in ("libgstnvjpeg.so", "libgstnvvidconv.so", "libgstnvvideo4linux2.so"):
-            self.assertIn(
-                f"/usr/lib/aarch64-linux-gnu/gstreamer-1.0/{plugin}:"
-                f"/usr/lib/aarch64-linux-gnu/gstreamer-1.0/{plugin}:ro",
-                service,
-            )
+        self.assertIn(
+            "/usr/lib/aarch64-linux-gnu/gstreamer-1.0:"
+            "/usr/lib/aarch64-linux-gnu/gstreamer-1.0:ro",
+            service,
+        )
         self.assertIn(
             "/lib/aarch64-linux-gnu/libgstnvexifmeta.so:"
             "/lib/aarch64-linux-gnu/libgstnvexifmeta.so:ro",
@@ -175,6 +174,7 @@ class InspectionDeployContractTest(unittest.TestCase):
             service,
         )
         self.assertIn('restart: "no"', service)
+        self.assertNotIn("libgstnvjpeg.so:/usr/lib", service)
 
     def test_image_installs_gstreamer_python_and_supports_jetson_ros_layout(self) -> None:
         dockerfile = (INSPECTION_ROOT / "Dockerfile").read_text(encoding="utf-8")
