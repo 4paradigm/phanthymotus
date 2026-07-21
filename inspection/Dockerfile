@@ -1,9 +1,13 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
+ARG UBUNTU_PORTS_MIRROR=https://ports.ubuntu.com/ubuntu-ports
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG UBUNTU_PORTS_MIRROR
 
-RUN apt-get update && \
+RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" /etc/apt/sources.list && \
+    ! grep -q "mirrors.tencentyun.com/ubuntu-ports" /etc/apt/sources.list && \
+    apt-get update -o Acquire::Retries=3 && \
     mv /sbin/ldconfig /sbin/ldconfig.real && \
     ln -s /bin/true /sbin/ldconfig && \
     apt-get install -y --no-install-recommends \

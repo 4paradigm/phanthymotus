@@ -55,7 +55,7 @@ curl -s http://127.0.0.1:15671/mcp \
 
 宿主文件权限应设为 `0600`。本地开发才允许用 `COS_SECRET_ID` / `COS_SECRET_KEY` / `COS_SESSION_TOKEN` 环境变量兼容。日志、MCP 返回和 Agent Core 配置均不回显凭证。
 
-G1 上的持久化宿主路径为 `/opt/phanthy-motus/secrets/phanthymotus/cos/default.json`，通过只读挂载映射到上述容器路径。不要把 secret 放在宿主 `/run`：该目录重启后可能被清空。
+G1 上的持久化宿主路径为 `/opt/phanthy-motus/secrets/phanthymotus/cos/default.json`，通过只读挂载映射到上述容器路径。不要把 secret 放在宿主 `/run`：该目录重启后可能被清空。部署脚本只在镜像构建和多媒体预检通过后才上传临时 secret，安装后无论成功或失败都会删除远端暂存副本。
 
 每个 segment 的媒体文件和 JSON metadata 作为两个不可变对象上传。上传后必须通过 HEAD 同时校验 `Content-Length` 与 `x-cos-meta-sha256`，才记为 `UPLOADED_VERIFIED`。远端同名对象内容不一致时进入 `CONFLICT`，不覆盖。
 
@@ -86,6 +86,7 @@ node --check agent-core/web/js/flow-view.js
 - 视频输入固定为 `sensor_msgs/CompressedImage`、`image/jpeg`，QoS 为 `BEST_EFFORT + KEEP_LAST(2) + VOLATILE`；
 - Jetson 管线固定为 `nvjpegdec → nvvidconv → nvv4l2h264enc → splitmuxsink`；指定硬件编码器不可用时启动失败，不做隐式 CPU 降级；
 - 上海 G1 的 Docker daemon 没有名为 `nvidia` 的 runtime，release 基础镜像中的 Jetson GStreamer 插件又是占位文件；部署契约因此从宿主只读挂载 `tegra` / `tegra-egl` 运行库、三个管线插件和 `libgstnvexifmeta.so`，并设置对应 `LD_LIBRARY_PATH`，不依赖 `runtime: nvidia`；
+- 当 release 基础镜像仍使用已无法解析的 `mirrors.tencentyun.com/ubuntu-ports` 时，Dockerfile 会在安装依赖前改用已验证可达的官方 `https://ports.ubuntu.com/ubuntu-ports`；可用 `UBUNTU_PORTS_MIRROR` build arg 显式覆盖；
 - 写入路径：`.wav.part` / `.mp4.part` → fsync → 媒体/JSON 原子 rename → SQLite `FINALIZED`；
 - 异常退出留下的 MP4 先由 `gst-discoverer-1.0` 校验，可读才恢复，否则保留为 `CORRUPT` 诊断文件；
 - SQLite 使用 WAL 和 `synchronous=FULL`，正式文件存在但账本缺失时可扫描重建。
