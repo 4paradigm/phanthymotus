@@ -87,6 +87,7 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy
     MIX_VITS_TRT_ENGINE_DIR=/models/vits2-mix/engines \
     MIX_VITS_MAX_TEXT_TOKENS=64 \
     MIX_VITS_MAX_FRAMES=2048 \
+    MIX_VITS_FRAME_INTERVAL_MS=0 \
     TTS_PLUGIN=vits2_tts_trt \
     DEFAULT_TTS_PLUGIN=vits2_tts_trt \
     OMP_NUM_THREADS=1 \

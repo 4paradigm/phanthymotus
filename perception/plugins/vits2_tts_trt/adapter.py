@@ -8,6 +8,8 @@ import re
 import threading
 from abc import ABC, abstractmethod
 
+import jieba
+
 from .runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
 
 
@@ -32,6 +34,13 @@ _ZH_NUMBER_UNIT_RE = re.compile(
     r"[零〇一二两三四五六七八九十百千万亿点]+"
     r"(?:K\s*B|M\s*B|G\s*B|T\s*B|P\s*B)(?:每[A-Za-z])?",
     re.IGNORECASE,
+)
+_SPLIT_PUNCTUATION = "，,、。．.｡！!？?；;：:…⋯—–~～\n\r"
+_CLOSING_PUNCTUATION = "”’\"'」』》〉】〕〗〙〛）)]｝}"
+_PUNCTUATION_UNIT_RE = re.compile(
+    rf".*?[{re.escape(_SPLIT_PUNCTUATION)}]+"
+    rf"[{re.escape(_CLOSING_PUNCTUATION)}]*|.+$",
+    flags=re.DOTALL,
 )
 
 
@@ -58,8 +67,7 @@ def _language_kind(char: str) -> str | None:
     return None
 
 
-def _preferred_split(text: str) -> int:
-    midpoint = len(text) // 2
+def _split_positions(text: str) -> tuple[list[int], list[int], list[int]]:
     protected = [match.span() for match in _ZH_NUMBER_UNIT_RE.finditer(text)]
 
     def is_safe(index: int) -> bool:
@@ -76,12 +84,16 @@ def _preferred_split(text: str) -> int:
                 boundaries.append(index)
         previous_kind = kind
     usable = [index for index in boundaries if 1 < index < len(text) - 1]
-    if usable:
-        return min(usable, key=lambda index: abs(index - midpoint))
+    word_boundaries = []
+    offset = 0
+    for word in jieba.cut(text):
+        offset += len(word)
+        if 1 < offset < len(text) - 1 and is_safe(offset):
+            word_boundaries.append(offset)
     fallback = [index for index in range(1, len(text)) if is_safe(index)]
     if not fallback:
         raise ValueError("Unable to split protected number-unit expression")
-    return min(fallback, key=lambda index: abs(index - midpoint))
+    return usable, word_boundaries, fallback
 
 
 class Vits2TensorRTAdapter(TTSAdapter):
@@ -104,7 +116,36 @@ class Vits2TensorRTAdapter(TTSAdapter):
             return
         if len(text) <= 1:
             raise ValueError("Unable to split text within TensorRT profile")
-        split_at = _preferred_split(text)
+        language_boundaries, word_boundaries, fallback = _split_positions(text)
+
+        def longest_fitting(positions):
+            low, high = 0, len(positions) - 1
+            best = None
+            while low <= high:
+                middle = (low + high) // 2
+                position = positions[middle]
+                prefix_ids = self._engine._get_text_ids(
+                    text[:position].strip(), normalized=True
+                )
+                if len(prefix_ids[0]) <= MAX_CHUNK_TOKENS:
+                    best = position
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            return best
+
+        split_at = longest_fitting(language_boundaries)
+        if split_at is None:
+            split_at = longest_fitting(word_boundaries)
+        if split_at is None:
+            log.warning(
+                "no punctuation, language, or word boundary fits TensorRT profile; "
+                "using forced split: chars=%d",
+                len(text),
+            )
+            split_at = longest_fitting(fallback)
+        if split_at is None:
+            raise ValueError("Unable to split text within TensorRT profile")
         left, right = text[:split_at].strip(), text[split_at:].strip()
         if not left or not right:
             raise ValueError("Unable to split text within TensorRT profile")
@@ -112,7 +153,9 @@ class Vits2TensorRTAdapter(TTSAdapter):
         yield from self._iter_unit_chunks(right)
 
     def _iter_text_chunks(self, text: str):
-        units = re.findall(r".*?[。！？!?；;，,：:\n]+|.+$", text, flags=re.DOTALL)
+        # Make every natural punctuation unit fit first. Greedy packing below
+        # only joins already-valid units and never re-splits a merged unit.
+        units = _PUNCTUATION_UNIT_RE.findall(text)
         chunks = []
         for unit in units:
             unit = unit.strip()

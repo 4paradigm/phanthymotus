@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -18,6 +19,9 @@ from .adapter import CHUNK_BYTES, SAMPLE_RATE, TTSAdapter, build_adapter
 
 
 log = logging.getLogger(__name__)
+FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "0"))
+if not 0 <= FRAME_INTERVAL_MS <= 100:
+    raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 100")
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -126,7 +130,7 @@ class _Vits2TTSNode(Node):
         self._pub.publish(message)
 
     def _worker(self):
-        frame_duration = CHUNK_BYTES / (SAMPLE_RATE * 2)
+        frame_interval = FRAME_INTERVAL_MS / 1000.0
         while not self._stop_event.is_set():
             try:
                 text = self._text_queue.get(timeout=1)
@@ -142,13 +146,14 @@ class _Vits2TTSNode(Node):
                     now = time.monotonic()
                     if started is None:
                         started = now
-                    target = started + frames_sent * frame_duration
-                    if target < now - frame_duration:
-                        started = now - frames_sent * frame_duration
-                        target = now
-                    delay = target - now
-                    if delay > 0:
-                        time.sleep(delay)
+                    if frame_interval:
+                        target = started + frames_sent * frame_interval
+                        if target < now - frame_interval:
+                            started = now - frames_sent * frame_interval
+                            target = now
+                        delay = target - now
+                        if delay > 0:
+                            time.sleep(delay)
                     self._publish(frame)
                     frames_sent += 1
 
