@@ -90,6 +90,7 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("MKL_NUM_THREADS=1", dockerfile)
         self.assertIn("NUMEXPR_NUM_THREADS=1", dockerfile)
         self.assertIn("OPENCV_FOR_THREADS_NUM=1", dockerfile)
+        self.assertIn("VIPS_CONCURRENCY=1", dockerfile)
         self.assertIn("MALLOC_ARENA_MAX=2", dockerfile)
 
     def test_jetson_image_loads_large_message_fastdds_profile(self):

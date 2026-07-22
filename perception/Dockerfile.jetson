@@ -53,6 +53,7 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
     OPENCV_FOR_THREADS_NUM=1 \
+    VIPS_CONCURRENCY=1 \
     MALLOC_ARENA_MAX=2
 
 # ── APT mirror (conditional) ─────────────────────────────────────
