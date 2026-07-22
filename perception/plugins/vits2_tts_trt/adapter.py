@@ -113,11 +113,31 @@ class Vits2TensorRTAdapter(TTSAdapter):
 
     def _iter_text_chunks(self, text: str):
         units = re.findall(r".*?[。！？!?；;，,：:\n]+|.+$", text, flags=re.DOTALL)
+        chunks = []
         for unit in units:
             unit = unit.strip()
             if not unit:
                 continue
-            yield from self._iter_unit_chunks(unit)
+            chunks.extend(self._iter_unit_chunks(unit))
+
+        pending_text = ""
+        pending_ids = None
+        for chunk, text_ids in chunks:
+            if not pending_text:
+                pending_text, pending_ids = chunk, text_ids
+                continue
+
+            combined = pending_text + chunk
+            combined_ids = self._engine._get_text_ids(combined, normalized=True)
+            if len(combined_ids[0]) <= MAX_CHUNK_TOKENS:
+                pending_text, pending_ids = combined, combined_ids
+                continue
+
+            yield pending_text, pending_ids
+            pending_text, pending_ids = chunk, text_ids
+
+        if pending_text:
+            yield pending_text, pending_ids
 
     def synthesize(self, text: str) -> bytes:
         return b"".join(self.synthesize_stream(text))
