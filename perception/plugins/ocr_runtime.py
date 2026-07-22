@@ -173,7 +173,13 @@ class _MNNModelSession:
         )
         self._net.runSession(self._session)
         output = self._net.getSessionOutput(self._session)
-        return output.getNumpyData().copy()
+        import numpy as _np, MNN as _MNN
+        out_shape = output.getShape()
+        host = _MNN.Tensor(
+            out_shape, _MNN.Halide_Type_Float, _MNN.Tensor_DimensionType_Caffe
+        )
+        output.copyToHostTensor(host)
+        return _np.array(host.getData(), dtype=_np.float32).reshape(out_shape).copy()
 
     def close(self) -> None:
         release = getattr(self._net, "releaseSession", None)

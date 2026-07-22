@@ -150,7 +150,14 @@ def _vips_to_bgr(image):
     if image.hasalpha():
         image = image.flatten(background=[255, 255, 255])
     image = image.colourspace("srgb")
-    rgb = image.numpy()
+    try:
+        rgb = image.numpy()
+    except ValueError:
+        import numpy as _np
+        mem = image.write_to_memory()
+        rgb = _np.frombuffer(mem, dtype=_np.uint8).reshape(
+            image.height, image.width, min(image.bands, 4)
+        )
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("decoded image must have three color channels")
     return np.ascontiguousarray(rgb[:, :, ::-1], dtype=np.uint8)
@@ -166,7 +173,6 @@ def decode_vips_overview(image_bytes: bytes, max_side: int):
         max_side,
         size="down",
         no_rotate=False,
-        fail_on="error",
     )
     return _vips_to_bgr(image)
 
@@ -178,7 +184,6 @@ def _open_vips_source(image_bytes: bytes):
         image_bytes,
         "",
         access="random",
-        fail_on="error",
     )
     return source.autorot()
 
