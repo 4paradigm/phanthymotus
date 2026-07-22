@@ -54,15 +54,16 @@ plugins:
     url: ""
     key: ""
     model: ""
-    model_dir: /models/ocr/ppocrv6-tiny-mnn
-    fallback_model_dir: /models/ocr/ppocrv6-tiny-ort
+    model_dir: /models/ocr/ppocrv6-small-mnn
+    fallback_model_dir: /models/ocr/ppocrv6-small-ort
     language: zh
     use_angle_cls: false
     num_threads: 1
     max_side_len: 960
     min_interval_ms: 0
     large_image_strategy:
-      enabled: true
+      # 关闭分块：tile 跨边界切割产生无法去重的碎片框, predict_T 膨胀 77%, F1 崩塌
+      enabled: false
       trigger_side: 2400
       decode_side: 3200
       decode_hard_limit: 4096

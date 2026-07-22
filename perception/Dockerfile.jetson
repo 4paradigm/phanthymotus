@@ -138,11 +138,11 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
 
 # ── OCR model (kept outside Git) ──────────────────────────────────
-ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-tiny-mnn
+ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-mnn
 COPY perception/utils/ocr_model_downloader.py /tmp/ocr_model_downloader.py
 RUN python3 /tmp/ocr_model_downloader.py \
     --base-url "${OCR_MODEL_BASE_URL}" \
-    --output-dir /models/ocr/ppocrv6-tiny-mnn \
+    --output-dir /models/ocr/ppocrv6-small-mnn \
     --filenames det.mnn rec.mnn keys.txt
 
 # ── Application code ───────────────────────────────────────────────

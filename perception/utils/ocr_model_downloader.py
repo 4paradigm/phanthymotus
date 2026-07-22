@@ -10,7 +10,7 @@ from urllib.request import urlopen
 
 
 MODEL_FILES = ("det.mnn", "rec.mnn", "keys.txt")
-MAX_BUNDLE_BYTES = 15 * 1024 * 1024
+MAX_BUNDLE_BYTES = 48 * 1024 * 1024
 DOWNLOAD_TIMEOUT = 120  # seconds
 MAX_RETRIES = 3
 RETRY_DELAY = 3  # seconds
