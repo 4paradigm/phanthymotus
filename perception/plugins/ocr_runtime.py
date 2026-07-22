@@ -15,9 +15,12 @@ from plugins.ocr_tiled_strategy import (
 )
 
 
-REQUIRED_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
+ORT_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
+MNN_MODEL_FILES = ("det.mnn", "rec.mnn", "keys.txt")
 _MIB = 1024 * 1024
 _DECODE_CHANNELS = 3
+_OCR_MEAN = (127.5, 127.5, 127.5)
+_OCR_NORMAL = (1 / 127.5, 1 / 127.5, 1 / 127.5)
 
 
 class ImageTooLargeError(ValueError):
@@ -128,10 +131,216 @@ def recognize_to_payload(
         return build_ocr_payload([], timestamp, language, error=exc)
 
 
+class _MNNModelSession:
+    def __init__(
+        self,
+        model_path: Path,
+        *,
+        num_threads: int,
+        mean: tuple[float, float, float],
+        normal: tuple[float, float, float],
+    ):
+        import MNN
+
+        self._net = MNN.Interpreter(str(model_path))
+        self._session = self._net.createSession(
+            {
+                "backend": "CPU",
+                "numThread": int(num_threads),
+                "precision": "low",
+                "memory": 2,
+                "power": 0,
+            }
+        )
+        self._input = self._net.getSessionInput(self._session)
+        self._process = MNN.CVImageProcess(
+            {
+                "sourceFormat": MNN.CV_ImageFormat_BGR,
+                "destFormat": MNN.CV_ImageFormat_BGR,
+                "filterType": MNN.CV_Filter_BILINEAL,
+                "mean": (*mean, 0.0),
+                "normal": (*normal, 1.0),
+            }
+        )
+
+    def run_uint8(self, image, shape: tuple[int, ...]):
+        import numpy as np
+
+        image = np.ascontiguousarray(image, dtype=np.uint8)
+        self._net.resizeTensor(self._input, shape)
+        self._net.resizeSession(self._session)
+        pointer = image.__array_interface__["data"][0]
+        self._process.convert(
+            pointer,
+            image.shape[1],
+            image.shape[0],
+            image.strides[0],
+            self._input,
+        )
+        self._net.runSession(self._session)
+        output = self._net.getSessionOutput(self._session)
+        return output.getNumpyData().copy()
+
+    def close(self) -> None:
+        release = getattr(self._net, "releaseSession", None)
+        if callable(release):
+            release(self._session)
+
+
+class _MNNPipeline:
+    def __init__(self, root: Path, *, num_threads: int, max_side_len: int):
+        from rapidocr.ch_ppocr_det.utils import DBPostProcess
+        from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
+        from rapidocr.utils.process_img import get_rotate_crop_image
+
+        self._det = _MNNModelSession(
+            root / "det.mnn",
+            num_threads=num_threads,
+            mean=_OCR_MEAN,
+            normal=_OCR_NORMAL,
+        )
+        try:
+            self._rec = _MNNModelSession(
+                root / "rec.mnn",
+                num_threads=num_threads,
+                mean=_OCR_MEAN,
+                normal=_OCR_NORMAL,
+            )
+        except Exception:
+            self._det.close()
+            raise
+        self._det_postprocess = DBPostProcess(
+            thresh=0.3,
+            box_thresh=0.5,
+            max_candidates=1000,
+            unclip_ratio=1.6,
+            use_dilation=True,
+            score_mode="fast",
+        )
+        self._rec_decode = CTCLabelDecode(character_path=root / "keys.txt")
+        self._crop = get_rotate_crop_image
+        self._max_side_len = max(32, int(max_side_len))
+
+    @staticmethod
+    def _multiple_of_32(value: float) -> int:
+        return max(32, int(round(value / 32)) * 32)
+
+    def _detector_input(self, image):
+        import cv2
+
+        height, width = image.shape[:2]
+        scale = min(1.0, self._max_side_len / max(height, width))
+        target_height = self._multiple_of_32(height * scale)
+        target_width = self._multiple_of_32(width * scale)
+        if (target_width, target_height) == (width, height):
+            return image
+        return cv2.resize(
+            image,
+            (target_width, target_height),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    def _detect(self, image):
+        import numpy as np
+
+        detector_input = self._detector_input(image)
+        height, width = detector_input.shape[:2]
+        prediction = self._det.run_uint8(
+            detector_input, (1, 3, height, width)
+        )
+        boxes, scores = self._det_postprocess(prediction, image.shape[:2])
+        if len(boxes) == 0:
+            return np.empty((0, 4, 2), dtype=np.float32), []
+        order = sorted(
+            range(len(boxes)),
+            key=lambda index: (boxes[index][0][1], boxes[index][0][0]),
+        )
+        return boxes[order], [scores[index] for index in order]
+
+    def _recognize_crop(self, crop):
+        import cv2
+        import numpy as np
+
+        height, width = crop.shape[:2]
+        if height <= 0 or width <= 0:
+            return "", 0.0
+        ratio = width / float(height)
+        target_height = 48
+        target_width = max(320, int(math.ceil(target_height * ratio)))
+        target_width = max(32, int(math.ceil(target_width / 8)) * 8)
+        resized_width = min(
+            target_width, max(1, int(math.ceil(target_height * ratio)))
+        )
+        resized = cv2.resize(
+            crop,
+            (resized_width, target_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        padded = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        padded[:, :resized_width] = resized
+        prediction = self._rec.run_uint8(
+            padded, (1, 3, target_height, target_width)
+        )
+        line_results, _ = self._rec_decode(
+            prediction,
+            False,
+            wh_ratio_list=(ratio,),
+            max_wh_ratio=target_width / target_height,
+        )
+        if not line_results:
+            return "", 0.0
+        text, score = line_results[0]
+        return str(text), float(score)
+
+    def infer(self, image) -> list[dict]:
+        import copy
+        import numpy as np
+
+        boxes, _ = self._detect(image)
+        items = []
+        for box in boxes:
+            crop = self._crop(image, copy.deepcopy(box))
+            text, score = self._recognize_crop(crop)
+            if not text.strip() or score < 0.5:
+                continue
+            xs = box[:, 0]
+            ys = box[:, 1]
+            items.append(
+                {
+                    "text": text,
+                    "bbox": [
+                        float(np.min(xs)),
+                        float(np.min(ys)),
+                        float(np.max(xs)),
+                        float(np.max(ys)),
+                    ],
+                    "score": score,
+                }
+            )
+        return items
+
+    def warm_up(self) -> None:
+        import numpy as np
+
+        self._det.run_uint8(
+            np.zeros((64, 64, 3), dtype=np.uint8), (1, 3, 64, 64)
+        )
+        self._rec.run_uint8(
+            np.zeros((48, 320, 3), dtype=np.uint8), (1, 3, 48, 320)
+        )
+
+    def close(self) -> None:
+        self._det.close()
+        self._rec.close()
+
+
 class RapidOCRAdapter:
     def __init__(
         self,
         model_dir: str,
+        backend: str = "onnxruntime",
+        fallback_backend: str = "",
+        fallback_model_dir: str = "",
         device: str = "cpu",
         device_id: int = 0,
         gpu_mem_mb: int = 512,
@@ -144,19 +353,18 @@ class RapidOCRAdapter:
         large_image_strategy: dict | None = None,
     ):
         root = Path(model_dir)
-        missing = [
-            name for name in REQUIRED_MODEL_FILES if not (root / name).is_file()
-        ]
-        if missing:
-            raise FileNotFoundError(
-                f"OCR model files missing: {', '.join(missing)}"
-            )
+        backend = str(backend).strip().lower()
+        fallback_backend = str(fallback_backend).strip().lower()
+        if backend not in ("mnn", "onnxruntime"):
+            raise ValueError("OCR backend must be 'mnn' or 'onnxruntime'")
+        if fallback_backend not in ("", "onnxruntime"):
+            raise ValueError("OCR fallback_backend must be empty or 'onnxruntime'")
 
         device = str(device).strip().lower()
         if device not in ("cpu", "cuda"):
             raise ValueError("OCR device must be 'cpu' or 'cuda'")
         use_cuda = device == "cuda"
-        if use_cuda:
+        if backend == "onnxruntime" and use_cuda:
             import onnxruntime as ort
 
             providers = ort.get_available_providers()
@@ -165,9 +373,6 @@ class RapidOCRAdapter:
                     "OCR device=cuda requires CUDAExecutionProvider; "
                     f"available providers: {providers}"
                 )
-
-        from rapidocr import RapidOCR
-        from rapidocr.main import DEFAULT_CFG_PATH
 
         self._use_angle_cls = use_angle_cls
         self._max_side_len = max_side_len
@@ -191,7 +396,49 @@ class RapidOCRAdapter:
             else None
         )
 
+        self._pipeline = None
+        self._backend_name = backend
+        if backend == "mnn":
+            try:
+                missing = [
+                    name for name in MNN_MODEL_FILES
+                    if not (root / name).is_file()
+                ]
+                if missing:
+                    raise FileNotFoundError(
+                        f"OCR MNN model files missing: {', '.join(missing)}"
+                    )
+                if use_angle_cls:
+                    raise ValueError("OCR MNN backend does not load angle classifier")
+                self._pipeline = _MNNPipeline(
+                    root,
+                    num_threads=num_threads,
+                    max_side_len=max_side_len,
+                )
+                self._pipeline.warm_up()
+                self._engine = None
+                return
+            except Exception:
+                if self._pipeline is not None:
+                    self._pipeline.close()
+                    self._pipeline = None
+                if fallback_backend != "onnxruntime" or not fallback_model_dir:
+                    raise
+                root = Path(fallback_model_dir)
+                self._backend_name = "onnxruntime"
+
+        missing = [
+            name for name in ORT_MODEL_FILES if not (root / name).is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"OCR ONNX model files missing: {', '.join(missing)}"
+            )
+
         # Load rapidocr's own default config, override model paths
+        from rapidocr import RapidOCR
+        from rapidocr.main import DEFAULT_CFG_PATH
+
         import yaml
         with open(DEFAULT_CFG_PATH) as f:
             cfg = yaml.safe_load(f)
@@ -334,6 +581,9 @@ class RapidOCRAdapter:
 
     def _infer_image(self, image) -> list[dict]:
         with self._inference_lock:
+            pipeline = getattr(self, "_pipeline", None)
+            if pipeline is not None:
+                return pipeline.infer(image)
             output = self._engine(
                 image,
                 use_det=True,

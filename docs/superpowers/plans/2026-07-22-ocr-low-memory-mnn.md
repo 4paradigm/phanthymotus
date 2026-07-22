@@ -197,9 +197,8 @@ class _MNNModelSession:
 
 Use RapidOCR's `DBPostProcess`, `CTCLabelDecode`, and
 `get_rotate_crop_image`. Resize detector input to a multiple of 32 as `uint8`;
-normalize only inside `CVImageProcess`. For detection use mean
-`(123.675, 116.28, 103.53)` and normal
-`(0.01712475, 0.017507, 0.017429)`; for recognition use mean
+normalize only inside `CVImageProcess`. RapidOCR 3.9.1 configures both the
+PP-OCRv6 tiny detector and recognizer with mean
 `(127.5, 127.5, 127.5)` and normal
 `(0.00784314, 0.00784314, 0.00784314)`. Resize and zero-pad one recognition crop
 at a time as `uint8`. Do not import or instantiate `TextDetector`,

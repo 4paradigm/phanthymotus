@@ -142,6 +142,9 @@ class OCRContractTest(unittest.TestCase):
         self.assertIs(result, expected)
         adapter.assert_called_once_with(
             "/models/ocr/ppocrv6-tiny",
+            backend="onnxruntime",
+            fallback_backend="",
+            fallback_model_dir="",
             device="cuda",
             device_id=0,
             gpu_mem_mb=512,
@@ -186,16 +189,173 @@ class OCRContractTest(unittest.TestCase):
 
         self.assertNotEqual(cpu, cuda)
 
-    def test_adapter_initialization_failure_does_not_stop_bundle(self):
+    def test_local_adapter_initialization_failure_is_fatal(self):
         with mock.patch(
             "plugins.ocr._build_ocr_adapter", side_effect=RuntimeError("load failed")
         ):
-            with self.assertLogs("plugins.ocr", level="ERROR"):
-                plugin = self.ocr.OCRPlugin(
+            with self.assertRaisesRegex(RuntimeError, "load failed"):
+                self.ocr.OCRPlugin(
                     {"provider": "rapidocr"}, object()
                 )
 
-        self.assertIsNone(plugin._adapter)
+    def test_mnn_config_is_forwarded_to_local_adapter(self):
+        expected = object()
+        with mock.patch(
+            "plugins.ocr.RapidOCRAdapter", return_value=expected
+        ) as adapter:
+            result = self.ocr._build_ocr_adapter(
+                {
+                    "provider": "rapidocr",
+                    "backend": "mnn",
+                    "fallback_backend": "",
+                    "model_dir": "/models/ocr/ppocrv6-tiny-mnn",
+                    "fallback_model_dir": "/models/ocr/ppocrv6-tiny-ort",
+                    "use_angle_cls": False,
+                    "num_threads": 1,
+                    "max_side_len": 960,
+                    "large_image_strategy": {"enabled": True},
+                }
+            )
+
+        self.assertIs(result, expected)
+        adapter.assert_called_once_with(
+            "/models/ocr/ppocrv6-tiny-mnn",
+            backend="mnn",
+            fallback_backend="",
+            fallback_model_dir="/models/ocr/ppocrv6-tiny-ort",
+            device="cpu",
+            device_id=0,
+            gpu_mem_mb=512,
+            use_angle_cls=False,
+            num_threads=1,
+            max_side_len=960,
+            max_input_mb=16,
+            max_decode_mb=64,
+            memory_guard={},
+            large_image_strategy={"enabled": True},
+        )
+
+    def test_mnn_session_uses_low_memory_config_and_uint8_pointer(self):
+        import numpy as np
+
+        state = types.SimpleNamespace(config=None, conversion=None)
+
+        class FakeTensor:
+            def getNumpyData(self):
+                return np.array([[[[0.75]]]], dtype=np.float32)
+
+        class FakeInterpreter:
+            def __init__(self, model_path):
+                state.model_path = model_path
+
+            def createSession(self, config):
+                state.config = config
+                return object()
+
+            def getSessionInput(self, _session):
+                return FakeTensor()
+
+            def resizeTensor(self, _tensor, shape):
+                state.shape = shape
+
+            def resizeSession(self, _session):
+                state.resized = True
+
+            def runSession(self, _session):
+                state.ran = True
+
+            def getSessionOutput(self, _session):
+                return FakeTensor()
+
+        class FakeImageProcess:
+            def __init__(self, config):
+                state.image_config = config
+
+            def convert(self, ptr, width, height, stride, destination):
+                state.conversion = (ptr, width, height, stride, destination)
+
+        mnn = types.ModuleType("MNN")
+        mnn.Interpreter = FakeInterpreter
+        mnn.CVImageProcess = FakeImageProcess
+        mnn.CV_ImageFormat_RGB = "RGB"
+        mnn.CV_ImageFormat_BGR = "BGR"
+        mnn.CV_Filter_BILINEAL = "BILINEAR"
+
+        with tempfile.TemporaryDirectory() as model_tmp:
+            model_path = Path(model_tmp) / "det.mnn"
+            model_path.write_bytes(b"model")
+            with mock.patch.dict(sys.modules, {"MNN": mnn}):
+                session = self.ocr_runtime._MNNModelSession(
+                    model_path,
+                    num_threads=1,
+                    mean=(127.5, 127.5, 127.5),
+                    normal=(1 / 127.5, 1 / 127.5, 1 / 127.5),
+                )
+                image = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
+                output = session.run_uint8(image, (1, 3, 2, 3))
+
+        self.assertEqual(
+            state.config,
+            {
+                "backend": "CPU",
+                "numThread": 1,
+                "precision": "low",
+                "memory": 2,
+                "power": 0,
+            },
+        )
+        self.assertEqual(state.shape, (1, 3, 2, 3))
+        self.assertEqual(state.conversion[:4], (image.ctypes.data, 3, 2, 9))
+        self.assertEqual(output.shape, (1, 1, 1, 1))
+
+    def test_mnn_adapter_requires_no_classifier_model(self):
+        with tempfile.TemporaryDirectory() as model_tmp:
+            root = Path(model_tmp)
+            for filename in ("det.mnn", "rec.mnn", "keys.txt"):
+                (root / filename).write_bytes(b"model")
+
+            with mock.patch("plugins.ocr_runtime._MNNPipeline") as pipeline:
+                adapter = self.ocr_runtime.RapidOCRAdapter(
+                    str(root),
+                    backend="mnn",
+                    use_angle_cls=False,
+                    num_threads=1,
+                )
+
+        pipeline.assert_called_once_with(root, num_threads=1, max_side_len=1600)
+        pipeline.return_value.warm_up.assert_called_once_with()
+        self.assertEqual(adapter._backend_name, "mnn")
+
+    def test_mnn_pipeline_closes_detector_when_recognizer_load_fails(self):
+        det_session = mock.Mock()
+        det_utils = types.ModuleType("rapidocr.ch_ppocr_det.utils")
+        det_utils.DBPostProcess = mock.Mock()
+        rec_utils = types.ModuleType("rapidocr.ch_ppocr_rec.utils")
+        rec_utils.CTCLabelDecode = mock.Mock()
+        image_utils = types.ModuleType("rapidocr.utils.process_img")
+        image_utils.get_rotate_crop_image = mock.Mock()
+        modules = {
+            "rapidocr": types.ModuleType("rapidocr"),
+            "rapidocr.ch_ppocr_det": types.ModuleType("rapidocr.ch_ppocr_det"),
+            "rapidocr.ch_ppocr_det.utils": det_utils,
+            "rapidocr.ch_ppocr_rec": types.ModuleType("rapidocr.ch_ppocr_rec"),
+            "rapidocr.ch_ppocr_rec.utils": rec_utils,
+            "rapidocr.utils": types.ModuleType("rapidocr.utils"),
+            "rapidocr.utils.process_img": image_utils,
+        }
+
+        with mock.patch.dict(sys.modules, modules), mock.patch(
+            "plugins.ocr_runtime._MNNModelSession",
+            side_effect=[det_session, RuntimeError("rec load failed")],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "rec load failed"):
+                self.ocr_runtime._MNNPipeline(
+                    Path("/models/ocr/mnn"),
+                    num_threads=1,
+                    max_side_len=960,
+                )
+
+        det_session.close.assert_called_once_with()
 
     def test_rapidocr_output_normalizes_polygon_to_pixel_bbox(self):
         output = types.SimpleNamespace(

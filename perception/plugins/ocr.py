@@ -457,7 +457,10 @@ def _adapter_signature(cfg: dict) -> tuple:
     common = (provider,)
     if provider == 'rapidocr':
         return common + (
+            str(cfg.get('backend', 'onnxruntime')).strip().lower(),
+            str(cfg.get('fallback_backend', '')).strip().lower(),
             cfg.get('model_dir', '/models/ocr/ppocrv6-tiny'),
+            cfg.get('fallback_model_dir', ''),
             str(cfg.get('device', 'cpu')).strip().lower(),
             int(cfg.get('device_id', 0)),
             int(cfg.get('gpu_mem_mb', 512)),
@@ -487,6 +490,11 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
     if provider == 'rapidocr':
         return RapidOCRAdapter(
             cfg.get('model_dir', '/models/ocr/ppocrv6-tiny'),
+            backend=str(cfg.get('backend', 'onnxruntime')).strip().lower(),
+            fallback_backend=str(
+                cfg.get('fallback_backend', '')
+            ).strip().lower(),
+            fallback_model_dir=cfg.get('fallback_model_dir', ''),
             device=str(cfg.get('device', 'cpu')).strip().lower(),
             device_id=int(cfg.get('device_id', 0)),
             gpu_mem_mb=int(cfg.get('gpu_mem_mb', 512)),
@@ -709,19 +717,12 @@ class OCRPlugin:
         self._executor = executor
         self._lifecycle_lock = threading.RLock()
 
-        try:
-            self._adapter = _build_ocr_adapter(plugin_cfg)
-            log.info(
-                f"[ocr] plugin init: provider={plugin_cfg.get('provider')}, "
-                f"language={self._language}, "
-                f"adapter_ok={self._adapter is not None}"
-            )
-        except Exception as exc:
-            log.error(
-                "[ocr] failed to create adapter: %s, OCR will be unavailable",
-                exc,
-            )
-            self._adapter = None
+        self._adapter = _build_ocr_adapter(plugin_cfg)
+        log.info(
+            f"[ocr] plugin init: provider={plugin_cfg.get('provider')}, "
+            f"language={self._language}, "
+            f"adapter_ok={self._adapter is not None}"
+        )
 
     def get_tools(self) -> list:
         return TOOLS
