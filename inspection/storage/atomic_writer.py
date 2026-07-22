@@ -66,6 +66,7 @@ class AudioSegmentWriter:
         session_id: str,
         device_id: str,
         segment_seconds: int,
+        max_segment_bytes: int = 4 * 1024 * 1024,
         sample_rate: int = 16000,
         channels: int = 1,
         sample_width: int = 2,
@@ -78,6 +79,7 @@ class AudioSegmentWriter:
         self.session_id = session_id
         self.device_id = device_id
         self.segment_seconds = int(segment_seconds)
+        self.max_segment_bytes = max(1, int(max_segment_bytes))
         self.sample_rate = int(sample_rate)
         self.channels = int(channels)
         self.sample_width = int(sample_width)
@@ -130,6 +132,7 @@ class AudioSegmentWriter:
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "sample_width": self.sample_width,
+            "max_segment_bytes": self.max_segment_bytes,
             "dropped_before_writer": self._dropped_before_writer,
         }
         _write_open_state(self._open_state_path, self._open_info)
@@ -157,7 +160,11 @@ class AudioSegmentWriter:
             if self._source_stamp_start_ns == 0:
                 self._source_stamp_start_ns = source_stamp_ns
             self._source_stamp_end_ns = source_stamp_ns
-        if self._samples >= self.segment_seconds * self.sample_rate:
+        current_bytes = self._samples * frame_width
+        if (
+            self._samples >= self.segment_seconds * self.sample_rate
+            or current_bytes >= self.max_segment_bytes
+        ):
             return self.finalize()
         return None
 

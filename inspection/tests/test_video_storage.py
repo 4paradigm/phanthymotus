@@ -120,6 +120,7 @@ class VideoStorageTest(unittest.TestCase):
             encoder="nvv4l2h264enc",
             target_bitrate_kbps=4000,
             segment_seconds=60,
+            max_segment_bytes=64 * 1024 * 1024,
             max_fps=15,
             queue_frames=8,
             shutdown_timeout_seconds=15,
@@ -132,6 +133,7 @@ class VideoStorageTest(unittest.TestCase):
         self.assertIn("nvv4l2h264enc bitrate=4000000", pipeline)
         self.assertNotIn("x264enc", pipeline)
         self.assertIn("splitmuxsink", pipeline)
+        self.assertIn("max-size-bytes=67108864", pipeline)
 
     def test_reboot_defaults_video_to_explicit_resume(self) -> None:
         config = {

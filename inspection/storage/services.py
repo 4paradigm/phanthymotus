@@ -40,18 +40,23 @@ class DurableServices:
     @staticmethod
     def _signature(config: dict[str, Any]) -> str:
         keys = (
-            "upload_enabled", "credential_profile", "cos_region", "cos_bucket",
+            "storage_mode", "upload_enabled", "credential_profile", "cos_region", "cos_bucket",
             "cos_prefix", "device_id", "upload_concurrency",
             "multipart_threshold_mb", "multipart_stale_hours", "retry_max_seconds",
         )
         return repr(tuple((key, config.get(key)) for key in keys))
 
     def configure(self, config: dict[str, Any], *, backend: Any | None = None) -> bool:
+        upload_enabled = (
+            str(config.get("storage_mode")) == "local_and_cos"
+            if config.get("storage_mode") is not None
+            else bool(config.get("upload_enabled", True))
+        )
         signature = self._signature(config)
         if (
             backend is None
             and signature == self._config_signature
-            and (self.uploader is not None or not bool(config.get("upload_enabled", True)))
+            and (self.uploader is not None or not upload_enabled)
         ):
             return True
         if self.uploader is not None:
@@ -61,7 +66,7 @@ class DurableServices:
             self.uploader = None
         self._config_signature = signature
         self.last_error = ""
-        if not bool(config.get("upload_enabled", True)):
+        if not upload_enabled:
             return True
         try:
             self.uploader = COSUploadCoordinator(

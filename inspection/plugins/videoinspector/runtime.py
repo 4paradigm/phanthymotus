@@ -123,6 +123,7 @@ class VideoRecorderRuntime:
         encoder: str,
         target_bitrate_kbps: int,
         segment_seconds: int,
+        max_segment_bytes: int,
         max_fps: float,
         queue_frames: int,
         shutdown_timeout_seconds: float,
@@ -134,6 +135,7 @@ class VideoRecorderRuntime:
         self.encoder = encoder
         self.target_bitrate_kbps = int(target_bitrate_kbps)
         self.segment_seconds = int(segment_seconds)
+        self.max_segment_bytes = max(1, int(max_segment_bytes))
         self.max_fps = float(max_fps)
         self.shutdown_timeout_seconds = float(shutdown_timeout_seconds)
         self._node = None
@@ -179,7 +181,8 @@ class VideoRecorderRuntime:
             common_head + encode +
             "h264parse config-interval=-1 ! "
             f"splitmuxsink name=segments location=/tmp/inspection-unused-%05d.mp4.part "
-            f"max-size-time={self.segment_seconds * 1_000_000_000} max-size-bytes=0 "
+            f"max-size-time={self.segment_seconds * 1_000_000_000} "
+            f"max-size-bytes={self.max_segment_bytes} "
             "send-keyframe-requests=true async-finalize=false use-robust-muxing=true"
         )
 

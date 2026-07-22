@@ -12,7 +12,7 @@
  */
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, getToolConfigs, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 
 let _canvasEl   = null;
@@ -30,6 +30,8 @@ let _draggingConn = null; // {fromCardId, fromPortEl, format, topic, tempPath, t
 
 // Project run state
 let _projectRunning = false;
+let _inspectorStatusTimer = null;
+let _inspectorPollBusy = false;
 
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
@@ -38,9 +40,9 @@ export function redrawCanvas() { _redrawConnections(); }
  * Programmatically add a card to the canvas (used by mobile tap-to-add).
  * Returns true if added, false if rejected.
  */
-export function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
+export function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance, toolType }) {
   if (_projectRunning) return false;
-  if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
+  if (toolType !== 'inspector' && hasConfig && !isToolConfigured(mcpId, toolName)) return false;
   if (!multiInstance) {
     const existing = _cards.find(c => c.mcpId === mcpId && c.toolName === toolName);
     if (existing) return false;
@@ -140,6 +142,9 @@ export async function initCanvas(initialMcps) {
   } catch { /* ignore */ }
 
   _syncEmptyState();
+  clearInterval(_inspectorStatusTimer);
+  _inspectorStatusTimer = setInterval(_pollInspectorStatuses, 5000);
+  _pollInspectorStatuses();
 }
 
 export function updateCanvasMcps(mcps) {
@@ -408,8 +413,7 @@ function _setupDropZone() {
       data = JSON.parse(e.dataTransfer.getData('application/x-cap-card'));
     } catch { return; }
 
-    // Prevent unconfigured tools from being added
-    if (data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {
+    if (data.toolType !== 'inspector' && data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {
       _showDropReject(e, '请先配置后再使用');
       return;
     }
@@ -797,8 +801,13 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           <button class="canvas-card-close" title="从画布移除">✕</button>
         </div>
         <div class="canvas-card-body canvas-inspector-body">
-          <div class="canvas-inspector-status idle"><span class="canvas-inspector-dot"></span><span>等待项目启动</span></div>
-          <div class="canvas-inspector-hint">输入数据将由独立采集服务异步处理</div>
+          <div class="canvas-inspector-status idle"><span class="canvas-inspector-dot"></span><span>待配置或连线</span></div>
+          <div class="canvas-inspector-metrics">
+            <span data-inspector-local>本地 --</span>
+            <span data-inspector-backlog>待上传 --</span>
+            <span data-inspector-remaining>可录 --</span>
+          </div>
+          <div class="canvas-inspector-hint">停止采集后，后台仍会继续上传已落盘分片</div>
         </div>
       </div>
       <div class="canvas-port-col left">${inPortsHtml}</div>
@@ -1494,6 +1503,124 @@ function _resolveAllTopics() {
   // (debug logs removed)
 }
 
+function _cardTool(card) {
+  const mcp = _allMcps.find(m => m.id === card.mcpId);
+  return (mcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
+}
+
+function _isInspectorCard(card) {
+  const tool = _cardTool(card);
+  return typeof tool === 'object' && tool.type === 'inspector';
+}
+
+function _inspectorPreflightError(card) {
+  if (!_isInspectorCard(card)) return '';
+  const inConns = _connections.filter(conn => conn.toCardId === card.id);
+  if (inConns.length !== 1) return `${card.toolName} 必须恰好连接一条输入`;
+  const inPort = card.el.querySelector(`.canvas-port.in[data-idx="${inConns[0].toPortIdx}"]`);
+  const expectedFormat = inPort?.dataset.format || '';
+  if (!expectedFormat || inConns[0].format !== expectedFormat) {
+    return `${card.toolName} 输入格式不匹配（需要 ${expectedFormat || '已声明格式'}）`;
+  }
+  if (!inConns[0].fromTopic) return `${card.toolName} 的输入连线尚未解析出 topic`;
+
+  const config = getToolConfigs()[`${card.mcpId}:${card.toolName}`];
+  if (!config) return `${card.toolName} 尚未配置存储模式`;
+  const mode = config.storage_mode || (config.upload_enabled === false ? 'local_ring' : 'local_and_cos');
+  if (!['local_ring', 'local_and_cos'].includes(mode)) return `${card.toolName} 的 storage_mode 无效`;
+  if (config.upload_enabled != null && Boolean(config.upload_enabled) !== (mode === 'local_and_cos')) {
+    return `${card.toolName} 的 storage_mode 与 upload_enabled 冲突`;
+  }
+  if (mode === 'local_and_cos' && !String(config.cos_bucket || '').trim()) {
+    return `${card.toolName} 使用 local_and_cos 时必须配置 cos_bucket`;
+  }
+  return '';
+}
+
+function _formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+}
+
+function _formatRemaining(seconds) {
+  const value = Math.max(0, Number(seconds) || 0);
+  if (value < 60) return `${Math.round(value)} 秒`;
+  if (value < 3600) return `${Math.floor(value / 60)} 分钟`;
+  return `${(value / 3600).toFixed(1)} 小时`;
+}
+
+function _renderInspectorInfo(card, info) {
+  const statusEl = card.el.querySelector('.canvas-inspector-status');
+  if (!statusEl) return;
+  const backlog = Number(info?.upload_backlog || 0);
+  const pressure = info?.disk_pressure || 'normal';
+  let stateClass = 'idle';
+  let label = '已就绪';
+  if (info?.state === 'recording') {
+    stateClass = 'recording';
+    label = '正在采集';
+  } else if (info?.state === 'paused_disk_full' || pressure === 'critical') {
+    stateClass = 'critical';
+    label = '磁盘水位过高，已暂停';
+  } else if (backlog > 0) {
+    stateClass = 'uploading';
+    label = `采集已停止，后台上传中（${backlog}）`;
+  } else if (info?.storage_mode === 'local_ring') {
+    label = '本地环形留存就绪';
+  } else if (Number(info?.uploaded_verified || 0) > 0) {
+    label = '已停止，云端已同步';
+  }
+  statusEl.className = `canvas-inspector-status ${stateClass}`;
+  statusEl.querySelector('span:last-child').textContent = label;
+
+  const localEl = card.el.querySelector('[data-inspector-local]');
+  const backlogEl = card.el.querySelector('[data-inspector-backlog]');
+  const remainingEl = card.el.querySelector('[data-inspector-remaining]');
+  if (localEl) {
+    localEl.textContent = `本地 ${_formatBytes(info?.local_bytes)} / ${_formatBytes(info?.local_limit_bytes)} · 磁盘可用 ${_formatBytes(info?.filesystem_free_bytes)} · ${pressure}`;
+  }
+  if (backlogEl) {
+    backlogEl.textContent = info?.storage_mode === 'local_ring'
+      ? '本地环形（不上云）'
+      : `待上传 ${backlog} 段 / ${_formatBytes(info?.upload_backlog_bytes)}`;
+  }
+  if (remainingEl) remainingEl.textContent = `预计可录 ${_formatRemaining(info?.estimated_remaining_seconds)}`;
+}
+
+async function _pollInspectorStatuses() {
+  if (_inspectorPollBusy) return;
+  _inspectorPollBusy = true;
+  try {
+    await Promise.all(_cards.filter(_isInspectorCard).map(async card => {
+      const preflightError = _inspectorPreflightError(card);
+      if (preflightError) {
+        const statusEl = card.el.querySelector('.canvas-inspector-status');
+        if (statusEl) {
+          statusEl.className = 'canvas-inspector-status idle';
+          statusEl.querySelector('span:last-child').textContent = preflightError;
+        }
+        return;
+      }
+      const conn = _connections.find(item => item.toCardId === card.id);
+      const response = await _triggerAction(card.mcpId, card.toolName, 'info', {
+        instance_id: card.id,
+        input_topic: conn?.fromTopic || '',
+      });
+      if (!response || response.code !== 200) {
+        const statusEl = card.el.querySelector('.canvas-inspector-status');
+        if (statusEl) statusEl.querySelector('span:last-child').textContent = response?.message || '采集服务不可用';
+        return;
+      }
+      _renderInspectorInfo(card, _parseMcpCallResult(response) || {});
+    }));
+  } finally {
+    _inspectorPollBusy = false;
+  }
+}
+
 // ── Project lifecycle ─────────────────────────────────────────────────────────
 
 function _autoStopOnDisconnect(cardId, portIdx, topic) {
@@ -1507,16 +1634,13 @@ function _autoStopOnDisconnect(cardId, portIdx, topic) {
 }
 
 async function _startProject() {
-  // 先对 agentcore 发 stop，清理上一轮残留的 topic 订阅（必须 await 否则后续 start 会被 stop 覆盖）
-  await _triggerAction('agentcore', 'decision_core', 'stop', {});
-
   // Check all cards on canvas that need config are configured (via sidebar per-tool config)
   const unconfigured = _cards.filter(c => {
     const mcp = _allMcps.find(m => m.id === c.mcpId);
     const tools = mcp?.tools || [];
     const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === c.toolName);
     const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
-    return hasSharedRequired(configSchema) && !isToolConfigured(c.mcpId, c.toolName);
+    return !_isInspectorCard(c) && hasSharedRequired(configSchema) && !isToolConfigured(c.mcpId, c.toolName);
   });
   if (unconfigured.length) {
     const names = unconfigured.map(c => c.toolName).join(', ');
@@ -1528,6 +1652,17 @@ async function _startProject() {
 
   // Resolve all topics before validation (ensures correctness after page reload)
   _resolveAllTopics();
+
+  // Inspectors are allowed on the canvas before configuration, but the project
+  // must not start until every Inspector has one compatible link and valid storage config.
+  const inspectorErrors = _cards.map(_inspectorPreflightError).filter(Boolean);
+  if (inspectorErrors.length) {
+    const msg = `无法启动：${inspectorErrors.join('；')}`;
+    _logActivity('error', msg);
+    _flashStartError(msg);
+    _pollInspectorStatuses();
+    return;
+  }
 
   // For processor cards with empty output topics, fetch from driver using input topic
   for (const card of _cards) {
@@ -1555,6 +1690,10 @@ async function _startProject() {
       return;
     }
   }
+
+  // Preflight is complete. Only now perform the first lifecycle side effect.
+  // The stop must be awaited so a stale subscription cleanup cannot race later starts.
+  await _triggerAction('agentcore', 'decision_core', 'stop', {});
 
   _projectRunning = true;
   _syncProjectBtn();
@@ -1635,15 +1774,10 @@ async function _startProject() {
         const cardMcp = _allMcps.find(m => m.id === card.mcpId);
         const cardTool = (cardMcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
         if (typeof cardTool === 'object' && cardTool.type === 'inspector') {
-          const statusEl = card.el.querySelector('.canvas-inspector-status');
-          if (statusEl) {
-            const recording = parsed?.state === 'recording';
-            statusEl.classList.toggle('recording', recording);
-            statusEl.classList.toggle('idle', !recording);
-            statusEl.querySelector('span:last-child').textContent = recording
-              ? '正在采集'
-              : (parsed?.message || parsed?.state || '启动失败');
+          if (parsed?.state !== 'recording') {
+            throw new Error(parsed?.message || parsed?.last_error || `${card.toolName} 未进入 recording 状态`);
           }
+          _renderInspectorInfo(card, parsed);
         }
         updateItem(i, 'ready');
       } catch (e) {
@@ -1712,12 +1846,13 @@ function _stopProject() {
     const cardMcp = _allMcps.find(m => m.id === card.mcpId);
     const cardTool = (cardMcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
     if (typeof cardTool === 'object' && cardTool.type === 'inspector') {
+      const statusEl = card.el.querySelector('.canvas-inspector-status');
+      if (statusEl) {
+        statusEl.className = 'canvas-inspector-status uploading';
+        statusEl.querySelector('span:last-child').textContent = '正在结束当前分片';
+      }
       stopPromise.finally(() => {
-        const statusEl = card.el.querySelector('.canvas-inspector-status');
-        if (!statusEl) return;
-        statusEl.classList.remove('recording');
-        statusEl.classList.add('idle');
-        statusEl.querySelector('span:last-child').textContent = '已停止';
+        _pollInspectorStatuses();
       });
     }
     // Auto-stop mic stream when remote_mic card stops

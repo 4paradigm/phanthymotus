@@ -316,6 +316,37 @@ class COSAndRetentionTest(unittest.TestCase):
         self.assertTrue(Path(record["local_path"]).exists())
         self.assertEqual(SegmentState.FINALIZED.value, self.ledger.get(metadata["segment_id"])["state"])
 
+    def test_local_ring_expiry_can_delete_unuploaded_segment(self) -> None:
+        metadata = self.make_segment(instance_id="local-ring")
+        record = self.ledger.get(metadata["segment_id"])
+        assert record is not None
+        self.ledger.set_instance_state(
+            card_id="audioinspector",
+            instance_id="local-ring",
+            input_topic="/robot/mic/audio",
+            desired_state="idle",
+            auto_resume=False,
+            session_id="session-local-ring",
+            config={
+                "storage_mode": "local_ring",
+                "local_retention_hours": 1,
+                "local_max_gb": 4,
+            },
+        )
+        sweeper = RetentionSweeper(
+            ledger=self.ledger,
+            card_id="audioinspector",
+            data_root=self.data_root,
+        )
+
+        stats = sweeper.sweep_once(
+            now_ns=int(record["created_at_ns"]) + 2 * 3600 * 1_000_000_000,
+        )
+
+        self.assertEqual(1, stats["purged"])
+        self.assertEqual(SegmentState.PURGED_LOCAL.value, self.ledger.get(metadata["segment_id"])["state"])
+        self.assertFalse(Path(record["local_path"]).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

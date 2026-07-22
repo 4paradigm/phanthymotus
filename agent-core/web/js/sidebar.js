@@ -298,6 +298,7 @@ function _buildChip(mcp, tool) {
       driverName: mcp.server_name || mcp.name || mcp.id,
       hasConfig: !!hasSharedFields,
       multiInstance: !!(tool.multiInstance),
+      toolType,
     });
     if (added) closeSidebarMobile();
   });
@@ -325,6 +326,7 @@ function _buildChip(mcp, tool) {
       hasConfig: !!hasSharedFields, configured,
       multiInstance: !!(tool.multiInstance),
       hasInstanceConfig: _hasInstanceFields(configSchema),
+      toolType,
     }));
   });
   chip.addEventListener('dragend', () => chip.classList.remove('dragging-source'));
@@ -432,6 +434,7 @@ function _buildToolCard(mcp, tool) {
       driverName: mcp.server_name || mcp.name || mcp.id,
       hasConfig: !!hasSharedFields,
       multiInstance: !!(tool.multiInstance),
+      toolType,
     });
     if (added) closeSidebarMobile();
   });
@@ -453,6 +456,7 @@ function _buildToolCard(mcp, tool) {
       hasConfig: !!hasSharedFields, configured,
       multiInstance: !!(tool.multiInstance),
       hasInstanceConfig: _hasInstanceFields(configSchema),
+      toolType,
     }));
   });
   card.addEventListener('dragend', () => card.classList.remove('dragging-source'));
@@ -500,6 +504,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   const hasSharedFields = Object.values(props).some(d => d.scope !== 'instance');
 
   for (const [key, def] of Object.entries(props)) {
+    if (def.uiHidden) continue;
     // Skip instance-scope fields only if there are also shared fields
     if (hasSharedFields && def.scope === 'instance') continue;
     const fieldWrapper = document.createElement('div');
@@ -706,8 +711,9 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
+      const payload = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+        alert(`配置保存失败: ${payload.detail || payload.message || `HTTP ${resp.status}`}`);
         return;
       }
     } catch (err) {
@@ -820,6 +826,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
 
   let hasFields = false;
   for (const [key, def] of Object.entries(props)) {
+    if (def.uiHidden) continue;
     // Only show instance-scope fields
     if (def.scope !== 'instance') continue;
     hasFields = true;
@@ -987,8 +994,9 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
+      const payload = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+        alert(`配置保存失败: ${payload.detail || payload.message || `HTTP ${resp.status}`}`);
         return;
       }
     } catch (err) {

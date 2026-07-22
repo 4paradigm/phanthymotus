@@ -22,6 +22,10 @@ class InspectorFrontendContractTest(unittest.TestCase):
         source = (CORE_ROOT / "web/js/canvas.js").read_text(encoding="utf-8")
         self.assertIn("effectiveType === 'inspector'", source)
         self.assertIn("canvas-inspector-status", source)
+        self.assertIn("_inspectorPreflightError", source)
+        self.assertIn("必须恰好连接一条输入", source)
+        self.assertIn("upload_backlog_bytes", source)
+        self.assertIn("toolType !== 'inspector' && hasConfig", source)
 
     def test_flow_view_uses_category_instead_of_topic_direction(self) -> None:
         source = (CORE_ROOT / "web/js/flow-view.js").read_text(encoding="utf-8")

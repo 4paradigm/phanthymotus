@@ -76,6 +76,29 @@ class AudioStorageTest(unittest.TestCase):
         self.assertEqual("wal", self.ledger.journal_mode)
         self.assertGreaterEqual(self.ledger.synchronous, 2)
 
+    def test_audio_segment_finalizes_when_byte_limit_arrives_first(self) -> None:
+        writer = AudioSegmentWriter(
+            data_root=self.root / "data",
+            ledger=self.ledger,
+            card_id="audioinspector",
+            instance_id="mic-size-limit",
+            input_topic="/robot/mic/audio",
+            session_id="session-size-limit",
+            device_id="g1-sh",
+            segment_seconds=600,
+            max_segment_bytes=8,
+            sample_rate=8,
+            channels=1,
+            sample_width=2,
+        )
+
+        metadata = writer.write_chunk(b"\x01\x00" * 4)
+
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(4, metadata["samples_or_frames"])
+        self.assertFalse(list((self.root / "data").rglob("*.part")))
+
     def test_unclean_part_is_recovered_to_playable_wav(self) -> None:
         writer = self.make_writer()
         self.assertIsNone(writer.write_chunk(b"\x02\x00" * 4, source_stamp_ns=456_000_000))

@@ -750,6 +750,26 @@ html, body {
   background: #0284C7;
   box-shadow: 0 0 0 3px rgba(2,132,199,0.12);
 }
+.canvas-inspector-status.uploading { color: #7C3AED; }
+.canvas-inspector-status.uploading .canvas-inspector-dot {
+  background: #8B5CF6;
+  box-shadow: 0 0 0 3px rgba(139,92,246,0.12);
+}
+.canvas-inspector-status.critical { color: #DC2626; }
+.canvas-inspector-status.critical .canvas-inspector-dot {
+  background: #EF4444;
+  box-shadow: 0 0 0 3px rgba(239,68,68,0.12);
+}
+.canvas-inspector-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
 .canvas-inspector-hint {
   margin-top: 6px;
   color: var(--text-dim);

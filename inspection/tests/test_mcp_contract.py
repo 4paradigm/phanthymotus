@@ -29,6 +29,9 @@ class InspectionContractTest(unittest.TestCase):
             self.assertTrue(tool["multiInstance"])
             self.assertFalse(tool["agentCallable"])
             self.assertEqual([], tool["topic_out"])
+            storage_mode = tool["configSchema"]["properties"]["storage_mode"]
+            self.assertEqual(["local_ring", "local_and_cos"], storage_mode["enum"])
+            self.assertEqual("local_and_cos", storage_mode["default"])
             corrupt_retention = tool["configSchema"]["properties"]["corrupt_retention_hours"]
             self.assertEqual(24, corrupt_retention["default"])
             self.assertEqual("instance", corrupt_retention["scope"])
@@ -73,6 +76,33 @@ class InspectionContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cos_bucket"):
             self.bundle.dispatch("audioinspector", {
                 "action": "start", "instance_id": "card-2", "input_topic": "/robot/mic/audio",
+            })
+
+    def test_local_ring_mode_does_not_require_cos(self) -> None:
+        configured = self.bundle.dispatch("audioinspector", {
+            "action": "config",
+            "storage_mode": "local_ring",
+            "instance_id": "card-local",
+        })
+        started = self.bundle.dispatch("audioinspector", {
+            "action": "start",
+            "instance_id": "card-local",
+            "input_topic": "/robot/mic/audio",
+        })
+
+        self.assertTrue(configured["adapter_ok"])
+        self.assertFalse(configured["upload_ready"])
+        self.assertEqual("recording", started["state"])
+        self.assertEqual("local_ring", started["storage_mode"])
+        self.assertIn("upload_backlog_bytes", started)
+        self.assertIn("disk_pressure", started)
+
+    def test_storage_mode_rejects_legacy_switch_conflict(self) -> None:
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self.bundle.dispatch("audioinspector", {
+                "action": "config",
+                "storage_mode": "local_ring",
+                "upload_enabled": True,
             })
 
     def test_config_is_validated_atomically(self) -> None:

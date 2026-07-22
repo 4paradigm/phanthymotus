@@ -1,33 +1,45 @@
 from __future__ import annotations
 
 import copy
+import shutil
 import socket
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
 _SHARED_PROPERTIES = {
+    "storage_mode": {
+        "type": "string", "enum": ["local_ring", "local_and_cos"],
+        "default": "local_and_cos", "scope": "shared",
+        "description": "Local rolling storage, or durable local storage plus asynchronous COS upload.",
+    },
     "storage_backend": {
         "type": "string", "enum": ["cos"], "default": "cos", "scope": "shared",
+        "uiHidden": True,
         "description": "Storage backend. Local durability is independent from asynchronous upload.",
     },
     "credential_profile": {
         "type": "string", "default": "default", "scope": "shared",
+        "x-show-when": {"storage_mode": "local_and_cos"},
         "description": "Deployment secret profile name; never contains credentials.",
     },
     "cos_region": {
         "type": "string", "default": "ap-beijing", "scope": "shared",
+        "x-show-when": {"storage_mode": "local_and_cos"},
         "description": "Tencent COS region.",
     },
     "cos_bucket": {
         "type": "string", "scope": "shared",
+        "x-show-when": {"storage_mode": "local_and_cos"},
         "description": "Full Tencent COS bucket name.",
     },
     "cos_prefix": {
         "type": "string", "default": "inspection-data", "scope": "shared",
+        "x-show-when": {"storage_mode": "local_and_cos"},
         "description": "Object key prefix without leading or trailing slash.",
     },
     "device_id": {
@@ -36,19 +48,24 @@ _SHARED_PROPERTIES = {
     },
     "upload_enabled": {
         "type": "boolean", "default": True, "scope": "shared",
-        "description": "Enable asynchronous COS upload when the durable backend lands.",
+        "uiHidden": True,
+        "description": "Legacy compatibility switch; new configurations should use storage_mode.",
     },
     "upload_concurrency": {
         "type": "integer", "minimum": 1, "maximum": 8, "default": 2, "scope": "shared",
+        "x-show-when": {"storage_mode": "local_and_cos"},
     },
     "multipart_threshold_mb": {
         "type": "integer", "minimum": 1, "default": 64, "scope": "shared",
+        "x-show-when": {"storage_mode": "local_and_cos"},
     },
     "multipart_stale_hours": {
         "type": "integer", "minimum": 1, "maximum": 168, "default": 24, "scope": "shared",
+        "x-show-when": {"storage_mode": "local_and_cos"},
     },
     "retry_max_seconds": {
         "type": "integer", "minimum": 1, "default": 300, "scope": "shared",
+        "x-show-when": {"storage_mode": "local_and_cos"},
     },
     "shutdown_finalize_timeout_seconds": {
         "type": "integer", "minimum": 5, "maximum": 60, "default": 15, "scope": "shared",
@@ -126,7 +143,7 @@ class InspectorPlugin:
             "configSchema": {
                 "type": "object",
                 "properties": config_properties,
-                "required": ["cos_bucket"],
+                "required": [],
             },
             "topic_in": [{"format": self.input_format, "desc": self.input_description}],
             "topic_out": [],
@@ -136,11 +153,14 @@ class InspectorPlugin:
         return [copy.deepcopy(self._tool)]
 
     def _effective_config(self, instance_id: str) -> dict[str, Any]:
-        return {
+        config = {
             **self._shared_config,
             **self._instance_defaults,
             **self._instance_config.get(instance_id, {}),
         }
+        mode = str(config.get("storage_mode", "local_and_cos"))
+        config["upload_enabled"] = mode == "local_and_cos"
+        return config
 
     @staticmethod
     def _validate_config_value(key: str, value: Any, spec: dict[str, Any]) -> None:
@@ -161,6 +181,14 @@ class InspectorPlugin:
             raise ValueError(f"config field {key} must be <= {spec['maximum']}")
 
     def _apply_config(self, args: dict[str, Any]) -> dict[str, Any]:
+        args = dict(args)
+        if "storage_mode" in args:
+            expected_upload = args["storage_mode"] == "local_and_cos"
+            if "upload_enabled" in args and bool(args["upload_enabled"]) != expected_upload:
+                raise ValueError("storage_mode conflicts with upload_enabled")
+            args["upload_enabled"] = expected_upload
+        elif "upload_enabled" in args:
+            args["storage_mode"] = "local_and_cos" if bool(args["upload_enabled"]) else "local_ring"
         instance_id = str(args.get("instance_id", ""))
         staged: list[tuple[str, Any, dict[str, Any]]] = []
         properties = self._tool["configSchema"]["properties"]
@@ -209,17 +237,68 @@ class InspectorPlugin:
 
     def _validate_start_config(self, instance_id: str) -> None:
         cfg = self._effective_config(instance_id)
-        if cfg.get("upload_enabled", True) and not str(cfg.get("cos_bucket", "")).strip():
-            raise ValueError("cos_bucket is required when upload_enabled=true")
+        mode = str(cfg.get("storage_mode", "local_and_cos"))
+        if mode not in {"local_ring", "local_and_cos"}:
+            raise ValueError("storage_mode must be local_ring or local_and_cos")
+        if mode == "local_and_cos" and not str(cfg.get("cos_bucket", "")).strip():
+            raise ValueError("cos_bucket is required when storage_mode=local_and_cos")
         prefix = str(cfg.get("cos_prefix", ""))
         if prefix.startswith("/") or prefix.endswith("/"):
             raise ValueError("cos_prefix must not start or end with '/'")
+
+    @staticmethod
+    def _storage_status(
+        *,
+        data_root: str | Path,
+        local_bytes: int,
+        config: dict[str, Any],
+        bytes_per_second: float,
+    ) -> dict[str, Any]:
+        local_limit_bytes = max(1, int(float(config.get("local_max_gb", 1)) * 1024 ** 3))
+        try:
+            usage = shutil.disk_usage(Path(data_root))
+            filesystem_total_bytes = int(usage.total)
+            filesystem_free_bytes = int(usage.free)
+        except OSError:
+            filesystem_total_bytes = 0
+            filesystem_free_bytes = 0
+        local_ratio = float(local_bytes) / local_limit_bytes
+        filesystem_ratio = (
+            1.0 - (filesystem_free_bytes / filesystem_total_bytes)
+            if filesystem_total_bytes > 0 else 0.0
+        )
+        effective_ratio = max(local_ratio, filesystem_ratio)
+        if effective_ratio >= 0.95:
+            pressure = "critical"
+        elif effective_ratio >= 0.85:
+            pressure = "high"
+        elif effective_ratio >= 0.70:
+            pressure = "warning"
+        else:
+            pressure = "normal"
+        instance_remaining = max(0, local_limit_bytes - int(local_bytes))
+        filesystem_safe_remaining = (
+            max(0, filesystem_free_bytes - int(filesystem_total_bytes * 0.05))
+            if filesystem_total_bytes > 0 else instance_remaining
+        )
+        remaining_bytes = min(instance_remaining, filesystem_safe_remaining)
+        estimated_remaining_seconds = int(remaining_bytes / max(1.0, float(bytes_per_second)))
+        return {
+            "storage_mode": str(config.get("storage_mode", "local_and_cos")),
+            "local_limit_bytes": local_limit_bytes,
+            "local_usage_ratio": local_ratio,
+            "filesystem_total_bytes": filesystem_total_bytes,
+            "filesystem_free_bytes": filesystem_free_bytes,
+            "filesystem_usage_ratio": filesystem_ratio,
+            "disk_pressure": pressure,
+            "estimated_remaining_seconds": estimated_remaining_seconds,
+        }
 
     def _instance_info(self, instance_id: str, input_topic: str = "") -> dict[str, Any]:
         instance = self._instances.get(instance_id)
         topic = instance.input_topic if instance else input_topic
         state = instance.state if instance else "idle"
-        runtime = self._runtime_stats(instance) if instance else {}
+        runtime = self._runtime_stats(instance, instance_id)
         return {
             "name": self.display_name,
             "card_id": self.card_id,
@@ -232,6 +311,7 @@ class InspectorPlugin:
             "recording": state == "recording",
             "local_bytes": int(runtime.get("local_bytes", 0)),
             "upload_backlog": int(runtime.get("upload_backlog", 0)),
+            "upload_backlog_bytes": int(runtime.get("upload_backlog_bytes", 0)),
             "uploaded_verified": int(runtime.get("uploaded_verified", 0)),
             "dropped": int(runtime.get("dropped", 0)),
             "finalized_segments": int(runtime.get("finalized_segments", instance.finalized_segments if instance else 0)),
@@ -239,6 +319,14 @@ class InspectorPlugin:
             "last_error": runtime.get("last_error", instance.last_error if instance else ""),
             "runtime_mode": self._runtime_mode,
             "storage_ready": self._storage_ready,
+            "storage_mode": runtime.get("storage_mode", self._effective_config(instance_id).get("storage_mode")),
+            "local_limit_bytes": int(runtime.get("local_limit_bytes", 0)),
+            "local_usage_ratio": float(runtime.get("local_usage_ratio", 0)),
+            "filesystem_total_bytes": int(runtime.get("filesystem_total_bytes", 0)),
+            "filesystem_free_bytes": int(runtime.get("filesystem_free_bytes", 0)),
+            "filesystem_usage_ratio": float(runtime.get("filesystem_usage_ratio", 0)),
+            "disk_pressure": runtime.get("disk_pressure", "normal"),
+            "estimated_remaining_seconds": int(runtime.get("estimated_remaining_seconds", 0)),
             "desc": (
                 "Durable local segment writer is active; COS upload may still be pending."
                 if self._storage_ready else
@@ -246,7 +334,10 @@ class InspectorPlugin:
             ),
         }
 
-    def _runtime_stats(self, instance: RecordingInstance) -> dict[str, Any]:
+    def _runtime_stats(self, instance: RecordingInstance | None, instance_id: str) -> dict[str, Any]:
+        return {}
+
+    def _aggregate_runtime_stats(self) -> dict[str, Any]:
         return {}
 
     def _start_runtime(self, instance: RecordingInstance, config: dict[str, Any]) -> None:
@@ -281,6 +372,7 @@ class InspectorPlugin:
                 if instance_id:
                     return self._instance_info(instance_id, str(args.get("input_topic", "")))
                 running = sum(1 for item in self._instances.values() if item.state == "recording")
+                aggregate = self._aggregate_runtime_stats()
                 return {
                     "name": self.display_name,
                     "card_id": self.card_id,
@@ -292,6 +384,7 @@ class InspectorPlugin:
                     "topic_out": [],
                     "runtime_mode": self._runtime_mode,
                     "storage_ready": self._storage_ready,
+                    **aggregate,
                 }
 
         if action == "start":

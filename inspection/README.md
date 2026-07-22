@@ -1,6 +1,13 @@
 # Inspection Stack
 
-独立的音视频采集卡片宿主。当前分支已完成 Gate 1 卡片与 Dashboard 编排、Gate 2 Audio Inspector 持久化采集、Gate 3 Video Inspector 硬件编码与 MP4 分片，以及 Gate 4–5 COS 校验上传、断点恢复和本地滚动清理。代码闭环已完成，真实 G1 采集与 COS 仍需部署验收。
+独立的音视频采集卡片宿主。当前分支已完成 Dashboard 编排、Audio Inspector 持久化采集、Video Inspector 硬件编码与 MP4 分片、COS 校验上传、断点恢复和本地滚动清理。基础采集与 COS 已在上海 G1 真机通过；本轮新增的卡片启动门禁、双条件分片和磁盘状态仍需部署到上海 G1 做联合验收。
+
+## 画布使用门禁
+
+- 未配置的 Audio / Video Inspector 可以先拖入画布，卡片会显示“待配置”或“待连线”。
+- 每张 Inspector 必须恰好连接一条 format 完全匹配的输入：音频为 `audio/pcm-16k`，视频为 `image/jpeg`。
+- 点击“开启智能控制”时，Dashboard 在调用任何 `start` 前检查全部 Inspector 的连线和存储配置；任意一张不合格则整个项目不启动。
+- Inspector 配置由服务端同步校验成功后才写入 Agent Core，不再出现“界面显示已保存、运行时才发现配置无效”的状态。
 
 ## 采集生命周期
 
@@ -11,6 +18,16 @@
 - 异常退出后启动时先恢复 `.part` 和 ledger。`auto_resume_after_reboot=false` 时保持 `idle` 并返回 `resume_required=true`，不会偷偷继续采集。
 - Inspection 容器使用 `on-failure:3` 隔离 Jetson 原生插件导致的非零退出：运行期异常最多自动重启 3 次，但 Docker daemon 或整机重启时不会自动拉起，不改变宿主服务先就绪、再启动容器的顺序。
 - 重启时当前卡片的 `UPLOADING` 回退到 `FINALIZED`；先通过 HEAD 识别已完整上传的对象，否则从本地正式分片重新上传，超过 `multipart_stale_hours` 的遗留 upload 尽力终止。
+- 卡片每 5 秒刷新本地占用、实例上限、文件系统水位、预计剩余可录时间和上传 backlog；项目停止后仍继续刷新，直到 backlog 清空。
+
+## 存储模式与分片
+
+- `storage_mode=local_and_cos`（默认）：本地原子落盘后异步上传；只有 `UPLOADED_VERIFIED` 的媒体/metadata 才可被本地留存策略删除。
+- `storage_mode=local_ring`：不要求 COS，允许按 `local_retention_hours` 和 `local_max_gb` 滚动删除最旧本地分片。这是显式选择的本地有损模式，不会由 COS 失败自动降级得到。
+- `upload_enabled` 仅用于兼容旧配置，WebUI 不再显示；与 `storage_mode` 冲突时配置保存失败。
+- 音频默认按 `segment_seconds=60` 或 `max_segment_mb=4` 先到者切成 WAV。
+- 视频默认按 `segment_seconds=60` 或 `max_segment_mb=64` 先到者切成 H.264 MP4。
+- `flush` 和 `stop` 都会强制结束当前分片；第一版不按 VAD、画面变化或动作语义切片。
 
 ## 本地运行
 
@@ -99,10 +116,11 @@ node --check agent-core/web/js/flow-view.js
 
 - `local_retention_hours` 控制本地保留时间，`local_max_gb` 控制实例最大 spool 预算；
 - Audio / Video Inspector 的 `corrupt_retention_hours` 控制不可恢复分片及诊断文件的保留时间，默认 24 小时；
-- 只有 `UPLOADED_VERIFIED` 数据可进入删除流程，并在断点可恢复的 `RETENTION_ELIGIBLE → PURGED_LOCAL` 状态间迁移；
+- `local_and_cos` 只有 `UPLOADED_VERIFIED` 数据可进入删除流程；`local_ring` 可对到期或超预算的本地 `FINALIZED` 数据执行显式环形清理；两种模式最终都经过 `RETENTION_ELIGIBLE → PURGED_LOCAL`；
 - 超预算时先从最旧的已验证数据开始删除；若剩余数据均未上传，暂停该 Inspector 并报 `paused_disk_full`，不静默丢数据；
 - 删除媒体、metadata 或过期 corrupt 诊断文件后，会从小时目录向上清理空目录；每小时额外清扫历史空目录；
 - 启动前会估算留存窗口所需容量，超过 `local_max_gb` 的 80% 则拒绝启动并给出错误。
+- 实例预算水位和宿主文件系统水位取较高者：70% warning、85% high、95% critical；critical 时停止接收新输入、完成当前分片后暂停。
 
 ## 当前边界
 
@@ -118,11 +136,14 @@ node --check agent-core/web/js/flow-view.js
 ## G1 部署后验收
 
 1. 确认 `embodied-inspection` 运行，`curl http://127.0.0.1:15671/health` 返回 `ok=true`。
-2. 在 Dashboard 加入 Audio Inspector 和 Video Inspector，分别连接 `/phanthymotus_g1_driver/mic/audio` 和当前可用的 `sensor_msgs/CompressedImage` topic；上海 G1 已验证外部相机 topic 为 `/phanthymotus_g1_driver/ext_camera/card-mrnbwcls6nji/rgb`。
-3. 配置 `cos_region`、`cos_bucket`、`cos_prefix`、`device_id`、`credential_profile`，先执行 `testupload`。
-4. 点击“开启智能控制”，等待至少一个 `segment_seconds`，再点击停止。
-5. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
-6. 检查 COS 对象键为 `<prefix>/<device>/<card>/<instance>/YYYYMMDD/HH/<file>`，且媒体和 metadata 的 size/SHA-256 与本地一致。旧版本已经上传的 `YYYY/MM/DD/HH` 对象不迁移，新旧布局可以并存。
-7. 停止智能控制后确认不再产生新分片，但已有 backlog 仍会减少；最后执行一次断网、强制退出和重启恢复验收。
+2. 先在未配置、未连线状态把两张 Inspector 拖入 Dashboard，确认卡片可添加且项目启动被明确拒绝。
+3. 验证错误 format 无法连线；再分别连接 `/phanthymotus_g1_driver/mic/audio` 和 `/phanthymotus_g1_driver/ext_camera/card-mrnbwcls6nji/rgb`。
+4. 配置 `storage_mode=local_and_cos`、`cos_region`、`cos_bucket`、`cos_prefix`、`device_id`、`credential_profile`，先执行 `testupload`。
+5. 点击“开启智能控制”，确认两张卡片均进入“正在采集”，并能看到本地用量、剩余可录时间和磁盘水位。
+6. 使用较小验收值验证按时长分片，再单独使用较小 `max_segment_mb` 验证按大小分片；停止项目时当前段必须被 finalize。
+7. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
+8. 检查 COS 对象键为 `<prefix>/<device>/<card>/<instance>/YYYYMMDD/HH/<file>`，且媒体和 metadata 的 size/SHA-256 与本地一致。
+9. 停止智能控制后确认不再产生新分片，但卡片仍显示 backlog 减少，最终变成“云端已同步”。
+10. 另建 `local_ring` 实例验证无需 COS 可启动，过期或超预算后只滚动本地数据，不创建 COS 对象。
 
 视频验收前必须先确认输入 topic 能在超时窗口内收到至少一帧 `sensor_msgs/msg/CompressedImage`。只有 publisher 数量不为零并不代表相机真实产帧；门禁失败时应先修复上游相机服务，不能用空 MP4 作为通过证据。

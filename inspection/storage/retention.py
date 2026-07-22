@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -40,6 +41,7 @@ class RetentionSweeper:
         self._next_artifact_sweep_ns = 0
         self.last_error = ""
         self.critical_instances: dict[str, dict[str, int]] = {}
+        self.pressure_instances: dict[str, dict[str, float | int | str]] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -175,35 +177,74 @@ class RetentionSweeper:
         self.empty_dirs_pruned += pruned
         return pruned
 
+    def _filesystem_ratio(self) -> float:
+        if self.data_root is None:
+            return 0.0
+        try:
+            usage = shutil.disk_usage(self.data_root)
+        except OSError:
+            return 0.0
+        return 1.0 - (usage.free / usage.total) if usage.total else 0.0
+
     def sweep_once(self, *, now_ns: int | None = None) -> dict[str, int]:
         now_ns = time.time_ns() if now_ns is None else int(now_ns)
         stats = {"purged": 0, "critical": 0, "corrupt_files_purged": 0, "empty_dirs_pruned": 0}
         self.critical_instances = {}
+        self.pressure_instances = {}
         saved_instances = self.ledger.list_instance_states(card_id=self.card_id)
         for saved in saved_instances:
             instance_id = str(saved["instance_id"])
             config = dict(saved.get("config") or {})
+            storage_mode = str(config.get(
+                "storage_mode",
+                "local_and_cos" if bool(config.get("upload_enabled", True)) else "local_ring",
+            ))
             retention_hours = float(config.get("local_retention_hours", 24))
             max_bytes = int(float(config.get("local_max_gb", 4)) * 1024 * 1024 * 1024)
             cutoff_ns = now_ns - int(retention_hours * 3600 * 1_000_000_000)
             local_bytes = self.ledger.summary(card_id=self.card_id, instance_id=instance_id)["local_bytes"]
-            candidates = self.ledger.list_cleanup_candidates(card_id=self.card_id, instance_id=instance_id)
+            filesystem_ratio = self._filesystem_ratio()
+            candidates = self.ledger.list_cleanup_candidates(
+                card_id=self.card_id,
+                instance_id=instance_id,
+                include_unuploaded=storage_mode == "local_ring",
+            )
             for record in candidates:
                 already_eligible = record["state"] == SegmentState.RETENTION_ELIGIBLE.value
                 expired = int(record["created_at_ns"]) <= cutoff_ns
-                over_budget = local_bytes > max_bytes
+                over_budget = local_bytes >= max_bytes * 0.85 or filesystem_ratio >= 0.85
                 if not (already_eligible or expired or over_budget):
                     continue
                 try:
                     removed_bytes, pruned_dirs = self._purge_record(record)
                     local_bytes = max(0, local_bytes - removed_bytes)
+                    filesystem_ratio = self._filesystem_ratio()
                     stats["purged"] += 1
                     stats["empty_dirs_pruned"] += pruned_dirs
                     self.last_error = ""
                 except Exception as exc:
                     self.last_error = str(exc)
                     log.exception("failed to purge local segment %s", record["segment_id"])
-            if local_bytes > max_bytes:
+            local_ratio = local_bytes / max(1, max_bytes)
+            filesystem_ratio = self._filesystem_ratio()
+            effective_ratio = max(local_ratio, filesystem_ratio)
+            if effective_ratio >= 0.95:
+                pressure = "critical"
+            elif effective_ratio >= 0.85:
+                pressure = "high"
+            elif effective_ratio >= 0.70:
+                pressure = "warning"
+            else:
+                pressure = "normal"
+            self.pressure_instances[instance_id] = {
+                "storage_mode": storage_mode,
+                "local_bytes": local_bytes,
+                "max_bytes": max_bytes,
+                "local_ratio": local_ratio,
+                "filesystem_ratio": filesystem_ratio,
+                "pressure": pressure,
+            }
+            if effective_ratio >= 0.95:
                 self.critical_instances[instance_id] = {"local_bytes": local_bytes, "max_bytes": max_bytes}
                 stats["critical"] += 1
                 if self.on_critical is not None:
@@ -240,4 +281,5 @@ class RetentionSweeper:
             "empty_dirs_pruned": self.empty_dirs_pruned,
             "retention_last_error": self.last_error,
             "critical_instances": dict(self.critical_instances),
+            "pressure_instances": dict(self.pressure_instances),
         }

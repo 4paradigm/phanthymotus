@@ -147,11 +147,14 @@ class SegmentLedger:
                 values,
             ).fetchall()
         counts = {str(row["state"]): int(row["count"]) for row in rows}
+        bytes_by_state = {str(row["state"]): int(row["bytes"]) for row in rows}
         local_bytes = sum(int(row["bytes"]) for row in rows if row["state"] != SegmentState.PURGED_LOCAL.value)
+        upload_states = (SegmentState.FINALIZED.value, SegmentState.UPLOADING.value)
         return {
             "local_bytes": local_bytes,
             "finalized_segments": sum(counts.values()),
-            "upload_backlog": counts.get(SegmentState.FINALIZED.value, 0) + counts.get(SegmentState.UPLOADING.value, 0),
+            "upload_backlog": sum(counts.get(state, 0) for state in upload_states),
+            "upload_backlog_bytes": sum(bytes_by_state.get(state, 0) for state in upload_states),
             "uploaded_verified": counts.get(SegmentState.UPLOADED_VERIFIED.value, 0),
         }
 
@@ -275,19 +278,25 @@ class SegmentLedger:
     def mark_conflict(self, segment_id: str, *, error: str) -> None:
         self.transition(segment_id, SegmentState.CONFLICT, error=error)
 
-    def list_cleanup_candidates(self, *, card_id: str, instance_id: str) -> list[dict]:
+    def list_cleanup_candidates(
+        self,
+        *,
+        card_id: str,
+        instance_id: str,
+        include_unuploaded: bool = False,
+    ) -> list[dict]:
+        states = [SegmentState.RETENTION_ELIGIBLE.value, SegmentState.UPLOADED_VERIFIED.value]
+        if include_unuploaded:
+            states.append(SegmentState.FINALIZED.value)
+        placeholders = ", ".join("?" for _ in states)
         with self._lock:
             rows = self._db.execute(
-                """
+                f"""
                 SELECT * FROM segments
-                WHERE card_id=? AND instance_id=? AND state IN (?, ?)
+                WHERE card_id=? AND instance_id=? AND state IN ({placeholders})
                 ORDER BY created_at_ns, segment_id
                 """,
-                (
-                    card_id, instance_id,
-                    SegmentState.RETENTION_ELIGIBLE.value,
-                    SegmentState.UPLOADED_VERIFIED.value,
-                ),
+                (card_id, instance_id, *states),
             ).fetchall()
             return [dict(row) for row in rows]
 

@@ -18,6 +18,54 @@ router = fastapi.APIRouter(prefix='/canvas', tags=['canvas'])
 _TOOL_CONFIG_PREFIX = 'tool_config:'
 
 
+def _is_inspector_tool(mcp_id: str, tool_name: str) -> bool:
+    services = config.main.get('services', {}).get('mcp', [])
+    mcp = next((item for item in services if item.get('id') == mcp_id), None) or {}
+    if mcp.get('category') == 'inspection':
+        return True
+    tool = next(
+        (item for item in (mcp.get('tools') or []) if isinstance(item, dict) and item.get('name') == tool_name),
+        None,
+    )
+    return bool(tool and tool.get('type') == 'inspector')
+
+
+async def _validate_inspector_config(
+    mcp_id: str,
+    tool_name: str,
+    body: dict,
+    *,
+    instance_id: str = '',
+) -> dict:
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+
+    arguments = {'action': 'config', **body}
+    if instance_id:
+        arguments['instance_id'] = instance_id
+    result = await mcp_call_tool(mcp_id, MCPCallRequest(tool=tool_name, arguments=arguments))
+    if result.get('code') != 200:
+        raise fastapi.HTTPException(status_code=400, detail=result.get('message') or 'Inspector config rejected')
+    parsed: dict = {}
+    content = result.get('data') or []
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict) or item.get('type') != 'text':
+                continue
+            try:
+                value = json.loads(item.get('text', '{}'))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                parsed = value
+                break
+    if not parsed.get('adapter_ok', True):
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail=parsed.get('message') or 'Inspector storage backend is not ready',
+        )
+    return parsed
+
+
 class CanvasLayout(BaseModel):
     cards:           list  = []
     connections:     list  = []
@@ -69,10 +117,15 @@ async def get_all_tool_configs():
 @router.put('/tool-config/{mcp_id}/{tool_name}')
 async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    if _is_inspector_tool(mcp_id, tool_name):
+        applied = await _validate_inspector_config(mcp_id, tool_name, body)
+        config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}'] = body
+        return {'code': 200, 'data': applied}
+
     config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}'] = body
 
-    # Apply config to the MCP plugin (fire-and-forget, don't block response)
-    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    # Existing non-Inspector tools keep their asynchronous apply behavior.
     async def _apply():
         try:
             req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', **body})
@@ -109,10 +162,20 @@ async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
 @router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
     """Save config for a specific tool instance and apply it."""
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    if _is_inspector_tool(mcp_id, tool_name):
+        applied = await _validate_inspector_config(
+            mcp_id,
+            tool_name,
+            body,
+            instance_id=instance_id,
+        )
+        config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}'] = body
+        return {'code': 200, 'data': applied}
+
     config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}'] = body
 
-    # Apply instance config to the MCP plugin (fire-and-forget)
-    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    # Existing non-Inspector tools keep their asynchronous apply behavior.
     async def _apply():
         try:
             req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', 'instance_id': instance_id, **body})
