@@ -41,6 +41,7 @@ class InspectorFrontendContractTest(unittest.TestCase):
         )
         self.assertIn('! grep -q "mirrors.tencentyun.com/ubuntu-ports"', source)
         self.assertIn("Acquire::Retries=3", source)
+        self.assertNotIn("--no-triggers", source)
 
 
 if __name__ == "__main__":
