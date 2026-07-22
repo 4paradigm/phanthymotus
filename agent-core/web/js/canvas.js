@@ -1557,6 +1557,8 @@ function _renderInspectorInfo(card, info) {
   if (!statusEl) return;
   const backlog = Number(info?.upload_backlog || 0);
   const pressure = info?.disk_pressure || 'normal';
+  const uploadError = String(info?.upload_error || info?.upload_last_error || info?.upload_service_error || '');
+  const retrySeconds = Number(info?.upload_retry_delay_seconds || 0);
   let stateClass = 'idle';
   let label = '已就绪';
   if (info?.state === 'stop_error') {
@@ -1565,12 +1567,15 @@ function _renderInspectorInfo(card, info) {
   } else if (info?.state === 'degraded') {
     stateClass = 'critical';
     label = '视频编码异常，请停止智能控制';
-  } else if (info?.state === 'recording') {
-    stateClass = 'recording';
-    label = '正在采集';
   } else if (info?.state === 'paused_disk_full' || pressure === 'critical') {
     stateClass = 'critical';
     label = '磁盘水位过高，已暂停';
+  } else if (info?.upload_state === 'error' || uploadError) {
+    stateClass = 'critical';
+    label = info?.recording ? '正在本地采集，但云端上传失败' : '云端上传失败，等待自动重试';
+  } else if (info?.state === 'recording') {
+    stateClass = 'recording';
+    label = '正在采集';
   } else if (backlog > 0) {
     stateClass = 'uploading';
     label = `采集已停止，后台上传中（${backlog}）`;
@@ -1585,15 +1590,21 @@ function _renderInspectorInfo(card, info) {
   const localEl = card.el.querySelector('[data-inspector-local]');
   const backlogEl = card.el.querySelector('[data-inspector-backlog]');
   const remainingEl = card.el.querySelector('[data-inspector-remaining]');
+  const hintEl = card.el.querySelector('.canvas-inspector-hint');
   if (localEl) {
     localEl.textContent = `本地 ${_formatBytes(info?.local_bytes)} / ${_formatBytes(info?.local_limit_bytes)} · 磁盘可用 ${_formatBytes(info?.filesystem_free_bytes)} · ${pressure}`;
   }
   if (backlogEl) {
     backlogEl.textContent = info?.storage_mode === 'local_ring'
       ? '本地环形（不上云）'
-      : `待上传 ${backlog} 段 / ${_formatBytes(info?.upload_backlog_bytes)}`;
+      : `待上传 ${backlog} 段 / ${_formatBytes(info?.upload_backlog_bytes)}${uploadError && retrySeconds > 0 ? ` · ${_formatRemaining(retrySeconds)}后重试` : ''}`;
   }
   if (remainingEl) remainingEl.textContent = `预计可录 ${_formatRemaining(info?.estimated_remaining_seconds)}`;
+  if (hintEl) {
+    hintEl.textContent = uploadError
+      ? `云端错误：${uploadError}`
+      : '停止采集后，后台仍会继续上传已落盘分片';
+  }
 }
 
 async function _pollInspectorStatuses() {

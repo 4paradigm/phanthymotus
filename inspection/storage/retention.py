@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from .atomic_writer import _safe_component, fsync_directory
+from .atomic_writer import fsync_directory
+from .layout import card_storage_slug, instance_storage_slug, safe_component
 from .ledger import SegmentLedger
 from .models import SegmentState
 
@@ -116,20 +117,33 @@ class RetentionSweeper:
             Path(text[:-len(marker)] + ".open.json"),
         )
 
-    def _purge_expired_corrupt(self, instance_id: str, *, cutoff_ns: int) -> tuple[int, int]:
+    def _instance_roots(self, instance_id: str, input_topic: str) -> list[Path]:
+        if self.data_root is None:
+            return []
+        roots = [
+            self.data_root / safe_component(self.card_id) / safe_component(instance_id),
+            self.data_root / card_storage_slug(self.card_id) / instance_storage_slug(instance_id, input_topic),
+        ]
+        return list(dict.fromkeys(roots))
+
+    def _purge_expired_corrupt(
+        self,
+        instance_id: str,
+        input_topic: str,
+        *,
+        cutoff_ns: int,
+    ) -> tuple[int, int]:
         if self.data_root is None:
             return 0, 0
-        instance_root = (
-            self.data_root / _safe_component(self.card_id) / _safe_component(instance_id)
-        )
-        if not instance_root.exists():
-            return 0, 0
         candidates: set[Path] = set()
-        for path in instance_root.rglob("*.part.corrupt*"):
-            text = str(path)
-            marker_index = text.rfind(".part.corrupt")
-            if marker_index >= 0:
-                candidates.add(Path(text[:marker_index + len(".part.corrupt")]))
+        for instance_root in self._instance_roots(instance_id, input_topic):
+            if not instance_root.exists():
+                continue
+            for path in instance_root.rglob("*.part.corrupt*"):
+                text = str(path)
+                marker_index = text.rfind(".part.corrupt")
+                if marker_index >= 0:
+                    candidates.add(Path(text[:marker_index + len(".part.corrupt")]))
         removed_files = 0
         pruned_dirs = 0
         for corrupt_path in sorted(candidates):
@@ -161,19 +175,23 @@ class RetentionSweeper:
     def _prune_existing_empty_dirs(self) -> int:
         if self.data_root is None:
             return 0
-        card_root = self.data_root / _safe_component(self.card_id)
-        if not card_root.exists():
-            return 0
         pruned = 0
-        for directory, _children, _files in os.walk(card_root, topdown=False):
-            path = Path(directory)
-            try:
-                path.rmdir()
-            except (FileNotFoundError, OSError):
+        card_roots = {
+            self.data_root / safe_component(self.card_id),
+            self.data_root / card_storage_slug(self.card_id),
+        }
+        for card_root in card_roots:
+            if not card_root.exists():
                 continue
-            pruned += 1
-            if path.parent.exists():
-                fsync_directory(path.parent)
+            for directory, _children, _files in os.walk(card_root, topdown=False):
+                path = Path(directory)
+                try:
+                    path.rmdir()
+                except (FileNotFoundError, OSError):
+                    continue
+                pruned += 1
+                if path.parent.exists():
+                    fsync_directory(path.parent)
         self.empty_dirs_pruned += pruned
         return pruned
 
@@ -257,6 +275,7 @@ class RetentionSweeper:
                 cutoff_ns = now_ns - int(retention_hours * 3600 * 1_000_000_000)
                 removed_files, pruned_dirs = self._purge_expired_corrupt(
                     instance_id,
+                    str(saved.get("input_topic", "")),
                     cutoff_ns=cutoff_ns,
                 )
                 stats["corrupt_files_purged"] += removed_files

@@ -60,6 +60,13 @@ class VideoStorageTest(unittest.TestCase):
         assert record is not None
         self.assertEqual(SegmentState.FINALIZED.value, record["state"])
         self.assertEqual(str(final_path), record["local_path"])
+        relative = final_path.relative_to(self.root / "data")
+        self.assertEqual("video-inspector", relative.parts[0])
+        self.assertTrue(relative.parts[1].startswith("camera-rgb--"))
+        self.assertRegex(relative.parts[2], r"^utc-hour=\d{4}-\d{2}-\d{2}T\d{2}Z$")
+        self.assertRegex(relative.name, r"^\d{8}T\d{6}\.\d{9}Z--\d{6}\.mp4$")
+        self.assertEqual("videoinspector", metadata["card_id"])
+        self.assertEqual("camera-1", metadata["instance_id"])
 
     def test_valid_interrupted_fragment_can_be_recovered(self) -> None:
         store = self.make_store()

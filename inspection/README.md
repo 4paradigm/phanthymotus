@@ -7,7 +7,7 @@
 - 未配置的 Audio / Video Inspector 可以先拖入画布，卡片会显示“待配置”或“待连线”。
 - 每张 Inspector 必须恰好连接一条 format 完全匹配的输入：音频为 `audio/pcm-16k`，视频为 `image/jpeg`。
 - 点击“开启智能控制”时，Dashboard 在调用任何 `start` 前检查全部 Inspector 的连线和存储配置；任意一张不合格则整个项目不启动。
-- Inspector 配置由服务端同步校验成功后才写入 Agent Core，不再出现“界面显示已保存、运行时才发现配置无效”的状态。
+- Inspector 配置由服务端同步校验成功后才写入 Agent Core；`local_and_cos` 会在保存时写入并 HEAD 校验一个最小健康对象，桶不存在、region 不匹配或无权限都会直接拒绝保存并显示原因。
 
 ## 采集生命周期
 
@@ -17,6 +17,7 @@
 - Jetson 解码/编码管线已进入终止错误时，`stop` 先中止管线以解除阻塞的 `appsrc push-buffer`，丢弃尚未编码的有界队列，并将未完成 MP4 保留为 `CORRUPT` 诊断文件。
 - 收尾失败不得继续回报 `recording`：订阅已停止时返回 `stop_error`/`recording=false`，Dashboard 显示“采集已停止，但当前分片收尾异常”并保留错误详情。
 - COS uploader 是独立长驻 worker；点击“停止智能控制”不再产生新数据，但会继续补传 ledger backlog。
+- 配置通过后发生的断网或权限变化不会删除本地数据，也不会隐式切换为 `local_ring`；卡片会显示“云端上传失败”、错误原因、待上传量和重试间隔，本地采集可在磁盘水位允许时继续。
 - 异常退出后启动时先恢复 `.part` 和 ledger。`auto_resume_after_reboot=false` 时保持 `idle` 并返回 `resume_required=true`，不会偷偷继续采集。
 - Inspection 容器使用 `on-failure:3` 隔离 Jetson 原生插件导致的非零退出：运行期异常最多自动重启 3 次，但 Docker daemon 或整机重启时不会自动拉起，不改变宿主服务先就绪、再启动容器的顺序。
 - 重启时当前卡片的 `UPLOADING` 回退到 `FINALIZED`；先通过 HEAD 识别已完整上传的对象，否则从本地正式分片重新上传，超过 `multipart_stale_hours` 的遗留 upload 尽力终止。
@@ -27,6 +28,7 @@
 - `storage_mode=local_and_cos`（默认）：本地原子落盘后异步上传；只有 `UPLOADED_VERIFIED` 的媒体/metadata 才可被本地留存策略删除。
 - `storage_mode=local_ring`：不要求 COS，允许按 `local_retention_hours` 和 `local_max_gb` 滚动删除最旧本地分片。这是显式选择的本地有损模式，不会由 COS 失败自动降级得到。
 - `upload_enabled` 仅用于兼容旧配置，WebUI 不再显示；与 `storage_mode` 冲突时配置保存失败。
+- `device_id` 从 Jetson 硬件序列号自动生成（上海 G1 为 `jetson-<serial>`），WebUI 不显示也不接受用户覆盖；旧配置中的 `device_id` 会被忽略。
 - 音频默认按 `segment_seconds=60` 或 `max_segment_mb=4` 先到者切成 WAV。
 - 视频默认按 `segment_seconds=60` 或 `max_segment_mb=64` 先到者切成 H.264 MP4。
 - `flush` 和 `stop` 都会强制结束当前分片；第一版不按 VAD、画面变化或动作语义切片。
@@ -81,6 +83,8 @@ COSBrowser / coscli 的 `mode=SecretKey` 配置会将 SecretId / SecretKey 加�
 
 每个 segment 的媒体文件和 JSON metadata 作为两个不可变对象上传。上传后必须通过 HEAD 同时校验 `Content-Length` 与 `x-cos-meta-sha256`，才记为 `UPLOADED_VERIFIED`。远端同名对象内容不一致时进入 `CONFLICT`，不覆盖。
 
+保存 `local_and_cos` 配置本身就会执行一次相同的小对象上传 + HEAD 校验；`testupload` 保留为独立诊断动作。配置校验失败时 Agent Core 不持久化新值。配置成功后才发生的网络故障由后台 worker 自动重试，卡片通过 `upload_state=error` 和 `upload_error` 明确暴露，不会把失败状态只显示成“后台上传中”。
+
 配置后可通过 MCP 做小对象上传 + HEAD 校验：
 
 ```bash
@@ -103,6 +107,9 @@ node --check agent-core/web/js/flow-view.js
 
 - 持久化目录：`/opt/phanthy-motus/inspection-data`；
 - 账本：`/opt/phanthy-motus/inspection-state/ledger.sqlite3`；
+- 新分片目录为 `<audio-inspector|video-inspector>/<输入源语义名>--<8位实例哈希>/utc-hour=YYYY-MM-DDTHHZ/<UTC时间>--<序号>.<扩展名>`；例如 `video-inspector/ext-camera-rgb--a1b2c3d4/utc-hour=2026-07-22T09Z/20260722T090737.590123456Z--000000.mp4`；
+- 画布内部 `instance_id`（如 `card-mrvusdyxxjln`）不再直接进入路径，但完整值和原始 `input_topic` 仍写入 metadata/ledger；短哈希只用于防止同源多实例目录冲突；
+- 旧版 `audioinspector/<instance>/YYYY-MM-DD/HH` 与 `videoinspector/<instance>/YYYY-MM-DD/HH` 数据不自动迁移或删除，恢复、补传和滚动清理继续兼容；
 - 音频输入固定为 `audio_msgs/AudioChunk`、`audio/pcm-16k`、PCM_S16_LE 16 kHz mono；
 - 音频 QoS：`BEST_EFFORT + KEEP_LAST(50) + VOLATILE`；
 - 视频输入固定为 `sensor_msgs/CompressedImage`、`image/jpeg`，QoS 为 `BEST_EFFORT + KEEP_LAST(2) + VOLATILE`；
@@ -142,12 +149,13 @@ node --check agent-core/web/js/flow-view.js
 1. 确认 `embodied-inspection` 运行，`curl http://127.0.0.1:15671/health` 返回 `ok=true`。
 2. 先在未配置、未连线状态把两张 Inspector 拖入 Dashboard，确认卡片可添加且项目启动被明确拒绝。
 3. 验证错误 format 无法连线；再分别连接 `/phanthymotus_g1_driver/mic/audio` 和 `/phanthymotus_g1_driver/ext_camera/card-mrnbwcls6nji/rgb`。
-4. 配置 `storage_mode=local_and_cos`、`cos_region`、`cos_bucket`、`cos_prefix`、`device_id`、`credential_profile`，先执行 `testupload`。
-5. 点击“开启智能控制”，确认两张卡片均进入“正在采集”，并能看到本地用量、剩余可录时间和磁盘水位。
-6. 使用较小验收值验证按时长分片，再单独使用较小 `max_segment_mb` 验证按大小分片；停止项目时当前段必须被 finalize。
-7. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
-8. 检查 COS 对象键为 `<prefix>/<device>/<card>/<instance>/YYYYMMDD/HH/<file>`，且媒体和 metadata 的 size/SHA-256 与本地一致。
-9. 停止智能控制后确认不再产生新分片，但卡片仍显示 backlog 减少，最终变成“云端已同步”。
-10. 另建 `local_ring` 实例验证无需 COS 可启动，过期或超预算后只滚动本地数据，不创建 COS 对象。
+4. 配置 `storage_mode=local_and_cos`、`cos_region`、`cos_bucket`、`cos_prefix`、`credential_profile`；确认界面没有 `device_id` 输入框，保存后返回自动设备 ID 和 `upload_validation=verified`。
+5. 故意填写一个格式正确但不存在的 bucket，确认配置保存被拒绝且界面明确显示“bucket 不存在或与 region 不匹配”；恢复正确 bucket 后再继续。
+6. 点击“开启智能控制”，确认两张卡片均进入“正在采集”，并能看到本地用量、剩余可录时间和磁盘水位。
+7. 使用较小验收值验证按时长分片，再单独使用较小 `max_segment_mb` 验证按大小分片；停止项目时当前段必须被 finalize。
+8. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
+9. 检查本地与 COS 路径使用自动设备 ID、`audio-inspector`/`video-inspector`、输入源语义名和显式 `utc-hour=...Z`，且媒体和 metadata 的 size/SHA-256 一致。
+10. 停止智能控制后确认不再产生新分片，但卡片仍显示 backlog 减少，最终变成“云端已同步”。
+11. 另建 `local_ring` 实例验证无需 COS 可启动，过期或超预算后只滚动本地数据，不创建 COS 对象。
 
 视频验收前必须先确认输入 topic 能在超时窗口内收到至少一帧 `sensor_msgs/msg/CompressedImage`。只有 publisher 数量不为零并不代表相机真实产帧；门禁失败时应先修复上游相机服务，不能用空 MP4 作为通过证据。

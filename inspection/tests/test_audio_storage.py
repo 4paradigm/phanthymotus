@@ -73,6 +73,15 @@ class AudioStorageTest(unittest.TestCase):
         assert record is not None
         self.assertEqual(SegmentState.FINALIZED.value, record["state"])
         self.assertEqual(str(wav_files[0]), record["local_path"])
+        relative = wav_files[0].relative_to(self.root / "data")
+        self.assertEqual("audio-inspector", relative.parts[0])
+        self.assertTrue(relative.parts[1].startswith("mic-audio--"))
+        self.assertRegex(relative.parts[2], r"^utc-hour=\d{4}-\d{2}-\d{2}T\d{2}Z$")
+        self.assertRegex(relative.name, r"^\d{8}T\d{6}\.\d{9}Z--\d{6}\.wav$")
+        self.assertEqual("audioinspector", metadata["card_id"])
+        self.assertEqual("mic-1", metadata["instance_id"])
+        self.assertEqual("audio-inspector", metadata["storage_card_slug"])
+        self.assertEqual(relative.parts[1], metadata["storage_instance_slug"])
         self.assertEqual("wal", self.ledger.journal_mode)
         self.assertGreaterEqual(self.ledger.synchronous, 2)
 

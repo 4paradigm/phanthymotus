@@ -27,6 +27,8 @@ class InspectorFrontendContractTest(unittest.TestCase):
         self.assertIn("upload_backlog_bytes", source)
         self.assertIn("toolType !== 'inspector' && hasConfig", source)
         self.assertIn("采集已停止，但当前分片收尾异常", source)
+        self.assertIn("正在本地采集，但云端上传失败", source)
+        self.assertIn("云端错误：", source)
         self.assertIn("Promise.allSettled(stopTasks)", source)
         self.assertIn("停止请求失败，请查看详情", source)
 

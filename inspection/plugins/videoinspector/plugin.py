@@ -63,19 +63,28 @@ class VideoInspectorPlugin(InspectorPlugin):
                 card_id=self.card_id,
                 on_critical=self._handle_critical,
             )
-            self._services.restore_latest()
+            self._services.restore_latest(overrides={"device_id": self.device_id})
             self._restore_desired_instances()
 
-    def _apply_config(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _apply_config(self, args: dict[str, Any], *, validate_remote: bool = True) -> dict[str, Any]:
         instance_id = str(args.get("instance_id", ""))
         previous_shared = copy.deepcopy(self._shared_config)
         previous_instance = copy.deepcopy(self._instance_config)
         previous_effective = self._effective_config(instance_id)
         try:
             result = super()._apply_config(args)
-            self._validate_start_config(instance_id)
+            self._validate_start_config(instance_id, validate_remote=validate_remote)
             result["adapter_ok"] = True
-            result["upload_ready"] = self._effective_config(instance_id)["storage_mode"] == "local_and_cos"
+            mode = self._effective_config(instance_id)["storage_mode"]
+            result["upload_ready"] = bool(
+                mode == "local_and_cos"
+                and self._services is not None
+                and self._services.uploader is not None
+                and not self._services.last_error
+            )
+            result["upload_validation"] = "verified" if result["upload_ready"] else (
+                "disabled" if mode == "local_ring" else "unavailable"
+            )
             return result
         except Exception:
             self._shared_config = previous_shared
@@ -84,7 +93,7 @@ class VideoInspectorPlugin(InspectorPlugin):
                 self._services.configure(previous_effective)
             raise
 
-    def _validate_start_config(self, instance_id: str) -> None:
+    def _validate_start_config(self, instance_id: str, *, validate_remote: bool = False) -> None:
         super()._validate_start_config(instance_id)
         config = self._effective_config(instance_id)
         estimated = (
@@ -98,7 +107,7 @@ class VideoInspectorPlugin(InspectorPlugin):
             )
         if self._services is not None:
             self._services.retention.sweep_once()
-            if not self._services.configure(config):
+            if not self._services.configure(config, validate_remote=validate_remote):
                 raise ValueError(self._services.last_error or "COS uploader is not ready")
         if self._ledger is not None:
             local_bytes = self._ledger.summary(card_id=self.card_id, instance_id=instance_id)["local_bytes"]
@@ -275,7 +284,10 @@ class VideoInspectorPlugin(InspectorPlugin):
             if saved["auto_resume"]:
                 try:
                     saved_config = dict(saved.get("config") or {})
-                    self._apply_config({"action": "config", "instance_id": instance.instance_id, **saved_config})
+                    self._apply_config(
+                        {"action": "config", "instance_id": instance.instance_id, **saved_config},
+                        validate_remote=False,
+                    )
                     self._validate_start_config(instance.instance_id)
                     instance.state = "recording"
                     self._start_runtime(instance, self._effective_config(instance.instance_id))

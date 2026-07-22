@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .ledger import SegmentLedger
+from .layout import card_storage_slug
 
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,33 @@ log = logging.getLogger(__name__)
 
 class COSObjectConflict(RuntimeError):
     pass
+
+
+def describe_cos_error(exc: Exception, *, bucket: str, region: str) -> str:
+    status = 0
+    status_getter = getattr(exc, "get_status_code", None)
+    if callable(status_getter):
+        try:
+            status = int(status_getter())
+        except (TypeError, ValueError):
+            status = 0
+    code = ""
+    code_getter = getattr(exc, "get_error_code", None)
+    if callable(code_getter):
+        try:
+            code = str(code_getter() or "")
+        except Exception:
+            code = ""
+    raw = str(exc)
+    lowered = f"{code} {raw}".lower()
+    if status == 404 or "nosuchbucket" in lowered:
+        return f"COS bucket 不存在或与 region 不匹配: bucket={bucket}, region={region}"
+    if status in {401, 403} or any(token in lowered for token in ("accessdenied", "invalidaccesskeyid", "signaturedoesnotmatch")):
+        return f"COS 凭证无效或无 bucket 读写权限: bucket={bucket}, region={region}"
+    if any(token in lowered for token in ("name or service not known", "no address associated", "timed out", "connection")):
+        return f"COS 网络连接失败: region={region}"
+    summary = re.sub(r"\s+", " ", raw).strip()[:240] or type(exc).__name__
+    return f"COS 校验/上传失败: {summary}"
 
 
 @dataclass(frozen=True)
@@ -194,12 +222,13 @@ class COSUploadCoordinator:
         self.bucket = str(config.get("cos_bucket", ""))
         self.prefix = str(config.get("cos_prefix", "inspection-data")).strip("/")
         self.device_id = str(config.get("device_id", "unknown"))
+        self.region = str(config.get("cos_region", "ap-beijing"))
         if not self.bucket:
             raise ValueError("cos_bucket is required")
         if backend is None:
             credentials = load_cos_credentials(str(config.get("credential_profile", "default")))
             backend = TencentCOSBackend(
-                region=str(config.get("cos_region", "ap-beijing")),
+                region=self.region,
                 credentials=credentials,
                 multipart_threshold_mb=int(config.get("multipart_threshold_mb", 64)),
                 upload_concurrency=int(config.get("upload_concurrency", 2)),
@@ -234,22 +263,24 @@ class COSUploadCoordinator:
 
     def _object_key(self, path: Path) -> str:
         relative = path.relative_to(self.data_root)
-        if len(relative.parts) < 5:
-            raise ValueError(f"unexpected inspection path: {path}")
-        card_id, instance_id, date, hour = relative.parts[:4]
-        try:
-            compact_date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y%m%d")
-        except ValueError as exc:
-            raise ValueError(f"unexpected inspection date directory: {date}") from exc
-        return "/".join(filter(None, (
-            self.prefix,
-            self.device_id,
-            card_id,
-            instance_id,
-            compact_date,
-            hour,
-            path.name,
-        )))
+        if len(relative.parts) >= 4 and relative.parts[2].startswith("utc-hour="):
+            return "/".join(filter(None, (self.prefix, self.device_id, *relative.parts)))
+        if len(relative.parts) >= 5:
+            card_id, instance_id, date, hour = relative.parts[:4]
+            try:
+                compact_date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y%m%d")
+            except ValueError as exc:
+                raise ValueError(f"unexpected inspection date directory: {date}") from exc
+            return "/".join(filter(None, (
+                self.prefix,
+                self.device_id,
+                card_id,
+                instance_id,
+                compact_date,
+                hour,
+                path.name,
+            )))
+        raise ValueError(f"unexpected inspection path: {path}")
 
     @staticmethod
     def _verify_head(info: dict[str, Any], *, size: int, sha256: str, key: str) -> None:
@@ -294,7 +325,7 @@ class COSUploadCoordinator:
             self.ledger.mark_conflict(segment_id, error=self.last_error)
         except Exception as exc:
             self.failed += 1
-            self.last_error = str(exc)
+            self.last_error = describe_cos_error(exc, bucket=self.bucket, region=self.region)
             self.last_retry_delay_seconds = self._retry_delay(exc, attempts=int(record["attempts"]))
             self.ledger.mark_upload_retry(
                 segment_id,
@@ -321,12 +352,12 @@ class COSUploadCoordinator:
         try:
             self.multipart_aborted = int(cleanup(
                 bucket=self.bucket,
-                prefix="/".join(filter(None, (self.prefix, self.device_id, self.card_id))),
+                prefix="/".join(filter(None, (self.prefix, self.device_id, card_storage_slug(self.card_id)))),
                 stale_hours=int(self.config.get("multipart_stale_hours", 24)),
             ))
             self.multipart_cleanup_error = ""
         except Exception as exc:
-            self.multipart_cleanup_error = str(exc)
+            self.multipart_cleanup_error = describe_cos_error(exc, bucket=self.bucket, region=self.region)
             log.warning("stale multipart cleanup skipped: %s", exc)
 
     def _worker(self, index: int) -> None:
@@ -351,21 +382,26 @@ class COSUploadCoordinator:
         key = "/".join(filter(None, (
             self.prefix,
             self.device_id,
-            self.card_id,
+            card_storage_slug(self.card_id),
             "_health",
             f"{time.time_ns()}.json",
         )))
-        self.backend.put_bytes(bucket=self.bucket, key=key, body=body, sha256=sha256)
-        info = self.backend.head(bucket=self.bucket, key=key)
-        if info is None:
-            raise RuntimeError("COS health object not found after upload")
-        self._verify_head(info, size=len(body), sha256=sha256, key=key)
-        return {
-            "state": "verified",
-            "verified": True,
-            "object_key": key,
-            "latency_ms": round((time.monotonic() - started) * 1000, 1),
-        }
+        try:
+            self.backend.put_bytes(bucket=self.bucket, key=key, body=body, sha256=sha256)
+            info = self.backend.head(bucket=self.bucket, key=key)
+            if info is None:
+                raise RuntimeError("COS health object not found after upload")
+            self._verify_head(info, size=len(body), sha256=sha256, key=key)
+            self.last_error = ""
+            return {
+                "state": "verified",
+                "verified": True,
+                "object_key": key,
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+        except Exception as exc:
+            self.last_error = describe_cos_error(exc, bucket=self.bucket, region=self.region)
+            raise RuntimeError(self.last_error) from exc
 
     def stats(self) -> dict[str, Any]:
         return {

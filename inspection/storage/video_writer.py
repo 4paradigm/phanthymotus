@@ -10,8 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .atomic_writer import _safe_component, _sha256, _write_json_temp, _write_open_state, fsync_directory
+from .atomic_writer import _sha256, _write_json_temp, _write_open_state, fsync_directory
 from .ledger import SegmentLedger
+from .layout import card_storage_slug, instance_storage_slug, segment_basename, utc_hour_partition
 from .models import SegmentRecord
 
 
@@ -38,6 +39,8 @@ class VideoFragmentStore:
         self.input_topic = input_topic
         self.session_id = session_id
         self.device_id = device_id
+        self.storage_card_slug = card_storage_slug(card_id)
+        self.storage_instance_slug = instance_storage_slug(instance_id, input_topic)
         self.encoder = encoder
         self.target_bitrate_kbps = int(target_bitrate_kbps)
         self._lock = threading.RLock()
@@ -50,14 +53,11 @@ class VideoFragmentStore:
     def create_location(self, fragment_id: int, *, first_source_stamp_ns: int = 0) -> str:
         wall_start_ns = time.time_ns()
         utc = datetime.fromtimestamp(wall_start_ns / 1_000_000_000, tz=timezone.utc)
-        directory = (
-            self.data_root / _safe_component(self.card_id) / _safe_component(self.instance_id)
-            / utc.strftime("%Y-%m-%d") / utc.strftime("%H")
-        )
+        directory = self.data_root / self.storage_card_slug / self.storage_instance_slug / utc_hour_partition(wall_start_ns)
         directory.mkdir(parents=True, exist_ok=True)
         sequence = self._sequence
         self._sequence += 1
-        part_path = directory / f"{wall_start_ns}_{sequence:06d}.mp4.part"
+        part_path = directory / f"{segment_basename(wall_start_ns, sequence, 'mp4')}.part"
         open_info = {
             "schema_version": "1.0",
             "segment_id": f"seg-{uuid.uuid4().hex}",
@@ -65,6 +65,9 @@ class VideoFragmentStore:
             "device_id": self.device_id,
             "card_id": self.card_id,
             "instance_id": self.instance_id,
+            "storage_card_slug": self.storage_card_slug,
+            "storage_instance_slug": self.storage_instance_slug,
+            "storage_time_partition": utc_hour_partition(wall_start_ns),
             "input_topic": self.input_topic,
             "format": "video/h264",
             "source_format": "image/jpeg",

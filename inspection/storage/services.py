@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from .cos_backend import COSUploadCoordinator
+from .cos_backend import COSUploadCoordinator, describe_cos_error
 from .ledger import SegmentLedger
 from .retention import RetentionSweeper
 
@@ -46,7 +46,13 @@ class DurableServices:
         )
         return repr(tuple((key, config.get(key)) for key in keys))
 
-    def configure(self, config: dict[str, Any], *, backend: Any | None = None) -> bool:
+    def configure(
+        self,
+        config: dict[str, Any],
+        *,
+        backend: Any | None = None,
+        validate_remote: bool = False,
+    ) -> bool:
         upload_enabled = (
             str(config.get("storage_mode")) == "local_and_cos"
             if config.get("storage_mode") is not None
@@ -58,36 +64,55 @@ class DurableServices:
             and signature == self._config_signature
             and (self.uploader is not None or not upload_enabled)
         ):
+            if validate_remote and self.uploader is not None:
+                try:
+                    self.uploader.test_upload()
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    return False
+            self.last_error = ""
             return True
         if self.uploader is not None:
             if not self.uploader.stop():
                 self.last_error = "previous COS uploader did not stop before reconfiguration"
                 return False
             self.uploader = None
-        self._config_signature = signature
         self.last_error = ""
         if not upload_enabled:
+            self._config_signature = signature
             return True
         try:
-            self.uploader = COSUploadCoordinator(
+            candidate = COSUploadCoordinator(
                 ledger=self.ledger,
                 data_root=self.data_root,
                 card_id=self.card_id,
                 config=config,
                 backend=backend,
             )
-            self.uploader.start()
+            if validate_remote:
+                candidate.test_upload()
+            candidate.start()
+            self.uploader = candidate
+            self._config_signature = signature
             return True
         except Exception as exc:
-            self.last_error = str(exc)
+            self.last_error = (
+                str(exc) if str(exc).startswith("COS ") else describe_cos_error(
+                    exc,
+                    bucket=str(config.get("cos_bucket", "")),
+                    region=str(config.get("cos_region", "ap-beijing")),
+                )
+            )
             self.uploader = None
             log.warning("%s uploader is not ready: %s", self.card_id, exc)
             return False
 
-    def restore_latest(self) -> None:
+    def restore_latest(self, *, overrides: dict[str, Any] | None = None) -> None:
         saved = self.ledger.list_instance_states(card_id=self.card_id)
         if saved:
-            self.configure(dict(saved[-1].get("config") or {}))
+            restored = dict(saved[-1].get("config") or {})
+            restored.update(overrides or {})
+            self.configure(restored)
 
     def test_upload(self) -> dict[str, Any]:
         if self.uploader is None:

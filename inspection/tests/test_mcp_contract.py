@@ -32,6 +32,9 @@ class InspectionContractTest(unittest.TestCase):
             storage_mode = tool["configSchema"]["properties"]["storage_mode"]
             self.assertEqual(["local_ring", "local_and_cos"], storage_mode["enum"])
             self.assertEqual("local_and_cos", storage_mode["default"])
+            device_id = tool["configSchema"]["properties"]["device_id"]
+            self.assertTrue(device_id["uiHidden"])
+            self.assertTrue(device_id["readOnly"])
             corrupt_retention = tool["configSchema"]["properties"]["corrupt_retention_hours"]
             self.assertEqual(24, corrupt_retention["default"])
             self.assertEqual("instance", corrupt_retention["scope"])
@@ -132,6 +135,50 @@ class InspectionContractTest(unittest.TestCase):
                 "storage_mode": "local_ring",
                 "upload_enabled": True,
             })
+
+    def test_device_id_is_automatic_and_legacy_input_is_ignored(self) -> None:
+        plugin = next(item for item in self.bundle._plugins if item.card_id == "audioinspector")
+        configured = self.bundle.dispatch("audioinspector", {
+            "action": "config",
+            "storage_mode": "local_ring",
+            "device_id": "user-forged-device",
+        })
+
+        self.assertIn("device_id", configured["ignored"])
+        self.assertEqual(plugin.device_id, configured["device_id"])
+        self.assertEqual(plugin.device_id, plugin._effective_config("")["device_id"])
+        self.assertNotEqual("user-forged-device", plugin.device_id)
+
+    def test_invalid_cos_bucket_format_is_rejected_before_remote_validation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "lowercase Tencent COS bucket"):
+            self.bundle.dispatch("audioinspector", {
+                "action": "config",
+                "cos_bucket": "Wrong Bucket",
+            })
+
+    def test_runtime_cos_failure_is_exposed_without_hiding_local_capture_state(self) -> None:
+        plugin = next(item for item in self.bundle._plugins if item.card_id == "audioinspector")
+        plugin._runtime_stats = lambda instance, instance_id: {
+            "storage_mode": "local_and_cos",
+            "local_bytes": 4096,
+            "upload_backlog": 3,
+            "upload_backlog_bytes": 2048,
+            "upload_last_error": "COS bucket 不存在或与 region 不匹配",
+            "upload_retry_delay_seconds": 30,
+        }
+
+        info = self.bundle.dispatch("audioinspector", {
+            "action": "info",
+            "instance_id": "card-runtime-error",
+            "input_topic": "/robot/mic/audio",
+        })
+
+        self.assertEqual("idle", info["state"])
+        self.assertFalse(info["recording"])
+        self.assertEqual("error", info["upload_state"])
+        self.assertIn("bucket", info["upload_error"])
+        self.assertEqual(3, info["upload_backlog"])
+        self.assertEqual(30, info["upload_retry_delay_seconds"])
 
     def test_config_is_validated_atomically(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown config field"):

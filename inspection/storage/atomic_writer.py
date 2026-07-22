@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import time
 import uuid
 import wave
@@ -12,6 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from .ledger import SegmentLedger
+from .layout import (
+    card_storage_slug,
+    instance_storage_slug,
+    safe_component,
+    segment_basename,
+    segment_start_ns_from_name,
+    utc_hour_partition,
+)
 from .models import SegmentRecord
 
 
@@ -23,11 +30,7 @@ def fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _safe_component(value: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9.-]+", "-", value).strip("-.")
-    if not cleaned:
-        raise ValueError("path component is empty after sanitization")
-    return cleaned
+_safe_component = safe_component
 
 
 def _sha256(path: Path) -> str:
@@ -78,6 +81,8 @@ class AudioSegmentWriter:
         self.input_topic = input_topic
         self.session_id = session_id
         self.device_id = device_id
+        self.storage_card_slug = card_storage_slug(card_id)
+        self.storage_instance_slug = instance_storage_slug(instance_id, input_topic)
         self.segment_seconds = int(segment_seconds)
         self.max_segment_bytes = max(1, int(max_segment_bytes))
         self.sample_rate = int(sample_rate)
@@ -99,12 +104,9 @@ class AudioSegmentWriter:
     def _begin_segment(self, source_stamp_ns: int) -> None:
         wall_start_ns = time.time_ns()
         utc = datetime.fromtimestamp(wall_start_ns / 1_000_000_000, tz=timezone.utc)
-        directory = (
-            self.data_root / _safe_component(self.card_id) / _safe_component(self.instance_id)
-            / utc.strftime("%Y-%m-%d") / utc.strftime("%H")
-        )
+        directory = self.data_root / self.storage_card_slug / self.storage_instance_slug / utc_hour_partition(wall_start_ns)
         directory.mkdir(parents=True, exist_ok=True)
-        basename = f"{wall_start_ns}_{self._sequence:06d}.wav"
+        basename = segment_basename(wall_start_ns, self._sequence, "wav")
         self._sequence += 1
         final_path = directory / basename
         self._part_path = final_path.with_name(final_path.name + ".part")
@@ -120,6 +122,9 @@ class AudioSegmentWriter:
             "device_id": self.device_id,
             "card_id": self.card_id,
             "instance_id": self.instance_id,
+            "storage_card_slug": self.storage_card_slug,
+            "storage_instance_slug": self.storage_instance_slug,
+            "storage_time_partition": utc_hour_partition(wall_start_ns),
             "input_topic": self.input_topic,
             "format": "audio/pcm-16k",
             "ros_type": "audio_msgs/msg/AudioChunk",
@@ -275,14 +280,24 @@ class AudioSegmentWriter:
             with open_state_path.open(encoding="utf-8") as handle:
                 open_info = json.load(handle)
         else:
-            wall_start_ns = int(final_path.stem.split("_", 1)[0])
+            wall_start_ns = segment_start_ns_from_name(final_path)
+            partition = final_path.parent.name
+            if partition.startswith("utc-hour="):
+                storage_instance = final_path.parents[1].name
+                storage_card = final_path.parents[2].name
+            else:
+                storage_instance = final_path.parents[2].name
+                storage_card = final_path.parents[3].name
             open_info = {
                 "schema_version": "1.0",
                 "segment_id": f"seg-recovered-{uuid.uuid4().hex}",
                 "kind": "audio",
                 "device_id": "unknown",
                 "card_id": "audioinspector",
-                "instance_id": final_path.parents[2].name,
+                "instance_id": "unknown",
+                "storage_card_slug": storage_card,
+                "storage_instance_slug": storage_instance,
+                "storage_time_partition": partition,
                 "input_topic": "",
                 "format": "audio/pcm-16k",
                 "ros_type": "audio_msgs/msg/AudioChunk",

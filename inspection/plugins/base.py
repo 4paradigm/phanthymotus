@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import copy
+import re
 import shutil
-import socket
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from storage.layout import card_storage_slug, detect_device_id, instance_storage_slug
 
 
 _SHARED_PROPERTIES = {
@@ -43,8 +45,8 @@ _SHARED_PROPERTIES = {
         "description": "Object key prefix without leading or trailing slash.",
     },
     "device_id": {
-        "type": "string", "default": socket.gethostname(), "scope": "shared",
-        "description": "Stable device identifier used in local and COS paths.",
+        "type": "string", "scope": "shared", "uiHidden": True, "readOnly": True,
+        "description": "Automatically detected hardware identity; legacy input is ignored.",
     },
     "upload_enabled": {
         "type": "boolean", "default": True, "scope": "shared",
@@ -107,7 +109,9 @@ class InspectorPlugin:
         self._lock = threading.RLock()
         self._instances: dict[str, RecordingInstance] = {}
         self._instance_config: dict[str, dict[str, Any]] = {}
+        self.device_id = detect_device_id()
         self._shared_config = self._defaults(_SHARED_PROPERTIES)
+        self._shared_config["device_id"] = self.device_id
         self._instance_properties = copy.deepcopy(instance_properties)
         self._instance_defaults = self._defaults(self._instance_properties)
         self._runtime_mode = runtime_mode
@@ -120,6 +124,7 @@ class InspectorPlugin:
 
     def _build_tool(self) -> dict[str, Any]:
         config_properties = copy.deepcopy(_SHARED_PROPERTIES)
+        config_properties["device_id"]["default"] = self.device_id
         config_properties.update(copy.deepcopy(self._instance_properties))
         return {
             "name": self.card_id,
@@ -160,6 +165,7 @@ class InspectorPlugin:
         }
         mode = str(config.get("storage_mode", "local_and_cos"))
         config["upload_enabled"] = mode == "local_and_cos"
+        config["device_id"] = self.device_id
         return config
 
     @staticmethod
@@ -182,6 +188,10 @@ class InspectorPlugin:
 
     def _apply_config(self, args: dict[str, Any]) -> dict[str, Any]:
         args = dict(args)
+        ignored: list[str] = []
+        if "device_id" in args:
+            args.pop("device_id")
+            ignored.append("device_id")
         if "storage_mode" in args:
             expected_upload = args["storage_mode"] == "local_and_cos"
             if "upload_enabled" in args and bool(args["upload_enabled"]) != expected_upload:
@@ -232,6 +242,8 @@ class InspectorPlugin:
             "state": "configured",
             "instance_id": instance_id or None,
             "applied": sorted(applied),
+            "ignored": ignored,
+            "device_id": self.device_id,
             "runtime_mode": self._runtime_mode,
         }
 
@@ -240,11 +252,20 @@ class InspectorPlugin:
         mode = str(cfg.get("storage_mode", "local_and_cos"))
         if mode not in {"local_ring", "local_and_cos"}:
             raise ValueError("storage_mode must be local_ring or local_and_cos")
-        if mode == "local_and_cos" and not str(cfg.get("cos_bucket", "")).strip():
-            raise ValueError("cos_bucket is required when storage_mode=local_and_cos")
+        bucket = str(cfg.get("cos_bucket", "")).strip()
+        if mode == "local_and_cos":
+            if not bucket:
+                raise ValueError("cos_bucket is required when storage_mode=local_and_cos")
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*-[1-9][0-9]{4,19}", bucket):
+                raise ValueError("cos_bucket must be a lowercase Tencent COS bucket name ending in -APPID")
+            region = str(cfg.get("cos_region", "")).strip()
+            if not re.fullmatch(r"[a-z][a-z0-9-]+", region):
+                raise ValueError("cos_region has an invalid format")
         prefix = str(cfg.get("cos_prefix", ""))
         if prefix.startswith("/") or prefix.endswith("/"):
             raise ValueError("cos_prefix must not start or end with '/'")
+        if "//" in prefix:
+            raise ValueError("cos_prefix must not contain empty path components")
 
     @staticmethod
     def _storage_status(
@@ -299,19 +320,39 @@ class InspectorPlugin:
         topic = instance.input_topic if instance else input_topic
         runtime = self._runtime_stats(instance, instance_id)
         state = instance.state if instance else "idle"
+        storage_mode = runtime.get("storage_mode", self._effective_config(instance_id).get("storage_mode"))
+        upload_backlog = int(runtime.get("upload_backlog", 0))
+        upload_error = str(runtime.get("upload_last_error") or runtime.get("upload_service_error") or "")
+        if storage_mode == "local_ring":
+            upload_state = "disabled"
+            upload_error = ""
+        elif upload_error:
+            upload_state = "error"
+        elif upload_backlog > 0:
+            upload_state = "uploading"
+        elif int(runtime.get("uploaded_verified", 0)) > 0:
+            upload_state = "synced"
+        else:
+            upload_state = "ready"
         return {
             "name": self.display_name,
             "card_id": self.card_id,
             "type": "inspector",
             "state": state,
             "instance_id": instance_id,
+            "device_id": self.device_id,
+            "storage_card_slug": card_storage_slug(self.card_id),
+            "storage_instance_slug": instance_storage_slug(instance_id, topic),
             "session_id": instance.session_id if instance else None,
             "topic_in": [{"topic": topic, "format": self.input_format, "desc": self.input_description}] if topic else [],
             "topic_out": [],
             "recording": state == "recording",
             "local_bytes": int(runtime.get("local_bytes", 0)),
-            "upload_backlog": int(runtime.get("upload_backlog", 0)),
+            "upload_backlog": upload_backlog,
             "upload_backlog_bytes": int(runtime.get("upload_backlog_bytes", 0)),
+            "upload_state": upload_state,
+            "upload_error": upload_error,
+            "upload_retry_delay_seconds": float(runtime.get("upload_retry_delay_seconds", 0)),
             "uploaded_verified": int(runtime.get("uploaded_verified", 0)),
             "dropped": int(runtime.get("dropped", 0)),
             "finalized_segments": int(runtime.get("finalized_segments", instance.finalized_segments if instance else 0)),
@@ -319,7 +360,7 @@ class InspectorPlugin:
             "last_error": runtime.get("last_error") or (instance.last_error if instance else ""),
             "runtime_mode": self._runtime_mode,
             "storage_ready": self._storage_ready,
-            "storage_mode": runtime.get("storage_mode", self._effective_config(instance_id).get("storage_mode")),
+            "storage_mode": storage_mode,
             "local_limit_bytes": int(runtime.get("local_limit_bytes", 0)),
             "local_usage_ratio": float(runtime.get("local_usage_ratio", 0)),
             "filesystem_total_bytes": int(runtime.get("filesystem_total_bytes", 0)),

@@ -16,8 +16,10 @@ sys.path.insert(0, str(INSPECTION_ROOT))
 from storage.atomic_writer import AudioSegmentWriter  # noqa: E402
 from storage.cos_backend import COSCredentials, COSUploadCoordinator, TencentCOSBackend, load_cos_credentials  # noqa: E402
 from storage.ledger import SegmentLedger  # noqa: E402
+from storage.layout import instance_storage_slug  # noqa: E402
 from storage.models import SegmentRecord, SegmentState  # noqa: E402
 from storage.retention import RetentionSweeper  # noqa: E402
+from storage.services import DurableServices  # noqa: E402
 
 
 class FakeCOSBackend:
@@ -46,6 +48,19 @@ class ForbiddenError(RuntimeError):
 class FailingCOSBackend(FakeCOSBackend):
     def upload_file(self, *, bucket: str, key: str, path: Path, sha256: str) -> None:
         raise ForbiddenError("403 forbidden")
+
+
+class MissingBucketError(RuntimeError):
+    def get_status_code(self):
+        return 404
+
+    def get_error_code(self):
+        return "NoSuchBucket"
+
+
+class MissingBucketCOSBackend(FakeCOSBackend):
+    def put_bytes(self, *, bucket: str, key: str, body: bytes, sha256: str) -> None:
+        raise MissingBucketError("NoSuchBucket")
 
 
 class COSAndRetentionTest(unittest.TestCase):
@@ -103,13 +118,9 @@ class COSAndRetentionTest(unittest.TestCase):
         self.assertEqual(SegmentState.UPLOADED_VERIFIED.value, record["state"])
         self.assertEqual(2, len(backend.upload_calls))
         self.assertTrue(record["object_key"].endswith(".wav"))
-        self.assertIn("/sh-g1/audioinspector/mic-1/", "/" + record["object_key"])
+        self.assertIn("/sh-g1/audio-inspector/mic-audio--", "/" + record["object_key"])
         media_path = Path(record["local_path"])
-        compact_date = media_path.parent.parent.name.replace("-", "")
-        expected_key = "/".join((
-            "inspection-data", "sh-g1", "audioinspector", "mic-1",
-            compact_date, media_path.parent.name, media_path.name,
-        ))
+        expected_key = "/".join(("inspection-data", "sh-g1", *media_path.relative_to(self.data_root).parts))
         self.assertEqual(expected_key, record["object_key"])
 
         self.ledger.transition(metadata["segment_id"], SegmentState.FINALIZED)
@@ -146,7 +157,45 @@ class COSAndRetentionTest(unittest.TestCase):
         self.assertEqual(1, record["attempts"])
         self.assertGreater(record["next_retry_at_ns"], time.time_ns() + 20_000_000_000)
         self.assertEqual(30.0, uploader.last_retry_delay_seconds)
+        self.assertIn("COS 凭证无效或无 bucket 读写权限", uploader.last_error)
         self.assertFalse(uploader.run_once(), "a second worker must not bypass the persisted retry window")
+
+    def test_explicit_configuration_rejects_missing_bucket_before_worker_start(self) -> None:
+        services = DurableServices(
+            ledger=self.ledger,
+            data_root=self.data_root,
+            card_id="audioinspector",
+        )
+        try:
+            configured = services.configure(
+                {
+                    "storage_mode": "local_and_cos",
+                    "cos_bucket": "missing-1250000000",
+                    "cos_region": "ap-beijing",
+                    "cos_prefix": "inspection-data",
+                    "device_id": "jetson-test",
+                    "upload_concurrency": 1,
+                },
+                backend=MissingBucketCOSBackend(),
+                validate_remote=True,
+            )
+            self.assertFalse(configured)
+            self.assertIsNone(services.uploader)
+            self.assertIn("bucket 不存在或与 region 不匹配", services.last_error)
+        finally:
+            services.stop()
+
+    def test_legacy_directory_keeps_legacy_cos_key(self) -> None:
+        legacy = self.data_root / "audioinspector" / "mic-1" / "2026-07-22" / "09" / "123_000000.wav"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"legacy")
+
+        key = self.make_uploader(FakeCOSBackend())._object_key(legacy)
+
+        self.assertEqual(
+            "inspection-data/sh-g1/audioinspector/mic-1/20260722/09/123_000000.wav",
+            key,
+        )
 
     def test_testupload_writes_and_verifies_health_object(self) -> None:
         backend = FakeCOSBackend()
@@ -287,6 +336,46 @@ class COSAndRetentionTest(unittest.TestCase):
         self.assertFalse(expired_dir.exists())
         self.assertTrue(recent.exists())
         self.assertEqual(3, sweeper.stats()["corrupt_files_purged"])
+
+    def test_retention_expires_corrupt_group_in_readable_layout(self) -> None:
+        instance_id = "card-mrvusdyxxjln"
+        input_topic = "/phanthymotus_g1_driver/ext_camera/card-mrvusdyxxjln/rgb"
+        instance_root = (
+            self.data_root / "video-inspector" / instance_storage_slug(instance_id, input_topic)
+            / "utc-hour=2026-07-22T09Z"
+        )
+        instance_root.mkdir(parents=True)
+        corrupt = instance_root / "20260722T090000.000000000Z--000000.mp4.part.corrupt"
+        reason = Path(str(corrupt) + ".json")
+        open_state = instance_root / "20260722T090000.000000000Z--000000.mp4.open.json"
+        for path in (corrupt, reason, open_state):
+            path.write_text("diagnostic", encoding="utf-8")
+        now_ns = time.time_ns()
+        expired_ns = now_ns - 2 * 3600 * 1_000_000_000
+        for path in (corrupt, reason, open_state):
+            os.utime(path, ns=(expired_ns, expired_ns))
+        self.ledger.set_instance_state(
+            card_id="videoinspector",
+            instance_id=instance_id,
+            input_topic=input_topic,
+            desired_state="idle",
+            auto_resume=False,
+            session_id="session-1",
+            config={"corrupt_retention_hours": 1, "local_retention_hours": 6, "local_max_gb": 20},
+        )
+        sweeper = RetentionSweeper(
+            ledger=self.ledger,
+            card_id="videoinspector",
+            data_root=self.data_root,
+        )
+
+        stats = sweeper.sweep_once(now_ns=now_ns)
+
+        self.assertEqual(3, stats["corrupt_files_purged"])
+        self.assertFalse(corrupt.exists())
+        self.assertFalse(reason.exists())
+        self.assertFalse(open_state.exists())
+        self.assertFalse(instance_root.exists())
 
     def test_retention_never_deletes_unuploaded_at_disk_pressure(self) -> None:
         metadata = self.make_segment()
