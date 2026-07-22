@@ -16,6 +16,11 @@ class OCRPackagingTest(unittest.TestCase):
             'plugins_cfg.get("ocr", {}).get("enabled", False)', source
         )
 
+    def test_dynamic_ocr_memory_rejection_module_is_removed(self):
+        self.assertFalse(
+            (REPO_ROOT / "perception" / "plugins" / "ocr_memory_guard.py").exists()
+        )
+
     def test_default_config_is_bounded_for_ocr_leaderboard(self):
         config = (REPO_ROOT / "perception" / "config.yaml").read_text(
             encoding="utf-8"

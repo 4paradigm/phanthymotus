@@ -126,12 +126,6 @@ class OCRContractTest(unittest.TestCase):
                     "use_angle_cls": True,
                     "num_threads": 2,
                     "max_side_len": 1600,
-                    "max_input_mb": 16,
-                    "max_decode_mb": 64,
-                    "memory_guard": {
-                        "enabled": True,
-                        "expected_workers": 10,
-                    },
                     "large_image_strategy": {
                         "enabled": True,
                         "trigger_side": 2400,
@@ -151,12 +145,6 @@ class OCRContractTest(unittest.TestCase):
             use_angle_cls=True,
             num_threads=2,
             max_side_len=1600,
-            max_input_mb=16,
-            max_decode_mb=64,
-            memory_guard={
-                "enabled": True,
-                "expected_workers": 10,
-            },
             large_image_strategy={
                 "enabled": True,
                 "trigger_side": 2400,
@@ -229,9 +217,6 @@ class OCRContractTest(unittest.TestCase):
             use_angle_cls=False,
             num_threads=1,
             max_side_len=960,
-            max_input_mb=16,
-            max_decode_mb=64,
-            memory_guard={},
             large_image_strategy={"enabled": True},
         )
 
@@ -357,6 +342,59 @@ class OCRContractTest(unittest.TestCase):
 
         det_session.close.assert_called_once_with()
 
+    def test_mnn_recognition_padding_is_neutral_before_normalization(self):
+        import numpy as np
+
+        pipeline = object.__new__(self.ocr_runtime._MNNPipeline)
+        captured = {}
+        pipeline._rec = mock.Mock()
+
+        def run_uint8(image, shape):
+            captured["image"] = image.copy()
+            captured["shape"] = shape
+            return np.zeros((1, 2, 2), dtype=np.float32)
+
+        pipeline._rec.run_uint8.side_effect = run_uint8
+        pipeline._rec_decode = mock.Mock(
+            return_value=([("text", 0.9)], [])
+        )
+        cv2_module = types.ModuleType("cv2")
+        cv2_module.INTER_LINEAR = 1
+        cv2_module.resize = mock.Mock(
+            return_value=np.full((48, 100, 3), 200, dtype=np.uint8)
+        )
+        crop = np.zeros((48, 100, 3), dtype=np.uint8)
+
+        with mock.patch.dict(sys.modules, {"cv2": cv2_module}):
+            result = pipeline._recognize_crop(crop)
+
+        self.assertEqual(result, ("text", 0.9))
+        self.assertEqual(captured["shape"], (1, 3, 48, 320))
+        self.assertTrue(np.all(captured["image"][:, :100] == 200))
+        self.assertTrue(np.all(captured["image"][:, 100:] == 128))
+
+    def test_single_pass_uses_bounded_vips_overview_for_any_source_size(self):
+        adapter = object.__new__(self.ocr_runtime.RapidOCRAdapter)
+        adapter._max_side_len = 960
+        adapter._probe_image_header = mock.Mock(
+            return_value=self.ocr_runtime.ImageHeader("PNG", 12000, 9000)
+        )
+        adapter._infer_image = mock.Mock(
+            return_value=[
+                {"text": "bounded", "bbox": [10, 20, 110, 60], "score": 0.9}
+            ]
+        )
+        overview = types.SimpleNamespace(shape=(720, 960, 3))
+
+        with mock.patch(
+            "plugins.ocr_runtime.decode_vips_overview",
+            return_value=overview,
+        ) as decode:
+            result = adapter._recognize_single_pass(b"compressed-image")
+
+        decode.assert_called_once_with(b"compressed-image", 960)
+        self.assertEqual(result[0]["bbox"], [125, 250, 1375, 750])
+
     def test_rapidocr_output_normalizes_polygon_to_pixel_bbox(self):
         output = types.SimpleNamespace(
             boxes=[
@@ -410,25 +448,6 @@ class OCRContractTest(unittest.TestCase):
                 "language": "zh",
             },
         )
-
-    def test_image_limit_error_only_fails_current_payload(self):
-        adapter = mock.Mock()
-        adapter.recognize.side_effect = [
-            self.ocr_runtime.ImageTooLargeError("decode limit exceeded"),
-            [{"text": "next", "bbox": [1, 2, 3, 4], "score": 0.9}],
-        ]
-
-        rejected = self.ocr.recognize_to_payload(
-            adapter, b"large", "zh", 123.0
-        )
-        following = self.ocr.recognize_to_payload(
-            adapter, b"normal", "zh", 124.0
-        )
-
-        self.assertEqual(rejected["items"], [])
-        self.assertEqual(rejected["error"], "decode limit exceeded")
-        self.assertEqual(following["text"], "next")
-        self.assertNotIn("error", following)
 
     def test_rapidocr_adapter_uses_only_external_cpu_models(self):
         fake_engine = mock.Mock()
@@ -683,179 +702,61 @@ class OCRContractTest(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertEqual(state["max_active"], 1)
 
-    def test_rapidocr_adapter_decodes_compressed_image_before_inference(self):
+    def _single_pass_adapter(self, source_size, output, *, max_side=1600):
         adapter = object.__new__(self.ocr.RapidOCRAdapter)
-        adapter._use_angle_cls = True
-        adapter._max_side_len = 1600
+        adapter._large_image_strategy = None
+        adapter._use_angle_cls = False
+        adapter._max_side_len = max_side
         adapter._probe_image_header = mock.Mock(
-            return_value=self.ocr_runtime.ImageHeader("JPEG", 200, 100)
+            return_value=self.ocr_runtime.ImageHeader(
+                "JPEG", source_size[0], source_size[1]
+            )
         )
         adapter._inference_lock = threading.Lock()
-        adapter._engine = mock.Mock(
-            return_value=types.SimpleNamespace(boxes=[], txts=(), scores=())
-        )
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.INTER_AREA = 3
-        decoded_image = types.SimpleNamespace(shape=(100, 200, 3))
-        cv2_module.imdecode = mock.Mock(return_value=decoded_image)
-        cv2_module.resize = mock.Mock()
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
+        adapter._engine = mock.Mock(return_value=output)
+        return adapter
 
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
-        ):
+    def test_rapidocr_adapter_uses_bounded_overview_before_inference(self):
+        decoded_image = types.SimpleNamespace(shape=(100, 200, 3))
+        adapter = self._single_pass_adapter(
+            (200, 100),
+            types.SimpleNamespace(boxes=[], txts=(), scores=()),
+        )
+
+        with mock.patch(
+            "plugins.ocr_runtime.decode_vips_overview",
+            return_value=decoded_image,
+        ) as decode:
             result = adapter.recognize(b"jpeg-bytes")
 
-        numpy_module.frombuffer.assert_called_once_with(b"jpeg-bytes", dtype="uint8")
-        cv2_module.imdecode.assert_called_once_with("encoded-buffer", 1)
+        decode.assert_called_once_with(b"jpeg-bytes", 1600)
         adapter._engine.assert_called_once_with(
-            decoded_image, use_det=True, use_cls=True, use_rec=True
+            decoded_image, use_det=True, use_cls=False, use_rec=True
         )
         self.assertEqual(result, [])
 
-    def test_large_jpeg_uses_reduced_decode_and_restores_source_bbox(self):
-        adapter = object.__new__(self.ocr.RapidOCRAdapter)
-        adapter._use_angle_cls = False
-        adapter._max_side_len = 1600
-        adapter._inference_lock = threading.Lock()
-        adapter._engine = mock.Mock(
-            return_value=types.SimpleNamespace(
+    def test_large_image_overview_restores_source_bbox(self):
+        adapter = self._single_pass_adapter(
+            (4000, 3000),
+            types.SimpleNamespace(
                 boxes=[[[10, 20], [100, 20], [100, 50], [10, 50]]],
                 txts=("large",),
                 scores=(0.8,),
-            )
+            ),
         )
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.INTER_AREA = 3
-        reduced_image = types.SimpleNamespace(shape=(750, 1000, 3))
-        cv2_module.imdecode = mock.Mock(return_value=reduced_image)
-        cv2_module.resize = mock.Mock()
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
-        jpeg = (
-            b"\xff\xd8\xff\xc0\x00\x11\x08"
-            + (3000).to_bytes(2, "big")
-            + (4000).to_bytes(2, "big")
-            + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00\xff\xd9"
-        )
+        overview = types.SimpleNamespace(shape=(750, 1000, 3))
 
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        with mock.patch(
+            "plugins.ocr_runtime.decode_vips_overview", return_value=overview
         ):
-            result = adapter.recognize(jpeg)
+            result = adapter.recognize(b"image-bytes")
 
-        cv2_module.imdecode.assert_called_once_with("encoded-buffer", 4)
-        cv2_module.resize.assert_not_called()
         self.assertEqual(result[0]["bbox"], [40, 80, 400, 200])
 
-    def test_oversized_non_jpeg_is_rejected_before_decode(self):
-        adapter = object.__new__(self.ocr.RapidOCRAdapter)
-        adapter._large_image_strategy = None
-        adapter._max_side_len = 960
-        adapter._max_input_bytes = 16 * 1024 * 1024
-        adapter._max_decode_bytes = 64 * 1024 * 1024
-        adapter._probe_image_header = mock.Mock(
-            return_value=self.ocr_runtime.ImageHeader("PNG", 10000, 10000)
-        )
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.imdecode = mock.Mock()
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
-
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
-        ):
-            with self.assertRaisesRegex(
-                self.ocr_runtime.ImageTooLargeError, "10000x10000"
-            ):
-                adapter.recognize(b"small-compressed-png")
-
-        cv2_module.imdecode.assert_not_called()
-        numpy_module.frombuffer.assert_not_called()
-
-    def test_dynamic_memory_pressure_rejects_before_decode(self):
-        adapter = object.__new__(self.ocr.RapidOCRAdapter)
-        adapter._large_image_strategy = None
-        adapter._max_side_len = 960
-        adapter._max_input_bytes = 16 * 1024 * 1024
-        adapter._max_decode_bytes = 64 * 1024 * 1024
-        adapter._memory_guard = mock.Mock()
-        adapter._memory_guard.decode_limit_bytes.return_value = 8 * 1024 * 1024
-        adapter._probe_image_header = mock.Mock(
-            return_value=self.ocr_runtime.ImageHeader("PNG", 2000, 2000)
-        )
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.imdecode = mock.Mock()
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
-
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
-        ):
-            with self.assertRaisesRegex(
-                self.ocr_runtime.ImageTooLargeError, "dynamic limit"
-            ):
-                adapter.recognize(b"compressed-png")
-
-        cv2_module.imdecode.assert_not_called()
-        numpy_module.frombuffer.assert_not_called()
-
-    def test_jpeg_too_large_after_reduced_decode_is_rejected_before_decode(self):
-        adapter = object.__new__(self.ocr.RapidOCRAdapter)
-        adapter._large_image_strategy = None
-        adapter._max_side_len = 960
-        adapter._max_input_bytes = 16 * 1024 * 1024
-        adapter._max_decode_bytes = 64 * 1024 * 1024
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.imdecode = mock.Mock()
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
-
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
-        ):
-            with self.assertRaisesRegex(
-                self.ocr_runtime.ImageTooLargeError, "65000x65000"
-            ):
-                adapter.recognize(self._jpeg(65000, 65000))
-
-        cv2_module.imdecode.assert_not_called()
-        numpy_module.frombuffer.assert_not_called()
-
     def test_single_pass_scales_float_polygon_before_rounding(self):
-        adapter = object.__new__(self.ocr.RapidOCRAdapter)
-        adapter._large_image_strategy = None
-        adapter._use_angle_cls = False
-        adapter._max_side_len = 1600
-        adapter._inference_lock = threading.Lock()
-        adapter._engine = mock.Mock(
-            return_value=types.SimpleNamespace(
+        adapter = self._single_pass_adapter(
+            (4000, 3000),
+            types.SimpleNamespace(
                 boxes=[
                     [
                         [10.8, 20.8],
@@ -866,106 +767,54 @@ class OCRContractTest(unittest.TestCase):
                 ],
                 txts=("precise",),
                 scores=(0.8,),
-            )
+            ),
         )
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.INTER_AREA = 3
-        cv2_module.imdecode = mock.Mock(
-            return_value=types.SimpleNamespace(shape=(750, 1000, 3))
-        )
-        cv2_module.resize = mock.Mock()
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
+        overview = types.SimpleNamespace(shape=(750, 1000, 3))
 
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        with mock.patch(
+            "plugins.ocr_runtime.decode_vips_overview", return_value=overview
         ):
-            result = adapter.recognize(self._jpeg(4000, 3000))
+            result = adapter.recognize(b"image-bytes")
 
         self.assertEqual(result[0]["bbox"], [43, 83, 401, 201])
 
-    def test_small_jpeg_keeps_full_decode_resolution(self):
-        adapter = object.__new__(self.ocr.RapidOCRAdapter)
-        adapter._use_angle_cls = False
-        adapter._max_side_len = 1600
-        adapter._inference_lock = threading.Lock()
-        adapter._engine = mock.Mock(
-            return_value=types.SimpleNamespace(
+    def test_small_image_keeps_source_coordinates(self):
+        adapter = self._single_pass_adapter(
+            (800, 600),
+            types.SimpleNamespace(
                 boxes=[[[10, 20], [100, 20], [100, 50], [10, 50]]],
                 txts=("small",),
                 scores=(0.8,),
-            )
+            ),
         )
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.INTER_AREA = 3
-        full_image = types.SimpleNamespace(shape=(600, 800, 3))
-        cv2_module.imdecode = mock.Mock(return_value=full_image)
-        cv2_module.resize = mock.Mock()
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
-        jpeg = (
-            b"\xff\xd8\xff\xc0\x00\x11\x08"
-            + (600).to_bytes(2, "big")
-            + (800).to_bytes(2, "big")
-            + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00\xff\xd9"
-        )
+        overview = types.SimpleNamespace(shape=(600, 800, 3))
 
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        with mock.patch(
+            "plugins.ocr_runtime.decode_vips_overview", return_value=overview
         ):
-            result = adapter.recognize(jpeg)
+            result = adapter.recognize(b"image-bytes")
 
-        cv2_module.imdecode.assert_called_once_with("encoded-buffer", 1)
-        cv2_module.resize.assert_not_called()
         self.assertEqual(result[0]["bbox"], [10, 20, 100, 50])
 
-    def test_non_jpeg_large_image_is_resized_and_bbox_is_restored(self):
-        adapter = object.__new__(self.ocr.RapidOCRAdapter)
-        adapter._use_angle_cls = True
-        adapter._max_side_len = 1600
-        adapter._probe_image_header = mock.Mock(
-            return_value=self.ocr_runtime.ImageHeader("PNG", 4000, 3000)
-        )
-        adapter._inference_lock = threading.Lock()
-        adapter._engine = mock.Mock(
-            return_value=types.SimpleNamespace(
+    def test_non_jpeg_overview_restores_source_bbox(self):
+        adapter = self._single_pass_adapter(
+            (4000, 3000),
+            types.SimpleNamespace(
                 boxes=[[[10, 10], [100, 10], [100, 40], [10, 40]]],
                 txts=("png",),
                 scores=(0.7,),
-            )
+            ),
         )
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.INTER_AREA = 3
-        full_image = types.SimpleNamespace(shape=(3000, 4000, 3))
-        resized_image = types.SimpleNamespace(shape=(1200, 1600, 3))
-        cv2_module.imdecode = mock.Mock(return_value=full_image)
-        cv2_module.resize = mock.Mock(return_value=resized_image)
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded-buffer")
+        adapter._probe_image_header.return_value = self.ocr_runtime.ImageHeader(
+            "PNG", 4000, 3000
+        )
+        overview = types.SimpleNamespace(shape=(1200, 1600, 3))
 
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
+        with mock.patch(
+            "plugins.ocr_runtime.decode_vips_overview", return_value=overview
         ):
             result = adapter.recognize(b"png-bytes")
 
-        cv2_module.resize.assert_called_once_with(
-            full_image, (1600, 1200), interpolation=3
-        )
         self.assertEqual(result[0]["bbox"], [25, 25, 250, 100])
 
     def test_frame_queue_keeps_only_latest_image(self):

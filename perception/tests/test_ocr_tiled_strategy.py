@@ -1,7 +1,11 @@
 import sys
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 class FakeImage:
@@ -57,14 +61,6 @@ class OCRTiledStrategyTest(unittest.TestCase):
         cls.strategy_type = AdaptiveTiledOCRStrategy
         cls.config_type = LargeImageStrategyConfig
 
-    def setUp(self):
-        self.cv2 = types.SimpleNamespace(
-            IMREAD_COLOR=1,
-            IMREAD_REDUCED_COLOR_2=2,
-            IMREAD_REDUCED_COLOR_4=4,
-            IMREAD_REDUCED_COLOR_8=8,
-        )
-
     @staticmethod
     def _decoded_image(width=2600, height=2000):
         return types.SimpleNamespace(
@@ -73,64 +69,119 @@ class OCRTiledStrategyTest(unittest.TestCase):
             factor=1,
         )
 
-    @staticmethod
-    def _jpeg(width, height):
-        return (
-            b"\xff\xd8\xff\xc0\x00\x11\x08"
-            + height.to_bytes(2, "big")
-            + width.to_bytes(2, "big")
-            + b"\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00\xff\xd9"
-        )
-
     def test_rejects_overlap_not_smaller_than_tile(self):
         with self.assertRaisesRegex(ValueError, "overlap must be smaller"):
             self.config_type.from_mapping(
                 {"tile_size": 1280, "overlap": 1280}
             )
 
+    def test_decode_uses_vips_thumbnail_without_full_image_array(self):
+        import numpy as np
+
+        state = types.SimpleNamespace(thumbnail_args=None)
+
+        class VipsImage:
+            width = 4000
+            height = 3000
+            bands = 3
+
+            def autorot(self):
+                return self
+
+            def hasalpha(self):
+                return False
+
+            def colourspace(self, _space):
+                return self
+
+            def numpy(self):
+                return np.zeros((720, 960, 3), dtype=np.uint8)
+
+        source = VipsImage()
+
+        class ImageFactory:
+            @staticmethod
+            def new_from_buffer(data, options, **kwargs):
+                state.source_args = (data, options, kwargs)
+                return source
+
+            @staticmethod
+            def thumbnail_buffer(data, width, **kwargs):
+                state.thumbnail_args = (data, width, kwargs)
+                return VipsImage()
+
+        pyvips = types.ModuleType("pyvips")
+        pyvips.Image = ImageFactory
+        strategy = self.strategy_type(
+            {"enabled": True}, global_max_side=960
+        )
+
+        with mock.patch.dict(sys.modules, {"pyvips": pyvips}):
+            decoded = strategy._decode_image(b"compressed-image")
+
+        self.assertEqual(state.thumbnail_args[1], 960)
+        self.assertEqual(decoded.source_size, (4000, 3000))
+        self.assertIs(decoded.source, source)
+        self.assertEqual(decoded.image.shape, (720, 960, 3))
+
+    def test_large_image_materializes_only_one_source_tile_at_a_time(self):
+        strategy = self.strategy_type(
+            {
+                "enabled": True,
+                "trigger_side": 2400,
+                "tile_size": 1280,
+                "overlap": 128,
+                "max_tiles": 4,
+            },
+            global_max_side=960,
+        )
+        decoded = types.SimpleNamespace(
+            image=FakeImage(720, 960),
+            source=object(),
+            source_size=(4000, 3000),
+            factor=1,
+        )
+        state = types.SimpleNamespace(active=0, maximum=0, regions=[])
+
+        class TrackedTile(FakeImage):
+            def __init__(self, height, width):
+                super().__init__(height, width)
+                state.active += 1
+                state.maximum = max(state.maximum, state.active)
+
+            def __del__(self):
+                state.active -= 1
+
+        def materialize(_source, region):
+            state.regions.append(region)
+            x1, y1, x2, y2 = region
+            return TrackedTile(y2 - y1, x2 - x1)
+
+        def infer(_image):
+            return []
+
+        with mock.patch.object(
+            strategy, "_decode_image", return_value=decoded
+        ), mock.patch.object(
+            strategy, "_materialize_region", side_effect=materialize
+        ):
+            result = strategy.recognize(b"image", infer)
+
+        self.assertEqual(result, [])
+        self.assertEqual(state.maximum, 1)
+        self.assertEqual(state.active, 0)
+        self.assertEqual(len(state.regions), 4)
+
     def test_strategy_is_opt_in_when_config_section_is_absent(self):
         config = self.config_type.from_mapping(None)
 
         self.assertFalse(config.enabled)
-
-    def test_decode_plan_preserves_detail_without_crossing_hard_limit(self):
-        strategy = self.strategy_type({}, global_max_side=1600)
-        cases = {
-            4000: (1, 3200),
-            6000: (2, 3000),
-            7000: (2, 3200),
-            9000: (4, 2250),
-        }
-
-        for source_side, expected in cases.items():
-            with self.subTest(source_side=source_side):
-                plan = strategy._plan_jpeg_decode(
-                    self.cv2, (source_side, source_side)
-                )
-                self.assertEqual((plan.factor, max(plan.target_size)), expected)
-
-    def test_decode_plan_never_exceeds_hard_limit(self):
-        strategy = self.strategy_type(
-            {"decode_side": 4096, "decode_hard_limit": 4096},
-            global_max_side=1600,
-        )
-
-        plan = strategy._plan_jpeg_decode(self.cv2, (9000, 4500))
-
-        self.assertEqual(plan.factor, 4)
-        self.assertLessEqual(max(plan.target_size), 4096)
 
     def test_rejects_tile_larger_than_decode_hard_limit(self):
         with self.assertRaisesRegex(ValueError, "tile_size must not exceed"):
             self.config_type.from_mapping(
                 {"tile_size": 5000, "decode_hard_limit": 4096}
             )
-
-    def test_decode_plan_rejects_image_too_large_for_reduced_decode(self):
-        strategy = self.strategy_type({}, global_max_side=1600)
-
-        with self.assertRaisesRegex(ValueError, "JPEG dimensions exceed"):
-            strategy._plan_jpeg_decode(self.cv2, (40000, 30000))
 
     def test_tile_grid_anchors_right_and_bottom_edges(self):
         strategy = self.strategy_type(
@@ -426,32 +477,6 @@ class OCRTiledStrategyTest(unittest.TestCase):
 
         self.assertEqual(seen_shapes, [(1200, 1600)])
         self.assertEqual(result[0]["bbox"], [100, 50, 200, 100])
-
-    def test_decode_4000_jpeg_keeps_3200_pixels_for_strategy(self):
-        strategy = self.strategy_type({}, global_max_side=1600)
-        cv2_module = types.ModuleType("cv2")
-        cv2_module.IMREAD_COLOR = 1
-        cv2_module.IMREAD_REDUCED_COLOR_2 = 2
-        cv2_module.IMREAD_REDUCED_COLOR_4 = 4
-        cv2_module.IMREAD_REDUCED_COLOR_8 = 8
-        cv2_module.INTER_AREA = 3
-        cv2_module.imdecode = mock.Mock(return_value=FakeImage(3000, 4000))
-        cv2_module.resize = mock.Mock(return_value=FakeImage(2400, 3200))
-        numpy_module = types.ModuleType("numpy")
-        numpy_module.uint8 = "uint8"
-        numpy_module.frombuffer = mock.Mock(return_value="encoded")
-
-        with mock.patch.dict(
-            sys.modules, {"cv2": cv2_module, "numpy": numpy_module}
-        ):
-            decoded = strategy._decode_image(self._jpeg(4000, 3000))
-
-        cv2_module.imdecode.assert_called_once_with("encoded", 1)
-        cv2_module.resize.assert_called_once_with(
-            mock.ANY, (3200, 2400), interpolation=3
-        )
-        self.assertEqual(decoded.image.shape[:2], (2400, 3200))
-        self.assertEqual(decoded.source_size, (4000, 3000))
 
     def test_tiled_pipeline_recovers_small_text_without_duplicate_large_text(self):
         strategy = self.strategy_type(

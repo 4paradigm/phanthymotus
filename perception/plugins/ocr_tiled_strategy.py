@@ -64,18 +64,11 @@ class LargeImageStrategyConfig:
 
 
 @dataclass(frozen=True)
-class DecodePlan:
-    flag: int
-    factor: int
-    reduced_size: tuple[int, int]
-    target_size: tuple[int, int]
-
-
-@dataclass(frozen=True)
 class _DecodedImage:
     image: object
     source_size: tuple[int, int]
     factor: int
+    source: object | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +144,45 @@ def _axis_starts(length: int, tile_size: int, stride: int) -> list[int]:
     return starts
 
 
+def _vips_to_bgr(image):
+    import numpy as np
+
+    if image.hasalpha():
+        image = image.flatten(background=[255, 255, 255])
+    image = image.colourspace("srgb")
+    rgb = image.numpy()
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("decoded image must have three color channels")
+    return np.ascontiguousarray(rgb[:, :, ::-1], dtype=np.uint8)
+
+
+def decode_vips_overview(image_bytes: bytes, max_side: int):
+    import pyvips
+
+    if max_side <= 0:
+        raise ValueError("max_side must be positive")
+    image = pyvips.Image.thumbnail_buffer(
+        image_bytes,
+        max_side,
+        size="down",
+        no_rotate=False,
+        fail_on="error",
+    )
+    return _vips_to_bgr(image)
+
+
+def _open_vips_source(image_bytes: bytes):
+    import pyvips
+
+    source = pyvips.Image.new_from_buffer(
+        image_bytes,
+        "",
+        access="random",
+        fail_on="error",
+    )
+    return source.autorot()
+
+
 class AdaptiveTiledOCRStrategy:
     def __init__(
         self,
@@ -176,36 +208,6 @@ class AdaptiveTiledOCRStrategy:
             or max(source_size) > self.config.trigger_side
         )
 
-    def _plan_jpeg_decode(
-        self, cv2, source_size: tuple[int, int]
-    ) -> DecodePlan:
-        width, height = source_size
-        choices = (
-            (1, cv2.IMREAD_COLOR),
-            (2, cv2.IMREAD_REDUCED_COLOR_2),
-            (4, cv2.IMREAD_REDUCED_COLOR_4),
-            (8, cv2.IMREAD_REDUCED_COLOR_8),
-        )
-        for factor, flag in choices:
-            reduced_size = (
-                math.ceil(width / factor),
-                math.ceil(height / factor),
-            )
-            if max(reduced_size) <= self.config.decode_hard_limit:
-                break
-        else:
-            raise ValueError("JPEG dimensions exceed reduced decode hard limit")
-
-        target_size = reduced_size
-        longest_side = max(reduced_size)
-        if longest_side > self.config.decode_side:
-            scale = self.config.decode_side / longest_side
-            target_size = (
-                max(1, round(reduced_size[0] * scale)),
-                max(1, round(reduced_size[1] * scale)),
-            )
-        return DecodePlan(flag, factor, reduced_size, target_size)
-
     @staticmethod
     def _resize_to_size(image, target_size: tuple[int, int]):
         import cv2
@@ -225,42 +227,25 @@ class AdaptiveTiledOCRStrategy:
         return self._resize_to_size(image, target_size)
 
     def _decode_image(self, image_bytes: bytes) -> _DecodedImage:
-        import cv2
-        import numpy as np
+        try:
+            source = _open_vips_source(image_bytes)
+            image = decode_vips_overview(image_bytes, self.global_max_side)
+        except Exception as exc:
+            raise ValueError("invalid or unsupported compressed image") from exc
+        return _DecodedImage(
+            image=image,
+            source_size=(int(source.width), int(source.height)),
+            factor=1,
+            source=source,
+        )
 
-        encoded = np.frombuffer(image_bytes, dtype=np.uint8)
-        source_size = jpeg_dimensions(image_bytes)
-        if source_size is not None:
-            plan = self._plan_jpeg_decode(cv2, source_size)
-            image = cv2.imdecode(encoded, plan.flag)
-            factor = plan.factor
-            target_size = plan.target_size
-        else:
-            image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-            factor = 1
-            target_size = None
-        if image is None:
-            raise ValueError("invalid compressed image")
-
-        decoded_height, decoded_width = image.shape[:2]
-        if source_size is None:
-            source_size = (decoded_width, decoded_height)
-            longest_side = max(decoded_width, decoded_height)
-            if longest_side > self.config.decode_side:
-                scale = self.config.decode_side / longest_side
-                target_size = (
-                    max(1, round(decoded_width * scale)),
-                    max(1, round(decoded_height * scale)),
-                )
-
-        if target_size is not None and target_size != (
-            decoded_width,
-            decoded_height,
-        ):
-            image = self._resize_to_size(image, target_size)
-        if max(image.shape[:2]) > self.config.decode_hard_limit:
-            raise ValueError("decoded image exceeds decode_hard_limit")
-        return _DecodedImage(image=image, source_size=source_size, factor=factor)
+    @staticmethod
+    def _materialize_region(
+        source, region: tuple[int, int, int, int]
+    ):
+        x1, y1, x2, y2 = region
+        tile = source.crop(x1, y1, x2 - x1, y2 - y1)
+        return _vips_to_bgr(tile)
 
     def _select_tiles(
         self, image_size: tuple[int, int]
@@ -484,6 +469,11 @@ class AdaptiveTiledOCRStrategy:
         image = decoded.image
         decoded_height, decoded_width = image.shape[:2]
         source_width, source_height = decoded.source_size
+        source = getattr(decoded, "source", None)
+        if source is None:
+            tile_width, tile_height = decoded_width, decoded_height
+        else:
+            tile_width, tile_height = source_width, source_height
 
         if max(source_width, source_height) <= self.config.trigger_side:
             single_image = self._resize_longest(image, self.global_max_side)
@@ -514,9 +504,9 @@ class AdaptiveTiledOCRStrategy:
                 global_count = len(global_items)
                 global_items = self._scale_items(
                     global_items,
-                    scale_x=decoded_width / global_width,
-                    scale_y=decoded_height / global_height,
-                    bounds=(decoded_width, decoded_height),
+                    scale_x=tile_width / global_width,
+                    scale_y=tile_height / global_height,
+                    bounds=(tile_width, tile_height),
                 )
                 candidates.extend(
                     self._candidate(item, from_tile=False)
@@ -528,11 +518,17 @@ class AdaptiveTiledOCRStrategy:
             finally:
                 global_elapsed = time.perf_counter() - global_started
 
-        tiles = self._select_tiles((decoded_width, decoded_height))
+        tiles = self._select_tiles((tile_width, tile_height))
         tile_started = time.perf_counter()
         for x1, y1, x2, y2 in tiles:
-            tile = image[y1:y2, x1:x2]
+            tile = None
             try:
+                if source is None:
+                    tile = image[y1:y2, x1:x2]
+                else:
+                    tile = self._materialize_region(
+                        source, (x1, y1, x2, y2)
+                    )
                 tile_items = infer_image(tile)
                 successful_passes += 1
                 successful_tiles += 1
@@ -552,6 +548,8 @@ class AdaptiveTiledOCRStrategy:
                     y2,
                     exc,
                 )
+            finally:
+                tile = None
         tile_elapsed = time.perf_counter() - tile_started
 
         if successful_passes == 0:
@@ -562,8 +560,8 @@ class AdaptiveTiledOCRStrategy:
         merged = self._deduplicate(candidates)
         result = self._scale_items(
             merged,
-            scale_x=source_width / decoded_width,
-            scale_y=source_height / decoded_height,
+            scale_x=source_width / tile_width,
+            scale_y=source_height / tile_height,
             bounds=decoded.source_size,
             round_bbox=True,
         )
