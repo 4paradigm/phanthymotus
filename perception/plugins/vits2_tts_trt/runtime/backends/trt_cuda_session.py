@@ -1,30 +1,26 @@
-"""Direct TensorRT runner using cuda-python and NumPy host arrays."""
+"""Direct TensorRT runner using libcudart and NumPy host arrays."""
 
 from __future__ import annotations
 
 import hashlib
+import ctypes
+import ctypes.util
 from pathlib import Path
 
 import numpy as np
 
 
 def _load_cuda_runtime():
+    library = ctypes.util.find_library("cudart") or "libcudart.so"
     try:
-        from cuda.bindings import runtime as cudart
-    except ImportError:
-        from cuda import cudart
-    return cudart
+        return ctypes.CDLL(library)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to load CUDA Runtime library {library!r}") from exc
 
 
-def _check_cuda(result, operation: str):
-    if not isinstance(result, tuple):
-        result = (result,)
-    error, *values = result
-    if int(error) != 0:
-        raise RuntimeError(f"CUDA {operation} failed with error {int(error)}")
-    if not values:
-        return None
-    return values[0] if len(values) == 1 else tuple(values)
+def _check_cuda(error: int, operation: str) -> None:
+    if error != 0:
+        raise RuntimeError(f"CUDA {operation} failed with error {error}")
 
 
 def _sha256(path: Path) -> str:
@@ -40,44 +36,99 @@ class CudaRuntime:
 
     def __init__(self):
         self.api = _load_cuda_runtime()
-        self.stream = _check_cuda(self.api.cudaStreamCreate(), "stream creation")
+        self._configure_api()
+        stream = ctypes.c_void_p()
+        _check_cuda(self.api.cudaStreamCreate(ctypes.byref(stream)), "stream creation")
+        self.stream = int(stream.value)
         self._closed = False
 
+    def _configure_api(self) -> None:
+        self.api.cudaStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self.api.cudaStreamCreate.restype = ctypes.c_int
+        self.api.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
+        self.api.cudaStreamDestroy.restype = ctypes.c_int
+        self.api.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        self.api.cudaStreamSynchronize.restype = ctypes.c_int
+        self.api.cudaMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+        ]
+        self.api.cudaMalloc.restype = ctypes.c_int
+        self.api.cudaFree.argtypes = [ctypes.c_void_p]
+        self.api.cudaFree.restype = ctypes.c_int
+        self.api.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self.api.cudaMemcpyAsync.restype = ctypes.c_int
+        self.api.cudaDeviceGetAttribute.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self.api.cudaDeviceGetAttribute.restype = ctypes.c_int
+
     def malloc(self, size: int) -> int:
-        return int(_check_cuda(self.api.cudaMalloc(size), "allocation"))
+        pointer = ctypes.c_void_p()
+        _check_cuda(self.api.cudaMalloc(ctypes.byref(pointer), size), "allocation")
+        return int(pointer.value)
 
     def free(self, pointer: int) -> None:
         if pointer:
-            _check_cuda(self.api.cudaFree(pointer), "free")
+            _check_cuda(self.api.cudaFree(ctypes.c_void_p(pointer)), "free")
 
     def copy_to_device(self, pointer: int, array: np.ndarray) -> None:
-        kind = self.api.cudaMemcpyKind.cudaMemcpyHostToDevice
         _check_cuda(
             self.api.cudaMemcpyAsync(
-                pointer, int(array.ctypes.data), array.nbytes, kind, self.stream
+                ctypes.c_void_p(pointer),
+                ctypes.c_void_p(array.ctypes.data),
+                array.nbytes,
+                1,
+                ctypes.c_void_p(self.stream),
             ),
             "host-to-device copy",
         )
 
     def copy_to_host(self, array: np.ndarray, pointer: int) -> None:
-        kind = self.api.cudaMemcpyKind.cudaMemcpyDeviceToHost
         _check_cuda(
             self.api.cudaMemcpyAsync(
-                int(array.ctypes.data), pointer, array.nbytes, kind, self.stream
+                ctypes.c_void_p(array.ctypes.data),
+                ctypes.c_void_p(pointer),
+                array.nbytes,
+                2,
+                ctypes.c_void_p(self.stream),
             ),
             "device-to-host copy",
         )
 
     def synchronize(self) -> None:
-        _check_cuda(self.api.cudaStreamSynchronize(self.stream), "stream synchronize")
+        _check_cuda(
+            self.api.cudaStreamSynchronize(ctypes.c_void_p(self.stream)),
+            "stream synchronize",
+        )
 
     def compute_capability(self) -> str:
-        properties = _check_cuda(self.api.cudaGetDeviceProperties(0), "device query")
-        return f"{int(properties.major)}.{int(properties.minor)}"
+        major = ctypes.c_int()
+        minor = ctypes.c_int()
+        _check_cuda(
+            self.api.cudaDeviceGetAttribute(ctypes.byref(major), 75, 0),
+            "compute capability major query",
+        )
+        _check_cuda(
+            self.api.cudaDeviceGetAttribute(ctypes.byref(minor), 76, 0),
+            "compute capability minor query",
+        )
+        return f"{major.value}.{minor.value}"
 
     def close(self) -> None:
         if not self._closed:
-            _check_cuda(self.api.cudaStreamDestroy(self.stream), "stream destruction")
+            _check_cuda(
+                self.api.cudaStreamDestroy(ctypes.c_void_p(self.stream)),
+                "stream destruction",
+            )
             self._closed = True
 
     def __del__(self):

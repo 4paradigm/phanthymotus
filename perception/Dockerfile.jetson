@@ -38,7 +38,7 @@ RUN /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
     cp -a artifacts/jetson-deps/openfst/lib/. /usr/local/lib/ && ldconfig && \
     /usr/bin/python3 -m pip install --no-cache-dir --no-index \
       --find-links=artifacts/jetson-deps/wheels -r /tmp/vits2-trt-requirements.txt && \
-    /usr/bin/python3 -c "import numpy,pynini,tn; from cuda import cudart" && \
+    /usr/bin/python3 -c "import ctypes,numpy,pynini,tn; ctypes.CDLL('libcudart.so')" && \
     cp -a artifacts/engines/jetson/. /models/vits2-mix/engines/ && \
     cp -a runtime/nltk_data runtime/tn_cache runtime/frontend_data /models/vits2-mix/ && \
     cp runtime/config.json /models/vits2-mix/config.json && \
