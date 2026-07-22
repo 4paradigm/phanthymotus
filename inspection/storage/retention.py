@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Callable
 
-from .atomic_writer import fsync_directory
+from .atomic_writer import _safe_component, fsync_directory
 from .ledger import SegmentLedger
 from .models import SegmentState
 
@@ -20,16 +21,23 @@ class RetentionSweeper:
         *,
         ledger: SegmentLedger,
         card_id: str,
+        data_root: str | Path | None = None,
         interval_seconds: float = 30,
+        artifact_sweep_interval_seconds: float = 3600,
         on_critical: Callable[[str, int, int], None] | None = None,
     ) -> None:
         self.ledger = ledger
         self.card_id = card_id
+        self.data_root = Path(data_root) if data_root is not None else None
         self.interval_seconds = float(interval_seconds)
+        self.artifact_sweep_interval_ns = int(float(artifact_sweep_interval_seconds) * 1_000_000_000)
         self.on_critical = on_critical
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.purged = 0
+        self.corrupt_files_purged = 0
+        self.empty_dirs_pruned = 0
+        self._next_artifact_sweep_ns = 0
         self.last_error = ""
         self.critical_instances: dict[str, dict[str, int]] = {}
 
@@ -49,7 +57,29 @@ class RetentionSweeper:
             self._thread = None
         return stopped
 
-    def _purge_record(self, record: dict) -> int:
+    def _prune_empty_parents(self, start: Path) -> int:
+        if self.data_root is None:
+            return 0
+        base = self.data_root.resolve()
+        current = start.resolve()
+        try:
+            current.relative_to(base)
+        except ValueError:
+            return 0
+        pruned = 0
+        while current != base:
+            parent = current.parent
+            try:
+                current.rmdir()
+            except (FileNotFoundError, OSError):
+                break
+            pruned += 1
+            if parent.exists():
+                fsync_directory(parent)
+            current = parent
+        return pruned
+
+    def _purge_record(self, record: dict) -> tuple[int, int]:
         segment_id = str(record["segment_id"])
         if record["state"] != SegmentState.RETENTION_ELIGIBLE.value:
             self.ledger.mark_retention_eligible(segment_id)
@@ -66,15 +96,91 @@ class RetentionSweeper:
         for parent in parents:
             if parent.exists():
                 fsync_directory(parent)
+        pruned_dirs = sum(self._prune_empty_parents(parent) for parent in parents)
         self.ledger.mark_purged_local(segment_id)
         self.purged += 1
-        return removed_bytes
+        self.empty_dirs_pruned += pruned_dirs
+        return removed_bytes, pruned_dirs
+
+    @staticmethod
+    def _corrupt_group(corrupt_path: Path) -> tuple[Path, Path, Path]:
+        marker = ".part.corrupt"
+        text = str(corrupt_path)
+        if not text.endswith(marker):
+            raise ValueError(f"unexpected corrupt artifact path: {corrupt_path}")
+        return (
+            corrupt_path,
+            Path(text + ".json"),
+            Path(text[:-len(marker)] + ".open.json"),
+        )
+
+    def _purge_expired_corrupt(self, instance_id: str, *, cutoff_ns: int) -> tuple[int, int]:
+        if self.data_root is None:
+            return 0, 0
+        instance_root = (
+            self.data_root / _safe_component(self.card_id) / _safe_component(instance_id)
+        )
+        if not instance_root.exists():
+            return 0, 0
+        candidates: set[Path] = set()
+        for path in instance_root.rglob("*.part.corrupt*"):
+            text = str(path)
+            marker_index = text.rfind(".part.corrupt")
+            if marker_index >= 0:
+                candidates.add(Path(text[:marker_index + len(".part.corrupt")]))
+        removed_files = 0
+        pruned_dirs = 0
+        for corrupt_path in sorted(candidates):
+            related = [path for path in self._corrupt_group(corrupt_path) if path.exists()]
+            if not related:
+                continue
+            try:
+                newest_mtime_ns = max(path.stat().st_mtime_ns for path in related)
+            except FileNotFoundError:
+                continue
+            if newest_mtime_ns > cutoff_ns:
+                continue
+            parents: set[Path] = set()
+            for path in related:
+                try:
+                    path.unlink()
+                    removed_files += 1
+                    parents.add(path.parent)
+                except FileNotFoundError:
+                    pass
+            for parent in parents:
+                if parent.exists():
+                    fsync_directory(parent)
+            pruned_dirs += sum(self._prune_empty_parents(parent) for parent in parents)
+        self.corrupt_files_purged += removed_files
+        self.empty_dirs_pruned += pruned_dirs
+        return removed_files, pruned_dirs
+
+    def _prune_existing_empty_dirs(self) -> int:
+        if self.data_root is None:
+            return 0
+        card_root = self.data_root / _safe_component(self.card_id)
+        if not card_root.exists():
+            return 0
+        pruned = 0
+        for directory, _children, _files in os.walk(card_root, topdown=False):
+            path = Path(directory)
+            try:
+                path.rmdir()
+            except (FileNotFoundError, OSError):
+                continue
+            pruned += 1
+            if path.parent.exists():
+                fsync_directory(path.parent)
+        self.empty_dirs_pruned += pruned
+        return pruned
 
     def sweep_once(self, *, now_ns: int | None = None) -> dict[str, int]:
         now_ns = time.time_ns() if now_ns is None else int(now_ns)
-        stats = {"purged": 0, "critical": 0}
+        stats = {"purged": 0, "critical": 0, "corrupt_files_purged": 0, "empty_dirs_pruned": 0}
         self.critical_instances = {}
-        for saved in self.ledger.list_instance_states(card_id=self.card_id):
+        saved_instances = self.ledger.list_instance_states(card_id=self.card_id)
+        for saved in saved_instances:
             instance_id = str(saved["instance_id"])
             config = dict(saved.get("config") or {})
             retention_hours = float(config.get("local_retention_hours", 24))
@@ -89,8 +195,10 @@ class RetentionSweeper:
                 if not (already_eligible or expired or over_budget):
                     continue
                 try:
-                    local_bytes = max(0, local_bytes - self._purge_record(record))
+                    removed_bytes, pruned_dirs = self._purge_record(record)
+                    local_bytes = max(0, local_bytes - removed_bytes)
                     stats["purged"] += 1
+                    stats["empty_dirs_pruned"] += pruned_dirs
                     self.last_error = ""
                 except Exception as exc:
                     self.last_error = str(exc)
@@ -100,6 +208,20 @@ class RetentionSweeper:
                 stats["critical"] += 1
                 if self.on_critical is not None:
                     self.on_critical(instance_id, local_bytes, max_bytes)
+        if self.data_root is not None and now_ns >= self._next_artifact_sweep_ns:
+            for saved in saved_instances:
+                instance_id = str(saved["instance_id"])
+                config = dict(saved.get("config") or {})
+                retention_hours = float(config.get("corrupt_retention_hours", 24))
+                cutoff_ns = now_ns - int(retention_hours * 3600 * 1_000_000_000)
+                removed_files, pruned_dirs = self._purge_expired_corrupt(
+                    instance_id,
+                    cutoff_ns=cutoff_ns,
+                )
+                stats["corrupt_files_purged"] += removed_files
+                stats["empty_dirs_pruned"] += pruned_dirs
+            stats["empty_dirs_pruned"] += self._prune_existing_empty_dirs()
+            self._next_artifact_sweep_ns = now_ns + self.artifact_sweep_interval_ns
         return stats
 
     def _run(self) -> None:
@@ -114,6 +236,8 @@ class RetentionSweeper:
     def stats(self) -> dict:
         return {
             "retention_purged": self.purged,
+            "corrupt_files_purged": self.corrupt_files_purged,
+            "empty_dirs_pruned": self.empty_dirs_pruned,
             "retention_last_error": self.last_error,
             "critical_instances": dict(self.critical_instances),
         }

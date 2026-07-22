@@ -29,6 +29,9 @@ class InspectionContractTest(unittest.TestCase):
             self.assertTrue(tool["multiInstance"])
             self.assertFalse(tool["agentCallable"])
             self.assertEqual([], tool["topic_out"])
+            corrupt_retention = tool["configSchema"]["properties"]["corrupt_retention_hours"]
+            self.assertEqual(24, corrupt_retention["default"])
+            self.assertEqual("instance", corrupt_retention["scope"])
 
     def test_config_start_info_stop_is_idempotent(self) -> None:
         configured = self.bundle.dispatch("audioinspector", {

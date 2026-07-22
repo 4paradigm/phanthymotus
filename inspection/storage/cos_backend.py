@@ -237,15 +237,16 @@ class COSUploadCoordinator:
         if len(relative.parts) < 5:
             raise ValueError(f"unexpected inspection path: {path}")
         card_id, instance_id, date, hour = relative.parts[:4]
-        year, month, day = date.split("-", 2)
+        try:
+            compact_date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y%m%d")
+        except ValueError as exc:
+            raise ValueError(f"unexpected inspection date directory: {date}") from exc
         return "/".join(filter(None, (
             self.prefix,
             self.device_id,
             card_id,
             instance_id,
-            year,
-            month,
-            day,
+            compact_date,
             hour,
             path.name,
         )))

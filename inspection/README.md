@@ -97,8 +97,10 @@ node --check agent-core/web/js/flow-view.js
 ## 本地滚动策略
 
 - `local_retention_hours` 控制本地保留时间，`local_max_gb` 控制实例最大 spool 预算；
+- Audio / Video Inspector 的 `corrupt_retention_hours` 控制不可恢复分片及诊断文件的保留时间，默认 24 小时；
 - 只有 `UPLOADED_VERIFIED` 数据可进入删除流程，并在断点可恢复的 `RETENTION_ELIGIBLE → PURGED_LOCAL` 状态间迁移；
 - 超预算时先从最旧的已验证数据开始删除；若剩余数据均未上传，暂停该 Inspector 并报 `paused_disk_full`，不静默丢数据；
+- 删除媒体、metadata 或过期 corrupt 诊断文件后，会从小时目录向上清理空目录；每小时额外清扫历史空目录；
 - 启动前会估算留存窗口所需容量，超过 `local_max_gb` 的 80% 则拒绝启动并给出错误。
 
 ## 当前边界
@@ -119,7 +121,7 @@ node --check agent-core/web/js/flow-view.js
 3. 配置 `cos_region`、`cos_bucket`、`cos_prefix`、`device_id`、`credential_profile`，先执行 `testupload`。
 4. 点击“开启智能控制”，等待至少一个 `segment_seconds`，再点击停止。
 5. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
-6. 检查 COS 对象键为 `<prefix>/<device>/<card>/<instance>/YYYY/MM/DD/HH/<file>`，且媒体和 metadata 的 size/SHA-256 与本地一致。
+6. 检查 COS 对象键为 `<prefix>/<device>/<card>/<instance>/YYYYMMDD/HH/<file>`，且媒体和 metadata 的 size/SHA-256 与本地一致。旧版本已经上传的 `YYYY/MM/DD/HH` 对象不迁移，新旧布局可以并存。
 7. 停止智能控制后确认不再产生新分片，但已有 backlog 仍会减少；最后执行一次断网、强制退出和重启恢复验收。
 
 视频验收前必须先确认输入 topic 能在超时窗口内收到至少一帧 `sensor_msgs/msg/CompressedImage`。只有 publisher 数量不为零并不代表相机真实产帧；门禁失败时应先修复上游相机服务，不能用空 MP4 作为通过证据。

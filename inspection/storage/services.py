@@ -30,6 +30,7 @@ class DurableServices:
         self.retention = RetentionSweeper(
             ledger=ledger,
             card_id=card_id,
+            data_root=self.data_root,
             on_critical=on_critical,
         )
         self.retention.start()

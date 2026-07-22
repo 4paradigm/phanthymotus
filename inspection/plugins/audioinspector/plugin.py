@@ -30,6 +30,7 @@ class AudioInspectorPlugin(InspectorPlugin):
             instance_properties={
                 "segment_seconds": {"type": "integer", "minimum": 5, "maximum": 600, "default": 60, "scope": "instance"},
                 "local_retention_hours": {"type": "number", "minimum": 1, "maximum": 720, "default": 24, "scope": "instance"},
+                "corrupt_retention_hours": {"type": "number", "minimum": 1, "maximum": 720, "default": 24, "scope": "instance"},
                 "local_max_gb": {"type": "number", "minimum": 0.1, "default": 4, "scope": "instance"},
                 "container": {"type": "string", "enum": ["wav"], "default": "wav", "scope": "instance"},
                 "queue_seconds": {"type": "number", "minimum": 1, "default": 5, "scope": "instance"},
