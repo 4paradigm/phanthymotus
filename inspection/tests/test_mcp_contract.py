@@ -223,7 +223,7 @@ class InspectionDeployContractTest(unittest.TestCase):
         self.assertIn("python3-gst-1.0", dockerfile)
         self.assertIn("gir1.2-gstreamer-1.0", dockerfile)
         self.assertIn("gstreamer1.0-plugins-base-apps", dockerfile)
-        self.assertIn("UBUNTU_PORTS_MIRROR=https://ports.ubuntu.com/ubuntu-ports", dockerfile)
+        self.assertIn("UBUNTU_PORTS_MIRROR=https://mirrors.ustc.edu.cn/ubuntu-ports", dockerfile)
         self.assertIn("mirrors.tencentyun.com/ubuntu-ports", dockerfile)
         self.assertIn("apt-get update -o Acquire::Retries=3", dockerfile)
         self.assertIn("-maxdepth 1 -type f -size 0 -delete", dockerfile)

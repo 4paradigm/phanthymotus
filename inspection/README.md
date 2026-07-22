@@ -106,7 +106,7 @@ node --check agent-core/web/js/flow-view.js
 - 视频输入固定为 `sensor_msgs/CompressedImage`、`image/jpeg`，QoS 为 `BEST_EFFORT + KEEP_LAST(2) + VOLATILE`；
 - Jetson 管线固定为 `nvjpegdec → nvvidconv → nvv4l2h264enc → splitmuxsink`；指定硬件编码器不可用时启动失败，不做隐式 CPU 降级；
 - 上海 G1 的 Docker daemon 没有名为 `nvidia` 的 runtime，release 基础镜像还包含未使用的 Jetson GStreamer 零字节占位插件；镜像构建时会删除这些无效插件，部署时只读挂载管线必需的 `libgstnvjpeg.so` / `libgstnvvidconv.so` / `libgstnvvideo4linux2.so`、`tegra` / `tegra-egl` 运行库和 `libgstnvexifmeta.so`，避免扫描 Argus/EGL 等无关插件，不依赖 `runtime: nvidia`；
-- 当 release 基础镜像仍使用已无法解析的 `mirrors.tencentyun.com/ubuntu-ports` 时，Dockerfile 会在安装依赖前改用已验证可达的官方 `https://ports.ubuntu.com/ubuntu-ports`；可用 `UBUNTU_PORTS_MIRROR` build arg 显式覆盖；
+- 当 release 基础镜像仍使用已无法解析的 `mirrors.tencentyun.com/ubuntu-ports` 时，Dockerfile 会在安装依赖前改用上海 G1 实测最快的中科大 `https://mirrors.ustc.edu.cn/ubuntu-ports`；2026-07-22 对 `jammy/main` 索引单次实测约 4.74 MB/s，`jammy-updates/main` 三次约 5.8–6.7 MB/s，四个 pocket 均返回 200；可用 `UBUNTU_PORTS_MIRROR` build arg 显式覆盖；
 - 联合验收会同时构建 Agent Core；Core Dockerfile 也使用同一 `UBUNTU_PORTS_MIRROR` build arg 替换失效的腾讯镜像源，部署脚本必须向 Core 和 Inspection 两次 `docker build` 传入同一值；
 - Jammy 的 `apt-get` 不接受 `--no-triggers`（该语义属于更底层的 `dpkg` 选项）；Core 在 G1 原生 arm64 构建时按正常 apt 流程处理 libc triggers，不再传入无效参数；
 - Python 依赖通过 `pip --target /opt/inspection-python --ignore-installed` 安装到隔离目录，不卸载或覆盖 Jetson release 镜像中由 Ubuntu/distutils 管理的 PyYAML 5.3.1；镜像构建会断言运行时实际加载隔离的 PyYAML 6.0.2 和 COS SDK；

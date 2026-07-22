@@ -1,6 +1,6 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
-ARG UBUNTU_PORTS_MIRROR=https://ports.ubuntu.com/ubuntu-ports
+ARG UBUNTU_PORTS_MIRROR=https://mirrors.ustc.edu.cn/ubuntu-ports
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG UBUNTU_PORTS_MIRROR

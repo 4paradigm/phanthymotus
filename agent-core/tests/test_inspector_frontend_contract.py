@@ -34,7 +34,7 @@ class InspectorFrontendContractTest(unittest.TestCase):
 
     def test_core_image_replaces_retired_ubuntu_ports_mirror(self) -> None:
         source = (CORE_ROOT / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("ARG UBUNTU_PORTS_MIRROR=https://ports.ubuntu.com/ubuntu-ports", source)
+        self.assertIn("ARG UBUNTU_PORTS_MIRROR=https://mirrors.ustc.edu.cn/ubuntu-ports", source)
         self.assertIn(
             'sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g"',
             source,
