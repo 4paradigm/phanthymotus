@@ -9,6 +9,7 @@
 - `stop` 先停止新数据进入，再排空有界 writer 队列并 finalize 当前分片；已完成分片的补传不应被取消。
 - COS uploader 是独立长驻 worker；点击“停止智能控制”不再产生新数据，但会继续补传 ledger backlog。
 - 异常退出后启动时先恢复 `.part` 和 ledger。`auto_resume_after_reboot=false` 时保持 `idle` 并返回 `resume_required=true`，不会偷偷继续采集。
+- Inspection 容器使用 `on-failure:3` 隔离 Jetson 原生插件导致的非零退出：运行期异常最多自动重启 3 次，但 Docker daemon 或整机重启时不会自动拉起，不改变宿主服务先就绪、再启动容器的顺序。
 - 重启时当前卡片的 `UPLOADING` 回退到 `FINALIZED`；先通过 HEAD 识别已完整上传的对象，否则从本地正式分片重新上传，超过 `multipart_stale_hours` 的遗留 upload 尽力终止。
 
 ## 本地运行
@@ -109,10 +110,10 @@ node --check agent-core/web/js/flow-view.js
 - Audio Inspector 已从 `/phanthymotus_g1_driver/mic/audio` 采集真实 `AudioChunk`，完成 WAV/JSON 成对落盘、COS 上传及 HEAD 大小/SHA-256 校验；
 - Video Inspector 已从 `/phanthymotus_g1_driver/ext_camera/card-mrnbwcls6nji/rgb` 采集真实 `CompressedImage`，使用 Jetson NVENC 完成 MP4/JSON 成对落盘、播放发现、COS 上传及 HEAD 校验；
 - 最终真实验收前缀为 `cos://embodied-ai-1252788780/inspection-acceptance/20260721-164837/`，共 12 个对象；验收后 Audio / Video Inspector 和 ext_camera 均为 `idle`，上传 backlog 为 0；
-- 首次视频尝试曾出现一次 Jetson NVENC native `exit 139`；同一真实 JPEG 的宿主、容器、Python appsrc、双线程、原样 Runtime 和真实 ROS executor 隔离测试均通过，受控重试完整通过并正确隔离了零字节 `.part`；长时间连续稳定性仍待 soak test；
+- 2026-07-21 与 2026-07-22 各出现一次 Jetson NVENC native 进程退出，并留下可诊断的零字节 `.part`；同一真实 JPEG 的宿主、容器、Python appsrc、双线程、原样 Runtime 和真实 ROS executor 隔离测试均通过，说明是低频原生编码路径故障而非稳定可复现的 Python 异常。容器现以 `on-failure:3` 限制运行期重启次数，验收只在确认容器发生非零退出并恢复后显式重试一次，不切换软件编码器；长时间连续稳定性仍待 soak test；
 - COS 上传、HEAD 校验、冲突保护、重试与本地滚动的 fake backend 测试和真实 bucket `testupload` 均已通过；断网、强制退出后的 backlog 补传及长时间滚动删除仍待专项验收；
 - COS 凭证只能由部署 secret 提供，不进入卡片配置或日志。
-- G1 容器使用 `restart: "no"`，必须在宿主相机、音频和 ROS2 服务就绪后按顺序启动；容器启动后会自动恢复 ledger backlog，但 `auto_resume_after_reboot=false` 时不会自动恢复采集实例。
+- G1 容器使用 `restart: "on-failure:3"`：只处理运行期非零退出，最多重试 3 次；Docker daemon/整机重启时不会自动拉起，因此仍必须在宿主相机、音频和 ROS2 服务就绪后按顺序启动。容器恢复后会自动恢复 ledger backlog，但 `auto_resume_after_reboot=false` 时不会自动恢复采集实例。
 
 ## G1 部署后验收
 

@@ -177,7 +177,9 @@ class InspectionDeployContractTest(unittest.TestCase):
             "/usr/lib/aarch64-linux-gnu/tegra-egl",
             service,
         )
-        self.assertIn('restart: "no"', service)
+        self.assertIn('restart: "on-failure:3"', service)
+        self.assertNotIn('restart: "unless-stopped"', service)
+        self.assertNotIn('restart: "always"', service)
         self.assertNotIn(
             "/usr/lib/aarch64-linux-gnu/gstreamer-1.0:"
             "/usr/lib/aarch64-linux-gnu/gstreamer-1.0:ro",

@@ -22,7 +22,7 @@ inspection:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra-egl
   stop_grace_period: 70s
-  restart: "no"
+  restart: "on-failure:3"
   logging:
     driver: local
     options:
