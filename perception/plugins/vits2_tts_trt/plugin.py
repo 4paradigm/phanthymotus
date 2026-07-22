@@ -56,6 +56,9 @@ TOOLS = [
         "topic_out": [{"format": "audio/pcm-16k", "desc": "synthesized PCM audio"}],
     }
 ]
+# Keep the historical vits2_tts name while exposing the module-selected name
+# expected by evaluators when TTS_PLUGIN=vits2_tts_trt.
+TOOLS.append({**TOOLS[0], "name": "tts_trt"})
 
 
 class _Vits2TTSNode(Node):
@@ -204,7 +207,7 @@ class TTSPlugin:
         return node
 
     def dispatch(self, name: str, args: dict):
-        action = args.get("action") if name == "tts" else name
+        action = args.get("action") if name in {"tts", "tts_trt"} else name
         instance_id = args.get("instance_id", "")
 
         if action == "info":
