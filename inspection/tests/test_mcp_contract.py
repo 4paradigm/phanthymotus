@@ -60,6 +60,34 @@ class InspectionContractTest(unittest.TestCase):
         self.assertEqual("idle", stopped["state"])
         self.assertEqual("idle", stopped_again["state"])
 
+    def test_stop_cleanup_failure_is_not_reported_as_recording(self) -> None:
+        self.bundle.dispatch("videoinspector", {
+            "action": "config", "cos_bucket": "test-1250000000", "instance_id": "camera-stop-error",
+        })
+        self.bundle.dispatch("videoinspector", {
+            "action": "start", "instance_id": "camera-stop-error", "input_topic": "/camera/front/image",
+        })
+        plugin = next(item for item in self.bundle._plugins if item.card_id == "videoinspector")
+
+        def fail_stop(_instance, *, for_shutdown):
+            self.assertFalse(for_shutdown)
+            raise TimeoutError("writer queue did not drain")
+
+        original_stats = plugin._runtime_stats
+        plugin._runtime_stats = lambda instance, instance_id: {
+            **original_stats(instance, instance_id),
+            "last_error": "",
+        }
+        plugin._stop_runtime = fail_stop
+        stopped = self.bundle.dispatch("videoinspector", {
+            "action": "stop", "instance_id": "camera-stop-error",
+        })
+
+        self.assertEqual("stop_error", stopped["state"])
+        self.assertFalse(stopped["recording"])
+        self.assertTrue(stopped["resume_required"])
+        self.assertIn("queue did not drain", stopped["last_error"])
+
     def test_running_instance_rejects_topic_change(self) -> None:
         self.bundle.dispatch("videoinspector", {
             "action": "config", "cos_bucket": "test-1250000000", "instance_id": "camera-1",

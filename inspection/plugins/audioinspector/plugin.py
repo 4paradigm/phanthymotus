@@ -155,19 +155,29 @@ class AudioInspectorPlugin(InspectorPlugin):
 
     def _stop_runtime(self, instance: RecordingInstance, *, for_shutdown: bool) -> None:
         runtime = self._runtimes.get(instance.instance_id)
-        if runtime is not None:
-            runtime.stop()
+        stop_error: Exception | None = None
+        try:
+            if runtime is not None:
+                runtime.stop()
+        except Exception as exc:
+            stop_error = exc
+        finally:
             self._runtimes.pop(instance.instance_id, None)
-        if self._ledger is not None and not for_shutdown:
-            self._ledger.set_instance_state(
-                card_id=self.card_id,
-                instance_id=instance.instance_id,
-                input_topic=instance.input_topic,
-                desired_state="idle",
-                auto_resume=False,
-                session_id=instance.session_id,
-                config=self._effective_config(instance.instance_id),
-            )
+            if self._ledger is not None and not for_shutdown:
+                try:
+                    self._ledger.set_instance_state(
+                        card_id=self.card_id,
+                        instance_id=instance.instance_id,
+                        input_topic=instance.input_topic,
+                        desired_state="idle",
+                        auto_resume=False,
+                        session_id=instance.session_id,
+                        config=self._effective_config(instance.instance_id),
+                    )
+                except Exception as exc:
+                    stop_error = stop_error or exc
+        if stop_error is not None:
+            raise stop_error
 
     def _runtime_stats(self, instance: RecordingInstance | None, instance_id: str) -> dict[str, Any]:
         stats = self._ledger.summary(card_id=self.card_id, instance_id=instance_id) if self._ledger is not None else {}

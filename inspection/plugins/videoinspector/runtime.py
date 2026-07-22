@@ -92,9 +92,22 @@ class VideoFramePump:
             finally:
                 self._queue.task_done()
 
-    def stop(self, *, timeout: float) -> None:
+    def stop(self, *, timeout: float, drain: bool = True) -> None:
         self._accepting = False
         self._stop_event.set()
+        if not drain:
+            discarded = 0
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._queue.task_done()
+                discarded += 1
+            if discarded:
+                self.dropped += discarded
+                if not self.last_error:
+                    self.last_error = f"discarded {discarded} queued frames after pipeline failure"
         if self._thread:
             self._thread.join(timeout=max(0.1, timeout))
             if self._thread.is_alive():
@@ -310,6 +323,7 @@ class VideoRecorderRuntime:
 
     def stop(self) -> dict[str, Any] | None:
         deadline = time.monotonic() + self.shutdown_timeout_seconds
+        cleanup_errors: list[str] = []
         if self._node is not None:
             if self._subscription is not None:
                 self._node.destroy_subscription(self._subscription)
@@ -317,8 +331,40 @@ class VideoRecorderRuntime:
             self.executor.remove_node(self._node)
             self._node.destroy_node()
             self._node = None
-        self.pump.stop(timeout=max(0.1, deadline - time.monotonic()))
-        self._shutdown_pipeline(timeout=max(0.1, deadline - time.monotonic()))
+
+        pipeline_error = self.last_error
+        if pipeline_error:
+            # appsrc uses block=true. Once the native decoder/encoder has failed,
+            # draining before tearing down the pipeline can block the writer
+            # thread forever inside push-buffer.
+            self._abort_pipeline()
+
+        try:
+            self.pump.stop(
+                timeout=max(0.1, deadline - time.monotonic()),
+                drain=not bool(pipeline_error),
+            )
+        except Exception as exc:
+            cleanup_errors.append(str(exc))
+            self._abort_pipeline()
+            try:
+                self.pump.stop(timeout=2.0, drain=False)
+            except Exception as retry_exc:
+                cleanup_errors.append(str(retry_exc))
+
+        if self._pipeline is not None:
+            try:
+                self._shutdown_pipeline(timeout=max(0.1, deadline - time.monotonic()))
+            except Exception as exc:
+                cleanup_errors.append(str(exc))
+                self._abort_pipeline()
+
+        if pipeline_error or cleanup_errors:
+            reasons = [item for item in [pipeline_error, *cleanup_errors] if item]
+            reason = "; ".join(dict.fromkeys(reasons))
+            self.store.preserve_open_fragments_as_corrupt(reason)
+            self.last_error = reason
+            raise RuntimeError(reason)
         return self.store.last_finalized
 
     def _shutdown_pipeline(self, *, timeout: float) -> None:
@@ -354,4 +400,5 @@ class VideoRecorderRuntime:
         stats = self.pump.stats()
         if self.last_error:
             stats["last_error"] = self.last_error
+            stats["pipeline_failed"] = True
         return stats

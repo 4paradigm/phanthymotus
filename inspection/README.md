@@ -1,6 +1,6 @@
 # Inspection Stack
 
-独立的音视频采集卡片宿主。当前分支已完成 Dashboard 编排、Audio Inspector 持久化采集、Video Inspector 硬件编码与 MP4 分片、COS 校验上传、断点恢复和本地滚动清理。基础采集与 COS 已在上海 G1 真机通过；本轮新增的卡片启动门禁、双条件分片和磁盘状态仍需部署到上海 G1 做联合验收。
+独立的音视频采集卡片宿主。当前分支已完成 Dashboard 编排、Audio Inspector 持久化采集、Video Inspector 硬件编码与 MP4 分片、COS 校验上传、断点恢复和本地滚动清理。基础采集、双条件分片、磁盘指标与 COS 已在上海 G1 真机通过；网页交互验收中发现的原生视频管线异常停止路径已增加显式收尾与状态传播，待新镜像复验。
 
 ## 画布使用门禁
 
@@ -14,6 +14,8 @@
 - Inspection 容器可以常驻，但卡片默认为 `idle`，不订阅数据。
 - 点击“开始智能控制”并触发卡片 `start` 后，才创建 ROS2 订阅并开始生成新分片。
 - `stop` 先停止新数据进入，再排空有界 writer 队列并 finalize 当前分片；已完成分片的补传不应被取消。
+- Jetson 解码/编码管线已进入终止错误时，`stop` 先中止管线以解除阻塞的 `appsrc push-buffer`，丢弃尚未编码的有界队列，并将未完成 MP4 保留为 `CORRUPT` 诊断文件。
+- 收尾失败不得继续回报 `recording`：订阅已停止时返回 `stop_error`/`recording=false`，Dashboard 显示“采集已停止，但当前分片收尾异常”并保留错误详情。
 - COS uploader 是独立长驻 worker；点击“停止智能控制”不再产生新数据，但会继续补传 ledger backlog。
 - 异常退出后启动时先恢复 `.part` 和 ledger。`auto_resume_after_reboot=false` 时保持 `idle` 并返回 `resume_required=true`，不会偷偷继续采集。
 - Inspection 容器使用 `on-failure:3` 隔离 Jetson 原生插件导致的非零退出：运行期异常最多自动重启 3 次，但 Docker daemon 或整机重启时不会自动拉起，不改变宿主服务先就绪、再启动容器的顺序。

@@ -85,6 +85,37 @@ class VideoStorageTest(unittest.TestCase):
         self.assertTrue(Path(location + ".corrupt").exists())
         self.assertTrue(Path(location + ".corrupt.json").exists())
 
+    def test_terminal_pipeline_error_aborts_before_drain_and_preserves_part(self) -> None:
+        store = self.make_store()
+        location = store.create_location(6)
+        Path(location).write_bytes(b"incomplete-mp4")
+        runtime = VideoRecorderRuntime(
+            executor=object(),
+            store=store,
+            instance_id="camera-1",
+            input_topic="/robot/camera/rgb",
+            encoder="nvv4l2h264enc",
+            target_bitrate_kbps=4000,
+            segment_seconds=60,
+            max_segment_bytes=64 * 1024 * 1024,
+            max_fps=15,
+            queue_frames=8,
+            shutdown_timeout_seconds=1,
+        )
+        runtime._pipeline = object()
+        runtime._appsrc = object()
+        runtime.last_error = "native decoder failed"
+
+        with self.assertRaisesRegex(RuntimeError, "native decoder failed"):
+            runtime.stop()
+
+        self.assertIsNone(runtime._pipeline)
+        self.assertTrue(Path(location + ".corrupt").exists())
+        reason = json.loads(Path(location + ".corrupt.json").read_text(encoding="utf-8"))
+        self.assertEqual("CORRUPT", reason["state"])
+        self.assertIn("native decoder failed", reason["reason"])
+        self.assertFalse(Path(location[:-5] + ".open.json").exists())
+
     def test_video_frame_pump_enforces_format_fps_and_drains(self) -> None:
         consumed = []
         ticks = iter((1_000_000_000, 1_050_000_000, 1_200_000_000))

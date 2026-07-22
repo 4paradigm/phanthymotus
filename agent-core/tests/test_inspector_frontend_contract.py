@@ -26,6 +26,9 @@ class InspectorFrontendContractTest(unittest.TestCase):
         self.assertIn("必须恰好连接一条输入", source)
         self.assertIn("upload_backlog_bytes", source)
         self.assertIn("toolType !== 'inspector' && hasConfig", source)
+        self.assertIn("采集已停止，但当前分片收尾异常", source)
+        self.assertIn("Promise.allSettled(stopTasks)", source)
+        self.assertIn("停止请求失败，请查看详情", source)
 
     def test_flow_view_uses_category_instead_of_topic_direction(self) -> None:
         source = (CORE_ROOT / "web/js/flow-view.js").read_text(encoding="utf-8")

@@ -1559,7 +1559,13 @@ function _renderInspectorInfo(card, info) {
   const pressure = info?.disk_pressure || 'normal';
   let stateClass = 'idle';
   let label = '已就绪';
-  if (info?.state === 'recording') {
+  if (info?.state === 'stop_error') {
+    stateClass = 'critical';
+    label = '采集已停止，但当前分片收尾异常';
+  } else if (info?.state === 'degraded') {
+    stateClass = 'critical';
+    label = '视频编码异常，请停止智能控制';
+  } else if (info?.state === 'recording') {
     stateClass = 'recording';
     label = '正在采集';
   } else if (info?.state === 'paused_disk_full' || pressure === 'critical') {
@@ -1829,6 +1835,7 @@ function _stopProject() {
   // Disable execute buttons
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.add('locked'));
   // Stop all cards on canvas, resolving input_topic from connections
+  const stopTasks = [];
   for (const card of _cards) {
     const inConns = _connections.filter(c => c.toCardId === card.id);
     const topics = inConns.map(conn => conn.fromTopic || '').filter(Boolean);
@@ -1845,16 +1852,32 @@ function _stopProject() {
     const stopPromise = _triggerAction(card.mcpId, card.toolName, 'stop', args);
     const cardMcp = _allMcps.find(m => m.id === card.mcpId);
     const cardTool = (cardMcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
-    if (typeof cardTool === 'object' && cardTool.type === 'inspector') {
+    const isInspector = typeof cardTool === 'object' && cardTool.type === 'inspector';
+    if (isInspector) {
       const statusEl = card.el.querySelector('.canvas-inspector-status');
       if (statusEl) {
         statusEl.className = 'canvas-inspector-status uploading';
         statusEl.querySelector('span:last-child').textContent = '正在结束当前分片';
       }
-      stopPromise.finally(() => {
-        _pollInspectorStatuses();
-      });
     }
+    stopTasks.push(stopPromise.then(response => {
+      if (!isInspector) return;
+      if (!response || response.code !== 200) {
+        const message = response?.message || '停止请求失败';
+        const statusEl = card.el.querySelector('.canvas-inspector-status');
+        if (statusEl) {
+          statusEl.className = 'canvas-inspector-status critical';
+          statusEl.querySelector('span:last-child').textContent = '停止请求失败，请查看详情';
+        }
+        _logActivity('error', `${card.toolName} 停止失败: ${message}`);
+        return;
+      }
+      const parsed = _parseMcpCallResult(response) || {};
+      _renderInspectorInfo(card, parsed);
+      if (parsed.state === 'stop_error') {
+        _logActivity('error', `${card.toolName} 已停止采集，但分片收尾异常: ${parsed.last_error || '未知错误'}`);
+      }
+    }));
     // Auto-stop mic stream when remote_mic card stops
     if (card.toolName === 'remote_mic' && isMicActive()) {
       toggleMicStream('', () => {}).catch(() => {});
@@ -1870,6 +1893,7 @@ function _stopProject() {
     method: 'PUT', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({running: false}),
   });
+  Promise.allSettled(stopTasks).then(() => _pollInspectorStatuses());
   _logActivity('project', '智能控制已停止');
 }
 

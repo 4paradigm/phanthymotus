@@ -297,8 +297,8 @@ class InspectorPlugin:
     def _instance_info(self, instance_id: str, input_topic: str = "") -> dict[str, Any]:
         instance = self._instances.get(instance_id)
         topic = instance.input_topic if instance else input_topic
-        state = instance.state if instance else "idle"
         runtime = self._runtime_stats(instance, instance_id)
+        state = instance.state if instance else "idle"
         return {
             "name": self.display_name,
             "card_id": self.card_id,
@@ -316,7 +316,7 @@ class InspectorPlugin:
             "dropped": int(runtime.get("dropped", 0)),
             "finalized_segments": int(runtime.get("finalized_segments", instance.finalized_segments if instance else 0)),
             "resume_required": bool(instance.resume_required) if instance else False,
-            "last_error": runtime.get("last_error", instance.last_error if instance else ""),
+            "last_error": runtime.get("last_error") or (instance.last_error if instance else ""),
             "runtime_mode": self._runtime_mode,
             "storage_ready": self._storage_ready,
             "storage_mode": runtime.get("storage_mode", self._effective_config(instance_id).get("storage_mode")),
@@ -438,9 +438,18 @@ class InspectorPlugin:
                 instance = self._instances.get(instance_id)
                 if not instance:
                     return self._instance_info(instance_id, str(args.get("input_topic", "")))
-                self._stop_runtime(instance, for_shutdown=False)
+                try:
+                    self._stop_runtime(instance, for_shutdown=False)
+                except Exception as exc:
+                    # A failed finalize must never leave the card claiming that it
+                    # is still recording after its subscription has been removed.
+                    instance.state = "stop_error"
+                    instance.resume_required = True
+                    instance.last_error = str(exc)
+                    return self._instance_info(instance_id)
                 instance.state = "idle"
                 instance.resume_required = False
+                instance.last_error = ""
                 return self._instance_info(instance_id)
 
         if action == "testupload":
@@ -451,7 +460,7 @@ class InspectorPlugin:
     def shutdown(self) -> None:
         with self._lock:
             for instance in self._instances.values():
-                if instance.state == "recording":
+                if instance.state in {"recording", "degraded"}:
                     try:
                         self._stop_runtime(instance, for_shutdown=True)
                     except Exception as exc:

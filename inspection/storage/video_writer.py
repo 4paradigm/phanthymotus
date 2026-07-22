@@ -127,6 +127,34 @@ class VideoFragmentStore:
         self.last_finalized = metadata
         return metadata
 
+    def preserve_open_fragments_as_corrupt(self, reason: str) -> int:
+        """Preserve fragments from a terminal pipeline failure for diagnosis."""
+        with self._lock:
+            open_items = list(self._open.items())
+            self._open.clear()
+            self._current_location = ""
+
+        preserved = 0
+        for location, open_info in open_items:
+            part_path = Path(location)
+            final_path = Path(str(part_path)[:-5])
+            open_state_path = Path(str(final_path) + ".open.json")
+            if part_path.exists():
+                corrupt_path = part_path.with_name(part_path.name + ".corrupt")
+                os.replace(part_path, corrupt_path)
+                reason_path = corrupt_path.with_name(corrupt_path.name + ".json")
+                temp_path = _write_json_temp(reason_path, {
+                    "state": "CORRUPT",
+                    "source": str(part_path),
+                    "reason": str(reason),
+                    "open_state": open_info,
+                })
+                os.replace(temp_path, reason_path)
+                preserved += 1
+            open_state_path.unlink(missing_ok=True)
+            fsync_directory(part_path.parent)
+        return preserved
+
     @staticmethod
     def finalize_part(
         *,
