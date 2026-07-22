@@ -486,6 +486,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             use_angle_cls=bool(cfg.get('use_angle_cls', True)),
             num_threads=int(cfg.get('num_threads', 2)),
             max_side_len=int(cfg.get('max_side_len', 1600)),
+            rec_min_score=float(cfg.get('rec_min_score', 0.3)),
             large_image_strategy=dict(
                 cfg.get('large_image_strategy') or {}
             ),

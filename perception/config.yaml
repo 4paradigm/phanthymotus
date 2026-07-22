@@ -60,6 +60,7 @@ plugins:
     use_angle_cls: false
     num_threads: 1
     max_side_len: 960
+    rec_min_score: 0.3          # MNN rec score 阈值（粗框不杀，留给 judge 的 IoU+LCS 判定）
     min_interval_ms: 0
     large_image_strategy:
       # 关闭分块：tile 跨边界切割产生无法去重的碎片框, predict_T 膨胀 77%, F1 崩塌

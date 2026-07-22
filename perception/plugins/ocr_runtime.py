@@ -188,7 +188,8 @@ class _MNNModelSession:
 
 
 class _MNNPipeline:
-    def __init__(self, root: Path, *, num_threads: int, max_side_len: int):
+    def __init__(self, root: Path, *, num_threads: int, max_side_len: int,
+                 rec_min_score: float = 0.3):
         from rapidocr.ch_ppocr_det.utils import DBPostProcess
         from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
         from rapidocr.utils.process_img import get_rotate_crop_image
@@ -219,6 +220,7 @@ class _MNNPipeline:
         )
         self._rec_decode = CTCLabelDecode(character_path=root / "keys.txt")
         self._crop = get_rotate_crop_image
+        self._rec_min_score = float(rec_min_score)
         self._max_side_len = max(32, int(max_side_len))
 
     @staticmethod
@@ -303,7 +305,7 @@ class _MNNPipeline:
         for box in boxes:
             crop = self._crop(image, copy.deepcopy(box))
             text, score = self._recognize_crop(crop)
-            if not text.strip() or score < 0.5:
+            if not text.strip() or score < self._rec_min_score:
                 continue
             xs = box[:, 0]
             ys = box[:, 1]
@@ -349,6 +351,7 @@ class RapidOCRAdapter:
         use_angle_cls: bool = True,
         num_threads: int = 2,
         max_side_len: int = 1600,
+        rec_min_score: float = 0.3,
         large_image_strategy: dict | None = None,
     ):
         root = Path(model_dir)
@@ -404,6 +407,7 @@ class RapidOCRAdapter:
                     root,
                     num_threads=num_threads,
                     max_side_len=max_side_len,
+                    rec_min_score=rec_min_score,
                 )
                 self._pipeline.warm_up()
                 self._engine = None
