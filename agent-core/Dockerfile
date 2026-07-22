@@ -1,10 +1,14 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+ARG UBUNTU_PORTS_MIRROR=https://ports.ubuntu.com/ubuntu-ports
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG UBUNTU_PORTS_MIRROR
 
 # Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault)
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" /etc/apt/sources.list && \
+    ! grep -q "mirrors.tencentyun.com/ubuntu-ports" /etc/apt/sources.list && \
+    apt-get -o Acquire::AllowInsecureRepositories=true -o Acquire::Retries=3 update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip python3-dbus ffmpeg curl && \
     curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/aarch64/docker-27.5.1.tgz \

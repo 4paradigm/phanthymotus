@@ -32,6 +32,16 @@ class InspectorFrontendContractTest(unittest.TestCase):
         self.assertIn("mcp.category === 'inspection'", source)
         self.assertIn("inspector: 'INSPECT'", source)
 
+    def test_core_image_replaces_retired_ubuntu_ports_mirror(self) -> None:
+        source = (CORE_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG UBUNTU_PORTS_MIRROR=https://ports.ubuntu.com/ubuntu-ports", source)
+        self.assertIn(
+            'sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g"',
+            source,
+        )
+        self.assertIn('! grep -q "mirrors.tencentyun.com/ubuntu-ports"', source)
+        self.assertIn("Acquire::Retries=3", source)
+
 
 if __name__ == "__main__":
     unittest.main()
