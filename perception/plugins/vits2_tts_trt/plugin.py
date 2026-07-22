@@ -134,22 +134,35 @@ class _Vits2TTSNode(Node):
                 continue
             try:
                 started = None
-                for frame_index, pcm in enumerate(self._adapter.synthesize_stream(text)):
-                    if self._stop_event.is_set():
-                        break
+                frames_sent = 0
+                buffer = bytearray()
+
+                def publish_frame(frame: bytes) -> None:
+                    nonlocal started, frames_sent
                     now = time.monotonic()
                     if started is None:
                         started = now
-                    target = started + frame_index * frame_duration
-                    # Rebase after an ONNX segment takes longer than one frame;
-                    # otherwise all buffered frames would be published at once.
+                    target = started + frames_sent * frame_duration
                     if target < now - frame_duration:
-                        started = now - frame_index * frame_duration
+                        started = now - frames_sent * frame_duration
                         target = now
                     delay = target - now
                     if delay > 0:
                         time.sleep(delay)
-                    self._publish(pcm)
+                    self._publish(frame)
+                    frames_sent += 1
+
+                for pcm in self._adapter.synthesize_stream(text):
+                    if self._stop_event.is_set():
+                        break
+                    buffer.extend(pcm)
+                    while len(buffer) >= CHUNK_BYTES:
+                        frame = bytes(buffer[:CHUNK_BYTES])
+                        del buffer[:CHUNK_BYTES]
+                        publish_frame(frame)
+
+                if buffer and not self._stop_event.is_set():
+                    publish_frame(bytes(buffer))
             except Exception:
                 log.exception("[vits2_tts_trt] synthesis failed")
 
