@@ -60,6 +60,7 @@ _INITIALS = [
 _PUNCT_SET = set(punctuation)
 _EN_TOKEN_RE = re.compile(r"[A-Za-z0-9'-]+")
 _NON_ZH_PIECE_RE = re.compile(r"[A-Za-z0-9'-]+|[^\w\s]", re.UNICODE)
+_LETTER_SPELLED_UNITS = {"KB", "MB", "GB", "TB", "PB", "KBPS", "MBPS", "GBPS"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -129,6 +130,15 @@ def _en_token_to_phones(word: str):
     """
     phones: list = []
     tones: list = []
+    if word.upper() in _LETTER_SPELLED_UNITS:
+        # Byte units must use letter names. Passing ``GB`` to g2p_en as one
+        # unknown word yields G EY B IY ("gay B"). Keep words such as IELTS
+        # on their existing dictionary/G2P path.
+        for letter in word:
+            letter_phones, letter_tones = _en_token_to_phones(letter)
+            phones.extend(letter_phones)
+            tones.extend(letter_tones)
+        return phones, tones
     if word.upper() in eng_dict:
         for syllable in eng_dict[word.upper()]:
             for phn in syllable:

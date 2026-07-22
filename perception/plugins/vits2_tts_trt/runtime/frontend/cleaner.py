@@ -9,6 +9,36 @@ def clean_text(text, language):
     return norm_text, phones, tones, word2ph
 
 
+def normalize_text_mix(text):
+    """Normalize the complete MIX input once, before chunking."""
+    has_zh = any("\u4e00" <= c <= "\u9fff" for c in text)
+    has_en = any(("a" <= c.lower() <= "z") for c in text)
+    if has_zh and not has_en:
+        return chinese.text_normalize(text)
+    if has_en and not has_zh:
+        if any(char.isdigit() for char in text):
+            raise ValueError("Pure-English numeric input is unsupported in Chinese MIX mode")
+        return english.text_normalize_without_numbers(text)
+    return chinese.mix_normalize(text)
+
+
+def g2p_normalized_text_mix(norm_text):
+    """Convert already-normalized MIX text to phones without running TN again."""
+    has_zh = any("\u4e00" <= c <= "\u9fff" for c in norm_text)
+    has_en = any(("a" <= c.lower() <= "z") for c in norm_text)
+    if has_zh and not has_en:
+        phones, tones, word2ph = chinese.g2p(norm_text)
+        return phones, tones, ["ZH"] * len(phones), word2ph
+    if has_en and not has_zh:
+        if any(char.isdigit() for char in norm_text):
+            raise ValueError("Arabic digits remained in an English-only MIX chunk")
+        phones, tones, word2ph = english.g2p(norm_text)
+        return phones, tones, ["EN"] * len(phones), word2ph
+    from .unified_g2p import unified_g2p
+
+    return unified_g2p(norm_text)
+
+
 def clean_text_mix(text):
     """Unified ZH/EN text entry without BERT.
 
@@ -21,28 +51,8 @@ def clean_text_mix(text):
     This keeps pure Chinese equivalent to the native `ZH` path while still
     allowing one external `MIX` label/entry for ZH, EN, and ZH/EN sentences.
     """
-    has_zh = any("\u4e00" <= c <= "\u9fff" for c in text)
-    has_en = any(("a" <= c.lower() <= "z") for c in text)
-
-    if has_zh and not has_en:
-        norm_text = chinese.text_normalize(text)
-        phones, tones, word2ph = chinese.g2p(norm_text)
-        langs = ["ZH"] * len(phones)
-        return norm_text, phones, tones, langs, word2ph
-
-    if has_en and not has_zh:
-        if any(char.isdigit() for char in text):
-            raise ValueError(
-                "Arabic digits reached an English-only chunk in Chinese MIX mode"
-            )
-        norm_text = english.text_normalize_without_numbers(text)
-        phones, tones, word2ph = english.g2p(norm_text)
-        langs = ["EN"] * len(phones)
-        return norm_text, phones, tones, langs, word2ph
-
-    from .unified_g2p import unified_g2p
-    norm_text = chinese.mix_normalize(text)
-    phones, tones, langs, word2ph = unified_g2p(norm_text)
+    norm_text = normalize_text_mix(text)
+    phones, tones, langs, word2ph = g2p_normalized_text_mix(norm_text)
     return norm_text, phones, tones, langs, word2ph
 
 

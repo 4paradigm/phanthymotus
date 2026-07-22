@@ -231,6 +231,7 @@ _MIX_UNIT_RANGE_RE = re.compile(r"(?<=[A-Za-z])\s*[-~～—]\s*(?=\d)")
 _MIX_NUMBER_UNIT_RE = re.compile(
     r"(?<![\d.])(\d+(?:\.\d+)?)([A-Za-z]+(?:/[A-Za-z]+)?)"
 )
+_LETTER_SPELLED_UNITS = {"KB", "MB", "GB", "TB", "PB"}
 
 
 def _normalize_unit_number(match: re.Match) -> str:
@@ -238,7 +239,16 @@ def _normalize_unit_number(match: re.Match) -> str:
     # cardinal numbers (九百), rather than digit sequences (九零零).
     normalized = _normalizer.normalize(f"{match.group(1)}个")
     number = normalized[:-1] if normalized.endswith("个") else normalized
-    return number + match.group(2)
+    raw_unit = match.group(2).upper()
+    numerator, separator, denominator = raw_unit.partition("/")
+    unit = " ".join(numerator) if numerator in _LETTER_SPELLED_UNITS else numerator
+    if separator:
+        unit += separator + (
+            " ".join(denominator)
+            if denominator in _LETTER_SPELLED_UNITS
+            else denominator
+        )
+    return number + unit
 
 
 def _normalize_mixed_zh_numbers(text: str) -> str:

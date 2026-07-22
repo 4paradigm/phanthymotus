@@ -14,6 +14,7 @@ from .runtime.backends.trt_tts_engine import TensorRTTTSEngine
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200
 MAX_CHUNK_TOKENS = int(os.getenv("MIX_VITS_MAX_TEXT_TOKENS", "64"))
+CHUNK_PAUSE_MS = int(os.getenv("MIX_VITS_CHUNK_PAUSE_MS", "20"))
 MODEL_CONFIG = os.getenv("MIX_VITS_CONFIG_PATH", "/models/vits2-mix/config.json")
 ENGINE_DIR = os.getenv("MIX_VITS_TRT_ENGINE_DIR", "/models/vits2-mix/engines")
 WARMUP_CASES = (
@@ -23,6 +24,15 @@ WARMUP_CASES = (
     "Lucy今天去公园散步并喝coffee，David开会前仔细检查PPT。",
 )
 log = logging.getLogger(__name__)
+
+if not 0 <= CHUNK_PAUSE_MS <= 1000:
+    raise ValueError("MIX_VITS_CHUNK_PAUSE_MS must be between 0 and 1000")
+
+_ZH_NUMBER_UNIT_RE = re.compile(
+    r"[零〇一二两三四五六七八九十百千万亿点]+"
+    r"(?:K\s*B|M\s*B|G\s*B|T\s*B|P\s*B)(?:每[A-Za-z])?",
+    re.IGNORECASE,
+)
 
 
 class TTSAdapter(ABC):
@@ -50,6 +60,11 @@ def _language_kind(char: str) -> str | None:
 
 def _preferred_split(text: str) -> int:
     midpoint = len(text) // 2
+    protected = [match.span() for match in _ZH_NUMBER_UNIT_RE.finditer(text)]
+
+    def is_safe(index: int) -> bool:
+        return not any(start < index < end for start, end in protected)
+
     boundaries = []
     previous_kind = None
     for index, char in enumerate(text):
@@ -57,12 +72,16 @@ def _preferred_split(text: str) -> int:
         if kind is None:
             continue
         if previous_kind is not None and kind != previous_kind:
-            boundaries.append(index)
+            if is_safe(index):
+                boundaries.append(index)
         previous_kind = kind
     usable = [index for index in boundaries if 1 < index < len(text) - 1]
     if usable:
         return min(usable, key=lambda index: abs(index - midpoint))
-    return max(1, midpoint)
+    fallback = [index for index in range(1, len(text)) if is_safe(index)]
+    if not fallback:
+        raise ValueError("Unable to split protected number-unit expression")
+    return min(fallback, key=lambda index: abs(index - midpoint))
 
 
 class Vits2TensorRTAdapter(TTSAdapter):
@@ -79,7 +98,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
             self._speed = speed
 
     def _iter_unit_chunks(self, text: str):
-        text_ids = self._engine._get_text_ids(text)
+        text_ids = self._engine._get_text_ids(text, normalized=True)
         if len(text_ids[0]) <= MAX_CHUNK_TOKENS:
             yield text, text_ids
             return
@@ -98,14 +117,6 @@ class Vits2TensorRTAdapter(TTSAdapter):
             unit = unit.strip()
             if not unit:
                 continue
-            has_zh = any("\u4e00" <= char <= "\u9fff" for char in unit)
-            has_en = any(char.isascii() and char.isalpha() for char in unit)
-            if has_zh and has_en:
-                # Preserve Chinese numeric context before recursive language-
-                # boundary splitting can turn ``900MB`` into a pure-EN chunk.
-                from .runtime.frontend.chinese import mix_normalize
-
-                unit = mix_normalize(unit)
             yield from self._iter_unit_chunks(unit)
 
     def synthesize(self, text: str) -> bytes:
@@ -115,7 +126,11 @@ class Vits2TensorRTAdapter(TTSAdapter):
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             raise ValueError("TTS text must not be empty")
-        silence = b"\x00\x00" * (SAMPLE_RATE // 10)
+        from .runtime.frontend.cleaner import normalize_text_mix
+
+        text = normalize_text_mix(text)
+        pause_samples = SAMPLE_RATE * CHUNK_PAUSE_MS // 1000
+        silence = b"\x00\x00" * pause_samples
         with self._lock:
             for chunk_index, (chunk, text_ids) in enumerate(
                 self._iter_text_chunks(text)
@@ -127,7 +142,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
                     chunk_index,
                     token_count,
                 )
-                if chunk_index:
+                if chunk_index and silence:
                     yield silence
                 pcm = self._engine.synthesize(
                     chunk,

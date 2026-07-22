@@ -100,11 +100,14 @@ class TensorRTTTSEngine:
                 f"GPU compute capability mismatch: engine={capability}, runtime={actual_capability}"
             )
 
-    def _get_text_ids(self, text):
+    def _get_text_ids(self, text, *, normalized=False):
         from ..frontend import cleaned_text_to_sequence_mix
-        from ..frontend.cleaner import clean_text_mix
+        from ..frontend.cleaner import clean_text_mix, g2p_normalized_text_mix
 
-        _, phones, tones, langs, _ = clean_text_mix(text)
+        if normalized:
+            phones, tones, langs, _ = g2p_normalized_text_mix(text)
+        else:
+            _, phones, tones, langs, _ = clean_text_mix(text)
         ids = cleaned_text_to_sequence_mix(phones, tones, langs)
         if self.add_blank:
             ids = tuple(_intersperse(values) for values in ids)
