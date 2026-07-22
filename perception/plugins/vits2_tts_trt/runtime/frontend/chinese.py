@@ -3,6 +3,7 @@ import re
 import runpy
 
 import jieba
+import numpy as np
 from pypinyin import lazy_pinyin, Style, load_phrases_dict
 
 from .symbols import punctuation
@@ -287,8 +288,7 @@ def mix_normalize(text: str) -> str:
 
 def get_bert_feature(text, word2ph):
     # BERT feature disabled for inference-only deployment
-    import torch
-    return torch.zeros(1024, sum(word2ph))
+    return np.zeros((1024, sum(word2ph)), dtype=np.float32)
 
 
 if __name__ == "__main__":

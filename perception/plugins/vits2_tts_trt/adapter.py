@@ -8,7 +8,7 @@ import re
 import threading
 from abc import ABC, abstractmethod
 
-from .runtime.backends.trt_tts_engine import TensorRTTTSEngine
+from .runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
 
 
 SAMPLE_RATE = 16000
@@ -88,7 +88,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
     def __init__(self, speed: float = 1.0):
         self._lock = threading.Lock()
         self.set_speed(speed)
-        self._engine = TensorRTTTSEngine(MODEL_CONFIG, ENGINE_DIR)
+        self._engine = TensorRTNumpyTTSEngine(MODEL_CONFIG, ENGINE_DIR)
 
     def set_speed(self, speed: float) -> None:
         speed = float(speed)

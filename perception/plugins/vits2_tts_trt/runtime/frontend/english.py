@@ -2,6 +2,7 @@ import pickle
 import os
 import re
 import inflect
+import numpy as np
 
 from .symbols import punctuation, symbols
 
@@ -323,5 +324,4 @@ def g2p(text):
 
 
 def get_bert_feature(text, word2ph):
-    import torch
-    return torch.zeros((1024, sum(word2ph)))
+    return np.zeros((1024, sum(word2ph)), dtype=np.float32)
