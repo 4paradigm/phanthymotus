@@ -82,81 +82,44 @@ MNN is the default backend. ONNX Runtime is a startup fallback, not a second
 resident engine. If MNN initialization fails, all partially created MNN state
 is released before ORT is initialized.
 
-## Module Boundaries
+## Implementation Boundary
 
-### `perception/plugins/ocr_image_decoder.py`
+Keep the implementation in the existing OCR files instead of introducing a
+new abstraction layer.
 
-Owns compressed-image inspection and bounded pixel access.
+### `perception/plugins/ocr_runtime.py`
 
-- Probe format, width, and height without full decode.
-- Apply image orientation consistently before coordinate planning.
-- Create the overview image directly at the configured target size.
-- Decode one source-region tile at a time.
-- Return contiguous `uint8` image data plus source-to-decoded transforms.
-- Never return a full-resolution array when the source exceeds the configured
-  overview or tile dimensions.
-
-This module does not know about OCR models or response schemas.
-
-### `perception/plugins/ocr_backend.py`
-
-Defines the internal backend contract:
-
-```python
-class OCRBackend:
-    def detect(self, image_uint8): ...
-    def recognize(self, crop_uint8): ...
-    def warm_up(self): ...
-    def close(self): ...
-```
-
-Detection returns polygons, confidence scores, and the image coordinate system
-used by the backend. Recognition returns text and confidence. Backend callers
-do not depend on MNN or ORT-specific objects.
-
-### `perception/plugins/ocr_mnn_backend.py`
-
-Owns MNN interpreter, session, tensor, preprocessing, and postprocessing state.
-
-- Load only detector and recognizer models.
-- Use one inference thread.
-- Configure low-memory scheduling and low precision where supported.
-- Keep Python-side image data as `uint8` until it is copied into the MNN input.
-- Use MNN image processing for normalization and layout conversion so no
-  NumPy Float32 preprocessing array is created.
-- Reuse bounded input and output tensors between calls.
-- Process recognition crops one at a time.
+The existing adapter owns MNN detector and recognizer sessions, direct MNN
+image preprocessing, RapidOCR-compatible postprocessing, startup fallback, and
+the ordinary-image path. It reuses RapidOCR's DB postprocessor, CTC decoder,
+and perspective-crop helper instead of reimplementing OCR algorithms. The
+adapter loads only detector and recognizer models and processes recognition
+crops one at a time.
 
 Low precision means FP16 arithmetic and buffers where the Jetson MNN backend
 supports it. It does not require converting quantized model weights back to
 FP16. INT8 activation quantization is deferred until accuracy can be measured,
 because detector quantization can reduce small-text recall.
 
-### `perception/plugins/ocr_ort_backend.py`
+The existing ORT construction remains in this file as a startup fallback. It
+disables the CPU memory arena and memory pattern, uses one thread, and never
+creates a classifier session. MNN and ORT are not resident at the same time.
 
-Wraps the existing RapidOCR/ONNX Runtime implementation for fallback and
-comparison tests.
+### `perception/plugins/ocr_tiled_strategy.py`
 
-- Load detector and recognizer only.
-- Disable the CPU memory arena and memory pattern when supported by the active
-  ORT version.
-- Use one intra-op thread and one inter-op thread.
-- Do not create or load a classifier session.
-- Reuse the same libvips decode and tile planner as MNN.
+The existing large-image strategy replaces OpenCV full-image decode with
+libvips overview and region decode. It continues to own tile planning,
+coordinate offsets, duplicate suppression, and reading-order sorting. Tiles
+run sequentially through the callback supplied by `ocr_runtime.py`.
 
-### `perception/plugins/ocr_runtime.py`
+### `perception/utils/ocr_model_downloader.py`
 
-Owns orchestration only:
+The existing downloader accepts an explicit file list, downloads MNN and ORT
+bundles, validates non-empty files, and enforces the aggregate 15 MiB model
+asset limit.
 
-- validate configuration;
-- select and initialize one backend;
-- execute overview, tiles, detection, recognition, merge, and coordinate
-  restoration;
-- serialize requests through the existing inference lock;
-- convert results and failures into the current plugin response format;
-- emit one summary log per request.
-
-The current dynamic memory rejection logic is removed from this path.
+No additional production Python modules are introduced. The current dynamic
+memory rejection module is removed after all call sites and tests are migrated.
 
 ## Model Distribution
 
@@ -432,12 +395,13 @@ total container RSS, latency percentiles, completion count, and backend.
 ## Rollout
 
 1. Convert and upload PP-OCRv6 tiny detector and recognizer MNN artifacts.
-2. Add libvips and MNN dependencies to `Dockerfile.jetson`.
-3. Implement and test the decoder and backend interfaces.
-4. Run MNN-versus-ORT compatibility tests locally.
-5. Build on Jetson and run single-container memory and accuracy tests.
-6. Run leaderboard-concurrency and 250-case stress tests.
-7. Submit the MNN commit only after all acceptance criteria pass.
+2. Update the existing model downloader, Jetson Dockerfile, and default config.
+3. Replace the existing adapter's inference and image-decode internals in
+   `ocr_runtime.py` and `ocr_tiled_strategy.py`.
+4. Run focused unit and contract tests.
+5. Build once on Jetson and compare MNN with the current ORT baseline for
+   memory, latency, and sample accuracy.
+6. Submit the MNN commit after the Jetson comparison passes.
 
 The current ORT implementation remains available behind explicit configuration
 until the MNN leaderboard run demonstrates equivalent accuracy and stable
