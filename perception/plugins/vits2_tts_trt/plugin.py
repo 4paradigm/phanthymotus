@@ -137,12 +137,15 @@ class _Vits2TTSNode(Node):
             except queue.Empty:
                 continue
             try:
+                task_started = time.monotonic()
+                first_published_at = None
+                total_bytes = 0
                 started = None
                 frames_sent = 0
                 buffer = bytearray()
 
                 def publish_frame(frame: bytes) -> None:
-                    nonlocal started, frames_sent
+                    nonlocal started, frames_sent, first_published_at, total_bytes
                     now = time.monotonic()
                     if started is None:
                         started = now
@@ -155,6 +158,9 @@ class _Vits2TTSNode(Node):
                         if delay > 0:
                             time.sleep(delay)
                     self._publish(frame)
+                    if first_published_at is None:
+                        first_published_at = time.monotonic()
+                    total_bytes += len(frame)
                     frames_sent += 1
 
                 for pcm in self._adapter.synthesize_stream(text):
@@ -168,6 +174,22 @@ class _Vits2TTSNode(Node):
 
                 if buffer and not self._stop_event.is_set():
                     publish_frame(bytes(buffer))
+                if total_bytes:
+                    finished_at = time.monotonic()
+                    audio_seconds = total_bytes / (SAMPLE_RATE * 2)
+                    elapsed = finished_at - task_started
+                    log.info(
+                        "[vits2_tts_trt] server delivery: bytes=%d frames=%d "
+                        "ttft=%.3fs elapsed=%.3fs audio=%.3fs rtf=%.4f "
+                        "frame_interval_ms=%d",
+                        total_bytes,
+                        frames_sent,
+                        first_published_at - task_started,
+                        elapsed,
+                        audio_seconds,
+                        elapsed / audio_seconds,
+                        FRAME_INTERVAL_MS,
+                    )
             except Exception:
                 log.exception("[vits2_tts_trt] synthesis failed")
 
