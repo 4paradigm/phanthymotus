@@ -118,6 +118,21 @@ class ProjectRunningRequest(BaseModel):
     running: bool
 
 
+def reset_project_running_after_restart() -> bool:
+    """Clear a persisted running flag that cannot survive an Agent Core restart.
+
+    Card ``start`` actions are runtime side effects.  Persisting only the UI
+    boolean across a Core restart makes the dashboard claim that the project is
+    running even though dynamic card instances/topics were never recreated.
+    """
+    core = config.main.get('core', {})
+    was_running = bool(core.get('project_running', False))
+    if was_running:
+        core['project_running'] = False
+        config.main['core'] = core
+    return was_running
+
+
 @router.put('/project-running')
 async def set_project_running(req: ProjectRunningRequest):
     core = config.main.get('core', {})
@@ -522,5 +537,4 @@ async def config_test_vad_audio(
         return {'code': 200, 'data': result}
     except Exception as e:
         return {'code': 200, 'data': {'ok': False, 'info': str(e)}}
-
 

@@ -736,9 +736,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     el.querySelector('.canvas-view-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      const liveMcp = _allMcps.find(m => m.id === mcpId);
-      const topics = topicOut.length ? topicOut : (liveMcp?.topic_out || []);
-      if (topics.length) showTopicDetail(topics[0].topic, topics[0].format || '');
+      _showCardTopicDetail(id, el, toolName, topicOut);
     });
 
     const sensorExecBtn = el.querySelector('.canvas-exec-btn');
@@ -974,9 +972,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (viewBtn) {
       viewBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        const liveMcp = _allMcps.find(m => m.id === mcpId);
-        const topics = topicOut.length ? topicOut : (liveMcp?.topic_out || []);
-        if (topics.length) showTopicDetail(topics[0].topic, topics[0].format || '');
+        _showCardTopicDetail(id, el, toolName, topicOut);
       });
     }
 
@@ -1552,12 +1548,38 @@ function _formatRemaining(seconds) {
   return `${(value / 3600).toFixed(1)} 小时`;
 }
 
+function _showCardTopicDetail(cardId, cardEl, toolName, fallbackTopics = []) {
+  // Multi-instance sensors learn their concrete topic asynchronously from
+  // info(instance_id). Read the live card/DOM state at click time instead of
+  // using the topicOut array captured when the card element was constructed.
+  const liveCard = _cards.find(card => card.id === cardId);
+  const domTopics = [...cardEl.querySelectorAll('.canvas-port.out')].map(port => ({
+    topic: port.dataset.topic || '',
+    format: port.dataset.format || '',
+  }));
+  const target = [
+    ...(liveCard?.topicOut || []),
+    ...domTopics,
+    ...(fallbackTopics || []),
+  ].find(item => item?.topic);
+
+  if (!target) {
+    const message = `${toolName} 的数据 topic 尚未解析，请等待驱动就绪后重试`;
+    _logActivity('warn', message);
+    alert(message);
+    return;
+  }
+  showTopicDetail(target.topic, target.format || '');
+}
+
 function _renderInspectorInfo(card, info) {
   const statusEl = card.el.querySelector('.canvas-inspector-status');
   if (!statusEl) return;
   const backlog = Number(info?.upload_backlog || 0);
   const pressure = info?.disk_pressure || 'normal';
   const uploadError = String(info?.upload_error || info?.upload_last_error || info?.upload_service_error || '');
+  const runtimeError = String(info?.last_error || '');
+  const errorKind = String(info?.error_kind || '');
   const retrySeconds = Number(info?.upload_retry_delay_seconds || 0);
   let stateClass = 'idle';
   let label = '已就绪';
@@ -1566,7 +1588,13 @@ function _renderInspectorInfo(card, info) {
     label = '采集已停止，但当前分片收尾异常';
   } else if (info?.state === 'degraded') {
     stateClass = 'critical';
-    label = '视频编码异常，请停止智能控制';
+    if (['input_start_timeout', 'input_stalled', 'invalid_input_format', 'invalid_jpeg'].includes(errorKind)) {
+      label = '相机输入异常，未在正常接收画面';
+    } else if (errorKind === 'unclean_shutdown') {
+      label = '上次采集被中断，需手动重新开始';
+    } else {
+      label = '视频编码异常，请停止智能控制';
+    }
   } else if (info?.state === 'paused_disk_full' || pressure === 'critical') {
     stateClass = 'critical';
     label = '磁盘水位过高，已暂停';
@@ -1601,8 +1629,23 @@ function _renderInspectorInfo(card, info) {
   }
   if (remainingEl) remainingEl.textContent = `预计可录 ${_formatRemaining(info?.estimated_remaining_seconds)}`;
   if (hintEl) {
-    hintEl.textContent = uploadError
-      ? `云端错误：${uploadError}`
+    const details = [];
+    if (runtimeError && (errorKind || ['degraded', 'stop_error'].includes(info?.state))) {
+      const prefix = errorKind.startsWith('input_') || errorKind === 'invalid_jpeg'
+        ? '输入错误'
+        : errorKind === 'encoder_pipeline' ? '编码错误' : '采集错误';
+      details.push(`${prefix}：${runtimeError}`);
+    }
+    if (uploadError) details.push(`云端错误：${uploadError}`);
+    if (!details.length && info?.input_state) {
+      const age = Number(info?.last_frame_age_seconds);
+      details.push(
+        `输入 ${info.input_state} · 已接收 ${Number(info?.frames_received || 0)} 帧`
+        + (Number.isFinite(age) ? ` · 最后一帧 ${age.toFixed(1)}s 前` : '')
+      );
+    }
+    hintEl.textContent = details.length
+      ? details.join('；')
       : '停止采集后，后台仍会继续上传已落盘分片';
   }
 }

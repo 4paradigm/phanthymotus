@@ -8,6 +8,8 @@
 - 每张 Inspector 必须恰好连接一条 format 完全匹配的输入：音频为 `audio/pcm-16k`，视频为 `image/jpeg`。
 - 点击“开启智能控制”时，Dashboard 在调用任何 `start` 前检查全部 Inspector 的连线和存储配置；任意一张不合格则整个项目不启动。
 - Inspector 配置由服务端同步校验成功后才写入 Agent Core；`local_and_cos` 会在保存时写入并 HEAD 校验一个最小健康对象，桶不存在、region 不匹配或无权限都会直接拒绝保存并显示原因。
+- 使用影石 MJPEG 中继时，External Camera 实例配置为 `source_mode=mjpeg`、`source_url=http://127.0.0.1:8002/stream`、`reconnect_delay=1`；停止项目后连接 `External Camera → Video Inspector`，再重新开启智能控制。只保存配置不会启动实例。
+- Agent Core 重启后不保留“智能控制运行中”的 UI 假状态；页面回到未启动，用户需要显式再次开启，以重建动态卡片实例和 topic。
 
 ## 采集生命周期
 
@@ -16,6 +18,7 @@
 - `stop` 先停止新数据进入，再排空有界 writer 队列并 finalize 当前分片；已完成分片的补传不应被取消。
 - Jetson 解码/编码管线已进入终止错误时，`stop` 先中止管线以解除阻塞的 `appsrc push-buffer`，丢弃尚未编码的有界队列，并将未完成 MP4 保留为 `CORRUPT` 诊断文件。
 - 收尾失败不得继续回报 `recording`：订阅已停止时返回 `stop_error`/`recording=false`，Dashboard 显示“采集已停止，但当前分片收尾异常”并保留错误详情。
+- Video Inspector 启动后 10 秒内没有合法 JPEG 首帧时报 `input_start_timeout`；正常收帧后连续 5 秒断流时报 `input_stalled`；缺失 JPEG SOI/EOI 标记时报 `invalid_jpeg`。错误持久化到 ledger，重启后仍在卡片显示，不再只呈现“正在采集”。
 - COS uploader 是独立长驻 worker；点击“停止智能控制”不再产生新数据，但会继续补传 ledger backlog。
 - 配置通过后发生的断网或权限变化不会删除本地数据，也不会隐式切换为 `local_ring`；卡片会显示“云端上传失败”、错误原因、待上传量和重试间隔，本地采集可在磁盘水位允许时继续。
 - 异常退出后启动时先恢复 `.part` 和 ledger。`auto_resume_after_reboot=false` 时保持 `idle` 并返回 `resume_required=true`，不会偷偷继续采集。
@@ -148,14 +151,15 @@ node --check agent-core/web/js/flow-view.js
 
 1. 确认 `embodied-inspection` 运行，`curl http://127.0.0.1:15671/health` 返回 `ok=true`。
 2. 先在未配置、未连线状态把两张 Inspector 拖入 Dashboard，确认卡片可添加且项目启动被明确拒绝。
-3. 验证错误 format 无法连线；再分别连接 `/phanthymotus_g1_driver/mic/audio` 和 `/phanthymotus_g1_driver/ext_camera/card-mrnbwcls6nji/rgb`。
+3. 验证错误 format 无法连线；再分别连接 `/phanthymotus_g1_driver/mic/audio` 和由 External Camera `start` 返回的 `/phanthymotus_g1_driver/ext_camera/<card-id>/rgb`，不得用内置 `camera_rgb` 的 topic 代替影石验收。
 4. 配置 `storage_mode=local_and_cos`、`cos_region`、`cos_bucket`、`cos_prefix`、`credential_profile`；确认界面没有 `device_id` 输入框，保存后返回自动设备 ID 和 `upload_validation=verified`。
 5. 故意填写一个格式正确但不存在的 bucket，确认配置保存被拒绝且界面明确显示“bucket 不存在或与 region 不匹配”；恢复正确 bucket 后再继续。
 6. 点击“开启智能控制”，确认两张卡片均进入“正在采集”，并能看到本地用量、剩余可录时间和磁盘水位。
-7. 使用较小验收值验证按时长分片，再单独使用较小 `max_segment_mb` 验证按大小分片；停止项目时当前段必须被 finalize。
-8. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
-9. 检查本地与 COS 路径使用自动设备 ID、`audio-inspector`/`video-inspector`、输入源语义名和显式 `utc-hour=...Z`，且媒体和 metadata 的 size/SHA-256 一致。
-10. 停止智能控制后确认不再产生新分片，但卡片仍显示 backlog 减少，最终变成“云端已同步”。
-11. 另建 `local_ring` 实例验证无需 COS 可启动，过期或超预算后只滚动本地数据，不创建 COS 对象。
+7. 点击 External Camera 的“查看数据流”，确认 WebSocket 先返回 topic metadata，再连续返回 SOI=`FFD8`、EOI=`FFD9` 的完整 JPEG；未启动时必须明确显示“数据源尚未启动”，不能静默无反应。
+8. 使用较小验收值验证按时长分片，再单独使用较小 `max_segment_mb` 验证按大小分片；停止项目时当前段必须被 finalize。
+9. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
+10. 检查本地与 COS 路径使用自动设备 ID、`audio-inspector`/`video-inspector`、输入源语义名和显式 `utc-hour=...Z`，且媒体和 metadata 的 size/SHA-256 一致。
+11. 停止智能控制后确认不再产生新分片，但卡片仍显示 backlog 减少，最终变成“云端已同步”。
+12. 另建 `local_ring` 实例验证无需 COS 可启动，过期或超预算后只滚动本地数据，不创建 COS 对象。
 
 视频验收前必须先确认输入 topic 能在超时窗口内收到至少一帧 `sensor_msgs/msg/CompressedImage`。只有 publisher 数量不为零并不代表相机真实产帧；门禁失败时应先修复上游相机服务，不能用空 MP4 作为通过证据。

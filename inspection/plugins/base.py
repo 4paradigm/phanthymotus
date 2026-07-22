@@ -319,7 +319,7 @@ class InspectorPlugin:
         instance = self._instances.get(instance_id)
         topic = instance.input_topic if instance else input_topic
         runtime = self._runtime_stats(instance, instance_id)
-        state = instance.state if instance else "idle"
+        state = str(runtime.get("runtime_state") or (instance.state if instance else "idle"))
         storage_mode = runtime.get("storage_mode", self._effective_config(instance_id).get("storage_mode"))
         upload_backlog = int(runtime.get("upload_backlog", 0))
         upload_error = str(runtime.get("upload_last_error") or runtime.get("upload_service_error") or "")
@@ -358,6 +358,12 @@ class InspectorPlugin:
             "finalized_segments": int(runtime.get("finalized_segments", instance.finalized_segments if instance else 0)),
             "resume_required": bool(instance.resume_required) if instance else False,
             "last_error": runtime.get("last_error") or (instance.last_error if instance else ""),
+            "error_kind": runtime.get("error_kind", ""),
+            "error_at_ns": int(runtime.get("error_at_ns", 0)),
+            "input_state": runtime.get("input_state", ""),
+            "last_frame_age_seconds": runtime.get("last_frame_age_seconds"),
+            "frames_received": int(runtime.get("received", 0)),
+            "frames_accepted": int(runtime.get("accepted", 0)),
             "runtime_mode": self._runtime_mode,
             "storage_ready": self._storage_ready,
             "storage_mode": storage_mode,

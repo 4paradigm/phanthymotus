@@ -249,6 +249,12 @@ async def lifespan(app):
     # 初始化资源文件（从 defaults 拷贝缺失文件）
     _init_resource_files()
 
+    # A persisted UI flag cannot prove that external card processes survived a
+    # Core restart.  Force an explicit project start so dynamic instances and
+    # topics (for example External Camera) are recreated deterministically.
+    if api.config.reset_project_running_after_restart():
+        print('[startup] cleared stale project_running flag after Agent Core restart')
+
     # 检查宿主是否有 ROS2 DDS 服务
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check_dds)

@@ -44,6 +44,22 @@ export function showTopicDetail(topicPath, format) {
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
   _renderer.mount(body, 'detail');
+  body.style.position = 'relative';
+  const streamStatus = document.createElement('div');
+  streamStatus.className = 'detail-stream-status';
+  streamStatus.style.cssText = 'position:absolute;left:10px;top:10px;z-index:10;padding:5px 8px;border-radius:4px;background:rgba(0,0,0,.72);color:#fff;font-size:12px;max-width:calc(100% - 20px)';
+  streamStatus.textContent = '正在连接数据流…';
+  body.appendChild(streamStatus);
+  let receivedData = false;
+  let streamFailed = false;
+
+  const showStreamStatus = (message, failed = false) => {
+    if (!streamStatus.isConnected) return;
+    streamFailed = streamFailed || failed;
+    streamStatus.style.display = '';
+    streamStatus.style.background = failed ? 'rgba(170,24,24,.88)' : 'rgba(0,0,0,.72)';
+    streamStatus.textContent = message;
+  };
 
   // Connect WebSocket — /ws/bus/* is proxied through agent-core
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -51,27 +67,50 @@ export function showTopicDetail(topicPath, format) {
   const wsUrl = `${proto}://${wsHost}/ws/bus${topicPath}`;
   _ws = new WebSocket(wsUrl);
   _ws.binaryType = 'arraybuffer';
+  _ws.onopen = () => showStreamStatus('已连接，等待首帧数据…');
   _ws.onmessage = (ev) => {
     if (ev.data instanceof ArrayBuffer) {
       // Binary frame — pass directly to renderer (audio PCM, sensor binary, etc.)
       if (ev.data.byteLength === 0) return;
+      receivedData = true;
+      streamStatus.style.display = 'none';
       _renderer?.onData?.(ev.data, hint);
     } else {
       // Text frame — JSON messages
       try {
         const parsed = JSON.parse(ev.data);
-        if (parsed.type === 'ping' || parsed.type === 'meta') return;
+        if (parsed.type === 'meta') {
+          showStreamStatus('已连接，等待首帧数据…');
+          return;
+        }
+        if (parsed.type === 'ping') {
+          if (!receivedData) showStreamStatus('已连接，但尚未收到数据');
+          return;
+        }
         if (parsed.type === 'error') {
           console.warn('[detail-panel] WS error:', parsed.message);
+          const message = parsed.message || '未知错误';
+          const displayMessage = /not registered/i.test(message)
+            ? '数据源尚未启动：请停止后重新开启智能控制'
+            : `数据流错误：${message}`;
+          showStreamStatus(displayMessage, true);
           return;
         }
       } catch {}
+      receivedData = true;
+      streamStatus.style.display = 'none';
       const buf = new TextEncoder().encode(ev.data).buffer;
       _renderer?.onData?.(buf, hint);
     }
   };
-  _ws.onclose = () => { console.debug('[detail-panel] WS closed:', topicPath); };
-  _ws.onerror = (e) => { console.warn('[detail-panel] WS error:', topicPath, e); };
+  _ws.onclose = () => {
+    console.debug('[detail-panel] WS closed:', topicPath);
+    if (!receivedData && !streamFailed) showStreamStatus('数据流已关闭，未收到任何数据', true);
+  };
+  _ws.onerror = (e) => {
+    console.warn('[detail-panel] WS error:', topicPath, e);
+    showStreamStatus('无法连接数据流，请检查 topic 和驱动状态', true);
+  };
 }
 
 export async function showNodeDetail(mcp) {

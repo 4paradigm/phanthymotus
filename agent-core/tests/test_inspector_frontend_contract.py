@@ -29,8 +29,28 @@ class InspectorFrontendContractTest(unittest.TestCase):
         self.assertIn("采集已停止，但当前分片收尾异常", source)
         self.assertIn("正在本地采集，但云端上传失败", source)
         self.assertIn("云端错误：", source)
+        self.assertIn("function _showCardTopicDetail", source)
+        self.assertIn("的数据 topic 尚未解析", source)
+        self.assertIn("liveCard?.topicOut", source)
+        self.assertIn("相机输入异常", source)
+        self.assertIn("? '输入错误'", source)
         self.assertIn("Promise.allSettled(stopTasks)", source)
         self.assertIn("停止请求失败，请查看详情", source)
+
+    def test_topic_detail_panel_shows_connection_and_stream_errors(self) -> None:
+        source = (CORE_ROOT / "web/js/detail-panel.js").read_text(encoding="utf-8")
+        self.assertIn("detail-stream-status", source)
+        self.assertIn("已连接，但尚未收到数据", source)
+        self.assertIn("数据流错误：", source)
+        self.assertIn("数据源尚未启动：请停止后重新开启智能控制", source)
+        self.assertIn("无法连接数据流", source)
+
+    def test_core_restart_clears_stale_project_running_flag(self) -> None:
+        config_source = (CORE_ROOT / "src/api/config.py").read_text(encoding="utf-8")
+        start_source = (CORE_ROOT / "src/start.py").read_text(encoding="utf-8")
+        self.assertIn("def reset_project_running_after_restart()", config_source)
+        self.assertIn("core['project_running'] = False", config_source)
+        self.assertIn("api.config.reset_project_running_after_restart()", start_source)
 
     def test_flow_view_uses_category_instead_of_topic_direction(self) -> None:
         source = (CORE_ROOT / "web/js/flow-view.js").read_text(encoding="utf-8")

@@ -38,6 +38,9 @@ class InspectionContractTest(unittest.TestCase):
             corrupt_retention = tool["configSchema"]["properties"]["corrupt_retention_hours"]
             self.assertEqual(24, corrupt_retention["default"])
             self.assertEqual("instance", corrupt_retention["scope"])
+        video_props = tools["videoinspector"]["configSchema"]["properties"]
+        self.assertEqual(10, video_props["input_start_timeout_seconds"]["default"])
+        self.assertEqual(5, video_props["input_stall_timeout_seconds"]["default"])
 
     def test_config_start_info_stop_is_idempotent(self) -> None:
         configured = self.bundle.dispatch("audioinspector", {

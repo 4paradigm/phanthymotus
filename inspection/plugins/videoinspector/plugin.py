@@ -37,6 +37,8 @@ class VideoInspectorPlugin(InspectorPlugin):
                 "target_bitrate_kbps": {"type": "integer", "minimum": 256, "maximum": 20000, "default": 4000, "scope": "instance"},
                 "max_fps": {"type": "number", "minimum": 1, "default": 30, "scope": "instance"},
                 "queue_frames": {"type": "integer", "minimum": 1, "default": 8, "scope": "instance"},
+                "input_start_timeout_seconds": {"type": "number", "minimum": 1, "maximum": 60, "default": 10, "scope": "instance"},
+                "input_stall_timeout_seconds": {"type": "number", "minimum": 1, "maximum": 60, "default": 5, "scope": "instance"},
                 "auto_resume_after_reboot": {"type": "boolean", "default": False, "scope": "instance"},
             },
             runtime_mode=runtime_mode,
@@ -150,6 +152,8 @@ class VideoInspectorPlugin(InspectorPlugin):
             max_fps=float(config.get("max_fps", 30)),
             queue_frames=int(config.get("queue_frames", 8)),
             shutdown_timeout_seconds=float(config.get("shutdown_finalize_timeout_seconds", 15)),
+            input_start_timeout_seconds=float(config.get("input_start_timeout_seconds", 10)),
+            input_stall_timeout_seconds=float(config.get("input_stall_timeout_seconds", 5)),
         )
         runtime.start()
         try:
@@ -162,6 +166,7 @@ class VideoInspectorPlugin(InspectorPlugin):
                 session_id=instance.session_id,
                 config=config,
             )
+            self._ledger.clear_instance_error(card_id=self.card_id, instance_id=instance.instance_id)
         except Exception:
             runtime.stop()
             raise
@@ -176,6 +181,7 @@ class VideoInspectorPlugin(InspectorPlugin):
     def _stop_runtime(self, instance: RecordingInstance, *, for_shutdown: bool) -> None:
         runtime = self._runtimes.get(instance.instance_id)
         stop_error: Exception | None = None
+        runtime_stats = runtime.stats() if runtime is not None else {}
         try:
             if runtime is not None:
                 runtime.stop()
@@ -196,6 +202,18 @@ class VideoInspectorPlugin(InspectorPlugin):
                     )
                 except Exception as exc:
                     stop_error = stop_error or exc
+                error_text = str(stop_error or runtime_stats.get("last_error") or "")
+                if error_text:
+                    self._ledger.set_instance_error(
+                        card_id=self.card_id,
+                        instance_id=instance.instance_id,
+                        runtime_state="stop_error" if stop_error else "degraded",
+                        last_error=error_text,
+                        error_kind=(
+                            "finalize_error" if stop_error
+                            else str(runtime_stats.get("error_kind") or "runtime_error")
+                        ),
+                    )
         if stop_error is not None:
             raise stop_error
 
@@ -204,10 +222,29 @@ class VideoInspectorPlugin(InspectorPlugin):
         runtime = self._runtimes.get(instance_id)
         if runtime is not None:
             stats.update(runtime.stats())
-            if stats.get("pipeline_failed") and instance is not None and instance.state == "recording":
+            if (stats.get("pipeline_failed") or stats.get("input_failed")) and instance is not None:
                 instance.state = "degraded"
                 instance.resume_required = True
                 instance.last_error = str(stats.get("last_error", "video pipeline failed"))
+                if self._ledger is not None:
+                    self._ledger.set_instance_error(
+                        card_id=self.card_id,
+                        instance_id=instance_id,
+                        runtime_state="degraded",
+                        last_error=instance.last_error,
+                        error_kind=str(stats.get("error_kind") or "runtime_error"),
+                    )
+        if self._ledger is not None and not stats.get("last_error"):
+            saved = next(
+                (item for item in self._ledger.list_instance_states(card_id=self.card_id)
+                 if item["instance_id"] == instance_id),
+                None,
+            )
+            if saved and saved.get("last_error"):
+                stats["last_error"] = saved["last_error"]
+                stats["error_kind"] = saved.get("error_kind", "")
+                stats["error_at_ns"] = int(saved.get("error_at_ns", 0))
+                stats["runtime_state"] = saved.get("runtime_state", "degraded")
         config = self._effective_config(instance_id)
         stats.update(self._storage_status(
             data_root=self._data_root,
@@ -296,6 +333,15 @@ class VideoInspectorPlugin(InspectorPlugin):
                     instance.resume_required = True
                     instance.last_error = f"automatic resume failed: {exc}"
                     log.exception("failed to auto-resume video inspector %s", instance.instance_id)
+            else:
+                instance.last_error = "video recording was interrupted by service or device restart; manual resume is required"
+                self._ledger.set_instance_error(
+                    card_id=self.card_id,
+                    instance_id=instance.instance_id,
+                    runtime_state="degraded",
+                    last_error=instance.last_error,
+                    error_kind="unclean_shutdown",
+                )
             self._instances[instance.instance_id] = instance
 
     def shutdown(self) -> None:

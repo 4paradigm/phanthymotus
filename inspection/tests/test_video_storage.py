@@ -149,6 +149,88 @@ class VideoStorageTest(unittest.TestCase):
         self.assertEqual(1, pump.stats()["rate_limited"])
         self.assertEqual(1, pump.stats()["dropped"])
 
+    def test_video_frame_pump_rejects_repeated_invalid_jpeg_payloads(self) -> None:
+        pump = VideoFramePump(
+            lambda *_args: None,
+            queue_frames=2,
+            max_fps=15,
+        )
+        pump.start()
+        broken = SimpleNamespace(format="jpeg", data=b"not-a-jpeg")
+
+        self.assertFalse(pump.submit_message(broken))
+        self.assertFalse(pump.submit_message(broken))
+        self.assertFalse(pump.submit_message(broken))
+        pump.stop(timeout=2)
+
+        stats = pump.stats()
+        self.assertEqual(3, stats["invalid_payload"])
+        self.assertEqual(3, stats["consecutive_invalid"])
+        self.assertIn("invalid JPEG payload", stats["last_error"])
+
+    def test_video_runtime_reports_first_frame_timeout_and_stream_stall(self) -> None:
+        now_ns = [12_000_000_000]
+        runtime = VideoRecorderRuntime(
+            executor=object(),
+            store=self.make_store(),
+            instance_id="camera-health",
+            input_topic="/robot/camera/rgb",
+            encoder="nvv4l2h264enc",
+            target_bitrate_kbps=4000,
+            segment_seconds=60,
+            max_segment_bytes=64 * 1024 * 1024,
+            max_fps=15,
+            queue_frames=8,
+            shutdown_timeout_seconds=15,
+            input_start_timeout_seconds=10,
+            input_stall_timeout_seconds=5,
+            monotonic_ns=lambda: now_ns[0],
+        )
+        runtime._started_ns = 1_000_000_000
+
+        missing = runtime.stats()
+        self.assertTrue(missing["input_failed"])
+        self.assertEqual("input_start_timeout", missing["error_kind"])
+        self.assertEqual("stalled", missing["input_state"])
+
+        runtime.pump.last_received_ns = 11_500_000_000
+        healthy = runtime.stats()
+        self.assertFalse(healthy.get("input_failed", False))
+        self.assertEqual("healthy", healthy["input_state"])
+
+        now_ns[0] = 17_000_000_000
+        stalled = runtime.stats()
+        self.assertTrue(stalled["input_failed"])
+        self.assertEqual("input_stalled", stalled["error_kind"])
+        self.assertGreaterEqual(stalled["last_frame_age_seconds"], 5)
+
+    def test_instance_runtime_error_survives_ledger_reopen(self) -> None:
+        self.ledger.set_instance_state(
+            card_id="videoinspector",
+            instance_id="camera-error",
+            input_topic="/robot/camera/rgb",
+            desired_state="idle",
+            auto_resume=False,
+            session_id="session-error",
+            config={},
+        )
+        self.ledger.set_instance_error(
+            card_id="videoinspector",
+            instance_id="camera-error",
+            runtime_state="degraded",
+            last_error="JPEG input stalled",
+            error_kind="input_stalled",
+        )
+        ledger_path = self.root / "state" / "ledger.sqlite3"
+        self.ledger.close()
+        self.ledger = SegmentLedger(ledger_path)
+
+        saved = self.ledger.list_instance_states(card_id="videoinspector")[0]
+        self.assertEqual("degraded", saved["runtime_state"])
+        self.assertEqual("input_stalled", saved["error_kind"])
+        self.assertEqual("JPEG input stalled", saved["last_error"])
+        self.assertGreater(saved["error_at_ns"], 0)
+
     def test_jetson_pipeline_uses_only_explicit_hardware_codec(self) -> None:
         runtime = VideoRecorderRuntime(
             executor=object(),
@@ -196,8 +278,10 @@ class VideoStorageTest(unittest.TestCase):
         info = restarted.dispatch("videoinspector", {"action": "info", "instance_id": "canvas-camera"})
 
         assert info is not None
-        self.assertEqual("idle", info["state"])
+        self.assertEqual("degraded", info["state"])
         self.assertTrue(info["resume_required"])
+        self.assertEqual("unclean_shutdown", info["error_kind"])
+        self.assertIn("interrupted", info["last_error"])
         restarted.shutdown()
 
 

@@ -40,6 +40,9 @@ class VideoFramePump:
         self.dropped = 0
         self.rate_limited = 0
         self.invalid_format = 0
+        self.invalid_payload = 0
+        self.consecutive_invalid = 0
+        self.last_received_ns = 0
         self.last_error = ""
 
     def start(self) -> None:
@@ -56,13 +59,21 @@ class VideoFramePump:
         message_format = str(getattr(message, "format", "")).lower()
         if "jpeg" not in message_format and "jpg" not in message_format:
             self.invalid_format += 1
+            self.consecutive_invalid += 1
             self.last_error = f"unsupported CompressedImage format: {message_format!r}"
             return False
         jpeg = bytes(getattr(message, "data", b""))
-        if not jpeg:
+        if len(jpeg) < 4 or not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
+            self.invalid_payload += 1
+            self.consecutive_invalid += 1
+            self.last_error = "invalid JPEG payload: missing SOI/EOI markers"
             return False
         self.received += 1
         received_ns = self._clock()
+        self.last_received_ns = received_ns
+        self.consecutive_invalid = 0
+        if self.last_error.startswith(("unsupported CompressedImage", "invalid JPEG payload")):
+            self.last_error = ""
         with self._admission_lock:
             if self._last_accepted_ns and received_ns - self._last_accepted_ns < self._minimum_interval_ns:
                 self.dropped += 1
@@ -120,6 +131,9 @@ class VideoFramePump:
             "dropped": self.dropped,
             "rate_limited": self.rate_limited,
             "invalid_format": self.invalid_format,
+            "invalid_payload": self.invalid_payload,
+            "consecutive_invalid": self.consecutive_invalid,
+            "last_received_ns": self.last_received_ns,
             "queue_depth": self._queue.qsize(),
             "last_error": self.last_error,
         }
@@ -140,6 +154,9 @@ class VideoRecorderRuntime:
         max_fps: float,
         queue_frames: int,
         shutdown_timeout_seconds: float,
+        input_start_timeout_seconds: float = 10.0,
+        input_stall_timeout_seconds: float = 5.0,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         self.executor = executor
         self.store = store
@@ -151,6 +168,10 @@ class VideoRecorderRuntime:
         self.max_segment_bytes = max(1, int(max_segment_bytes))
         self.max_fps = float(max_fps)
         self.shutdown_timeout_seconds = float(shutdown_timeout_seconds)
+        self.input_start_timeout_seconds = float(input_start_timeout_seconds)
+        self.input_stall_timeout_seconds = float(input_stall_timeout_seconds)
+        self._clock = monotonic_ns
+        self._started_ns = 0
         self._node = None
         self._subscription = None
         self._pipeline = None
@@ -167,6 +188,7 @@ class VideoRecorderRuntime:
             self._push_frame,
             queue_frames=queue_frames,
             max_fps=max_fps,
+            monotonic_ns=monotonic_ns,
         )
 
     def _pipeline_description(self) -> str:
@@ -202,6 +224,7 @@ class VideoRecorderRuntime:
     def start(self) -> None:
         if self.executor is None:
             raise RuntimeError("ROS2 executor is required for videoinspector runtime_mode=ros2-gstreamer")
+        self._started_ns = self._clock()
         import gi
 
         gi.require_version("Gst", "1.0")
@@ -398,7 +421,51 @@ class VideoRecorderRuntime:
 
     def stats(self) -> dict[str, Any]:
         stats = self.pump.stats()
+        now_ns = self._clock()
+        last_received_ns = int(stats.get("last_received_ns", 0))
+        if last_received_ns:
+            stats["last_frame_age_seconds"] = max(0.0, (now_ns - last_received_ns) / 1_000_000_000)
+        else:
+            stats["last_frame_age_seconds"] = None
+
+        input_error = ""
+        error_kind = ""
+        if int(stats.get("consecutive_invalid", 0)) >= 3:
+            input_error = str(stats.get("last_error") or "received invalid JPEG frames")
+            error_kind = (
+                "invalid_input_format" if int(stats.get("invalid_format", 0)) > 0
+                else "invalid_jpeg"
+            )
+            stats["input_state"] = "invalid"
+        elif self._started_ns and not last_received_ns:
+            wait_seconds = max(0.0, (now_ns - self._started_ns) / 1_000_000_000)
+            stats["input_state"] = "waiting_first_frame"
+            if wait_seconds >= self.input_start_timeout_seconds:
+                input_error = (
+                    f"no valid JPEG frame received from {self.input_topic} "
+                    f"within {self.input_start_timeout_seconds:.1f}s"
+                )
+                error_kind = "input_start_timeout"
+                stats["input_state"] = "stalled"
+        elif last_received_ns:
+            stats["input_state"] = "healthy"
+            if stats["last_frame_age_seconds"] >= self.input_stall_timeout_seconds:
+                input_error = (
+                    f"JPEG input {self.input_topic} stalled for "
+                    f"{stats['last_frame_age_seconds']:.1f}s"
+                )
+                error_kind = "input_stalled"
+                stats["input_state"] = "stalled"
+        else:
+            stats["input_state"] = "not_started"
+
+        if input_error:
+            stats["input_error"] = input_error
+            stats["error_kind"] = error_kind
+            stats["last_error"] = input_error
+            stats["input_failed"] = True
         if self.last_error:
             stats["last_error"] = self.last_error
+            stats["error_kind"] = "encoder_pipeline"
             stats["pipeline_failed"] = True
         return stats

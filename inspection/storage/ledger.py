@@ -69,6 +69,17 @@ class SegmentLedger:
                 )
                 """
             )
+            instance_columns = {
+                str(row["name"]) for row in self._db.execute("PRAGMA table_info(instance_state)")
+            }
+            for name, definition in (
+                ("runtime_state", "TEXT NOT NULL DEFAULT ''"),
+                ("last_error", "TEXT NOT NULL DEFAULT ''"),
+                ("error_kind", "TEXT NOT NULL DEFAULT ''"),
+                ("error_at_ns", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in instance_columns:
+                    self._db.execute(f"ALTER TABLE instance_state ADD COLUMN {name} {definition}")
 
     @property
     def journal_mode(self) -> str:
@@ -193,6 +204,51 @@ class SegmentLedger:
 
     def list_desired_recording(self, *, card_id: str) -> list[dict]:
         return [row for row in self.list_instance_states(card_id=card_id) if row["desired_state"] == "recording"]
+
+    def set_instance_error(
+        self,
+        *,
+        card_id: str,
+        instance_id: str,
+        runtime_state: str,
+        last_error: str,
+        error_kind: str,
+    ) -> None:
+        error_at_ns = time.time_ns() if last_error else 0
+        with self._lock, self._db:
+            self._db.execute(
+                """
+                INSERT INTO instance_state (
+                    card_id, instance_id, input_topic, desired_state, auto_resume,
+                    session_id, config_json, updated_at_ns,
+                    runtime_state, last_error, error_kind, error_at_ns
+                ) VALUES (?, ?, '', 'idle', 0, '', '{}', ?, ?, ?, ?, ?)
+                ON CONFLICT(card_id, instance_id) DO UPDATE SET
+                    runtime_state=excluded.runtime_state,
+                    last_error=excluded.last_error,
+                    error_kind=excluded.error_kind,
+                    error_at_ns=excluded.error_at_ns,
+                    updated_at_ns=excluded.updated_at_ns
+                """,
+                (
+                    card_id,
+                    instance_id,
+                    time.time_ns(),
+                    runtime_state,
+                    last_error,
+                    error_kind,
+                    error_at_ns,
+                ),
+            )
+
+    def clear_instance_error(self, *, card_id: str, instance_id: str) -> None:
+        self.set_instance_error(
+            card_id=card_id,
+            instance_id=instance_id,
+            runtime_state="",
+            last_error="",
+            error_kind="",
+        )
 
     def list_instance_states(self, *, card_id: str) -> list[dict]:
         with self._lock:
