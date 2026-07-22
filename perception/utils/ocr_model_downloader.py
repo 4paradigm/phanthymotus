@@ -9,7 +9,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 
-MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
+MODEL_FILES = ("det.mnn", "rec.mnn", "keys.txt")
 MAX_BUNDLE_BYTES = 15 * 1024 * 1024
 DOWNLOAD_TIMEOUT = 120  # seconds
 MAX_RETRIES = 3
@@ -78,8 +78,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--filenames", nargs="+", default=list(MODEL_FILES))
     args = parser.parse_args()
-    download_model(args.base_url, args.output_dir)
+    download_model(
+        args.base_url,
+        args.output_dir,
+        filenames=tuple(args.filenames),
+    )
 
 
 if __name__ == "__main__":

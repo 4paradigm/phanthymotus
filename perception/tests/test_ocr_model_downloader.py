@@ -9,6 +9,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 class OCRModelDownloaderTest(unittest.TestCase):
+    def test_default_bundle_contains_only_mnn_detector_and_recognizer(self):
+        from utils.ocr_model_downloader import MODEL_FILES
+
+        self.assertEqual(MODEL_FILES, ("det.mnn", "rec.mnn", "keys.txt"))
+
+    def test_cli_accepts_explicit_model_filenames(self):
+        from utils import ocr_model_downloader
+
+        argv = [
+            "ocr_model_downloader.py",
+            "--base-url",
+            "https://models.example.test/mnn",
+            "--output-dir",
+            "/models/ocr/mnn",
+            "--filenames",
+            "det.mnn",
+            "rec.mnn",
+            "keys.txt",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            ocr_model_downloader, "download_model"
+        ) as download:
+            ocr_model_downloader.main()
+
+        download.assert_called_once_with(
+            "https://models.example.test/mnn",
+            "/models/ocr/mnn",
+            filenames=("det.mnn", "rec.mnn", "keys.txt"),
+        )
+
     def test_downloads_complete_bundle_without_checksum_pins(self):
         from utils.ocr_model_downloader import MODEL_FILES, download_model
 
@@ -45,7 +75,7 @@ class OCRModelDownloaderTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as output_tmp:
             def oversized_download(_url, destination):
-                destination.write_bytes(b"x" * 4_000_000)
+                destination.write_bytes(b"x" * 6_000_000)
 
             with mock.patch(
                 "utils.ocr_model_downloader.download_file",
