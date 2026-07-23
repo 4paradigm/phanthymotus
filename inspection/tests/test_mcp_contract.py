@@ -337,7 +337,23 @@ class InspectionDeployContractTest(unittest.TestCase):
         self.assertIn("isolated inspection Python dependencies PASS", dockerfile)
         self.assertIn("/opt/ros/humble/install/setup.bash", dockerfile)
         self.assertIn("/opt/ros/humble/setup.bash", dockerfile)
+        self.assertIn("COPY deploy/ /deploy/", dockerfile)
         self.assertIn("pyyaml==6.0.2", requirements)
+
+    def test_image_exposes_compose_manifest_for_webui_deployment(self) -> None:
+        dockerfile = (INSPECTION_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        service = (INSPECTION_ROOT / "deploy" / "service.yml").read_text(encoding="utf-8")
+        build_script = (
+            INSPECTION_ROOT.parent / "deploy" / "build_inspection.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("COPY deploy/ /deploy/", dockerfile)
+        self.assertIn("inspection:", service)
+        self.assertIn("container_name: embodied-inspection", service)
+        self.assertIn("image: __IMAGE__", service)
+        self.assertIn("/inspection:${TAG}", build_script)
+        self.assertIn('\\"category\\":\\"inspection\\"', build_script)
+        self.assertIn('\\"registryImage\\":\\"inspection\\"', build_script)
 
 
 if __name__ == "__main__":

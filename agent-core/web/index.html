@@ -303,12 +303,21 @@
     </div>
     <div class="deploy-tabs">
       <button class="deploy-tab active" data-tab="my-services">我的服务</button>
-      <button class="deploy-tab" data-tab="marketplace">驱动市场</button>
+      <button class="deploy-tab" data-tab="marketplace">服务市场</button>
     </div>
     <div class="deploy-tab-pane active" id="pane-my-services"></div>
     <div class="deploy-tab-pane" id="pane-marketplace">
       <div class="marketplace-search-bar">
-        <input id="marketplace-search" type="search" placeholder="搜索驱动…" autocomplete="off" spellcheck="false">
+        <label class="marketplace-type-filter">
+          <span>服务类型</span>
+          <select id="marketplace-category-select" aria-label="服务类型">
+            <option value="all">全部</option>
+            <option value="driver">Driver</option>
+            <option value="perception">Perception</option>
+            <option value="inspection">Inspector</option>
+          </select>
+        </label>
+        <input id="marketplace-search" type="search" placeholder="搜索服务…" autocomplete="off" spellcheck="false">
       </div>
       <div class="marketplace-filters" id="marketplace-filters"></div>
       <div class="marketplace-grid" id="marketplace-grid"></div>

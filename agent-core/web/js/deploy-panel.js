@@ -3,7 +3,7 @@
  *
  * 双 Tab 设计：
  *   Tab 1 「我的服务」— 管理已安装的服务（升级/停止/启动/卸载）
- *   Tab 2 「驱动市场」— 浏览和安装新驱动（flat grid + filter chips）
+ *   Tab 2 「服务市场」— 按类型浏览和安装 Driver / Perception / Inspector
  */
 
 let _overlay  = null;
@@ -18,6 +18,7 @@ let _pending = {};
 
 let _activeTab = 'my-services';
 let _activeFilter = null; // null = all providers
+let _activeServiceType = 'all';
 
 export function initDeployPanel() {
   _overlay = document.getElementById('deploy-overlay');
@@ -33,6 +34,11 @@ export function initDeployPanel() {
 
   // Marketplace search
   document.getElementById('marketplace-search').addEventListener('input', _renderMarketplace);
+  document.getElementById('marketplace-category-select').addEventListener('change', (event) => {
+    _activeServiceType = event.target.value || 'all';
+    _activeFilter = null;
+    _renderMarketplace();
+  });
 
   // Channel selector
   const channelSelect = document.getElementById('deploy-channel-select');
@@ -164,6 +170,7 @@ function _renderMyServices() {
     ...(_catalog.core || []).map(it => ({ ...it, _cat: 'core' })),
     ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
+    ...(_catalog.inspection || []).map(it => ({ ...it, _cat: 'inspection' })),
   ];
 
   // Only show items that have actually been deployed (not just synced from catalog)
@@ -177,7 +184,7 @@ function _renderMyServices() {
   if (deployed.length === 0) {
     container.innerHTML = `<div class="svc-empty">
       <div class="svc-empty-title">暂无已安装服务</div>
-      <div class="svc-empty-hint">前往「驱动市场」安装驱动</div>
+      <div class="svc-empty-hint">前往「服务市场」安装服务</div>
     </div>`;
     return;
   }
@@ -351,20 +358,29 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-//  TAB 2: 驱动市场
+//  TAB 2: 服务市场
 // ══════════════════════════════════════════════════════════════════════════
 
 function _renderMarketplace() {
   const q = (document.getElementById('marketplace-search')?.value || '').trim().toLowerCase();
 
-  // Merge driver + perception for marketplace (core is managed in My Services only)
-  const allItems = [
+  // Core upgrades stay in My Services. All independently deployed services
+  // are available here, including the standalone Inspection image.
+  let allItems = [
     ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
+    ...(_catalog.inspection || []).map(it => ({ ...it, _cat: 'inspection' })),
   ];
+  if (_activeServiceType !== 'all') {
+    allItems = allItems.filter(it => it._cat === _activeServiceType);
+  }
 
-  // Build provider list for filter chips
-  const providers = [...new Set(allItems.map(it => it.provider || it.name || 'Other').filter(Boolean))];
+  // Provider chips apply only when the catalog declares a real provider.
+  // Perception/Inspection services should not create one chip per service name.
+  const providers = [...new Set(allItems.map(it => it.provider || '').filter(Boolean))];
+  if (_activeFilter && !providers.includes(_activeFilter)) {
+    _activeFilter = null;
+  }
 
   // Render filter chips
   const filtersEl = document.getElementById('marketplace-filters');
@@ -382,14 +398,15 @@ function _renderMarketplace() {
   // Filter items
   let filtered = allItems;
   if (_activeFilter) {
-    filtered = filtered.filter(it => (it.provider || it.name || 'Other') === _activeFilter);
+    filtered = filtered.filter(it => it.provider === _activeFilter);
   }
   if (q) {
     filtered = filtered.filter(it => {
       const model = (it.model || '').toLowerCase();
       const provider = (it.provider || '').toLowerCase();
       const name = (it.name || '').toLowerCase();
-      return model.includes(q) || provider.includes(q) || name.includes(q);
+      const category = _categoryLabel(it._cat).toLowerCase();
+      return model.includes(q) || provider.includes(q) || name.includes(q) || category.includes(q);
     });
   }
 
@@ -397,8 +414,8 @@ function _renderMarketplace() {
   const gridEl = document.getElementById('marketplace-grid');
   if (filtered.length === 0) {
     gridEl.innerHTML = `<div class="svc-empty">
-      <div class="svc-empty-title">未找到驱动</div>
-      <div class="svc-empty-hint">尝试其他搜索词或切换更新通道</div>
+      <div class="svc-empty-title">未找到服务</div>
+      <div class="svc-empty-hint">尝试其他搜索词、服务类型或更新通道</div>
     </div>`;
     return;
   }
@@ -451,6 +468,7 @@ function _mpCardHTML(item) {
   const imageBase = item.full_repo || item.image;
   const desc = item.description || '';
   const fullName = item.name || label;
+  const categoryLabel = _categoryLabel(cat);
 
   const versionOpts = tags.map(t => {
     const fullImg = t.imageRef || (imageBase + ':' + t.tag);
@@ -469,9 +487,10 @@ function _mpCardHTML(item) {
       : `<span class="mp-action-btn mp-no-version">暂无版本</span>`;
 
   return `
-    <div class="mp-card" data-driver-id="${driverId}" data-name="${_escAttr(fullName)}" data-desc="${_escAttr(desc)}" data-provider="${_escAttr(provider)}">
+    <div class="mp-card" data-driver-id="${driverId}" data-name="${_escAttr(fullName)}" data-desc="${_escAttr(desc)}" data-provider="${_escAttr(provider)}" data-category-label="${categoryLabel}">
       <div class="mp-card-header">
         <span class="mp-card-name">${label}</span>
+        <span class="mp-card-category ${cat}">${categoryLabel}</span>
         ${provider ? `<span class="mp-card-provider">${provider}</span>` : ''}
       </div>
       ${desc ? `<div class="mp-card-desc">${_escHTML(desc)}</div>` : ''}
@@ -568,6 +587,7 @@ function _showDriverDetail(card) {
   const name = card.dataset.name || '';
   const desc = card.dataset.desc || '';
   const provider = card.dataset.provider || '';
+  const categoryLabel = card.dataset.categoryLabel || '';
   const driverId = card.dataset.driverId || '';
   const s = _statuses[driverId];
   const isInstalled = s && (s.running || s.last_deploy);
@@ -599,6 +619,7 @@ function _showDriverDetail(card) {
       <button class="mp-detail-back">← 返回</button>
       <div class="mp-detail-header">
         <div class="mp-detail-title">${name}</div>
+        ${categoryLabel ? `<span class="mp-card-category">${categoryLabel}</span>` : ''}
         ${provider ? `<div class="mp-detail-provider">${provider}</div>` : ''}
         ${isInstalled ? '<span class="mp-installed-badge" style="margin-top:8px;display:inline-block">已安装</span>' : ''}
       </div>
@@ -682,6 +703,14 @@ function _driverIdForItem(item, category) {
   return item.image;
 }
 
+function _categoryLabel(category) {
+  if (category === 'driver') return 'Driver';
+  if (category === 'perception') return 'Perception';
+  if (category === 'inspection') return 'Inspector';
+  if (category === 'core') return 'Core';
+  return 'Service';
+}
+
 function _channelLabel(channel) {
   if (channel === 'ga') return 'Stable';
   if (channel === 'release') return 'Release';
@@ -705,7 +734,7 @@ function _syncFooter() {
   const count  = Object.keys(_pending).length;
   if (count > 0) {
     footer.style.display = '';
-    hint.textContent = `已选 ${count} 个驱动`;
+    hint.textContent = `已选 ${count} 个服务`;
   } else {
     footer.style.display = 'none';
   }

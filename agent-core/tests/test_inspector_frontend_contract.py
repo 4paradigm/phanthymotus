@@ -11,12 +11,27 @@ class InspectorFrontendContractTest(unittest.TestCase):
     def test_inspection_service_has_mcp_endpoint(self) -> None:
         source = (CORE_ROOT / "src/api/drivers.py").read_text(encoding="utf-8")
         self.assertIn("'inspection': {'port': 15671, 'mcp_url': 'http://localhost:15671/mcp'}", source)
+        self.assertIn("catalog.get('inspection', [])", source)
+        self.assertIn("container.get_archive('/deploy/service.yml')", source)
 
     def test_sidebar_renders_inspection_category(self) -> None:
         source = (CORE_ROOT / "web/js/sidebar.js").read_text(encoding="utf-8")
         self.assertIn("m.category === 'inspection'", source)
         self.assertIn("_buildInspectionSection", source)
         self.assertIn("'inspector'", source)
+
+    def test_deploy_service_marketplace_has_inspector_selector(self) -> None:
+        html = (CORE_ROOT / "web/index.html").read_text(encoding="utf-8")
+        source = (CORE_ROOT / "web/js/deploy-panel.js").read_text(encoding="utf-8")
+
+        self.assertIn('data-tab="marketplace">服务市场</button>', html)
+        self.assertIn('id="marketplace-category-select"', html)
+        self.assertIn('<option value="inspection">Inspector</option>', html)
+        self.assertIn("...(_catalog.inspection || [])", source)
+        self.assertIn("_activeServiceType = event.target.value || 'all'", source)
+        self.assertIn("it._cat === _activeServiceType", source)
+        self.assertIn("if (category === 'inspection') return 'Inspector'", source)
+        self.assertIn("已选 ${count} 个服务", source)
 
     def test_canvas_has_explicit_inspector_branch(self) -> None:
         source = (CORE_ROOT / "web/js/canvas.js").read_text(encoding="utf-8")

@@ -1,6 +1,6 @@
 # Inspection Stack
 
-独立的音视频采集卡片宿主。当前分支已完成 Dashboard 编排、Audio Inspector 持久化采集、Video Inspector 硬件编码与 MP4 分片、COS 校验上传、断点恢复和本地滚动清理。基础采集、双条件分片、磁盘指标与 COS 已在上海 G1 真机通过；v3 存储目录改为无标签的人类可读层级，待新镜像真机复验。
+独立的音视频采集卡片宿主。当前分支已完成 Dashboard 编排、Audio Inspector 持久化采集、Video Inspector 硬件编码与 MP4 分片、COS 校验上传、断点恢复和本地滚动清理。基础采集、双条件分片、磁盘指标、COS 和 v3 人类可读目录均已在上海 G1 真机通过。
 
 ## 画布使用门禁
 
@@ -39,6 +39,35 @@
 - 音频默认按 `segment_seconds=60` 或 `max_segment_mb=4` 先到者切成 WAV。
 - 视频默认按 `segment_seconds=60` 或 `max_segment_mb=64` 先到者切成 H.264 MP4。
 - `flush` 和 `stop` 都会强制结束当前分片；第一版不按 VAD、画面变化或动作语义切片。
+
+## 独立镜像与 WebUI 部署
+
+Inspection 不合并进 Agent Core。它与 Driver、Perception 一样单独构建、发布和运行：
+
+- 镜像仓库名：`inspection`；
+- Resource Center 分类：`inspection`；
+- Compose 服务名：`inspection`；
+- 容器名：`embodied-inspection`；
+- MCP 端口：`15671`；
+- 镜像内必须包含 `/deploy/service.yml`，Agent Core 从这里读取宿主设备、Jetson 库、数据目录、账本和只读凭证挂载，然后通过 `docker compose` 安装。
+
+构建本地镜像：
+
+```bash
+bash deploy/build_inspection.sh --mirror tencent
+```
+
+复制 `deploy/.env.example` 为 `deploy/.env` 并配置 registry 后，同一命令会推送独立镜像；再配置 `RESOURCE_CENTER_API_KEY` 时会把镜像以 `category=inspection` 注册到 Resource Center。凭证文件不进入镜像或 git。
+
+发布后在 WebUI 点击“部署服务”：
+
+1. 打开“服务市场”；
+2. 在“服务类型”下拉框选择 `Inspector`；
+3. 选择 `Inspection Stack` 的目标版本并安装；
+4. 安装完成后，在“我的服务”确认 Inspection 独立显示为运行中；
+5. 回到画布，从 Inspector 分组拖入 Audio Inspector 或 Video Inspector，再连线和配置。
+
+部署 Inspector 不替换 Agent Core，也不把采集代码复制进 Core；Core 只负责服务目录、容器生命周期、画布编排和 MCP 转发。
 
 ## 本地运行
 
@@ -105,6 +134,7 @@ curl -s http://127.0.0.1:15671/mcp \
 ```bash
 python3 -m unittest discover -s inspection/tests -v
 python3 -m unittest discover -s agent-core/tests -v
+node --check agent-core/web/js/deploy-panel.js
 node --check agent-core/web/js/sidebar.js
 node --check agent-core/web/js/canvas.js
 node --check agent-core/web/js/flow-view.js
@@ -157,7 +187,7 @@ node --check agent-core/web/js/flow-view.js
 
 ## G1 部署后验收
 
-1. 确认 `embodied-inspection` 运行，`curl http://127.0.0.1:15671/health` 返回 `ok=true`。
+1. 在“部署服务 → 服务市场”把“服务类型”切到 `Inspector`，安装独立 Inspection 镜像；确认“我的服务”出现 Inspection，`embodied-inspection` 运行，且 `curl http://127.0.0.1:15671/health` 返回 `ok=true`。
 2. 先在未配置、未连线状态把两张 Inspector 拖入 Dashboard，确认卡片可添加且项目启动被明确拒绝。
 3. 验证错误 format 无法连线；再分别连接 `/phanthymotus_g1_driver/mic/audio` 和由 External Camera `start` 返回的 `/phanthymotus_g1_driver/ext_camera/<card-id>/rgb`，不得用内置 `camera_rgb` 的 topic 代替影石验收。
 4. 配置 `storage_mode=local_and_cos`、`cos_region`、`cos_bucket`、`cos_prefix`、`credential_profile`；确认界面没有 `robot_id`、`source_device_id` 或旧 `device_id` 输入框，保存后返回自动 `robot_id`、identity source 和 `upload_validation=verified`。

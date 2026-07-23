@@ -2121,13 +2121,17 @@ html, body {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   TAB 2: 驱动市场
+   TAB 2: 服务市场
 ══════════════════════════════════════════════════════════════════════════ */
 .marketplace-search-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
   margin-bottom: 12px;
 }
 .marketplace-search-bar input {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   padding: 8px 12px;
   font-size: 13px;
   border: 1px solid var(--border);
@@ -2139,6 +2143,28 @@ html, body {
 }
 .marketplace-search-bar input:focus { border-color: var(--accent); }
 .marketplace-search-bar input::placeholder { color: var(--text-dim); }
+.marketplace-type-filter {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 0 0 142px;
+}
+.marketplace-type-filter > span {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.marketplace-type-filter select {
+  width: 100%;
+  padding: 7px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text);
+  outline: none;
+  cursor: pointer;
+}
+.marketplace-type-filter select:focus { border-color: var(--accent); }
 
 .marketplace-filters {
   display: flex;
@@ -2211,6 +2237,21 @@ html, body {
   padding: 2px 8px;
   white-space: nowrap;
   flex-shrink: 0;
+}
+.mp-card-category {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .3px;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-radius: 4px;
+  padding: 2px 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.mp-card-category.inspection {
+  color: #0788B5;
+  background: rgba(7, 136, 181, .10);
 }
 .mp-card-desc {
   font-size: 10.5px;
@@ -5285,8 +5326,13 @@ html, body {
   .mp-card-name { font-size: 13px; }
   .mp-card-desc { font-size: 10px; -webkit-line-clamp: 2; }
   .mp-card-provider { font-size: 9px; padding: 1px 6px; }
+  .mp-card-category { font-size: 8px; padding: 1px 5px; }
   .mp-action-btn { min-height: 34px; padding: 6px 12px; font-size: 11px; }
+  .marketplace-search-bar { align-items: stretch; }
   .marketplace-search-bar input { min-height: 40px; font-size: 14px; }
+  .marketplace-type-filter { flex-basis: 118px; }
+  .marketplace-type-filter > span { display: none; }
+  .marketplace-type-filter select { min-height: 40px; font-size: 12px; }
   .marketplace-filters { gap: 6px; }
   .mp-chip { min-height: 32px; padding: 6px 12px; font-size: 12px; }
 

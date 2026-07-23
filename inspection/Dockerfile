@@ -39,6 +39,7 @@ RUN python3 -m pip install --no-cache-dir --ignore-installed \
 ENV PYTHONPATH=/opt/inspection-python:${PYTHONPATH}
 
 COPY . /work/
+COPY deploy/ /deploy/
 
 EXPOSE 15671
 CMD ["/bin/bash", "-c", "if [ -f /opt/ros/humble/install/setup.bash ]; then source /opt/ros/humble/install/setup.bash; else source /opt/ros/humble/setup.bash; fi && source /ros_ws/install/setup.bash && python3 /work/main.py"]
