@@ -19,7 +19,7 @@ from .adapter import CHUNK_BYTES, SAMPLE_RATE, TTSAdapter, build_adapter
 
 
 log = logging.getLogger(__name__)
-FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "5"))
+FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "40"))
 if not 0 <= FRAME_INTERVAL_MS <= 100:
     raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 100")
 
@@ -181,13 +181,14 @@ class _Vits2TTSNode(Node):
                     log.info(
                         "[vits2_tts_trt] server delivery: bytes=%d frames=%d "
                         "ttft=%.3fs elapsed=%.3fs audio=%.3fs rtf=%.4f "
-                        "frame_interval_ms=%d",
+                        "chunk_bytes=%d frame_interval_ms=%d",
                         total_bytes,
                         frames_sent,
                         first_published_at - task_started,
                         elapsed,
                         audio_seconds,
                         elapsed / audio_seconds,
+                        CHUNK_BYTES,
                         FRAME_INTERVAL_MS,
                     )
             except Exception:

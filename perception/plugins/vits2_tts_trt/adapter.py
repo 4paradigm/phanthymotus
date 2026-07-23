@@ -14,7 +14,7 @@ from .runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
 
 
 SAMPLE_RATE = 16000
-CHUNK_BYTES = 3200
+CHUNK_BYTES = int(os.getenv("MIX_VITS_CHUNK_BYTES", "6400"))
 MAX_CHUNK_TOKENS = int(os.getenv("MIX_VITS_MAX_TEXT_TOKENS", "64"))
 CHUNK_PAUSE_MS = int(os.getenv("MIX_VITS_CHUNK_PAUSE_MS", "0"))
 MODEL_CONFIG = os.getenv("MIX_VITS_CONFIG_PATH", "/models/vits2-mix/config.json")
@@ -27,6 +27,8 @@ WARMUP_CASES = (
 )
 log = logging.getLogger(__name__)
 
+if CHUNK_BYTES <= 0 or CHUNK_BYTES % 2:
+    raise ValueError("MIX_VITS_CHUNK_BYTES must be a positive even number")
 if not 0 <= CHUNK_PAUSE_MS <= 1000:
     raise ValueError("MIX_VITS_CHUNK_PAUSE_MS must be between 0 and 1000")
 
