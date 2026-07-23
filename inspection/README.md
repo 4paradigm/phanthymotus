@@ -19,6 +19,7 @@
 - Jetson 解码/编码管线已进入终止错误时，`stop` 先中止管线以解除阻塞的 `appsrc push-buffer`，丢弃尚未编码的有界队列，并将未完成 MP4 保留为 `CORRUPT` 诊断文件。
 - 收尾失败不得继续回报 `recording`：订阅已停止时返回 `stop_error`/`recording=false`，Dashboard 显示“采集已停止，但当前分片收尾异常”并保留错误详情。
 - Video Inspector 启动后 10 秒内没有合法 JPEG 首帧时报 `input_start_timeout`；正常收帧后连续 5 秒断流时报 `input_stalled`；缺失 JPEG SOI/EOI 标记时报 `invalid_jpeg`。错误持久化到 ledger，重启后仍在卡片显示，不再只呈现“正在采集”。
+- Agent Core 打开图片 WebSocket 时会刷新从未收帧或已超过 10 秒未收帧的 ROS2 primary subscription；刷新后 10 秒仍没有 JPEG 时返回明确的数据流错误并关闭预览，不再只返回 ping 造成空白窗口。
 - COS uploader 是独立长驻 worker；点击“停止智能控制”不再产生新数据，但会继续补传 ledger backlog。
 - 配置通过后发生的断网或权限变化不会删除本地数据，也不会隐式切换为 `local_ring`；卡片会显示“云端上传失败”、错误原因、待上传量和重试间隔，本地采集可在磁盘水位允许时继续。
 - 异常退出后启动时先恢复 `.part` 和 ledger。`auto_resume_after_reboot=false` 时保持 `idle` 并返回 `resume_required=true`，不会偷偷继续采集。
@@ -161,7 +162,7 @@ node --check agent-core/web/js/flow-view.js
 4. 配置 `storage_mode=local_and_cos`、`cos_region`、`cos_bucket`、`cos_prefix`、`credential_profile`；确认界面没有 `robot_id`、`source_device_id` 或旧 `device_id` 输入框，保存后返回自动 `robot_id`、identity source 和 `upload_validation=verified`。
 5. 故意填写一个格式正确但不存在的 bucket，确认配置保存被拒绝且界面明确显示“bucket 不存在或与 region 不匹配”；恢复正确 bucket 后再继续。
 6. 点击“开启智能控制”，确认两张卡片均进入“正在采集”，并能看到本地用量、剩余可录时间和磁盘水位。
-7. 点击 External Camera 的“查看数据流”，确认 WebSocket 先返回 topic metadata，再连续返回 SOI=`FFD8`、EOI=`FFD9` 的完整 JPEG；未启动时必须明确显示“数据源尚未启动”，不能静默无反应。
+7. 点击 External Camera 的“查看数据流”，确认 WebSocket 先返回 topic metadata，再连续返回 SOI=`FFD8`、EOI=`FFD9` 的完整 JPEG；动态 publisher 重建后 Core 必须自动刷新 ROS2 subscription，刷新后 10 秒仍无帧则明确报错；未启动时必须显示“数据源尚未启动”，不能静默无反应。
 8. 使用较小验收值验证按时长分片，再单独使用较小 `max_segment_mb` 验证按大小分片；停止项目时当前段必须被 finalize。
 9. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
 10. 检查本地与 COS 路径都严格为 `inspection/<robot-id>/<audio|video>/<source-device-id>/YYYY-MM-DD/<local-time+0800>--<sequence>`；不得出现 `robot=`、`device=`、`date=` 或带验收时间戳的顶层 prefix，两者相对路径一致，metadata 的 identity source、size 和 SHA-256 与实际文件一致。

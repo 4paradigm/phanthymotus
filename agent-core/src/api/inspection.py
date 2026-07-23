@@ -40,12 +40,23 @@ _active_primary_subs: set[str] = set()
 # Last frame cache per topic (for initial snapshot push on new WS connect)
 _last_frame: dict[str, bytes] = {}
 
+_PRIMARY_STALE_SECONDS = 10.0
+_IMAGE_STREAM_TIMEOUT_SECONDS = 10.0
+
 
 # ── Status helpers ─────────────────────────────────────────────────────────────
 
+def _has_recent_frame(topic: str, now: float | None = None) -> bool:
+    last_seen = ros2_bridge.get_last_seen(topic)
+    if last_seen <= 0:
+        return False
+    current = time.time() if now is None else now
+    return current - last_seen < _PRIMARY_STALE_SECONDS
+
+
 def _topic_status(topic: str) -> str:
     if topic in _active_primary_subs:
-        if time.time() - ros2_bridge.get_last_seen(topic) < 10:
+        if _has_recent_frame(topic):
             return 'active'
         return 'online'
     if topic in ros2_bridge.get_dds_topics():
@@ -94,15 +105,30 @@ def _push_factory(topic: str):
     return _push
 
 
-def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
-    """Start primary ROS2 subscription only if not already active. Once started, stays forever."""
-    if topic in _active_primary_subs:
-        return  # already subscribed, no DDS discovery delay
-    _active_primary_subs.add(topic)  # mark immediately to prevent race
+def _ensure_primary_sub(
+    topic: str,
+    fmt: str,
+    loop: asyncio.AbstractEventLoop,
+    *,
+    force: bool = False,
+) -> bool:
+    """Start or refresh a primary ROS2 subscription.
+
+    Dynamic publishers can be destroyed and recreated while Agent Core keeps
+    running. Fast DDS may leave the long-lived subscription without samples
+    even though a fresh one can discover the publisher immediately, so a
+    stale WebSocket stream is allowed to rebuild this subscription in place.
+    """
+    already_active = topic in _active_primary_subs
+    if already_active and not force:
+        return False
 
     key = f'__primary__#{topic}'
     ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
-    print(f'[inspection] started primary sub: {topic}')
+    _active_primary_subs.add(topic)
+    action = 'refreshed' if already_active else 'started'
+    print(f'[inspection] {action} primary sub: {topic}')
+    return True
 
 
 # ── Internal API (called by mcp_manage directly) ───────────────────────────────
@@ -219,8 +245,12 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
     fmt = info['format']
     loop = asyncio.get_event_loop()
 
-    # Ensure DDS subscription is active (no-op if already running)
-    _ensure_primary_sub(topic, fmt, loop)
+    # A dynamic camera publisher may have been recreated while Core retained
+    # its original subscription. Refresh a never-seen or stale subscription
+    # before opening the user-facing stream.
+    had_recent_frame = _has_recent_frame(topic)
+    recovery_started_at = time.monotonic() if not had_recent_frame else None
+    _ensure_primary_sub(topic, fmt, loop, force=not had_recent_frame)
 
     await websocket.send_text(json.dumps({
         'type':   'meta',
@@ -230,7 +260,11 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
     }))
 
     # Push cached snapshot immediately (so page refresh shows current map)
+    # Never present an old camera frame as proof that a rebuilt subscription
+    # is live. Non-image streams retain the historical snapshot behaviour.
     snapshot = _last_frame.get(topic)
+    if fmt == 'image/jpeg' and not had_recent_frame:
+        snapshot = None
     if snapshot:
         if fmt in ('sensor/pointcloud', 'sensor/mapping'):
             await websocket.send_bytes(snapshot)
@@ -241,13 +275,13 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
 
     q: asyncio.Queue = asyncio.Queue(maxsize=4096)
     _topic_queues.setdefault(topic, []).append(q)
-
     try:
         while True:
             try:
                 data = await asyncio.wait_for(q.get(), timeout=5.0)
                 if data is None:
                     break  # signal to stop
+                recovery_started_at = None
                 if fmt in ('sensor/pointcloud', 'sensor/mapping'):
                     await websocket.send_bytes(data)
                 elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
@@ -255,6 +289,21 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
                 else:
                     await websocket.send_bytes(data)
             except asyncio.TimeoutError:
+                if fmt == 'image/jpeg':
+                    now = time.monotonic()
+                    if recovery_started_at is None:
+                        _ensure_primary_sub(topic, fmt, loop, force=True)
+                        recovery_started_at = now
+                    elif now - recovery_started_at >= _IMAGE_STREAM_TIMEOUT_SECONDS:
+                        await websocket.send_text(json.dumps({
+                            'type': 'error',
+                            'message': (
+                                '图像 topic 已注册，但 10 秒内未收到 JPEG；'
+                                'Agent Core 已自动重建 ROS2 订阅，请检查上游相机数据流'
+                            ),
+                        }))
+                        await websocket.close()
+                        break
                 try:
                     await websocket.send_text(json.dumps({'type': 'ping', 'ts': time.time()}))
                 except Exception:

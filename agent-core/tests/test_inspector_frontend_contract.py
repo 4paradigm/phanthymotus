@@ -45,6 +45,17 @@ class InspectorFrontendContractTest(unittest.TestCase):
         self.assertIn("数据源尚未启动：请停止后重新开启智能控制", source)
         self.assertIn("无法连接数据流", source)
 
+    def test_image_websocket_refreshes_stale_ros_subscription(self) -> None:
+        source = (CORE_ROOT / "src/api/inspection.py").read_text(encoding="utf-8")
+        self.assertIn("def _has_recent_frame(", source)
+        self.assertIn("force: bool = False", source)
+        self.assertIn("force=not had_recent_frame", source)
+        self.assertIn("_ensure_primary_sub(topic, fmt, loop, force=True)", source)
+        self.assertIn("if fmt == 'image/jpeg' and not had_recent_frame:", source)
+        self.assertIn("recovery_started_at = now", source)
+        self.assertIn("10 秒内未收到 JPEG", source)
+        self.assertIn("Agent Core 已自动重建 ROS2 订阅", source)
+
     def test_core_restart_clears_stale_project_running_flag(self) -> None:
         config_source = (CORE_ROOT / "src/api/config.py").read_text(encoding="utf-8")
         start_source = (CORE_ROOT / "src/start.py").read_text(encoding="utf-8")
