@@ -125,7 +125,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
                 middle = (low + high) // 2
                 position = positions[middle]
                 prefix_ids = self._engine._get_text_ids(
-                    text[:position].strip(), normalized=True
+                    text[:position], normalized=True
                 )
                 if len(prefix_ids[0]) <= MAX_CHUNK_TOKENS:
                     best = position
@@ -146,8 +146,8 @@ class Vits2TensorRTAdapter(TTSAdapter):
             split_at = longest_fitting(fallback)
         if split_at is None:
             raise ValueError("Unable to split text within TensorRT profile")
-        left, right = text[:split_at].strip(), text[split_at:].strip()
-        if not left or not right:
+        left, right = text[:split_at], text[split_at:]
+        if not left.strip() or not right.strip():
             raise ValueError("Unable to split text within TensorRT profile")
         yield from self._iter_unit_chunks(left)
         yield from self._iter_unit_chunks(right)
@@ -158,8 +158,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
         units = _PUNCTUATION_UNIT_RE.findall(text)
         chunks = []
         for unit in units:
-            unit = unit.strip()
-            if not unit:
+            if not unit.strip():
                 continue
             chunks.extend(self._iter_unit_chunks(unit))
 
@@ -186,7 +185,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
         return b"".join(self.synthesize_stream(text))
 
     def synthesize_stream(self, text: str):
-        text = re.sub(r"\s+", " ", text).strip()
+        text = text.strip()
         if not text:
             raise ValueError("TTS text must not be empty")
         from .runtime.frontend.cleaner import normalize_text_mix
