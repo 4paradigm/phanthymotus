@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from storage.layout import card_storage_slug, detect_device_id, instance_storage_slug
+from storage.layout import (
+    card_storage_slug,
+    detect_robot_identity,
+    detect_source_identity,
+    instance_storage_slug,
+)
 
 
 _SHARED_PROPERTIES = {
@@ -40,13 +45,17 @@ _SHARED_PROPERTIES = {
         "description": "Full Tencent COS bucket name.",
     },
     "cos_prefix": {
-        "type": "string", "default": "inspection-data", "scope": "shared",
+        "type": "string", "default": "inspection", "scope": "shared",
         "x-show-when": {"storage_mode": "local_and_cos"},
         "description": "Object key prefix without leading or trailing slash.",
     },
+    "robot_id": {
+        "type": "string", "scope": "shared", "uiHidden": True, "readOnly": True,
+        "description": "Automatically detected robot identity and never accepted from card input.",
+    },
     "device_id": {
         "type": "string", "scope": "shared", "uiHidden": True, "readOnly": True,
-        "description": "Automatically detected hardware identity; legacy input is ignored.",
+        "description": "Deprecated robot host identity alias; legacy input is ignored.",
     },
     "upload_enabled": {
         "type": "boolean", "default": True, "scope": "shared",
@@ -106,11 +115,15 @@ class InspectorPlugin:
         self.display_name = display_name
         self.input_format = input_format
         self.input_description = input_description
+        self.modality = "audio" if input_format.startswith("audio/") else "video"
         self._lock = threading.RLock()
         self._instances: dict[str, RecordingInstance] = {}
         self._instance_config: dict[str, dict[str, Any]] = {}
-        self.device_id = detect_device_id()
+        self.robot_identity = detect_robot_identity()
+        self.robot_id = self.robot_identity.value
+        self.device_id = self.robot_id
         self._shared_config = self._defaults(_SHARED_PROPERTIES)
+        self._shared_config["robot_id"] = self.robot_id
         self._shared_config["device_id"] = self.device_id
         self._instance_properties = copy.deepcopy(instance_properties)
         self._instance_defaults = self._defaults(self._instance_properties)
@@ -124,6 +137,7 @@ class InspectorPlugin:
 
     def _build_tool(self) -> dict[str, Any]:
         config_properties = copy.deepcopy(_SHARED_PROPERTIES)
+        config_properties["robot_id"]["default"] = self.robot_id
         config_properties["device_id"]["default"] = self.device_id
         config_properties.update(copy.deepcopy(self._instance_properties))
         return {
@@ -165,6 +179,7 @@ class InspectorPlugin:
         }
         mode = str(config.get("storage_mode", "local_and_cos"))
         config["upload_enabled"] = mode == "local_and_cos"
+        config["robot_id"] = self.robot_id
         config["device_id"] = self.device_id
         return config
 
@@ -189,9 +204,10 @@ class InspectorPlugin:
     def _apply_config(self, args: dict[str, Any]) -> dict[str, Any]:
         args = dict(args)
         ignored: list[str] = []
-        if "device_id" in args:
-            args.pop("device_id")
-            ignored.append("device_id")
+        for identity_field in ("robot_id", "device_id", "source_device_id"):
+            if identity_field in args:
+                args.pop(identity_field)
+                ignored.append(identity_field)
         if "storage_mode" in args:
             expected_upload = args["storage_mode"] == "local_and_cos"
             if "upload_enabled" in args and bool(args["upload_enabled"]) != expected_upload:
@@ -243,7 +259,9 @@ class InspectorPlugin:
             "instance_id": instance_id or None,
             "applied": sorted(applied),
             "ignored": ignored,
-            "device_id": self.device_id,
+            "robot_id": self.robot_id,
+            "robot_identity_source": self.robot_identity.source,
+            "robot_identity_is_manufacturer_serial": self.robot_identity.manufacturer_serial,
             "runtime_mode": self._runtime_mode,
         }
 
@@ -323,6 +341,10 @@ class InspectorPlugin:
         storage_mode = runtime.get("storage_mode", self._effective_config(instance_id).get("storage_mode"))
         upload_backlog = int(runtime.get("upload_backlog", 0))
         upload_error = str(runtime.get("upload_last_error") or runtime.get("upload_service_error") or "")
+        source_identity = (
+            detect_source_identity(topic, self.modality, robot_identity=self.robot_identity)
+            if topic else None
+        )
         if storage_mode == "local_ring":
             upload_state = "disabled"
             upload_error = ""
@@ -340,7 +362,21 @@ class InspectorPlugin:
             "type": "inspector",
             "state": state,
             "instance_id": instance_id,
-            "device_id": self.device_id,
+            "robot_id": self.robot_id,
+            "robot_identity_source": self.robot_identity.source,
+            "robot_identity_is_manufacturer_serial": self.robot_identity.manufacturer_serial,
+            "device_id": source_identity.value if source_identity else "",
+            "source_device_id": source_identity.value if source_identity else "",
+            "source_identity_source": source_identity.source if source_identity else "",
+            "source_identity_is_manufacturer_serial": (
+                source_identity.manufacturer_serial if source_identity else False
+            ),
+            "storage_layout_version": "2.0",
+            "storage_path_template": (
+                f"robot={self.robot_id}/{self.modality}/device={source_identity.value}/"
+                "date=YYYY-MM-DD/<local-time+0800>--<sequence>"
+                if source_identity else ""
+            ),
             "storage_card_slug": card_storage_slug(self.card_id),
             "storage_instance_slug": instance_storage_slug(instance_id, topic),
             "session_id": instance.session_id if instance else None,
@@ -424,6 +460,9 @@ class InspectorPlugin:
                     "name": self.display_name,
                     "card_id": self.card_id,
                     "type": "inspector",
+                    "robot_id": self.robot_id,
+                    "robot_identity_source": self.robot_identity.source,
+                    "robot_identity_is_manufacturer_serial": self.robot_identity.manufacturer_serial,
                     "state": "recording" if running else "idle",
                     "instances": len(self._instances),
                     "recording_instances": running,

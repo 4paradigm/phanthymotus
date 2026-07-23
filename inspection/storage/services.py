@@ -41,7 +41,7 @@ class DurableServices:
     def _signature(config: dict[str, Any]) -> str:
         keys = (
             "storage_mode", "upload_enabled", "credential_profile", "cos_region", "cos_bucket",
-            "cos_prefix", "device_id", "upload_concurrency",
+            "cos_prefix", "robot_id", "device_id", "upload_concurrency",
             "multipart_threshold_mb", "multipart_stale_hours", "retry_max_seconds",
         )
         return repr(tuple((key, config.get(key)) for key in keys))

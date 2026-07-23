@@ -32,6 +32,10 @@ class InspectionContractTest(unittest.TestCase):
             storage_mode = tool["configSchema"]["properties"]["storage_mode"]
             self.assertEqual(["local_ring", "local_and_cos"], storage_mode["enum"])
             self.assertEqual("local_and_cos", storage_mode["default"])
+            self.assertEqual("inspection", tool["configSchema"]["properties"]["cos_prefix"]["default"])
+            robot_id = tool["configSchema"]["properties"]["robot_id"]
+            self.assertTrue(robot_id["uiHidden"])
+            self.assertTrue(robot_id["readOnly"])
             device_id = tool["configSchema"]["properties"]["device_id"]
             self.assertTrue(device_id["uiHidden"])
             self.assertTrue(device_id["readOnly"])
@@ -139,18 +143,38 @@ class InspectionContractTest(unittest.TestCase):
                 "upload_enabled": True,
             })
 
-    def test_device_id_is_automatic_and_legacy_input_is_ignored(self) -> None:
+    def test_robot_and_source_device_id_are_automatic_and_user_input_is_ignored(self) -> None:
         plugin = next(item for item in self.bundle._plugins if item.card_id == "audioinspector")
         configured = self.bundle.dispatch("audioinspector", {
             "action": "config",
             "storage_mode": "local_ring",
+            "robot_id": "user-forged-robot",
             "device_id": "user-forged-device",
+            "source_device_id": "user-forged-source",
         })
 
+        self.assertIn("robot_id", configured["ignored"])
         self.assertIn("device_id", configured["ignored"])
-        self.assertEqual(plugin.device_id, configured["device_id"])
+        self.assertIn("source_device_id", configured["ignored"])
+        self.assertEqual(plugin.robot_id, configured["robot_id"])
+        self.assertEqual(plugin.robot_identity.source, configured["robot_identity_source"])
+        self.assertEqual(plugin.robot_id, plugin._effective_config("")["robot_id"])
         self.assertEqual(plugin.device_id, plugin._effective_config("")["device_id"])
-        self.assertNotEqual("user-forged-device", plugin.device_id)
+        self.assertNotEqual("user-forged-robot", plugin.robot_id)
+
+        info = self.bundle.dispatch("audioinspector", {
+            "action": "info",
+            "instance_id": "card-auto-id",
+            "input_topic": "/robot/mic/audio",
+        })
+        self.assertEqual(
+            f"{plugin.robot_id}-builtin-mic-array",
+            info["source_device_id"],
+        )
+        self.assertEqual("robot-builtin-composite", info["source_identity_source"])
+        self.assertEqual(info["source_device_id"], info["device_id"])
+        self.assertEqual("2.0", info["storage_layout_version"])
+        self.assertIn("/audio/device=", info["storage_path_template"])
 
     def test_invalid_cos_bucket_format_is_rejected_before_remote_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "lowercase Tencent COS bucket"):

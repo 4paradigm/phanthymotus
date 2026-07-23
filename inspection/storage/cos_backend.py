@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from .ledger import SegmentLedger
-from .layout import card_storage_slug
 
 
 log = logging.getLogger(__name__)
@@ -220,8 +219,10 @@ class COSUploadCoordinator:
         self.card_id = card_id
         self.config = dict(config)
         self.bucket = str(config.get("cos_bucket", ""))
-        self.prefix = str(config.get("cos_prefix", "inspection-data")).strip("/")
+        self.prefix = str(config.get("cos_prefix", "inspection")).strip("/")
+        self.robot_id = str(config.get("robot_id") or config.get("device_id") or "unknown-robot")
         self.device_id = str(config.get("device_id", "unknown"))
+        self.modality = "audio" if card_id == "audioinspector" else "video"
         self.region = str(config.get("cos_region", "ap-beijing"))
         if not self.bucket:
             raise ValueError("cos_bucket is required")
@@ -244,6 +245,14 @@ class COSUploadCoordinator:
         self.last_error = ""
         self.last_retry_delay_seconds = 0.0
 
+    def _legacy_device_id_for_path(self, path: Path) -> str:
+        metadata_path = path if path.suffix == ".json" else path.with_suffix(".json")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return self.device_id
+        return str(metadata.get("device_id") or self.device_id)
+
     def start(self) -> None:
         if self._threads:
             return
@@ -263,8 +272,20 @@ class COSUploadCoordinator:
 
     def _object_key(self, path: Path) -> str:
         relative = path.relative_to(self.data_root)
+        if (
+            len(relative.parts) >= 5
+            and relative.parts[0].startswith("robot=")
+            and relative.parts[1] in {"audio", "video"}
+            and relative.parts[2].startswith("device=")
+            and relative.parts[3].startswith("date=")
+        ):
+            return "/".join(filter(None, (self.prefix, *relative.parts)))
         if len(relative.parts) >= 4 and relative.parts[2].startswith("utc-hour="):
-            return "/".join(filter(None, (self.prefix, self.device_id, *relative.parts)))
+            return "/".join(filter(None, (
+                self.prefix,
+                self._legacy_device_id_for_path(path),
+                *relative.parts,
+            )))
         if len(relative.parts) >= 5:
             card_id, instance_id, date, hour = relative.parts[:4]
             try:
@@ -273,7 +294,7 @@ class COSUploadCoordinator:
                 raise ValueError(f"unexpected inspection date directory: {date}") from exc
             return "/".join(filter(None, (
                 self.prefix,
-                self.device_id,
+                self._legacy_device_id_for_path(path),
                 card_id,
                 instance_id,
                 compact_date,
@@ -352,7 +373,11 @@ class COSUploadCoordinator:
         try:
             self.multipart_aborted = int(cleanup(
                 bucket=self.bucket,
-                prefix="/".join(filter(None, (self.prefix, self.device_id, card_storage_slug(self.card_id)))),
+                prefix="/".join(filter(None, (
+                    self.prefix,
+                    f"robot={self.robot_id}",
+                    self.modality,
+                ))),
                 stale_hours=int(self.config.get("multipart_stale_hours", 24)),
             ))
             self.multipart_cleanup_error = ""
@@ -377,12 +402,17 @@ class COSUploadCoordinator:
 
     def test_upload(self) -> dict[str, Any]:
         started = time.monotonic()
-        body = json.dumps({"ok": True, "device_id": self.device_id, "card_id": self.card_id}).encode("utf-8")
+        body = json.dumps({
+            "ok": True,
+            "robot_id": self.robot_id,
+            "card_id": self.card_id,
+            "modality": self.modality,
+        }).encode("utf-8")
         sha256 = hashlib.sha256(body).hexdigest()
         key = "/".join(filter(None, (
             self.prefix,
-            self.device_id,
-            card_storage_slug(self.card_id),
+            f"robot={self.robot_id}",
+            self.modality,
             "_health",
             f"{time.time_ns()}.json",
         )))

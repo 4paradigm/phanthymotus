@@ -12,12 +12,15 @@ from typing import Any
 
 from .ledger import SegmentLedger
 from .layout import (
+    HardwareIdentity,
     card_storage_slug,
+    detect_source_identity,
     instance_storage_slug,
+    local_date_partition,
     safe_component,
     segment_basename,
     segment_start_ns_from_name,
-    utc_hour_partition,
+    storage_relative_directory,
 )
 from .models import SegmentRecord
 
@@ -67,7 +70,9 @@ class AudioSegmentWriter:
         instance_id: str,
         input_topic: str,
         session_id: str,
-        device_id: str,
+        device_id: str | None = None,
+        robot_identity: HardwareIdentity | None = None,
+        source_identity: HardwareIdentity | None = None,
         segment_seconds: int,
         max_segment_bytes: int = 4 * 1024 * 1024,
         sample_rate: int = 16000,
@@ -80,7 +85,17 @@ class AudioSegmentWriter:
         self.instance_id = instance_id
         self.input_topic = input_topic
         self.session_id = session_id
-        self.device_id = device_id
+        self.robot_identity = robot_identity or HardwareIdentity(
+            value=str(device_id or "unknown-robot"),
+            source="legacy-device-id",
+            manufacturer_serial=False,
+        )
+        self.source_identity = source_identity or detect_source_identity(
+            input_topic,
+            "audio",
+            robot_identity=self.robot_identity,
+        )
+        self.device_id = self.source_identity.value
         self.storage_card_slug = card_storage_slug(card_id)
         self.storage_instance_slug = instance_storage_slug(instance_id, input_topic)
         self.segment_seconds = int(segment_seconds)
@@ -104,7 +119,13 @@ class AudioSegmentWriter:
     def _begin_segment(self, source_stamp_ns: int) -> None:
         wall_start_ns = time.time_ns()
         utc = datetime.fromtimestamp(wall_start_ns / 1_000_000_000, tz=timezone.utc)
-        directory = self.data_root / self.storage_card_slug / self.storage_instance_slug / utc_hour_partition(wall_start_ns)
+        relative_directory = storage_relative_directory(
+            self.robot_identity,
+            self.source_identity,
+            "audio",
+            wall_start_ns,
+        )
+        directory = self.data_root / relative_directory
         directory.mkdir(parents=True, exist_ok=True)
         basename = segment_basename(wall_start_ns, self._sequence, "wav")
         self._sequence += 1
@@ -116,15 +137,23 @@ class AudioSegmentWriter:
         self._source_stamp_start_ns = source_stamp_ns if source_stamp_ns > 0 else 0
         self._source_stamp_end_ns = self._source_stamp_start_ns
         self._open_info = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "segment_id": f"seg-{uuid.uuid4().hex}",
             "kind": "audio",
             "device_id": self.device_id,
+            "robot_id": self.robot_identity.value,
+            "robot_identity_source": self.robot_identity.source,
+            "robot_identity_is_manufacturer_serial": self.robot_identity.manufacturer_serial,
+            "source_device_id": self.source_identity.value,
+            "source_identity_source": self.source_identity.source,
+            "source_identity_is_manufacturer_serial": self.source_identity.manufacturer_serial,
             "card_id": self.card_id,
             "instance_id": self.instance_id,
             "storage_card_slug": self.storage_card_slug,
             "storage_instance_slug": self.storage_instance_slug,
-            "storage_time_partition": utc_hour_partition(wall_start_ns),
+            "storage_modality": "audio",
+            "storage_relative_directory": relative_directory.as_posix(),
+            "storage_time_partition": local_date_partition(wall_start_ns),
             "input_topic": self.input_topic,
             "format": "audio/pcm-16k",
             "ros_type": "audio_msgs/msg/AudioChunk",
@@ -282,21 +311,50 @@ class AudioSegmentWriter:
         else:
             wall_start_ns = segment_start_ns_from_name(final_path)
             partition = final_path.parent.name
-            if partition.startswith("utc-hour="):
+            if partition.startswith("date=") and final_path.parents[1].name.startswith("device="):
+                storage_instance = "unknown"
+                storage_card = "audio-inspector"
+                source_device_id = final_path.parents[1].name[len("device="):]
+                robot_name = final_path.parents[3].name
+                robot_id = robot_name[len("robot="):] if robot_name.startswith("robot=") else "unknown"
+                schema_version = "2.0"
+                storage_relative_directory_value = Path(
+                    robot_name,
+                    final_path.parents[2].name,
+                    final_path.parents[1].name,
+                    partition,
+                ).as_posix()
+            elif partition.startswith("utc-hour="):
                 storage_instance = final_path.parents[1].name
                 storage_card = final_path.parents[2].name
+                source_device_id = "unknown"
+                robot_id = "unknown"
+                schema_version = "1.0"
+                storage_relative_directory_value = str(final_path.parent)
             else:
                 storage_instance = final_path.parents[2].name
                 storage_card = final_path.parents[3].name
+                source_device_id = "unknown"
+                robot_id = "unknown"
+                schema_version = "1.0"
+                storage_relative_directory_value = str(final_path.parent)
             open_info = {
-                "schema_version": "1.0",
+                "schema_version": schema_version,
                 "segment_id": f"seg-recovered-{uuid.uuid4().hex}",
                 "kind": "audio",
-                "device_id": "unknown",
+                "device_id": source_device_id,
+                "robot_id": robot_id,
+                "robot_identity_source": "recovered-from-path",
+                "robot_identity_is_manufacturer_serial": False,
+                "source_device_id": source_device_id,
+                "source_identity_source": "recovered-from-path",
+                "source_identity_is_manufacturer_serial": False,
                 "card_id": "audioinspector",
                 "instance_id": "unknown",
                 "storage_card_slug": storage_card,
                 "storage_instance_slug": storage_instance,
+                "storage_modality": "audio",
+                "storage_relative_directory": storage_relative_directory_value,
                 "storage_time_partition": partition,
                 "input_topic": "",
                 "format": "audio/pcm-16k",

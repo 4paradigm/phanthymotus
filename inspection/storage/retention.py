@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -124,7 +125,26 @@ class RetentionSweeper:
             self.data_root / safe_component(self.card_id) / safe_component(instance_id),
             self.data_root / card_storage_slug(self.card_id) / instance_storage_slug(instance_id, input_topic),
         ]
+        modality = "audio" if self.card_id == "audioinspector" else "video"
+        roots.extend(self.data_root.glob(f"robot=*/{modality}/device=*"))
         return list(dict.fromkeys(roots))
+
+    @staticmethod
+    def _v2_corrupt_instance_id(corrupt_path: Path) -> str:
+        for candidate in (
+            Path(str(corrupt_path) + ".json"),
+            Path(str(corrupt_path)[:-len(".part.corrupt")] + ".open.json"),
+        ):
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            open_state = payload.get("open_state") if isinstance(payload, dict) else None
+            if isinstance(open_state, dict):
+                payload = open_state
+            if isinstance(payload, dict) and payload.get("instance_id"):
+                return str(payload["instance_id"])
+        return ""
 
     def _purge_expired_corrupt(
         self,
@@ -147,6 +167,13 @@ class RetentionSweeper:
         removed_files = 0
         pruned_dirs = 0
         for corrupt_path in sorted(candidates):
+            try:
+                relative = corrupt_path.relative_to(self.data_root)
+            except ValueError:
+                continue
+            if relative.parts and relative.parts[0].startswith("robot="):
+                if self._v2_corrupt_instance_id(corrupt_path) != instance_id:
+                    continue
             related = [path for path in self._corrupt_group(corrupt_path) if path.exists()]
             if not related:
                 continue
@@ -180,6 +207,8 @@ class RetentionSweeper:
             self.data_root / safe_component(self.card_id),
             self.data_root / card_storage_slug(self.card_id),
         }
+        modality = "audio" if self.card_id == "audioinspector" else "video"
+        card_roots.update(self.data_root.glob(f"robot=*/{modality}"))
         for card_root in card_roots:
             if not card_root.exists():
                 continue

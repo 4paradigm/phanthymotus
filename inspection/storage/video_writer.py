@@ -12,7 +12,15 @@ from typing import Any, Callable
 
 from .atomic_writer import _sha256, _write_json_temp, _write_open_state, fsync_directory
 from .ledger import SegmentLedger
-from .layout import card_storage_slug, instance_storage_slug, segment_basename, utc_hour_partition
+from .layout import (
+    HardwareIdentity,
+    card_storage_slug,
+    detect_source_identity,
+    instance_storage_slug,
+    local_date_partition,
+    segment_basename,
+    storage_relative_directory,
+)
 from .models import SegmentRecord
 
 
@@ -28,7 +36,9 @@ class VideoFragmentStore:
         instance_id: str,
         input_topic: str,
         session_id: str,
-        device_id: str,
+        device_id: str | None = None,
+        robot_identity: HardwareIdentity | None = None,
+        source_identity: HardwareIdentity | None = None,
         encoder: str,
         target_bitrate_kbps: int,
     ) -> None:
@@ -38,7 +48,17 @@ class VideoFragmentStore:
         self.instance_id = instance_id
         self.input_topic = input_topic
         self.session_id = session_id
-        self.device_id = device_id
+        self.robot_identity = robot_identity or HardwareIdentity(
+            value=str(device_id or "unknown-robot"),
+            source="legacy-device-id",
+            manufacturer_serial=False,
+        )
+        self.source_identity = source_identity or detect_source_identity(
+            input_topic,
+            "video",
+            robot_identity=self.robot_identity,
+        )
+        self.device_id = self.source_identity.value
         self.storage_card_slug = card_storage_slug(card_id)
         self.storage_instance_slug = instance_storage_slug(instance_id, input_topic)
         self.encoder = encoder
@@ -53,21 +73,35 @@ class VideoFragmentStore:
     def create_location(self, fragment_id: int, *, first_source_stamp_ns: int = 0) -> str:
         wall_start_ns = time.time_ns()
         utc = datetime.fromtimestamp(wall_start_ns / 1_000_000_000, tz=timezone.utc)
-        directory = self.data_root / self.storage_card_slug / self.storage_instance_slug / utc_hour_partition(wall_start_ns)
+        relative_directory = storage_relative_directory(
+            self.robot_identity,
+            self.source_identity,
+            "video",
+            wall_start_ns,
+        )
+        directory = self.data_root / relative_directory
         directory.mkdir(parents=True, exist_ok=True)
         sequence = self._sequence
         self._sequence += 1
         part_path = directory / f"{segment_basename(wall_start_ns, sequence, 'mp4')}.part"
         open_info = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "segment_id": f"seg-{uuid.uuid4().hex}",
             "kind": "video",
             "device_id": self.device_id,
+            "robot_id": self.robot_identity.value,
+            "robot_identity_source": self.robot_identity.source,
+            "robot_identity_is_manufacturer_serial": self.robot_identity.manufacturer_serial,
+            "source_device_id": self.source_identity.value,
+            "source_identity_source": self.source_identity.source,
+            "source_identity_is_manufacturer_serial": self.source_identity.manufacturer_serial,
             "card_id": self.card_id,
             "instance_id": self.instance_id,
             "storage_card_slug": self.storage_card_slug,
             "storage_instance_slug": self.storage_instance_slug,
-            "storage_time_partition": utc_hour_partition(wall_start_ns),
+            "storage_modality": "video",
+            "storage_relative_directory": relative_directory.as_posix(),
+            "storage_time_partition": local_date_partition(wall_start_ns),
             "input_topic": self.input_topic,
             "format": "video/h264",
             "source_format": "image/jpeg",

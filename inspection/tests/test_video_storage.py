@@ -13,6 +13,7 @@ sys.path.insert(0, str(INSPECTION_ROOT))
 
 from plugins.videoinspector import VideoInspectorPlugin  # noqa: E402
 from plugins.videoinspector.runtime import VideoFramePump, VideoRecorderRuntime  # noqa: E402
+from storage.layout import HardwareIdentity  # noqa: E402
 from storage.ledger import SegmentLedger  # noqa: E402
 from storage.models import SegmentState  # noqa: E402
 from storage.video_writer import VideoFragmentStore, reconcile_video_store  # noqa: E402
@@ -36,7 +37,8 @@ class VideoStorageTest(unittest.TestCase):
             instance_id="camera-1",
             input_topic="/robot/camera/rgb",
             session_id="session-1",
-            device_id="g1-sh",
+            robot_identity=HardwareIdentity("g1-sh-sn123", "unitree-robot-sn", True),
+            source_identity=HardwareIdentity("realsense-254343063760", "usb-manufacturer-serial", True),
             encoder="nvv4l2h264enc",
             target_bitrate_kbps=4000,
         )
@@ -61,12 +63,17 @@ class VideoStorageTest(unittest.TestCase):
         self.assertEqual(SegmentState.FINALIZED.value, record["state"])
         self.assertEqual(str(final_path), record["local_path"])
         relative = final_path.relative_to(self.root / "data")
-        self.assertEqual("video-inspector", relative.parts[0])
-        self.assertTrue(relative.parts[1].startswith("camera-rgb--"))
-        self.assertRegex(relative.parts[2], r"^utc-hour=\d{4}-\d{2}-\d{2}T\d{2}Z$")
-        self.assertRegex(relative.name, r"^\d{8}T\d{6}\.\d{9}Z--\d{6}\.mp4$")
+        self.assertEqual("robot=g1-sh-sn123", relative.parts[0])
+        self.assertEqual("video", relative.parts[1])
+        self.assertEqual("device=realsense-254343063760", relative.parts[2])
+        self.assertRegex(relative.parts[3], r"^date=\d{4}-\d{2}-\d{2}$")
+        self.assertRegex(relative.name, r"^\d{8}T\d{6}\.\d{9}\+0800--\d{6}\.mp4$")
         self.assertEqual("videoinspector", metadata["card_id"])
         self.assertEqual("camera-1", metadata["instance_id"])
+        self.assertEqual("2.0", metadata["schema_version"])
+        self.assertEqual("g1-sh-sn123", metadata["robot_id"])
+        self.assertEqual("realsense-254343063760", metadata["source_device_id"])
+        self.assertEqual("usb-manufacturer-serial", metadata["source_identity_source"])
 
     def test_valid_interrupted_fragment_can_be_recovered(self) -> None:
         store = self.make_store()

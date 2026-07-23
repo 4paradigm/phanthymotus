@@ -16,7 +16,7 @@ sys.path.insert(0, str(INSPECTION_ROOT))
 from storage.atomic_writer import AudioSegmentWriter  # noqa: E402
 from storage.cos_backend import COSCredentials, COSUploadCoordinator, TencentCOSBackend, load_cos_credentials  # noqa: E402
 from storage.ledger import SegmentLedger  # noqa: E402
-from storage.layout import instance_storage_slug  # noqa: E402
+from storage.layout import HardwareIdentity  # noqa: E402
 from storage.models import SegmentRecord, SegmentState  # noqa: E402
 from storage.retention import RetentionSweeper  # noqa: E402
 from storage.services import DurableServices  # noqa: E402
@@ -82,7 +82,12 @@ class COSAndRetentionTest(unittest.TestCase):
             instance_id=instance_id,
             input_topic="/robot/mic/audio",
             session_id="session-1",
-            device_id="g1-sh",
+            robot_identity=HardwareIdentity("unitree-g1-sn123", "unitree-robot-sn", True),
+            source_identity=HardwareIdentity(
+                "unitree-g1-sn123-builtin-mic-array",
+                "robot-builtin-composite",
+                False,
+            ),
             segment_seconds=1,
             sample_rate=8,
             channels=1,
@@ -99,8 +104,9 @@ class COSAndRetentionTest(unittest.TestCase):
             card_id="audioinspector",
             config={
                 "cos_bucket": "inspection-1250000000",
-                "cos_prefix": "inspection-data",
-                "device_id": "sh-g1",
+                "cos_prefix": "inspection",
+                "robot_id": "unitree-g1-sn123",
+                "device_id": "jetson-legacy",
                 "upload_concurrency": 1,
             },
             backend=backend,
@@ -118,9 +124,12 @@ class COSAndRetentionTest(unittest.TestCase):
         self.assertEqual(SegmentState.UPLOADED_VERIFIED.value, record["state"])
         self.assertEqual(2, len(backend.upload_calls))
         self.assertTrue(record["object_key"].endswith(".wav"))
-        self.assertIn("/sh-g1/audio-inspector/mic-audio--", "/" + record["object_key"])
+        self.assertIn(
+            "/robot=unitree-g1-sn123/audio/device=unitree-g1-sn123-builtin-mic-array/date=",
+            "/" + record["object_key"],
+        )
         media_path = Path(record["local_path"])
-        expected_key = "/".join(("inspection-data", "sh-g1", *media_path.relative_to(self.data_root).parts))
+        expected_key = "/".join(("inspection", *media_path.relative_to(self.data_root).parts))
         self.assertEqual(expected_key, record["object_key"])
 
         self.ledger.transition(metadata["segment_id"], SegmentState.FINALIZED)
@@ -172,7 +181,8 @@ class COSAndRetentionTest(unittest.TestCase):
                     "storage_mode": "local_and_cos",
                     "cos_bucket": "missing-1250000000",
                     "cos_region": "ap-beijing",
-                    "cos_prefix": "inspection-data",
+                    "cos_prefix": "inspection",
+                    "robot_id": "jetson-test",
                     "device_id": "jetson-test",
                     "upload_concurrency": 1,
                 },
@@ -193,8 +203,54 @@ class COSAndRetentionTest(unittest.TestCase):
         key = self.make_uploader(FakeCOSBackend())._object_key(legacy)
 
         self.assertEqual(
-            "inspection-data/sh-g1/audioinspector/mic-1/20260722/09/123_000000.wav",
+            "inspection/jetson-legacy/audioinspector/mic-1/20260722/09/123_000000.wav",
             key,
+        )
+
+    def test_v1_readable_directory_keeps_v1_cos_key(self) -> None:
+        v1 = (
+            self.data_root
+            / "audio-inspector"
+            / "mic-audio--12345678"
+            / "utc-hour=2026-07-22T09Z"
+            / "20260722T090000.000000000Z--000000.wav"
+        )
+        v1.parent.mkdir(parents=True)
+        v1.write_bytes(b"v1")
+
+        key = self.make_uploader(FakeCOSBackend())._object_key(v1)
+
+        self.assertEqual(
+            "inspection/jetson-legacy/audio-inspector/mic-audio--12345678/"
+            "utc-hour=2026-07-22T09Z/20260722T090000.000000000Z--000000.wav",
+            key,
+        )
+
+    def test_v1_readable_directory_uses_original_metadata_device_id(self) -> None:
+        v1 = (
+            self.data_root
+            / "audio-inspector"
+            / "mic-audio--12345678"
+            / "utc-hour=2026-07-22T09Z"
+            / "20260722T090000.000000000Z--000000.wav"
+        )
+        v1.parent.mkdir(parents=True)
+        v1.write_bytes(b"v1")
+        v1.with_suffix(".json").write_text(
+            '{"device_id":"jetson-original"}',
+            encoding="utf-8",
+        )
+        uploader = self.make_uploader(FakeCOSBackend())
+
+        self.assertEqual(
+            "inspection/jetson-original/audio-inspector/mic-audio--12345678/"
+            "utc-hour=2026-07-22T09Z/20260722T090000.000000000Z--000000.wav",
+            uploader._object_key(v1),
+        )
+        self.assertEqual(
+            "inspection/jetson-original/audio-inspector/mic-audio--12345678/"
+            "utc-hour=2026-07-22T09Z/20260722T090000.000000000Z--000000.json",
+            uploader._object_key(v1.with_suffix(".json")),
         )
 
     def test_testupload_writes_and_verifies_health_object(self) -> None:
@@ -202,7 +258,10 @@ class COSAndRetentionTest(unittest.TestCase):
         result = self.make_uploader(backend).test_upload()
 
         self.assertTrue(result["verified"])
-        self.assertIn("/_health/", "/" + result["object_key"])
+        self.assertIn(
+            "/robot=unitree-g1-sn123/audio/_health/",
+            "/" + result["object_key"],
+        )
         self.assertEqual(1, len(backend.upload_calls))
 
     def test_tencent_sdk_receives_full_custom_metadata_header(self) -> None:
@@ -341,15 +400,22 @@ class COSAndRetentionTest(unittest.TestCase):
         instance_id = "card-mrvusdyxxjln"
         input_topic = "/phanthymotus_g1_driver/ext_camera/card-mrvusdyxxjln/rgb"
         instance_root = (
-            self.data_root / "video-inspector" / instance_storage_slug(instance_id, input_topic)
-            / "utc-hour=2026-07-22T09Z"
+            self.data_root
+            / "robot=unitree-g1-sn123"
+            / "video"
+            / "device=insta360-2e1a4c06-port-1-3"
+            / "date=2026-07-22"
         )
         instance_root.mkdir(parents=True)
-        corrupt = instance_root / "20260722T090000.000000000Z--000000.mp4.part.corrupt"
+        corrupt = instance_root / "20260722T170000.000000000+0800--000000.mp4.part.corrupt"
         reason = Path(str(corrupt) + ".json")
-        open_state = instance_root / "20260722T090000.000000000Z--000000.mp4.open.json"
-        for path in (corrupt, reason, open_state):
-            path.write_text("diagnostic", encoding="utf-8")
+        open_state = instance_root / "20260722T170000.000000000+0800--000000.mp4.open.json"
+        corrupt.write_text("diagnostic", encoding="utf-8")
+        reason.write_text(
+            '{"state":"CORRUPT","open_state":{"instance_id":"card-mrvusdyxxjln"}}',
+            encoding="utf-8",
+        )
+        open_state.write_text('{"instance_id":"card-mrvusdyxxjln"}', encoding="utf-8")
         now_ns = time.time_ns()
         expired_ns = now_ns - 2 * 3600 * 1_000_000_000
         for path in (corrupt, reason, open_state):

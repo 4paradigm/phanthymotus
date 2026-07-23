@@ -62,7 +62,10 @@ class AudioInspectorPlugin(InspectorPlugin):
                 card_id=self.card_id,
                 on_critical=self._handle_critical,
             )
-            self._services.restore_latest(overrides={"device_id": self.device_id})
+            self._services.restore_latest(overrides={
+                "robot_id": self.robot_id,
+                "device_id": self.device_id,
+            })
             self._restore_desired_instances()
 
     def _apply_config(self, args: dict[str, Any], *, validate_remote: bool = True) -> dict[str, Any]:
@@ -128,7 +131,7 @@ class AudioInspectorPlugin(InspectorPlugin):
             instance_id=instance.instance_id,
             input_topic=instance.input_topic,
             session_id=instance.session_id,
-            device_id=str(config.get("device_id", "unknown")),
+            robot_identity=self.robot_identity,
             segment_seconds=int(config.get("segment_seconds", 60)),
             max_segment_bytes=int(float(config.get("max_segment_mb", 4)) * 1024 * 1024),
         )
