@@ -16,7 +16,10 @@ services:
       - CONTAINER_NAME=phanthy-motus-agent-core-1
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+      # Dynamic camera JPEGs have proven unreliable over FastDDS SHM across
+      # G1 containers. Core is a monitoring/control-plane consumer, so prefer
+      # the host-network UDP path; publishers may still advertise SHM + UDP.
+      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
     logging:
       driver: local
       options:

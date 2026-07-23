@@ -63,6 +63,12 @@ class InspectorFrontendContractTest(unittest.TestCase):
         self.assertIn("core['project_running'] = False", config_source)
         self.assertIn("api.config.reset_project_running_after_restart()", start_source)
 
+    def test_core_uses_udp_for_cross_container_dynamic_images(self) -> None:
+        source = (CORE_ROOT / "deploy/docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn("network_mode: host", source)
+        self.assertIn("FASTDDS_BUILTIN_TRANSPORTS=UDPv4", source)
+        self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS=DEFAULT", source)
+
     def test_flow_view_uses_category_instead_of_topic_direction(self) -> None:
         source = (CORE_ROOT / "web/js/flow-view.js").read_text(encoding="utf-8")
         self.assertIn("mcp.category === 'inspection'", source)

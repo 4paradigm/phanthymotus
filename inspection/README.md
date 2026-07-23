@@ -20,6 +20,7 @@
 - 收尾失败不得继续回报 `recording`：订阅已停止时返回 `stop_error`/`recording=false`，Dashboard 显示“采集已停止，但当前分片收尾异常”并保留错误详情。
 - Video Inspector 启动后 10 秒内没有合法 JPEG 首帧时报 `input_start_timeout`；正常收帧后连续 5 秒断流时报 `input_stalled`；缺失 JPEG SOI/EOI 标记时报 `invalid_jpeg`。错误持久化到 ledger，重启后仍在卡片显示，不再只呈现“正在采集”。
 - Agent Core 打开图片 WebSocket 时会刷新从未收帧或已超过 10 秒未收帧的 ROS2 primary subscription；刷新后 10 秒仍没有 JPEG 时返回明确的数据流错误并关闭预览，不再只返回 ping 造成空白窗口。
+- 上海 G1 实测 Core 能跨容器接收 1024-byte 音频帧和状态消息，但 FastDDS SHM 无法稳定接收动态 External Camera JPEG；因此 Core 固定使用宿主机 `UDPv4` 传输保障 WebUI 预览，Driver/Inspection 的数据面配置不变。
 - COS uploader 是独立长驻 worker；点击“停止智能控制”不再产生新数据，但会继续补传 ledger backlog。
 - 配置通过后发生的断网或权限变化不会删除本地数据，也不会隐式切换为 `local_ring`；卡片会显示“云端上传失败”、错误原因、待上传量和重试间隔，本地采集可在磁盘水位允许时继续。
 - 异常退出后启动时先恢复 `.part` 和 ledger。`auto_resume_after_reboot=false` 时保持 `idle` 并返回 `resume_required=true`，不会偷偷继续采集。
