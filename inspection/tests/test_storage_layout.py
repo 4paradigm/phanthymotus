@@ -41,16 +41,16 @@ class StorageLayoutTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             serial = Path(tempdir) / "device-tree" / "serial-number"
             serial.parent.mkdir()
-            serial.write_bytes(b"1424525045894\x00")
+            serial.write_bytes(b"0000000000000\x00")
             self.assertEqual(
-                "jetson-1424525045894",
+                "jetson-0000000000000",
                 detect_device_id(serial_paths=(serial,)),
             )
 
             identity = detect_robot_identity(serial_paths=(
                 (serial, "jetson-module-serial", "jetson", False),
             ))
-            self.assertEqual("jetson-1424525045894", identity.value)
+            self.assertEqual("jetson-0000000000000", identity.value)
             self.assertEqual("jetson-module-serial", identity.source)
             self.assertFalse(identity.manufacturer_serial)
 
@@ -63,8 +63,8 @@ class StorageLayoutTest(unittest.TestCase):
             (dji / "idProduct").write_text("4011\n")
             (dji / "manufacturer").write_text("DJI Technology Co., Ltd.\n")
             (dji / "product").write_text("Wireless Mic Rx\n")
-            (dji / "serial").write_text("XSP12345678B\n")
-            robot = HardwareIdentity("jetson-1424525045894", "jetson-module-serial", False)
+            (dji / "serial").write_text("TESTMIC000001\n")
+            robot = HardwareIdentity("jetson-0000000000000", "jetson-module-serial", False)
 
             microphone = detect_source_identity(
                 "/phanthymotus_g1_driver/ext_mic/card_abc/audio",
@@ -72,7 +72,7 @@ class StorageLayoutTest(unittest.TestCase):
                 robot_identity=robot,
                 usb_root=usb_root,
             )
-            self.assertEqual("dji-xsp12345678b", microphone.value)
+            self.assertEqual("dji-testmic000001", microphone.value)
             self.assertEqual("usb-manufacturer-serial", microphone.source)
             self.assertTrue(microphone.manufacturer_serial)
 
@@ -107,7 +107,7 @@ class StorageLayoutTest(unittest.TestCase):
                 (device / "idProduct").write_text("4c06\n")
                 (device / "manufacturer").write_text("Insta360\n")
                 (device / "product").write_text(product + "\n")
-            robot = HardwareIdentity("jetson-1424525045894", "jetson-module-serial", False)
+            robot = HardwareIdentity("jetson-0000000000000", "jetson-module-serial", False)
 
             camera = detect_source_identity(
                 "/phanthymotus_g1_driver/ext_camera/card_mrvxi910w7ye/rgb",
@@ -116,12 +116,12 @@ class StorageLayoutTest(unittest.TestCase):
                 usb_root=usb_root,
             )
 
-            self.assertTrue(camera.value.startswith("jetson-1424525045894-ext-camera-rgb-"))
+            self.assertTrue(camera.value.startswith("jetson-0000000000000-ext-camera-rgb-"))
             self.assertEqual("topic-composite-fallback", camera.source)
             self.assertFalse(camera.manufacturer_serial)
 
     def test_builtin_microphone_uses_robot_scoped_composite_identity(self) -> None:
-        robot = HardwareIdentity("jetson-1424525045894", "jetson-module-serial", False)
+        robot = HardwareIdentity("jetson-0000000000000", "jetson-module-serial", False)
 
         source = detect_source_identity(
             "/phanthymotus_g1_driver/mic/audio",
@@ -130,12 +130,12 @@ class StorageLayoutTest(unittest.TestCase):
             usb_root=Path("/path/that/does/not/exist"),
         )
 
-        self.assertEqual("jetson-1424525045894-builtin-mic-array", source.value)
+        self.assertEqual("jetson-0000000000000-builtin-mic-array", source.value)
         self.assertEqual("robot-builtin-composite", source.source)
 
     def test_v3_layout_uses_plain_robot_modality_device_and_local_date(self) -> None:
         wall_ns = int(datetime(2026, 7, 22, 10, 23, 45, tzinfo=timezone.utc).timestamp()) * 1_000_000_000 + 123
-        robot = HardwareIdentity("jetson-1424525045894", "jetson-module-serial", False)
+        robot = HardwareIdentity("jetson-0000000000000", "jetson-module-serial", False)
         source = HardwareIdentity("insta360-2e1a4c06-port-1-3", "usb-topology-composite", False)
 
         directory = storage_relative_directory(robot, source, "video", wall_ns)
@@ -143,7 +143,7 @@ class StorageLayoutTest(unittest.TestCase):
 
         self.assertEqual(
             Path(
-                "jetson-1424525045894",
+                "jetson-0000000000000",
                 "video",
                 "insta360-2e1a4c06-port-1-3",
                 "2026-07-22",

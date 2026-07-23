@@ -113,7 +113,7 @@ node --check agent-core/web/js/flow-view.js
 - 持久化目录：`/opt/phanthy-motus/inspection-data`；
 - 账本：`/opt/phanthy-motus/inspection-state/ledger.sqlite3`；
 - v3 新分片目录为 `<robot-id>/<audio|video>/<source-device-id>/YYYY-MM-DD/<上海本地时间+0800>--<序号>.<扩展名>`；
-- 例如 `jetson-1424525045894/video/insta360-2e1a4c06-port-1-3/2026-07-23/20260723T141500.123456789+0800--000001.mp4`，同目录存在同名 JSON metadata；
+- 例如 `jetson-0000000000000/video/insta360-2e1a4c06-port-1-3/2026-07-23/20260723T141500.123456789+0800--000001.mp4`，同目录存在同名 JSON metadata；
 - `cos_prefix` 默认并应在生产配置中保持为 `inspection`；v3 COS 对象键就是 `inspection/` 加上述本地相对路径，本地与云端层级完全一致；
 - 文件名采用上海本地日期和时间，并显式携带 `+0800`；metadata 同时保留精确的 UTC ns 和 `wall_clock_*_utc`，跨时区处理不依赖文件名猜测；
 - 画布内部 `instance_id`（如 `card-mrvusdyxxjln`）不进入 v3 路径，完整值和原始 `input_topic` 仍写入 metadata/ledger；
@@ -146,7 +146,7 @@ node --check agent-core/web/js/flow-view.js
 - 2026-07-21 已在上海 G1 实际构建并部署 `phanthymotus/inspection:local-7624db48f262-g1-test`；Jetson GStreamer 硬件管线预检、Core 注册和两张 Inspector 发现均通过；
 - Audio Inspector 已从 `/phanthymotus_g1_driver/mic/audio` 采集真实 `AudioChunk`，完成 WAV/JSON 成对落盘、COS 上传及 HEAD 大小/SHA-256 校验；
 - Video Inspector 已从 `/phanthymotus_g1_driver/ext_camera/card-mrnbwcls6nji/rgb` 采集真实 `CompressedImage`，使用 Jetson NVENC 完成 MP4/JSON 成对落盘、播放发现、COS 上传及 HEAD 校验；
-- 最终真实验收前缀为 `cos://embodied-ai-1252788780/inspection-acceptance/20260721-164837/`，共 12 个对象；验收后 Audio / Video Inspector 和 ext_camera 均为 `idle`，上传 backlog 为 0；
+- 最终真实验收前缀已脱敏为 `cos://example-bucket-1250000000/inspection-acceptance/20260721-164837/`，共 12 个对象；验收后 Audio / Video Inspector 和 ext_camera 均为 `idle`，上传 backlog 为 0；
 - 2026-07-21 与 2026-07-22 各出现一次 Jetson NVENC native 进程退出，并留下可诊断的零字节 `.part`；同一真实 JPEG 的宿主、容器、Python appsrc、双线程、原样 Runtime 和真实 ROS executor 隔离测试均通过，说明是低频原生编码路径故障而非稳定可复现的 Python 异常。容器现以 `on-failure:3` 限制运行期重启次数，验收只在确认容器发生非零退出并恢复后显式重试一次，不切换软件编码器；长时间连续稳定性仍待 soak test；
 - COS 上传、HEAD 校验、冲突保护、重试与本地滚动的 fake backend 测试和真实 bucket `testupload` 均已通过；断网、强制退出后的 backlog 补传及长时间滚动删除仍待专项验收；
 - 2026-07-23 `940091d` 已在上海 G1 完成 v2 自动身份、真实音视频、本地/COS 同路径和旧数据兼容验收；后续根据人工可读性反馈将新写入升级为 v3 `<robot>/<modality>/<device>/<date>`，旧 v2 数据继续兼容，v3 待新镜像联合验收；
