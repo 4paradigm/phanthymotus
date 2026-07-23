@@ -80,14 +80,14 @@ class AudioStorageTest(unittest.TestCase):
         self.assertEqual(SegmentState.FINALIZED.value, record["state"])
         self.assertEqual(str(wav_files[0]), record["local_path"])
         relative = wav_files[0].relative_to(self.root / "data")
-        self.assertEqual("robot=g1-sh-sn123", relative.parts[0])
+        self.assertEqual("g1-sh-sn123", relative.parts[0])
         self.assertEqual("audio", relative.parts[1])
-        self.assertEqual("device=g1-sh-sn123-builtin-mic-array", relative.parts[2])
-        self.assertRegex(relative.parts[3], r"^date=\d{4}-\d{2}-\d{2}$")
+        self.assertEqual("g1-sh-sn123-builtin-mic-array", relative.parts[2])
+        self.assertRegex(relative.parts[3], r"^\d{4}-\d{2}-\d{2}$")
         self.assertRegex(relative.name, r"^\d{8}T\d{6}\.\d{9}\+0800--\d{6}\.wav$")
         self.assertEqual("audioinspector", metadata["card_id"])
         self.assertEqual("mic-1", metadata["instance_id"])
-        self.assertEqual("2.0", metadata["schema_version"])
+        self.assertEqual("3.0", metadata["schema_version"])
         self.assertEqual("g1-sh-sn123", metadata["robot_id"])
         self.assertEqual("unitree-robot-sn", metadata["robot_identity_source"])
         self.assertTrue(metadata["robot_identity_is_manufacturer_serial"])
@@ -146,7 +146,7 @@ class AudioStorageTest(unittest.TestCase):
         with wave.open(str(metadata_path.with_suffix(".wav")), "rb") as wav_file:
             self.assertEqual(4, wav_file.getnframes())
 
-    def test_v2_part_without_open_state_rebuilds_relative_identity_path(self) -> None:
+    def test_v3_part_without_open_state_rebuilds_relative_identity_path(self) -> None:
         writer = self.make_writer()
         self.assertIsNone(writer.write_chunk(b"\x02\x00" * 4))
         assert writer._raw_handle is not None
@@ -162,7 +162,7 @@ class AudioStorageTest(unittest.TestCase):
         metadata_path = next((self.root / "data").rglob("*.json"))
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         relative_directory = metadata_path.parent.relative_to(self.root / "data").as_posix()
-        self.assertEqual("2.0", metadata["schema_version"])
+        self.assertEqual("3.0", metadata["schema_version"])
         self.assertEqual(relative_directory, metadata["storage_relative_directory"])
         self.assertEqual("recovered-from-path", metadata["robot_identity_source"])
         self.assertEqual("recovered-from-path", metadata["source_identity_source"])

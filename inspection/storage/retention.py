@@ -126,7 +126,7 @@ class RetentionSweeper:
             self.data_root / card_storage_slug(self.card_id) / instance_storage_slug(instance_id, input_topic),
         ]
         modality = "audio" if self.card_id == "audioinspector" else "video"
-        roots.extend(self.data_root.glob(f"robot=*/{modality}/device=*"))
+        roots.extend(self.data_root.glob(f"*/{modality}/*"))
         return list(dict.fromkeys(roots))
 
     @staticmethod
@@ -171,7 +171,7 @@ class RetentionSweeper:
                 relative = corrupt_path.relative_to(self.data_root)
             except ValueError:
                 continue
-            if relative.parts and relative.parts[0].startswith("robot="):
+            if len(relative.parts) >= 5 and relative.parts[1] in {"audio", "video"}:
                 if self._v2_corrupt_instance_id(corrupt_path) != instance_id:
                     continue
             related = [path for path in self._corrupt_group(corrupt_path) if path.exists()]
@@ -208,7 +208,7 @@ class RetentionSweeper:
             self.data_root / card_storage_slug(self.card_id),
         }
         modality = "audio" if self.card_id == "audioinspector" else "video"
-        card_roots.update(self.data_root.glob(f"robot=*/{modality}"))
+        card_roots.update(self.data_root.glob(f"*/{modality}"))
         for card_root in card_roots:
             if not card_root.exists():
                 continue

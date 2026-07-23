@@ -371,10 +371,10 @@ class InspectorPlugin:
             "source_identity_is_manufacturer_serial": (
                 source_identity.manufacturer_serial if source_identity else False
             ),
-            "storage_layout_version": "2.0",
+            "storage_layout_version": "3.0",
             "storage_path_template": (
-                f"robot={self.robot_id}/{self.modality}/device={source_identity.value}/"
-                "date=YYYY-MM-DD/<local-time+0800>--<sequence>"
+                f"{self.robot_id}/{self.modality}/{source_identity.value}/"
+                "YYYY-MM-DD/<local-time+0800>--<sequence>"
                 if source_identity else ""
             ),
             "storage_card_slug": card_storage_slug(self.card_id),

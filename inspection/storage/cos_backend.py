@@ -274,6 +274,14 @@ class COSUploadCoordinator:
         relative = path.relative_to(self.data_root)
         if (
             len(relative.parts) >= 5
+            and relative.parts[1] in {"audio", "video"}
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", relative.parts[3])
+            and not relative.parts[0].startswith("robot=")
+            and not relative.parts[2].startswith("device=")
+        ):
+            return "/".join(filter(None, (self.prefix, *relative.parts)))
+        if (
+            len(relative.parts) >= 5
             and relative.parts[0].startswith("robot=")
             and relative.parts[1] in {"audio", "video"}
             and relative.parts[2].startswith("device=")
@@ -371,15 +379,18 @@ class COSUploadCoordinator:
         if not callable(cleanup):
             return
         try:
-            self.multipart_aborted = int(cleanup(
-                bucket=self.bucket,
-                prefix="/".join(filter(None, (
-                    self.prefix,
-                    f"robot={self.robot_id}",
-                    self.modality,
-                ))),
-                stale_hours=int(self.config.get("multipart_stale_hours", 24)),
-            ))
+            prefixes = (
+                "/".join(filter(None, (self.prefix, self.robot_id, self.modality))),
+                "/".join(filter(None, (self.prefix, f"robot={self.robot_id}", self.modality))),
+            )
+            self.multipart_aborted = sum(
+                int(cleanup(
+                    bucket=self.bucket,
+                    prefix=prefix,
+                    stale_hours=int(self.config.get("multipart_stale_hours", 24)),
+                ))
+                for prefix in prefixes
+            )
             self.multipart_cleanup_error = ""
         except Exception as exc:
             self.multipart_cleanup_error = describe_cos_error(exc, bucket=self.bucket, region=self.region)
@@ -411,7 +422,7 @@ class COSUploadCoordinator:
         sha256 = hashlib.sha256(body).hexdigest()
         key = "/".join(filter(None, (
             self.prefix,
-            f"robot={self.robot_id}",
+            self.robot_id,
             self.modality,
             "_health",
             f"{time.time_ns()}.json",

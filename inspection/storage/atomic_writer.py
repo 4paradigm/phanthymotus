@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 import wave
@@ -137,7 +138,7 @@ class AudioSegmentWriter:
         self._source_stamp_start_ns = source_stamp_ns if source_stamp_ns > 0 else 0
         self._source_stamp_end_ns = self._source_stamp_start_ns
         self._open_info = {
-            "schema_version": "2.0",
+            "schema_version": "3.0",
             "segment_id": f"seg-{uuid.uuid4().hex}",
             "kind": "audio",
             "device_id": self.device_id,
@@ -311,7 +312,25 @@ class AudioSegmentWriter:
         else:
             wall_start_ns = segment_start_ns_from_name(final_path)
             partition = final_path.parent.name
-            if partition.startswith("date=") and final_path.parents[1].name.startswith("device="):
+            if (
+                re.fullmatch(r"\d{4}-\d{2}-\d{2}", partition)
+                and final_path.parents[2].name == "audio"
+                and not final_path.parents[1].name.startswith("device=")
+                and not final_path.parents[3].name.startswith("robot=")
+            ):
+                storage_instance = "unknown"
+                storage_card = "audio-inspector"
+                source_device_id = final_path.parents[1].name
+                robot_name = final_path.parents[3].name
+                robot_id = robot_name
+                schema_version = "3.0"
+                storage_relative_directory_value = Path(
+                    robot_name,
+                    final_path.parents[2].name,
+                    source_device_id,
+                    partition,
+                ).as_posix()
+            elif partition.startswith("date=") and final_path.parents[1].name.startswith("device="):
                 storage_instance = "unknown"
                 storage_card = "audio-inspector"
                 source_device_id = final_path.parents[1].name[len("device="):]

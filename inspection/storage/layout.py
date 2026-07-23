@@ -263,7 +263,7 @@ def instance_storage_slug(instance_id: str, input_topic: str) -> str:
 
 def local_date_partition(wall_clock_ns: int) -> str:
     local = datetime.fromtimestamp(wall_clock_ns / 1_000_000_000, tz=_SHANGHAI_TIMEZONE)
-    return f"date={local.strftime('%Y-%m-%d')}"
+    return local.strftime("%Y-%m-%d")
 
 
 def utc_hour_partition(wall_clock_ns: int) -> str:
@@ -280,9 +280,9 @@ def storage_relative_directory(
 ) -> Path:
     modality = safe_component(kind)
     return Path(
-        f"robot={safe_component(robot_identity.value)}",
+        safe_component(robot_identity.value),
         modality,
-        f"device={safe_component(source_identity.value)}",
+        safe_component(source_identity.value),
         local_date_partition(wall_clock_ns),
     )
 

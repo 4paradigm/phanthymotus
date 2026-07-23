@@ -125,7 +125,7 @@ class COSAndRetentionTest(unittest.TestCase):
         self.assertEqual(2, len(backend.upload_calls))
         self.assertTrue(record["object_key"].endswith(".wav"))
         self.assertIn(
-            "/robot=unitree-g1-sn123/audio/device=unitree-g1-sn123-builtin-mic-array/date=",
+            "/unitree-g1-sn123/audio/unitree-g1-sn123-builtin-mic-array/",
             "/" + record["object_key"],
         )
         media_path = Path(record["local_path"])
@@ -226,6 +226,27 @@ class COSAndRetentionTest(unittest.TestCase):
             key,
         )
 
+    def test_v2_labeled_directory_keeps_v2_cos_key(self) -> None:
+        v2 = (
+            self.data_root
+            / "robot=unitree-g1-sn123"
+            / "audio"
+            / "device=unitree-g1-sn123-builtin-mic-array"
+            / "date=2026-07-22"
+            / "20260722T170000.000000000+0800--000000.wav"
+        )
+        v2.parent.mkdir(parents=True)
+        v2.write_bytes(b"v2")
+
+        key = self.make_uploader(FakeCOSBackend())._object_key(v2)
+
+        self.assertEqual(
+            "inspection/robot=unitree-g1-sn123/audio/"
+            "device=unitree-g1-sn123-builtin-mic-array/date=2026-07-22/"
+            "20260722T170000.000000000+0800--000000.wav",
+            key,
+        )
+
     def test_v1_readable_directory_uses_original_metadata_device_id(self) -> None:
         v1 = (
             self.data_root
@@ -259,7 +280,7 @@ class COSAndRetentionTest(unittest.TestCase):
 
         self.assertTrue(result["verified"])
         self.assertIn(
-            "/robot=unitree-g1-sn123/audio/_health/",
+            "/unitree-g1-sn123/audio/_health/",
             "/" + result["object_key"],
         )
         self.assertEqual(1, len(backend.upload_calls))
@@ -401,10 +422,10 @@ class COSAndRetentionTest(unittest.TestCase):
         input_topic = "/phanthymotus_g1_driver/ext_camera/card-mrvusdyxxjln/rgb"
         instance_root = (
             self.data_root
-            / "robot=unitree-g1-sn123"
+            / "unitree-g1-sn123"
             / "video"
-            / "device=insta360-2e1a4c06-port-1-3"
-            / "date=2026-07-22"
+            / "insta360-2e1a4c06-port-1-3"
+            / "2026-07-22"
         )
         instance_root.mkdir(parents=True)
         corrupt = instance_root / "20260722T170000.000000000+0800--000000.mp4.part.corrupt"

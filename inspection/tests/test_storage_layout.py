@@ -133,7 +133,7 @@ class StorageLayoutTest(unittest.TestCase):
         self.assertEqual("jetson-1424525045894-builtin-mic-array", source.value)
         self.assertEqual("robot-builtin-composite", source.source)
 
-    def test_v2_layout_uses_robot_modality_device_and_local_date(self) -> None:
+    def test_v3_layout_uses_plain_robot_modality_device_and_local_date(self) -> None:
         wall_ns = int(datetime(2026, 7, 22, 10, 23, 45, tzinfo=timezone.utc).timestamp()) * 1_000_000_000 + 123
         robot = HardwareIdentity("jetson-1424525045894", "jetson-module-serial", False)
         source = HardwareIdentity("insta360-2e1a4c06-port-1-3", "usb-topology-composite", False)
@@ -143,10 +143,10 @@ class StorageLayoutTest(unittest.TestCase):
 
         self.assertEqual(
             Path(
-                "robot=jetson-1424525045894",
+                "jetson-1424525045894",
                 "video",
-                "device=insta360-2e1a4c06-port-1-3",
-                "date=2026-07-22",
+                "insta360-2e1a4c06-port-1-3",
+                "2026-07-22",
             ),
             directory,
         )

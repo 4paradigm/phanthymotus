@@ -1,6 +1,6 @@
 # Inspection Stack
 
-独立的音视频采集卡片宿主。当前分支已完成 Dashboard 编排、Audio Inspector 持久化采集、Video Inspector 硬件编码与 MP4 分片、COS 校验上传、断点恢复和本地滚动清理。基础采集、双条件分片、磁盘指标与 COS 已在上海 G1 真机通过；网页交互验收中发现的原生视频管线异常停止路径已增加显式收尾与状态传播，待新镜像复验。
+独立的音视频采集卡片宿主。当前分支已完成 Dashboard 编排、Audio Inspector 持久化采集、Video Inspector 硬件编码与 MP4 分片、COS 校验上传、断点恢复和本地滚动清理。基础采集、双条件分片、磁盘指标与 COS 已在上海 G1 真机通过；v3 存储目录改为无标签的人类可读层级，待新镜像真机复验。
 
 ## 画布使用门禁
 
@@ -112,12 +112,12 @@ node --check agent-core/web/js/flow-view.js
 
 - 持久化目录：`/opt/phanthy-motus/inspection-data`；
 - 账本：`/opt/phanthy-motus/inspection-state/ledger.sqlite3`；
-- v2 新分片目录为 `robot=<robot-id>/<audio|video>/device=<source-device-id>/date=YYYY-MM-DD/<上海本地时间+0800>--<序号>.<扩展名>`；
-- 例如 `robot=jetson-1424525045894/video/device=insta360-2e1a4c06-port-1-3/date=2026-07-23/20260723T141500.123456789+0800--000001.mp4`，同目录存在同名 JSON metadata；
-- `cos_prefix` 默认 `inspection`；v2 COS 对象键就是 `<cos_prefix>/` 加上述本地相对路径，本地与云端层级完全一致；
+- v3 新分片目录为 `<robot-id>/<audio|video>/<source-device-id>/YYYY-MM-DD/<上海本地时间+0800>--<序号>.<扩展名>`；
+- 例如 `jetson-1424525045894/video/insta360-2e1a4c06-port-1-3/2026-07-23/20260723T141500.123456789+0800--000001.mp4`，同目录存在同名 JSON metadata；
+- `cos_prefix` 默认并应在生产配置中保持为 `inspection`；v3 COS 对象键就是 `inspection/` 加上述本地相对路径，本地与云端层级完全一致；
 - 文件名采用上海本地日期和时间，并显式携带 `+0800`；metadata 同时保留精确的 UTC ns 和 `wall_clock_*_utc`，跨时区处理不依赖文件名猜测；
-- 画布内部 `instance_id`（如 `card-mrvusdyxxjln`）不进入 v2 路径，完整值和原始 `input_topic` 仍写入 metadata/ledger；
-- v1 `audio-inspector|video-inspector/<source>--<hash>/utc-hour=...` 和更早的 `audioinspector|videoinspector/<instance>/YYYY-MM-DD/HH` 数据不迁移、不重命名、不删除；恢复、补传和滚动清理继续兼容。旧布局补传优先使用原 metadata 中记录的旧 `device_id`，避免后续识别到真实机器人 SN 后改变历史 COS key；
+- 画布内部 `instance_id`（如 `card-mrvusdyxxjln`）不进入 v3 路径，完整值和原始 `input_topic` 仍写入 metadata/ledger；
+- v2 `robot=<robot-id>/<audio|video>/device=<source-device-id>/date=YYYY-MM-DD`、v1 `audio-inspector|video-inspector/<source>--<hash>/utc-hour=...` 和更早的 `audioinspector|videoinspector/<instance>/YYYY-MM-DD/HH` 数据不迁移、不重命名、不删除；恢复、补传和滚动清理继续兼容。旧布局补传优先使用原 metadata 中记录的旧 `device_id`，避免后续识别到真实机器人 SN 后改变历史 COS key；
 - 音频输入固定为 `audio_msgs/AudioChunk`、`audio/pcm-16k`、PCM_S16_LE 16 kHz mono；
 - 音频 QoS：`BEST_EFFORT + KEEP_LAST(50) + VOLATILE`；
 - 视频输入固定为 `sensor_msgs/CompressedImage`、`image/jpeg`，QoS 为 `BEST_EFFORT + KEEP_LAST(2) + VOLATILE`；
@@ -149,7 +149,7 @@ node --check agent-core/web/js/flow-view.js
 - 最终真实验收前缀为 `cos://embodied-ai-1252788780/inspection-acceptance/20260721-164837/`，共 12 个对象；验收后 Audio / Video Inspector 和 ext_camera 均为 `idle`，上传 backlog 为 0；
 - 2026-07-21 与 2026-07-22 各出现一次 Jetson NVENC native 进程退出，并留下可诊断的零字节 `.part`；同一真实 JPEG 的宿主、容器、Python appsrc、双线程、原样 Runtime 和真实 ROS executor 隔离测试均通过，说明是低频原生编码路径故障而非稳定可复现的 Python 异常。容器现以 `on-failure:3` 限制运行期重启次数，验收只在确认容器发生非零退出并恢复后显式重试一次，不切换软件编码器；长时间连续稳定性仍待 soak test；
 - COS 上传、HEAD 校验、冲突保护、重试与本地滚动的 fake backend 测试和真实 bucket `testupload` 均已通过；断网、强制退出后的 backlog 补传及长时间滚动删除仍待专项验收；
-- 2026-07-23 已在当前分支完成 v2 自动身份与 `robot/modality/device/date` 路径实现及本地兼容性测试；上海 G1 的真实 SN 识别、本地/COS 同路径与旧数据补传仍须通过新镜像联合验收后才能标记为真机通过；
+- 2026-07-23 `940091d` 已在上海 G1 完成 v2 自动身份、真实音视频、本地/COS 同路径和旧数据兼容验收；后续根据人工可读性反馈将新写入升级为 v3 `<robot>/<modality>/<device>/<date>`，旧 v2 数据继续兼容，v3 待新镜像联合验收；
 - COS 凭证只能由部署 secret 提供，不进入卡片配置或日志。
 - G1 容器使用 `restart: "on-failure:3"`：只处理运行期非零退出，最多重试 3 次；Docker daemon/整机重启时不会自动拉起，因此仍必须在宿主相机、音频和 ROS2 服务就绪后按顺序启动。容器恢复后会自动恢复 ledger backlog，但 `auto_resume_after_reboot=false` 时不会自动恢复采集实例。
 
@@ -164,7 +164,7 @@ node --check agent-core/web/js/flow-view.js
 7. 点击 External Camera 的“查看数据流”，确认 WebSocket 先返回 topic metadata，再连续返回 SOI=`FFD8`、EOI=`FFD9` 的完整 JPEG；未启动时必须明确显示“数据源尚未启动”，不能静默无反应。
 8. 使用较小验收值验证按时长分片，再单独使用较小 `max_segment_mb` 验证按大小分片；停止项目时当前段必须被 finalize。
 9. 检查本地 WAV/MP4 和 JSON 成对存在，媒体可播放，ledger 状态最终为 `UPLOADED_VERIFIED`。
-10. 检查本地与 COS 路径都严格为 `<prefix>/robot=<robot-id>/<audio|video>/device=<source-device-id>/date=YYYY-MM-DD/<local-time+0800>--<sequence>`；两者相对路径一致，metadata 的 identity source、size 和 SHA-256 与实际文件一致。
+10. 检查本地与 COS 路径都严格为 `inspection/<robot-id>/<audio|video>/<source-device-id>/YYYY-MM-DD/<local-time+0800>--<sequence>`；不得出现 `robot=`、`device=`、`date=` 或带验收时间戳的顶层 prefix，两者相对路径一致，metadata 的 identity source、size 和 SHA-256 与实际文件一致。
 11. 停止智能控制后确认不再产生新分片，但卡片仍显示 backlog 减少，最终变成“云端已同步”。
 12. 另建 `local_ring` 实例验证无需 COS 可启动，过期或超预算后只滚动本地数据，不创建 COS 对象。
 

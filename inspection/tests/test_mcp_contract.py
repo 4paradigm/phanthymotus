@@ -173,8 +173,9 @@ class InspectionContractTest(unittest.TestCase):
         )
         self.assertEqual("robot-builtin-composite", info["source_identity_source"])
         self.assertEqual(info["source_device_id"], info["device_id"])
-        self.assertEqual("2.0", info["storage_layout_version"])
-        self.assertIn("/audio/device=", info["storage_path_template"])
+        self.assertEqual("3.0", info["storage_layout_version"])
+        self.assertIn("/audio/", info["storage_path_template"])
+        self.assertNotIn("=", info["storage_path_template"])
 
     def test_invalid_cos_bucket_format_is_rejected_before_remote_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "lowercase Tencent COS bucket"):

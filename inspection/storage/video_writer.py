@@ -85,7 +85,7 @@ class VideoFragmentStore:
         self._sequence += 1
         part_path = directory / f"{segment_basename(wall_start_ns, sequence, 'mp4')}.part"
         open_info = {
-            "schema_version": "2.0",
+            "schema_version": "3.0",
             "segment_id": f"seg-{uuid.uuid4().hex}",
             "kind": "video",
             "device_id": self.device_id,
