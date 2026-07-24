@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import tempfile
 import threading
@@ -13,6 +14,10 @@ from plugins.ocr_tiled_strategy import (
     decode_vips_overview,
     jpeg_dimensions,
 )
+
+from plugins.ocr_preprocess import preprocess_for_ocr
+
+_log = logging.getLogger(__name__)
 
 
 ORT_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
@@ -189,7 +194,11 @@ class _MNNModelSession:
 
 class _MNNPipeline:
     def __init__(self, root: Path, *, num_threads: int, max_side_len: int,
-                 rec_min_score: float = 0.3):
+                 rec_min_score: float = 0.3,
+                 enable_preprocess: bool = True,
+                 det_thresh: float = 0.3,
+                 det_box_thresh: float = 0.5,
+                 det_unclip_ratio: float = 1.6):
         from rapidocr.ch_ppocr_det.utils import DBPostProcess
         from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
         from rapidocr.utils.process_img import get_rotate_crop_image
@@ -211,16 +220,17 @@ class _MNNPipeline:
             self._det.close()
             raise
         self._det_postprocess = DBPostProcess(
-            thresh=0.3,
-            box_thresh=0.5,
+            thresh=float(det_thresh),
+            box_thresh=float(det_box_thresh),
             max_candidates=1000,
-            unclip_ratio=1.6,
+            unclip_ratio=float(det_unclip_ratio),
             use_dilation=True,
             score_mode="fast",
         )
         self._rec_decode = CTCLabelDecode(character_path=root / "keys.txt")
         self._crop = get_rotate_crop_image
         self._rec_min_score = float(rec_min_score)
+        self._enable_preprocess = bool(enable_preprocess)
         self._max_side_len = max(32, int(max_side_len))
 
     @staticmethod
@@ -300,9 +310,18 @@ class _MNNPipeline:
         import copy
         import numpy as np
 
-        boxes, _ = self._detect(image)
+        det_image = image
+        if self._enable_preprocess:
+            try:
+                det_image = preprocess_for_ocr(image)
+            except Exception:
+                _log.debug("preprocess failed, using original image", exc_info=True)
+
+        boxes, _ = self._detect(det_image)
         items = []
         for box in boxes:
+            # rec uses the ORIGINAL image crop (not the preprocessed one),
+            # so bbox coordinates map back to the original without adjustment
             crop = self._crop(image, copy.deepcopy(box))
             text, score = self._recognize_crop(crop)
             if not text.strip() or score < self._rec_min_score:
@@ -352,6 +371,10 @@ class RapidOCRAdapter:
         num_threads: int = 2,
         max_side_len: int = 1600,
         rec_min_score: float = 0.3,
+        enable_preprocess: bool = True,
+        det_thresh: float = 0.3,
+        det_box_thresh: float = 0.5,
+        det_unclip_ratio: float = 1.6,
         large_image_strategy: dict | None = None,
     ):
         root = Path(model_dir)
@@ -408,6 +431,10 @@ class RapidOCRAdapter:
                     num_threads=num_threads,
                     max_side_len=max_side_len,
                     rec_min_score=rec_min_score,
+                    enable_preprocess=enable_preprocess,
+                    det_thresh=det_thresh,
+                    det_box_thresh=det_box_thresh,
+                    det_unclip_ratio=det_unclip_ratio,
                 )
                 self._pipeline.warm_up()
                 self._engine = None
