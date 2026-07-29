@@ -183,10 +183,14 @@ class TensorRTTTSEngine:
             ].float()
             input_frames = ctx_end - ctx_start
             if logits.size(2) % input_frames:
-                raise RuntimeError(
-                    "decoder output length is not an integer multiple of input frames: "
-                    f"{logits.size(2)} vs {input_frames}"
-                )
+                # LC1's exported ISTFT decoder returns frames * hop + 1 samples.
+                # Drop the right ISTFT boundary before overlap cropping.
+                if (logits.size(2) - 1) % input_frames:
+                    raise RuntimeError(
+                        "unexpected decoder output length for input frames: "
+                        f"{logits.size(2)} vs {input_frames}"
+                    )
+                logits = logits[:, :, :-1]
             piece_upsample = logits.size(2) // input_frames
             if upsample is None:
                 upsample = piece_upsample

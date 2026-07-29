@@ -210,10 +210,15 @@ class TensorRTNumpyTTSEngine:
             )["decoder_logits"].astype(np.float32)
             input_frames = ctx_end - ctx_start
             if logits.shape[2] % input_frames:
-                raise RuntimeError(
-                    "decoder output length is not an integer multiple of input frames: "
-                    f"{logits.shape[2]} vs {input_frames}"
-                )
+                # LC1's exported ISTFT decoder returns frames * hop + 1 samples.
+                # The last sample is the right ISTFT boundary; discard it before
+                # overlap-cropping independently decoded context chunks.
+                if (logits.shape[2] - 1) % input_frames:
+                    raise RuntimeError(
+                        "unexpected decoder output length for input frames: "
+                        f"{logits.shape[2]} vs {input_frames}"
+                    )
+                logits = logits[:, :, :-1]
             piece_upsample = logits.shape[2] // input_frames
             if upsample is None:
                 upsample = piece_upsample
