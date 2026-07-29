@@ -14,7 +14,7 @@ from .runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
 
 
 SAMPLE_RATE = 16000
-CHUNK_BYTES = int(os.getenv("MIX_VITS_CHUNK_BYTES", "6400"))
+CHUNK_BYTES = int(os.getenv("MIX_VITS_CHUNK_BYTES", "3200"))
 PCM_FRAME_MS = CHUNK_BYTES * 1000.0 / (SAMPLE_RATE * 2)
 MAX_CHUNK_TOKENS = int(os.getenv("MIX_VITS_MAX_TEXT_TOKENS", "256"))
 CHUNK_PAUSE_MS = int(os.getenv("MIX_VITS_CHUNK_PAUSE_MS", "0"))

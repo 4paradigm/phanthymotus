@@ -19,10 +19,10 @@ from .adapter import CHUNK_BYTES, PCM_FRAME_MS, SAMPLE_RATE, TTSAdapter, build_a
 
 
 log = logging.getLogger(__name__)
-FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "200"))
+FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "80"))
 if not 0 <= FRAME_INTERVAL_MS <= 1000:
     raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 1000")
-ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "0") == "1"
+ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "1") == "1"
 if FRAME_INTERVAL_MS < PCM_FRAME_MS and not ALLOW_FAST_DELIVERY:
     raise ValueError(
         f"MIX_VITS_FRAME_INTERVAL_MS={FRAME_INTERVAL_MS} sends "
