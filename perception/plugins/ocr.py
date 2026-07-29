@@ -490,7 +490,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             enable_preprocess=bool(cfg.get('enable_preprocess', True)),
             det_thresh=float(cfg.get('det_thresh', 0.3)),
             det_box_thresh=float(cfg.get('det_box_thresh', 0.5)),
-            det_unclip_ratio=float(cfg.get('det_unclip_ratio', 1.6)),
+            det_unclip_ratio=float(cfg.get('det_unclip_ratio', 1.2)),
             large_image_strategy=dict(
                 cfg.get('large_image_strategy') or {}
             ),

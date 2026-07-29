@@ -198,7 +198,7 @@ class _MNNPipeline:
                  enable_preprocess: bool = True,
                  det_thresh: float = 0.3,
                  det_box_thresh: float = 0.5,
-                 det_unclip_ratio: float = 1.6):
+                 det_unclip_ratio: float = 1.2):
         from rapidocr.ch_ppocr_det.utils import DBPostProcess
         from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
         from rapidocr.utils.process_img import get_rotate_crop_image
@@ -374,7 +374,7 @@ class RapidOCRAdapter:
         enable_preprocess: bool = True,
         det_thresh: float = 0.3,
         det_box_thresh: float = 0.5,
-        det_unclip_ratio: float = 1.6,
+        det_unclip_ratio: float = 1.2,
         large_image_strategy: dict | None = None,
     ):
         root = Path(model_dir)
