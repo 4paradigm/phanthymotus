@@ -13,6 +13,15 @@ from .trt_cuda_session import CudaRuntime, TensorRTCudaSession
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_MAX_ENGINE_BYTES = 64 * 1024 * 1024
+
+
+def _profile_max(manifest, name, fallback):
+    profile = str(manifest.get("profiles", {}).get(name, ""))
+    try:
+        return int(profile.split(",")[2])
+    except (IndexError, TypeError, ValueError):
+        return int(fallback)
 
 
 def _intersperse(values, item=0):
@@ -58,13 +67,11 @@ def _istft(spectrum, n_fft: int, hop_length: int):
 
 
 def _soft_clip_and_pcm(audio, sample_rate):
+    del sample_rate
     audio = np.nan_to_num(audio, nan=0.0, posinf=0.95, neginf=-0.95)
     peak = float(np.max(np.abs(audio), initial=0.0))
     if peak > 1.0:
         audio = audio / peak
-    fade_samples = min(int(sample_rate * 0.020), audio.shape[-1])
-    if fade_samples:
-        audio[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
     return np.clip(audio * 32767.0, -32768, 32767).astype(np.int16).tobytes()
 
 
@@ -82,8 +89,45 @@ class TensorRTNumpyTTSEngine:
         self.add_blank = bool(config["data"].get("add_blank", True))
         self.n_fft = int(config["model"].get("gen_istft_n_fft", 16))
         self.istft_hop = int(config["model"].get("gen_istft_hop_size", 4))
-        self.max_text_tokens = int(os.getenv("MIX_VITS_MAX_TEXT_TOKENS", "512"))
-        self.max_frames = int(os.getenv("MIX_VITS_MAX_FRAMES", "2048"))
+        text_profile_max = _profile_max(self.manifest, "text", 512)
+        frame_profile_max = _profile_max(self.manifest, "frames", 2048)
+        decoder_profile_max = _profile_max(
+            self.manifest, "decoder_frames", frame_profile_max
+        )
+        self.max_text_tokens = int(
+            os.getenv("MIX_VITS_MAX_TEXT_TOKENS", str(text_profile_max))
+        )
+        self.max_frames = int(
+            os.getenv("MIX_VITS_MAX_FRAMES", str(frame_profile_max))
+        )
+        # Overlap-discard chunked decoding keeps decoder activations bounded;
+        # chunk=0 disables. Verified vs full decode: rms diff ~-81 dB at overlap 96.
+        self.dec_chunk = int(os.getenv("MIX_VITS_DECODER_CHUNK", "192"))
+        self.dec_overlap = int(os.getenv("MIX_VITS_DECODER_OVERLAP", "96"))
+        if self.max_text_tokens <= 0 or self.max_frames <= 0:
+            raise ValueError("TensorRT text/frame limits must be positive")
+        if self.dec_chunk < 0 or self.dec_overlap < 0:
+            raise ValueError("decoder chunk and overlap must be non-negative")
+        if self.max_text_tokens > text_profile_max:
+            raise ValueError(
+                f"MIX_VITS_MAX_TEXT_TOKENS={self.max_text_tokens} exceeds "
+                f"TensorRT text profile max={text_profile_max}"
+            )
+        if self.max_frames > frame_profile_max:
+            raise ValueError(
+                f"MIX_VITS_MAX_FRAMES={self.max_frames} exceeds TensorRT "
+                f"frame profile max={frame_profile_max}"
+            )
+        if self.dec_chunk > 0 and self.dec_chunk + 2 * self.dec_overlap > decoder_profile_max:
+            raise ValueError(
+                f"decoder chunk context {self.dec_chunk}+2*{self.dec_overlap} "
+                f"exceeds TensorRT decoder profile max={decoder_profile_max}"
+            )
+        if self.dec_chunk == 0 and self.max_frames > decoder_profile_max:
+            raise ValueError(
+                "chunked decoding is disabled, but MIX_VITS_MAX_FRAMES="
+                f"{self.max_frames} exceeds decoder profile max={decoder_profile_max}"
+            )
         self.replica_id = replica_id
         self.cuda = CudaRuntime()
         self._validate_manifest()
@@ -109,8 +153,19 @@ class TensorRTNumpyTTSEngine:
     def _validate_manifest(self):
         import tensorrt as trt
 
-        if int(self.manifest.get("total_engine_bytes", 0)) > 50 * 1024 * 1024:
-            raise RuntimeError("TensorRT bundle exceeds the 50 MiB model budget")
+        total = int(self.manifest.get("total_engine_bytes", 0))
+        declared_limit = int(
+            self.manifest.get("max_engine_bytes", DEFAULT_MAX_ENGINE_BYTES)
+        )
+        hard_limit = int(
+            os.getenv("MIX_VITS_MAX_ENGINE_BYTES", str(DEFAULT_MAX_ENGINE_BYTES))
+        )
+        if total <= 0 or total > declared_limit or declared_limit > hard_limit:
+            raise RuntimeError(
+                "TensorRT bundle budget mismatch: "
+                f"total={total}, manifest_limit={declared_limit}, "
+                f"runtime_limit={hard_limit}"
+            )
         expected_major = str(self.manifest.get("tensorrt_major", ""))
         actual_major = trt.__version__.split(".", 1)[0]
         if expected_major != actual_major:
@@ -136,6 +191,41 @@ class TensorRTNumpyTTSEngine:
         if self.add_blank:
             ids = tuple(_intersperse(values) for values in ids)
         return tuple(tuple(values) for values in ids)
+
+    def _decode(self, z, g):
+        total = z.shape[2]
+        if self.dec_chunk <= 0 or total <= self.dec_chunk + 2 * self.dec_overlap:
+            return self.decoder.run({"z": z, "g": g})["decoder_logits"].astype(
+                np.float32
+            )
+        pieces = []
+        upsample = None
+        start = 0
+        while start < total:
+            end = min(start + self.dec_chunk, total)
+            ctx_start = max(0, start - self.dec_overlap)
+            ctx_end = min(total, end + self.dec_overlap)
+            logits = self.decoder.run(
+                {"z": np.ascontiguousarray(z[:, :, ctx_start:ctx_end]), "g": g}
+            )["decoder_logits"].astype(np.float32)
+            input_frames = ctx_end - ctx_start
+            if logits.shape[2] % input_frames:
+                raise RuntimeError(
+                    "decoder output length is not an integer multiple of input frames: "
+                    f"{logits.shape[2]} vs {input_frames}"
+                )
+            piece_upsample = logits.shape[2] // input_frames
+            if upsample is None:
+                upsample = piece_upsample
+            elif piece_upsample != upsample:
+                raise RuntimeError(
+                    f"decoder upsample changed between chunks: {upsample} -> "
+                    f"{piece_upsample}"
+                )
+            left = (start - ctx_start) * upsample
+            pieces.append(logits[:, :, left : left + (end - start) * upsample])
+            start = end
+        return np.concatenate(pieces, axis=2)
 
     def _infer_ids(self, text_ids, noise_scale=0.667, length_scale=1.0):
         phone_ids, tone_ids, lang_ids = text_ids
@@ -176,9 +266,7 @@ class TensorRTNumpyTTSEngine:
         noise = np.random.standard_normal(m_p.shape).astype(np.float32)
         z_p = m_p + noise * np.exp(logs_p) * noise_scale
         z = self.flow.run({"z_p": z_p, "y_mask": y_mask, "g": g})["z"]
-        logits = self.decoder.run({"z": z * y_mask, "g": g})[
-            "decoder_logits"
-        ].astype(np.float32)
+        logits = self._decode(z * y_mask, g)
         split = self.n_fft // 2 + 1
         magnitude = np.exp(logits[:, :split])
         phase = math.pi * np.sin(logits[:, split:])

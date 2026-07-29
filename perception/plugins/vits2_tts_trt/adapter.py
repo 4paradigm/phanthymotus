@@ -15,15 +15,16 @@ from .runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = int(os.getenv("MIX_VITS_CHUNK_BYTES", "6400"))
-MAX_CHUNK_TOKENS = int(os.getenv("MIX_VITS_MAX_TEXT_TOKENS", "64"))
+PCM_FRAME_MS = CHUNK_BYTES * 1000.0 / (SAMPLE_RATE * 2)
+MAX_CHUNK_TOKENS = int(os.getenv("MIX_VITS_MAX_TEXT_TOKENS", "256"))
 CHUNK_PAUSE_MS = int(os.getenv("MIX_VITS_CHUNK_PAUSE_MS", "0"))
 MODEL_CONFIG = os.getenv("MIX_VITS_CONFIG_PATH", "/models/vits2-mix/config.json")
 ENGINE_DIR = os.getenv("MIX_VITS_TRT_ENGINE_DIR", "/models/vits2-mix/engines")
 WARMUP_CASES = (
-    "你好。",
-    "晚上我用FaceTime和家人视频聊天。",
-    "周末我拍了一张selfie发给朋友。",
-    "Lucy今天去公园散步并喝coffee，David开会前仔细检查PPT。",
+    "你好，语音服务已经准备好了。",
+    "她正在准备IELTS考试，晚上会用FaceTime练习英语。",
+    "重庆银行的员工重新核对了一百二十八份文件。",
+    "Lucy喝完coffee后检查PPT，David同时记录GPS数据。" * 4,
 )
 log = logging.getLogger(__name__)
 
@@ -99,10 +100,27 @@ def _split_positions(text: str) -> tuple[list[int], list[int], list[int]]:
 
 
 class Vits2TensorRTAdapter(TTSAdapter):
-    def __init__(self, speed: float = 1.0):
+    def __init__(
+        self,
+        speed: float = 1.0,
+        *,
+        engine=None,
+        max_chunk_tokens: int | None = None,
+    ):
         self._lock = threading.Lock()
         self.set_speed(speed)
-        self._engine = TensorRTNumpyTTSEngine(MODEL_CONFIG, ENGINE_DIR)
+        self._engine = engine or TensorRTNumpyTTSEngine(MODEL_CONFIG, ENGINE_DIR)
+        self.max_chunk_tokens = int(
+            MAX_CHUNK_TOKENS if max_chunk_tokens is None else max_chunk_tokens
+        )
+        if self.max_chunk_tokens <= 0:
+            raise ValueError("max_chunk_tokens must be positive")
+        engine_limit = int(getattr(self._engine, "max_text_tokens", self.max_chunk_tokens))
+        if self.max_chunk_tokens > engine_limit:
+            raise ValueError(
+                f"adapter text limit {self.max_chunk_tokens} exceeds engine limit "
+                f"{engine_limit}"
+            )
 
     def set_speed(self, speed: float) -> None:
         speed = float(speed)
@@ -113,7 +131,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
 
     def _iter_unit_chunks(self, text: str):
         text_ids = self._engine._get_text_ids(text, normalized=True)
-        if len(text_ids[0]) <= MAX_CHUNK_TOKENS:
+        if len(text_ids[0]) <= self.max_chunk_tokens:
             yield text, text_ids
             return
         if len(text) <= 1:
@@ -129,7 +147,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
                 prefix_ids = self._engine._get_text_ids(
                     text[:position], normalized=True
                 )
-                if len(prefix_ids[0]) <= MAX_CHUNK_TOKENS:
+                if len(prefix_ids[0]) <= self.max_chunk_tokens:
                     best = position
                     low = middle + 1
                 else:
@@ -173,7 +191,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
 
             combined = pending_text + chunk
             combined_ids = self._engine._get_text_ids(combined, normalized=True)
-            if len(combined_ids[0]) <= MAX_CHUNK_TOKENS:
+            if len(combined_ids[0]) <= self.max_chunk_tokens:
                 pending_text, pending_ids = combined, combined_ids
                 continue
 
@@ -183,26 +201,29 @@ class Vits2TensorRTAdapter(TTSAdapter):
         if pending_text:
             yield pending_text, pending_ids
 
-    def synthesize(self, text: str) -> bytes:
-        return b"".join(self.synthesize_stream(text))
-
-    def synthesize_stream(self, text: str):
+    def iter_text_chunks(self, text: str):
+        """Yield the exact normalized text chunks and IDs used in production."""
         text = text.strip()
         if not text:
             raise ValueError("TTS text must not be empty")
         from .runtime.frontend.cleaner import normalize_text_mix
 
-        text = normalize_text_mix(text)
+        yield from self._iter_text_chunks(normalize_text_mix(text))
+
+    def synthesize(self, text: str) -> bytes:
+        return b"".join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
         pause_samples = SAMPLE_RATE * CHUNK_PAUSE_MS // 1000
         silence = b"\x00\x00" * pause_samples
         with self._lock:
             for chunk_index, (chunk, text_ids) in enumerate(
-                self._iter_text_chunks(text)
+                self.iter_text_chunks(text)
             ):
                 token_count = len(text_ids[0])
                 log.info(
                     "text redacted: chars=%d chunk=%d tokens=%d",
-                    len(text),
+                    len(text.strip()),
                     chunk_index,
                     token_count,
                 )

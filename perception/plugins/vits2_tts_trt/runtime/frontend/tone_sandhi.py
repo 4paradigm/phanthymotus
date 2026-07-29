@@ -595,6 +595,10 @@ class ToneSandhi:
                         elif (
                             i == 1
                             and not self._all_tone_three(sub)
+                            and finals_list[i]
+                            and finals_list[i][0]
+                            and finals_list[0]
+                            and finals_list[0][-1]
                             and finals_list[i][0][-1] == "3"
                             and finals_list[0][-1][-1] == "3"
                         ):
@@ -612,7 +616,10 @@ class ToneSandhi:
         return finals
 
     def _all_tone_three(self, finals: List[str]) -> bool:
-        return all(x[-1] == "3" for x in finals)
+        # Punctuation/foreign fragments can produce an empty finals token.
+        # They are not a valid all-third-tone word and must not crash the
+        # MIX frontend while checking the adjacent segment.
+        return bool(finals) and all(x and x[-1] == "3" for x in finals)
 
     # merge "不" and the word behind it
     # if don't merge, "不" sometimes appears alone according to jieba, which may occur sandhi error
@@ -637,7 +644,7 @@ class ToneSandhi:
     # input seg: [('听', 'v'), ('一', 'm'), ('听', 'v')]
     # output seg: [['听一听', 'v']]
     def _merge_yi(self, seg: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        new_seg = [] * len(seg)
+        new_seg = []
         # function 1
         i = 0
         while i < len(seg):
@@ -649,7 +656,11 @@ class ToneSandhi:
                 and seg[i - 1][0] == seg[i + 1][0]
                 and seg[i - 1][1] == "v"
             ):
-                new_seg[i - 1][0] = new_seg[i - 1][0] + "一" + new_seg[i - 1][0]
+                repeated = seg[i - 1][0]
+                if new_seg and new_seg[-1][0] == repeated:
+                    new_seg[-1][0] = repeated + "一" + repeated
+                else:
+                    new_seg.append([repeated + "一" + repeated, seg[i - 1][1]])
                 i += 2
             else:
                 if (
@@ -662,7 +673,7 @@ class ToneSandhi:
                 else:
                     new_seg.append([word, pos])
                 i += 1
-        seg = [i for i in new_seg if len(i) > 0]
+        seg = new_seg
         new_seg = []
         # function 2
         for i, (word, pos) in enumerate(seg):
@@ -721,6 +732,9 @@ class ToneSandhi:
         for i, (word, pos) in enumerate(seg):
             if (
                 i - 1 >= 0
+                and sub_finals_list[i - 1]
+                and sub_finals_list[i - 1][-1]
+                and sub_finals_list[i][0]
                 and sub_finals_list[i - 1][-1][-1] == "3"
                 and sub_finals_list[i][0][-1] == "3"
                 and not merge_last[i - 1]

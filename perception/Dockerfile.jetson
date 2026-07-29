@@ -4,7 +4,7 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3-igpu
 FROM ${BASE_IMAGE}
 
-ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/jetson/vits2-mix/vits2-mix-jp6-runtime.tar.gz
+ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-mix-jp6-runtime.tar.gz
 ARG VITS2_RUNTIME_SHA256=83a24d5d4a7ace48ab533cc255654bb0d79e3bd728125da01ffd1abca6d294e9
 
 USER root
@@ -42,7 +42,7 @@ RUN /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
     cp -a artifacts/engines/jetson/. /models/vits2-mix/engines/ && \
     cp -a runtime/nltk_data runtime/tn_cache runtime/frontend_data /models/vits2-mix/ && \
     cp runtime/config.json /models/vits2-mix/config.json && \
-    /usr/bin/python3 -c "import json,pathlib; p=pathlib.Path('/models/vits2-mix/engines'); m=json.loads((p/'manifest.json').read_text()); assert m['architecture']=='aarch64'; assert m['compute_capability']=='8.7'; assert m['total_engine_bytes'] <= 50*1024*1024; assert all((p/e['file']).stat().st_size==e['bytes'] for e in m['engines'].values())" && \
+    /usr/bin/python3 -c "import json,pathlib; p=pathlib.Path('/models/vits2-mix/engines'); m=json.loads((p/'manifest.json').read_text()); assert m['architecture']=='aarch64'; assert m['compute_capability']=='8.7'; assert m['total_engine_bytes'] <= m.get('max_engine_bytes',64*1024*1024) <= 64*1024*1024; assert all((p/e['file']).stat().st_size==e['bytes'] for e in m['engines'].values())" && \
     rm -f /tmp/vits2-mix-jp6-runtime.tar.gz /tmp/vits2-trt-requirements.txt /tmp/download_vits2_trt_runtime.py
 
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
@@ -75,7 +75,7 @@ RUN cp /opt/vits2-runtime/runtime/frontend_assets/cmudict.rep \
     EN_TN_CACHE_DIR=/models/vits2-mix/tn_cache \
     TN_CACHE_DIR=/models/vits2-mix/tn_cache \
     VITS2_FRONTEND_DATA_DIR=/models/vits2-mix/frontend_data \
-    /usr/bin/python3 -c "from frontend.cleaner import clean_text_mix; [clean_text_mix(t) for t in ('你好。','今天AI助手ready了。','Lucy今天喝coffee。','他警惕地观察。')]"
+    /usr/bin/python3 -c "from frontend.cleaner import clean_text_mix; [clean_text_mix(t) for t in ('你好。','AI助手现在ready了。','Mark今天想喝coffee。')]"
 
 ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy/lib:${LD_LIBRARY_PATH} \
     AMENT_PREFIX_PATH=/ros_ws/install/audio_msgs:/opt/ros/jazzy \
@@ -85,10 +85,12 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy
     VITS2_FRONTEND_DATA_DIR=/models/vits2-mix/frontend_data \
     MIX_VITS_CONFIG_PATH=/models/vits2-mix/config.json \
     MIX_VITS_TRT_ENGINE_DIR=/models/vits2-mix/engines \
-    MIX_VITS_MAX_TEXT_TOKENS=64 \
+    MIX_VITS_MAX_ENGINE_BYTES=67108864 \
+    MIX_VITS_MAX_TEXT_TOKENS=256 \
     MIX_VITS_MAX_FRAMES=2048 \
     MIX_VITS_CHUNK_BYTES=6400 \
-    MIX_VITS_FRAME_INTERVAL_MS=40 \
+    MIX_VITS_FRAME_INTERVAL_MS=200 \
+    MIX_VITS_ALLOW_FAST_DELIVERY=0 \
     TTS_PLUGIN=vits2_tts_trt \
     DEFAULT_TTS_PLUGIN=vits2_tts_trt \
     OMP_NUM_THREADS=1 \

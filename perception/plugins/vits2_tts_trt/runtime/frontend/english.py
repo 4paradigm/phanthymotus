@@ -20,8 +20,19 @@ from g2p_en import G2p
 EN_TN_CACHE_DIR = os.getenv("EN_TN_CACHE_DIR", os.path.join(project_root, "tn_cache"))
 EN_TN_MODE = os.getenv("EN_TN_MODE", "auto").lower()
 
-CMU_DICT_PATH = os.path.join(current_file_path, "cmudict.rep")
-CACHE_PATH = os.path.join(current_file_path, "cmudict_cache.pickle")
+_frontend_data_dir = os.getenv("VITS2_FRONTEND_DATA_DIR", "")
+CMU_DICT_PATH = os.getenv(
+    "VITS2_CMU_DICT_PATH",
+    os.path.join(_frontend_data_dir, "cmudict.rep")
+    if _frontend_data_dir
+    else os.path.join(current_file_path, "cmudict.rep"),
+)
+CACHE_PATH = os.getenv(
+    "VITS2_CMU_CACHE_PATH",
+    os.path.join(_frontend_data_dir, "cmudict_cache.pickle")
+    if _frontend_data_dir
+    else os.path.join(current_file_path, "cmudict_cache.pickle"),
+)
 _g2p = G2p()
 _normalizer = None
 

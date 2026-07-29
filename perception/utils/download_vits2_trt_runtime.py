@@ -11,7 +11,7 @@ from urllib.request import urlopen
 
 
 DEFAULT_URL = (
-    "http://172.28.4.81:34567/liaoqianqian/jetson/vits2-mix/"
+    "http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/"
     "vits2-mix-jp6-runtime.tar.gz"
 )
 

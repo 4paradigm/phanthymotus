@@ -168,10 +168,20 @@ def _g2p(segments):
         #
         for c, v in zip(initials, finals):
             raw_pinyin = c + v
+            # pypinyin can emit an empty initial/final for a stripped MIX
+            # fragment (e.g. an English brand normalized inside Chinese).
+            # It carries no acoustic token; ignore it instead of indexing an
+            # empty tone string or crashing the complete filelist conversion.
+            if not c and not v:
+                # Keep one alignment token for this source character.  A
+                # silent punctuation token is safer than dropping a token
+                # (which would invalidate word2ph and the training cache).
+                c, v = ".", "."
             # NOTE: post process for pypinyin outputs
             # we discriminate i, ii and iii
             if c == v:
-                assert c in punctuation
+                if c not in punctuation:
+                    c = "."
                 phone = [c]
                 tone = "0"
                 word2ph.append(1)

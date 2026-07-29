@@ -61,6 +61,11 @@ _PUNCT_SET = set(punctuation)
 _EN_TOKEN_RE = re.compile(r"[A-Za-z0-9'-]+")
 _NON_ZH_PIECE_RE = re.compile(r"[A-Za-z0-9'-]+|[^\w\s]", re.UNICODE)
 _LETTER_SPELLED_UNITS = {"KB", "MB", "GB", "TB", "PB", "KBPS", "MBPS", "GBPS"}
+# Deterministic pronunciations missing from the stock CMU dictionary. Keep this
+# tiny and release-controlled: training/export and deployed runtime must match.
+_CUSTOM_EN_PRONUNCIATIONS = {
+    "IELTS": [["AY1"], ["EH0", "L", "T", "S"]],
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -139,8 +144,9 @@ def _en_token_to_phones(word: str):
             phones.extend(letter_phones)
             tones.extend(letter_tones)
         return phones, tones
-    if word.upper() in eng_dict:
-        for syllable in eng_dict[word.upper()]:
+    syllables = _CUSTOM_EN_PRONUNCIATIONS.get(word.upper(), eng_dict.get(word.upper()))
+    if syllables is not None:
+        for syllable in syllables:
             for phn in syllable:
                 phn, tone = refine_ph(phn)
                 phones.append(post_replace_ph(phn))

@@ -13,7 +13,7 @@ ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
-ARG VITS2_RESOURCE_BASE_URL=http://172.28.4.81:34567/liaoqianqian/jetson/vits2-mix
+ARG VITS2_RESOURCE_BASE_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix
 
 ENV TTS_PLUGIN=vits2_tts DEFAULT_TTS_PLUGIN=vits2_tts
 
