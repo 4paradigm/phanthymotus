@@ -6,6 +6,10 @@ FROM ${BASE_IMAGE}
 
 ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-mix-jp6-runtime.tar.gz
 ARG VITS2_RUNTIME_SHA256=83a24d5d4a7ace48ab533cc255654bb0d79e3bd728125da01ffd1abca6d294e9
+ARG LC1_RELEASE_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_jetson_bundle_lc1_v0_170k.tar.gz
+ARG LC1_RELEASE_SHA256=6c097dabcc65f38121be78eecbe0bf71771f8fddf13ad14ca9a04d8e7160e8cc
+ARG LC1_ENGINE_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_170k_orin_engines.tar.gz
+ARG LC1_ENGINE_SHA256=3df757ffd61debb1a15c55f841b2162e3766c80d44f92ac822c1e5af36dd71a6
 
 USER root
 
@@ -39,11 +43,28 @@ RUN /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
     /usr/bin/python3 -m pip install --no-cache-dir --no-index \
       --find-links=artifacts/jetson-deps/wheels -r /tmp/vits2-trt-requirements.txt && \
     /usr/bin/python3 -c "import ctypes,numpy,pynini,tn; ctypes.CDLL('libcudart.so')" && \
-    cp -a artifacts/engines/jetson/. /models/vits2-mix/engines/ && \
-    cp -a runtime/nltk_data runtime/tn_cache runtime/frontend_data /models/vits2-mix/ && \
-    cp runtime/config.json /models/vits2-mix/config.json && \
+    cp -a runtime/nltk_data /models/vits2-mix/
+
+# LC1 model resources are versioned outside the public repository, verified at
+# build time, and baked into the image under the paths consumed by the plugin.
+RUN /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+      --url "$LC1_RELEASE_URL" --sha256 "$LC1_RELEASE_SHA256" \
+      --output /tmp/lc1-release.tar.gz && \
+    /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+      --url "$LC1_ENGINE_URL" --sha256 "$LC1_ENGINE_SHA256" \
+      --output /tmp/lc1-engines.tar.gz && \
+    mkdir -p /opt/lc1 /models/vits2-mix/engines && \
+    tar --no-same-owner -xzf /tmp/lc1-release.tar.gz -C /opt/lc1 && \
+    tar --no-same-owner -xzf /tmp/lc1-engines.tar.gz \
+      -C /opt/lc1/lc1_jetson_bundle && \
+    cp -a /opt/lc1/lc1_jetson_bundle/engines/. /models/vits2-mix/engines/ && \
+    cp -a /opt/lc1/lc1_jetson_bundle/tn_cache \
+      /opt/lc1/lc1_jetson_bundle/frontend_data /models/vits2-mix/ && \
+    cp /opt/lc1/lc1_jetson_bundle/config.json /models/vits2-mix/config.json && \
     /usr/bin/python3 -c "import json,pathlib; p=pathlib.Path('/models/vits2-mix/engines'); m=json.loads((p/'manifest.json').read_text()); assert m['architecture']=='aarch64'; assert m['compute_capability']=='8.7'; assert m['total_engine_bytes'] <= m.get('max_engine_bytes',64*1024*1024) <= 64*1024*1024; assert all((p/e['file']).stat().st_size==e['bytes'] for e in m['engines'].values())" && \
-    rm -f /tmp/vits2-mix-jp6-runtime.tar.gz /tmp/vits2-trt-requirements.txt /tmp/download_vits2_trt_runtime.py
+    rm -f /tmp/vits2-mix-jp6-runtime.tar.gz /tmp/lc1-release.tar.gz \
+      /tmp/lc1-engines.tar.gz /tmp/vits2-trt-requirements.txt \
+      /tmp/download_vits2_trt_runtime.py
 
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
 RUN cd /ros_ws && . /opt/ros/jazzy/setup.bash && \
@@ -60,9 +81,9 @@ COPY perception/plugins/vits2_tts_trt/ /work/plugins/vits2_tts_trt/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/start_vits2_trt.sh /work/start_vits2_trt.sh
 
-RUN cp /opt/vits2-runtime/runtime/frontend_assets/cmudict.rep \
+RUN cp /models/vits2-mix/frontend_data/cmudict.rep \
        /work/plugins/vits2_tts_trt/runtime/frontend/cmudict.rep && \
-    cp /opt/vits2-runtime/runtime/frontend_assets/cmudict_cache.pickle \
+    cp /models/vits2-mix/frontend_data/cmudict_cache.pickle \
        /work/plugins/vits2_tts_trt/runtime/frontend/cmudict_cache.pickle && \
     test -s /models/vits2-mix/tn_cache/zh_tn_tagger.fst && \
     test -s /models/vits2-mix/tn_cache/zh_tn_verbalizer.fst && \
