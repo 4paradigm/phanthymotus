@@ -10,7 +10,7 @@ from typing import Callable, Deque, Iterable, Optional
 
 
 SAMPLE_RATE = 16000
-_SUPPORTED_VAD_BACKENDS = {"energy", "sherpa_onnx", "webrtc"}
+_SUPPORTED_VAD_BACKENDS = {"energy", "sherpa_onnx", "webrtc", "firered"}
 
 try:
     import numpy as _np
@@ -55,6 +55,8 @@ def normalize_vad_backend(backend: str | None) -> str:
         "silero": "sherpa_onnx",
         "silero_onnx": "sherpa_onnx",
         "webrtcvad": "webrtc",
+        "fireredvad": "firered",
+        "fire_red": "firered",
     }
     name = aliases.get(name, name)
     if name not in _SUPPORTED_VAD_BACKENDS:
@@ -366,6 +368,112 @@ class _SherpaVadSession:
         return self._completed.popleft()[0]
 
 
+class _FireRedVadSession:
+    """FireRedVAD (DFSMN ONNX) session: buffer + periodic re-detection.
+
+    FireRedVAD is non-streaming, so we buffer all PCM since init() and
+    re-run detection as new audio arrives (2.2MB model, ~15ms per detect on
+    ~1s audio — cheap enough per chunk batch). A segment is emitted once
+    its end has been followed by >= silence_ms of non-speech, with pre_roll
+    and a 300ms tail pad to protect weak trailing syllables (same rationale
+    as the silero _drain tail pad, see [[asr-miss-root-cause]]).
+
+    Scores 97.57 F1 vs silero 95.95 on FLEURS-VAD-102; on our 12-case eval
+    it does not truncate case 7's trailing syllable where silero did.
+    """
+
+    _REDETECT_SAMPLES = int(SAMPLE_RATE * 0.3)  # re-detect every ~0.3s new audio
+    _TAIL_PAD_S = 0.3
+
+    def __init__(
+        self,
+        threshold: float,
+        silence_ms: int,
+        pre_roll_ms: int,
+        model_dir: str,
+        sample_rate: int = SAMPLE_RATE,
+    ):
+        from plugins.firered_vad import FireRedVadOnnx
+
+        self._detector = FireRedVadOnnx(
+            model_dir,
+            speech_threshold=threshold,
+            min_silence_frame=max(1, round(silence_ms / 10)),
+        )
+        self._sample_rate = sample_rate
+        self._silence_s = silence_ms / 1000.0
+        self._pre_roll_s = pre_roll_ms / 1000.0
+        self._pcm = bytearray()
+        self._emitted = 0
+        self._detect_at = 0
+        self._completed: Deque[tuple[bytes, float, float]] = deque()
+
+    def reset(self) -> None:
+        self._pcm.clear()
+        self._emitted = 0
+        self._detect_at = 0
+        self._completed.clear()
+
+    def _total_s(self) -> float:
+        return len(self._pcm) / 2 / self._sample_rate
+
+    def _slice(self, start_s: float, end_s: float) -> bytes:
+        start_b = max(0, int(start_s * self._sample_rate) * 2)
+        end_b = min(len(self._pcm), int(end_s * self._sample_rate) * 2)
+        return bytes(self._pcm[start_b:end_b])
+
+    def _detect_segments(self):
+        if _np is None:
+            raise RuntimeError("firered VAD requires numpy")
+        # kaldi_native_fbank expects raw int16-range amplitudes (as in
+        # fireredvad's AudioFeat), NOT normalized [-1, 1] floats.
+        samples = _np.frombuffer(bytes(self._pcm), dtype="<i2").astype(_np.float32)
+        if samples.shape[0] < int(0.05 * self._sample_rate):
+            return []
+        return self._detector.detect(samples)
+
+    def _emit_ready(self, now_ts: float, final: bool) -> None:
+        total_s = self._total_s()
+        try:
+            segs = self._detect_segments()
+        except Exception as e:  # pragma: no cover - defensive
+            logger_warning = logging.getLogger("asr_runtime.firered")
+            logger_warning.warning(f"[firered-vad] detect failed: {e}")
+            return
+        for i in range(self._emitted, len(segs)):
+            start_s, end_s = segs[i]
+            if not final and end_s > total_s - self._silence_s:
+                break  # still collecting silence evidence after this segment
+            start = max(0.0, start_s - self._pre_roll_s)
+            end = min(end_s + self._TAIL_PAD_S, total_s)
+            utterance = self._slice(start, end)
+            start_ts = now_ts - (total_s - start)
+            end_ts = now_ts - (total_s - end)
+            self._completed.append((utterance, start_ts, end_ts))
+            self._emitted = i + 1
+
+    def process_chunk(
+        self, chunk: bytes, now_ts: float
+    ) -> Optional[tuple[bytes, float, float]]:
+        if chunk:
+            self._pcm += chunk
+            if len(self._pcm) // 2 - self._detect_at >= self._REDETECT_SAMPLES:
+                self._detect_at = len(self._pcm) // 2
+                self._emit_ready(now_ts, final=False)
+        return self._completed.popleft() if self._completed else None
+
+    def flush(self) -> bytes:
+        self._emit_ready(0.0, final=True)
+        if not self._completed:
+            return b""
+        # Concatenate any remaining utterances; eval sends one utterance per
+        # case, and offline ASR handles a silence gap inside fine.
+        parts = []
+        while self._completed:
+            parts.append(self._completed.popleft()[0])
+        return b"".join(parts)
+
+
 class VadSession:
     """Backend-selecting VAD session shared by ROS and WebSocket ASR."""
 
@@ -380,6 +488,10 @@ class VadSession:
         self.backend = normalize_vad_backend(backend)
         if self.backend == "sherpa_onnx":
             self._impl = _SherpaVadSession(
+                threshold, silence_ms, pre_roll_ms, model_dir
+            )
+        elif self.backend == "firered":
+            self._impl = _FireRedVadSession(
                 threshold, silence_ms, pre_roll_ms, model_dir
             )
         else:

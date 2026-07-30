@@ -76,12 +76,20 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
+# ── FireRedVAD deps (kaldi_native_fbank only; onnxruntime comes with sherpa-onnx) ──
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} kaldi_native_fbank
+
 # ── Offline ASR model ─────────────────────────────────────────────
 ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/x_asr_punct_int8
 COPY perception/utils/asr_model_downloader.py /tmp/asr_model_downloader.py
 RUN python3 /tmp/asr_model_downloader.py \
     --base-url "${ASR_OFFLINE_MODEL_BASE_URL}" \
     --output-dir /models/sherpa-onnx/x_asr_punct_int8 --model x_asr
+
+# ── FireRedVAD model (ONNX export of DFSMN, ~2.4MB) ───────────────
+RUN python3 /tmp/asr_model_downloader.py \
+    --base-url "http://172.28.4.81:34567/zengzhitao/embodied-ai/firered_vad" \
+    --output-dir /models/firered_vad --model firered_vad
 
 # ── VAD model (sherpa-onnx Silero VAD) ────────────────────────────
 RUN mkdir -p /models/sherpa-onnx/vad && \

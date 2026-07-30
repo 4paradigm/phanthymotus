@@ -32,6 +32,14 @@ X_ASR_PUNCT_INT8_FILES = (
     "hotwords.txt",
 )
 
+# FireRedVAD (DFSMN, exported to ONNX — see plugins/firered_vad.py header)
+# .onnx.data holds the weights (external-data format from the torch 2.x exporter)
+FIRERED_VAD_FILES = (
+    "firered_vad.onnx",
+    "firered_vad.onnx.data",
+    "cmvn.npz",
+)
+
 
 def download_model(
     base_url: str,
@@ -67,14 +75,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        choices=("x_asr", "paraformer"),
+        choices=("x_asr", "paraformer", "firered_vad"),
         default="paraformer",
         help="model family to download (default: paraformer)",
     )
     args = parser.parse_args()
-    filenames = (
-        X_ASR_PUNCT_INT8_FILES if args.model == "x_asr" else OFFICIAL_PARAFORMER_FILES
-    )
+    if args.model == "x_asr":
+        filenames = X_ASR_PUNCT_INT8_FILES
+    elif args.model == "firered_vad":
+        filenames = FIRERED_VAD_FILES
+    else:
+        filenames = OFFICIAL_PARAFORMER_FILES
     download_model(args.base_url, args.output_dir, filenames)
 
 

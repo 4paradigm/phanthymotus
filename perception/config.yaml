@@ -32,11 +32,11 @@ plugins:
         modelingUnit: bpe
         bpeVocab: bpe.vocab
     vad:
-      model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
-      threshold: 0.5
+      model: firered      # firered (DFSMN ONNX, F1 97.57) | sherpa_onnx (silero, F1 95.95) | webrtc
+      threshold: 0.4      # firered 官方推荐 0.4
       silence_ms: 400
       pre_roll_ms: 500
-      model_dir: /models/sherpa-onnx/vad
+      model_dir: /models/firered_vad
     kws:
       enabled: true
       model_dir: /models/sherpa-onnx/kws
