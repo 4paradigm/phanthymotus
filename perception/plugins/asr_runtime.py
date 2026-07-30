@@ -369,19 +369,19 @@ class _SherpaVadSession:
 
 
 class _FireRedVadSession:
-    """FireRedVAD (DFSMN ONNX) session: buffer all audio, detect on flush.
+    """FireRedVAD (DFSMN ONNX) session: buffer audio, detect after trailing silence.
 
-    FireRedVAD is non-streaming — we buffer all PCM since init() and run
-    one detect on flush (after the eval pipeline sends its trailing
-    silence). Each returned segment gets pre_roll + 300ms tail pad to
-    protect weak trailing syllables (see [[asr-miss-root-cause]] — same
-    rationale as the silero _drain tail pad).
+    FireRedVAD is non-streaming, so we buffer all PCM and run one detect
+    after seeing >= silence_ms of actual silence (zero-valued PCM). This
+    matches the eval pipeline's "send audio → send 1500ms silence → flush"
+    flow without the segment-boundary drift of incremental re-detection.
 
-    Scores 97.57 F1 vs silero 95.95 on FLEURS-VAD-102; on our 12-case
-    eval it does not truncate case 7's trailing syllable where silero did.
+    Each returned segment gets pre_roll + 300ms tail pad to protect weak
+    trailing syllables (see [[asr-miss-root-cause]]).
     """
 
     _TAIL_PAD_S = 0.3
+    _SILENCE_TO_DETECT_S = 1.0  # run one detect after >=1s of trailing silence
 
     def __init__(
         self,
@@ -401,21 +401,15 @@ class _FireRedVadSession:
         self._sample_rate = sample_rate
         self._pre_roll_s = pre_roll_ms / 1000.0
         self._pcm = bytearray()
+        self._detected = False
+        self._silence_samples = 0
         self._completed: Deque[tuple[bytes, float, float]] = deque()
-        self._has_audio = False
 
     def reset(self) -> None:
         self._pcm.clear()
+        self._detected = False
+        self._silence_samples = 0
         self._completed.clear()
-        self._has_audio = False
-
-    def process_chunk(
-        self, chunk: bytes, now_ts: float
-    ) -> Optional[tuple[bytes, float, float]]:
-        if chunk:
-            self._pcm += chunk
-            self._has_audio = True
-        return None  # never emit mid-stream; batch-detect on flush
 
     def _total_s(self) -> float:
         return len(self._pcm) / 2 / self._sample_rate
@@ -425,29 +419,58 @@ class _FireRedVadSession:
         end_b = min(len(self._pcm), int(end_s * self._sample_rate) * 2)
         return bytes(self._pcm[start_b:end_b])
 
-    def flush(self) -> bytes:
-        if not self._has_audio or _np is None:
-            return b""
+    def _run_detect(self) -> None:
+        if self._detected or _np is None:
+            return
         total_s = self._total_s()
-        # kaldi_native_fbank expects raw int16-range amplitudes
         samples = _np.frombuffer(bytes(self._pcm), dtype="<i2").astype(_np.float32)
         if samples.shape[0] < int(0.05 * self._sample_rate):
-            return b""
+            return
         try:
             segs = self._detector.detect(samples)
         except Exception as e:
             logger_fr = logging.getLogger("asr_runtime.firered")
             logger_fr.warning(f"[firered-vad] detect failed: {e}")
-            return b""
+            return
+        self._detected = True
         if not segs:
-            return b""
-        # merge segments: concat with tail pad between them
+            return
         parts = []
         for start_s, end_s in segs:
             start = max(0.0, start_s - self._pre_roll_s)
             end = min(end_s + self._TAIL_PAD_S, total_s)
             parts.append(self._slice(start, end))
-        return b"".join(parts)
+        utterance = b"".join(parts)
+        # timestamps are approximate: span covers all audio up to total_s
+        self._completed.append((
+            utterance,
+            -total_s,  # start_ts relative (not used by caller)
+            0.0,
+        ))
+
+    def process_chunk(
+        self, chunk: bytes, now_ts: float
+    ) -> Optional[tuple[bytes, float, float]]:
+        if self._detected:
+            return self._completed.popleft() if self._completed else None
+        silence_thresh_samples = int(self._SILENCE_TO_DETECT_S * self._sample_rate)
+        if chunk:
+            self._pcm += chunk
+            # is this chunk all-zero? (PCM16 silence)
+            if chunk == b"\x00" * len(chunk):
+                self._silence_samples += len(chunk) // 2
+            else:
+                self._silence_samples = 0
+            if self._silence_samples >= silence_thresh_samples:
+                self._run_detect()
+        return self._completed.popleft() if self._completed else None
+
+    def flush(self) -> bytes:
+        if not self._detected:
+            self._run_detect()
+        if not self._completed:
+            return b""
+        return self._completed.popleft()[0]
 
 
 class VadSession:
