@@ -4,11 +4,13 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3-igpu
 FROM ${BASE_IMAGE}
 
-ARG VITS_MODEL_RELEASE=lc1_v0_214k
+ARG VITS_MODEL_RELEASE=lc1_v0_240k
 ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-mix-jp6-runtime-deps.tar.gz
 ARG VITS2_RUNTIME_SHA256=8a36fad685c2dee4063f6a9c719a02a6e9256c8d681eae3e190bde23c70ebc0f
 ARG LC1_V0_214K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_214k_runtime.tar.gz
 ARG LC1_V0_214K_SHA256=05b584727c37f224650cac319cae3b17e0bbf85df6ac509dd6edcffd75cca584
+ARG LC1_V0_240K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_240k_runtime.tar.gz
+ARG LC1_V0_240K_SHA256=5a285d54879712ae11e3a4ca84412162bf0b713d6fab905b66b927cf761d3470
 ARG VITS256_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits256_runtime.tar.gz
 ARG VITS256_SHA256=a9538e7a4469c6f297d0f8c609655505624a430b39ecff9befcff18f8e77c58f
 
@@ -60,6 +62,10 @@ RUN mkdir -p /models/releases && \
       lc1_v0_214k) \
         /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
           --url "$LC1_V0_214K_URL" --sha256 "$LC1_V0_214K_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      lc1_v0_240k) \
+        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+          --url "$LC1_V0_240K_URL" --sha256 "$LC1_V0_240K_SHA256" \
           --output /tmp/model-release.tar.gz ;; \
       *) \
         echo "Unsupported VITS_MODEL_RELEASE=$VITS_MODEL_RELEASE" >&2; exit 2 ;; \
@@ -115,7 +121,9 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy
     MIX_VITS_MAX_FRAMES=2048 \
     MIX_VITS_CHUNK_BYTES=3200 \
     MIX_VITS_FRAME_INTERVAL_MS=85 \
-    MIX_VITS_FIRST_FRAME_DELAY_MS=100 \
+    MIX_VITS_FIRST_FRAME_DELAY_MS=0 \
+    MIX_VITS_SUBSCRIBER_WAIT_MS=5000 \
+    MIX_VITS_SUBSCRIBER_POLL_MS=10 \
     MIX_VITS_ALLOW_FAST_DELIVERY=1 \
     TTS_PLUGIN=vits2_tts_trt \
     DEFAULT_TTS_PLUGIN=vits2_tts_trt \
