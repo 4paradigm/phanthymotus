@@ -401,6 +401,7 @@ class RapidOCRAdapter:
 
         self._use_angle_cls = use_angle_cls
         self._max_side_len = max_side_len
+        self._rec_min_score = float(rec_min_score)
         self._request_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         strategy_config = LargeImageStrategyConfig.from_mapping(
@@ -471,6 +472,11 @@ class RapidOCRAdapter:
                 "model_type": "tiny",
                 "ocr_version": "PP-OCRv6",
                 "model_path": str(root / "det.onnx"),
+                # 必须显式转发：rapidocr 默认 unclip_ratio=1.6/thresh/box_thresh
+                # 与 MNN 管线参数不一致会导致 ORT 结果偏离生产配置
+                "thresh": float(det_thresh),
+                "box_thresh": float(det_box_thresh),
+                "unclip_ratio": float(det_unclip_ratio),
             }
         )
         cfg["Cls"].update(
@@ -542,7 +548,12 @@ class RapidOCRAdapter:
                 use_cls=self._use_angle_cls,
                 use_rec=True,
             )
-        return normalize_rapidocr_output(output, round_bbox=False)
+        items = normalize_rapidocr_output(output, round_bbox=False)
+        # 与 _MNNPipeline.infer 对齐：ORT 路径同样应用 rec_min_score 过滤
+        return [
+            item for item in items
+            if item["text"].strip() and item["score"] >= self._rec_min_score
+        ]
 
     def _recognize_single_pass(self, image_bytes: bytes) -> list[dict]:
         header = self._probe_image_header(image_bytes)
