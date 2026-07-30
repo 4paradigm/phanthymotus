@@ -1194,11 +1194,21 @@ class ASRPlugin:
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "message": f"Switching to model '{self._asr_model}', downloading..."}
-            # Stop all nodes but keep them in executor (preserves publisher for DDS discovery)
-            # Only stop VAD/subscription internals — node + publisher stay alive
-            for key in list(self._nodes.keys()):
-                node = self._nodes[key]
+            # Hot-reload: stop running nodes, apply new config, restart automatically
+            was_running = [(key, node) for key, node in self._nodes.items() if node.state == "running"]
+            for key, node in was_running:
                 node.stop()
+            # Sync updated config into nodes and restart
+            for key, node in was_running:
+                node._adapter = self._adapter
+                node._language = self._language
+                node._vad_backend = self._vad_backend
+                node._vad_threshold = self._vad_threshold
+                node._vad_silence_ms = self._vad_silence_ms
+                node._kws_cfg = self._kws_cfg
+                node._save_vad_segments = self._save_vad_segments
+                node._max_saved_segments = self._max_saved_segments
+                node.start()
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None
