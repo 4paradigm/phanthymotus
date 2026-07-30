@@ -259,6 +259,11 @@ class OfflineASRAdapter:
             raw_pcm = wav_file.readframes(wav_file.getnframes())
 
         samples = pcm16_to_float_samples(raw_pcm)
+        # 0.5s tail padding: critical for transducer to decode final tokens
+        # (without this, short utterance ends can regress to wrong language/output).
+        # param_experiment.py verified: mbs(5)+hotwords ARM 1-CER 0.8388 with pad,
+        # vs 0.7130/degraded-to-English without.  [[arm-int8-drift]]
+        samples.extend([0.0] * int(sample_rate * 0.5))
         with self._decode_lock:
             stream = self._recognizer.create_stream()
             stream.accept_waveform(sample_rate, samples)
