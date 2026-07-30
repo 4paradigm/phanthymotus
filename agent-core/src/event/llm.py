@@ -570,13 +570,32 @@ class Event:
         frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
 
         finish_tool = 'finish'
-        max_rounds  = 20
+        llm_cfg = config.main.get('event', {}).get('llm', {})
+        max_rounds  = llm_cfg.get('max_rounds', 100)
+        truncate_keep = llm_cfg.get('truncate_keep_rounds', 50)
+        absolute_max = max_rounds * 5  # 绝对上限防死循环
         response    = None
         decisions   = []
         turn_messages = self._current_turn  # alias for brevity
         _turn_usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'cached_tokens': 0}
 
-        for round_idx in range(max_rounds):
+        round_idx = 0
+        total_rounds = 0
+        while True:
+            # ── 绝对上限检查 ──────────────────────────────────────────────
+            if total_rounds >= absolute_max:
+                print(f'[decision] absolute max {absolute_max} reached, forcing end')
+                break
+
+            # ── 截断续跑：达到 max_rounds 时截断 turn_messages ────────────
+            if round_idx >= max_rounds:
+                if len(turn_messages) > truncate_keep:
+                    turn_messages_new = [turn_messages[0]] + turn_messages[-truncate_keep:]
+                    turn_messages.clear()
+                    turn_messages.extend(turn_messages_new)
+                round_idx = 0
+                print(f'[decision] hit max_rounds={max_rounds}, truncated turn_messages to {len(turn_messages)}, continuing')
+                await push_event({'type': 'turn_truncated', 'payload': {'kept': len(turn_messages), 'total_rounds': total_rounds}})
             # ── 构建分层 prompt ────────────────────────────────────────────
             history = self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
@@ -793,6 +812,9 @@ class Event:
             if cancel_event and cancel_event.is_set():
                 raise TurnCancelled("Interrupted after tool dispatch")
 
+            round_idx += 1
+            total_rounds += 1
+
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
         await self._maybe_compress()
 
@@ -807,12 +829,12 @@ class Event:
         ros2_bridge.publish('/decision_core', json.dumps(decision, ensure_ascii=False))
 
         await push_event({'type': 'turn_end', 'payload': {
-            'rounds': round_idx + 1,
+            'rounds': total_rounds + 1,
             'duration_s': round(_time.perf_counter() - _turn_t0, 2),
             'usage': _turn_usage,
         }})
         _turn_elapsed = _time.perf_counter() - _turn_t0
-        print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {round_idx + 1} rounds')
+        print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {total_rounds + 1} rounds')
 
         # 性能追踪：提交 spans
         _turn_end_ts = time.time()

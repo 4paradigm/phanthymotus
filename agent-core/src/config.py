@@ -54,6 +54,8 @@ _DB_DEFAULTS = {
             'trigger_interval_ms': 1000,
             'collector_max_window': 20,
             'history_turns': 30,
+            'max_rounds': 100,                  # 单 turn 触发截断续跑的轮数阈值
+            'truncate_keep_rounds': 50,         # 截断时保留最新消息条数
             'compress_threshold_chars': 80000,  # 约 20K tokens，超过此字符数触发压缩
             'compress_keep_recent': 6,          # 压缩时保留最近 N 轮不动
             'source_ring_size': 50,             # per-source ring buffer 大小（供 raw_input_info 查询）
@@ -71,7 +73,7 @@ _DB_DEFAULTS = {
     'subagent': {
         'max_concurrent': 2,
         'max_total': 10,
-        'default_max_rounds': 10,
+        'default_max_rounds': 50,
         'default_timeout_s': 300,
         'preemption_enabled': True,
         'checkpoint_interval': 5,
