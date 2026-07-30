@@ -332,13 +332,20 @@ class _SherpaVadSession:
                     - self._silence_samples,
                 )
             segment_start = int(segment_start)
-            segment_end = segment_start + len(segment_samples)
+            # Extend segment end by tail_pad_ms to capture weak trailing
+            # syllables that the VAD misclassifies as silence (e.g., case 7
+            # "举双手" tail 144ms classified as silence → truncated → hotwords
+            # can't recover).  [[arm-int8-drift]]
+            tail_pad_samples = int(self._sample_rate * 0.3)  # 300ms
+            segment_end_orig = segment_start + len(segment_samples)
+            segment_end = min(segment_end_orig + tail_pad_samples,
+                              self._history.total_samples)
             pre_start = max(0, segment_start - self._pre_roll_samples)
             pre_pcm, start_ts, _ = self._history.slice(pre_start, segment_start)
             segment_pcm, segment_ts, end_ts = self._history.slice(
                 segment_start, segment_end
             )
-            if len(segment_pcm) != len(segment_samples) * 2:
+            if len(segment_pcm) < len(segment_samples) * 2:
                 segment_pcm = float_samples_to_pcm16(segment_samples)
             utterance = pre_pcm + segment_pcm
             if start_ts is None:
