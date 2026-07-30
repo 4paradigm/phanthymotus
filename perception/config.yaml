@@ -5,12 +5,32 @@ plugins:
     enabled: true
     mode: offline          # offline | streaming (online=streaming, segmented=offline are legacy aliases)
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
-    model_path: /models/sherpa-onnx/asr
-    model_dir: /models/sherpa-onnx/asr   # legacy alias of model_path
+    model_path: /models/sherpa-onnx/x_asr_punct_int8
+    model_dir: /models/sherpa-onnx/x_asr_punct_int8   # legacy alias of model_path
     device: cpu            # cpu | cuda (legacy alias: hw_provider)
     hw_provider: cpu
     num_threads: 2
     language: zh-CN
+    # x-asr transducer + modified_beam_search(5) + hotwords：ARM 实测 1-CER 0.8388，
+    # mbs(5) 消除跨平台漂移，hotwords 偏置机器人动作术语（举双手/锁定站立等）再 +3.8pt。
+    # 详见 docs/current-state.md §x-asr hotwords 调参结论。
+    sherpa_config:
+      tokens: tokens.txt
+      numThreads: 2
+      provider: cpu
+      debug: false
+      featureConfig:
+        featureDim: 80
+      recognizerConfig:
+        decodingMethod: modified_beam_search
+        maxActivePaths: 5
+        # hotwords: 逐字空格分隔格式由 asr_offline.py 在加载时从 hotwordsFile
+        # 原文转换（x-asr tokens.txt 全是 ▁X 单字 token，整词 BPE 编码会产出
+        # tokens.txt 里没有的多字 piece，必须逐字喂入）。
+        hotwordsFile: hotwords.txt   # 相对 model_path，234 个机器人动作术语
+        hotwordsScore: 2.0
+        modelingUnit: bpe
+        bpeVocab: bpe.vocab
     vad:
       model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
       threshold: 0.5
