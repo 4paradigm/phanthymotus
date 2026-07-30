@@ -44,13 +44,13 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: true
+    enabled: false  # disabled for ASR-only eval, saves ~125MB download + memory
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
   htmsg:
-    enabled: true
+    enabled: false  # disabled for ASR-only eval
     namespace: ""       # auto-detect from hostname if empty
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
@@ -64,7 +64,7 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: true
+    enabled: false  # disabled for ASR-only eval
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
     confidence: 0.3
