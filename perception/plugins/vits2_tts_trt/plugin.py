@@ -31,6 +31,9 @@ if not 0 <= SUBSCRIBER_WAIT_MS <= 60000:
 SUBSCRIBER_POLL_MS = int(os.getenv("MIX_VITS_SUBSCRIBER_POLL_MS", "10"))
 if not 1 <= SUBSCRIBER_POLL_MS <= 1000:
     raise ValueError("MIX_VITS_SUBSCRIBER_POLL_MS must be between one and 1000")
+SUBSCRIBER_SETTLE_MS = int(os.getenv("MIX_VITS_SUBSCRIBER_SETTLE_MS", "250"))
+if not 0 <= SUBSCRIBER_SETTLE_MS <= 5000:
+    raise ValueError("MIX_VITS_SUBSCRIBER_SETTLE_MS must be between zero and 5000")
 ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "1") == "1"
 if FRAME_INTERVAL_MS < PCM_FRAME_MS and not ALLOW_FAST_DELIVERY:
     raise ValueError(
@@ -146,18 +149,29 @@ class _Vits2TTSNode(Node):
         message.data = list(pcm)
         self._pub.publish(message)
 
-    def _wait_for_audio_subscriber(self) -> tuple[float, int]:
-        """Wait until DDS has matched at least one audio subscriber."""
+    def _wait_for_audio_subscriber(self) -> tuple[float, float, int]:
+        """Wait until an audio subscriber remains DDS-matched long enough."""
         started = time.monotonic()
-        deadline = started + SUBSCRIBER_WAIT_MS / 1000.0
+        deadline = started + (SUBSCRIBER_WAIT_MS + SUBSCRIBER_SETTLE_MS) / 1000.0
+        matched_at = None
         while not self._stop_event.is_set():
+            now = time.monotonic()
             count = self._pub.get_subscription_count()
             if count > 0:
-                return time.monotonic() - started, count
-            if time.monotonic() >= deadline:
+                if matched_at is None:
+                    matched_at = now
+                settled = now - matched_at
+                if settled >= SUBSCRIBER_SETTLE_MS / 1000.0:
+                    return matched_at - started, settled, count
+            else:
+                # Require a continuous stable match. A transient graph match is
+                # not sufficient for a BEST_EFFORT reader to receive frame 0.
+                matched_at = None
+            if now >= deadline:
                 raise RuntimeError(
-                    "no matched TTS audio subscriber within "
-                    f"{SUBSCRIBER_WAIT_MS}ms on {self._output_topic}"
+                    "no stable matched TTS audio subscriber within "
+                    f"{SUBSCRIBER_WAIT_MS + SUBSCRIBER_SETTLE_MS}ms "
+                    f"on {self._output_topic}"
                 )
             time.sleep(SUBSCRIBER_POLL_MS / 1000.0)
         raise RuntimeError("TTS stopped while waiting for an audio subscriber")
@@ -177,16 +191,20 @@ class _Vits2TTSNode(Node):
                 frames_sent = 0
                 buffer = bytearray()
                 subscriber_wait_seconds = None
+                subscriber_settle_seconds = None
                 subscriber_count = 0
 
                 def publish_frame(frame: bytes) -> None:
                     nonlocal started, frames_sent, first_published_at, total_bytes
-                    nonlocal subscriber_wait_seconds, subscriber_count
+                    nonlocal subscriber_wait_seconds, subscriber_settle_seconds
+                    nonlocal subscriber_count
                     now = time.monotonic()
                     if started is None:
-                        subscriber_wait_seconds, subscriber_count = (
-                            self._wait_for_audio_subscriber()
-                        )
+                        (
+                            subscriber_wait_seconds,
+                            subscriber_settle_seconds,
+                            subscriber_count,
+                        ) = self._wait_for_audio_subscriber()
                         if FIRST_FRAME_DELAY_MS:
                             time.sleep(FIRST_FRAME_DELAY_MS / 1000.0)
                         started = time.monotonic()
@@ -225,7 +243,7 @@ class _Vits2TTSNode(Node):
                         "ttft=%.3fs elapsed=%.3fs audio=%.3fs rtf=%.4f "
                         "chunk_bytes=%d frame_interval_ms=%d "
                         "first_frame_delay_ms=%d subscriber_wait_ms=%.1f "
-                        "subscriber_count=%d",
+                        "subscriber_settle_ms=%.1f subscriber_count=%d",
                         total_bytes,
                         frames_sent,
                         first_published_at - task_started,
@@ -236,6 +254,7 @@ class _Vits2TTSNode(Node):
                         FRAME_INTERVAL_MS,
                         FIRST_FRAME_DELAY_MS,
                         (subscriber_wait_seconds or 0.0) * 1000.0,
+                        (subscriber_settle_seconds or 0.0) * 1000.0,
                         subscriber_count,
                     )
             except Exception:
