@@ -4,15 +4,13 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3-igpu
 FROM ${BASE_IMAGE}
 
-ARG VITS_MODEL_VARIANT=vits256
+ARG VITS_MODEL_RELEASE=lc1_v0_214k
 ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-mix-jp6-runtime-deps.tar.gz
 ARG VITS2_RUNTIME_SHA256=49dd734098e28c29732752bcfc2726db7e96ba8f4ff74af94168447e897401cb
-ARG LC1_RELEASE_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_jetson_bundle_lc1_v0_170k.tar.gz
-ARG LC1_RELEASE_SHA256=6c097dabcc65f38121be78eecbe0bf71771f8fddf13ad14ca9a04d8e7160e8cc
-ARG LC1_ENGINE_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_170k_orin_engines.tar.gz
-ARG LC1_ENGINE_SHA256=3df757ffd61debb1a15c55f841b2162e3766c80d44f92ac822c1e5af36dd71a6
-ARG VITS256_MODEL_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-old-text256-runtime.tar.gz
-ARG VITS256_MODEL_SHA256=155373d1953aa631d8a3bca4df0836587c88eeff0f853c336c9498749ff9b8d6
+ARG LC1_V0_214K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_214k_runtime.tar.gz
+ARG LC1_V0_214K_SHA256=05b584727c37f224650cac319cae3b17e0bbf85df6ac509dd6edcffd75cca584
+ARG VITS256_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits256_runtime.tar.gz
+ARG VITS256_SHA256=a9538e7a4469c6f297d0f8c609655505624a430b39ecff9befcff18f8e77c58f
 
 USER root
 
@@ -53,38 +51,23 @@ RUN /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
       /models/vits2-mix/frontend_data/
 
 # Exactly one private model is downloaded and baked into each image.
-RUN case "$VITS_MODEL_VARIANT" in \
+RUN mkdir -p /models/releases && \
+    case "$VITS_MODEL_RELEASE" in \
       vits256) \
         /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
-          --url "$VITS256_MODEL_URL" --sha256 "$VITS256_MODEL_SHA256" \
-          --output /tmp/vits256-model.tar.gz && \
-        tar --no-same-owner -xzf /tmp/vits256-model.tar.gz -C /models ;; \
-      lc1) \
+          --url "$VITS256_URL" --sha256 "$VITS256_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      lc1_v0_214k) \
         /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
-          --url "$LC1_RELEASE_URL" --sha256 "$LC1_RELEASE_SHA256" \
-          --output /tmp/lc1-release.tar.gz && \
-        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
-          --url "$LC1_ENGINE_URL" --sha256 "$LC1_ENGINE_SHA256" \
-          --output /tmp/lc1-engines.tar.gz && \
-        mkdir -p /opt/lc1 /models/vits2-mix/engines && \
-        tar --no-same-owner -xzf /tmp/lc1-release.tar.gz -C /opt/lc1 && \
-        tar --no-same-owner -xzf /tmp/lc1-engines.tar.gz \
-          -C /opt/lc1/lc1_jetson_bundle && \
-        cp -a /opt/lc1/lc1_jetson_bundle/engines/. \
-          /models/vits2-mix/engines/ && \
-        cp -a /opt/lc1/lc1_jetson_bundle/tn_cache/. \
-          /models/vits2-mix/tn_cache/ && \
-        cp -a /opt/lc1/lc1_jetson_bundle/frontend_data/. \
-          /models/vits2-mix/frontend_data/ && \
-        cp /opt/lc1/lc1_jetson_bundle/config.json \
-          /models/vits2-mix/config.json ;; \
+          --url "$LC1_V0_214K_URL" --sha256 "$LC1_V0_214K_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
       *) \
-        echo "Unsupported VITS_MODEL_VARIANT=$VITS_MODEL_VARIANT" >&2; exit 2 ;; \
+        echo "Unsupported VITS_MODEL_RELEASE=$VITS_MODEL_RELEASE" >&2; exit 2 ;; \
     esac && \
-    printf '%s\n' "$VITS_MODEL_VARIANT" > /models/vits2-model.variant && \
-    VITS_MODEL_VARIANT="$VITS_MODEL_VARIANT" /usr/bin/python3 -c "import json,os,pathlib; variant=os.environ['VITS_MODEL_VARIANT']; root=pathlib.Path('/models/vits2-vits256' if variant=='vits256' else '/models/vits2-mix'); p=root/'engines'; m=json.loads((p/'manifest.json').read_text()); assert (root/'config.json').is_file(); assert m['architecture']=='aarch64'; assert m['compute_capability']=='8.7'; assert m['profiles']['text']=='1,128,256'; assert m['total_engine_bytes'] <= m.get('max_engine_bytes',64*1024*1024) <= 64*1024*1024; assert all((p/e['file']).stat().st_size==e['bytes'] for e in m['engines'].values())" && \
-    rm -f /tmp/vits2-mix-jp6-runtime.tar.gz /tmp/lc1-release.tar.gz \
-      /tmp/lc1-engines.tar.gz /tmp/vits256-model.tar.gz \
+    tar --no-same-owner -xzf /tmp/model-release.tar.gz -C /models/releases && \
+    printf '%s\n' "$VITS_MODEL_RELEASE" > /models/vits2-model.release && \
+    VITS_MODEL_RELEASE="$VITS_MODEL_RELEASE" /usr/bin/python3 -c "import json,os,pathlib; release=os.environ['VITS_MODEL_RELEASE']; root=pathlib.Path('/models/releases')/release; p=root/'engines'; m=json.loads((p/'manifest.json').read_text()); assert (root/'config.json').is_file(); assert m['architecture']=='aarch64'; assert m['compute_capability']=='8.7'; assert m['profiles']['text']=='1,128,256'; assert m['total_engine_bytes'] <= m.get('max_engine_bytes',64*1024*1024) <= 64*1024*1024; assert all((p/e['file']).stat().st_size==e['bytes'] for e in m['engines'].values())" && \
+    rm -f /tmp/vits2-mix-jp6-runtime.tar.gz /tmp/model-release.tar.gz \
       /tmp/vits2-trt-requirements.txt \
       /tmp/download_vits2_trt_runtime.py
 
@@ -126,9 +109,7 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy
     EN_TN_CACHE_DIR=/models/vits2-mix/tn_cache \
     TN_CACHE_DIR=/models/vits2-mix/tn_cache \
     VITS2_FRONTEND_DATA_DIR=/models/vits2-mix/frontend_data \
-    MIX_VITS_MODEL_VARIANT=${VITS_MODEL_VARIANT} \
-    MIX_VITS_CONFIG_PATH=/models/vits2-mix/config.json \
-    MIX_VITS_TRT_ENGINE_DIR=/models/vits2-mix/engines \
+    MIX_VITS_RELEASE=${VITS_MODEL_RELEASE} \
     MIX_VITS_MAX_ENGINE_BYTES=67108864 \
     MIX_VITS_MAX_TEXT_TOKENS=256 \
     MIX_VITS_MAX_FRAMES=2048 \
