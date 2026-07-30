@@ -258,7 +258,7 @@ class OfflineASRAdapter:
             sample_rate = wav_file.getframerate()
             raw_pcm = wav_file.readframes(wav_file.getnframes())
 
-        samples = pcm16_to_float_samples(raw_pcm)
+        samples = list(pcm16_to_float_samples(raw_pcm))
         # 0.5s tail padding: critical for transducer to decode final tokens
         # (without this, short utterance ends can regress to wrong language/output).
         # param_experiment.py verified: mbs(5)+hotwords ARM 1-CER 0.8388 with pad,
