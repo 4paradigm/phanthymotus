@@ -76,8 +76,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
-# ── FireRedVAD deps (kaldi_native_fbank only; onnxruntime comes with sherpa-onnx) ──
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} kaldi_native_fbank
+# ── FireRedVAD deps (kaldi_native_fbank + onnxruntime python binding) ──
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} kaldi_native_fbank onnxruntime
 
 # ── Offline ASR model ─────────────────────────────────────────────
 ARG ASR_OFFLINE_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/x_asr_punct_int8
