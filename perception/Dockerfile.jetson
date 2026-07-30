@@ -6,7 +6,7 @@ FROM ${BASE_IMAGE}
 
 ARG VITS_MODEL_RELEASE=lc1_v0_214k
 ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-mix-jp6-runtime-deps.tar.gz
-ARG VITS2_RUNTIME_SHA256=49dd734098e28c29732752bcfc2726db7e96ba8f4ff74af94168447e897401cb
+ARG VITS2_RUNTIME_SHA256=8a36fad685c2dee4063f6a9c719a02a6e9256c8d681eae3e190bde23c70ebc0f
 ARG LC1_V0_214K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_214k_runtime.tar.gz
 ARG LC1_V0_214K_SHA256=05b584727c37f224650cac319cae3b17e0bbf85df6ac509dd6edcffd75cca584
 ARG VITS256_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits256_runtime.tar.gz
@@ -114,7 +114,7 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy
     MIX_VITS_MAX_TEXT_TOKENS=256 \
     MIX_VITS_MAX_FRAMES=2048 \
     MIX_VITS_CHUNK_BYTES=3200 \
-    MIX_VITS_FRAME_INTERVAL_MS=80 \
+    MIX_VITS_FRAME_INTERVAL_MS=90 \
     MIX_VITS_ALLOW_FAST_DELIVERY=1 \
     TTS_PLUGIN=vits2_tts_trt \
     DEFAULT_TTS_PLUGIN=vits2_tts_trt \
