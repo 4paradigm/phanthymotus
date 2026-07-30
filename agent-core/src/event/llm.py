@@ -631,6 +631,7 @@ class Event:
                     tool_list    = all_tool_list,
                     cancel_event = cancel_event,
                     trace_id     = _trace_id,
+                    caller_info  = {'agent_type': 'main_agent'},
                 )
             except TurnCancelled:
                 raise
@@ -660,6 +661,7 @@ class Event:
                             message_list = messages,
                             tool_list    = all_tool_list,
                             trace_id     = _trace_id,
+                            caller_info  = {'agent_type': 'main_agent'},
                         )
                     else:
                         raise

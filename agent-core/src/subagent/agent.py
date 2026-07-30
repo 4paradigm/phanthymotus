@@ -254,6 +254,7 @@ class Subagent:
                         cancel_event=self._cancel_event,
                         model_override=self.spec.model,
                         trace_id=_trace_id,
+                        caller_info={'agent_type': 'subagent'},
                     )
                     _spans.append({'span': f'llm_round_{round_idx}', 'component': 'subagent',
                                    'start_ts': _round_start, 'end_ts': time.time()})

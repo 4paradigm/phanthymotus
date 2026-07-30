@@ -93,6 +93,14 @@ _DB_DEFAULTS = {
             'api_key': '',
         },
     },
+    'llm_logger': {
+        'enabled': True,
+        'data_dir': './resource/llm_data',
+        'recent_dir': './resource/llm_recent_request',
+        'batch_size': 500,
+        'max_records': 50000,
+        'recent_max_per_dir': 100,
+    },
 }
 
 
