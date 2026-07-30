@@ -19,9 +19,12 @@ from .adapter import CHUNK_BYTES, PCM_FRAME_MS, SAMPLE_RATE, TTSAdapter, build_a
 
 
 log = logging.getLogger(__name__)
-FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "90"))
+FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "85"))
 if not 0 <= FRAME_INTERVAL_MS <= 1000:
     raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 1000")
+FIRST_FRAME_DELAY_MS = int(os.getenv("MIX_VITS_FIRST_FRAME_DELAY_MS", "100"))
+if not 0 <= FIRST_FRAME_DELAY_MS <= 1000:
+    raise ValueError("MIX_VITS_FIRST_FRAME_DELAY_MS must be between zero and 1000")
 ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "1") == "1"
 if FRAME_INTERVAL_MS < PCM_FRAME_MS and not ALLOW_FAST_DELIVERY:
     raise ValueError(
@@ -156,7 +159,10 @@ class _Vits2TTSNode(Node):
                     nonlocal started, frames_sent, first_published_at, total_bytes
                     now = time.monotonic()
                     if started is None:
-                        started = now
+                        if FIRST_FRAME_DELAY_MS:
+                            time.sleep(FIRST_FRAME_DELAY_MS / 1000.0)
+                        started = time.monotonic()
+                        now = started
                     if frame_interval:
                         target = started + frames_sent * frame_interval
                         if target < now - frame_interval:
@@ -189,7 +195,8 @@ class _Vits2TTSNode(Node):
                     log.info(
                         "[vits2_tts_trt] server delivery: bytes=%d frames=%d "
                         "ttft=%.3fs elapsed=%.3fs audio=%.3fs rtf=%.4f "
-                        "chunk_bytes=%d frame_interval_ms=%d",
+                        "chunk_bytes=%d frame_interval_ms=%d "
+                        "first_frame_delay_ms=%d",
                         total_bytes,
                         frames_sent,
                         first_published_at - task_started,
@@ -198,6 +205,7 @@ class _Vits2TTSNode(Node):
                         elapsed / audio_seconds,
                         CHUNK_BYTES,
                         FRAME_INTERVAL_MS,
+                        FIRST_FRAME_DELAY_MS,
                     )
             except Exception:
                 log.exception("[vits2_tts_trt] synthesis failed")
