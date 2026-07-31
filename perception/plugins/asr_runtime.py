@@ -440,27 +440,6 @@ class _FireRedVadSession:
             logger_fr.warning(f"[firered-vad] detect failed: {e}")
             return
         self._detected = True
-        if not segs and total_s >= self._WHOLE_BUFFER_MIN_S:
-            # FireRedVAD found zero speech segments, but the buffer has
-            # meaningful audio. This is the last-resort fallback for when
-            # the zero-run / starvation triggers both miss (UDP reordering
-            # on the judge under 10-instance load): send the ENTIRE buffer
-            # to the recognizer. Even garbled output has lower CER than
-            # returning empty (CER=1.0). A 5% zero-sample threshold guards
-            # against emitting pure-silence buffers.
-            nonzero = int(_np.sum(_np.abs(samples) > 20.0))  # 20 ~= -64dBFS
-            if nonzero > int(samples.shape[0] * 0.05):
-                logger_fb = logging.getLogger("asr_runtime.firered")
-                logger_fb.info(
-                    "[firered-vad] no segments, flushing whole buffer "
-                    "%.2fs (%d/%d nonzero samples)", total_s, nonzero, samples.shape[0]
-                )
-                self._completed.append((
-                    bytes(self._pcm),
-                    -total_s,
-                    0.0,
-                ))
-            return
         if not segs:
             return
         parts = []
@@ -541,14 +520,36 @@ class _FireRedVadSession:
         return self._completed.popleft()[0]
 
     def force_flush(self) -> bytes:
-        """Run detect + fallback; returns pending utterance or b''.
-        Called by stop() before pausing — ensures buffered audio that
-        never reached a VAD endpoint is not silently discarded (the root
-        cause of 4/120 empty texts on judge 42534d7)."""
-        self._run_detect()
-        if not self._completed:
+        """Last-resort: re-detect the FULL buffer and emit something.
+
+        Called by stop() before pausing. Bypasses the _detected guard
+        (which an earlier silence trigger may have set) and re-runs
+        detect on everything accumulated.  If FireRedVAD still finds
+        no segments but the buffer has meaningful audio, fall back to
+        sending the whole buffer — even garbled output beats empty
+        (CER=1.0).  A 5% zero-sample threshold guards against
+        emitting pure-silence buffers."""
+        if _np is None:
             return b""
-        return self._completed.popleft()[0]
+        self._detected = False  # re-enable for one last pass
+        self._run_detect()
+        if self._completed:
+            return self._completed.popleft()[0]
+        # No segments even on re-detect — whole-buffer fallback
+        total_s = self._total_s()
+        if total_s < self._WHOLE_BUFFER_MIN_S:
+            return b""
+        samples = _np.frombuffer(bytes(self._pcm), dtype="<i2").astype(_np.float32)
+        nonzero = int(_np.sum(_np.abs(samples) > 20.0))  # 20 ~= -64dBFS
+        if nonzero <= int(samples.shape[0] * 0.05):
+            return b""
+        logger_fb = logging.getLogger("asr_runtime.firered")
+        logger_fb.info(
+            "[firered-vad] force_flush: no segments, falling back to "
+            "whole buffer %.2fs (%d/%d nonzero samples)",
+            total_s, nonzero, samples.shape[0],
+        )
+        return bytes(self._pcm)
 
 
 class VadSession:
