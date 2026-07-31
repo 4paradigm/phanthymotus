@@ -19,7 +19,7 @@ from .adapter import CHUNK_BYTES, PCM_FRAME_MS, SAMPLE_RATE, TTSAdapter, build_a
 
 
 log = logging.getLogger(__name__)
-FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "80"))
+FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "75"))
 if not 0 <= FRAME_INTERVAL_MS <= 1000:
     raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 1000")
 FIRST_FRAME_DELAY_MS = int(os.getenv("MIX_VITS_FIRST_FRAME_DELAY_MS", "0"))
