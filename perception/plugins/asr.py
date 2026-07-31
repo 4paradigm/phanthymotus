@@ -878,7 +878,18 @@ class _ASRNode(Node):
         self._adapter  = adapter
         self._language = language
         self.state     = "idle"
-        self._sub      = None
+        # Persistent input subscription: created once, kept across stop/start
+        # cycles. The evaluator creates a NEW audio publisher per case; with
+        # a long-lived reader, endpoint matching completes in ~100ms instead
+        # of full DDS discovery (~2-5s under 10-instance load), which was
+        # dropping entire short utterances (e.g. case 7's 1.044s speech was
+        # published before the match finished → VAD got silence only →
+        # 120s case timeout). Same keep-alive pattern as the publisher and
+        # the vits2_tts_trt plugin.
+        from audio_msgs.msg import AudioChunk
+        self._sub = self.create_subscription(
+            AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS
+        )
         self._pub      = self.create_publisher(String, self._output_topic, _ASR_PUB_QOS)
         # VAD runs in a separate process to avoid GIL contention
         self._vad_backend = vad_backend
@@ -925,10 +936,15 @@ class _ASRNode(Node):
                 repr(sorted(self._kws_cfg.items())))
 
     def _start_inner(self) -> dict:
-        from audio_msgs.msg import AudioChunk
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
         self._first_chunk_event = threading.Event()
-        self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
+        # Subscription is persistent (created in __init__); only recreate if
+        # it was torn down (e.g. after an error path).
+        if self._sub is None:
+            from audio_msgs.msg import AudioChunk
+            self._sub = self.create_subscription(
+                AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS
+            )
         self._stop_event.clear()
 
         new_vad_cfg = self._vad_cfg_snapshot()
@@ -985,19 +1001,11 @@ class _ASRNode(Node):
                     f"or that the COS fallback download succeeded."
                 )
 
-        # ── Subscriber gate: wait until audio publisher has matched ──
-        # Avoids the eval framework seeing "running" before DDS discovery
-        # completes — which would cause the first audio chunks to be dropped.
-        _gate_deadline = time.time() + float(os.environ.get("MIX_ASR_SUB_WAIT_MS", "3000")) / 1000.0
-        while time.time() < _gate_deadline:
-            try:
-                if self.count_publishers(self._input_topic) > 0:
-                    break
-            except Exception:
-                break
-            time.sleep(0.05)
-        else:
-            log.warning(f"[asr] no audio publisher matched on {self._input_topic} within gate window, proceeding anyway")
+        # NOTE: the old "wait for audio publisher" gate was removed — the
+        # evaluator creates its publisher only AFTER start() returns, so the
+        # gate could never succeed and just burned 3s per case. With the
+        # persistent subscription (created in __init__), the evaluator's
+        # per-case publisher SEDP-matches quickly instead.
 
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
@@ -1007,19 +1015,14 @@ class _ASRNode(Node):
         return self._status_dict()
 
     def stop(self) -> dict:
-        """Pause the ASR instance — VAD process + publisher stay alive.
+        """Pause the ASR instance — VAD process + publisher + subscription stay alive.
 
         The next start() resumes the same VAD worker (no fork, no model
-        reload, DDS discovery state preserved). Use _destroy_vad() for real
-        teardown (adapter rebuild / topic change / plugin shutdown).
+        reload) and the same DDS endpoints (discovery state preserved).
+        Use _destroy_vad() for real teardown (adapter rebuild / topic change).
         """
-        # Stop subscription first to prevent new audio_cb calls
-        if self._sub:
-            try:
-                self.destroy_subscription(self._sub)
-            except Exception:
-                pass  # may already be invalid
-            self._sub = None
+        # Subscription stays alive across stop/start (see __init__ comment);
+        # _audio_cb drops incoming chunks while _stop_event is set.
         # Unblock start() if it's waiting
         if hasattr(self, '_first_chunk_event'):
             self._first_chunk_event.set()
@@ -1100,7 +1103,7 @@ class _ASRNode(Node):
         return False
 
     def _audio_cb(self, msg):
-        if self._stop_event.is_set():
+        if self._stop_event.is_set() or self._pcm_queue is None:
             return
         # Signal first chunk arrival to unblock start()
         if not self._first_chunk_event.is_set():
