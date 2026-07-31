@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import struct
 from collections import deque
@@ -405,6 +406,7 @@ class _FireRedVadSession:
         self._detected = False
         self._silence_samples = 0
         self._last_chunk_ts = 0.0
+        self._last_detect_bytes = 0
         self._completed: Deque[tuple[bytes, float, float]] = deque()
 
     def reset(self) -> None:
@@ -412,6 +414,7 @@ class _FireRedVadSession:
         self._detected = False
         self._silence_samples = 0
         self._last_chunk_ts = 0.0
+        self._last_detect_bytes = 0
         self._completed.clear()
 
     def _total_s(self) -> float:
@@ -425,6 +428,11 @@ class _FireRedVadSession:
     def _run_detect(self) -> None:
         if self._detected or _np is None:
             return
+        pcm_bytes = len(self._pcm)
+        # FireRedVAD is deterministic. Do not keep re-running the model on
+        # the same idle buffer after an empty result; wait for more audio.
+        if pcm_bytes == self._last_detect_bytes:
+            return
         total_s = self._total_s()
         samples = _np.frombuffer(bytes(self._pcm), dtype="<i2").astype(_np.float32)
         if samples.shape[0] < int(0.05 * self._sample_rate):
@@ -434,10 +442,17 @@ class _FireRedVadSession:
         except Exception as e:
             logger_fr = logging.getLogger("asr_runtime.firered")
             logger_fr.warning(f"[firered-vad] detect failed: {e}")
+            self._silence_samples = 0
+            return
+        self._last_detect_bytes = pcm_bytes
+        # An empty pass is not a terminal state. Under DDS packet reordering,
+        # the first 1s zero run can arrive before delayed speech packets. If
+        # we seal the session here, process_chunk() discards those packets and
+        # notify_idle() can never recover, producing an empty judge result.
+        if not segs:
+            self._silence_samples = 0
             return
         self._detected = True
-        if not segs:
-            return
         parts = []
         for start_s, end_s in segs:
             start = max(0.0, start_s - self._pre_roll_s)
