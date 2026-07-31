@@ -28,8 +28,8 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("  asr:\n    enabled: false\n    mode: offline", config)
         self.assertIn("  ocr:\n    enabled: true\n    provider: rapidocr", config)
         self.assertIn("    backend: mnn", config)
-        self.assertIn("model_dir: /models/ocr/ppocrv6-tiny-mnn", config)
-        self.assertIn("    max_side_len: 960", config)
+        self.assertIn("model_dir: /models/ocr/ppocrv6-small-mnn", config)
+        self.assertIn("    max_side_len: 1600", config)
         self.assertNotIn("    max_input_mb:", config)
         self.assertNotIn("    max_decode_mb:", config)
         self.assertNotIn("    memory_guard:", config)
@@ -38,7 +38,7 @@ class OCRPackagingTest(unittest.TestCase):
             config,
             r"large_image_strategy:\n"
             r"(?:      #.*\n)*"
-            r"      enabled: true",
+            r"      enabled: false",
         )
         self.assertIn("      max_tiles: 12", config)
         self.assertIn('    url: ""', config)
@@ -68,11 +68,11 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("-name '*.onnx' -delete", dockerfile)
         self.assertIn("ocr_model_downloader.py", dockerfile)
         self.assertIn(
-            "http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-tiny-mnn",
+            "http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-mnn",
             dockerfile,
         )
         self.assertIn("--filenames det.mnn rec.mnn keys.txt", dockerfile)
-        self.assertIn("/models/ocr/ppocrv6-tiny-mnn", dockerfile)
+        self.assertIn("/models/ocr/ppocrv6-small-mnn", dockerfile)
         self.assertNotIn("COPY perception/models", dockerfile)
 
         service = (REPO_ROOT / "perception" / "deploy" / "service.yml").read_text(

@@ -145,6 +145,11 @@ class OCRContractTest(unittest.TestCase):
             use_angle_cls=True,
             num_threads=2,
             max_side_len=1600,
+            rec_min_score=0.3,
+            enable_preprocess=True,
+            det_thresh=0.3,
+            det_box_thresh=0.5,
+            det_unclip_ratio=1.2,
             large_image_strategy={
                 "enabled": True,
                 "trigger_side": 2400,
@@ -217,6 +222,11 @@ class OCRContractTest(unittest.TestCase):
             use_angle_cls=False,
             num_threads=1,
             max_side_len=960,
+            rec_min_score=0.3,
+            enable_preprocess=True,
+            det_thresh=0.3,
+            det_box_thresh=0.5,
+            det_unclip_ratio=1.2,
             large_image_strategy={"enabled": True},
         )
 
@@ -226,8 +236,21 @@ class OCRContractTest(unittest.TestCase):
         state = types.SimpleNamespace(config=None, conversion=None)
 
         class FakeTensor:
+            def getShape(self):
+                return [1, 1, 1, 1]
+
+            def copyToHostTensor(self, _host):
+                state.copied_to_host = True
+
             def getNumpyData(self):
                 return np.array([[[[0.75]]]], dtype=np.float32)
+
+        class FakeHostTensor:
+            def __init__(self, *_args):
+                pass
+
+            def getData(self):
+                return [0.75]
 
         class FakeInterpreter:
             def __init__(self, model_path):
@@ -265,6 +288,9 @@ class OCRContractTest(unittest.TestCase):
         mnn.CV_ImageFormat_RGB = "RGB"
         mnn.CV_ImageFormat_BGR = "BGR"
         mnn.CV_Filter_BILINEAL = "BILINEAR"
+        mnn.Tensor = FakeHostTensor
+        mnn.Halide_Type_Float = "float"
+        mnn.Tensor_DimensionType_Caffe = "caffe"
 
         with tempfile.TemporaryDirectory() as model_tmp:
             model_path = Path(model_tmp) / "det.mnn"
@@ -307,7 +333,16 @@ class OCRContractTest(unittest.TestCase):
                     num_threads=1,
                 )
 
-        pipeline.assert_called_once_with(root, num_threads=1, max_side_len=1600)
+        pipeline.assert_called_once_with(
+            root,
+            num_threads=1,
+            max_side_len=1600,
+            rec_min_score=0.3,
+            enable_preprocess=True,
+            det_thresh=0.3,
+            det_box_thresh=0.5,
+            det_unclip_ratio=1.2,
+        )
         pipeline.return_value.warm_up.assert_called_once_with()
         self.assertEqual(adapter._backend_name, "mnn")
 
@@ -713,6 +748,7 @@ class OCRContractTest(unittest.TestCase):
             )
         )
         adapter._inference_lock = threading.Lock()
+        adapter._rec_min_score = 0.3
         adapter._engine = mock.Mock(return_value=output)
         return adapter
 

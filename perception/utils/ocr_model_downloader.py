@@ -65,7 +65,8 @@ def download_model(
         total = sum((staging / name).stat().st_size for name in filenames)
         if total > max_bundle_bytes:
             raise ValueError(
-                f"OCR model bundle is {total} bytes, exceeds 15 MiB limit"
+                f"OCR model bundle is {total} bytes, exceeds configured "
+                f"{max_bundle_bytes} byte limit"
             )
 
         for filename in filenames:

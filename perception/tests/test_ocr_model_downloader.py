@@ -70,7 +70,7 @@ class OCRModelDownloaderTest(unittest.TestCase):
 
             self.assertEqual(list(Path(output_tmp).iterdir()), [])
 
-    def test_rejects_bundle_over_fifteen_mebibytes(self):
+    def test_rejects_bundle_over_configured_limit(self):
         from utils.ocr_model_downloader import download_model
 
         with tempfile.TemporaryDirectory() as output_tmp:
@@ -81,8 +81,12 @@ class OCRModelDownloaderTest(unittest.TestCase):
                 "utils.ocr_model_downloader.download_file",
                 side_effect=oversized_download,
             ):
-                with self.assertRaisesRegex(ValueError, "15 MiB"):
-                    download_model("https://models.example.test", output_tmp)
+                with self.assertRaisesRegex(ValueError, "configured 15 byte"):
+                    download_model(
+                        "https://models.example.test",
+                        output_tmp,
+                        max_bundle_bytes=15,
+                    )
 
             self.assertEqual(list(Path(output_tmp).iterdir()), [])
 
