@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
+import time
 from pathlib import Path
-from urllib.request import urlretrieve
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 DEFAULT_BASE_URL = (
@@ -40,31 +43,89 @@ FIRERED_VAD_FILES = (
     "cmvn.npz",
 )
 
+DOWNLOAD_TIMEOUT = 120
+MAX_RETRIES = 3
+RETRY_DELAY = 3.0
+
+
+def _download_file(
+    url: str,
+    destination: Path,
+    *,
+    timeout: float,
+    retries: int,
+    retry_delay: float,
+) -> None:
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    if retries < 1:
+        raise ValueError("retries must be at least one")
+
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            size = 0
+            with urlopen(url, timeout=timeout) as response, destination.open(
+                "wb"
+            ) as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    size += len(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            if size == 0:
+                raise ValueError(f"downloaded file is empty: {url}")
+            return
+        except (URLError, TimeoutError, OSError, ValueError) as error:
+            last_error = error
+            destination.unlink(missing_ok=True)
+            if attempt < retries:
+                print(
+                    f"Retry {attempt}/{retries} after error: {error}",
+                    flush=True,
+                )
+                time.sleep(retry_delay)
+
+    assert last_error is not None
+    raise last_error
+
 
 def download_model(
     base_url: str,
     output_dir: str | Path,
     filenames: tuple[str, ...],
+    *,
+    timeout: float = DOWNLOAD_TIMEOUT,
+    retries: int = MAX_RETRIES,
+    retry_delay: float = RETRY_DELAY,
 ) -> None:
     destination_dir = Path(output_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
+    if not filenames:
+        raise ValueError("filenames must not be empty")
+    if any(Path(filename).name != filename or not filename for filename in filenames):
+        raise ValueError("filenames must be plain file names")
 
-    for filename in filenames:
-        destination = destination_dir / filename
-        url = f"{base_url.rstrip('/')}/{filename}"
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                prefix=f".{filename}.", dir=destination_dir, delete=False
-            ) as temporary:
-                temporary_path = Path(temporary.name)
+    with tempfile.TemporaryDirectory(
+        prefix="asr-model-", dir=destination_dir.parent
+    ) as staging_directory:
+        staging = Path(staging_directory)
+        for filename in filenames:
+            url = f"{base_url.rstrip('/')}/{filename}"
             print(f"Downloading {url}", flush=True)
-            urlretrieve(url, temporary_path)
-            temporary_path.replace(destination)
-            temporary_path = None
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+            _download_file(
+                url,
+                staging / filename,
+                timeout=timeout,
+                retries=retries,
+                retry_delay=retry_delay,
+            )
+
+        for filename in filenames:
+            os.replace(staging / filename, destination_dir / filename)
 
 
 def main() -> None:
