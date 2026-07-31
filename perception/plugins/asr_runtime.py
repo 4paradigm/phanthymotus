@@ -382,6 +382,7 @@ class _FireRedVadSession:
 
     _TAIL_PAD_S = 0.3
     _SILENCE_TO_DETECT_S = 1.0  # run one detect after >=1s of trailing silence
+    _STARVE_TRIGGER_S = 1.5     # fallback: stream quiet this long → detect anyway
 
     def __init__(
         self,
@@ -403,12 +404,14 @@ class _FireRedVadSession:
         self._pcm = bytearray()
         self._detected = False
         self._silence_samples = 0
+        self._last_chunk_ts = 0.0
         self._completed: Deque[tuple[bytes, float, float]] = deque()
 
     def reset(self) -> None:
         self._pcm.clear()
         self._detected = False
         self._silence_samples = 0
+        self._last_chunk_ts = 0.0
         self._completed.clear()
 
     def _total_s(self) -> float:
@@ -456,6 +459,7 @@ class _FireRedVadSession:
         silence_thresh_samples = int(self._SILENCE_TO_DETECT_S * self._sample_rate)
         if chunk:
             self._pcm += chunk
+            self._last_chunk_ts = now_ts
             # is this chunk all-zero? (PCM16 silence)
             if chunk == b"\x00" * len(chunk):
                 self._silence_samples += len(chunk) // 2
@@ -463,6 +467,24 @@ class _FireRedVadSession:
                 self._silence_samples = 0
             if self._silence_samples >= silence_thresh_samples:
                 self._run_detect()
+        return self._completed.popleft() if self._completed else None
+
+    def notify_idle(
+        self, now_ts: float
+    ) -> Optional[tuple[bytes, float, float]]:
+        """Starvation fallback: run detect when the stream went quiet
+        without a clean run of zero chunks. On the judge under 10-instance
+        load, UDP reordering can insert a speech packet into the silence
+        tail and reset the zero counter (or silence packets get dropped),
+        so the 1s-consecutive-zeros trigger never fires and the case hits
+        the 120s timeout with audio sitting in the buffer."""
+        if self._detected or not self._pcm:
+            return None
+        if self._last_chunk_ts <= 0.0:
+            return None
+        if now_ts - self._last_chunk_ts < self._STARVE_TRIGGER_S:
+            return None
+        self._run_detect()
         return self._completed.popleft() if self._completed else None
 
     def flush(self) -> bytes:
@@ -528,6 +550,15 @@ class VadSession:
         self, chunk: bytes, now_ts: float
     ) -> Optional[tuple[bytes, float, float]]:
         return self._impl.process_chunk(chunk, now_ts)
+
+    def notify_idle(
+        self, now_ts: float
+    ) -> Optional[tuple[bytes, float, float]]:
+        """Forward starvation ticks to backends that support them."""
+        fn = getattr(self._impl, "notify_idle", None)
+        if fn is None:
+            return None
+        return fn(now_ts)
 
     def flush(self) -> bytes:
         return self._impl.flush()

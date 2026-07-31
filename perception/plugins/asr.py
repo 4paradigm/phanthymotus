@@ -771,6 +771,19 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         try:
             pcm, ts = pcm_q.get(timeout=1)
         except queue.Empty:
+            # Starvation tick: no chunk for 1s. FireRedVAD's zero-run
+            # trigger can miss when DDS reorders/losses the silence tail
+            # (judge 120s timeouts) — let the session detect on idle.
+            if state == 'listening':
+                idle_result = vad_session.notify_idle(time.time())
+                if idle_result is not None:
+                    utterance, start_ts, end_ts = idle_result
+                    if len(utterance) > SAMPLE_RATE:
+                        _log.info(f"[vad-worker] idle-trigger utterance, len={len(utterance)} bytes")
+                        try:
+                            result_q.put((utterance, start_ts, end_ts), timeout=0.2)
+                        except queue.Full:
+                            _log.warning("[vad-worker] utterance queue full on idle trigger")
             continue
 
         audio_count += 1
