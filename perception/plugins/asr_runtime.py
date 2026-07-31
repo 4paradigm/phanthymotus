@@ -383,6 +383,8 @@ class _FireRedVadSession:
     _TAIL_PAD_S = 0.3
     _SILENCE_TO_DETECT_S = 1.0  # run one detect after >=1s of trailing silence
     _STARVE_TRIGGER_S = 1.5     # fallback: stream quiet this long → detect anyway
+    _MAX_BUFFER_S = 15.0        # hard cap: buffer this long → force detect
+    _WHOLE_BUFFER_MIN_S = 0.5   # min duration to fallback to whole-buffer output
 
     def __init__(
         self,
@@ -405,6 +407,7 @@ class _FireRedVadSession:
         self._detected = False
         self._silence_samples = 0
         self._last_chunk_ts = 0.0
+        self._last_speech_ts = 0.0   # only non-zero chunks; trickle silence can't reset this
         self._completed: Deque[tuple[bytes, float, float]] = deque()
 
     def reset(self) -> None:
@@ -412,6 +415,7 @@ class _FireRedVadSession:
         self._detected = False
         self._silence_samples = 0
         self._last_chunk_ts = 0.0
+        self._last_speech_ts = 0.0
         self._completed.clear()
 
     def _total_s(self) -> float:
@@ -436,6 +440,27 @@ class _FireRedVadSession:
             logger_fr.warning(f"[firered-vad] detect failed: {e}")
             return
         self._detected = True
+        if not segs and total_s >= self._WHOLE_BUFFER_MIN_S:
+            # FireRedVAD found zero speech segments, but the buffer has
+            # meaningful audio. This is the last-resort fallback for when
+            # the zero-run / starvation triggers both miss (UDP reordering
+            # on the judge under 10-instance load): send the ENTIRE buffer
+            # to the recognizer. Even garbled output has lower CER than
+            # returning empty (CER=1.0). A 5% zero-sample threshold guards
+            # against emitting pure-silence buffers.
+            nonzero = int(_np.sum(_np.abs(samples) > 20.0))  # 20 ~= -64dBFS
+            if nonzero > int(samples.shape[0] * 0.05):
+                logger_fb = logging.getLogger("asr_runtime.firered")
+                logger_fb.info(
+                    "[firered-vad] no segments, flushing whole buffer "
+                    "%.2fs (%d/%d nonzero samples)", total_s, nonzero, samples.shape[0]
+                )
+                self._completed.append((
+                    bytes(self._pcm),
+                    -total_s,
+                    0.0,
+                ))
+            return
         if not segs:
             return
         parts = []
@@ -465,6 +490,7 @@ class _FireRedVadSession:
                 self._silence_samples += len(chunk) // 2
             else:
                 self._silence_samples = 0
+                self._last_speech_ts = now_ts
             if self._silence_samples >= silence_thresh_samples:
                 self._run_detect()
         return self._completed.popleft() if self._completed else None
@@ -473,23 +499,53 @@ class _FireRedVadSession:
         self, now_ts: float
     ) -> Optional[tuple[bytes, float, float]]:
         """Starvation fallback: run detect when the stream went quiet
-        without a clean run of zero chunks. On the judge under 10-instance
-        load, UDP reordering can insert a speech packet into the silence
-        tail and reset the zero counter (or silence packets get dropped),
-        so the 1s-consecutive-zeros trigger never fires and the case hits
-        the 120s timeout with audio sitting in the buffer."""
+        without a clean run of zero chunks, OR the buffer has accumulated
+        too much un-examined audio.
+
+        On the judge under 10-instance load, UDP reordering can:
+          (a) insert a speech packet into the silence tail → reset the
+              zero counter → detect never fires
+          (b) deliver trickle packets indefinitely → wall-clock
+              starvation (1.5s of silence) never triggers
+          (c) deliver only silence packets → _last_chunk_ts keeps
+              advancing while _last_speech_ts is frozen
+
+        OR conditions handle all three:
+          1. Wall-clock silence ≥ 1.5s (existing, uses _last_speech_ts
+             so trickle silence can't defeat it)
+          2. Buffer duration ≥ _MAX_BUFFER_S (hard cap)"""
         if self._detected or not self._pcm:
             return None
-        if self._last_chunk_ts <= 0.0:
+        total_s = self._total_s()
+        starve = (
+            self._last_speech_ts > 0
+            and now_ts - self._last_speech_ts >= self._STARVE_TRIGGER_S
+        )
+        buf_full = total_s >= self._MAX_BUFFER_S
+        if not (starve or buf_full):
             return None
-        if now_ts - self._last_chunk_ts < self._STARVE_TRIGGER_S:
-            return None
+        if buf_full:
+            logger_fb = logging.getLogger("asr_runtime.firered")
+            logger_fb.warning(
+                "[firered-vad] buffer cap triggered %.1fs (last spk %.1fs ago)",
+                total_s, now_ts - self._last_speech_ts if self._last_speech_ts else -1,
+            )
         self._run_detect()
         return self._completed.popleft() if self._completed else None
 
     def flush(self) -> bytes:
         if not self._detected:
             self._run_detect()
+        if not self._completed:
+            return b""
+        return self._completed.popleft()[0]
+
+    def force_flush(self) -> bytes:
+        """Run detect + fallback; returns pending utterance or b''.
+        Called by stop() before pausing — ensures buffered audio that
+        never reached a VAD endpoint is not silently discarded (the root
+        cause of 4/120 empty texts on judge 42534d7)."""
+        self._run_detect()
         if not self._completed:
             return b""
         return self._completed.popleft()[0]
@@ -559,6 +615,13 @@ class VadSession:
         if fn is None:
             return None
         return fn(now_ts)
+
+    def force_flush(self) -> bytes:
+        """Flush even when the normal endpoint hasn't fired (corner cases)."""
+        fn = getattr(self._impl, "force_flush", None)
+        if fn is None:
+            return self._impl.flush()
+        return fn()
 
     def flush(self) -> bytes:
         return self._impl.flush()

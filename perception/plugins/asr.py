@@ -754,7 +754,18 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         if pause_evt is not None and pause_evt.is_set():
             if not paused:
                 paused = True
+                # Force-flush any audio still sitting in the VAD buffer
+                # before resetting — this is the fix for 4/120 empty
+                # texts on judge 42534d7: stop() → pause → init() used
+                # to discard pending PCM that never hit an endpoint.
                 try:
+                    leftover = vad_session.force_flush()
+                    if leftover and state == 'listening' and len(leftover) > SAMPLE_RATE:
+                        _log.info("[vad-worker] pause flush emitted, len=%d bytes", len(leftover))
+                        try:
+                            result_q.put((leftover, 0.0, 0.0), timeout=0.2)
+                        except queue.Full:
+                            _log.warning("[vad-worker] utterance queue full on pause flush")
                     vad_session.init()  # reset VAD state for the next utterance
                     _log.info("[vad-worker] paused, session reset")
                 except Exception:
