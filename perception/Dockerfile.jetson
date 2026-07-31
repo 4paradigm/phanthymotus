@@ -24,10 +24,8 @@ ARG BASE_IMAGE=
 # Same as deploy/prepare_jp_v6_local.sh and the vits2-trt-jp6 pattern.
 FROM ${PYTORCH_DONOR} AS pytorch-donor
 FROM ${ROS_BASE} AS jp6-torch-built
-RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated libopenblas-base && \
-    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+# The JP6 ROS base already contains OpenBLAS. Do not refresh its expired ROS
+# repository metadata or weaken APT signature verification.
 COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/ /tmp/pt-donor/
 RUN cd /tmp/pt-donor && \
     mkdir -p /usr/local/lib/python3.10/dist-packages && \
@@ -64,8 +62,8 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
 # ── System deps ────────────────────────────────────────────────────
 # (build-essential + python3-dev: webrtcvad has no aarch64 wheel, builds from source)
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
       ffmpeg build-essential python3-dev libvips42 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
