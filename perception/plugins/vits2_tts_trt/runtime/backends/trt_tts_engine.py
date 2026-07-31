@@ -183,8 +183,8 @@ class TensorRTTTSEngine:
             ].float()
             input_frames = ctx_end - ctx_start
             if logits.size(2) % input_frames:
-                # LC1's exported ISTFT decoder returns frames * hop + 1 samples.
-                # Drop the right ISTFT boundary before overlap cropping.
+                # The exported iSTFT decoder includes one right-boundary sample.
+                # Remove it before overlap cropping.
                 if (logits.size(2) - 1) % input_frames:
                     raise RuntimeError(
                         "unexpected decoder output length for input frames: "

@@ -1,1 +1,1 @@
-"""Private VITS2 TensorRT runtime."""
+"""Bundled VITS2 TensorRT runtime."""

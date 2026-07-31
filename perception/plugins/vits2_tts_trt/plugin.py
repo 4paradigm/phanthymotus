@@ -19,7 +19,7 @@ from .adapter import CHUNK_BYTES, PCM_FRAME_MS, SAMPLE_RATE, TTSAdapter, build_a
 
 
 log = logging.getLogger(__name__)
-FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "75"))
+FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "70"))
 if not 0 <= FRAME_INTERVAL_MS <= 1000:
     raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 1000")
 FIRST_FRAME_DELAY_MS = int(os.getenv("MIX_VITS_FIRST_FRAME_DELAY_MS", "0"))
@@ -80,8 +80,7 @@ TOOLS = [
         "topic_out": [{"format": "audio/pcm-16k", "desc": "synthesized PCM audio"}],
     }
 ]
-# Keep the historical vits2_tts name while exposing the module-selected name
-# expected by evaluators when TTS_PLUGIN=vits2_tts_trt.
+# Preserve the existing tool name and expose the TensorRT-specific alias.
 TOOLS.append({**TOOLS[0], "name": "tts_trt"})
 
 

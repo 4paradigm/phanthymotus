@@ -8,7 +8,7 @@ from .symbols import punctuation, symbols
 current_file_path = os.path.dirname(__file__)
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Setup NLTK path BEFORE importing g2p_en
+# Configure the bundled NLTK data path before importing g2p_en.
 NLTK_DATA_DIR = os.getenv("NLTK_DATA", os.path.join(project_root, "nltk_data"))
 import nltk
 if NLTK_DATA_DIR not in nltk.data.path:

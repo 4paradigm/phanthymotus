@@ -68,10 +68,6 @@ _CUSTOM_EN_PRONUNCIATIONS = {
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _split_pinyin(tone3: str):
     """Split a TONE3 pinyin string into (initial, final_no_tone, tone_int).
 
@@ -99,18 +95,18 @@ def _zh_pinyin_to_phones(tone3: str):
     """
     c, v, tone = _split_pinyin(tone3)
 
-    # Punctuation shortcut (c == v case from chinese.py)
+    # Handle punctuation represented as identical initial and final values.
     if c == v and c in _PUNCT_SET:
         return [c], 0
 
     pinyin = c + v
     if c:
-        # Has consonant initial — apply vowel contraction normalisation
+        # Apply vowel contraction to syllables with an initial.
         v_rep = {"uei": "ui", "iou": "iu", "uen": "un"}
         if v in v_rep:
             pinyin = c + v_rep[v]
     else:
-        # Vowel-only syllable — apply leading-vowel normalisation
+        # Apply leading-vowel normalization to syllables without an initial.
         whole_rep = {"ing": "ying", "i": "yi", "in": "yin", "u": "wu"}
         if pinyin in whole_rep:
             pinyin = whole_rep[pinyin]
@@ -214,10 +210,6 @@ def _flatten_seg(segments):
     return result
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Public API
-# ──────────────────────────────────────────────────────────────────────────────
-
 def unified_g2p(text: str):
     """Convert ZH/EN mixed text to a phoneme sequence.
 
@@ -235,7 +227,7 @@ def unified_g2p(text: str):
     Raises:
         ValueError: if pypinyin and simpleseg produce misaligned lengths.
     """
-    # ── 1. Whole-text pinyin (tone sandhi applied in context) ──────────────────
+    # Preserve full-sentence context for tone sandhi.
     pinyins = lazy_pinyin(
         text,
         style=Style.TONE3,
@@ -243,7 +235,7 @@ def unified_g2p(text: str):
         tone_sandhi=True,
     )
 
-    # ── 2. Segment-aligned positions ──────────────────────────────────────────
+    # Align pinyin output with mixed-language segments.
     segments = _flatten_seg(list(seg(text)))
 
     if len(pinyins) != len(segments):
@@ -264,7 +256,7 @@ def unified_g2p(text: str):
         p = pinyins[i]
         s = segments[i]
 
-        # ── ZH character: pinyin ends with a tone digit ────────────────────────
+        # A trailing tone digit identifies a Chinese syllable.
         if p and p[-1] in "12345":
             ph_list, tone = _zh_pinyin_to_phones(p)
             if ph_list:
@@ -273,11 +265,11 @@ def unified_g2p(text: str):
                 langs.extend(["ZH"] * len(ph_list))
                 word2ph.append(len(ph_list))
             else:
-                # Unknown pinyin — skip silently, record 0 phones for position
+                # Preserve position alignment when a pinyin is unsupported.
                 word2ph.append(0)
             i += 1
 
-        # ── Non-ZH token/span: lazy_pinyin returned the string unchanged ──────
+        # Unchanged alphanumeric segments are handled by the English frontend.
         elif p == s and re.match(r"^[A-Za-z0-9'-]+$", p):
             # Collect consecutive alpha/alphanumeric positions into one word.
             # This handles letter-by-letter splits of abbreviations:
@@ -298,9 +290,7 @@ def unified_g2p(text: str):
                 tones.extend(tone_list)
                 langs.extend(["EN"] * len(ph_list))
 
-            # Distribute word2ph across the collected positions:
-            #   intermediate positions = 0; last position = total phone count.
-            # sum([0, ..., 0, N]) == N == len(ph_list)  ✓
+            # Assign the phone count to the final position of a merged token.
             word2ph.extend([0] * (j - i - 1))
             word2ph.append(len(ph_list))
             i = j
@@ -314,7 +304,7 @@ def unified_g2p(text: str):
             word2ph.append(len(ph_list))
             i += 1
 
-        # ── Punctuation or unrecognised ────────────────────────────────────────
+        # Preserve supported punctuation and alignment for other symbols.
         else:
             if p and p[0] in _PUNCT_SET:
                 phones.append(p[0])
@@ -322,17 +312,16 @@ def unified_g2p(text: str):
                 langs.append("ZH")
                 word2ph.append(1)
             else:
-                # Silently skip (e.g. spaces, unrecognised symbols)
                 word2ph.append(0)
             i += 1
 
-    # ── Wrap with silence tokens (matches chinese.py g2p convention) ───────────
+    # Match the silence-token convention used by the Chinese frontend.
     phones = ["_"] + phones + ["_"]
     tones = [0] + tones + [0]
     langs = ["ZH"] + langs + ["ZH"]
     word2ph = [1] + word2ph + [1]
 
-    # ── Invariant check ────────────────────────────────────────────────────────
+    # Validate phone-level and source-position alignment.
     assert len(phones) == len(tones) == len(langs), (
         f"Internal length mismatch: phones={len(phones)} tones={len(tones)} langs={len(langs)}"
     )
@@ -341,30 +330,3 @@ def unified_g2p(text: str):
     )
 
     return phones, tones, langs, word2ph
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Quick smoke test
-# ──────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # mix_normalize is defined in text/chinese.py; import lazily here
-    from .chinese import mix_normalize
-
-    test_cases = [
-        "昨天CEO在MacBook上review了我们的PPT。",
-        "Byebye了我的周末计划。",
-        "你好world！",
-        "AI和ML技术很厉害。",
-        "MP3播放器很好用。",
-        "这里有3个苹果。",
-    ]
-    for raw in test_cases:
-        text = mix_normalize(raw)
-        phones, tones, langs, word2ph = unified_g2p(text)
-        print(f"\nRaw   : {raw}")
-        print(f"Norm  : {text}")
-        print(f"Phones: {phones}")
-        print(f"Tones : {tones}")
-        print(f"Langs : {langs}")
-        print(f"w2ph  : {word2ph}")
-        print("OK")

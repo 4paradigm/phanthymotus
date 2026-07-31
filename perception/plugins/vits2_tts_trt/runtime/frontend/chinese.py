@@ -125,7 +125,7 @@ def g2p(text):
     sentences = [i for i in re.split(pattern, text) if i.strip() != ""]
     phones, tones, word2ph = _g2p(sentences)
     assert sum(word2ph) == len(phones)
-    assert len(word2ph) == len(text)  # Sometimes it will crash,you can add a try-catch.
+    assert len(word2ph) == len(text)
     phones = ["_"] + phones + ["_"]
     tones = [0] + tones + [0]
     word2ph = [1] + word2ph + [1]
@@ -164,10 +164,8 @@ def _g2p(segments):
             initials.append(sub_initials)
             finals.append(sub_finals)
 
-            # assert len(sub_initials) == len(sub_finals) == len(word)
         initials = sum(initials, [])
         finals = sum(finals, [])
-        #
         for c, v in zip(initials, finals):
             raw_pinyin = c + v
             # pypinyin can emit an empty initial/final for a stripped MIX
@@ -179,8 +177,7 @@ def _g2p(segments):
                 # silent punctuation token is safer than dropping a token
                 # (which would invalidate word2ph and the training cache).
                 c, v = ".", "."
-            # NOTE: post process for pypinyin outputs
-            # we discriminate i, ii and iii
+            # Distinguish the three pypinyin representations of "i".
             if c == v:
                 if c not in punctuation:
                     c = "."
@@ -195,7 +192,7 @@ def _g2p(segments):
                 assert tone in "12345"
 
                 if c:
-                    # 多音节
+                    # Syllables with an initial.
                     v_rep_map = {
                         "uei": "ui",
                         "iou": "iu",
@@ -204,7 +201,7 @@ def _g2p(segments):
                     if v_without_tone in v_rep_map.keys():
                         pinyin = c + v_rep_map[v_without_tone]
                 else:
-                    # 单音节
+                    # Syllables without an initial.
                     pinyin_rep_map = {
                         "ing": "ying",
                         "i": "yi",
@@ -253,22 +250,5 @@ def mix_normalize(text: str) -> str:
 
 
 def get_bert_feature(text, word2ph):
-    # BERT feature disabled for inference-only deployment
+    """Return the zero BERT feature tensor expected by this model."""
     return np.zeros((1024, sum(word2ph)), dtype=np.float32)
-
-
-if __name__ == "__main__":
-    from .chinese_bert import get_bert_feature
-
-    text = "啊！但是《原神》是由,米哈\游自主，  [研发]的一款全.新开放世界.冒险游戏"
-    text = text_normalize(text)
-    print(text)
-    phones, tones, word2ph = g2p(text)
-    bert = get_bert_feature(text, word2ph)
-
-    print(phones, tones, word2ph, bert.shape)
-
-
-# # 示例用法
-# text = "这是一个示例文本：,你好！这是一个测试...."
-# print(g2p_paddle(text))  # 输出: 这是一个示例文本你好这是一个测试
