@@ -971,6 +971,39 @@ class _ASRNode(Node):
         self.state = "idle"
         return {"state": "idle"}
 
+    def _wait_result_subscriber(self) -> bool:
+        """Wait for a stably-matched result subscriber before publishing.
+
+        _ASR_PUB_QOS is BEST_EFFORT: a transient DDS graph match is not
+        enough for the evaluator's (per-case recreated) subscriber to
+        receive the result frame. Same gate pattern as the vits2_tts_trt
+        plugin's _wait_for_audio_subscriber. Bounded; on timeout we publish
+        anyway and log, so a missing subscriber degrades to the old
+        behavior rather than hanging the case.
+        """
+        wait_s = float(os.environ.get("ASR_RESULT_SUB_WAIT_S", "2.0"))
+        settle_s = float(os.environ.get("ASR_RESULT_SUB_SETTLE_S", "0.5"))
+        deadline = time.monotonic() + wait_s + settle_s
+        matched_at = None
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            if now >= deadline:
+                log.warning(
+                    f"[asr] result subscriber not stably matched on "
+                    f"{self._output_topic} after {wait_s + settle_s:.1f}s, "
+                    f"publishing anyway (may be dropped)"
+                )
+                return False
+            if self._pub.get_subscription_count() > 0:
+                if matched_at is None:
+                    matched_at = now
+                elif now - matched_at >= settle_s:
+                    return True
+            else:
+                matched_at = None
+            time.sleep(0.01)
+        return False
+
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
             return
@@ -1090,6 +1123,7 @@ class _ASRNode(Node):
                           "priority": 1,
                           "spans": _spans}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
+                self._wait_result_subscriber()
                 self._pub.publish(msg)
                 self._completed_utterances += 1
                 self._last_result_ts = result["asr_complete_ts"]
@@ -1277,6 +1311,12 @@ class ASRPlugin:
             if not input_topic:
                 raise ValueError("input_topic is required")
             node_key = instance_id or input_topic
+            if node_key in self._nodes and self._nodes[node_key]._input_topic != input_topic:
+                # Topic changed for the same key — rebuild so the publisher
+                # binds the correct output topic.
+                self._nodes[node_key].stop()
+                self._executor.remove_node(self._nodes[node_key])
+                del self._nodes[node_key]
             if node_key not in self._nodes:
                 node = _ASRNode(input_topic, adapter, self._language,
                                 self._vad_backend, self._vad_threshold, self._vad_silence_ms,
@@ -1303,20 +1343,16 @@ class ASRPlugin:
             return self._nodes[node_key].start()
 
         elif action == "stop":
+            # Keep node + publisher alive across stop/start cycles — reusing
+            # the publisher preserves DDS discovery state, so the evaluator's
+            # per-case subscriber re-matches quickly and BEST_EFFORT results
+            # are not dropped (same pattern as vits2_tts_trt plugin).
             if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                result = node.stop()
-                self._executor.remove_node(node)
-                del self._nodes[instance_id]
-                return result
+                return self._nodes[instance_id].stop()
             elif not instance_id and self._nodes:
-                # Stop all instances (backward compat / project stop)
                 results = []
-                for key in list(self._nodes.keys()):
-                    node = self._nodes[key]
+                for key, node in self._nodes.items():
                     node.stop()
-                    self._executor.remove_node(node)
-                    del self._nodes[key]
                     results.append(key)
                 return {"state": "idle", "stopped_instances": results}
             return {"state": "idle"}
@@ -1375,11 +1411,10 @@ class ASRPlugin:
                     "asr_model": self._asr_model,
                     "message": f"Switching ASR to mode '{self._mode}'...",
                 }
-            # Stop all nodes (they'll use new config on next start)
-            for key in list(self._nodes.keys()):
-                self._nodes[key].stop()
-                self._executor.remove_node(self._nodes[key])
-                del self._nodes[key]
+            # Stop all nodes (they keep publisher/DDS state; next start
+            # syncs the new config into them via the start path's reuse branch)
+            for node in self._nodes.values():
+                node.stop()
             return {
                 "status": "configured",
                 "mode": self._mode,
