@@ -19,7 +19,7 @@ from .adapter import CHUNK_BYTES, PCM_FRAME_MS, SAMPLE_RATE, TTSAdapter, build_a
 
 
 log = logging.getLogger(__name__)
-FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "85"))
+FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "80"))
 if not 0 <= FRAME_INTERVAL_MS <= 1000:
     raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 1000")
 FIRST_FRAME_DELAY_MS = int(os.getenv("MIX_VITS_FIRST_FRAME_DELAY_MS", "0"))
@@ -31,7 +31,7 @@ if not 0 <= SUBSCRIBER_WAIT_MS <= 60000:
 SUBSCRIBER_POLL_MS = int(os.getenv("MIX_VITS_SUBSCRIBER_POLL_MS", "10"))
 if not 1 <= SUBSCRIBER_POLL_MS <= 1000:
     raise ValueError("MIX_VITS_SUBSCRIBER_POLL_MS must be between one and 1000")
-SUBSCRIBER_SETTLE_MS = int(os.getenv("MIX_VITS_SUBSCRIBER_SETTLE_MS", "250"))
+SUBSCRIBER_SETTLE_MS = int(os.getenv("MIX_VITS_SUBSCRIBER_SETTLE_MS", "500"))
 if not 0 <= SUBSCRIBER_SETTLE_MS <= 5000:
     raise ValueError("MIX_VITS_SUBSCRIBER_SETTLE_MS must be between zero and 5000")
 ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "1") == "1"
@@ -149,12 +149,16 @@ class _Vits2TTSNode(Node):
         message.data = list(pcm)
         self._pub.publish(message)
 
-    def _wait_for_audio_subscriber(self) -> tuple[float, float, int]:
+    def _wait_for_audio_subscriber(
+        self, cancel_event: Optional[threading.Event] = None
+    ) -> tuple[float, float, int]:
         """Wait until an audio subscriber remains DDS-matched long enough."""
         started = time.monotonic()
         deadline = started + (SUBSCRIBER_WAIT_MS + SUBSCRIBER_SETTLE_MS) / 1000.0
         matched_at = None
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not (
+            cancel_event and cancel_event.is_set()
+        ):
             now = time.monotonic()
             count = self._pub.get_subscription_count()
             if count > 0:
@@ -174,6 +178,8 @@ class _Vits2TTSNode(Node):
                     f"on {self._output_topic}"
                 )
             time.sleep(SUBSCRIBER_POLL_MS / 1000.0)
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("subscriber wait cancelled")
         raise RuntimeError("TTS stopped while waiting for an audio subscriber")
 
     def _worker(self):
@@ -183,6 +189,29 @@ class _Vits2TTSNode(Node):
                 text = self._text_queue.get(timeout=1)
             except queue.Empty:
                 continue
+            subscriber_gate_cancel = threading.Event()
+            subscriber_gate_done = threading.Event()
+            subscriber_gate_result = {}
+
+            def wait_for_subscriber() -> None:
+                try:
+                    subscriber_gate_result["value"] = (
+                        self._wait_for_audio_subscriber(subscriber_gate_cancel)
+                    )
+                except BaseException as exc:
+                    subscriber_gate_result["error"] = exc
+                finally:
+                    subscriber_gate_done.set()
+
+            subscriber_gate_thread = threading.Thread(
+                target=wait_for_subscriber,
+                name="vits2-trt-subscriber-gate",
+                daemon=True,
+            )
+            # DDS discovery/settling runs in parallel with frontend + first
+            # TensorRT synthesis so the stronger BEST_EFFORT guard does not
+            # become pure TTFT overhead.
+            subscriber_gate_thread.start()
             try:
                 task_started = time.monotonic()
                 first_published_at = None
@@ -200,11 +229,18 @@ class _Vits2TTSNode(Node):
                     nonlocal subscriber_count
                     now = time.monotonic()
                     if started is None:
+                        while not subscriber_gate_done.wait(timeout=0.05):
+                            if self._stop_event.is_set():
+                                raise RuntimeError(
+                                    "TTS stopped while waiting for an audio subscriber"
+                                )
+                        if "error" in subscriber_gate_result:
+                            raise subscriber_gate_result["error"]
                         (
                             subscriber_wait_seconds,
                             subscriber_settle_seconds,
                             subscriber_count,
-                        ) = self._wait_for_audio_subscriber()
+                        ) = subscriber_gate_result["value"]
                         if FIRST_FRAME_DELAY_MS:
                             time.sleep(FIRST_FRAME_DELAY_MS / 1000.0)
                         started = time.monotonic()
@@ -259,6 +295,9 @@ class _Vits2TTSNode(Node):
                     )
             except Exception:
                 log.exception("[vits2_tts_trt] synthesis failed")
+            finally:
+                subscriber_gate_cancel.set()
+                subscriber_gate_thread.join(timeout=0.1)
 
     def status(self):
         return {
