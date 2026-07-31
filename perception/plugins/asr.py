@@ -599,12 +599,14 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 backend: str, threshold: float, silence_ms: int, pre_roll_ms: int,
                 model_dir: str,
                 kws_cfg: dict = None,
-                save_vad_segments: bool = False, max_saved_segments: int = 1000):
+                save_vad_segments: bool = False, max_saved_segments: int = 1000,
+                pause_evt: multiprocessing.Event = None):
     """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
     - If kws_cfg is provided and enabled, only output utterances after keyword detected
     - Otherwise (kws disabled), output all utterances (backward compat)
+    - pause_evt: when set, drain pcm_q without outputting (VAD process stays alive across stop/start)
     """
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                         datefmt='%H:%M:%S')
@@ -696,6 +698,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # States: 'waiting_wake' (KWS mode) or 'listening' (direct mode / post-wake)
     state = 'waiting_wake' if kws_enabled else 'listening'
     kws_cooldown_until = 0.0
+    paused = False
 
     _log.info(
         f"[vad-worker] process started (pid={os.getpid()}, "
@@ -747,6 +750,24 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             pass
 
     while not stop_evt.is_set():
+        # Pause path: drain pcm_q silently while paused (VAD process stays alive)
+        if pause_evt is not None and pause_evt.is_set():
+            if not paused:
+                paused = True
+                try:
+                    vad_session.init()  # reset VAD state for the next utterance
+                    _log.info("[vad-worker] paused, session reset")
+                except Exception:
+                    pass
+            try:
+                pcm_q.get(timeout=0.1)
+            except queue.Empty:
+                pass
+            continue
+        if paused:
+            paused = False
+            _log.info("[vad-worker] resumed")
+
         try:
             pcm, ts = pcm_q.get(timeout=1)
         except queue.Empty:
@@ -871,7 +892,9 @@ class _ASRNode(Node):
         self._pcm_queue: Optional[multiprocessing.Queue] = None
         self._utterance_queue: Optional[multiprocessing.Queue] = None
         self._vad_stop: Optional[multiprocessing.Event] = None
+        self._vad_pause: Optional[multiprocessing.Event] = None   # pause=True → VAD drains silently
         self._vad_proc: Optional[multiprocessing.Process] = None
+        self._vad_cfg_key: tuple = ()                             # snapshot for change-detection
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._first_chunk_event = threading.Event()
@@ -895,39 +918,87 @@ class _ASRNode(Node):
             self.state = "error"
             return {"state": "error", "message": str(e)}
 
+    def _vad_cfg_snapshot(self) -> tuple:
+        """Return a hashable snapshot of VAD config for change-detection."""
+        return (self._vad_backend, self._vad_threshold, self._vad_silence_ms,
+                self._vad_pre_roll_ms, self._vad_model_dir,
+                repr(sorted(self._kws_cfg.items())))
+
     def _start_inner(self) -> dict:
         from audio_msgs.msg import AudioChunk
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
         self._first_chunk_event = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
         self._stop_event.clear()
-        # Start VAD in a child process
-        self._pcm_queue = multiprocessing.Queue(maxsize=1000)
-        self._utterance_queue = multiprocessing.Queue(maxsize=100)
-        self._vad_stop = multiprocessing.Event()
-        self._vad_proc = multiprocessing.Process(
-            target=_vad_worker,
-            args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
-                  self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                  self._vad_pre_roll_ms, self._vad_model_dir, self._kws_cfg,
-                  self._save_vad_segments, self._max_saved_segments),
-            daemon=True, name="vad_worker",
-        )
-        self._vad_proc.start()
-        log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
-        # Verify VAD worker is alive before returning "running" to caller.
-        # A dead VAD worker silently drops all audio — fail fast so the
-        # evaluation framework knows the instance is broken.
-        time.sleep(1.0)
-        if not self._vad_proc.is_alive():
-            exitcode = self._vad_proc.exitcode
-            self.state = "error"
-            self.destroy_subscription(self._sub); self._sub = None
-            raise RuntimeError(
-                f"VAD worker process died immediately (exitcode={exitcode}). "
-                f"Check that /models/sherpa-onnx/vad/silero_vad.onnx exists "
-                f"or that the COS fallback download succeeded."
+
+        new_vad_cfg = self._vad_cfg_snapshot()
+        vad_cfg_changed = (new_vad_cfg != self._vad_cfg_key)
+
+        # ── VAD process: reuse if alive and config unchanged, else (re)build ──
+        if (self._vad_proc is not None and self._vad_proc.is_alive()
+                and not vad_cfg_changed and self._vad_pause is not None):
+            # Resume paused VAD process — ONNX model already loaded, no cold start
+            self._vad_pause.clear()
+            log.info(f"[asr] VAD worker resumed (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
+        else:
+            # Tear down any stale process first
+            if self._vad_proc is not None and self._vad_proc.is_alive():
+                if self._vad_stop:
+                    self._vad_stop.set()
+                self._vad_proc.join(timeout=3)
+                if self._vad_proc.is_alive():
+                    self._vad_proc.terminate()
+            for q in (self._pcm_queue, self._utterance_queue):
+                if q:
+                    try:
+                        q.cancel_join_thread(); q.close()
+                    except Exception:
+                        pass
+
+            self._pcm_queue = multiprocessing.Queue(maxsize=1000)
+            self._utterance_queue = multiprocessing.Queue(maxsize=100)
+            self._vad_stop = multiprocessing.Event()
+            self._vad_pause = multiprocessing.Event()
+            self._vad_cfg_key = new_vad_cfg
+            self._vad_proc = multiprocessing.Process(
+                target=_vad_worker,
+                args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
+                      self._vad_backend, self._vad_threshold, self._vad_silence_ms,
+                      self._vad_pre_roll_ms, self._vad_model_dir, self._kws_cfg,
+                      self._save_vad_segments, self._max_saved_segments,
+                      self._vad_pause),
+                daemon=True, name="vad_worker",
             )
+            self._vad_proc.start()
+            log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
+            # Verify VAD worker is alive before returning "running" to caller.
+            # A dead VAD worker silently drops all audio — fail fast so the
+            # evaluation framework knows the instance is broken.
+            time.sleep(1.0)
+            if not self._vad_proc.is_alive():
+                exitcode = self._vad_proc.exitcode
+                self.state = "error"
+                self.destroy_subscription(self._sub); self._sub = None
+                raise RuntimeError(
+                    f"VAD worker process died immediately (exitcode={exitcode}). "
+                    f"Check that /models/sherpa-onnx/vad/silero_vad.onnx exists "
+                    f"or that the COS fallback download succeeded."
+                )
+
+        # ── Subscriber gate: wait until audio publisher has matched ──
+        # Avoids the eval framework seeing "running" before DDS discovery
+        # completes — which would cause the first audio chunks to be dropped.
+        _gate_deadline = time.time() + float(os.environ.get("MIX_ASR_SUB_WAIT_MS", "3000")) / 1000.0
+        while time.time() < _gate_deadline:
+            try:
+                if self.count_publishers(self._input_topic) > 0:
+                    break
+            except Exception:
+                break
+            time.sleep(0.05)
+        else:
+            log.warning(f"[asr] no audio publisher matched on {self._input_topic} within gate window, proceeding anyway")
+
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
@@ -936,6 +1007,12 @@ class _ASRNode(Node):
         return self._status_dict()
 
     def stop(self) -> dict:
+        """Pause the ASR instance — VAD process + publisher stay alive.
+
+        The next start() resumes the same VAD worker (no fork, no model
+        reload, DDS discovery state preserved). Use _destroy_vad() for real
+        teardown (adapter rebuild / topic change / plugin shutdown).
+        """
         # Stop subscription first to prevent new audio_cb calls
         if self._sub:
             try:
@@ -943,22 +1020,42 @@ class _ASRNode(Node):
             except Exception:
                 pass  # may already be invalid
             self._sub = None
-        self._stop_event.set()
         # Unblock start() if it's waiting
         if hasattr(self, '_first_chunk_event'):
             self._first_chunk_event.set()
         if hasattr(self, '_worker_ready'):
             self._worker_ready.set()
+        # Pause the VAD worker (it resets its session and drains pcm silently)
+        if self._vad_pause is not None:
+            self._vad_pause.set()
+        # Let the transcription worker drain queued utterances before we stop it
+        if self._utterance_queue is not None and self._worker_thread is not None:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                try:
+                    if self._utterance_queue.empty():
+                        time.sleep(0.3)  # settle: last utterance being transcribed
+                        if self._utterance_queue.empty():
+                            break
+                except Exception:
+                    break
+                time.sleep(0.1)
+        self._stop_event.set()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=3)
+        self.state = "idle"
+        return {"state": "idle"}
+
+    def _destroy_vad(self) -> None:
+        """Fully tear down the VAD worker process + queues (real shutdown)."""
         if self._vad_stop:
             self._vad_stop.set()
-        # Join VAD worker BEFORE cancelling the feeder threads.
-        # The worker's drain+flush tail path emits any buffered utterance
-        # after stop_evt is set; closing the queue first would lose it.
+        if self._vad_pause is not None:
+            self._vad_pause.clear()  # let the worker see stop_evt
         if self._vad_proc and self._vad_proc.is_alive():
             self._vad_proc.join(timeout=5)
             if self._vad_proc.is_alive():
                 self._vad_proc.terminate()
-        # Cancel feeder threads after VAD worker has drained — avoids BrokenPipeError spam
         for q in (self._pcm_queue, self._utterance_queue):
             if q:
                 try:
@@ -966,10 +1063,8 @@ class _ASRNode(Node):
                     q.close()
                 except Exception:
                     pass
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=3)
-        self.state = "idle"
-        return {"state": "idle"}
+        self._vad_proc = None
+        self._vad_cfg_key = ()
 
     def _wait_result_subscriber(self) -> bool:
         """Wait for a stably-matched result subscriber before publishing.
@@ -1315,6 +1410,7 @@ class ASRPlugin:
                 # Topic changed for the same key — rebuild so the publisher
                 # binds the correct output topic.
                 self._nodes[node_key].stop()
+                self._nodes[node_key]._destroy_vad()
                 self._executor.remove_node(self._nodes[node_key])
                 del self._nodes[node_key]
             if node_key not in self._nodes:
@@ -1398,9 +1494,11 @@ class ASRPlugin:
                 self._max_saved_segments = int(cfg['max_saved_segments'])
             # ASR model / mode switch — load in background if changed
             if should_rebuild_adapter:
-                # Stop all running nodes first
+                # Stop all running nodes first (full teardown: adapter reload
+                # may change model dirs, so VAD processes must be rebuilt too)
                 for key in list(self._nodes.keys()):
                     self._nodes[key].stop()
+                    self._nodes[key]._destroy_vad()
                     self._executor.remove_node(self._nodes[key])
                     del self._nodes[key]
                 self._asr_model = cfg.get('asr_model', self._asr_model)
