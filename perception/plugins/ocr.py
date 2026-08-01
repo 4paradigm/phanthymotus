@@ -39,6 +39,11 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from plugins.ocr_runtime import (
+    DEFAULT_DET_BOX_THRESH,
+    DEFAULT_DET_THRESH,
+    DEFAULT_DET_UNCLIP_RATIO,
+    DEFAULT_MAX_SIDE_LEN,
+    DEFAULT_REC_MIN_SCORE,
     RapidOCRAdapter,
     normalize_rapidocr_output,
     recognize_to_payload,
@@ -92,6 +97,12 @@ TOOLS = [
                 "key":      {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
                 "model":    {"type": "string", "description": "模型名称", "scope": "instance"},
                 "language": {"type": "string", "description": "默认语言", "default": "zh", "scope": "instance"},
+                "max_side_len": {"type": "integer", "minimum": 32, "default": DEFAULT_MAX_SIDE_LEN, "description": "检测输入最长边", "scope": "shared"},
+                "det_thresh": {"type": "number", "minimum": 0, "maximum": 1, "default": DEFAULT_DET_THRESH, "description": "DB 文本像素阈值", "scope": "shared"},
+                "det_box_thresh": {"type": "number", "minimum": 0, "maximum": 1, "default": DEFAULT_DET_BOX_THRESH, "description": "DB 文本框阈值", "scope": "shared"},
+                "det_unclip_ratio": {"type": "number", "exclusiveMinimum": 0, "default": DEFAULT_DET_UNCLIP_RATIO, "description": "DB 文本框扩张比例", "scope": "shared"},
+                "rec_min_score": {"type": "number", "minimum": 0, "maximum": 1, "default": DEFAULT_REC_MIN_SCORE, "description": "识别结果最低置信度", "scope": "shared"},
+                "enable_preprocess": {"type": "boolean", "default": True, "description": "启用 OCR 图像预处理", "scope": "shared"},
                 "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "shared"},
             },
             "required": ["provider"]
@@ -454,7 +465,12 @@ def _adapter_signature(cfg: dict) -> tuple:
             int(cfg.get('gpu_mem_mb', 512)),
             bool(cfg.get('use_angle_cls', True)),
             int(cfg.get('num_threads', 2)),
-            int(cfg.get('max_side_len', 1600)),
+            int(cfg.get('max_side_len', DEFAULT_MAX_SIDE_LEN)),
+            float(cfg.get('rec_min_score', DEFAULT_REC_MIN_SCORE)),
+            bool(cfg.get('enable_preprocess', True)),
+            float(cfg.get('det_thresh', DEFAULT_DET_THRESH)),
+            float(cfg.get('det_box_thresh', DEFAULT_DET_BOX_THRESH)),
+            float(cfg.get('det_unclip_ratio', DEFAULT_DET_UNCLIP_RATIO)),
             _freeze_config(cfg.get('large_image_strategy', {})),
         )
     if provider in ('openai', 'qwen'):
@@ -485,12 +501,18 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             gpu_mem_mb=int(cfg.get('gpu_mem_mb', 512)),
             use_angle_cls=bool(cfg.get('use_angle_cls', True)),
             num_threads=int(cfg.get('num_threads', 2)),
-            max_side_len=int(cfg.get('max_side_len', 1600)),
-            rec_min_score=float(cfg.get('rec_min_score', 0.3)),
+            max_side_len=int(cfg.get('max_side_len', DEFAULT_MAX_SIDE_LEN)),
+            rec_min_score=float(
+                cfg.get('rec_min_score', DEFAULT_REC_MIN_SCORE)
+            ),
             enable_preprocess=bool(cfg.get('enable_preprocess', True)),
-            det_thresh=float(cfg.get('det_thresh', 0.3)),
-            det_box_thresh=float(cfg.get('det_box_thresh', 0.5)),
-            det_unclip_ratio=float(cfg.get('det_unclip_ratio', 1.2)),
+            det_thresh=float(cfg.get('det_thresh', DEFAULT_DET_THRESH)),
+            det_box_thresh=float(
+                cfg.get('det_box_thresh', DEFAULT_DET_BOX_THRESH)
+            ),
+            det_unclip_ratio=float(
+                cfg.get('det_unclip_ratio', DEFAULT_DET_UNCLIP_RATIO)
+            ),
             large_image_strategy=dict(
                 cfg.get('large_image_strategy') or {}
             ),

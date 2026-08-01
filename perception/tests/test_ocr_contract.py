@@ -98,6 +98,10 @@ class OCRContractTest(unittest.TestCase):
             tool["configSchema"]["properties"]["provider"]["enum"],
             ["rapidocr", "openai", "qwen", "tesseract"],
         )
+        properties = tool["configSchema"]["properties"]
+        self.assertEqual(properties["max_side_len"]["default"], 1600)
+        self.assertEqual(properties["det_unclip_ratio"]["default"], 0.7)
+        self.assertEqual(properties["rec_min_score"]["default"], 0.9)
 
     def test_camera_and_result_topics_use_appropriate_reliability(self):
         self.assertEqual(self.ocr._CAMERA_QOS["reliability"], "RELIABLE")
@@ -145,11 +149,11 @@ class OCRContractTest(unittest.TestCase):
             use_angle_cls=True,
             num_threads=2,
             max_side_len=1600,
-            rec_min_score=0.3,
+            rec_min_score=0.9,
             enable_preprocess=True,
             det_thresh=0.3,
             det_box_thresh=0.5,
-            det_unclip_ratio=1.2,
+            det_unclip_ratio=0.7,
             large_image_strategy={
                 "enabled": True,
                 "trigger_side": 2400,
@@ -171,6 +175,27 @@ class OCRContractTest(unittest.TestCase):
         )
 
         self.assertNotEqual(first, second)
+
+    def test_adapter_signature_changes_with_inference_tuning(self):
+        baseline = {
+            "provider": "rapidocr",
+            "rec_min_score": 0.9,
+            "det_unclip_ratio": 0.7,
+        }
+
+        for key, value in (
+            ("rec_min_score", 0.8),
+            ("enable_preprocess", False),
+            ("det_thresh", 0.2),
+            ("det_box_thresh", 0.4),
+            ("det_unclip_ratio", 1.0),
+        ):
+            changed = {**baseline, key: value}
+            with self.subTest(key=key):
+                self.assertNotEqual(
+                    self.ocr._adapter_signature(baseline),
+                    self.ocr._adapter_signature(changed),
+                )
 
     def test_adapter_signature_changes_with_device(self):
         cpu = self.ocr._adapter_signature(
@@ -222,11 +247,11 @@ class OCRContractTest(unittest.TestCase):
             use_angle_cls=False,
             num_threads=1,
             max_side_len=960,
-            rec_min_score=0.3,
+            rec_min_score=0.9,
             enable_preprocess=True,
             det_thresh=0.3,
             det_box_thresh=0.5,
-            det_unclip_ratio=1.2,
+            det_unclip_ratio=0.7,
             large_image_strategy={"enabled": True},
         )
 
@@ -337,11 +362,11 @@ class OCRContractTest(unittest.TestCase):
             root,
             num_threads=1,
             max_side_len=1600,
-            rec_min_score=0.3,
+            rec_min_score=0.9,
             enable_preprocess=True,
             det_thresh=0.3,
             det_box_thresh=0.5,
-            det_unclip_ratio=1.2,
+            det_unclip_ratio=0.7,
         )
         pipeline.return_value.warm_up.assert_called_once_with()
         self.assertEqual(adapter._backend_name, "mnn")
@@ -543,6 +568,9 @@ class OCRContractTest(unittest.TestCase):
         self.assertEqual(Path(captured_config["Rec"]["rec_keys_path"]).name, "keys.txt")
         self.assertEqual(captured_config["Det"]["model_type"], "tiny")
         self.assertEqual(captured_config["Det"]["ocr_version"], "PP-OCRv6")
+        self.assertEqual(captured_config["Det"]["thresh"], 0.3)
+        self.assertEqual(captured_config["Det"]["box_thresh"], 0.5)
+        self.assertEqual(captured_config["Det"]["unclip_ratio"], 0.7)
         self.assertEqual(captured_config["Cls"]["model_type"], "mobile")
         self.assertEqual(captured_config["Cls"]["ocr_version"], "PP-OCRv4")
         self.assertEqual(captured_config["Rec"]["model_type"], "tiny")
@@ -909,6 +937,24 @@ class OCRContractTest(unittest.TestCase):
         self.assertEqual(build.call_count, 1)
         self.assertIs(plugin._adapter, shared_adapter)
         self.assertTrue(result["reused"])
+
+    def test_shared_tuning_config_rebuilds_adapter(self):
+        shared_adapter = object()
+        tuned_adapter = object()
+        with mock.patch(
+            "plugins.ocr._build_ocr_adapter",
+            side_effect=[shared_adapter, tuned_adapter],
+        ) as build:
+            plugin = self.ocr.OCRPlugin(
+                {"provider": "rapidocr", "rec_min_score": 0.9}, mock.Mock()
+            )
+            result = plugin.dispatch(
+                "ocr", {"action": "config", "rec_min_score": 0.8}
+            )
+
+        self.assertEqual(build.call_count, 2)
+        self.assertIs(plugin._adapter, tuned_adapter)
+        self.assertFalse(result["reused"])
 
     def test_repeated_start_stop_reuses_one_ros_node(self):
         executor = mock.Mock()

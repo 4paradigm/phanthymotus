@@ -24,6 +24,11 @@ ORT_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
 MNN_MODEL_FILES = ("det.mnn", "rec.mnn", "keys.txt")
 _OCR_MEAN = (127.5, 127.5, 127.5)
 _OCR_NORMAL = (1 / 127.5, 1 / 127.5, 1 / 127.5)
+DEFAULT_MAX_SIDE_LEN = 1600
+DEFAULT_REC_MIN_SCORE = 0.9
+DEFAULT_DET_THRESH = 0.3
+DEFAULT_DET_BOX_THRESH = 0.5
+DEFAULT_DET_UNCLIP_RATIO = 0.7
 
 
 @dataclass(frozen=True)
@@ -194,11 +199,11 @@ class _MNNModelSession:
 
 class _MNNPipeline:
     def __init__(self, root: Path, *, num_threads: int, max_side_len: int,
-                 rec_min_score: float = 0.3,
+                 rec_min_score: float = DEFAULT_REC_MIN_SCORE,
                  enable_preprocess: bool = True,
-                 det_thresh: float = 0.3,
-                 det_box_thresh: float = 0.5,
-                 det_unclip_ratio: float = 1.2):
+                 det_thresh: float = DEFAULT_DET_THRESH,
+                 det_box_thresh: float = DEFAULT_DET_BOX_THRESH,
+                 det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO):
         from rapidocr.ch_ppocr_det.utils import DBPostProcess
         from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
         from rapidocr.utils.process_img import get_rotate_crop_image
@@ -369,12 +374,12 @@ class RapidOCRAdapter:
         gpu_mem_mb: int = 512,
         use_angle_cls: bool = True,
         num_threads: int = 2,
-        max_side_len: int = 1600,
-        rec_min_score: float = 0.3,
+        max_side_len: int = DEFAULT_MAX_SIDE_LEN,
+        rec_min_score: float = DEFAULT_REC_MIN_SCORE,
         enable_preprocess: bool = True,
-        det_thresh: float = 0.3,
-        det_box_thresh: float = 0.5,
-        det_unclip_ratio: float = 1.2,
+        det_thresh: float = DEFAULT_DET_THRESH,
+        det_box_thresh: float = DEFAULT_DET_BOX_THRESH,
+        det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO,
         large_image_strategy: dict | None = None,
     ):
         root = Path(model_dir)
