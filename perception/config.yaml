@@ -11,9 +11,9 @@ plugins:
     hw_provider: cpu
     num_threads: 2
     language: zh-CN
-    # x-asr transducer + modified_beam_search(5) + hotwords：ARM 实测 1-CER 0.8388，
-    # mbs(5) 消除跨平台漂移，hotwords 偏置机器人动作术语（举双手/锁定站立等）再 +3.8pt。
-    # 详见 docs/current-state.md §x-asr hotwords 调参结论。
+    # x-asr transducer + modified_beam_search(10) + hotwords：ARM 12-case
+    # full-file 实测 1-CER 0.8947；扩 beam 并补齐飞吻/大疆/高举双手等领域词。
+    # 详见 docs/asr-miss-root-cause.md 的 2026-08-01 热词扩展记录。
     sherpa_config:
       tokens: tokens.txt
       numThreads: 2
@@ -23,11 +23,11 @@ plugins:
         featureDim: 80
       recognizerConfig:
         decodingMethod: modified_beam_search
-        maxActivePaths: 5
+        maxActivePaths: 10
         # hotwords: 逐字空格分隔格式由 asr_offline.py 在加载时从 hotwordsFile
         # 原文转换（x-asr tokens.txt 全是 ▁X 单字 token，整词 BPE 编码会产出
         # tokens.txt 里没有的多字 piece，必须逐字喂入）。
-        hotwordsFile: hotwords.txt   # 相对 model_path，234 个机器人动作术语
+        hotwordsFile: hotwords.txt   # 相对 model_path，234 个基础词 + 10 个内置领域词
         hotwordsScore: 2.0
         modelingUnit: bpe
         bpeVocab: bpe.vocab

@@ -17,6 +17,22 @@ from plugins.asr_runtime import pcm16_to_float_samples
 SAMPLE_RATE = 16000
 log = logging.getLogger(__name__)
 
+# Product vocabulary missing from the downloaded 234-term robot-action list.
+# Keep this in code so every image gets the same additions without mutating or
+# checking model artifacts into Git.
+_DOMAIN_HOTWORDS = (
+    "进入零力矩模式",
+    "进入阻尼模式",
+    "飞吻",
+    "来个飞吻",
+    "大疆",
+    "大疆创新",
+    "仙元路",
+    "大疆天空之城",
+    "高举你的双手",
+    "双手打叉",
+)
+
 
 def _resolve_model_file(model_root: Path, configured_model: str) -> Path:
     if configured_model:
@@ -77,15 +93,19 @@ def _prepare_hotwords_file(
     """
     tmp_dir.mkdir(parents=True, exist_ok=True)
     out_path = tmp_dir / "hotwords_char_bpe.txt"
-    with hotwords_path.open("r", encoding="utf-8") as src, out_path.open(
-        "w", encoding="utf-8"
-    ) as dst:
-        for line in src:
-            line = line.strip()
-            if not line or line.startswith("#"):
+    with hotwords_path.open("r", encoding="utf-8") as src:
+        phrases = [line.strip() for line in src]
+
+    seen: set[str] = set()
+    with out_path.open("w", encoding="utf-8") as dst:
+        for phrase in (*phrases, *_DOMAIN_HOTWORDS):
+            if not phrase or phrase.startswith("#"):
                 continue
-            chars = list(line.replace(" ", ""))
-            dst.write(" ".join(chars) + " :2.0\n")
+            compact = phrase.replace(" ", "")
+            if compact in seen:
+                continue
+            seen.add(compact)
+            dst.write(" ".join(compact) + " :2.0\n")
     return out_path, "bpe"
 
 
@@ -134,7 +154,7 @@ def _create_sherpa_recognizer(
         )
         transducer_kwargs = dict(common_kwargs)
         # modified_beam_search 需显式传 max_active_paths（默认 4），
-        # 允许 config 覆盖以启用 mbs(5) 等配置。
+        # 允许 config 覆盖以启用更宽的 beam 配置。
         if method != "greedy_search":
             max_active = int(recognizer_config.get("maxActivePaths", 4))
             transducer_kwargs["max_active_paths"] = max_active
