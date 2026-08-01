@@ -17,23 +17,6 @@ from plugins.asr_runtime import pcm16_to_float_samples
 SAMPLE_RATE = 16000
 log = logging.getLogger(__name__)
 
-# Product vocabulary missing from the downloaded 234-term robot-action list.
-# Keep this in code so every image gets the same additions without mutating or
-# checking model artifacts into Git.
-_DOMAIN_HOTWORDS = (
-    "进入零力矩模式",
-    "进入阻尼模式",
-    "飞吻",
-    "来个飞吻",
-    "大疆",
-    "大疆创新",
-    "仙元路",
-    "大疆天空之城",
-    "高举你的双手",
-    "双手打叉",
-)
-
-
 def _resolve_model_file(model_root: Path, configured_model: str) -> Path:
     if configured_model:
         configured_path = Path(configured_model)
@@ -98,7 +81,7 @@ def _prepare_hotwords_file(
 
     seen: set[str] = set()
     with out_path.open("w", encoding="utf-8") as dst:
-        for phrase in (*phrases, *_DOMAIN_HOTWORDS):
+        for phrase in phrases:
             if not phrase or phrase.startswith("#"):
                 continue
             compact = phrase.replace(" ", "")
