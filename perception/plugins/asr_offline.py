@@ -74,7 +74,7 @@ def _find_transducer_files(model_root: Path) -> tuple[str, str, str] | None:
 
 
 def _prepare_hotwords_file(
-    hotwords_path: Path, tmp_dir: Path
+    hotwords_path: Path, tmp_dir: Path, hotwords_score: float = 2.0
 ) -> tuple[Path, str]:
     """把热词原文转成 sherpa bpe 模式可编码的逐字空格格式。
 
@@ -86,8 +86,8 @@ def _prepare_hotwords_file(
         阻尼模式
         举双手
     输出（char-separated + :score）：
-        阻 尼 模 式 :2.0
-        举 双 手 :2.0
+        阻 尼 模 式 :2.5
+        举 双 手 :2.5
 
     返回 (转换后文件路径, modeling_unit)。
     """
@@ -105,7 +105,7 @@ def _prepare_hotwords_file(
             if compact in seen:
                 continue
             seen.add(compact)
-            dst.write(" ".join(compact) + " :2.0\n")
+            dst.write(" ".join(compact) + f" :{float(hotwords_score)}\n")
     return out_path, "bpe"
 
 
@@ -170,11 +170,14 @@ def _create_sherpa_recognizer(
             hw_path = hw_path.resolve()
             if hw_path.is_file():
                 tmp_dir = Path("/tmp/asr_hotwords") if Path("/tmp").is_dir() else model_root.parent
-                encoded_path, modeling_unit = _prepare_hotwords_file(hw_path, tmp_dir)
-                transducer_kwargs["hotwords_file"] = str(encoded_path)
-                transducer_kwargs["hotwords_score"] = float(
+                hotwords_score = float(
                     recognizer_config.get("hotwordsScore", 2.0)
                 )
+                encoded_path, modeling_unit = _prepare_hotwords_file(
+                    hw_path, tmp_dir, hotwords_score=hotwords_score
+                )
+                transducer_kwargs["hotwords_file"] = str(encoded_path)
+                transducer_kwargs["hotwords_score"] = hotwords_score
                 transducer_kwargs["modeling_unit"] = modeling_unit
                 bpe_vocab = recognizer_config.get("bpeVocab")
                 if bpe_vocab:

@@ -28,7 +28,7 @@ plugins:
         # 原文转换（x-asr tokens.txt 全是 ▁X 单字 token，整词 BPE 编码会产出
         # tokens.txt 里没有的多字 piece，必须逐字喂入）。
         hotwordsFile: hotwords.txt   # 相对 model_path，234 个基础词 + 10 个内置领域词
-        hotwordsScore: 2.0
+        hotwordsScore: 2.5
         modelingUnit: bpe
         bpeVocab: bpe.vocab
     vad:
