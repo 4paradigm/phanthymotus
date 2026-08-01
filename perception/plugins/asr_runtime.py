@@ -377,8 +377,9 @@ class _FireRedVadSession:
     matches the eval pipeline's "send audio → send 1500ms silence → flush"
     flow without the segment-boundary drift of incremental re-detection.
 
-    Each returned segment gets pre_roll + 300ms tail pad to protect weak
-    trailing syllables (see [[asr-miss-root-cause]]).
+    The returned utterance preserves one continuous span from the first
+    detected segment to the last. FireRed's completed segment already contains
+    ``silence_ms`` of possible silence, so replace it with a 300ms tail pad.
     """
 
     _TAIL_PAD_S = 0.3
@@ -402,6 +403,7 @@ class _FireRedVadSession:
         )
         self._sample_rate = sample_rate
         self._pre_roll_s = pre_roll_ms / 1000.0
+        self._silence_s = silence_ms / 1000.0
         self._pcm = bytearray()
         self._detected = False
         self._silence_samples = 0
@@ -453,12 +455,16 @@ class _FireRedVadSession:
             self._silence_samples = 0
             return
         self._detected = True
-        parts = []
-        for start_s, end_s in segs:
-            start = max(0.0, start_s - self._pre_roll_s)
-            end = min(end_s + self._TAIL_PAD_S, total_s)
-            parts.append(self._slice(start, end))
-        utterance = b"".join(parts)
+        start = max(0.0, min(start_s for start_s, _ in segs) - self._pre_roll_s)
+        detected_end = max(end_s for _, end_s in segs)
+        # A completed FireRed segment includes the possible-silence run used
+        # to declare its end. Replace that run with the desired tail pad. If
+        # the segment reaches the buffered waveform end, it may still contain
+        # speech (idle-trigger path), so do not subtract anything.
+        if detected_end < total_s - 0.02:
+            detected_end = max(start, detected_end - self._silence_s)
+        end = min(total_s, detected_end + self._TAIL_PAD_S)
+        utterance = self._slice(start, end)
         # timestamps are approximate: span covers all audio up to total_s
         self._completed.append((
             utterance,
