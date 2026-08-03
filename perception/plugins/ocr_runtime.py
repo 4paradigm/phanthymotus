@@ -23,6 +23,7 @@ _log = logging.getLogger(__name__)
 ORT_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
 MNN_MODEL_FILES = ("det.mnn", "rec.mnn", "keys.txt")
 TENSORRT_MODEL_FILES = ("det.engine", "rec.engine", "keys.txt")
+TENSORRT_CLASSIFIER_MODEL_FILE = "cls.engine"
 _OCR_MEAN = (127.5, 127.5, 127.5)
 _OCR_NORMAL = (1 / 127.5, 1 / 127.5, 1 / 127.5)
 DEFAULT_MAX_SIDE_LEN = 1600
@@ -30,6 +31,7 @@ DEFAULT_REC_MIN_SCORE = 0.9
 DEFAULT_DET_THRESH = 0.3
 DEFAULT_DET_BOX_THRESH = 0.5
 DEFAULT_DET_UNCLIP_RATIO = 0.7
+DEFAULT_CLS_THRESH = 0.9
 DEFAULT_CROP_REFINEMENT_ENABLED = True
 DEFAULT_CROP_REFINEMENT_MIN_SCORE = 0.9
 DEFAULT_CROP_REFINEMENT_MIN_GAIN = 0.12
@@ -845,6 +847,8 @@ class _TensorRTPipeline(_MNNPipeline):
         det_box_thresh: float = DEFAULT_DET_BOX_THRESH,
         det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO,
         crop_refinement: CropRefinementConfig | None = None,
+        use_angle_cls: bool = False,
+        cls_thresh: float = DEFAULT_CLS_THRESH,
     ):
         from rapidocr.ch_ppocr_det.utils import DBPostProcess
         from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
@@ -866,6 +870,19 @@ class _TensorRTPipeline(_MNNPipeline):
         except Exception:
             self._det.close()
             raise
+        self._cls = None
+        if use_angle_cls:
+            try:
+                self._cls = _TensorRTModelSession(
+                    root / TENSORRT_CLASSIFIER_MODEL_FILE,
+                    device_id=device_id,
+                    mean=_OCR_MEAN,
+                    normal=_OCR_NORMAL,
+                )
+            except Exception:
+                self._rec.close()
+                self._det.close()
+                raise
         self._det_postprocess = DBPostProcess(
             thresh=float(det_thresh),
             box_thresh=float(det_box_thresh),
@@ -879,6 +896,7 @@ class _TensorRTPipeline(_MNNPipeline):
         self._rec_min_score = float(rec_min_score)
         self._enable_preprocess = bool(enable_preprocess)
         self._max_side_len = max(32, int(max_side_len))
+        self._cls_thresh = float(cls_thresh)
         self._crop_refinement = (
             crop_refinement
             if crop_refinement is not None
@@ -904,6 +922,70 @@ class _TensorRTPipeline(_MNNPipeline):
             ),
             rec_shape,
         )
+        if self._cls is not None:
+            cls_shape = self._cls.optimization_shape
+            self._cls.run_uint8_batch(
+                np.zeros(
+                    (cls_shape[0], cls_shape[2], cls_shape[3], 3),
+                    dtype=np.uint8,
+                ),
+                cls_shape,
+            )
+
+    @staticmethod
+    def _prepare_classifier_crop(crop):
+        import cv2
+        import numpy as np
+
+        height, width = crop.shape[:2]
+        if height <= 0 or width <= 0:
+            return None
+        target_height = 48
+        target_width = 192
+        resized_width = min(
+            target_width,
+            max(1, int(math.ceil(target_height * width / float(height)))),
+        )
+        resized = cv2.resize(
+            crop,
+            (resized_width, target_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        padded = np.zeros(
+            (target_height, target_width, 3), dtype=np.uint8
+        )
+        padded[:, :resized_width] = resized
+        return padded
+
+    def _orient_crops(self, crops):
+        import cv2
+        import numpy as np
+
+        classifier = getattr(self, "_cls", None)
+        if classifier is None:
+            return crops
+        oriented = list(crops)
+        prepared = []
+        for index, crop in enumerate(crops):
+            value = self._prepare_classifier_crop(crop)
+            if value is not None:
+                prepared.append((index, value))
+        max_batch = classifier.max_batch_size(48, 192)
+        for offset in range(0, len(prepared), max_batch):
+            chunk = prepared[offset:offset + max_batch]
+            images = np.stack([entry[1] for entry in chunk])
+            prediction = classifier.run_uint8_batch(
+                images,
+                (len(chunk), 3, 48, 192),
+            )
+            for entry, probabilities in zip(chunk, prediction):
+                label = int(np.argmax(probabilities))
+                score = float(probabilities[label])
+                if label == 1 and score > self._cls_thresh:
+                    oriented[entry[0]] = cv2.rotate(
+                        crops[entry[0]], cv2.ROTATE_180
+                    )
+        return oriented
 
     def _recognize_boxes(self, image, boxes):
         import copy
@@ -913,8 +995,10 @@ class _TensorRTPipeline(_MNNPipeline):
 
         prepared_by_width = defaultdict(list)
         recognized = [("", 0.0)] * len(boxes)
-        for index, box in enumerate(boxes):
-            crop = self._crop(image, copy.deepcopy(box))
+        crops = [
+            self._crop(image, copy.deepcopy(box)) for box in boxes
+        ]
+        for index, crop in enumerate(self._orient_crops(crops)):
             prepared = self._prepare_recognition_crop(crop)
             if prepared is None:
                 continue
@@ -941,6 +1025,13 @@ class _TensorRTPipeline(_MNNPipeline):
                     text, score = result
                     recognized[entry[0]] = str(text), float(score)
         return recognized
+
+    def close(self) -> None:
+        classifier = getattr(self, "_cls", None)
+        if classifier is not None:
+            classifier.close()
+            self._cls = None
+        super().close()
 
     @staticmethod
     def _sub_quad(box, x0: float, y0: float, x1: float, y1: float):
@@ -1124,22 +1215,29 @@ class RapidOCRAdapter:
         self._runtime_fallback_pipeline = None
         self._runtime_fallback_loader = None
 
-        def load_native_pipeline(selected_backend: str, selected_root: Path):
+        def load_native_pipeline(
+            selected_backend: str,
+            selected_root: Path,
+            *,
+            enable_angle_cls: bool,
+        ):
             if selected_backend == "mnn":
                 required_files = MNN_MODEL_FILES
                 pipeline_type = _MNNPipeline
                 pipeline_kwargs = {"num_threads": num_threads}
                 classifier_error = "OCR MNN backend does not load angle classifier"
             elif selected_backend == "tensorrt":
-                required_files = TENSORRT_MODEL_FILES
+                required_files = TENSORRT_MODEL_FILES + (
+                    (TENSORRT_CLASSIFIER_MODEL_FILE,)
+                    if enable_angle_cls else ()
+                )
                 pipeline_type = _TensorRTPipeline
                 pipeline_kwargs = {
                     "device_id": device_id,
                     "crop_refinement": crop_refinement_config,
+                    "use_angle_cls": enable_angle_cls,
                 }
-                classifier_error = (
-                    "OCR TensorRT backend does not load angle classifier"
-                )
+                classifier_error = ""
             else:
                 raise ValueError(
                     f"unsupported native OCR backend: {selected_backend}"
@@ -1154,7 +1252,7 @@ class RapidOCRAdapter:
                     f"OCR {selected_backend} model files missing: "
                     f"{', '.join(missing)}"
                 )
-            if use_angle_cls:
+            if enable_angle_cls and selected_backend == "mnn":
                 raise ValueError(classifier_error)
             return pipeline_type(
                 selected_root,
@@ -1167,8 +1265,17 @@ class RapidOCRAdapter:
                 det_unclip_ratio=det_unclip_ratio,
             )
 
-        def start_native_pipeline(selected_backend: str, selected_root: Path):
-            pipeline = load_native_pipeline(selected_backend, selected_root)
+        def start_native_pipeline(
+            selected_backend: str,
+            selected_root: Path,
+            *,
+            enable_angle_cls: bool,
+        ):
+            pipeline = load_native_pipeline(
+                selected_backend,
+                selected_root,
+                enable_angle_cls=enable_angle_cls,
+            )
             try:
                 pipeline.warm_up()
             except Exception:
@@ -1178,7 +1285,9 @@ class RapidOCRAdapter:
 
         if backend in ("mnn", "tensorrt"):
             try:
-                self._pipeline = start_native_pipeline(backend, root)
+                self._pipeline = start_native_pipeline(
+                    backend, root, enable_angle_cls=use_angle_cls
+                )
                 self._engine = None
                 if (
                     backend == "tensorrt"
@@ -1187,7 +1296,9 @@ class RapidOCRAdapter:
                 ):
                     fallback_root = Path(fallback_model_dir)
                     self._runtime_fallback_loader = lambda: (
-                        start_native_pipeline("mnn", fallback_root)
+                        start_native_pipeline(
+                            "mnn", fallback_root, enable_angle_cls=False
+                        )
                     )
                 return
             except Exception:
@@ -1199,7 +1310,9 @@ class RapidOCRAdapter:
                 root = Path(fallback_model_dir)
                 self._backend_name = fallback_backend
                 if fallback_backend == "mnn":
-                    self._pipeline = start_native_pipeline("mnn", root)
+                    self._pipeline = start_native_pipeline(
+                        "mnn", root, enable_angle_cls=False
+                    )
                     self._engine = None
                     return
 

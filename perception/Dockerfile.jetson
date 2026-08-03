@@ -142,7 +142,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 
 # ── OCR model (kept outside Git) ──────────────────────────────────
 ARG OCR_MNN_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-mnn
-ARG OCR_TRT_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-trt-jp6-trt10.4-orin-batch8
+ARG OCR_TRT_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8
 COPY perception/utils/ocr_model_downloader.py /tmp/ocr_model_downloader.py
 RUN python3 /tmp/ocr_model_downloader.py \
     --base-url "${OCR_MNN_MODEL_BASE_URL}" \
@@ -150,10 +150,11 @@ RUN python3 /tmp/ocr_model_downloader.py \
     --filenames det.mnn rec.mnn keys.txt && \
     python3 /tmp/ocr_model_downloader.py \
     --base-url "${OCR_TRT_MODEL_BASE_URL}" \
-    --output-dir /opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8 \
-    --filenames det.engine rec.engine keys.txt \
+    --output-dir /opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8 \
+    --filenames det.engine rec.engine cls.engine keys.txt \
     --sha256 det.engine=3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef \
     --sha256 rec.engine=8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641 \
+    --sha256 cls.engine=148a6895260d3b6b6f86e0c5787121fc1bba316f3427397f654421196c13cb77 \
     --sha256 keys.txt=b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d
 
 # ── Application code ───────────────────────────────────────────────

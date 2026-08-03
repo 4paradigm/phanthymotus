@@ -79,6 +79,19 @@ RECOGNIZER_PROFILES = (
 )
 
 
+# PP-OCRv4's mobile direction classifier consumes fixed-size 48x192 crops.
+# Batch eight matches the recognition engine and bounds activation memory on
+# the 8 GB Orin deployment target.
+CLASSIFIER_PROFILES = (
+    ShapeProfile(
+        "classifier",
+        (1, 3, 48, 192),
+        (4, 3, 48, 192),
+        (8, 3, 48, 192),
+    ),
+)
+
+
 def _validate_profiles(profiles: tuple[ShapeProfile, ...]) -> None:
     for profile in profiles:
         for lower, optimum, upper in zip(
@@ -118,6 +131,19 @@ def build_engine(
         raise RuntimeError(
             f"OCR ONNX input must be rank 4, got {input_tensor.shape}"
         )
+    # Paddle exports all spatial dimensions as dynamic even when a component
+    # has fixed geometry. TensorRT 10.4 rejects the PP-OCRv4 classifier when
+    # its 48x192 constraints exist only in the optimization profile, so make
+    # dimensions shared by every profile explicit in the parsed network.
+    static_shape = []
+    for axis in range(4):
+        values = {
+            value
+            for profile in profiles
+            for value in (profile.minimum[axis], profile.maximum[axis])
+        }
+        static_shape.append(values.pop() if len(values) == 1 else -1)
+    input_tensor.shape = tuple(static_shape)
 
     config = builder.create_builder_config()
     config.set_flag(trt.BuilderFlag.FP16)
@@ -173,11 +199,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--det-onnx", type=Path)
     parser.add_argument("--rec-onnx", type=Path)
+    parser.add_argument("--cls-onnx", type=Path)
     parser.add_argument("--keys", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--component",
-        choices=("all", "det", "rec"),
+        choices=("all", "det", "rec", "cls"),
         default="rec",
         help="build both engines or only one component",
     )
@@ -199,6 +226,10 @@ def main() -> None:
         if args.rec_onnx is None:
             raise ValueError("--rec-onnx is required for recognizer builds")
         required.append(args.rec_onnx)
+    if args.component in ("all", "cls"):
+        if args.cls_onnx is None:
+            raise ValueError("--cls-onnx is required for classifier builds")
+        required.append(args.cls_onnx)
     for path in required:
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -221,6 +252,15 @@ def main() -> None:
             args.rec_onnx,
             args.output_dir / "rec.engine",
             RECOGNIZER_PROFILES,
+            workspace_mb=args.workspace_mb,
+            optimization_level=args.builder_optimization_level,
+        )
+    if args.component in ("all", "cls"):
+        print(f"Building classifier from {args.cls_onnx}", flush=True)
+        build_engine(
+            args.cls_onnx,
+            args.output_dir / "cls.engine",
+            CLASSIFIER_PROFILES,
             workspace_mb=args.workspace_mb,
             optimization_level=args.builder_optimization_level,
         )

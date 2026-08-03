@@ -58,7 +58,7 @@ log = logging.getLogger(__name__)
 DEFAULT_OCR_BACKEND = "tensorrt"
 DEFAULT_OCR_FALLBACK_BACKEND = "mnn"
 DEFAULT_OCR_MODEL_DIR = (
-    "/models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8"
+    "/models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8"
 )
 DEFAULT_OCR_FALLBACK_MODEL_DIR = "/models/ocr/ppocrv6-small-mnn"
 DEFAULT_OCR_ONNX_MODEL_DIR = "/models/ocr/ppocrv6-small-ort"
@@ -109,6 +109,7 @@ TOOLS = [
                 "device": {"type": "string", "enum": ["cpu", "cuda"], "default": DEFAULT_OCR_DEVICE, "scope": "shared"},
                 "device_id": {"type": "integer", "minimum": 0, "default": 0, "scope": "shared"},
                 "gpu_mem_mb": {"type": "integer", "minimum": 0, "default": 512, "scope": "shared"},
+                "use_angle_cls": {"type": "boolean", "default": True, "description": "启用 0/180 度文字方向分类", "scope": "shared"},
                 "provider": {"type": "string", "enum": ["rapidocr", "openai", "qwen", "tesseract"], "description": "OCR 服务商", "scope": "shared"},
                 "url":      {"type": "string", "description": "API URL (可选)", "scope": "shared"},
                 "key":      {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},

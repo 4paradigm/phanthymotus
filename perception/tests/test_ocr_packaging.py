@@ -30,9 +30,10 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn("    backend: tensorrt", config)
         self.assertIn("    fallback_backend: mnn", config)
         self.assertIn(
-            "model_dir: /models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8",
+            "model_dir: /models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8",
             config,
         )
+        self.assertIn("    use_angle_cls: true", config)
         self.assertIn(
             "fallback_model_dir: /models/ocr/ppocrv6-small-mnn", config
         )
@@ -83,12 +84,15 @@ class OCRPackagingTest(unittest.TestCase):
         )
         self.assertIn(
             "http://172.28.4.81:34567/zengzhitao/embodied-ai/"
-            "ppocrv6-small-trt-jp6-trt10.4-orin-batch8",
+            "ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8",
             dockerfile,
         )
         self.assertIn("--filenames det.mnn rec.mnn keys.txt", dockerfile)
-        self.assertIn("--filenames det.engine rec.engine keys.txt", dockerfile)
+        self.assertIn(
+            "--filenames det.engine rec.engine cls.engine keys.txt", dockerfile
+        )
         self.assertIn("--sha256 det.engine=3b36aae", dockerfile)
+        self.assertIn("--sha256 cls.engine=148a6895", dockerfile)
         self.assertIn(
             "/opt/phanthy-motus/model-seed/ocr/ppocrv6-small-mnn",
             dockerfile,

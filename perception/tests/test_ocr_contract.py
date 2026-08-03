@@ -424,6 +424,7 @@ class OCRContractTest(unittest.TestCase):
         pipeline.assert_called_once_with(
             root,
             device_id=0,
+            use_angle_cls=False,
             max_side_len=1600,
             rec_min_score=0.9,
             enable_preprocess=True,
@@ -472,7 +473,7 @@ class OCRContractTest(unittest.TestCase):
         mnn.return_value.warm_up.assert_called_once_with()
         self.assertEqual(adapter._backend_name, "mnn")
 
-    def test_tensorrt_adapter_requires_cuda_and_disables_classifier(self):
+    def test_tensorrt_adapter_requires_cuda_and_classifier_engine(self):
         with self.assertRaisesRegex(ValueError, "requires device='cuda'"):
             self.ocr_runtime.RapidOCRAdapter(
                 "/models/ocr/trt", backend="tensorrt", device="cpu"
@@ -482,10 +483,67 @@ class OCRContractTest(unittest.TestCase):
             root = Path(model_tmp)
             for filename in ("det.engine", "rec.engine", "keys.txt"):
                 (root / filename).write_bytes(b"model")
-            with self.assertRaisesRegex(ValueError, "angle classifier"):
+            with self.assertRaisesRegex(FileNotFoundError, "cls.engine"):
                 self.ocr_runtime.RapidOCRAdapter(
                     str(root), backend="tensorrt", device="cuda"
                 )
+
+    def test_tensorrt_adapter_loads_classifier_engine(self):
+        with tempfile.TemporaryDirectory() as model_tmp:
+            root = Path(model_tmp)
+            for filename in (
+                "det.engine", "rec.engine", "cls.engine", "keys.txt"
+            ):
+                (root / filename).write_bytes(b"model")
+
+            with mock.patch(
+                "plugins.ocr_runtime._TensorRTPipeline"
+            ) as pipeline:
+                adapter = self.ocr_runtime.RapidOCRAdapter(
+                    str(root),
+                    backend="tensorrt",
+                    device="cuda",
+                    device_id=0,
+                    use_angle_cls=True,
+                )
+
+        pipeline.assert_called_once_with(
+            root,
+            device_id=0,
+            use_angle_cls=True,
+            max_side_len=1600,
+            rec_min_score=0.9,
+            enable_preprocess=True,
+            det_thresh=0.3,
+            det_box_thresh=0.5,
+            det_unclip_ratio=0.7,
+            crop_refinement=self.ocr_runtime.CropRefinementConfig(),
+        )
+        pipeline.return_value.warm_up.assert_called_once_with()
+        self.assertEqual(adapter._backend_name, "tensorrt")
+
+    def test_tensorrt_classifier_rotates_confident_180_crop(self):
+        import numpy as np
+
+        pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
+        pipeline._cls_thresh = 0.9
+        pipeline._cls = mock.Mock()
+        pipeline._cls.max_batch_size.return_value = 8
+        pipeline._cls.run_uint8_batch.return_value = np.asarray(
+            [[0.01, 0.99], [0.95, 0.05]], dtype=np.float32
+        )
+        upside_down = np.arange(36, dtype=np.uint8).reshape(3, 4, 3)
+        upright = np.arange(36, 72, dtype=np.uint8).reshape(3, 4, 3)
+
+        result = pipeline._orient_crops([upside_down, upright])
+
+        np.testing.assert_array_equal(
+            result[0], upside_down[::-1, ::-1]
+        )
+        np.testing.assert_array_equal(result[1], upright)
+        call = pipeline._cls.run_uint8_batch.call_args
+        self.assertEqual(call.args[0].shape, (2, 48, 192, 3))
+        self.assertEqual(call.args[1], (2, 3, 48, 192))
 
     def test_tensorrt_session_executes_supported_dynamic_shape(self):
         import numpy as np

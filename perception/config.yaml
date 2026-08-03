@@ -54,12 +54,12 @@ plugins:
     url: ""
     key: ""
     model: ""
-    model_dir: /models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8
+    model_dir: /models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8
     fallback_model_dir: /models/ocr/ppocrv6-small-mnn
     device: cuda
     device_id: 0
     language: zh
-    use_angle_cls: false
+    use_angle_cls: true
     num_threads: 1
     # v2 最优配置（GT-centric macro F1 0.6847，2026-07-30 调参定稿）：
     #   1600 / unclip0.7 / rec_min0.9。回滚点：9de44b7（960/unclip1.2/rec_min0.3）。

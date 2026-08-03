@@ -35,6 +35,46 @@ class OCRTensorRTBuilderTest(unittest.TestCase):
                 shape,
             )
 
+    def test_classifier_profile_supports_batch_eight(self):
+        for batch in range(1, 9):
+            shape = (batch, 3, 48, 192)
+            self.assertTrue(
+                any(
+                    profile.contains(shape)
+                    for profile in builder.CLASSIFIER_PROFILES
+                ),
+                shape,
+            )
+
+    def test_classifier_only_build_uses_classifier_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            classifier = root / "cls.onnx"
+            keys = root / "keys.txt"
+            output = root / "output"
+            classifier.write_bytes(b"cls")
+            keys.write_text("key", encoding="utf-8")
+            argv = [
+                "build_ocr_tensorrt_engines.py",
+                "--component", "cls",
+                "--cls-onnx", str(classifier),
+                "--keys", str(keys),
+                "--output-dir", str(output),
+            ]
+
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                builder, "build_engine"
+            ) as build_engine:
+                builder.main()
+
+            build_engine.assert_called_once_with(
+                classifier,
+                output / "cls.engine",
+                builder.CLASSIFIER_PROFILES,
+                workspace_mb=512,
+                optimization_level=3,
+            )
+
     def test_recognizer_only_build_does_not_require_detector(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
