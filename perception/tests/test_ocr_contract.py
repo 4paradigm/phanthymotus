@@ -601,6 +601,96 @@ class OCRContractTest(unittest.TestCase):
         self.assertTrue(state.synchronized)
         self.assertEqual(output.shape, (1, 1, 32, 32))
 
+    def test_tensorrt_session_selects_nearest_profile_and_batch_limit(self):
+        session = object.__new__(self.ocr_runtime._TensorRTModelSession)
+        session._profiles = [
+            (
+                (1, 3, 48, 320),
+                (8, 3, 48, 320),
+                (16, 3, 48, 320),
+            ),
+            (
+                (1, 3, 48, 320),
+                (2, 3, 48, 640),
+                (4, 3, 48, 1024),
+            ),
+        ]
+
+        self.assertEqual(session._select_profile((8, 3, 48, 320)), 0)
+        self.assertEqual(session._select_profile((2, 3, 48, 640)), 1)
+        self.assertEqual(session.max_batch_size(48, 320), 16)
+        self.assertEqual(session.max_batch_size(48, 640), 4)
+        with self.assertRaisesRegex(
+            self.ocr_runtime.TensorRTShapeError, "outside profiles"
+        ):
+            session.max_batch_size(48, 2048)
+
+    def test_tensorrt_pipeline_batches_equal_width_crops_in_box_order(self):
+        import numpy as np
+
+        pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
+        pipeline._enable_preprocess = False
+        pipeline._rec_min_score = 0.9
+        boxes = np.asarray(
+            [
+                [[0, 0], [10, 0], [10, 10], [0, 10]],
+                [[20, 0], [30, 0], [30, 10], [20, 10]],
+                [[40, 0], [50, 0], [50, 10], [40, 10]],
+            ],
+            dtype=np.float32,
+        )
+        pipeline._detect = mock.Mock(return_value=(boxes, [1.0] * 3))
+        pipeline._crop = mock.Mock(side_effect=[object(), object(), object()])
+        pipeline._prepare_recognition_crop = mock.Mock(side_effect=[
+            (np.zeros((48, 320, 3), dtype=np.uint8), 1.0),
+            (np.zeros((48, 328, 3), dtype=np.uint8), 2.0),
+            (np.zeros((48, 320, 3), dtype=np.uint8), 3.0),
+        ])
+        pipeline._rec = mock.Mock()
+        pipeline._rec.max_batch_size.return_value = 8
+        pipeline._rec.run_uint8_batch.side_effect = lambda images, _shape: (
+            np.zeros((len(images), 2, 2), dtype=np.float32)
+        )
+
+        def decode(_prediction, _use_space_char, *, wh_ratio_list, **_kwargs):
+            return (
+                [(f"text-{int(ratio)}", 0.95) for ratio in wh_ratio_list],
+                [],
+            )
+
+        pipeline._rec_decode = mock.Mock(side_effect=decode)
+
+        result = pipeline.infer(np.zeros((64, 64, 3), dtype=np.uint8))
+
+        self.assertEqual(
+            [item["text"] for item in result],
+            ["text-1", "text-2", "text-3"],
+        )
+        calls = pipeline._rec.run_uint8_batch.call_args_list
+        self.assertEqual(calls[0].args[0].shape, (2, 48, 320, 3))
+        self.assertEqual(calls[0].args[1], (2, 3, 48, 320))
+        self.assertEqual(calls[1].args[0].shape, (1, 48, 328, 3))
+
+    def test_tensorrt_shape_error_lazily_loads_mnn_fallback_once(self):
+        adapter = object.__new__(self.ocr_runtime.RapidOCRAdapter)
+        adapter._inference_lock = threading.Lock()
+        adapter._pipeline = mock.Mock()
+        adapter._pipeline.infer.side_effect = (
+            self.ocr_runtime.TensorRTShapeError("outside profiles")
+        )
+        fallback = mock.Mock()
+        fallback.infer.return_value = [{"text": "fallback"}]
+        adapter._runtime_fallback_pipeline = None
+        adapter._runtime_fallback_loader = mock.Mock(return_value=fallback)
+
+        first = adapter._infer_image(object())
+        second = adapter._infer_image(object())
+
+        self.assertEqual(first, [{"text": "fallback"}])
+        self.assertEqual(second, first)
+        adapter._runtime_fallback_loader.assert_called_once_with()
+        self.assertEqual(fallback.infer.call_count, 2)
+
     def test_mnn_pipeline_closes_detector_when_recognizer_load_fails(self):
         det_session = mock.Mock()
         det_utils = types.ModuleType("rapidocr.ch_ppocr_det.utils")

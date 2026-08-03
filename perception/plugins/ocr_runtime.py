@@ -198,6 +198,10 @@ class _MNNModelSession:
             release(self._session)
 
 
+class TensorRTShapeError(ValueError):
+    """Raised when an OCR tensor is not covered by an engine profile."""
+
+
 class _TensorRTModelSession:
     def __init__(
         self,
@@ -292,6 +296,7 @@ class _TensorRTModelSession:
         return self._profiles[0][1]
 
     def _select_profile(self, shape: tuple[int, ...]) -> int:
+        candidates = []
         for index, (minimum, _optimum, maximum) in enumerate(self._profiles):
             if len(shape) != len(minimum):
                 continue
@@ -299,12 +304,18 @@ class _TensorRTModelSession:
                 lower <= value <= upper
                 for value, lower, upper in zip(shape, minimum, maximum)
             ):
-                return index
+                distance = sum(
+                    abs(math.log(max(1, value) / max(1, optimum)))
+                    for value, optimum in zip(shape, _optimum)
+                )
+                candidates.append((distance, index))
+        if candidates:
+            return min(candidates)[1]
         ranges = [
             {"min": minimum, "max": maximum}
             for minimum, _optimum, maximum in self._profiles
         ]
-        raise ValueError(
+        raise TensorRTShapeError(
             f"OCR TensorRT input shape {shape} is outside profiles {ranges}"
         )
 
@@ -316,11 +327,38 @@ class _TensorRTModelSession:
             raise ValueError(
                 f"OCR TensorRT image/shape mismatch: {image.shape} vs {shape}"
             )
-        value = (image.astype(self._np.float32) - self._mean) * self._normal
+        return self.run_uint8_batch(image[None], shape)
+
+    def run_uint8_batch(self, images, shape: tuple[int, ...]):
+        images = self._np.ascontiguousarray(images, dtype=self._np.uint8)
+        if len(shape) != 4 or shape[1] != 3:
+            raise ValueError(f"invalid OCR TensorRT NCHW shape: {shape}")
+        if images.ndim != 4 or images.shape != (
+            shape[0], shape[2], shape[3], shape[1]
+        ):
+            raise ValueError(
+                f"OCR TensorRT image batch/shape mismatch: {images.shape} vs "
+                f"{shape}"
+            )
+        value = (images.astype(self._np.float32) - self._mean) * self._normal
         array = self._np.ascontiguousarray(
-            value.transpose(2, 0, 1)[None], dtype=self._input_numpy_dtype
+            value.transpose(0, 3, 1, 2), dtype=self._input_numpy_dtype
         )
         return self._run(array)
+
+    def max_batch_size(self, height: int, width: int) -> int:
+        compatible = [
+            maximum[0]
+            for minimum, _optimum, maximum in self._profiles
+            if len(minimum) == 4
+            and minimum[1] <= 3 <= maximum[1]
+            and minimum[2] <= height <= maximum[2]
+            and minimum[3] <= width <= maximum[3]
+            and minimum[0] <= 1 <= maximum[0]
+        ]
+        if not compatible:
+            self._select_profile((1, 3, int(height), int(width)))
+        return max(compatible)
 
     def _run(self, array):
         shape = tuple(int(value) for value in array.shape)
@@ -455,13 +493,14 @@ class _MNNPipeline:
         )
         return boxes[order], [scores[index] for index in order]
 
-    def _recognize_crop(self, crop):
+    @staticmethod
+    def _prepare_recognition_crop(crop):
         import cv2
         import numpy as np
 
         height, width = crop.shape[:2]
         if height <= 0 or width <= 0:
-            return "", 0.0
+            return None
         ratio = width / float(height)
         target_height = 48
         target_width = max(320, int(math.ceil(target_height * ratio)))
@@ -478,6 +517,14 @@ class _MNNPipeline:
             (target_height, target_width, 3), 128, dtype=np.uint8
         )
         padded[:, :resized_width] = resized
+        return padded, ratio
+
+    def _recognize_crop(self, crop):
+        prepared = self._prepare_recognition_crop(crop)
+        if prepared is None:
+            return "", 0.0
+        padded, ratio = prepared
+        target_height, target_width = padded.shape[:2]
         prediction = self._rec.run_uint8(
             padded, (1, 3, target_height, target_width)
         )
@@ -595,14 +642,84 @@ class _TensorRTPipeline(_MNNPipeline):
 
         det_shape = self._det.optimization_shape
         rec_shape = self._rec.optimization_shape
-        self._det.run_uint8(
-            np.zeros((det_shape[2], det_shape[3], 3), dtype=np.uint8),
+        self._det.run_uint8_batch(
+            np.zeros(
+                (det_shape[0], det_shape[2], det_shape[3], 3),
+                dtype=np.uint8,
+            ),
             det_shape,
         )
-        self._rec.run_uint8(
-            np.zeros((rec_shape[2], rec_shape[3], 3), dtype=np.uint8),
+        self._rec.run_uint8_batch(
+            np.zeros(
+                (rec_shape[0], rec_shape[2], rec_shape[3], 3),
+                dtype=np.uint8,
+            ),
             rec_shape,
         )
+
+    def infer(self, image) -> list[dict]:
+        import copy
+        from collections import defaultdict
+
+        import numpy as np
+
+        det_image = image
+        if self._enable_preprocess:
+            try:
+                det_image = preprocess_for_ocr(image)
+            except Exception:
+                _log.debug("preprocess failed, using original image", exc_info=True)
+
+        boxes, _ = self._detect(det_image)
+        prepared_by_width = defaultdict(list)
+        recognized = [("", 0.0)] * len(boxes)
+        for index, box in enumerate(boxes):
+            crop = self._crop(image, copy.deepcopy(box))
+            prepared = self._prepare_recognition_crop(crop)
+            if prepared is None:
+                continue
+            padded, ratio = prepared
+            prepared_by_width[padded.shape[1]].append((index, padded, ratio))
+
+        for target_width, group in prepared_by_width.items():
+            max_batch = self._rec.max_batch_size(48, target_width)
+            for offset in range(0, len(group), max_batch):
+                chunk = group[offset:offset + max_batch]
+                images = np.stack([entry[1] for entry in chunk])
+                ratios = tuple(entry[2] for entry in chunk)
+                prediction = self._rec.run_uint8_batch(
+                    images,
+                    (len(chunk), 3, 48, target_width),
+                )
+                line_results, _ = self._rec_decode(
+                    prediction,
+                    False,
+                    wh_ratio_list=ratios,
+                    max_wh_ratio=target_width / 48,
+                )
+                for entry, result in zip(chunk, line_results):
+                    text, score = result
+                    recognized[entry[0]] = str(text), float(score)
+
+        items = []
+        for box, (text, score) in zip(boxes, recognized):
+            if not text.strip() or score < self._rec_min_score:
+                continue
+            xs = box[:, 0]
+            ys = box[:, 1]
+            items.append(
+                {
+                    "text": text,
+                    "bbox": [
+                        float(np.min(xs)),
+                        float(np.min(ys)),
+                        float(np.max(xs)),
+                        float(np.max(ys)),
+                    ],
+                    "score": score,
+                }
+            )
+        return items
 
 
 class RapidOCRAdapter:
@@ -669,6 +786,8 @@ class RapidOCRAdapter:
 
         self._pipeline = None
         self._backend_name = backend
+        self._runtime_fallback_pipeline = None
+        self._runtime_fallback_loader = None
 
         def load_native_pipeline(selected_backend: str, selected_root: Path):
             if selected_backend == "mnn":
@@ -723,6 +842,15 @@ class RapidOCRAdapter:
             try:
                 self._pipeline = start_native_pipeline(backend, root)
                 self._engine = None
+                if (
+                    backend == "tensorrt"
+                    and fallback_backend == "mnn"
+                    and fallback_model_dir
+                ):
+                    fallback_root = Path(fallback_model_dir)
+                    self._runtime_fallback_loader = lambda: (
+                        start_native_pipeline("mnn", fallback_root)
+                    )
                 return
             except Exception:
                 if self._pipeline is not None:
@@ -829,7 +957,23 @@ class RapidOCRAdapter:
         with self._inference_lock:
             pipeline = getattr(self, "_pipeline", None)
             if pipeline is not None:
-                return pipeline.infer(image)
+                try:
+                    return pipeline.infer(image)
+                except TensorRTShapeError:
+                    loader = getattr(self, "_runtime_fallback_loader", None)
+                    if loader is None:
+                        raise
+                    fallback = getattr(
+                        self, "_runtime_fallback_pipeline", None
+                    )
+                    if fallback is None:
+                        _log.warning(
+                            "OCR TensorRT profile does not cover this request; "
+                            "loading the configured MNN fallback"
+                        )
+                        fallback = loader()
+                        self._runtime_fallback_pipeline = fallback
+                    return fallback.infer(image)
             output = self._engine(
                 image,
                 use_det=True,
