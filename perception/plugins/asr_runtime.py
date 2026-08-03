@@ -410,6 +410,16 @@ class _FireRedVadSession:
         self._last_chunk_ts = 0.0
         self._last_detect_bytes = 0
         self._completed: Deque[tuple[bytes, float, float]] = deque()
+        self._reset_diagnostics()
+
+    def _reset_diagnostics(self) -> None:
+        self._chunks_seen = 0
+        self._detect_calls = 0
+        self._detect_skips_same_buffer = 0
+        self._empty_detects = 0
+        self._segments_detected = 0
+        self._detect_errors = 0
+        self._detect_triggers: dict[str, int] = {}
 
     def reset(self) -> None:
         self._pcm.clear()
@@ -418,6 +428,7 @@ class _FireRedVadSession:
         self._last_chunk_ts = 0.0
         self._last_detect_bytes = 0
         self._completed.clear()
+        self._reset_diagnostics()
 
     def _total_s(self) -> float:
         return len(self._pcm) / 2 / self._sample_rate
@@ -427,34 +438,124 @@ class _FireRedVadSession:
         end_b = min(len(self._pcm), int(end_s * self._sample_rate) * 2)
         return bytes(self._pcm[start_b:end_b])
 
-    def _run_detect(self) -> None:
+    def _pcm_diagnostics(self) -> dict:
+        """Return compact, JSON-safe signal statistics for this session."""
+        pcm = bytes(self._pcm[: len(self._pcm) // 2 * 2])
+        sample_count = len(pcm) // 2
+        if not sample_count:
+            return {
+                "pcm_bytes": 0,
+                "duration_ms": 0,
+                "nonzero_samples": 0,
+                "active_samples": 0,
+                "active_ratio": 0.0,
+                "rms": 0.0,
+                "peak": 0,
+            }
+
+        if _np is not None and all(
+            hasattr(_np, name) for name in ("abs", "mean", "sqrt")
+        ):
+            values = _np.frombuffer(pcm, dtype="<i2").astype(_np.float32)
+            magnitudes = _np.abs(values)
+            nonzero_samples = int(_np.sum(magnitudes > 0.0))
+            active_samples = int(_np.sum(magnitudes > 20.0))
+            rms = float(_np.sqrt(_np.mean(values * values)))
+            peak = int(_np.max(magnitudes))
+        else:
+            nonzero_samples = 0
+            active_samples = 0
+            sum_squares = 0
+            peak = 0
+            for (sample,) in struct.iter_unpack("<h", pcm):
+                magnitude = abs(sample)
+                nonzero_samples += magnitude > 0
+                active_samples += magnitude > 20
+                sum_squares += sample * sample
+                peak = max(peak, magnitude)
+            rms = math.sqrt(sum_squares / sample_count)
+
+        return {
+            "pcm_bytes": len(pcm),
+            "duration_ms": round(sample_count * 1000 / self._sample_rate),
+            "nonzero_samples": nonzero_samples,
+            "active_samples": active_samples,
+            "active_ratio": round(active_samples / sample_count, 6),
+            "rms": round(rms, 3),
+            "peak": peak,
+        }
+
+    def diagnostics(self) -> dict:
+        """Snapshot used by Judge logs to distinguish transport and VAD misses."""
+        return {
+            "backend": "firered",
+            "chunks_seen": self._chunks_seen,
+            "detected": self._detected,
+            "detect_calls": self._detect_calls,
+            "detect_skips_same_buffer": self._detect_skips_same_buffer,
+            "empty_detects": self._empty_detects,
+            "segments_detected": self._segments_detected,
+            "detect_errors": self._detect_errors,
+            "detect_triggers": dict(sorted(self._detect_triggers.items())),
+            **self._pcm_diagnostics(),
+        }
+
+    def _run_detect(self, trigger: str = "manual") -> None:
         if self._detected or _np is None:
             return
         pcm_bytes = len(self._pcm)
         # FireRedVAD is deterministic. Do not keep re-running the model on
         # the same idle buffer after an empty result; wait for more audio.
         if pcm_bytes == self._last_detect_bytes:
+            self._detect_skips_same_buffer += 1
             return
         total_s = self._total_s()
         samples = _np.frombuffer(bytes(self._pcm), dtype="<i2").astype(_np.float32)
         if samples.shape[0] < int(0.05 * self._sample_rate):
             return
         try:
+            self._detect_calls += 1
+            self._detect_triggers[trigger] = self._detect_triggers.get(trigger, 0) + 1
             segs = self._detector.detect(samples)
         except Exception as e:
+            self._detect_errors += 1
             logger_fr = logging.getLogger("asr_runtime.firered")
-            logger_fr.warning(f"[firered-vad] detect failed: {e}")
+            try:
+                logger_fr.warning(
+                    "[firered-vad] detect failed trigger=%s diagnostics=%s: %s",
+                    trigger,
+                    self.diagnostics(),
+                    e,
+                )
+            except Exception:
+                logger_fr.exception(
+                    "[firered-vad] detect failed and diagnostics failed: %s", e
+                )
             self._silence_samples = 0
             return
         self._last_detect_bytes = pcm_bytes
+        self._segments_detected += len(segs)
+        if not segs:
+            self._empty_detects += 1
+        else:
+            self._detected = True
         # An empty pass is not a terminal state. Under DDS packet reordering,
         # the first 1s zero run can arrive before delayed speech packets. If
         # we seal the session here, process_chunk() discards those packets and
         # notify_idle() can never recover, producing an empty judge result.
         if not segs:
+            try:
+                logging.getLogger("asr_runtime.firered").info(
+                    "[firered-vad] detect trigger=%s segments=0 diagnostics=%s",
+                    trigger,
+                    self.diagnostics(),
+                )
+            except Exception:
+                logging.getLogger("asr_runtime.firered").exception(
+                    "[firered-vad] diagnostics failed after empty detection"
+                )
             self._silence_samples = 0
             return
-        self._detected = True
         start = max(0.0, min(start_s for start_s, _ in segs) - self._pre_roll_s)
         detected_end = max(end_s for _, end_s in segs)
         # A completed FireRed segment includes the possible-silence run used
@@ -471,6 +572,17 @@ class _FireRedVadSession:
             -total_s,  # start_ts relative (not used by caller)
             0.0,
         ))
+        try:
+            logging.getLogger("asr_runtime.firered").info(
+                "[firered-vad] detect trigger=%s segments=%d diagnostics=%s",
+                trigger,
+                len(segs),
+                self.diagnostics(),
+            )
+        except Exception:
+            logging.getLogger("asr_runtime.firered").exception(
+                "[firered-vad] diagnostics failed after successful detection"
+            )
 
     def process_chunk(
         self, chunk: bytes, now_ts: float
@@ -480,6 +592,7 @@ class _FireRedVadSession:
         silence_thresh_samples = int(self._SILENCE_TO_DETECT_S * self._sample_rate)
         if chunk:
             self._pcm += chunk
+            self._chunks_seen += 1
             self._last_chunk_ts = now_ts
             # is this chunk all-zero? (PCM16 silence)
             if chunk == b"\x00" * len(chunk):
@@ -487,7 +600,7 @@ class _FireRedVadSession:
             else:
                 self._silence_samples = 0
             if self._silence_samples >= silence_thresh_samples:
-                self._run_detect()
+                self._run_detect("zero_tail")
         return self._completed.popleft() if self._completed else None
 
     def notify_idle(
@@ -505,12 +618,12 @@ class _FireRedVadSession:
             return None
         if now_ts - self._last_chunk_ts < self._STARVE_TRIGGER_S:
             return None
-        self._run_detect()
+        self._run_detect("idle")
         return self._completed.popleft() if self._completed else None
 
     def flush(self) -> bytes:
         if not self._detected:
-            self._run_detect()
+            self._run_detect("flush")
         if not self._completed:
             return b""
         return self._completed.popleft()[0]
@@ -580,6 +693,13 @@ class VadSession:
         if fn is None:
             return None
         return fn(now_ts)
+
+    def diagnostics(self) -> dict:
+        """Return backend diagnostics without requiring backend-specific callers."""
+        fn = getattr(self._impl, "diagnostics", None)
+        if fn is None:
+            return {"backend": self.backend}
+        return fn()
 
     def flush(self) -> bytes:
         return self._impl.flush()

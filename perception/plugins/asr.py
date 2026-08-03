@@ -704,7 +704,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         f"[vad-worker] process started (pid={os.getpid()}, "
         f"backend={vad_session.backend}, kws={kws_enabled})"
     )
-    audio_count = 0
+    session_id = 1
+    session_chunks = 0
+    session_bytes = 0
+    session_utterances = 0
+    session_queue_drops = 0
+    paused_dropped_chunks = 0
+    paused_dropped_bytes = 0
 
     # VAD segment saving
     _VAD_SEG_DIR = '/models/vad_segments'
@@ -755,18 +761,49 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             if not paused:
                 paused = True
                 try:
-                    vad_session.init()  # reset VAD state for the next utterance
-                    _log.info("[vad-worker] paused, session reset")
+                    summary = {
+                        "session_id": session_id,
+                        "worker_chunks": session_chunks,
+                        "worker_bytes": session_bytes,
+                        "utterances": session_utterances,
+                        "result_queue_drops": session_queue_drops,
+                        **vad_session.diagnostics(),
+                    }
+                    _log.info(
+                        "[vad-worker] session summary reason=pause %s",
+                        json.dumps(summary, ensure_ascii=False, sort_keys=True),
+                    )
                 except Exception:
-                    pass
+                    _log.exception("[vad-worker] failed to log paused session")
+                try:
+                    vad_session.init()  # reset VAD state for the next utterance
+                    _log.info("[vad-worker] paused, session=%d reset", session_id)
+                except Exception:
+                    _log.exception("[vad-worker] failed to reset paused session")
             try:
-                pcm_q.get(timeout=0.1)
+                pcm, _ = pcm_q.get(timeout=0.1)
+                paused_dropped_chunks += 1
+                paused_dropped_bytes += len(pcm)
             except queue.Empty:
                 pass
             continue
         if paused:
             paused = False
-            _log.info("[vad-worker] resumed")
+            if paused_dropped_chunks:
+                _log.warning(
+                    "[vad-worker] pause drain dropped chunks=%d bytes=%d after session=%d",
+                    paused_dropped_chunks,
+                    paused_dropped_bytes,
+                    session_id,
+                )
+            session_id += 1
+            session_chunks = 0
+            session_bytes = 0
+            session_utterances = 0
+            session_queue_drops = 0
+            paused_dropped_chunks = 0
+            paused_dropped_bytes = 0
+            _log.info("[vad-worker] resumed session=%d", session_id)
 
         try:
             pcm, ts = pcm_q.get(timeout=1)
@@ -783,12 +820,20 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         try:
                             result_q.put((utterance, start_ts, end_ts), timeout=0.2)
                         except queue.Full:
+                            session_queue_drops += 1
                             _log.warning("[vad-worker] utterance queue full on idle trigger")
+                        else:
+                            session_utterances += 1
             continue
 
-        audio_count += 1
-        if audio_count == 1:
-            _log.info(f"[vad-worker] first audio chunk received! len={len(pcm)}")
+        session_chunks += 1
+        session_bytes += len(pcm)
+        if session_chunks == 1:
+            _log.info(
+                "[vad-worker] first audio chunk received! session=%d len=%d",
+                session_id,
+                len(pcm),
+            )
 
         if len(pcm) < 320:
             continue
@@ -830,7 +875,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             try:
                 result_q.put((utterance, start_ts, end_ts), timeout=0.2)
             except queue.Full:
+                session_queue_drops += 1
                 _log.warning("[vad-worker] utterance queue full, dropping segment")
+            else:
+                session_utterances += 1
             if kws_enabled:
                 state = 'waiting_wake'
 
