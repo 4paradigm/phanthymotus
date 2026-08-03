@@ -465,34 +465,50 @@ class OCRContractTest(unittest.TestCase):
                 )
 
     def test_tensorrt_session_executes_supported_dynamic_shape(self):
-        import contextlib
         import numpy as np
 
-        state = types.SimpleNamespace(shape=None, addresses={}, executed=False)
+        state = types.SimpleNamespace(
+            shape=None,
+            addresses={},
+            executed=False,
+            synchronized=False,
+            allocations=[],
+            frees=[],
+            host_inputs=[],
+            closed=False,
+        )
 
-        class FakeTensor:
-            def __init__(self, value):
-                self.value = np.asarray(value)
-                self.dtype = "float32"
+        class FakeCuda:
+            stream_handle = 123
 
-            def to(self, **_kwargs):
-                return self
+            def __init__(self, device_id):
+                self.device_id = device_id
 
-            def data_ptr(self):
-                return id(self.value)
+            @staticmethod
+            def malloc(size):
+                pointer = 1000 + len(state.allocations)
+                state.allocations.append((pointer, size))
+                return pointer
 
-            def cpu(self):
-                return self
+            @staticmethod
+            def free(pointer):
+                state.frees.append(pointer)
 
-            def numpy(self):
-                return self.value
+            @staticmethod
+            def copy_host_to_device(_pointer, array):
+                state.host_inputs.append(array.copy())
 
-        class FakeStream:
-            cuda_stream = 123
+            @staticmethod
+            def copy_device_to_host(array, _pointer):
+                array.fill(0)
 
             @staticmethod
             def synchronize():
                 state.synchronized = True
+
+            @staticmethod
+            def close():
+                state.closed = True
 
         class FakeContext:
             @staticmethod
@@ -564,44 +580,44 @@ class OCRContractTest(unittest.TestCase):
         )
         trt.nptype = lambda _dtype: np.float32
 
-        torch = types.ModuleType("torch")
-        torch.cuda = types.SimpleNamespace(
-            is_available=lambda: True,
-            device=lambda _device: contextlib.nullcontext(),
-            Stream=lambda **_kwargs: FakeStream(),
-            stream=lambda _stream: contextlib.nullcontext(),
-        )
-        torch.from_numpy = lambda value: FakeTensor(value)
-        torch.empty = lambda shape, **_kwargs: FakeTensor(
-            np.zeros(shape, dtype=np.float32)
-        )
-
         with tempfile.TemporaryDirectory() as model_tmp:
             engine_path = Path(model_tmp) / "det.engine"
             engine_path.write_bytes(b"engine")
-            with mock.patch.dict(
-                sys.modules, {"tensorrt": trt, "torch": torch}
-            ):
-                session = self.ocr_runtime._TensorRTModelSession(
-                    engine_path,
-                    device_id=0,
-                    mean=(127.5, 127.5, 127.5),
-                    normal=(1 / 127.5, 1 / 127.5, 1 / 127.5),
-                )
-                output = session.run_uint8(
-                    np.zeros((32, 32, 3), dtype=np.uint8),
-                    (1, 3, 32, 32),
-                )
-                with self.assertRaisesRegex(ValueError, "outside profiles"):
-                    session.run_uint8(
-                        np.zeros((160, 160, 3), dtype=np.uint8),
-                        (1, 3, 160, 160),
+            with mock.patch.dict(sys.modules, {"tensorrt": trt}):
+                with mock.patch.object(
+                    self.ocr_runtime, "_CudaRuntime", FakeCuda
+                ):
+                    session = self.ocr_runtime._TensorRTModelSession(
+                        engine_path,
+                        device_id=0,
+                        mean=(127.5, 127.5, 127.5),
+                        normal=(1 / 127.5, 1 / 127.5, 1 / 127.5),
                     )
+                    output = session.run_uint8(
+                        np.zeros((32, 32, 3), dtype=np.uint8),
+                        (1, 3, 32, 32),
+                    )
+                    session.run_uint8(
+                        np.zeros((32, 32, 3), dtype=np.uint8),
+                        (1, 3, 32, 32),
+                    )
+                    with self.assertRaisesRegex(ValueError, "outside profiles"):
+                        session.run_uint8(
+                            np.zeros((160, 160, 3), dtype=np.uint8),
+                            (1, 3, 160, 160),
+                        )
+                    session.close()
 
         self.assertEqual(state.shape, (1, 3, 32, 32))
         self.assertEqual(set(state.addresses), {"x", "y"})
         self.assertTrue(state.executed)
         self.assertTrue(state.synchronized)
+        self.assertEqual(len(state.allocations), 2)
+        self.assertEqual(len(state.frees), 2)
+        self.assertTrue(state.closed)
+        self.assertEqual(len(state.host_inputs), 2)
+        self.assertTrue(state.host_inputs[0].flags.c_contiguous)
+        self.assertAlmostEqual(float(state.host_inputs[0][0, 0, 0, 0]), -1.0)
         self.assertEqual(output.shape, (1, 1, 32, 32))
 
     def test_tensorrt_session_selects_nearest_profile_and_batch_limit(self):

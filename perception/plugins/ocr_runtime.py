@@ -202,6 +202,142 @@ class TensorRTShapeError(ValueError):
     """Raised when an OCR tensor is not covered by an engine profile."""
 
 
+class _CudaRuntime:
+    """Minimal CUDA Runtime API wrapper for TensorRT device buffers."""
+
+    _MEMCPY_HOST_TO_DEVICE = 1
+    _MEMCPY_DEVICE_TO_HOST = 2
+    _STREAM_NON_BLOCKING = 1
+
+    def __init__(self, device_id: int):
+        import ctypes
+
+        self._ctypes = ctypes
+        self._device_id = int(device_id)
+        self._library = ctypes.CDLL("libcudart.so")
+        self._bind_functions()
+        self._stream = ctypes.c_void_p()
+        self._set_device()
+        self._check(
+            self._library.cudaStreamCreateWithFlags(
+                ctypes.byref(self._stream), self._STREAM_NON_BLOCKING
+            ),
+            "cudaStreamCreateWithFlags",
+        )
+
+    def _bind_functions(self) -> None:
+        ctypes = self._ctypes
+        library = self._library
+        library.cudaGetErrorString.argtypes = [ctypes.c_int]
+        library.cudaGetErrorString.restype = ctypes.c_char_p
+        library.cudaSetDevice.argtypes = [ctypes.c_int]
+        library.cudaSetDevice.restype = ctypes.c_int
+        library.cudaStreamCreateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+        ]
+        library.cudaStreamCreateWithFlags.restype = ctypes.c_int
+        library.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
+        library.cudaStreamDestroy.restype = ctypes.c_int
+        library.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        library.cudaStreamSynchronize.restype = ctypes.c_int
+        library.cudaMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+        ]
+        library.cudaMalloc.restype = ctypes.c_int
+        library.cudaFree.argtypes = [ctypes.c_void_p]
+        library.cudaFree.restype = ctypes.c_int
+        library.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        library.cudaMemcpyAsync.restype = ctypes.c_int
+
+    def _check(self, code: int, operation: str) -> None:
+        if code == 0:
+            return
+        message = self._library.cudaGetErrorString(code)
+        detail = message.decode("utf-8", errors="replace") if message else "unknown"
+        raise RuntimeError(f"{operation} failed with CUDA error {code}: {detail}")
+
+    def _set_device(self) -> None:
+        self._check(
+            self._library.cudaSetDevice(self._device_id), "cudaSetDevice"
+        )
+
+    @property
+    def stream_handle(self) -> int:
+        return int(self._stream.value or 0)
+
+    def malloc(self, size: int) -> int:
+        self._set_device()
+        pointer = self._ctypes.c_void_p()
+        self._check(
+            self._library.cudaMalloc(
+                self._ctypes.byref(pointer), self._ctypes.c_size_t(size)
+            ),
+            "cudaMalloc",
+        )
+        if not pointer.value:
+            raise RuntimeError("cudaMalloc returned a null device pointer")
+        return int(pointer.value)
+
+    def free(self, pointer: int) -> None:
+        if not pointer:
+            return
+        self._set_device()
+        self._check(
+            self._library.cudaFree(self._ctypes.c_void_p(pointer)), "cudaFree"
+        )
+
+    def copy_host_to_device(self, pointer: int, array) -> None:
+        self._set_device()
+        self._check(
+            self._library.cudaMemcpyAsync(
+                self._ctypes.c_void_p(pointer),
+                self._ctypes.c_void_p(array.ctypes.data),
+                self._ctypes.c_size_t(array.nbytes),
+                self._MEMCPY_HOST_TO_DEVICE,
+                self._stream,
+            ),
+            "cudaMemcpyAsync(H2D)",
+        )
+
+    def copy_device_to_host(self, array, pointer: int) -> None:
+        self._set_device()
+        self._check(
+            self._library.cudaMemcpyAsync(
+                self._ctypes.c_void_p(array.ctypes.data),
+                self._ctypes.c_void_p(pointer),
+                self._ctypes.c_size_t(array.nbytes),
+                self._MEMCPY_DEVICE_TO_HOST,
+                self._stream,
+            ),
+            "cudaMemcpyAsync(D2H)",
+        )
+
+    def synchronize(self) -> None:
+        self._set_device()
+        self._check(
+            self._library.cudaStreamSynchronize(self._stream),
+            "cudaStreamSynchronize",
+        )
+
+    def close(self) -> None:
+        if not self._stream.value:
+            return
+        self._set_device()
+        stream = self._stream
+        self._stream = self._ctypes.c_void_p()
+        self._check(
+            self._library.cudaStreamDestroy(stream), "cudaStreamDestroy"
+        )
+
+
 class _TensorRTModelSession:
     def __init__(
         self,
@@ -213,19 +349,20 @@ class _TensorRTModelSession:
     ):
         import numpy as np
         import tensorrt as trt
-        import torch
-
-        if not torch.cuda.is_available():
-            raise RuntimeError("OCR TensorRT backend requires CUDA")
-
         self._np = np
-        self._torch = torch
         self._device_id = int(device_id)
-        self._mean = np.asarray(mean, dtype=np.float32)
-        self._normal = np.asarray(normal, dtype=np.float32)
+        self._cuda = None
+        self._input_device = 0
+        self._input_capacity = 0
+        self._output_device = 0
+        self._output_capacity = 0
+        self._context = None
+        self._engine = None
+        self._runtime = None
 
-        logger = trt.Logger(trt.Logger.WARNING)
-        with torch.cuda.device(self._device_id):
+        try:
+            self._cuda = _CudaRuntime(self._device_id)
+            logger = trt.Logger(trt.Logger.WARNING)
             self._runtime = trt.Runtime(logger)
             self._engine = self._runtime.deserialize_cuda_engine(
                 engine_path.read_bytes()
@@ -239,7 +376,9 @@ class _TensorRTModelSession:
                 raise RuntimeError(
                     f"failed to create TensorRT context: {engine_path}"
                 )
-            self._stream = torch.cuda.Stream(device=self._device_id)
+        except Exception:
+            self.close()
+            raise
 
         inputs = []
         outputs = []
@@ -257,14 +396,11 @@ class _TensorRTModelSession:
         self._input_numpy_dtype = _trt_dtype_to_numpy(
             trt, self._engine.get_tensor_dtype(self._input_name)
         )
-        self._output_torch_dtype = torch.from_numpy(
-            np.empty(
-                0,
-                dtype=_trt_dtype_to_numpy(
-                    trt, self._engine.get_tensor_dtype(self._output_name)
-                ),
-            )
-        ).dtype
+        self._output_numpy_dtype = _trt_dtype_to_numpy(
+            trt, self._engine.get_tensor_dtype(self._output_name)
+        )
+        self._mean = np.asarray(mean, dtype=np.float32).reshape(1, 3, 1, 1)
+        self._normal = np.asarray(normal, dtype=np.float32).reshape(1, 3, 1, 1)
         self._profiles = self._read_profiles()
         self._active_profile = 0
 
@@ -340,10 +476,16 @@ class _TensorRTModelSession:
                 f"OCR TensorRT image batch/shape mismatch: {images.shape} vs "
                 f"{shape}"
             )
-        value = (images.astype(self._np.float32) - self._mean) * self._normal
-        array = self._np.ascontiguousarray(
-            value.transpose(0, 3, 1, 2), dtype=self._input_numpy_dtype
-        )
+        nchw = images.transpose(0, 3, 1, 2)
+        if self._input_numpy_dtype == self._np.dtype(self._np.float32):
+            array = self._np.empty(nchw.shape, dtype=self._np.float32)
+            self._np.subtract(nchw, self._mean, out=array)
+            self._np.multiply(array, self._normal, out=array)
+        else:
+            value = (nchw.astype(self._np.float32) - self._mean) * self._normal
+            array = self._np.ascontiguousarray(
+                value, dtype=self._input_numpy_dtype
+            )
         return self._run(array)
 
     def max_batch_size(self, height: int, width: int) -> int:
@@ -363,50 +505,86 @@ class _TensorRTModelSession:
     def _run(self, array):
         shape = tuple(int(value) for value in array.shape)
         profile = self._select_profile(shape)
-        torch = self._torch
-        with torch.cuda.device(self._device_id), torch.cuda.stream(self._stream):
-            if profile != self._active_profile:
-                if not self._context.set_optimization_profile_async(
-                    profile, self._stream.cuda_stream
-                ):
-                    raise RuntimeError(
-                        f"failed to select TensorRT profile {profile}"
-                    )
-                self._active_profile = profile
-            if not self._context.set_input_shape(self._input_name, shape):
-                raise RuntimeError(f"TensorRT rejected OCR input shape {shape}")
-            output_shape = tuple(
-                int(value)
-                for value in self._context.get_tensor_shape(self._output_name)
-            )
-            if any(value < 0 for value in output_shape):
+        cuda = self._cuda
+        if profile != self._active_profile:
+            if not self._context.set_optimization_profile_async(
+                profile, cuda.stream_handle
+            ):
                 raise RuntimeError(
-                    f"TensorRT produced unresolved output shape {output_shape}"
+                    f"failed to select TensorRT profile {profile}"
                 )
-            input_tensor = torch.from_numpy(array).to(
-                device=f"cuda:{self._device_id}", non_blocking=False
+            self._active_profile = profile
+        if not self._context.set_input_shape(self._input_name, shape):
+            raise RuntimeError(f"TensorRT rejected OCR input shape {shape}")
+        output_shape = tuple(
+            int(value)
+            for value in self._context.get_tensor_shape(self._output_name)
+        )
+        if any(value < 0 for value in output_shape):
+            raise RuntimeError(
+                f"TensorRT produced unresolved output shape {output_shape}"
             )
-            output_tensor = torch.empty(
-                output_shape,
-                dtype=self._output_torch_dtype,
-                device=f"cuda:{self._device_id}",
-            )
-            self._context.set_tensor_address(
-                self._input_name, input_tensor.data_ptr()
-            )
-            self._context.set_tensor_address(
-                self._output_name, output_tensor.data_ptr()
-            )
-            if not self._context.execute_async_v3(self._stream.cuda_stream):
-                raise RuntimeError("TensorRT OCR execution failed")
-            self._stream.synchronize()
-            return output_tensor.cpu().numpy()
+
+        self._input_device = self._ensure_capacity(
+            "_input_device", "_input_capacity", array.nbytes
+        )
+        output = self._np.empty(output_shape, dtype=self._output_numpy_dtype)
+        self._output_device = self._ensure_capacity(
+            "_output_device", "_output_capacity", output.nbytes
+        )
+        cuda.copy_host_to_device(self._input_device, array)
+        self._context.set_tensor_address(
+            self._input_name, self._input_device
+        )
+        self._context.set_tensor_address(
+            self._output_name, self._output_device
+        )
+        if not self._context.execute_async_v3(cuda.stream_handle):
+            raise RuntimeError("TensorRT OCR execution failed")
+        cuda.copy_device_to_host(output, self._output_device)
+        cuda.synchronize()
+        return output
+
+    def _ensure_capacity(
+        self, pointer_attribute: str, capacity_attribute: str, required: int
+    ) -> int:
+        pointer = getattr(self, pointer_attribute)
+        capacity = getattr(self, capacity_attribute)
+        if required <= capacity:
+            return pointer
+        if pointer:
+            self._cuda.free(pointer)
+            setattr(self, pointer_attribute, 0)
+            setattr(self, capacity_attribute, 0)
+        replacement = self._cuda.malloc(required)
+        setattr(self, pointer_attribute, replacement)
+        setattr(self, capacity_attribute, required)
+        return replacement
 
     def close(self) -> None:
+        cuda = self._cuda
+        if cuda is not None:
+            if self._input_device:
+                cuda.free(self._input_device)
+                self._input_device = 0
+                self._input_capacity = 0
+            if self._output_device:
+                cuda.free(self._output_device)
+                self._output_device = 0
+                self._output_capacity = 0
         self._context = None
         self._engine = None
         self._runtime = None
-        self._stream = None
+        if cuda is not None:
+            cuda.close()
+            self._cuda = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            # Interpreter shutdown can unload CUDA before Python finalizers run.
+            pass
 
 
 def _trt_dtype_to_numpy(trt_module, dtype):
