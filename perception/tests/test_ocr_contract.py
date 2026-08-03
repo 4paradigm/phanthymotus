@@ -107,6 +107,9 @@ class OCRContractTest(unittest.TestCase):
             properties["fallback_backend"]["enum"],
             ["", "mnn", "onnxruntime"],
         )
+        self.assertEqual(properties["backend"]["default"], "tensorrt")
+        self.assertEqual(properties["fallback_backend"]["default"], "mnn")
+        self.assertEqual(properties["device"]["default"], "cuda")
         self.assertEqual(properties["max_side_len"]["default"], 1600)
         self.assertEqual(properties["det_unclip_ratio"]["default"], 0.7)
         self.assertEqual(properties["rec_min_score"]["default"], 0.9)
@@ -148,9 +151,9 @@ class OCRContractTest(unittest.TestCase):
         self.assertIs(result, expected)
         adapter.assert_called_once_with(
             "/models/ocr/ppocrv6-tiny",
-            backend="onnxruntime",
-            fallback_backend="",
-            fallback_model_dir="",
+            backend="tensorrt",
+            fallback_backend="mnn",
+            fallback_model_dir="/models/ocr/ppocrv6-small-mnn",
             device="cuda",
             device_id=0,
             gpu_mem_mb=512,

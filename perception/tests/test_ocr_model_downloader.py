@@ -37,6 +37,7 @@ class OCRModelDownloaderTest(unittest.TestCase):
             "https://models.example.test/mnn",
             "/models/ocr/mnn",
             filenames=("det.mnn", "rec.mnn", "keys.txt"),
+            checksums={},
         )
 
     def test_downloads_complete_bundle_without_checksum_pins(self):
@@ -54,6 +55,46 @@ class OCRModelDownloaderTest(unittest.TestCase):
                     {path.name for path in Path(output_tmp).iterdir()},
                     set(MODEL_FILES),
                 )
+
+    def test_verifies_pinned_checksums_before_installing_bundle(self):
+        import hashlib
+
+        from utils.ocr_model_downloader import download_model
+
+        with tempfile.TemporaryDirectory() as source_tmp:
+            with tempfile.TemporaryDirectory() as output_tmp:
+                source = Path(source_tmp)
+                (source / "det.engine").write_bytes(b"engine")
+                expected = hashlib.sha256(b"engine").hexdigest()
+
+                download_model(
+                    source.as_uri(),
+                    output_tmp,
+                    filenames=("det.engine",),
+                    checksums={"det.engine": expected},
+                )
+
+                self.assertEqual(
+                    (Path(output_tmp) / "det.engine").read_bytes(), b"engine"
+                )
+
+    def test_checksum_mismatch_leaves_no_partial_bundle(self):
+        from utils.ocr_model_downloader import download_model
+
+        with tempfile.TemporaryDirectory() as source_tmp:
+            with tempfile.TemporaryDirectory() as output_tmp:
+                source = Path(source_tmp)
+                (source / "det.engine").write_bytes(b"engine")
+
+                with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                    download_model(
+                        source.as_uri(),
+                        output_tmp,
+                        filenames=("det.engine",),
+                        checksums={"det.engine": "0" * 64},
+                    )
+
+                self.assertEqual(list(Path(output_tmp).iterdir()), [])
 
     def test_rejects_empty_file_and_leaves_no_partial_bundle(self):
         from utils.ocr_model_downloader import download_model

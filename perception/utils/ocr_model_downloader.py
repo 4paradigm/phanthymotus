@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import tempfile
 import time
@@ -42,12 +43,27 @@ def download_file(url: str, dest: Path) -> None:
     raise last_error
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def download_model(
     base_url: str,
     output_dir: str,
     filenames=MODEL_FILES,
     max_bundle_bytes=MAX_BUNDLE_BYTES,
+    checksums: dict[str, str] | None = None,
 ) -> None:
+    checksums = checksums or {}
+    unknown_checksums = set(checksums) - set(filenames)
+    if unknown_checksums:
+        raise ValueError(
+            f"checksums provided for unknown files: {sorted(unknown_checksums)}"
+        )
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
@@ -60,6 +76,14 @@ def download_model(
             url = f"{base_url.rstrip('/')}/{filename}"
             print(f"Downloading {url}", flush=True)
             download_file(url, staged_file)
+            expected = checksums.get(filename)
+            if expected:
+                actual = file_sha256(staged_file)
+                if actual.lower() != expected.lower():
+                    raise ValueError(
+                        f"SHA256 mismatch for {filename}: expected "
+                        f"{expected}, got {actual}"
+                    )
             print(f"  OK ({staged_file.stat().st_size} bytes)", flush=True)
 
         total = sum((staging / name).stat().st_size for name in filenames)
@@ -80,11 +104,29 @@ def main() -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--filenames", nargs="+", default=list(MODEL_FILES))
+    parser.add_argument(
+        "--sha256",
+        action="append",
+        default=[],
+        metavar="FILE=DIGEST",
+        help="expected SHA256; may be repeated",
+    )
     args = parser.parse_args()
+    checksums = {}
+    for value in args.sha256:
+        filename, separator, digest = value.partition("=")
+        if not separator or len(digest) != 64:
+            raise ValueError(f"invalid --sha256 value: {value}")
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise ValueError(f"invalid --sha256 digest: {digest}") from exc
+        checksums[filename] = digest.lower()
     download_model(
         args.base_url,
         args.output_dir,
         filenames=tuple(args.filenames),
+        checksums=checksums,
     )
 
 

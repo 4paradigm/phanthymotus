@@ -124,9 +124,10 @@ RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true; \
       "numpy==1.26.4" "onnxruntime==1.23.0" && \
     python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert ort.__version__ == '1.23.0', ort.__version__; assert 'CPUExecutionProvider' in providers, providers; assert 'CUDAExecutionProvider' not in providers, providers"
 
-# TensorRT is supplied by the JetPack base image. Engines stay external so the
-# default CPU MNN deployment does not carry device/profile-specific artifacts.
-RUN python3 -c "import tensorrt as trt; assert int(trt.__version__.split('.')[0]) >= 10, trt.__version__"
+# TensorRT is supplied by the JetPack base image. Docker build RUN steps do
+# not have the NVIDIA runtime's DLA libraries mounted, so inspect package
+# metadata here and leave the actual import/execution check to runtime smoke.
+RUN python3 -c "from importlib.metadata import version; value = version('tensorrt'); assert int(value.split('.')[0]) >= 10, value"
 
 # ── RapidOCR utilities + low-memory MNN OCR runtime ───────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
@@ -140,12 +141,20 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
 
 # ── OCR model (kept outside Git) ──────────────────────────────────
-ARG OCR_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-mnn
+ARG OCR_MNN_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-mnn
+ARG OCR_TRT_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-trt-jp6-trt10.4-orin-batch8
 COPY perception/utils/ocr_model_downloader.py /tmp/ocr_model_downloader.py
 RUN python3 /tmp/ocr_model_downloader.py \
-    --base-url "${OCR_MODEL_BASE_URL}" \
-    --output-dir /models/ocr/ppocrv6-small-mnn \
-    --filenames det.mnn rec.mnn keys.txt
+    --base-url "${OCR_MNN_MODEL_BASE_URL}" \
+    --output-dir /opt/phanthy-motus/model-seed/ocr/ppocrv6-small-mnn \
+    --filenames det.mnn rec.mnn keys.txt && \
+    python3 /tmp/ocr_model_downloader.py \
+    --base-url "${OCR_TRT_MODEL_BASE_URL}" \
+    --output-dir /opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8 \
+    --filenames det.engine rec.engine keys.txt \
+    --sha256 det.engine=3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef \
+    --sha256 rec.engine=8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641 \
+    --sha256 keys.txt=b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
@@ -154,6 +163,8 @@ COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
+COPY perception/deploy/seed_ocr_models.sh /deploy/seed_ocr_models.sh
+RUN chmod 0755 /deploy/seed_ocr_models.sh
 
 EXPOSE 15720
 EXPOSE 15721
@@ -168,6 +179,7 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+     /deploy/seed_ocr_models.sh && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      python3 /work/main.py"]

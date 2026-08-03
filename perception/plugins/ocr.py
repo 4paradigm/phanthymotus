@@ -51,6 +51,15 @@ from plugins.ocr_runtime import (
 
 log = logging.getLogger(__name__)
 
+DEFAULT_OCR_BACKEND = "tensorrt"
+DEFAULT_OCR_FALLBACK_BACKEND = "mnn"
+DEFAULT_OCR_MODEL_DIR = (
+    "/models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8"
+)
+DEFAULT_OCR_FALLBACK_MODEL_DIR = "/models/ocr/ppocrv6-small-mnn"
+DEFAULT_OCR_ONNX_MODEL_DIR = "/models/ocr/ppocrv6-small-ort"
+DEFAULT_OCR_DEVICE = "cuda"
+
 _CAMERA_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
@@ -89,11 +98,11 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "backend": {"type": "string", "enum": ["mnn", "onnxruntime", "tensorrt"], "default": "mnn", "scope": "shared"},
-                "fallback_backend": {"type": "string", "enum": ["", "mnn", "onnxruntime"], "default": "", "scope": "shared"},
+                "backend": {"type": "string", "enum": ["mnn", "onnxruntime", "tensorrt"], "default": DEFAULT_OCR_BACKEND, "scope": "shared"},
+                "fallback_backend": {"type": "string", "enum": ["", "mnn", "onnxruntime"], "default": DEFAULT_OCR_FALLBACK_BACKEND, "scope": "shared"},
                 "model_dir": {"type": "string", "description": "OCR 模型或 TensorRT engine 目录", "scope": "shared"},
                 "fallback_model_dir": {"type": "string", "description": "OCR 回退模型目录", "scope": "shared"},
-                "device": {"type": "string", "enum": ["cpu", "cuda"], "default": "cpu", "scope": "shared"},
+                "device": {"type": "string", "enum": ["cpu", "cuda"], "default": DEFAULT_OCR_DEVICE, "scope": "shared"},
                 "device_id": {"type": "integer", "minimum": 0, "default": 0, "scope": "shared"},
                 "gpu_mem_mb": {"type": "integer", "minimum": 0, "default": 512, "scope": "shared"},
                 "provider": {"type": "string", "enum": ["rapidocr", "openai", "qwen", "tesseract"], "description": "OCR 服务商", "scope": "shared"},
@@ -459,12 +468,30 @@ def _adapter_signature(cfg: dict) -> tuple:
     provider = cfg.get('provider', 'rapidocr')
     common = (provider,)
     if provider == 'rapidocr':
+        backend = str(
+            cfg.get('backend', DEFAULT_OCR_BACKEND)
+        ).strip().lower()
+        fallback_backend = str(cfg.get(
+            'fallback_backend',
+            DEFAULT_OCR_FALLBACK_BACKEND if backend == 'tensorrt' else '',
+        )).strip().lower()
+        default_model_dir = {
+            'tensorrt': DEFAULT_OCR_MODEL_DIR,
+            'mnn': DEFAULT_OCR_FALLBACK_MODEL_DIR,
+            'onnxruntime': DEFAULT_OCR_ONNX_MODEL_DIR,
+        }.get(backend, DEFAULT_OCR_MODEL_DIR)
         return common + (
-            str(cfg.get('backend', 'onnxruntime')).strip().lower(),
-            str(cfg.get('fallback_backend', '')).strip().lower(),
-            cfg.get('model_dir', '/models/ocr/ppocrv6-tiny'),
-            cfg.get('fallback_model_dir', ''),
-            str(cfg.get('device', 'cpu')).strip().lower(),
+            backend,
+            fallback_backend,
+            cfg.get('model_dir', default_model_dir),
+            cfg.get(
+                'fallback_model_dir',
+                DEFAULT_OCR_FALLBACK_MODEL_DIR
+                if fallback_backend == 'mnn' else '',
+            ),
+            str(cfg.get(
+                'device', DEFAULT_OCR_DEVICE if backend == 'tensorrt' else 'cpu'
+            )).strip().lower(),
             int(cfg.get('device_id', 0)),
             int(cfg.get('gpu_mem_mb', 512)),
             bool(cfg.get('use_angle_cls', True)),
@@ -493,14 +520,30 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
     provider = cfg.get('provider', 'rapidocr')
 
     if provider == 'rapidocr':
+        backend = str(
+            cfg.get('backend', DEFAULT_OCR_BACKEND)
+        ).strip().lower()
+        fallback_backend = str(cfg.get(
+            'fallback_backend',
+            DEFAULT_OCR_FALLBACK_BACKEND if backend == 'tensorrt' else '',
+        )).strip().lower()
+        default_model_dir = {
+            'tensorrt': DEFAULT_OCR_MODEL_DIR,
+            'mnn': DEFAULT_OCR_FALLBACK_MODEL_DIR,
+            'onnxruntime': DEFAULT_OCR_ONNX_MODEL_DIR,
+        }.get(backend, DEFAULT_OCR_MODEL_DIR)
         return RapidOCRAdapter(
-            cfg.get('model_dir', '/models/ocr/ppocrv6-tiny'),
-            backend=str(cfg.get('backend', 'onnxruntime')).strip().lower(),
-            fallback_backend=str(
-                cfg.get('fallback_backend', '')
-            ).strip().lower(),
-            fallback_model_dir=cfg.get('fallback_model_dir', ''),
-            device=str(cfg.get('device', 'cpu')).strip().lower(),
+            cfg.get('model_dir', default_model_dir),
+            backend=backend,
+            fallback_backend=fallback_backend,
+            fallback_model_dir=cfg.get(
+                'fallback_model_dir',
+                DEFAULT_OCR_FALLBACK_MODEL_DIR
+                if fallback_backend == 'mnn' else '',
+            ),
+            device=str(cfg.get(
+                'device', DEFAULT_OCR_DEVICE if backend == 'tensorrt' else 'cpu'
+            )).strip().lower(),
             device_id=int(cfg.get('device_id', 0)),
             gpu_mem_mb=int(cfg.get('gpu_mem_mb', 512)),
             use_angle_cls=bool(cfg.get('use_angle_cls', True)),

@@ -49,13 +49,15 @@ plugins:
   ocr:
     enabled: true
     provider: rapidocr
-    backend: mnn
-    fallback_backend: ""
+    backend: tensorrt
+    fallback_backend: mnn
     url: ""
     key: ""
     model: ""
-    model_dir: /models/ocr/ppocrv6-small-mnn
-    fallback_model_dir: /models/ocr/ppocrv6-small-ort
+    model_dir: /models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8
+    fallback_model_dir: /models/ocr/ppocrv6-small-mnn
+    device: cuda
+    device_id: 0
     language: zh
     use_angle_cls: false
     num_threads: 1

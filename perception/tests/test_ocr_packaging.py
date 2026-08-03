@@ -27,8 +27,16 @@ class OCRPackagingTest(unittest.TestCase):
         )
         self.assertIn("  asr:\n    enabled: false\n    mode: offline", config)
         self.assertIn("  ocr:\n    enabled: true\n    provider: rapidocr", config)
-        self.assertIn("    backend: mnn", config)
-        self.assertIn("model_dir: /models/ocr/ppocrv6-small-mnn", config)
+        self.assertIn("    backend: tensorrt", config)
+        self.assertIn("    fallback_backend: mnn", config)
+        self.assertIn(
+            "model_dir: /models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8",
+            config,
+        )
+        self.assertIn(
+            "fallback_model_dir: /models/ocr/ppocrv6-small-mnn", config
+        )
+        self.assertIn("    device: cuda", config)
         self.assertIn("    max_side_len: 1600", config)
         self.assertNotIn("    max_input_mb:", config)
         self.assertNotIn("    max_decode_mb:", config)
@@ -62,7 +70,8 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn(
             "assert 'CUDAExecutionProvider' not in providers", dockerfile
         )
-        self.assertIn("import tensorrt as trt", dockerfile)
+        self.assertIn("version('tensorrt')", dockerfile)
+        self.assertIn("from importlib.metadata import version", dockerfile)
         self.assertIn("--no-deps", dockerfile)
         self.assertIn("onnxruntime", dockerfile)
         self.assertIn("rapidocr.__file__", dockerfile)
@@ -72,8 +81,19 @@ class OCRPackagingTest(unittest.TestCase):
             "http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-mnn",
             dockerfile,
         )
+        self.assertIn(
+            "http://172.28.4.81:34567/zengzhitao/embodied-ai/"
+            "ppocrv6-small-trt-jp6-trt10.4-orin-batch8",
+            dockerfile,
+        )
         self.assertIn("--filenames det.mnn rec.mnn keys.txt", dockerfile)
-        self.assertIn("/models/ocr/ppocrv6-small-mnn", dockerfile)
+        self.assertIn("--filenames det.engine rec.engine keys.txt", dockerfile)
+        self.assertIn("--sha256 det.engine=3b36aae", dockerfile)
+        self.assertIn(
+            "/opt/phanthy-motus/model-seed/ocr/ppocrv6-small-mnn",
+            dockerfile,
+        )
+        self.assertIn("seed_ocr_models.sh", dockerfile)
         self.assertNotIn("COPY perception/models", dockerfile)
 
         service = (REPO_ROOT / "perception" / "deploy" / "service.yml").read_text(
