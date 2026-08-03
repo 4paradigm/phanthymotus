@@ -39,6 +39,10 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from plugins.ocr_runtime import (
+    DEFAULT_CROP_REFINEMENT_ENABLED,
+    DEFAULT_CROP_REFINEMENT_MIN_GAIN,
+    DEFAULT_CROP_REFINEMENT_MIN_SCORE,
+    DEFAULT_CROP_REFINEMENT_PROFILES,
     DEFAULT_DET_BOX_THRESH,
     DEFAULT_DET_THRESH,
     DEFAULT_DET_UNCLIP_RATIO,
@@ -116,6 +120,31 @@ TOOLS = [
                 "det_unclip_ratio": {"type": "number", "exclusiveMinimum": 0, "default": DEFAULT_DET_UNCLIP_RATIO, "description": "DB 文本框扩张比例", "scope": "shared"},
                 "rec_min_score": {"type": "number", "minimum": 0, "maximum": 1, "default": DEFAULT_REC_MIN_SCORE, "description": "识别结果最低置信度", "scope": "shared"},
                 "enable_preprocess": {"type": "boolean", "default": True, "description": "启用 OCR 图像预处理", "scope": "shared"},
+                "crop_refinement": {
+                    "type": "object",
+                    "description": "TensorRT 低置信文本框二次裁剪识别",
+                    "scope": "shared",
+                    "default": {
+                        "enabled": DEFAULT_CROP_REFINEMENT_ENABLED,
+                        "min_score": DEFAULT_CROP_REFINEMENT_MIN_SCORE,
+                        "min_gain": DEFAULT_CROP_REFINEMENT_MIN_GAIN,
+                        "min_text_length": 2,
+                        "profiles": list(DEFAULT_CROP_REFINEMENT_PROFILES),
+                    },
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "min_score": {"type": "number", "minimum": 0, "maximum": 1},
+                        "min_gain": {"type": "number", "minimum": 0},
+                        "min_text_length": {"type": "integer", "minimum": 1},
+                        "profiles": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["prefix_65", "upper_center", "upper_tight"],
+                            },
+                        },
+                    },
+                },
                 "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "shared"},
             },
             "required": ["provider"]
@@ -503,6 +532,7 @@ def _adapter_signature(cfg: dict) -> tuple:
             float(cfg.get('det_box_thresh', DEFAULT_DET_BOX_THRESH)),
             float(cfg.get('det_unclip_ratio', DEFAULT_DET_UNCLIP_RATIO)),
             _freeze_config(cfg.get('large_image_strategy', {})),
+            _freeze_config(cfg.get('crop_refinement', {})),
         )
     if provider in ('openai', 'qwen'):
         return common + (
@@ -563,6 +593,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
             large_image_strategy=dict(
                 cfg.get('large_image_strategy') or {}
             ),
+            crop_refinement=dict(cfg.get('crop_refinement') or {}),
         )
 
     elif provider == 'openai':

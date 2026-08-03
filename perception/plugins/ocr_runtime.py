@@ -30,6 +30,70 @@ DEFAULT_REC_MIN_SCORE = 0.9
 DEFAULT_DET_THRESH = 0.3
 DEFAULT_DET_BOX_THRESH = 0.5
 DEFAULT_DET_UNCLIP_RATIO = 0.7
+DEFAULT_CROP_REFINEMENT_ENABLED = True
+DEFAULT_CROP_REFINEMENT_MIN_SCORE = 0.9
+DEFAULT_CROP_REFINEMENT_MIN_GAIN = 0.12
+DEFAULT_CROP_REFINEMENT_PROFILES = (
+    "prefix_65",
+    "upper_center",
+    "upper_tight",
+)
+
+_CROP_REFINEMENT_PROFILE_BOXES = {
+    "prefix_65": (0.05, 0.00, 0.70, 1.00),
+    "upper_center": (0.20, 0.05, 0.80, 0.68),
+    "upper_tight": (0.28, 0.10, 0.72, 0.64),
+}
+
+
+@dataclass(frozen=True)
+class CropRefinementConfig:
+    enabled: bool = DEFAULT_CROP_REFINEMENT_ENABLED
+    min_score: float = DEFAULT_CROP_REFINEMENT_MIN_SCORE
+    min_gain: float = DEFAULT_CROP_REFINEMENT_MIN_GAIN
+    min_text_length: int = 2
+    profiles: tuple[str, ...] = DEFAULT_CROP_REFINEMENT_PROFILES
+
+    @classmethod
+    def from_mapping(cls, value: dict | None) -> "CropRefinementConfig":
+        mapping = dict(value or {})
+        profiles = tuple(
+            str(profile).strip()
+            for profile in mapping.get(
+                "profiles", DEFAULT_CROP_REFINEMENT_PROFILES
+            )
+            if str(profile).strip()
+        )
+        unknown = set(profiles) - set(_CROP_REFINEMENT_PROFILE_BOXES)
+        if unknown:
+            raise ValueError(
+                "unknown OCR crop refinement profiles: "
+                + ", ".join(sorted(unknown))
+            )
+        min_score = float(
+            mapping.get("min_score", DEFAULT_CROP_REFINEMENT_MIN_SCORE)
+        )
+        min_gain = float(
+            mapping.get("min_gain", DEFAULT_CROP_REFINEMENT_MIN_GAIN)
+        )
+        min_text_length = int(mapping.get("min_text_length", 2))
+        if not 0.0 <= min_score <= 1.0:
+            raise ValueError("OCR crop refinement min_score must be in [0, 1]")
+        if min_gain < 0.0:
+            raise ValueError("OCR crop refinement min_gain must be non-negative")
+        if min_text_length < 1:
+            raise ValueError(
+                "OCR crop refinement min_text_length must be positive"
+            )
+        return cls(
+            enabled=bool(
+                mapping.get("enabled", DEFAULT_CROP_REFINEMENT_ENABLED)
+            ),
+            min_score=min_score,
+            min_gain=min_gain,
+            min_text_length=min_text_length,
+            profiles=profiles,
+        )
 
 
 @dataclass(frozen=True)
@@ -780,6 +844,7 @@ class _TensorRTPipeline(_MNNPipeline):
         det_thresh: float = DEFAULT_DET_THRESH,
         det_box_thresh: float = DEFAULT_DET_BOX_THRESH,
         det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO,
+        crop_refinement: CropRefinementConfig | None = None,
     ):
         from rapidocr.ch_ppocr_det.utils import DBPostProcess
         from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
@@ -814,6 +879,11 @@ class _TensorRTPipeline(_MNNPipeline):
         self._rec_min_score = float(rec_min_score)
         self._enable_preprocess = bool(enable_preprocess)
         self._max_side_len = max(32, int(max_side_len))
+        self._crop_refinement = (
+            crop_refinement
+            if crop_refinement is not None
+            else CropRefinementConfig()
+        )
 
     def warm_up(self) -> None:
         import numpy as np
@@ -835,20 +905,12 @@ class _TensorRTPipeline(_MNNPipeline):
             rec_shape,
         )
 
-    def infer(self, image) -> list[dict]:
+    def _recognize_boxes(self, image, boxes):
         import copy
         from collections import defaultdict
 
         import numpy as np
 
-        det_image = image
-        if self._enable_preprocess:
-            try:
-                det_image = preprocess_for_ocr(image)
-            except Exception:
-                _log.debug("preprocess failed, using original image", exc_info=True)
-
-        boxes, _ = self._detect(det_image)
         prepared_by_width = defaultdict(list)
         recognized = [("", 0.0)] * len(boxes)
         for index, box in enumerate(boxes):
@@ -878,24 +940,115 @@ class _TensorRTPipeline(_MNNPipeline):
                 for entry, result in zip(chunk, line_results):
                     text, score = result
                     recognized[entry[0]] = str(text), float(score)
+        return recognized
+
+    @staticmethod
+    def _sub_quad(box, x0: float, y0: float, x1: float, y1: float):
+        import numpy as np
+
+        def point(u: float, v: float):
+            top = box[0] * (1.0 - u) + box[1] * u
+            bottom = box[3] * (1.0 - u) + box[2] * u
+            return top * (1.0 - v) + bottom * v
+
+        return np.asarray(
+            [
+                point(x0, y0),
+                point(x1, y0),
+                point(x1, y1),
+                point(x0, y1),
+            ],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _item(box, text: str, score: float) -> dict:
+        import numpy as np
+
+        xs = box[:, 0]
+        ys = box[:, 1]
+        return {
+            "text": text,
+            "bbox": [
+                float(np.min(xs)),
+                float(np.min(ys)),
+                float(np.max(xs)),
+                float(np.max(ys)),
+            ],
+            "score": score,
+        }
+
+    def infer(self, image) -> list[dict]:
+        det_image = image
+        if self._enable_preprocess:
+            try:
+                det_image = preprocess_for_ocr(image)
+            except Exception:
+                _log.debug("preprocess failed, using original image", exc_info=True)
+
+        boxes, _ = self._detect(det_image)
+        recognized = self._recognize_boxes(image, boxes)
+        refinement = getattr(
+            self, "_crop_refinement", CropRefinementConfig(enabled=False)
+        )
+        if not refinement.enabled:
+            return [
+                self._item(box, text, score)
+                for box, (text, score) in zip(boxes, recognized)
+                if text.strip() and score >= self._rec_min_score
+            ]
+
+        refined_boxes = []
+        refined_sources = []
+        for box_index, (box, (_, score)) in enumerate(
+            zip(boxes, recognized)
+        ):
+            if score >= self._rec_min_score:
+                continue
+            for profile in refinement.profiles:
+                refined_boxes.append(
+                    self._sub_quad(
+                        box, *_CROP_REFINEMENT_PROFILE_BOXES[profile]
+                    )
+                )
+                refined_sources.append(box_index)
+
+        refined_results = self._recognize_boxes(image, refined_boxes)
+        candidates_by_box = {}
+        for box, source, result in zip(
+            refined_boxes, refined_sources, refined_results
+        ):
+            text, score = result
+            if len(text.strip()) < refinement.min_text_length:
+                continue
+            candidate = candidates_by_box.get(source)
+            if candidate is None or score > candidate[2]:
+                candidates_by_box[source] = (box, text, score)
 
         items = []
-        for box, (text, score) in zip(boxes, recognized):
-            if not text.strip() or score < self._rec_min_score:
+        for box_index, (box, (text, score)) in enumerate(
+            zip(boxes, recognized)
+        ):
+            selected_box = box
+            selected_text = text
+            selected_score = score
+            candidate = candidates_by_box.get(box_index)
+            if (
+                candidate is not None
+                and candidate[2] >= refinement.min_score
+                and candidate[2] >= score + refinement.min_gain
+            ):
+                selected_box, selected_text, selected_score = candidate
+
+            score_floor = (
+                refinement.min_score
+                if selected_box is not box
+                else self._rec_min_score
+            )
+            if not selected_text.strip() or selected_score < score_floor:
                 continue
-            xs = box[:, 0]
-            ys = box[:, 1]
             items.append(
-                {
-                    "text": text,
-                    "bbox": [
-                        float(np.min(xs)),
-                        float(np.min(ys)),
-                        float(np.max(xs)),
-                        float(np.max(ys)),
-                    ],
-                    "score": score,
-                }
+                self._item(selected_box, selected_text, selected_score)
             )
         return items
 
@@ -919,6 +1072,7 @@ class RapidOCRAdapter:
         det_box_thresh: float = DEFAULT_DET_BOX_THRESH,
         det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO,
         large_image_strategy: dict | None = None,
+        crop_refinement: dict | None = None,
     ):
         root = Path(model_dir)
         backend = str(backend).strip().lower()
@@ -956,6 +1110,9 @@ class RapidOCRAdapter:
         strategy_config = LargeImageStrategyConfig.from_mapping(
             large_image_strategy
         )
+        crop_refinement_config = CropRefinementConfig.from_mapping(
+            crop_refinement
+        )
         self._large_image_strategy = (
             AdaptiveTiledOCRStrategy(strategy_config, max_side_len)
             if strategy_config.enabled
@@ -976,7 +1133,10 @@ class RapidOCRAdapter:
             elif selected_backend == "tensorrt":
                 required_files = TENSORRT_MODEL_FILES
                 pipeline_type = _TensorRTPipeline
-                pipeline_kwargs = {"device_id": device_id}
+                pipeline_kwargs = {
+                    "device_id": device_id,
+                    "crop_refinement": crop_refinement_config,
+                }
                 classifier_error = (
                     "OCR TensorRT backend does not load angle classifier"
                 )

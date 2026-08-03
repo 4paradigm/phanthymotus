@@ -113,6 +113,16 @@ class OCRContractTest(unittest.TestCase):
         self.assertEqual(properties["max_side_len"]["default"], 1600)
         self.assertEqual(properties["det_unclip_ratio"]["default"], 0.7)
         self.assertEqual(properties["rec_min_score"]["default"], 0.9)
+        self.assertEqual(
+            properties["crop_refinement"]["default"],
+            {
+                "enabled": True,
+                "min_score": 0.9,
+                "min_gain": 0.12,
+                "min_text_length": 2,
+                "profiles": ["prefix_65", "upper_center", "upper_tight"],
+            },
+        )
 
     def test_camera_and_result_topics_use_appropriate_reliability(self):
         self.assertEqual(self.ocr._CAMERA_QOS["reliability"], "RELIABLE")
@@ -169,6 +179,7 @@ class OCRContractTest(unittest.TestCase):
                 "enabled": True,
                 "trigger_side": 2400,
             },
+            crop_refinement={},
         )
 
     def test_adapter_signature_changes_with_large_image_strategy(self):
@@ -186,6 +197,16 @@ class OCRContractTest(unittest.TestCase):
         )
 
         self.assertNotEqual(first, second)
+
+    def test_adapter_signature_changes_with_crop_refinement(self):
+        baseline = self.ocr._adapter_signature(
+            {"provider": "rapidocr", "crop_refinement": {"enabled": True}}
+        )
+        disabled = self.ocr._adapter_signature(
+            {"provider": "rapidocr", "crop_refinement": {"enabled": False}}
+        )
+
+        self.assertNotEqual(baseline, disabled)
 
     def test_adapter_signature_changes_with_inference_tuning(self):
         baseline = {
@@ -264,6 +285,7 @@ class OCRContractTest(unittest.TestCase):
             det_box_thresh=0.5,
             det_unclip_ratio=0.7,
             large_image_strategy={"enabled": True},
+            crop_refinement={},
         )
 
     def test_mnn_session_uses_low_memory_config_and_uint8_pointer(self):
@@ -408,6 +430,7 @@ class OCRContractTest(unittest.TestCase):
             det_thresh=0.3,
             det_box_thresh=0.5,
             det_unclip_ratio=0.7,
+            crop_refinement=self.ocr_runtime.CropRefinementConfig(),
         )
         pipeline.return_value.warm_up.assert_called_once_with()
         self.assertEqual(adapter._backend_name, "tensorrt")
@@ -689,6 +712,63 @@ class OCRContractTest(unittest.TestCase):
         self.assertEqual(calls[0].args[0].shape, (2, 48, 320, 3))
         self.assertEqual(calls[0].args[1], (2, 3, 48, 320))
         self.assertEqual(calls[1].args[0].shape, (1, 48, 328, 3))
+
+    def test_tensorrt_pipeline_refines_low_confidence_box(self):
+        import numpy as np
+
+        pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
+        pipeline._enable_preprocess = False
+        pipeline._rec_min_score = 0.9
+        pipeline._crop_refinement = self.ocr_runtime.CropRefinementConfig()
+        box = np.asarray(
+            [[0, 0], [100, 0], [100, 40], [0, 40]],
+            dtype=np.float32,
+        )
+        pipeline._detect = mock.Mock(return_value=(np.asarray([box]), [1.0]))
+        pipeline._recognize_boxes = mock.Mock(side_effect=[
+            [("noisy-extra", 0.7)],
+            [
+                ("correct", 0.95),
+                ("upper", 0.91),
+                ("tight", 0.92),
+            ],
+        ])
+
+        result = pipeline.infer(np.zeros((64, 128, 3), dtype=np.uint8))
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "correct")
+        self.assertAlmostEqual(result[0]["score"], 0.95)
+        self.assertEqual(result[0]["bbox"], [5.0, 0.0, 70.0, 40.0])
+        refined_boxes = pipeline._recognize_boxes.call_args_list[1].args[1]
+        self.assertEqual(len(refined_boxes), 3)
+
+    def test_tensorrt_pipeline_rejects_refinement_without_minimum_gain(self):
+        import numpy as np
+
+        pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
+        pipeline._enable_preprocess = False
+        pipeline._rec_min_score = 0.9
+        pipeline._crop_refinement = self.ocr_runtime.CropRefinementConfig()
+        box = np.asarray(
+            [[0, 0], [100, 0], [100, 40], [0, 40]],
+            dtype=np.float32,
+        )
+        pipeline._detect = mock.Mock(return_value=(np.asarray([box]), [1.0]))
+        pipeline._recognize_boxes = mock.Mock(side_effect=[
+            [("primary", 0.85)],
+            [("candidate", 0.96), ("other", 0.94), ("tight", 0.93)],
+        ])
+
+        result = pipeline.infer(np.zeros((64, 128, 3), dtype=np.uint8))
+
+        self.assertEqual(result, [])
+
+    def test_crop_refinement_rejects_unknown_profile(self):
+        with self.assertRaisesRegex(ValueError, "unknown OCR crop refinement"):
+            self.ocr_runtime.CropRefinementConfig.from_mapping(
+                {"profiles": ["unknown"]}
+            )
 
     def test_tensorrt_shape_error_lazily_loads_mnn_fallback_once(self):
         adapter = object.__new__(self.ocr_runtime.RapidOCRAdapter)

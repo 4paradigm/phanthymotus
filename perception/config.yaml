@@ -70,6 +70,14 @@ plugins:
     det_thresh: 0.3
     det_box_thresh: 0.5
     rec_min_score: 0.9          # v2 最优：TP置信度~1.0 / FP~0.79，抬到0.9砍FP +8.4pp
+    crop_refinement:
+      # 仅对低于 rec_min_score 的 TensorRT 框做三种保守子框复识别；新结果必须
+      # 同时达到 min_score 且比原框高 min_gain，避免全局低阈值重新引入 FP。
+      enabled: true
+      min_score: 0.9
+      min_gain: 0.12
+      min_text_length: 2
+      profiles: [prefix_65, upper_center, upper_tight]
     min_interval_ms: 0
     large_image_strategy:
       # 关闭分块：tile 跨边界切割产生无法去重的碎片框, predict_T 膨胀 77%, F1 崩塌
