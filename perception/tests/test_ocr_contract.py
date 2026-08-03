@@ -123,6 +123,14 @@ class OCRContractTest(unittest.TestCase):
                 "profiles": ["prefix_65", "upper_center", "upper_tight"],
             },
         )
+        self.assertEqual(
+            properties["empty_result_retry"]["default"],
+            {
+                "enabled": True,
+                "det_thresh": 0.1,
+                "det_box_thresh": 0.1,
+            },
+        )
 
     def test_camera_and_result_topics_use_appropriate_reliability(self):
         self.assertEqual(self.ocr._CAMERA_QOS["reliability"], "RELIABLE")
@@ -180,6 +188,7 @@ class OCRContractTest(unittest.TestCase):
                 "trigger_side": 2400,
             },
             crop_refinement={},
+            empty_result_retry={},
         )
 
     def test_adapter_signature_changes_with_large_image_strategy(self):
@@ -204,6 +213,16 @@ class OCRContractTest(unittest.TestCase):
         )
         disabled = self.ocr._adapter_signature(
             {"provider": "rapidocr", "crop_refinement": {"enabled": False}}
+        )
+
+        self.assertNotEqual(baseline, disabled)
+
+    def test_adapter_signature_changes_with_empty_result_retry(self):
+        baseline = self.ocr._adapter_signature(
+            {"provider": "rapidocr", "empty_result_retry": {"enabled": True}}
+        )
+        disabled = self.ocr._adapter_signature(
+            {"provider": "rapidocr", "empty_result_retry": {"enabled": False}}
         )
 
         self.assertNotEqual(baseline, disabled)
@@ -286,6 +305,7 @@ class OCRContractTest(unittest.TestCase):
             det_unclip_ratio=0.7,
             large_image_strategy={"enabled": True},
             crop_refinement={},
+            empty_result_retry={},
         )
 
     def test_mnn_session_uses_low_memory_config_and_uint8_pointer(self):
@@ -432,6 +452,7 @@ class OCRContractTest(unittest.TestCase):
             det_box_thresh=0.5,
             det_unclip_ratio=0.7,
             crop_refinement=self.ocr_runtime.CropRefinementConfig(),
+            empty_result_retry=self.ocr_runtime.EmptyResultRetryConfig(),
         )
         pipeline.return_value.warm_up.assert_called_once_with()
         self.assertEqual(adapter._backend_name, "tensorrt")
@@ -518,6 +539,7 @@ class OCRContractTest(unittest.TestCase):
             det_box_thresh=0.5,
             det_unclip_ratio=0.7,
             crop_refinement=self.ocr_runtime.CropRefinementConfig(),
+            empty_result_retry=self.ocr_runtime.EmptyResultRetryConfig(),
         )
         pipeline.return_value.warm_up.assert_called_once_with()
         self.assertEqual(adapter._backend_name, "tensorrt")
@@ -731,6 +753,7 @@ class OCRContractTest(unittest.TestCase):
         pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
         pipeline._enable_preprocess = False
         pipeline._rec_min_score = 0.9
+        pipeline._det_postprocess = object()
         boxes = np.asarray(
             [
                 [[0, 0], [10, 0], [10, 10], [0, 10]],
@@ -739,7 +762,12 @@ class OCRContractTest(unittest.TestCase):
             ],
             dtype=np.float32,
         )
-        pipeline._detect = mock.Mock(return_value=(boxes, [1.0] * 3))
+        pipeline._run_detector = mock.Mock(
+            return_value=(object(), (64, 64))
+        )
+        pipeline._postprocess_detection = mock.Mock(
+            return_value=(boxes, [1.0] * 3)
+        )
         pipeline._crop = mock.Mock(side_effect=[object(), object(), object()])
         pipeline._prepare_recognition_crop = mock.Mock(side_effect=[
             (np.zeros((48, 320, 3), dtype=np.uint8), 1.0),
@@ -777,12 +805,18 @@ class OCRContractTest(unittest.TestCase):
         pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
         pipeline._enable_preprocess = False
         pipeline._rec_min_score = 0.9
+        pipeline._det_postprocess = object()
         pipeline._crop_refinement = self.ocr_runtime.CropRefinementConfig()
         box = np.asarray(
             [[0, 0], [100, 0], [100, 40], [0, 40]],
             dtype=np.float32,
         )
-        pipeline._detect = mock.Mock(return_value=(np.asarray([box]), [1.0]))
+        pipeline._run_detector = mock.Mock(
+            return_value=(object(), (64, 128))
+        )
+        pipeline._postprocess_detection = mock.Mock(
+            return_value=(np.asarray([box]), [1.0])
+        )
         pipeline._recognize_boxes = mock.Mock(side_effect=[
             [("noisy-extra", 0.7)],
             [
@@ -807,12 +841,18 @@ class OCRContractTest(unittest.TestCase):
         pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
         pipeline._enable_preprocess = False
         pipeline._rec_min_score = 0.9
+        pipeline._det_postprocess = object()
         pipeline._crop_refinement = self.ocr_runtime.CropRefinementConfig()
         box = np.asarray(
             [[0, 0], [100, 0], [100, 40], [0, 40]],
             dtype=np.float32,
         )
-        pipeline._detect = mock.Mock(return_value=(np.asarray([box]), [1.0]))
+        pipeline._run_detector = mock.Mock(
+            return_value=(object(), (64, 128))
+        )
+        pipeline._postprocess_detection = mock.Mock(
+            return_value=(np.asarray([box]), [1.0])
+        )
         pipeline._recognize_boxes = mock.Mock(side_effect=[
             [("primary", 0.85)],
             [("candidate", 0.96), ("other", 0.94), ("tight", 0.93)],
@@ -821,6 +861,52 @@ class OCRContractTest(unittest.TestCase):
         result = pipeline.infer(np.zeros((64, 128, 3), dtype=np.uint8))
 
         self.assertEqual(result, [])
+
+    def test_tensorrt_empty_result_retry_reuses_detector_prediction(self):
+        import numpy as np
+
+        pipeline = object.__new__(self.ocr_runtime._TensorRTPipeline)
+        pipeline._enable_preprocess = False
+        prediction = object()
+        primary_boxes = np.asarray(
+            [[[0, 0], [10, 0], [10, 10], [0, 10]]], dtype=np.float32
+        )
+        retry_boxes = np.asarray(
+            [[[20, 20], [40, 20], [40, 30], [20, 30]]], dtype=np.float32
+        )
+        pipeline._det_postprocess = object()
+        pipeline._empty_result_retry_postprocess = object()
+        pipeline._run_detector = mock.Mock(
+            return_value=(prediction, (64, 64))
+        )
+        pipeline._postprocess_detection = mock.Mock(
+            side_effect=[
+                (primary_boxes, [0.8]),
+                (retry_boxes, [0.2]),
+            ]
+        )
+        retry_item = {"text": "桌牌", "bbox": [20, 20, 40, 30], "score": 0.99}
+        pipeline._recognize_with_refinement = mock.Mock(
+            side_effect=[[], [retry_item]]
+        )
+
+        result = pipeline.infer(np.zeros((64, 64, 3), dtype=np.uint8))
+
+        self.assertEqual(result, [retry_item])
+        pipeline._run_detector.assert_called_once()
+        self.assertEqual(pipeline._postprocess_detection.call_count, 2)
+        self.assertIs(
+            pipeline._postprocess_detection.call_args_list[1].args[0],
+            prediction,
+        )
+
+    def test_empty_result_retry_rejects_invalid_threshold(self):
+        with self.assertRaisesRegex(
+            ValueError, "empty-result retry det_thresh"
+        ):
+            self.ocr_runtime.EmptyResultRetryConfig.from_mapping(
+                {"det_thresh": -0.1}
+            )
 
     def test_crop_refinement_rejects_unknown_profile(self):
         with self.assertRaisesRegex(ValueError, "unknown OCR crop refinement"):

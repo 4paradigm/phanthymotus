@@ -40,6 +40,9 @@ DEFAULT_CROP_REFINEMENT_PROFILES = (
     "upper_center",
     "upper_tight",
 )
+DEFAULT_EMPTY_RESULT_RETRY_ENABLED = True
+DEFAULT_EMPTY_RESULT_RETRY_DET_THRESH = 0.1
+DEFAULT_EMPTY_RESULT_RETRY_DET_BOX_THRESH = 0.1
 
 _CROP_REFINEMENT_PROFILE_BOXES = {
     "prefix_65": (0.05, 0.00, 0.70, 1.00),
@@ -95,6 +98,38 @@ class CropRefinementConfig:
             min_gain=min_gain,
             min_text_length=min_text_length,
             profiles=profiles,
+        )
+
+
+@dataclass(frozen=True)
+class EmptyResultRetryConfig:
+    enabled: bool = DEFAULT_EMPTY_RESULT_RETRY_ENABLED
+    det_thresh: float = DEFAULT_EMPTY_RESULT_RETRY_DET_THRESH
+    det_box_thresh: float = DEFAULT_EMPTY_RESULT_RETRY_DET_BOX_THRESH
+
+    @classmethod
+    def from_mapping(cls, value: dict | None) -> "EmptyResultRetryConfig":
+        mapping = dict(value or {})
+        det_thresh = float(
+            mapping.get("det_thresh", DEFAULT_EMPTY_RESULT_RETRY_DET_THRESH)
+        )
+        det_box_thresh = float(
+            mapping.get(
+                "det_box_thresh", DEFAULT_EMPTY_RESULT_RETRY_DET_BOX_THRESH
+            )
+        )
+        if not 0.0 <= det_thresh <= 1.0:
+            raise ValueError("OCR empty-result retry det_thresh must be in [0, 1]")
+        if not 0.0 <= det_box_thresh <= 1.0:
+            raise ValueError(
+                "OCR empty-result retry det_box_thresh must be in [0, 1]"
+            )
+        return cls(
+            enabled=bool(
+                mapping.get("enabled", DEFAULT_EMPTY_RESULT_RETRY_ENABLED)
+            ),
+            det_thresh=det_thresh,
+            det_box_thresh=det_box_thresh,
         )
 
 
@@ -720,15 +755,19 @@ class _MNNPipeline:
             interpolation=cv2.INTER_AREA,
         )
 
-    def _detect(self, image):
-        import numpy as np
-
+    def _run_detector(self, image):
         detector_input = self._detector_input(image)
         height, width = detector_input.shape[:2]
         prediction = self._det.run_uint8(
             detector_input, (1, 3, height, width)
         )
-        boxes, scores = self._det_postprocess(prediction, image.shape[:2])
+        return prediction, image.shape[:2]
+
+    @staticmethod
+    def _postprocess_detection(prediction, image_shape, postprocess):
+        import numpy as np
+
+        boxes, scores = postprocess(prediction, image_shape)
         if len(boxes) == 0:
             return np.empty((0, 4, 2), dtype=np.float32), []
         order = sorted(
@@ -736,6 +775,12 @@ class _MNNPipeline:
             key=lambda index: (boxes[index][0][1], boxes[index][0][0]),
         )
         return boxes[order], [scores[index] for index in order]
+
+    def _detect(self, image):
+        prediction, image_shape = self._run_detector(image)
+        return self._postprocess_detection(
+            prediction, image_shape, self._det_postprocess
+        )
 
     @staticmethod
     def _prepare_recognition_crop(crop):
@@ -847,6 +892,7 @@ class _TensorRTPipeline(_MNNPipeline):
         det_box_thresh: float = DEFAULT_DET_BOX_THRESH,
         det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO,
         crop_refinement: CropRefinementConfig | None = None,
+        empty_result_retry: EmptyResultRetryConfig | None = None,
         use_angle_cls: bool = False,
         cls_thresh: float = DEFAULT_CLS_THRESH,
     ):
@@ -902,6 +948,21 @@ class _TensorRTPipeline(_MNNPipeline):
             if crop_refinement is not None
             else CropRefinementConfig()
         )
+        retry = (
+            empty_result_retry
+            if empty_result_retry is not None
+            else EmptyResultRetryConfig()
+        )
+        self._empty_result_retry_postprocess = None
+        if retry.enabled:
+            self._empty_result_retry_postprocess = DBPostProcess(
+                thresh=retry.det_thresh,
+                box_thresh=retry.det_box_thresh,
+                max_candidates=1000,
+                unclip_ratio=float(det_unclip_ratio),
+                use_dilation=True,
+                score_mode="fast",
+            )
 
     def warm_up(self) -> None:
         import numpy as np
@@ -1069,15 +1130,7 @@ class _TensorRTPipeline(_MNNPipeline):
             "score": score,
         }
 
-    def infer(self, image) -> list[dict]:
-        det_image = image
-        if self._enable_preprocess:
-            try:
-                det_image = preprocess_for_ocr(image)
-            except Exception:
-                _log.debug("preprocess failed, using original image", exc_info=True)
-
-        boxes, _ = self._detect(det_image)
+    def _recognize_with_refinement(self, image, boxes) -> list[dict]:
         recognized = self._recognize_boxes(image, boxes)
         refinement = getattr(
             self, "_crop_refinement", CropRefinementConfig(enabled=False)
@@ -1143,6 +1196,30 @@ class _TensorRTPipeline(_MNNPipeline):
             )
         return items
 
+    def infer(self, image) -> list[dict]:
+        det_image = image
+        if self._enable_preprocess:
+            try:
+                det_image = preprocess_for_ocr(image)
+            except Exception:
+                _log.debug("preprocess failed, using original image", exc_info=True)
+
+        prediction, image_shape = self._run_detector(det_image)
+        boxes, _ = self._postprocess_detection(
+            prediction, image_shape, self._det_postprocess
+        )
+        items = self._recognize_with_refinement(image, boxes)
+        retry_postprocess = getattr(
+            self, "_empty_result_retry_postprocess", None
+        )
+        if items or retry_postprocess is None:
+            return items
+
+        retry_boxes, _ = self._postprocess_detection(
+            prediction, image_shape, retry_postprocess
+        )
+        return self._recognize_with_refinement(image, retry_boxes)
+
 
 class RapidOCRAdapter:
     def __init__(
@@ -1164,6 +1241,7 @@ class RapidOCRAdapter:
         det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO,
         large_image_strategy: dict | None = None,
         crop_refinement: dict | None = None,
+        empty_result_retry: dict | None = None,
     ):
         root = Path(model_dir)
         backend = str(backend).strip().lower()
@@ -1204,6 +1282,9 @@ class RapidOCRAdapter:
         crop_refinement_config = CropRefinementConfig.from_mapping(
             crop_refinement
         )
+        empty_result_retry_config = EmptyResultRetryConfig.from_mapping(
+            empty_result_retry
+        )
         self._large_image_strategy = (
             AdaptiveTiledOCRStrategy(strategy_config, max_side_len)
             if strategy_config.enabled
@@ -1235,6 +1316,7 @@ class RapidOCRAdapter:
                 pipeline_kwargs = {
                     "device_id": device_id,
                     "crop_refinement": crop_refinement_config,
+                    "empty_result_retry": empty_result_retry_config,
                     "use_angle_cls": enable_angle_cls,
                 }
                 classifier_error = ""

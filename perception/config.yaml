@@ -78,6 +78,12 @@ plugins:
       min_gain: 0.12
       min_text_length: 2
       profiles: [prefix_65, upper_center, upper_tight]
+    empty_result_retry:
+      # 主流程过滤后为空时，复用同一张 detector 概率图，以低阈值重新生成候选框；
+      # 不重复执行 GPU detector，非空结果完全不受影响。
+      enabled: true
+      det_thresh: 0.1
+      det_box_thresh: 0.1
     min_interval_ms: 0
     large_image_strategy:
       # 关闭分块：tile 跨边界切割产生无法去重的碎片框, predict_T 膨胀 77%, F1 崩塌

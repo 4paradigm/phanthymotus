@@ -46,6 +46,9 @@ from plugins.ocr_runtime import (
     DEFAULT_DET_BOX_THRESH,
     DEFAULT_DET_THRESH,
     DEFAULT_DET_UNCLIP_RATIO,
+    DEFAULT_EMPTY_RESULT_RETRY_DET_BOX_THRESH,
+    DEFAULT_EMPTY_RESULT_RETRY_DET_THRESH,
+    DEFAULT_EMPTY_RESULT_RETRY_ENABLED,
     DEFAULT_MAX_SIDE_LEN,
     DEFAULT_REC_MIN_SCORE,
     RapidOCRAdapter,
@@ -144,6 +147,21 @@ TOOLS = [
                                 "enum": ["prefix_65", "upper_center", "upper_tight"],
                             },
                         },
+                    },
+                },
+                "empty_result_retry": {
+                    "type": "object",
+                    "description": "TensorRT 主流程空输出时复用检测图进行低阈值后处理",
+                    "scope": "shared",
+                    "default": {
+                        "enabled": DEFAULT_EMPTY_RESULT_RETRY_ENABLED,
+                        "det_thresh": DEFAULT_EMPTY_RESULT_RETRY_DET_THRESH,
+                        "det_box_thresh": DEFAULT_EMPTY_RESULT_RETRY_DET_BOX_THRESH,
+                    },
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "det_thresh": {"type": "number", "minimum": 0, "maximum": 1},
+                        "det_box_thresh": {"type": "number", "minimum": 0, "maximum": 1},
                     },
                 },
                 "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "shared"},
@@ -534,6 +552,7 @@ def _adapter_signature(cfg: dict) -> tuple:
             float(cfg.get('det_unclip_ratio', DEFAULT_DET_UNCLIP_RATIO)),
             _freeze_config(cfg.get('large_image_strategy', {})),
             _freeze_config(cfg.get('crop_refinement', {})),
+            _freeze_config(cfg.get('empty_result_retry', {})),
         )
     if provider in ('openai', 'qwen'):
         return common + (
@@ -595,6 +614,7 @@ def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
                 cfg.get('large_image_strategy') or {}
             ),
             crop_refinement=dict(cfg.get('crop_refinement') or {}),
+            empty_result_retry=dict(cfg.get('empty_result_retry') or {}),
         )
 
     elif provider == 'openai':

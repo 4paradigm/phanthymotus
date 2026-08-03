@@ -39,6 +39,14 @@ class OCRPackagingTest(unittest.TestCase):
         )
         self.assertIn("    device: cuda", config)
         self.assertIn("    max_side_len: 1600", config)
+        self.assertRegex(
+            config,
+            r"empty_result_retry:\n"
+            r"(?:      #.*\n)*"
+            r"      enabled: true\n"
+            r"      det_thresh: 0.1\n"
+            r"      det_box_thresh: 0.1",
+        )
         self.assertNotIn("    max_input_mb:", config)
         self.assertNotIn("    max_decode_mb:", config)
         self.assertNotIn("    memory_guard:", config)
