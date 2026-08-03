@@ -89,6 +89,10 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
+                "backend": {"type": "string", "enum": ["mnn", "onnxruntime", "tensorrt"], "default": "mnn", "scope": "shared"},
+                "fallback_backend": {"type": "string", "enum": ["", "mnn", "onnxruntime"], "default": "", "scope": "shared"},
+                "model_dir": {"type": "string", "description": "OCR 模型或 TensorRT engine 目录", "scope": "shared"},
+                "fallback_model_dir": {"type": "string", "description": "OCR 回退模型目录", "scope": "shared"},
                 "device": {"type": "string", "enum": ["cpu", "cuda"], "default": "cpu", "scope": "shared"},
                 "device_id": {"type": "integer", "minimum": 0, "default": 0, "scope": "shared"},
                 "gpu_mem_mb": {"type": "integer", "minimum": 0, "default": 512, "scope": "shared"},

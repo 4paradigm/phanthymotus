@@ -62,6 +62,7 @@ class OCRPackagingTest(unittest.TestCase):
         self.assertIn(
             "assert 'CUDAExecutionProvider' not in providers", dockerfile
         )
+        self.assertIn("import tensorrt as trt", dockerfile)
         self.assertIn("--no-deps", dockerfile)
         self.assertIn("onnxruntime", dockerfile)
         self.assertIn("rapidocr.__file__", dockerfile)

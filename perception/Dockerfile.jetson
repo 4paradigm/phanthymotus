@@ -124,6 +124,10 @@ RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true; \
       "numpy==1.26.4" "onnxruntime==1.23.0" && \
     python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert ort.__version__ == '1.23.0', ort.__version__; assert 'CPUExecutionProvider' in providers, providers; assert 'CUDAExecutionProvider' not in providers, providers"
 
+# TensorRT is supplied by the JetPack base image. Engines stay external so the
+# default CPU MNN deployment does not carry device/profile-specific artifacts.
+RUN python3 -c "import tensorrt as trt; assert int(trt.__version__.split('.')[0]) >= 10, trt.__version__"
+
 # ── RapidOCR utilities + low-memory MNN OCR runtime ───────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
       "numpy==1.26.4" pyclipper==1.3.0.post3 six Shapely==2.0.5 Pillow \

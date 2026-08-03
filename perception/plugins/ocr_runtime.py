@@ -22,6 +22,7 @@ _log = logging.getLogger(__name__)
 
 ORT_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx", "keys.txt")
 MNN_MODEL_FILES = ("det.mnn", "rec.mnn", "keys.txt")
+TENSORRT_MODEL_FILES = ("det.engine", "rec.engine", "keys.txt")
 _OCR_MEAN = (127.5, 127.5, 127.5)
 _OCR_NORMAL = (1 / 127.5, 1 / 127.5, 1 / 127.5)
 DEFAULT_MAX_SIDE_LEN = 1600
@@ -197,6 +198,186 @@ class _MNNModelSession:
             release(self._session)
 
 
+class _TensorRTModelSession:
+    def __init__(
+        self,
+        engine_path: Path,
+        *,
+        device_id: int,
+        mean: tuple[float, float, float],
+        normal: tuple[float, float, float],
+    ):
+        import numpy as np
+        import tensorrt as trt
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("OCR TensorRT backend requires CUDA")
+
+        self._np = np
+        self._torch = torch
+        self._device_id = int(device_id)
+        self._mean = np.asarray(mean, dtype=np.float32)
+        self._normal = np.asarray(normal, dtype=np.float32)
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        with torch.cuda.device(self._device_id):
+            self._runtime = trt.Runtime(logger)
+            self._engine = self._runtime.deserialize_cuda_engine(
+                engine_path.read_bytes()
+            )
+            if self._engine is None:
+                raise RuntimeError(
+                    f"failed to deserialize TensorRT engine: {engine_path}"
+                )
+            self._context = self._engine.create_execution_context()
+            if self._context is None:
+                raise RuntimeError(
+                    f"failed to create TensorRT context: {engine_path}"
+                )
+            self._stream = torch.cuda.Stream(device=self._device_id)
+
+        inputs = []
+        outputs = []
+        for index in range(self._engine.num_io_tensors):
+            name = self._engine.get_tensor_name(index)
+            mode = self._engine.get_tensor_mode(name)
+            (inputs if mode == trt.TensorIOMode.INPUT else outputs).append(name)
+        if len(inputs) != 1 or len(outputs) != 1:
+            raise RuntimeError(
+                "OCR TensorRT engine must have exactly one input and output; "
+                f"got inputs={inputs}, outputs={outputs}"
+            )
+        self._input_name = inputs[0]
+        self._output_name = outputs[0]
+        self._input_numpy_dtype = _trt_dtype_to_numpy(
+            trt, self._engine.get_tensor_dtype(self._input_name)
+        )
+        self._output_torch_dtype = torch.from_numpy(
+            np.empty(
+                0,
+                dtype=_trt_dtype_to_numpy(
+                    trt, self._engine.get_tensor_dtype(self._output_name)
+                ),
+            )
+        ).dtype
+        self._profiles = self._read_profiles()
+        self._active_profile = 0
+
+    def _read_profiles(self):
+        static_shape = tuple(
+            int(value) for value in self._engine.get_tensor_shape(self._input_name)
+        )
+        if static_shape and all(value > 0 for value in static_shape):
+            return [(static_shape, static_shape, static_shape)]
+
+        profiles = []
+        for index in range(self._engine.num_optimization_profiles):
+            minimum, optimum, maximum = self._engine.get_tensor_profile_shape(
+                self._input_name, index
+            )
+            profiles.append(
+                tuple(tuple(int(value) for value in shape) for shape in (
+                    minimum,
+                    optimum,
+                    maximum,
+                ))
+            )
+        if not profiles:
+            raise RuntimeError("OCR TensorRT engine has no optimization profile")
+        return profiles
+
+    @property
+    def optimization_shape(self) -> tuple[int, ...]:
+        return self._profiles[0][1]
+
+    def _select_profile(self, shape: tuple[int, ...]) -> int:
+        for index, (minimum, _optimum, maximum) in enumerate(self._profiles):
+            if len(shape) != len(minimum):
+                continue
+            if all(
+                lower <= value <= upper
+                for value, lower, upper in zip(shape, minimum, maximum)
+            ):
+                return index
+        ranges = [
+            {"min": minimum, "max": maximum}
+            for minimum, _optimum, maximum in self._profiles
+        ]
+        raise ValueError(
+            f"OCR TensorRT input shape {shape} is outside profiles {ranges}"
+        )
+
+    def run_uint8(self, image, shape: tuple[int, ...]):
+        image = self._np.ascontiguousarray(image, dtype=self._np.uint8)
+        if len(shape) != 4 or shape[0] != 1 or shape[1] != 3:
+            raise ValueError(f"invalid OCR TensorRT NCHW shape: {shape}")
+        if image.shape[:2] != (shape[2], shape[3]):
+            raise ValueError(
+                f"OCR TensorRT image/shape mismatch: {image.shape} vs {shape}"
+            )
+        value = (image.astype(self._np.float32) - self._mean) * self._normal
+        array = self._np.ascontiguousarray(
+            value.transpose(2, 0, 1)[None], dtype=self._input_numpy_dtype
+        )
+        return self._run(array)
+
+    def _run(self, array):
+        shape = tuple(int(value) for value in array.shape)
+        profile = self._select_profile(shape)
+        torch = self._torch
+        with torch.cuda.device(self._device_id), torch.cuda.stream(self._stream):
+            if profile != self._active_profile:
+                if not self._context.set_optimization_profile_async(
+                    profile, self._stream.cuda_stream
+                ):
+                    raise RuntimeError(
+                        f"failed to select TensorRT profile {profile}"
+                    )
+                self._active_profile = profile
+            if not self._context.set_input_shape(self._input_name, shape):
+                raise RuntimeError(f"TensorRT rejected OCR input shape {shape}")
+            output_shape = tuple(
+                int(value)
+                for value in self._context.get_tensor_shape(self._output_name)
+            )
+            if any(value < 0 for value in output_shape):
+                raise RuntimeError(
+                    f"TensorRT produced unresolved output shape {output_shape}"
+                )
+            input_tensor = torch.from_numpy(array).to(
+                device=f"cuda:{self._device_id}", non_blocking=False
+            )
+            output_tensor = torch.empty(
+                output_shape,
+                dtype=self._output_torch_dtype,
+                device=f"cuda:{self._device_id}",
+            )
+            self._context.set_tensor_address(
+                self._input_name, input_tensor.data_ptr()
+            )
+            self._context.set_tensor_address(
+                self._output_name, output_tensor.data_ptr()
+            )
+            if not self._context.execute_async_v3(self._stream.cuda_stream):
+                raise RuntimeError("TensorRT OCR execution failed")
+            self._stream.synchronize()
+            return output_tensor.cpu().numpy()
+
+    def close(self) -> None:
+        self._context = None
+        self._engine = None
+        self._runtime = None
+        self._stream = None
+
+
+def _trt_dtype_to_numpy(trt_module, dtype):
+    """Keep TensorRT's deprecated nptype warning isolated in one helper."""
+    import numpy as np
+
+    return np.dtype(trt_module.nptype(dtype))
+
+
 class _MNNPipeline:
     def __init__(self, root: Path, *, num_threads: int, max_side_len: int,
                  rec_min_score: float = DEFAULT_REC_MIN_SCORE,
@@ -362,6 +543,68 @@ class _MNNPipeline:
         self._rec.close()
 
 
+class _TensorRTPipeline(_MNNPipeline):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        device_id: int,
+        max_side_len: int,
+        rec_min_score: float = DEFAULT_REC_MIN_SCORE,
+        enable_preprocess: bool = True,
+        det_thresh: float = DEFAULT_DET_THRESH,
+        det_box_thresh: float = DEFAULT_DET_BOX_THRESH,
+        det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO,
+    ):
+        from rapidocr.ch_ppocr_det.utils import DBPostProcess
+        from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
+        from rapidocr.utils.process_img import get_rotate_crop_image
+
+        self._det = _TensorRTModelSession(
+            root / "det.engine",
+            device_id=device_id,
+            mean=_OCR_MEAN,
+            normal=_OCR_NORMAL,
+        )
+        try:
+            self._rec = _TensorRTModelSession(
+                root / "rec.engine",
+                device_id=device_id,
+                mean=_OCR_MEAN,
+                normal=_OCR_NORMAL,
+            )
+        except Exception:
+            self._det.close()
+            raise
+        self._det_postprocess = DBPostProcess(
+            thresh=float(det_thresh),
+            box_thresh=float(det_box_thresh),
+            max_candidates=1000,
+            unclip_ratio=float(det_unclip_ratio),
+            use_dilation=True,
+            score_mode="fast",
+        )
+        self._rec_decode = CTCLabelDecode(character_path=root / "keys.txt")
+        self._crop = get_rotate_crop_image
+        self._rec_min_score = float(rec_min_score)
+        self._enable_preprocess = bool(enable_preprocess)
+        self._max_side_len = max(32, int(max_side_len))
+
+    def warm_up(self) -> None:
+        import numpy as np
+
+        det_shape = self._det.optimization_shape
+        rec_shape = self._rec.optimization_shape
+        self._det.run_uint8(
+            np.zeros((det_shape[2], det_shape[3], 3), dtype=np.uint8),
+            det_shape,
+        )
+        self._rec.run_uint8(
+            np.zeros((rec_shape[2], rec_shape[3], 3), dtype=np.uint8),
+            rec_shape,
+        )
+
+
 class RapidOCRAdapter:
     def __init__(
         self,
@@ -385,15 +628,21 @@ class RapidOCRAdapter:
         root = Path(model_dir)
         backend = str(backend).strip().lower()
         fallback_backend = str(fallback_backend).strip().lower()
-        if backend not in ("mnn", "onnxruntime"):
-            raise ValueError("OCR backend must be 'mnn' or 'onnxruntime'")
-        if fallback_backend not in ("", "onnxruntime"):
-            raise ValueError("OCR fallback_backend must be empty or 'onnxruntime'")
+        if backend not in ("mnn", "onnxruntime", "tensorrt"):
+            raise ValueError(
+                "OCR backend must be 'mnn', 'onnxruntime', or 'tensorrt'"
+            )
+        if fallback_backend not in ("", "mnn", "onnxruntime"):
+            raise ValueError(
+                "OCR fallback_backend must be empty, 'mnn', or 'onnxruntime'"
+            )
 
         device = str(device).strip().lower()
         if device not in ("cpu", "cuda"):
             raise ValueError("OCR device must be 'cpu' or 'cuda'")
         use_cuda = device == "cuda"
+        if backend == "tensorrt" and not use_cuda:
+            raise ValueError("OCR TensorRT backend requires device='cuda'")
         if backend == "onnxruntime" and use_cuda:
             import onnxruntime as ort
 
@@ -420,39 +669,73 @@ class RapidOCRAdapter:
 
         self._pipeline = None
         self._backend_name = backend
-        if backend == "mnn":
-            try:
-                missing = [
-                    name for name in MNN_MODEL_FILES
-                    if not (root / name).is_file()
-                ]
-                if missing:
-                    raise FileNotFoundError(
-                        f"OCR MNN model files missing: {', '.join(missing)}"
-                    )
-                if use_angle_cls:
-                    raise ValueError("OCR MNN backend does not load angle classifier")
-                self._pipeline = _MNNPipeline(
-                    root,
-                    num_threads=num_threads,
-                    max_side_len=max_side_len,
-                    rec_min_score=rec_min_score,
-                    enable_preprocess=enable_preprocess,
-                    det_thresh=det_thresh,
-                    det_box_thresh=det_box_thresh,
-                    det_unclip_ratio=det_unclip_ratio,
+
+        def load_native_pipeline(selected_backend: str, selected_root: Path):
+            if selected_backend == "mnn":
+                required_files = MNN_MODEL_FILES
+                pipeline_type = _MNNPipeline
+                pipeline_kwargs = {"num_threads": num_threads}
+                classifier_error = "OCR MNN backend does not load angle classifier"
+            elif selected_backend == "tensorrt":
+                required_files = TENSORRT_MODEL_FILES
+                pipeline_type = _TensorRTPipeline
+                pipeline_kwargs = {"device_id": device_id}
+                classifier_error = (
+                    "OCR TensorRT backend does not load angle classifier"
                 )
-                self._pipeline.warm_up()
+            else:
+                raise ValueError(
+                    f"unsupported native OCR backend: {selected_backend}"
+                )
+
+            missing = [
+                name for name in required_files
+                if not (selected_root / name).is_file()
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    f"OCR {selected_backend} model files missing: "
+                    f"{', '.join(missing)}"
+                )
+            if use_angle_cls:
+                raise ValueError(classifier_error)
+            return pipeline_type(
+                selected_root,
+                **pipeline_kwargs,
+                max_side_len=max_side_len,
+                rec_min_score=rec_min_score,
+                enable_preprocess=enable_preprocess,
+                det_thresh=det_thresh,
+                det_box_thresh=det_box_thresh,
+                det_unclip_ratio=det_unclip_ratio,
+            )
+
+        def start_native_pipeline(selected_backend: str, selected_root: Path):
+            pipeline = load_native_pipeline(selected_backend, selected_root)
+            try:
+                pipeline.warm_up()
+            except Exception:
+                pipeline.close()
+                raise
+            return pipeline
+
+        if backend in ("mnn", "tensorrt"):
+            try:
+                self._pipeline = start_native_pipeline(backend, root)
                 self._engine = None
                 return
             except Exception:
                 if self._pipeline is not None:
                     self._pipeline.close()
                     self._pipeline = None
-                if fallback_backend != "onnxruntime" or not fallback_model_dir:
+                if not fallback_backend or not fallback_model_dir:
                     raise
                 root = Path(fallback_model_dir)
-                self._backend_name = "onnxruntime"
+                self._backend_name = fallback_backend
+                if fallback_backend == "mnn":
+                    self._pipeline = start_native_pipeline("mnn", root)
+                    self._engine = None
+                    return
 
         missing = [
             name for name in ORT_MODEL_FILES if not (root / name).is_file()

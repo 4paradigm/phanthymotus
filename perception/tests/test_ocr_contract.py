@@ -99,6 +99,14 @@ class OCRContractTest(unittest.TestCase):
             ["rapidocr", "openai", "qwen", "tesseract"],
         )
         properties = tool["configSchema"]["properties"]
+        self.assertEqual(
+            properties["backend"]["enum"],
+            ["mnn", "onnxruntime", "tensorrt"],
+        )
+        self.assertEqual(
+            properties["fallback_backend"]["enum"],
+            ["", "mnn", "onnxruntime"],
+        )
         self.assertEqual(properties["max_side_len"]["default"], 1600)
         self.assertEqual(properties["det_unclip_ratio"]["default"], 0.7)
         self.assertEqual(properties["rec_min_score"]["default"], 0.9)
@@ -370,6 +378,228 @@ class OCRContractTest(unittest.TestCase):
         )
         pipeline.return_value.warm_up.assert_called_once_with()
         self.assertEqual(adapter._backend_name, "mnn")
+
+    def test_tensorrt_adapter_loads_external_engines(self):
+        with tempfile.TemporaryDirectory() as model_tmp:
+            root = Path(model_tmp)
+            for filename in ("det.engine", "rec.engine", "keys.txt"):
+                (root / filename).write_bytes(b"model")
+
+            with mock.patch(
+                "plugins.ocr_runtime._TensorRTPipeline"
+            ) as pipeline:
+                adapter = self.ocr_runtime.RapidOCRAdapter(
+                    str(root),
+                    backend="tensorrt",
+                    device="cuda",
+                    device_id=0,
+                    use_angle_cls=False,
+                )
+
+        pipeline.assert_called_once_with(
+            root,
+            device_id=0,
+            max_side_len=1600,
+            rec_min_score=0.9,
+            enable_preprocess=True,
+            det_thresh=0.3,
+            det_box_thresh=0.5,
+            det_unclip_ratio=0.7,
+        )
+        pipeline.return_value.warm_up.assert_called_once_with()
+        self.assertEqual(adapter._backend_name, "tensorrt")
+
+    def test_tensorrt_adapter_falls_back_to_mnn(self):
+        with tempfile.TemporaryDirectory() as primary_tmp, \
+                tempfile.TemporaryDirectory() as fallback_tmp:
+            primary = Path(primary_tmp)
+            fallback = Path(fallback_tmp)
+            for filename in ("det.engine", "rec.engine", "keys.txt"):
+                (primary / filename).write_bytes(b"model")
+            for filename in ("det.mnn", "rec.mnn", "keys.txt"):
+                (fallback / filename).write_bytes(b"model")
+
+            with mock.patch(
+                "plugins.ocr_runtime._TensorRTPipeline",
+                side_effect=RuntimeError("engine rejected"),
+            ), mock.patch("plugins.ocr_runtime._MNNPipeline") as mnn:
+                adapter = self.ocr_runtime.RapidOCRAdapter(
+                    str(primary),
+                    backend="tensorrt",
+                    fallback_backend="mnn",
+                    fallback_model_dir=str(fallback),
+                    device="cuda",
+                    use_angle_cls=False,
+                    num_threads=1,
+                )
+
+        mnn.assert_called_once_with(
+            fallback,
+            num_threads=1,
+            max_side_len=1600,
+            rec_min_score=0.9,
+            enable_preprocess=True,
+            det_thresh=0.3,
+            det_box_thresh=0.5,
+            det_unclip_ratio=0.7,
+        )
+        mnn.return_value.warm_up.assert_called_once_with()
+        self.assertEqual(adapter._backend_name, "mnn")
+
+    def test_tensorrt_adapter_requires_cuda_and_disables_classifier(self):
+        with self.assertRaisesRegex(ValueError, "requires device='cuda'"):
+            self.ocr_runtime.RapidOCRAdapter(
+                "/models/ocr/trt", backend="tensorrt", device="cpu"
+            )
+
+        with tempfile.TemporaryDirectory() as model_tmp:
+            root = Path(model_tmp)
+            for filename in ("det.engine", "rec.engine", "keys.txt"):
+                (root / filename).write_bytes(b"model")
+            with self.assertRaisesRegex(ValueError, "angle classifier"):
+                self.ocr_runtime.RapidOCRAdapter(
+                    str(root), backend="tensorrt", device="cuda"
+                )
+
+    def test_tensorrt_session_executes_supported_dynamic_shape(self):
+        import contextlib
+        import numpy as np
+
+        state = types.SimpleNamespace(shape=None, addresses={}, executed=False)
+
+        class FakeTensor:
+            def __init__(self, value):
+                self.value = np.asarray(value)
+                self.dtype = "float32"
+
+            def to(self, **_kwargs):
+                return self
+
+            def data_ptr(self):
+                return id(self.value)
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return self.value
+
+        class FakeStream:
+            cuda_stream = 123
+
+            @staticmethod
+            def synchronize():
+                state.synchronized = True
+
+        class FakeContext:
+            @staticmethod
+            def set_input_shape(_name, shape):
+                state.shape = shape
+                return True
+
+            @staticmethod
+            def get_tensor_shape(_name):
+                return (1, 1, 32, 32)
+
+            @staticmethod
+            def set_tensor_address(name, address):
+                state.addresses[name] = address
+
+            @staticmethod
+            def execute_async_v3(stream):
+                state.executed = stream == 123
+                return True
+
+        class FakeEngine:
+            num_io_tensors = 2
+            num_optimization_profiles = 1
+
+            @staticmethod
+            def create_execution_context():
+                return FakeContext()
+
+            @staticmethod
+            def get_tensor_name(index):
+                return ("x", "y")[index]
+
+            @staticmethod
+            def get_tensor_mode(name):
+                return "input" if name == "x" else "output"
+
+            @staticmethod
+            def get_tensor_shape(_name):
+                return (-1, 3, -1, -1)
+
+            @staticmethod
+            def get_tensor_profile_shape(_name, _index):
+                return (
+                    (1, 3, 32, 32),
+                    (1, 3, 64, 64),
+                    (1, 3, 128, 128),
+                )
+
+            @staticmethod
+            def get_tensor_dtype(_name):
+                return "float32"
+
+        class FakeRuntime:
+            def __init__(self, _logger):
+                pass
+
+            @staticmethod
+            def deserialize_cuda_engine(_data):
+                return FakeEngine()
+
+        trt = types.ModuleType("tensorrt")
+        trt.Logger = type("Logger", (), {
+            "WARNING": 1,
+            "__init__": lambda self, _level: None,
+        })
+        trt.Runtime = FakeRuntime
+        trt.TensorIOMode = types.SimpleNamespace(
+            INPUT="input", OUTPUT="output"
+        )
+        trt.nptype = lambda _dtype: np.float32
+
+        torch = types.ModuleType("torch")
+        torch.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            device=lambda _device: contextlib.nullcontext(),
+            Stream=lambda **_kwargs: FakeStream(),
+            stream=lambda _stream: contextlib.nullcontext(),
+        )
+        torch.from_numpy = lambda value: FakeTensor(value)
+        torch.empty = lambda shape, **_kwargs: FakeTensor(
+            np.zeros(shape, dtype=np.float32)
+        )
+
+        with tempfile.TemporaryDirectory() as model_tmp:
+            engine_path = Path(model_tmp) / "det.engine"
+            engine_path.write_bytes(b"engine")
+            with mock.patch.dict(
+                sys.modules, {"tensorrt": trt, "torch": torch}
+            ):
+                session = self.ocr_runtime._TensorRTModelSession(
+                    engine_path,
+                    device_id=0,
+                    mean=(127.5, 127.5, 127.5),
+                    normal=(1 / 127.5, 1 / 127.5, 1 / 127.5),
+                )
+                output = session.run_uint8(
+                    np.zeros((32, 32, 3), dtype=np.uint8),
+                    (1, 3, 32, 32),
+                )
+                with self.assertRaisesRegex(ValueError, "outside profiles"):
+                    session.run_uint8(
+                        np.zeros((160, 160, 3), dtype=np.uint8),
+                        (1, 3, 160, 160),
+                    )
+
+        self.assertEqual(state.shape, (1, 3, 32, 32))
+        self.assertEqual(set(state.addresses), {"x", "y"})
+        self.assertTrue(state.executed)
+        self.assertTrue(state.synchronized)
+        self.assertEqual(output.shape, (1, 1, 32, 32))
 
     def test_mnn_pipeline_closes_detector_when_recognizer_load_fails(self):
         det_session = mock.Mock()
