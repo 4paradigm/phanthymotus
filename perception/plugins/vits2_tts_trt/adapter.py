@@ -22,9 +22,8 @@ MODEL_CONFIG = os.getenv("MIX_VITS_CONFIG_PATH", "/models/vits2-mix/config.json"
 ENGINE_DIR = os.getenv("MIX_VITS_TRT_ENGINE_DIR", "/models/vits2-mix/engines")
 WARMUP_CASES = (
     "你好，语音服务已经准备好了。",
-    "她正在准备IELTS考试，晚上会用FaceTime练习英语。",
-    "重庆银行的员工重新核对了一百二十八份文件。",
-    "Lucy喝完coffee后检查PPT，David同时记录GPS数据。" * 4,
+    "晚上会用FaceTime练习英语。",
+    "Lucy喝完coffee后检查PPT，David同时记录GPS数据。"
 )
 log = logging.getLogger(__name__)
 

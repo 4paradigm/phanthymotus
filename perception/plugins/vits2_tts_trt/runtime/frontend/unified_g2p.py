@@ -1,21 +1,17 @@
 """
 Unified ZH/EN mixed grapheme-to-phoneme converter.
 
-No jieba, no langdetect. Uses pypinyin on the full text for tone-sandhi-aware
-conversion, with simpleseg for segment alignment.
+Chinese runs use the native Chinese frontend (jieba, release dictionaries and
+ToneSandhi); English runs use the release-controlled English frontend.
 
 Design decisions:
-  1. lazy_pinyin on the *whole* text with tone_sandhi=True handles 变调/轻声
-     correctly in context (e.g. 一 + 4th tone → tone-2 sandhi).
-  2. pypinyin.seg.simpleseg keeps EN words as units ("CEO" stays "CEO"), so
-     CJK and EN positions stay aligned after _flatten_seg.
-  3. When lazy_pinyin can't convert a position it returns the raw string
-     unchanged; p == s and re.match(alpha) is our EN-word gate.
-  4. Consecutive alpha positions are concatenated into one word before the
-     CMU-dict / g2p_en lookup (handles letter-by-letter splits of abbreviations).
-  5. English phonemes use refine_ph() + post_replace_ph() from english.py so
+  1. Contiguous CJK runs follow the same native path as pure Chinese text, so
+     light tones and connected-speech tone sandhi remain consistent.
+  2. English words and explicitly spaced letters remain separate tokens.
+  3. Explicit whitespace remains a zero-phone boundary.
+  4. English phonemes use refine_ph() + post_replace_ph() from english.py so
      the output symbols match en_symbols in symbols.py (lowercase ARPAbet).
-  6. Punctuation in the else branch is remapped by the caller via
+  5. Punctuation is remapped by the caller via
      english.replace_punctuation *before* this function is called, so
      only ASCII punctuation survives here (in the `punctuation` set).
 
@@ -30,9 +26,6 @@ import os
 import re
 
 from g2p_en import G2p
-from pypinyin import lazy_pinyin, Style
-from pypinyin.seg.simpleseg import seg
-
 from .symbols import punctuation
 from .english import eng_dict, refine_ph, post_replace_ph, arpa
 
@@ -60,6 +53,10 @@ _INITIALS = [
 _PUNCT_SET = set(punctuation)
 _EN_TOKEN_RE = re.compile(r"[A-Za-z0-9'-]+")
 _NON_ZH_PIECE_RE = re.compile(r"[A-Za-z0-9'-]+|[^\w\s]", re.UNICODE)
+_MIX_TOKEN_RE = re.compile(
+    r"[\u4e00-\u9fff]+|[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*|\s+|.",
+    re.DOTALL,
+)
 _LETTER_SPELLED_UNITS = {"KB", "MB", "GB", "TB", "PB", "KBPS", "MBPS", "GBPS"}
 # Deterministic pronunciations missing from the stock CMU dictionary. Keep this
 # tiny and release-controlled: training/export and deployed runtime must match.
@@ -224,104 +221,53 @@ def unified_g2p(text: str):
         langs   : List[str]  'ZH' or 'EN' per phone position
         word2ph : List[int]  phones-per-input-position (sums to len(phones))
 
-    Raises:
-        ValueError: if pypinyin and simpleseg produce misaligned lengths.
     """
-    # Preserve full-sentence context for tone sandhi.
-    pinyins = lazy_pinyin(
-        text,
-        style=Style.TONE3,
-        neutral_tone_with_five=True,
-        tone_sandhi=True,
-    )
-
-    # Align pinyin output with mixed-language segments.
-    segments = _flatten_seg(list(seg(text)))
-
-    if len(pinyins) != len(segments):
-        raise ValueError(
-            f"pinyin/seg length mismatch: {len(pinyins)} vs {len(segments)}\n"
-            f"  text     = {text!r}\n"
-            f"  pinyins  = {pinyins}\n"
-            f"  segments = {segments}"
-        )
-
     phones: list = []
     tones: list = []
     langs: list = []
     word2ph: list = []
 
-    i = 0
-    while i < len(pinyins):
-        p = pinyins[i]
-        s = segments[i]
+    # Import lazily to avoid the cleaner -> unified_g2p -> chinese cycle.
+    from . import chinese
 
-        # A trailing tone digit identifies a Chinese syllable.
-        if p and p[-1] in "12345":
-            ph_list, tone = _zh_pinyin_to_phones(p)
+    for match in _MIX_TOKEN_RE.finditer(text):
+        token = match.group(0)
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            ph_list, tone_list, zh_word2ph = chinese.g2p(token)
+            ph_list, tone_list = ph_list[1:-1], tone_list[1:-1]
+            zh_word2ph = zh_word2ph[1:-1]
             if ph_list:
                 phones.extend(ph_list)
-                tones.extend([tone] * len(ph_list))
+                tones.extend(tone_list)
                 langs.extend(["ZH"] * len(ph_list))
-                word2ph.append(len(ph_list))
-            else:
-                # Preserve position alignment when a pinyin is unsupported.
-                word2ph.append(0)
-            i += 1
-
-        # Unchanged alphanumeric segments are handled by the English frontend.
-        elif p == s and re.match(r"^[A-Za-z0-9'-]+$", p):
-            # Collect consecutive alpha/alphanumeric positions into one word.
-            # This handles letter-by-letter splits of abbreviations:
-            #   "CEO" may appear as ["C","E","O"] in pinyins/segments.
-            j = i + 1
-            while (
-                j < len(pinyins)
-                and pinyins[j] == segments[j]
-                and re.match(r"^[A-Za-z0-9'-]+$", pinyins[j])
-            ):
-                j += 1
-
-            word = "".join(segments[i:j])
-            ph_list, tone_list = _en_token_to_phones(word)
-
-            if ph_list:
-                phones.extend(ph_list)
-                tones.extend(tone_list)
-                langs.extend(["EN"] * len(ph_list))
-
-            # Assign the phone count to the final position of a merged token.
-            word2ph.extend([0] * (j - i - 1))
+            word2ph.extend(zh_word2ph)
+        elif _EN_TOKEN_RE.fullmatch(token):
+            ph_list, tone_list = _en_token_to_phones(token)
+            phones.extend(ph_list)
+            tones.extend(tone_list)
+            langs.extend(["EN"] * len(ph_list))
             word2ph.append(len(ph_list))
-            i = j
-
-        elif p == s:
-            ph_list, tone_list, lang_list = _non_zh_token_to_phones(p)
-            if ph_list:
-                phones.extend(ph_list)
-                tones.extend(tone_list)
-                langs.extend(lang_list)
-            word2ph.append(len(ph_list))
-            i += 1
-
-        # Preserve supported punctuation and alignment for other symbols.
+        elif token.isspace():
+            # Preserve explicit token boundaries.
+            word2ph.append(0)
+        elif token in _PUNCT_SET:
+            phones.append(token)
+            tones.append(0)
+            langs.append("ZH")
+            word2ph.append(1)
         else:
-            if p and p[0] in _PUNCT_SET:
-                phones.append(p[0])
-                tones.append(0)
-                langs.append("ZH")
-                word2ph.append(1)
-            else:
-                word2ph.append(0)
-            i += 1
+            ph_list, tone_list, lang_list = _non_zh_token_to_phones(token)
+            phones.extend(ph_list)
+            tones.extend(tone_list)
+            langs.extend(lang_list)
+            word2ph.append(len(ph_list))
 
-    # Match the silence-token convention used by the Chinese frontend.
+    # Match the silence-token convention used by the native Chinese frontend.
     phones = ["_"] + phones + ["_"]
     tones = [0] + tones + [0]
     langs = ["ZH"] + langs + ["ZH"]
     word2ph = [1] + word2ph + [1]
 
-    # Validate phone-level and source-position alignment.
     assert len(phones) == len(tones) == len(langs), (
         f"Internal length mismatch: phones={len(phones)} tones={len(tones)} langs={len(langs)}"
     )
