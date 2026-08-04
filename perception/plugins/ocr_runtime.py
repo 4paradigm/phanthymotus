@@ -1418,7 +1418,7 @@ class RapidOCRAdapter:
             {
                 "engine_type": "onnxruntime",
                 "lang_type": "ch",
-                "model_type": "tiny",
+                "model_type": "small",
                 "ocr_version": "PP-OCRv6",
                 "model_path": str(root / "det.onnx"),
                 # 必须显式转发：rapidocr 默认 unclip_ratio=1.6/thresh/box_thresh
@@ -1441,7 +1441,7 @@ class RapidOCRAdapter:
             {
                 "engine_type": "onnxruntime",
                 "lang_type": "ch",
-                "model_type": "tiny",
+                "model_type": "small",
                 "ocr_version": "PP-OCRv6",
                 "model_path": str(root / "rec.onnx"),
                 "rec_keys_path": str(root / "keys.txt"),

@@ -33,4 +33,3 @@ jobs:
           perception/plugins/ocr_tiled_strategy.py
           perception/utils/ocr_model_downloader.py
           perception/tools/build_ocr_tensorrt_engines.py
-          tools/prepare_ocr_model_bundle.py
