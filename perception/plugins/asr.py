@@ -1573,10 +1573,23 @@ class ASRPlugin:
                     "asr_model": self._asr_model,
                     "message": f"Switching ASR to mode '{self._mode}'...",
                 }
-            # Stop all nodes (they keep publisher/DDS state; next start
-            # syncs the new config into them via the start path's reuse branch)
-            for node in self._nodes.values():
+            # Hot-reload (upstream c72134b): stop running nodes, sync new config,
+            # restart automatically. Publisher/DDS state preserved via stop/start cycle.
+            was_running = [node for node in self._nodes.values() if node.state == "running"]
+            for node in was_running:
                 node.stop()
+            for node in was_running:
+                node._adapter = self._adapter
+                node._language = self._language
+                node._vad_backend = self._vad_backend
+                node._vad_threshold = self._vad_threshold
+                node._vad_silence_ms = self._vad_silence_ms
+                node._vad_pre_roll_ms = self._vad_pre_roll_ms
+                node._vad_model_dir = self._vad_model_dir
+                node._kws_cfg = self._kws_cfg
+                node._save_vad_segments = self._save_vad_segments
+                node._max_saved_segments = self._max_saved_segments
+                node.start()
             return {
                 "status": "configured",
                 "mode": self._mode,
