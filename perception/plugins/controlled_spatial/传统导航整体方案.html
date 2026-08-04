@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>controlled_spatial Perception 卡片 · G1 传统导航整体方案</title>
+  <style>
+    :root {
+      --ink: #14212b;
+      --muted: #5d6b75;
+      --line: #d9e1e5;
+      --paper: #f4f7f6;
+      --card: #ffffff;
+      --navy: #16384a;
+      --teal: #0c7b74;
+      --teal-soft: #dff3ef;
+      --blue-soft: #e7f0f7;
+      --amber: #b86612;
+      --amber-soft: #fff0d9;
+      --red: #a23c3c;
+      --red-soft: #fae8e6;
+      --shadow: 0 12px 36px rgba(20, 33, 43, 0.08);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: radial-gradient(circle at 12% 0%, rgba(12,123,116,.10), transparent 28rem), var(--paper);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.72;
+    }
+    code, pre { font-family: "SFMono-Regular", Consolas, monospace; }
+    code { padding: .12rem .34rem; border-radius: 5px; background: #edf2f3; color: #174a58; font-size: .92em; }
+    pre { overflow-x: auto; padding: 1rem 1.15rem; border-radius: 12px; background: #102d3a; color: #edf7f6; line-height: 1.55; }
+    pre code { padding: 0; background: transparent; color: inherit; }
+    .layout { display: grid; grid-template-columns: 248px minmax(0,1fr); min-height: 100vh; }
+    aside { position: sticky; top: 0; height: 100vh; padding: 1.7rem 1.25rem; color: #d9e9ed; background: var(--navy); overflow-y: auto; }
+    .brand { margin-bottom: 1.4rem; padding-bottom: 1.2rem; border-bottom: 1px solid rgba(255,255,255,.14); }
+    .brand small { display: block; color: #79d0c7; font-size: .72rem; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    .brand strong { color: #fff; font-size: 1.05rem; }
+    nav a { display: block; margin: .15rem 0; padding: .48rem .65rem; border-left: 2px solid transparent; color: #c5d8de; text-decoration: none; font-size: .86rem; }
+    nav a:hover, nav a:focus { border-left-color: #79d0c7; background: rgba(255,255,255,.08); color: #fff; }
+    .aside-note { margin-top: 1.4rem; padding: .8rem; border: 1px solid rgba(255,255,255,.14); border-radius: 10px; color: #bcd0d6; font-size: .76rem; }
+    main { width: min(1180px, calc(100% - 3rem)); margin: 0 auto; padding: 2.4rem 0 5rem; }
+    section { scroll-margin-top: 1.5rem; }
+    .hero { padding: clamp(2rem,5vw,4.5rem); border-radius: 24px; color: #fff; background: linear-gradient(135deg,#15394b,#0c716d 72%,#0b8679); box-shadow: var(--shadow); }
+    .eyebrow { margin: 0 0 .5rem; color: #a8e2dc; font-size: .78rem; font-weight: 800; letter-spacing: .15em; text-transform: uppercase; }
+    h1 { max-width: 880px; margin: 0; font-size: clamp(2rem,5vw,3.55rem); line-height: 1.15; letter-spacing: -.035em; }
+    .lede { max-width: 850px; margin: 1.2rem 0 0; color: #e4f4f3; font-size: 1.05rem; }
+    .chips { display: flex; flex-wrap: wrap; gap: .55rem; margin-top: 1.5rem; }
+    .chip { padding: .36rem .7rem; border: 1px solid rgba(255,255,255,.24); border-radius: 999px; background: rgba(255,255,255,.10); font-size: .79rem; font-weight: 650; }
+    h2 { margin: 3.7rem 0 1.15rem; color: var(--navy); font-size: clamp(1.5rem,3vw,2.1rem); line-height: 1.25; }
+    h3 { margin: 1.7rem 0 .65rem; color: #204d5c; }
+    .num { display: inline-grid; place-items: center; width: 2rem; height: 2rem; margin-right: .5rem; border-radius: 50%; color: #fff; background: var(--teal); font-size: .9rem; vertical-align: .14rem; }
+    .subtle { color: var(--muted); }
+    .grid { display: grid; gap: 1rem; }
+    .grid.two { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .grid.three { grid-template-columns: repeat(3,minmax(0,1fr)); }
+    .grid.four { grid-template-columns: repeat(4,minmax(0,1fr)); }
+    .card { padding: 1.15rem 1.2rem; border: 1px solid var(--line); border-radius: 16px; background: var(--card); box-shadow: 0 5px 18px rgba(20,33,43,.04); }
+    .card h3 { margin-top: 0; font-size: 1rem; }
+    .callout { margin: 1.2rem 0; padding: 1rem 1.15rem; border-left: 4px solid var(--teal); border-radius: 0 12px 12px 0; background: var(--teal-soft); }
+    .callout.warning { border-color: var(--amber); background: var(--amber-soft); }
+    .callout.danger { border-color: var(--red); background: var(--red-soft); }
+    .diagram { overflow-x: auto; padding: 1rem; border: 1px solid var(--line); border-radius: 16px; background: #fff; box-shadow: var(--shadow); }
+    .diagram svg { display: block; min-width: 980px; width: 100%; height: auto; }
+    .diagram .node { fill:#fff; stroke:#9eb1ba; stroke-width:1.5; }
+    .diagram .perception { fill:#e7f0f7; stroke:#4e7b91; }
+    .diagram .driver { fill:#dff3ef; stroke:#338d84; }
+    .diagram .algo { fill:#fff0d9; stroke:#c17b31; }
+    .diagram .safe { fill:#fae8e6; stroke:#b55b58; }
+    .diagram .title { font-size:15px; font-weight:700; fill:#18313e; }
+    .diagram .meta { font-size:11px; fill:#59717d; }
+    .diagram .edge { fill:none; stroke:#55717c; stroke-width:2; marker-end:url(#arrow); }
+    .diagram .edge.dashed { stroke-dasharray:6 5; }
+    .diagram .label { font-size:11px; fill:#48626c; }
+    .table-wrap { overflow-x:auto; margin:1rem 0; border:1px solid var(--line); border-radius:13px; background:#fff; }
+    table { width:100%; border-collapse:collapse; min-width:720px; }
+    th,td { padding:.78rem .86rem; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; font-size:.87rem; }
+    th { color:#34505e; background:#edf3f4; font-size:.77rem; white-space:nowrap; }
+    tbody tr:last-child td { border-bottom:0; }
+    .steps { counter-reset:step; display:grid; gap:.8rem; }
+    .step { position:relative; padding:1rem 1rem 1rem 3.8rem; border:1px solid var(--line); border-radius:13px; background:#fff; }
+    .step::before { counter-increment:step; content:counter(step); position:absolute; left:1rem; top:.92rem; display:grid; place-items:center; width:2rem; height:2rem; border-radius:50%; color:#fff; background:var(--teal); font-weight:800; }
+    .phase-grid { display:grid; grid-template-columns:repeat(6,minmax(130px,1fr)); gap:.65rem; overflow-x:auto; }
+    .phase { min-width:130px; padding:.9rem; border-top:4px solid var(--teal); border-radius:9px; background:#fff; box-shadow:0 5px 16px rgba(20,33,43,.05); }
+    .phase.pending { border-top-color:var(--amber); }
+    .phase strong,.phase small { display:block; }
+    .phase small { margin-top:.4rem; color:var(--muted); }
+    footer { margin-top:4rem; padding-top:1.2rem; border-top:1px solid var(--line); color:var(--muted); font-size:.82rem; }
+    @media (max-width:980px) { .layout{display:block} aside{position:relative;height:auto;padding:1rem 1.2rem} nav,.aside-note{display:none} main{width:min(100% - 1.5rem,900px);padding-top:.75rem}.grid.four,.grid.three{grid-template-columns:repeat(2,minmax(0,1fr))} }
+    @media (max-width:650px) { .grid.two,.grid.three,.grid.four{grid-template-columns:1fr}.hero{border-radius:16px} }
+    @media print { body{background:#fff}.layout{display:block}aside{display:none}main{width:100%;padding:0}.hero,.card,.diagram,.phase{box-shadow:none;print-color-adjust:exact;-webkit-print-color-adjust:exact}.table-wrap{overflow:visible}table{min-width:0} }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside aria-label="文档导航">
+      <div class="brand"><small>Phanthy Motus · Perception</small><strong>controlled_spatial</strong></div>
+      <nav>
+        <a href="#correction">01 归属纠正</a>
+        <a href="#contract">02 卡片契约</a>
+        <a href="#architecture">03 总体架构</a>
+        <a href="#boundary">04 Perception / Driver 边界</a>
+        <a href="#frames">05 坐标与地图</a>
+        <a href="#planning">06 全局与局部规划</a>
+        <a href="#state">07 状态机</a>
+        <a href="#safety">08 安全执行</a>
+        <a href="#gates">09 阶段门禁</a>
+        <a href="#shanghai">10 上海验证</a>
+        <a href="#migration">11 仓库迁移</a>
+      </nav>
+      <div class="aside-note">逻辑设计基线 · 2026-08-04<br>卡片宿主：Perception Bundle<br>默认：shadow / unarmed</div>
+    </aside>
+
+    <main>
+      <header class="hero">
+        <p class="eyebrow">Perception card architecture</p>
+        <h1>G1 传统导航整体方案</h1>
+        <p class="lede"><code>controlled_spatial</code> 是 Perception 卡片：感知算法与导航状态归 Perception，硬件 topic 与唯一安全执行权归 G1 Driver。</p>
+        <div class="chips">
+          <span class="chip">processor · single instance</span>
+          <span class="chip">14 business actions</span>
+          <span class="chip">PREFIX controlled + tool spatial</span>
+          <span class="chip">Shadow first</span>
+          <span class="chip">G1 真机优先</span>
+        </div>
+      </header>
+
+      <section id="correction">
+        <h2><span class="num">1</span>归属纠正</h2>
+        <div class="grid four">
+          <article class="card"><h3>卡片宿主</h3><p>Perception Bundle 注册并暴露 <code>controlled_spatial</code>，不是 G1 Device Bundle。</p></article>
+          <article class="card"><h3>算法面</h3><p>FAST-LIVO2、地图/重定位、全局规划、EGO 和任务状态属于 perception。</p></article>
+          <article class="card"><h3>硬件面</h3><p>Driver 发布传感器与机身状态，并承载最终 SmartMotion / 高层运动安全门。</p></article>
+          <article class="card"><h3>执行权</h3><p>Perception 只产生 shadow proposal；永远不直接导入 Unitree SDK 或取得运动权限。</p></article>
+        </div>
+        <div class="callout warning"><strong>旧实现的定位：</strong><code>phanthymotus-driver/unitree/g1/controlled_spatial.py</code> 是历史兼容参考，不再是新卡片正本。目标部署不得让 Driver 与 Perception 同时暴露同名工具。</div>
+      </section>
+
+      <section id="contract">
+        <h2><span class="num">2</span>卡片契约与 Perception 路由</h2>
+        <div class="grid two">
+          <article class="card">
+            <h3>对外工具名保持不变</h3>
+            <pre><code>class ControlledSpatialPlugin:
+    PREFIX = "controlled"
+
+    def get_tools(self):
+        return [{
+            "name": "spatial",
+            "type": "processor",
+            "multiInstance": False,
+            ...
+        }]</code></pre>
+            <p>当前 Bundle 组合后对外工具名正好是 <code>controlled_spatial</code>。直接把带下划线的全名设为 PREFIX 会被错误拆分。</p>
+          </article>
+          <article class="card">
+            <h3>业务 schema 严格保持 14 项</h3>
+            <p><code>start_mapping</code>、<code>stop_mapping</code>、tag CRUD、map CRUD/load、两种 navigate、wait、pause/resume/stop。</p>
+            <p>Perception 的 <code>info</code> 等框架生命周期作为内部 adapter 路径处理，不加入用户冻结的业务 action enum；实现前必须用契约测试锁死。</p>
+          </article>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>接口</th><th>Perception 语义</th><th>关键约束</th></tr></thead>
+            <tbody>
+              <tr><td>topic_in</td><td>由画布连接 Driver 的 MID360、IMU、RGB、Depth、机身/关节状态</td><td>不绕过 Driver 直读硬件</td></tr>
+              <tr><td>topic_out</td><td>status、map、global path、local trajectory、cmd_vel_shadow</td><td>输出是算法结果/动作建议，不是物理执行</td></tr>
+              <tr><td>navigate_to_*</td><td>创建 nav_id 后立即返回 navigating</td><td>必须继续调用 wait_navigation_done</td></tr>
+              <tr><td>wait_navigation_done</td><td>等待 arrived / blocked / stalled / canceled / error</td><td>stall_timeout 默认 90 秒且只计算非暂停无进展</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <h2><span class="num">3</span>端到端架构</h2>
+        <p class="subtle">蓝色属于 Perception 控制面，黄色属于 perception 算法 sidecars，绿色属于 Driver 数据面，红色属于唯一物理执行边界。</p>
+        <div class="diagram" role="img" aria-label="controlled_spatial Perception 卡片架构图">
+          <svg viewBox="0 0 1240 650" xmlns="http://www.w3.org/2000/svg">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#55717c"/></marker></defs>
+            <rect class="node perception" x="30" y="35" width="160" height="70" rx="12"/><text class="title" x="110" y="64" text-anchor="middle">Agent Core</text><text class="meta" x="110" y="86" text-anchor="middle">MCP tools/call</text>
+            <rect class="node perception" x="235" y="35" width="180" height="70" rx="12"/><text class="title" x="325" y="64" text-anchor="middle">Perception Bundle</text><text class="meta" x="325" y="86" text-anchor="middle">MCP 15720</text>
+            <rect class="node perception" x="460" y="35" width="205" height="70" rx="12"/><text class="title" x="563" y="64" text-anchor="middle">controlled_spatial</text><text class="meta" x="563" y="86" text-anchor="middle">processor · 14 actions</text>
+            <rect class="node perception" x="710" y="35" width="195" height="70" rx="12"/><text class="title" x="808" y="64" text-anchor="middle">导航编排器</text><text class="meta" x="808" y="86" text-anchor="middle">state · nav_id · cancel</text>
+
+            <rect class="node algo" x="30" y="220" width="170" height="70" rx="12"/><text class="title" x="115" y="249" text-anchor="middle">地图 / POI 仓库</text><text class="meta" x="115" y="271" text-anchor="middle">PCD · occupancy · manifest</text>
+            <rect class="node algo" x="245" y="220" width="170" height="70" rx="12"/><text class="title" x="330" y="249" text-anchor="middle">全局重定位</text><text class="meta" x="330" y="271" text-anchor="middle">scan-to-map · map→odom</text>
+            <rect class="node algo" x="460" y="220" width="170" height="70" rx="12"/><text class="title" x="545" y="249" text-anchor="middle">二维全局引导</text><text class="meta" x="545" y="271" text-anchor="middle">A* / Theta* · subgoal</text>
+            <rect class="node algo" x="675" y="220" width="170" height="70" rx="12"/><text class="title" x="760" y="249" text-anchor="middle">EGO 局部规划</text><text class="meta" x="760" y="271" text-anchor="middle">B-spline · replan</text>
+            <rect class="node algo" x="890" y="220" width="180" height="70" rx="12"/><text class="title" x="980" y="249" text-anchor="middle">ground-controller</text><text class="meta" x="980" y="271" text-anchor="middle">planar · freshness · limits</text>
+
+            <rect class="node driver" x="30" y="415" width="180" height="70" rx="12"/><text class="title" x="120" y="444" text-anchor="middle">G1 Driver sensors</text><text class="meta" x="120" y="466" text-anchor="middle">LiDAR · IMU · RGBD · state</text>
+            <rect class="node driver" x="255" y="415" width="180" height="70" rx="12"/><text class="title" x="345" y="444" text-anchor="middle">硬件适配层</text><text class="meta" x="345" y="466" text-anchor="middle">time · QoS · Rx(π)</text>
+            <rect class="node algo" x="480" y="415" width="180" height="70" rx="12"/><text class="title" x="570" y="444" text-anchor="middle">FAST-LIVO2</text><text class="meta" x="570" y="466" text-anchor="middle">local odom · cloud · PCD</text>
+            <rect class="node safe" x="890" y="415" width="180" height="70" rx="12"/><text class="title" x="980" y="444" text-anchor="middle">Driver 安全执行器</text><text class="meta" x="980" y="466" text-anchor="middle">armed · lease · TTL</text>
+            <rect class="node safe" x="890" y="550" width="180" height="70" rx="12"/><text class="title" x="980" y="579" text-anchor="middle">主运控 / G1</text><text class="meta" x="980" y="601" text-anchor="middle">遥控急停优先</text>
+
+            <path class="edge" d="M190 70H235"/><path class="edge" d="M415 70H460"/><path class="edge" d="M665 70H710"/>
+            <path class="edge dashed" d="M808 105V165H115V220"/><path class="edge dashed" d="M808 105V220"/>
+            <path class="edge" d="M200 255H245"/><path class="edge" d="M415 255H460"/><path class="edge" d="M630 255H675"/><path class="edge" d="M845 255H890"/>
+            <path class="edge" d="M210 450H255"/><path class="edge" d="M435 450H480"/><path class="edge" d="M570 415V350H330V290"/>
+            <path class="edge" d="M330 290V345H760V290"/><text class="label" x="510" y="337">map-frame odom / cloud</text>
+            <path class="edge dashed" d="M1070 255H1130V450H1070"/><text class="label" x="1080" y="342">cmd_vel_shadow</text>
+            <path class="edge" d="M980 485V550"/>
+          </svg>
+        </div>
+      </section>
+
+      <section id="boundary">
+        <h2><span class="num">4</span>Perception / Driver 硬边界</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>能力</th><th>Perception card</th><th>G1 Driver</th></tr></thead>
+          <tbody>
+            <tr><td>工具注册</td><td>唯一注册 <code>controlled_spatial</code></td><td>不得再注册同名新卡片</td></tr>
+            <tr><td>传感器</td><td>只订阅画布连入的标准 topic</td><td>访问 Unitree DDS / 相机并发布 topic</td></tr>
+            <tr><td>算法</td><td>LIO、地图、重定位、route、EGO、状态机</td><td>只做硬件适配与安全执行</td></tr>
+            <tr><td>动作</td><td>发布 <code>cmd_vel_shadow</code> proposal</td><td>显式 armed 后校验并转成有限时长高层指令</td></tr>
+            <tr><td>失败</td><td>规划/录制失败不得绕过状态机</td><td>失联、过期、急停、租约冲突立即清零</td></tr>
+          </tbody>
+        </table></div>
+        <div class="callout danger"><strong>不允许：</strong>Perception 容器导入 Unitree SDK、直接调用 SmartMotion、relay EGO <code>/position_cmd</code> 到物理话题，或让算法 sidecar 持有运动权限。</div>
+      </section>
+
+      <section id="frames">
+        <h2><span class="num">5</span>坐标、地图与真实重定位</h2>
+        <pre><code>map → odom → base_link → livox_frame</code></pre>
+        <div class="grid two">
+          <article class="card"><h3>TF owner</h3><ul><li>FAST-LIVO2：<code>odom → base_link</code></li><li>重定位器：<code>map → odom</code></li><li>Driver 标定：<code>base_link → livox_frame</code></li></ul></article>
+          <article class="card"><h3>地图包</h3><pre><code>maps/&lt;map_name&gt;/
+├── manifest.json
+├── map.pcd
+├── occupancy.yaml/.pgm
+├── pois.json
+└── calibration/</code></pre></article>
+        </div>
+        <p><code>load_map</code> V1 要求机器人回到建图原点，以 <code>(0,0,0)</code> 为粗初值，但仍必须跑 scan-to-map 精配准并通过 fitness、重叠率和连续帧稳定性门禁。重启 LIO、改 frame 名或写单位变换都不是重定位。</p>
+      </section>
+
+      <section id="planning">
+        <h2><span class="num">6</span>全局引导与 EGO 分工</h2>
+        <div class="grid three">
+          <article class="card"><h3>地图尺度</h3><p>A* / Theta* 在二维占据栅格产生跨房间路线，并按 G1 机体半径膨胀障碍。</p></article>
+          <article class="card"><h3>局部目标</h3><p>路线跟随器选择前方 2–4 米 subgoal，使目标始终位于 EGO 局部地图范围。</p></article>
+          <article class="card"><h3>动态点云</h3><p>EGO 用实时注册点云做局部优化；持续无解或偏航后触发全局路线重算。</p></article>
+        </div>
+        <div class="callout"><strong>障碍策略：</strong><code>mode=1</code> 遇阻进入 BLOCKED 并零速；<code>mode=0</code> 才允许局部绕行与全局重算，N5 验收前必须返回 unsupported。</div>
+      </section>
+
+      <section id="state">
+        <h2><span class="num">7</span>14-action 状态机</h2>
+        <pre><code>IDLE ──start_mapping──► MAPPING ──stop_mapping──► MAP_READY
+  └────────load_map──► LOCALIZING ──quality ok──► READY
+                                                   │
+                                     navigate_to_* ▼
+                           PAUSED ◄──► NAVIGATING ◄──► BLOCKED
+                                         │
+                      arrived / stop / error ──► READY</code></pre>
+        <div class="table-wrap"><table>
+          <thead><tr><th>action 组</th><th>核心语义</th></tr></thead>
+          <tbody>
+            <tr><td>start/stop mapping</td><td><code>.partial</code> 工作目录；产物校验通过后原子发布地图</td></tr>
+            <tr><td>tag/list/delete/load</td><td>POI 使用 map 帧；拒绝删除 in-use 地图；load 必须真实配准</td></tr>
+            <tr><td>navigate_to_tag / pose</td><td>创建 nav_id 后非阻塞返回 navigating</td></tr>
+            <tr><td>wait_navigation_done</td><td>condition/event 收口到达、停滞、阻挡、取消或错误</td></tr>
+            <tr><td>pause/resume/stop</td><td>pause 立即零速且不计 stall；stop 清空 route 与 EGO trajectory</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+
+      <section id="safety">
+        <h2><span class="num">8</span>Shadow 与唯一安全执行权</h2>
+        <div class="grid two">
+          <article class="card"><h3>Perception 输出</h3><ul><li>只发布 map、path、trajectory、diagnostics 和 <code>cmd_vel_shadow</code></li><li>定位、cloud、command 过期时 proposal 清零</li><li>episode 录制 fail-open，但绝不影响动作门禁</li></ul></article>
+          <article class="card"><h3>Driver 执行</h3><ul><li>部署时单独 armed，不由业务 action 开启</li><li>首次现场档不高于 0.2 m/s</li><li>TTL、租约、主运控、急停、姿态与障碍门禁同时满足</li></ul></article>
+        </div>
+      </section>
+
+      <section id="gates">
+        <h2><span class="num">9</span>N1–N6 阶段门禁</h2>
+        <div class="phase-grid">
+          <div class="phase"><strong>N1 契约</strong><small>Perception tool、topic、TF、路由测试</small></div>
+          <div class="phase"><strong>N2 LIO</strong><small>频率、时钟、活性与资源</small></div>
+          <div class="phase pending"><strong>N3 定位</strong><small>地图 load、真实配准、连续 TF</small></div>
+          <div class="phase pending"><strong>N4 EGO</strong><small>route、replan、fault injection、shadow</small></div>
+          <div class="phase pending"><strong>N5 执行</strong><small>0.2 m/s、TTL、停障、急停</small></div>
+          <div class="phase pending"><strong>N6 闭环</strong><small>多 POI、重定位、日志与视频</small></div>
+        </div>
+        <p>北京已有约 20 分钟 N2 阶段证据。按用户决定，后续不等待固定 30 分钟 soak 才推进；更长稳定性测试作为发布质量项。</p>
+      </section>
+
+      <section id="shanghai">
+        <h2><span class="num">10</span>上海 G1 ready 后</h2>
+        <div class="steps">
+          <div class="step"><strong>固定只读检查</strong>：运行本 Perception 卡片目录下的无参数脚本；它委托 Driver 底层 preflight。</div>
+          <div class="step"><strong>LIO 短采样</strong>：检查四路 topic、诊断、资源、外参和 namespace。</div>
+          <div class="step"><strong>人工驾驶建图</strong>：现场 owner 显式启动/停止 mapping；Agent 不代执行机器人写操作。</div>
+          <div class="step"><strong>产物验收</strong>：PCD header、点数、大小与 <code>/tmp/nav_result.json</code> 必须有真实证据。</div>
+          <div class="step"><strong>重启重定位</strong>：有效地图后实现原点粗初值 + scan-to-map 精配准。</div>
+          <div class="step"><strong>先 shadow 后低速</strong>：N3 后验证 EGO proposal；最后单约 0.2 m/s 有人值守窗口。</div>
+        </div>
+        <pre><code>cd perception/plugins/controlled_spatial
+./scripts/shanghai-ready-check.sh</code></pre>
+      </section>
+
+      <section id="migration">
+        <h2><span class="num">11</span>仓库迁移计划</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>步骤</th><th>迁移内容</th><th>验收</th></tr></thead>
+          <tbody>
+            <tr><td>M0（本次）</td><td>设计 HTML、固定只读入口、归属与路由约束进入 Perception repo</td><td>HTML / shell 测试；不改 loader</td></tr>
+            <tr><td>M1</td><td>在 Perception 实现精确 14-action contract 与状态机骨架</td><td>工具名、type、schema、info adapter 单测</td></tr>
+            <tr><td>M2</td><td>迁入 FAST-LIVO2 / mapping / relocalization companion assets</td><td>arm64 build、Compose、N2/N3 回归</td></tr>
+            <tr><td>M3</td><td>接入全局规划、EGO、ground-controller shadow</td><td>ROS 数据面与故障注入</td></tr>
+            <tr><td>M4</td><td>增加 Driver navigation executor，停用旧 Driver 同名卡片</td><td>无重复工具、唯一执行权、回滚</td></tr>
+          </tbody>
+        </table></div>
+        <div class="callout warning"><strong>当前未完成：</strong>Perception plugin、loader、config、算法资产迁移和真机执行。本设计不能被当作卡片已经可部署的证据。</div>
+      </section>
+
+      <footer>正确代码归属：<code>phanthymotus/perception/plugins/controlled_spatial/</code>。Driver 仅保留硬件适配、安全执行和底层验收能力。</footer>
+    </main>
+  </div>
+</body>
+</html>
