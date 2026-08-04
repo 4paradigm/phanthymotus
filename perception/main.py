@@ -272,7 +272,7 @@ def make_handler():
 
 # ── WebSocket ASR server ───────────────────────────────────────────────────────
 
-async def _ws_asr_handler(websocket):
+async def _ws_asr_handler(websocket, asr_cfg: dict | None = None):
     """Handle a /ws/asr WebSocket connection.
 
     Protocol:
@@ -282,6 +282,10 @@ async def _ws_asr_handler(websocket):
       3. Server sends JSON text frames with transcription:
          {"text": "识别结果"}
       4. Client sends text "flush" to force-flush remaining speech
+
+    `asr_cfg` is the deployed config.yaml plugins.asr section; the client frame
+    overrides it per-key, so offline mode falls back to the configured
+    model_path/sherpa_config instead of a stale default path.
     """
     from plugins.asr import VadSession, _build_asr_adapter, _pcm16_to_wav
     import websockets
@@ -289,10 +293,14 @@ async def _ws_asr_handler(websocket):
     # 1. Receive config frame
     try:
         cfg_raw = await websocket.recv()
-        cfg = json.loads(cfg_raw)
+        client_cfg = json.loads(cfg_raw)
     except Exception as e:
         log.warning(f"[ws_asr] invalid config frame: {e}")
         return
+
+    # Client frame wins over deployed config; missing keys (model_path,
+    # sherpa_config, num_threads…) fall back to the plugin's own config.
+    cfg = {**(asr_cfg or {}), **client_cfg}
 
     adapter = _build_asr_adapter(cfg)
     language = cfg.get('language', 'zh-CN')
@@ -341,17 +349,18 @@ async def _ws_asr_handler(websocket):
         log.warning(f"[ws_asr] connection error: {e}")
 
 
-async def _run_ws_server(ws_port: int):
+async def _run_ws_server(ws_port: int, asr_cfg: dict | None = None):
     import websockets
-    async with websockets.serve(_ws_asr_handler, "", ws_port):
+    from functools import partial
+    async with websockets.serve(partial(_ws_asr_handler, asr_cfg=asr_cfg), "", ws_port):
         log.info(f"WebSocket ASR server → ws://0.0.0.0:{ws_port}")
         await asyncio.Future()  # run forever
 
 
-def _start_ws_thread(ws_port: int):
+def _start_ws_thread(ws_port: int, asr_cfg: dict | None = None):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(_run_ws_server(ws_port))
+    loop.run_until_complete(_run_ws_server(ws_port, asr_cfg))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -417,7 +426,7 @@ def main():
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
     # Start WebSocket ASR server in a separate thread
-    threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
+    threading.Thread(target=_start_ws_thread, args=(ws_port, asr_cfg), daemon=True, name="ws_asr").start()
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 
