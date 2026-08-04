@@ -2,7 +2,7 @@
 """
 perception/main.py — Perception Stack bundle 统一入口。
 
-读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin（以及未来的 VLM、SLAM 等），
+读取 config.yaml，按插件配置加载 ASR、TTS、障碍物感知等插件，
 聚合成一个 MCP HTTP server 对外暴露。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
@@ -86,6 +86,11 @@ class PerceptionBundle:
             plugin = VideoObjectPerceptionPlugin(plugins_cfg["vop"], namespace, executor)
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
+
+        if plugins_cfg.get("obstacle", {}).get("enabled", False):
+            from plugins.obstacle import ObstacleDistancePlugin
+            self._plugins.append(ObstacleDistancePlugin(plugins_cfg["obstacle"], executor))
+            log.info("ObstacleDistancePlugin loaded")
 
     def get_all_tools(self) -> list:
         tools = []

@@ -45,3 +45,8 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  obstacle:
+    enabled: true
+    provider: local
+    model: ""

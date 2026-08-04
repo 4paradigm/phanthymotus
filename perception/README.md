@@ -90,3 +90,23 @@ ASR result JSON:
   "asr_complete_ts": 1234567891.789
 }
 ```
+
+## Obstacle Distance
+
+The `obstacle` processor subscribes to a compressed camera topic and publishes
+the estimated distance to the nearest obstacle in meters.
+
+| Direction | Topic pattern | Format |
+|-----------|---------------|--------|
+| Input | `{input_topic}` | `image/jpeg` |
+| Output | `{input_topic}/obstacle` | `data/json` |
+
+Output JSON:
+
+```json
+{"pred_distance": 2.43}
+```
+
+Select `local`, `openai`, or `qwen` with `plugins.obstacle.provider` in
+`config.yaml`. API-backed providers also require their URL, key, and model
+configuration.
