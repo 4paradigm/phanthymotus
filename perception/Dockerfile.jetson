@@ -43,7 +43,8 @@ RUN /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
       --output /tmp/vits2-mix-jp6-runtime.tar.gz && \
     mkdir -p /opt/vits2-runtime /models/vits2-mix/engines && \
     tar --no-same-owner -xzf /tmp/vits2-mix-jp6-runtime.tar.gz -C /opt/vits2-runtime && \
-    cd /opt/vits2-runtime && sha256sum -c runtime/SHA256SUMS && \
+    cd /opt/vits2-runtime/runtime && sha256sum -c SHA256SUMS && \
+    cd /opt/vits2-runtime && \
     grep -qx 'architecture=aarch64' artifacts/jetson-deps/versions.txt && \
     grep -qx 'python=3.12.3' artifacts/jetson-deps/versions.txt && \
     cp -a artifacts/jetson-deps/openfst/lib/. /usr/local/lib/ && ldconfig && \
