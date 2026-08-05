@@ -24,6 +24,22 @@ plugins:
     speaker_id: 0
     speed: 1.0
 
+  # TTS + AEC audio front-end. Its clean output connects to the standalone ASR
+  # card; its TTS output connects to Speaker. When enabling this plugin, disable
+  # the standalone TTS plugin above to avoid loading and playing TTS twice.
+  duplexaudio:
+    enabled: false
+    tts:
+      model_dir: /models/sherpa-onnx/tts
+      speaker_id: 0
+      speed: 1.0
+    aec:
+      enabled: true
+      backend: auto       # auto: LiveKit APM first, then SpeexDSP
+      delay_ms: 100       # calibrate for every mic/speaker path; do not copy 910 blindly
+      filter_length_ms: 200
+      failure_policy: fail_closed  # fail_closed | passthrough
+
   htmsg:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty

@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "tts": {
+    "model_dir": "/models/sherpa-onnx/tts",
+    "speaker_id": 0,
+    "speed": 1.0
+  },
+  "aec": {
+    "enabled": true,
+    "backend": "auto",
+    "delay_ms": 100,
+    "filter_length_ms": 200,
+    "failure_policy": "fail_closed"
+  }
+}

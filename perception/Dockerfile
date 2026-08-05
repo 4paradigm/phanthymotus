@@ -6,7 +6,7 @@ ARG PYPI_MIRROR
 RUN apt-get update && \
     mv /sbin/ldconfig /sbin/ldconfig.real && \
     ln -s /bin/true /sbin/ldconfig && \
-    apt-get install -y --no-install-recommends python3-pip && \
+    apt-get install -y --no-install-recommends python3-pip libspeexdsp1 && \
     mv /sbin/ldconfig.real /sbin/ldconfig && \
     rm -rf /var/lib/apt/lists/*
 

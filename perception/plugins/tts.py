@@ -12,7 +12,7 @@ import logging
 import queue
 import threading
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 import rclpy
 from rclpy.node import Node
@@ -155,12 +155,15 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
 
 class _TTSNode(Node):
-    def __init__(self, input_topic: Optional[str], adapter: Optional[TTSAdapter], node_suffix: str = ''):
+    def __init__(self, input_topic: Optional[str], adapter: Optional[TTSAdapter], node_suffix: str = '',
+                 output_topic: Optional[str] = None,
+                 frame_observer: Optional[Callable[[bytes, float], None]] = None):
         node_name = f"tts_{node_suffix}" if node_suffix else "tts"
         super().__init__(node_name)
         self._input_topic  = input_topic or ''
-        self._output_topic = f"{input_topic}/tts" if input_topic else '/perception/tts'
+        self._output_topic = output_topic or (f"{input_topic}/tts" if input_topic else '/perception/tts')
         self._adapter      = adapter
+        self._frame_observer = frame_observer
         self.state         = "idle"
         self._text_queue   = queue.Queue()
         self._worker_thread: Optional[threading.Thread] = None
@@ -217,8 +220,19 @@ class _TTSNode(Node):
             log.info(f"[tts] received text from topic: {text[:50]}...")
             self._text_queue.put((text, ''))
 
-    def _worker(self):
+    def _publish_frame(self, frame: bytes, play_start_ts: float) -> None:
+        """Publish one paced PCM frame and optionally expose its playback reference."""
         from audio_msgs.msg import AudioChunk
+
+        if self._frame_observer is not None:
+            self._frame_observer(frame, play_start_ts)
+        msg = AudioChunk()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.format = "audio/pcm-16k"
+        msg.data = list(frame)
+        self._pub.publish(msg)
+
+    def _worker(self):
         import time as _time
 
         # Real-time pacing: publish frames at playback rate to avoid bursts/gaps
@@ -264,11 +278,8 @@ class _TTSNode(Node):
                                 t0 = _time.monotonic()
                                 t0_wall = _time.time()
                                 for pf in prebuf:
-                                    msg = AudioChunk()
-                                    msg.header.stamp = self.get_clock().now().to_msg()
-                                    msg.format = "audio/pcm-16k"
-                                    msg.data   = list(pf)
-                                    self._pub.publish(msg)
+                                    play_ts = t0_wall + frames_sent * FRAME_DURATION
+                                    self._publish_frame(pf, play_ts)
                                     frames_sent += 1
                                 prebuf = []
                             continue
@@ -278,22 +289,17 @@ class _TTSNode(Node):
                         now = _time.monotonic()
                         if now < target:
                             _time.sleep(target - now)
-                        msg = AudioChunk()
-                        msg.header.stamp = self.get_clock().now().to_msg()
-                        msg.format = "audio/pcm-16k"
-                        msg.data   = list(frame)
-                        self._pub.publish(msg)
+                        play_ts = t0_wall + frames_sent * FRAME_DURATION
+                        self._publish_frame(frame, play_ts)
                         frames_sent += 1
 
                 # Flush any remaining pre-buffer (short utterances < PREBUF_FRAMES)
                 if prebuf and not self._stop_event.is_set():
                     t0 = _time.monotonic()
+                    t0_wall = _time.time()
                     for pf in prebuf:
-                        msg = AudioChunk()
-                        msg.header.stamp = self.get_clock().now().to_msg()
-                        msg.format = "audio/pcm-16k"
-                        msg.data   = list(pf)
-                        self._pub.publish(msg)
+                        play_ts = t0_wall + frames_sent * FRAME_DURATION
+                        self._publish_frame(pf, play_ts)
                         frames_sent += 1
 
                 # flush remainder
@@ -303,11 +309,11 @@ class _TTSNode(Node):
                         now = _time.monotonic()
                         if now < target:
                             _time.sleep(target - now)
-                    msg = AudioChunk()
-                    msg.header.stamp = self.get_clock().now().to_msg()
-                    msg.format = "audio/pcm-16k"
-                    msg.data   = list(buf)
-                    self._pub.publish(msg)
+                    if t0_wall is None:
+                        t0_wall = _time.time()
+                    play_ts = t0_wall + frames_sent * FRAME_DURATION
+                    self._publish_frame(buf, play_ts)
+                    frames_sent += 1
                 log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames) in {_time.monotonic() - t_start:.2f}s")
                 # 上报 TTS perf spans（生成 + 播放）
                 try:

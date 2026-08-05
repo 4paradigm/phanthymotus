@@ -66,6 +66,13 @@ class PerceptionBundle:
             self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
             log.info("TTSPlugin loaded")
 
+        if plugins_cfg.get("duplexaudio", {}).get("enabled", False):
+            from plugins.duplexaudio import DuplexAudioPlugin
+            self._plugins.append(
+                DuplexAudioPlugin(plugins_cfg["duplexaudio"], executor)
+            )
+            log.info("DuplexAudioPlugin loaded")
+
         if plugins_cfg.get("htmsg", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["htmsg"].get("namespace", "").strip()

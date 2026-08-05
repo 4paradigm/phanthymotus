@@ -1,6 +1,6 @@
 # Perception Stack
 
-Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
+Modular ASR/TTS/duplex-audio perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
 
 ## Audio Requirements for ASR
 
@@ -90,3 +90,44 @@ ASR result JSON:
   "asr_complete_ts": 1234567891.789
 }
 ```
+
+---
+
+## Duplex Audio (external microphone + TTS reference + AEC)
+
+`duplexaudio` owns the timing-sensitive TTS reference and AEC path while leaving
+ASR as an independent downstream card. It has one external-microphone input and
+two PCM outputs:
+
+| Direction | Topic pattern | Format |
+|-----------|---------------|--------|
+| Input | `start.input_topic` | `audio/pcm-16k` |
+| Output port 0 | `{input_topic}/duplexaudio/clean` | `audio/pcm-16k` |
+| Output port 1 | `{input_topic}/duplexaudio/tts` | `audio/pcm-16k` |
+
+Connect output port 0 to the existing ASR card and output port 1 to Speaker. Use
+MCP `duplexaudio.speak(text)` to synthesize speech. Every paced TTS frame is
+also stored as a timestamped AEC reference before it is published to the
+downstream speaker actuator. The mic path aligns that reference using
+`aec_delay_ms`, performs AEC, and re-chunks clean audio to the ASR minimum.
+
+The plugin is disabled by default. When enabling it, keep standalone ASR enabled
+but disable the standalone TTS plugin to avoid loading and playing TTS twice.
+Publishing PCM alone does not prove physical speaker playback.
+
+AEC backends:
+
+- `auto`: try LiveKit WebRTC APM, then SpeexDSP.
+- `livekit`: parity with the `voice-service` AEC3 backend; requires a compatible
+  Python runtime and wheel.
+- `speexdsp`: uses the system `libspeexdsp1` library and supports the current
+  Python 3.8 Jetson image.
+
+`aec_failure_policy=fail_closed` is the default: a missing backend or processing
+failure is reported as an error instead of silently claiming echo cancellation.
+`passthrough` exists only for explicit A/B and recovery tests. After several
+seconds of robot speech, call `aec_calibrate`; apply its `d_real_ms` suggestion
+only when `peak_corr` is credible, then verify `erle_db` and real ASR echo errors.
+
+The full contract, failure semantics, and test gates are in
+`plugins/duplexaudio/README.md`.
