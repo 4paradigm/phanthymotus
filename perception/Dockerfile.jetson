@@ -4,15 +4,17 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3-igpu
 FROM ${BASE_IMAGE}
 
-ARG VITS_MODEL_RELEASE=vits256
+ARG VITS_MODEL_RELEASE=lc1_male_v0_168k
 ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-mix-jp6-runtime-deps.tar.gz
-ARG VITS2_RUNTIME_SHA256=8a36fad685c2dee4063f6a9c719a02a6e9256c8d681eae3e190bde23c70ebc0f
+ARG VITS2_RUNTIME_SHA256=87a70b686fb67dc13b0441965e7a4fefdde28e49556c3ab664c24dc22bb8a58a
 ARG LC1_V0_214K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_214k_runtime.tar.gz
 ARG LC1_V0_214K_SHA256=05b584727c37f224650cac319cae3b17e0bbf85df6ac509dd6edcffd75cca584
 ARG LC1_V0_240K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_240k_runtime.tar.gz
 ARG LC1_V0_240K_SHA256=5a285d54879712ae11e3a4ca84412162bf0b713d6fab905b66b927cf761d3470
 ARG LC1_MALE_V0_120K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_male_v0_120k_runtime.tar.gz
 ARG LC1_MALE_V0_120K_SHA256=930b3e6ac1b7ce8bf9932055249cf91f9a7ca91ab80c3081e5a2d22bf2bacf1c
+ARG LC1_MALE_V0_168K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_male_v0_168k_runtime.tar.gz
+ARG LC1_MALE_V0_168K_SHA256=6683af301fa48d25c1d08251c045c510f937b428b41df3f2116886c1e02e8451
 ARG VITS256_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits256_runtime.tar.gz
 ARG VITS256_SHA256=a9538e7a4469c6f297d0f8c609655505624a430b39ecff9befcff18f8e77c58f
 
@@ -72,6 +74,10 @@ RUN mkdir -p /models/releases && \
       lc1_male_v0_120k) \
         /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
           --url "$LC1_MALE_V0_120K_URL" --sha256 "$LC1_MALE_V0_120K_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      lc1_male_v0_168k) \
+        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+          --url "$LC1_MALE_V0_168K_URL" --sha256 "$LC1_MALE_V0_168K_SHA256" \
           --output /tmp/model-release.tar.gz ;; \
       *) \
         echo "Unsupported VITS_MODEL_RELEASE=$VITS_MODEL_RELEASE" >&2; exit 2 ;; \
