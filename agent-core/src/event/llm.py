@@ -500,6 +500,28 @@ class Event:
                 meta = entry.get('tool_meta', {}).get(name)
                 return bool(meta and meta.get('type') == 'sensor')
 
+
+            def _is_tts_speak(name: str) -> bool:
+                if not name.startswith('mcp__'):
+                    return False
+                short = name.split('__')[-1]
+                return short.startswith('tts')
+            
+            def _estimate_tts_delay(text: str) -> float:
+                if not text:
+                    return 0.0
+                return max(0.3, len(text) / 7.0)
+            
+            def _extract_tts_text(result: str) -> str:
+                import json as _json
+                try:
+                    data = _json.loads(result) if isinstance(result, str) else result
+                    if isinstance(data, dict):
+                        return data.get('text', '') or data.get('content', '')
+                except:
+                    pass
+                return ''
+
             results = []
             _batch = []
             for c in tool_calls:
@@ -509,7 +531,14 @@ class Event:
                     if _batch:
                         results.extend(await asyncio.gather(*[_dispatch(b) for b in _batch]))
                         _batch = []
-                    results.append(await _dispatch(c))
+                    _result = await _dispatch(c)
+                    results.append(_result)
+                    # TTS 等待：如果是 speak 动作，等语音播放完成再执行下一个 actuator
+                    if _is_tts_speak(c['function']['name']):
+                        tts_text = _extract_tts_text(_result.get('result', ''))
+                        delay = _estimate_tts_delay(tts_text)
+                        if delay > 0:
+                            await asyncio.sleep(delay)
             if _batch:
                 results.extend(await asyncio.gather(*[_dispatch(b) for b in _batch]))
 
