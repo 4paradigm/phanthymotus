@@ -281,6 +281,9 @@ eng_dict = get_dict()
 def g2p_token(token):
     if token in punctuation:
         return (token,), (0,)
+    # Uppercase A is a spelled letter (for example, OA), not the article "a".
+    if token == "A":
+        return ("ey",), (2,)
     if token.upper() in eng_dict:
         phns, tns = refine_syllables(eng_dict[token.upper()])
         return tuple(post_replace_ph(i) for i in phns), tuple(tns)

@@ -125,6 +125,8 @@ def _en_token_to_phones(word: str):
     """
     phones: list = []
     tones: list = []
+    if word == "A":
+        return ["ey"], [2]
     if word.upper() in eng_dict:
         for syllable in eng_dict[word.upper()]:
             for phn in syllable:

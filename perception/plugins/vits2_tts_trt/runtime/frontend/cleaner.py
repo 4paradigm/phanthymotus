@@ -16,9 +16,7 @@ def normalize_text_mix(text):
     if has_zh and not has_en:
         return chinese.text_normalize(text)
     if has_en and not has_zh:
-        if any(char.isdigit() for char in text):
-            raise ValueError("Pure-English numeric input is unsupported in Chinese MIX mode")
-        return english.text_normalize_without_numbers(text)
+        return chinese.mix_normalize(text)
     return chinese.mix_normalize(text)
 
 

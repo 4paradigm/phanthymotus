@@ -216,6 +216,11 @@ class Vits2TensorRTAdapter(TTSAdapter):
         pause_samples = SAMPLE_RATE * CHUNK_PAUSE_MS // 1000
         silence = b"\x00\x00" * pause_samples
         with self._lock:
+            # One deterministic latent stream per complete request. Resetting for
+            # every text chunk would repeat the same noise prefix at boundaries.
+            reset_random_state = getattr(self._engine, "reset_random_state", None)
+            if reset_random_state is not None:
+                reset_random_state()
             for chunk_index, (chunk, text_ids) in enumerate(
                 self.iter_text_chunks(text)
             ):

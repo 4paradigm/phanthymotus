@@ -128,6 +128,8 @@ def _en_token_to_phones(word: str):
     """
     phones: list = []
     tones: list = []
+    if word == "A":
+        return ["ey"], [2]
     if word.upper() in _LETTER_SPELLED_UNITS:
         # Byte units must use letter names. Passing ``GB`` to g2p_en as one
         # unknown word yields G EY B IY ("gay B"). Keep words such as IELTS

@@ -31,9 +31,9 @@ def clean_text_mix(text):
         return norm_text, phones, tones, langs, word2ph
 
     if has_en and not has_zh:
-        norm_text = english.text_normalize(text)
-        phones, tones, word2ph = english.g2p(norm_text)
-        langs = ["EN"] * len(phones)
+        from .unified_g2p import unified_g2p
+        norm_text = chinese.mix_normalize(text)
+        phones, tones, langs, word2ph = unified_g2p(norm_text)
         return norm_text, phones, tones, langs, word2ph
 
     from .unified_g2p import unified_g2p

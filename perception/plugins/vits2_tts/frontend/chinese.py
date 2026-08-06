@@ -216,7 +216,13 @@ def _g2p(segments):
     return phones_list, tones_list, word2ph
 
 
+def _remove_redundant_newlines_after_punctuation(text):
+    """Avoid creating duplicate stops from an existing stop plus a newline."""
+    return re.sub(r"([。！？!?；;：:，,.])[\t ]*(?:\r\n|\r|\n)+[\t ]*", r"\1", text)
+
+
 def text_normalize(text):
+    text = _remove_redundant_newlines_after_punctuation(text)
     text = _normalizer.normalize(text)
     text = _post_replace(text)
     text = replace_punctuation(text)
@@ -234,6 +240,7 @@ def mix_normalize(text: str) -> str:
     acronyms (GPT→G P T, CEO→C E O) natively, so no preprocessing is needed.
     """
     from .english import replace_punctuation as en_replace_punct
+    text = _remove_redundant_newlines_after_punctuation(text)
     text = _normalizer.normalize(text)
     text = _post_replace(text)
     text = en_replace_punct(text)

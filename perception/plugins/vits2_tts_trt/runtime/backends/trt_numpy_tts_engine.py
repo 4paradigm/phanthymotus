@@ -100,6 +100,10 @@ class TensorRTNumpyTTSEngine:
         self.max_frames = int(
             os.getenv("MIX_VITS_MAX_FRAMES", str(frame_profile_max))
         )
+        self.inference_seed = int(os.getenv("MIX_VITS_INFERENCE_SEED", "42"))
+        if not 0 <= self.inference_seed < 2**32:
+            raise ValueError("MIX_VITS_INFERENCE_SEED must be in [0, 2**32)")
+        self.reset_random_state()
         # Overlap-discard chunked decoding keeps decoder activations bounded;
         # chunk=0 disables. Verified vs full decode: rms diff ~-81 dB at overlap 96.
         self.dec_chunk = int(os.getenv("MIX_VITS_DECODER_CHUNK", "192"))
@@ -140,7 +144,15 @@ class TensorRTNumpyTTSEngine:
             "engine_dir": str(self.engine_dir),
             "total_engine_bytes": self.manifest["total_engine_bytes"],
             "tensorrt_version": self.manifest["trtexec_version"],
+            "inference_seed": self.inference_seed,
         }
+
+    def reset_random_state(self, seed: int | None = None):
+        """Reset latent sampling once at the start of a synthesis request."""
+        request_seed = self.inference_seed if seed is None else int(seed)
+        if not 0 <= request_seed < 2**32:
+            raise ValueError("inference seed must be in [0, 2**32)")
+        self._rng = np.random.default_rng(request_seed)
 
     def _load_engine(self, name, engines):
         entry = engines.get(name)
@@ -267,7 +279,7 @@ class TensorRTNumpyTTSEngine:
         logs_p = np.matmul(
             attention[:, 0], logs_p.transpose(0, 2, 1)
         ).transpose(0, 2, 1)
-        noise = np.random.standard_normal(m_p.shape).astype(np.float32)
+        noise = self._rng.standard_normal(m_p.shape).astype(np.float32)
         z_p = m_p + noise * np.exp(logs_p) * noise_scale
         z = self.flow.run({"z_p": z_p, "y_mask": y_mask, "g": g})["z"]
         logits = self._decode(z * y_mask, g)
