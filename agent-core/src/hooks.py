@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +27,7 @@ class HookBinding:
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 _registry: dict[str, list[HookBinding]] = {}
+_fire_log: deque = deque(maxlen=30)
 
 
 def register(mcp_id: str, tool_name: str, x_hooks: dict):
@@ -89,6 +91,14 @@ def get_hook_for_binding(mcp_id: str, tool: str, action: str) -> str | None:
     return None
 
 
+def get_status() -> dict:
+    """Return hook registry and recent fire log for diagnostics."""
+    return {
+        'registry': list_hooks(),
+        'recent_fires': list(_fire_log),
+    }
+
+
 # ── Executor ─────────────────────────────────────────────────────────────────
 
 async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: str | None = None) -> list[dict]:
@@ -132,6 +142,11 @@ async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: s
 
     if bindings:
         print(f'[hooks] fired {hook_id}: {len(bindings)} binding(s)')
+    _fire_log.append({
+        'hook': hook_id, 'ts': time.time(),
+        'bindings': len(bindings),
+        'errors': [r for r in results if 'error' in r],
+    })
     return results
 
 

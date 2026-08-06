@@ -284,6 +284,13 @@ def _guess_data_type(tools: list, resources: list, name: str) -> str:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@router.get('/hooks/status')
+async def hooks_status():
+    """Return hook registry and recent fire log for diagnostics."""
+    import hooks
+    return {'code': 200, 'data': hooks.get_status()}
+
+
 @router.get('')
 async def mcp_list():
     items = [
