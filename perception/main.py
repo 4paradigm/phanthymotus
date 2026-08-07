@@ -41,6 +41,27 @@ log = logging.getLogger(__name__)
 for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx', 'dashscope'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
+# ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
+
+import queue as _queue
+
+_sse_clients: list[_queue.Queue] = []   # 每个 SSE 连接一个 queue
+_sse_lock = threading.Lock()
+
+
+def sse_push(event: dict):
+    """线程安全地广播 SSE 事件到所有连接的客户端。"""
+    data = json.dumps(event, ensure_ascii=False)
+    with _sse_lock:
+        dead = []
+        for q in _sse_clients:
+            try:
+                q.put_nowait(data)
+            except _queue.Full:
+                dead.append(q)
+        for q in dead:
+            _sse_clients.remove(q)
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -180,11 +201,33 @@ def make_handler():
                 self._send(405, '{"error":"Use POST"}')
                 return
             if self.path.split("?")[0] == "/sse":
-                self.send_response(405)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Allow", "POST, OPTIONS")
+                # SSE streaming endpoint for ACP completion events
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(b'{"error":"SSE not supported. Use HTTP POST."}')
+
+                client_queue = _queue.Queue(maxsize=64)
+                with _sse_lock:
+                    _sse_clients.append(client_queue)
+                try:
+                    while True:
+                        try:
+                            data = client_queue.get(timeout=30)
+                            self.wfile.write(f"data: {data}\n\n".encode())
+                            self.wfile.flush()
+                        except _queue.Empty:
+                            # keep-alive ping
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    with _sse_lock:
+                        if client_queue in _sse_clients:
+                            _sse_clients.remove(client_queue)
                 return
             self.send_response(404)
             self.end_headers()

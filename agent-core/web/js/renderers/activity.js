@@ -27,7 +27,10 @@ export const ActivityRenderer = {
       const msg = obj.text
         ? `<span style="color:var(--text-primary)">${obj.text}</span>`
         : `<span style="color:var(--text-muted)">${_truncate(text, 120)}</span>`;
-      row.innerHTML = `<span class="log-time">${t}</span><span class="log-type asr_result">asr</span><span class="log-msg">${msg}</span>`;
+      // Determine badge type from data content
+      const badgeType = obj.platform ? obj.platform : (obj.asr_complete_ts ? 'asr_result' : 'msg');
+      const badgeLabel = obj.platform || (obj.asr_complete_ts ? 'ASR' : 'msg');
+      row.innerHTML = `<span class="log-time">${t}</span><span class="log-type ${badgeType}">${badgeLabel}</span><span class="log-msg">${msg}</span>`;
       this._el.appendChild(row);
       this._el.scrollTop = this._el.scrollHeight;
     } catch {

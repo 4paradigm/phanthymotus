@@ -25,7 +25,13 @@ export const TextRenderer = {
       if (json.text) {
         const p = document.createElement('p');
         p.className = 'asr-line';
-        p.textContent = json.text;
+        if (json.asr_complete_ts) {
+          const tag = document.createElement('span');
+          tag.className = 'asr-tag';
+          tag.textContent = 'ASR';
+          p.appendChild(tag);
+        }
+        p.appendChild(document.createTextNode(json.text));
         this._textEl.appendChild(p);
         this._textEl.scrollTop = this._textEl.scrollHeight;
         while (this._textEl.children.length > 50) this._textEl.removeChild(this._textEl.firstChild);

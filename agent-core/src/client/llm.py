@@ -31,6 +31,7 @@ class LLMErrorKind:
     CONTEXT_OVERFLOW = 'context_overflow' # 上下文溢出
     AUTH            = 'auth'             # 401/403
     TIMEOUT         = 'timeout'          # 超时
+    CONNECTION      = 'connection'       # 网络连接失败
     UNKNOWN         = 'unknown'
 
 
@@ -41,6 +42,9 @@ def _classify_error(e: Exception) -> tuple[str, float | None]:
 
     if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException, openai.APITimeoutError)):
         return LLMErrorKind.TIMEOUT, 5.0
+
+    if isinstance(e, openai.APIConnectionError):
+        return LLMErrorKind.CONNECTION, 2.0
 
     if status == 429:
         # 尝试解析 retry-after
@@ -93,12 +97,13 @@ class Client():
                 base_url=config_it['url'],
                 api_key=config_it['key'],
                 max_retries=0,  # 由我们自己管理重试
-                timeout=120.0,
+                timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=10.0),
                 http_client=httpx.AsyncClient(
                     event_hooks={"request": [_log_request]},
                 ),
             )
             for config_it in config.main['client']['llm']
+            if config_it.get('key')  # 跳过未配置 credentials 的条目
         ]
         # 跟踪每个 endpoint 的健康状态
         self._endpoint_dead: list[bool] = [False] * len(self.client_list)
@@ -106,19 +111,27 @@ class Client():
     async def __call__(self,
         message_list: list[dict],
         tool_list: list[dict],
+        cancel_event: 'asyncio.Event | None' = None,
+        model_override: 'str | None' = None,
     ) -> dict:
 
-        async def _go(client, model) -> dict:
+        async def _go(client, model, think_mode: bool) -> dict:
             url = str(client.base_url)
             t0 = time.perf_counter()
             try:
+                extra = {}
+                if not think_mode:
+                    extra["extra_body"] = {
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    }
+
                 response = await client.chat.completions.create(
                     model=model,
                     messages=message_list,
                     tools=tool_list,
                     max_tokens=10240,
                     stream=False,
-                    extra_body={"thinking": {"type": "disabled"}, "enable_thinking": False},
+                    **extra,
                 )
                 elapsed = time.perf_counter() - t0
                 # Performance log: latency + token usage
@@ -133,10 +146,41 @@ class Client():
                     )
                 else:
                     print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A')
-                msg = response.choices[0].message.to_dict()
+                try:
+                    msg = response.choices[0].message.to_dict()
+                except (KeyError, AttributeError, IndexError) as parse_err:
+                    # Some models return non-standard response structures
+                    # Fallback: extract what we can manually
+                    m = response.choices[0].message
+                    msg = {'role': 'assistant', 'content': getattr(m, 'content', '') or ''}
+                    if hasattr(m, 'tool_calls') and m.tool_calls:
+                        try:
+                            msg['tool_calls'] = [tc.to_dict() for tc in m.tool_calls]
+                        except Exception:
+                            pass
+                    print(f'[llm] WARNING: message.to_dict() failed ({parse_err}), using fallback parse')
+                # OpenAI SDK 可能生成 tool_calls: None，清理以避免下游迭代报错
+                if 'tool_calls' in msg and msg['tool_calls'] is None:
+                    del msg['tool_calls']
+                # glm 有时返回 tool_calls 内部缺少必要字段，清理无效条目
+                if 'tool_calls' in msg and isinstance(msg['tool_calls'], list):
+                    msg['tool_calls'] = [
+                        tc for tc in msg['tool_calls']
+                        if isinstance(tc, dict) and 'function' in tc and 'name' in tc.get('function', {})
+                    ]
+                    if not msg['tool_calls']:
+                        del msg['tool_calls']
                 # 清理模型泄漏的 think 标签残留
                 if msg.get('content'):
                     msg['content'] = re.sub(r'</?think>', '', msg['content']).strip()
+                # 附加 token 用量信息（内部字段，下划线前缀）
+                if usage:
+                    msg['_usage'] = {
+                        'prompt_tokens': usage.prompt_tokens,
+                        'completion_tokens': usage.completion_tokens,
+                        'total_tokens': usage.total_tokens,
+                        'cached_tokens': cached_tokens,
+                    }
                 return msg
             except Exception as e:
                 elapsed = time.perf_counter() - t0
@@ -147,27 +191,59 @@ class Client():
         last_error = None
         max_retries = 2  # 重试上限
 
+        # model_override: select matching endpoints or override model on first endpoint
+        _override_model = None
+        if model_override:
+            matched_indices = [i for i, c in enumerate(configs) if c.get('model') == model_override]
+            if matched_indices:
+                # Use only matching endpoints
+                configs = [configs[i] for i in matched_indices]
+                client_list = [self.client_list[i] for i in matched_indices]
+                endpoint_dead = [self._endpoint_dead[i] for i in matched_indices]
+            else:
+                # Override model name, use all endpoints
+                _override_model = model_override
+                client_list = self.client_list
+                endpoint_dead = self._endpoint_dead
+        else:
+            client_list = self.client_list
+            endpoint_dead = self._endpoint_dead
+
         for attempt in range(max_retries + 1):
             # 筛选存活的 endpoint
             alive = [
-                (i, self.client_list[i], configs[i])
-                for i in range(len(self.client_list))
-                if not self._endpoint_dead[i]
+                (i, client_list[i], configs[i])
+                for i in range(len(client_list))
+                if not endpoint_dead[i]
             ]
             if not alive:
                 # 全部标记为 dead，重置后再试
-                self._endpoint_dead = [False] * len(self.client_list)
-                alive = [(i, self.client_list[i], configs[i]) for i in range(len(self.client_list))]
+                endpoint_dead = [False] * len(client_list)
+                alive = [(i, client_list[i], configs[i]) for i in range(len(client_list))]
 
             # 竞速调用所有存活 endpoint
             task_list = [
-                asyncio.create_task(_go(c, cfg['model']))
+                asyncio.create_task(_go(c, _override_model or cfg['model'], cfg.get('think_mode', False)))
                 for _, c, cfg in alive
             ]
 
-            done, pending = await asyncio.wait(task_list, return_when=asyncio.FIRST_COMPLETED)
+            # 如果有 cancel_event，加入哨兵 task 实现用户消息抢占
+            cancel_task = None
+            wait_tasks = list(task_list)
+            if cancel_event:
+                cancel_task = asyncio.create_task(cancel_event.wait())
+                wait_tasks.append(cancel_task)
+
+            done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
+
+            # 如果 cancel 先完成 → 中断当前 turn
+            if cancel_task and cancel_task in done:
+                for t in task_list:
+                    t.cancel()
+                from event.llm import TurnCancelled
+                raise TurnCancelled("Interrupted by user message during LLM call")
 
             # 检查是否有成功的
             for t in done:
@@ -184,14 +260,14 @@ class Client():
             if kind == LLMErrorKind.BILLING:
                 # 标记触发 402 的 endpoint 为 dead，切换到下一个
                 for idx, _, cfg in alive:
-                    self._endpoint_dead[idx] = True
+                    endpoint_dead[idx] = True
                 print(f'[llm] billing error — marked endpoint(s) dead, trying others')
                 continue  # 立即重试剩余 endpoint
 
             if kind == LLMErrorKind.AUTH:
                 # 认证错误不可恢复
                 for idx, _, cfg in alive:
-                    self._endpoint_dead[idx] = True
+                    endpoint_dead[idx] = True
                 print(f'[llm] auth error — marked endpoint(s) dead')
                 continue
 
@@ -213,6 +289,15 @@ class Client():
                 if attempt < max_retries:
                     print(f'[llm] timeout — retrying immediately')
                     continue
+
+            if kind == LLMErrorKind.CONNECTION:
+                if attempt < max_retries:
+                    wait = retry_after or 2.0
+                    print(f'[llm] connection failed — retrying in {wait:.1f}s (check network)')
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    print(f'[llm] connection failed after {max_retries + 1} attempts — LLM unreachable, check network connectivity')
 
             if kind == LLMErrorKind.CONTEXT_OVERFLOW:
                 # 上下文溢出：不重试，由调用方处理（需要压缩历史）

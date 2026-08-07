@@ -42,6 +42,10 @@ MODELS = {
         "url": f"{COS_BASE}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.zip",
         "check_file": "tokens.txt",
     },
+    "asr_paraformer_offline": {
+        "url": f"{COS_BASE}/sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2",
+        "check_file": "tokens.txt",
+    },
     "tts": {
         "url": f"{COS_BASE}/matcha-icefall-zh-en.tar.bz2",
         "check_file": "model-steps-3.onnx",
@@ -55,10 +59,23 @@ MODELS = {
         "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
         "check_file": "tokens.txt",
     },
+    "kws_zh": {
+        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.zip",
+        "check_file": "tokens.txt",
+    },
+    "kws_en": {
+        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.zip",
+        "check_file": "tokens.txt",
+    },
     "vad": {
         "url": f"{COS_BASE}/silero_vad.onnx",
         "check_file": "silero_vad.onnx",
         "single_file": True,  # Not an archive, just a single file download
+    },
+    "denoise": {
+        "url": f"{COS_BASE}/gtcrn_simple.onnx",
+        "check_file": "gtcrn_simple.onnx",
+        "single_file": True,
     },
 }
 

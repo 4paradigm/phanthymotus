@@ -18,6 +18,7 @@ class LLMConfig(BaseModel):
     url:   str = ''
     key:   str = ''
     model: str = ''
+    think_mode: bool = False
 
 
 class TTSConfig(BaseModel):
@@ -45,12 +46,19 @@ class InspectorConfig(BaseModel):
     url: str = ''
 
 
+class SearchConfig(BaseModel):
+    type:     str = 'none'   # 'none' | 'baidu_search'
+    base_url: str = ''
+    api_key:  str = ''
+
+
 class ServicesConfig(BaseModel):
     llm:       LLMConfig       = LLMConfig()
     tts:       TTSConfig       = TTSConfig()
     vad:       VADConfig       = VADConfig()
     asr:       ASRConfig       = ASRConfig()
     inspector: InspectorConfig = InspectorConfig()
+    search:    SearchConfig    = SearchConfig()
 
 
 class MCPEntry(BaseModel):
@@ -81,6 +89,26 @@ class ServiceTestRequest(BaseModel):
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
+@router.get('/update-channel')
+async def get_update_channel():
+    core = config.main.get('core', {})
+    return {'code': 200, 'data': {'channel': core.get('update_channel', 'ga')}}
+
+
+class UpdateChannelRequest(BaseModel):
+    channel: str  # preview | release | ga
+
+
+@router.put('/update-channel')
+async def set_update_channel(req: UpdateChannelRequest):
+    if req.channel not in ('preview', 'release', 'ga'):
+        raise fastapi.HTTPException(status_code=422, detail='channel must be preview | release | ga')
+    core = config.main.get('core', {})
+    core['update_channel'] = req.channel
+    config.main['core'] = core
+    return {'code': 200, 'data': {'channel': req.channel}}
+
+
 @router.get('/status')
 async def config_status():
     core = config.main.get('core', {})
@@ -94,6 +122,254 @@ async def get_project_running():
     return {'running': bool(core.get('project_running', False))}
 
 
+# ── Start / Stop Project (统一入口) ─────────────────────────────────────────────
+
+async def _do_start_project():
+    """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
+
+    Topic resolution strategy:
+      1. Start source cards first, then call info() to get their actual topic_out
+      2. Build a resolved_topics map: card_id → [topic_out entries]
+      3. When starting processor cards, look up source card's topic_out via connections
+      4. Fallback: use connection's persisted fromTopic if info() didn't return topic_out
+    """
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.motus_stream import push_event
+    import json as _json
+
+    layout = config.main.get('canvas_layout', {})
+    cards = layout.get('cards', [])
+    connections = layout.get('connections', [])
+
+    if not cards:
+        return
+
+    # 分类：sources (无入连接) 和 processors (有入连接)
+    cards_with_inbound = set()
+    for conn in connections:
+        cards_with_inbound.add(conn.get('toCardId'))
+
+    sources = [c for c in cards if c['id'] not in cards_with_inbound]
+    processors = [c for c in cards if c['id'] in cards_with_inbound]
+    all_ordered = sources + processors
+
+    # 广播启动开始
+    await push_event({'type': 'project_start_begin', 'payload': {
+        'cards': [{'tool': c.get('toolName', ''), 'mcp_id': c.get('mcpId', '')} for c in all_ordered],
+    }})
+
+    errors = []
+    # Resolved topic_out per card (populated after starting sources)
+    resolved_topics: dict[str, list] = {}
+
+    async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None):
+        """Start a card, then call info() to get its resolved topic_out."""
+        mcp_id = card.get('mcpId', '')
+        tool_name = card.get('toolName', '')
+        card_id = card.get('id', '')
+        if not mcp_id or not tool_name:
+            return
+
+        await push_event({'type': 'project_start_item', 'payload': {
+            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'starting',
+        }})
+
+        args = {'action': 'start', 'instance_id': card_id}
+        if input_topics and len(input_topics) > 1:
+            args['input_topics'] = input_topics
+        elif input_topic:
+            args['input_topic'] = input_topic
+
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments=args)
+            result = await mcp_call_tool(mcp_id, req)
+            if result.get('code') == 200:
+                # Check if tool reported an error state in its response
+                resp_data = result.get('data')
+                tool_state = None
+                tool_message = ''
+                if isinstance(resp_data, dict):
+                    tool_state = resp_data.get('state')
+                    tool_message = resp_data.get('message', '')
+                elif isinstance(resp_data, list) and resp_data:
+                    try:
+                        parsed = _json.loads(resp_data[0].get('text', '{}')) if isinstance(resp_data[0], dict) else {}
+                        tool_state = parsed.get('state')
+                        tool_message = parsed.get('message', '')
+                    except Exception:
+                        pass
+
+                if tool_state == 'error':
+                    print(f'[start-project] {tool_name} ({mcp_id}) self-check failed: {tool_message}')
+                    await push_event({'type': 'project_start_item', 'payload': {
+                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
+                    }})
+                    errors.append(tool_name)
+                else:
+                    print(f'[start-project] started {tool_name} ({mcp_id})')
+                    await push_event({'type': 'project_start_item', 'payload': {
+                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
+                    }})
+                # After successful start, query info() to get resolved topic_out
+                try:
+                    info_req = MCPCallRequest(tool=tool_name, arguments={'action': 'info', 'instance_id': card_id})
+                    info_result = await mcp_call_tool(mcp_id, info_req)
+                    if info_result.get('code') == 200:
+                        data = info_result.get('data')
+                        # Parse MCP JSON-RPC content format: [{"type":"text","text":"..."}]
+                        if isinstance(data, list) and data:
+                            text = data[0].get('text', '{}') if isinstance(data[0], dict) else '{}'
+                            try:
+                                data = _json.loads(text)
+                            except Exception:
+                                data = {}
+                        elif isinstance(data, str):
+                            try:
+                                data = _json.loads(data)
+                            except Exception:
+                                data = {}
+                        if isinstance(data, dict):
+                            topic_out = data.get('topic_out', [])
+                            if topic_out:
+                                resolved_topics[card_id] = topic_out
+                                # Register resolved topics so WebSocket relay works
+                                from api.inspection import register_topic_internal
+                                for tp in topic_out:
+                                    if tp.get('topic') and tp.get('format'):
+                                        await register_topic_internal(tp['topic'], tp['format'], mcp_id)
+                except Exception:
+                    pass  # info() failure is non-fatal
+            else:
+                msg = str(result.get('detail', result.get('data', '')))[:100]
+                print(f'[start-project] {tool_name} error: {result}')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': msg,
+                }})
+                errors.append(tool_name)
+        except Exception as e:
+            print(f'[start-project] failed {tool_name}: {e}')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': str(e)[:100],
+            }})
+            errors.append(tool_name)
+
+    def _resolve_input_topic(card_id: str) -> tuple[str, list]:
+        """Resolve input_topic(s) for a processor card from its inbound connections."""
+        in_conns = [c for c in connections if c.get('toCardId') == card_id]
+        topics = []
+        for conn in in_conns:
+            from_card_id = conn.get('fromCardId', '')
+            port_idx = int(conn.get('fromPortIdx', 0))
+            # Primary: use resolved topic_out from source card's info() response
+            if from_card_id in resolved_topics:
+                out_list = resolved_topics[from_card_id]
+                if port_idx < len(out_list) and out_list[port_idx].get('topic'):
+                    topics.append(out_list[port_idx]['topic'])
+                elif out_list and out_list[0].get('topic'):
+                    topics.append(out_list[0]['topic'])
+            # Fallback: use persisted fromTopic in connection data
+            elif conn.get('fromTopic'):
+                topics.append(conn['fromTopic'])
+            # Fallback 2: use source card's persisted topicOut
+            else:
+                from_card = next((c for c in cards if c.get('id') == from_card_id), None)
+                if from_card:
+                    card_topic_out = from_card.get('topicOut') or []
+                    if port_idx < len(card_topic_out) and card_topic_out[port_idx].get('topic'):
+                        topics.append(card_topic_out[port_idx]['topic'])
+                    elif card_topic_out and card_topic_out[0].get('topic'):
+                        topics.append(card_topic_out[0]['topic'])
+        topics = list(set(t for t in topics if t))
+        if len(topics) > 1:
+            return '', topics
+        elif len(topics) == 1:
+            return topics[0], []
+        return '', []
+
+    # Phase 1: start sources (no input_topic needed) and collect their topic_out
+    for card in sources:
+        await _start_and_resolve(card)
+
+    # Phase 2: start processors with resolved input_topic from sources
+    for card in processors:
+        input_topic, input_topics = _resolve_input_topic(card['id'])
+        await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
+
+    # 有 card 失败 → 全部回滚，不标记 running
+    if errors:
+        print(f'[start-project] {len(errors)} cards failed ({", ".join(errors)}), rolling back')
+        await push_event({'type': 'project_start_done', 'payload': {'has_error': True, 'errors': errors}})
+        await _do_stop_project()
+        return False
+
+    # 全部成功 → 标记 running
+    core = config.main.get('core', {})
+    core['project_running'] = True
+    config.main['core'] = core
+
+    # 确保 channel adapters 已连接（restart 断开的 adapter）
+    from channel.manager import manager as channel_mgr, _get_channel_configs
+    channel_mgr.sync_from_canvas()
+    for ch_cfg in _get_channel_configs():
+        ch_id = ch_cfg.get('id', '')
+        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
+            try:
+                await channel_mgr.restart_adapter(ch_id)
+            except Exception as e:
+                print(f'[start-project] channel {ch_id} restart failed: {e}')
+
+    # 广播启动完成
+    await push_event({'type': 'project_start_done', 'payload': {'has_error': False}})
+    await push_event({'type': 'project_state', 'payload': {'running': True}})
+    print(f'[start-project] done ({len(cards)} cards, all succeeded)')
+    return True
+
+
+async def _do_stop_project():
+    """停止所有 canvas cards。"""
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.motus_stream import push_event
+
+    layout = config.main.get('canvas_layout', {})
+    cards = layout.get('cards', [])
+
+    for card in cards:
+        mcp_id = card.get('mcpId', '')
+        tool_name = card.get('toolName', '')
+        card_id = card.get('id', '')
+        if not mcp_id or not tool_name:
+            continue
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
+            await mcp_call_tool(mcp_id, req)
+        except Exception:
+            pass
+
+    core = config.main.get('core', {})
+    core['project_running'] = False
+    config.main['core'] = core
+    await push_event({'type': 'project_state', 'payload': {'running': False}})
+    print('[stop-project] done')
+
+
+@router.post('/start-project')
+async def api_start_project():
+    success = await _do_start_project()
+    if success is False:
+        return fastapi.responses.JSONResponse(
+            status_code=500,
+            content={'ok': False, 'detail': '部分设备启动失败，已回滚'}
+        )
+    return {'ok': True}
+
+
+@router.post('/stop-project')
+async def api_stop_project():
+    await _do_stop_project()
+    return {'ok': True}
+
+
+
 class ProjectRunningRequest(BaseModel):
     running: bool
 
@@ -102,6 +378,24 @@ class ProjectRunningRequest(BaseModel):
 async def set_project_running(req: ProjectRunningRequest):
     core = config.main.get('core', {})
     core['project_running'] = req.running
+    config.main['core'] = core
+    return {'ok': True}
+
+
+@router.get('/auto-start')
+async def get_auto_start():
+    core = config.main.get('core', {})
+    return {'auto_start': bool(core.get('auto_start', False))}
+
+
+class AutoStartRequest(BaseModel):
+    auto_start: bool
+
+
+@router.put('/auto-start')
+async def set_auto_start(req: AutoStartRequest):
+    core = config.main.get('core', {})
+    core['auto_start'] = req.auto_start
     config.main['core'] = core
     return {'ok': True}
 
@@ -120,6 +414,7 @@ async def config_get():
     llm = dict(services.get('llm', {}))
     if llm.get('key'):
         llm['key'] = '****'
+    llm.setdefault('think_mode', False)
 
     mcp_list = [
         {
@@ -159,6 +454,12 @@ async def config_get():
     if tts.get('api_key'):
         tts['api_key'] = '****'
 
+    # Search config (from desktop_tools)
+    dt = config.main.get('desktop_tools', {})
+    search = dict(dt.get('search', {}))
+    if search.get('api_key'):
+        search['api_key'] = '****'
+
     return {
         'code': 200,
         'data': {
@@ -168,6 +469,7 @@ async def config_get():
                 'vad':       dict(services.get('vad', {})),
                 'asr':       asr,
                 'inspector': inspector,
+                'search':    search,
             },
             'mcp_list': mcp_list,
         }
@@ -185,7 +487,21 @@ async def config_save(req: ConfigSaveRequest):
         'url':   _normalize_llm_url(req.services.llm.url),
         'key':   new_key,
         'model': req.services.llm.model,
+        'think_mode': req.services.llm.think_mode,
     }
+
+    # Sync to client.llm (operational LLM config)
+    client_cfg = config.main.get('client', {})
+    client_cfg['llm'] = [{
+        'url':   services['llm']['url'],
+        'key':   services['llm']['key'],
+        'model': services['llm']['model'],
+        'think_mode': services['llm']['think_mode'],
+    }]
+    config.main['client'] = client_cfg
+    # Reinitialize the LLM client with new config
+    import client as client_mod
+    client_mod.llm = client_mod.llm.__class__()
 
     # TTS / VAD / ASR
     existing_tts_key = services.get('tts', {}).get('api_key', '')
@@ -236,6 +552,18 @@ async def config_save(req: ConfigSaveRequest):
         services['inspector'] = {'url': req.services.inspector.url}
 
     config.main['services'] = services
+
+    # Search config → desktop_tools section
+    dt = config.main.get('desktop_tools', {})
+    existing_search = dt.get('search', {})
+    existing_search_key = existing_search.get('api_key', '')
+    new_search_key = req.services.search.api_key if (req.services.search.api_key and req.services.search.api_key != '****') else existing_search_key
+    dt['search'] = {
+        'type':     req.services.search.type,
+        'base_url': req.services.search.base_url,
+        'api_key':  new_search_key,
+    }
+    config.main['desktop_tools'] = dt
 
     # Mark configured
     core = config.main.get('core', {})
@@ -502,5 +830,132 @@ async def config_test_vad_audio(
         return {'code': 200, 'data': result}
     except Exception as e:
         return {'code': 200, 'data': {'ok': False, 'info': str(e)}}
+
+
+# ── 重置 ─────────────────────────────────────────────────────────────────────────
+
+class ResetRequest(BaseModel):
+    restart_services: bool = False
+    chat_history: bool = False
+    system_prompt: bool = False
+    identity: bool = False
+    memory: bool = False
+    skills: bool = False
+
+
+@router.post('/reset')
+async def reset_config(req: ResetRequest):
+    import shutil
+    import pathlib
+    reset_items = []
+
+    defaults_dir = pathlib.Path('/opt/defaults/memory')
+    memory_dir = pathlib.Path('./resource/memory')
+
+    if req.chat_history:
+        import chat_history
+        chat_history.clear_all()
+        import event
+        event.llm._turns = []
+        event.llm._summary = None
+        event.llm._session_id = None
+        event.llm._current_turn = []
+        reset_items.append('chat_history')
+
+    if req.system_prompt:
+        src = defaults_dir / 'prompt_system.md'
+        dst = memory_dir / 'prompt_system.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('system_prompt')
+
+    if req.identity:
+        src = defaults_dir / 'identity.md'
+        dst = memory_dir / 'identity.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('identity')
+
+    if req.memory:
+        src = defaults_dir / 'prompt_memory_init.md'
+        dst = memory_dir / 'prompt_memory.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('memory')
+
+    if req.skills:
+        skills_cfg = config.main.get('skills', {'installed': []})
+        for skill in skills_cfg.get('installed', []):
+            skill['active'] = False
+        config.main['skills'] = skills_cfg
+        import event.skills
+        event.skills._runtime_activated.clear()
+        reset_items.append('skills')
+
+    if req.restart_services:
+        reset_items.append('restart_services')
+        # Restart all deployed services by matching running containers to deployed images
+        import subprocess
+        import os
+
+        # Get all running containers with their images
+        result = subprocess.run(
+            ['docker', 'ps', '--format', '{{.Names}}\t{{.Image}}'],
+            capture_output=True, text=True
+        )
+
+        # Collect deployed images from config
+        deployed_images = set()
+        drivers = config.main.get('drivers', [])
+        for d in drivers:
+            img = d.get('image', '')
+            if img:
+                # Match by repo (without tag) for robustness
+                deployed_images.add(img.rsplit(':', 1)[0])
+
+        # Find containers whose image matches a deployed service
+        self_name = os.environ.get('CONTAINER_NAME', 'phanthy-motus-agent-core-1')
+        others = []
+        restart_self = False
+
+        for line in result.stdout.strip().split('\n'):
+            if not line or '\t' not in line:
+                continue
+            name, image = line.split('\t', 1)
+            image_repo = image.rsplit(':', 1)[0]
+            if image_repo in deployed_images:
+                if name == self_name:
+                    restart_self = True
+                else:
+                    others.append(name)
+
+        # Restart others first, then self last
+        # Spawn a detached sidecar container to do the restart — child processes
+        # inside this container get killed when it restarts, so we need an external actor.
+        targets = others + ([self_name] if restart_self else [])
+        if targets:
+            restart_script = 'sleep 2; ' + '; '.join(f'docker restart {name}' for name in targets)
+            # Reuse our own image (guaranteed available locally) as the restart helper
+            own_image_result = subprocess.run(
+                ['docker', 'inspect', self_name, '--format', '{{.Config.Image}}'],
+                capture_output=True, text=True
+            )
+            helper_image = own_image_result.stdout.strip() or 'alpine'
+            # Remove stale helper if exists
+            subprocess.run(
+                ['docker', 'rm', '-f', 'phanthy-restart-helper'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            subprocess.Popen(
+                ['docker', 'run', '--rm', '-d',
+                 '--name', 'phanthy-restart-helper',
+                 '--entrypoint', 'sh',
+                 '-v', '/var/run/docker.sock:/var/run/docker.sock',
+                 helper_image,
+                 '-c', restart_script],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+    return {'ok': True, 'reset': reset_items}
 
 

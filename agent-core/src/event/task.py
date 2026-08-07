@@ -58,7 +58,11 @@ class Tools:
         """更新任务进展。收到任务检查事件后用此工具记录最新状态。"""
         task = task_store.update(id, progress=progress if progress else None)
         if not task:
-            return f'任务 {id} 不存在'
+            active = task_store.active_tasks()
+            if active:
+                ids = ', '.join(t.id for t in active)
+                return f'任务 {id} 不存在。当前活跃任务 ID: {ids}'
+            return f'任务 {id} 不存在，当前无活跃任务。'
         return f'已更新：[{task.id}] {task.progress}'
 
     @log.function_(call=True)
@@ -70,7 +74,11 @@ class Tools:
         _unregister_check(id)
         task = task_store.done(id, summary=summary)
         if not task:
-            return f'任务 {id} 不存在'
+            active = task_store.active_tasks()
+            if active:
+                ids = ', '.join(t.id for t in active)
+                return f'任务 {id} 不存在。当前活跃任务 ID: {ids}'
+            return f'任务 {id} 不存在，当前无活跃任务。'
         return f'任务完成：[{task.id}] {task.goal}'
 
     @log.function_(call=True)
@@ -82,8 +90,23 @@ class Tools:
         _unregister_check(id)
         task = task_store.fail(id, reason=reason)
         if not task:
-            return f'任务 {id} 不存在'
+            active = task_store.active_tasks()
+            if active:
+                ids = ', '.join(t.id for t in active)
+                return f'任务 {id} 不存在。当前活跃任务 ID: {ids}'
+            return f'任务 {id} 不存在，当前无活跃任务。'
         return f'任务失败：[{task.id}] {reason or task.goal}'
+
+    @log.function_(call=True)
+    async def task_force_clear(self):
+        """强制清除所有活跃任务及其定时检查。当任务无法正常关闭时使用此工具。"""
+        tasks = task_store.active_tasks()
+        if not tasks:
+            return '当前没有活跃任务需要清除。'
+        for t in tasks:
+            _unregister_check(t.id)
+            task_store.done(t.id, summary='强制清除')
+        return f'已强制清除 {len(tasks)} 个任务。'
 
     @log.function_(call=True)
     async def task_list(self):

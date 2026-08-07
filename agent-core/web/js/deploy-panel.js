@@ -1,19 +1,23 @@
 /**
  * deploy-panel.js — 部署服务 modal
  *
- * 单一 modal，展示所有驱动类别。每张卡内联版本下拉选择器。
- * 底部确认按钮触发部署，支持同时操作多个驱动（stop 仍为卡片内即时操作）。
+ * 双 Tab 设计：
+ *   Tab 1 「我的服务」— 管理已安装的服务（升级/停止/启动/卸载）
+ *   Tab 2 「驱动市场」— 浏览和安装新驱动（flat grid + filter chips）
  */
 
 let _overlay  = null;
 let _polling  = null;
 
 let _catalog  = { core: [], driver: [], perception: [], inspection: [] };
-let _statuses = {};   // driver_id → { running, status }
+let _statuses = {};   // driver_id → { running, status, running_image, image, last_deploy }
 let _logPolls = {};   // driver_id → intervalId
 
-// { driverId → { registry_image, tag } }
+// { driverId → { image } }
 let _pending = {};
+
+let _activeTab = 'my-services';
+let _activeFilter = null; // null = all providers
 
 export function initDeployPanel() {
   _overlay = document.getElementById('deploy-overlay');
@@ -21,8 +25,67 @@ export function initDeployPanel() {
   document.getElementById('btn-deploy').addEventListener('click', _open);
   document.getElementById('deploy-close').addEventListener('click', _close);
   document.getElementById('deploy-modal-confirm').addEventListener('click', _confirmAll);
-  document.getElementById('hw-search').addEventListener('input', () => _renderHardwareSection(_catalog.driver));
+
+  // Tab switching
+  _overlay.querySelectorAll('.deploy-tab').forEach(tab => {
+    tab.addEventListener('click', () => _switchTab(tab.dataset.tab));
+  });
+
+  // Marketplace search
+  document.getElementById('marketplace-search').addEventListener('input', _renderMarketplace);
+
+  // Channel selector
+  const channelSelect = document.getElementById('deploy-channel-select');
+  channelSelect.addEventListener('change', _onChannelChange);
+  _loadChannel();
 }
+
+// ── Channel management ────────────────────────────────────────────────────
+
+async function _loadChannel() {
+  try {
+    const res = await fetch('/api/config/update-channel');
+    const json = await res.json();
+    const channel = json.data?.channel || 'ga';
+    document.getElementById('deploy-channel-select').value = channel;
+  } catch { /* keep default */ }
+}
+
+async function _onChannelChange(e) {
+  const channel = e.target.value;
+  const warnings = {
+    preview: '预览版可能不稳定，仅建议用于测试环境。确定切换？',
+    release: '正式版已通过基础测试，但未经长期稳定性验证。确定切换？',
+  };
+  if (warnings[channel] && !confirm(warnings[channel])) {
+    await _loadChannel();
+    return;
+  }
+  try {
+    await fetch('/api/config/update-channel', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel }),
+    });
+    await _loadCatalog(true);
+    _render();
+  } catch { /* ignore */ }
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────
+
+function _switchTab(tabId) {
+  _activeTab = tabId;
+  _overlay.querySelectorAll('.deploy-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.tab === tabId);
+  });
+  _overlay.querySelectorAll('.deploy-tab-pane').forEach(p => {
+    p.classList.toggle('active', p.id === `pane-${tabId}`);
+  });
+  _render();
+}
+
+// ── Open / Close ──────────────────────────────────────────────────────────
 
 function _open() {
   _pending = {};
@@ -40,7 +103,6 @@ function _close() {
 // ── Data loading ──────────────────────────────────────────────────────────
 
 async function _load() {
-  // Auto-sync from registry on every open (transparent to user)
   try {
     await fetch('/api/drivers/sync', { method: 'POST' });
   } catch { /* ignore */ }
@@ -54,9 +116,7 @@ async function _loadCatalog(refresh = false) {
     const res  = await fetch(url);
     const json = await res.json();
     if (json.data) _catalog = json.data;
-  } catch {
-    // keep existing catalog
-  }
+  } catch { /* keep existing */ }
 }
 
 async function _loadStatuses() {
@@ -65,143 +125,578 @@ async function _loadStatuses() {
     const json = await res.json();
     _statuses = {};
     for (const d of (json.data || [])) {
-    _statuses[d.id] = {
+      _statuses[d.id] = {
         running:       d.running,
         status:        d.status,
         logs:          d.logs || '',
         running_image: d.running_image || '',
         image:         d.image || '',
         last_deploy:   d.last_deploy || null,
+        name:          d.name || '',
+        category:      d.category || 'driver',
       };
     }
-  } catch {
-    // keep existing statuses
-  }
+  } catch { /* keep existing */ }
+  // Update dots if visible
   _updateStatusDots();
-}
-
-// ── Empty state illustrations ─────────────────────────────────────────────
-
-const _EMPTY_ICONS = {
-  core:       `<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="10" width="28" height="18" rx="3.5" stroke="currentColor" stroke-width="1.4"/><path d="M4 15h28" stroke="currentColor" stroke-width="1.2"/><circle cx="8.5" cy="12.5" r="1" fill="currentColor"/><circle cx="12" cy="12.5" r="1" fill="currentColor"/><rect x="9" y="19" width="8" height="4" rx="1.2" stroke="currentColor" stroke-width="1.1"/><rect x="19" y="19" width="8" height="4" rx="1.2" stroke="currentColor" stroke-width="1.1"/></svg>`,
-  driver:     `<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="4" y="11" width="28" height="18" rx="3.5" stroke="currentColor" stroke-width="1.4"/><path d="M9 8v3M14 8v3M22 8v3M27 8v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><rect x="9" y="17" width="7" height="5" rx="1.2" stroke="currentColor" stroke-width="1.1"/><rect x="20" y="17" width="7" height="5" rx="1.2" stroke="currentColor" stroke-width="1.1"/><circle cx="18" cy="26" r="1.2" fill="currentColor" opacity=".6"/></svg>`,
-  perception: `<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="18" cy="18" r="9" stroke="currentColor" stroke-width="1.4"/><circle cx="18" cy="18" r="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M18 4v4M18 28v4M4 18h4M28 18h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`,
-};
-const _EMPTY_TITLE = {
-  core:       '暂无核心服务驱动',
-  driver:     '暂无硬件驱动',
-  perception: '暂无感知服务驱动',
-};
-function _emptyStateHTML(category) {
-  return `<div class="drivers-empty-state"><div class="drivers-empty-icon">${_EMPTY_ICONS[category] || _EMPTY_ICONS.driver}</div><div class="drivers-empty-title">${_EMPTY_TITLE[category] || '暂无可用驱动'}</div><div class="drivers-empty-hint">点击右上角「同步镜像」从镜像仓库拉取驱动</div></div>`;
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────
 
 function _render() {
-  _renderSection('drivers-core',       _catalog.core,       'core');
-  _renderHardwareSection(_catalog.driver);
-  _renderSection('drivers-perception', _catalog.perception, 'perception');
+  if (_activeTab === 'my-services') {
+    _renderMyServices();
+  } else {
+    _renderMarketplace();
+  }
   _syncFooter();
 }
 
-function _renderSection(containerId, items, category) {
-  const container = document.getElementById(containerId);
-  if (!items || items.length === 0) {
-    container.innerHTML = _emptyStateHTML(category);
+// ══════════════════════════════════════════════════════════════════════════
+//  TAB 1: 我的服务
+// ══════════════════════════════════════════════════════════════════════════
+
+function _renderMyServices() {
+  const container = document.getElementById('pane-my-services');
+
+  // Collect all items from catalog that have a status (i.e., deployed)
+  const allItems = [
+    ...(_catalog.core || []).map(it => ({ ...it, _cat: 'core' })),
+    ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
+    ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
+  ];
+
+  // Only show items that have actually been deployed (not just synced from catalog)
+  const deployed = allItems.filter(item => {
+    const id = _driverIdForItem(item, item._cat);
+    const s = _statuses[id];
+    if (!s) return false;
+    return s.running || s.last_deploy || item._cat === 'core';
+  });
+
+  if (deployed.length === 0) {
+    container.innerHTML = `<div class="svc-empty">
+      <div class="svc-empty-title">暂无已安装服务</div>
+      <div class="svc-empty-hint">前往「驱动市场」安装驱动</div>
+    </div>`;
     return;
   }
-  container.innerHTML = items.map(item => _cardHTML(item, category)).join('');
-  // Bind version selectors & stop buttons & upgrade buttons
-  container.querySelectorAll('.vsel').forEach(vsel => _bindVsel(vsel));
-  container.querySelectorAll('[data-action="stop"]').forEach(btn => {
-    btn.addEventListener('click', () => _stopDriver(btn.dataset.driverId, btn));
-  });
+
+  // Split into groups: updatable, running, stopped
+  const updatable = [];
+  const running   = [];
+  const stopped   = [];
+
+  for (const item of deployed) {
+    const id = _driverIdForItem(item, item._cat);
+    const s  = _statuses[id] || {};
+    const tags = item.tags || [];
+    const latestTag = tags.length > 0 ? tags[0].tag : null;
+    const currentTag = s.running_image?.includes(':') ? s.running_image.split(':').pop() : null;
+    const hasUpdate = latestTag && currentTag && latestTag !== currentTag;
+
+    const entry = { item, id, s, latestTag, currentTag, hasUpdate };
+
+    if ((s.running || item._cat === 'core') && hasUpdate) {
+      updatable.push(entry);
+    } else if (s.running || item._cat === 'core') {
+      running.push(entry);
+    } else {
+      stopped.push(entry);
+    }
+  }
+
+  let html = '';
+
+  if (updatable.length) {
+    html += _svcGroupHTML('可更新', updatable.length, 'updatable');
+    html += updatable.map(e => _svcRowHTML(e)).join('');
+    html += '</div>';
+  }
+  if (running.length) {
+    html += _svcGroupHTML('运行中', running.length, 'running');
+    html += running.map(e => _svcRowHTML(e)).join('');
+    html += '</div>';
+  }
+  if (stopped.length) {
+    html += _svcGroupHTML('已停止', stopped.length, 'stopped');
+    html += stopped.map(e => _svcRowHTML(e)).join('');
+    html += '</div>';
+  }
+
+  container.innerHTML = html;
+
+  // Bind actions
   container.querySelectorAll('[data-action="upgrade"]').forEach(btn => {
     btn.addEventListener('click', () => _showUpgradeConfirm(btn.dataset));
   });
+  container.querySelectorAll('[data-action="stop"]').forEach(btn => {
+    btn.addEventListener('click', () => _stopDriver(btn.dataset.driverId, btn));
+  });
+  container.querySelectorAll('[data-action="start"]').forEach(btn => {
+    btn.addEventListener('click', () => _startDriver(btn.dataset.driverId, btn.dataset.image, btn));
+  });
+  container.querySelectorAll('[data-action="remove"]').forEach(btn => {
+    btn.addEventListener('click', () => _removeDriver(btn.dataset.driverId, btn));
+  });
+  container.querySelectorAll('[data-action="log"]').forEach(btn => {
+    btn.addEventListener('click', () => _toggleLog(btn.dataset.driverId));
+  });
+  // Version switcher dropdowns
+  container.querySelectorAll('[data-action="switch-version"]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wrap = btn.closest('.svc-ver-wrap');
+      const dd = wrap.querySelector('.svc-ver-dropdown');
+
+      if (window.innerWidth <= 768) {
+        // Mobile: show bottom action sheet
+        _showVersionSheet(dd.innerHTML, wrap.dataset.driverId || '');
+        return;
+      }
+
+      // Desktop: position fixed dropdown
+      const wasHidden = dd.classList.contains('hidden');
+      document.querySelectorAll('.svc-ver-dropdown').forEach(d => d.classList.add('hidden'));
+      if (wasHidden) {
+        const rect = btn.getBoundingClientRect();
+        dd.classList.remove('hidden');
+        const ddHeight = dd.offsetHeight;
+        const spaceBelow = window.innerHeight - rect.bottom;
+        if (spaceBelow < ddHeight + 10) {
+          dd.style.top = (rect.top - ddHeight - 4) + 'px';
+        } else {
+          dd.style.top = (rect.bottom + 4) + 'px';
+        }
+        dd.style.right = (window.innerWidth - rect.right) + 'px';
+        dd.style.left = '';
+      }
+    });
+  });
+  container.querySelectorAll('.svc-ver-opt').forEach(opt => {
+    opt.addEventListener('click', () => {
+      if (opt.classList.contains('current')) return;
+      const { driverId, fullImage, tag, label, channel } = opt.dataset;
+      opt.closest('.svc-ver-dropdown').classList.add('hidden');
+      showDeployConfirmModal(
+        [{ label, currentTag: '—', newTag: tag, channel: channel || '' }],
+        () => _executeDeploys([[driverId, { image: fullImage }]])
+      );
+    });
+  });
 }
 
-// ── Hardware: provider accordion groups ────────────────────────────────────
+function _svcGroupHTML(title, count, cls) {
+  return `<div class="svc-group ${cls}">
+    <div class="svc-group-header">
+      <span class="svc-group-title">${title}</span>
+      <span class="svc-group-count">${count}</span>
+    </div>`;
+}
 
-function _renderHardwareSection(items) {
-  const container = document.getElementById('drivers-hardware-inner');
-  const q = (document.getElementById('hw-search')?.value || '').trim().toLowerCase();
+function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
+  const label = item._cat === 'driver' ? (item.model || item.image) : (item.name || item.image);
+  const isRunning = s.running || item._cat === 'core';
+  const statusDot = isRunning ? 'running' : s.status === 'error' ? 'error' : 'stopped';
+  const imageBase = item.full_repo || item.image;
+  const tags = item.tags || [];
 
-  if (!items || items.length === 0) {
-    container.innerHTML = _emptyStateHTML('driver');
-    return;
+  let actions = '';
+  // Version switcher (dropdown)
+  if (tags.length > 1) {
+    const versionOpts = tags.map(t => {
+      const fullImg = t.imageRef || (imageBase + ':' + t.tag);
+      const isCurrent = currentTag && t.tag === currentTag;
+      const ch = _channelLabel(t.channel);
+      return `<div class="svc-ver-opt${isCurrent ? ' current' : ''}" data-driver-id="${id}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}" data-channel="${t.channel || ''}">
+        <span class="svc-ver-tag">${t.tag}</span>
+        ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
+        ${isCurrent ? '<span class="svc-ver-badge">当前</span>' : ''}
+      </div>`;
+    }).join('');
+    actions += `<div class="svc-ver-wrap">
+      <button class="svc-btn svc-btn-ver" data-action="switch-version">切换版本 ▾</button>
+      <div class="svc-ver-dropdown hidden">${versionOpts}</div>
+    </div>`;
+  }
+  if (hasUpdate) {
+    const latestImage = tags[0]?.imageRef || (imageBase + ':' + latestTag);
+    actions += `<button class="svc-btn svc-btn-upgrade" data-action="upgrade" data-driver-id="${id}" data-current-tag="${currentTag}" data-latest-tag="${latestTag}" data-latest-image="${latestImage}" data-label="${label}">升级</button>`;
+  }
+  if (item._cat === 'core') {
+    // Core cannot stop itself — no stop button
+  } else if (isRunning) {
+    actions += `<button class="svc-btn svc-btn-stop" data-action="stop" data-driver-id="${id}">停止</button>`;
+  } else {
+    // Stopped: show start + remove
+    const lastImage = s.running_image || s.last_deploy?.image || s.image || '';
+    if (lastImage) {
+      actions += `<button class="svc-btn svc-btn-start" data-action="start" data-driver-id="${id}" data-image="${lastImage}">启动</button>`;
+    }
+    actions += `<button class="svc-btn svc-btn-remove" data-action="remove" data-driver-id="${id}">卸载</button>`;
   }
 
-  // Group by provider
-  const groups = {};
-  for (const item of items) {
-    const prov = item.provider || 'Unknown';
-    (groups[prov] ??= []).push(item);
-  }
+  // Log button (always available)
+  actions += `<button class="svc-btn svc-btn-log" data-action="log" data-driver-id="${id}">日志</button>`;
 
-  // Filter by search query; within each group, also filter items
-  let entries = Object.entries(groups);
-  let hasQuery = q.length > 0;
-  if (hasQuery) {
-    entries = entries
-      .map(([prov, provItems]) => {
-        const provMatch = prov.toLowerCase().includes(q);
-        const filtered = provMatch
-          ? provItems
-          : provItems.filter(it => (it.model || '').toLowerCase().includes(q));
-        return filtered.length ? [prov, filtered] : null;
-      })
-      .filter(Boolean);
-  }
+  const versionText = currentTag || (s.running_image?.split(':').pop()) || '—';
 
-  if (entries.length === 0) {
-    container.innerHTML = _emptyStateHTML('driver');
-    return;
-  }
+  return `
+    <div class="svc-row" id="card-${id}">
+      <div class="svc-row-dot ${statusDot}" id="dot-${id}"></div>
+      <div class="svc-row-info">
+        <span class="svc-row-name">${label}</span>
+        <div class="svc-row-version-line">
+          <span class="svc-row-version">${versionText}</span>
+          ${hasUpdate ? `<span class="svc-row-arrow">→</span><span class="svc-row-new-version">${latestTag}</span>` : ''}
+        </div>
+      </div>
+      <div class="svc-row-actions">${actions}</div>
+    </div>
+    <div class="deploy-log hidden" id="log-${id}"></div>`;
+}
 
-  // Render; first group open by default (or all open when searching)
-  container.innerHTML = entries
-    .map(([prov, provItems], idx) => _providerGroupHTML(prov, provItems, hasQuery || idx === 0))
-    .join('');
+// ══════════════════════════════════════════════════════════════════════════
+//  TAB 2: 驱动市场
+// ══════════════════════════════════════════════════════════════════════════
 
-  // Bind accordion toggle
-  container.querySelectorAll('.hw-provider-header').forEach(header => {
-    header.addEventListener('click', () => {
-      header.closest('.hw-provider-group').classList.toggle('open');
+function _renderMarketplace() {
+  const q = (document.getElementById('marketplace-search')?.value || '').trim().toLowerCase();
+
+  // Merge driver + perception for marketplace (core is managed in My Services only)
+  const allItems = [
+    ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
+    ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
+  ];
+
+  // Build provider list for filter chips
+  const providers = [...new Set(allItems.map(it => it.provider || it.name || 'Other').filter(Boolean))];
+
+  // Render filter chips
+  const filtersEl = document.getElementById('marketplace-filters');
+  filtersEl.innerHTML = `
+    <button class="mp-chip${_activeFilter === null ? ' active' : ''}" data-filter="">全部</button>
+    ${providers.map(p => `<button class="mp-chip${_activeFilter === p ? ' active' : ''}" data-filter="${p}">${p}</button>`).join('')}
+  `;
+  filtersEl.querySelectorAll('.mp-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      _activeFilter = chip.dataset.filter || null;
+      _renderMarketplace();
     });
   });
 
-  // Bind vsel + stop buttons
-  container.querySelectorAll('.vsel').forEach(vsel => _bindVsel(vsel));
-  container.querySelectorAll('[data-action="stop"]').forEach(btn => {
-    btn.addEventListener('click', () => _stopDriver(btn.dataset.driverId, btn));
+  // Filter items
+  let filtered = allItems;
+  if (_activeFilter) {
+    filtered = filtered.filter(it => (it.provider || it.name || 'Other') === _activeFilter);
+  }
+  if (q) {
+    filtered = filtered.filter(it => {
+      const model = (it.model || '').toLowerCase();
+      const provider = (it.provider || '').toLowerCase();
+      const name = (it.name || '').toLowerCase();
+      return model.includes(q) || provider.includes(q) || name.includes(q);
+    });
+  }
+
+  // Render grid
+  const gridEl = document.getElementById('marketplace-grid');
+  if (filtered.length === 0) {
+    gridEl.innerHTML = `<div class="svc-empty">
+      <div class="svc-empty-title">未找到驱动</div>
+      <div class="svc-empty-hint">尝试其他搜索词或切换更新通道</div>
+    </div>`;
+    return;
+  }
+
+  gridEl.innerHTML = filtered.map(item => _mpCardHTML(item)).join('');
+
+  // Bind install buttons
+  gridEl.querySelectorAll('.mp-install-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _toggleInstallDropdown(btn);
+    });
   });
-  container.querySelectorAll('[data-action="upgrade"]').forEach(btn => {
-    btn.addEventListener('click', () => _showUpgradeConfirm(btn.dataset));
+
+  // Bind card click → detail
+  gridEl.querySelectorAll('.mp-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      // Don't open detail if clicking install button or version dropdown
+      if (e.target.closest('.mp-install-btn') || e.target.closest('.mp-versions') || e.target.closest('.mp-installed-badge')) return;
+      _showDriverDetail(card);
+    });
+  });
+
+  // Bind version options
+  gridEl.querySelectorAll('.mp-version-opt').forEach(opt => {
+    opt.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const driverId = opt.dataset.driverId;
+      const image = opt.dataset.fullImage;
+      const label = opt.dataset.label;
+      const tag = opt.dataset.tag;
+      const channel = opt.dataset.channel || '';
+      opt.closest('.mp-card').querySelector('.mp-versions').classList.add('hidden');
+      showDeployConfirmModal(
+        [{ label, currentTag: '—', newTag: tag, channel }],
+        () => _executeDeploys([[driverId, { image }]])
+      );
+    });
   });
 }
 
-function _providerGroupHTML(provider, items, open) {
-  const cards = items.map(item => _cardHTML(item, 'driver')).join('');
-  const chevron = `<svg class="hw-provider-chevron" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 5l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+function _mpCardHTML(item) {
+  const cat = item._cat;
+  const label = cat === 'driver' ? (item.model || item.image) : (item.name || item.image);
+  const provider = item.provider || '';
+  const driverId = _driverIdForItem(item, cat);
+  const s = _statuses[driverId];
+  const isInstalled = s && (s.running || s.last_deploy);
+  const tags = item.tags || [];
+  const imageBase = item.full_repo || item.image;
+  const desc = item.description || (cat === 'perception' ? '语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测' : '');
+  const fullName = item.name || label;
+
+  const versionOpts = tags.map(t => {
+    const fullImg = t.imageRef || (imageBase + ':' + t.tag);
+    const ch = _channelLabel(t.channel);
+    return `<div class="mp-version-opt" data-driver-id="${driverId}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}" data-channel="${t.channel || ''}">
+      <span class="mp-version-tag">${t.tag}</span>
+      ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
+      ${t.created ? `<span class="mp-version-date">${t.created.replace(/\s+\d{2}:\d{2}$/, '')}</span>` : ''}
+    </div>`;
+  }).join('');
+
+  const installBtn = isInstalled
+    ? `<span class="mp-action-btn mp-installed-badge">已安装</span>`
+    : tags.length > 0
+      ? `<button class="mp-action-btn mp-install-btn">安装 ▾</button>`
+      : `<span class="mp-action-btn mp-no-version">暂无版本</span>`;
+
   return `
-  <div class="hw-provider-group${open ? ' open' : ''}">
-    <div class="hw-provider-header">
-      <span class="hw-provider-left">
-        <span>${provider}</span>
-        <span class="hw-provider-count">${items.length}</span>
-      </span>
-      ${chevron}
-    </div>
-    <div class="hw-provider-body">${cards}</div>
-  </div>`;
+    <div class="mp-card" data-driver-id="${driverId}" data-name="${_escAttr(fullName)}" data-desc="${_escAttr(desc)}" data-provider="${_escAttr(provider)}">
+      <div class="mp-card-header">
+        <span class="mp-card-name">${label}</span>
+        ${provider ? `<span class="mp-card-provider">${provider}</span>` : ''}
+      </div>
+      ${desc ? `<div class="mp-card-desc">${_escHTML(desc)}</div>` : ''}
+      <div class="mp-card-action">${installBtn}</div>
+      <div class="mp-versions hidden">${versionOpts}</div>
+      <div class="mp-card-log hidden" id="mp-log-${driverId}"></div>
+    </div>`;
 }
 
+function _escAttr(s) { return s.replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+function _escHTML(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
-function _cardLabel(item, category) {
-  if (category === 'driver') return item.model || item.image;
-  return item.name || item.image;
+function _toggleInstallDropdown(btn) {
+  const card = btn.closest('.mp-card');
+  const dropdown = card.querySelector('.mp-versions');
+
+  if (window.innerWidth <= 768) {
+    // Mobile: use bottom action sheet
+    const label = card.querySelector('.mp-card-name')?.textContent || '';
+    _showInstallSheet(dropdown.innerHTML, label);
+    return;
+  }
+
+  // Desktop: position fixed dropdown
+  const wasHidden = dropdown.classList.contains('hidden');
+  document.querySelectorAll('.mp-versions').forEach(d => d.classList.add('hidden'));
+  if (wasHidden) {
+    const rect = btn.getBoundingClientRect();
+    dropdown.classList.remove('hidden');
+    dropdown.style.position = 'fixed';
+    dropdown.style.left = '';
+    dropdown.style.transform = '';
+    const ddHeight = dropdown.offsetHeight;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    if (spaceBelow < ddHeight + 10) {
+      dropdown.style.top = (rect.top - ddHeight - 4) + 'px';
+    } else {
+      dropdown.style.top = (rect.bottom + 4) + 'px';
+    }
+    dropdown.style.right = (window.innerWidth - rect.right) + 'px';
+  }
+}
+
+function _showInstallSheet(optionsHTML, title) {
+  document.getElementById('ver-sheet-overlay')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'ver-sheet-overlay';
+  overlay.className = 'ver-sheet-overlay';
+  overlay.innerHTML = `
+    <div class="ver-sheet">
+      <div class="ver-sheet-header">
+        <span class="ver-sheet-title">${title || '选择版本'}</span>
+        <button class="ver-sheet-close">✕</button>
+      </div>
+      <div class="ver-sheet-body">${optionsHTML}</div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  requestAnimationFrame(() => overlay.classList.add('active'));
+
+  const close = () => {
+    overlay.classList.remove('active');
+    setTimeout(() => overlay.remove(), 200);
+  };
+
+  overlay.querySelector('.ver-sheet-close').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  overlay.querySelectorAll('.mp-version-opt').forEach(opt => {
+    opt.addEventListener('click', () => {
+      const { driverId, fullImage, tag, label, channel } = opt.dataset;
+      close();
+      showDeployConfirmModal(
+        [{ label, currentTag: '—', newTag: tag, channel: channel || '' }],
+        () => _executeDeploys([[driverId, { image: fullImage }]])
+      );
+    });
+  });
+}
+
+// Close marketplace dropdowns when clicking outside
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.mp-card')) {
+    document.querySelectorAll('.mp-versions').forEach(d => d.classList.add('hidden'));
+  }
+  if (!e.target.closest('.svc-ver-wrap')) {
+    document.querySelectorAll('.svc-ver-dropdown').forEach(d => d.classList.add('hidden'));
+  }
+});
+
+// ── Driver detail (in-modal view) ────────────────────────────────────────
+
+function _showDriverDetail(card) {
+  const name = card.dataset.name || '';
+  const desc = card.dataset.desc || '';
+  const provider = card.dataset.provider || '';
+  const driverId = card.dataset.driverId || '';
+  const s = _statuses[driverId];
+  const isInstalled = s && (s.running || s.last_deploy);
+
+  // Get tags from the card's versions dropdown
+  const versions = [...card.querySelectorAll('.mp-version-opt')].map(opt => ({
+    tag: opt.dataset.tag,
+    fullImage: opt.dataset.fullImage,
+    label: opt.dataset.label,
+    channel: opt.dataset.channel || '',
+  }));
+
+  const pane = document.getElementById('pane-marketplace');
+  // Save current content for back navigation
+  const savedHTML = pane.innerHTML;
+
+  const versionsHTML = versions.map(v => {
+    const ch = _channelLabel(v.channel);
+    return `
+    <div class="detail-ver-row" data-full-image="${v.fullImage}" data-tag="${v.tag}" data-label="${v.label}" data-driver-id="${driverId}" data-channel="${v.channel}">
+      <span class="detail-ver-tag">${v.tag}</span>
+      ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
+      <button class="svc-btn svc-btn-upgrade">部署此版本</button>
+    </div>`;
+  }).join('');
+
+  pane.innerHTML = `
+    <div class="mp-detail">
+      <button class="mp-detail-back">← 返回</button>
+      <div class="mp-detail-header">
+        <div class="mp-detail-title">${name}</div>
+        ${provider ? `<div class="mp-detail-provider">${provider}</div>` : ''}
+        ${isInstalled ? '<span class="mp-installed-badge" style="margin-top:8px;display:inline-block">已安装</span>' : ''}
+      </div>
+      ${desc ? `<div class="mp-detail-desc">${desc}</div>` : '<div class="mp-detail-desc" style="color:var(--text-dim)">暂无描述</div>'}
+      <div class="deploy-log hidden" id="mp-log-${driverId}"></div>
+      <div class="mp-detail-versions">
+        <div class="mp-detail-section-title">可用版本</div>
+        ${versionsHTML || '<div style="color:var(--text-dim);font-size:12px">暂无版本</div>'}
+      </div>
+    </div>
+  `;
+
+  // Bind back
+  pane.querySelector('.mp-detail-back').addEventListener('click', () => {
+    pane.innerHTML = savedHTML;
+    _renderMarketplace();
+  });
+
+  // Bind deploy buttons
+  pane.querySelectorAll('.detail-ver-row .svc-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const row = btn.closest('.detail-ver-row');
+      showDeployConfirmModal(
+        [{ label: row.dataset.label, currentTag: '—', newTag: row.dataset.tag, channel: row.dataset.channel || '' }],
+        () => _executeDeploys([[row.dataset.driverId, { image: row.dataset.fullImage }]])
+      );
+    });
+  });
+
+  // Always fetch and show deploy logs on detail page
+  const logEl = document.getElementById(`mp-log-${driverId}`);
+  if (logEl) {
+    fetch(`/api/drivers/${driverId}/status`).then(r => r.json()).then(json => {
+      const logs = (json.data || {}).logs || '';
+      if (logs.trim()) {
+        const lines = logs.trim().split('\n');
+        logEl.innerHTML = `<div class="deploy-log-title">上次部署日志</div><pre class="log-output">${lines.join('\n')}</pre>`;
+        logEl.scrollTop = logEl.scrollHeight;
+        logEl.classList.remove('hidden');
+      }
+    }).catch(() => {});
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SHARED UTILITIES
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── Mobile: bottom action sheet for version selection ─────────────────────
+
+function _showVersionSheet(optionsHTML) {
+  // Remove existing sheet if any
+  document.getElementById('ver-sheet-overlay')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'ver-sheet-overlay';
+  overlay.className = 'ver-sheet-overlay';
+  overlay.innerHTML = `
+    <div class="ver-sheet">
+      <div class="ver-sheet-header">
+        <span class="ver-sheet-title">选择版本</span>
+        <button class="ver-sheet-close">✕</button>
+      </div>
+      <div class="ver-sheet-body">${optionsHTML}</div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  // Animate in
+  requestAnimationFrame(() => overlay.classList.add('active'));
+
+  const close = () => {
+    overlay.classList.remove('active');
+    setTimeout(() => overlay.remove(), 200);
+  };
+
+  overlay.querySelector('.ver-sheet-close').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  // Bind version option clicks
+  overlay.querySelectorAll('.svc-ver-opt').forEach(opt => {
+    opt.addEventListener('click', () => {
+      if (opt.classList.contains('current')) return;
+      const { driverId, fullImage, tag, label, channel } = opt.dataset;
+      close();
+      showDeployConfirmModal(
+        [{ label, currentTag: '—', newTag: tag, channel: channel || '' }],
+        () => _executeDeploys([[driverId, { image: fullImage }]])
+      );
+    });
+  });
 }
 
 function _driverIdForItem(item, category) {
@@ -209,164 +704,21 @@ function _driverIdForItem(item, category) {
   return item.image;
 }
 
-function _vselHTML(driverId, imageBase, runningImage, tags, running, latestTag, deployedTag) {
-  const opts = tags.map((t, idx) => {
-    const fullImg   = t.imageRef || (imageBase + ':' + t.tag);
-    const isCurrent = runningImage && runningImage.endsWith(':' + t.tag);
-    // 仅在运行中时，已部署版本不可重新选择
-    const isDisabled = isCurrent && running;
-    const isLatest  = idx === 0;
-    const dateStr   = t.created ? t.created.replace(/\s+\d{2}:\d{2}$/, '') : '';
-    const timeStr   = t.created ? t.created.match(/\d{2}:\d{2}$/)?.[0] ?? '' : '';
-    const dateLabel = dateStr + (timeStr ? ' ' + timeStr : '');
-    return `<div class="vsel-option${isDisabled ? ' disabled' : ''}" data-value="${t.tag}" data-full-image="${fullImg}">
-      <span class="vsel-option-tag">${t.tag}</span>
-      ${dateLabel ? `<span class="vsel-option-date">${dateLabel}</span>` : ''}
-      ${isCurrent ? `<span class="vsel-option-current">已部署</span>` : ''}
-      ${isLatest && !isCurrent ? `<span class="vsel-option-latest">最新</span>` : ''}
-    </div>`;
-  }).join('');
-  // 若有已部署版本，按钮初始显示该版本名
-  const btnLabel = deployedTag ? `${running ? '▶' : '⏹'} ${deployedTag}` : '— 选择版本 —';
-  const hasValue = !!deployedTag;
-  return `<div class="vsel${hasValue ? ' has-value' : ''}" data-driver-id="${driverId}" data-image-base="${imageBase}">
-    <button type="button" class="vsel-btn">
-      <span class="vsel-label">${btnLabel}</span>
-      <svg class="vsel-chevron" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>
-    <div class="vsel-dropdown">${opts}</div>
-  </div>`;
-}
-
-function _cardHTML(item, category) {
-  const label    = _cardLabel(item, category);
-  const driverId = _driverIdForItem(item, category);
-  const s        = _statuses[driverId] || {};
-  const running  = s.running || false;
-  const errored  = s.status === 'error';
-  const tags     = item.tags || [];
-  const imageBase = item.full_repo || item.image;
-  const runningImage = s.running_image || '';
-
-  // core: no status dot, no stop button — version selector replaces deployed tag
-  if (category === 'core') {
-    const currentTag = runningImage.includes(':') ? runningImage.split(':').pop() : runningImage;
-    const versionCtrl = tags.length === 0
-      ? `<span style="font-size:11px;color:var(--text-dim)">暂无版本</span>`
-      : _vselHTML(driverId, imageBase, runningImage, tags, false, tags.length > 0 ? tags[0].tag : null, currentTag);
-    return `
-    <div class="driver-card" id="card-${driverId}">
-      <div class="driver-card-info">
-        <div class="driver-card-name">${label}</div>
-        <div class="driver-card-image">${imageBase}</div>
-        <div class="driver-card-vsel">${versionCtrl}</div>
-      </div>
-    </div>
-    <div class="deploy-log hidden" id="log-${driverId}"></div>`;
-  }
-
-  const statusClass = running ? 'running' : errored ? 'error' : 'stopped';
-
-  // Determine currently deployed tag for non-core drivers
-  let deployedTag = '';
-  if (runningImage) {
-    deployedTag = runningImage.includes(':') ? runningImage.split(':').pop() : runningImage;
-  } else if (s.last_deploy?.image) {
-    deployedTag = s.last_deploy.image.includes(':') ? s.last_deploy.image.split(':').pop() : s.last_deploy.image;
-  }
-
-  // 检测是否有新版本（tags[0] 为最新）
-  const latestTag = tags.length > 0 ? tags[0].tag : null;
-  const currentTag = runningImage?.includes(':') ? runningImage.split(':').pop() : null;
-  const hasNewVersion = latestTag && currentTag && latestTag !== currentTag;
-
-  const versionCtrl = tags.length === 0
-    ? `<span style="font-size:11px;color:var(--text-dim)">暂无版本</span>`
-    : _vselHTML(driverId, imageBase, runningImage, tags, running, latestTag, deployedTag);
-
-  const stopBtn = running
-    ? `<button class="btn-deploy-action running" data-action="stop" data-driver-id="${driverId}">停止</button>`
-    : '';
-
-  return `
-    <div class="driver-card" id="card-${driverId}">
-      <div class="driver-status-dot ${statusClass}" id="dot-${driverId}"></div>
-      <div class="driver-card-info">
-        <div class="driver-card-name">${label}${running ? `<span class="driver-running-badge">运行中</span>` : ''}${hasNewVersion ? `<span class="btn-upgrade" data-action="upgrade" data-driver-id="${driverId}" data-current-tag="${currentTag}" data-latest-tag="${latestTag}" data-latest-image="${imageBase}:${latestTag}" data-label="${label}">有新版本</span>` : ''}</div>
-        <div class="driver-card-image">${imageBase}</div>
-        <div class="driver-card-vsel">${versionCtrl}</div>
-      </div>
-      ${stopBtn ? `<div class="driver-card-ctrl">${stopBtn}</div>` : ''}
-    </div>
-    <div class="deploy-log hidden" id="log-${driverId}"></div>`;
+function _channelLabel(channel) {
+  if (channel === 'ga') return 'Stable';
+  if (channel === 'release') return 'Release';
+  if (channel === 'preview') return 'Preview';
+  return '';
 }
 
 function _updateStatusDots() {
   for (const [id, s] of Object.entries(_statuses)) {
     const dot = document.getElementById(`dot-${id}`);
     if (dot) {
-      dot.className = 'driver-status-dot ' + (s.running ? 'running' : s.status === 'error' ? 'error' : 'stopped');
+      const isRunning = s.running || s.category === 'core';
+      dot.className = 'svc-row-dot ' + (isRunning ? 'running' : s.status === 'error' ? 'error' : 'stopped');
     }
   }
-}
-
-// ── Version select ─────────────────────────────────────────────────────────
-
-function _bindVsel(vsel) {
-  const btn      = vsel.querySelector('.vsel-btn');
-  const dropdown = vsel.querySelector('.vsel-dropdown');
-
-  btn.addEventListener('click', e => {
-    e.stopPropagation();
-    const isOpen = vsel.classList.contains('open');
-    // Close all others
-    document.querySelectorAll('.vsel.open').forEach(v => v.classList.remove('open'));
-    if (!isOpen) vsel.classList.add('open');
-  });
-
-  dropdown.querySelectorAll('.vsel-option').forEach(opt => {
-    opt.addEventListener('click', () => {
-      if (opt.classList.contains('disabled')) return;
-
-      const tag       = opt.dataset.value;
-      const fullImage = opt.dataset.fullImage;
-      const driverId  = vsel.dataset.driverId;
-
-      // Update label & selected state
-      dropdown.querySelectorAll('.vsel-option').forEach(o => o.classList.remove('selected'));
-      opt.classList.add('selected');
-      vsel.querySelector('.vsel-label').textContent = tag;
-      vsel.classList.add('has-value');
-      vsel.classList.remove('open');
-
-      if (tag) {
-        _pending[driverId] = { image: fullImage };
-      } else {
-        delete _pending[driverId];
-      }
-      _syncFooter();
-    });
-  });
-}
-
-// Close dropdowns when clicking outside
-document.addEventListener('click', () => {
-  document.querySelectorAll('.vsel.open').forEach(v => v.classList.remove('open'));
-});
-
-function _onVersionChange(sel) {
-  const driverId  = sel.dataset.driverId;
-  const tag       = sel.value;
-  const opt       = sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex] : null;
-  // Prefer the full imageRef stored on the option; fall back to building from imageBase
-  const fullImage = (opt && opt.dataset.fullImage) || (sel.dataset.imageBase + ':' + tag);
-
-  if (tag) {
-    _pending[driverId] = { image: fullImage };
-  } else {
-    delete _pending[driverId];
-  }
-  _syncFooter();
 }
 
 function _syncFooter() {
@@ -392,15 +744,19 @@ export function showDeployConfirmModal(items, onConfirm) {
   const overlay = document.getElementById('deploy-confirm-overlay');
   const body    = document.getElementById('deploy-confirm-body');
 
-  body.innerHTML = items.map(it => `
+  body.innerHTML = items.map(it => {
+    const ch = it.channel ? _channelLabel(it.channel) : '';
+    return `
     <div class="deploy-confirm-item">
       <div class="deploy-confirm-item-name">${it.label}</div>
       <div class="deploy-confirm-item-versions">
         <span class="deploy-confirm-tag current">${it.currentTag || '—'}</span>
         <span class="deploy-confirm-arrow">→</span>
         <span class="deploy-confirm-tag latest">${it.newTag}</span>
+        ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   overlay.classList.remove('hidden');
 
@@ -418,19 +774,16 @@ export function showDeployConfirmModal(items, onConfirm) {
   btnCancel.addEventListener('click', doCancel);
 }
 
-// ── Upgrade confirm (single driver → deploy immediately) ──────────────────
+// ── Upgrade confirm ───────────────────────────────────────────────────────
 
 function _showUpgradeConfirm({ driverId, currentTag, latestTag, latestImage, label }) {
   showDeployConfirmModal(
     [{ label, currentTag, newTag: latestTag }],
-    () => {
-      // Deploy directly
-      _executeDeploys([[driverId, { image: latestImage }]]);
-    }
+    () => _executeDeploys([[driverId, { image: latestImage }]])
   );
 }
 
-// ── Stop ──────────────────────────────────────────────────────────────────
+// ── Stop / Start / Remove ─────────────────────────────────────────────────
 
 async function _stopDriver(driverId, btn) {
   btn.disabled    = true;
@@ -440,7 +793,42 @@ async function _stopDriver(driverId, btn) {
   } catch (e) {
     console.error('[deploy] stop', e);
   }
-  setTimeout(_loadStatuses, 1500);
+  setTimeout(async () => { await _loadStatuses(); _render(); }, 1500);
+}
+
+async function _startDriver(driverId, image, btn) {
+  if (!image) return;
+  btn.disabled    = true;
+  btn.textContent = '启动中…';
+  _showDeployLog(driverId, '正在启动…');
+  try {
+    const res = await fetch(`/api/drivers/${driverId}/deploy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image }),
+    });
+    const json = await res.json();
+    if (json.code !== 200) {
+      _appendLog(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
+    } else {
+      _appendLog(driverId, '容器启动中…');
+      _startLogPolling(driverId);
+    }
+  } catch (e) {
+    _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
+  }
+}
+
+async function _removeDriver(driverId, btn) {
+  if (!confirm('确定卸载此服务？将移除容器并释放空间。')) return;
+  btn.disabled = true;
+  btn.textContent = '卸载中…';
+  try {
+    await fetch(`/api/drivers/${driverId}/remove`, { method: 'POST' });
+  } catch (e) {
+    console.error('[deploy] remove', e);
+  }
+  setTimeout(async () => { await _loadStatuses(); _render(); }, 1500);
 }
 
 // ── Confirm all pending deploys ───────────────────────────────────────────
@@ -449,31 +837,22 @@ async function _confirmAll() {
   const entries = Object.entries(_pending);
   if (!entries.length) return;
 
-  // Build items for the confirm modal
   const items = entries.map(([id, { image }]) => {
     const s = _statuses[id] || {};
     const currentTag = s.running_image?.includes(':') ? s.running_image.split(':').pop() : '—';
     const newTag = image.split(':').pop();
-    let label = id;
-    for (const cat of [_catalog.core, _catalog.driver, _catalog.perception]) {
-      for (const item of (cat || [])) {
-        const cid = _driverIdForItem(item, cat === _catalog.driver ? 'driver' : 'core');
-        if (cid === id) { label = _cardLabel(item, cat === _catalog.driver ? 'driver' : 'core'); break; }
-      }
-    }
-    return { label, currentTag, newTag };
+    return { label: s.name || id, currentTag, newTag };
   });
 
-  showDeployConfirmModal(items, () => {
-    _executeDeploys(entries);
-  });
+  showDeployConfirmModal(items, () => _executeDeploys(entries));
 }
 
 async function _executeDeploys(entries) {
-  document.getElementById('deploy-modal-confirm').disabled = true;
+  const confirmBtn = document.getElementById('deploy-modal-confirm');
+  if (confirmBtn) confirmBtn.disabled = true;
 
   for (const [driverId, { image }] of entries) {
-    const isCoreDriver = _catalog.core.some(item => _driverIdForItem(item, 'core') === driverId);
+    const isCoreDriver = (_catalog.core || []).some(item => _driverIdForItem(item, 'core') === driverId);
 
     if (isCoreDriver) {
       _showDeployLog(driverId, '正在启动升级…');
@@ -494,32 +873,78 @@ async function _executeDeploys(entries) {
         _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
       }
     } else {
-      _showDeployLog(driverId, '正在请求部署…');
+      _showDeployLogAny(driverId, '正在请求部署…');
       try {
-        const res  = await fetch(`/api/drivers/${driverId}/deploy`, {
+        const res = await fetch(`/api/drivers/${driverId}/deploy`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ image }),
         });
         const json = await res.json();
         if (json.code !== 200) {
-          _appendLog(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
+          _appendLogAny(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
         } else {
-          _appendLog(driverId, '容器启动中…');
+          _appendLogAny(driverId, '镜像拉取中…');
           _startLogPolling(driverId);
         }
       } catch (e) {
-        _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
+        _appendLogAny(driverId, `✗ 网络错误: ${e.message}`, 'error');
       }
     }
   }
 
   _pending = {};
   _syncFooter();
-  document.getElementById('deploy-modal-confirm').disabled = false;
+  if (confirmBtn) confirmBtn.disabled = false;
 }
 
 // ── Deploy log (inline) ───────────────────────────────────────────────────
+
+function _ensureLogElement(driverId) {
+  if (document.getElementById(`log-${driverId}`)) return;
+  // Create a temporary card + log area for new installs
+  const container = document.getElementById('pane-my-services');
+  if (!container) return;
+  const html = `
+    <div class="svc-row" id="card-${driverId}">
+      <div class="svc-row-dot deploying" id="dot-${driverId}"></div>
+      <div class="svc-row-info">
+        <span class="svc-row-name">${driverId}</span>
+        <div class="svc-row-version-line"><span class="svc-row-version">部署中…</span></div>
+      </div>
+    </div>
+    <div class="deploy-log" id="log-${driverId}"></div>`;
+  container.insertAdjacentHTML('afterbegin', html);
+}
+
+async function _toggleLog(driverId) {
+  const el = document.getElementById(`log-${driverId}`);
+  if (!el) return;
+
+  if (!el.classList.contains('hidden')) {
+    el.classList.add('hidden');
+    return;
+  }
+
+  el.innerHTML = `<div class="deploy-log-line" style="color:var(--text-dim)">加载中…</div>`;
+  el.classList.remove('hidden');
+
+  try {
+    const res = await fetch(`/api/drivers/${driverId}/status`);
+    const json = await res.json();
+    const data = json.data || {};
+    const logs = data.logs || '';
+
+    if (logs.trim()) {
+      const lines = logs.trim().split('\n').slice(-20);
+      el.innerHTML = `<pre class="log-output">${lines.join('\n')}</pre>`;
+    } else {
+      el.innerHTML = `<div class="deploy-log-line" style="color:var(--text-dim)">暂无日志</div>`;
+    }
+  } catch {
+    el.innerHTML = `<div class="deploy-log-line error">获取日志失败</div>`;
+  }
+}
 
 function _showDeployLog(driverId, msg) {
   const el = document.getElementById(`log-${driverId}`);
@@ -538,6 +963,42 @@ function _appendLog(driverId, msg, type = '') {
   el.scrollTop = el.scrollHeight;
 }
 
+// Variants that check both marketplace (mp-log-) and my-services (log-) elements
+function _getLogEl(driverId) {
+  return document.getElementById(`mp-log-${driverId}`) || document.getElementById(`log-${driverId}`);
+}
+
+function _isCardLog(el) {
+  return el && el.classList.contains('mp-card-log');
+}
+
+function _showDeployLogAny(driverId, msg) {
+  const el = _getLogEl(driverId);
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function _appendLogAny(driverId, msg, type = '') {
+  const el = _getLogEl(driverId);
+  if (!el) return;
+  if (_isCardLog(el)) {
+    // Single-line overwrite on card
+    el.textContent = msg;
+    if (type === 'error') { el.style.color = 'var(--red)'; }
+    else if (type === 'success') { el.style.color = 'var(--green)'; }
+    else { el.style.color = ''; }
+    el.classList.remove('hidden');
+  } else {
+    // Multi-line append on detail/my-services
+    const line = document.createElement('div');
+    line.className = 'deploy-log-line' + (type ? ` ${type}` : '');
+    line.textContent = msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
 function _startLogPolling(driverId) {
   if (_logPolls[driverId]) clearInterval(_logPolls[driverId]);
 
@@ -551,27 +1012,37 @@ function _startLogPolling(driverId) {
       const status = data.status || '';
       const logs   = data.logs   || '';
 
-      const el = document.getElementById(`log-${driverId}`);
+      const el = _getLogEl(driverId);
       if (el && logs) {
-        const lines = logs.trim().split('\n').slice(-5);
-        el.querySelectorAll('.log-output').forEach(e => e.remove());
-        const pre = document.createElement('pre');
-        pre.className = 'log-output';
-        pre.textContent = lines.join('\n');
-        el.appendChild(pre);
+        if (_isCardLog(el)) {
+          // Single-line: show last meaningful line
+          const lastLine = logs.trim().split('\n').filter(Boolean).pop() || '';
+          el.textContent = lastLine;
+          el.style.color = '';
+        } else {
+          // Multi-line: show full log
+          const lines = logs.trim().split('\n').slice(-30);
+          el.querySelectorAll('.log-output').forEach(e => e.remove());
+          const pre = document.createElement('pre');
+          pre.className = 'log-output';
+          pre.textContent = lines.join('\n');
+          el.appendChild(pre);
+          el.scrollTop = el.scrollHeight;
+        }
       }
 
       if (status === 'running') {
         _stopLogPolling(driverId);
-        _appendLog(driverId, '✓ 运行中', 'success');
+        _appendLogAny(driverId, '✓ 运行中', 'success');
         setTimeout(() => {
-          const logEl = document.getElementById(`log-${driverId}`);
+          const logEl = _getLogEl(driverId);
           if (logEl) logEl.classList.add('hidden');
         }, 5000);
-        _loadStatuses();
+        await _loadStatuses();
+        _render();
       } else if (status === 'error' || attempts > 30) {
         _stopLogPolling(driverId);
-        _appendLog(driverId, `✗ ${status === 'error' ? (data.error || '启动失败') : '部署超时'}`, 'error');
+        _appendLogAny(driverId, `✗ ${status === 'error' ? (data.error || '启动失败') : '部署超时'}`, 'error');
       }
     } catch {
       // ignore
@@ -586,7 +1057,7 @@ function _stopLogPolling(driverId) {
   }
 }
 
-// ── Core update polling (uses /api/system/update-status) ─────────────────
+// ── Core update polling ───────────────────────────────────────────────────
 
 function _startCoreUpdatePolling(driverId) {
   if (_logPolls[driverId]) clearInterval(_logPolls[driverId]);
@@ -603,7 +1074,6 @@ function _startCoreUpdatePolling(driverId) {
         _stopLogPolling(driverId);
         _appendLog(driverId, `✗ 升级失败：${data.error}`, 'error');
       } else if (data.step) {
-        // 更新进度显示
         const el = document.getElementById(`log-${driverId}`);
         if (el) {
           el.querySelectorAll('.log-output').forEach(e => e.remove());
@@ -619,7 +1089,7 @@ function _startCoreUpdatePolling(driverId) {
         _appendLog(driverId, '✗ 升级超时', 'error');
       }
     } catch {
-      // 服务重启中，连接断开是正常的 — 等待重连
+      // 服务重启中，连接断开是正常的
     }
   }, 2000);
 }

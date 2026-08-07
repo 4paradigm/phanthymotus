@@ -73,7 +73,7 @@ _l2_static_cache: dict = {'fingerprint': None, 'content': ''}
 
 
 def _registry_fingerprint(mcp_registry: dict, bound_tools: set | None) -> tuple:
-    """计算 registry + bound_tools 的指纹，用于判断是否需要重建。"""
+    """计算 registry + bound_tools + skills 状态的指纹，用于判断是否需要重建。"""
     # 使用 registry 的 key 集合 + 每个设备的 online/tools 状态 + bound_tools
     parts = []
     for mcp_id, info in sorted(mcp_registry.items()):
@@ -83,7 +83,13 @@ def _registry_fingerprint(mcp_registry: dict, bound_tools: set | None) -> tuple:
             tuple(sorted(info.get('tools', []))),
             info.get('name', ''),
         ))
-    return (tuple(parts), frozenset(bound_tools) if bound_tools else None)
+    # 包含 skills 状态（visible + runtime activated）
+    from event.skills import visible_skills as _visible_skills, _runtime_activated as _rt_act
+    skills_fp = (
+        tuple(s['slug'] for s in _visible_skills()),
+        frozenset(_rt_act),
+    )
+    return (tuple(parts), frozenset(bound_tools) if bound_tools else None, skills_fp)
 
 
 def _env_static(mcp_registry: dict, bound_tools: set | None = None) -> str:
@@ -172,21 +178,12 @@ def _env_static(mcp_registry: dict, bound_tools: set | None = None) -> str:
 # ── L2 动态部分（时间/任务/事件统计）─────────────────────────────────────────
 
 def _env_dynamic() -> str:
-    """生成 L2 动态环境快照（时间、活跃任务、最近事件）。
+    """生成 L2 动态环境快照（时间、活跃任务）。
 
     每次调用都重新生成，但作为 user message 放在历史之后，
     不影响 system message 的缓存命中。
     """
     now = datetime.datetime.now(_TZ_CN).strftime('%Y-%m-%d %H:%M:%S')
-
-    # 最近事件来源统计
-    recents = event_bus.recent(10)
-    if recents:
-        from collections import Counter
-        counts = Counter(e['source'] for e in recents)
-        recent_str = ', '.join(f'{src} ×{n}' for src, n in counts.most_common())
-    else:
-        recent_str = '暂无历史事件'
 
     # 活跃任务
     import task_store
@@ -206,9 +203,11 @@ def _env_dynamic() -> str:
             task_lines.append(f'  <task id="{t.id}" status="{t.status}" elapsed="{elapsed_str}">{t.goal}{" — " + t.progress if t.progress else ""}</task>')
         tasks_section = f'<active_tasks>\n' + '\n'.join(task_lines) + '\n</active_tasks>\n'
 
+    # 不再显示 active_subagents — bg subagent 结论通过 memory_recall 按需检索，
+    # 用户任务 subagent 完成后会发精简通知。
+
     return (
         f'<status time="{now}">\n'
-        f'  <recent_sources>最近 {len(recents)} 条事件来自: {recent_str}</recent_sources>\n'
         f'{tasks_section}'
         f'</status>'
     )

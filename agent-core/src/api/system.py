@@ -124,12 +124,24 @@ def _pull_and_restart_sync(image: str) -> None:
 
     restart_image = os.environ.get('RESTART_IMAGE', '')
     if not restart_image:
-        current_image = _get_current_image()
-        # Image path: registry/org/category/name:tag — take only registry/org as base
-        image_path = current_image.rsplit(':', 1)[0]  # strip tag
+        # 从目标镜像（而非 current_image）推导 registry 前缀，确保使用正确仓库
+        image_path = image.rsplit(':', 1)[0]  # strip tag
         parts = image_path.split('/')
-        base = '/'.join(parts[:2]) if len(parts) >= 2 else parts[0]
+        # registry/namespace/name → registry/namespace; 无 registry 则用 image 的前两段
+        if len(parts) >= 3:
+            base = '/'.join(parts[:2])  # registry/namespace
+        elif len(parts) == 2:
+            base = parts[0]  # 可能是 namespace/name，取 namespace
+        else:
+            base = ''
         restart_image = f'{base}/restart:latest' if base else 'restart:latest'
+
+    try:
+        _set_step(f'正在拉取 restart helper…')
+        client.images.pull(restart_image)
+    except Exception as e:
+        _set_error(f'restart helper 镜像拉取失败: {e}')
+        return
 
     try:
         _set_step(f'启动 restart helper，升级 agent-core → {image.rsplit(":", 1)[-1]}…')

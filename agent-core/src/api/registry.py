@@ -25,6 +25,15 @@ _CACHE_TTL = 300  # 5 minutes
 
 def _build_catalog_sync() -> dict:
     url = f'{RESOURCE_CENTER_URL}/api/images'
+
+    # Append channel parameter from config
+    try:
+        import config as _cfg
+        channel = _cfg.main.get('core', {}).get('update_channel', 'ga')
+    except Exception:
+        channel = 'ga'
+    url = f'{url}?channel={channel}'
+
     print(f'[registry] fetching catalog from resource-center: {url}')
 
     try:
@@ -70,6 +79,7 @@ def _build_catalog_sync() -> dict:
                 'created': created,
                 'size': '',
                 'imageRef': t.get('imageRef', ''),
+                'channel': t.get('channel', ''),
             })
 
         entry = {

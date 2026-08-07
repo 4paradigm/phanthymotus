@@ -3,6 +3,7 @@
  * Mounts canvas, sidebar, deploy panel, settings panel, and activity log.
  */
 
+import { getToken, setToken, verifyToken } from './auth.js';
 import { initSidebar, renderSidebar } from './sidebar.js';
 import { initCanvas, updateCanvasMcps } from './canvas.js';
 import { initDeployPanel, showDeployConfirmModal } from './deploy-panel.js';
@@ -13,6 +14,10 @@ import { initMonitorMode }   from './monitor-mode.js';
 import { initSkills }        from './skills.js';
 import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
+import { initChannels }      from './channels.js';
+import { initMobile }        from './mobile.js';
+import { initPerformance }   from './performance.js';
+import { initUsage }         from './usage.js';
 import './agent-definition.js';
 
 let _allMcps   = [];
@@ -20,6 +25,18 @@ let _topicStatuses = {};
 const _pingedIds = new Set();
 
 async function main() {
+  // Auth gate: check if auth is required
+  const token = getToken();
+  const noTokenValid = await verifyToken('');  // If no-token passes, auth is disabled
+  if (!noTokenValid && (!token || !(await verifyToken(token)))) {
+    _showLoginScreen();
+    return;
+  }
+
+  // Auth passed — show app
+  document.getElementById('app').style.display = '';
+
+  initMobile();
   initSidebar();
   initDetailPanel();
   initMonitorMode();
@@ -27,6 +44,12 @@ async function main() {
   initSkills();
   initHistory();
   initNetwork();
+  initChannels();
+  initPerformance();
+  initUsage();
+
+  // Settings dropdown (web topbar)
+  _initSettingsDropdown();
 
   initActivityLog();
 
@@ -50,7 +73,15 @@ async function main() {
 
   // Poll every 10s
   setInterval(async () => {
-    _allMcps = await _fetchMcps();
+    const fresh = await _fetchMcps();
+    // Preserve online status from previous ping results
+    const oldMap = Object.fromEntries(_allMcps.map(m => [m.id, m]));
+    for (const m of fresh) {
+      if (m.online == null && oldMap[m.id]?.online != null) {
+        m.online = oldMap[m.id].online;
+      }
+    }
+    _allMcps = fresh;
     await fetchTopicStatuses();
     renderSidebar(_allMcps, _topicStatuses);
     updateCanvasMcps(_allMcps);
@@ -89,6 +120,7 @@ async function checkForUpdate() {
 
     // Find services that have a newer image available vs what's running
     const updatable = json.data.filter(d => {
+      if (!d.running && d.category !== 'core') return false;  // core is always running if responding
       if (!d.image || !d.running_image) return false;
       const latestTag  = _tagFromImage(d.image);
       const runningTag = _tagFromImage(d.running_image);
@@ -289,6 +321,193 @@ async function _pingOne(mcp) {
 
 async function updateModelLabel() {
   // no-op: model label removed from topbar
+}
+
+function _initSettingsDropdown() {
+  const btn = document.getElementById('topbar-settings-btn');
+  const dropdown = document.getElementById('topbar-settings-dropdown');
+  if (!btn || !dropdown) return;
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    dropdown.classList.toggle('hidden');
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#topbar-settings')) {
+      dropdown.classList.add('hidden');
+    }
+  });
+
+  dropdown.querySelectorAll('.settings-dropdown-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const targetId = item.dataset.target;
+      document.getElementById(targetId)?.click();
+      dropdown.classList.add('hidden');
+    });
+  });
+
+  // Reset modal
+  _initResetModal();
+}
+
+function _initResetModal() {
+  const overlay = document.getElementById('reset-overlay');
+  const btnOpen = document.getElementById('btn-reset');
+  const btnClose = document.getElementById('reset-close');
+  const btnCancel = document.getElementById('reset-cancel');
+  const btnConfirm = document.getElementById('reset-confirm');
+  if (!overlay || !btnOpen) return;
+
+  const close = () => overlay.classList.add('hidden');
+
+  btnOpen.addEventListener('click', () => overlay.classList.remove('hidden'));
+  btnClose?.addEventListener('click', close);
+  btnCancel?.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  btnConfirm?.addEventListener('click', async () => {
+    const restartServices = document.getElementById('reset-restart-services')?.checked || false;
+    const body = {
+      restart_services: restartServices,
+      chat_history: document.getElementById('reset-chat-history')?.checked || false,
+      system_prompt: document.getElementById('reset-system-prompt')?.checked || false,
+      identity: document.getElementById('reset-identity')?.checked || false,
+      memory: document.getElementById('reset-memory')?.checked || false,
+      skills: document.getElementById('reset-skills')?.checked || false,
+    };
+    if (!Object.values(body).some(v => v)) return;
+
+    btnConfirm.disabled = true;
+    btnConfirm.textContent = '执行中...';
+    try {
+      const res = await fetch('/api/config/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        overlay.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
+        if (restartServices) {
+          // Show restart waiting overlay
+          close();
+          _showRestartWaiting();
+        } else {
+          btnConfirm.textContent = '已完成';
+          setTimeout(() => { close(); btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 1000);
+        }
+      }
+    } catch (e) {
+      console.error('[reset] failed:', e);
+      btnConfirm.textContent = '失败';
+      setTimeout(() => { btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 2000);
+    }
+  });
+}
+
+function _showRestartWaiting() {
+  let el = document.getElementById('restart-waiting-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'restart-waiting-overlay';
+    el.className = 'modal-overlay';
+    el.innerHTML = `
+      <div class="restart-waiting">
+        <div class="restart-waiting-spinner"></div>
+        <p class="restart-waiting-text">服务重启中，请稍候...</p>
+        <p class="restart-waiting-sub" id="restart-waiting-status">等待服务关闭...</p>
+      </div>
+    `;
+    document.body.appendChild(el);
+  }
+  el.classList.remove('hidden');
+
+  // Phase 1: Wait for agent-core to go down (up to 10s)
+  // Phase 2: Then poll until it's back up
+  let attempts = 0;
+  let wentDown = false;
+  const poll = setInterval(async () => {
+    attempts++;
+    const statusEl = document.getElementById('restart-waiting-status');
+    try {
+      const r = await fetch('/api/config', { signal: AbortSignal.timeout(2000) });
+      if (r.ok && wentDown) {
+        // Phase 2 complete: service is back
+        clearInterval(poll);
+        if (statusEl) statusEl.textContent = '服务已恢复，正在刷新...';
+        setTimeout(() => location.reload(), 500);
+        return;
+      }
+      // Still up, waiting to go down
+      if (!wentDown && statusEl) statusEl.textContent = '等待服务关闭...';
+    } catch (_) {
+      // Service is down
+      if (!wentDown) {
+        wentDown = true;
+        if (statusEl) statusEl.textContent = '服务已关闭，等待恢复...';
+      } else {
+        if (statusEl) statusEl.textContent = `等待恢复中... (${attempts * 2}s)`;
+      }
+    }
+    if (attempts > 45) { // 90s timeout
+      clearInterval(poll);
+      if (statusEl) statusEl.textContent = '超时，请手动刷新页面';
+    }
+  }, 2000);
+}
+
+function _showLoginScreen() {
+  const app = document.getElementById('app');
+  if (app) app.style.display = 'none';
+
+  let loginEl = document.getElementById('login-screen');
+  if (!loginEl) {
+    loginEl = document.createElement('div');
+    loginEl.id = 'login-screen';
+    loginEl.className = 'login-screen';
+    loginEl.innerHTML = `
+      <div class="login-card">
+        <div class="login-brand">
+          <img class="login-logo" src="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/PhanthyMotus_Final_Refined_logo.png" alt="PhanthyMotus">
+          <div class="login-brand-text">
+            <span class="brand-name">Phanthy</span><span class="brand-name-accent">Motus</span>
+          </div>
+        </div>
+        <p class="login-subtitle">Enter access token to continue</p>
+        <input type="password" class="login-input" id="login-token-input" placeholder="Access Token" autocomplete="off" />
+        <button class="login-btn" id="login-btn">Login</button>
+        <p class="login-hint" id="login-hint"></p>
+        <p class="login-footer">Token is shown in server console on startup</p>
+      </div>
+    `;
+    document.body.appendChild(loginEl);
+  }
+  loginEl.style.display = 'flex';
+
+  const input = document.getElementById('login-token-input');
+  const btn = document.getElementById('login-btn');
+  const hint = document.getElementById('login-hint');
+
+  async function doLogin() {
+    const val = input.value.trim();
+    if (!val) { hint.textContent = 'Please enter a token'; return; }
+    hint.textContent = 'Verifying...';
+    btn.disabled = true;
+    const valid = await verifyToken(val);
+    if (valid) {
+      setToken(val);
+      loginEl.style.display = 'none';
+      if (app) app.style.display = '';
+      main();
+    } else {
+      hint.textContent = 'Invalid token';
+      btn.disabled = false;
+    }
+  }
+
+  btn.addEventListener('click', doLogin);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+  input.focus();
 }
 
 main();

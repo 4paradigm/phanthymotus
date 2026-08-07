@@ -3,13 +3,16 @@ canvas.py — Canvas layout persistence + per-tool config storage.
 
 Stores the orchestration canvas layout (card positions) and per-tool
 configuration in the SQLite config table.
+
+Includes editor lock: only one session can edit at a time.
 """
 
 import asyncio
 import json
+import time
 import fastapi
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, Optional
 
 import config
 
@@ -17,25 +20,102 @@ router = fastapi.APIRouter(prefix='/canvas', tags=['canvas'])
 
 _TOOL_CONFIG_PREFIX = 'tool_config:'
 
+# ── Editor Lock State (in-memory, resets on restart) ─────────────────────────
+
+_editor_session: Optional[str] = None   # session_id of current editor
+_editor_last_seen: float = 0.0          # monotonic timestamp of last activity
+_EDITOR_TIMEOUT = 60.0                  # seconds before auto-release
+
+
+def _check_editor_expired():
+    """Release editor if inactive for too long."""
+    global _editor_session, _editor_last_seen
+    if _editor_session and (time.monotonic() - _editor_last_seen) > _EDITOR_TIMEOUT:
+        _editor_session = None
+        _editor_last_seen = 0.0
+
 
 class CanvasLayout(BaseModel):
     cards:           list  = []
     connections:     list  = []
     execConnections: list  = []
     transform:       dict  = {}
+    session_id:      Optional[str] = None
 
+
+# ── Editor Lock Endpoints ────────────────────────────────────────────────────
+
+@router.post('/claim-edit')
+async def claim_edit(body: dict = fastapi.Body(...)):
+    """Request edit permission. Returns 423 if someone else is editing."""
+    global _editor_session, _editor_last_seen
+    _check_editor_expired()
+
+    session_id = body.get('session_id', '')
+    if not session_id:
+        return fastapi.responses.JSONResponse(
+            status_code=400, content={'code': 400, 'message': 'session_id required'})
+
+    if _editor_session and _editor_session != session_id:
+        return fastapi.responses.JSONResponse(
+            status_code=423, content={'code': 423, 'message': 'Canvas is locked by another editor',
+                                      'editor': _editor_session})
+
+    _editor_session = session_id
+    _editor_last_seen = time.monotonic()
+    return {'code': 200, 'editor': session_id}
+
+
+@router.post('/release-edit')
+async def release_edit(body: dict = fastapi.Body(...)):
+    """Release edit permission."""
+    global _editor_session, _editor_last_seen
+    session_id = body.get('session_id', '')
+    if _editor_session == session_id:
+        _editor_session = None
+        _editor_last_seen = 0.0
+    return {'code': 200}
+
+
+@router.get('/edit-status')
+async def edit_status():
+    """Check who is currently editing."""
+    _check_editor_expired()
+    return {'code': 200, 'editor': _editor_session}
+
+
+# ── Layout Endpoints ─────────────────────────────────────────────────────────
 
 @router.get('/layout')
 async def get_layout():
-    """Return the saved canvas layout."""
+    """Return the saved canvas layout + current editor info."""
+    _check_editor_expired()
     data = config.main.get('canvas_layout', {'cards': []})
-    return {'code': 200, 'data': data}
+    return {'code': 200, 'data': data, 'editor': _editor_session}
 
 
 @router.post('/layout')
 async def save_layout(layout: CanvasLayout):
-    """Persist the canvas layout to the config store."""
-    config.main['canvas_layout'] = layout.dict()
+    """Persist the canvas layout. Only the current editor can save."""
+    global _editor_session, _editor_last_seen
+    _check_editor_expired()
+
+    session_id = layout.session_id
+    if _editor_session and session_id != _editor_session:
+        return fastapi.responses.JSONResponse(
+            status_code=403, content={'code': 403, 'message': 'Not the current editor',
+                                      'editor': _editor_session})
+
+    # Auto-claim if no editor (backward compat: first save becomes editor)
+    if not _editor_session and session_id:
+        _editor_session = session_id
+
+    if session_id == _editor_session:
+        _editor_last_seen = time.monotonic()
+
+    save_data = layout.dict()
+    save_data.pop('session_id', None)
+    config.main['canvas_layout'] = save_data
     return {'code': 200}
 
 

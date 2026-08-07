@@ -3,9 +3,16 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
+# Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault)
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip docker.io docker-compose-v2 python3-dbus && \
+        python3-pip python3-dbus ffmpeg curl && \
+    curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/aarch64/docker-27.5.1.tgz \
+        | tar -xz --strip-components=1 -C /usr/local/bin/ docker/docker && \
+    mkdir -p /usr/local/lib/docker/cli-plugins && \
+    curl -fsSL https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/docker-compose-linux-aarch64 \
+        -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv

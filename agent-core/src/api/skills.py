@@ -48,7 +48,7 @@ async def list_skills():
 
 
 @router.post('/install')
-async def install_skill(body: dict = fastapi.Body(...)):
+async def install_skill(request: fastapi.Request, body: dict = fastapi.Body(...)):
     """从 Resource Center 安装技能。"""
     slug = body.get('slug', '').strip()
     if not slug:
@@ -61,20 +61,27 @@ async def install_skill(body: dict = fastapi.Body(...)):
 
     # 从 Resource Center 获取技能定义
     rc_url = _get_rc_url()
+    headers = {}
+    # 传递 RC token 以允许作者安装自己的未发布技能
+    rc_token = request.headers.get('x-rc-token')
+    if rc_token:
+        headers['Authorization'] = f'Bearer {rc_token}'
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10) as http:
-            resp = await http.get(f'{rc_url}/api/skills/{slug}')
+            resp = await http.get(f'{rc_url}/api/skills/{slug}', headers=headers)
             if resp.status_code != 200:
                 return {'code': 404, 'error': f'技能 "{slug}" 未在 Resource Center 找到 (HTTP {resp.status_code})'}
             data = resp.json()
             if not data.get('ok'):
                 return {'code': 404, 'error': data.get('error', '获取失败')}
     except ImportError:
-        # httpx 未安装时 fallback 到 aiohttp 或 urllib
+        # httpx 未安装时 fallback 到 urllib
         import urllib.request, json as _json
         try:
             req = urllib.request.Request(f'{rc_url}/api/skills/{slug}')
+            for k, v in headers.items():
+                req.add_header(k, v)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = _json.loads(resp.read())
                 if not data.get('ok'):
@@ -247,3 +254,149 @@ async def deactivate(body: dict = fastapi.Body(...)):
     slug = body.get('slug', '').strip()
     _skills_mod.active_skills.discard(slug)
     return {'code': 200, 'data': {'slug': slug, 'active': False}}
+
+
+# ── Resource Center proxy endpoints ─────────────────────────────────────────
+
+def _get_rc_token(request: fastapi.Request) -> str | None:
+    """从请求头 X-RC-Token 中获取 RC bearer token。"""
+    return request.headers.get('x-rc-token')
+
+
+@router.post('/rc/login')
+async def rc_login(body: dict = fastapi.Body(...)):
+    """代理登录 Resource Center，返回 bearer token。"""
+    rc_url = _get_rc_url()
+    identifier = body.get('identifier', '').strip()
+    password = body.get('password', '')
+    if not identifier or not password:
+        return {'code': 422, 'error': '请输入账号和密码'}
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.post(f'{rc_url}/api/auth/login', json={
+                'identifier': identifier, 'password': password
+            })
+            data = resp.json()
+            if resp.status_code == 200 and data.get('ok'):
+                return {'code': 200, 'data': {
+                    'token': data['token'],
+                    'userId': data.get('userId'),
+                    'role': data.get('role'),
+                }}
+            return {'code': resp.status_code, 'error': data.get('error', '登录失败')}
+    except Exception as e:
+        return {'code': 502, 'error': f'无法连接 Resource Center: {e}'}
+
+
+@router.get('/rc/mine')
+async def rc_my_skills(request: fastapi.Request):
+    """代理获取用户在 RC 上的技能列表。"""
+    token = _get_rc_token(request)
+    if not token:
+        return {'code': 401, 'error': '未登录 Resource Center'}
+
+    rc_url = _get_rc_url()
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.get(f'{rc_url}/api/skills/mine', headers={
+                'Authorization': f'Bearer {token}'
+            })
+            data = resp.json()
+            if resp.status_code == 200:
+                return {'code': 200, 'data': data.get('data', [])}
+            return {'code': resp.status_code, 'error': data.get('error', '获取失败')}
+    except Exception as e:
+        return {'code': 502, 'error': f'无法连接 Resource Center: {e}'}
+
+
+@router.post('/rc/mine')
+async def rc_create_skill(request: fastapi.Request, body: dict = fastapi.Body(...)):
+    """代理在 RC 上创建/更新技能。"""
+    token = _get_rc_token(request)
+    if not token:
+        return {'code': 401, 'error': '未登录 Resource Center'}
+
+    rc_url = _get_rc_url()
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.post(f'{rc_url}/api/skills/mine', json=body, headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+            })
+            data = resp.json()
+            if resp.status_code == 200 and data.get('ok'):
+                return {'code': 200, 'data': data.get('data')}
+            return {'code': resp.status_code, 'error': data.get('error', '操作失败')}
+    except Exception as e:
+        return {'code': 502, 'error': f'无法连接 Resource Center: {e}'}
+
+
+@router.put('/rc/mine/{skill_id}')
+async def rc_update_skill(skill_id: str, request: fastapi.Request, body: dict = fastapi.Body(...)):
+    """代理更新 RC 上的技能。"""
+    token = _get_rc_token(request)
+    if not token:
+        return {'code': 401, 'error': '未登录 Resource Center'}
+
+    rc_url = _get_rc_url()
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.put(f'{rc_url}/api/skills/mine/{skill_id}', json=body, headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+            })
+            data = resp.json()
+            if resp.status_code == 200 and data.get('ok'):
+                return {'code': 200, 'data': data.get('data')}
+            return {'code': resp.status_code, 'error': data.get('error', '更新失败')}
+    except Exception as e:
+        return {'code': 502, 'error': f'无法连接 Resource Center: {e}'}
+
+
+@router.delete('/rc/mine/{skill_id}')
+async def rc_delete_skill(skill_id: str, request: fastapi.Request):
+    """代理删除 RC 上的技能。"""
+    token = _get_rc_token(request)
+    if not token:
+        return {'code': 401, 'error': '未登录 Resource Center'}
+
+    rc_url = _get_rc_url()
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.delete(f'{rc_url}/api/skills/mine/{skill_id}', headers={
+                'Authorization': f'Bearer {token}'
+            })
+            data = resp.json()
+            if resp.status_code == 200 and data.get('ok'):
+                return {'code': 200, 'data': {'id': skill_id}}
+            return {'code': resp.status_code, 'error': data.get('error', '删除失败')}
+    except Exception as e:
+        return {'code': 502, 'error': f'无法连接 Resource Center: {e}'}
+
+
+@router.post('/rc/mine/{skill_id}/submit')
+async def rc_submit_skill(skill_id: str, request: fastapi.Request):
+    """代理提交技能送审。"""
+    token = _get_rc_token(request)
+    if not token:
+        return {'code': 401, 'error': '未登录 Resource Center'}
+
+    rc_url = _get_rc_url()
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.post(f'{rc_url}/api/skills/mine/{skill_id}/submit', headers={
+                'Authorization': f'Bearer {token}'
+            })
+            data = resp.json()
+            if resp.status_code == 200 and data.get('ok'):
+                return {'code': 200, 'data': data.get('data')}
+            return {'code': resp.status_code, 'error': data.get('error', '提交失败')}
+    except Exception as e:
+        return {'code': 502, 'error': f'无法连接 Resource Center: {e}'}

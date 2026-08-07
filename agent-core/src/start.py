@@ -1,14 +1,26 @@
 import contextlib
 import asyncio
+import json
+import logging
 import pathlib
 import shutil
 import subprocess
+import sys
+
+# Fix Python "dual module" bug: start.py runs as __main__, but other modules
+# `import start` which creates a SEPARATE module instance with its own globals.
+# This ensures `import start` returns the same object as __main__.
+sys.modules['start'] = sys.modules[__name__]
 
 import config
+import auth
 import event
 import collector
 import scheduler
+import daily_summary
 import topic_subscriber
+import mcp_client
+from channel.manager import manager as channel_manager
 
 
 def _init_resource_files():
@@ -108,6 +120,10 @@ def _register_core_mcp(silent=False):
                         'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password'},
                         'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
+                        'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
+                        'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
+                        'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
+                        'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
                     },
                     'required': ['llm_url', 'llm_key']
                 },
@@ -149,11 +165,80 @@ def _register_core_mcp(silent=False):
                     'required': ['action', 'text'],
                 },
                 'topic_out': [{'topic': '/remote_control/message', 'format': 'data/json'}],
+            },
+            {
+                'name': 'remote_audio',
+                'type': 'sensor',
+                'description': '远程音频 — 从浏览器上传音频文件，转换为 PCM-16k 发布到 DDS',
+                'inputSchema': {'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['send_audio'], 'description': 'Action to perform'},
+                    'audio_file': {'type': 'string', 'format': 'file', 'accept': 'audio/*', 'description': '音频文件'},
+                }, 'required': ['action', 'audio_file']},
+                'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}],
         'topic_in': [{'format': 'data/json'}],
     })
+
+    # Register Channel as independent internal MCP (no MCP-level topics)
+    existing = [m for m in existing if m.get('id') != 'channel']
+    existing.append({
+        'id': 'channel',
+        'name': 'Channel',
+        'transport': 'internal',
+        'url': '',
+        'server_name': 'Channel',
+        'category': 'controller',
+        'online': True,
+        'tools': [
+            {
+                'name': 'channel_request',
+                'type': 'sensor',
+                'description': 'Channel message input — receive messages from Telegram/Slack and other platforms',
+                'inputSchema': {'type': 'object', 'properties': {}},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'channel_id': {
+                            'type': 'string',
+                            'description': 'Select a channel (configure in Settings → Channels first)',
+                            'format': 'channel-select',
+                            'scope': 'instance',
+                        },
+                    },
+                },
+                'multiInstance': True,
+                'topic_out': [{'format': 'data/json'}],
+            },
+            {
+                'name': 'channel_reply',
+                'type': 'actuator',
+                'description': 'Reply to a message from a messaging platform (Feishu/Telegram/Slack). ONLY use this tool when the triggering event has channel="channel:*". Never use for local_mic/remote_mic/remote_web events — those should be answered via TTS/speaker on the robot body.',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'action': {'type': 'string', 'enum': ['send'], 'description': 'Action'},
+                        'text': {'type': 'string', 'description': 'Reply text to send to the user'},
+                    },
+                    'required': ['action', 'text'],
+                },
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'channel_id': {
+                            'type': 'string',
+                            'description': 'Select a channel (configure in Settings → Channels first)',
+                            'format': 'channel-select',
+                            'scope': 'instance',
+                        },
+                    },
+                },
+                'multiInstance': True,
+            },
+        ],
+    })
+
     mcp_mgr._save_mcp_list(existing)
     if not silent:
         print(f'[startup] registered core MCP: {CORE_MCP_ID}')
@@ -170,8 +255,33 @@ async def _heartbeat_core_mcp():
             print(f'[heartbeat] core re-register failed: {e}')
 
 
+async def _auto_start_project():
+    """开机自动启动：等待设备就绪后调用统一的 start-project 函数。"""
+    import time as _time
+
+    # 等待 MCP 设备 online（最多 30s）
+    print('[auto-start] waiting for devices...')
+    deadline = _time.time() + 30
+    while _time.time() < deadline:
+        external = [
+            info for mcp_id, info in mcp_client.registry.items()
+            if mcp_id not in ('agentcore', 'channel', '__perf__')
+        ]
+        if external and all(info.get('online') for info in external):
+            break
+        await asyncio.sleep(2)
+
+    # 调用统一的启动函数
+    from api.config import _do_start_project
+    await _do_start_project()
+    print('[auto-start] done')
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
+    # 初始化 access token 认证
+    auth.init()
+
     # 初始化资源文件（从 defaults 拷贝缺失文件）
     _init_resource_files()
 
@@ -183,6 +293,10 @@ async def lifespan(app):
     import ros2_bridge
     _ros2_loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, ros2_bridge.start, _ros2_loop)
+
+    # Pre-create audio publisher so DDS discovery completes before first use
+    _ensure_audio_pub()
+    _ensure_mic_pub()
 
     # 注册 AgentCore 自身为 MCP（含 decision_core 工具）
     await loop.run_in_executor(None, _register_core_mcp)
@@ -201,20 +315,49 @@ async def lifespan(app):
     topics = config.main.get('event', {}).get('subscribe_topics', [])
     topic_subscriber.start(topics, asyncio.get_event_loop())
 
+    # 订阅 perf_spans topic（用于接收 perception TTS 等异步上报的性能 span）
+    from api.inspection import register_topic_internal
+    await register_topic_internal('/perception/perf_spans', 'data/json', '__perf__')
+
     # 启动 collector（信息整理器）
     collector.start()
 
+    # 启动 Channel Manager（消息平台适配器）
+    await channel_manager.start()
+
     async with event.llm:
+        # Auto-start project if configured, otherwise reset running state
+        if config.main.get('core', {}).get('auto_start', False):
+            async def _safe_auto_start():
+                try:
+                    await _auto_start_project()
+                except Exception as e:
+                    print(f'[auto-start] ERROR: {e}')
+                    import traceback
+                    traceback.print_exc()
+            asyncio.create_task(_safe_auto_start())
+        else:
+            # Not auto-starting: clear stale project_running flag from last session
+            core = config.main.get('core', {})
+            if core.get('project_running'):
+                core['project_running'] = False
+                config.main['core'] = core
+
         tasks = [
             asyncio.create_task(event.llm.run_forever()),
             asyncio.create_task(scheduler.run()),
+            asyncio.create_task(daily_summary.run()),
         ]
         try:
             yield
         finally:
             for t in tasks:
                 t.cancel()
-            await loop.run_in_executor(None, ros2_bridge.stop)
+            await channel_manager.stop()
+            try:
+                await loop.run_in_executor(None, ros2_bridge.stop)
+            except (asyncio.CancelledError, RuntimeError):
+                ros2_bridge.stop()
 
 
 # ========== 网络服务 ==========
@@ -266,39 +409,232 @@ app_api.include_router(api.skills.router)
 import api.history
 app_api.include_router(api.history.router)
 
+import api.tasks
+app_api.include_router(api.tasks.router)
+
 import api.network
 app_api.include_router(api.network.router)
 
+import api.channel
+app_api.include_router(api.channel.router)
+
+import api.performance
+app_api.include_router(api.performance.router)
+
 app = fastapi.FastAPI(lifespan=lifespan)
+app.middleware('http')(auth.auth_middleware)
 app.mount('/api', app_api)
+
+# Auth verify endpoint (exempt from middleware, does its own token check)
+@app_api.get('/auth/verify')
+async def _auth_verify(request: fastapi.Request):
+    if not auth.is_enabled():
+        return {'valid': True, 'auth_required': False}
+    token = auth._extract_token(request)
+    if auth.verify(token):
+        return {'valid': True, 'auth_required': True}
+    return fastapi.responses.JSONResponse(
+        status_code=401,
+        content={'valid': False, 'auth_required': True}
+    )
 
 import api.motus_stream
 app.include_router(api.motus_stream.router)
 
 app.include_router(api.inspection.ws_router)
 
+# ── ACP: 异步动作完成回调接口 ─────────────────────────────────────────────────
+
+@app_api.post('/acp/complete')
+async def acp_complete(request: fastapi.Request):
+    """Driver 动作完成后回调此接口，通知 Agent Core 解锁 sync() 并注入 steering。"""
+    body = await request.json()
+    action_id = body.get('action_id')
+    status = body.get('status', 'completed')
+    result = body.get('result', {})
+
+    if not action_id:
+        return {'ok': False, 'error': 'action_id required'}
+
+    # 通道1: 解锁 sync() 等待
+    if action_id in mcp_client._pending_actions:
+        mcp_client._pending_results[action_id] = body
+        mcp_client._pending_actions[action_id].set()
+
+    # 通道2: 进 event_bus → steering 注入 LLM
+    import event_bus
+    await event_bus.enqueue(
+        source=f'acp:{action_id}',
+        text=json.dumps({'type': 'action_complete', 'action_id': action_id,
+                         'status': status, 'result': result}, ensure_ascii=False),
+        payload={'type': 'action_complete', 'action_id': action_id,
+                 'status': status, 'result': result},
+    )
+
+    return {'ok': True, 'action_id': action_id}
+
+
+# ── System Hooks API ─────────────────────────────────────────────────────────
+
+@app_api.get('/hooks')
+async def hooks_list():
+    import hooks
+    return hooks.list_hooks()
+
+
+@app_api.post('/hooks/fire')
+async def hooks_fire(request: fastapi.Request):
+    import hooks
+    body = await request.json()
+    hook_id = body.get('hook', '')
+    params = body.get('params', {})
+    if not hook_id:
+        return {'error': 'hook field required'}
+    results = await hooks.fire(hook_id, extra_params=params)
+    return {'ok': True, 'hook': hook_id, 'results': results}
+
+
+# ── Remote Audio: convert file to PCM-16k and publish to ROS2 ──────────────────
+_audio_pub = None
+
+def _ensure_audio_pub():
+    """Lazily create the ROS2 publisher for /remote_control/audio."""
+    global _audio_pub
+    if _audio_pub is not None:
+        return _audio_pub
+    try:
+        from audio_msgs.msg import AudioChunk
+        import ros2_bridge
+        node = ros2_bridge._node_main
+        if node:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=200,
+                             durability=DurabilityPolicy.VOLATILE)
+            _audio_pub = node.create_publisher(AudioChunk, "/remote_control/audio", qos)
+    except Exception:
+        pass
+    return _audio_pub
+
+async def publish_audio_file(file_path: str) -> dict:
+    """Convert audio file to PCM-16k via ffmpeg and publish chunks to DDS at real-time rate."""
+    import subprocess, os, asyncio, time
+    pub = _ensure_audio_pub()
+    if not pub:
+        return {'code': 500, 'message': 'ROS2 not available'}
+    if not os.path.isfile(file_path):
+        return {'code': 400, 'message': f'文件不存在: {file_path}'}
+
+    proc = subprocess.run(
+        ['ffmpeg', '-y', '-i', file_path, '-f', 's16le', '-acodec', 'pcm_s16le',
+         '-ar', '16000', '-ac', '1', 'pipe:1'],
+        capture_output=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return {'code': 400, 'message': f'ffmpeg error: {proc.stderr.decode()[:200]}'}
+
+    pcm_data = proc.stdout
+    if not pcm_data:
+        return {'code': 400, 'message': 'No audio data after conversion'}
+
+    from audio_msgs.msg import AudioChunk
+    chunk_size = 1024  # 512 samples @ 16-bit = 32ms per chunk
+    batch_size = 4     # send 4 chunks (~128ms) then pace
+    silence_chunk = [0] * chunk_size
+
+    # Prepend silence to warm up DDS link (avoid losing initial chunks)
+    warmup_chunks = int(0.5 * 16000 * 2 / chunk_size)  # 500ms
+    for _ in range(warmup_chunks):
+        msg = AudioChunk()
+        msg.format = "pcm_16k_16bit_mono"
+        msg.data = silence_chunk
+        pub.publish(msg)
+    await asyncio.sleep(0.3)  # let DDS settle
+
+    offset = 0
+    chunks_sent = 0
+    start_time = time.monotonic()
+    while offset < len(pcm_data):
+        chunk = pcm_data[offset:offset + chunk_size]
+        offset += chunk_size
+        msg = AudioChunk()
+        msg.format = "pcm_16k_16bit_mono"
+        msg.data = list(chunk)
+        pub.publish(msg)
+        chunks_sent += 1
+        # Pace every batch_size chunks at real-time
+        if chunks_sent % batch_size == 0:
+            expected_time = chunks_sent * 0.032
+            elapsed = time.monotonic() - start_time
+            sleep_time = expected_time - elapsed
+            if sleep_time > 0.005:
+                await asyncio.sleep(sleep_time)
+
+    # Append silence so VAD detects end-of-speech and flushes the utterance
+    silence_ms = 800  # must exceed vad_silence_ms (default 400ms)
+    silence_bytes = int(16000 * 2 * silence_ms / 1000)  # 16kHz 16-bit mono
+    silence_chunk = [0] * chunk_size
+    for _ in range(silence_bytes // chunk_size):
+        msg = AudioChunk()
+        msg.format = "pcm_16k_16bit_mono"
+        msg.data = silence_chunk
+        pub.publish(msg)
+        chunks_sent += 1
+    await asyncio.sleep(0.1)
+
+    duration_s = len(pcm_data) / (16000 * 2)
+    return {'code': 200, 'data': {'chunks': chunks_sent, 'duration_s': round(duration_s, 2), 'bytes': len(pcm_data)}}
+
+@app_api.post('/remote-audio/upload')
+async def _remote_audio_upload(file: fastapi.UploadFile = fastapi.File()):
+    """Upload audio file, convert to PCM-16k mono, publish to ROS2 topic."""
+    import tempfile, os
+    suffix = os.path.splitext(file.filename or '')[1] or '.wav'
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+        content = await file.read()
+        tmp.write(content)
+    try:
+        return await publish_audio_file(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
 # ── Mic WebSocket endpoint (receive browser PCM and publish to ROS2) ──────────
 _mic_pub = None
+
+
+def _ensure_mic_pub():
+    """Lazily create the ROS2 publisher for /remote_control/mic."""
+    global _mic_pub
+    if _mic_pub is not None:
+        return _mic_pub
+    try:
+        from audio_msgs.msg import AudioChunk
+        import ros2_bridge
+        node = ros2_bridge._node_main
+        if node:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=200,
+                             durability=DurabilityPolicy.VOLATILE)
+            _mic_pub = node.create_publisher(AudioChunk, "/remote_control/mic", qos)
+    except Exception:
+        pass
+    return _mic_pub
+
+
+_mic_chunk_count = 0
+_mic_ws_connected = False
+
 
 @app.websocket('/ws/mic')
 async def _ws_mic(ws: fastapi.WebSocket):
     """Receive PCM-16k audio from browser and publish to ROS2 topic."""
-    global _mic_pub
+    global _mic_chunk_count, _mic_ws_connected
     await ws.accept()
+    _mic_ws_connected = True
     try:
-        if _mic_pub is None:
-            try:
-                from audio_msgs.msg import AudioChunk
-                import ros2_bridge
-                node = ros2_bridge._node_main
-                if node:
-                    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-                    qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                                     history=HistoryPolicy.KEEP_LAST, depth=200,
-                                     durability=DurabilityPolicy.VOLATILE)
-                    _mic_pub = node.create_publisher(AudioChunk, "/remote_control/mic", qos)
-            except Exception:
-                pass
+        _ensure_mic_pub()
         while True:
             data = await ws.receive_bytes()
             if _mic_pub:
@@ -312,6 +648,7 @@ async def _ws_mic(ws: fastapi.WebSocket):
                     msg.format = "pcm_16k_16bit_mono"
                     msg.data = list(chunk)
                     _mic_pub.publish(msg)
+                    _mic_chunk_count += 1
     except Exception:
         pass
 
@@ -322,11 +659,9 @@ class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
 
         async def send_no_cache(message):
             if message['type'] == 'http.response.start':
-                path = scope.get('path', '')
-                if path.endswith('.js') or path.endswith('.css'):
-                    headers = dict(message.get('headers', []))
-                    headers[b'cache-control'] = b'no-cache, no-store, must-revalidate'
-                    message = {**message, 'headers': list(headers.items())}
+                headers = dict(message.get('headers', []))
+                headers[b'cache-control'] = b'no-cache, no-store, must-revalidate'
+                message = {**message, 'headers': list(headers.items())}
             await send(message)
 
         await super().__call__(scope, receive, send_no_cache)
@@ -354,6 +689,15 @@ def _ensure_ssl_certs(cert_dir: str = "./resource/certs") -> tuple[str, str]:
 
 # ========== 启动服务 ==========
 if __name__ == '__main__':
+    # Suppress noisy "SSL connection is closed" from uvicorn/asyncio
+    class _SSLCloseFilter(logging.Filter):
+        def filter(self, record):
+            return 'SSL connection is closed' not in record.getMessage()
+
+    logging.getLogger('uvicorn.error').addFilter(_SSLCloseFilter())
+    logging.getLogger('asyncio').addFilter(_SSLCloseFilter())
+
     cert_file, key_file = _ensure_ssl_certs()
     uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None,
-                ssl_certfile=cert_file, ssl_keyfile=key_file)
+                ssl_certfile=cert_file, ssl_keyfile=key_file,
+                timeout_keep_alive=65)

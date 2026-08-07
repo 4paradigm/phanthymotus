@@ -70,16 +70,45 @@ def _push_factory(topic: str):
                 q.put_nowait(data)
             except asyncio.QueueFull:
                 pass  # drop frame for slow consumer
+        # 处理 perf_span 类型消息（来自 perception TTS 等组件）
+        if topic == '/perception/perf_spans':
+            try:
+                import json, perf_log, config
+                text = data.decode('utf-8') if isinstance(data, bytes) else data
+                span_data = json.loads(text)
+                if span_data.get('type') == 'perf_span':
+                    trace_id = span_data.pop('trace_id', None)
+                    if trace_id:
+                        # 直接归属（trace_id 由 agent-core 透传）
+                        perf_log.commit_spans(trace_id, [span_data], source='perception')
+                    else:
+                        # 兼容旧版本 perception: fallback 到时间窗口匹配
+                        span_start = span_data.get('start_ts', 0)
+                        conn = config._get_conn()
+                        row = conn.execute(
+                            '''SELECT trace_id FROM perf_spans
+                               WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
+                               ORDER BY start_ts DESC LIMIT 1''',
+                            (span_start, span_start)
+                        ).fetchone()
+                        conn.close()
+                        if row:
+                            perf_log.commit_spans(row[0], [span_data], source='perception')
+                    if row:
+                        perf_log.commit_spans(row[0], [span_data], source='perception')
+            except Exception:
+                pass
     return _push
 
 
 def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
-    """Start primary ROS2 subscription only if not already active. Once started, stays forever."""
-    if topic in _active_primary_subs:
-        return  # already subscribed, no DDS discovery delay
-    _active_primary_subs.add(topic)  # mark immediately to prevent race
-
+    """Start primary ROS2 subscription only if not already active."""
     key = f'__primary__#{topic}'
+
+    if topic in _active_primary_subs:
+        return  # already subscribed
+
+    _active_primary_subs.add(topic)  # mark immediately to prevent race
     ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
     print(f'[inspection] started primary sub: {topic}')
 
@@ -87,21 +116,33 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
 # ── Internal API (called by mcp_manage directly) ───────────────────────────────
 
 async def register_topic_internal(topic: str, fmt: str, mcp_id: str) -> None:
-    """Register a topic in the registry; if consumers exist, start primary sub immediately."""
+    """Register a topic in the registry; always check primary sub health."""
     if not topic:
         return
     existing = _topic_registry.get(topic)
-    if existing and existing.get('format') == fmt and existing.get('mcp_id') == mcp_id:
-        return  # already registered with same params, skip
-    _topic_registry[topic] = {
-        'format':        fmt,
-        'mcp_id':        mcp_id,
-        'registered_at': time.time(),
-    }
-    print(f'[inspection] registered topic={topic} format={fmt} mcp_id={mcp_id}')
-    # Start primary sub immediately on registration (stays forever)
+    if not (existing and existing.get('format') == fmt and existing.get('mcp_id') == mcp_id):
+        _topic_registry[topic] = {
+            'format':        fmt,
+            'mcp_id':        mcp_id,
+            'registered_at': time.time(),
+        }
+        print(f'[inspection] registered topic={topic} format={fmt} mcp_id={mcp_id}')
+    # Always check health of primary sub (even on duplicate registration)
     loop = asyncio.get_event_loop()
     _ensure_primary_sub(topic, fmt, loop)
+
+
+async def publish_to_topic(topic: str, data: str | bytes) -> None:
+    """Publish data to a topic via DDS (ros2_bridge).
+    Data reaches dashboard via DDS → inspection primary sub → WebSocket.
+    Data reaches decision_core via DDS → topic_subscriber → event_bus."""
+    if topic not in _topic_registry:
+        await register_topic_internal(topic, 'data/json', 'agentcore')
+    text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
+
+    # Publish to DDS — inspection sub will push to WebSocket, topic_subscriber to event_bus
+    import ros2_bridge
+    ros2_bridge.publish(topic, text)
 
 
 # ── HTTP: Monitor (legacy, kept for compatibility) ────────────────────────────
@@ -225,7 +266,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
                     await websocket.send_text(json.dumps({'type': 'ping', 'ts': time.time()}))
                 except Exception:
                     break
-    except (fastapi.WebSocketDisconnect, Exception):
+    except (fastapi.WebSocketDisconnect, asyncio.CancelledError, Exception):
         pass
     finally:
         queues = _topic_queues.get(topic, [])

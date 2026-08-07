@@ -518,11 +518,13 @@ async def _do_ping(mcp_id: str) -> dict:
         if len(tool_schemas) == 1:
             schema = tool_schemas[0]
             schemas[schema['name']] = schema
-            action_enum = (tool.get('inputSchema') or {}).get('properties', {}).get('action', {}).get('enum')
+            raw_input_schema = tool.get('inputSchema') or {}
+            action_enum = raw_input_schema.get('properties', {}).get('action', {}).get('enum')
             tool_meta_map[schema['name']] = {
                 'type': tool.get('type'),
                 'action_enum': action_enum,
                 'has_config_schema': bool(tool.get('configSchema')),
+                'completion': raw_input_schema.get('x-completion'),
             }
         else:
             group = []
@@ -532,6 +534,7 @@ async def _do_ping(mcp_id: str) -> dict:
                     'type': tool.get('type'),
                     'action_enum': None,
                     'has_config_schema': bool(tool.get('configSchema')),
+                    'completion': (tool.get('inputSchema') or {}).get('x-completion'),
                 }
                 action_name = schema['name'].split('__')[-1]
                 split_map[schema['name']] = {
@@ -554,6 +557,13 @@ async def _do_ping(mcp_id: str) -> dict:
         'split_map':   split_map,
         'tool_groups': tool_groups,
     }
+
+    # Register system hooks from x-hooks declarations
+    import hooks
+    for tool in caps['tools']:
+        x_hooks = (tool.get('inputSchema') or {}).get('x-hooks')
+        if x_hooks and isinstance(x_hooks, dict):
+            hooks.register(mcp_id, tool.get('name', ''), x_hooks)
 
     # Notify inspection module about all topics from this device
     asyncio.create_task(_notify_inspector(mcp_id, topic_out + topic_in))
@@ -691,9 +701,10 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         llm_url = req.arguments.get('llm_url', '')
         llm_key = req.arguments.get('llm_key', '')
         llm_model = req.arguments.get('llm_model', '')
+        think_mode = req.arguments.get('think_mode', False)
         if llm_url and llm_key:
             client_cfg = config.main.get('client', {})
-            client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model}]
+            client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model, 'think_mode': think_mode}]
             config.main['client'] = client_cfg
             # Reinitialize the LLM client with new config
             import client as client_mod
@@ -706,6 +717,20 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             llm_cfg['trigger_interval_ms'] = int(trigger_interval)
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
+        # Save search config to desktop_tools.search
+        search_type = req.arguments.get('search_type')
+        if search_type is not None:
+            dt = config.main.get('desktop_tools', {})
+            search_cfg = dt.get('search', {})
+            search_cfg['type'] = search_type
+            search_base = req.arguments.get('search_base_url', '')
+            search_key = req.arguments.get('search_api_key', '')
+            if search_base and search_base != '****':
+                search_cfg['base_url'] = search_base
+            if search_key and search_key != '****':
+                search_cfg['api_key'] = search_key
+            dt['search'] = search_cfg
+            config.main['desktop_tools'] = dt
         return {'code': 200, 'data': 'config saved'}
 
     return {'code': 200, 'data': None}
@@ -720,11 +745,37 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'remote_mic':
             action = req.arguments.get('action', 'start')
             if action == 'start':
-                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic'}}
+                # Self-check: ensure publisher exists + wait for real browser audio data
+                from start import _ensure_mic_pub
+                import start as _start_mod
+                pub = _ensure_mic_pub()
+                if pub is None:
+                    return {'code': 200, 'data': {'state': 'error', 'message': 'ROS2 mic publisher not available'}}
+                # Wait up to 10s for browser to connect and send audio chunks
+                # (browser mic is started in parallel by frontend before this API call)
+                import asyncio
+                initial_count = _start_mod._mic_chunk_count
+                for _ in range(20):  # 20 × 0.5s = 10s
+                    if _start_mod._mic_chunk_count > initial_count:
+                        return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
+                                                       'chunks_received': _start_mod._mic_chunk_count}}
+                    await asyncio.sleep(0.5)
+                # Timeout — no audio received
+                if not _start_mod._mic_ws_connected:
+                    return {'code': 200, 'data': {'state': 'error', 'message': '等待浏览器麦克风连接超时（10s）— 请在 dashboard 开启麦克风'}}
+                else:
+                    return {'code': 200, 'data': {'state': 'error', 'message': '浏览器已连接但未收到音频数据 — 请检查麦克风权限'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic', 'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}]}}
+                import ros2_bridge, start as _start_mod
+                topic_visible = '/remote_control/mic' in ros2_bridge.get_dds_topics()
+                return {'code': 200, 'data': {'state': 'running' if _start_mod._mic_chunk_count > 0 else 'idle',
+                                               'ws_path': '/ws/mic',
+                                               'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}],
+                                               'topic_visible': topic_visible,
+                                               'ws_connected': _start_mod._mic_ws_connected,
+                                               'chunks_received': _start_mod._mic_chunk_count}}
             return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
             action = req.arguments.get('action', 'start')
@@ -742,7 +793,86 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                     return {'code': 200, 'data': {'status': 'sent', 'text': text}}
                 return {'code': 200, 'data': {'error': 'Missing text'}}
             return {'code': 200, 'data': None}
+        if req.tool == 'remote_audio':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'send_audio':
+                audio_file = req.arguments.get('audio_file', '')
+                if not audio_file:
+                    return {'code': 400, 'message': '缺少 audio_file 参数', 'data': None}
+                from start import publish_audio_file
+                return await publish_audio_file(audio_file)
+            elif action == 'info':
+                return {'code': 200, 'data': {'state': 'running', 'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}]}}
+            return {'code': 200, 'data': None}
         return await _handle_agentcore_call(req)
+
+    # ── Handle internal channel MCP ──
+    if mcp_id == 'channel':
+        if req.tool == 'channel_request':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                # Self-check: verify channel adapter is connected (with retry wait)
+                from channel.manager import manager as channel_mgr
+                import asyncio
+                instance_id = req.arguments.get('instance_id', '')
+                channel_id = ''
+                if instance_id:
+                    cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
+                    if cfg:
+                        channel_id = cfg.get('channel_id', '')
+                if channel_id:
+                    # Wait up to 10s for adapter to connect
+                    for _ in range(20):  # 20 × 0.5s = 10s
+                        if channel_id in channel_mgr._adapters:
+                            adapter = channel_mgr._adapters[channel_id]
+                            if adapter.status() == 'connected':
+                                return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
+                        await asyncio.sleep(0.5)
+                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel {channel_id} adapter not connected (10s timeout)'}}
+                return {'code': 200, 'data': {'state': 'running'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'info':
+                channel_id = req.arguments.get('channel_id', '')
+                if not channel_id:
+                    instance_id = req.arguments.get('instance_id', '')
+                    if instance_id:
+                        cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
+                        if cfg:
+                            channel_id = cfg.get('channel_id', '')
+                topic_id = channel_id.replace(' ', '_') if channel_id else ''
+                topic = f'/channel/request/{topic_id}' if topic_id else '/channel/request'
+                return {'code': 200, 'data': {'topic_out': [{'topic': topic, 'format': 'data/json'}]}}
+            return {'code': 200, 'data': None}
+        if req.tool == 'channel_reply':
+            action = req.arguments.get('action', 'send')
+            if action == 'start':
+                # Self-check: send a greeting to verify channel is working
+                from channel.manager import manager as channel_mgr
+                try:
+                    import asyncio
+                    result = await channel_mgr.send_to_channel_any("我上线啦！我可以通过飞书与您交流。")
+                    if result:
+                        return {'code': 200, 'data': {'state': 'running', 'self_check': 'greeting sent'}}
+                    else:
+                        return {'code': 200, 'data': {'state': 'error', 'message': 'failed to send greeting — channel not connected'}}
+                except Exception as e:
+                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel send failed: {e}'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'send':
+                text = req.arguments.get('text', '')
+                if not text:
+                    return {'code': 200, 'data': {'error': 'text is required'}}
+                from channel.manager import manager as channel_mgr
+                result = await channel_mgr.send_to_channel_any(text)
+                return {'code': 200, 'data': {'result': result}}
+            return {'code': 200, 'data': None}
+        return {'code': 200, 'data': None}
 
     mcps = _get_mcp_list()
     target = next((m for m in mcps if m.get('id') == mcp_id), None)
@@ -754,7 +884,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         raise fastapi.HTTPException(status_code=400, detail='MCP not reachable via HTTP')
 
     headers = {'Content-Type': 'application/json'}
-    timeout = aiohttp.ClientTimeout(total=10)
+    timeout = aiohttp.ClientTimeout(total=None)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Initialize first (required by MCP protocol)

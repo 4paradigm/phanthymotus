@@ -1,0 +1,114 @@
+"""Data structures for the subagent system."""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+import time
+
+
+# Priority constants
+P_CRITICAL = 0
+P_HIGH = 1
+P_NORMAL = 2
+P_LOW = 3
+
+# Status constants
+STATUS_PENDING = 'pending'
+STATUS_RUNNING = 'running'
+STATUS_PAUSED = 'paused'
+STATUS_SUSPENDED = 'suspended'
+STATUS_COMPLETED = 'completed'
+STATUS_FAILED = 'failed'
+STATUS_TIMEOUT = 'timeout'
+STATUS_CANCELLED = 'cancelled'
+
+TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_TIMEOUT, STATUS_CANCELLED}
+ACTIVE_STATUSES = {STATUS_PENDING, STATUS_RUNNING, STATUS_PAUSED, STATUS_SUSPENDED}
+
+
+@dataclass
+class SubagentSpec:
+    """Task specification for spawning a subagent."""
+    goal: str
+    priority: int = P_NORMAL
+    model: str | None = None
+    tool_filter: list[str] | None = None
+    tool_deny: list[str] | None = None
+    max_rounds: int = 10
+    timeout_s: float = 300.0
+    system_prompt_extra: str = ''
+    context_seed: str = ''
+    checkpoint_interval: int = 5
+    metadata: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            'goal': self.goal,
+            'priority': self.priority,
+            'model': self.model,
+            'tool_filter': self.tool_filter,
+            'tool_deny': self.tool_deny,
+            'max_rounds': self.max_rounds,
+            'timeout_s': self.timeout_s,
+            'system_prompt_extra': self.system_prompt_extra,
+            'context_seed': self.context_seed,
+            'checkpoint_interval': self.checkpoint_interval,
+            'metadata': self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> SubagentSpec:
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class SubagentResult:
+    """Result returned when a subagent reaches terminal state."""
+    agent_id: str
+    status: str
+    output: str
+    tool_calls_made: list[dict] = field(default_factory=list)
+    rounds_used: int = 0
+    duration_s: float = 0.0
+    error: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            'agent_id': self.agent_id,
+            'status': self.status,
+            'output': self.output,
+            'tool_calls_made': self.tool_calls_made,
+            'rounds_used': self.rounds_used,
+            'duration_s': self.duration_s,
+            'error': self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> SubagentResult:
+        if not d:
+            return None
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class SubagentStatus:
+    """Lightweight status for listing subagents."""
+    id: str
+    goal: str
+    status: str
+    priority: int
+    model: str | None
+    rounds_completed: int
+    created_at: float
+    updated_at: float
+
+    def to_display(self) -> str:
+        elapsed = time.time() - self.created_at
+        if elapsed < 60:
+            elapsed_str = f'{elapsed:.0f}s'
+        else:
+            elapsed_str = f'{elapsed / 60:.1f}min'
+        model_str = f' [{self.model}]' if self.model else ''
+        return (
+            f'[{self.id}] P{self.priority}{model_str} {self.status} '
+            f'({self.rounds_completed}轮, {elapsed_str}) — {self.goal[:60]}'
+        )

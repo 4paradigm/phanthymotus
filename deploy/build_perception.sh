@@ -105,7 +105,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"registryImage\": \"perception\",
                 \"tag\": \"${TAG}\",
                 \"category\": \"perception\",
-                \"name\": \"Perception Stack\"
+                \"name\": \"Perception Stack\",
+                \"description\": \"语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测\"
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then

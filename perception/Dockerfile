@@ -22,6 +22,14 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     ultralytics
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     sherpa-onnx
+RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    phonemizer
+
+# Override base image RMW (some ros-base tags ship cyclonedds by default)
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV ROS_DOMAIN_ID=42
 
 WORKDIR /work
 COPY main.py    /work/main.py

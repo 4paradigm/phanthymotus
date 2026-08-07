@@ -45,18 +45,37 @@ def _container_name(driver_id: str) -> str:
     return f'embodied-{driver_id}'
 
 
+# ── Deploy log buffer (in-memory, per driver) ─────────────────────────────
+
+_deploy_logs: dict[str, str] = {}
+
+
+def _log_deploy(driver_id: str, msg: str):
+    _deploy_logs.setdefault(driver_id, '')
+    _deploy_logs[driver_id] += msg + '\n'
+
+
+def _clear_deploy_log(driver_id: str):
+    _deploy_logs.pop(driver_id, None)
+
+
 def _get_status_sync(driver_id: str) -> dict:
     try:
         client = _docker()
         name = _container_name(driver_id)
         containers = client.containers.list(all=True, filters={'name': f'^{name}$'})
         if not containers:
-            return {'status': 'stopped'}
+            deploy_log = _deploy_logs.get(driver_id, '')
+            return {'status': 'stopped', 'logs': deploy_log}
         c = containers[0]
         try:
-            logs = c.logs(tail=30).decode('utf-8', errors='replace')
+            logs = c.logs(tail=100).decode('utf-8', errors='replace')
         except Exception:
             logs = ''
+        # Prepend deploy logs if available
+        deploy_log = _deploy_logs.get(driver_id, '')
+        if deploy_log:
+            logs = deploy_log + logs
         running_image = c.attrs.get('Config', {}).get('Image', '')
         return {'status': c.status, 'logs': logs, 'running_image': running_image}
     except Exception as e:
@@ -89,7 +108,21 @@ def _deploy_sync(driver: dict) -> dict:
         pass
 
     # Pull image
-    client.images.pull(target_image)
+    _clear_deploy_log(driver['id'])
+    _log_deploy(driver['id'], f'[pull] {target_image}')
+    try:
+        for line in client.api.pull(target_image, stream=True, decode=True):
+            status = line.get('status', '')
+            progress = line.get('progress', '')
+            layer_id = line.get('id', '')
+            if status:
+                msg = f'  {layer_id} {status}' if layer_id else f'  {status}'
+                if progress:
+                    msg += f' {progress}'
+                _log_deploy(driver['id'], msg)
+    except Exception as e:
+        _log_deploy(driver['id'], f'[pull] failed: {e}')
+        return {'status': 'error', 'error': f'pull failed: {e}'}
 
     # Extract service.yml from image
     compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
@@ -153,10 +186,19 @@ def _deploy_sync(driver: dict) -> dict:
             pass
 
     # docker compose up
-    subprocess.run(
+    _log_deploy(driver['id'], f'[compose] up -d {service_name}')
+    result = subprocess.run(
         ['docker', 'compose', '-f', compose_file, 'up', '-d', '--no-deps', '--force-recreate', service_name],
-        check=True,
+        capture_output=True, text=True,
     )
+    if result.stdout:
+        _log_deploy(driver['id'], result.stdout.strip())
+    if result.stderr:
+        _log_deploy(driver['id'], result.stderr.strip())
+    if result.returncode != 0:
+        _log_deploy(driver['id'], f'[compose] exit code {result.returncode}')
+        return {'status': 'error', 'error': f'compose up failed (rc={result.returncode})'}
+    _log_deploy(driver['id'], '[deploy] done')
     return {'status': 'starting', 'service': service_name}
 
 
@@ -189,8 +231,17 @@ def _deploy_sync_legacy(driver: dict) -> dict:
     )
 
     if '-jetson' in target_image:
-        run_kwargs['runtime'] = 'nvidia'
-        env_base = {'NVIDIA_VISIBLE_DEVICES': 'all'}
+        # Only use nvidia runtime if available on host
+        try:
+            runtimes = client.info().get('Runtimes', {})
+        except Exception:
+            runtimes = {}
+        if 'nvidia' in runtimes:
+            run_kwargs['runtime'] = 'nvidia'
+            env_base = {'NVIDIA_VISIBLE_DEVICES': 'all'}
+        else:
+            run_kwargs['privileged'] = True
+            env_base = {}
     else:
         run_kwargs['privileged'] = True
         env_base = {}
@@ -222,7 +273,13 @@ def _deploy_sync_legacy(driver: dict) -> dict:
 
     run_kwargs['log_config'] = {'type': 'local'}
 
-    container = client.containers.run(**run_kwargs)
+    _log_deploy(driver['id'], f'[run] {name}')
+    try:
+        container = client.containers.run(**run_kwargs)
+    except Exception as e:
+        _log_deploy(driver['id'], f'[error] {e}')
+        raise
+    _log_deploy(driver['id'], f'[deploy] done, container={container.id[:12]}')
     return {'status': 'starting', 'container_id': container.id[:12]}
 
 
@@ -236,6 +293,21 @@ def _stop_sync(driver_id: str) -> dict:
         return {'status': 'stopped'}
     except docker_sdk.errors.NotFound:
         return {'status': 'already_stopped'}
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+
+def _remove_sync(driver_id: str) -> dict:
+    """Stop and remove container."""
+    import docker as docker_sdk
+    try:
+        client = _docker()
+        name = _container_name(driver_id)
+        container = client.containers.get(name)
+        container.remove(force=True)
+        return {'status': 'removed'}
+    except docker_sdk.errors.NotFound:
+        return {'status': 'not_found'}
     except Exception as e:
         raise RuntimeError(str(e))
 
@@ -410,6 +482,7 @@ async def driver_deploy(driver_id: str, body: dict = fastapi.Body(default={})):
     try:
         result = await _run_in_executor(_deploy_sync, driver)
     except Exception as e:
+        _log_deploy(driver_id, f'[error] {e}')
         return {'code': 500, 'message': str(e)}
 
     # Persist updated image into manifest (so DB remembers last deployed image)
@@ -437,6 +510,21 @@ async def driver_stop(driver_id: str):
         return {'code': 200, 'data': result}
     except Exception as e:
         return {'code': 500, 'message': str(e)}
+
+
+@router.post('/{driver_id}/remove')
+async def driver_remove(driver_id: str):
+    """Stop + remove container, clear last_deploy from manifest."""
+    try:
+        result = await _run_in_executor(_remove_sync, driver_id)
+    except Exception as e:
+        return {'code': 500, 'message': str(e)}
+    manifest = _load_manifest()
+    entry = next((d for d in manifest if d.get('id') == driver_id), None)
+    if entry:
+        entry.pop('last_deploy', None)
+        _save_manifest(manifest)
+    return {'code': 200, 'data': result}
 
 
 @router.get('/{driver_id}/status')

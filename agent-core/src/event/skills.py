@@ -73,7 +73,7 @@ class Tools:
         if not skill:
             return f'技能 "{slug}" 不可用。可用技能: {", ".join(s["slug"] for s in avail)}'
         _runtime_activated.add(slug)
-        return f'已激活技能「{skill["name"]}」。完整指令将在下一轮推理中可见。'
+        return f'已激活技能「{skill["name"]}」。完整指令已注入，请立即根据指令执行任务，不要 finish。'
 
     async def deactivate_skill(self,
         slug: typing.Annotated[str, '要停用的技能 slug'],

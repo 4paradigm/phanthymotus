@@ -62,6 +62,10 @@ function _summarize(event) {
     case 'asr_result':     return `"${p.text || ''}"`;
     case 'trigger':        return p.text || _trunc(JSON.stringify(p), 60);
     case 'render':         return `renderer=${p.renderer}`;
+    case 'llm_usage':      return `tokens: in=${p.prompt_tokens} out=${p.completion_tokens} cached=${p.cached_tokens}`;
+    case 'turn_end':
+      if (p.usage) return `✓ ${p.rounds}轮 ${p.duration_s}s | tokens: in=${p.usage.prompt_tokens} out=${p.usage.completion_tokens} cached=${p.usage.cached_tokens}`;
+      return '✓ turn complete';
     case 'status':
       return 'connected' in p
         ? (p.connected ? '● 已连接' : '○ 断开')

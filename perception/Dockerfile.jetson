@@ -105,6 +105,18 @@ RUN cd /ros_ws && . /opt/ros/jazzy/setup.bash && \
     . /ros_ws/install/setup.bash && \
     /usr/bin/python3 -c "import rclpy,yaml; from audio_msgs.msg import AudioChunk"
 
+# Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
+ENV YOLO_CONFIG_DIR=/work
+
+# ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
+
+# ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
+RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
+
+# ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py /work/main.py
 COPY perception/plugins/vits2_tts_trt/ /work/plugins/vits2_tts_trt/

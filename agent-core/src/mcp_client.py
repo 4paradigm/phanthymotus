@@ -23,6 +23,7 @@ mcp_client.py — MCP HTTP transport 客户端。
 import asyncio
 import json
 import time
+import uuid
 
 import aiohttp
 import jsonschema
@@ -32,6 +33,12 @@ import event_bus
 
 # ── 全局注册表 ─────────────────────────────────────────────────────────────────
 registry: dict[str, dict] = {}   # mcp_id → info
+
+# ── ACP: 异步动作完成协议 ──────────────────────────────────────────────────────
+_pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on completion)
+_pending_results: dict[str, dict] = {}            # action_id → completion payload
+_pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
+_pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
 
 
 # ── 内部 JSON-RPC 助手 ─────────────────────────────────────────────────────────
@@ -125,6 +132,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
                         'type': tool.get('type'),
                         'action_enum': action_enum,
                         'has_config_schema': bool(tool.get('configSchema')),
+                        'completion': raw_input_schema.get('x-completion'),
                     }
                 else:
                     # 拆分：多个 sub-schemas
@@ -137,6 +145,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
                             'type': tool.get('type'),
                             'action_enum': None,
                             'has_config_schema': bool(tool.get('configSchema')),
+                            'completion': (tool.get('inputSchema') or {}).get('x-completion'),
                         }
                         # 解析 action name（最后一段 __）
                         action_name = schema['name'].split('__')[-1]
@@ -196,6 +205,15 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                         except json.JSONDecodeError:
                             text    = raw
                             payload = {}
+
+                        # ACP: action_complete 事件 → 解锁 sync() 等待
+                        msg_type = msg.get('type') if isinstance(msg, dict) else None
+                        if msg_type == 'action_complete':
+                            action_id = msg.get('action_id') or payload.get('action_id')
+                            if action_id and action_id in _pending_actions:
+                                _pending_results[action_id] = msg
+                                _pending_actions[action_id].set()
+
                         await event_bus.enqueue(
                             source  = f'mcp:{mcp_id}',
                             text    = text,
@@ -225,6 +243,45 @@ async def init_all() -> None:
     ]
     if tasks:
         await asyncio.gather(*tasks)
+
+    # Register internal MCPs (transport='internal') into registry for tool schema lookup
+    _register_internal_mcps()
+
+
+def _register_internal_mcps():
+    """Register internal MCPs (agentcore, channel) into registry so their
+    tool schemas are available for _get_bound_tool_schemas() in llm.py."""
+    mcp_list = config.main.get('services', {}).get('mcp', [])
+    for m in mcp_list:
+        if m.get('transport') != 'internal':
+            continue
+        mcp_id = m.get('id', '')
+        if not mcp_id or mcp_id in registry:
+            continue
+        tools = m.get('tools', [])
+        schemas = {}
+        input_schemas = {}
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_name = tool.get('name', '')
+            full_name = f'mcp__{mcp_id}__{tool_name}'
+            # Build schema in the format LLM expects
+            schema = {
+                'name': full_name,
+                'description': tool.get('description', ''),
+                'parameters': tool.get('inputSchema', {'type': 'object', 'properties': {}}),
+            }
+            schemas[full_name] = schema
+            input_schemas[full_name] = tool.get('inputSchema', {})
+        registry[mcp_id] = {
+            'online': True,
+            'transport': 'internal',
+            'schemas': schemas,
+            'input_schemas': input_schemas,
+            'tool_groups': {},
+            'split_map': {},
+        }
 
 
 # ── 工具调用 ────────────────────────────────────────────────────────────────────
@@ -264,8 +321,18 @@ async def call_tool(full_name: str, args: dict) -> str:
     if not info:
         return f'MCP {mcp_id} 未注册'
 
+    # Internal tools (agentcore) — dispatch locally
+    if info.get('transport') == 'internal':
+        return await _dispatch_internal(mcp_id, tool_name, args)
+
     url     = info['url']
     timeout = aiohttp.ClientTimeout(total=30)
+
+    # ── ACP: 提取内部控制参数（不送给 driver）──────────────────────────────────
+    cancel_event = args.pop('_cancel_event', None)
+    trace_id = args.pop('_trace_id', None)
+    if trace_id:
+        args['_trace_id'] = trace_id  # _trace_id 保留给 driver（driver 需要）
 
     # ── 参数校验：按工具声明的 inputSchema 验证 LLM 生成的参数 ──────────────
     input_schema = info.get('input_schemas', {}).get(full_name)
@@ -348,6 +415,30 @@ async def call_tool(full_name: str, args: dict) -> str:
         except Exception:
             pass
 
+    # ── ACP: 异步工具 — 注册 pending，立即返回（barrier 在 _dispatch 层）────────
+    action = args.get('action')
+    meta = info.get('tool_meta', {}).get(full_name, {})
+    completion_spec = meta.get('completion')
+    if completion_spec and _should_await_completion(completion_spec, action):
+        try:
+            parsed_result = json.loads(texts[0]) if texts else {}
+            action_id = parsed_result.get('action_id')
+            if action_id:
+                _pending_actions[action_id] = asyncio.Event()
+                # 记录该 pending 属于哪个工具（用于 barrier 资源冲突判断）
+                _pending_tools[action_id] = tool_name
+                # 动态 timeout：有 text 参数时按字数算（合成+播放: 字数/3 + 10s余量），否则用 schema 默认值
+                text_arg = args.get('text', '')
+                default_timeout = completion_spec.get('timeout', 120)
+                if text_arg:
+                    dynamic_timeout = len(text_arg) / 3 + 10
+                else:
+                    dynamic_timeout = default_timeout
+                _pending_timeouts[action_id] = dynamic_timeout
+                print(f'[acp] registered pending: {action_id} (tool={tool_name}, timeout={dynamic_timeout:.0f}s)')
+        except (json.JSONDecodeError, IndexError):
+            pass
+
     return text_result
 
 
@@ -380,3 +471,208 @@ def all_schemas() -> list[dict]:
                 }}
             schemas.append(schema)
     return schemas
+
+
+async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
+    """Dispatch tool call for internal (agentcore/channel) tools."""
+    if tool_name == 'channel_reply':
+        action = args.get('action', '')
+        if action == 'send':
+            text = args.get('text', '')
+            if not text:
+                return 'Error: "text" field is required.'
+            from channel.manager import manager as channel_mgr
+            channels_with_context = list(channel_mgr._get_last_context().keys())
+            if not channels_with_context:
+                return (
+                    'Error: No active conversation context. '
+                    'A user must send a message to the bot first before it can reply. '
+                    'Ask the user to send a message in Feishu/Telegram/Slack.'
+                )
+            channel_id = channels_with_context[-1]
+            return await channel_mgr.send_to_channel(channel_id, text)
+        return f'Error: Unknown action "{action}". Use action="send" with a "text" field.'
+
+    # Default: return info for other internal tools
+    return json.dumps({'status': 'ok', 'tool': tool_name})
+
+
+# ── ACP: 异步动作完成协议 ─────────────────────────────────────────────────────
+
+def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
+    """判断当前 action 是否为异步动作（需要注册 pending）。"""
+    actions_list = completion_spec.get('actions', [])
+    if not actions_list:
+        return True  # 无 filter → 所有 action 都是异步的
+    return action in actions_list
+
+
+async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
+                        tool_name: str | None = None) -> dict:
+    """等待 pending actions 完成。全局 barrier：等所有 pending。"""
+    aids = list(_pending_actions.keys())
+    if not aids:
+        return {"status": "no_pending"}
+
+    events = [_pending_actions[aid] for aid in aids if aid in _pending_actions]
+    if not events:
+        return {"status": "no_pending"}
+
+    # 取所有 pending action 中最大的 timeout
+    effective_timeout = max(_pending_timeouts.get(aid, timeout) for aid in aids)
+    print(f'[acp] barrier: waiting for {aids} (timeout={effective_timeout:.0f}s)')
+
+    async def _wait_all():
+        await asyncio.gather(*[ev.wait() for ev in events])
+
+    try:
+        if cancel_event:
+            wait_task = asyncio.create_task(_wait_all())
+            cancel_task = asyncio.create_task(cancel_event.wait())
+            done, pending = await asyncio.wait(
+                [wait_task, cancel_task],
+                timeout=effective_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
+            if cancel_task in done:
+                # 用户打断：清理所有 pending
+                for aid in aids:
+                    _pending_actions.pop(aid, None)
+                    _pending_results.pop(aid, None)
+                    _pending_timeouts.pop(aid, None)
+                    _pending_tools.pop(aid, None)
+                return {"status": "cancelled"}
+        else:
+            await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
+
+        # 清理已完成的
+        for aid in aids:
+            _pending_actions.pop(aid, None)
+            _pending_results.pop(aid, None)
+            _pending_timeouts.pop(aid, None)
+            _pending_tools.pop(aid, None)
+        print(f'[acp] barrier cleared: {aids}')
+        return {"status": "completed", "actions": aids}
+    except asyncio.TimeoutError:
+        for aid in aids:
+            _pending_actions.pop(aid, None)
+            _pending_results.pop(aid, None)
+            _pending_timeouts.pop(aid, None)
+            _pending_tools.pop(aid, None)
+        print(f'[acp] barrier timeout: {aids}')
+        return {"status": "timeout", "actions": aids}
+
+
+async def sync(action_ids: list[str] | None = None, timeout: float = 120,
+               cancel_event: asyncio.Event | None = None) -> dict:
+    """等待指定异步动作完成。不指定 ids 则等待所有 pending actions。
+
+    返回: {"status": "completed"|"timeout"|"cancelled", "results": {...}}
+    """
+    targets = action_ids or list(_pending_actions.keys())
+    if not targets:
+        return {"status": "no_pending_actions"}
+
+    events = [(aid, _pending_actions[aid]) for aid in targets if aid in _pending_actions]
+    if not events:
+        return {"status": "no_pending_actions", "note": f"action_ids {targets} not found in pending"}
+
+    async def _wait_all():
+        await asyncio.gather(*[ev.wait() for _, ev in events])
+
+    async def _wait_with_cancel():
+        """等待完成或取消。"""
+        wait_task = asyncio.create_task(_wait_all())
+        if cancel_event:
+            cancel_task = asyncio.create_task(cancel_event.wait())
+            done, pending = await asyncio.wait(
+                [wait_task, cancel_task], return_when=asyncio.FIRST_COMPLETED
+            )
+            for p in pending:
+                p.cancel()
+            if cancel_task in done:
+                wait_task.cancel()
+                raise asyncio.CancelledError()
+        else:
+            await wait_task
+
+    try:
+        await asyncio.wait_for(_wait_with_cancel(), timeout=timeout)
+        # 收集结果并清理
+        results = {}
+        for aid, _ in events:
+            results[aid] = _pending_results.pop(aid, {"status": "completed"})
+            _pending_actions.pop(aid, None)
+        return {"status": "completed", "results": results}
+    except asyncio.TimeoutError:
+        completed = {aid: _pending_results.pop(aid, {}) for aid, ev in events if ev.is_set()}
+        still_pending = [aid for aid, ev in events if not ev.is_set()]
+        # 清理已完成的
+        for aid in completed:
+            _pending_actions.pop(aid, None)
+        return {"status": "timeout", "completed": completed, "pending": still_pending}
+    except asyncio.CancelledError:
+        return {"status": "cancelled", "pending": [aid for aid, _ in events]}
+
+
+def get_pending_actions() -> list[str]:
+    """返回当前所有 pending action_ids（供 prompt 展示）。"""
+    return list(_pending_actions.keys())
+
+
+def get_pending_for_tool(tool_name: str) -> list[str]:
+    """返回指定工具的 pending action_ids（barrier 资源冲突用）。"""
+    return [aid for aid, tn in _pending_tools.items() if tn == tool_name and aid in _pending_actions]
+
+
+# ── Direct Tool Call (bypass barrier/ACP) ────────────────────────────────────
+
+async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
+    """Direct MCP tool call — bypasses barrier, ACP, and schema validation.
+
+    Used by system hooks for immediate execution (e.g. interrupt, LED effects).
+    Does NOT register pending actions or check barriers.
+    """
+    entry = registry.get(mcp_id)
+    if not entry:
+        return {"error": f"device {mcp_id} not registered"}
+    if not entry.get('online'):
+        return {"error": f"device {mcp_id} offline"}
+    url = entry['url']
+    payload = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000) % 1_000_000,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": args},
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                data = await resp.json()
+                if "error" in data:
+                    return {"error": data["error"]}
+                result = data.get("result", {})
+                # Extract text content from MCP response
+                content = result.get("content", [])
+                if content and isinstance(content, list):
+                    text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                    if text_parts:
+                        try:
+                            return json.loads(text_parts[0])
+                        except (json.JSONDecodeError, IndexError):
+                            return {"raw": text_parts[0]}
+                return result
+    except Exception as e:
+        return {"error": f"call_tool_direct failed: {e}"}
+
+
+def cleanup_stale_actions(max_age_s: float = 300):
+    """清理超时的 pending actions（防泄漏，由定时器调用）。"""
+    # 简单实现：如果 action 超过 max_age 仍未完成，移除
+    # 实际超时由 sync() 的 timeout 参数处理，这里作为安全网
+    stale = [aid for aid, ev in _pending_actions.items() if ev.is_set()]
+    for aid in stale:
+        _pending_actions.pop(aid, None)
+        _pending_results.pop(aid, None)

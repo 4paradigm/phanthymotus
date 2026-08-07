@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>PhanthyMotus</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -13,7 +13,7 @@
 <body>
 
 <!-- ── Main App Shell ──────────────────────────────────────────────────────── -->
-<div id="app">
+<div id="app" style="display:none">
 
   <!-- Top Bar -->
   <header class="topbar">
@@ -27,28 +27,69 @@
     <!-- Mode toggle: 配置 / 监控 -->
     <div class="mode-toggle-group" id="mode-toggle-group">
       <div class="mode-toggle" id="mode-toggle">
-        <button class="mode-toggle-btn active" data-mode="configure">配置</button>
-        <button class="mode-toggle-btn" data-mode="monitor">监控</button>
+        <button class="mode-toggle-btn active" data-mode="configure">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M5 8v8"/><path d="M19 6v12"/><circle cx="12" cy="8" r="2"/><circle cx="5" cy="14" r="2"/><circle cx="19" cy="10" r="2"/></svg>
+          配置
+        </button>
+        <button class="mode-toggle-btn" data-mode="monitor">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 13V9"/><path d="M12 13V7"/><path d="M17 13v-2"/></svg>
+          监控
+        </button>
       </div>
     </div>
+    <button class="mobile-sidebar-toggle" id="mobile-sidebar-toggle" aria-label="工具列表">☰</button>
     <div class="topbar-actions">
       <div id="update-banner" class="update-banner hidden">
         <span id="update-banner-text"></span>
         <button class="btn-update" id="btn-update">更新</button>
       </div>
-      <button class="btn-ghost topbar-btn" id="btn-network">网络</button>
-      <button class="btn-ghost topbar-btn" id="btn-history">历史日志</button>
-      <button class="btn-ghost topbar-btn" id="btn-agent-def">智能体定义</button>
-      <button class="btn-ghost topbar-btn" id="btn-skills">技能</button>
-      <button class="btn-ghost topbar-btn" id="btn-deploy">部署 ▾</button>
+      <div class="topbar-settings" id="topbar-settings">
+        <button class="topbar-settings-btn" id="topbar-settings-btn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15 1.65 1.65 0 0 0 3.17 14H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span>设置</span>
+        </button>
+        <div class="topbar-settings-dropdown hidden" id="topbar-settings-dropdown">
+          <button class="settings-dropdown-item" data-target="btn-network">网络</button>
+          <button class="settings-dropdown-item" data-target="btn-history">历史日志</button>
+          <button class="settings-dropdown-item" data-target="btn-agent-def">智能体定义</button>
+          <button class="settings-dropdown-item" data-target="btn-skills">技能</button>
+          <button class="settings-dropdown-item" data-target="btn-channels">渠道</button>
+          <button class="settings-dropdown-item" data-target="btn-deploy">部署</button>
+          <button class="settings-dropdown-item" data-target="btn-performance">性能</button>
+          <button class="settings-dropdown-item" data-target="btn-usage">用量</button>
+          <div class="settings-dropdown-divider"></div>
+          <button class="settings-dropdown-item settings-dropdown-item--danger" data-target="btn-reset">重启与重置</button>
+        </div>
+      </div>
+      <!-- Hidden buttons for existing JS handlers -->
+      <button class="btn-ghost topbar-btn hidden" id="btn-network">网络</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-history">历史日志</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-agent-def">智能体定义</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-skills">技能</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-channels">渠道</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-reset">重置</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-performance">性能</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-usage">用量</button>
     </div>
+    <button class="mobile-hamburger" id="mobile-hamburger" aria-label="菜单">⋮</button>
   </header>
 
   <!-- Body: Drivers Sidebar + Flow + Detail Panel -->
   <div class="body-area">
 
+    <!-- Mobile floating buttons -->
+    <button class="mobile-sidebar-fab" id="mobile-sidebar-fab" aria-label="工具列表">☰</button>
+    <button class="mobile-log-fab" id="mobile-log-fab">日志</button>
+
     <!-- Sidebar (left) -->
     <div class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <img class="sidebar-logo" src="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/PhanthyMotus_Final_Refined_logo.png" alt="PhanthyMotus">
+        <div class="sidebar-brand-text">
+          <span class="brand-name">Phanthy</span><span class="brand-name-accent">Motus</span>
+        </div>
+      </div>
       <div class="sidebar-filter">
         <input type="text" id="sidebar-search" placeholder="搜索工具…" autocomplete="off" />
       </div>
@@ -93,11 +134,17 @@
       </div>
       <div class="canvas-empty" id="canvas-empty">
         <div class="placeholder-icon">⬡</div>
-        <p>从左侧拖入能力卡片</p>
+        <p class="desktop-hint">从左侧拖入能力卡片</p>
+        <p class="mobile-hint">点击 ☰ 打开工具列表，点击 + 添加卡片</p>
         <p style="font-size:12px;color:var(--text-dim);margin-top:4px">构建你的数据流编排</p>
       </div>
       <div class="canvas-top-control" id="canvas-top-control">
         <button class="canvas-main-btn" id="canvas-project-toggle" title="开启智能控制">开启智能控制</button>
+        <label class="auto-start-toggle" title="开机后自动开启智能控制">
+          <input type="checkbox" id="auto-start-checkbox">
+          <span class="auto-start-switch"></span>
+          <span class="auto-start-label">开机自启动</span>
+        </label>
       </div>
       <div class="canvas-controls" id="canvas-controls">
         <button class="canvas-ctrl-btn" id="canvas-zoom-out" title="缩小">−</button>
@@ -124,8 +171,56 @@
       <div class="monitor-dashboard-header">
         <span class="monitor-dashboard-title">DATA STREAMS</span>
         <button class="btn-ghost monitor-reset-btn" id="monitor-layout-reset">重置布局</button>
+        <button class="monitor-log-btn" id="monitor-log-btn">日志</button>
       </div>
       <div class="monitor-dashboard-grid" id="monitor-dashboard-grid"></div>
+    </div>
+
+    <!-- Mobile Settings Panel (shown when settings tab active) -->
+    <div class="mobile-settings-panel hidden" id="mobile-settings-panel">
+      <h2 class="settings-title">设置</h2>
+      <div class="mobile-update-banner hidden" id="mobile-update-banner">
+        <span class="mobile-update-text" id="mobile-update-text"></span>
+        <button class="mobile-update-btn" id="mobile-update-btn">更新</button>
+      </div>
+      <div class="settings-list">
+        <button class="settings-item" data-action="network">
+          <span class="settings-item-label">网络</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="history">
+          <span class="settings-item-label">历史日志</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="agent-def">
+          <span class="settings-item-label">智能体定义</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="skills">
+          <span class="settings-item-label">技能</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="channels">
+          <span class="settings-item-label">渠道</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="deploy">
+          <span class="settings-item-label">部署</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="performance">
+          <span class="settings-item-label">性能</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="usage">
+          <span class="settings-item-label">用量</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item settings-item--danger" data-action="reset">
+          <span class="settings-item-label">重启与重置</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+      </div>
     </div>
   </div>
 
@@ -138,7 +233,26 @@
     <div class="activity-log" id="activity-log"></div>
   </div>
 
+  <!-- Mobile Bottom Tab Bar -->
+  <nav class="mobile-tabbar" id="mobile-tabbar">
+    <button class="tabbar-btn active" data-tab="configure">
+      <span class="tabbar-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M5 8v8"/><path d="M19 6v12"/><circle cx="12" cy="8" r="2"/><circle cx="5" cy="14" r="2"/><circle cx="19" cy="10" r="2"/></svg></span>
+      <span class="tabbar-label">配置</span>
+    </button>
+    <button class="tabbar-btn" data-tab="monitor">
+      <span class="tabbar-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 13V9"/><path d="M12 13V7"/><path d="M17 13v-2"/></svg></span>
+      <span class="tabbar-label">监控</span>
+    </button>
+    <button class="tabbar-btn" data-tab="settings">
+      <span class="tabbar-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15 1.65 1.65 0 0 0 3.17 14H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span class="tabbar-badge hidden" id="settings-badge"></span></span>
+      <span class="tabbar-label">设置</span>
+    </button>
+  </nav>
+
 </div>
+
+<!-- Mobile overlay backdrop (outside #app to avoid flex/stacking issues) -->
+<div class="mobile-overlay" id="mobile-overlay"></div>
 
 <!-- ── Agent Definition Modal ──────────────────────────────────────────── -->
 <div class="modal-overlay hidden" id="agent-def-overlay">
@@ -173,6 +287,31 @@
   </div>
 </div>
 
+<!-- ── Reset Modal ────────────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="reset-overlay">
+  <div class="modal reset-modal">
+    <div class="modal-header">
+      <span class="modal-title">重启与重置</span>
+      <button class="btn-icon" id="reset-close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="reset-hint">选择操作，执行后不可撤销。</p>
+      <div class="reset-section-label">服务</div>
+      <label class="reset-item"><input type="checkbox" id="reset-restart-services"><div class="reset-item-text"><span>重启所有服务</span><small>重启 Agent Core、Driver、Perception 等</small></div></label>
+      <div class="reset-section-label">记忆</div>
+      <label class="reset-item"><input type="checkbox" id="reset-chat-history"><div class="reset-item-text"><span>历史对话</span><small>清空所有聊天记录与上下文</small></div></label>
+      <label class="reset-item"><input type="checkbox" id="reset-system-prompt"><div class="reset-item-text"><span>系统提示词</span><small>恢复出厂系统规则</small></div></label>
+      <label class="reset-item"><input type="checkbox" id="reset-identity"><div class="reset-item-text"><span>身份设定</span><small>恢复默认身份与性格</small></div></label>
+      <label class="reset-item"><input type="checkbox" id="reset-memory"><div class="reset-item-text"><span>长期记忆</span><small>清除智能体积累的记忆</small></div></label>
+      <label class="reset-item"><input type="checkbox" id="reset-skills"><div class="reset-item-text"><span>技能</span><small>停用所有已启用的技能</small></div></label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="reset-cancel">取消</button>
+      <button class="btn-danger" id="reset-confirm">确认执行</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Deploy Confirm Modal ─────────────────────────────────────────────── -->
 <div class="modal-overlay hidden" id="deploy-confirm-overlay">
   <div class="modal deploy-confirm-modal">
@@ -195,24 +334,27 @@
   <div class="modal deploy-modal">
     <div class="modal-header">
       <span class="modal-title">部署服务</span>
+      <div class="deploy-channel-selector" id="deploy-channel-selector">
+        <label class="deploy-channel-label">更新通道</label>
+        <select id="deploy-channel-select" class="deploy-channel-select">
+          <option value="ga">GA（稳定版）</option>
+          <option value="release">Release（正式版）</option>
+          <option value="preview">Preview（预览版）</option>
+        </select>
+      </div>
       <button class="btn-icon" id="deploy-close">✕</button>
     </div>
-    <div class="modal-body deploy-modal-body">
-      <div class="drivers-section">
-        <div class="drivers-section-label">核心服务</div>
-        <div class="drivers-grid" id="drivers-core"></div>
+    <div class="deploy-tabs">
+      <button class="deploy-tab active" data-tab="my-services">我的服务</button>
+      <button class="deploy-tab" data-tab="marketplace">驱动市场</button>
+    </div>
+    <div class="deploy-tab-pane active" id="pane-my-services"></div>
+    <div class="deploy-tab-pane" id="pane-marketplace">
+      <div class="marketplace-search-bar">
+        <input id="marketplace-search" type="search" placeholder="搜索驱动…" autocomplete="off" spellcheck="false">
       </div>
-      <div class="drivers-section">
-        <div class="drivers-section-label">硬件驱动</div>
-        <div class="hw-search-bar">
-          <input id="hw-search" type="search" placeholder="搜索驱动…" autocomplete="off" spellcheck="false">
-        </div>
-        <div id="drivers-hardware-inner"></div>
-      </div>
-      <div class="drivers-section">
-        <div class="drivers-section-label">感知服务</div>
-        <div class="drivers-grid" id="drivers-perception"></div>
-      </div>
+      <div class="marketplace-filters" id="marketplace-filters"></div>
+      <div class="marketplace-grid" id="marketplace-grid"></div>
     </div>
     <div class="modal-footer" id="deploy-modal-footer" style="display:none">
       <span class="deploy-footer-hint" id="deploy-footer-hint"></span>
@@ -252,16 +394,38 @@
   <div class="modal skill-modal">
     <div class="modal-header">
       <span class="modal-title">技能管理</span>
+      <div class="skill-rc-login-status" id="skill-rc-login-status"></div>
       <button class="btn-icon" id="skill-close">✕</button>
     </div>
     <div class="skill-tabs">
       <button class="skill-tab active" data-tab="installed">已安装</button>
+      <button class="skill-tab" data-tab="mine">我的技能</button>
       <button class="skill-tab" data-tab="browse">技能广场</button>
     </div>
     <div class="modal-body skill-modal-body">
       <div class="skill-panel active" data-panel="installed" id="skill-installed-panel">
         <div class="skill-empty" id="skill-installed-empty">暂无已安装技能</div>
         <div class="skill-list" id="skill-installed-list"></div>
+      </div>
+      <div class="skill-panel" data-panel="mine" id="skill-mine-panel">
+        <!-- Login form (shown when not logged in) -->
+        <div id="skill-rc-login-form" class="skill-rc-login">
+          <p class="skill-rc-login-hint">登录 Resource Center 以管理您的技能</p>
+          <form id="skill-rc-login-form-el">
+            <input type="text" id="skill-rc-email" placeholder="账号" required autocomplete="username">
+            <input type="password" id="skill-rc-password" placeholder="密码" required autocomplete="current-password">
+            <button type="submit" class="skill-btn skill-btn-primary">登录</button>
+          </form>
+          <p class="skill-rc-login-error hidden" id="skill-rc-login-error"></p>
+        </div>
+        <!-- My skills list (shown when logged in) -->
+        <div id="skill-mine-content" class="hidden">
+          <div class="skill-mine-toolbar">
+            <button class="skill-btn skill-btn-primary" id="skill-mine-create-btn">+ 创建技能</button>
+          </div>
+          <div class="skill-list" id="skill-mine-list"></div>
+          <div class="skill-empty hidden" id="skill-mine-empty">暂无技能，点击上方创建</div>
+        </div>
       </div>
       <div class="skill-panel" data-panel="browse" id="skill-browse-panel">
         <div class="skill-search-bar">
@@ -274,11 +438,83 @@
   </div>
 </div>
 
+<!-- Skill Create/Edit Form Modal -->
+<div class="modal-overlay hidden" id="skill-form-overlay">
+  <div class="modal skill-form-modal">
+    <div class="modal-header">
+      <span class="modal-title" id="skill-form-title">创建技能</span>
+      <button class="btn-icon" id="skill-form-close">✕</button>
+    </div>
+    <div class="modal-body skill-form-body">
+      <form id="skill-form-el">
+        <div class="skill-form-row">
+          <div class="skill-form-field">
+            <label>名称 <span class="required">*</span></label>
+            <input type="text" id="sf-name" required>
+          </div>
+          <div class="skill-form-field">
+            <label>Slug <span class="required">*</span></label>
+            <input type="text" id="sf-slug" required pattern="[a-z0-9-]+">
+          </div>
+        </div>
+        <div class="skill-form-row">
+          <div class="skill-form-field">
+            <label>分类</label>
+            <select id="sf-category">
+              <option value="navigation">navigation</option>
+              <option value="perception">perception</option>
+              <option value="manipulation">manipulation</option>
+              <option value="social">social</option>
+              <option value="utility" selected>utility</option>
+            </select>
+          </div>
+          <div class="skill-form-field skill-form-field-sm">
+            <label>图标</label>
+            <input type="text" id="sf-icon" placeholder="🤖">
+          </div>
+          <div class="skill-form-field">
+            <label>版本 <span class="required">*</span></label>
+            <input type="text" id="sf-version" required value="1.0.0">
+          </div>
+        </div>
+        <div class="skill-form-field">
+          <label>一句话描述 <span class="required">*</span></label>
+          <input type="text" id="sf-oneliner" required maxlength="80">
+        </div>
+        <div class="skill-form-field">
+          <label>详细描述 <span class="required">*</span></label>
+          <textarea id="sf-description" rows="2" required></textarea>
+        </div>
+        <div class="skill-form-field">
+          <label>指令 <span class="required">*</span></label>
+          <textarea id="sf-instruction" rows="8" required class="mono"></textarea>
+        </div>
+        <div class="skill-form-field">
+          <label>依赖工具（逗号分隔）</label>
+          <input type="text" id="sf-tools" placeholder="mic_start, speaker_play">
+        </div>
+        <div class="skill-form-field">
+          <label>配置模式 (JSON Schema)</label>
+          <textarea id="sf-configschema" rows="3" class="mono" placeholder='{"type":"object","properties":{}}'></textarea>
+        </div>
+        <p class="skill-form-error hidden" id="skill-form-error"></p>
+        <div class="skill-form-footer">
+          <button type="button" class="skill-btn" id="skill-form-cancel">取消</button>
+          <button type="submit" class="skill-btn skill-btn-primary" id="skill-form-submit-btn">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
 <!-- History Modal -->
 <div class="modal-overlay hidden" id="history-overlay">
   <div class="modal history-modal">
     <div class="modal-header">
-      <span class="modal-title">历史日志</span>
+      <div class="history-tabs">
+        <button class="history-tab active" data-tab="sessions">会话记录</button>
+        <button class="history-tab" data-tab="tasks">任务</button>
+      </div>
       <div class="history-header-actions">
         <button class="btn-ghost btn-sm" id="history-refresh">刷新</button>
         <button class="btn-ghost btn-sm" id="history-clear-all">清空全部</button>
@@ -287,12 +523,62 @@
       </div>
     </div>
     <div class="modal-body history-body">
-      <div class="history-list" id="history-list">
-        <div class="history-empty">暂无对话记录</div>
+      <div class="history-sessions-pane">
+        <div class="history-list" id="history-list">
+          <div class="history-empty">暂无对话记录</div>
+        </div>
+        <div class="history-chat" id="history-chat">
+          <div class="history-placeholder">选择一个会话查看对话记录</div>
+        </div>
       </div>
-      <div class="history-chat" id="history-chat">
-        <div class="history-placeholder">选择一个会话查看对话记录</div>
+      <div class="history-tasks-pane hidden" id="history-tasks"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Performance Modal -->
+<div class="modal-overlay hidden" id="performance-overlay">
+  <div class="modal performance-modal">
+    <div class="modal-header">
+      <span class="modal-title">性能分析</span>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="perf-range" class="perf-select">
+          <option value="1h">最近1小时</option>
+          <option value="6h">最近6小时</option>
+          <option value="24h" selected>最近24小时</option>
+          <option value="7d">最近7天</option>
+        </select>
+        <button class="btn-ghost btn-sm" id="perf-refresh">刷新</button>
+        <button class="btn-ghost btn-sm" id="perf-clear" style="color:var(--red)">清空</button>
+        <button class="btn-icon" id="performance-close">✕</button>
       </div>
+    </div>
+    <div class="modal-body performance-body">
+      <div id="perf-summary-cards"></div>
+      <div id="perf-waterfall"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Usage Modal -->
+<div class="modal-overlay hidden" id="usage-overlay">
+  <div class="modal usage-modal">
+    <div class="modal-header">
+      <span class="modal-title">用量统计</span>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="usage-range" class="perf-select">
+          <option value="today">今天</option>
+          <option value="7d" selected>最近7天</option>
+          <option value="30d">最近30天</option>
+          <option value="90d">最近90天</option>
+        </select>
+        <button class="btn-icon" id="usage-close">✕</button>
+      </div>
+    </div>
+    <div class="modal-body usage-body">
+      <div id="usage-summary-cards"></div>
+      <div id="usage-daily-chart"></div>
+      <div id="usage-daily-table"></div>
     </div>
   </div>
 </div>
@@ -326,12 +612,30 @@
   </div>
 </div>
 
+<!-- Channel Settings Modal -->
+<div class="modal-overlay hidden" id="channel-overlay">
+  <div class="modal channel-modal">
+    <div class="modal-header">
+      <span class="modal-title">Channels</span>
+      <button class="btn-icon" id="channel-close">✕</button>
+    </div>
+    <div class="modal-body channel-body">
+      <div class="channel-toolbar">
+        <button class="btn-primary btn-sm" id="channel-add-btn">+ Add Channel</button>
+      </div>
+      <div class="channel-list" id="channel-list">
+        <div class="channel-empty">Loading...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script type="importmap">
 { "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.164/build/three.module.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164/examples/jsm/"
 } }
 </script>
-<script type="module" src="/js/app.js"></script>
+<script type="module" src="/js/app.js?v=2"></script>
 </body>
 </html>

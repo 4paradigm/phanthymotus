@@ -23,6 +23,36 @@ let _connSvg    = null;
 let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
 
+// ── Editor Lock ──────────────────────────────────────────────────────────────
+let _sessionId = localStorage.getItem('canvas_session_id');
+if (!_sessionId) {
+  _sessionId = 'sess-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  localStorage.setItem('canvas_session_id', _sessionId);
+}
+let _isEditor = false;
+let _currentEditor = null;  // session_id of current editor (null = no one)
+
+/** Check if current session can modify. If not, show warning and return false. */
+function _canEdit() {
+  if (!_isEditor) {
+    const msg = _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先点击「编辑」进入编辑状态';
+    _showToast(msg);
+    return false;
+  }
+  return true;
+}
+
+function _showToast(msg) {
+  const old = document.getElementById('canvas-toast');
+  if (old) old.remove();
+  const toast = document.createElement('div');
+  toast.id = 'canvas-toast';
+  toast.textContent = msg;
+  toast.style.cssText = 'position:absolute;bottom:80px;left:50%;transform:translateX(-50%);width:fit-content;max-width:80%;background:rgba(28,25,23,.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:9999;pointer-events:none;opacity:0;animation:canvas-toast-in 2.5s ease forwards;';
+  _canvasEl.appendChild(toast);
+  setTimeout(() => toast.remove(), 2600);
+}
+
 // Connection state
 let _connections = [];  // [{id, fromCardId, fromPort, toCardId, toPort, format}]
 let _execConnections = []; // [{id, fromCardId, toCardId, toToolName, toMcpId}]
@@ -33,6 +63,29 @@ let _projectRunning = false;
 
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
+export function canEdit() { return _canEdit(); }
+
+/**
+ * Programmatically add a card to the canvas (used by mobile tap-to-add).
+ * Returns true if added, false if rejected.
+ */
+export function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
+  if (_projectRunning) return false;
+  if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
+  if (!multiInstance) {
+    const existing = _cards.find(c => c.mcpId === mcpId && c.toolName === toolName);
+    if (existing) return false;
+  }
+  // Position at viewport center in world coordinates
+  const rect = _canvasEl.getBoundingClientRect();
+  const cx = (rect.width / 2 - _tx) / _zoom;
+  const cy = (rect.height / 2 - _ty) / _zoom;
+  let x = cx - 130, y = cy - 70;
+  ({ x, y } = _findNonOverlappingPos(x, y));
+  const id = 'card-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  _addCard({ id, mcpId, toolName, driverName, x, y }, true);
+  return true;
+}
 
 // ── Viewport transform state ──────────────────────────────────────────────────
 let _zoom = 1;
@@ -99,7 +152,19 @@ export async function initCanvas(initialMcps) {
       _ty   = layoutJson.data.transform.ty   ?? 0;
       _applyTransform();
     }
+
+    // On mobile, auto-fit cards to viewport instead of using saved desktop transform
+    if (window.innerWidth <= 768 && _cards.length > 0) {
+      _fitToViewport();
+    }
+
+    // Initialize editor lock state from layout response
+    _currentEditor = layoutJson.editor || null;
+    if (_currentEditor === _sessionId) _isEditor = true;
   } catch { /* start empty */ }
+
+  // Show editor status bar
+  _updateEditorUI();
 
   // Restore project running state from backend
   try {
@@ -111,6 +176,36 @@ export async function initCanvas(initialMcps) {
       document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
     }
   } catch { /* ignore */ }
+
+  // Cross-tab sync: listen for project_state events via WebSocket
+  const { onMotusEvent } = await import('./motus-stream.js');
+  onMotusEvent(null, (event) => {
+    if (event.type === 'project_state') {
+      const running = event.payload?.running;
+      if (running !== _projectRunning) {
+        _projectRunning = running;
+        _syncProjectBtn();
+        document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+          btn.classList.toggle('locked', !_projectRunning);
+        });
+      }
+    }
+  });
+
+  // Re-sync state when tab becomes visible (fallback for WS disconnect)
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      fetch('/api/config/project-running').then(r => r.json()).then(d => {
+        if (d.running !== _projectRunning) {
+          _projectRunning = d.running;
+          _syncProjectBtn();
+          document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+            btn.classList.toggle('locked', !_projectRunning);
+          });
+        }
+      }).catch(() => {});
+    }
+  });
 
   _syncEmptyState();
 }
@@ -181,6 +276,44 @@ function _applyTransform() {
   if (_zoomLabel) _zoomLabel.textContent = Math.round(_zoom * 100) + '%';
 }
 
+function _fitToViewport() {
+  if (!_cards.length) return;
+  const rect = _canvasEl.getBoundingClientRect();
+  const padding = 30;
+  // Find bounding box of all cards in world coords (with port margins)
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const cardW = window.innerWidth <= 768 ? 220 : 260;
+  for (const c of _cards) {
+    minX = Math.min(minX, c.x - 20); // port extends left
+    minY = Math.min(minY, c.y);
+    maxX = Math.max(maxX, c.x + cardW + 20); // port extends right
+    maxY = Math.max(maxY, c.y + 160);
+  }
+  const contentW = maxX - minX;
+  const contentH = maxY - minY;
+  const availW = rect.width - padding * 2;
+  const availH = rect.height - padding * 2;
+  _zoom = Math.min(availW / contentW, availH / contentH, 1);
+  _zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, _zoom));
+  // Center content
+  _tx = padding + (availW - contentW * _zoom) / 2 - minX * _zoom;
+  _ty = padding + (availH - contentH * _zoom) / 2 - minY * _zoom;
+  _applyTransform();
+}
+
+// ── Touch helpers ─────────────────────────────────────────────────────────────
+function _getTouchDist(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.hypot(dx, dy);
+}
+function _getTouchCenter(touches) {
+  return {
+    x: (touches[0].clientX + touches[1].clientX) / 2,
+    y: (touches[0].clientY + touches[1].clientY) / 2
+  };
+}
+
 function _zoomAt(clientX, clientY, delta) {
   const rect    = _canvasEl.getBoundingClientRect();
   const mouseX  = clientX - rect.left;
@@ -207,6 +340,41 @@ function _setupZoomPan() {
     _zoomAt(e.clientX, e.clientY, delta);
     _debouncedSave();
   }, { passive: false });
+
+  // ── Pinch-to-zoom (mobile two-finger gesture) ──
+  let _pinchDist = 0;
+  let _pinchCenter = { x: 0, y: 0 };
+  let _pinching = false;
+
+  _canvasEl.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      _pinching = true;
+      _panning = false; // cancel any single-finger pan
+      _pinchDist = _getTouchDist(e.touches);
+      _pinchCenter = _getTouchCenter(e.touches);
+    }
+  }, { passive: false });
+
+  _canvasEl.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2 && _pinching) {
+      e.preventDefault();
+      const dist = _getTouchDist(e.touches);
+      const center = _getTouchCenter(e.touches);
+      const scale = dist / _pinchDist;
+      const delta = (scale - 1) * 0.5;
+      _zoomAt(center.x, center.y, delta);
+      _pinchDist = dist;
+      _pinchCenter = center;
+    }
+  }, { passive: false });
+
+  _canvasEl.addEventListener('touchend', (e) => {
+    if (e.touches.length < 2) {
+      _pinching = false;
+      _debouncedSave();
+    }
+  });
 
   // Left-click drag on canvas background = pan (like a map)
   let _panning    = false;
@@ -277,6 +445,9 @@ function _setupControlButtons() {
     _projectRunning ? _stopProject() : _startProject();
   });
   _syncProjectBtn();
+
+  // Auto-start toggle
+  _initAutoStartToggle();
 }
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
@@ -300,6 +471,11 @@ function _setupDropZone() {
 
     if (_projectRunning) {
       _showDropReject(e, '请停止智能控制后修改');
+      return;
+    }
+
+    if (!_isEditor) {
+      _showDropReject(e, _currentEditor ? '画布已被其他用户锁定' : '请先获取编辑权');
       return;
     }
 
@@ -425,6 +601,7 @@ function _removeCard(id) {
     _logActivity('warn', '请停止智能控制后修改');
     return;
   }
+  if (!_canEdit()) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
   _cards[idx].el.remove();
@@ -562,6 +739,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           if (!enumVals.length) return '';
           const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(titleMap[v] || v)}</option>`).join('');
           inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
+        } else if (def.format === 'file') {
+          const accept = def.accept || '*/*';
+          inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}">Choose File</button><span class="canvas-file-name"></span></div>`;
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
           const desc = def.description || '';
@@ -638,9 +818,47 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (sensorExecBtn) {
       sensorExecBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
+        if (!_canEdit()) return;
         await _executeCard(el, mcpId, toolName, id);
       });
     }
+
+    // Generic file upload buttons for sensor cards (format: 'file' in schema)
+    el.querySelectorAll('.canvas-file-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        const wrapper = btn.closest('.canvas-field-file');
+        const hiddenInput = wrapper.querySelector('.canvas-field-input');
+        const nameSpan = wrapper.querySelector('.canvas-file-name');
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = btn.dataset.accept || '*/*';
+        fileInput.onchange = async () => {
+          if (!fileInput.files[0]) return;
+          btn.textContent = 'Uploading...';
+          const form = new FormData();
+          form.append('file', fileInput.files[0]);
+          form.append('path', '/tmp/uploads');
+          try {
+            const res = await fetch('/api/file/upload', { method: 'POST', body: form });
+            const data = await res.json();
+            if (data.code === 200) {
+              hiddenInput.value = '/tmp/uploads/' + fileInput.files[0].name;
+              nameSpan.textContent = fileInput.files[0].name;
+              btn.textContent = 'Re-select';
+            } else {
+              btn.textContent = 'Failed';
+              setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
+            }
+          } catch (err) {
+            btn.textContent = 'Error';
+            setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
+          }
+        };
+        fileInput.click();
+      });
+    });
   } else {
     // Actuator/processor/default card
     const props   = schema?.properties || {};
@@ -663,6 +881,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         if (!enumVals.length) return '';  // hide field entirely if no options left
         const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(v)}</option>`).join('');
         inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
+      } else if (def.format === 'file') {
+        const accept = def.accept || '*/*';
+        inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}">选择文件</button><span class="canvas-file-name"></span></div>`;
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
         const desc = def.description || '';
@@ -732,7 +953,13 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             field.style.display = paramKeys.includes(key) ? '' : 'none';
           });
         };
-        actionSelect.addEventListener('change', _applyActionParams);
+        actionSelect.addEventListener('change', () => {
+          if (!_canEdit()) {
+            _applyActionParams();  // revert visual to match current state
+            return;
+          }
+          _applyActionParams();
+        });
         _applyActionParams();  // 初始应用
       }
     }
@@ -766,6 +993,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (execBtn) {
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
+        if (!_canEdit()) return;
         await _executeCard(el, mcpId, toolName);
       });
     }
@@ -781,36 +1009,44 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     }
 
     // remote_mic 特殊渲染：麦克风录音按钮
-    if (toolName === 'remote_mic') {
-      const footer = el.querySelector('.canvas-card-footer');
-      const micBtn = document.createElement('button');
-      micBtn.className = 'canvas-mic-btn';
-      micBtn.textContent = isMicActive() ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-      if (isMicActive()) micBtn.classList.add('recording');
-      micBtn.addEventListener('click', async (e) => {
+    // remote_mic: no manual button — mic auto-starts with project
+
+    // Generic file upload buttons (format: 'file' in schema)
+    el.querySelectorAll('.canvas-file-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
         e.stopPropagation();
-        const liveMcp = _allMcps.find(m => m.id === mcpId);
-        if (!liveMcp) return;
-        // Connect mic WebSocket to agent-core's /ws/mic proxy (same host/port as page)
-        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-        try {
-          // Ensure mic permission is granted before connecting
-          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            alert('麦克风不可用：需要 HTTPS 安全连接');
-            return;
+        e.preventDefault();
+        const wrapper = btn.closest('.canvas-field-file');
+        const hiddenInput = wrapper.querySelector('.canvas-field-input');
+        const nameSpan = wrapper.querySelector('.canvas-file-name');
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = btn.dataset.accept || '*/*';
+        fileInput.onchange = async () => {
+          if (!fileInput.files[0]) return;
+          btn.textContent = 'Uploading...';
+          const form = new FormData();
+          form.append('file', fileInput.files[0]);
+          form.append('path', '/tmp/uploads');
+          try {
+            const res = await fetch('/api/file/upload', { method: 'POST', body: form });
+            const data = await res.json();
+            if (data.code === 200) {
+              hiddenInput.value = '/tmp/uploads/' + fileInput.files[0].name;
+              nameSpan.textContent = fileInput.files[0].name;
+              btn.textContent = 'Re-select';
+            } else {
+              btn.textContent = 'Failed';
+              setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
+            }
+          } catch (err) {
+            btn.textContent = 'Error';
+            setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
           }
-          await toggleMicStream(wsUrl, (active) => {
-            micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-            micBtn.classList.toggle('recording', active);
-          });
-        } catch (err) {
-          console.error('[canvas] mic toggle failed:', err);
-          alert('麦克风启动失败: ' + err.message);
-        }
+        };
+        fileInput.click();
       });
-      footer.prepend(micBtn);
-    }
+    });
   }
 
   return el;
@@ -828,7 +1064,7 @@ function _fmtColorClass(fmt) {
 // ── Port drag-to-connect ──────────────────────────────────────────────────────
 
 function _setupPortDrag() {
-  document.addEventListener('mousemove', (e) => {
+  document.addEventListener('pointermove', (e) => {
     if (!_draggingConn) return;
     const vpRect = _viewport.getBoundingClientRect();
     const x2 = (e.clientX - vpRect.left) / _zoom;
@@ -883,7 +1119,7 @@ function _setupPortDrag() {
     }
   });
 
-  document.addEventListener('mouseup', (e) => {
+  document.addEventListener('pointerup', (e) => {
     if (!_draggingConn) return;
 
     // Remove highlights
@@ -968,8 +1204,8 @@ function _setupPortDrag() {
     _draggingConn = null;
   });
 
-  // Delegate mousedown on out ports and executor ports
-  _viewport.addEventListener('mousedown', (e) => {
+  // Delegate pointerdown on out ports and executor ports
+  _viewport.addEventListener('pointerdown', (e) => {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;
@@ -977,6 +1213,7 @@ function _setupPortDrag() {
       _logActivity('warn', '请停止智能控制后修改');
       return;
     }
+    if (!_canEdit()) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -1093,6 +1330,7 @@ function _redrawConnections() {
         _logActivity('warn', '请停止智能控制后修改');
         return;
       }
+      if (!_canEdit()) return;
       _connections = _connections.filter(c => c.id !== conn.id);
       _resolveAllTopics();
       _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
@@ -1168,6 +1406,7 @@ function _redrawConnections() {
     delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
 
     const removeExec = () => {
+      if (!_canEdit()) return;
       _execConnections = _execConnections.filter(c => c.id !== conn.id);
       _logActivity('executor', `解绑执行器: ${conn.toToolName || conn.toCardId}`);
       _redrawConnections();
@@ -1279,138 +1518,82 @@ function _autoStopOnDisconnect(cardId, portIdx, topic) {
 }
 
 async function _startProject() {
-  // 先对 agentcore 发 stop，清理上一轮残留的 topic 订阅（必须 await 否则后续 start 会被 stop 覆盖）
-  await _triggerAction('agentcore', 'decision_core', 'stop', {});
+  // Save canvas layout first (so backend reads latest topology)
+  await _saveLayout();
 
-  // Check all cards on canvas that need config are configured (via sidebar per-tool config)
-  const unconfigured = _cards.filter(c => {
-    const mcp = _allMcps.find(m => m.id === c.mcpId);
-    const tools = mcp?.tools || [];
-    const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === c.toolName);
-    const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
-    return hasSharedRequired(configSchema) && !isToolConfigured(c.mcpId, c.toolName);
-  });
-  if (unconfigured.length) {
-    const names = unconfigured.map(c => c.toolName).join(', ');
-    const msg = `无法启动：以下工具未配置: ${names}（请在侧边栏中配置）`;
-    _logActivity('error', msg);
-    _flashStartError(msg);
-    return;
-  }
+  // Import motus for event subscription
+  const { onMotusEvent, offMotusEvent } = await import('./motus-stream.js');
 
-  // Resolve all topics before validation (ensures correctness after page reload)
-  _resolveAllTopics();
+  // Subscribe to startup progress events
+  let modal = null;
+  let itemIndex = {};  // tool_name -> index in modal
 
-  // For processor cards with empty output topics, fetch from driver using input topic
-  for (const card of _cards) {
-    const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-    const hasEmptyOut = outPorts.some(p => !p.dataset.topic);
-    if (!hasEmptyOut) continue;
-    // Only for cards that have outgoing connections (otherwise irrelevant)
-    const hasOutConn = _connections.some(c => c.fromCardId === card.id);
-    if (!hasOutConn) continue;
-    // Get input topic from inbound connection
-    const inConn = _connections.find(c => c.toCardId === card.id);
-    const inputTopic = inConn?.fromTopic || '';
-    await _fetchTopicsFromDriver(card, inputTopic);
-  }
-  _resolveAllTopics();
-
-  // Validate topic connections: every connection must have a fromTopic
-  for (const conn of _connections) {
-    if (!conn.fromTopic) {
-      const fromCard = _cards.find(c => c.id === conn.fromCardId);
-      const toCard = _cards.find(c => c.id === conn.toCardId);
-      const msg = `连线缺少 topic: ${fromCard?.toolName || '?'} → ${toCard?.toolName || '?'}，请删除并重新连接`;
-      _logActivity('error', msg);
-      _flashStartError(msg);
-      return;
+  function _onEvent(event) {
+    const p = event.payload || {};
+    if (event.type === 'project_start_begin') {
+      const cards = p.cards || [];
+      const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
+      modal = _showStartupModal(items);
+      cards.forEach((c, i) => { itemIndex[c.tool] = i; });
+    } else if (event.type === 'project_start_item' && modal) {
+      const idx = itemIndex[p.tool];
+      if (idx !== undefined) {
+        modal.updateItem(idx, p.status, p.message || '');
+      }
+    } else if (event.type === 'project_start_done') {
+      if (modal && !p.has_error) {
+        // Show countdown close button, auto-close after 15s
+        modal.startCountdown(15);
+      }
+      offMotusEvent(_onEvent);
     }
   }
 
-  _projectRunning = true;
-  _syncProjectBtn();
-  // Enable execute buttons
-  document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+  onMotusEvent(null, _onEvent);
 
-  // Start all cards on canvas, resolving input_topic(s) from connections
-  for (const card of _cards) {
-    // Collect ALL inbound connections to support multiple input topics (deduplicate)
-    const inConns = _connections.filter(c => c.toCardId === card.id);
-    const topics = [...new Set(inConns.map(conn => conn.fromTopic || '').filter(Boolean))];
+  // 立即启动浏览器麦克风（与 API 调用并行，解决 self-check 时序问题）
+  const remoteMicCard = _cards.find(c => c.toolName === 'remote_mic');
+  if (remoteMicCard && !isMicActive()) {
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+    toggleMicStream(wsUrl, (active) => {
+      const micBtn = remoteMicCard.el?.querySelector('.canvas-mic-btn');
+      if (micBtn) {
+        micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+        micBtn.classList.toggle('recording', active);
+      }
+    }).catch(err => _logActivity('warn', `麦克风启动失败: ${err.message}`));
+  }
 
-    let args;
-    if (topics.length > 1) {
-      args = { input_topics: topics };
-    } else if (topics.length === 1) {
-      args = { input_topic: topics[0] };
+  // Call unified backend start-project
+  try {
+    const res = await fetch('/api/config/start-project', { method: 'POST' });
+    if (res.ok) {
+      _projectRunning = true;
+      _syncProjectBtn();
+      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+      _logActivity('project', '智能控制已开启');
     } else {
-      args = {};
-    }
-    args.instance_id = card.id;
-    const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
-    if (startResult && startResult.code !== 200) {
-      const msg = `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`;
-      _logActivity('error', msg);
-      _flashStartError(msg);
-    }
-    // Auto-start mic stream when remote_mic card starts
-    if (card.toolName === 'remote_mic' && !isMicActive()) {
-      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-      try {
-        await toggleMicStream(wsUrl, (active) => {
-          const micBtn = card.el?.querySelector('.canvas-mic-btn');
-          if (micBtn) {
-            micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-            micBtn.classList.toggle('recording', active);
-          }
-        });
-      } catch (err) {
-        _logActivity('error', '麦克风启动失败: ' + err.message);
+      const data = await res.json().catch(() => ({}));
+      _logActivity('error', `启动失败: ${data.detail || res.status}`);
+      offMotusEvent(_onEvent);
+      if (modal) {
+        _showStartupError(modal);
       }
     }
-    // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
-    const parsed = _parseMcpCallResult(startResult);
-    if (parsed?.topic_out?.some(t => t.topic)) {
-      card.topicOut = parsed.topic_out;
-      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-      parsed.topic_out.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
-      _resolveAllTopics();  // re-propagate updated topic paths into conn.fromTopic before next card starts
-      _redrawConnections();
-    }
+  } catch (e) {
+    _logActivity('error', `启动失败: ${e.message}`);
+    offMotusEvent(_onEvent);
+    if (modal) modal.close();
   }
-  // Immediately persist layout so monitor-dashboard can read inferred topic paths
-  await _saveLayout();
-  // 持久化运行状态
-  fetch('/api/config/project-running', {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({running: true}),
-  });
-  _logActivity('project', '智能控制已开启');
 }
 
 function _stopProject() {
   _projectRunning = false;
   _syncProjectBtn();
-  // Disable execute buttons
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.add('locked'));
-  // Stop all cards on canvas, resolving input_topic from connections
+  // Auto-stop mic stream
   for (const card of _cards) {
-    const inConns = _connections.filter(c => c.toCardId === card.id);
-    const topics = inConns.map(conn => conn.fromTopic || '').filter(Boolean);
-
-    let args;
-    if (topics.length > 1) {
-      args = { input_topics: topics };
-    } else if (topics.length === 1) {
-      args = { input_topic: topics[0] };
-    } else {
-      args = {};
-    }
-    args.instance_id = card.id;
-    _triggerAction(card.mcpId, card.toolName, 'stop', args);
-    // Auto-stop mic stream when remote_mic card stops
     if (card.toolName === 'remote_mic' && isMicActive()) {
       toggleMicStream('', () => {}).catch(() => {});
       const micBtn = card.el?.querySelector('.canvas-mic-btn');
@@ -1420,11 +1603,7 @@ function _stopProject() {
       }
     }
   }
-  // 持久化运行状态
-  fetch('/api/config/project-running', {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({running: false}),
-  });
+  fetch('/api/config/stop-project', { method: 'POST' }).catch(() => {});
   _logActivity('project', '智能控制已停止');
 }
 
@@ -1434,6 +1613,39 @@ function _syncProjectBtn() {
   btn.textContent = _projectRunning ? '停止智能控制' : '开启智能控制';
   btn.title = _projectRunning ? '停止智能控制' : '开启智能控制';
   btn.classList.toggle('running', _projectRunning);
+}
+
+function _initAutoStartToggle() {
+  const checkbox = document.getElementById('auto-start-checkbox');
+  if (!checkbox) return;
+
+  fetch('/api/config/auto-start')
+    .then(r => r.json())
+    .then(res => { checkbox.checked = res.auto_start ?? false; })
+    .catch(() => {});
+
+  checkbox.addEventListener('change', async () => {
+    // 开启时警告 token 消耗
+    if (checkbox.checked) {
+      const confirmed = confirm(
+        '开启后，设备启动时将自动开始智能控制，持续消耗 LLM Token。\n\n确认开启开机自启动？'
+      );
+      if (!confirmed) {
+        checkbox.checked = false;
+        return;
+      }
+    }
+    try {
+      await fetch('/api/config/auto-start', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_start: checkbox.checked }),
+      });
+    } catch (e) {
+      console.error('[auto-start] save failed:', e);
+      checkbox.checked = !checkbox.checked;
+    }
+  });
 }
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
@@ -1448,6 +1660,87 @@ async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
     console.error(`[canvas] ${action} call failed:`, err);
     return null;
   }
+}
+
+// ── Startup Modal ──────────────────────────────────────────────────────────────
+
+function _showStartupError(modalWrapper) {
+  const modalEl = modalWrapper.modal;
+  const cancelBtn = modalEl.querySelector('.startup-cancel-btn');
+  if (cancelBtn) {
+    cancelBtn.textContent = '关闭';
+    cancelBtn.onclick = () => modalWrapper.close();
+  }
+  // Update modal title to indicate failure
+  const title = modalEl.querySelector('.modal-title');
+  if (title) title.textContent = '启动失败';
+}
+
+function _showStartupModal(items) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '420px';
+  modal.innerHTML = `
+    <div class="modal-header">
+      <span class="modal-title">启动智能控制</span>
+    </div>
+    <ul class="startup-modal-list"></ul>
+    <div class="startup-modal-footer">
+      <button class="startup-cancel-btn">取消启动</button>
+    </div>`;
+  overlay.appendChild(modal);
+  const list = modal.querySelector('.startup-modal-list');
+  const dots = [];
+  const statuses = [];
+  items.forEach(({ card }) => {
+    const li = document.createElement('li');
+    li.className = 'startup-modal-item';
+    li.innerHTML = `<span class="startup-dot"></span><span class="startup-name">${card.toolName}</span><span class="startup-status">等待启动</span>`;
+    list.appendChild(li);
+    dots.push(li.querySelector('.startup-dot'));
+    statuses.push(li.querySelector('.startup-status'));
+  });
+  document.body.appendChild(overlay);
+
+  const STATUS_TEXT = { starting: '启动中...', ready: '已就绪', error: '启动失败' };
+  function updateItem(i, state, msg) {
+    dots[i].className = 'startup-dot ' + state;
+    statuses[i].textContent = msg || STATUS_TEXT[state] || '';
+  }
+  function close() {
+    if (_countdownTimer) clearInterval(_countdownTimer);
+    overlay.remove();
+  }
+
+  let _countdownTimer = null;
+  function startCountdown(seconds) {
+    const footer = modal.querySelector('.startup-modal-footer');
+    const title = modal.querySelector('.modal-title');
+    if (title) title.textContent = '启动完成';
+    let remaining = seconds;
+    footer.innerHTML = `<button class="startup-close-btn">关闭 <span class="startup-countdown">${remaining}s</span></button>`;
+    const btn = footer.querySelector('.startup-close-btn');
+    const span = footer.querySelector('.startup-countdown');
+    btn.addEventListener('click', close);
+    _countdownTimer = setInterval(() => {
+      remaining--;
+      if (remaining <= 0) {
+        close();
+      } else {
+        span.textContent = `${remaining}s`;
+      }
+    }, 1000);
+  }
+
+  const cancelBtn = modal.querySelector('.startup-cancel-btn');
+  cancelBtn.addEventListener('click', () => {
+    close();
+    // Actually stop the project when user cancels during startup
+    _stopProject();
+  });
+  return { modal, updateItem, close, startCountdown };
 }
 
 /**
@@ -1659,6 +1952,7 @@ function _makeDraggable(el, cardData) {
     if (e.target.closest('.canvas-card-info-btn')) return;
     if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
     if (_projectRunning) return;
+    if (!_canEdit()) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -1704,6 +1998,7 @@ function _debouncedSave() {
 }
 
 async function _saveLayout() {
+  if (!_isEditor) return;  // Only editor can save
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
@@ -1715,11 +2010,17 @@ async function _saveLayout() {
     topicOut:   c.topicOut || [],
   }));
   try {
-    await fetch('/api/canvas/layout', {
+    const resp = await fetch('/api/canvas/layout', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty } }),
+      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
     });
+    if (resp.status === 403) {
+      // Lost edit permission — reload layout from server
+      _isEditor = false;
+      _updateEditorUI();
+      await _reloadLayout();
+    }
   } catch { /* silent */ }
 }
 
@@ -1733,3 +2034,123 @@ function _syncEmptyState() {
 function _esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+// ── Editor Lock UI ───────────────────────────────────────────────────────────
+
+const _SVG_PEN = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>';
+const _SVG_LOCK = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+
+function _createEditorBar() {
+  const bar = document.createElement('div');
+  bar.id = 'canvas-editor-bar';
+  bar.className = 'canvas-editor-bar';
+  _canvasEl.appendChild(bar);
+  return bar;
+}
+
+function _updateEditorUI() {
+  let bar = document.getElementById('canvas-editor-bar');
+  if (!bar) bar = _createEditorBar();
+
+  if (_isEditor) {
+    bar.innerHTML = `${_SVG_PEN}<span class="editor-label editor-label--active">编辑中</span><button class="editor-btn" id="canvas-release-btn">释放</button>`;
+    bar.querySelector('#canvas-release-btn').onclick = _releaseEdit;
+    _setCanvasReadonly(false);
+  } else if (_currentEditor) {
+    bar.innerHTML = `${_SVG_LOCK}<span class="editor-label editor-label--locked">已锁定</span>`;
+    _setCanvasReadonly(true);
+  } else {
+    bar.innerHTML = `${_SVG_PEN}<button class="editor-btn editor-btn--claim" id="canvas-claim-btn">编辑</button>`;
+    bar.querySelector('#canvas-claim-btn').onclick = _claimEdit;
+    _setCanvasReadonly(true);
+  }
+}
+
+function _setCanvasReadonly(readonly) {
+  // Don't use pointer-events: none — it blocks all interaction including toast triggers.
+  // Instead, each action handler checks _canEdit() individually.
+  document.querySelectorAll('.sidebar-tool-item').forEach(el => {
+    el.draggable = !readonly;
+  });
+}
+
+async function _claimEdit() {
+  try {
+    const resp = await fetch('/api/canvas/claim-edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _sessionId }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      _isEditor = true;
+      _currentEditor = _sessionId;
+    } else {
+      _currentEditor = data.editor || null;
+    }
+  } catch { /* silent */ }
+  _updateEditorUI();
+}
+
+async function _releaseEdit() {
+  try {
+    await fetch('/api/canvas/release-edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _sessionId }),
+    });
+  } catch { /* silent */ }
+  _isEditor = false;
+  _currentEditor = null;
+  _updateEditorUI();
+}
+
+async function _checkEditStatus() {
+  try {
+    const resp = await fetch('/api/canvas/edit-status');
+    const data = await resp.json();
+    const prevEditor = _isEditor;
+    _currentEditor = data.editor || null;
+    if (_currentEditor === _sessionId) {
+      _isEditor = true;
+    } else if (_isEditor) {
+      // We lost editor status (timeout)
+      _isEditor = false;
+      _logActivity('warn', '编辑权已超时释放（60秒无操作）');
+    }
+    _updateEditorUI();
+  } catch { /* silent */ }
+}
+
+async function _reloadLayout() {
+  try {
+    const layoutRes = await fetch('/api/canvas/layout');
+    const layoutJson = await layoutRes.json();
+    // Clear current cards
+    for (const c of _cards) c.el.remove();
+    _cards = [];
+    _connections = [];
+    _execConnections = [];
+    // Reload
+    const saved = layoutJson.data?.cards || [];
+    for (const c of saved) _addCard(c, false);
+    const cardIds = new Set(_cards.map(c => c.id));
+    _connections = (layoutJson.data?.connections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
+    _execConnections = (layoutJson.data?.execConnections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
+    _resolveAllTopics();
+    _redrawConnections();
+    _syncEmptyState();
+    // Update editor info
+    _currentEditor = layoutJson.editor || null;
+    if (_currentEditor === _sessionId) _isEditor = true;
+    _updateEditorUI();
+  } catch { /* silent */ }
+}
+
+// Release on page close
+window.addEventListener('beforeunload', () => {
+  if (_isEditor) {
+    navigator.sendBeacon('/api/canvas/release-edit', JSON.stringify({ session_id: _sessionId }));
+  }
+});
+
+// Periodically check edit status (piggyback on existing polling interval)
+setInterval(_checkEditStatus, 10000);
