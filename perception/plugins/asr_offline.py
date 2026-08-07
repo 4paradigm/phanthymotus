@@ -61,16 +61,16 @@ def _prepare_hotwords_file(
 ) -> tuple[Path, str]:
     """把热词原文转成 sherpa bpe 模式可编码的逐字空格格式。
 
-    x-asr 的 tokens.txt 4000 个中文 token 全是 ▁X（▁+单字），没有裸字符。
+    x-asr 的中文 token 使用 ▁X（▁+单字）形式，没有裸字符。
     bpe.model 整词编码会产出 tokens.txt 里没有的多字 piece（如 "尼模式"），
-    sherpa 直接丢弃。逐字喂入让 bpe 把每个字编码成 ▁X，230/234 可编码。
+    sherpa 会直接丢弃。逐字喂入可让 bpe 把每个字编码成 ▁X。
 
     输入原文（hotwords.txt，每行一个短语）：
-        阻尼模式
-        举双手
+        甲乙
+        丙丁
     输出（char-separated + :score）：
-        阻 尼 模 式 :2.5
-        举 双 手 :2.5
+        甲 乙 :2.5
+        丙 丁 :2.5
 
     返回 (转换后文件路径, modeling_unit)。
     """
@@ -265,10 +265,8 @@ class OfflineASRAdapter:
             raw_pcm = wav_file.readframes(wav_file.getnframes())
 
         samples = list(pcm16_to_float_samples(raw_pcm))
-        # 0.5s tail padding: critical for transducer to decode final tokens
-        # (without this, short utterance ends can regress to wrong language/output).
-        # param_experiment.py verified: mbs(5)+hotwords ARM 1-CER 0.8388 with pad,
-        # vs 0.7130/degraded-to-English without.  [[arm-int8-drift]]
+        # Tail padding lets the transducer emit final tokens when an
+        # utterance ends without enough trailing silence.
         samples.extend([0.0] * int(sample_rate * 0.5))
         with self._decode_lock:
             stream = self._recognizer.create_stream()

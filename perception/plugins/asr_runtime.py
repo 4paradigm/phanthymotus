@@ -335,10 +335,8 @@ class _SherpaVadSession:
                     - self._silence_samples,
                 )
             segment_start = int(segment_start)
-            # Extend segment end by tail_pad_ms to capture weak trailing
-            # syllables that the VAD misclassifies as silence (e.g., case 7
-            # "举双手" tail 144ms classified as silence → truncated → hotwords
-            # can't recover).  [[arm-int8-drift]]
+            # Extend the segment to retain weak trailing syllables that the
+            # VAD may classify as silence.
             tail_pad_samples = int(self._sample_rate * 0.3)  # 300ms
             segment_end_orig = segment_start + len(segment_samples)
             segment_end = min(segment_end_orig + tail_pad_samples,
@@ -374,8 +372,8 @@ class _FireRedVadSession:
 
     FireRedVAD is non-streaming, so we buffer all PCM and run one detect
     after seeing >= silence_ms of actual silence (zero-valued PCM). This
-    matches the eval pipeline's "send audio → send 1500ms silence → flush"
-    flow without the segment-boundary drift of incremental re-detection.
+    supports audio followed by a zero tail and explicit flush without the
+    segment-boundary drift of incremental re-detection.
 
     The returned utterance preserves one continuous span from the first
     detected segment to the last. FireRed's completed segment already contains
@@ -486,7 +484,7 @@ class _FireRedVadSession:
         }
 
     def diagnostics(self) -> dict:
-        """Snapshot used by Judge logs to distinguish transport and VAD misses."""
+        """Snapshot used by runtime logs to distinguish transport and VAD misses."""
         return {
             "backend": "firered",
             "chunks_seen": self._chunks_seen,
@@ -542,7 +540,7 @@ class _FireRedVadSession:
         # An empty pass is not a terminal state. Under DDS packet reordering,
         # the first 1s zero run can arrive before delayed speech packets. If
         # we seal the session here, process_chunk() discards those packets and
-        # notify_idle() can never recover, producing an empty judge result.
+        # notify_idle() can never recover, producing an empty result.
         if not segs:
             try:
                 logging.getLogger("asr_runtime.firered").info(
@@ -606,12 +604,11 @@ class _FireRedVadSession:
     def notify_idle(
         self, now_ts: float
     ) -> Optional[tuple[bytes, float, float]]:
-        """Starvation fallback: run detect when the stream went quiet
-        without a clean run of zero chunks. On the judge under 10-instance
-        load, UDP reordering can insert a speech packet into the silence
-        tail and reset the zero counter (or silence packets get dropped),
-        so the 1s-consecutive-zeros trigger never fires and the case hits
-        the 120s timeout with audio sitting in the buffer."""
+        """Run detection when a stream becomes idle without a zero tail.
+
+        Packet reordering or loss can reset the consecutive-silence counter
+        and otherwise leave buffered audio waiting indefinitely.
+        """
         if self._detected or not self._pcm:
             return None
         if self._last_chunk_ts <= 0.0:

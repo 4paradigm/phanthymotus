@@ -808,9 +808,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         try:
             pcm, ts = pcm_q.get(timeout=1)
         except queue.Empty:
-            # Starvation tick: no chunk for 1s. FireRedVAD's zero-run
-            # trigger can miss when DDS reorders/losses the silence tail
-            # (judge 120s timeouts) — let the session detect on idle.
+            # FireRedVAD's zero-run trigger can miss when DDS reorders or
+            # loses the silence tail, so let the session detect on idle.
             if state == 'listening':
                 idle_result = vad_session.notify_idle(time.time())
                 if idle_result is not None:
@@ -939,14 +938,9 @@ class _ASRNode(Node):
         self._adapter  = adapter
         self._language = language
         self.state     = "idle"
-        # Persistent input subscription: created once, kept across stop/start
-        # cycles. The evaluator creates a NEW audio publisher per case; with
-        # a long-lived reader, endpoint matching completes in ~100ms instead
-        # of full DDS discovery (~2-5s under 10-instance load), which was
-        # dropping entire short utterances (e.g. case 7's 1.044s speech was
-        # published before the match finished → VAD got silence only →
-        # 120s case timeout). Same keep-alive pattern as the publisher and
-        # the vits2_tts_trt plugin.
+        # Keep the input subscription across stop/start cycles. Clients may
+        # begin streaming immediately after start returns, so recreating the
+        # reader can lose short utterances while DDS endpoints rematch.
         from audio_msgs.msg import AudioChunk
         self._sub = self.create_subscription(
             AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS
@@ -1050,7 +1044,7 @@ class _ASRNode(Node):
             log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid}, rss={_rss_mb():.0f}MB)")
             # Verify VAD worker is alive before returning "running" to caller.
             # A dead VAD worker silently drops all audio — fail fast so the
-            # evaluation framework knows the instance is broken.
+            # caller receives an explicit startup failure.
             time.sleep(1.0)
             if not self._vad_proc.is_alive():
                 exitcode = self._vad_proc.exitcode
@@ -1062,11 +1056,9 @@ class _ASRNode(Node):
                     f"or that the COS fallback download succeeded."
                 )
 
-        # NOTE: the old "wait for audio publisher" gate was removed — the
-        # evaluator creates its publisher only AFTER start() returns, so the
-        # gate could never succeed and just burned 3s per case. With the
-        # persistent subscription (created in __init__), the evaluator's
-        # per-case publisher SEDP-matches quickly instead.
+        # Do not wait for an audio publisher here: clients may create it only
+        # after start() returns. The persistent subscription lets endpoint
+        # matching complete asynchronously.
 
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
@@ -1134,11 +1126,10 @@ class _ASRNode(Node):
         """Wait for a stably-matched result subscriber before publishing.
 
         _ASR_PUB_QOS is BEST_EFFORT: a transient DDS graph match is not
-        enough for the evaluator's (per-case recreated) subscriber to
-        receive the result frame. Same gate pattern as the vits2_tts_trt
-        plugin's _wait_for_audio_subscriber. Bounded; on timeout we publish
-        anyway and log, so a missing subscriber degrades to the old
-        behavior rather than hanging the case.
+        enough for a newly created subscriber to receive the result frame.
+        Same gate pattern as the vits2_tts_trt plugin's
+        _wait_for_audio_subscriber. The wait is bounded; on timeout we
+        publish anyway and log the missing subscriber.
         """
         wait_s = float(os.environ.get("ASR_RESULT_SUB_WAIT_S", "2.0"))
         settle_s = float(os.environ.get("ASR_RESULT_SUB_SETTLE_S", "0.5"))
@@ -1503,10 +1494,9 @@ class ASRPlugin:
             return self._nodes[node_key].start()
 
         elif action == "stop":
-            # Keep node + publisher alive across stop/start cycles — reusing
-            # the publisher preserves DDS discovery state, so the evaluator's
-            # per-case subscriber re-matches quickly and BEST_EFFORT results
-            # are not dropped (same pattern as vits2_tts_trt plugin).
+            # Keep node + publisher alive across stop/start cycles so DDS
+            # discovery state is reused and BEST_EFFORT results are not
+            # dropped while a new subscriber matches.
             if instance_id and instance_id in self._nodes:
                 return self._nodes[instance_id].stop()
             elif not instance_id and self._nodes:

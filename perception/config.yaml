@@ -11,8 +11,7 @@ plugins:
     hw_provider: cpu
     num_threads: 2
     language: zh-CN
-    # x-asr transducer + modified_beam_search(10)，使用模型包内 234 个
-    # 通用机器人热词；不在产品代码中注入评测样本定制词。
+    # x-asr transducer + modified_beam_search，使用模型包内的机器人领域热词。
     sherpa_config:
       tokens: tokens.txt
       numThreads: 2
@@ -26,12 +25,12 @@ plugins:
         # hotwords: 逐字空格分隔格式由 asr_offline.py 在加载时从 hotwordsFile
         # 原文转换（x-asr tokens.txt 全是 ▁X 单字 token，整词 BPE 编码会产出
         # tokens.txt 里没有的多字 piece，必须逐字喂入）。
-        hotwordsFile: hotwords.txt   # 相对 model_path，模型包内 234 个通用机器人词
+        hotwordsFile: hotwords.txt   # 相对 model_path 的模型包内热词文件
         hotwordsScore: 2.5
         modelingUnit: bpe
         bpeVocab: bpe.vocab
     vad:
-      model: firered      # firered (DFSMN ONNX, F1 97.57) | sherpa_onnx (silero, F1 95.95) | webrtc
+      model: firered      # firered (DFSMN ONNX) | sherpa_onnx (silero) | webrtc
       threshold: 0.4      # firered 官方推荐 0.4
       silence_ms: 400
       pre_roll_ms: 500
@@ -43,13 +42,13 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: false  # disabled for ASR-only eval, saves ~125MB download + memory
+    enabled: false  # disabled in the ASR-only image
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
   htmsg:
-    enabled: false  # disabled for ASR-only eval
+    enabled: false  # disabled in the ASR-only image
     namespace: ""       # auto-detect from hostname if empty
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
@@ -63,7 +62,7 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: false  # disabled for ASR-only eval
+    enabled: false  # disabled in the ASR-only image
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
     confidence: 0.3

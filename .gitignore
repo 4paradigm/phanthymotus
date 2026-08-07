@@ -26,6 +26,40 @@ resource/frame_rgb.jpg
 !docs/images/*.png
 !docs/images/*.jpg
 
+# Local ML artifacts and evaluation data
+*.pt
+*.pth
+*.pth.tar
+*.ckpt
+*.onnx
+*.onnx.data
+*.mnn
+*.engine
+*.plan
+*.safetensors
+*.npy
+*.npz
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.pcm
+*.jsonl
+*.parquet
+*.arrow
+*.log
+/models/
+/checkpoints/
+/datasets/
+/perception/models/
+/perception/checkpoints/
+/perception/evaluation_output/
+/perception/eval_outputs/
+artifacts/
+eval_results/
+results/
+
 # Node.js
 node_modules/
 .next/

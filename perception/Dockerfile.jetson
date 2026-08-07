@@ -1,6 +1,6 @@
 # ── Jetson variant (JetPack 6) — ASR-only build ───────────────────
 # ROS2 Humble installed from apt (not dustynv source build) to match
-# the eval platform's ros-base:latest FastDDS ABI.
+# the deployed ros-base image's FastDDS ABI.
 #
 # Usage:
 #   docker build -f perception/Dockerfile.jetson --network=host \

@@ -3,12 +3,9 @@
 # Source: https://github.com/FireRedTeam/FireRedVAD (Apache License 2.0)
 # Copyright 2026 Xiaohongshu. (Author: Kaituo Xu, Wenpeng Li, Kai Huang, Kun Liu)
 #
-# The DFSMN model was exported to ONNX (parity vs torch < 1e-7, see
-# /mnt/disk1/zengzhitao/tmp/export_firered_onnx.py). This module replicates
+# The DFSMN model is distributed as ONNX. This module replicates
 # fireredvad.core.{audio_feat,vad_postprocessor} using only numpy +
-# kaldi_native_fbank + onnxruntime so the Jetson ASR image does not need to
-# import torch (which would add ~0.5-1GB RSS per VAD worker process and
-# re-trigger the 10-instance OOM we fixed in 69ac49a).
+# kaldi_native_fbank + onnxruntime so each VAD worker avoids importing torch.
 
 from __future__ import annotations
 
@@ -209,7 +206,7 @@ class _VadPostprocessor:
 
 
 class FireRedVadOnnx:
-    """ONNX-only FireRedVAD detector. drop-in for the eval VAD pipeline."""
+    """ONNX-only FireRedVAD detector for the runtime VAD pipeline."""
 
     def __init__(
         self,
