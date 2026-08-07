@@ -13,9 +13,10 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Tuple
 
 
-Shape = tuple[int, int, int, int]
+Shape = Tuple[int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -131,19 +132,36 @@ def build_engine(
         raise RuntimeError(
             f"OCR ONNX input must be rank 4, got {input_tensor.shape}"
         )
+    # Some Paddle exports label both dynamic spatial axes with the same "?"
+    # dimension name. TensorRT 8.5 treats equal names as an equality
+    # constraint and rejects valid non-square profiles such as 48x192. Keep
+    # meaningful unique names, but disambiguate repeated input-axis names.
+    if hasattr(input_tensor, "get_dimension_name") and hasattr(
+        input_tensor, "set_dimension_name"
+    ):
+        dimension_names = [
+            input_tensor.get_dimension_name(axis) for axis in range(4)
+        ]
+        for axis, name in enumerate(dimension_names):
+            if name and dimension_names.count(name) > 1:
+                input_tensor.set_dimension_name(axis, f"{name}_{axis}")
     # Paddle exports all spatial dimensions as dynamic even when a component
     # has fixed geometry. TensorRT 10.4 rejects the PP-OCRv4 classifier when
     # its 48x192 constraints exist only in the optimization profile, so make
     # dimensions shared by every profile explicit in the parsed network.
-    static_shape = []
-    for axis in range(4):
-        values = {
-            value
-            for profile in profiles
-            for value in (profile.minimum[axis], profile.maximum[axis])
-        }
-        static_shape.append(values.pop() if len(values) == 1 else -1)
-    input_tensor.shape = tuple(static_shape)
+    # TensorRT 8.5 must retain the parsed dynamic dimensions: rewriting them
+    # conflicts with ONNX dimension names and fails shape analysis.
+    trt_major = int(trt.__version__.split(".", 1)[0])
+    if trt_major >= 10:
+        static_shape = []
+        for axis in range(4):
+            values = {
+                value
+                for profile in profiles
+                for value in (profile.minimum[axis], profile.maximum[axis])
+            }
+            static_shape.append(values.pop() if len(values) == 1 else -1)
+        input_tensor.shape = tuple(static_shape)
 
     config = builder.create_builder_config()
     config.set_flag(trt.BuilderFlag.FP16)

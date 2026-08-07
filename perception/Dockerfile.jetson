@@ -1,48 +1,40 @@
-# ── Jetson variant (JetPack 6) ─────────────────────────────────────
-# Self-contained: builds jp6-torch from public dustynv images — no private
+# ── Jetson variant (JetPack 5.1.1) ─────────────────────────────────
+# Self-contained: builds jp511-torch from public dustynv images — no private
 # registry needed. Local builds can skip the inline stage by setting
-# BASE_IMAGE=local/phanthy-motus/jetson-base:jp6-torch (or via
-# build_perception.sh which does the same).
+# BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
+# (or via build_perception.sh which does the same).
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
 #   docker build -f perception/Dockerfile.jetson --network=host \
-#     -t phanthymotus-perception-ocr:jp6 .
+#     -t phanthymotus-perception-ocr:jp511 .
 #
 #   ./deploy/build_perception.sh --variant jetson --mirror tuna
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG ROS_BASE=docker.m.daocloud.io/dustynv/ros:humble-desktop-l4t-r36.4.0
-ARG PYTORCH_DONOR=docker.m.daocloud.io/dustynv/l4t-pytorch:r36.4.0
+ARG ROS_BASE=docker.m.daocloud.io/dustynv/ros:humble-desktop-l4t-r35.3.1
+ARG PYTORCH_DONOR=docker.m.daocloud.io/dustynv/l4t-pytorch:r35.3.1
 ARG BASE_IMAGE=
 
-# ── Stage: jp6-torch (inline, from public dustynv images) ──────────
-# Same as deploy/prepare_jp_v6_local.sh and the vits2-trt-jp6 pattern.
+# ── Stage: jp511-torch (inline, from public dustynv images) ────────
+# Both stages use L4T r35.3.1, so the donor's CUDA-enabled PyTorch ABI
+# matches the ROS/TensorRT base.
 FROM ${PYTORCH_DONOR} AS pytorch-donor
-FROM ${ROS_BASE} AS jp6-torch-built
-# The JP6 ROS base already contains OpenBLAS. Do not refresh its expired ROS
-# repository metadata or weaken APT signature verification.
-COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/ /tmp/pt-donor/
-RUN cd /tmp/pt-donor && \
-    mkdir -p /usr/local/lib/python3.10/dist-packages && \
-    for item in torch torchgen torchvision triton; do \
-        if [ -e "$item" ]; then cp -a "$item" /usr/local/lib/python3.10/dist-packages/; fi; \
-    done && \
-    shopt -s nullglob && \
-    for item in torch-*.dist-info torchvision-*.dist-info triton-*.dist-info; do \
-        cp -a "$item" /usr/local/lib/python3.10/dist-packages/; \
-    done && \
-    rm -rf /tmp/pt-donor
+FROM ${ROS_BASE} AS jp511-torch-built
+COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torch/ /usr/local/lib/python3.8/dist-packages/torch/
+COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torch-2.0.0+nv23.5.dist-info/ /usr/local/lib/python3.8/dist-packages/torch-2.0.0+nv23.5.dist-info/
+COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torchgen/ /usr/local/lib/python3.8/dist-packages/torchgen/
+COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torchvision/ /usr/local/lib/python3.8/dist-packages/torchvision/
+COPY --from=pytorch-donor /usr/local/lib/python3.8/dist-packages/torchvision-0.15.1a0+42759b1.dist-info/ /usr/local/lib/python3.8/dist-packages/torchvision-0.15.1a0+42759b1.dist-info/
 
 # Use pre-built BASE_IMAGE when set; otherwise use the inline build above
-FROM ${BASE_IMAGE:-jp6-torch-built}
+FROM ${BASE_IMAGE:-jp511-torch-built}
 ARG PYPI_MIRROR APT_MIRROR
 
-# jp6/dustynv base sets PIP_INDEX_URL=jetson.webredirect.org (dead)
 ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     PIP_EXTRA_INDEX_URL= \
     PIP_TRUSTED_HOST="mirrors.tuna.tsinghua.edu.cn pypi.tuna.tsinghua.edu.cn pypi.org files.pythonhosted.org" \
@@ -64,10 +56,8 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-      ffmpeg build-essential python3-dev libvips42 && \
+      ffmpeg build-essential python3-dev libopenblas-base libvips42 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-
-# libffi8: not needed on JP6 — Ubuntu 22.04 ships libffi.so.8 natively.
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
@@ -80,6 +70,7 @@ RUN cd /ros_ws && \
 
 # ── Python deps ────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    "typing_extensions>=4.4,<5" \
     pyyaml requests websockets webrtcvad websocket-client dashscope && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
 
@@ -88,17 +79,23 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
-# NOTE: cv2 in the jp6 base works out of the box (the jp511 __init__ fix is
-# not needed and its python3.8 paths do not exist here).
+# Fix the JP511 system cv2 wrapper when its mat_wrapper import is broken.
+RUN python3 -c "import cv2" 2>/dev/null || { \
+    echo 'import importlib.util, sys, os' > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_so = os.path.join(os.path.dirname(__file__), "python-3.8", "cv2.cpython-38-aarch64-linux-gnu.so")' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_spec = importlib.util.spec_from_file_location("cv2", _so)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_mod = importlib.util.module_from_spec(_spec)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo '_spec.loader.exec_module(_mod)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
+    echo 'sys.modules["cv2"] = _mod' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py; \
+    }
 # Install ultralytics WITHOUT replacing Jetson's CUDA torch + torchvision
 RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
     "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
-# ultralytics CLIP (needed for set_classes). The jp6 base bakes
-# PIP_INDEX_URL=jetson.webredirect.org (dead), so force the PyPI mirror
-# for the isolated build env (needs setuptools>=70).
+# ultralytics CLIP (needed for set_classes). Force the selected PyPI mirror
+# for the isolated build environment.
 RUN PIP_INDEX_URL=${PYPI_MIRROR} pip3 install --no-cache-dir --no-deps "git+https://github.com/ultralytics/CLIP.git" && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
 
@@ -117,32 +114,39 @@ RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
-# ── ONNX Runtime CPU (CPython 3.10 / aarch64) ─────────────────────
-# OCR runs on CPU to keep each evaluator container's working set bounded.
+# ── ONNX Runtime CPU (CPython 3.8 / aarch64) ──────────────────────
+# Keep the optional ONNX backend available without replacing JetPack's CUDA
+# libraries. ORT 1.17.3 and NumPy 1.23.5 are the compatible CPython 3.8 pins.
 RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true; \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-      "numpy==1.26.4" "onnxruntime==1.23.0" && \
-    python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert ort.__version__ == '1.23.0', ort.__version__; assert 'CPUExecutionProvider' in providers, providers; assert 'CUDAExecutionProvider' not in providers, providers"
+      "numpy==1.23.5" "onnxruntime==1.17.3" && \
+    python3 -c "import onnxruntime as ort; providers = ort.get_available_providers(); assert ort.__version__ == '1.17.3', ort.__version__; assert 'CPUExecutionProvider' in providers, providers; assert 'CUDAExecutionProvider' not in providers, providers"
 
 # TensorRT is supplied by the JetPack base image. Docker build RUN steps do
 # not have the NVIDIA runtime's DLA libraries mounted, so inspect package
 # metadata here and leave the actual import/execution check to runtime smoke.
-RUN python3 -c "from importlib.metadata import version; value = version('tensorrt'); assert int(value.split('.')[0]) >= 10, value"
+RUN python3 -c "from importlib.metadata import version; value = version('tensorrt'); parts = tuple(int(item) for item in value.split('.')[:2]); assert (8, 5) <= parts < (9, 0), value"
 
 # ── RapidOCR utilities + low-memory MNN OCR runtime ───────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-      "numpy==1.26.4" pyclipper==1.3.0.post3 six Shapely==2.0.5 Pillow \
+      "numpy==1.23.5" pyclipper==1.3.0.post3 six Shapely==2.0.5 Pillow \
       omegaconf==2.3.0 colorlog && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
       rapidocr==3.9.1 && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
       "MNN==3.6.0" "pyvips==3.1.0" && \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
-    find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
+    find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete && \
+    MNN_GOMP="$(find /usr/local/lib/python3.8/dist-packages/mnn.libs -maxdepth 1 -type f -name 'libgomp-*.so.1.0.0' -print -quit)" && \
+    test -n "${MNN_GOMP}" && \
+    ln -sfn "${MNN_GOMP}" /usr/local/lib/libgomp-mnn.so.1 && \
+    LD_PRELOAD=/usr/local/lib/libgomp-mnn.so.1 \
+      python3 -c "import torch, ultralytics, MNN" && \
+    rm -rf /work/Ultralytics
 
 # ── OCR model (public ModelScope artifacts, kept outside Git) ─────
 ARG OCR_MNN_MODEL_BASE_URL=https://www.modelscope.cn/models/Flame4pd/ppocrv6-small-edge-ocr/resolve/master/mnn
-ARG OCR_TRT_MODEL_BASE_URL=https://www.modelscope.cn/models/Flame4pd/ppocrv6-small-edge-ocr/resolve/master/tensorrt-jp6-trt10.4-orin-batch8-cls8
+ARG OCR_TRT_MODEL_BASE_URL=https://www.modelscope.cn/models/Flame4pd/ppocrv6-small-edge-ocr/resolve/master/tensorrt-jp511-trt8.5-orin-batch8-cls8
 COPY perception/utils/ocr_model_downloader.py /tmp/ocr_model_downloader.py
 RUN python3 /tmp/ocr_model_downloader.py \
     --base-url "${OCR_MNN_MODEL_BASE_URL}" \
@@ -153,11 +157,11 @@ RUN python3 /tmp/ocr_model_downloader.py \
     --sha256 keys.txt=b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d && \
     python3 /tmp/ocr_model_downloader.py \
     --base-url "${OCR_TRT_MODEL_BASE_URL}" \
-    --output-dir /opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8 \
+    --output-dir /opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt-jp511-trt8.5-orin-batch8-cls8 \
     --filenames det.engine rec.engine cls.engine keys.txt \
-    --sha256 det.engine=3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef \
-    --sha256 rec.engine=8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641 \
-    --sha256 cls.engine=148a6895260d3b6b6f86e0c5787121fc1bba316f3427397f654421196c13cb77 \
+    --sha256 det.engine=1bb32a027e93b06d5319ac61e38bb3e447137b01465eacefa7a652f58130ebdf \
+    --sha256 rec.engine=1e204f0469beba33d8590b29c06419cf1073d98d41243b5ee316d2f877340b61 \
+    --sha256 cls.engine=02c722e56e621b56a36678cc8aa124a31b41e9e3c9ca350b11e4de0d5bbd0a35 \
     --sha256 keys.txt=b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d
 
 # ── Application code ───────────────────────────────────────────────
@@ -175,14 +179,14 @@ EXPOSE 15721
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
 RUN find /ros_ws/install /opt/ros/humble/install -type d \( -name "site-packages" -o -name "dist-packages" \) \
-      > /usr/local/lib/python3.10/dist-packages/ros_ws.pth
+      > /usr/local/lib/python3.8/dist-packages/ros_ws.pth
 
 # ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 CMD ["/bin/bash", "-c", \
-    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+    "export LD_PRELOAD=/usr/local/lib/libgomp-mnn.so.1 && \
      /deploy/seed_ocr_models.sh && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \

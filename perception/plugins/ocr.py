@@ -59,7 +59,7 @@ def _resource_snapshot() -> str:
 DEFAULT_OCR_BACKEND = "tensorrt"
 DEFAULT_OCR_FALLBACK_BACKEND = "mnn"
 DEFAULT_OCR_MODEL_DIR = (
-    "/models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8"
+    "/models/ocr/ppocrv6-small-trt-jp511-trt8.5-orin-batch8-cls8"
 )
 DEFAULT_OCR_FALLBACK_MODEL_DIR = "/models/ocr/ppocrv6-small-mnn"
 DEFAULT_OCR_ONNX_MODEL_DIR = "/models/ocr/ppocrv6-small-ort"

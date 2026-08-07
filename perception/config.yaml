@@ -50,7 +50,7 @@ plugins:
     enabled: false
     backend: tensorrt
     fallback_backend: mnn
-    model_dir: /models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8
+    model_dir: /models/ocr/ppocrv6-small-trt-jp511-trt8.5-orin-batch8-cls8
     fallback_model_dir: /models/ocr/ppocrv6-small-mnn
     device: cuda
     device_id: 0
