@@ -2,6 +2,18 @@
 
 Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
 
+## Host Identity
+
+Every Perception host must provide two different, globally unique identities in `config.yaml`:
+
+```yaml
+identity:
+  core_display_name: "Perception Stack · Shanghai G1"
+  mcp_server_name: "perception-stack-shanghai-g1"
+```
+
+`core_display_name` is shown in Agent Core. `mcp_server_name` is returned as MCP `initialize.serverInfo.name` and is used by Core for deduplication. Missing values, equal values, and the legacy defaults `Perception Stack` / `perception-bundle` are rejected at startup so one host cannot silently replace another host's URL.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.
