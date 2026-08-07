@@ -20,6 +20,16 @@ resource/world/
 resource/log/
 resource/frame_rgb.jpg
 
+# Externally mounted TTS artifacts (never commit to the public fork)
+*.plan
+*.engine
+*.fst
+**/engines/
+**/tn_cache/
+**/frontend_data/
+**/cmudict.rep
+**/cmudict_cache.pickle
+
 # Media (runtime captures)
 *.jpg
 *.png

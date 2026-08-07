@@ -19,13 +19,26 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: true
+    enabled: false
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
-  htmsg:
+  vits2_tts:
     enabled: true
+    vits2_model_dir: /models/vits2-mix
+    vits2_num_threads: 1
+    vits2_max_chunk_tokens: 64
+    vits2_warmup: true
+
+  vits2_tts_trt:
+    enabled: true
+    speaker_id: 0
+    speed: 1.0
+    vits2_warmup: true
+
+  htmsg:
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
@@ -39,7 +52,7 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
     confidence: 0.3

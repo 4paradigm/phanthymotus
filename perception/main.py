@@ -15,6 +15,7 @@ WebSocket ASR 端口: config.ws_port（默认 15721）
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -70,6 +71,25 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _sanitize_mcp_log(value, key: str = ""):
+    """Redact request content and credentials before writing MCP logs."""
+    normalized_key = key.lower()
+    if normalized_key in {"api_key", "key", "token", "authorization"}:
+        return "<redacted>" if value else ""
+    if normalized_key == "text" and os.environ.get(
+        "LOG_MCP_TEXT", ""
+    ).lower() not in {"1", "true", "yes", "on"}:
+        return f"<redacted:{len(str(value))} chars>"
+    if isinstance(value, dict):
+        return {
+            item_key: _sanitize_mcp_log(item_value, item_key)
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_mcp_log(item, key) for item in value]
+    return value
+
+
 # ── Bundle ────────────────────────────────────────────────────────────────────
 
 class PerceptionBundle:
@@ -82,10 +102,32 @@ class PerceptionBundle:
             self._plugins.append(ASRPlugin(plugins_cfg["asr"], executor))
             log.info("ASRPlugin loaded")
 
-        if plugins_cfg.get("tts", {}).get("enabled", False):
-            from plugins.tts import TTSPlugin
-            self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
-            log.info("TTSPlugin loaded")
+        requested_tts_plugin = os.environ.get("TTS_PLUGIN", "").strip()
+        default_tts_plugin = os.environ.get(
+            "DEFAULT_TTS_PLUGIN", "vits2_tts"
+        ).strip()
+        if not default_tts_plugin.isidentifier():
+            raise RuntimeError(
+                f"Invalid DEFAULT_TTS_PLUGIN={default_tts_plugin!r}"
+            )
+        tts_plugin = requested_tts_plugin or default_tts_plugin
+        tts_cfg = plugins_cfg.get(tts_plugin, {})
+        if not tts_plugin.isidentifier() or not tts_cfg.get("enabled", False):
+            log.warning(
+                "Invalid or disabled TTS_PLUGIN=%r; falling back to %s",
+                requested_tts_plugin,
+                default_tts_plugin,
+            )
+            tts_plugin = default_tts_plugin
+            tts_cfg = plugins_cfg.get(tts_plugin, {})
+        if not tts_cfg.get("enabled", False):
+            raise RuntimeError(
+                f"Fallback plugin {default_tts_plugin!r} is not enabled"
+            )
+        module = importlib.import_module(f"plugins.{tts_plugin}")
+        TTSPlugin = module.TTSPlugin
+        self._plugins.append(TTSPlugin(tts_cfg, executor))
+        log.info("TTSPlugin loaded: plugins.%s", tts_plugin)
 
         if plugins_cfg.get("htmsg", {}).get("enabled", False):
             import re, socket
@@ -126,7 +168,7 @@ class PerceptionBundle:
 
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:
-            if getattr(p, 'PREFIX', None) == 'tts':
+            if getattr(p, 'PREFIX', None) in ('tts', 'vits2'):
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
 
@@ -291,13 +333,21 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        log.info(
+                            "[mcp] tools/call: %s(%s)",
+                            name,
+                            _sanitize_mcp_log(args),
+                        )
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            safe_result = _sanitize_mcp_log(result)
+                            log.info(
+                                "[mcp] tools/call result: %s",
+                                json.dumps(safe_result)[:200],
+                            )
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
@@ -434,8 +484,8 @@ def main():
     global _bundle
 
     cfg      = _load_config()
-    mcp_port = int(cfg.get("mcp_port", 15720))
-    ws_port  = int(cfg.get("ws_port",  15721))
+    mcp_port = int(os.environ.get("MCP_PORT") or cfg.get("mcp_port", 15720))
+    ws_port = int(os.environ.get("WS_PORT") or cfg.get("ws_port", 15721))
 
     log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "

@@ -1,77 +1,109 @@
-# ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
-#
-# Build context: repo root (phanthy-motus/) so we can access both
-# src/perception_stack/ and deploy/ros-base/audio_msgs/
-#
-# Usage:
-#   ./deploy/build_perception.sh --variant jetson --mirror tuna
-# ────────────────────────────────────────────────────────────────────
+# JetPack 6.2 TensorRT-only perception image for TTS evaluation.
+# The former JP5.1.1 all-plugin image is preserved as Dockerfile.jetson.jp511.
 
-ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
-ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3-igpu
 FROM ${BASE_IMAGE}
-ARG PYPI_MIRROR APT_MIRROR
 
-# ── APT mirror (conditional) ─────────────────────────────────────
-RUN if [ -n "${APT_MIRROR}" ]; then \
-        sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
-    fi
+ARG VITS_MODEL_RELEASE=lc1_male_v0_168k
+ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-mix-jp6-runtime-deps.tar.gz
+ARG VITS2_RUNTIME_SHA256=87a70b686fb67dc13b0441965e7a4fefdde28e49556c3ab664c24dc22bb8a58a
+ARG LC1_V0_214K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_214k_runtime.tar.gz
+ARG LC1_V0_214K_SHA256=05b584727c37f224650cac319cae3b17e0bbf85df6ac509dd6edcffd75cca584
+ARG LC1_V0_240K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_240k_runtime.tar.gz
+ARG LC1_V0_240K_SHA256=5a285d54879712ae11e3a4ca84412162bf0b713d6fab905b66b927cf761d3470
+ARG LC1_MALE_V0_120K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_male_v0_120k_runtime.tar.gz
+ARG LC1_MALE_V0_120K_SHA256=930b3e6ac1b7ce8bf9932055249cf91f9a7ca91ab80c3081e5a2d22bf2bacf1c
+ARG LC1_MALE_V0_168K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_male_v0_168k_runtime.tar.gz
+ARG LC1_MALE_V0_168K_SHA256=6683af301fa48d25c1d08251c045c510f937b428b41df3f2116886c1e02e8451
+ARG LC1_MALE_V0_250K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_male_v0_250k_runtime.tar.gz
+ARG LC1_MALE_V0_250K_SHA256=2f56e3f512866017205f0b5efbe30801e62fc31e88fe58bc9fc90385f498f874
+ARG VITS256_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits256_runtime.tar.gz
+ARG VITS256_SHA256=a9538e7a4469c6f297d0f8c609655505624a430b39ecff9befcff18f8e77c58f
 
-# ── Switch ROS2 to TUNA mirror + skip expired key (if sources exist) ──
-RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
-        sed -i 's|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g' /etc/apt/sources.list.d/*.list && \
-        sed -i 's|deb \[|deb [trusted=yes |g; s|deb http|deb [trusted=yes] http|g' /etc/apt/sources.list.d/ros2*.list; \
-    fi
+USER root
 
-# ── System deps ────────────────────────────────────────────────────
-RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+# ROS Jazzy and TensorRT use the Ubuntu 24.04 system Python in one process.
+RUN . /etc/os-release && test "$VERSION_CODENAME" = noble && \
+    sed -i 's|http://ports.ubuntu.com/ubuntu-ports|https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports|g' \
+      /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+RUN printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "3";\n' \
+      > /etc/apt/apt.conf.d/99-vits2-network && \
+    apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg python3-yaml && \
+    curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+      | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu noble main" \
+      > /etc/apt/sources.list.d/ros2.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+      ros-jazzy-ros-base python3-colcon-common-extensions && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
+COPY perception/utils/download_vits2_trt_runtime.py /tmp/download_vits2_trt_runtime.py
+COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-trt-requirements.txt
+RUN /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+      --url "$VITS2_RUNTIME_URL" --sha256 "$VITS2_RUNTIME_SHA256" \
+      --output /tmp/vits2-mix-jp6-runtime.tar.gz && \
+    mkdir -p /opt/vits2-runtime /models/vits2-mix/engines && \
+    tar --no-same-owner -xzf /tmp/vits2-mix-jp6-runtime.tar.gz -C /opt/vits2-runtime && \
+    cd /opt/vits2-runtime/runtime && sha256sum -c SHA256SUMS && \
+    cd /opt/vits2-runtime && \
+    grep -qx 'architecture=aarch64' artifacts/jetson-deps/versions.txt && \
+    grep -qx 'python=3.12.3' artifacts/jetson-deps/versions.txt && \
+    cp -a artifacts/jetson-deps/openfst/lib/. /usr/local/lib/ && ldconfig && \
+    /usr/bin/python3 -m pip install --no-cache-dir --no-index \
+      --find-links=artifacts/jetson-deps/wheels -r /tmp/vits2-trt-requirements.txt && \
+    /usr/bin/python3 -c "import ctypes,numpy,pynini,tn; ctypes.CDLL('libcudart.so')" && \
+    cp -a runtime/nltk_data runtime/tn_cache runtime/frontend_data \
+      /models/vits2-mix/ && \
+    cp runtime/frontend_assets/cmudict.rep \
+      runtime/frontend_assets/cmudict_cache.pickle \
+      /models/vits2-mix/frontend_data/
 
-# ── audio_msgs ROS2 package (Humble already in base) ──────────────
+# Bake exactly one selected model release into the image.
+RUN mkdir -p /models/releases && \
+    case "$VITS_MODEL_RELEASE" in \
+      vits256) \
+        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+          --url "$VITS256_URL" --sha256 "$VITS256_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      lc1_v0_214k) \
+        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+          --url "$LC1_V0_214K_URL" --sha256 "$LC1_V0_214K_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      lc1_v0_240k) \
+        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+          --url "$LC1_V0_240K_URL" --sha256 "$LC1_V0_240K_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      lc1_male_v0_120k) \
+        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+          --url "$LC1_MALE_V0_120K_URL" --sha256 "$LC1_MALE_V0_120K_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      lc1_male_v0_168k) \
+        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+          --url "$LC1_MALE_V0_168K_URL" --sha256 "$LC1_MALE_V0_168K_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      lc1_male_v0_250k) \
+        /usr/bin/python3 /tmp/download_vits2_trt_runtime.py \
+          --url "$LC1_MALE_V0_250K_URL" --sha256 "$LC1_MALE_V0_250K_SHA256" \
+          --output /tmp/model-release.tar.gz ;; \
+      *) \
+        echo "Unsupported VITS_MODEL_RELEASE=$VITS_MODEL_RELEASE" >&2; exit 2 ;; \
+    esac && \
+    tar --no-same-owner -xzf /tmp/model-release.tar.gz -C /models/releases && \
+    printf '%s\n' "$VITS_MODEL_RELEASE" > /models/vits2-model.release && \
+    VITS_MODEL_RELEASE="$VITS_MODEL_RELEASE" /usr/bin/python3 -c "import json,os,pathlib; release=os.environ['VITS_MODEL_RELEASE']; root=pathlib.Path('/models/releases')/release; p=root/'engines'; m=json.loads((p/'manifest.json').read_text()); assert (root/'config.json').is_file(); assert m['architecture']=='aarch64'; assert m['compute_capability']=='8.7'; assert m['profiles']['text']=='1,128,256'; assert m['total_engine_bytes'] <= m.get('max_engine_bytes',64*1024*1024) <= 64*1024*1024; assert all((p/e['file']).stat().st_size==e['bytes'] for e in m['engines'].values())" && \
+    rm -f /tmp/vits2-mix-jp6-runtime.tar.gz /tmp/model-release.tar.gz \
+      /tmp/vits2-trt-requirements.txt \
+      /tmp/download_vits2_trt_runtime.py
+
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
-RUN cd /ros_ws && \
-    . /opt/ros/humble/install/setup.bash && \
-    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
-
-# ── Python deps ────────────────────────────────────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml requests websockets webrtcvad websocket-client dashscope && \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
-
-# ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    kiss-icp scipy
-
-# ── VOP deps (YOLOv8-World object detection) ─────────────────────
-# Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
-RUN python3 -c "import cv2" 2>/dev/null || { \
-    echo 'import importlib.util, sys, os' > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_so = os.path.join(os.path.dirname(__file__), "python-3.8", "cv2.cpython-38-aarch64-linux-gnu.so")' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_spec = importlib.util.spec_from_file_location("cv2", _so)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_mod = importlib.util.module_from_spec(_spec)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_spec.loader.exec_module(_mod)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo 'sys.modules["cv2"] = _mod' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py; \
-    }
-# Install ultralytics WITHOUT replacing Jetson's CUDA torch + torchvision
-RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
-    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
-    pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
-# ultralytics CLIP (GitHub via mirror, needed for set_classes)
-RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
-
-# Pre-download CLIP weights into image (avoids 338MB download at runtime)
-RUN mkdir -p /work/weights/clip && \
-    python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt', '/work/weights/clip/ViT-B-32.pt')"
+RUN cd /ros_ws && . /opt/ros/jazzy/setup.bash && \
+    colcon build --packages-select audio_msgs --cmake-args \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DPython3_EXECUTABLE=/usr/bin/python3 \
+      -DPYTHON_EXECUTABLE=/usr/bin/python3 && \
+    . /ros_ws/install/setup.bash && \
+    /usr/bin/python3 -c "import rclpy,yaml; from audio_msgs.msg import AudioChunk"
 
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work
@@ -86,24 +118,51 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
-COPY perception/main.py    /work/main.py
-COPY perception/plugins/   /work/plugins/
-COPY perception/utils/     /work/utils/
+COPY perception/main.py /work/main.py
+COPY perception/plugins/vits2_tts_trt/ /work/plugins/vits2_tts_trt/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/start_vits2_trt.sh /work/start_vits2_trt.sh
 
-EXPOSE 15720
-EXPOSE 15721
+RUN cp /models/vits2-mix/frontend_data/cmudict.rep \
+       /work/plugins/vits2_tts_trt/runtime/frontend/cmudict.rep && \
+    cp /models/vits2-mix/frontend_data/cmudict_cache.pickle \
+       /work/plugins/vits2_tts_trt/runtime/frontend/cmudict_cache.pickle && \
+    test -s /models/vits2-mix/tn_cache/zh_tn_tagger.fst && \
+    test -s /models/vits2-mix/tn_cache/zh_tn_verbalizer.fst && \
+    test -s /models/vits2-mix/tn_cache/en_tn_tagger.fst && \
+    test -s /models/vits2-mix/tn_cache/en_tn_verbalizer.fst && \
+    test -s /models/vits2-mix/frontend_data/phrase_pinyin_data/di.py && \
+    chmod 755 /work/start_vits2_trt.sh && \
+    cd /work/plugins/vits2_tts_trt/runtime && \
+    NLTK_DATA=/models/vits2-mix/nltk_data \
+    EN_TN_CACHE_DIR=/models/vits2-mix/tn_cache \
+    TN_CACHE_DIR=/models/vits2-mix/tn_cache \
+    VITS2_FRONTEND_DATA_DIR=/models/vits2-mix/frontend_data \
+    /usr/bin/python3 -c "from frontend.cleaner import clean_text_mix; [clean_text_mix(t) for t in ('你好。','AI助手现在ready了。','Mark今天想喝coffee。')]"
 
-# 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
-RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.8/dist-packages/ros_ws.pth && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python3.8/dist-packages/ros_ws.pth
+ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy/lib:${LD_LIBRARY_PATH} \
+    AMENT_PREFIX_PATH=/ros_ws/install/audio_msgs:/opt/ros/jazzy \
+    NLTK_DATA=/models/vits2-mix/nltk_data \
+    EN_TN_CACHE_DIR=/models/vits2-mix/tn_cache \
+    TN_CACHE_DIR=/models/vits2-mix/tn_cache \
+    VITS2_FRONTEND_DATA_DIR=/models/vits2-mix/frontend_data \
+    MIX_VITS_RELEASE=${VITS_MODEL_RELEASE} \
+    MIX_VITS_MAX_ENGINE_BYTES=67108864 \
+    MIX_VITS_MAX_TEXT_TOKENS=256 \
+    MIX_VITS_MAX_FRAMES=2048 \
+    MIX_VITS_INFERENCE_SEED=42 \
+    MIX_VITS_CHUNK_BYTES=3200 \
+    MIX_VITS_FRAME_INTERVAL_MS=70 \
+    MIX_VITS_FIRST_FRAME_DELAY_MS=0 \
+    MIX_VITS_SUBSCRIBER_WAIT_MS=5000 \
+    MIX_VITS_SUBSCRIBER_POLL_MS=10 \
+    MIX_VITS_SUBSCRIBER_SETTLE_MS=500 \
+    MIX_VITS_ALLOW_FAST_DELIVERY=1 \
+    TTS_PLUGIN=vits2_tts_trt \
+    DEFAULT_TTS_PLUGIN=vits2_tts_trt \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1
 
-# ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
-ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
-
-CMD ["/bin/bash", "-c", \
-    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
-     source /opt/ros/humble/install/setup.bash && \
-     source /ros_ws/install/setup.bash && \
-     python3 /work/main.py"]
+EXPOSE 15720 15721
+ENTRYPOINT ["/work/start_vits2_trt.sh"]

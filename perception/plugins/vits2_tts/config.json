@@ -1,0 +1,10 @@
+{
+  "data": {
+    "sampling_rate": 16000,
+    "add_blank": true
+  },
+  "model": {
+    "gen_istft_n_fft": 16,
+    "gen_istft_hop_size": 4
+  }
+}
