@@ -4,7 +4,7 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3-igpu
 FROM ${BASE_IMAGE}
 
-ARG VITS_MODEL_RELEASE=lc1_male_v0_250k
+ARG VITS_MODEL_RELEASE=lc1_male_v0_168k
 ARG VITS2_RUNTIME_URL=http://172.28.4.81:34567/liaoqianqian/models/vits2-mix/vits2-mix-jp6-runtime-deps.tar.gz
 ARG VITS2_RUNTIME_SHA256=87a70b686fb67dc13b0441965e7a4fefdde28e49556c3ab664c24dc22bb8a58a
 ARG LC1_V0_214K_URL=http://172.28.4.81:34567/liaoqianqian/models/lc1-jetson/lc1_v0_214k_runtime.tar.gz
