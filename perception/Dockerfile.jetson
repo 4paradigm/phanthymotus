@@ -140,14 +140,17 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
 
-# ── OCR model (kept outside Git) ──────────────────────────────────
-ARG OCR_MNN_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-mnn
-ARG OCR_TRT_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8
+# ── OCR model (public ModelScope artifacts, kept outside Git) ─────
+ARG OCR_MNN_MODEL_BASE_URL=https://www.modelscope.cn/models/Flame4pd/ppocrv6-small-edge-ocr/resolve/master/mnn
+ARG OCR_TRT_MODEL_BASE_URL=https://www.modelscope.cn/models/Flame4pd/ppocrv6-small-edge-ocr/resolve/master/tensorrt-jp6-trt10.4-orin-batch8-cls8
 COPY perception/utils/ocr_model_downloader.py /tmp/ocr_model_downloader.py
 RUN python3 /tmp/ocr_model_downloader.py \
     --base-url "${OCR_MNN_MODEL_BASE_URL}" \
     --output-dir /opt/phanthy-motus/model-seed/ocr/ppocrv6-small-mnn \
-    --filenames det.mnn rec.mnn keys.txt && \
+    --filenames det.mnn rec.mnn keys.txt \
+    --sha256 det.mnn=a41bcf051c24b67c46172005915f8b8f6a0272cb30b11bf9f16cca4231d21ee1 \
+    --sha256 rec.mnn=3ed704bdc5495002225237444384437617777bd962fa048d5d09d1444b98564b \
+    --sha256 keys.txt=b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d && \
     python3 /tmp/ocr_model_downloader.py \
     --base-url "${OCR_TRT_MODEL_BASE_URL}" \
     --output-dir /opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8 \

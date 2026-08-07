@@ -8,28 +8,12 @@ plugins/ocr.py — OCRPlugin: OCR 文字识别封装。
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import queue
 import threading
 import time
 from abc import ABC, abstractmethod
-from io import BytesIO
-
-
-def _resource_snapshot() -> str:
-    """轻量资源快照：RSS + 线程数（用于定位服务慢性死亡原因）"""
-    rss_mb = -1.0
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmRSS"):
-                    rss_mb = int(line.split()[1]) / 1024.0
-                    break
-    except OSError:
-        pass
-    return f"rss={rss_mb:.0f}MB threads={threading.active_count()}"
 from typing import Optional
 
 import rclpy
@@ -57,6 +41,20 @@ from plugins.ocr_runtime import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _resource_snapshot() -> str:
+    """轻量资源快照：RSS + 线程数（用于定位服务慢性死亡原因）"""
+    rss_mb = -1.0
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS"):
+                    rss_mb = int(line.split()[1]) / 1024.0
+                    break
+    except OSError:
+        pass
+    return f"rss={rss_mb:.0f}MB threads={threading.active_count()}"
 
 DEFAULT_OCR_BACKEND = "tensorrt"
 DEFAULT_OCR_FALLBACK_BACKEND = "mnn"
@@ -113,10 +111,6 @@ TOOLS = [
                 "device_id": {"type": "integer", "minimum": 0, "default": 0, "scope": "shared"},
                 "gpu_mem_mb": {"type": "integer", "minimum": 0, "default": 512, "scope": "shared"},
                 "use_angle_cls": {"type": "boolean", "default": True, "description": "启用 0/180 度文字方向分类", "scope": "shared"},
-                "provider": {"type": "string", "enum": ["rapidocr", "openai", "qwen", "tesseract"], "description": "OCR 服务商", "scope": "shared"},
-                "url":      {"type": "string", "description": "API URL (可选)", "scope": "shared"},
-                "key":      {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
-                "model":    {"type": "string", "description": "模型名称", "scope": "instance"},
                 "language": {"type": "string", "description": "默认语言", "default": "zh", "scope": "instance"},
                 "max_side_len": {"type": "integer", "minimum": 32, "default": DEFAULT_MAX_SIDE_LEN, "description": "检测输入最长边", "scope": "shared"},
                 "det_thresh": {"type": "number", "minimum": 0, "maximum": 1, "default": DEFAULT_DET_THRESH, "description": "DB 文本像素阈值", "scope": "shared"},
@@ -166,7 +160,6 @@ TOOLS = [
                 },
                 "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "shared"},
             },
-            "required": ["provider"]
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
         "topic_out": [{"format": "data/json",  "desc": "OCR result with text boxes"}],
@@ -190,311 +183,6 @@ class OCRAdapter(ABC):
         return " ".join(item.get("text", "") for item in results if item.get("text"))
 
 
-class OpenAIVisionAdapter(OCRAdapter):
-    """OpenAI Vision API (GPT-4o / GPT-4o-mini) OCR"""
-
-    _SYSTEM_PROMPT_TEMPLATE = (
-        "You are an OCR (Optical Character Recognition) system with bounding box detection.\n\n"
-        "Your task is to extract ALL text from the provided image and return each text segment with its bounding box coordinates.\n\n"
-        "Output format: Return a JSON array where each element contains:\n"
-        "- \"text\": the extracted text string\n"
-        "- \"bbox\": [x1, y1, x2, y2] coordinates of the bounding box (top-left x, top-left y, bottom-right x, bottom-right y)\n\n"
-        "Rules:\n"
-        "1. Extract text exactly as it appears in the image, preserving the original order.\n"
-        "2. Each text segment should be a distinct line or logical text block.\n"
-        "3. Bounding box coordinates should be integers representing pixel positions.\n"
-        "4. Do NOT translate, summarize, or interpret the text.\n"
-        "5. If there is no text in the image, return an empty array [].\n"
-        "6. For multi-language text, transcribe each language as-is.\n\n"
-        "Image dimensions: {width}x{height} (width x height).\n"
-        "IMPORTANT: Return bounding box coordinates scaled to the original image dimensions ({width}x{height}).\n\n"
-        "Output ONLY the JSON array, nothing else. Example:\n"
-        '[{{"text": "Hello World", "bbox": [100, 50, 300, 80]}}, {{"text": "Price: $10", "bbox": [100, 100, 250, 130]}}]'
-    )
-
-    @staticmethod
-    def _scale_results(results: list, orig_w: int, orig_h: int, model_w: int, model_h: int) -> list:
-        """将模型返回的坐标缩放到原始图片尺寸"""
-        if model_w <= 0 or model_h <= 0 or orig_w == model_w and orig_h == model_h:
-            return results
-        scale_x = orig_w / model_w
-        scale_y = orig_h / model_h
-        scaled = []
-        for item in results:
-            bbox = item.get("bbox", [])
-            if bbox and len(bbox) == 4:
-                scaled_item = {
-                    **item,
-                    "bbox": [
-                        int(round(bbox[0] * scale_x)),
-                        int(round(bbox[1] * scale_y)),
-                        int(round(bbox[2] * scale_x)),
-                        int(round(bbox[3] * scale_y)),
-                    ],
-                }
-                scaled.append(scaled_item)
-            else:
-                scaled.append(item)
-        return scaled
-
-    @staticmethod
-    def _convert_gemini_bbox(results: list, orig_w: int, orig_h: int) -> list:
-        """Gemini 原生输出 [ymin, xmin, ymax, xmax] 归一化到 [0, 1000]，
-        转换为像素坐标 [x1, y1, x2, y2]。"""
-        converted = []
-        for item in results:
-            bbox = item.get("bbox", [])
-            if len(bbox) == 4:
-                ymin_n, xmin_n, ymax_n, xmax_n = bbox
-                converted.append({
-                    **item,
-                    "bbox": [
-                        int(xmin_n / 1000 * orig_w),
-                        int(ymin_n / 1000 * orig_h),
-                        int(xmax_n / 1000 * orig_w),
-                        int(ymax_n / 1000 * orig_h),
-                    ]
-                })
-            else:
-                converted.append(item)
-        return converted
-
-    @staticmethod
-    def _get_image_dimensions(image_bytes: bytes) -> tuple:
-        """获取原始图片尺寸 (width, height)"""
-        from PIL import Image
-        with Image.open(BytesIO(image_bytes)) as img:
-            return img.width, img.height
-
-    def __init__(self, url: str, key: str, model: str):
-        self.base_url = url.rstrip('/') if url else "https://api.openai.com/v1"
-        self.key = key
-        self.model = model or "gpt-4o-mini"
-
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
-        import requests
-
-        # 获取原始图片尺寸
-        orig_w, orig_h = self._get_image_dimensions(image_bytes)
-
-        _MAX_SIDE = 3072
-        scale = min(_MAX_SIDE / max(orig_w, orig_h), 1.0)
-
-        system_prompt = self._SYSTEM_PROMPT_TEMPLATE.format(width=orig_w, height=orig_h)
-
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        # 检测图片格式
-        image_format = "jpeg"
-        if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
-            image_format = "png"
-        elif image_bytes[:2] == b'BM':
-            image_format = "bmp"
-        elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
-            image_format = "webp"
-
-        user_text = f"Extract all text from this image with bounding boxes. Language hint: {language}"
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/{image_format};base64,{image_b64}",
-                            "detail": "high"
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": user_text
-                    }
-                ]
-            }
-        ]
-
-        headers = {
-            "Authorization": f"Bearer {self.key}",
-            "Content-Type": "application/json"
-        }
-
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            json={
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": 4096,
-            },
-            headers=headers,
-            timeout=60
-        )
-        response.raise_for_status()
-
-        result = response.json()
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        parsed_results = self._parse_result(content)
-        return self._convert_gemini_bbox(parsed_results, orig_w, orig_h)
-
-    @staticmethod
-    def _parse_result(content: str) -> list:
-        """解析模型返回的 JSON 结果"""
-        content = content.strip()
-        # 尝试提取 JSON 数组
-        if content.startswith("["):
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                pass
-        # 尝试从 markdown 代码块中提取
-        import re
-        match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", content, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
-        # 尝试找到第一个 [ 到最后一个 ]
-        start = content.find("[")
-        end = content.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(content[start:end + 1])
-            except json.JSONDecodeError:
-                pass
-        # 兜底：作为纯文本处理
-        log.warning(f"[ocr] failed to parse JSON result, treating as plain text: {content[:200]!r}")
-        return [{"text": content, "bbox": []}]
-
-
-class QwenVLAdapter(OCRAdapter):
-    """Qwen-VL (通义千问视觉模型) OCR
-
-    通过 OpenAI 兼容接口调用 Qwen-VL 进行 OCR。
-    """
-
-    _SYSTEM_PROMPT_TEMPLATE = (
-        "你是一个 OCR 文字识别系统，支持坐标检测。\n\n"
-        "任务：从图片中提取所有文字，并返回每段文字的边界框坐标。\n\n"
-        "输出格式：返回 JSON 数组，每个元素包含：\n"
-        '- "text": 提取的文字\n'
-        '- "bbox": [x1, y1, x2, y2] 边界框坐标（左上角x, 左上角y, 右下角x, 右下角y）\n\n'
-        "规则：\n"
-        "1. 准确提取图片中的所有文字，保持原有顺序。\n"
-        "2. 每段文字应为独立的一行或逻辑文本块。\n"
-        "3. 坐标为整数，表示像素位置。\n"
-        "4. 不要翻译、总结或解释文字内容。\n"
-        "5. 如果图片中没有文字，返回空数组 []。\n\n"
-        "图片原始尺寸：{width}x{height}（宽 x 高）。\n"
-        "重要：请返回基于原始图片尺寸的边界框坐标。\n\n"
-        "只输出 JSON 数组，不要输出其他内容。示例：\n"
-        '[{{"text": "你好世界", "bbox": [100, 50, 300, 80]}}, {{"text": "价格：10元", "bbox": [100, 100, 250, 130]}}]'
-    )
-
-    def __init__(self, url: str, key: str, model: str):
-        self.base_url = url.rstrip('/') if url else "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        self.key = key
-        self.model = model or "qwen-vl-max"
-
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
-        import requests
-
-        # 获取原始图片尺寸
-        orig_w, orig_h = OpenAIVisionAdapter._get_image_dimensions(image_bytes)
-
-        # 使用模板填充尺寸信息
-        system_prompt = self._SYSTEM_PROMPT_TEMPLATE.format(width=orig_w, height=orig_h)
-
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        image_format = "jpeg"
-        if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
-            image_format = "png"
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:image/{image_format};base64,{image_b64}"
-                    },
-                    {
-                        "type": "text",
-                        "text": "请识别图片中的所有文字并返回坐标。"
-                    }
-                ]
-            }
-        ]
-
-        headers = {
-            "Authorization": f"Bearer {self.key}",
-            "Content-Type": "application/json"
-        }
-
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            json={
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": 4096,
-            },
-            headers=headers,
-            timeout=60
-        )
-        response.raise_for_status()
-
-        result = response.json()
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return OpenAIVisionAdapter._parse_result(content)
-
-
-class TesseractAdapter(OCRAdapter):
-    """Tesseract 本地 OCR 引擎
-
-    离线 OCR，无需网络，但精度较低。
-    Tesseract 不支持坐标输出，返回无 bbox 的结果。
-    """
-
-    def __init__(self, language: str = "chi_sim+eng"):
-        self._language = language
-
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
-        try:
-            import pytesseract
-            from PIL import Image
-        except ImportError:
-            raise RuntimeError("pytesseract and PIL are required for Tesseract OCR")
-
-        lang_map = {
-            "zh": "chi_sim+eng",
-            "ch": "chi_sim+eng",
-            "zh-CN": "chi_sim+eng",
-            "zh-TW": "chi_tra+eng",
-            "en": "eng",
-            "ja": "jpn+eng",
-            "ko": "kor+eng",
-        }
-        tesseract_lang = lang_map.get(language, self._language)
-
-        image = Image.open(BytesIO(image_bytes))
-        # 使用 image_to_data 获取带坐标的结果
-        data = pytesseract.image_to_data(image, lang=tesseract_lang, output_type=pytesseract.Output.DICT)
-        results = []
-        for i in range(len(data["text"])):
-            text = data["text"][i].strip()
-            if not text:
-                continue
-            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-            results.append({
-                "text": text,
-                "bbox": [x, y, x + w, y + h],
-            })
-        return results
-
-
 def _ocr_output_topic(input_topic: str) -> str:
     return f"{input_topic}/ocr"
 
@@ -513,126 +201,90 @@ def _freeze_config(value):
 
 
 def _adapter_signature(cfg: dict) -> tuple:
-    provider = cfg.get('provider', 'rapidocr')
-    common = (provider,)
-    if provider == 'rapidocr':
-        backend = str(
-            cfg.get('backend', DEFAULT_OCR_BACKEND)
-        ).strip().lower()
-        fallback_backend = str(cfg.get(
-            'fallback_backend',
-            DEFAULT_OCR_FALLBACK_BACKEND if backend == 'tensorrt' else '',
-        )).strip().lower()
-        default_model_dir = {
-            'tensorrt': DEFAULT_OCR_MODEL_DIR,
-            'mnn': DEFAULT_OCR_FALLBACK_MODEL_DIR,
-            'onnxruntime': DEFAULT_OCR_ONNX_MODEL_DIR,
-        }.get(backend, DEFAULT_OCR_MODEL_DIR)
-        return common + (
-            backend,
-            fallback_backend,
-            cfg.get('model_dir', default_model_dir),
-            cfg.get(
-                'fallback_model_dir',
-                DEFAULT_OCR_FALLBACK_MODEL_DIR
-                if fallback_backend == 'mnn' else '',
-            ),
-            str(cfg.get(
-                'device', DEFAULT_OCR_DEVICE if backend == 'tensorrt' else 'cpu'
-            )).strip().lower(),
-            int(cfg.get('device_id', 0)),
-            int(cfg.get('gpu_mem_mb', 512)),
-            bool(cfg.get('use_angle_cls', True)),
-            int(cfg.get('num_threads', 2)),
-            int(cfg.get('max_side_len', DEFAULT_MAX_SIDE_LEN)),
-            float(cfg.get('rec_min_score', DEFAULT_REC_MIN_SCORE)),
-            bool(cfg.get('enable_preprocess', True)),
-            float(cfg.get('det_thresh', DEFAULT_DET_THRESH)),
-            float(cfg.get('det_box_thresh', DEFAULT_DET_BOX_THRESH)),
-            float(cfg.get('det_unclip_ratio', DEFAULT_DET_UNCLIP_RATIO)),
-            _freeze_config(cfg.get('large_image_strategy', {})),
-            _freeze_config(cfg.get('crop_refinement', {})),
-            _freeze_config(cfg.get('empty_result_retry', {})),
-        )
-    if provider in ('openai', 'qwen'):
-        return common + (
-            cfg.get('url', ''),
-            cfg.get('key', ''),
-            cfg.get('model', ''),
-        )
-    if provider == 'tesseract':
-        return common + (cfg.get('language', 'chi_sim+eng'),)
-    return common
+    backend = str(
+        cfg.get('backend', DEFAULT_OCR_BACKEND)
+    ).strip().lower()
+    fallback_backend = str(cfg.get(
+        'fallback_backend',
+        DEFAULT_OCR_FALLBACK_BACKEND if backend == 'tensorrt' else '',
+    )).strip().lower()
+    default_model_dir = {
+        'tensorrt': DEFAULT_OCR_MODEL_DIR,
+        'mnn': DEFAULT_OCR_FALLBACK_MODEL_DIR,
+        'onnxruntime': DEFAULT_OCR_ONNX_MODEL_DIR,
+    }.get(backend, DEFAULT_OCR_MODEL_DIR)
+    return (
+        backend,
+        fallback_backend,
+        cfg.get('model_dir', default_model_dir),
+        cfg.get(
+            'fallback_model_dir',
+            DEFAULT_OCR_FALLBACK_MODEL_DIR
+            if fallback_backend == 'mnn' else '',
+        ),
+        str(cfg.get(
+            'device', DEFAULT_OCR_DEVICE if backend == 'tensorrt' else 'cpu'
+        )).strip().lower(),
+        int(cfg.get('device_id', 0)),
+        int(cfg.get('gpu_mem_mb', 512)),
+        bool(cfg.get('use_angle_cls', True)),
+        int(cfg.get('num_threads', 2)),
+        int(cfg.get('max_side_len', DEFAULT_MAX_SIDE_LEN)),
+        float(cfg.get('rec_min_score', DEFAULT_REC_MIN_SCORE)),
+        bool(cfg.get('enable_preprocess', True)),
+        float(cfg.get('det_thresh', DEFAULT_DET_THRESH)),
+        float(cfg.get('det_box_thresh', DEFAULT_DET_BOX_THRESH)),
+        float(cfg.get('det_unclip_ratio', DEFAULT_DET_UNCLIP_RATIO)),
+        _freeze_config(cfg.get('large_image_strategy', {})),
+        _freeze_config(cfg.get('crop_refinement', {})),
+        _freeze_config(cfg.get('empty_result_retry', {})),
+    )
 
 
-def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
-    """根据配置创建 OCR 适配器"""
-    provider = cfg.get('provider', 'rapidocr')
-
-    if provider == 'rapidocr':
-        backend = str(
-            cfg.get('backend', DEFAULT_OCR_BACKEND)
-        ).strip().lower()
-        fallback_backend = str(cfg.get(
-            'fallback_backend',
-            DEFAULT_OCR_FALLBACK_BACKEND if backend == 'tensorrt' else '',
-        )).strip().lower()
-        default_model_dir = {
-            'tensorrt': DEFAULT_OCR_MODEL_DIR,
-            'mnn': DEFAULT_OCR_FALLBACK_MODEL_DIR,
-            'onnxruntime': DEFAULT_OCR_ONNX_MODEL_DIR,
-        }.get(backend, DEFAULT_OCR_MODEL_DIR)
-        return RapidOCRAdapter(
-            cfg.get('model_dir', default_model_dir),
-            backend=backend,
-            fallback_backend=fallback_backend,
-            fallback_model_dir=cfg.get(
-                'fallback_model_dir',
-                DEFAULT_OCR_FALLBACK_MODEL_DIR
-                if fallback_backend == 'mnn' else '',
-            ),
-            device=str(cfg.get(
-                'device', DEFAULT_OCR_DEVICE if backend == 'tensorrt' else 'cpu'
-            )).strip().lower(),
-            device_id=int(cfg.get('device_id', 0)),
-            gpu_mem_mb=int(cfg.get('gpu_mem_mb', 512)),
-            use_angle_cls=bool(cfg.get('use_angle_cls', True)),
-            num_threads=int(cfg.get('num_threads', 2)),
-            max_side_len=int(cfg.get('max_side_len', DEFAULT_MAX_SIDE_LEN)),
-            rec_min_score=float(
-                cfg.get('rec_min_score', DEFAULT_REC_MIN_SCORE)
-            ),
-            enable_preprocess=bool(cfg.get('enable_preprocess', True)),
-            det_thresh=float(cfg.get('det_thresh', DEFAULT_DET_THRESH)),
-            det_box_thresh=float(
-                cfg.get('det_box_thresh', DEFAULT_DET_BOX_THRESH)
-            ),
-            det_unclip_ratio=float(
-                cfg.get('det_unclip_ratio', DEFAULT_DET_UNCLIP_RATIO)
-            ),
-            large_image_strategy=dict(
-                cfg.get('large_image_strategy') or {}
-            ),
-            crop_refinement=dict(cfg.get('crop_refinement') or {}),
-            empty_result_retry=dict(cfg.get('empty_result_retry') or {}),
-        )
-
-    elif provider == 'openai':
-        url, key = cfg.get('url', ''), cfg.get('key', '')
-        if not key:
-            return None
-        return OpenAIVisionAdapter(url, key, cfg.get('model', ''))
-
-    elif provider == 'qwen':
-        url, key = cfg.get('url', ''), cfg.get('key', '')
-        if not key:
-            return None
-        return QwenVLAdapter(url, key, cfg.get('model', ''))
-
-    elif provider == 'tesseract':
-        return TesseractAdapter(cfg.get('language', 'chi_sim+eng'))
-
-    return None
+def _build_ocr_adapter(cfg: dict) -> OCRAdapter:
+    """Create the configured on-device OCR adapter."""
+    backend = str(
+        cfg.get('backend', DEFAULT_OCR_BACKEND)
+    ).strip().lower()
+    fallback_backend = str(cfg.get(
+        'fallback_backend',
+        DEFAULT_OCR_FALLBACK_BACKEND if backend == 'tensorrt' else '',
+    )).strip().lower()
+    default_model_dir = {
+        'tensorrt': DEFAULT_OCR_MODEL_DIR,
+        'mnn': DEFAULT_OCR_FALLBACK_MODEL_DIR,
+        'onnxruntime': DEFAULT_OCR_ONNX_MODEL_DIR,
+    }.get(backend, DEFAULT_OCR_MODEL_DIR)
+    return RapidOCRAdapter(
+        cfg.get('model_dir', default_model_dir),
+        backend=backend,
+        fallback_backend=fallback_backend,
+        fallback_model_dir=cfg.get(
+            'fallback_model_dir',
+            DEFAULT_OCR_FALLBACK_MODEL_DIR
+            if fallback_backend == 'mnn' else '',
+        ),
+        device=str(cfg.get(
+            'device', DEFAULT_OCR_DEVICE if backend == 'tensorrt' else 'cpu'
+        )).strip().lower(),
+        device_id=int(cfg.get('device_id', 0)),
+        gpu_mem_mb=int(cfg.get('gpu_mem_mb', 512)),
+        use_angle_cls=bool(cfg.get('use_angle_cls', True)),
+        num_threads=int(cfg.get('num_threads', 2)),
+        max_side_len=int(cfg.get('max_side_len', DEFAULT_MAX_SIDE_LEN)),
+        rec_min_score=float(cfg.get('rec_min_score', DEFAULT_REC_MIN_SCORE)),
+        enable_preprocess=bool(cfg.get('enable_preprocess', True)),
+        det_thresh=float(cfg.get('det_thresh', DEFAULT_DET_THRESH)),
+        det_box_thresh=float(
+            cfg.get('det_box_thresh', DEFAULT_DET_BOX_THRESH)
+        ),
+        det_unclip_ratio=float(
+            cfg.get('det_unclip_ratio', DEFAULT_DET_UNCLIP_RATIO)
+        ),
+        large_image_strategy=dict(cfg.get('large_image_strategy') or {}),
+        crop_refinement=dict(cfg.get('crop_refinement') or {}),
+        empty_result_retry=dict(cfg.get('empty_result_retry') or {}),
+    )
 
 
 # ── ROS2 Node (订阅模式) ───────────────────────────────────────────────────────
@@ -735,9 +387,9 @@ class _OCRNode(Node):
             return
         self._frame_count += 1
         image_data = bytes(msg.data)
-        log.info(f"[ocr] received image frame #{self._frame_count}: "
-                 f"size={len(image_data)} bytes, format={msg.format}, "
-                 f"topic={self._input_topic}")
+        log.debug(f"[ocr] received image frame #{self._frame_count}: "
+                  f"size={len(image_data)} bytes, format={msg.format}, "
+                  f"topic={self._input_topic}")
         try:
             frame_queue.put_nowait((image_data, time.time()))
         except queue.Full:
@@ -786,7 +438,7 @@ class _OCRNode(Node):
             if "error" in payload:
                 log.error("[ocr] recognition error: %s", payload["error"])
             else:
-                log.info(
+                log.debug(
                     "[ocr] published result to %s: %d items",
                     self._output_topic,
                     len(payload["items"]),
@@ -825,11 +477,10 @@ class OCRPlugin:
         self._executor = executor
         self._lifecycle_lock = threading.RLock()
 
-        self._adapter = _build_ocr_adapter(plugin_cfg)
+        self._adapter: OCRAdapter | None = None
         log.info(
-            f"[ocr] plugin init: provider={plugin_cfg.get('provider')}, "
-            f"language={self._language}, "
-            f"adapter_ok={self._adapter is not None}"
+            f"[ocr] plugin registered: language={self._language}; "
+            "runtime will load on first start"
         )
 
     def get_tools(self) -> list:
@@ -848,12 +499,18 @@ class OCRPlugin:
         )
         return result
 
-    def _adapter_for_instance(self, instance_id: str) -> OCRAdapter | None:
+    def _default_adapter(self) -> OCRAdapter:
+        if self._adapter is None:
+            self._adapter = _build_ocr_adapter(self._plugin_cfg)
+            log.info(f"[ocr] default runtime loaded | {_resource_snapshot()}")
+        return self._adapter
+
+    def _adapter_for_instance(self, instance_id: str) -> OCRAdapter:
         override = self._instance_configs.get(instance_id, {})
         cfg = {**self._plugin_cfg, **override}
         signature = _adapter_signature(cfg)
         if signature == _adapter_signature(self._plugin_cfg):
-            return self._adapter
+            return self._default_adapter()
 
         cached = self._instance_adapters.get(instance_id)
         if cached and cached[0] == signature:
@@ -869,8 +526,7 @@ class OCRPlugin:
 
     def _configure_node(self, node: _OCRNode, instance_id: str) -> None:
         cfg = {**self._plugin_cfg, **self._instance_configs.get(instance_id, {})}
-        adapter = self._adapter_for_instance(instance_id) if instance_id else self._adapter
-        node._adapter = adapter
+        node._adapter = self._adapter_for_instance(instance_id)
         node._language = cfg.get("language", self._language)
         node._min_interval = max(
             0.0, float(cfg.get("min_interval_ms", 0)) / 1000.0
@@ -968,16 +624,12 @@ class OCRPlugin:
                 self._retire_node(node_key)
 
             if node_key not in self._nodes:
-                adapter = self._adapter
-                language = self._language
-
-                if instance_id and instance_id in self._instance_configs:
-                    inst_adapter = self._adapter_for_instance(instance_id)
-                    if inst_adapter:
-                        adapter = inst_adapter
-                    inst_lang = self._instance_configs[instance_id].get("language")
-                    if inst_lang:
-                        language = inst_lang
+                adapter = self._adapter_for_instance(instance_id)
+                cfg = {
+                    **self._plugin_cfg,
+                    **self._instance_configs.get(instance_id, {}),
+                }
+                language = cfg.get("language", self._language)
 
                 node = _OCRNode(
                     input_topic, adapter, language,
@@ -1009,13 +661,30 @@ class OCRPlugin:
 
             if instance_id:
                 previous = self._instance_configs.get(instance_id, {})
-                self._instance_configs[instance_id] = {**previous, **cfg}
-                self._instance_adapters.pop(instance_id, None)
+                previous_cfg = {**self._plugin_cfg, **previous}
+                updated_override = {**previous, **cfg}
+                updated_cfg = {**self._plugin_cfg, **updated_override}
+                rebuild = (
+                    _adapter_signature(updated_cfg)
+                    != _adapter_signature(previous_cfg)
+                )
+                self._instance_configs[instance_id] = updated_override
+                if rebuild:
+                    self._instance_adapters.pop(instance_id, None)
                 if instance_id in self._nodes:
                     node = self._nodes[instance_id]
                     node.stop()
-                    self._configure_node(node, instance_id)
-                return {"status": "configured", "instance_id": instance_id}
+                    node._adapter = None
+                    node._language = updated_cfg.get("language", self._language)
+                    node._min_interval = max(
+                        0.0,
+                        float(updated_cfg.get("min_interval_ms", 0)) / 1000.0,
+                    )
+                return {
+                    "status": "configured",
+                    "instance_id": instance_id,
+                    "reused": not rebuild,
+                }
             else:
                 updated_cfg = {**self._plugin_cfg, **cfg}
                 rebuild = (
@@ -1023,16 +692,22 @@ class OCRPlugin:
                     != _adapter_signature(self._plugin_cfg)
                 )
                 if rebuild:
-                    self._adapter = _build_ocr_adapter(updated_cfg)
+                    self._adapter = None
                     self._instance_adapters.clear()
                 self._plugin_cfg = updated_cfg
                 self._language = updated_cfg.get('language', self._language)
-                for node_key, node in self._nodes.items():
+                for node in self._nodes.values():
                     node.stop()
-                    self._configure_node(node, node_key)
+                    node._adapter = None
+                    node._language = self._language
+                    node._min_interval = max(
+                        0.0,
+                        float(updated_cfg.get("min_interval_ms", 0)) / 1000.0,
+                    )
                 return {
                     "status": "configured",
-                    "adapter_ok": self._adapter is not None,
+                    "adapter_ok": True,
+                    "adapter_loaded": self._adapter is not None,
                     "reused": not rebuild,
                 }
 

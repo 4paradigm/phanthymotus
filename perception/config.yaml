@@ -47,13 +47,9 @@ plugins:
     fps: 5
 
   ocr:
-    enabled: true
-    provider: rapidocr
+    enabled: false
     backend: tensorrt
     fallback_backend: mnn
-    url: ""
-    key: ""
-    model: ""
     model_dir: /models/ocr/ppocrv6-small-trt-jp6-trt10.4-orin-batch8-cls8
     fallback_model_dir: /models/ocr/ppocrv6-small-mnn
     device: cuda

@@ -2,7 +2,7 @@ name: ocr-checks
 
 on:
   push:
-    branches: [feat/zengzhitao-ocr-pure]
+    branches: [main]
     paths:
       - "perception/**"
       - ".github/workflows/ocr-checks.yml"
