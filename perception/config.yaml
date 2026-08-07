@@ -61,15 +61,14 @@ plugins:
     language: zh
     use_angle_cls: true
     num_threads: 1
-    # v2 最优配置（GT-centric macro F1 0.6847，2026-07-30 调参定稿）：
-    #   1600 / unclip0.7 / rec_min0.9。回滚点：9de44b7（960/unclip1.2/rec_min0.3）。
-    #   rec_min0.9 是最大杠杆(+8.4pp)：TP rec_score 中位1.0、FP 0.79，砍FP几乎不伤TP。
-    #   注意：此为 v2(waic/上海公区小字) 调优值；v1(菜单/海报) 偏好更低分辨率，见 docs。
+    # Default inference settings. max_side_len bounds detector input size,
+    # det_unclip_ratio controls box expansion, and rec_min_score filters
+    # low-confidence recognition results before publication.
     max_side_len: 1600
     det_unclip_ratio: 0.7
     det_thresh: 0.3
     det_box_thresh: 0.5
-    rec_min_score: 0.9          # v2 最优：TP置信度~1.0 / FP~0.79，抬到0.9砍FP +8.4pp
+    rec_min_score: 0.9
     crop_refinement:
       # 仅对低于 rec_min_score 的 TensorRT 框做三种保守子框复识别；新结果必须
       # 同时达到 min_score 且比原框高 min_gain，避免全局低阈值重新引入 FP。
@@ -86,7 +85,8 @@ plugins:
       det_box_thresh: 0.1
     min_interval_ms: 0
     large_image_strategy:
-      # 关闭分块：tile 跨边界切割产生无法去重的碎片框, predict_T 膨胀 77%, F1 崩塌
+      # Disabled by default because boundary fragments cannot be reliably
+      # deduplicated across overlapping tiles.
       enabled: false
       trigger_side: 2400
       decode_side: 3200
