@@ -45,3 +45,51 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: false
+    backend: tensorrt
+    fallback_backend: mnn
+    model_dir: /models/ocr/ppocrv6-small-trt-jp511-trt8.5-orin-batch8-cls8
+    fallback_model_dir: /models/ocr/ppocrv6-small-mnn
+    device: cuda
+    device_id: 0
+    language: zh
+    use_angle_cls: true
+    num_threads: 1
+    # Default inference settings. max_side_len bounds detector input size,
+    # det_unclip_ratio controls box expansion, and rec_min_score filters
+    # low-confidence recognition results before publication.
+    max_side_len: 1600
+    det_unclip_ratio: 0.7
+    det_thresh: 0.3
+    det_box_thresh: 0.5
+    rec_min_score: 0.9
+    crop_refinement:
+      # 仅对低于 rec_min_score 的 TensorRT 框做三种保守子框复识别；新结果必须
+      # 同时达到 min_score 且比原框高 min_gain，避免全局低阈值重新引入 FP。
+      enabled: true
+      min_score: 0.9
+      min_gain: 0.12
+      min_text_length: 2
+      profiles: [prefix_65, upper_center, upper_tight]
+    empty_result_retry:
+      # 主流程过滤后为空时，复用同一张 detector 概率图，以低阈值重新生成候选框；
+      # 不重复执行 GPU detector，非空结果完全不受影响。
+      enabled: true
+      det_thresh: 0.1
+      det_box_thresh: 0.1
+    min_interval_ms: 0
+    large_image_strategy:
+      # Disabled by default because boundary fragments cannot be reliably
+      # deduplicated across overlapping tiles.
+      enabled: false
+      trigger_side: 2400
+      decode_side: 3200
+      decode_hard_limit: 4096
+      tile_size: 1280
+      overlap: 128
+      max_tiles: 12
+      global_pass: true
+      dedup_iou: 0.5
+      dedup_text_similarity: 0.8
