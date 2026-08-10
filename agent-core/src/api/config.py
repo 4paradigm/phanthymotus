@@ -1,15 +1,338 @@
+import asyncio
+import json
 import time
-from urllib.parse import urlparse
 from typing import List
+from urllib.parse import urlparse
 
+import aiohttp
 import fastapi
+import openai as openai_lib
 from pydantic import BaseModel
 
 import config
-import aiohttp
-import openai as openai_lib
+from teleop import authority_guard
 
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
+_project_transition_lock = asyncio.Lock()
+_project_residual_latched = False
+_project_residual_cards: list[dict] = []
+
+
+def _project_transition_conflict() -> dict:
+    return {
+        'status_code': 409,
+        'detail': {
+            'code': 'project_transition_in_progress',
+            'reason': 'another_start_or_stop_is_running',
+        },
+        'errors': [],
+    }
+
+
+def _project_card_snapshot(cards) -> list[dict]:
+    if not isinstance(cards, list):
+        return []
+    return [
+        {
+            'id': card.get('id', ''),
+            'mcpId': card.get('mcpId', ''),
+            'toolName': card.get('toolName', ''),
+        }
+        for card in cards
+        if isinstance(card, dict)
+        and card.get('id')
+        and card.get('mcpId')
+        and card.get('toolName')
+    ]
+
+
+def _latch_project_residual(cards) -> None:
+    """Keep residual-control state fail-closed if durable state cannot be written."""
+
+    global _project_residual_latched, _project_residual_cards
+    snapshot = _project_card_snapshot(cards)
+    if snapshot:
+        _project_residual_cards = snapshot
+    _project_residual_latched = True
+
+
+def _clear_project_residual() -> None:
+    global _project_residual_latched, _project_residual_cards
+    _project_residual_latched = False
+    _project_residual_cards = []
+
+
+def _effective_project_cards(core: dict) -> list[dict]:
+    if _project_residual_latched:
+        return _project_card_snapshot(_project_residual_cards)
+    active = core.get('active_project_cards')
+    if isinstance(active, list) and active:
+        return _project_card_snapshot(active)
+    layout = config.main.get('canvas_layout', {})
+    cards = layout.get('cards', []) if isinstance(layout, dict) else []
+    return _project_card_snapshot(cards)
+
+
+def _reject_non_finite_json(value: str):
+    raise ValueError(f'non-finite JSON constant: {value}')
+
+
+def _project_tool_ack_error(result: object) -> str | None:
+    """Require a structured, non-failing acknowledgement for lifecycle calls."""
+
+    if not isinstance(result, dict) or result.get('code') != 200:
+        if isinstance(result, dict):
+            message = result.get('message') or result.get('detail')
+            if message:
+                return str(message)[:200]
+        return 'Driver lifecycle call failed'
+
+    data = result.get('data')
+    acknowledgements = []
+    if isinstance(data, dict):
+        acknowledgements.append(data)
+    elif isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict) or item.get('type') != 'text':
+                continue
+            text = item.get('text')
+            if not isinstance(text, str):
+                continue
+            try:
+                parsed = json.loads(
+                    text,
+                    parse_constant=_reject_non_finite_json,
+                )
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                acknowledgements.append(parsed)
+    if not acknowledgements:
+        return 'Driver did not return a structured lifecycle acknowledgement'
+
+    for acknowledgement in acknowledgements:
+        explicit_error = acknowledgement.get('error')
+        if explicit_error not in (None, '', False):
+            return (
+                str(explicit_error)[:200]
+                if isinstance(explicit_error, str)
+                else 'Driver returned an explicit error'
+            )
+        if acknowledgement.get('adapter_ok') is False:
+            message = acknowledgement.get('message')
+            return str(message)[:200] if message else 'Driver rejected the lifecycle call'
+        if acknowledgement.get('state') == 'error':
+            message = acknowledgement.get('message')
+            return str(message)[:200] if message else 'Driver reported an error state'
+        status = acknowledgement.get('status')
+        if (
+            acknowledgement.get('ok') is False
+            or acknowledgement.get('success') is False
+            or acknowledgement.get('configured') is False
+            or (isinstance(status, str) and status in {'error', 'failed', 'failure'})
+        ):
+            message = acknowledgement.get('message')
+            return str(message)[:200] if message else 'Driver rejected the operation'
+    return None
+
+
+def _set_project_state(state: str, *, cards=None) -> None:
+    core = config.main.get('core', {})
+    core['project_state'] = state
+    core['project_running'] = state in {'running', 'degraded'}
+    if state in {'running', 'degraded'}:
+        if cards is not None:
+            core['active_project_cards'] = _project_card_snapshot(cards)
+    else:
+        core.pop('active_project_cards', None)
+    config.main['core'] = core
+
+
+def _set_project_state_safely(state: str, *, cards=None) -> bool:
+    try:
+        _set_project_state(state, cards=cards)
+        return True
+    except Exception as error:
+        print(f'[project-state] failed to persist {state}: {type(error).__name__}')
+        return False
+
+
+async def _await_project_cleanup(task: asyncio.Task):
+    """Wait for a project rollback even if the initiating request is recancelled."""
+
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+
+
+def _authority_roots(record: dict) -> tuple[str, ...]:
+    roots = []
+    for key in ('authority_domain', 'pending_authority_domain'):
+        root_id = record.get(key)
+        if isinstance(root_id, str) and root_id and root_id not in roots:
+            roots.append(root_id)
+    return tuple(roots)
+
+
+def _project_target_signature(record: object) -> tuple:
+    """Fields that must remain stable until every active card is stopped."""
+
+    target = record if isinstance(record, dict) else {}
+    try:
+        tools = json.dumps(
+            target.get('tools', []),
+            sort_keys=True,
+            separators=(',', ':'),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, RecursionError):
+        tools = repr(target.get('tools', []))
+    return (
+        target.get('id'),
+        target.get('url', ''),
+        target.get('transport', 'http'),
+        target.get('trust_state', ''),
+        target.get('category', ''),
+        target.get('authority_domain', ''),
+        target.get('pending_authority_domain', ''),
+        target.get('authority_binding_error', ''),
+        bool(target.get('authority_binding_required', False)),
+        bool(target.get('capability_refresh_required', False)),
+        target.get('reported_robot_id', ''),
+        tools,
+    )
+
+
+def _project_locked_target_ids(targets: list[dict]) -> tuple[bool, set[str]]:
+    """Return whether a transition is active and the targets needed for Stop."""
+
+    transitioning = _project_transition_lock.locked()
+    if transitioning:
+        return True, {
+            target.get('id')
+            for target in targets
+            if isinstance(target, dict) and isinstance(target.get('id'), str)
+        }
+
+    core = config.main.get('core', {})
+    state = core.get('project_state')
+    if (
+        not _project_residual_latched
+        and not core.get('project_running', False)
+        and state not in {'running', 'degraded'}
+    ):
+        return False, set()
+
+    cards = _effective_project_cards(core)
+    by_id = {
+        target.get('id'): target
+        for target in targets
+        if isinstance(target, dict) and isinstance(target.get('id'), str)
+    }
+    locked_ids: set[str] = set()
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        mcp_id = card.get('mcpId')
+        if not isinstance(mcp_id, str) or not mcp_id:
+            continue
+        locked_ids.add(mcp_id)
+        target = by_id.get(mcp_id, {})
+        authority_root = target.get('authority_domain')
+        if isinstance(authority_root, str) and authority_root:
+            locked_ids.add(authority_root)
+    return False, locked_ids
+
+
+async def _project_target_mutation_error(
+    current_targets: list[dict],
+    proposed_targets: list[dict],
+) -> dict | None:
+    """Reject target changes that could invalidate Stop or recovery authority."""
+
+    transitioning, locked_ids = _project_locked_target_ids(current_targets)
+    guard_store_failed = False
+    try:
+        guards = await asyncio.to_thread(authority_guard.list_guards)
+    except Exception:  # noqa: BLE001 -- unreadable deny state locks all mutations
+        guard_store_failed = True
+        locked_ids.update(
+            target.get('id')
+            for target in current_targets
+            if isinstance(target, dict) and isinstance(target.get('id'), str)
+        )
+    else:
+        for guard in guards:
+            locked_ids.update({guard.driver_id, guard.robot_id})
+    if not transitioning and not locked_ids and not guard_store_failed:
+        return None
+
+    current_by_id: dict[str, list[dict]] = {}
+    proposed_by_id: dict[str, list[dict]] = {}
+    for target in current_targets:
+        if isinstance(target, dict) and isinstance(target.get('id'), str):
+            current_by_id.setdefault(target['id'], []).append(target)
+    for target in proposed_targets:
+        if isinstance(target, dict) and isinstance(target.get('id'), str):
+            proposed_by_id.setdefault(target['id'], []).append(target)
+
+    changed_ids: set[str] = set()
+    if (transitioning or guard_store_failed) and set(current_by_id) != set(proposed_by_id):
+        changed_ids.update(set(current_by_id) ^ set(proposed_by_id))
+    if guard_store_failed:
+        for mcp_id in set(current_by_id) & set(proposed_by_id):
+            if current_by_id[mcp_id] != proposed_by_id[mcp_id]:
+                changed_ids.add(mcp_id)
+    for mcp_id in locked_ids:
+        current_matches = current_by_id.get(mcp_id, [])
+        proposed_matches = proposed_by_id.get(mcp_id, [])
+        if (
+            len(current_matches) != 1
+            or len(proposed_matches) != 1
+            or _project_target_signature(current_matches[0])
+            != _project_target_signature(proposed_matches[0])
+        ):
+            changed_ids.add(mcp_id)
+    if not changed_ids:
+        return None
+
+    core = config.main.get('core', {})
+    return {
+        'code': (
+            'authority_guard_persistence_error'
+            if guard_store_failed
+            else 'authority_target_locked'
+            if any(
+                guard.driver_id in changed_ids or guard.robot_id in changed_ids
+                for guard in guards
+            )
+            else 'project_target_locked'
+        ),
+        'reason': (
+            'authority_guard_store_unavailable'
+            if guard_store_failed
+            else 'persistent_authority_guard_requires_stable_target'
+            if any(
+                guard.driver_id in changed_ids or guard.robot_id in changed_ids
+                for guard in guards
+            )
+            else 'project_transition_in_progress'
+            if transitioning
+            else 'active_project_requires_stable_stop_targets'
+        ),
+        'project_state': (
+            'transitioning'
+            if transitioning
+            else 'degraded'
+            if _project_residual_latched
+            else core.get('project_state', 'running')
+        ),
+        'mcp_ids': sorted(changed_ids),
+    }
 
 
 # ── Models ──────────────────────────────────────────────────────────────────
@@ -119,12 +442,27 @@ async def config_status():
 @router.get('/project-running')
 async def get_project_running():
     core = config.main.get('core', {})
-    return {'running': bool(core.get('project_running', False))}
+    running = _project_residual_latched or bool(core.get('project_running', False))
+    state = (
+        'degraded'
+        if _project_residual_latched
+        else core.get('project_state', 'running' if running else 'stopped')
+    )
+    return {
+        'running': running,
+        'state': state,
+        'transitioning': _project_transition_lock.locked(),
+    }
 
 
 # ── Start / Stop Project (统一入口) ─────────────────────────────────────────────
 
-async def _do_start_project():
+async def _do_start_project(
+    *,
+    _transition_locked: bool = False,
+    editor_session_id: str | None = None,
+    expected_layout_revision: int | None = None,
+):
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
 
     Topic resolution strategy:
@@ -133,6 +471,54 @@ async def _do_start_project():
       3. When starting processor cards, look up source card's topic_out via connections
       4. Fallback: use connection's persisted fromTopic if info() didn't return topic_out
     """
+    if not _transition_locked:
+        if _project_transition_lock.locked():
+            return _project_transition_conflict()
+        async with _project_transition_lock:
+            return await _do_start_project(
+                _transition_locked=True,
+                editor_session_id=editor_session_id,
+                expected_layout_revision=expected_layout_revision,
+            )
+
+    core = config.main.get('core', {})
+    if _project_residual_latched or core.get('project_running', False):
+        project_state = (
+            'degraded'
+            if _project_residual_latched
+            else core.get('project_state', 'running')
+        )
+        if project_state == 'running':
+            return True
+        return {
+            'status_code': 409,
+            'detail': {
+                'code': 'project_degraded_requires_stop',
+                'reason': 'residual_control_must_be_stopped_before_start',
+                'project_state': 'degraded',
+            },
+            'errors': [],
+        }
+
+    if editor_session_id is not None or expected_layout_revision is not None:
+        from api.canvas import validate_project_start_snapshot
+
+        if editor_session_id is None or expected_layout_revision is None:
+            return {
+                'status_code': 422,
+                'detail': {
+                    'code': 'project_start_snapshot_required',
+                    'reason': 'editor_session_and_layout_revision_are_required',
+                },
+                'errors': [],
+            }
+        snapshot_error = validate_project_start_snapshot(
+            editor_session_id,
+            expected_layout_revision,
+        )
+        if snapshot_error is not None:
+            return snapshot_error
+
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
     import json as _json
@@ -141,16 +527,64 @@ async def _do_start_project():
     cards = layout.get('cards', [])
     connections = layout.get('connections', [])
 
-    if not cards:
-        return
+    if not isinstance(cards, list) or not cards:
+        return {
+            'status_code': 409,
+            'detail': {
+                'code': 'project_empty',
+                'reason': 'no_canvas_cards',
+            },
+            'errors': [],
+        }
+
+    card_ids = set()
+    layout_errors = []
+    for index, card in enumerate(cards):
+        if not isinstance(card, dict):
+            layout_errors.append(f'cards[{index}] must be an object')
+            continue
+        card_id = card.get('id')
+        if not card_id or not card.get('mcpId') or not card.get('toolName'):
+            layout_errors.append(f'cards[{index}] is missing id, mcpId, or toolName')
+            continue
+        if card_id in card_ids:
+            layout_errors.append(f'duplicate card id: {card_id}')
+        card_ids.add(card_id)
+    if not isinstance(connections, list):
+        layout_errors.append('connections must be an array')
+    else:
+        for index, connection in enumerate(connections):
+            if not isinstance(connection, dict):
+                layout_errors.append(f'connections[{index}] must be an object')
+                continue
+            if (
+                connection.get('fromCardId') not in card_ids
+                or connection.get('toCardId') not in card_ids
+            ):
+                layout_errors.append(f'connections[{index}] references an unknown card')
+            try:
+                port_index = int(connection.get('fromPortIdx', 0))
+                if port_index < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                layout_errors.append(f'connections[{index}].fromPortIdx is invalid')
+    if layout_errors:
+        return {
+            'status_code': 422,
+            'detail': {
+                'code': 'project_layout_invalid',
+                'errors': layout_errors,
+            },
+            'errors': layout_errors,
+        }
 
     # 分类：sources (无入连接) 和 processors (有入连接)
     cards_with_inbound = set()
     for conn in connections:
         cards_with_inbound.add(conn.get('toCardId'))
 
-    sources = [c for c in cards if c['id'] not in cards_with_inbound]
-    processors = [c for c in cards if c['id'] in cards_with_inbound]
+    sources = [c for c in cards if c.get('id') not in cards_with_inbound]
+    processors = [c for c in cards if c.get('id') in cards_with_inbound]
     all_ordered = sources + processors
 
     # 广播启动开始
@@ -159,6 +593,9 @@ async def _do_start_project():
     }})
 
     errors = []
+    teleop_conflicts: list[dict] = []
+    started_cards: list[dict] = []
+    attempted_cards: list[dict] = []
     # Resolved topic_out per card (populated after starting sources)
     resolved_topics: dict[str, list] = {}
 
@@ -168,6 +605,14 @@ async def _do_start_project():
         tool_name = card.get('toolName', '')
         card_id = card.get('id', '')
         if not mcp_id or not tool_name:
+            item_name = tool_name or card_id or '<invalid-card>'
+            errors.append(item_name)
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name,
+                'mcp_id': mcp_id,
+                'status': 'error',
+                'message': 'card is missing mcpId or toolName',
+            }})
             return
 
         await push_event({'type': 'project_start_item', 'payload': {
@@ -182,70 +627,99 @@ async def _do_start_project():
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
+            attempted_cards.append(card)
             result = await mcp_call_tool(mcp_id, req)
-            if result.get('code') == 200:
-                # Check if tool reported an error state in its response
-                resp_data = result.get('data')
-                tool_state = None
-                tool_message = ''
-                if isinstance(resp_data, dict):
-                    tool_state = resp_data.get('state')
-                    tool_message = resp_data.get('message', '')
-                elif isinstance(resp_data, list) and resp_data:
-                    try:
-                        parsed = _json.loads(resp_data[0].get('text', '{}')) if isinstance(resp_data[0], dict) else {}
-                        tool_state = parsed.get('state')
-                        tool_message = parsed.get('message', '')
-                    except Exception:
-                        pass
-
-                if tool_state == 'error':
-                    print(f'[start-project] {tool_name} ({mcp_id}) self-check failed: {tool_message}')
-                    await push_event({'type': 'project_start_item', 'payload': {
-                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
-                    }})
-                    errors.append(tool_name)
-                else:
-                    print(f'[start-project] started {tool_name} ({mcp_id})')
-                    await push_event({'type': 'project_start_item', 'payload': {
-                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
-                    }})
-                # After successful start, query info() to get resolved topic_out
-                try:
-                    info_req = MCPCallRequest(tool=tool_name, arguments={'action': 'info', 'instance_id': card_id})
-                    info_result = await mcp_call_tool(mcp_id, info_req)
-                    if info_result.get('code') == 200:
-                        data = info_result.get('data')
-                        # Parse MCP JSON-RPC content format: [{"type":"text","text":"..."}]
-                        if isinstance(data, list) and data:
-                            text = data[0].get('text', '{}') if isinstance(data[0], dict) else '{}'
-                            try:
-                                data = _json.loads(text)
-                            except Exception:
-                                data = {}
-                        elif isinstance(data, str):
-                            try:
-                                data = _json.loads(data)
-                            except Exception:
-                                data = {}
-                        if isinstance(data, dict):
-                            topic_out = data.get('topic_out', [])
-                            if topic_out:
-                                resolved_topics[card_id] = topic_out
-                                # Register resolved topics so WebSocket relay works
-                                from api.inspection import register_topic_internal
-                                for tp in topic_out:
-                                    if tp.get('topic') and tp.get('format'):
-                                        await register_topic_internal(tp['topic'], tp['format'], mcp_id)
-                except Exception:
-                    pass  # info() failure is non-fatal
-            else:
-                msg = str(result.get('detail', result.get('data', '')))[:100]
+            ack_error = _project_tool_ack_error(result)
+            if ack_error:
+                msg = ack_error[:100]
                 print(f'[start-project] {tool_name} error: {result}')
                 await push_event({'type': 'project_start_item', 'payload': {
                     'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': msg,
                 }})
                 errors.append(tool_name)
+                return
+
+            # Check if a legacy/internal tool reported an error state in a 200.
+            resp_data = result.get('data')
+            tool_state = None
+            tool_message = ''
+            if isinstance(resp_data, dict):
+                tool_state = resp_data.get('state')
+                tool_message = resp_data.get('message', '')
+            elif isinstance(resp_data, list) and resp_data:
+                try:
+                    parsed = _json.loads(resp_data[0].get('text', '{}')) if isinstance(resp_data[0], dict) else {}
+                    tool_state = parsed.get('state')
+                    tool_message = parsed.get('message', '')
+                except Exception:
+                    pass
+
+            if tool_state == 'error':
+                print(f'[start-project] {tool_name} ({mcp_id}) self-check failed: {tool_message}')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
+                }})
+                errors.append(tool_name)
+                return
+
+            started_cards.append(card)
+            print(f'[start-project] started {tool_name} ({mcp_id})')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
+            }})
+
+            # After successful start, query info() to get resolved topic_out.
+            try:
+                info_req = MCPCallRequest(tool=tool_name, arguments={'action': 'info', 'instance_id': card_id})
+                info_result = await mcp_call_tool(mcp_id, info_req)
+                if info_result.get('code') == 200:
+                    data = info_result.get('data')
+                    # Parse MCP JSON-RPC content format: [{"type":"text","text":"..."}]
+                    if isinstance(data, list) and data:
+                        text = data[0].get('text', '{}') if isinstance(data[0], dict) else '{}'
+                        try:
+                            data = _json.loads(text)
+                        except Exception:
+                            data = {}
+                    elif isinstance(data, str):
+                        try:
+                            data = _json.loads(data)
+                        except Exception:
+                            data = {}
+                    if isinstance(data, dict):
+                        topic_out = data.get('topic_out', [])
+                        if (
+                            isinstance(topic_out, list)
+                            and topic_out
+                            and all(isinstance(topic, dict) for topic in topic_out)
+                        ):
+                            resolved_topics[card_id] = topic_out
+                            # Register resolved topics so WebSocket relay works
+                            from api.inspection import register_topic_internal
+                            for tp in topic_out:
+                                if tp.get('topic') and tp.get('format'):
+                                    await register_topic_internal(tp['topic'], tp['format'], mcp_id)
+            except Exception:
+                pass  # info() failure is non-fatal
+        except fastapi.HTTPException as error:
+            # HTTPException paths are rejected by Core before a Driver call.
+            if card in attempted_cards:
+                attempted_cards.remove(card)
+            detail = error.detail if isinstance(error.detail, dict) else {}
+            if (
+                error.status_code == 409
+                and detail.get('code') == 'teleop_command_blocked'
+            ):
+                teleop_conflicts.append(detail)
+            message = detail.get('code') or str(error.detail)[:100]
+            print(f'[start-project] failed {tool_name}: {message}')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name,
+                'mcp_id': mcp_id,
+                'status': 'error',
+                'message': message,
+            }})
+            errors.append(tool_name)
         except Exception as e:
             print(f'[start-project] failed {tool_name}: {e}')
             await push_event({'type': 'project_start_item', 'payload': {
@@ -286,54 +760,220 @@ async def _do_start_project():
             return topics[0], []
         return '', []
 
-    # Phase 1: start sources (no input_topic needed) and collect their topic_out
-    for card in sources:
-        await _start_and_resolve(card)
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        # Phase 1: start sources (no input_topic needed) and collect their topic_out
+        for card in sources:
+            await _start_and_resolve(card)
 
-    # Phase 2: start processors with resolved input_topic from sources
-    for card in processors:
-        input_topic, input_topics = _resolve_input_topic(card['id'])
-        await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
+        # Phase 2: start processors with resolved input_topic from sources
+        for card in processors:
+            input_topic, input_topics = _resolve_input_topic(card['id'])
+            await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
+    except asyncio.CancelledError as error:
+        cancellation = error
+        errors.append('project_start_cancelled')
+    except Exception as error:
+        print(f'[start-project] orchestration failed: {error}')
+        errors.append('project_orchestration')
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
         print(f'[start-project] {len(errors)} cards failed ({", ".join(errors)}), rolling back')
-        await push_event({'type': 'project_start_done', 'payload': {'has_error': True, 'errors': errors}})
-        await _do_stop_project()
-        return False
-
-    # 全部成功 → 标记 running
-    core = config.main.get('core', {})
-    core['project_running'] = True
-    config.main['core'] = core
+        rollback_task = asyncio.create_task(
+            _do_stop_project(
+                cards=attempted_cards,
+                _transition_locked=True,
+            ),
+            name='project-start-rollback',
+        )
+        try:
+            rollback = await _await_project_cleanup(rollback_task)
+        except Exception as error:
+            print(
+                '[start-project] rollback failed: '
+                f'{type(error).__name__}'
+            )
+            rollback = {
+                'errors': ['project_rollback_failed'],
+            }
+        rollback_incomplete = rollback is not True
+        rollback_errors = rollback.get('errors', []) if isinstance(rollback, dict) else []
+        if cancellation is not None:
+            raise cancellation
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True,
+            'errors': errors,
+            'rollback_incomplete': rollback_incomplete,
+            'rollback_errors': rollback_errors,
+        }})
+        detail = (
+            dict(teleop_conflicts[0])
+            if teleop_conflicts
+            else {'code': 'project_start_failed', 'reason': 'driver_start_failed'}
+        )
+        detail.update({
+            'rollback_incomplete': rollback_incomplete,
+            'project_state': 'degraded' if rollback_incomplete else 'stopped',
+            'started_card_ids': [card.get('id', '') for card in started_cards],
+            'attempted_card_ids': [card.get('id', '') for card in attempted_cards],
+            'rollback_errors': rollback_errors,
+        })
+        return {
+            'status_code': 409 if teleop_conflicts else 500,
+            'detail': detail,
+            'errors': errors,
+        }
 
     # 确保 channel adapters 已连接（restart 断开的 adapter）
     from channel.manager import manager as channel_mgr, _get_channel_configs
-    channel_mgr.sync_from_canvas()
-    for ch_cfg in _get_channel_configs():
-        ch_id = ch_cfg.get('id', '')
-        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
-            try:
+    cancellation = None
+    try:
+        channel_mgr.sync_from_canvas()
+        for ch_cfg in _get_channel_configs():
+            ch_id = ch_cfg.get('id', '')
+            if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
                 await channel_mgr.restart_adapter(ch_id)
-            except Exception as e:
-                print(f'[start-project] channel {ch_id} restart failed: {e}')
+    except asyncio.CancelledError as error:
+        cancellation = error
+        errors.append('project_start_cancelled')
+        print('[start-project] channel synchronization cancelled; rolling back')
+    except Exception as error:
+        print(f'[start-project] channel synchronization failed: {error}')
+        errors.append('channel_sync')
+    if errors:
+        rollback_task = asyncio.create_task(
+            _do_stop_project(
+                cards=attempted_cards,
+                _transition_locked=True,
+            ),
+            name='project-channel-rollback',
+        )
+        try:
+            rollback = await _await_project_cleanup(rollback_task)
+        except Exception as error:
+            print(
+                '[start-project] channel rollback failed: '
+                f'{type(error).__name__}'
+            )
+            rollback = {'errors': ['project_channel_rollback_failed']}
+        rollback_incomplete = rollback is not True
+        rollback_errors = rollback.get('errors', []) if isinstance(rollback, dict) else []
+        if cancellation is not None:
+            raise cancellation
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True,
+            'errors': errors,
+            'rollback_incomplete': rollback_incomplete,
+            'rollback_errors': rollback_errors,
+        }})
+        return {
+            'status_code': 500,
+            'detail': {
+                'code': 'project_start_failed',
+                'reason': 'channel_sync_failed',
+                'rollback_incomplete': rollback_incomplete,
+                'project_state': 'degraded' if rollback_incomplete else 'stopped',
+                'started_card_ids': [card.get('id', '') for card in started_cards],
+                'attempted_card_ids': [card.get('id', '') for card in attempted_cards],
+                'rollback_errors': rollback_errors,
+            },
+            'errors': errors,
+        }
+
+    # 全部成功 → 标记 running
+    if not _set_project_state_safely('running', cards=attempted_cards):
+        rollback_task = asyncio.create_task(
+            _do_stop_project(
+                cards=attempted_cards,
+                _transition_locked=True,
+            ),
+            name='project-state-commit-rollback',
+        )
+        try:
+            rollback = await _await_project_cleanup(rollback_task)
+        except Exception as error:
+            print(
+                '[start-project] state-commit rollback failed: '
+                f'{type(error).__name__}'
+            )
+            rollback = {
+                'errors': ['project_state_commit_rollback_failed'],
+            }
+        rollback_incomplete = rollback is not True
+        rollback_errors = (
+            rollback.get('errors', [])
+            if isinstance(rollback, dict)
+            else []
+        )
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True,
+            'errors': ['project_state_commit_failed'],
+            'rollback_incomplete': rollback_incomplete,
+            'rollback_errors': rollback_errors,
+        }})
+        return {
+            'status_code': 500,
+            'detail': {
+                'code': 'project_state_commit_failed',
+                'reason': 'running_state_not_persisted',
+                'rollback_incomplete': rollback_incomplete,
+                'project_state': 'degraded' if rollback_incomplete else 'stopped',
+                'attempted_card_ids': [
+                    card.get('id', '') for card in attempted_cards
+                ],
+                'rollback_errors': rollback_errors,
+            },
+            'errors': ['project_state_commit_failed'],
+        }
 
     # 广播启动完成
     await push_event({'type': 'project_start_done', 'payload': {'has_error': False}})
-    await push_event({'type': 'project_state', 'payload': {'running': True}})
+    await push_event({'type': 'project_state', 'payload': {
+        'running': True,
+        'state': 'running',
+    }})
     print(f'[start-project] done ({len(cards)} cards, all succeeded)')
     return True
 
 
-async def _do_stop_project():
+async def _do_stop_project(*, cards=None, _transition_locked: bool = False):
     """停止所有 canvas cards。"""
+    if not _transition_locked:
+        if _project_transition_lock.locked():
+            return _project_transition_conflict()
+        async with _project_transition_lock:
+            stop_task = asyncio.create_task(
+                _do_stop_project(
+                    cards=cards,
+                    _transition_locked=True,
+                ),
+                name='project-stop-transition',
+            )
+            try:
+                return await asyncio.shield(stop_task)
+            except asyncio.CancelledError as cancellation:
+                await _await_project_cleanup(stop_task)
+                raise cancellation
+
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
 
-    layout = config.main.get('canvas_layout', {})
-    cards = layout.get('cards', [])
+    core = config.main.get('core', {})
+    if (
+        cards is None
+        and not _project_residual_latched
+        and not core.get('project_running', False)
+    ):
+        return True
+    if cards is None:
+        target_cards = _effective_project_cards(core)
+    else:
+        target_cards = cards
+    errors = []
+    teleop_conflicts: list[dict] = []
 
-    for card in cards:
+    for card in target_cards:
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
         card_id = card.get('id', '')
@@ -341,21 +981,101 @@ async def _do_stop_project():
             continue
         try:
             req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
-            await mcp_call_tool(mcp_id, req)
+            result = await mcp_call_tool(mcp_id, req)
+            if _project_tool_ack_error(result):
+                errors.append(tool_name)
+        except fastapi.HTTPException as error:
+            detail = error.detail if isinstance(error.detail, dict) else {}
+            if (
+                error.status_code == 409
+                and detail.get('code') == 'teleop_command_blocked'
+            ):
+                teleop_conflicts.append(detail)
+            errors.append(tool_name)
         except Exception:
-            pass
+            errors.append(tool_name)
 
-    core = config.main.get('core', {})
-    core['project_running'] = False
-    config.main['core'] = core
-    await push_event({'type': 'project_state', 'payload': {'running': False}})
+    if teleop_conflicts:
+        _latch_project_residual(target_cards)
+        state_persisted = _set_project_state_safely(
+            'degraded',
+            cards=target_cards,
+        )
+        await push_event({'type': 'project_state', 'payload': {
+            'running': True,
+            'state': 'degraded',
+        }})
+        detail = dict(teleop_conflicts[0])
+        detail['project_state'] = 'degraded'
+        detail['state_persisted'] = state_persisted
+        return {
+            'status_code': 409,
+            'detail': detail,
+            'errors': errors,
+        }
+    if errors:
+        _latch_project_residual(target_cards)
+        state_persisted = _set_project_state_safely(
+            'degraded',
+            cards=target_cards,
+        )
+        await push_event({'type': 'project_state', 'payload': {
+            'running': True,
+            'state': 'degraded',
+        }})
+        return {
+            'status_code': 500,
+            'detail': {
+                'code': 'project_stop_failed',
+                'reason': 'driver_stop_failed',
+                'project_state': 'degraded',
+                'state_persisted': state_persisted,
+            },
+            'errors': errors,
+        }
+
+    if not _set_project_state_safely('stopped'):
+        _latch_project_residual(target_cards)
+        return {
+            'status_code': 500,
+            'detail': {
+                'code': 'project_state_persist_failed',
+                'reason': 'drivers_stopped_but_state_not_persisted',
+                'project_state': 'unknown',
+                'state_persisted': False,
+            },
+            'errors': ['project_state_persist_failed'],
+        }
+    _clear_project_residual()
+    await push_event({'type': 'project_state', 'payload': {
+        'running': False,
+        'state': 'stopped',
+    }})
     print('[stop-project] done')
+    return True
+
+
+class ProjectStartRequest(BaseModel):
+    session_id: str
+    layout_revision: int
 
 
 @router.post('/start-project')
-async def api_start_project():
-    success = await _do_start_project()
-    if success is False:
+async def api_start_project(req: ProjectStartRequest):
+    success = await _do_start_project(
+        editor_session_id=req.session_id,
+        expected_layout_revision=req.layout_revision,
+    )
+    if isinstance(success, dict):
+        return fastapi.responses.JSONResponse(
+            status_code=success.get('status_code', 500),
+            content={
+                'ok': False,
+                'detail': success.get('detail', 'Project start failed'),
+                'errors': success.get('errors', []),
+            },
+        )
+    if success is not True:
         return fastapi.responses.JSONResponse(
             status_code=500,
             content={'ok': False, 'detail': '部分设备启动失败，已回滚'}
@@ -365,7 +1085,21 @@ async def api_start_project():
 
 @router.post('/stop-project')
 async def api_stop_project():
-    await _do_stop_project()
+    success = await _do_stop_project()
+    if isinstance(success, dict):
+        return fastapi.responses.JSONResponse(
+            status_code=success.get('status_code', 500),
+            content={
+                'ok': False,
+                'detail': success.get('detail', 'Project stop failed'),
+                'errors': success.get('errors', []),
+            },
+        )
+    if success is not True:
+        return fastapi.responses.JSONResponse(
+            status_code=500,
+            content={'ok': False, 'detail': '部分设备停止失败'},
+        )
     return {'ok': True}
 
 
@@ -376,10 +1110,13 @@ class ProjectRunningRequest(BaseModel):
 
 @router.put('/project-running')
 async def set_project_running(req: ProjectRunningRequest):
-    core = config.main.get('core', {})
-    core['project_running'] = req.running
-    config.main['core'] = core
-    return {'ok': True}
+    raise fastapi.HTTPException(
+        status_code=409,
+        detail={
+            'code': 'project_state_write_forbidden',
+            'reason': 'use start-project or stop-project',
+        },
+    )
 
 
 @router.get('/auto-start')
@@ -478,7 +1215,116 @@ async def config_get():
 
 @router.post('')
 async def config_save(req: ConfigSaveRequest):
+    async with authority_guard.target_mutation_lock:
+        return await _config_save_locked(req)
+
+
+async def _config_save_locked(req: ConfigSaveRequest):
     services = config.main.get('services', {})
+
+    # Build and validate the complete MCP proposal before writing any config or
+    # replacing the live LLM client.  A rejected save must be a true zero-write.
+    current_mcp_list = services.get('mcp', [])
+    current_mcp_list = current_mcp_list if isinstance(current_mcp_list, list) else []
+    existing_mcps = {
+        m.get('id'): m for m in current_mcp_list if isinstance(m, dict)
+    }
+    new_mcps = [
+        {
+            'id':          m.id or f'mcp-{int(time.time())}',
+            'name':        m.name,
+            'transport':   m.transport,
+            'url':         m.url,
+            'render_hint': m.render_hint,
+            'depends_on':  m.depends_on,
+            'topic_in':    m.topic_in if m.topic_in else existing_mcps.get(m.id, {}).get('topic_in', []),
+            'topic_out':   m.topic_out if m.topic_out else existing_mcps.get(m.id, {}).get('topic_out', []),
+            **({
+                key: existing_mcps[m.id][key]
+                for key in (
+                    'authority_binding_error', 'authority_binding_required',
+                    'authority_domain', 'category', 'credential_binding',
+                    'pending_authority_domain',
+                    'reported_robot_id', 'resources', 'server_name', 'tools',
+                    'trust_state',
+                )
+                if m.id in existing_mcps and key in existing_mcps[m.id]
+            }),
+        }
+        for m in req.mcp_list
+    ]
+    new_ids = [m.get('id', '') for m in new_mcps]
+    if len(new_ids) != len(set(new_ids)):
+        raise fastapi.HTTPException(status_code=409, detail='Duplicate MCP id')
+
+    # A target change invalidates the old capability snapshot immediately.
+    # Apply this before binding validation so a retargeted authority root cannot
+    # retain an actuator proof that belongs to its previous endpoint.
+    changed_targets = []
+    for target in new_mcps:
+        previous = existing_mcps.get(target.get('id'))
+        if previous and (
+            previous.get('url') != target.get('url')
+            or previous.get('transport', 'http') != target.get('transport', 'http')
+        ):
+            target['tools'] = []
+            target['resources'] = []
+            target['server_name'] = ''
+            target['capability_refresh_required'] = True
+            changed_targets.append(target.get('id', ''))
+
+    mutation_error = await _project_target_mutation_error(
+        current_mcp_list,
+        new_mcps,
+    )
+    if mutation_error is not None:
+        raise fastapi.HTTPException(status_code=409, detail=mutation_error)
+
+    missing_roots = [
+        {
+            'mcp_id': m.get('id', ''),
+            'root_mcp_id': root_id,
+        }
+        for m in new_mcps
+        for root_id in _authority_roots(m)
+        if root_id and root_id != m.get('id') and root_id not in new_ids
+    ]
+    if missing_roots:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail={
+                'code': 'authority_binding_invalid',
+                'reason': 'authority_root_would_be_removed',
+                'bindings': missing_roots,
+            },
+        )
+    from api.mcp_manage import _authority_binding_problem
+    binding_problems = []
+    for target in new_mcps:
+        for root_id in _authority_roots(target):
+            if root_id == target.get('id'):
+                continue
+            roots = [root for root in new_mcps if root.get('id') == root_id]
+            problem = (
+                'authority_root_not_unique'
+                if len(roots) != 1
+                else _authority_binding_problem(target, roots[0], root_id)
+            )
+            if problem is not None:
+                binding_problems.append({
+                    'mcp_id': target.get('id', ''),
+                    'root_mcp_id': root_id,
+                    'reason': problem,
+                })
+    if binding_problems:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail={
+                'code': 'authority_binding_invalid',
+                'reason': 'authority_binding_would_be_invalidated',
+                'bindings': binding_problems,
+            },
+        )
 
     # LLM
     existing_key = services.get('llm', {}).get('key', '')
@@ -490,7 +1336,8 @@ async def config_save(req: ConfigSaveRequest):
         'think_mode': req.services.llm.think_mode,
     }
 
-    # Sync to client.llm (operational LLM config)
+    # Stage client.llm; persistence and the runtime swap happen only after all
+    # MCP/authority/project validation above has succeeded.
     client_cfg = config.main.get('client', {})
     client_cfg['llm'] = [{
         'url':   services['llm']['url'],
@@ -498,11 +1345,6 @@ async def config_save(req: ConfigSaveRequest):
         'model': services['llm']['model'],
         'think_mode': services['llm']['think_mode'],
     }]
-    config.main['client'] = client_cfg
-    # Reinitialize the LLM client with new config
-    import client as client_mod
-    client_mod.llm = client_mod.llm.__class__()
-
     # TTS / VAD / ASR
     existing_tts_key = services.get('tts', {}).get('api_key', '')
     new_tts_key = req.services.tts.api_key if (req.services.tts.api_key and req.services.tts.api_key != '****') else existing_tts_key
@@ -527,31 +1369,11 @@ async def config_save(req: ConfigSaveRequest):
         'language':   asr.language,
     }
 
-    # MCP — topic_in/topic_out from request take priority (user may have updated them via dep selection);
-    # server_name/tools/resources fall back to DB-persisted values.
-    existing_mcps = {m.get('id'): m for m in services.get('mcp', [])}
-    services['mcp'] = [
-        {
-            'id':          m.id or f'mcp-{int(time.time())}',
-            'name':        m.name,
-            'transport':   m.transport,
-            'url':         m.url,
-            'render_hint': m.render_hint,
-            'depends_on':  m.depends_on,
-            'topic_in':    m.topic_in  if m.topic_in  else existing_mcps.get(m.id, {}).get('topic_in',  []),
-            'topic_out':   m.topic_out if m.topic_out else existing_mcps.get(m.id, {}).get('topic_out', []),
-            **({k: existing_mcps[m.id][k]
-                for k in ('server_name', 'tools', 'resources')
-                if m.id in existing_mcps and k in existing_mcps[m.id]}),
-        }
-        for m in req.mcp_list
-    ]
+    services['mcp'] = new_mcps
 
     # Inspector — only persist if non-empty (URL is auto-detected from running container)
     if req.services.inspector.url:
         services['inspector'] = {'url': req.services.inspector.url}
-
-    config.main['services'] = services
 
     # Search config → desktop_tools section
     dt = config.main.get('desktop_tools', {})
@@ -563,12 +1385,31 @@ async def config_save(req: ConfigSaveRequest):
         'base_url': req.services.search.base_url,
         'api_key':  new_search_key,
     }
-    config.main['desktop_tools'] = dt
-
     # Mark configured
     core = config.main.get('core', {})
     core['configured'] = True
-    config.main['core'] = core
+    import client as client_mod
+
+    # Validate and fully construct the next runtime before durable commit.  An
+    # invalid URL/credential must leave both DB and the live route untouched.
+    candidate_llm = client_mod.llm.__class__(configs=client_cfg['llm'])
+    try:
+        config.main.set_many({
+            'services': services,
+            'client': client_cfg,
+            'desktop_tools': dt,
+            'core': core,
+        })
+    except Exception:
+        await candidate_llm.aclose()
+        raise
+    client_mod.llm = candidate_llm
+
+    if changed_targets:
+        import mcp_client
+
+        for mcp_id in changed_targets:
+            mcp_client.registry.pop(mcp_id, None)
 
     return {'code': 200, 'message': 'saved'}
 
@@ -703,7 +1544,7 @@ async def config_test_asr_audio(
 
 
 def _asr_transcribe_sync(cfg: dict, wav_bytes: bytes) -> str:
-    import requests, base64, json as _json, time as _time
+    import requests, base64, json as _json
     provider = cfg.get('provider', 'openai')
 
     if provider in ('openai', 'openai_omni'):
@@ -957,5 +1798,3 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
-
-

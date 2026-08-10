@@ -670,14 +670,31 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     });
 
     // Save to per-tool API
+    let saveResult = null;
     try {
       const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
+      saveResult = await resp.json().catch(() => null);
+      if (saveResult?.data?.saved) {
+        _toolConfigs[configKey] = values;
+      }
       if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+        if (saveResult?.data?.saved) {
+          const card = _scroll.querySelector(`.sidebar-tool-card[data-mcp-id="${mcpId}"][data-tool-name="${toolName}"]`);
+          const statusEl = card?.querySelector('.tool-card-config-status');
+          if (statusEl) {
+            statusEl.className = 'tool-card-config-status configured';
+            statusEl.textContent = '⚠';
+            statusEl.title = 'Saved in Core; Driver apply failed';
+          }
+        }
+        const message = saveResult?.data?.saved
+          ? '配置已保存到 Core，但 Driver 应用失败；请检查 Driver 状态后重试。'
+          : `配置保存失败 (HTTP ${resp.status})`;
+        alert(message);
         return;
       }
     } catch (err) {
@@ -696,8 +713,14 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       if (statusEl) {
         statusEl.className = 'tool-card-config-status configured';
         statusEl.textContent = '✓';
-        statusEl.title = 'Configured';
+        statusEl.title = saveResult?.data?.deferred
+          ? 'Saved locally; apply deferred while teleoperation is active'
+          : 'Configured';
       }
+    }
+
+    if (saveResult?.data?.deferred) {
+      alert('配置已保存到 Core；当前遥操会话占用机器人，尚未下发到 Driver。');
     }
 
     close();
@@ -956,14 +979,22 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
       else values[input.dataset.key] = v;
     });
 
+    let saveResult = null;
     try {
       const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
+      saveResult = await resp.json().catch(() => null);
+      if (saveResult?.data?.saved) {
+        _toolConfigs[configKey] = values;
+      }
       if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+        const message = saveResult?.data?.saved
+          ? '实例配置已保存到 Core，但 Driver 应用失败；请检查 Driver 状态后重试。'
+          : `配置保存失败 (HTTP ${resp.status})`;
+        alert(message);
         return;
       }
     } catch (err) {
@@ -973,6 +1004,9 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
     }
 
     _toolConfigs[configKey] = values;
+    if (saveResult?.data?.deferred) {
+      alert('实例配置已保存到 Core；当前遥操会话占用机器人，尚未下发到 Driver。');
+    }
     close();
   };
 

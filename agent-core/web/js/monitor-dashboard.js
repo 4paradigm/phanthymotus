@@ -16,6 +16,7 @@ import { SkeletonRenderer } from './renderers/skeleton.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer } from './renderers/camera.js';
 import { HTMSGRenderer }    from './renderers/htmsg.js';
+import { wsUrl as authenticatedWsUrl } from './auth.js';
 
 const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
@@ -238,8 +239,7 @@ function _applyPlacement(el, col, row, colSpan, rowSpan) {
 }
 
 function _connectWs(topicPath, format, renderer) {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsUrl = `${proto}://${location.host}/ws/bus${topicPath}`;
+  const wsUrl = authenticatedWsUrl(`/ws/bus${topicPath}`);
 
   function create() {
     const ws = new WebSocket(wsUrl);

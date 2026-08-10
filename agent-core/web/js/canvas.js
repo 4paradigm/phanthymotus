@@ -14,6 +14,7 @@
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
+import { wsUrl as authenticatedWsUrl } from './auth.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -24,11 +25,14 @@ let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
 
 // ── Editor Lock ──────────────────────────────────────────────────────────────
-let _sessionId = localStorage.getItem('canvas_session_id');
-if (!_sessionId) {
-  _sessionId = 'sess-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  localStorage.setItem('canvas_session_id', _sessionId);
-}
+const _CANVAS_SESSION_KEY = 'canvas_session_id';
+// Never reuse a sessionStorage value: duplicated tabs inherit it and would
+// otherwise share editor authority. The stored value is diagnostic only.
+const _sessionId = globalThis.crypto?.randomUUID?.()
+  || ('sess-' + Date.now().toString(36) + Math.random().toString(36).slice(2));
+try {
+  sessionStorage.setItem(_CANVAS_SESSION_KEY, _sessionId);
+} catch { /* document-lifetime identity is sufficient */ }
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
 
@@ -60,6 +64,9 @@ let _draggingConn = null; // {fromCardId, fromPortEl, format, topic, tempPath, t
 
 // Project run state
 let _projectRunning = false;
+let _projectState = 'stopped';
+let _projectTransitioning = false;
+let _layoutRevision = 0;
 
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
@@ -117,6 +124,9 @@ export async function initCanvas(initialMcps) {
   try {
     const layoutRes = await fetch('/api/canvas/layout');
     const layoutJson = await layoutRes.json();
+    _layoutRevision = Number.isInteger(layoutJson.data?.revision)
+      ? layoutJson.data.revision
+      : 0;
 
     const saved = layoutJson.data?.cards || [];
     for (const c of saved) {
@@ -168,12 +178,10 @@ export async function initCanvas(initialMcps) {
 
   // Restore project running state from backend
   try {
-    const runRes = await fetch('/api/config/project-running');
-    const runData = await runRes.json();
-    if (runData.running) {
-      _projectRunning = true;
-      _syncProjectBtn();
-      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+    const runData = await _fetchProjectStateSnapshot();
+    _applyProjectState(runData.running, runData.state);
+    if (runData.state === 'degraded') {
+      _logActivity('error', '项目处于 degraded：部分组件可能仍在运行，请执行停止。');
     }
   } catch { /* ignore */ }
 
@@ -181,28 +189,18 @@ export async function initCanvas(initialMcps) {
   const { onMotusEvent } = await import('./motus-stream.js');
   onMotusEvent(null, (event) => {
     if (event.type === 'project_state') {
-      const running = event.payload?.running;
-      if (running !== _projectRunning) {
-        _projectRunning = running;
-        _syncProjectBtn();
-        document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-          btn.classList.toggle('locked', !_projectRunning);
-        });
-      }
+      _applyProjectState(event.payload?.running, event.payload?.state);
     }
   });
 
   // Re-sync state when tab becomes visible (fallback for WS disconnect)
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
-      fetch('/api/config/project-running').then(r => r.json()).then(d => {
-        if (d.running !== _projectRunning) {
-          _projectRunning = d.running;
-          _syncProjectBtn();
-          document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-            btn.classList.toggle('locked', !_projectRunning);
-          });
-        }
+      const refresh = _projectState === 'unknown'
+        ? _reconcileAmbiguousProjectStart()
+        : _fetchProjectStateSnapshot();
+      refresh.then(d => {
+        if (d && !d.transitioning) _applyProjectState(d.running, d.state);
       }).catch(() => {});
     }
   });
@@ -442,7 +440,13 @@ function _setupControlButtons() {
   });
 
   document.getElementById('canvas-project-toggle')?.addEventListener('click', () => {
-    _projectRunning ? _stopProject() : _startProject();
+    if (_projectRunning) {
+      _stopProject();
+    } else if (!_isEditor) {
+      _showToast('请先获取画布编辑权，再启动当前所见布局');
+    } else {
+      _startProject();
+    }
   });
   _syncProjectBtn();
 
@@ -1518,8 +1522,28 @@ function _autoStopOnDisconnect(cardId, portIdx, topic) {
 }
 
 async function _startProject() {
-  // Save canvas layout first (so backend reads latest topology)
-  await _saveLayout();
+  if (_projectTransitioning) return;
+  if (!_isEditor) {
+    _showToast('请先获取画布编辑权，再启动当前所见布局');
+    return;
+  }
+  _projectTransitioning = true;
+  _syncProjectBtn();
+  try {
+    await _startProjectOnce();
+  } catch (error) {
+    _logActivity('error', `启动失败: ${error.message}`);
+  } finally {
+    _projectTransitioning = false;
+    _syncProjectBtn();
+  }
+}
+
+async function _startProjectOnce() {
+  // An editor must receive an explicit save acknowledgement before any start
+  // side effect. Otherwise the backend could start an older, invisible layout.
+  if (!_isEditor) throw new Error('请先获取画布编辑权');
+  await _saveLayout({ strict: true });
 
   // Import motus for event subscription
   const { onMotusEvent, offMotusEvent } = await import('./motus-stream.js');
@@ -1553,46 +1577,111 @@ async function _startProject() {
 
   // 立即启动浏览器麦克风（与 API 调用并行，解决 self-check 时序问题）
   const remoteMicCard = _cards.find(c => c.toolName === 'remote_mic');
-  if (remoteMicCard && !isMicActive()) {
-    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-    toggleMicStream(wsUrl, (active) => {
+  const micWasActive = isMicActive();
+  let micStartPromise = null;
+  if (remoteMicCard && !micWasActive) {
+    micStartPromise = toggleMicStream(authenticatedWsUrl('/ws/mic'), (active) => {
       const micBtn = remoteMicCard.el?.querySelector('.canvas-mic-btn');
       if (micBtn) {
         micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
         micBtn.classList.toggle('recording', active);
       }
-    }).catch(err => _logActivity('warn', `麦克风启动失败: ${err.message}`));
+    });
+    micStartPromise.catch(err => _logActivity('warn', `麦克风启动失败: ${err.message}`));
   }
 
   // Call unified backend start-project
   try {
-    const res = await fetch('/api/config/start-project', { method: 'POST' });
+    const res = await fetch('/api/config/start-project', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: _sessionId,
+        layout_revision: _layoutRevision,
+      }),
+    });
     if (res.ok) {
-      _projectRunning = true;
-      _syncProjectBtn();
-      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+      _applyProjectState(true, 'running');
       _logActivity('project', '智能控制已开启');
     } else {
       const data = await res.json().catch(() => ({}));
-      _logActivity('error', `启动失败: ${data.detail || res.status}`);
+      const detail = data.detail;
+      const message = detail?.code === 'teleop_command_blocked'
+        ? '遥操会话正在占用该机器人，智能控制启动已被阻止'
+        : (typeof detail === 'string' ? detail : detail?.code || res.status);
+      if (detail?.project_state === 'degraded') {
+        _applyProjectState(true, 'degraded');
+      }
+      if (detail?.rollback_incomplete) {
+        _logActivity('error', `启动回滚不完整：${(detail.rollback_errors || []).join(', ') || '仍有组件可能运行'}`);
+      }
+      _logActivity('error', `启动失败: ${message}`);
+      await _cleanupMicAfterFailedStart(remoteMicCard, micWasActive, micStartPromise);
       offMotusEvent(_onEvent);
       if (modal) {
         _showStartupError(modal);
       }
     }
   } catch (e) {
-    _logActivity('error', `启动失败: ${e.message}`);
     offMotusEvent(_onEvent);
     if (modal) modal.close();
+
+    // The request may have reached Core even when the browser did not receive
+    // the HTTP response. Reconcile before deciding what the Start button means.
+    const snapshot = await _reconcileAmbiguousProjectStart();
+    if (snapshot) {
+      _applyProjectState(snapshot.running, snapshot.state);
+      if (!snapshot.running || snapshot.state === 'degraded') {
+        await _cleanupMicAfterFailedStart(remoteMicCard, micWasActive, micStartPromise);
+      }
+      if (snapshot.state === 'running') {
+        _logActivity('warn', '启动响应中断，但已从 Core 确认智能控制正在运行');
+      } else if (snapshot.state === 'degraded') {
+        _logActivity('error', '启动响应中断，Core 报告仍有残留控制，请执行停止');
+      } else {
+        _logActivity('error', `启动失败: ${e.message}（Core 已确认未运行）`);
+      }
+    } else {
+      // Unknown is deliberately represented as running=true: the next click
+      // can only issue Stop, never a second Start against uncertain hardware.
+      _applyProjectState(true, 'unknown');
+      await _cleanupMicAfterFailedStart(remoteMicCard, micWasActive, micStartPromise);
+      _logActivity('error', `启动响应中断且无法确认状态: ${e.message}；请尝试停止控制`);
+    }
   }
 }
 
-function _stopProject() {
-  _projectRunning = false;
+async function _stopProject() {
+  if (_projectTransitioning) return;
+  _projectTransitioning = true;
   _syncProjectBtn();
-  document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.add('locked'));
-  // Auto-stop mic stream
+  try {
+    await _stopProjectOnce();
+  } finally {
+    _projectTransitioning = false;
+    _syncProjectBtn();
+  }
+}
+
+async function _stopProjectOnce() {
+  try {
+    const res = await fetch('/api/config/stop-project', { method: 'POST' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const detail = data.detail;
+      const message = detail?.code === 'teleop_command_blocked'
+        ? '遥操会话正在占用该机器人，智能控制停止命令未执行'
+        : (typeof detail === 'string' ? detail : detail?.code || res.status);
+      _logActivity('error', `停止失败: ${message}`);
+      return;
+    }
+  } catch (error) {
+    _logActivity('error', `停止失败: ${error.message}`);
+    return;
+  }
+
+  _applyProjectState(false, 'stopped');
+  // Auto-stop mic stream only after the backend confirms project shutdown.
   for (const card of _cards) {
     if (card.toolName === 'remote_mic' && isMicActive()) {
       toggleMicStream('', () => {}).catch(() => {});
@@ -1603,16 +1692,88 @@ function _stopProject() {
       }
     }
   }
-  fetch('/api/config/stop-project', { method: 'POST' }).catch(() => {});
   _logActivity('project', '智能控制已停止');
+}
+
+async function _cleanupMicAfterFailedStart(remoteMicCard, micWasActive, micStartPromise) {
+  if (micStartPromise) await micStartPromise.catch(() => {});
+  if (!micWasActive && isMicActive()) {
+    await toggleMicStream('', () => {}).catch(() => {});
+  }
+  const micBtn = remoteMicCard?.el?.querySelector('.canvas-mic-btn');
+  if (micBtn && !isMicActive()) {
+    micBtn.textContent = '\uD83C\uDF99 开始录音';
+    micBtn.classList.remove('recording');
+  }
+}
+
+async function _fetchProjectStateSnapshot() {
+  const response = await fetch('/api/config/project-running', { cache: 'no-store' });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const snapshot = await response.json();
+  const validState = snapshot?.state === 'stopped'
+    || snapshot?.state === 'running'
+    || snapshot?.state === 'degraded';
+  const stateMatchesRunning = snapshot?.running === (snapshot?.state !== 'stopped');
+  if (
+    typeof snapshot?.running !== 'boolean'
+    || typeof snapshot?.transitioning !== 'boolean'
+    || !validState
+    || !stateMatchesRunning
+  ) {
+    throw new Error('Core returned an invalid project state');
+  }
+  return snapshot;
+}
+
+async function _reconcileAmbiguousProjectStart() {
+  const deadline = Date.now() + 8000;
+  let observedTransition = false;
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await _fetchProjectStateSnapshot();
+      observedTransition = observedTransition || snapshot.transitioning;
+      if (!snapshot.transitioning) {
+        // A running/degraded state proves that a start reached Core. A stopped
+        // state is authoritative only after this client observed the matching
+        // transition; otherwise a delayed POST could still arrive after GET.
+        if (snapshot.running || observedTransition) return snapshot;
+      }
+    } catch { /* retry until the safety deadline */ }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return null;
+}
+
+function _applyProjectState(running, state) {
+  _projectRunning = Boolean(running);
+  _projectState = state || (_projectRunning ? 'running' : 'stopped');
+  _syncProjectBtn();
+  document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+    btn.classList.toggle('locked', _projectState !== 'running');
+  });
 }
 
 function _syncProjectBtn() {
   const btn = document.getElementById('canvas-project-toggle');
   if (!btn) return;
-  btn.textContent = _projectRunning ? '停止智能控制' : '开启智能控制';
-  btn.title = _projectRunning ? '停止智能控制' : '开启智能控制';
+  btn.textContent = _projectTransitioning
+    ? '处理中…'
+    : (_projectState === 'unknown'
+      ? '状态未知—尝试停止'
+      : (_projectState === 'degraded'
+      ? '停止残留控制'
+      : (_projectRunning ? '停止智能控制' : '开启智能控制')));
+  btn.title = _projectTransitioning
+    ? '项目状态切换中'
+    : (_projectState === 'unknown'
+      ? 'Core 状态未知；只允许尝试停止'
+      : (_projectRunning
+        ? '停止智能控制'
+        : (_isEditor ? '开启当前所见布局' : '请先获取画布编辑权')));
+  btn.disabled = _projectTransitioning || (!_projectRunning && !_isEditor);
   btn.classList.toggle('running', _projectRunning);
+  btn.classList.toggle('degraded', _projectState === 'degraded' || _projectState === 'unknown');
 }
 
 function _initAutoStartToggle() {
@@ -1997,8 +2158,8 @@ function _debouncedSave() {
   _saveTimer = setTimeout(_saveLayout, 400);
 }
 
-async function _saveLayout() {
-  if (!_isEditor) return;  // Only editor can save
+async function _saveLayout({ strict = false } = {}) {
+  if (!_isEditor) return true;  // Only editor can save
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
@@ -2013,15 +2174,29 @@ async function _saveLayout() {
     const resp = await fetch('/api/canvas/layout', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
+      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId, revision: _layoutRevision }),
     });
+    const result = await resp.json().catch(() => null);
     if (resp.status === 403) {
       // Lost edit permission — reload layout from server
       _isEditor = false;
       _updateEditorUI();
       await _reloadLayout();
     }
-  } catch { /* silent */ }
+    if (!resp.ok || result?.code !== 200) {
+      const reason = result?.detail?.code || result?.message || `HTTP ${resp.status}`;
+      throw new Error(`画布保存未确认：${reason}`);
+    }
+    const savedRevision = result?.data?.revision;
+    if (!Number.isInteger(savedRevision) || savedRevision <= _layoutRevision) {
+      throw new Error('画布保存未返回有效 revision');
+    }
+    _layoutRevision = savedRevision;
+    return true;
+  } catch (error) {
+    if (strict) throw error;
+    return false;
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2064,6 +2239,7 @@ function _updateEditorUI() {
     bar.querySelector('#canvas-claim-btn').onclick = _claimEdit;
     _setCanvasReadonly(true);
   }
+  _syncProjectBtn();
 }
 
 function _setCanvasReadonly(readonly) {
@@ -2082,8 +2258,16 @@ async function _claimEdit() {
     });
     const data = await resp.json();
     if (resp.ok) {
-      _isEditor = true;
       _currentEditor = _sessionId;
+      _isEditor = false;
+      if (!await _reloadLayout()) {
+        await fetch('/api/canvas/release-edit', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: _sessionId }),
+        }).catch(() => {});
+        _currentEditor = null;
+        _showToast('无法刷新最新画布，编辑权已释放');
+      }
     } else {
       _currentEditor = data.editor || null;
     }
@@ -2124,6 +2308,10 @@ async function _reloadLayout() {
   try {
     const layoutRes = await fetch('/api/canvas/layout');
     const layoutJson = await layoutRes.json();
+    if (!layoutRes.ok || layoutJson?.code !== 200) return false;
+    _layoutRevision = Number.isInteger(layoutJson.data?.revision)
+      ? layoutJson.data.revision
+      : 0;
     // Clear current cards
     for (const c of _cards) c.el.remove();
     _cards = [];
@@ -2140,15 +2328,22 @@ async function _reloadLayout() {
     _syncEmptyState();
     // Update editor info
     _currentEditor = layoutJson.editor || null;
-    if (_currentEditor === _sessionId) _isEditor = true;
+    _isEditor = _currentEditor === _sessionId;
     _updateEditorUI();
-  } catch { /* silent */ }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Release on page close
 window.addEventListener('beforeunload', () => {
   if (_isEditor) {
-    navigator.sendBeacon('/api/canvas/release-edit', JSON.stringify({ session_id: _sessionId }));
+    const payload = new Blob(
+      [JSON.stringify({ session_id: _sessionId })],
+      { type: 'application/json' },
+    );
+    navigator.sendBeacon('/api/canvas/release-edit', payload);
   }
 });
 

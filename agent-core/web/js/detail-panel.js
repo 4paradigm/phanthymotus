@@ -16,6 +16,7 @@ import { SkeletonRenderer } from './renderers/skeleton.js';
 import { CameraRenderer, DepthRenderer } from './renderers/camera.js';
 import { HTMSGRenderer }    from './renderers/htmsg.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
+import { wsUrl as authenticatedWsUrl } from './auth.js';
 
 const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 
@@ -46,10 +47,7 @@ export function showTopicDetail(topicPath, format) {
   _renderer.mount(body, 'detail');
 
   // Connect WebSocket — /ws/bus/* is proxied through agent-core
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsHost = location.host;
-  const wsUrl = `${proto}://${wsHost}/ws/bus${topicPath}`;
-  _ws = new WebSocket(wsUrl);
+  _ws = new WebSocket(authenticatedWsUrl(`/ws/bus${topicPath}`));
   _ws.binaryType = 'arraybuffer';
   _ws.onmessage = (ev) => {
     if (ev.data instanceof ArrayBuffer) {

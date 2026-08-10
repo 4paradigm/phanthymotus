@@ -268,6 +268,7 @@ html, body {
 /* Mode toggle icons */
 .mode-toggle-btn { display: flex; align-items: center; gap: 4px; }
 .mode-toggle-btn svg { opacity: 0.7; flex-shrink: 0; }
+.topbar-teleop-link { text-decoration: none; }
 
 #btn-monitor.monitor-active {
   background: var(--green-bg);
@@ -6790,4 +6791,3 @@ html, body {
   color: var(--text-secondary);
   white-space: nowrap;
 }
-

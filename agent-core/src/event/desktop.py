@@ -36,6 +36,52 @@ _PYTHON_ALLOWED_MODULES = {
     'dataclasses', 'csv', 'io', 'os.path',
 }
 
+_PROTECTED_FILE_SUFFIXES = {'.key', '.pem', '.p12', '.pfx'}
+
+
+def _path_is_protected(p: pathlib.Path) -> bool:
+    """Keep deployment credentials and the runtime config DB out of file tools."""
+
+    name = p.name.lower()
+    if name == '.env' or name.startswith('.env.'):
+        return True
+    if (
+        name in {'id_rsa', 'id_ed25519', 'credentials.json', 'secrets.json'}
+        or 'privkey' in name
+        or 'private-key' in name
+    ):
+        return True
+    if p.suffix.lower() in _PROTECTED_FILE_SUFFIXES:
+        return True
+
+    protected_paths = {
+        pathlib.Path('/opt/phanthy-motus/.env'),
+        pathlib.Path('.env'),
+    }
+    tls_key_path = os.environ.get('MOTUS_TLS_KEY_FILE', '').strip()
+    if tls_key_path:
+        protected_paths.add(pathlib.Path(tls_key_path))
+    try:
+        config_db = pathlib.Path(config.DB_PATH).resolve()
+        protected_paths.update({
+            config_db,
+            pathlib.Path(f'{config_db}-shm'),
+            pathlib.Path(f'{config_db}-wal'),
+            pathlib.Path(f'{config_db}-journal'),
+        })
+    except (OSError, RuntimeError, TypeError):
+        pass
+    for protected in protected_paths:
+        try:
+            protected = protected.resolve()
+            if p == protected:
+                return True
+            if p.exists() and protected.exists() and os.path.samefile(p, protected):
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
 
 def _resolve_path(path: str) -> pathlib.Path:
     """Resolve path, default relative to /work."""
@@ -47,6 +93,12 @@ def _resolve_path(path: str) -> pathlib.Path:
 
 def _check_path_allowed(p: pathlib.Path, dirs: list[str] | None = None) -> str | None:
     """Return error message if path is not within allowed dirs, else None."""
+    try:
+        p = p.resolve()
+    except (OSError, RuntimeError):
+        return f'Access denied: cannot safely resolve path {p}'
+    if _path_is_protected(p):
+        return f'Access denied: {p} is a protected credential or runtime config path'
     allowed = dirs or _ALLOWED_DIRS
     s = str(p)
     for d in allowed:
@@ -138,8 +190,12 @@ class DesktopTools:
 
         # Build restricted builtins
         import builtins as _builtins
-        safe_builtins = {k: getattr(_builtins, k) for k in dir(_builtins)
-                        if not k.startswith('_') and k not in ('exec', 'eval', 'compile', 'exit', 'quit')}
+        safe_builtins = {
+            k: getattr(_builtins, k)
+            for k in dir(_builtins)
+            if not k.startswith('_')
+            and k not in ('exec', 'eval', 'compile', 'exit', 'quit', 'open')
+        }
 
         original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
 
@@ -324,7 +380,15 @@ class DesktopTools:
             return f'Error: directory not found: {root}'
 
         try:
-            matches = sorted(root.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+            matches = sorted(
+                (
+                    match
+                    for match in root.glob(pattern)
+                    if _check_path_allowed(match) is None
+                ),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
         except Exception as e:
             return f'Error: {e}'
 
@@ -353,40 +417,10 @@ class DesktopTools:
         if err:
             return err
 
-        # Try using grep/rg subprocess for speed
-        cmd_parts = []
-        if os.path.exists('/usr/bin/grep') or os.path.exists('/bin/grep'):
-            cmd_parts = ['grep', '-rn', '--color=never', '-E']
-            if include:
-                cmd_parts.extend(['--include', include])
-            cmd_parts.extend([pattern, str(root)])
-        else:
-            # Fallback: pure Python
-            return await self._grep_python(pattern, root, include)
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd_parts,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            output = stdout.decode('utf-8', errors='replace')
-        except asyncio.TimeoutError:
-            return 'Error: grep timed out after 30s'
-        except Exception as e:
-            return await self._grep_python(pattern, root, include)
-
-        if not output.strip():
-            return f'No matches for pattern "{pattern}" in {root}'
-
-        # Limit output
-        lines = output.splitlines()
-        if len(lines) > 50:
-            result = '\n'.join(lines[:50])
-            result += f'\n\n... ({len(lines) - 50} more matches not shown)'
-            return _truncate(result)
-        return _truncate(output)
+        # A Python traversal makes the per-file protected-path check explicit;
+        # recursive grep subprocesses can otherwise read hidden .env or SQLite
+        # credential stores even when their root directory itself is allowed.
+        return await self._grep_python(pattern, root, include)
 
     async def _grep_python(self, pattern: str, root: pathlib.Path, include: str) -> str:
         """Pure Python grep fallback."""
@@ -400,10 +434,16 @@ class DesktopTools:
 
         def _search_file(fp: pathlib.Path):
             try:
-                text = fp.read_text(encoding='utf-8', errors='ignore')
+                resolved = fp.resolve()
+            except (OSError, RuntimeError):
+                return
+            if _check_path_allowed(resolved) is not None:
+                return
+            try:
+                text = resolved.read_text(encoding='utf-8', errors='ignore')
                 for i, line in enumerate(text.splitlines(), 1):
                     if regex.search(line):
-                        results.append(f'{fp}:{i}: {line.rstrip()}')
+                        results.append(f'{resolved}:{i}: {line.rstrip()}')
                         if len(results) >= max_results:
                             return
             except (OSError, UnicodeDecodeError):
@@ -453,8 +493,7 @@ class DesktopTools:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout),
-                                       headers={'User-Agent': 'Mozilla/5.0 (compatible; AgentBot/1.0)'},
-                                       ssl=False) as resp:
+                                       headers={'User-Agent': 'Mozilla/5.0 (compatible; AgentBot/1.0)'}) as resp:
                     if resp.status >= 400:
                         return f'Error: HTTP {resp.status} {resp.reason}'
                     content_type = resp.headers.get('content-type', '')
@@ -545,7 +584,6 @@ class DesktopTools:
                     json=payload,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
-                    ssl=False,
                 ) as resp:
                     if resp.status == 401:
                         return 'Error: Search API key is invalid (401 Unauthorized)'

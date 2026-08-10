@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>通用遥操作 · PhanthyMotus</title>
+  <link rel="stylesheet" href="/css/teleop.css">
+</head>
+<body>
+  <main class="teleop-shell">
+    <header class="teleop-header">
+      <div>
+        <p class="eyebrow">PHANTHY MOTUS</p>
+        <h1>通用遥操作控制台</h1>
+        <p class="subtitle">可信 Driver、显式 Shadow / Live 会话、OpenXR Capture 与 Quest WebXR fallback</p>
+      </div>
+      <nav class="header-actions" aria-label="页面操作">
+        <a class="button secondary" href="/">返回主界面</a>
+        <button class="button secondary hidden" id="logout-button" type="button">退出登录</button>
+      </nav>
+    </header>
+
+    <section class="notice" id="global-notice" role="status">正在检查登录状态…</section>
+
+    <section class="login-panel hidden" id="login-panel" aria-labelledby="login-title">
+      <h2 id="login-title">登录</h2>
+      <p>请输入 owner、operator 或 viewer token。viewer 只能查看，operator 与 owner 可以管理本标签页明确获取的遥操作会话。</p>
+      <form id="login-form">
+        <label for="token-input">Access token</label>
+        <div class="login-row">
+          <input id="token-input" type="password" autocomplete="current-password" required>
+          <button class="button primary" type="submit">登录</button>
+        </div>
+        <p class="form-error" id="login-error" role="alert"></p>
+      </form>
+    </section>
+
+    <div class="content hidden" id="content">
+      <section class="identity-card" aria-labelledby="identity-title">
+        <div>
+          <p class="section-label" id="identity-title">当前身份</p>
+          <strong id="principal-id">—</strong>
+          <p class="identity-permission" id="principal-permission">—</p>
+          <p class="client-identity">本页 Client ID：<code id="teleop-client-id">—</code></p>
+        </div>
+        <span class="role-badge" id="principal-role">—</span>
+      </section>
+
+      <section class="safety-card" aria-labelledby="safety-title">
+        <div class="safety-icon" aria-hidden="true">S</div>
+        <div>
+          <p class="section-label" id="safety-title">TELEOP AUTHORITY</p>
+          <h2>Shadow 只记录；Live 必须二次明确确认硬件输出</h2>
+          <p>WebXR 能力：<strong id="webxr-support">正在检测安全上下文与 immersive-vr…</strong></p>
+          <p>本页只在用户点击后从 Quest 的 <code>local-floor</code> 读取头部与唯一左右手柄姿态，按当前会话 mode 生成最高 60 Hz 的 RTC frame。只有有效 <code>xr-standard</code> 双 squeeze、先松开、能力声明的运动轴全部归入各自 deadzone、再空挡重握时 deadman 才能为 true，不能预装首帧运动；tracking、输入或 deadman 退化时会发送 fail-safe frame。</p>
+          <p>Core 不解释厂商 SDK、关节顺序、逆解或速度语义。浏览器只采用可信 Driver descriptor 中的 profile、effectors、outputs 与 input bindings；未启用的 base 或 hands 不会出现在 frame 中。任何能力声明的输入缩放只是浏览器侧投影，最终限幅和硬件适配仍由 Driver 负责。</p>
+          <p>Shadow 的 <code>hardware_output=false</code>，只产生 recording 证据。Live 的 <code>hardware_output=true</code>：第一次 Acquire 只创建短期内存 reservation，并停在 <code>awaiting_confirmation</code>，不会调用 Driver、续租或开放 RTC；操作员核对 Robot、Driver、Profile 与 Effectors 后，必须再次点击醒目的 Live 确认按钮，Core 才会 prepare Driver。</p>
+          <p>本切片进入 VR 后头显只显示诊断黑场：没有机器人视频，也没有头显内 HUD。所有 tracking、deadman、sequence 与 Driver dispatch 证据只显示在 2D 镜像页，需要通过 Quest 投屏或桌面浏览器观察。</p>
+          <p>每次页面加载都会生成独立 Client ID，避免复制标签页继承控制权；本页只为自己的已准备会话每 5 秒续一次 Core 所有权租约，Core 倒计时为 15 秒。Pause/HOLD/Release、RTC/XR 断开、reference-space reset、页面或 XR 不可见都会先本地释放 deadman 并关闭 XR 与 RTC。Pause 仍占用机器人；恢复必须先 Release，再重新 Acquire。刷新、RTC 断线或 XR 退出绝不会自动确认 Live、自动恢复、自动重进 VR、自动重连或自动获取会话。</p>
+          <p>Shadow prepare 或 Live 明确确认后，Core 会持久保存一把不含 fence、令牌或浏览器身份的机器人写入锁；等待 Live 确认时不会写这把锁。若 Core 意外退出，重启后的普通执行器命令仍会被拒绝，页面显示“重启安全锁定”；只有 owner 可以请求 Core 读取同一可信 Driver 的状态，并在必要时执行无旧 fence 的 lifecycle stop。只有严格安全证明与锁记录删除都成功后才会开放写入，旧会话始终不会恢复。</p>
+        </div>
+      </section>
+
+      <section class="capture-section hidden" id="capture-panel" aria-labelledby="capture-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">OPENXR CAPTURE</p>
+            <h2 id="capture-title">独立 OpenXR 头显姿态采集设备</h2>
+          </div>
+          <div class="capture-heading-actions">
+            <button class="button secondary" id="capture-refresh-button" type="button">刷新采集设备</button>
+            <button class="button primary" id="capture-pair-button" type="button">生成一次性配对</button>
+          </div>
+        </div>
+        <p class="capture-explanation">PC 标签页始终持有会话与硬件确认权；OpenXR 头显 Capture 只接收当前会话的安全投影并把姿态通过 RTC 直发 Driver。配对、Acquire、Live 确认、Attach、Pause/HOLD 与 Release 都必须在 PC 上手动执行，页面刷新不会自动执行其中任何一步。</p>
+
+        <div class="capture-pair-row">
+          <label for="capture-label">设备标签</label>
+          <input id="capture-label" type="text" maxlength="64" value="OpenXR Headset Capture" autocomplete="off">
+        </div>
+
+        <section class="capture-bootstrap hidden" id="capture-bootstrap" aria-labelledby="capture-bootstrap-title">
+          <h3 id="capture-bootstrap-title">一次性实验室启动信息</h3>
+          <p class="capture-secret-warning">Pairing code 是短期一次性秘密。只通过受控启动参数交给 OpenXR 头显 Capture；不要放入 URL、HTTP header、浏览器 console、日志或 shell 历史。CA 是当前 Core HTTPS 部署的公开证书链，不包含私钥。</p>
+          <div class="capture-bootstrap-grid">
+            <label for="capture-wss-url">core_wss_url</label>
+            <div class="capture-copy-row">
+              <input id="capture-wss-url" type="text" readonly>
+              <button class="button secondary capture-copy-button" type="button" data-copy-field="coreWssUrl">复制</button>
+            </div>
+            <label for="capture-pairing-id">pairing_id</label>
+            <div class="capture-copy-row">
+              <input id="capture-pairing-id" type="text" readonly>
+              <button class="button secondary capture-copy-button" type="button" data-copy-field="pairingId">复制</button>
+            </div>
+            <label for="capture-pairing-code">pairing_code（一次性秘密）</label>
+            <div class="capture-copy-row">
+              <input id="capture-pairing-code" type="password" readonly>
+              <button class="button warning capture-copy-button" type="button" data-copy-field="pairingCode">复制秘密</button>
+            </div>
+            <label for="capture-ca-base64">ca_certificate_base64（公开）</label>
+            <div class="capture-copy-row">
+              <textarea id="capture-ca-base64" rows="3" readonly></textarea>
+              <button class="button secondary capture-copy-button" type="button" data-copy-field="caCertificateBase64">复制</button>
+            </div>
+          </div>
+          <p class="capture-expiry" id="capture-pairing-expiry">—</p>
+        </section>
+
+        <div class="capture-selection-grid">
+          <label for="capture-device-select">采集设备</label>
+          <select id="capture-device-select"></select>
+          <label for="capture-session-select">本标签页会话</label>
+          <select id="capture-session-select"></select>
+        </div>
+        <dl class="capture-facts" id="capture-device-facts"></dl>
+        <div class="capture-actions">
+          <button class="button primary" id="capture-attach-button" type="button">Attach 到所选 Active 会话</button>
+          <button class="button danger" id="capture-revoke-button" type="button">撤销所选设备</button>
+        </div>
+        <p class="capture-status" id="capture-status" role="status">尚未读取采集设备。</p>
+        <p class="capture-fallback"><strong>Direct WebXR fallback（显式同页模式）仍保留：</strong>在机器人卡片中手动连接 RTC、再手动进入 Quest VR。Capture 与 Direct source 在同一会话内互斥，页面不会静默切换；若要切换，先 HOLD/Release，再新建会话。</p>
+      </section>
+
+      <section class="devices-section" aria-labelledby="devices-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-label">SESSION CONTROL</p>
+            <h2 id="devices-title">机器人 Driver 与遥操作会话</h2>
+          </div>
+          <button class="button secondary" id="refresh-button" type="button">刷新</button>
+        </div>
+        <p class="empty hidden" id="devices-empty">尚未发现 category=driver 的服务。控制台不会自动 Acquire。</p>
+        <div class="device-grid" id="device-grid"></div>
+      </section>
+    </div>
+  </main>
+
+  <script type="module" src="/js/teleop/app.js"></script>
+</body>
+</html>

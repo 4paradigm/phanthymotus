@@ -21,13 +21,25 @@ export function clearToken() {
 }
 
 export async function verifyToken(token) {
+  const status = await getAuthStatus(token);
+  return status.valid;
+}
+
+/** Return auth status and the authenticated Principal, when present. */
+export async function getAuthStatus(token = getToken()) {
   try {
     const res = await _origFetch('/api/auth/verify', {
       headers: { 'Authorization': `Bearer ${token}` }
     });
-    return res.ok;
+    const data = await res.json().catch(() => ({}));
+    return {
+      valid: res.ok && data.valid !== false,
+      authRequired: Boolean(data.auth_required),
+      principal: data.principal || null,
+      status: res.status,
+    };
   } catch {
-    return false;
+    return { valid: false, authRequired: true, principal: null, status: 0 };
   }
 }
 

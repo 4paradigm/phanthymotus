@@ -10,6 +10,7 @@ import { VideoRenderer }    from './renderers/video.js';
 import { ImageRenderer }    from './renderers/image.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
+import { wsUrl as authenticatedWsUrl } from './auth.js';
 
 const RENDERERS = [VideoRenderer, ImageRenderer, AudioRenderer, LidarRenderer, TextRenderer, ActivityRenderer];
 
@@ -34,9 +35,11 @@ class SkillBuffer {
   _connect() {
     const ws = new WebSocket(this._wsUrl);
     ws.binaryType = 'arraybuffer';
-    ws.onopen  = () => console.log('[preview ws] open', this._wsUrl);
+    // Never log the full WebSocket URL: it carries the owner token in its
+    // query string until the WS authentication protocol is migrated.
+    ws.onopen  = () => console.log('[preview ws] open');
     ws.onclose = (e) => {
-      console.log('[preview ws] closed', e.code, this._wsUrl);
+      console.log('[preview ws] closed', e.code);
       if (this._ws === ws) {
         this._ws = null;
         // Reconnect after 3 s if not destroyed
@@ -155,8 +158,6 @@ async function loadSkills() {
       renderSkillList();
       // Spin up background preview buffers for this skill
       _startPreviewBuffers(skill);
-      // Auto-start if global state is running
-      if (_globalRunning && skill.online) _callToolForSkill(skill, 'start');
     } catch {
       skill.online = false;
       renderSkillList();
@@ -202,34 +203,111 @@ function selectSkill(id) {
 // ── Global Start / Stop ───────────────────────────────────────────────────────
 
 async function _callToolForSkill(skill, actionName) {
-  const tools = skill.tools || [];
-  for (const tool of tools) {
+  const tools = (skill.tools || []).map(tool => (
+    typeof tool === 'string' ? tool : tool?.name
+  )).filter(Boolean);
+  const completedTools = [];
+  for (const toolName of tools) {
     const args = { action: actionName };
     if (actionName === 'start' && skill.topic_in?.[0]?.topic) {
       const t = skill.topic_in[0].topic;
       args.input_topic = t;
       args.topic       = t;
     }
-    console.log(`[ctrl] ${tool} ${skill.id} action=${actionName} args=${JSON.stringify(args)}`);
+    console.log(`[ctrl] ${toolName} ${skill.id} action=${actionName} args=${JSON.stringify(args)}`);
     try {
       const resp = await fetch(`/api/mcp/${encodeURIComponent(skill.id)}/call`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tool, arguments: args }),
+        body: JSON.stringify({ tool: toolName, arguments: args }),
       });
-      const j = await resp.json();
-      console.log(`[ctrl] ${tool} ${skill.id} →`, JSON.stringify(j).slice(0, 200));
+      const j = await resp.json().catch(() => ({}));
+      console.log(`[ctrl] ${toolName} ${skill.id} →`, JSON.stringify(j).slice(0, 200));
+      if (!resp.ok || j.code !== 200) {
+        const detail = j.detail;
+        const reason = detail?.code === 'teleop_command_blocked'
+          ? '遥操会话正在占用机器人'
+          : (typeof detail === 'string'
+            ? detail
+            : detail?.code || j.message || j.code || `HTTP ${resp.status}`);
+        const rollback = [];
+        if (actionName === 'start') {
+          for (const startedTool of [...completedTools].reverse()) {
+            rollback.push(await _callNamedTool(skill, startedTool, 'stop'));
+          }
+        }
+        return {
+          ok: false,
+          skill,
+          reason,
+          completedTools,
+          rollbackOk: rollback.every(result => result.ok),
+        };
+      }
+      completedTools.push(toolName);
     } catch (e) {
-      console.error(`[ctrl] ${tool} ${skill.id} failed:`, e);
+      console.error(`[ctrl] ${toolName} ${skill.id} failed:`, e);
+      const rollback = [];
+      if (actionName === 'start') {
+        for (const startedTool of [...completedTools].reverse()) {
+          rollback.push(await _callNamedTool(skill, startedTool, 'stop'));
+        }
+      }
+      return {
+        ok: false,
+        skill,
+        reason: e.message,
+        completedTools,
+        rollbackOk: rollback.every(result => result.ok),
+      };
     }
+  }
+  return { ok: true, skill, completedTools, rollbackOk: true };
+}
+
+async function _callNamedTool(skill, toolName, actionName) {
+  const args = { action: actionName };
+  if (actionName === 'start' && skill.topic_in?.[0]?.topic) {
+    const topic = skill.topic_in[0].topic;
+    args.input_topic = topic;
+    args.topic = topic;
+  }
+  try {
+    const resp = await fetch(`/api/mcp/${encodeURIComponent(skill.id)}/call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool: toolName, arguments: args }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    return { ok: resp.ok && body.code === 200, toolName };
+  } catch {
+    return { ok: false, toolName };
   }
 }
 
 async function globalStart() {
+  const results = await Promise.all(
+    _skills.filter(s => s.online).map(s => _callToolForSkill(s, 'start')),
+  );
+  const failed = results.find(result => !result.ok);
+  if (failed) {
+    const rollback = await Promise.all(results.filter(result => result.ok).map(async (result) => {
+      const stopped = [];
+      for (const toolName of [...result.completedTools].reverse()) {
+        stopped.push(await _callNamedTool(result.skill, toolName, 'stop'));
+      }
+      return stopped.every(item => item.ok);
+    }));
+    const rollbackOk = (
+      results.filter(result => !result.ok).every(result => result.rollbackOk !== false)
+      && rollback.every(Boolean)
+    );
+    window.alert(`启动失败：${failed.reason}${rollbackOk ? '' : '；部分工具回滚失败'}`);
+    return;
+  }
   _globalRunning = true;
   localStorage.setItem('motus_global_running', '1');
   updateGlobalCtrlUI();
-  await Promise.all(_skills.filter(s => s.online).map(s => _callToolForSkill(s, 'start')));
   // Re-select the active skill to re-attach the renderer after start.
   // Without this, Stop → Start All leaves the renderer detached (no waveform).
   const targetId = _activeSkillId || _skills.find(s => s.online)?.id;
@@ -237,12 +315,19 @@ async function globalStart() {
 }
 
 async function globalStop() {
+  const results = await Promise.all(
+    _skills.filter(s => s.online).map(s => _callToolForSkill(s, 'stop')),
+  );
+  const failed = results.find(result => !result.ok);
+  if (failed) {
+    window.alert(`停止失败：${failed.reason}`);
+    return;
+  }
   _globalRunning = false;
   localStorage.removeItem('motus_global_running');
   updateGlobalCtrlUI();
   _activeRenderer?.stopPlayback?.();
   _inRenderer?.stopPlayback?.();
-  await Promise.all(_skills.filter(s => s.online).map(s => _callToolForSkill(s, 'stop')));
 }
 
 function updateGlobalCtrlUI() {
@@ -253,9 +338,15 @@ function updateGlobalCtrlUI() {
 }
 
 function setupGlobalCtrl() {
-  _globalRunning = localStorage.getItem('motus_global_running') === '1';
   const startBtn = document.getElementById('btn-global-start');
   const stopBtn  = document.getElementById('btn-global-stop');
+  if (!startBtn && !stopBtn) {
+    _globalRunning = false;
+    localStorage.removeItem('motus_global_running');
+    return;
+  }
+  _globalRunning = false;
+  localStorage.removeItem('motus_global_running');
   if (startBtn) startBtn.onclick = globalStart;
   if (stopBtn)  stopBtn.onclick  = globalStop;
   updateGlobalCtrlUI();
@@ -265,8 +356,7 @@ function setupGlobalCtrl() {
 
 function _wsUrlFor(path) {
   if (!path) return null;
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${location.host}${path}`;
+  return authenticatedWsUrl(path);
 }
 
 function _startPreviewBuffers(skill) {

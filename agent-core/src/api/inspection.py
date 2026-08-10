@@ -210,6 +210,10 @@ async def topics_subscriptions():
 
 @ws_router.websocket('/ws/bus/{topic:path}')
 async def bus_ws(websocket: fastapi.WebSocket, topic: str):
+    import auth
+    if not auth.check_ws_token(websocket):
+        await websocket.close(code=4003, reason='Owner role required')
+        return
     await websocket.accept()
 
     topic = '/' + topic  # restore leading /

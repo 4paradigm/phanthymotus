@@ -205,6 +205,17 @@ _seed_defaults()
 def _migrate():
     """One-time data migrations to fix stale values from previous versions."""
     with _get_conn() as conn:
+        guard_table = conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='teleop_authority_guards'"""
+        ).fetchone()
+        if guard_table is not None:
+            guarded = conn.execute(
+                'SELECT 1 FROM teleop_authority_guards LIMIT 1'
+            ).fetchone()
+            if guarded is not None:
+                print('[config] deferred MCP dedup while teleop recovery is pending')
+                return
         # Dedup MCP list by id (keep last occurrence)
         row_svc = conn.execute("SELECT value FROM config WHERE key='services'").fetchone()
         if row_svc:
@@ -249,6 +260,26 @@ class ConfigDB:
                 (key, json.dumps(value))
             )
             conn.commit()
+
+    def set_many(self, values: dict[str, object]) -> None:
+        """Persist a related configuration snapshot in one SQLite transaction."""
+
+        encoded = {
+            key: json.dumps(value)
+            for key, value in values.items()
+        }
+        with _get_conn() as conn:
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                for key, value in encoded.items():
+                    conn.execute(
+                        'INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
+                        (key, value),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def __contains__(self, key: str) -> bool:
         with _get_conn() as conn:

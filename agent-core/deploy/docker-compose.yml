@@ -14,6 +14,8 @@ services:
       - DB_PATH=/work/resource/data.db
       - COMPOSE_DIR=/opt/phanthy-motus
       - CONTAINER_NAME=phanthy-motus-agent-core-1
+      - MOTUS_TLS_CERT_FILE=${MOTUS_TLS_CERT_FILE:-}
+      - MOTUS_TLS_KEY_FILE=${MOTUS_TLS_KEY_FILE:-}
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
       - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT

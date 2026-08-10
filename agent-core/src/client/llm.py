@@ -1,5 +1,3 @@
-import typing
-import base64
 import pathlib
 import asyncio
 import re
@@ -86,12 +84,14 @@ def _classify_error(e: Exception) -> tuple[str, float | None]:
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class Client():
-    def __init__(self):
+    def __init__(self, configs: list[dict] | None = None):
         LOG_PATH.mkdir(parents=True, exist_ok=True)
-        self._init_clients()
+        self._init_clients(configs)
 
-    def _init_clients(self):
+    def _init_clients(self, configs: list[dict] | None = None):
         """从配置创建 OpenAI client 列表。"""
+        if configs is None:
+            configs = config.main['client']['llm']
         self.client_list = [
             openai.AsyncOpenAI(
                 base_url=config_it['url'],
@@ -102,11 +102,19 @@ class Client():
                     event_hooks={"request": [_log_request]},
                 ),
             )
-            for config_it in config.main['client']['llm']
+            for config_it in configs
             if config_it.get('key')  # 跳过未配置 credentials 的条目
         ]
         # 跟踪每个 endpoint 的健康状态
         self._endpoint_dead: list[bool] = [False] * len(self.client_list)
+
+    async def aclose(self) -> None:
+        """Close a staged client that could not be committed."""
+
+        await asyncio.gather(
+            *(client.close() for client in self.client_list),
+            return_exceptions=True,
+        )
 
     async def __call__(self,
         message_list: list[dict],
@@ -261,14 +269,14 @@ class Client():
                 # 标记触发 402 的 endpoint 为 dead，切换到下一个
                 for idx, _, cfg in alive:
                     endpoint_dead[idx] = True
-                print(f'[llm] billing error — marked endpoint(s) dead, trying others')
+                print('[llm] billing error — marked endpoint(s) dead, trying others')
                 continue  # 立即重试剩余 endpoint
 
             if kind == LLMErrorKind.AUTH:
                 # 认证错误不可恢复
                 for idx, _, cfg in alive:
                     endpoint_dead[idx] = True
-                print(f'[llm] auth error — marked endpoint(s) dead')
+                print('[llm] auth error — marked endpoint(s) dead')
                 continue
 
             if kind == LLMErrorKind.RATE_LIMIT:
@@ -287,7 +295,7 @@ class Client():
 
             if kind == LLMErrorKind.TIMEOUT:
                 if attempt < max_retries:
-                    print(f'[llm] timeout — retrying immediately')
+                    print('[llm] timeout — retrying immediately')
                     continue
 
             if kind == LLMErrorKind.CONNECTION:
@@ -301,7 +309,7 @@ class Client():
 
             if kind == LLMErrorKind.CONTEXT_OVERFLOW:
                 # 上下文溢出：不重试，由调用方处理（需要压缩历史）
-                print(f'[llm] context overflow — caller should compress history')
+                print('[llm] context overflow — caller should compress history')
                 raise error
 
             # UNKNOWN：不重试

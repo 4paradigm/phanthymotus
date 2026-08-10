@@ -25,6 +25,7 @@ import client
 import event
 import event_bus
 import collector
+import auth
 import mcp_client
 import perf_log
 import prompt as prompt_mod
@@ -75,6 +76,26 @@ def _build_system_tools(named_functions: list[tuple[str, callable]]) -> dict:
             },
         }
     return tool_dict
+
+
+def _desktop_tool_functions(desktop_tools) -> list[tuple[str, callable]]:
+    """Return desktop tools safe for the current deployment credential mode."""
+
+    tools = [
+        ('Read', desktop_tools.Read),
+        ('Glob', desktop_tools.Glob),
+        ('Grep', desktop_tools.Grep),
+        ('WebSearch', desktop_tools.WebSearch),
+    ]
+    if auth.unsafe_desktop_code_tools_enabled():
+        tools[:0] = [
+            ('Bash', desktop_tools.Bash),
+            ('PythonExec', desktop_tools.PythonExec),
+            ('Write', desktop_tools.Write),
+            ('Edit', desktop_tools.Edit),
+            ('WebFetch', desktop_tools.WebFetch),
+        ]
+    return tools
 
 
 # ── History helpers ────────────────────────────────────────────────────────────
@@ -479,7 +500,7 @@ class Event:
         self._desktop_tools = DesktopTools()
 
         # 注册系统工具（finish / memory / task / detailed_info / subagent / desktop）
-        self._sys_tools = _build_system_tools([
+        system_functions = [
             ('finish', event.finish.__call__),
             ('update_memory', event.memory.update),
             ('activate_skill', event.skills.activate_skill),
@@ -499,17 +520,9 @@ class Event:
             ('subagent_cancel', _sa_tools.subagent_cancel),
             ('subagent_message', _sa_tools.subagent_message),
             ('subagent_result', _sa_tools.subagent_result),
-            # Desktop tools (Claude Code 风格)
-            ('Bash', self._desktop_tools.Bash),
-            ('PythonExec', self._desktop_tools.PythonExec),
-            ('Read', self._desktop_tools.Read),
-            ('Write', self._desktop_tools.Write),
-            ('Edit', self._desktop_tools.Edit),
-            ('Glob', self._desktop_tools.Glob),
-            ('Grep', self._desktop_tools.Grep),
-            ('WebFetch', self._desktop_tools.WebFetch),
-            ('WebSearch', self._desktop_tools.WebSearch),
-        ])
+        ]
+        system_functions.extend(_desktop_tool_functions(self._desktop_tools))
+        self._sys_tools = _build_system_tools(system_functions)
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
         # 恢复持久化的活跃任务及其定时检查

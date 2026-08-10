@@ -4,7 +4,6 @@ import json
 import logging
 import pathlib
 import shutil
-import subprocess
 import sys
 
 # Fix Python "dual module" bug: start.py runs as __main__, but other modules
@@ -21,6 +20,7 @@ import daily_summary
 import topic_subscriber
 import mcp_client
 from channel.manager import manager as channel_manager
+from tls_config import load_public_certificate_chain, resolve_tls_certificates
 
 
 def _init_resource_files():
@@ -78,7 +78,7 @@ async def _auto_ping_all_mcps():
     import api.mcp_manage as mcp_mgr
     for mcp in mcp_mgr._get_mcp_list():
         mcp_id = mcp.get('id', '')
-        if not mcp_id:
+        if not mcp_id or not mcp_mgr._runtime_registration_allowed(mcp):
             continue
         try:
             await mcp_mgr._do_ping(mcp_id)
@@ -87,7 +87,7 @@ async def _auto_ping_all_mcps():
             print(f'[startup] auto-ping failed: {mcp_id}: {e}')
 
 
-def _register_core_mcp(silent=False):
+def _register_core_mcp_locked(silent=False):
     """Register agent-core itself as an MCP with decision_core tool."""
     import api.mcp_manage as mcp_mgr
 
@@ -104,6 +104,7 @@ def _register_core_mcp(silent=False):
         'render_hint': '',
         'server_name': 'AgentCore',
         'category': 'controller',
+        'trust_state': 'internal',
         'online': True,
         'tools': [
             {
@@ -190,6 +191,7 @@ def _register_core_mcp(silent=False):
         'url': '',
         'server_name': 'Channel',
         'category': 'controller',
+        'trust_state': 'internal',
         'online': True,
         'tools': [
             {
@@ -244,13 +246,21 @@ def _register_core_mcp(silent=False):
         print(f'[startup] registered core MCP: {CORE_MCP_ID}')
 
 
+async def _register_core_mcp(silent=False):
+    """Update internal MCP records without overwriting guarded target changes."""
+
+    import api.mcp_manage as mcp_mgr
+
+    async with mcp_mgr._mcp_write_lock:
+        await asyncio.to_thread(_register_core_mcp_locked, silent=silent)
+
+
 async def _heartbeat_core_mcp():
     """Periodically re-register agent-core MCP every 30s."""
-    import api.mcp_manage as mcp_mgr
     while True:
         await asyncio.sleep(30)
         try:
-            _register_core_mcp(silent=True)
+            await _register_core_mcp(silent=True)
         except Exception as e:
             print(f'[heartbeat] core re-register failed: {e}')
 
@@ -299,7 +309,12 @@ async def lifespan(app):
     _ensure_mic_pub()
 
     # 注册 AgentCore 自身为 MCP（含 decision_core 工具）
-    await loop.run_in_executor(None, _register_core_mcp)
+    await _register_core_mcp()
+
+    # Authority aliases are owner-controlled and frozen for the process
+    # lifetime.  Pending changes become active only at this startup boundary.
+    from api.mcp_manage import activate_pending_authority_bindings
+    await activate_pending_authority_bindings()
 
     # 注册 /decision_core output topic 到 inspection
     from api.inspection import register_topic_internal
@@ -325,9 +340,21 @@ async def lifespan(app):
     # 启动 Channel Manager（消息平台适配器）
     await channel_manager.start()
 
+    # Start the dedicated teleop ownership/Driver-heartbeat supervisor only
+    # after authentication and service discovery infrastructure are ready.
+    from teleop.service import coordinator as teleop_coordinator
+    await teleop_coordinator.start()
+
     async with event.llm:
-        # Auto-start project if configured, otherwise reset running state
-        if config.main.get('core', {}).get('auto_start', False):
+        # Runtime project state never survives a Core process boundary. Reset
+        # both fields together before optionally issuing a fresh auto-start.
+        core = config.main.get('core', {})
+        auto_start = bool(core.get('auto_start', False))
+        core['project_running'] = False
+        core['project_state'] = 'stopped'
+        core.pop('active_project_cards', None)
+        config.main['core'] = core
+        if auto_start:
             async def _safe_auto_start():
                 try:
                     await _auto_start_project()
@@ -336,13 +363,6 @@ async def lifespan(app):
                     import traceback
                     traceback.print_exc()
             asyncio.create_task(_safe_auto_start())
-        else:
-            # Not auto-starting: clear stale project_running flag from last session
-            core = config.main.get('core', {})
-            if core.get('project_running'):
-                core['project_running'] = False
-                config.main['core'] = core
-
         tasks = [
             asyncio.create_task(event.llm.run_forever()),
             asyncio.create_task(scheduler.run()),
@@ -351,6 +371,10 @@ async def lifespan(app):
         try:
             yield
         finally:
+            # Revoke teleop authority before tearing down the remaining Core
+            # transports. If a Driver is unreachable, its own short watchdog
+            # lease still expires independently.
+            await teleop_coordinator.stop()
             for t in tasks:
                 t.cancel()
             await channel_manager.stop()
@@ -421,6 +445,9 @@ app_api.include_router(api.channel.router)
 import api.performance
 app_api.include_router(api.performance.router)
 
+import api.teleop
+app_api.include_router(api.teleop.router)
+
 app = fastapi.FastAPI(lifespan=lifespan)
 app.middleware('http')(auth.auth_middleware)
 app.mount('/api', app_api)
@@ -429,19 +456,25 @@ app.mount('/api', app_api)
 @app_api.get('/auth/verify')
 async def _auth_verify(request: fastapi.Request):
     if not auth.is_enabled():
-        return {'valid': True, 'auth_required': False}
+        return {'valid': True, 'auth_required': False, 'principal': None}
     token = auth._extract_token(request)
-    if auth.verify(token):
-        return {'valid': True, 'auth_required': True}
+    principal = auth.authenticate(token)
+    if principal:
+        return {
+            'valid': True,
+            'auth_required': True,
+            'principal': principal.as_dict(),
+        }
     return fastapi.responses.JSONResponse(
         status_code=401,
-        content={'valid': False, 'auth_required': True}
+        content={'valid': False, 'auth_required': True, 'principal': None}
     )
 
 import api.motus_stream
 app.include_router(api.motus_stream.router)
 
 app.include_router(api.inspection.ws_router)
+app.include_router(api.teleop.ws_router)
 
 # ── ACP: 异步动作完成回调接口 ─────────────────────────────────────────────────
 
@@ -631,6 +664,9 @@ _mic_ws_connected = False
 async def _ws_mic(ws: fastapi.WebSocket):
     """Receive PCM-16k audio from browser and publish to ROS2 topic."""
     global _mic_chunk_count, _mic_ws_connected
+    if not auth.check_ws_token(ws):
+        await ws.close(code=4003, reason='Owner role required')
+        return
     await ws.accept()
     _mic_ws_connected = True
     try:
@@ -669,24 +705,6 @@ class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
 app.mount('/', _HTTPOnlyStaticFiles(directory='./web', html=True), name='web')
 
 
-# ========== SSL 自签名证书 ==========
-def _ensure_ssl_certs(cert_dir: str = "./resource/certs") -> tuple[str, str]:
-    """自动生成自签名 SSL 证书（如不存在）。首次启动生成，后续复用。"""
-    cert_path = pathlib.Path(cert_dir) / "cert.pem"
-    key_path = pathlib.Path(cert_dir) / "key.pem"
-    if cert_path.exists() and key_path.exists():
-        return str(cert_path), str(key_path)
-    pathlib.Path(cert_dir).mkdir(parents=True, exist_ok=True)
-    subprocess.run([
-        "openssl", "req", "-x509", "-newkey", "rsa:2048",
-        "-keyout", str(key_path), "-out", str(cert_path),
-        "-days", "3650", "-nodes",
-        "-subj", "/CN=phanthy-motus",
-    ], check=True, capture_output=True)
-    print(f"[ssl] Generated self-signed certificate: {cert_path}")
-    return str(cert_path), str(key_path)
-
-
 # ========== 启动服务 ==========
 if __name__ == '__main__':
     # Suppress noisy "SSL connection is closed" from uvicorn/asyncio
@@ -697,7 +715,13 @@ if __name__ == '__main__':
     logging.getLogger('uvicorn.error').addFilter(_SSLCloseFilter())
     logging.getLogger('asyncio').addFilter(_SSLCloseFilter())
 
-    cert_file, key_file = _ensure_ssl_certs()
+    cert_file, key_file = resolve_tls_certificates()
+    # The mounted API app is the request.app seen by /api/teleop routes. Keep
+    # only a bounded, certificate-only public chain there; the private-key path
+    # remains local to this startup block and is passed solely to Uvicorn.
+    app_api.state.teleop_capture_ca_certificate_pem = (
+        load_public_certificate_chain(cert_file)
+    )
     uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None,
                 ssl_certfile=cert_file, ssl_keyfile=key_file,
                 timeout_keep_alive=65)
