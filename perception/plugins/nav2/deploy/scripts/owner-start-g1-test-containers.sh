@@ -18,7 +18,6 @@ FAST_LIVO2_CONTAINER="${FAST_LIVO2_CONTAINER:-embodied-perception-fast-livo2-tes
 NAV2_CONTAINER="${NAV2_CONTAINER:-embodied-perception-nav2-test}"
 AGENT_CORE_CONTAINER="${AGENT_CORE_CONTAINER:-phanthy-motus-agent-core-1}"
 DRIVER_CONTAINER="${DRIVER_CONTAINER:-embodied-unitree-g1}"
-CORE_ACCESS_TOKEN="${CORE_ACCESS_TOKEN:-}"
 
 AGENT_CORE_URL="${AGENT_CORE_URL:-https://localhost:15678}"
 PERCEPTION_MCP_URL="${PERCEPTION_MCP_URL:-http://127.0.0.1:15720/mcp}"
@@ -69,44 +68,6 @@ require_running_container() {
   local name="$1"
   container_exists "${name}" || die "required container is absent: ${name}"
   container_running "${name}" || die "required container is not running: ${name}"
-}
-
-project_running_state() {
-  local response
-  local -a auth_args=()
-  if [[ -n "${CORE_ACCESS_TOKEN}" ]]; then
-    auth_args=(--header "Authorization: Bearer ${CORE_ACCESS_TOKEN}")
-  fi
-  response="$(curl --insecure --fail --silent --show-error \
-    --max-time 5 \
-    "${auth_args[@]}" \
-    "${AGENT_CORE_URL}/api/config/project-running")" || return 1
-  printf '%s' "${response}" | python3 -c '
-import json
-import sys
-
-payload = json.load(sys.stdin)
-value = payload.get("running")
-if value is None and isinstance(payload.get("project"), dict):
-    value = payload["project"].get("running")
-if value is True:
-    print("true")
-elif value is False:
-    print("false")
-else:
-    raise SystemExit("response does not contain a boolean running state")
-'
-}
-
-require_canvas_stopped() {
-  local state
-  if state="$(project_running_state)"; then
-    [[ "${state}" == "false" ]] || \
-      die "Canvas project is running; stop it before managing test containers"
-    note "G1_NAV2_TEST_CANVAS_STATE=stopped"
-    return
-  fi
-  die "cannot verify Canvas state through Agent Core; set CORE_ACCESS_TOKEN when authentication is enabled"
 }
 
 require_arm64_image() {
@@ -169,7 +130,6 @@ preflight() {
   require_arm64_image "${NAV2_IMAGE}"
   require_running_container "${AGENT_CORE_CONTAINER}"
   require_running_container "${DRIVER_CONTAINER}"
-  require_canvas_stopped
 
   container_exists "${PERCEPTION_CONTAINER}" && \
     die "${PERCEPTION_CONTAINER} already exists; inspect it with STAGE=status or remove it with STAGE=stop"
@@ -326,7 +286,7 @@ start_test_containers() {
   print_container_status "${FAST_LIVO2_CONTAINER}"
   print_container_status "${NAV2_CONTAINER}"
   note "G1_NAV2_TEST_CONTAINERS_START=PASS"
-  note "NOTE=full Perception is running with restart=no; Canvas remains stopped and no navigation action was issued"
+  note "NOTE=full Perception is running with restart=no; Canvas state was not queried or changed and no navigation action was issued"
 }
 
 status_test_containers() {
@@ -366,7 +326,6 @@ stop_test_containers() {
   require_command curl
   require_command python3
   docker info >/dev/null 2>&1 || die "Docker daemon is not accessible"
-  require_canvas_stopped
 
   stop_one_test_container "${PERCEPTION_CONTAINER}"
   stop_one_test_container "${NAV2_CONTAINER}"

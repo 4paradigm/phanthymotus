@@ -186,6 +186,22 @@ class Nav2ContractTest(unittest.TestCase):
             second["topic_in"][0]["topic"], "/ubuntu/navigation/odom"
         )
 
+    def test_g1_test_container_script_has_no_canvas_auth_gate(self) -> None:
+        script = (
+            PERCEPTION_ROOT
+            / "plugins"
+            / "nav2"
+            / "deploy"
+            / "scripts"
+            / "owner-start-g1-test-containers.sh"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("CORE_ACCESS_TOKEN", script)
+        self.assertNotIn("/api/config/project-running", script)
+        self.assertNotIn("require_canvas_stopped", script)
+        self.assertIn("require_test_owned", script)
+        self.assertIn("require_port_free 15720", script)
+        self.assertIn("require_port_free 15721", script)
+
 
 if __name__ == "__main__":
     unittest.main()

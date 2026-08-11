@@ -177,12 +177,13 @@ G1 临时验证从仓库根目录执行一条命令；脚本按当前 commit 生
 bash perception/plugins/nav2/deploy/scripts/build-and-start-g1.sh
 ```
 
-运行前应停掉 Canvas 项目，并确保锁定的本地基础镜像
+运行前确保锁定的本地基础镜像
 `phanthy-fast-livo2:g1-1fcd0d0-n3save1` 存在。脚本不执行 Git 同步、不删除旧
-容器、不启动 Canvas，也不会发布建图或导航命令；已有测试容器需要先用
-现有 `STAGE=stop` 入口移除。Core 启用认证时，运行前显式提供
-`CORE_ACCESS_TOKEN`。`perception/deploy/service.yml` 是正式运行编排，不是
-源码构建入口。
+容器、不启停 Canvas，也不会发布建图或导航命令；已有测试容器需要先用
+现有 `STAGE=stop` 入口移除。脚本不再读取 Canvas 运行状态，也不需要
+`CORE_ACCESS_TOKEN`；仍保留测试容器 owner label、必需容器、端口冲突和
+镜像架构检查。`perception/deploy/service.yml` 是正式运行编排，不是源码
+构建入口。
 
 Canvas 启动时 Nav2 只等待 companion 的 DDS 控制面，不等待 odom/cloud，避免
 与 FAST-LIVO2 的 `start_mapping` action 形成生命周期环形等待。真正执行
