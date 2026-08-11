@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phanthy Navigation Velocity Proposal v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "nav_id",
+    "sequence",
+    "ttl_ms",
+    "issued_at_unix_ms",
+    "frame",
+    "nav_status",
+    "velocity",
+    "shadow_only",
+    "physical_execution"
+  ],
+  "properties": {
+    "schema": {"const": "phanthy.navigation.velocity_proposal.v1"},
+    "nav_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+    },
+    "sequence": {"type": "integer", "minimum": 1},
+    "ttl_ms": {"type": "integer", "minimum": 1, "maximum": 250},
+    "issued_at_unix_ms": {"type": "integer", "minimum": 1},
+    "frame": {"const": "base_link"},
+    "nav_status": {
+      "enum": [
+        "planning",
+        "navigating",
+        "replanning",
+        "running",
+        "active",
+        "paused",
+        "arrived",
+        "cancelled",
+        "stopped",
+        "error",
+        "aborted",
+        "rejected"
+      ]
+    },
+    "velocity": {
+      "type": "object",
+      "required": ["x", "y", "yaw"],
+      "properties": {
+        "x": {"type": "number", "minimum": -0.05, "maximum": 0.15},
+        "y": {"type": "number", "minimum": -0.12, "maximum": 0.12},
+        "yaw": {"type": "number", "minimum": -0.35, "maximum": 0.35}
+      },
+      "additionalProperties": false,
+      "description": "base_link velocity; planar hypot(x,y) must not exceed 0.18 m/s"
+    },
+    "reason": {"type": "string", "maxLength": 256},
+    "shadow_only": {"const": true},
+    "physical_execution": {"const": false}
+  },
+  "additionalProperties": false
+}

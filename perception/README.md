@@ -90,3 +90,39 @@ ASR result JSON:
   "asr_complete_ts": 1234567891.789
 }
 ```
+
+---
+
+## Nav2 卡片
+
+`nav2` 是单实例 `processor` 卡片，提供建图、地图保存/加载、位置标签和点到点导航。
+首版接收 G1 Driver 的 `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud`，只输出
+`/ubuntu/navigation/nav2/velocity_proposal`。卡片不会直接调用机器人 SDK；任何物理
+执行都必须由 Agent Core 建立受信任务 lease，再由 Driver 独立完成限幅、急停和停车确认。
+
+用户可见约束：
+
+- `speed` 范围 `0.05–0.15 m/s`，`mode` 首版只能为整数 `0`；
+- 输入超过 `500 ms`、TF/地图/Nav2 lifecycle 不 ready 时 fail closed；
+- `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；
+- 地图宿主机目录为 `/opt/phanthy-motus/data/nav2/maps`，companion 容器内为 `/maps`；
+- `start_mapping` 自动切换 mapping，`stop_mapping` 原子保存后自动切回 localization；
+- 当前官方 Agent Core 尚缺 `x-execution-control` / `x-topic-actions` 消费能力，
+  因而 `goal_pose` topic 和 Driver 物理 lease 仍是明确的外部依赖。
+
+Nav2 依赖独立的 ROS 2 Humble companion 镜像。它已经作为第二个 service 接入
+`perception/deploy/service.yml`，整体执行 `docker compose up -d` 时会一起启动；Canvas
+的 `start/stop` 不创建或删除容器。当前 Agent Core Dashboard 部署器仍只启动 fragment
+中的第一个 service（`--no-deps`），所以首次自动部署 sidecar 仍需 Core 的 multi-service
+部署能力，这是本 Perception PR 的范围外依赖。开发构建入口：
+
+Nav2-only 配置会同时禁用 ASR WebSocket 服务；未启用的 ASR 不会占用 `ws_port`、启动
+后台线程或引入 `websockets` 运行时依赖。
+
+```bash
+cd perception/plugins/nav2/companion
+docker compose --env-file source-lock.env build nav2
+```
+
+完整 action、topic/schema、配置、部署限制和验收状态见
+[`plugins/nav2/README.md`](plugins/nav2/README.md)。

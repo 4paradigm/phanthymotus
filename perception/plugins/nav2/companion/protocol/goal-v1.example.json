@@ -1,0 +1,9 @@
+{
+  "schema": "phanthy.navigation.goal.v1",
+  "goal_id": "room-a-001",
+  "x": 1.2,
+  "y": -0.8,
+  "yaw": 0.0,
+  "speed": 0.15,
+  "mode": 0
+}

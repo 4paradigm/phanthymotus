@@ -108,6 +108,11 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("nav2", {}).get("enabled", False):
+            from plugins.nav2 import Nav2Plugin
+            self._plugins.append(Nav2Plugin(plugins_cfg["nav2"], executor))
+            log.info("Nav2Plugin loaded (resources remain idle until Canvas start)")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -129,6 +134,17 @@ class PerceptionBundle:
             if getattr(p, 'PREFIX', None) == 'tts':
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
+
+    def stop(self) -> None:
+        """Best-effort release for every plugin that owns runtime resources."""
+
+        for plugin in reversed(self._plugins):
+            stop = getattr(plugin, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    log.exception("failed to stop plugin %s", plugin.PREFIX)
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -459,8 +475,17 @@ def main():
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
-    # Start WebSocket ASR server in a separate thread
-    threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
+    # The WebSocket endpoint belongs to ASR.  A Nav2-only bundle must not
+    # acquire its dependency, port, or background thread.
+    if asr_cfg.get("enabled", False):
+        threading.Thread(
+            target=_start_ws_thread,
+            args=(ws_port,),
+            daemon=True,
+            name="ws_asr",
+        ).start()
+    else:
+        log.info("WebSocket ASR server disabled with ASRPlugin")
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 
@@ -477,6 +502,7 @@ def main():
     try:
         server.serve_forever()
     finally:
+        _bundle.stop()
         executor.shutdown()
         rclpy.shutdown()
 

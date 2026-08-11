@@ -1,0 +1,28 @@
+mcp_port: 15720
+ws_port: 15721
+
+plugins:
+  asr:
+    enabled: false
+  tts:
+    enabled: false
+  htmsg:
+    enabled: false
+  vop:
+    enabled: false
+  nav2:
+    enabled: true
+    namespace: ubuntu
+    backend: ros_topic
+    shadow_only: true
+    request_timeout_sec: 30.0
+    runtime_switch_timeout_sec: 120.0
+    discovery_timeout_sec: 5.0
+    input_max_age_ms: 500
+    max_forward_mps: 0.15
+    max_reverse_mps: 0.05
+    max_lateral_mps: 0.12
+    max_yaw_rps: 0.35
+    max_planar_mps: 0.18
+    proposal_ttl_ms: 250
+    map_storage_dir: /maps
