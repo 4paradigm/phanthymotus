@@ -16,6 +16,8 @@ import time
 SCHEMA_VERSION = 1
 VELOCITY_PROPOSAL_SCHEMA = "phanthy.navigation.velocity_proposal.v1"
 VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
+MIN_EFFECTIVE_LINEAR_MPS = 0.10
+MIN_EFFECTIVE_YAW_RADPS = 0.30
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MOTION_STATUSES = {"planning", "navigating", "replanning", "running", "active"}
@@ -86,6 +88,23 @@ def limit_forward_velocity(
     if velocity.x <= limit:
         return velocity
     return Velocity(x=limit, y=velocity.y, yaw=velocity.yaw)
+
+
+def apply_g1_motion_floor(velocity: Velocity) -> Velocity:
+    """Raise nonzero G1 commands above the measured locomotion dead zone.
+
+    Exact zeros remain zeros so readiness, pause, terminal and watchdog stops
+    preserve their fail-closed semantics.  Signs and lateral velocity are not
+    changed; the normal proposal validator still owns the upper bounds.
+    """
+
+    x = velocity.x
+    yaw = velocity.yaw
+    if 0.0 < abs(x) < MIN_EFFECTIVE_LINEAR_MPS:
+        x = math.copysign(MIN_EFFECTIVE_LINEAR_MPS, x)
+    if 0.0 < abs(yaw) < MIN_EFFECTIVE_YAW_RADPS:
+        yaw = math.copysign(MIN_EFFECTIVE_YAW_RADPS, yaw)
+    return Velocity(x=x, y=velocity.y, yaw=yaw)
 
 
 @dataclass(frozen=True)
@@ -285,6 +304,8 @@ def build_velocity_proposal(
 
 __all__ = [
     "DEFAULT_VELOCITY_LIMITS",
+    "MIN_EFFECTIVE_LINEAR_MPS",
+    "MIN_EFFECTIVE_YAW_RADPS",
     "ProtocolError",
     "SCHEMA_VERSION",
     "VELOCITY_PROPOSAL_SCHEMA",
@@ -292,6 +313,7 @@ __all__ = [
     "Velocity",
     "VelocityLimits",
     "VelocityProposal",
+    "apply_g1_motion_floor",
     "build_velocity_proposal",
     "limit_forward_velocity",
 ]

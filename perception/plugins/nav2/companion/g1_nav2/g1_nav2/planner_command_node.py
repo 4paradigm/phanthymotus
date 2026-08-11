@@ -35,6 +35,7 @@ from tf2_ros import Buffer, TransformListener
 from .execution_protocol import (
     ProtocolError,
     Velocity,
+    apply_g1_motion_floor,
     build_velocity_proposal,
     limit_forward_velocity,
 )
@@ -376,6 +377,7 @@ class PlannerCommandNode(Node):
                 velocity = limit_forward_velocity(
                     velocity, max_forward_mps=forward_speed_limit
                 )
+                velocity = apply_g1_motion_floor(velocity)
             self._publish_velocity_proposal(
                 nav_id=nav_id,
                 navigation_status=status,

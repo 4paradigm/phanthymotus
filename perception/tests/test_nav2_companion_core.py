@@ -19,6 +19,7 @@ from g1_nav2.execution_protocol import (  # noqa: E402
     ProtocolError,
     Velocity,
     VelocityProposal,
+    apply_g1_motion_floor,
     build_velocity_proposal,
     limit_forward_velocity,
 )
@@ -64,6 +65,21 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             max_forward_mps=0.10,
         )
         self.assertEqual(reverse.x, -1.0)
+
+    def test_g1_motion_floor_preserves_zero_sign_and_upper_values(self) -> None:
+        self.assertEqual(apply_g1_motion_floor(Velocity.zero()), Velocity.zero())
+        self.assertEqual(
+            apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.02)),
+            Velocity(x=0.10, y=0.0, yaw=-0.30),
+        )
+        self.assertEqual(
+            apply_g1_motion_floor(Velocity(x=-0.05, y=0.0, yaw=0.31)),
+            Velocity(x=-0.10, y=0.0, yaw=0.31),
+        )
+        self.assertEqual(
+            apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=0.35)),
+            Velocity(x=0.50, y=0.0, yaw=0.35),
+        )
 
     def test_fast_livo2_readiness_is_fail_closed(self) -> None:
         ready = evaluate_readiness(
@@ -190,7 +206,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             "vy_samples: 1",
         ):
             self.assertIn(expected, follow_path)
-        self.assertIn("max_velocity: [1.0, 0.0, 0.25]", smoother)
+        self.assertIn("rotate_to_heading_angular_vel: 0.30", follow_path)
+        self.assertIn("min_speed_theta: 0.30", follow_path)
+        self.assertIn("max_velocity: [1.0, 0.0, 0.35]", smoother)
         self.assertIn("odom_topic: /ubuntu/navigation/odom", smoother)
 
     def test_speed_limit_and_behavior_tree_reach_planner_bridge(self) -> None:
@@ -208,6 +226,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
         self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
         self.assertIn("limit_forward_velocity", command)
+        self.assertIn("apply_g1_motion_floor", command)
         self.assertIn("goal.pose.header.frame_id = self._global_frame", command)
 
 
