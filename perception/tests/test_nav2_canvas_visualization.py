@@ -57,6 +57,12 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
         self.assertIn("this._controls.enableRotate = false", mapping)
         self.assertIn("this._camera.up.set(0, 0, -1)", mapping)
         self.assertIn("this._fitTopDownView()", mapping)
+        self.assertIn(
+            "this._robotMesh.rotation.set(0, robotYaw, 0)", mapping
+        )
+        self.assertNotIn(
+            "this._robotMesh.rotation.set(0, -robotYaw, 0)", mapping
+        )
 
 
 if __name__ == "__main__":

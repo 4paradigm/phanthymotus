@@ -56,7 +56,8 @@ Canvas 地图最多保留 80,000 个 `0.10 m` 体素占用点；Agent Core 在�
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
 `map_view` wire payload，也不让 FAST-LIVO2 依赖 Nav2。地图卡片支持三维
 浏览和正上方二维投影切换；二维模式只是同一三维点云的平面显示，不是另存
-一份 occupancy grid。它是监控视图，不是
+一份 occupancy grid。绿色机器人箭头沿 canonical `base_link` 的 `+X` 前向，
+并保持 ROS `map` frame 的 yaw 正方向。它是监控视图，不是
 可重定位地图格式。原始 PCD 分片保存在宿主机
 `/opt/phanthy-motus/data/fast_livo2/maps`。
 
