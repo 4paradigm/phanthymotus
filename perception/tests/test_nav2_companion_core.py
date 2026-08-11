@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 import sys
 import tempfile
@@ -19,9 +20,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 from g1_nav2.canvas_pointcloud_core import (  # noqa: E402
     InvalidCanvasPointCloud,
-    LidarClockNormalizer,
-    point_time_max_offset_ns,
-    validate_standard_pointcloud,
+    decode_canvas_pointcloud,
 )
 from g1_nav2.execution_protocol import (  # noqa: E402
     ProtocolError,
@@ -32,6 +31,7 @@ from g1_nav2.execution_protocol import (  # noqa: E402
 from g1_nav2.loco_odom_core import (  # noqa: E402
     InvalidLocoState,
     OriginNormalizer,
+    evaluate_odom_timestamp_health,
 )
 from g1_nav2.map_view_core import (  # noqa: E402
     InvalidMapView,
@@ -44,6 +44,64 @@ from g1_nav2.readiness import (  # noqa: E402
     navigation_motion_blocker,
 )
 from g1_nav2.runtime_process import build_launch_command  # noqa: E402
+
+
+def _pclmeta2_payload(
+    *,
+    source_stamp_ns: int = 10_000_000_000,
+    timestamp_source: str = "driver_receive",
+    metadata_updates: dict | None = None,
+) -> bytes:
+    point_step = 22
+    point_count = 2
+    points = bytearray(point_step * point_count)
+    struct.pack_into("<f", points, 18, 5_000.0)
+    struct.pack_into("<f", points, 40, 99_840_000.0)
+    metadata = {
+        "schema": "phanthy.g1.lidar_cloud.v2",
+        "schema_version": 2,
+        "source_stamp_ns": source_stamp_ns,
+        "timestamp_source": timestamp_source,
+        "driver_receive_unix_ns": source_stamp_ns,
+        "driver_receive_monotonic_ns": 123_456_789,
+        "lidar_header": {
+            "stamp": {
+                "sec": 1,
+                "nanosec": 2,
+                "stamp_ns": 1_000_000_002,
+                "valid": True,
+            },
+            "frame_id": "utlidar_lidar",
+        },
+        "pointcloud": {
+            "height": 1,
+            "width": point_count,
+            "fields": [
+                {"name": "x", "offset": 0, "datatype": 7, "count": 1},
+                {"name": "y", "offset": 4, "datatype": 7, "count": 1},
+                {"name": "z", "offset": 8, "datatype": 7, "count": 1},
+                {"name": "intensity", "offset": 12, "datatype": 7, "count": 1},
+                {"name": "ring", "offset": 16, "datatype": 4, "count": 1},
+                {"name": "time", "offset": 18, "datatype": 7, "count": 1},
+            ],
+            "is_bigendian": False,
+            "point_step": point_step,
+            "row_step": point_step * point_count,
+            "is_dense": False,
+        },
+        "point_data_transform": "gravity_aligned_roll_pitch",
+    }
+    if metadata_updates:
+        metadata.update(metadata_updates)
+    metadata_bytes = json.dumps(
+        metadata, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return (
+        struct.pack("<II", point_step, point_count)
+        + points
+        + metadata_bytes
+        + struct.pack("<I8s", len(metadata_bytes), b"PCLMETA2")
+    )
 
 
 class Nav2CompanionCoreTest(unittest.TestCase):
@@ -90,118 +148,80 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 data=[0, 100],
             )
 
-    def test_native_pointcloud2_preserves_header_contract(self) -> None:
-        stamp_ns = validate_standard_pointcloud(
-            stamp_sec=10,
-            stamp_nanosec=20,
-            receive_stamp_ns=None,
-            frame_id="utlidar_lidar",
-            height=1,
-            width=2,
-            point_step=22,
-            row_step=44,
-            data_length=44,
-            field_names=("x", "y", "z", "intensity", "ring", "time"),
+    def test_pclmeta2_restores_fields_and_driver_receive_time(self) -> None:
+        payload = _pclmeta2_payload()
+        cloud = decode_canvas_pointcloud(
+            payload,
+            receive_stamp_ns=10_100_000_000,
+            output_frame_id="livox_frame",
         )
-        self.assertEqual(stamp_ns, 10_000_000_020)
 
-        with self.assertRaisesRegex(InvalidCanvasPointCloud, "x/y/z"):
-            validate_standard_pointcloud(
-                stamp_sec=10,
-                stamp_nanosec=0,
-                receive_stamp_ns=None,
-                frame_id="utlidar_lidar",
-                height=1,
-                width=2,
-                point_step=22,
-                row_step=44,
-                data_length=44,
-                field_names=("x", "y", "time"),
+        self.assertEqual(cloud.source_stamp_ns, 10_000_000_000)
+        self.assertEqual(cloud.timestamp_source, "driver_receive")
+        self.assertEqual(cloud.frame_id, "livox_frame")
+        self.assertEqual(cloud.raw_lidar_frame_id, "utlidar_lidar")
+        self.assertEqual(cloud.raw_lidar_stamp_ns, 1_000_000_002)
+        self.assertEqual(cloud.point_count, 2)
+        self.assertEqual(cloud.point_step, 22)
+        self.assertEqual(
+            [field.name for field in cloud.fields],
+            ["x", "y", "z", "intensity", "ring", "time"],
+        )
+        self.assertEqual(cloud.data, payload[8:52])
+
+    def test_pclmeta2_rejects_legacy_corrupt_and_stale_frames(self) -> None:
+        legacy = struct.pack("<II", 22, 1) + bytes(22)
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "PCLMETA2"):
+            decode_canvas_pointcloud(
+                legacy,
+                receive_stamp_ns=10_100_000_000,
+                output_frame_id="livox_frame",
             )
 
-    def test_native_lidar_clock_is_mapped_to_ros_system_time(self) -> None:
-        normalizer = LidarClockNormalizer(
-            warmup_samples=3,
-            window_samples=5,
-        )
-        raw = 1_700_000_000_000_000_000
-        clock_offset = 16_857_528_000_000_000
-        scan_span = 99_840_000
-
-        self.assertIsNone(
-            normalizer.normalize(
-                raw_stamp_ns=raw,
-                receive_stamp_ns=raw + clock_offset + scan_span + 8_000_000,
-                scan_end_offset_ns=scan_span,
+        corrupt = _pclmeta2_payload()[:-1] + b"X"
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "PCLMETA2"):
+            decode_canvas_pointcloud(
+                corrupt,
+                receive_stamp_ns=10_100_000_000,
+                output_frame_id="livox_frame",
             )
-        )
-        self.assertIsNone(
-            normalizer.normalize(
-                raw_stamp_ns=raw + 100_000_000,
-                receive_stamp_ns=(
-                    raw + 100_000_000 + clock_offset + scan_span + 2_000_000
+
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "stale"):
+            decode_canvas_pointcloud(
+                _pclmeta2_payload(source_stamp_ns=10_000_000_000),
+                receive_stamp_ns=10_500_000_001,
+                output_frame_id="livox_frame",
+            )
+
+    def test_pclmeta2_rejects_ambiguous_timestamp_and_layout(self) -> None:
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "driver_receive"):
+            decode_canvas_pointcloud(
+                _pclmeta2_payload(timestamp_source="lidar_header"),
+                receive_stamp_ns=10_100_000_000,
+                output_frame_id="livox_frame",
+            )
+
+        bad_pointcloud = {
+            "height": 1,
+            "width": 2,
+            "fields": [
+                {"name": "x", "offset": 0, "datatype": 7, "count": 1},
+                {"name": "y", "offset": 4, "datatype": 7, "count": 1},
+                {"name": "z", "offset": 8, "datatype": 7, "count": 1},
+            ],
+            "is_bigendian": False,
+            "point_step": 22,
+            "row_step": 44,
+            "is_dense": False,
+        }
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "field time"):
+            decode_canvas_pointcloud(
+                _pclmeta2_payload(
+                    metadata_updates={"pointcloud": bad_pointcloud}
                 ),
-                scan_end_offset_ns=scan_span,
+                receive_stamp_ns=10_100_000_000,
+                output_frame_id="livox_frame",
             )
-        )
-        normalized = normalizer.normalize(
-            raw_stamp_ns=raw + 200_000_000,
-            receive_stamp_ns=(
-                raw + 200_000_000 + clock_offset + scan_span + 5_000_000
-            ),
-            scan_end_offset_ns=scan_span,
-        )
-
-        self.assertEqual(
-            normalized,
-            raw + 200_000_000 + clock_offset + 2_000_000,
-        )
-        self.assertEqual(normalizer.snapshot().mode, "normalize")
-
-        late = normalizer.normalize(
-            raw_stamp_ns=raw + 300_000_000,
-            receive_stamp_ns=(
-                raw + 300_000_000 + clock_offset + scan_span + 400_000_000
-            ),
-            scan_end_offset_ns=scan_span,
-        )
-        self.assertEqual(
-            late,
-            raw + 300_000_000 + clock_offset + 2_000_000,
-        )
-        self.assertEqual(normalizer.snapshot().resets, 0)
-
-    def test_aligned_lidar_stamp_is_passed_through(self) -> None:
-        normalizer = LidarClockNormalizer(warmup_samples=3)
-        normalized = normalizer.normalize(
-            raw_stamp_ns=10_000_000_000,
-            receive_stamp_ns=10_120_000_000,
-            scan_end_offset_ns=100_000_000,
-        )
-
-        self.assertEqual(normalized, 10_000_000_000)
-        self.assertEqual(normalizer.snapshot().mode, "passthrough")
-
-    def test_native_point_time_field_defines_scan_end(self) -> None:
-        data = bytearray(44)
-        struct.pack_into("<f", data, 18, 5_000.0)
-        struct.pack_into("<f", data, 40, 99_840_000.0)
-        fields = [
-            type("Field", (), {"name": "time", "offset": 18, "datatype": 7, "count": 1})()
-        ]
-
-        self.assertEqual(
-            point_time_max_offset_ns(
-                data=data,
-                fields=fields,
-                height=1,
-                width=2,
-                point_step=22,
-                row_step=44,
-                is_bigendian=False,
-            ),
-            99_840_000,
-        )
 
     def test_canvas_map_view_is_installed_and_launched(self) -> None:
         setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
@@ -362,6 +382,29 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertEqual(odom.timestamp_source, "driver_receive")
         self.assertEqual(odom.source_stamp_ns, source_stamp_ns)
+
+    def test_loco_v2_driver_receive_status_becomes_ready(self) -> None:
+        ready, source_age = evaluate_odom_timestamp_health(
+            receive_age_sec=0.05,
+            source_stamp_ns=10_000_000_000,
+            timestamp_source="driver_receive",
+            now_stamp_ns=10_100_000_000,
+            max_age_sec=0.5,
+            max_future_skew_sec=0.1,
+        )
+        self.assertTrue(ready)
+        self.assertAlmostEqual(source_age, 0.1)
+
+        stale, stale_age = evaluate_odom_timestamp_health(
+            receive_age_sec=0.05,
+            source_stamp_ns=10_000_000_000,
+            timestamp_source="driver_receive",
+            now_stamp_ns=10_500_000_001,
+            max_age_sec=0.5,
+            max_future_skew_sec=0.1,
+        )
+        self.assertFalse(stale)
+        self.assertGreater(stale_age, 0.5)
 
     def test_loco_v2_rejects_bad_clock_and_schema(self) -> None:
         stale_normalizer = OriginNormalizer()

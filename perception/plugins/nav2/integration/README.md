@@ -13,8 +13,10 @@ NAV2_IMAGE=phanthy-nav2:nav2-card-stage6-amd64 \
   docker compose -f compose.stage6.yml --profile fixture run --rm fixture
 ```
 
-fixture 默认发布与新 G1 Driver 一致的 `loco_state.v2` 和机器人原生
-`/utlidar/cloud` 标准 `PointCloud2`，同时完整记录 status/proposal。向
+fixture 默认发布与新 G1 Driver 一致的 `loco_state.v2` 和
+`/ubuntu/lidar/cloud` `UInt8MultiArray`；点云保留 legacy prefix，并附加
+`PCLMETA2` footer 中的 Driver 接收时间、原始 LiDAR header 与 XYZIRT fields。
+它同时完整记录 status/proposal。向
 `/nav2_stage6/fixture_control` 发布 `stop_inputs` 可在保留订阅观测的同时中断
 传感器输入；发布 `resume_inputs` 恢复。fixture 是可重复的合同和故障注入
 样本。为了在导航终态前精确触发 freshness 门限，也可向 fixture
@@ -29,7 +31,8 @@ NAV2_IMAGE=phanthy-nav2:nav2-card-stage6-amd64 \
   docker compose -f compose.stage6.yml --profile fixture run --rm fixture
 ```
 
-v2 fixture 使用同一 ROS system clock 时间生成声明 `driver_receive` 的
-`loco_state.v2` 和 MID360 XYZIRT `PointCloud2` 帧，验证已同步 header 的
-passthrough 路径、各流 freshness 及时间来源语义。独立 LiDAR 时钟的
-normalization 由纯逻辑单测覆盖，真机偏移仍需用 `lidar_status` 验收。
+v2 fixture 用同一 ROS system clock 生成声明 `driver_receive` 的
+`loco_state.v2` 和 `lidar_cloud.v2`，验证 companion 严格解析 footer、
+还原 PointCloud2 fields，并以同钟域接收时间执行 freshness 检查。
+`NAV2_FIXTURE_SENSOR_SCHEMA=legacy` 则故意不加 footer，用于验证 Nav2 拒绝无可信
+时间的旧帧；该模式不应进入 ready。

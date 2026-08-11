@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import array
 import json
 import math
 import os
@@ -19,8 +20,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from sensor_msgs.msg import PointCloud2, PointField
-from std_msgs.msg import String
+from std_msgs.msg import String, UInt8MultiArray
 
 
 def _cloud_points(radius: float = 2.5, points: int = 720) -> tuple[bytes, bytes]:
@@ -70,7 +70,7 @@ class StageSixFixture(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self._cloud_pub = self.create_publisher(
-            PointCloud2, "/utlidar/cloud", cloud_qos
+            UInt8MultiArray, "/ubuntu/lidar/cloud", cloud_qos
         )
         self.create_subscription(
             String,
@@ -127,25 +127,59 @@ class StageSixFixture(Node):
             )
         state = String()
         state.data = json.dumps(state_payload, separators=(",", ":"))
-        cloud = PointCloud2()
-        cloud.header.stamp.sec = source_stamp_ns // 1_000_000_000
-        cloud.header.stamp.nanosec = source_stamp_ns % 1_000_000_000
-        cloud.header.frame_id = "utlidar_lidar"
-        cloud.height = 1
-        cloud.width = self._point_count
-        cloud.fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-            PointField(name="intensity", offset=12, datatype=PointField.FLOAT32, count=1),
-            PointField(name="ring", offset=16, datatype=PointField.UINT16, count=1),
-            PointField(name="time", offset=18, datatype=PointField.FLOAT32, count=1),
-        ]
-        cloud.is_bigendian = False
-        cloud.point_step = 22
-        cloud.row_step = 22 * self._point_count
-        cloud.data = self._v2_cloud_data
-        cloud.is_dense = True
+        legacy_cloud = (
+            struct.pack("<II", 22, self._point_count) + self._v2_cloud_data
+        )
+        if self._sensor_schema == "v2":
+            raw_stamp_ns = source_stamp_ns - 16_857_528_000_000_000
+            raw_sec, raw_nanosec = divmod(raw_stamp_ns, 1_000_000_000)
+            metadata = {
+                "schema": "phanthy.g1.lidar_cloud.v2",
+                "schema_version": 2,
+                "source_stamp_ns": source_stamp_ns,
+                "timestamp_source": "driver_receive",
+                "driver_receive_unix_ns": source_stamp_ns,
+                "driver_receive_monotonic_ns": time.monotonic_ns(),
+                "lidar_header": {
+                    "stamp": {
+                        "sec": raw_sec,
+                        "nanosec": raw_nanosec,
+                        "stamp_ns": raw_stamp_ns,
+                        "valid": True,
+                    },
+                    "frame_id": "utlidar_lidar",
+                },
+                "pointcloud": {
+                    "height": 1,
+                    "width": self._point_count,
+                    "fields": [
+                        {"name": "x", "offset": 0, "datatype": 7, "count": 1},
+                        {"name": "y", "offset": 4, "datatype": 7, "count": 1},
+                        {"name": "z", "offset": 8, "datatype": 7, "count": 1},
+                        {
+                            "name": "intensity",
+                            "offset": 12,
+                            "datatype": 7,
+                            "count": 1,
+                        },
+                        {"name": "ring", "offset": 16, "datatype": 4, "count": 1},
+                        {"name": "time", "offset": 18, "datatype": 7, "count": 1},
+                    ],
+                    "is_bigendian": False,
+                    "point_step": 22,
+                    "row_step": 22 * self._point_count,
+                    "is_dense": True,
+                },
+                "point_data_transform": "gravity_aligned_roll_pitch",
+            }
+            metadata_bytes = json.dumps(
+                metadata, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+            legacy_cloud += metadata_bytes + struct.pack(
+                "<I8s", len(metadata_bytes), b"PCLMETA2"
+            )
+        cloud = UInt8MultiArray()
+        cloud.data = array.array("B", legacy_cloud)
         self._loco_pub.publish(state)
         self._cloud_pub.publish(cloud)
 

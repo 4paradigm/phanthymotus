@@ -13,7 +13,11 @@ from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 
-from .loco_odom_core import InvalidLocoState, OriginNormalizer
+from .loco_odom_core import (
+    InvalidLocoState,
+    OriginNormalizer,
+    evaluate_odom_timestamp_health,
+)
 
 
 POSE_COVARIANCE = [
@@ -55,10 +59,10 @@ class G1LocoOdomBridge(Node):
         self._base_frame = str(self.get_parameter("base_frame").value)
         self._publish_tf = bool(self.get_parameter("publish_tf").value)
         self._source_timeout = float(self.get_parameter("source_timeout").value)
-        source_future_tolerance = float(
+        self._source_future_tolerance = float(
             self.get_parameter("source_future_tolerance").value
         )
-        if self._source_timeout <= 0.0 or source_future_tolerance < 0.0:
+        if self._source_timeout <= 0.0 or self._source_future_tolerance < 0.0:
             raise ValueError(
                 "source_timeout must be positive and source_future_tolerance "
                 "must be non-negative"
@@ -67,7 +71,9 @@ class G1LocoOdomBridge(Node):
             reset_origin=bool(self.get_parameter("reset_origin").value),
             velocity_frame=str(self.get_parameter("velocity_frame").value),
             max_source_age_ns=int(self._source_timeout * 1_000_000_000),
-            max_future_skew_ns=int(source_future_tolerance * 1_000_000_000),
+            max_future_skew_ns=int(
+                self._source_future_tolerance * 1_000_000_000
+            ),
         )
         self._received = 0
         self._invalid = 0
@@ -149,27 +155,17 @@ class G1LocoOdomBridge(Node):
         receive_age = None
         if self._last_receive_monotonic is not None:
             receive_age = max(0.0, time.monotonic() - self._last_receive_monotonic)
-        source_age = None
-        if (
-            self._last_source_stamp_ns is not None
-            and self._last_timestamp_source == "driver"
-        ):
-            source_age = (
-                self.get_clock().now().nanoseconds - self._last_source_stamp_ns
-            ) / 1_000_000_000.0
-        timestamp_fresh = (
-            self._last_timestamp_source == "adapter_receive"
-            or (
-                self._last_timestamp_source == "driver"
-                and source_age is not None
-                and -0.1 <= source_age <= self._source_timeout
-            )
+        timestamp_fresh, source_age = evaluate_odom_timestamp_health(
+            receive_age_sec=receive_age,
+            source_stamp_ns=self._last_source_stamp_ns,
+            timestamp_source=self._last_timestamp_source,
+            now_stamp_ns=self.get_clock().now().nanoseconds,
+            max_age_sec=self._source_timeout,
+            max_future_skew_sec=self._source_future_tolerance,
         )
         state = (
             "ready"
-            if receive_age is not None
-            and receive_age <= self._source_timeout
-            and timestamp_fresh
+            if timestamp_fresh
             else "waiting_for_native_odom"
         )
         message = String()

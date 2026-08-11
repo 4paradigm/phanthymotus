@@ -33,15 +33,15 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(set(inputs), {"loco_state", "lidar_cloud", "goal_pose"})
         self.assertEqual(inputs["loco_state"]["topic"], "/ubuntu/loco/state")
         self.assertEqual(
-            inputs["lidar_cloud"]["topic"], "/utlidar/cloud"
+            inputs["lidar_cloud"]["topic"], "/ubuntu/lidar/cloud"
         )
         self.assertEqual(
             inputs["lidar_cloud"]["schema"],
-            "sensor_msgs/msg/PointCloud2",
+            "phanthy.g1.lidar_cloud.v2",
         )
         self.assertEqual(
             inputs["lidar_cloud"]["ros_type"],
-            "sensor_msgs/msg/PointCloud2",
+            "std_msgs/msg/UInt8MultiArray",
         )
         self.assertEqual(
             inputs["lidar_cloud"]["qos"],
@@ -78,16 +78,17 @@ class Nav2ContractTest(unittest.TestCase):
             companion_root / "g1_nav2" / "canvas_pointcloud_node.py"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            'default_value="/utlidar/cloud"', launch
+            'default_value="/ubuntu/lidar/cloud"', launch
         )
         self.assertIn(
-            'self.declare_parameter("input_topic", "/utlidar/cloud")',
+            'self.declare_parameter("input_topic", "/ubuntu/lidar/cloud")',
             bridge,
         )
-        self.assertIn('default_value="utlidar_lidar"', launch)
-        self.assertNotIn("UInt8MultiArray", bridge)
-        self.assertIn("LidarClockNormalizer", bridge)
-        self.assertIn("raw_stamp_ns", bridge)
+        self.assertIn('default_value="livox_frame"', launch)
+        self.assertIn("UInt8MultiArray", bridge)
+        self.assertIn("decode_canvas_pointcloud", bridge)
+        self.assertIn('"metadata_footer": "PCLMETA2"', bridge)
+        self.assertNotIn("LidarClockNormalizer", bridge)
         self.assertIn('"queue_size": 1', launch)
 
         canvas = (

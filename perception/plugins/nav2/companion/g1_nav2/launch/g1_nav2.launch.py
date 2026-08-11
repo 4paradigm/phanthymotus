@@ -56,11 +56,8 @@ def generate_launch_description() -> LaunchDescription:
                     "input_topic": source_cloud_topic,
                     "output_topic": cloud_topic,
                     "status_topic": "/ubuntu/navigation/nav2/lidar_status",
-                    "timestamp_mode": "auto",
-                    "clock_warmup_samples": 8,
-                    "clock_window_samples": 200,
-                    "already_aligned_tolerance": 2.0,
-                    "max_normalized_source_age": 2.0,
+                    "output_frame_id": lidar_frame,
+                    "max_source_age": 0.5,
                     "source_future_tolerance": 0.1,
                 }
             ],
@@ -266,7 +263,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "source_cloud_topic",
-                default_value="/utlidar/cloud",
+                default_value="/ubuntu/lidar/cloud",
             ),
             DeclareLaunchArgument(
                 "cloud_topic",
@@ -278,13 +275,14 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "lidar_frame",
-                default_value="utlidar_lidar",
+                default_value="livox_frame",
             ),
             DeclareLaunchArgument(
                 "publish_lidar_static_tf",
                 default_value="true",
                 description=(
-                    "Publish the configured base_link -> utlidar_lidar extrinsics; "
+                    "Publish the configured base_link -> gravity-aligned LiDAR "
+                    "adapter frame extrinsics; "
                     "set false when the robot already publishes this TF"
                 ),
             ),

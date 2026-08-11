@@ -315,25 +315,28 @@ def nav2_tool_definition(namespace: str) -> dict:
             },
             {
                 "port": "lidar_cloud",
-                "topic": "/utlidar/cloud",
+                "topic": f"{root}/lidar/cloud",
                 "format": "sensor/pointcloud",
-                "ros_type": "sensor_msgs/msg/PointCloud2",
+                "ros_type": "std_msgs/msg/UInt8MultiArray",
                 "qos": "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
-                "schema": "sensor_msgs/msg/PointCloud2",
+                "schema": "phanthy.g1.lidar_cloud.v2",
                 "rate_hz": 10,
                 "timestamp": (
-                    "native PointCloud2 header.stamp; companion maps an independent "
-                    "LiDAR clock into ROS system time before Nav2 consumption"
+                    "PCLMETA2 source_stamp_ns/driver_receive_unix_ns; same Driver "
+                    "callback receive clock as loco_state.v2"
                 ),
-                "frame_id": "native PointCloud2 header.frame_id (utlidar_lidar)",
+                "frame_id": (
+                    "livox_frame adapter contract for gravity-aligned point bytes; "
+                    "raw LiDAR frame retained in PCLMETA2 diagnostics"
+                ),
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
-                "units": "native PointCloud2 fields; x/y/z in meters",
+                "units": "PCLMETA2 PointField layout; x/y/z in meters",
                 "max_age_ms": 500,
                 "desc": (
-                    "Robot-native ROS2 PointCloud2 stream. The companion preserves "
-                    "frame_id, fields and point bytes, retains the raw stamp in "
-                    "diagnostics, and only rewrites the output stamp when clock-domain "
-                    "normalization is required"
+                    "Legacy-compatible Driver envelope with a required PCLMETA2 "
+                    "footer. The companion restores PointCloud2 fields, uses only "
+                    "the Driver receive stamp for Nav2 freshness, and rejects legacy "
+                    "or damaged frames instead of fabricating timestamps"
                 ),
             },
             {

@@ -39,6 +39,38 @@ def wrap_angle(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+def evaluate_odom_timestamp_health(
+    *,
+    receive_age_sec: float | None,
+    source_stamp_ns: int | None,
+    timestamp_source: str | None,
+    now_stamp_ns: int,
+    max_age_sec: float,
+    max_future_skew_sec: float,
+) -> tuple[bool, float | None]:
+    """Evaluate the odom status timestamp using the published source label."""
+
+    if max_age_sec <= 0.0 or max_future_skew_sec < 0.0:
+        raise ValueError("invalid odom timestamp tolerances")
+    receive_fresh = (
+        isinstance(receive_age_sec, (int, float))
+        and 0.0 <= receive_age_sec <= max_age_sec
+    )
+    if timestamp_source == "adapter_receive":
+        return receive_fresh, None
+    if timestamp_source not in {"driver", "driver_receive"}:
+        return False, None
+    if (
+        isinstance(source_stamp_ns, bool)
+        or not isinstance(source_stamp_ns, int)
+        or source_stamp_ns <= 0
+    ):
+        return False, None
+    source_age_sec = (int(now_stamp_ns) - source_stamp_ns) / 1_000_000_000.0
+    source_fresh = -max_future_skew_sec <= source_age_sec <= max_age_sec
+    return receive_fresh and source_fresh, source_age_sec
+
+
 def _finite_vector(value: Any, size: int, name: str) -> list[float]:
     if not isinstance(value, (list, tuple)) or len(value) < size:
         raise InvalidLocoState(f"{name} must contain at least {size} values")
@@ -241,3 +273,13 @@ class OriginNormalizer:
         if timestamp_source == "driver_receive":
             self._last_driver_source_stamp_ns = source_stamp_ns
         return odometry
+
+
+__all__ = [
+    "InvalidLocoState",
+    "OriginNormalizer",
+    "PlanarOdometry",
+    "decode_state",
+    "evaluate_odom_timestamp_health",
+    "wrap_angle",
+]
