@@ -172,6 +172,42 @@ map -> odom -> base_link -> lidar_frame
 零外参或视图层坐标变换代替真实 TF。依赖版本、镜像 digest 和许可证必须在实现
 阶段写入 source lock/第三方清单，不能依赖浮动 latest。
 
+## RViz 地图与导航可视化
+
+companion 包内置 [nav2.rviz](companion/g1_nav2/rviz/nav2.rviz)，固定以 `map`
+为坐标系，显示已保存/实时地图、全局路径、局部 costmap、LaserScan、
+odom、机器人 footprint 和 TF。该配置只订阅标准 ROS 2 topic，不含
+`SetGoal` / `InitialPose` 等会改变导航状态的 RViz 工具。
+
+在与 G1 同一 DDS 网络的 Ubuntu 开发机上，从仓库根目录执行：
+
+```bash
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+
+ros2 topic info /map -v
+ros2 topic info /ubuntu/navigation/nav2/scan -v
+rviz2 -d perception/plugins/nav2/companion/g1_nav2/rviz/nav2.rviz
+```
+
+如开发机只安装 ROS 2 Jazzy，可将第一行替换为
+`source /opt/ros/jazzy/setup.bash`，但必须先用上述 `topic info` 确认标准消息
+可发现；这条路径只用于可视化，不用它发布目标或调用 Nav2 service。
+
+在本地 colcon 安装过 `g1_nav2` 包后，也可从包的 share 目录打开：
+
+```bash
+source install/setup.bash
+rviz2 -d "$(ros2 pkg prefix --share g1_nav2)/rviz/nav2.rviz"
+```
+
+主视图中 `/map` 只在 mapping runtime 正在建图，或 localization runtime
+已成功加载地图时有数据。`Global Costmap` 默认关闭以避免遮住原图，
+需要排查全局避障时可在 Displays 面板手动打开。本配置不要求 G1 安装
+RViz，也不会从可视化机器上发送运动命令。
+
 ## 部署
 
 - 目标运行环境：G1 Jetson ARM64、Ubuntu 20.04、ROS 2 Humble、DDS host network。
