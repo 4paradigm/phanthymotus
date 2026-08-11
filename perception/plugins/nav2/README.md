@@ -66,6 +66,7 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 | --- | --- | --- | --- |
 | `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.velocity_proposal.v1`，20 Hz，`base_link`，TTL 最大 250 ms |
 | `plan` | `/plan` | `nav_msgs/msg/Path`; `RELIABLE + KEEP_LAST(1)` | Nav2 原生 `map` 全局路径，Canvas 显示起点、终点、路径长度和折线 |
+| `costmap` | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | Nav2 实时二维全局代价地图，作为卡片默认预览，叠加路径、位姿、终点和膨胀障碍 |
 
 速度提案至少包含 `nav_id`、递增 `sequence`、`issued_at_unix_ms`、
 `ttl_ms`、`nav_status` 和 `velocity{x,y,yaw}`。终态必须发布零速。
@@ -140,8 +141,14 @@ Nav2 卡片需要三条必需输入：
 FAST-LIVO2 三维点云的正上方平面投影，与 Nav2 的二维规划坐标直接对齐，
 不是新增的 occupancy grid。
 
-Canvas 的 odom/path 监控依赖 Agent Core 按原生 ROS 2 类型订阅
-`nav_msgs/msg/Odometry` 和 `nav_msgs/msg/Path`；不得在同名 topic 上创建
+Nav2 卡片自己的“查看数据流”默认打开二维导航视图：底图是规划器
+实际使用的 `/global_costmap/costmap`，红色是占据障碍，橙色是膨胀代价，
+绿色是当前 `/plan`，绿色箭头是 `map -> base_link` 位姿，橙色圆点是目标。
+该视图用来直接判断“目标在代价地图外”、“起点或终点落在膨胀区”和
+“障碍将可通行区切断”等无有效路径原因。
+
+Canvas 的 odom/path/costmap 监控依赖 Agent Core 按原生 ROS 2 类型订阅
+`nav_msgs/msg/Odometry`、`nav_msgs/msg/Path` 和 `nav_msgs/msg/OccupancyGrid`；不得在同名 topic 上创建
 `std_msgs/msg/String` 订阅，否则 DDS graph 会出现同 topic 多类型且数据流为空。
 Core 镜像因此需要包含 `ros-humble-nav-msgs`；单独重建 Perception/Nav2
 镜像不会更新 Canvas 的解码与 renderer。

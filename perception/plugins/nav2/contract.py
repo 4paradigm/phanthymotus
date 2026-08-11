@@ -335,6 +335,22 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "units": "x/y/z=m; yaw=rad",
                 "desc": "Current Nav2 global plan rendered as a 2D path in Canvas",
             },
+            {
+                "port": "costmap",
+                "topic": "/global_costmap/costmap",
+                "format": "sensor/costmap",
+                "ros_type": "nav_msgs/msg/OccupancyGrid",
+                "qos": "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
+                "schema": "phanthy.navigation.costmap.v1",
+                "frame_id": "map",
+                "axes": "ROS REP-103 right-handed: x forward, y left",
+                "units": "resolution=m/cell; data=-1 unknown, 0 free, 100 occupied",
+                "default_preview": True,
+                "desc": (
+                    "Live Nav2 global costmap rendered with the current plan, "
+                    "robot pose, inflated obstacles, and goal in Canvas"
+                ),
+            },
         ],
         "inputSchema": {
             "type": "object",

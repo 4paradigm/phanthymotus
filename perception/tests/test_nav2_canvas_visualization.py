@@ -1,13 +1,47 @@
 from __future__ import annotations
 
+import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Nav2CanvasVisualizationTest(unittest.TestCase):
+    def test_costmap_payload_preserves_grid_geometry_and_costs(self) -> None:
+        bridge_path = REPO_ROOT / "agent-core" / "src" / "ros2_bridge.py"
+        spec = importlib.util.spec_from_file_location("nav2_core_ros2_bridge", bridge_path)
+        bridge = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bridge)
+
+        zero_orientation = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+        message = SimpleNamespace(
+            header=SimpleNamespace(
+                frame_id="map",
+                stamp=SimpleNamespace(sec=12, nanosec=34),
+            ),
+            info=SimpleNamespace(
+                resolution=0.05,
+                width=2,
+                height=2,
+                origin=SimpleNamespace(
+                    position=SimpleNamespace(x=-1.0, y=-2.0),
+                    orientation=zero_orientation,
+                ),
+            ),
+            data=[0, 25, 99, -1],
+        )
+
+        payload = bridge._occupancy_grid_payload(message)
+
+        self.assertEqual(payload["schema"], "phanthy.navigation.costmap.v1")
+        self.assertEqual(payload["frame_id"], "map")
+        self.assertEqual(payload["stamp_ns"], 12_000_000_034)
+        self.assertEqual(payload["origin"], {"x": -1.0, "y": -2.0, "yaw": 0.0})
+        self.assertEqual(payload["data"], [0, 25, 99, -1])
+
     def test_agent_core_uses_native_navigation_messages(self) -> None:
         bridge = (REPO_ROOT / "agent-core" / "src" / "ros2_bridge.py").read_text(
             encoding="utf-8"
@@ -16,8 +50,11 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
         self.assertIn("from nav_msgs.msg import Odometry", bridge)
         self.assertIn("fmt == 'sensor/path'", bridge)
         self.assertIn("from nav_msgs.msg import Path", bridge)
+        self.assertIn("fmt == 'sensor/costmap'", bridge)
+        self.assertIn("from nav_msgs.msg import OccupancyGrid", bridge)
         self.assertIn("_odometry_payload(msg)", bridge)
         self.assertIn("_path_payload(msg)", bridge)
+        self.assertIn("_occupancy_grid_payload(msg)", bridge)
         dockerfile = (REPO_ROOT / "agent-core" / "Dockerfile").read_text(
             encoding="utf-8"
         )
@@ -36,10 +73,16 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
 
         self.assertIn("hint === 'sensor/odometry'", renderer)
         self.assertIn("hint === 'sensor/path'", renderer)
+        self.assertIn("hint === 'sensor/costmap'", renderer)
+        self.assertIn("/ws/bus/plan", renderer)
+        self.assertIn("/ws/bus/ubuntu/navigation/odom", renderer)
+        self.assertIn("Inflated", renderer)
         self.assertIn("OdometryRenderer", dashboard)
         self.assertIn("PathRenderer", dashboard)
+        self.assertIn("CostmapRenderer", dashboard)
         self.assertIn("OdometryRenderer", detail)
         self.assertIn("PathRenderer", detail)
+        self.assertIn("CostmapRenderer", detail)
 
     def test_mapping_renderer_overlays_the_map_frame_plan(self) -> None:
         mapping = (

@@ -250,6 +250,25 @@ def _path_payload(msg) -> dict:
     }
 
 
+def _occupancy_grid_payload(msg) -> dict:
+    info = msg.info
+    origin = info.origin
+    return {
+        'schema': 'phanthy.navigation.costmap.v1',
+        'frame_id': str(msg.header.frame_id),
+        'stamp_ns': _stamp_ns(msg.header),
+        'resolution': float(info.resolution),
+        'width': int(info.width),
+        'height': int(info.height),
+        'origin': {
+            'x': float(origin.position.x),
+            'y': float(origin.position.y),
+            'yaw': _yaw_from_quaternion(origin.orientation),
+        },
+        'data': [int(value) for value in msg.data],
+    }
+
+
 def _encode_message(msg, fmt: str) -> bytes:
     """Convert supported ROS messages to the dashboard wire representation."""
     if fmt == 'sensor/odometry':
@@ -259,6 +278,10 @@ def _encode_message(msg, fmt: str) -> bytes:
     if fmt == 'sensor/path':
         return json.dumps(
             _path_payload(msg), separators=(',', ':'), allow_nan=False
+        ).encode('utf-8')
+    if fmt == 'sensor/costmap':
+        return json.dumps(
+            _occupancy_grid_payload(msg), separators=(',', ':'), allow_nan=False
         ).encode('utf-8')
 
     raw = msg.data
@@ -297,6 +320,13 @@ def _resolve_msg_type(fmt: str):
         try:
             from nav_msgs.msg import Path
             return Path
+        except ImportError:
+            pass
+        return None
+    if fmt == 'sensor/costmap':
+        try:
+            from nav_msgs.msg import OccupancyGrid
+            return OccupancyGrid
         except ImportError:
             pass
         return None

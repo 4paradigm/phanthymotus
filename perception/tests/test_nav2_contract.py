@@ -65,7 +65,7 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertFalse(inputs["goal_pose"]["required"])
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
-        self.assertEqual(set(outputs), {"velocity_proposal", "plan"})
+        self.assertEqual(set(outputs), {"velocity_proposal", "plan", "costmap"})
         self.assertEqual(tool["topic_out"][0]["port"], "velocity_proposal")
         proposal = outputs["velocity_proposal"]
         self.assertEqual(proposal["schema"], "phanthy.navigation.velocity_proposal.v1")
@@ -75,6 +75,12 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(plan["format"], "sensor/path")
         self.assertEqual(plan["ros_type"], "nav_msgs/msg/Path")
         self.assertEqual(plan["schema"], "phanthy.navigation.path.v1")
+        costmap = outputs["costmap"]
+        self.assertEqual(costmap["topic"], "/global_costmap/costmap")
+        self.assertEqual(costmap["format"], "sensor/costmap")
+        self.assertEqual(costmap["ros_type"], "nav_msgs/msg/OccupancyGrid")
+        self.assertEqual(costmap["schema"], "phanthy.navigation.costmap.v1")
+        self.assertTrue(costmap["default_preview"])
 
         companion_root = (
             PERCEPTION_ROOT

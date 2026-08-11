@@ -132,7 +132,8 @@ SLAM Toolbox、AMCL 或 Map Server。
 - FAST-LIVO2 卡片的 odom 以 `sensor/odometry` 显示实时位姿与速度；
   地图仍以 FAST-LIVO2 `map_view` 为唯一权威源，Agent Core 在显示层把原生
   `/plan` 叠加到该地图，并提供同一三维点云的 `2D/3D` 视图切换，同时保留
-  Nav2 卡片的独立路径数据流；
+  Nav2 卡片的独立路径数据流；Nav2 默认预览为实时二维
+  `/global_costmap/costmap`，同屏叠加规划路径、机器人位姿、终点和膨胀障碍；
 - 当前官方 Agent Core 尚缺 `x-execution-control` / `x-topic-actions` 消费能力，
   因而 `goal_pose` topic 和 Driver 物理 lease 仍是明确的外部依赖。
 

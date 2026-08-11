@@ -181,3 +181,287 @@ export const PathRenderer = {
     this._latest = null;
   },
 };
+
+export const CostmapRenderer = {
+  name: 'costmap',
+  canRender: (hint) => hint === 'sensor/costmap',
+  _el: null,
+  _canvas: null,
+  _ctx: null,
+  _summary: null,
+  _legend: null,
+  _ro: null,
+  _latest: null,
+  _plan: null,
+  _odom: null,
+  _planWs: null,
+  _odomWs: null,
+  _planReconnectTimer: null,
+  _odomReconnectTimer: null,
+
+  mount(container) {
+    this._latest = null;
+    this._plan = null;
+    this._odom = null;
+    this._el = document.createElement('div');
+    this._el.style.cssText =
+      'width:100%;height:100%;position:relative;background:#070908;overflow:hidden';
+    this._canvas = document.createElement('canvas');
+    this._canvas.style.cssText = 'width:100%;height:100%;display:block';
+    this._summary = document.createElement('div');
+    this._summary.style.cssText =
+      'position:absolute;left:9px;bottom:7px;padding:3px 7px;border-radius:4px;' +
+      'background:rgba(0,0,0,.68);color:#dce7df;font:11px monospace';
+    this._legend = document.createElement('div');
+    this._legend.style.cssText =
+      'position:absolute;right:9px;bottom:7px;padding:3px 7px;border-radius:4px;' +
+      'background:rgba(0,0,0,.68);color:#dce7df;font:10px monospace';
+    this._legend.innerHTML =
+      '<span style="color:#d9382e">Occupied</span>  ' +
+      '<span style="color:#f0a52b">Inflated</span>  ' +
+      '<span style="color:#55d675">Path</span>';
+    this._el.append(this._canvas, this._summary, this._legend);
+    container.appendChild(this._el);
+    this._ctx = this._canvas.getContext('2d');
+    this._ro = new ResizeObserver(() => this._draw());
+    this._ro.observe(this._el);
+    this._connectAuxStream('plan', '/ws/bus/plan');
+    this._connectAuxStream('odom', '/ws/bus/ubuntu/navigation/odom');
+    this._draw();
+  },
+
+  onData(buffer) {
+    const data = _decode(buffer);
+    const width = Number(data?.width);
+    const height = Number(data?.height);
+    const resolution = Number(data?.resolution);
+    if (
+      data?.frame_id !== 'map'
+      || !Number.isInteger(width) || width <= 0
+      || !Number.isInteger(height) || height <= 0
+      || !Number.isFinite(resolution) || resolution <= 0
+      || !Array.isArray(data?.data) || data.data.length < width * height
+    ) return;
+    this._latest = data;
+    this._draw();
+  },
+
+  onDataSilent(buffer) { this.onData(buffer); },
+
+  _connectAuxStream(kind, path) {
+    if (!this._el || this[`_${kind}Ws`]) return;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}${path}`);
+    ws.binaryType = 'arraybuffer';
+    this[`_${kind}Ws`] = ws;
+    ws.onmessage = (event) => {
+      if (this[`_${kind}Ws`] !== ws) return;
+      let data;
+      try {
+        const text = event.data instanceof ArrayBuffer
+          ? new TextDecoder().decode(event.data)
+          : String(event.data);
+        data = JSON.parse(text);
+      } catch {
+        return;
+      }
+      if (data?.type === 'ping' || data?.type === 'meta' || data?.type === 'error') return;
+      if (kind === 'plan' && data?.frame_id === 'map' && Array.isArray(data?.poses)) {
+        this._plan = data;
+      }
+      if (
+        kind === 'odom' && data?.frame_id === 'map'
+        && data?.child_frame_id === 'base_link' && data?.position
+      ) {
+        this._odom = data;
+      }
+      this._draw();
+    };
+    ws.onclose = () => {
+      if (this[`_${kind}Ws`] !== ws) return;
+      this[`_${kind}Ws`] = null;
+      if (!this._el) return;
+      const timerName = `_${kind}ReconnectTimer`;
+      this[timerName] = setTimeout(() => {
+        this[timerName] = null;
+        this._connectAuxStream(kind, path);
+      }, 5000);
+    };
+    ws.onerror = () => {};
+  },
+
+  _draw() {
+    if (!this._canvas || !this._ctx || !this._el) return;
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    const width = Math.max(this._el.clientWidth, 1);
+    const height = Math.max(this._el.clientHeight, 1);
+    this._canvas.width = Math.floor(width * ratio);
+    this._canvas.height = Math.floor(height * ratio);
+    this._ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    const ctx = this._ctx;
+    ctx.fillStyle = '#070908';
+    ctx.fillRect(0, 0, width, height);
+
+    const grid = this._latest;
+    if (!grid) {
+      ctx.fillStyle = '#79817c';
+      ctx.font = '13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('等待 Nav2 全局代价地图', width / 2, height / 2);
+      if (this._summary) this._summary.textContent = 'COSTMAP  waiting';
+      return;
+    }
+
+    const gridWidth = Number(grid.width);
+    const gridHeight = Number(grid.height);
+    const resolution = Number(grid.resolution);
+    const originX = Number(grid.origin?.x || 0);
+    const originY = Number(grid.origin?.y || 0);
+    const originYaw = Number(grid.origin?.yaw || 0);
+    const cosYaw = Math.cos(originYaw);
+    const sinYaw = Math.sin(originYaw);
+    const gridMetersX = gridWidth * resolution;
+    const gridMetersY = gridHeight * resolution;
+    const worldFromLocal = (x, y) => ({
+      x: originX + cosYaw * x - sinYaw * y,
+      y: originY + sinYaw * x + cosYaw * y,
+    });
+    const corners = [
+      worldFromLocal(0, 0),
+      worldFromLocal(gridMetersX, 0),
+      worldFromLocal(0, gridMetersY),
+      worldFromLocal(gridMetersX, gridMetersY),
+    ];
+    const poses = Array.isArray(this._plan?.poses) ? this._plan.poses : [];
+    const boundsPoints = [...corners, ...poses];
+    if (this._odom?.position) boundsPoints.push(this._odom.position);
+    let minX = Math.min(...boundsPoints.map((point) => Number(point.x)));
+    let maxX = Math.max(...boundsPoints.map((point) => Number(point.x)));
+    let minY = Math.min(...boundsPoints.map((point) => Number(point.y)));
+    let maxY = Math.max(...boundsPoints.map((point) => Number(point.y)));
+    const pad = 16;
+    const spanX = Math.max(maxX - minX, resolution);
+    const spanY = Math.max(maxY - minY, resolution);
+    const scale = Math.max(
+      0.01,
+      Math.min((width - pad * 2) / spanX, (height - pad * 2) / spanY),
+    );
+    const offsetX = (width - spanX * scale) / 2;
+    const offsetY = (height - spanY * scale) / 2;
+    const project = (point) => ({
+      x: offsetX + (Number(point.x) - minX) * scale,
+      y: height - offsetY - (Number(point.y) - minY) * scale,
+    });
+
+    const gridCanvas = document.createElement('canvas');
+    gridCanvas.width = gridWidth;
+    gridCanvas.height = gridHeight;
+    const gridCtx = gridCanvas.getContext('2d');
+    const pixels = gridCtx.createImageData(gridWidth, gridHeight);
+    for (let row = 0; row < gridHeight; row++) {
+      for (let col = 0; col < gridWidth; col++) {
+        const value = Number(grid.data[row * gridWidth + col]);
+        const pixel = ((gridHeight - 1 - row) * gridWidth + col) * 4;
+        let red = 10, green = 13, blue = 12;
+        if (value < 0) {
+          red = 43; green = 47; blue = 45;
+        } else if (value >= 99) {
+          red = 217; green = 56; blue = 46;
+        } else if (value > 0) {
+          const t = Math.min(Math.max(value / 100, 0), 1);
+          red = 180 + Math.round(60 * t);
+          green = 145 - Math.round(90 * t);
+          blue = 34;
+        }
+        pixels.data[pixel] = red;
+        pixels.data[pixel + 1] = green;
+        pixels.data[pixel + 2] = blue;
+        pixels.data[pixel + 3] = 255;
+      }
+    }
+    gridCtx.putImageData(pixels, 0, 0);
+
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    const cellScale = resolution * scale;
+    ctx.transform(
+      cosYaw * cellScale,
+      -sinYaw * cellScale,
+      sinYaw * cellScale,
+      cosYaw * cellScale,
+      offsetX + (originX - sinYaw * gridMetersY - minX) * scale,
+      height - offsetY - (originY + cosYaw * gridMetersY - minY) * scale,
+    );
+    ctx.drawImage(gridCanvas, 0, 0);
+    ctx.restore();
+
+    if (poses.length) {
+      ctx.strokeStyle = '#55d675';
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      poses.forEach((pose, index) => {
+        const point = project(pose);
+        if (index === 0) ctx.moveTo(point.x, point.y);
+        else ctx.lineTo(point.x, point.y);
+      });
+      ctx.stroke();
+      const goal = project(poses[poses.length - 1]);
+      ctx.fillStyle = '#ffb347';
+      ctx.beginPath();
+      ctx.arc(goal.x, goal.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+
+    if (this._odom?.position) {
+      const robot = project(this._odom.position);
+      const yaw = Number(this._odom.yaw || 0);
+      ctx.save();
+      ctx.translate(robot.x, robot.y);
+      ctx.rotate(-yaw);
+      ctx.fillStyle = '#72e98a';
+      ctx.beginPath();
+      ctx.moveTo(10, 0);
+      ctx.lineTo(-7, -6);
+      ctx.lineTo(-4, 0);
+      ctx.lineTo(-7, 6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    if (this._summary) {
+      this._summary.textContent =
+        `COSTMAP  ${gridWidth}×${gridHeight}  ${resolution.toFixed(2)} m/cell  ` +
+        `PATH ${poses.length}`;
+    }
+  },
+
+  unmount() {
+    if (this._planReconnectTimer) clearTimeout(this._planReconnectTimer);
+    if (this._odomReconnectTimer) clearTimeout(this._odomReconnectTimer);
+    this._planReconnectTimer = null;
+    this._odomReconnectTimer = null;
+    const planWs = this._planWs;
+    const odomWs = this._odomWs;
+    this._planWs = null;
+    this._odomWs = null;
+    planWs?.close();
+    odomWs?.close();
+    this._ro?.disconnect();
+    this._el?.remove();
+    this._el = null;
+    this._canvas = null;
+    this._ctx = null;
+    this._summary = null;
+    this._legend = null;
+    this._ro = null;
+    this._latest = null;
+    this._plan = null;
+    this._odom = null;
+  },
+};
