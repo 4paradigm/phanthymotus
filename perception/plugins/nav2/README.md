@@ -80,6 +80,9 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 - 禁止横移，`y=0`；
 - 非零偏航角速度在发布前保持符号并抬升到至少
   `1.00 rad/s`，绝对值不超过 loco 合同的 `2.00 rad/s`；
+- 平移与转向强制互斥：混合提案的原始 `|yaw| >= 0.20 rad/s` 时只原地
+  转向（`x=0`），低于该阈值时只平移（`yaw=0`），不会向 Driver 发布
+  同时包含非零 `x` 和 `yaw` 的动作；
 - 上述最小值只处理非零运动提案；readiness blocker、暂停和终态零速
   仍保持严格零值；
 - BackUp 恢复动作固定为 `0.30 m/s`；
@@ -110,7 +113,8 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   去天花板并投影到二维的 `/ubuntu/navigation/obstacle_map`，避免已观察障碍
   因当前视角遮挡而消失；local costmap 继续使用实时
   `/ubuntu/navigation/cloud_registered`，高度带为 `-1.15…+0.80 m`。
-- Rotation Shim 在航向偏差大时先旋转，DWB 只采样 `x/yaw`，不采样横移。
+- Rotation Shim 在航向偏差大时先旋转，DWB 只采样 `x/yaw`，不采样横移；
+  proposal 出口再把 DWB 的弧线速度离散成“只转”或“只走”。
 - velocity smoother 使用 `/ubuntu/navigation/odom` 作为反馈。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
 - Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；

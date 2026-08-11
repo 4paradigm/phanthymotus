@@ -66,19 +66,27 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertEqual(reverse.x, -1.0)
 
-    def test_g1_motion_floor_preserves_zero_sign_and_upper_values(self) -> None:
+    def test_g1_motion_policy_is_axis_exclusive_and_clears_dead_zones(self) -> None:
         self.assertEqual(apply_g1_motion_floor(Velocity.zero()), Velocity.zero())
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.02)),
-            Velocity(x=0.30, y=0.0, yaw=-1.00),
+            apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=0.0)),
+            Velocity(x=0.30, y=0.0, yaw=0.0),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=-0.05, y=0.0, yaw=1.01)),
-            Velocity(x=-0.30, y=0.0, yaw=1.01),
+            apply_g1_motion_floor(Velocity(x=0.0, y=0.0, yaw=-0.02)),
+            Velocity(x=0.0, y=0.0, yaw=-1.00),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=2.0)),
-            Velocity(x=0.50, y=0.0, yaw=2.0),
+            apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.19)),
+            Velocity(x=0.30, y=0.0, yaw=0.0),
+        )
+        self.assertEqual(
+            apply_g1_motion_floor(Velocity(x=-0.05, y=0.0, yaw=0.20)),
+            Velocity(x=0.0, y=0.0, yaw=1.00),
+        )
+        self.assertEqual(
+            apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=-2.0)),
+            Velocity(x=0.0, y=0.0, yaw=-2.0),
         )
 
     def test_fast_livo2_readiness_is_fail_closed(self) -> None:

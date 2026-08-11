@@ -18,6 +18,7 @@ VELOCITY_PROPOSAL_SCHEMA = "phanthy.navigation.velocity_proposal.v1"
 VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
 MIN_EFFECTIVE_LINEAR_MPS = 0.30
 MIN_EFFECTIVE_YAW_RADPS = 1.00
+TURN_ONLY_YAW_THRESHOLD_RADPS = 0.20
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MOTION_STATUSES = {"planning", "navigating", "replanning", "running", "active"}
@@ -91,15 +92,22 @@ def limit_forward_velocity(
 
 
 def apply_g1_motion_floor(velocity: Velocity) -> Velocity:
-    """Raise nonzero G1 commands above the measured locomotion dead zone.
+    """Make G1 translation and rotation exclusive, then clear dead zones.
 
     Exact zeros remain zeros so readiness, pause, terminal and watchdog stops
-    preserve their fail-closed semantics.  Signs and lateral velocity are not
-    changed; the normal proposal validator still owns the upper bounds.
+    preserve their fail-closed semantics.  A mixed Nav2 command turns in place
+    when its raw yaw demand is significant; otherwise it moves without yaw.
+    Signs and lateral velocity are not changed, and the normal proposal
+    validator still owns the upper bounds.
     """
 
     x = velocity.x
     yaw = velocity.yaw
+    if x != 0.0 and yaw != 0.0:
+        if abs(yaw) >= TURN_ONLY_YAW_THRESHOLD_RADPS:
+            x = 0.0
+        else:
+            yaw = 0.0
     if 0.0 < abs(x) < MIN_EFFECTIVE_LINEAR_MPS:
         x = math.copysign(MIN_EFFECTIVE_LINEAR_MPS, x)
     if 0.0 < abs(yaw) < MIN_EFFECTIVE_YAW_RADPS:
@@ -306,6 +314,7 @@ __all__ = [
     "DEFAULT_VELOCITY_LIMITS",
     "MIN_EFFECTIVE_LINEAR_MPS",
     "MIN_EFFECTIVE_YAW_RADPS",
+    "TURN_ONLY_YAW_THRESHOLD_RADPS",
     "ProtocolError",
     "SCHEMA_VERSION",
     "VELOCITY_PROPOSAL_SCHEMA",
