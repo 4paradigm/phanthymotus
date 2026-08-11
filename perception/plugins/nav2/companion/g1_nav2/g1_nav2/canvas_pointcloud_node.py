@@ -1,4 +1,4 @@
-"""ROS bridge from the released G1 canvas cloud to PointCloud2."""
+"""ROS bridge from the G1 navigation PCV2 stream to PointCloud2."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from .canvas_pointcloud_core import InvalidCanvasPointCloud, decode_canvas_point
 class CanvasPointCloudBridge(Node):
     def __init__(self) -> None:
         super().__init__("g1_canvas_pointcloud_bridge")
-        self.declare_parameter("input_topic", "/ubuntu/lidar/cloud")
+        self.declare_parameter("input_topic", "/ubuntu/navigation/lidar")
         self.declare_parameter(
             "output_topic", "/ubuntu/navigation/nav2/cloud"
         )

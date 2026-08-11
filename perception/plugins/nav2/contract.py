@@ -315,27 +315,25 @@ def nav2_tool_definition(namespace: str) -> dict:
             },
             {
                 "port": "lidar_cloud",
-                "topic": f"{root}/lidar/cloud",
+                "topic": f"{root}/navigation/lidar",
                 "format": "sensor/pointcloud",
                 "ros_type": "std_msgs/msg/UInt8MultiArray",
                 "qos": "BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE",
-                "schema": "unitree.g1.pointcloud.legacy",
-                "compatible_schemas": ["phanthy.sensor.pointcloud.v2"],
+                "schema": "phanthy.sensor.pointcloud.v2",
                 "rate_hz": 10,
                 "timestamp": (
-                    "legacy uses adapter receive time; v2 uses normalized scan-start "
-                    "source_stamp_ns in ROS system/Unix clock"
+                    "normalized scan-start source_stamp_ns in ROS system/Unix clock"
                 ),
-                "frame_id": "livox_frame (v2 payload or legacy adapter contract)",
+                "frame_id": "original MID360 frame from the v2 payload",
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
                 "units": (
                     "x/y/z=float32 meters; MID360 v2 time=float32 relative ns"
                 ),
                 "max_age_ms": 500,
                 "desc": (
-                    "Legacy envelope remains supported. PCV2 restores source time, "
-                    "frame and an explicit MID360 XYZIRT layout; malformed or "
-                    "cross-clock timestamps are rejected before ROS publication"
+                    "Dedicated navigation PCV2 stream with source time, original "
+                    "frame and MID360 XYZIRT bytes; malformed or cross-clock "
+                    "timestamps are rejected before ROS publication"
                 ),
             },
             {

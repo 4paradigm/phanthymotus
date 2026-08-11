@@ -68,7 +68,7 @@ services:
       ROS_DOMAIN_ID: "42"
       RMW_IMPLEMENTATION: rmw_fastrtps_cpp
       FASTDDS_BUILTIN_TRANSPORTS: UDPv4
-      NAV2_FIXTURE_SENSOR_SCHEMA: ${NAV2_FIXTURE_SENSOR_SCHEMA:-legacy}
+      NAV2_FIXTURE_SENSOR_SCHEMA: ${NAV2_FIXTURE_SENSOR_SCHEMA:-v2}
     command:
       - /bin/bash
       - -lc

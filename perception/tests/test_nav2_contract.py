@@ -32,7 +32,14 @@ class Nav2ContractTest(unittest.TestCase):
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(set(inputs), {"loco_state", "lidar_cloud", "goal_pose"})
         self.assertEqual(inputs["loco_state"]["topic"], "/ubuntu/loco/state")
-        self.assertEqual(inputs["lidar_cloud"]["topic"], "/ubuntu/lidar/cloud")
+        self.assertEqual(
+            inputs["lidar_cloud"]["topic"], "/ubuntu/navigation/lidar"
+        )
+        self.assertEqual(
+            inputs["lidar_cloud"]["schema"],
+            "phanthy.sensor.pointcloud.v2",
+        )
+        self.assertNotIn("compatible_schemas", inputs["lidar_cloud"])
         self.assertIn("BEST_EFFORT", inputs["lidar_cloud"]["qos"])
         self.assertFalse(inputs["goal_pose"]["required"])
 
@@ -48,6 +55,30 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(map_view["format"], "sensor/mapping")
         self.assertEqual(map_view["ros_type"], "std_msgs/msg/UInt8MultiArray")
         self.assertTrue(map_view["default_preview"])
+
+        companion_root = (
+            PERCEPTION_ROOT
+            / "plugins"
+            / "nav2"
+            / "companion"
+            / "g1_nav2"
+        )
+        launch = (companion_root / "launch" / "g1_nav2.launch.py").read_text(
+            encoding="utf-8"
+        )
+        bridge = (
+            companion_root / "g1_nav2" / "canvas_pointcloud_node.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'default_value="/ubuntu/navigation/lidar"', launch
+        )
+        self.assertIn(
+            'self.declare_parameter("input_topic", "/ubuntu/navigation/lidar")',
+            bridge,
+        )
+        self.assertNotIn(
+            'default_value="/ubuntu/lidar/cloud"', launch
+        )
 
         canvas = (
             PERCEPTION_ROOT.parent / "agent-core" / "web" / "js" / "canvas.js"

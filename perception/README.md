@@ -96,7 +96,8 @@ ASR result JSON:
 ## Nav2 卡片
 
 `nav2` 是单实例 `processor` 卡片，提供建图、地图保存/加载、位置标签和点到点导航。
-首版接收 G1 Driver 的 `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud`，输出
+首版接收 G1 Driver 的 `/ubuntu/loco/state` 与专用 PCV2 流
+`/ubuntu/navigation/lidar`，输出
 `/ubuntu/navigation/nav2/velocity_proposal` 以及仅用于 Canvas 监控的
 `/ubuntu/navigation/nav2/map_view`。卡片不会直接调用机器人 SDK；任何物理
 执行都必须由 Agent Core 建立受信任务 lease，再由 Driver 独立完成限幅、急停和停车确认。

@@ -260,7 +260,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "wrapped_cloud_topic",
-                default_value="/ubuntu/lidar/cloud",
+                default_value="/ubuntu/navigation/lidar",
             ),
             DeclareLaunchArgument(
                 "cloud_topic",

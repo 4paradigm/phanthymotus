@@ -67,7 +67,7 @@ class StageSixFixture(Node):
         self._post_stale_nonzero = 0
         self._statuses = 0
         self._sensor_schema = os.getenv(
-            "NAV2_FIXTURE_SENSOR_SCHEMA", "legacy"
+            "NAV2_FIXTURE_SENSOR_SCHEMA", "v2"
         ).strip()
         if self._sensor_schema not in {"legacy", "v2"}:
             raise ValueError("NAV2_FIXTURE_SENSOR_SCHEMA must be legacy or v2")
@@ -84,7 +84,7 @@ class StageSixFixture(Node):
             String, "/ubuntu/loco/state", qos_profile_sensor_data
         )
         self._cloud_pub = self.create_publisher(
-            UInt8MultiArray, "/ubuntu/lidar/cloud", qos_profile_sensor_data
+            UInt8MultiArray, "/ubuntu/navigation/lidar", qos_profile_sensor_data
         )
         self.create_subscription(
             String,

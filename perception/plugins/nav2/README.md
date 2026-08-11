@@ -26,7 +26,7 @@ ROS 2 Humble Nav2 运行时，提供建图、地图管理、位置标签和点�
 
 ```text
 Driver.loco_state ──┐
-Driver.lidar_cloud ─┼──> Nav2 ──┬──> velocity_proposal.v1 ──> Driver.loco ──> Robot
+Driver.navigation/lidar ─┼──> Nav2 ──┬──> velocity_proposal.v1 ──> Driver.loco ──> Robot
 goal_pose.v1（可选）─┘           └──> map_view.v1 ──> Canvas 只读地图监控
 ```
 
@@ -46,12 +46,13 @@ topic 名以 Canvas 的端口绑定为准。首版 companion 与现有 G1 Driver
 | port | 当前 G1 示例 | ROS 2 type / format | QoS | 数据合同 |
 | --- | --- | --- | --- | --- |
 | `loco_state` | `/ubuntu/loco/state` | `std_msgs/msg/String` / `data/json` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 `unitree.g1.loco_state.legacy` 和带源时间戳/frame 的 `phanthy.g1.loco_state.v2`；期望 10 Hz，最大 age 500 ms |
-| `lidar_cloud` | `/ubuntu/lidar/cloud` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 MID360 legacy envelope 和 `phanthy.sensor.pointcloud.v2`；期望 10 Hz，最大 age 500 ms |
+| `lidar_cloud` | `/ubuntu/navigation/lidar` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 专用 `phanthy.sensor.pointcloud.v2` PCV2 流，保留 MID360 原始 frame、XYZIRT 和逐点 time；期望 10 Hz，最大 age 500 ms |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String` / `data/json` | `RELIABLE + KEEP_LAST(depth=10) + VOLATILE` | `phanthy.navigation.goal.v1`；`map` frame；每条消息必须有唯一 `goal_id` |
 
-legacy payload 没有源时间戳或 frame 时，adapter 必须明确标记接收时间和配置来源，
-不得把接收时间伪装成设备源时间。LiDAR 使用 sensor-data QoS，以兼容现有
-BEST_EFFORT 发布端。
+legacy `loco_state` 没有源时间戳或 frame 时，adapter 必须明确标记接收时间和
+配置来源，不得把接收时间伪装成设备源时间。Nav2 不订阅保留给安全与看板的
+legacy `/ubuntu/lidar/cloud`；LiDAR 只从 `/ubuntu/navigation/lidar` 接收 PCV2，
+并使用 sensor-data QoS 兼容 Driver 的 BEST_EFFORT 发布端。
 
 ### Driver v2 时间和点云合同
 
@@ -71,7 +72,8 @@ BEST_EFFORT 发布端。
 }
 ```
 
-`phanthy.sensor.pointcloud.v2` 仍用 `UInt8MultiArray`，字节序为
+`/ubuntu/navigation/lidar` 上的 `phanthy.sensor.pointcloud.v2` 使用
+`UInt8MultiArray`，字节序为
 little-endian：
 
 ```text
@@ -101,8 +103,8 @@ point_count * point_step raw point bytes
 开始时间。Perception 在发布 odom/TF/cloud 前要求源时间落在
 `[-100 ms, +500 ms]` 接收年龄窗口内，且 v2 odom 与 scan 的
 最新源时间差不超过 `200 ms`。陈旧、过度超前、倒退或 v2
-跨流错位均会阻断导航。legacy 两路只有独立的 adapter 接收时间，
-因此继续分别执行 freshness 检查，不伪装成跨流源时间同步。
+跨流错位均会阻断导航。兼容的 legacy `loco_state` 只有 adapter 接收时间，
+因此只执行自身 freshness 检查，不伪装成与 PCV2 的跨流源时间同步。
 部署时先升级 Perception，再让 Driver 发送 `flags=0x0001`；旧版
 Perception 会按 fail-closed 原则拒绝该新布局。
 
@@ -410,8 +412,8 @@ STAGE=stop \
 `input_topics` 连线、建图/停图/原子存图、结构化 proposal、传感器断流
 零速保护与恢复、10 轮 start/stop、非法输入隔离和 Perception 重启验证。
 
-当前仍是 Draft，不能宣称完整可用：本轮使用的是严格匹配 G1 legacy
-合同的确定性 fixture，没有真实 G1 录包，合成点云也不能证明非空房间
+当前仍是 Draft，不能宣称完整可用：本轮已有 legacy/v2 确定性 fixture，
+但没有真实 G1 PCV2 录包，合成点云也不能证明非空房间
 路径规划。此外，官方 Core 尚未消费 `x-execution-control` / `x-topic-actions`，
 所以 Driver lease 和 `goal_pose` 执行闭环仍是外部 blocker。ARM64 生产镜像、真实
 录包、Dashboard 人工界面确认以及 G1 真机执行属于后续验收。
