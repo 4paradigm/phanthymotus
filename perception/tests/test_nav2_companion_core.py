@@ -324,6 +324,20 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_launch_command(mode="mapping", environ={})
 
+    def test_runtime_mode_switch_action_reuses_supervisor(self) -> None:
+        command = (
+            PACKAGE_ROOT / "g1_nav2" / "navigation_command_node.py"
+        ).read_text(encoding="utf-8")
+        supervisor = (
+            PACKAGE_ROOT / "g1_nav2" / "runtime_supervisor.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('if action == "switch_runtime_mode":', command)
+        self.assertIn("def _switch_runtime_mode", command)
+        self.assertIn('"stop_mapping is required before switching', command)
+        self.assertIn('target_mode not in {"mapping", "localization"}', command)
+        self.assertIn('target_mode not in VALID_MODES', supervisor)
+
 
 if __name__ == "__main__":
     unittest.main()

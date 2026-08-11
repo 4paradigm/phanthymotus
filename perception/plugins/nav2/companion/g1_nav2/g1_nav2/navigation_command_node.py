@@ -536,6 +536,8 @@ class NavigationCommandNode(Node):
             return self._start_mapping(args, request_id=request_id)
         if action == "stop_mapping":
             return self._stop_mapping(request_id=request_id)
+        if action == "switch_runtime_mode":
+            return self._switch_runtime_mode(args, request_id=request_id)
         if action == "tag_place":
             return self._tag_place(args)
         if action == "untag_place":
@@ -705,6 +707,48 @@ class NavigationCommandNode(Node):
             "next_map_yaml": summary["map_yaml"],
             "note": "Nav2 runtime is switching to localization automatically",
         }
+
+    def _switch_runtime_mode(
+        self, args: dict, *, request_id: str = ""
+    ) -> dict:
+        self._assert_no_active_navigation("switch_runtime_mode")
+        target_mode = str(args.get("runtime_mode", "")).strip()
+        if target_mode not in {"mapping", "localization"}:
+            raise CommandError(
+                "invalid_argument",
+                "runtime_mode must be mapping or localization",
+            )
+        with self._lock:
+            mapping_session = self._mapping_session
+        if mapping_session is not None:
+            raise CommandError(
+                "mapping_active",
+                "stop_mapping is required before switching runtime mode so the "
+                "active map is saved",
+            )
+
+        map_name = ""
+        summary = None
+        if target_mode == "localization":
+            map_name = self._map_store.validate_map_name(args.get("map_name"))
+            summary = self._map_store.map_summary(map_name)
+
+        self._request_runtime_switch(
+            request_id=request_id,
+            target_mode=target_mode,
+            map_name=map_name,
+        )
+        result = {
+            "status": "switching",
+            "runtime_mode": self._runtime_mode,
+            "mode_switch_required": True,
+            "next_runtime_mode": target_mode,
+            "map_name": map_name,
+            "requested_mode_switch": True,
+        }
+        if summary is not None:
+            result["next_map_yaml"] = summary["map_yaml"]
+        return result
 
     def _request_runtime_switch(
         self, *, request_id: str, target_mode: str, map_name: str

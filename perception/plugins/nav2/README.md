@@ -16,7 +16,7 @@ ROS 2 Humble Nav2 运行时，提供建图、地图管理、位置标签和点�
 | 感知目标 | 消费机器人状态和 LiDAR 点云，完成建图、保存地图、定位、位置标签、全局/局部规划和导航状态管理；输出结构化速度提案 |
 | input topic | 必需：`loco_state`、`lidar_cloud`；可选：`goal_pose`。首版只接受 G1 Driver 的 `/ubuntu/...` 精确绑定 |
 | output topic | `velocity_proposal` 连接 Driver；`map_view` 仅供 Canvas 只读可视化；Nav2 内部 `odom/scan/map/plan/status` topic 仅供运行和调试 |
-| actions | 生命周期：`info/config/start/stop`；业务：14 个建图、地图、标签和导航 action |
+| actions | 生命周期：`info/config/start/stop`；业务：15 个建图、地图、标签和导航 action |
 | 配置 | robot namespace、地图持久化目录、输入新鲜度、速度上限、提案 TTL 和控制面超时；非法配置 fail closed |
 | 模型/算法 | 无训练模型；基线为 ROS 2 Humble Nav2、SLAM Toolbox、AMCL、NavFn、DWB 和 velocity smoother |
 | 部署 | 目标为 Jetson ARM64；Nav2 companion 纳入正式 Perception Compose 项目，与 Perception 一起启动和重启 |
@@ -107,6 +107,7 @@ BEST_EFFORT 发布端。
 | --- | --- | --- |
 | `start_mapping` | `map_name:string` | 自动切换到 mapping runtime，开始新地图；已存在同名地图时拒绝覆盖 |
 | `stop_mapping` | 无 | 停止建图，原子保存地图和 pose graph，然后切回 localization 并加载新地图 |
+| `switch_runtime_mode` | `runtime_mode:mapping|localization`、`map_name?:string` | 独立切换 Nav2 容器模式；localization 必须指定已保存地图，存在未保存建图 session 时拒绝切换 |
 | `tag_place` | `name:string`、`description?:string` | 在当前 `map` 位姿记录语义位置标签 |
 | `untag_place` | `name:string` | 删除当前地图中的标签；不存在时返回可判定错误 |
 | `list_tags` | 无 | 返回当前地图的全部标签及其 pose |

@@ -62,6 +62,7 @@ _NAV_CONTROL_ACTIONS = {
 _MAP_MUTATING_ACTIONS = {
     "start_mapping",
     "stop_mapping",
+    "switch_runtime_mode",
     "tag_place",
     "untag_place",
     "delete_map",
@@ -124,7 +125,18 @@ def _number(args: dict, key: str, *, default=None) -> float:
 
 def _normalize(action: str, args: dict) -> dict:
     normalized: dict = {}
-    if action in {"start_mapping", "delete_map", "load_map"}:
+    if action == "switch_runtime_mode":
+        runtime_mode = _text(args, "runtime_mode")
+        if runtime_mode not in {"mapping", "localization"}:
+            raise NavigationBackendError(
+                "invalid_argument",
+                "runtime_mode must be mapping or localization",
+            )
+        normalized["runtime_mode"] = runtime_mode
+        normalized["map_name"] = (
+            _map_name(args) if runtime_mode == "localization" else ""
+        )
+    elif action in {"start_mapping", "delete_map", "load_map"}:
         normalized["map_name"] = _map_name(args)
     elif action == "tag_place":
         normalized["name"] = _text(args, "name")
@@ -210,7 +222,9 @@ class Nav2Core:
         action = args.get("action", "")
         if not isinstance(action, str) or action not in NAV2_ACTIONS:
             return self._error(
-                str(action), "unsupported_action", "action must be one of the 14 business actions"
+                str(action),
+                "unsupported_action",
+                f"action must be one of the {len(NAV2_ACTIONS)} business actions",
             )
         try:
             trusted_nav_id = _trusted_nav_id(args)

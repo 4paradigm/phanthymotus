@@ -140,8 +140,12 @@ class RosTopicNavigationBackend:
                     "runtime_mode": target_mode,
                     "mode_switch_required": False,
                     "next_runtime_mode": None,
-                    "automatic_mode_switch": True,
+                    "runtime_switch_completed": True,
                 }
+                if action in {"start_mapping", "stop_mapping"}:
+                    payload["automatic_mode_switch"] = True
+                else:
+                    payload["requested_mode_switch"] = True
         return payload
 
     def stop(self) -> None:

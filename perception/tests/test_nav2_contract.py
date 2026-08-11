@@ -27,6 +27,7 @@ class Nav2ContractTest(unittest.TestCase):
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(actions[:4], list(NAV2_LIFECYCLE_ACTIONS))
         self.assertEqual(actions[4:], list(NAV2_ACTIONS))
+        self.assertIn("switch_runtime_mode", actions)
 
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(set(inputs), {"loco_state", "lidar_cloud", "goal_pose"})
@@ -61,6 +62,9 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(speed["maximum"], 0.15)
         self.assertEqual(speed["default"], 0.15)
         self.assertNotIn("mode", properties)
+        self.assertEqual(
+            properties["runtime_mode"]["enum"], ["mapping", "localization"]
+        )
 
         full_config = NAV2_FULL_CONFIG_SCHEMA["properties"]
         self.assertEqual(full_config["max_lateral_mps"]["const"], 0.0)
@@ -69,6 +73,10 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(full_config["max_reverse_mps"]["default"], 0.15)
 
         action_params = tool["inputSchema"]["x-action-params"]
+        self.assertEqual(
+            action_params["switch_runtime_mode"]["params"],
+            ["runtime_mode", "map_name"],
+        )
         self.assertNotIn("mode", action_params["navigate_to_tag"]["params"])
         self.assertNotIn("mode", action_params["navigate_to_pose"]["params"])
         topic_action = tool["x-topic-actions"][0]

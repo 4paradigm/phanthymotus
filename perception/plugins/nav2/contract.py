@@ -8,6 +8,7 @@ from copy import deepcopy
 NAV2_ACTIONS = (
     "start_mapping",
     "stop_mapping",
+    "switch_runtime_mode",
     "tag_place",
     "untag_place",
     "list_tags",
@@ -161,6 +162,13 @@ NAV2_ACTION_PARAMS = {
     "stop_mapping": {
         "params": [],
         "description": "Stop mapping and save the map",
+    },
+    "switch_runtime_mode": {
+        "params": ["runtime_mode", "map_name"],
+        "description": (
+            "Switch the Nav2 container between mapping and localization. "
+            "Localization requires an existing map_name."
+        ),
     },
     "tag_place": {
         "params": ["name", "description"],
@@ -392,7 +400,16 @@ def nav2_tool_definition(namespace: str) -> dict:
                 },
                 "map_name": {
                     "type": "string",
-                    "description": "Map name (for start_mapping, delete_map, load_map)",
+                    "description": (
+                        "Map name (required for localization mode, start_mapping, "
+                        "delete_map and load_map)"
+                    ),
+                },
+                "runtime_mode": {
+                    "type": "string",
+                    "enum": ["mapping", "localization"],
+                    "default": "localization",
+                    "description": "Target Nav2 container runtime mode",
                 },
                 "name": {"type": "string", "description": "POI tag name"},
                 "description": {

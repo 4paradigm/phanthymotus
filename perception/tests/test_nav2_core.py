@@ -91,6 +91,47 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(result["error_code"], "invalid_argument")
         self.assertEqual(self.backend.calls, [])
 
+    def test_runtime_mode_switch_is_explicit_and_localization_requires_map(self) -> None:
+        mapping = self.core.dispatch(
+            {"action": "switch_runtime_mode", "runtime_mode": "mapping"}
+        )
+        self.assertEqual(mapping["status"], "ok")
+        self.assertEqual(
+            self.backend.calls[-1],
+            (
+                "switch_runtime_mode",
+                {"runtime_mode": "mapping", "map_name": ""},
+                None,
+            ),
+        )
+
+        missing_map = self.core.dispatch(
+            {"action": "switch_runtime_mode", "runtime_mode": "localization"}
+        )
+        self.assertEqual(missing_map["error_code"], "missing_argument")
+
+        localization = self.core.dispatch(
+            {
+                "action": "switch_runtime_mode",
+                "runtime_mode": "localization",
+                "map_name": "room-a",
+            }
+        )
+        self.assertEqual(localization["status"], "ok")
+        self.assertEqual(
+            self.backend.calls[-1],
+            (
+                "switch_runtime_mode",
+                {"runtime_mode": "localization", "map_name": "room-a"},
+                None,
+            ),
+        )
+
+        invalid = self.core.dispatch(
+            {"action": "switch_runtime_mode", "runtime_mode": "invalid"}
+        )
+        self.assertEqual(invalid["error_code"], "invalid_argument")
+
     def test_map_mutation_is_blocked_during_navigation(self) -> None:
         started = self.core.dispatch(
             {
@@ -105,6 +146,10 @@ class Nav2CoreTest(unittest.TestCase):
             {"action": "delete_map", "map_name": "room-a"}
         )
         self.assertEqual(blocked["error_code"], "navigation_active")
+        blocked_switch = self.core.dispatch(
+            {"action": "switch_runtime_mode", "runtime_mode": "mapping"}
+        )
+        self.assertEqual(blocked_switch["error_code"], "navigation_active")
         stopped = self.core.dispatch({"action": "stop_nav"})
         self.assertEqual(stopped["status"], "stopped")
         self.assertIsNone(self.core.info()["active_nav_id"])
