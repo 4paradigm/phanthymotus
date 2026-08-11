@@ -41,6 +41,23 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
         self.assertIn("OdometryRenderer", detail)
         self.assertIn("PathRenderer", detail)
 
+    def test_mapping_renderer_overlays_the_map_frame_plan(self) -> None:
+        mapping = (
+            REPO_ROOT / "agent-core" / "web" / "js" / "renderers" / "mapping.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("/ws/bus/plan", mapping)
+        self.assertIn("new THREE.Line", mapping)
+        self.assertIn("data.frame_id !== 'map'", mapping)
+        self.assertIn("this._goalMesh.position.set", mapping)
+        self.assertIn("PATH  ${poses.length} poses", mapping)
+        self.assertIn("planWs?.close()", mapping)
+        self.assertIn("this._setViewMode", mapping)
+        self.assertIn("this._viewMode === '3d' ? '2d' : '3d'", mapping)
+        self.assertIn("this._controls.enableRotate = false", mapping)
+        self.assertIn("this._camera.up.set(0, 0, -1)", mapping)
+        self.assertIn("this._fitTopDownView()", mapping)
+
 
 if __name__ == "__main__":
     unittest.main()

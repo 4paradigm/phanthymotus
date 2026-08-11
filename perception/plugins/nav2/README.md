@@ -121,8 +121,12 @@ Nav2 卡片需要两条必需输入：
 3. Nav2 `velocity_proposal` -> Driver `loco.velocity_proposal`。
 
 地图从 FAST-LIVO2 卡片的 `map_view` 查看，实时位姿从其
-`livo_odom` 查看。Nav2 卡片输出 `/plan` 的 2D 路径视图，但不复制
-`map_view`，避免两张“地图”在 Canvas 中同时成为权威源。
+`livo_odom` 查看。Agent Core 的地图 renderer 会额外只读订阅 Nav2 `/plan`，
+在同一个 `map` frame 中把绿色全局路径和橙色终点叠加到地图上；Nav2 仍不
+复制 `map_view`，因此 Canvas 只有一张权威地图。`/plan` 独立数据流仍保留，
+用于查看路径点数、长度和纯折线。地图右上角可切换 `2D/3D`：2D 是对
+FAST-LIVO2 三维点云的正上方平面投影，与 Nav2 的二维规划坐标直接对齐，
+不是新增的 occupancy grid。
 
 Canvas 的 odom/path 监控依赖 Agent Core 按原生 ROS 2 类型订阅
 `nav_msgs/msg/Odometry` 和 `nav_msgs/msg/Path`；不得在同名 topic 上创建
