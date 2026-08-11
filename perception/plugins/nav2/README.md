@@ -187,6 +187,50 @@ ROS 资源和导航任务，不负责创建或销毁基础容器。
 首次部署 Perception 时，Nav2 companion 不会被自动拉起；还需要部署器新增 multi-service
 启动和 sidecar 镜像解析能力。该修改超出本 PR 允许的 Perception 范围。
 
+### G1 测试容器
+
+在正式部署器支持 multi-service 前，可使用
+`deploy/scripts/owner-start-g1-test-containers.sh` 在 G1 上显式启动两个临时测试容器：
+
+- `embodied-perception-test`：使用默认 `perception/config.yaml` 的完整 Perception Bundle，不是 nav2-only 配置。
+- `embodied-perception-nav2-test`：Nav2 companion，持久化地图目录与正式 Compose 一致。
+
+脚本不修改 `/opt/phanthy-motus/docker-compose.yml`，不启动 Canvas，不调用 Nav2 action
+或 Driver。两个容器的 restart policy 固定为 `no`，仅用于当次人工调试。
+启动前必须保持 Core/Driver 运行且 Canvas project 已停止。若 Core 已启用
+token 认证，脚本不会自动探测凭据：可由调用方显式提供 `CORE_ACCESS_TOKEN`，或在
+现场确认 Canvas 已停止后设置 `I_CONFIRM_CANVAS_STOPPED=1`。两者都缺失时 fail closed。
+
+从仓库根目录执行：
+
+```bash
+export PERCEPTION_IMAGE=local/phanthy-motus/perception:release.260811.e4836f9-jetson
+export NAV2_IMAGE=phanthy-nav2:nav2-card-e4836f9
+
+I_CONFIRM_CANVAS_STOPPED=1 STAGE=preflight \
+  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
+
+I_AM_G1_OWNER=1 I_CONFIRM_CANVAS_STOPPED=1 STAGE=start \
+  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
+```
+
+`start` 会重复执行全部 preflight，等待 MCP `tools/list` 真实返回 `nav2`；任一容器
+提前退出或超时时，它会输出两侧日志尾部，并且只清理本次创建、携带
+`com.phanthymotus.test-owner=nav2-card` 标签的测试容器。
+
+查看状态或停止：
+
+```bash
+STAGE=status \
+  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
+
+I_AM_G1_OWNER=1 I_CONFIRM_CANVAS_STOPPED=1 STAGE=stop \
+  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
+```
+
+`stop` 同样要求 Canvas project 已停止，并拒绝操作缺少上述 owner 标签的同名容器。
+重新构建镜像后应更新两个环境变量，不要静默复用旧 tag。
+
 范围外依赖：当前官方 Agent Core 没有消费 `x-execution-control` / `x-topic-actions`，
 所以还不能把每个导航任务的受信 `nav_id` 自动绑定到 Driver `loco` lease。该能力应
 由 Core 单独实现；本卡片不会通过直接调用 Driver 或伪造授权绕过这一门禁。
