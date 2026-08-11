@@ -8,9 +8,7 @@ Nav2 companion 的基础镜像和 apt 包必须按 `source-lock.env` 与 `Docker
 | `python3-pytest` | `6.2.5-1ubuntu2` | `6.2.5-1ubuntu2` | <https://github.com/pytest-dev/pytest> | MIT / Expat |
 | `ros-humble-nav2-bringup` | `1.1.20-1jammy.20260804.225407` | `1.1.20-1jammy.20260805.020157` | <https://github.com/ros-navigation/navigation2> | Apache-2.0 |
 | `ros-humble-navigation2` | `1.1.20-1jammy.20260804.223401` | `1.1.20-1jammy.20260805.013510` | <https://github.com/ros-navigation/navigation2> | Apache-2.0 |
-| `ros-humble-pointcloud-to-laserscan` | `2.0.1-3jammy.20260804.195259` | `2.0.1-3jammy.20260804.192935` | <https://github.com/ros-perception/pointcloud_to_laserscan> | BSD |
 | `ros-humble-rmw-fastrtps-cpp` | `6.2.10-1jammy.20260724.002510` | `6.2.10-1jammy.20260725.133410` | <https://github.com/ros2/rmw_fastrtps> | Apache-2.0 |
-| `ros-humble-slam-toolbox` | `2.6.10-1jammy.20260804.222728` | `2.6.10-1jammy.20260805.012523` | <https://github.com/SteveMacenski/slam_toolbox> | LGPL |
 
 版本 pin 由 2026-08-11 的 ROS 2 Humble 软件源实际可用版本生成；ROS buildfarm 的 amd64 与 arm64 构建时间戳不同，因此必须分架构精确锁定。许可证来自镜像内 Debian copyright 或 ROS `package.xml`。镜像构建若无法解析任一精确版本或遇到未支持架构必须失败，不允许自动升级到仓库最新版本。
 

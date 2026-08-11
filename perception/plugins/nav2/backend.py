@@ -49,15 +49,8 @@ class RosTopicNavigationBackend:
             "status_topic", f"{root}/navigation/nav2/status"
         )
         self._request_timeout = float(cfg.get("request_timeout_sec", 30.0))
-        self._runtime_switch_timeout = float(
-            cfg.get("runtime_switch_timeout_sec", 120.0)
-        )
         self._discovery_timeout = float(cfg.get("discovery_timeout_sec", 5.0))
-        if (
-            self._request_timeout <= 0
-            or self._runtime_switch_timeout <= 0
-            or self._discovery_timeout <= 0
-        ):
+        if self._request_timeout <= 0 or self._discovery_timeout <= 0:
             raise ValueError("navigation bridge timeouts must be positive")
 
         node_suffix = re.sub(r"[^a-zA-Z0-9_]", "_", namespace or "root")
@@ -123,29 +116,6 @@ class RosTopicNavigationBackend:
                 str(payload.get("error_code", "nav2_error")),
                 str(payload.get("error", "Nav2 companion rejected the request")),
             )
-        if payload.get("mode_switch_required") is True:
-            target_mode = str(payload.get("next_runtime_mode", ""))
-            map_name = str(payload.get("map_name", ""))
-            self._wait_for_runtime(target_mode, map_name=map_name)
-            if payload.get("retry_action_after_switch") is True:
-                payload = self._request(action, args, nav_id=nav_id)
-                if payload.get("status") == "error":
-                    raise NavigationBackendError(
-                        str(payload.get("error_code", "nav2_error")),
-                        str(payload.get("error", "Nav2 rejected the retried request")),
-                    )
-            else:
-                payload = {
-                    **payload,
-                    "runtime_mode": target_mode,
-                    "mode_switch_required": False,
-                    "next_runtime_mode": None,
-                    "runtime_switch_completed": True,
-                }
-                if action in {"start_mapping", "stop_mapping"}:
-                    payload["automatic_mode_switch"] = True
-                else:
-                    payload["requested_mode_switch"] = True
         return payload
 
     def stop(self) -> None:
@@ -193,37 +163,6 @@ class RosTopicNavigationBackend:
                     f"no subscriber on {self._command_topic}",
                 )
             time.sleep(0.05)
-
-    def _wait_for_runtime(self, mode: str, *, map_name: str = "") -> None:
-        if mode not in {"mapping", "localization"}:
-            raise NavigationBackendError(
-                "runtime_switch_invalid", f"unsupported target runtime: {mode}"
-            )
-        deadline = time.monotonic() + self._runtime_switch_timeout
-        with self._condition:
-            while True:
-                status = dict(self._last_status)
-                if status.get("event") == "runtime_switch_error":
-                    raise NavigationBackendError(
-                        "runtime_switch_failed",
-                        str(status.get("error", "Nav2 runtime switch failed")),
-                    )
-                ready = status.get("runtime_mode") == mode
-                if mode == "localization":
-                    ready = ready and status.get("active_map") == map_name
-                    ready = ready and status.get("navigation_ready") is True
-                else:
-                    ready = ready and status.get("n3_ready") is True
-                if ready:
-                    return
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise NavigationBackendError(
-                        "runtime_switch_timeout",
-                        f"Nav2 did not become ready in {mode} mode within "
-                        f"{self._runtime_switch_timeout:.1f}s",
-                    )
-                self._condition.wait(timeout=min(remaining, 0.5))
 
     def _request(self, action: str, args: dict, *, nav_id: str | None) -> dict:
         self._wait_for_bridge()

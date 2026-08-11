@@ -1,164 +1,50 @@
-# Nav2 Perception 卡片规格
+# Nav2 Perception 卡片
 
-`nav2` 是单实例 `processor` 卡片，负责把机器人状态、LiDAR 点云和导航目标交给
-ROS 2 Humble Nav2 运行时，提供建图、地图管理、位置标签和点到点导航能力。
-卡片的控制输出只有带时效和任务标识的速度提案，另发布一条只读地图监控流；
-它不直接调用机器人 SDK，也不直接取得物理控制权。最终执行、限幅、急停和
-停车确认由下游 Driver actuator 负责。
+`nav2` 是单实例 `processor` 卡片，现在只负责目标导航、路径规划、
+局部避障和有时效的速度提案。建图、定位、点云去畸变、地图存储和
+地图可视化由 FAST-LIVO2 卡片负责。Nav2 不订阅 Driver 原始点云，也不再
+启动 SLAM Toolbox、AMCL 或 Map Server。
 
-## 规格总览
-
-| 项目 | 必填内容 |
-| --- | --- |
-| card id | `nav2` |
-| display name | `Nav2` |
-| card type | `processor` |
-| 感知目标 | 消费机器人状态和 LiDAR 点云，完成建图、保存地图、定位、位置标签、全局/局部规划和导航状态管理；输出结构化速度提案 |
-| input topic | 必需：`/ubuntu/loco/state`、`/ubuntu/lidar/cloud`；可选：`goal_pose`。生产输入精确绑定 |
-| output topic | `velocity_proposal` 连接 Driver；`map_view` 仅供 Canvas 只读可视化；Nav2 内部 `odom/scan/map/plan/status` topic 仅供运行和调试 |
-| actions | 生命周期：`info/config/start/stop`；业务：15 个建图、地图、标签和导航 action |
-| 配置 | robot namespace、地图持久化目录、输入新鲜度、速度上限、提案 TTL 和控制面超时；非法配置 fail closed |
-| 模型/算法 | 无训练模型；基线为 ROS 2 Humble Nav2、SLAM Toolbox、AMCL、NavFn、DWB 和 velocity smoother |
-| 部署 | 目标为 Jetson ARM64；Nav2 companion 纳入正式 Perception Compose 项目，与 Perception 一起启动和重启 |
-| 测试 | 契约校验、纯逻辑单测、ROS 2 回放、Compose smoke、Canvas 闭环、故障注入和 owner 授权的 G1 真机验收 |
-
-## 数据链路
+## 责任边界
 
 ```text
-Driver.loco_state ──┐
-/ubuntu/lidar/cloud + PCLMETA2 ─┼──> Nav2 ──┬──> velocity_proposal.v1 ──> Driver.loco ──> Robot
-goal_pose.v1（可选）─┘           └──> map_view.v1 ──> Canvas 只读地图监控
+Driver sensors
+    |
+    v
+FAST-LIVO2 card
+    |-- /ubuntu/navigation/odom                 nav_msgs/Odometry
+    |-- /ubuntu/navigation/cloud_registered     sensor_msgs/PointCloud2
+    `-- TF: map -> base_link
+              |
+              v
+          Nav2 card
+              |-- planner + rolling costmaps + controller
+              `-- /ubuntu/navigation/nav2/velocity_proposal
+                                      |
+                                      v
+                              Driver loco actuator
 ```
 
-导航卡片与 Driver 的职责边界：
+- FAST-LIVO2 负责把原始 `camera_init -> aft_mapped` 输出归一化为下表的
+  `map/base_link` 合同。不能只改 topic 名来伪装坐标系。
+- Nav2 只消费已去畸变、已对时、已归一化 frame 的数据，并在任一
+  输入过期、frame 不符或 `map -> base_link` 不可用时 fail closed。
+- Agent Core 负责 Canvas 生命周期和导航任务 lease。
+- Driver `loco` 负责物理执行、二次限幅、急停、TTL 和停车确认。
 
-- `nav2` 负责传感器适配、TF、地图、定位、规划、导航状态和速度提案。
-- Agent Core 负责 Canvas 生命周期、工具调用，以及导航任务与 Driver lease 的关联。
-- Driver `loco` 负责校验 `nav_id`、sequence、TTL、速度边界、主运控、急停和停车确认。
-- 输入断流、TF/地图失效、Nav2 未 ready 或 Driver 未授权时必须拒绝导航，不能绕过门禁直连机器人 SDK。
+## 输入合同
 
-## Input topics
+| port | topic | type / QoS | 必要条件 |
+| --- | --- | --- | --- |
+| `livo_odom` | `/ubuntu/navigation/odom` | `nav_msgs/msg/Odometry`; `BEST_EFFORT + KEEP_LAST(5)` | `header.frame_id=map`，`child_frame_id=base_link`，ROS system time，最大 age 500 ms |
+| `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，已运动去畸变，ROS system time，最大 age 500 ms |
+| `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.goal.v1`，`map` frame，每条唯一 `goal_id` |
 
-topic 名以 Canvas 的端口绑定为准。首版 companion 冻结 G1 的
-`/ubuntu/loco/state` 与 Driver `/ubuntu/lidar/cloud`；更换 topic 前必须先完成 companion 参数化和相应回放验收，
-当前 `config` 会 fail closed 拒绝其他 namespace。
+Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIVO2 还在
+直接发布 `camera_init` / `aft_mapped` frame 时，Nav2 会返回
+`fast_livo2_odom_frame_invalid` 或 `registered_cloud_frame_invalid`，而不会启动导航。
 
-| port | 当前 G1 示例 | ROS 2 type / format | QoS | 数据合同 |
-| --- | --- | --- | --- | --- |
-| `loco_state` | `/ubuntu/loco/state` | `std_msgs/msg/String` / `data/json` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 `unitree.g1.loco_state.legacy` 和带源时间戳/frame 的 `phanthy.g1.loco_state.v2`；期望 10 Hz，最大 age 500 ms；必须恰好一个 publisher |
-| `lidar_cloud` | `/ubuntu/lidar/cloud` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE` | legacy 重力对齐点数据前缀 + 必需 `PCLMETA2` footer；footer 同时携带 Driver 接收时间、原始 LiDAR header、XYZIRT fields 和恢复刚性 LiDAR 坐标所需的精确逆旋转；必须恰好一个 publisher |
-| `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String` / `data/json` | `RELIABLE + KEEP_LAST(depth=10) + VOLATILE` | `phanthy.navigation.goal.v1`；`map` frame；每条消息必须有唯一 `goal_id` |
-
-legacy `loco_state` 没有源时间戳或 frame 时，adapter 必须明确标记接收时间和
-配置来源，不得把接收时间伪装成设备源时间。LiDAR 仍复用现有
-`/ubuntu/lidar/cloud`，但 Nav2 只接受带合法 `PCLMETA2` 的 v2 帧，并使用
-`BEST_EFFORT + KEEP_LAST(1)` 避免历史帧排队。无 footer、footer 损坏或时间过期时
-不发布 Nav2 PointCloud2，也不用 companion 到达时间补造时间戳。
-任一路输入存在零个或多个 publisher 时同样停止对应 Nav2 输出；这会阻止旧测试
-Driver 与当前 Driver 同时运行时把两套 state/cloud 静默混进同一张地图。
-
-### Loco v2 与 PCLMETA2 时间合同
-
-`loco_state.v2` 可用 `schema="phanthy.g1.loco_state.v2"` 或
-`schema_version=2` 识别；两者同时出现时必须一致。最小 JSON 如下：
-
-```json
-{
-  "schema": "phanthy.g1.loco_state.v2",
-  "schema_version": 2,
-  "source_stamp_ns": 1786444832836579000,
-  "timestamp_source": "driver_receive",
-  "frame_id": "odom_source",
-  "position": [0.0, 0.0, 0.0],
-  "velocity": [0.0, 0.0, 0.0],
-  "imu": {"rpy": [0.0, 0.0, 0.0]},
-  "yaw_speed": 0.0
-}
-```
-
-LiDAR wire layout 为 little-endian：
-
-```text
-uint32 point_step
-uint32 point_count
-uint8  point_data[point_step * point_count]
-uint8  metadata_json[metadata_length]
-uint32 metadata_length
-char   magic[8] = "PCLMETA2"
-```
-
-`metadata_json` 必须声明 `schema=phanthy.g1.lidar_cloud.v2`、
-`schema_version=2`、`timestamp_source=driver_receive`，且
-`source_stamp_ns == driver_receive_unix_ns`。`pointcloud` 字段必须与 legacy
-前缀和点数据长度一致，并保留 MID360 XYZIRT 布局。Driver 继续为既有安全与
-Canvas 消费者发布重力对齐后的 legacy 前缀，但必须在同一帧 footer 中声明：
-
-```json
-{
-  "point_data_transform": "gravity_aligned_roll_pitch",
-  "point_data_transform_params": {
-    "version": 1,
-    "applied": true,
-    "roll_rad": 0.012,
-    "pitch_rad": -0.021,
-    "payload_to_sensor_rotation_row_major": [
-      0.999779522, -0.000251975, -0.020996945,
-      0.000000000, 0.999927998, -0.011999712,
-      0.020998457, 0.011997066, 0.999707520
-    ],
-    "source_frame_id": "utlidar_lidar",
-    "attitude_source": "latest_livox_imu_callback",
-    "attitude_time_correlated": false
-  }
-}
-```
-
-`payload_to_sensor_rotation_row_major` 是 Driver 对本帧实际使用的同一旋转生成的
-精确逆矩阵，语义为 `xyz_sensor = M * xyz_payload`。companion 校验版本、有限值、
-正交性、行列式、source frame 和姿态来源后，只逆变换 XYZ；intensity、ring、
-逐点 time 等其余字节保持不变。旧 Driver 没有该参数、矩阵损坏或 frame 不一致时
-Nav2 fail closed，不允许静默沿用会随机器人姿态变化的点坐标。
-
-MID360 点布局为：
-
-| field | offset | datatype | unit/reference |
-| --- | ---: | --- | --- |
-| `x` | 0 | `FLOAT32` | m |
-| `y` | 4 | `FLOAT32` | m |
-| `z` | 8 | `FLOAT32` | m |
-| `intensity` | 12 | `FLOAT32` | Driver 原值 |
-| `ring` | 16 | `UINT16` | 通道号 |
-| `time` | 18 | `FLOAT32` | 相对原始 LiDAR header stamp 的 ns |
-
-Nav2 不把 Driver callback receive 时间直接当作激光采样时间。companion 使用
-`lidar_header.stamp` 作为扫描起点、逐点 `time` 最大值作为扫描跨度，并以
-`driver_receive_unix_ns` 为 system-time 锚点；滚动窗口取
-`driver_receive - raw_scan_start - scan_span` 的最小值，过滤 callback 调度抖动后，
-把归一化的扫描起点写入 PointCloud2 header。估计器启动需 8 帧预热；原始时间倒退
-会清空估计器并重新预热，期间不向 Nav2 发布点云。
-
-`/ubuntu/navigation/nav2/lidar_status` 记录 Driver/bridge receive stamp、归一化
-source age、原始 LiDAR header、扫描跨度、clock offset/residual/reset、publisher
-数量、输出 frame、点数和拒绝原因。断流、重复 publisher、过期/超前或时间倒退
-仍 fail closed。
-
-Driver 发布前仍对 legacy 前缀的 xyz 执行 `gravity_aligned_roll_pitch`；companion
-使用上述逆矩阵把 Nav2 分支恢复成原始刚性 LiDAR 坐标，再把
-`livox_frame` 作为这套刚性坐标的 adapter alias 发布。这样旧安全与 Canvas 消费者
-的输入不变，同时 SLAM 不再把随最新 IMU roll/pitch 变化的整帧点云误认为固定 frame。
-`/ubuntu/navigation/nav2/lidar_status` 同时报告源变换和已移除的 roll/pitch，便于
-确认现场真正启用了恢复路径。
-`base_link -> livox_frame` 默认使用 Driver G1 URDF 中沿零腰部链
-合成的标称外参，不能只替换 frame 字符串；如果现场有校准值，
-应通过环境变量覆盖。默认由 companion 发布该静态 TF；如果机器人
-已有节点发布同一 TF，必须设置 `NAV2_PUBLISH_LIDAR_STATIC_TF=false`
-避免重复 authority。
-
-这个合同使用 MID360 逐点 `time` 的最大值确定整帧跨度，但现有
-`pointcloud_to_laserscan -> SLAM Toolbox` 仍不会逐点变换做 deskew。本轮修正
-整帧扫描起点、TF 对齐和重复源污染，不把逐点运动去畸变宣称为已完成。
-
-`goal_pose` JSON 最小结构：
+`goal_pose` 最小样例：
 
 ```json
 {
@@ -171,155 +57,63 @@ Driver 发布前仍对 legacy 前缀的 xyz 执行 `gravity_aligned_roll_pitch`�
 }
 ```
 
-`x/y` 单位为米，`yaw` 单位为弧度，坐标系为 `map`。首版固定使用绕障模式，
-不向 Canvas 暴露无可选值的 `mode` 参数。可选 topic 输入最终仍转换为普通
-`navigate_to_pose` 调用，不能绕过 Agent Core 和 Driver lease。
+## 输出合同
 
-当前官方 Agent Core 尚未实现本卡片声明的 `x-topic-actions` 消费逻辑，因此
-`goal_pose` 端口目前只完成 schema/连线声明，不能作为已打通的执行入口。MCP action
-仍可用于 shadow 规划；物理执行必须等待 Core 提供受信 `nav_id`/Driver lease 绑定。
+| port | topic | type / QoS | 语义 |
+| --- | --- | --- | --- |
+| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.velocity_proposal.v1`，20 Hz，`base_link`，TTL 最大 250 ms |
 
-## Output topic
+速度提案至少包含 `nav_id`、递增 `sequence`、`issued_at_unix_ms`、
+`ttl_ms`、`nav_status` 和 `velocity{x,y,yaw}`。终态必须发布零速。
+卡片始终为 proposal-only；`shadow_only=true` 不代表 Driver 一定执行。
 
-| port | 推导规则 | ROS 2 type / format | QoS | 数据合同 |
-| --- | --- | --- | --- | --- |
-| `velocity_proposal` | `/<namespace>/navigation/nav2/velocity_proposal` | `std_msgs/msg/String` / `data/json` | `RELIABLE + KEEP_LAST(depth=10) + VOLATILE` | `phanthy.navigation.velocity_proposal.v1`，目标频率 20 Hz，`base_link` frame，TTL 不超过 250 ms |
-| `map_view` | `/<namespace>/navigation/nav2/map_view` | `std_msgs/msg/UInt8MultiArray` / `sensor/mapping` | `BEST_EFFORT + KEEP_LAST(depth=5) + VOLATILE` | 默认数据流预览；`phanthy.navigation.map_view.v1`，1 Hz 全量快照，包含占用栅格中心点和当前机器人 `map` 位姿 |
+首版限制：
 
-提案至少包含 `nav_id`、单调递增 `sequence`、`issued_at_unix_ms`、`ttl_ms`、
-`frame=base_link`、`nav_status` 和 `velocity{x,y,yaw}`。终态必须发布零速提案。
-提案本身不携带执行权限，`shadow_only=true`、`physical_execution=false` 表示
-卡片没有直接执行机器人动作；下游 Driver 是否执行由独立授权决定。
-
-首版提案边界：前进不超过 `0.15 m/s`，后退不超过 `0.15 m/s`，禁止横移
-（`y=0`），偏航角速度绝对值不超过 `0.35 rad/s`，平面合速度不超过
-`0.18 m/s`。Driver 必须再次独立限幅。
+- 前进/后退绝对值不超过 `0.15 m/s`；
+- 禁止横移，`y=0`；
+- 偏航角速度绝对值不超过 `0.35 rad/s`；
+- 平面合速度不超过 `0.18 m/s`；
+- 导航请求 `speed` 范围为 `0.10–0.15 m/s`。
 
 ## Actions
 
-### 生命周期
-
-| action | 请求 | 行为与返回 |
-| --- | --- | --- |
-| `info` | 无 | 只读返回 `state`、输入连线、输出 topic、runtime mode、active map、active goal、readiness 和 blocker；不得启动进程或改变配置 |
-| `config` | 仅接受 `configSchema` 字段 | 幂等校验并保存配置；运行中拒绝更新，控制面 timeout 在下一次 `start` 生效 |
-| `start` | Canvas 提供 `input_bindings` | 校验两路必需输入、Nav2 companion 和地图目录；ready 后进入 `idle/ready`，重复调用幂等 |
-| `stop` | 无 | 取消活动导航并停止卡片会话，释放订阅和任务状态；重复调用幂等。物理停车确认仍由 Driver 返回 |
-
-### 业务动作
-
 | action | 参数 | 语义 |
 | --- | --- | --- |
-| `start_mapping` | `map_name:string` | 自动切换到 mapping runtime，开始新地图；已存在同名地图时拒绝覆盖 |
-| `stop_mapping` | 无 | 停止建图，原子保存地图和 pose graph，然后切回 localization 并加载新地图 |
-| `switch_runtime_mode` | `runtime_mode:mapping|localization`、`map_name?:string` | 独立切换 Nav2 容器模式；localization 必须指定已保存地图，存在未保存建图 session 时拒绝切换 |
-| `tag_place` | `name:string`、`description?:string` | 在当前 `map` 位姿记录语义位置标签 |
-| `untag_place` | `name:string` | 删除当前地图中的标签；不存在时返回可判定错误 |
-| `list_tags` | 无 | 返回当前地图的全部标签及其 pose |
-| `list_maps` | 无 | 返回已保存地图、状态和元数据 |
-| `delete_map` | `map_name:string` | 删除未加载、未建图中的地图；活动地图不得删除 |
-| `load_map` | `map_name:string` | 加载地图并进入 localization；定位未 ready 时不得宣称成功 |
-| `navigate_to_tag` | `tag_name:string`、`speed?:number` | 以固定绕障模式非阻塞创建导航任务并返回唯一 `nav_id` |
-| `navigate_to_pose` | `x:number`、`y:number`、`yaw:number`、`speed?:number` | 以固定绕障模式非阻塞创建 `map` frame 导航任务并返回唯一 `nav_id` |
-| `wait_navigation_done` | `stall_timeout?:number` | 等待当前任务到达、取消、超时或错误，返回 terminal receipt |
-| `pause_nav` | 无 | 暂停当前导航并等待 Nav2 接受；无活动任务时幂等返回 |
-| `resume_nav` | 无 | 恢复已暂停任务；状态不允许时明确拒绝 |
-| `stop_nav` | 无 | 取消当前任务，发布终态零速并等待 Nav2 terminal；物理停车确认由 Driver 完成 |
+| `navigate_to_pose` | `x`、`y`、`yaw`、`speed?` | 在 `map` frame 中非阻塞创建导航任务 |
+| `wait_navigation_done` | `stall_timeout?` | 等待到达、取消、超时或错误 |
+| `pause_nav` | 无 | 暂停当前导航 |
+| `resume_nav` | 无 | 恢复已暂停导航 |
+| `stop_nav` | 无 | 取消任务并发布终态零速 |
 
-`speed` 默认 `0.15 m/s`，范围 `0.10–0.15 m/s`。每次发送 Nav2 goal 前会把该值
-发布为 controller server 的绝对线速度上限；限速 topic 无订阅时请求 fail closed。
-DDS transport acknowledgement 不能证明 controller 已应用限速，因此不再把
-`wait_for_all_acked` 当成应用层确认；真正的安全边界是在每条
-`velocity_proposal` 发布前再次把正向 `x` 强制截断到本任务的 `speed`。恢复行为的
-固定后退速度为 `0.15 m/s`，不受该前向限速参数影响；首版导航固定允许绕障。
-为匹配 G1 的可执行死区，DWB 不采样低于 `0.10 m/s` 的纯平移候选，也不采样
-低于 `0.10 rad/s` 的纯旋转候选；零速仍保留给到站、暂停和终止停车。
-参数错误、not-ready、timeout、cancelled 和内部错误必须具有不同的结构化
-`error_code`，不能只返回 HTTP 200 或日志文本。
+`start_mapping`、`stop_mapping`、地图 CRUD、tag CRUD 和 `navigate_to_tag` 已从
+Nav2 公共合同移除。这些能力如果需要，应由 FAST-LIVO2/位置服务单独暴露，
+不应再把 SLAM 运行时塞回 Nav2 卡片。
 
-`map_name` 始终按字符串传给 ROS 2；纯数字地图名（例如 `1`）不得被
-launch 参数自动推断为整数，避免 localization 启动后 command bridge 因参数
-类型不匹配退出。
+## 规划与控制
 
-## 配置
+- NavFn 生成全局路径。
+- global/local costmap 都是 rolling window，直接使用
+  `/ubuntu/navigation/cloud_registered` 的 `PointCloud2` 障碍物。
+- Rotation Shim 在航向偏差大时先旋转，DWB 只采样 `x/yaw`，不采样横移。
+- velocity smoother 使用 `/ubuntu/navigation/odom` 作为反馈。
+- 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
 
-卡片为单实例。Canvas `configSchema` 只暴露 `backend` 和三个控制面 timeout；其余字段
-是 `perception/config.yaml` 与 companion 镜像之间的首版部署合同，用户不能在 Canvas
-热改：
+## Canvas 连线
 
-| 字段 | 默认值 | 范围/更新行为 |
-| --- | --- | --- |
-| `namespace` | `ubuntu` | 首版固定；其他 namespace 会被拒绝 |
-| `map_storage_dir` | `/maps` | 首版固定；由正式 Compose 持久化挂载 |
-| `input_max_age_ms` | `500` | 首版固定，超过后导航 fail closed |
-| `max_forward_mps` | `0.15` | 首版固定安全上限 |
-| `max_reverse_mps` | `0.15` | 首版固定安全上限 |
-| `max_lateral_mps` | `0.0` | 首版禁止横移，非零提案 fail closed |
-| `max_yaw_rps` | `0.35` | 首版固定安全上限 |
-| `max_planar_mps` | `0.18` | 首版固定安全上限 |
-| `proposal_ttl_ms` | `250` | 首版固定；Driver 仍独立校验 |
-| `request_timeout_sec` | `30` | `1–120` s；控制面请求超时 |
-| `runtime_switch_timeout_sec` | `120` | `10–300` s；mapping/localization 切换超时 |
-| `discovery_timeout_sec` | `5` | `0.5–30` s；等待 companion command subscriber |
+Nav2 卡片需要两条必需输入：
 
-`shadow_only` 不是用户可关闭的配置：本卡片始终是 proposal-only。配置更新不能
-自动扩大速度边界，不能静默重启活动任务。首版把数据面参数冻结为已验收值，避免
-Canvas 配置与 companion 实际运行参数出现 silent drift。
+1. FAST-LIVO2 `livo_odom` -> Nav2 `livo_odom`；
+2. FAST-LIVO2 `registered_cloud` -> Nav2 `registered_cloud`；
+3. Nav2 `velocity_proposal` -> Driver `loco.velocity_proposal`。
 
-## 算法与 TF
+地图和轨迹数据流应从 FAST-LIVO2 卡片查看。Nav2 卡片不再发布
+`map_view`，避免两张“地图”在 Canvas 中同时成为权威源。
 
-首版不包含可训练模型，使用：
+## RViz 调试
 
-- SLAM Toolbox：建图和 pose graph 持久化；
-- Map Server + AMCL：已保存地图定位；
-- NavFn：全局路径；
-- Rotation Shim + DWB + velocity smoother：航向偏差较大时先原地转向，
-  再以零横移的前向轨迹跟随路径并平滑限速。
-
-导航默认不使用 G1 的横移能力：DWB 只采样 `x/yaw`，velocity
-smoother 的 y 速度和加速度均为 0，提案协议也拒绝非零 y。这只约束
-Nav2 速度方向；步态、躯干和手臂姿态仍由 Driver/Loco 主运控负责。
-
-TF 链固定为：
-
-```text
-map -> odom -> base_link -> lidar_frame
-```
-
-传感器外参必须来自 Driver/机器人模型的可追溯配置，并在启动时校验；不能使用
-零外参或视图层坐标变换代替真实 TF。依赖版本、镜像 digest 和许可证必须在实现
-阶段写入 source lock/第三方清单，不能依赖浮动 latest。
-
-## Canvas 地图监控
-
-Nav2 companion 将 `/map` 中占用率不低于 65% 的栅格转换为
-Canvas 已支持的 `sensor/mapping` 全量快照，并通过
-`map -> base_link` TF 加入当前机器人位置和朝向。该输出仅包含地图
-监控数据，不包含 action、service 或速度指令。
-
-在 Canvas 中将 Nav2 卡片加入当前工程并启动后：
-
-1. 点击 Nav2 卡片的「查看数据流」，会直接打开 `map_view`；也可进入
-   Canvas 「监控」页查看 `/ubuntu/navigation/nav2/map_view`。
-2. mapping runtime 中地图随 SLAM 更新；localization runtime 中显示已加载地图。
-3. 绿色机器人标记表示当前位置和朝向，可在视图中旋转、缩放或
-   切换跟随机器人。
-
-卡片右侧的 `mapping` 端口只用于地图监控；连接 Driver `loco` 时必须使用
-标记为 `json` 的 `velocity_proposal` 端口，不能把 `map_view` 接入执行器。
-
-当 `/map` 未准备好、map frame 不匹配或 `map -> base_link` TF 不可用时，
-companion 不发布伪造位姿，Canvas 保持等待数据。单帧最多 80,000 个
-占用点，更大地图会均匀降采样，不改变 Nav2 实际规划使用的地图。
-
-## RViz 地图与导航可视化（开发备用）
-
-companion 包内置 [nav2.rviz](companion/g1_nav2/rviz/nav2.rviz)，固定以 `map`
-为坐标系，显示已保存/实时地图、全局路径、局部 costmap、LaserScan、
-odom、机器人 footprint 和 TF。该配置只订阅标准 ROS 2 topic，不含
-`SetGoal` / `InitialPose` 等会改变导航状态的 RViz 工具。
-
-在与 G1 同一 DDS 网络的 Ubuntu 开发机上，从仓库根目录执行：
+[nav2.rviz](companion/g1_nav2/rviz/nav2.rviz) 只读显示 FAST-LIVO2 registered
+cloud、odom、TF、global path、rolling costmap 和 footprint，不包含
+`SetGoal` 或 `InitialPose` 工具。
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -327,80 +121,28 @@ export ROS_DOMAIN_ID=42
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 
-ros2 topic info /map -v
-ros2 topic info /ubuntu/navigation/nav2/scan -v
+ros2 topic info /ubuntu/navigation/odom -v
+ros2 topic info /ubuntu/navigation/cloud_registered -v
 rviz2 -d perception/plugins/nav2/companion/g1_nav2/rviz/nav2.rviz
 ```
 
-如开发机只安装 ROS 2 Jazzy，可将第一行替换为
-`source /opt/ros/jazzy/setup.bash`，但必须先用上述 `topic info` 确认标准消息
-可发现；这条路径只用于可视化，不用它发布目标或调用 Nav2 service。
+## 构建与部署
 
-在本地 colcon 安装过 `g1_nav2` 包后，也可从包的 share 目录打开：
+FAST-LIVO2 和 Nav2 companion 都已接入 `perception/deploy/service.yml`，与
+Perception 一起启动。Nav2 容器无地图 volume、无 Driver SDK、无 Docker
+socket，且以 read-only 模式运行。
 
 ```bash
-source install/setup.bash
-rviz2 -d "$(ros2 pkg prefix --share g1_nav2)/rviz/nav2.rviz"
+cd perception/plugins/nav2/companion
+docker compose --env-file source-lock.env build nav2
 ```
 
-主视图中 `/map` 只在 mapping runtime 正在建图，或 localization runtime
-已成功加载地图时有数据。`Global Costmap` 默认关闭以避免遮住原图，
-需要排查全局避障时可在 Displays 面板手动打开。本配置不要求 G1 安装
-RViz，也不会从可视化机器上发送运动命令。日常验收优先使用上述
-Canvas 地图监控；RViz 仅用于需要同时排查 path、costmap 和 TF 的开发场景。
-
-## 部署
-
-- 目标运行环境：G1 Jetson ARM64、Ubuntu 20.04、ROS 2 Humble、DDS host network。
-- `nav2` Plugin 运行在正式 Perception Bundle；Nav2 companion 作为同一正式
-  Perception Compose 项目的受管 service 随 Perception 一起启动。
-- 卡片进程不得调用 Docker、不得挂载 Docker socket，也不得自行创建容器。
-- Compose 将宿主机 `/opt/phanthy-motus/data/nav2/maps` 挂载到容器 `/maps`；容器重建和机器人重启后地图仍可恢复。
-- 不需要 CUDA、训练模型、云端服务或 Unitree SDK。
-- x86 CPU 仅用于契约、回放和 Compose smoke；不能代替 ARM64 或真机验收。
-
-正式 `perception/deploy/service.yml` 已加入 companion service；整体执行
-`docker compose up -d` 时两者会一起启动和重启。Canvas 的 `start/stop` 只管理卡片
-ROS 资源和导航任务，不负责创建或销毁基础容器。
-
-当前 Agent Core 部署器仍按“一个 `service.yml` 只有一个 service”的旧假设工作：它会
-合并两个 service，但仅对第一个执行 `docker compose up --no-deps`。因此从 Dashboard
-首次部署 Perception 时，Nav2 companion 不会被自动拉起；还需要部署器新增 multi-service
-启动和 sidecar 镜像解析能力。该修改超出本 PR 允许的 Perception 范围。
-
-### G1 测试容器
-
-在正式部署器支持 multi-service 前，可使用
-`deploy/scripts/owner-start-g1-test-containers.sh` 在 G1 上显式启动两个临时测试容器：
-
-- `embodied-perception-test`：使用默认 `perception/config.yaml` 的完整 Perception Bundle，不是 nav2-only 配置。
-- `embodied-perception-nav2-test`：Nav2 companion，持久化地图目录与正式 Compose 一致。
-
-脚本不修改 `/opt/phanthy-motus/docker-compose.yml`，不启动 Canvas，不调用 Nav2 action
-或 Driver。两个容器的 restart policy 固定为 `no`，仅用于当次人工调试。
-启动前必须保持 Core/Driver 运行且 Canvas project 已停止。若 Core 已启用
-token 认证，由调用方显式提供 `CORE_ACCESS_TOKEN`。脚本会查询真实 Canvas 状态；
-查询失败或 Canvas 仍在运行时 fail closed，不使用字符串确认变量绕过检查。
-
-从仓库根目录执行：
+G1 临时验证容器：
 
 ```bash
-git switch feat/Nav2-card
-git pull --ff-only origin feat/Nav2-card
-
-BUILD_DATE="$(date +%y%m%d)"
-COMMIT="$(git rev-parse --short=7 HEAD)"
-export PERCEPTION_IMAGE="local/phanthy-motus/perception:release.${BUILD_DATE}.${COMMIT}-jetson"
-export NAV2_IMAGE="phanthy-nav2:nav2-card-${COMMIT}"
-export ROS_BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f"
-
-./deploy/build_perception.sh --variant jetson --mirror tuna
-
-(
-  cd perception/plugins/nav2/companion
-  DOCKER_BUILDKIT=0 NAV2_IMAGE="${NAV2_IMAGE}" ROS_BASE_IMAGE="${ROS_BASE_IMAGE}" \
-    docker compose --env-file source-lock.env build nav2
-)
+export PERCEPTION_IMAGE=local/phanthy-motus/perception:<tag>
+export FAST_LIVO2_IMAGE=phanthy-fast-livo2:<tag>
+export NAV2_IMAGE=phanthy-nav2:<tag>
 
 STAGE=preflight \
   bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
@@ -409,62 +151,23 @@ STAGE=start \
   bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
 ```
 
-G1 构建显式使用已锁定的内部 ARM64 ROS Humble 基础镜像，并关闭 BuildKit 的
-Docker Hub metadata 查询；因此即使 G1 无法访问 `registry-1.docker.io` 也能使用本地缓存构建。
+脚本会验证 Core/Driver/Canvas 状态、端口冲突、三个镜像的架构、FAST-LIVO2
+地图目录权限和 owner label；
+不会发布导航目标或机器人命令。如 Core 启用认证，显式提供
+`CORE_ACCESS_TOKEN`。
 
-`start` 会重复执行全部 preflight，等待 MCP `tools/list` 真实返回 `nav2`；任一容器
-提前退出或超时时，它会输出两侧日志尾部，并且只清理本次创建、携带
-`com.phanthymotus.test-owner=nav2-card` 标签的测试容器。
+Canvas 启动时 Nav2 只等待 companion 的 DDS 控制面，不等待 odom/cloud，避免
+与 FAST-LIVO2 的 `start_mapping` action 形成生命周期环形等待。真正执行
+`navigate_to_pose` 时仍会严格检查输入 freshness、frame、TF 和 lifecycle。
 
-查看状态或停止：
+## 验收边界
 
-```bash
-STAGE=status \
-  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
+当前可以在不下发物理命令的情况下验证：合同、配置、MCP 注册、容器
+启动、FAST-LIVO2 时间/frame readiness、路径/costmap 和 bounded proposal。
 
-STAGE=stop \
-  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
-```
+完整真机导航还必须同时满足：
 
-`stop` 同样要求 Canvas project 已停止，并拒绝操作缺少上述 owner 标签的同名容器。
-上述流程每次都会先拉取当前分支，再根据新 `HEAD` 生成两个镜像 tag；Docker
-层缓存会复用未变的构建步骤，但不会静默启动上一个 commit 的镜像。
-
-范围外依赖：当前官方 Agent Core 没有消费 `x-execution-control` / `x-topic-actions`，
-所以还不能把每个导航任务的受信 `nav_id` 自动绑定到 Driver `loco` lease。该能力应
-由 Core 单独实现；本卡片不会通过直接调用 Driver 或伪造授权绕过这一门禁。
-
-## 验收
-
-实现完成后至少通过：
-
-1. `validate_card.py`：tool id、type、生命周期、topic 和 schema 一致。
-2. 单元测试：参数边界、状态机、重复 start/stop、地图原子保存、标签 CRUD、
-   goal correlation、终态零速和结构化错误。
-3. ROS 2 回放：合成/录制的 state 与点云能够产生新鲜 odom/scan、完整 TF、地图、
-   非空路径和 bounded proposal；输入断流后在时限内停止提案。
-4. Compose smoke：Perception 与 Nav2 companion 按依赖顺序启动，重启后地图恢复；
-   companion 不可用时卡片显示 not-ready。
-5. Canvas：两路必需输入和一个 proposal 输出可正确连线；固定绕障模式不显示
-   `mode` 选项，缺输入和过期输入可见失败。`goal_pose` 执行要求 Core
-   消费 `x-topic-actions`，在官方 Core 提供该能力前只验证 schema 和连线。
-6. G1 真机：由 owner 明确授权并持有遥控器/急停，验证建图、保存/加载、标签导航、
-   绕障重规划、到达、取消、Driver 停车确认和 lease 释放。
-
-只有控制面注册、`tools/list`、进程存活、shadow proposal 或短距离直行都不构成
-完整验收。真机运动必须单独授权，自动化测试和 CI 禁止下发物理动作。
-
-## 当前阶段
-
-阶段三到五的代码已实现。阶段六已在 amd64 Ubuntu 集成主机完成
-镜像构建、Compose smoke、18 项测试、MCP 唯一注册和配置恢复、Canvas
-`input_topics` 连线、建图/停图/原子存图、结构化 proposal、传感器断流
-零速保护与恢复、10 轮 start/stop、非法输入隔离和 Perception 重启验证。
-
-当前仍是 Draft，不能宣称完整可用：本轮已有 PCLMETA2、刚性 LiDAR 坐标恢复、
-整帧时钟归一化、重复 publisher 拒绝和提案侧速度截断的确定性测试，但尚未用
-新版 Driver + companion 在真机现场重建一张地图；合成点云也不能证明非空房间
-路径规划。此外，官方 Core 尚未消费
-`x-execution-control` / `x-topic-actions`，
-所以 Driver lease 和 `goal_pose` 执行闭环仍是外部 blocker。ARM64 生产镜像、真实
-录包、Dashboard 人工界面确认以及 G1 真机执行属于后续验收。
+1. FAST-LIVO2 卡片已发布上述 canonical topic 和 `map -> base_link` TF；
+2. Agent Core 已把受信 `nav_id` 与 Driver lease 绑定；
+3. Driver 返回提案执行和停车确认；
+4. owner 持有遥控器/急停并显式授权真机运动。

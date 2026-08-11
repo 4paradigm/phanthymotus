@@ -1,0 +1,28 @@
+services:
+  fast_livo2:
+    image: ${FAST_LIVO2_IMAGE:-phanthy-fast-livo2:perception-card-dev}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        FAST_LIVO2_BASE_IMAGE: ${FAST_LIVO2_BASE_IMAGE:?locked FAST-LIVO2 base image required}
+    container_name: embodied-perception-fast-livo2
+    network_mode: host
+    ipc: host
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m
+      - /root/.ros:rw,nosuid,nodev,noexec,size=64m
+    volumes:
+      - ${FAST_LIVO2_MAP_DIR:-./maps}:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
+    group_add:
+      - "${FAST_LIVO2_MAP_GID:-1000}"
+    environment:
+      ROS_DOMAIN_ID: "42"
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      FASTDDS_BUILTIN_TRANSPORTS: ${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"

@@ -1,40 +1,9 @@
-amcl:
-  ros__parameters:
-    use_sim_time: false
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
-    alpha5: 0.2
-    base_frame_id: base_link
-    global_frame_id: map
-    odom_frame_id: odom
-    robot_model_type: nav2_amcl::OmniMotionModel
-    scan_topic: /ubuntu/navigation/nav2/scan
-    min_particles: 300
-    max_particles: 1200
-    max_beams: 90
-    laser_model_type: likelihood_field
-    laser_min_range: 0.35
-    laser_max_range: 12.0
-    laser_likelihood_max_dist: 2.0
-    transform_tolerance: 0.5
-    update_min_d: 0.10
-    update_min_a: 0.10
-    tf_broadcast: true
-    set_initial_pose: true
-    initial_pose:
-      x: 0.0
-      y: 0.0
-      z: 0.0
-      yaw: 0.0
-
 bt_navigator:
   ros__parameters:
     use_sim_time: false
     global_frame: map
     robot_base_frame: base_link
-    odom_topic: /ubuntu/navigation/nav2/odom
+    odom_topic: /ubuntu/navigation/odom
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 1000
@@ -175,7 +144,7 @@ local_costmap:
     ros__parameters:
       update_frequency: 8.0
       publish_frequency: 2.0
-      global_frame: odom
+      global_frame: map
       robot_base_frame: base_link
       use_sim_time: false
       rolling_window: true
@@ -187,16 +156,16 @@ local_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
-        observation_sources: scan
-        scan:
-          topic: /ubuntu/navigation/nav2/scan
-          data_type: LaserScan
-          clearing: true
+        observation_sources: registered_cloud
+        registered_cloud:
+          topic: /ubuntu/navigation/cloud_registered
+          data_type: PointCloud2
+          clearing: false
           marking: true
-          obstacle_min_range: 0.35
-          obstacle_max_range: 6.0
-          raytrace_min_range: 0.35
-          raytrace_max_range: 8.0
+          min_obstacle_height: -0.10
+          max_obstacle_height: 1.80
+          obstacle_min_range: 0.20
+          obstacle_max_range: 8.0
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.0
@@ -211,44 +180,31 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: false
+      rolling_window: true
+      width: 12
+      height: 12
       resolution: 0.05
-      track_unknown_space: true
+      track_unknown_space: false
       footprint: "[[0.32, 0.28], [0.32, -0.28], [-0.32, -0.28], [-0.32, 0.28]]"
-      plugins: [static_layer, obstacle_layer, inflation_layer]
-      static_layer:
-        plugin: nav2_costmap_2d::StaticLayer
-        map_subscribe_transient_local: true
+      plugins: [obstacle_layer, inflation_layer]
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
-        observation_sources: scan
-        scan:
-          topic: /ubuntu/navigation/nav2/scan
-          data_type: LaserScan
-          clearing: true
+        observation_sources: registered_cloud
+        registered_cloud:
+          topic: /ubuntu/navigation/cloud_registered
+          data_type: PointCloud2
+          clearing: false
           marking: true
-          obstacle_min_range: 0.35
-          obstacle_max_range: 6.0
-          raytrace_min_range: 0.35
-          raytrace_max_range: 8.0
+          min_obstacle_height: -0.10
+          max_obstacle_height: 1.80
+          obstacle_min_range: 0.20
+          obstacle_max_range: 8.0
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.0
         inflation_radius: 0.55
       always_send_full_costmap: true
-
-map_server:
-  ros__parameters:
-    use_sim_time: false
-    yaml_filename: ""
-
-map_saver:
-  ros__parameters:
-    use_sim_time: false
-    save_map_timeout: 8.0
-    free_thresh_default: 0.25
-    occupied_thresh_default: 0.65
-    map_subscribe_transient_local: true
 
 planner_server:
   ros__parameters:
@@ -286,7 +242,7 @@ behavior_server:
       plugin: nav2_behaviors/DriveOnHeading
     wait:
       plugin: nav2_behaviors/Wait
-    global_frame: odom
+    global_frame: map
     robot_base_frame: base_link
     transform_tolerance: 0.2
     simulate_ahead_time: 2.0
@@ -315,7 +271,7 @@ velocity_smoother:
     min_velocity: [-0.15, 0.0, -0.25]
     max_accel: [0.30, 0.0, 0.40]
     max_decel: [-0.30, 0.0, -0.40]
-    odom_topic: /ubuntu/navigation/nav2/odom
+    odom_topic: /ubuntu/navigation/odom
     odom_duration: 0.2
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 0.5

@@ -4,9 +4,8 @@ Panels:
     Name: Displays
     Property Tree Widget:
       Expanded:
-        - /Saved Map1
         - /Global Path1
-        - /Laser Scan1
+        - /FAST-LIVO2 Registered Cloud1
       Splitter Ratio: 0.5
     Tree Height: 612
   - Class: rviz_common/Selection
@@ -32,25 +31,6 @@ Visualization Manager:
       Plane: XY
       Plane Cell Count: 40
       Reference Frame: <Fixed Frame>
-    - Alpha: 0.85
-      Class: rviz_default_plugins/Map
-      Color Scheme: map
-      Draw Behind: true
-      Enabled: true
-      Name: Saved Map
-      Topic:
-        Depth: 5
-        Durability Policy: Transient Local
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /map
-      Update Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /map_updates
-      Use Timestamp: false
     - Alpha: 0.35
       Class: rviz_default_plugins/Map
       Color Scheme: costmap
@@ -122,7 +102,7 @@ Visualization Manager:
         Value: true
       Axis: Z
       Channel Name: intensity
-      Class: rviz_default_plugins/LaserScan
+      Class: rviz_default_plugins/PointCloud2
       Color: 255; 0; 0
       Color Transformer: FlatColor
       Decay Time: 0
@@ -132,7 +112,7 @@ Visualization Manager:
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Laser Scan
+      Name: FAST-LIVO2 Registered Cloud
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
@@ -143,7 +123,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /ubuntu/navigation/nav2/scan
+        Value: /ubuntu/navigation/cloud_registered
       Use Fixed Frame: true
       Use rainbow: true
     - Angle Tolerance: 0.1
@@ -181,7 +161,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /ubuntu/navigation/nav2/odom
+        Value: /ubuntu/navigation/odom
     - Class: rviz_default_plugins/Polygon
       Color: 0; 255; 255
       Enabled: true

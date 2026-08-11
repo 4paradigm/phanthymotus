@@ -10,9 +10,11 @@ fi
 
 STAGE="${STAGE:-preflight}"
 PERCEPTION_IMAGE="${PERCEPTION_IMAGE:-}"
+FAST_LIVO2_IMAGE="${FAST_LIVO2_IMAGE:-}"
 NAV2_IMAGE="${NAV2_IMAGE:-}"
 
 PERCEPTION_CONTAINER="${PERCEPTION_CONTAINER:-embodied-perception-test}"
+FAST_LIVO2_CONTAINER="${FAST_LIVO2_CONTAINER:-embodied-perception-fast-livo2-test}"
 NAV2_CONTAINER="${NAV2_CONTAINER:-embodied-perception-nav2-test}"
 AGENT_CORE_CONTAINER="${AGENT_CORE_CONTAINER:-phanthy-motus-agent-core-1}"
 DRIVER_CONTAINER="${DRIVER_CONTAINER:-embodied-unitree-g1}"
@@ -20,14 +22,11 @@ CORE_ACCESS_TOKEN="${CORE_ACCESS_TOKEN:-}"
 
 AGENT_CORE_URL="${AGENT_CORE_URL:-https://localhost:15678}"
 PERCEPTION_MCP_URL="${PERCEPTION_MCP_URL:-http://127.0.0.1:15720/mcp}"
-MAP_DIR="${MAP_DIR:-/opt/phanthy-motus/data/nav2/maps}"
 MODELS_DIR="${MODELS_DIR:-/opt/embodied/models}"
+FAST_LIVO2_MAP_DIR="${FAST_LIVO2_MAP_DIR:-/opt/phanthy-motus/data/fast_livo2/maps}"
 START_TIMEOUT_SEC="${START_TIMEOUT_SEC:-120}"
 
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
-NAV2_MODE="${NAV2_MODE:-mapping}"
-NAV2_MAP_NAME="${NAV2_MAP_NAME:-}"
-
 TEST_OWNER_LABEL="com.phanthymotus.test-owner"
 TEST_OWNER_VALUE="nav2-card"
 
@@ -125,7 +124,7 @@ require_port_free() {
   [[ -z "${listeners}" ]] || die "TCP port ${port} is already in use"
 }
 
-probe_nav2_tool() {
+probe_navigation_tools() {
   local response
   response="$(curl --fail --silent --show-error \
     --max-time 5 \
@@ -137,8 +136,8 @@ import json
 import sys
 
 payload = json.load(sys.stdin)
-tools = payload.get("result", {}).get("tools", [])
-raise SystemExit(0 if any(tool.get("name") == "nav2" for tool in tools) else 1)
+tools = {tool.get("name") for tool in payload.get("result", {}).get("tools", [])}
+raise SystemExit(0 if {"fast_livo2", "nav2"}.issubset(tools) else 1)
 ' >/dev/null
 }
 
@@ -162,9 +161,11 @@ preflight() {
 
   [[ "$(uname -m)" == "aarch64" ]] || die "this script only starts containers on the G1 aarch64 host"
   [[ -n "${PERCEPTION_IMAGE}" ]] || die "set PERCEPTION_IMAGE to the exact built Perception image"
+  [[ -n "${FAST_LIVO2_IMAGE}" ]] || die "set FAST_LIVO2_IMAGE to the exact built FAST-LIVO2 companion image"
   [[ -n "${NAV2_IMAGE}" ]] || die "set NAV2_IMAGE to the exact built Nav2 companion image"
 
   require_arm64_image "${PERCEPTION_IMAGE}"
+  require_arm64_image "${FAST_LIVO2_IMAGE}"
   require_arm64_image "${NAV2_IMAGE}"
   require_running_container "${AGENT_CORE_CONTAINER}"
   require_running_container "${DRIVER_CONTAINER}"
@@ -172,20 +173,23 @@ preflight() {
 
   container_exists "${PERCEPTION_CONTAINER}" && \
     die "${PERCEPTION_CONTAINER} already exists; inspect it with STAGE=status or remove it with STAGE=stop"
+  container_exists "${FAST_LIVO2_CONTAINER}" && \
+    die "${FAST_LIVO2_CONTAINER} already exists; inspect it with STAGE=status or remove it with STAGE=stop"
   container_exists "${NAV2_CONTAINER}" && \
     die "${NAV2_CONTAINER} already exists; inspect it with STAGE=status or remove it with STAGE=stop"
 
   require_port_free 15720
   require_port_free 15721
-  [[ -d "${MAP_DIR}" ]] || \
-    die "map directory does not exist: ${MAP_DIR}"
-  [[ -w "${MAP_DIR}" ]] || \
-    die "map directory is not writable by $(id -un): ${MAP_DIR}"
   [[ -d "${MODELS_DIR}" ]] || \
     die "Perception models directory does not exist: ${MODELS_DIR}"
+  [[ -d "${FAST_LIVO2_MAP_DIR}" ]] || \
+    die "FAST-LIVO2 map directory does not exist: ${FAST_LIVO2_MAP_DIR}"
+  [[ -w "${FAST_LIVO2_MAP_DIR}" ]] || \
+    die "FAST-LIVO2 map directory is not writable: ${FAST_LIVO2_MAP_DIR}"
 
   note "G1_NAV2_TEST_PREFLIGHT=PASS"
   note "PERCEPTION_IMAGE=${PERCEPTION_IMAGE}"
+  note "FAST_LIVO2_IMAGE=${FAST_LIVO2_IMAGE}"
   note "NAV2_IMAGE=${NAV2_IMAGE}"
   note "NOTE=read-only preflight; no container or robot command was issued"
 }
@@ -207,7 +211,7 @@ remove_created_container() {
 
 show_failure_logs() {
   local name
-  for name in "${PERCEPTION_CONTAINER}" "${NAV2_CONTAINER}"; do
+  for name in "${PERCEPTION_CONTAINER}" "${NAV2_CONTAINER}" "${FAST_LIVO2_CONTAINER}"; do
     if container_exists "${name}"; then
       note "${name}_LOG_TAIL_BEGIN"
       docker logs --tail 80 "${name}" 2>&1 || true
@@ -220,8 +224,9 @@ wait_until_ready() {
   local started_at now
   started_at="$(date +%s)"
   while true; do
+    container_running "${FAST_LIVO2_CONTAINER}" || return 1
     container_running "${NAV2_CONTAINER}" || return 1
-    if container_running "${PERCEPTION_CONTAINER}" && probe_nav2_tool; then
+    if container_running "${PERCEPTION_CONTAINER}" && probe_navigation_tools; then
       return 0
     fi
     now="$(date +%s)"
@@ -233,9 +238,32 @@ wait_until_ready() {
 }
 
 start_test_containers() {
-  local map_gid
   preflight
-  map_gid="$(stat -c '%g' "${MAP_DIR}")"
+
+  note "Starting ${FAST_LIVO2_CONTAINER}"
+  if ! docker run --detach \
+    --name "${FAST_LIVO2_CONTAINER}" \
+    --label "${TEST_OWNER_LABEL}=${TEST_OWNER_VALUE}" \
+    --label "com.phanthymotus.source-revision=${SOURCE_REVISION}" \
+    --network host \
+    --ipc host \
+    --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=512m \
+    --tmpfs /root/.ros:rw,nosuid,nodev,noexec,size=64m \
+    --volume "${FAST_LIVO2_MAP_DIR}:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw" \
+    --group-add "$(stat -c '%g' "${FAST_LIVO2_MAP_DIR}")" \
+    --env "ROS_DOMAIN_ID=${ROS_DOMAIN_ID}" \
+    --env RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+    --env FASTDDS_BUILTIN_TRANSPORTS=UDPv4 \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --log-driver local \
+    --log-opt max-size=20m \
+    --log-opt max-file=3 \
+    --restart no \
+    "${FAST_LIVO2_IMAGE}" >/dev/null; then
+    die "failed to start ${FAST_LIVO2_CONTAINER}"
+  fi
 
   note "Starting ${NAV2_CONTAINER}"
   if ! docker run --detach \
@@ -246,19 +274,9 @@ start_test_containers() {
     --read-only \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
     --tmpfs /root/.ros:rw,nosuid,nodev,noexec,size=64m \
-    --volume "${MAP_DIR}:/maps" \
-    --group-add "${map_gid}" \
     --env "ROS_DOMAIN_ID=${ROS_DOMAIN_ID}" \
     --env RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
     --env FASTDDS_BUILTIN_TRANSPORTS=UDPv4 \
-    --env "NAV2_MODE=${NAV2_MODE}" \
-    --env "NAV2_MAP_NAME=${NAV2_MAP_NAME}" \
-    --env NAV2_LIDAR_X=-0.00368 \
-    --env NAV2_LIDAR_Y=0.00003 \
-    --env NAV2_LIDAR_Z=0.46018 \
-    --env NAV2_LIDAR_ROLL=0.0 \
-    --env NAV2_LIDAR_PITCH=0.04014257279586953 \
-    --env NAV2_LIDAR_YAW=0.0 \
     --cap-drop ALL \
     --security-opt no-new-privileges:true \
     --log-driver local \
@@ -266,6 +284,7 @@ start_test_containers() {
     --log-opt max-file=3 \
     --restart no \
     "${NAV2_IMAGE}" >/dev/null; then
+    remove_created_container "${FAST_LIVO2_CONTAINER}"
     die "failed to start ${NAV2_CONTAINER}"
   fi
 
@@ -291,17 +310,20 @@ start_test_containers() {
     --restart no \
     "${PERCEPTION_IMAGE}" >/dev/null; then
     remove_created_container "${NAV2_CONTAINER}"
-    die "failed to start ${PERCEPTION_CONTAINER}; companion was removed"
+    remove_created_container "${FAST_LIVO2_CONTAINER}"
+    die "failed to start ${PERCEPTION_CONTAINER}; companions were removed"
   fi
 
   if ! wait_until_ready; then
     show_failure_logs
     remove_created_container "${PERCEPTION_CONTAINER}"
     remove_created_container "${NAV2_CONTAINER}"
-    die "test stack did not expose the nav2 MCP tool within ${START_TIMEOUT_SEC}s; created containers were removed"
+    remove_created_container "${FAST_LIVO2_CONTAINER}"
+    die "test stack did not expose the FAST-LIVO2 and Nav2 MCP tools within ${START_TIMEOUT_SEC}s; created containers were removed"
   fi
 
   print_container_status "${PERCEPTION_CONTAINER}"
+  print_container_status "${FAST_LIVO2_CONTAINER}"
   print_container_status "${NAV2_CONTAINER}"
   note "G1_NAV2_TEST_CONTAINERS_START=PASS"
   note "NOTE=full Perception is running with restart=no; Canvas remains stopped and no navigation action was issued"
@@ -314,12 +336,13 @@ status_test_containers() {
   docker info >/dev/null 2>&1 || die "Docker daemon is not accessible"
 
   print_container_status "${PERCEPTION_CONTAINER}"
+  print_container_status "${FAST_LIVO2_CONTAINER}"
   print_container_status "${NAV2_CONTAINER}"
   if container_running "${PERCEPTION_CONTAINER}"; then
-    if probe_nav2_tool; then
+    if probe_navigation_tools; then
       note "G1_NAV2_TEST_MCP=PASS"
     else
-      die "${PERCEPTION_CONTAINER} is running but the nav2 MCP tool is not ready"
+      die "${PERCEPTION_CONTAINER} is running but the FAST-LIVO2/Nav2 MCP tools are not ready"
     fi
   fi
 }
@@ -347,6 +370,7 @@ stop_test_containers() {
 
   stop_one_test_container "${PERCEPTION_CONTAINER}"
   stop_one_test_container "${NAV2_CONTAINER}"
+  stop_one_test_container "${FAST_LIVO2_CONTAINER}"
   note "G1_NAV2_TEST_CONTAINERS_STOP=PASS"
   note "NOTE=only containers labelled ${TEST_OWNER_LABEL}=${TEST_OWNER_VALUE} were removed"
 }

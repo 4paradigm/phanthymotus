@@ -6,16 +6,6 @@ from copy import deepcopy
 
 
 NAV2_ACTIONS = (
-    "start_mapping",
-    "stop_mapping",
-    "switch_runtime_mode",
-    "tag_place",
-    "untag_place",
-    "list_tags",
-    "list_maps",
-    "delete_map",
-    "load_map",
-    "navigate_to_tag",
     "navigate_to_pose",
     "wait_navigation_done",
     "pause_nav",
@@ -31,7 +21,6 @@ NAV2_CONFIG_DEFAULTS = {
     "backend": "ros_topic",
     "shadow_only": True,
     "request_timeout_sec": 30.0,
-    "runtime_switch_timeout_sec": 120.0,
     "discovery_timeout_sec": 5.0,
     "input_max_age_ms": 500,
     "max_forward_mps": 0.15,
@@ -40,7 +29,6 @@ NAV2_CONFIG_DEFAULTS = {
     "max_yaw_rps": 0.35,
     "max_planar_mps": 0.18,
     "proposal_ttl_ms": 250,
-    "map_storage_dir": "/maps",
 }
 
 NAV2_FULL_CONFIG_SCHEMA = {
@@ -68,12 +56,6 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "minimum": 1.0,
             "maximum": 120.0,
             "default": 30.0,
-        },
-        "runtime_switch_timeout_sec": {
-            "type": "number",
-            "minimum": 10.0,
-            "maximum": 300.0,
-            "default": 120.0,
         },
         "discovery_timeout_sec": {
             "type": "number",
@@ -130,11 +112,6 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "maximum": 250,
             "default": 250,
         },
-        "map_storage_dir": {
-            "type": "string",
-            "const": "/maps",
-            "default": "/maps",
-        },
     },
     "additionalProperties": False,
 }
@@ -142,7 +119,6 @@ NAV2_FULL_CONFIG_SCHEMA = {
 _CANVAS_CONFIG_FIELDS = (
     "backend",
     "request_timeout_sec",
-    "runtime_switch_timeout_sec",
     "discovery_timeout_sec",
 )
 NAV2_CONFIG_SCHEMA = {
@@ -155,51 +131,6 @@ NAV2_CONFIG_SCHEMA = {
 }
 
 NAV2_ACTION_PARAMS = {
-    "start_mapping": {
-        "params": ["map_name"],
-        "description": "Start SLAM mapping with given map name",
-    },
-    "stop_mapping": {
-        "params": [],
-        "description": "Stop mapping and save the map",
-    },
-    "switch_runtime_mode": {
-        "params": ["runtime_mode", "map_name"],
-        "description": (
-            "Switch the Nav2 container between mapping and localization. "
-            "Localization requires an existing map_name."
-        ),
-    },
-    "tag_place": {
-        "params": ["name", "description"],
-        "description": "Tag current position with a semantic name",
-    },
-    "untag_place": {
-        "params": ["name"],
-        "description": "Remove a place tag",
-    },
-    "list_tags": {
-        "params": [],
-        "description": "List all tags in current map with relative positions",
-    },
-    "list_maps": {"params": [], "description": "List all saved maps"},
-    "delete_map": {
-        "params": ["map_name"],
-        "description": "Delete a map and its associated data",
-    },
-    "load_map": {
-        "params": ["map_name"],
-        "description": "Load a map (robot must be at map origin)",
-    },
-    "navigate_to_tag": {
-        "params": ["tag_name", "speed"],
-        "description": (
-            "Navigate to a tagged place with obstacle detouring (non-blocking). "
-            "MUST be followed by a "
-            "separate wait_navigation_done call in the same turn to wait for "
-            "arrival before proceeding."
-        ),
-    },
     "navigate_to_pose": {
         "params": ["x", "y", "yaw", "speed"],
         "description": (
@@ -212,9 +143,9 @@ NAV2_ACTION_PARAMS = {
     "wait_navigation_done": {
         "params": ["stall_timeout"],
         "description": (
-            "Block until the previous navigate_to_tag or navigate_to_pose "
+            "Block until the previous navigate_to_pose "
             "completes. Returns on arrival, timeout, or error. Always call "
-            "after navigate_to_tag/navigate_to_pose."
+            "after navigate_to_pose."
         ),
     },
     "pause_nav": {"params": [], "description": "Pause navigation"},
@@ -252,8 +183,8 @@ def nav2_tool_definition(namespace: str) -> dict:
         "type": "processor",
         "multiInstance": False,
         "description": (
-            "Nav2 — mapping, saved-map localization, semantic "
-            "place tags and Nav2 navigation. This Perception card only emits "
+            "Nav2 planner and controller consuming FAST-LIVO2 localization and "
+            "registered obstacles. This Perception card only emits "
             "bounded velocity proposals; an explicitly authorized Driver loco "
             "actuator owns any physical execution."
         ),
@@ -263,7 +194,7 @@ def nav2_tool_definition(namespace: str) -> dict:
             "output_port": "velocity_proposal",
             "target_tool": "loco",
             "lease_argument": "_control_nav_id",
-            "start_actions": ["navigate_to_tag", "navigate_to_pose"],
+            "start_actions": ["navigate_to_pose"],
             "wait_actions": ["wait_navigation_done"],
             "stop_actions": ["stop_nav"],
             "pause_actions": ["pause_nav"],
@@ -292,52 +223,37 @@ def nav2_tool_definition(namespace: str) -> dict:
         ],
         "topic_in": [
             {
-                "port": "loco_state",
-                "topic": f"{root}/loco/state",
-                "format": "data/json",
-                "ros_type": "std_msgs/msg/String",
-                "qos": "BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE",
-                "schema": "unitree.g1.loco_state.legacy",
-                "compatible_schemas": ["phanthy.g1.loco_state.v2"],
+                "port": "livo_odom",
+                "topic": f"{root}/navigation/odom",
+                "format": "sensor/odometry",
+                "ros_type": "nav_msgs/msg/Odometry",
+                "qos": "BEST_EFFORT + KEEP_LAST(depth=5) + VOLATILE",
                 "rate_hz": 10,
-                "timestamp": (
-                    "legacy uses adapter receive time; v2 declares Driver callback "
-                    "receive time in source_stamp_ns using ROS system/Unix clock"
-                ),
-                "frame_id": "odom_source (v2 payload or legacy adapter contract)",
+                "timestamp": "FAST-LIVO2 corrected ROS system time",
+                "frame_id": "map -> base_link",
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
-                "units": "position=m, velocity=m/s, yaw_speed=rad/s",
+                "units": "position=m, velocity=m/s, angular=rad/s",
                 "max_age_ms": 500,
                 "desc": (
-                    "Legacy Driver locomotion JSON remains supported; v2 Driver "
-                    "receive timestamps are freshness-checked before odom/TF"
+                    "Canonical planar navigation odometry produced by the "
+                    "FAST-LIVO2 companion adapter"
                 ),
             },
             {
-                "port": "lidar_cloud",
-                "topic": f"{root}/lidar/cloud",
+                "port": "registered_cloud",
+                "topic": f"{root}/navigation/cloud_registered",
                 "format": "sensor/pointcloud",
-                "ros_type": "std_msgs/msg/UInt8MultiArray",
+                "ros_type": "sensor_msgs/msg/PointCloud2",
                 "qos": "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
-                "schema": "phanthy.g1.lidar_cloud.v2",
                 "rate_hz": 10,
-                "timestamp": (
-                    "PCLMETA2 source_stamp_ns/driver_receive_unix_ns; same Driver "
-                    "callback receive clock as loco_state.v2"
-                ),
-                "frame_id": (
-                    "livox_frame adapter alias for restored rigid LiDAR point bytes; "
-                    "raw source frame retained in PCLMETA2 diagnostics"
-                ),
+                "timestamp": "FAST-LIVO2 corrected ROS system time",
+                "frame_id": "map",
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
-                "units": "PCLMETA2 PointField layout; x/y/z in meters",
+                "units": "x/y/z in meters",
                 "max_age_ms": 500,
                 "desc": (
-                    "Legacy-compatible Driver envelope with a required PCLMETA2 "
-                    "footer. The companion restores rigid LiDAR xyz and PointCloud2 "
-                    "fields, uses only the Driver receive stamp for Nav2 freshness, "
-                    "and rejects legacy or damaged frames instead of fabricating "
-                    "timestamps"
+                    "Motion-compensated registered cloud from FAST-LIVO2; Nav2 "
+                    "uses it only for rolling obstacle costmaps"
                 ),
             },
             {
@@ -377,23 +293,6 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "actuator; never a physical command by itself"
                 ),
             },
-            {
-                "port": "map_view",
-                "topic": f"{root}/navigation/nav2/map_view",
-                "format": "sensor/mapping",
-                "ros_type": "std_msgs/msg/UInt8MultiArray",
-                "qos": "BEST_EFFORT + KEEP_LAST(depth=5) + VOLATILE",
-                "schema": "phanthy.navigation.map_view.v1",
-                "rate_hz": 1,
-                "frame_id": "map",
-                "axes": "ROS REP-103 right-handed: x forward, y left",
-                "units": "x/y=m, yaw=rad, occupancy=percent",
-                "default_preview": True,
-                "desc": (
-                    "Default read-only Canvas preview containing occupied cells "
-                    "and the current robot pose; it cannot issue navigation commands"
-                ),
-            },
         ],
         "inputSchema": {
             "type": "object",
@@ -402,28 +301,6 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "type": "string",
                     "enum": list(NAV2_PUBLIC_ACTIONS),
                     "description": "Action to perform",
-                },
-                "map_name": {
-                    "type": "string",
-                    "description": (
-                        "Map name (required for localization mode, start_mapping, "
-                        "delete_map and load_map)"
-                    ),
-                },
-                "runtime_mode": {
-                    "type": "string",
-                    "enum": ["mapping", "localization"],
-                    "default": "localization",
-                    "description": "Target Nav2 container runtime mode",
-                },
-                "name": {"type": "string", "description": "POI tag name"},
-                "description": {
-                    "type": "string",
-                    "description": "POI description",
-                },
-                "tag_name": {
-                    "type": "string",
-                    "description": "Target tag name for navigation",
                 },
                 "x": {
                     "type": "number",

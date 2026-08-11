@@ -108,6 +108,13 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("fast_livo2", {}).get("enabled", False):
+            from plugins.fast_livo2 import FastLivo2Plugin
+            self._plugins.append(FastLivo2Plugin(plugins_cfg["fast_livo2"], executor))
+            log.info(
+                "FastLivo2Plugin loaded (resources remain idle until Canvas start)"
+            )
+
         if plugins_cfg.get("nav2", {}).get("enabled", False):
             from plugins.nav2 import Nav2Plugin
             self._plugins.append(Nav2Plugin(plugins_cfg["nav2"], executor))
@@ -122,10 +129,12 @@ class PerceptionBundle:
         return tools
 
     def dispatch(self, full_name: str, args: dict) -> dict | None:
-        prefix, sep, tool_name = full_name.partition("_")
-        name = tool_name if sep else prefix
         for p in self._plugins:
-            if p.PREFIX == prefix:
+            if full_name == p.PREFIX:
+                return p.dispatch(p.PREFIX, args)
+            qualified_prefix = f"{p.PREFIX}_"
+            if full_name.startswith(qualified_prefix):
+                name = full_name[len(qualified_prefix):]
                 return p.dispatch(name, args)
         return None
 

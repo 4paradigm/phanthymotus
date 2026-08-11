@@ -52,21 +52,12 @@ class UnavailableNavigationBackend:
         return None
 
 
-_NAVIGATE_ACTIONS = {"navigate_to_tag", "navigate_to_pose"}
+_NAVIGATE_ACTIONS = {"navigate_to_pose"}
 _NAV_CONTROL_ACTIONS = {
     "wait_navigation_done",
     "pause_nav",
     "resume_nav",
     "stop_nav",
-}
-_MAP_MUTATING_ACTIONS = {
-    "start_mapping",
-    "stop_mapping",
-    "switch_runtime_mode",
-    "tag_place",
-    "untag_place",
-    "delete_map",
-    "load_map",
 }
 _TERMINAL_STATUSES = {
     "arrived",
@@ -78,29 +69,6 @@ _TERMINAL_STATUSES = {
     "aborted",
     "rejected",
 }
-
-
-def _text(args: dict, key: str, *, required: bool = True, limit: int = 128) -> str:
-    raw = args.get(key, "")
-    if not isinstance(raw, str):
-        raise NavigationBackendError("invalid_argument", f"{key} must be a string")
-    value = raw.strip()
-    if required and not value:
-        raise NavigationBackendError("missing_argument", f"{key} is required")
-    if len(value) > limit:
-        raise NavigationBackendError(
-            "invalid_argument", f"{key} must not exceed {limit} characters"
-        )
-    return value
-
-
-def _map_name(args: dict) -> str:
-    value = _text(args, "map_name")
-    if value in {".", ".."} or any(char in value for char in ("/", "\\", "\x00")):
-        raise NavigationBackendError(
-            "invalid_argument", "map_name must be a plain name, not a path"
-        )
-    return value
 
 
 def _number(args: dict, key: str, *, default=None) -> float:
@@ -125,29 +93,7 @@ def _number(args: dict, key: str, *, default=None) -> float:
 
 def _normalize(action: str, args: dict) -> dict:
     normalized: dict = {}
-    if action == "switch_runtime_mode":
-        runtime_mode = _text(args, "runtime_mode")
-        if runtime_mode not in {"mapping", "localization"}:
-            raise NavigationBackendError(
-                "invalid_argument",
-                "runtime_mode must be mapping or localization",
-            )
-        normalized["runtime_mode"] = runtime_mode
-        normalized["map_name"] = (
-            _map_name(args) if runtime_mode == "localization" else ""
-        )
-    elif action in {"start_mapping", "delete_map", "load_map"}:
-        normalized["map_name"] = _map_name(args)
-    elif action == "tag_place":
-        normalized["name"] = _text(args, "name")
-        normalized["description"] = _text(
-            args, "description", required=False, limit=512
-        )
-    elif action == "untag_place":
-        normalized["name"] = _text(args, "name")
-    elif action == "navigate_to_tag":
-        normalized["tag_name"] = _text(args, "tag_name")
-    elif action == "navigate_to_pose":
+    if action == "navigate_to_pose":
         normalized["x"] = _number(args, "x")
         normalized["y"] = _number(args, "y")
         normalized["yaw"] = _number(args, "yaw")
@@ -255,13 +201,6 @@ class Nav2Core:
         if action in _NAV_CONTROL_ACTIONS:
             return self._control_navigation(action, args)
 
-        with self._lock:
-            active_nav_id = self._active_nav_id
-        if active_nav_id and action in _MAP_MUTATING_ACTIONS:
-            raise NavigationBackendError(
-                "navigation_active",
-                f"cannot run {action} while navigation {active_nav_id} is active",
-            )
         return self._result(action, self._backend.execute(action, args, nav_id=None))
 
     def _start_navigation(

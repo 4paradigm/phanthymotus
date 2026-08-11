@@ -95,40 +95,33 @@ ASR result JSON:
 
 ## Nav2 卡片
 
-`nav2` 是单实例 `processor` 卡片，提供建图、地图保存/加载、位置标签和点到点导航。
-首版接收 G1 Driver 的 `/ubuntu/loco/state` 与带 `PCLMETA2` footer 的
-`/ubuntu/lidar/cloud` `std_msgs/msg/UInt8MultiArray`，输出
-`/ubuntu/navigation/nav2/velocity_proposal` 以及仅用于 Canvas 监控的
-`/ubuntu/navigation/nav2/map_view`。卡片不会直接调用机器人 SDK；任何物理
-执行都必须由 Agent Core 建立受信任务 lease，再由 Driver 独立完成限幅、急停和停车确认。
+`nav2` 是单实例 `processor` 卡片，只提供点到点导航、路径规划、
+滚动 costmap 局部避障和速度提案。建图、定位、去畸变、地图存储和可视化
+由 FAST-LIVO2 卡片负责。Nav2 不再读取 Driver 原始 state/cloud，不启动
+SLAM Toolbox、AMCL 或 Map Server。
 
 用户可见约束：
 
-- `speed` 范围 `0.05–0.15 m/s`，首版导航固定允许绕障，不显示无可选值的 `mode`；
-- 输入超过 `500 ms`、TF/地图/Nav2 lifecycle 不 ready 时 fail closed；
-- `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud` 都必须只有一个发布者；重复
-  Driver 数据源会被 fail closed，避免不同时间合同的帧交替污染 odom、scan 和地图；
-- `loco_state.v2` 使用 Driver callback 的 ROS system/Unix 时间；LiDAR companion
-  从 `PCLMETA2` 还原 fields/XYZIRT、原始扫描起始时间和逐点 `time`，再以 Driver
-  接收时间为锚进行时钟归一化。归一化 warmup 或缺失合法 footer 时不会发布伪造点云；
+- 必需输入为 FAST-LIVO2 归一化后的 `/ubuntu/navigation/odom` 和
+  `/ubuntu/navigation/cloud_registered`；
+- odom 必须是 `map -> base_link`，registered cloud 必须是 `map` frame，
+  两者使用 ROS system time；
+- 输入超过 `500 ms`、frame 错误、`map -> base_link` TF 或 Nav2 lifecycle
+  不 ready 时 fail closed；
+- `speed` 范围 `0.10–0.15 m/s`，禁止横移，Rotation Shim 先对齐航向；
 - `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；请求速度
   在每条 `velocity_proposal` 上强制限制正向速度，Nav2 `SpeedLimit` 只作为控制器
   advisory，不再把 DDS transport ack 误判为控制器已应用速度；
-- 地图宿主机目录为 `/opt/phanthy-motus/data/nav2/maps`，companion 容器内为 `/maps`；
-- `start_mapping` 自动切换 mapping，`stop_mapping` 原子保存后自动切回 localization；
-- Canvas 「查看数据流」默认打开 `map_view`，以 1 Hz 显示占用栅格和机器人位姿，
-  该数据流不能发起导航或改变机器人状态；
+- 地图/轨迹数据流从 FAST-LIVO2 卡片查看；Nav2 不再发布 `map_view`；
 - 当前官方 Agent Core 尚缺 `x-execution-control` / `x-topic-actions` 消费能力，
   因而 `goal_pose` topic 和 Driver 物理 lease 仍是明确的外部依赖。
 
-Nav2 依赖独立的 ROS 2 Humble companion 镜像。它已经作为第二个 service 接入
-`perception/deploy/service.yml`，整体执行 `docker compose up -d` 时会一起启动；Canvas
-的 `start/stop` 不创建或删除容器。当前 Agent Core Dashboard 部署器仍只启动 fragment
-中的第一个 service（`--no-deps`），所以首次自动部署 sidecar 仍需 Core 的 multi-service
-部署能力，这是本 Perception PR 的范围外依赖。开发构建入口：
-
-Nav2-only 配置会同时禁用 ASR WebSocket 服务；未启用的 ASR 不会占用 `ws_port`、启动
-后台线程或引入 `websockets` 运行时依赖。
+FAST-LIVO2 与 Nav2 都使用独立 ROS 2 companion 镜像，并已作为正式 service
+接入 `perception/deploy/service.yml`。整体执行 `docker compose up -d` 时三者一起
+启动；Canvas 的 `start/stop` 不创建或删除容器。当前 Agent Core Dashboard
+部署器仍只启动 fragment 中的第一个 service（`--no-deps`），所以首次自动部署
+sidecar 仍需 Core 的 multi-service 部署能力，这是本 Perception PR 的范围外依赖。
+Nav2 companion 开发构建入口：
 
 ```bash
 cd perception/plugins/nav2/companion
@@ -137,3 +130,19 @@ docker compose --env-file source-lock.env build nav2
 
 完整 action、topic/schema、配置、部署限制和验收状态见
 [`plugins/nav2/README.md`](plugins/nav2/README.md)。
+
+## FAST-LIVO2 卡片
+
+`fast_livo2` 是 Perception Bundle 内的会话级建图/定位 processor。它通过
+独立 companion 运行锁定的 FAST-LIVO2 算法，消费既有 Driver
+`navigation_sensors` 输出，并向 Nav2 提供权威
+`map -> base_link` odom、`map` registered cloud 和 Canvas `map_view`。
+
+当前只支持同一算法进程内边建图边导航。PCD 会持久化，但锁定算法不支持
+加载旧图或全局重定位，不能把重启后的新会话称作继续定位。输入输出、坐标
+换算、Canvas 连线、构建和部署步骤见
+[`plugins/fast_livo2/README.md`](plugins/fast_livo2/README.md)。
+
+正式 compose 现在包含三个服务：主 Perception、FAST-LIVO2 companion 和
+planner/controller-only Nav2 companion。开发测试脚本同样一次管理三个带
+`com.phanthymotus.test-owner=nav2-card` label 的容器。

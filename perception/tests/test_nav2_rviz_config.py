@@ -16,13 +16,12 @@ class Nav2RvizConfigTest(unittest.TestCase):
 
         self.assertIn("Fixed Frame: map", rviz)
         required_topics = (
-            "/map",
             "/plan",
             "/global_costmap/costmap",
             "/local_costmap/costmap",
             "/local_costmap/published_footprint",
-            "/ubuntu/navigation/nav2/scan",
-            "/ubuntu/navigation/nav2/odom",
+            "/ubuntu/navigation/cloud_registered",
+            "/ubuntu/navigation/odom",
         )
         for topic in required_topics:
             self.assertIn(f"Value: {topic}", rviz)

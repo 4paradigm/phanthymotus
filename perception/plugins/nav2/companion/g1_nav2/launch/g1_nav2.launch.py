@@ -1,4 +1,4 @@
-"""Nav2-only bringup for G1 mapping or saved-map localization."""
+"""Planner/controller-only Nav2 bringup consuming FAST-LIVO2 outputs."""
 
 from __future__ import annotations
 
@@ -6,253 +6,27 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetRemap
-from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
     package_share = get_package_share_directory("g1_nav2")
     nav2_share = get_package_share_directory("nav2_bringup")
-    slam_share = get_package_share_directory("slam_toolbox")
 
-    mode = LaunchConfiguration("mode")
-    map_yaml = LaunchConfiguration("map")
-    map_name = LaunchConfiguration("map_name")
-    maps_root = LaunchConfiguration("maps_root")
     params_file = LaunchConfiguration("params_file")
-    slam_params_file = LaunchConfiguration("slam_params_file")
-    source_cloud_topic = LaunchConfiguration("source_cloud_topic")
-    cloud_topic = LaunchConfiguration("cloud_topic")
-    lidar_frame = LaunchConfiguration("lidar_frame")
-    scan_topic = LaunchConfiguration("scan_topic")
-    odom_input_topic = LaunchConfiguration("odom_input_topic")
     odom_topic = LaunchConfiguration("odom_topic")
+    obstacle_cloud_topic = LaunchConfiguration("obstacle_cloud_topic")
     cmd_vel_raw_topic = LaunchConfiguration("cmd_vel_raw_topic")
     cmd_vel_shadow_topic = LaunchConfiguration("cmd_vel_shadow_topic")
     velocity_proposal_topic = LaunchConfiguration("velocity_proposal_topic")
-    map_view_topic = LaunchConfiguration("map_view_topic")
     command_topic = LaunchConfiguration("command_topic")
     status_topic = LaunchConfiguration("status_topic")
 
-    common_nav_args = {
-        "use_sim_time": "false",
-        "params_file": params_file,
-        "autostart": "true",
-        "use_composition": "False",
-    }
-
-    sensor_adapters = [
-        Node(
-            package="g1_nav2",
-            executable="canvas_pointcloud_bridge",
-            name="g1_canvas_pointcloud_bridge",
-            output="screen",
-            parameters=[
-                {
-                    "input_topic": source_cloud_topic,
-                    "output_topic": cloud_topic,
-                    "status_topic": "/ubuntu/navigation/nav2/lidar_status",
-                    "output_frame_id": lidar_frame,
-                    "timestamp_mode": "auto",
-                    "clock_warmup_samples": 8,
-                    "clock_window_samples": 200,
-                    "already_aligned_tolerance": 2.0,
-                    "max_source_age": 0.5,
-                    "source_future_tolerance": 0.1,
-                }
-            ],
-        ),
-        Node(
-            package="g1_nav2",
-            executable="loco_odom_bridge",
-            name="g1_loco_odom_bridge",
-            output="screen",
-            parameters=[
-                {
-                    "input_topic": odom_input_topic,
-                    "odom_topic": odom_topic,
-                    "status_topic": "/ubuntu/navigation/nav2/odom_status",
-                    "odom_frame": "odom",
-                    "base_frame": "base_link",
-                    "reset_origin": True,
-                    "velocity_frame": "body",
-                    "publish_tf": True,
-                    "source_timeout": 0.5,
-                    "source_future_tolerance": 0.1,
-                }
-            ],
-        ),
-        Node(
-            package="tf2_ros",
-            executable="static_transform_publisher",
-            name="g1_lidar_static_tf",
-            condition=IfCondition(LaunchConfiguration("publish_lidar_static_tf")),
-            arguments=[
-                "--x", LaunchConfiguration("lidar_x"),
-                "--y", LaunchConfiguration("lidar_y"),
-                "--z", LaunchConfiguration("lidar_z"),
-                "--roll", LaunchConfiguration("lidar_roll"),
-                "--pitch", LaunchConfiguration("lidar_pitch"),
-                "--yaw", LaunchConfiguration("lidar_yaw"),
-                "--frame-id", "base_link",
-                "--child-frame-id", lidar_frame,
-            ],
-        ),
-        Node(
-            package="pointcloud_to_laserscan",
-            executable="pointcloud_to_laserscan_node",
-            name="g1_pointcloud_to_laserscan",
-            remappings=[
-                ("cloud_in", cloud_topic),
-                ("scan", scan_topic),
-            ],
-            parameters=[
-                {
-                    "target_frame": lidar_frame,
-                    "transform_tolerance": 0.05,
-                    "min_height": -0.20,
-                    "max_height": 0.25,
-                    "angle_min": -3.141592653589793,
-                    "angle_max": 3.141592653589793,
-                    "angle_increment": 0.008726646259971648,
-                    "scan_time": 0.1,
-                    "range_min": 0.35,
-                    "range_max": 12.0,
-                    "use_inf": True,
-                    "inf_epsilon": 1.0,
-                    "queue_size": 1,
-                }
-            ],
-        ),
-        Node(
-            package="g1_nav2",
-            executable="canvas_map_view",
-            name="g1_nav2_canvas_map_view",
-            output="screen",
-            parameters=[
-                {
-                    "map_topic": "/map",
-                    "output_topic": map_view_topic,
-                    "map_frame": "map",
-                    "base_frame": "base_link",
-                    "occupancy_threshold": 65,
-                    "max_points": 80000,
-                    "publish_rate_hz": 1.0,
-                }
-            ],
-        ),
-        Node(
-            package="g1_nav2",
-            executable="navigation_command_bridge",
-            name="g1_nav2_navigation_command",
-            output="screen",
-            parameters=[
-                {
-                    "command_topic": command_topic,
-                    "status_topic": status_topic,
-                    "runtime_switch_topic": "/ubuntu/navigation/nav2/runtime_switch",
-                    "action_name": "/navigate_to_pose",
-                    "shadow_topic": cmd_vel_shadow_topic,
-                    "proposal_topic": velocity_proposal_topic,
-                    "controller_speed_limit_topic": (
-                        "/ubuntu/navigation/nav2/speed_limit"
-                    ),
-                    "speed_limit_timeout": 3.0,
-                    "behavior_tree_path": os.path.join(
-                        package_share,
-                        "behavior_trees",
-                        "navigate_to_pose_w_replanning_and_recovery.xml",
-                    ),
-                    "proposal_ttl_ms": 250,
-                    "enforce_shadow_isolation": True,
-                    "max_shadow_speed": 0.15,
-                    "supported_mode": 0,
-                    "goal_response_timeout": 8.0,
-                    "runtime_mode": mode,
-                    "maps_root": maps_root,
-                    "startup_map_name": ParameterValue(map_name, value_type=str),
-                    "service_timeout": 20.0,
-                    "pose_lookup_timeout": 2.0,
-                    "odom_status_topic": "/ubuntu/navigation/nav2/odom_status",
-                    "scan_topic": scan_topic,
-                    "sensor_max_age_sec": 0.5,
-                    "sensor_max_stamp_skew_sec": 0.2,
-                }
-            ],
-        ),
-    ]
-
-    mapping = GroupAction(
-        condition=IfCondition(
-            PythonExpression(["'", mode, "' == 'mapping'"])
-        ),
-        actions=[
-            SetRemap(src="/cmd_vel", dst=cmd_vel_raw_topic),
-            SetRemap(src="cmd_vel", dst=cmd_vel_raw_topic),
-            SetRemap(src="/cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
-            SetRemap(src="cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(nav2_share, "launch", "navigation_launch.py")
-                ),
-                launch_arguments=common_nav_args.items(),
-            ),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(slam_share, "launch", "online_async_launch.py")
-                ),
-                launch_arguments={
-                    "use_sim_time": "false",
-                    "slam_params_file": slam_params_file,
-                }.items(),
-            ),
-        ],
-    )
-
-    localization = GroupAction(
-        condition=IfCondition(
-            PythonExpression(["'", mode, "' == 'localization'"])
-        ),
-        actions=[
-            SetRemap(src="/cmd_vel", dst=cmd_vel_raw_topic),
-            SetRemap(src="cmd_vel", dst=cmd_vel_raw_topic),
-            SetRemap(src="/cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
-            SetRemap(src="cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(nav2_share, "launch", "bringup_launch.py")
-                ),
-                launch_arguments={
-                    **common_nav_args,
-                    "slam": "False",
-                    "map": map_yaml,
-                }.items(),
-            ),
-        ],
-    )
-
     return LaunchDescription(
         [
-            DeclareLaunchArgument(
-                "mode",
-                default_value="mapping",
-                description="mapping or localization",
-            ),
-            DeclareLaunchArgument(
-                "map",
-                default_value="",
-                description="saved map.yaml path required in localization mode",
-            ),
-            DeclareLaunchArgument(
-                "map_name",
-                default_value="",
-                description="saved map name required in localization mode",
-            ),
-            DeclareLaunchArgument("maps_root", default_value="/maps"),
             DeclareLaunchArgument(
                 "params_file",
                 default_value=os.path.join(
@@ -260,41 +34,11 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
-                "slam_params_file",
-                default_value=os.path.join(
-                    package_share, "config", "slam_toolbox.yaml"
-                ),
+                "odom_topic", default_value="/ubuntu/navigation/odom"
             ),
             DeclareLaunchArgument(
-                "source_cloud_topic",
-                default_value="/ubuntu/lidar/cloud",
-            ),
-            DeclareLaunchArgument(
-                "cloud_topic",
-                default_value="/ubuntu/navigation/nav2/cloud",
-            ),
-            DeclareLaunchArgument(
-                "scan_topic",
-                default_value="/ubuntu/navigation/nav2/scan",
-            ),
-            DeclareLaunchArgument(
-                "lidar_frame",
-                default_value="livox_frame",
-            ),
-            DeclareLaunchArgument(
-                "publish_lidar_static_tf",
-                default_value="true",
-                description=(
-                    "Publish the configured base_link -> rigid LiDAR "
-                    "adapter frame extrinsics; "
-                    "set false when the robot already publishes this TF"
-                ),
-            ),
-            DeclareLaunchArgument(
-                "odom_input_topic", default_value="/ubuntu/loco/state"
-            ),
-            DeclareLaunchArgument(
-                "odom_topic", default_value="/ubuntu/navigation/nav2/odom"
+                "obstacle_cloud_topic",
+                default_value="/ubuntu/navigation/cloud_registered",
             ),
             DeclareLaunchArgument(
                 "cmd_vel_raw_topic",
@@ -309,10 +53,6 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/ubuntu/navigation/nav2/velocity_proposal",
             ),
             DeclareLaunchArgument(
-                "map_view_topic",
-                default_value="/ubuntu/navigation/nav2/map_view",
-            ),
-            DeclareLaunchArgument(
                 "command_topic",
                 default_value="/ubuntu/navigation/nav2/command",
             ),
@@ -320,26 +60,54 @@ def generate_launch_description() -> LaunchDescription:
                 "status_topic",
                 default_value="/ubuntu/navigation/nav2/status",
             ),
-            DeclareLaunchArgument(
-                "lidar_x", description="Configured base_link -> lidar x (m)"
+            SetRemap(src="/cmd_vel", dst=cmd_vel_raw_topic),
+            SetRemap(src="cmd_vel", dst=cmd_vel_raw_topic),
+            SetRemap(src="/cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
+            SetRemap(src="cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(nav2_share, "launch", "navigation_launch.py")
+                ),
+                launch_arguments={
+                    "use_sim_time": "false",
+                    "params_file": params_file,
+                    "autostart": "true",
+                    "use_composition": "False",
+                }.items(),
             ),
-            DeclareLaunchArgument(
-                "lidar_y", description="Configured base_link -> lidar y (m)"
+            Node(
+                package="g1_nav2",
+                executable="planner_command_bridge",
+                name="g1_nav2_planner_command",
+                output="screen",
+                parameters=[
+                    {
+                        "command_topic": command_topic,
+                        "status_topic": status_topic,
+                        "action_name": "/navigate_to_pose",
+                        "shadow_topic": cmd_vel_shadow_topic,
+                        "proposal_topic": velocity_proposal_topic,
+                        "controller_speed_limit_topic": (
+                            "/ubuntu/navigation/nav2/speed_limit"
+                        ),
+                        "speed_limit_timeout": 3.0,
+                        "behavior_tree_path": os.path.join(
+                            package_share,
+                            "behavior_trees",
+                            "navigate_to_pose_w_replanning_and_recovery.xml",
+                        ),
+                        "proposal_ttl_ms": 250,
+                        "enforce_shadow_isolation": True,
+                        "max_shadow_speed": 0.15,
+                        "supported_mode": 0,
+                        "goal_response_timeout": 8.0,
+                        "global_frame": "map",
+                        "base_frame": "base_link",
+                        "odom_topic": odom_topic,
+                        "obstacle_cloud_topic": obstacle_cloud_topic,
+                        "sensor_max_age_sec": 0.5,
+                    }
+                ],
             ),
-            DeclareLaunchArgument(
-                "lidar_z", description="Configured base_link -> lidar z (m)"
-            ),
-            DeclareLaunchArgument(
-                "lidar_roll", description="Configured base_link -> lidar roll (rad)"
-            ),
-            DeclareLaunchArgument(
-                "lidar_pitch", description="Configured base_link -> lidar pitch (rad)"
-            ),
-            DeclareLaunchArgument(
-                "lidar_yaw", description="Configured base_link -> lidar yaw (rad)"
-            ),
-            *sensor_adapters,
-            mapping,
-            localization,
         ]
     )

@@ -37,16 +37,12 @@ setup(
     zip_safe=True,
     maintainer="Phanthy Motus",
     maintainer_email="devnull@example.com",
-    description="G1 Nav2 adapters with persistent maps and semantic tags",
+    description="G1 Nav2 planner/controller adapter for FAST-LIVO2 outputs",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "canvas_pointcloud_bridge = g1_nav2.canvas_pointcloud_node:main",
-            "canvas_map_view = g1_nav2.map_view_node:main",
-            "loco_odom_bridge = g1_nav2.loco_odom_node:main",
-            "navigation_command_bridge = g1_nav2.navigation_command_node:main",
-            "runtime_supervisor = g1_nav2.runtime_supervisor:main",
+            "planner_command_bridge = g1_nav2.planner_command_node:main",
         ],
     },
 )

@@ -46,13 +46,22 @@ plugins:
     classes: []         # empty = default broad set
     fps: 5
 
+  fast_livo2:
+    enabled: true
+    namespace: ubuntu
+    backend: ros_topic
+    request_timeout_sec: 130.0
+    discovery_timeout_sec: 5.0
+    input_max_age_ms: 500
+    map_voxel_size_m: 0.10
+    map_max_points: 80000
+
   nav2:
     enabled: true
     namespace: ubuntu
     backend: ros_topic
     shadow_only: true
     request_timeout_sec: 30.0
-    runtime_switch_timeout_sec: 120.0
     discovery_timeout_sec: 5.0
     input_max_age_ms: 500
     max_forward_mps: 0.15
@@ -61,4 +70,3 @@ plugins:
     max_yaw_rps: 0.35
     max_planar_mps: 0.18
     proposal_ttl_ms: 250
-    map_storage_dir: /maps

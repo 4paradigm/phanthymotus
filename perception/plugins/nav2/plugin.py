@@ -18,7 +18,6 @@ log = logging.getLogger(__name__)
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,127}$")
 _NUMBER_RANGES = {
     "request_timeout_sec": (1.0, 120.0),
-    "runtime_switch_timeout_sec": (10.0, 300.0),
     "discovery_timeout_sec": (0.5, 30.0),
     "max_forward_mps": (0.01, 0.15),
     "max_reverse_mps": (0.0, 0.15),
@@ -95,21 +94,11 @@ def _validated_config(base: dict, updates: dict) -> dict:
         if result[key] != expected:
             raise ConfigError(f"first-release {key} is fixed to {expected}")
 
-    map_storage_dir = result.get("map_storage_dir")
-    if (
-        not isinstance(map_storage_dir, str)
-        or not map_storage_dir.startswith("/")
-        or "\x00" in map_storage_dir
-    ):
-        raise ConfigError("map_storage_dir must be an absolute container path")
-    result["map_storage_dir"] = map_storage_dir.rstrip("/") or "/"
-    if result["map_storage_dir"] != "/maps":
-        raise ConfigError("first-release map_storage_dir is fixed to /maps")
     return result
 
 
 class Nav2Plugin:
-    """Expose lifecycle plus the frozen 14-action Nav2 business contract."""
+    """Expose lifecycle plus planner/controller-only Nav2 actions."""
 
     PREFIX = "nav2"
 
@@ -155,7 +144,7 @@ class Nav2Plugin:
         if not canvas_started or core is None:
             return self._error(
                 "canvas_not_started",
-                "connect loco_state and lidar_cloud, then start the Canvas project",
+                "connect FAST-LIVO2 odom and registered_cloud, then start Canvas",
             )
         return core.dispatch(args)
 
@@ -229,12 +218,6 @@ class Nav2Plugin:
                     "nav2_companion_unavailable",
                     "Nav2 companion is not subscribed to the command topic",
                 )
-            if backend_info.get("n3_ready") is not True:
-                blockers = backend_info.get("readiness_blockers") or [
-                    "Nav2 companion has not published a ready runtime receipt"
-                ]
-                self._release_core()
-                return self._error("navigation_not_ready", "; ".join(blockers))
 
         instance_id = str(args.get("instance_id", "") or "default").strip()
         with self._lifecycle_lock:
@@ -246,7 +229,7 @@ class Nav2Plugin:
         return result
 
     def _await_backend_startup(self, core: Nav2Core) -> dict:
-        """Wait for DDS discovery and the companion's retained ready receipt."""
+        """Wait only for DDS discovery; sensor readiness gates navigation actions."""
 
         deadline = time.monotonic() + self._cfg["discovery_timeout_sec"]
         while True:
@@ -255,10 +238,7 @@ class Nav2Plugin:
                 return info
             if str(info.get("state", "idle")) in {"unavailable", "error"}:
                 return info
-            if (
-                int(info.get("bridge_subscribers", 0)) >= 1
-                and info.get("n3_ready") is True
-            ):
+            if int(info.get("bridge_subscribers", 0)) >= 1:
                 return info
             if time.monotonic() >= deadline:
                 return info
@@ -337,7 +317,7 @@ class Nav2Plugin:
                 details.append("unexpected=" + ",".join(unknown))
             return self._error(
                 "invalid_canvas_wiring",
-                "Nav2 requires exact Driver sensor bindings (" + "; ".join(details) + ")",
+                "Nav2 requires exact FAST-LIVO2 bindings (" + "; ".join(details) + ")",
             )
         return {"wired_topics": bound_topics}
 

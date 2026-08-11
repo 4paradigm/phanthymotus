@@ -23,7 +23,7 @@ class FakeBackend:
         self.calls.append((action, dict(args), nav_id))
         if action == "wait_navigation_done":
             return {"status": "arrived"}
-        if action in {"navigate_to_pose", "navigate_to_tag"}:
+        if action == "navigate_to_pose":
             return {"status": "navigating"}
         if action == "stop_nav":
             return {"status": "stopped", "terminal_confirmed": True}
@@ -66,8 +66,10 @@ class Nav2CoreTest(unittest.TestCase):
     def test_minimum_navigation_speed_is_accepted(self) -> None:
         result = self.core.dispatch(
             {
-                "action": "navigate_to_tag",
-                "tag_name": "room-a",
+                "action": "navigate_to_pose",
+                "x": 0.5,
+                "y": 0.0,
+                "yaw": 0.0,
                 "speed": 0.10,
                 "_control_nav_id": "lease-min-speed",
             }
@@ -75,7 +77,7 @@ class Nav2CoreTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "navigating")
         action, args, nav_id = self.backend.calls[-1]
-        self.assertEqual(action, "navigate_to_tag")
+        self.assertEqual(action, "navigate_to_pose")
         self.assertEqual(args["speed"], 0.10)
         self.assertEqual(nav_id, "lease-min-speed")
 
@@ -100,75 +102,12 @@ class Nav2CoreTest(unittest.TestCase):
                 self.assertEqual(result["error_code"], code)
         self.assertEqual(self.backend.calls, [])
 
-    def test_map_names_are_path_safe(self) -> None:
+    def test_removed_mapping_actions_are_rejected(self) -> None:
         result = self.core.dispatch(
             {"action": "start_mapping", "map_name": "../escape"}
         )
-        self.assertEqual(result["error_code"], "invalid_argument")
+        self.assertEqual(result["error_code"], "unsupported_action")
         self.assertEqual(self.backend.calls, [])
-
-    def test_runtime_mode_switch_is_explicit_and_localization_requires_map(self) -> None:
-        mapping = self.core.dispatch(
-            {"action": "switch_runtime_mode", "runtime_mode": "mapping"}
-        )
-        self.assertEqual(mapping["status"], "ok")
-        self.assertEqual(
-            self.backend.calls[-1],
-            (
-                "switch_runtime_mode",
-                {"runtime_mode": "mapping", "map_name": ""},
-                None,
-            ),
-        )
-
-        missing_map = self.core.dispatch(
-            {"action": "switch_runtime_mode", "runtime_mode": "localization"}
-        )
-        self.assertEqual(missing_map["error_code"], "missing_argument")
-
-        localization = self.core.dispatch(
-            {
-                "action": "switch_runtime_mode",
-                "runtime_mode": "localization",
-                "map_name": "room-a",
-            }
-        )
-        self.assertEqual(localization["status"], "ok")
-        self.assertEqual(
-            self.backend.calls[-1],
-            (
-                "switch_runtime_mode",
-                {"runtime_mode": "localization", "map_name": "room-a"},
-                None,
-            ),
-        )
-
-        invalid = self.core.dispatch(
-            {"action": "switch_runtime_mode", "runtime_mode": "invalid"}
-        )
-        self.assertEqual(invalid["error_code"], "invalid_argument")
-
-    def test_map_mutation_is_blocked_during_navigation(self) -> None:
-        started = self.core.dispatch(
-            {
-                "action": "navigate_to_tag",
-                "tag_name": "door",
-                "_control_nav_id": "lease-002",
-            }
-        )
-        self.assertEqual(started["status"], "navigating")
-
-        blocked = self.core.dispatch(
-            {"action": "delete_map", "map_name": "room-a"}
-        )
-        self.assertEqual(blocked["error_code"], "navigation_active")
-        blocked_switch = self.core.dispatch(
-            {"action": "switch_runtime_mode", "runtime_mode": "mapping"}
-        )
-        self.assertEqual(blocked_switch["error_code"], "navigation_active")
-        stopped = self.core.dispatch({"action": "stop_nav"})
-        self.assertEqual(stopped["status"], "stopped")
-        self.assertIsNone(self.core.info()["active_nav_id"])
 
     def test_stop_without_navigation_is_idempotent(self) -> None:
         result = self.core.dispatch({"action": "stop_nav"})

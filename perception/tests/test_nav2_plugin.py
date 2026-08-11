@@ -25,8 +25,8 @@ class ReadyBackend:
             "state": "ready",
             "backend": "nav2_ros_topic",
             "bridge_subscribers": self.subscribers,
-            "n3_ready": self.ready,
-            "readiness_blockers": [] if self.ready else ["scan_stale"],
+            "navigation_ready": self.ready,
+            "readiness_blockers": [] if self.ready else ["registered_cloud_stale"],
         }
 
     def execute(self, action: str, args: dict, *, nav_id: str | None) -> dict:
@@ -45,13 +45,12 @@ class DelayedReadyBackend(ReadyBackend):
     def info(self) -> dict:
         self.info_calls += 1
         discovered = self.info_calls >= 2
-        ready = self.info_calls >= 3
         return {
             "state": "ready",
             "backend": "nav2_ros_topic",
             "bridge_subscribers": 1 if discovered else 0,
-            "n3_ready": ready,
-            "readiness_blockers": [] if ready else ["startup_pending"],
+            "navigation_ready": False,
+            "readiness_blockers": ["fast_livo2_not_started"],
         }
 
 
@@ -150,7 +149,7 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         self.assertEqual(result["error_code"], "nav2_companion_unavailable")
         self.assertEqual(unavailable_backend.stop_calls, 1)
 
-    def test_start_waits_for_dds_discovery_and_retained_ready_receipt(self) -> None:
+    def test_start_waits_for_dds_discovery_without_requiring_sensor_data(self) -> None:
         backend = DelayedReadyBackend()
         plugin = Nav2Plugin(
             {"discovery_timeout_sec": 0.5}, None, backend=backend
@@ -161,7 +160,9 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         )
 
         self.assertEqual(result["state"], "ready")
-        self.assertGreaterEqual(backend.info_calls, 3)
+        self.assertGreaterEqual(backend.info_calls, 2)
+        self.assertFalse(result["navigation_ready"])
+        self.assertEqual(result["readiness_blockers"], ["fast_livo2_not_started"])
 
     def test_config_validation_and_active_stop(self) -> None:
         backend = ReadyBackend()

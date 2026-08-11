@@ -9,41 +9,23 @@ services:
         APT_UBUNTU_MIRROR: ${APT_UBUNTU_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
         APT_ROS_MIRROR: ${APT_ROS_MIRROR:-mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu}
         PYTHON_COLCON_VERSION: ${PYTHON_COLCON_VERSION:?locked python3-colcon version required}
-        PYTHON_NUMPY_VERSION: ${PYTHON_NUMPY_VERSION:?locked python3-numpy version required}
         PYTHON_PYTEST_VERSION: ${PYTHON_PYTEST_VERSION:?locked python3-pytest version required}
         ROS_NAV2_BRINGUP_VERSION_AMD64: ${ROS_NAV2_BRINGUP_VERSION_AMD64:?locked amd64 nav2-bringup version required}
         ROS_NAV2_BRINGUP_VERSION_ARM64: ${ROS_NAV2_BRINGUP_VERSION_ARM64:?locked arm64 nav2-bringup version required}
         ROS_NAVIGATION2_VERSION_AMD64: ${ROS_NAVIGATION2_VERSION_AMD64:?locked amd64 navigation2 version required}
         ROS_NAVIGATION2_VERSION_ARM64: ${ROS_NAVIGATION2_VERSION_ARM64:?locked arm64 navigation2 version required}
-        ROS_POINTCLOUD_TO_LASERSCAN_VERSION_AMD64: ${ROS_POINTCLOUD_TO_LASERSCAN_VERSION_AMD64:?locked amd64 pointcloud-to-laserscan version required}
-        ROS_POINTCLOUD_TO_LASERSCAN_VERSION_ARM64: ${ROS_POINTCLOUD_TO_LASERSCAN_VERSION_ARM64:?locked arm64 pointcloud-to-laserscan version required}
         ROS_RMW_FASTRTPS_CPP_VERSION_AMD64: ${ROS_RMW_FASTRTPS_CPP_VERSION_AMD64:?locked amd64 rmw-fastrtps-cpp version required}
         ROS_RMW_FASTRTPS_CPP_VERSION_ARM64: ${ROS_RMW_FASTRTPS_CPP_VERSION_ARM64:?locked arm64 rmw-fastrtps-cpp version required}
-        ROS_SLAM_TOOLBOX_VERSION_AMD64: ${ROS_SLAM_TOOLBOX_VERSION_AMD64:?locked amd64 slam-toolbox version required}
-        ROS_SLAM_TOOLBOX_VERSION_ARM64: ${ROS_SLAM_TOOLBOX_VERSION_ARM64:?locked arm64 slam-toolbox version required}
     container_name: phanthy-nav2
     network_mode: host
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=256m
       - /root/.ros:rw,nosuid,nodev,noexec,size=64m
-    volumes:
-      - ${NAV2_MAP_DIR:-./maps}:/maps
-    group_add:
-      - "${NAV2_MAP_GID:-1000}"
     environment:
       ROS_DOMAIN_ID: "42"
       RMW_IMPLEMENTATION: rmw_fastrtps_cpp
       FASTDDS_BUILTIN_TRANSPORTS: ${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}
-      NAV2_MODE: ${NAV2_MODE:-mapping}
-      NAV2_MAP_NAME: ${NAV2_MAP_NAME:-}
-      NAV2_MAP_YAML: ${NAV2_MAP_YAML:-}
-      NAV2_LIDAR_X: ${NAV2_LIDAR_X:?Driver must provide measured lidar_x}
-      NAV2_LIDAR_Y: ${NAV2_LIDAR_Y:?Driver must provide measured lidar_y}
-      NAV2_LIDAR_Z: ${NAV2_LIDAR_Z:?Driver must provide measured lidar_z}
-      NAV2_LIDAR_ROLL: ${NAV2_LIDAR_ROLL:?Driver must provide measured lidar_roll}
-      NAV2_LIDAR_PITCH: ${NAV2_LIDAR_PITCH:?Driver must provide measured lidar_pitch}
-      NAV2_LIDAR_YAW: ${NAV2_LIDAR_YAW:?Driver must provide measured lidar_yaw}
     cap_drop:
       - ALL
     security_opt:
@@ -55,4 +37,4 @@ services:
       - |
         source /opt/ros/humble/setup.bash
         source /nav2_ws/install/setup.bash
-        exec ros2 run g1_nav2 runtime_supervisor
+        exec ros2 launch g1_nav2 g1_nav2.launch.py
