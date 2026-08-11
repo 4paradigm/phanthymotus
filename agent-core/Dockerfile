@@ -1,10 +1,22 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG ROS_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
-ARG PYPI_MIRROR
+ARG PYPI_MIRROR APT_MIRROR ROS_MIRROR
 
 # Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault)
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+            -exec sed -E -i \
+            "s#https?://(mirrors\.tencentyun\.com|ports\.ubuntu\.com)/ubuntu-ports/?#https://${APT_MIRROR}/ubuntu-ports/#g" {} +; \
+    fi && \
+    if [ -n "${ROS_MIRROR}" ]; then \
+        find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+            -exec sed -E -i \
+            "s#https?://packages\.ros\.org/ros2/ubuntu#${ROS_MIRROR}#g" {} +; \
+    fi && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip python3-dbus ffmpeg curl ros-humble-nav-msgs && \
     curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/aarch64/docker-27.5.1.tgz \

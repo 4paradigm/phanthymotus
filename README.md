@@ -122,6 +122,11 @@ A community-driven Skill Marketplace where users share and discover skills. Brow
 
 Deploy and manage Agent Core and hardware driver containers from the dashboard.
 
+For a local Agent Core build, `./deploy/build_core.sh --mirror tuna` passes the
+selected Ubuntu, ROS 2, and PyPI mirrors into the Docker build. The Dockerfile
+rewrites inherited base-image APT sources before installing additional ROS 2
+packages, so a stale Tencent VPC source cannot block a TUNA build.
+
 ![Deploy](docs/images/deploy.png)
 
 ## Deployment Architecture
@@ -220,4 +225,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, architecture detai
 ## License
 
 [Apache License 2.0](LICENSE)
-
