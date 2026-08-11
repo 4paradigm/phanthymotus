@@ -89,6 +89,10 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 Nav2 公共合同移除。这些能力如果需要，应由 FAST-LIVO2/位置服务单独暴露，
 不应再把 SLAM 运行时塞回 Nav2 卡片。
 
+为兼容重构前 Canvas 已保存的卡片实例，废弃字段
+`runtime_switch_timeout_sec` 会在配置迁移时被忽略；Nav2 已不再切换
+mapping/localization 运行模式。其他未知配置字段仍会拒绝。
+
 ## 规划与控制
 
 - NavFn 生成全局路径。

@@ -149,6 +149,25 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         self.assertEqual(result["error_code"], "nav2_companion_unavailable")
         self.assertEqual(unavailable_backend.stop_calls, 1)
 
+    def test_legacy_runtime_switch_timeout_is_ignored_but_unknown_fields_fail(self) -> None:
+        plugin = Nav2Plugin(
+            {"runtime_switch_timeout_sec": 45.0}, None, backend=ReadyBackend()
+        )
+        self.assertEqual(plugin.dispatch("nav2", {"action": "info"})["state"], "idle")
+
+        migrated = plugin.dispatch(
+            "nav2",
+            {"action": "config", "runtime_switch_timeout_sec": 60.0},
+        )
+        self.assertEqual(migrated["state"], "configured")
+        self.assertNotIn("runtime_switch_timeout_sec", migrated["config"])
+
+        invalid = plugin.dispatch(
+            "nav2", {"action": "config", "unexpected_field": True}
+        )
+        self.assertEqual(invalid["error_code"], "invalid_config")
+        self.assertIn("unexpected_field", invalid["error"])
+
     def test_start_waits_for_dds_discovery_without_requiring_sensor_data(self) -> None:
         backend = DelayedReadyBackend()
         plugin = Nav2Plugin(

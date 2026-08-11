@@ -29,6 +29,7 @@ _INTEGER_RANGES = {
     "input_max_age_ms": (100, 2000),
     "proposal_ttl_ms": (50, 250),
 }
+_LEGACY_NOOP_CONFIG_FIELDS = {"runtime_switch_timeout_sec"}
 
 
 class ConfigError(ValueError):
@@ -36,6 +37,11 @@ class ConfigError(ValueError):
 
 
 def _validated_config(base: dict, updates: dict) -> dict:
+    updates = {
+        key: value
+        for key, value in updates.items()
+        if key not in _LEGACY_NOOP_CONFIG_FIELDS
+    }
     unknown = sorted(set(updates) - set(NAV2_CONFIG_DEFAULTS))
     if unknown:
         raise ConfigError("unsupported config fields: " + ",".join(unknown))
