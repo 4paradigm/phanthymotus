@@ -14,9 +14,9 @@ cd "${REPO_ROOT}"
 BUILD_DATE="$(date +%y%m%d)"
 COMMIT="$(git rev-parse --short=7 HEAD)"
 
-export PERCEPTION_IMAGE="${PERCEPTION_IMAGE:-local/phanthy-motus/perception:release.${BUILD_DATE}.${COMMIT}-jetson}"
-export FAST_LIVO2_IMAGE="${FAST_LIVO2_IMAGE:-phanthy-fast-livo2:nav2-card-${COMMIT}}"
-export NAV2_IMAGE="${NAV2_IMAGE:-phanthy-nav2:nav2-card-${COMMIT}}"
+export PERCEPTION_IMAGE="local/phanthy-motus/perception:release.${BUILD_DATE}.${COMMIT}-jetson"
+export FAST_LIVO2_IMAGE="phanthy-fast-livo2:nav2-card-${COMMIT}"
+export NAV2_IMAGE="phanthy-nav2:nav2-card-${COMMIT}"
 export ROS_BASE_IMAGE="${ROS_BASE_IMAGE:-bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f}"
 
 if [[ ! -d /opt/phanthy-motus/data/fast_livo2/maps ]]; then
