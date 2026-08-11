@@ -273,11 +273,18 @@ def _slim_event_text(text: str) -> str:
         data = _json.loads(text)
     except (ValueError, TypeError):
         return text
-    keys_to_remove = _LLM_IRRELEVANT_KEYS & data.keys()
-    if not keys_to_remove:
+    changed = False
+    # 移除 perf trace 字段
+    for key in _LLM_IRRELEVANT_KEYS:
+        if key in data:
+            del data[key]
+            changed = True
+    # ACP 完成事件：去掉 result 中的冗余内容（LLM 已知自己发出了什么）
+    if data.get('type') == 'action_complete' and 'result' in data:
+        del data['result']
+        changed = True
+    if not changed:
         return text
-    for key in keys_to_remove:
-        del data[key]
     return _json.dumps(data, ensure_ascii=False)
 
 
