@@ -262,8 +262,8 @@ ROS 资源和导航任务，不负责创建或销毁基础容器。
 脚本不修改 `/opt/phanthy-motus/docker-compose.yml`，不启动 Canvas，不调用 Nav2 action
 或 Driver。两个容器的 restart policy 固定为 `no`，仅用于当次人工调试。
 启动前必须保持 Core/Driver 运行且 Canvas project 已停止。若 Core 已启用
-token 认证，脚本不会自动探测凭据：可由调用方显式提供 `CORE_ACCESS_TOKEN`，或在
-现场确认 Canvas 已停止后设置 `I_CONFIRM_CANVAS_STOPPED=1`。两者都缺失时 fail closed。
+token 认证，由调用方显式提供 `CORE_ACCESS_TOKEN`。脚本会查询真实 Canvas 状态；
+查询失败或 Canvas 仍在运行时 fail closed，不使用字符串确认变量绕过检查。
 
 从仓库根目录执行：
 
@@ -285,10 +285,10 @@ export ROS_BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sh
     docker compose --env-file source-lock.env build nav2
 )
 
-I_CONFIRM_CANVAS_STOPPED=1 STAGE=preflight \
+STAGE=preflight \
   bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
 
-I_AM_G1_OWNER=1 I_CONFIRM_CANVAS_STOPPED=1 STAGE=start \
+STAGE=start \
   bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
 ```
 
@@ -305,7 +305,7 @@ Docker Hub metadata 查询；因此即使 G1 无法访问 `registry-1.docker.io`
 STAGE=status \
   bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
 
-I_AM_G1_OWNER=1 I_CONFIRM_CANVAS_STOPPED=1 STAGE=stop \
+STAGE=stop \
   bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
 ```
 

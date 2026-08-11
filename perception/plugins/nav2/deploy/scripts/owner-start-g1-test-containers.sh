@@ -44,10 +44,6 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-require_owner() {
-  [[ "${I_AM_G1_OWNER:-0}" == "1" ]] || die "set I_AM_G1_OWNER=1 for STAGE=${STAGE}"
-}
-
 container_exists() {
   docker container inspect "$1" >/dev/null 2>&1
 }
@@ -105,17 +101,13 @@ else:
 
 require_canvas_stopped() {
   local state
-  if [[ "${I_CONFIRM_CANVAS_STOPPED:-0}" == "1" ]]; then
-    note "G1_NAV2_TEST_CANVAS_STATE=owner-confirmed-stopped"
-    return
-  fi
   if state="$(project_running_state)"; then
     [[ "${state}" == "false" ]] || \
       die "Canvas project is running; stop it before managing test containers"
     note "G1_NAV2_TEST_CANVAS_STATE=stopped"
     return
   fi
-  die "cannot verify Canvas state; stop the project manually, then set I_CONFIRM_CANVAS_STOPPED=1"
+  die "cannot verify Canvas state through Agent Core; set CORE_ACCESS_TOKEN when authentication is enabled"
 }
 
 require_arm64_image() {
@@ -242,7 +234,6 @@ wait_until_ready() {
 
 start_test_containers() {
   local map_gid
-  require_owner
   preflight
   map_gid="$(stat -c '%g' "${MAP_DIR}")"
 
@@ -348,7 +339,6 @@ stop_one_test_container() {
 }
 
 stop_test_containers() {
-  require_owner
   require_command docker
   require_command curl
   require_command python3
