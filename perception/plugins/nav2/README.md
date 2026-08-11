@@ -53,7 +53,7 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
   "x": 1.2,
   "y": -0.8,
   "yaw": 0.0,
-  "speed": 0.15
+  "speed": 0.5
 }
 ```
 
@@ -67,13 +67,15 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 `ttl_ms`、`nav_status` 和 `velocity{x,y,yaw}`。终态必须发布零速。
 卡片始终为 proposal-only；`shadow_only=true` 不代表 Driver 一定执行。
 
-首版限制：
+速度限制：
 
-- 前进/后退绝对值不超过 `0.15 m/s`；
+- 导航请求 `speed` 范围为 `0.10–1.00 m/s`，默认 `0.50 m/s`；
+- 前进/后退提案的协议上限为 `1.00 m/s`，每次导航仍由请求的
+  `speed` 再限幅；
 - 禁止横移，`y=0`；
 - 偏航角速度绝对值不超过 `0.35 rad/s`；
-- 平面合速度不超过 `0.18 m/s`；
-- 导航请求 `speed` 范围为 `0.10–0.15 m/s`。
+- BackUp 恢复动作仍固定为 `0.15 m/s`；
+- Driver 仍负责二次限幅、TTL、急停和停车确认。
 
 ## Actions
 

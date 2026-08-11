@@ -35,7 +35,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             sequence=1,
             ttl_ms=250,
             navigation_status="navigating",
-            velocity=Velocity(x=0.15, y=0.0, yaw=0.35),
+            velocity=Velocity(x=1.0, y=0.0, yaw=0.35),
             issued_at_unix_ms=1,
         )
         self.assertEqual(VelocityProposal.from_payload(payload).nav_id, "nav-001")
@@ -55,15 +55,15 @@ class Nav2CompanionCoreTest(unittest.TestCase):
 
     def test_requested_speed_is_enforced_on_forward_proposals(self) -> None:
         limited = limit_forward_velocity(
-            Velocity(x=0.15, y=0.0, yaw=0.2),
+            Velocity(x=0.50, y=0.0, yaw=0.2),
             max_forward_mps=0.10,
         )
         self.assertEqual(limited, Velocity(x=0.10, y=0.0, yaw=0.2))
         reverse = limit_forward_velocity(
-            Velocity(x=-0.15, y=0.0, yaw=0.0),
+            Velocity(x=-1.0, y=0.0, yaw=0.0),
             max_forward_mps=0.10,
         )
-        self.assertEqual(reverse.x, -0.15)
+        self.assertEqual(reverse.x, -1.0)
 
     def test_fast_livo2_readiness_is_fail_closed(self) -> None:
         ready = evaluate_readiness(
@@ -190,7 +190,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             "vy_samples: 1",
         ):
             self.assertIn(expected, follow_path)
-        self.assertIn("max_velocity: [0.15, 0.0, 0.25]", smoother)
+        self.assertIn("max_velocity: [1.0, 0.0, 0.25]", smoother)
         self.assertIn("odom_topic: /ubuntu/navigation/odom", smoother)
 
     def test_speed_limit_and_behavior_tree_reach_planner_bridge(self) -> None:

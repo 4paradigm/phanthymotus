@@ -85,7 +85,7 @@ class PlannerCommandNode(Node):
         self.declare_parameter("behavior_tree_path", "")
         self.declare_parameter("proposal_ttl_ms", 250)
         self.declare_parameter("enforce_shadow_isolation", True)
-        self.declare_parameter("max_shadow_speed", 0.15)
+        self.declare_parameter("max_shadow_speed", 1.0)
         self.declare_parameter("supported_mode", 0)
         self.declare_parameter("goal_response_timeout", 8.0)
         self.declare_parameter("global_frame", "map")
@@ -144,8 +144,8 @@ class PlannerCommandNode(Node):
             for item in self.get_parameter("required_lifecycle_nodes").value
         ]
 
-        if not 0.0 < self._max_shadow_speed <= 0.2:
-            raise ValueError("max_shadow_speed must be within (0, 0.2]")
+        if not 0.0 < self._max_shadow_speed <= 1.0:
+            raise ValueError("max_shadow_speed must be within (0, 1.0]")
         if not 50 <= self._proposal_ttl_ms <= 250:
             raise ValueError("proposal_ttl_ms must be within [50, 250]")
         if self._supported_mode != 0:

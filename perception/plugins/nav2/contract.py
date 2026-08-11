@@ -23,11 +23,11 @@ NAV2_CONFIG_DEFAULTS = {
     "request_timeout_sec": 30.0,
     "discovery_timeout_sec": 5.0,
     "input_max_age_ms": 500,
-    "max_forward_mps": 0.15,
-    "max_reverse_mps": 0.15,
+    "max_forward_mps": 1.0,
+    "max_reverse_mps": 1.0,
     "max_lateral_mps": 0.0,
     "max_yaw_rps": 0.35,
-    "max_planar_mps": 0.18,
+    "max_planar_mps": 1.0,
     "proposal_ttl_ms": 250,
 }
 
@@ -72,17 +72,17 @@ NAV2_FULL_CONFIG_SCHEMA = {
         },
         "max_forward_mps": {
             "type": "number",
-            "const": 0.15,
+            "const": 1.0,
             "minimum": 0.01,
-            "maximum": 0.15,
-            "default": 0.15,
+            "maximum": 1.0,
+            "default": 1.0,
         },
         "max_reverse_mps": {
             "type": "number",
-            "const": 0.15,
+            "const": 1.0,
             "minimum": 0.0,
-            "maximum": 0.15,
-            "default": 0.15,
+            "maximum": 1.0,
+            "default": 1.0,
         },
         "max_lateral_mps": {
             "type": "number",
@@ -100,10 +100,10 @@ NAV2_FULL_CONFIG_SCHEMA = {
         },
         "max_planar_mps": {
             "type": "number",
-            "const": 0.18,
+            "const": 1.0,
             "minimum": 0.01,
-            "maximum": 0.18,
-            "default": 0.18,
+            "maximum": 1.0,
+            "default": 1.0,
         },
         "proposal_ttl_ms": {
             "type": "integer",
@@ -317,9 +317,9 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "speed": {
                     "type": "number",
                     "minimum": 0.10,
-                    "maximum": 0.15,
-                    "default": 0.15,
-                    "description": "Navigation speed 0.10-0.15 m/s (default 0.15)",
+                    "maximum": 1.0,
+                    "default": 0.5,
+                    "description": "Navigation speed 0.10-1.00 m/s (default 0.50)",
                 },
                 "stall_timeout": {
                     "type": "number",

@@ -19,11 +19,11 @@ _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,127}$")
 _NUMBER_RANGES = {
     "request_timeout_sec": (1.0, 120.0),
     "discovery_timeout_sec": (0.5, 30.0),
-    "max_forward_mps": (0.01, 0.15),
-    "max_reverse_mps": (0.0, 0.15),
+    "max_forward_mps": (0.01, 1.0),
+    "max_reverse_mps": (0.0, 1.0),
     "max_lateral_mps": (0.0, 0.12),
     "max_yaw_rps": (0.01, 0.35),
-    "max_planar_mps": (0.01, 0.18),
+    "max_planar_mps": (0.01, 1.0),
 }
 _INTEGER_RANGES = {
     "input_max_age_ms": (100, 2000),
@@ -89,11 +89,11 @@ def _validated_config(base: dict, updates: dict) -> dict:
 
     fixed = {
         "input_max_age_ms": 500,
-        "max_forward_mps": 0.15,
-        "max_reverse_mps": 0.15,
+        "max_forward_mps": 1.0,
+        "max_reverse_mps": 1.0,
         "max_lateral_mps": 0.0,
         "max_yaw_rps": 0.35,
-        "max_planar_mps": 0.18,
+        "max_planar_mps": 1.0,
         "proposal_ttl_ms": 250,
     }
     for key, expected in fixed.items():

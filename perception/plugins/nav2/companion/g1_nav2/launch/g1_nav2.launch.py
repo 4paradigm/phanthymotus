@@ -109,7 +109,7 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "proposal_ttl_ms": 250,
                         "enforce_shadow_isolation": True,
-                        "max_shadow_speed": 0.15,
+                        "max_shadow_speed": 1.0,
                         "supported_mode": 0,
                         "goal_response_timeout": 8.0,
                         "global_frame": "map",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -85,6 +86,18 @@ class Nav2ContractTest(unittest.TestCase):
         source_lock = (companion_dir / "source-lock.env").read_text(
             encoding="utf-8"
         )
+        goal_schema = json.loads(
+            (companion_dir / "protocol" / "goal-v1.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        proposal_schema = json.loads(
+            (
+                companion_dir
+                / "protocol"
+                / "velocity-proposal-v1.schema.json"
+            ).read_text(encoding="utf-8")
+        )
         self.assertIn('default_value="/ubuntu/navigation/odom"', launch)
         self.assertIn('default_value="/ubuntu/navigation/cloud_registered"', launch)
         self.assertIn("from nav_msgs.msg import Odometry", planner_bridge)
@@ -93,21 +106,27 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("python3-numpy", dockerfile)
         self.assertNotIn("PYTHON_NUMPY_VERSION", compose)
         self.assertNotIn("PYTHON_NUMPY_VERSION", source_lock)
+        self.assertEqual(goal_schema["properties"]["speed"]["maximum"], 1.0)
+        self.assertEqual(goal_schema["properties"]["speed"]["default"], 0.5)
+        self.assertEqual(
+            proposal_schema["properties"]["velocity"]["properties"]["x"],
+            {"type": "number", "minimum": -1.0, "maximum": 1.0},
+        )
 
     def test_config_and_speed_bounds_are_fail_closed(self) -> None:
         tool = nav2_tool_definition("ubuntu")
         properties = tool["inputSchema"]["properties"]
         speed = properties["speed"]
         self.assertEqual(speed["minimum"], 0.10)
-        self.assertEqual(speed["maximum"], 0.15)
-        self.assertEqual(speed["default"], 0.15)
+        self.assertEqual(speed["maximum"], 1.0)
+        self.assertEqual(speed["default"], 0.5)
         self.assertNotIn("mode", properties)
 
         full_config = NAV2_FULL_CONFIG_SCHEMA["properties"]
         self.assertEqual(full_config["max_lateral_mps"]["const"], 0.0)
         self.assertEqual(full_config["max_lateral_mps"]["default"], 0.0)
-        self.assertEqual(full_config["max_reverse_mps"]["const"], 0.15)
-        self.assertEqual(full_config["max_reverse_mps"]["default"], 0.15)
+        self.assertEqual(full_config["max_reverse_mps"]["const"], 1.0)
+        self.assertEqual(full_config["max_reverse_mps"]["default"], 1.0)
 
         action_params = tool["inputSchema"]["x-action-params"]
         self.assertNotIn("mode", action_params["navigate_to_pose"]["params"])

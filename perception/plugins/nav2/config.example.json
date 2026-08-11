@@ -6,10 +6,10 @@
   "request_timeout_sec": 30.0,
   "discovery_timeout_sec": 5.0,
   "input_max_age_ms": 500,
-  "max_forward_mps": 0.15,
-  "max_reverse_mps": 0.15,
+  "max_forward_mps": 1.0,
+  "max_reverse_mps": 1.0,
   "max_lateral_mps": 0.0,
   "max_yaw_rps": 0.35,
-  "max_planar_mps": 0.18,
+  "max_planar_mps": 1.0,
   "proposal_ttl_ms": 250
 }

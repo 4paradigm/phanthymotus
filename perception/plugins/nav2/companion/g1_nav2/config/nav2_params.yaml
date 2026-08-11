@@ -96,12 +96,12 @@ controller_server:
       rotate_to_goal_heading: false
       debug_trajectory_details: true
       min_vel_x: 0.0
-      max_vel_x: 0.15
+      max_vel_x: 1.0
       min_vel_y: 0.0
       max_vel_y: 0.0
       max_vel_theta: 0.25
       min_speed_xy: 0.10
-      max_speed_xy: 0.15
+      max_speed_xy: 1.0
       min_speed_theta: 0.10
       acc_lim_x: 0.30
       acc_lim_y: 0.0
@@ -267,8 +267,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: OPEN_LOOP
-    max_velocity: [0.15, 0.0, 0.25]
-    min_velocity: [-0.15, 0.0, -0.25]
+    max_velocity: [1.0, 0.0, 0.25]
+    min_velocity: [-1.0, 0.0, -0.25]
     max_accel: [0.30, 0.0, 0.40]
     max_decel: [-0.30, 0.0, -0.40]
     odom_topic: /ubuntu/navigation/odom

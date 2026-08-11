@@ -90,11 +90,11 @@ def limit_forward_velocity(
 
 @dataclass(frozen=True)
 class VelocityLimits:
-    min_x: float = -0.15
-    max_x: float = 0.15
+    min_x: float = -1.0
+    max_x: float = 1.0
     max_abs_y: float = 0.0
     max_abs_yaw: float = 0.35
-    max_planar_speed: float = 0.18
+    max_planar_speed: float = 1.0
 
     def validate(self, velocity: Velocity) -> None:
         values = (velocity.x, velocity.y, velocity.yaw)

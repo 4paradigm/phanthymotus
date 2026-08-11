@@ -44,12 +44,12 @@
       "type": "object",
       "required": ["x", "y", "yaw"],
       "properties": {
-        "x": {"type": "number", "minimum": -0.15, "maximum": 0.15},
+        "x": {"type": "number", "minimum": -1.0, "maximum": 1.0},
         "y": {"type": "number", "minimum": -0.12, "maximum": 0.12},
         "yaw": {"type": "number", "minimum": -0.35, "maximum": 0.35}
       },
       "additionalProperties": false,
-      "description": "base_link velocity; planar hypot(x,y) must not exceed 0.18 m/s"
+      "description": "base_link velocity; planar hypot(x,y) must not exceed 1.0 m/s"
     },
     "reason": {"type": "string", "maxLength": 256},
     "shadow_only": {"const": true},

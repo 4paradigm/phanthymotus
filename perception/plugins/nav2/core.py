@@ -99,10 +99,10 @@ def _normalize(action: str, args: dict) -> dict:
         normalized["yaw"] = _number(args, "yaw")
 
     if action in _NAVIGATE_ACTIONS:
-        speed = _number(args, "speed", default=0.15)
-        if not 0.10 <= speed <= 0.15:
+        speed = _number(args, "speed", default=0.50)
+        if not 0.10 <= speed <= 1.00:
             raise NavigationBackendError(
-                "invalid_argument", "speed must be within [0.10, 0.15] m/s"
+                "invalid_argument", "speed must be within [0.10, 1.00] m/s"
             )
         raw_mode = args.get("mode", 0)
         if isinstance(raw_mode, bool) or not isinstance(raw_mode, int):
