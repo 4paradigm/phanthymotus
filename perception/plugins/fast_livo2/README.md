@@ -100,22 +100,13 @@ FAST-LIVO2 和 Vikit 保持在独立 GPL companion 镜像中；主 Perception �
 
 ## 部署与只读验收
 
-完整测试栈需要 Perception、FAST-LIVO2 companion 和 Nav2 companion 三个
-arm64 镜像：
+完整 G1 测试栈从仓库根目录用同一个入口构建并启动：
 
 ```bash
-mkdir -p /opt/phanthy-motus/data/fast_livo2/maps
-
-export PERCEPTION_IMAGE=local/phanthy-motus/perception:<tag>
-export FAST_LIVO2_IMAGE=phanthy-fast-livo2:<tag>
-export NAV2_IMAGE=phanthy-nav2:<tag>
-
-STAGE=preflight \
-  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
-STAGE=start \
-  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
+bash perception/plugins/nav2/deploy/scripts/build-and-start-g1.sh
 ```
 
-脚本检查真实 Canvas 状态、Core/Driver、端口、三镜像架构、地图目录权限和
-owner label；不会执行 `start_mapping`、导航或机器人运动。Core 启用认证时
-提供真实 `CORE_ACCESS_TOKEN`。
+脚本只负责准备地图目录、构建三个 arm64 镜像并调用现有测试容器
+`preflight/start`。它不会执行 Git 同步、清理旧容器、启动 Canvas、
+`start_mapping` 或导航。运行前停止 Canvas；Core 启用认证时提供真实
+`CORE_ACCESS_TOKEN`。

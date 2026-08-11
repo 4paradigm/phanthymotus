@@ -132,29 +132,20 @@ FAST-LIVO2 和 Nav2 companion 都已接入 `perception/deploy/service.yml`，与
 Perception 一起启动。Nav2 容器无地图 volume、无 Driver SDK、无 Docker
 socket，且以 read-only 模式运行。
 
-```bash
-cd perception/plugins/nav2/companion
-docker compose --env-file source-lock.env build nav2
-```
-
-G1 临时验证容器：
+G1 临时验证从仓库根目录执行一条命令；脚本按当前 commit 生成三个镜像标签，
+依次构建 Perception、FAST-LIVO2 companion 和 Nav2 companion，再运行现有
+`preflight` 与 `start`：
 
 ```bash
-export PERCEPTION_IMAGE=local/phanthy-motus/perception:<tag>
-export FAST_LIVO2_IMAGE=phanthy-fast-livo2:<tag>
-export NAV2_IMAGE=phanthy-nav2:<tag>
-
-STAGE=preflight \
-  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
-
-STAGE=start \
-  bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
+bash perception/plugins/nav2/deploy/scripts/build-and-start-g1.sh
 ```
 
-脚本会验证 Core/Driver/Canvas 状态、端口冲突、三个镜像的架构、FAST-LIVO2
-地图目录权限和 owner label；
-不会发布导航目标或机器人命令。如 Core 启用认证，显式提供
-`CORE_ACCESS_TOKEN`。
+运行前应停掉 Canvas 项目，并确保锁定的本地基础镜像
+`phanthy-fast-livo2:g1-1fcd0d0-n3save1` 存在。脚本不执行 Git 同步、不删除旧
+容器、不启动 Canvas，也不会发布建图或导航命令；已有测试容器需要先用
+现有 `STAGE=stop` 入口移除。Core 启用认证时，运行前显式提供
+`CORE_ACCESS_TOKEN`。`perception/deploy/service.yml` 是正式运行编排，不是
+源码构建入口。
 
 Canvas 启动时 Nav2 只等待 companion 的 DDS 控制面，不等待 odom/cloud，避免
 与 FAST-LIVO2 的 `start_mapping` action 形成生命周期环形等待。真正执行

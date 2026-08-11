@@ -83,6 +83,28 @@ class FastLivo2ContractTest(unittest.TestCase):
         for unsupported in ("load_map", "global_localization", "navigate_to_tag"):
             self.assertNotIn(unsupported, actions)
 
+    def test_g1_build_and_start_entrypoint_stays_narrow(self) -> None:
+        deploy_script = (
+            PERCEPTION_ROOT
+            / "plugins"
+            / "nav2"
+            / "deploy"
+            / "scripts"
+            / "build-and-start-g1.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("./deploy/build_perception.sh", deploy_script)
+        self.assertIn("build-companion.sh", deploy_script)
+        self.assertIn(
+            "docker compose --env-file source-lock.env build nav2",
+            deploy_script,
+        )
+        self.assertIn("STAGE=preflight", deploy_script)
+        self.assertIn("STAGE=start", deploy_script)
+        self.assertNotIn("git pull", deploy_script)
+        self.assertNotIn("git reset", deploy_script)
+        self.assertNotIn("STAGE=stop", deploy_script)
+
 
 if __name__ == "__main__":
     unittest.main()
