@@ -125,6 +125,10 @@ class Nav2ContractTest(unittest.TestCase):
             proposal_schema["properties"]["velocity"]["properties"]["x"],
             {"type": "number", "minimum": -1.0, "maximum": 1.0},
         )
+        self.assertEqual(
+            proposal_schema["properties"]["velocity"]["properties"]["y"],
+            {"type": "number", "minimum": -1.0, "maximum": 1.0},
+        )
 
     def test_config_and_speed_bounds_are_fail_closed(self) -> None:
         tool = nav2_tool_definition("ubuntu")
@@ -136,12 +140,21 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("mode", properties)
 
         full_config = NAV2_FULL_CONFIG_SCHEMA["properties"]
-        self.assertEqual(full_config["max_lateral_mps"]["const"], 0.0)
-        self.assertEqual(full_config["max_lateral_mps"]["default"], 0.0)
-        self.assertEqual(full_config["max_reverse_mps"]["const"], 1.0)
-        self.assertEqual(full_config["max_reverse_mps"]["default"], 1.0)
-        self.assertEqual(full_config["max_yaw_rps"]["const"], 2.0)
+        self.assertEqual(full_config["min_x_mps"]["default"], 0.30)
+        self.assertEqual(full_config["max_x_mps"]["default"], 1.0)
+        self.assertEqual(full_config["min_y_mps"]["default"], 0.0)
+        self.assertEqual(full_config["max_y_mps"]["default"], 0.0)
+        self.assertEqual(full_config["min_yaw_rps"]["default"], 1.0)
         self.assertEqual(full_config["max_yaw_rps"]["default"], 2.0)
+        for field in (
+            "min_x_mps",
+            "max_x_mps",
+            "min_y_mps",
+            "max_y_mps",
+            "min_yaw_rps",
+            "max_yaw_rps",
+        ):
+            self.assertNotIn("const", full_config[field])
 
         action_params = tool["inputSchema"]["x-action-params"]
         self.assertNotIn("mode", action_params["navigate_to_pose"]["params"])
@@ -156,6 +169,12 @@ class Nav2ContractTest(unittest.TestCase):
                 "backend",
                 "request_timeout_sec",
                 "discovery_timeout_sec",
+                "min_x_mps",
+                "max_x_mps",
+                "min_y_mps",
+                "max_y_mps",
+                "min_yaw_rps",
+                "max_yaw_rps",
             },
         )
 

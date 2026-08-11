@@ -9,6 +9,7 @@ PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
 from plugins.nav2.plugin import Nav2Plugin  # noqa: E402
+from plugins.nav2.backend import _build_command_payload  # noqa: E402
 
 
 class ReadyBackend:
@@ -64,6 +65,26 @@ def _bindings(plugin: Nav2Plugin) -> list[dict]:
 
 
 class Nav2PluginLifecycleTest(unittest.TestCase):
+    def test_velocity_limits_are_sent_to_the_companion(self) -> None:
+        limits = {
+            "min_x_mps": 0.4,
+            "max_x_mps": 0.8,
+            "min_y_mps": 0.1,
+            "max_y_mps": 0.3,
+            "min_yaw_rps": 1.2,
+            "max_yaw_rps": 1.8,
+        }
+        payload = _build_command_payload(
+            request_id="request-1",
+            nav_id="nav-1",
+            action="navigate_to_pose",
+            args={"x": 1.0, "y": 0.0, "yaw": 0.0, "speed": 0.5},
+            velocity_limits=limits,
+        )
+        self.assertEqual(payload["velocity_limits"], limits)
+        limits["max_x_mps"] = 0.1
+        self.assertEqual(payload["velocity_limits"]["max_x_mps"], 0.8)
+
     def test_constructor_and_info_do_not_acquire_backend(self) -> None:
         backend = ReadyBackend()
         plugin = Nav2Plugin({"enabled": True}, None, backend=backend)
@@ -188,14 +209,28 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         plugin = Nav2Plugin({}, None, backend=backend)
         bad = plugin.dispatch("nav2", {"action": "config", "proposal_ttl_ms": 100})
         self.assertEqual(bad["error_code"], "invalid_config")
-        lateral = plugin.dispatch(
-            "nav2", {"action": "config", "max_lateral_mps": 0.01}
+        inverted = plugin.dispatch(
+            "nav2",
+            {"action": "config", "min_x_mps": 0.7, "max_x_mps": 0.6},
         )
-        self.assertEqual(lateral["error_code"], "invalid_config")
+        self.assertEqual(inverted["error_code"], "invalid_config")
         configured = plugin.dispatch(
-            "nav2", {"action": "config", "request_timeout_sec": 20}
+            "nav2",
+            {
+                "action": "config",
+                "request_timeout_sec": 20,
+                "min_x_mps": 0.4,
+                "max_x_mps": 0.8,
+                "min_y_mps": 0.1,
+                "max_y_mps": 0.3,
+                "min_yaw_rps": 1.2,
+                "max_yaw_rps": 1.8,
+            },
         )
         self.assertEqual(configured["state"], "configured")
+        self.assertEqual(configured["config"]["min_x_mps"], 0.4)
+        self.assertEqual(configured["config"]["max_y_mps"], 0.3)
+        self.assertEqual(configured["config"]["min_yaw_rps"], 1.2)
 
         plugin.dispatch(
             "nav2", {"action": "start", "input_bindings": _bindings(plugin)}

@@ -123,8 +123,10 @@ SLAM Toolbox、AMCL 或 Map Server。
   两者使用 ROS system time；
 - 输入超过 `500 ms`、frame 错误、`map -> base_link` TF 或 Nav2 lifecycle
   不 ready 时 fail closed；
-- `speed` 范围 `0.10–1.00 m/s`，禁止横移，Rotation Shim 先对齐航向；
-- `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；请求速度
+- `speed` 范围 `0.30–1.00 m/s`，Rotation Shim 先对齐航向；
+- 卡片可配置 X/Y/yaw 三轴非零速度的最小/最大绝对值，默认
+  `X=0.30–1.00 m/s`、`Y=0–0 m/s`、`yaw=1.00–2.00 rad/s`；
+- `namespace=ubuntu` 和 proposal TTL `250 ms` 仍是首版冻结合同；请求速度
   在每条 `velocity_proposal` 上强制限制正向速度，Nav2 `SpeedLimit` 只作为控制器
   advisory，不再把 DDS transport ack 误判为控制器已应用速度；
 - FAST-LIVO2 卡片的 odom 以 `sensor/odometry` 显示实时位姿与速度；

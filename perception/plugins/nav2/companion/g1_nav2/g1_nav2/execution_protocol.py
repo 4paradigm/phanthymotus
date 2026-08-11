@@ -62,6 +62,70 @@ class Velocity:
         return {"x": self.x, "y": self.y, "yaw": self.yaw}
 
 
+@dataclass(frozen=True)
+class MotionLimits:
+    """Per-navigation nonzero magnitude floors and hard axis caps."""
+
+    min_x_mps: float = MIN_EFFECTIVE_LINEAR_MPS
+    max_x_mps: float = 1.0
+    min_y_mps: float = 0.0
+    max_y_mps: float = 0.0
+    min_yaw_rps: float = MIN_EFFECTIVE_YAW_RADPS
+    max_yaw_rps: float = 2.0
+
+    @classmethod
+    def from_payload(cls, payload) -> "MotionLimits":
+        if payload is None:
+            return cls()
+        if not isinstance(payload, dict):
+            raise ProtocolError(
+                "invalid_velocity_limits", "velocity_limits must be an object"
+            )
+        expected = set(cls.__dataclass_fields__)
+        missing = sorted(expected - set(payload))
+        unknown = sorted(set(payload) - expected)
+        if missing or unknown:
+            details = []
+            if missing:
+                details.append("missing=" + ",".join(missing))
+            if unknown:
+                details.append("unknown=" + ",".join(unknown))
+            raise ProtocolError(
+                "invalid_velocity_limits", "; ".join(details)
+            )
+        limits = cls(
+            **{
+                field: _finite_number(payload[field], f"velocity_limits.{field}")
+                for field in expected
+            }
+        )
+        limits.validate()
+        return limits
+
+    def validate(self) -> None:
+        bounds = {
+            "x": (self.min_x_mps, self.max_x_mps, 1.0),
+            "y": (self.min_y_mps, self.max_y_mps, 1.0),
+            "yaw": (self.min_yaw_rps, self.max_yaw_rps, 2.0),
+        }
+        for axis, (minimum, maximum, contract_maximum) in bounds.items():
+            if not 0.0 <= minimum <= maximum <= contract_maximum:
+                raise ProtocolError(
+                    "invalid_velocity_limits",
+                    f"{axis} limits must satisfy 0 <= min <= max <= "
+                    f"{contract_maximum}",
+                )
+
+    def as_dict(self) -> dict:
+        return {
+            field: float(getattr(self, field))
+            for field in self.__dataclass_fields__
+        }
+
+
+DEFAULT_MOTION_LIMITS = MotionLimits()
+
+
 def limit_forward_velocity(
     velocity: Velocity, *, max_forward_mps: float
 ) -> Velocity:
@@ -91,37 +155,74 @@ def limit_forward_velocity(
     return Velocity(x=limit, y=velocity.y, yaw=velocity.yaw)
 
 
-def apply_g1_motion_floor(velocity: Velocity) -> Velocity:
-    """Make G1 translation and rotation exclusive, then clear dead zones.
+def _apply_axis_magnitude(value: float, minimum: float, maximum: float) -> float:
+    if value == 0.0 or maximum == 0.0:
+        return 0.0
+    magnitude = min(max(abs(value), min(minimum, maximum)), maximum)
+    return math.copysign(magnitude, value)
+
+
+def apply_g1_motion_limits(
+    velocity: Velocity,
+    *,
+    limits: MotionLimits,
+    max_forward_mps: float,
+) -> Velocity:
+    """Make translation/rotation exclusive and enforce configured magnitudes.
 
     Exact zeros remain zeros so readiness, pause, terminal and watchdog stops
     preserve their fail-closed semantics.  A mixed Nav2 command turns in place
     when its raw yaw demand is significant; otherwise it moves without yaw.
-    Signs and lateral velocity are not changed, and the normal proposal
-    validator still owns the upper bounds.
+    Axis signs are preserved.  The navigation request's forward cap always
+    wins over the configured X floor.
     """
 
-    x = velocity.x
-    yaw = velocity.yaw
-    if x != 0.0 and yaw != 0.0:
+    limits.validate()
+    limited = limit_forward_velocity(
+        velocity,
+        max_forward_mps=max_forward_mps,
+    )
+    x = limited.x
+    y = limited.y
+    yaw = limited.yaw
+    if (x != 0.0 or y != 0.0) and yaw != 0.0:
         if abs(yaw) >= TURN_ONLY_YAW_THRESHOLD_RADPS:
             x = 0.0
+            y = 0.0
         else:
             yaw = 0.0
-    if 0.0 < abs(x) < MIN_EFFECTIVE_LINEAR_MPS:
-        x = math.copysign(MIN_EFFECTIVE_LINEAR_MPS, x)
-    if 0.0 < abs(yaw) < MIN_EFFECTIVE_YAW_RADPS:
-        yaw = math.copysign(MIN_EFFECTIVE_YAW_RADPS, yaw)
-    return Velocity(x=x, y=velocity.y, yaw=yaw)
+
+    x_max = limits.max_x_mps
+    if x > 0.0:
+        x_max = min(x_max, float(max_forward_mps))
+    return Velocity(
+        x=_apply_axis_magnitude(x, limits.min_x_mps, x_max),
+        y=_apply_axis_magnitude(y, limits.min_y_mps, limits.max_y_mps),
+        yaw=_apply_axis_magnitude(
+            yaw,
+            limits.min_yaw_rps,
+            limits.max_yaw_rps,
+        ),
+    )
+
+
+def apply_g1_motion_floor(velocity: Velocity) -> Velocity:
+    """Compatibility wrapper for the default card motion limits."""
+
+    return apply_g1_motion_limits(
+        velocity,
+        limits=DEFAULT_MOTION_LIMITS,
+        max_forward_mps=DEFAULT_MOTION_LIMITS.max_x_mps,
+    )
 
 
 @dataclass(frozen=True)
 class VelocityLimits:
     min_x: float = -1.0
     max_x: float = 1.0
-    max_abs_y: float = 0.0
+    max_abs_y: float = 1.0
     max_abs_yaw: float = 2.0
-    max_planar_speed: float = 1.0
+    max_planar_speed: float = math.sqrt(2.0)
 
     def validate(self, velocity: Velocity) -> None:
         values = (velocity.x, velocity.y, velocity.yaw)
@@ -311,9 +412,11 @@ def build_velocity_proposal(
 
 
 __all__ = [
+    "DEFAULT_MOTION_LIMITS",
     "DEFAULT_VELOCITY_LIMITS",
     "MIN_EFFECTIVE_LINEAR_MPS",
     "MIN_EFFECTIVE_YAW_RADPS",
+    "MotionLimits",
     "TURN_ONLY_YAW_THRESHOLD_RADPS",
     "ProtocolError",
     "SCHEMA_VERSION",
@@ -323,6 +426,7 @@ __all__ = [
     "VelocityLimits",
     "VelocityProposal",
     "apply_g1_motion_floor",
+    "apply_g1_motion_limits",
     "build_velocity_proposal",
     "limit_forward_velocity",
 ]

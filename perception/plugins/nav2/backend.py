@@ -22,10 +22,36 @@ _TERMINAL = {
     "rejected",
 }
 
+_VELOCITY_LIMIT_FIELDS = (
+    "min_x_mps",
+    "max_x_mps",
+    "min_y_mps",
+    "max_y_mps",
+    "min_yaw_rps",
+    "max_yaw_rps",
+)
+
 
 def _topic_root(namespace: str) -> str:
     normalized = namespace.strip("/")
     return f"/{normalized}" if normalized else ""
+
+
+def _build_command_payload(
+    *,
+    request_id: str,
+    nav_id: str | None,
+    action: str,
+    args: dict,
+    velocity_limits: dict,
+) -> dict:
+    return {
+        "request_id": request_id,
+        "nav_id": nav_id,
+        "action": action,
+        "args": args,
+        "velocity_limits": dict(velocity_limits),
+    }
 
 
 class RosTopicNavigationBackend:
@@ -52,6 +78,9 @@ class RosTopicNavigationBackend:
         self._discovery_timeout = float(cfg.get("discovery_timeout_sec", 5.0))
         if self._request_timeout <= 0 or self._discovery_timeout <= 0:
             raise ValueError("navigation bridge timeouts must be positive")
+        self._velocity_limits = {
+            field: float(cfg[field]) for field in _VELOCITY_LIMIT_FIELDS
+        }
 
         node_suffix = re.sub(r"[^a-zA-Z0-9_]", "_", namespace or "root")
         self._node = Node(f"nav2_{node_suffix}")
@@ -167,12 +196,13 @@ class RosTopicNavigationBackend:
     def _request(self, action: str, args: dict, *, nav_id: str | None) -> dict:
         self._wait_for_bridge()
         request_id = uuid.uuid4().hex
-        payload = {
-            "request_id": request_id,
-            "nav_id": nav_id,
-            "action": action,
-            "args": args,
-        }
+        payload = _build_command_payload(
+            request_id=request_id,
+            nav_id=nav_id,
+            action=action,
+            args=args,
+            velocity_limits=self._velocity_limits,
+        )
         message = self._String()
         message.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         with self._condition:

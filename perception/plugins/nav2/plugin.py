@@ -19,11 +19,12 @@ _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,127}$")
 _NUMBER_RANGES = {
     "request_timeout_sec": (1.0, 120.0),
     "discovery_timeout_sec": (0.5, 30.0),
-    "max_forward_mps": (0.01, 1.0),
-    "max_reverse_mps": (0.0, 1.0),
-    "max_lateral_mps": (0.0, 0.12),
-    "max_yaw_rps": (0.01, 2.0),
-    "max_planar_mps": (0.01, 1.0),
+    "min_x_mps": (0.0, 1.0),
+    "max_x_mps": (0.0, 1.0),
+    "min_y_mps": (0.0, 1.0),
+    "max_y_mps": (0.0, 1.0),
+    "min_yaw_rps": (0.0, 2.0),
+    "max_yaw_rps": (0.0, 2.0),
 }
 _INTEGER_RANGES = {
     "input_max_age_ms": (100, 2000),
@@ -84,16 +85,16 @@ def _validated_config(base: dict, updates: dict) -> dict:
         if not minimum <= raw <= maximum:
             raise ConfigError(f"{key} must be within [{minimum}, {maximum}]")
 
-    if result["max_planar_mps"] < result["max_forward_mps"]:
-        raise ConfigError("max_planar_mps must be >= max_forward_mps")
+    for axis, unit in (("x", "m/s"), ("y", "m/s"), ("yaw", "rad/s")):
+        minimum = result[f"min_{axis}_{'rps' if axis == 'yaw' else 'mps'}"]
+        maximum = result[f"max_{axis}_{'rps' if axis == 'yaw' else 'mps'}"]
+        if minimum > maximum:
+            raise ConfigError(
+                f"min_{axis} must not exceed max_{axis} ({unit})"
+            )
 
     fixed = {
         "input_max_age_ms": 500,
-        "max_forward_mps": 1.0,
-        "max_reverse_mps": 1.0,
-        "max_lateral_mps": 0.0,
-        "max_yaw_rps": 2.0,
-        "max_planar_mps": 1.0,
         "proposal_ttl_ms": 250,
     }
     for key, expected in fixed.items():

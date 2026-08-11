@@ -16,10 +16,12 @@ PACKAGE_ROOT = (
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from g1_nav2.execution_protocol import (  # noqa: E402
+    MotionLimits,
     ProtocolError,
     Velocity,
     VelocityProposal,
     apply_g1_motion_floor,
+    apply_g1_motion_limits,
     build_velocity_proposal,
     limit_forward_velocity,
 )
@@ -47,7 +49,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 sequence=2,
                 ttl_ms=250,
                 navigation_status="navigating",
-                velocity=Velocity(x=0.10, y=0.01, yaw=0.0),
+                velocity=Velocity(x=0.10, y=1.01, yaw=0.0),
                 issued_at_unix_ms=2,
             )
         payload["nav_status"] = "arrived"
@@ -88,6 +90,91 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=-2.0)),
             Velocity(x=0.0, y=0.0, yaw=-2.0),
         )
+
+    def test_card_motion_limits_apply_axis_floors_caps_and_disable_lateral(self) -> None:
+        limits = MotionLimits(
+            min_x_mps=0.40,
+            max_x_mps=0.80,
+            min_y_mps=0.10,
+            max_y_mps=0.30,
+            min_yaw_rps=1.20,
+            max_yaw_rps=1.60,
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(x=0.05), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity(x=0.40),
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(x=0.90), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity(x=0.50),
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(x=0.05),
+                limits=MotionLimits(min_x_mps=0.80, max_x_mps=1.0),
+                max_forward_mps=0.50,
+            ),
+            Velocity(x=0.50),
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(x=-0.90), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity(x=-0.80),
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(y=-0.02), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity(y=-0.10),
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(y=0.8), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity(y=0.30),
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(y=0.20, yaw=-0.30),
+                limits=limits,
+                max_forward_mps=0.50,
+            ),
+            Velocity(y=0.0, yaw=-1.20),
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(y=0.20),
+                limits=MotionLimits(max_y_mps=0.0),
+                max_forward_mps=0.50,
+            ),
+            Velocity.zero(),
+        )
+
+    def test_motion_limit_payload_is_complete_and_validated(self) -> None:
+        limits = MotionLimits.from_payload(
+            {
+                "min_x_mps": 0.4,
+                "max_x_mps": 0.8,
+                "min_y_mps": 0.1,
+                "max_y_mps": 0.3,
+                "min_yaw_rps": 1.2,
+                "max_yaw_rps": 1.8,
+            }
+        )
+        self.assertEqual(limits.max_y_mps, 0.3)
+        with self.assertRaises(ProtocolError):
+            MotionLimits.from_payload(
+                {
+                    **limits.as_dict(),
+                    "min_yaw_rps": 1.9,
+                    "max_yaw_rps": 1.8,
+                }
+            )
 
     def test_fast_livo2_readiness_is_fail_closed(self) -> None:
         ready = evaluate_readiness(
@@ -235,8 +322,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(backup.attrib["backup_speed"], "0.30")
         self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
         self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
-        self.assertIn("limit_forward_velocity", command)
-        self.assertIn("apply_g1_motion_floor", command)
+        self.assertIn("MotionLimits.from_payload", command)
+        self.assertIn("apply_g1_motion_limits", command)
+        self.assertIn('payload.get("velocity_limits")', command)
         self.assertIn("goal.pose.header.frame_id = self._global_frame", command)
 
 

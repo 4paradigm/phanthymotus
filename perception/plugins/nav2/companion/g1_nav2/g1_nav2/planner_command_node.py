@@ -33,11 +33,11 @@ from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
 from .execution_protocol import (
+    MotionLimits,
     ProtocolError,
     Velocity,
-    apply_g1_motion_floor,
+    apply_g1_motion_limits,
     build_velocity_proposal,
-    limit_forward_velocity,
 )
 from .readiness import evaluate_readiness, navigation_motion_blocker
 
@@ -356,7 +356,10 @@ class PlannerCommandNode(Node):
             nav_id = self._active.get("nav_id")
             status = self._active.get("status", "error")
             forward_speed_limit = self._active.get("effective_speed_limit")
+            motion_limits = self._active.get("motion_limits")
         if not isinstance(nav_id, str) or not nav_id:
+            return
+        if not isinstance(motion_limits, MotionLimits):
             return
 
         velocity = Velocity(
@@ -374,10 +377,11 @@ class PlannerCommandNode(Node):
                 velocity = Velocity.zero()
         try:
             if reason is None:
-                velocity = limit_forward_velocity(
-                    velocity, max_forward_mps=forward_speed_limit
+                velocity = apply_g1_motion_limits(
+                    velocity,
+                    limits=motion_limits,
+                    max_forward_mps=forward_speed_limit,
                 )
-                velocity = apply_g1_motion_floor(velocity)
             self._publish_velocity_proposal(
                 nav_id=nav_id,
                 navigation_status=status,
@@ -418,8 +422,14 @@ class PlannerCommandNode(Node):
                 raise CommandError("invalid_request", "action is required")
             if not isinstance(args, dict):
                 raise CommandError("invalid_request", "args must be an object")
+            try:
+                motion_limits = MotionLimits.from_payload(
+                    payload.get("velocity_limits")
+                )
+            except ProtocolError as exc:
+                raise CommandError(exc.code, str(exc)) from exc
             with self._command_lock:
-                result = self._dispatch(action, args, nav_id)
+                result = self._dispatch(action, args, nav_id, motion_limits)
             self._respond(request_id, action, nav_id, result)
         except CommandError as exc:
             self._respond(
@@ -443,11 +453,17 @@ class PlannerCommandNode(Node):
                 },
             )
 
-    def _dispatch(self, action: str, args: dict, nav_id) -> dict:
+    def _dispatch(
+        self,
+        action: str,
+        args: dict,
+        nav_id,
+        motion_limits: MotionLimits,
+    ) -> dict:
         if action == "navigate_to_pose":
             if not isinstance(nav_id, str) or not nav_id:
                 raise CommandError("invalid_request", "nav_id is required")
-            return self._navigate_to_pose(nav_id, args)
+            return self._navigate_to_pose(nav_id, args, motion_limits)
         if action == "pause_nav":
             return self._pause(nav_id)
         if action == "resume_nav":
@@ -461,7 +477,12 @@ class PlannerCommandNode(Node):
             )
         raise CommandError("unsupported_action", f"unsupported action: {action}")
 
-    def _navigate_to_pose(self, nav_id: str, args: dict) -> dict:
+    def _navigate_to_pose(
+        self,
+        nav_id: str,
+        args: dict,
+        motion_limits: MotionLimits,
+    ) -> dict:
         self._require_navigation_ready("navigate_to_pose")
         try:
             mode = int(args["mode"])
@@ -497,6 +518,7 @@ class PlannerCommandNode(Node):
                 "effective_speed_limit": min(
                     requested_speed, self._max_shadow_speed
                 ),
+                "motion_limits": motion_limits,
                 "mode": mode,
                 "attempt": 0,
                 "goal_handle": None,
@@ -525,6 +547,7 @@ class PlannerCommandNode(Node):
                 "effective_speed_limit": active["effective_speed_limit"],
                 "speed_policy": "proposal_enforced_with_controller_advisory",
                 "speed_limit_topic": self._controller_speed_limit_topic,
+                "velocity_limits": active["motion_limits"].as_dict(),
                 "mode": active["mode"],
                 "shadow_only": True,
             }
@@ -937,8 +960,12 @@ class PlannerCommandNode(Node):
                         "last_feedback_publish",
                         "last_pose",
                         "cancel_intent",
+                        "motion_limits",
                     }
                 }
+                payload["velocity_limits"] = self._active[
+                    "motion_limits"
+                ].as_dict()
                 payload["event"] = "navigation_status"
                 if payload.get("status") in _IDLE_OR_TERMINAL_STATES:
                     stop_proposal = (str(payload["nav_id"]), str(payload["status"]))
@@ -983,6 +1010,11 @@ class PlannerCommandNode(Node):
                 "controller_speed_limit_topic": self._controller_speed_limit_topic,
                 "controller_speed_limit_subscribers": (
                     self._speed_limit_pub.get_subscription_count()
+                ),
+                "velocity_limits": (
+                    self._active["motion_limits"].as_dict()
+                    if self._active
+                    else None
                 ),
             }
         payload.update(self._readiness())

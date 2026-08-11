@@ -74,15 +74,16 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 速度限制：
 
 - 导航请求 `speed` 范围为 `0.30–1.00 m/s`，默认 `0.50 m/s`；
-- 前进/后退提案的协议上限为 `1.00 m/s`，每次导航仍由请求的
-  `speed` 再限幅；
-- 非零线速度在发布前保持符号并抬升到至少 `0.30 m/s`；
-- 禁止横移，`y=0`；
-- 非零偏航角速度在发布前保持符号并抬升到至少
-  `1.00 rad/s`，绝对值不超过 loco 合同的 `2.00 rad/s`；
+- `config` 动作可配置 `min_x_mps/max_x_mps`、`min_y_mps/max_y_mps`
+  和 `min_yaw_rps/max_yaw_rps`；这些值都是非零速度的绝对值，
+  Nav2 原始方向符号保持不变；
+- 默认 `X=0.30–1.00 m/s`、`Y=0–0 m/s`、`yaw=1.00–2.00 rad/s`；
+  `max_y_mps=0` 保持当前禁止横移的行为；
+- 每次导航的 `speed` 继续作为正向 X 上限，它比卡片配置的
+  X 最小值优先，不会被速度下限反向放大；
 - 平移与转向强制互斥：混合提案的原始 `|yaw| >= 0.20 rad/s` 时只原地
-  转向（`x=0`），低于该阈值时只平移（`yaw=0`），不会向 Driver 发布
-  同时包含非零 `x` 和 `yaw` 的动作；
+  转向（`x=y=0`），低于该阈值时只平移（`yaw=0`），不会向
+  Driver 发布同时包含平移和转向的动作；
 - 上述最小值只处理非零运动提案；readiness blocker、暂停和终态零速
   仍保持严格零值；
 - BackUp 恢复动作固定为 `0.30 m/s`；
@@ -92,6 +93,7 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 
 | action | 参数 | 语义 |
 | --- | --- | --- |
+| `config` | X/Y/yaw 的最小/最大速度绝对值 | 卡片停止时配置，下次 `start` 生效 |
 | `navigate_to_pose` | `x`、`y`、`yaw`、`speed?` | 在 `map` frame 中非阻塞创建导航任务 |
 | `wait_navigation_done` | `stall_timeout?` | 等待到达、取消、超时或错误 |
 | `pause_nav` | 无 | 暂停当前导航 |
@@ -113,8 +115,9 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   去天花板并投影到二维的 `/ubuntu/navigation/obstacle_map`，避免已观察障碍
   因当前视角遮挡而消失；local costmap 继续使用实时
   `/ubuntu/navigation/cloud_registered`，高度带为 `-1.15…+0.80 m`。
-- Rotation Shim 在航向偏差大时先旋转，DWB 只采样 `x/yaw`，不采样横移；
-  proposal 出口再把 DWB 的弧线速度离散成“只转”或“只走”。
+- Rotation Shim 在航向偏差大时先旋转；当前 DWB 仍只采样 `x/yaw`，
+  proposal 出口把弧线速度离散成“只转”或“只走”，并对 X/Y/yaw
+  三轴应用卡片配置的最小/最大绝对值。Y 默认上限为零。
 - velocity smoother 使用 `/ubuntu/navigation/odom` 作为反馈。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
 - Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；
