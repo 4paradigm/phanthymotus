@@ -203,8 +203,22 @@ token 认证，脚本不会自动探测凭据：可由调用方显式提供 `COR
 从仓库根目录执行：
 
 ```bash
-export PERCEPTION_IMAGE=local/phanthy-motus/perception:release.260811.e4836f9-jetson
-export NAV2_IMAGE=phanthy-nav2:nav2-card-e4836f9
+git switch feat/Nav2-card
+git pull --ff-only origin feat/Nav2-card
+
+BUILD_DATE="$(date +%y%m%d)"
+COMMIT="$(git rev-parse --short=7 HEAD)"
+export PERCEPTION_IMAGE="local/phanthy-motus/perception:release.${BUILD_DATE}.${COMMIT}-jetson"
+export NAV2_IMAGE="phanthy-nav2:nav2-card-${COMMIT}"
+export ROS_BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f"
+
+./deploy/build_perception.sh --variant jetson --mirror tuna
+
+(
+  cd perception/plugins/nav2/companion
+  DOCKER_BUILDKIT=0 NAV2_IMAGE="${NAV2_IMAGE}" ROS_BASE_IMAGE="${ROS_BASE_IMAGE}" \
+    docker compose --env-file source-lock.env build nav2
+)
 
 I_CONFIRM_CANVAS_STOPPED=1 STAGE=preflight \
   bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
@@ -212,6 +226,9 @@ I_CONFIRM_CANVAS_STOPPED=1 STAGE=preflight \
 I_AM_G1_OWNER=1 I_CONFIRM_CANVAS_STOPPED=1 STAGE=start \
   bash perception/plugins/nav2/deploy/scripts/owner-start-g1-test-containers.sh
 ```
+
+G1 构建显式使用已锁定的内部 ARM64 ROS Humble 基础镜像，并关闭 BuildKit 的
+Docker Hub metadata 查询；因此即使 G1 无法访问 `registry-1.docker.io` 也能使用本地缓存构建。
 
 `start` 会重复执行全部 preflight，等待 MCP `tools/list` 真实返回 `nav2`；任一容器
 提前退出或超时时，它会输出两侧日志尾部，并且只清理本次创建、携带
@@ -228,7 +245,8 @@ I_AM_G1_OWNER=1 I_CONFIRM_CANVAS_STOPPED=1 STAGE=stop \
 ```
 
 `stop` 同样要求 Canvas project 已停止，并拒绝操作缺少上述 owner 标签的同名容器。
-重新构建镜像后应更新两个环境变量，不要静默复用旧 tag。
+上述流程每次都会先拉取当前分支，再根据新 `HEAD` 生成两个镜像 tag；Docker
+层缓存会复用未变的构建步骤，但不会静默启动上一个 commit 的镜像。
 
 范围外依赖：当前官方 Agent Core 没有消费 `x-execution-control` / `x-topic-actions`，
 所以还不能把每个导航任务的受信 `nav_id` 自动绑定到 Driver `loco` lease。该能力应
