@@ -108,7 +108,7 @@ class Nav2ContractTest(unittest.TestCase):
         tool = nav2_tool_definition("ubuntu")
         properties = tool["inputSchema"]["properties"]
         speed = properties["speed"]
-        self.assertEqual(speed["minimum"], 0.05)
+        self.assertEqual(speed["minimum"], 0.10)
         self.assertEqual(speed["maximum"], 0.15)
         self.assertEqual(speed["default"], 0.15)
         self.assertNotIn("mode", properties)

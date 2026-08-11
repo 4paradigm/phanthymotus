@@ -14,7 +14,7 @@
     "yaw": {"type": "number"},
     "speed": {
       "type": "number",
-      "minimum": 0.05,
+      "minimum": 0.10,
       "maximum": 0.15,
       "default": 0.15
     },

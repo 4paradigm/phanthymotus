@@ -63,10 +63,26 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(terminal["status"], "arrived")
         self.assertIsNone(self.core.info()["active_nav_id"])
 
+    def test_minimum_navigation_speed_is_accepted(self) -> None:
+        result = self.core.dispatch(
+            {
+                "action": "navigate_to_tag",
+                "tag_name": "room-a",
+                "speed": 0.10,
+                "_control_nav_id": "lease-min-speed",
+            }
+        )
+
+        self.assertEqual(result["status"], "navigating")
+        action, args, nav_id = self.backend.calls[-1]
+        self.assertEqual(action, "navigate_to_tag")
+        self.assertEqual(args["speed"], 0.10)
+        self.assertEqual(nav_id, "lease-min-speed")
+
     def test_speed_mode_and_non_finite_values_are_rejected(self) -> None:
         cases = (
             ({"speed": 0.151}, "invalid_argument"),
-            ({"speed": 0.049}, "invalid_argument"),
+            ({"speed": 0.099}, "invalid_argument"),
             ({"mode": "0"}, "invalid_argument"),
             ({"x": float("nan")}, "invalid_argument"),
         )

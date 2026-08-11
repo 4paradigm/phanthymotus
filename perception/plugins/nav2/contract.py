@@ -438,10 +438,10 @@ def nav2_tool_definition(namespace: str) -> dict:
                 },
                 "speed": {
                     "type": "number",
-                    "minimum": 0.05,
+                    "minimum": 0.10,
                     "maximum": 0.15,
                     "default": 0.15,
-                    "description": "Navigation speed 0.05-0.15 m/s (default 0.15)",
+                    "description": "Navigation speed 0.10-0.15 m/s (default 0.15)",
                 },
                 "stall_timeout": {
                     "type": "number",

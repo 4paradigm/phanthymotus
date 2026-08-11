@@ -383,6 +383,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             "primary_controller: dwb_core::DWBLocalPlanner",
             "min_vel_y: 0.0",
             "max_vel_y: 0.0",
+            "min_speed_xy: 0.10",
+            "min_speed_theta: 0.10",
             "vy_samples: 1",
             "rotate_to_goal_heading: false",
         )

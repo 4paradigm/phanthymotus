@@ -154,9 +154,9 @@ def _normalize(action: str, args: dict) -> dict:
 
     if action in _NAVIGATE_ACTIONS:
         speed = _number(args, "speed", default=0.15)
-        if not 0.05 <= speed <= 0.15:
+        if not 0.10 <= speed <= 0.15:
             raise NavigationBackendError(
-                "invalid_argument", "speed must be within [0.05, 0.15] m/s"
+                "invalid_argument", "speed must be within [0.10, 0.15] m/s"
             )
         raw_mode = args.get("mode", 0)
         if isinstance(raw_mode, bool) or not isinstance(raw_mode, int):

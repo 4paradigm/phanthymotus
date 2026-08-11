@@ -194,12 +194,14 @@ Driver 发布前已对 xyz 执行 `gravity_aligned_roll_pitch`，因此 PCLMETA2
 | `resume_nav` | 无 | 恢复已暂停任务；状态不允许时明确拒绝 |
 | `stop_nav` | 无 | 取消当前任务，发布终态零速并等待 Nav2 terminal；物理停车确认由 Driver 完成 |
 
-`speed` 默认 `0.15 m/s`，范围 `0.05–0.15 m/s`。每次发送 Nav2 goal 前会把该值
+`speed` 默认 `0.15 m/s`，范围 `0.10–0.15 m/s`。每次发送 Nav2 goal 前会把该值
 发布为 controller server 的绝对线速度上限；限速 topic 无订阅时请求 fail closed。
 DDS transport acknowledgement 不能证明 controller 已应用限速，因此不再把
 `wait_for_all_acked` 当成应用层确认；真正的安全边界是在每条
 `velocity_proposal` 发布前再次把正向 `x` 强制截断到本任务的 `speed`。恢复行为的
 固定后退速度为 `0.15 m/s`，不受该前向限速参数影响；首版导航固定允许绕障。
+为匹配 G1 的可执行死区，DWB 不采样低于 `0.10 m/s` 的纯平移候选，也不采样
+低于 `0.10 rad/s` 的纯旋转候选；零速仍保留给到站、暂停和终止停车。
 参数错误、not-ready、timeout、cancelled 和内部错误必须具有不同的结构化
 `error_code`，不能只返回 HTTP 200 或日志文本。
 

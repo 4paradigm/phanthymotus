@@ -131,9 +131,9 @@ controller_server:
       min_vel_y: 0.0
       max_vel_y: 0.0
       max_vel_theta: 0.25
-      min_speed_xy: 0.0
+      min_speed_xy: 0.10
       max_speed_xy: 0.15
-      min_speed_theta: 0.0
+      min_speed_theta: 0.10
       acc_lim_x: 0.30
       acc_lim_y: 0.0
       acc_lim_theta: 0.40
