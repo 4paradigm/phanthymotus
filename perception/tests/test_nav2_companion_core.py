@@ -338,6 +338,16 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn('target_mode not in {"mapping", "localization"}', command)
         self.assertIn('target_mode not in VALID_MODES', supervisor)
 
+    def test_numeric_map_name_is_forced_to_string_in_launch(self) -> None:
+        launch = (
+            PACKAGE_ROOT / "launch" / "g1_nav2.launch.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            '"startup_map_name": ParameterValue(map_name, value_type=str)',
+            launch,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

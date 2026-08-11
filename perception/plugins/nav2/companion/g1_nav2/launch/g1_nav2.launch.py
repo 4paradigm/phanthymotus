@@ -11,6 +11,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node, SetRemap
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -163,7 +164,7 @@ def generate_launch_description() -> LaunchDescription:
                     "goal_response_timeout": 8.0,
                     "runtime_mode": mode,
                     "maps_root": maps_root,
-                    "startup_map_name": map_name,
+                    "startup_map_name": ParameterValue(map_name, value_type=str),
                     "service_timeout": 20.0,
                     "pose_lookup_timeout": 2.0,
                     "odom_status_topic": "/ubuntu/navigation/nav2/odom_status",

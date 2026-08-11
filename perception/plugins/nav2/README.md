@@ -128,6 +128,10 @@ BEST_EFFORT 发布端。
 参数错误、not-ready、timeout、cancelled 和内部错误必须具有不同的结构化
 `error_code`，不能只返回 HTTP 200 或日志文本。
 
+`map_name` 始终按字符串传给 ROS 2；纯数字地图名（例如 `1`）不得被
+launch 参数自动推断为整数，避免 localization 启动后 command bridge 因参数
+类型不匹配退出。
+
 ## 配置
 
 卡片为单实例。Canvas `configSchema` 只暴露 `backend` 和三个控制面 timeout；其余字段
