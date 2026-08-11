@@ -53,10 +53,16 @@ def _pclmeta2_payload(
     source_stamp_ns: int = 10_000_000_000,
     timestamp_source: str = "driver_receive",
     metadata_updates: dict | None = None,
+    xyz_points: tuple[tuple[float, float, float], ...] = (
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+    ),
 ) -> bytes:
     point_step = 22
     point_count = 2
     points = bytearray(point_step * point_count)
+    for index, xyz in enumerate(xyz_points):
+        struct.pack_into("<fff", points, index * point_step, *xyz)
     struct.pack_into("<f", points, 18, 5_000.0)
     struct.pack_into("<f", points, 40, 99_840_000.0)
     metadata = {
@@ -92,6 +98,20 @@ def _pclmeta2_payload(
             "is_dense": False,
         },
         "point_data_transform": "gravity_aligned_roll_pitch",
+        "point_data_transform_params": {
+            "version": 1,
+            "applied": False,
+            "roll_rad": 0.0,
+            "pitch_rad": 0.0,
+            "payload_to_sensor_rotation_row_major": [
+                1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0,
+            ],
+            "source_frame_id": "utlidar_lidar",
+            "attitude_source": "latest_livox_imu_callback",
+            "attitude_time_correlated": False,
+        },
     }
     if metadata_updates:
         metadata.update(metadata_updates)
@@ -162,6 +182,15 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(cloud.timestamp_source, "driver_receive")
         self.assertEqual(cloud.frame_id, "livox_frame")
         self.assertEqual(cloud.raw_lidar_frame_id, "utlidar_lidar")
+        self.assertEqual(
+            cloud.source_point_data_transform,
+            "gravity_aligned_roll_pitch",
+        )
+        self.assertEqual(
+            cloud.point_data_transform,
+            "rigid_lidar_frame_restored",
+        )
+        self.assertFalse(cloud.gravity_alignment_applied)
         self.assertEqual(cloud.raw_lidar_stamp_ns, 1_000_000_002)
         self.assertEqual(cloud.point_count, 2)
         self.assertEqual(cloud.point_step, 22)
@@ -171,6 +200,43 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             ["x", "y", "z", "intensity", "ring", "time"],
         )
         self.assertEqual(cloud.data, payload[8:52])
+
+    def test_pclmeta2_restores_rigid_sensor_xyz_and_preserves_other_fields(self) -> None:
+        payload = _pclmeta2_payload(
+            xyz_points=((1.0, 3.0, -2.0), (-4.0, 6.0, -5.0)),
+            metadata_updates={
+                "point_data_transform_params": {
+                    "version": 1,
+                    "applied": True,
+                    "roll_rad": 1.5707963267948966,
+                    "pitch_rad": 0.0,
+                    "payload_to_sensor_rotation_row_major": [
+                        1.0, 0.0, 0.0,
+                        0.0, 0.0, -1.0,
+                        0.0, 1.0, 0.0,
+                    ],
+                    "source_frame_id": "utlidar_lidar",
+                    "attitude_source": "latest_livox_imu_callback",
+                    "attitude_time_correlated": False,
+                }
+            },
+        )
+
+        cloud = decode_canvas_pointcloud(
+            payload,
+            receive_stamp_ns=10_100_000_000,
+            output_frame_id="livox_frame",
+        )
+
+        first = struct.unpack_from("<fff", cloud.data, 0)
+        second = struct.unpack_from("<fff", cloud.data, 22)
+        for actual, expected in zip(first, (1.0, 2.0, 3.0)):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for actual, expected in zip(second, (-4.0, 5.0, 6.0)):
+            self.assertAlmostEqual(actual, expected, places=6)
+        self.assertEqual(cloud.data[12:22], payload[20:30])
+        self.assertEqual(cloud.data[34:44], payload[42:52])
+        self.assertTrue(cloud.gravity_alignment_applied)
 
     def test_pclmeta2_rejects_legacy_corrupt_and_stale_frames(self) -> None:
         legacy = struct.pack("<II", 22, 1) + bytes(22)
@@ -225,6 +291,62 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 receive_stamp_ns=10_100_000_000,
                 output_frame_id="livox_frame",
             )
+
+    def test_pclmeta2_rejects_missing_or_invalid_inverse_transform(self) -> None:
+        invalid_params = (
+            None,
+            {
+                "version": 1,
+                "applied": True,
+                "roll_rad": 0.1,
+                "pitch_rad": 0.2,
+                "payload_to_sensor_rotation_row_major": [0.0] * 9,
+                "source_frame_id": "utlidar_lidar",
+                "attitude_source": "latest_livox_imu_callback",
+                "attitude_time_correlated": False,
+            },
+            {
+                "version": 1,
+                "applied": False,
+                "roll_rad": 0.0,
+                "pitch_rad": 0.0,
+                "payload_to_sensor_rotation_row_major": [
+                    -1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0,
+                ],
+                "source_frame_id": "utlidar_lidar",
+                "attitude_source": "latest_livox_imu_callback",
+                "attitude_time_correlated": False,
+            },
+            {
+                "version": 1,
+                "applied": False,
+                "roll_rad": 0.0,
+                "pitch_rad": 0.0,
+                "payload_to_sensor_rotation_row_major": [
+                    1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0,
+                ],
+                "source_frame_id": "wrong_frame",
+                "attitude_source": "latest_livox_imu_callback",
+                "attitude_time_correlated": False,
+            },
+        )
+        for params in invalid_params:
+            with self.subTest(params=params), self.assertRaises(
+                InvalidCanvasPointCloud
+            ):
+                decode_canvas_pointcloud(
+                    _pclmeta2_payload(
+                        metadata_updates={
+                            "point_data_transform_params": params,
+                        }
+                    ),
+                    receive_stamp_ns=10_100_000_000,
+                    output_frame_id="livox_frame",
+                )
 
     def test_pclmeta2_lidar_clock_maps_scan_start_to_driver_time(self) -> None:
         normalizer = LidarClockNormalizer(

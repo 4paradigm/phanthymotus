@@ -171,6 +171,20 @@ class StageSixFixture(Node):
                     "is_dense": True,
                 },
                 "point_data_transform": "gravity_aligned_roll_pitch",
+                "point_data_transform_params": {
+                    "version": 1,
+                    "applied": False,
+                    "roll_rad": 0.0,
+                    "pitch_rad": 0.0,
+                    "payload_to_sensor_rotation_row_major": [
+                        1.0, 0.0, 0.0,
+                        0.0, 1.0, 0.0,
+                        0.0, 0.0, 1.0,
+                    ],
+                    "source_frame_id": "utlidar_lidar",
+                    "attitude_source": "latest_livox_imu_callback",
+                    "attitude_time_correlated": False,
+                },
             }
             metadata_bytes = json.dumps(
                 metadata, separators=(",", ":"), sort_keys=True

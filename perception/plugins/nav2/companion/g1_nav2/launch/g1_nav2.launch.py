@@ -285,7 +285,7 @@ def generate_launch_description() -> LaunchDescription:
                 "publish_lidar_static_tf",
                 default_value="true",
                 description=(
-                    "Publish the configured base_link -> gravity-aligned LiDAR "
+                    "Publish the configured base_link -> rigid LiDAR "
                     "adapter frame extrinsics; "
                     "set false when the robot already publishes this TF"
                 ),

@@ -15,7 +15,9 @@ NAV2_IMAGE=phanthy-nav2:nav2-card-stage6-amd64 \
 
 fixture 默认发布与新 G1 Driver 一致的 `loco_state.v2` 和
 `/ubuntu/lidar/cloud` `UInt8MultiArray`；点云保留 legacy prefix，并附加
-`PCLMETA2` footer 中的 Driver 接收时间、原始 LiDAR header 与 XYZIRT fields。
+`PCLMETA2` footer 中的 Driver 接收时间、原始 LiDAR header、XYZIRT fields 与
+必需的刚性坐标恢复参数。fixture 使用 `applied=false` 和单位逆旋转，既覆盖完整
+新合同，又避免为静态合成点云伪造姿态变换。
 它同时完整记录 status/proposal。向
 `/nav2_stage6/fixture_control` 发布 `stop_inputs` 可在保留订阅观测的同时中断
 传感器输入；发布 `resume_inputs` 恢复。fixture 是可重复的合同和故障注入
@@ -33,9 +35,10 @@ NAV2_IMAGE=phanthy-nav2:nav2-card-stage6-amd64 \
 
 v2 fixture 用同一 ROS system clock 生成声明 `driver_receive` 的
 `loco_state.v2`，并为点云提供 Driver 接收时间、原始 LiDAR 扫描起始时间和逐点
-`time`。它验证 companion 严格解析 footer、还原 PointCloud2 fields、将 LiDAR
-原始时钟归一化到 odom/TF 的 system-time 时钟域，再以归一化后的扫描起始时间
-执行 freshness 检查。运行时 `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud` 都必须
-各自只有一个发布者，重复 Driver 数据源应被拒绝。
+`time`，以及 `point_data_transform_params` 中的精确逆旋转。它验证 companion
+严格解析 footer、恢复刚性 LiDAR xyz、还原 PointCloud2 fields、将 LiDAR 原始
+时钟归一化到 odom/TF 的 system-time 时钟域，再以归一化后的扫描起始时间执行
+freshness 检查。运行时 `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud` 都必须各自
+只有一个发布者，重复 Driver 数据源应被拒绝。
 `NAV2_FIXTURE_SENSOR_SCHEMA=legacy` 则故意不加 footer，用于验证 Nav2 拒绝无可信
 时间的旧帧；该模式不应进入 ready。

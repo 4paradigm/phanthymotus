@@ -272,6 +272,22 @@ class CanvasPointCloudBridge(Node):
             "point_data_transform": (
                 cloud.point_data_transform if cloud is not None else None
             ),
+            "source_point_data_transform": (
+                cloud.source_point_data_transform if cloud is not None else None
+            ),
+            "removed_gravity_alignment": (
+                {
+                    "applied": cloud.gravity_alignment_applied,
+                    "roll_rad": cloud.gravity_alignment_roll_rad,
+                    "pitch_rad": cloud.gravity_alignment_pitch_rad,
+                    "attitude_source": cloud.gravity_alignment_attitude_source,
+                    "attitude_time_correlated": (
+                        cloud.gravity_alignment_attitude_time_correlated
+                    ),
+                }
+                if cloud is not None
+                else None
+            ),
             "scan_end_offset_ms": (
                 round(cloud.scan_end_offset_ns / 1_000_000, 3)
                 if cloud is not None

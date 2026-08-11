@@ -49,6 +49,18 @@ class Nav2ContractTest(unittest.TestCase):
         )
         self.assertNotIn("compatible_schemas", inputs["lidar_cloud"])
         self.assertIn("BEST_EFFORT", inputs["lidar_cloud"]["qos"])
+        self.assertIn(
+            "restored rigid LiDAR point bytes",
+            inputs["lidar_cloud"]["frame_id"],
+        )
+        self.assertIn(
+            "restores rigid LiDAR xyz",
+            inputs["lidar_cloud"]["desc"],
+        )
+        self.assertNotIn(
+            "gravity-aligned point bytes",
+            inputs["lidar_cloud"]["frame_id"],
+        )
         self.assertFalse(inputs["goal_pose"]["required"])
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
@@ -77,9 +89,21 @@ class Nav2ContractTest(unittest.TestCase):
         bridge = (
             companion_root / "g1_nav2" / "canvas_pointcloud_node.py"
         ).read_text(encoding="utf-8")
+        pointcloud_core = (
+            companion_root / "g1_nav2" / "canvas_pointcloud_core.py"
+        ).read_text(encoding="utf-8")
         odom_bridge = (
             companion_root / "g1_nav2" / "loco_odom_node.py"
         ).read_text(encoding="utf-8")
+        package_xml = (companion_root / "package.xml").read_text(
+            encoding="utf-8"
+        )
+        companion_dir = companion_root.parent
+        dockerfile = (companion_dir / "Dockerfile").read_text(encoding="utf-8")
+        compose = (companion_dir / "compose.yml").read_text(encoding="utf-8")
+        source_lock = (companion_dir / "source-lock.env").read_text(
+            encoding="utf-8"
+        )
         self.assertIn(
             'default_value="/ubuntu/lidar/cloud"', launch
         )
@@ -94,6 +118,12 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertIn("LidarClockNormalizer", bridge)
         self.assertIn("self._lidar_clock = LidarClockNormalizer", bridge)
         self.assertNotIn("self._clock = LidarClockNormalizer", bridge)
+        self.assertIn('POINT_DATA_TRANSFORM = "rigid_lidar_frame_restored"', pointcloud_core)
+        self.assertIn("payload_to_sensor_rotation_row_major", pointcloud_core)
+        self.assertIn("python3-numpy", package_xml)
+        self.assertIn("python3-numpy=${PYTHON_NUMPY_VERSION}", dockerfile)
+        self.assertIn("PYTHON_NUMPY_VERSION", compose)
+        self.assertIn("PYTHON_NUMPY_VERSION=", source_lock)
         self.assertIn('"timestamp_mode": "auto"', launch)
         self.assertIn("expected exactly one publisher", bridge)
         self.assertIn("expected exactly one publisher", odom_bridge)

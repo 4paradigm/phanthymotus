@@ -9,6 +9,8 @@ import math
 import struct
 from typing import Any, Iterable
 
+import numpy as np
+
 from .timestamp_contract import (
     DEFAULT_MAX_FUTURE_SKEW_NS,
     DEFAULT_MAX_SOURCE_AGE_NS,
@@ -19,7 +21,9 @@ from .timestamp_contract import (
 
 LIDAR_CLOUD_SCHEMA = "phanthy.g1.lidar_cloud.v2"
 LIDAR_CLOUD_TRAILER_MAGIC = b"PCLMETA2"
-POINT_DATA_TRANSFORM = "gravity_aligned_roll_pitch"
+DRIVER_POINT_DATA_TRANSFORM = "gravity_aligned_roll_pitch"
+POINT_DATA_TRANSFORM = "rigid_lidar_frame_restored"
+POINT_DATA_TRANSFORM_PARAMS_VERSION = 1
 POINT_FIELD_FLOAT32 = 7
 NSEC_PER_SEC = 1_000_000_000
 _LEGACY_HEADER = struct.Struct("<II")
@@ -63,7 +67,13 @@ class CanvasPointCloud:
     raw_lidar_stamp_ns: int | None
     raw_lidar_stamp_valid: bool
     raw_lidar_frame_id: str
+    source_point_data_transform: str
     point_data_transform: str
+    gravity_alignment_applied: bool
+    gravity_alignment_roll_rad: float
+    gravity_alignment_pitch_rad: float
+    gravity_alignment_attitude_source: str
+    gravity_alignment_attitude_time_correlated: bool
     height: int
     width: int
     fields: tuple[CanvasPointField, ...]
@@ -384,6 +394,151 @@ def _decode_raw_lidar_header(metadata: dict[str, Any]) -> tuple[int | None, bool
     return raw_stamp_ns, valid, frame_id
 
 
+@dataclass(frozen=True)
+class _PointDataTransform:
+    applied: bool
+    roll_rad: float
+    pitch_rad: float
+    payload_to_sensor_rotation: np.ndarray
+    source_frame_id: str
+    attitude_source: str
+    attitude_time_correlated: bool
+
+
+def _require_finite_number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidCanvasPointCloud(f"{name} must be a number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise InvalidCanvasPointCloud(f"{name} must be finite")
+    return number
+
+
+def _decode_point_data_transform(
+    metadata: dict[str, Any],
+    *,
+    raw_frame_id: str,
+) -> _PointDataTransform:
+    if metadata.get("point_data_transform") != DRIVER_POINT_DATA_TRANSFORM:
+        raise InvalidCanvasPointCloud(
+            "unsupported point_data_transform: "
+            f"{metadata.get('point_data_transform')!r}"
+        )
+    params = metadata.get("point_data_transform_params")
+    if not isinstance(params, dict):
+        raise InvalidCanvasPointCloud(
+            "point_data_transform_params are required to restore the rigid LiDAR frame"
+        )
+    if params.get("version") != POINT_DATA_TRANSFORM_PARAMS_VERSION:
+        raise InvalidCanvasPointCloud(
+            "unsupported point_data_transform_params version: "
+            f"{params.get('version')!r}"
+        )
+    applied = params.get("applied")
+    if not isinstance(applied, bool):
+        raise InvalidCanvasPointCloud(
+            "point_data_transform_params.applied must be boolean"
+        )
+    roll_rad = _require_finite_number(
+        params.get("roll_rad"), "point_data_transform_params.roll_rad"
+    )
+    pitch_rad = _require_finite_number(
+        params.get("pitch_rad"), "point_data_transform_params.pitch_rad"
+    )
+    if not -math.pi <= roll_rad <= math.pi:
+        raise InvalidCanvasPointCloud(
+            "point_data_transform_params.roll_rad is out of range"
+        )
+    if not -math.pi / 2 <= pitch_rad <= math.pi / 2:
+        raise InvalidCanvasPointCloud(
+            "point_data_transform_params.pitch_rad is out of range"
+        )
+
+    matrix_values = params.get("payload_to_sensor_rotation_row_major")
+    if not isinstance(matrix_values, list) or len(matrix_values) != 9:
+        raise InvalidCanvasPointCloud(
+            "payload_to_sensor_rotation_row_major must contain 9 numbers"
+        )
+    matrix = np.asarray(
+        [
+            _require_finite_number(
+                value,
+                f"payload_to_sensor_rotation_row_major[{index}]",
+            )
+            for index, value in enumerate(matrix_values)
+        ],
+        dtype=np.float64,
+    ).reshape(3, 3)
+    identity = np.eye(3, dtype=np.float64)
+    if not np.allclose(matrix @ matrix.T, identity, rtol=0.0, atol=1e-5):
+        raise InvalidCanvasPointCloud(
+            "payload_to_sensor_rotation_row_major must be orthonormal"
+        )
+    determinant = float(np.linalg.det(matrix))
+    if not math.isclose(determinant, 1.0, rel_tol=0.0, abs_tol=1e-5):
+        raise InvalidCanvasPointCloud(
+            "payload_to_sensor_rotation_row_major must be a proper rotation"
+        )
+    if not applied and not np.allclose(
+        matrix, identity, rtol=0.0, atol=1e-7
+    ):
+        raise InvalidCanvasPointCloud(
+            "an unapplied point_data_transform must use the identity rotation"
+        )
+
+    source_frame_id = params.get("source_frame_id")
+    if source_frame_id != raw_frame_id:
+        raise InvalidCanvasPointCloud(
+            "point_data_transform source_frame_id must match lidar_header.frame_id"
+        )
+    attitude_source = params.get("attitude_source")
+    if attitude_source != "latest_livox_imu_callback":
+        raise InvalidCanvasPointCloud(
+            "unsupported point_data_transform attitude_source"
+        )
+    attitude_time_correlated = params.get("attitude_time_correlated")
+    if attitude_time_correlated is not False:
+        raise InvalidCanvasPointCloud(
+            "point_data_transform attitude_time_correlated must be false"
+        )
+    return _PointDataTransform(
+        applied=applied,
+        roll_rad=roll_rad,
+        pitch_rad=pitch_rad,
+        payload_to_sensor_rotation=matrix,
+        source_frame_id=source_frame_id,
+        attitude_source=attitude_source,
+        attitude_time_correlated=attitude_time_correlated,
+    )
+
+
+def _restore_rigid_lidar_points(
+    data: bytes,
+    *,
+    point_step: int,
+    point_count: int,
+    transform: _PointDataTransform,
+) -> bytes:
+    if not transform.applied:
+        return data
+
+    restored = bytearray(data)
+    records = np.frombuffer(restored, dtype=np.uint8).reshape(
+        point_count, point_step
+    )
+    payload_xyz = (
+        records[:, :12]
+        .copy()
+        .view("<f4")
+        .reshape(point_count, 3)
+    )
+    sensor_xyz = payload_xyz @ transform.payload_to_sensor_rotation.T
+    records[:, :12] = np.asarray(sensor_xyz, dtype="<f4").view(np.uint8).reshape(
+        point_count, 12
+    )
+    return bytes(restored)
+
+
 def decode_canvas_pointcloud(
     payload: bytes | bytearray | memoryview | Iterable[int],
     *,
@@ -394,11 +549,14 @@ def decode_canvas_pointcloud(
 ) -> CanvasPointCloud:
     """Decode a legacy-compatible point payload with a strict PCLMETA2 footer.
 
-    The Driver rotates xyz into its established gravity-aligned payload before
-    publishing. Therefore the raw ``lidar_header.frame_id`` is diagnostic only;
-    ``output_frame_id`` remains the reviewed adapter frame used by Nav2.
-    Frames without valid v2 metadata are rejected instead of receiving a
-    fabricated adapter timestamp.
+    The Driver keeps its established gravity-aligned legacy prefix for existing
+    dashboard and safety consumers.  PCLMETA2 must carry the exact inverse
+    rotation applied to that prefix so this adapter can restore a rigid sensor
+    frame before publishing to Nav2.  ``output_frame_id`` is an explicit alias
+    for that rigid frame and retains the reviewed static-TF contract.
+
+    Frames without valid v2 metadata or a valid inverse transform are rejected
+    instead of silently feeding gravity-aligned points into SLAM.
     """
 
     try:
@@ -454,12 +612,11 @@ def decode_canvas_pointcloud(
     except InvalidSourceTimestamp as exc:
         raise InvalidCanvasPointCloud(str(exc)) from exc
 
-    if metadata.get("point_data_transform") != POINT_DATA_TRANSFORM:
-        raise InvalidCanvasPointCloud(
-            "unsupported point_data_transform: "
-            f"{metadata.get('point_data_transform')!r}"
-        )
     raw_stamp_ns, raw_stamp_valid, raw_frame_id = _decode_raw_lidar_header(metadata)
+    point_data_transform = _decode_point_data_transform(
+        metadata,
+        raw_frame_id=raw_frame_id,
+    )
 
     pointcloud = metadata.get("pointcloud")
     if not isinstance(pointcloud, dict):
@@ -486,7 +643,13 @@ def decode_canvas_pointcloud(
         raise InvalidCanvasPointCloud("pointcloud.is_dense must be boolean")
     fields = _decode_fields(pointcloud.get("fields"), point_step=point_step)
 
-    point_data = raw[_LEGACY_HEADER.size:point_data_end]
+    source_point_data = raw[_LEGACY_HEADER.size:point_data_end]
+    point_data = _restore_rigid_lidar_points(
+        source_point_data,
+        point_step=point_step,
+        point_count=point_count,
+        transform=point_data_transform,
+    )
     scan_end_offset_ns = point_time_max_offset_ns(
         data=point_data,
         fields=fields,
@@ -502,12 +665,20 @@ def decode_canvas_pointcloud(
         driver_receive_monotonic_ns=driver_receive_monotonic_ns,
         timestamp_source="driver_receive",
         frame_id=output_frame_id,
-        frame_source="adapter_contract_for_gravity_aligned_payload",
+        frame_source="adapter_alias_for_restored_rigid_lidar_payload",
         source_schema=LIDAR_CLOUD_SCHEMA,
         raw_lidar_stamp_ns=raw_stamp_ns,
         raw_lidar_stamp_valid=raw_stamp_valid,
         raw_lidar_frame_id=raw_frame_id,
+        source_point_data_transform=DRIVER_POINT_DATA_TRANSFORM,
         point_data_transform=POINT_DATA_TRANSFORM,
+        gravity_alignment_applied=point_data_transform.applied,
+        gravity_alignment_roll_rad=point_data_transform.roll_rad,
+        gravity_alignment_pitch_rad=point_data_transform.pitch_rad,
+        gravity_alignment_attitude_source=point_data_transform.attitude_source,
+        gravity_alignment_attitude_time_correlated=(
+            point_data_transform.attitude_time_correlated
+        ),
         height=height,
         width=width,
         fields=fields,
@@ -529,8 +700,10 @@ __all__ = [
     "LidarClockSnapshot",
     "LIDAR_CLOUD_SCHEMA",
     "LIDAR_CLOUD_TRAILER_MAGIC",
+    "DRIVER_POINT_DATA_TRANSFORM",
     "NSEC_PER_SEC",
     "POINT_DATA_TRANSFORM",
+    "POINT_DATA_TRANSFORM_PARAMS_VERSION",
     "decode_canvas_pointcloud",
     "point_time_max_offset_ns",
 ]

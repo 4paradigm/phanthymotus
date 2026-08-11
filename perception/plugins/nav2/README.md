@@ -46,7 +46,7 @@ topic 名以 Canvas 的端口绑定为准。首版 companion 冻结 G1 的
 | port | 当前 G1 示例 | ROS 2 type / format | QoS | 数据合同 |
 | --- | --- | --- | --- | --- |
 | `loco_state` | `/ubuntu/loco/state` | `std_msgs/msg/String` / `data/json` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 `unitree.g1.loco_state.legacy` 和带源时间戳/frame 的 `phanthy.g1.loco_state.v2`；期望 10 Hz，最大 age 500 ms；必须恰好一个 publisher |
-| `lidar_cloud` | `/ubuntu/lidar/cloud` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE` | legacy 点数据前缀 + 必需 `PCLMETA2` footer；Driver 接收时间与 `loco_state.v2` 同钟域，原始 LiDAR header 和 XYZIRT fields 用于整帧时间归一化；必须恰好一个 publisher |
+| `lidar_cloud` | `/ubuntu/lidar/cloud` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE` | legacy 重力对齐点数据前缀 + 必需 `PCLMETA2` footer；footer 同时携带 Driver 接收时间、原始 LiDAR header、XYZIRT fields 和恢复刚性 LiDAR 坐标所需的精确逆旋转；必须恰好一个 publisher |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String` / `data/json` | `RELIABLE + KEEP_LAST(depth=10) + VOLATILE` | `phanthy.navigation.goal.v1`；`map` frame；每条消息必须有唯一 `goal_id` |
 
 legacy `loco_state` 没有源时间戳或 frame 时，adapter 必须明确标记接收时间和
@@ -90,7 +90,36 @@ char   magic[8] = "PCLMETA2"
 `metadata_json` 必须声明 `schema=phanthy.g1.lidar_cloud.v2`、
 `schema_version=2`、`timestamp_source=driver_receive`，且
 `source_stamp_ns == driver_receive_unix_ns`。`pointcloud` 字段必须与 legacy
-前缀和点数据长度一致，并保留 MID360 XYZIRT 布局：
+前缀和点数据长度一致，并保留 MID360 XYZIRT 布局。Driver 继续为既有安全与
+Canvas 消费者发布重力对齐后的 legacy 前缀，但必须在同一帧 footer 中声明：
+
+```json
+{
+  "point_data_transform": "gravity_aligned_roll_pitch",
+  "point_data_transform_params": {
+    "version": 1,
+    "applied": true,
+    "roll_rad": 0.012,
+    "pitch_rad": -0.021,
+    "payload_to_sensor_rotation_row_major": [
+      0.999779522, -0.000251975, -0.020996945,
+      0.000000000, 0.999927998, -0.011999712,
+      0.020998457, 0.011997066, 0.999707520
+    ],
+    "source_frame_id": "utlidar_lidar",
+    "attitude_source": "latest_livox_imu_callback",
+    "attitude_time_correlated": false
+  }
+}
+```
+
+`payload_to_sensor_rotation_row_major` 是 Driver 对本帧实际使用的同一旋转生成的
+精确逆矩阵，语义为 `xyz_sensor = M * xyz_payload`。companion 校验版本、有限值、
+正交性、行列式、source frame 和姿态来源后，只逆变换 XYZ；intensity、ring、
+逐点 time 等其余字节保持不变。旧 Driver 没有该参数、矩阵损坏或 frame 不一致时
+Nav2 fail closed，不允许静默沿用会随机器人姿态变化的点坐标。
+
+MID360 点布局为：
 
 | field | offset | datatype | unit/reference |
 | --- | ---: | --- | --- |
@@ -113,9 +142,12 @@ source age、原始 LiDAR header、扫描跨度、clock offset/residual/reset、
 数量、输出 frame、点数和拒绝原因。断流、重复 publisher、过期/超前或时间倒退
 仍 fail closed。
 
-Driver 发布前已对 xyz 执行 `gravity_aligned_roll_pitch`，因此 PCLMETA2 中的
-原始 `utlidar_lidar` frame 不能直接标在变换后的点字节上。companion 保留已验收
-的 `livox_frame` adapter 语义，并仅把原始 frame 放入诊断。
+Driver 发布前仍对 legacy 前缀的 xyz 执行 `gravity_aligned_roll_pitch`；companion
+使用上述逆矩阵把 Nav2 分支恢复成原始刚性 LiDAR 坐标，再把
+`livox_frame` 作为这套刚性坐标的 adapter alias 发布。这样旧安全与 Canvas 消费者
+的输入不变，同时 SLAM 不再把随最新 IMU roll/pitch 变化的整帧点云误认为固定 frame。
+`/ubuntu/navigation/nav2/lidar_status` 同时报告源变换和已移除的 roll/pitch，便于
+确认现场真正启用了恢复路径。
 `base_link -> livox_frame` 默认使用 Driver G1 URDF 中沿零腰部链
 合成的标称外参，不能只替换 frame 字符串；如果现场有校准值，
 应通过环境变量覆盖。默认由 companion 发布该静态 TF；如果机器人
@@ -429,9 +461,10 @@ STAGE=stop \
 `input_topics` 连线、建图/停图/原子存图、结构化 proposal、传感器断流
 零速保护与恢复、10 轮 start/stop、非法输入隔离和 Perception 重启验证。
 
-当前仍是 Draft，不能宣称完整可用：本轮已有 PCLMETA2、整帧时钟归一化、重复
-publisher 拒绝和提案侧速度截断的确定性测试，但尚未用去重后的单 Driver 现场重建
-一张地图；合成点云也不能证明非空房间路径规划。此外，官方 Core 尚未消费
+当前仍是 Draft，不能宣称完整可用：本轮已有 PCLMETA2、刚性 LiDAR 坐标恢复、
+整帧时钟归一化、重复 publisher 拒绝和提案侧速度截断的确定性测试，但尚未用
+新版 Driver + companion 在真机现场重建一张地图；合成点云也不能证明非空房间
+路径规划。此外，官方 Core 尚未消费
 `x-execution-control` / `x-topic-actions`，
 所以 Driver lease 和 `goal_pose` 执行闭环仍是外部 blocker。ARM64 生产镜像、真实
 录包、Dashboard 人工界面确认以及 G1 真机执行属于后续验收。

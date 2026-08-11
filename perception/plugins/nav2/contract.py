@@ -326,17 +326,18 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "callback receive clock as loco_state.v2"
                 ),
                 "frame_id": (
-                    "livox_frame adapter contract for gravity-aligned point bytes; "
-                    "raw LiDAR frame retained in PCLMETA2 diagnostics"
+                    "livox_frame adapter alias for restored rigid LiDAR point bytes; "
+                    "raw source frame retained in PCLMETA2 diagnostics"
                 ),
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
                 "units": "PCLMETA2 PointField layout; x/y/z in meters",
                 "max_age_ms": 500,
                 "desc": (
                     "Legacy-compatible Driver envelope with a required PCLMETA2 "
-                    "footer. The companion restores PointCloud2 fields, uses only "
-                    "the Driver receive stamp for Nav2 freshness, and rejects legacy "
-                    "or damaged frames instead of fabricating timestamps"
+                    "footer. The companion restores rigid LiDAR xyz and PointCloud2 "
+                    "fields, uses only the Driver receive stamp for Nav2 freshness, "
+                    "and rejects legacy or damaged frames instead of fabricating "
+                    "timestamps"
                 ),
             },
             {

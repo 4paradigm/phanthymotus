@@ -4,6 +4,7 @@ FROM ${ROS_BASE_IMAGE}
 ARG APT_UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG APT_ROS_MIRROR=mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 ARG PYTHON_COLCON_VERSION=0.3.0-100
+ARG PYTHON_NUMPY_VERSION=1:1.21.5-1ubuntu22.04.1
 ARG PYTHON_PYTEST_VERSION=6.2.5-1ubuntu2
 ARG ROS_NAV2_BRINGUP_VERSION_AMD64=1.1.20-1jammy.20260804.225407
 ARG ROS_NAV2_BRINGUP_VERSION_ARM64=1.1.20-1jammy.20260805.020157
@@ -44,6 +45,7 @@ RUN arch="$(dpkg --print-architecture)" && \
     apt-get -o APT::Sandbox::User=root update && \
     apt-get -o APT::Sandbox::User=root install -y --no-install-recommends \
       python3-colcon-common-extensions=${PYTHON_COLCON_VERSION} \
+      python3-numpy=${PYTHON_NUMPY_VERSION} \
       python3-pytest=${PYTHON_PYTEST_VERSION} \
       ros-humble-nav2-bringup=${nav2_bringup_version} \
       ros-humble-navigation2=${navigation2_version} \
@@ -58,6 +60,7 @@ RUN . /opt/ros/humble/setup.sh && \
     colcon build --packages-select g1_nav2 --symlink-install && \
     dpkg-query -W \
       python3-colcon-common-extensions \
+      python3-numpy \
       python3-pytest \
       ros-humble-nav2-bringup \
       ros-humble-navigation2 \
@@ -65,7 +68,7 @@ RUN . /opt/ros/humble/setup.sh && \
       ros-humble-rmw-fastrtps-cpp \
       ros-humble-slam-toolbox \
       > /opt/g1-nav2-package-lock.txt && \
-    test "$(wc -l < /opt/g1-nav2-package-lock.txt)" -eq 7
+    test "$(wc -l < /opt/g1-nav2-package-lock.txt)" -eq 8
 
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp

@@ -9,6 +9,7 @@ services:
         APT_UBUNTU_MIRROR: ${APT_UBUNTU_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
         APT_ROS_MIRROR: ${APT_ROS_MIRROR:-mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu}
         PYTHON_COLCON_VERSION: ${PYTHON_COLCON_VERSION:?locked python3-colcon version required}
+        PYTHON_NUMPY_VERSION: ${PYTHON_NUMPY_VERSION:?locked python3-numpy version required}
         PYTHON_PYTEST_VERSION: ${PYTHON_PYTEST_VERSION:?locked python3-pytest version required}
         ROS_NAV2_BRINGUP_VERSION_AMD64: ${ROS_NAV2_BRINGUP_VERSION_AMD64:?locked amd64 nav2-bringup version required}
         ROS_NAV2_BRINGUP_VERSION_ARM64: ${ROS_NAV2_BRINGUP_VERSION_ARM64:?locked arm64 nav2-bringup version required}
