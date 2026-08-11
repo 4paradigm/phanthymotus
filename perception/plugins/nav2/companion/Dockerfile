@@ -16,7 +16,8 @@ ARG ROS_RMW_FASTRTPS_CPP_VERSION_ARM64=6.2.10-1jammy.20260725.133410
 ARG ROS_SLAM_TOOLBOX_VERSION_AMD64=2.6.10-1jammy.20260804.222728
 ARG ROS_SLAM_TOOLBOX_VERSION_ARM64=2.6.10-1jammy.20260805.012523
 
-RUN sed -i "s|http://ports.ubuntu.com/ubuntu-ports|https://${APT_UBUNTU_MIRROR}/ubuntu-ports|g" /etc/apt/sources.list && \
+RUN install -m 0644 /usr/share/ros-apt-source/ros2.sources /etc/apt/sources.list.d/ros2.sources && \
+    sed -i "s|http://ports.ubuntu.com/ubuntu-ports|https://${APT_UBUNTU_MIRROR}/ubuntu-ports|g" /etc/apt/sources.list && \
     sed -i "s|http://packages.ros.org/ros2/ubuntu|https://${APT_ROS_MIRROR}|g; s|^Types: deb deb-src$|Types: deb|" /etc/apt/sources.list.d/ros2.sources
 
 # Docker Desktop arm64 emulation makes apt's `_apt` sandbox fail detached
