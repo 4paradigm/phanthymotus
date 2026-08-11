@@ -105,6 +105,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
     split_map:  dict[str, dict] = {}  # split_schema_name → {tool, action}
     tool_groups: dict[str, list] = {} # original_tool_name → [split_schema_names]
     input_schemas: dict[str, dict] = {}  # schema_name → 原始 MCP inputSchema（用于参数校验）
+    tool_definitions: list[dict] = []    # 原始定义（含 x-topic-actions 等扩展）
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
@@ -118,6 +119,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
             # 2. tools/list
             result = await _jrpc(session, url, 'tools/list', {})
             for tool in result.get('tools', []):
+                tool_definitions.append(tool)
                 tool_schemas = _to_openai_schema(mcp_id, tool)
                 tools.append(tool['name'])
 
@@ -171,6 +173,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
         'split_map':     split_map,
         'tool_groups':   tool_groups,
         'input_schemas': input_schemas,
+        'tool_definitions': tool_definitions,
     }
 
     # 3. 后台订阅 SSE 事件流（非阻塞）
@@ -281,6 +284,7 @@ def _register_internal_mcps():
             'input_schemas': input_schemas,
             'tool_groups': {},
             'split_map': {},
+            'tool_definitions': tools,
         }
 
 

@@ -302,10 +302,22 @@ async def _do_start_project():
         await _do_stop_project()
         return False
 
-    # 全部成功 → 标记 running
+    # 全部成功 → 标记 running，再激活 Canvas 连线声明的 topic actions。
     core = config.main.get('core', {})
     core['project_running'] = True
     config.main['core'] = core
+
+    try:
+        from topic_actions import manager as topic_action_mgr
+        await topic_action_mgr.start(layout)
+    except Exception as e:
+        print(f'[start-project] topic-actions failed: {e}')
+        errors.append('topic-actions')
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True, 'errors': errors,
+        }})
+        await _do_stop_project()
+        return False
 
     # 确保 channel adapters 已连接（restart 断开的 adapter）
     from channel.manager import manager as channel_mgr, _get_channel_configs
@@ -333,6 +345,13 @@ async def _do_stop_project():
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
 
+    # 先关运行态和 topic actions，避免停卡过程再接收新动作。
+    core = config.main.get('core', {})
+    core['project_running'] = False
+    config.main['core'] = core
+    from topic_actions import manager as topic_action_mgr
+    await topic_action_mgr.stop()
+
     for card in cards:
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -345,9 +364,6 @@ async def _do_stop_project():
         except Exception:
             pass
 
-    core = config.main.get('core', {})
-    core['project_running'] = False
-    config.main['core'] = core
     await push_event({'type': 'project_state', 'payload': {'running': False}})
     print('[stop-project] done')
 
@@ -957,5 +973,4 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
-
 

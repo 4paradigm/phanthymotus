@@ -233,6 +233,7 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "schema": "phanthy.navigation.goal.v1",
                 "id_field": "goal_id",
                 "allowed_fields": ["x", "y", "yaw", "speed"],
+                "required_fields": ["x", "y", "yaw"],
             }
         ],
         "topic_in": [

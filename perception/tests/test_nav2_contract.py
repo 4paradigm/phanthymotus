@@ -166,6 +166,7 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("mode", action_params["navigate_to_pose"]["params"])
         topic_action = tool["x-topic-actions"][0]
         self.assertNotIn("mode", topic_action["allowed_fields"])
+        self.assertEqual(topic_action["required_fields"], ["x", "y", "yaw"])
 
         config = tool["configSchema"]
         self.assertFalse(config["additionalProperties"])

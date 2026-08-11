@@ -60,6 +60,12 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 }
 ```
 
+Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
+`goal_pose` 端口时激活 `x-topic-actions`。Core 会把通过校验的
+`x/y/yaw/speed` 转为同一张卡片的 `navigate_to_pose` MCP 调用；
+`schema` 不符、缺坐标、夹带未声明字段或重复 `goal_id` 的消息
+都不会被执行。停止 Canvas 项目会先退订该 topic，再停止卡片。
+
 ## 输出合同
 
 | port | topic | type / QoS | 语义 |

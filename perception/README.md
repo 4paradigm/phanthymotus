@@ -134,8 +134,11 @@ SLAM Toolbox、AMCL 或 Map Server。
   `/plan` 叠加到该地图，并提供同一三维点云的 `2D/3D` 视图切换，同时保留
   Nav2 卡片的独立路径数据流；Nav2 默认预览为实时二维
   `/global_costmap/costmap`，同屏叠加规划路径、机器人位姿、终点和膨胀障碍；
-- 当前官方 Agent Core 尚缺 `x-execution-control` / `x-topic-actions` 消费能力，
-  因而 `goal_pose` topic 和 Driver 物理 lease 仍是明确的外部依赖。
+- Agent Core 会在 Canvas 项目启动后消费工具声明的
+  `x-topic-actions`；只有实际连到 `goal_pose` 端口的 JSON topic
+  才能调用 `navigate_to_pose`，并严格校验 schema、字段白名单、
+  必填坐标和唯一 `goal_id`。`x-execution-control` 的 Driver lease
+  编排仍是独立能力，不由 topic action 绕过。
 
 FAST-LIVO2 与 Nav2 都使用独立 ROS 2 companion 镜像，并已作为正式 service
 接入 `perception/deploy/service.yml`。整体执行 `docker compose up -d` 时三者一起
