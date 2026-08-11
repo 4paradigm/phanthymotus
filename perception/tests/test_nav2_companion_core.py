@@ -48,6 +48,16 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         parsed = VelocityProposal.from_payload(payload)
         self.assertEqual(parsed.nav_id, "nav-001")
 
+        with self.assertRaises(ProtocolError):
+            build_velocity_proposal(
+                nav_id="nav-001",
+                sequence=2,
+                ttl_ms=250,
+                navigation_status="navigating",
+                velocity=Velocity(x=0.10, y=0.01, yaw=0.0),
+                issued_at_unix_ms=2,
+            )
+
         payload["nav_status"] = "arrived"
         with self.assertRaises(ProtocolError):
             VelocityProposal.from_payload(payload)
@@ -60,6 +70,27 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 velocity=Velocity.zero(),
                 issued_at_unix_ms=2,
             )
+
+    def test_controller_faces_path_and_disables_lateral_motion(self) -> None:
+        params_path = PACKAGE_ROOT / "config" / "nav2_params.yaml"
+        params = params_path.read_text(encoding="utf-8")
+        follow_path = params.split("    FollowPath:\n", 1)[1].split(
+            "\n\nlocal_costmap:", 1
+        )[0]
+        smoother = params.split("velocity_smoother:\n", 1)[1]
+
+        expected_follow_path = (
+            "plugin: nav2_rotation_shim_controller::RotationShimController",
+            "primary_controller: dwb_core::DWBLocalPlanner",
+            "min_vel_y: 0.0",
+            "max_vel_y: 0.0",
+            "vy_samples: 1",
+            "rotate_to_goal_heading: false",
+        )
+        for expected in expected_follow_path:
+            self.assertIn(expected, follow_path)
+        self.assertIn("max_velocity: [0.15, 0.0, 0.25]", smoother)
+        self.assertIn("min_velocity: [-0.05, 0.0, -0.25]", smoother)
 
     def test_legacy_sensor_adapters_label_receive_time(self) -> None:
         point_step = 12

@@ -35,7 +35,7 @@ NAV2_CONFIG_DEFAULTS = {
     "input_max_age_ms": 500,
     "max_forward_mps": 0.15,
     "max_reverse_mps": 0.05,
-    "max_lateral_mps": 0.12,
+    "max_lateral_mps": 0.0,
     "max_yaw_rps": 0.35,
     "max_planar_mps": 0.18,
     "proposal_ttl_ms": 250,
@@ -103,10 +103,10 @@ NAV2_FULL_CONFIG_SCHEMA = {
         },
         "max_lateral_mps": {
             "type": "number",
-            "const": 0.12,
+            "const": 0.0,
             "minimum": 0.0,
             "maximum": 0.12,
-            "default": 0.12,
+            "default": 0.0,
         },
         "max_yaw_rps": {
             "type": "number",

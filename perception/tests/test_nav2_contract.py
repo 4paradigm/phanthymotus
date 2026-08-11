@@ -10,6 +10,7 @@ sys.path.insert(0, str(PERCEPTION_ROOT))
 
 from plugins.nav2.contract import (  # noqa: E402
     NAV2_ACTIONS,
+    NAV2_FULL_CONFIG_SCHEMA,
     NAV2_LIFECYCLE_ACTIONS,
     nav2_tool_definition,
 )
@@ -48,6 +49,10 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(speed["maximum"], 0.15)
         self.assertEqual(speed["default"], 0.15)
         self.assertNotIn("mode", properties)
+
+        full_config = NAV2_FULL_CONFIG_SCHEMA["properties"]
+        self.assertEqual(full_config["max_lateral_mps"]["const"], 0.0)
+        self.assertEqual(full_config["max_lateral_mps"]["default"], 0.0)
 
         action_params = tool["inputSchema"]["x-action-params"]
         self.assertNotIn("mode", action_params["navigate_to_tag"]["params"])

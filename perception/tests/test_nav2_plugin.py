@@ -168,6 +168,10 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         plugin = Nav2Plugin({}, None, backend=backend)
         bad = plugin.dispatch("nav2", {"action": "config", "proposal_ttl_ms": 100})
         self.assertEqual(bad["error_code"], "invalid_config")
+        lateral = plugin.dispatch(
+            "nav2", {"action": "config", "max_lateral_mps": 0.01}
+        )
+        self.assertEqual(lateral["error_code"], "invalid_config")
         configured = plugin.dispatch(
             "nav2", {"action": "config", "request_timeout_sec": 20}
         )

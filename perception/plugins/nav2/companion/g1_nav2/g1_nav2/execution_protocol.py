@@ -63,7 +63,7 @@ class Velocity:
 class VelocityLimits:
     min_x: float = -0.05
     max_x: float = 0.15
-    max_abs_y: float = 0.12
+    max_abs_y: float = 0.0
     max_abs_yaw: float = 0.35
     max_planar_speed: float = 0.18
 

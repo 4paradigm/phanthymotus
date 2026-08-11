@@ -85,8 +85,8 @@ BEST_EFFORT 发布端。
 提案本身不携带执行权限，`shadow_only=true`、`physical_execution=false` 表示
 卡片没有直接执行机器人动作；下游 Driver 是否执行由独立授权决定。
 
-首版提案边界：前进不超过 `0.15 m/s`，后退不超过 `0.05 m/s`，横移绝对值不超过
-`0.12 m/s`，偏航角速度绝对值不超过 `0.35 rad/s`，平面合速度不超过
+首版提案边界：前进不超过 `0.15 m/s`，后退不超过 `0.05 m/s`，禁止横移
+（`y=0`），偏航角速度绝对值不超过 `0.35 rad/s`，平面合速度不超过
 `0.18 m/s`。Driver 必须再次独立限幅。
 
 ## Actions
@@ -136,7 +136,7 @@ BEST_EFFORT 发布端。
 | `input_max_age_ms` | `500` | 首版固定，超过后导航 fail closed |
 | `max_forward_mps` | `0.15` | 首版固定安全上限 |
 | `max_reverse_mps` | `0.05` | 首版固定安全上限 |
-| `max_lateral_mps` | `0.12` | 首版固定安全上限 |
+| `max_lateral_mps` | `0.0` | 首版禁止横移，非零提案 fail closed |
 | `max_yaw_rps` | `0.35` | 首版固定安全上限 |
 | `max_planar_mps` | `0.18` | 首版固定安全上限 |
 | `proposal_ttl_ms` | `250` | 首版固定；Driver 仍独立校验 |
@@ -155,7 +155,12 @@ Canvas 配置与 companion 实际运行参数出现 silent drift。
 - SLAM Toolbox：建图和 pose graph 持久化；
 - Map Server + AMCL：已保存地图定位；
 - NavFn：全局路径；
-- DWB + velocity smoother：局部避障和速度平滑。
+- Rotation Shim + DWB + velocity smoother：航向偏差较大时先原地转向，
+  再以零横移的前向轨迹跟随路径并平滑限速。
+
+导航默认不使用 G1 的横移能力：DWB 只采样 `x/yaw`，velocity
+smoother 的 y 速度和加速度均为 0，提案协议也拒绝非零 y。这只约束
+Nav2 速度方向；步态、躯干和手臂姿态仍由 Driver/Loco 主运控负责。
 
 TF 链固定为：
 

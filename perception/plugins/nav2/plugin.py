@@ -86,7 +86,7 @@ def _validated_config(base: dict, updates: dict) -> dict:
         "input_max_age_ms": 500,
         "max_forward_mps": 0.15,
         "max_reverse_mps": 0.05,
-        "max_lateral_mps": 0.12,
+        "max_lateral_mps": 0.0,
         "max_yaw_rps": 0.35,
         "max_planar_mps": 0.18,
         "proposal_ttl_ms": 250,
