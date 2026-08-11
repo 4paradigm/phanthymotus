@@ -57,6 +57,7 @@ class G1LocoOdomBridge(Node):
 
         self._odom_frame = str(self.get_parameter("odom_frame").value)
         self._base_frame = str(self.get_parameter("base_frame").value)
+        self._input_topic = str(self.get_parameter("input_topic").value)
         self._publish_tf = bool(self.get_parameter("publish_tf").value)
         self._source_timeout = float(self.get_parameter("source_timeout").value)
         self._source_future_tolerance = float(
@@ -82,6 +83,7 @@ class G1LocoOdomBridge(Node):
         self._last_timestamp_source: str | None = None
         self._last_frame_source: str | None = None
         self._last_source_schema: str | None = None
+        self._source_topology_error: str | None = None
 
         self._odom_publisher = self.create_publisher(
             Odometry, str(self.get_parameter("odom_topic").value), 20
@@ -92,7 +94,7 @@ class G1LocoOdomBridge(Node):
         self._tf_broadcaster = TransformBroadcaster(self)
         self.create_subscription(
             String,
-            str(self.get_parameter("input_topic").value),
+            self._input_topic,
             self._on_state,
             qos_profile_sensor_data,
         )
@@ -101,6 +103,23 @@ class G1LocoOdomBridge(Node):
         self.create_timer(0.1, self._publish_status)
 
     def _on_state(self, message: String) -> None:
+        input_publishers = self.count_publishers(self._input_topic)
+        if input_publishers != 1:
+            self._invalid += 1
+            self._source_topology_error = (
+                f"expected exactly one publisher on {self._input_topic}; "
+                f"found {input_publishers}"
+            )
+            self._normalizer.reset()
+            self._last_receive_monotonic = None
+            self._last_source_stamp_ns = None
+            self._last_timestamp_source = None
+            self._last_frame_source = None
+            self._last_source_schema = None
+            if self._invalid <= 3 or self._invalid % 100 == 0:
+                self.get_logger().warning(self._source_topology_error)
+            return
+
         try:
             odom = self._normalizer.convert(
                 message.data,
@@ -112,6 +131,7 @@ class G1LocoOdomBridge(Node):
                 self.get_logger().warning(f"invalid loco state: {exc}")
             return
 
+        self._source_topology_error = None
         self._received += 1
         self._last_receive_monotonic = time.monotonic()
         self._last_source_stamp_ns = odom.source_stamp_ns
@@ -163,11 +183,10 @@ class G1LocoOdomBridge(Node):
             max_age_sec=self._source_timeout,
             max_future_skew_sec=self._source_future_tolerance,
         )
-        state = (
-            "ready"
-            if timestamp_fresh
-            else "waiting_for_native_odom"
-        )
+        if self._source_topology_error is not None:
+            state = "invalid_source_topology"
+        else:
+            state = "ready" if timestamp_fresh else "waiting_for_native_odom"
         message = String()
         message.data = json.dumps(
             {
@@ -184,6 +203,9 @@ class G1LocoOdomBridge(Node):
                 "timestamp_source": self._last_timestamp_source,
                 "frame_source": self._last_frame_source,
                 "source_schema": self._last_source_schema,
+                "input_topic": self._input_topic,
+                "input_publishers": self.count_publishers(self._input_topic),
+                "error": self._source_topology_error,
                 "odom_frame": self._odom_frame,
                 "base_frame": self._base_frame,
             }

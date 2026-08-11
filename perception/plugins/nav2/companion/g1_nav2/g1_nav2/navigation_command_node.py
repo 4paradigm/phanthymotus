@@ -37,6 +37,7 @@ from .execution_protocol import (
     ProtocolError,
     Velocity,
     build_velocity_proposal,
+    limit_forward_velocity,
 )
 from .map_store import MapStore, MapStoreError, MappingSession
 from .readiness import evaluate_readiness, navigation_motion_blocker
@@ -455,6 +456,7 @@ class NavigationCommandNode(Node):
                 return
             nav_id = self._active.get("nav_id")
             status = self._active.get("status", "error")
+            forward_speed_limit = self._active.get("effective_speed_limit")
         if not isinstance(nav_id, str) or not nav_id:
             return
 
@@ -472,6 +474,11 @@ class NavigationCommandNode(Node):
             if reason is not None:
                 velocity = Velocity.zero()
         try:
+            if reason is None:
+                velocity = limit_forward_velocity(
+                    velocity,
+                    max_forward_mps=forward_speed_limit,
+                )
             self._publish_velocity_proposal(
                 nav_id=nav_id,
                 navigation_status=status,
@@ -1073,7 +1080,7 @@ class NavigationCommandNode(Node):
                 "target_pose": dict(active["target_pose"]),
                 "requested_speed": active["requested_speed"],
                 "effective_speed_limit": active["effective_speed_limit"],
-                "speed_policy": "nav2_absolute_controller_limit",
+                "speed_policy": "proposal_enforced_with_controller_advisory",
                 "speed_limit_topic": self._controller_speed_limit_topic,
                 "mode": active["mode"],
                 "shadow_only": True,
@@ -1097,7 +1104,7 @@ class NavigationCommandNode(Node):
             self._active["cancel_intent"] = None
             self._active["goal_handle"] = None
 
-        self._apply_controller_speed_limit(speed_limit)
+        self._publish_controller_speed_limit(speed_limit)
 
         goal = NavigateToPose.Goal()
         goal.behavior_tree = self._behavior_tree_path
@@ -1139,7 +1146,7 @@ class NavigationCommandNode(Node):
                 str(outcome.get("error", "Nav2 rejected the goal")),
             )
 
-    def _apply_controller_speed_limit(self, speed_limit: float) -> None:
+    def _publish_controller_speed_limit(self, speed_limit: float) -> None:
         deadline = time.monotonic() + self._speed_limit_timeout
         while self._speed_limit_pub.get_subscription_count() == 0:
             remaining = deadline - time.monotonic()
@@ -1157,15 +1164,6 @@ class NavigationCommandNode(Node):
         message.percentage = False
         message.speed_limit = speed_limit
         self._speed_limit_pub.publish(message)
-        remaining = max(0.0, deadline - time.monotonic())
-        if not self._speed_limit_pub.wait_for_all_acked(
-            Duration(seconds=remaining)
-        ):
-            raise CommandError(
-                "speed_limit_unconfirmed",
-                "Nav2 controller did not acknowledge speed limit "
-                f"{speed_limit:.3f} m/s",
-            )
 
     def _on_goal_response(
         self,

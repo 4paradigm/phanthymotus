@@ -59,6 +59,35 @@ class Velocity:
         return {"x": self.x, "y": self.y, "yaw": self.yaw}
 
 
+def limit_forward_velocity(
+    velocity: Velocity, *, max_forward_mps: float
+) -> Velocity:
+    """Apply the per-navigation forward cap before a proposal is published.
+
+    Reverse recovery remains governed by the separate global reverse limit;
+    lateral and yaw components are preserved so the normal proposal validator
+    can reject any unsafe Nav2 output instead of silently hiding it.
+    """
+
+    if isinstance(max_forward_mps, bool):
+        raise ProtocolError(
+            "invalid_speed_limit", "max_forward_mps must be positive and finite"
+        )
+    try:
+        limit = float(max_forward_mps)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(
+            "invalid_speed_limit", "max_forward_mps must be positive and finite"
+        ) from exc
+    if not math.isfinite(limit) or limit <= 0.0:
+        raise ProtocolError(
+            "invalid_speed_limit", "max_forward_mps must be positive and finite"
+        )
+    if velocity.x <= limit:
+        return velocity
+    return Velocity(x=limit, y=velocity.y, yaw=velocity.yaw)
+
+
 @dataclass(frozen=True)
 class VelocityLimits:
     min_x: float = -0.15
@@ -264,4 +293,5 @@ __all__ = [
     "VelocityLimits",
     "VelocityProposal",
     "build_velocity_proposal",
+    "limit_forward_velocity",
 ]

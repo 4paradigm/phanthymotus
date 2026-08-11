@@ -45,8 +45,8 @@ topic 名以 Canvas 的端口绑定为准。首版 companion 冻结 G1 的
 
 | port | 当前 G1 示例 | ROS 2 type / format | QoS | 数据合同 |
 | --- | --- | --- | --- | --- |
-| `loco_state` | `/ubuntu/loco/state` | `std_msgs/msg/String` / `data/json` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 `unitree.g1.loco_state.legacy` 和带源时间戳/frame 的 `phanthy.g1.loco_state.v2`；期望 10 Hz，最大 age 500 ms |
-| `lidar_cloud` | `/ubuntu/lidar/cloud` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE` | legacy 点数据前缀 + 必需 `PCLMETA2` footer；Driver 接收时间与 `loco_state.v2` 同钟域，原始 LiDAR header 和 XYZIRT fields 保留作诊断 |
+| `loco_state` | `/ubuntu/loco/state` | `std_msgs/msg/String` / `data/json` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 `unitree.g1.loco_state.legacy` 和带源时间戳/frame 的 `phanthy.g1.loco_state.v2`；期望 10 Hz，最大 age 500 ms；必须恰好一个 publisher |
+| `lidar_cloud` | `/ubuntu/lidar/cloud` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE` | legacy 点数据前缀 + 必需 `PCLMETA2` footer；Driver 接收时间与 `loco_state.v2` 同钟域，原始 LiDAR header 和 XYZIRT fields 用于整帧时间归一化；必须恰好一个 publisher |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String` / `data/json` | `RELIABLE + KEEP_LAST(depth=10) + VOLATILE` | `phanthy.navigation.goal.v1`；`map` frame；每条消息必须有唯一 `goal_id` |
 
 legacy `loco_state` 没有源时间戳或 frame 时，adapter 必须明确标记接收时间和
@@ -54,6 +54,8 @@ legacy `loco_state` 没有源时间戳或 frame 时，adapter 必须明确标记
 `/ubuntu/lidar/cloud`，但 Nav2 只接受带合法 `PCLMETA2` 的 v2 帧，并使用
 `BEST_EFFORT + KEEP_LAST(1)` 避免历史帧排队。无 footer、footer 损坏或时间过期时
 不发布 Nav2 PointCloud2，也不用 companion 到达时间补造时间戳。
+任一路输入存在零个或多个 publisher 时同样停止对应 Nav2 输出；这会阻止旧测试
+Driver 与当前 Driver 同时运行时把两套 state/cloud 静默混进同一张地图。
 
 ### Loco v2 与 PCLMETA2 时间合同
 
@@ -99,12 +101,17 @@ char   magic[8] = "PCLMETA2"
 | `ring` | 16 | `UINT16` | 通道号 |
 | `time` | 18 | `FLOAT32` | 相对原始 LiDAR header stamp 的 ns |
 
-Nav2 的 PointCloud2 header 只使用 `source_stamp_ns`，与 `loco_state.v2`
-使用的 Driver callback receive 时间同钟域；不再在 companion 中估计原始
-LiDAR clock offset。`lidar_header.stamp/frame_id` 和逐点 `time` 只作诊断与后续
-deskew 依据，当前不声明 Driver callback receive 时间等于真实激光采样时间。
-`/ubuntu/navigation/nav2/lidar_status` 记录 Driver/bridge receive stamp、source age、
-原始 LiDAR header、输出 frame、点数和拒绝原因。断流、过期/超前或时间倒退仍 fail closed。
+Nav2 不把 Driver callback receive 时间直接当作激光采样时间。companion 使用
+`lidar_header.stamp` 作为扫描起点、逐点 `time` 最大值作为扫描跨度，并以
+`driver_receive_unix_ns` 为 system-time 锚点；滚动窗口取
+`driver_receive - raw_scan_start - scan_span` 的最小值，过滤 callback 调度抖动后，
+把归一化的扫描起点写入 PointCloud2 header。估计器启动需 8 帧预热；原始时间倒退
+会清空估计器并重新预热，期间不向 Nav2 发布点云。
+
+`/ubuntu/navigation/nav2/lidar_status` 记录 Driver/bridge receive stamp、归一化
+source age、原始 LiDAR header、扫描跨度、clock offset/residual/reset、publisher
+数量、输出 frame、点数和拒绝原因。断流、重复 publisher、过期/超前或时间倒退
+仍 fail closed。
 
 Driver 发布前已对 xyz 执行 `gravity_aligned_roll_pitch`，因此 PCLMETA2 中的
 原始 `utlidar_lidar` frame 不能直接标在变换后的点字节上。companion 保留已验收
@@ -115,10 +122,9 @@ Driver 发布前已对 xyz 执行 `gravity_aligned_roll_pitch`，因此 PCLMETA2
 已有节点发布同一 TF，必须设置 `NAV2_PUBLISH_LIDAR_STATIC_TF=false`
 避免重复 authority。
 
-这个合同会保留 MID360 逐点 `time` metadata，但现有
-`pointcloud_to_laserscan -> SLAM Toolbox` 不会自动消费它做逐点
-deskew。本轮只修正整帧时间、TF 对齐和字段传递，不把地图去畸变
-宣称为已完成。
+这个合同使用 MID360 逐点 `time` 的最大值确定整帧跨度，但现有
+`pointcloud_to_laserscan -> SLAM Toolbox` 仍不会逐点变换做 deskew。本轮修正
+整帧扫描起点、TF 对齐和重复源污染，不把逐点运动去畸变宣称为已完成。
 
 `goal_pose` JSON 最小结构：
 
@@ -188,10 +194,12 @@ deskew。本轮只修正整帧时间、TF 对齐和字段传递，不把地图�
 | `resume_nav` | 无 | 恢复已暂停任务；状态不允许时明确拒绝 |
 | `stop_nav` | 无 | 取消当前任务，发布终态零速并等待 Nav2 terminal；物理停车确认由 Driver 完成 |
 
-`speed` 默认 `0.15 m/s`，范围 `0.05–0.15 m/s`；该值会在每次发送 Nav2 goal
-前发布为 controller server 的绝对线速度上限，限速 topic 无订阅或未确认时
-请求 fail closed。恢复行为的固定后退速度为 `0.15 m/s`，不受该前向限速参数影响；
-首版导航固定允许绕障。
+`speed` 默认 `0.15 m/s`，范围 `0.05–0.15 m/s`。每次发送 Nav2 goal 前会把该值
+发布为 controller server 的绝对线速度上限；限速 topic 无订阅时请求 fail closed。
+DDS transport acknowledgement 不能证明 controller 已应用限速，因此不再把
+`wait_for_all_acked` 当成应用层确认；真正的安全边界是在每条
+`velocity_proposal` 发布前再次把正向 `x` 强制截断到本任务的 `speed`。恢复行为的
+固定后退速度为 `0.15 m/s`，不受该前向限速参数影响；首版导航固定允许绕障。
 参数错误、not-ready、timeout、cancelled 和内部错误必须具有不同的结构化
 `error_code`，不能只返回 HTTP 200 或日志文本。
 
@@ -419,8 +427,9 @@ STAGE=stop \
 `input_topics` 连线、建图/停图/原子存图、结构化 proposal、传感器断流
 零速保护与恢复、10 轮 start/stop、非法输入隔离和 Perception 重启验证。
 
-当前仍是 Draft，不能宣称完整可用：本轮已有 PCLMETA2 确定性 fixture，
-但没有在真机上验收新 Driver footer 的实际 freshness 和连续性，合成点云也不能证明非空房间
-路径规划。此外，官方 Core 尚未消费 `x-execution-control` / `x-topic-actions`，
+当前仍是 Draft，不能宣称完整可用：本轮已有 PCLMETA2、整帧时钟归一化、重复
+publisher 拒绝和提案侧速度截断的确定性测试，但尚未用去重后的单 Driver 现场重建
+一张地图；合成点云也不能证明非空房间路径规划。此外，官方 Core 尚未消费
+`x-execution-control` / `x-topic-actions`，
 所以 Driver lease 和 `goal_pose` 执行闭环仍是外部 blocker。ARM64 生产镜像、真实
 录包、Dashboard 人工界面确认以及 G1 真机执行属于后续验收。

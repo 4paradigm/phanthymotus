@@ -106,10 +106,14 @@ ASR result JSON:
 
 - `speed` 范围 `0.05–0.15 m/s`，首版导航固定允许绕障，不显示无可选值的 `mode`；
 - 输入超过 `500 ms`、TF/地图/Nav2 lifecycle 不 ready 时 fail closed；
-- `loco_state.v2` 与 `lidar_cloud.v2` 都使用 Driver callback 的 ROS
-  system/Unix 时间；LiDAR companion 从 `PCLMETA2` 还原 fields/XYZIRT 点数据，
-  保留原始 LiDAR header 作诊断，无合法 footer 时不会补造时间戳；
-- `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；
+- `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud` 都必须只有一个发布者；重复
+  Driver 数据源会被 fail closed，避免不同时间合同的帧交替污染 odom、scan 和地图；
+- `loco_state.v2` 使用 Driver callback 的 ROS system/Unix 时间；LiDAR companion
+  从 `PCLMETA2` 还原 fields/XYZIRT、原始扫描起始时间和逐点 `time`，再以 Driver
+  接收时间为锚进行时钟归一化。归一化 warmup 或缺失合法 footer 时不会发布伪造点云；
+- `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；请求速度
+  在每条 `velocity_proposal` 上强制限制正向速度，Nav2 `SpeedLimit` 只作为控制器
+  advisory，不再把 DDS transport ack 误判为控制器已应用速度；
 - 地图宿主机目录为 `/opt/phanthy-motus/data/nav2/maps`，companion 容器内为 `/maps`；
 - `start_mapping` 自动切换 mapping，`stop_mapping` 原子保存后自动切回 localization；
 - Canvas 「查看数据流」默认打开 `map_view`，以 1 Hz 显示占用栅格和机器人位姿，

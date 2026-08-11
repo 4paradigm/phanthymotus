@@ -18,7 +18,12 @@ from std_msgs.msg import String, UInt8MultiArray
 from .canvas_pointcloud_core import (
     CanvasPointCloud,
     InvalidCanvasPointCloud,
+    LidarClockNormalizer,
     decode_canvas_pointcloud,
+)
+from .timestamp_contract import (
+    InvalidSourceTimestamp,
+    validate_source_timestamp_ns,
 )
 
 
@@ -41,6 +46,10 @@ class CanvasPointCloudBridge(Node):
             "status_topic", "/ubuntu/navigation/nav2/lidar_status"
         )
         self.declare_parameter("output_frame_id", "livox_frame")
+        self.declare_parameter("timestamp_mode", "auto")
+        self.declare_parameter("clock_warmup_samples", 8)
+        self.declare_parameter("clock_window_samples", 200)
+        self.declare_parameter("already_aligned_tolerance", 2.0)
         self.declare_parameter("max_source_age", 0.5)
         self.declare_parameter("source_future_tolerance", 0.1)
         max_source_age = float(self.get_parameter("max_source_age").value)
@@ -55,9 +64,26 @@ class CanvasPointCloudBridge(Node):
         self._output_frame_id = str(
             self.get_parameter("output_frame_id").value
         )
+        self._input_topic = str(self.get_parameter("input_topic").value)
         self._max_source_age_ns = int(max_source_age * 1_000_000_000)
         self._max_future_skew_ns = int(future_tolerance * 1_000_000_000)
+        self._clock = LidarClockNormalizer(
+            mode=str(self.get_parameter("timestamp_mode").value),
+            warmup_samples=int(
+                self.get_parameter("clock_warmup_samples").value
+            ),
+            window_samples=int(
+                self.get_parameter("clock_window_samples").value
+            ),
+            aligned_tolerance_ns=int(
+                float(
+                    self.get_parameter("already_aligned_tolerance").value
+                )
+                * 1_000_000_000
+            ),
+        )
         self._last_source_stamp_ns: int | None = None
+        self._source_topology_error: str | None = None
         self._invalid = 0
         self._received = 0
         self._published = 0
@@ -73,7 +99,7 @@ class CanvasPointCloudBridge(Node):
         )
         self.create_subscription(
             UInt8MultiArray,
-            str(self.get_parameter("input_topic").value),
+            self._input_topic,
             self._on_cloud,
             _SENSOR_QOS,
         )
@@ -82,7 +108,20 @@ class CanvasPointCloudBridge(Node):
         self._received += 1
         receive_stamp_ns = self.get_clock().now().nanoseconds
         cloud: CanvasPointCloud | None = None
+        normalized_stamp_ns: int | None = None
         try:
+            input_publishers = self.count_publishers(self._input_topic)
+            if input_publishers != 1:
+                topology_error = (
+                    f"expected exactly one publisher on {self._input_topic}; "
+                    f"found {input_publishers}"
+                )
+                if self._source_topology_error is None:
+                    self._clock.reset()
+                    self._last_source_stamp_ns = None
+                self._source_topology_error = topology_error
+                raise InvalidCanvasPointCloud(topology_error)
+            self._source_topology_error = None
             cloud = decode_canvas_pointcloud(
                 message.data,
                 receive_stamp_ns=receive_stamp_ns,
@@ -90,28 +129,58 @@ class CanvasPointCloudBridge(Node):
                 max_source_age_ns=self._max_source_age_ns,
                 max_future_skew_ns=self._max_future_skew_ns,
             )
+            if not cloud.raw_lidar_stamp_valid or cloud.raw_lidar_stamp_ns is None:
+                raise InvalidCanvasPointCloud(
+                    "raw LiDAR header timestamp is required for Nav2"
+                )
+            normalized_stamp_ns = self._clock.normalize(
+                raw_stamp_ns=cloud.raw_lidar_stamp_ns,
+                driver_receive_stamp_ns=cloud.source_stamp_ns,
+                scan_end_offset_ns=cloud.scan_end_offset_ns,
+            )
+            if normalized_stamp_ns is None:
+                self._publish_status(
+                    state="warming_up",
+                    receive_stamp_ns=receive_stamp_ns,
+                    normalized_stamp_ns=None,
+                    cloud=cloud,
+                )
+                return
+            validate_source_timestamp_ns(
+                normalized_stamp_ns,
+                receive_stamp_ns,
+                max_source_age_ns=self._max_source_age_ns,
+                max_future_skew_ns=self._max_future_skew_ns,
+            )
             if (
                 self._last_source_stamp_ns is not None
-                and cloud.source_stamp_ns <= self._last_source_stamp_ns
+                and normalized_stamp_ns <= self._last_source_stamp_ns
             ):
                 raise InvalidCanvasPointCloud(
-                    "Driver receive timestamp did not advance"
+                    "normalized LiDAR scan-start timestamp did not advance"
                 )
-        except (InvalidCanvasPointCloud, TypeError, ValueError) as exc:
+        except (
+            InvalidCanvasPointCloud,
+            InvalidSourceTimestamp,
+            TypeError,
+            ValueError,
+        ) as exc:
             self._invalid += 1
             if self._invalid <= 3 or self._invalid % 100 == 0:
                 self.get_logger().warning(f"invalid canvas point cloud: {exc}")
             self._publish_status(
                 state="invalid",
                 receive_stamp_ns=receive_stamp_ns,
+                normalized_stamp_ns=normalized_stamp_ns,
                 cloud=cloud,
                 error=str(exc),
             )
             return
 
+        assert cloud is not None and normalized_stamp_ns is not None
         output = PointCloud2()
         output.header.stamp.sec, output.header.stamp.nanosec = divmod(
-            cloud.source_stamp_ns, 1_000_000_000
+            normalized_stamp_ns, 1_000_000_000
         )
         output.header.frame_id = cloud.frame_id
         output.height = cloud.height
@@ -131,11 +200,12 @@ class CanvasPointCloudBridge(Node):
         output.data = cloud.data
         output.is_dense = cloud.is_dense
         self._publisher.publish(output)
-        self._last_source_stamp_ns = cloud.source_stamp_ns
+        self._last_source_stamp_ns = normalized_stamp_ns
         self._published += 1
         self._publish_status(
             state="ready",
             receive_stamp_ns=receive_stamp_ns,
+            normalized_stamp_ns=normalized_stamp_ns,
             cloud=cloud,
         )
 
@@ -144,23 +214,44 @@ class CanvasPointCloudBridge(Node):
         *,
         state: str,
         receive_stamp_ns: int,
+        normalized_stamp_ns: int | None,
         cloud: CanvasPointCloud | None,
         error: str | None = None,
     ) -> None:
-        source_stamp_ns = cloud.source_stamp_ns if cloud is not None else None
+        clock = self._clock.snapshot()
+        driver_receive_stamp_ns = (
+            cloud.source_stamp_ns if cloud is not None else None
+        )
         payload = {
             "schema": "phanthy.navigation.lidar_adapter.v2",
             "state": state,
             "source_schema": cloud.source_schema if cloud is not None else None,
             "timestamp_source": (
+                "raw_lidar_header_normalized_to_driver_receive"
+                if cloud is not None
+                else None
+            ),
+            "metadata_timestamp_source": (
                 cloud.timestamp_source if cloud is not None else None
             ),
             "frame_source": cloud.frame_source if cloud is not None else None,
             "bridge_receive_stamp_ns": receive_stamp_ns,
-            "source_stamp_ns": source_stamp_ns,
+            "source_stamp_ns": normalized_stamp_ns,
             "source_age_ms": (
-                round((receive_stamp_ns - source_stamp_ns) / 1_000_000, 3)
-                if source_stamp_ns is not None
+                round(
+                    (receive_stamp_ns - normalized_stamp_ns) / 1_000_000,
+                    3,
+                )
+                if normalized_stamp_ns is not None
+                else None
+            ),
+            "driver_receive_stamp_ns": driver_receive_stamp_ns,
+            "driver_receive_age_ms": (
+                round(
+                    (receive_stamp_ns - driver_receive_stamp_ns) / 1_000_000,
+                    3,
+                )
+                if driver_receive_stamp_ns is not None
                 else None
             ),
             "driver_receive_monotonic_ns": (
@@ -179,8 +270,27 @@ class CanvasPointCloudBridge(Node):
             "point_data_transform": (
                 cloud.point_data_transform if cloud is not None else None
             ),
+            "scan_end_offset_ms": (
+                round(cloud.scan_end_offset_ns / 1_000_000, 3)
+                if cloud is not None
+                else None
+            ),
+            "clock": {
+                "ready": clock.ready,
+                "mode": clock.mode,
+                "samples": clock.samples,
+                "offset_ns": clock.offset_ns,
+                "residual_ms": (
+                    round(clock.residual_ns / 1_000_000, 3)
+                    if clock.residual_ns is not None
+                    else None
+                ),
+                "resets": clock.resets,
+            },
             "point_count": cloud.point_count if cloud is not None else None,
             "metadata_footer": "PCLMETA2",
+            "input_topic": self._input_topic,
+            "input_publishers": self.count_publishers(self._input_topic),
             "received": self._received,
             "published": self._published,
             "invalid": self._invalid,

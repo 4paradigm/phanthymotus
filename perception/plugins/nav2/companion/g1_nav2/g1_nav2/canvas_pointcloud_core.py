@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import json
+import math
 import struct
 from typing import Any, Iterable
 
@@ -19,6 +21,7 @@ LIDAR_CLOUD_SCHEMA = "phanthy.g1.lidar_cloud.v2"
 LIDAR_CLOUD_TRAILER_MAGIC = b"PCLMETA2"
 POINT_DATA_TRANSFORM = "gravity_aligned_roll_pitch"
 POINT_FIELD_FLOAT32 = 7
+NSEC_PER_SEC = 1_000_000_000
 _LEGACY_HEADER = struct.Struct("<II")
 _TRAILER = struct.Struct("<I8s")
 _MIN_POINT_STEP = 12
@@ -69,7 +72,138 @@ class CanvasPointCloud:
     row_step: int
     is_dense: bool
     point_count: int
+    scan_end_offset_ns: int
     data: bytes
+
+
+@dataclass(frozen=True)
+class LidarClockSnapshot:
+    ready: bool
+    mode: str
+    samples: int
+    offset_ns: int | None
+    residual_ns: int | None
+    resets: int
+
+
+class LidarClockNormalizer:
+    """Map the native LiDAR scan clock into Driver system time.
+
+    ``PCLMETA2`` gives both the native scan-start stamp and the Driver callback
+    receive time.  The minimum observed ``receive - scan_end`` offset rejects
+    callback scheduling jitter while retaining the physical scan-start time.
+    A native timestamp regression resets the estimator and requires a fresh
+    warm-up before another cloud can reach Nav2.
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: str = "auto",
+        warmup_samples: int = 8,
+        window_samples: int = 200,
+        aligned_tolerance_ns: int = 2 * NSEC_PER_SEC,
+    ) -> None:
+        if mode not in {"auto", "normalize", "passthrough"}:
+            raise ValueError("mode must be auto, normalize, or passthrough")
+        if warmup_samples < 1:
+            raise ValueError("warmup_samples must be positive")
+        if window_samples < warmup_samples:
+            raise ValueError("window_samples must be >= warmup_samples")
+        if aligned_tolerance_ns < 1:
+            raise ValueError("aligned_tolerance_ns must be positive")
+        self._configured_mode = mode
+        self._active_mode: str | None = None
+        self._warmup_samples = int(warmup_samples)
+        self._aligned_tolerance_ns = int(aligned_tolerance_ns)
+        self._candidates: deque[int] = deque(maxlen=int(window_samples))
+        self._last_raw_stamp_ns: int | None = None
+        self._offset_ns: int | None = None
+        self._residual_ns: int | None = None
+        self._resets = 0
+
+    def normalize(
+        self,
+        *,
+        raw_stamp_ns: int,
+        driver_receive_stamp_ns: int,
+        scan_end_offset_ns: int,
+    ) -> int | None:
+        raw_stamp_ns = int(raw_stamp_ns)
+        driver_receive_stamp_ns = int(driver_receive_stamp_ns)
+        scan_end_offset_ns = int(scan_end_offset_ns)
+        if raw_stamp_ns <= 0 or driver_receive_stamp_ns <= 0:
+            raise ValueError("raw and Driver receive timestamps must be positive")
+        if not 0 <= scan_end_offset_ns <= NSEC_PER_SEC:
+            raise ValueError("scan_end_offset_ns must be within one second")
+
+        if (
+            self._last_raw_stamp_ns is not None
+            and raw_stamp_ns <= self._last_raw_stamp_ns
+        ):
+            self.reset()
+        self._last_raw_stamp_ns = raw_stamp_ns
+
+        if self._active_mode is None:
+            self._active_mode = self._resolve_mode(
+                raw_stamp_ns=raw_stamp_ns,
+                driver_receive_stamp_ns=driver_receive_stamp_ns,
+            )
+
+        if self._active_mode == "passthrough":
+            raw_age_ns = driver_receive_stamp_ns - raw_stamp_ns
+            if not (
+                -self._aligned_tolerance_ns
+                <= raw_age_ns
+                <= self._aligned_tolerance_ns
+            ):
+                raise ValueError("passthrough LiDAR clock left system-time domain")
+            self._offset_ns = 0
+            self._residual_ns = raw_age_ns - scan_end_offset_ns
+            return raw_stamp_ns
+
+        candidate = (
+            driver_receive_stamp_ns - raw_stamp_ns - scan_end_offset_ns
+        )
+        self._candidates.append(candidate)
+        self._offset_ns = min(self._candidates)
+        self._residual_ns = candidate - self._offset_ns
+        if len(self._candidates) < self._warmup_samples:
+            return None
+        return raw_stamp_ns + self._offset_ns
+
+    def snapshot(self) -> LidarClockSnapshot:
+        return LidarClockSnapshot(
+            ready=(
+                self._active_mode == "passthrough"
+                or len(self._candidates) >= self._warmup_samples
+            ),
+            mode=self._active_mode or "warming_up",
+            samples=len(self._candidates),
+            offset_ns=self._offset_ns,
+            residual_ns=self._residual_ns,
+            resets=self._resets,
+        )
+
+    def _resolve_mode(
+        self, *, raw_stamp_ns: int, driver_receive_stamp_ns: int
+    ) -> str:
+        if self._configured_mode != "auto":
+            return self._configured_mode
+        raw_age_ns = driver_receive_stamp_ns - raw_stamp_ns
+        if -self._aligned_tolerance_ns <= raw_age_ns <= self._aligned_tolerance_ns:
+            return "passthrough"
+        return "normalize"
+
+    def reset(self) -> None:
+        """Discard the clock estimate after a source/topology discontinuity."""
+
+        self._candidates.clear()
+        self._active_mode = None
+        self._last_raw_stamp_ns = None
+        self._offset_ns = None
+        self._residual_ns = None
+        self._resets += 1
 
 
 def _valid_frame_id(frame_id: str) -> bool:
@@ -167,6 +301,58 @@ def _decode_fields(value: Any, *, point_step: int) -> tuple[CanvasPointField, ..
             "point field time must be FLOAT32 count=1"
         )
     return tuple(fields)
+
+
+def point_time_max_offset_ns(
+    *,
+    data: bytes | bytearray | memoryview,
+    fields: Iterable[CanvasPointField],
+    height: int,
+    width: int,
+    point_step: int,
+    row_step: int,
+    is_bigendian: bool,
+) -> int:
+    """Return the MID360 scan-end offset from the per-point ``time`` field."""
+
+    time_fields = [field for field in fields if field.name == "time"]
+    if len(time_fields) != 1:
+        raise InvalidCanvasPointCloud("PointCloud2 requires one time field")
+    time_field = time_fields[0]
+    if (
+        time_field.datatype != POINT_FIELD_FLOAT32
+        or time_field.count != 1
+        or time_field.offset < 0
+        or time_field.offset + 4 > point_step
+    ):
+        raise InvalidCanvasPointCloud("unexpected PointCloud2 time field layout")
+
+    raw = memoryview(data)
+    unpack = struct.Struct(">f" if is_bigendian else "<f").unpack_from
+    maximum = 0.0
+    try:
+        for row in range(height):
+            row_offset = row * row_step
+            for column in range(width):
+                value = float(
+                    unpack(
+                        raw,
+                        row_offset + column * point_step + time_field.offset,
+                    )[0]
+                )
+                if not math.isfinite(value) or value < 0.0:
+                    raise InvalidCanvasPointCloud(
+                        "PointCloud2 contains an invalid point time"
+                    )
+                maximum = max(maximum, value)
+    except (struct.error, TypeError, ValueError) as exc:
+        if isinstance(exc, InvalidCanvasPointCloud):
+            raise
+        raise InvalidCanvasPointCloud("invalid PointCloud2 time buffer") from exc
+    maximum_ns = int(round(maximum))
+    if maximum_ns > NSEC_PER_SEC:
+        raise InvalidCanvasPointCloud("PointCloud2 scan duration exceeds one second")
+    return maximum_ns
 
 
 def _decode_raw_lidar_header(metadata: dict[str, Any]) -> tuple[int | None, bool, str]:
@@ -300,6 +486,17 @@ def decode_canvas_pointcloud(
         raise InvalidCanvasPointCloud("pointcloud.is_dense must be boolean")
     fields = _decode_fields(pointcloud.get("fields"), point_step=point_step)
 
+    point_data = raw[_LEGACY_HEADER.size:point_data_end]
+    scan_end_offset_ns = point_time_max_offset_ns(
+        data=point_data,
+        fields=fields,
+        height=height,
+        width=width,
+        point_step=point_step,
+        row_step=row_step,
+        is_bigendian=False,
+    )
+
     return CanvasPointCloud(
         source_stamp_ns=source_stamp_ns,
         driver_receive_monotonic_ns=driver_receive_monotonic_ns,
@@ -319,7 +516,8 @@ def decode_canvas_pointcloud(
         row_step=row_step,
         is_dense=is_dense,
         point_count=point_count,
-        data=raw[_LEGACY_HEADER.size:point_data_end],
+        scan_end_offset_ns=scan_end_offset_ns,
+        data=point_data,
     )
 
 
@@ -327,8 +525,12 @@ __all__ = [
     "CanvasPointCloud",
     "CanvasPointField",
     "InvalidCanvasPointCloud",
+    "LidarClockNormalizer",
+    "LidarClockSnapshot",
     "LIDAR_CLOUD_SCHEMA",
     "LIDAR_CLOUD_TRAILER_MAGIC",
+    "NSEC_PER_SEC",
     "POINT_DATA_TRANSFORM",
     "decode_canvas_pointcloud",
+    "point_time_max_offset_ns",
 ]

@@ -57,6 +57,10 @@ def generate_launch_description() -> LaunchDescription:
                     "output_topic": cloud_topic,
                     "status_topic": "/ubuntu/navigation/nav2/lidar_status",
                     "output_frame_id": lidar_frame,
+                    "timestamp_mode": "auto",
+                    "clock_warmup_samples": 8,
+                    "clock_window_samples": 200,
+                    "already_aligned_tolerance": 2.0,
                     "max_source_age": 0.5,
                     "source_future_tolerance": 0.1,
                 }

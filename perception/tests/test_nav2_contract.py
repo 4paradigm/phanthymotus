@@ -77,6 +77,9 @@ class Nav2ContractTest(unittest.TestCase):
         bridge = (
             companion_root / "g1_nav2" / "canvas_pointcloud_node.py"
         ).read_text(encoding="utf-8")
+        odom_bridge = (
+            companion_root / "g1_nav2" / "loco_odom_node.py"
+        ).read_text(encoding="utf-8")
         self.assertIn(
             'default_value="/ubuntu/lidar/cloud"', launch
         )
@@ -88,7 +91,10 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertIn("UInt8MultiArray", bridge)
         self.assertIn("decode_canvas_pointcloud", bridge)
         self.assertIn('"metadata_footer": "PCLMETA2"', bridge)
-        self.assertNotIn("LidarClockNormalizer", bridge)
+        self.assertIn("LidarClockNormalizer", bridge)
+        self.assertIn('"timestamp_mode": "auto"', launch)
+        self.assertIn("expected exactly one publisher", bridge)
+        self.assertIn("expected exactly one publisher", odom_bridge)
         self.assertIn('"queue_size": 1', launch)
 
         canvas = (

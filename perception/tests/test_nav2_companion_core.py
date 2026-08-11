@@ -20,6 +20,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 from g1_nav2.canvas_pointcloud_core import (  # noqa: E402
     InvalidCanvasPointCloud,
+    LidarClockNormalizer,
     decode_canvas_pointcloud,
 )
 from g1_nav2.execution_protocol import (  # noqa: E402
@@ -27,6 +28,7 @@ from g1_nav2.execution_protocol import (  # noqa: E402
     Velocity,
     VelocityProposal,
     build_velocity_proposal,
+    limit_forward_velocity,
 )
 from g1_nav2.loco_odom_core import (  # noqa: E402
     InvalidLocoState,
@@ -163,6 +165,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(cloud.raw_lidar_stamp_ns, 1_000_000_002)
         self.assertEqual(cloud.point_count, 2)
         self.assertEqual(cloud.point_step, 22)
+        self.assertEqual(cloud.scan_end_offset_ns, 99_840_000)
         self.assertEqual(
             [field.name for field in cloud.fields],
             ["x", "y", "z", "intensity", "ring", "time"],
@@ -222,6 +225,75 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 receive_stamp_ns=10_100_000_000,
                 output_frame_id="livox_frame",
             )
+
+    def test_pclmeta2_lidar_clock_maps_scan_start_to_driver_time(self) -> None:
+        normalizer = LidarClockNormalizer(
+            warmup_samples=3,
+            window_samples=5,
+        )
+        raw = 1_700_000_000_000_000_000
+        clock_offset = 16_857_528_000_000_000
+        scan_span = 99_840_000
+
+        for index, scheduling_delay in enumerate((8_000_000, 2_000_000)):
+            self.assertIsNone(
+                normalizer.normalize(
+                    raw_stamp_ns=raw + index * 100_000_000,
+                    driver_receive_stamp_ns=(
+                        raw
+                        + index * 100_000_000
+                        + clock_offset
+                        + scan_span
+                        + scheduling_delay
+                    ),
+                    scan_end_offset_ns=scan_span,
+                )
+            )
+        normalized = normalizer.normalize(
+            raw_stamp_ns=raw + 200_000_000,
+            driver_receive_stamp_ns=(
+                raw + 200_000_000 + clock_offset + scan_span + 5_000_000
+            ),
+            scan_end_offset_ns=scan_span,
+        )
+
+        self.assertEqual(
+            normalized,
+            raw + 200_000_000 + clock_offset + 2_000_000,
+        )
+        self.assertEqual(normalizer.snapshot().mode, "normalize")
+
+        late = normalizer.normalize(
+            raw_stamp_ns=raw + 300_000_000,
+            driver_receive_stamp_ns=(
+                raw + 300_000_000 + clock_offset + scan_span + 400_000_000
+            ),
+            scan_end_offset_ns=scan_span,
+        )
+        self.assertEqual(
+            late,
+            raw + 300_000_000 + clock_offset + 2_000_000,
+        )
+        normalizer.reset()
+        snapshot = normalizer.snapshot()
+        self.assertFalse(snapshot.ready)
+        self.assertEqual(snapshot.mode, "warming_up")
+        self.assertEqual(snapshot.samples, 0)
+        self.assertEqual(snapshot.resets, 1)
+
+    def test_requested_speed_is_enforced_on_forward_proposals(self) -> None:
+        limited = limit_forward_velocity(
+            Velocity(x=0.15, y=0.0, yaw=0.2),
+            max_forward_mps=0.10,
+        )
+        self.assertEqual(limited, Velocity(x=0.10, y=0.0, yaw=0.2))
+        reverse = limit_forward_velocity(
+            Velocity(x=-0.15, y=0.0, yaw=0.0),
+            max_forward_mps=0.10,
+        )
+        self.assertEqual(reverse.x, -0.15)
+        with self.assertRaisesRegex(ProtocolError, "max_forward_mps"):
+            limit_forward_velocity(Velocity(x=0.1), max_forward_mps=0.0)
 
     def test_canvas_map_view_is_installed_and_launched(self) -> None:
         setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
@@ -345,8 +417,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn('glob("behavior_trees/*.xml")', setup)
         self.assertIn('"behavior_tree_path": os.path.join(', launch)
         self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
-        self.assertIn("self._apply_controller_speed_limit(speed_limit)", command)
-        self.assertIn("wait_for_all_acked", command)
+        self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
+        self.assertIn("limit_forward_velocity", command)
+        self.assertNotIn("wait_for_all_acked", command)
         self.assertIn("goal.behavior_tree = self._behavior_tree_path", command)
 
     def test_legacy_loco_adapter_labels_receive_time(self) -> None:

@@ -32,7 +32,10 @@ NAV2_IMAGE=phanthy-nav2:nav2-card-stage6-amd64 \
 ```
 
 v2 fixture 用同一 ROS system clock 生成声明 `driver_receive` 的
-`loco_state.v2` 和 `lidar_cloud.v2`，验证 companion 严格解析 footer、
-还原 PointCloud2 fields，并以同钟域接收时间执行 freshness 检查。
+`loco_state.v2`，并为点云提供 Driver 接收时间、原始 LiDAR 扫描起始时间和逐点
+`time`。它验证 companion 严格解析 footer、还原 PointCloud2 fields、将 LiDAR
+原始时钟归一化到 odom/TF 的 system-time 时钟域，再以归一化后的扫描起始时间
+执行 freshness 检查。运行时 `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud` 都必须
+各自只有一个发布者，重复 Driver 数据源应被拒绝。
 `NAV2_FIXTURE_SENSOR_SCHEMA=legacy` 则故意不加 footer，用于验证 Nav2 拒绝无可信
 时间的旧帧；该模式不应进入 ready。
