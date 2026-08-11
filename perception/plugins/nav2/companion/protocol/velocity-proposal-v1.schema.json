@@ -44,7 +44,7 @@
       "type": "object",
       "required": ["x", "y", "yaw"],
       "properties": {
-        "x": {"type": "number", "minimum": -0.05, "maximum": 0.15},
+        "x": {"type": "number", "minimum": -0.15, "maximum": 0.15},
         "y": {"type": "number", "minimum": -0.12, "maximum": 0.12},
         "yaw": {"type": "number", "minimum": -0.35, "maximum": 0.35}
       },

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 
@@ -12,6 +13,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import LoadMap
 from sensor_msgs.msg import LaserScan
 from rclpy.action import ActionClient
@@ -78,6 +80,12 @@ class NavigationCommandNode(Node):
         self.declare_parameter(
             "proposal_topic", "/ubuntu/navigation/nav2/velocity_proposal"
         )
+        self.declare_parameter(
+            "controller_speed_limit_topic",
+            "/ubuntu/navigation/nav2/speed_limit",
+        )
+        self.declare_parameter("speed_limit_timeout", 3.0)
+        self.declare_parameter("behavior_tree_path", "")
         self.declare_parameter("proposal_ttl_ms", 250)
         self.declare_parameter("enforce_shadow_isolation", True)
         self.declare_parameter("max_shadow_speed", 0.15)
@@ -117,6 +125,15 @@ class NavigationCommandNode(Node):
         self._action_name = str(self.get_parameter("action_name").value)
         self._shadow_topic = str(self.get_parameter("shadow_topic").value)
         self._proposal_topic = str(self.get_parameter("proposal_topic").value)
+        self._controller_speed_limit_topic = str(
+            self.get_parameter("controller_speed_limit_topic").value
+        )
+        self._speed_limit_timeout = float(
+            self.get_parameter("speed_limit_timeout").value
+        )
+        self._behavior_tree_path = str(
+            self.get_parameter("behavior_tree_path").value
+        )
         self._proposal_ttl_ms = int(
             self.get_parameter("proposal_ttl_ms").value
         )
@@ -175,6 +192,12 @@ class NavigationCommandNode(Node):
             raise ValueError("supported_mode must be 0 until another mode is implemented")
         if self._goal_response_timeout <= 0:
             raise ValueError("goal_response_timeout must be positive")
+        if self._speed_limit_timeout <= 0:
+            raise ValueError("speed_limit_timeout must be positive")
+        if not os.path.isfile(self._behavior_tree_path):
+            raise ValueError(
+                "behavior_tree_path must point to the installed G1 Nav2 tree"
+            )
         if self._runtime_mode not in {"mapping", "localization"}:
             raise ValueError("runtime_mode must be mapping or localization")
         if self._service_timeout <= 0 or self._pose_lookup_timeout <= 0:
@@ -207,6 +230,9 @@ class NavigationCommandNode(Node):
         )
         self._proposal_pub = self.create_publisher(
             String, self._proposal_topic, command_qos
+        )
+        self._speed_limit_pub = self.create_publisher(
+            SpeedLimit, self._controller_speed_limit_topic, command_qos
         )
         self._initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped,
@@ -978,7 +1004,8 @@ class NavigationCommandNode(Node):
                 "target_pose": dict(active["target_pose"]),
                 "requested_speed": active["requested_speed"],
                 "effective_speed_limit": active["effective_speed_limit"],
-                "speed_policy": "explicit_shadow_safety_cap",
+                "speed_policy": "nav2_absolute_controller_limit",
+                "speed_limit_topic": self._controller_speed_limit_topic,
                 "mode": active["mode"],
                 "shadow_only": True,
             }
@@ -996,11 +1023,15 @@ class NavigationCommandNode(Node):
             attempt = self._active["attempt"]
             nav_id = self._active["nav_id"]
             target = dict(self._active["target_pose"])
+            speed_limit = float(self._active["effective_speed_limit"])
             self._active["status"] = "starting"
             self._active["cancel_intent"] = None
             self._active["goal_handle"] = None
 
+        self._apply_controller_speed_limit(speed_limit)
+
         goal = NavigateToPose.Goal()
+        goal.behavior_tree = self._behavior_tree_path
         goal.pose.header.frame_id = "map"
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = target["x"]
@@ -1037,6 +1068,34 @@ class NavigationCommandNode(Node):
             raise CommandError(
                 str(outcome.get("error_code", "goal_rejected")),
                 str(outcome.get("error", "Nav2 rejected the goal")),
+            )
+
+    def _apply_controller_speed_limit(self, speed_limit: float) -> None:
+        deadline = time.monotonic() + self._speed_limit_timeout
+        while self._speed_limit_pub.get_subscription_count() == 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CommandError(
+                    "speed_limit_unavailable",
+                    "Nav2 controller has no subscriber on "
+                    f"{self._controller_speed_limit_topic}",
+                )
+            time.sleep(min(0.05, remaining))
+
+        message = SpeedLimit()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = "base_link"
+        message.percentage = False
+        message.speed_limit = speed_limit
+        self._speed_limit_pub.publish(message)
+        remaining = max(0.0, deadline - time.monotonic())
+        if not self._speed_limit_pub.wait_for_all_acked(
+            Duration(seconds=remaining)
+        ):
+            raise CommandError(
+                "speed_limit_unconfirmed",
+                "Nav2 controller did not acknowledge speed limit "
+                f"{speed_limit:.3f} m/s",
             )
 
     def _on_goal_response(
@@ -1451,6 +1510,10 @@ class NavigationCommandNode(Node):
                 "velocity_proposal_topic": self._proposal_topic,
                 "proposal_ttl_ms": self._proposal_ttl_ms,
                 "proposal_subscribers": self._proposal_pub.get_subscription_count(),
+                "controller_speed_limit_topic": self._controller_speed_limit_topic,
+                "controller_speed_limit_subscribers": (
+                    self._speed_limit_pub.get_subscription_count()
+                ),
             }
         payload.update(self._readiness())
         self._emit(payload)

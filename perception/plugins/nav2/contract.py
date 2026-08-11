@@ -34,7 +34,7 @@ NAV2_CONFIG_DEFAULTS = {
     "discovery_timeout_sec": 5.0,
     "input_max_age_ms": 500,
     "max_forward_mps": 0.15,
-    "max_reverse_mps": 0.05,
+    "max_reverse_mps": 0.15,
     "max_lateral_mps": 0.0,
     "max_yaw_rps": 0.35,
     "max_planar_mps": 0.18,
@@ -96,10 +96,10 @@ NAV2_FULL_CONFIG_SCHEMA = {
         },
         "max_reverse_mps": {
             "type": "number",
-            "const": 0.05,
+            "const": 0.15,
             "minimum": 0.0,
-            "maximum": 0.05,
-            "default": 0.05,
+            "maximum": 0.15,
+            "default": 0.15,
         },
         "max_lateral_mps": {
             "type": "number",

@@ -86,7 +86,7 @@ BEST_EFFORT 发布端。
 提案本身不携带执行权限，`shadow_only=true`、`physical_execution=false` 表示
 卡片没有直接执行机器人动作；下游 Driver 是否执行由独立授权决定。
 
-首版提案边界：前进不超过 `0.15 m/s`，后退不超过 `0.05 m/s`，禁止横移
+首版提案边界：前进不超过 `0.15 m/s`，后退不超过 `0.15 m/s`，禁止横移
 （`y=0`），偏航角速度绝对值不超过 `0.35 rad/s`，平面合速度不超过
 `0.18 m/s`。Driver 必须再次独立限幅。
 
@@ -120,7 +120,10 @@ BEST_EFFORT 发布端。
 | `resume_nav` | 无 | 恢复已暂停任务；状态不允许时明确拒绝 |
 | `stop_nav` | 无 | 取消当前任务，发布终态零速并等待 Nav2 terminal；物理停车确认由 Driver 完成 |
 
-`speed` 默认 `0.15 m/s`，范围 `0.05–0.15 m/s`；首版导航固定允许绕障。
+`speed` 默认 `0.15 m/s`，范围 `0.05–0.15 m/s`；该值会在每次发送 Nav2 goal
+前发布为 controller server 的绝对线速度上限，限速 topic 无订阅或未确认时
+请求 fail closed。恢复行为的固定后退速度为 `0.15 m/s`，不受该前向限速参数影响；
+首版导航固定允许绕障。
 参数错误、not-ready、timeout、cancelled 和内部错误必须具有不同的结构化
 `error_code`，不能只返回 HTTP 200 或日志文本。
 
@@ -136,7 +139,7 @@ BEST_EFFORT 发布端。
 | `map_storage_dir` | `/maps` | 首版固定；由正式 Compose 持久化挂载 |
 | `input_max_age_ms` | `500` | 首版固定，超过后导航 fail closed |
 | `max_forward_mps` | `0.15` | 首版固定安全上限 |
-| `max_reverse_mps` | `0.05` | 首版固定安全上限 |
+| `max_reverse_mps` | `0.15` | 首版固定安全上限 |
 | `max_lateral_mps` | `0.0` | 首版禁止横移，非零提案 fail closed |
 | `max_yaw_rps` | `0.35` | 首版固定安全上限 |
 | `max_planar_mps` | `0.18` | 首版固定安全上限 |

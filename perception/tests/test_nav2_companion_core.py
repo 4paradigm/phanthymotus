@@ -4,6 +4,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -115,6 +116,27 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         parsed = VelocityProposal.from_payload(payload)
         self.assertEqual(parsed.nav_id, "nav-001")
 
+        reverse = build_velocity_proposal(
+            nav_id="nav-001",
+            sequence=2,
+            ttl_ms=250,
+            navigation_status="navigating",
+            velocity=Velocity(x=-0.15, y=0.0, yaw=0.0),
+            issued_at_unix_ms=2,
+        )
+        self.assertEqual(
+            VelocityProposal.from_payload(reverse).velocity.x, -0.15
+        )
+        with self.assertRaises(ProtocolError):
+            build_velocity_proposal(
+                nav_id="nav-001",
+                sequence=3,
+                ttl_ms=250,
+                navigation_status="navigating",
+                velocity=Velocity(x=-0.151, y=0.0, yaw=0.0),
+                issued_at_unix_ms=3,
+            )
+
         with self.assertRaises(ProtocolError):
             build_velocity_proposal(
                 nav_id="nav-001",
@@ -157,7 +179,37 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         for expected in expected_follow_path:
             self.assertIn(expected, follow_path)
         self.assertIn("max_velocity: [0.15, 0.0, 0.25]", smoother)
-        self.assertIn("min_velocity: [-0.05, 0.0, -0.25]", smoother)
+        self.assertIn("min_velocity: [-0.15, 0.0, -0.25]", smoother)
+
+    def test_speed_parameter_reaches_controller_and_backup_is_usable(self) -> None:
+        params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
+            encoding="utf-8"
+        )
+        setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
+        launch = (PACKAGE_ROOT / "launch" / "g1_nav2.launch.py").read_text(
+            encoding="utf-8"
+        )
+        command = (
+            PACKAGE_ROOT / "g1_nav2" / "navigation_command_node.py"
+        ).read_text(encoding="utf-8")
+        tree = ET.parse(
+            PACKAGE_ROOT
+            / "behavior_trees"
+            / "navigate_to_pose_w_replanning_and_recovery.xml"
+        )
+
+        backup = tree.find(".//BackUp")
+        self.assertIsNotNone(backup)
+        self.assertEqual(backup.attrib["backup_speed"], "0.15")
+        self.assertIn(
+            "speed_limit_topic: /ubuntu/navigation/nav2/speed_limit", params
+        )
+        self.assertIn('glob("behavior_trees/*.xml")', setup)
+        self.assertIn('"behavior_tree_path": os.path.join(', launch)
+        self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
+        self.assertIn("self._apply_controller_speed_limit(speed_limit)", command)
+        self.assertIn("wait_for_all_acked", command)
+        self.assertIn("goal.behavior_tree = self._behavior_tree_path", command)
 
     def test_legacy_sensor_adapters_label_receive_time(self) -> None:
         point_step = 12

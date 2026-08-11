@@ -147,6 +147,15 @@ def generate_launch_description() -> LaunchDescription:
                     "action_name": "/navigate_to_pose",
                     "shadow_topic": cmd_vel_shadow_topic,
                     "proposal_topic": velocity_proposal_topic,
+                    "controller_speed_limit_topic": (
+                        "/ubuntu/navigation/nav2/speed_limit"
+                    ),
+                    "speed_limit_timeout": 3.0,
+                    "behavior_tree_path": os.path.join(
+                        package_share,
+                        "behavior_trees",
+                        "navigate_to_pose_w_replanning_and_recovery.xml",
+                    ),
                     "proposal_ttl_ms": 250,
                     "enforce_shadow_isolation": True,
                     "max_shadow_speed": 0.15,

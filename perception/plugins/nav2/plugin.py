@@ -21,7 +21,7 @@ _NUMBER_RANGES = {
     "runtime_switch_timeout_sec": (10.0, 300.0),
     "discovery_timeout_sec": (0.5, 30.0),
     "max_forward_mps": (0.01, 0.15),
-    "max_reverse_mps": (0.0, 0.05),
+    "max_reverse_mps": (0.0, 0.15),
     "max_lateral_mps": (0.0, 0.12),
     "max_yaw_rps": (0.01, 0.35),
     "max_planar_mps": (0.01, 0.18),
@@ -85,7 +85,7 @@ def _validated_config(base: dict, updates: dict) -> dict:
     fixed = {
         "input_max_age_ms": 500,
         "max_forward_mps": 0.15,
-        "max_reverse_mps": 0.05,
+        "max_reverse_mps": 0.15,
         "max_lateral_mps": 0.0,
         "max_yaw_rps": 0.35,
         "max_planar_mps": 0.18,

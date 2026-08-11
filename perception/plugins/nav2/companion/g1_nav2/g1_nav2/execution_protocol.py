@@ -61,7 +61,7 @@ class Velocity:
 
 @dataclass(frozen=True)
 class VelocityLimits:
-    min_x: float = -0.05
+    min_x: float = -0.15
     max_x: float = 0.15
     max_abs_y: float = 0.0
     max_abs_yaw: float = 0.35

@@ -65,6 +65,8 @@ class Nav2ContractTest(unittest.TestCase):
         full_config = NAV2_FULL_CONFIG_SCHEMA["properties"]
         self.assertEqual(full_config["max_lateral_mps"]["const"], 0.0)
         self.assertEqual(full_config["max_lateral_mps"]["default"], 0.0)
+        self.assertEqual(full_config["max_reverse_mps"]["const"], 0.15)
+        self.assertEqual(full_config["max_reverse_mps"]["default"], 0.15)
 
         action_params = tool["inputSchema"]["x-action-params"]
         self.assertNotIn("mode", action_params["navigate_to_tag"]["params"])
