@@ -77,7 +77,7 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 - 非零线速度在发布前保持符号并抬升到至少 `0.10 m/s`；
 - 禁止横移，`y=0`；
 - 非零偏航角速度在发布前保持符号并抬升到至少
-  `0.30 rad/s`，绝对值不超过 `0.35 rad/s`；
+  `1.00 rad/s`，绝对值不超过 loco 合同的 `2.00 rad/s`；
 - 上述最小值只处理非零运动提案；readiness blocker、暂停和终态零速
   仍保持严格零值；
 - BackUp 恢复动作仍固定为 `0.15 m/s`；

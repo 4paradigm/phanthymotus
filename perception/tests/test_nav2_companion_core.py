@@ -36,7 +36,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             sequence=1,
             ttl_ms=250,
             navigation_status="navigating",
-            velocity=Velocity(x=1.0, y=0.0, yaw=0.35),
+            velocity=Velocity(x=1.0, y=0.0, yaw=2.0),
             issued_at_unix_ms=1,
         )
         self.assertEqual(VelocityProposal.from_payload(payload).nav_id, "nav-001")
@@ -70,15 +70,15 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(apply_g1_motion_floor(Velocity.zero()), Velocity.zero())
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.02)),
-            Velocity(x=0.10, y=0.0, yaw=-0.30),
+            Velocity(x=0.10, y=0.0, yaw=-1.00),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=-0.05, y=0.0, yaw=0.31)),
-            Velocity(x=-0.10, y=0.0, yaw=0.31),
+            apply_g1_motion_floor(Velocity(x=-0.05, y=0.0, yaw=1.01)),
+            Velocity(x=-0.10, y=0.0, yaw=1.01),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=0.35)),
-            Velocity(x=0.50, y=0.0, yaw=0.35),
+            apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=2.0)),
+            Velocity(x=0.50, y=0.0, yaw=2.0),
         )
 
     def test_fast_livo2_readiness_is_fail_closed(self) -> None:
@@ -206,9 +206,10 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             "vy_samples: 1",
         ):
             self.assertIn(expected, follow_path)
-        self.assertIn("rotate_to_heading_angular_vel: 0.30", follow_path)
-        self.assertIn("min_speed_theta: 0.30", follow_path)
-        self.assertIn("max_velocity: [1.0, 0.0, 0.35]", smoother)
+        self.assertIn("rotate_to_heading_angular_vel: 1.00", follow_path)
+        self.assertIn("min_speed_theta: 1.00", follow_path)
+        self.assertIn("max_vel_theta: 2.00", follow_path)
+        self.assertIn("max_velocity: [1.0, 0.0, 2.0]", smoother)
         self.assertIn("odom_topic: /ubuntu/navigation/odom", smoother)
 
     def test_speed_limit_and_behavior_tree_reach_planner_bridge(self) -> None:

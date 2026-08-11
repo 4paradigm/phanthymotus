@@ -17,7 +17,7 @@ SCHEMA_VERSION = 1
 VELOCITY_PROPOSAL_SCHEMA = "phanthy.navigation.velocity_proposal.v1"
 VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
 MIN_EFFECTIVE_LINEAR_MPS = 0.10
-MIN_EFFECTIVE_YAW_RADPS = 0.30
+MIN_EFFECTIVE_YAW_RADPS = 1.00
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MOTION_STATUSES = {"planning", "navigating", "replanning", "running", "active"}
@@ -112,7 +112,7 @@ class VelocityLimits:
     min_x: float = -1.0
     max_x: float = 1.0
     max_abs_y: float = 0.0
-    max_abs_yaw: float = 0.35
+    max_abs_yaw: float = 2.0
     max_planar_speed: float = 1.0
 
     def validate(self, velocity: Velocity) -> None:

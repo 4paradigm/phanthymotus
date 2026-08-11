@@ -9,7 +9,7 @@
   "velocity": {
     "x": 0.1,
     "y": 0.0,
-    "yaw": 0.05
+    "yaw": 1.0
   },
   "shadow_only": true,
   "physical_execution": false

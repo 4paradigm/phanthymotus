@@ -132,6 +132,8 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(full_config["max_lateral_mps"]["default"], 0.0)
         self.assertEqual(full_config["max_reverse_mps"]["const"], 1.0)
         self.assertEqual(full_config["max_reverse_mps"]["default"], 1.0)
+        self.assertEqual(full_config["max_yaw_rps"]["const"], 2.0)
+        self.assertEqual(full_config["max_yaw_rps"]["default"], 2.0)
 
         action_params = tool["inputSchema"]["x-action-params"]
         self.assertNotIn("mode", action_params["navigate_to_pose"]["params"])

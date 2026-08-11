@@ -22,7 +22,7 @@ _NUMBER_RANGES = {
     "max_forward_mps": (0.01, 1.0),
     "max_reverse_mps": (0.0, 1.0),
     "max_lateral_mps": (0.0, 0.12),
-    "max_yaw_rps": (0.01, 0.35),
+    "max_yaw_rps": (0.01, 2.0),
     "max_planar_mps": (0.01, 1.0),
 }
 _INTEGER_RANGES = {
@@ -92,7 +92,7 @@ def _validated_config(base: dict, updates: dict) -> dict:
         "max_forward_mps": 1.0,
         "max_reverse_mps": 1.0,
         "max_lateral_mps": 0.0,
-        "max_yaw_rps": 0.35,
+        "max_yaw_rps": 2.0,
         "max_planar_mps": 1.0,
         "proposal_ttl_ms": 250,
     }

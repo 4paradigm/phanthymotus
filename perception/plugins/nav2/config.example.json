@@ -9,7 +9,7 @@
   "max_forward_mps": 1.0,
   "max_reverse_mps": 1.0,
   "max_lateral_mps": 0.0,
-  "max_yaw_rps": 0.35,
+  "max_yaw_rps": 2.0,
   "max_planar_mps": 1.0,
   "proposal_ttl_ms": 250
 }

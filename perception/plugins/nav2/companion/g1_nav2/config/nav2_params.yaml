@@ -90,7 +90,7 @@ controller_server:
       primary_controller: dwb_core::DWBLocalPlanner
       angular_dist_threshold: 0.35
       forward_sampling_distance: 0.40
-      rotate_to_heading_angular_vel: 0.30
+      rotate_to_heading_angular_vel: 1.00
       max_angular_accel: 0.40
       simulate_ahead_time: 1.0
       rotate_to_goal_heading: false
@@ -99,10 +99,10 @@ controller_server:
       max_vel_x: 1.0
       min_vel_y: 0.0
       max_vel_y: 0.0
-      max_vel_theta: 0.35
+      max_vel_theta: 2.00
       min_speed_xy: 0.10
       max_speed_xy: 1.0
-      min_speed_theta: 0.30
+      min_speed_theta: 1.00
       acc_lim_x: 0.30
       acc_lim_y: 0.0
       acc_lim_theta: 0.40
@@ -246,8 +246,8 @@ behavior_server:
     robot_base_frame: base_link
     transform_tolerance: 0.2
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.35
-    min_rotational_vel: 0.30
+    max_rotational_vel: 2.00
+    min_rotational_vel: 1.00
     rotational_acc_lim: 0.40
 
 waypoint_follower:
@@ -267,8 +267,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: OPEN_LOOP
-    max_velocity: [1.0, 0.0, 0.35]
-    min_velocity: [-1.0, 0.0, -0.35]
+    max_velocity: [1.0, 0.0, 2.0]
+    min_velocity: [-1.0, 0.0, -2.0]
     max_accel: [0.30, 0.0, 0.40]
     max_decel: [-0.30, 0.0, -0.40]
     odom_topic: /ubuntu/navigation/odom
