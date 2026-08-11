@@ -144,6 +144,21 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "desc": "Motion-compensated current scan in the session map frame",
             },
             {
+                "port": "obstacle_map",
+                "topic": f"{root}/navigation/obstacle_map",
+                "format": "sensor/pointcloud",
+                "ros_type": "sensor_msgs/msg/PointCloud2",
+                "qos": "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
+                "rate_hz": 1,
+                "timestamp": "adapter publish time, ROS system time",
+                "frame_id": "map",
+                "units": "x/y=m; z=0 projected obstacle plane",
+                "desc": (
+                    "Accumulated XY obstacle projection after removing the G1 "
+                    "floor and ceiling height bands"
+                ),
+            },
+            {
                 "port": "map_view",
                 "topic": f"{root}/navigation/fast_livo2/map_view",
                 "format": "sensor/mapping",

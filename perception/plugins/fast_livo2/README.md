@@ -16,6 +16,7 @@ Driver navigation_sensors
             FAST-LIVO2 card
               |-- /ubuntu/navigation/odom
               |-- /ubuntu/navigation/cloud_registered
+              |-- /ubuntu/navigation/obstacle_map
               |-- TF map -> base_link
               `-- /ubuntu/navigation/fast_livo2/map_view
                     |
@@ -49,6 +50,7 @@ frame 不符时 companion 不发布伪造的 canonical odom/cloud。
 | --- | --- | --- | --- |
 | `livo_odom` | `/ubuntu/navigation/odom` | `map -> base_link` | Nav2 位姿与速度反馈 |
 | `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `map` | Nav2 rolling costmap 障碍输入 |
+| `obstacle_map` | `/ubuntu/navigation/obstacle_map` | `map` | 去除地板/天花板后累计投影的 Nav2 全局二维障碍输入 |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | `map` | Canvas 体素化累计地图和机器人位置 |
 | `status` | `/ubuntu/navigation/fast_livo2/status` | JSON | 算法进程、输入 freshness、frame 和产物状态 |
 
@@ -60,6 +62,12 @@ Canvas 地图最多保留 80,000 个 `0.10 m` 体素占用点；Agent Core 在�
 并保持 ROS `map` frame 的 yaw 正方向。它是监控视图，不是
 可重定位地图格式。原始 PCD 分片保存在宿主机
 `/opt/phanthy-motus/data/fast_livo2/maps`。
+
+Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter 按当前
+上海 G1 室内点云分布保留相对雷达原点 `z=-1.15…+0.80 m` 的高度带，排除
+约 `z=-1.3 m` 的地板和约 `z=+1.7 m` 的天花板，再按 XY 体素去重投影到
+`z=0`。由于 MID360 位于机器人上部，这个范围向下覆盖更多、向上覆盖更少，
+用于保留桌腿、椅子、箱体、人体和墙面等二维碰撞障碍。
 
 ## Actions
 
@@ -81,7 +89,8 @@ Canvas 地图最多保留 80,000 个 `0.10 m` 体素占用点；Agent Core 在�
 2. Driver `navigation_imu` -> FAST-LIVO2 `imu`；
 3. FAST-LIVO2 `livo_odom` -> Nav2 `livo_odom`；
 4. FAST-LIVO2 `registered_cloud` -> Nav2 `registered_cloud`；
-5. Nav2 `velocity_proposal` -> Driver `loco.velocity_proposal`。
+5. FAST-LIVO2 `obstacle_map` -> Nav2 `obstacle_map`；
+6. Nav2 `velocity_proposal` -> Driver `loco.velocity_proposal`。
 
 Canvas 启动后，Nav2 可以先进入 wired 状态，但在 FAST-LIVO2 尚未开始产出
 odom/cloud 时，`navigate_to_pose` 会返回 readiness blocker。先在

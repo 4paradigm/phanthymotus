@@ -43,10 +43,15 @@ class FastLivo2ContractTest(unittest.TestCase):
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
         self.assertEqual(
-            set(outputs), {"livo_odom", "registered_cloud", "map_view", "status"}
+            set(outputs),
+            {"livo_odom", "registered_cloud", "obstacle_map", "map_view", "status"},
         )
         self.assertEqual(outputs["livo_odom"]["frame_id"], "map -> base_link")
         self.assertEqual(outputs["registered_cloud"]["frame_id"], "map")
+        self.assertEqual(
+            outputs["obstacle_map"]["topic"], "/ubuntu/navigation/obstacle_map"
+        )
+        self.assertEqual(outputs["obstacle_map"]["frame_id"], "map")
         self.assertEqual(outputs["map_view"]["schema"], "phanthy.navigation.map_view.v1")
 
     def test_companion_is_locked_and_navigation_compose_owns_the_service(self) -> None:

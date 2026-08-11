@@ -150,7 +150,7 @@ class Nav2Plugin:
         if not canvas_started or core is None:
             return self._error(
                 "canvas_not_started",
-                "connect FAST-LIVO2 odom and registered_cloud, then start Canvas",
+                "connect FAST-LIVO2 odom, registered_cloud and obstacle_map, then start Canvas",
             )
         return core.dispatch(args)
 

@@ -70,7 +70,7 @@ class Nav2CoreTest(unittest.TestCase):
                 "x": 0.5,
                 "y": 0.0,
                 "yaw": 0.0,
-                "speed": 0.10,
+                "speed": 0.30,
                 "_control_nav_id": "lease-min-speed",
             }
         )
@@ -78,7 +78,7 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(result["status"], "navigating")
         action, args, nav_id = self.backend.calls[-1]
         self.assertEqual(action, "navigate_to_pose")
-        self.assertEqual(args["speed"], 0.10)
+        self.assertEqual(args["speed"], 0.30)
         self.assertEqual(nav_id, "lease-min-speed")
 
     def test_maximum_navigation_speed_is_accepted(self) -> None:
@@ -102,7 +102,7 @@ class Nav2CoreTest(unittest.TestCase):
     def test_speed_mode_and_non_finite_values_are_rejected(self) -> None:
         cases = (
             ({"speed": 1.001}, "invalid_argument"),
-            ({"speed": 0.099}, "invalid_argument"),
+            ({"speed": 0.299}, "invalid_argument"),
             ({"mode": "0"}, "invalid_argument"),
             ({"x": float("nan")}, "invalid_argument"),
         )

@@ -200,6 +200,29 @@ class VoxelMap:
     def point_count(self) -> int:
         return len(self._points)
 
+    def project_xy(
+        self,
+        *,
+        min_z: float,
+        max_z: float,
+        output_z: float = 0.0,
+    ) -> tuple[tuple[float, float, float], ...]:
+        """Project the non-floor/non-ceiling slice into one point per XY voxel."""
+
+        if not all(math.isfinite(value) for value in (min_z, max_z, output_z)):
+            raise ValueError("projection heights must be finite")
+        if min_z >= max_z:
+            raise ValueError("min_z must be less than max_z")
+
+        projected: dict[tuple[int, int], tuple[float, float, float]] = {}
+        for (ix, iy, _iz), point in self._points.items():
+            if min_z <= point[2] <= max_z:
+                projected.setdefault(
+                    (ix, iy),
+                    ((ix + 0.5) * self._voxel, (iy + 0.5) * self._voxel, output_z),
+                )
+        return tuple(projected.values())
+
     def encode(self, robot_pose: Pose3) -> bytes:
         yaw = yaw_from_quaternion(robot_pose.q)
         body = bytearray(len(self._points) * _POINT.size)

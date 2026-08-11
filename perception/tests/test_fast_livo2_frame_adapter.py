@@ -107,6 +107,28 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
                 )
             )
 
+    def test_obstacle_projection_excludes_floor_and_ceiling(self) -> None:
+        voxel_map = VoxelMap(0.10)
+        voxel_map.add(
+            [
+                (1.01, 2.01, -1.30),
+                (1.01, 2.01, -0.50),
+                (1.04, 2.04, 0.40),
+                (2.01, 3.01, 1.70),
+                (3.01, 4.01, 0.20),
+            ]
+        )
+
+        projected = voxel_map.project_xy(min_z=-1.15, max_z=0.80)
+
+        self.assertEqual(len(projected), 2)
+        self.assertEqual(
+            [(round(x, 2), round(y, 2), z) for x, y, z in projected],
+            [(1.05, 2.05, 0.0), (3.05, 4.05, 0.0)],
+        )
+        with self.assertRaises(ValueError):
+            voxel_map.project_xy(min_z=1.0, max_z=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 import threading
 import time
 
@@ -12,7 +13,7 @@ from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 from tf2_ros import TransformBroadcaster
 
@@ -34,12 +35,15 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("raw_cloud_topic", "/ubuntu/navigation/fast_livo2/raw/cloud_registered")
         self.declare_parameter("odom_topic", "/ubuntu/navigation/odom")
         self.declare_parameter("cloud_topic", "/ubuntu/navigation/cloud_registered")
+        self.declare_parameter("obstacle_map_topic", "/ubuntu/navigation/obstacle_map")
         self.declare_parameter("map_view_topic", "/ubuntu/navigation/fast_livo2/map_view")
         self.declare_parameter("diagnostics_topic", "/ubuntu/navigation/fast_livo2/diagnostics")
         self.declare_parameter("reset_topic", "/ubuntu/navigation/fast_livo2/reset_map")
         self.declare_parameter("source_max_age_sec", 0.5)
         self.declare_parameter("map_voxel_size_m", 0.10)
         self.declare_parameter("map_max_points", 80000)
+        self.declare_parameter("obstacle_min_height_m", -1.15)
+        self.declare_parameter("obstacle_max_height_m", 0.80)
         self.declare_parameter("base_to_sensor_x", -0.00368)
         self.declare_parameter("base_to_sensor_y", 0.00003)
         self.declare_parameter("base_to_sensor_z", 0.46018)
@@ -62,6 +66,12 @@ class FastLivo2Adapter(Node):
             float(self.get_parameter("map_voxel_size_m").value),
             int(self.get_parameter("map_max_points").value),
         )
+        self._obstacle_min_height = float(self.get_parameter("obstacle_min_height_m").value)
+        self._obstacle_max_height = float(self.get_parameter("obstacle_max_height_m").value)
+        if not math.isfinite(self._obstacle_min_height) or not math.isfinite(self._obstacle_max_height):
+            raise ValueError("obstacle projection heights must be finite")
+        if self._obstacle_min_height >= self._obstacle_max_height:
+            raise ValueError("obstacle_min_height_m must be less than obstacle_max_height_m")
         self._lock = threading.Lock()
         self._latest_pose: Pose3 | None = None
         self._last_odom_monotonic: float | None = None
@@ -74,6 +84,11 @@ class FastLivo2Adapter(Node):
 
         self._odom_pub = self.create_publisher(Odometry, str(self.get_parameter("odom_topic").value), qos_profile_sensor_data)
         self._cloud_pub = self.create_publisher(PointCloud2, str(self.get_parameter("cloud_topic").value), qos_profile_sensor_data)
+        self._obstacle_map_pub = self.create_publisher(
+            PointCloud2,
+            str(self.get_parameter("obstacle_map_topic").value),
+            qos_profile_sensor_data,
+        )
         self._map_view_pub = self.create_publisher(UInt8MultiArray, str(self.get_parameter("map_view_topic").value), qos_profile_sensor_data)
         self._diagnostics_pub = self.create_publisher(String, str(self.get_parameter("diagnostics_topic").value), 10)
         self._tf = TransformBroadcaster(self)
@@ -185,10 +200,32 @@ class FastLivo2Adapter(Node):
             self._map.clear()
             self._session_name = message.data.strip() or None
 
+    def _obstacle_cloud(self, points: tuple[tuple[float, float, float], ...]) -> PointCloud2:
+        output = PointCloud2()
+        output.header.stamp = self.get_clock().now().to_msg()
+        output.header.frame_id = "map"
+        output.height = 1
+        output.width = len(points)
+        output.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        output.is_bigendian = False
+        output.point_step = 12
+        output.row_step = output.point_step * output.width
+        output.data = b"".join(struct.pack("<fff", *point) for point in points)
+        output.is_dense = True
+        return output
+
     def _publish_periodic(self) -> None:
         now = time.monotonic()
         with self._lock:
             pose = self._latest_pose
+            obstacle_points = self._map.project_xy(
+                min_z=self._obstacle_min_height,
+                max_z=self._obstacle_max_height,
+            )
             if pose is not None and self._map.point_count:
                 frame = UInt8MultiArray()
                 frame.data = self._map.encode(pose)
@@ -210,12 +247,17 @@ class FastLivo2Adapter(Node):
                 "odom_source_age_sec": self._last_odom_source_age,
                 "cloud_source_age_sec": self._last_cloud_source_age,
                 "map_point_count": self._map.point_count,
+                "obstacle_point_count": len(obstacle_points),
+                "obstacle_height_range_m": [self._obstacle_min_height, self._obstacle_max_height],
                 "invalid_odom": self._invalid_odom,
                 "invalid_cloud": self._invalid_cloud,
                 "raw_odom_frame": "camera_init -> aft_mapped",
                 "canonical_odom_frame": "map -> base_link",
                 "canonical_cloud_frame": "map",
+                "obstacle_map_frame": "map",
             }
+        if obstacle_points:
+            self._obstacle_map_pub.publish(self._obstacle_cloud(obstacle_points))
         message = String()
         message.data = json.dumps(payload, separators=(",", ":"))
         self._diagnostics_pub.publish(message)

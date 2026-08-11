@@ -14,6 +14,7 @@ Driver sensors
 FAST-LIVO2 card
     |-- /ubuntu/navigation/odom                 nav_msgs/Odometry
     |-- /ubuntu/navigation/cloud_registered     sensor_msgs/PointCloud2
+    |-- /ubuntu/navigation/obstacle_map          sensor_msgs/PointCloud2
     `-- TF: map -> base_link
               |
               v
@@ -39,6 +40,7 @@ FAST-LIVO2 card
 | --- | --- | --- | --- |
 | `livo_odom` | `/ubuntu/navigation/odom` | `nav_msgs/msg/Odometry`; `BEST_EFFORT + KEEP_LAST(5)` | `header.frame_id=map`，`child_frame_id=base_link`，ROS system time，最大 age 500 ms |
 | `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，已运动去畸变，ROS system time，最大 age 500 ms |
+| `obstacle_map` | `/ubuntu/navigation/obstacle_map` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，累计点云排除地板/天花板后投影到 `z=0` |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.goal.v1`，`map` frame，每条唯一 `goal_id` |
 
 Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIVO2 还在
@@ -71,16 +73,16 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 
 速度限制：
 
-- 导航请求 `speed` 范围为 `0.10–1.00 m/s`，默认 `0.50 m/s`；
+- 导航请求 `speed` 范围为 `0.30–1.00 m/s`，默认 `0.50 m/s`；
 - 前进/后退提案的协议上限为 `1.00 m/s`，每次导航仍由请求的
   `speed` 再限幅；
-- 非零线速度在发布前保持符号并抬升到至少 `0.10 m/s`；
+- 非零线速度在发布前保持符号并抬升到至少 `0.30 m/s`；
 - 禁止横移，`y=0`；
 - 非零偏航角速度在发布前保持符号并抬升到至少
   `1.00 rad/s`，绝对值不超过 loco 合同的 `2.00 rad/s`；
 - 上述最小值只处理非零运动提案；readiness blocker、暂停和终态零速
   仍保持严格零值；
-- BackUp 恢复动作仍固定为 `0.15 m/s`；
+- BackUp 恢复动作固定为 `0.30 m/s`；
 - Driver 仍负责二次限幅、TTL、急停和停车确认。
 
 ## Actions
@@ -104,8 +106,10 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 ## 规划与控制
 
 - NavFn 生成全局路径。
-- global/local costmap 都是 rolling window，直接使用
-  `/ubuntu/navigation/cloud_registered` 的 `PointCloud2` 障碍物。
+- global/local costmap 都是 rolling window。global costmap 使用累计、去地面、
+  去天花板并投影到二维的 `/ubuntu/navigation/obstacle_map`，避免已观察障碍
+  因当前视角遮挡而消失；local costmap 继续使用实时
+  `/ubuntu/navigation/cloud_registered`，高度带为 `-1.15…+0.80 m`。
 - Rotation Shim 在航向偏差大时先旋转，DWB 只采样 `x/yaw`，不采样横移。
 - velocity smoother 使用 `/ubuntu/navigation/odom` 作为反馈。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
@@ -114,11 +118,12 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 
 ## Canvas 连线
 
-Nav2 卡片需要两条必需输入：
+Nav2 卡片需要三条必需输入：
 
 1. FAST-LIVO2 `livo_odom` -> Nav2 `livo_odom`；
 2. FAST-LIVO2 `registered_cloud` -> Nav2 `registered_cloud`；
-3. Nav2 `velocity_proposal` -> Driver `loco.velocity_proposal`。
+3. FAST-LIVO2 `obstacle_map` -> Nav2 `obstacle_map`；
+4. Nav2 `velocity_proposal` -> Driver `loco.velocity_proposal`。
 
 地图从 FAST-LIVO2 卡片的 `map_view` 查看，实时位姿从其
 `livo_odom` 查看。Agent Core 的地图 renderer 会额外只读订阅 Nav2 `/plan`，

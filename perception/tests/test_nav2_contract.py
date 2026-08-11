@@ -40,7 +40,10 @@ class Nav2ContractTest(unittest.TestCase):
         )
 
         inputs = {item["port"]: item for item in tool["topic_in"]}
-        self.assertEqual(set(inputs), {"livo_odom", "registered_cloud", "goal_pose"})
+        self.assertEqual(
+            set(inputs),
+            {"livo_odom", "registered_cloud", "obstacle_map", "goal_pose"},
+        )
         self.assertEqual(inputs["livo_odom"]["topic"], "/ubuntu/navigation/odom")
         self.assertEqual(
             inputs["registered_cloud"]["topic"],
@@ -55,6 +58,10 @@ class Nav2ContractTest(unittest.TestCase):
             "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
         )
         self.assertEqual(inputs["registered_cloud"]["frame_id"], "map")
+        self.assertEqual(
+            inputs["obstacle_map"]["topic"], "/ubuntu/navigation/obstacle_map"
+        )
+        self.assertEqual(inputs["obstacle_map"]["frame_id"], "map")
         self.assertFalse(inputs["goal_pose"]["required"])
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
@@ -112,6 +119,7 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("PYTHON_NUMPY_VERSION", compose)
         self.assertNotIn("PYTHON_NUMPY_VERSION", source_lock)
         self.assertEqual(goal_schema["properties"]["speed"]["maximum"], 1.0)
+        self.assertEqual(goal_schema["properties"]["speed"]["minimum"], 0.30)
         self.assertEqual(goal_schema["properties"]["speed"]["default"], 0.5)
         self.assertEqual(
             proposal_schema["properties"]["velocity"]["properties"]["x"],
@@ -122,7 +130,7 @@ class Nav2ContractTest(unittest.TestCase):
         tool = nav2_tool_definition("ubuntu")
         properties = tool["inputSchema"]["properties"]
         speed = properties["speed"]
-        self.assertEqual(speed["minimum"], 0.10)
+        self.assertEqual(speed["minimum"], 0.30)
         self.assertEqual(speed["maximum"], 1.0)
         self.assertEqual(speed["default"], 0.5)
         self.assertNotIn("mode", properties)

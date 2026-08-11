@@ -184,7 +184,7 @@ def nav2_tool_definition(namespace: str) -> dict:
         "multiInstance": False,
         "description": (
             "Nav2 planner and controller consuming FAST-LIVO2 localization and "
-            "registered obstacles. This Perception card only emits "
+            "accumulated 2D obstacles. This Perception card only emits "
             "bounded velocity proposals; an explicitly authorized Driver loco "
             "actuator owns any physical execution."
         ),
@@ -254,6 +254,22 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "desc": (
                     "Motion-compensated registered cloud from FAST-LIVO2; Nav2 "
                     "uses it only for rolling obstacle costmaps"
+                ),
+            },
+            {
+                "port": "obstacle_map",
+                "topic": f"{root}/navigation/obstacle_map",
+                "format": "sensor/pointcloud",
+                "ros_type": "sensor_msgs/msg/PointCloud2",
+                "qos": "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
+                "rate_hz": 1,
+                "timestamp": "FAST-LIVO2 adapter publish time",
+                "frame_id": "map",
+                "axes": "ROS REP-103 right-handed: x forward, y left, z up",
+                "units": "x/y in meters; z=0 projected obstacle plane",
+                "desc": (
+                    "Accumulated floor/ceiling-filtered 2D obstacle source for "
+                    "the Nav2 global costmap"
                 ),
             },
             {
@@ -328,10 +344,10 @@ def nav2_tool_definition(namespace: str) -> dict:
                 },
                 "speed": {
                     "type": "number",
-                    "minimum": 0.10,
+                    "minimum": 0.30,
                     "maximum": 1.0,
                     "default": 0.5,
-                    "description": "Navigation speed 0.10-1.00 m/s (default 0.50)",
+                    "description": "Navigation speed 0.30-1.00 m/s (default 0.50)",
                 },
                 "stall_timeout": {
                     "type": "number",

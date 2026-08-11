@@ -70,11 +70,11 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(apply_g1_motion_floor(Velocity.zero()), Velocity.zero())
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.02)),
-            Velocity(x=0.10, y=0.0, yaw=-1.00),
+            Velocity(x=0.30, y=0.0, yaw=-1.00),
         )
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=-0.05, y=0.0, yaw=1.01)),
-            Velocity(x=-0.10, y=0.0, yaw=1.01),
+            Velocity(x=-0.30, y=0.0, yaw=1.01),
         )
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=2.0)),
@@ -174,7 +174,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertNotIn("/maps", compose)
         self.assertNotIn("NAV2_MODE", compose)
 
-    def test_costmaps_consume_fast_livo2_registered_cloud(self) -> None:
+    def test_costmaps_consume_live_and_accumulated_fast_livo2_obstacles(self) -> None:
         params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
             encoding="utf-8"
         )
@@ -182,10 +182,11 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertNotIn("map_server:", params)
         self.assertNotIn("static_layer", params)
         self.assertNotIn("data_type: LaserScan", params)
-        self.assertEqual(
-            params.count("topic: /ubuntu/navigation/cloud_registered"), 2
-        )
+        self.assertEqual(params.count("topic: /ubuntu/navigation/cloud_registered"), 1)
+        self.assertEqual(params.count("topic: /ubuntu/navigation/obstacle_map"), 1)
         self.assertEqual(params.count("data_type: PointCloud2"), 2)
+        self.assertIn("min_obstacle_height: -1.15", params)
+        self.assertIn("max_obstacle_height: 0.80", params)
         self.assertIn("global_frame: map", params)
         self.assertIn("rolling_window: true", params)
 
@@ -202,7 +203,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             "primary_controller: dwb_core::DWBLocalPlanner",
             "min_vel_y: 0.0",
             "max_vel_y: 0.0",
-            "min_speed_xy: 0.10",
+            "min_speed_xy: 0.30",
             "vy_samples: 1",
         ):
             self.assertIn(expected, follow_path)
@@ -223,7 +224,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         backup = tree.find(".//BackUp")
         self.assertIsNotNone(backup)
-        self.assertEqual(backup.attrib["backup_speed"], "0.15")
+        self.assertEqual(backup.attrib["backup_speed"], "0.30")
         self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
         self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
         self.assertIn("limit_forward_velocity", command)
