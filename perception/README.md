@@ -93,6 +93,16 @@ ASR result JSON:
 
 ---
 
+## Semantic Navigation 占位接入
+
+`semantic_navigation` 已显式接入 `PerceptionBundle`，默认使用
+`namespace=ubuntu`。当前是与语义导航联调用的最小占位插件：不暴露
+MCP tools，不订阅 ROS topic，也不持有运行时资源。后续能力实现应在
+`plugins/semantic_navigation/` 内扩展，无需再手工修改容器内的
+`main.py` 或 `config.yaml`。
+
+---
+
 ## Nav2 卡片
 
 `nav2` 是单实例 `processor` 卡片，只提供点到点导航、路径规划、
