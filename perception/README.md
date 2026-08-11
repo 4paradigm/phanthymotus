@@ -96,8 +96,9 @@ ASR result JSON:
 ## Nav2 卡片
 
 `nav2` 是单实例 `processor` 卡片，提供建图、地图保存/加载、位置标签和点到点导航。
-首版接收 G1 Driver 的 `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud`，只输出
-`/ubuntu/navigation/nav2/velocity_proposal`。卡片不会直接调用机器人 SDK；任何物理
+首版接收 G1 Driver 的 `/ubuntu/loco/state` 与 `/ubuntu/lidar/cloud`，输出
+`/ubuntu/navigation/nav2/velocity_proposal` 以及仅用于 Canvas 监控的
+`/ubuntu/navigation/nav2/map_view`。卡片不会直接调用机器人 SDK；任何物理
 执行都必须由 Agent Core 建立受信任务 lease，再由 Driver 独立完成限幅、急停和停车确认。
 
 用户可见约束：
@@ -107,6 +108,8 @@ ASR result JSON:
 - `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；
 - 地图宿主机目录为 `/opt/phanthy-motus/data/nav2/maps`，companion 容器内为 `/maps`；
 - `start_mapping` 自动切换 mapping，`stop_mapping` 原子保存后自动切回 localization；
+- Canvas 「查看数据流」默认打开 `map_view`，以 1 Hz 显示占用栅格和机器人位姿，
+  该数据流不能发起导航或改变机器人状态；
 - 当前官方 Agent Core 尚缺 `x-execution-control` / `x-topic-actions` 消费能力，
   因而 `goal_pose` topic 和 Driver 物理 lease 仍是明确的外部依赖。
 

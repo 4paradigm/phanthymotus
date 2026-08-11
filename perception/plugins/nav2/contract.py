@@ -364,6 +364,23 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "actuator; never a physical command by itself"
                 ),
             },
+            {
+                "port": "map_view",
+                "topic": f"{root}/navigation/nav2/map_view",
+                "format": "sensor/mapping",
+                "ros_type": "std_msgs/msg/UInt8MultiArray",
+                "qos": "BEST_EFFORT + KEEP_LAST(depth=5) + VOLATILE",
+                "schema": "phanthy.navigation.map_view.v1",
+                "rate_hz": 1,
+                "frame_id": "map",
+                "axes": "ROS REP-103 right-handed: x forward, y left",
+                "units": "x/y=m, yaw=rad, occupancy=percent",
+                "default_preview": True,
+                "desc": (
+                    "Default read-only Canvas preview containing occupied cells "
+                    "and the current robot pose; it cannot issue navigation commands"
+                ),
+            },
         ],
         "inputSchema": {
             "type": "object",

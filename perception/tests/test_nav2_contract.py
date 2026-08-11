@@ -35,11 +35,23 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertIn("BEST_EFFORT", inputs["lidar_cloud"]["qos"])
         self.assertFalse(inputs["goal_pose"]["required"])
 
-        self.assertEqual(len(tool["topic_out"]), 1)
-        output = tool["topic_out"][0]
-        self.assertEqual(output["port"], "velocity_proposal")
-        self.assertEqual(output["schema"], "phanthy.navigation.velocity_proposal.v1")
-        self.assertEqual(output["max_age_ms"], 250)
+        outputs = {item["port"]: item for item in tool["topic_out"]}
+        self.assertEqual(set(outputs), {"velocity_proposal", "map_view"})
+        self.assertEqual(tool["topic_out"][0]["port"], "velocity_proposal")
+        self.assertEqual(tool["topic_out"][1]["port"], "map_view")
+        proposal = outputs["velocity_proposal"]
+        self.assertEqual(proposal["schema"], "phanthy.navigation.velocity_proposal.v1")
+        self.assertEqual(proposal["max_age_ms"], 250)
+        map_view = outputs["map_view"]
+        self.assertEqual(map_view["topic"], "/ubuntu/navigation/nav2/map_view")
+        self.assertEqual(map_view["format"], "sensor/mapping")
+        self.assertEqual(map_view["ros_type"], "std_msgs/msg/UInt8MultiArray")
+        self.assertTrue(map_view["default_preview"])
+
+        canvas = (
+            PERCEPTION_ROOT.parent / "agent-core" / "web" / "js" / "canvas.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("t.default_preview === true", canvas)
 
     def test_config_and_speed_bounds_are_fail_closed(self) -> None:
         tool = nav2_tool_definition("ubuntu")

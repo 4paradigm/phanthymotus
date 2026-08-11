@@ -2,8 +2,9 @@
 
 `nav2` 是单实例 `processor` 卡片，负责把机器人状态、LiDAR 点云和导航目标交给
 ROS 2 Humble Nav2 运行时，提供建图、地图管理、位置标签和点到点导航能力。
-卡片只发布带时效和任务标识的速度提案，不直接调用机器人 SDK，也不直接取得
-物理控制权；最终执行、限幅、急停和停车确认由下游 Driver actuator 负责。
+卡片的控制输出只有带时效和任务标识的速度提案，另发布一条只读地图监控流；
+它不直接调用机器人 SDK，也不直接取得物理控制权。最终执行、限幅、急停和
+停车确认由下游 Driver actuator 负责。
 
 ## 规格总览
 
@@ -14,7 +15,7 @@ ROS 2 Humble Nav2 运行时，提供建图、地图管理、位置标签和点�
 | card type | `processor` |
 | 感知目标 | 消费机器人状态和 LiDAR 点云，完成建图、保存地图、定位、位置标签、全局/局部规划和导航状态管理；输出结构化速度提案 |
 | input topic | 必需：`loco_state`、`lidar_cloud`；可选：`goal_pose`。首版只接受 G1 Driver 的 `/ubuntu/...` 精确绑定 |
-| output topic | 只向 Canvas 暴露 `velocity_proposal`；Nav2 内部 `odom/scan/map/plan/status` topic 仅供运行和调试 |
+| output topic | `velocity_proposal` 连接 Driver；`map_view` 仅供 Canvas 只读可视化；Nav2 内部 `odom/scan/map/plan/status` topic 仅供运行和调试 |
 | actions | 生命周期：`info/config/start/stop`；业务：14 个建图、地图、标签和导航 action |
 | 配置 | robot namespace、地图持久化目录、输入新鲜度、速度上限、提案 TTL 和控制面超时；非法配置 fail closed |
 | 模型/算法 | 无训练模型；基线为 ROS 2 Humble Nav2、SLAM Toolbox、AMCL、NavFn、DWB 和 velocity smoother |
@@ -25,9 +26,8 @@ ROS 2 Humble Nav2 运行时，提供建图、地图管理、位置标签和点�
 
 ```text
 Driver.loco_state ──┐
-                     ├──> Nav2 ── velocity_proposal.v1 ──> Driver.loco ──> Robot
-Driver.lidar_cloud ─┘
-goal_pose.v1（可选）─┘
+Driver.lidar_cloud ─┼──> Nav2 ──┬──> velocity_proposal.v1 ──> Driver.loco ──> Robot
+goal_pose.v1（可选）─┘           └──> map_view.v1 ──> Canvas 只读地图监控
 ```
 
 导航卡片与 Driver 的职责边界：
@@ -79,6 +79,7 @@ BEST_EFFORT 发布端。
 | port | 推导规则 | ROS 2 type / format | QoS | 数据合同 |
 | --- | --- | --- | --- | --- |
 | `velocity_proposal` | `/<namespace>/navigation/nav2/velocity_proposal` | `std_msgs/msg/String` / `data/json` | `RELIABLE + KEEP_LAST(depth=10) + VOLATILE` | `phanthy.navigation.velocity_proposal.v1`，目标频率 20 Hz，`base_link` frame，TTL 不超过 250 ms |
+| `map_view` | `/<namespace>/navigation/nav2/map_view` | `std_msgs/msg/UInt8MultiArray` / `sensor/mapping` | `BEST_EFFORT + KEEP_LAST(depth=5) + VOLATILE` | 默认数据流预览；`phanthy.navigation.map_view.v1`，1 Hz 全量快照，包含占用栅格中心点和当前机器人 `map` 位姿 |
 
 提案至少包含 `nav_id`、单调递增 `sequence`、`issued_at_unix_ms`、`ttl_ms`、
 `frame=base_link`、`nav_status` 和 `velocity{x,y,yaw}`。终态必须发布零速提案。
@@ -172,7 +173,29 @@ map -> odom -> base_link -> lidar_frame
 零外参或视图层坐标变换代替真实 TF。依赖版本、镜像 digest 和许可证必须在实现
 阶段写入 source lock/第三方清单，不能依赖浮动 latest。
 
-## RViz 地图与导航可视化
+## Canvas 地图监控
+
+Nav2 companion 将 `/map` 中占用率不低于 65% 的栅格转换为
+Canvas 已支持的 `sensor/mapping` 全量快照，并通过
+`map -> base_link` TF 加入当前机器人位置和朝向。该输出仅包含地图
+监控数据，不包含 action、service 或速度指令。
+
+在 Canvas 中将 Nav2 卡片加入当前工程并启动后：
+
+1. 点击 Nav2 卡片的「查看数据流」，会直接打开 `map_view`；也可进入
+   Canvas 「监控」页查看 `/ubuntu/navigation/nav2/map_view`。
+2. mapping runtime 中地图随 SLAM 更新；localization runtime 中显示已加载地图。
+3. 绿色机器人标记表示当前位置和朝向，可在视图中旋转、缩放或
+   切换跟随机器人。
+
+卡片右侧的 `mapping` 端口只用于地图监控；连接 Driver `loco` 时必须使用
+标记为 `json` 的 `velocity_proposal` 端口，不能把 `map_view` 接入执行器。
+
+当 `/map` 未准备好、map frame 不匹配或 `map -> base_link` TF 不可用时，
+companion 不发布伪造位姿，Canvas 保持等待数据。单帧最多 80,000 个
+占用点，更大地图会均匀降采样，不改变 Nav2 实际规划使用的地图。
+
+## RViz 地图与导航可视化（开发备用）
 
 companion 包内置 [nav2.rviz](companion/g1_nav2/rviz/nav2.rviz)，固定以 `map`
 为坐标系，显示已保存/实时地图、全局路径、局部 costmap、LaserScan、
@@ -206,7 +229,8 @@ rviz2 -d "$(ros2 pkg prefix --share g1_nav2)/rviz/nav2.rviz"
 主视图中 `/map` 只在 mapping runtime 正在建图，或 localization runtime
 已成功加载地图时有数据。`Global Costmap` 默认关闭以避免遮住原图，
 需要排查全局避障时可在 Displays 面板手动打开。本配置不要求 G1 安装
-RViz，也不会从可视化机器上发送运动命令。
+RViz，也不会从可视化机器上发送运动命令。日常验收优先使用上述
+Canvas 地图监控；RViz 仅用于需要同时排查 path、costmap 和 TF 的开发场景。
 
 ## 部署
 

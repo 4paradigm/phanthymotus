@@ -32,6 +32,7 @@ def generate_launch_description() -> LaunchDescription:
     cmd_vel_raw_topic = LaunchConfiguration("cmd_vel_raw_topic")
     cmd_vel_shadow_topic = LaunchConfiguration("cmd_vel_shadow_topic")
     velocity_proposal_topic = LaunchConfiguration("velocity_proposal_topic")
+    map_view_topic = LaunchConfiguration("map_view_topic")
     command_topic = LaunchConfiguration("command_topic")
     status_topic = LaunchConfiguration("status_topic")
 
@@ -113,6 +114,23 @@ def generate_launch_description() -> LaunchDescription:
                     "use_inf": True,
                     "inf_epsilon": 1.0,
                     "queue_size": 10,
+                }
+            ],
+        ),
+        Node(
+            package="g1_nav2",
+            executable="canvas_map_view",
+            name="g1_nav2_canvas_map_view",
+            output="screen",
+            parameters=[
+                {
+                    "map_topic": "/map",
+                    "output_topic": map_view_topic,
+                    "map_frame": "map",
+                    "base_frame": "base_link",
+                    "occupancy_threshold": 65,
+                    "max_points": 80000,
+                    "publish_rate_hz": 1.0,
                 }
             ],
         ),
@@ -255,6 +273,10 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "velocity_proposal_topic",
                 default_value="/ubuntu/navigation/nav2/velocity_proposal",
+            ),
+            DeclareLaunchArgument(
+                "map_view_topic",
+                default_value="/ubuntu/navigation/nav2/map_view",
             ),
             DeclareLaunchArgument(
                 "command_topic",

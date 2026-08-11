@@ -39,6 +39,7 @@ setup(
     entry_points={
         "console_scripts": [
             "canvas_pointcloud_bridge = g1_nav2.canvas_pointcloud_node:main",
+            "canvas_map_view = g1_nav2.map_view_node:main",
             "loco_odom_bridge = g1_nav2.loco_odom_node:main",
             "navigation_command_bridge = g1_nav2.navigation_command_node:main",
             "runtime_supervisor = g1_nav2.runtime_supervisor:main",

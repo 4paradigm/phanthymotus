@@ -27,6 +27,11 @@ from g1_nav2.execution_protocol import (  # noqa: E402
     build_velocity_proposal,
 )
 from g1_nav2.loco_odom_core import OriginNormalizer  # noqa: E402
+from g1_nav2.map_view_core import (  # noqa: E402
+    InvalidMapView,
+    build_occupancy_snapshot,
+    encode_canvas_mapping_frame,
+)
 from g1_nav2.map_store import MapStore, MapStoreError  # noqa: E402
 from g1_nav2.readiness import (  # noqa: E402
     evaluate_readiness,
@@ -36,6 +41,68 @@ from g1_nav2.runtime_process import build_launch_command  # noqa: E402
 
 
 class Nav2CompanionCoreTest(unittest.TestCase):
+    def test_canvas_map_view_encodes_occupied_cells_and_robot_pose(self) -> None:
+        snapshot = build_occupancy_snapshot(
+            width=3,
+            height=2,
+            resolution=0.5,
+            origin_x=1.0,
+            origin_y=-1.0,
+            origin_yaw=0.0,
+            data=[0, 65, -1, 100, 10, 90],
+            occupancy_threshold=65,
+            max_points=2,
+        )
+        self.assertEqual(snapshot.occupied_cell_count, 3)
+        self.assertEqual(snapshot.point_count, 2)
+
+        payload = encode_canvas_mapping_frame(
+            snapshot,
+            robot_x=1.25,
+            robot_y=-0.75,
+            robot_yaw=0.5,
+        )
+        robot_x, robot_y, robot_yaw, flags, point_count = struct.unpack_from(
+            "<fffBI", payload, 0
+        )
+        self.assertAlmostEqual(robot_x, 1.25)
+        self.assertAlmostEqual(robot_y, -0.75)
+        self.assertAlmostEqual(robot_yaw, 0.5)
+        self.assertEqual(flags, 0x03)
+        self.assertEqual(point_count, 2)
+        first_point = struct.unpack_from("<fff", payload, 17)
+        self.assertEqual(first_point, (1.75, -0.75, 0.0))
+
+        with self.assertRaises(InvalidMapView):
+            build_occupancy_snapshot(
+                width=2,
+                height=2,
+                resolution=0.5,
+                origin_x=0.0,
+                origin_y=0.0,
+                origin_yaw=0.0,
+                data=[0, 100],
+            )
+
+    def test_canvas_map_view_is_installed_and_launched(self) -> None:
+        setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
+        launch = (
+            PACKAGE_ROOT / "launch" / "g1_nav2.launch.py"
+        ).read_text(encoding="utf-8")
+        node = (PACKAGE_ROOT / "g1_nav2" / "map_view_node.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("canvas_map_view = g1_nav2.map_view_node:main", setup)
+        self.assertIn('executable="canvas_map_view"', launch)
+        self.assertIn(
+            'default_value="/ubuntu/navigation/nav2/map_view"', launch
+        )
+        invalid_map_handler = node.split(
+            "def _report_invalid_map", 1
+        )[1].split("def _publish_view", 1)[0]
+        self.assertIn("self._snapshot = None", invalid_map_handler)
+
     def test_velocity_proposal_contract_and_terminal_zero(self) -> None:
         payload = build_velocity_proposal(
             nav_id="nav-001",
