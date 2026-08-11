@@ -101,6 +101,11 @@ MCP tools，不订阅 ROS topic，也不持有运行时资源。后续能力实�
 `plugins/semantic_navigation/` 内扩展，无需再手工修改容器内的
 `main.py` 或 `config.yaml`。
 
+张逸群提供的 `vln` 最小插件也已显式接入 `PerceptionBundle`。默认启用并在
+`namespace` 为空时按 hostname 自动生成命名空间；当前同样不暴露 MCP tools、
+不订阅 ROS topic，也不持有运行时资源。后续视觉语言导航能力直接在
+`plugins/vln/` 内扩展。
+
 ---
 
 ## Nav2 卡片
@@ -118,11 +123,13 @@ SLAM Toolbox、AMCL 或 Map Server。
   两者使用 ROS system time；
 - 输入超过 `500 ms`、frame 错误、`map -> base_link` TF 或 Nav2 lifecycle
   不 ready 时 fail closed；
-- `speed` 范围 `0.10–0.15 m/s`，禁止横移，Rotation Shim 先对齐航向；
+- `speed` 范围 `0.10–1.00 m/s`，禁止横移，Rotation Shim 先对齐航向；
 - `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；请求速度
   在每条 `velocity_proposal` 上强制限制正向速度，Nav2 `SpeedLimit` 只作为控制器
   advisory，不再把 DDS transport ack 误判为控制器已应用速度；
-- 地图/轨迹数据流从 FAST-LIVO2 卡片查看；Nav2 不再发布 `map_view`；
+- FAST-LIVO2 卡片的 odom 以 `sensor/odometry` 显示实时位姿与速度；
+  Nav2 卡片直接显示原生 `/plan` 全局路径，地图仍以 FAST-LIVO2
+  `map_view` 为唯一权威源；
 - 当前官方 Agent Core 尚缺 `x-execution-control` / `x-topic-actions` 消费能力，
   因而 `goal_pose` topic 和 Driver 物理 lease 仍是明确的外部依赖。
 

@@ -293,6 +293,18 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "actuator; never a physical command by itself"
                 ),
             },
+            {
+                "port": "plan",
+                "topic": "/plan",
+                "format": "sensor/path",
+                "ros_type": "nav_msgs/msg/Path",
+                "qos": "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
+                "schema": "phanthy.navigation.path.v1",
+                "frame_id": "map",
+                "axes": "ROS REP-103 right-handed: x forward, y left",
+                "units": "x/y/z=m; yaw=rad",
+                "desc": "Current Nav2 global plan rendered as a 2D path in Canvas",
+            },
         ],
         "inputSchema": {
             "type": "object",

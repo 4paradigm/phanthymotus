@@ -6,7 +6,7 @@ ARG PYPI_MIRROR
 # Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault)
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip python3-dbus ffmpeg curl && \
+        python3-pip python3-dbus ffmpeg curl ros-humble-nav-msgs && \
     curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/aarch64/docker-27.5.1.tgz \
         | tar -xz --strip-components=1 -C /usr/local/bin/ docker/docker && \
     mkdir -p /usr/local/lib/docker/cli-plugins && \
@@ -24,7 +24,7 @@ COPY pyproject.toml /work/
 ENV UV_INDEX_URL=${PYPI_MIRROR}
 RUN uv lock && uv sync --no-dev --no-install-project
 
-# Link system ROS2 packages into venv so sensor_msgs/rclpy are importable
+# Link system ROS2 packages into venv so sensor_msgs/nav_msgs/rclpy are importable
 RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/opt/ros/humble/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \

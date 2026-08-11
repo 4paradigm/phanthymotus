@@ -122,6 +122,20 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("SemanticNavigationPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("vln", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["vln"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.vln import VisionLanguageNavigationPlugin
+            plugin = VisionLanguageNavigationPlugin(
+                plugins_cfg["vln"], namespace, executor
+            )
+            self._plugins.append(plugin)
+            log.info(
+                "VisionLanguageNavigationPlugin loaded (namespace=%s)", namespace
+            )
+
         if plugins_cfg.get("fast_livo2", {}).get("enabled", False):
             from plugins.fast_livo2 import FastLivo2Plugin
             self._plugins.append(FastLivo2Plugin(plugins_cfg["fast_livo2"], executor))

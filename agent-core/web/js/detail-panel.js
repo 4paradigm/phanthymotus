@@ -15,9 +15,10 @@ import { LidarRenderer }    from './renderers/lidar.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { CameraRenderer, DepthRenderer } from './renderers/camera.js';
 import { HTMSGRenderer }    from './renderers/htmsg.js';
+import { OdometryRenderer, PathRenderer } from './renderers/navigation.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, OdometryRenderer, PathRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 
 let _panel    = null;
 let _renderer = null;
