@@ -20,3 +20,16 @@ envelope，同时完整记录 status/proposal。向
 样本。为了在导航终态前精确触发 freshness 门限，也可向 fixture
 容器发送 `SIGUSR1` 停止输入、`SIGUSR2` 恢复输入。这只是阶段六的
 确定性合同测试，不代替 G1 真实录包和真机物理执行验收。
+
+默认 `NAV2_FIXTURE_SENSOR_SCHEMA=legacy` 保留发布版回归。验证 Driver
+v2 同时钟合同时使用：
+
+```bash
+NAV2_FIXTURE_SENSOR_SCHEMA=v2 \
+NAV2_IMAGE=phanthy-nav2:nav2-card-stage6-amd64 \
+  docker compose -f compose.stage6.yml --profile fixture run --rm fixture
+```
+
+v2 fixture 使用同一 ROS system clock 时间生成 `loco_state.v2` 和
+`PCV2 flags=0x0001` MID360 XYZIRT 帧，用于验证字段恢复、freshness
+以及 odom/scan 源时间差门禁。

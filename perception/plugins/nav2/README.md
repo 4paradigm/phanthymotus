@@ -45,13 +45,71 @@ topic 名以 Canvas 的端口绑定为准。首版 companion 与现有 G1 Driver
 
 | port | 当前 G1 示例 | ROS 2 type / format | QoS | 数据合同 |
 | --- | --- | --- | --- | --- |
-| `loco_state` | `/ubuntu/loco/state` | `std_msgs/msg/String` / `data/json` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 当前兼容 `unitree.g1.loco_state.legacy`，后续兼容带源时间戳和 frame 的 `phanthy.g1.loco_state.v2`；期望 10 Hz，最大 age 500 ms |
-| `lidar_cloud` | `/ubuntu/lidar/cloud` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 当前兼容 MID360 legacy envelope，后续兼容 `phanthy.sensor.pointcloud.v2`；期望 10 Hz，最大 age 500 ms |
+| `loco_state` | `/ubuntu/loco/state` | `std_msgs/msg/String` / `data/json` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 `unitree.g1.loco_state.legacy` 和带源时间戳/frame 的 `phanthy.g1.loco_state.v2`；期望 10 Hz，最大 age 500 ms |
+| `lidar_cloud` | `/ubuntu/lidar/cloud` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 MID360 legacy envelope 和 `phanthy.sensor.pointcloud.v2`；期望 10 Hz，最大 age 500 ms |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String` / `data/json` | `RELIABLE + KEEP_LAST(depth=10) + VOLATILE` | `phanthy.navigation.goal.v1`；`map` frame；每条消息必须有唯一 `goal_id` |
 
 legacy payload 没有源时间戳或 frame 时，adapter 必须明确标记接收时间和配置来源，
 不得把接收时间伪装成设备源时间。LiDAR 使用 sensor-data QoS，以兼容现有
 BEST_EFFORT 发布端。
+
+### Driver v2 时间和点云合同
+
+`loco_state.v2` 可用 `schema="phanthy.g1.loco_state.v2"` 或
+`schema_version=2` 识别；两者同时出现时必须一致。最小 JSON 如下：
+
+```json
+{
+  "schema": "phanthy.g1.loco_state.v2",
+  "schema_version": 2,
+  "source_stamp_ns": 1786444832836579000,
+  "frame_id": "odom_source",
+  "position": [0.0, 0.0, 0.0],
+  "velocity": [0.0, 0.0, 0.0],
+  "imu": {"rpy": [0.0, 0.0, 0.0]},
+  "yaw_speed": 0.0
+}
+```
+
+`phanthy.sensor.pointcloud.v2` 仍用 `UInt8MultiArray`，字节序为
+little-endian：
+
+```text
+<4sHHIIqH
+magic="PCV2", version=2, flags, point_step, point_count,
+source_stamp_ns, frame_id_length
+frame_id UTF-8 bytes
+point_count * point_step raw point bytes
+```
+
+`flags=0x0000` 只声明 `x/y/z float32 @ 0/4/8`，保留已有 v2
+兼容路径。G1 MID360 完整布局必须设置
+`flags=0x0001`，且 `point_step=22`：
+
+| field | offset | datatype | unit/reference |
+| --- | ---: | --- | --- |
+| `x` | 0 | `FLOAT32` | m |
+| `y` | 4 | `FLOAT32` | m |
+| `z` | 8 | `FLOAT32` | m |
+| `intensity` | 12 | `FLOAT32` | Driver 原值 |
+| `ring` | 16 | `UINT16` | 通道号 |
+| `time` | 18 | `FLOAT32` | 相对 `source_stamp_ns` 的 ns |
+
+未知 flag 或 flag/`point_step` 不匹配会 fail closed。两路 v2 的
+`source_stamp_ns` 都必须是 Driver 已归一化到 ROS system/Unix epoch
+的纳秒，不能直接透传设备 epoch；LiDAR stamp 表示一帧扫描的
+开始时间。Perception 在发布 odom/TF/cloud 前要求源时间落在
+`[-100 ms, +500 ms]` 接收年龄窗口内，且 v2 odom 与 scan 的
+最新源时间差不超过 `200 ms`。陈旧、过度超前、倒退或 v2
+跨流错位均会阻断导航。legacy 两路只有独立的 adapter 接收时间，
+因此继续分别执行 freshness 检查，不伪装成跨流源时间同步。
+部署时先升级 Perception，再让 Driver 发送 `flags=0x0001`；旧版
+Perception 会按 fail-closed 原则拒绝该新布局。
+
+这个合同会保留 MID360 逐点 `time` metadata，但现有
+`pointcloud_to_laserscan -> SLAM Toolbox` 不会自动消费它做逐点
+deskew。本轮只修正整帧时间、TF 对齐和字段传递，不把地图去畸变
+宣称为已完成。
 
 `goal_pose` JSON 最小结构：
 

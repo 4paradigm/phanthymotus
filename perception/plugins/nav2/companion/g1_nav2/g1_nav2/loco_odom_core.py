@@ -7,6 +7,13 @@ import json
 import math
 from typing import Any
 
+from .timestamp_contract import (
+    DEFAULT_MAX_FUTURE_SKEW_NS,
+    DEFAULT_MAX_SOURCE_AGE_NS,
+    InvalidSourceTimestamp,
+    validate_source_timestamp_ns,
+)
+
 
 class InvalidLocoState(ValueError):
     """Raised when a native G1 locomotion state cannot form odometry."""
@@ -57,15 +64,42 @@ def decode_state(payload: str | dict[str, Any]) -> dict[str, Any]:
 
 
 def _timestamp_and_frame(
-    state: dict[str, Any], receive_stamp_ns: int | None
+    state: dict[str, Any],
+    receive_stamp_ns: int | None,
+    *,
+    max_source_age_ns: int,
+    max_future_skew_ns: int,
 ) -> tuple[int, str, str, str, str]:
     schema_version = state.get("schema_version")
-    if schema_version == 2:
+    schema = state.get("schema")
+    if schema_version is not None and (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 2
+    ):
+        raise InvalidLocoState(f"unsupported schema_version: {schema_version!r}")
+    if schema not in (
+        None,
+        "unitree.g1.loco_state.legacy",
+        "phanthy.g1.loco_state.v2",
+    ):
+        raise InvalidLocoState(f"unsupported schema: {schema!r}")
+    if schema_version == 2 and schema == "unitree.g1.loco_state.legacy":
+        raise InvalidLocoState("schema conflicts with schema_version=2")
+    is_v2 = schema_version == 2 or schema == "phanthy.g1.loco_state.v2"
+    if is_v2:
         source_stamp_ns = state.get("source_stamp_ns")
         if isinstance(source_stamp_ns, bool) or not isinstance(source_stamp_ns, int):
             raise InvalidLocoState("source_stamp_ns must be an integer")
-        if source_stamp_ns <= 0:
-            raise InvalidLocoState("source_stamp_ns must be positive")
+        try:
+            validate_source_timestamp_ns(
+                source_stamp_ns,
+                receive_stamp_ns,
+                max_source_age_ns=max_source_age_ns,
+                max_future_skew_ns=max_future_skew_ns,
+            )
+        except InvalidSourceTimestamp as exc:
+            raise InvalidLocoState(str(exc)) from exc
         source_frame = state.get("frame_id")
         if source_frame != "odom_source":
             raise InvalidLocoState("frame_id must be 'odom_source'")
@@ -77,8 +111,6 @@ def _timestamp_and_frame(
             "phanthy.g1.loco_state.v2",
         )
 
-    if schema_version is not None:
-        raise InvalidLocoState(f"unsupported schema_version: {schema_version!r}")
     if isinstance(receive_stamp_ns, bool) or not isinstance(receive_stamp_ns, int):
         raise InvalidLocoState(
             "legacy loco_state requires an adapter receive timestamp"
@@ -97,12 +129,24 @@ def _timestamp_and_frame(
 class OriginNormalizer:
     """Normalizes the native boot-relative pose to a card-local odom origin."""
 
-    def __init__(self, reset_origin: bool = True, velocity_frame: str = "body"):
+    def __init__(
+        self,
+        reset_origin: bool = True,
+        velocity_frame: str = "body",
+        *,
+        max_source_age_ns: int = DEFAULT_MAX_SOURCE_AGE_NS,
+        max_future_skew_ns: int = DEFAULT_MAX_FUTURE_SKEW_NS,
+    ):
         if velocity_frame not in {"body", "odom"}:
             raise ValueError("velocity_frame must be 'body' or 'odom'")
+        if max_source_age_ns <= 0 or max_future_skew_ns < 0:
+            raise ValueError("invalid source timestamp tolerances")
         self.reset_origin = reset_origin
         self.velocity_frame = velocity_frame
+        self.max_source_age_ns = max_source_age_ns
+        self.max_future_skew_ns = max_future_skew_ns
         self._origin: tuple[float, float, float] | None = None
+        self._last_driver_source_stamp_ns: int | None = None
 
     @property
     def initialized(self) -> bool:
@@ -110,6 +154,7 @@ class OriginNormalizer:
 
     def reset(self) -> None:
         self._origin = None
+        self._last_driver_source_stamp_ns = None
 
     def convert(
         self,
@@ -124,7 +169,18 @@ class OriginNormalizer:
             timestamp_source,
             frame_source,
             source_schema,
-        ) = _timestamp_and_frame(state, receive_stamp_ns)
+        ) = _timestamp_and_frame(
+            state,
+            receive_stamp_ns,
+            max_source_age_ns=self.max_source_age_ns,
+            max_future_skew_ns=self.max_future_skew_ns,
+        )
+        if (
+            timestamp_source == "driver"
+            and self._last_driver_source_stamp_ns is not None
+            and source_stamp_ns < self._last_driver_source_stamp_ns
+        ):
+            raise InvalidLocoState("source_stamp_ns moved backwards")
         stamp = source_stamp_ns / 1_000_000_000.0
         position = _finite_vector(state.get("position"), 2, "position")
         velocity = _finite_vector(state.get("velocity"), 2, "velocity")
@@ -163,7 +219,7 @@ class OriginNormalizer:
                 -sin_yaw * velocity[0] + cos_yaw * velocity[1],
             )
 
-        return PlanarOdometry(
+        odometry = PlanarOdometry(
             stamp=stamp,
             source_stamp_ns=source_stamp_ns,
             source_frame=source_frame,
@@ -177,3 +233,6 @@ class OriginNormalizer:
             vy=vy,
             wz=yaw_speed,
         )
+        if timestamp_source == "driver":
+            self._last_driver_source_stamp_ns = source_stamp_ns
+        return odometry

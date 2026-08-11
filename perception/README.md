@@ -105,6 +105,8 @@ ASR result JSON:
 
 - `speed` 范围 `0.05–0.15 m/s`，首版导航固定允许绕障，不显示无可选值的 `mode`；
 - 输入超过 `500 ms`、TF/地图/Nav2 lifecycle 不 ready 时 fail closed；
+- Driver v2 输入必须使用 ROS system/Unix 同一时钟域；Perception 会在发布
+  odom/TF/cloud 前拒绝陈旧、超前、倒退或 odom/scan 错位的时间戳；
 - `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；
 - 地图宿主机目录为 `/opt/phanthy-motus/data/nav2/maps`，companion 容器内为 `/maps`；
 - `start_mapping` 自动切换 mapping，`stop_mapping` 原子保存后自动切回 localization；

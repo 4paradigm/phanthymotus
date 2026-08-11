@@ -112,6 +112,7 @@ class NavigationCommandNode(Node):
         )
         self.declare_parameter("scan_topic", "/ubuntu/navigation/nav2/scan")
         self.declare_parameter("sensor_max_age_sec", 0.5)
+        self.declare_parameter("sensor_max_stamp_skew_sec", 0.2)
         self.declare_parameter(
             "required_lifecycle_nodes",
             ["controller_server", "velocity_smoother", "planner_server", "bt_navigator"],
@@ -180,6 +181,9 @@ class NavigationCommandNode(Node):
         self._sensor_max_age_sec = float(
             self.get_parameter("sensor_max_age_sec").value
         )
+        self._sensor_max_stamp_skew_sec = float(
+            self.get_parameter("sensor_max_stamp_skew_sec").value
+        )
         self._required_lifecycle_nodes = [
             str(item).strip("/")
             for item in self.get_parameter("required_lifecycle_nodes").value
@@ -204,6 +208,11 @@ class NavigationCommandNode(Node):
             raise ValueError("service and pose lookup timeouts must be positive")
         if self._sensor_max_age_sec <= 0:
             raise ValueError("sensor_max_age_sec must be positive")
+        if not 0.0 < self._sensor_max_stamp_skew_sec <= self._sensor_max_age_sec:
+            raise ValueError(
+                "sensor_max_stamp_skew_sec must be positive and no greater "
+                "than sensor_max_age_sec"
+            )
         if not self._required_lifecycle_nodes or any(
             not item for item in self._required_lifecycle_nodes
         ):
@@ -325,6 +334,7 @@ class NavigationCommandNode(Node):
         self._last_odom_status_monotonic: float | None = None
         self._last_scan_monotonic: float | None = None
         self._last_scan_source_age_sec: float | None = None
+        self._last_scan_source_stamp_ns: int | None = None
         self._lifecycle_states = {
             name: 0 for name in self._required_lifecycle_nodes
         }
@@ -363,6 +373,7 @@ class NavigationCommandNode(Node):
         with self._lock:
             self._last_scan_monotonic = time.monotonic()
             self._last_scan_source_age_sec = source_age
+            self._last_scan_source_stamp_ns = stamp_ns if stamp_ns > 0 else None
 
     def _refresh_lifecycle_states(self) -> None:
         for name, client in self._lifecycle_clients.items():
@@ -389,8 +400,20 @@ class NavigationCommandNode(Node):
             odom_received_at = self._last_odom_status_monotonic
             scan_received_at = self._last_scan_monotonic
             scan_source_age = self._last_scan_source_age_sec
+            scan_source_stamp_ns = self._last_scan_source_stamp_ns
             lifecycle_states = dict(self._lifecycle_states)
             map_ready = bool(self._mapping_session or self._active_map_name)
+        odom_source_stamp_ns = odom_status.get("source_stamp_ns")
+        sensor_stamp_skew = None
+        if (
+            isinstance(odom_source_stamp_ns, int)
+            and not isinstance(odom_source_stamp_ns, bool)
+            and odom_source_stamp_ns > 0
+            and scan_source_stamp_ns is not None
+        ):
+            sensor_stamp_skew = abs(
+                odom_source_stamp_ns - scan_source_stamp_ns
+            ) / 1_000_000_000.0
         map_to_base_ready = self._tf_buffer.can_transform(
             "map", "base_link", Time(), timeout=Duration(seconds=0.0)
         )
@@ -401,6 +424,8 @@ class NavigationCommandNode(Node):
             odom_status_received_at=odom_received_at,
             scan_received_at=scan_received_at,
             scan_source_age_sec=scan_source_age,
+            sensor_stamp_skew_sec=sensor_stamp_skew,
+            max_sensor_stamp_skew_sec=self._sensor_max_stamp_skew_sec,
             lifecycle_states=lifecycle_states,
             action_server_ready=self._action_client.server_is_ready(),
             map_ready=map_ready,

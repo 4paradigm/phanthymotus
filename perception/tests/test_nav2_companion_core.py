@@ -19,6 +19,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 from g1_nav2.canvas_pointcloud_core import (  # noqa: E402
     InvalidCanvasPointCloud,
+    PCV2_FLAG_MID360_XYZIRT,
     decode_canvas_pointcloud,
 )
 from g1_nav2.execution_protocol import (  # noqa: E402
@@ -27,7 +28,10 @@ from g1_nav2.execution_protocol import (  # noqa: E402
     VelocityProposal,
     build_velocity_proposal,
 )
-from g1_nav2.loco_odom_core import OriginNormalizer  # noqa: E402
+from g1_nav2.loco_odom_core import (  # noqa: E402
+    InvalidLocoState,
+    OriginNormalizer,
+)
 from g1_nav2.map_view_core import (  # noqa: E402
     InvalidMapView,
     build_occupancy_snapshot,
@@ -42,6 +46,31 @@ from g1_nav2.runtime_process import build_launch_command  # noqa: E402
 
 
 class Nav2CompanionCoreTest(unittest.TestCase):
+    @staticmethod
+    def _v2_cloud(
+        *,
+        source_stamp_ns: int,
+        flags: int = 0,
+        point_step: int = 12,
+        point_data: bytes | None = None,
+    ) -> bytes:
+        frame = b"livox_frame"
+        data = point_data if point_data is not None else b"\0" * point_step
+        return (
+            struct.pack(
+                "<4sHHIIqH",
+                b"PCV2",
+                2,
+                flags,
+                point_step,
+                1,
+                source_stamp_ns,
+                len(frame),
+            )
+            + frame
+            + data
+        )
+
     def test_canvas_map_view_encodes_occupied_cells_and_robot_pose(self) -> None:
         snapshot = build_occupancy_snapshot(
             width=3,
@@ -238,14 +267,130 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertAlmostEqual(first.y, 0.0)
         self.assertEqual(first.timestamp_source, "adapter_receive")
 
+    def test_v2_sensor_contract_preserves_time_frame_and_mid360_fields(self) -> None:
+        source_stamp_ns = 1_000_000_000
+        point = struct.pack("<ffffHf", 1.0, 2.0, 3.0, 42.0, 7, 50_000_000.0)
+        cloud = decode_canvas_pointcloud(
+            self._v2_cloud(
+                source_stamp_ns=source_stamp_ns,
+                flags=PCV2_FLAG_MID360_XYZIRT,
+                point_step=22,
+                point_data=point,
+            ),
+            receive_stamp_ns=1_100_000_000,
+        )
+        self.assertEqual(cloud.source_stamp_ns, source_stamp_ns)
+        self.assertEqual(cloud.timestamp_source, "driver")
+        self.assertEqual(cloud.frame_id, "livox_frame")
+        self.assertEqual(
+            [(field.name, field.offset, field.datatype) for field in cloud.fields],
+            [
+                ("x", 0, 7),
+                ("y", 4, 7),
+                ("z", 8, 7),
+                ("intensity", 12, 7),
+                ("ring", 16, 4),
+                ("time", 18, 7),
+            ],
+        )
+        self.assertEqual(cloud.data, point)
+
+        normalizer = OriginNormalizer()
+        odom = normalizer.convert(
+            {
+                "schema": "phanthy.g1.loco_state.v2",
+                "source_stamp_ns": source_stamp_ns,
+                "frame_id": "odom_source",
+                "position": [2.0, 3.0],
+                "velocity": [0.1, 0.0],
+                "imu": {"rpy": [0.0, 0.0, 0.2]},
+                "yaw_speed": 0.1,
+            },
+            receive_stamp_ns=1_100_000_000,
+        )
+        self.assertEqual(odom.timestamp_source, "driver")
+        self.assertEqual(odom.source_stamp_ns, source_stamp_ns)
+
+    def test_v2_sensor_contract_rejects_bad_clock_layout_and_schema(self) -> None:
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "stale"):
+            decode_canvas_pointcloud(
+                self._v2_cloud(source_stamp_ns=1_000_000_000),
+                receive_stamp_ns=1_600_000_001,
+            )
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "ahead"):
+            decode_canvas_pointcloud(
+                self._v2_cloud(source_stamp_ns=1_200_000_001),
+                receive_stamp_ns=1_100_000_000,
+            )
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "unsupported.*flags"):
+            decode_canvas_pointcloud(
+                self._v2_cloud(source_stamp_ns=1_000_000_000, flags=0x8000),
+                receive_stamp_ns=1_100_000_000,
+            )
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "point_step=22"):
+            decode_canvas_pointcloud(
+                self._v2_cloud(
+                    source_stamp_ns=1_000_000_000,
+                    flags=PCV2_FLAG_MID360_XYZIRT,
+                ),
+                receive_stamp_ns=1_100_000_000,
+            )
+
+        stale_normalizer = OriginNormalizer()
+        stale_state = {
+            "schema_version": 2,
+            "source_stamp_ns": 1_000_000_000,
+            "frame_id": "odom_source",
+            "position": [2.0, 3.0],
+            "velocity": [0.1, 0.0],
+            "imu": {"rpy": [0.0, 0.0, 0.2]},
+            "yaw_speed": 0.1,
+        }
+        with self.assertRaisesRegex(InvalidLocoState, "stale"):
+            stale_normalizer.convert(
+                stale_state,
+                receive_stamp_ns=1_600_000_001,
+            )
+        self.assertFalse(stale_normalizer.initialized)
+
+        conflict = dict(stale_state)
+        conflict["schema"] = "unitree.g1.loco_state.legacy"
+        with self.assertRaisesRegex(InvalidLocoState, "conflicts"):
+            OriginNormalizer().convert(
+                conflict,
+                receive_stamp_ns=1_100_000_000,
+            )
+
+    def test_v2_loco_state_rejects_source_time_regression(self) -> None:
+        normalizer = OriginNormalizer()
+        state = {
+            "schema": "phanthy.g1.loco_state.v2",
+            "source_stamp_ns": 1_000_000_000,
+            "frame_id": "odom_source",
+            "position": [2.0, 3.0],
+            "velocity": [0.1, 0.0],
+            "imu": {"rpy": [0.0, 0.0, 0.2]},
+            "yaw_speed": 0.1,
+        }
+        normalizer.convert(state, receive_stamp_ns=1_100_000_000)
+        state["source_stamp_ns"] = 900_000_000
+        with self.assertRaisesRegex(InvalidLocoState, "moved backwards"):
+            normalizer.convert(state, receive_stamp_ns=1_150_000_000)
+
     def test_readiness_is_fail_closed_for_stale_inputs(self) -> None:
         ready = evaluate_readiness(
             now_monotonic=10.0,
             max_age_sec=0.5,
-            odom_status={"state": "ready", "timestamp_source": "adapter_receive"},
+            odom_status={
+                "state": "ready",
+                "timestamp_source": "driver",
+                "source_age_sec": 0.2,
+            },
             odom_status_received_at=9.8,
             scan_received_at=9.8,
             scan_source_age_sec=0.2,
+            sensor_stamp_skew_sec=0.05,
+            max_sensor_stamp_skew_sec=0.2,
             lifecycle_states={"planner_server": 3, "bt_navigator": 3},
             action_server_ready=True,
             map_ready=True,
@@ -261,6 +406,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             odom_status_received_at=9.0,
             scan_received_at=None,
             scan_source_age_sec=None,
+            sensor_stamp_skew_sec=None,
+            max_sensor_stamp_skew_sec=0.2,
             lifecycle_states={"planner_server": 2},
             action_server_ready=False,
             map_ready=False,
@@ -274,6 +421,42 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIsNotNone(blocker)
         self.assertIn("odom_status_stale", blocker)
         self.assertIn("scan_stale", blocker)
+
+        legacy_async = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            odom_status={"state": "ready", "timestamp_source": "adapter_receive"},
+            odom_status_received_at=9.9,
+            scan_received_at=9.9,
+            scan_source_age_sec=0.1,
+            sensor_stamp_skew_sec=0.45,
+            max_sensor_stamp_skew_sec=0.2,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            map_ready=True,
+            map_to_base_ready=True,
+        )
+        self.assertNotIn("sensor_stamp_skew", legacy_async["readiness_blockers"])
+
+        skewed = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            odom_status={
+                "state": "ready",
+                "timestamp_source": "driver",
+                "source_age_sec": 0.1,
+            },
+            odom_status_received_at=9.9,
+            scan_received_at=9.9,
+            scan_source_age_sec=0.1,
+            sensor_stamp_skew_sec=0.201,
+            max_sensor_stamp_skew_sec=0.2,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            map_ready=True,
+            map_to_base_ready=True,
+        )
+        self.assertIn("sensor_stamp_skew", skewed["readiness_blockers"])
 
     def test_map_store_finalizes_atomically_and_rejects_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

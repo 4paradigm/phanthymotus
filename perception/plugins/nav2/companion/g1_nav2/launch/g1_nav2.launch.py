@@ -55,6 +55,8 @@ def generate_launch_description() -> LaunchDescription:
                     "input_topic": wrapped_cloud_topic,
                     "output_topic": cloud_topic,
                     "legacy_frame_id": "livox_frame",
+                    "source_timeout": 0.5,
+                    "source_future_tolerance": 0.1,
                 }
             ],
         ),
@@ -74,6 +76,7 @@ def generate_launch_description() -> LaunchDescription:
                     "velocity_frame": "body",
                     "publish_tf": True,
                     "source_timeout": 0.5,
+                    "source_future_tolerance": 0.1,
                 }
             ],
         ),
@@ -170,6 +173,7 @@ def generate_launch_description() -> LaunchDescription:
                     "odom_status_topic": "/ubuntu/navigation/nav2/odom_status",
                     "scan_topic": scan_topic,
                     "sensor_max_age_sec": 0.5,
+                    "sensor_max_stamp_skew_sec": 0.2,
                 }
             ],
         ),

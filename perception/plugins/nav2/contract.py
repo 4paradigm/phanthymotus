@@ -301,16 +301,16 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "compatible_schemas": ["phanthy.g1.loco_state.v2"],
                 "rate_hz": 10,
                 "timestamp": (
-                    "adapter receive time; released Driver payload has no source timestamp"
+                    "legacy uses adapter receive time; v2 uses normalized Driver "
+                    "source_stamp_ns in ROS system/Unix clock"
                 ),
-                "frame_id": "odom_source (adapter contract, absent from payload)",
+                "frame_id": "odom_source (v2 payload or legacy adapter contract)",
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
                 "units": "position=m, velocity=m/s, yaw_speed=rad/s",
                 "max_age_ms": 500,
                 "desc": (
-                    "Released Driver locomotion JSON; the adapter labels its "
-                    "receive-time and frame assumptions explicitly before "
-                    "converting it to odom -> base_link"
+                    "Legacy Driver locomotion JSON remains supported; v2 source "
+                    "timestamps are freshness-checked before publishing odom/TF"
                 ),
             },
             {
@@ -323,16 +323,19 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "compatible_schemas": ["phanthy.sensor.pointcloud.v2"],
                 "rate_hz": 10,
                 "timestamp": (
-                    "adapter receive time; released Driver envelope has no source timestamp"
+                    "legacy uses adapter receive time; v2 uses normalized scan-start "
+                    "source_stamp_ns in ROS system/Unix clock"
                 ),
-                "frame_id": "livox_frame (adapter launch contract, absent from payload)",
+                "frame_id": "livox_frame (v2 payload or legacy adapter contract)",
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
-                "units": "x/y/z=float32 meters",
+                "units": (
+                    "x/y/z=float32 meters; MID360 v2 time=float32 relative ns"
+                ),
                 "max_age_ms": 500,
                 "desc": (
-                    "Released Driver MID360 envelope: uint32 point_step, "
-                    "uint32 point_count, raw PointCloud2 bytes; exact size is "
-                    "validated before rebuilding ROS PointCloud2"
+                    "Legacy envelope remains supported. PCV2 restores source time, "
+                    "frame and an explicit MID360 XYZIRT layout; malformed or "
+                    "cross-clock timestamps are rejected before ROS publication"
                 ),
             },
             {

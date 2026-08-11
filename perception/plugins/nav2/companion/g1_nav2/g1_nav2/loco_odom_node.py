@@ -49,14 +49,25 @@ class G1LocoOdomBridge(Node):
         self.declare_parameter("velocity_frame", "body")
         self.declare_parameter("publish_tf", True)
         self.declare_parameter("source_timeout", 0.5)
+        self.declare_parameter("source_future_tolerance", 0.1)
 
         self._odom_frame = str(self.get_parameter("odom_frame").value)
         self._base_frame = str(self.get_parameter("base_frame").value)
         self._publish_tf = bool(self.get_parameter("publish_tf").value)
         self._source_timeout = float(self.get_parameter("source_timeout").value)
+        source_future_tolerance = float(
+            self.get_parameter("source_future_tolerance").value
+        )
+        if self._source_timeout <= 0.0 or source_future_tolerance < 0.0:
+            raise ValueError(
+                "source_timeout must be positive and source_future_tolerance "
+                "must be non-negative"
+            )
         self._normalizer = OriginNormalizer(
             reset_origin=bool(self.get_parameter("reset_origin").value),
             velocity_frame=str(self.get_parameter("velocity_frame").value),
+            max_source_age_ns=int(self._source_timeout * 1_000_000_000),
+            max_future_skew_ns=int(source_future_tolerance * 1_000_000_000),
         )
         self._received = 0
         self._invalid = 0

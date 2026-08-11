@@ -6,6 +6,13 @@ from dataclasses import dataclass
 import struct
 from typing import Iterable
 
+from .timestamp_contract import (
+    DEFAULT_MAX_FUTURE_SKEW_NS,
+    DEFAULT_MAX_SOURCE_AGE_NS,
+    InvalidSourceTimestamp,
+    validate_source_timestamp_ns,
+)
+
 
 _MAGIC = b"PCV2"
 _VERSION = 2
@@ -15,10 +22,35 @@ _MIN_POINT_STEP = 12
 _MAX_POINT_STEP = 512
 _MAX_POINTS = 2_000_000
 _MAX_FRAME_ID_BYTES = 128
+PCV2_FLAG_MID360_XYZIRT = 0x0001
+_SUPPORTED_FLAGS = PCV2_FLAG_MID360_XYZIRT
+_MID360_POINT_STEP = 22
+POINT_FIELD_UINT16 = 4
+POINT_FIELD_FLOAT32 = 7
 
 
 class InvalidCanvasPointCloud(ValueError):
     """Raised when a ``sensor/pointcloud`` envelope is malformed."""
+
+
+@dataclass(frozen=True)
+class PointFieldSpec:
+    name: str
+    offset: int
+    datatype: int
+    count: int = 1
+
+
+XYZ_FIELDS = (
+    PointFieldSpec("x", 0, POINT_FIELD_FLOAT32),
+    PointFieldSpec("y", 4, POINT_FIELD_FLOAT32),
+    PointFieldSpec("z", 8, POINT_FIELD_FLOAT32),
+)
+MID360_XYZIRT_FIELDS = XYZ_FIELDS + (
+    PointFieldSpec("intensity", 12, POINT_FIELD_FLOAT32),
+    PointFieldSpec("ring", 16, POINT_FIELD_UINT16),
+    PointFieldSpec("time", 18, POINT_FIELD_FLOAT32),
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +60,8 @@ class CanvasPointCloud:
     timestamp_source: str
     frame_source: str
     source_schema: str
+    flags: int
+    fields: tuple[PointFieldSpec, ...]
     point_step: int
     point_count: int
     data: bytes
@@ -54,6 +88,8 @@ def decode_canvas_pointcloud(
     *,
     receive_stamp_ns: int | None = None,
     legacy_frame_id: str | None = None,
+    max_source_age_ns: int = DEFAULT_MAX_SOURCE_AGE_NS,
+    max_future_skew_ns: int = DEFAULT_MAX_FUTURE_SKEW_NS,
 ) -> CanvasPointCloud:
     """Decode the released legacy envelope or timestamped v2 envelope.
 
@@ -99,6 +135,8 @@ def decode_canvas_pointcloud(
             timestamp_source="adapter_receive",
             frame_source="adapter_contract",
             source_schema="unitree.g1.pointcloud.legacy",
+            flags=0,
+            fields=XYZ_FIELDS,
             point_step=point_step,
             point_count=point_count,
             data=raw[_LEGACY_HEADER.size:],
@@ -122,10 +160,21 @@ def decode_canvas_pointcloud(
         raise InvalidCanvasPointCloud(
             f"unsupported point-cloud envelope version: {version}"
         )
-    if flags != 0:
+    if flags & ~_SUPPORTED_FLAGS:
         raise InvalidCanvasPointCloud(f"unsupported point-cloud flags: {flags}")
-    if source_stamp_ns <= 0:
-        raise InvalidCanvasPointCloud("source_stamp_ns must be positive")
+    if flags & PCV2_FLAG_MID360_XYZIRT and point_step != _MID360_POINT_STEP:
+        raise InvalidCanvasPointCloud(
+            "MID360 XYZIRT layout requires point_step=22"
+        )
+    try:
+        validate_source_timestamp_ns(
+            source_stamp_ns,
+            receive_stamp_ns,
+            max_source_age_ns=max_source_age_ns,
+            max_future_skew_ns=max_future_skew_ns,
+        )
+    except InvalidSourceTimestamp as exc:
+        raise InvalidCanvasPointCloud(str(exc)) from exc
     if not 0 < frame_id_length <= _MAX_FRAME_ID_BYTES:
         raise InvalidCanvasPointCloud(
             f"invalid frame_id length: {frame_id_length}"
@@ -150,6 +199,12 @@ def decode_canvas_pointcloud(
         timestamp_source="driver",
         frame_source="driver_payload",
         source_schema="phanthy.sensor.pointcloud.v2",
+        flags=flags,
+        fields=(
+            MID360_XYZIRT_FIELDS
+            if flags & PCV2_FLAG_MID360_XYZIRT
+            else XYZ_FIELDS
+        ),
         point_step=point_step,
         point_count=point_count,
         data=raw[data_offset:],
@@ -159,5 +214,9 @@ def decode_canvas_pointcloud(
 __all__ = [
     "CanvasPointCloud",
     "InvalidCanvasPointCloud",
+    "MID360_XYZIRT_FIELDS",
+    "PCV2_FLAG_MID360_XYZIRT",
+    "PointFieldSpec",
+    "XYZ_FIELDS",
     "decode_canvas_pointcloud",
 ]

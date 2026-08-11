@@ -17,6 +17,8 @@ def evaluate_readiness(
     odom_status_received_at: float | None,
     scan_received_at: float | None,
     scan_source_age_sec: float | None,
+    sensor_stamp_skew_sec: float | None,
+    max_sensor_stamp_skew_sec: float,
     lifecycle_states: dict[str, int],
     action_server_ready: bool,
     map_ready: bool,
@@ -48,6 +50,16 @@ def evaluate_readiness(
         or not -0.1 <= scan_source_age_sec <= max_age_sec
     ):
         runtime_blockers.append("scan_source_stamp_stale")
+    # Legacy adapters timestamp the streams independently on receipt, so their
+    # relative phase is not a Driver synchronization guarantee. Enforce the
+    # cross-stream source-time contract only after odometry has upgraded to the
+    # normalized Driver clock; individual freshness checks still protect legacy.
+    if timestamp_source == "driver" and (
+        not isinstance(sensor_stamp_skew_sec, (int, float))
+        or sensor_stamp_skew_sec < 0.0
+        or sensor_stamp_skew_sec > max_sensor_stamp_skew_sec
+    ):
+        runtime_blockers.append("sensor_stamp_skew")
     inactive = sorted(
         name for name, state_id in lifecycle_states.items() if state_id != 3
     )
@@ -70,6 +82,8 @@ def evaluate_readiness(
         "odom_status_age_sec": odom_receive_age,
         "scan_receive_age_sec": scan_receive_age,
         "scan_source_age_sec": scan_source_age_sec,
+        "sensor_stamp_skew_sec": sensor_stamp_skew_sec,
+        "max_sensor_stamp_skew_sec": max_sensor_stamp_skew_sec,
         "lifecycle_states": dict(lifecycle_states),
         "action_server_ready": action_server_ready,
         "map_ready": map_ready,

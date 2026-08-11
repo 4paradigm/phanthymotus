@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import signal
 import struct
 import time
@@ -21,9 +22,9 @@ from rclpy.qos import (
 from std_msgs.msg import String, UInt8MultiArray
 
 
-def _legacy_cloud(radius: float = 2.5, points: int = 720) -> bytes:
-    point_step = 12
-    raw_points = bytearray()
+def _cloud_points(radius: float = 2.5, points: int = 720) -> tuple[bytes, bytes]:
+    xyz_points = bytearray()
+    xyzirt_points = bytearray()
     for index in range(points):
         angle = 2.0 * math.pi * index / points
         x = radius * math.cos(angle)
@@ -31,8 +32,30 @@ def _legacy_cloud(radius: float = 2.5, points: int = 720) -> bytes:
         # Static lidar extrinsics lift the cloud by 0.46018 m. Keeping points
         # around base_link z=0 places the deterministic ring in the laser slice.
         z = -0.46018
-        raw_points.extend(struct.pack("<fff", x, y, z))
-    return struct.pack("<II", point_step, points) + raw_points
+        xyz_points.extend(struct.pack("<fff", x, y, z))
+        time_offset_ns = 100_000_000.0 * index / points
+        xyzirt_points.extend(
+            struct.pack("<ffffHf", x, y, z, 1.0, index % 4, time_offset_ns)
+        )
+    return bytes(xyz_points), bytes(xyzirt_points)
+
+
+def _v2_cloud(source_stamp_ns: int, points: int, data: bytes) -> bytes:
+    frame = b"livox_frame"
+    return (
+        struct.pack(
+            "<4sHHIIqH",
+            b"PCV2",
+            2,
+            0x0001,
+            22,
+            points,
+            source_stamp_ns,
+            len(frame),
+        )
+        + frame
+        + data
+    )
 
 
 class StageSixFixture(Node):
@@ -43,7 +66,17 @@ class StageSixFixture(Node):
         self._proposals = 0
         self._post_stale_nonzero = 0
         self._statuses = 0
-        self._cloud = _legacy_cloud()
+        self._sensor_schema = os.getenv(
+            "NAV2_FIXTURE_SENSOR_SCHEMA", "legacy"
+        ).strip()
+        if self._sensor_schema not in {"legacy", "v2"}:
+            raise ValueError("NAV2_FIXTURE_SENSOR_SCHEMA must be legacy or v2")
+        self._point_count = 720
+        xyz_points, xyzirt_points = _cloud_points(points=self._point_count)
+        self._legacy_cloud = (
+            struct.pack("<II", 12, self._point_count) + xyz_points
+        )
+        self._v2_cloud_data = xyzirt_points
         signal.signal(signal.SIGUSR1, self._on_stop_signal)
         signal.signal(signal.SIGUSR2, self._on_resume_signal)
 
@@ -89,18 +122,35 @@ class StageSixFixture(Node):
     def _publish_inputs(self) -> None:
         if not self._inputs_active:
             return
+        source_stamp_ns = self.get_clock().now().nanoseconds
+        state_payload = {
+            "position": [0.0, 0.0, 0.0],
+            "velocity": [0.0, 0.0, 0.0],
+            "imu": {"rpy": [0.0, 0.0, 0.0]},
+            "yaw_speed": 0.0,
+        }
+        if self._sensor_schema == "v2":
+            state_payload.update(
+                {
+                    "schema": "phanthy.g1.loco_state.v2",
+                    "schema_version": 2,
+                    "source_stamp_ns": source_stamp_ns,
+                    "frame_id": "odom_source",
+                }
+            )
         state = String()
-        state.data = json.dumps(
-            {
-                "position": [0.0, 0.0, 0.0],
-                "velocity": [0.0, 0.0, 0.0],
-                "imu": {"rpy": [0.0, 0.0, 0.0]},
-                "yaw_speed": 0.0,
-            },
-            separators=(",", ":"),
-        )
+        state.data = json.dumps(state_payload, separators=(",", ":"))
         cloud = UInt8MultiArray()
-        cloud.data = list(self._cloud)
+        cloud_payload = (
+            _v2_cloud(
+                source_stamp_ns,
+                self._point_count,
+                self._v2_cloud_data,
+            )
+            if self._sensor_schema == "v2"
+            else self._legacy_cloud
+        )
+        cloud.data = list(cloud_payload)
         self._loco_pub.publish(state)
         self._cloud_pub.publish(cloud)
 

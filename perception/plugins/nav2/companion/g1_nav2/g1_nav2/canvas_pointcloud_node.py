@@ -19,6 +19,20 @@ class CanvasPointCloudBridge(Node):
             "output_topic", "/ubuntu/navigation/nav2/cloud"
         )
         self.declare_parameter("legacy_frame_id", "")
+        self.declare_parameter("source_timeout", 0.5)
+        self.declare_parameter("source_future_tolerance", 0.1)
+        source_timeout = float(self.get_parameter("source_timeout").value)
+        future_tolerance = float(
+            self.get_parameter("source_future_tolerance").value
+        )
+        if source_timeout <= 0.0 or future_tolerance < 0.0:
+            raise ValueError(
+                "source_timeout must be positive and source_future_tolerance "
+                "must be non-negative"
+            )
+        self._max_source_age_ns = int(source_timeout * 1_000_000_000)
+        self._max_future_skew_ns = int(future_tolerance * 1_000_000_000)
+        self._last_driver_source_stamp_ns: int | None = None
         self._invalid = 0
         self._publisher = self.create_publisher(
             PointCloud2,
@@ -40,12 +54,25 @@ class CanvasPointCloudBridge(Node):
                 legacy_frame_id=str(
                     self.get_parameter("legacy_frame_id").value
                 ),
+                max_source_age_ns=self._max_source_age_ns,
+                max_future_skew_ns=self._max_future_skew_ns,
             )
+            if (
+                cloud.timestamp_source == "driver"
+                and self._last_driver_source_stamp_ns is not None
+                and cloud.source_stamp_ns < self._last_driver_source_stamp_ns
+            ):
+                raise InvalidCanvasPointCloud(
+                    "source_stamp_ns moved backwards"
+                )
         except InvalidCanvasPointCloud as exc:
             self._invalid += 1
             if self._invalid <= 3 or self._invalid % 100 == 0:
                 self.get_logger().warning(f"invalid canvas point cloud: {exc}")
             return
+
+        if cloud.timestamp_source == "driver":
+            self._last_driver_source_stamp_ns = cloud.source_stamp_ns
 
         output = PointCloud2()
         output.header.stamp.sec = cloud.source_stamp_ns // 1_000_000_000
@@ -54,9 +81,13 @@ class CanvasPointCloudBridge(Node):
         output.height = 1
         output.width = cloud.point_count
         output.fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(
+                name=field.name,
+                offset=field.offset,
+                datatype=field.datatype,
+                count=field.count,
+            )
+            for field in cloud.fields
         ]
         output.is_bigendian = False
         output.point_step = cloud.point_step
