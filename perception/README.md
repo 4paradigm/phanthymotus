@@ -102,7 +102,7 @@ ASR result JSON:
 
 用户可见约束：
 
-- `speed` 范围 `0.05–0.15 m/s`，`mode` 首版只能为整数 `0`；
+- `speed` 范围 `0.05–0.15 m/s`，首版导航固定允许绕障，不显示无可选值的 `mode`；
 - 输入超过 `500 ms`、TF/地图/Nav2 lifecycle 不 ready 时 fail closed；
 - `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；
 - 地图宿主机目录为 `/opt/phanthy-motus/data/nav2/maps`，companion 容器内为 `/maps`；

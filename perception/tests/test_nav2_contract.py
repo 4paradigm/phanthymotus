@@ -42,10 +42,18 @@ class Nav2ContractTest(unittest.TestCase):
 
     def test_config_and_speed_bounds_are_fail_closed(self) -> None:
         tool = nav2_tool_definition("ubuntu")
-        speed = tool["inputSchema"]["properties"]["speed"]
+        properties = tool["inputSchema"]["properties"]
+        speed = properties["speed"]
         self.assertEqual(speed["minimum"], 0.05)
         self.assertEqual(speed["maximum"], 0.15)
         self.assertEqual(speed["default"], 0.15)
+        self.assertNotIn("mode", properties)
+
+        action_params = tool["inputSchema"]["x-action-params"]
+        self.assertNotIn("mode", action_params["navigate_to_tag"]["params"])
+        self.assertNotIn("mode", action_params["navigate_to_pose"]["params"])
+        topic_action = tool["x-topic-actions"][0]
+        self.assertNotIn("mode", topic_action["allowed_fields"])
 
         config = tool["configSchema"]
         self.assertFalse(config["additionalProperties"])

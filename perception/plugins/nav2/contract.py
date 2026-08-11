@@ -184,20 +184,18 @@ NAV2_ACTION_PARAMS = {
         "description": "Load a map (robot must be at map origin)",
     },
     "navigate_to_tag": {
-        "params": ["tag_name", "speed", "mode"],
+        "params": ["tag_name", "speed"],
         "description": (
-            "Navigate to a tagged place (non-blocking). mode: "
-            "0=detour (the only supported mode). "
+            "Navigate to a tagged place with obstacle detouring (non-blocking). "
             "MUST be followed by a "
             "separate wait_navigation_done call in the same turn to wait for "
             "arrival before proceeding."
         ),
     },
     "navigate_to_pose": {
-        "params": ["x", "y", "yaw", "speed", "mode"],
+        "params": ["x", "y", "yaw", "speed"],
         "description": (
-            "Navigate to coordinates (non-blocking). mode: "
-            "0=detour (the only supported mode). "
+            "Navigate to coordinates with obstacle detouring (non-blocking). "
             "MUST be followed by a "
             "separate wait_navigation_done call in the same turn to wait for "
             "arrival before proceeding."
@@ -281,7 +279,7 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "stop_action": "stop_nav",
                 "schema": "phanthy.navigation.goal.v1",
                 "id_field": "goal_id",
-                "allowed_fields": ["x", "y", "yaw", "speed", "mode"],
+                "allowed_fields": ["x", "y", "yaw", "speed"],
             }
         ],
         "topic_in": [
@@ -406,12 +404,6 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "maximum": 0.15,
                     "default": 0.15,
                     "description": "Navigation speed 0.05-0.15 m/s (default 0.15)",
-                },
-                "mode": {
-                    "type": "integer",
-                    "enum": [0],
-                    "default": 0,
-                    "description": "Obstacle mode: 0=detour (only supported mode)",
                 },
                 "stall_timeout": {
                     "type": "number",

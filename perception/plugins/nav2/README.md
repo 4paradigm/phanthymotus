@@ -62,13 +62,12 @@ BEST_EFFORT 发布端。
   "x": 1.2,
   "y": -0.8,
   "yaw": 0.0,
-  "speed": 0.15,
-  "mode": 0
+  "speed": 0.15
 }
 ```
 
-`x/y` 单位为米，`yaw` 单位为弧度，坐标系为 `map`；`mode=0` 表示允许绕障，
-是首版唯一支持的模式。可选 topic 输入最终仍转换为普通
+`x/y` 单位为米，`yaw` 单位为弧度，坐标系为 `map`。首版固定使用绕障模式，
+不向 Canvas 暴露无可选值的 `mode` 参数。可选 topic 输入最终仍转换为普通
 `navigate_to_pose` 调用，不能绕过 Agent Core 和 Driver lease。
 
 当前官方 Agent Core 尚未实现本卡片声明的 `x-topic-actions` 消费逻辑，因此
@@ -113,14 +112,14 @@ BEST_EFFORT 发布端。
 | `list_maps` | 无 | 返回已保存地图、状态和元数据 |
 | `delete_map` | `map_name:string` | 删除未加载、未建图中的地图；活动地图不得删除 |
 | `load_map` | `map_name:string` | 加载地图并进入 localization；定位未 ready 时不得宣称成功 |
-| `navigate_to_tag` | `tag_name:string`、`speed?:number`、`mode?:integer` | 非阻塞创建导航任务并返回唯一 `nav_id` |
-| `navigate_to_pose` | `x:number`、`y:number`、`yaw:number`、`speed?:number`、`mode?:integer` | 非阻塞创建 `map` frame 导航任务并返回唯一 `nav_id` |
+| `navigate_to_tag` | `tag_name:string`、`speed?:number` | 以固定绕障模式非阻塞创建导航任务并返回唯一 `nav_id` |
+| `navigate_to_pose` | `x:number`、`y:number`、`yaw:number`、`speed?:number` | 以固定绕障模式非阻塞创建 `map` frame 导航任务并返回唯一 `nav_id` |
 | `wait_navigation_done` | `stall_timeout?:number` | 等待当前任务到达、取消、超时或错误，返回 terminal receipt |
 | `pause_nav` | 无 | 暂停当前导航并等待 Nav2 接受；无活动任务时幂等返回 |
 | `resume_nav` | 无 | 恢复已暂停任务；状态不允许时明确拒绝 |
 | `stop_nav` | 无 | 取消当前任务，发布终态零速并等待 Nav2 terminal；物理停车确认由 Driver 完成 |
 
-`speed` 默认 `0.15 m/s`，范围 `0.05–0.15 m/s`；`mode` 首版只能为整数 `0`。
+`speed` 默认 `0.15 m/s`，范围 `0.05–0.15 m/s`；首版导航固定允许绕障。
 参数错误、not-ready、timeout、cancelled 和内部错误必须具有不同的结构化
 `error_code`，不能只返回 HTTP 200 或日志文本。
 
@@ -246,8 +245,8 @@ I_AM_G1_OWNER=1 I_CONFIRM_CANVAS_STOPPED=1 STAGE=stop \
    非空路径和 bounded proposal；输入断流后在时限内停止提案。
 4. Compose smoke：Perception 与 Nav2 companion 按依赖顺序启动，重启后地图恢复；
    companion 不可用时卡片显示 not-ready。
-5. Canvas：两路必需输入和一个 proposal 输出可正确连线；非法
-   `mode`、缺输入和过期输入可见失败。`goal_pose` 执行要求 Core
+5. Canvas：两路必需输入和一个 proposal 输出可正确连线；固定绕障模式不显示
+   `mode` 选项，缺输入和过期输入可见失败。`goal_pose` 执行要求 Core
    消费 `x-topic-actions`，在官方 Core 提供该能力前只验证 schema 和连线。
 6. G1 真机：由 owner 明确授权并持有遥控器/急停，验证建图、保存/加载、标签导航、
    绕障重规划、到达、取消、Driver 停车确认和 lease 释放。
