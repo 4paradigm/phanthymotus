@@ -145,6 +145,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         ):
             self.assertNotIn(f'"{removed} =', setup)
         self.assertIn('executable="planner_command_bridge"', launch)
+        self.assertIn("GroupAction(", launch)
+        self.assertIn("scoped=True", launch)
         self.assertIn('default_value="/ubuntu/navigation/odom"', launch)
         self.assertIn(
             'default_value="/ubuntu/navigation/cloud_registered"', launch

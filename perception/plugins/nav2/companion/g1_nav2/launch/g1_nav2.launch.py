@@ -6,7 +6,11 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    IncludeLaunchDescription,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetRemap
@@ -60,20 +64,27 @@ def generate_launch_description() -> LaunchDescription:
                 "status_topic",
                 default_value="/ubuntu/navigation/nav2/status",
             ),
-            SetRemap(src="/cmd_vel", dst=cmd_vel_raw_topic),
-            SetRemap(src="cmd_vel", dst=cmd_vel_raw_topic),
-            SetRemap(src="/cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
-            SetRemap(src="cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(nav2_share, "launch", "navigation_launch.py")
-                ),
-                launch_arguments={
-                    "use_sim_time": "false",
-                    "params_file": params_file,
-                    "autostart": "true",
-                    "use_composition": "False",
-                }.items(),
+            GroupAction(
+                scoped=True,
+                actions=[
+                    SetRemap(src="/cmd_vel", dst=cmd_vel_raw_topic),
+                    SetRemap(src="cmd_vel", dst=cmd_vel_raw_topic),
+                    SetRemap(src="/cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
+                    SetRemap(src="cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
+                    IncludeLaunchDescription(
+                        PythonLaunchDescriptionSource(
+                            os.path.join(
+                                nav2_share, "launch", "navigation_launch.py"
+                            )
+                        ),
+                        launch_arguments={
+                            "use_sim_time": "false",
+                            "params_file": params_file,
+                            "autostart": "true",
+                            "use_composition": "False",
+                        }.items(),
+                    ),
+                ],
             ),
             Node(
                 package="g1_nav2",

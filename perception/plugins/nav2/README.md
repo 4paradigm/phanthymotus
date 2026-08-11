@@ -101,6 +101,8 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 - Rotation Shim 在航向偏差大时先旋转，DWB 只采样 `x/yaw`，不采样横移。
 - velocity smoother 使用 `/ubuntu/navigation/odom` 作为反馈。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
+- Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；
+  proposal bridge 始终检查真正的根 `/cmd_vel`，发现外部发布者仍会拒绝导航。
 
 ## Canvas 连线
 
