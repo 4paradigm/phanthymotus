@@ -86,8 +86,8 @@ FAST-LIVO2 卡片执行 `start_mapping`，等地图视图和 odom 出现后再�
 
 companion 从已验证的本地
 `phanthy-fast-livo2:g1-1fcd0d0-n3save1` 镜像派生。统一构建脚本会先检查
-这个 tag 的实际 image ID 与 `source-lock.env` 完全一致，再调用 Compose；
-同名镜像内容变化会直接失败：
+这个 tag 的 arm64 架构、上游 revision 和两个补丁 SHA256 与
+`source-lock.env` 完全一致，再调用 Compose；同名镜像内容变化会直接失败：
 
 ```bash
 cd perception/plugins/fast_livo2/companion

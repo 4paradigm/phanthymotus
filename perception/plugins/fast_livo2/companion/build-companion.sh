@@ -19,25 +19,47 @@ if [[ -n "${requested_image}" ]]; then
   export FAST_LIVO2_IMAGE
 fi
 
-[[ -n "${FAST_LIVO2_BASE_IMAGE:-}" ]] || {
-  printf 'ERROR=FAST_LIVO2_BASE_IMAGE is missing from source-lock.env\n' >&2
-  exit 1
-}
-[[ -n "${FAST_LIVO2_BASE_IMAGE_ID:-}" ]] || {
-  printf 'ERROR=FAST_LIVO2_BASE_IMAGE_ID is missing from source-lock.env\n' >&2
-  exit 1
-}
+for required in \
+  FAST_LIVO2_BASE_IMAGE \
+  FAST_LIVO2_COMMIT \
+  FAST_LIVO2_RUNTIME_PATCH_SHA256 \
+  FAST_LIVO2_PCD_SAVE_PATCH_SHA256
+do
+  [[ -n "${!required:-}" ]] || {
+    printf 'ERROR=%s is missing from source-lock.env\n' "${required}" >&2
+    exit 1
+  }
+done
 
-actual_id="$(docker image inspect \
-  --format '{{.Id}}' "${FAST_LIVO2_BASE_IMAGE}" 2>/dev/null || true)"
-[[ -n "${actual_id}" ]] || {
+metadata="$(docker image inspect --format \
+  '{{.Architecture}}|{{ index .Config.Labels "org.opencontainers.image.revision" }}|{{ index .Config.Labels "org.opencontainers.image.fast-livo2-runtime-patch" }}|{{ index .Config.Labels "org.opencontainers.image.fast-livo2-pcd-save-patch" }}' \
+  "${FAST_LIVO2_BASE_IMAGE}" 2>/dev/null || true)"
+[[ -n "${metadata}" ]] || {
   printf 'ERROR=locked FAST-LIVO2 base image is absent: %s\n' \
     "${FAST_LIVO2_BASE_IMAGE}" >&2
   exit 1
 }
-[[ "${actual_id}" == "${FAST_LIVO2_BASE_IMAGE_ID}" ]] || {
-  printf 'ERROR=FAST-LIVO2 base image ID mismatch: expected=%s actual=%s\n' \
-    "${FAST_LIVO2_BASE_IMAGE_ID}" "${actual_id}" >&2
+
+IFS='|' read -r actual_arch actual_revision actual_runtime_patch actual_pcd_patch \
+  <<<"${metadata}"
+[[ "${actual_arch}" == "arm64" ]] || {
+  printf 'ERROR=FAST-LIVO2 base image architecture mismatch: expected=arm64 actual=%s\n' \
+    "${actual_arch}" >&2
+  exit 1
+}
+[[ "${actual_revision}" == "${FAST_LIVO2_COMMIT}" ]] || {
+  printf 'ERROR=FAST-LIVO2 revision mismatch: expected=%s actual=%s\n' \
+    "${FAST_LIVO2_COMMIT}" "${actual_revision}" >&2
+  exit 1
+}
+[[ "${actual_runtime_patch}" == "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" ]] || {
+  printf 'ERROR=FAST-LIVO2 runtime patch mismatch: expected=%s actual=%s\n' \
+    "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" "${actual_runtime_patch}" >&2
+  exit 1
+}
+[[ "${actual_pcd_patch}" == "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" ]] || {
+  printf 'ERROR=FAST-LIVO2 PCD patch mismatch: expected=%s actual=%s\n' \
+    "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" "${actual_pcd_patch}" >&2
   exit 1
 }
 

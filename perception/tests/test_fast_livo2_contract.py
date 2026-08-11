@@ -66,12 +66,19 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_BASE_IMAGE_ID=sha256:26bce71e5e0b056525f048114d873130203864cd356fc7339e6b99a721b512dc",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b",
+            source_lock,
+        )
+        self.assertIn(
+            "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=b3afa3e64b5743898c829fe34891f828027eb372324d05a8c94357f9cacd6ec4",
             source_lock,
         )
         self.assertIn("GPL-2.0-only AND GPL-3.0-only", dockerfile)
-        self.assertIn('actual_id="$(docker image inspect', build_script)
-        self.assertIn('"${actual_id}" == "${FAST_LIVO2_BASE_IMAGE_ID}"', build_script)
+        self.assertIn("org.opencontainers.image.revision", build_script)
+        self.assertIn("org.opencontainers.image.fast-livo2-runtime-patch", build_script)
+        self.assertIn("org.opencontainers.image.fast-livo2-pcd-save-patch", build_script)
+        self.assertIn('"${actual_arch}" == "arm64"', build_script)
+        self.assertNotIn("FAST_LIVO2_BASE_IMAGE_ID", build_script)
         self.assertIn("fast_livo2:", service)
         self.assertIn("/opt/phanthy-motus/data/fast_livo2/maps", service)
         self.assertIn('full_name == p.PREFIX', main)
