@@ -92,6 +92,8 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertIn("decode_canvas_pointcloud", bridge)
         self.assertIn('"metadata_footer": "PCLMETA2"', bridge)
         self.assertIn("LidarClockNormalizer", bridge)
+        self.assertIn("self._lidar_clock = LidarClockNormalizer", bridge)
+        self.assertNotIn("self._clock = LidarClockNormalizer", bridge)
         self.assertIn('"timestamp_mode": "auto"', launch)
         self.assertIn("expected exactly one publisher", bridge)
         self.assertIn("expected exactly one publisher", odom_bridge)

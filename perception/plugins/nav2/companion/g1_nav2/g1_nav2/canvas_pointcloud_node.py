@@ -67,7 +67,9 @@ class CanvasPointCloudBridge(Node):
         self._input_topic = str(self.get_parameter("input_topic").value)
         self._max_source_age_ns = int(max_source_age * 1_000_000_000)
         self._max_future_skew_ns = int(future_tolerance * 1_000_000_000)
-        self._clock = LidarClockNormalizer(
+        # rclpy.node.Node owns ``self._clock``; do not shadow it or
+        # ``get_clock()`` will return the LiDAR normalizer instead of ROS time.
+        self._lidar_clock = LidarClockNormalizer(
             mode=str(self.get_parameter("timestamp_mode").value),
             warmup_samples=int(
                 self.get_parameter("clock_warmup_samples").value
@@ -117,7 +119,7 @@ class CanvasPointCloudBridge(Node):
                     f"found {input_publishers}"
                 )
                 if self._source_topology_error is None:
-                    self._clock.reset()
+                    self._lidar_clock.reset()
                     self._last_source_stamp_ns = None
                 self._source_topology_error = topology_error
                 raise InvalidCanvasPointCloud(topology_error)
@@ -133,7 +135,7 @@ class CanvasPointCloudBridge(Node):
                 raise InvalidCanvasPointCloud(
                     "raw LiDAR header timestamp is required for Nav2"
                 )
-            normalized_stamp_ns = self._clock.normalize(
+            normalized_stamp_ns = self._lidar_clock.normalize(
                 raw_stamp_ns=cloud.raw_lidar_stamp_ns,
                 driver_receive_stamp_ns=cloud.source_stamp_ns,
                 scan_end_offset_ns=cloud.scan_end_offset_ns,
@@ -218,7 +220,7 @@ class CanvasPointCloudBridge(Node):
         cloud: CanvasPointCloud | None,
         error: str | None = None,
     ) -> None:
-        clock = self._clock.snapshot()
+        clock = self._lidar_clock.snapshot()
         driver_receive_stamp_ns = (
             cloud.source_stamp_ns if cloud is not None else None
         )
