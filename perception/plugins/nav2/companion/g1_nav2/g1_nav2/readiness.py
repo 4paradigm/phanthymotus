@@ -37,7 +37,7 @@ def evaluate_readiness(
     source_age = odom_status.get("source_age_sec")
     timestamp_source = odom_status.get("timestamp_source")
     source_stamp_fresh = timestamp_source == "adapter_receive" or (
-        timestamp_source == "driver"
+        timestamp_source in {"driver", "driver_receive"}
         and isinstance(source_age, (int, float))
         and -0.1 <= source_age <= max_age_sec
     )
@@ -50,10 +50,10 @@ def evaluate_readiness(
         or not -0.1 <= scan_source_age_sec <= max_age_sec
     ):
         runtime_blockers.append("scan_source_stamp_stale")
-    # Legacy adapters timestamp the streams independently on receipt, so their
-    # relative phase is not a Driver synchronization guarantee. Enforce the
-    # cross-stream source-time contract only after odometry has upgraded to the
-    # normalized Driver clock; individual freshness checks still protect legacy.
+    # adapter_receive and driver_receive are callback times, not synchronized
+    # measurement times. Their phase relative to a LiDAR scan-start stamp is not
+    # a sensor synchronization guarantee. Preserve the strict cross-stream gate
+    # only for an explicitly synchronized Driver source timestamp.
     if timestamp_source == "driver" and (
         not isinstance(sensor_stamp_skew_sec, (int, float))
         or sensor_stamp_skew_sec < 0.0

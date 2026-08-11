@@ -301,39 +301,39 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "compatible_schemas": ["phanthy.g1.loco_state.v2"],
                 "rate_hz": 10,
                 "timestamp": (
-                    "legacy uses adapter receive time; v2 uses normalized Driver "
-                    "source_stamp_ns in ROS system/Unix clock"
+                    "legacy uses adapter receive time; v2 declares Driver callback "
+                    "receive time in source_stamp_ns using ROS system/Unix clock"
                 ),
                 "frame_id": "odom_source (v2 payload or legacy adapter contract)",
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
                 "units": "position=m, velocity=m/s, yaw_speed=rad/s",
                 "max_age_ms": 500,
                 "desc": (
-                    "Legacy Driver locomotion JSON remains supported; v2 source "
-                    "timestamps are freshness-checked before publishing odom/TF"
+                    "Legacy Driver locomotion JSON remains supported; v2 Driver "
+                    "receive timestamps are freshness-checked before odom/TF"
                 ),
             },
             {
                 "port": "lidar_cloud",
-                "topic": f"{root}/navigation/lidar",
+                "topic": "/utlidar/cloud",
                 "format": "sensor/pointcloud",
-                "ros_type": "std_msgs/msg/UInt8MultiArray",
-                "qos": "BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE",
-                "schema": "phanthy.sensor.pointcloud.v2",
+                "ros_type": "sensor_msgs/msg/PointCloud2",
+                "qos": "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
+                "schema": "sensor_msgs/msg/PointCloud2",
                 "rate_hz": 10,
                 "timestamp": (
-                    "normalized scan-start source_stamp_ns in ROS system/Unix clock"
+                    "native PointCloud2 header.stamp; companion maps an independent "
+                    "LiDAR clock into ROS system time before Nav2 consumption"
                 ),
-                "frame_id": "original MID360 frame from the v2 payload",
+                "frame_id": "native PointCloud2 header.frame_id (utlidar_lidar)",
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
-                "units": (
-                    "x/y/z=float32 meters; MID360 v2 time=float32 relative ns"
-                ),
+                "units": "native PointCloud2 fields; x/y/z in meters",
                 "max_age_ms": 500,
                 "desc": (
-                    "Dedicated navigation PCV2 stream with source time, original "
-                    "frame and MID360 XYZIRT bytes; malformed or cross-clock "
-                    "timestamps are rejected before ROS publication"
+                    "Robot-native ROS2 PointCloud2 stream. The companion preserves "
+                    "frame_id, fields and point bytes, retains the raw stamp in "
+                    "diagnostics, and only rewrites the output stamp when clock-domain "
+                    "normalization is required"
                 ),
             },
             {

@@ -50,6 +50,13 @@ def build_launch_command(
             raise ValueError(f"{key} must be finite")
         command.append(f"{argument}:={value}")
 
+    publish_static_tf = str(
+        env.get("NAV2_PUBLISH_LIDAR_STATIC_TF", "true")
+    ).strip().lower()
+    if publish_static_tf not in {"true", "false"}:
+        raise ValueError("NAV2_PUBLISH_LIDAR_STATIC_TF must be true or false")
+    command.append(f"publish_lidar_static_tf:={publish_static_tf}")
+
     if mode == "localization":
         name = plain_map_name(map_name)
         map_yaml = Path(maps_root) / name / "map.yaml"

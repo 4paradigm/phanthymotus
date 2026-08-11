@@ -25,8 +25,9 @@ def generate_launch_description() -> LaunchDescription:
     maps_root = LaunchConfiguration("maps_root")
     params_file = LaunchConfiguration("params_file")
     slam_params_file = LaunchConfiguration("slam_params_file")
-    wrapped_cloud_topic = LaunchConfiguration("wrapped_cloud_topic")
+    source_cloud_topic = LaunchConfiguration("source_cloud_topic")
     cloud_topic = LaunchConfiguration("cloud_topic")
+    lidar_frame = LaunchConfiguration("lidar_frame")
     scan_topic = LaunchConfiguration("scan_topic")
     odom_input_topic = LaunchConfiguration("odom_input_topic")
     odom_topic = LaunchConfiguration("odom_topic")
@@ -52,10 +53,14 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             parameters=[
                 {
-                    "input_topic": wrapped_cloud_topic,
+                    "input_topic": source_cloud_topic,
                     "output_topic": cloud_topic,
-                    "legacy_frame_id": "livox_frame",
-                    "source_timeout": 0.5,
+                    "status_topic": "/ubuntu/navigation/nav2/lidar_status",
+                    "timestamp_mode": "auto",
+                    "clock_warmup_samples": 8,
+                    "clock_window_samples": 200,
+                    "already_aligned_tolerance": 2.0,
+                    "max_normalized_source_age": 2.0,
                     "source_future_tolerance": 0.1,
                 }
             ],
@@ -83,7 +88,8 @@ def generate_launch_description() -> LaunchDescription:
         Node(
             package="tf2_ros",
             executable="static_transform_publisher",
-            name="g1_livox_static_tf",
+            name="g1_lidar_static_tf",
+            condition=IfCondition(LaunchConfiguration("publish_lidar_static_tf")),
             arguments=[
                 "--x", LaunchConfiguration("lidar_x"),
                 "--y", LaunchConfiguration("lidar_y"),
@@ -92,7 +98,7 @@ def generate_launch_description() -> LaunchDescription:
                 "--pitch", LaunchConfiguration("lidar_pitch"),
                 "--yaw", LaunchConfiguration("lidar_yaw"),
                 "--frame-id", "base_link",
-                "--child-frame-id", "livox_frame",
+                "--child-frame-id", lidar_frame,
             ],
         ),
         Node(
@@ -105,7 +111,7 @@ def generate_launch_description() -> LaunchDescription:
             ],
             parameters=[
                 {
-                    "target_frame": "livox_frame",
+                    "target_frame": lidar_frame,
                     "transform_tolerance": 0.05,
                     "min_height": -0.20,
                     "max_height": 0.25,
@@ -117,7 +123,7 @@ def generate_launch_description() -> LaunchDescription:
                     "range_max": 12.0,
                     "use_inf": True,
                     "inf_epsilon": 1.0,
-                    "queue_size": 10,
+                    "queue_size": 1,
                 }
             ],
         ),
@@ -259,8 +265,8 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
-                "wrapped_cloud_topic",
-                default_value="/ubuntu/navigation/lidar",
+                "source_cloud_topic",
+                default_value="/utlidar/cloud",
             ),
             DeclareLaunchArgument(
                 "cloud_topic",
@@ -269,6 +275,18 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "scan_topic",
                 default_value="/ubuntu/navigation/nav2/scan",
+            ),
+            DeclareLaunchArgument(
+                "lidar_frame",
+                default_value="utlidar_lidar",
+            ),
+            DeclareLaunchArgument(
+                "publish_lidar_static_tf",
+                default_value="true",
+                description=(
+                    "Publish the configured base_link -> utlidar_lidar extrinsics; "
+                    "set false when the robot already publishes this TF"
+                ),
             ),
             DeclareLaunchArgument(
                 "odom_input_topic", default_value="/ubuntu/loco/state"
@@ -301,22 +319,22 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/ubuntu/navigation/nav2/status",
             ),
             DeclareLaunchArgument(
-                "lidar_x", description="Required measured base_link -> lidar x (m)"
+                "lidar_x", description="Configured base_link -> lidar x (m)"
             ),
             DeclareLaunchArgument(
-                "lidar_y", description="Required measured base_link -> lidar y (m)"
+                "lidar_y", description="Configured base_link -> lidar y (m)"
             ),
             DeclareLaunchArgument(
-                "lidar_z", description="Required measured base_link -> lidar z (m)"
+                "lidar_z", description="Configured base_link -> lidar z (m)"
             ),
             DeclareLaunchArgument(
-                "lidar_roll", description="Required measured base_link -> lidar roll (rad)"
+                "lidar_roll", description="Configured base_link -> lidar roll (rad)"
             ),
             DeclareLaunchArgument(
-                "lidar_pitch", description="Required measured base_link -> lidar pitch (rad)"
+                "lidar_pitch", description="Configured base_link -> lidar pitch (rad)"
             ),
             DeclareLaunchArgument(
-                "lidar_yaw", description="Required measured base_link -> lidar yaw (rad)"
+                "lidar_yaw", description="Configured base_link -> lidar yaw (rad)"
             ),
             *sensor_adapters,
             mapping,

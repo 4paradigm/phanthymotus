@@ -88,6 +88,11 @@ def _timestamp_and_frame(
         raise InvalidLocoState("schema conflicts with schema_version=2")
     is_v2 = schema_version == 2 or schema == "phanthy.g1.loco_state.v2"
     if is_v2:
+        timestamp_source = state.get("timestamp_source")
+        if timestamp_source != "driver_receive":
+            raise InvalidLocoState(
+                "timestamp_source must be 'driver_receive' for loco_state.v2"
+            )
         source_stamp_ns = state.get("source_stamp_ns")
         if isinstance(source_stamp_ns, bool) or not isinstance(source_stamp_ns, int):
             raise InvalidLocoState("source_stamp_ns must be an integer")
@@ -106,7 +111,7 @@ def _timestamp_and_frame(
         return (
             source_stamp_ns,
             source_frame,
-            "driver",
+            timestamp_source,
             "driver_payload",
             "phanthy.g1.loco_state.v2",
         )
@@ -176,7 +181,7 @@ class OriginNormalizer:
             max_future_skew_ns=self.max_future_skew_ns,
         )
         if (
-            timestamp_source == "driver"
+            timestamp_source == "driver_receive"
             and self._last_driver_source_stamp_ns is not None
             and source_stamp_ns < self._last_driver_source_stamp_ns
         ):
@@ -233,6 +238,6 @@ class OriginNormalizer:
             vy=vy,
             wz=yaw_speed,
         )
-        if timestamp_source == "driver":
+        if timestamp_source == "driver_receive":
             self._last_driver_source_stamp_ns = source_stamp_ns
         return odometry

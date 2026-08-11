@@ -14,7 +14,7 @@ ROS 2 Humble Nav2 运行时，提供建图、地图管理、位置标签和点�
 | display name | `Nav2` |
 | card type | `processor` |
 | 感知目标 | 消费机器人状态和 LiDAR 点云，完成建图、保存地图、定位、位置标签、全局/局部规划和导航状态管理；输出结构化速度提案 |
-| input topic | 必需：`loco_state`、`lidar_cloud`；可选：`goal_pose`。首版只接受 G1 Driver 的 `/ubuntu/...` 精确绑定 |
+| input topic | 必需：`/ubuntu/loco/state`、`/utlidar/cloud`；可选：`goal_pose`。生产输入精确绑定 |
 | output topic | `velocity_proposal` 连接 Driver；`map_view` 仅供 Canvas 只读可视化；Nav2 内部 `odom/scan/map/plan/status` topic 仅供运行和调试 |
 | actions | 生命周期：`info/config/start/stop`；业务：15 个建图、地图、标签和导航 action |
 | 配置 | robot namespace、地图持久化目录、输入新鲜度、速度上限、提案 TTL 和控制面超时；非法配置 fail closed |
@@ -26,7 +26,7 @@ ROS 2 Humble Nav2 运行时，提供建图、地图管理、位置标签和点�
 
 ```text
 Driver.loco_state ──┐
-Driver.navigation/lidar ─┼──> Nav2 ──┬──> velocity_proposal.v1 ──> Driver.loco ──> Robot
+/utlidar/cloud PointCloud2 ─┼──> Nav2 ──┬──> velocity_proposal.v1 ──> Driver.loco ──> Robot
 goal_pose.v1（可选）─┘           └──> map_view.v1 ──> Canvas 只读地图监控
 ```
 
@@ -39,22 +39,22 @@ goal_pose.v1（可选）─┘           └──> map_view.v1 ──> Canvas �
 
 ## Input topics
 
-topic 名以 Canvas 的端口绑定为准。首版 companion 与现有 G1 Driver 合同冻结为
-`/ubuntu/...`；连接其他 namespace 前必须先完成 companion 参数化和相应回放验收，
+topic 名以 Canvas 的端口绑定为准。首版 companion 冻结 G1 的
+`/ubuntu/loco/state` 与原生 `/utlidar/cloud`；更换 topic 前必须先完成 companion 参数化和相应回放验收，
 当前 `config` 会 fail closed 拒绝其他 namespace。
 
 | port | 当前 G1 示例 | ROS 2 type / format | QoS | 数据合同 |
 | --- | --- | --- | --- | --- |
 | `loco_state` | `/ubuntu/loco/state` | `std_msgs/msg/String` / `data/json` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 兼容 `unitree.g1.loco_state.legacy` 和带源时间戳/frame 的 `phanthy.g1.loco_state.v2`；期望 10 Hz，最大 age 500 ms |
-| `lidar_cloud` | `/ubuntu/navigation/lidar` | `std_msgs/msg/UInt8MultiArray` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=10) + VOLATILE` | 专用 `phanthy.sensor.pointcloud.v2` PCV2 流，保留 MID360 原始 frame、XYZIRT 和逐点 time；期望 10 Hz，最大 age 500 ms |
+| `lidar_cloud` | `/utlidar/cloud` | `sensor_msgs/msg/PointCloud2` / `sensor/pointcloud` | `BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE` | 机器人原生 MID360 XYZIRT；companion 保留 frame/fields/点数据，仅在 LiDAR 为独立时钟时归一化输出 header stamp |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String` / `data/json` | `RELIABLE + KEEP_LAST(depth=10) + VOLATILE` | `phanthy.navigation.goal.v1`；`map` frame；每条消息必须有唯一 `goal_id` |
 
 legacy `loco_state` 没有源时间戳或 frame 时，adapter 必须明确标记接收时间和
 配置来源，不得把接收时间伪装成设备源时间。Nav2 不订阅保留给安全与看板的
-legacy `/ubuntu/lidar/cloud`；LiDAR 只从 `/ubuntu/navigation/lidar` 接收 PCV2，
-并使用 sensor-data QoS 兼容 Driver 的 BEST_EFFORT 发布端。
+legacy `/ubuntu/lidar/cloud`；LiDAR 直接订阅 `/utlidar/cloud`，使用
+`BEST_EFFORT + KEEP_LAST(1)` 避免历史帧排队。
 
-### Driver v2 时间和点云合同
+### Loco v2 与原生 LiDAR 时间合同
 
 `loco_state.v2` 可用 `schema="phanthy.g1.loco_state.v2"` 或
 `schema_version=2` 识别；两者同时出现时必须一致。最小 JSON 如下：
@@ -64,6 +64,7 @@ legacy `/ubuntu/lidar/cloud`；LiDAR 只从 `/ubuntu/navigation/lidar` 接收 PC
   "schema": "phanthy.g1.loco_state.v2",
   "schema_version": 2,
   "source_stamp_ns": 1786444832836579000,
+  "timestamp_source": "driver_receive",
   "frame_id": "odom_source",
   "position": [0.0, 0.0, 0.0],
   "velocity": [0.0, 0.0, 0.0],
@@ -72,21 +73,8 @@ legacy `/ubuntu/lidar/cloud`；LiDAR 只从 `/ubuntu/navigation/lidar` 接收 PC
 }
 ```
 
-`/ubuntu/navigation/lidar` 上的 `phanthy.sensor.pointcloud.v2` 使用
-`UInt8MultiArray`，字节序为
-little-endian：
-
-```text
-<4sHHIIqH
-magic="PCV2", version=2, flags, point_step, point_count,
-source_stamp_ns, frame_id_length
-frame_id UTF-8 bytes
-point_count * point_step raw point bytes
-```
-
-`flags=0x0000` 只声明 `x/y/z float32 @ 0/4/8`，保留已有 v2
-兼容路径。G1 MID360 完整布局必须设置
-`flags=0x0001`，且 `point_step=22`：
+`/utlidar/cloud` 必须是标准 `sensor_msgs/msg/PointCloud2`，
+`header.frame_id=utlidar_lidar`，并保留 MID360 XYZIRT 布局：
 
 | field | offset | datatype | unit/reference |
 | --- | ---: | --- | --- |
@@ -95,18 +83,22 @@ point_count * point_step raw point bytes
 | `z` | 8 | `FLOAT32` | m |
 | `intensity` | 12 | `FLOAT32` | Driver 原值 |
 | `ring` | 16 | `UINT16` | 通道号 |
-| `time` | 18 | `FLOAT32` | 相对 `source_stamp_ns` 的 ns |
+| `time` | 18 | `FLOAT32` | 相对原始 `header.stamp` 的 ns |
 
-未知 flag 或 flag/`point_step` 不匹配会 fail closed。两路 v2 的
-`source_stamp_ns` 都必须是 Driver 已归一化到 ROS system/Unix epoch
-的纳秒，不能直接透传设备 epoch；LiDAR stamp 表示一帧扫描的
-开始时间。Perception 在发布 odom/TF/cloud 前要求源时间落在
-`[-100 ms, +500 ms]` 接收年龄窗口内，且 v2 odom 与 scan 的
-最新源时间差不超过 `200 ms`。陈旧、过度超前、倒退或 v2
-跨流错位均会阻断导航。兼容的 legacy `loco_state` 只有 adapter 接收时间，
-因此只执行自身 freshness 检查，不伪装成与 PCV2 的跨流源时间同步。
-部署时先升级 Perception，再让 Driver 发送 `flags=0x0001`；旧版
-Perception 会按 fail-closed 原则拒绝该新布局。
+现场 LiDAR raw stamp 与 Jetson system time 相差约 16,857,528 秒，
+不能直接用于 TF。companion 的 `timestamp_mode=auto` 先判断 raw header 是否
+已在 system-time 域：已同步则原样使用；否则用
+`receive - raw_header - max(point.time)` 的滑动最小值映射到 loco/TF 的时间轴。
+单帧调度抖动只记录 residual，不会向前拖动时钟或触发误 reset。
+`/ubuntu/navigation/nav2/lidar_status` 记录 raw/normalized/receive stamp、
+offset、residual、reset 和计数器，但不声明点云到达时间就是源采样时间。
+接收断流、归一化后过度陈旧/超前或时间倒退仍 fail closed。
+
+`base_link -> utlidar_lidar` 默认使用 Driver G1 URDF 中沿零腰部链
+合成的标称外参，不能只替换 frame 字符串；如果现场有校准值，
+应通过环境变量覆盖。默认由 companion 发布该静态 TF；如果机器人
+已有节点发布同一 TF，必须设置 `NAV2_PUBLISH_LIDAR_STATIC_TF=false`
+避免重复 authority。
 
 这个合同会保留 MID360 逐点 `time` metadata，但现有
 `pointcloud_to_laserscan -> SLAM Toolbox` 不会自动消费它做逐点
@@ -412,8 +404,8 @@ STAGE=stop \
 `input_topics` 连线、建图/停图/原子存图、结构化 proposal、传感器断流
 零速保护与恢复、10 轮 start/stop、非法输入隔离和 Perception 重启验证。
 
-当前仍是 Draft，不能宣称完整可用：本轮已有 legacy/v2 确定性 fixture，
-但没有真实 G1 PCV2 录包，合成点云也不能证明非空房间
+当前仍是 Draft，不能宣称完整可用：本轮已有标准 PointCloud2 确定性 fixture，
+但没有在真机上验收新 companion 的 clock offset/residual，合成点云也不能证明非空房间
 路径规划。此外，官方 Core 尚未消费 `x-execution-control` / `x-topic-actions`，
 所以 Driver lease 和 `goal_pose` 执行闭环仍是外部 blocker。ARM64 生产镜像、真实
 录包、Dashboard 人工界面确认以及 G1 真机执行属于后续验收。

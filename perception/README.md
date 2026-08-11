@@ -96,8 +96,8 @@ ASR result JSON:
 ## Nav2 卡片
 
 `nav2` 是单实例 `processor` 卡片，提供建图、地图保存/加载、位置标签和点到点导航。
-首版接收 G1 Driver 的 `/ubuntu/loco/state` 与专用 PCV2 流
-`/ubuntu/navigation/lidar`，输出
+首版接收 G1 Driver 的 `/ubuntu/loco/state` 与机器人原生标准
+`/utlidar/cloud` `sensor_msgs/msg/PointCloud2`，输出
 `/ubuntu/navigation/nav2/velocity_proposal` 以及仅用于 Canvas 监控的
 `/ubuntu/navigation/nav2/map_view`。卡片不会直接调用机器人 SDK；任何物理
 执行都必须由 Agent Core 建立受信任务 lease，再由 Driver 独立完成限幅、急停和停车确认。
@@ -106,8 +106,9 @@ ASR result JSON:
 
 - `speed` 范围 `0.05–0.15 m/s`，首版导航固定允许绕障，不显示无可选值的 `mode`；
 - 输入超过 `500 ms`、TF/地图/Nav2 lifecycle 不 ready 时 fail closed；
-- Driver v2 输入必须使用 ROS system/Unix 同一时钟域；Perception 会在发布
-  odom/TF/cloud 前拒绝陈旧、超前、倒退或 odom/scan 错位的时间戳；
+- `loco_state.v2` 使用 Driver callback 的 ROS system/Unix 时间；LiDAR companion
+  保留原始 frame/fields/XYZIRT 点数据，将独立 LiDAR 时钟映射到同一时间域，
+  并在 `/ubuntu/navigation/nav2/lidar_status` 保留 raw stamp 和偏移诊断；
 - `namespace=ubuntu`、proposal TTL `250 ms` 和速度上限是首版冻结合同；
 - 地图宿主机目录为 `/opt/phanthy-motus/data/nav2/maps`，companion 容器内为 `/maps`；
 - `start_mapping` 自动切换 mapping，`stop_mapping` 原子保存后自动切回 localization；

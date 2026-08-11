@@ -19,7 +19,8 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from std_msgs.msg import String, UInt8MultiArray
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import String
 
 
 def _cloud_points(radius: float = 2.5, points: int = 720) -> tuple[bytes, bytes]:
@@ -40,24 +41,6 @@ def _cloud_points(radius: float = 2.5, points: int = 720) -> tuple[bytes, bytes]
     return bytes(xyz_points), bytes(xyzirt_points)
 
 
-def _v2_cloud(source_stamp_ns: int, points: int, data: bytes) -> bytes:
-    frame = b"livox_frame"
-    return (
-        struct.pack(
-            "<4sHHIIqH",
-            b"PCV2",
-            2,
-            0x0001,
-            22,
-            points,
-            source_stamp_ns,
-            len(frame),
-        )
-        + frame
-        + data
-    )
-
-
 class StageSixFixture(Node):
     def __init__(self) -> None:
         super().__init__("nav2_stage6_fixture")
@@ -72,10 +55,7 @@ class StageSixFixture(Node):
         if self._sensor_schema not in {"legacy", "v2"}:
             raise ValueError("NAV2_FIXTURE_SENSOR_SCHEMA must be legacy or v2")
         self._point_count = 720
-        xyz_points, xyzirt_points = _cloud_points(points=self._point_count)
-        self._legacy_cloud = (
-            struct.pack("<II", 12, self._point_count) + xyz_points
-        )
+        _xyz_points, xyzirt_points = _cloud_points(points=self._point_count)
         self._v2_cloud_data = xyzirt_points
         signal.signal(signal.SIGUSR1, self._on_stop_signal)
         signal.signal(signal.SIGUSR2, self._on_resume_signal)
@@ -83,8 +63,14 @@ class StageSixFixture(Node):
         self._loco_pub = self.create_publisher(
             String, "/ubuntu/loco/state", qos_profile_sensor_data
         )
+        cloud_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self._cloud_pub = self.create_publisher(
-            UInt8MultiArray, "/ubuntu/navigation/lidar", qos_profile_sensor_data
+            PointCloud2, "/utlidar/cloud", cloud_qos
         )
         self.create_subscription(
             String,
@@ -135,22 +121,31 @@ class StageSixFixture(Node):
                     "schema": "phanthy.g1.loco_state.v2",
                     "schema_version": 2,
                     "source_stamp_ns": source_stamp_ns,
+                    "timestamp_source": "driver_receive",
                     "frame_id": "odom_source",
                 }
             )
         state = String()
         state.data = json.dumps(state_payload, separators=(",", ":"))
-        cloud = UInt8MultiArray()
-        cloud_payload = (
-            _v2_cloud(
-                source_stamp_ns,
-                self._point_count,
-                self._v2_cloud_data,
-            )
-            if self._sensor_schema == "v2"
-            else self._legacy_cloud
-        )
-        cloud.data = list(cloud_payload)
+        cloud = PointCloud2()
+        cloud.header.stamp.sec = source_stamp_ns // 1_000_000_000
+        cloud.header.stamp.nanosec = source_stamp_ns % 1_000_000_000
+        cloud.header.frame_id = "utlidar_lidar"
+        cloud.height = 1
+        cloud.width = self._point_count
+        cloud.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="intensity", offset=12, datatype=PointField.FLOAT32, count=1),
+            PointField(name="ring", offset=16, datatype=PointField.UINT16, count=1),
+            PointField(name="time", offset=18, datatype=PointField.FLOAT32, count=1),
+        ]
+        cloud.is_bigendian = False
+        cloud.point_step = 22
+        cloud.row_step = 22 * self._point_count
+        cloud.data = self._v2_cloud_data
+        cloud.is_dense = True
         self._loco_pub.publish(state)
         self._cloud_pub.publish(cloud)
 

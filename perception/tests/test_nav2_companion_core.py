@@ -19,8 +19,9 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 from g1_nav2.canvas_pointcloud_core import (  # noqa: E402
     InvalidCanvasPointCloud,
-    PCV2_FLAG_MID360_XYZIRT,
-    decode_canvas_pointcloud,
+    LidarClockNormalizer,
+    point_time_max_offset_ns,
+    validate_standard_pointcloud,
 )
 from g1_nav2.execution_protocol import (  # noqa: E402
     ProtocolError,
@@ -46,31 +47,6 @@ from g1_nav2.runtime_process import build_launch_command  # noqa: E402
 
 
 class Nav2CompanionCoreTest(unittest.TestCase):
-    @staticmethod
-    def _v2_cloud(
-        *,
-        source_stamp_ns: int,
-        flags: int = 0,
-        point_step: int = 12,
-        point_data: bytes | None = None,
-    ) -> bytes:
-        frame = b"livox_frame"
-        data = point_data if point_data is not None else b"\0" * point_step
-        return (
-            struct.pack(
-                "<4sHHIIqH",
-                b"PCV2",
-                2,
-                flags,
-                point_step,
-                1,
-                source_stamp_ns,
-                len(frame),
-            )
-            + frame
-            + data
-        )
-
     def test_canvas_map_view_encodes_occupied_cells_and_robot_pose(self) -> None:
         snapshot = build_occupancy_snapshot(
             width=3,
@@ -113,6 +89,119 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 origin_yaw=0.0,
                 data=[0, 100],
             )
+
+    def test_native_pointcloud2_preserves_header_contract(self) -> None:
+        stamp_ns = validate_standard_pointcloud(
+            stamp_sec=10,
+            stamp_nanosec=20,
+            receive_stamp_ns=None,
+            frame_id="utlidar_lidar",
+            height=1,
+            width=2,
+            point_step=22,
+            row_step=44,
+            data_length=44,
+            field_names=("x", "y", "z", "intensity", "ring", "time"),
+        )
+        self.assertEqual(stamp_ns, 10_000_000_020)
+
+        with self.assertRaisesRegex(InvalidCanvasPointCloud, "x/y/z"):
+            validate_standard_pointcloud(
+                stamp_sec=10,
+                stamp_nanosec=0,
+                receive_stamp_ns=None,
+                frame_id="utlidar_lidar",
+                height=1,
+                width=2,
+                point_step=22,
+                row_step=44,
+                data_length=44,
+                field_names=("x", "y", "time"),
+            )
+
+    def test_native_lidar_clock_is_mapped_to_ros_system_time(self) -> None:
+        normalizer = LidarClockNormalizer(
+            warmup_samples=3,
+            window_samples=5,
+        )
+        raw = 1_700_000_000_000_000_000
+        clock_offset = 16_857_528_000_000_000
+        scan_span = 99_840_000
+
+        self.assertIsNone(
+            normalizer.normalize(
+                raw_stamp_ns=raw,
+                receive_stamp_ns=raw + clock_offset + scan_span + 8_000_000,
+                scan_end_offset_ns=scan_span,
+            )
+        )
+        self.assertIsNone(
+            normalizer.normalize(
+                raw_stamp_ns=raw + 100_000_000,
+                receive_stamp_ns=(
+                    raw + 100_000_000 + clock_offset + scan_span + 2_000_000
+                ),
+                scan_end_offset_ns=scan_span,
+            )
+        )
+        normalized = normalizer.normalize(
+            raw_stamp_ns=raw + 200_000_000,
+            receive_stamp_ns=(
+                raw + 200_000_000 + clock_offset + scan_span + 5_000_000
+            ),
+            scan_end_offset_ns=scan_span,
+        )
+
+        self.assertEqual(
+            normalized,
+            raw + 200_000_000 + clock_offset + 2_000_000,
+        )
+        self.assertEqual(normalizer.snapshot().mode, "normalize")
+
+        late = normalizer.normalize(
+            raw_stamp_ns=raw + 300_000_000,
+            receive_stamp_ns=(
+                raw + 300_000_000 + clock_offset + scan_span + 400_000_000
+            ),
+            scan_end_offset_ns=scan_span,
+        )
+        self.assertEqual(
+            late,
+            raw + 300_000_000 + clock_offset + 2_000_000,
+        )
+        self.assertEqual(normalizer.snapshot().resets, 0)
+
+    def test_aligned_lidar_stamp_is_passed_through(self) -> None:
+        normalizer = LidarClockNormalizer(warmup_samples=3)
+        normalized = normalizer.normalize(
+            raw_stamp_ns=10_000_000_000,
+            receive_stamp_ns=10_120_000_000,
+            scan_end_offset_ns=100_000_000,
+        )
+
+        self.assertEqual(normalized, 10_000_000_000)
+        self.assertEqual(normalizer.snapshot().mode, "passthrough")
+
+    def test_native_point_time_field_defines_scan_end(self) -> None:
+        data = bytearray(44)
+        struct.pack_into("<f", data, 18, 5_000.0)
+        struct.pack_into("<f", data, 40, 99_840_000.0)
+        fields = [
+            type("Field", (), {"name": "time", "offset": 18, "datatype": 7, "count": 1})()
+        ]
+
+        self.assertEqual(
+            point_time_max_offset_ns(
+                data=data,
+                fields=fields,
+                height=1,
+                width=2,
+                point_step=22,
+                row_step=44,
+                is_bigendian=False,
+            ),
+            99_840_000,
+        )
 
     def test_canvas_map_view_is_installed_and_launched(self) -> None:
         setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
@@ -240,19 +329,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("wait_for_all_acked", command)
         self.assertIn("goal.behavior_tree = self._behavior_tree_path", command)
 
-    def test_legacy_sensor_adapters_label_receive_time(self) -> None:
-        point_step = 12
-        raw = struct.pack("<II", point_step, 1) + b"\0" * point_step
-        cloud = decode_canvas_pointcloud(
-            raw, receive_stamp_ns=123, legacy_frame_id="livox_frame"
-        )
-        self.assertEqual(cloud.timestamp_source, "adapter_receive")
-        self.assertEqual(cloud.source_schema, "unitree.g1.pointcloud.legacy")
-        with self.assertRaises(InvalidCanvasPointCloud):
-            decode_canvas_pointcloud(
-                raw[:-1], receive_stamp_ns=123, legacy_frame_id="livox_frame"
-            )
-
+    def test_legacy_loco_adapter_labels_receive_time(self) -> None:
         normalizer = OriginNormalizer()
         first = normalizer.convert(
             {
@@ -267,39 +344,14 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertAlmostEqual(first.y, 0.0)
         self.assertEqual(first.timestamp_source, "adapter_receive")
 
-    def test_v2_sensor_contract_preserves_time_frame_and_mid360_fields(self) -> None:
+    def test_loco_v2_preserves_driver_receive_time(self) -> None:
         source_stamp_ns = 1_000_000_000
-        point = struct.pack("<ffffHf", 1.0, 2.0, 3.0, 42.0, 7, 50_000_000.0)
-        cloud = decode_canvas_pointcloud(
-            self._v2_cloud(
-                source_stamp_ns=source_stamp_ns,
-                flags=PCV2_FLAG_MID360_XYZIRT,
-                point_step=22,
-                point_data=point,
-            ),
-            receive_stamp_ns=1_100_000_000,
-        )
-        self.assertEqual(cloud.source_stamp_ns, source_stamp_ns)
-        self.assertEqual(cloud.timestamp_source, "driver")
-        self.assertEqual(cloud.frame_id, "livox_frame")
-        self.assertEqual(
-            [(field.name, field.offset, field.datatype) for field in cloud.fields],
-            [
-                ("x", 0, 7),
-                ("y", 4, 7),
-                ("z", 8, 7),
-                ("intensity", 12, 7),
-                ("ring", 16, 4),
-                ("time", 18, 7),
-            ],
-        )
-        self.assertEqual(cloud.data, point)
-
         normalizer = OriginNormalizer()
         odom = normalizer.convert(
             {
                 "schema": "phanthy.g1.loco_state.v2",
                 "source_stamp_ns": source_stamp_ns,
+                "timestamp_source": "driver_receive",
                 "frame_id": "odom_source",
                 "position": [2.0, 3.0],
                 "velocity": [0.1, 0.0],
@@ -308,38 +360,15 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             },
             receive_stamp_ns=1_100_000_000,
         )
-        self.assertEqual(odom.timestamp_source, "driver")
+        self.assertEqual(odom.timestamp_source, "driver_receive")
         self.assertEqual(odom.source_stamp_ns, source_stamp_ns)
 
-    def test_v2_sensor_contract_rejects_bad_clock_layout_and_schema(self) -> None:
-        with self.assertRaisesRegex(InvalidCanvasPointCloud, "stale"):
-            decode_canvas_pointcloud(
-                self._v2_cloud(source_stamp_ns=1_000_000_000),
-                receive_stamp_ns=1_600_000_001,
-            )
-        with self.assertRaisesRegex(InvalidCanvasPointCloud, "ahead"):
-            decode_canvas_pointcloud(
-                self._v2_cloud(source_stamp_ns=1_200_000_001),
-                receive_stamp_ns=1_100_000_000,
-            )
-        with self.assertRaisesRegex(InvalidCanvasPointCloud, "unsupported.*flags"):
-            decode_canvas_pointcloud(
-                self._v2_cloud(source_stamp_ns=1_000_000_000, flags=0x8000),
-                receive_stamp_ns=1_100_000_000,
-            )
-        with self.assertRaisesRegex(InvalidCanvasPointCloud, "point_step=22"):
-            decode_canvas_pointcloud(
-                self._v2_cloud(
-                    source_stamp_ns=1_000_000_000,
-                    flags=PCV2_FLAG_MID360_XYZIRT,
-                ),
-                receive_stamp_ns=1_100_000_000,
-            )
-
+    def test_loco_v2_rejects_bad_clock_and_schema(self) -> None:
         stale_normalizer = OriginNormalizer()
         stale_state = {
             "schema_version": 2,
             "source_stamp_ns": 1_000_000_000,
+            "timestamp_source": "driver_receive",
             "frame_id": "odom_source",
             "position": [2.0, 3.0],
             "velocity": [0.1, 0.0],
@@ -361,11 +390,21 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 receive_stamp_ns=1_100_000_000,
             )
 
+        ambiguous_time = dict(stale_state)
+        ambiguous_time.pop("timestamp_source")
+        ambiguous_time["source_stamp_ns"] = 1_000_000_000
+        with self.assertRaisesRegex(InvalidLocoState, "driver_receive"):
+            OriginNormalizer().convert(
+                ambiguous_time,
+                receive_stamp_ns=1_100_000_000,
+            )
+
     def test_v2_loco_state_rejects_source_time_regression(self) -> None:
         normalizer = OriginNormalizer()
         state = {
             "schema": "phanthy.g1.loco_state.v2",
             "source_stamp_ns": 1_000_000_000,
+            "timestamp_source": "driver_receive",
             "frame_id": "odom_source",
             "position": [2.0, 3.0],
             "velocity": [0.1, 0.0],
@@ -438,6 +477,29 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertNotIn("sensor_stamp_skew", legacy_async["readiness_blockers"])
 
+        driver_receive_async = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            odom_status={
+                "state": "ready",
+                "timestamp_source": "driver_receive",
+                "source_age_sec": 0.1,
+            },
+            odom_status_received_at=9.9,
+            scan_received_at=9.9,
+            scan_source_age_sec=0.1,
+            sensor_stamp_skew_sec=0.45,
+            max_sensor_stamp_skew_sec=0.2,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            map_ready=True,
+            map_to_base_ready=True,
+        )
+        self.assertNotIn(
+            "sensor_stamp_skew",
+            driver_receive_async["readiness_blockers"],
+        )
+
         skewed = evaluate_readiness(
             now_monotonic=10.0,
             max_age_sec=0.5,
@@ -493,6 +555,13 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         }
         mapping = build_launch_command(mode="mapping", environ=env)
         self.assertIn("mode:=mapping", mapping)
+        self.assertIn("publish_lidar_static_tf:=true", mapping)
+        env["NAV2_PUBLISH_LIDAR_STATIC_TF"] = "false"
+        self.assertIn(
+            "publish_lidar_static_tf:=false",
+            build_launch_command(mode="mapping", environ=env),
+        )
+        env["NAV2_PUBLISH_LIDAR_STATIC_TF"] = "true"
         with tempfile.TemporaryDirectory() as temporary:
             map_dir = Path(temporary) / "room-a"
             map_dir.mkdir()

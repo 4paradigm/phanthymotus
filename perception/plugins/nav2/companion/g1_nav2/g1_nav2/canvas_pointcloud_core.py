@@ -1,8 +1,10 @@
-"""Decode released and timestamped G1 canvas point-cloud envelopes."""
+"""Validate native G1 PointCloud2 data and normalize its LiDAR clock."""
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+import math
 import struct
 from typing import Iterable
 
@@ -14,57 +16,137 @@ from .timestamp_contract import (
 )
 
 
-_MAGIC = b"PCV2"
-_VERSION = 2
-_HEADER = struct.Struct("<4sHHIIqH")
-_LEGACY_HEADER = struct.Struct("<II")
+NSEC_PER_SEC = 1_000_000_000
+POINT_FIELD_FLOAT32 = 7
 _MIN_POINT_STEP = 12
 _MAX_POINT_STEP = 512
 _MAX_POINTS = 2_000_000
-_MAX_FRAME_ID_BYTES = 128
-PCV2_FLAG_MID360_XYZIRT = 0x0001
-_SUPPORTED_FLAGS = PCV2_FLAG_MID360_XYZIRT
-_MID360_POINT_STEP = 22
-POINT_FIELD_UINT16 = 4
-POINT_FIELD_FLOAT32 = 7
 
 
 class InvalidCanvasPointCloud(ValueError):
-    """Raised when a ``sensor/pointcloud`` envelope is malformed."""
+    """Raised when a native ``sensor_msgs/msg/PointCloud2`` is malformed."""
 
 
 @dataclass(frozen=True)
-class PointFieldSpec:
-    name: str
-    offset: int
-    datatype: int
-    count: int = 1
+class LidarClockSnapshot:
+    ready: bool
+    mode: str
+    samples: int
+    offset_ns: int | None
+    residual_ns: int | None
+    resets: int
 
 
-XYZ_FIELDS = (
-    PointFieldSpec("x", 0, POINT_FIELD_FLOAT32),
-    PointFieldSpec("y", 4, POINT_FIELD_FLOAT32),
-    PointFieldSpec("z", 8, POINT_FIELD_FLOAT32),
-)
-MID360_XYZIRT_FIELDS = XYZ_FIELDS + (
-    PointFieldSpec("intensity", 12, POINT_FIELD_FLOAT32),
-    PointFieldSpec("ring", 16, POINT_FIELD_UINT16),
-    PointFieldSpec("time", 18, POINT_FIELD_FLOAT32),
-)
+class LidarClockNormalizer:
+    """Map a native LiDAR clock into the ROS system-time domain.
 
+    If the native header is already close to the ROS receive clock, ``auto``
+    mode passes it through unchanged. Otherwise the minimum observed
+    ``receive - scan_end`` offset is used so scheduling jitter cannot move the
+    LiDAR clock forward. A backwards native stamp starts a new warm-up period.
+    """
 
-@dataclass(frozen=True)
-class CanvasPointCloud:
-    source_stamp_ns: int
-    frame_id: str
-    timestamp_source: str
-    frame_source: str
-    source_schema: str
-    flags: int
-    fields: tuple[PointFieldSpec, ...]
-    point_step: int
-    point_count: int
-    data: bytes
+    def __init__(
+        self,
+        *,
+        mode: str = "auto",
+        warmup_samples: int = 8,
+        window_samples: int = 200,
+        aligned_tolerance_ns: int = 2 * NSEC_PER_SEC,
+    ) -> None:
+        if mode not in {"auto", "normalize", "passthrough"}:
+            raise ValueError("mode must be auto, normalize, or passthrough")
+        if warmup_samples < 1:
+            raise ValueError("warmup_samples must be positive")
+        if window_samples < warmup_samples:
+            raise ValueError("window_samples must be >= warmup_samples")
+        if aligned_tolerance_ns < 1:
+            raise ValueError("aligned_tolerance_ns must be positive")
+        self._configured_mode = mode
+        self._active_mode: str | None = None
+        self._warmup_samples = int(warmup_samples)
+        self._aligned_tolerance_ns = int(aligned_tolerance_ns)
+        self._candidates: deque[int] = deque(maxlen=int(window_samples))
+        self._last_raw_stamp_ns: int | None = None
+        self._offset_ns: int | None = None
+        self._residual_ns: int | None = None
+        self._resets = 0
+
+    def normalize(
+        self,
+        *,
+        raw_stamp_ns: int,
+        receive_stamp_ns: int,
+        scan_end_offset_ns: int,
+    ) -> int | None:
+        raw_stamp_ns = int(raw_stamp_ns)
+        receive_stamp_ns = int(receive_stamp_ns)
+        scan_end_offset_ns = int(scan_end_offset_ns)
+        if raw_stamp_ns <= 0 or receive_stamp_ns <= 0:
+            raise ValueError("raw and receive timestamps must be positive")
+        if not 0 <= scan_end_offset_ns <= NSEC_PER_SEC:
+            raise ValueError("scan_end_offset_ns must be within one second")
+
+        if (
+            self._last_raw_stamp_ns is not None
+            and raw_stamp_ns <= self._last_raw_stamp_ns
+        ):
+            self._reset()
+        self._last_raw_stamp_ns = raw_stamp_ns
+
+        if self._active_mode is None:
+            self._active_mode = self._resolve_mode(
+                raw_stamp_ns=raw_stamp_ns,
+                receive_stamp_ns=receive_stamp_ns,
+            )
+
+        if self._active_mode == "passthrough":
+            raw_age_ns = receive_stamp_ns - raw_stamp_ns
+            if not (
+                -self._aligned_tolerance_ns
+                <= raw_age_ns
+                <= self._aligned_tolerance_ns
+            ):
+                raise ValueError("passthrough LiDAR clock left system-time domain")
+            self._offset_ns = 0
+            self._residual_ns = raw_age_ns - scan_end_offset_ns
+            return raw_stamp_ns
+
+        candidate = receive_stamp_ns - raw_stamp_ns - scan_end_offset_ns
+        self._candidates.append(candidate)
+        self._offset_ns = min(self._candidates)
+        self._residual_ns = candidate - self._offset_ns
+        if len(self._candidates) < self._warmup_samples:
+            return None
+        return raw_stamp_ns + self._offset_ns
+
+    def snapshot(self) -> LidarClockSnapshot:
+        return LidarClockSnapshot(
+            ready=(
+                self._active_mode == "passthrough"
+                or len(self._candidates) >= self._warmup_samples
+            ),
+            mode=self._active_mode or "warming_up",
+            samples=len(self._candidates),
+            offset_ns=self._offset_ns,
+            residual_ns=self._residual_ns,
+            resets=self._resets,
+        )
+
+    def _resolve_mode(self, *, raw_stamp_ns: int, receive_stamp_ns: int) -> str:
+        if self._configured_mode != "auto":
+            return self._configured_mode
+        raw_age_ns = receive_stamp_ns - raw_stamp_ns
+        if -self._aligned_tolerance_ns <= raw_age_ns <= self._aligned_tolerance_ns:
+            return "passthrough"
+        return "normalize"
+
+    def _reset(self) -> None:
+        self._candidates.clear()
+        self._active_mode = None
+        self._offset_ns = None
+        self._residual_ns = None
+        self._resets += 1
 
 
 def _valid_frame_id(frame_id: str) -> bool:
@@ -83,140 +165,120 @@ def _validate_shape(point_step: int, point_count: int) -> None:
         raise InvalidCanvasPointCloud(f"invalid point_count: {point_count}")
 
 
-def decode_canvas_pointcloud(
-    payload: bytes | bytearray | memoryview | Iterable[int],
+def validate_standard_pointcloud(
     *,
-    receive_stamp_ns: int | None = None,
-    legacy_frame_id: str | None = None,
+    stamp_sec: int,
+    stamp_nanosec: int,
+    receive_stamp_ns: int | None,
+    frame_id: str,
+    height: int,
+    width: int,
+    point_step: int,
+    row_step: int,
+    data_length: int,
+    field_names: Iterable[str],
     max_source_age_ns: int = DEFAULT_MAX_SOURCE_AGE_NS,
     max_future_skew_ns: int = DEFAULT_MAX_FUTURE_SKEW_NS,
-) -> CanvasPointCloud:
-    """Decode the released legacy envelope or timestamped v2 envelope.
+) -> int:
+    """Validate native PointCloud2 metadata without rewriting its payload.
 
-    Header layout is ``magic, version, flags, point_step, point_count,
-    source_stamp_ns, frame_id_length`` followed by UTF-8 ``frame_id`` and raw
-    point bytes. x/y/z are float32 metres at offsets 0/4/8.
-
-    The released G1 Driver currently emits ``point_step, point_count, data``.
-    It carries neither stamp nor frame, so callers must provide an adapter
-    receive timestamp and the configured MID360 frame. These are explicitly
-    labelled as adapter metadata, not Driver source metadata.
+    A native LiDAR stamp may use a device clock. Source-age validation is only
+    performed when ``receive_stamp_ns`` is provided. The G1 bridge validates
+    raw structure first and validates age after clock normalization.
     """
-
-    try:
-        raw = bytes(payload)
-    except (TypeError, ValueError) as exc:
-        raise InvalidCanvasPointCloud("payload must be a byte sequence") from exc
-    if raw[:4] != _MAGIC:
-        if len(raw) < _LEGACY_HEADER.size:
-            raise InvalidCanvasPointCloud(
-                f"payload is shorter than the {_LEGACY_HEADER.size}-byte legacy header"
+    if isinstance(stamp_sec, bool) or isinstance(stamp_nanosec, bool):
+        raise InvalidCanvasPointCloud("PointCloud2 header stamp must be integer")
+    stamp_sec = int(stamp_sec)
+    stamp_nanosec = int(stamp_nanosec)
+    if not 0 <= stamp_nanosec < NSEC_PER_SEC:
+        raise InvalidCanvasPointCloud("PointCloud2 header nanosec is out of range")
+    source_stamp_ns = stamp_sec * NSEC_PER_SEC + stamp_nanosec
+    if source_stamp_ns <= 0:
+        raise InvalidCanvasPointCloud("PointCloud2 header stamp must be positive")
+    if receive_stamp_ns is not None:
+        try:
+            validate_source_timestamp_ns(
+                source_stamp_ns,
+                receive_stamp_ns,
+                max_source_age_ns=max_source_age_ns,
+                max_future_skew_ns=max_future_skew_ns,
             )
-        point_step, point_count = _LEGACY_HEADER.unpack_from(raw)
-        _validate_shape(point_step, point_count)
-        expected_size = _LEGACY_HEADER.size + point_step * point_count
-        if len(raw) != expected_size:
-            raise InvalidCanvasPointCloud(
-                f"payload size mismatch: expected {expected_size}, got {len(raw)}"
-            )
-        if isinstance(receive_stamp_ns, bool) or not isinstance(receive_stamp_ns, int):
-            raise InvalidCanvasPointCloud(
-                "legacy point cloud requires an adapter receive timestamp"
-            )
-        if receive_stamp_ns <= 0:
-            raise InvalidCanvasPointCloud("receive_stamp_ns must be positive")
-        if not isinstance(legacy_frame_id, str) or not _valid_frame_id(legacy_frame_id):
-            raise InvalidCanvasPointCloud(
-                f"invalid configured legacy frame_id: {legacy_frame_id!r}"
-            )
-        return CanvasPointCloud(
-            source_stamp_ns=receive_stamp_ns,
-            frame_id=legacy_frame_id,
-            timestamp_source="adapter_receive",
-            frame_source="adapter_contract",
-            source_schema="unitree.g1.pointcloud.legacy",
-            flags=0,
-            fields=XYZ_FIELDS,
-            point_step=point_step,
-            point_count=point_count,
-            data=raw[_LEGACY_HEADER.size:],
-        )
-
-    if len(raw) < _HEADER.size:
-        raise InvalidCanvasPointCloud(
-            f"payload is shorter than the {_HEADER.size}-byte v2 header"
-        )
-
-    (
-        magic,
-        version,
-        flags,
-        point_step,
-        point_count,
-        source_stamp_ns,
-        frame_id_length,
-    ) = _HEADER.unpack_from(raw)
-    if magic != _MAGIC or version != _VERSION:
-        raise InvalidCanvasPointCloud(
-            f"unsupported point-cloud envelope version: {version}"
-        )
-    if flags & ~_SUPPORTED_FLAGS:
-        raise InvalidCanvasPointCloud(f"unsupported point-cloud flags: {flags}")
-    if flags & PCV2_FLAG_MID360_XYZIRT and point_step != _MID360_POINT_STEP:
-        raise InvalidCanvasPointCloud(
-            "MID360 XYZIRT layout requires point_step=22"
-        )
-    try:
-        validate_source_timestamp_ns(
-            source_stamp_ns,
-            receive_stamp_ns,
-            max_source_age_ns=max_source_age_ns,
-            max_future_skew_ns=max_future_skew_ns,
-        )
-    except InvalidSourceTimestamp as exc:
-        raise InvalidCanvasPointCloud(str(exc)) from exc
-    if not 0 < frame_id_length <= _MAX_FRAME_ID_BYTES:
-        raise InvalidCanvasPointCloud(
-            f"invalid frame_id length: {frame_id_length}"
-        )
-    _validate_shape(point_step, point_count)
-
-    data_offset = _HEADER.size + frame_id_length
-    expected_size = data_offset + point_step * point_count
-    if len(raw) != expected_size:
-        raise InvalidCanvasPointCloud(
-            f"payload size mismatch: expected {expected_size}, got {len(raw)}"
-        )
-    try:
-        frame_id = raw[_HEADER.size:data_offset].decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise InvalidCanvasPointCloud("frame_id is not valid UTF-8") from exc
+        except InvalidSourceTimestamp as exc:
+            raise InvalidCanvasPointCloud(str(exc)) from exc
     if not _valid_frame_id(frame_id):
         raise InvalidCanvasPointCloud(f"invalid ROS frame_id: {frame_id!r}")
-    return CanvasPointCloud(
-        source_stamp_ns=source_stamp_ns,
-        frame_id=frame_id,
-        timestamp_source="driver",
-        frame_source="driver_payload",
-        source_schema="phanthy.sensor.pointcloud.v2",
-        flags=flags,
-        fields=(
-            MID360_XYZIRT_FIELDS
-            if flags & PCV2_FLAG_MID360_XYZIRT
-            else XYZ_FIELDS
-        ),
-        point_step=point_step,
-        point_count=point_count,
-        data=raw[data_offset:],
-    )
+
+    height = int(height)
+    width = int(width)
+    point_step = int(point_step)
+    row_step = int(row_step)
+    data_length = int(data_length)
+    point_count = height * width
+    _validate_shape(point_step, point_count)
+    if height < 1 or row_step < point_step * width:
+        raise InvalidCanvasPointCloud("invalid PointCloud2 row layout")
+    if data_length != row_step * height:
+        raise InvalidCanvasPointCloud(
+            f"PointCloud2 data size mismatch: expected {row_step * height}, "
+            f"got {data_length}"
+        )
+    names = {str(name) for name in field_names}
+    if not {"x", "y", "z"}.issubset(names):
+        raise InvalidCanvasPointCloud("PointCloud2 must contain x/y/z fields")
+    return source_stamp_ns
+
+
+def point_time_max_offset_ns(
+    *,
+    data: bytes | bytearray | memoryview,
+    fields: Iterable,
+    height: int,
+    width: int,
+    point_step: int,
+    row_step: int,
+    is_bigendian: bool,
+) -> int:
+    """Return the native MID360 scan-end offset from its ``time`` field."""
+    time_fields = [field for field in fields if str(field.name) == "time"]
+    if len(time_fields) != 1:
+        raise InvalidCanvasPointCloud("PointCloud2 requires one time field")
+    time_field = time_fields[0]
+    offset = int(time_field.offset)
+    if (
+        int(time_field.datatype) != POINT_FIELD_FLOAT32
+        or int(time_field.count) != 1
+    ):
+        raise InvalidCanvasPointCloud("unexpected PointCloud2 time field layout")
+    if offset < 0 or offset + 4 > int(point_step):
+        raise InvalidCanvasPointCloud("PointCloud2 time field is outside point_step")
+
+    raw = memoryview(data)
+    unpack = struct.Struct(">f" if is_bigendian else "<f").unpack_from
+    maximum = 0.0
+    try:
+        for row in range(int(height)):
+            row_offset = row * int(row_step)
+            for column in range(int(width)):
+                value = float(
+                    unpack(raw, row_offset + column * int(point_step) + offset)[0]
+                )
+                if not math.isfinite(value) or value < 0.0:
+                    raise InvalidCanvasPointCloud(
+                        "PointCloud2 contains an invalid point time"
+                    )
+                maximum = max(maximum, value)
+    except (struct.error, TypeError, ValueError) as exc:
+        raise InvalidCanvasPointCloud("invalid PointCloud2 time buffer") from exc
+    maximum_ns = int(round(maximum))
+    if maximum_ns > NSEC_PER_SEC:
+        raise InvalidCanvasPointCloud("PointCloud2 scan duration exceeds one second")
+    return maximum_ns
 
 
 __all__ = [
-    "CanvasPointCloud",
     "InvalidCanvasPointCloud",
-    "MID360_XYZIRT_FIELDS",
-    "PCV2_FLAG_MID360_XYZIRT",
-    "PointFieldSpec",
-    "XYZ_FIELDS",
-    "decode_canvas_pointcloud",
+    "LidarClockNormalizer",
+    "LidarClockSnapshot",
+    "point_time_max_offset_ns",
+    "validate_standard_pointcloud",
 ]
