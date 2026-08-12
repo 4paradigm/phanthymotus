@@ -84,18 +84,13 @@ class SubagentContext:
     def build_messages(self, inbox_messages: list[dict] | None = None) -> list[dict]:
         """Build full message list for LLM call.
 
-        Returns: [system, (summary if exists), history turns..., inbox messages...]
+        Returns: [system, (summary if exists), history turns..., context_seed, inbox messages...]
+        Note: context_seed is placed AFTER stable prefix (system+summary+turns) to maximize
+        prefix cache hit rate. Dynamic sensor data in context_seed would break caching if first.
         """
         messages = [{'role': 'system', 'content': self._system_prompt}]
 
-        # Context seed as first user message
-        if self._spec.context_seed and not self._turns:
-            messages.append({
-                'role': 'user',
-                'content': f'[上下文信息]\n{self._spec.context_seed}'
-            })
-
-        # Compressed summary of old turns
+        # Compressed summary of old turns (stable prefix)
         if self._summary:
             messages.append({
                 'role': 'user',
@@ -106,9 +101,16 @@ class SubagentContext:
                 'content': '了解，继续执行任务。'
             })
 
-        # History turns
+        # History turns (stable prefix)
         for turn in self._turns:
             messages.extend(turn)
+
+        # Context seed placed after stable content — dynamic data won't break prefix cache
+        if self._spec.context_seed and not self._turns:
+            messages.append({
+                'role': 'user',
+                'content': f'[上下文信息]\n{self._spec.context_seed}'
+            })
 
         # Inbox messages from parent
         if inbox_messages:
