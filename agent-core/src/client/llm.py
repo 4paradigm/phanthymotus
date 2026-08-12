@@ -180,7 +180,11 @@ class Client():
                         'completion_tokens': usage.completion_tokens,
                         'total_tokens': usage.total_tokens,
                         'cached_tokens': cached_tokens,
+                        'elapsed_s': round(elapsed, 2),
+                        'model': model,
                     }
+                else:
+                    msg['_usage'] = {'elapsed_s': round(elapsed, 2), 'model': model}
                 return msg
             except Exception as e:
                 elapsed = time.perf_counter() - t0

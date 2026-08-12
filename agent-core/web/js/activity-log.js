@@ -62,7 +62,8 @@ function _summarize(event) {
     case 'asr_result':     return `"${p.text || ''}"`;
     case 'trigger':        return p.text || _trunc(JSON.stringify(p), 60);
     case 'render':         return `renderer=${p.renderer}`;
-    case 'llm_usage':      return `tokens: in=${p.prompt_tokens} out=${p.completion_tokens} cached=${p.cached_tokens}`;
+    case 'llm_usage':      return `${p.model || ''} ${p.elapsed_s || '?'}s | in=${p.prompt_tokens} out=${p.completion_tokens} cached=${p.cached_tokens}`;
+    case 'llm_request':    return `${p.model || ''} round=${p.round}`;
     case 'turn_end':
       if (p.usage) return `✓ ${p.rounds}轮 ${p.duration_s}s | tokens: in=${p.usage.prompt_tokens} out=${p.usage.completion_tokens} cached=${p.usage.cached_tokens}`;
       return '✓ turn complete';

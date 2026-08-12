@@ -885,7 +885,10 @@ class Event:
                     message_list = current_history,
                 )
 
-            await push_event({'type': 'llm_request', 'payload': {'round': round_idx}})
+            # Get model name from config for event payload
+            _llm_configs = config.main.get('client', {}).get('llm', [])
+            _model_name = _llm_configs[0].get('model', 'unknown') if _llm_configs else 'unknown'
+            await push_event({'type': 'llm_request', 'payload': {'round': round_idx, 'model': _model_name}})
 
             # 保存请求日志
             pathlib.Path('./resource/log').mkdir(parents=True, exist_ok=True)
