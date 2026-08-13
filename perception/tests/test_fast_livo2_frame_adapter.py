@@ -92,6 +92,10 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
         self.assertEqual(flags, 0x03)
         self.assertEqual(point_count, 1)
 
+        full_map = VoxelMap(0.10)
+        full_map.add((index * 0.20, 0.0, 0.0) for index in range(80_001))
+        self.assertEqual(full_map.point_count, 80_001)
+
         with self.assertRaises(InvalidFastLivo2Frame):
             list(
                 iter_xyz_points(

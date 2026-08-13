@@ -63,8 +63,6 @@ def _validated_config(base: dict, updates: dict) -> dict:
         result[key] = value
     if result.get("input_max_age_ms") != 500:
         raise ConfigError("input_max_age_ms is fixed to 500")
-    if result.get("map_max_points") != 80_000:
-        raise ConfigError("map_max_points is fixed to 80000")
     if not isinstance(result.get("collection_enabled"), bool):
         raise ConfigError("collection_enabled must be a boolean")
     raw_directory = result.get("collection_directory")

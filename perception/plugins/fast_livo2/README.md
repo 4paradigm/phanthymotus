@@ -57,7 +57,8 @@ frame 不符时 companion 不发布伪造的 canonical odom/cloud。
 | `status`            | `/ubuntu/navigation/fast_livo2/status`            | JSON               | 算法进程、输入 freshness、frame 和产物状态 |
 | `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | JSON               | 录制进程、每路计数、丢失/过期源与停止回执         |
 
-Canvas 地图最多保留 80,000 个 `0.10 m` 体素占用点；Agent Core 在显示层
+在 `0.10 m` 体素去重后，Canvas 地图保留当前会话的全部占用点，不再按
+80,000 点截断；Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
 `map_view` wire payload，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
 重定位成功前不显示伪造的机器人位姿。地图卡片支持三维

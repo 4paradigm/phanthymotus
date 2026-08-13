@@ -50,7 +50,6 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("map_root", "/opt/fast_livo_ws/src/fast_livo/Log/pcd")
         self.declare_parameter("source_max_age_sec", 0.5)
         self.declare_parameter("map_voxel_size_m", 0.10)
-        self.declare_parameter("map_max_points", 80000)
         self.declare_parameter("obstacle_min_height_m", -1.15)
         self.declare_parameter("obstacle_max_height_m", 0.80)
         self.declare_parameter("base_to_sensor_x", -0.00368)
@@ -72,10 +71,7 @@ class FastLivo2Adapter(Node):
                 float(self.get_parameter("base_to_sensor_yaw").value),
             ),
         )
-        self._map = VoxelMap(
-            float(self.get_parameter("map_voxel_size_m").value),
-            int(self.get_parameter("map_max_points").value),
-        )
+        self._map = VoxelMap(float(self.get_parameter("map_voxel_size_m").value))
         self._obstacle_min_height = float(self.get_parameter("obstacle_min_height_m").value)
         self._obstacle_max_height = float(self.get_parameter("obstacle_max_height_m").value)
         if not math.isfinite(self._obstacle_min_height) or not math.isfinite(self._obstacle_max_height):
@@ -278,20 +274,14 @@ class FastLivo2Adapter(Node):
         files = args.get("pcd_files") or []
         if not map_name or not isinstance(files, list) or not files:
             raise InvalidFastLivo2Frame("map_name and pcd_files are required")
-        loaded = VoxelMap(
-            float(self.get_parameter("map_voxel_size_m").value),
-            int(self.get_parameter("map_max_points").value),
-        )
+        loaded = VoxelMap(float(self.get_parameter("map_voxel_size_m").value))
         for path in files:
             if not isinstance(path, str):
                 raise InvalidFastLivo2Frame("pcd_files must contain paths")
             resolved = Path(path).resolve()
             if resolved.parent != self._map_root or not resolved.is_file():
                 raise InvalidFastLivo2Frame("PCD path must be an existing map-root file")
-            remaining = int(self.get_parameter("map_max_points").value) - loaded.point_count
-            if remaining <= 0:
-                break
-            loaded.add(read_pcd_xyz(resolved, max_points=remaining))
+            loaded.add(read_pcd_xyz(resolved))
         if loaded.point_count < 40:
             raise InvalidFastLivo2Frame("saved map has too few finite points")
         with self._lock:

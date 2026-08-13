@@ -54,7 +54,6 @@ plugins:
     discovery_timeout_sec: 5.0
     input_max_age_ms: 500
     map_voxel_size_m: 0.10
-    map_max_points: 80000
     collection_enabled: false
     collection_directory: /opt/phanthy-motus/data/fast_livo2/recordings
 

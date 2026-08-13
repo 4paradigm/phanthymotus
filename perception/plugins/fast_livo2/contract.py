@@ -21,7 +21,6 @@ FAST_LIVO2_CONFIG_DEFAULTS = {
     "discovery_timeout_sec": 5.0,
     "input_max_age_ms": 500,
     "map_voxel_size_m": 0.10,
-    "map_max_points": 80_000,
     "collection_enabled": False,
     "collection_directory": "/opt/phanthy-motus/data/fast_livo2/recordings",
 }
@@ -212,7 +211,7 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "rate_hz": 1,
                 "frame_id": "map",
                 "units": "x/y/z=m; yaw=rad",
-                "desc": "Bounded voxelized session map plus current base pose for Canvas",
+                "desc": "Complete voxelized session map plus current base pose for Canvas",
             },
             {
                 "port": "status",

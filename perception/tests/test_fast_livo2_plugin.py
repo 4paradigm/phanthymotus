@@ -248,7 +248,7 @@ class FastLivo2PluginTest(unittest.TestCase):
         )
         self.assertEqual(result["error_code"], "fast_livo2_companion_unavailable")
 
-        invalid = FastLivo2Plugin({"map_max_points": 100}, None, backend=ReadyBackend())
+        invalid = FastLivo2Plugin({"map_max_points": 80_000}, None, backend=ReadyBackend())
         info = invalid.dispatch("fast_livo2", {"action": "info"})
         self.assertEqual(info["error_code"], "invalid_config")
 

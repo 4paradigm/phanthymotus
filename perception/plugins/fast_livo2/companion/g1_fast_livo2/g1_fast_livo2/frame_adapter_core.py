@@ -11,7 +11,6 @@ from typing import Iterable, Sequence
 
 FLOAT32 = 7
 FLOAT64 = 8
-CANVAS_MAPPING_MAX_POINTS = 80_000
 _FRAME_HEADER = struct.Struct("<fffBI")
 _POINT = struct.Struct("<fff")
 _FULL_MAP_WITH_Z = 0x01 | 0x02
@@ -154,11 +153,11 @@ def transform_points(
         yield pose.x + rx, pose.y + ry, pose.z + rz
 
 
-def read_pcd_xyz(path: str | Path, *, max_points: int = CANVAS_MAPPING_MAX_POINTS):
+def read_pcd_xyz(path: str | Path, *, max_points: int | None = None):
     """Read finite XYZ points from an ASCII or uncompressed binary PCD file."""
 
-    if not 1 <= max_points <= CANVAS_MAPPING_MAX_POINTS:
-        raise ValueError("max_points is out of range")
+    if max_points is not None and max_points < 1:
+        raise ValueError("max_points must be positive when provided")
     source = Path(path)
     try:
         stream = source.open("rb")
@@ -214,11 +213,15 @@ def read_pcd_xyz(path: str | Path, *, max_points: int = CANVAS_MAPPING_MAX_POINT
 
         mode = (header.get("DATA") or [""])[0].lower()
         points: list[tuple[float, float, float]] = []
-        sample_stride = max(1, math.ceil(max(1, declared_points) / max_points))
+        sample_stride = (
+            1
+            if max_points is None
+            else max(1, math.ceil(max(1, declared_points) / max_points))
+        )
         if mode == "ascii":
             source_index = 0
             for raw in stream:
-                if len(points) >= max_points:
+                if max_points is not None and len(points) >= max_points:
                     break
                 values = raw.split()
                 if not values:
@@ -245,7 +248,7 @@ def read_pcd_xyz(path: str | Path, *, max_points: int = CANVAS_MAPPING_MAX_POINT
             if available < required:
                 raise InvalidFastLivo2Frame("PCD binary payload is truncated")
             for point_index in range(0, declared_points, sample_stride):
-                if len(points) >= max_points:
+                if max_points is not None and len(points) >= max_points:
                     break
                 stream.seek(payload_offset + point_index * byte_offset)
                 record = stream.read(byte_offset)
@@ -480,13 +483,10 @@ def iter_xyz_points(
 
 
 class VoxelMap:
-    def __init__(self, voxel_size_m: float, max_points: int = CANVAS_MAPPING_MAX_POINTS):
+    def __init__(self, voxel_size_m: float):
         if not math.isfinite(voxel_size_m) or voxel_size_m <= 0:
             raise ValueError("voxel_size_m must be finite and positive")
-        if not 1 <= max_points <= CANVAS_MAPPING_MAX_POINTS:
-            raise ValueError("max_points is out of range")
         self._voxel = voxel_size_m
-        self._max_points = max_points
         self._points: dict[tuple[int, int, int], tuple[float, float, float]] = {}
 
     def clear(self) -> None:
@@ -494,8 +494,6 @@ class VoxelMap:
 
     def add(self, points: Iterable[tuple[float, float, float]]) -> None:
         for point in points:
-            if len(self._points) >= self._max_points:
-                break
             x, y, z = point
             if not all(math.isfinite(value) for value in point):
                 continue
