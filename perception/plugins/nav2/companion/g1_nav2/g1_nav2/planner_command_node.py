@@ -39,6 +39,7 @@ from .execution_protocol import (
     Velocity,
     apply_g1_motion_limits,
     build_velocity_proposal,
+    proposal_context_is_current,
     shape_terminal_approach,
 )
 from .readiness import evaluate_readiness, navigation_motion_blocker
@@ -100,6 +101,8 @@ class PlannerCommandNode(Node):
         self.declare_parameter("sensor_max_age_sec", 0.5)
         self.declare_parameter("terminal_xy_tolerance_m", 0.18)
         self.declare_parameter("terminal_yaw_tolerance_rad", 0.45)
+        self.declare_parameter("goal_xy_tolerance_m", 0.20)
+        self.declare_parameter("goal_yaw_tolerance_rad", 0.50)
         self.declare_parameter(
             "required_lifecycle_nodes",
             [
@@ -150,6 +153,12 @@ class PlannerCommandNode(Node):
         self._terminal_yaw_tolerance_rad = float(
             self.get_parameter("terminal_yaw_tolerance_rad").value
         )
+        self._goal_xy_tolerance_m = float(
+            self.get_parameter("goal_xy_tolerance_m").value
+        )
+        self._goal_yaw_tolerance_rad = float(
+            self.get_parameter("goal_yaw_tolerance_rad").value
+        )
         self._required_lifecycle_nodes = [
             str(item).strip("/")
             for item in self.get_parameter("required_lifecycle_nodes").value
@@ -171,10 +180,23 @@ class PlannerCommandNode(Node):
             raise ValueError("global_frame and base_frame must not be empty")
         if self._sensor_max_age_sec <= 0:
             raise ValueError("sensor_max_age_sec must be positive")
-        if self._terminal_xy_tolerance_m <= 0:
-            raise ValueError("terminal_xy_tolerance_m must be positive")
-        if self._terminal_yaw_tolerance_rad <= 0:
-            raise ValueError("terminal_yaw_tolerance_rad must be positive")
+        tolerances = {
+            "terminal_xy_tolerance_m": self._terminal_xy_tolerance_m,
+            "terminal_yaw_tolerance_rad": self._terminal_yaw_tolerance_rad,
+            "goal_xy_tolerance_m": self._goal_xy_tolerance_m,
+            "goal_yaw_tolerance_rad": self._goal_yaw_tolerance_rad,
+        }
+        for name, value in tolerances.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if self._terminal_xy_tolerance_m > self._goal_xy_tolerance_m:
+            raise ValueError(
+                "terminal_xy_tolerance_m must not exceed Nav2 xy_goal_tolerance"
+            )
+        if self._terminal_yaw_tolerance_rad > self._goal_yaw_tolerance_rad:
+            raise ValueError(
+                "terminal_yaw_tolerance_rad must not exceed Nav2 yaw_goal_tolerance"
+            )
         if not self._required_lifecycle_nodes or any(
             not item for item in self._required_lifecycle_nodes
         ):
@@ -382,6 +404,7 @@ class PlannerCommandNode(Node):
             if self._active is None:
                 return
             nav_id = self._active.get("nav_id")
+            attempt = self._active.get("attempt")
             status = self._active.get("status", "error")
             forward_speed_limit = self._active.get("effective_speed_limit")
             motion_limits = self._active.get("motion_limits")
@@ -427,27 +450,40 @@ class PlannerCommandNode(Node):
                     limits=motion_limits,
                     max_forward_mps=forward_speed_limit,
                 )
-            self._publish_velocity_proposal(
-                nav_id=nav_id,
-                navigation_status=status,
-                velocity=velocity,
-                reason=reason,
-            )
+            with self._lock:
+                if not proposal_context_is_current(
+                    self._active,
+                    nav_id=nav_id,
+                    attempt=attempt,
+                    status=status,
+                ):
+                    return
+                self._publish_velocity_proposal(
+                    nav_id=nav_id,
+                    navigation_status=status,
+                    velocity=velocity,
+                    reason=reason,
+                )
         except ProtocolError as exc:
             self.get_logger().error(
                 f"unsafe Nav2 shadow velocity rejected: {exc.code}: {exc}"
             )
             with self._lock:
-                if self._active and self._active.get("nav_id") == nav_id:
+                if proposal_context_is_current(
+                    self._active,
+                    nav_id=nav_id,
+                    attempt=attempt,
+                    status=status,
+                ):
                     self._active["status"] = "error"
                     self._active["error_code"] = "unsafe_shadow_velocity"
                     self._active["error"] = f"{exc.code}: {exc}"
-            self._publish_velocity_proposal(
-                nav_id=nav_id,
-                navigation_status="error",
-                velocity=Velocity.zero(),
-                reason=f"unsafe_shadow_velocity:{exc.code}",
-            )
+                    self._publish_velocity_proposal(
+                        nav_id=nav_id,
+                        navigation_status="error",
+                        velocity=Velocity.zero(),
+                        reason=f"unsafe_shadow_velocity:{exc.code}",
+                    )
 
     def _on_command(self, message: String) -> None:
         request_id = ""

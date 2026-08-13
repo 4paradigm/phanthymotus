@@ -119,6 +119,8 @@ def generate_launch_description() -> LaunchDescription:
                         "sensor_max_age_sec": 0.5,
                         "terminal_xy_tolerance_m": 0.18,
                         "terminal_yaw_tolerance_rad": 0.45,
+                        "goal_xy_tolerance_m": 0.20,
+                        "goal_yaw_tolerance_rad": 0.50,
                     }
                 ],
             ),

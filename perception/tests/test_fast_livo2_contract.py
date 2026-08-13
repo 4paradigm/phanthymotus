@@ -143,8 +143,18 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("_MAP_NAME_RE.fullmatch(map_name)", supervisor)
         self.assertIn("self._algorithm_command(save_pcd=False)", supervisor)
         self.assertIn('self._adapter_execute("unload_map", {})', supervisor)
+        self.assertIn("self._runtime_lifecycle_lock = threading.Lock()", supervisor)
+        self.assertIn("self._collection_lifecycle_lock = threading.Lock()", supervisor)
+        self.assertIn('"rollback_status"', supervisor)
+        self.assertIn("finalize_collection_session(", supervisor)
         self.assertIn("self._reference_points = loaded.points", adapter)
         self.assertIn("reference = self._reference_points", adapter)
+
+        frame_adapter = (companion_package / "frame_adapter_core.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("payload = stream.read()", frame_adapter)
+        self.assertIn("stream.seek(payload_offset + point_index * byte_offset)", frame_adapter)
 
     def test_g1_build_and_start_entrypoint_stays_narrow(self) -> None:
         deploy_script = (

@@ -125,6 +125,23 @@ def shape_terminal_approach(
     return Velocity.zero(), "reached"
 
 
+def proposal_context_is_current(
+    active: dict | None,
+    *,
+    nav_id: str,
+    attempt: int,
+    status: str,
+) -> bool:
+    """Return whether an asynchronously shaped proposal still owns the goal."""
+
+    return bool(
+        active is not None
+        and active.get("nav_id") == nav_id
+        and active.get("attempt") == attempt
+        and active.get("status") == status
+    )
+
+
 @dataclass(frozen=True)
 class MotionLimits:
     """Per-navigation nonzero magnitude floors and hard axis caps."""
@@ -495,5 +512,6 @@ __all__ = [
     "apply_g1_motion_limits",
     "build_velocity_proposal",
     "limit_forward_velocity",
+    "proposal_context_is_current",
     "shape_terminal_approach",
 ]

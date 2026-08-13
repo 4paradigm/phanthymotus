@@ -59,6 +59,8 @@ class FastLivo2Supervisor(Node):
         self.declare_parameter("collection_stop_timeout_sec", 30.0)
 
         self._lock = threading.RLock()
+        self._runtime_lifecycle_lock = threading.Lock()
+        self._collection_lifecycle_lock = threading.Lock()
         self._process: subprocess.Popen | None = None
         self._active_map: str | None = None
         self._loaded_map: str | None = None
@@ -186,18 +188,27 @@ class FastLivo2Supervisor(Node):
             request_id = str(request.get("request_id", ""))
             action = request.get("action")
             args = request.get("args") or {}
-            if action == "start_mapping":
-                result = self._start_mapping(str(args.get("map_name", "")))
-            elif action == "stop_mapping":
-                result = self._stop_mapping()
-            elif action == "load_map":
-                result = self._load_map(str(args.get("map_name", "")))
-            elif action == "relocalize":
-                result = self._relocalize(args)
-            elif action == "unload_map":
-                result = self._unload_map()
+            if action in {
+                "start_mapping",
+                "stop_mapping",
+                "load_map",
+                "relocalize",
+                "unload_map",
+            }:
+                with self._runtime_lifecycle_lock:
+                    if action == "start_mapping":
+                        result = self._start_mapping(str(args.get("map_name", "")))
+                    elif action == "stop_mapping":
+                        result = self._stop_mapping()
+                    elif action == "load_map":
+                        result = self._load_map(str(args.get("map_name", "")))
+                    elif action == "relocalize":
+                        result = self._relocalize(args)
+                    else:
+                        result = self._unload_map()
             elif action == "configure_collection":
-                result = self._configure_collection(args)
+                with self._collection_lifecycle_lock:
+                    result = self._configure_collection(args)
             else:
                 result = {"status": "error", "error_code": "unsupported_action", "error": f"unsupported action {action}"}
         except Exception as exc:
@@ -246,6 +257,10 @@ class FastLivo2Supervisor(Node):
                 return stopped
 
         root = Path(directory)
+        process = None
+        partial_dir = None
+        final_dir = None
+        session_id = None
         try:
             root.mkdir(parents=True, exist_ok=True)
             now = time.gmtime()
@@ -267,12 +282,46 @@ class FastLivo2Supervisor(Node):
             if return_code is not None:
                 raise RuntimeError(f"ros2 bag record exited with {return_code}")
         except (OSError, RuntimeError) as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+            receipt = None
+            if partial_dir is not None and final_dir is not None and session_id is not None:
+                try:
+                    partial_dir.mkdir(parents=True, exist_ok=True)
+                    failed_health = CollectionHealth()
+                    failed_health.start(session_id, str(final_dir))
+                    failed_status = failed_health.snapshot(
+                        process_running=False,
+                        process_return_code=(
+                            None if process is None else process.poll()
+                        ),
+                        process_error=failure,
+                    )
+                    receipt = finalize_collection_session(
+                        str(partial_dir),
+                        str(final_dir),
+                        {
+                            "schema": "phanthy.navigation.fast_livo2_collection_receipt.v1",
+                            "state": "failed",
+                            "stopped_unix_ms": int(time.time() * 1000),
+                            "storage_complete": False,
+                            "return_code": None if process is None else process.poll(),
+                            "failure_reason": failure,
+                            "sources": failed_status["sources"],
+                        },
+                        storage_complete=False,
+                    )
+                except OSError as receipt_exc:
+                    failure += f"; receipt_failed:{receipt_exc}"
             with self._lock:
-                self._collection_error = f"{type(exc).__name__}: {exc}"
+                self._collection_error = failure
+                self._collection_last_receipt = (
+                    None if receipt is None else dict(receipt)
+                )
             return {
                 "status": "error",
                 "error_code": "collection_start_failed",
                 "error": self._collection_error,
+                "receipt": receipt,
             }
 
         with self._lock:
@@ -318,6 +367,15 @@ class FastLivo2Supervisor(Node):
                 stop_error = "rosbag_stop_timeout"
             except OSError as exc:
                 stop_error = f"rosbag_stop_failed:{exc}"
+                if process.poll() is None:
+                    with self._lock:
+                        self._collection_error = stop_error
+                    return {
+                        "status": "error",
+                        "error_code": "collection_stop_failed",
+                        "error": stop_error,
+                        "collection": self._collection_snapshot(),
+                    }
 
         storage_ok = stop_error is None and return_code == 0 and partial_dir is not None
         receipt = {
@@ -506,11 +564,76 @@ class FastLivo2Supervisor(Node):
                 "status": "error",
                 "error_code": "map_artifact_invalid",
                 "error": str(exc),
+                "loaded_map": previous_map,
+                "runtime_mode": runtime_mode,
             }
+        previous_files = None
+        if runtime_mode == "localization" and previous_map:
+            try:
+                previous_files = self._map_files_from_manifest(previous_map)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                return {
+                    "status": "error",
+                    "error_code": "active_map_artifact_invalid",
+                    "error": f"cannot replace active map {previous_map}: {exc}",
+                    "loaded_map": previous_map,
+                    "runtime_mode": runtime_mode,
+                }
         if runtime_mode == "localization":
             unloaded = self._unload_map()
             if unloaded.get("status") == "error":
-                return unloaded
+                rollback = (
+                    self._activate_localization(previous_map, previous_files)
+                    if previous_map and previous_files
+                    else None
+                )
+                with self._lock:
+                    actual_map = self._loaded_map
+                    actual_mode = self._runtime_mode
+                return {
+                    **unloaded,
+                    "loaded_map": actual_map,
+                    "runtime_mode": actual_mode,
+                    "replaced_map": previous_map,
+                    "rollback_status": (
+                        "restored"
+                        if rollback and rollback.get("status") != "error"
+                        else "failed"
+                    ),
+                    "rollback_error": (
+                        rollback.get("error")
+                        if rollback and rollback.get("status") == "error"
+                        else None
+                    ),
+                }
+        loaded = self._activate_localization(map_name, files)
+        if loaded.get("status") == "error":
+            rollback = None
+            if previous_map and previous_files:
+                rollback = self._activate_localization(previous_map, previous_files)
+            with self._lock:
+                actual_map = self._loaded_map
+                actual_mode = self._runtime_mode
+            return {
+                **loaded,
+                "loaded_map": actual_map,
+                "runtime_mode": actual_mode,
+                "replaced_map": previous_map,
+                "rollback_status": (
+                    "not_needed"
+                    if previous_map is None
+                    else "restored"
+                    if rollback and rollback.get("status") != "error"
+                    else "failed"
+                ),
+                "rollback_error": (
+                    rollback.get("error") if rollback and rollback.get("status") == "error" else None
+                ),
+            }
+        loaded["replaced_map"] = previous_map
+        return loaded
+
+    def _activate_localization(self, map_name: str, files: tuple[Path, ...]) -> dict:
         loaded = self._adapter_execute(
             "load_map", {"map_name": map_name, "pcd_files": [str(path) for path in files]}
         )
@@ -549,7 +672,7 @@ class FastLivo2Supervisor(Node):
             **loaded,
             "pid": process.pid,
             "runtime_mode": "localization",
-            "replaced_map": previous_map,
+            "loaded_map": map_name,
             "bounded_relocalization_supported": True,
         }
 
@@ -583,8 +706,16 @@ class FastLivo2Supervisor(Node):
             self._runtime_mode = "idle"
             self._started_unix_ms = None
         if stop_error is not None:
-            return stop_error
-        return adapter_result
+            return {
+                **stop_error,
+                "loaded_map": None,
+                "runtime_mode": "idle",
+            }
+        return {
+            **adapter_result,
+            "loaded_map": None,
+            "runtime_mode": "idle",
+        }
 
     def _terminate_process(self, process: subprocess.Popen | None) -> dict | None:
         if process is None or process.poll() is not None:
@@ -773,15 +904,17 @@ class FastLivo2Supervisor(Node):
 
     def destroy_node(self):
         try:
-            if self._runtime_mode == "localization":
-                self._terminate_process(self._process)
-                with self._lock:
-                    self._process = None
-                    self._loaded_map = None
-                    self._runtime_mode = "idle"
-            else:
-                self._stop_mapping()
-            self._stop_collection()
+            with self._runtime_lifecycle_lock:
+                if self._runtime_mode == "localization":
+                    self._terminate_process(self._process)
+                    with self._lock:
+                        self._process = None
+                        self._loaded_map = None
+                        self._runtime_mode = "idle"
+                else:
+                    self._stop_mapping()
+            with self._collection_lifecycle_lock:
+                self._stop_collection()
         finally:
             return super().destroy_node()
 

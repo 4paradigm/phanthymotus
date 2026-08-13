@@ -14,9 +14,10 @@ _MAP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 class FastLivo2BackendError(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, details: dict | None = None):
         super().__init__(message)
         self.code = code
+        self.details = dict(details or {})
 
 
 class FastLivo2Backend(Protocol):
@@ -73,6 +74,8 @@ class FastLivo2Core:
     def __init__(self, backend: FastLivo2Backend):
         self._backend = backend
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._collection_lock = threading.Lock()
         self._active_map: str | None = None
         self._loaded_map: str | None = None
 
@@ -88,6 +91,10 @@ class FastLivo2Core:
         return result
 
     def dispatch(self, args: dict) -> dict:
+        with self._lifecycle_lock:
+            return self._dispatch(args)
+
+    def _dispatch(self, args: dict) -> dict:
         if not isinstance(args, dict):
             return self._error("", "invalid_argument", "arguments must be an object")
         action = args.get("action", "")
@@ -120,14 +127,10 @@ class FastLivo2Core:
                         raise FastLivo2BackendError(
                             "mapping_active", f"mapping {self._active_map} is already active"
                         )
-                if previous_map:
-                    stopped = self.stop_localization()
-                    if stopped.get("status") == "error":
-                        return self._result(action, stopped)
                 result = dict(self._backend.execute(action, {"map_name": map_name}))
                 if result.get("status") not in {"error", "rejected"}:
                     with self._lock:
-                        self._loaded_map = map_name
+                        self._loaded_map = str(result.get("loaded_map") or map_name)
                     result.setdefault("replaced_map", previous_map)
                 return self._result(action, result)
 
@@ -164,12 +167,32 @@ class FastLivo2Core:
                     self._active_map = None
             return self._result(action, result)
         except FastLivo2BackendError as exc:
-            return self._error(str(action), exc.code, str(exc))
+            if "loaded_map" in exc.details:
+                with self._lock:
+                    loaded_map = exc.details.get("loaded_map")
+                    self._loaded_map = (
+                        str(loaded_map) if isinstance(loaded_map, str) else None
+                    )
+            error = self._error(str(action), exc.code, str(exc))
+            for key in (
+                "loaded_map",
+                "runtime_mode",
+                "replaced_map",
+                "rollback_status",
+                "rollback_error",
+            ):
+                if key in exc.details:
+                    error[key] = exc.details[key]
+            return error
         except Exception as exc:
             return self._error(str(action), "backend_error", f"{type(exc).__name__}: {exc}")
 
     def stop_localization(self) -> dict:
         """Stop the private localization runtime without exposing unload_map."""
+        with self._lifecycle_lock:
+            return self._stop_localization()
+
+    def _stop_localization(self) -> dict:
         with self._lock:
             loaded_map = self._loaded_map
         if not loaded_map:
@@ -185,6 +208,12 @@ class FastLivo2Core:
                     f"failed to stop localization for map {loaded_map}",
                 )
         except FastLivo2BackendError as exc:
+            if "loaded_map" in exc.details:
+                with self._lock:
+                    restored = exc.details.get("loaded_map")
+                    self._loaded_map = (
+                        str(restored) if isinstance(restored, str) else None
+                    )
             return self._error("stop_localization", exc.code, str(exc))
         except Exception as exc:
             return self._error(
@@ -198,16 +227,17 @@ class FastLivo2Core:
 
     def configure_collection(self, config: dict) -> dict:
         """Apply private recorder configuration without exposing a public action."""
-        try:
-            return dict(self._backend.execute("configure_collection", dict(config)))
-        except FastLivo2BackendError as exc:
-            return self._error("configure_collection", exc.code, str(exc))
-        except Exception as exc:
-            return self._error(
-                "configure_collection",
-                "backend_error",
-                f"{type(exc).__name__}: {exc}",
-            )
+        with self._collection_lock:
+            try:
+                return dict(self._backend.execute("configure_collection", dict(config)))
+            except FastLivo2BackendError as exc:
+                return self._error("configure_collection", exc.code, str(exc))
+            except Exception as exc:
+                return self._error(
+                    "configure_collection",
+                    "backend_error",
+                    f"{type(exc).__name__}: {exc}",
+                )
 
     def stop(self) -> None:
         self._backend.stop()

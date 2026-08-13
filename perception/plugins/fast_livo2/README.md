@@ -48,13 +48,14 @@ frame 不符时 companion 不发布伪造的 canonical odom/cloud。
 
 ## 输出
 
-| port | topic | frame | 用途 |
-| --- | --- | --- | --- |
-| `livo_odom` | `/ubuntu/navigation/odom` | `map -> base_link` | Nav2 位姿与速度反馈 |
-| `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `map` | Nav2 rolling costmap 障碍输入 |
-| `obstacle_map` | `/ubuntu/navigation/obstacle_map` | `map` | 去除地板/天花板后累计投影的 Nav2 全局二维障碍输入 |
-| `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | `map` | Canvas 体素化累计地图和机器人位置 |
-| `status` | `/ubuntu/navigation/fast_livo2/status` | JSON | 算法进程、输入 freshness、frame 和产物状态 |
+| port                | topic                                             | frame              | 用途                            |
+| ------------------- | ------------------------------------------------- | ------------------ | ----------------------------- |
+| `livo_odom`         | `/ubuntu/navigation/odom`                         | `map -> base_link` | Nav2 位姿与速度反馈                  |
+| `registered_cloud`  | `/ubuntu/navigation/cloud_registered`             | `map`              | Nav2 rolling costmap 障碍输入     |
+| `obstacle_map`      | `/ubuntu/navigation/obstacle_map`                 | `map`              | 去除地板/天花板后累计投影的 Nav2 全局二维障碍输入  |
+| `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 体素化累计地图和机器人位置          |
+| `status`            | `/ubuntu/navigation/fast_livo2/status`            | JSON               | 算法进程、输入 freshness、frame 和产物状态 |
+| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | JSON               | 录制进程、每路计数、丢失/过期源与停止回执         |
 
 Canvas 地图最多保留 80,000 个 `0.10 m` 体素占用点；Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
@@ -78,7 +79,7 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 | --------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | `start_mapping` | `map_name`                                                                            | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程                    |
 | `stop_mapping`  | 无                                                                                     | `SIGINT` 停止算法，等待尾段保存并写 session manifest               |
-| `load_map`      | `map_name`                                                                            | 自动停止旧定位前端，读取 manifest/PCD 并启动新定位前端     |
+| `load_map`      | `map_name`                                                                            | 先校验新旧 manifest/PCD，再串行替换定位前端，失败时尝试回滚旧图 |
 | `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
 
 `map_name` 只允许 `A-Z a-z 0-9 _ . -`，最长 64 字符。停止 Canvas 时若仍在
@@ -94,8 +95,11 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
    `0.1–3.0 m` 和 `0.05–π/2 rad`。
 4. 返回 `status=relocalized` 后，卡片才发布旧图 frame 下的
    `map -> base_link`、registered cloud 和障碍图；此时再启动 Nav2 任务。
-5. 切换地图时直接再次执行 `load_map`；新地图的 manifest/PCD 先通过
-   校验，再自动停止旧定位前端并加载新图。卡片停止时会自动释放
+5. 切换地图时直接再次执行 `load_map`。supervisor 先校验
+   目标图和当前图的 manifest/PCD，未通过时不停旧前端；切换后如
+   adapter 加载或新算法启动失败，会尝试恢复旧图。回执中的
+   `rollback_status` 为 `restored/failed`，`loaded_map/runtime_mode`
+   是切换后真实状态；回滚也失败时必须 fail closed。卡片停止时会自动释放
    当前定位前端，不再对外提供 `unload_map`。
 
 当前锁定的 FAST-LIVO2 本身仍然没有 PCD 加载、`/initialpose` 或全局回环。
@@ -103,6 +107,23 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 初值的有界匹配，不是无初值的全局搜索，也不在定位成功后持续做全局
 闭环校正。匹配分数不足、点数不足、数据过期、manifest/PCD 损坏时全部
 fail closed。
+
+当前有界匹配使用 `0.20 m` 二维体素，旧图和当前 scan 都至少需要
+40 个有效障碍体素，scan 最多参与 1,200 点，最低匹配比为 `0.20`。
+成功回执会返回 `match_ratio`、`matched_points` 和 `evaluated_points`；
+`status=relocalized` 只证明本次有界匹配过关，不等同于长时间全局定位
+可靠性已验收。
+
+### 生命周期与大图读取
+
+- Core 和 supervisor 都将 `start_mapping` / `stop_mapping` / `load_map` /
+  `relocalize` 收口到单一地图生命周期锁；采集启停使用独立锁，
+  不会与地图操作互相阻塞。
+- 地图替换是带 best-effort 旧图恢复的串行事务，不是两个前端
+  同时运行的无损热切换。验收必须读回 `status/error_code`、
+  `rollback_status`、`loaded_map` 和 `runtime_mode`。
+- binary PCD 按采样点偏移流式读取，不再将完整 payload 读入内存；
+  路径仍只能来自当前 map root 下通过 manifest 校验的 PCD。
 
 ## 自动数据采集
 
@@ -119,11 +140,15 @@ fail closed。
 
 | 数据 | topic | ROS type / QoS |
 | --- | --- | --- |
-| LiDAR | `/ubuntu/navigation/lidar_fast_livo` | `PointCloud2`; RELIABLE |
-| IMU | `/ubuntu/navigation/imu` | `Imu`; RELIABLE |
-| RGB | `/ubuntu/camera/rgb` | `CompressedImage`; BEST_EFFORT |
-| Depth | `/ubuntu/camera/depth` | `Image`; BEST_EFFORT |
-| CameraInfo | `/ubuntu/camera/camera_info` | `CameraInfo`; BEST_EFFORT |
+| LiDAR | `/ubuntu/navigation/lidar_fast_livo` | `PointCloud2`; `RELIABLE + KEEP_LAST(2) + VOLATILE` |
+| IMU | `/ubuntu/navigation/imu` | `Imu`; `RELIABLE + KEEP_LAST(200) + VOLATILE` |
+| RGB | `/ubuntu/camera/rgb` | `CompressedImage`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE` |
+| Depth | `/ubuntu/camera/depth` | `Image`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE` |
+| CameraInfo | `/ubuntu/camera/camera_info` | `CameraInfo`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE` |
+
+MCAP 保留实际收到消息的 CDR payload，但 `BEST_EFFORT` 源在网络或系统
+负载下允许丢帧。`collection_status.sources[*].count` 和 stale 状态是
+采集健康证据，不是跨传感器帧同步或数据完备性证明。
 
 录制目录按 `ubuntu/YYYY-MM-DD/<session_id>` 分层。录制期间目录名带
 `.partial`；Canvas 正常停止、rosbag2 完成 flush 且 receipt 写入后才原子改为
@@ -137,6 +162,15 @@ fail closed。
 - 每路 topic 的消息计数、最近接收年龄、源时间戳和 publisher 数量；
 - `missing_sources`、`stale_sources` 与 `failure_reason`；
 - 上一次停止时的 receipt 和最终目录。
+
+Canvas `stop` 只有在算法和采集都确认停止后才返回
+`state/status=idle`；任一收口失败时返回顶层
+`error_code=canvas_stop_failed`并保留卡片控制对象以便重试。仍必须同时检查
+`collection_stop_result.status`、`receipt.storage_complete` 和 `receipt.state`：
+只有 `storage_complete=true` 才会将 `.partial` 改名为最终目录；
+`state=degraded` 表示存储完整但存在缺失/过期源，仍应按降级验收。
+采集启停在内部串行；rosbag 启动早退时会保留 `.partial`
+并写入 `state=failed/storage_complete=false` receipt，不会冒充完整 session。
 
 当前 G1 Driver 代码已经发布 RGB 与 depth，但尚未发布 ROS
 `sensor_msgs/msg/CameraInfo`。因此在 Driver 补齐该真实 producer 前，启用采集
@@ -179,7 +213,7 @@ FAST-LIVO2 和 Vikit 保持在独立 GPL companion 镜像中；主 Perception �
 
 ## 部署与只读验收
 
-完整 G1 测试栈从仓库根目录用同一个入口构建并启动：
+G1 导航临时测试栈从仓库根目录用同一个入口构建并启动：
 
 ```bash
 bash perception/plugins/nav2/deploy/scripts/build-and-start-g1.sh
@@ -189,3 +223,8 @@ bash perception/plugins/nav2/deploy/scripts/build-and-start-g1.sh
 `preflight/start`。它不会执行 Git 同步、清理旧容器、启动 Canvas、
 `start_mapping` 或导航。运行前停止 Canvas；Core 启用认证时提供真实
 `CORE_ACCESS_TOKEN`。
+
+该临时脚本当前只挂载 maps 目录，没有创建或挂载 recordings 目录，
+因此不能用于验收 `collection_enabled=true`。自动采集只能通过已挂载
+`/opt/phanthy-motus/data/fast_livo2/recordings` 的正式
+`perception/deploy/service.yml` 验收。

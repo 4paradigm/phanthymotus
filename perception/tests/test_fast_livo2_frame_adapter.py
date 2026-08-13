@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
 import math
 import struct
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 PACKAGE_ROOT = (
@@ -174,6 +177,33 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
                 read_pcd_xyz(sampled, max_points=3),
                 ((0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
             )
+
+    def test_binary_pcd_reader_never_requests_the_full_payload(self) -> None:
+        class TrackingStream(io.BytesIO):
+            unbounded_read = False
+
+            def read(self, size=-1):
+                if size < 0:
+                    self.unbounded_read = True
+                return super().read(size)
+
+        header = (
+            "FIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n"
+            "WIDTH 4\nHEIGHT 1\nPOINTS 4\nDATA binary\n"
+        ).encode("ascii")
+        content = header + b"".join(
+            struct.pack("<fff", float(index), 0.0, 0.0) for index in range(4)
+        )
+        stream = TrackingStream(content)
+        with mock.patch.object(Path, "open", return_value=stream), mock.patch.object(
+            Path,
+            "stat",
+            return_value=SimpleNamespace(st_size=len(content)),
+        ):
+            points = read_pcd_xyz("bounded.pcd", max_points=2)
+
+        self.assertEqual(points, ((0.0, 0.0, 0.0), (2.0, 0.0, 0.0)))
+        self.assertFalse(stream.unbounded_read)
 
     def test_bounded_planar_relocalization_recovers_known_pose(self) -> None:
         reference = []

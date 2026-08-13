@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -48,11 +49,33 @@ class RejectingBackend(FakeBackend):
         raise FastLivo2BackendError("algorithm_unavailable", "algorithm is unavailable")
 
 
-class UnconfirmedLocalizationStopBackend(FakeBackend):
+class RollbackReportingBackend(FakeBackend):
     def execute(self, action: str, args: dict) -> dict:
-        if action == "unload_map":
+        if action == "load_map" and args["map_name"] == "warehouse":
             self.calls.append((action, dict(args)))
-            return {"status": "running", "map_name": args["map_name"]}
+            raise FastLivo2BackendError(
+                "algorithm_start_failed",
+                "new runtime failed and old map was restored",
+                details={
+                    "loaded_map": "office",
+                    "runtime_mode": "localization",
+                    "replaced_map": "office",
+                    "rollback_status": "restored",
+                },
+            )
+        return super().execute(action, args)
+
+
+class BlockingBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def execute(self, action: str, args: dict) -> dict:
+        if not self.calls:
+            self.entered.set()
+            self.release.wait(timeout=2.0)
         return super().execute(action, args)
 
 
@@ -120,16 +143,13 @@ class FastLivo2CoreTest(unittest.TestCase):
         self.assertEqual(replaced["status"], "map_loaded")
         self.assertEqual(replaced["replaced_map"], "office")
         self.assertEqual(core.info()["loaded_map"], "warehouse")
-        self.assertEqual(
-            [call[0] for call in backend.calls[-2:]],
-            ["unload_map", "load_map"],
-        )
+        self.assertEqual([call[0] for call in backend.calls[-1:]], ["load_map"])
 
         removed = core.dispatch({"action": "unload_map"})
         self.assertEqual(removed["error_code"], "unsupported_action")
 
-    def test_load_map_keeps_old_map_when_private_stop_is_unconfirmed(self) -> None:
-        backend = UnconfirmedLocalizationStopBackend()
+    def test_load_map_reconciles_restored_map_after_transaction_failure(self) -> None:
+        backend = RollbackReportingBackend()
         core = FastLivo2Core(backend)
         self.assertEqual(
             core.dispatch({"action": "load_map", "map_name": "office"})["status"],
@@ -139,14 +159,58 @@ class FastLivo2CoreTest(unittest.TestCase):
         result = core.dispatch({"action": "load_map", "map_name": "warehouse"})
 
         self.assertEqual(result["status"], "error")
-        self.assertEqual(result["error_code"], "localization_stop_unconfirmed")
+        self.assertEqual(result["error_code"], "algorithm_start_failed")
+        self.assertEqual(result["rollback_status"], "restored")
         self.assertEqual(core.info()["loaded_map"], "office")
         self.assertEqual(
             backend.calls,
             [
                 ("load_map", {"map_name": "office"}),
-                ("unload_map", {"map_name": "office"}),
+                ("load_map", {"map_name": "warehouse"}),
             ],
+        )
+
+    def test_runtime_and_collection_lifecycles_are_serialized(self) -> None:
+        backend = BlockingBackend()
+        core = FastLivo2Core(backend)
+        results = []
+        first = threading.Thread(
+            target=lambda: results.append(
+                core.dispatch({"action": "start_mapping", "map_name": "office"})
+            )
+        )
+        second = threading.Thread(
+            target=lambda: results.append(
+                core.dispatch({"action": "start_mapping", "map_name": "warehouse"})
+            )
+        )
+        first.start()
+        self.assertTrue(backend.entered.wait(timeout=1.0))
+        second.start()
+        self.assertEqual(backend.calls, [])
+        backend.release.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+        self.assertEqual(len(backend.calls), 1)
+        self.assertEqual({result["status"] for result in results}, {"mapping", "error"})
+
+        collection_backend = BlockingBackend()
+        collection_core = FastLivo2Core(collection_backend)
+        first = threading.Thread(
+            target=lambda: collection_core.configure_collection({"enabled": True})
+        )
+        second = threading.Thread(
+            target=lambda: collection_core.configure_collection({"enabled": False})
+        )
+        first.start()
+        self.assertTrue(collection_backend.entered.wait(timeout=1.0))
+        second.start()
+        collection_backend.release.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+        self.assertEqual(
+            [call[1]["enabled"] for call in collection_backend.calls],
+            [True, False],
         )
 
     def test_relocalize_requires_map_and_finite_pose(self) -> None:

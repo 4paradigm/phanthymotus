@@ -61,6 +61,25 @@ class CollectionRejectingBackend(ReadyBackend):
         return super().execute(action, args)
 
 
+class CollectionStopRejectingBackend(ReadyBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.disable_calls = 0
+
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "configure_collection" and not args["enabled"]:
+            self.disable_calls += 1
+            if self.disable_calls == 1:
+                return super().execute(action, args)
+            self.calls.append((action, dict(args)))
+            return {
+                "status": "error",
+                "error_code": "collection_stop_failed",
+                "error": "recorder is still running",
+            }
+        return super().execute(action, args)
+
+
 def _bindings(plugin: FastLivo2Plugin) -> list[dict]:
     return [
         {"port": item["port"], "topic": item["topic"]}
@@ -202,6 +221,22 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(backend.stop_calls, 1)
         info = plugin.dispatch("fast_livo2", {"action": "info"})
         self.assertFalse(info["canvas_wired"])
+
+    def test_collection_stop_failure_keeps_card_retryable(self) -> None:
+        backend = CollectionStopRejectingBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertTrue(result["canvas_wired"])
+        self.assertEqual(backend.stop_calls, 0)
+        self.assertTrue(
+            plugin.dispatch("fast_livo2", {"action": "info"})["canvas_wired"]
+        )
 
     def test_missing_companion_and_invalid_config_fail_closed(self) -> None:
         unavailable = FastLivo2Plugin(

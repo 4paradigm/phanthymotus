@@ -234,19 +234,28 @@ def read_pcd_xyz(path: str | Path, *, max_points: int = CANVAS_MAPPING_MAX_POINT
                 if all(math.isfinite(value) for value in point):
                     points.append(point)
         elif mode == "binary":
-            payload = stream.read()
+            payload_offset = stream.tell()
             required = declared_points * byte_offset
-            if len(payload) < required:
+            try:
+                available = source.stat().st_size - payload_offset
+            except OSError as exc:
+                raise InvalidFastLivo2Frame(
+                    f"cannot inspect PCD {source.name}: {exc}"
+                ) from exc
+            if available < required:
                 raise InvalidFastLivo2Frame("PCD binary payload is truncated")
             for point_index in range(0, declared_points, sample_stride):
                 if len(points) >= max_points:
                     break
-                base = point_index * byte_offset
+                stream.seek(payload_offset + point_index * byte_offset)
+                record = stream.read(byte_offset)
+                if len(record) != byte_offset:
+                    raise InvalidFastLivo2Frame("PCD binary payload is truncated")
                 values = []
                 for name in ("x", "y", "z"):
                     field_index = fields.index(name)
                     fmt = "<f" if sizes[field_index] == 4 else "<d"
-                    values.append(struct.unpack_from(fmt, payload, base + byte_offsets[name])[0])
+                    values.append(struct.unpack_from(fmt, record, byte_offsets[name])[0])
                 point = tuple(values)
                 if all(math.isfinite(value) for value in point):
                     points.append(point)

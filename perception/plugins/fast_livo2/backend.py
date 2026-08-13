@@ -89,6 +89,7 @@ class RosTopicFastLivo2Backend:
             raise FastLivo2BackendError(
                 str(payload.get("error_code", "fast_livo2_error")),
                 str(payload.get("error", "FAST-LIVO2 companion rejected request")),
+                details=payload,
             )
         return payload
 

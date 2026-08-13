@@ -267,6 +267,25 @@ class FastLivo2Plugin:
             )
         else:
             collection_stop_result = None
+        failures = [
+            result
+            for result in (stop_result, collection_stop_result)
+            if isinstance(result, dict) and result.get("status") == "error"
+        ]
+        if failures:
+            return {
+                "state": "error",
+                "status": "error",
+                "error_code": "canvas_stop_failed",
+                "error": "; ".join(
+                    str(result.get("error", result.get("error_code", "stop failed")))
+                    for result in failures
+                ),
+                "canvas_wired": True,
+                "stop_result": stop_result,
+                "collection_stop_result": collection_stop_result,
+                "physical_execution": False,
+            }
         self._release_core()
         return {
             "state": "idle",

@@ -26,6 +26,7 @@ from g1_nav2.execution_protocol import (  # noqa: E402
     apply_g1_motion_limits,
     build_velocity_proposal,
     limit_forward_velocity,
+    proposal_context_is_current,
     shape_terminal_approach,
 )
 from g1_nav2.readiness import (  # noqa: E402
@@ -125,6 +126,25 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             target_pose=Pose2D(x=2.0, y=2.0, yaw=0.0),
         )
         self.assertEqual((next_goal, phase), (raw, "approach"))
+
+    def test_stale_async_proposal_context_is_rejected(self) -> None:
+        active = {"nav_id": "nav-1", "attempt": 2, "status": "navigating"}
+        self.assertTrue(
+            proposal_context_is_current(
+                active, nav_id="nav-1", attempt=2, status="navigating"
+            )
+        )
+        for nav_id, attempt, status in (
+            ("nav-old", 2, "navigating"),
+            ("nav-1", 1, "navigating"),
+            ("nav-1", 2, "arrived"),
+        ):
+            with self.subTest(nav_id=nav_id, attempt=attempt, status=status):
+                self.assertFalse(
+                    proposal_context_is_current(
+                        active, nav_id=nav_id, attempt=attempt, status=status
+                    )
+                )
 
     def test_card_motion_limits_apply_axis_floors_caps_and_disable_lateral(self) -> None:
         limits = MotionLimits(
@@ -350,6 +370,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         launch = (PACKAGE_ROOT / "launch" / "g1_nav2.launch.py").read_text(
             encoding="utf-8"
         )
+        params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
+            encoding="utf-8"
+        )
         tree = ET.parse(
             PACKAGE_ROOT
             / "behavior_trees"
@@ -365,6 +388,11 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("shape_terminal_approach", command)
         self.assertIn('"terminal_xy_tolerance_m": 0.18', launch)
         self.assertIn('"terminal_yaw_tolerance_rad": 0.45', launch)
+        self.assertIn('"goal_xy_tolerance_m": 0.20', launch)
+        self.assertIn('"goal_yaw_tolerance_rad": 0.50', launch)
+        self.assertIn("xy_goal_tolerance: 0.20", params)
+        self.assertIn("yaw_goal_tolerance: 0.50", params)
+        self.assertIn("proposal_context_is_current", command)
         self.assertIn('payload.get("velocity_limits")', command)
         self.assertIn("goal.pose.header.frame_id = self._global_frame", command)
 

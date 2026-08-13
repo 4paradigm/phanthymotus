@@ -112,7 +112,10 @@ SLAM Toolbox、AMCL 或 Map Server。
 - 卡片可配置 X/Y/yaw 三轴非零速度的最小/最大绝对值，默认
   `X=0.30–1.00 m/s`、`Y=0–0 m/s`、`yaw=1.00–2.00 rad/s`；
 - 终点附近使用无状态内层容差整形：位置到达后停止平移，位置和朝向
-  都到达后输出严格零速，避免最小速度把 Nav2 尾段修正放大成徘徊；
+  都到达后输出严格零速，避免最小速度把 Nav2 尾段修正放大成徘徊。
+  该逻辑依赖 fresh canonical odom 和当前 target；每条 proposal
+  在发布前会重新校验 `nav_id/attempt/status`，已过期的 shadow
+  velocity 回调不能覆盖终态零速；
 - `namespace=ubuntu` 和 proposal TTL `250 ms` 仍是首版冻结合同；请求速度
   在每条 `velocity_proposal` 上强制限制正向速度，Nav2 `SpeedLimit` 只作为控制器
   advisory，不再把 DDS transport ack 误判为控制器已应用速度；
@@ -152,13 +155,19 @@ docker compose --env-file source-lock.env build nav2
 卡片可以加载自身 `stop_mapping` 生成的 manifest/PCD，并在操作者提供的
 近似位姿附近做有界二维 scan-to-map 重定位。匹配成功前不发布
 canonical odom/cloud/TF。这不是无初值全局搜索，也没有持续的全局闭环校正。
-`load_map` 会先校验新图文件，再自动替换已加载的旧图；卡片不再暴露
-`unload_map` 公开 action。
+`load_map` 替换已加载地图时会先校验新旧产物，再串行切换前端；
+新图 adapter 加载或算法启动失败时会尝试恢复旧图，并回传
+`rollback_status/loaded_map/runtime_mode` 供 Core 对账。卡片不再暴露
+`unload_map` 公开 action，地图和采集生命周期均在内部串行。
 卡片还可以在创建时配置 `collection_enabled` 和
 `collection_directory`：启用后随 Canvas 卡片生命周期自动用 MCAP 记录
 LiDAR、IMU、RGB、depth 与 CameraInfo，不提供额外 start/stop 录制 action。
 `collection_status` 数据流显示每路计数、缺失/中断源和失败原因；当前 G1 Driver
 尚无 CameraInfo producer 时会明确降级但继续保存其余真实数据，不伪造标定。
+停止验收必须读取 `collection_stop_result` 及 receipt；收口失败时卡片
+保持可重试状态并返回顶层 `canvas_stop_failed`，不再伪报 `idle`。
+当前 G1 临时测试脚本没有挂载 recordings 目录，不能用于
+自动采集验收；需使用正式 `perception/deploy/service.yml`。
 输入输出、坐标换算、Canvas 连线、操作顺序、构建和部署步骤见
 [`plugins/fast_livo2/README.md`](plugins/fast_livo2/README.md)。
 

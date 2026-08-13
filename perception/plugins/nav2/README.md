@@ -96,7 +96,9 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 - 终点内层容差为 `0.18 m / 0.45 rad`：进入位置容差后不再发布平移，
   只保留 Nav2 的朝向校正；位置和朝向都进入容差后发布严格零速，避免
   速度下限把尾段微调放大成终点徘徊。该判断无跨任务状态，不会锁住
-  下一次导航，最终 `arrived` 仍以 Nav2 action result 为准；
+  下一次导航。它只在 fresh canonical odom 和当前 target 都存在时生效；
+  `goal_tolerance_reached` 只是零速 proposal reason，最终 `arrived` 仍以
+  Nav2 action result 为准；
 - BackUp 恢复动作固定为 `0.30 m/s`；
 - Driver 仍负责二次限幅、TTL、急停和停车确认。
 
@@ -133,6 +135,20 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
 - Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；
   proposal bridge 始终检查真正的根 `/cmd_vel`，发现外部发布者仍会拒绝导航。
+
+### 终点整形与并发保护
+
+当前整形容差 `0.18 m / 0.45 rad` 严于 Nav2 GoalChecker 的
+`0.20 m / 0.50 rad`。planner bridge 同时接收这组 GoalChecker 容差用于
+启动校验；终点整形容差非正、非有限，或大于对应 GoalChecker
+容差时直接拒绝启动。自定义 Nav2 params 时仍必须同步更新 bridge
+中的 paired tolerance。
+
+shadow velocity 回调在计算后、发布 proposal 前会在同一互斥区内
+二次校验 `nav_id/attempt/status`。Nav2 action result 、pause/resume 或
+新任务已使回调过期时，该回调不发布提案；因此终态零速不会被
+旧回调用更高 `sequence` 覆盖。当前自动证据覆盖纯函数和源码
+合同；终点不徘徊及真机时序仍需 G1 验收。
 
 ## Canvas 连线
 
