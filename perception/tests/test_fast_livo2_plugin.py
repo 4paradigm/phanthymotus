@@ -31,6 +31,10 @@ class ReadyBackend:
         self.calls.append((action, dict(args)))
         if action == "start_mapping":
             return {"status": "mapping", "map_name": args["map_name"]}
+        if action == "load_map":
+            return {"status": "map_loaded", "map_name": args["map_name"]}
+        if action == "unload_map":
+            return {"status": "unloaded", "map_name": args["map_name"]}
         return {"status": "saved", "map_name": args["map_name"]}
 
     def stop(self) -> None:
@@ -113,6 +117,20 @@ class FastLivo2PluginTest(unittest.TestCase):
         invalid = FastLivo2Plugin({"map_max_points": 100}, None, backend=ReadyBackend())
         info = invalid.dispatch("fast_livo2", {"action": "info"})
         self.assertEqual(info["error_code"], "invalid_config")
+
+    def test_canvas_stop_unloads_localization_before_backend_release(self) -> None:
+        backend = ReadyBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch("fast_livo2", {"action": "load_map", "map_name": "office"})
+
+        stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(stopped["stop_result"]["status"], "unloaded")
+        self.assertEqual([call[0] for call in backend.calls], ["load_map", "unload_map"])
+        self.assertEqual(backend.stop_calls, 1)
 
 
 if __name__ == "__main__":

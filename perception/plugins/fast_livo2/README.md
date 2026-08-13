@@ -32,7 +32,9 @@ Driver navigation_sensors
 - 原始 `/tf`、debug cloud 和 marker 全部隔离在
   `/ubuntu/navigation/fast_livo2/raw/*`，只有 adapter 发布权威
   `map -> base_link`。
-- `map` 是本次 FAST-LIVO2 进程的会话原点，不宣称跨重启全局定位。
+- 建图时 `map` 是本次 FAST-LIVO2 进程的会话原点。加载旧图后，
+  adapter 只在有限搜索范围内匹配成功后建立旧图到当前会话的刚体变换；
+  匹配前不发布伪造的 canonical odom/cloud 或 TF。
 
 ## 输入
 
@@ -56,7 +58,8 @@ frame 不符时 companion 不发布伪造的 canonical odom/cloud。
 
 Canvas 地图最多保留 80,000 个 `0.10 m` 体素占用点；Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
-`map_view` wire payload，也不让 FAST-LIVO2 依赖 Nav2。地图卡片支持三维
+`map_view` wire payload，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
+重定位成功前不显示伪造的机器人位姿。地图卡片支持三维
 浏览和正上方二维投影切换；二维模式只是同一三维点云的平面显示，不是另存
 一份 occupancy grid。绿色机器人箭头沿 canonical `base_link` 的 `+X` 前向，
 并保持 ROS `map` frame 的 yaw 正方向。它是监控视图，不是
@@ -75,13 +78,30 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 | --- | --- | --- |
 | `start_mapping` | `map_name` | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程 |
 | `stop_mapping` | 无 | `SIGINT` 停止算法，等待尾段保存并写 session manifest |
+| `load_map` | `map_name` | 读取 `stop_mapping` 生成的 manifest 和 PCD，启动不再写 PCD 的新定位前端 |
+| `relocalize` | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配 |
+| `unload_map` | 无 | 停止定位前端并卸载旧图 |
 
 `map_name` 只允许 `A-Z a-z 0-9 _ . -`，最长 64 字符。停止 Canvas 时若仍在
 建图，卡片会先执行 `stop_mapping` 再释放 ROS backend。
 
-当前锁定算法只有 PCD 保存，没有 PCD 加载、`/initialpose` 或 scan-to-map
-全局重定位。因此首版只支持同一进程会话内“边建图边导航”；重启 companion
-后旧 PCD 仍在，但不能把它冒充为已加载定位地图。
+重定位的操作顺序为：
+
+1. 执行 `load_map(map_name)`；只接受该卡片 `stop_mapping` 生成的
+   `phanthy.navigation.fast_livo2_map_session.v1` manifest，不猜测孤立 PCD 的归属。
+2. 机器人保持静止，等待新前端产生新鲜 odom 和 registered cloud。
+3. 在 Canvas 中给出机器人在旧图上的近似 `x/y/z/yaw`，执行
+   `relocalize`。默认只搜索位置±1.0 m、航向±0.35 rad；允许范围分别是
+   `0.1–3.0 m` 和 `0.05–π/2 rad`。
+4. 返回 `status=relocalized` 后，卡片才发布旧图 frame 下的
+   `map -> base_link`、registered cloud 和障碍图；此时再启动 Nav2 任务。
+5. 完成后执行 `unload_map`。
+
+当前锁定的 FAST-LIVO2 本身仍然没有 PCD 加载、`/initialpose` 或全局回环。
+这里的加载和重定位由 Perception companion adapter 实现：它是依赖人工
+初值的有界匹配，不是无初值的全局搜索，也不在定位成功后持续做全局
+闭环校正。匹配分数不足、点数不足、数据过期、manifest/PCD 损坏时全部
+fail closed。
 
 ## Canvas 连线
 
@@ -93,8 +113,9 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 6. Nav2 `velocity_proposal` -> Driver `loco.velocity_proposal`。
 
 Canvas 启动后，Nav2 可以先进入 wired 状态，但在 FAST-LIVO2 尚未开始产出
-odom/cloud 时，`navigate_to_pose` 会返回 readiness blocker。先在
-FAST-LIVO2 卡片执行 `start_mapping`，等地图视图和 odom 出现后再导航。
+odom/cloud 时，`navigate_to_pose` 会返回 readiness blocker。新图流程先执行
+`start_mapping`；旧图流程先执行 `load_map` 和 `relocalize`。等地图视图、odom
+和 diagnostics `ready=true` 后再导航。
 
 ## 构建
 

@@ -26,6 +26,12 @@ class FakeBackend:
         self.calls.append((action, dict(args)))
         if action == "start_mapping":
             return {"status": "mapping", "map_name": args["map_name"]}
+        if action == "load_map":
+            return {"status": "map_loaded", "map_name": args["map_name"]}
+        if action == "relocalize":
+            return {"status": "relocalized", "map_name": args["map_name"], "score": 0.8}
+        if action == "unload_map":
+            return {"status": "unloaded", "map_name": args["map_name"]}
         return {
             "status": "saved",
             "map_name": args["map_name"],
@@ -78,6 +84,52 @@ class FastLivo2CoreTest(unittest.TestCase):
         result = core.dispatch({"action": "start_mapping", "map_name": "room"})
         self.assertEqual(result["error_code"], "algorithm_unavailable")
         self.assertIsNone(core.info()["active_map"])
+
+    def test_load_relocalize_and_unload_lifecycle(self) -> None:
+        backend = FakeBackend()
+        core = FastLivo2Core(backend)
+
+        loaded = core.dispatch({"action": "load_map", "map_name": "office"})
+        self.assertEqual(loaded["status"], "map_loaded")
+        self.assertEqual(core.info()["loaded_map"], "office")
+
+        blocked_mapping = core.dispatch({"action": "start_mapping", "map_name": "new"})
+        self.assertEqual(blocked_mapping["error_code"], "localization_active")
+
+        localized = core.dispatch(
+            {
+                "action": "relocalize",
+                "initial_x": 1.0,
+                "initial_y": -2.0,
+                "initial_yaw": 0.5,
+            }
+        )
+        self.assertEqual(localized["status"], "relocalized")
+        self.assertEqual(backend.calls[-1][1]["map_name"], "office")
+        self.assertEqual(backend.calls[-1][1]["search_xy_m"], 1.0)
+
+        unloaded = core.dispatch({"action": "unload_map"})
+        self.assertEqual(unloaded["status"], "unloaded")
+        self.assertIsNone(core.info()["loaded_map"])
+
+    def test_relocalize_requires_map_and_finite_pose(self) -> None:
+        backend = FakeBackend()
+        core = FastLivo2Core(backend)
+        missing = core.dispatch(
+            {"action": "relocalize", "initial_x": 0, "initial_y": 0, "initial_yaw": 0}
+        )
+        self.assertEqual(missing["error_code"], "map_not_loaded")
+        core.dispatch({"action": "load_map", "map_name": "office"})
+        for key, value in (("initial_x", float("nan")), ("search_xy_m", 10.0)):
+            args = {
+                "action": "relocalize",
+                "initial_x": 0,
+                "initial_y": 0,
+                "initial_yaw": 0,
+                key: value,
+            }
+            with self.subTest(key=key):
+                self.assertEqual(core.dispatch(args)["error_code"], "invalid_argument")
 
 
 if __name__ == "__main__":

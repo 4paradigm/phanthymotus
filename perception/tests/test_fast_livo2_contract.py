@@ -25,7 +25,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(actions[:4], list(FAST_LIVO2_LIFECYCLE_ACTIONS))
         self.assertEqual(actions[4:], list(FAST_LIVO2_ACTIONS))
-        self.assertEqual(actions[4:], ["start_mapping", "stop_mapping"])
+        self.assertEqual(
+            actions[4:],
+            ["start_mapping", "stop_mapping", "load_map", "relocalize", "unload_map"],
+        )
 
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(set(inputs), {"lidar", "imu"})
@@ -89,11 +92,36 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn('full_name == p.PREFIX', main)
         self.assertIn('qualified_prefix = f"{p.PREFIX}_"', main)
 
-    def test_contract_does_not_claim_relocalization(self) -> None:
+    def test_contract_exposes_bounded_relocalization_not_navigation(self) -> None:
         tool = fast_livo2_tool_definition("ubuntu")
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
-        for unsupported in ("load_map", "global_localization", "navigate_to_tag"):
-            self.assertNotIn(unsupported, actions)
+        self.assertIn("load_map", actions)
+        self.assertIn("relocalize", actions)
+        self.assertIn("unload_map", actions)
+        self.assertNotIn("global_localization", actions)
+        self.assertNotIn("navigate_to_tag", actions)
+        self.assertEqual(
+            tool["inputSchema"]["x-action-params"]["relocalize"]["params"][:4],
+            ["initial_x", "initial_y", "initial_z", "initial_yaw"],
+        )
+
+        companion_package = (
+            PERCEPTION_ROOT
+            / "plugins"
+            / "fast_livo2"
+            / "companion"
+            / "g1_fast_livo2"
+            / "g1_fast_livo2"
+        )
+        supervisor = (companion_package / "runtime_supervisor.py").read_text(
+            encoding="utf-8"
+        )
+        adapter = (companion_package / "adapter_node.py").read_text(encoding="utf-8")
+        self.assertIn("_MAP_NAME_RE.fullmatch(map_name)", supervisor)
+        self.assertIn("self._algorithm_command(save_pcd=False)", supervisor)
+        self.assertIn('self._adapter_execute("unload_map", {})', supervisor)
+        self.assertIn("self._reference_points = loaded.points", adapter)
+        self.assertIn("reference = self._reference_points", adapter)
 
     def test_g1_build_and_start_entrypoint_stays_narrow(self) -> None:
         deploy_script = (

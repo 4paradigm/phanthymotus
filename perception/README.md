@@ -142,14 +142,15 @@ docker compose --env-file source-lock.env build nav2
 
 ## FAST-LIVO2 卡片
 
-`fast_livo2` 是 Perception Bundle 内的会话级建图/定位 processor。它通过
+`fast_livo2` 是 Perception Bundle 内的建图/定位 processor。它通过
 独立 companion 运行锁定的 FAST-LIVO2 算法，消费既有 Driver
 `navigation_sensors` 输出，并向 Nav2 提供权威
 `map -> base_link` odom、`map` registered cloud 和 Canvas `map_view`。
 
-当前只支持同一算法进程内边建图边导航。PCD 会持久化，但锁定算法不支持
-加载旧图或全局重定位，不能把重启后的新会话称作继续定位。输入输出、坐标
-换算、Canvas 连线、构建和部署步骤见
+卡片可以加载自身 `stop_mapping` 生成的 manifest/PCD，并在操作者提供的
+近似位姿附近做有界二维 scan-to-map 重定位。匹配成功前不发布
+canonical odom/cloud/TF。这不是无初值全局搜索，也没有持续的全局闭环校正。
+输入输出、坐标换算、Canvas 连线、操作顺序、构建和部署步骤见
 [`plugins/fast_livo2/README.md`](plugins/fast_livo2/README.md)。
 
 正式 compose 现在包含三个服务：主 Perception、FAST-LIVO2 companion 和

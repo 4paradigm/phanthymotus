@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 import struct
 from typing import Iterable, Sequence
 
@@ -34,6 +35,15 @@ class Pose3:
     y: float
     z: float
     q: Quaternion
+
+
+@dataclass(frozen=True)
+class RelocalizationResult:
+    map_from_session: Pose3
+    map_base_pose: Pose3
+    match_ratio: float
+    matched_points: int
+    evaluated_points: int
 
 
 def normalize_quaternion(q: Quaternion) -> Quaternion:
@@ -125,6 +135,297 @@ def yaw_from_quaternion(q: Quaternion) -> float:
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
+def transform_points(
+    pose: Pose3, points: Iterable[tuple[float, float, float]]
+) -> Iterable[tuple[float, float, float]]:
+    q = normalize_quaternion(pose.q)
+    xx, yy, zz = q.x * q.x, q.y * q.y, q.z * q.z
+    xy, xz, yz = q.x * q.y, q.x * q.z, q.y * q.z
+    wx, wy, wz = q.w * q.x, q.w * q.y, q.w * q.z
+    matrix = (
+        (1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)),
+        (2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)),
+        (2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)),
+    )
+    for x, y, z in points:
+        rx = matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z
+        ry = matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z
+        rz = matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z
+        yield pose.x + rx, pose.y + ry, pose.z + rz
+
+
+def read_pcd_xyz(path: str | Path, *, max_points: int = CANVAS_MAPPING_MAX_POINTS):
+    """Read finite XYZ points from an ASCII or uncompressed binary PCD file."""
+
+    if not 1 <= max_points <= CANVAS_MAPPING_MAX_POINTS:
+        raise ValueError("max_points is out of range")
+    source = Path(path)
+    try:
+        stream = source.open("rb")
+    except OSError as exc:
+        raise InvalidFastLivo2Frame(f"cannot open PCD {source.name}: {exc}") from exc
+    with stream:
+        header: dict[str, list[str]] = {}
+        while True:
+            raw = stream.readline()
+            if not raw:
+                raise InvalidFastLivo2Frame("PCD header is missing DATA")
+            try:
+                line = raw.decode("ascii").strip()
+            except UnicodeDecodeError as exc:
+                raise InvalidFastLivo2Frame("PCD header must be ASCII") from exc
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            key = parts[0].upper()
+            header[key] = parts[1:]
+            if key == "DATA":
+                break
+
+        fields = header.get("FIELDS") or header.get("FIELD")
+        if not fields or not {"x", "y", "z"}.issubset(fields):
+            raise InvalidFastLivo2Frame("PCD requires x/y/z fields")
+        try:
+            sizes = [int(value) for value in header["SIZE"]]
+            types = [value.upper() for value in header["TYPE"]]
+            counts = [int(value) for value in header.get("COUNT", ["1"] * len(fields))]
+            fallback_points = int(header["WIDTH"][0]) * int(header.get("HEIGHT", ["1"])[0])
+            declared_points = int((header.get("POINTS") or [str(fallback_points)])[0])
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            raise InvalidFastLivo2Frame("PCD field layout is invalid") from exc
+        if not (len(fields) == len(sizes) == len(types) == len(counts)):
+            raise InvalidFastLivo2Frame("PCD field layout lengths differ")
+        if declared_points < 0 or any(size <= 0 for size in sizes) or any(count <= 0 for count in counts):
+            raise InvalidFastLivo2Frame("PCD dimensions are invalid")
+
+        token_offsets: dict[str, int] = {}
+        byte_offsets: dict[str, int] = {}
+        token_offset = 0
+        byte_offset = 0
+        for name, size, count in zip(fields, sizes, counts):
+            token_offsets[name] = token_offset
+            byte_offsets[name] = byte_offset
+            token_offset += count
+            byte_offset += size * count
+        for name in ("x", "y", "z"):
+            index = fields.index(name)
+            if counts[index] != 1 or types[index] != "F" or sizes[index] not in {4, 8}:
+                raise InvalidFastLivo2Frame(f"PCD {name} must be scalar float32/float64")
+
+        mode = (header.get("DATA") or [""])[0].lower()
+        points: list[tuple[float, float, float]] = []
+        sample_stride = max(1, math.ceil(max(1, declared_points) / max_points))
+        if mode == "ascii":
+            source_index = 0
+            for raw in stream:
+                if len(points) >= max_points:
+                    break
+                values = raw.split()
+                if not values:
+                    continue
+                should_sample = source_index % sample_stride == 0
+                source_index += 1
+                if not should_sample:
+                    continue
+                try:
+                    point = tuple(float(values[token_offsets[name]]) for name in ("x", "y", "z"))
+                except (ValueError, IndexError) as exc:
+                    raise InvalidFastLivo2Frame("PCD ASCII point is malformed") from exc
+                if all(math.isfinite(value) for value in point):
+                    points.append(point)
+        elif mode == "binary":
+            payload = stream.read()
+            required = declared_points * byte_offset
+            if len(payload) < required:
+                raise InvalidFastLivo2Frame("PCD binary payload is truncated")
+            for point_index in range(0, declared_points, sample_stride):
+                if len(points) >= max_points:
+                    break
+                base = point_index * byte_offset
+                values = []
+                for name in ("x", "y", "z"):
+                    field_index = fields.index(name)
+                    fmt = "<f" if sizes[field_index] == 4 else "<d"
+                    values.append(struct.unpack_from(fmt, payload, base + byte_offsets[name])[0])
+                point = tuple(values)
+                if all(math.isfinite(value) for value in point):
+                    points.append(point)
+        else:
+            raise InvalidFastLivo2Frame(
+                f"PCD DATA {mode or '<missing>'} is unsupported; use ascii or binary"
+            )
+    if not points:
+        raise InvalidFastLivo2Frame("PCD contains no finite XYZ points")
+    return tuple(points)
+
+
+def _search_values(radius: float, step: float) -> tuple[float, ...]:
+    count = int(math.floor(radius / step))
+    values = {index * step for index in range(-count, count + 1)}
+    values.update({-radius, 0.0, radius})
+    return tuple(sorted(values))
+
+
+def estimate_planar_relocalization(
+    *,
+    reference_points: Iterable[tuple[float, float, float]],
+    session_points: Iterable[tuple[float, float, float]],
+    session_base_pose: Pose3,
+    initial_map_base_pose: Pose3,
+    search_xy_m: float,
+    search_yaw_rad: float,
+    min_z: float,
+    max_z: float,
+    match_voxel_m: float = 0.20,
+    min_match_ratio: float = 0.20,
+    min_points: int = 40,
+    max_scan_points: int = 1200,
+) -> RelocalizationResult:
+    """Bounded 2D correlative scan match around an operator pose guess."""
+
+    numeric = (
+        search_xy_m,
+        search_yaw_rad,
+        min_z,
+        max_z,
+        match_voxel_m,
+        min_match_ratio,
+    )
+    if not all(math.isfinite(value) for value in numeric):
+        raise InvalidFastLivo2Frame("relocalization parameters must be finite")
+    if search_xy_m <= 0 or search_yaw_rad <= 0 or match_voxel_m <= 0:
+        raise InvalidFastLivo2Frame("relocalization search bounds must be positive")
+    if min_z >= max_z or not 0.0 < min_match_ratio <= 1.0:
+        raise InvalidFastLivo2Frame("relocalization thresholds are invalid")
+
+    reference_cells = {
+        (math.floor(x / match_voxel_m), math.floor(y / match_voxel_m))
+        for x, y, z in reference_points
+        if all(math.isfinite(value) for value in (x, y, z)) and min_z <= z <= max_z
+    }
+    if len(reference_cells) < min_points:
+        raise InvalidFastLivo2Frame("saved map has too few obstacle points")
+    expanded_reference_cells = {
+        (ix + dx, iy + dy)
+        for ix, iy in reference_cells
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+    }
+
+    scan_voxels: dict[tuple[int, int], tuple[float, float]] = {}
+    relative_z_offset = initial_map_base_pose.z - session_base_pose.z
+    for x, y, z in session_points:
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            continue
+        if not min_z <= z + relative_z_offset <= max_z:
+            continue
+        key = (math.floor(x / match_voxel_m), math.floor(y / match_voxel_m))
+        scan_voxels.setdefault(key, (x, y))
+    samples = list(scan_voxels.values())
+    if len(samples) > max_scan_points:
+        stride = math.ceil(len(samples) / max_scan_points)
+        samples = samples[::stride]
+    if len(samples) < min_points:
+        raise InvalidFastLivo2Frame("current scan has too few obstacle points")
+
+    session_yaw = yaw_from_quaternion(session_base_pose.q)
+    initial_yaw = yaw_from_quaternion(initial_map_base_pose.q)
+
+    def evaluate(base_x: float, base_y: float, base_yaw: float):
+        theta = base_yaw - session_yaw
+        cosine = math.cos(theta)
+        sine = math.sin(theta)
+        tx = base_x - (cosine * session_base_pose.x - sine * session_base_pose.y)
+        ty = base_y - (sine * session_base_pose.x + cosine * session_base_pose.y)
+        hits = 0
+        quality = 0.0
+        for x, y in samples:
+            mx = cosine * x - sine * y + tx
+            my = sine * x + cosine * y + ty
+            ix = math.floor(mx / match_voxel_m)
+            iy = math.floor(my / match_voxel_m)
+            if (ix, iy) in reference_cells:
+                hits += 1
+                quality += 1.0
+            elif (ix, iy) in expanded_reference_cells:
+                hits += 1
+                quality += 0.25
+        return quality / len(samples), hits
+
+    def correction_distance(base_x: float, base_y: float, base_yaw: float) -> float:
+        return (
+            ((base_x - initial_map_base_pose.x) / search_xy_m) ** 2
+            + ((base_y - initial_map_base_pose.y) / search_xy_m) ** 2
+            + ((base_yaw - initial_yaw) / search_yaw_rad) ** 2
+        )
+
+    def in_bounds(base_x: float, base_y: float, base_yaw: float) -> bool:
+        epsilon = 1e-9
+        return (
+            abs(base_x - initial_map_base_pose.x) <= search_xy_m + epsilon
+            and abs(base_y - initial_map_base_pose.y) <= search_xy_m + epsilon
+            and abs(base_yaw - initial_yaw) <= search_yaw_rad + epsilon
+        )
+
+    def consider(base_x: float, base_y: float, base_yaw: float, current):
+        if not in_bounds(base_x, base_y, base_yaw):
+            return current
+        score, hits = evaluate(base_x, base_y, base_yaw)
+        distance = correction_distance(base_x, base_y, base_yaw)
+        if current is None or score > current[0] + 1e-12 or (
+            abs(score - current[0]) <= 1e-12
+            and (hits > current[1] or (hits == current[1] and distance < current[5]))
+        ):
+            return (score, hits, base_x, base_y, base_yaw, distance)
+        return current
+
+    coarse_xy = min(0.25, search_xy_m)
+    coarse_yaw = min(0.10, search_yaw_rad)
+    best = None
+    for dx in _search_values(search_xy_m, coarse_xy):
+        for dy in _search_values(search_xy_m, coarse_xy):
+            for dyaw in _search_values(search_yaw_rad, coarse_yaw):
+                best = consider(
+                    initial_map_base_pose.x + dx,
+                    initial_map_base_pose.y + dy,
+                    initial_yaw + dyaw,
+                    best,
+                )
+    if best is None:
+        raise InvalidFastLivo2Frame("relocalization search produced no candidates")
+
+    fine_xy = coarse_xy / 5.0
+    fine_yaw = coarse_yaw / 5.0
+    coarse_best = best
+    for dx in _search_values(coarse_xy, fine_xy):
+        for dy in _search_values(coarse_xy, fine_xy):
+            for dyaw in _search_values(coarse_yaw, fine_yaw):
+                best = consider(
+                    coarse_best[2] + dx,
+                    coarse_best[3] + dy,
+                    coarse_best[4] + dyaw,
+                    best,
+                )
+
+    if best[0] < min_match_ratio:
+        raise InvalidFastLivo2Frame(
+            f"scan-to-map match ratio {best[0]:.3f} is below {min_match_ratio:.3f}"
+        )
+    map_base = Pose3(
+        best[2],
+        best[3],
+        initial_map_base_pose.z,
+        quaternion_from_rpy(0.0, 0.0, best[4]),
+    )
+    return RelocalizationResult(
+        map_from_session=compose_pose(map_base, inverse_pose(session_base_pose)),
+        map_base_pose=map_base,
+        match_ratio=best[0],
+        matched_points=best[1],
+        evaluated_points=len(samples),
+    )
+
+
 def _field_value(field, key: str):
     return field[key] if isinstance(field, dict) else getattr(field, key)
 
@@ -200,6 +501,10 @@ class VoxelMap:
     def point_count(self) -> int:
         return len(self._points)
 
+    @property
+    def points(self) -> tuple[tuple[float, float, float], ...]:
+        return tuple(self._points.values())
+
     def project_xy(
         self,
         *,
@@ -241,10 +546,14 @@ __all__ = [
     "InvalidFastLivo2Frame",
     "Pose3",
     "Quaternion",
+    "RelocalizationResult",
     "VoxelMap",
     "canonical_base_pose",
     "compose_pose",
+    "estimate_planar_relocalization",
     "iter_xyz_points",
     "quaternion_from_rpy",
+    "read_pcd_xyz",
+    "transform_points",
     "yaw_from_quaternion",
 ]

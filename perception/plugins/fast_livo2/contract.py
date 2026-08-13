@@ -5,7 +5,13 @@ from __future__ import annotations
 from copy import deepcopy
 
 
-FAST_LIVO2_ACTIONS = ("start_mapping", "stop_mapping")
+FAST_LIVO2_ACTIONS = (
+    "start_mapping",
+    "stop_mapping",
+    "load_map",
+    "relocalize",
+    "unload_map",
+)
 FAST_LIVO2_LIFECYCLE_ACTIONS = ("info", "config", "start", "stop")
 FAST_LIVO2_PUBLIC_ACTIONS = FAST_LIVO2_LIFECYCLE_ACTIONS + FAST_LIVO2_ACTIONS
 
@@ -67,6 +73,28 @@ FAST_LIVO2_ACTION_PARAMS = {
     "stop_mapping": {
         "params": [],
         "description": "Stop the active mapping session and finalize PCD files",
+    },
+    "load_map": {
+        "params": ["map_name"],
+        "description": "Load a saved PCD session and start a fresh localization frontend",
+    },
+    "relocalize": {
+        "params": [
+            "initial_x",
+            "initial_y",
+            "initial_z",
+            "initial_yaw",
+            "search_xy_m",
+            "search_yaw_rad",
+        ],
+        "description": (
+            "Align the current FAST-LIVO2 session to the loaded map near an "
+            "operator-provided pose guess"
+        ),
+    },
+    "unload_map": {
+        "params": [],
+        "description": "Stop localization and unload the saved map",
     },
 }
 
@@ -194,6 +222,45 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                     "maxLength": 64,
                     "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
                     "description": "Logical name recorded in the PCD session manifest",
+                },
+                "initial_x": {
+                    "type": "number",
+                    "minimum": -1000.0,
+                    "maximum": 1000.0,
+                    "description": "Approximate robot X in the loaded map, metres",
+                },
+                "initial_y": {
+                    "type": "number",
+                    "minimum": -1000.0,
+                    "maximum": 1000.0,
+                    "description": "Approximate robot Y in the loaded map, metres",
+                },
+                "initial_z": {
+                    "type": "number",
+                    "minimum": -10.0,
+                    "maximum": 10.0,
+                    "default": 0.0,
+                    "description": "Approximate robot Z in the loaded map, metres",
+                },
+                "initial_yaw": {
+                    "type": "number",
+                    "minimum": -3.141592653589793,
+                    "maximum": 3.141592653589793,
+                    "description": "Approximate robot yaw in the loaded map, radians",
+                },
+                "search_xy_m": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 3.0,
+                    "default": 1.0,
+                    "description": "Bounded XY search radius around the initial guess",
+                },
+                "search_yaw_rad": {
+                    "type": "number",
+                    "minimum": 0.05,
+                    "maximum": 1.5707963267948966,
+                    "default": 0.35,
+                    "description": "Bounded yaw search radius around the initial guess",
                 },
                 "instance_id": {"type": "string"},
                 "input_topic": {"type": "string"},

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import math
 import threading
 from typing import Protocol
 
@@ -53,18 +54,36 @@ def normalize_map_name(value) -> str:
     return normalized
 
 
+def _finite_number(args: dict, key: str, minimum: float, maximum: float, *, default=None) -> float:
+    raw = args.get(key, default)
+    if isinstance(raw, bool):
+        raise FastLivo2BackendError("invalid_argument", f"{key} must be a number")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise FastLivo2BackendError("invalid_argument", f"{key} must be a number") from exc
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise FastLivo2BackendError(
+            "invalid_argument", f"{key} must be within [{minimum}, {maximum}]"
+        )
+    return value
+
+
 class FastLivo2Core:
     def __init__(self, backend: FastLivo2Backend):
         self._backend = backend
         self._lock = threading.Lock()
         self._active_map: str | None = None
+        self._loaded_map: str | None = None
 
     def info(self) -> dict:
         with self._lock:
             active_map = self._active_map
+            loaded_map = self._loaded_map
         result = dict(self._backend.info())
         result.setdefault("state", "idle")
         result["active_map"] = active_map
+        result["loaded_map"] = loaded_map
         result["actions"] = list(FAST_LIVO2_ACTIONS)
         return result
 
@@ -82,10 +101,67 @@ class FastLivo2Core:
                         raise FastLivo2BackendError(
                             "mapping_active", f"mapping {self._active_map} is already active"
                         )
+                    if self._loaded_map:
+                        raise FastLivo2BackendError(
+                            "localization_active",
+                            f"map {self._loaded_map} is loaded for localization",
+                        )
                 result = dict(self._backend.execute(action, {"map_name": map_name}))
                 if result.get("status") not in {"error", "rejected"}:
                     with self._lock:
                         self._active_map = map_name
+                return self._result(action, result)
+
+            if action == "load_map":
+                map_name = normalize_map_name(args.get("map_name"))
+                with self._lock:
+                    if self._active_map:
+                        raise FastLivo2BackendError(
+                            "mapping_active", f"mapping {self._active_map} is already active"
+                        )
+                    if self._loaded_map:
+                        raise FastLivo2BackendError(
+                            "localization_active",
+                            f"map {self._loaded_map} is already loaded",
+                        )
+                result = dict(self._backend.execute(action, {"map_name": map_name}))
+                if result.get("status") not in {"error", "rejected"}:
+                    with self._lock:
+                        self._loaded_map = map_name
+                return self._result(action, result)
+
+            if action == "relocalize":
+                with self._lock:
+                    loaded_map = self._loaded_map
+                if not loaded_map:
+                    raise FastLivo2BackendError(
+                        "map_not_loaded", "load a saved map before relocalizing"
+                    )
+                request = {
+                    "map_name": loaded_map,
+                    "initial_x": _finite_number(args, "initial_x", -1000.0, 1000.0),
+                    "initial_y": _finite_number(args, "initial_y", -1000.0, 1000.0),
+                    "initial_z": _finite_number(args, "initial_z", -10.0, 10.0, default=0.0),
+                    "initial_yaw": _finite_number(args, "initial_yaw", -math.pi, math.pi),
+                    "search_xy_m": _finite_number(args, "search_xy_m", 0.1, 3.0, default=1.0),
+                    "search_yaw_rad": _finite_number(
+                        args, "search_yaw_rad", 0.05, math.pi / 2.0, default=0.35
+                    ),
+                }
+                return self._result(action, dict(self._backend.execute(action, request)))
+
+            if action == "unload_map":
+                with self._lock:
+                    loaded_map = self._loaded_map
+                if not loaded_map:
+                    return self._result(
+                        action,
+                        {"status": "idle", "already_idle": True, "map_name": None},
+                    )
+                result = dict(self._backend.execute(action, {"map_name": loaded_map}))
+                if result.get("status") in {"unloaded", "stopped", "idle"}:
+                    with self._lock:
+                        self._loaded_map = None
                 return self._result(action, result)
 
             with self._lock:

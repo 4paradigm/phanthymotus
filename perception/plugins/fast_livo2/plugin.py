@@ -220,8 +220,12 @@ class FastLivo2Plugin:
         with self._lock:
             core = self._core
         stop_result = None
-        if core is not None and core.info().get("active_map"):
-            stop_result = core.dispatch({"action": "stop_mapping"})
+        if core is not None:
+            info = core.info()
+            if info.get("active_map"):
+                stop_result = core.dispatch({"action": "stop_mapping"})
+            elif info.get("loaded_map"):
+                stop_result = core.dispatch({"action": "unload_map"})
         self._release_core()
         return {
             "state": "idle",
@@ -277,6 +281,7 @@ class FastLivo2Plugin:
             "status": "error" if config_error else "idle",
             "backend": "not_started",
             "active_map": None,
+            "loaded_map": None,
             "actions": list(FAST_LIVO2_ACTIONS),
             "physical_execution": False,
         }

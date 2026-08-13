@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -22,8 +23,12 @@ from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     Quaternion,
     VoxelMap,
     canonical_base_pose,
+    estimate_planar_relocalization,
+    inverse_pose,
     iter_xyz_points,
     quaternion_from_rpy,
+    read_pcd_xyz,
+    transform_points,
     yaw_from_quaternion,
 )
 
@@ -128,6 +133,120 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             voxel_map.project_xy(min_z=1.0, max_z=1.0)
+
+    def test_ascii_and_binary_pcd_are_read_fail_closed(self) -> None:
+        header = (
+            "# .PCD v0.7\nVERSION 0.7\nFIELDS x y z intensity\n"
+            "SIZE 4 4 4 4\nTYPE F F F F\nCOUNT 1 1 1 1\n"
+            "WIDTH 2\nHEIGHT 1\nPOINTS 2\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ascii_path = Path(directory) / "ascii.pcd"
+            ascii_path.write_bytes(
+                (header + "DATA ascii\n1 2 0 3\n4 5 0.5 6\n").encode("ascii")
+            )
+            self.assertEqual(read_pcd_xyz(ascii_path), ((1.0, 2.0, 0.0), (4.0, 5.0, 0.5)))
+
+            binary_path = Path(directory) / "binary.pcd"
+            binary_path.write_bytes(
+                (header + "DATA binary\n").encode("ascii")
+                + struct.pack("<ffffffff", 1, 2, 0, 3, 4, 5, 0.5, 6)
+            )
+            self.assertEqual(read_pcd_xyz(binary_path), ((1.0, 2.0, 0.0), (4.0, 5.0, 0.5)))
+
+            compressed = Path(directory) / "compressed.pcd"
+            compressed.write_text(header + "DATA binary_compressed\n", encoding="ascii")
+            with self.assertRaisesRegex(InvalidFastLivo2Frame, "unsupported"):
+                read_pcd_xyz(compressed)
+
+            sampled_header = header.replace("WIDTH 2", "WIDTH 10").replace(
+                "POINTS 2", "POINTS 10"
+            )
+            sampled = Path(directory) / "sampled.pcd"
+            sampled.write_bytes(
+                (sampled_header + "DATA binary\n").encode("ascii")
+                + b"".join(
+                    struct.pack("<ffff", float(index), 0.0, 0.0, 1.0)
+                    for index in range(10)
+                )
+            )
+            self.assertEqual(
+                read_pcd_xyz(sampled, max_points=3),
+                ((0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (8.0, 0.0, 0.0)),
+            )
+
+    def test_bounded_planar_relocalization_recovers_known_pose(self) -> None:
+        reference = []
+        for index in range(60):
+            reference.append((index * 0.10, 0.0, 0.0))
+            reference.append((0.0, index * 0.10, 0.0))
+        expected = Pose3(2.0, -1.0, 0.0, quaternion_from_rpy(0.0, 0.0, 0.30))
+        session_points = tuple(transform_points(inverse_pose(expected), reference))
+        result = estimate_planar_relocalization(
+            reference_points=reference,
+            session_points=session_points,
+            session_base_pose=Pose3(0.0, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0)),
+            initial_map_base_pose=Pose3(
+                2.20, -1.15, 0.0, quaternion_from_rpy(0.0, 0.0, 0.40)
+            ),
+            search_xy_m=0.5,
+            search_yaw_rad=0.25,
+            min_z=-0.5,
+            max_z=0.5,
+            min_match_ratio=0.5,
+        )
+        self.assertAlmostEqual(result.map_base_pose.x, expected.x, delta=0.15)
+        self.assertAlmostEqual(result.map_base_pose.y, expected.y, delta=0.15)
+        self.assertAlmostEqual(
+            yaw_from_quaternion(result.map_base_pose.q),
+            yaw_from_quaternion(expected.q),
+            delta=0.08,
+        )
+        self.assertGreaterEqual(result.match_ratio, 0.5)
+
+        with self.assertRaisesRegex(InvalidFastLivo2Frame, "too few"):
+            estimate_planar_relocalization(
+                reference_points=reference[:5],
+                session_points=session_points,
+                session_base_pose=Pose3(
+                    0.0, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0)
+                ),
+                initial_map_base_pose=expected,
+                search_xy_m=0.5,
+                search_yaw_rad=0.25,
+                min_z=-0.5,
+                max_z=0.5,
+            )
+
+    def test_relocalization_ties_prefer_operator_guess_and_stay_bounded(self) -> None:
+        session = []
+        for index in range(40):
+            session.append((index * 0.20, 0.0, 0.0))
+            session.append((0.0, index * 0.20, 0.0))
+        reference = session + [(x + 2.0, y, z) for x, y, z in session]
+        initial = Pose3(2.0, 0.0, 0.0, quaternion_from_rpy(0.0, 0.0, 0.0))
+
+        result = estimate_planar_relocalization(
+            reference_points=reference,
+            session_points=session,
+            session_base_pose=Pose3(
+                0.0, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0)
+            ),
+            initial_map_base_pose=initial,
+            search_xy_m=2.0,
+            search_yaw_rad=0.10,
+            min_z=-0.5,
+            max_z=0.5,
+            min_match_ratio=0.5,
+        )
+
+        self.assertAlmostEqual(result.map_base_pose.x, initial.x, places=6)
+        self.assertLessEqual(abs(result.map_base_pose.y - initial.y), 2.0)
+        self.assertAlmostEqual(
+            yaw_from_quaternion(result.map_base_pose.q),
+            yaw_from_quaternion(initial.q),
+            places=6,
+        )
 
 
 if __name__ == "__main__":
