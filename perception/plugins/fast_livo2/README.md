@@ -78,9 +78,8 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 | --------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | `start_mapping` | `map_name`                                                                            | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程                    |
 | `stop_mapping`  | 无                                                                                     | `SIGINT` 停止算法，等待尾段保存并写 session manifest               |
-| `load_map`      | `map_name`                                                                            | 读取 `stop_mapping` 生成的 manifest 和 PCD，启动不再写 PCD 的新定位前端 |
+| `load_map`      | `map_name`                                                                            | 自动停止旧定位前端，读取 manifest/PCD 并启动新定位前端     |
 | `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
-| `unload_map`    | 无                                                                                     | 停止定位前端并卸载旧图                                           |
 
 `map_name` 只允许 `A-Z a-z 0-9 _ . -`，最长 64 字符。停止 Canvas 时若仍在
 建图，卡片会先执行 `stop_mapping` 再释放 ROS backend。
@@ -95,7 +94,9 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
    `0.1–3.0 m` 和 `0.05–π/2 rad`。
 4. 返回 `status=relocalized` 后，卡片才发布旧图 frame 下的
    `map -> base_link`、registered cloud 和障碍图；此时再启动 Nav2 任务。
-5. 完成后执行 `unload_map`。
+5. 切换地图时直接再次执行 `load_map`；新地图的 manifest/PCD 先通过
+   校验，再自动停止旧定位前端并加载新图。卡片停止时会自动释放
+   当前定位前端，不再对外提供 `unload_map`。
 
 当前锁定的 FAST-LIVO2 本身仍然没有 PCD 加载、`/initialpose` 或全局回环。
 这里的加载和重定位由 Perception companion adapter 实现：它是依赖人工

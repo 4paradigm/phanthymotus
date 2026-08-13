@@ -10,7 +10,6 @@ FAST_LIVO2_ACTIONS = (
     "stop_mapping",
     "load_map",
     "relocalize",
-    "unload_map",
 )
 FAST_LIVO2_LIFECYCLE_ACTIONS = ("info", "config", "start", "stop")
 FAST_LIVO2_PUBLIC_ACTIONS = FAST_LIVO2_LIFECYCLE_ACTIONS + FAST_LIVO2_ACTIONS
@@ -94,7 +93,10 @@ FAST_LIVO2_ACTION_PARAMS = {
     },
     "load_map": {
         "params": ["map_name"],
-        "description": "Load a saved PCD session and start a fresh localization frontend",
+        "description": (
+            "Replace any loaded map, then load a saved PCD session and start "
+            "a fresh localization frontend"
+        ),
     },
     "relocalize": {
         "params": [
@@ -109,10 +111,6 @@ FAST_LIVO2_ACTION_PARAMS = {
             "Align the current FAST-LIVO2 session to the loaded map near an "
             "operator-provided pose guess"
         ),
-    },
-    "unload_map": {
-        "params": [],
-        "description": "Stop localization and unload the saved map",
     },
 }
 

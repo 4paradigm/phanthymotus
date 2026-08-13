@@ -48,6 +48,14 @@ class RejectingBackend(FakeBackend):
         raise FastLivo2BackendError("algorithm_unavailable", "algorithm is unavailable")
 
 
+class UnconfirmedLocalizationStopBackend(FakeBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "unload_map":
+            self.calls.append((action, dict(args)))
+            return {"status": "running", "map_name": args["map_name"]}
+        return super().execute(action, args)
+
+
 class FastLivo2CoreTest(unittest.TestCase):
     def test_mapping_lifecycle_and_idempotent_stop(self) -> None:
         backend = FakeBackend()
@@ -85,7 +93,7 @@ class FastLivo2CoreTest(unittest.TestCase):
         self.assertEqual(result["error_code"], "algorithm_unavailable")
         self.assertIsNone(core.info()["active_map"])
 
-    def test_load_relocalize_and_unload_lifecycle(self) -> None:
+    def test_load_relocalize_and_automatic_map_replacement(self) -> None:
         backend = FakeBackend()
         core = FastLivo2Core(backend)
 
@@ -108,9 +116,38 @@ class FastLivo2CoreTest(unittest.TestCase):
         self.assertEqual(backend.calls[-1][1]["map_name"], "office")
         self.assertEqual(backend.calls[-1][1]["search_xy_m"], 1.0)
 
-        unloaded = core.dispatch({"action": "unload_map"})
-        self.assertEqual(unloaded["status"], "unloaded")
-        self.assertIsNone(core.info()["loaded_map"])
+        replaced = core.dispatch({"action": "load_map", "map_name": "warehouse"})
+        self.assertEqual(replaced["status"], "map_loaded")
+        self.assertEqual(replaced["replaced_map"], "office")
+        self.assertEqual(core.info()["loaded_map"], "warehouse")
+        self.assertEqual(
+            [call[0] for call in backend.calls[-2:]],
+            ["unload_map", "load_map"],
+        )
+
+        removed = core.dispatch({"action": "unload_map"})
+        self.assertEqual(removed["error_code"], "unsupported_action")
+
+    def test_load_map_keeps_old_map_when_private_stop_is_unconfirmed(self) -> None:
+        backend = UnconfirmedLocalizationStopBackend()
+        core = FastLivo2Core(backend)
+        self.assertEqual(
+            core.dispatch({"action": "load_map", "map_name": "office"})["status"],
+            "map_loaded",
+        )
+
+        result = core.dispatch({"action": "load_map", "map_name": "warehouse"})
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "localization_stop_unconfirmed")
+        self.assertEqual(core.info()["loaded_map"], "office")
+        self.assertEqual(
+            backend.calls,
+            [
+                ("load_map", {"map_name": "office"}),
+                ("unload_map", {"map_name": "office"}),
+            ],
+        )
 
     def test_relocalize_requires_map_and_finite_pose(self) -> None:
         backend = FakeBackend()

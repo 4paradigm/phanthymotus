@@ -488,11 +488,16 @@ class FastLivo2Supervisor(Node):
 
     def _load_map(self, map_name: str) -> dict:
         with self._lock:
-            if self._process is not None and self._process.poll() is None:
+            process_running = (
+                self._process is not None and self._process.poll() is None
+            )
+            runtime_mode = self._runtime_mode
+            previous_map = self._loaded_map
+            if process_running and runtime_mode != "localization":
                 return {
                     "status": "error",
                     "error_code": "runtime_active",
-                    "error": f"FAST-LIVO2 {self._runtime_mode} runtime is already active",
+                    "error": f"FAST-LIVO2 {runtime_mode} runtime is already active",
                 }
         try:
             files = self._map_files_from_manifest(map_name)
@@ -502,6 +507,10 @@ class FastLivo2Supervisor(Node):
                 "error_code": "map_artifact_invalid",
                 "error": str(exc),
             }
+        if runtime_mode == "localization":
+            unloaded = self._unload_map()
+            if unloaded.get("status") == "error":
+                return unloaded
         loaded = self._adapter_execute(
             "load_map", {"map_name": map_name, "pcd_files": [str(path) for path in files]}
         )
@@ -540,6 +549,7 @@ class FastLivo2Supervisor(Node):
             **loaded,
             "pid": process.pid,
             "runtime_mode": "localization",
+            "replaced_map": previous_map,
             "bounded_relocalization_supported": True,
         }
 

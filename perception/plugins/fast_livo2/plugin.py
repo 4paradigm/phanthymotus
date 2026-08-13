@@ -257,7 +257,7 @@ class FastLivo2Plugin:
             if info.get("active_map"):
                 stop_result = core.dispatch({"action": "stop_mapping"})
             elif info.get("loaded_map"):
-                stop_result = core.dispatch({"action": "unload_map"})
+                stop_result = core.stop_localization()
             collection_stop_result = core.configure_collection(
                 {
                     "enabled": False,

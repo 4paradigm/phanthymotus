@@ -150,6 +150,8 @@ docker compose --env-file source-lock.env build nav2
 卡片可以加载自身 `stop_mapping` 生成的 manifest/PCD，并在操作者提供的
 近似位姿附近做有界二维 scan-to-map 重定位。匹配成功前不发布
 canonical odom/cloud/TF。这不是无初值全局搜索，也没有持续的全局闭环校正。
+`load_map` 会先校验新图文件，再自动替换已加载的旧图；卡片不再暴露
+`unload_map` 公开 action。
 卡片还可以在创建时配置 `collection_enabled` 和
 `collection_directory`：启用后随 Canvas 卡片生命周期自动用 MCAP 记录
 LiDAR、IMU、RGB、depth 与 CameraInfo，不提供额外 start/stop 录制 action。

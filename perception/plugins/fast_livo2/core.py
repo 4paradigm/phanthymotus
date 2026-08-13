@@ -115,19 +115,20 @@ class FastLivo2Core:
             if action == "load_map":
                 map_name = normalize_map_name(args.get("map_name"))
                 with self._lock:
+                    previous_map = self._loaded_map
                     if self._active_map:
                         raise FastLivo2BackendError(
                             "mapping_active", f"mapping {self._active_map} is already active"
                         )
-                    if self._loaded_map:
-                        raise FastLivo2BackendError(
-                            "localization_active",
-                            f"map {self._loaded_map} is already loaded",
-                        )
+                if previous_map:
+                    stopped = self.stop_localization()
+                    if stopped.get("status") == "error":
+                        return self._result(action, stopped)
                 result = dict(self._backend.execute(action, {"map_name": map_name}))
                 if result.get("status") not in {"error", "rejected"}:
                     with self._lock:
                         self._loaded_map = map_name
+                    result.setdefault("replaced_map", previous_map)
                 return self._result(action, result)
 
             if action == "relocalize":
@@ -150,20 +151,6 @@ class FastLivo2Core:
                 }
                 return self._result(action, dict(self._backend.execute(action, request)))
 
-            if action == "unload_map":
-                with self._lock:
-                    loaded_map = self._loaded_map
-                if not loaded_map:
-                    return self._result(
-                        action,
-                        {"status": "idle", "already_idle": True, "map_name": None},
-                    )
-                result = dict(self._backend.execute(action, {"map_name": loaded_map}))
-                if result.get("status") in {"unloaded", "stopped", "idle"}:
-                    with self._lock:
-                        self._loaded_map = None
-                return self._result(action, result)
-
             with self._lock:
                 active_map = self._active_map
             if not active_map:
@@ -180,6 +167,34 @@ class FastLivo2Core:
             return self._error(str(action), exc.code, str(exc))
         except Exception as exc:
             return self._error(str(action), "backend_error", f"{type(exc).__name__}: {exc}")
+
+    def stop_localization(self) -> dict:
+        """Stop the private localization runtime without exposing unload_map."""
+        with self._lock:
+            loaded_map = self._loaded_map
+        if not loaded_map:
+            return {"status": "idle", "already_idle": True, "map_name": None}
+        try:
+            result = dict(
+                self._backend.execute("unload_map", {"map_name": loaded_map})
+            )
+            if result.get("status") not in {"unloaded", "stopped", "idle"}:
+                return self._error(
+                    "stop_localization",
+                    "localization_stop_unconfirmed",
+                    f"failed to stop localization for map {loaded_map}",
+                )
+        except FastLivo2BackendError as exc:
+            return self._error("stop_localization", exc.code, str(exc))
+        except Exception as exc:
+            return self._error(
+                "stop_localization",
+                "backend_error",
+                f"{type(exc).__name__}: {exc}",
+            )
+        with self._lock:
+            self._loaded_map = None
+        return result
 
     def configure_collection(self, config: dict) -> dict:
         """Apply private recorder configuration without exposing a public action."""

@@ -27,7 +27,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertEqual(actions[4:], list(FAST_LIVO2_ACTIONS))
         self.assertEqual(
             actions[4:],
-            ["start_mapping", "stop_mapping", "load_map", "relocalize", "unload_map"],
+            ["start_mapping", "stop_mapping", "load_map", "relocalize"],
         )
 
         inputs = {item["port"]: item for item in tool["topic_in"]}
@@ -120,7 +120,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertIn("load_map", actions)
         self.assertIn("relocalize", actions)
-        self.assertIn("unload_map", actions)
+        self.assertNotIn("unload_map", actions)
         self.assertNotIn("global_localization", actions)
         self.assertNotIn("navigate_to_tag", actions)
         self.assertEqual(
