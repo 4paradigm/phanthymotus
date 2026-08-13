@@ -791,7 +791,7 @@ class FastLivo2Supervisor(Node):
             "-p", f"pcd_save.interval:={interval}",
             "-p", "pcd_save.type:=0",
             "--log-level", "warn",
-            "-r", "/livox/lidar:=/ubuntu/navigation/lidar_fast_livo",
+            "-r", "/livox/lidar:=/ubuntu/navigation/lidar",
             "-r", "/livox/imu:=/ubuntu/navigation/imu",
             "-r", "/left_camera/image:=/ubuntu/navigation/camera_disabled",
             "-r", "/cloud_registered:=/ubuntu/navigation/fast_livo2/raw/cloud_registered",

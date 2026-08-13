@@ -135,7 +135,7 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
         "topic_in": [
             {
                 "port": "lidar",
-                "topic": f"{root}/navigation/lidar_fast_livo",
+                "topic": f"{root}/navigation/lidar",
                 "format": "sensor/pointcloud",
                 "ros_type": "sensor_msgs/msg/PointCloud2",
                 "qos": "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",

@@ -14,7 +14,7 @@ COLLECTION_ROOT = PurePosixPath(
 COLLECTION_SOURCES = (
     {
         "port": "lidar",
-        "topic": "/ubuntu/navigation/lidar_fast_livo",
+        "topic": "/ubuntu/navigation/lidar",
         "ros_type": "sensor_msgs/msg/PointCloud2",
         "qos": "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",
     },

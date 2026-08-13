@@ -51,6 +51,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
         self.assertEqual(
             command[7:], [item["topic"] for item in COLLECTION_SOURCES]
         )
+        self.assertEqual(COLLECTION_SOURCES[0]["topic"], "/ubuntu/navigation/lidar")
 
     def test_health_exposes_normal_and_missing_source_failure(self) -> None:
         health = CollectionHealth(grace_sec=5.0, stale_sec=2.0)

@@ -9,7 +9,7 @@ Perception Bundle；Driver 只提供已冻结的标准传感器输入。
 
 ```text
 Driver navigation_sensors
-  /ubuntu/navigation/lidar_fast_livo  PointCloud2, 10 Hz
+  /ubuntu/navigation/lidar            PointCloud2, 10 Hz
   /ubuntu/navigation/imu              Imu, 200 Hz
                     |
                     v
@@ -40,7 +40,7 @@ Driver navigation_sensors
 
 | port | topic | type / QoS | 约束 |
 | --- | --- | --- | --- |
-| `lidar` | `/ubuntu/navigation/lidar_fast_livo` | `sensor_msgs/msg/PointCloud2`; `RELIABLE + KEEP_LAST(2)` | MID360 `livox_frame`，ROS system time，逐点 offset 保留 |
+| `lidar` | `/ubuntu/navigation/lidar` | `sensor_msgs/msg/PointCloud2`; `RELIABLE + KEEP_LAST(2)` | MID360 `livox_frame`，ROS system time，逐点 offset 保留 |
 | `imu` | `/ubuntu/navigation/imu` | `sensor_msgs/msg/Imu`; `RELIABLE + KEEP_LAST(200)` | 与点云相同时钟域和安装旋转，约 200 Hz |
 
 这两路输入来自既有 Driver `navigation_sensors` sensor cards。缺失、过期或
@@ -140,7 +140,7 @@ fail closed。
 
 | 数据 | topic | ROS type / QoS |
 | --- | --- | --- |
-| LiDAR | `/ubuntu/navigation/lidar_fast_livo` | `PointCloud2`; `RELIABLE + KEEP_LAST(2) + VOLATILE` |
+| LiDAR | `/ubuntu/navigation/lidar` | `PointCloud2`; `RELIABLE + KEEP_LAST(2) + VOLATILE` |
 | IMU | `/ubuntu/navigation/imu` | `Imu`; `RELIABLE + KEEP_LAST(200) + VOLATILE` |
 | RGB | `/ubuntu/camera/rgb` | `CompressedImage`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE` |
 | Depth | `/ubuntu/camera/depth` | `Image`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE` |
@@ -183,7 +183,7 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 
 ## Canvas 连线
 
-1. Driver `navigation_lidar_fast_livo` -> FAST-LIVO2 `lidar`；
+1. Driver `navigation_lidar` -> FAST-LIVO2 `lidar`；
 2. Driver `navigation_imu` -> FAST-LIVO2 `imu`；
 3. FAST-LIVO2 `livo_odom` -> Nav2 `livo_odom`；
 4. FAST-LIVO2 `registered_cloud` -> Nav2 `registered_cloud`；

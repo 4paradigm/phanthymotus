@@ -33,7 +33,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(set(inputs), {"lidar", "imu"})
         self.assertEqual(
-            inputs["lidar"]["topic"], "/ubuntu/navigation/lidar_fast_livo"
+            inputs["lidar"]["topic"], "/ubuntu/navigation/lidar"
         )
         self.assertEqual(inputs["lidar"]["ros_type"], "sensor_msgs/msg/PointCloud2")
         self.assertEqual(
@@ -142,6 +142,8 @@ class FastLivo2ContractTest(unittest.TestCase):
         adapter = (companion_package / "adapter_node.py").read_text(encoding="utf-8")
         self.assertIn("_MAP_NAME_RE.fullmatch(map_name)", supervisor)
         self.assertIn("self._algorithm_command(save_pcd=False)", supervisor)
+        self.assertIn('"/livox/lidar:=/ubuntu/navigation/lidar"', supervisor)
+        self.assertNotIn("lidar_fast_livo", supervisor)
         self.assertIn('self._adapter_execute("unload_map", {})', supervisor)
         self.assertIn("self._runtime_lifecycle_lock = threading.Lock()", supervisor)
         self.assertIn("self._collection_lifecycle_lock = threading.Lock()", supervisor)
