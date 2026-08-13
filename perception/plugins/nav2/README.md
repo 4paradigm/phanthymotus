@@ -127,7 +127,7 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 - global/local costmap 都是 rolling window。global costmap 使用累计、去地面、
   去天花板并投影到二维的 `/ubuntu/navigation/obstacle_map`，避免已观察障碍
   因当前视角遮挡而消失；local costmap 继续使用实时
-  `/ubuntu/navigation/cloud_registered`，高度带为 `-1.15…+0.80 m`。
+  `/ubuntu/navigation/cloud_registered`，高度带为 `-1.25…+0.30 m`。
 - Rotation Shim 在航向偏差大时先旋转；当前 DWB 仍只采样 `x/yaw`，
   proposal 出口把弧线速度离散成“只转”或“只走”，并对 X/Y/yaw
   三轴应用卡片配置的最小/最大绝对值。Y 默认上限为零。

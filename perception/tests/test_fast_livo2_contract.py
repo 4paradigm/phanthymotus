@@ -151,6 +151,8 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("finalize_collection_session(", supervisor)
         self.assertIn("self._reference_points = loaded.points", adapter)
         self.assertIn("reference = self._reference_points", adapter)
+        self.assertIn('"obstacle_min_height_m", -1.25', adapter)
+        self.assertIn('"obstacle_max_height_m", 0.30', adapter)
 
         frame_adapter = (companion_package / "frame_adapter_core.py").read_text(
             encoding="utf-8"

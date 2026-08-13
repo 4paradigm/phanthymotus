@@ -128,15 +128,16 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
                 (1.04, 2.04, 0.40),
                 (2.01, 3.01, 1.70),
                 (3.01, 4.01, 0.20),
+                (4.01, 5.01, -1.20),
             ]
         )
 
-        projected = voxel_map.project_xy(min_z=-1.15, max_z=0.80)
+        projected = voxel_map.project_xy(min_z=-1.25, max_z=0.30)
 
-        self.assertEqual(len(projected), 2)
+        self.assertEqual(len(projected), 3)
         self.assertEqual(
             [(round(x, 2), round(y, 2), z) for x, y, z in projected],
-            [(1.05, 2.05, 0.0), (3.05, 4.05, 0.0)],
+            [(1.05, 2.05, 0.0), (3.05, 4.05, 0.0), (4.05, 5.05, 0.0)],
         )
         with self.assertRaises(ValueError):
             voxel_map.project_xy(min_z=1.0, max_z=1.0)

@@ -335,8 +335,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(params.count("topic: /ubuntu/navigation/cloud_registered"), 1)
         self.assertEqual(params.count("topic: /ubuntu/navigation/obstacle_map"), 1)
         self.assertEqual(params.count("data_type: PointCloud2"), 2)
-        self.assertIn("min_obstacle_height: -1.15", params)
-        self.assertIn("max_obstacle_height: 0.80", params)
+        self.assertIn("min_obstacle_height: -1.25", params)
+        self.assertIn("max_obstacle_height: 0.30", params)
         self.assertIn("global_frame: map", params)
         self.assertIn("rolling_window: true", params)
 

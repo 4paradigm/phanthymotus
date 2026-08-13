@@ -69,7 +69,7 @@ frame 不符时 companion 不发布伪造的 canonical odom/cloud。
 `/opt/phanthy-motus/data/fast_livo2/maps`。
 
 Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter 按当前
-上海 G1 室内点云分布保留相对雷达原点 `z=-1.15…+0.80 m` 的高度带，排除
+上海 G1 室内点云分布保留相对雷达原点 `z=-1.25…+0.30 m` 的高度带，排除
 约 `z=-1.3 m` 的地板和约 `z=+1.7 m` 的天花板，再按 XY 体素去重投影到
 `z=0`。由于 MID360 位于机器人上部，这个范围向下覆盖更多、向上覆盖更少，
 用于保留桌腿、椅子、箱体、人体和墙面等二维碰撞障碍。
