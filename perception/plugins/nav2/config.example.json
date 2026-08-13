@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "namespace": "ubuntu",
+  "backend": "ros_topic",
+  "shadow_only": true,
+  "request_timeout_sec": 30.0,
+  "discovery_timeout_sec": 5.0,
+  "input_max_age_ms": 500,
+  "min_x_mps": 0.3,
+  "max_x_mps": 1.0,
+  "min_y_mps": 0.0,
+  "max_y_mps": 0.0,
+  "min_yaw_rps": 1.0,
+  "max_yaw_rps": 2.0,
+  "proposal_ttl_ms": 250
+}

@@ -22,6 +22,8 @@ cb 签名: async def cb(data: bytes, fmt: str) -> None
 """
 
 import asyncio
+import json
+import math
 import sys
 import threading
 
@@ -124,8 +126,7 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
 
     def _on_msg(msg):
         try:
-            raw = msg.data
-            data = raw if isinstance(raw, bytes) else (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw))
+            data = _encode_message(msg, fmt)
             msg_fmt = getattr(msg, 'format', fmt)
         except Exception as e:
             print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
@@ -188,6 +189,109 @@ def publish(topic: str, data: str) -> None:
     _publishers[topic].publish(msg)
 
 
+def _stamp_ns(header) -> int:
+    stamp = header.stamp
+    return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
+def _yaw_from_quaternion(orientation) -> float:
+    sin_yaw = 2.0 * (
+        float(orientation.w) * float(orientation.z)
+        + float(orientation.x) * float(orientation.y)
+    )
+    cos_yaw = 1.0 - 2.0 * (
+        float(orientation.y) ** 2 + float(orientation.z) ** 2
+    )
+    return math.atan2(sin_yaw, cos_yaw)
+
+
+def _odometry_payload(msg) -> dict:
+    pose = msg.pose.pose
+    twist = msg.twist.twist
+    return {
+        'schema': 'phanthy.sensor.odometry.v1',
+        'frame_id': str(msg.header.frame_id),
+        'child_frame_id': str(msg.child_frame_id),
+        'stamp_ns': _stamp_ns(msg.header),
+        'position': {
+            'x': float(pose.position.x),
+            'y': float(pose.position.y),
+            'z': float(pose.position.z),
+        },
+        'yaw': _yaw_from_quaternion(pose.orientation),
+        'linear_velocity': {
+            'x': float(twist.linear.x),
+            'y': float(twist.linear.y),
+            'z': float(twist.linear.z),
+        },
+        'angular_velocity': {
+            'x': float(twist.angular.x),
+            'y': float(twist.angular.y),
+            'z': float(twist.angular.z),
+        },
+    }
+
+
+def _path_payload(msg) -> dict:
+    poses = []
+    for stamped_pose in msg.poses:
+        pose = stamped_pose.pose
+        poses.append({
+            'x': float(pose.position.x),
+            'y': float(pose.position.y),
+            'z': float(pose.position.z),
+            'yaw': _yaw_from_quaternion(pose.orientation),
+        })
+    return {
+        'schema': 'phanthy.navigation.path.v1',
+        'frame_id': str(msg.header.frame_id),
+        'stamp_ns': _stamp_ns(msg.header),
+        'poses': poses,
+    }
+
+
+def _occupancy_grid_payload(msg) -> dict:
+    info = msg.info
+    origin = info.origin
+    return {
+        'schema': 'phanthy.navigation.costmap.v1',
+        'frame_id': str(msg.header.frame_id),
+        'stamp_ns': _stamp_ns(msg.header),
+        'resolution': float(info.resolution),
+        'width': int(info.width),
+        'height': int(info.height),
+        'origin': {
+            'x': float(origin.position.x),
+            'y': float(origin.position.y),
+            'yaw': _yaw_from_quaternion(origin.orientation),
+        },
+        'data': [int(value) for value in msg.data],
+    }
+
+
+def _encode_message(msg, fmt: str) -> bytes:
+    """Convert supported ROS messages to the dashboard wire representation."""
+    if fmt == 'sensor/odometry':
+        return json.dumps(
+            _odometry_payload(msg), separators=(',', ':'), allow_nan=False
+        ).encode('utf-8')
+    if fmt == 'sensor/path':
+        return json.dumps(
+            _path_payload(msg), separators=(',', ':'), allow_nan=False
+        ).encode('utf-8')
+    if fmt == 'sensor/costmap':
+        return json.dumps(
+            _occupancy_grid_payload(msg), separators=(',', ':'), allow_nan=False
+        ).encode('utf-8')
+
+    raw = msg.data
+    if isinstance(raw, bytes):
+        return raw
+    if isinstance(raw, str):
+        return raw.encode('utf-8')
+    return bytes(raw)
+
+
 def _resolve_msg_type(fmt: str):
     """根据 data format 返回对应的 ROS2 消息类型，未知返回 None。"""
     if fmt.startswith('audio/'):
@@ -202,6 +306,27 @@ def _resolve_msg_type(fmt: str):
         try:
             from std_msgs.msg import UInt8MultiArray
             return UInt8MultiArray
+        except ImportError:
+            pass
+        return None
+    if fmt == 'sensor/odometry':
+        try:
+            from nav_msgs.msg import Odometry
+            return Odometry
+        except ImportError:
+            pass
+        return None
+    if fmt == 'sensor/path':
+        try:
+            from nav_msgs.msg import Path
+            return Path
+        except ImportError:
+            pass
+        return None
+    if fmt == 'sensor/costmap':
+        try:
+            from nav_msgs.msg import OccupancyGrid
+            return OccupancyGrid
         except ImportError:
             pass
         return None

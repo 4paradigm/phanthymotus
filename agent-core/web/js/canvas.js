@@ -1004,7 +1004,16 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         e.stopPropagation();
         const liveMcp = _allMcps.find(m => m.id === mcpId);
         const topics = topicOut.length ? topicOut : (liveMcp?.topic_out || []);
-        if (topics.length) showTopicDetail(topics[0].topic, topics[0].format || '');
+        const declaredPreview = toolTopicOut.find(t => t.default_preview === true);
+        const previewTopic = declaredPreview
+          ? topics.find(t =>
+              (declaredPreview.port && t.port === declaredPreview.port)
+              || t.topic === declaredPreview.topic
+            ) || declaredPreview
+          : topics[0];
+        if (previewTopic?.topic) {
+          showTopicDetail(previewTopic.topic, previewTopic.format || '');
+        }
       });
     }
 

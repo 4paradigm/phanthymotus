@@ -94,7 +94,11 @@ async def _ping_mcp_http(url: str) -> dict:
             async with session.post(url, json=tools_payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)
                 tools = [
-                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'multiInstance', 'inputSchema', 'configSchema', 'topic_out', 'topic_in')}
+                    {k: v for k, v in t.items() if k in (
+                        'name', 'description', 'type', 'multiInstance',
+                        'inputSchema', 'configSchema', 'topic_out', 'topic_in',
+                        'x-topic-actions', 'x-execution-control',
+                    )}
                     for t in data.get('result', {}).get('tools', [])
                 ]
         except Exception as e:
@@ -563,6 +567,7 @@ async def _do_ping(mcp_id: str) -> dict:
         'tool_meta':   tool_meta_map,
         'split_map':   split_map,
         'tool_groups': tool_groups,
+        'tool_definitions': caps['tools'],
     }
 
     # Register system hooks from x-hooks declarations
