@@ -72,3 +72,24 @@ plugins:
     min_yaw_rps: 1.0
     max_yaw_rps: 2.0
     proposal_ttl_ms: 250
+
+  vln:
+    enabled: true
+    namespace: ""
+    camera_topic: "/ubuntu/camera/rgb"
+    odometry_topic: "/ubuntu/navigation/odom"
+    fast_livo2_status_topic: "/ubuntu/navigation/fast_livo2/status"
+    goal_topic: "/ubuntu/navigation/goal_pose"
+    required_frame_id: "map"
+    required_child_frame_id: "base_link"
+    sensor_timeout_sec: 2.5
+    sensor_max_age_sec: 1.0
+    sensor_max_skew_sec: 0.35
+    # Use receive time unless upstream cards share a header clock domain.
+    sensor_sync_mode: "receive_time"
+    status_restart_gap_sec: 5.0
+    status_stale_after_sec: 3.5
+    subscriber_timeout_sec: 2.0
+    match_threshold: 0.55
+    navigation_speed: 0.30
+    auto_start_on_action: true
