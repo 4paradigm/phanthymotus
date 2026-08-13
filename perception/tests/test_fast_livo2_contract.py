@@ -110,6 +110,12 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("/etc/apt/sources.list.d/*.sources", dockerfile)
         self.assertIn("ports\\.ubuntu\\.com/ubuntu-ports", dockerfile)
         self.assertIn("packages\\.ros\\.org/ros2/ubuntu", dockerfile)
+        self.assertIn("/^[[:space:]]*deb-src[[:space:]]/d", dockerfile)
+        self.assertIn("^Types:[[:space:]]*deb", dockerfile)
+        self.assertIn(
+            "APT source-package entries remain after binary-only rewrite",
+            dockerfile,
+        )
         self.assertIn("APT_UBUNTU_MIRROR:", compose)
         self.assertIn("APT_ROS_MIRROR:", compose)
         self.assertIn("GPL-2.0-only AND GPL-3.0-only", dockerfile)

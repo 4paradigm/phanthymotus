@@ -13,13 +13,22 @@ RUN set -eu; \
       sed -E -i \
         "s|https?://ports\\.ubuntu\\.com/ubuntu-ports|https://${APT_UBUNTU_MIRROR}/ubuntu-ports|g; \
          s|https?://mirrors\\.tencentyun\\.com/ubuntu-ports|https://${APT_UBUNTU_MIRROR}/ubuntu-ports|g; \
-         s|https?://packages\\.ros\\.org/ros2/ubuntu|https://${APT_ROS_MIRROR}|g" \
+         s|https?://packages\\.ros\\.org/ros2/ubuntu|https://${APT_ROS_MIRROR}|g; \
+         /^[[:space:]]*deb-src[[:space:]]/d; \
+         s|^Types:[[:space:]]*deb[[:space:]]+deb-src[[:space:]]*$|Types: deb|; \
+         s|^Types:[[:space:]]*deb-src([[:space:]]+deb)?[[:space:]]*$|Types: deb|" \
         "${source}"; \
     done; \
     if grep -R -E \
       'https?://(ports\.ubuntu\.com/ubuntu-ports|packages\.ros\.org/ros2/ubuntu)' \
       /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then \
       echo 'official Ubuntu or ROS APT source remains after mirror rewrite' >&2; \
+      exit 1; \
+    fi; \
+    if grep -R -E \
+      '^[[:space:]]*deb-src[[:space:]]|^Types:.*deb-src' \
+      /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then \
+      echo 'APT source-package entries remain after binary-only rewrite' >&2; \
       exit 1; \
     fi; \
     apt-get update && \

@@ -203,7 +203,9 @@ companion 从已验证的本地
 这个 tag 的 arm64 架构、上游 revision 和两个补丁 SHA256 与
 `source-lock.env` 完全一致，再调用 Compose；同名镜像内容变化会直接失败：
 依赖安装默认将 Ubuntu ports 和 ROS 2 APT 源都切换为清华 TUNA，
-同时兼容基础镜像中 `.list` 与 `.sources` 两种源文件格式。
+同时兼容基础镜像中 `.list` 与 `.sources` 两种源文件格式。TUNA ROS 2
+镜像只使用二进制包索引；构建会移除 `deb-src`，避免请求镜像站未提供的
+`source/Sources` 索引。
 
 ```bash
 cd perception/plugins/fast_livo2/companion
