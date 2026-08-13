@@ -29,9 +29,7 @@ class FastLivo2ContractTest(unittest.TestCase):
 
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(set(inputs), {"lidar", "imu"})
-        self.assertEqual(
-            inputs["lidar"]["topic"], "/ubuntu/navigation/lidar_fast_livo"
-        )
+        self.assertEqual(inputs["lidar"]["topic"], "/ubuntu/navigation/lidar")
         self.assertEqual(inputs["lidar"]["ros_type"], "sensor_msgs/msg/PointCloud2")
         self.assertEqual(
             inputs["lidar"]["qos"], "RELIABLE + KEEP_LAST(depth=2) + VOLATILE"

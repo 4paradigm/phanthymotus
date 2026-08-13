@@ -9,8 +9,8 @@ Perception Bundle；Driver 只提供已冻结的标准传感器输入。
 
 ```text
 Driver navigation_sensors
-  /ubuntu/navigation/lidar_fast_livo  PointCloud2, 10 Hz
-  /ubuntu/navigation/imu              Imu, 200 Hz
+  /ubuntu/navigation/lidar  PointCloud2, 10 Hz
+  /ubuntu/navigation/imu    Imu, 200 Hz
                     |
                     v
             FAST-LIVO2 card
@@ -38,7 +38,7 @@ Driver navigation_sensors
 
 | port | topic | type / QoS | 约束 |
 | --- | --- | --- | --- |
-| `lidar` | `/ubuntu/navigation/lidar_fast_livo` | `sensor_msgs/msg/PointCloud2`; `RELIABLE + KEEP_LAST(2)` | MID360 `livox_frame`，ROS system time，逐点 offset 保留 |
+| `lidar` | `/ubuntu/navigation/lidar` | `sensor_msgs/msg/PointCloud2`; `RELIABLE + KEEP_LAST(2)` | MID360 `livox_frame`，ROS system time，逐点 offset 保留 |
 | `imu` | `/ubuntu/navigation/imu` | `sensor_msgs/msg/Imu`; `RELIABLE + KEEP_LAST(200)` | 与点云相同时钟域和安装旋转，约 200 Hz |
 
 这两路输入来自既有 Driver `navigation_sensors` sensor cards。缺失、过期或
@@ -85,7 +85,7 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 
 ## Canvas 连线
 
-1. Driver `navigation_lidar_fast_livo` -> FAST-LIVO2 `lidar`；
+1. Driver `navigation_lidar` -> FAST-LIVO2 `lidar`；
 2. Driver `navigation_imu` -> FAST-LIVO2 `imu`；
 3. FAST-LIVO2 `livo_odom` -> Nav2 `livo_odom`；
 4. FAST-LIVO2 `registered_cloud` -> Nav2 `registered_cloud`；
