@@ -111,6 +111,8 @@ SLAM Toolbox、AMCL 或 Map Server。
 - `speed` 范围 `0.30–1.00 m/s`，Rotation Shim 先对齐航向；
 - 卡片可配置 X/Y/yaw 三轴非零速度的最小/最大绝对值，默认
   `X=0.30–1.00 m/s`、`Y=0–0 m/s`、`yaw=1.00–2.00 rad/s`；
+- 终点附近使用无状态内层容差整形：位置到达后停止平移，位置和朝向
+  都到达后输出严格零速，避免最小速度把 Nav2 尾段修正放大成徘徊；
 - `namespace=ubuntu` 和 proposal TTL `250 ms` 仍是首版冻结合同；请求速度
   在每条 `velocity_proposal` 上强制限制正向速度，Nav2 `SpeedLimit` 只作为控制器
   advisory，不再把 DDS transport ack 误判为控制器已应用速度；

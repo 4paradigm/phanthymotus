@@ -19,6 +19,8 @@ VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
 MIN_EFFECTIVE_LINEAR_MPS = 0.30
 MIN_EFFECTIVE_YAW_RADPS = 1.00
 TURN_ONLY_YAW_THRESHOLD_RADPS = 0.20
+TERMINAL_XY_TOLERANCE_M = 0.18
+TERMINAL_YAW_TOLERANCE_RAD = 0.45
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MOTION_STATUSES = {"planning", "navigating", "replanning", "running", "active"}
@@ -60,6 +62,67 @@ class Velocity:
 
     def as_dict(self) -> dict:
         return {"x": self.x, "y": self.y, "yaw": self.yaw}
+
+
+@dataclass(frozen=True)
+class Pose2D:
+    x: float
+    y: float
+    yaw: float
+
+
+def _normalized_angle(value: float) -> float:
+    return math.atan2(math.sin(value), math.cos(value))
+
+
+def shape_terminal_approach(
+    velocity: Velocity,
+    *,
+    current_pose: Pose2D,
+    target_pose: Pose2D,
+    xy_tolerance_m: float = TERMINAL_XY_TOLERANCE_M,
+    yaw_tolerance_rad: float = TERMINAL_YAW_TOLERANCE_RAD,
+) -> tuple[Velocity, str]:
+    """Prevent configured motion floors from amplifying terminal corrections.
+
+    This function is deliberately stateless: every proposal is evaluated from
+    the current pose and target, so reaching one goal cannot lock a subsequent
+    navigation.  Once position is within the inner tolerance, translation is
+    suppressed while Nav2 finishes the requested heading.  Once both errors
+    are within tolerance, the proposal is forced to exact zero and Nav2 remains
+    responsible for reporting the action result.
+    """
+
+    values = (
+        current_pose.x,
+        current_pose.y,
+        current_pose.yaw,
+        target_pose.x,
+        target_pose.y,
+        target_pose.yaw,
+        xy_tolerance_m,
+        yaw_tolerance_rad,
+    )
+    if any(not math.isfinite(float(value)) for value in values):
+        raise ProtocolError(
+            "non_finite_pose", "terminal pose and tolerances must be finite"
+        )
+    if xy_tolerance_m <= 0.0 or yaw_tolerance_rad <= 0.0:
+        raise ProtocolError(
+            "invalid_goal_tolerance", "terminal tolerances must be positive"
+        )
+
+    xy_error = math.hypot(
+        target_pose.x - current_pose.x,
+        target_pose.y - current_pose.y,
+    )
+    if xy_error > xy_tolerance_m:
+        return velocity, "approach"
+
+    yaw_error = abs(_normalized_angle(target_pose.yaw - current_pose.yaw))
+    if yaw_error > yaw_tolerance_rad:
+        return Velocity(yaw=velocity.yaw), "rotate"
+    return Velocity.zero(), "reached"
 
 
 @dataclass(frozen=True)
@@ -417,6 +480,9 @@ __all__ = [
     "MIN_EFFECTIVE_LINEAR_MPS",
     "MIN_EFFECTIVE_YAW_RADPS",
     "MotionLimits",
+    "Pose2D",
+    "TERMINAL_XY_TOLERANCE_M",
+    "TERMINAL_YAW_TOLERANCE_RAD",
     "TURN_ONLY_YAW_THRESHOLD_RADPS",
     "ProtocolError",
     "SCHEMA_VERSION",
@@ -429,4 +495,5 @@ __all__ = [
     "apply_g1_motion_limits",
     "build_velocity_proposal",
     "limit_forward_velocity",
+    "shape_terminal_approach",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 import xml.etree.ElementTree as ET
@@ -17,6 +18,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 from g1_nav2.execution_protocol import (  # noqa: E402
     MotionLimits,
+    Pose2D,
     ProtocolError,
     Velocity,
     VelocityProposal,
@@ -24,6 +26,7 @@ from g1_nav2.execution_protocol import (  # noqa: E402
     apply_g1_motion_limits,
     build_velocity_proposal,
     limit_forward_velocity,
+    shape_terminal_approach,
 )
 from g1_nav2.readiness import (  # noqa: E402
     evaluate_readiness,
@@ -90,6 +93,38 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=-2.0)),
             Velocity(x=0.0, y=0.0, yaw=-2.0),
         )
+
+    def test_terminal_approach_suppresses_floor_amplification_without_a_lock(self) -> None:
+        target = Pose2D(x=1.0, y=2.0, yaw=-math.pi + 0.05)
+        raw = Velocity(x=0.04, y=0.0, yaw=0.08)
+
+        approaching, phase = shape_terminal_approach(
+            raw,
+            current_pose=Pose2D(x=0.70, y=2.0, yaw=0.0),
+            target_pose=target,
+        )
+        self.assertEqual((approaching, phase), (raw, "approach"))
+
+        rotating, phase = shape_terminal_approach(
+            raw,
+            current_pose=Pose2D(x=0.90, y=2.0, yaw=0.0),
+            target_pose=target,
+        )
+        self.assertEqual((rotating, phase), (Velocity(yaw=0.08), "rotate"))
+
+        reached, phase = shape_terminal_approach(
+            raw,
+            current_pose=Pose2D(x=0.90, y=2.0, yaw=math.pi - 0.05),
+            target_pose=target,
+        )
+        self.assertEqual((reached, phase), (Velocity.zero(), "reached"))
+
+        next_goal, phase = shape_terminal_approach(
+            raw,
+            current_pose=Pose2D(x=0.90, y=2.0, yaw=math.pi - 0.05),
+            target_pose=Pose2D(x=2.0, y=2.0, yaw=0.0),
+        )
+        self.assertEqual((next_goal, phase), (raw, "approach"))
 
     def test_card_motion_limits_apply_axis_floors_caps_and_disable_lateral(self) -> None:
         limits = MotionLimits(
@@ -312,6 +347,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         command = (
             PACKAGE_ROOT / "g1_nav2" / "planner_command_node.py"
         ).read_text(encoding="utf-8")
+        launch = (PACKAGE_ROOT / "launch" / "g1_nav2.launch.py").read_text(
+            encoding="utf-8"
+        )
         tree = ET.parse(
             PACKAGE_ROOT
             / "behavior_trees"
@@ -324,6 +362,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
         self.assertIn("MotionLimits.from_payload", command)
         self.assertIn("apply_g1_motion_limits", command)
+        self.assertIn("shape_terminal_approach", command)
+        self.assertIn('"terminal_xy_tolerance_m": 0.18', launch)
+        self.assertIn('"terminal_yaw_tolerance_rad": 0.45', launch)
         self.assertIn('payload.get("velocity_limits")', command)
         self.assertIn("goal.pose.header.frame_id = self._global_frame", command)
 

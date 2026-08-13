@@ -34,10 +34,12 @@ from tf2_ros import Buffer, TransformListener
 
 from .execution_protocol import (
     MotionLimits,
+    Pose2D,
     ProtocolError,
     Velocity,
     apply_g1_motion_limits,
     build_velocity_proposal,
+    shape_terminal_approach,
 )
 from .readiness import evaluate_readiness, navigation_motion_blocker
 
@@ -96,6 +98,8 @@ class PlannerCommandNode(Node):
             "obstacle_cloud_topic", "/ubuntu/navigation/cloud_registered"
         )
         self.declare_parameter("sensor_max_age_sec", 0.5)
+        self.declare_parameter("terminal_xy_tolerance_m", 0.18)
+        self.declare_parameter("terminal_yaw_tolerance_rad", 0.45)
         self.declare_parameter(
             "required_lifecycle_nodes",
             [
@@ -140,6 +144,12 @@ class PlannerCommandNode(Node):
         self._sensor_max_age_sec = float(
             self.get_parameter("sensor_max_age_sec").value
         )
+        self._terminal_xy_tolerance_m = float(
+            self.get_parameter("terminal_xy_tolerance_m").value
+        )
+        self._terminal_yaw_tolerance_rad = float(
+            self.get_parameter("terminal_yaw_tolerance_rad").value
+        )
         self._required_lifecycle_nodes = [
             str(item).strip("/")
             for item in self.get_parameter("required_lifecycle_nodes").value
@@ -161,6 +171,10 @@ class PlannerCommandNode(Node):
             raise ValueError("global_frame and base_frame must not be empty")
         if self._sensor_max_age_sec <= 0:
             raise ValueError("sensor_max_age_sec must be positive")
+        if self._terminal_xy_tolerance_m <= 0:
+            raise ValueError("terminal_xy_tolerance_m must be positive")
+        if self._terminal_yaw_tolerance_rad <= 0:
+            raise ValueError("terminal_yaw_tolerance_rad must be positive")
         if not self._required_lifecycle_nodes or any(
             not item for item in self._required_lifecycle_nodes
         ):
@@ -250,6 +264,7 @@ class PlannerCommandNode(Node):
         self._last_odom_source_age_sec: float | None = None
         self._last_odom_source_stamp_ns: int | None = None
         self._last_odom_frame_ready = False
+        self._last_odom_pose: Pose2D | None = None
         self._last_obstacle_monotonic: float | None = None
         self._last_obstacle_source_age_sec: float | None = None
         self._last_obstacle_source_stamp_ns: int | None = None
@@ -266,6 +281,14 @@ class PlannerCommandNode(Node):
 
     def _on_odom(self, message: Odometry) -> None:
         stamp_ns = _stamp_ns(message)
+        position = message.pose.pose.position
+        orientation = message.pose.pose.orientation
+        yaw = math.atan2(
+            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1.0
+            - 2.0
+            * (orientation.y * orientation.y + orientation.z * orientation.z),
+        )
         with self._lock:
             self._last_odom_monotonic = time.monotonic()
             self._last_odom_source_age_sec = self._source_age(stamp_ns)
@@ -273,6 +296,11 @@ class PlannerCommandNode(Node):
             self._last_odom_frame_ready = (
                 message.header.frame_id.strip("/") == self._global_frame.strip("/")
                 and message.child_frame_id.strip("/") == self._base_frame.strip("/")
+            )
+            self._last_odom_pose = Pose2D(
+                x=float(position.x),
+                y=float(position.y),
+                yaw=float(yaw),
             )
 
     def _on_obstacle_cloud(self, message: PointCloud2) -> None:
@@ -357,6 +385,8 @@ class PlannerCommandNode(Node):
             status = self._active.get("status", "error")
             forward_speed_limit = self._active.get("effective_speed_limit")
             motion_limits = self._active.get("motion_limits")
+            target = self._active.get("target_pose")
+            current_pose = self._last_odom_pose
         if not isinstance(nav_id, str) or not nav_id:
             return
         if not isinstance(motion_limits, MotionLimits):
@@ -376,6 +406,21 @@ class PlannerCommandNode(Node):
             if reason is not None:
                 velocity = Velocity.zero()
         try:
+            if reason is None:
+                if isinstance(current_pose, Pose2D) and isinstance(target, dict):
+                    velocity, terminal_phase = shape_terminal_approach(
+                        velocity,
+                        current_pose=current_pose,
+                        target_pose=Pose2D(
+                            x=float(target["x"]),
+                            y=float(target["y"]),
+                            yaw=float(target["yaw"]),
+                        ),
+                        xy_tolerance_m=self._terminal_xy_tolerance_m,
+                        yaw_tolerance_rad=self._terminal_yaw_tolerance_rad,
+                    )
+                    if terminal_phase == "reached":
+                        reason = "goal_tolerance_reached"
             if reason is None:
                 velocity = apply_g1_motion_limits(
                     velocity,

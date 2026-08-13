@@ -117,6 +117,8 @@ def generate_launch_description() -> LaunchDescription:
                         "odom_topic": odom_topic,
                         "obstacle_cloud_topic": obstacle_cloud_topic,
                         "sensor_max_age_sec": 0.5,
+                        "terminal_xy_tolerance_m": 0.18,
+                        "terminal_yaw_tolerance_rad": 0.45,
                     }
                 ],
             ),
