@@ -106,8 +106,8 @@ def _layout() -> dict:
         "cards": [
             {
                 "id": "goal-source",
-                "mcpId": "vln",
-                "toolName": "vln",
+                "mcpId": "goal-source",
+                "toolName": "goal-source",
                 "topicOut": [
                     {
                         "port": "goal_pose",

@@ -46,14 +46,6 @@ plugins:
     classes: []         # empty = default broad set
     fps: 5
 
-  semantic_navigation:
-    enabled: true
-    namespace: "ubuntu"
-
-  vln:
-    enabled: true
-    namespace: ""
-
   fast_livo2:
     enabled: true
     namespace: ubuntu
