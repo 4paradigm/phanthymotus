@@ -1,7 +1,28 @@
 ARG FAST_LIVO2_BASE_IMAGE=phanthy-fast-livo2:g1-1fcd0d0-n3save1
 FROM ${FAST_LIVO2_BASE_IMAGE}
 
-RUN apt-get update && \
+ARG APT_UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG APT_ROS_MIRROR=mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
+
+RUN set -eu; \
+    for source in \
+      /etc/apt/sources.list \
+      /etc/apt/sources.list.d/*.list \
+      /etc/apt/sources.list.d/*.sources; do \
+      [ -f "${source}" ] || continue; \
+      sed -E -i \
+        "s|https?://ports\\.ubuntu\\.com/ubuntu-ports|https://${APT_UBUNTU_MIRROR}/ubuntu-ports|g; \
+         s|https?://mirrors\\.tencentyun\\.com/ubuntu-ports|https://${APT_UBUNTU_MIRROR}/ubuntu-ports|g; \
+         s|https?://packages\\.ros\\.org/ros2/ubuntu|https://${APT_ROS_MIRROR}|g" \
+        "${source}"; \
+    done; \
+    if grep -R -E \
+      'https?://(ports\.ubuntu\.com/ubuntu-ports|packages\.ros\.org/ros2/ubuntu)' \
+      /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then \
+      echo 'official Ubuntu or ROS APT source remains after mirror rewrite' >&2; \
+      exit 1; \
+    fi; \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
       ros-humble-ros2bag \
       ros-humble-rosbag2-storage-mcap && \

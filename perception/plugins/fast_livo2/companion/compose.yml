@@ -6,6 +6,8 @@ services:
       dockerfile: Dockerfile
       args:
         FAST_LIVO2_BASE_IMAGE: ${FAST_LIVO2_BASE_IMAGE:?locked FAST-LIVO2 base image required}
+        APT_UBUNTU_MIRROR: ${APT_UBUNTU_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
+        APT_ROS_MIRROR: ${APT_ROS_MIRROR:-mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu}
     container_name: embodied-perception-fast-livo2
     network_mode: host
     ipc: host

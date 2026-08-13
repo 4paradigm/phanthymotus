@@ -78,6 +78,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         companion = PERCEPTION_ROOT / "plugins" / "fast_livo2" / "companion"
         source_lock = (companion / "source-lock.env").read_text(encoding="utf-8")
         dockerfile = (companion / "Dockerfile").read_text(encoding="utf-8")
+        compose = (companion / "compose.yml").read_text(encoding="utf-8")
         build_script = (companion / "build-companion.sh").read_text(
             encoding="utf-8"
         )
@@ -98,6 +99,19 @@ class FastLivo2ContractTest(unittest.TestCase):
             "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=b3afa3e64b5743898c829fe34891f828027eb372324d05a8c94357f9cacd6ec4",
             source_lock,
         )
+        self.assertIn(
+            "APT_UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn", source_lock
+        )
+        self.assertIn(
+            "APT_ROS_MIRROR=mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu",
+            source_lock,
+        )
+        self.assertIn("/etc/apt/sources.list.d/*.list", dockerfile)
+        self.assertIn("/etc/apt/sources.list.d/*.sources", dockerfile)
+        self.assertIn("ports\\.ubuntu\\.com/ubuntu-ports", dockerfile)
+        self.assertIn("packages\\.ros\\.org/ros2/ubuntu", dockerfile)
+        self.assertIn("APT_UBUNTU_MIRROR:", compose)
+        self.assertIn("APT_ROS_MIRROR:", compose)
         self.assertIn("GPL-2.0-only AND GPL-3.0-only", dockerfile)
         self.assertIn("org.opencontainers.image.revision", build_script)
         self.assertIn("org.opencontainers.image.fast-livo2-runtime-patch", build_script)
@@ -169,6 +183,9 @@ class FastLivo2ContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("./deploy/build_perception.sh", deploy_script)
+        self.assertIn('JP_VERSION="${JP_VERSION:-5.11}"', deploy_script)
+        self.assertIn('-jetson-jp${JP_VERSION}', deploy_script)
+        self.assertIn('--jp-version "${JP_VERSION}"', deploy_script)
         self.assertIn("build-companion.sh", deploy_script)
         self.assertIn(
             "docker compose --env-file source-lock.env build nav2",

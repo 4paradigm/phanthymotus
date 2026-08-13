@@ -202,6 +202,8 @@ companion 从已验证的本地
 `phanthy-fast-livo2:g1-1fcd0d0-n3save1` 镜像派生。统一构建脚本会先检查
 这个 tag 的 arm64 架构、上游 revision 和两个补丁 SHA256 与
 `source-lock.env` 完全一致，再调用 Compose；同名镜像内容变化会直接失败：
+依赖安装默认将 Ubuntu ports 和 ROS 2 APT 源都切换为清华 TUNA，
+同时兼容基础镜像中 `.list` 与 `.sources` 两种源文件格式。
 
 ```bash
 cd perception/plugins/fast_livo2/companion
@@ -223,7 +225,8 @@ bash perception/plugins/nav2/deploy/scripts/build-and-start-g1.sh
 脚本只负责准备地图目录、构建三个 arm64 镜像并调用现有测试容器
 `preflight/start`。它不会执行 Git 同步、清理旧容器、启动 Canvas、
 `start_mapping` 或导航。运行前停止 Canvas；Core 启用认证时提供真实
-`CORE_ACCESS_TOKEN`。
+`CORE_ACCESS_TOKEN`。Perception 镜像标签与构建器使用同一
+`JP_VERSION`（默认 `5.11`），避免构建成功后 preflight 查找旧标签。
 
 该临时脚本当前只挂载 maps 目录，没有创建或挂载 recordings 目录，
 因此不能用于验收 `collection_enabled=true`。自动采集只能通过已挂载
