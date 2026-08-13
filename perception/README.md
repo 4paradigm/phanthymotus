@@ -1,6 +1,9 @@
 # Perception Stack
 
-Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
+Modular perception plugins running as an MCP HTTP server. They connect to Agent
+Core through MCP tool calls and exchange data over ROS2 DDS topics. The
+[Vision-and-Language Navigation (vln) card](plugins/vln/README.md) captures visual waypoints
+and publishes matched navigation goals over ROS2.
 
 ## Audio Requirements for ASR
 

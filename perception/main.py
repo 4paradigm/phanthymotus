@@ -2,7 +2,8 @@
 """
 perception/main.py — Perception Stack bundle 统一入口。
 
-读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin（以及未来的 VLM、SLAM 等），
+读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin /
+VisionAndLanguageNavigationPlugin 等，
 聚合成一个 MCP HTTP server 对外暴露。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
@@ -32,6 +33,8 @@ import yaml
 
 import rclpy
 import rclpy.executors
+
+from utils.security import redact_sensitive
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
@@ -108,6 +111,21 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("vln", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["vln"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.vln import VisionAndLanguageNavigationPlugin
+            plugin = VisionAndLanguageNavigationPlugin(
+                plugins_cfg["vln"], namespace, executor
+            )
+            self._plugins.append(plugin)
+            log.info(
+                "VisionAndLanguageNavigationPlugin loaded (namespace=%s)",
+                namespace,
+            )
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -129,6 +147,17 @@ class PerceptionBundle:
             if getattr(p, 'PREFIX', None) == 'tts':
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
+
+    def close(self) -> None:
+        """Release nodes owned by plugins that expose an explicit close hook."""
+        for plugin in reversed(self._plugins):
+            close = getattr(plugin, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception:
+                log.exception("failed to close plugin %s", type(plugin).__name__)
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -291,13 +320,21 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        log.info(
+                            "[mcp] tools/call: %s(%s)",
+                            name,
+                            redact_sensitive(args),
+                        )
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            safe_result = redact_sensitive(result)
+                            log.info(
+                                "[mcp] tools/call result: %s",
+                                json.dumps(safe_result)[:200],
+                            )
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
@@ -477,8 +514,12 @@ def main():
     try:
         server.serve_forever()
     finally:
-        executor.shutdown()
-        rclpy.shutdown()
+        try:
+            if _bundle is not None:
+                _bundle.close()
+        finally:
+            executor.shutdown()
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
