@@ -16,6 +16,17 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
             -exec sed -E -i \
             "s#https?://packages\.ros\.org/ros2/ubuntu#${ROS_MIRROR}#g" {} +; \
     fi && \
+    find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+        -exec sed -E -i \
+        '/^[[:space:]]*deb-src[[:space:]]/d; \
+         s|^Types:[[:space:]]*deb[[:space:]]+deb-src[[:space:]]*$|Types: deb|; \
+         s|^Types:[[:space:]]*deb-src([[:space:]]+deb)?[[:space:]]*$|Types: deb|' {} + && \
+    if grep -R -E \
+        '^[[:space:]]*deb-src[[:space:]]|^Types:.*deb-src' \
+        /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then \
+        echo 'APT source-package entries remain after binary-only rewrite' >&2; \
+        exit 1; \
+    fi && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip python3-dbus ffmpeg curl ros-humble-nav-msgs && \

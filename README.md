@@ -125,7 +125,9 @@ Deploy and manage Agent Core and hardware driver containers from the dashboard.
 For a local Agent Core build, `./deploy/build_core.sh --mirror tuna` passes the
 selected Ubuntu, ROS 2, and PyPI mirrors into the Docker build. The Dockerfile
 rewrites inherited base-image APT sources before installing additional ROS 2
-packages, so a stale Tencent VPC source cannot block a TUNA build.
+packages, so a stale Tencent VPC source cannot block a TUNA build. TUNA ROS 2
+uses binary package indexes only; inherited `deb-src` entries are removed before
+`apt-get update` to avoid requesting an unavailable `source/Sources` index.
 
 ![Deploy](docs/images/deploy.png)
 
