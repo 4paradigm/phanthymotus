@@ -35,6 +35,7 @@ fast_livo2:
     - /root/.ros:rw,nosuid,nodev,noexec,size=64m
   volumes:
     - /opt/phanthy-motus/data/fast_livo2/maps:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
+    - /opt/phanthy-motus/data/fast_livo2/recordings:/opt/phanthy-motus/data/fast_livo2/recordings:rw
   group_add:
     - "1000"
   environment:

@@ -47,7 +47,14 @@ class FastLivo2ContractTest(unittest.TestCase):
         outputs = {item["port"]: item for item in tool["topic_out"]}
         self.assertEqual(
             set(outputs),
-            {"livo_odom", "registered_cloud", "obstacle_map", "map_view", "status"},
+            {
+                "livo_odom",
+                "registered_cloud",
+                "obstacle_map",
+                "map_view",
+                "status",
+                "collection_status",
+            },
         )
         self.assertEqual(outputs["livo_odom"]["frame_id"], "map -> base_link")
         self.assertEqual(outputs["registered_cloud"]["frame_id"], "map")
@@ -56,6 +63,18 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(outputs["obstacle_map"]["frame_id"], "map")
         self.assertEqual(outputs["map_view"]["schema"], "phanthy.navigation.map_view.v1")
+        self.assertEqual(
+            outputs["collection_status"]["schema"],
+            "phanthy.navigation.fast_livo2_collection_status.v1",
+        )
+        config = tool["configSchema"]["properties"]
+        self.assertFalse(config["collection_enabled"]["default"])
+        self.assertEqual(
+            config["collection_directory"]["default"],
+            "/opt/phanthy-motus/data/fast_livo2/recordings",
+        )
+        self.assertNotIn("start_recording", actions)
+        self.assertNotIn("stop_recording", actions)
 
     def test_companion_is_locked_and_navigation_compose_owns_the_service(self) -> None:
         companion = PERCEPTION_ROOT / "plugins" / "fast_livo2" / "companion"
@@ -89,6 +108,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE_ID", build_script)
         self.assertIn("fast_livo2:", service)
         self.assertIn("/opt/phanthy-motus/data/fast_livo2/maps", service)
+        self.assertIn(
+            "/opt/phanthy-motus/data/fast_livo2/recordings", service
+        )
+        self.assertIn("ros-humble-rosbag2-storage-mcap", dockerfile)
         self.assertIn('full_name == p.PREFIX', main)
         self.assertIn('qualified_prefix = f"{p.PREFIX}_"', main)
 

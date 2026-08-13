@@ -74,13 +74,13 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 
 ## Actions
 
-| action | 参数 | 语义 |
-| --- | --- | --- |
-| `start_mapping` | `map_name` | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程 |
-| `stop_mapping` | 无 | `SIGINT` 停止算法，等待尾段保存并写 session manifest |
-| `load_map` | `map_name` | 读取 `stop_mapping` 生成的 manifest 和 PCD，启动不再写 PCD 的新定位前端 |
-| `relocalize` | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配 |
-| `unload_map` | 无 | 停止定位前端并卸载旧图 |
+| action          | 参数                                                                                    | 语义                                                    |
+| --------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `start_mapping` | `map_name`                                                                            | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程                    |
+| `stop_mapping`  | 无                                                                                     | `SIGINT` 停止算法，等待尾段保存并写 session manifest               |
+| `load_map`      | `map_name`                                                                            | 读取 `stop_mapping` 生成的 manifest 和 PCD，启动不再写 PCD 的新定位前端 |
+| `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
+| `unload_map`    | 无                                                                                     | 停止定位前端并卸载旧图                                           |
 
 `map_name` 只允许 `A-Z a-z 0-9 _ . -`，最长 64 字符。停止 Canvas 时若仍在
 建图，卡片会先执行 `stop_mapping` 再释放 ROS backend。
@@ -102,6 +102,49 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 初值的有界匹配，不是无初值的全局搜索，也不在定位成功后持续做全局
 闭环校正。匹配分数不足、点数不足、数据过期、manifest/PCD 损坏时全部
 fail closed。
+
+## 自动数据采集
+
+数据采集属于同一张 `fast_livo2` 卡片，不增加单独卡片，也不增加
+`start_recording` / `stop_recording` 等公开 action。创建卡片时配置：
+
+| 配置 | 默认值 | 语义 |
+| --- | --- | --- |
+| `collection_enabled` | `false` | Canvas 启动该卡片时自动开始采集，停止卡片时自动收口 |
+| `collection_directory` | `/opt/phanthy-motus/data/fast_livo2/recordings` | companion 内持久化根目录；只能配置为该挂载目录或其子目录 |
+
+启用后，companion 使用 ROS 2 原生 rosbag2 MCAP 后端记录以下原始 topic，
+保留消息自身的 CDR payload、`header.stamp`、`frame_id` 和 encoding：
+
+| 数据 | topic | ROS type / QoS |
+| --- | --- | --- |
+| LiDAR | `/ubuntu/navigation/lidar_fast_livo` | `PointCloud2`; RELIABLE |
+| IMU | `/ubuntu/navigation/imu` | `Imu`; RELIABLE |
+| RGB | `/ubuntu/camera/rgb` | `CompressedImage`; BEST_EFFORT |
+| Depth | `/ubuntu/camera/depth` | `Image`; BEST_EFFORT |
+| CameraInfo | `/ubuntu/camera/camera_info` | `CameraInfo`; BEST_EFFORT |
+
+录制目录按 `ubuntu/YYYY-MM-DD/<session_id>` 分层。录制期间目录名带
+`.partial`；Canvas 正常停止、rosbag2 完成 flush 且 receipt 写入后才原子改为
+最终目录。异常退出会保留 `.partial`，不会冒充完整数据。
+
+卡片原有 `/ubuntu/navigation/fast_livo2/status` 的 `collection` 字段，以及
+独立的 `/ubuntu/navigation/fast_livo2/collection_status` 数据流，都会显示：
+
+- `state`: `disabled | starting | recording | degraded | error`；
+- 当前 session、落盘目录和 rosbag PID；
+- 每路 topic 的消息计数、最近接收年龄、源时间戳和 publisher 数量；
+- `missing_sources`、`stale_sources` 与 `failure_reason`；
+- 上一次停止时的 receipt 和最终目录。
+
+当前 G1 Driver 代码已经发布 RGB 与 depth，但尚未发布 ROS
+`sensor_msgs/msg/CameraInfo`。因此在 Driver 补齐该真实 producer 前，启用采集
+会继续保存其余四路数据，同时状态明确显示
+`missing_sources:camera_info`，不会生成或伪造内参。此能力只记录数据，
+不会启用 FAST-LIVO2 图像处理，也不会发送 Driver、Nav2 或机器人运动命令。
+
+本阶段不包含离线回放、派生标注、自动清理、容量配额或 Canvas 数据浏览；
+这些是后续独立子任务。
 
 ## Canvas 连线
 

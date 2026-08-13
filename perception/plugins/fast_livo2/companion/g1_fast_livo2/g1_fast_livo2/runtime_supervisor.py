@@ -10,13 +10,23 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu, PointCloud2
 from std_msgs.msg import String
+
+from .collection_core import (
+    COLLECTION_SOURCES,
+    CollectionHealth,
+    finalize_collection_session,
+    normalize_collection_directory,
+    rosbag_record_command,
+)
 
 
 _STATUS_QOS = QoSProfile(
@@ -33,6 +43,10 @@ class FastLivo2Supervisor(Node):
         super().__init__("g1_fast_livo2_supervisor")
         self.declare_parameter("command_topic", "/ubuntu/navigation/fast_livo2/command")
         self.declare_parameter("status_topic", "/ubuntu/navigation/fast_livo2/status")
+        self.declare_parameter(
+            "collection_status_topic",
+            "/ubuntu/navigation/fast_livo2/collection_status",
+        )
         self.declare_parameter("diagnostics_topic", "/ubuntu/navigation/fast_livo2/diagnostics")
         self.declare_parameter("reset_topic", "/ubuntu/navigation/fast_livo2/reset_map")
         self.declare_parameter("map_control_topic", "/ubuntu/navigation/fast_livo2/map_control")
@@ -42,6 +56,7 @@ class FastLivo2Supervisor(Node):
         self.declare_parameter("pcd_save_interval", 600)
         self.declare_parameter("stop_timeout_sec", 120.0)
         self.declare_parameter("map_control_timeout_sec", 130.0)
+        self.declare_parameter("collection_stop_timeout_sec", 30.0)
 
         self._lock = threading.RLock()
         self._process: subprocess.Popen | None = None
@@ -52,10 +67,22 @@ class FastLivo2Supervisor(Node):
         self._files_before: dict[str, tuple[int, int]] = {}
         self._diagnostics: dict = {}
         self._map_control_responses: dict[str, dict] = {}
+        self._collection_process: subprocess.Popen | None = None
+        self._collection_partial_dir: Path | None = None
+        self._collection_final_dir: Path | None = None
+        self._collection_directory: str | None = None
+        self._collection_error: str | None = None
+        self._collection_last_receipt: dict | None = None
+        self._collection_health = CollectionHealth()
         self._condition = threading.Condition(self._lock)
         self._map_root = Path(str(self.get_parameter("map_root").value))
         self._map_root.mkdir(parents=True, exist_ok=True)
         self._status_pub = self.create_publisher(String, str(self.get_parameter("status_topic").value), _STATUS_QOS)
+        self._collection_status_pub = self.create_publisher(
+            String,
+            str(self.get_parameter("collection_status_topic").value),
+            _STATUS_QOS,
+        )
         self._reset_pub = self.create_publisher(String, str(self.get_parameter("reset_topic").value), 10)
         self._map_control_pub = self.create_publisher(
             String, str(self.get_parameter("map_control_topic").value), 10
@@ -76,7 +103,57 @@ class FastLivo2Supervisor(Node):
             callback_group=callbacks,
         )
         self.create_subscription(String, str(self.get_parameter("diagnostics_topic").value), self._on_diagnostics, 10)
+        self._collection_subscriptions = self._create_collection_subscriptions()
         self.create_timer(1.0, self._publish_heartbeat)
+
+    def _create_collection_subscriptions(self) -> list:
+        reliable_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=200,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        sensor_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=4,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        message_types = {
+            "lidar": PointCloud2,
+            "imu": Imu,
+            "rgb": CompressedImage,
+            "depth": Image,
+            "camera_info": CameraInfo,
+        }
+        subscriptions = []
+        for item in COLLECTION_SOURCES:
+            port = item["port"]
+            qos = reliable_qos if port in {"lidar", "imu"} else sensor_qos
+            subscriptions.append(
+                self.create_subscription(
+                    message_types[port],
+                    item["topic"],
+                    lambda message, source_port=port: self._on_collection_sample(
+                        source_port, message
+                    ),
+                    qos,
+                )
+            )
+        return subscriptions
+
+    def _on_collection_sample(self, port: str, message) -> None:
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        source_stamp_ns = None
+        if stamp is not None:
+            candidate = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+            if candidate > 0:
+                source_stamp_ns = candidate
+        with self._lock:
+            self._collection_health.observe(
+                port,
+                source_stamp_ns=source_stamp_ns,
+            )
 
     def _on_diagnostics(self, message: String) -> None:
         try:
@@ -119,6 +196,8 @@ class FastLivo2Supervisor(Node):
                 result = self._relocalize(args)
             elif action == "unload_map":
                 result = self._unload_map()
+            elif action == "configure_collection":
+                result = self._configure_collection(args)
             else:
                 result = {"status": "error", "error_code": "unsupported_action", "error": f"unsupported action {action}"}
         except Exception as exc:
@@ -126,6 +205,200 @@ class FastLivo2Supervisor(Node):
             action = locals().get("action", "")
             result = {"status": "error", "error_code": "supervisor_error", "error": f"{type(exc).__name__}: {exc}"}
         self._publish({"event": "response", "request_id": request_id, "action": action, **result})
+
+    def _configure_collection(self, args: dict) -> dict:
+        enabled = args.get("enabled")
+        if not isinstance(enabled, bool):
+            return {
+                "status": "error",
+                "error_code": "invalid_collection_config",
+                "error": "enabled must be a boolean",
+            }
+        if not enabled:
+            return self._stop_collection()
+        if args.get("namespace") != "ubuntu":
+            return {
+                "status": "error",
+                "error_code": "invalid_collection_config",
+                "error": "first-release collection requires namespace=ubuntu",
+            }
+        try:
+            directory = normalize_collection_directory(args.get("directory"))
+        except ValueError as exc:
+            return {
+                "status": "error",
+                "error_code": "invalid_collection_config",
+                "error": str(exc),
+            }
+
+        with self._lock:
+            process = self._collection_process
+            current_directory = self._collection_directory
+        if process is not None and process.poll() is None:
+            if current_directory == directory:
+                return {
+                    "status": "recording",
+                    "already_started": True,
+                    "collection": self._collection_snapshot(),
+                }
+            stopped = self._stop_collection()
+            if stopped.get("status") == "error":
+                return stopped
+
+        root = Path(directory)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            now = time.gmtime()
+            session_id = time.strftime("%Y%m%dT%H%M%SZ", now) + "-" + uuid.uuid4().hex[:8]
+            parent = root / "ubuntu" / time.strftime("%Y-%m-%d", now)
+            parent.mkdir(parents=True, exist_ok=True)
+            partial_dir = parent / f"{session_id}.partial"
+            final_dir = parent / session_id
+            if partial_dir.exists() or final_dir.exists():
+                raise FileExistsError(f"collection session already exists: {session_id}")
+            process = subprocess.Popen(
+                rosbag_record_command(str(partial_dir)),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            time.sleep(0.25)
+            return_code = process.poll()
+            if return_code is not None:
+                raise RuntimeError(f"ros2 bag record exited with {return_code}")
+        except (OSError, RuntimeError) as exc:
+            with self._lock:
+                self._collection_error = f"{type(exc).__name__}: {exc}"
+            return {
+                "status": "error",
+                "error_code": "collection_start_failed",
+                "error": self._collection_error,
+            }
+
+        with self._lock:
+            self._collection_process = process
+            self._collection_partial_dir = partial_dir
+            self._collection_final_dir = final_dir
+            self._collection_directory = directory
+            self._collection_error = None
+            self._collection_health.start(session_id, str(final_dir))
+        return {"status": "recording", "collection": self._collection_snapshot()}
+
+    def _stop_collection(self) -> dict:
+        with self._lock:
+            process = self._collection_process
+            partial_dir = self._collection_partial_dir
+            final_dir = self._collection_final_dir
+            source_status = self._collection_health.snapshot(
+                process_running=process is not None and process.poll() is None,
+                process_return_code=None if process is None else process.poll(),
+                process_error=self._collection_error,
+            )
+            was_enabled = source_status["enabled"]
+        if process is None and not was_enabled:
+            return {
+                "status": "disabled",
+                "already_stopped": True,
+                "collection": self._collection_snapshot(),
+            }
+
+        return_code = None if process is None else process.poll()
+        stop_error = None
+        if process is not None and return_code is None:
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+                return_code = process.wait(
+                    timeout=float(
+                        self.get_parameter("collection_stop_timeout_sec").value
+                    )
+                )
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                return_code = process.wait(timeout=10)
+                stop_error = "rosbag_stop_timeout"
+            except OSError as exc:
+                stop_error = f"rosbag_stop_failed:{exc}"
+
+        storage_ok = stop_error is None and return_code == 0 and partial_dir is not None
+        receipt = {
+            "schema": "phanthy.navigation.fast_livo2_collection_receipt.v1",
+            "state": (
+                "complete"
+                if storage_ok and source_status["healthy"]
+                else "degraded" if storage_ok else "failed"
+            ),
+            "stopped_unix_ms": int(time.time() * 1000),
+            "storage_complete": storage_ok,
+            "return_code": return_code,
+            "failure_reason": (
+                stop_error
+                or source_status.get("failure_reason")
+                or (
+                    "missing_sources:" + ",".join(source_status["missing_sources"])
+                    if source_status["missing_sources"]
+                    else None
+                )
+            ),
+            "sources": source_status["sources"],
+        }
+        if partial_dir is not None and partial_dir.is_dir():
+            try:
+                receipt = finalize_collection_session(
+                    str(partial_dir),
+                    str(final_dir),
+                    receipt,
+                    storage_complete=storage_ok,
+                )
+            except OSError as exc:
+                storage_ok = False
+                stop_error = f"collection_finalize_failed:{exc}"
+                receipt.update(
+                    {
+                        "state": "failed",
+                        "storage_complete": False,
+                        "failure_reason": stop_error,
+                    }
+                )
+
+        with self._lock:
+            self._collection_process = None
+            self._collection_partial_dir = None
+            self._collection_final_dir = None
+            self._collection_directory = None
+            self._collection_error = stop_error
+            self._collection_last_receipt = dict(receipt)
+            self._collection_health.stop()
+        if not storage_ok:
+            return {
+                "status": "error",
+                "error_code": "collection_stop_failed",
+                "error": stop_error or "rosbag did not finish cleanly",
+                "receipt": receipt,
+            }
+        return {"status": "collection_saved", "receipt": receipt}
+
+    def _collection_snapshot(self) -> dict:
+        with self._lock:
+            process = self._collection_process
+            return_code = None if process is None else process.poll()
+            result = self._collection_health.snapshot(
+                process_running=process is not None and return_code is None,
+                process_return_code=return_code,
+                process_error=self._collection_error,
+            )
+            result["pid"] = (
+                process.pid if process is not None and return_code is None else None
+            )
+            result["last_receipt"] = (
+                None
+                if self._collection_last_receipt is None
+                else dict(self._collection_last_receipt)
+            )
+        for item in COLLECTION_SOURCES:
+            result["sources"][item["port"]]["publisher_count"] = (
+                self.count_publishers(item["topic"])
+            )
+        return result
 
     def _start_mapping(self, map_name: str) -> dict:
         with self._lock:
@@ -446,6 +719,7 @@ class FastLivo2Supervisor(Node):
         return str(path)
 
     def _publish_heartbeat(self) -> None:
+        collection = self._collection_snapshot()
         with self._lock:
             process = self._process
             running = process is not None and process.poll() is None
@@ -471,8 +745,16 @@ class FastLivo2Supervisor(Node):
                 "global_relocalization_supported": False,
                 "bounded_relocalization_supported": True,
                 "diagnostics": dict(self._diagnostics),
+                "collection": collection,
             }
         self._publish(payload)
+        message = String()
+        message.data = json.dumps(
+            collection,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self._collection_status_pub.publish(message)
 
     def _publish(self, payload: dict) -> None:
         message = String()
@@ -489,6 +771,7 @@ class FastLivo2Supervisor(Node):
                     self._runtime_mode = "idle"
             else:
                 self._stop_mapping()
+            self._stop_collection()
         finally:
             return super().destroy_node()
 

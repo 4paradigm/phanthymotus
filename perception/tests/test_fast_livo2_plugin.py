@@ -29,6 +29,14 @@ class ReadyBackend:
 
     def execute(self, action: str, args: dict) -> dict:
         self.calls.append((action, dict(args)))
+        if action == "configure_collection":
+            return {
+                "status": "recording" if args["enabled"] else "disabled",
+                "collection": {
+                    "enabled": args["enabled"],
+                    "state": "recording" if args["enabled"] else "disabled",
+                },
+            }
         if action == "start_mapping":
             return {"status": "mapping", "map_name": args["map_name"]}
         if action == "load_map":
@@ -39,6 +47,18 @@ class ReadyBackend:
 
     def stop(self) -> None:
         self.stop_calls += 1
+
+
+class CollectionRejectingBackend(ReadyBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "configure_collection" and args["enabled"]:
+            self.calls.append((action, dict(args)))
+            return {
+                "status": "error",
+                "error_code": "collection_start_failed",
+                "error": "recording directory is not writable",
+            }
+        return super().execute(action, args)
 
 
 def _bindings(plugin: FastLivo2Plugin) -> list[dict]:
@@ -86,6 +106,8 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(ready["state"], "ready")
         self.assertTrue(ready["canvas_wired"])
         self.assertTrue(all(item["connected"] for item in ready["topic_in"]))
+        self.assertEqual(backend.calls[0][0], "configure_collection")
+        self.assertFalse(backend.calls[0][1]["enabled"])
 
     def test_canvas_stop_finalizes_mapping_before_backend_release(self) -> None:
         backend = ReadyBackend()
@@ -101,8 +123,85 @@ class FastLivo2PluginTest(unittest.TestCase):
 
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(stopped["stop_result"]["status"], "saved")
-        self.assertEqual([call[0] for call in backend.calls], ["start_mapping", "stop_mapping"])
+        self.assertEqual(
+            [call[0] for call in backend.calls],
+            [
+                "configure_collection",
+                "start_mapping",
+                "stop_mapping",
+                "configure_collection",
+            ],
+        )
         self.assertEqual(backend.stop_calls, 1)
+
+    def test_collection_is_config_only_and_starts_with_canvas(self) -> None:
+        backend = ReadyBackend()
+        plugin = FastLivo2Plugin(
+            {
+                "collection_enabled": True,
+                "collection_directory": (
+                    "/opt/phanthy-motus/data/fast_livo2/recordings/acceptance"
+                ),
+            },
+            None,
+            backend=backend,
+        )
+
+        actions = plugin.get_tools()[0]["inputSchema"]["properties"]["action"]["enum"]
+        self.assertNotIn("start_recording", actions)
+        ready = plugin.dispatch(
+            "fast_livo2",
+            {"action": "start", "input_bindings": _bindings(plugin)},
+        )
+
+        self.assertEqual(ready["state"], "ready")
+        self.assertEqual(backend.calls[0][0], "configure_collection")
+        self.assertEqual(
+            backend.calls[0][1],
+            {
+                "enabled": True,
+                "directory": (
+                    "/opt/phanthy-motus/data/fast_livo2/recordings/acceptance"
+                ),
+                "namespace": "ubuntu",
+            },
+        )
+
+        stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertEqual(
+            stopped["collection_stop_result"]["status"], "disabled"
+        )
+        self.assertFalse(backend.calls[-1][1]["enabled"])
+
+    def test_collection_directory_is_confined_to_mounted_root(self) -> None:
+        for directory in ("relative", "/tmp/recordings", "/opt/../tmp"):
+            with self.subTest(directory=directory):
+                plugin = FastLivo2Plugin(
+                    {
+                        "collection_enabled": True,
+                        "collection_directory": directory,
+                    },
+                    None,
+                    backend=ReadyBackend(),
+                )
+                info = plugin.dispatch("fast_livo2", {"action": "info"})
+                self.assertEqual(info["error_code"], "invalid_config")
+
+    def test_collection_start_failure_prevents_canvas_ready(self) -> None:
+        backend = CollectionRejectingBackend()
+        plugin = FastLivo2Plugin(
+            {"collection_enabled": True}, None, backend=backend
+        )
+
+        result = plugin.dispatch(
+            "fast_livo2",
+            {"action": "start", "input_bindings": _bindings(plugin)},
+        )
+
+        self.assertEqual(result["error_code"], "collection_start_failed")
+        self.assertEqual(backend.stop_calls, 1)
+        info = plugin.dispatch("fast_livo2", {"action": "info"})
+        self.assertFalse(info["canvas_wired"])
 
     def test_missing_companion_and_invalid_config_fail_closed(self) -> None:
         unavailable = FastLivo2Plugin(
@@ -129,7 +228,15 @@ class FastLivo2PluginTest(unittest.TestCase):
         stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
 
         self.assertEqual(stopped["stop_result"]["status"], "unloaded")
-        self.assertEqual([call[0] for call in backend.calls], ["load_map", "unload_map"])
+        self.assertEqual(
+            [call[0] for call in backend.calls],
+            [
+                "configure_collection",
+                "load_map",
+                "unload_map",
+                "configure_collection",
+            ],
+        )
         self.assertEqual(backend.stop_calls, 1)
 
 

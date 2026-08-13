@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from pathlib import PurePosixPath
 import re
 import threading
 import time
@@ -19,6 +20,9 @@ from .core import FastLivo2Core, UnavailableFastLivo2Backend
 
 log = logging.getLogger(__name__)
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,127}$")
+_COLLECTION_ROOT = PurePosixPath(
+    "/opt/phanthy-motus/data/fast_livo2/recordings"
+)
 
 
 class ConfigError(ValueError):
@@ -61,6 +65,21 @@ def _validated_config(base: dict, updates: dict) -> dict:
         raise ConfigError("input_max_age_ms is fixed to 500")
     if result.get("map_max_points") != 80_000:
         raise ConfigError("map_max_points is fixed to 80000")
+    if not isinstance(result.get("collection_enabled"), bool):
+        raise ConfigError("collection_enabled must be a boolean")
+    raw_directory = result.get("collection_directory")
+    if not isinstance(raw_directory, str) or not raw_directory.strip():
+        raise ConfigError("collection_directory must be a non-empty absolute path")
+    directory = PurePosixPath(raw_directory.strip())
+    if not directory.is_absolute() or ".." in directory.parts:
+        raise ConfigError("collection_directory must be a safe absolute path")
+    try:
+        directory.relative_to(_COLLECTION_ROOT)
+    except ValueError as exc:
+        raise ConfigError(
+            f"collection_directory must be within {_COLLECTION_ROOT}"
+        ) from exc
+    result["collection_directory"] = str(directory)
     return result
 
 
@@ -171,6 +190,19 @@ class FastLivo2Plugin:
         if info.get("state") in {"unavailable", "error"}:
             self._release_core()
             return self._error("backend_not_ready", str(info.get("reason", info["state"])))
+        collection_result = core.configure_collection(
+            {
+                "enabled": self._cfg["collection_enabled"],
+                "directory": self._cfg["collection_directory"],
+                "namespace": self._cfg["namespace"],
+            }
+        )
+        if collection_result.get("status") == "error":
+            self._release_core()
+            return self._error(
+                str(collection_result.get("error_code", "collection_start_failed")),
+                str(collection_result.get("error", "data collection could not start")),
+            )
         with self._lock:
             self._canvas_started = True
             self._instance_id = str(args.get("instance_id") or "default").strip()
@@ -226,12 +258,22 @@ class FastLivo2Plugin:
                 stop_result = core.dispatch({"action": "stop_mapping"})
             elif info.get("loaded_map"):
                 stop_result = core.dispatch({"action": "unload_map"})
+            collection_stop_result = core.configure_collection(
+                {
+                    "enabled": False,
+                    "directory": self._cfg["collection_directory"],
+                    "namespace": self._cfg["namespace"],
+                }
+            )
+        else:
+            collection_stop_result = None
         self._release_core()
         return {
             "state": "idle",
             "status": "idle",
             "canvas_wired": False,
             "stop_result": stop_result,
+            "collection_stop_result": collection_stop_result,
             "physical_execution": False,
         }
 

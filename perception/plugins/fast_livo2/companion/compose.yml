@@ -15,6 +15,7 @@ services:
       - /root/.ros:rw,nosuid,nodev,noexec,size=64m
     volumes:
       - ${FAST_LIVO2_MAP_DIR:-./maps}:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
+      - ${FAST_LIVO2_RECORDING_DIR:-./recordings}:/opt/phanthy-motus/data/fast_livo2/recordings:rw
     group_add:
       - "${FAST_LIVO2_MAP_GID:-1000}"
     environment:

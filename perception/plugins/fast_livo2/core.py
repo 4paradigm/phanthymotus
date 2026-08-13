@@ -181,6 +181,19 @@ class FastLivo2Core:
         except Exception as exc:
             return self._error(str(action), "backend_error", f"{type(exc).__name__}: {exc}")
 
+    def configure_collection(self, config: dict) -> dict:
+        """Apply private recorder configuration without exposing a public action."""
+        try:
+            return dict(self._backend.execute("configure_collection", dict(config)))
+        except FastLivo2BackendError as exc:
+            return self._error("configure_collection", exc.code, str(exc))
+        except Exception as exc:
+            return self._error(
+                "configure_collection",
+                "backend_error",
+                f"{type(exc).__name__}: {exc}",
+            )
+
     def stop(self) -> None:
         self._backend.stop()
 

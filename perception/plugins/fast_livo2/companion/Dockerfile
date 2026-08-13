@@ -1,6 +1,12 @@
 ARG FAST_LIVO2_BASE_IMAGE=phanthy-fast-livo2:g1-1fcd0d0-n3save1
 FROM ${FAST_LIVO2_BASE_IMAGE}
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ros-humble-ros2bag \
+      ros-humble-rosbag2-storage-mcap && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /fast_livo2_card_ws
 COPY g1_fast_livo2/ /fast_livo2_card_ws/src/g1_fast_livo2/
 RUN . /opt/ros/humble/setup.sh && \
@@ -15,7 +21,7 @@ ENV FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 ENV RCUTILS_LOGGING_BUFFERED_STREAM=1
 
 LABEL org.opencontainers.image.title="Phanthy Motus FAST-LIVO2 Perception companion"
-LABEL org.opencontainers.image.description="Session mapping plus canonical map/base_link adapter"
+LABEL org.opencontainers.image.description="Session mapping, automatic MCAP capture and canonical map/base_link adapter"
 LABEL org.opencontainers.image.licenses="Apache-2.0 AND GPL-2.0-only AND GPL-3.0-only"
 LABEL org.opencontainers.image.fast-livo2-revision="1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea"
 

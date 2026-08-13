@@ -23,6 +23,8 @@ FAST_LIVO2_CONFIG_DEFAULTS = {
     "input_max_age_ms": 500,
     "map_voxel_size_m": 0.10,
     "map_max_points": 80_000,
+    "collection_enabled": False,
+    "collection_directory": "/opt/phanthy-motus/data/fast_livo2/recordings",
 }
 
 FAST_LIVO2_CONFIG_SCHEMA = {
@@ -50,6 +52,22 @@ FAST_LIVO2_CONFIG_SCHEMA = {
             "minimum": 0.05,
             "maximum": 0.50,
             "default": 0.10,
+        },
+        "collection_enabled": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Automatically record LiDAR, IMU, RGB, depth and CameraInfo "
+                "while this Canvas card is running"
+            ),
+        },
+        "collection_directory": {
+            "type": "string",
+            "default": "/opt/phanthy-motus/data/fast_livo2/recordings",
+            "description": (
+                "Persistent companion directory; it must remain under the "
+                "mounted FAST-LIVO2 recordings root"
+            ),
         },
     },
     "additionalProperties": False,
@@ -207,6 +225,19 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "schema": "phanthy.navigation.fast_livo2_status.v1",
                 "rate_hz": 1,
                 "desc": "Lifecycle, source freshness, frame validation and artifact status",
+            },
+            {
+                "port": "collection_status",
+                "topic": f"{root}/navigation/fast_livo2/collection_status",
+                "format": "data/json",
+                "ros_type": "std_msgs/msg/String",
+                "qos": "RELIABLE + KEEP_LAST(depth=10) + TRANSIENT_LOCAL",
+                "schema": "phanthy.navigation.fast_livo2_collection_status.v1",
+                "rate_hz": 1,
+                "desc": (
+                    "Automatic data collection state, per-source counts and "
+                    "explicit failure reason"
+                ),
             },
         ],
         "inputSchema": {
