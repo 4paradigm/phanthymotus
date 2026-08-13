@@ -206,11 +206,27 @@ def _env_dynamic() -> str:
     # 不再显示 active_subagents — bg subagent 结论通过 memory_recall 按需检索，
     # 用户任务 subagent 完成后会发精简通知。
 
-    return (
-        f'<status time="{now}">\n'
-        f'{tasks_section}'
-        f'</status>'
-    )
+    # 已订阅的传感器数据源（排除 ASR，它已作为触发事件直接可见）
+    import collector
+    active_sources = [s for s in collector.get_available_sources()
+                      if s.startswith('dds:') and '/asr' not in s]
+    sensors_section = ''
+    if active_sources:
+        sensor_lines = [f'  <source name="{s}" />' for s in active_sources]
+        sensors_section = (
+            '<subscribed_sensors hint="用 raw_input_info(source=...) 查询最新数据">\n'
+            + '\n'.join(sensor_lines) + '\n'
+            + '</subscribed_sensors>\n'
+        )
+
+    inner = tasks_section + sensors_section
+    if inner:
+        return (
+            f'<status time="{now}">\n'
+            f'{inner}'
+            f'</status>'
+        )
+    return f'<status time="{now}" />'
 
 
 # ── L4 ────────────────────────────────────────────────────────────────────────

@@ -2,8 +2,9 @@
 # build_perception.sh — 构建 perception-stack（感知层）镜像并推送
 #
 # Usage:
-#   ./build_perception.sh                           # CPU 版（默认），交互选源
-#   ./build_perception.sh --variant jetson          # Jetson GPU 版
+#   ./build_perception.sh                                       # CPU 版（默认），交互选源
+#   ./build_perception.sh --variant jetson                      # Jetson GPU 版, JetPack 5.11
+#   ./build_perception.sh --variant jetson --jp-version 6.1     # Jetson GPU 版，JetPack 6.1
 #   ./build_perception.sh --variant jetson --mirror tuna
 set -euo pipefail
 
@@ -21,9 +22,11 @@ eval "$(parse_mirror_arg "$@")"
 
 # ── 解析参数 ─────────────────────────────────────────────────────────
 VARIANT="cpu"
+JP_VERSION="5.11"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant) VARIANT="$2"; shift 2 ;;
+        --jp-version) JP_VERSION="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -52,10 +55,25 @@ case "${VARIANT}" in
     jetson)
         DOCKERFILE="${REPO_ROOT}/perception/Dockerfile.jetson"
         BUILD_CONTEXT="${REPO_ROOT}"
-        TAG="release.${DATE}.${COMMIT}-jetson"
+        TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
         ;;
     *)
         echo "Unknown variant: ${VARIANT}  (supported: cpu, jetson)"
+        exit 1
+        ;;
+esac
+
+BUILD_ARGS=""
+# ── 根据 jp_version 选择 base image  ────────────────────────
+case "${JP_VERSION}" in
+    5.11)
+        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=511"
+        ;;
+    6.1)
+        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=61"
+        ;;
+    *)
+        echo "Unknown JetPack version: ${JP_VERSION} (support: 5.11, 6.1)"
         exit 1
         ;;
 esac
@@ -65,6 +83,7 @@ FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/perception:${TAG}"
 echo "============================================"
 echo "Building perception-stack image"
 echo "Variant: ${VARIANT}"
+echo "PyTorch for JetPack: JP${JP_VERSION}"
 echo "Image  : ${FULL_IMAGE}"
 echo "Arch   : ${ARCH} (native=${IS_ARM64})"
 echo "Push   : ${PUSH_ENABLED}"
@@ -76,7 +95,11 @@ fi
 
 select_mirror
 
-do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}"
+# trim leading and trailing space
+BUILD_ARGS="${BUILD_ARGS#${BUILD_ARGS%%[![:space:]]*}}"
+BUILD_ARGS="${BUILD_ARGS%${BUILD_ARGS##*[![:space:]]}}"
+
+do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${BUILD_ARGS}"
 
 if ${PUSH_ENABLED}; then
     do_push "${FULL_IMAGE}"

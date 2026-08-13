@@ -1543,9 +1543,9 @@ async function _startProject() {
       const cards = p.cards || [];
       const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
       modal = _showStartupModal(items);
-      cards.forEach((c, i) => { itemIndex[c.tool] = i; });
+      cards.forEach((c, i) => { itemIndex[`${c.mcp_id}:${c.tool}`] = i; });
     } else if (event.type === 'project_start_item' && modal) {
-      const idx = itemIndex[p.tool];
+      const idx = itemIndex[`${p.mcp_id}:${p.tool}`];
       if (idx !== undefined) {
         modal.updateItem(idx, p.status, p.message || '');
       }

@@ -354,4 +354,12 @@ def _resolve_msg_type(fmt: str):
             print(f'[ros2_bridge] cannot import Image: {e}', file=sys.stderr)
             pass
         return None
+    if fmt == 'image/depth-zlib':
+        try:
+            from sensor_msgs.msg import CompressedImage
+            return CompressedImage
+        except ImportError as e:
+            print(f'[ros2_bridge] cannot import CompressedImage: {e}', file=sys.stderr)
+            pass
+        return None
     return None

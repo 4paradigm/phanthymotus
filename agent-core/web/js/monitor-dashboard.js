@@ -14,11 +14,11 @@ import { PointCloudRenderer } from './renderers/pointcloud.js';
 import { MappingRenderer }   from './renderers/mapping.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
-import { CameraRenderer, DepthRenderer } from './renderers/camera.js';
+import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { HTMSGRenderer }    from './renderers/htmsg.js';
 import { CostmapRenderer, OdometryRenderer, PathRenderer } from './renderers/navigation.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, CostmapRenderer, OdometryRenderer, PathRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, CostmapRenderer, OdometryRenderer, PathRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 const CELL_SIZE = 280;  // minimum px per grid cell
 const GAP = 12;         // px gap between cells

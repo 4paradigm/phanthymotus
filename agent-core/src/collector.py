@@ -102,6 +102,28 @@ def _extract_perf_timestamps(ev: dict):
         ev['_perf_spans'] = spans
 
 
+def _extract_asr_text_field(ev: dict) -> str:
+    """从 ASR 事件中提取纯文本（用于去重比较）。"""
+    text = ev.get('text', '')
+    if text.startswith('{'):
+        try:
+            return _json.loads(text).get('text', '')
+        except (ValueError, TypeError):
+            pass
+    return text
+
+
+def _pending_has_same_asr_text(asr_text: str) -> bool:
+    """检查 steering_queue 或 priority_pending 中是否已有相同 ASR 文本。"""
+    for item in list(_steering_queue._queue):
+        if _extract_asr_text_field(item) == asr_text:
+            return True
+    for item in _priority_pending:
+        if _extract_asr_text_field(item) == asr_text:
+            return True
+    return False
+
+
 # ── 公开接口 ──────────────────────────────────────────────────────────────────
 
 def set_busy(busy: bool):
@@ -236,14 +258,44 @@ async def _emit_batch(batch: list[dict], urgent: bool = False):
     await _output.put(trigger)
 
 
+# 对 LLM 决策无意义的 perf/trace 字段（已独立存入 perf_spans 表）
+_LLM_IRRELEVANT_KEYS = frozenset({
+    'audio_start_ts', 'audio_end_ts', 'asr_complete_ts',
+    'spans', 'priority', 'text_length',
+})
+
+
+def _slim_event_text(text: str) -> str:
+    """剥离对 LLM 决策无意义的 perf/trace 字段，只保留语义信息。"""
+    if not text or not text.startswith('{'):
+        return text
+    try:
+        data = _json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    changed = False
+    # 移除 perf trace 字段
+    for key in _LLM_IRRELEVANT_KEYS:
+        if key in data:
+            del data[key]
+            changed = True
+    # ACP 完成事件：去掉 result 中的冗余内容（LLM 已知自己发出了什么）
+    if data.get('type') == 'action_complete' and 'result' in data:
+        del data['result']
+        changed = True
+    if not changed:
+        return text
+    return _json.dumps(data, ensure_ascii=False)
+
+
 def _format_priority_batch(events: list[dict]) -> str:
-    """格式化 P>0 事件为 XML（保留原文）。"""
+    """格式化 P>0 事件为 XML（精简 perf 字段后的文本）。"""
     parts = []
     for ev in events:
         ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
         channel = _infer_channel(ev)
         source = ev.get('source', '')
-        text = ev.get('text', '')
+        text = _slim_event_text(ev.get('text', ''))
         parts.append(f'<event source="{source}" channel="{channel}" ts="{ts}">\n{text}\n</event>')
     return '\n'.join(parts)
 
@@ -305,17 +357,29 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
 
     summary = _format_bg_batch(batch)
 
-    # 同步 main agent 最近对话上下文（精简，subagent 可自行 memory_recall）
+    # 丰富上下文：用 rich 版本获取更多对话历史
     try:
-        from event.llm import get_recent_context
-        recent_context = get_recent_context(max_turns=2)
+        from event.llm import get_recent_context_rich
+        recent_context = get_recent_context_rich(max_turns=10, max_chars=3000)
     except (ImportError, AttributeError):
         recent_context = ''
 
+    # 同步 active tasks（让 bg subagent 知道主代理当前关注什么）
+    import task_store
+    active_tasks = task_store.active_tasks()
+    tasks_context = ''
+    if active_tasks:
+        task_lines = [f'- [{t.id[:8]}] {t.goal}' + (f' — {t.progress}' if t.progress else '') for t in active_tasks]
+        tasks_context = '[主代理活跃任务]\n' + '\n'.join(task_lines)
+
+    # 构建 message
+    parts = []
     if recent_context:
-        message = f'[主代理最近决策]\n{recent_context}\n\n[新数据]\n{summary}'
-    else:
-        message = summary
+        parts.append(f'[主代理上下文]\n{recent_context}')
+    if tasks_context:
+        parts.append(tasks_context)
+    parts.append(f'[新数据]\n{summary}')
+    message = '\n\n'.join(parts)
 
     # 检查是否有活跃的 bg subagent
     active = _manager_instance.list_active()
@@ -327,17 +391,23 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
         from subagent.protocol import SubagentSpec, P_LOW
         spec = SubagentSpec(
             goal=(
-                '[bg] 后台监控：分析传入的信息。\n'
-                '- 需要历史对比时，用 memory_recall 检索之前的结论\n'
-                '- 无变化 → subagent_finish\n'
-                '- 有变化但非紧急 → subagent_report(progress=结论)\n'
-                '- 安全/硬件告警（SOC<10%、温度>50°C、碰撞） → subagent_report(progress=..., urgent=true)\n'
-                '不要主动调用 Bash/Read 等工具，只分析传入内容或通过 memory_recall 检索历史。'
+                '[bg] 后台监控：快速分析传感器数据，结合主代理上下文判断重要性。\n'
+                '\n'
+                '## 行为要求\n'
+                '- 直接阅读 JSON 数据做判断，不要用 PythonExec 分析\n'
+                '- 只在有明确理由时才用 memory_recall（如需对比历史基线），不要盲目搜索\n'
+                '- 收到数据后 1-2 轮内必须做出决策（report 或 finish）\n'
+                '\n'
+                '## 判断规则\n'
+                '- 状态变化与主代理活跃任务直接相关 → subagent_report(progress=变化描述, urgent=true)\n'
+                '- 安全/硬件异常 → subagent_report(progress=告警, urgent=true)\n'
+                '- 首次收到新类型数据或有意义的变化 → subagent_report(progress=摘要)\n'
+                '- 无显著变化 → subagent_finish\n'
             ),
             priority=P_LOW,
             model=bg_config.get('bg_model'),
-            tool_deny=['mcp__*', 'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
-            max_rounds=50,
+            tool_deny=['mcp__*', 'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'PythonExec'],
+            max_rounds=10,
             timeout_s=3600,
             context_seed=message,
         )
@@ -412,6 +482,13 @@ async def _drain_loop():
                     if 0 < duration_ms < _barge_in_threshold_ms:
                         continue  # backchannel，不打断
 
+                # ASR 去重：busy 时如果相同 text 已在排队中，丢弃重复
+                if 'asr' in source.lower():
+                    _asr_text = _extract_asr_text_field(ev)
+                    if _asr_text and _pending_has_same_asr_text(_asr_text):
+                        print(f'[collector] dedup: ASR text "{_asr_text[:30]}" already pending, skip')
+                        continue
+
                 # 按模式处理
                 if _interrupt_mode == 'steer':
                     # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过
@@ -444,6 +521,26 @@ async def _drain_loop():
             _bg_buffer_add(ev)
 
 
+def _bg_buffer_has_substance(batch: list[dict]) -> bool:
+    """检查事件批次是否包含有意义的传感器数据。空文本或无数值的事件不值得 spawn bg_monitor。"""
+    for ev in batch:
+        text = ev.get('text', '').strip()
+        if not text:
+            continue
+        if text.startswith('{'):
+            try:
+                data = _json.loads(text)
+                # 含数值字段 = 有传感器数据（SOC/温度/电压/IMU 等）
+                if any(isinstance(v, (int, float)) for v in data.values()):
+                    return True
+            except (ValueError, TypeError):
+                pass
+        elif len(text) > 5:
+            # 非 JSON 但有文本内容
+            return True
+    return False
+
+
 async def _bg_trigger_loop():
     """独立节奏：每 interval 把 bg_buffer 送给 bg subagent。"""
     while True:
@@ -453,6 +550,9 @@ async def _bg_trigger_loop():
             continue
         batch = list(_bg_buffer)
         _bg_buffer.clear()
+        # 只在 buffer 含有实质性传感器数据时才路由到 bg subagent
+        if not _bg_buffer_has_substance(batch):
+            continue
         await _route_to_bg_subagent(batch)
 
 

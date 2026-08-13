@@ -10,8 +10,8 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
-FROM ${BASE_IMAGE}
+ARG JP_VERSION=511
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR
 
 # ── APT mirror (conditional) ─────────────────────────────────────
@@ -66,7 +66,7 @@ RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
     "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
 # ultralytics CLIP (GitHub via mirror, needed for set_classes)
-RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
 
 # Pre-download CLIP weights into image (avoids 338MB download at runtime)
@@ -95,8 +95,8 @@ EXPOSE 15720
 EXPOSE 15721
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
-RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.8/dist-packages/ros_ws.pth && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python3.8/dist-packages/ros_ws.pth
+RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth
 
 # ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"

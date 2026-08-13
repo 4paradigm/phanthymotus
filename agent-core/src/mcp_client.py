@@ -330,7 +330,13 @@ async def call_tool(full_name: str, args: dict) -> str:
         return await _dispatch_internal(mcp_id, tool_name, args)
 
     url     = info['url']
-    timeout = aiohttp.ClientTimeout(total=30)
+    # Actuator/processor tools (e.g. load_map, navigate) may need longer than 30s
+    meta = info.get('tool_meta', {}).get(full_name, {})
+    tool_type = meta.get('type', '')
+    if tool_type in ('actuator', 'processor'):
+        timeout = aiohttp.ClientTimeout(total=60)
+    else:
+        timeout = aiohttp.ClientTimeout(total=30)
 
     # ── ACP: 提取内部控制参数（不送给 driver）──────────────────────────────────
     cancel_event = args.pop('_cancel_event', None)
@@ -373,11 +379,16 @@ async def call_tool(full_name: str, args: dict) -> str:
             else:
                 return f'[{tool_name}] 尚未配置，请先在设备面板中完成配置（provider/url/key）后再启动。'
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        result = await _jrpc(session, url, 'tools/call', {
-            'name':      tool_name,
-            'arguments': args,
-        })
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            result = await _jrpc(session, url, 'tools/call', {
+                'name':      tool_name,
+                'arguments': args,
+            })
+    except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
+        msg = f'[{tool_name}] MCP 调用超时（{int(timeout.total)}s），设备可能正在执行耗时操作（如地图上传/定位）。请稍后重试。'
+        print(f'[mcp] {full_name} timeout after {timeout.total}s')
+        return msg
 
     # MCP call result: list of content items
     content_items = result.get('content', [])
