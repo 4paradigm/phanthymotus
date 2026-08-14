@@ -79,6 +79,14 @@ ENV YOLO_CONFIG_DIR=/work
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
+# Bake the default X-ASR bundle into both JP5 and JP6 images.
+ARG ASR_X_ASR_MODEL_BASE_URL=http://172.28.4.81:34567/zengzhitao/embodied-ai/x_asr_punct_int8_robot343_20260814
+COPY perception/utils/model_downloader.py /tmp/model_downloader.py
+RUN ASR_X_ASR_MODEL_BASE_URL="${ASR_X_ASR_MODEL_BASE_URL}" \
+    NO_PROXY=172.28.4.81 no_proxy=172.28.4.81 PYTHONPATH=/tmp \
+    python3 -c "from model_downloader import ensure_model; ensure_model('asr_x_asr', '/models/sherpa-onnx/x-asr-zh-en')" && \
+    rm -f /tmp/model_downloader.py
+
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
     rm -rf /var/lib/apt/lists/*

@@ -23,6 +23,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
 
+from plugins.vad_preroll import PcmHistory
+
 log = logging.getLogger(__name__)
 
 SAMPLE_RATE    = 16000
@@ -278,7 +280,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "x-asr-zh-en", "scope": "shared"},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -286,6 +288,7 @@ TOOLS = [
                 "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
+                "vad_pre_roll_ms":{"type": "integer", "description": "Audio retained before detected speech (ms)", "default": 500, "scope": "shared"},
                 "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": False, "scope": "shared"},
                 "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
@@ -517,8 +520,25 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
         return text.strip()
 
 
+class SherpaOnnxXASRAdapter(ASRAdapter):
+    """Offline X-ASR transducer with general robot-domain hotword biasing."""
+
+    def __init__(self, model_dir: str, hw_provider: str = "cpu", num_threads: int = 2):
+        from plugins.x_asr import XASRAdapter
+
+        self._delegate = XASRAdapter(model_dir, hw_provider, num_threads)
+
+    def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        return self._delegate.transcribe(wav_bytes, language)
+
+
 # ASR model registry
 ASR_MODELS = {
+    "x-asr-zh-en": {
+        "label": "X-ASR Bilingual (zh+en, offline transducer)",
+        "adapter": SherpaOnnxXASRAdapter,
+        "default_model_dir": "/models/sherpa-onnx/x-asr-zh-en",
+    },
     "paraformer-zh-en": {
         "label": "Paraformer Bilingual (zh+en, streaming)",
         "adapter": SherpaOnnxASRAdapter,
@@ -567,7 +587,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 stop_evt: multiprocessing.Event,
                 backend: str, threshold: float, silence_ms: int,
                 kws_cfg: dict = None,
-                save_vad_segments: bool = False, max_saved_segments: int = 1000):
+                save_vad_segments: bool = False, max_saved_segments: int = 1000,
+                pre_roll_ms: int = 500):
     """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
@@ -600,7 +621,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         provider="cpu",
     )
     vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
-    _log.info(f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, silence_ms={silence_ms})")
+    pre_roll_samples = max(0, int(SAMPLE_RATE * pre_roll_ms / 1000))
+    silence_samples = max(0, int(SAMPLE_RATE * silence_ms / 1000))
+    pcm_history = PcmHistory(SAMPLE_RATE * 31)
+    _log.info(
+        f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, "
+        f"silence_ms={silence_ms}, pre_roll_ms={pre_roll_ms})"
+    )
 
     # ── Initialize KWS (optional) ──
     kws_spotter = None
@@ -744,6 +771,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         float_samples = [s / 32768.0 for s in samples]
 
         # Feed VAD
+        pcm_history.append(pcm[:n * 2])
         vad.accept_waveform(float_samples)
 
         if state == 'waiting_wake':
@@ -788,14 +816,26 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
                 if not start_ts:
-                    start_ts = ts
-                speech_buf += seg_pcm
+                    pre_pcm = pcm_history.pre_roll(
+                        getattr(seg, 'start', None),
+                        len(seg.samples),
+                        pre_roll_samples,
+                        silence_samples,
+                    )
+                    start_ts = ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
+                    speech_buf = pre_pcm + seg_pcm
+                else:
+                    pre_pcm = b''
+                    speech_buf += seg_pcm
                 end_ts = ts
                 vad.pop()
 
                 # Output the segment as an utterance
                 if len(speech_buf) > SAMPLE_RATE:  # >500ms
-                    _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
+                    _log.info(
+                        f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
+                        f"pre_roll_bytes={len(pre_pcm)}"
+                    )
                     if save_vad_segments:
                         _save_segment_pcm(speech_buf, _seg_count)
                         _seg_count[0] += 1
@@ -817,7 +857,8 @@ class _ASRNode(Node):
     def __init__(self, input_topic: str, adapter: Optional[ASRAdapter], language: str,
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
                  kws_cfg: dict = None, node_suffix: str = '',
-                 save_vad_segments: bool = False, max_saved_segments: int = 1000):
+                 save_vad_segments: bool = False, max_saved_segments: int = 1000,
+                 vad_pre_roll_ms: int = 500):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -831,6 +872,7 @@ class _ASRNode(Node):
         self._vad_backend = vad_backend
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
+        self._vad_pre_roll_ms = vad_pre_roll_ms
         self._kws_cfg = kws_cfg or {}
         self._save_vad_segments = save_vad_segments
         self._max_saved_segments = max_saved_segments
@@ -868,7 +910,8 @@ class _ASRNode(Node):
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                  self._kws_cfg, self._save_vad_segments, self._max_saved_segments),
+                  self._kws_cfg, self._save_vad_segments, self._max_saved_segments,
+                  self._vad_pre_roll_ms),
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
@@ -1090,13 +1133,15 @@ class ASRPlugin:
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
+        self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
         self._kws_cfg      = plugin_cfg.get('kws', {})
         self._save_vad_segments = False
         self._max_saved_segments = 1000
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
         self._executor = executor
         log.info(f"[asr] plugin init: model={self._asr_model}, vad={self._vad_backend}, threshold={self._vad_threshold}, "
-                 f"silence_ms={self._vad_silence_ms}, kws_enabled={self._kws_cfg.get('enabled', False)}")
+                 f"silence_ms={self._vad_silence_ms}, pre_roll_ms={self._vad_pre_roll_ms}, "
+                 f"kws_enabled={self._kws_cfg.get('enabled', False)}")
 
     def get_tools(self) -> list:
         return TOOLS
@@ -1205,7 +1250,8 @@ class ASRPlugin:
                                 kws_cfg=self._kws_cfg,
                                 node_suffix=node_key.replace('/', '_').replace('-', '_'),
                                 save_vad_segments=self._save_vad_segments,
-                                max_saved_segments=self._max_saved_segments)
+                                max_saved_segments=self._max_saved_segments,
+                                vad_pre_roll_ms=self._vad_pre_roll_ms)
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
             else:
@@ -1216,6 +1262,7 @@ class ASRPlugin:
                 node._vad_backend = self._vad_backend
                 node._vad_threshold = self._vad_threshold
                 node._vad_silence_ms = self._vad_silence_ms
+                node._vad_pre_roll_ms = self._vad_pre_roll_ms
                 node._kws_cfg = self._kws_cfg
                 node._save_vad_segments = self._save_vad_segments
                 node._max_saved_segments = self._max_saved_segments
@@ -1248,6 +1295,8 @@ class ASRPlugin:
                 self._vad_threshold = float(cfg['vad_threshold'])
             if 'vad_silence_ms' in cfg:
                 self._vad_silence_ms = int(cfg['vad_silence_ms'])
+            if 'vad_pre_roll_ms' in cfg:
+                self._vad_pre_roll_ms = int(cfg['vad_pre_roll_ms'])
             if 'trigger_mode' in cfg:
                 self._kws_cfg['trigger_mode'] = cfg['trigger_mode']
             if 'kws_model' in cfg:
@@ -1285,6 +1334,7 @@ class ASRPlugin:
                 node._vad_backend = self._vad_backend
                 node._vad_threshold = self._vad_threshold
                 node._vad_silence_ms = self._vad_silence_ms
+                node._vad_pre_roll_ms = self._vad_pre_roll_ms
                 node._kws_cfg = self._kws_cfg
                 node._save_vad_segments = self._save_vad_segments
                 node._max_saved_segments = self._max_saved_segments
