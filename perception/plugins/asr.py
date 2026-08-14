@@ -524,8 +524,10 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
     def __init__(self, model_dir: str, hw_provider: str = "cpu", num_threads: int = 2):
+        from utils.model_downloader import ensure_model
         from plugins.x_asr import XASRAdapter
 
+        ensure_model("asr_x_asr", model_dir)
         self._delegate = XASRAdapter(model_dir, hw_provider, num_threads)
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
