@@ -549,6 +549,22 @@ class VoxelMap:
         ) + body
 
 
+def source_age_is_valid(
+    source_age_sec: float,
+    *,
+    max_age_sec: float,
+    tolerance_sec: float,
+) -> bool:
+    if not all(
+        math.isfinite(value)
+        for value in (source_age_sec, max_age_sec, tolerance_sec)
+    ):
+        return False
+    if max_age_sec <= 0 or not 0 <= tolerance_sec <= 0.1:
+        return False
+    return -0.1 <= source_age_sec <= max_age_sec + tolerance_sec
+
+
 __all__ = [
     "InvalidFastLivo2Frame",
     "Pose3",
@@ -561,6 +577,7 @@ __all__ = [
     "iter_xyz_points",
     "quaternion_from_rpy",
     "read_pcd_xyz",
+    "source_age_is_valid",
     "transform_points",
     "yaw_from_quaternion",
 ]

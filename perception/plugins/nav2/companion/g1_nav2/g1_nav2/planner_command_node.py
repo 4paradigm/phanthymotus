@@ -14,6 +14,7 @@ from geometry_msgs.msg import Twist
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import SpeedLimit
+from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -41,6 +42,12 @@ from .execution_protocol import (
     build_velocity_proposal,
     proposal_context_is_current,
     shape_terminal_approach,
+)
+from .costmap_validation import (
+    CostmapError,
+    CostmapSnapshot,
+    GoalCellRejected,
+    validated_goal_cell_receipt,
 )
 from .readiness import evaluate_readiness, navigation_motion_blocker
 
@@ -98,6 +105,9 @@ class PlannerCommandNode(Node):
         self.declare_parameter(
             "obstacle_cloud_topic", "/ubuntu/navigation/cloud_registered"
         )
+        self.declare_parameter("global_costmap_topic", "/global_costmap/costmap")
+        self.declare_parameter("goal_costmap_max_age_sec", 2.0)
+        self.declare_parameter("source_age_tolerance_sec", 0.05)
         self.declare_parameter("sensor_max_age_sec", 0.5)
         self.declare_parameter("terminal_xy_tolerance_m", 0.18)
         self.declare_parameter("terminal_yaw_tolerance_rad", 0.45)
@@ -144,6 +154,15 @@ class PlannerCommandNode(Node):
         self._obstacle_cloud_topic = str(
             self.get_parameter("obstacle_cloud_topic").value
         )
+        self._global_costmap_topic = str(
+            self.get_parameter("global_costmap_topic").value
+        )
+        self._goal_costmap_max_age_sec = float(
+            self.get_parameter("goal_costmap_max_age_sec").value
+        )
+        self._source_age_tolerance_sec = float(
+            self.get_parameter("source_age_tolerance_sec").value
+        )
         self._sensor_max_age_sec = float(
             self.get_parameter("sensor_max_age_sec").value
         )
@@ -180,6 +199,10 @@ class PlannerCommandNode(Node):
             raise ValueError("global_frame and base_frame must not be empty")
         if self._sensor_max_age_sec <= 0:
             raise ValueError("sensor_max_age_sec must be positive")
+        if self._goal_costmap_max_age_sec <= 0:
+            raise ValueError("goal_costmap_max_age_sec must be positive")
+        if not 0 <= self._source_age_tolerance_sec <= 0.1:
+            raise ValueError("source_age_tolerance_sec must be within [0, 0.1]")
         tolerances = {
             "terminal_xy_tolerance_m": self._terminal_xy_tolerance_m,
             "terminal_yaw_tolerance_rad": self._terminal_yaw_tolerance_rad,
@@ -252,6 +275,19 @@ class PlannerCommandNode(Node):
             qos_profile_sensor_data,
             callback_group=self._callbacks,
         )
+        costmap_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._global_costmap_sub = self.create_subscription(
+            OccupancyGrid,
+            self._global_costmap_topic,
+            self._on_global_costmap,
+            costmap_qos,
+            callback_group=self._callbacks,
+        )
         self._action_client = ActionClient(
             self,
             NavigateToPose,
@@ -291,6 +327,8 @@ class PlannerCommandNode(Node):
         self._last_obstacle_source_age_sec: float | None = None
         self._last_obstacle_source_stamp_ns: int | None = None
         self._last_obstacle_frame_ready = False
+        self._global_costmap: CostmapSnapshot | None = None
+        self._global_costmap_error: str | None = None
         self._lifecycle_states = {
             name: 0 for name in self._required_lifecycle_nodes
         }
@@ -334,6 +372,41 @@ class PlannerCommandNode(Node):
             self._last_obstacle_frame_ready = (
                 message.header.frame_id.strip("/") == self._global_frame.strip("/")
             )
+
+    def _on_global_costmap(self, message: OccupancyGrid) -> None:
+        orientation = message.info.origin.orientation
+        origin_yaw = math.atan2(
+            2.0
+            * (
+                orientation.w * orientation.z
+                + orientation.x * orientation.y
+            ),
+            1.0
+            - 2.0
+            * (
+                orientation.y * orientation.y
+                + orientation.z * orientation.z
+            ),
+        )
+        try:
+            snapshot = CostmapSnapshot.from_values(
+                frame_id=message.header.frame_id,
+                stamp_ns=_stamp_ns(message) or 0,
+                resolution=float(message.info.resolution),
+                width=int(message.info.width),
+                height=int(message.info.height),
+                origin_x=float(message.info.origin.position.x),
+                origin_y=float(message.info.origin.position.y),
+                origin_yaw=origin_yaw,
+                data=message.data,
+            )
+        except CostmapError as exc:
+            with self._lock:
+                self._global_costmap_error = str(exc)
+            return
+        with self._lock:
+            self._global_costmap = snapshot
+            self._global_costmap_error = None
 
     def _refresh_lifecycle_states(self) -> None:
         for name, client in self._lifecycle_clients.items():
@@ -379,6 +452,7 @@ class PlannerCommandNode(Node):
         return evaluate_readiness(
             now_monotonic=time.monotonic(),
             max_age_sec=self._sensor_max_age_sec,
+            source_age_tolerance_sec=self._source_age_tolerance_sec,
             odom_received_at=odom_received_at,
             odom_source_age_sec=odom_source_age,
             odom_frame_ready=odom_frame_ready,
@@ -390,6 +464,35 @@ class PlannerCommandNode(Node):
             action_server_ready=self._action_client.server_is_ready(),
             global_to_base_ready=global_to_base_ready,
         )
+
+    def _global_costmap_diagnostics(self) -> dict:
+        with self._lock:
+            snapshot = self._global_costmap
+            error = self._global_costmap_error
+        if snapshot is None:
+            return {
+                "state": "error" if error else "waiting",
+                "topic": self._global_costmap_topic,
+                "error": error,
+            }
+        return {
+            "topic": self._global_costmap_topic,
+            **snapshot.diagnostics(),
+        }
+
+    def _validate_goal_cell(self, target: dict) -> dict:
+        with self._lock:
+            snapshot = self._global_costmap
+        try:
+            return validated_goal_cell_receipt(
+                snapshot,
+                x=float(target["x"]),
+                y=float(target["y"]),
+                expected_frame=self._global_frame,
+                max_receive_age_sec=self._goal_costmap_max_age_sec,
+            )
+        except GoalCellRejected as exc:
+            raise CommandError(exc.code, str(exc)) from exc
 
     def _require_navigation_ready(self, action: str) -> None:
         receipt = self._readiness()
@@ -601,6 +704,7 @@ class PlannerCommandNode(Node):
                 ),
                 "motion_limits": motion_limits,
                 "mode": mode,
+                "goal_cell": None,
                 "attempt": 0,
                 "goal_handle": None,
                 "cancel_intent": None,
@@ -630,23 +734,29 @@ class PlannerCommandNode(Node):
                 "speed_limit_topic": self._controller_speed_limit_topic,
                 "velocity_limits": active["motion_limits"].as_dict(),
                 "mode": active["mode"],
+                "goal_cell": dict(active["goal_cell"]),
                 "shadow_only": True,
             }
 
     def _send_active_goal(self) -> None:
+        with self._lock:
+            if self._active is None:
+                raise CommandError("no_active_navigation", "navigation disappeared")
+            nav_id = self._active["nav_id"]
+            target = dict(self._active["target_pose"])
+        goal_cell = self._validate_goal_cell(target)
         if not self._action_client.wait_for_server(timeout_sec=3.0):
             raise CommandError(
                 "nav2_action_unavailable",
                 f"action server {self._action_name} is unavailable",
             )
         with self._lock:
-            if self._active is None:
+            if self._active is None or self._active.get("nav_id") != nav_id:
                 raise CommandError("no_active_navigation", "navigation disappeared")
             self._active["attempt"] += 1
             attempt = self._active["attempt"]
-            nav_id = self._active["nav_id"]
-            target = dict(self._active["target_pose"])
             speed_limit = float(self._active["effective_speed_limit"])
+            self._active["goal_cell"] = goal_cell
             self._active["status"] = "starting"
             self._active["cancel_intent"] = None
             self._active["goal_handle"] = None
@@ -1058,6 +1168,7 @@ class PlannerCommandNode(Node):
                 }
             )
         payload.update(self._readiness())
+        payload["global_costmap"] = self._global_costmap_diagnostics()
         self._emit(payload)
         if stop_proposal is not None:
             nav_id, status = stop_proposal
@@ -1099,6 +1210,7 @@ class PlannerCommandNode(Node):
                 ),
             }
         payload.update(self._readiness())
+        payload["global_costmap"] = self._global_costmap_diagnostics()
         self._emit(payload)
 
     def _emit(self, payload: dict) -> None:

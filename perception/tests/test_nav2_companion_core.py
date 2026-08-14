@@ -16,6 +16,13 @@ PACKAGE_ROOT = (
 )
 sys.path.insert(0, str(PACKAGE_ROOT))
 
+from g1_nav2.costmap_validation import (  # noqa: E402
+    CostmapError,
+    CostmapSnapshot,
+    GoalCellRejected,
+    goal_cell_receipt,
+    validated_goal_cell_receipt,
+)
 from g1_nav2.execution_protocol import (  # noqa: E402
     MotionLimits,
     Pose2D,
@@ -290,6 +297,144 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             "fast_livo2_source_stamp_skew", skewed["navigation_blockers"]
         )
 
+        boundary_jitter = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            source_age_tolerance_sec=0.05,
+            odom_received_at=9.9,
+            odom_source_age_sec=0.51,
+            odom_frame_ready=True,
+            obstacle_received_at=9.9,
+            obstacle_source_age_sec=0.51,
+            obstacle_frame_ready=True,
+            source_stamp_skew_sec=0.01,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertTrue(boundary_jitter["navigation_ready"])
+
+        too_old = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            source_age_tolerance_sec=0.05,
+            odom_received_at=9.9,
+            odom_source_age_sec=0.551,
+            odom_frame_ready=True,
+            obstacle_received_at=9.9,
+            obstacle_source_age_sec=0.551,
+            obstacle_frame_ready=True,
+            source_stamp_skew_sec=0.01,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertIn("odom_source_stamp_stale", too_old["navigation_blockers"])
+
+    def test_goal_cell_is_checked_before_nav2_action_dispatch(self) -> None:
+        snapshot = CostmapSnapshot.from_values(
+            frame_id="map",
+            stamp_ns=123,
+            resolution=0.5,
+            width=4,
+            height=3,
+            origin_x=-1.0,
+            origin_y=-0.5,
+            origin_yaw=0.0,
+            data=[
+                0,
+                0,
+                0,
+                0,
+                0,
+                20,
+                99,
+                100,
+                -1,
+                0,
+                0,
+                0,
+            ],
+            received_monotonic=10.0,
+        )
+
+        free = goal_cell_receipt(
+            snapshot,
+            x=-0.75,
+            y=-0.25,
+            expected_frame="map",
+            max_receive_age_sec=2.0,
+            now_monotonic=10.5,
+        )
+        self.assertEqual(free["cost"], 0)
+        self.assertFalse(free["collision"])
+
+        inscribed = goal_cell_receipt(
+            snapshot,
+            x=0.25,
+            y=0.25,
+            expected_frame="map",
+            max_receive_age_sec=2.0,
+            now_monotonic=10.5,
+        )
+        self.assertEqual(inscribed["cost"], 99)
+        self.assertTrue(inscribed["collision"])
+        with self.assertRaises(GoalCellRejected) as rejected:
+            validated_goal_cell_receipt(
+                snapshot,
+                x=0.25,
+                y=0.25,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+            )
+        self.assertEqual(rejected.exception.code, "goal_in_collision")
+
+        with self.assertRaises(GoalCellRejected) as rejected:
+            validated_goal_cell_receipt(
+                snapshot,
+                x=-0.75,
+                y=0.75,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+            )
+        self.assertEqual(rejected.exception.code, "goal_cost_unknown")
+
+        diagnostics = snapshot.diagnostics(now_monotonic=10.5)
+        self.assertEqual(diagnostics["inflated_cells"], 1)
+        self.assertEqual(diagnostics["inscribed_cells"], 1)
+        self.assertEqual(diagnostics["lethal_cells"], 1)
+        self.assertEqual(diagnostics["unknown_cells"], 1)
+        with self.assertRaisesRegex(CostmapError, "outside"):
+            goal_cell_receipt(
+                snapshot,
+                x=2.0,
+                y=0.0,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+            )
+        with self.assertRaises(GoalCellRejected) as rejected:
+            validated_goal_cell_receipt(
+                snapshot,
+                x=2.0,
+                y=0.0,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+            )
+        self.assertEqual(rejected.exception.code, "goal_outside_costmap")
+        with self.assertRaisesRegex(CostmapError, "receive age"):
+            goal_cell_receipt(
+                snapshot,
+                x=0.0,
+                y=0.0,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=12.1,
+            )
+
     def test_runtime_is_planner_controller_only(self) -> None:
         setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
         launch = (PACKAGE_ROOT / "launch" / "g1_nav2.launch.py").read_text(
@@ -339,6 +484,24 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("max_obstacle_height: 0.30", params)
         self.assertIn("global_frame: map", params)
         self.assertIn("rolling_window: true", params)
+        local = params.split("local_costmap:\n", 1)[1].split(
+            "\nglobal_costmap:", 1
+        )[0]
+        global_map = params.split("global_costmap:\n", 1)[1].split(
+            "\nplanner_server:", 1
+        )[0]
+        self.assertIn("sensor_frame: base_link", local)
+        self.assertIn("clearing: true", local)
+        self.assertIn("raytrace_max_range: 8.5", local)
+        self.assertIn("clearing: false", global_map)
+        self.assertIn("obstacle_min_range: 0.0", global_map)
+        self.assertIn("obstacle_max_range: 1000.0", global_map)
+        self.assertIn("inflation_radius: 0.55", local)
+        self.assertIn("inflation_radius: 0.55", global_map)
+        footprint_radius = math.hypot(0.32, 0.28)
+        self.assertAlmostEqual(footprint_radius, 0.4252058, places=6)
+        self.assertGreater(0.55 - footprint_radius, 0.12)
+        self.assertLess(0.55 - footprint_radius, 0.13)
 
     def test_controller_faces_path_and_disables_lateral_motion(self) -> None:
         params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
@@ -395,6 +558,15 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("proposal_context_is_current", command)
         self.assertIn('payload.get("velocity_limits")', command)
         self.assertIn("goal.pose.header.frame_id = self._global_frame", command)
+        send_goal = command.split("    def _send_active_goal", 1)[1].split(
+            "    def _publish_controller_speed_limit", 1
+        )[0]
+        self.assertLess(
+            send_goal.index("self._validate_goal_cell(target)"),
+            send_goal.index("self._action_client.wait_for_server"),
+        )
+        self.assertIn('"goal_costmap_max_age_sec": 2.0', launch)
+        self.assertIn('"source_age_tolerance_sec": 0.05', launch)
 
 
 if __name__ == "__main__":

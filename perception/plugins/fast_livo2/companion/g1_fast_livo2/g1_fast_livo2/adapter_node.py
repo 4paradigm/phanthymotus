@@ -29,6 +29,7 @@ from .frame_adapter_core import (
     iter_xyz_points,
     quaternion_from_rpy,
     read_pcd_xyz,
+    source_age_is_valid,
     transform_points,
     yaw_from_quaternion,
 )
@@ -49,6 +50,7 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("map_control_status_topic", "/ubuntu/navigation/fast_livo2/map_control_status")
         self.declare_parameter("map_root", "/opt/fast_livo_ws/src/fast_livo/Log/pcd")
         self.declare_parameter("source_max_age_sec", 0.5)
+        self.declare_parameter("source_age_tolerance_sec", 0.05)
         self.declare_parameter("map_voxel_size_m", 0.10)
         self.declare_parameter("obstacle_min_height_m", -1.25)
         self.declare_parameter("obstacle_max_height_m", 0.30)
@@ -60,6 +62,11 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("base_to_sensor_yaw", 0.0)
 
         self._source_max_age = float(self.get_parameter("source_max_age_sec").value)
+        self._source_age_tolerance = float(
+            self.get_parameter("source_age_tolerance_sec").value
+        )
+        if not 0 <= self._source_age_tolerance <= 0.1:
+            raise ValueError("source_age_tolerance_sec must be within [0, 0.1]")
         self._map_root = Path(str(self.get_parameter("map_root").value)).resolve()
         self._base_to_sensor = Pose3(
             float(self.get_parameter("base_to_sensor_x").value),
@@ -127,7 +134,11 @@ class FastLivo2Adapter(Node):
             if message.header.frame_id.strip() != "camera_init" or message.child_frame_id.strip() != "aft_mapped":
                 raise InvalidFastLivo2Frame("raw odom must be camera_init -> aft_mapped")
             source_age = self._source_age(message.header.stamp)
-            if source_age < -0.1 or source_age > self._source_max_age:
+            if not source_age_is_valid(
+                source_age,
+                max_age_sec=self._source_max_age,
+                tolerance_sec=self._source_age_tolerance,
+            ):
                 raise InvalidFastLivo2Frame(f"raw odom source age {source_age:.3f}s is invalid")
             pose = message.pose.pose
             session_pose = canonical_base_pose(
@@ -189,7 +200,11 @@ class FastLivo2Adapter(Node):
             if message.header.frame_id.strip() != "camera_init":
                 raise InvalidFastLivo2Frame("raw registered cloud must use camera_init")
             source_age = self._source_age(message.header.stamp)
-            if source_age < -0.1 or source_age > self._source_max_age:
+            if not source_age_is_valid(
+                source_age,
+                max_age_sec=self._source_max_age,
+                tolerance_sec=self._source_age_tolerance,
+            ):
                 raise InvalidFastLivo2Frame(f"raw cloud source age {source_age:.3f}s is invalid")
             points = list(
                 iter_xyz_points(

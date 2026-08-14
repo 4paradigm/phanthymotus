@@ -27,6 +27,7 @@ from .collection_core import (
     normalize_collection_directory,
     rosbag_record_command,
 )
+from .runtime_core import controlled_stop_succeeded
 
 
 _STATUS_QOS = QoSProfile(
@@ -533,13 +534,15 @@ class FastLivo2Supervisor(Node):
             self._active_map = None
             self._started_unix_ms = None
             self._runtime_mode = "idle"
-        if return_code != 0:
+        if not controlled_stop_succeeded(return_code):
             return {"status": "error", "error_code": "algorithm_stop_failed", "error": f"FAST-LIVO2 exited with {return_code}", "map_name": map_name, "pcd_files": files}
         return {
             "status": "saved" if files else "stopped",
             "map_name": map_name,
             "pcd_files": files,
             "manifest": manifest,
+            "algorithm_return_code": return_code,
+            "controlled_stop": True,
             "global_relocalization_supported": False,
             "bounded_relocalization_supported": True,
         }
@@ -722,7 +725,9 @@ class FastLivo2Supervisor(Node):
             return None
         os.killpg(process.pid, signal.SIGINT)
         try:
-            process.wait(timeout=float(self.get_parameter("stop_timeout_sec").value))
+            return_code = process.wait(
+                timeout=float(self.get_parameter("stop_timeout_sec").value)
+            )
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=10)
@@ -730,6 +735,12 @@ class FastLivo2Supervisor(Node):
                 "status": "error",
                 "error_code": "algorithm_stop_timeout",
                 "error": "FAST-LIVO2 did not stop within timeout",
+            }
+        if not controlled_stop_succeeded(return_code):
+            return {
+                "status": "error",
+                "error_code": "algorithm_stop_failed",
+                "error": f"FAST-LIVO2 exited with {return_code}",
             }
         return None
 
