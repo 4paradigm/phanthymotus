@@ -45,3 +45,27 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: false
+    provider: rapidocr
+    model_dir: /models/ocr/ppocrv6-small-trt
+    device_id: 0
+    language: zh
+    use_angle_cls: true
+    max_side_len: 1600
+    det_unclip_ratio: 0.7
+    det_thresh: 0.3
+    det_box_thresh: 0.5
+    rec_min_score: 0.9
+    crop_refinement:
+      enabled: true
+      min_score: 0.9
+      min_gain: 0.12
+      min_text_length: 2
+      profiles: [prefix_65, upper_center, upper_tight]
+    empty_result_retry:
+      enabled: true
+      det_thresh: 0.1
+      det_box_thresh: 0.1
+    min_interval_ms: 0

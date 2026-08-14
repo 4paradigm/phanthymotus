@@ -1,35 +1,50 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
+#   docker build -f perception/Dockerfile.jetson --network=host \
+#     --build-arg JP_VERSION=61 \
+#     -t phanthymotus-perception-ocr:jp61 .
+#
 #   ./deploy/build_perception.sh --variant jetson --mirror tuna
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch AS jp61-compat
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
-ARG PYPI_MIRROR APT_MIRROR
+ARG PYPI_MIRROR APT_MIRROR JP_VERSION
+
+ENV PIP_INDEX_URL=${PYPI_MIRROR} \
+    PIP_EXTRA_INDEX_URL= \
+    PIP_TRUSTED_HOST="mirrors.tuna.tsinghua.edu.cn pypi.tuna.tsinghua.edu.cn pypi.org files.pythonhosted.org" \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    OPENCV_FOR_THREADS_NUM=1 \
+    VIPS_CONCURRENCY=1 \
+    MALLOC_ARENA_MAX=2
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
         sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
     fi
 
-# ── Switch ROS2 to TUNA mirror + skip expired key (if sources exist) ──
-RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
-        sed -i 's|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g' /etc/apt/sources.list.d/*.list && \
-        sed -i 's|deb \[|deb [trusted=yes |g; s|deb http|deb [trusted=yes] http|g' /etc/apt/sources.list.d/ros2*.list; \
-    fi
-
 # ── System deps ────────────────────────────────────────────────────
+# (build-essential + python3-dev: webrtcvad has no aarch64 wheel, builds from source)
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ffmpeg build-essential python3-dev libvips42 curl && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# JP511/Focal lacks libffi.so.8, which is required when the NVIDIA runtime
+# exposes the OpenCV/CUDA dependency chain. The JP61 donor contains Ubuntu's
+# ABI-compatible 39 KiB libffi8 package; copying it is harmless on JP61.
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
@@ -50,7 +65,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
-# Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
+# Fix the legacy JP5.1.1 cv2 package when needed; JP6 passes the import probe.
 RUN python3 -c "import cv2" 2>/dev/null || { \
     echo 'import importlib.util, sys, os' > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
     echo '_so = os.path.join(os.path.dirname(__file__), "python-3.8", "cv2.cpython-38-aarch64-linux-gnu.so")' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
@@ -79,10 +94,78 @@ ENV YOLO_CONFIG_DIR=/work
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
+# TensorRT is supplied by the selected JetPack base.
+RUN python3 -c "from importlib.metadata import version; value = version('tensorrt'); minimum = 10 if '${JP_VERSION}' == '61' else 8; assert int(value.split('.')[0]) >= minimum, value"
+
+# ── RapidOCR post-processing utilities ────────────────────────────
+RUN if [ "${JP_VERSION}" = "61" ]; then \
+      NUMPY_VERSION=1.26.4; \
+    else \
+      NUMPY_VERSION=1.24.4; \
+    fi; \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+      "numpy==${NUMPY_VERSION}" pyclipper==1.3.0.post3 six Shapely==2.0.5 Pillow \
+      omegaconf==2.3.0 colorlog && \
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
+      rapidocr==3.9.1 && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pyvips==3.1.0" && \
+    RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
+    find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
+
+# ── OCR model (kept outside Git) ──────────────────────────────────
+ARG OCR_MODEL_BASE_URL=https://www.modelscope.cn/models/Flame4pd/ppocrv6-small-edge-ocr/resolve
+ARG OCR_MODEL_REVISION=0301e9299b3abe09c6a60796d7bed74c23fcc525
+RUN if [ "${JP_VERSION}" = "61" ]; then \
+      OCR_TRT_MODEL_BUNDLE=tensorrt-jp6-trt10.4-orin-batch8-cls8; \
+      DET_SIZE=11194324; \
+      DET_SHA256=3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef; \
+      REC_SIZE=23303292; \
+      REC_SHA256=8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641; \
+      CLS_SIZE=1046484; \
+      CLS_SHA256=148a6895260d3b6b6f86e0c5787121fc1bba316f3427397f654421196c13cb77; \
+    else \
+      OCR_TRT_MODEL_BUNDLE=tensorrt-jp511-trt8.5-orin-batch8-cls8; \
+      DET_SIZE=12334256; \
+      DET_SHA256=1bb32a027e93b06d5319ac61e38bb3e447137b01465eacefa7a652f58130ebdf; \
+      REC_SIZE=19915466; \
+      REC_SHA256=1e204f0469beba33d8590b29c06419cf1073d98d41243b5ee316d2f877340b61; \
+      CLS_SIZE=1038858; \
+      CLS_SHA256=02c722e56e621b56a36678cc8aa124a31b41e9e3c9ca350b11e4de0d5bbd0a35; \
+    fi && \
+    OCR_TRT_MODEL_BASE_URL="${OCR_MODEL_BASE_URL}/${OCR_MODEL_REVISION}/${OCR_TRT_MODEL_BUNDLE}" && \
+    OCR_TRT_MODEL_DIR=/opt/phanthy-motus/model-seed/ocr/ppocrv6-small-trt && \
+    mkdir -p "${OCR_TRT_MODEL_DIR}" && \
+    for MODEL_SPEC in \
+      "det.engine:${DET_SIZE}:${DET_SHA256}" \
+      "rec.engine:${REC_SIZE}:${REC_SHA256}" \
+      "cls.engine:${CLS_SIZE}:${CLS_SHA256}" \
+      "keys.txt:74947:b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d"; do \
+      MODEL_FILE="${MODEL_SPEC%%:*}"; \
+      MODEL_METADATA="${MODEL_SPEC#*:}"; \
+      MODEL_SIZE="${MODEL_METADATA%%:*}"; \
+      MODEL_SHA256="${MODEL_METADATA#*:}"; \
+      MODEL_TEMP="$(mktemp "${OCR_TRT_MODEL_DIR}/.${MODEL_FILE}.XXXXXX")"; \
+      curl --fail --location --silent --show-error --retry 3 \
+        --retry-connrefused --connect-timeout 20 --max-time 120 \
+        "${OCR_TRT_MODEL_BASE_URL}/${MODEL_FILE}" \
+        --output "${MODEL_TEMP}"; \
+      ACTUAL_SIZE="$(stat -c '%s' "${MODEL_TEMP}")"; \
+      [ "${ACTUAL_SIZE}" = "${MODEL_SIZE}" ] || { \
+        echo "size mismatch for ${MODEL_FILE}: expected ${MODEL_SIZE}, got ${ACTUAL_SIZE}" >&2; \
+        exit 1; \
+      }; \
+      echo "${MODEL_SHA256}  ${MODEL_TEMP}" | sha256sum -c -; \
+      chmod 0644 "${MODEL_TEMP}"; \
+      mv -f "${MODEL_TEMP}" "${OCR_TRT_MODEL_DIR}/${MODEL_FILE}"; \
+    done
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
+
+# Keep the JP511 image self-contained instead of requiring a host bind mount.
+COPY --from=jp61-compat /usr/lib/aarch64-linux-gnu/libffi.so.8.1.0 /usr/lib/aarch64-linux-gnu/libffi.so.8.1.0
+RUN ln -sfn libffi.so.8.1.0 /usr/lib/aarch64-linux-gnu/libffi.so.8
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
@@ -90,6 +173,9 @@ COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastdds_large_message.xml
+COPY perception/deploy/seed_ocr_models.sh /deploy/seed_ocr_models.sh
+RUN chmod 0755 /deploy/seed_ocr_models.sh
 
 EXPOSE 15720
 EXPOSE 15721
@@ -104,6 +190,7 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+     /deploy/seed_ocr_models.sh && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      python3 /work/main.py"]

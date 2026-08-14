@@ -108,6 +108,11 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("ocr", {}).get("enabled", False):
+            from plugins.ocr import OCRPlugin
+            self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
+            log.info("OCRPlugin loaded")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -129,6 +134,20 @@ class PerceptionBundle:
             if getattr(p, 'PREFIX', None) == 'tts':
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
+
+    def run_lifecycle_hook(self, name: str) -> None:
+        for plugin in self._plugins:
+            hook = getattr(plugin, name, None)
+            if hook is None:
+                continue
+            try:
+                hook()
+            except Exception:
+                log.exception(
+                    "plugin %s failed: %s",
+                    name,
+                    getattr(plugin, "PREFIX", type(plugin).__name__),
+                )
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -434,8 +453,8 @@ def main():
     global _bundle
 
     cfg      = _load_config()
-    mcp_port = int(cfg.get("mcp_port", 15720))
-    ws_port  = int(cfg.get("ws_port",  15721))
+    mcp_port = int(os.environ.get("MCP_PORT") or cfg.get("mcp_port", 15720))
+    ws_port  = int(os.environ.get("WS_PORT") or cfg.get("ws_port", 15721))
 
     log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "
@@ -477,7 +496,9 @@ def main():
     try:
         server.serve_forever()
     finally:
+        _bundle.run_lifecycle_hook("prepare_shutdown")
         executor.shutdown()
+        _bundle.run_lifecycle_hook("destroy_nodes")
         rclpy.shutdown()
 
 

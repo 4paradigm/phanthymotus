@@ -1,6 +1,7 @@
 perception:
   image: __IMAGE__
   container_name: embodied-perception
+  runtime: nvidia
   network_mode: host
   ipc: host
   pid: host
@@ -11,7 +12,7 @@ perception:
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/config/fastdds_large_message.xml
   logging:
     driver: local
     options:
