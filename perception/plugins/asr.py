@@ -882,7 +882,6 @@ class _ASRNode(Node):
         self._vad_proc: Optional[multiprocessing.Process] = None
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._first_chunk_event = threading.Event()
 
     def start(self) -> dict:
         if self.state == "running":
@@ -899,7 +898,6 @@ class _ASRNode(Node):
     def _start_inner(self) -> dict:
         from audio_msgs.msg import AudioChunk
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
-        self._first_chunk_event = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
         self._stop_event.clear()
         # Start VAD in a child process
@@ -917,24 +915,10 @@ class _ASRNode(Node):
         self._vad_proc.start()
         log.info(f"[asr] VAD worker process started (pid={self._vad_proc.pid})")
         # Transcription worker thread (reads from utterance_queue)
+        self.state = "running"
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
-        self.state = "starting"
-        self._worker_ready = threading.Event()
-        log.info("[asr] waiting for first audio chunk...")
-        # Block until first audio chunk arrives or stop() cancels (timeout to avoid infinite hang)
-        got_chunk = self._first_chunk_event.wait(timeout=10)
-        if self._stop_event.is_set():
-            self.state = "idle"
-            return {"state": "idle"}
-        if not got_chunk:
-            log.warning("[asr] timeout waiting for first audio chunk (10s), starting anyway")
-        # Wait for worker to finish initialization (IPA precompute etc.)
-        self._worker_ready.wait(timeout=5)
-        if self.state == "error":
-            return {"state": "error", "message": "ASR worker failed to initialize (check logs)"}
-        self.state = "running"
-        log.info("[asr] started, receiving audio data")
+        log.info("[asr] started, waiting for audio data")
         return self._status_dict()
 
     def stop(self) -> dict:
@@ -946,11 +930,6 @@ class _ASRNode(Node):
                 pass  # may already be invalid
             self._sub = None
         self._stop_event.set()
-        # Unblock start() if it's waiting
-        if hasattr(self, '_first_chunk_event'):
-            self._first_chunk_event.set()
-        if hasattr(self, '_worker_ready'):
-            self._worker_ready.set()
         if self._vad_stop:
             self._vad_stop.set()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
@@ -965,6 +944,7 @@ class _ASRNode(Node):
             self._vad_proc.join(timeout=5)
             if self._vad_proc.is_alive():
                 self._vad_proc.terminate()
+                self._vad_proc.join(timeout=1)
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
         self.state = "idle"
@@ -973,9 +953,6 @@ class _ASRNode(Node):
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
             return
-        # Signal first chunk arrival to unblock start()
-        if not self._first_chunk_event.is_set():
-            self._first_chunk_event.set()
         # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder
         if self._vad_proc and not self._vad_proc.is_alive():
             log.warning(f"[asr] VAD worker died (exitcode={self._vad_proc.exitcode}), stopping ASR")
@@ -1005,8 +982,6 @@ class _ASRNode(Node):
         except Exception as e:
             log.error(f"[asr] worker fatal error: {e}", exc_info=True)
             self.state = "error"
-            if hasattr(self, '_worker_ready'):
-                self._worker_ready.set()
 
     def _worker_inner(self):
         # Pre-compute keyword IPA if in asr_kws mode
@@ -1022,10 +997,6 @@ class _ASRNode(Node):
             else:
                 log.warning("[asr] asr_kws mode but no keyword configured, falling back to vad mode")
                 trigger_mode = 'vad'
-
-        # Signal that worker init is complete
-        if hasattr(self, '_worker_ready'):
-            self._worker_ready.set()
 
         while not self._stop_event.is_set():
             try:
@@ -1125,10 +1096,10 @@ class ASRPlugin:
     def __init__(self, plugin_cfg: dict, executor):
         self._language     = plugin_cfg.get('language', 'zh-CN')
         self._asr_model    = plugin_cfg.get('asr_model', 'paraformer-zh-en')
-        self._plugin_cfg   = plugin_cfg
-        self._loading      = False
+        self._plugin_cfg   = dict(plugin_cfg)
         self._load_error   = None
-        self._adapter      = _build_asr_adapter(plugin_cfg)
+        self._adapter      = None
+        self._adapter_lock = threading.Lock()
         vad_cfg            = plugin_cfg.get('vad', {})
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
@@ -1141,44 +1112,59 @@ class ASRPlugin:
         self._executor = executor
         log.info(f"[asr] plugin init: model={self._asr_model}, vad={self._vad_backend}, threshold={self._vad_threshold}, "
                  f"silence_ms={self._vad_silence_ms}, pre_roll_ms={self._vad_pre_roll_ms}, "
-                 f"kws_enabled={self._kws_cfg.get('enabled', False)}")
+                 f"kws_enabled={self._kws_cfg.get('enabled', False)}, adapter=lazy")
 
     def get_tools(self) -> list:
         return TOOLS
 
-    def _load_model_async(self, model_name: str):
-        """Download and load ASR model in a background thread."""
-        import threading
-        def _do_load():
-            try:
-                log.info(f"[asr] downloading/loading model '{model_name}'...")
-                self._plugin_cfg['asr_model'] = model_name
-                adapter = _build_asr_adapter(self._plugin_cfg)
-                self._adapter = adapter
-                self._loading = False
-                self._load_error = None
-                log.info(f"[asr] model '{model_name}' ready")
-            except Exception as e:
-                log.error(f"[asr] failed to load model '{model_name}': {e}", exc_info=True)
-                self._loading = False
-                self._load_error = str(e)
+    def _ensure_adapter(self) -> Optional[ASRAdapter]:
+        """Load the configured ASR runtime once, on the first valid start."""
+        if self._adapter is not None:
+            return self._adapter
 
-        self._loading = True
-        self._load_error = None
-        threading.Thread(target=_do_load, daemon=True, name="asr_model_loader").start()
+        with self._adapter_lock:
+            if self._adapter is not None:
+                return self._adapter
+            try:
+                log.info(f"[asr] loading model '{self._asr_model}' on first start...")
+                adapter = _build_asr_adapter(self._plugin_cfg)
+            except Exception as e:
+                self._load_error = str(e)
+                log.error(
+                    f"[asr] failed to load model '{self._asr_model}': {e}",
+                    exc_info=True,
+                )
+                raise
+
+            self._adapter = adapter
+            self._load_error = None
+            log.info(f"[asr] model '{self._asr_model}' ready")
+            return adapter
+
+    def _dispose_node(self, key: str) -> dict:
+        """Stop and fully destroy one ROS node so its endpoints do not leak."""
+        node = self._nodes.pop(key, None)
+        if node is None:
+            return {"state": "idle"}
+
+        try:
+            result = node.stop()
+        finally:
+            try:
+                self._executor.remove_node(node)
+            except Exception as error:
+                log.warning(f"[asr] failed to remove ROS node '{key}': {error}")
+            try:
+                node.destroy_node()
+            except Exception as error:
+                log.warning(f"[asr] failed to destroy ROS node '{key}': {error}")
+        return result
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name == "asr" else name
         instance_id = args.get("instance_id", "")
 
         if action == "info":
-            # Report loading/error state at plugin level
-            if self._loading:
-                return {
-                    "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
-                    "state": "loading",
-                    "desc": f"Downloading model '{self._asr_model}'...",
-                }
             if self._load_error:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
@@ -1226,15 +1212,6 @@ class ASRPlugin:
             }
 
         elif action == "start":
-            if self._loading:
-                # Wait for model to finish loading
-                import time as _time
-                while self._loading:
-                    _time.sleep(0.5)
-            if self._load_error:
-                return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
-            if not self._adapter:
-                return {"state": "error", "message": "ASR model not loaded"}
             input_topic = args.get("input_topic")
             # Also accept input_topics list (sent by canvas when multiple connections exist)
             if not input_topic:
@@ -1243,21 +1220,31 @@ class ASRPlugin:
                     input_topic = topics_list[0]
             if not input_topic:
                 raise ValueError("input_topic is required")
+            try:
+                adapter = self._ensure_adapter()
+            except Exception as e:
+                return {"state": "error", "message": f"Model failed to load: {e}"}
+            if not adapter:
+                return {"state": "error", "message": "ASR model not loaded"}
             node_key = instance_id or input_topic
             if node_key not in self._nodes:
-                node = _ASRNode(input_topic, self._adapter, self._language,
+                node = _ASRNode(input_topic, adapter, self._language,
                                 self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                                 kws_cfg=self._kws_cfg,
                                 node_suffix=node_key.replace('/', '_').replace('-', '_'),
                                 save_vad_segments=self._save_vad_segments,
                                 max_saved_segments=self._max_saved_segments,
                                 vad_pre_roll_ms=self._vad_pre_roll_ms)
-                self._executor.add_node(node)
+                try:
+                    self._executor.add_node(node)
+                except Exception:
+                    node.destroy_node()
+                    raise
                 self._nodes[node_key] = node
             else:
                 # Sync latest config into existing node before restart
                 node = self._nodes[node_key]
-                node._adapter = self._adapter
+                node._adapter = adapter
                 node._language = self._language
                 node._vad_backend = self._vad_backend
                 node._vad_threshold = self._vad_threshold
@@ -1266,23 +1253,19 @@ class ASRPlugin:
                 node._kws_cfg = self._kws_cfg
                 node._save_vad_segments = self._save_vad_segments
                 node._max_saved_segments = self._max_saved_segments
-            return self._nodes[node_key].start()
+            result = self._nodes[node_key].start()
+            if result.get("state") == "error":
+                self._dispose_node(node_key)
+            return result
 
         elif action == "stop":
             if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                result = node.stop()
-                self._executor.remove_node(node)
-                del self._nodes[instance_id]
-                return result
+                return self._dispose_node(instance_id)
             elif not instance_id and self._nodes:
                 # Stop all instances (backward compat / project stop)
                 results = []
                 for key in list(self._nodes.keys()):
-                    node = self._nodes[key]
-                    node.stop()
-                    self._executor.remove_node(node)
-                    del self._nodes[key]
+                    self._dispose_node(key)
                     results.append(key)
                 return {"state": "idle", "stopped_instances": results}
             return {"state": "idle"}
@@ -1311,18 +1294,27 @@ class ASRPlugin:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:
                 self._max_saved_segments = int(cfg['max_saved_segments'])
-            # ASR model switch — load in background if changed
-            if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
+            adapter_keys = ('asr_model', 'model_dir', 'hw_provider', 'num_threads')
+            adapter_changed = any(
+                key in cfg and cfg[key] != self._plugin_cfg.get(key)
+                for key in adapter_keys
+            )
+            if adapter_changed:
                 # Stop all running nodes first
                 for key in list(self._nodes.keys()):
-                    node = self._nodes.pop(key, None)
-                    if node:
-                        node.stop()
-                        self._executor.remove_node(node)
-                self._asr_model = cfg['asr_model']
-                self._load_model_async(self._asr_model)
-                return {"status": "loading", "asr_model": self._asr_model,
-                        "message": f"Switching to model '{self._asr_model}', downloading..."}
+                    self._dispose_node(key)
+                for key in adapter_keys:
+                    if key in cfg:
+                        self._plugin_cfg[key] = cfg[key]
+                self._asr_model = self._plugin_cfg.get('asr_model', self._asr_model)
+                with self._adapter_lock:
+                    self._adapter = None
+                    self._load_error = None
+                return {
+                    "status": "configured",
+                    "asr_model": self._asr_model,
+                    "message": "Model will load on next start",
+                }
             # Hot-reload: stop running nodes, apply new config, restart automatically
             was_running = [(key, node) for key, node in self._nodes.items() if node.state == "running"]
             for key, node in was_running:

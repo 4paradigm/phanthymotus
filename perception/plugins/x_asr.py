@@ -80,12 +80,6 @@ class XASRAdapter:
         hw_provider: str = "cpu",
         num_threads: int = 2,
     ):
-        from utils.model_downloader import ensure_model
-
-        ensure_model("asr_x_asr", model_dir)
-
-        import sherpa_onnx
-
         root = Path(model_dir)
         encoder = root / "encoder-epoch-99-avg-1.int8.onnx"
         decoder = root / "decoder-epoch-99-avg-1.onnx"
@@ -108,6 +102,8 @@ class XASRAdapter:
             raise FileNotFoundError(
                 f"X-ASR model bundle is incomplete at {root}: {', '.join(missing)}"
             )
+
+        import sherpa_onnx
 
         encoded_hotwords = _prepare_hotwords_file(hotwords)
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(

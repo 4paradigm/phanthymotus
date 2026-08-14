@@ -1,6 +1,4 @@
-"""
-utils/model_downloader.py — Auto-download sherpa-onnx models from COS if missing.
-"""
+"""Download and verify deployment model artifacts when they are missing."""
 
 from __future__ import annotations
 
@@ -17,15 +15,22 @@ from urllib.request import urlopen, urlretrieve
 log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
-# Artifact: sherpa-onnx-x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03.
-# Source: https://github.com/Gilgamesh-J/X-ASR (Apache-2.0).
-# The internal mirror below is pinned by byte size and SHA256 for image builds.
 X_ASR_BASE = os.environ.get(
     "ASR_X_ASR_MODEL_BASE_URL",
-    "http://172.28.4.81:34567/zengzhitao/embodied-ai/x_asr_punct_int8_robot343_20260814",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    "x-asr-zh-en-punct-int8-robot/resolve/"
+    "e111bb210b1aad07c6a16b75adb61b80ee841990",
 )
 
 X_ASR_FILES = {
+    "LICENSE": {
+        "size": 11358,
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    },
+    "README.md": {
+        "size": 1965,
+        "sha256": "2aa4393f1af6f823eec58fbf5225ff86209595c04edba05aadab7d474cdebbac",
+    },
     "encoder-epoch-99-avg-1.int8.onnx": {
         "size": 161015713,
         "sha256": "7f6aa62056efd8af9da13e0faa81cd3f284d2fb2e3b63de56fd2dfd3450910dc",
@@ -127,7 +132,7 @@ MODELS = {
 
 
 def ensure_model(name: str, model_dir: str) -> None:
-    """Ensure model files exist in model_dir. Download from COS if missing."""
+    """Ensure model files exist in model_dir, downloading them if needed."""
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
@@ -188,12 +193,16 @@ def ensure_model(name: str, model_dir: str) -> None:
 
 
 def _bundle_exists(model_dir: str, files: dict) -> bool:
-    """Accept complete non-empty local bundles, including user-supplied weights."""
-    return all(
-        os.path.isfile(os.path.join(model_dir, filename))
-        and os.path.getsize(os.path.join(model_dir, filename)) > 0
-        for filename in files
-    )
+    """Return whether every bundle file matches its pinned size and SHA256."""
+    try:
+        for filename, metadata in files.items():
+            path = os.path.join(model_dir, filename)
+            if not os.path.isfile(path):
+                return False
+            _verify_download(path, metadata)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _verify_download(path: str, metadata: dict) -> None:
