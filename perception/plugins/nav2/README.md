@@ -38,14 +38,16 @@ FAST-LIVO2 card
 
 | port | topic | type / QoS | 必要条件 |
 | --- | --- | --- | --- |
-| `livo_odom` | `/ubuntu/navigation/odom` | `nav_msgs/msg/Odometry`; `BEST_EFFORT + KEEP_LAST(5)` | `header.frame_id=map`，`child_frame_id=base_link`，ROS system time，最大 age 500 ms |
-| `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，已运动去畸变，ROS system time，最大 age 500 ms |
+| `livo_odom` | `/ubuntu/navigation/odom` | `nav_msgs/msg/Odometry`; `BEST_EFFORT + KEEP_LAST(5)` | `header.frame_id=map`，`child_frame_id=base_link`，ROS system time，接收 age 最大 500 ms |
+| `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，已运动去畸变，ROS system time，接收 age 最大 500 ms |
 | `obstacle_map` | `/ubuntu/navigation/obstacle_map` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，累计点云排除地板/天花板后投影到 `z=0` |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.goal.v1`，`map` frame，每条唯一 `goal_id` |
 
 Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIVO2 还在
 直接发布 `camera_init` / `aft_mapped` frame 时，Nav2 会返回
 `fast_livo2_odom_frame_invalid` 或 `registered_cloud_frame_invalid`，而不会启动导航。
+接收 freshness 仍严格按 500 ms 判定；source stamp 额外允许 50 ms 有界调度抖动，
+因此约 0.51 s 的处理边界帧不会被误拒，大于 0.55 s 仍 fail closed。
 
 `goal_pose` 最小样例：
 
@@ -107,7 +109,7 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 | action | 参数 | 语义 |
 | --- | --- | --- |
 | `config` | X/Y/yaw 的最小/最大速度绝对值 | 卡片停止时配置，下次 `start` 生效 |
-| `navigate_to_pose` | `x`、`y`、`yaw`、`speed?` | 在 `map` frame 中非阻塞创建导航任务 |
+| `navigate_to_pose` | `x`、`y`、`yaw`、`speed?` | 先校验全局代价地图目标格，通过后在 `map` frame 中非阻塞创建导航任务 |
 | `wait_navigation_done` | `stall_timeout?` | 等待到达、取消、超时或错误 |
 | `pause_nav` | 无 | 暂停当前导航 |
 | `resume_nav` | 无 | 恢复已暂停导航 |
@@ -124,10 +126,24 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 ## 规划与控制
 
 - NavFn 生成全局路径。
+- planner bridge 在创建 Nav2 action 前读取最新
+  `/global_costmap/costmap` 目标格。代价 `>=99`（inscribed/lethal）直接返回
+  `goal_in_collision`；地图缺失/过期、目标在当前 rolling window 外或未知格都有
+  独立错误，不再进入长时间恢复流程。成功回执包含 `goal_cell`。
 - global/local costmap 都是 rolling window。global costmap 使用累计、去地面、
   去天花板并投影到二维的 `/ubuntu/navigation/obstacle_map`，避免已观察障碍
   因当前视角遮挡而消失；local costmap 继续使用实时
   `/ubuntu/navigation/cloud_registered`，高度带为 `-1.25…+0.30 m`。
+- local 实时点云以 `base_link` 为 sensor origin 开启 raytrace clearing，
+  不再把短时障碍轨迹永久留在局部窗口。global 输入本身是累计快照，
+  继续 `clearing=false`，避免从错误的 map 原点向全图做射线清除。
+  global 累计点的 range 也不再以 map 原点限制为 8 m，否则机器人走远后
+  当前 rolling window 内的真实障碍会被误删。
+- 两张 costmap 保留 `inflation_radius=0.55 m`。G1 矩形 footprint 的外接半径
+  约 `0.425 m`，该配置实际额外余量约 `0.125 m`，不是这次过度占用的首要根因。
+  heartbeat/status 的 `global_costmap` 字段现在分别给出 inflated、inscribed、
+  lethal 数量及比例，用于独立评估累计障碍图是否过度占用，不通过
+  缩小安全边界掩盖问题。
 - Rotation Shim 在航向偏差大时先旋转；当前 DWB 仍只采样 `x/yaw`，
   proposal 出口把弧线速度离散成“只转”或“只走”，并对 X/Y/yaw
   三轴应用卡片配置的最小/最大绝对值。Y 默认上限为零。

@@ -45,6 +45,8 @@ Driver navigation_sensors
 
 这两路输入来自既有 Driver `navigation_sensors` sensor cards。缺失、过期或
 frame 不符时 companion 不发布伪造的 canonical odom/cloud。
+adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms 有界
+调度抖动；约 0.51 s 的边界帧可接受，超过 0.55 s 仍拒绝。
 
 ## 输出
 
@@ -85,6 +87,10 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter �
 
 `map_name` 只允许 `A-Z a-z 0-9 _ . -`，最长 64 字符。停止 Canvas 时若仍在
 建图，卡片会先执行 `stop_mapping` 再释放 ROS backend。
+FAST-LIVO2 在受控 `SIGINT` 收口期间可因上游 C++ 析构路径返回
+`-SIGABRT (-6)`。supervisor 仅在自己已发出停止信号的路径将 `0/-SIGINT/-SIGABRT`
+视为受控停止，并在回执保留原始 `algorithm_return_code`；运行中自行 `-6`
+或其他退出码仍按 `algorithm_exited/algorithm_stop_failed` fail closed。
 
 重定位的操作顺序为：
 

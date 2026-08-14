@@ -13,6 +13,7 @@ def evaluate_readiness(
     *,
     now_monotonic: float,
     max_age_sec: float,
+    source_age_tolerance_sec: float = 0.0,
     odom_received_at: float | None,
     odom_source_age_sec: float | None,
     odom_frame_ready: bool,
@@ -34,7 +35,9 @@ def evaluate_readiness(
         runtime_blockers.append("fast_livo2_odom_stale")
     if (
         odom_source_age_sec is None
-        or not -0.1 <= odom_source_age_sec <= max_age_sec
+        or not -0.1
+        <= odom_source_age_sec
+        <= max_age_sec + source_age_tolerance_sec
     ):
         runtime_blockers.append("odom_source_stamp_stale")
     if not odom_frame_ready:
@@ -43,7 +46,9 @@ def evaluate_readiness(
         runtime_blockers.append("registered_cloud_stale")
     if (
         obstacle_source_age_sec is None
-        or not -0.1 <= obstacle_source_age_sec <= max_age_sec
+        or not -0.1
+        <= obstacle_source_age_sec
+        <= max_age_sec + source_age_tolerance_sec
     ):
         runtime_blockers.append("registered_cloud_source_stamp_stale")
     if not obstacle_frame_ready:

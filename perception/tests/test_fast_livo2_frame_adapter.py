@@ -31,12 +31,36 @@ from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     iter_xyz_points,
     quaternion_from_rpy,
     read_pcd_xyz,
+    source_age_is_valid,
     transform_points,
     yaw_from_quaternion,
 )
+from g1_fast_livo2.runtime_core import controlled_stop_succeeded  # noqa: E402
 
 
 class FastLivo2FrameAdapterTest(unittest.TestCase):
+    def test_controlled_stop_and_source_age_jitter_are_bounded(self) -> None:
+        self.assertTrue(controlled_stop_succeeded(0))
+        self.assertTrue(controlled_stop_succeeded(-2))
+        self.assertTrue(controlled_stop_succeeded(-6))
+        self.assertFalse(controlled_stop_succeeded(1))
+        self.assertFalse(controlled_stop_succeeded(-9))
+
+        self.assertTrue(
+            source_age_is_valid(
+                0.51,
+                max_age_sec=0.5,
+                tolerance_sec=0.05,
+            )
+        )
+        self.assertFalse(
+            source_age_is_valid(
+                0.551,
+                max_age_sec=0.5,
+                tolerance_sec=0.05,
+            )
+        )
+
     def test_sensor_pose_is_converted_to_base_pose(self) -> None:
         base_to_sensor = Pose3(0.0, 0.0, 0.46, Quaternion(0.0, 0.0, 0.0, 1.0))
         map_to_sensor = Pose3(1.0, 2.0, 0.46, Quaternion(0.0, 0.0, 0.0, 1.0))
