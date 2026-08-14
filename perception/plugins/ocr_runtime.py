@@ -441,6 +441,35 @@ class _TensorRTModelSession:
     def optimization_shape(self) -> tuple[int, ...]:
         return self._profiles[0][1]
 
+    def fit_input_image_shape(
+        self, height: int, width: int
+    ) -> tuple[int, int]:
+        """Return the smallest profile-compatible HWC canvas for an image."""
+        height = int(height)
+        width = int(width)
+        if height <= 0 or width <= 0:
+            raise ValueError("OCR TensorRT image dimensions must be positive")
+
+        candidates = []
+        for minimum, _optimum, maximum in self._profiles:
+            if (
+                len(minimum) == 4
+                and minimum[0] <= 1 <= maximum[0]
+                and minimum[1] <= 3 <= maximum[1]
+            ):
+                candidate = (
+                    max(height, minimum[2]), max(width, minimum[3])
+                )
+                if candidate[0] <= maximum[2] and candidate[1] <= maximum[3]:
+                    candidates.append(candidate)
+
+        if candidates:
+            return min(candidates, key=lambda shape: shape[0] * shape[1])
+
+        # Reuse the standard diagnostic, including all supported ranges.
+        self._select_profile((1, 3, height, width))
+        raise AssertionError("unreachable")
+
     def _select_profile(self, shape: tuple[int, ...]) -> int:
         candidates = []
         for index, (minimum, _optimum, maximum) in enumerate(self._profiles):
@@ -611,24 +640,88 @@ class _TensorRTPipeline:
 
     def _detector_input(self, image):
         import cv2
+        import numpy as np
 
         height, width = image.shape[:2]
         scale = min(1.0, self._max_side_len / max(height, width))
         target_height = self._multiple_of_32(height * scale)
         target_width = self._multiple_of_32(width * scale)
-        if (target_width, target_height) == (width, height):
-            return image
-        return cv2.resize(
-            image,
-            (target_width, target_height),
-            interpolation=cv2.INTER_AREA,
+        canvas_height, canvas_width = self._det.fit_input_image_shape(
+            target_height, target_width
+        )
+
+        # Uniformly enlarge small images until one canvas edge is filled, then
+        # pad the remaining edge. This preserves aspect ratio while satisfying
+        # TensorRT profiles whose minimum dimensions exceed the camera frame.
+        fit_scale = min(
+            canvas_height / target_height,
+            canvas_width / target_width,
+        )
+        content_height = min(
+            canvas_height,
+            max(target_height, int(round(target_height * fit_scale))),
+        )
+        content_width = min(
+            canvas_width,
+            max(target_width, int(round(target_width * fit_scale))),
+        )
+
+        if (content_width, content_height) == (width, height):
+            resized = image
+        else:
+            shrinking = content_height <= height and content_width <= width
+            resized = cv2.resize(
+                image,
+                (content_width, content_height),
+                interpolation=(
+                    cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+                ),
+            )
+
+        if (content_height, content_width) == (
+            canvas_height,
+            canvas_width,
+        ):
+            return resized, (content_height, content_width)
+
+        padded = np.full(
+            (canvas_height, canvas_width, 3), 128, dtype=np.uint8
+        )
+        padded[:content_height, :content_width] = resized
+        return padded, (content_height, content_width)
+
+    @staticmethod
+    def _crop_detector_prediction(
+        prediction, input_shape, content_shape
+    ):
+        if input_shape == content_shape:
+            return prediction
+
+        import numpy as np
+
+        input_height, input_width = input_shape
+        content_height, content_width = content_shape
+        output_height, output_width = prediction.shape[-2:]
+        crop_height = min(
+            output_height,
+            max(1, int(round(output_height * content_height / input_height))),
+        )
+        crop_width = min(
+            output_width,
+            max(1, int(round(output_width * content_width / input_width))),
+        )
+        return np.ascontiguousarray(
+            prediction[..., :crop_height, :crop_width]
         )
 
     def _run_detector(self, image):
-        detector_input = self._detector_input(image)
+        detector_input, content_shape = self._detector_input(image)
         height, width = detector_input.shape[:2]
         prediction = self._det.run_uint8(
             detector_input, (1, 3, height, width)
+        )
+        prediction = self._crop_detector_prediction(
+            prediction, (height, width), content_shape
         )
         return prediction, image.shape[:2]
 
