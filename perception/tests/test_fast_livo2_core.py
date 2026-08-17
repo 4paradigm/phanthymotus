@@ -9,7 +9,7 @@ from pathlib import Path
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
-from plugins.fast_livo2.core import (  # noqa: E402
+from plugins.navigation.mapping.core import (  # noqa: E402
     FastLivo2BackendError,
     FastLivo2Core,
 )

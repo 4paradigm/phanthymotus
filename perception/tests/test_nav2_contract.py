@@ -9,7 +9,7 @@ from pathlib import Path
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
-from plugins.nav2.contract import (  # noqa: E402
+from plugins.navigation.planning.contract import (  # noqa: E402
     NAV2_ACTIONS,
     NAV2_FULL_CONFIG_SCHEMA,
     NAV2_LIFECYCLE_ACTIONS,
@@ -85,8 +85,8 @@ class Nav2ContractTest(unittest.TestCase):
         companion_root = (
             PERCEPTION_ROOT
             / "plugins"
-            / "nav2"
-            / "companion"
+            / "navigation"
+            / "runtime"
             / "g1_nav2"
         )
         launch = (companion_root / "launch" / "g1_nav2.launch.py").read_text(
@@ -98,20 +98,24 @@ class Nav2ContractTest(unittest.TestCase):
         package_xml = (companion_root / "package.xml").read_text(
             encoding="utf-8"
         )
-        companion_dir = companion_root.parent
-        dockerfile = (companion_dir / "Dockerfile").read_text(encoding="utf-8")
-        compose = (companion_dir / "compose.yml").read_text(encoding="utf-8")
-        source_lock = (companion_dir / "source-lock.env").read_text(
+        runtime_dir = companion_root.parent
+        dockerfile = (PERCEPTION_ROOT / "Dockerfile.navigation").read_text(
+            encoding="utf-8"
+        )
+        service = (PERCEPTION_ROOT / "deploy" / "service.yml").read_text(
+            encoding="utf-8"
+        )
+        source_lock = (runtime_dir / "nav2-source-lock.env").read_text(
             encoding="utf-8"
         )
         goal_schema = json.loads(
-            (companion_dir / "protocol" / "goal-v1.schema.json").read_text(
+            (runtime_dir / "protocol" / "goal-v1.schema.json").read_text(
                 encoding="utf-8"
             )
         )
         proposal_schema = json.loads(
             (
-                companion_dir
+                runtime_dir
                 / "protocol"
                 / "velocity-proposal-v1.schema.json"
             ).read_text(encoding="utf-8")
@@ -122,7 +126,7 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertIn("from sensor_msgs.msg import PointCloud2", planner_bridge)
         self.assertNotIn("slam_toolbox", package_xml)
         self.assertNotIn("python3-numpy", dockerfile)
-        self.assertNotIn("PYTHON_NUMPY_VERSION", compose)
+        self.assertNotIn("PYTHON_NUMPY_VERSION", service)
         self.assertNotIn("PYTHON_NUMPY_VERSION", source_lock)
         self.assertEqual(goal_schema["properties"]["speed"]["maximum"], 1.0)
         self.assertEqual(goal_schema["properties"]["speed"]["minimum"], 0.30)
@@ -197,7 +201,7 @@ class Nav2ContractTest(unittest.TestCase):
         script = (
             PERCEPTION_ROOT
             / "plugins"
-            / "nav2"
+            / "navigation"
             / "deploy"
             / "scripts"
             / "owner-start-g1-test-containers.sh"
@@ -205,9 +209,11 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("CORE_ACCESS_TOKEN", script)
         self.assertNotIn("/api/config/project-running", script)
         self.assertNotIn("require_canvas_stopped", script)
-        self.assertIn("require_test_owned", script)
+        self.assertIn('OWNER_LABEL="com.phanthymotus.test-owner"', script)
         self.assertIn("require_port_free 15720", script)
         self.assertIn("require_port_free 15721", script)
+        self.assertNotIn("FAST_LIVO2_CONTAINER", script)
+        self.assertNotIn("NAV2_CONTAINER", script)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@ from pathlib import Path
 
 
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_ROOT = PERCEPTION_ROOT / "plugins" / "nav2" / "companion" / "g1_nav2"
+PACKAGE_ROOT = (
+    PERCEPTION_ROOT / "plugins" / "navigation" / "runtime" / "g1_nav2"
+)
 
 
 class Nav2RvizConfigTest(unittest.TestCase):

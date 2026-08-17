@@ -18,9 +18,9 @@ PERCEPTION_DIR = Path(__file__).resolve().parents[1]
 if str(PERCEPTION_DIR) not in sys.path:
     sys.path.insert(0, str(PERCEPTION_DIR))
 
-from plugins.vln.manifest import MANIFEST  # noqa: E402
-from plugins.vln.plugin import VisionAndLanguageNavigationPlugin  # noqa: E402
-from plugins.vln.ros import (  # noqa: E402
+from plugins.navigation.semantic.manifest import MANIFEST  # noqa: E402
+from plugins.navigation.semantic.plugin import VisionAndLanguageNavigationPlugin  # noqa: E402
+from plugins.navigation.semantic.ros import (  # noqa: E402
     MapSessionChangedError,
     Pose,
     RosBridge,
@@ -29,7 +29,7 @@ from plugins.vln.ros import (  # noqa: E402
     _PoseSample,
     pose_from_odometry,
 )
-from plugins.vln.vlm import Client, _parse_json, validate_configuration  # noqa: E402
+from plugins.navigation.semantic.vlm import Client, _parse_json, validate_configuration  # noqa: E402
 from utils.security import REDACTED, redact_sensitive  # noqa: E402
 
 
@@ -159,7 +159,7 @@ class FakeBridgeFactory:
         return bridge
 
 
-def _plugin(client, factory, **config):
+def _plugin(client, factory, *, goal_handler=None, **config):
     cfg = {
         "sensor_timeout_sec": 0.1,
         "subscriber_timeout_sec": 0.1,
@@ -171,6 +171,7 @@ def _plugin(client, factory, **config):
         executor=object(),
         client=client,
         bridge_factory=factory,
+        goal_handler=goal_handler,
     )
 
 
@@ -589,6 +590,38 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual((goal["x"], goal["y"], goal["yaw"]), (1.25, -0.5, 0.75))
         self.assertEqual(goal["speed"], 0.5)
 
+    def test_unified_card_delivers_match_directly_to_planner_with_same_lease(self):
+        client = FakeClient(
+            [
+                {"scene": "办公室", "objects": ["白板"], "description": "白板办公室"},
+                {"point_id": "vln_point_0001", "confidence": 0.91, "reason": "匹配"},
+            ]
+        )
+        factory = FakeBridgeFactory(subscribers=0)
+        calls = []
+
+        def handle(goal, *, control_nav_id=None):
+            calls.append((dict(goal), control_nav_id))
+            return {"status": "navigating", "nav_id": control_nav_id}
+
+        plugin = _plugin(client, factory, goal_handler=handle, navigation_speed=0.5)
+        plugin.dispatch("vln", {"action": "capture"})
+        result = plugin.dispatch(
+            "vln",
+            {
+                "action": "navigate",
+                "query": "去白板办公室",
+                "_control_nav_id": "lease-unified-1",
+            },
+        )
+
+        self.assertTrue(result["navigation_requested"])
+        self.assertFalse(result["goal_published"])
+        self.assertEqual(result["goal_delivery"], "in_process_planner")
+        self.assertEqual(calls[0][1], "lease-unified-1")
+        self.assertEqual(calls[0][0]["speed"], 0.5)
+        self.assertEqual(factory.instances[0].published, [])
+
     def test_no_subscriber_still_publishes_and_reports_delivery_warning(self):
         client = FakeClient(
             [
@@ -857,7 +890,7 @@ class PureHelperTests(unittest.TestCase):
             io.BytesIO(secret.encode()),
         )
         with mock.patch(
-            "plugins.vln.vlm.urlopen",
+            "plugins.navigation.semantic.vlm.urlopen",
             side_effect=upstream_error,
         ):
             with self.assertRaises(RuntimeError) as raised:

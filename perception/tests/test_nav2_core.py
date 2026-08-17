@@ -8,7 +8,7 @@ from pathlib import Path
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
-from plugins.nav2.core import Nav2Core  # noqa: E402
+from plugins.navigation.planning.core import Nav2Core  # noqa: E402
 
 
 class FakeBackend:

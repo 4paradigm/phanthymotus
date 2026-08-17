@@ -10,8 +10,8 @@ from pathlib import Path
 PACKAGE_ROOT = (
     Path(__file__).resolve().parents[1]
     / "plugins"
-    / "nav2"
-    / "companion"
+    / "navigation"
+    / "runtime"
     / "g1_nav2"
 )
 sys.path.insert(0, str(PACKAGE_ROOT))
@@ -441,9 +441,12 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             encoding="utf-8"
         )
         package = (PACKAGE_ROOT / "package.xml").read_text(encoding="utf-8")
-        companion = PACKAGE_ROOT.parent
-        dockerfile = (companion / "Dockerfile").read_text(encoding="utf-8")
-        compose = (companion / "compose.yml").read_text(encoding="utf-8")
+        dockerfile = (
+            Path(__file__).resolve().parents[1] / "Dockerfile.navigation"
+        ).read_text(encoding="utf-8")
+        service = (
+            Path(__file__).resolve().parents[1] / "deploy" / "service.yml"
+        ).read_text(encoding="utf-8")
 
         self.assertIn(
             "planner_command_bridge = g1_nav2.planner_command_node:main", setup
@@ -466,8 +469,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertNotIn("pointcloud_to_laserscan", package)
         self.assertNotIn("slam_toolbox", dockerfile)
         self.assertNotIn("pointcloud_to_laserscan", dockerfile)
-        self.assertNotIn("/maps", compose)
-        self.assertNotIn("NAV2_MODE", compose)
+        self.assertNotIn("NAV2_MODE", service)
+        self.assertNotIn("container_name: embodied-perception-nav2", service)
 
     def test_costmaps_consume_live_and_accumulated_fast_livo2_obstacles(self) -> None:
         params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(

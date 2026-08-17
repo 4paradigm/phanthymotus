@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 import unittest
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
-from plugins.fast_livo2.contract import (  # noqa: E402
+from plugins.navigation.mapping.contract import (  # noqa: E402
     FAST_LIVO2_ACTIONS,
     FAST_LIVO2_LIFECYCLE_ACTIONS,
     fast_livo2_tool_definition,
@@ -74,18 +75,20 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("start_recording", actions)
         self.assertNotIn("stop_recording", actions)
 
-    def test_companion_is_locked_and_navigation_compose_owns_the_service(self) -> None:
-        companion = PERCEPTION_ROOT / "plugins" / "fast_livo2" / "companion"
-        source_lock = (companion / "source-lock.env").read_text(encoding="utf-8")
-        dockerfile = (companion / "Dockerfile").read_text(encoding="utf-8")
-        compose = (companion / "compose.yml").read_text(encoding="utf-8")
-        build_script = (companion / "build-companion.sh").read_text(
+    def test_runtime_is_locked_inside_the_single_perception_image(self) -> None:
+        runtime = PERCEPTION_ROOT / "plugins" / "navigation" / "runtime"
+        source_lock = (runtime / "fast_livo2-source-lock.env").read_text(
+            encoding="utf-8"
+        )
+        dockerfile = (PERCEPTION_ROOT / "Dockerfile.navigation").read_text(
             encoding="utf-8"
         )
         service = (PERCEPTION_ROOT / "deploy" / "service.yml").read_text(
             encoding="utf-8"
         )
         main = (PERCEPTION_ROOT / "main.py").read_text(encoding="utf-8")
+        runtime_patch = runtime / "patches" / "fast-livo2-runtime.patch"
+        pcd_patch = runtime / "patches" / "fast-livo2-pcd-save.patch"
 
         self.assertIn(
             "FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea",
@@ -106,6 +109,29 @@ class FastLivo2ContractTest(unittest.TestCase):
             "APT_ROS_MIRROR=mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu",
             source_lock,
         )
+        self.assertIn("ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/", source_lock)
+        for variable in (
+            "FAST_LIVO2_REPO",
+            "FAST_LIVO2_COMMIT",
+            "RPG_VIKIT_REPO",
+            "RPG_VIKIT_COMMIT",
+            "LIVOX_ROS_DRIVER2_REPO",
+            "LIVOX_ROS_DRIVER2_COMMIT",
+            "LIVOX_SDK2_REPO",
+            "LIVOX_SDK2_COMMIT",
+            "SOPHUS_REPO",
+            "SOPHUS_COMMIT",
+        ):
+            self.assertIn(f"{variable}=", source_lock)
+            self.assertIn(f"${{{variable}}}", dockerfile)
+        self.assertEqual(
+            hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
+            "534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b",
+        )
+        self.assertEqual(
+            hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
+            "b3afa3e64b5743898c829fe34891f828027eb372324d05a8c94357f9cacd6ec4",
+        )
         self.assertIn("/etc/apt/sources.list.d/*.list", dockerfile)
         self.assertIn("/etc/apt/sources.list.d/*.sources", dockerfile)
         self.assertIn("ports\\.ubuntu\\.com/ubuntu-ports", dockerfile)
@@ -116,20 +142,30 @@ class FastLivo2ContractTest(unittest.TestCase):
             "APT source-package entries remain after binary-only rewrite",
             dockerfile,
         )
-        self.assertIn("APT_UBUNTU_MIRROR:", compose)
-        self.assertIn("APT_ROS_MIRROR:", compose)
         self.assertIn("GPL-2.0-only AND GPL-3.0-only", dockerfile)
-        self.assertIn("org.opencontainers.image.revision", build_script)
-        self.assertIn("org.opencontainers.image.fast-livo2-runtime-patch", build_script)
-        self.assertIn("org.opencontainers.image.fast-livo2-pcd-save-patch", build_script)
-        self.assertIn('"${actual_arch}" == "arm64"', build_script)
-        self.assertNotIn("FAST_LIVO2_BASE_IMAGE_ID", build_script)
-        self.assertIn("fast_livo2:", service)
+        self.assertIn("FROM ${ROS_BASE_IMAGE}", dockerfile)
+        self.assertNotIn("FAST_LIVO2_BASE_IMAGE", dockerfile)
+        self.assertIn("git fetch --depth 1 origin", dockerfile)
+        self.assertIn("git apply --check /tmp/fast-livo2-runtime.patch", dockerfile)
+        self.assertIn("git apply --check /tmp/fast-livo2-pcd-save.patch", dockerfile)
+        self.assertIn("--packages-select livox_ros_driver2 vikit_common vikit_ros", dockerfile)
+        self.assertIn("--packages-select fast_livo", dockerfile)
+        self.assertIn("PCD finalization completed", dockerfile)
+        self.assertIn("g1_fast_livo2", dockerfile)
+        self.assertIn("g1_nav2", dockerfile)
+        self.assertNotIn("container_name: embodied-perception-fast-livo2", service)
+        self.assertNotIn("container_name: embodied-perception-nav2", service)
+        self.assertEqual(service.count("container_name:"), 1)
         self.assertIn("/opt/phanthy-motus/data/fast_livo2/maps", service)
         self.assertIn(
             "/opt/phanthy-motus/data/fast_livo2/recordings", service
         )
         self.assertIn("ros-humble-rosbag2-storage-mcap", dockerfile)
+        self.assertIn("> /opt/g1-nav2-package-lock.txt", dockerfile)
+        self.assertIn(
+            'test "$(wc -l < /opt/g1-nav2-package-lock.txt)" -eq 5',
+            dockerfile,
+        )
         self.assertIn('full_name == p.PREFIX', main)
         self.assertIn('qualified_prefix = f"{p.PREFIX}_"', main)
 
@@ -146,18 +182,18 @@ class FastLivo2ContractTest(unittest.TestCase):
             ["initial_x", "initial_y", "initial_z", "initial_yaw"],
         )
 
-        companion_package = (
+        runtime_package = (
             PERCEPTION_ROOT
             / "plugins"
-            / "fast_livo2"
-            / "companion"
+            / "navigation"
+            / "runtime"
             / "g1_fast_livo2"
             / "g1_fast_livo2"
         )
-        supervisor = (companion_package / "runtime_supervisor.py").read_text(
+        supervisor = (runtime_package / "runtime_supervisor.py").read_text(
             encoding="utf-8"
         )
-        adapter = (companion_package / "adapter_node.py").read_text(encoding="utf-8")
+        adapter = (runtime_package / "adapter_node.py").read_text(encoding="utf-8")
         self.assertIn("_MAP_NAME_RE.fullmatch(map_name)", supervisor)
         self.assertIn("self._algorithm_command(save_pcd=False)", supervisor)
         self.assertIn('"/livox/lidar:=/ubuntu/navigation/lidar"', supervisor)
@@ -172,39 +208,34 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn('"obstacle_min_height_m", -1.25', adapter)
         self.assertIn('"obstacle_max_height_m", 0.30', adapter)
 
-        frame_adapter = (companion_package / "frame_adapter_core.py").read_text(
+        frame_adapter = (runtime_package / "frame_adapter_core.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("payload = stream.read()", frame_adapter)
         self.assertIn("stream.seek(payload_offset + point_index * byte_offset)", frame_adapter)
 
-    def test_g1_build_and_start_entrypoint_stays_narrow(self) -> None:
+    def test_g1_deploy_entrypoint_stays_narrow(self) -> None:
         deploy_script = (
             PERCEPTION_ROOT
             / "plugins"
-            / "nav2"
+            / "navigation"
             / "deploy"
             / "scripts"
-            / "build-and-start-g1.sh"
+            / "deploy-g1.sh"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("./deploy/build_perception.sh", deploy_script)
-        self.assertIn('JP_VERSION="${JP_VERSION:-5.11}"', deploy_script)
-        self.assertIn('-jetson-jp${JP_VERSION}', deploy_script)
-        self.assertIn('--jp-version "${JP_VERSION}"', deploy_script)
-        self.assertIn("build-companion.sh", deploy_script)
         self.assertIn(
-            "docker compose --env-file source-lock.env build nav2",
-            deploy_script,
+            "./deploy/build_perception.sh --mirror tuna", deploy_script
         )
+        self.assertNotIn("--variant navigation", deploy_script)
+        self.assertNotIn("build-companion.sh", deploy_script)
+        self.assertNotIn("docker compose", deploy_script)
+        self.assertIn("STAGE=stop", deploy_script)
         self.assertIn("STAGE=preflight", deploy_script)
         self.assertIn("STAGE=start", deploy_script)
         self.assertNotIn('${PERCEPTION_IMAGE:-', deploy_script)
-        self.assertNotIn('${FAST_LIVO2_IMAGE:-', deploy_script)
-        self.assertNotIn('${NAV2_IMAGE:-', deploy_script)
         self.assertNotIn("git pull", deploy_script)
         self.assertNotIn("git reset", deploy_script)
-        self.assertNotIn("STAGE=stop", deploy_script)
 
 
 if __name__ == "__main__":

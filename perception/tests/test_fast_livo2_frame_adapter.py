@@ -14,8 +14,8 @@ from unittest import mock
 PACKAGE_ROOT = (
     Path(__file__).resolve().parents[1]
     / "plugins"
-    / "fast_livo2"
-    / "companion"
+    / "navigation"
+    / "runtime"
     / "g1_fast_livo2"
 )
 sys.path.insert(0, str(PACKAGE_ROOT))

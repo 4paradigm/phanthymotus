@@ -1,11 +1,6 @@
 perception:
   image: __IMAGE__
   container_name: embodied-perception
-  depends_on:
-    fast_livo2:
-      condition: service_started
-    nav2:
-      condition: service_started
   network_mode: host
   ipc: host
   pid: host
@@ -13,83 +8,15 @@ perception:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
-  environment:
-    - ROS_DOMAIN_ID=42
-    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-  logging:
-    driver: local
-    options:
-      max-size: "10m"
-      max-file: "3"
-  restart: unless-stopped
-
-fast_livo2:
-  image: ${FAST_LIVO2_IMAGE:-phanthy-fast-livo2:perception-card-dev}
-  container_name: embodied-perception-fast-livo2
-  network_mode: host
-  ipc: host
-  read_only: true
-  tmpfs:
-    - /tmp:rw,nosuid,nodev,noexec,size=512m
-    - /root/.ros:rw,nosuid,nodev,noexec,size=64m
-  volumes:
     - /opt/phanthy-motus/data/fast_livo2/maps:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
     - /opt/phanthy-motus/data/fast_livo2/recordings:/opt/phanthy-motus/data/fast_livo2/recordings:rw
-  group_add:
-    - "1000"
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-  cap_drop:
-    - ALL
-  security_opt:
-    - no-new-privileges:true
-  logging:
-    driver: local
-    options:
-      max-size: "20m"
-      max-file: "3"
-  restart: unless-stopped
-  command:
-    - /bin/bash
-    - -lc
-    - >-
-      source /opt/ros/humble/setup.bash &&
-      source /opt/fast_livo_ws/install/setup.bash &&
-      source /fast_livo2_card_ws/install/setup.bash &&
-      exec ros2 launch g1_fast_livo2 g1_fast_livo2.launch.py
-
-nav2:
-  image: ${NAV2_IMAGE:-phanthy-nav2:nav2-card-dev}
-  container_name: embodied-perception-nav2
-  depends_on:
-    fast_livo2:
-      condition: service_started
-  network_mode: host
-  read_only: true
-  tmpfs:
-    - /tmp:rw,nosuid,nodev,noexec,size=256m
-    - /root/.ros:rw,nosuid,nodev,noexec,size=64m
-  environment:
-    - ROS_DOMAIN_ID=42
-    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-  cap_drop:
-    - ALL
-  security_opt:
-    - no-new-privileges:true
   logging:
     driver: local
     options:
       max-size: "10m"
       max-file: "3"
   restart: unless-stopped
-  command:
-    - /bin/bash
-    - -lc
-    - >-
-      source /opt/ros/humble/setup.bash &&
-      source /nav2_ws/install/setup.bash &&
-      exec ros2 launch g1_nav2 g1_nav2.launch.py

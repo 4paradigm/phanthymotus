@@ -1,0 +1,65 @@
+diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
+--- a/src/LIVMapper.cpp
++++ b/src/LIVMapper.cpp
+@@ -309,11 +309,16 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node,
+ {
+   image_transport::ImageTransport it(this->node);
++  // This node services subscriptions and mapping in one spin_some loop. Huge
++  // reader histories preserve stale samples and can make the estimator lag
++  // indefinitely when a transient load spike occurs.
++  constexpr size_t kPointCloudQueueDepth = 8;
++  constexpr size_t kImuQueueDepth = 400;
+   if (p_pre->lidar_type == AVIA) {
+-    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
++    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, kPointCloudQueueDepth, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
+   } else {
+-    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 200000, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
++    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, kPointCloudQueueDepth, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+   }
+-  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
++  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, kImuQueueDepth, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
+   if (enable_image_processing) {
+     sub_img_compressed = this->node->create_subscription<sensor_msgs::msg::CompressedImage>(
+       img_topic, 200000, std::bind(&LIVMapper::jpeg_callback, this, std::placeholders::_1));
+@@ -929,14 +934,16 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
+   if (!imu_en) return;
+ 
+   if (last_timestamp_lidar < 0.0) return;
+-  RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f", stamp2Sec(msg_in->header.stamp));
+   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+   msg->header.stamp = sec2Stamp(stamp2Sec(msg->header.stamp) - imu_time_offset);
+   double timestamp = stamp2Sec(msg->header.stamp);
+ 
+   if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
+   {
+-    RCLCPP_WARN(this->node->get_logger(), "IMU and LiDAR not synced! delta time: %lf .\n", last_timestamp_lidar - timestamp);
++    RCLCPP_WARN_THROTTLE(
++      this->node->get_logger(), *this->node->get_clock(), 1000,
++      "IMU and LiDAR not synced! delta time: %lf .",
++      last_timestamp_lidar - timestamp);
+   }
+ 
+   if (ros_driver_fix_en) timestamp += std::round(last_timestamp_lidar - timestamp);
+@@ -962,15 +969,17 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
+   if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 0.2)
+   {
+-    RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds \n", timestamp - last_timestamp_imu);
+-    mtx_buffer.unlock();
+-    sig_buffer.notify_all();
+-    return;
++    // Returning here without advancing last_timestamp_imu wedges the stream:
++    // every subsequent valid sample is still more than 0.2 s ahead. Keep the
++    // gap visible, but accept the first post-gap sample as the new baseline.
++    RCLCPP_WARN_THROTTLE(
++      this->node->get_logger(), *this->node->get_clock(), 1000,
++      "IMU gap is %0.4lf seconds; accepting current sample to resynchronize",
++      timestamp - last_timestamp_imu);
+   }
+ 
+   last_timestamp_imu = timestamp;
+ 
+   imu_buffer.push_back(msg);
+-  cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
+   mtx_buffer.unlock();
+   if (imu_prop_enable)
+   {

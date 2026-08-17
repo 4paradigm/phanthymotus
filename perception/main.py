@@ -3,7 +3,7 @@
 perception/main.py — Perception Stack bundle 统一入口。
 
 读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin /
-VisionAndLanguageNavigationPlugin 等，
+NavigationPlugin 等，
 聚合成一个 MCP HTTP server 对外暴露。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
@@ -111,30 +111,16 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
-        if plugins_cfg.get("fast_livo2", {}).get("enabled", False):
-            from plugins.fast_livo2 import FastLivo2Plugin
-            self._plugins.append(FastLivo2Plugin(plugins_cfg["fast_livo2"], executor))
-            log.info(
-                "FastLivo2Plugin loaded (resources remain idle until Canvas start)"
-            )
-
-        if plugins_cfg.get("nav2", {}).get("enabled", False):
-            from plugins.nav2 import Nav2Plugin
-            self._plugins.append(Nav2Plugin(plugins_cfg["nav2"], executor))
-            log.info("Nav2Plugin loaded (resources remain idle until Canvas start)")
-
-        if plugins_cfg.get("vln", {}).get("enabled", False):
+        if plugins_cfg.get("navigation", {}).get("enabled", False):
             import re, socket
-            namespace = plugins_cfg["vln"].get("namespace", "").strip()
+            namespace = plugins_cfg["navigation"].get("namespace", "").strip()
             if not namespace:
                 namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
-            from plugins.vln import VisionAndLanguageNavigationPlugin
-            plugin = VisionAndLanguageNavigationPlugin(
-                plugins_cfg["vln"], namespace, executor
-            )
+            from plugins.navigation import NavigationPlugin
+            plugin = NavigationPlugin(plugins_cfg["navigation"], namespace, executor)
             self._plugins.append(plugin)
             log.info(
-                "VisionAndLanguageNavigationPlugin loaded (namespace=%s)",
+                "NavigationPlugin loaded (single-container runtime, namespace=%s)",
                 namespace,
             )
 

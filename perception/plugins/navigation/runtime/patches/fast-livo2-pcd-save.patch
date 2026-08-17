@@ -1,0 +1,179 @@
+--- a/src/LIVMapper.cpp
++++ b/src/LIVMapper.cpp
+@@ -13,6 +13,87 @@
+ #include "LIVMapper.h"
+ #include <vikit/camera_loader.h>
+ #include <boost/filesystem.hpp>
++#include <cmath>
++#include <fstream>
++
++namespace
++{
++bool writeIntensityPCDBinary(const std::string &path, const PointCloudXYZI &cloud, std::size_t &written_points)
++{
++  written_points = 0;
++  for (const auto &point : cloud.points)
++  {
++    if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z))
++    {
++      ++written_points;
++    }
++  }
++  if (written_points == 0)
++  {
++    return false;
++  }
++
++  const std::string temporary_path = path + ".tmp";
++  std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);
++  if (!output)
++  {
++    return false;
++  }
++
++  output << "# .PCD v0.7 - Point Cloud Data file format\n"
++         << "VERSION 0.7\n"
++         << "FIELDS x y z intensity\n"
++         << "SIZE 4 4 4 4\n"
++         << "TYPE F F F F\n"
++         << "COUNT 1 1 1 1\n"
++         << "WIDTH " << written_points << "\n"
++         << "HEIGHT 1\n"
++         << "VIEWPOINT 0 0 0 1 0 0 0\n"
++         << "POINTS " << written_points << "\n"
++         << "DATA binary\n";
++
++  constexpr std::size_t kChunkPoints = 8192;
++  std::vector<float> buffer;
++  buffer.reserve(kChunkPoints * 4);
++  for (const auto &point : cloud.points)
++  {
++    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
++    {
++      continue;
++    }
++    buffer.push_back(point.x);
++    buffer.push_back(point.y);
++    buffer.push_back(point.z);
++    buffer.push_back(std::isfinite(point.intensity) ? point.intensity : 0.0F);
++    if (buffer.size() == kChunkPoints * 4)
++    {
++      output.write(reinterpret_cast<const char *>(buffer.data()),
++                   static_cast<std::streamsize>(buffer.size() * sizeof(float)));
++      buffer.clear();
++    }
++  }
++  if (!buffer.empty())
++  {
++    output.write(reinterpret_cast<const char *>(buffer.data()),
++                 static_cast<std::streamsize>(buffer.size() * sizeof(float)));
++  }
++  output.close();
++  if (!output)
++  {
++    boost::filesystem::remove(temporary_path);
++    return false;
++  }
++
++  boost::system::error_code error;
++  boost::filesystem::rename(temporary_path, path, error);
++  if (error)
++  {
++    boost::filesystem::remove(temporary_path);
++    return false;
++  }
++  return true;
++}
++}
+ 
+ using namespace Sophus;
+ LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options)
+@@ -653,12 +734,17 @@
+ 
+ void LIVMapper::savePCD() 
+ {
+-  if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
++  if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0))
+   {
+-    std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_raw_points.pcd";
++    const std::string raw_points_name = pcd_save_interval < 0 ? "all_raw_points.pcd" : "tail_raw_points.pcd";
++    std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/" + raw_points_name;
+     std::string downsampled_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
+     pcl::PCDWriter pcd_writer;
+ 
++    RCLCPP_WARN(this->node->get_logger(),
++      "PCD finalization started: rgb_points=%zu intensity_points=%zu interval=%d",
++      pcl_wait_save->points.size(), pcl_wait_save_intensity->points.size(), pcd_save_interval);
++
+     if (img_en)
+     {
+       pcl::PointCloud<pcl::PointXYZRGB>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+@@ -693,10 +779,15 @@
+       }
+     }
+     else
+-    {      
+-      pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save_intensity);
+-      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
+-                << " with point count: " << pcl_wait_save_intensity->points.size() << RESET << std::endl;
++    {
++      std::size_t written_points = 0;
++      if (!writeIntensityPCDBinary(raw_points_dir, *pcl_wait_save_intensity, written_points))
++      {
++        RCLCPP_ERROR(this->node->get_logger(), "PCD finalization failed: %s", raw_points_dir.c_str());
++        return;
++      }
++      RCLCPP_WARN(this->node->get_logger(), "PCD finalization completed: path=%s points=%zu",
++        raw_points_dir.c_str(), written_points);
+     }
+   }
+ }
+@@ -1401,19 +1492,36 @@
+       string all_points_dir(string(string(ROOT_DIR) + "Log/pcd/") + ss_time.str() + string(".pcd"));
+ 
+       pcl::PCDWriter pcd_writer;
++      bool saved = true;
+ 
+       cout << "current scan saved to " << all_points_dir << endl;
+       if (pcl_wait_save->points.size() > 0)
+       {
+-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save); // pcl::io::savePCDFileASCII(all_points_dir, *pcl_wait_save);
+-        PointCloudXYZRGB().swap(*pcl_wait_save);
++        saved = pcd_writer.writeBinary(all_points_dir, *pcl_wait_save) == 0;
++        if (saved)
++        {
++          PointCloudXYZRGB().swap(*pcl_wait_save);
++        }
+       }
+       if(pcl_wait_save_intensity->points.size() > 0)
+       {
+-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save_intensity);
+-        PointCloudXYZI().swap(*pcl_wait_save_intensity);
++        std::size_t written_points = 0;
++        saved = writeIntensityPCDBinary(all_points_dir, *pcl_wait_save_intensity, written_points);
++        if (saved)
++        {
++          PointCloudXYZI().swap(*pcl_wait_save_intensity);
++          RCLCPP_WARN(this->node->get_logger(), "PCD checkpoint completed: path=%s points=%zu",
++            all_points_dir.c_str(), written_points);
++        }
++      }
++      if (saved)
++      {
++        scan_wait_num = 0;
++      }
++      else
++      {
++        RCLCPP_ERROR(this->node->get_logger(), "PCD checkpoint failed: %s", all_points_dir.c_str());
+       }
+-      scan_wait_num = 0;
+     }
+     
+     if(LidarMeasures.lio_vio_flg == LIO || LidarMeasures.lio_vio_flg == LO)
+@@ -1525,4 +1633,4 @@
+   msg_body_pose.header.frame_id = "camera_init";
+   path.poses.push_back(msg_body_pose);
+   pubPath->publish(path);
+-}
+\ No newline at end of file
++}

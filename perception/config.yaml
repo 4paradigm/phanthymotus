@@ -46,50 +46,44 @@ plugins:
     classes: []         # empty = default broad set
     fps: 5
 
-  fast_livo2:
+  navigation:
     enabled: true
     namespace: ubuntu
-    backend: ros_topic
-    request_timeout_sec: 130.0
-    discovery_timeout_sec: 5.0
-    input_max_age_ms: 500
-    map_voxel_size_m: 0.10
-    collection_enabled: false
-    collection_directory: /opt/phanthy-motus/data/fast_livo2/recordings
-
-  nav2:
-    enabled: true
-    namespace: ubuntu
-    backend: ros_topic
-    shadow_only: true
-    request_timeout_sec: 30.0
-    discovery_timeout_sec: 5.0
-    input_max_age_ms: 500
-    min_x_mps: 0.30
-    max_x_mps: 1.0
-    min_y_mps: 0.0
-    max_y_mps: 0.0
-    min_yaw_rps: 1.0
-    max_yaw_rps: 2.0
-    proposal_ttl_ms: 250
-
-  vln:
-    enabled: true
-    namespace: ""
-    camera_topic: "/ubuntu/camera/rgb"
-    odometry_topic: "/ubuntu/navigation/odom"
-    fast_livo2_status_topic: "/ubuntu/navigation/fast_livo2/status"
-    goal_topic: "/ubuntu/navigation/goal_pose"
-    required_frame_id: "map"
-    required_child_frame_id: "base_link"
-    sensor_timeout_sec: 2.5
-    sensor_max_age_sec: 1.0
-    sensor_max_skew_sec: 0.35
-    # Use receive time unless upstream cards share a header clock domain.
-    sensor_sync_mode: "receive_time"
-    status_restart_gap_sec: 5.0
-    status_stale_after_sec: 3.5
-    subscriber_timeout_sec: 2.0
-    match_threshold: 0.55
-    navigation_speed: 0.30
-    auto_start_on_action: true
+    mapping:
+      backend: ros_topic
+      request_timeout_sec: 130.0
+      discovery_timeout_sec: 5.0
+      input_max_age_ms: 500
+      map_voxel_size_m: 0.10
+      collection_enabled: false
+      collection_directory: /opt/phanthy-motus/data/fast_livo2/recordings
+    planning:
+      backend: ros_topic
+      shadow_only: true
+      request_timeout_sec: 30.0
+      discovery_timeout_sec: 5.0
+      input_max_age_ms: 500
+      min_x_mps: 0.30
+      max_x_mps: 1.0
+      min_y_mps: 0.0
+      max_y_mps: 0.0
+      min_yaw_rps: 1.0
+      max_yaw_rps: 2.0
+      proposal_ttl_ms: 250
+    semantic:
+      camera_topic: "/ubuntu/camera/rgb"
+      odometry_topic: "/ubuntu/navigation/odom"
+      fast_livo2_status_topic: "/ubuntu/navigation/fast_livo2/status"
+      goal_topic: "/ubuntu/navigation/goal_pose"
+      required_frame_id: "map"
+      required_child_frame_id: "base_link"
+      sensor_timeout_sec: 2.5
+      sensor_max_age_sec: 1.0
+      sensor_max_skew_sec: 0.35
+      sensor_sync_mode: "receive_time"
+      status_restart_gap_sec: 5.0
+      status_stale_after_sec: 3.5
+      subscriber_timeout_sec: 2.0
+      match_threshold: 0.55
+      navigation_speed: 0.30
+      auto_start_on_action: true

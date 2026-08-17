@@ -6,14 +6,14 @@ import unittest
 from pathlib import Path
 
 
-COMPANION_PACKAGE = (
+RUNTIME_PACKAGE = (
     Path(__file__).resolve().parents[1]
     / "plugins"
-    / "fast_livo2"
-    / "companion"
+    / "navigation"
+    / "runtime"
     / "g1_fast_livo2"
 )
-sys.path.insert(0, str(COMPANION_PACKAGE))
+sys.path.insert(0, str(RUNTIME_PACKAGE))
 
 from g1_fast_livo2.collection_core import (  # noqa: E402
     COLLECTION_SOURCES,

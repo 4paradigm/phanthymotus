@@ -2,7 +2,9 @@
 # build_perception.sh — 构建 perception-stack（感知层）镜像并推送
 #
 # Usage:
-#   ./build_perception.sh                                       # CPU 版（默认），交互选源
+#   ./build_perception.sh                                       # 单容器导航版（默认），交互选源
+#   ./build_perception.sh --mirror tuna                         # 单容器导航版（默认），清华源
+#   ./build_perception.sh --variant cpu                         # 旧 CPU 版
 #   ./build_perception.sh --variant jetson                      # Jetson GPU 版, JetPack 5.11
 #   ./build_perception.sh --variant jetson --jp-version 6.1     # Jetson GPU 版，JetPack 6.1
 #   ./build_perception.sh --variant jetson --mirror tuna
@@ -21,7 +23,7 @@ fi
 eval "$(parse_mirror_arg "$@")"
 
 # ── 解析参数 ─────────────────────────────────────────────────────────
-VARIANT="cpu"
+VARIANT="navigation"
 JP_VERSION="5.11"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,33 +59,72 @@ case "${VARIANT}" in
         BUILD_CONTEXT="${REPO_ROOT}"
         TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
         ;;
+    navigation)
+        DOCKERFILE="${REPO_ROOT}/perception/Dockerfile.navigation"
+        BUILD_CONTEXT="${REPO_ROOT}"
+        TAG="release.${DATE}.${COMMIT}-navigation"
+        ;;
     *)
-        echo "Unknown variant: ${VARIANT}  (supported: cpu, jetson)"
+        echo "Unknown variant: ${VARIANT}  (supported: cpu, jetson, navigation)"
         exit 1
         ;;
 esac
 
-BUILD_ARGS=""
+RESOURCE_CENTER_NAME="Perception Stack"
+RESOURCE_CENTER_DESCRIPTION="语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测"
+if [ "${VARIANT}" = "navigation" ]; then
+    RESOURCE_CENTER_NAME="Perception Stack with Navigation"
+    RESOURCE_CENTER_DESCRIPTION="单容器 Navigation 卡片 — FAST-LIVO2 建图定位 + Nav2 规划控制 + 视觉语义航点"
+fi
+
+BUILD_ARGS=()
 # ── 根据 jp_version 选择 base image  ────────────────────────
-case "${JP_VERSION}" in
-    5.11)
-        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=511"
-        ;;
-    6.1)
-        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=61"
-        ;;
-    *)
-        echo "Unknown JetPack version: ${JP_VERSION} (support: 5.11, 6.1)"
-        exit 1
-        ;;
-esac
+if [ "${VARIANT}" = "jetson" ]; then
+    case "${JP_VERSION}" in
+        5.11) BUILD_ARGS+=("JP_VERSION=511") ;;
+        6.1) BUILD_ARGS+=("JP_VERSION=61") ;;
+        *)
+            echo "Unknown JetPack version: ${JP_VERSION} (support: 5.11, 6.1)"
+            exit 1
+            ;;
+    esac
+fi
+
+if [ "${VARIANT}" = "navigation" ]; then
+    source "${REPO_ROOT}/perception/plugins/navigation/runtime/fast_livo2-source-lock.env"
+    source "${REPO_ROOT}/perception/plugins/navigation/runtime/nav2-source-lock.env"
+    BUILD_ARGS+=(
+        "ROS_BASE_IMAGE=${ROS_BASE_IMAGE}"
+        "GIT_MIRROR_PREFIX=${GIT_MIRROR_PREFIX}"
+        "FAST_LIVO2_REPO=${FAST_LIVO2_REPO}"
+        "FAST_LIVO2_COMMIT=${FAST_LIVO2_COMMIT}"
+        "FAST_LIVO2_RUNTIME_PATCH_SHA256=${FAST_LIVO2_RUNTIME_PATCH_SHA256}"
+        "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}"
+        "RPG_VIKIT_REPO=${RPG_VIKIT_REPO}"
+        "RPG_VIKIT_COMMIT=${RPG_VIKIT_COMMIT}"
+        "LIVOX_ROS_DRIVER2_REPO=${LIVOX_ROS_DRIVER2_REPO}"
+        "LIVOX_ROS_DRIVER2_COMMIT=${LIVOX_ROS_DRIVER2_COMMIT}"
+        "LIVOX_SDK2_REPO=${LIVOX_SDK2_REPO}"
+        "LIVOX_SDK2_COMMIT=${LIVOX_SDK2_COMMIT}"
+        "SOPHUS_REPO=${SOPHUS_REPO}"
+        "SOPHUS_COMMIT=${SOPHUS_COMMIT}"
+        "PYTHON_COLCON_VERSION=${PYTHON_COLCON_VERSION}"
+        "PYTHON_PYTEST_VERSION=${PYTHON_PYTEST_VERSION}"
+        "ROS_NAV2_BRINGUP_VERSION_AMD64=${ROS_NAV2_BRINGUP_VERSION_AMD64}"
+        "ROS_NAV2_BRINGUP_VERSION_ARM64=${ROS_NAV2_BRINGUP_VERSION_ARM64}"
+        "ROS_NAVIGATION2_VERSION_AMD64=${ROS_NAVIGATION2_VERSION_AMD64}"
+        "ROS_NAVIGATION2_VERSION_ARM64=${ROS_NAVIGATION2_VERSION_ARM64}"
+        "ROS_RMW_FASTRTPS_CPP_VERSION_AMD64=${ROS_RMW_FASTRTPS_CPP_VERSION_AMD64}"
+        "ROS_RMW_FASTRTPS_CPP_VERSION_ARM64=${ROS_RMW_FASTRTPS_CPP_VERSION_ARM64}"
+    )
+fi
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/perception:${TAG}"
 
 echo "============================================"
 echo "Building perception-stack image"
 echo "Variant: ${VARIANT}"
-echo "PyTorch for JetPack: JP${JP_VERSION}"
+[ "${VARIANT}" != "jetson" ] || echo "PyTorch for JetPack: JP${JP_VERSION}"
 echo "Image  : ${FULL_IMAGE}"
 echo "Arch   : ${ARCH} (native=${IS_ARM64})"
 echo "Push   : ${PUSH_ENABLED}"
@@ -95,11 +136,7 @@ fi
 
 select_mirror
 
-# trim leading and trailing space
-BUILD_ARGS="${BUILD_ARGS#${BUILD_ARGS%%[![:space:]]*}}"
-BUILD_ARGS="${BUILD_ARGS%${BUILD_ARGS##*[![:space:]]}}"
-
-do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${BUILD_ARGS}"
+do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${BUILD_ARGS[@]}"
 
 if ${PUSH_ENABLED}; then
     do_push "${FULL_IMAGE}"
@@ -128,8 +165,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"registryImage\": \"perception\",
                 \"tag\": \"${TAG}\",
                 \"category\": \"perception\",
-                \"name\": \"Perception Stack\",
-                \"description\": \"语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测\"
+                \"name\": \"${RESOURCE_CENTER_NAME}\",
+                \"description\": \"${RESOURCE_CENTER_DESCRIPTION}\"
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then

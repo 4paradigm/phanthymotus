@@ -8,7 +8,7 @@ from pathlib import Path
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
-from plugins.fast_livo2.plugin import FastLivo2Plugin  # noqa: E402
+from plugins.navigation.mapping.plugin import FastLivo2Plugin  # noqa: E402
 
 
 class ReadyBackend:
@@ -238,7 +238,7 @@ class FastLivo2PluginTest(unittest.TestCase):
             plugin.dispatch("fast_livo2", {"action": "info"})["canvas_wired"]
         )
 
-    def test_missing_companion_and_invalid_config_fail_closed(self) -> None:
+    def test_missing_runtime_and_invalid_config_fail_closed(self) -> None:
         unavailable = FastLivo2Plugin(
             {"discovery_timeout_sec": 0.5}, None, backend=ReadyBackend(0)
         )
@@ -246,7 +246,7 @@ class FastLivo2PluginTest(unittest.TestCase):
             "fast_livo2",
             {"action": "start", "input_bindings": _bindings(unavailable)},
         )
-        self.assertEqual(result["error_code"], "fast_livo2_companion_unavailable")
+        self.assertEqual(result["error_code"], "fast_livo2_runtime_unavailable")
 
         invalid = FastLivo2Plugin({"map_max_points": 80_000}, None, backend=ReadyBackend())
         info = invalid.dispatch("fast_livo2", {"action": "info"})

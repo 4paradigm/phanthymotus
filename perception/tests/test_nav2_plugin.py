@@ -8,8 +8,8 @@ from pathlib import Path
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
-from plugins.nav2.plugin import Nav2Plugin  # noqa: E402
-from plugins.nav2.backend import _build_command_payload  # noqa: E402
+from plugins.navigation.planning.plugin import Nav2Plugin  # noqa: E402
+from plugins.navigation.planning.backend import _build_command_payload  # noqa: E402
 
 
 class ReadyBackend:
@@ -150,7 +150,7 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         self.assertEqual(stopped_again["state"], "idle")
         self.assertEqual(backend.stop_calls, 1)
 
-    def test_invalid_configuration_and_missing_companion_fail_closed(self) -> None:
+    def test_invalid_configuration_and_missing_runtime_fail_closed(self) -> None:
         invalid = Nav2Plugin({"shadow_only": False}, None, backend=ReadyBackend())
         info = invalid.dispatch("nav2", {"action": "info"})
         self.assertEqual(info["error_code"], "invalid_config")
@@ -167,7 +167,7 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
             "nav2",
             {"action": "start", "input_bindings": _bindings(unavailable)},
         )
-        self.assertEqual(result["error_code"], "nav2_companion_unavailable")
+        self.assertEqual(result["error_code"], "nav2_runtime_unavailable")
         self.assertEqual(unavailable_backend.stop_calls, 1)
 
     def test_legacy_runtime_switch_timeout_is_ignored_but_unknown_fields_fail(self) -> None:
