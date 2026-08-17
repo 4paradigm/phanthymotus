@@ -98,8 +98,9 @@ bash perception/plugins/navigation/deploy/scripts/deploy-g1.sh
 
 `deploy-g1.sh` 不实现另一套构建逻辑；它只调用仓库默认的
 `./deploy/build_perception.sh --mirror tuna`，再调用上述容器生命周期脚本。
-旧容器只有带 `com.phanthymotus.test-owner=navigation-card` 标签时才会
-被替换；脚本不发送导航目标或速度指令。
+旧容器只有带 `com.phanthymotus.test-owner=navigation-card`，或迁移前已知值
+`com.phanthymotus.test-owner=nav2-card` 时才会被替换；其他 owner 仍会安全拒绝。
+脚本不发送导航目标或速度指令。
 
 正式 `perception/deploy/service.yml` 也只有 `perception` 一个 service。地图和
 录制目录作为该容器的持久化 volume；不再定义 `fast_livo2` 或 `nav2` service。

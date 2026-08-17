@@ -13,6 +13,7 @@ MCP_URL="${MCP_URL:-http://127.0.0.1:15720/mcp}"
 START_TIMEOUT_SEC="${START_TIMEOUT_SEC:-120}"
 OWNER_LABEL="com.phanthymotus.test-owner"
 OWNER_VALUE="navigation-card"
+LEGACY_OWNER_VALUE="nav2-card"
 
 die() { printf 'ERROR=%s\n' "$*" >&2; exit 1; }
 exists() { docker container inspect "$1" >/dev/null 2>&1; }
@@ -100,7 +101,14 @@ stop() {
     return
   fi
   owner="$(docker container inspect --format "{{ index .Config.Labels \"${OWNER_LABEL}\" }}" "${PERCEPTION_CONTAINER}")"
-  [[ "${owner}" == "${OWNER_VALUE}" ]] || die "refusing to remove container owned by ${owner:-unknown}"
+  case "${owner}" in
+    "${OWNER_VALUE}") ;;
+    "${LEGACY_OWNER_VALUE}")
+      printf 'G1_NAVIGATION_TEST_OWNER_MIGRATION=%s->%s\n' \
+        "${LEGACY_OWNER_VALUE}" "${OWNER_VALUE}"
+      ;;
+    *) die "refusing to remove container owned by ${owner:-unknown}" ;;
+  esac
   docker rm --force "${PERCEPTION_CONTAINER}" >/dev/null
   printf 'G1_NAVIGATION_TEST_CONTAINER_STOP=PASS\n'
 }

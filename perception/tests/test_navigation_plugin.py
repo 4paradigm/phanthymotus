@@ -204,6 +204,20 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("STAGE=preflight", deploy_script)
         self.assertIn("STAGE=start", deploy_script)
 
+        runtime_script = (
+            PERCEPTION_ROOT
+            / "plugins"
+            / "navigation"
+            / "deploy"
+            / "scripts"
+            / "owner-start-g1-test-containers.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('OWNER_VALUE="navigation-card"', runtime_script)
+        self.assertIn('LEGACY_OWNER_VALUE="nav2-card"', runtime_script)
+        self.assertIn(
+            "refusing to remove container owned by", runtime_script
+        )
+
 
 class NavigationPluginTest(unittest.TestCase):
     def make_plugin(self, *, runtime=None, mapping=None, planning=None, semantic=None):
