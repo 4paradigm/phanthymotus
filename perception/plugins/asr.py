@@ -32,6 +32,14 @@ SPEECH_THRESH  = 0.5
 SILENCE_THRESH = 0.35
 SILENCE_FRAMES = 16
 
+# Documented AudioChunk contract — see perception/README.md ("Audio Requirements
+# for ASR"): 16 kHz mono PCM_S16_LE, at least 512 samples per chunk.
+AUDIO_FORMAT       = "audio/pcm-16k"
+# agent-core's remote-control mic bridge publishes this spelling instead; accept
+# it rather than warning on every chunk of a path that already works.
+_AUDIO_FORMAT_ALIASES = frozenset({AUDIO_FORMAT, "pcm_16k_16bit_mono"})
+MIN_CHUNK_BYTES    = 1024  # 512 samples — one Silero VAD window
+
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -812,24 +820,31 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 result_q.put(("speech_start", ts, ts, False))
             _was_speaking = _is_speaking
 
-            # Collect completed VAD segments
+            # Collect completed VAD segments.
+            # The VAD only reports a segment after min_silence_duration of
+            # trailing silence has elapsed, and that silence is not part of
+            # seg.samples — so the current chunk timestamp sits one silence
+            # window past the real end of speech. Rewind it, the same way
+            # PcmHistory.pre_roll() rewinds by silence_samples to locate the
+            # segment start in the sample domain.
+            seg_end_ts = ts - silence_samples / SAMPLE_RATE
             while not vad.empty():
                 seg = vad.front
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
-                if not start_ts:
+                if start_ts is None:
                     pre_pcm = pcm_history.pre_roll(
                         getattr(seg, 'start', None),
                         len(seg.samples),
                         pre_roll_samples,
                         silence_samples,
                     )
-                    start_ts = ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
+                    start_ts = seg_end_ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
                     speech_buf = pre_pcm + seg_pcm
                 else:
                     pre_pcm = b''
                     speech_buf += seg_pcm
-                end_ts = ts
+                end_ts = seg_end_ts
                 vad.pop()
 
                 # Output the segment as an utterance
@@ -841,7 +856,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     if save_vad_segments:
                         _save_segment_pcm(speech_buf, _seg_count)
                         _seg_count[0] += 1
-                    result_q.put((speech_buf, start_ts or ts, end_ts or ts, _kws_triggered))
+                    result_q.put((speech_buf,
+                                  seg_end_ts if start_ts is None else start_ts,
+                                  seg_end_ts if end_ts is None else end_ts,
+                                  _kws_triggered))
                     _kws_triggered = False
                     speech_buf = b''
                     start_ts = None
@@ -884,6 +902,7 @@ class _ASRNode(Node):
         self._vad_proc: Optional[multiprocessing.Process] = None
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._audio_contract_warns: dict = {}
 
     def start(self) -> dict:
         if self.state == "running":
@@ -969,7 +988,9 @@ class _ASRNode(Node):
                         pass
             self.state = "error"
             return
-        pcm = bytes(msg.data)
+        pcm = self._check_audio_contract(getattr(msg, 'format', '') or '', bytes(msg.data))
+        if not pcm:
+            return
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
@@ -977,6 +998,44 @@ class _ASRNode(Node):
             self._pcm_queue.put_nowait((pcm, ts))
         except Exception:
             pass  # drop if severely behind
+
+    def _warn_audio_contract(self, key: str, detail: str) -> None:
+        """Warn on the first violation of a kind, then every 500th one.
+
+        A misbehaving mic driver publishes ~30 chunks/s, so an unthrottled
+        warning would bury the log.
+        """
+        n = self._audio_contract_warns.get(key, 0) + 1
+        self._audio_contract_warns[key] = n
+        if n == 1 or n % 500 == 0:
+            log.warning(f"[asr] audio contract violated on {self._input_topic}: {detail} "
+                        f"(occurrence {n}) — see perception/README.md")
+
+    def _check_audio_contract(self, fmt: str, pcm: bytes) -> bytes:
+        """Validate the documented AudioChunk contract, return usable PCM.
+
+        Only the 16-bit alignment is corrected: a chunk with an odd byte count
+        makes the VAD worker's struct.unpack() raise, killing the subprocess and
+        taking ASR to the error state. Format and chunk size are reported but
+        left alone — undersized chunks are the most common cause of "ASR hears
+        audio but never emits text", and dropping them here would change the
+        behaviour of producers that work today.
+        """
+        if fmt not in _AUDIO_FORMAT_ALIASES:
+            self._warn_audio_contract(
+                'format', f"format={fmt!r}, expected {AUDIO_FORMAT!r}")
+
+        if len(pcm) % 2:
+            self._warn_audio_contract(
+                'align', f"{len(pcm)} bytes is not 16-bit aligned, truncating")
+            pcm = pcm[:len(pcm) // 2 * 2]
+
+        if len(pcm) and len(pcm) < MIN_CHUNK_BYTES:
+            self._warn_audio_contract(
+                'size', f"{len(pcm)}-byte chunk is below the {MIN_CHUNK_BYTES}-byte "
+                        f"minimum, VAD may never emit a segment")
+
+        return pcm
 
     def _worker(self):
         try:
