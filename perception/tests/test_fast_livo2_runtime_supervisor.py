@@ -1,0 +1,514 @@
+from __future__ import annotations
+
+import json
+import struct
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+
+PACKAGE_ROOT = (
+    Path(__file__).resolve().parents[1]
+    / "plugins"
+    / "navigation"
+    / "runtime"
+    / "g1_fast_livo2"
+)
+sys.path.insert(0, str(PACKAGE_ROOT))
+
+
+def _import_ros_runtime_modules():
+    inserted: list[str] = []
+
+    def module(name: str):
+        value = types.ModuleType(name)
+        sys.modules[name] = value
+        inserted.append(name)
+        return value
+
+    class Message:
+        def __init__(self) -> None:
+            self.data = ""
+
+    rclpy = module("rclpy")
+    callbacks = module("rclpy.callback_groups")
+    callbacks.ReentrantCallbackGroup = type("ReentrantCallbackGroup", (), {})
+    executors = module("rclpy.executors")
+    executors.MultiThreadedExecutor = type("MultiThreadedExecutor", (), {})
+    node = module("rclpy.node")
+    node.Node = type("Node", (), {})
+    qos = module("rclpy.qos")
+    policy = type(
+        "Policy",
+        (),
+        {
+            "KEEP_LAST": 1,
+            "RELIABLE": 1,
+            "TRANSIENT_LOCAL": 1,
+            "VOLATILE": 1,
+            "BEST_EFFORT": 1,
+        },
+    )
+    qos.DurabilityPolicy = policy
+    qos.HistoryPolicy = policy
+    qos.ReliabilityPolicy = policy
+    qos.QoSProfile = lambda **kwargs: kwargs
+    qos.qos_profile_sensor_data = {}
+
+    for parent in ("geometry_msgs", "nav_msgs", "sensor_msgs", "std_msgs"):
+        module(parent)
+    message_modules = {
+        "geometry_msgs.msg": ("TransformStamped",),
+        "nav_msgs.msg": ("OccupancyGrid", "Odometry"),
+        "sensor_msgs.msg": (
+            "CameraInfo",
+            "CompressedImage",
+            "Image",
+            "Imu",
+            "PointCloud2",
+            "PointField",
+        ),
+        "std_msgs.msg": ("String", "UInt8MultiArray"),
+        "tf2_ros": ("TransformBroadcaster",),
+    }
+    for module_name, names in message_modules.items():
+        target = module(module_name)
+        for name in names:
+            setattr(target, name, Message if name == "String" else type(name, (), {}))
+
+    try:
+        from g1_fast_livo2 import adapter_node, runtime_supervisor
+    finally:
+        for name in reversed(inserted):
+            sys.modules.pop(name, None)
+    return adapter_node, runtime_supervisor
+
+
+ADAPTER_MODULE, SUPERVISOR_MODULE = _import_ros_runtime_modules()
+FastLivo2Adapter = ADAPTER_MODULE.FastLivo2Adapter
+FastLivo2Supervisor = SUPERVISOR_MODULE.FastLivo2Supervisor
+TemporalOccupancyMap = ADAPTER_MODULE.TemporalOccupancyMap
+write_pcd_xyz_atomic = ADAPTER_MODULE.write_pcd_xyz_atomic
+Pose3 = ADAPTER_MODULE.Pose3
+Quaternion = ADAPTER_MODULE.Quaternion
+
+
+class _CapturePublisher:
+    def __init__(self, events=None, label="response") -> None:
+        self.messages = []
+        self.events = events
+        self.label = label
+
+    def publish(self, message) -> None:
+        self.messages.append(message)
+        if self.events is not None:
+            self.events.append(self.label)
+
+
+class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
+    def test_extreme_float64_live_cloud_is_rejected_without_callback_escape(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._source_age = lambda _stamp: 0.0
+        adapter._source_max_age = 0.5
+        adapter._source_age_tolerance = 0.05
+        adapter._map_load_max_points = 200_000
+        adapter._live_cloud_max_bytes = 64 * 1024 * 1024
+        adapter._invalid_cloud = 0
+        adapter._lock = threading.RLock()
+        adapter._latest_session_points = ()
+        adapter._last_cloud_monotonic = None
+        adapter._last_cloud_source_age = None
+        adapter._map_from_session = Pose3(
+            0.0,
+            0.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        adapter._mode = "localization"
+        adapter._pose_history = []
+        adapter._obstacle_min_height = -0.30
+        adapter._obstacle_max_height = 0.30
+        adapter.get_logger = lambda: SimpleNamespace(warning=lambda _msg: None)
+        message = SimpleNamespace(
+            header=SimpleNamespace(
+                frame_id="camera_init",
+                stamp=SimpleNamespace(sec=1, nanosec=0),
+            ),
+            width=1,
+            height=1,
+            point_step=24,
+            is_bigendian=False,
+            fields=[
+                SimpleNamespace(name="x", offset=0, datatype=8, count=1),
+                SimpleNamespace(name="y", offset=8, datatype=8, count=1),
+                SimpleNamespace(name="z", offset=16, datatype=8, count=1),
+            ],
+            data=struct.pack("<ddd", 1e308, 0.0, 0.0),
+        )
+
+        adapter._on_cloud(message)
+
+        self.assertEqual(adapter._invalid_cloud, 1)
+        self.assertEqual(adapter._latest_session_points, ())
+
+    def test_static_map_disk_failure_remains_retryable_through_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = object.__new__(FastLivo2Adapter)
+            adapter._lock = threading.RLock()
+            adapter._session_name = "office"
+            adapter._static_map_error = None
+            adapter._static_save_result = None
+            adapter._mode = "mapping"
+            adapter._static_map = SimpleNamespace(
+                confirmed_points=tuple(
+                    (float(index), 0.0, 0.0) for index in range(40)
+                )
+            )
+            adapter._static_map_load_max_points = 200_000
+            adapter._obstacle_min_height = -0.30
+            adapter._obstacle_max_height = 0.30
+            adapter._pose_history = []
+            adapter._map_root = Path(directory).resolve()
+            adapter._map_control_status_pub = _CapturePublisher()
+            request = SimpleNamespace(
+                data=json.dumps(
+                    {
+                        "request_id": "save-1",
+                        "action": "save_static_map",
+                        "args": {"map_name": "office"},
+                        "operation_deadline_monotonic": time.monotonic() + 10.0,
+                    }
+                )
+            )
+
+            with mock.patch.object(
+                Path,
+                "open",
+                side_effect=OSError("disk full"),
+            ):
+                adapter._on_map_control(request)
+
+            payload = json.loads(adapter._map_control_status_pub.messages[-1].data)
+            self.assertEqual(payload["error_code"], "map_control_io_failed")
+            self.assertTrue(payload["retryable"])
+            self.assertEqual(adapter._mode, "finalizing")
+
+    def test_expired_map_control_cannot_mutate_adapter_state(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._mode = "awaiting_relocalization"
+        adapter._map_control_status_pub = _CapturePublisher()
+        request = SimpleNamespace(
+            data=json.dumps(
+                {
+                    "request_id": "late-unload",
+                    "action": "unload_map",
+                    "args": {},
+                    "operation_deadline_monotonic": time.monotonic() - 1.0,
+                }
+            )
+        )
+
+        adapter._on_map_control(request)
+
+        payload = json.loads(adapter._map_control_status_pub.messages[-1].data)
+        self.assertEqual(payload["error_code"], "map_control_timeout")
+        self.assertTrue(payload["retryable"])
+        self.assertEqual(adapter._mode, "awaiting_relocalization")
+
+    def test_map_control_replies_before_deferred_map_publication(self) -> None:
+        events = []
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._map_control_status_pub = _CapturePublisher(events, "response")
+        adapter._load_saved_map = lambda _args: {
+            "status": "map_loaded",
+            "_post_response": lambda: events.append("map"),
+        }
+        request = SimpleNamespace(
+            data=json.dumps(
+                {
+                    "request_id": "load-1",
+                    "action": "load_map",
+                    "args": {},
+                    "operation_deadline_monotonic": time.monotonic() + 10.0,
+                }
+            )
+        )
+
+        adapter._on_map_control(request)
+
+        self.assertEqual(events, ["response", "map"])
+        payload = json.loads(adapter._map_control_status_pub.messages[-1].data)
+        self.assertNotIn("_post_response", payload)
+
+    def test_load_timeout_before_atomic_commit_preserves_active_map(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            points = tuple((index * 0.2, 0.0, 0.0) for index in range(40))
+            old_points = tuple((index * 0.2, 2.0, 0.0) for index in range(40))
+            pcd = root / "office.pcd"
+            write_pcd_xyz_atomic(pcd, points)
+            adapter = object.__new__(FastLivo2Adapter)
+            adapter._lock = threading.RLock()
+            adapter._map_root = root
+            adapter._map_load_max_points = 200_000
+            adapter._static_map_load_max_points = 200_000
+            adapter._obstacle_min_height = -0.30
+            adapter._obstacle_max_height = 0.30
+            adapter._static_map = TemporalOccupancyMap(0.1)
+            adapter._static_map.load_confirmed(old_points)
+            adapter._mode = "idle"
+            adapter.get_parameter = lambda _name: SimpleNamespace(value=0.1)
+            args = {
+                "map_name": "office",
+                "pcd_files": [str(pcd)],
+                "_operation_deadline_monotonic": time.monotonic() + 30.0,
+            }
+            original_require = FastLivo2Adapter._require_map_control_deadline
+
+            def require_deadline(request_args, *, stage):
+                if stage == "map activation commit":
+                    raise TimeoutError("forced deadline before commit")
+                return original_require(request_args, stage=stage)
+
+            with mock.patch.object(
+                FastLivo2Adapter,
+                "_require_map_control_deadline",
+                side_effect=require_deadline,
+            ):
+                with self.assertRaisesRegex(TimeoutError, "before commit"):
+                    adapter._load_saved_map(args)
+
+            self.assertEqual(adapter._mode, "idle")
+            self.assertEqual(adapter._static_map.confirmed_points, old_points)
+
+    def test_late_terminal_mapping_failure_is_replayed_on_retry(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        process = object()
+        supervisor._lock = threading.RLock()
+        supervisor._process = process
+        supervisor._active_map = "office"
+        supervisor._loaded_map = None
+        supervisor._runtime_mode = "finalizing"
+        supervisor._started_unix_ms = 123
+        supervisor._pending_mapping_finalize = {"process": process}
+        supervisor._last_mapping_result = None
+        supervisor._diagnostics = {}
+        supervisor._diagnostics_monotonic = None
+        terminal = {
+            "status": "error",
+            "error_code": "manifest_write_failed",
+            "error": "invalid manifest",
+            "map_name": "office",
+            "retryable": False,
+        }
+
+        # The outer backend may already have timed out when this late result is
+        # produced.  The next stop request must not be turned into already_idle.
+        supervisor._finish_mapping_runtime(
+            process,
+            terminal_result=terminal,
+        )
+        replay = supervisor._stop_mapping("office")
+
+        self.assertEqual(replay["status"], "error")
+        self.assertEqual(replay["error_code"], "manifest_write_failed")
+        self.assertFalse(replay["retryable"])
+        self.assertTrue(replay["already_finalized"])
+
+    def test_stale_stop_request_cannot_terminate_new_mapping_session(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        process = mock.Mock()
+        process.poll.return_value = None
+        supervisor._lock = threading.RLock()
+        supervisor._process = process
+        supervisor._active_map = "map-b"
+        supervisor._loaded_map = None
+        supervisor._runtime_mode = "mapping"
+        supervisor._started_unix_ms = 123
+        supervisor._pending_mapping_finalize = None
+        supervisor._last_mapping_result = None
+        supervisor._diagnostics = {}
+        supervisor._diagnostics_monotonic = None
+
+        with mock.patch.object(SUPERVISOR_MODULE.os, "killpg") as killpg:
+            result = supervisor._stop_mapping("map-a")
+
+        self.assertEqual(result["error_code"], "mapping_session_mismatch")
+        self.assertEqual(result["map_name"], "map-b")
+        self.assertIs(supervisor._process, process)
+        killpg.assert_not_called()
+
+    def test_stale_stop_request_cannot_finalize_other_pending_session(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        process = mock.Mock()
+        supervisor._lock = threading.RLock()
+        supervisor._process = process
+        supervisor._active_map = "map-b"
+        supervisor._loaded_map = None
+        supervisor._runtime_mode = "finalizing"
+        supervisor._started_unix_ms = 123
+        pending = {"process": process, "map_name": "map-b"}
+        supervisor._pending_mapping_finalize = pending
+        supervisor._last_mapping_result = None
+        supervisor._diagnostics = {}
+        supervisor._diagnostics_monotonic = None
+        supervisor._snapshot_session_pcd_files = mock.Mock()
+        supervisor._adapter_execute = mock.Mock()
+
+        result = supervisor._stop_mapping("map-a")
+
+        self.assertEqual(result["error_code"], "mapping_session_mismatch")
+        self.assertIs(supervisor._pending_mapping_finalize, pending)
+        supervisor._snapshot_session_pcd_files.assert_not_called()
+        supervisor._adapter_execute.assert_not_called()
+
+    def test_manifest_aggregate_limit_counts_raw_and_static_map(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "raw.pcd").write_bytes(b"raw")
+            (root / "static").mkdir()
+            (root / "static" / "office.static.pcd").write_bytes(b"grid")
+            (root / "sessions").mkdir()
+            (root / "sessions" / "office.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "phanthy.navigation.fast_livo2_map_session.v1",
+                        "static_map_format_version": 2,
+                        "map_name": "office",
+                        "pcd_files": ["raw.pcd"],
+                        "static_map_pcd": "static/office.static.pcd",
+                        "obstacle_height_range_m": [-0.30, 0.30],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            supervisor = object.__new__(FastLivo2Supervisor)
+            supervisor._map_root = root
+
+            with mock.patch.object(
+                SUPERVISOR_MODULE,
+                "_MAX_MAP_ARTIFACT_TOTAL_BYTES",
+                6,
+            ):
+                with self.assertRaisesRegex(ValueError, "aggregate byte"):
+                    supervisor._map_artifacts_from_manifest("office")
+
+    def test_oversized_manifest_is_rejected_before_json_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "sessions").mkdir()
+            (root / "sessions" / "office.json").write_bytes(
+                b"{" + b"x" * SUPERVISOR_MODULE._MAX_MAP_MANIFEST_BYTES
+            )
+            supervisor = object.__new__(FastLivo2Supervisor)
+            supervisor._map_root = root
+
+            with mock.patch.object(
+                SUPERVISOR_MODULE.json,
+                "loads",
+                side_effect=AssertionError("oversized manifest was decoded"),
+            ) as loads:
+                with self.assertRaisesRegex(ValueError, "manifest exceeds byte"):
+                    supervisor._map_artifacts_from_manifest("office")
+
+            loads.assert_not_called()
+
+    def test_permanent_finalize_failure_cleans_uncommitted_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            raw = root / "office-session.raw.pcd"
+            static_root = root / "static"
+            static_root.mkdir()
+            static = static_root / "office.static.pcd"
+            raw.write_bytes(b"raw")
+            static.write_bytes(b"static")
+            supervisor = object.__new__(FastLivo2Supervisor)
+            supervisor._map_root = root
+            supervisor.get_logger = lambda: SimpleNamespace(warning=lambda _msg: None)
+
+            supervisor._cleanup_session_artifacts(
+                [raw.name],
+                {"static_map_file": static.name},
+            )
+
+            self.assertFalse(raw.exists())
+            self.assertFalse(static.exists())
+
+    def test_algorithm_start_cleanup_timeout_keeps_adapter_map_owned(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lock = threading.RLock()
+        supervisor._process = None
+        supervisor._active_map = None
+        supervisor._loaded_map = None
+        supervisor._runtime_mode = "idle"
+        supervisor._started_unix_ms = None
+        responses = iter(
+            (
+                {"status": "map_loaded", "loaded_map": "office"},
+                {
+                    "status": "error",
+                    "error_code": "map_control_timeout",
+                    "error": "adapter cleanup timed out",
+                    "retryable": True,
+                },
+            )
+        )
+        supervisor._adapter_execute = lambda _action, _args: next(responses)
+        supervisor._algorithm_command = lambda **_kwargs: ["fast-livo2"]
+
+        with mock.patch.object(
+            SUPERVISOR_MODULE.subprocess,
+            "Popen",
+            side_effect=OSError("cannot fork"),
+        ):
+            result = supervisor._activate_localization(
+                "office",
+                ((Path("raw.pcd"),), None, None),
+            )
+
+        self.assertEqual(result["error_code"], "algorithm_start_cleanup_pending")
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["loaded_map"], "office")
+        self.assertEqual(supervisor._loaded_map, "office")
+        self.assertEqual(supervisor._runtime_mode, "localization")
+
+    def test_replace_map_validates_active_artifacts_before_unload(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lock = threading.RLock()
+        supervisor._pending_mapping_finalize = None
+        supervisor._process = mock.Mock()
+        supervisor._process.poll.return_value = None
+        supervisor._runtime_mode = "localization"
+        supervisor._loaded_map = "map-a"
+        target = ((Path("map-b.pcd"),), None, None)
+        active = ((Path("map-a.pcd"),), None, None)
+        supervisor._map_artifacts_from_manifest = mock.Mock(
+            side_effect=[target, active]
+        )
+        supervisor._adapter_execute = mock.Mock(
+            side_effect=[
+                {"status": "map_validated"},
+                {
+                    "status": "error",
+                    "error_code": "map_control_failed",
+                    "error": "active PCD is corrupt",
+                },
+            ]
+        )
+        supervisor._unload_map = mock.Mock()
+
+        result = supervisor._load_map("map-b")
+
+        self.assertEqual(result["error_code"], "active_map_artifact_invalid")
+        self.assertEqual(result["loaded_map"], "map-a")
+        supervisor._unload_map.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

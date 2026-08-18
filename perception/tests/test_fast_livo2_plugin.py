@@ -8,6 +8,7 @@ from pathlib import Path
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
+from plugins.navigation.mapping.core import FastLivo2BackendError  # noqa: E402
 from plugins.navigation.mapping.plugin import FastLivo2Plugin  # noqa: E402
 
 
@@ -96,7 +97,36 @@ class CollectionStopRejectingBackend(ReadyBackend):
                 "status": "error",
                 "error_code": "collection_stop_failed",
                 "error": "recorder is still running",
+                "retryable": True,
             }
+        return super().execute(action, args)
+
+
+class RetryableMappingStopBackend(ReadyBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "stop_mapping":
+            self.calls.append((action, dict(args)))
+            raise FastLivo2BackendError(
+                "manifest_write_failed",
+                "temporary persistence failure",
+                details={"retryable": True},
+            )
+        return super().execute(action, args)
+
+
+class RetryableLocalizationStopBackend(ReadyBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "unload_map":
+            self.calls.append((action, dict(args)))
+            raise FastLivo2BackendError(
+                "fast_livo2_response_timeout",
+                "adapter unload is still converging",
+                details={
+                    "retryable": True,
+                    "loaded_map": "office",
+                    "runtime_mode": "localization",
+                },
+            )
         return super().execute(action, args)
 
 
@@ -259,9 +289,60 @@ class FastLivo2PluginTest(unittest.TestCase):
         result = plugin.dispatch("fast_livo2", {"action": "stop"})
 
         self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertTrue(result["retryable"])
         self.assertTrue(result["canvas_wired"])
         self.assertEqual(backend.stop_calls, 0)
         self.assertTrue(
+            plugin.dispatch("fast_livo2", {"action": "info"})["canvas_wired"]
+        )
+
+    def test_mapping_stop_retryability_survives_backend_core_and_plugin(self) -> None:
+        backend = RetryableMappingStopBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch(
+            "fast_livo2", {"action": "start_mapping", "map_name": "office"}
+        )
+
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["stop_result"]["error_code"], "manifest_write_failed")
+        self.assertTrue(result["stop_result"]["retryable"])
+        self.assertEqual(backend.stop_calls, 0)
+        info = plugin.dispatch("fast_livo2", {"action": "info"})
+        self.assertTrue(info["canvas_wired"])
+        self.assertEqual(info["active_map"], "office")
+
+    def test_permanent_mapping_stop_failure_releases_card_backend(self) -> None:
+        class PermanentStopBackend(ReadyBackend):
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "stop_mapping":
+                    raise FastLivo2BackendError(
+                        "static_map_accumulation_failed",
+                        "static evidence exceeded its safety limit",
+                    )
+                return super().execute(action, args)
+
+        backend = PermanentStopBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch(
+            "fast_livo2", {"action": "start_mapping", "map_name": "office"}
+        )
+
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["canvas_wired"])
+        self.assertEqual(backend.stop_calls, 1)
+        self.assertFalse(
             plugin.dispatch("fast_livo2", {"action": "info"})["canvas_wired"]
         )
 
@@ -348,6 +429,27 @@ class FastLivo2PluginTest(unittest.TestCase):
             ],
         )
         self.assertEqual(backend.stop_calls, 1)
+
+    def test_localization_stop_timeout_keeps_card_retryable(self) -> None:
+        backend = RetryableLocalizationStopBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch("fast_livo2", {"action": "load_map", "map_name": "office"})
+
+        stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(stopped["error_code"], "canvas_stop_failed")
+        self.assertTrue(stopped["retryable"])
+        self.assertTrue(stopped["canvas_wired"])
+        self.assertEqual(
+            stopped["stop_result"]["error_code"],
+            "fast_livo2_response_timeout",
+        )
+        self.assertTrue(stopped["stop_result"]["retryable"])
+        self.assertEqual(stopped["stop_result"]["loaded_map"], "office")
+        self.assertEqual(backend.stop_calls, 0)
 
 
 if __name__ == "__main__":

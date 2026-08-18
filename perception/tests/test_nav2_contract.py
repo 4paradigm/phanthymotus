@@ -42,7 +42,7 @@ class Nav2ContractTest(unittest.TestCase):
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(
             set(inputs),
-            {"livo_odom", "registered_cloud", "obstacle_map", "goal_pose"},
+            {"livo_odom", "registered_cloud", "static_map", "goal_pose"},
         )
         self.assertEqual(inputs["livo_odom"]["topic"], "/ubuntu/navigation/odom")
         self.assertEqual(
@@ -58,10 +58,13 @@ class Nav2ContractTest(unittest.TestCase):
             "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
         )
         self.assertEqual(inputs["registered_cloud"]["frame_id"], "map")
+        self.assertEqual(inputs["static_map"]["topic"], "/ubuntu/navigation/static_map")
+        self.assertEqual(inputs["static_map"]["ros_type"], "nav_msgs/msg/OccupancyGrid")
         self.assertEqual(
-            inputs["obstacle_map"]["topic"], "/ubuntu/navigation/obstacle_map"
+            inputs["static_map"]["qos"],
+            "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
         )
-        self.assertEqual(inputs["obstacle_map"]["frame_id"], "map")
+        self.assertEqual(inputs["static_map"]["frame_id"], "map")
         self.assertFalse(inputs["goal_pose"]["required"])
 
         outputs = {item["port"]: item for item in tool["topic_out"]}

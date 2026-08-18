@@ -15,7 +15,7 @@ Driver sensors
 FAST-LIVO2 internal module
     |-- /ubuntu/navigation/odom                 nav_msgs/Odometry
     |-- /ubuntu/navigation/cloud_registered     sensor_msgs/PointCloud2
-    |-- /ubuntu/navigation/obstacle_map          sensor_msgs/PointCloud2
+    |-- /ubuntu/navigation/static_map            nav_msgs/OccupancyGrid
     `-- TF: map -> base_link
               |
               v
@@ -41,7 +41,7 @@ FAST-LIVO2 internal module
 | --- | --- | --- | --- |
 | `livo_odom` | `/ubuntu/navigation/odom` | `nav_msgs/msg/Odometry`; `BEST_EFFORT + KEEP_LAST(5)` | `header.frame_id=map`，`child_frame_id=base_link`，ROS system time，接收 age 最大 500 ms |
 | `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，已运动去畸变，ROS system time，接收 age 最大 500 ms |
-| `obstacle_map` | `/ubuntu/navigation/obstacle_map` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，累计点云排除地板/天花板后投影到 `z=0` |
+| `static_map` | `/ubuntu/navigation/static_map` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | `header.frame_id=map`，完整多帧确认静态图，`-1/0/100` |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.goal.v1`，`map` frame，每条唯一 `goal_id` |
 
 Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIVO2 还在
@@ -131,21 +131,31 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   `/global_costmap/costmap` 目标格。代价 `>=99`（inscribed/lethal）直接返回
   `goal_in_collision`；地图缺失/过期、目标在当前 rolling window 外或未知格都有
   独立错误，不再进入长时间恢复流程。成功回执包含 `goal_cell`。
-- global/local costmap 都是 rolling window。global costmap 使用累计、去地面、
-  去天花板并投影到二维的 `/ubuntu/navigation/obstacle_map`，避免已观察障碍
-  因当前视角遮挡而消失；local costmap 继续使用实时
-  `/ubuntu/navigation/cloud_registered`。两者都由 FAST-LIVO2 adapter 使用卡片
-  的 `obstacle_min_height_m/obstacle_max_height_m` 预过滤，Nav2 不再维护一份
-  独立固定下界，避免 Canvas 配置只改变全局图却不改变局部避障。
-- local 实时点云以 `base_link` 为 sensor origin 开启 raytrace clearing，
-  不再把短时障碍轨迹永久留在局部窗口。global 输入本身是累计快照，
-  继续 `clearing=false`，避免从错误的 map 原点向全图做射线清除。
-  global 累计点的 range 也不再以 map 原点限制为 8 m，否则机器人走远后
-  当前 rolling window 内的真实障碍会被误删。
+- global/local costmap 都是 rolling window。global 插件顺序固定为
+  `StaticLayer -> live ObstacleLayer -> InflationLayer`：StaticLayer 消费完整的
+  `/ubuntu/navigation/static_map`，live layer 与 local costmap 一样消费实时
+  `/ubuntu/navigation/cloud_registered` 并开启 marking/raytrace clearing。
+  live layer 只表达当前动态环境并依靠 raytrace clearing 更新，不会把人员等
+  单帧障碍写进持久静态图；只有 FAST-LIVO2 adapter 运动门控并多帧确认后的
+  OccupancyGrid 才能进入 StaticLayer。
+- adapter 以“紧凑分量运动门 + 多帧体素证据”生成静态图：同一扫描的密集点
+  只计一次命中；连通分量先按不超过 `1.0 m` 的空间片拆分，移动空间片在
+  完整体素驻留观察窗内被隔离，并撤销其近期候选和已确认格。默认窗口为
+  `sqrt(2) * 0.10 / 0.03 + 0.40 ~= 5.114 s`，历史按 20 Hz 时间桶保存紧凑摘要，
+  完整观察窗最多 30 秒；全局 1,000,000 history-unit 预算覆盖轨迹、格、样本和
+  近期动态键，饱和时 fail closed，不随输入频率或短命目标无界增长；
+  稳定结构连续 8 帧且通过观察窗口后晋升。动态物体仍由 live layer 实时
+  marking/clearing；其他已进入静态层的旧格需连续 3 帧自由射线才显式发布为
+  `free=0`，不会因暂时不可见按 TTL 删除。重叠格内的原始点质心用于区分
+  真实平移和墙面可见子集变化；纯几何门仍不能识别长期静止人员。
+- 两层都使用卡片的 `obstacle_min_height_m/obstacle_max_height_m` 预过滤；旧
+  `/ubuntu/navigation/obstacle_map` 仅作兼容诊断，不再以 `clearing=false`
+  驱动全局代价图。confirmed static PCD 加载时还要求保存的高度带与当前配置
+  完全一致，不一致则拒绝加载并要求恢复配置或重新建图。
 - 两张 costmap 保留 `inflation_radius=0.55 m`。G1 矩形 footprint 的外接半径
   约 `0.425 m`，该配置实际额外余量约 `0.125 m`，不是这次过度占用的首要根因。
   heartbeat/status 的 `global_costmap` 字段现在分别给出 inflated、inscribed、
-  lethal 数量及比例，用于独立评估累计障碍图是否过度占用，不通过
+  lethal 数量及比例，用于独立评估静态图与实时层是否过度占用，不通过
   缩小安全边界掩盖问题。
 - Rotation Shim 在航向偏差大时先旋转；当前 DWB 仍只采样 `x/yaw`，
   proposal 出口把弧线速度离散成“只转”或“只走”，并对 X/Y/yaw
@@ -154,6 +164,14 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
 - Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；
   proposal bridge 始终检查真正的根 `/cmd_vel`，发现外部发布者仍会拒绝导航。
+
+上游 adapter 在发布 planning 输入前对单帧 live cloud 同时实施 200,000 点和
+64 MiB 数据区上限；静态证据和 confirmed static map 各自最多 200,000 点，
+超限均 fail closed。保存/加载会话最多包含 64 个 raw PCD，raw 与 static PCD
+合计最多 512 MiB；manifest、PCD header 和 ASCII 单行都有 64 KiB 有界读取，
+ASCII token 布局和数据行必须与声明精确一致。`load_map` 会在
+停止旧定位前端前验证 manifest、全部 PCD、障碍高度带和静态 OccupancyGrid
+边界，因此 planning 不会在未验证新图上切换 StaticLayer。
 
 ### 终点整形与并发保护
 
@@ -171,7 +189,7 @@ shadow velocity 回调在计算后、发布 proposal 前会在同一互斥区内
 
 ## 统一卡片连线
 
-odom、registered cloud 和 obstacle map 由 `NavigationPlugin` 固定为同容器
+odom、registered cloud 和 static map 由 `NavigationPlugin` 固定为同容器
 内部 topic，不需要 Canvas 连线。Canvas 只需把公开 `velocity_proposal`
 输出接到 Driver `loco.velocity_proposal`；可选 `goal_pose` 仍可作为外部输入。
 
@@ -228,6 +246,11 @@ bash perception/plugins/navigation/deploy/scripts/deploy-g1.sh
 Canvas 启动时 Nav2 只等待同容器 runtime 的 DDS 控制面，不等待 odom/cloud，避免
 与 FAST-LIVO2 的 `start_mapping` action 形成生命周期环形等待。真正执行
 `navigate_to_pose` 时仍会严格检查输入 freshness、frame、TF 和 lifecycle。
+地图收口和加载的 backend 等待预算分别至少 360 s 与 900 s；可重试的
+`stop_mapping` 会保留统一卡片 wiring 和 pending transaction，永久失败才释放
+mapping 控制对象并继续整体停止。成功终态可对同名迟到请求幂等重放。统一
+Runtime 对 launch 根进程及其独立 Linux 后代进程组执行有界信号阶梯回收，
+不会因根进程提前退出而把算法子进程遗留在容器内。
 
 ## 验收边界
 

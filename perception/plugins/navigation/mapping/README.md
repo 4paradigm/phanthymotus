@@ -16,6 +16,7 @@ Driver navigation_sensors
        FAST-LIVO2 internal module
               |-- /ubuntu/navigation/odom
               |-- /ubuntu/navigation/cloud_registered
+              |-- /ubuntu/navigation/static_map
               |-- /ubuntu/navigation/obstacle_map
               |-- TF map -> base_link
               `-- /ubuntu/navigation/fast_livo2/map_view
@@ -53,14 +54,37 @@ adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms �
 | port                | topic                                             | frame              | 用途                            |
 | ------------------- | ------------------------------------------------- | ------------------ | ----------------------------- |
 | `livo_odom`         | `/ubuntu/navigation/odom`                         | `map -> base_link` | Nav2 位姿与速度反馈                  |
-| `registered_cloud`  | `/ubuntu/navigation/cloud_registered`             | `map`              | Nav2 rolling costmap 障碍输入     |
-| `obstacle_map`      | `/ubuntu/navigation/obstacle_map`                 | `map`              | 去除地板/天花板后累计投影的 Nav2 全局二维障碍输入  |
-| `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 体素化累计地图和机器人位置          |
+| `registered_cloud`  | `/ubuntu/navigation/cloud_registered`             | `map`              | Nav2 实时障碍层输入                        |
+| `static_map`        | `/ubuntu/navigation/static_map`                   | `map`              | 运动门控并经多帧确认的完整二维 OccupancyGrid，供 Nav2 StaticLayer |
+| `obstacle_map`      | `/ubuntu/navigation/obstacle_map`                 | `map`              | 运动门控静态障碍的兼容诊断投影                |
+| `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 静态体素地图、最新阈值调试帧和机器人位置           |
 | `status`            | `/ubuntu/navigation/fast_livo2/status`            | JSON               | 算法进程、输入 freshness、frame 和产物状态 |
 | `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | JSON               | 录制进程、每路计数、丢失/过期源与停止回执         |
 
-在 `0.10 m` 体素去重后，Canvas 地图保留当前会话的全部占用点，不再按
-80,000 点截断；Agent Core 在显示层
+adapter 先按 `0.10 m` 体素把同一帧命中去重；导航高度带内的同一体素默认
+需要连续 8 个扫描支持才进入稳定静态图，候选点默认 1 秒过期。二维连通
+分量会按不超过 `1.0 m` 的固定空间片分解后经过运动门。默认完整观察窗为
+`max(0.8, 0.03 / 0.03, sqrt(2) * 0.10 / 0.03 + 0.40)`，即约
+`5.114 s`；最后一项保证以阈值速度运动的返回即使从体素最不利位置进入，
+也必须跨过完整体素对角线。轨迹和动态格历史按 20 Hz 时间桶保存紧凑二进制
+摘要；完整观察窗最多 30 秒，所有轨迹、栅格、样本及近期动态键合计最多
+1,000,000 个 history units。同一时间桶只更新几何，不滑动其时间戳；高频输入
+和短命目标都不能扩大历史，预算饱和时保持隔离并 fail closed。连续两次成立
+即视为动态，隔离当前空间片并撤销其近期
+候选和已确认静态证据。动态分量停止 `1.5 s` 后才重新开始静态确认。稀疏到
+单格的分量同样受运动门约束；长墙会被分片，而不是让与墙相连的移动物体
+绕过运动门。判断同时比较重叠栅格内的原始点质心，因此墙面只改变可见子集
+不会仅因整体质心偏移就被整片删除。
+
+点云只和源时间戳相差不超过 `50 ms` 的 canonical odom 位姿配对；不匹配帧
+跳过静态证据更新并进入 diagnostics 计数，不能拿最新位姿清除旧点。已确认点
+不会因暂时离开视野而删除，但同一格连续 3 帧被射线观察为空闲后会移除。
+上述门控不替代人员语义分割：静止人员最终仍可能进入静态图；人与墙相连时
+空间分片可避免整块大分量直接绕过，但极端稀疏、遮挡或传感器噪声下仍不能
+提供语义级人员识别保证。当前 registered cloud 始终独立进入 Nav2
+实时障碍层，所以被静态门隔离的移动物体仍参与即时避障。Canvas 地图不再按
+80,000 点截断；稳定部分显示多帧确认结果，高度带外仅叠加新鲜的最新扫描，
+用于蓝色/粉色阈值调试而不进入累计静态图。Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
 `map_view` 点数组语义，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
 重定位成功前不显示伪造的机器人位姿。地图卡片支持三维
@@ -68,13 +92,24 @@ adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms �
 一份 occupancy grid。绿色机器人箭头沿 canonical `base_link` 的 `+X` 前向，
 并保持 ROS `map` frame 的 yaw 正方向。它是监控视图，不是
 可重定位地图格式。原始 PCD 分片保存在宿主机
-`/opt/phanthy-motus/data/fast_livo2/maps`。
+`/opt/phanthy-motus/data/fast_livo2/maps`；`stop_mapping` 还会原子写入
+`maps/static/<map>-*.static.pcd`，保存导航高度带内经运动门控和多帧确认的静态点。
 
-Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。卡片配置
+live PointCloud2 在复制数据区前同时检查 `width * height <= 200,000` 和
+`data <= 64 MiB`；静态候选证据及加载后的 confirmed static map 各自也以
+200,000 点为硬上限。live frame、静态证据或确认图超限都会 fail closed，
+不会用静默下采样改变占用语义。用于有界重定位的 raw PCD 读取仍可在总预算内
+抽样到最多 200,000 个参考点。
+
+Nav2 的全局静态层使用 `/ubuntu/navigation/static_map`，实时动态层使用
+`/ubuntu/navigation/cloud_registered`；`obstacle_map` 只保留为兼容诊断，不再
+驱动 global costmap。卡片配置
 `obstacle_min_height_m` 和 `obstacle_max_height_m` 定义 `map` frame 中参与
 二维导航的 Z 高度带，默认 `-0.30…+0.30 m`，可在 Canvas 停止卡片后调整，
-下次启动生效。adapter 用同一高度带过滤实时 Nav2 点云，并将累计图按 XY
-体素去重投影到 `z=0`；完整三维点仍保留在 `map_view`。监控中低于下界的点
+下次启动生效。adapter 用同一高度带过滤实时 Nav2 点云，并把稳定静态图输出
+为 `-1/0/100` 的完整 OccupancyGrid；单帧超出 `8.5 m` 的点不参与静态证据，
+栅格还受单边 `2,048` 格、总计 `2,000,000` 格的硬上限保护，异常外点或
+无界轨迹会 fail closed，不会分配无限地图。监控中低于下界的最新点
 显示为蓝色，高于上界的点显示为粉色，范围内点继续使用彩虹高度色，并显示
 当前阈值图例。阈值是地图坐标，不直接等同于雷达物理安装高度；应结合现场
 地面色带和低矮障碍调节，且必须满足 `-3.0 <= min < max <= 3.0`。
@@ -84,12 +119,14 @@ Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。卡片配
 | action          | 参数                                                                                    | 语义                                                    |
 | --------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | `start_mapping` | `map_name`                                                                            | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程                    |
-| `stop_mapping`  | 无                                                                                     | `SIGINT` 停止算法，等待尾段保存并写 session manifest               |
+| `stop_mapping`  | 无                                                                                     | 先检查静态证据，再 `SIGINT` 停止算法；分别保存 raw PCD 与 confirmed static PCD 后原子写 session manifest；保存失败可用同一 action 重试 |
 | `load_map`      | `map_name`                                                                            | 先校验新旧 manifest/PCD，再串行替换定位前端，失败时尝试回滚旧图 |
 | `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
 
 `map_name` 只允许 `A-Z a-z 0-9 _ . -`，最长 64 字符。停止 Canvas 时若仍在
-建图，卡片会先执行 `stop_mapping` 再释放 ROS backend。
+建图，卡片会先执行 `stop_mapping` 再释放 ROS backend。直接杀死容器或 ROS
+进程不具备完成跨进程静态图事务的条件，只会受控终止算法并明确留下无成功
+manifest 的产物；需要可加载地图时必须先获得 `stop_mapping.status=saved`。
 FAST-LIVO2 在受控 `SIGINT` 收口期间可因上游 C++ 析构路径返回
 `-SIGABRT (-6)`。supervisor 仅在自己已发出停止信号的路径将 `0/-SIGINT/-SIGABRT`
 视为受控停止，并在回执保留原始 `algorithm_return_code`；运行中自行 `-6`
@@ -128,12 +165,50 @@ fail closed。
 
 - Core 和 supervisor 都将 `start_mapping` / `stop_mapping` / `load_map` /
   `relocalize` 收口到单一地图生命周期锁；采集启停使用独立锁，
-  不会与地图操作互相阻塞。
+  不会与地图操作互相阻塞。并发生命周期请求立即返回 `runtime_busy`，不占满
+  executor callback 线程。`stop_mapping` 的外层等待预算至少 360 s，覆盖算法
+  最长 120 s 受控停止、adapter 最长 130 s 保存及有界快照/fsync；`load_map`
+  的外层等待预算至少 900 s。两者不会被较小的普通请求超时配置缩短。
+- `stop_mapping` 在发送停止信号前要求收到当前 session 的新鲜静态图诊断，
+  且至少已有 40 个 confirmed 点；否则保留建图进程并返回可重试错误。算法
+  已正常停止后进入 `finalizing`，静态 PCD 或 manifest 写失败不会清除会话，
+  再次执行 `stop_mapping` 会继续同一事务；adapter 会复用已成功保存的静态
+  PCD，避免重试生成重复文件。I/O 或响应超时属于可重试失败，mapping core、
+  Canvas wiring 和 pending transaction 均保留；结构、路径或资源上限错误属于
+  永久失败，会释放 mapping 控制对象并让统一卡片继续停止其他模块。若同名
+  stop 请求在事务已成功后迟到，supervisor 会幂等重放原 `saved` 回执并标记
+  `already_finalized=true`，不会重复产出地图。
 - 地图替换是带 best-effort 旧图恢复的串行事务，不是两个前端
-  同时运行的无损热切换。验收必须读回 `status/error_code`、
+  同时运行的无损热切换。目标 manifest/PCD、障碍高度带、点数及完整静态
+  OccupancyGrid 的尺寸/总格数会在停止旧前端之前全部验证；验证失败时旧图
+  保持运行。验收必须读回 `status/error_code`、
   `rollback_status`、`loaded_map` 和 `runtime_mode`。
-- binary PCD 按采样点偏移流式读取，不再将完整 payload 读入内存；
-  路径仍只能来自当前 map root 下通过 manifest 校验的 PCD。
+- binary PCD 按采样点偏移流式读取，不再将完整 payload 读入内存；PCD header
+  和 ASCII 单条记录均限制为 64 KiB。ASCII token 布局、非空行数必须与声明
+  完全一致，多 token、多行或少行均拒绝，解析过程持续检查 map-control
+  deadline。每张图最多接受 64 个 raw PCD，manifest 最大 64 KiB，raw 会话快照与 confirmed static PCD
+  合计最多 512 MiB；单个 PCD 另有 1 GiB 上限，但仍受更小的会话总量约束。
+  raw 重定位参考点最多抽样 200,000 个，而 confirmed static map 超过
+  200,000 点会直接拒绝，不做抽样。manifest
+  的 `pcd_files` 继续保存 raw PCD 并仅用于有界重定位；
+  `static_map_pcd` 保存导航高度带内的确认静态点并用于 Canvas/StaticLayer。
+  新保存的 manifest 带 `static_map_format_version=2`，缺少 confirmed static
+  PCD 会 fail closed；旧版 manifest 没有该版本字段时兼容回退到 raw PCD，并在加载回执标记
+  `static_map_source=legacy_raw`；该回退不具备动态物体过滤保证。所有路径仍须
+  位于当前 map root 的固定目录。confirmed static PCD 会同时记录建图时的
+  `obstacle_height_range_m`；加载时必须与当前卡片上下界一致，否则 fail closed，
+  操作者应恢复原上下界或重新建图，不能用另一套高度语义解释既有静态证据。
+  raw 或 static 任一保存失败都不会发布新的成功 manifest；永久收口失败会
+  best-effort 删除本次未提交快照，避免无 manifest 产物持续占用磁盘。
+
+- `load_map` 先在当前状态之外完成 PCD 解析、静态体素化和完整 OccupancyGrid
+  构建；deadline 内仅进行 O(1) 状态指针切换，控制回执发布后才序列化并发布
+  大栅格。超时发生在 commit 前时旧图和定位状态保持不变。
+
+统一 Runtime 会持续记录 launch 进程产生的独立 Linux 子进程组。停止或启动
+回滚时，即使 launch 根进程已先退出，也会在校验进程组 leader 的启动时刻后，
+按有界 `SIGINT` grace、`SIGTERM` 2 s、`SIGKILL` 2 s 阶梯回收；非 Linux
+环境没有 `/proc` 时只执行常规 launch 进程组清理。
 
 ## 自动数据采集
 

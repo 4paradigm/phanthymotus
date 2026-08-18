@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,8 +17,14 @@ PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
 from plugins.navigation.contract import navigation_tool_definition  # noqa: E402
+from plugins.navigation.mapping.backend import RosTopicFastLivo2Backend  # noqa: E402
+from plugins.navigation.mapping.core import FastLivo2BackendError  # noqa: E402
+from plugins.navigation.mapping.plugin import FastLivo2Plugin  # noqa: E402
 from plugins.navigation.plugin import NavigationPlugin  # noqa: E402
-from plugins.navigation.runtime import NavigationRuntime  # noqa: E402
+from plugins.navigation.runtime import (  # noqa: E402
+    NavigationRuntime,
+    _OwnedProcessGroup,
+)
 
 
 class FakeRuntime:
@@ -44,9 +54,10 @@ class FakeRuntime:
 
 
 class FakeComponent:
-    def __init__(self, name, *, fail_start=False):
+    def __init__(self, name, *, fail_start=False, stop_result=None):
         self.name = name
         self.fail_start = fail_start
+        self.stop_result = stop_result
         self.calls = []
         self.started = False
 
@@ -60,10 +71,43 @@ class FakeComponent:
             return {"state": "ready", "status": "ready"}
         if action == "stop":
             self.started = False
+            if self.stop_result is not None:
+                return dict(self.stop_result)
             return {"state": "idle", "status": "idle"}
         if action == "info":
             return {"state": "ready" if self.started else "idle"}
         return {"status": action, "component": self.name}
+
+
+class RetryableMappingBackend:
+    def __init__(self):
+        self.stop_calls = 0
+
+    def info(self):
+        return {
+            "state": "ready",
+            "status": "ready",
+            "backend": "fast_livo2_ros_topic",
+            "bridge_subscribers": 1,
+        }
+
+    def execute(self, action, args):
+        if action == "configure_obstacle_filter":
+            return {"status": "configured"}
+        if action == "configure_collection":
+            return {"status": "recording" if args["enabled"] else "disabled"}
+        if action == "start_mapping":
+            return {"status": "mapping", "map_name": args["map_name"]}
+        if action == "stop_mapping":
+            raise FastLivo2BackendError(
+                "manifest_write_failed",
+                "temporary persistence failure",
+                details={"retryable": True},
+            )
+        raise AssertionError(f"unexpected mapping action: {action}")
+
+    def stop(self):
+        self.stop_calls += 1
 
 
 def _external_bindings():
@@ -98,6 +142,7 @@ class NavigationContractTest(unittest.TestCase):
                 "livo_odom",
                 "registered_cloud",
                 "obstacle_map",
+                "static_map",
                 "collection_status",
             }.isdisjoint({item["port"] for item in tool["topic_out"]})
         )
@@ -343,6 +388,10 @@ class NavigationPluginTest(unittest.TestCase):
             planning_topics["registered_cloud"],
             "/ubuntu/navigation/cloud_registered",
         )
+        self.assertEqual(
+            planning_topics["static_map"],
+            "/ubuntu/navigation/static_map",
+        )
         semantic_start = next(args for _, args in semantic.calls if args["action"] == "start")
         self.assertEqual(
             {item["port"] for item in semantic_start["input_bindings"]},
@@ -405,6 +454,78 @@ class NavigationPluginTest(unittest.TestCase):
             ],
             "semantic",
         )
+
+    def test_retryable_mapping_stop_keeps_runtime_and_canvas_lifecycle(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent(
+            "mapping",
+            stop_result={
+                "state": "error",
+                "status": "error",
+                "error_code": "manifest_write_failed",
+                "error": "temporary persistence failure",
+                "retryable": True,
+            },
+        )
+        planning = FakeComponent("planning")
+        semantic = FakeComponent("semantic")
+        plugin = self.make_plugin(
+            runtime=runtime,
+            mapping=mapping,
+            planning=planning,
+            semantic=semantic,
+        )
+        plugin.dispatch(
+            "controlled_semantic_spatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "navigation_stop_pending")
+        self.assertTrue(result["retryable"])
+        self.assertTrue(runtime.started)
+        self.assertEqual(runtime.stop_calls, 0)
+        self.assertTrue(plugin._started)
+        self.assertFalse(any(args["action"] == "stop" for _, args in planning.calls))
+        self.assertFalse(any(args["action"] == "stop" for _, args in semantic.calls))
+
+    def test_real_mapping_retryability_reaches_unified_lifecycle(self):
+        runtime = FakeRuntime()
+        backend = RetryableMappingBackend()
+        mapping = FastLivo2Plugin({}, None, backend=backend)
+        planning = FakeComponent("planning")
+        semantic = FakeComponent("semantic")
+        plugin = self.make_plugin(
+            runtime=runtime,
+            mapping=mapping,
+            planning=planning,
+            semantic=semantic,
+        )
+        started = plugin.dispatch(
+            "controlled_semantic_spatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+        self.assertEqual(started["state"], "ready")
+        mapping_started = plugin.dispatch(
+            "controlled_semantic_spatial",
+            {"action": "start_mapping", "map_name": "office"},
+        )
+        self.assertEqual(mapping_started["status"], "mapping")
+
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "navigation_stop_pending")
+        self.assertTrue(result["retryable"])
+        self.assertTrue(runtime.started)
+        self.assertEqual(runtime.stop_calls, 0)
+        self.assertTrue(plugin._started)
+        self.assertEqual(backend.stop_calls, 0)
+        self.assertTrue(
+            mapping.dispatch("fast_livo2", {"action": "info"})["canvas_wired"]
+        )
+        self.assertFalse(any(args["action"] == "stop" for _, args in planning.calls))
+        self.assertFalse(any(args["action"] == "stop" for _, args in semantic.calls))
 
     def test_unified_config_rejects_unknown_and_partial_vlm_fields(self):
         plugin = self.make_plugin()
@@ -484,6 +605,295 @@ class NavigationRuntimeTest(unittest.TestCase):
             stopped = runtime.stop()
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(killpg.call_count, 2)
+
+    def test_runtime_signals_owned_nested_session_groups_before_launch_group(self):
+        def factory(command, **kwargs):
+            del kwargs
+            return self.Process(command)
+
+        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        started = runtime.start()
+        root_groups = {
+            child["pid"]
+            for child in started["children"]
+            if child["pid"] is not None
+        }
+        nested_groups = {
+            pid: _OwnedProcessGroup(pid + 1000, f"start-{pid}")
+            for pid in root_groups
+        }
+        with mock.patch.object(
+            NavigationRuntime,
+            "_independent_descendant_process_groups",
+            side_effect=lambda pid: (nested_groups[pid],),
+        ), mock.patch.object(
+            NavigationRuntime,
+            "_remaining_process_groups",
+            side_effect=lambda groups: groups,
+        ), mock.patch.object(
+            NavigationRuntime,
+            "_wait_for_process_groups",
+            return_value=(),
+        ), mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+            stopped = runtime.stop()
+
+        self.assertEqual(stopped["state"], "idle")
+        calls = [(call.args[0], call.args[1]) for call in killpg.call_args_list]
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(sig == signal.SIGINT for _, sig in calls))
+        self.assertEqual(
+            {group for group, _ in calls},
+            root_groups | {pid + 1000 for pid in root_groups},
+        )
+
+    def test_runtime_escalates_nested_group_when_launch_root_exits_first(self):
+        def factory(command, **kwargs):
+            del kwargs
+            return self.Process(command)
+
+        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        runtime._children = runtime._children[:1]
+        started = runtime.start()
+        root_pid = started["children"][0]["pid"]
+        nested_group = _OwnedProcessGroup(root_pid + 1000, "owned-start")
+
+        with mock.patch.object(
+            NavigationRuntime,
+            "_independent_descendant_process_groups",
+            return_value=(nested_group,),
+        ), mock.patch.object(
+            NavigationRuntime,
+            "_remaining_process_groups",
+            side_effect=lambda groups: groups,
+        ), mock.patch.object(
+            NavigationRuntime,
+            "_wait_for_process_groups",
+            side_effect=[(nested_group,), (nested_group,), ()],
+        ), mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+            stopped = runtime.stop()
+
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in killpg.call_args_list],
+            [
+                (nested_group.group_id, signal.SIGINT),
+                (root_pid, signal.SIGINT),
+                (nested_group.group_id, signal.SIGTERM),
+                (nested_group.group_id, signal.SIGKILL),
+            ],
+        )
+
+    def test_runtime_drops_reused_descendant_group_identity(self):
+        owned_group = _OwnedProcessGroup(1234, "original-start")
+        with mock.patch(
+            "plugins.navigation.runtime.os.getpgid", return_value=1234
+        ), mock.patch.object(
+            NavigationRuntime,
+            "_process_start_time",
+            return_value="replacement-start",
+        ):
+            remaining = NavigationRuntime._remaining_process_groups(
+                (owned_group,)
+            )
+
+        self.assertEqual(remaining, ())
+
+    def test_runtime_uses_cached_group_after_root_exited_before_stop(self):
+        def factory(command, **kwargs):
+            del kwargs
+            return self.Process(command)
+
+        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        runtime._children = runtime._children[:1]
+        runtime.start()
+        child = runtime._children[0]
+        nested_group = _OwnedProcessGroup(child.process.pid + 1000, "cached")
+        with child.independent_groups_lock:
+            child.independent_groups[nested_group.group_id] = nested_group
+        child.process.return_code = 0
+
+        with mock.patch.object(
+            NavigationRuntime,
+            "_independent_descendant_process_groups",
+            return_value=(),
+        ), mock.patch.object(
+            NavigationRuntime,
+            "_remaining_process_groups",
+            side_effect=lambda groups: groups,
+        ), mock.patch.object(
+            NavigationRuntime,
+            "_wait_for_process_groups",
+            side_effect=[(nested_group,), ()],
+        ), mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+            stopped = runtime.stop()
+
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in killpg.call_args_list],
+            [
+                (nested_group.group_id, signal.SIGINT),
+                (nested_group.group_id, signal.SIGTERM),
+            ],
+        )
+
+    def test_runtime_never_signals_reused_cached_group_identity(self):
+        def factory(command, **kwargs):
+            del kwargs
+            return self.Process(command)
+
+        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        runtime._children = runtime._children[:1]
+        runtime.start()
+        child = runtime._children[0]
+        reused_group = _OwnedProcessGroup(child.process.pid + 1000, "old-start")
+        with child.independent_groups_lock:
+            child.independent_groups[reused_group.group_id] = reused_group
+        child.process.return_code = 0
+
+        with mock.patch.object(
+            NavigationRuntime,
+            "_independent_descendant_process_groups",
+            return_value=(),
+        ), mock.patch.object(
+            NavigationRuntime,
+            "_remaining_process_groups",
+            return_value=(),
+        ), mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+            stopped = runtime.stop()
+
+        self.assertEqual(stopped["state"], "idle")
+        killpg.assert_not_called()
+
+    @unittest.skipUnless(
+        Path("/proc/self/stat").exists(), "requires Linux procfs"
+    )
+    def test_runtime_reaps_cached_nested_group_after_root_already_exited(self):
+        nested_code = (
+            "import signal,time\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            "time.sleep(60)\n"
+        )
+        launcher_code = (
+            "import subprocess,sys,time\n"
+            "child=subprocess.Popen(\n"
+            f"    [sys.executable, '-c', {nested_code!r}],\n"
+            "    stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            "    start_new_session=True,\n"
+            ")\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(0.4)\n"
+        )
+        created = []
+        nested_pid = None
+
+        def factory(command, **kwargs):
+            del command
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.PIPE
+            kwargs["text"] = True
+            process = subprocess.Popen(
+                [sys.executable, "-c", launcher_code], **kwargs
+            )
+            created.append(process)
+            return process
+
+        def pid_is_running(pid):
+            try:
+                raw_stat = Path(f"/proc/{pid}/stat").read_text(
+                    encoding="ascii"
+                )
+            except OSError:
+                return False
+            command_end = raw_stat.rfind(")")
+            fields = raw_stat[command_end + 1 :].split()
+            return bool(fields) and fields[0] != "Z"
+
+        runtime = NavigationRuntime(
+            popen_factory=factory,
+            startup_grace_sec=0,
+            stop_timeout_sec=0.5,
+        )
+        runtime._children = runtime._children[:1]
+        try:
+            runtime.start()
+            root_process = created[0]
+            nested_pid = int(root_process.stdout.readline().strip())
+            root_process.wait(timeout=2.0)
+            self.assertTrue(pid_is_running(nested_pid))
+
+            stopped = runtime.stop()
+
+            self.assertEqual(stopped["state"], "idle")
+            deadline = time.monotonic() + 2.0
+            while pid_is_running(nested_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(pid_is_running(nested_pid))
+        finally:
+            if nested_pid is not None and pid_is_running(nested_pid):
+                try:
+                    os.killpg(nested_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+class FastLivo2BackendTest(unittest.TestCase):
+    def test_stop_mapping_timeout_covers_supervisor_shutdown_and_map_save(self):
+        backend = object.__new__(RosTopicFastLivo2Backend)
+        backend._request_timeout = 5.0
+
+        self.assertEqual(backend._response_timeout("start_mapping"), 5.0)
+        self.assertEqual(backend._response_timeout("stop_mapping"), 360.0)
+        self.assertEqual(backend._response_timeout("unload_map"), 360.0)
+        self.assertEqual(backend._response_timeout("load_map"), 900.0)
+        self.assertEqual(backend._response_timeout("relocalize"), 180.0)
+        backend._request_timeout = 400.0
+        self.assertEqual(backend._response_timeout("stop_mapping"), 400.0)
+        self.assertEqual(backend._response_timeout("unload_map"), 400.0)
+        self.assertEqual(backend._response_timeout("load_map"), 900.0)
+        self.assertEqual(backend._response_timeout("relocalize"), 400.0)
+
+    def test_late_backend_response_is_not_retained(self):
+        backend = object.__new__(RosTopicFastLivo2Backend)
+        backend._condition = threading.Condition()
+        backend._last_status = {}
+        backend._responses = {}
+        backend._pending_requests = {"active"}
+
+        backend._on_status(
+            type(
+                "Message",
+                (),
+                {
+                    "data": json.dumps(
+                        {
+                            "event": "response",
+                            "request_id": "late",
+                            "status": "saved",
+                        }
+                    )
+                },
+            )()
+        )
+        self.assertEqual(backend._responses, {})
+
+        backend._on_status(
+            type(
+                "Message",
+                (),
+                {
+                    "data": json.dumps(
+                        {
+                            "event": "response",
+                            "request_id": "active",
+                            "status": "saved",
+                        }
+                    )
+                },
+            )()
+        )
+        self.assertIn("active", backend._responses)
 
 
 if __name__ == "__main__":

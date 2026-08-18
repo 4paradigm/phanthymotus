@@ -181,6 +181,7 @@ class FastLivo2Core:
                 "replaced_map",
                 "rollback_status",
                 "rollback_error",
+                "retryable",
             ):
                 if key in exc.details:
                     error[key] = exc.details[key]
@@ -215,7 +216,11 @@ class FastLivo2Core:
                     self._loaded_map = (
                         str(restored) if isinstance(restored, str) else None
                     )
-            return self._error("stop_localization", exc.code, str(exc))
+            error = self._error("stop_localization", exc.code, str(exc))
+            for key in ("loaded_map", "runtime_mode", "retryable"):
+                if key in exc.details:
+                    error[key] = exc.details[key]
+            return error
         except Exception as exc:
             return self._error(
                 "stop_localization",
@@ -232,7 +237,10 @@ class FastLivo2Core:
             try:
                 return dict(self._backend.execute("configure_collection", dict(config)))
             except FastLivo2BackendError as exc:
-                return self._error("configure_collection", exc.code, str(exc))
+                error = self._error("configure_collection", exc.code, str(exc))
+                if "retryable" in exc.details:
+                    error["retryable"] = exc.details["retryable"]
+                return error
             except Exception as exc:
                 return self._error(
                     "configure_collection",
@@ -248,7 +256,12 @@ class FastLivo2Core:
                     self._backend.execute("configure_obstacle_filter", dict(config))
                 )
             except FastLivo2BackendError as exc:
-                return self._error("configure_obstacle_filter", exc.code, str(exc))
+                error = self._error(
+                    "configure_obstacle_filter", exc.code, str(exc)
+                )
+                if "retryable" in exc.details:
+                    error["retryable"] = exc.details["retryable"]
+                return error
             except Exception as exc:
                 return self._error(
                     "configure_obstacle_filter",

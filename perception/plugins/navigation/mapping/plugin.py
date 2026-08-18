@@ -293,6 +293,9 @@ class FastLivo2Plugin:
             if isinstance(result, dict) and result.get("status") == "error"
         ]
         if failures:
+            retryable = any(result.get("retryable") is True for result in failures)
+            if not retryable:
+                self._release_core()
             return {
                 "state": "error",
                 "status": "error",
@@ -301,9 +304,10 @@ class FastLivo2Plugin:
                     str(result.get("error", result.get("error_code", "stop failed")))
                     for result in failures
                 ),
-                "canvas_wired": True,
+                "canvas_wired": retryable,
                 "stop_result": stop_result,
                 "collection_stop_result": collection_stop_result,
+                "retryable": retryable,
                 "physical_execution": False,
             }
         self._release_core()

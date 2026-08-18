@@ -50,6 +50,7 @@ class FastLivo2ContractTest(unittest.TestCase):
                 "livo_odom",
                 "registered_cloud",
                 "obstacle_map",
+                "static_map",
                 "map_view",
                 "status",
                 "collection_status",
@@ -61,6 +62,13 @@ class FastLivo2ContractTest(unittest.TestCase):
             outputs["obstacle_map"]["topic"], "/ubuntu/navigation/obstacle_map"
         )
         self.assertEqual(outputs["obstacle_map"]["frame_id"], "map")
+        self.assertEqual(outputs["static_map"]["topic"], "/ubuntu/navigation/static_map")
+        self.assertEqual(outputs["static_map"]["ros_type"], "nav_msgs/msg/OccupancyGrid")
+        self.assertEqual(
+            outputs["static_map"]["qos"],
+            "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
+        )
+        self.assertEqual(outputs["static_map"]["frame_id"], "map")
         self.assertEqual(outputs["map_view"]["schema"], "phanthy.navigation.map_view.v1")
         self.assertEqual(
             outputs["collection_status"]["schema"],
@@ -210,13 +218,60 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn('"obstacle_min_height_m", -0.30', adapter)
         self.assertIn('"obstacle_max_height_m", 0.30', adapter)
         self.assertIn('action == "configure_obstacle_filter"', adapter)
+        self.assertIn('action == "save_static_map"', adapter)
+        self.assertIn('action == "validate_map"', adapter)
+        self.assertIn("self._static_save_result", adapter)
+        self.assertNotIn("and self._static_save_result is not None", adapter)
+        self.assertIn('"map_load_max_points", 200000', adapter)
+        self.assertIn('"static_map_load_max_points", 200000', adapter)
+        self.assertIn('"static_confirmation_frames", 8', adapter)
+        self.assertIn("nearest_stamped_pose(", adapter)
+        self.assertIn('self._mode = "finalizing"', adapter)
+        self.assertIn("self._static_map.observe_scan(", adapter)
+        self.assertIn("self._static_map.prepare_confirmed(static_loaded.points)", adapter)
+        self.assertIn("self._static_map.apply_prepared_confirmed(prepared)", adapter)
+        self.assertIn('result.pop("_post_response", None)', adapter)
         self.assertIn('action == "configure_obstacle_filter"', supervisor)
+        self.assertIn("self._map_artifacts_from_manifest(map_name)", supervisor)
+        self.assertIn('self._adapter_execute("validate_map", validation_args)', supervisor)
+        self.assertIn("self._snapshot_session_pcd_files(", supervisor)
+        self.assertIn("_MAX_MAP_ARTIFACT_FILES = 64", supervisor)
+        self.assertIn("_MAX_MAP_ARTIFACT_BYTES = 1_073_741_824", supervisor)
+        self.assertIn("_MAX_MAP_ARTIFACT_TOTAL_BYTES = 536_870_912", supervisor)
+        self.assertIn("_MAX_MAP_MANIFEST_BYTES = 65_536", supervisor)
+        self.assertIn('"static_map_save_failed"', supervisor)
+        self.assertIn('"manifest_write_failed"', supervisor)
+        self.assertIn("self._pending_mapping_finalize = pending", supervisor)
+        self.assertIn('"mapping_finalize_pending"', supervisor)
+        self.assertIn('"static_map_format_version": 2', supervisor)
+        self.assertIn('"retryable": True', supervisor)
+        self.assertIn("acquire(blocking=False)", supervisor)
+        self.assertIn('"static_map_status_unavailable"', supervisor)
+        self.assertNotIn("time.sleep(0.10)", supervisor)
+        self.assertIn('"static_map_pcd"', supervisor)
+        self.assertIn('args["obstacle_height_range_m"]', supervisor)
+        self.assertIn("normalize_obstacle_height_range(", supervisor)
+        self.assertIn("obstacle_height_ranges_match(", adapter)
+        self.assertIn(
+            "saved static map obstacle height range does not match",
+            adapter,
+        )
         frame_adapter = (runtime_package / "frame_adapter_core.py").read_text(
             encoding="utf-8"
         )
         self.assertIn("MVFILT2", frame_adapter)
+        self.assertIn("class TemporalOccupancyMap", frame_adapter)
+        self.assertIn("def write_pcd_xyz_atomic(", frame_adapter)
+        self.assertIn("max_declared_points", frame_adapter)
+        self.assertIn("_MAX_PCD_HEADER_BYTES = 65_536", frame_adapter)
+        self.assertIn("_MAX_PCD_ASCII_RECORD_BYTES = 65_536", frame_adapter)
+        self.assertIn("deadline_monotonic", frame_adapter)
         self.assertNotIn("payload = stream.read()", frame_adapter)
         self.assertIn("stream.seek(payload_offset + point_index * byte_offset)", frame_adapter)
+        mapping_backend = (
+            PERCEPTION_ROOT / "plugins" / "navigation" / "mapping" / "backend.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('if action == "stop_mapping"', mapping_backend)
 
     def test_g1_deploy_entrypoint_stays_narrow(self) -> None:
         deploy_script = (

@@ -166,8 +166,8 @@ class NavigationPlugin:
                     "topic": f"/{self._namespace}/navigation/cloud_registered",
                 },
                 {
-                    "port": "obstacle_map",
-                    "topic": f"/{self._namespace}/navigation/obstacle_map",
+                    "port": "static_map",
+                    "topic": f"/{self._namespace}/navigation/static_map",
                 },
             ]
             if "goal_pose" in wiring["wired_topics"]:
@@ -235,10 +235,37 @@ class NavigationPlugin:
 
     def _stop(self) -> dict:
         results = {}
+        # Mapping owns the only operation that can legitimately require a
+        # retryable stop: it must wait for FAST-LIVO2 to exit and persist the
+        # map transaction.  Do it first so a retry leaves all owned processes
+        # and the already-started Canvas lifecycle intact.
+        try:
+            results["mapping"] = self._mapping.dispatch(
+                "fast_livo2", {"action": "stop"}
+            )
+        except Exception as exc:
+            results["mapping"] = self._error("component_stop_failed", str(exc))
+        mapping_result = results["mapping"]
+        if (
+            isinstance(mapping_result, dict)
+            and mapping_result.get("retryable") is True
+            and (
+                mapping_result.get("status") == "error"
+                or mapping_result.get("state") == "error"
+            )
+        ):
+            return self._error(
+                "navigation_stop_pending",
+                "mapping finalization is retryable; retry stop without restarting "
+                "controlled_semantic_spatial",
+                component_results=results,
+                retryable=True,
+                canvas_wired=True,
+            )
+
         for name, plugin, prefix in (
             ("semantic", self._semantic, "vln"),
             ("planning", self._planning, "nav2"),
-            ("mapping", self._mapping, "fast_livo2"),
         ):
             try:
                 results[name] = plugin.dispatch(prefix, {"action": "stop"})

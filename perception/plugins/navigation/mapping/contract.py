@@ -110,7 +110,11 @@ FAST_LIVO2_ACTION_PARAMS = {
     },
     "stop_mapping": {
         "params": [],
-        "description": "Stop the active mapping session and finalize PCD files",
+        "description": (
+            "Stop the active mapping session and transactionally finalize raw "
+            "and confirmed-static PCD files; retry the same action after a "
+            "retryable persistence error"
+        ),
     },
     "load_map": {
         "params": ["map_name"],
@@ -222,8 +226,24 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map",
                 "units": "x/y=m; z=0 projected obstacle plane",
                 "desc": (
-                    "Accumulated XY obstacle projection after removing the G1 "
-                    "floor and ceiling height bands"
+                    "Motion-gated, multi-frame static XY obstacle projection kept "
+                    "for diagnostics and backward-compatible inspection"
+                ),
+            },
+            {
+                "port": "static_map",
+                "topic": f"{root}/navigation/static_map",
+                "format": "sensor/occupancy-grid",
+                "ros_type": "nav_msgs/msg/OccupancyGrid",
+                "qos": "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
+                "rate_hz": 1,
+                "timestamp": "adapter publish time, ROS system time",
+                "frame_id": "map",
+                "units": "resolution=m/cell; data=-1 unknown, 0 free, 100 occupied",
+                "desc": (
+                    "Full motion-gated, multi-frame static occupancy snapshot. "
+                    "Moving bounded spatial components revoke recent static evidence; "
+                    "repeated free rays clear other stale static cells."
                 ),
             },
             {
@@ -237,8 +257,9 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map",
                 "units": "x/y/z=m; yaw=rad",
                 "desc": (
-                    "Complete voxelized session map plus current base pose and "
-                    "optional obstacle-height metadata for Canvas"
+                    "Motion-gated confirmed in-band voxel map plus the latest "
+                    "out-of-band scan, current base pose and height metadata "
+                    "for Canvas"
                 ),
             },
             {

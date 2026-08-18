@@ -198,7 +198,9 @@ def nav2_tool_definition(namespace: str) -> dict:
         "multiInstance": False,
         "description": (
             "Nav2 planner and controller consuming FAST-LIVO2 localization and "
-            "accumulated 2D obstacles. This Perception card only emits "
+            "motion-gated confirmed static occupancy plus live clearing "
+            "obstacles. This "
+            "Perception card only emits "
             "bounded velocity proposals; an explicitly authorized Driver loco "
             "actuator owns any physical execution."
         ),
@@ -272,19 +274,19 @@ def nav2_tool_definition(namespace: str) -> dict:
                 ),
             },
             {
-                "port": "obstacle_map",
-                "topic": f"{root}/navigation/obstacle_map",
-                "format": "sensor/pointcloud",
-                "ros_type": "sensor_msgs/msg/PointCloud2",
-                "qos": "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
+                "port": "static_map",
+                "topic": f"{root}/navigation/static_map",
+                "format": "sensor/occupancy-grid",
+                "ros_type": "nav_msgs/msg/OccupancyGrid",
+                "qos": "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
                 "rate_hz": 1,
                 "timestamp": "FAST-LIVO2 adapter publish time",
                 "frame_id": "map",
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
-                "units": "x/y in meters; z=0 projected obstacle plane",
+                "units": "resolution=m/cell; data=-1 unknown, 0 free, 100 occupied",
                 "desc": (
-                    "Accumulated floor/ceiling-filtered 2D obstacle source for "
-                    "the Nav2 global costmap"
+                    "Motion-gated, multi-frame static occupancy source for "
+                    "the Nav2 global StaticLayer"
                 ),
             },
             {

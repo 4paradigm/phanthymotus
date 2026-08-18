@@ -45,7 +45,8 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
 | `plan` | `/plan` | 当前二维全局路径 |
 | `costmap` | `/global_costmap/costmap` | 实时全局代价地图 |
 
-`livo_odom`、registered cloud、obstacle map 和 collection status topic 仍由
+`livo_odom`、registered cloud、confirmed static map、obstacle map 和
+collection status topic 仍由
 同容器内的定位、规划、语义和数据采集逻辑消费或发布，只是不再生成 Canvas
 右侧连线端口。详细 frame、QoS、freshness 和速度约束见内部实现说明：
 
@@ -56,9 +57,43 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
 完整的静态插件配置样例见 [config.example.json](config.example.json)；其中
 `semantic.vlm.api_key` 必须通过部署配置或环境注入真实值，不能提交凭据。
 Canvas 的 `config` 动作还提供 `obstacle_min_height_m` 和
-`obstacle_max_height_m`。它们控制实时与累计二维障碍的 `map` frame 高度带，
-必须在卡片停止时修改；`map_view` 会保留范围外点并用蓝色/粉色标记，方便
-现场根据地面和天花板分布调参。
+`obstacle_max_height_m`。它们控制实时与稳定静态二维障碍的 `map` frame
+高度带，必须在卡片停止时修改；`map_view` 会把最新扫描的范围外点用
+蓝色/粉色标记，方便现场根据地面和天花板分布调参，但不会累计这些点。
+
+动态物体不会直接写入永久全局图：当前 registered cloud 始终独立进入 Nav2
+开启 marking/raytrace clearing 的 live ObstacleLayer；FAST-LIVO2 adapter 只有在
+运动门和多帧证据均通过后，才把 confirmed static OccupancyGrid 交给
+StaticLayer。静态层在连续 8 帧体素确认前，还会把二维连通分量拆成不超过
+`1.0 m` 的空间片执行运动跟踪。默认 `0.10 m` 体素、`0.03 m/s` 速度阈值和
+`0.40 s` 比较窗共同给出
+`sqrt(2) * 0.10 / 0.03 + 0.40 ~= 5.114 s` 的完整体素驻留观察窗；这比仅看
+`0.03 m` 位移所需的 `1.0 s` 更保守。历史按 20 Hz 时间桶保存紧凑二进制摘要，
+完整观察窗最多 30 秒；所有轨迹、栅格、样本和近期动态键合计最多
+1,000,000 个 history units，输入频率或短命目标增多都不会让历史无界增长。
+预算饱和时对应分量保持隔离并 fail closed。满足动态条件的局部
+格会被隔离，并撤销其近期的候选和已确认静态格；
+停止运动 `1.5 s` 后才重新开始静态确认。其他已确认静态格只有被连续 3 帧
+自由射线穿过才会清除。Canvas `map_view` 的稳定部分读取同一静态结果；高度
+带外仅叠加最新一帧用于阈值调试，不累计成拖尾。
+
+这是一套只依赖几何和时间的保守过滤，不是人员语义分割：已经静止足够久的
+人会按静态物体处理；空间分片会处理人与墙相连的常见情况，但极端稀疏、
+遮挡和噪声仍不具备语义分割保证。
+无论是否写入静态层，当前帧都继续进入实时障碍层，因此移动人员仍会触发
+即时避障。已保存的 confirmed static PCD 还会绑定建图时的障碍高度带；加载
+时若当前上下界不同会拒绝使用，需恢复原配置或重新建图，避免静态证据语义
+悄然变化。
+
+资源和地图事务均 fail closed：单帧 live PointCloud2 最多 200,000 点且数据区
+最多 64 MiB；静态候选证据和 confirmed static map 各最多 200,000 点，超限
+时不静默抽样。PCD header 和 ASCII 单条记录均限制为 64 KiB，ASCII token
+布局及实际非空数据行数必须与声明完全一致，解析还受 map-control deadline
+约束。manifest 最大 64 KiB。一次
+地图会话最多 64 个 raw PCD，raw 快照与 confirmed static PCD 合计最多
+512 MiB。`load_map` 会先完成新旧 manifest/PCD、障碍高度带及完整静态
+OccupancyGrid 边界验证，再停止旧定位前端；Adapter 先在旧状态之外准备图，
+deadline 内只做原子状态切换，并在控制回执之后发布大栅格。
 
 ## Actions
 
@@ -69,8 +104,16 @@ Canvas 的 `config` 动作还提供 `obstacle_min_height_m` 和
 - 语义地点：`capture`、`navigate`
 
 `start` 按 runtime → mapping → planning → semantic 顺序获取资源；任一步
-失败会按相反顺序回滚。`stop` 始终尝试停止所有内部模块和两个子进程组，
-并保留各模块回执，避免部分停止冒充成功。
+失败会按相反顺序回滚。`stop_mapping` 和 `load_map` 的 backend 等待预算分别
+至少为 360 s 和 900 s。可重试的地图收口失败会保留 Canvas wiring、运行时和
+`finalizing` 事务，下一次 `stop`/`stop_mapping` 从原事务继续；永久失败会释放
+mapping 控制对象，并继续回收其他模块和运行时。已完成的同名
+`stop_mapping` 终态可幂等重放原保存回执，避免迟到重试制造第二份成功结果。
+
+`stop` 始终尝试停止所有内部模块和两个 launch 子进程组，并保留各模块回执，
+避免部分停止冒充成功。Runtime 还跟踪 launch 进程派生的独立 Linux 进程组；
+即使根进程快速退出，也会按有界的 `SIGINT -> SIGTERM -> SIGKILL` 阶梯回收，
+并在首次发送信号前用进程启动时刻校验，避免 PID 复用误杀。
 
 ## 构建与本地部署验收
 
