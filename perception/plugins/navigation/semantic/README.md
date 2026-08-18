@@ -1,6 +1,6 @@
 # Navigation 内部视觉语言导航模块
 
-该模块属于统一 `navigation` 卡片，不再注册独立 `vln` 卡片。
+该模块属于统一 `controlled_semantic_spatial` 卡片，不再注册独立 `vln` 卡片。
 
 - `capture`：等待新的 RGB/odom 对，调用配置的 VLM 生成描述，并记录当前
   `map -> base_link` 位姿。

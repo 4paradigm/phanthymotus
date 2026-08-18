@@ -1,8 +1,8 @@
 """Own the ROS navigation runtime inside the Perception container.
 
-The public Navigation card is the only lifecycle owner.  FAST-LIVO2 adapters
-and Nav2 are regular child process groups in the same container; Docker is not
-used or required at runtime.
+The public controlled_semantic_spatial card is the only lifecycle owner.
+FAST-LIVO2 adapters and Nav2 are regular child process groups in the same
+container; Docker is not used or required at runtime.
 """
 
 from __future__ import annotations

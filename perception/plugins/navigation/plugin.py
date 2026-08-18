@@ -6,6 +6,7 @@ import logging
 import threading
 
 from .contract import (
+    CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
     NAVIGATION_ACTIONS,
     NAVIGATION_CONFIG_SCHEMA,
     navigation_tool_definition,
@@ -24,7 +25,7 @@ log = logging.getLogger(__name__)
 class NavigationPlugin:
     """Expose one Canvas card and one lifecycle for the whole navigation stack."""
 
-    PREFIX = "navigation"
+    PREFIX = CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME
 
     def __init__(
         self,
@@ -101,12 +102,14 @@ class NavigationPlugin:
             if not self._started:
                 return self._error(
                     "canvas_not_started",
-                    "connect LiDAR, IMU and RGB, then start the Navigation card",
+                    "connect LiDAR, IMU and RGB, then start the "
+                    "controlled_semantic_spatial card",
                 )
         if not self._runtime.info().get("running", False):
             return self._error(
                 "navigation_runtime_unavailable",
-                "an owned Navigation child process is not running; stop and restart the card",
+                "an owned controlled_semantic_spatial child process is not running; "
+                "stop and restart the card",
             )
         if action in FAST_LIVO2_ACTIONS:
             return self._mapping.dispatch("fast_livo2", args)
@@ -210,7 +213,11 @@ class NavigationPlugin:
             self._require_started("semantic", semantic_result)
             started.append(("semantic", self._semantic))
         except Exception as exc:
-            log.error("[navigation] start failed: %s", exc, exc_info=True)
+            log.error(
+                "[controlled_semantic_spatial] start failed: %s",
+                exc,
+                exc_info=True,
+            )
             cleanup = self._stop_started(started)
             return self._error(
                 "navigation_start_failed",
@@ -270,7 +277,8 @@ class NavigationPlugin:
         with self._lock:
             if self._started:
                 return self._error(
-                    "config_while_running", "stop Navigation before changing config"
+                    "config_while_running",
+                    "stop controlled_semantic_spatial before changing config",
                 )
         updates = {
             key: value
@@ -428,7 +436,7 @@ class NavigationPlugin:
                 details.append("unexpected=" + ",".join(unknown))
             return self._error(
                 "invalid_canvas_wiring",
-                "Navigation requires exact external bindings ("
+                "controlled_semantic_spatial requires exact external bindings ("
                 + "; ".join(details)
                 + ")",
             )
@@ -464,7 +472,7 @@ class NavigationPlugin:
             else "idle"
         )
         return {
-            "name": "Navigation",
+            "name": self.PREFIX,
             "type": "processor",
             "state": state,
             "status": state,
@@ -490,7 +498,7 @@ class NavigationPlugin:
                 else None
             ),
             "error": config_error or (
-                "an owned Navigation child process exited"
+                "an owned controlled_semantic_spatial child process exited"
                 if runtime_failed
                 else None
             ),

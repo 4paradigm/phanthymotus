@@ -21,6 +21,14 @@ NAVIGATION_LIFECYCLE_ACTIONS = ("info", "config", "start", "stop")
 SEMANTIC_ACTIONS = ("capture", "navigate")
 NAVIGATION_ACTIONS = FAST_LIVO2_ACTIONS + NAV2_ACTIONS + SEMANTIC_ACTIONS
 NAVIGATION_PUBLIC_ACTIONS = NAVIGATION_LIFECYCLE_ACTIONS + NAVIGATION_ACTIONS
+CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME = "controlled_semantic_spatial"
+NAVIGATION_PUBLIC_OUTPUT_PORTS = (
+    "map_view",
+    "status",
+    "velocity_proposal",
+    "plan",
+    "costmap",
+)
 
 
 def _config_properties() -> dict:
@@ -139,19 +147,20 @@ def navigation_tool_definition(namespace: str) -> dict:
     )
     external_inputs.append(deepcopy(goal_input))
 
-    outputs: list[dict] = []
-    seen_ports: set[str] = set()
-    for item in [*mapping["topic_out"], *planning["topic_out"]]:
-        port = str(item.get("port", ""))
-        if port and port not in seen_ports:
-            outputs.append(deepcopy(item))
-            seen_ports.add(port)
+    component_outputs = {
+        str(item.get("port", "")): item
+        for item in [*mapping["topic_out"], *planning["topic_out"]]
+        if item.get("port")
+    }
+    outputs = [
+        deepcopy(component_outputs[port]) for port in NAVIGATION_PUBLIC_OUTPUT_PORTS
+    ]
 
     execution_control = deepcopy(planning["x-execution-control"])
     execution_control["start_actions"] = ["navigate_to_pose", "navigate"]
     return {
-        "name": "navigation",
-        "displayName": "Navigation",
+        "name": CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
+        "displayName": CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
         "type": "processor",
         "multiInstance": False,
         "description": (
@@ -176,9 +185,11 @@ def navigation_tool_definition(namespace: str) -> dict:
 
 
 __all__ = [
+    "CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME",
     "NAVIGATION_ACTIONS",
     "NAVIGATION_ACTION_PARAMS",
     "NAVIGATION_CONFIG_SCHEMA",
+    "NAVIGATION_PUBLIC_OUTPUT_PORTS",
     "NAVIGATION_PUBLIC_ACTIONS",
     "navigation_tool_definition",
 ]

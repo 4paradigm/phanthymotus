@@ -1,6 +1,6 @@
 # Navigation 内部 Nav2 模块
 
-该模块在统一 `navigation` 卡片内负责目标导航、路径规划、
+该模块在统一 `controlled_semantic_spatial` 卡片内负责目标导航、路径规划、
 局部避障和有时效的速度提案。建图、定位、点云去畸变、地图存储和
 地图可视化由同卡片 FAST-LIVO2 模块负责。它不再单独注册 MCP 卡片，
 不订阅 Driver 原始点云，也不再
@@ -173,8 +173,9 @@ odom、registered cloud 和 obstacle map 由 `NavigationPlugin` 固定为同容�
 内部 topic，不需要 Canvas 连线。Canvas 只需把公开 `velocity_proposal`
 输出接到 Driver `loco.velocity_proposal`；可选 `goal_pose` 仍可作为外部输入。
 
-地图从统一卡片的 `map_view` 查看，实时位姿从其
-`livo_odom` 查看。Agent Core 的地图 renderer 会额外只读订阅 Nav2 `/plan`，
+地图和实时位姿从统一卡片的 `map_view` 查看；`livo_odom` 只作为同容器内部
+定位/规划数据，不再生成 Canvas 公共端口。Agent Core 的地图 renderer 会额外
+只读订阅 Nav2 `/plan`，
 在同一个 `map` frame 中把绿色全局路径和橙色终点叠加到地图上；Nav2 仍不
 复制 `map_view`，因此 Canvas 只有一张权威地图。`/plan` 独立数据流仍保留，
 用于查看路径点数、长度和纯折线。地图右上角可切换 `2D/3D`：2D 是对

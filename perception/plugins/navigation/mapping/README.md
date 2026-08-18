@@ -1,6 +1,6 @@
 # Navigation 内部 FAST-LIVO2 模块
 
-该模块负责统一 `navigation` 卡片内的会话级 LiDAR-Inertial 建图、里程计、
+该模块负责统一 `controlled_semantic_spatial` 卡片内的会话级 LiDAR-Inertial 建图、里程计、
 运动补偿点云、标准 TF 和 Canvas 地图可视化。它不再单独注册 MCP 卡片，
 FAST-LIVO2 及 adapter 由同一个 Perception 容器内的 `NavigationRuntime`
 托管；Driver 只提供已冻结的标准传感器输入。
@@ -134,7 +134,7 @@ fail closed。
 
 ## 自动数据采集
 
-数据采集属于统一 `navigation` 卡片，不增加单独卡片，也不增加
+数据采集属于统一 `controlled_semantic_spatial` 卡片，不增加单独卡片，也不增加
 `start_recording` / `stop_recording` 等公开 action。创建卡片时配置：
 
 | 配置 | 默认值 | 语义 |
@@ -191,8 +191,10 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 ## 统一卡片连线与构建
 
 Canvas 只把 Driver `navigation_lidar`、`navigation_imu` 接到公开
-`navigation` 卡片。`livo_odom`、registered cloud、obstacle map 和 status
-都在同一容器内交给 planning/semantic 模块，不再暴露成卡片间连线。
+`controlled_semantic_spatial` 卡片。`livo_odom`、registered cloud、obstacle map
+都在同一容器内交给 planning/semantic 模块；collection status 也只保留为内部
+诊断 topic。它们均不再暴露成 Canvas 公共连线端口，公共定位状态统一通过
+`status` 输出查看。
 
 本模块随统一镜像构建，版本和许可证见
 [`../runtime/FAST_LIVO2_THIRD_PARTY.md`](../runtime/FAST_LIVO2_THIRD_PARTY.md)。

@@ -38,7 +38,7 @@ probe() {
   python3 -c '
 import json, sys
 tools = {item.get("name") for item in json.load(sys.stdin).get("result", {}).get("tools", [])}
-raise SystemExit(0 if "navigation" in tools else 1)
+raise SystemExit(0 if "controlled_semantic_spatial" in tools else 1)
 ' <<<"${response}" >/dev/null 2>&1
 }
 

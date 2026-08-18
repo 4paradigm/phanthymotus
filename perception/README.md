@@ -95,11 +95,12 @@ ASR result JSON:
 
 ---
 
-## Navigation 卡片
+## controlled_semantic_spatial 卡片
 
-PR #99 的 FAST-LIVO2、Nav2 和 VLN 已合并为一张公开 `navigation` 卡片：
+PR #99 的 FAST-LIVO2、Nav2 和 VLN 已合并为一张公开
+`controlled_semantic_spatial` 卡片：
 
-- Canvas 只注册一个 `navigation` 工具；
+- Canvas 只注册一个 `controlled_semantic_spatial` 工具；
 - 正式 Compose 只运行一个 `embodied-perception` 容器；
 - FAST-LIVO2 和 Nav2 由卡片在同容器内作为 ROS 子进程组托管，不调用 Docker；
 - 统一镜像从锁定 ROS Humble 基础镜像直接编译 FAST-LIVO2 及其全部锁定依赖，
@@ -110,7 +111,7 @@ PR #99 的 FAST-LIVO2、Nav2 和 VLN 已合并为一张公开 `navigation` 卡�
 - 物理运动仍严格走 `velocity_proposal -> Driver loco`，Perception 不直接控制机器人。
 
 完整 action、topic、配置、构建、许可证和验收边界见
-[Navigation 卡片文档](plugins/navigation/README.md)。
+[controlled_semantic_spatial 卡片文档](plugins/navigation/README.md)。
 
 统一镜像构建：
 
@@ -118,8 +119,9 @@ PR #99 的 FAST-LIVO2、Nav2 和 VLN 已合并为一张公开 `navigation` 卡�
 ./deploy/build_perception.sh --mirror tuna
 ```
 
-`navigation` 是仓库默认构建目标，不需要专用构建脚本或预构建 companion
-镜像。需要旧 CPU 或 Jetson 镜像时再显式传入 `--variant cpu` 或
+`navigation` 仍是仓库内部的默认镜像构建 variant；公开 MCP 工具名为
+`controlled_semantic_spatial`。无需专用构建脚本或预构建 companion 镜像。
+需要旧 CPU 或 Jetson 镜像时再显式传入 `--variant cpu` 或
 `--variant jetson`。
 
 G1 临时测试只创建一个 Perception 容器；将上一步输出的精确镜像名传入：

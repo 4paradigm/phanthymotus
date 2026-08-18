@@ -1,13 +1,14 @@
-# Navigation Perception 卡片
+# controlled_semantic_spatial Perception 卡片
 
-`navigation` 是 PR #99 中 FAST-LIVO2、Nav2 和 VLN 的统一公开卡片。Canvas
+`controlled_semantic_spatial` 是 PR #99 中 FAST-LIVO2、Nav2 和 VLN 的统一
+公开卡片。Canvas
 只看到这一张 `processor` 卡片，正式部署只运行一个 Perception 容器。
 
 ## 运行边界
 
 ```text
 Driver lidar + imu ─┐
-camera rgb ─────────┼─> Navigation card (Perception container)
+camera rgb ─────────┼─> controlled_semantic_spatial card (Perception container)
 optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child process
                             ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
@@ -18,8 +19,8 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
 - `NavigationPlugin` 是唯一 MCP/Canvas 生命周期所有者。
 - FAST-LIVO2 和 Nav2 ROS launch 由 `NavigationRuntime` 作为同容器子进程组
   启停；运行时不调用 Docker，也不需要 Docker socket。
-- odom、registered cloud、obstacle map 和 FAST-LIVO2 status 是卡片内部 ROS
-  边，不再要求用户在 Canvas 上连接。
+- odom、registered cloud、obstacle map 和 collection status 是卡片内部 ROS
+  边，不再作为 Canvas 公共连线端口。
 - VLN 命中地点后直接调用同卡片 planner，并透传 Agent Core 的
   `_control_nav_id`；`goal_pose` topic 只保留为可选外部控制入口。
 - Nav2 仍只发布 `phanthy.navigation.velocity_proposal.v1`，Driver 继续负责
@@ -34,8 +35,19 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
 | `rgb` | `/ubuntu/camera/rgb` | 是 |
 | `goal_pose` | `/ubuntu/navigation/goal_pose` | 否 |
 
-输出合并 FAST-LIVO2 地图/里程计、Nav2 plan/costmap 和
-`velocity_proposal`。详细 frame、QoS、freshness 和速度约束见内部实现说明：
+## 公共输出
+
+| port | topic | 用途 |
+| --- | --- | --- |
+| `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
+| `status` | `/ubuntu/navigation/fast_livo2/status` | 定位、建图和运行状态 |
+| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | 连接 Driver `loco` 执行器 |
+| `plan` | `/plan` | 当前二维全局路径 |
+| `costmap` | `/global_costmap/costmap` | 实时全局代价地图 |
+
+`livo_odom`、registered cloud、obstacle map 和 collection status topic 仍由
+同容器内的定位、规划、语义和数据采集逻辑消费或发布，只是不再生成 Canvas
+右侧连线端口。详细 frame、QoS、freshness 和速度约束见内部实现说明：
 
 - [mapping/README.md](mapping/README.md)
 - [planning/README.md](planning/README.md)

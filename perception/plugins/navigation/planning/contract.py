@@ -1,4 +1,4 @@
-"""Internal Nav2 contract owned by the public Navigation card."""
+"""Internal Nav2 contract owned by controlled_semantic_spatial."""
 
 from __future__ import annotations
 

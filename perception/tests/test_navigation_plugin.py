@@ -77,8 +77,8 @@ def _external_bindings():
 class NavigationContractTest(unittest.TestCase):
     def test_one_public_card_hides_internal_ros_edges(self):
         tool = navigation_tool_definition("ubuntu")
-        self.assertEqual(tool["name"], "navigation")
-        self.assertEqual(tool["displayName"], "Navigation")
+        self.assertEqual(tool["name"], "controlled_semantic_spatial")
+        self.assertEqual(tool["displayName"], "controlled_semantic_spatial")
         self.assertEqual(
             {item["port"] for item in tool["topic_in"]},
             {"lidar", "imu", "rgb", "goal_pose"},
@@ -89,6 +89,18 @@ class NavigationContractTest(unittest.TestCase):
             ]
         )
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
+        self.assertEqual(
+            [item["port"] for item in tool["topic_out"]],
+            ["map_view", "status", "velocity_proposal", "plan", "costmap"],
+        )
+        self.assertTrue(
+            {
+                "livo_odom",
+                "registered_cloud",
+                "obstacle_map",
+                "collection_status",
+            }.isdisjoint({item["port"] for item in tool["topic_out"]})
+        )
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         for action in (
             "start_mapping",
@@ -220,6 +232,8 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn(
             "refusing to remove container owned by", runtime_script
         )
+        self.assertIn('"controlled_semantic_spatial" in tools', runtime_script)
+        self.assertNotIn('"navigation" in tools', runtime_script)
 
     def test_g1_status_probe_is_quiet_while_mcp_is_starting(self):
         runtime_script = (
@@ -278,6 +292,18 @@ class NavigationPluginTest(unittest.TestCase):
             semantic_plugin=semantic or FakeComponent("semantic"),
         )
 
+    def test_only_controlled_semantic_spatial_is_a_public_dispatch_name(self):
+        plugin = self.make_plugin()
+
+        self.assertEqual(plugin.PREFIX, "controlled_semantic_spatial")
+        self.assertIsNone(plugin.dispatch("navigation", {"action": "info"}))
+        self.assertEqual(
+            plugin.dispatch("controlled_semantic_spatial", {"action": "info"})[
+                "name"
+            ],
+            "controlled_semantic_spatial",
+        )
+
     def test_single_start_owns_runtime_and_internal_wiring(self):
         runtime = FakeRuntime()
         mapping = FakeComponent("mapping")
@@ -291,7 +317,7 @@ class NavigationPluginTest(unittest.TestCase):
         )
 
         result = plugin.dispatch(
-            "navigation",
+            "controlled_semantic_spatial",
             {
                 "action": "start",
                 "instance_id": "canvas-navigation",
@@ -320,7 +346,7 @@ class NavigationPluginTest(unittest.TestCase):
             {item["port"] for item in semantic_start["input_bindings"]},
             {"rgb", "livo_odom", "livo_status"},
         )
-        stopped = plugin.dispatch("navigation", {"action": "stop"})
+        stopped = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(runtime.stop_calls, 1)
 
@@ -335,7 +361,7 @@ class NavigationPluginTest(unittest.TestCase):
         )
 
         result = plugin.dispatch(
-            "navigation",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
 
@@ -354,24 +380,27 @@ class NavigationPluginTest(unittest.TestCase):
             semantic=semantic,
         )
         plugin.dispatch(
-            "navigation",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
         self.assertEqual(
             plugin.dispatch(
-                "navigation", {"action": "start_mapping", "map_name": "room"}
+                "controlled_semantic_spatial",
+                {"action": "start_mapping", "map_name": "room"},
             )["component"],
             "mapping",
         )
         self.assertEqual(
             plugin.dispatch(
-                "navigation",
+                "controlled_semantic_spatial",
                 {"action": "navigate_to_pose", "x": 1, "y": 2, "yaw": 0},
             )["component"],
             "planning",
         )
         self.assertEqual(
-            plugin.dispatch("navigation", {"action": "capture"})["component"],
+            plugin.dispatch("controlled_semantic_spatial", {"action": "capture"})[
+                "component"
+            ],
             "semantic",
         )
 
@@ -379,13 +408,14 @@ class NavigationPluginTest(unittest.TestCase):
         plugin = self.make_plugin()
 
         unknown = plugin.dispatch(
-            "navigation", {"action": "config", "legacy_companion": True}
+            "controlled_semantic_spatial",
+            {"action": "config", "legacy_companion": True},
         )
         self.assertEqual(unknown["error_code"], "invalid_config")
         self.assertIn("legacy_companion", unknown["error"])
 
         partial = plugin.dispatch(
-            "navigation",
+            "controlled_semantic_spatial",
             {"action": "config", "vlm_base_url": "https://vlm.example.test"},
         )
         self.assertEqual(partial["error_code"], "invalid_config")
