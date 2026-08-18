@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -217,6 +220,50 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn(
             "refusing to remove container owned by", runtime_script
         )
+
+    def test_g1_status_probe_is_quiet_while_mcp_is_starting(self):
+        runtime_script = (
+            PERCEPTION_ROOT
+            / "plugins"
+            / "navigation"
+            / "deploy"
+            / "scripts"
+            / "owner-start-g1-test-containers.sh"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fake_docker = Path(directory) / "docker"
+            fake_docker.write_text(
+                """#!/usr/bin/env bash
+if [[ "$*" == *"--format {{.State.Running}}"* ]]; then
+  echo true
+elif [[ "$*" == *"--format"* ]]; then
+  echo '/fake|image=fake|status=running|running=true|owner=navigation-card'
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(runtime_script)],
+                env={
+                    **os.environ,
+                    "PATH": f"{directory}:{os.environ['PATH']}",
+                    "STAGE": "status",
+                    "PERCEPTION_CONTAINER": "fake",
+                    "MCP_URL": "http://127.0.0.1:1/mcp",
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fake|image=fake|status=running", result.stdout)
+        self.assertNotIn("curl:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("JSONDecodeError", result.stderr)
 
 
 class NavigationPluginTest(unittest.TestCase):

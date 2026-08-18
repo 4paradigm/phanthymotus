@@ -26,14 +26,20 @@ require_port_free() {
 }
 
 probe() {
-  curl --fail --silent --show-error --max-time 5 \
-    --header 'Content-Type: application/json' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
-    "${MCP_URL}" | python3 -c '
+  local response
+  if ! response="$(
+    curl --fail --silent --max-time 5 \
+      --header 'Content-Type: application/json' \
+      --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+      "${MCP_URL}" 2>/dev/null
+  )"; then
+    return 1
+  fi
+  python3 -c '
 import json, sys
 tools = {item.get("name") for item in json.load(sys.stdin).get("result", {}).get("tools", [])}
 raise SystemExit(0 if "navigation" in tools else 1)
-' >/dev/null
+' <<<"${response}" >/dev/null 2>&1
 }
 
 status() {
