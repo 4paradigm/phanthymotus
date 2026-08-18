@@ -57,7 +57,7 @@ adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms �
 | `registered_cloud`  | `/ubuntu/navigation/cloud_registered`             | `map`              | Nav2 实时障碍层输入                        |
 | `static_map`        | `/ubuntu/navigation/static_map`                   | `map`              | 运动门控并经多帧确认的完整二维 OccupancyGrid，供 Nav2 StaticLayer |
 | `obstacle_map`      | `/ubuntu/navigation/obstacle_map`                 | `map`              | 运动门控静态障碍的兼容诊断投影                |
-| `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 静态体素地图、最新阈值调试帧和机器人位置           |
+| `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 确认静态点、候选点、最新实时点和机器人位置            |
 | `status`            | `/ubuntu/navigation/fast_livo2/status`            | JSON               | 算法进程、输入 freshness、frame 和产物状态 |
 | `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | JSON               | 录制进程、每路计数、丢失/过期源与停止回执         |
 
@@ -82,9 +82,11 @@ adapter 先按 `0.10 m` 体素把同一帧命中去重；导航高度带内的�
 上述门控不替代人员语义分割：静止人员最终仍可能进入静态图；人与墙相连时
 空间分片可避免整块大分量直接绕过，但极端稀疏、遮挡或传感器噪声下仍不能
 提供语义级人员识别保证。当前 registered cloud 始终独立进入 Nav2
-实时障碍层，所以被静态门隔离的移动物体仍参与即时避障。Canvas 地图不再按
-80,000 点截断；稳定部分显示多帧确认结果，高度带外仅叠加新鲜的最新扫描，
-用于蓝色/粉色阈值调试而不进入累计静态图。Agent Core 在显示层
+实时障碍层，所以被静态门隔离的移动物体仍参与即时避障。Canvas `map_view`
+在同一现有 XYZ 点数组中合并确认静态点、多帧候选点和新鲜的最新实时扫描，
+相同体素只显示一次。它不增加分类协议，也不要求修改 Agent Core；现有渲染器
+继续按高度显示，范围外点仍以蓝色/粉色用于阈值调试且不进入累计静态图。
+Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
 `map_view` 点数组语义，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
 重定位成功前不显示伪造的机器人位姿。地图卡片支持三维

@@ -190,6 +190,7 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
         self.assertEqual(magic, b"MVFILT2\0")
         self.assertAlmostEqual(minimum, -0.8)
         self.assertAlmostEqual(maximum, 0.4)
+        self.assertEqual(len(frame), metadata_offset + struct.calcsize("<8sff"))
 
         full_map = VoxelMap(0.10)
         full_map.add((index * 0.20, 0.0, 0.0) for index in range(80_001))
@@ -284,8 +285,10 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
 
         self.assertEqual(static_map.point_count, 0)
         self.assertEqual(static_map.candidate_count, 1)
+        self.assertEqual(static_map.candidate_points, ((1.05, 0.05, 0.0),))
         static_map.expire(now_monotonic=1.01)
         self.assertEqual(static_map.candidate_count, 0)
+        self.assertEqual(static_map.candidate_points, ())
         self.assertEqual(static_map.confirmed_points, ())
 
     def test_out_of_navigation_height_points_never_enter_static_map(self) -> None:

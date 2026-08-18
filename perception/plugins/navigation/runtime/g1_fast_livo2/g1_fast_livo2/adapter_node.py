@@ -935,16 +935,19 @@ class FastLivo2Adapter(Node):
                 max_z=self._obstacle_max_height,
             )
             view_map = self._static_map.as_voxel_map()
+            candidate_points = self._static_map.candidate_points
+            view_map.add(candidate_points)
             live_out_of_band = ()
             if cloud_age is not None and cloud_age <= self._source_max_age:
+                live_points = self._latest_mapped_points
+                view_map.add(live_points)
                 live_out_of_band = tuple(
                     point
-                    for point in self._latest_mapped_points
+                    for point in live_points
                     if not self._obstacle_min_height
                     <= point[2]
                     <= self._obstacle_max_height
                 )
-                view_map.add(live_out_of_band)
             if pose is not None:
                 snapshot = self._static_map.occupancy_snapshot(
                     center_x=pose.x,

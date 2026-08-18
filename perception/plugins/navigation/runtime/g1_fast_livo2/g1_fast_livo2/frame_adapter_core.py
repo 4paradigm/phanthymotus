@@ -1264,6 +1264,14 @@ class TemporalOccupancyMap:
             if evidence.confirmed
         )
 
+    @property
+    def candidate_points(self) -> tuple[tuple[float, float, float], ...]:
+        return tuple(
+            self._evidence[key].point
+            for key in sorted(self._candidates)
+            if key in self._evidence and not self._evidence[key].confirmed
+        )
+
     def load_confirmed(
         self, points: Iterable[tuple[float, float, float]]
     ) -> None:

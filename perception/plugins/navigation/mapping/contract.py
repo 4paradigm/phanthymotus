@@ -257,8 +257,8 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map",
                 "units": "x/y/z=m; yaw=rad",
                 "desc": (
-                    "Motion-gated confirmed in-band voxel map plus the latest "
-                    "out-of-band scan, current base pose and height metadata "
+                    "Motion-gated confirmed static points, multi-frame candidates "
+                    "and the latest fresh scan, current base pose and height metadata "
                     "for Canvas"
                 ),
             },
