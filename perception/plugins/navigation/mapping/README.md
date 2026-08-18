@@ -62,7 +62,7 @@ adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms �
 在 `0.10 m` 体素去重后，Canvas 地图保留当前会话的全部占用点，不再按
 80,000 点截断；Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
-`map_view` wire payload，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
+`map_view` 点数组语义，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
 重定位成功前不显示伪造的机器人位姿。地图卡片支持三维
 浏览和正上方二维投影切换；二维模式只是同一三维点云的平面显示，不是另存
 一份 occupancy grid。绿色机器人箭头沿 canonical `base_link` 的 `+X` 前向，
@@ -70,11 +70,14 @@ adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms �
 可重定位地图格式。原始 PCD 分片保存在宿主机
 `/opt/phanthy-motus/data/fast_livo2/maps`。
 
-Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。adapter 按当前
-上海 G1 室内点云分布保留相对雷达原点 `z=-1.25…+0.30 m` 的高度带，排除
-约 `z=-1.3 m` 的地板和约 `z=+1.7 m` 的天花板，再按 XY 体素去重投影到
-`z=0`。由于 MID360 位于机器人上部，这个范围向下覆盖更多、向上覆盖更少，
-用于保留桌腿、椅子、箱体、人体和墙面等二维碰撞障碍。
+Nav2 使用的 `obstacle_map` 不等同于 Canvas 三维渲染数据。卡片配置
+`obstacle_min_height_m` 和 `obstacle_max_height_m` 定义 `map` frame 中参与
+二维导航的 Z 高度带，默认 `-0.30…+0.30 m`，可在 Canvas 停止卡片后调整，
+下次启动生效。adapter 用同一高度带过滤实时 Nav2 点云，并将累计图按 XY
+体素去重投影到 `z=0`；完整三维点仍保留在 `map_view`。监控中低于下界的点
+显示为蓝色，高于上界的点显示为粉色，范围内点继续使用彩虹高度色，并显示
+当前阈值图例。阈值是地图坐标，不直接等同于雷达物理安装高度；应结合现场
+地面色带和低矮障碍调节，且必须满足 `-3.0 <= min < max <= 3.0`。
 
 ## Actions
 

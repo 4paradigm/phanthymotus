@@ -8,6 +8,7 @@
  *   [uint32 num_points]                    (4 bytes)
  *   Body: [float32 x, y, z] × N           (if has_z, 12 bytes/point)
  *      or [float32 x, y] × N              (if !has_z, 8 bytes/point, z=0)
+ *   Optional trailer: [8 bytes "MVFILT2\\0"][float32 min_z][float32 max_z]
  *
  * Legacy protocol (16-byte header) still supported for backward compatibility.
  *
@@ -38,6 +39,7 @@ export const MappingRenderer = {
   _pathPositions: null,
   _goalMesh: null,
   _pathSummary: null,
+  _heightLegend: null,
   _planWs: null,
   _planReconnectTimer: null,
   _viewBtn: null,
@@ -141,6 +143,12 @@ export const MappingRenderer = {
     this._pathSummary.textContent = '等待 Nav2 路径';
     this._el.appendChild(this._pathSummary);
     this._connectPlanStream();
+
+    this._heightLegend = document.createElement('div');
+    this._heightLegend.style.cssText =
+      'display:none;position:absolute;left:8px;top:8px;z-index:10;padding:4px 7px;' +
+      'border-radius:4px;background:rgba(0,0,0,.68);color:#e8edf2;font:11px monospace';
+    this._el.appendChild(this._heightLegend);
 
     // Follow-robot toggle button
     this._followBtn = document.createElement('button');
@@ -316,6 +324,25 @@ export const MappingRenderer = {
     const expectedBody = headerSize + numPoints * bytesPerPoint;
     if (byteLen < expectedBody) return;
 
+    let filterMin = null;
+    let filterMax = null;
+    if (hasZ && byteLen >= expectedBody + 16) {
+      const magic = String.fromCharCode(
+        ...new Uint8Array(buffer, expectedBody, 8)
+      );
+      const possibleMin = view.getFloat32(expectedBody + 8, true);
+      const possibleMax = view.getFloat32(expectedBody + 12, true);
+      if (
+        magic === 'MVFILT2\0' &&
+        Number.isFinite(possibleMin) &&
+        Number.isFinite(possibleMax) &&
+        possibleMin < possibleMax
+      ) {
+        filterMin = possibleMin;
+        filterMax = possibleMax;
+      }
+    }
+
     const count = Math.min(numPoints, MAX_POINTS);
 
     // Parse points and compute Z range for coloring
@@ -352,11 +379,37 @@ export const MappingRenderer = {
 
     for (let i = 0; i < count; i++) {
       const z = pos[i * 3 + 1]; // y in Three.js = height
-      const t = hasZ ? (z - zMin) * zScale : 0.5;
       const idx = i * 3;
-      col[idx] = this._rainbowR(t);
-      col[idx + 1] = this._rainbowG(t);
-      col[idx + 2] = this._rainbowB(t);
+      if (filterMin !== null && z < filterMin) {
+        // Below the configured navigation band: blue.
+        col[idx] = 0.18;
+        col[idx + 1] = 0.48;
+        col[idx + 2] = 1.0;
+      } else if (filterMax !== null && z > filterMax) {
+        // Above the configured navigation band: magenta.
+        col[idx] = 1.0;
+        col[idx + 1] = 0.18;
+        col[idx + 2] = 0.62;
+      } else {
+        const t = filterMin !== null
+          ? (z - filterMin) / (filterMax - filterMin)
+          : (hasZ ? (z - zMin) * zScale : 0.5);
+        col[idx] = this._rainbowR(t);
+        col[idx + 1] = this._rainbowG(t);
+        col[idx + 2] = this._rainbowB(t);
+      }
+    }
+
+    if (this._heightLegend) {
+      if (filterMin !== null) {
+        this._heightLegend.style.display = 'block';
+        this._heightLegend.innerHTML =
+          `<span style="color:#2e7aff">●</span> &lt; ${filterMin.toFixed(2)} m&nbsp; ` +
+          `<span style="color:#76df79">●</span> 导航障碍带&nbsp; ` +
+          `<span style="color:#ff2e9e">●</span> &gt; ${filterMax.toFixed(2)} m`;
+      } else {
+        this._heightLegend.style.display = 'none';
+      }
     }
 
     // Update geometry
@@ -531,6 +584,7 @@ export const MappingRenderer = {
     this._renderer?.dispose();
     this._followBtn?.remove();
     this._viewBtn?.remove();
+    this._heightLegend?.remove();
     this._el?.remove();
     this._el = null;
     this._renderer = null;
@@ -543,6 +597,7 @@ export const MappingRenderer = {
     this._pathPositions = null;
     this._goalMesh = null;
     this._pathSummary = null;
+    this._heightLegend = null;
     this._planWs = null;
     this._viewBtn = null;
     this._saved3dPosition = null;

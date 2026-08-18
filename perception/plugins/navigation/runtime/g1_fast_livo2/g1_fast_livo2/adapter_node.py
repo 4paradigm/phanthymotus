@@ -52,7 +52,7 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("source_max_age_sec", 0.5)
         self.declare_parameter("source_age_tolerance_sec", 0.05)
         self.declare_parameter("map_voxel_size_m", 0.10)
-        self.declare_parameter("obstacle_min_height_m", -1.25)
+        self.declare_parameter("obstacle_min_height_m", -0.30)
         self.declare_parameter("obstacle_max_height_m", 0.30)
         self.declare_parameter("base_to_sensor_x", -0.00368)
         self.declare_parameter("base_to_sensor_y", 0.00003)
@@ -226,10 +226,19 @@ class FastLivo2Adapter(Node):
             self._last_cloud_monotonic = time.monotonic()
             self._last_cloud_source_age = source_age
             map_from_session = self._map_from_session
+            obstacle_min_height = self._obstacle_min_height
+            obstacle_max_height = self._obstacle_max_height
         if map_from_session is None:
             return
         mapped_points = tuple(transform_points(map_from_session, points))
-        self._cloud_pub.publish(self._xyz_cloud(mapped_points, message.header.stamp))
+        navigation_points = tuple(
+            point
+            for point in mapped_points
+            if obstacle_min_height <= point[2] <= obstacle_max_height
+        )
+        self._cloud_pub.publish(
+            self._xyz_cloud(navigation_points, message.header.stamp)
+        )
         with self._lock:
             self._map.add(mapped_points)
 
@@ -265,6 +274,8 @@ class FastLivo2Adapter(Node):
                 result = self._relocalize(args)
             elif action == "unload_map":
                 result = self._unload_saved_map()
+            elif action == "configure_obstacle_filter":
+                result = self._configure_obstacle_filter(args)
             else:
                 result = {
                     "status": "error",
@@ -283,6 +294,23 @@ class FastLivo2Adapter(Node):
             separators=(",", ":"),
         )
         self._map_control_status_pub.publish(response)
+
+    def _configure_obstacle_filter(self, args: dict) -> dict:
+        minimum = float(args.get("min_height_m"))
+        maximum = float(args.get("max_height_m"))
+        if not all(math.isfinite(value) for value in (minimum, maximum)):
+            raise InvalidFastLivo2Frame("obstacle height limits must be finite")
+        if not -3.0 <= minimum < maximum <= 3.0:
+            raise InvalidFastLivo2Frame(
+                "obstacle heights must satisfy -3.0 <= min < max <= 3.0"
+            )
+        with self._lock:
+            self._obstacle_min_height = minimum
+            self._obstacle_max_height = maximum
+        return {
+            "status": "configured",
+            "obstacle_height_range_m": [minimum, maximum],
+        }
 
     def _load_saved_map(self, args: dict) -> dict:
         map_name = str(args.get("map_name", "")).strip()
@@ -420,7 +448,11 @@ class FastLivo2Adapter(Node):
             )
             if pose is not None and self._map.point_count:
                 frame = UInt8MultiArray()
-                frame.data = self._map.encode(pose)
+                frame.data = self._map.encode(
+                    pose,
+                    obstacle_min_height_m=self._obstacle_min_height,
+                    obstacle_max_height_m=self._obstacle_max_height,
+                )
                 self._map_view_pub.publish(frame)
             odom_age = None if self._last_odom_monotonic is None else now - self._last_odom_monotonic
             cloud_age = None if self._last_cloud_monotonic is None else now - self._last_cloud_monotonic

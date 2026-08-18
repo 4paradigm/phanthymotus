@@ -21,6 +21,8 @@ FAST_LIVO2_CONFIG_DEFAULTS = {
     "discovery_timeout_sec": 5.0,
     "input_max_age_ms": 500,
     "map_voxel_size_m": 0.10,
+    "obstacle_min_height_m": -0.30,
+    "obstacle_max_height_m": 0.30,
     "collection_enabled": False,
     "collection_directory": "/opt/phanthy-motus/data/fast_livo2/recordings",
 }
@@ -50,6 +52,26 @@ FAST_LIVO2_CONFIG_SCHEMA = {
             "minimum": 0.05,
             "maximum": 0.50,
             "default": 0.10,
+        },
+        "obstacle_min_height_m": {
+            "type": "number",
+            "minimum": -3.0,
+            "maximum": 3.0,
+            "default": -0.30,
+            "description": (
+                "Lowest map-frame Z retained as a 2D navigation obstacle; "
+                "lower points remain visible in map_view"
+            ),
+        },
+        "obstacle_max_height_m": {
+            "type": "number",
+            "minimum": -3.0,
+            "maximum": 3.0,
+            "default": 0.30,
+            "description": (
+                "Highest map-frame Z retained as a 2D navigation obstacle; "
+                "higher points remain visible in map_view"
+            ),
         },
         "collection_enabled": {
             "type": "boolean",
@@ -184,7 +206,10 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map",
                 "units": "x/y/z=m",
                 "max_age_ms": 500,
-                "desc": "Motion-compensated current scan in the session map frame",
+                "desc": (
+                    "Motion-compensated current scan in the session map frame, "
+                    "filtered by the card-configured obstacle height band"
+                ),
             },
             {
                 "port": "obstacle_map",
@@ -211,7 +236,10 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "rate_hz": 1,
                 "frame_id": "map",
                 "units": "x/y/z=m; yaw=rad",
-                "desc": "Complete voxelized session map plus current base pose for Canvas",
+                "desc": (
+                    "Complete voxelized session map plus current base pose and "
+                    "optional obstacle-height metadata for Canvas"
+                ),
             },
             {
                 "port": "status",

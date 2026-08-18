@@ -49,6 +49,8 @@ def _validated_config(base: dict, updates: dict) -> dict:
         "request_timeout_sec": (5.0, 180.0),
         "discovery_timeout_sec": (0.5, 30.0),
         "map_voxel_size_m": (0.05, 0.50),
+        "obstacle_min_height_m": (-3.0, 3.0),
+        "obstacle_max_height_m": (-3.0, 3.0),
     }
     for key, (minimum, maximum) in ranges.items():
         raw = result.get(key)
@@ -61,6 +63,10 @@ def _validated_config(base: dict, updates: dict) -> dict:
         if not math.isfinite(value) or not minimum <= value <= maximum:
             raise ConfigError(f"{key} must be within [{minimum}, {maximum}]")
         result[key] = value
+    if result["obstacle_min_height_m"] >= result["obstacle_max_height_m"]:
+        raise ConfigError(
+            "obstacle_min_height_m must be less than obstacle_max_height_m"
+        )
     if result.get("input_max_age_ms") != 500:
         raise ConfigError("input_max_age_ms is fixed to 500")
     if not isinstance(result.get("collection_enabled"), bool):
@@ -188,6 +194,22 @@ class FastLivo2Plugin:
         if info.get("state") in {"unavailable", "error"}:
             self._release_core()
             return self._error("backend_not_ready", str(info.get("reason", info["state"])))
+        obstacle_result = core.configure_obstacle_filter(
+            {
+                "min_height_m": self._cfg["obstacle_min_height_m"],
+                "max_height_m": self._cfg["obstacle_max_height_m"],
+            }
+        )
+        if obstacle_result.get("status") == "error":
+            self._release_core()
+            return self._error(
+                str(obstacle_result.get("error_code", "obstacle_filter_failed")),
+                str(
+                    obstacle_result.get(
+                        "error", "obstacle filter could not be configured"
+                    )
+                ),
+            )
         collection_result = core.configure_collection(
             {
                 "enabled": self._cfg["collection_enabled"],

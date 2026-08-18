@@ -67,6 +67,8 @@ class FastLivo2ContractTest(unittest.TestCase):
             "phanthy.navigation.fast_livo2_collection_status.v1",
         )
         config = tool["configSchema"]["properties"]
+        self.assertEqual(config["obstacle_min_height_m"]["default"], -0.30)
+        self.assertEqual(config["obstacle_max_height_m"]["default"], 0.30)
         self.assertFalse(config["collection_enabled"]["default"])
         self.assertEqual(
             config["collection_directory"]["default"],
@@ -205,12 +207,14 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("finalize_collection_session(", supervisor)
         self.assertIn("self._reference_points = loaded.points", adapter)
         self.assertIn("reference = self._reference_points", adapter)
-        self.assertIn('"obstacle_min_height_m", -1.25', adapter)
+        self.assertIn('"obstacle_min_height_m", -0.30', adapter)
         self.assertIn('"obstacle_max_height_m", 0.30', adapter)
-
+        self.assertIn('action == "configure_obstacle_filter"', adapter)
+        self.assertIn('action == "configure_obstacle_filter"', supervisor)
         frame_adapter = (runtime_package / "frame_adapter_core.py").read_text(
             encoding="utf-8"
         )
+        self.assertIn("MVFILT2", frame_adapter)
         self.assertNotIn("payload = stream.read()", frame_adapter)
         self.assertIn("stream.seek(payload_offset + point_index * byte_offset)", frame_adapter)
 

@@ -55,6 +55,8 @@ plugins:
       discovery_timeout_sec: 5.0
       input_max_age_ms: 500
       map_voxel_size_m: 0.10
+      obstacle_min_height_m: -0.30
+      obstacle_max_height_m: 0.30
       collection_enabled: false
       collection_directory: /opt/phanthy-motus/data/fast_livo2/recordings
     planning:

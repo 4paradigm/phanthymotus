@@ -134,7 +134,9 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 - global/local costmap 都是 rolling window。global costmap 使用累计、去地面、
   去天花板并投影到二维的 `/ubuntu/navigation/obstacle_map`，避免已观察障碍
   因当前视角遮挡而消失；local costmap 继续使用实时
-  `/ubuntu/navigation/cloud_registered`，高度带为 `-1.25…+0.30 m`。
+  `/ubuntu/navigation/cloud_registered`。两者都由 FAST-LIVO2 adapter 使用卡片
+  的 `obstacle_min_height_m/obstacle_max_height_m` 预过滤，Nav2 不再维护一份
+  独立固定下界，避免 Canvas 配置只改变全局图却不改变局部避障。
 - local 实时点云以 `base_link` 为 sensor origin 开启 raytrace clearing，
   不再把短时障碍轨迹永久留在局部窗口。global 输入本身是累计快照，
   继续 `clearing=false`，避免从错误的 map 原点向全图做射线清除。

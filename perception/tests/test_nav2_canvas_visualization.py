@@ -103,6 +103,11 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
         self.assertIn(
             "this._robotMesh.rotation.set(0, robotYaw, 0)", mapping
         )
+        self.assertIn("MVFILT2", mapping)
+        self.assertIn("filterMin", mapping)
+        self.assertIn("Below the configured navigation band: blue", mapping)
+        self.assertIn("Above the configured navigation band: magenta", mapping)
+        self.assertIn("this._heightLegend.innerHTML", mapping)
         self.assertNotIn(
             "this._robotMesh.rotation.set(0, -robotYaw, 0)", mapping
         )

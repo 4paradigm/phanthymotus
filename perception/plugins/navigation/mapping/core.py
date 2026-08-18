@@ -76,6 +76,7 @@ class FastLivo2Core:
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._collection_lock = threading.Lock()
+        self._obstacle_filter_lock = threading.Lock()
         self._active_map: str | None = None
         self._loaded_map: str | None = None
 
@@ -235,6 +236,22 @@ class FastLivo2Core:
             except Exception as exc:
                 return self._error(
                     "configure_collection",
+                    "backend_error",
+                    f"{type(exc).__name__}: {exc}",
+                )
+
+    def configure_obstacle_filter(self, config: dict) -> dict:
+        """Apply the private height band before Nav2 acquires its inputs."""
+        with self._obstacle_filter_lock:
+            try:
+                return dict(
+                    self._backend.execute("configure_obstacle_filter", dict(config))
+                )
+            except FastLivo2BackendError as exc:
+                return self._error("configure_obstacle_filter", exc.code, str(exc))
+            except Exception as exc:
+                return self._error(
+                    "configure_obstacle_filter",
                     "backend_error",
                     f"{type(exc).__name__}: {exc}",
                 )

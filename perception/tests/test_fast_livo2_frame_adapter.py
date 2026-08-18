@@ -105,7 +105,9 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
         voxel_map.add(points)
         self.assertEqual(voxel_map.point_count, 1)
         frame = voxel_map.encode(
-            Pose3(0.5, -0.25, 0.0, quaternion_from_rpy(0.0, 0.0, 1.0))
+            Pose3(0.5, -0.25, 0.0, quaternion_from_rpy(0.0, 0.0, 1.0)),
+            obstacle_min_height_m=-0.8,
+            obstacle_max_height_m=0.4,
         )
         robot_x, robot_y, robot_yaw, flags, point_count = struct.unpack_from(
             "<fffBI", frame
@@ -115,6 +117,11 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
         self.assertAlmostEqual(robot_yaw, 1.0)
         self.assertEqual(flags, 0x03)
         self.assertEqual(point_count, 1)
+        metadata_offset = 17 + point_count * 12
+        magic, minimum, maximum = struct.unpack_from("<8sff", frame, metadata_offset)
+        self.assertEqual(magic, b"MVFILT2\0")
+        self.assertAlmostEqual(minimum, -0.8)
+        self.assertAlmostEqual(maximum, 0.4)
 
         full_map = VoxelMap(0.10)
         full_map.add((index * 0.20, 0.0, 0.0) for index in range(80_001))
@@ -149,6 +156,8 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
             [
                 (1.01, 2.01, -1.30),
                 (1.01, 2.01, -0.50),
+                (1.01, 2.01, -0.35),
+                (1.01, 2.01, -0.30),
                 (1.04, 2.04, 0.40),
                 (2.01, 3.01, 1.70),
                 (3.01, 4.01, 0.20),
@@ -156,12 +165,12 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
             ]
         )
 
-        projected = voxel_map.project_xy(min_z=-1.25, max_z=0.30)
+        projected = voxel_map.project_xy(min_z=-0.30, max_z=0.30)
 
-        self.assertEqual(len(projected), 3)
+        self.assertEqual(len(projected), 2)
         self.assertEqual(
             [(round(x, 2), round(y, 2), z) for x, y, z in projected],
-            [(1.05, 2.05, 0.0), (3.05, 4.05, 0.0), (4.05, 5.05, 0.0)],
+            [(1.05, 2.05, 0.0), (3.05, 4.05, 0.0)],
         )
         with self.assertRaises(ValueError):
             voxel_map.project_xy(min_z=1.0, max_z=1.0)

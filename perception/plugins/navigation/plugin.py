@@ -313,6 +313,8 @@ class NavigationPlugin:
                     ("mapping_request_timeout_sec", "request_timeout_sec"),
                     ("mapping_discovery_timeout_sec", "discovery_timeout_sec"),
                     ("map_voxel_size_m", "map_voxel_size_m"),
+                    ("obstacle_min_height_m", "obstacle_min_height_m"),
+                    ("obstacle_max_height_m", "obstacle_max_height_m"),
                     ("collection_enabled", "collection_enabled"),
                     ("collection_directory", "collection_directory"),
                 )

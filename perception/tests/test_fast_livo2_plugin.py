@@ -29,6 +29,14 @@ class ReadyBackend:
 
     def execute(self, action: str, args: dict) -> dict:
         self.calls.append((action, dict(args)))
+        if action == "configure_obstacle_filter":
+            return {
+                "status": "configured",
+                "obstacle_height_range_m": [
+                    args["min_height_m"],
+                    args["max_height_m"],
+                ],
+            }
         if action == "configure_collection":
             return {
                 "status": "recording" if args["enabled"] else "disabled",
@@ -57,6 +65,18 @@ class CollectionRejectingBackend(ReadyBackend):
                 "status": "error",
                 "error_code": "collection_start_failed",
                 "error": "recording directory is not writable",
+            }
+        return super().execute(action, args)
+
+
+class ObstacleFilterRejectingBackend(ReadyBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "configure_obstacle_filter":
+            self.calls.append((action, dict(args)))
+            return {
+                "status": "error",
+                "error_code": "invalid_obstacle_filter",
+                "error": "adapter rejected height limits",
             }
         return super().execute(action, args)
 
@@ -125,8 +145,13 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(ready["state"], "ready")
         self.assertTrue(ready["canvas_wired"])
         self.assertTrue(all(item["connected"] for item in ready["topic_in"]))
-        self.assertEqual(backend.calls[0][0], "configure_collection")
-        self.assertFalse(backend.calls[0][1]["enabled"])
+        self.assertEqual(backend.calls[0][0], "configure_obstacle_filter")
+        self.assertEqual(
+            backend.calls[0][1],
+            {"min_height_m": -0.30, "max_height_m": 0.30},
+        )
+        self.assertEqual(backend.calls[1][0], "configure_collection")
+        self.assertFalse(backend.calls[1][1]["enabled"])
 
     def test_canvas_stop_finalizes_mapping_before_backend_release(self) -> None:
         backend = ReadyBackend()
@@ -145,6 +170,7 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(
             [call[0] for call in backend.calls],
             [
+                "configure_obstacle_filter",
                 "configure_collection",
                 "start_mapping",
                 "stop_mapping",
@@ -174,9 +200,10 @@ class FastLivo2PluginTest(unittest.TestCase):
         )
 
         self.assertEqual(ready["state"], "ready")
-        self.assertEqual(backend.calls[0][0], "configure_collection")
+        self.assertEqual(backend.calls[0][0], "configure_obstacle_filter")
+        self.assertEqual(backend.calls[1][0], "configure_collection")
         self.assertEqual(
-            backend.calls[0][1],
+            backend.calls[1][1],
             {
                 "enabled": True,
                 "directory": (
@@ -252,6 +279,53 @@ class FastLivo2PluginTest(unittest.TestCase):
         info = invalid.dispatch("fast_livo2", {"action": "info"})
         self.assertEqual(info["error_code"], "invalid_config")
 
+        inverted = FastLivo2Plugin(
+            {"obstacle_min_height_m": 0.5, "obstacle_max_height_m": 0.2},
+            None,
+            backend=ReadyBackend(),
+        )
+        info = inverted.dispatch("fast_livo2", {"action": "info"})
+        self.assertEqual(info["error_code"], "invalid_config")
+
+        configurable_backend = ReadyBackend()
+        configurable = FastLivo2Plugin({}, None, backend=configurable_backend)
+        configured = configurable.dispatch(
+            "fast_livo2",
+            {
+                "action": "config",
+                "obstacle_min_height_m": -0.8,
+                "obstacle_max_height_m": 0.4,
+            },
+        )
+        self.assertEqual(configured["state"], "configured")
+        self.assertEqual(configured["config"]["obstacle_min_height_m"], -0.8)
+        self.assertEqual(configured["config"]["obstacle_max_height_m"], 0.4)
+        started = configurable.dispatch(
+            "fast_livo2",
+            {"action": "start", "input_bindings": _bindings(configurable)},
+        )
+        self.assertEqual(started["state"], "ready")
+        self.assertEqual(
+            configurable_backend.calls[0],
+            (
+                "configure_obstacle_filter",
+                {"min_height_m": -0.8, "max_height_m": 0.4},
+            ),
+        )
+
+    def test_obstacle_filter_failure_prevents_canvas_ready(self) -> None:
+        backend = ObstacleFilterRejectingBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+
+        result = plugin.dispatch(
+            "fast_livo2",
+            {"action": "start", "input_bindings": _bindings(plugin)},
+        )
+
+        self.assertEqual(result["error_code"], "invalid_obstacle_filter")
+        self.assertEqual(backend.stop_calls, 1)
+        self.assertFalse(plugin.dispatch("fast_livo2", {"action": "info"})["canvas_wired"])
+
     def test_canvas_stop_unloads_localization_before_backend_release(self) -> None:
         backend = ReadyBackend()
         plugin = FastLivo2Plugin({}, None, backend=backend)
@@ -266,6 +340,7 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(
             [call[0] for call in backend.calls],
             [
+                "configure_obstacle_filter",
                 "configure_collection",
                 "load_map",
                 "unload_map",

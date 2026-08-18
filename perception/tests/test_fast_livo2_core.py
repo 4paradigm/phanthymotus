@@ -33,6 +33,14 @@ class FakeBackend:
             return {"status": "relocalized", "map_name": args["map_name"], "score": 0.8}
         if action == "unload_map":
             return {"status": "unloaded", "map_name": args["map_name"]}
+        if action == "configure_obstacle_filter":
+            return {
+                "status": "configured",
+                "obstacle_height_range_m": [
+                    args["min_height_m"],
+                    args["max_height_m"],
+                ],
+            }
         return {
             "status": "saved",
             "map_name": args["map_name"],
@@ -211,6 +219,22 @@ class FastLivo2CoreTest(unittest.TestCase):
         self.assertEqual(
             [call[1]["enabled"] for call in collection_backend.calls],
             [True, False],
+        )
+
+        filter_backend = FakeBackend()
+        filter_core = FastLivo2Core(filter_backend)
+        configured = filter_core.configure_obstacle_filter(
+            {"min_height_m": -0.8, "max_height_m": 0.4}
+        )
+        self.assertEqual(configured["status"], "configured")
+        self.assertEqual(
+            filter_backend.calls,
+            [
+                (
+                    "configure_obstacle_filter",
+                    {"min_height_m": -0.8, "max_height_m": 0.4},
+                )
+            ],
         )
 
     def test_relocalize_requires_map_and_finite_pose(self) -> None:

@@ -210,6 +210,8 @@ class FastLivo2Supervisor(Node):
             elif action == "configure_collection":
                 with self._collection_lifecycle_lock:
                     result = self._configure_collection(args)
+            elif action == "configure_obstacle_filter":
+                result = self._adapter_execute(action, args)
             else:
                 result = {"status": "error", "error_code": "unsupported_action", "error": f"unsupported action {action}"}
         except Exception as exc:

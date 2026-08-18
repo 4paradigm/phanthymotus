@@ -13,6 +13,8 @@ FLOAT32 = 7
 FLOAT64 = 8
 _FRAME_HEADER = struct.Struct("<fffBI")
 _POINT = struct.Struct("<fff")
+_FILTER_METADATA = struct.Struct("<8sff")
+_FILTER_METADATA_MAGIC = b"MVFILT2\0"
 _FULL_MAP_WITH_Z = 0x01 | 0x02
 
 
@@ -535,7 +537,29 @@ class VoxelMap:
                 )
         return tuple(projected.values())
 
-    def encode(self, robot_pose: Pose3) -> bytes:
+    def encode(
+        self,
+        robot_pose: Pose3,
+        *,
+        obstacle_min_height_m: float | None = None,
+        obstacle_max_height_m: float | None = None,
+    ) -> bytes:
+        if (obstacle_min_height_m is None) != (obstacle_max_height_m is None):
+            raise ValueError("both obstacle height limits are required")
+        metadata = b""
+        if obstacle_min_height_m is not None and obstacle_max_height_m is not None:
+            if not all(
+                math.isfinite(value)
+                for value in (obstacle_min_height_m, obstacle_max_height_m)
+            ):
+                raise ValueError("obstacle height limits must be finite")
+            if obstacle_min_height_m >= obstacle_max_height_m:
+                raise ValueError("obstacle minimum height must be below maximum")
+            metadata = _FILTER_METADATA.pack(
+                _FILTER_METADATA_MAGIC,
+                obstacle_min_height_m,
+                obstacle_max_height_m,
+            )
         yaw = yaw_from_quaternion(robot_pose.q)
         body = bytearray(len(self._points) * _POINT.size)
         for index, point in enumerate(self._points.values()):
@@ -546,7 +570,7 @@ class VoxelMap:
             yaw,
             _FULL_MAP_WITH_Z,
             len(self._points),
-        ) + body
+        ) + body + metadata
 
 
 def source_age_is_valid(

@@ -128,6 +128,8 @@ class NavigationContractTest(unittest.TestCase):
         )
         self.assertIn("vlm_api_key", properties)
         self.assertIn("planning_request_timeout_sec", properties)
+        self.assertIn("obstacle_min_height_m", properties)
+        self.assertIn("obstacle_max_height_m", properties)
         self.assertNotIn("backend", properties)
         self.assertNotIn("request_timeout_sec", properties)
         self.assertNotIn("base_url", properties)
@@ -422,6 +424,27 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertIn("vlm_api_key", partial["error"])
         self.assertFalse(
             any(args["action"] == "config" for _, args in plugin._semantic.calls)
+        )
+
+        configured = plugin.dispatch(
+            "controlled_semantic_spatial",
+            {
+                "action": "config",
+                "obstacle_min_height_m": -0.8,
+                "obstacle_max_height_m": 0.4,
+            },
+        )
+        self.assertEqual(configured["state"], "configured")
+        self.assertIn(
+            (
+                "fast_livo2",
+                {
+                    "action": "config",
+                    "obstacle_min_height_m": -0.8,
+                    "obstacle_max_height_m": 0.4,
+                },
+            ),
+            plugin._mapping.calls,
         )
 
 

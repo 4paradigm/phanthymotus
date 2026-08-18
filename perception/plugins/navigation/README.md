@@ -55,6 +55,10 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
 
 完整的静态插件配置样例见 [config.example.json](config.example.json)；其中
 `semantic.vlm.api_key` 必须通过部署配置或环境注入真实值，不能提交凭据。
+Canvas 的 `config` 动作还提供 `obstacle_min_height_m` 和
+`obstacle_max_height_m`。它们控制实时与累计二维障碍的 `map` frame 高度带，
+必须在卡片停止时修改；`map_view` 会保留范围外点并用蓝色/粉色标记，方便
+现场根据地面和天花板分布调参。
 
 ## Actions
 
