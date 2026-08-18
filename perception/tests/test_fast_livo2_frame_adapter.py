@@ -967,7 +967,7 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
             )
         )
 
-    def test_far_outlier_is_ignored_and_grid_growth_is_bounded(self) -> None:
+    def test_large_motion_keeps_sparse_map_and_bounded_grid_window(self) -> None:
         static_map = TemporalOccupancyMap(
             0.10,
             confirmation_frames=3,
@@ -984,17 +984,24 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
         )
         self.assertEqual(static_map.candidate_count, 1)
 
-        with self.assertRaisesRegex(ValueError, "occupancy grid exceeds"):
-            static_map.observe_scan(
-                sensor_origin=(2.05, 0.05, 0.0),
-                points=[(3.05, 0.05, 0.0)],
-                now_monotonic=0.1,
-                obstacle_min_height_m=-0.30,
-                obstacle_max_height_m=0.30,
-            )
-        self.assertEqual(static_map.candidate_count, 1)
+        static_map.observe_scan(
+            sensor_origin=(2.05, 0.05, 0.0),
+            points=[(3.05, 0.05, 0.0)],
+            now_monotonic=0.1,
+            obstacle_min_height_m=-0.30,
+            obstacle_max_height_m=0.30,
+        )
+        self.assertEqual(static_map.candidate_count, 2)
+        snapshot = static_map.occupancy_snapshot(
+            center_x=625.0,
+            center_y=-49.0,
+            min_z=-0.30,
+            max_z=0.30,
+        )
+        self.assertEqual((snapshot.width, snapshot.height), (3, 3))
+        self.assertEqual(len(snapshot.data), 9)
 
-    def test_oversized_loaded_map_is_rejected_atomically(self) -> None:
+    def test_large_loaded_map_uses_bounded_grid_window(self) -> None:
         static_map = TemporalOccupancyMap(
             0.10,
             confirmation_frames=3,
@@ -1002,19 +1009,18 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
             max_grid_dimension_cells=20,
             max_grid_cells=400,
         )
-        baseline = ((0.55, 0.05, 0.0),)
-        static_map.load_confirmed(baseline)
-
-        with self.assertRaisesRegex(ValueError, "occupancy grid exceeds"):
-            static_map.load_confirmed(
-                ((0.55, 0.05, 0.0), (5.05, 0.05, 0.0))
-            )
-        self.assertEqual(static_map.confirmed_points, baseline)
-        with self.assertRaisesRegex(ValueError, "occupancy grid exceeds"):
-            static_map.validate_confirmed(
-                ((0.55, 0.05, 0.0), (5.05, 0.05, 0.0))
-            )
-        self.assertEqual(static_map.confirmed_points, baseline)
+        large_map = ((0.55, 0.05, 0.0), (500.05, 500.05, 0.0))
+        static_map.load_confirmed(large_map)
+        self.assertEqual(set(static_map.confirmed_points), set(large_map))
+        self.assertEqual(static_map.validate_confirmed(large_map), 2)
+        snapshot = static_map.occupancy_snapshot(
+            center_x=0.55,
+            center_y=0.05,
+            min_z=-0.30,
+            max_z=0.30,
+        )
+        self.assertEqual((snapshot.width, snapshot.height), (3, 3))
+        self.assertEqual(snapshot.occupied_cells, 1)
 
         cleared = static_map.cleared_snapshot()
         self.assertEqual(cleared.occupied_cells, 0)

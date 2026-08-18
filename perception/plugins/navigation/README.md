@@ -85,14 +85,19 @@ StaticLayer。静态层在连续 8 帧体素确认前，还会把二维连通分
 时若当前上下界不同会拒绝使用，需恢复原配置或重新建图，避免静态证据语义
 悄然变化。
 
+confirmed static map 以有点数上限的稀疏体素保存，不因覆盖范围变大而拒绝
+建图。面向 Nav2 StaticLayer 的稠密 OccupancyGrid 则始终发布机器人周围
+`static_grid_margin_m` 半径的滚动窗口；地图跨度增大或全局坐标远离原点时，
+不会按整张地图包围盒分配巨型数组，也不会使 frame adapter 退出。
+
 资源和地图事务均 fail closed：单帧 live PointCloud2 最多 200,000 点且数据区
 最多 64 MiB；静态候选证据和 confirmed static map 各最多 200,000 点，超限
 时不静默抽样。PCD header 和 ASCII 单条记录均限制为 64 KiB，ASCII token
 布局及实际非空数据行数必须与声明完全一致，解析还受 map-control deadline
 约束。manifest 最大 64 KiB。一次
 地图会话最多 64 个 raw PCD，raw 快照与 confirmed static PCD 合计最多
-512 MiB。`load_map` 会先完成新旧 manifest/PCD、障碍高度带及完整静态
-OccupancyGrid 边界验证，再停止旧定位前端；Adapter 先在旧状态之外准备图，
+512 MiB。`load_map` 会先完成新旧 manifest/PCD、障碍高度带、点数限制及
+滚动 OccupancyGrid 窗口验证，再停止旧定位前端；Adapter 先在旧状态之外准备图，
 deadline 内只做原子状态切换，并在控制回执之后发布大栅格。
 
 ## Actions

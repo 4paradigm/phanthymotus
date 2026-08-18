@@ -170,8 +170,9 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 超限均 fail closed。保存/加载会话最多包含 64 个 raw PCD，raw 与 static PCD
 合计最多 512 MiB；manifest、PCD header 和 ASCII 单行都有 64 KiB 有界读取，
 ASCII token 布局和数据行必须与声明精确一致。`load_map` 会在
-停止旧定位前端前验证 manifest、全部 PCD、障碍高度带和静态 OccupancyGrid
-边界，因此 planning 不会在未验证新图上切换 StaticLayer。
+停止旧定位前端前验证 manifest、全部 PCD、障碍高度带和静态点数，并准备
+机器人周围的有界 OccupancyGrid 滚动窗口，因此 planning 不会在未验证新图上
+切换 StaticLayer，也不会按全图包围盒分配稠密数组。
 
 ### 终点整形与并发保护
 

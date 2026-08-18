@@ -1335,7 +1335,6 @@ class TemporalOccupancyMap:
         xy_index: dict[
             tuple[int, int], set[tuple[int, int, int]]
         ] = {}
-        occupied_xy: set[tuple[int, int]] = set()
         for point in points:
             key = self._key(point)
             if key is None or key in evidence_by_key:
@@ -1352,13 +1351,15 @@ class TemporalOccupancyMap:
             )
             xy = key[:2]
             xy_index.setdefault(xy, set()).add(key)
-            occupied_xy.add(xy)
             if len(evidence_by_key) > self._max_evidence_points:
                 raise ValueError(
                     "confirmed static map exceeds "
                     f"{self._max_evidence_points} point safety limit"
                 )
-        replacement_bounds = self._expanded_bounds_from(None, occupied_xy)
+        # The confirmed map remains sparse and may span a large site.  Dense
+        # OccupancyGrid publication is a rolling window around the active
+        # pose, so the full point extent must not become an allocation bound.
+        replacement_bounds = None
         return evidence_by_key, xy_index, replacement_bounds
 
     def observe_scan(
@@ -1416,8 +1417,6 @@ class TemporalOccupancyMap:
             endpoints=obstacle_endpoints.values(),
         )
         ray_free.difference_update(observed_xy)
-        sensor_xy = self._xy_key(sensor_origin[0], sensor_origin[1])
-        next_bounds = self._expanded_bounds({sensor_xy, *observed_xy, *ray_free})
         projected_evidence = len(self._evidence) + sum(
             1 for key in observed if key not in self._evidence
         )
@@ -1529,7 +1528,6 @@ class TemporalOccupancyMap:
             and obstacle_min_height_m <= evidence.point[2] <= obstacle_max_height_m
         }
         self._free_cells.difference_update(confirmed_xy)
-        self._bounds = next_bounds
 
     def expire(self, *, now_monotonic: float) -> None:
         if not math.isfinite(now_monotonic):
@@ -1634,14 +1632,22 @@ class TemporalOccupancyMap:
             raise ValueError("occupancy snapshot values must be finite")
         if min_z >= max_z:
             raise ValueError("min_z must be less than max_z")
-        expanded = self._expanded_bounds_from(
-            bounds,
-            {self._xy_key(center_x, center_y)},
-        )
-        assert expanded is not None
-        min_ix, max_ix, min_iy, max_iy = expanded
+        center_ix, center_iy = self._xy_key(center_x, center_y)
+        min_ix = center_ix - self._grid_margin_cells
+        max_ix = center_ix + self._grid_margin_cells
+        min_iy = center_iy - self._grid_margin_cells
+        max_iy = center_iy + self._grid_margin_cells
+        expanded = (min_ix, max_ix, min_iy, max_iy)
         width = max_ix - min_ix + 1
         height = max_iy - min_iy + 1
+        if (
+            width > self._max_grid_dimension_cells
+            or height > self._max_grid_dimension_cells
+            or width * height > self._max_grid_cells
+        ):
+            raise ValueError(
+                "configured occupancy window exceeds dimension or cell-count limit"
+            )
         data = [-1] * (width * height)
 
         def offset(cell: tuple[int, int]) -> int | None:
@@ -1662,12 +1668,14 @@ class TemporalOccupancyMap:
             for key, item in evidence.items()
             if item.confirmed and min_z <= item.point[2] <= max_z
         }
+        occupied_count = 0
         for cell in occupied:
             index = offset(cell)
             if index is not None:
                 if data[index] == 0:
                     free_count -= 1
                 data[index] = 100
+                occupied_count += 1
         return (
             OccupancyGridSnapshot(
                 resolution=self._voxel,
@@ -1676,7 +1684,7 @@ class TemporalOccupancyMap:
                 width=width,
                 height=height,
                 data=tuple(data),
-                occupied_cells=len(occupied),
+                occupied_cells=occupied_count,
                 free_cells=free_count,
             ),
             expanded,
