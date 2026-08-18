@@ -112,6 +112,73 @@ class _CapturePublisher:
 
 
 class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
+    def test_adapter_execute_waits_for_bidirectional_discovery(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lock = threading.RLock()
+        supervisor._condition = threading.Condition(supervisor._lock)
+        supervisor._pending_map_control_requests = set()
+        supervisor._map_control_responses = {}
+        supervisor._map_control_status_topic = (
+            "/ubuntu/navigation/fast_livo2/map_control_status"
+        )
+        publisher = mock.Mock()
+        publisher.get_subscription_count.side_effect = [0, 1, 1]
+        supervisor._map_control_pub = publisher
+        supervisor.count_publishers = mock.Mock(side_effect=[0, 0, 1])
+        supervisor.get_parameter = lambda _name: SimpleNamespace(value=1.0)
+
+        def answer(message) -> None:
+            request = json.loads(message.data)
+            supervisor._on_map_control_status(
+                SimpleNamespace(
+                    data=json.dumps(
+                        {
+                            "event": "response",
+                            "request_id": request["request_id"],
+                            "action": request["action"],
+                            "status": "configured",
+                        }
+                    )
+                )
+            )
+
+        publisher.publish.side_effect = answer
+        with mock.patch.object(SUPERVISOR_MODULE.time, "sleep") as sleep:
+            result = supervisor._adapter_execute(
+                "configure_obstacle_filter",
+                {"min_height_m": -0.3, "max_height_m": 0.3},
+            )
+
+        self.assertEqual(result["status"], "configured")
+        self.assertEqual(sleep.call_count, 2)
+        publisher.publish.assert_called_once()
+
+    def test_adapter_execute_fails_fast_when_adapter_is_undiscovered(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._map_control_status_topic = (
+            "/ubuntu/navigation/fast_livo2/map_control_status"
+        )
+        supervisor._map_control_pub = mock.Mock()
+        supervisor._map_control_pub.get_subscription_count.return_value = 0
+        supervisor.count_publishers = mock.Mock(return_value=0)
+
+        with mock.patch.object(
+            SUPERVISOR_MODULE,
+            "_MAP_CONTROL_DISCOVERY_TIMEOUT_SEC",
+            0.001,
+        ):
+            result = supervisor._adapter_execute(
+                "configure_obstacle_filter",
+                {"min_height_m": -0.3, "max_height_m": 0.3},
+            )
+
+        self.assertEqual(
+            result["error_code"],
+            "fast_livo2_adapter_unavailable",
+        )
+        self.assertTrue(result["retryable"])
+        supervisor._map_control_pub.publish.assert_not_called()
+
     def test_extreme_float64_live_cloud_is_rejected_without_callback_escape(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._source_age = lambda _stamp: 0.0

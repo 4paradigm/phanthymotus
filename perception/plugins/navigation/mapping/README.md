@@ -163,6 +163,10 @@ fail closed。
 
 ### 生命周期与大图读取
 
+- supervisor 向 adapter 发送首次地图控制请求前，会同时等待 command subscriber
+  和 response publisher 完成 DDS discovery，最长 5 秒。adapter 尚未就绪时返回
+  可重试的 `fast_livo2_adapter_unavailable`，不会丢失一次性 VOLATILE 请求后
+  占满普通 130 秒响应预算。
 - Core 和 supervisor 都将 `start_mapping` / `stop_mapping` / `load_map` /
   `relocalize` 收口到单一地图生命周期锁；采集启停使用独立锁，
   不会与地图操作互相阻塞。并发生命周期请求立即返回 `runtime_busy`，不占满

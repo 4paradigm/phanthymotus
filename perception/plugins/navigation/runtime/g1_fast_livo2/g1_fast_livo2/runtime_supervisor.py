@@ -44,6 +44,7 @@ _MAX_MAP_ARTIFACT_BYTES = 1_073_741_824
 _MAX_MAP_ARTIFACT_TOTAL_BYTES = 536_870_912
 _MAX_MAP_MANIFEST_BYTES = 65_536
 _MAP_CONTROL_RESPONSE_GRACE_SEC = 5.0
+_MAP_CONTROL_DISCOVERY_TIMEOUT_SEC = 5.0
 
 
 class FastLivo2Supervisor(Node):
@@ -98,8 +99,12 @@ class FastLivo2Supervisor(Node):
             _STATUS_QOS,
         )
         self._reset_pub = self.create_publisher(String, str(self.get_parameter("reset_topic").value), 10)
+        map_control_topic = str(self.get_parameter("map_control_topic").value)
+        self._map_control_status_topic = str(
+            self.get_parameter("map_control_status_topic").value
+        )
         self._map_control_pub = self.create_publisher(
-            String, str(self.get_parameter("map_control_topic").value), 10
+            String, map_control_topic, 10
         )
         callbacks = ReentrantCallbackGroup()
         self.create_subscription(
@@ -111,7 +116,7 @@ class FastLivo2Supervisor(Node):
         )
         self.create_subscription(
             String,
-            str(self.get_parameter("map_control_status_topic").value),
+            self._map_control_status_topic,
             self._on_map_control_status,
             10,
             callback_group=callbacks,
@@ -1262,6 +1267,18 @@ class FastLivo2Supervisor(Node):
         return tuple(files), static_path, obstacle_height_range
 
     def _adapter_execute(self, action: str, args: dict) -> dict:
+        if not self._wait_for_adapter_bridge(
+            _MAP_CONTROL_DISCOVERY_TIMEOUT_SEC
+        ):
+            return {
+                "status": "error",
+                "error_code": "fast_livo2_adapter_unavailable",
+                "error": (
+                    "FAST-LIVO2 adapter command/response topics were not "
+                    "discovered"
+                ),
+                "retryable": True,
+            }
         request_id = f"map-{time.time_ns()}"
         timeout = float(self.get_parameter("map_control_timeout_sec").value)
         operation_deadline = time.monotonic() + max(
@@ -1297,6 +1314,23 @@ class FastLivo2Supervisor(Node):
             finally:
                 self._pending_map_control_requests.discard(request_id)
         return {key: value for key, value in response.items() if key not in {"event", "request_id", "action"}}
+
+    def _wait_for_adapter_bridge(self, timeout_sec: float) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while True:
+            try:
+                command_ready = self._map_control_pub.get_subscription_count() >= 1
+                response_ready = (
+                    self.count_publishers(self._map_control_status_topic) >= 1
+                )
+            except Exception:
+                command_ready = False
+                response_ready = False
+            if command_ready and response_ready:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
 
     def _algorithm_command(self, *, save_pcd: bool = True) -> list[str]:
         interval = int(self.get_parameter("pcd_save_interval").value)
