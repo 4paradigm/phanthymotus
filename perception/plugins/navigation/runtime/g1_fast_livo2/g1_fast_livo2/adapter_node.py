@@ -89,6 +89,7 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("static_component_stationary_sec", 1.50)
         self.declare_parameter("static_component_max_span_m", 1.00)
         self.declare_parameter("static_component_match_distance_m", 0.60)
+        self.declare_parameter("static_dynamic_filter_enabled", False)
         self.declare_parameter("obstacle_min_height_m", -0.30)
         self.declare_parameter("obstacle_max_height_m", 0.30)
         self.declare_parameter("base_to_sensor_x", -0.00368)
@@ -168,6 +169,9 @@ class FastLivo2Adapter(Node):
                 self.get_parameter("static_component_match_distance_m").value
             ),
             max_evidence_points=self._static_map_load_max_points,
+            dynamic_filter_enabled=bool(
+                self.get_parameter("static_dynamic_filter_enabled").value
+            ),
         )
         self._static_pose_match_tolerance = float(
             self.get_parameter("static_pose_match_tolerance_sec").value
@@ -988,6 +992,9 @@ class FastLivo2Adapter(Node):
                 "static_candidate_point_count": self._static_map.candidate_count,
                 "static_free_cell_count": self._static_map.free_cell_count,
                 "static_dynamic_track_count": self._static_map.dynamic_track_count,
+                "static_dynamic_filter_enabled": (
+                    self._static_map.dynamic_filter_enabled
+                ),
                 "static_quarantined_point_count": (
                     self._static_map.quarantined_point_count
                 ),

@@ -198,7 +198,7 @@ def nav2_tool_definition(namespace: str) -> dict:
         "multiInstance": False,
         "description": (
             "Nav2 planner and controller consuming FAST-LIVO2 localization and "
-            "motion-gated confirmed static occupancy plus live clearing "
+            "directly accumulated static occupancy plus live clearing "
             "obstacles. This "
             "Perception card only emits "
             "bounded velocity proposals; an explicitly authorized Driver loco "
@@ -285,7 +285,7 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "axes": "ROS REP-103 right-handed: x forward, y left, z up",
                 "units": "resolution=m/cell; data=-1 unknown, 0 free, 100 occupied",
                 "desc": (
-                    "Motion-gated, multi-frame static occupancy source for "
+                    "Directly accumulated static occupancy source for "
                     "the Nav2 global StaticLayer"
                 ),
             },

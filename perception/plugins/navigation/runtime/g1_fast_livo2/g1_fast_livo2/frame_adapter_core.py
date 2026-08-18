@@ -1040,14 +1040,12 @@ class VoxelMap:
 
 
 class TemporalOccupancyMap:
-    """Separate stable static geometry from one-frame live obstacles.
+    """Accumulate navigation-height geometry with an optional motion gate.
 
-    Hits and misses are counted once per scan, regardless of point density.
-    Bounded spatial shards must first remain geometrically stationary;
-    moving shards stay available to the live obstacle layer but cannot
-    enter this static map. Confirmed cells are removed only when later rays
-    repeatedly observe them as free; merely leaving the field of view never
-    erases a wall.
+    Direct accumulation preserves every observed voxel until the map is reset.
+    The optional dynamic filter retains the older multi-frame confirmation and
+    ray-clearing behavior for controlled experiments, but production mapping
+    does not enable it.
     """
 
     def __init__(
@@ -1073,6 +1071,7 @@ class TemporalOccupancyMap:
         component_min_cells: int = 1,
         max_evidence_points: int = 200_000,
         max_component_history_units: int = 1_000_000,
+        dynamic_filter_enabled: bool = True,
     ):
         values = (
             voxel_size_m,
@@ -1126,6 +1125,8 @@ class TemporalOccupancyMap:
                 "max_component_history_units must be within "
                 f"[40, {_MAX_COMPONENT_HISTORY_UNITS}]"
             )
+        if not isinstance(dynamic_filter_enabled, bool):
+            raise ValueError("dynamic_filter_enabled must be boolean")
 
         self._voxel = voxel_size_m
         self._confirmation_frames = confirmation_frames
@@ -1177,6 +1178,7 @@ class TemporalOccupancyMap:
         self._component_history_unit_limit = int(
             max_component_history_units
         )
+        self._dynamic_filter_enabled = dynamic_filter_enabled
         self._evidence: dict[
             tuple[int, int, int], _TemporalVoxelEvidence
         ] = {}
@@ -1234,6 +1236,10 @@ class TemporalOccupancyMap:
     @property
     def dynamic_track_count(self) -> int:
         return self._dynamic_track_count
+
+    @property
+    def dynamic_filter_enabled(self) -> bool:
+        return self._dynamic_filter_enabled
 
     @property
     def quarantined_point_count(self) -> int:
@@ -1416,7 +1422,8 @@ class TemporalOccupancyMap:
             if not self._raytrace_min_range <= planar_range <= self._raytrace_max_range:
                 continue
             observed.setdefault(key, normalized)
-            component_points.setdefault(key[:2], []).append(normalized)
+            if self._dynamic_filter_enabled:
+                component_points.setdefault(key[:2], []).append(normalized)
             obstacle_endpoints.setdefault(key[:2], normalized)
 
         observed_xy = set(obstacle_endpoints)
@@ -1437,6 +1444,33 @@ class TemporalOccupancyMap:
 
         self._scan_index += 1
         scan_index = self._scan_index
+        if not self._dynamic_filter_enabled:
+            for key, point in observed.items():
+                evidence = self._evidence.get(key)
+                if evidence is None:
+                    evidence = _TemporalVoxelEvidence(
+                        point=point,
+                        hit_frames=self._confirmation_frames,
+                        first_hit_monotonic=now_monotonic,
+                        first_hit_point=point,
+                        last_hit_monotonic=now_monotonic,
+                        last_hit_scan=scan_index,
+                        confirmed=True,
+                    )
+                    self._evidence[key] = evidence
+                    self._xy_index.setdefault(key[:2], set()).add(key)
+                else:
+                    evidence.point = point
+                    evidence.hit_frames = self._confirmation_frames
+                    evidence.last_hit_monotonic = now_monotonic
+                    evidence.last_hit_scan = scan_index
+                    evidence.confirmed = True
+                    evidence.free_miss_frames = 0
+                    self._candidates.discard(key)
+            self._free_cells.update(ray_free)
+            self._free_cells.difference_update(observed_xy)
+            return
+
         eligible_keys, quarantined_keys, purge_keys = self._component_gate(
             observed,
             component_points=component_points,

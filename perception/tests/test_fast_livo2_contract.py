@@ -225,6 +225,8 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn('"map_load_max_points", 200000', adapter)
         self.assertIn('"static_map_load_max_points", 200000', adapter)
         self.assertIn('"static_confirmation_frames", 8', adapter)
+        self.assertIn('"static_dynamic_filter_enabled", False', adapter)
+        self.assertIn("dynamic_filter_enabled=bool(", adapter)
         self.assertIn("nearest_stamped_pose(", adapter)
         self.assertIn('self._mode = "finalizing"', adapter)
         self.assertIn("self._static_map.observe_scan(", adapter)

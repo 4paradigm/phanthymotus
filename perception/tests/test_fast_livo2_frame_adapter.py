@@ -291,6 +291,40 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
         self.assertEqual(static_map.candidate_points, ())
         self.assertEqual(static_map.confirmed_points, ())
 
+    def test_direct_accumulation_keeps_first_observation_without_motion_gate(self) -> None:
+        static_map = TemporalOccupancyMap(
+            0.10,
+            confirmation_frames=8,
+            candidate_ttl_sec=1.0,
+            clear_miss_frames=2,
+            dynamic_filter_enabled=False,
+        )
+        first = (1.05, 0.05, 0.0)
+        static_map.observe_scan(
+            sensor_origin=(0.05, 0.05, 0.0),
+            points=[first],
+            now_monotonic=0.0,
+            obstacle_min_height_m=-0.30,
+            obstacle_max_height_m=0.30,
+        )
+
+        self.assertFalse(static_map.dynamic_filter_enabled)
+        self.assertEqual(static_map.confirmed_points, (first,))
+        self.assertEqual(static_map.candidate_count, 0)
+        self.assertEqual(static_map.dynamic_track_count, 0)
+
+        static_map.observe_scan(
+            sensor_origin=(0.05, 0.05, 0.0),
+            points=[(2.05, 0.05, 0.0)],
+            now_monotonic=0.1,
+            obstacle_min_height_m=-0.30,
+            obstacle_max_height_m=0.30,
+        )
+        static_map.expire(now_monotonic=10.0)
+
+        self.assertIn(first, static_map.confirmed_points)
+        self.assertEqual(static_map.point_count, 2)
+
     def test_out_of_navigation_height_points_never_enter_static_map(self) -> None:
         static_map = TemporalOccupancyMap(0.10, confirmation_frames=3)
         for frame in range(3):

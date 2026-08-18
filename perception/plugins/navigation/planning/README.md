@@ -41,7 +41,7 @@ FAST-LIVO2 internal module
 | --- | --- | --- | --- |
 | `livo_odom` | `/ubuntu/navigation/odom` | `nav_msgs/msg/Odometry`; `BEST_EFFORT + KEEP_LAST(5)` | `header.frame_id=map`，`child_frame_id=base_link`，ROS system time，接收 age 最大 500 ms |
 | `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，已运动去畸变，ROS system time，接收 age 最大 500 ms |
-| `static_map` | `/ubuntu/navigation/static_map` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | `header.frame_id=map`，完整多帧确认静态图，`-1/0/100` |
+| `static_map` | `/ubuntu/navigation/static_map` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | `header.frame_id=map`，直接累计静态图，`-1/0/100` |
 | `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.goal.v1`，`map` frame，每条唯一 `goal_id` |
 
 Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIVO2 还在
@@ -135,19 +135,11 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   `StaticLayer -> live ObstacleLayer -> InflationLayer`：StaticLayer 消费完整的
   `/ubuntu/navigation/static_map`，live layer 与 local costmap 一样消费实时
   `/ubuntu/navigation/cloud_registered` 并开启 marking/raytrace clearing。
-  live layer 只表达当前动态环境并依靠 raytrace clearing 更新，不会把人员等
-  单帧障碍写进持久静态图；只有 FAST-LIVO2 adapter 运动门控并多帧确认后的
-  OccupancyGrid 才能进入 StaticLayer。
-- adapter 以“紧凑分量运动门 + 多帧体素证据”生成静态图：同一扫描的密集点
-  只计一次命中；连通分量先按不超过 `1.0 m` 的空间片拆分，移动空间片在
-  完整体素驻留观察窗内被隔离，并撤销其近期候选和已确认格。默认窗口为
-  `sqrt(2) * 0.10 / 0.03 + 0.40 ~= 5.114 s`，历史按 20 Hz 时间桶保存紧凑摘要，
-  完整观察窗最多 30 秒；全局 1,000,000 history-unit 预算覆盖轨迹、格、样本和
-  近期动态键，饱和时 fail closed，不随输入频率或短命目标无界增长；
-  稳定结构连续 8 帧且通过观察窗口后晋升。动态物体仍由 live layer 实时
-  marking/clearing；其他已进入静态层的旧格需连续 3 帧自由射线才显式发布为
-  `free=0`，不会因暂时不可见按 TTL 删除。重叠格内的原始点质心用于区分
-  真实平移和墙面可见子集变化；纯几何门仍不能识别长期静止人员。
+  live layer 表达当前动态环境并依靠 raytrace clearing 更新。FAST-LIVO2
+  adapter 的静态图则恢复为直接累计：同一扫描按 `0.10 m` 体素去重，有效
+  高度带内的体素首次出现即写入 StaticLayer，不等待多帧确认、不做动态分量
+  跟踪，也不通过后续自由射线删除。该模式保留稀疏墙面证据，但建图期间出现
+  的人员或移动物体可能固化进地图，建图现场应尽量保持静止。
 - 两层都使用卡片的 `obstacle_min_height_m/obstacle_max_height_m` 预过滤；旧
   `/ubuntu/navigation/obstacle_map` 仅作兼容诊断，不再以 `clearing=false`
   驱动全局代价图。confirmed static PCD 加载时还要求保存的高度带与当前配置

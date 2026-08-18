@@ -226,7 +226,7 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map",
                 "units": "x/y=m; z=0 projected obstacle plane",
                 "desc": (
-                    "Motion-gated, multi-frame static XY obstacle projection kept "
+                    "Directly accumulated static XY obstacle projection kept "
                     "for diagnostics and backward-compatible inspection"
                 ),
             },
@@ -241,9 +241,8 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map",
                 "units": "resolution=m/cell; data=-1 unknown, 0 free, 100 occupied",
                 "desc": (
-                    "Full motion-gated, multi-frame static occupancy snapshot. "
-                    "Moving bounded spatial components revoke recent static evidence; "
-                    "repeated free rays clear other stale static cells."
+                    "Bounded static occupancy snapshot accumulated directly from "
+                    "valid navigation-height registered-cloud voxels."
                 ),
             },
             {
@@ -257,9 +256,8 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map",
                 "units": "x/y/z=m; yaw=rad",
                 "desc": (
-                    "Motion-gated confirmed static points, multi-frame candidates "
-                    "and the latest fresh scan, current base pose and height metadata "
-                    "for Canvas"
+                    "Directly accumulated static points and the latest fresh scan, "
+                    "current base pose and height metadata for Canvas"
                 ),
             },
             {

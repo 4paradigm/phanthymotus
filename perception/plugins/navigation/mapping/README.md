@@ -55,36 +55,22 @@ adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms �
 | ------------------- | ------------------------------------------------- | ------------------ | ----------------------------- |
 | `livo_odom`         | `/ubuntu/navigation/odom`                         | `map -> base_link` | Nav2 位姿与速度反馈                  |
 | `registered_cloud`  | `/ubuntu/navigation/cloud_registered`             | `map`              | Nav2 实时障碍层输入                        |
-| `static_map`        | `/ubuntu/navigation/static_map`                   | `map`              | 运动门控并经多帧确认的完整二维 OccupancyGrid，供 Nav2 StaticLayer |
-| `obstacle_map`      | `/ubuntu/navigation/obstacle_map`                 | `map`              | 运动门控静态障碍的兼容诊断投影                |
-| `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 确认静态点、候选点、最新实时点和机器人位置            |
+| `static_map`        | `/ubuntu/navigation/static_map`                   | `map`              | 直接累计体素生成的二维 OccupancyGrid，供 Nav2 StaticLayer |
+| `obstacle_map`      | `/ubuntu/navigation/obstacle_map`                 | `map`              | 累计静态障碍的兼容诊断投影                |
+| `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 累计静态点、最新实时点和机器人位置            |
 | `status`            | `/ubuntu/navigation/fast_livo2/status`            | JSON               | 算法进程、输入 freshness、frame 和产物状态 |
 | `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | JSON               | 录制进程、每路计数、丢失/过期源与停止回执         |
 
-adapter 先按 `0.10 m` 体素把同一帧命中去重；导航高度带内的同一体素默认
-需要连续 8 个扫描支持才进入稳定静态图，候选点默认 1 秒过期。二维连通
-分量会按不超过 `1.0 m` 的固定空间片分解后经过运动门。默认完整观察窗为
-`max(0.8, 0.03 / 0.03, sqrt(2) * 0.10 / 0.03 + 0.40)`，即约
-`5.114 s`；最后一项保证以阈值速度运动的返回即使从体素最不利位置进入，
-也必须跨过完整体素对角线。轨迹和动态格历史按 20 Hz 时间桶保存紧凑二进制
-摘要；完整观察窗最多 30 秒，所有轨迹、栅格、样本及近期动态键合计最多
-1,000,000 个 history units。同一时间桶只更新几何，不滑动其时间戳；高频输入
-和短命目标都不能扩大历史，预算饱和时保持隔离并 fail closed。连续两次成立
-即视为动态，隔离当前空间片并撤销其近期
-候选和已确认静态证据。动态分量停止 `1.5 s` 后才重新开始静态确认。稀疏到
-单格的分量同样受运动门约束；长墙会被分片，而不是让与墙相连的移动物体
-绕过运动门。判断同时比较重叠栅格内的原始点质心，因此墙面只改变可见子集
-不会仅因整体质心偏移就被整片删除。
+adapter 先按 `0.10 m` 体素把同一帧命中去重；导航高度带和有效距离内的体素
+首次出现即写入累计静态图，不等待多帧确认、不跟踪动态分量，也不通过后续
+自由射线删除。点云只和源时间戳相差不超过 `50 ms` 的 canonical odom 位姿
+配对；不匹配帧跳过累计并进入 diagnostics 计数，不能拿最新位姿拼接旧点。
+直接累计可以恢复墙面和稀疏结构密度，但不提供人员语义分割或动态物体清除，
+建图时经过的人可能固化进地图，现场应尽量保持环境静止。
 
-点云只和源时间戳相差不超过 `50 ms` 的 canonical odom 位姿配对；不匹配帧
-跳过静态证据更新并进入 diagnostics 计数，不能拿最新位姿清除旧点。已确认点
-不会因暂时离开视野而删除，但同一格连续 3 帧被射线观察为空闲后会移除。
-上述门控不替代人员语义分割：静止人员最终仍可能进入静态图；人与墙相连时
-空间分片可避免整块大分量直接绕过，但极端稀疏、遮挡或传感器噪声下仍不能
-提供语义级人员识别保证。当前 registered cloud 始终独立进入 Nav2
-实时障碍层，所以被静态门隔离的移动物体仍参与即时避障。Canvas `map_view`
-在同一现有 XYZ 点数组中合并确认静态点、多帧候选点和新鲜的最新实时扫描，
-相同体素只显示一次。它不增加分类协议，也不要求修改 Agent Core；现有渲染器
+当前 registered cloud 始终独立进入 Nav2 实时障碍层，因此导航期间移动物体
+仍参与即时避障。Canvas `map_view` 在同一现有 XYZ 点数组中合并累计静态点和
+新鲜的最新实时扫描，相同体素只显示一次。它不增加分类协议，也不要求修改 Agent Core；现有渲染器
 继续按高度显示，范围外点仍以蓝色/粉色用于阈值调试且不进入累计静态图。
 Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
@@ -95,10 +81,10 @@ Agent Core 在显示层
 并保持 ROS `map` frame 的 yaw 正方向。它是监控视图，不是
 可重定位地图格式。原始 PCD 分片保存在宿主机
 `/opt/phanthy-motus/data/fast_livo2/maps`；`stop_mapping` 还会原子写入
-`maps/static/<map>-*.static.pcd`，保存导航高度带内经运动门控和多帧确认的静态点。
+`maps/static/<map>-*.static.pcd`，保存导航高度带内直接累计的静态点。
 
 live PointCloud2 在复制数据区前同时检查 `width * height <= 200,000` 和
-`data <= 64 MiB`；静态候选证据及加载后的 confirmed static map 各自也以
+`data <= 64 MiB`；累计及加载后的 confirmed static map 都以
 200,000 点为硬上限。live frame、静态证据或确认图超限都会 fail closed，
 不会用静默下采样改变占用语义。用于有界重定位的 raw PCD 读取仍可在总预算内
 抽样到最多 200,000 个参考点。
