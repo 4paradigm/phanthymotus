@@ -196,6 +196,36 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
         full_map.add((index * 0.20, 0.0, 0.0) for index in range(80_001))
         self.assertEqual(full_map.point_count, 80_001)
 
+        bounded_map = VoxelMap(0.10)
+        bounded_map.add(
+            [(index * 0.20, 0.0, -1.20) for index in range(100)]
+            + [(index * 0.20, 1.0, 0.0) for index in range(100)]
+            + [(index * 0.20, 2.0, 1.20) for index in range(100)]
+        )
+        bounded_frame = bounded_map.encode(
+            Pose3(0.0, 0.0, 0.0, quaternion_from_rpy(0.0, 0.0, 0.0)),
+            obstacle_min_height_m=-0.30,
+            obstacle_max_height_m=0.30,
+            max_points=20,
+        )
+        bounded_count = struct.unpack_from("<I", bounded_frame, 13)[0]
+        bounded_points = [
+            struct.unpack_from("<fff", bounded_frame, 17 + index * 12)
+            for index in range(bounded_count)
+        ]
+        self.assertEqual(bounded_count, 20)
+        self.assertEqual(sum(point[2] < -0.30 for point in bounded_points), 7)
+        self.assertEqual(
+            sum(-0.30 <= point[2] <= 0.30 for point in bounded_points),
+            11,
+        )
+        self.assertEqual(sum(point[2] > 0.30 for point in bounded_points), 2)
+        with self.assertRaises(ValueError):
+            bounded_map.encode(
+                Pose3(0.0, 0.0, 0.0, quaternion_from_rpy(0.0, 0.0, 0.0)),
+                max_points=0,
+            )
+
         with self.assertRaises(InvalidFastLivo2Frame):
             list(
                 iter_xyz_points(

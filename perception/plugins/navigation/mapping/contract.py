@@ -256,8 +256,9 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map",
                 "units": "x/y/z=m; yaw=rad",
                 "desc": (
-                    "Directly accumulated static points and the latest fresh scan, "
-                    "current base pose and height metadata for Canvas"
+                    "Bounded height-balanced Canvas view of static obstacles, "
+                    "visual-only out-of-band surfaces, the latest fresh scan, "
+                    "current base pose and height metadata"
                 ),
             },
             {

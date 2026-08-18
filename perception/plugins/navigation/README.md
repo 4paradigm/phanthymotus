@@ -59,7 +59,9 @@ collection status topic 仍由
 Canvas 的 `config` 动作还提供 `obstacle_min_height_m` 和
 `obstacle_max_height_m`。它们控制实时与稳定静态二维障碍的 `map` frame
 高度带，必须在卡片停止时修改；`map_view` 会把最新扫描的范围外点用
-蓝色/粉色标记，方便现场根据地面和天花板分布调参，但不会累计这些点。
+蓝色/粉色标记，方便现场根据地面和天花板分布调参。范围外表面以 `0.20 m`
+体素单独累计或从已加载 raw PCD 恢复，只用于 Canvas；它们不会进入
+registered cloud、静态障碍图或 Nav2 costmap。
 
 建图恢复为直接累计模式：FAST-LIVO2 adapter 对每帧注册点云按 `0.10 m`
 体素去重后，将导航高度带内且距离有效的体素首次出现即写入静态图，不等待
@@ -70,8 +72,9 @@ Canvas 的 `config` 动作还提供 `obstacle_min_height_m` 和
 实时避障与累计地图彼此独立：当前 registered cloud 继续进入 Nav2 开启
 marking/raytrace clearing 的 live ObstacleLayer，所以导航期间新出现或移动的
 物体仍参与即时避障。Canvas `map_view` 显示累计静态点和新鲜的最新实时扫描，
-不增加分类协议或 Agent Core 改动；高度带外点仍由蓝色/粉色阈值颜色覆盖且
-不会累计。已保存的 confirmed static PCD 还会绑定建图时的障碍高度带；加载
+并显示单独累计的高度带外表面。输出最多 80,000 点，并为低于、位于和高于
+导航高度带的三组点分别保留显示预算，避免地面被大量障碍点截断；该采样只
+影响监控，不改变规划输入。已保存的 confirmed static PCD 还会绑定建图时的障碍高度带；加载
 时若当前上下界不同会拒绝使用，需恢复原配置或重新建图，避免静态证据语义
 悄然变化。
 

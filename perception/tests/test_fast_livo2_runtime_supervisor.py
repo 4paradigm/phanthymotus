@@ -94,6 +94,7 @@ ADAPTER_MODULE, SUPERVISOR_MODULE = _import_ros_runtime_modules()
 FastLivo2Adapter = ADAPTER_MODULE.FastLivo2Adapter
 FastLivo2Supervisor = SUPERVISOR_MODULE.FastLivo2Supervisor
 TemporalOccupancyMap = ADAPTER_MODULE.TemporalOccupancyMap
+VoxelMap = ADAPTER_MODULE.VoxelMap
 write_pcd_xyz_atomic = ADAPTER_MODULE.write_pcd_xyz_atomic
 Pose3 = ADAPTER_MODULE.Pose3
 Quaternion = ADAPTER_MODULE.Quaternion
@@ -327,6 +328,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             adapter._static_map_load_max_points = 200_000
             adapter._obstacle_min_height = -0.30
             adapter._obstacle_max_height = 0.30
+            adapter._map_view_voxel_size = 0.20
+            adapter._map_view_context = VoxelMap(0.20)
             adapter._static_map = TemporalOccupancyMap(0.1)
             adapter._static_map.load_confirmed(old_points)
             adapter._mode = "idle"
@@ -353,6 +356,40 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
 
             self.assertEqual(adapter._mode, "idle")
             self.assertEqual(adapter._static_map.confirmed_points, old_points)
+
+    def test_map_validation_recovers_ground_for_canvas_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            points = tuple(
+                [(index * 0.25, 0.0, -1.20) for index in range(20)]
+                + [(index * 0.25, 1.0, 0.0) for index in range(20)]
+            )
+            pcd = root / "office.pcd"
+            write_pcd_xyz_atomic(pcd, points)
+            adapter = object.__new__(FastLivo2Adapter)
+            adapter._lock = threading.RLock()
+            adapter._map_root = root
+            adapter._map_load_max_points = 200_000
+            adapter._static_map_load_max_points = 200_000
+            adapter._obstacle_min_height = -0.30
+            adapter._obstacle_max_height = 0.30
+            adapter._map_view_voxel_size = 0.20
+            adapter._map_view_context = VoxelMap(0.20)
+            adapter._static_map = TemporalOccupancyMap(0.1)
+            adapter.get_parameter = lambda _name: SimpleNamespace(value=0.1)
+
+            result = adapter._load_saved_map(
+                {
+                    "map_name": "office",
+                    "pcd_files": [str(pcd)],
+                    "_operation_deadline_monotonic": time.monotonic() + 30.0,
+                },
+                validate_only=True,
+            )
+
+            self.assertEqual(result["status"], "map_validated")
+            self.assertEqual(result["map_view_context_point_count"], 20)
+            self.assertEqual(adapter._static_map.point_count, 0)
 
     def test_late_terminal_mapping_failure_is_replayed_on_retry(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)

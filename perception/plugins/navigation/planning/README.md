@@ -130,7 +130,9 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 - planner bridge 在创建 Nav2 action 前读取最新
   `/global_costmap/costmap` 目标格。代价 `>=99`（inscribed/lethal）直接返回
   `goal_in_collision`；地图缺失/过期、目标在当前 rolling window 外或未知格都有
-  独立错误，不再进入长时间恢复流程。成功回执包含 `goal_cell`。
+  独立错误，不再进入长时间恢复流程。成功回执包含 `goal_cell`。Canvas 代价图
+  只把同一拒绝阈值 `>=99` 的格子标红；`1..98` 的软 inflation 仍由 Nav2 用于
+  路径评分，但不再渲染成类似不可通行区域。
 - global/local costmap 都是 rolling window。global 插件顺序固定为
   `StaticLayer -> live ObstacleLayer -> InflationLayer`：StaticLayer 消费完整的
   `/ubuntu/navigation/static_map`，live layer 与 local costmap 一样消费实时

@@ -1000,9 +1000,14 @@ class VoxelMap:
         *,
         obstacle_min_height_m: float | None = None,
         obstacle_max_height_m: float | None = None,
+        max_points: int | None = None,
     ) -> bytes:
         if (obstacle_min_height_m is None) != (obstacle_max_height_m is None):
             raise ValueError("both obstacle height limits are required")
+        if max_points is not None and (
+            isinstance(max_points, bool) or not isinstance(max_points, int) or max_points < 1
+        ):
+            raise ValueError("max_points must be a positive integer")
         metadata = b""
         if obstacle_min_height_m is not None and obstacle_max_height_m is not None:
             if not all(
@@ -1017,9 +1022,47 @@ class VoxelMap:
                 obstacle_min_height_m,
                 obstacle_max_height_m,
             )
+        points = tuple(self._points.values())
+        if max_points is not None and len(points) > max_points:
+            if obstacle_min_height_m is None:
+                points = self._even_sample(points, max_points)
+            else:
+                below = tuple(
+                    point for point in points if point[2] < obstacle_min_height_m
+                )
+                obstacle = tuple(
+                    point
+                    for point in points
+                    if obstacle_min_height_m <= point[2] <= obstacle_max_height_m
+                )
+                above = tuple(
+                    point for point in points if point[2] > obstacle_max_height_m
+                )
+                groups = (below, obstacle, above)
+                allocations = [
+                    min(len(below), max_points * 35 // 100),
+                    min(len(obstacle), max_points * 55 // 100),
+                    min(len(above), max_points * 10 // 100),
+                ]
+                remaining = max_points - sum(allocations)
+                for index in sorted(
+                    range(len(groups)),
+                    key=lambda item: len(groups[item]) - allocations[item],
+                    reverse=True,
+                ):
+                    extra = min(remaining, len(groups[index]) - allocations[index])
+                    allocations[index] += extra
+                    remaining -= extra
+                    if remaining == 0:
+                        break
+                points = tuple(
+                    point
+                    for group, allocation in zip(groups, allocations)
+                    for point in self._even_sample(group, allocation)
+                )
         yaw = yaw_from_quaternion(robot_pose.q)
-        body = bytearray(len(self._points) * _POINT.size)
-        for index, point in enumerate(self._points.values()):
+        body = bytearray(len(points) * _POINT.size)
+        for index, point in enumerate(points):
             normalized = _float32_xyz(point, context="encoded map point")
             _POINT.pack_into(body, index * _POINT.size, *normalized)
         header_pose = _float32_xyz(
@@ -1032,11 +1075,22 @@ class VoxelMap:
                 header_pose[1],
                 header_pose[2],
                 _FULL_MAP_WITH_Z,
-                len(self._points),
+                len(points),
             )
         except (OverflowError, struct.error) as exc:
             raise InvalidFastLivo2Frame("encoded map header is invalid") from exc
         return header + body + metadata
+
+    @staticmethod
+    def _even_sample(
+        points: tuple[tuple[float, float, float], ...],
+        count: int,
+    ) -> tuple[tuple[float, float, float], ...]:
+        if count <= 0:
+            return ()
+        if len(points) <= count:
+            return points
+        return tuple(points[index * len(points) // count] for index in range(count))
 
 
 class TemporalOccupancyMap:

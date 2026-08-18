@@ -49,6 +49,7 @@ from .frame_adapter_core import (
 
 
 _MAP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_MAP_VIEW_MAX_POINTS = 80_000
 
 
 def _stamp_ns(stamp) -> int:
@@ -130,6 +131,8 @@ class FastLivo2Adapter(Node):
             ),
         )
         map_voxel_size = float(self.get_parameter("map_voxel_size_m").value)
+        self._map_view_voxel_size = max(map_voxel_size, 0.20)
+        self._map_view_context = VoxelMap(self._map_view_voxel_size)
         self._static_map = TemporalOccupancyMap(
             map_voxel_size,
             confirmation_frames=int(
@@ -396,6 +399,12 @@ class FastLivo2Adapter(Node):
             if self._map_from_session != map_from_session:
                 return
             self._latest_mapped_points = mapped_points
+            if self._mode == "mapping":
+                self._map_view_context.add(
+                    point
+                    for point in mapped_points
+                    if not obstacle_min_height <= point[2] <= obstacle_max_height
+                )
         self._cloud_pub.publish(navigation_cloud)
         if mode == "mapping":
             matched_pose = nearest_stamped_pose(
@@ -429,6 +438,8 @@ class FastLivo2Adapter(Node):
         with self._lock:
             cleared = self._static_map.cleared_snapshot()
             self._static_map.clear()
+            retired_map_view = self._map_view_context
+            self._map_view_context = VoxelMap(self._map_view_voxel_size)
             self._static_map_load_time = self.get_clock().now().to_msg()
             self._session_name = message.data.strip() or None
             self._mode = "mapping"
@@ -446,6 +457,7 @@ class FastLivo2Adapter(Node):
             self._static_map_error = None
             self._static_save_result = None
         self._static_map_pub.publish(self._occupancy_grid(cleared))
+        _ = retired_map_view
 
     def _on_map_control(self, message: String) -> None:
         request_id = ""
@@ -714,6 +726,12 @@ class FastLivo2Adapter(Node):
                     "confirmed static map has too few finite points"
                 )
             static_source = "confirmed_static_pcd"
+        map_view_context = VoxelMap(self._map_view_voxel_size)
+        map_view_context.add(
+            point
+            for point in loaded.points
+            if not active_height_range[0] <= point[2] <= active_height_range[1]
+        )
         prepared = self._static_map.prepare_confirmed(static_loaded.points)
         snapshot = self._static_map.prepared_occupancy_snapshot(
             prepared,
@@ -730,6 +748,7 @@ class FastLivo2Adapter(Node):
                 "map_point_count": loaded.point_count,
                 "static_map_point_count": static_loaded.point_count,
                 "static_map_source": static_source,
+                "map_view_context_point_count": map_view_context.point_count,
                 "obstacle_height_range_m": list(active_height_range),
             }
         with self._lock:
@@ -753,6 +772,7 @@ class FastLivo2Adapter(Node):
                 self._pose_history,
                 self._latest_session_points,
                 self._latest_mapped_points,
+                self._map_view_context,
             )
             self._static_map_load_time = self.get_clock().now().to_msg()
             self._reference_points = loaded.points
@@ -764,6 +784,7 @@ class FastLivo2Adapter(Node):
             self._latest_session_pose = None
             self._latest_session_points = ()
             self._latest_mapped_points = ()
+            self._map_view_context = map_view_context
             self._last_odom_monotonic = None
             self._last_cloud_monotonic = None
             self._last_match = None
@@ -782,6 +803,7 @@ class FastLivo2Adapter(Node):
             "map_point_count": loaded.point_count,
             "static_map_point_count": static_loaded.point_count,
             "static_map_source": static_source,
+            "map_view_context_point_count": map_view_context.point_count,
             "obstacle_height_range_m": list(active_height_range),
             "localization_state": "awaiting_relocalization",
             "_post_response": publish_loaded_map,
@@ -863,6 +885,7 @@ class FastLivo2Adapter(Node):
                 self._pose_history,
                 self._latest_session_points,
                 self._latest_mapped_points,
+                self._map_view_context,
             )
             self._static_map_load_time = self.get_clock().now().to_msg()
             self._session_name = None
@@ -873,6 +896,7 @@ class FastLivo2Adapter(Node):
             self._latest_session_pose = None
             self._latest_session_points = ()
             self._latest_mapped_points = ()
+            self._map_view_context = VoxelMap(self._map_view_voxel_size)
             self._reference_points = ()
             self._last_odom_monotonic = None
             self._last_cloud_monotonic = None
@@ -939,6 +963,7 @@ class FastLivo2Adapter(Node):
                 max_z=self._obstacle_max_height,
             )
             view_map = self._static_map.as_voxel_map()
+            view_map.add(self._map_view_context.points)
             candidate_points = self._static_map.candidate_points
             view_map.add(candidate_points)
             live_out_of_band = ()
@@ -966,6 +991,7 @@ class FastLivo2Adapter(Node):
                     pose,
                     obstacle_min_height_m=self._obstacle_min_height,
                     obstacle_max_height_m=self._obstacle_max_height,
+                    max_points=_MAP_VIEW_MAX_POINTS,
                 )
                 self._map_view_pub.publish(frame)
             ready = (
@@ -1001,6 +1027,8 @@ class FastLivo2Adapter(Node):
                 "static_pose_match_tolerance_sec": self._static_pose_match_tolerance,
                 "unmatched_static_cloud": self._unmatched_static_cloud,
                 "static_map_error": self._static_map_error,
+                "map_view_context_point_count": self._map_view_context.point_count,
+                "map_view_max_point_count": _MAP_VIEW_MAX_POINTS,
                 "map_view_live_out_of_band_point_count": len(live_out_of_band),
                 "obstacle_point_count": len(obstacle_points),
                 "obstacle_height_range_m": [self._obstacle_min_height, self._obstacle_max_height],

@@ -217,8 +217,7 @@ export const CostmapRenderer = {
       'position:absolute;right:9px;bottom:7px;padding:3px 7px;border-radius:4px;' +
       'background:rgba(0,0,0,.68);color:#dce7df;font:10px monospace';
     this._legend.innerHTML =
-      '<span style="color:#d9382e">Occupied</span>  ' +
-      '<span style="color:#f0a52b">Inflated</span>  ' +
+      '<span style="color:#d9382e">Rejected (&gt;=99)</span>  ' +
       '<span style="color:#55d675">Path</span>';
     this._el.append(this._canvas, this._summary, this._legend);
     container.appendChild(this._el);
@@ -367,11 +366,6 @@ export const CostmapRenderer = {
           red = 43; green = 47; blue = 45;
         } else if (value >= 99) {
           red = 217; green = 56; blue = 46;
-        } else if (value > 0) {
-          const t = Math.min(Math.max(value / 100, 0), 1);
-          red = 180 + Math.round(60 * t);
-          green = 145 - Math.round(90 * t);
-          blue = 34;
         }
         pixels.data[pixel] = red;
         pixels.data[pixel + 1] = green;
