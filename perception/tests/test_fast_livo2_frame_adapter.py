@@ -29,6 +29,7 @@ from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     VoxelMap,
     canonical_base_pose,
     compose_pose,
+    encode_map_view_points,
     estimate_planar_relocalization,
     inverse_pose,
     iter_xyz_points,
@@ -225,6 +226,33 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
                 Pose3(0.0, 0.0, 0.0, quaternion_from_rpy(0.0, 0.0, 0.0)),
                 max_points=0,
             )
+
+        direct_frame = encode_map_view_points(
+            (
+                point
+                for point in (
+                    [(index * 0.20, 0.0, -1.20) for index in range(100)]
+                    + [(index * 0.20, 1.0, 0.0) for index in range(100)]
+                    + [(index * 0.20, 2.0, 1.20) for index in range(100)]
+                )
+            ),
+            Pose3(0.0, 0.0, 0.0, quaternion_from_rpy(0.0, 0.0, 0.0)),
+            obstacle_min_height_m=-0.30,
+            obstacle_max_height_m=0.30,
+            max_points=20,
+        )
+        direct_count = struct.unpack_from("<I", direct_frame, 13)[0]
+        direct_points = [
+            struct.unpack_from("<fff", direct_frame, 17 + index * 12)
+            for index in range(direct_count)
+        ]
+        self.assertEqual(direct_count, 20)
+        self.assertEqual(sum(point[2] < -0.30 for point in direct_points), 7)
+        self.assertEqual(
+            sum(-0.30 <= point[2] <= 0.30 for point in direct_points),
+            11,
+        )
+        self.assertEqual(sum(point[2] > 0.30 for point in direct_points), 2)
 
         with self.assertRaises(InvalidFastLivo2Frame):
             list(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from itertools import chain
 import json
 import math
 from pathlib import Path
@@ -35,6 +36,7 @@ from .frame_adapter_core import (
     canonical_base_pose,
     compose_pose,
     estimate_planar_relocalization,
+    encode_map_view_points,
     iter_xyz_points,
     nearest_stamped_pose,
     normalize_obstacle_height_range,
@@ -962,14 +964,11 @@ class FastLivo2Adapter(Node):
                 min_z=self._obstacle_min_height,
                 max_z=self._obstacle_max_height,
             )
-            view_map = self._static_map.as_voxel_map()
-            view_map.add(self._map_view_context.points)
             candidate_points = self._static_map.candidate_points
-            view_map.add(candidate_points)
+            live_points = ()
             live_out_of_band = ()
             if cloud_age is not None and cloud_age <= self._source_max_age:
                 live_points = self._latest_mapped_points
-                view_map.add(live_points)
                 live_out_of_band = tuple(
                     point
                     for point in live_points
@@ -987,7 +986,13 @@ class FastLivo2Adapter(Node):
                 static_grid = self._occupancy_grid(snapshot)
             if pose is not None:
                 frame = UInt8MultiArray()
-                frame.data = view_map.encode(
+                frame.data = encode_map_view_points(
+                    chain(
+                        self._static_map.map_view_points,
+                        self._map_view_context.points,
+                        candidate_points,
+                        live_points,
+                    ),
                     pose,
                     obstacle_min_height_m=self._obstacle_min_height,
                     obstacle_max_height_m=self._obstacle_max_height,

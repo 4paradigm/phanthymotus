@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import chain
 import math
 import os
 from pathlib import Path
@@ -1093,6 +1094,106 @@ class VoxelMap:
         return tuple(points[index * len(points) // count] for index in range(count))
 
 
+def encode_map_view_points(
+    points: Iterable[tuple[float, float, float]],
+    robot_pose: Pose3,
+    *,
+    obstacle_min_height_m: float,
+    obstacle_max_height_m: float,
+    max_points: int,
+) -> bytes:
+    """Encode already bounded display sources without rebuilding a voxel map.
+
+    The static map, out-of-band context, and current scan are already bounded
+    independently. Rehashing all of them into a temporary ``VoxelMap`` once
+    per second made Canvas rendering monopolize the single-threaded adapter and
+    delayed the canonical odom/cloud outputs. Callers pass points already
+    validated by ``VoxelMap``, ``TemporalOccupancyMap``, or the live cloud
+    decoder. This display-only encoder keeps the existing height-balanced point
+    budget without repeating the same Python validation and voxel hashing.
+    """
+
+    if not all(
+        math.isfinite(value)
+        for value in (obstacle_min_height_m, obstacle_max_height_m)
+    ):
+        raise ValueError("obstacle height limits must be finite")
+    if obstacle_min_height_m >= obstacle_max_height_m:
+        raise ValueError("obstacle minimum height must be below maximum")
+    if (
+        isinstance(max_points, bool)
+        or not isinstance(max_points, int)
+        or max_points < 1
+    ):
+        raise ValueError("max_points must be a positive integer")
+
+    selected = tuple(points)
+    if len(selected) > max_points:
+        below = tuple(
+            point for point in selected if point[2] < obstacle_min_height_m
+        )
+        obstacle = tuple(
+            point
+            for point in selected
+            if obstacle_min_height_m <= point[2] <= obstacle_max_height_m
+        )
+        above = tuple(
+            point for point in selected if point[2] > obstacle_max_height_m
+        )
+        groups = (below, obstacle, above)
+        allocations = [
+            min(len(below), max_points * 35 // 100),
+            min(len(obstacle), max_points * 55 // 100),
+            min(len(above), max_points * 10 // 100),
+        ]
+        remaining = max_points - sum(allocations)
+        for index in sorted(
+            range(len(groups)),
+            key=lambda item: len(groups[item]) - allocations[item],
+            reverse=True,
+        ):
+            extra = min(remaining, len(groups[index]) - allocations[index])
+            allocations[index] += extra
+            remaining -= extra
+            if remaining == 0:
+                break
+        selected = tuple(
+            point
+            for group, allocation in zip(groups, allocations)
+            for point in VoxelMap._even_sample(group, allocation)
+        )
+
+    try:
+        body = struct.pack(
+            f"<{len(selected) * 3}f",
+            *chain.from_iterable(selected),
+        )
+    except (OverflowError, struct.error, TypeError, ValueError) as exc:
+        raise InvalidFastLivo2Frame(
+            "validated map-view points cannot be encoded"
+        ) from exc
+    header_pose = _float32_xyz(
+        (robot_pose.x, robot_pose.y, yaw_from_quaternion(robot_pose.q)),
+        context="encoded robot pose",
+    )
+    try:
+        header = _FRAME_HEADER.pack(
+            header_pose[0],
+            header_pose[1],
+            header_pose[2],
+            _FULL_MAP_WITH_Z,
+            len(selected),
+        )
+    except (OverflowError, struct.error) as exc:
+        raise InvalidFastLivo2Frame("encoded map header is invalid") from exc
+    metadata = _FILTER_METADATA.pack(
+        _FILTER_METADATA_MAGIC,
+        obstacle_min_height_m,
+        obstacle_max_height_m,
+    )
+    return header + body + metadata
+
+
 class TemporalOccupancyMap:
     """Accumulate navigation-height geometry with an optional motion gate.
 
@@ -1321,6 +1422,16 @@ class TemporalOccupancyMap:
         return tuple(
             evidence.point
             for key, evidence in sorted(self._evidence.items())
+            if evidence.confirmed
+        )
+
+    @property
+    def map_view_points(self) -> tuple[tuple[float, float, float], ...]:
+        """Return an unordered immutable snapshot for display-only encoding."""
+
+        return tuple(
+            evidence.point
+            for evidence in self._evidence.values()
             if evidence.confirmed
         )
 
