@@ -472,16 +472,18 @@ class NavigationPlugin:
         return {"wired_topics": wired}
 
     def _handle_semantic_goal(self, goal: dict, *, control_nav_id=None) -> dict:
+        request = {
+            "action": "navigate_to_pose",
+            "x": goal["x"],
+            "y": goal["y"],
+            "yaw": goal["yaw"],
+            "speed": goal["speed"],
+        }
+        if control_nav_id is not None:
+            request["_control_nav_id"] = control_nav_id
         return self._planning.dispatch(
             "nav2",
-            {
-                "action": "navigate_to_pose",
-                "x": goal["x"],
-                "y": goal["y"],
-                "yaw": goal["yaw"],
-                "speed": goal["speed"],
-                "_control_nav_id": control_nav_id,
-            },
+            request,
         )
 
     def _info(self) -> dict:
@@ -518,7 +520,7 @@ class NavigationPlugin:
             "topic_out": tool["topic_out"],
             "container_model": "single_perception_container",
             "docker_runtime_dependency": False,
-            "control_lease": "requires_agent_core_execution_control",
+            "task_identity": "perception_generated_nav_id",
             "error_code": (
                 "invalid_config"
                 if config_error

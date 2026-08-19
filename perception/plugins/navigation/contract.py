@@ -158,8 +158,6 @@ def navigation_tool_definition(namespace: str) -> dict:
         deepcopy(component_outputs[port]) for port in NAVIGATION_PUBLIC_OUTPUT_PORTS
     ]
 
-    execution_control = deepcopy(planning["x-execution-control"])
-    execution_control["start_actions"] = ["navigate_to_pose", "navigate"]
     return {
         "name": CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
         "displayName": CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
@@ -171,7 +169,6 @@ def navigation_tool_definition(namespace: str) -> dict:
             "inside the Perception container; only bounded velocity proposals "
             "leave the card."
         ),
-        "x-execution-control": execution_control,
         "x-topic-actions": deepcopy(planning["x-topic-actions"]),
         "topic_in": external_inputs,
         "topic_out": outputs,

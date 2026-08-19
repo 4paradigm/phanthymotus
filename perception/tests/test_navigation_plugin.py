@@ -155,19 +155,7 @@ class NavigationContractTest(unittest.TestCase):
             "navigate",
         ):
             self.assertIn(action, actions)
-        self.assertEqual(
-            tool["x-execution-control"]["start_actions"],
-            ["navigate_to_pose", "navigate"],
-        )
-        self.assertEqual(tool["x-execution-control"]["version"], 2)
-        self.assertEqual(
-            tool["x-execution-control"]["authorize_action"],
-            "authorize_navigation",
-        )
-        self.assertEqual(
-            tool["x-execution-control"]["revoke_action"],
-            "revoke_navigation",
-        )
+        self.assertNotIn("x-execution-control", tool)
 
     def test_unified_action_schema_only_exposes_supported_fields(self):
         tool = navigation_tool_definition("ubuntu")
@@ -463,6 +451,18 @@ class NavigationPluginTest(unittest.TestCase):
             ],
             "semantic",
         )
+
+    def test_semantic_goal_without_control_id_lets_planner_create_task_id(self):
+        planning = FakeComponent("planning")
+        plugin = self.make_plugin(planning=planning)
+
+        plugin._handle_semantic_goal(
+            {"x": 1.0, "y": -0.5, "yaw": 0.25, "speed": 0.5}
+        )
+
+        request = planning.calls[-1][1]
+        self.assertEqual(request["action"], "navigate_to_pose")
+        self.assertNotIn("_control_nav_id", request)
 
     def test_retryable_mapping_stop_keeps_runtime_and_canvas_lifecycle(self):
         runtime = FakeRuntime()

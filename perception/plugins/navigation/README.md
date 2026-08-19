@@ -21,8 +21,9 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
   启停；运行时不调用 Docker，也不需要 Docker socket。
 - odom、registered cloud、obstacle map 和 collection status 是卡片内部 ROS
   边，不再作为 Canvas 公共连线端口。
-- VLN 命中地点后直接调用同卡片 planner，并透传 Agent Core 的
-  `_control_nav_id`；`goal_pose` topic 只保留为可选外部控制入口。
+- VLN 命中地点后直接调用同卡片 planner；无论是 Canvas、
+  `goal_pose` topic 还是 VLN 入口，planner 都为每个新任务生成独立
+  `nav_id`。
 - Nav2 仍只发布 `phanthy.navigation.velocity_proposal.v1`，Driver 继续负责
   物理执行、TTL、急停、二次限幅和停车确认。
 
@@ -114,14 +115,13 @@ deadline 内只做原子状态切换，并在控制回执之后发布大栅格�
 `stop_nav` 解锁；终态后迟到的 `wait_navigation_done` 会幂等返回已保存的
 终态回执。不同 `nav_id` 的迟到消息不会解锁当前任务。
 
-Canvas 手动执行 `navigate_to_pose` 时，Agent Core 根据
-`x-execution-control` 为每次点击生成新 `nav_id`，先调用与
-`velocity_proposal` topic/schema 唯一匹配的 Driver `loco.authorize_navigation`，
-再将同一 ID 以 `_control_nav_id` 传入本卡片。上一任务已终态时
-Driver 可直接接受新授权，因此连续手动导航不需重启 Canvas 或 Driver。
-若上一任务仍活动、执行器不唯一或授权失败，Core 会在调用本卡片前
-明确拒绝，不会用新目标覆盖进行中任务。`stop_nav` 会在卡片停止后
-调用 `loco.revoke_navigation`；若卡片启动新任务失败，Core 也会撤销刚获得的授权。
+Canvas 手动执行 `navigate_to_pose` 时，Agent Core 只透明转发 MCP
+请求。planner 接受目标后生成新 `nav_id`，并在整个任务的
+velocity proposal 中保持该 ID。Nav2 上报匹配的终态后，卡片释放
+活动任务；下一次点击因此会获得另一个 ID，无需重启
+Canvas、Core 或 Driver。Driver 在空闲订阅状态接纳首条新鲜、合法、
+非零且非终态 proposal 的 `nav_id`，活动任务期间拒绝 ID 切换，并在
+终态零速后退役该 ID。Core 不另外维护 authorize/revoke 状态。
 
 `start` 按 runtime → mapping → planning → semantic 顺序获取资源；任一步
 失败会按相反顺序回滚。`stop_mapping` 和 `load_map` 的 backend 等待预算分别

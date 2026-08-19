@@ -128,7 +128,7 @@ def _normalize(action: str, args: dict) -> dict:
 
 
 def _trusted_nav_id(args: dict) -> str | None:
-    """Read the private task lease injected by the trusted Agent Core."""
+    """Read an optional private task ID used by an in-process caller."""
 
     if "_control_nav_id" not in args:
         return None

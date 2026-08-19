@@ -85,19 +85,7 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(costmap["schema"], "phanthy.navigation.costmap.v1")
         self.assertTrue(costmap["default_preview"])
 
-        execution_control = tool["x-execution-control"]
-        self.assertEqual(execution_control["version"], 2)
-        self.assertEqual(
-            execution_control["authorize_action"], "authorize_navigation"
-        )
-        self.assertEqual(execution_control["revoke_action"], "revoke_navigation")
-        self.assertEqual(execution_control["nav_id_argument"], "nav_id")
-        self.assertEqual(
-            execution_control["proposal_topic_argument"], "proposal_topic"
-        )
-        self.assertEqual(
-            execution_control["proposal_schema_argument"], "proposal_schema"
-        )
+        self.assertNotIn("x-execution-control", tool)
 
         companion_root = (
             PERCEPTION_ROOT

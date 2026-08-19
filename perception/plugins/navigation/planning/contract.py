@@ -201,36 +201,9 @@ def nav2_tool_definition(namespace: str) -> dict:
             "directly accumulated static occupancy plus live clearing "
             "obstacles. This "
             "Perception card only emits "
-            "bounded velocity proposals; an explicitly authorized Driver loco "
-            "actuator owns any physical execution."
+            "bounded velocity proposals with a fresh task ID; the Driver loco "
+            "actuator owns any physical execution and task adoption."
         ),
-        "x-execution-control": {
-            "version": 2,
-            "proposal_schema": "phanthy.navigation.velocity_proposal.v1",
-            "output_port": "velocity_proposal",
-            "target_tool": "loco",
-            "lease_argument": "_control_nav_id",
-            "authorize_action": "authorize_navigation",
-            "revoke_action": "revoke_navigation",
-            "nav_id_argument": "nav_id",
-            "proposal_topic_argument": "proposal_topic",
-            "proposal_schema_argument": "proposal_schema",
-            "start_actions": ["navigate_to_pose"],
-            "wait_actions": ["wait_navigation_done"],
-            "stop_actions": ["stop_nav"],
-            "pause_actions": ["pause_nav"],
-            "resume_actions": ["resume_nav"],
-            "terminal_statuses": [
-                "arrived",
-                "succeeded",
-                "cancelled",
-                "stopped",
-                "timeout",
-                "error",
-                "aborted",
-                "rejected",
-            ],
-        },
         "x-topic-actions": [
             {
                 "port": "goal_pose",
@@ -307,8 +280,8 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "units": "x/y=m, yaw=rad, speed=m/s",
                 "desc": (
                     "Optional target input. Each JSON message needs a unique "
-                    "goal_id plus x/y/yaw and is executed through the same "
-                    "Agent Core Driver lease as navigate_to_pose."
+                    "goal_id plus x/y/yaw; the planner creates a fresh nav_id "
+                    "for the accepted navigation task."
                 ),
             },
         ],

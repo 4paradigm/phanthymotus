@@ -424,7 +424,7 @@ class Nav2Plugin:
                     for item in tool["topic_in"]
                 ],
                 "topic_out": tool["topic_out"],
-                "control_lease": "requires_agent_core_execution_control",
+                "task_identity": "perception_generated_nav_id",
             }
         )
         return result

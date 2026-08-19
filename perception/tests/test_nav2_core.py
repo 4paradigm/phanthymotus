@@ -129,6 +129,39 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(second["status"], "navigating")
         self.assertEqual(second["nav_id"], "lease-second")
 
+    def test_consecutive_manual_goals_generate_distinct_task_ids(self) -> None:
+        first = self.core.dispatch(
+            {
+                "action": "navigate_to_pose",
+                "x": 0.5,
+                "y": 0.0,
+                "yaw": 0.0,
+            }
+        )
+        self.assertEqual(first["status"], "navigating")
+        self.assertRegex(first["nav_id"], r"^[0-9a-f]{32}$")
+
+        self.backend.emit_terminal(first["nav_id"])
+
+        second = self.core.dispatch(
+            {
+                "action": "navigate_to_pose",
+                "x": 1.0,
+                "y": 0.0,
+                "yaw": 0.0,
+            }
+        )
+        self.assertEqual(second["status"], "navigating")
+        self.assertRegex(second["nav_id"], r"^[0-9a-f]{32}$")
+        self.assertNotEqual(first["nav_id"], second["nav_id"])
+        navigate_calls = [
+            call for call in self.backend.calls if call[0] == "navigate_to_pose"
+        ]
+        self.assertEqual(
+            [call[2] for call in navigate_calls],
+            [first["nav_id"], second["nav_id"]],
+        )
+
     def test_terminal_for_another_navigation_does_not_release_task(self) -> None:
         self.core.dispatch(
             {

@@ -8,13 +8,11 @@ import fastapi
 from pydantic import BaseModel
 
 import config
-from execution_control import ManualExecutionController
 import mcp_client
 
 router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
-_manual_execution_control = ManualExecutionController()
 
 
 def _get_inspector_url() -> str:
@@ -751,24 +749,6 @@ async def _handle_agentcore_call(req: MCPCallRequest):
 
 
 @router.post('/{mcp_id}/call')
-async def mcp_call_tool_http(mcp_id: str, req: MCPCallRequest):
-    """Handle a manual Canvas call, including declared execution control."""
-
-    async def raw_call(target_mcp_id: str, tool: str, arguments: dict) -> dict:
-        return await mcp_call_tool(
-            target_mcp_id,
-            MCPCallRequest(tool=tool, arguments=arguments),
-        )
-
-    return await _manual_execution_control.call_manual(
-        mcps=_get_mcp_list(),
-        source_mcp_id=mcp_id,
-        source_tool_name=req.tool,
-        arguments=dict(req.arguments),
-        raw_call=raw_call,
-    )
-
-
 async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
     """Call a tool on an MCP server and return the result."""
     # ── Handle internal agentcore MCP (no HTTP transport) ──

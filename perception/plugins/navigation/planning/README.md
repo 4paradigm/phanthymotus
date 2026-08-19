@@ -32,7 +32,8 @@ FAST-LIVO2 internal module
   `map/base_link` 合同。不能只改 topic 名来伪装坐标系。
 - Nav2 只消费已去畸变、已对时、已归一化 frame 的数据，并在任一
   输入过期、frame 不符或 `map -> base_link` 不可用时 fail closed。
-- Agent Core 负责 Canvas 生命周期和导航任务 lease。
+- Agent Core 负责 Canvas 生命周期和 MCP 请求转发；Nav2 planner
+  在接受每个新目标时生成独立 `nav_id`。
 - Driver `loco` 负责物理执行、二次限幅、急停、TTL 和停车确认。
 
 ## 输入合同
@@ -259,6 +260,7 @@ Runtime 对 launch 根进程及其独立 Linux 后代进程组执行有界信号
 完整真机导航还必须同时满足：
 
 1. 同卡片 FAST-LIVO2 模块已发布上述 canonical topic 和 `map -> base_link` TF；
-2. Agent Core 已把受信 `nav_id` 与 Driver lease 绑定；
+2. planner 已为目标生成 `nav_id`，Driver 在空闲时接纳该任务
+   的首条新鲜、合法、非零 proposal；
 3. Driver 返回提案执行和停车确认；
 4. owner 持有遥控器/急停并显式授权真机运动。

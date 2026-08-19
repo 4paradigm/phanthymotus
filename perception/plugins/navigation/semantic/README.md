@@ -5,8 +5,8 @@
 - `capture`：等待新的 RGB/odom 对，调用配置的 VLM 生成描述，并记录当前
   `map -> base_link` 位姿。
 - `navigate(query)`：只在当前 FAST-LIVO2 map session 内匹配已记录地点。
-  命中后直接调用同卡片 Nav2 planner，并透传 Agent Core 的
-  `_control_nav_id`；未命中时不产生目标。
+  命中后直接调用同卡片 Nav2 planner，由 planner 为该任务
+  生成新 `nav_id`；未命中时不产生目标。
 
 ## VLM 配置
 
@@ -32,5 +32,5 @@ Canvas 自连线缺失导致目标丢失。
   或 session 变化都会阻止复用旧坐标。
 - 默认按 ROS 接收时间配对传感器；只有确认上游共享 header 时钟域后才使用
   `source_timestamp`。
-- VLM 匹配成功不等于物理执行授权；proposal 仍必须经过 Agent Core lease 和
-  Driver 安全检查。
+- VLM 匹配成功不等于物理执行；proposal 仍必须经过 Driver
+  的任务 ID、TTL、急停和障碍等安全检查。
