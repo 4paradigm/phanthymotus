@@ -1,5 +1,9 @@
 mcp_port: 15720
 
+identity:
+  core_display_name: "Perception Stack · Shanghai G1"
+  mcp_server_name: "perception-stack-shanghai-g1"
+
 plugins:
   asr:
     enabled: true
@@ -46,3 +50,14 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  vlapi05g1:
+    enabled: true
+    policy_url: "http://127.0.0.1:18080/predict"
+    health_url: ""
+    request_timeout_s: 120.0
+    max_image_bytes: 8388608
+    task: "move blue box back and forth between tables"
+    seed: 0
+    max_image_age_s: 1.0
+    max_state_age_s: 0.5
