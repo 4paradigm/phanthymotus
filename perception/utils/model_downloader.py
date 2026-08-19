@@ -594,6 +594,51 @@ OCR_MODEL_BUNDLES = {
 }
 
 
+# ── Obstacle distance (ZipDepth + YOLO26n TensorRT INT8 engines) ─────────
+OBSTACLE_MODEL_REVISION = "b8ba6d69a819b5ed6f0c1c5723b37c8775fa737b"
+OBSTACLE_MODEL_BASE = os.environ.get(
+    "OBSTACLE_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    f"obstacle-distance-jetson-int8/resolve/{OBSTACLE_MODEL_REVISION}",
+)
+OBSTACLE_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{OBSTACLE_MODEL_BASE}/jp61",
+        "files": {
+            "zipdepth-base-npu-512x384-int8.engine": {
+                "size": 7935428,
+                "sha256": "aa34296bcaeed28a5176b423f074da3923c996e7be06702a3952d475000a8887",
+            },
+            "yolo26n-depth-int8.engine": {
+                "size": 7778158,
+                "sha256": "8174652d6ba72af15c10caccf95629d585d33245e5242aa1f1734317d5a23f7c",
+            },
+            "yolo26n-seg-int8.engine": {
+                "size": 5641961,
+                "sha256": "7cb85598bc50b82ab5835102dab9214f6e58a0061c6a1891ee018387346bae30",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": f"{OBSTACLE_MODEL_BASE}/jp511",
+        "files": {
+            "zipdepth-base-npu-512x384-int8.engine": {
+                "size": 7936960,
+                "sha256": "61d9b81c81bcd26660d3647bfb86fd133f865ad5b73b4177efcad2884f7a2d1c",
+            },
+            "yolo26n-depth-int8.engine": {
+                "size": 6746230,
+                "sha256": "816ca14c23af37ee2961ec09db51a54888462c5e4bb296bbaba2a569e6f2bb64",
+            },
+            "yolo26n-seg-int8.engine": {
+                "size": 4920200,
+                "sha256": "ed5e0f8dcb968440866f5b0433f7b813d14f2e89f810be6e8910945e0af42635",
+            },
+        },
+    },
+}
+
+
 def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
     """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
     model_dir = require_models_subpath(model_dir)
@@ -742,3 +787,22 @@ def ensure_vits2_model(model_dir: str, family: str | None = None) -> str:
         entry,
     )
     return os.path.join(model_dir, "engines", key)
+
+
+def ensure_obstacle_models(
+    model_dir: str, bundle: str | None = None
+) -> dict[str, str]:
+    """Ensure the obstacle TensorRT engines matching the runtime TensorRT.
+
+    ``bundle`` (or the OBSTACLE_MODEL_BUNDLE environment variable) is an
+    explicit test override such as "jp61"/"jp511"; production deployments
+    leave it unset and follow the importable TensorRT version.
+    """
+    family = bundle or os.environ.get("OBSTACLE_MODEL_BUNDLE") or None
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(OBSTACLE_MODEL_BUNDLES, family)
+    entry = OBSTACLE_MODEL_BUNDLES[key]
+    log.info(f"[model_downloader] obstacle: using {key} bundle")
+    return ensure_verified_bundle(
+        f"obstacle/{key}", model_dir, entry["base_url"], entry["files"]
+    )
