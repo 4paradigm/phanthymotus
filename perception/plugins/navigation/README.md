@@ -108,6 +108,12 @@ deadline 内只做原子状态切换，并在控制回执之后发布大栅格�
   `resume_nav`、`stop_nav`
 - 语义地点：`capture`、`navigate`
 
+`navigate_to_pose` 保持非阻塞；需要在同一调用链内等待结果时仍使用
+`wait_navigation_done`。Nav2 异步上报同一 `nav_id` 的到达、取消、停止、
+超时或失败终态时，卡片会立即释放活动任务，下一个导航无需再手工
+`stop_nav` 解锁；终态后迟到的 `wait_navigation_done` 会幂等返回已保存的
+终态回执。不同 `nav_id` 的迟到消息不会解锁当前任务。
+
 `start` 按 runtime → mapping → planning → semantic 顺序获取资源；任一步
 失败会按相反顺序回滚。`stop_mapping` 和 `load_map` 的 backend 等待预算分别
 至少为 360 s 和 900 s。可重试的地图收口失败会保留 Canvas wiring、运行时和

@@ -152,6 +152,10 @@ class Nav2Core:
         self._backend = backend
         self._lock = threading.Lock()
         self._active_nav_id: str | None = None
+        self._last_terminal_result: dict | None = None
+        set_terminal_callback = getattr(backend, "set_terminal_callback", None)
+        if callable(set_terminal_callback):
+            set_terminal_callback(self._on_navigation_terminal)
 
     def info(self) -> dict:
         with self._lock:
@@ -214,6 +218,7 @@ class Nav2Core:
                     f"navigation {self._active_nav_id} is already active",
                 )
             self._active_nav_id = nav_id
+            self._last_terminal_result = None
         try:
             result = self._result(
                 action,
@@ -226,16 +231,23 @@ class Nav2Core:
                     self._active_nav_id = None
             raise
         if result.get("status") in _TERMINAL_STATUSES:
-            with self._lock:
-                if self._active_nav_id == nav_id:
-                    self._active_nav_id = None
+            self._on_navigation_terminal(result)
         return result
 
     def _control_navigation(self, action: str, args: dict) -> dict:
         with self._lock:
             nav_id = self._active_nav_id
+            terminal_result = (
+                dict(self._last_terminal_result)
+                if self._last_terminal_result is not None
+                else None
+            )
 
         if not nav_id:
+            if action == "wait_navigation_done" and terminal_result is not None:
+                terminal_result["action"] = action
+                terminal_result["terminal_replayed"] = True
+                return terminal_result
             if action == "stop_nav":
                 return {
                     "action": action,
@@ -253,10 +265,23 @@ class Nav2Core:
             nav_id=nav_id,
         )
         if result.get("status") in _TERMINAL_STATUSES:
-            with self._lock:
-                if self._active_nav_id == nav_id:
-                    self._active_nav_id = None
+            self._on_navigation_terminal(result)
         return result
+
+    def _on_navigation_terminal(self, raw: dict) -> None:
+        """Release only the matching task when Nav2 reports a terminal state."""
+
+        result = dict(raw)
+        nav_id = result.get("nav_id")
+        status = result.get("status") or result.get("state")
+        if not isinstance(nav_id, str) or status not in _TERMINAL_STATUSES:
+            return
+        with self._lock:
+            if self._active_nav_id != nav_id:
+                return
+            result.setdefault("status", status)
+            self._active_nav_id = None
+            self._last_terminal_result = result
 
     @staticmethod
     def _result(action: str, raw: dict | None, *, nav_id: str | None = None) -> dict:

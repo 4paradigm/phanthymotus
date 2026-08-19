@@ -1,20 +1,34 @@
 from __future__ import annotations
 
+import json
 import sys
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 PERCEPTION_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERCEPTION_ROOT))
 
 from plugins.navigation.planning.core import Nav2Core  # noqa: E402
+from plugins.navigation.planning.backend import (  # noqa: E402
+    RosTopicNavigationBackend,
+)
 
 
 class FakeBackend:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict, str | None]] = []
         self.stopped = 0
+        self.terminal_callback = None
+
+    def set_terminal_callback(self, callback) -> None:
+        self.terminal_callback = callback
+
+    def emit_terminal(self, nav_id: str, status: str = "arrived") -> None:
+        assert self.terminal_callback is not None
+        self.terminal_callback({"nav_id": nav_id, "status": status})
 
     def info(self) -> dict:
         return {"state": "ready", "backend": "fake"}
@@ -81,6 +95,64 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(args["speed"], 0.30)
         self.assertEqual(nav_id, "lease-min-speed")
 
+    def test_async_arrival_releases_task_and_preserves_wait_receipt(self) -> None:
+        first = self.core.dispatch(
+            {
+                "action": "navigate_to_pose",
+                "x": 0.5,
+                "y": 0.0,
+                "yaw": 0.0,
+                "_control_nav_id": "lease-first",
+            }
+        )
+        self.assertEqual(first["status"], "navigating")
+
+        self.backend.emit_terminal("lease-first")
+
+        self.assertIsNone(self.core.info()["active_nav_id"])
+        terminal = self.core.dispatch(
+            {"action": "wait_navigation_done", "stall_timeout": 2}
+        )
+        self.assertEqual(terminal["status"], "arrived")
+        self.assertEqual(terminal["nav_id"], "lease-first")
+        self.assertTrue(terminal["terminal_replayed"])
+
+        second = self.core.dispatch(
+            {
+                "action": "navigate_to_pose",
+                "x": 1.0,
+                "y": 0.0,
+                "yaw": 0.0,
+                "_control_nav_id": "lease-second",
+            }
+        )
+        self.assertEqual(second["status"], "navigating")
+        self.assertEqual(second["nav_id"], "lease-second")
+
+    def test_terminal_for_another_navigation_does_not_release_task(self) -> None:
+        self.core.dispatch(
+            {
+                "action": "navigate_to_pose",
+                "x": 0.5,
+                "y": 0.0,
+                "yaw": 0.0,
+                "_control_nav_id": "lease-active",
+            }
+        )
+
+        self.backend.emit_terminal("lease-other")
+
+        rejected = self.core.dispatch(
+            {
+                "action": "navigate_to_pose",
+                "x": 1.0,
+                "y": 0.0,
+                "yaw": 0.0,
+            }
+        )
+        self.assertEqual(rejected["error_code"], "navigation_active")
+        self.assertEqual(self.core.info()["active_nav_id"], "lease-active")
+
     def test_maximum_navigation_speed_is_accepted(self) -> None:
         result = self.core.dispatch(
             {
@@ -131,6 +203,33 @@ class Nav2CoreTest(unittest.TestCase):
         result = self.core.dispatch({"action": "stop_nav"})
         self.assertEqual(result["status"], "stopped")
         self.assertTrue(result["already_idle"])
+
+
+class RosTopicNavigationBackendTest(unittest.TestCase):
+    def test_terminal_status_notifies_registered_callback(self) -> None:
+        backend = object.__new__(RosTopicNavigationBackend)
+        backend._condition = threading.Condition()
+        backend._last_status = {}
+        backend._responses = {}
+        backend._navigation = {}
+        received = []
+        backend._terminal_callback = received.append
+
+        backend._on_status(
+            SimpleNamespace(
+                data=json.dumps(
+                    {
+                        "event": "heartbeat",
+                        "nav_id": "lease-001",
+                        "status": "arrived",
+                        "progress_seq": 5,
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(received[0]["nav_id"], "lease-001")
+        self.assertEqual(received[0]["status"], "arrived")
 
 
 if __name__ == "__main__":

@@ -114,7 +114,14 @@ class RosTopicNavigationBackend:
             "shadow_only": True,
             "physical_execution": False,
         }
+        self._terminal_callback = None
         self._closed = False
+
+    def set_terminal_callback(self, callback) -> None:
+        """Receive terminal navigation status without blocking the ROS callback."""
+
+        with self._condition:
+            self._terminal_callback = callback
 
     def info(self) -> dict:
         with self._condition:
@@ -163,6 +170,8 @@ class RosTopicNavigationBackend:
             return
         if not isinstance(payload, dict):
             return
+        terminal_callback = None
+        terminal_payload = None
         with self._condition:
             self._last_status = dict(payload)
             request_id = payload.get("request_id")
@@ -179,7 +188,13 @@ class RosTopicNavigationBackend:
                         "progress_received_at", time.monotonic()
                     )
                 self._navigation[nav_id] = dict(payload)
+                status = payload.get("status") or payload.get("state")
+                if status in _TERMINAL and self._terminal_callback is not None:
+                    terminal_callback = self._terminal_callback
+                    terminal_payload = dict(payload)
             self._condition.notify_all()
+        if terminal_callback is not None and terminal_payload is not None:
+            terminal_callback(terminal_payload)
 
     def _wait_for_bridge(self) -> None:
         deadline = time.monotonic() + self._discovery_timeout
