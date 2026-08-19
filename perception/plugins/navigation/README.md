@@ -114,6 +114,15 @@ deadline 内只做原子状态切换，并在控制回执之后发布大栅格�
 `stop_nav` 解锁；终态后迟到的 `wait_navigation_done` 会幂等返回已保存的
 终态回执。不同 `nav_id` 的迟到消息不会解锁当前任务。
 
+Canvas 手动执行 `navigate_to_pose` 时，Agent Core 根据
+`x-execution-control` 为每次点击生成新 `nav_id`，先调用与
+`velocity_proposal` topic/schema 唯一匹配的 Driver `loco.authorize_navigation`，
+再将同一 ID 以 `_control_nav_id` 传入本卡片。上一任务已终态时
+Driver 可直接接受新授权，因此连续手动导航不需重启 Canvas 或 Driver。
+若上一任务仍活动、执行器不唯一或授权失败，Core 会在调用本卡片前
+明确拒绝，不会用新目标覆盖进行中任务。`stop_nav` 会在卡片停止后
+调用 `loco.revoke_navigation`；若卡片启动新任务失败，Core 也会撤销刚获得的授权。
+
 `start` 按 runtime → mapping → planning → semantic 顺序获取资源；任一步
 失败会按相反顺序回滚。`stop_mapping` 和 `load_map` 的 backend 等待预算分别
 至少为 360 s 和 900 s。可重试的地图收口失败会保留 Canvas wiring、运行时和

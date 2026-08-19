@@ -205,11 +205,16 @@ def nav2_tool_definition(namespace: str) -> dict:
             "actuator owns any physical execution."
         ),
         "x-execution-control": {
-            "version": 1,
+            "version": 2,
             "proposal_schema": "phanthy.navigation.velocity_proposal.v1",
             "output_port": "velocity_proposal",
             "target_tool": "loco",
             "lease_argument": "_control_nav_id",
+            "authorize_action": "authorize_navigation",
+            "revoke_action": "revoke_navigation",
+            "nav_id_argument": "nav_id",
+            "proposal_topic_argument": "proposal_topic",
+            "proposal_schema_argument": "proposal_schema",
             "start_actions": ["navigate_to_pose"],
             "wait_actions": ["wait_navigation_done"],
             "stop_actions": ["stop_nav"],

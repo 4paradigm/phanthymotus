@@ -159,6 +159,15 @@ class NavigationContractTest(unittest.TestCase):
             tool["x-execution-control"]["start_actions"],
             ["navigate_to_pose", "navigate"],
         )
+        self.assertEqual(tool["x-execution-control"]["version"], 2)
+        self.assertEqual(
+            tool["x-execution-control"]["authorize_action"],
+            "authorize_navigation",
+        )
+        self.assertEqual(
+            tool["x-execution-control"]["revoke_action"],
+            "revoke_navigation",
+        )
 
     def test_unified_action_schema_only_exposes_supported_fields(self):
         tool = navigation_tool_definition("ubuntu")
