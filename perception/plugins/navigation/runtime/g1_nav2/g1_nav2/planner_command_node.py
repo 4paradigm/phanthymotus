@@ -443,6 +443,14 @@ class PlannerCommandNode(Node):
             source_skew = abs(
                 odom_source_stamp_ns - obstacle_source_stamp_ns
             ) / 1_000_000_000.0
+        source_transform_ready = False
+        if obstacle_source_stamp_ns is not None:
+            source_transform_ready = self._tf_buffer.can_transform(
+                self._global_frame,
+                self._base_frame,
+                Time(nanoseconds=obstacle_source_stamp_ns),
+                timeout=Duration(seconds=0.0),
+            )
         global_to_base_ready = self._tf_buffer.can_transform(
             self._global_frame,
             self._base_frame,
@@ -459,6 +467,7 @@ class PlannerCommandNode(Node):
             obstacle_received_at=obstacle_received_at,
             obstacle_source_age_sec=obstacle_source_age,
             obstacle_frame_ready=obstacle_frame_ready,
+            source_transform_ready=source_transform_ready,
             source_stamp_skew_sec=source_skew,
             lifecycle_states=lifecycle_states,
             action_server_ready=self._action_client.server_is_ready(),

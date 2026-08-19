@@ -20,6 +20,7 @@ def evaluate_readiness(
     obstacle_received_at: float | None,
     obstacle_source_age_sec: float | None,
     obstacle_frame_ready: bool,
+    source_transform_ready: bool,
     source_stamp_skew_sec: float | None,
     lifecycle_states: dict[str, int],
     action_server_ready: bool,
@@ -53,10 +54,8 @@ def evaluate_readiness(
         runtime_blockers.append("registered_cloud_source_stamp_stale")
     if not obstacle_frame_ready:
         runtime_blockers.append("registered_cloud_frame_invalid")
-    if not isinstance(source_stamp_skew_sec, (int, float)):
-        runtime_blockers.append("fast_livo2_stamp_pair_unavailable")
-    elif not 0.0 <= source_stamp_skew_sec <= max_age_sec:
-        runtime_blockers.append("fast_livo2_source_stamp_skew")
+    if not source_transform_ready:
+        runtime_blockers.append("registered_cloud_transform_unavailable")
     inactive = sorted(
         name for name, state_id in lifecycle_states.items() if state_id != 3
     )
@@ -78,6 +77,7 @@ def evaluate_readiness(
         "registered_cloud_receive_age_sec": obstacle_receive_age,
         "registered_cloud_source_age_sec": obstacle_source_age_sec,
         "registered_cloud_frame_ready": obstacle_frame_ready,
+        "registered_cloud_transform_ready": source_transform_ready,
         "fast_livo2_source_stamp_skew_sec": source_stamp_skew_sec,
         "lifecycle_states": dict(lifecycle_states),
         "action_server_ready": action_server_ready,

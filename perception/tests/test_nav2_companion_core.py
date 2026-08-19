@@ -248,6 +248,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             obstacle_received_at=9.8,
             obstacle_source_age_sec=0.2,
             obstacle_frame_ready=True,
+            source_transform_ready=True,
             source_stamp_skew_sec=0.05,
             lifecycle_states={"planner_server": 3, "bt_navigator": 3},
             action_server_ready=True,
@@ -265,6 +266,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             obstacle_received_at=None,
             obstacle_source_age_sec=None,
             obstacle_frame_ready=False,
+            source_transform_ready=False,
             source_stamp_skew_sec=None,
             lifecycle_states={"planner_server": 2},
             action_server_ready=False,
@@ -287,14 +289,33 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             obstacle_received_at=9.9,
             obstacle_source_age_sec=0.1,
             obstacle_frame_ready=True,
+            source_transform_ready=True,
             source_stamp_skew_sec=0.6,
             lifecycle_states={"planner_server": 3, "bt_navigator": 3},
             action_server_ready=True,
             global_to_base_ready=True,
         )
-        self.assertFalse(skewed["navigation_ready"])
+        self.assertTrue(skewed["navigation_ready"])
+        self.assertEqual(skewed["fast_livo2_source_stamp_skew_sec"], 0.6)
+
+        unpaired = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            odom_received_at=9.9,
+            odom_source_age_sec=0.1,
+            odom_frame_ready=True,
+            obstacle_received_at=9.9,
+            obstacle_source_age_sec=0.1,
+            obstacle_frame_ready=True,
+            source_transform_ready=False,
+            source_stamp_skew_sec=0.01,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
         self.assertIn(
-            "fast_livo2_source_stamp_skew", skewed["navigation_blockers"]
+            "registered_cloud_transform_unavailable",
+            unpaired["navigation_blockers"],
         )
 
         boundary_jitter = evaluate_readiness(
@@ -307,6 +328,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             obstacle_received_at=9.9,
             obstacle_source_age_sec=0.51,
             obstacle_frame_ready=True,
+            source_transform_ready=True,
             source_stamp_skew_sec=0.01,
             lifecycle_states={"planner_server": 3, "bt_navigator": 3},
             action_server_ready=True,
@@ -324,6 +346,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             obstacle_received_at=9.9,
             obstacle_source_age_sec=0.551,
             obstacle_frame_ready=True,
+            source_transform_ready=True,
             source_stamp_skew_sec=0.01,
             lifecycle_states={"planner_server": 3, "bt_navigator": 3},
             action_server_ready=True,

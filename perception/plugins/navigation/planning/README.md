@@ -48,7 +48,11 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 直接发布 `camera_init` / `aft_mapped` frame 时，Nav2 会返回
 `fast_livo2_odom_frame_invalid` 或 `registered_cloud_frame_invalid`，而不会启动导航。
 接收 freshness 仍严格按 500 ms 判定；source stamp 额外允许 50 ms 有界调度抖动，
-因此约 0.51 s 的处理边界帧不会被误拒，大于 0.55 s 仍 fail closed。
+因此约 0.51 s 的处理边界帧不会被误拒，大于 0.55 s 仍 fail closed。上游
+adapter 以 latest-only QoS 消除内部积压，并且只在 odom/TF 历史已包围 cloud
+源时间戳后发布 registered cloud。Nav2 readiness 直接检查该 cloud 时间点的
+`map -> base_link` TF；“最新 odom 与最新 cloud”的时间差只作诊断，不再冒充
+配对结果阻塞导航。
 
 `goal_pose` 最小样例：
 

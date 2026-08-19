@@ -46,8 +46,10 @@ Driver navigation_sensors
 
 这两路输入来自既有 Driver `navigation_sensors` sensor cards。缺失、过期或
 frame 不符时同容器 adapter 不发布伪造的 canonical odom/cloud。
-adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms 有界
-调度抖动；约 0.51 s 的边界帧可接受，超过 0.55 s 仍拒绝。
+adapter 对 FAST-LIVO2 原始 odom/cloud 使用
+`BEST_EFFORT + KEEP_LAST(1)`，慢回调只保留最新样本，不把旧帧排成约
+0.5 秒的内部积压。接收 age 仍使用 500 ms 上限，对源时间戳另保留
+50 ms 有界调度抖动；约 0.51 s 的边界帧可接受，超过 0.55 s 仍拒绝。
 
 ## 输出
 
@@ -63,8 +65,10 @@ adapter 对接收 age 仍使用 500 ms 上限，对源时间戳另保留 50 ms �
 
 adapter 先按 `0.10 m` 体素把同一帧命中去重；导航高度带和有效距离内的体素
 首次出现即写入累计静态图，不等待多帧确认、不跟踪动态分量，也不通过后续
-自由射线删除。点云只和源时间戳相差不超过 `50 ms` 的 canonical odom 位姿
-配对；不匹配帧跳过累计并进入 diagnostics 计数，不能拿最新位姿拼接旧点。
+自由射线删除。点云会先等待 odom/TF 历史从前后包围其源时间戳，再选择
+时间差不超过 `50 ms` 的 canonical odom 位姿配对；配对成功前不会发布给
+Nav2，也不会进入累计。不匹配帧进入 diagnostics 计数，不能拿最新位姿
+拼接旧点。
 直接累计可以恢复墙面和稀疏结构密度，但不提供人员语义分割或动态物体清除，
 建图时经过的人可能固化进地图，现场应尽量保持环境静止。
 

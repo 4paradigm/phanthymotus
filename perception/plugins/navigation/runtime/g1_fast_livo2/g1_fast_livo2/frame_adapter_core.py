@@ -289,6 +289,39 @@ def nearest_stamped_pose(
     return nearest_pose
 
 
+def bracketed_stamped_pose(
+    history: Sequence[tuple[int, Pose3]],
+    stamp_ns: int,
+    *,
+    tolerance_ns: int,
+) -> Pose3 | None:
+    """Return a nearby pose only after TF history brackets the source stamp."""
+
+    if tolerance_ns < 0:
+        raise ValueError("tolerance_ns must be non-negative")
+    before: tuple[int, Pose3] | None = None
+    after: tuple[int, Pose3] | None = None
+    for candidate_stamp, candidate_pose in history:
+        candidate_stamp = int(candidate_stamp)
+        if candidate_stamp <= stamp_ns and (
+            before is None or candidate_stamp > before[0]
+        ):
+            before = (candidate_stamp, candidate_pose)
+        if candidate_stamp >= stamp_ns and (
+            after is None or candidate_stamp < after[0]
+        ):
+            after = (candidate_stamp, candidate_pose)
+    if before is None or after is None:
+        return None
+    before_delta = stamp_ns - before[0]
+    after_delta = after[0] - stamp_ns
+    if min(before_delta, after_delta) > tolerance_ns:
+        return None
+    if before_delta <= after_delta:
+        return before[1]
+    return after[1]
+
+
 def normalize_obstacle_height_range(
     value,
     *,
@@ -2670,6 +2703,7 @@ def source_age_is_valid(
 
 
 __all__ = [
+    "bracketed_stamped_pose",
     "FastLivo2PersistenceError",
     "InvalidFastLivo2Frame",
     "nearest_stamped_pose",

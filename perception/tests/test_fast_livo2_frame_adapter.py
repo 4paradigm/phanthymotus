@@ -27,6 +27,7 @@ from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     Quaternion,
     TemporalOccupancyMap,
     VoxelMap,
+    bracketed_stamped_pose,
     canonical_base_pose,
     compose_pose,
     encode_map_view_points,
@@ -1058,6 +1059,29 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
             nearest_stamped_pose(
                 history,
                 1_049_999_999,
+                tolerance_ns=40_000_000,
+            )
+        )
+
+        self.assertIsNone(
+            bracketed_stamped_pose(
+                history[:1],
+                1_020_000_000,
+                tolerance_ns=50_000_000,
+            )
+        )
+        self.assertEqual(
+            bracketed_stamped_pose(
+                history,
+                1_020_000_000,
+                tolerance_ns=50_000_000,
+            ),
+            first,
+        )
+        self.assertIsNone(
+            bracketed_stamped_pose(
+                history,
+                1_045_000_000,
                 tolerance_ns=40_000_000,
             )
         )

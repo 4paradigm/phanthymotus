@@ -33,12 +33,12 @@ from .frame_adapter_core import (
     Quaternion,
     TemporalOccupancyMap,
     VoxelMap,
+    bracketed_stamped_pose,
     canonical_base_pose,
     compose_pose,
     estimate_planar_relocalization,
     encode_map_view_points,
     iter_xyz_points,
-    nearest_stamped_pose,
     normalize_obstacle_height_range,
     obstacle_height_ranges_match,
     quaternion_from_rpy,
@@ -206,11 +206,15 @@ class FastLivo2Adapter(Node):
         self._last_match: dict | None = None
         self._last_odom_monotonic: float | None = None
         self._last_cloud_monotonic: float | None = None
+        self._last_navigation_cloud_monotonic: float | None = None
         self._last_odom_source_age: float | None = None
         self._last_cloud_source_age: float | None = None
         self._invalid_odom = 0
         self._invalid_cloud = 0
+        self._unmatched_navigation_cloud = 0
         self._unmatched_static_cloud = 0
+        self._last_cloud_pose_skew_sec: float | None = None
+        self._pending_cloud = None
         self._static_map_error: str | None = None
         self._static_save_result: dict | None = None
         self._session_name: str | None = None
@@ -240,8 +244,24 @@ class FastLivo2Adapter(Node):
             String, str(self.get_parameter("map_control_status_topic").value), 10
         )
         self._tf = TransformBroadcaster(self)
-        self.create_subscription(Odometry, str(self.get_parameter("raw_odom_topic").value), self._on_odom, qos_profile_sensor_data)
-        self.create_subscription(PointCloud2, str(self.get_parameter("raw_cloud_topic").value), self._on_cloud, qos_profile_sensor_data)
+        latest_sensor_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            Odometry,
+            str(self.get_parameter("raw_odom_topic").value),
+            self._on_odom,
+            latest_sensor_qos,
+        )
+        self.create_subscription(
+            PointCloud2,
+            str(self.get_parameter("raw_cloud_topic").value),
+            self._on_cloud,
+            latest_sensor_qos,
+        )
         self.create_subscription(String, str(self.get_parameter("reset_topic").value), self._on_reset, 10)
         self.create_subscription(
             String,
@@ -324,6 +344,7 @@ class FastLivo2Adapter(Node):
         transform.transform.translation.z = canonical.z
         transform.transform.rotation = output.pose.pose.orientation
         self._tf.sendTransform(transform)
+        self._drain_pending_cloud()
 
     def _on_cloud(self, message: PointCloud2) -> None:
         receive_monotonic = time.monotonic()
@@ -369,17 +390,50 @@ class FastLivo2Adapter(Node):
             self.get_logger().warning(f"rejecting FAST-LIVO2 cloud: {exc}")
             return
 
+        sample = (message, tuple(points), receive_monotonic, source_age)
         with self._lock:
-            self._latest_session_points = tuple(points)
+            self._latest_session_points = sample[1]
             self._last_cloud_monotonic = receive_monotonic
             self._last_cloud_source_age = source_age
+            if self._map_from_session is None:
+                return
+            if self._pending_cloud is not None:
+                self._unmatched_navigation_cloud += 1
+                if self._mode == "mapping":
+                    self._unmatched_static_cloud += 1
+            self._pending_cloud = sample
+        self._drain_pending_cloud()
+
+    def _drain_pending_cloud(self) -> None:
+        with self._lock:
+            sample = self._pending_cloud
+            if sample is None or self._map_from_session is None:
+                return
+            message, points, receive_monotonic, _source_age = sample
+            source_stamp_ns = _stamp_ns(message.header.stamp)
+            pose_history = tuple(self._pose_history)
+            if not pose_history or pose_history[-1][0] < source_stamp_ns:
+                return
+            self._pending_cloud = None
             map_from_session = self._map_from_session
             mode = self._mode
-            pose_history = tuple(self._pose_history)
             obstacle_min_height = self._obstacle_min_height
             obstacle_max_height = self._obstacle_max_height
-        if map_from_session is None:
+        matched_pose = bracketed_stamped_pose(
+            pose_history,
+            source_stamp_ns,
+            tolerance_ns=self._static_pose_match_tolerance_ns,
+        )
+        if matched_pose is None:
+            with self._lock:
+                self._unmatched_navigation_cloud += 1
+                if mode == "mapping":
+                    self._unmatched_static_cloud += 1
             return
+        pose_skew_sec = min(
+            abs(int(stamp_ns) - source_stamp_ns)
+            for stamp_ns, _pose in pose_history
+        ) / 1_000_000_000.0
         try:
             mapped_points = tuple(transform_points(map_from_session, points))
             navigation_points = tuple(
@@ -400,6 +454,7 @@ class FastLivo2Adapter(Node):
         with self._lock:
             if self._map_from_session != map_from_session:
                 return
+            self._last_cloud_pose_skew_sec = pose_skew_sec
             self._latest_mapped_points = mapped_points
             if self._mode == "mapping":
                 self._map_view_context.add(
@@ -408,17 +463,11 @@ class FastLivo2Adapter(Node):
                     if not obstacle_min_height <= point[2] <= obstacle_max_height
                 )
         self._cloud_pub.publish(navigation_cloud)
+        with self._lock:
+            self._last_navigation_cloud_monotonic = time.monotonic()
         if mode == "mapping":
-            matched_pose = nearest_stamped_pose(
-                pose_history,
-                _stamp_ns(message.header.stamp),
-                tolerance_ns=self._static_pose_match_tolerance_ns,
-            )
             with self._lock:
                 if self._mode != "mapping" or self._map_from_session != map_from_session:
-                    return
-                if matched_pose is None:
-                    self._unmatched_static_cloud += 1
                     return
                 try:
                     sensor_pose = compose_pose(matched_pose, self._base_to_sensor)
@@ -455,6 +504,10 @@ class FastLivo2Adapter(Node):
             self._latest_mapped_points = ()
             self._reference_points = ()
             self._last_match = None
+            self._pending_cloud = None
+            self._last_cloud_pose_skew_sec = None
+            self._last_navigation_cloud_monotonic = None
+            self._unmatched_navigation_cloud = 0
             self._unmatched_static_cloud = 0
             self._static_map_error = None
             self._static_save_result = None
@@ -608,6 +661,7 @@ class FastLivo2Adapter(Node):
             )
             self._mode = "finalizing"
             self._pose_history.clear()
+            self._pending_cloud = None
         static_root = (self._map_root / "static").resolve()
         filename = f"{map_name}-{time.time_ns()}.static.pcd"
         destination = (static_root / filename).resolve()
@@ -789,6 +843,9 @@ class FastLivo2Adapter(Node):
             self._map_view_context = map_view_context
             self._last_odom_monotonic = None
             self._last_cloud_monotonic = None
+            self._last_navigation_cloud_monotonic = None
+            self._pending_cloud = None
+            self._last_cloud_pose_skew_sec = None
             self._last_match = None
             self._static_map_error = None
             self._static_save_result = None
@@ -854,6 +911,9 @@ class FastLivo2Adapter(Node):
         with self._lock:
             self._map_from_session = result.map_from_session
             self._latest_pose = result.map_base_pose
+            self._pending_cloud = None
+            self._last_cloud_pose_skew_sec = None
+            self._last_navigation_cloud_monotonic = None
             self._mode = "relocalized"
             self._last_match = match
         return {
@@ -902,6 +962,9 @@ class FastLivo2Adapter(Node):
             self._reference_points = ()
             self._last_odom_monotonic = None
             self._last_cloud_monotonic = None
+            self._last_navigation_cloud_monotonic = None
+            self._pending_cloud = None
+            self._last_cloud_pose_skew_sec = None
             self._last_match = None
             self._static_map_error = None
             self._static_save_result = None
@@ -959,6 +1022,11 @@ class FastLivo2Adapter(Node):
             pose = self._latest_pose
             odom_age = None if self._last_odom_monotonic is None else now - self._last_odom_monotonic
             cloud_age = None if self._last_cloud_monotonic is None else now - self._last_cloud_monotonic
+            navigation_cloud_age = (
+                None
+                if self._last_navigation_cloud_monotonic is None
+                else now - self._last_navigation_cloud_monotonic
+            )
             self._static_map.expire(now_monotonic=now)
             obstacle_points = self._static_map.project_xy(
                 min_z=self._obstacle_min_height,
@@ -1004,8 +1072,10 @@ class FastLivo2Adapter(Node):
                 and self._map_from_session is not None
                 and odom_age is not None
                 and cloud_age is not None
+                and navigation_cloud_age is not None
                 and odom_age <= self._source_max_age
                 and cloud_age <= self._source_max_age
+                and navigation_cloud_age <= self._source_max_age
             )
             payload = {
                 "schema": "phanthy.navigation.fast_livo2_diagnostics.v1",
@@ -1016,6 +1086,7 @@ class FastLivo2Adapter(Node):
                 "last_match": self._last_match,
                 "odom_receive_age_sec": odom_age,
                 "cloud_receive_age_sec": cloud_age,
+                "navigation_cloud_receive_age_sec": navigation_cloud_age,
                 "odom_source_age_sec": self._last_odom_source_age,
                 "cloud_source_age_sec": self._last_cloud_source_age,
                 "map_point_count": self._static_map.point_count,
@@ -1030,6 +1101,9 @@ class FastLivo2Adapter(Node):
                     self._static_map.quarantined_point_count
                 ),
                 "static_pose_match_tolerance_sec": self._static_pose_match_tolerance,
+                "cloud_pose_skew_sec": self._last_cloud_pose_skew_sec,
+                "pending_navigation_cloud": self._pending_cloud is not None,
+                "unmatched_navigation_cloud": self._unmatched_navigation_cloud,
                 "unmatched_static_cloud": self._unmatched_static_cloud,
                 "static_map_error": self._static_map_error,
                 "map_view_context_point_count": self._map_view_context.point_count,

@@ -225,6 +225,50 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(adapter._invalid_cloud, 1)
         self.assertEqual(adapter._latest_session_points, ())
 
+    def test_navigation_cloud_waits_until_tf_history_brackets_its_stamp(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        identity = Pose3(
+            0.0,
+            0.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        stamp = SimpleNamespace(sec=1, nanosec=20_000_000)
+        message = SimpleNamespace(header=SimpleNamespace(stamp=stamp))
+        adapter._pending_cloud = (
+            message,
+            ((1.0, 2.0, 0.0),),
+            10.0,
+            0.01,
+        )
+        adapter._map_from_session = identity
+        adapter._mode = "relocalized"
+        adapter._pose_history = [(1_000_000_000, identity)]
+        adapter._static_pose_match_tolerance_ns = 50_000_000
+        adapter._obstacle_min_height = -0.30
+        adapter._obstacle_max_height = 0.30
+        adapter._unmatched_navigation_cloud = 0
+        adapter._unmatched_static_cloud = 0
+        adapter._last_cloud_pose_skew_sec = None
+        adapter._latest_mapped_points = ()
+        adapter._invalid_cloud = 0
+        adapter._cloud_pub = _CapturePublisher()
+        adapter._xyz_cloud = lambda points, source_stamp: (points, source_stamp)
+        adapter.get_logger = lambda: SimpleNamespace(warning=lambda _msg: None)
+
+        adapter._drain_pending_cloud()
+
+        self.assertIsNotNone(adapter._pending_cloud)
+        self.assertEqual(adapter._cloud_pub.messages, [])
+
+        adapter._pose_history.append((1_100_000_000, identity))
+        adapter._drain_pending_cloud()
+
+        self.assertIsNone(adapter._pending_cloud)
+        self.assertEqual(len(adapter._cloud_pub.messages), 1)
+        self.assertAlmostEqual(adapter._last_cloud_pose_skew_sec, 0.02)
+
     def test_static_map_disk_failure_remains_retryable_through_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             adapter = object.__new__(FastLivo2Adapter)
