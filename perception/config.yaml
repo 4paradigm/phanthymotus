@@ -21,9 +21,12 @@ plugins:
 
   tts:
     enabled: true
-    model_dir: /models/sherpa-onnx/tts
+    model_dir: /models/sherpa-onnx/tts   # for TRT: /models/vits2-mix
     speaker_id: 0
     speed: 1.0
+    # backend: trt            # uncomment for VITS2 TRT backend
+    # trt_dir: /models/vits2-mix/trt     # TRT engine directory
+    # model_type: "v8"        # "v8" (n_fft=64) or "i128" (n_fft=128)
 
   htmsg:
     enabled: true
