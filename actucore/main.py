@@ -7,11 +7,12 @@ ActuCore 把意图/目标变成运动指令。执行模型（VLA、导航、抓�
 whole-body control）以卡片（插件）的形式挂在这里，聚合成一个 MCP HTTP server
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-当前版本不带任何卡片 —— 这是骨架 + 全链路（注册、探活、部署）打通。
-新增卡片的完整步骤见 README.md。
+当前挂载的卡片：`navigation`（公开工具名 `ControlledSemanticSpatial`）——
+FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者作为子进程跑在本容器内，
+对外只发布 bounded velocity proposal。新增卡片的完整步骤见 README.md。
 
-MCP 工具命名规则：{plugin_prefix}_{tool_name}
-  例：vla_info, vla_start, nav_goto
+MCP 工具命名规则：{plugin_prefix}_{tool_name}；工具名等于 PREFIX 时不加前缀
+  例：vla_info、vla_start、ControlledSemanticSpatial
 
 MCP server 端口: config.mcp_port（默认 15730）
 """
@@ -35,6 +36,8 @@ import yaml
 
 import rclpy
 import rclpy.executors
+
+from utils.security import redact_sensitive
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
@@ -102,6 +105,19 @@ class ActuCoreBundle:
         # 卡片契约（PREFIX 不能含下划线、action.enum 必须含 "info" 等）见 README.md。
         # ──────────────────────────────────────────────────────────────────
 
+        if plugins_cfg.get("navigation", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["navigation"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.navigation import NavigationPlugin
+            plugin = NavigationPlugin(plugins_cfg["navigation"], namespace, executor)
+            self._plugins.append(plugin)
+            log.info(
+                "NavigationPlugin loaded (single-container runtime, namespace=%s)",
+                namespace,
+            )
+
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 
@@ -120,6 +136,21 @@ class ActuCoreBundle:
             if p.PREFIX == prefix:
                 return p.dispatch(name, args)
         return None
+
+    def stop(self) -> None:
+        """Best-effort release for every card that owns runtime resources.
+
+        执行模型卡片常常持有真实资源（导航卡片在容器内跑 FAST-LIVO2 / Nav2
+        子进程），进程退出时必须收回，否则重启会撞上残留的 ROS 节点。
+        """
+
+        for plugin in reversed(self._plugins):
+            stop = getattr(plugin, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    log.exception("failed to stop card %s", plugin.PREFIX)
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -222,13 +253,21 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        log.info(
+                            "[mcp] tools/call: %s(%s)",
+                            name,
+                            redact_sensitive(args),
+                        )
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            safe_result = redact_sensitive(result)
+                            log.info(
+                                "[mcp] tools/call result: %s",
+                                json.dumps(safe_result)[:200],
+                            )
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
@@ -315,6 +354,7 @@ def main():
     try:
         server.serve_forever()
     finally:
+        _bundle.stop()
         executor.shutdown()
         rclpy.shutdown()
 

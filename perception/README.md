@@ -212,39 +212,18 @@ ASR result JSON:
 
 ---
 
-## controlled_semantic_spatial 卡片
+## 导航卡片已迁到 ActuCore
 
-PR #99 的 FAST-LIVO2、Nav2 和 VLN 已合并为一张公开
-`controlled_semantic_spatial` 卡片：
+`ControlledSemanticSpatial`（FAST-LIVO2 + Nav2 + 语义航点）曾经是 Perception 的
+一张卡片，现在属于 **ActuCore（执行模型层）**：Perception 把原始数据流变成语义，
+ActuCore 把意图/目标变成运动指令 —— 这张卡片输出的是 `velocity_proposal`，
+按定义在执行侧。
 
-- Canvas 只注册一个 `controlled_semantic_spatial` 工具；
-- 正式 Compose 只运行一个 `embodied-perception` 容器；
-- FAST-LIVO2 和 Nav2 由卡片在同容器内作为 ROS 子进程组托管，不调用 Docker；
-- 统一镜像从锁定 ROS Humble 基础镜像直接编译 FAST-LIVO2 及其全部锁定依赖，
-  不需要预构建的 `phanthy-fast-livo2` 镜像；
-- lidar、IMU、RGB 是外部必需输入，`goal_pose` 是可选外部入口；
-- odom、registered cloud、obstacle map、status 以及 VLN 到 planner 的目标传递
-  都是卡片内部边，不需要 Canvas 连接；
-- 物理运动仍严格走 `velocity_proposal -> Driver loco`，Perception 不直接控制机器人。
+代码、配置、镜像、部署脚本都在 `actucore/`：
 
-完整 action、topic、配置、构建、许可证和验收边界见
-[controlled_semantic_spatial 卡片文档](plugins/navigation/README.md)。
+- 卡片实现与文档：[actucore/plugins/navigation/README.md](../actucore/plugins/navigation/README.md)
+- 镜像：`actucore/Dockerfile.jetson`，构建入口 `./deploy/build_actucore.sh --mirror tuna`
+- MCP 端口从 15720 变为 **15730**，容器从 `embodied-perception` 变为 `embodied-actucore`
 
-统一镜像构建：
-
-```bash
-./deploy/build_perception.sh --mirror tuna
-```
-
-`navigation` 仍是仓库内部的默认镜像构建 variant；公开 MCP 工具名为
-`controlled_semantic_spatial`。无需专用构建脚本或预构建 companion 镜像。
-需要旧 CPU 或 Jetson 镜像时再显式传入 `--variant cpu` 或
-`--variant jetson`。
-
-G1 临时测试只创建一个 Perception 容器；将上一步输出的精确镜像名传入：
-
-```bash
-export PERCEPTION_IMAGE=local/phanthy-motus/perception:<exact-navigation-tag>
-STAGE=preflight bash perception/plugins/navigation/deploy/scripts/owner-start-g1-test-containers.sh
-STAGE=start bash perception/plugins/navigation/deploy/scripts/owner-start-g1-test-containers.sh
-```
+Perception 侧不再有 `navigation` 卡片、`navigation` 镜像 variant，也不再有
+`plugins/navigation/` 目录。

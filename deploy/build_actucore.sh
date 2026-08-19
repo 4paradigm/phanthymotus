@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # build_actucore.sh — 构建 actucore（执行模型层）镜像并推送
 #
-# 只有 Jetson GPU 版：执行模型（VLA / 抓取策略 / locomotion）都要 GPU，
-# 没有 CPU 变体。
+# 只有 Jetson 版：执行模型多数要 GPU（VLA / 抓取策略 / locomotion），
+# 没有 CPU 变体。navigation 卡片本身不用 GPU，但和它们共用这一个镜像。
+#
+# 镜像里会从锁定源码编译 FAST-LIVO2 与 Nav2（base 是 Focal，ros-humble-*
+# 只有 Jammy 的 Debian 包），首次构建约 1-3 小时，之后走 layer 缓存。
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
@@ -50,20 +53,57 @@ DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
 BUILD_CONTEXT="${REPO_ROOT}"
 TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
-BUILD_ARGS=""
+BUILD_ARGS=()
 # ── 根据 jp_version 选择 base image  ────────────────────────
 case "${JP_VERSION}" in
     5.11)
-        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=511"
+        BUILD_ARGS+=("JP_VERSION=511")
         ;;
     6.1)
-        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=61"
+        BUILD_ARGS+=("JP_VERSION=61")
         ;;
     *)
         echo "Unknown JetPack version: ${JP_VERSION} (support: 5.11, 6.1)"
         exit 1
         ;;
 esac
+
+# ── navigation 卡片的源码锁 ──────────────────────────────────────────
+# FAST-LIVO2 与 Nav2 都在本镜像里从锁定源码编译（base 是 Focal，没有
+# ros-humble-* 的 Debian 包可用），所以每个 revision 都要作为 build arg
+# 传进去，Dockerfile 里再校验成完整 SHA。
+NAV_RUNTIME_DIR="${REPO_ROOT}/actucore/plugins/navigation/runtime"
+source "${NAV_RUNTIME_DIR}/fast_livo2-source-lock.env"
+source "${NAV_RUNTIME_DIR}/nav2-source-lock.env"
+BUILD_ARGS+=(
+    "GIT_MIRROR_PREFIX=${GIT_MIRROR_PREFIX}"
+    "FAST_LIVO2_REPO=${FAST_LIVO2_REPO}"
+    "FAST_LIVO2_COMMIT=${FAST_LIVO2_COMMIT}"
+    "FAST_LIVO2_RUNTIME_PATCH_SHA256=${FAST_LIVO2_RUNTIME_PATCH_SHA256}"
+    "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}"
+    "RPG_VIKIT_REPO=${RPG_VIKIT_REPO}"
+    "RPG_VIKIT_COMMIT=${RPG_VIKIT_COMMIT}"
+    "LIVOX_ROS_DRIVER2_REPO=${LIVOX_ROS_DRIVER2_REPO}"
+    "LIVOX_ROS_DRIVER2_COMMIT=${LIVOX_ROS_DRIVER2_COMMIT}"
+    "LIVOX_SDK2_REPO=${LIVOX_SDK2_REPO}"
+    "LIVOX_SDK2_COMMIT=${LIVOX_SDK2_COMMIT}"
+    "SOPHUS_REPO=${SOPHUS_REPO}"
+    "SOPHUS_COMMIT=${SOPHUS_COMMIT}"
+    "NAVIGATION2_REPO=${NAVIGATION2_REPO}"
+    "NAVIGATION2_COMMIT=${NAVIGATION2_COMMIT}"
+    "BEHAVIORTREE_CPP_REPO=${BEHAVIORTREE_CPP_REPO}"
+    "BEHAVIORTREE_CPP_COMMIT=${BEHAVIORTREE_CPP_COMMIT}"
+    "ANGLES_REPO=${ANGLES_REPO}"
+    "ANGLES_COMMIT=${ANGLES_COMMIT}"
+    "BOND_CORE_REPO=${BOND_CORE_REPO}"
+    "BOND_CORE_COMMIT=${BOND_CORE_COMMIT}"
+    "DIAGNOSTICS_REPO=${DIAGNOSTICS_REPO}"
+    "DIAGNOSTICS_COMMIT=${DIAGNOSTICS_COMMIT}"
+    "NAVIGATION_MSGS_REPO=${NAVIGATION_MSGS_REPO}"
+    "NAVIGATION_MSGS_COMMIT=${NAVIGATION_MSGS_COMMIT}"
+    "LASER_GEOMETRY_REPO=${LASER_GEOMETRY_REPO}"
+    "LASER_GEOMETRY_COMMIT=${LASER_GEOMETRY_COMMIT}"
+)
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/actucore:${TAG}"
 
@@ -81,11 +121,7 @@ fi
 
 select_mirror
 
-# trim leading and trailing space
-BUILD_ARGS="${BUILD_ARGS#${BUILD_ARGS%%[![:space:]]*}}"
-BUILD_ARGS="${BUILD_ARGS%${BUILD_ARGS##*[![:space:]]}}"
-
-do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${BUILD_ARGS}"
+do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${BUILD_ARGS[@]}"
 
 if ${PUSH_ENABLED}; then
     do_push "${FULL_IMAGE}"

@@ -2,8 +2,7 @@
 """
 perception/main.py — Perception Stack bundle 统一入口。
 
-读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin /
-NavigationPlugin 等，
+读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin（以及未来的 VLM、SLAM 等），
 聚合成一个 MCP HTTP server 对外暴露。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
@@ -33,8 +32,6 @@ import yaml
 
 import rclpy
 import rclpy.executors
-
-from utils.security import redact_sensitive
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
@@ -111,19 +108,6 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
-        if plugins_cfg.get("navigation", {}).get("enabled", False):
-            import re, socket
-            namespace = plugins_cfg["navigation"].get("namespace", "").strip()
-            if not namespace:
-                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
-            from plugins.navigation import NavigationPlugin
-            plugin = NavigationPlugin(plugins_cfg["navigation"], namespace, executor)
-            self._plugins.append(plugin)
-            log.info(
-                "NavigationPlugin loaded (single-container runtime, namespace=%s)",
-                namespace,
-            )
-
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -133,12 +117,10 @@ class PerceptionBundle:
         return tools
 
     def dispatch(self, full_name: str, args: dict) -> dict | None:
+        prefix, sep, tool_name = full_name.partition("_")
+        name = tool_name if sep else prefix
         for p in self._plugins:
-            if full_name == p.PREFIX:
-                return p.dispatch(p.PREFIX, args)
-            qualified_prefix = f"{p.PREFIX}_"
-            if full_name.startswith(qualified_prefix):
-                name = full_name[len(qualified_prefix):]
+            if p.PREFIX == prefix:
                 return p.dispatch(name, args)
         return None
 
@@ -320,21 +302,13 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(
-                            "[mcp] tools/call: %s(%s)",
-                            name,
-                            redact_sensitive(args),
-                        )
+                        log.info(f"[mcp] tools/call: {name}({args})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            safe_result = redact_sensitive(result)
-                            log.info(
-                                "[mcp] tools/call result: %s",
-                                json.dumps(safe_result)[:200],
-                            )
+                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
@@ -496,8 +470,8 @@ def main():
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
-    # The WebSocket endpoint belongs to ASR.  A Nav2-only bundle must not
-    # acquire its dependency, port, or background thread.
+    # The WebSocket endpoint belongs to ASR.  A bundle running without the ASR
+    # card must not acquire its dependency, port, or background thread.
     if asr_cfg.get("enabled", False):
         threading.Thread(
             target=_start_ws_thread,

@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前不带任何卡片** —— 这一版是骨架加全链路打通。`tools/list` 返回空数组，服务照样注册、探活、在 Dashboard 侧边栏「执行」分区里显示（count 0）。
+**当前卡片：`navigation`**，公开工具名 `ControlledSemanticSpatial` —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket），对外只发布 bounded `velocity_proposal`，物理执行仍归 Driver。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/navigation/README.md](plugins/navigation/README.md)。
 
 | | |
 |---|---|
@@ -24,7 +24,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 ## 构建与运行
 
-只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
+只有 Jetson 版 —— 执行模型多数要 GPU（VLA、抓取策略、locomotion），没有 CPU 变体。`navigation` 卡片本身不用 GPU，但和它们共用这一个镜像。
 
 ```bash
 ./deploy/build_actucore.sh                    # JetPack 5.11（默认）
@@ -32,7 +32,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 ./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
 ```
 
-镜像刻意做薄 —— 除了 MCP server 本身，只保留 base 镜像自带的 CUDA torch 和 ROS2 环境。加卡片时把该卡片的依赖放在它自己的 `RUN` 层，不要预装在基础层里。
+base（`jetson-base:jp*-torch`）是 Ubuntu 20.04 + 源码 install-space 的 ROS Humble，`ros-humble-*` 的 Debian 包只有 Jammy 版，所以 `navigation` 卡片需要的 Nav2 与 FAST-LIVO2 都在镜像里**从锁定源码编译**：首次构建约 1-3 小时，之后走 layer 缓存。加新卡片时把该卡片的依赖放在它自己的 `RUN` 层，不要预装在基础层里。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 
@@ -110,9 +110,9 @@ TOOLS = [
        self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
        log.info("XPlugin loaded")
    ```
-4. 该卡片需要的依赖加到 `Dockerfile`（以及 `Dockerfile.jetson`，如果要跑 GPU）
+4. 该卡片需要的依赖加到 `Dockerfile.jetson` 自己的 `RUN` 层
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
-需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 htmsg / vop 的注册块。
+需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照本目录 `main.py` 里 `navigation` 的注册块。
 
-完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/htmsg/plugin.py` —— 它是最干净的范例。
+本层最完整的范例就是 `plugins/navigation/` —— 一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管两组 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/htmsg/plugin.py`。

@@ -8,12 +8,10 @@ perception:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
-    - /opt/phanthy-motus/data/fast_livo2/maps:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
-    - /opt/phanthy-motus/data/fast_livo2/recordings:/opt/phanthy-motus/data/fast_livo2/recordings:rw
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
   logging:
     driver: local
     options:

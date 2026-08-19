@@ -8,10 +8,14 @@ actucore:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
+    # navigation 卡片：FAST-LIVO2 的点云地图与采集数据要活过容器重建
+    - /opt/phanthy-motus/data/fast_livo2/maps:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
+    - /opt/phanthy-motus/data/fast_livo2/recordings:/opt/phanthy-motus/data/fast_livo2/recordings:rw
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    # UDPv4 而非 DEFAULT：与 perception / driver 侧一致，也是 G1 上验证过的组合
+    - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
   logging:
     driver: local
     options:
