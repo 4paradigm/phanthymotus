@@ -1,7 +1,6 @@
 <!--
-  Nav2 Humble's default NavigateToPose recovery tree with the G1 backup speed
-  raised to 0.30 m/s. The controller remains responsible for path-following
-  speed limits; this fixed recovery speed only applies to the BackUp action.
+  Forward-only G1 recovery tree. BackUp is intentionally omitted because the
+  humanoid navigation contract never permits a negative X proposal.
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
@@ -27,7 +26,6 @@
           </Sequence>
           <Spin spin_dist="1.57"/>
           <Wait wait_duration="5"/>
-          <BackUp backup_dist="0.30" backup_speed="0.30"/>
         </RoundRobin>
       </ReactiveFallback>
     </RecoveryNode>

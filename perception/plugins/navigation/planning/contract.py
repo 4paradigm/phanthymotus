@@ -30,6 +30,7 @@ NAV2_CONFIG_DEFAULTS = {
     "min_yaw_rps": 1.0,
     "max_yaw_rps": 2.0,
     "proposal_ttl_ms": 250,
+    "proposal_frequency_hz": 5.0,
 }
 
 NAV2_FULL_CONFIG_SCHEMA = {
@@ -119,6 +120,12 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "minimum": 50,
             "maximum": 250,
             "default": 250,
+        },
+        "proposal_frequency_hz": {
+            "type": "number",
+            "const": 5.0,
+            "default": 5.0,
+            "description": "Latest-only G1 velocity proposal cadence",
         },
     },
     "additionalProperties": False,
@@ -291,9 +298,9 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "topic": f"{root}/navigation/nav2/velocity_proposal",
                 "format": "data/json",
                 "ros_type": "std_msgs/msg/String",
-                "qos": "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
+                "qos": "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
                 "schema": "phanthy.navigation.velocity_proposal.v1",
-                "rate_hz": 20,
+                "rate_hz": 5,
                 "timestamp": "issued_at_unix_ms; TTL uses Driver receive monotonic time",
                 "frame_id": "base_link",
                 "axes": "ROS REP-103: x forward, y left, yaw counter-clockwise",

@@ -77,7 +77,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             Velocity(x=-1.0, y=0.0, yaw=0.0),
             max_forward_mps=0.10,
         )
-        self.assertEqual(reverse.x, -1.0)
+        self.assertEqual(reverse, Velocity.zero())
 
     def test_g1_motion_policy_is_axis_exclusive_and_clears_dead_zones(self) -> None:
         self.assertEqual(apply_g1_motion_floor(Velocity.zero()), Velocity.zero())
@@ -186,7 +186,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             apply_g1_motion_limits(
                 Velocity(x=-0.90), limits=limits, max_forward_mps=0.50
             ),
-            Velocity(x=-0.80),
+            Velocity.zero(),
         )
         self.assertEqual(
             apply_g1_motion_limits(
@@ -557,6 +557,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("min_speed_theta: 1.00", follow_path)
         self.assertIn("max_vel_theta: 2.00", follow_path)
         self.assertIn("max_velocity: [1.0, 0.0, 2.0]", smoother)
+        self.assertIn("min_velocity: [0.0, 0.0, -2.0]", smoother)
         self.assertIn("odom_topic: /ubuntu/navigation/odom", smoother)
 
     def test_speed_limit_and_behavior_tree_reach_planner_bridge(self) -> None:
@@ -575,8 +576,11 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             / "navigate_to_pose_w_replanning_and_recovery.xml"
         )
         backup = tree.find(".//BackUp")
-        self.assertIsNotNone(backup)
-        self.assertEqual(backup.attrib["backup_speed"], "0.30")
+        self.assertIsNone(backup)
+        self.assertIn(
+            "behavior_plugins: [spin, drive_on_heading, wait]",
+            params,
+        )
         self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
         self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
         self.assertIn("MotionLimits.from_payload", command)
@@ -588,6 +592,10 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn('"goal_yaw_tolerance_rad": 0.50', launch)
         self.assertIn("xy_goal_tolerance: 0.20", params)
         self.assertIn("yaw_goal_tolerance: 0.50", params)
+        self.assertIn("controller_frequency: 5.0", params)
+        self.assertIn("smoothing_frequency: 5.0", params)
+        self.assertIn('self.declare_parameter("proposal_frequency_hz", 5.0)', command)
+        self.assertIn("depth=1", command)
         self.assertIn("proposal_context_is_current", command)
         self.assertIn('payload.get("velocity_limits")', command)
         self.assertIn("goal.pose.header.frame_id = self._global_frame", command)

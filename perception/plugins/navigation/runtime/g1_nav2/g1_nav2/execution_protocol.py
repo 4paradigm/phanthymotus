@@ -209,11 +209,11 @@ DEFAULT_MOTION_LIMITS = MotionLimits()
 def limit_forward_velocity(
     velocity: Velocity, *, max_forward_mps: float
 ) -> Velocity:
-    """Apply the per-navigation forward cap before a proposal is published.
+    """Apply the forward-only per-navigation cap before publication.
 
-    Reverse recovery remains governed by the separate global reverse limit;
-    lateral and yaw components are preserved so the normal proposal validator
-    can reject any unsafe Nav2 output instead of silently hiding it.
+    Negative X is suppressed at the proposal boundary so no Nav2 recovery,
+    controller or smoother configuration can command the humanoid to walk
+    backwards. Lateral and yaw components are preserved.
     """
 
     if isinstance(max_forward_mps, bool):
@@ -230,9 +230,8 @@ def limit_forward_velocity(
         raise ProtocolError(
             "invalid_speed_limit", "max_forward_mps must be positive and finite"
         )
-    if velocity.x <= limit:
-        return velocity
-    return Velocity(x=limit, y=velocity.y, yaw=velocity.yaw)
+    forward = min(max(float(velocity.x), 0.0), limit)
+    return Velocity(x=forward, y=velocity.y, yaw=velocity.yaw)
 
 
 def _apply_axis_magnitude(value: float, minimum: float, maximum: float) -> float:
@@ -253,8 +252,8 @@ def apply_g1_motion_limits(
     Exact zeros remain zeros so readiness, pause, terminal and watchdog stops
     preserve their fail-closed semantics.  A mixed Nav2 command turns in place
     when its raw yaw demand is significant; otherwise it moves without yaw.
-    Axis signs are preserved.  The navigation request's forward cap always
-    wins over the configured X floor.
+    Lateral and yaw signs are preserved, while negative X is suppressed. The
+    navigation request's forward cap always wins over the configured X floor.
     """
 
     limits.validate()
@@ -298,7 +297,7 @@ def apply_g1_motion_floor(velocity: Velocity) -> Velocity:
 
 @dataclass(frozen=True)
 class VelocityLimits:
-    min_x: float = -1.0
+    min_x: float = 0.0
     max_x: float = 1.0
     max_abs_y: float = 1.0
     max_abs_yaw: float = 2.0

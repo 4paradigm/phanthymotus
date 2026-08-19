@@ -77,7 +77,10 @@ registered cloud、静态障碍图或 Nav2 costmap。高度带默认值是
 marking/raytrace clearing 的 live ObstacleLayer，所以导航期间新出现或移动的
 物体仍参与即时避障。原始 FAST-LIVO2 odom/cloud 使用 latest-only 订阅；cloud
 只有在其源时间戳已被前后 odom/TF 包围且最近位姿差不超过 50 ms 时才对
-Nav2 发布，避免 adapter 排队旧帧或让点云早于 TF。Canvas `map_view` 显示累计静态点和新鲜的最新实时扫描，
+Nav2 发布，避免 adapter 排队旧帧或让点云早于 TF。canonical registered cloud
+发布是独立快路径；静态地图累计与 Canvas 编码在 latest-only 后台任务中执行，
+不会占用导航点云回调。后台来不及处理时覆盖旧建图样本并在诊断中累计
+`mapping_work_dropped`，但不阻塞最新导航点云。Canvas `map_view` 显示累计静态点和新鲜的最新实时扫描，
 并显示单独累计的高度带外表面。输出最多 80,000 点，并为低于、位于和高于
 导航高度带的三组点分别保留显示预算，避免地面被大量障碍点截断；该采样只
 影响监控，不改变规划输入。显示帧直接编码已经分别有界的静态、范围外和实时

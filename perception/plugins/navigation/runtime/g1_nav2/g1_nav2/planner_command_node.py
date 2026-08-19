@@ -95,6 +95,7 @@ class PlannerCommandNode(Node):
         self.declare_parameter("speed_limit_timeout", 3.0)
         self.declare_parameter("behavior_tree_path", "")
         self.declare_parameter("proposal_ttl_ms", 250)
+        self.declare_parameter("proposal_frequency_hz", 5.0)
         self.declare_parameter("enforce_shadow_isolation", True)
         self.declare_parameter("max_shadow_speed", 1.0)
         self.declare_parameter("supported_mode", 0)
@@ -138,6 +139,9 @@ class PlannerCommandNode(Node):
             self.get_parameter("behavior_tree_path").value
         )
         self._proposal_ttl_ms = int(self.get_parameter("proposal_ttl_ms").value)
+        self._proposal_frequency_hz = float(
+            self.get_parameter("proposal_frequency_hz").value
+        )
         self._enforce_shadow_isolation = bool(
             self.get_parameter("enforce_shadow_isolation").value
         )
@@ -187,6 +191,10 @@ class PlannerCommandNode(Node):
             raise ValueError("max_shadow_speed must be within (0, 1.0]")
         if not 50 <= self._proposal_ttl_ms <= 250:
             raise ValueError("proposal_ttl_ms must be within [50, 250]")
+        if not math.isfinite(self._proposal_frequency_hz) or not (
+            1.0 <= self._proposal_frequency_hz <= 20.0
+        ):
+            raise ValueError("proposal_frequency_hz must be within [1, 20]")
         if self._supported_mode != 0:
             raise ValueError("supported_mode must be 0 until another mode is implemented")
         if self._goal_response_timeout <= 0 or self._speed_limit_timeout <= 0:
@@ -232,6 +240,12 @@ class PlannerCommandNode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+        latest_command_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         status_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -242,7 +256,7 @@ class PlannerCommandNode(Node):
             String, self._status_topic, status_qos
         )
         self._proposal_pub = self.create_publisher(
-            String, self._proposal_topic, command_qos
+            String, self._proposal_topic, latest_command_qos
         )
         self._speed_limit_pub = self.create_publisher(
             SpeedLimit, self._controller_speed_limit_topic, command_qos
@@ -258,7 +272,7 @@ class PlannerCommandNode(Node):
             Twist,
             self._shadow_topic,
             self._on_shadow_velocity,
-            command_qos,
+            latest_command_qos,
             callback_group=self._callbacks,
         )
         self._odom_sub = self.create_subscription(
@@ -312,12 +326,19 @@ class PlannerCommandNode(Node):
         self._lifecycle_timer = self.create_timer(
             1.0, self._refresh_lifecycle_states, callback_group=self._callbacks
         )
+        self._proposal_timer = self.create_timer(
+            1.0 / self._proposal_frequency_hz,
+            self._publish_latest_velocity_proposal,
+            callback_group=self._callbacks,
+        )
 
         self._lock = threading.RLock()
         self._state_changed = threading.Condition(self._lock)
         self._command_lock = threading.Lock()
         self._active: dict | None = None
         self._proposal_sequence = 0
+        self._latest_proposal_candidate: dict | None = None
+        self._last_published_proposal: dict | None = None
         self._last_odom_monotonic: float | None = None
         self._last_odom_source_age_sec: float | None = None
         self._last_odom_source_stamp_ns: int | None = None
@@ -570,6 +591,22 @@ class PlannerCommandNode(Node):
                     status=status,
                 ):
                     return
+                self._latest_proposal_candidate = {
+                    "nav_id": nav_id,
+                    "attempt": attempt,
+                    "navigation_status": status,
+                    "velocity": velocity,
+                    "reason": reason,
+                    "received_monotonic": time.monotonic(),
+                }
+                publish_safety_zero = velocity == Velocity.zero() and (
+                    self._last_published_proposal is None
+                    or self._last_published_proposal.get("nav_id") != nav_id
+                    or self._last_published_proposal.get("velocity")
+                    != Velocity.zero()
+                    or self._last_published_proposal.get("reason") != reason
+                )
+            if publish_safety_zero:
                 self._publish_velocity_proposal(
                     nav_id=nav_id,
                     navigation_status=status,
@@ -722,6 +759,8 @@ class PlannerCommandNode(Node):
                 "last_pose": None,
                 "last_feedback_publish": 0.0,
             }
+            self._latest_proposal_candidate = None
+            self._last_published_proposal = None
         try:
             self._send_active_goal()
         except Exception:
@@ -1117,6 +1156,67 @@ class PlannerCommandNode(Node):
         message = String()
         message.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         self._proposal_pub.publish(message)
+        with self._lock:
+            self._last_published_proposal = {
+                "nav_id": nav_id,
+                "navigation_status": navigation_status,
+                "velocity": velocity,
+                "reason": reason,
+            }
+
+    def _publish_latest_velocity_proposal(self) -> None:
+        """Publish only the newest Nav2 sample at the G1 execution cadence."""
+        with self._lock:
+            candidate = (
+                dict(self._latest_proposal_candidate)
+                if self._latest_proposal_candidate is not None
+                else None
+            )
+            active = dict(self._active) if self._active is not None else None
+        if candidate is None or active is None:
+            return
+
+        nav_id = candidate.get("nav_id")
+        attempt = candidate.get("attempt")
+        status = candidate.get("navigation_status")
+        if not proposal_context_is_current(
+            active,
+            nav_id=nav_id,
+            attempt=attempt,
+            status=status,
+        ):
+            return
+
+        velocity = candidate.get("velocity")
+        reason = candidate.get("reason")
+        if not isinstance(velocity, Velocity):
+            return
+        candidate_age = time.monotonic() - float(
+            candidate.get("received_monotonic", 0.0)
+        )
+        if candidate_age > self._proposal_ttl_ms / 1000.0:
+            velocity = Velocity.zero()
+            reason = "shadow_velocity_stale"
+        else:
+            blocker = navigation_motion_blocker(self._readiness())
+            if blocker is not None:
+                velocity = Velocity.zero()
+                reason = blocker
+
+        with self._lock:
+            if not proposal_context_is_current(
+                self._active,
+                nav_id=nav_id,
+                attempt=attempt,
+                status=status,
+            ):
+                return
+        self._publish_velocity_proposal(
+            nav_id=str(nav_id),
+            navigation_status=str(status),
+            velocity=velocity,
+            reason=reason,
+        )
 
     def _require_matching_navigation(self, nav_id) -> dict:
         with self._lock:
@@ -1207,6 +1307,7 @@ class PlannerCommandNode(Node):
                 "n5_protocol_ready": True,
                 "velocity_proposal_topic": self._proposal_topic,
                 "proposal_ttl_ms": self._proposal_ttl_ms,
+                "proposal_frequency_hz": self._proposal_frequency_hz,
                 "proposal_subscribers": self._proposal_pub.get_subscription_count(),
                 "controller_speed_limit_topic": self._controller_speed_limit_topic,
                 "controller_speed_limit_subscribers": (

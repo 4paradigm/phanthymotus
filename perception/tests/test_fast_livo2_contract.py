@@ -232,8 +232,20 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("self._pending_cloud", adapter)
         self.assertIn('self._mode = "finalizing"', adapter)
         self.assertIn("self._static_map.observe_scan(", adapter)
+        self.assertIn("self._mapping_worker_main", adapter)
+        self.assertIn("self._queue_mapping_scan(", adapter)
+        self.assertIn("self._mapping_work_dropped", adapter)
+        self.assertIn("MultiThreadedExecutor(num_threads=4)", adapter)
+        publish_fast_path = adapter.split("    def _drain_pending_cloud", 1)[1].split(
+            "    def _on_reset", 1
+        )[0]
+        self.assertLess(
+            publish_fast_path.index("self._cloud_pub.publish(navigation_cloud)"),
+            publish_fast_path.index("self._queue_mapping_scan("),
+        )
+        self.assertNotIn("self._static_map.observe_scan(", publish_fast_path)
         self.assertIn("candidate_points = self._static_map.candidate_points", adapter)
-        self.assertIn("self._map_view_context.add(", adapter)
+        self.assertIn('map_view_context.add(work["out_of_band_points"])', adapter)
         self.assertIn("encode_map_view_points(", adapter)
         self.assertIn("self._static_map.map_view_points", adapter)
         self.assertNotIn("self._static_map.as_voxel_map()", adapter)

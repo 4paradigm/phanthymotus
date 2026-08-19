@@ -108,6 +108,7 @@ def generate_launch_description() -> LaunchDescription:
                             "navigate_to_pose_w_replanning_and_recovery.xml",
                         ),
                         "proposal_ttl_ms": 250,
+                        "proposal_frequency_hz": 5.0,
                         "enforce_shadow_isolation": True,
                         "max_shadow_speed": 1.0,
                         "supported_mode": 0,

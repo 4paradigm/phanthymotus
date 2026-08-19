@@ -73,6 +73,11 @@ class Nav2ContractTest(unittest.TestCase):
         proposal = outputs["velocity_proposal"]
         self.assertEqual(proposal["schema"], "phanthy.navigation.velocity_proposal.v1")
         self.assertEqual(proposal["max_age_ms"], 250)
+        self.assertEqual(proposal["rate_hz"], 5)
+        self.assertEqual(
+            proposal["qos"],
+            "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
+        )
         plan = outputs["plan"]
         self.assertEqual(plan["topic"], "/plan")
         self.assertEqual(plan["format"], "sensor/path")

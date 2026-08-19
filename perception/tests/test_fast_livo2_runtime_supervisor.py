@@ -112,6 +112,14 @@ class _CapturePublisher:
             self.events.append(self.label)
 
 
+def _prepare_adapter_concurrency(adapter) -> None:
+    adapter._static_lock = threading.Lock()
+    adapter._mapping_work_condition = threading.Condition()
+    adapter._mapping_work = None
+    adapter._mapping_generation = 0
+    adapter._mapping_work_dropped = 0
+
+
 class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
     def test_adapter_execute_waits_for_bidirectional_discovery(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
@@ -228,6 +236,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
     def test_navigation_cloud_waits_until_tf_history_brackets_its_stamp(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
+        _prepare_adapter_concurrency(adapter)
         identity = Pose3(
             0.0,
             0.0,
@@ -273,6 +282,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             adapter = object.__new__(FastLivo2Adapter)
             adapter._lock = threading.RLock()
+            _prepare_adapter_concurrency(adapter)
             adapter._session_name = "office"
             adapter._static_map_error = None
             adapter._static_save_result = None
@@ -367,6 +377,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             write_pcd_xyz_atomic(pcd, points)
             adapter = object.__new__(FastLivo2Adapter)
             adapter._lock = threading.RLock()
+            _prepare_adapter_concurrency(adapter)
             adapter._map_root = root
             adapter._map_load_max_points = 200_000
             adapter._static_map_load_max_points = 200_000
@@ -412,6 +423,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             write_pcd_xyz_atomic(pcd, points)
             adapter = object.__new__(FastLivo2Adapter)
             adapter._lock = threading.RLock()
+            _prepare_adapter_concurrency(adapter)
             adapter._map_root = root
             adapter._map_load_max_points = 200_000
             adapter._static_map_load_max_points = 200_000
@@ -434,6 +446,16 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             self.assertEqual(result["status"], "map_validated")
             self.assertEqual(result["map_view_context_point_count"], 20)
             self.assertEqual(adapter._static_map.point_count, 0)
+
+    def test_mapping_work_queue_keeps_only_the_latest_scan(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        _prepare_adapter_concurrency(adapter)
+
+        adapter._queue_mapping_scan({"generation": 1, "sample": "old"})
+        adapter._queue_mapping_scan({"generation": 1, "sample": "latest"})
+
+        self.assertEqual(adapter._mapping_work["sample"], "latest")
+        self.assertEqual(adapter._mapping_work_dropped, 1)
 
     def test_late_terminal_mapping_failure_is_replayed_on_retry(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)

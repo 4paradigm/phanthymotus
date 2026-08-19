@@ -53,7 +53,9 @@ Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIV
 adapter 以 latest-only QoS 消除内部积压，并且只在 odom/TF 历史已包围 cloud
 源时间戳后发布 registered cloud。Nav2 readiness 直接检查该 cloud 时间点的
 `map -> base_link` TF；“最新 odom 与最新 cloud”的时间差只作诊断，不再冒充
-配对结果阻塞导航。
+配对结果阻塞导航。静态图累计和 1 Hz Canvas/OccupancyGrid 编码不在该发布
+快路径执行；它们使用独立 latest-only 后台任务和锁，因此不会周期性把
+registered cloud 的接收 age 推过 500 ms。
 
 `goal_pose` 最小样例：
 
@@ -78,7 +80,7 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 
 | port | topic | type / QoS | 语义 |
 | --- | --- | --- | --- |
-| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.velocity_proposal.v1`，20 Hz，`base_link`，TTL 最大 250 ms |
+| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.velocity_proposal.v1`，固定 5 Hz、只保留最新值，`base_link`，TTL 最大 250 ms |
 | `plan` | `/plan` | `nav_msgs/msg/Path`; `RELIABLE + KEEP_LAST(1)` | Nav2 原生 `map` 全局路径，Canvas 显示起点、终点、路径长度和折线 |
 | `costmap` | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | Nav2 实时二维全局代价地图，作为卡片默认预览，叠加路径、位姿、终点和膨胀障碍 |
 
@@ -89,6 +91,8 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 速度限制：
 
 - 导航请求 `speed` 范围为 `0.30–1.00 m/s`，默认 `0.50 m/s`；
+- X 轴为仅前进合同：Nav2 controller、velocity smoother 或恢复树产生的
+  负 X 均在 proposal 边界强制归零，不会向 Driver 发布倒退命令；
 - `config` 动作可配置 `min_x_mps/max_x_mps`、`min_y_mps/max_y_mps`
   和 `min_yaw_rps/max_yaw_rps`；这些值都是非零速度的绝对值，
   Nav2 原始方向符号保持不变；
@@ -107,7 +111,7 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
   下一次导航。它只在 fresh canonical odom 和当前 target 都存在时生效；
   `goal_tolerance_reached` 只是零速 proposal reason，最终 `arrived` 仍以
   Nav2 action result 为准；
-- BackUp 恢复动作固定为 `0.30 m/s`；
+- 恢复树不含 BackUp，只使用清除代价地图、原地转向和等待；
 - Driver 仍负责二次限幅、TTL、急停和停车确认。
 
 ## Actions
@@ -161,6 +165,10 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   三轴应用卡片配置的最小/最大绝对值。Y 默认上限为零。
 - velocity smoother 使用 `/ubuntu/navigation/odom` 作为反馈。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
+- 局部 controller、velocity smoother 与 proposal bridge 统一为 5 Hz，匹配
+  G1 实际执行能力；costmap 和传感器更新仍保持独立高频。安全 blocker、协议
+  错误和任务终态的首个零速不等待下一个周期。proposal topic 使用
+  `KEEP_LAST(1)`，避免 Driver 排队执行过期轨迹。
 - Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；
   proposal bridge 始终检查真正的根 `/cmd_vel`，发现外部发布者仍会拒绝导航。
 
@@ -181,10 +189,10 @@ ASCII token 布局和数据行必须与声明精确一致。`load_map` 会在
 容差时直接拒绝启动。自定义 Nav2 params 时仍必须同步更新 bridge
 中的 paired tolerance。
 
-shadow velocity 回调在计算后、发布 proposal 前会在同一互斥区内
-二次校验 `nav_id/attempt/status`。Nav2 action result 、pause/resume 或
-新任务已使回调过期时，该回调不发布提案；因此终态零速不会被
-旧回调用更高 `sequence` 覆盖。当前自动证据覆盖纯函数和源码
+shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互斥区内
+二次校验 `nav_id/attempt/status`；5 Hz 发布定时器在真正发布前再次校验任务
+上下文和 readiness。Nav2 action result、pause/resume 或新任务已使样本过期时，
+该样本不发布；因此终态零速不会被旧回调用更高 `sequence` 覆盖。当前自动证据覆盖纯函数和源码
 合同；终点不徘徊及真机时序仍需 G1 验收。
 
 ## 统一卡片连线
