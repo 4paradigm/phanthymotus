@@ -40,8 +40,11 @@ cp .env.example .env  # Configure registry settings
 # Build Agent Core
 ./build_core.sh
 
-# Build Perception Stack
+# Build Perception Stack (Jetson only — see the script's --jp-version flag)
 ./build_perception.sh
+
+# Build ActuCore (Jetson only)
+./build_actucore.sh
 ```
 
 ## Project Structure
@@ -64,6 +67,9 @@ phanthymotus/
 ├── perception/        — Layer 2: Perception Stack (ASR/TTS MCP Server)
 │   ├── main.py        — MCP server entry point
 │   └── plugins/       — ASR/TTS plugin implementations
+├── actucore/          — Layer 2: ActuCore (execution models, MCP Server)
+│   ├── main.py        — MCP server entry point
+│   └── plugins/       — Execution model cards (none yet)
 ├── deploy/            — Build & deployment scripts
 └── docker-compose.yml — Full stack orchestration
 ```
@@ -74,10 +80,13 @@ Hardware drivers are in a separate repository: [phanthymotus-driver](https://git
 
 ### Three-Layer Design
 
+See the [architecture diagram](README.md#architecture) for how these layers connect.
+
 | Layer | Component | Description |
 |-------|-----------|-------------|
-| Layer 1 — Hardware Drivers | MCP HTTP Servers | Physical device interfaces ([phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)) |
-| Layer 2 — Perception Stack | ASR/TTS plugins | Speech processing with local inference support (Jetson) |
+| Layer 1 — Hardware Drivers | MCP HTTP Servers | Physical device interfaces ([phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)). A single driver exposes both the sensor side (video, audio, lidar, joints, battery, status) and the actuator side (motion, hand, head, waist, speaker, LED) |
+| Layer 2 — Perception Stack | ASR/TTS/VLM plugins | Raw streams → semantics, with local inference support (Jetson) |
+| Layer 2 — ActuCore | Execution models | The mirror of perception on the action side: VLA, navigation, grasp policies, locomotion, whole-body control. Lives in `actucore/`, structurally identical to the perception stack — each model attaches as a `processor` card. Ships no cards yet |
 | Layer 3 — Agent Core | FastAPI + LLM Loop | Event-driven agent with DDS bridge and web dashboard |
 
 ### Communication
@@ -85,6 +94,7 @@ Hardware drivers are in a separate repository: [phanthymotus-driver](https://git
 - **Data Plane**: ROS2 DDS → `ros2_bridge.py` (daemon thread) → `inspection.py` fan-out → WebSocket `/ws/bus/{topic}`
 - **Control Plane**: MCP HTTP JSON-RPC 2.0 (Agent Core → hardware/perception)
 - **Activity Stream**: WebSocket `/ws/motus` (real-time agent decision broadcast)
+- **Tool Types**: every MCP tool declares a `type` — `sensor`, `actuator`, `processor`, or `resource`. The type drives dispatch behaviour: consecutive `sensor` calls are batched in parallel, while `actuator` and `processor` calls pass through the ACP barrier and wait for pending actions to complete first (`_needs_barrier()` in `agent-core/src/event/llm.py`). Tools with no declared type default to barrier-guarded
 
 ### Core Flow
 
@@ -106,7 +116,7 @@ All paths relative to `agent-core/`:
 | `src/api/inspection.py` | DDS topic monitoring, WS `/ws/bus/{topic}` |
 | `src/api/mcp_manage.py` | MCP device registration + tool discovery |
 | `src/api/canvas.py` | Visual canvas state persistence |
-| `src/config.py` | SQLite ConfigDB, auto-migrates old ports on startup |
+| `src/config.py` | SQLite ConfigDB, seeds defaults and de-dupes the MCP list on startup |
 | `src/prompt.py` | Layered prompt construction (L1 system → L4 trigger) |
 
 ## MCP Protocol

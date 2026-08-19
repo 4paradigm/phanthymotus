@@ -13,13 +13,16 @@ import config as _config
 
 router = fastapi.APIRouter(prefix='/drivers', tags=['drivers'])
 
-# Fixed service endpoints for core/perception/inspection (not hardware drivers)
+# Fixed service endpoints for core/perception/actucore (not hardware drivers).
+# Keyed by registryImage — the same string the build scripts register with.
 _SERVICE_ENDPOINTS: dict[str, dict] = {
     'core':       {'host_port': 15678},
     'perception': {'port': 15720, 'mcp_url': 'http://localhost:15720/mcp',
                    'volumes': {os.environ.get('MODELS_PATH', '/opt/embodied/models'):
                                {'bind': '/models', 'mode': 'rw'}}},
-    'inspection': {'port': 15671},
+    'actucore':   {'port': 15730, 'mcp_url': 'http://localhost:15730/mcp',
+                   'volumes': {os.environ.get('MODELS_PATH', '/opt/embodied/models'):
+                               {'bind': '/models', 'mode': 'rw'}}},
 }
 
 
@@ -327,12 +330,8 @@ def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
     added = 0
     updated = 0
 
-    all_items = (
-        catalog.get('core', []) +
-        catalog.get('driver', []) +
-        catalog.get('perception', []) +
-        catalog.get('inspection', [])
-    )
+    from api.registry import CATEGORIES
+    all_items = [item for c in CATEGORIES for item in catalog.get(c, [])]
 
     for item in all_items:
         tags = item.get('tags', [])
@@ -442,16 +441,16 @@ async def drivers_list():
 @router.post('/sync')
 async def drivers_sync():
     """Fetch registry catalog and upsert drivers in DB."""
-    from api.registry import _build_catalog_sync, _cache as _registry_cache
+    from api.registry import _build_catalog_sync, _current_channel, _cache as _registry_cache
+    channel = _current_channel()
     loop = asyncio.get_event_loop()
     try:
-        catalog = await loop.run_in_executor(None, _build_catalog_sync)
+        catalog = await loop.run_in_executor(None, _build_catalog_sync, channel)
     except Exception as e:
         return {'code': 500, 'message': str(e)}
 
     # Update registry cache with fresh data so next GET /registry/catalog is immediate
-    _registry_cache['data'] = catalog
-    _registry_cache['ts']   = __import__('time').time()
+    _registry_cache[channel] = {'data': catalog, 'ts': __import__('time').time()}
 
     manifest = _load_manifest()
     added, updated = _upsert_from_catalog(manifest, catalog)

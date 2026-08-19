@@ -385,6 +385,9 @@ html, body {
 .sidebar-section-icon.controller {
   color: var(--emerald);
 }
+.sidebar-section-icon.actucore {
+  color: var(--blue);
+}
 
 .sidebar-section-name {
   font-size: 10px;
@@ -3207,26 +3210,6 @@ html, body {
 .node-info-label { color: var(--text-muted); min-width: 70px; flex-shrink: 0; font-weight: 500; }
 .node-info-value { color: var(--text); font-family: var(--font-mono); word-break: break-all; }
 .node-info-tools { margin-top: 10px; }
-
-/* Inspection topic list */
-.insp-topic-list {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.insp-topic-row {
-  display: grid;
-  grid-template-columns: 16px 1fr auto auto;
-  gap: 4px;
-  align-items: center;
-  font-size: 11px;
-  padding: 2px 0;
-}
-.insp-topic-status { font-size: 9px; }
-.insp-topic-path   { font-family: var(--font-mono); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.insp-topic-fmt    { font-family: var(--font-mono); color: var(--text-dim); white-space: nowrap; }
-.insp-topic-src    { color: var(--accent); white-space: nowrap; }
 .tool-chip {
   display: inline-block;
   font-size: 11px; font-family: var(--font-mono);

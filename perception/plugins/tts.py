@@ -499,9 +499,39 @@ class TTSPlugin:
             self._adapter = None
             self._load_error = str(e)
         self._nodes: dict[str, _TTSNode] = {}
+        # main.py serves MCP over ThreadingHTTPServer, so start/stop/speak/config
+        # can run concurrently. Every read-modify-write of _nodes must hold this:
+        # otherwise two threads both pass a "key not in _nodes" check, both build
+        # a node, and the dict keeps only the last — leaving the other running but
+        # unreachable, with a duplicate publisher on the same topic that nothing
+        # can stop. See perception/README.md § Plugin Concurrency.
+        # RLock: dispatch paths nest (start → _dispose_node).
+        self._nodes_lock = threading.RLock()
         self._executor = executor
         log.info(f"[tts] plugin init: sherpa-onnx VITS, "
                  f"speaker_id={plugin_cfg.get('speaker_id', 0)}, speed={plugin_cfg.get('speed', 1.0)}")
+
+    def _dispose_node(self, node: _TTSNode, key: str = "") -> dict:
+        """Stop a node and release its ROS endpoints. Caller holds _nodes_lock.
+
+        destroy_node() matters: without it the publisher and the ROS node name
+        outlive the node object, so a later start on the same key collides with a
+        still-registered ghost.
+        """
+        result = {"state": "idle"}
+        try:
+            result = node.stop()
+        except Exception:
+            log.error(f"[tts] node.stop() failed while disposing '{key}'", exc_info=True)
+        try:
+            self._executor.remove_node(node)
+        except Exception as error:
+            log.warning(f"[tts] failed to remove ROS node '{key}': {error}")
+        try:
+            node.destroy_node()
+        except Exception as error:
+            log.warning(f"[tts] failed to destroy ROS node '{key}': {error}")
+        return result
 
     def get_tools(self) -> list:
         return TOOLS
@@ -524,8 +554,12 @@ class TTSPlugin:
                     "desc": f"Model load failed: {self._load_error}",
                 }
             input_topic = args.get("input_topic", "")
-            if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
+            # Snapshot under the lock: info is a heartbeat probe and iterating the
+            # live dict can raise "dictionary changed size" mid-start.
+            with self._nodes_lock:
+                node = self._nodes.get(instance_id) if instance_id else None
+                nodes_snapshot = list(self._nodes.values())
+            if instance_id and node is not None:
                 return {
                     "name": "TTS", "manufacture": "Embodied", "model": "tts",
                     "state": node.state,
@@ -544,10 +578,10 @@ class TTSPlugin:
                     "desc": "TTS service — converts text to audio/pcm-16k",
                 }
             # Aggregate info (no instance_id = ping/overview only)
-            if self._nodes:
-                topics_in = [{"topic": n._input_topic, "format": "data/json", "desc": ""} for n in self._nodes.values()]
-                topics_out = [{"topic": n._output_topic, "format": "audio/pcm-16k", "desc": ""} for n in self._nodes.values()]
-                states = list(set(n.state for n in self._nodes.values()))
+            if nodes_snapshot:
+                topics_in = [{"topic": n._input_topic, "format": "data/json", "desc": ""} for n in nodes_snapshot]
+                topics_out = [{"topic": n._output_topic, "format": "audio/pcm-16k", "desc": ""} for n in nodes_snapshot]
+                states = list(set(n.state for n in nodes_snapshot))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
                 inferred_out = f"{input_topic}/tts" if input_topic else "/perception/tts"
@@ -571,43 +605,39 @@ class TTSPlugin:
                 return {"state": "error", "message": "TTS model not loaded"}
             input_topic = args.get("input_topic") or ''
             node_key = instance_id or input_topic or '_default'
-            # Clean up _default node if it would conflict with this instance
-            if '_default' in self._nodes and node_key != '_default':
-                default_node = self._nodes['_default']
-                if default_node._input_topic == input_topic or default_node._output_topic == (f"{input_topic}/tts" if input_topic else '/perception/tts'):
-                    default_node.stop()
-                    self._executor.remove_node(default_node)
-                    del self._nodes['_default']
-            if node_key not in self._nodes:
-                node = _TTSNode(input_topic or None, self._adapter,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
-                self._executor.add_node(node)
-                self._nodes[node_key] = node
-            elif input_topic and self._nodes[node_key]._input_topic != input_topic:
-                # Input topic changed for existing instance — recreate
-                old_node = self._nodes[node_key]
-                old_node.stop()
-                self._executor.remove_node(old_node)
-                node = _TTSNode(input_topic, self._adapter,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
-                self._executor.add_node(node)
-                self._nodes[node_key] = node
-            return self._nodes[node_key].start()
+            with self._nodes_lock:
+                # Clean up _default node if it would conflict with this instance
+                if '_default' in self._nodes and node_key != '_default':
+                    default_node = self._nodes['_default']
+                    if default_node._input_topic == input_topic or default_node._output_topic == (f"{input_topic}/tts" if input_topic else '/perception/tts'):
+                        del self._nodes['_default']
+                        self._dispose_node(default_node, '_default')
+                node = self._nodes.get(node_key)
+                if node is None:
+                    node = _TTSNode(input_topic or None, self._adapter,
+                                    node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                    self._executor.add_node(node)
+                    self._nodes[node_key] = node
+                elif input_topic and node._input_topic != input_topic:
+                    # Input topic changed for existing instance — recreate
+                    del self._nodes[node_key]
+                    self._dispose_node(node, node_key)
+                    node = _TTSNode(input_topic, self._adapter,
+                                    node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                    self._executor.add_node(node)
+                    self._nodes[node_key] = node
+                return node.start()
 
         elif action == "stop":
-            if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                result = node.stop()
-                self._executor.remove_node(node)
-                del self._nodes[instance_id]
-                return result
-            elif not instance_id and self._nodes:
+            with self._nodes_lock:
+                if instance_id:
+                    node = self._nodes.pop(instance_id, None)
+                    if node is None:
+                        return {"state": "idle"}
+                    return self._dispose_node(node, instance_id)
                 for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
-                    del self._nodes[key]
+                    self._dispose_node(self._nodes.pop(key), key)
                 return {"state": "idle"}
-            return {"state": "idle"}
 
         elif action == "speak":
             if self._loading:
@@ -618,29 +648,29 @@ class TTSPlugin:
             if not text:
                 raise ValueError("text is required")
             # Find any existing running node to reuse
-            node = None
-            for n in self._nodes.values():
-                if n.state == "running":
-                    node = n
-                    break
-            if node is None:
-                # No running node — use instance key or fallback
-                node_key = instance_id or '_default'
-                if node_key not in self._nodes:
-                    input_topic = args.get("input_topic") or None
-                    adapter = self._adapter
-                    if instance_id and instance_id in self._instance_configs:
-                        inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
-                        if inst_adapter:
-                            adapter = inst_adapter
-                    node = _TTSNode(input_topic, adapter,
-                                    node_suffix=node_key.replace('/', '_').replace('-', '_'))
-                    self._executor.add_node(node)
-                    self._nodes[node_key] = node
-                else:
-                    node = self._nodes[node_key]
-                if node.state != "running":
-                    node.start()
+            with self._nodes_lock:
+                node = None
+                for n in self._nodes.values():
+                    if n.state == "running":
+                        node = n
+                        break
+                if node is None:
+                    # No running node — use instance key or fallback
+                    node_key = instance_id or '_default'
+                    node = self._nodes.get(node_key)
+                    if node is None:
+                        input_topic = args.get("input_topic") or None
+                        adapter = self._adapter
+                        if instance_id and instance_id in self._instance_configs:
+                            inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
+                            if inst_adapter:
+                                adapter = inst_adapter
+                        node = _TTSNode(input_topic, adapter,
+                                        node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                        self._executor.add_node(node)
+                        self._nodes[node_key] = node
+                    if node.state != "running":
+                        node.start()
             # ACP: 生成 action_id
             import uuid as _uuid
             action_id = f"speak-{_uuid.uuid4().hex[:8]}"
@@ -656,26 +686,24 @@ class TTSPlugin:
                 self._cfg['speed'] = float(cfg['speed'])
             self._adapter = _build_tts_adapter(self._cfg)
             # Stop all nodes (they'll use new adapter on next start)
-            for key in list(self._nodes.keys()):
-                self._nodes[key].stop()
-                self._executor.remove_node(self._nodes[key])
-                del self._nodes[key]
+            with self._nodes_lock:
+                for key in list(self._nodes.keys()):
+                    self._dispose_node(self._nodes.pop(key), key)
             return {"status": "configured"}
 
         elif action == "interrupt":
             # 立即中止所有 TTS 播放（清空队列 + 停止当前 utterance）
             total_cleared = 0
             interrupted_count = 0
-            if instance_id and instance_id in self._nodes:
-                result = self._nodes[instance_id].interrupt()
+            with self._nodes_lock:
+                if instance_id:
+                    targets = [self._nodes[instance_id]] if instance_id in self._nodes else []
+                else:
+                    targets = [n for n in self._nodes.values() if n.state == "running"]
+            for node in targets:
+                result = node.interrupt()
                 total_cleared += result.get('cleared', 0)
                 interrupted_count += 1
-            elif not instance_id:
-                for node in self._nodes.values():
-                    if node.state == "running":
-                        result = node.interrupt()
-                        total_cleared += result.get('cleared', 0)
-                        interrupted_count += 1
             return {"status": "interrupted", "nodes": interrupted_count, "cleared": total_cleared}
 
         return None

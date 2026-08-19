@@ -55,8 +55,11 @@ def _extract_priority(ev: dict) -> int:
             p = data.get('priority')
             if p is not None:
                 return int(p)
-            # ACP: action_complete 事件自动为 P>0（需要 steering 注入 LLM turn）
+            # ACP: action_complete 事件 — speak/tts completions are silent (barrier handles sync)
             if data.get('type') == 'action_complete':
+                aid = data.get('action_id', '')
+                if aid.startswith('speak-') or aid.startswith('tts-'):
+                    return 0  # don't steer into LLM — just a playback ack
                 return 1
         except (ValueError, TypeError):
             pass
@@ -64,6 +67,9 @@ def _extract_priority(ev: dict) -> int:
     payload = ev.get('payload', {})
     if isinstance(payload, dict):
         if payload.get('type') == 'action_complete':
+            aid = payload.get('action_id', '')
+            if aid.startswith('speak-') or aid.startswith('tts-'):
+                return 0
             return 1
         # Subagent 完成事件：继承 subagent 的 priority（反转映射回 event priority）
         sub_p = payload.get('priority')

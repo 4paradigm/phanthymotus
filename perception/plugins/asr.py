@@ -23,12 +23,26 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
 
+from plugins.vad_preroll import PcmHistory
+
 log = logging.getLogger(__name__)
 
 SAMPLE_RATE    = 16000
 SPEECH_THRESH  = 0.5
 SILENCE_THRESH = 0.35
 SILENCE_FRAMES = 16
+
+# Documented AudioChunk contract — see perception/README.md ("Audio Requirements
+# for ASR"): 16 kHz mono PCM_S16_LE, at least 512 samples per chunk.
+AUDIO_FORMAT       = "audio/pcm-16k"
+# agent-core's remote-control mic bridge publishes this spelling instead; accept
+# it rather than warning on every chunk of a path that already works.
+_AUDIO_FORMAT_ALIASES = frozenset({AUDIO_FORMAT, "pcm_16k_16bit_mono"})
+MIN_CHUNK_BYTES    = 1024  # 512 samples — one Silero VAD window
+
+# Upper bound on how long `start` waits for a background model load. Prevents a
+# stalled download from pinning an MCP worker thread indefinitely.
+MODEL_LOAD_TIMEOUT_S = 300
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -278,7 +292,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -286,7 +300,8 @@ TOOLS = [
                 "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
-                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": False, "scope": "shared"},
+                "vad_pre_roll_ms":{"type": "integer", "description": "Audio retained before detected speech (ms)", "default": 500, "scope": "shared"},
+                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": True, "scope": "shared"},
                 "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
             "required": []
@@ -517,8 +532,27 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
         return text.strip()
 
 
+class SherpaOnnxXASRAdapter(ASRAdapter):
+    """Offline X-ASR transducer with general robot-domain hotword biasing."""
+
+    def __init__(self, model_dir: str, hw_provider: str = "cpu", num_threads: int = 2):
+        from utils.model_downloader import ensure_model
+        from plugins.x_asr import XASRAdapter
+
+        ensure_model("asr_x_asr", model_dir)
+        self._delegate = XASRAdapter(model_dir, hw_provider, num_threads)
+
+    def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        return self._delegate.transcribe(wav_bytes, language)
+
+
 # ASR model registry
 ASR_MODELS = {
+    "x-asr-zh-en": {
+        "label": "X-ASR Bilingual (zh+en, offline transducer)",
+        "adapter": SherpaOnnxXASRAdapter,
+        "default_model_dir": "/models/sherpa-onnx/x-asr-zh-en",
+    },
     "paraformer-zh-en": {
         "label": "Paraformer Bilingual (zh+en, streaming)",
         "adapter": SherpaOnnxASRAdapter,
@@ -567,7 +601,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 stop_evt: multiprocessing.Event,
                 backend: str, threshold: float, silence_ms: int,
                 kws_cfg: dict = None,
-                save_vad_segments: bool = False, max_saved_segments: int = 1000):
+                save_vad_segments: bool = False, max_saved_segments: int = 1000,
+                pre_roll_ms: int = 500):
     """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
@@ -600,7 +635,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         provider="cpu",
     )
     vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
-    _log.info(f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, silence_ms={silence_ms})")
+    pre_roll_samples = max(0, int(SAMPLE_RATE * pre_roll_ms / 1000))
+    silence_samples = max(0, int(SAMPLE_RATE * silence_ms / 1000))
+    pcm_history = PcmHistory(SAMPLE_RATE * 31)
+    _log.info(
+        f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, "
+        f"silence_ms={silence_ms}, pre_roll_ms={pre_roll_ms})"
+    )
 
     # ── Initialize KWS (optional) ──
     kws_spotter = None
@@ -684,46 +725,76 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 
     # VAD segment saving
     _VAD_SEG_DIR = '/models/vad_segments'
-    _seg_count = [0]
 
-    def _save_segment(float_samples_list, count_ref):
+    def _save_segment(float_samples_list):
         """Save float samples as WAV."""
         try:
-            import wave as _wave, time as _time2
-            os.makedirs(_VAD_SEG_DIR, exist_ok=True)
-            seg_pcm = _struct.pack(f'<{len(float_samples_list)}h',
-                                   *[int(max(-32768, min(32767, s * 32768))) for s in float_samples_list])
-            fname = os.path.join(_VAD_SEG_DIR, f"seg_{int(_time2.time()*1000)}.wav")
-            with _wave.open(fname, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(seg_pcm)
-            # Enforce max segments limit
-            if count_ref[0] >= max_saved_segments:
-                files = sorted(os.listdir(_VAD_SEG_DIR))
-                for old in files[:len(files) - max_saved_segments + 1]:
-                    os.remove(os.path.join(_VAD_SEG_DIR, old))
+            seg_pcm = struct.pack(f'<{len(float_samples_list)}h',
+                                  *[int(max(-32768, min(32767, s * 32768))) for s in float_samples_list])
+            _write_segment(seg_pcm)
         except Exception:
             pass
 
-    def _save_segment_pcm(pcm_bytes, count_ref):
+    def _save_segment_pcm(pcm_bytes):
         """Save raw PCM bytes as WAV."""
         try:
-            import wave as _wave, time as _time2
-            os.makedirs(_VAD_SEG_DIR, exist_ok=True)
-            fname = os.path.join(_VAD_SEG_DIR, f"seg_{int(_time2.time()*1000)}.wav")
-            with _wave.open(fname, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(pcm_bytes)
-            if count_ref[0] >= max_saved_segments:
-                files = sorted(os.listdir(_VAD_SEG_DIR))
-                for old in files[:len(files) - max_saved_segments + 1]:
-                    os.remove(os.path.join(_VAD_SEG_DIR, old))
+            _write_segment(pcm_bytes)
         except Exception:
             pass
+
+    def _segment_path():
+        """A path no existing segment occupies.
+
+        The name carries wall-clock milliseconds, and _save_segment is called
+        from inside the wake-wait drain loop — several segments get written
+        back-to-back well within one millisecond, and wave.open(..., 'wb')
+        truncates, so without a suffix the earlier audio is silently lost.
+        """
+        stamp = int(time.time() * 1000)
+        path = os.path.join(_VAD_SEG_DIR, f"seg_{stamp}.wav")
+        if not os.path.exists(path):
+            return path
+        for n in range(1, 1000):
+            alt = os.path.join(_VAD_SEG_DIR, f"seg_{stamp}_{n}.wav")
+            if not os.path.exists(alt):
+                return alt
+        return path
+
+    def _enforce_retention():
+        """Prune to max_saved_segments, counting what is on disk.
+
+        The old gate was an in-process counter `>= max_saved_segments`, but it was
+        initialised per VAD worker *process* — every ASR restart reset it to 0,
+        so a robot that restarts ASR regularly never pruned at all (observed:
+        5590 files with max_saved_segments=1000). Also filter the listing: it
+        used to feed raw os.listdir() to os.remove(), which would delete any
+        unrelated file that happened to live in this directory.
+        """
+        try:
+            names = [f for f in os.listdir(_VAD_SEG_DIR)
+                     if f.startswith('seg_') and f.endswith('.wav')]
+        except OSError:
+            return
+        if len(names) <= max_saved_segments:
+            return
+        # Fixed-width 13-digit epoch-ms keeps ASCII order == chronological order
+        # until year 2286, so a plain sort is correct here.
+        names.sort()
+        for old in names[:len(names) - max_saved_segments]:
+            try:
+                os.remove(os.path.join(_VAD_SEG_DIR, old))
+            except OSError:
+                pass
+
+    def _write_segment(pcm_bytes):
+        import wave as _wave
+        os.makedirs(_VAD_SEG_DIR, exist_ok=True)
+        with _wave.open(_segment_path(), 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(pcm_bytes)
+        _enforce_retention()
 
     while not stop_evt.is_set():
         try:
@@ -744,6 +815,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         float_samples = [s / 32768.0 for s in samples]
 
         # Feed VAD
+        pcm_history.append(pcm[:n * 2])
         vad.accept_waveform(float_samples)
 
         if state == 'waiting_wake':
@@ -771,8 +843,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             while not vad.empty():
                 seg = vad.front
                 if save_vad_segments:
-                    _save_segment(seg.samples, _seg_count)
-                    _seg_count[0] += 1
+                    _save_segment(seg.samples)
                 vad.pop()
 
         elif state == 'listening':
@@ -782,24 +853,47 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 result_q.put(("speech_start", ts, ts, False))
             _was_speaking = _is_speaking
 
-            # Collect completed VAD segments
+            # Collect completed VAD segments.
+            # The VAD only reports a segment after min_silence_duration of
+            # trailing silence has elapsed, and that silence is not part of
+            # seg.samples — so the current chunk timestamp sits one silence
+            # window past the real end of speech. Rewind it, the same way
+            # PcmHistory.pre_roll() rewinds by silence_samples to locate the
+            # segment start in the sample domain.
+            seg_end_ts = ts - silence_samples / SAMPLE_RATE
             while not vad.empty():
                 seg = vad.front
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
-                if not start_ts:
-                    start_ts = ts
-                speech_buf += seg_pcm
-                end_ts = ts
+                # `is None`, not falsy: a legitimate start_ts of 0.0 would
+                # otherwise be re-stamped.
+                if start_ts is None:
+                    pre_pcm = pcm_history.pre_roll(
+                        getattr(seg, 'start', None),
+                        len(seg.samples),
+                        pre_roll_samples,
+                        silence_samples,
+                    )
+                    start_ts = seg_end_ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
+                    speech_buf = pre_pcm + seg_pcm
+                else:
+                    pre_pcm = b''
+                    speech_buf += seg_pcm
+                end_ts = seg_end_ts
                 vad.pop()
 
                 # Output the segment as an utterance
                 if len(speech_buf) > SAMPLE_RATE:  # >500ms
-                    _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
+                    _log.info(
+                        f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
+                        f"pre_roll_bytes={len(pre_pcm)}"
+                    )
                     if save_vad_segments:
-                        _save_segment_pcm(speech_buf, _seg_count)
-                        _seg_count[0] += 1
-                    result_q.put((speech_buf, start_ts or ts, end_ts or ts, _kws_triggered))
+                        _save_segment_pcm(speech_buf)
+                    result_q.put((speech_buf,
+                                  seg_end_ts if start_ts is None else start_ts,
+                                  seg_end_ts if end_ts is None else end_ts,
+                                  _kws_triggered))
                     _kws_triggered = False
                     speech_buf = b''
                     start_ts = None
@@ -807,6 +901,15 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     # Return to waiting for wake word (if KWS enabled)
                     if kws_enabled:
                         state = 'waiting_wake'
+                        # Stop draining here. Without the break, segments still
+                        # queued in the VAD keep being treated as an active
+                        # listening session and can emit a second utterance in
+                        # this same pass, after the wake gate has already closed.
+                        # `state` is only re-read on the next outer iteration, so
+                        # the gate would be bypassed for however many segments
+                        # the VAD had queued. The remainder belongs to
+                        # waiting_wake, which drains it next round.
+                        break
 
     _log.info("[vad-worker] process exiting")
 
@@ -817,7 +920,8 @@ class _ASRNode(Node):
     def __init__(self, input_topic: str, adapter: Optional[ASRAdapter], language: str,
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
                  kws_cfg: dict = None, node_suffix: str = '',
-                 save_vad_segments: bool = False, max_saved_segments: int = 1000):
+                 save_vad_segments: bool = False, max_saved_segments: int = 1000,
+                 vad_pre_roll_ms: int = 500):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -831,6 +935,7 @@ class _ASRNode(Node):
         self._vad_backend = vad_backend
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
+        self._vad_pre_roll_ms = vad_pre_roll_ms
         self._kws_cfg = kws_cfg or {}
         self._save_vad_segments = save_vad_segments
         self._max_saved_segments = max_saved_segments
@@ -841,25 +946,51 @@ class _ASRNode(Node):
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._first_chunk_event = threading.Event()
+        # Created here rather than in _start_inner so request_stop() can always
+        # set it, and so the worker thread cannot reach it before it exists.
+        self._worker_ready = threading.Event()
+        # Serialises start/stop on this node. RLock because _start_inner calls
+        # _teardown() while already holding it.
+        self._lifecycle_lock = threading.RLock()
+        self._audio_contract_warns: dict = {}
 
     def start(self) -> dict:
-        if self.state == "running":
-            return self._status_dict()
-        if not self._adapter:
-            return {"state": "error", "message": "ASR adapter not configured"}
-        try:
-            return self._start_inner()
-        except Exception as e:
-            log.error(f"[asr] start failed: {e}", exc_info=True)
-            self.state = "error"
-            return {"state": "error", "message": str(e)}
+        with self._lifecycle_lock:
+            # "starting" counts as taken: _start_inner blocks up to 15s waiting
+            # for the first audio chunk, and a second start slipping in during
+            # that window would build a second subscription and a second VAD
+            # process on this same node.
+            if self.state in ("running", "starting"):
+                return self._status_dict()
+            if not self._adapter:
+                return {"state": "error", "message": "ASR adapter not configured"}
+            try:
+                return self._start_inner()
+            except Exception as e:
+                log.error(f"[asr] start failed: {e}", exc_info=True)
+                self.state = "error"
+                return {"state": "error", "message": str(e)}
 
     def _start_inner(self) -> dict:
         from audio_msgs.msg import AudioChunk
+        # Belt and braces: never let a second subscription or VAD process exist
+        # on one node. If the plugin-level guard ever regresses, this turns a
+        # silent duplicate-pipeline leak into a logged restart.
+        if (self._vad_proc is not None or self._sub is not None
+                or (self._worker_thread is not None and self._worker_thread.is_alive())):
+            log.warning(
+                f"[asr] stale pipeline on {self._input_topic} "
+                f"(vad_pid={getattr(self._vad_proc, 'pid', None)}, sub={self._sub is not None}) "
+                f"— tearing down before restart"
+            )
+            self._teardown()
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
         self._first_chunk_event = threading.Event()
+        self._worker_ready = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
-        self._stop_event.clear()
+        # A fresh event, not .clear(): the previous worker thread and _audio_cb
+        # closures still hold a reference to the old one.
+        self._stop_event = threading.Event()
         # Start VAD in a child process
         self._pcm_queue = multiprocessing.Queue(maxsize=1000)
         self._utterance_queue = multiprocessing.Queue(maxsize=100)
@@ -868,7 +999,8 @@ class _ASRNode(Node):
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                  self._kws_cfg, self._save_vad_segments, self._max_saved_segments),
+                  self._kws_cfg, self._save_vad_segments, self._max_saved_segments,
+                  self._vad_pre_roll_ms),
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
@@ -877,7 +1009,6 @@ class _ASRNode(Node):
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
         self.state = "starting"
-        self._worker_ready = threading.Event()
         log.info("[asr] waiting for first audio chunk...")
         # Block until first audio chunk arrives or stop() cancels (timeout to avoid infinite hang)
         got_chunk = self._first_chunk_event.wait(timeout=10)
@@ -894,7 +1025,35 @@ class _ASRNode(Node):
         log.info("[asr] started, receiving audio data")
         return self._status_dict()
 
+    def request_stop(self) -> None:
+        """Signal cancellation without blocking. Safe from any thread, idempotent.
+
+        stop() must call this *before* taking _lifecycle_lock: _start_inner holds
+        that lock for up to 15s waiting on the first audio chunk, and it can only
+        honour a cancellation if _stop_event is already set by the time its wait
+        returns. Blocking on the lock first would let start() sail through to
+        "running" and leave a pipeline nobody asked for.
+        """
+        for event in (self._stop_event, self._first_chunk_event, self._worker_ready):
+            try:
+                event.set()
+            except Exception:
+                pass
+        if self._vad_stop is not None:
+            try:
+                self._vad_stop.set()
+            except Exception:
+                pass
+
     def stop(self) -> dict:
+        self.request_stop()
+        with self._lifecycle_lock:
+            self._teardown()
+            self.state = "idle"
+            return {"state": "idle"}
+
+    def _teardown(self) -> None:
+        """Release every handle this node owns. Idempotent."""
         # Stop subscription first to prevent new audio_cb calls
         if self._sub:
             try:
@@ -902,14 +1061,7 @@ class _ASRNode(Node):
             except Exception:
                 pass  # may already be invalid
             self._sub = None
-        self._stop_event.set()
-        # Unblock start() if it's waiting
-        if hasattr(self, '_first_chunk_event'):
-            self._first_chunk_event.set()
-        if hasattr(self, '_worker_ready'):
-            self._worker_ready.set()
-        if self._vad_stop:
-            self._vad_stop.set()
+        self.request_stop()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
         for q in (self._pcm_queue, self._utterance_queue):
             if q:
@@ -918,14 +1070,32 @@ class _ASRNode(Node):
                     q.close()
                 except Exception:
                     pass
-        if self._vad_proc and self._vad_proc.is_alive():
-            self._vad_proc.join(timeout=5)
+        if self._vad_proc is not None:
             if self._vad_proc.is_alive():
-                self._vad_proc.terminate()
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=3)
-        self.state = "idle"
-        return {"state": "idle"}
+                self._vad_proc.join(timeout=5)
+                if self._vad_proc.is_alive():
+                    log.warning(f"[asr] VAD worker pid={self._vad_proc.pid} ignored stop, terminating")
+                    self._vad_proc.terminate()
+                    self._vad_proc.join(timeout=2)
+                    if self._vad_proc.is_alive():
+                        # A worker wedged inside sherpa-onnx survives SIGTERM.
+                        # main only sent terminate() and never joined, so such a
+                        # worker leaked for the life of the container.
+                        log.warning(f"[asr] VAD worker pid={self._vad_proc.pid} ignored SIGTERM, killing")
+                        self._vad_proc.kill()
+                        self._vad_proc.join(timeout=2)
+            try:
+                self._vad_proc.close()
+            except Exception:
+                pass
+            self._vad_proc = None
+        if self._worker_thread is not None:
+            if self._worker_thread.is_alive():
+                self._worker_thread.join(timeout=3)
+            self._worker_thread = None
+        self._pcm_queue = None
+        self._utterance_queue = None
+        self._vad_stop = None
 
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
@@ -947,7 +1117,9 @@ class _ASRNode(Node):
                         pass
             self.state = "error"
             return
-        pcm = bytes(msg.data)
+        pcm = self._check_audio_contract(getattr(msg, 'format', '') or '', bytes(msg.data))
+        if not pcm:
+            return
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
@@ -956,14 +1128,51 @@ class _ASRNode(Node):
         except Exception:
             pass  # drop if severely behind
 
+    def _warn_audio_contract(self, key: str, detail: str) -> None:
+        """Warn on the first violation of a kind, then every 500th one.
+
+        A misbehaving mic driver publishes ~30 chunks/s, so an unthrottled
+        warning would bury the log.
+        """
+        n = self._audio_contract_warns.get(key, 0) + 1
+        self._audio_contract_warns[key] = n
+        if n == 1 or n % 500 == 0:
+            log.warning(f"[asr] audio contract violated on {self._input_topic}: {detail} "
+                        f"(occurrence {n}) — see perception/README.md")
+
+    def _check_audio_contract(self, fmt: str, pcm: bytes) -> bytes:
+        """Validate the documented AudioChunk contract, return usable PCM.
+
+        Only the 16-bit alignment is corrected: a chunk with an odd byte count
+        makes the VAD worker's struct.unpack() raise, killing the subprocess and
+        taking ASR to the error state. Format and chunk size are reported but
+        left alone — undersized chunks are the most common cause of "ASR hears
+        audio but never emits text", and dropping them here would change the
+        behaviour of producers that work today.
+        """
+        if fmt not in _AUDIO_FORMAT_ALIASES:
+            self._warn_audio_contract(
+                'format', f"format={fmt!r}, expected {AUDIO_FORMAT!r}")
+
+        if len(pcm) % 2:
+            self._warn_audio_contract(
+                'align', f"{len(pcm)} bytes is not 16-bit aligned, truncating")
+            pcm = pcm[:len(pcm) // 2 * 2]
+
+        if len(pcm) and len(pcm) < MIN_CHUNK_BYTES:
+            self._warn_audio_contract(
+                'size', f"{len(pcm)}-byte chunk is below the {MIN_CHUNK_BYTES}-byte "
+                        f"minimum, VAD may never emit a segment")
+
+        return pcm
+
     def _worker(self):
         try:
             self._worker_inner()
         except Exception as e:
             log.error(f"[asr] worker fatal error: {e}", exc_info=True)
             self.state = "error"
-            if hasattr(self, '_worker_ready'):
-                self._worker_ready.set()
+            self._worker_ready.set()
 
     def _worker_inner(self):
         # Pre-compute keyword IPA if in asr_kws mode
@@ -981,8 +1190,7 @@ class _ASRNode(Node):
                 trigger_mode = 'vad'
 
         # Signal that worker init is complete
-        if hasattr(self, '_worker_ready'):
-            self._worker_ready.set()
+        self._worker_ready.set()
 
         while not self._stop_event.is_set():
             try:
@@ -1091,15 +1299,63 @@ class ASRPlugin:
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
         self._kws_cfg      = plugin_cfg.get('kws', {})
-        self._save_vad_segments = False
-        self._max_saved_segments = 1000
+        # On by default: the saved segments are the only way to audit what the VAD
+        # actually handed the recogniser when a transcription looks wrong. Bounded
+        # by _max_saved_segments — see _enforce_retention(), which unlike the
+        # previous per-process counter actually prunes.
+        self._save_vad_segments = bool(plugin_cfg.get('save_vad_segments', True))
+        self._max_saved_segments = int(plugin_cfg.get('max_saved_segments', 1000))
+        self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
+        # main.py serves MCP over ThreadingHTTPServer, so start/stop/config can
+        # run concurrently on this plugin. Guards read-modify-write of _nodes
+        # only — never held across node.start()/stop() or a model load, because
+        # start() blocks up to 15s and a stop queued behind it could no longer
+        # cancel it. See perception/README.md § Plugin Concurrency.
+        self._nodes_lock = threading.RLock()
         self._executor = executor
         log.info(f"[asr] plugin init: model={self._asr_model}, vad={self._vad_backend}, threshold={self._vad_threshold}, "
-                 f"silence_ms={self._vad_silence_ms}, kws_enabled={self._kws_cfg.get('enabled', False)}")
+                 f"silence_ms={self._vad_silence_ms}, pre_roll_ms={self._vad_pre_roll_ms}, "
+                 f"kws_enabled={self._kws_cfg.get('enabled', False)}")
 
     def get_tools(self) -> list:
         return TOOLS
+
+    def _dispose_node(self, node: _ASRNode, key: str = "") -> dict:
+        """Stop a node and release its ROS endpoints.
+
+        Takes the node itself rather than a key: the caller unlinks it from
+        _nodes first, and an already-orphaned node is by definition not in there.
+        destroy_node() matters — without it the publisher and the ROS node name
+        outlive the node object, so a later start on the same key collides with
+        a still-registered ghost.
+        """
+        result = {"state": "idle"}
+        try:
+            result = node.stop()
+        except Exception:
+            log.error(f"[asr] node.stop() failed while disposing '{key}'", exc_info=True)
+        try:
+            self._executor.remove_node(node)
+        except Exception as error:
+            log.warning(f"[asr] failed to remove ROS node '{key}': {error}")
+        try:
+            node.destroy_node()
+        except Exception as error:
+            log.warning(f"[asr] failed to destroy ROS node '{key}': {error}")
+        return result
+
+    def _sync_cfg(self, node: _ASRNode) -> None:
+        """Push current shared plugin config into an existing node."""
+        node._adapter = self._adapter
+        node._language = self._language
+        node._vad_backend = self._vad_backend
+        node._vad_threshold = self._vad_threshold
+        node._vad_silence_ms = self._vad_silence_ms
+        node._vad_pre_roll_ms = self._vad_pre_roll_ms
+        node._kws_cfg = self._kws_cfg
+        node._save_vad_segments = self._save_vad_segments
+        node._max_saved_segments = self._max_saved_segments
 
     def _load_model_async(self, model_name: str):
         """Download and load ASR model in a background thread."""
@@ -1118,8 +1374,12 @@ class ASRPlugin:
                 self._loading = False
                 self._load_error = str(e)
 
-        self._loading = True
-        self._load_error = None
+        with self._nodes_lock:
+            if self._loading:
+                log.warning(f"[asr] a model load is already in flight, ignoring '{model_name}'")
+                return
+            self._loading = True
+            self._load_error = None
         threading.Thread(target=_do_load, daemon=True, name="asr_model_loader").start()
 
     def dispatch(self, name: str, args: dict) -> dict | None:
@@ -1141,8 +1401,12 @@ class ASRPlugin:
                     "desc": f"Model load failed: {self._load_error}",
                 }
             input_topic = args.get("input_topic", "")
-            if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
+            # Snapshot under the lock: info is a heartbeat probe and iterating
+            # the live dict can raise "dictionary changed size" mid-start.
+            with self._nodes_lock:
+                node = self._nodes.get(instance_id) if instance_id else None
+                nodes_snapshot = list(self._nodes.values())
+            if instance_id and node is not None:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": node.state,
@@ -1162,10 +1426,10 @@ class ASRPlugin:
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             # Aggregate info for all instances (no instance_id = ping/overview only)
-            if self._nodes:
-                topics_in = [{"topic": n._input_topic, "format": "audio/pcm-16k", "desc": ""} for n in self._nodes.values()]
-                topics_out = [{"topic": n._output_topic, "format": "data/json", "desc": ""} for n in self._nodes.values()]
-                states = list(set(n.state for n in self._nodes.values()))
+            if nodes_snapshot:
+                topics_in = [{"topic": n._input_topic, "format": "audio/pcm-16k", "desc": ""} for n in nodes_snapshot]
+                topics_out = [{"topic": n._output_topic, "format": "data/json", "desc": ""} for n in nodes_snapshot]
+                states = list(set(n.state for n in nodes_snapshot))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
                 inferred_out = f"{input_topic}/asr" if input_topic else ""
@@ -1182,10 +1446,17 @@ class ASRPlugin:
 
         elif action == "start":
             if self._loading:
-                # Wait for model to finish loading
-                import time as _time
+                # Bounded wait. The unbounded `while self._loading: sleep(0.5)`
+                # this replaces pinned an MCP worker thread for as long as the
+                # download took — and forever if the loader thread died without
+                # raising Exception, since nothing else clears _loading.
+                deadline = time.monotonic() + MODEL_LOAD_TIMEOUT_S
                 while self._loading:
-                    _time.sleep(0.5)
+                    if time.monotonic() > deadline:
+                        return {"state": "loading", "asr_model": self._asr_model,
+                                "message": f"model '{self._asr_model}' still loading after "
+                                           f"{MODEL_LOAD_TIMEOUT_S}s, retry later"}
+                    time.sleep(0.5)
             if self._load_error:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
             if not self._adapter:
@@ -1199,45 +1470,59 @@ class ASRPlugin:
             if not input_topic:
                 raise ValueError("input_topic is required")
             node_key = instance_id or input_topic
-            if node_key not in self._nodes:
-                node = _ASRNode(input_topic, self._adapter, self._language,
-                                self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                                kws_cfg=self._kws_cfg,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'),
-                                save_vad_segments=self._save_vad_segments,
-                                max_saved_segments=self._max_saved_segments)
-                self._executor.add_node(node)
-                self._nodes[node_key] = node
-            else:
-                # Sync latest config into existing node before restart
-                node = self._nodes[node_key]
-                node._adapter = self._adapter
-                node._language = self._language
-                node._vad_backend = self._vad_backend
-                node._vad_threshold = self._vad_threshold
-                node._vad_silence_ms = self._vad_silence_ms
-                node._kws_cfg = self._kws_cfg
-                node._save_vad_segments = self._save_vad_segments
-                node._max_saved_segments = self._max_saved_segments
-            return self._nodes[node_key].start()
+            # Atomic get-or-create. Two concurrent starts used to both pass a
+            # bare `not in` check and each build an _ASRNode with the same ROS
+            # node name; the dict kept only the last, orphaning a live node whose
+            # subscription and VAD subprocess nothing could ever stop.
+            with self._nodes_lock:
+                node = self._nodes.get(node_key)
+                if node is None:
+                    node = _ASRNode(input_topic, self._adapter, self._language,
+                                    self._vad_backend, self._vad_threshold, self._vad_silence_ms,
+                                    kws_cfg=self._kws_cfg,
+                                    node_suffix=node_key.replace('/', '_').replace('-', '_'),
+                                    save_vad_segments=self._save_vad_segments,
+                                    max_saved_segments=self._max_saved_segments,
+                                    vad_pre_roll_ms=self._vad_pre_roll_ms)
+                    try:
+                        self._executor.add_node(node)
+                    except Exception:
+                        node.destroy_node()
+                        raise
+                    self._nodes[node_key] = node
+                else:
+                    # Sync latest config into existing node before restart
+                    self._sync_cfg(node)
+            # Outside the lock on purpose: node.start() blocks up to 15s, and the
+            # node is already registered, so a concurrent stop can find it, set
+            # its _stop_event, and have start() roll itself back to idle.
+            result = node.start()
+            if result.get("state") == "error":
+                with self._nodes_lock:
+                    if self._nodes.get(node_key) is node:
+                        del self._nodes[node_key]
+                self._dispose_node(node, node_key)
+            return result
 
         elif action == "stop":
-            if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                result = node.stop()
-                self._executor.remove_node(node)
-                del self._nodes[instance_id]
+            with self._nodes_lock:
+                if instance_id:
+                    keys = [instance_id] if instance_id in self._nodes else []
+                else:
+                    # Stop all instances (backward compat / project stop)
+                    keys = list(self._nodes.keys())
+                nodes = [(k, self._nodes.pop(k)) for k in keys]
+            # request_stop() before disposing: it is non-blocking and unblocks an
+            # in-flight start() so _dispose_node does not sit behind it.
+            for _, node in nodes:
+                node.request_stop()
+            result = {"state": "idle"}
+            for key, node in nodes:
+                result = self._dispose_node(node, key)
+            if instance_id:
                 return result
-            elif not instance_id and self._nodes:
-                # Stop all instances (backward compat / project stop)
-                results = []
-                for key in list(self._nodes.keys()):
-                    node = self._nodes[key]
-                    node.stop()
-                    self._executor.remove_node(node)
-                    del self._nodes[key]
-                    results.append(key)
-                return {"state": "idle", "stopped_instances": results}
+            if keys:
+                return {"state": "idle", "stopped_instances": keys}
             return {"state": "idle"}
 
         elif action == "config":
@@ -1262,32 +1547,30 @@ class ASRPlugin:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:
                 self._max_saved_segments = int(cfg['max_saved_segments'])
+            if 'vad_pre_roll_ms' in cfg:
+                self._vad_pre_roll_ms = int(cfg['vad_pre_roll_ms'])
             # ASR model switch — load in background if changed
             if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
                 # Stop all running nodes first
-                for key in list(self._nodes.keys()):
-                    node = self._nodes.pop(key, None)
-                    if node:
-                        node.stop()
-                        self._executor.remove_node(node)
+                with self._nodes_lock:
+                    nodes = [(k, self._nodes.pop(k)) for k in list(self._nodes.keys())]
+                for _, node in nodes:
+                    node.request_stop()
+                for key, node in nodes:
+                    self._dispose_node(node, key)
                 self._asr_model = cfg['asr_model']
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "message": f"Switching to model '{self._asr_model}', downloading..."}
             # Hot-reload: stop running nodes, apply new config, restart automatically
-            was_running = [(key, node) for key, node in self._nodes.items() if node.state == "running"]
-            for key, node in was_running:
+            with self._nodes_lock:
+                was_running = [(key, node) for key, node in self._nodes.items()
+                               if node.state == "running"]
+            for _, node in was_running:
                 node.stop()
             # Sync updated config into nodes and restart
             for key, node in was_running:
-                node._adapter = self._adapter
-                node._language = self._language
-                node._vad_backend = self._vad_backend
-                node._vad_threshold = self._vad_threshold
-                node._vad_silence_ms = self._vad_silence_ms
-                node._kws_cfg = self._kws_cfg
-                node._save_vad_segments = self._save_vad_segments
-                node._max_saved_segments = self._max_saved_segments
+                self._sync_cfg(node)
                 node.start()
             return {"status": "configured", "asr_model": self._asr_model}
 

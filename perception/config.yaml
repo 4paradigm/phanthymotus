@@ -12,6 +12,7 @@ plugins:
       model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
       threshold: 0.5
       silence_ms: 400
+      pre_roll_ms: 500
     kws:
       enabled: true
       model_dir: /models/sherpa-onnx/kws

@@ -65,10 +65,11 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   const controllers = allMcps.filter(m => m.category === 'controller');
   const drivers = allMcps.filter(m => m.category === 'driver' && m.online === true);
   const perceptions = allMcps.filter(m => m.category === 'perception' && m.online === true);
+  const actucores = allMcps.filter(m => m.category === 'actucore' && m.online === true);
 
   _scroll.innerHTML = '';
 
-  if (!controllers.length && !drivers.length && !perceptions.length) {
+  if (!controllers.length && !drivers.length && !perceptions.length && !actucores.length) {
     _scroll.appendChild(_empty);
     return;
   }
@@ -81,8 +82,16 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
   // Perception section
   if (perceptions.length) {
-    const section = _buildPerceptionSection(perceptions);
-    _scroll.appendChild(section);
+    _scroll.appendChild(_buildMergedSection(perceptions, {
+      cls: 'sidebar-section-perception', icon: '◈', label: '感知',
+    }));
+  }
+
+  // ActuCore section
+  if (actucores.length) {
+    _scroll.appendChild(_buildMergedSection(actucores, {
+      cls: 'sidebar-section-actucore', icon: '❋', iconCls: 'actucore', label: '执行',
+    }));
   }
 
   // Driver sections (one per driver)
@@ -125,14 +134,19 @@ function _buildSection(mcp) {
   return section;
 }
 
-function _buildPerceptionSection(perceptions) {
+/**
+ * Merge the tools of several MCPs of the same category into one section,
+ * grouped by tool type. Used for perception and actucore, which each may be
+ * served by more than one container but read as a single layer in the sidebar.
+ */
+function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
   const section = document.createElement('div');
-  section.className = 'sidebar-section sidebar-section-perception';
+  section.className = `sidebar-section ${cls}`;
 
   const header = document.createElement('div');
   header.className = 'sidebar-section-header';
   const allTools = [];
-  for (const mcp of perceptions) {
+  for (const mcp of mcps) {
     const tools = (mcp.tools || []).map(t => typeof t === 'string' ? { name: t } : t);
     for (const tool of tools) {
       if (!tool.type && (tool.topic_in || []).length && (tool.topic_out || []).length) {
@@ -143,8 +157,8 @@ function _buildPerceptionSection(perceptions) {
     }
   }
   header.innerHTML = `
-    <span class="sidebar-section-icon">◈</span>
-    <span class="sidebar-section-name">感知</span>
+    <span class="sidebar-section-icon ${_esc(iconCls)}">${_esc(icon)}</span>
+    <span class="sidebar-section-name">${_esc(label)}</span>
     <span class="sidebar-section-count">${allTools.length}</span>
   `;
   section.appendChild(header);

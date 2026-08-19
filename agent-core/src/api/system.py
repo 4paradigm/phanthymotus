@@ -74,11 +74,11 @@ def _tag_from_image(image: str) -> str:
 
 
 def _check_update_sync() -> dict:
-    from api.registry import _build_catalog_sync
+    from api.registry import _build_catalog_sync, _current_channel
 
     current_tag = _get_current_tag()
 
-    catalog = _build_catalog_sync()
+    catalog = _build_catalog_sync(_current_channel())
     core_items = catalog.get('core', [])
 
     if not core_items:

@@ -1,0 +1,20 @@
+# ActuCore — 执行模型层配置
+#
+# 与 perception/config.yaml 同构：mcp_port + 每张卡片的开关与参数。
+# 当前不带任何卡片，plugins 为空。
+
+mcp_port: 15730
+
+plugins: {}
+  # 新增卡片后在这里打开它，例如：
+  #
+  # vla:
+  #   enabled: true
+  #   model_dir: /models/vla
+  #   namespace: ""       # 留空则用 hostname 自动推导
+  #
+  # nav:
+  #   enabled: true
+  #   map_dir: /models/maps
+  #
+  # 卡片名要和 main.py 里 ActuCoreBundle 的注册块、以及插件的 PREFIX 对上。

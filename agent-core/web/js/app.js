@@ -108,7 +108,7 @@ async function fetchTopicStatuses() {
 }
 
 // Priority order for update banner display
-const _UPDATE_PRIORITY = ['core', 'perception', 'driver'];
+const _UPDATE_PRIORITY = ['core', 'perception', 'actucore', 'driver'];
 
 async function checkForUpdate() {
   try {

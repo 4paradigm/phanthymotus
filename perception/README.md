@@ -72,6 +72,123 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 |-----------|---------|-------|
 | `vad_threshold` | `0.5` | Speech probability threshold (0–1). Raise to `0.7`–`0.85` in noisy environments (e.g. robot motor noise). |
 | `vad_silence_ms` | `400` | Silence duration (ms) required before an utterance is considered complete. |
+| `vad_pre_roll_ms` | `500` | Audio retained from *before* the VAD tripped. Recovers clipped word onsets — without it the first syllable is often missing, which costs wake-word recall. |
+
+---
+
+## Plugin Concurrency
+
+**`dispatch()` is not single-threaded.** `main.py` serves MCP over
+`ThreadingHTTPServer`, so every `tools/call` runs on its own thread. `start`,
+`stop`, `config`, and `speak` on the *same* plugin can genuinely run at once —
+the canvas does exactly this (config → start, then stop, then config → start).
+
+This has already caused a production incident, so the rules below are not
+theoretical.
+
+### The failure mode
+
+Any plugin that keeps per-instance state in a dict is exposed to this shape:
+
+```python
+# ❌ WRONG — check-then-act with no lock
+node_key = instance_id or input_topic
+if node_key not in self._nodes:          # ← two threads both pass here
+    node = _ASRNode(...)
+    self._executor.add_node(node)
+    self._nodes[node_key] = node         # ← only the last one survives
+return self._nodes[node_key].start()
+```
+
+Both threads build a node with the *same* ROS node name, both add it to the
+executor, and the dict keeps only the second. The first is now an **orphan**: its
+subscription, its VAD subprocess, and its transcription thread are all still
+running and still publishing to the same output topic, but it is not in
+`self._nodes`, so `stop` can never reach it. It survives until the process exits.
+
+Observable symptoms: every utterance recognised and published twice, duplicate
+files in `/models/vad_segments` with byte-identical content, an extra
+`vad_worker` child process that `stop` does not reap, and this from rclpy:
+
+```
+Publisher already registered for provided node name. If this is due to multiple
+nodes with the same name then all logs for that logger name will go out over the
+existing publisher.
+```
+
+### The rules
+
+**1. Make the dict access atomic.** One `threading.RLock` per plugin, guarding
+every read-modify-write of the state dict:
+
+```python
+# ✅ CORRECT — atomic get-or-create
+with self._nodes_lock:
+    node = self._nodes.get(node_key)
+    if node is None:
+        node = _ASRNode(...)
+        try:
+            self._executor.add_node(node)
+        except Exception:
+            node.destroy_node()          # don't leak a half-registered node
+            raise
+        self._nodes[node_key] = node
+    else:
+        self._sync_cfg(node)
+```
+
+**2. Never hold that lock across `node.start()`, `node.stop()`, or a model
+load.** `_ASRNode.start()` blocks for up to 15 s waiting for the first audio
+chunk. If `stop` is queued behind the lock for those 15 s, it cannot set the
+cancellation flag in time, `start` sails through to `running`, and you are left
+with a pipeline nobody asked for. Register the node inside the lock, then release
+it and call `start()` outside.
+
+**3. Register the node *before* starting it.** That is what lets a concurrent
+`stop` find it and cancel the in-flight start. Loading a model or otherwise
+blocking *before* the node is in the dict means `stop` finds nothing, returns
+`{"state": "idle"}`, and silently no-ops — while the start it was meant to cancel
+completes anyway.
+
+**4. `stop` signals first, locks second.** Give the node a non-blocking
+`request_stop()` that sets its cancellation events, call that before taking any
+lock, and only then tear down:
+
+```python
+def stop(self) -> dict:
+    self.request_stop()                  # non-blocking; unblocks an in-flight start
+    with self._lifecycle_lock:
+        self._teardown()
+        self.state = "idle"
+        return {"state": "idle"}
+```
+
+**5. Guard the node object too, and treat "starting" as taken.** A per-node
+`RLock` plus `if self.state in ("running", "starting")` — otherwise two threads
+that resolve to the *same* node object can both enter `_start_inner()` and build
+two subscriptions and two subprocesses on one node.
+
+**6. `destroy_node()`, not just `remove_node()`.** `remove_node` detaches the
+node from the executor; it does not release the rclpy node, its publishers, or
+its node name. Skip it and every start/stop cycle leaks a topic endpoint, and a
+later start on the same key collides with the still-registered ghost:
+
+```python
+def _dispose_node(self, node, key=""):
+    node.stop()
+    self._executor.remove_node(node)
+    node.destroy_node()                  # ← required
+```
+
+**7. Snapshot before iterating.** `info` is a heartbeat probe called constantly.
+Iterating the live dict can raise `RuntimeError: dictionary changed size during
+iteration` in the middle of a start. Copy under the lock, then iterate the copy.
+
+### Where this applies
+
+Every MCP server in the project uses `ThreadingHTTPServer` — `perception/main.py`
+and each robot driver's `main.py`. Any plugin holding a `self._nodes` /
+`self._instances` / `self._streams` dict needs the treatment above.
 
 ---
 

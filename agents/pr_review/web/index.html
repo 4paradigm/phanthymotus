@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PR Review Agent</title>
+  <!-- Inline SVG favicon: avoids a 404 without shipping a binary asset. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='11' fill='%23C4673A'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <!-- display=swap, and the CSS falls back to system fonts, so a slow or
+       blocked font CDN never blocks rendering. -->
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-brand">
+    <span class="brand-mark"></span>
+    <span class="brand-name">PR Review Agent</span>
+  </div>
+  <nav class="tab-bar" id="tab-bar">
+    <button class="tab-btn active" data-tab="overview">Overview</button>
+    <button class="tab-btn" data-tab="history">History</button>
+  </nav>
+  <div class="topbar-right">
+    <span class="conn-state" id="conn-state">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span id="conn-text">connecting</span>
+    </span>
+    <button class="btn-ghost btn-sm" id="btn-refresh">Refresh</button>
+  </div>
+</header>
+
+<main class="content">
+
+  <!-- ── Overview ─────────────────────────────────────────────────────────── -->
+  <section class="tab-panel active" id="panel-overview">
+    <div class="stat-grid" id="stat-grid"></div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">In flight</h2>
+        <span class="card-meta" id="active-meta"></span>
+      </div>
+      <div class="card-body" id="active-body"></div>
+    </div>
+
+    <div class="two-col">
+      <div class="card">
+        <div class="card-header"><h2 class="card-title">Poller</h2></div>
+        <div class="card-body" id="poller-body"></div>
+      </div>
+      <div class="card">
+        <div class="card-header"><h2 class="card-title">Configuration</h2></div>
+        <div class="card-body" id="config-body"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── History ──────────────────────────────────────────────────────────── -->
+  <section class="tab-panel" id="panel-history">
+    <div class="filter-bar">
+      <label class="filter-field">
+        <span>Status</span>
+        <select id="filter-status">
+          <option value="">All</option>
+          <option value="queued">Queued</option>
+          <option value="running">Running</option>
+          <option value="retrying">Retrying</option>
+          <option value="build_success">Build success</option>
+          <option value="build_failed">Build failed</option>
+          <option value="review_done">Review done</option>
+          <option value="timeout">Timeout</option>
+          <option value="error">Error</option>
+          <option value="cancelled">Cancelled</option>
+        </select>
+      </label>
+      <label class="filter-field">
+        <span>Repo</span>
+        <select id="filter-repo"><option value="">All</option></select>
+      </label>
+      <span class="filter-spacer"></span>
+      <span class="card-meta" id="history-meta"></span>
+    </div>
+
+    <div class="card">
+      <div class="card-body no-pad" id="history-body"></div>
+    </div>
+
+    <div class="pager" id="pager"></div>
+  </section>
+
+  <!-- ── Job detail ───────────────────────────────────────────────────────── -->
+  <section class="tab-panel" id="panel-detail">
+    <button class="btn-ghost btn-sm back-btn" id="btn-back">&larr; Back to history</button>
+    <div id="detail-body"></div>
+  </section>
+
+</main>
+
+<script type="module" src="/js/app.js?v=1"></script>
+</body>
+</html>

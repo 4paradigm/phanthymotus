@@ -91,38 +91,6 @@ export async function showNodeDetail(mcp) {
   const topicOut    = (mcp.topic_out || []).map(t => t.topic).filter(Boolean);
   const topicIn     = (mcp.topic_in  || []).map(t => t.topic).filter(Boolean);
 
-  // For inspection nodes: fetch registered topics from /api/topics
-  let inspectionSection = '';
-  if (mcp.category === 'inspection') {
-    try {
-      const res  = await fetch('/api/topics');
-      const json = await res.json();
-      const items = json.data || [];
-      const rows = items.map(t => {
-        const statusDot = t.status === 'active' ? '🟢' : t.status === 'online' ? '🟡' : '⚫';
-        return `<div class="insp-topic-row">
-          <span class="insp-topic-status">${statusDot}</span>
-          <span class="insp-topic-path" title="${t.topic}">${t.topic}</span>
-          <span class="insp-topic-fmt">${t.format || ''}</span>
-          <span class="insp-topic-src">${t.mcp_id || ''}</span>
-        </div>`;
-      }).join('');
-
-      inspectionSection = `
-        <div class="node-info-row" style="align-items:flex-start;flex-direction:column;gap:4px">
-          <span class="node-info-label">工作机制</span>
-          <span class="node-info-value" style="color:var(--text-dim);font-size:0.78rem;line-height:1.5">
-            订阅驱动注册的 ROS2 DDS topic，通过<br>
-            <code style="background:var(--bg2);padding:1px 4px;border-radius:3px;font-size:0.75rem">WS /ws/bus/{topic}</code> 实时推送数据流
-          </span>
-        </div>
-        <div class="node-info-row" style="align-items:flex-start;flex-direction:column;gap:6px">
-          <span class="node-info-label">已注册 Topics（${items.length}）</span>
-          ${items.length ? `<div class="insp-topic-list">${rows}</div>` : `<span class="node-info-value" style="color:var(--text-dim)">暂无 — 驱动 ping 成功后自动注册</span>`}
-        </div>`;
-    } catch { /* silent */ }
-  }
-
   body.innerHTML = `
     <div class="node-info">
       <div class="node-info-row">
@@ -147,7 +115,6 @@ export async function showNodeDetail(mcp) {
         <span class="node-info-label">输入 topic</span>
         <span class="node-info-value">${topicIn.join('<br>')}</span>
       </div>` : ''}
-      ${inspectionSection}
       ${tools.length ? `
       <div class="node-info-tools">
         <div class="node-info-label" style="margin-bottom:6px">工具</div>

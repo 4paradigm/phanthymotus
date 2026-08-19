@@ -1,0 +1,20 @@
+actucore:
+  image: __IMAGE__
+  container_name: embodied-actucore
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/embodied/models:/models
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

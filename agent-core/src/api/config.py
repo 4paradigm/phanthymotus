@@ -42,10 +42,6 @@ class ASRConfig(BaseModel):
     language:   str = 'zh-CN'
 
 
-class InspectorConfig(BaseModel):
-    url: str = ''
-
-
 class SearchConfig(BaseModel):
     type:     str = 'none'   # 'none' | 'baidu_search'
     base_url: str = ''
@@ -57,7 +53,6 @@ class ServicesConfig(BaseModel):
     tts:       TTSConfig       = TTSConfig()
     vad:       VADConfig       = VADConfig()
     asr:       ASRConfig       = ASRConfig()
-    inspector: InspectorConfig = InspectorConfig()
     search:    SearchConfig    = SearchConfig()
 
 
@@ -416,13 +411,6 @@ async def set_auto_start(req: AutoStartRequest):
     return {'ok': True}
 
 
-@router.get('/services')
-async def config_services():
-    """Return just the services section (used by browser to resolve inspector host)."""
-    services = config.main.get('services', {})
-    return {'code': 200, 'data': {'inspector': services.get('inspector', {})}}
-
-
 @router.get('')
 async def config_get():
     services = config.main.get('services', {})
@@ -450,22 +438,6 @@ async def config_get():
     if asr.get('key'):
         asr['key'] = '****'
 
-    # Auto-detect inspector URL from running inspection container
-    inspector = dict(services.get('inspector', {}))
-    from api.drivers import _load_manifest, _get_status_sync
-    loop = __import__('asyncio').get_event_loop()
-    try:
-        manifest = _load_manifest()
-        insp_driver = next((d for d in manifest if d.get('category') == 'inspection'), None)
-        if insp_driver:
-            status = await loop.run_in_executor(None, _get_status_sync, insp_driver['id'])
-            if status.get('status') == 'running' and insp_driver.get('port'):
-                inspector = {'url': f'http://localhost:{insp_driver["port"]}', 'auto': True}
-            else:
-                inspector = {'url': '', 'auto': False}
-    except Exception:
-        pass
-
     tts = dict(services.get('tts', {}))
     if tts.get('api_key'):
         tts['api_key'] = '****'
@@ -484,7 +456,6 @@ async def config_get():
                 'tts':       tts,
                 'vad':       dict(services.get('vad', {})),
                 'asr':       asr,
-                'inspector': inspector,
                 'search':    search,
             },
             'mcp_list': mcp_list,
@@ -563,10 +534,6 @@ async def config_save(req: ConfigSaveRequest):
         for m in req.mcp_list
     ]
 
-    # Inspector — only persist if non-empty (URL is auto-detected from running container)
-    if req.services.inspector.url:
-        services['inspector'] = {'url': req.services.inspector.url}
-
     config.main['services'] = services
 
     # Search config → desktop_tools section
@@ -601,27 +568,6 @@ def _normalize_llm_url(url: str) -> str:
     if not parsed.path or parsed.path == '/':
         url = url + '/v1'
     return url
-
-
-@router.get('/inspector/topics')
-async def inspector_topics():
-    from api.mcp_manage import _get_inspector_url
-    url = _get_inspector_url()
-    if not url:
-        return {'code': 200, 'data': {'running': False, 'topics': []}}
-    try:
-        timeout = aiohttp.ClientTimeout(total=3)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url.rstrip('/') + '/api/topics') as resp:
-                json_data = await resp.json()
-                return {'code': 200, 'data': {'running': True, 'topics': json_data.get('data', [])}}
-    except Exception as e:
-        err_str = str(e)
-        if 'Connect call failed' in err_str or 'Cannot connect' in err_str:
-            error = '连接失败（服务未运行）'
-        else:
-            error = err_str
-        return {'code': 200, 'data': {'running': False, 'topics': [], 'error': error}}
 
 
 @router.post('/test')

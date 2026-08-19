@@ -15,10 +15,6 @@ router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
 
 
-def _get_inspector_url() -> str:
-    return ''  # Inspector is now embedded in agent-core; no external URL needed
-
-
 async def _notify_inspector(mcp_id: str, topics: list) -> None:
     """Register topics with the embedded inspection module (process-internal call)."""
     from api.inspection import register_topic_internal

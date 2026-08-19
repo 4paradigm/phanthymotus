@@ -1,0 +1,65 @@
+services:
+  pr-review-agent:
+    build:
+      context: ../../
+      dockerfile: agents/pr_review/Dockerfile
+      args:
+        # Tencent Cloud mirrors by default. Override in .env for a host
+        # outside the Tencent VPC.
+        MIRROR_BASE: ${MIRROR_BASE:-mirror.ccs.tencentyun.com}
+        PYPI_MIRROR: ${PYPI_MIRROR:-https://mirrors.tencentyun.com/pypi/simple/}
+        APT_MIRROR: ${APT_MIRROR:-mirrors.tencentyun.com}
+        DOCKER_REPO: ${DOCKER_REPO:-https://mirrors.tencentyun.com/docker-ce/linux/debian}
+    image: phanthy-pr-review:latest
+    container_name: phanthy-pr-review
+    restart: unless-stopped
+
+    # Both sides of the mapping use ${PORT}. The container side is what uvicorn
+    # actually binds, so hardcoding it made PORT in .env silently ineffective:
+    # the app would listen on the configured port while compose published a
+    # different one, and nothing was reachable — not even from the host.
+    #
+    # BIND_ADDR defaults to 0.0.0.0 so the dashboard is reachable from the LAN.
+    # The dashboard has NO authentication, so on a shared or internet-facing
+    # host set BIND_ADDR=127.0.0.1 and reach it over an SSH tunnel instead.
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:${PORT:-25000}:${PORT:-25000}"
+
+    volumes:
+      # Docker socket — the agent shells out to the repos' own build scripts,
+      # which invoke `docker buildx`. This grants root-equivalent access to the
+      # host, so keep this container's env file readable only by root.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Job history (jobs.db), full build logs, bare clones, and the poller
+      # watermarks. Keeping this across restarts is what makes history durable,
+      # fetches incremental, and stops the poller replaying old comments.
+      #
+      # A bind mount rather than a named volume, matching how agent-core mounts
+      # /opt/phanthy-motus/data: the path is discoverable, backups are a plain
+      # tar, and `docker compose down -v` cannot take the history with it.
+      - ${DATA_HOST_DIR:-/opt/phanthy-motus/pr-review}:/data/repos
+      # SSH key, read-only. Needed because GIT_TRANSPORT defaults to ssh: on
+      # these hosts TCP to github.com:443 completes but the TLS handshake is
+      # dropped by SNI, so git over HTTPS fails every time while SSH works.
+      # Not an authentication requirement — the repos are public — a
+      # reachability one. Set GIT_TRANSPORT=https where 443 actually works.
+      - ${SSH_DIR:-/root/.ssh}:/root/.ssh:ro
+
+    env_file:
+      - .env
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    # On stop, in-flight jobs are told on their PR that the agent restarted, so
+    # a build killed mid-flight does not leave a "Building..." comment that
+    # never resolves. This is the window for those API calls — not enough to
+    # finish a build, which is deliberate: waiting out a 30 min build on every
+    # restart would be worse than asking the author to retrigger.
+    stop_grace_period: 30s
+
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"

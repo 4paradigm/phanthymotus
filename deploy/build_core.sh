@@ -60,8 +60,13 @@ fi
 
 # ── 注册到 resource-center（可选）────────────────────────────────────────────
 if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
+    # Ask only if there is a terminal to ask on; otherwise sync (the key being
+    # set is the opt-in). Test by opening /dev/tty, not with `[ -e ]`: the device
+    # node exists in any container, but opening it without a controlling
+    # terminal fails with ENXIO — which under `set -e` aborted the whole script
+    # here, reporting a successful build as failed.
     SYNC_CONFIRM="y"
-    if [ -t 0 ] || [ -e /dev/tty ]; then
+    if { : >/dev/tty; } 2>/dev/null; then
         printf "Sync to resource-center (%s)? [Y/n]: " "${RESOURCE_CENTER_URL}" >/dev/tty
         read -r SYNC_CONFIRM </dev/tty || SYNC_CONFIRM="y"
     fi

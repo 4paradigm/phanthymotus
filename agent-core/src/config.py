@@ -40,7 +40,6 @@ _DB_DEFAULTS = {
         'asr': {'provider': 'openai', 'url': '', 'key': '', 'model': '',
                 'app_key': '', 'ak_id': '', 'ak_secret': '', 'api_secret': '', 'language': 'zh-CN'},
         'mcp': [],
-        'inspector': {'url': 'http://localhost:15671'},
         'resource_center': {'url': 'https://motus.phanthy.com'},
     },
     'client': {

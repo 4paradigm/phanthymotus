@@ -1,0 +1,371 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PhanthyMotus architecture diagram — editable source.
+
+  Rendered from the Resource Center homepage component
+  (components/ArchitectureDiagram.tsx), a hand-laid-out 1200x704 SVG.
+
+  The HARDWARE row loads 20 vendor logos over HTTP from an external
+  bucket. GitHub blocks external references inside SVG, so this file is
+  the source only — README.md / README_zh.md embed docs/images/architecture.png.
+  After editing this file, re-export that PNG (2x, white background).
+-->
+<svg viewBox="0 0 1200 704" role="img" aria-label="PhanthyMotus architecture: hardware, sensor and actuator drivers, perception stack, ActuCore, agent loop and web dashboard" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="704">
+<defs>
+<marker id="head-sense" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M 0 0 L 10 5 L 0 10 z" fill="#6B7A8D">
+</path>
+</marker>
+<marker id="head-act" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M 0 0 L 10 5 L 0 10 z" fill="#C4673A">
+</path>
+</marker>
+<marker id="head-bus" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M 0 0 L 10 5 L 0 10 z" fill="#B07A3C">
+</path>
+</marker>
+</defs>
+<text x="96" y="85" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.08em">AGENT CORE</text>
+<text x="96" y="262" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.08em">L2</text>
+<text x="96" y="434" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.08em">DRIVERS · L1</text>
+<text x="96" y="619" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.08em">HARDWARE</text>
+<g>
+<path d="M 314 546 L 314 490" fill="none" stroke="#6B7A8D" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-sense)">
+</path>
+<text x="326" y="524" fill="#78716C" text-anchor="start" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">SDK / DDS</text>
+</g>
+<g>
+<path d="M 314 370 L 314 314" fill="none" stroke="#6B7A8D" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-sense)">
+</path>
+<text x="326" y="348" fill="#78716C" text-anchor="start" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">raw streams</text>
+</g>
+<g>
+<path d="M 314 202 L 314 146" fill="none" stroke="#6B7A8D" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-sense)">
+</path>
+<text x="326" y="180" fill="#78716C" text-anchor="start" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">semantics / captions</text>
+</g>
+<g>
+<path d="M 520 410 L 540 410 L 540 146" fill="none" stroke="#6B7A8D" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6 4" marker-end="url(#head-sense)">
+</path>
+</g>
+<text x="532" y="286" fill="#78716C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" transform="rotate(-90 532 286)">sensor tools</text>
+<g>
+<path d="M 798 146 L 798 202" fill="none" stroke="#C4673A" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-act)">
+</path>
+<text x="810" y="180" fill="#78716C" text-anchor="start" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">intent / goal</text>
+</g>
+<g>
+<path d="M 798 314 L 798 370" fill="none" stroke="#C4673A" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-act)">
+</path>
+<text x="810" y="348" fill="#78716C" text-anchor="start" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">motion cmd</text>
+</g>
+<g>
+<path d="M 798 490 L 798 546" fill="none" stroke="#C4673A" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-act)">
+</path>
+<text x="810" y="524" fill="#78716C" text-anchor="start" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">SDK / DDS</text>
+</g>
+<g>
+<path d="M 572 146 L 572 434 L 592 434" fill="none" stroke="#C4673A" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6 4" marker-end="url(#head-act)">
+</path>
+</g>
+<text x="582" y="286" fill="#78716C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" transform="rotate(-90 582 286)">mcp json-rpc</text>
+<g>
+<path d="M 1004 610 L 1020 610 L 1020 320 L 1036 320" fill="none" stroke="#B07A3C" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6 4" marker-end="url(#head-bus)">
+</path>
+</g>
+<path d="M 1004 434 L 1020 434" fill="none" stroke="#B07A3C" stroke-width="2" stroke-dasharray="6 4">
+</path>
+<text x="1014" y="520" fill="#78716C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" transform="rotate(-90 1014 520)">dds · all topics</text>
+<g>
+<path d="M 1004 72 L 1036 72" fill="none" stroke="#B07A3C" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-bus)">
+</path>
+</g>
+<g>
+<rect x="108" y="16" width="896" height="130" rx="10" fill="#EEF4F1" stroke="#5C7A6A" stroke-width="2">
+</rect>
+<text x="122" y="40" fill="#425A4B" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">AGENT LOOP</text>
+<text x="122" y="54" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">FastAPI · ros2_bridge.py · port 15678</text>
+<g>
+<rect x="122" y="66" width="68" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="156" y="79.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Collector</text>
+</g>
+<g>
+<rect x="196" y="66" width="134" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="263" y="79.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Layered Prompt L1–L4</text>
+</g>
+<g>
+<rect x="336" y="66" width="92" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="382" y="79.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Tool Dispatch</text>
+</g>
+<g>
+<rect x="434" y="66" width="80" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="474" y="79.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">ACP Barrier</text>
+</g>
+<g>
+<rect x="520" y="66" width="122" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="581" y="79.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">History Compaction</text>
+</g>
+<g>
+<rect x="648" y="66" width="134" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="715" y="79.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Steering / Interrupt</text>
+</g>
+<g>
+<rect x="788" y="66" width="74" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="825" y="79.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Task Store</text>
+</g>
+<g>
+<rect x="868" y="66" width="110" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="923" y="79.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Subagent Manager</text>
+</g>
+<g>
+<rect x="122" y="91" width="50" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="147" y="104.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Skills</text>
+</g>
+<g>
+<rect x="178" y="91" width="50" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="203" y="104.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Memory</text>
+</g>
+<text x="237" y="105" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">…</text>
+</g>
+<g>
+<rect x="108" y="202" width="412" height="112" rx="10" fill="#EFF1F5" stroke="#6B7A8D" stroke-width="2">
+</rect>
+<text x="122" y="226" fill="#4F5C6B" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">PERCEPTION</text>
+<text x="122" y="240" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">ports 15720 / 15721</text>
+<g>
+<rect x="122" y="252" width="32" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#6B7A8D" stroke-opacity="0.45">
+</rect>
+<text x="138" y="265.5" fill="#4F5C6B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">VLM</text>
+</g>
+<g>
+<rect x="160" y="252" width="32" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#6B7A8D" stroke-opacity="0.45">
+</rect>
+<text x="176" y="265.5" fill="#4F5C6B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">ASR</text>
+</g>
+<g>
+<rect x="198" y="252" width="32" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#6B7A8D" stroke-opacity="0.45">
+</rect>
+<text x="214" y="265.5" fill="#4F5C6B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">TTS</text>
+</g>
+<g>
+<rect x="236" y="252" width="134" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#6B7A8D" stroke-opacity="0.45">
+</rect>
+<text x="303" y="265.5" fill="#4F5C6B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Vision Understanding</text>
+</g>
+<g>
+<rect x="376" y="252" width="110" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#6B7A8D" stroke-opacity="0.45">
+</rect>
+<text x="431" y="265.5" fill="#4F5C6B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Face Recognition</text>
+</g>
+<g>
+<rect x="122" y="277" width="38" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#6B7A8D" stroke-opacity="0.45">
+</rect>
+<text x="141" y="290.5" fill="#4F5C6B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">SLAM</text>
+</g>
+<text x="169" y="291" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">…</text>
+</g>
+<g>
+<rect x="592" y="202" width="412" height="112" rx="10" fill="#F4EFF7" stroke="#8A6BA0" stroke-width="2">
+</rect>
+<text x="606" y="226" fill="#6B4E80" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">ACTUCORE</text>
+<text x="606" y="240" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">execution models</text>
+<g>
+<rect x="606" y="252" width="32" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#8A6BA0" stroke-opacity="0.45">
+</rect>
+<text x="622" y="265.5" fill="#6B4E80" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">VLA</text>
+</g>
+<g>
+<rect x="644" y="252" width="38" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#8A6BA0" stroke-opacity="0.45">
+</rect>
+<text x="663" y="265.5" fill="#6B4E80" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">SLAM</text>
+</g>
+<g>
+<rect x="688" y="252" width="74" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#8A6BA0" stroke-opacity="0.45">
+</rect>
+<text x="725" y="265.5" fill="#6B4E80" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Navigation</text>
+</g>
+<g>
+<rect x="768" y="252" width="86" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#8A6BA0" stroke-opacity="0.45">
+</rect>
+<text x="811" y="265.5" fill="#6B4E80" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Grasp Policy</text>
+</g>
+<g>
+<rect x="860" y="252" width="74" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#8A6BA0" stroke-opacity="0.45">
+</rect>
+<text x="897" y="265.5" fill="#6B4E80" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Locomotion</text>
+</g>
+<g>
+<rect x="606" y="277" width="104" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#8A6BA0" stroke-opacity="0.45">
+</rect>
+<text x="658" y="290.5" fill="#6B4E80" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Whole-Body Ctrl</text>
+</g>
+<text x="719" y="291" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">…</text>
+</g>
+<g>
+<rect x="108" y="370" width="412" height="120" rx="10" fill="#FDF0E8" stroke="#C4673A" stroke-width="2">
+</rect>
+<text x="122" y="394" fill="#A0502C" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">DRIVER · SENSOR</text>
+<text x="122" y="408" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">MCP HTTP · 15701 / 15710</text>
+<g>
+<rect x="122" y="420" width="44" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="144" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Video</text>
+</g>
+<g>
+<rect x="172" y="420" width="44" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="194" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Audio</text>
+</g>
+<g>
+<rect x="222" y="420" width="44" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="244" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Lidar</text>
+</g>
+<g>
+<rect x="272" y="420" width="50" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="297" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Joints</text>
+</g>
+<g>
+<rect x="328" y="420" width="56" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="356" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Battery</text>
+</g>
+<g>
+<rect x="390" y="420" width="92" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="436" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Motion Status</text>
+</g>
+<g>
+<rect x="122" y="445" width="98" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="171" y="458.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Running Status</text>
+</g>
+<text x="229" y="459" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">…</text>
+</g>
+<g>
+<rect x="592" y="370" width="412" height="120" rx="10" fill="#FDF0E8" stroke="#C4673A" stroke-width="2">
+</rect>
+<text x="606" y="394" fill="#A0502C" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">DRIVER · ACTUATOR</text>
+<text x="606" y="408" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">MCP HTTP · 15701 / 15710</text>
+<g>
+<rect x="606" y="420" width="50" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="631" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Motion</text>
+</g>
+<g>
+<rect x="662" y="420" width="38" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="681" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Hand</text>
+</g>
+<g>
+<rect x="706" y="420" width="38" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="725" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Head</text>
+</g>
+<g>
+<rect x="750" y="420" width="44" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="772" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Waist</text>
+</g>
+<g>
+<rect x="800" y="420" width="56" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="828" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Speaker</text>
+</g>
+<g>
+<rect x="862" y="420" width="32" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#C4673A" stroke-opacity="0.45">
+</rect>
+<text x="878" y="433.5" fill="#A0502C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">LED</text>
+</g>
+<text x="903" y="434" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">…</text>
+</g>
+<rect x="108" y="546" width="896" height="138" rx="10" fill="#FFFFFF" stroke="#C9BFA9" stroke-width="2">
+</rect>
+<text x="122" y="568" fill="#57534E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">HARDWARE</text>
+<g>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/unitree.png" x="126" y="576" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/dji.png" x="248.85714285714286" y="576" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/engineai.png" x="371.7142857142857" y="576" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/ubtech.png" x="494.57142857142856" y="576" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/deep-robotics.png" x="617.4285714285714" y="576" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/robotera.png" x="740.2857142857143" y="576" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/x-humanoid.png" x="863.1428571428571" y="576" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/noetix-robotics.png" x="126" y="614" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/pndbotics.png" x="248.85714285714286" y="614" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/realman-robotics.png" x="371.7142857142857" y="614" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/qysea.png" x="494.57142857142856" y="614" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/brainco.png" x="617.4285714285714" y="614" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/leju-robot.png" x="740.2857142857143" y="614" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/rokae.png" x="863.1428571428571" y="614" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/booster-robotics.png" x="126" y="652" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/titan-robotics.png" x="248.85714285714286" y="652" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/limx-dynamics.png" x="371.7142857142857" y="652" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/agilex-robotics.png" x="494.57142857142856" y="652" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/unix-ai.svg" x="617.4285714285714" y="652" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+<image href="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/resource-center/uploads/ecosystem/pnp-robotics.svg" x="740.2857142857143" y="652" width="110.85714285714286" height="30" preserveAspectRatio="xMidYMid meet" opacity="0.72">
+</image>
+</g>
+<g>
+<rect x="1036" y="16" width="156" height="668" rx="10" fill="#FDF5E6" stroke="#B07A3C" stroke-width="2">
+</rect>
+<text x="1050" y="40" fill="#8C5F2E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">WEB</text>
+</g>
+<text x="1050" y="56" fill="#8C5F2E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">DASHBOARD</text>
+<g>
+<rect x="1050" y="82" width="128" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#B07A3C" stroke-opacity="0.45">
+</rect>
+<text x="1114" y="95.5" fill="#8C5F2E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Canvas</text>
+</g>
+<g>
+<rect x="1050" y="107" width="128" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#B07A3C" stroke-opacity="0.45">
+</rect>
+<text x="1114" y="120.5" fill="#8C5F2E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Data Bus</text>
+</g>
+<g>
+<rect x="1050" y="132" width="128" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#B07A3C" stroke-opacity="0.45">
+</rect>
+<text x="1114" y="145.5" fill="#8C5F2E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Activity</text>
+</g>
+<g>
+<rect x="1050" y="157" width="128" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#B07A3C" stroke-opacity="0.45">
+</rect>
+<text x="1114" y="170.5" fill="#8C5F2E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Config</text>
+</g>
+<g>
+<rect x="1050" y="182" width="128" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#B07A3C" stroke-opacity="0.45">
+</rect>
+<text x="1114" y="195.5" fill="#8C5F2E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Inspection</text>
+</g>
+<text x="1114" y="650" fill="#A8A29E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">/ws/motus</text>
+<text x="1114" y="666" fill="#A8A29E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">/ws/bus/<!-- -->{topic}</text>
+</svg>
