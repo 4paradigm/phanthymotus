@@ -40,7 +40,7 @@ from .execution_protocol import (
     Velocity,
     apply_g1_motion_limits,
     build_velocity_proposal,
-    proposal_context_is_current,
+    proposal_context_is_publishable,
     shape_terminal_approach,
 )
 from .costmap_validation import (
@@ -591,7 +591,7 @@ class PlannerCommandNode(Node):
                     max_forward_mps=forward_speed_limit,
                 )
             with self._lock:
-                if not proposal_context_is_current(
+                if not proposal_context_is_publishable(
                     self._active,
                     nav_id=nav_id,
                     attempt=attempt,
@@ -625,7 +625,7 @@ class PlannerCommandNode(Node):
                 f"unsafe Nav2 shadow velocity rejected: {exc.code}: {exc}"
             )
             with self._lock:
-                if proposal_context_is_current(
+                if proposal_context_is_publishable(
                     self._active,
                     nav_id=nav_id,
                     attempt=attempt,
@@ -1186,7 +1186,7 @@ class PlannerCommandNode(Node):
         nav_id = candidate.get("nav_id")
         attempt = candidate.get("attempt")
         status = candidate.get("navigation_status")
-        if not proposal_context_is_current(
+        if not proposal_context_is_publishable(
             active,
             nav_id=nav_id,
             attempt=attempt,
@@ -1211,7 +1211,7 @@ class PlannerCommandNode(Node):
                 reason = blocker
 
         with self._lock:
-            if not proposal_context_is_current(
+            if not proposal_context_is_publishable(
                 self._active,
                 nav_id=nav_id,
                 attempt=attempt,

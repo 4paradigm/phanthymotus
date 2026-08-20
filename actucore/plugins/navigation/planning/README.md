@@ -81,12 +81,13 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 
 | port | topic | type / QoS | 语义 |
 | --- | --- | --- | --- |
-| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.velocity_proposal.v1`，固定 5 Hz、只保留最新值，`base_link`，TTL 最大 250 ms |
+| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.velocity_proposal.v1`，导航活动期间固定 5 Hz、只保留最新值，`base_link`，TTL 最大 250 ms |
 | `plan` | `/plan` | `nav_msgs/msg/Path`; `RELIABLE + KEEP_LAST(1)` | Nav2 原生 `map` 全局路径，Canvas 显示起点、终点、路径长度和折线 |
 | `costmap` | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | Nav2 实时二维全局代价地图，作为卡片默认预览，叠加路径、位姿、终点和膨胀障碍 |
 
 速度提案至少包含 `nav_id`、递增 `sequence`、`issued_at_unix_ms`、
-`ttl_ms`、`nav_status` 和 `velocity{x,y,yaw}`。终态必须发布零速。
+`ttl_ms`、`nav_status` 和 `velocity{x,y,yaw}`。终态立即发布一次零速，随后停止该
+`nav_id` 的周期 proposal；终态回执仍保留供查询和幂等重放。
 卡片始终为 proposal-only；`shadow_only=true` 不代表 Driver 一定执行。
 
 速度限制：

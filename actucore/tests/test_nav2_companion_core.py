@@ -34,6 +34,7 @@ from g1_nav2.execution_protocol import (  # noqa: E402
     build_velocity_proposal,
     limit_forward_velocity,
     proposal_context_is_current,
+    proposal_context_is_publishable,
     shape_terminal_approach,
 )
 from g1_nav2.readiness import (  # noqa: E402
@@ -150,6 +151,31 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 self.assertFalse(
                     proposal_context_is_current(
                         active, nav_id=nav_id, attempt=attempt, status=status
+                    )
+                )
+
+    def test_terminal_context_cannot_keep_periodic_proposals_alive(self) -> None:
+        navigating = {"nav_id": "nav-1", "attempt": 2, "status": "navigating"}
+        self.assertTrue(
+            proposal_context_is_publishable(
+                navigating, nav_id="nav-1", attempt=2, status="navigating"
+            )
+        )
+
+        for status in (
+            "arrived",
+            "cancelled",
+            "stopped",
+            "error",
+            "aborted",
+            "rejected",
+            "paused",
+        ):
+            with self.subTest(status=status):
+                active = {"nav_id": "nav-1", "attempt": 2, "status": status}
+                self.assertFalse(
+                    proposal_context_is_publishable(
+                        active, nav_id="nav-1", attempt=2, status=status
                     )
                 )
 
@@ -619,7 +645,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("smoothing_frequency: 5.0", params)
         self.assertIn('self.declare_parameter("proposal_frequency_hz", 5.0)', command)
         self.assertIn("depth=1", command)
-        self.assertIn("proposal_context_is_current", command)
+        self.assertIn("proposal_context_is_publishable", command)
         self.assertIn('payload.get("velocity_limits")', command)
         self.assertIn("goal.pose.header.frame_id = self._global_frame", command)
         send_goal = command.split("    def _send_active_goal", 1)[1].split(

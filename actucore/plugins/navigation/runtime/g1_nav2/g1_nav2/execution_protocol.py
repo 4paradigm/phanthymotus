@@ -33,6 +33,7 @@ _TERMINAL_STATUSES = {
     "aborted",
     "rejected",
 }
+_PROPOSAL_PRODUCING_STATUSES = {"starting", "navigating"}
 
 
 class ProtocolError(ValueError):
@@ -139,6 +140,23 @@ def proposal_context_is_current(
         and active.get("nav_id") == nav_id
         and active.get("attempt") == attempt
         and active.get("status") == status
+    )
+
+
+def proposal_context_is_publishable(
+    active: dict | None,
+    *,
+    nav_id: str,
+    attempt: int,
+    status: str,
+) -> bool:
+    """Return whether a current goal still owns periodic motion output."""
+
+    return status in _PROPOSAL_PRODUCING_STATUSES and proposal_context_is_current(
+        active,
+        nav_id=nav_id,
+        attempt=attempt,
+        status=status,
     )
 
 
@@ -512,5 +530,6 @@ __all__ = [
     "build_velocity_proposal",
     "limit_forward_velocity",
     "proposal_context_is_current",
+    "proposal_context_is_publishable",
     "shape_terminal_approach",
 ]

@@ -23,7 +23,8 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
   边，不再作为 Canvas 公共连线端口。
 - VLN 命中地点后直接调用同卡片 planner；无论是 Canvas、
   `goal_pose` topic 还是 VLN 入口，planner 都为每个新任务生成独立
-  `nav_id`。
+  `nav_id`。终态到达时只发布一次零速 proposal，不会继续以 5 Hz
+  刷新已结束任务；终态结果本身仍可查询和幂等重放。
 - Nav2 仍只发布 `phanthy.navigation.velocity_proposal.v1`，Driver 继续负责
   物理执行、TTL、急停、二次限幅和停车确认。
 
