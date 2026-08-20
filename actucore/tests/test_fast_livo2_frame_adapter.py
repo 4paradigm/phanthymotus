@@ -1475,6 +1475,37 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
             places=6,
         )
 
+    def test_relocalization_rejects_best_candidate_on_search_boundary(self) -> None:
+        session = []
+        for index in range(40):
+            session.append((index * 0.15, 0.0, 0.0))
+            session.append((0.0, index * 0.15, 0.0))
+        reference = tuple((x + 0.5, y, z) for x, y, z in session)
+
+        with self.assertRaisesRegex(InvalidFastLivo2Frame, "search boundary"):
+            estimate_planar_relocalization(
+                reference_points=reference,
+                session_points=session,
+                session_base_pose=Pose3(
+                    0.0,
+                    0.0,
+                    0.0,
+                    Quaternion(0.0, 0.0, 0.0, 1.0),
+                ),
+                initial_map_base_pose=Pose3(
+                    0.0,
+                    0.0,
+                    0.0,
+                    Quaternion(0.0, 0.0, 0.0, 1.0),
+                ),
+                search_xy_m=0.5,
+                search_yaw_rad=0.2,
+                min_z=-0.5,
+                max_z=0.5,
+                match_voxel_m=0.1,
+                min_match_ratio=0.5,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

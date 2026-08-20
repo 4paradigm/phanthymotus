@@ -56,7 +56,8 @@ registered cloud。Nav2 readiness 直接检查该 cloud 时间点的
 `map -> base_link` TF；“最新 odom 与最新 cloud”的时间差只作诊断，不再冒充
 配对结果阻塞导航。静态图累计和 1 Hz Canvas/OccupancyGrid 编码不在该发布
 快路径执行；它们使用独立 latest-only 后台任务和锁，因此不会周期性把
-registered cloud 的接收 age 推过 500 ms。
+registered cloud 的接收 age 推过 500 ms。BT 主循环为 20 Hz，仍快于 5 Hz
+局部控制输出，但不会在 Jetson 上用 100 Hz 空转与定位、点云序列化争抢调度。
 
 `goal_pose` 最小样例：
 

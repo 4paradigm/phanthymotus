@@ -126,8 +126,10 @@ Nav2 的全局静态层使用 `/ubuntu/navigation/static_map`，实时动态层�
 `cloud_pack_publish`、`cloud_end_to_end`、`map_view_encode` 和
 `map_view_pose_publish` 分段耗时，`latency_max_ms` 保留本进程最大值；同时发布
 `map_view_cache_age_sec`、`map_view_point_refresh_hz=1` 和
-`map_view_pose_refresh_hz=5`。这些字段用于区分传感器/TF 等待、点云计算、DDS
-发布和 Canvas 编码延迟，不改变 freshness 门禁。
+`map_view_pose_refresh_hz=2`。Canvas 帧最多携带 40,000 点，避免在 G1 上以
+5 Hz 重复序列化近 1 MiB 帧并阻塞 odom/registered cloud；这些字段用于区分
+传感器/TF 等待、点云计算、DDS 发布和 Canvas 编码延迟，不改变 500 ms
+freshness 门禁。
 
 ## Actions
 
@@ -137,6 +139,12 @@ Nav2 的全局静态层使用 `/ubuntu/navigation/static_map`，实时动态层�
 | `stop_mapping`  | 无                                                                                     | 先检查静态证据，再 `SIGINT` 停止算法；分别保存 raw PCD 与 confirmed static PCD 后原子写 session manifest；保存失败可用同一 action 重试 |
 | `load_map`      | `map_name`                                                                            | 先校验新旧 manifest/PCD，再串行替换定位前端，失败时尝试回滚旧图 |
 | `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
+
+重定位只有在匹配率至少为 0.35、且最优候选未贴住 XY/yaw 搜索边界时才提交新的
+`map -> base_link` 对齐；否则明确拒绝并要求扩大搜索范围或修正初始位姿。重复
+重定位提交时会先丢弃旧对齐下生成的实时点和 Canvas 缓存，等待新对齐下的下一帧，
+避免新箭头叠加旧扫描造成显示错位。该对齐同时供 Canvas、TF、costmap 和寻路使用，
+因此拒绝低质量结果是导航安全边界，不只是显示策略。
 
 `map_name` 只允许 `A-Z a-z 0-9 _ . -`，最长 64 字符。停止 Canvas 时若仍在
 建图，卡片会先执行 `stop_mapping` 再释放 ROS backend。直接杀死容器或 ROS

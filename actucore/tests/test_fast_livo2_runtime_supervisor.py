@@ -168,6 +168,78 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertAlmostEqual(adapter._latency_ms["cloud_decode"], 4.0)
         self.assertAlmostEqual(adapter._latency_max_ms["cloud_decode"], 12.0)
 
+    def test_relocalize_discards_live_points_encoded_under_old_alignment(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._mode = "relocalized"
+        adapter._session_name = "office"
+        adapter._latest_session_pose = Pose3(
+            0.0,
+            0.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        adapter._latest_session_points = ((0.0, 0.0, 0.0),) * 40
+        adapter._last_odom_monotonic = time.monotonic()
+        adapter._last_cloud_monotonic = time.monotonic()
+        adapter._source_max_age = 0.5
+        adapter._reference_points = ((0.0, 0.0, 0.0),) * 40
+        adapter._obstacle_min_height = -0.3
+        adapter._obstacle_max_height = 0.3
+        adapter._latest_mapped_points = ((9.0, 9.0, 0.0),)
+        adapter._pending_cloud = object()
+        adapter._last_cloud_pose_skew_sec = 0.01
+        adapter._last_navigation_cloud_monotonic = time.monotonic()
+        adapter._map_view_cache = b"old-cache"
+        adapter._map_view_cache_monotonic = time.monotonic()
+        map_from_session = Pose3(
+            1.0,
+            2.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        map_base_pose = Pose3(
+            3.0,
+            4.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+
+        with mock.patch.object(
+            ADAPTER_MODULE,
+            "estimate_planar_relocalization",
+            return_value=SimpleNamespace(
+                map_from_session=map_from_session,
+                map_base_pose=map_base_pose,
+                match_ratio=0.8,
+                matched_points=40,
+                evaluated_points=40,
+            ),
+        ) as estimate:
+            result = adapter._relocalize(
+                {
+                    "initial_x": 3.0,
+                    "initial_y": 4.0,
+                    "initial_yaw": 0.0,
+                    "search_xy_m": 1.0,
+                    "search_yaw_rad": 0.35,
+                    "_operation_deadline_monotonic": time.monotonic() + 1.0,
+                }
+            )
+
+        self.assertEqual(result["status"], "relocalized")
+        self.assertEqual(adapter._latest_mapped_points, ())
+        self.assertIsNone(adapter._pending_cloud)
+        self.assertIsNone(adapter._last_navigation_cloud_monotonic)
+        self.assertIsNone(adapter._map_view_cache)
+        self.assertIsNone(adapter._map_view_cache_monotonic)
+        self.assertEqual(adapter._map_from_session, map_from_session)
+        estimate.assert_called_once()
+        self.assertEqual(
+            estimate.call_args.kwargs["min_match_ratio"],
+            ADAPTER_MODULE._RELOCALIZATION_MIN_MATCH_RATIO,
+        )
+
     def test_adapter_execute_waits_for_bidirectional_discovery(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
         supervisor._lock = threading.RLock()

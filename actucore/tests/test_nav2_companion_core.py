@@ -654,6 +654,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("xy_goal_tolerance: 0.20", params)
         self.assertIn("yaw_goal_tolerance: 0.50", params)
         self.assertIn("controller_frequency: 5.0", params)
+        self.assertIn("bt_loop_duration: 50", params)
         self.assertIn("smoothing_frequency: 5.0", params)
         self.assertIn('self.declare_parameter("proposal_frequency_hz", 5.0)', command)
         self.assertIn("depth=1", command)

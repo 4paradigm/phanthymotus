@@ -753,7 +753,7 @@ def estimate_planar_relocalization(
     min_z: float,
     max_z: float,
     match_voxel_m: float = 0.20,
-    min_match_ratio: float = 0.20,
+    min_match_ratio: float = 0.35,
     min_points: int = 40,
     max_scan_points: int = 1200,
 ) -> RelocalizationResult:
@@ -886,6 +886,20 @@ def estimate_planar_relocalization(
     if best[0] < min_match_ratio:
         raise InvalidFastLivo2Frame(
             f"scan-to-map match ratio {best[0]:.3f} is below {min_match_ratio:.3f}"
+        )
+    boundary_margin_xy = fine_xy * 0.5
+    boundary_margin_yaw = fine_yaw * 0.5
+    correction_x = abs(best[2] - initial_map_base_pose.x)
+    correction_y = abs(best[3] - initial_map_base_pose.y)
+    correction_yaw = abs(best[4] - initial_yaw)
+    if (
+        correction_x >= search_xy_m - boundary_margin_xy
+        or correction_y >= search_xy_m - boundary_margin_xy
+        or correction_yaw >= search_yaw_rad - boundary_margin_yaw
+    ):
+        raise InvalidFastLivo2Frame(
+            "best relocalization candidate lies on the search boundary; "
+            "increase the search radius or improve the initial pose"
         )
     map_base = Pose3(
         best[2],

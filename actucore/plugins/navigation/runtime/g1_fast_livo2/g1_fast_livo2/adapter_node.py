@@ -56,7 +56,9 @@ from .vectorized_cloud import (
 
 
 _MAP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_MAP_VIEW_MAX_POINTS = 80_000
+_MAP_VIEW_MAX_POINTS = 40_000
+_MAP_VIEW_POSE_REFRESH_HZ = 2.0
+_RELOCALIZATION_MIN_MATCH_RATIO = 0.35
 
 
 def _stamp_ns(stamp) -> int:
@@ -300,7 +302,7 @@ class FastLivo2Adapter(Node):
             callback_group=self._callbacks,
         )
         self.create_timer(
-            0.2,
+            1.0 / _MAP_VIEW_POSE_REFRESH_HZ,
             self._publish_map_view,
             callback_group=self._callbacks,
         )
@@ -1057,6 +1059,7 @@ class FastLivo2Adapter(Node):
             search_yaw_rad=float(args.get("search_yaw_rad", 0.35)),
             min_z=self._obstacle_min_height,
             max_z=self._obstacle_max_height,
+            min_match_ratio=_RELOCALIZATION_MIN_MATCH_RATIO,
         )
         match = {
             "match_ratio": result.match_ratio,
@@ -1070,9 +1073,11 @@ class FastLivo2Adapter(Node):
         with self._lock:
             self._map_from_session = result.map_from_session
             self._latest_pose = result.map_base_pose
+            self._latest_mapped_points = ()
             self._pending_cloud = None
             self._last_cloud_pose_skew_sec = None
             self._last_navigation_cloud_monotonic = None
+            self._invalidate_map_view_cache_locked()
             self._mode = "relocalized"
             self._last_match = match
         return {
@@ -1328,7 +1333,7 @@ class FastLivo2Adapter(Node):
             "static_map_error": state["static_map_error"],
             "map_view_max_point_count": _MAP_VIEW_MAX_POINTS,
             "map_view_point_refresh_hz": 1.0,
-            "map_view_pose_refresh_hz": 5.0,
+            "map_view_pose_refresh_hz": _MAP_VIEW_POSE_REFRESH_HZ,
             "map_view_cache_age_sec": (
                 None
                 if state["map_view_cache_monotonic"] is None
