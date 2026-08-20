@@ -48,10 +48,11 @@ FAST-LIVO2 internal module
 Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIVO2 还在
 直接发布 `camera_init` / `aft_mapped` frame 时，Nav2 会返回
 `fast_livo2_odom_frame_invalid` 或 `registered_cloud_frame_invalid`，而不会启动导航。
-接收 freshness 仍严格按 500 ms 判定；source stamp 额外允许 50 ms 有界调度抖动，
-因此约 0.51 s 的处理边界帧不会被误拒，大于 0.55 s 仍 fail closed。上游
-adapter 以 latest-only QoS 消除内部积压，并且只在 odom/TF 历史已包围 cloud
-源时间戳后发布 registered cloud。Nav2 readiness 直接检查该 cloud 时间点的
+接收 freshness 仍严格按 500 ms 判定；source stamp 使用独立的 1.0 s 上限，
+容纳 FAST-LIVO2 对点云解码、坐标变换和发布带来的有界处理延迟。接收断流超过
+500 ms 或源时间戳超过 1.0 s 仍然 fail closed。上游 adapter 以 latest-only
+QoS 消除内部积压，并且只在 odom/TF 历史已包围 cloud 源时间戳后发布
+registered cloud。Nav2 readiness 直接检查该 cloud 时间点的
 `map -> base_link` TF；“最新 odom 与最新 cloud”的时间差只作诊断，不再冒充
 配对结果阻塞导航。静态图累计和 1 Hz Canvas/OccupancyGrid 编码不在该发布
 快路径执行；它们使用独立 latest-only 后台任务和锁，因此不会周期性把
@@ -111,7 +112,9 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
   下一次导航。它只在 fresh canonical odom 和当前 target 都存在时生效；
   `goal_tolerance_reached` 只是零速 proposal reason，最终 `arrived` 仍以
   Nav2 action result 为准；
-- 恢复树不含 BackUp，只使用清除代价地图、原地转向和等待；
+- Nav2 Humble 固定创建 pose 与 through-poses 两个内部 navigator；卡片为二者
+  显式加载无 BackUp 的恢复树，只使用清除代价地图、原地转向和等待。公开动作
+  仍只有 `navigate_to_pose`；
 - Driver 仍负责二次限幅、TTL、急停和停车确认。
 
 ## Actions

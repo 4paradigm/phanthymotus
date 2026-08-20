@@ -108,8 +108,8 @@ class PlannerCommandNode(Node):
         )
         self.declare_parameter("global_costmap_topic", "/global_costmap/costmap")
         self.declare_parameter("goal_costmap_max_age_sec", 2.0)
-        self.declare_parameter("source_age_tolerance_sec", 0.05)
         self.declare_parameter("sensor_max_age_sec", 0.5)
+        self.declare_parameter("sensor_source_max_age_sec", 1.0)
         self.declare_parameter("terminal_xy_tolerance_m", 0.18)
         self.declare_parameter("terminal_yaw_tolerance_rad", 0.45)
         self.declare_parameter("goal_xy_tolerance_m", 0.20)
@@ -164,11 +164,11 @@ class PlannerCommandNode(Node):
         self._goal_costmap_max_age_sec = float(
             self.get_parameter("goal_costmap_max_age_sec").value
         )
-        self._source_age_tolerance_sec = float(
-            self.get_parameter("source_age_tolerance_sec").value
-        )
         self._sensor_max_age_sec = float(
             self.get_parameter("sensor_max_age_sec").value
+        )
+        self._sensor_source_max_age_sec = float(
+            self.get_parameter("sensor_source_max_age_sec").value
         )
         self._terminal_xy_tolerance_m = float(
             self.get_parameter("terminal_xy_tolerance_m").value
@@ -207,10 +207,17 @@ class PlannerCommandNode(Node):
             raise ValueError("global_frame and base_frame must not be empty")
         if self._sensor_max_age_sec <= 0:
             raise ValueError("sensor_max_age_sec must be positive")
+        if not (
+            self._sensor_max_age_sec
+            <= self._sensor_source_max_age_sec
+            <= 2.0
+        ):
+            raise ValueError(
+                "sensor_source_max_age_sec must be within "
+                "[sensor_max_age_sec, 2.0]"
+            )
         if self._goal_costmap_max_age_sec <= 0:
             raise ValueError("goal_costmap_max_age_sec must be positive")
-        if not 0 <= self._source_age_tolerance_sec <= 0.1:
-            raise ValueError("source_age_tolerance_sec must be within [0, 0.1]")
         tolerances = {
             "terminal_xy_tolerance_m": self._terminal_xy_tolerance_m,
             "terminal_yaw_tolerance_rad": self._terminal_yaw_tolerance_rad,
@@ -481,7 +488,7 @@ class PlannerCommandNode(Node):
         return evaluate_readiness(
             now_monotonic=time.monotonic(),
             max_age_sec=self._sensor_max_age_sec,
-            source_age_tolerance_sec=self._source_age_tolerance_sec,
+            source_max_age_sec=self._sensor_source_max_age_sec,
             odom_received_at=odom_received_at,
             odom_source_age_sec=odom_source_age,
             odom_frame_ready=odom_frame_ready,

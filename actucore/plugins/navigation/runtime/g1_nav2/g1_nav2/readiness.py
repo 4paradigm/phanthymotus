@@ -13,7 +13,7 @@ def evaluate_readiness(
     *,
     now_monotonic: float,
     max_age_sec: float,
-    source_age_tolerance_sec: float = 0.0,
+    source_max_age_sec: float | None = None,
     odom_received_at: float | None,
     odom_source_age_sec: float | None,
     odom_frame_ready: bool,
@@ -28,6 +28,8 @@ def evaluate_readiness(
 ) -> dict:
     """Evaluate the planner/controller boundary against FAST-LIVO2 outputs."""
 
+    if source_max_age_sec is None:
+        source_max_age_sec = max_age_sec
     odom_receive_age = _age(now_monotonic, odom_received_at)
     obstacle_receive_age = _age(now_monotonic, obstacle_received_at)
     runtime_blockers: list[str] = []
@@ -36,9 +38,7 @@ def evaluate_readiness(
         runtime_blockers.append("fast_livo2_odom_stale")
     if (
         odom_source_age_sec is None
-        or not -0.1
-        <= odom_source_age_sec
-        <= max_age_sec + source_age_tolerance_sec
+        or not -0.1 <= odom_source_age_sec <= source_max_age_sec
     ):
         runtime_blockers.append("odom_source_stamp_stale")
     if not odom_frame_ready:
@@ -47,9 +47,7 @@ def evaluate_readiness(
         runtime_blockers.append("registered_cloud_stale")
     if (
         obstacle_source_age_sec is None
-        or not -0.1
-        <= obstacle_source_age_sec
-        <= max_age_sec + source_age_tolerance_sec
+        or not -0.1 <= obstacle_source_age_sec <= source_max_age_sec
     ):
         runtime_blockers.append("registered_cloud_source_stamp_stale")
     if not obstacle_frame_ready:
@@ -79,6 +77,8 @@ def evaluate_readiness(
         "registered_cloud_frame_ready": obstacle_frame_ready,
         "registered_cloud_transform_ready": source_transform_ready,
         "fast_livo2_source_stamp_skew_sec": source_stamp_skew_sec,
+        "sensor_receive_max_age_sec": max_age_sec,
+        "sensor_source_max_age_sec": source_max_age_sec,
         "lifecycle_states": dict(lifecycle_states),
         "action_server_ready": action_server_ready,
         "global_to_base_ready": global_to_base_ready,

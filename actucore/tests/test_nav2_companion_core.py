@@ -321,12 +321,12 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         boundary_jitter = evaluate_readiness(
             now_monotonic=10.0,
             max_age_sec=0.5,
-            source_age_tolerance_sec=0.05,
+            source_max_age_sec=1.0,
             odom_received_at=9.9,
-            odom_source_age_sec=0.51,
+            odom_source_age_sec=0.71,
             odom_frame_ready=True,
             obstacle_received_at=9.9,
-            obstacle_source_age_sec=0.51,
+            obstacle_source_age_sec=0.71,
             obstacle_frame_ready=True,
             source_transform_ready=True,
             source_stamp_skew_sec=0.01,
@@ -339,12 +339,12 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         too_old = evaluate_readiness(
             now_monotonic=10.0,
             max_age_sec=0.5,
-            source_age_tolerance_sec=0.05,
+            source_max_age_sec=1.0,
             odom_received_at=9.9,
-            odom_source_age_sec=0.551,
+            odom_source_age_sec=1.001,
             odom_frame_ready=True,
             obstacle_received_at=9.9,
-            obstacle_source_age_sec=0.551,
+            obstacle_source_age_sec=1.001,
             obstacle_frame_ready=True,
             source_transform_ready=True,
             source_stamp_skew_sec=0.01,
@@ -353,6 +353,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             global_to_base_ready=True,
         )
         self.assertIn("odom_source_stamp_stale", too_old["navigation_blockers"])
+        self.assertEqual(boundary_jitter["sensor_receive_max_age_sec"], 0.5)
+        self.assertEqual(boundary_jitter["sensor_source_max_age_sec"], 1.0)
 
     def test_goal_cell_is_checked_before_nav2_action_dispatch(self) -> None:
         snapshot = CostmapSnapshot.from_values(
@@ -575,12 +577,31 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             / "behavior_trees"
             / "navigate_to_pose_w_replanning_and_recovery.xml"
         )
-        backup = tree.find(".//BackUp")
-        self.assertIsNone(backup)
+        through_tree = ET.parse(
+            PACKAGE_ROOT
+            / "behavior_trees"
+            / "navigate_through_poses_w_replanning_and_recovery.xml"
+        )
+        self.assertIsNone(tree.find(".//BackUp"))
+        self.assertIsNone(through_tree.find(".//BackUp"))
+        self.assertIsNotNone(through_tree.find(".//ComputePathThroughPoses"))
         self.assertIn(
             "behavior_plugins: [spin, drive_on_heading, wait]",
             params,
         )
+        self.assertIn(
+            "default_nav_to_pose_bt_xml: "
+            "/ros_ws/install/g1_nav2/share/g1_nav2/behavior_trees/"
+            "navigate_to_pose_w_replanning_and_recovery.xml",
+            params,
+        )
+        self.assertIn(
+            "default_nav_through_poses_bt_xml: "
+            "/ros_ws/install/g1_nav2/share/g1_nav2/behavior_trees/"
+            "navigate_through_poses_w_replanning_and_recovery.xml",
+            params,
+        )
+        self.assertIn("bt_navigator_navigate_through_poses_rclcpp_node", params)
         self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
         self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
         self.assertIn("MotionLimits.from_payload", command)
@@ -588,6 +609,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("shape_terminal_approach", command)
         self.assertIn('"terminal_xy_tolerance_m": 0.18', launch)
         self.assertIn('"terminal_yaw_tolerance_rad": 0.45', launch)
+        self.assertIn('"sensor_max_age_sec": 0.5', launch)
+        self.assertIn('"sensor_source_max_age_sec": 1.0', launch)
         self.assertIn('"goal_xy_tolerance_m": 0.20', launch)
         self.assertIn('"goal_yaw_tolerance_rad": 0.50', launch)
         self.assertIn("xy_goal_tolerance: 0.20", params)
@@ -607,7 +630,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             send_goal.index("self._action_client.wait_for_server"),
         )
         self.assertIn('"goal_costmap_max_age_sec": 2.0', launch)
-        self.assertIn('"source_age_tolerance_sec": 0.05', launch)
+        self.assertNotIn("source_age_tolerance_sec", launch)
 
 
 if __name__ == "__main__":
