@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from .contract import (
     CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
@@ -73,6 +74,7 @@ class NavigationPlugin:
             goal_handler=self._handle_semantic_goal,
         )
         self._lock = threading.RLock()
+        self._transition_lock = threading.Lock()
         self._started = False
         self._instance_id = ""
         self._external_wiring: dict[str, str] = {}
@@ -124,6 +126,10 @@ class NavigationPlugin:
         self._stop()
 
     def _start(self, args: dict) -> dict:
+        with self._transition_lock:
+            return self._start_serialized(args)
+
+    def _start_serialized(self, args: dict) -> dict:
         with self._lock:
             if self._started:
                 result = self._info()
@@ -177,14 +183,24 @@ class NavigationPlugin:
                         "topic": wiring["wired_topics"]["goal_pose"],
                     }
                 )
-            planning_result = self._planning.dispatch(
-                "nav2",
-                {
-                    "action": "start",
-                    "instance_id": args.get("instance_id"),
-                    "input_bindings": planner_bindings,
-                },
-            )
+            planning_start = {
+                "action": "start",
+                "instance_id": args.get("instance_id"),
+                "input_bindings": planner_bindings,
+            }
+            planning_result = self._planning.dispatch("nav2", planning_start)
+            if self._is_transient_planning_discovery_failure(planning_result):
+                if not self._runtime.info().get("running", False):
+                    raise RuntimeError(
+                        "planning start failed after a navigation child process exited"
+                    )
+                log.warning(
+                    "[ControlledSemanticSpatial] Nav2 command subscriber was not "
+                    "discovered on the first attempt; rebuilding only the planning "
+                    "bridge before rollback"
+                )
+                time.sleep(0.25)
+                planning_result = self._planning.dispatch("nav2", planning_start)
             self._require_started("planning", planning_result)
             started.append(("planning", self._planning))
 
@@ -234,6 +250,10 @@ class NavigationPlugin:
         return result
 
     def _stop(self) -> dict:
+        with self._transition_lock:
+            return self._stop_serialized()
+
+    def _stop_serialized(self) -> dict:
         results = {}
         # Mapping owns the only operation that can legitimately require a
         # retryable stop: it must wait for FAST-LIVO2 to exit and persist the
@@ -301,6 +321,10 @@ class NavigationPlugin:
         }
 
     def _configure(self, args: dict) -> dict:
+        with self._transition_lock:
+            return self._configure_serialized(args)
+
+    def _configure_serialized(self, args: dict) -> dict:
         with self._lock:
             if self._started:
                 return self._error(
@@ -563,6 +587,15 @@ class NavigationPlugin:
                 f"{name} start failed: "
                 + str(result.get("error") or result.get("error_code") or result)
             )
+
+    @staticmethod
+    def _is_transient_planning_discovery_failure(result: dict | None) -> bool:
+        return (
+            isinstance(result, dict)
+            and result.get("error_code") == "nav2_runtime_unavailable"
+            and "not subscribed to the command topic"
+            in str(result.get("error") or result.get("message") or "")
+        )
 
     @staticmethod
     def _error(code: str, message: str, **extra) -> dict:

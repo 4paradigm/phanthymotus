@@ -154,6 +154,11 @@ Canvas、Core 或 Driver。Driver 在空闲订阅状态接纳首条新鲜、合�
 `finalizing` 事务，下一次 `stop`/`stop_mapping` 从原事务继续；永久失败会释放
 mapping 控制对象，并继续回收其他模块和运行时。已完成的同名
 `stop_mapping` 终态可幂等重放原保存回执，避免迟到重试制造第二份成功结果。
+卡片级 `start`/`stop`/`config` 转换串行执行，不允许 Canvas 的迟到请求在
+前一次启动中途关闭 backend。若 Nav2 command bridge 子进程仍存活，但
+Fast DDS 在首个发现窗口内暂未报告 command subscriber，只重建一次
+planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第二次仍失败
+才执行完整回滚。
 
 `stop` 始终尝试停止所有内部模块和两个 launch 子进程组，并保留各模块回执，
 避免部分停止冒充成功。Runtime 还跟踪 launch 进程派生的独立 Linux 进程组；

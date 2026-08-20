@@ -79,6 +79,50 @@ class FakeComponent:
         return {"status": action, "component": self.name}
 
 
+class TransientPlanningComponent(FakeComponent):
+    def __init__(self):
+        super().__init__("planning")
+        self.start_attempts = 0
+
+    def dispatch(self, prefix, args):
+        if args.get("action") == "start":
+            self.calls.append((prefix, dict(args)))
+            self.start_attempts += 1
+            if self.start_attempts == 1:
+                return {
+                    "state": "error",
+                    "status": "error",
+                    "error_code": "nav2_runtime_unavailable",
+                    "error": (
+                        "in-container Nav2 runtime is not subscribed to the "
+                        "command topic"
+                    ),
+                }
+            self.started = True
+            return {"state": "ready", "status": "ready"}
+        return super().dispatch(prefix, args)
+
+
+class BlockingStartComponent(FakeComponent):
+    def __init__(self):
+        super().__init__("mapping")
+        self.start_entered = threading.Event()
+        self.release_start = threading.Event()
+        self.stop_entered = threading.Event()
+
+    def dispatch(self, prefix, args):
+        if args.get("action") == "start":
+            self.calls.append((prefix, dict(args)))
+            self.start_entered.set()
+            if not self.release_start.wait(timeout=2.0):
+                raise RuntimeError("test did not release mapping start")
+            self.started = True
+            return {"state": "ready", "status": "ready"}
+        if args.get("action") == "stop":
+            self.stop_entered.set()
+        return super().dispatch(prefix, args)
+
+
 class RetryableMappingBackend:
     def __init__(self):
         self.stop_calls = 0
@@ -454,6 +498,64 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertFalse(runtime.started)
         self.assertEqual(runtime.stop_calls, 1)
         self.assertTrue(any(args["action"] == "stop" for _, args in mapping.calls))
+
+    def test_transient_planning_discovery_retries_without_runtime_rollback(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent("mapping")
+        planning = TransientPlanningComponent()
+        plugin = self.make_plugin(
+            runtime=runtime,
+            mapping=mapping,
+            planning=planning,
+        )
+
+        result = plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(planning.start_attempts, 2)
+        self.assertEqual(runtime.stop_calls, 0)
+        self.assertEqual(
+            sum(args["action"] == "start" for _, args in mapping.calls),
+            1,
+        )
+
+    def test_stop_waits_for_inflight_start_instead_of_closing_its_backend(self):
+        mapping = BlockingStartComponent()
+        plugin = self.make_plugin(mapping=mapping)
+        start_result = {}
+        stop_result = {}
+
+        start_thread = threading.Thread(
+            target=lambda: start_result.update(
+                plugin.dispatch(
+                    "ControlledSemanticSpatial",
+                    {"action": "start", "input_bindings": _external_bindings()},
+                )
+            )
+        )
+        start_thread.start()
+        self.assertTrue(mapping.start_entered.wait(timeout=1.0))
+
+        stop_thread = threading.Thread(
+            target=lambda: stop_result.update(
+                plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+            )
+        )
+        stop_thread.start()
+        self.assertFalse(mapping.stop_entered.wait(timeout=0.05))
+
+        mapping.release_start.set()
+        start_thread.join(timeout=2.0)
+        stop_thread.join(timeout=2.0)
+
+        self.assertFalse(start_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(start_result["state"], "ready")
+        self.assertEqual(stop_result["state"], "idle")
+        self.assertTrue(mapping.stop_entered.is_set())
 
     def test_business_actions_route_to_owned_components(self):
         mapping = FakeComponent("mapping")
