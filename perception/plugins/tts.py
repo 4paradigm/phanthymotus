@@ -737,6 +737,7 @@ class TTSPlugin:
             self._adapter = None
             self._load_error = str(e)
         self._nodes: dict[str, _TTSNode] = {}
+        self._instance_configs: dict = {}
         # main.py serves MCP over ThreadingHTTPServer, so start/stop/speak/config
         # can run concurrently. Every read-modify-write of _nodes must hold this:
         # otherwise two threads both pass a "key not in _nodes" check, both build
