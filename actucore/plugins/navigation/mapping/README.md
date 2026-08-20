@@ -49,7 +49,9 @@ frame 不符时同容器 adapter 不发布伪造的 canonical odom/cloud。
 adapter 对 FAST-LIVO2 原始 odom/cloud 使用
 `BEST_EFFORT + KEEP_LAST(1)`，慢回调只保留最新样本，不把旧帧排成约
 0.5 秒的内部积压。接收 age 仍使用 500 ms 上限，对源时间戳另保留
-50 ms 有界调度抖动；约 0.51 s 的边界帧可接受，超过 0.55 s 仍拒绝。
+50 ms 有界调度抖动；约 0.51 s 的边界帧可接受，超过 0.55 s 仍拒绝。live
+PointCloud2 的 XYZ 解码、刚体变换、高度过滤和 float32 输出打包走 NumPy
+批处理；边界、字段、有限值、点数和字节上限仍在发布前 fail closed。
 
 ## 输出
 
@@ -86,7 +88,9 @@ Nav2，也不会进入累计。不匹配帧进入 diagnostics 计数，不能拿
 累计；加载旧图时从 raw PCD 恢复。它们只用于 Canvas 阈值调试，不进入
 registered cloud、累计静态图或 Nav2 costmap。`map_view` 最多编码 80,000 点，
 对低于、位于和高于导航高度带的点分别保留预算，因此地面不会被先写入的
-障碍点挤出前端上限。现有渲染器继续按高度显示范围外点为蓝色/粉色。
+障碍点挤出前端上限。地图点主体每秒编码一次并缓存，机器人 `x/y/yaw` 只更新
+固定 12 字节头部并以 5 Hz 发布；位姿刷新不再重复编码整张地图。现有渲染器
+继续按高度显示范围外点为蓝色/粉色。
 Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
 `map_view` 点数组语义，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
@@ -116,6 +120,14 @@ Nav2 的全局静态层使用 `/ubuntu/navigation/static_map`，实时动态层�
 显示为蓝色，高于上界的点显示为粉色，范围内点继续使用彩虹高度色，并显示
 当前阈值图例。阈值是地图坐标，不直接等同于雷达物理安装高度；应结合现场
 地面色带和低矮障碍调节，且必须满足 `-3.0 <= min < max <= 3.0`。
+
+`/ubuntu/navigation/fast_livo2/diagnostics` 通过 `latency_ms` 给出最近一次
+`cloud_decode`、`cloud_pose_wait`、`cloud_transform_filter`、
+`cloud_pack_publish`、`cloud_end_to_end`、`map_view_encode` 和
+`map_view_pose_publish` 分段耗时，`latency_max_ms` 保留本进程最大值；同时发布
+`map_view_cache_age_sec`、`map_view_point_refresh_hz=1` 和
+`map_view_pose_refresh_hz=5`。这些字段用于区分传感器/TF 等待、点云计算、DDS
+发布和 Canvas 编码延迟，不改变 freshness 门禁。
 
 ## Actions
 

@@ -78,14 +78,22 @@ marking/raytrace clearing 的 live ObstacleLayer，所以导航期间新出现�
 物体仍参与即时避障。原始 FAST-LIVO2 odom/cloud 使用 latest-only 订阅；cloud
 只有在其源时间戳已被前后 odom/TF 包围且最近位姿差不超过 50 ms 时才对
 Nav2 发布，避免 adapter 排队旧帧或让点云早于 TF。canonical registered cloud
-发布是独立快路径；静态地图累计与 Canvas 编码在 latest-only 后台任务中执行，
+发布是独立快路径：PointCloud2 的 XYZ 解码、`map` 坐标变换、高度过滤和
+float32 打包均使用 NumPy 批量运算，不再逐点进入 Python 循环。静态地图累计与
+Canvas 编码在 latest-only 后台任务中执行，
 不会占用导航点云回调。后台来不及处理时覆盖旧建图样本并在诊断中累计
 `mapping_work_dropped`，但不阻塞最新导航点云。Canvas `map_view` 显示累计静态点和新鲜的最新实时扫描，
 并显示单独累计的高度带外表面。输出最多 80,000 点，并为低于、位于和高于
 导航高度带的三组点分别保留显示预算，避免地面被大量障碍点截断；该采样只
 影响监控，不改变规划输入。显示帧直接编码已经分别有界的静态、范围外和实时
 点源，不再构造一次性全图体素副本，避免 Canvas 更新拖慢 Nav2 所依赖的 odom
-与 registered cloud。已保存的 confirmed static PCD 还会绑定建图时的障碍高度带；加载
+与 registered cloud。点云主体按 1 Hz 重编码并缓存；缓存帧只替换前 12 字节的
+机器人 `x/y/yaw`，以 5 Hz 发布，因此位姿刷新不再重复打包最多 80,000 个地图点。
+FAST-LIVO2 diagnostics 的 `latency_ms` / `latency_max_ms` 分别报告最近值和进程内
+最大值，包含 `cloud_decode`、`cloud_pose_wait`、`cloud_transform_filter`、
+`cloud_pack_publish`、`cloud_end_to_end`、`map_view_encode` 和
+`map_view_pose_publish`；`map_view_cache_age_sec` 用于区分点云主体陈旧和位姿刷新
+本身的开销。已保存的 confirmed static PCD 还会绑定建图时的障碍高度带；加载
 时若当前上下界不同会拒绝使用，需恢复原配置或重新建图，避免静态证据语义
 悄然变化。
 

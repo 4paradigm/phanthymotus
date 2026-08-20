@@ -121,6 +121,53 @@ def _prepare_adapter_concurrency(adapter) -> None:
 
 
 class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
+    def test_cached_map_view_refreshes_pose_without_reencoding_points(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._latency_ms = {}
+        adapter._latency_max_ms = {}
+        identity = Pose3(
+            0.0,
+            0.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        adapter._map_view_cache = ADAPTER_MODULE.encode_map_view_points(
+            ((1.0, 2.0, 0.1),),
+            identity,
+            obstacle_min_height_m=-0.30,
+            obstacle_max_height_m=0.30,
+            max_points=80_000,
+        )
+        adapter._latest_pose = Pose3(
+            3.0,
+            -4.0,
+            0.0,
+            ADAPTER_MODULE.quaternion_from_rpy(0.0, 0.0, 1.0),
+        )
+        adapter._map_view_pub = _CapturePublisher()
+        adapter.get_logger = lambda: SimpleNamespace(warning=lambda _msg: None)
+
+        adapter._publish_map_view()
+
+        self.assertEqual(len(adapter._map_view_pub.messages), 1)
+        published = bytes(adapter._map_view_pub.messages[0].data)
+        self.assertEqual(published[12:], adapter._map_view_cache[12:])
+        x, y, yaw = struct.unpack_from("<fff", published, 0)
+        self.assertAlmostEqual(x, 3.0)
+        self.assertAlmostEqual(y, -4.0)
+        self.assertAlmostEqual(yaw, 1.0)
+        self.assertIn("map_view_pose_publish", adapter._latency_ms)
+
+    def test_segment_latency_diagnostics_keep_last_and_maximum(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+
+        adapter._record_latency_locked("cloud_decode", 0.012)
+        adapter._record_latency_locked("cloud_decode", 0.004)
+
+        self.assertAlmostEqual(adapter._latency_ms["cloud_decode"], 4.0)
+        self.assertAlmostEqual(adapter._latency_max_ms["cloud_decode"], 12.0)
+
     def test_adapter_execute_waits_for_bidirectional_discovery(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
         supervisor._lock = threading.RLock()

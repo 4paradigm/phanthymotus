@@ -8,7 +8,6 @@ import json
 import math
 from pathlib import Path
 import re
-import struct
 import threading
 import time
 
@@ -40,15 +39,19 @@ from .frame_adapter_core import (
     compose_pose,
     estimate_planar_relocalization,
     encode_map_view_points,
-    iter_xyz_points,
     normalize_obstacle_height_range,
     obstacle_height_ranges_match,
     quaternion_from_rpy,
     read_pcd_xyz,
     source_age_is_valid,
-    transform_points,
     write_pcd_xyz_atomic,
     yaw_from_quaternion,
+)
+from .vectorized_cloud import (
+    decode_xyz_array,
+    map_view_with_pose,
+    transform_xyz_array,
+    xyz_array_bytes,
 )
 
 
@@ -206,8 +209,8 @@ class FastLivo2Adapter(Node):
         self._latest_pose: Pose3 | None = None
         self._pose_history = deque(maxlen=128)
         self._latest_session_pose: Pose3 | None = None
-        self._latest_session_points: tuple[tuple[float, float, float], ...] = ()
-        self._latest_mapped_points: tuple[tuple[float, float, float], ...] = ()
+        self._latest_session_points = ()
+        self._latest_mapped_points = ()
         self._reference_points: tuple[tuple[float, float, float], ...] = ()
         self._map_from_session: Pose3 | None = None
         self._mode = "idle"
@@ -226,6 +229,10 @@ class FastLivo2Adapter(Node):
         self._static_map_error: str | None = None
         self._static_save_result: dict | None = None
         self._session_name: str | None = None
+        self._map_view_cache: bytes | None = None
+        self._map_view_cache_monotonic: float | None = None
+        self._latency_ms: dict[str, float] = {}
+        self._latency_max_ms: dict[str, float] = {}
         self._static_map_load_time = self.get_clock().now().to_msg()
         self._callbacks = ReentrantCallbackGroup()
 
@@ -292,6 +299,11 @@ class FastLivo2Adapter(Node):
             self._publish_periodic,
             callback_group=self._callbacks,
         )
+        self.create_timer(
+            0.2,
+            self._publish_map_view,
+            callback_group=self._callbacks,
+        )
         self._mapping_worker = threading.Thread(
             target=self._mapping_worker_main,
             name="g1-fast-livo2-static-map",
@@ -312,6 +324,21 @@ class FastLivo2Adapter(Node):
         self._mapping_generation += 1
         with self._mapping_work_condition:
             self._mapping_work = None
+
+    def _invalidate_map_view_cache_locked(self) -> None:
+        self._map_view_cache = None
+        self._map_view_cache_monotonic = None
+
+    def _record_latency_locked(self, name: str, elapsed_sec: float) -> None:
+        elapsed_ms = max(0.0, float(elapsed_sec) * 1000.0)
+        if not hasattr(self, "_latency_ms"):
+            self._latency_ms = {}
+            self._latency_max_ms = {}
+        self._latency_ms[name] = elapsed_ms
+        self._latency_max_ms[name] = max(
+            elapsed_ms,
+            self._latency_max_ms.get(name, 0.0),
+        )
 
     def _queue_mapping_scan(self, work: dict) -> None:
         with self._mapping_work_condition:
@@ -467,28 +494,38 @@ class FastLivo2Adapter(Node):
                     "PointCloud2 exceeds "
                     f"{self._live_cloud_max_bytes} byte safety limit"
                 )
-            points = list(
-                iter_xyz_points(
-                    fields=message.fields,
-                    data=bytes(message.data),
-                    point_step=point_step,
-                    width=width,
-                    height=height,
-                    is_bigendian=bool(message.is_bigendian),
-                    max_points=self._map_load_max_points,
-                    max_data_bytes=self._live_cloud_max_bytes,
-                )
+            points = decode_xyz_array(
+                fields=message.fields,
+                data=bytes(message.data),
+                point_step=point_step,
+                row_step=int(getattr(message, "row_step", width * point_step)),
+                width=width,
+                height=height,
+                is_bigendian=bool(message.is_bigendian),
+                max_points=self._map_load_max_points,
+                max_data_bytes=self._live_cloud_max_bytes,
             )
         except (InvalidFastLivo2Frame, ValueError, TypeError) as exc:
             self._invalid_cloud += 1
             self.get_logger().warning(f"rejecting FAST-LIVO2 cloud: {exc}")
             return
 
-        sample = (message, tuple(points), receive_monotonic, source_age)
+        decode_end_monotonic = time.monotonic()
+        sample = (
+            message,
+            points,
+            receive_monotonic,
+            source_age,
+            decode_end_monotonic,
+        )
         with self._lock:
             self._latest_session_points = sample[1]
             self._last_cloud_monotonic = receive_monotonic
             self._last_cloud_source_age = source_age
+            self._record_latency_locked(
+                "cloud_decode",
+                decode_end_monotonic - receive_monotonic,
+            )
             if self._map_from_session is None:
                 return
             if self._pending_cloud is not None:
@@ -503,7 +540,10 @@ class FastLivo2Adapter(Node):
             sample = self._pending_cloud
             if sample is None or self._map_from_session is None:
                 return
-            message, points, receive_monotonic, _source_age = sample
+            message, points, receive_monotonic, _source_age = sample[:4]
+            decode_end_monotonic = (
+                sample[4] if len(sample) > 4 else receive_monotonic
+            )
             source_stamp_ns = _stamp_ns(message.header.stamp)
             pose_history = tuple(self._pose_history)
             if not pose_history or pose_history[-1][0] < source_stamp_ns:
@@ -528,18 +568,23 @@ class FastLivo2Adapter(Node):
             abs(int(stamp_ns) - source_stamp_ns)
             for stamp_ns, _pose in pose_history
         ) / 1_000_000_000.0
+        transform_start_monotonic = time.monotonic()
         try:
-            mapped_points = tuple(transform_points(map_from_session, points))
-            navigation_points = tuple(
-                point
-                for point in mapped_points
-                if obstacle_min_height <= point[2] <= obstacle_max_height
-            )
+            mapped_points = transform_xyz_array(map_from_session, points)
+            navigation_points = mapped_points[
+                (mapped_points[:, 2] >= obstacle_min_height)
+                & (mapped_points[:, 2] <= obstacle_max_height)
+            ]
+            out_of_band_points = mapped_points[
+                (mapped_points[:, 2] < obstacle_min_height)
+                | (mapped_points[:, 2] > obstacle_max_height)
+            ]
+            transform_end_monotonic = time.monotonic()
             navigation_cloud = self._xyz_cloud(
                 navigation_points,
                 message.header.stamp,
             )
-        except (InvalidFastLivo2Frame, OverflowError, struct.error) as exc:
+        except (InvalidFastLivo2Frame, OverflowError) as exc:
             self._invalid_cloud += 1
             self.get_logger().warning(
                 f"rejecting transformed FAST-LIVO2 cloud: {exc}"
@@ -552,8 +597,25 @@ class FastLivo2Adapter(Node):
             self._latest_mapped_points = mapped_points
             generation = self._mapping_generation
         self._cloud_pub.publish(navigation_cloud)
+        publish_end_monotonic = time.monotonic()
         with self._lock:
-            self._last_navigation_cloud_monotonic = time.monotonic()
+            self._last_navigation_cloud_monotonic = publish_end_monotonic
+            self._record_latency_locked(
+                "cloud_pose_wait",
+                transform_start_monotonic - decode_end_monotonic,
+            )
+            self._record_latency_locked(
+                "cloud_transform_filter",
+                transform_end_monotonic - transform_start_monotonic,
+            )
+            self._record_latency_locked(
+                "cloud_pack_publish",
+                publish_end_monotonic - transform_end_monotonic,
+            )
+            self._record_latency_locked(
+                "cloud_end_to_end",
+                publish_end_monotonic - receive_monotonic,
+            )
         if mode == "mapping":
             sensor_pose = compose_pose(matched_pose, self._base_to_sensor)
             self._queue_mapping_scan(
@@ -566,13 +628,7 @@ class FastLivo2Adapter(Node):
                         sensor_pose.z,
                     ),
                     "mapped_points": mapped_points,
-                    "out_of_band_points": tuple(
-                        point
-                        for point in mapped_points
-                        if not obstacle_min_height
-                        <= point[2]
-                        <= obstacle_max_height
-                    ),
+                    "out_of_band_points": out_of_band_points,
                     "receive_monotonic": receive_monotonic,
                     "obstacle_min_height": obstacle_min_height,
                     "obstacle_max_height": obstacle_max_height,
@@ -607,6 +663,7 @@ class FastLivo2Adapter(Node):
             self._unmatched_static_cloud = 0
             self._static_map_error = None
             self._static_save_result = None
+            self._invalidate_map_view_cache_locked()
         self._static_map_pub.publish(self._occupancy_grid(cleared))
         _ = retired_map_view
 
@@ -950,6 +1007,7 @@ class FastLivo2Adapter(Node):
             self._last_match = None
             self._static_map_error = None
             self._static_save_result = None
+            self._invalidate_map_view_cache_locked()
         def publish_loaded_map() -> None:
             self._static_map_pub.publish(self._occupancy_grid(cleared))
             self._static_map_pub.publish(self._occupancy_grid(snapshot))
@@ -980,7 +1038,7 @@ class FastLivo2Adapter(Node):
             cloud_age = None if self._last_cloud_monotonic is None else time.monotonic() - self._last_cloud_monotonic
             reference = self._reference_points
             map_name = self._session_name
-        if session_pose is None or not session_points:
+        if session_pose is None or len(session_points) == 0:
             raise InvalidFastLivo2Frame("FAST-LIVO2 odom and registered cloud are not ready")
         if odom_age is None or cloud_age is None or max(odom_age, cloud_age) > self._source_max_age:
             raise InvalidFastLivo2Frame("FAST-LIVO2 odom or registered cloud is stale")
@@ -1072,6 +1130,7 @@ class FastLivo2Adapter(Node):
             self._last_match = None
             self._static_map_error = None
             self._static_save_result = None
+            self._invalidate_map_view_cache_locked()
         def publish_cleared_map() -> None:
             self._static_map_pub.publish(self._occupancy_grid(cleared))
             _ = retired_static, retired_adapter
@@ -1082,7 +1141,7 @@ class FastLivo2Adapter(Node):
             "_post_response": publish_cleared_map,
         }
 
-    def _obstacle_cloud(self, points: tuple[tuple[float, float, float], ...]) -> PointCloud2:
+    def _obstacle_cloud(self, points) -> PointCloud2:
         output = PointCloud2()
         output.header.stamp = self.get_clock().now().to_msg()
         output.header.frame_id = "map"
@@ -1096,14 +1155,35 @@ class FastLivo2Adapter(Node):
         output.is_bigendian = False
         output.point_step = 12
         output.row_step = output.point_step * output.width
-        output.data = b"".join(struct.pack("<fff", *point) for point in points)
+        output.data = xyz_array_bytes(points)
         output.is_dense = True
         return output
 
     def _xyz_cloud(self, points, stamp) -> PointCloud2:
-        output = self._obstacle_cloud(tuple(points))
+        output = self._obstacle_cloud(points)
         output.header.stamp = stamp
         return output
+
+    def _publish_map_view(self) -> None:
+        started = time.monotonic()
+        with self._lock:
+            cached = self._map_view_cache
+            pose = self._latest_pose
+        if cached is None or pose is None:
+            return
+        try:
+            data = map_view_with_pose(cached, pose)
+        except InvalidFastLivo2Frame as exc:
+            self.get_logger().warning(f"rejecting cached map view: {exc}")
+            return
+        frame = UInt8MultiArray()
+        frame.data = data
+        self._map_view_pub.publish(frame)
+        with self._lock:
+            self._record_latency_locked(
+                "map_view_pose_publish",
+                time.monotonic() - started,
+            )
 
     def _occupancy_grid(self, snapshot) -> OccupancyGrid:
         output = OccupancyGrid()
@@ -1122,6 +1202,8 @@ class FastLivo2Adapter(Node):
     def _publish_periodic(self) -> None:
         now = time.monotonic()
         static_grid = None
+        encoded_map_view = None
+        map_view_encode_sec = None
         with self._lock:
             pose = self._latest_pose
             odom_age = None if self._last_odom_monotonic is None else now - self._last_odom_monotonic
@@ -1152,6 +1234,9 @@ class FastLivo2Adapter(Node):
                 "static_map_error": self._static_map_error,
                 "invalid_odom": self._invalid_odom,
                 "invalid_cloud": self._invalid_cloud,
+                "latency_ms": dict(self._latency_ms),
+                "latency_max_ms": dict(self._latency_max_ms),
+                "map_view_cache_monotonic": self._map_view_cache_monotonic,
             }
 
         with self._static_lock:
@@ -1174,8 +1259,8 @@ class FastLivo2Adapter(Node):
                     max_z=obstacle_max_height,
                 )
                 static_grid = self._occupancy_grid(snapshot)
-                frame = UInt8MultiArray()
-                frame.data = encode_map_view_points(
+                map_view_encode_started = time.monotonic()
+                encoded_map_view = encode_map_view_points(
                     chain(
                         self._static_map.map_view_points,
                         map_view_context.points,
@@ -1187,7 +1272,7 @@ class FastLivo2Adapter(Node):
                     obstacle_max_height_m=obstacle_max_height,
                     max_points=_MAP_VIEW_MAX_POINTS,
                 )
-                self._map_view_pub.publish(frame)
+                map_view_encode_sec = time.monotonic() - map_view_encode_started
             static_diagnostics = {
                 "map_point_count": self._static_map.point_count,
                 "static_candidate_point_count": self._static_map.candidate_count,
@@ -1197,6 +1282,17 @@ class FastLivo2Adapter(Node):
                 "static_quarantined_point_count": self._static_map.quarantined_point_count,
                 "map_view_context_point_count": map_view_context.point_count,
             }
+        if encoded_map_view is not None:
+            with self._lock:
+                self._map_view_cache = encoded_map_view
+                self._map_view_cache_monotonic = time.monotonic()
+                self._record_latency_locked(
+                    "map_view_encode",
+                    map_view_encode_sec,
+                )
+                state["map_view_cache_monotonic"] = self._map_view_cache_monotonic
+                state["latency_ms"] = dict(self._latency_ms)
+                state["latency_max_ms"] = dict(self._latency_max_ms)
         with self._mapping_work_condition:
             mapping_work_dropped = self._mapping_work_dropped
         ready = (
@@ -1231,6 +1327,15 @@ class FastLivo2Adapter(Node):
             "mapping_work_dropped": mapping_work_dropped,
             "static_map_error": state["static_map_error"],
             "map_view_max_point_count": _MAP_VIEW_MAX_POINTS,
+            "map_view_point_refresh_hz": 1.0,
+            "map_view_pose_refresh_hz": 5.0,
+            "map_view_cache_age_sec": (
+                None
+                if state["map_view_cache_monotonic"] is None
+                else max(0.0, now - state["map_view_cache_monotonic"])
+            ),
+            "latency_ms": state["latency_ms"],
+            "latency_max_ms": state["latency_max_ms"],
             "map_view_live_out_of_band_point_count": len(live_out_of_band),
             "obstacle_point_count": len(obstacle_points),
             "obstacle_height_range_m": [obstacle_min_height, obstacle_max_height],
