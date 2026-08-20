@@ -550,6 +550,7 @@ class PlannerCommandNode(Node):
             motion_limits = self._active.get("motion_limits")
             target = self._active.get("target_pose")
             current_pose = self._last_odom_pose
+            terminal_phase = self._active.get("terminal_phase", "approach")
         if not isinstance(nav_id, str) or not nav_id:
             return
         if not isinstance(motion_limits, MotionLimits):
@@ -579,6 +580,7 @@ class PlannerCommandNode(Node):
                             y=float(target["y"]),
                             yaw=float(target["yaw"]),
                         ),
+                        position_reached=terminal_phase in {"rotate", "reached"},
                         xy_tolerance_m=self._terminal_xy_tolerance_m,
                         yaw_tolerance_rad=self._terminal_yaw_tolerance_rad,
                     )
@@ -598,6 +600,7 @@ class PlannerCommandNode(Node):
                     status=status,
                 ):
                     return
+                self._active["terminal_phase"] = terminal_phase
                 self._latest_proposal_candidate = {
                     "nav_id": nav_id,
                     "attempt": attempt,
@@ -765,6 +768,7 @@ class PlannerCommandNode(Node):
                 "last_distance": None,
                 "last_pose": None,
                 "last_feedback_publish": 0.0,
+                "terminal_phase": "approach",
             }
             self._latest_proposal_candidate = None
             self._last_published_proposal = None

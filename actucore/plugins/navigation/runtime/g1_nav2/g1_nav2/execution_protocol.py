@@ -81,16 +81,16 @@ def shape_terminal_approach(
     *,
     current_pose: Pose2D,
     target_pose: Pose2D,
+    position_reached: bool = False,
     xy_tolerance_m: float = TERMINAL_XY_TOLERANCE_M,
     yaw_tolerance_rad: float = TERMINAL_YAW_TOLERANCE_RAD,
 ) -> tuple[Velocity, str]:
     """Prevent configured motion floors from amplifying terminal corrections.
 
-    This function is deliberately stateless: every proposal is evaluated from
-    the current pose and target, so reaching one goal cannot lock a subsequent
-    navigation.  Once position is within the inner tolerance, translation is
-    suppressed while Nav2 finishes the requested heading.  Once both errors
-    are within tolerance, the proposal is forced to exact zero and Nav2 remains
+    Once position is reached for the current navigation, the caller keeps that
+    phase latched so localization jitter cannot re-enable the configured linear
+    speed floor.  A new navigation owns a fresh phase.  Once both errors are
+    within tolerance, the proposal is forced to exact zero and Nav2 remains
     responsible for reporting the action result.
     """
 
@@ -117,7 +117,7 @@ def shape_terminal_approach(
         target_pose.x - current_pose.x,
         target_pose.y - current_pose.y,
     )
-    if xy_error > xy_tolerance_m:
+    if not position_reached and xy_error > xy_tolerance_m:
         return velocity, "approach"
 
     yaw_error = abs(_normalized_angle(target_pose.yaw - current_pose.yaw))

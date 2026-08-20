@@ -128,6 +128,14 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertEqual((reached, phase), (Velocity.zero(), "reached"))
 
+        latched, phase = shape_terminal_approach(
+            raw,
+            current_pose=Pose2D(x=0.70, y=2.0, yaw=0.0),
+            target_pose=target,
+            position_reached=True,
+        )
+        self.assertEqual((latched, phase), (Velocity(yaw=0.08), "rotate"))
+
         next_goal, phase = shape_terminal_approach(
             raw,
             current_pose=Pose2D(x=0.90, y=2.0, yaw=math.pi - 0.05),
@@ -633,6 +641,10 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("MotionLimits.from_payload", command)
         self.assertIn("apply_g1_motion_limits", command)
         self.assertIn("shape_terminal_approach", command)
+        self.assertIn('"terminal_phase": "approach"', command)
+        self.assertIn(
+            'position_reached=terminal_phase in {"rotate", "reached"}', command
+        )
         self.assertIn('"terminal_xy_tolerance_m": 0.18', launch)
         self.assertIn('"terminal_yaw_tolerance_rad": 0.45', launch)
         self.assertIn('"sensor_max_age_sec": 0.5', launch)

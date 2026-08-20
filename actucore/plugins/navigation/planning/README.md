@@ -109,8 +109,10 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
   仍保持严格零值；
 - 终点内层容差为 `0.18 m / 0.45 rad`：进入位置容差后不再发布平移，
   只保留 Nav2 的朝向校正；位置和朝向都进入容差后发布严格零速，避免
-  速度下限把尾段微调放大成终点徘徊。该判断无跨任务状态，不会锁住
-  下一次导航。它只在 fresh canonical odom 和当前 target 都存在时生效；
+  速度下限把尾段微调放大成终点徘徊。位置容差首次满足后，当前
+  `nav_id` 的终点阶段保持为“只转向”，不因定位边界抖动重新启用平移；
+  新导航创建独立阶段，不会锁住下一次导航。该判断只在 fresh canonical
+  odom 和当前 target 都存在时生效；
   `goal_tolerance_reached` 只是零速 proposal reason，最终 `arrived` 仍以
   Nav2 action result 为准；
 - Nav2 Humble 固定创建 pose 与 through-poses 两个内部 navigator；卡片为二者
