@@ -7,12 +7,21 @@ On-device text-to-speech using sherpa-onnx MeloTTS (Chinese + English).
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import json
 import logging
+import os
 import queue
+import struct
+import sys
 import threading
+import time
+import types
 from abc import ABC, abstractmethod
 from typing import Optional
+
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
@@ -158,10 +167,239 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
 
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     import os
+    backend = cfg.get('backend', 'sherpa-onnx')
     model_dir = cfg.get('model_dir', '/models/sherpa-onnx/tts')
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
+
+    if backend == 'trt':
+        trt_dir = cfg.get('trt_dir', os.path.join(model_dir, 'trt'))
+        model_type = cfg.get('model_type', 'mel20full_d50')
+        return TRTTSAdapter(model_dir, trt_dir, speaker_id, speed, model_type)
+
     return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
+
+
+# ── ORT Session Cache ────────────────────────────────────────────────────────
+_ORT_SESSIONS = {}
+_TRT_ENGINES = {}
+
+
+def _get_ort_session(path):
+    if path not in _ORT_SESSIONS:
+        import onnxruntime as ort
+        _ORT_SESSIONS[path] = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    return _ORT_SESSIONS[path]
+
+
+def _get_trt_engine(path):
+    if path not in _TRT_ENGINES:
+        import tensorrt as trt
+        with open(path, "rb") as f:
+            _TRT_ENGINES[path] = trt.Runtime(trt.Logger(trt.Logger.WARNING)).deserialize_cuda_engine(f.read())
+    return _TRT_ENGINES[path]
+
+
+# ── TRT TTS Adapter (VITS2-Mix, no PyTorch) ────────────────────────────────
+
+class TRTTSAdapter(TTSAdapter):
+    """VITS2-Mix TensorRT TTS adapter — no PyTorch dependency.
+
+    Uses ONNX Runtime for encoder, TRT engines for flow + decoder,
+    and NumPy for iSTFT. Long text is split by sentence boundaries,
+    each chunk always runs through TRT (no ORT fallback).
+    """
+
+    _MODEL_CFG = {
+        "mel20full_d50": {"n_fft": 128, "hop": 4, "gain": 0.0833},
+    }
+
+    # 每个 chunk 最大字符数，保证 decoder 输入 Ty 不超过 TRT max shape (JP5=1500)
+    MAX_CHUNK_CHARS = 100
+
+    def __init__(self, model_dir: str, trt_dir: str,
+                 speaker_id: int = 0, speed: float = 1.0,
+                 model_type: str = "mel20full_d50"):
+        self._speed = speed
+        self._trt_dir = trt_dir
+
+        # ── Frontend (G2P) ──
+        sys.path.insert(0, model_dir)
+        from frontend.cleaner import clean_text_mix
+        from frontend import cleaned_text_to_sequence_mix
+        self._clean_text = clean_text_mix
+        self._seq_mix = cleaned_text_to_sequence_mix
+
+        # ── Model-specific iSTFT parameters ──
+        mc = self._MODEL_CFG.get(model_type, self._MODEL_CFG["mel20full_d50"])
+        self._n_fft = mc["n_fft"]
+        self._hop = mc["hop"]
+        self._gain = mc["gain"]
+
+        # Periodic Hann window (matches TorchSTFT fftbins=True)
+        w = np.hanning(self._n_fft + 1)[:self._n_fft].astype(np.float32)
+        self._window = w.reshape(1, self._n_fft, 1)
+
+        # ── ONNX Runtime encoder (shared across instances) ──
+        encoder_path = os.path.join(trt_dir, "encoder_duration.onnx")
+        self._encoder = _get_ort_session(encoder_path)
+
+        # ── TRT engines (shared across instances via module cache) ──
+        flow_path = os.path.join(trt_dir, "flow.trt")
+        dec_path = os.path.join(trt_dir, "decoder.trt")
+        self._flow_eng = _get_trt_engine(flow_path)
+        self._dec_eng = _get_trt_engine(dec_path)
+        if self._flow_eng is None or self._dec_eng is None:
+            raise RuntimeError(f"Failed to load TRT engines from {trt_dir}")
+
+        # ── CUDA allocator ──
+        self._cuda = ctypes.CDLL("libcudart.so")
+        self._cuda.cudaMalloc.restype = int
+        self._cuda.cudaMalloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self._cuda.cudaFree.restype = int
+        self._cuda.cudaFree.argtypes = [ctypes.c_void_p]
+        self._cuda.cudaMemcpy.restype = int
+        self._cuda.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                           ctypes.c_size_t, ctypes.c_int]
+
+        log.info("[tts] TRT adapter loaded: model=%s n_fft=%d hop=%d gain=%.4f",
+                 model_type, self._n_fft, self._hop, self._gain)
+
+    def _gpu_alloc(self, size):
+        ptr = ctypes.c_void_p(0)
+        self._cuda.cudaMalloc(ctypes.byref(ptr), size)
+        return ptr
+
+    def _trt_run(self, engine, inputs, output_names):
+        import tensorrt as trt
+        ctx = engine.create_execution_context()
+        gpu_ptrs, outputs = {}, {}
+        for i in range(engine.num_io_tensors):
+            name = engine.get_tensor_name(i)
+            if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                data = inputs[name].astype(np.float32)
+                ctx.set_input_shape(name, data.shape)
+                ptr = self._gpu_alloc(data.nbytes)
+                self._cuda.cudaMemcpy(ptr, data.ctypes.data, data.nbytes, 1)  # H2D
+                gpu_ptrs[name] = ptr
+            else:
+                shape = tuple(ctx.get_tensor_shape(name))
+                outputs[name] = np.empty(shape, dtype=np.float32)
+                ptr = self._gpu_alloc(outputs[name].nbytes)
+                gpu_ptrs[name] = ptr
+        bindings = [gpu_ptrs[engine.get_tensor_name(i)].value
+                     for i in range(engine.num_io_tensors)]
+        ctx.execute_v2(bindings)
+        for name, arr in outputs.items():
+            self._cuda.cudaMemcpy(arr.ctypes.data, gpu_ptrs[name], arr.nbytes, 2)  # D2H
+        for p in gpu_ptrs.values():
+            self._cuda.cudaFree(p)
+        return tuple(outputs[n] for n in output_names)
+
+    @staticmethod
+    def _split_sentences(text: str) -> list:
+        """按句号截断，超长文本分批，每批不超过 MAX_CHUNK_CHARS 字符。"""
+        import re
+        sentences = re.split(r'(?<=[。！？\n])', text)
+        chunks, buf = [], ""
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            if len(buf) + len(s) <= TRTTSAdapter.MAX_CHUNK_CHARS:
+                buf += s
+            else:
+                if buf:
+                    chunks.append(buf)
+                buf = s
+        if buf:
+            chunks.append(buf)
+        return chunks if chunks else [text]
+
+    def synthesize(self, text: str) -> bytes:
+        return b"".join(self.synthesize_stream(text))
+
+    def _synthesize_chunk(self, text: str, noise_scale: float = 0.667):
+        """Synthesize a single text chunk through TRT, returning float32 numpy array."""
+        t0 = time.perf_counter()
+        # ── 1. Text → phoneme IDs ──
+        norm_text, phones, tones, langs, _ = self._clean_text(text)
+        phone_ids, tone_ids, lang_ids = self._seq_mix(phones, tones, langs)
+        phone_ids = [0] + [p for pid in phone_ids for p in (pid, 0)]
+        tone_ids = [0] + [t for tid in tone_ids for t in (tid, 0)]
+        lang_ids = [0] + [l for lid in lang_ids for l in (lid, 0)]
+        T = len(phone_ids)
+
+        ph = np.array([phone_ids], dtype=np.int32)
+        to = np.array([tone_ids], dtype=np.int32)
+        la = np.array([lang_ids], dtype=np.int32)
+        xl = np.array([T], dtype=np.int32)
+
+        # ── 2. Encoder (ORT) ──
+        m_p, logs_p, logw, x_mask = self._encoder.run(None,
+            {"ph": ph, "to": to, "la": la, "xl": xl})
+
+        # ── 3. Duration expansion (pure NumPy MAS) ──
+        w = np.exp(logw[0, 0, :T]) * x_mask[0, 0, :T]
+        w_ceil = np.ceil(w).astype(np.int32)
+        Ty = max(1, int(w_ceil.sum()))
+        y_mask = np.ones((1, 1, Ty), dtype=np.float32)
+
+        cum_dur = np.cumsum(w_ceil)
+        attn = np.zeros((1, T, Ty), dtype=np.float32)
+        for tx in range(T):
+            end_pos = int(cum_dur[tx])
+            start_pos = end_pos - int(w_ceil[tx])
+            if start_pos < Ty and end_pos > 0:
+                lo, hi = max(start_pos, 0), min(end_pos, Ty)
+                if hi > lo:
+                    attn[0, tx, lo:hi] = 1.0
+
+        m_p_exp = np.matmul(m_p[:, :, :T], attn)
+        logs_p_exp = np.matmul(logs_p[:, :, :T], attn)
+        z_p = m_p_exp + np.random.randn(1, 256, Ty).astype(np.float32) * np.exp(logs_p_exp) * noise_scale
+
+        # ── 4. Flow (TRT) ──
+        z, = self._trt_run(self._flow_eng, {"z_p": z_p, "y_mask": y_mask}, ["z"])
+
+        # ── 5. Decoder (TRT) ──
+        spec, phase = self._trt_run(self._dec_eng, {"z": z}, ["spec", "phase"])
+
+        # ── 6. iSTFT (NumPy bincount overlap-add) ──
+        tf = np.fft.irfft(spec * np.exp(1j * phase), n=self._n_fft, axis=1)
+        wf2d = tf[0] * self._window[0]
+        _, T_frames = wf2d.shape
+        out_len = (T_frames - 1) * self._hop + self._n_fft
+        base = np.arange(T_frames, dtype=np.int32) * self._hop
+        offsets = np.arange(self._n_fft, dtype=np.int32)[:, None]
+        indices = (base + offsets).ravel()
+        audio = np.bincount(indices, weights=wf2d.ravel().astype(np.float64),
+                            minlength=out_len).astype(np.float32)
+        audio = audio[self._n_fft // 2:out_len - self._n_fft // 2].reshape(1, -1) * self._gain
+
+        if self._speed and self._speed != 1.0:
+            target_len = int(audio.shape[1] / self._speed)
+            xp = np.linspace(0, 1, audio.shape[1])
+            x = np.linspace(0, 1, target_len)
+            audio = np.interp(x, xp, audio[0]).reshape(1, -1).astype(np.float32)
+
+        # ── 7. Convert to PCM ──
+        audio_f32 = audio[0]
+        peak = max(abs(audio_f32.max()), abs(audio_f32.min()), 1.0)
+        if peak > 1.5:
+            audio_f32 = audio_f32 * (1.0 / peak)
+        t1 = time.perf_counter()
+        log.info("[tts] chunk %d chars %d phones → Ty=%d T_frames=%d | total=%dms audio=%.1fs",
+                 len(text), T, Ty, T_frames, int((t1 - t0) * 1000), len(audio_f32) / 16000)
+        return audio_f32
+
+    def synthesize_stream(self, text: str):
+        chunks = self._split_sentences(text)
+        for chunk_text in chunks:
+            audio_f32 = self._synthesize_chunk(chunk_text)
+            pcm = np.clip(audio_f32 * 32767, -32768, 32767).astype(np.int16).tobytes()
+            for i in range(0, len(pcm), CHUNK_BYTES):
+                yield pcm[i:i + CHUNK_BYTES]
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────

@@ -133,6 +133,52 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
+# ── VITS2 TRT TTS (optional backend, JP5 TRT 8.5.2) ──────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    numpy pypinyin jieba wetext inflect g2p-en nltk cn2an
+
+ARG VITS2_BASE_URL=http://172.28.4.81:34567/zhangjinghong/vits2_submit
+RUN mkdir -p /models/vits2-mix/vits2/text /models/vits2-mix/frontend /models/vits2-mix/tn_cache && \
+    cd /models/vits2-mix && \
+    curl -fsSL -o config.json "${VITS2_BASE_URL}/config.json" && \
+    for f in models.py modules.py commons.py attentions.py transforms.py stft.py utils.py monotonic_align.py; do \
+        curl -fsSL -o "vits2/$f" "${VITS2_BASE_URL}/vits2_src/$f"; \
+    done && \
+    curl -fsSL -o vits2/text/__init__.py "${VITS2_BASE_URL}/vits2_src/text/__init__.py" && \
+    curl -fsSL -o vits2/text/symbols.py "${VITS2_BASE_URL}/vits2_src/text/symbols.py" && \
+    for f in __init__.py cleaner.py chinese.py english.py heteronym.py tone_sandhi.py unified_g2p.py symbols.py cmudict.rep cmudict_cache.pickle; do \
+        curl -fsSL -o "frontend/$f" "${VITS2_BASE_URL}/frontend/$f"; \
+    done && \
+    curl -fsSL -o frontend/opencpop-strict.txt "${VITS2_BASE_URL}/opencpop-strict.txt" && \
+    for f in zh_tn_tagger.fst zh_tn_verbalizer.fst en_tn_tagger.fst en_tn_verbalizer.fst; do \
+        curl -fsSL -o "tn_cache/$f" "${VITS2_BASE_URL}/tn_cache/$f"; \
+    done && \
+    echo "VITS2 model files installed" && \
+    python3 -c "import site,os; p=os.path.join(site.getsitepackages()[0],'tn','chinese'); os.makedirs(p,exist_ok=True); open(os.path.join(p,'normalizer.py'),'w').write('class Normalizer:\\n    def __init__(self,**kw):pass\\n    def normalize(self,t):return t\\n'); open(os.path.join(os.path.dirname(p),'__init__.py'),'w').close(); open(os.path.join(p,'__init__.py'),'w').close(); print('tn chinese stub ok')" && \
+    python3 -c "import site,os; p=os.path.join(site.getsitepackages()[0],'tn','english'); os.makedirs(p,exist_ok=True); open(os.path.join(p,'normalizer.py'),'w').write('class Normalizer:\\n    def __init__(self,**kw):pass\\n    def normalize(self,t):return t\\n'); open(os.path.join(p,'__init__.py'),'w').close(); print('tn english stub ok')" && \
+    mkdir -p /models/vits2-mix/nltk_data/taggers /models/vits2-mix/nltk_data/tokenizers /models/vits2-mix/nltk_data/corpora && \
+    curl -fsSL -o /tmp/nltk_1.zip "${VITS2_BASE_URL}/nltk/averaged_perceptron_tagger_eng.zip" && \
+    unzip -qo /tmp/nltk_1.zip -d /models/vits2-mix/nltk_data/taggers/ && rm /tmp/nltk_1.zip && \
+    curl -fsSL -o /tmp/nltk_2.zip "${VITS2_BASE_URL}/nltk/punkt_tab.zip" && \
+    unzip -qo /tmp/nltk_2.zip -d /models/vits2-mix/nltk_data/tokenizers/ && rm /tmp/nltk_2.zip && \
+    curl -fsSL -o /tmp/nltk_3.zip "${VITS2_BASE_URL}/nltk/cmudict.zip" && \
+    unzip -qo /tmp/nltk_3.zip -d /models/vits2-mix/nltk_data/corpora/ && rm /tmp/nltk_3.zip && \
+    echo "NLTK data installed"
+
+ENV NLTK_DATA=/models/vits2-mix/nltk_data
+
+# ── VITS2 mel20full_d50 TRT engine (JP5, TRT 8.5.2) ──────────────
+ARG TRT_MEL20FULL_D50_URL=http://172.28.4.81:34567/zhangjinghong/vits2_submit/mel20full_d50trt_jp5
+RUN mkdir -p /models/vits2-mix/trt_mel20full_d50 && \
+    cd /models/vits2-mix/trt_mel20full_d50 && \
+    curl -fsSL -o encoder_duration.onnx "${TRT_MEL20FULL_D50_URL}/encoder_duration.onnx" && \
+    curl -fsSL -o flow.trt              "${TRT_MEL20FULL_D50_URL}/flow.trt" && \
+    curl -fsSL -o flow.onnx             "${TRT_MEL20FULL_D50_URL}/flow.onnx" && \
+    curl -fsSL -o decoder.trt           "${TRT_MEL20FULL_D50_URL}/decoder.trt" && \
+    curl -fsSL -o decoder_spec.onnx      "${TRT_MEL20FULL_D50_URL}/decoder_spec.onnx" && \
+    echo "TRT engines mel20full_d50:" && ls -lh
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
