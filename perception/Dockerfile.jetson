@@ -138,42 +138,29 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     numpy pypinyin jieba inflect g2p-en nltk kaldifst
 
-ARG VITS2_BASE_URL=http://172.28.4.81:34567/zhangjinghong/vits2_submit
 ARG WETEXT_URL=https://dou-1257995901.cos.ap-guangzhou.myqcloud.com/source_code
-RUN mkdir -p /models/vits2-mix/vits2/text /models/vits2-mix/frontend && \
+RUN mkdir -p /models/vits2-mix/frontend && \
     cd /models/vits2-mix && \
-    curl -fsSL -o config.json "${VITS2_BASE_URL}/config.json" && \
-    for f in models.py modules.py commons.py attentions.py transforms.py stft.py utils.py monotonic_align.py; do \
-        curl -fsSL -o "vits2/$f" "${VITS2_BASE_URL}/vits2_src/$f"; \
-    done && \
-    curl -fsSL -o vits2/text/__init__.py "${VITS2_BASE_URL}/vits2_src/text/__init__.py" && \
-    curl -fsSL -o vits2/text/symbols.py "${VITS2_BASE_URL}/vits2_src/text/symbols.py" && \
+    curl -fsSL -o /tmp/vits2_model.tar.gz "${WETEXT_URL}/vits2_model.tar.gz" && \
+    tar -xzf /tmp/vits2_model.tar.gz -C /models/vits2-mix && rm /tmp/vits2_model.tar.gz && \
     curl -fsSL -o /tmp/frontend.tar.gz "${WETEXT_URL}/frontend.tar.gz" && \
     tar -xzf /tmp/frontend.tar.gz -C /models/vits2-mix/frontend && rm /tmp/frontend.tar.gz && \
     curl -fsSL -o /tmp/wetext_with_fsts.tar.gz "${WETEXT_URL}/wetext_with_fsts.tar.gz" && \
     tar -xzf /tmp/wetext_with_fsts.tar.gz -C "$(python3 -c 'import site; print(site.getsitepackages()[0])')" && rm /tmp/wetext_with_fsts.tar.gz && \
-    echo "VITS2 model files installed" && \
     mkdir -p /models/vits2-mix/nltk_data/taggers /models/vits2-mix/nltk_data/tokenizers /models/vits2-mix/nltk_data/corpora && \
-    curl -fsSL -o /tmp/nltk_1.zip "${VITS2_BASE_URL}/nltk/averaged_perceptron_tagger_eng.zip" && \
-    unzip -qo /tmp/nltk_1.zip -d /models/vits2-mix/nltk_data/taggers/ && rm /tmp/nltk_1.zip && \
-    curl -fsSL -o /tmp/nltk_2.zip "${VITS2_BASE_URL}/nltk/punkt_tab.zip" && \
-    unzip -qo /tmp/nltk_2.zip -d /models/vits2-mix/nltk_data/tokenizers/ && rm /tmp/nltk_2.zip && \
-    curl -fsSL -o /tmp/nltk_3.zip "${VITS2_BASE_URL}/nltk/cmudict.zip" && \
-    unzip -qo /tmp/nltk_3.zip -d /models/vits2-mix/nltk_data/corpora/ && rm /tmp/nltk_3.zip && \
-    echo "NLTK data installed"
+    unzip -qo /models/vits2-mix/nltk/averaged_perceptron_tagger_eng.zip -d /models/vits2-mix/nltk_data/taggers/ && \
+    unzip -qo /models/vits2-mix/nltk/punkt_tab.zip -d /models/vits2-mix/nltk_data/tokenizers/ && \
+    unzip -qo /models/vits2-mix/nltk/cmudict.zip -d /models/vits2-mix/nltk_data/corpora/ && \
+    echo "VITS2 model files installed"
 
 ENV NLTK_DATA=/models/vits2-mix/nltk_data
 
 # ── VITS2 mel20full_d50 TRT engine (JP5, TRT 8.5.2) ──────────────
-ARG TRT_MEL20FULL_D50_URL=http://172.28.4.81:34567/zhangjinghong/vits2_submit/mel20full_d50trt_jp5
-RUN mkdir -p /models/vits2-mix/trt_mel20full_d50 && \
-    cd /models/vits2-mix/trt_mel20full_d50 && \
-    curl -fsSL -o encoder_duration.onnx "${TRT_MEL20FULL_D50_URL}/encoder_duration.onnx" && \
-    curl -fsSL -o flow.trt              "${TRT_MEL20FULL_D50_URL}/flow.trt" && \
-    curl -fsSL -o flow.onnx             "${TRT_MEL20FULL_D50_URL}/flow.onnx" && \
-    curl -fsSL -o decoder.trt           "${TRT_MEL20FULL_D50_URL}/decoder.trt" && \
-    curl -fsSL -o decoder_spec.onnx      "${TRT_MEL20FULL_D50_URL}/decoder_spec.onnx" && \
-    echo "TRT engines mel20full_d50:" && ls -lh
+RUN cd /models/vits2-mix && \
+    curl -fsSL -o /tmp/trt_mel20full_d50.tar.gz "${WETEXT_URL}/trt_mel20full_d50.tar.gz" && \
+    tar -xzf /tmp/trt_mel20full_d50.tar.gz -C /models/vits2-mix && rm /tmp/trt_mel20full_d50.tar.gz && \
+    mv /models/vits2-mix/mel20full_d50trt_jp5 /models/vits2-mix/trt_mel20full_d50 && \
+    echo "TRT engines mel20full_d50:" && ls -lh /models/vits2-mix/trt_mel20full_d50/
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
