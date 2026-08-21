@@ -344,14 +344,20 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 MCAP/ROS 工具再手工解包：
 
 - `rgb/frame-XXXXXXXX.jpg`：原始 JPEG；
+- `depth/depth-<source_stamp_ns>.png`：与 RGB 最近邻匹配的 16-bit 灰度
+  Z16 深度图；像素保留 Driver 原始无符号整数，米制距离为
+  `pixel * frame.depth_parameters.depth_scale_m`，同一 Depth 帧按源
+  时间戳去重；
 - `lidar/lidar-<source_stamp_ns>.pcd`：与图片配对的 binary PCD，XYZ 为
   little-endian float32 米；同一雷达帧被多张图片复用时只保存一份；
-- `frames/frame-XXXXXXXX.json`：逐图记录图片 ID/路径、雷达 ID/路径、各路
+- `frames/frame-XXXXXXXX.json`：逐图记录图片 ID/路径、Depth ID/路径与
+  `depth_scale_m`、雷达 ID/路径、各路
   source timestamp、相机宽高与 `fx/fy/cx/cy`、像素单位等效焦距
   `sqrt(fx*fy)`、畸变参数、障碍物 ID、相机光学坐标系最近 LiDAR 三维点、
   LiDAR 距离真值与失败原因；
 - `tracks.json`：session 内稳定的 `obs-XXXXXX` 轨迹 ID；
-- `manifest.json`：总图片/雷达帧数、有效/无效帧数、产物格式与最终状态；
+- `manifest.json`：总图片/Depth/雷达帧数、有效/无效帧数、产物格式与
+  最终状态；
 - `postprocess.json`：可读回的任务进度/错误日志。
 
 这里的“等效焦距”明确使用像素单位；没有传感器物理尺寸时不会伪造毫米焦距。
@@ -359,7 +365,8 @@ MCAP/ROS 工具再手工解包：
 不是单目估计值。原始 MCAP 继续保留完整 ROS 消息，作为可追溯源数据。
 
 流程使用 IMU 重力方向移除地面、LiDAR 点云做几何聚类，再通过
-标定外参投影到每张 RGB；Depth v2 当前作为同步原始证据保存，尚不参与
+标定外参投影到每张 RGB；Depth v2 同时保留在原始 MCAP 和可直接查看的
+16-bit PNG 产物中，当前尚不参与
 障碍物最近点真值计算。卡片或
 导航 runtime 活跃时 worker 自动暂停，卡片停止后继续，避免与定位/
 规划抢占 G1 CPU。ActuCore 重启后会重新发现已完成但尚无

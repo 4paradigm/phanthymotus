@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import tempfile
 import time
 import unittest
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -174,6 +176,37 @@ def synthetic_points() -> np.ndarray:
     return np.vstack((ground, obstacle))
 
 
+def decode_grayscale16_png(payload: bytes) -> tuple[int, int, np.ndarray]:
+    assert payload.startswith(b"\x89PNG\r\n\x1a\n")
+    offset = 8
+    width = height = 0
+    compressed = bytearray()
+    while offset < len(payload):
+        size = struct.unpack_from(">I", payload, offset)[0]
+        name = payload[offset + 4 : offset + 8]
+        data = payload[offset + 8 : offset + 8 + size]
+        offset += 12 + size
+        if name == b"IHDR":
+            width, height, bit_depth, color_type, _, _, _ = struct.unpack(
+                ">IIBBBBB", data
+            )
+            assert (bit_depth, color_type) == (16, 0)
+        elif name == b"IDAT":
+            compressed.extend(data)
+        elif name == b"IEND":
+            break
+    rows = zlib.decompress(bytes(compressed))
+    stride = width * 2 + 1
+    assert len(rows) == stride * height
+    image = np.vstack(
+        [
+            np.frombuffer(rows[row * stride + 1 : (row + 1) * stride], dtype=">u2")
+            for row in range(height)
+        ]
+    )
+    return width, height, image
+
+
 class FakeReader:
     def __init__(self, records: list[dict]):
         self.records = records
@@ -254,6 +287,20 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             {"stamp_ns": stamp, "t_map_base": np.eye(4)},
             SessionTracker(),
             0,
+            {
+                "stamp_ns": stamp,
+                "frame_id": "camera_depth_optical_frame",
+                "depth_id": f"depth-{stamp:019d}",
+                "depth_path": f"depth/depth-{stamp:019d}.png",
+                "metadata": {
+                    "width": 2,
+                    "height": 2,
+                    "encoding": "z16_le",
+                    "depth_scale_m": 0.001,
+                    "aligned_to_rgb": False,
+                    "receive_stamp_ns": stamp + 1_000_000,
+                },
+            },
         )
         self.assertEqual(result["status"], "valid", result)
         self.assertTrue(result["obstacles"])
@@ -277,6 +324,8 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
         stamp = metadata()["source_stamp_ns"]
         lidar_stamp = stamp + 50_000_000
         imu_stamp = lidar_stamp + 1_000_000
+        depth_stamp = stamp + 40_000_000
+        raw_depth = np.asarray((100, 200, 300, 400), dtype="<u2").tobytes()
         records = [
             {
                 "kind": "lidar",
@@ -290,6 +339,24 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
                 "gravity": np.asarray((0.0, 0.0, -9.81)),
             },
             {"kind": "odom", "stamp_ns": stamp, "t_map_base": np.eye(4)},
+            {
+                "kind": "depth_v2",
+                "stamp_ns": depth_stamp,
+                "frame_id": "camera_depth_optical_frame",
+                "metadata": {
+                    "source_stamp_ns": depth_stamp,
+                    "receive_stamp_ns": depth_stamp + 1_000_000,
+                    "frame_id": "camera_depth_optical_frame",
+                    "calibration_id": "sha256:test",
+                    "width": 2,
+                    "height": 2,
+                    "encoding": "z16_le",
+                    "step_bytes": 4,
+                    "depth_scale_m": 0.001,
+                    "aligned_to_rgb": False,
+                },
+                "depth": raw_depth,
+            },
             {
                 "kind": "rgb_v2",
                 "stamp_ns": stamp,
@@ -309,6 +376,7 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             )
             self.assertEqual(manifest["processed_images"], 1)
             self.assertEqual(manifest["lidar_frames"], 1)
+            self.assertEqual(manifest["depth_frames"], 1)
             self.assertTrue((session / "derived" / "rgb" / "frame-00000001.jpg").is_file())
             lidar_id = f"lidar-{lidar_stamp:019d}"
             lidar_path = session / "derived" / "lidar" / f"{lidar_id}.pcd"
@@ -320,23 +388,43 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
                 f"POINTS {len(synthetic_points())}\n".encode("ascii"), lidar_header
             )
             self.assertEqual(len(lidar_binary), len(synthetic_points()) * 3 * 4)
+            depth_id = f"depth-{depth_stamp:019d}"
+            depth_path = session / "derived" / "depth" / f"{depth_id}.png"
+            width, height, decoded_depth = decode_grayscale16_png(
+                depth_path.read_bytes()
+            )
+            self.assertEqual((width, height), (2, 2))
+            np.testing.assert_array_equal(
+                decoded_depth,
+                np.asarray(((100, 200), (300, 400)), dtype=np.uint16),
+            )
             frame_path = session / "derived" / "frames" / "frame-00000001.json"
             self.assertTrue(frame_path.is_file())
             frame = json.loads(frame_path.read_text(encoding="utf-8"))
             self.assertEqual(frame["schema"], "phanthy.navigation.obstacle_frame.v1")
             self.assertEqual(frame["lidar_id"], lidar_id)
             self.assertEqual(frame["lidar_path"], f"lidar/{lidar_id}.pcd")
+            self.assertEqual(frame["depth_id"], depth_id)
+            self.assertEqual(frame["depth_path"], f"depth/{depth_id}.png")
             self.assertEqual(frame["timestamps_ns"]["image_source"], stamp)
             self.assertEqual(frame["timestamps_ns"]["lidar_source"], lidar_stamp)
             self.assertEqual(frame["timestamps_ns"]["imu_source"], imu_stamp)
+            self.assertEqual(frame["timestamps_ns"]["depth_source"], depth_stamp)
             self.assertEqual(frame["time_skew_ms"]["image_lidar"], 50.0)
             self.assertEqual(frame["time_skew_ms"]["lidar_imu"], 1.0)
+            self.assertEqual(frame["time_skew_ms"]["image_depth"], 40.0)
+            self.assertEqual(frame["depth_parameters"]["depth_scale_m"], 0.001)
+            self.assertFalse(frame["depth_parameters"]["aligned_to_rgb"])
             self.assertEqual(
                 frame["camera_parameters"]["equivalent_focal_length_px"], 100.0
             )
             self.assertEqual(
                 manifest["artifacts"]["lidar"]["format"],
                 "pcd_binary_xyz_float32_m",
+            )
+            self.assertEqual(
+                manifest["artifacts"]["depth"]["format"],
+                "png_grayscale_16bit_z16",
             )
             self.assertFalse((session / "derived.partial").exists())
             self.assertEqual(events[-1][0], "finalizing")

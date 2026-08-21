@@ -9,9 +9,11 @@ import math
 import os
 from pathlib import Path
 import queue
+import struct
 import threading
 import time
 from typing import Callable, Iterable
+import zlib
 
 import numpy as np
 
@@ -19,6 +21,7 @@ import numpy as np
 ANNOTATION_SCHEMA = "phanthy.navigation.obstacle_frame.v1"
 POSTPROCESS_SCHEMA = "phanthy.navigation.collection_postprocess.v1"
 _SYNC_TOLERANCE_NS = {
+    "depth_v2": 150_000_000,
     "lidar": 60_000_000,
     "imu": 20_000_000,
     "odom": 120_000_000,
@@ -113,6 +116,36 @@ def _pcd_bytes(points: np.ndarray) -> bytes:
         "DATA binary\n"
     ).encode("ascii")
     return header + cloud.tobytes(order="C")
+
+
+def _png_chunk(name: bytes, payload: bytes) -> bytes:
+    checksum = zlib.crc32(name + payload) & 0xFFFFFFFF
+    return (
+        struct.pack(">I", len(payload))
+        + name
+        + payload
+        + struct.pack(">I", checksum)
+    )
+
+
+def _depth_png_bytes(raw_depth: bytes, *, width: int, height: int) -> bytes:
+    """Encode little-endian Z16 as a lossless 16-bit grayscale PNG."""
+
+    if width <= 0 or height <= 0 or len(raw_depth) != width * height * 2:
+        raise PostprocessError("depth_dimensions_invalid")
+    image = np.frombuffer(raw_depth, dtype="<u2").reshape(height, width)
+    scanlines = b"".join(
+        b"\x00" + row.astype(">u2", copy=False).tobytes()
+        for row in image
+    )
+    header = struct.pack(">IIBBBBB", width, height, 16, 0, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + b"".join(
+        (
+            _png_chunk(b"IHDR", header),
+            _png_chunk(b"IDAT", zlib.compress(scanlines, level=6)),
+            _png_chunk(b"IEND", b""),
+        )
+    )
 
 
 def _matrix(value, field: str) -> np.ndarray:
@@ -419,11 +452,13 @@ def annotate_frame(
     odom: dict | None,
     tracker: SessionTracker,
     frame_index: int,
+    depth: dict | None = None,
 ) -> dict:
     image_stamp_ns = int(image["stamp_ns"])
     lidar_stamp_ns = None if lidar is None else int(lidar["stamp_ns"])
     imu_stamp_ns = None if imu is None else int(imu["stamp_ns"])
     odom_stamp_ns = None if odom is None else int(odom["stamp_ns"])
+    depth_stamp_ns = None if depth is None else int(depth["stamp_ns"])
     base = {
         "schema": ANNOTATION_SCHEMA,
         "image_id": image["image_id"],
@@ -432,6 +467,9 @@ def annotate_frame(
         "lidar_id": None if lidar is None else lidar.get("lidar_id"),
         "lidar_path": None if lidar is None else lidar.get("lidar_path"),
         "lidar_frame_id": None if lidar is None else lidar.get("frame_id"),
+        "depth_id": None if depth is None else depth.get("depth_id"),
+        "depth_path": None if depth is None else depth.get("depth_path"),
+        "depth_frame_id": None if depth is None else depth.get("frame_id"),
         "calibration_id": image["metadata"].get("calibration_id"),
         "frame_id": image["metadata"].get("frame_id"),
         "coordinate_convention": "camera_optical_x_right_y_down_z_forward",
@@ -441,10 +479,26 @@ def annotate_frame(
             "lidar_source": lidar_stamp_ns,
             "imu_source": imu_stamp_ns,
             "odom_source": odom_stamp_ns,
+            "depth_source": depth_stamp_ns,
+            "depth_driver_receive": (
+                None if depth is None else depth["metadata"].get("receive_stamp_ns")
+            ),
         },
         "matched_lidar_stamp_ns": lidar_stamp_ns,
         "matched_imu_stamp_ns": imu_stamp_ns,
         "matched_odom_stamp_ns": odom_stamp_ns,
+        "matched_depth_stamp_ns": depth_stamp_ns,
+        "depth_parameters": (
+            None
+            if depth is None
+            else {
+                "width_px": int(depth["metadata"]["width"]),
+                "height_px": int(depth["metadata"]["height"]),
+                "encoding": str(depth["metadata"]["encoding"]),
+                "depth_scale_m": float(depth["metadata"]["depth_scale_m"]),
+                "aligned_to_rgb": bool(depth["metadata"]["aligned_to_rgb"]),
+            }
+        ),
         "distance_ground_truth": {
             "source": "matched_lidar_nearest_visible_point",
             "unit": "meter",
@@ -456,19 +510,31 @@ def annotate_frame(
         base["camera_parameters"] = _camera_parameters(image["metadata"])
     except (KeyError, TypeError, ValueError, PostprocessError) as exc:
         return {**base, "status": "invalid", "failure_reason": str(exc)}
-    missing = [name for name, value in (("lidar", lidar), ("imu", imu), ("odom", odom)) if value is None]
+    missing = [
+        name
+        for name, value in (
+            ("lidar", lidar),
+            ("imu", imu),
+            ("odom", odom),
+            ("depth_v2", depth),
+        )
+        if value is None
+    ]
     if missing:
         return {**base, "status": "invalid", "failure_reason": "missing_time_match:" + ",".join(missing)}
     skews = {
         "image_lidar": abs(lidar_stamp_ns - image_stamp_ns) / 1_000_000.0,
         "lidar_imu": abs(imu_stamp_ns - lidar_stamp_ns) / 1_000_000.0,
         "image_odom": abs(odom_stamp_ns - image_stamp_ns) / 1_000_000.0,
+        "image_depth": abs(depth_stamp_ns - image_stamp_ns) / 1_000_000.0,
     }
     base["time_skew_ms"] = {key: round(value, 3) for key, value in skews.items()}
     if (
         skews["image_lidar"] > _SYNC_TOLERANCE_NS["lidar"] / 1_000_000.0
         or skews["lidar_imu"] > _SYNC_TOLERANCE_NS["imu"] / 1_000_000.0
         or skews["image_odom"] > _SYNC_TOLERANCE_NS["odom"] / 1_000_000.0
+        or skews["image_depth"]
+        > _SYNC_TOLERANCE_NS["depth_v2"] / 1_000_000.0
     ):
         return {**base, "status": "invalid", "failure_reason": "time_skew_exceeded"}
     try:
@@ -552,6 +618,7 @@ class RosbagRecordReader:
 
     def iter_records(self) -> Iterable[dict]:
         try:
+            from g1_fast_livo2.camera_depth_v2 import decode as decode_depth_v2
             from g1_fast_livo2.camera_rgb_v2 import decode as decode_rgb_v2
             from g1_fast_livo2.vectorized_cloud import decode_xyz_array
             from nav_msgs.msg import Odometry
@@ -564,6 +631,11 @@ class RosbagRecordReader:
             "/ubuntu/navigation/camera/rgb": ("rgb_v2", UInt8MultiArray),
             "/ubuntu/navigation/collection/camera/rgb": (
                 "rgb_v2",
+                UInt8MultiArray,
+            ),
+            "/ubuntu/navigation/camera/depth": ("depth_v2", UInt8MultiArray),
+            "/ubuntu/navigation/collection/camera/depth": (
+                "depth_v2",
                 UInt8MultiArray,
             ),
             "/ubuntu/navigation/lidar": ("lidar", PointCloud2),
@@ -588,6 +660,16 @@ class RosbagRecordReader:
                     "stamp_ns": int(metadata["source_stamp_ns"]),
                     "metadata": metadata,
                     "jpeg": jpeg,
+                }
+                continue
+            if kind == "depth_v2":
+                metadata, depth = decode_depth_v2(bytes(message.data))
+                yield {
+                    "kind": kind,
+                    "stamp_ns": int(metadata["source_stamp_ns"]),
+                    "frame_id": str(metadata["frame_id"]),
+                    "metadata": metadata,
+                    "depth": depth,
                 }
                 continue
             header = message.header.stamp
@@ -675,18 +757,21 @@ class OfflineAnnotationProcessor:
             return json.loads((final / "manifest.json").read_text(encoding="utf-8"))
         partial.mkdir(parents=True, exist_ok=True)
         (partial / "rgb").mkdir(exist_ok=True)
+        (partial / "depth").mkdir(exist_ok=True)
         (partial / "lidar").mkdir(exist_ok=True)
         (partial / "frames").mkdir(exist_ok=True)
         buffers = {
             "lidar": deque(maxlen=8),
             "imu": deque(maxlen=64),
             "odom": deque(maxlen=16),
+            "depth_v2": deque(maxlen=16),
         }
         pending = deque()
         pending_bytes = 0
         tracker = SessionTracker()
         processed = valid = invalid = 0
         lidar_ids: set[str] = set()
+        depth_ids: set[str] = set()
 
         def consume(image: dict) -> None:
             nonlocal processed, valid, invalid
@@ -716,6 +801,27 @@ class OfflineAnnotationProcessor:
                     "lidar_id": lidar_id,
                     "lidar_path": lidar_relative_path,
                 }
+            depth = self._nearest(
+                buffers["depth_v2"], int(image["stamp_ns"]), "depth_v2"
+            )
+            if depth is not None:
+                depth_id = f"depth-{int(depth['stamp_ns']):019d}"
+                depth_relative_path = f"depth/{depth_id}.png"
+                if depth_id not in depth_ids:
+                    _atomic_bytes(
+                        partial / depth_relative_path,
+                        _depth_png_bytes(
+                            bytes(depth["depth"]),
+                            width=int(depth["metadata"]["width"]),
+                            height=int(depth["metadata"]["height"]),
+                        ),
+                    )
+                    depth_ids.add(depth_id)
+                depth = {
+                    **depth,
+                    "depth_id": depth_id,
+                    "depth_path": depth_relative_path,
+                }
             imu_reference_stamp_ns = (
                 int(image["stamp_ns"])
                 if lidar is None
@@ -728,6 +834,7 @@ class OfflineAnnotationProcessor:
                 self._nearest(buffers["odom"], int(image["stamp_ns"]), "odom"),
                 tracker,
                 processed,
+                depth,
             )
             _atomic_json(partial / "frames" / f"{image_id}.json", annotation)
             processed += 1
@@ -745,6 +852,10 @@ class OfflineAnnotationProcessor:
                         None if lidar is None else lidar["lidar_id"]
                     ),
                     "generated_lidar_frames": len(lidar_ids),
+                    "current_depth_id": (
+                        None if depth is None else depth["depth_id"]
+                    ),
+                    "generated_depth_frames": len(depth_ids),
                 },
             )
 
@@ -785,10 +896,16 @@ class OfflineAnnotationProcessor:
             "total_images": total,
             "processed_images": processed,
             "lidar_frames": len(lidar_ids),
+            "depth_frames": len(depth_ids),
             "valid_images": valid,
             "invalid_images": invalid,
             "artifacts": {
                 "rgb": {"directory": "rgb", "format": "jpeg"},
+                "depth": {
+                    "directory": "depth",
+                    "format": "png_grayscale_16bit_z16",
+                    "unit": "raw_z16_units; multiply by per-frame depth_scale_m",
+                },
                 "lidar": {
                     "directory": "lidar",
                     "format": "pcd_binary_xyz_float32_m",
