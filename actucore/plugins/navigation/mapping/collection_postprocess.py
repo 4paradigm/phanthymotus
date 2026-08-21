@@ -9,11 +9,9 @@ import math
 import os
 from pathlib import Path
 import queue
-import struct
 import threading
 import time
 from typing import Callable, Iterable
-import zlib
 
 import numpy as np
 
@@ -128,34 +126,20 @@ def _pcd_bytes(points: np.ndarray) -> bytes:
     return header + cloud.tobytes(order="C")
 
 
-def _png_chunk(name: bytes, payload: bytes) -> bytes:
-    checksum = zlib.crc32(name + payload) & 0xFFFFFFFF
-    return (
-        struct.pack(">I", len(payload))
-        + name
-        + payload
-        + struct.pack(">I", checksum)
-    )
-
-
 def _depth_png_bytes(raw_depth: bytes, *, width: int, height: int) -> bytes:
     """Encode little-endian Z16 as a lossless 16-bit grayscale PNG."""
 
     if width <= 0 or height <= 0 or len(raw_depth) != width * height * 2:
         raise PostprocessError("depth_dimensions_invalid")
+    try:
+        import cv2
+    except ImportError as exc:
+        raise PostprocessError("opencv_unavailable_for_depth_export") from exc
     image = np.frombuffer(raw_depth, dtype="<u2").reshape(height, width)
-    scanlines = b"".join(
-        b"\x00" + row.astype(">u2", copy=False).tobytes()
-        for row in image
-    )
-    header = struct.pack(">IIBBBBB", width, height, 16, 0, 0, 0, 0)
-    return b"\x89PNG\r\n\x1a\n" + b"".join(
-        (
-            _png_chunk(b"IHDR", header),
-            _png_chunk(b"IDAT", zlib.compress(scanlines, level=6)),
-            _png_chunk(b"IEND", b""),
-        )
-    )
+    encoded, png = cv2.imencode(".png", image)
+    if not encoded:
+        raise PostprocessError("depth_png_encode_failed")
+    return png.tobytes()
 
 
 def _matrix(value, field: str) -> np.ndarray:

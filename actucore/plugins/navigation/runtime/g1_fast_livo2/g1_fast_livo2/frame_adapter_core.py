@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import chain
 import math
 import os
@@ -21,12 +21,6 @@ _MAX_PCD_ASCII_RECORD_BYTES = 65_536
 _FILTER_METADATA = struct.Struct("<8sff")
 _FILTER_METADATA_MAGIC = b"MVFILT2\0"
 _FULL_MAP_WITH_Z = 0x01 | 0x02
-_COMPONENT_SAMPLE_RATE_HZ = 20.0
-_MAX_COMPONENT_OBSERVATION_WINDOW_SEC = 30.0
-_MAX_COMPONENT_HISTORY_UNITS = 1_000_000
-_COMPONENT_TRACK_HISTORY_UNITS = 64
-_COMPONENT_CELL = struct.Struct("<iiffB")
-_COMPONENT_POINT_2D = struct.Struct("<ff")
 
 
 class InvalidFastLivo2Frame(ValueError):
@@ -109,163 +103,7 @@ class OccupancyGridSnapshot:
 class _PreparedConfirmedState:
     """Fully validated saved-map state awaiting one atomic pointer swap."""
 
-    evidence: dict[tuple[int, int, int], _TemporalVoxelEvidence]
-    xy_index: dict[tuple[int, int], set[tuple[int, int, int]]]
-    bounds: tuple[int, int, int, int] | None
-
-
-@dataclass
-class _TemporalVoxelEvidence:
-    point: tuple[float, float, float]
-    hit_frames: int
-    first_hit_monotonic: float
-    first_hit_point: tuple[float, float, float]
-    last_hit_monotonic: float
-    last_hit_scan: int
-    confirmed: bool = False
-    free_miss_frames: int = 0
-
-
-@dataclass(frozen=True)
-class _ComponentObservation:
-    keys: frozenset[tuple[int, int, int]]
-    cells: frozenset[tuple[int, int]]
-    point_source: dict[
-        tuple[int, int], list[tuple[float, float, float]]
-    ] = field(compare=False, repr=False)
-    centroid_x: float
-    centroid_y: float
-    span_x: float
-    span_y: float
-
-
-@dataclass(frozen=True)
-class _ComponentMotionSample:
-    stamp: float
-    centroid_x: float
-    centroid_y: float
-    cell_count: int
-    payload: bytes
-
-
-@dataclass
-class _TemporalComponentTrack:
-    track_id: int
-    centroid_x: float
-    centroid_y: float
-    first_seen_monotonic: float
-    last_seen_monotonic: float
-    cells: frozenset[tuple[int, int]]
-    samples: list[_ComponentMotionSample]
-    motion_votes: int = 0
-    dynamic: bool = False
-    last_motion_monotonic: float | None = None
-    recent_dynamic_cells: dict[tuple[int, int], float] = field(
-        default_factory=dict
-    )
-    recent_keys: dict[tuple[int, int, int], float] = field(
-        default_factory=dict
-    )
-    history_saturated: bool = False
-
-
-def _component_cell_geometry(
-    component: _ComponentObservation,
-) -> tuple[
-    tuple[tuple[int, int, float, float], ...],
-    tuple[tuple[int, int, tuple[tuple[float, float], ...]], ...],
-]:
-    """Build detailed geometry only when motion comparison needs it."""
-
-    cell_centroids = []
-    sampled_cell_points = []
-    for cell in sorted(component.cells):
-        cell_points = component.point_source[cell]
-        cell_centroids.append(
-            (
-                cell[0],
-                cell[1],
-                sum(point[0] for point in cell_points) / len(cell_points),
-                sum(point[1] for point in cell_points) / len(cell_points),
-            )
-        )
-        ordered_points = sorted(
-            (float(point[0]), float(point[1])) for point in cell_points
-        )
-        if len(ordered_points) > 8:
-            stride = max(1, len(ordered_points) // 8)
-            ordered_points = ordered_points[::stride][:8]
-        sampled_cell_points.append(
-            (cell[0], cell[1], tuple(ordered_points))
-        )
-    return tuple(cell_centroids), tuple(sampled_cell_points)
-
-
-def _pack_component_motion_sample(
-    component: _ComponentObservation,
-    stamp: float,
-) -> _ComponentMotionSample:
-    """Pack bounded per-cell motion evidence without retaining frame objects."""
-
-    cell_centroids, cell_points = _component_cell_geometry(component)
-    centroids_by_cell = {
-        (cell_x, cell_y): (point_x, point_y)
-        for cell_x, cell_y, point_x, point_y in cell_centroids
-    }
-    payload = bytearray()
-    for cell_x, cell_y, points in cell_points:
-        centroid_x, centroid_y = centroids_by_cell[(cell_x, cell_y)]
-        payload.extend(
-            _COMPONENT_CELL.pack(
-                cell_x,
-                cell_y,
-                centroid_x,
-                centroid_y,
-                len(points),
-            )
-        )
-        for point_x, point_y in points:
-            payload.extend(_COMPONENT_POINT_2D.pack(point_x, point_y))
-    return _ComponentMotionSample(
-        stamp=float(stamp),
-        centroid_x=component.centroid_x,
-        centroid_y=component.centroid_y,
-        cell_count=len(cell_points),
-        payload=bytes(payload),
-    )
-
-
-def _unpack_component_motion_sample(
-    sample: _ComponentMotionSample,
-) -> tuple[
-    frozenset[tuple[int, int]],
-    dict[tuple[int, int], tuple[float, float]],
-    dict[tuple[int, int], tuple[tuple[float, float], ...]],
-]:
-    cells: set[tuple[int, int]] = set()
-    centroids: dict[tuple[int, int], tuple[float, float]] = {}
-    point_sets: dict[
-        tuple[int, int], tuple[tuple[float, float], ...]
-    ] = {}
-    offset = 0
-    for _index in range(sample.cell_count):
-        cell_x, cell_y, centroid_x, centroid_y, point_count = (
-            _COMPONENT_CELL.unpack_from(sample.payload, offset)
-        )
-        offset += _COMPONENT_CELL.size
-        points = []
-        for _point_index in range(point_count):
-            points.append(
-                _COMPONENT_POINT_2D.unpack_from(sample.payload, offset)
-            )
-            offset += _COMPONENT_POINT_2D.size
-        cell = (cell_x, cell_y)
-        cells.add(cell)
-        centroids[cell] = (centroid_x, centroid_y)
-        point_sets[cell] = tuple(points)
-    if offset != len(sample.payload):
-        raise RuntimeError("component motion sample payload is inconsistent")
-    return frozenset(cells), centroids, point_sets
+    evidence: dict[tuple[int, int, int], tuple[float, float, float]]
 
 
 def nearest_stamped_pose(
@@ -1242,64 +1080,31 @@ def encode_map_view_points(
 
 
 class TemporalOccupancyMap:
-    """Accumulate navigation-height geometry with an optional motion gate.
-
-    Direct accumulation preserves every observed voxel until the map is reset.
-    The optional dynamic filter retains the older multi-frame confirmation and
-    ray-clearing behavior for controlled experiments, but production mapping
-    does not enable it.
-    """
+    """Accumulate every observed navigation-height voxel until reset."""
 
     def __init__(
         self,
         voxel_size_m: float,
         *,
-        confirmation_frames: int = 8,
-        candidate_ttl_sec: float = 1.0,
-        clear_miss_frames: int = 3,
         raytrace_min_range_m: float = 0.20,
         raytrace_max_range_m: float = 8.5,
         angular_bin_deg: float = 1.0,
         grid_margin_m: float = 6.0,
         max_grid_dimension_cells: int = 2048,
         max_grid_cells: int = 2_000_000,
-        component_motion_window_sec: float = 0.40,
-        component_history_sec: float = 0.80,
-        component_motion_distance_m: float = 0.03,
-        component_motion_speed_mps: float = 0.03,
-        component_stationary_sec: float = 1.50,
-        component_max_span_m: float = 1.00,
-        component_match_distance_m: float = 0.60,
-        component_min_cells: int = 1,
         max_evidence_points: int = 200_000,
-        max_component_history_units: int = 1_000_000,
-        dynamic_filter_enabled: bool = True,
     ):
         values = (
             voxel_size_m,
-            candidate_ttl_sec,
             raytrace_min_range_m,
             raytrace_max_range_m,
             angular_bin_deg,
             grid_margin_m,
-            component_motion_window_sec,
-            component_history_sec,
-            component_motion_distance_m,
-            component_motion_speed_mps,
-            component_stationary_sec,
-            component_max_span_m,
-            component_match_distance_m,
         )
         if not all(math.isfinite(value) for value in values):
             raise ValueError("temporal occupancy parameters must be finite")
         if voxel_size_m <= 0:
             raise ValueError("voxel_size_m must be positive")
-        if confirmation_frames < 2:
-            raise ValueError("confirmation_frames must be at least 2")
-        if candidate_ttl_sec <= 0:
-            raise ValueError("candidate_ttl_sec must be positive")
-        if clear_miss_frames < 1:
-            raise ValueError("clear_miss_frames must be positive")
         if not 0 <= raytrace_min_range_m < raytrace_max_range_m:
             raise ValueError("raytrace range is invalid")
         if not 0 < angular_bin_deg <= 10:
@@ -1308,92 +1113,23 @@ class TemporalOccupancyMap:
             raise ValueError("grid_margin_m must cover at least one voxel")
         if max_grid_dimension_cells < 1 or max_grid_cells < 1:
             raise ValueError("occupancy grid limits must be positive")
-        if not 0 < component_motion_window_sec <= component_history_sec:
-            raise ValueError("component motion/history window is invalid")
-        if component_motion_distance_m <= 0 or component_motion_speed_mps <= 0:
-            raise ValueError("component motion thresholds must be positive")
-        if component_stationary_sec <= component_history_sec:
-            raise ValueError("component stationary time must exceed history time")
-        if component_max_span_m <= voxel_size_m:
-            raise ValueError("component maximum span must exceed one voxel")
-        if component_match_distance_m <= voxel_size_m:
-            raise ValueError("component match distance must exceed one voxel")
-        if component_min_cells < 1:
-            raise ValueError("component_min_cells must be positive")
         if max_evidence_points < 40:
             raise ValueError("max_evidence_points must be at least 40")
-        if not 40 <= max_component_history_units <= _MAX_COMPONENT_HISTORY_UNITS:
-            raise ValueError(
-                "max_component_history_units must be within "
-                f"[40, {_MAX_COMPONENT_HISTORY_UNITS}]"
-            )
-        if not isinstance(dynamic_filter_enabled, bool):
-            raise ValueError("dynamic_filter_enabled must be boolean")
 
         self._voxel = voxel_size_m
-        self._confirmation_frames = confirmation_frames
-        self._candidate_ttl_sec = candidate_ttl_sec
-        self._clear_miss_frames = clear_miss_frames
         self._raytrace_min_range = raytrace_min_range_m
         self._raytrace_max_range = raytrace_max_range_m
         self._angular_bin = math.radians(angular_bin_deg)
         self._grid_margin_cells = math.ceil(grid_margin_m / voxel_size_m)
         self._max_grid_dimension_cells = int(max_grid_dimension_cells)
         self._max_grid_cells = int(max_grid_cells)
-        self._component_motion_window = component_motion_window_sec
-        self._component_history = component_history_sec
-        self._component_motion_distance = component_motion_distance_m
-        self._component_motion_speed = component_motion_speed_mps
-        # A moving return can stay inside one XY voxel without changing its
-        # occupied cell.  Do not admit that cell to the static map until an
-        # object moving at the configured threshold would necessarily have
-        # crossed a full voxel diagonal (plus one motion-comparison window).
-        # The diagonal covers every entry phase and direction through a cell.
-        # This is
-        # deliberately based on occupancy residence rather than the raw point
-        # centroid inside a cell: LiDAR sampling can move several centimetres
-        # along a perfectly static wall while the occupied voxel stays fixed.
-        self._component_observation_window = max(
-            component_history_sec,
-            component_motion_distance_m / component_motion_speed_mps,
-            math.sqrt(2.0) * voxel_size_m / component_motion_speed_mps
-            + component_motion_window_sec,
-        )
-        if (
-            self._component_observation_window
-            > _MAX_COMPONENT_OBSERVATION_WINDOW_SEC
-        ):
-            raise ValueError(
-                "component observation window exceeds "
-                f"{_MAX_COMPONENT_OBSERVATION_WINDOW_SEC:.0f}s safety limit"
-            )
-        self._component_sample_interval = 1.0 / _COMPONENT_SAMPLE_RATE_HZ
-        self._component_track_sample_limit = math.ceil(
-            self._component_observation_window
-            / self._component_sample_interval
-        ) + 2
-        self._component_stationary = component_stationary_sec
-        self._component_max_span = component_max_span_m
-        self._component_match_distance = component_match_distance_m
-        self._component_min_cells = int(component_min_cells)
         self._max_evidence_points = int(max_evidence_points)
-        self._component_history_unit_limit = int(
-            max_component_history_units
-        )
-        self._dynamic_filter_enabled = dynamic_filter_enabled
         self._evidence: dict[
-            tuple[int, int, int], _TemporalVoxelEvidence
+            tuple[int, int, int], tuple[float, float, float]
         ] = {}
-        self._candidates: set[tuple[int, int, int]] = set()
-        self._xy_index: dict[tuple[int, int], set[tuple[int, int, int]]] = {}
         self._free_cells: set[tuple[int, int]] = set()
         self._bounds: tuple[int, int, int, int] | None = None
-        self._scan_index = 0
         self._read_only_baseline = False
-        self._component_tracks: dict[int, _TemporalComponentTrack] = {}
-        self._next_component_track_id = 1
-        self._dynamic_track_count = 0
-        self._quarantined_point_count = 0
         self._last_observation_monotonic: float | None = None
 
     def clear(self) -> None:
@@ -1404,91 +1140,34 @@ class TemporalOccupancyMap:
 
         retired = (
             self._evidence,
-            self._candidates,
-            self._xy_index,
             self._free_cells,
-            self._component_tracks,
         )
         self._evidence = {}
-        self._candidates = set()
-        self._xy_index = {}
         self._free_cells = set()
         self._bounds = None
-        self._scan_index = 0
         self._read_only_baseline = False
-        self._component_tracks = {}
-        self._next_component_track_id = 1
-        self._dynamic_track_count = 0
-        self._quarantined_point_count = 0
         self._last_observation_monotonic = None
         return retired
 
     @property
     def point_count(self) -> int:
-        return sum(1 for evidence in self._evidence.values() if evidence.confirmed)
-
-    @property
-    def candidate_count(self) -> int:
-        return len(self._candidates)
+        return len(self._evidence)
 
     @property
     def free_cell_count(self) -> int:
         return len(self._free_cells)
 
     @property
-    def dynamic_track_count(self) -> int:
-        return self._dynamic_track_count
-
-    @property
-    def dynamic_filter_enabled(self) -> bool:
-        return self._dynamic_filter_enabled
-
-    @property
-    def quarantined_point_count(self) -> int:
-        return self._quarantined_point_count
-
-    @property
-    def component_history_unit_count(self) -> int:
-        """Return bounded cell summaries retained across component tracks."""
-
-        return sum(
-            _COMPONENT_TRACK_HISTORY_UNITS
-            + len(track.cells)
-            + sum(sample.cell_count for sample in track.samples)
-            + len(track.recent_dynamic_cells)
-            + len(track.recent_keys)
-            for track in self._component_tracks.values()
-        )
-
-    @property
-    def component_history_unit_limit(self) -> int:
-        return self._component_history_unit_limit
-
-    @property
     def confirmed_points(self) -> tuple[tuple[float, float, float], ...]:
         return tuple(
-            evidence.point
-            for key, evidence in sorted(self._evidence.items())
-            if evidence.confirmed
+            point for key, point in sorted(self._evidence.items())
         )
 
     @property
     def map_view_points(self) -> tuple[tuple[float, float, float], ...]:
         """Return an unordered immutable snapshot for display-only encoding."""
 
-        return tuple(
-            evidence.point
-            for evidence in self._evidence.values()
-            if evidence.confirmed
-        )
-
-    @property
-    def candidate_points(self) -> tuple[tuple[float, float, float], ...]:
-        return tuple(
-            self._evidence[key].point
-            for key in sorted(self._candidates)
-            if key in self._evidence and not self._evidence[key].confirmed
-        )
+        return tuple(self._evidence.values())
 
     def load_confirmed(
         self, points: Iterable[tuple[float, float, float]]
@@ -1502,13 +1181,8 @@ class TemporalOccupancyMap:
     ) -> _PreparedConfirmedState:
         """Build all saved-map state without changing the active map."""
 
-        evidence_by_key, xy_index, replacement_bounds = (
-            self._validated_confirmed_state(points)
-        )
         return _PreparedConfirmedState(
-            evidence=evidence_by_key,
-            xy_index=xy_index,
-            bounds=replacement_bounds,
+            evidence=self._validated_confirmed_state(points),
         )
 
     def apply_prepared_confirmed(
@@ -1520,22 +1194,12 @@ class TemporalOccupancyMap:
             raise TypeError("prepared confirmed state is invalid")
         retired = (
             self._evidence,
-            self._candidates,
-            self._xy_index,
             self._free_cells,
-            self._component_tracks,
         )
         self._evidence = prepared.evidence
-        self._candidates = set()
-        self._xy_index = prepared.xy_index
         self._free_cells = set()
-        self._bounds = prepared.bounds
-        self._scan_index = 0
+        self._bounds = None
         self._read_only_baseline = True
-        self._component_tracks = {}
-        self._next_component_track_id = 1
-        self._dynamic_track_count = 0
-        self._quarantined_point_count = 0
         self._last_observation_monotonic = None
         return retired
 
@@ -1548,45 +1212,24 @@ class TemporalOccupancyMap:
 
     def _validated_confirmed_state(
         self, points: Iterable[tuple[float, float, float]]
-    ) -> tuple[
-        dict[tuple[int, int, int], _TemporalVoxelEvidence],
-        dict[tuple[int, int], set[tuple[int, int, int]]],
-        tuple[int, int, int, int] | None,
-    ]:
+    ) -> dict[tuple[int, int, int], tuple[float, float, float]]:
         """Build a complete immutable-map replacement before mutating state."""
 
         evidence_by_key: dict[
-            tuple[int, int, int], _TemporalVoxelEvidence
-        ] = {}
-        xy_index: dict[
-            tuple[int, int], set[tuple[int, int, int]]
+            tuple[int, int, int], tuple[float, float, float]
         ] = {}
         for point in points:
             key = self._key(point)
             if key is None or key in evidence_by_key:
                 continue
             normalized = tuple(float(value) for value in point)
-            evidence_by_key[key] = _TemporalVoxelEvidence(
-                point=normalized,
-                hit_frames=self._confirmation_frames,
-                first_hit_monotonic=0.0,
-                first_hit_point=normalized,
-                last_hit_monotonic=0.0,
-                last_hit_scan=0,
-                confirmed=True,
-            )
-            xy = key[:2]
-            xy_index.setdefault(xy, set()).add(key)
+            evidence_by_key[key] = normalized
             if len(evidence_by_key) > self._max_evidence_points:
                 raise ValueError(
                     "confirmed static map exceeds "
                     f"{self._max_evidence_points} point safety limit"
                 )
-        # The confirmed map remains sparse and may span a large site.  Dense
-        # OccupancyGrid publication is a rolling window around the active
-        # pose, so the full point extent must not become an allocation bound.
-        replacement_bounds = None
-        return evidence_by_key, xy_index, replacement_bounds
+        return evidence_by_key
 
     def observe_scan(
         self,
@@ -1616,9 +1259,6 @@ class TemporalOccupancyMap:
         observed: dict[
             tuple[int, int, int], tuple[float, float, float]
         ] = {}
-        component_points: dict[
-            tuple[int, int], list[tuple[float, float, float]]
-        ] = {}
         obstacle_endpoints: dict[tuple[int, int], tuple[float, float, float]] = {}
         for point in points:
             key = self._key(point)
@@ -1634,8 +1274,6 @@ class TemporalOccupancyMap:
             if not self._raytrace_min_range <= planar_range <= self._raytrace_max_range:
                 continue
             observed.setdefault(key, normalized)
-            if self._dynamic_filter_enabled:
-                component_points.setdefault(key[:2], []).append(normalized)
             obstacle_endpoints.setdefault(key[:2], normalized)
 
         observed_xy = set(obstacle_endpoints)
@@ -1653,149 +1291,11 @@ class TemporalOccupancyMap:
                 f"{self._max_evidence_points} point safety limit"
             )
         self._last_observation_monotonic = now_monotonic
-
-        self._scan_index += 1
-        scan_index = self._scan_index
-        if not self._dynamic_filter_enabled:
-            for key, point in observed.items():
-                evidence = self._evidence.get(key)
-                if evidence is None:
-                    evidence = _TemporalVoxelEvidence(
-                        point=point,
-                        hit_frames=self._confirmation_frames,
-                        first_hit_monotonic=now_monotonic,
-                        first_hit_point=point,
-                        last_hit_monotonic=now_monotonic,
-                        last_hit_scan=scan_index,
-                        confirmed=True,
-                    )
-                    self._evidence[key] = evidence
-                    self._xy_index.setdefault(key[:2], set()).add(key)
-                else:
-                    evidence.point = point
-                    evidence.hit_frames = self._confirmation_frames
-                    evidence.last_hit_monotonic = now_monotonic
-                    evidence.last_hit_scan = scan_index
-                    evidence.confirmed = True
-                    evidence.free_miss_frames = 0
-                    self._candidates.discard(key)
-            self._free_cells.update(ray_free)
-            self._free_cells.difference_update(observed_xy)
-            return
-
-        eligible_keys, quarantined_keys, purge_keys = self._component_gate(
-            observed,
-            component_points=component_points,
-            now_monotonic=now_monotonic,
-        )
-        for key in purge_keys:
-            evidence = self._evidence.get(key)
-            if evidence is None:
-                continue
-            current_point = observed.get(key)
-            if (
-                current_point is not None
-                and math.dist(current_point, evidence.first_hit_point)
-                <= min(
-                    self._voxel * 0.15,
-                    self._component_motion_distance * 0.50,
-                )
-            ):
-                continue
-            self._remove(key)
         for key, point in observed.items():
-            if key in quarantined_keys:
-                prior = self._evidence.get(key)
-                if (
-                    prior is None
-                    or math.dist(point, prior.first_hit_point)
-                    > min(
-                        self._voxel * 0.15,
-                        self._component_motion_distance * 0.50,
-                    )
-                ):
-                    continue
-            evidence = self._evidence.get(key)
-            if evidence is None:
-                evidence = _TemporalVoxelEvidence(
-                    point=point,
-                    hit_frames=1,
-                    first_hit_monotonic=now_monotonic,
-                    first_hit_point=point,
-                    last_hit_monotonic=now_monotonic,
-                    last_hit_scan=scan_index,
-                )
-                self._evidence[key] = evidence
-                self._candidates.add(key)
-                self._xy_index.setdefault(key[:2], set()).add(key)
-            else:
-                evidence.point = point
-                if evidence.confirmed:
-                    evidence.hit_frames = self._confirmation_frames
-                elif (
-                    evidence.last_hit_scan == scan_index - 1
-                    and now_monotonic - evidence.last_hit_monotonic
-                    <= self._candidate_ttl_sec
-                ):
-                    evidence.hit_frames += 1
-                else:
-                    evidence.hit_frames = 1
-                    evidence.first_hit_monotonic = now_monotonic
-                    evidence.first_hit_point = point
-                evidence.last_hit_monotonic = now_monotonic
-                evidence.last_hit_scan = scan_index
-                evidence.free_miss_frames = 0
-            if (
-                evidence.hit_frames >= self._confirmation_frames
-                and key in eligible_keys
-                and now_monotonic - evidence.first_hit_monotonic
-                >= self._component_observation_window
-            ):
-                evidence.confirmed = True
-                self._candidates.discard(key)
-
-        for xy in ray_free:
-            for key in tuple(self._xy_index.get(xy, ())):
-                evidence = self._evidence.get(key)
-                if evidence is None:
-                    continue
-                if not obstacle_min_height_m <= evidence.point[2] <= obstacle_max_height_m:
-                    continue
-                evidence.hit_frames = 0
-                evidence.free_miss_frames += 1
-                if evidence.free_miss_frames >= self._clear_miss_frames:
-                    self._remove(key)
-
-        for key in tuple(self._candidates):
-            evidence = self._evidence.get(key)
-            if evidence is None:
-                self._candidates.discard(key)
-                continue
-            if now_monotonic - evidence.last_hit_monotonic > self._candidate_ttl_sec:
-                self._remove(key)
+            self._evidence[key] = point
 
         self._free_cells.update(ray_free)
-        confirmed_xy = {
-            key[:2]
-            for key, evidence in self._evidence.items()
-            if evidence.confirmed
-            and obstacle_min_height_m <= evidence.point[2] <= obstacle_max_height_m
-        }
-        self._free_cells.difference_update(confirmed_xy)
-
-    def expire(self, *, now_monotonic: float) -> None:
-        if not math.isfinite(now_monotonic):
-            raise ValueError("now_monotonic must be finite")
-        for key in tuple(self._candidates):
-            evidence = self._evidence.get(key)
-            if evidence is None:
-                self._candidates.discard(key)
-                continue
-            if (
-                now_monotonic - evidence.last_hit_monotonic
-                > self._candidate_ttl_sec
-            ):
-                self._remove(key)
+        self._free_cells.difference_update(observed_xy)
 
     def project_xy(
         self,
@@ -1809,19 +1309,14 @@ class TemporalOccupancyMap:
         if min_z >= max_z:
             raise ValueError("min_z must be less than max_z")
         projected: dict[tuple[int, int], tuple[float, float, float]] = {}
-        for key, evidence in self._evidence.items():
-            if evidence.confirmed and min_z <= evidence.point[2] <= max_z:
+        for key, point in self._evidence.items():
+            if min_z <= point[2] <= max_z:
                 ix, iy, _ = key
                 projected.setdefault(
                     (ix, iy),
                     ((ix + 0.5) * self._voxel, (iy + 0.5) * self._voxel, output_z),
                 )
         return tuple(projected[key] for key in sorted(projected))
-
-    def as_voxel_map(self) -> VoxelMap:
-        output = VoxelMap(self._voxel)
-        output.add(self.confirmed_points)
-        return output
 
     def occupancy_snapshot(
         self,
@@ -1838,7 +1333,6 @@ class TemporalOccupancyMap:
         snapshot, bounds = self._build_occupancy_snapshot(
             evidence=self._evidence,
             free_cells=self._free_cells,
-            bounds=self._bounds,
             center_x=center_x,
             center_y=center_y,
             min_z=min_z,
@@ -1863,7 +1357,6 @@ class TemporalOccupancyMap:
         snapshot, _bounds = self._build_occupancy_snapshot(
             evidence=prepared.evidence,
             free_cells=(),
-            bounds=prepared.bounds,
             center_x=center_x,
             center_y=center_y,
             min_z=min_z,
@@ -1874,9 +1367,8 @@ class TemporalOccupancyMap:
     def _build_occupancy_snapshot(
         self,
         *,
-        evidence: dict[tuple[int, int, int], _TemporalVoxelEvidence],
+        evidence: dict[tuple[int, int, int], tuple[float, float, float]],
         free_cells: Iterable[tuple[int, int]],
-        bounds: tuple[int, int, int, int] | None,
         center_x: float,
         center_y: float,
         min_z: float,
@@ -1920,7 +1412,7 @@ class TemporalOccupancyMap:
         occupied = {
             key[:2]
             for key, item in evidence.items()
-            if item.confirmed and min_z <= item.point[2] <= max_z
+            if min_z <= item[2] <= max_z
         }
         occupied_count = 0
         for cell in occupied:
@@ -2011,641 +1503,6 @@ class TemporalOccupancyMap:
             raise InvalidFastLivo2Frame(
                 "temporal map XY coordinates exceed supported range"
             ) from exc
-
-    def _remove(self, key: tuple[int, int, int]) -> None:
-        self._evidence.pop(key, None)
-        self._candidates.discard(key)
-        xy = key[:2]
-        keys = self._xy_index.get(xy)
-        if keys is None:
-            return
-        keys.discard(key)
-        if not keys:
-            self._xy_index.pop(xy, None)
-
-    def _component_gate(
-        self,
-        observed: dict[
-            tuple[int, int, int], tuple[float, float, float]
-        ],
-        *,
-        component_points: dict[
-            tuple[int, int], list[tuple[float, float, float]]
-        ],
-        now_monotonic: float,
-    ) -> tuple[
-        set[tuple[int, int, int]],
-        set[tuple[int, int, int]],
-        set[tuple[int, int, int]],
-    ]:
-        """Return static-eligible, quarantined, and candidate-purge keys.
-
-        Large connected structures are split into bounded spatial shards so a
-        person touching a wall cannot bypass motion qualification. Motion uses
-        common-cell point displacement before whole-shard centroid movement,
-        which keeps a changing visible subset of one wall stationary.
-        """
-
-        eligible = set(observed)
-        quarantined: set[tuple[int, int, int]] = set()
-        purge: set[tuple[int, int, int]] = set()
-        observations = [
-            component
-            for component in self._connected_components(
-                observed,
-                component_points=component_points,
-            )
-            if self._track_component(component)
-        ]
-        for component in observations:
-            eligible.difference_update(component.keys)
-
-        stale_before = now_monotonic - max(
-            self._candidate_ttl_sec,
-            self._component_stationary,
-            self._component_observation_window,
-        )
-        for track_id in tuple(self._component_tracks):
-            if self._component_tracks[track_id].last_seen_monotonic < stale_before:
-                self._component_tracks.pop(track_id, None)
-
-        bucket_size = self._component_match_distance
-        buckets: dict[tuple[int, int], list[int]] = {}
-        for track_id, track in self._component_tracks.items():
-            bucket = (
-                math.floor(track.centroid_x / bucket_size),
-                math.floor(track.centroid_y / bucket_size),
-            )
-            buckets.setdefault(bucket, []).append(track_id)
-
-        history_units = self.component_history_unit_count
-        used_tracks: set[int] = set()
-        for component in sorted(observations, key=lambda item: -len(item.cells)):
-            bucket_x = math.floor(component.centroid_x / bucket_size)
-            bucket_y = math.floor(component.centroid_y / bucket_size)
-            matches: list[tuple[float, float, int]] = []
-            for delta_x in (-1, 0, 1):
-                for delta_y in (-1, 0, 1):
-                    for track_id in buckets.get(
-                        (bucket_x + delta_x, bucket_y + delta_y), ()
-                    ):
-                        if track_id in used_tracks:
-                            continue
-                        track = self._component_tracks[track_id]
-                        distance = math.hypot(
-                            component.centroid_x - track.centroid_x,
-                            component.centroid_y - track.centroid_y,
-                        )
-                        if distance > self._component_match_distance:
-                            continue
-                        overlap = len(component.cells.intersection(track.cells))
-                        overlap_ratio = overlap / max(
-                            1,
-                            min(len(component.cells), len(track.cells)),
-                        )
-                        if overlap == 0 and distance > bucket_size * 0.5:
-                            continue
-                        matches.append((-overlap_ratio, distance, track_id))
-
-            if matches:
-                _overlap, _distance, track_id = min(matches)
-                track = self._component_tracks[track_id]
-                used_tracks.add(track_id)
-            else:
-                track_units = (
-                    _COMPONENT_TRACK_HISTORY_UNITS + len(component.cells)
-                )
-                if (
-                    history_units + track_units
-                    > self._component_history_unit_limit
-                ):
-                    # Do not allocate an unbounded population of one-cell
-                    # tracks.  The current component remains withheld and its
-                    # existing evidence is removed conservatively.
-                    quarantined.update(component.keys)
-                    purge.update(component.keys)
-                    continue
-                track_id = self._next_component_track_id
-                self._next_component_track_id += 1
-                track = _TemporalComponentTrack(
-                    track_id=track_id,
-                    centroid_x=component.centroid_x,
-                    centroid_y=component.centroid_y,
-                    first_seen_monotonic=now_monotonic,
-                    last_seen_monotonic=now_monotonic,
-                    cells=component.cells,
-                    samples=[],
-                )
-                self._component_tracks[track_id] = track
-                used_tracks.add(track_id)
-                history_units += track_units
-
-            track.centroid_x = component.centroid_x
-            track.centroid_y = component.centroid_y
-            track.last_seen_monotonic = now_monotonic
-            cell_unit_delta = len(component.cells) - len(track.cells)
-            if (
-                history_units + cell_unit_delta
-                <= self._component_history_unit_limit
-            ):
-                track.cells = component.cells
-                history_units += cell_unit_delta
-            else:
-                track.history_saturated = True
-            sample_interval = self._component_sample_interval
-            motion_stale_before = (
-                now_monotonic - self._component_observation_window
-            )
-            while (
-                len(track.samples) > 1
-                and track.samples[1].stamp <= motion_stale_before
-            ):
-                history_units -= track.samples.pop(0).cell_count
-            expired_dynamic_cells = [
-                cell
-                for cell, stamp in track.recent_dynamic_cells.items()
-                if stamp < motion_stale_before
-            ]
-            for cell in expired_dynamic_cells:
-                track.recent_dynamic_cells.pop(cell, None)
-                history_units -= 1
-            expired_keys = [
-                key
-                for key, stamp in track.recent_keys.items()
-                if stamp < motion_stale_before
-            ]
-            for key in expired_keys:
-                track.recent_keys.pop(key, None)
-                history_units -= 1
-
-            sample_due = (
-                not track.samples
-                or now_monotonic - track.samples[-1].stamp
-                >= sample_interval - 1e-9
-            )
-            if sample_due:
-                current_sample = _pack_component_motion_sample(
-                    component,
-                    now_monotonic,
-                )
-                if (
-                    history_units + current_sample.cell_count
-                    > self._component_history_unit_limit
-                ):
-                    # Reset only this track.  Until a complete observation
-                    # window is rebuilt it remains ineligible for the static
-                    # map, so pressure cannot turn missing motion evidence
-                    # into a persistent obstacle.
-                    history_units -= sum(
-                        sample.cell_count for sample in track.samples
-                    )
-                    track.samples.clear()
-                    track.history_saturated = True
-                if (
-                    history_units + current_sample.cell_count
-                    <= self._component_history_unit_limit
-                ):
-                    track.samples.append(current_sample)
-                    history_units += current_sample.cell_count
-                else:
-                    track.history_saturated = True
-            elif track.samples:
-                replacement = _pack_component_motion_sample(
-                    component,
-                    track.samples[-1].stamp,
-                )
-                previous_units = track.samples[-1].cell_count
-                projected_units = (
-                    history_units
-                    - previous_units
-                    + replacement.cell_count
-                )
-                if projected_units <= self._component_history_unit_limit:
-                    track.samples[-1] = replacement
-                    history_units = projected_units
-                else:
-                    history_units -= sum(
-                        sample.cell_count for sample in track.samples
-                    )
-                    track.samples.clear()
-                    track.history_saturated = True
-
-            new_component_keys = component.keys.difference(track.recent_keys)
-            if (
-                history_units + len(new_component_keys)
-                > self._component_history_unit_limit
-            ):
-                history_units -= sum(
-                    sample.cell_count for sample in track.samples
-                )
-                track.samples.clear()
-                track.history_saturated = True
-            if (
-                history_units + len(new_component_keys)
-                <= self._component_history_unit_limit
-            ):
-                for key in component.keys:
-                    if key not in track.recent_keys:
-                        history_units += 1
-                    track.recent_keys[key] = now_monotonic
-            else:
-                track.history_saturated = True
-
-            if len(track.samples) > self._component_track_sample_limit:
-                removed = track.samples[
-                    : -self._component_track_sample_limit
-                ]
-                history_units -= sum(
-                    sample.cell_count for sample in removed
-                )
-                track.samples = track.samples[
-                    -self._component_track_sample_limit :
-                ]
-
-            reference = next(
-                (
-                    sample
-                    for sample in track.samples
-                    if now_monotonic - sample.stamp
-                    >= self._component_motion_window
-                ),
-                None,
-            )
-            motion_cells: frozenset[tuple[int, int]] = frozenset()
-            if reference is not None:
-                elapsed = now_monotonic - reference.stamp
-                motion_cells = self._component_motion_cells(
-                    component,
-                    reference=reference,
-                    elapsed=elapsed,
-                )
-            motion_now = bool(motion_cells)
-
-            if motion_now:
-                track.motion_votes = min(2, track.motion_votes + 1)
-                new_motion_cells = motion_cells.difference(
-                    track.recent_dynamic_cells
-                )
-                if (
-                    history_units + len(new_motion_cells)
-                    > self._component_history_unit_limit
-                ):
-                    history_units -= sum(
-                        sample.cell_count for sample in track.samples
-                    )
-                    track.samples.clear()
-                    track.history_saturated = True
-                if (
-                    history_units + len(new_motion_cells)
-                    <= self._component_history_unit_limit
-                ):
-                    for cell in motion_cells:
-                        if cell not in track.recent_dynamic_cells:
-                            history_units += 1
-                        track.recent_dynamic_cells[cell] = now_monotonic
-                else:
-                    # Current motion is still quarantined below even when the
-                    # bounded history cannot retain its complete footprint.
-                    track.history_saturated = True
-                    track.dynamic = True
-                    track.last_motion_monotonic = now_monotonic
-                if track.motion_votes >= 2:
-                    track.dynamic = True
-                    track.last_motion_monotonic = now_monotonic
-            else:
-                track.motion_votes = 0
-
-            history_ready = bool(track.samples) and (
-                now_monotonic - track.samples[0].stamp
-                >= self._component_observation_window - 1e-9
-            )
-            if history_ready:
-                track.history_saturated = False
-            if (
-                track.dynamic
-                and not motion_now
-                and not track.history_saturated
-                and track.last_motion_monotonic is not None
-                and now_monotonic - track.last_motion_monotonic
-                >= self._component_stationary
-            ):
-                reset_sample = _pack_component_motion_sample(
-                    component,
-                    now_monotonic,
-                )
-                replacement_units = reset_sample.cell_count
-                retained_units = history_units - sum(
-                    sample.cell_count for sample in track.samples
-                ) - len(track.recent_dynamic_cells) - len(track.recent_keys)
-                replacement_units += len(component.keys)
-                if (
-                    retained_units + replacement_units
-                    <= self._component_history_unit_limit
-                ):
-                    history_units = retained_units + replacement_units
-                    track.dynamic = False
-                    track.motion_votes = 0
-                    track.first_seen_monotonic = now_monotonic
-                    track.samples = [reset_sample]
-                    track.recent_dynamic_cells.clear()
-                    track.recent_keys = {
-                        key: now_monotonic for key in component.keys
-                    }
-                    track.history_saturated = False
-                    history_ready = False
-
-            dynamic_cells = set(track.recent_dynamic_cells)
-            if track.history_saturated:
-                # Fail closed: without a complete bounded history, withhold
-                # the whole current shard instead of admitting an unobserved
-                # moving object to the persistent map.
-                dynamic_cells.update(component.cells)
-            if track.dynamic or track.history_saturated:
-                # Only remove the local cells that supplied motion evidence.
-                # A person can be connected to a wall in the 2D grid; purging
-                # the whole connected shard would punch holes in that wall.
-                quarantined.update(
-                    key for key in component.keys if key[:2] in dynamic_cells
-                )
-                purge.update(
-                    key
-                    for key in (
-                        set(track.recent_keys)
-                        | (set(component.keys) if track.history_saturated else set())
-                    )
-                    if key[:2] in dynamic_cells
-                )
-            # Admission belongs to each occupied voxel, not to the lifetime of
-            # the connected component track.  A moving person can repeatedly
-            # quantize between motion/stationary while touching a wall; using
-            # track age would reset the wall's static observation every time.
-            # Stable wall voxels retain their own first-hit clock, while cells
-            # implicated by recent motion remain quarantined.
-            eligible.update(
-                key
-                for key in component.keys
-                if key[:2] not in dynamic_cells
-                and not track.history_saturated
-                and (evidence := self._evidence.get(key)) is not None
-                and now_monotonic - evidence.first_hit_monotonic
-                >= self._component_observation_window
-            )
-
-        self._dynamic_track_count = sum(
-            1 for track in self._component_tracks.values() if track.dynamic
-        )
-        self._quarantined_point_count = len(quarantined)
-        return eligible, quarantined, purge
-
-    def _component_motion_cells(
-        self,
-        component: _ComponentObservation,
-        *,
-        reference: _ComponentMotionSample,
-        elapsed: float,
-    ) -> frozenset[tuple[int, int]]:
-        """Return a local motion footprint without erasing connected walls."""
-
-        if elapsed <= 0:
-            return frozenset()
-        required_displacement = self._component_motion_distance
-        reference_cells, previous_cells, previous_point_sets = (
-            _unpack_component_motion_sample(reference)
-        )
-
-        # The packed cell set is sufficient for the overwhelmingly common
-        # static case.  Avoid rebuilding detailed geometry for every cell in
-        # every frame when occupancy has not changed.
-        if component.cells == reference_cells:
-            return frozenset()
-
-        cell_centroids, cell_points = _component_cell_geometry(component)
-        current_cells = {
-            (cell_x, cell_y): (point_x, point_y)
-            for cell_x, cell_y, point_x, point_y in cell_centroids
-        }
-        current_point_sets = {
-            (cell_x, cell_y): points
-            for cell_x, cell_y, points in cell_points
-        }
-        common_cells = current_cells.keys() & previous_cells.keys()
-
-        anchor_tolerance = min(
-            self._voxel * 0.15,
-            self._component_motion_distance * 0.50,
-        )
-        anchored_common: set[tuple[int, int]] = set()
-        moving_common: set[tuple[int, int]] = set()
-        for cell in common_cells:
-            current = current_cells[cell]
-            previous = previous_cells[cell]
-            displacement = math.hypot(
-                current[0] - previous[0],
-                current[1] - previous[1],
-            )
-            current_points = current_point_sets.get(cell, ())
-            previous_points = previous_point_sets.get(cell, ())
-            anchored = any(
-                math.hypot(
-                    current_point[0] - previous_point[0],
-                    current_point[1] - previous_point[1],
-                )
-                <= anchor_tolerance
-                for current_point in current_points
-                for previous_point in previous_points
-            )
-            if anchored:
-                anchored_common.add(cell)
-            elif displacement + 1e-9 >= required_displacement:
-                moving_common.add(cell)
-        if moving_common:
-            footprint = set(moving_common)
-            changed = component.cells.symmetric_difference(reference_cells)
-            # Include turnover cells immediately next to the measured motion,
-            # but not the rest of a connected wall.
-            for cell in component.cells.union(reference_cells):
-                if cell not in anchored_common and any(
-                    max(abs(cell[0] - moving[0]), abs(cell[1] - moving[1]))
-                    <= 1
-                    for moving in moving_common
-                ):
-                    footprint.add(cell)
-            for cell in changed:
-                if cell not in anchored_common and any(
-                    max(abs(cell[0] - moving[0]), abs(cell[1] - moving[1]))
-                    <= 2
-                    for moving in moving_common
-                ):
-                    footprint.add(cell)
-            return frozenset(footprint)
-
-        # With no common-cell evidence, accept only a clear component
-        # translation.  A changing visible subset of one wall retains high
-        # overlap and is deliberately not treated as a moving object.
-        displacement = math.hypot(
-            component.centroid_x - reference.centroid_x,
-            component.centroid_y - reference.centroid_y,
-        )
-        if (
-            displacement + 1e-9 < required_displacement
-            or displacement / elapsed + 1e-9 < self._component_motion_speed
-        ):
-            return frozenset()
-        overlap = len(component.cells.intersection(reference_cells))
-        overlap_ratio = overlap / max(
-            1,
-            min(len(component.cells), len(reference_cells)),
-        )
-        all_cells = component.cells.union(reference_cells)
-        minimum_x = min(cell[0] for cell in all_cells)
-        maximum_x = max(cell[0] for cell in all_cells)
-        minimum_y = min(cell[1] for cell in all_cells)
-        maximum_y = max(cell[1] for cell in all_cells)
-        width = maximum_x - minimum_x + 1
-        height = maximum_y - minimum_y + 1
-        compact_shape = (
-            min(width, height) >= 3
-            and max(width, height) / min(width, height) <= 4.0
-        )
-        if common_cells and overlap_ratio >= 0.50 and not compact_shape:
-            return frozenset()
-        return frozenset(all_cells.difference(anchored_common))
-
-    def _connected_components(
-        self,
-        observed: dict[
-            tuple[int, int, int], tuple[float, float, float]
-        ],
-        *,
-        component_points: dict[
-            tuple[int, int], list[tuple[float, float, float]]
-        ],
-    ) -> tuple[_ComponentObservation, ...]:
-        keys_by_cell: dict[
-            tuple[int, int], list[tuple[int, int, int]]
-        ] = {}
-        for key in observed:
-            keys_by_cell.setdefault(key[:2], []).append(key)
-        remaining = set(keys_by_cell)
-        components: list[_ComponentObservation] = []
-        neighbours = (
-            (-1, -1), (-1, 0), (-1, 1),
-            (0, -1), (0, 1),
-            (1, -1), (1, 0), (1, 1),
-        )
-        while remaining:
-            first = remaining.pop()
-            cells = {first}
-            stack = [first]
-            while stack:
-                cell_x, cell_y = stack.pop()
-                for delta_x, delta_y in neighbours:
-                    neighbour = (cell_x + delta_x, cell_y + delta_y)
-                    if neighbour in remaining:
-                        remaining.remove(neighbour)
-                        cells.add(neighbour)
-                        stack.append(neighbour)
-            minimum_x = min(cell[0] for cell in cells)
-            maximum_x = max(cell[0] for cell in cells)
-            minimum_y = min(cell[1] for cell in cells)
-            maximum_y = max(cell[1] for cell in cells)
-            tile_cells = max(1, math.floor(self._component_max_span / self._voxel))
-            if (
-                maximum_x - minimum_x + 1 <= tile_cells
-                and maximum_y - minimum_y + 1 <= tile_cells
-            ):
-                shards = (cells,)
-            else:
-                by_tile: dict[tuple[int, int], set[tuple[int, int]]] = {}
-                for cell in cells:
-                    tile = (cell[0] // tile_cells, cell[1] // tile_cells)
-                    by_tile.setdefault(tile, set()).add(cell)
-                shards = tuple(by_tile.values())
-            for shard in shards:
-                keys = frozenset(
-                    key for cell in shard for key in keys_by_cell[cell]
-                )
-                point_count = sum(
-                    len(component_points[cell]) for cell in shard
-                )
-                centroid_x = sum(
-                    point[0]
-                    for cell in shard
-                    for point in component_points[cell]
-                ) / point_count
-                centroid_y = sum(
-                    point[1]
-                    for cell in shard
-                    for point in component_points[cell]
-                ) / point_count
-                shard_minimum_x = min(cell[0] for cell in shard)
-                shard_maximum_x = max(cell[0] for cell in shard)
-                shard_minimum_y = min(cell[1] for cell in shard)
-                shard_maximum_y = max(cell[1] for cell in shard)
-                components.append(
-                    _ComponentObservation(
-                        keys=keys,
-                        cells=frozenset(shard),
-                        point_source=component_points,
-                        centroid_x=centroid_x,
-                        centroid_y=centroid_y,
-                        span_x=(shard_maximum_x - shard_minimum_x + 1)
-                        * self._voxel,
-                        span_y=(shard_maximum_y - shard_minimum_y + 1)
-                        * self._voxel,
-                    )
-                )
-        return tuple(components)
-
-    def _track_component(self, component: _ComponentObservation) -> bool:
-        if len(component.cells) < self._component_min_cells:
-            return False
-        longest = max(component.span_x, component.span_y)
-        return longest <= self._component_max_span
-
-    def _expand_bounds(self, cells: Iterable[tuple[int, int]]) -> None:
-        expanded = self._expanded_bounds(cells)
-        if expanded is not None:
-            self._bounds = expanded
-
-    def _expanded_bounds(
-        self, cells: Iterable[tuple[int, int]]
-    ) -> tuple[int, int, int, int] | None:
-        return self._expanded_bounds_from(self._bounds, cells)
-
-    def _expanded_bounds_from(
-        self,
-        bounds: tuple[int, int, int, int] | None,
-        cells: Iterable[tuple[int, int]],
-    ) -> tuple[int, int, int, int] | None:
-        cells = tuple(cells)
-        if not cells:
-            return bounds
-        minimum_x = min(cell[0] for cell in cells) - self._grid_margin_cells
-        maximum_x = max(cell[0] for cell in cells) + self._grid_margin_cells
-        minimum_y = min(cell[1] for cell in cells) - self._grid_margin_cells
-        maximum_y = max(cell[1] for cell in cells) + self._grid_margin_cells
-        if bounds is None:
-            expanded = (minimum_x, maximum_x, minimum_y, maximum_y)
-        else:
-            old_min_x, old_max_x, old_min_y, old_max_y = bounds
-            expanded = (
-                min(old_min_x, minimum_x),
-                max(old_max_x, maximum_x),
-                min(old_min_y, minimum_y),
-                max(old_max_y, maximum_y),
-            )
-        width = expanded[1] - expanded[0] + 1
-        height = expanded[3] - expanded[2] + 1
-        if (
-            width > self._max_grid_dimension_cells
-            or height > self._max_grid_dimension_cells
-            or width * height > self._max_grid_cells
-        ):
-            raise ValueError(
-                "occupancy grid exceeds configured dimension or cell-count limit"
-            )
-        return expanded
 
     def _ray_free_cells(
         self,

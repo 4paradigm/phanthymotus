@@ -86,20 +86,9 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("source_max_age_sec", 0.5)
         self.declare_parameter("source_age_tolerance_sec", 0.05)
         self.declare_parameter("map_voxel_size_m", 0.10)
-        self.declare_parameter("static_confirmation_frames", 8)
-        self.declare_parameter("static_candidate_ttl_sec", 1.0)
-        self.declare_parameter("static_clear_miss_frames", 3)
         self.declare_parameter("static_angular_bin_deg", 1.0)
         self.declare_parameter("static_grid_margin_m", 6.0)
         self.declare_parameter("static_pose_match_tolerance_sec", 0.05)
-        self.declare_parameter("static_component_motion_window_sec", 0.40)
-        self.declare_parameter("static_component_history_sec", 0.80)
-        self.declare_parameter("static_component_motion_distance_m", 0.03)
-        self.declare_parameter("static_component_motion_speed_mps", 0.03)
-        self.declare_parameter("static_component_stationary_sec", 1.50)
-        self.declare_parameter("static_component_max_span_m", 1.00)
-        self.declare_parameter("static_component_match_distance_m", 0.60)
-        self.declare_parameter("static_dynamic_filter_enabled", False)
         self.declare_parameter("obstacle_min_height_m", -0.30)
         self.declare_parameter("obstacle_max_height_m", 0.30)
         self.declare_parameter("base_to_sensor_x", -0.00368)
@@ -144,46 +133,13 @@ class FastLivo2Adapter(Node):
         self._map_view_context = VoxelMap(self._map_view_voxel_size)
         self._static_map = TemporalOccupancyMap(
             map_voxel_size,
-            confirmation_frames=int(
-                self.get_parameter("static_confirmation_frames").value
-            ),
-            candidate_ttl_sec=float(
-                self.get_parameter("static_candidate_ttl_sec").value
-            ),
-            clear_miss_frames=int(
-                self.get_parameter("static_clear_miss_frames").value
-            ),
             angular_bin_deg=float(
                 self.get_parameter("static_angular_bin_deg").value
             ),
             grid_margin_m=float(
                 self.get_parameter("static_grid_margin_m").value
             ),
-            component_motion_window_sec=float(
-                self.get_parameter("static_component_motion_window_sec").value
-            ),
-            component_history_sec=float(
-                self.get_parameter("static_component_history_sec").value
-            ),
-            component_motion_distance_m=float(
-                self.get_parameter("static_component_motion_distance_m").value
-            ),
-            component_motion_speed_mps=float(
-                self.get_parameter("static_component_motion_speed_mps").value
-            ),
-            component_stationary_sec=float(
-                self.get_parameter("static_component_stationary_sec").value
-            ),
-            component_max_span_m=float(
-                self.get_parameter("static_component_max_span_m").value
-            ),
-            component_match_distance_m=float(
-                self.get_parameter("static_component_match_distance_m").value
-            ),
             max_evidence_points=self._static_map_load_max_points,
-            dynamic_filter_enabled=bool(
-                self.get_parameter("static_dynamic_filter_enabled").value
-            ),
         )
         self._static_pose_match_tolerance = float(
             self.get_parameter("static_pose_match_tolerance_sec").value
@@ -1245,12 +1201,10 @@ class FastLivo2Adapter(Node):
             }
 
         with self._static_lock:
-            self._static_map.expire(now_monotonic=now)
             obstacle_points = self._static_map.project_xy(
                 min_z=obstacle_min_height,
                 max_z=obstacle_max_height,
             )
-            candidate_points = self._static_map.candidate_points
             live_out_of_band = tuple(
                 point
                 for point in live_points
@@ -1269,7 +1223,6 @@ class FastLivo2Adapter(Node):
                     chain(
                         self._static_map.map_view_points,
                         map_view_context.points,
-                        candidate_points,
                         live_points,
                     ),
                     pose,
@@ -1280,11 +1233,7 @@ class FastLivo2Adapter(Node):
                 map_view_encode_sec = time.monotonic() - map_view_encode_started
             static_diagnostics = {
                 "map_point_count": self._static_map.point_count,
-                "static_candidate_point_count": self._static_map.candidate_count,
                 "static_free_cell_count": self._static_map.free_cell_count,
-                "static_dynamic_track_count": self._static_map.dynamic_track_count,
-                "static_dynamic_filter_enabled": self._static_map.dynamic_filter_enabled,
-                "static_quarantined_point_count": self._static_map.quarantined_point_count,
                 "map_view_context_point_count": map_view_context.point_count,
             }
         if encoded_map_view is not None:

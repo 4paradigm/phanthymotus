@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
 import json
-import struct
 import sys
 import tempfile
 import time
 import unittest
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -178,37 +177,6 @@ def synthetic_points() -> np.ndarray:
         dtype=np.float64,
     )
     return np.vstack((ground, obstacle))
-
-
-def decode_grayscale16_png(payload: bytes) -> tuple[int, int, np.ndarray]:
-    assert payload.startswith(b"\x89PNG\r\n\x1a\n")
-    offset = 8
-    width = height = 0
-    compressed = bytearray()
-    while offset < len(payload):
-        size = struct.unpack_from(">I", payload, offset)[0]
-        name = payload[offset + 4 : offset + 8]
-        data = payload[offset + 8 : offset + 8 + size]
-        offset += 12 + size
-        if name == b"IHDR":
-            width, height, bit_depth, color_type, _, _, _ = struct.unpack(
-                ">IIBBBBB", data
-            )
-            assert (bit_depth, color_type) == (16, 0)
-        elif name == b"IDAT":
-            compressed.extend(data)
-        elif name == b"IEND":
-            break
-    rows = zlib.decompress(bytes(compressed))
-    stride = width * 2 + 1
-    assert len(rows) == stride * height
-    image = np.vstack(
-        [
-            np.frombuffer(rows[row * stride + 1 : (row + 1) * stride], dtype=">u2")
-            for row in range(height)
-        ]
-    )
-    return width, height, image
 
 
 class FakeReader:
@@ -390,7 +358,10 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
         synchronizer.update_session("session-b")
         self.assertEqual(synchronizer.session_id, "session-b")
 
+    @unittest.skipUnless(importlib.util.find_spec("cv2"), "opencv is unavailable")
     def test_processor_writes_one_json_per_image_and_atomic_manifest(self) -> None:
+        import cv2
+
         stamp = metadata()["source_stamp_ns"]
         lidar_stamp = stamp + 50_000_000
         imu_stamp = lidar_stamp + 1_000_000
@@ -460,10 +431,11 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             self.assertEqual(len(lidar_binary), len(synthetic_points()) * 3 * 4)
             depth_id = f"depth-{depth_stamp:019d}"
             depth_path = session / "derived" / "depth" / f"{depth_id}.png"
-            width, height, decoded_depth = decode_grayscale16_png(
-                depth_path.read_bytes()
+            decoded_depth = cv2.imdecode(
+                np.frombuffer(depth_path.read_bytes(), dtype=np.uint8),
+                cv2.IMREAD_UNCHANGED,
             )
-            self.assertEqual((width, height), (2, 2))
+            self.assertEqual(decoded_depth.shape, (2, 2))
             np.testing.assert_array_equal(
                 decoded_depth,
                 np.asarray(((100, 200), (300, 400)), dtype=np.uint16),
