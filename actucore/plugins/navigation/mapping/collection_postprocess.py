@@ -271,6 +271,37 @@ def visible_cluster_points(
     labels: np.ndarray,
     metadata: dict,
 ) -> dict[int, np.ndarray]:
+
+    u, v, inside_projection = project_camera_points(points_camera, metadata)
+    points = np.asarray(points_camera, dtype=np.float64)
+    width = int(metadata["width"])
+    z = points[:, 2]
+    inside = inside_projection & (labels >= 0)
+    candidates = np.flatnonzero(inside)
+    if not len(candidates):
+        return {}
+    pixels = v[candidates] * width + u[candidates]
+    order = np.argsort(z[candidates], kind="stable")
+    sorted_indices = candidates[order]
+    sorted_pixels = pixels[order]
+    _, first = np.unique(sorted_pixels, return_index=True)
+    visible = sorted_indices[np.sort(first)]
+    result: dict[int, list[int]] = {}
+    for index in visible:
+        result.setdefault(int(labels[index]), []).append(int(index))
+    return {
+        label: np.asarray(indices, dtype=np.int64)
+        for label, indices in result.items()
+        if len(indices) >= _MIN_CLUSTER_POINTS
+    }
+
+
+def project_camera_points(
+    points_camera: np.ndarray,
+    metadata: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project camera-frame XYZ points to integer image pixels."""
+
     intrinsics = metadata["intrinsics"]
     width, height = int(metadata["width"]), int(metadata["height"])
     points = np.asarray(points_camera, dtype=np.float64)
@@ -359,25 +390,8 @@ def visible_cluster_points(
         & (u < width)
         & (v >= 0)
         & (v < height)
-        & (labels >= 0)
     )
-    candidates = np.flatnonzero(inside)
-    if not len(candidates):
-        return {}
-    pixels = v[candidates] * width + u[candidates]
-    order = np.argsort(z[candidates], kind="stable")
-    sorted_indices = candidates[order]
-    sorted_pixels = pixels[order]
-    _, first = np.unique(sorted_pixels, return_index=True)
-    visible = sorted_indices[np.sort(first)]
-    result: dict[int, list[int]] = {}
-    for index in visible:
-        result.setdefault(int(labels[index]), []).append(int(index))
-    return {
-        label: np.asarray(indices, dtype=np.int64)
-        for label, indices in result.items()
-        if len(indices) >= _MIN_CLUSTER_POINTS
-    }
+    return u, v, inside
 
 
 @dataclass
@@ -562,6 +576,11 @@ def annotate_frame(
             distances = np.linalg.norm(visible_points, axis=1)
             nearest = visible_points[int(np.argmin(distances))]
             distance = float(np.linalg.norm(nearest))
+            pixel_x, pixel_y, pixel_inside = project_camera_points(
+                nearest.reshape(1, 3), metadata
+            )
+            if not bool(pixel_inside[0]):
+                continue
             output.append(
                 {
                     "obstacle_id": obstacle_id,
@@ -572,6 +591,10 @@ def annotate_frame(
                     },
                     "distance_m": round(distance, 6),
                     "distance_ground_truth_m": round(distance, 6),
+                    "image_pixel": {
+                        "x": int(pixel_x[0]),
+                        "y": int(pixel_y[0]),
+                    },
                     "visible_point_count": int(len(visible_indices)),
                     "point_source": "lidar",
                 }
@@ -593,6 +616,264 @@ def annotate_frame(
         }
     except (KeyError, TypeError, ValueError, PostprocessError) as exc:
         return {**base, "status": "invalid", "failure_reason": str(exc)}
+
+
+class LiveCollectionSynchronizer:
+    """Reassemble the already sampled internal record topics into one frame."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._session_id: str | None = None
+        self._frame_count = 0
+        self._pending_rgb: deque = deque(maxlen=8)
+        self._buffers = {
+            "depth_v2": deque(maxlen=8),
+            "lidar": deque(maxlen=8),
+            "imu": deque(maxlen=32),
+            "odom": deque(maxlen=8),
+        }
+
+    def reset(self, session_id: str | None) -> None:
+        with self._lock:
+            self._session_id = session_id
+            self._frame_count = 0
+            self._pending_rgb.clear()
+            for values in self._buffers.values():
+                values.clear()
+
+    def update_session(self, session_id: str | None) -> None:
+        with self._lock:
+            if session_id and session_id != self._session_id:
+                self.reset(session_id)
+
+    @property
+    def session_id(self) -> str | None:
+        with self._lock:
+            return self._session_id
+
+    @staticmethod
+    def _nearest(records: deque, stamp_ns: int, kind: str) -> dict | None:
+        if not records:
+            return None
+        candidate = min(
+            records,
+            key=lambda value: abs(int(value["stamp_ns"]) - stamp_ns),
+        )
+        if abs(int(candidate["stamp_ns"]) - stamp_ns) > _SYNC_TOLERANCE_NS[kind]:
+            return None
+        return candidate
+
+    def observe(self, record: dict) -> tuple[int, dict] | None:
+        with self._lock:
+            return self._observe_locked(record)
+
+    def _observe_locked(self, record: dict) -> tuple[int, dict] | None:
+        kind = str(record.get("kind", ""))
+        if kind == "rgb_v2":
+            self._pending_rgb.append(record)
+        elif kind in self._buffers:
+            self._buffers[kind].append(record)
+        else:
+            return None
+        if not self._pending_rgb:
+            return None
+        image = self._pending_rgb[0]
+        image_stamp_ns = int(image["stamp_ns"])
+        lidar = self._nearest(self._buffers["lidar"], image_stamp_ns, "lidar")
+        depth = self._nearest(
+            self._buffers["depth_v2"], image_stamp_ns, "depth_v2"
+        )
+        odom = self._nearest(self._buffers["odom"], image_stamp_ns, "odom")
+        if lidar is None or depth is None or odom is None:
+            return None
+        imu = self._nearest(
+            self._buffers["imu"], int(lidar["stamp_ns"]), "imu"
+        )
+        if imu is None:
+            return None
+        self._pending_rgb.popleft()
+        self._frame_count += 1
+        return self._frame_count, {
+            "rgb_v2": image,
+            "depth_v2": depth,
+            "lidar": lidar,
+            "imu": imu,
+            "odom": odom,
+        }
+
+
+def render_collection_preview(
+    bundle: dict,
+    frame_number: int,
+    tracker: SessionTracker,
+) -> tuple[bytes, dict]:
+    """Render the latest synchronized RGB frame with LiDAR distance markers."""
+
+    try:
+        import cv2
+    except ImportError as exc:
+        raise PostprocessError("opencv_unavailable_for_collection_preview") from exc
+    image = bundle["rgb_v2"]
+    annotation = annotate_frame(
+        {
+            **image,
+            "image_id": f"frame-{frame_number:08d}",
+            "image_path": "live://collection-preview",
+        },
+        {
+            **bundle["lidar"],
+            "lidar_id": f"lidar-{int(bundle['lidar']['stamp_ns']):019d}",
+            "lidar_path": "live://collection-preview",
+        },
+        bundle["imu"],
+        bundle["odom"],
+        tracker,
+        frame_number - 1,
+        {
+            **bundle["depth_v2"],
+            "depth_id": f"depth-{int(bundle['depth_v2']['stamp_ns']):019d}",
+            "depth_path": "live://collection-preview",
+        },
+    )
+    pixels = np.frombuffer(bytes(image["jpeg"]), dtype=np.uint8)
+    canvas = cv2.imdecode(pixels, cv2.IMREAD_COLOR)
+    if canvas is None:
+        raise PostprocessError("collection_preview_jpeg_decode_failed")
+    cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 42), (20, 20, 20), -1)
+    cv2.putText(
+        canvas,
+        f"Frame #{frame_number:08d}",
+        (14, 29),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    if annotation.get("status") == "valid":
+        for obstacle in annotation.get("obstacles", []):
+            pixel = obstacle.get("image_pixel") or {}
+            x, y = int(pixel.get("x", -1)), int(pixel.get("y", -1))
+            if x < 0 or y < 0:
+                continue
+            cv2.circle(canvas, (x, y), 7, (0, 60, 255), 2, cv2.LINE_AA)
+            cv2.putText(
+                canvas,
+                f"{float(obstacle['distance_m']):.2f} m",
+                (min(x + 10, max(0, canvas.shape[1] - 100)), max(55, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 60, 255),
+                2,
+                cv2.LINE_AA,
+            )
+    else:
+        cv2.putText(
+            canvas,
+            f"Annotation unavailable: {annotation.get('failure_reason')}",
+            (14, min(70, canvas.shape[0] - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 165, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    encoded, jpeg = cv2.imencode(
+        ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 88]
+    )
+    if not encoded:
+        raise PostprocessError("collection_preview_jpeg_encode_failed")
+    return bytes(jpeg), annotation
+
+
+class CollectionPreviewWorker:
+    """Latest-only preview renderer that never blocks ROS callbacks."""
+
+    def __init__(self, renderer: Callable = render_collection_preview):
+        self._renderer = renderer
+        self._jobs: queue.Queue[tuple[int, dict]] = queue.Queue(maxsize=1)
+        self._lock = threading.Lock()
+        self._tracker = SessionTracker()
+        self._serial = 0
+        self._latest: bytes | None = None
+        self._frame_number = 0
+        self._annotation: dict | None = None
+        self._failure_reason: str | None = None
+        self._worker = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="navigation-collection-preview",
+        )
+        self._worker.start()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._tracker = SessionTracker()
+            self._latest = None
+            self._frame_number = 0
+            self._annotation = None
+            self._failure_reason = None
+            self._serial += 1
+        while True:
+            try:
+                self._jobs.get_nowait()
+                self._jobs.task_done()
+            except queue.Empty:
+                break
+
+    def submit(self, frame_number: int, bundle: dict) -> None:
+        job = (int(frame_number), bundle)
+        try:
+            self._jobs.put_nowait(job)
+        except queue.Full:
+            try:
+                self._jobs.get_nowait()
+                self._jobs.task_done()
+            except queue.Empty:
+                pass
+            self._jobs.put_nowait(job)
+
+    def record_failure(self, exc: Exception) -> None:
+        with self._lock:
+            self._failure_reason = f"{type(exc).__name__}:{exc}"
+            self._serial += 1
+
+    def _run(self) -> None:
+        while True:
+            frame_number, bundle = self._jobs.get()
+            try:
+                payload, annotation = self._renderer(
+                    bundle, frame_number, self._tracker
+                )
+                with self._lock:
+                    self._latest = bytes(payload)
+                    self._frame_number = frame_number
+                    self._annotation = dict(annotation)
+                    self._failure_reason = None
+                    self._serial += 1
+            except Exception as exc:
+                with self._lock:
+                    self._failure_reason = f"{type(exc).__name__}:{exc}"
+                    self._serial += 1
+            finally:
+                self._jobs.task_done()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "serial": self._serial,
+                "frame_number": self._frame_number,
+                "jpeg": self._latest,
+                "annotation_status": (
+                    None if self._annotation is None else self._annotation.get("status")
+                ),
+                "obstacle_count": (
+                    0
+                    if self._annotation is None
+                    else len(self._annotation.get("obstacles", []))
+                ),
+                "failure_reason": self._failure_reason,
+            }
 
 
 class RosbagRecordReader:
@@ -1170,32 +1451,85 @@ class DisabledCollectionController:
 
 
 class RosCollectionController:
-    """Bridge child-runtime raw status to one persistent public Canvas topic."""
+    """Publish a human-readable Canvas preview and retain machine diagnostics."""
 
     def __init__(self, root_directory: str, namespace: str, executor):
+        from g1_fast_livo2.camera_depth_v2 import decode as decode_depth_v2
+        from g1_fast_livo2.camera_rgb_v2 import decode as decode_rgb_v2
+        from g1_fast_livo2.vectorized_cloud import decode_xyz_array
+        from nav_msgs.msg import Odometry
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-        from std_msgs.msg import String
+        from sensor_msgs.msg import CompressedImage, Imu, PointCloud2
+        from std_msgs.msg import String, UInt8MultiArray
 
         root = f"/{namespace.strip('/')}"
         self._String = String
+        self._CompressedImage = CompressedImage
+        self._decode_depth_v2 = decode_depth_v2
+        self._decode_rgb_v2 = decode_rgb_v2
+        self._decode_xyz_array = decode_xyz_array
         self._node = Node("navigation_collection_status")
-        qos = QoSProfile(
+        status_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
+        preview_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        record_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self._manager = CollectionPostprocessManager(root_directory)
-        self._publisher = self._node.create_publisher(
-            String, f"{root}/navigation/fast_livo2/collection_status", qos
+        self._synchronizer = LiveCollectionSynchronizer()
+        self._preview_worker = CollectionPreviewWorker()
+        self._last_preview_serial = -1
+        self._preview_publisher = self._node.create_publisher(
+            CompressedImage,
+            f"{root}/navigation/fast_livo2/collection_status",
+            preview_qos,
+        )
+        self._diagnostics_publisher = self._node.create_publisher(
+            String,
+            f"{root}/navigation/fast_livo2/collection_status_json",
+            status_qos,
         )
         self._subscription = self._node.create_subscription(
             String,
             f"{root}/navigation/fast_livo2/collection_status_raw",
             self._on_raw,
-            qos,
+            status_qos,
         )
+        record_topics = {
+            "lidar": (f"{root}/navigation/collection/lidar", PointCloud2),
+            "imu": (f"{root}/navigation/collection/imu", Imu),
+            "rgb_v2": (
+                f"{root}/navigation/collection/camera/rgb",
+                UInt8MultiArray,
+            ),
+            "depth_v2": (
+                f"{root}/navigation/collection/camera/depth",
+                UInt8MultiArray,
+            ),
+            "odom": (f"{root}/navigation/collection/odom", Odometry),
+        }
+        self._record_subscriptions = [
+            self._node.create_subscription(
+                message_type,
+                topic,
+                lambda message, source=kind: self._on_record(source, message),
+                record_qos,
+            )
+            for kind, (topic, message_type) in record_topics.items()
+        ]
         self._timer = self._node.create_timer(1.0, self._publish)
         executor.add_node(self._node)
 
@@ -1205,13 +1539,126 @@ class RosCollectionController:
         except (TypeError, ValueError):
             return
         self._manager.update_raw_status(value)
+        session_id = value.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            previous = self._synchronizer.session_id
+            self._synchronizer.update_session(session_id)
+            if previous != session_id:
+                self._preview_worker.reset()
+
+    @staticmethod
+    def _header_stamp_ns(message) -> int:
+        stamp = message.header.stamp
+        value = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        if value <= 0:
+            raise PostprocessError("collection_preview_source_stamp_missing")
+        return value
+
+    def _normalize_record(self, kind: str, message) -> dict:
+        if kind == "rgb_v2":
+            metadata, jpeg = self._decode_rgb_v2(bytes(message.data))
+            return {
+                "kind": kind,
+                "stamp_ns": int(metadata["source_stamp_ns"]),
+                "metadata": metadata,
+                "jpeg": jpeg,
+            }
+        if kind == "depth_v2":
+            metadata, depth = self._decode_depth_v2(bytes(message.data))
+            return {
+                "kind": kind,
+                "stamp_ns": int(metadata["source_stamp_ns"]),
+                "frame_id": str(metadata["frame_id"]),
+                "metadata": metadata,
+                "depth": depth,
+            }
+        stamp_ns = self._header_stamp_ns(message)
+        if kind == "lidar":
+            return {
+                "kind": kind,
+                "stamp_ns": stamp_ns,
+                "frame_id": str(message.header.frame_id),
+                "points": self._decode_xyz_array(
+                    fields=message.fields,
+                    data=bytes(message.data),
+                    point_step=int(message.point_step),
+                    row_step=int(message.row_step),
+                    width=int(message.width),
+                    height=int(message.height),
+                    is_bigendian=bool(message.is_bigendian),
+                    max_points=200_000,
+                    max_data_bytes=64 * 1024 * 1024,
+                ),
+            }
+        if kind == "imu":
+            return {
+                "kind": kind,
+                "stamp_ns": stamp_ns,
+                "gravity": np.asarray(
+                    (
+                        message.linear_acceleration.x,
+                        message.linear_acceleration.y,
+                        message.linear_acceleration.z,
+                    ),
+                    dtype=np.float64,
+                ),
+            }
+        pose = message.pose.pose
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = _quaternion_matrix(
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        )
+        transform[:3, 3] = (
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+        )
+        return {
+            "kind": kind,
+            "stamp_ns": stamp_ns,
+            "t_map_base": transform,
+        }
+
+    def _on_record(self, kind: str, message) -> None:
+        try:
+            record = self._normalize_record(kind, message)
+            ready = self._synchronizer.observe(record)
+        except Exception as exc:
+            self._preview_worker.record_failure(exc)
+            return
+        if ready is not None:
+            frame_number, bundle = ready
+            self._preview_worker.submit(frame_number, bundle)
 
     def _publish(self) -> None:
-        message = self._String()
-        message.data = json.dumps(
-            self._manager.snapshot(), ensure_ascii=False, separators=(",", ":")
+        preview = self._preview_worker.snapshot()
+        diagnostics = {
+            **self._manager.snapshot(),
+            "preview": {
+                key: value for key, value in preview.items() if key != "jpeg"
+            },
+        }
+        diagnostics_message = self._String()
+        diagnostics_message.data = json.dumps(
+            diagnostics, ensure_ascii=False, separators=(",", ":")
         )
-        self._publisher.publish(message)
+        self._diagnostics_publisher.publish(diagnostics_message)
+        serial = int(preview["serial"])
+        if serial == self._last_preview_serial:
+            return
+        self._last_preview_serial = serial
+        payload = preview.get("jpeg")
+        if not payload:
+            return
+        message = self._CompressedImage()
+        message.header.stamp = self._node.get_clock().now().to_msg()
+        message.header.frame_id = "camera_color_optical_frame"
+        message.format = "jpeg"
+        message.data = bytes(payload)
+        self._preview_publisher.publish(message)
 
     def set_runtime_active(self, active: bool) -> None:
         self._manager.set_runtime_active(active)
@@ -1223,7 +1670,13 @@ class RosCollectionController:
         self._manager.update_root(root_directory)
 
     def snapshot(self) -> dict:
-        return self._manager.snapshot()
+        preview = self._preview_worker.snapshot()
+        return {
+            **self._manager.snapshot(),
+            "preview": {
+                key: value for key, value in preview.items() if key != "jpeg"
+            },
+        }
 
 
 def build_collection_controller(root_directory: str, namespace: str, executor):
@@ -1235,7 +1688,9 @@ def build_collection_controller(root_directory: str, namespace: str, executor):
 __all__ = [
     "ANNOTATION_SCHEMA",
     "CollectionPostprocessManager",
+    "CollectionPreviewWorker",
     "DisabledCollectionController",
+    "LiveCollectionSynchronizer",
     "OfflineAnnotationProcessor",
     "PostprocessError",
     "RosCollectionController",
@@ -1243,6 +1698,8 @@ __all__ = [
     "annotate_frame",
     "build_collection_controller",
     "cluster_points",
+    "project_camera_points",
     "remove_ground",
+    "render_collection_preview",
     "visible_cluster_points",
 ]

@@ -20,8 +20,8 @@ optional goal_pose ────────┘      ├─ Nav2 planner/controll
 - FAST-LIVO2 和 Nav2 ROS launch 由 `NavigationRuntime` 作为同容器子进程组
   启停；运行时不调用 Docker，也不需要 Docker socket。
 - odom、registered cloud 和 obstacle map 是卡片内部 ROS 边；
-  `collection_status` 作为只读公共输出供 Canvas 查看录制健康、
-  时间对齐、离线标注进度与失败原因。
+  `collection_status` 作为只读公共图像输出，供 Canvas 查看最新同步 RGB、
+  当前采集帧号和 LiDAR 障碍物距离标注。机器诊断保留在内部 JSON topic。
 - VLN 命中地点后直接调用同卡片 planner；无论是 Canvas、
   `goal_pose` topic 还是 VLN 入口，planner 都为每个新任务生成独立
   `nav_id`。终态到达时只发布一次零速 proposal，不会继续以 5 Hz
@@ -46,7 +46,7 @@ optional goal_pose ────────┘      ├─ Nav2 planner/controll
 | --- | --- | --- |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
 | `status` | `/ubuntu/navigation/fast_livo2/status` | 定位、建图和运行状态 |
-| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | 录制健康、同步质量、离线标注进度和失败原因 |
+| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | 最新同步 RGB、采集帧号和障碍物距离标注 |
 | `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | 连接 Driver `loco` 执行器 |
 | `plan` | `/plan` | 当前二维全局路径 |
 | `costmap` | `/global_costmap/costmap` | 实时全局代价地图 |

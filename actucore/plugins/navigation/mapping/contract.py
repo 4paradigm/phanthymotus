@@ -275,14 +275,14 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
             {
                 "port": "collection_status",
                 "topic": f"{root}/navigation/fast_livo2/collection_status",
-                "format": "data/json",
-                "ros_type": "std_msgs/msg/String",
-                "qos": "RELIABLE + KEEP_LAST(depth=10) + TRANSIENT_LOCAL",
-                "schema": "phanthy.navigation.fast_livo2_collection_status.v1",
+                "format": "image/jpeg",
+                "ros_type": "sensor_msgs/msg/CompressedImage",
+                "qos": "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
+                "schema": "phanthy.navigation.collection_preview.v1",
                 "rate_hz": 1,
                 "desc": (
-                    "Automatic data collection, software timestamp alignment, "
-                    "offline annotation progress and explicit failure reasons"
+                    "Latest synchronized RGB sample with its frame number and "
+                    "LiDAR nearest-visible-point distance markers"
                 ),
             },
         ],

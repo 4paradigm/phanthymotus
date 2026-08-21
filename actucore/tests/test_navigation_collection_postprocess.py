@@ -34,7 +34,9 @@ from g1_fast_livo2.camera_rgb_v2 import (  # noqa: E402
     encode,
 )
 from plugins.navigation.mapping.collection_postprocess import (  # noqa: E402
+    CollectionPreviewWorker,
     CollectionPostprocessManager,
+    LiveCollectionSynchronizer,
     OfflineAnnotationProcessor,
     SessionTracker,
     annotate_frame,
@@ -319,6 +321,72 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             expected,
             places=5,
         )
+        self.assertGreaterEqual(obstacle["image_pixel"]["x"], 0)
+        self.assertLess(obstacle["image_pixel"]["x"], metadata()["width"])
+        self.assertGreaterEqual(obstacle["image_pixel"]["y"], 0)
+        self.assertLess(obstacle["image_pixel"]["y"], metadata()["height"])
+
+    def test_live_preview_reassembles_sampled_topics_and_renders_in_background(self) -> None:
+        stamp = metadata()["source_stamp_ns"]
+        synchronizer = LiveCollectionSynchronizer()
+        synchronizer.update_session("session-a")
+        records = [
+            {
+                "kind": "lidar",
+                "stamp_ns": stamp + 10_000_000,
+                "points": synthetic_points(),
+            },
+            {
+                "kind": "imu",
+                "stamp_ns": stamp + 11_000_000,
+                "gravity": np.asarray((0.0, 0.0, -9.81)),
+            },
+            {
+                "kind": "depth_v2",
+                "stamp_ns": stamp + 20_000_000,
+                "metadata": {"source_stamp_ns": stamp + 20_000_000},
+                "depth": b"depth",
+            },
+            {"kind": "odom", "stamp_ns": stamp, "t_map_base": np.eye(4)},
+            {
+                "kind": "rgb_v2",
+                "stamp_ns": stamp,
+                "metadata": metadata(stamp),
+                "jpeg": b"jpeg",
+            },
+        ]
+        ready = None
+        for record in records:
+            ready = synchronizer.observe(record) or ready
+        self.assertIsNotNone(ready)
+        frame_number, bundle = ready
+        self.assertEqual(frame_number, 1)
+        self.assertEqual(set(bundle), {"rgb_v2", "depth_v2", "lidar", "imu", "odom"})
+
+        def fake_renderer(value, number, tracker):
+            self.assertIs(value, bundle)
+            self.assertEqual(number, 1)
+            self.assertIsInstance(tracker, SessionTracker)
+            return b"\xff\xd8preview\xff\xd9", {
+                "status": "valid",
+                "obstacles": [{"distance_m": 1.25}],
+            }
+
+        worker = CollectionPreviewWorker(fake_renderer)
+        worker.submit(frame_number, bundle)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if worker.snapshot()["frame_number"] == 1:
+                break
+            time.sleep(0.01)
+        preview = worker.snapshot()
+        self.assertEqual(preview["jpeg"], b"\xff\xd8preview\xff\xd9")
+        self.assertEqual(preview["annotation_status"], "valid")
+        self.assertEqual(preview["obstacle_count"], 1)
+        self.assertIsNone(preview["failure_reason"])
+
+        synchronizer.update_session("session-b")
+        self.assertEqual(synchronizer.session_id, "session-b")
 
     def test_processor_writes_one_json_per_image_and_atomic_manifest(self) -> None:
         stamp = metadata()["source_stamp_ns"]
