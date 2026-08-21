@@ -134,33 +134,19 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
 # ── VITS2 TRT TTS (optional backend, JP5 TRT 8.5.2) ──────────────
+# 模型资产（frontend / vits2 源码 / nltk / TRT engine）运行时由
+# model_downloader.ensure_model 下载（/models 会被 bind-mount 覆盖，
+# 故不 bake 进镜像）。这里只装 Python 依赖。
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     numpy pypinyin jieba inflect g2p-en nltk kaldifst
 
+# wetext（Python 依赖，含预构建 fst）装到 site-packages
 ARG WETEXT_URL=https://dou-1257995901.cos.ap-guangzhou.myqcloud.com/source_code
-RUN mkdir -p /models/vits2-mix/frontend && \
-    cd /models/vits2-mix && \
-    curl -fsSL -o /tmp/vits2_model.tar.gz "${WETEXT_URL}/vits2_model.tar.gz" && \
-    tar -xzf /tmp/vits2_model.tar.gz -C /models/vits2-mix && rm /tmp/vits2_model.tar.gz && \
-    curl -fsSL -o /tmp/frontend.tar.gz "${WETEXT_URL}/frontend.tar.gz" && \
-    tar -xzf /tmp/frontend.tar.gz -C /models/vits2-mix/frontend && rm /tmp/frontend.tar.gz && \
-    curl -fsSL -o /tmp/wetext_with_fsts.tar.gz "${WETEXT_URL}/wetext_with_fsts.tar.gz" && \
-    tar -xzf /tmp/wetext_with_fsts.tar.gz -C "$(python3 -c 'import site; print(site.getsitepackages()[0])')" && rm /tmp/wetext_with_fsts.tar.gz && \
-    mkdir -p /models/vits2-mix/nltk_data/taggers /models/vits2-mix/nltk_data/tokenizers /models/vits2-mix/nltk_data/corpora && \
-    unzip -qo /models/vits2-mix/nltk/averaged_perceptron_tagger_eng.zip -d /models/vits2-mix/nltk_data/taggers/ && \
-    unzip -qo /models/vits2-mix/nltk/punkt_tab.zip -d /models/vits2-mix/nltk_data/tokenizers/ && \
-    unzip -qo /models/vits2-mix/nltk/cmudict.zip -d /models/vits2-mix/nltk_data/corpora/ && \
-    echo "VITS2 model files installed"
-
-ENV NLTK_DATA=/models/vits2-mix/nltk_data
-
-# ── VITS2 mel20full_d50 TRT engine (JP5, TRT 8.5.2) ──────────────
-RUN cd /models/vits2-mix && \
-    curl -fsSL -o /tmp/trt_mel20full_d50.tar.gz "${WETEXT_URL}/trt_mel20full_d50.tar.gz" && \
-    tar -xzf /tmp/trt_mel20full_d50.tar.gz -C /models/vits2-mix && rm /tmp/trt_mel20full_d50.tar.gz && \
-    mv /models/vits2-mix/mel20full_d50trt_jp5 /models/vits2-mix/trt_mel20full_d50 && \
-    echo "TRT engines mel20full_d50:" && ls -lh /models/vits2-mix/trt_mel20full_d50/
+RUN curl -fsSL -o /tmp/wetext_with_fsts.tar.gz "${WETEXT_URL}/wetext_with_fsts.tar.gz" && \
+    tar -xzf /tmp/wetext_with_fsts.tar.gz -C "$(python3 -c 'import site; print(site.getsitepackages()[0])')" && \
+    rm /tmp/wetext_with_fsts.tar.gz && \
+    echo "wetext (with fst) installed"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work

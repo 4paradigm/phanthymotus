@@ -8,7 +8,6 @@ On-device text-to-speech using sherpa-onnx MeloTTS (Chinese + English).
 from __future__ import annotations
 
 import ctypes
-import gc
 import json
 import logging
 import os
@@ -17,7 +16,6 @@ import struct
 import sys
 import threading
 import time
-import types
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -223,6 +221,19 @@ class TRTTSAdapter(TTSAdapter):
         self._speed = speed
         self._trt_dir = trt_dir
 
+        # ── TRT 版本检查：engine 仅按 JP5 / TRT 8.5.x 构建，JP6 不兼容 ──
+        import tensorrt as trt
+        if not trt.__version__.startswith("8.5"):
+            raise RuntimeError(
+                f"VITS2 TRT engine 仅支持 JP5 / TRT 8.5.x，当前为 TRT {trt.__version__}；"
+                f"请勿在 JP6 镜像启用 backend: trt"
+            )
+
+        # ── 运行时下载模型资产（不 bake 进镜像：/models 会被 bind-mount 覆盖）──
+        from utils.model_downloader import ensure_model
+        ensure_model("vits2_mix", model_dir)
+        ensure_model("vits2_trt_mel20full_d50", trt_dir)
+
         # ── Frontend (G2P) ──
         sys.path.insert(0, model_dir)
         from frontend.cleaner import clean_text_mix
@@ -231,7 +242,11 @@ class TRTTSAdapter(TTSAdapter):
         self._seq_mix = cleaned_text_to_sequence_mix
 
         # ── Model-specific iSTFT parameters ──
-        mc = self._MODEL_CFG.get(model_type, self._MODEL_CFG["mel20full_d50"])
+        if model_type not in self._MODEL_CFG:
+            raise ValueError(
+                f"Unknown model_type: {model_type!r}; supported: {sorted(self._MODEL_CFG)}"
+            )
+        mc = self._MODEL_CFG[model_type]
         self._n_fft = mc["n_fft"]
         self._hop = mc["hop"]
         self._gain = mc["gain"]
@@ -298,22 +313,40 @@ class TRTTSAdapter(TTSAdapter):
 
     @staticmethod
     def _split_sentences(text: str) -> list:
-        """按句号截断，超长文本分批，每批不超过 MAX_CHUNK_CHARS 字符。"""
+        """按句号截断，超长文本分批，每批不超过 MAX_CHUNK_CHARS 字符。
+
+        单个无标点句子超过上限时也会切成多个片段，保证 decoder Ty 不超过
+        TRT engine 的 max shape（JP5 约 1500）。
+        """
         import re
         sentences = re.split(r'(?<=[。！？\n])', text)
+        limit = TRTTSAdapter.MAX_CHUNK_CHARS
         chunks, buf = [], ""
+
+        def flush():
+            nonlocal buf
+            if buf:
+                chunks.append(buf)
+                buf = ""
+
         for s in sentences:
             s = s.strip()
             if not s:
                 continue
-            if len(buf) + len(s) <= TRTTSAdapter.MAX_CHUNK_CHARS:
-                buf += s
-            else:
-                if buf:
-                    chunks.append(buf)
-                buf = s
-        if buf:
-            chunks.append(buf)
+            while s:
+                room = limit - len(buf)
+                if room >= len(s):
+                    buf += s
+                    break
+                if room > 0:
+                    buf += s[:room]
+                    s = s[room:]
+                flush()
+                # 此时 buf 为空；若 s 仍超长，切成完整片段
+                while len(s) >= limit:
+                    chunks.append(s[:limit])
+                    s = s[limit:]
+        flush()
         return chunks if chunks else [text]
 
     def synthesize(self, text: str) -> bytes:
