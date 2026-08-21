@@ -308,6 +308,12 @@ JSON，而是输出最新一帧已对齐的 RGB 预览：顶部显示采集帧�
 生成的 1 Hz 录制快照，后台采用 latest-only 队列，不会提高录制频率或阻塞
 FAST-LIVO2/Nav2 回调。
 
+停止智能控制并完成 MCAP 原子收口后，同一 `collection_status` 图像端口自动
+切换为本体离线导出进度卡；显示 session、阶段、已处理/总帧数、百分比、
+RGB/JSON、Depth PNG、LiDAR PCD 产物数以及暂停或失败原因。`complete`、
+`degraded`、`error` 终态采用 transient-local 保留，下一次采集产生新预览后
+再被替换，不需要额外动作或新的 Canvas 连接点。
+
 完整机器诊断继续保留在卡片原有
 `/ubuntu/navigation/fast_livo2/status` 的 `collection` 字段，并额外发布到内部
 `/ubuntu/navigation/fast_livo2/collection_status_json`，包含：
@@ -328,8 +334,8 @@ FAST-LIVO2/Nav2 回调。
   `recording_empty` 明确标记为不健康；
 - `postprocess.state/stage`: `queued` / `scanning` / `processing` / `paused` /
   `finalizing` / `complete` / `degraded` / `error`；
-- `processed_images`、`total_images`、`generated_lidar_frames`、`percent`、
-  `paused_reason` 与 `failure_reason`。
+- `processed_images`、`total_images`、`generated_lidar_frames`、
+  `generated_depth_frames`、`percent`、`paused_reason` 与 `failure_reason`。
 
 Canvas `stop` 只有在算法和采集都确认停止后才返回
 `state/status=idle`；任一收口失败时返回顶层

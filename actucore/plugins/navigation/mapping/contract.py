@@ -282,7 +282,8 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "rate_hz": 1,
                 "desc": (
                     "Latest synchronized RGB sample with its frame number and "
-                    "LiDAR nearest-visible-point distance markers"
+                    "LiDAR nearest-visible-point distance markers while recording; "
+                    "switches to export progress after the card stops"
                 ),
             },
         ],

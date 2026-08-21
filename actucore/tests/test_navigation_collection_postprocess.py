@@ -40,6 +40,8 @@ from plugins.navigation.mapping.collection_postprocess import (  # noqa: E402
     OfflineAnnotationProcessor,
     SessionTracker,
     annotate_frame,
+    collection_public_mode,
+    render_collection_progress,
 )
 
 
@@ -505,6 +507,57 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no_rgb_v2_images"):
                 processor.process_session(session, lambda *args: None, lambda: None)
 
+    def test_public_status_switches_to_export_progress_after_stop(self) -> None:
+        class FakeCv2:
+            FONT_HERSHEY_SIMPLEX = 0
+            LINE_AA = 0
+            IMWRITE_JPEG_QUALITY = 1
+
+            def __init__(self):
+                self.text = []
+
+            def putText(self, image, text, *args):
+                self.text.append(str(text))
+                return image
+
+            @staticmethod
+            def rectangle(image, *args):
+                return image
+
+            @staticmethod
+            def imencode(extension, image, parameters):
+                return True, np.frombuffer(
+                    b"\xff\xd8progress\xff\xd9", dtype=np.uint8
+                )
+
+        running = {
+            "enabled": True,
+            "postprocess": {"state": "processing"},
+        }
+        stopped = {
+            "enabled": False,
+            "postprocess": {
+                "state": "processing",
+                "stage": "processing",
+                "session_id": "session-a",
+                "processed_images": 8,
+                "total_images": 20,
+                "generated_depth_frames": 7,
+                "generated_lidar_frames": 8,
+                "percent": 40.0,
+            },
+        }
+        self.assertEqual(collection_public_mode(running), "preview")
+        self.assertEqual(collection_public_mode(stopped), "progress")
+        fake_cv2 = FakeCv2()
+        payload = render_collection_progress(
+            stopped["postprocess"], cv2_module=fake_cv2
+        )
+        self.assertEqual(payload, b"\xff\xd8progress\xff\xd9")
+        self.assertIn("Frames: 8 / 20", fake_cv2.text)
+        self.assertIn("40.0%", fake_cv2.text)
+        self.assertTrue(any("Depth: 7" in value for value in fake_cv2.text))
+
     def test_manager_pauses_for_runtime_and_resumes_after_stop(self) -> None:
         class FakeProcessor:
             def process_session(self, session, progress, wait_if_paused):
@@ -517,6 +570,8 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
                     "state": "complete",
                     "processed_images": 1,
                     "total_images": 1,
+                    "lidar_frames": 1,
+                    "depth_frames": 1,
                 }
                 (derived / "manifest.json").write_text(json.dumps(manifest))
                 return manifest
@@ -565,6 +620,8 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             status = manager.snapshot()["postprocess"]
             self.assertEqual(status["state"], "complete", status)
             self.assertEqual(status["percent"], 100.0)
+            self.assertEqual(status["generated_lidar_frames"], 1)
+            self.assertEqual(status["generated_depth_frames"], 1)
             journal = json.loads(
                 (session / "postprocess.json").read_text(encoding="utf-8")
             )

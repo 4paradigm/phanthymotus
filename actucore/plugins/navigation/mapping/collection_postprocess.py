@@ -33,6 +33,16 @@ _GROUND_DISTANCE_M = 0.08
 _GROUND_NORMAL_ANGLE_RAD = math.radians(15.0)
 _DOWNSAMPLE_M = 0.05
 _CLUSTER_CELL_M = 0.15
+_POSTPROCESS_VISUAL_STATES = {
+    "queued",
+    "scanning",
+    "processing",
+    "paused",
+    "finalizing",
+    "complete",
+    "degraded",
+    "error",
+}
 
 
 class PostprocessError(RuntimeError):
@@ -876,6 +886,136 @@ class CollectionPreviewWorker:
             }
 
 
+def collection_public_mode(snapshot: dict) -> str:
+    """Select the single Canvas image without exposing another output port."""
+
+    postprocess = snapshot.get("postprocess") or {}
+    if (
+        snapshot.get("enabled") is not True
+        and postprocess.get("state") in _POSTPROCESS_VISUAL_STATES
+    ):
+        return "progress"
+    return "preview"
+
+
+def render_collection_progress(status: dict, cv2_module=None) -> bytes:
+    """Render a latched, human-readable post-processing progress card."""
+
+    if cv2_module is None:
+        try:
+            import cv2 as cv2_module
+        except ImportError as exc:
+            raise PostprocessError(
+                "opencv_unavailable_for_collection_progress"
+            ) from exc
+    cv2 = cv2_module
+    width, height = 960, 540
+    canvas = np.full((height, width, 3), (24, 24, 24), dtype=np.uint8)
+    state = str(status.get("state") or "unknown")
+    stage = str(status.get("stage") or state)
+    processed = max(0, int(status.get("processed_images") or 0))
+    total = max(0, int(status.get("total_images") or 0))
+    percent = max(0.0, min(100.0, float(status.get("percent") or 0.0)))
+    title_color = (80, 210, 120)
+    if state in {"degraded", "error"}:
+        title_color = (80, 120, 255)
+    cv2.putText(
+        canvas,
+        "Collection export",
+        (48, 72),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.35,
+        title_color,
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        f"Stage: {stage}",
+        (50, 130),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.82,
+        (235, 235, 235),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        f"Frames: {processed} / {total}",
+        (50, 174),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        (210, 210, 210),
+        2,
+        cv2.LINE_AA,
+    )
+    left, top, right, bottom = 50, 218, 910, 270
+    cv2.rectangle(canvas, (left, top), (right, bottom), (85, 85, 85), 2)
+    fill_right = left + int((right - left) * percent / 100.0)
+    if fill_right > left:
+        cv2.rectangle(
+            canvas,
+            (left + 2, top + 2),
+            (fill_right, bottom - 2),
+            title_color,
+            -1,
+        )
+    cv2.putText(
+        canvas,
+        f"{percent:.1f}%",
+        (430, 257),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    outputs = (
+        f"RGB/JSON: {processed}    Depth: "
+        f"{int(status.get('generated_depth_frames') or 0)}    LiDAR: "
+        f"{int(status.get('generated_lidar_frames') or 0)}"
+    )
+    cv2.putText(
+        canvas,
+        outputs,
+        (50, 330),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.67,
+        (200, 200, 200),
+        2,
+        cv2.LINE_AA,
+    )
+    session_id = str(status.get("session_id") or "-")
+    cv2.putText(
+        canvas,
+        f"Session: {session_id[:72]}",
+        (50, 380),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (170, 170, 170),
+        1,
+        cv2.LINE_AA,
+    )
+    failure = status.get("failure_reason") or status.get("paused_reason")
+    if failure:
+        cv2.putText(
+            canvas,
+            f"Status: {str(failure)[:86]}",
+            (50, 432),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (80, 150, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    encoded, jpeg = cv2.imencode(
+        ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+    )
+    if not encoded:
+        raise PostprocessError("collection_progress_jpeg_encode_failed")
+    return bytes(jpeg)
+
+
 class RosbagRecordReader:
     """Stream normalized records from one finalized rosbag2 MCAP directory."""
 
@@ -1244,6 +1384,7 @@ class CollectionPostprocessManager:
             "processed_images": 0,
             "total_images": 0,
             "generated_lidar_frames": 0,
+            "generated_depth_frames": 0,
             "percent": 0.0,
             "output_directory": None,
             "paused_reason": None,
@@ -1291,15 +1432,37 @@ class CollectionPostprocessManager:
                 "last_receipt": dict(receipt),
             }
         if receipt.get("storage_complete") is not True:
+            with self._lock:
+                self._status.update(
+                    state="error",
+                    stage="error",
+                    session_id=receipt.get("session_id"),
+                    failure_reason=(
+                        receipt.get("failure_reason")
+                        or "collection_storage_incomplete"
+                    ),
+                )
             return False
         directory = receipt.get("directory")
         if not isinstance(directory, str) or not directory:
+            with self._lock:
+                self._status.update(
+                    state="error",
+                    stage="error",
+                    failure_reason="collection_directory_missing",
+                )
             return False
         try:
             session = Path(directory).resolve()
             root = self._root.resolve()
             session.relative_to(root)
         except (OSError, ValueError):
+            with self._lock:
+                self._status.update(
+                    state="error",
+                    stage="error",
+                    failure_reason="collection_directory_outside_root",
+                )
             return False
         return self.enqueue(session)
 
@@ -1405,6 +1568,9 @@ class CollectionPostprocessManager:
                         generated_lidar_frames=int(
                             manifest.get("lidar_frames", 0)
                         ),
+                        generated_depth_frames=int(
+                            manifest.get("depth_frames", 0)
+                        ),
                         failure_reason=(
                             "invalid_frames_present" if final_state == "degraded" else None
                         ),
@@ -1492,6 +1658,7 @@ class RosCollectionController:
         self._synchronizer = LiveCollectionSynchronizer()
         self._preview_worker = CollectionPreviewWorker()
         self._last_preview_serial = -1
+        self._last_progress_signature: str | None = None
         self._preview_publisher = self._node.create_publisher(
             CompressedImage,
             f"{root}/navigation/fast_livo2/collection_status",
@@ -1646,6 +1813,22 @@ class RosCollectionController:
             diagnostics, ensure_ascii=False, separators=(",", ":")
         )
         self._diagnostics_publisher.publish(diagnostics_message)
+        if collection_public_mode(diagnostics) == "progress":
+            progress = diagnostics["postprocess"]
+            signature = json.dumps(
+                progress, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            if signature == self._last_progress_signature:
+                return
+            try:
+                payload = render_collection_progress(progress)
+            except Exception as exc:
+                self._preview_worker.record_failure(exc)
+                return
+            self._last_progress_signature = signature
+            self._publish_jpeg(payload, "collection_export_progress")
+            return
+        self._last_progress_signature = None
         serial = int(preview["serial"])
         if serial == self._last_preview_serial:
             return
@@ -1653,9 +1836,12 @@ class RosCollectionController:
         payload = preview.get("jpeg")
         if not payload:
             return
+        self._publish_jpeg(payload, "camera_color_optical_frame")
+
+    def _publish_jpeg(self, payload: bytes, frame_id: str) -> None:
         message = self._CompressedImage()
         message.header.stamp = self._node.get_clock().now().to_msg()
-        message.header.frame_id = "camera_color_optical_frame"
+        message.header.frame_id = frame_id
         message.format = "jpeg"
         message.data = bytes(payload)
         self._preview_publisher.publish(message)
@@ -1698,8 +1884,10 @@ __all__ = [
     "annotate_frame",
     "build_collection_controller",
     "cluster_points",
+    "collection_public_mode",
     "project_camera_points",
     "remove_ground",
+    "render_collection_progress",
     "render_collection_preview",
     "visible_cluster_points",
 ]
