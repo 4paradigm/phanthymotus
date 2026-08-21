@@ -73,6 +73,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(outputs["static_map"]["frame_id"], "map")
         self.assertEqual(outputs["map_view"]["schema"], "phanthy.navigation.map_view.v1")
+        self.assertEqual(
+            outputs["collection_status"]["topic"],
+            "/ubuntu/navigation/fast_livo2/collection_preview",
+        )
         self.assertEqual(outputs["collection_status"]["format"], "image/jpeg")
         self.assertEqual(
             outputs["collection_status"]["ros_type"],

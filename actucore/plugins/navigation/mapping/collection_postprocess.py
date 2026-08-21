@@ -1661,7 +1661,7 @@ class RosCollectionController:
         self._last_progress_signature: str | None = None
         self._preview_publisher = self._node.create_publisher(
             CompressedImage,
-            f"{root}/navigation/fast_livo2/collection_status",
+            f"{root}/navigation/fast_livo2/collection_preview",
             preview_qos,
         )
         self._diagnostics_publisher = self._node.create_publisher(

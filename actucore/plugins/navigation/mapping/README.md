@@ -63,7 +63,7 @@ PointCloud2 的 XYZ 解码、刚体变换、高度过滤和 float32 输出打包
 | `obstacle_map`      | `/ubuntu/navigation/obstacle_map`                 | `map`              | 累计静态障碍的兼容诊断投影                |
 | `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 累计静态点、最新实时点和机器人位置            |
 | `status`            | `/ubuntu/navigation/fast_livo2/status`            | JSON               | 算法进程、输入 freshness、frame 和产物状态 |
-| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | JPEG               | 最新同步 RGB、采集帧号和 LiDAR 障碍物距离标注     |
+| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_preview` | JPEG               | 最新同步 RGB、采集帧号和 LiDAR 障碍物距离标注     |
 
 adapter 先按 `0.10 m` 体素把同一帧命中去重；导航高度带和有效距离内的体素
 首次出现即写入累计静态图，不等待多帧确认、不跟踪动态分量，也不通过后续
@@ -302,8 +302,10 @@ system-time 时钟域的软件对齐证据，不等同于 PTP、外部触发或�
 `.partial`；Canvas 正常停止、rosbag2 完成 flush 且 receipt 写入后才原子改为
 最终目录。异常退出会保留 `.partial`，不会冒充完整数据。
 
-Canvas 公共 `/ubuntu/navigation/fast_livo2/collection_status` 不再输出日志式
-JSON，而是输出最新一帧已对齐的 RGB 预览：顶部显示采集帧号，图中按现有离线
+Canvas 公共 `/ubuntu/navigation/fast_livo2/collection_preview` 输出图像；它与旧的
+`collection_status` String topic 使用不同名称，避免 ROS topic 在版本升级后
+同名异型。该图像端口不再输出日志式 JSON，而是输出最新一帧已对齐的 RGB 预览：
+顶部显示采集帧号，图中按现有离线
 算法投影 LiDAR 可见最近点，并在对应像素标出障碍物距离。预览只消费采样器已经
 生成的 1 Hz 录制快照，后台采用 latest-only 队列，不会提高录制频率或阻塞
 FAST-LIVO2/Nav2 回调。

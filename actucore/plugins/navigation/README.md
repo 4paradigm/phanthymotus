@@ -47,7 +47,7 @@ optional goal_pose ────────┘      ├─ Nav2 planner/controll
 | --- | --- | --- |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
 | `status` | `/ubuntu/navigation/fast_livo2/status` | 定位、建图和运行状态 |
-| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | 采集中显示 RGB/帧号/距离，停止后显示导出进度 |
+| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_preview` | 采集中显示 RGB/帧号/距离，停止后显示导出进度 |
 | `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | 连接 Driver `loco` 执行器 |
 | `plan` | `/plan` | 当前二维全局路径 |
 | `costmap` | `/global_costmap/costmap` | 实时全局代价地图 |

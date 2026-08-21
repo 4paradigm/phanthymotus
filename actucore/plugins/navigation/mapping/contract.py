@@ -274,7 +274,7 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
             },
             {
                 "port": "collection_status",
-                "topic": f"{root}/navigation/fast_livo2/collection_status",
+                "topic": f"{root}/navigation/fast_livo2/collection_preview",
                 "format": "image/jpeg",
                 "ros_type": "sensor_msgs/msg/CompressedImage",
                 "qos": "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
