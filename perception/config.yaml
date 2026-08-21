@@ -84,7 +84,7 @@ plugins:
     min_interval_ms: 0
 
   obstacle:
-    enabled: false
+    enabled: true
     provider: local
     # Select the deployment domain explicitly; OBSTACLE_FIXED_SCENE overrides it.
     scene_mode: fixed
