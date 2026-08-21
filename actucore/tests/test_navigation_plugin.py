@@ -180,7 +180,7 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(tool["displayName"], "ControlledSemanticSpatial")
         self.assertEqual(
             {item["port"] for item in tool["topic_in"]},
-            {"lidar", "imu", "rgb", "rgb_v2", "depth_v2"},
+            {"lidar", "imu", "rgb", "depth_frame"},
         )
         optional_inputs = {
             item["port"]
@@ -189,24 +189,25 @@ class NavigationContractTest(unittest.TestCase):
         }
         self.assertEqual(
             optional_inputs,
-            {"rgb_v2", "depth_v2"},
+            {"depth_frame"},
         )
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(
-            inputs["rgb_v2"]["topic"],
-            "/ubuntu/navigation/camera/rgb",
+            inputs["rgb"]["topic"],
+            "/ubuntu/camera/rgb_frame",
         )
         self.assertEqual(
-            inputs["rgb_v2"]["format"],
-            "application/vnd.phanthy.sensor-envelope.v2",
+            inputs["rgb"]["format"],
+            "application/vnd.phanthy.sensor-envelope.v1",
+        )
+        self.assertEqual(inputs["rgb"]["schema"], "phanthy.sensor.camera_rgb_frame.v1")
+        self.assertEqual(
+            inputs["depth_frame"]["topic"],
+            "/ubuntu/camera/depth_frame",
         )
         self.assertEqual(
-            inputs["depth_v2"]["topic"],
-            "/ubuntu/navigation/camera/depth",
-        )
-        self.assertEqual(
-            inputs["depth_v2"]["schema"],
-            "phanthy.sensor.camera_depth.v2",
+            inputs["depth_frame"]["schema"],
+            "phanthy.sensor.camera_depth_frame.v1",
         )
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
         self.assertEqual(
@@ -517,7 +518,7 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(runtime.stop_calls, 1)
 
-    def test_collection_requires_versioned_rgb_and_depth_bindings(self):
+    def test_collection_reuses_rgb_and_requires_depth_binding(self):
         mapping = CollectionMappingComponent("mapping")
         plugin = self.make_plugin(mapping=mapping)
 
@@ -526,8 +527,8 @@ class NavigationPluginTest(unittest.TestCase):
             {"action": "start", "input_bindings": _external_bindings()},
         )
         self.assertEqual(missing["error_code"], "invalid_canvas_wiring")
-        self.assertIn("depth_v2", missing["error"])
-        self.assertIn("rgb_v2", missing["error"])
+        self.assertIn("depth_frame", missing["error"])
+        self.assertNotIn("rgb_frame", missing["error"])
 
         all_bindings = [
             {"port": item["port"], "topic": item["topic"]}

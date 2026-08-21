@@ -8,8 +8,8 @@
 
 ```text
 Driver lidar + imu ────────┐
-camera rgb ────────────────┼─> ControlledSemanticSpatial card (ActuCore container)
-collection rgb_v2 + depth_v2 ─┤   ├─ FAST-LIVO2 mapping/localization child process
+camera RGB + depth frame ──┴─> ControlledSemanticSpatial card (ActuCore container)
+                            ├─ FAST-LIVO2 mapping/localization child process
                             ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
                                       |
@@ -36,9 +36,8 @@ collection rgb_v2 + depth_v2 ─┤   ├─ FAST-LIVO2 mapping/localization chi
 | --- | --- | --- |
 | `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `imu` | `/ubuntu/navigation/imu` | 是 |
-| `rgb` | `/ubuntu/camera/rgb` | 是 |
-| `rgb_v2` | `/ubuntu/navigation/camera/rgb` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE2` 封装中的标定与外参 |
-| `depth_v2` | `/ubuntu/navigation/camera/depth` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE2` 封装中的深度尺度、标定与源时间戳 |
+| `rgb` | `/ubuntu/camera/rgb_frame` | 是；语义导航与数采共用 Driver `PSE1` 中的 JPEG、源时间戳、标定和外参 |
+| `depth_frame` | `/ubuntu/camera/depth_frame` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE1` 封装中的深度尺度、标定与源时间戳 |
 
 ## 公共输出
 
@@ -59,8 +58,8 @@ frame、QoS、freshness、数采和速度约束见内部实现说明：
 - [semantic/README.md](semantic/README.md)
 
 Canvas 的静态卡片规格无法随 `collection_enabled` 动态改变端口外观，所以
-`rgb_v2`、`depth_v2` 仍显示为可选端口；统一卡片在启动时执行条件校验。启用
-数采却缺少其中任一路，会返回明确的 `invalid_canvas_wiring`，而不是启动一份
+`depth_frame` 仍显示为可选端口；统一卡片在启动时执行条件校验。启用
+数采却缺少该输入，会返回明确的 `invalid_canvas_wiring`，而不是启动一份
 不完整的数据集。
 
 完整的静态插件配置样例见 [config.example.json](config.example.json)；其中

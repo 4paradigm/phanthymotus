@@ -35,7 +35,7 @@ def _config_properties() -> dict:
     mapping = fast_livo2_tool_definition("ubuntu")["configSchema"]["properties"]
     planning = nav2_tool_definition("ubuntu")["configSchema"]["properties"]
     semantic = build_manifest(
-        "/ubuntu/camera/rgb",
+        "/ubuntu/camera/rgb_frame",
         "/ubuntu/navigation/odom",
     )["configSchema"]["properties"]
     result = {
@@ -81,7 +81,7 @@ def _action_properties() -> dict:
     mapping = fast_livo2_tool_definition("ubuntu")["inputSchema"]["properties"]
     planning = nav2_tool_definition("ubuntu")["inputSchema"]["properties"]
     semantic = build_manifest(
-        "/ubuntu/camera/rgb",
+        "/ubuntu/camera/rgb_frame",
         "/ubuntu/navigation/odom",
     )["inputSchema"]["properties"]
     result = {"action": {"type": "string", "enum": list(NAVIGATION_PUBLIC_ACTIONS)}}
@@ -137,7 +137,7 @@ def navigation_tool_definition(namespace: str) -> dict:
     mapping = fast_livo2_tool_definition(namespace)
     planning = nav2_tool_definition(namespace)
     semantic = build_manifest(
-        f"/{namespace.strip('/')}/camera/rgb",
+        f"/{namespace.strip('/')}/camera/rgb_frame",
         f"/{namespace.strip('/')}/navigation/odom",
         status_topic=f"/{namespace.strip('/')}/navigation/fast_livo2/status",
     )
@@ -146,37 +146,19 @@ def navigation_tool_definition(namespace: str) -> dict:
     external_inputs.extend(
         [
             {
-                "port": "depth_v2",
-                "topic": f"/{namespace.strip('/')}/navigation/camera/depth",
-                "format": "application/vnd.phanthy.sensor-envelope.v2",
+                "port": "depth_frame",
+                "topic": f"/{namespace.strip('/')}/camera/depth_frame",
+                "format": "application/vnd.phanthy.sensor-envelope.v1",
                 "ros_type": "std_msgs/msg/UInt8MultiArray",
                 "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
                 "required": False,
-                "schema": "phanthy.sensor.camera_depth.v2",
+                "schema": "phanthy.sensor.camera_depth_frame.v1",
                 "timestamp": (
-                    "header.stamp_ns / timing.source_stamp_ns in the PSE2 envelope"
+                    "header.stamp_ns / timing.source_stamp_ns in the PSE1 envelope"
                 ),
                 "desc": (
                     "Driver Z16 depth with scale, calibration, RGB alignment metadata, "
                     "and source time; required when collection_enabled=true"
-                ),
-            },
-            {
-                "port": "rgb_v2",
-                "topic": f"/{namespace.strip('/')}/navigation/camera/rgb",
-                "format": "application/vnd.phanthy.sensor-envelope.v2",
-                "ros_type": "std_msgs/msg/UInt8MultiArray",
-                "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
-                "required": False,
-                "schema": "phanthy.sensor.camera_rgb.v2",
-                "timestamp": (
-                    "header.stamp_ns / timing.source_stamp_ns in the PSE2 envelope"
-                ),
-                "desc": (
-                    "Driver RGB JPEG with calibration and LiDAR-to-camera "
-                    "extrinsics; ActuCore derives the base transform for "
-                    "automatic offline obstacle annotation; required when "
-                    "collection_enabled=true"
                 ),
             },
         ]

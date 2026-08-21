@@ -196,7 +196,8 @@ class ManifestTests(unittest.TestCase):
         self.assertNotIn("default", properties["api_key"])
 
     def test_ros_contract_is_explicit(self):
-        self.assertEqual(MANIFEST["topic_in"][0]["ros_type"], "sensor_msgs/msg/CompressedImage")
+        self.assertEqual(MANIFEST["topic_in"][0]["ros_type"], "std_msgs/msg/UInt8MultiArray")
+        self.assertEqual(MANIFEST["topic_in"][0]["schema"], "phanthy.sensor.camera_rgb_frame.v1")
         self.assertEqual(MANIFEST["topic_in"][1]["format"], "sensor/odometry")
         self.assertEqual(MANIFEST["topic_in"][1]["ros_type"], "nav_msgs/msg/Odometry")
         self.assertEqual(
@@ -389,12 +390,15 @@ class ProcessorTests(unittest.TestCase):
                 "action": "start",
                 "input_topics": [
                     "/ubuntu/navigation/odom",
-                    "/ubuntu/camera/rgb",
+                    "/ubuntu/camera/rgb_frame",
                 ],
             },
         )
         self.assertEqual(result["state"], "running")
-        self.assertEqual(factory.calls[0]["camera_topic"], "/ubuntu/camera/rgb")
+        self.assertEqual(
+            factory.calls[0]["camera_topic"],
+            "/ubuntu/camera/rgb_frame",
+        )
         self.assertEqual(factory.calls[0]["odometry_topic"], "/ubuntu/navigation/odom")
         self.assertEqual(
             factory.calls[0]["status_topic"],
@@ -411,13 +415,16 @@ class ProcessorTests(unittest.TestCase):
                 "action": "start",
                 "input_bindings": {
                     "livo_odom": {"topic": "/robot/navigation/odom"},
-                    "rgb": {"topic": "/robot/camera/rgb"},
+                    "rgb": {"topic": "/robot/camera/rgb_frame"},
                     "livo_status": {"topic": "/robot/fast_livo2/status"},
                 },
             },
         )
         self.assertEqual(result["state"], "running")
-        self.assertEqual(factory.calls[0]["camera_topic"], "/robot/camera/rgb")
+        self.assertEqual(
+            factory.calls[0]["camera_topic"],
+            "/robot/camera/rgb_frame",
+        )
         self.assertEqual(factory.calls[0]["odometry_topic"], "/robot/navigation/odom")
         self.assertEqual(factory.calls[0]["status_topic"], "/robot/fast_livo2/status")
 
@@ -431,7 +438,7 @@ class ProcessorTests(unittest.TestCase):
                 "input_topics": [
                     "/robot/fast_livo2/status",
                     "/ubuntu/navigation/odom",
-                    "/ubuntu/camera/rgb",
+                    "/ubuntu/camera/rgb_frame",
                 ],
             },
         )
@@ -443,10 +450,10 @@ class ProcessorTests(unittest.TestCase):
             {"input_bindings": "bad"},
             {"input_bindings": {"unexpected": "/bad/topic"}},
             {"input_bindings": {}},
-            {"input_topics": ["/ubuntu/camera/rgb"]},
+            {"input_topics": ["/ubuntu/camera/rgb_frame"]},
             {
                 "input_topics": [
-                    "/ubuntu/camera/rgb",
+                    "/ubuntu/camera/rgb_frame",
                     "/ubuntu/navigation/odom",
                     "/unexpected/topic",
                 ]
@@ -830,6 +837,16 @@ class PureHelperTests(unittest.TestCase):
         self.assertAlmostEqual(pose.qw, math.sqrt(0.5))
         self.assertAlmostEqual(pose.yaw, math.pi / 2)
         self.assertEqual(pose.source_timestamp, 12.5)
+
+    def test_rgb_frame_is_decoded_for_semantic_snapshot(self):
+        bridge = self._bare_ros_bridge()
+        bridge._decode_camera_rgb_frame = mock.Mock(
+            return_value=({"source_stamp_ns": 12_500_000_000}, b"jpeg-frame")
+        )
+        bridge._on_image(SimpleNamespace(data=b"PSE1-frame"))
+
+        self.assertEqual(bridge._latest_image.data, b"jpeg-frame")
+        self.assertEqual(bridge._latest_image.source_timestamp, 12.5)
 
     def test_vlm_json_parser_handles_markdown_and_rejects_non_json(self):
         self.assertEqual(_parse_json("```json\n{\"ok\": true}\n```"), {"ok": True})

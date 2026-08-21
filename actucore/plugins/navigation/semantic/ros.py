@@ -16,7 +16,6 @@ import time
 import uuid
 from dataclasses import dataclass
 
-
 log = logging.getLogger(__name__)
 
 
@@ -110,13 +109,6 @@ def _stamp_to_seconds(stamp) -> float | None:
     return sec + nanosec / 1_000_000_000.0
 
 
-def _image_mime_type(image_format: str) -> str:
-    normalized = image_format.lower().strip()
-    if "png" in normalized:
-        return "image/png"
-    return "image/jpeg"
-
-
 def pose_from_odometry(message, source_topic: str, received_at: float) -> Pose:
     """Validate and detach the useful fields from nav_msgs/msg/Odometry."""
 
@@ -185,6 +177,7 @@ class RosBridge:
         status_stale_after_sec: float = 3.5,
         synchronization_mode: str = "receive_time",
     ):
+        from g1_fast_livo2.camera_rgb_frame import decode as decode_camera_rgb_frame
         from nav_msgs.msg import Odometry
         from rclpy.node import Node
         from rclpy.qos import (
@@ -193,8 +186,7 @@ class RosBridge:
             QoSProfile,
             ReliabilityPolicy,
         )
-        from sensor_msgs.msg import CompressedImage
-        from std_msgs.msg import String
+        from std_msgs.msg import String, UInt8MultiArray
 
         suffix = re.sub(
             r"[^a-zA-Z0-9_]",
@@ -221,6 +213,7 @@ class RosBridge:
         self._latest_pose: _PoseSample | None = None
         self._closed = False
         self._String = String
+        self._decode_camera_rgb_frame = decode_camera_rgb_frame
         self._status_state = ""
         self._status_map_name = ""
         self._status_generation = 0
@@ -258,7 +251,7 @@ class RosBridge:
 
         try:
             self._image_subscription = self._node.create_subscription(
-                CompressedImage,
+                UInt8MultiArray,
                 camera_topic,
                 self._on_image,
                 image_qos,
@@ -288,22 +281,18 @@ class RosBridge:
             raise
 
     def _on_image(self, message) -> None:
-        data = bytes(message.data)
-        if not data:
+        try:
+            metadata, jpeg = self._decode_camera_rgb_frame(bytes(message.data))
+        except (AttributeError, TypeError, ValueError) as exc:
+            log.warning("[vln] ignored invalid camera RGB frame frame: %s", exc)
             return
         received_at = time.time()
         received_monotonic = time.monotonic()
-        image_format = str(getattr(message, "format", "jpeg") or "jpeg")
-        normalized_format = image_format.lower()
-        if not any(token in normalized_format for token in ("jpeg", "jpg", "png")):
-            log.warning("[vln] ignored unsupported compressed image format %r", image_format)
-            return
-        header = getattr(message, "header", None)
         sample = _ImageSample(
-            data=data,
-            image_format=image_format,
-            mime_type=_image_mime_type(image_format),
-            source_timestamp=_stamp_to_seconds(getattr(header, "stamp", None)),
+            data=jpeg,
+            image_format="jpeg",
+            mime_type="image/jpeg",
+            source_timestamp=int(metadata["source_stamp_ns"]) / 1_000_000_000.0,
             received_at=received_at,
             received_monotonic=received_monotonic,
         )

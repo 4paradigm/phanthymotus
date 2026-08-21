@@ -22,13 +22,13 @@ RUNTIME_PACKAGE = (
 sys.path.insert(0, str(ACTUCORE_ROOT))
 sys.path.insert(0, str(RUNTIME_PACKAGE))
 
-from g1_fast_livo2.camera_depth_v2 import (  # noqa: E402
-    InvalidCameraDepthV2,
+from g1_fast_livo2.camera_depth_frame import (  # noqa: E402
+    InvalidCameraDepthFrame,
     decode as decode_depth,
     encode as encode_depth,
 )
-from g1_fast_livo2.camera_rgb_v2 import (  # noqa: E402
-    InvalidCameraRgbV2,
+from g1_fast_livo2.camera_rgb_frame import (  # noqa: E402
+    InvalidCameraRgbFrame,
     decode,
     encode,
 )
@@ -46,7 +46,7 @@ from plugins.navigation.mapping.collection_postprocess import (  # noqa: E402
 
 def metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
     return {
-        "schema": "phanthy.sensor.camera_rgb.v2",
+        "schema": "phanthy.sensor.camera_rgb_frame.v1",
         "source_stamp_ns": stamp,
         "receive_stamp_ns": stamp + 1_000_000,
         "frame_id": "camera_color_optical_frame",
@@ -70,7 +70,7 @@ def metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
 def driver_metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
     identity = np.eye(4).reshape(-1).tolist()
     return {
-        "schema": "phanthy.sensor.camera_rgb.v2",
+        "schema": "phanthy.sensor.camera_rgb_frame.v1",
         "header": {
             "stamp_ns": stamp,
             "frame_id": "camera_color_optical_frame",
@@ -123,7 +123,7 @@ def depth_driver_metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
         "matrix_row_major": identity,
     }
     return {
-        "schema": "phanthy.sensor.camera_depth.v2",
+        "schema": "phanthy.sensor.camera_depth_frame.v1",
         "header": {
             "stamp_ns": stamp,
             "frame_id": "camera_depth_optical_frame",
@@ -184,17 +184,17 @@ class FakeReader:
         self.records = records
 
     def count_images(self) -> int:
-        return sum(record["kind"] == "rgb_v2" for record in self.records)
+        return sum(record["kind"] == "rgb_frame" for record in self.records)
 
     def iter_records(self):
         return iter(self.records)
 
 
 class NavigationCollectionPostprocessTest(unittest.TestCase):
-    def test_camera_rgb_v2_round_trip_and_rejects_missing_calibration(self) -> None:
+    def test_camera_rgb_frame_round_trip_and_rejects_missing_calibration(self) -> None:
         jpeg = b"\xff\xd8\xff\xd9"
         payload = encode(driver_metadata(), jpeg)
-        self.assertEqual(payload[:4], b"PSE2")
+        self.assertEqual(payload[:4], b"PSE1")
         decoded_metadata, decoded_jpeg = decode(payload)
         self.assertEqual(decoded_metadata["calibration_id"], "sha256:test")
         self.assertEqual(
@@ -206,7 +206,7 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
 
         invalid = driver_metadata()
         invalid["calibration"].pop("lidar_to_camera")
-        with self.assertRaisesRegex(InvalidCameraRgbV2, "lidar_to_camera"):
+        with self.assertRaisesRegex(InvalidCameraRgbFrame, "lidar_to_camera"):
             encode(invalid, jpeg)
 
         inverse = driver_metadata()
@@ -220,13 +220,13 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             "realsense_inverse_brown_conrady",
         )
 
-        with self.assertRaisesRegex(InvalidCameraRgbV2, "JPEG"):
+        with self.assertRaisesRegex(InvalidCameraRgbFrame, "JPEG"):
             encode(driver_metadata(), b"not-a-jpeg")
 
-        with self.assertRaisesRegex(InvalidCameraRgbV2, "magic"):
+        with self.assertRaisesRegex(InvalidCameraRgbFrame, "magic"):
             decode(b"CRGB" + payload[4:])
 
-    def test_camera_depth_v2_round_trip_and_rejects_scale_mismatch(self) -> None:
+    def test_camera_depth_frame_round_trip_and_rejects_scale_mismatch(self) -> None:
         raw_depth = np.asarray((100, 200, 300, 400), dtype="<u2").tobytes()
         payload = encode_depth(depth_driver_metadata(), raw_depth)
         decoded, depth = decode_depth(payload)
@@ -236,7 +236,7 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
 
         invalid = depth_driver_metadata()
         invalid["calibration"]["depth_scale_m"] = 0.002
-        with self.assertRaisesRegex(InvalidCameraDepthV2, "scales disagree"):
+        with self.assertRaisesRegex(InvalidCameraDepthFrame, "scales disagree"):
             encode_depth(invalid, raw_depth)
 
     def test_annotation_outputs_session_id_nearest_point_and_distance(self) -> None:
@@ -312,14 +312,14 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
                 "gravity": np.asarray((0.0, 0.0, -9.81)),
             },
             {
-                "kind": "depth_v2",
+                "kind": "depth_frame",
                 "stamp_ns": stamp + 20_000_000,
                 "metadata": {"source_stamp_ns": stamp + 20_000_000},
                 "depth": b"depth",
             },
             {"kind": "odom", "stamp_ns": stamp, "t_map_base": np.eye(4)},
             {
-                "kind": "rgb_v2",
+                "kind": "rgb_frame",
                 "stamp_ns": stamp,
                 "metadata": metadata(stamp),
                 "jpeg": b"jpeg",
@@ -331,7 +331,7 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
         self.assertIsNotNone(ready)
         frame_number, bundle = ready
         self.assertEqual(frame_number, 1)
-        self.assertEqual(set(bundle), {"rgb_v2", "depth_v2", "lidar", "imu", "odom"})
+        self.assertEqual(set(bundle), {"rgb_frame", "depth_frame", "lidar", "imu", "odom"})
 
         def fake_renderer(value, number, tracker):
             self.assertIs(value, bundle)
@@ -381,7 +381,7 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             },
             {"kind": "odom", "stamp_ns": stamp, "t_map_base": np.eye(4)},
             {
-                "kind": "depth_v2",
+                "kind": "depth_frame",
                 "stamp_ns": depth_stamp,
                 "frame_id": "camera_depth_optical_frame",
                 "metadata": {
@@ -399,7 +399,7 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
                 "depth": raw_depth,
             },
             {
-                "kind": "rgb_v2",
+                "kind": "rgb_frame",
                 "stamp_ns": stamp,
                 "metadata": metadata(stamp),
                 "jpeg": b"\xff\xd8\xff\xd9",
@@ -476,7 +476,7 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             session = Path(temporary) / "session"
             session.mkdir()
             processor = OfflineAnnotationProcessor(lambda _: FakeReader([]))
-            with self.assertRaisesRegex(RuntimeError, "no_rgb_v2_images"):
+            with self.assertRaisesRegex(RuntimeError, "no_rgb_frame_images"):
                 processor.process_session(session, lambda *args: None, lambda: None)
 
     def test_public_status_switches_to_export_progress_after_stop(self) -> None:

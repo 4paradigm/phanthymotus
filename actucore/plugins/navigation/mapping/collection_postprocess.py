@@ -19,7 +19,7 @@ import numpy as np
 ANNOTATION_SCHEMA = "phanthy.navigation.obstacle_frame.v1"
 POSTPROCESS_SCHEMA = "phanthy.navigation.collection_postprocess.v1"
 _SYNC_TOLERANCE_NS = {
-    "depth_v2": 150_000_000,
+    "depth_frame": 150_000_000,
     "lidar": 60_000_000,
     "imu": 20_000_000,
     "odom": 120_000_000,
@@ -524,7 +524,7 @@ def annotate_frame(
             ("lidar", lidar),
             ("imu", imu),
             ("odom", odom),
-            ("depth_v2", depth),
+            ("depth_frame", depth),
         )
         if value is None
     ]
@@ -542,7 +542,7 @@ def annotate_frame(
         or skews["lidar_imu"] > _SYNC_TOLERANCE_NS["imu"] / 1_000_000.0
         or skews["image_odom"] > _SYNC_TOLERANCE_NS["odom"] / 1_000_000.0
         or skews["image_depth"]
-        > _SYNC_TOLERANCE_NS["depth_v2"] / 1_000_000.0
+        > _SYNC_TOLERANCE_NS["depth_frame"] / 1_000_000.0
     ):
         return {**base, "status": "invalid", "failure_reason": "time_skew_exceeded"}
     try:
@@ -621,7 +621,7 @@ class LiveCollectionSynchronizer:
         self._frame_count = 0
         self._pending_rgb: deque = deque(maxlen=8)
         self._buffers = {
-            "depth_v2": deque(maxlen=8),
+            "depth_frame": deque(maxlen=8),
             "lidar": deque(maxlen=8),
             "imu": deque(maxlen=32),
             "odom": deque(maxlen=8),
@@ -663,7 +663,7 @@ class LiveCollectionSynchronizer:
 
     def _observe_locked(self, record: dict) -> tuple[int, dict] | None:
         kind = str(record.get("kind", ""))
-        if kind == "rgb_v2":
+        if kind == "rgb_frame":
             self._pending_rgb.append(record)
         elif kind in self._buffers:
             self._buffers[kind].append(record)
@@ -675,7 +675,7 @@ class LiveCollectionSynchronizer:
         image_stamp_ns = int(image["stamp_ns"])
         lidar = self._nearest(self._buffers["lidar"], image_stamp_ns, "lidar")
         depth = self._nearest(
-            self._buffers["depth_v2"], image_stamp_ns, "depth_v2"
+            self._buffers["depth_frame"], image_stamp_ns, "depth_frame"
         )
         odom = self._nearest(self._buffers["odom"], image_stamp_ns, "odom")
         if lidar is None or depth is None or odom is None:
@@ -688,8 +688,8 @@ class LiveCollectionSynchronizer:
         self._pending_rgb.popleft()
         self._frame_count += 1
         return self._frame_count, {
-            "rgb_v2": image,
-            "depth_v2": depth,
+            "rgb_frame": image,
+            "depth_frame": depth,
             "lidar": lidar,
             "imu": imu,
             "odom": odom,
@@ -707,7 +707,7 @@ def render_collection_preview(
         import cv2
     except ImportError as exc:
         raise PostprocessError("opencv_unavailable_for_collection_preview") from exc
-    image = bundle["rgb_v2"]
+    image = bundle["rgb_frame"]
     annotation = annotate_frame(
         {
             **image,
@@ -724,8 +724,8 @@ def render_collection_preview(
         tracker,
         frame_number - 1,
         {
-            **bundle["depth_v2"],
-            "depth_id": f"depth-{int(bundle['depth_v2']['stamp_ns']):019d}",
+            **bundle["depth_frame"],
+            "depth_id": f"depth-{int(bundle['depth_frame']['stamp_ns']):019d}",
             "depth_path": "live://collection-preview",
         },
     )
@@ -1019,12 +1019,12 @@ class RosbagRecordReader:
         return reader
 
     def count_images(self) -> int:
-        return sum(1 for record in self.iter_records() if record["kind"] == "rgb_v2")
+        return sum(1 for record in self.iter_records() if record["kind"] == "rgb_frame")
 
     def iter_records(self) -> Iterable[dict]:
         try:
-            from g1_fast_livo2.camera_depth_v2 import decode as decode_depth_v2
-            from g1_fast_livo2.camera_rgb_v2 import decode as decode_rgb_v2
+            from g1_fast_livo2.camera_depth_frame import decode as decode_depth_frame
+            from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb_frame
             from g1_fast_livo2.vectorized_cloud import decode_xyz_array
             from nav_msgs.msg import Odometry
             from rclpy.serialization import deserialize_message
@@ -1033,14 +1033,14 @@ class RosbagRecordReader:
         except ImportError as exc:
             raise PostprocessError(f"offline_reader_dependency_unavailable:{exc}") from exc
         topics = {
-            "/ubuntu/navigation/camera/rgb": ("rgb_v2", UInt8MultiArray),
+            "/ubuntu/camera/rgb_frame": ("rgb_frame", UInt8MultiArray),
             "/ubuntu/navigation/collection/camera/rgb": (
-                "rgb_v2",
+                "rgb_frame",
                 UInt8MultiArray,
             ),
-            "/ubuntu/navigation/camera/depth": ("depth_v2", UInt8MultiArray),
+            "/ubuntu/camera/depth_frame": ("depth_frame", UInt8MultiArray),
             "/ubuntu/navigation/collection/camera/depth": (
-                "depth_v2",
+                "depth_frame",
                 UInt8MultiArray,
             ),
             "/ubuntu/navigation/lidar": ("lidar", PointCloud2),
@@ -1058,8 +1058,8 @@ class RosbagRecordReader:
                 continue
             kind, message_type = spec
             message = deserialize_message(payload, message_type)
-            if kind == "rgb_v2":
-                metadata, jpeg = decode_rgb_v2(bytes(message.data))
+            if kind == "rgb_frame":
+                metadata, jpeg = decode_rgb_frame(bytes(message.data))
                 yield {
                     "kind": kind,
                     "stamp_ns": int(metadata["source_stamp_ns"]),
@@ -1067,8 +1067,8 @@ class RosbagRecordReader:
                     "jpeg": jpeg,
                 }
                 continue
-            if kind == "depth_v2":
-                metadata, depth = decode_depth_v2(bytes(message.data))
+            if kind == "depth_frame":
+                metadata, depth = decode_depth_frame(bytes(message.data))
                 yield {
                     "kind": kind,
                     "stamp_ns": int(metadata["source_stamp_ns"]),
@@ -1155,7 +1155,7 @@ class OfflineAnnotationProcessor:
         progress("scanning", 0, 0, None)
         total = int(reader.count_images())
         if total <= 0:
-            raise PostprocessError("no_rgb_v2_images")
+            raise PostprocessError("no_rgb_frame_images")
         partial = session / "derived.partial"
         final = session / "derived"
         if final.is_dir() and (final / "manifest.json").is_file():
@@ -1169,7 +1169,7 @@ class OfflineAnnotationProcessor:
             "lidar": deque(maxlen=8),
             "imu": deque(maxlen=64),
             "odom": deque(maxlen=16),
-            "depth_v2": deque(maxlen=16),
+            "depth_frame": deque(maxlen=16),
         }
         pending = deque()
         pending_bytes = 0
@@ -1207,7 +1207,7 @@ class OfflineAnnotationProcessor:
                     "lidar_path": lidar_relative_path,
                 }
             depth = self._nearest(
-                buffers["depth_v2"], int(image["stamp_ns"]), "depth_v2"
+                buffers["depth_frame"], int(image["stamp_ns"]), "depth_frame"
             )
             if depth is not None:
                 depth_id = f"depth-{int(depth['stamp_ns']):019d}"
@@ -1267,7 +1267,7 @@ class OfflineAnnotationProcessor:
         for record in reader.iter_records():
             wait_if_paused()
             kind = record["kind"]
-            if kind == "rgb_v2":
+            if kind == "rgb_frame":
                 pending.append(record)
                 pending_bytes += len(record["jpeg"])
             elif kind in buffers:
@@ -1604,8 +1604,8 @@ class RosCollectionController:
     """Publish a human-readable Canvas preview and retain machine diagnostics."""
 
     def __init__(self, root_directory: str, namespace: str, executor):
-        from g1_fast_livo2.camera_depth_v2 import decode as decode_depth_v2
-        from g1_fast_livo2.camera_rgb_v2 import decode as decode_rgb_v2
+        from g1_fast_livo2.camera_depth_frame import decode as decode_depth_frame
+        from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb_frame
         from g1_fast_livo2.vectorized_cloud import decode_xyz_array
         from nav_msgs.msg import Odometry
         from rclpy.node import Node
@@ -1616,8 +1616,8 @@ class RosCollectionController:
         root = f"/{namespace.strip('/')}"
         self._String = String
         self._CompressedImage = CompressedImage
-        self._decode_depth_v2 = decode_depth_v2
-        self._decode_rgb_v2 = decode_rgb_v2
+        self._decode_depth_frame = decode_depth_frame
+        self._decode_rgb_frame = decode_rgb_frame
         self._decode_xyz_array = decode_xyz_array
         self._node = Node("navigation_collection_status")
         status_qos = QoSProfile(
@@ -1662,11 +1662,11 @@ class RosCollectionController:
         record_topics = {
             "lidar": (f"{root}/navigation/collection/lidar", PointCloud2),
             "imu": (f"{root}/navigation/collection/imu", Imu),
-            "rgb_v2": (
+            "rgb_frame": (
                 f"{root}/navigation/collection/camera/rgb",
                 UInt8MultiArray,
             ),
-            "depth_v2": (
+            "depth_frame": (
                 f"{root}/navigation/collection/camera/depth",
                 UInt8MultiArray,
             ),
@@ -1706,16 +1706,16 @@ class RosCollectionController:
         return value
 
     def _normalize_record(self, kind: str, message) -> dict:
-        if kind == "rgb_v2":
-            metadata, jpeg = self._decode_rgb_v2(bytes(message.data))
+        if kind == "rgb_frame":
+            metadata, jpeg = self._decode_rgb_frame(bytes(message.data))
             return {
                 "kind": kind,
                 "stamp_ns": int(metadata["source_stamp_ns"]),
                 "metadata": metadata,
                 "jpeg": jpeg,
             }
-        if kind == "depth_v2":
-            metadata, depth = self._decode_depth_v2(bytes(message.data))
+        if kind == "depth_frame":
+            metadata, depth = self._decode_depth_frame(bytes(message.data))
             return {
                 "kind": kind,
                 "stamp_ns": int(metadata["source_stamp_ns"]),

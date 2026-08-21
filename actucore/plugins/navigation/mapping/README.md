@@ -251,7 +251,7 @@ fail closed。
 多模态快照，再通过内部 `collection/*` topic 交给 ROS 2 原生 rosbag2 MCAP
 后端。FAST-LIVO2 和 Nav2 仍按原始频率消费输入；1 Hz 只限制数采旁路，不会
 降低定位或避障频率。每条被选消息保留原始 CDR payload 和源时间戳：
-每次以 RGB v2 为快照锚点，先选取最近的 Depth v2、LiDAR 和 Odom，
+每次以 RGB frame 为快照锚点，先选取最近的 Depth frame、LiDAR 和 Odom，
 再以已选 LiDAR 的时间戳选取最近 IMU。因此 `20 ms` 门槛限制的是
 LiDAR/IMU 运动对齐，不会错误要求高频 IMU 同时贴近 RGB 锚点。
 
@@ -259,18 +259,18 @@ LiDAR/IMU 运动对齐，不会错误要求高频 IMU 同时贴近 RGB 锚点。
 | --- | --- | --- |
 | LiDAR | `/ubuntu/navigation/lidar` | `PointCloud2` |
 | IMU | `/ubuntu/navigation/imu` | `Imu` |
-| RGB v2 | `/ubuntu/navigation/camera/rgb` | `UInt8MultiArray`; `phanthy.sensor.camera_rgb.v2` |
-| Depth v2 | `/ubuntu/navigation/camera/depth` | `UInt8MultiArray`; `phanthy.sensor.camera_depth.v2` |
+| RGB frame | `/ubuntu/camera/rgb_frame` | `UInt8MultiArray`; `phanthy.sensor.camera_rgb_frame.v1` |
+| Depth frame | `/ubuntu/camera/depth_frame` | `UInt8MultiArray`; `phanthy.sensor.camera_depth_frame.v1` |
 | Odom | `/ubuntu/navigation/odom` | `Odometry` |
 
-启用数采时 RGB v2 和 Depth v2 都是条件必需输入。Depth v2 的 PSE2 元数据已
+启用数采时 RGB frame 和 Depth frame 都是条件必需输入。Depth frame 的 PSE1 元数据已
 包含 Z16 编码、`depth_scale_m`、深度/RGB 内参、`depth_to_rgb` 和
-LiDAR-to-camera 外参，因此不再需要单独的 `CameraInfo` topic。任一 PSE2
+LiDAR-to-camera 外参，因此不再需要单独的 `CameraInfo` topic。任一 PSE1
 封装、尺寸、尺度、标定或时间戳校验失败，该帧不会进入对齐快照。
 
-RGB v2 直接沿用 Driver 已发布的
-`PSE2 + uint32_le(metadata_size) + uint32_le(payload_size) + JSON + JPEG`
-封装（`application/vnd.phanthy.sensor-envelope.v2`），不引入卡片私有
+RGB frame 直接沿用 Driver 已发布的
+`PSE1 + uint32_le(metadata_size) + uint32_le(payload_size) + JSON + JPEG`
+封装（`application/vnd.phanthy.sensor-envelope.v1`），不引入卡片私有
 wire format。JSON 必须逐帧携带 `header.stamp_ns`、
 `timing.source_stamp_ns`、`timing.driver_receive_stamp_ns`、尺寸、
 `frame_id`、`calibration_id`、内参/畸变以及 Driver 标定的
@@ -286,12 +286,12 @@ adapter 相同的 `base_link -> livox_frame` 外参，与 Driver 的
 `realsense_inverse_brown_conrady`；逆 Brown 模型按 RealSense 语义迭代求
 投影坐标，不会忽略畸变继续投影。
 因此不再依赖独立 `CameraInfo` topic，也不在 ActuCore 伪造或推断
-标定。原有 `/ubuntu/camera/rgb` 仍供语义模块使用，不是离线投影
-真值输入。
+标定。同一 `/ubuntu/camera/rgb_frame` PSE1 输入也由语义模块
+解码 JPEG 使用，Canvas 不再需要第二路 RGB 连线。
 
 MCAP 只保存通过对齐门槛的 1 Hz 快照。在线状态不会改写或伪造时间戳，而是
 基于原始 source stamp 做有界的软件对齐诊断：检查每路时间戳覆盖率和单调性，
-并计算 RGB-v2/Depth、LiDAR/IMU、RGB-v2/LiDAR、RGB-v2/Odom、
+并计算 RGB/Depth、LiDAR/IMU、RGB/LiDAR、RGB/Odom、
 Depth/LiDAR 的最近邻时间偏差。P95 门槛分别是 `150 / 20 / 60 / 120 /
 60 ms`，对应 G1 当前 10 Hz RGB、5 Hz Depth、10 Hz LiDAR、高频 IMU 和约
 5 Hz Odom 的异步采样上限；它们是数据健康门槛，不是硬件同步声明。超限、
@@ -350,7 +350,7 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 采集启停在内部串行；rosbag 启动早退时会保留 `.partial`
 并写入 `state=failed/storage_complete=false` receipt，不会冒充完整 session。
 
-完整标注依赖 Driver 发布上述 RGB v2 与 Depth v2 topic。缺失或封装校验失败时，
+完整标注依赖 Driver 发布上述 RGB frame 与 Depth frame topic。缺失或封装校验失败时，
 原始 MCAP 仍按实际收到的数据收口，但状态明确显示
 `missing_sources` 或解码失败；不会回退到无标定的旧 RGB/Depth。
 
@@ -380,7 +380,7 @@ MCAP/ROS 工具再手工解包：
 不是单目估计值。原始 MCAP 继续保留完整 ROS 消息，作为可追溯源数据。
 
 流程使用 IMU 重力方向移除地面、LiDAR 点云做几何聚类，再通过
-标定外参投影到每张 RGB；Depth v2 同时保留在原始 MCAP 和可直接查看的
+标定外参投影到每张 RGB；Depth frame 同时保留在原始 MCAP 和可直接查看的
 16-bit PNG 产物中，当前尚不参与
 障碍物最近点真值计算。卡片或
 导航 runtime 活跃时 worker 自动暂停，卡片停止后继续，避免与定位/
@@ -394,9 +394,9 @@ MCAP/ROS 工具再手工解包：
 
 ## 统一卡片连线与构建
 
-Canvas 把 Driver `navigation_lidar`、`navigation_imu` 和相机 `rgb` 接到公开
-`ControlledSemanticSpatial` 卡片；启用完整数采时再连接可选的 `rgb_v2`
-与 `depth_v2`。`livo_odom`、registered cloud、obstacle map 都在同一容器内
+Canvas 把 Driver `navigation_lidar`、`navigation_imu` 和 PSE1 相机 `rgb` 接到公开
+`ControlledSemanticSpatial` 卡片；语义导航和数采共用这一路 RGB，启用完整数采时再连接可选的
+`depth_frame`。`livo_odom`、registered cloud、obstacle map 都在同一容器内
 交给 planning/semantic 模块。`collection_status` 是唯一新增的只读公共诊断
 输出，用于直接查看数采是否正常及失败原因。
 

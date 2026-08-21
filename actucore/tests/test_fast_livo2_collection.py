@@ -54,15 +54,15 @@ class FastLivo2CollectionTest(unittest.TestCase):
             command[7:], [item["record_topic"] for item in COLLECTION_SOURCES]
         )
         self.assertEqual(COLLECTION_SOURCES[0]["topic"], "/ubuntu/navigation/lidar")
-        rgb_v2 = next(
-            item for item in COLLECTION_SOURCES if item["port"] == "rgb_v2"
+        rgb_frame = next(
+            item for item in COLLECTION_SOURCES if item["port"] == "rgb_frame"
         )
-        self.assertEqual(rgb_v2["topic"], "/ubuntu/navigation/camera/rgb")
-        depth_v2 = next(
-            item for item in COLLECTION_SOURCES if item["port"] == "depth_v2"
+        self.assertEqual(rgb_frame["topic"], "/ubuntu/camera/rgb_frame")
+        depth_frame = next(
+            item for item in COLLECTION_SOURCES if item["port"] == "depth_frame"
         )
         self.assertEqual(
-            depth_v2["topic"], "/ubuntu/navigation/camera/depth"
+            depth_frame["topic"], "/ubuntu/camera/depth_frame"
         )
 
     def test_health_exposes_normal_and_missing_source_failure(self) -> None:
@@ -74,7 +74,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
         self.assertIsNone(starting["failure_reason"])
 
         for index, item in enumerate(COLLECTION_SOURCES):
-            if item["port"] == "rgb_v2":
+            if item["port"] == "rgb_frame":
                 continue
             health.observe(
                 item["port"],
@@ -83,9 +83,9 @@ class FastLivo2CollectionTest(unittest.TestCase):
             )
         degraded = health.snapshot(process_running=True, now_monotonic=16.0)
         self.assertEqual(degraded["state"], "degraded")
-        self.assertEqual(degraded["missing_sources"], ["rgb_v2"])
+        self.assertEqual(degraded["missing_sources"], ["rgb_frame"])
         self.assertEqual(
-            degraded["failure_reason"], "missing_sources:rgb_v2"
+            degraded["failure_reason"], "missing_sources:rgb_frame"
         )
 
         for index, item in enumerate(COLLECTION_SOURCES):
@@ -124,16 +124,16 @@ class FastLivo2CollectionTest(unittest.TestCase):
     def test_decode_error_is_visible_in_collection_status(self) -> None:
         health = CollectionHealth(grace_sec=0.0)
         health.start("session-decode", "/recordings/session-decode")
-        health.observe_error("rgb_v2", "unsupported distortion model")
+        health.observe_error("rgb_frame", "unsupported distortion model")
         status = health.snapshot(process_running=True)
         self.assertEqual(status["state"], "degraded")
-        self.assertEqual(status["source_errors"], ["rgb_v2"])
+        self.assertEqual(status["source_errors"], ["rgb_frame"])
         self.assertEqual(
-            status["failure_reason"], "source_decode_errors:rgb_v2"
+            status["failure_reason"], "source_decode_errors:rgb_frame"
         )
         self.assertIn(
             "unsupported distortion",
-            status["sources"]["rgb_v2"]["error"],
+            status["sources"]["rgb_frame"]["error"],
         )
 
     def test_time_alignment_reports_software_sync_and_pair_skew(self) -> None:
@@ -143,8 +143,8 @@ class FastLivo2CollectionTest(unittest.TestCase):
         stamps = {
             "lidar": base,
             "imu": base + 1_000_000,
-            "rgb_v2": base + 2_000_000,
-            "depth_v2": base + 3_000_000,
+            "rgb_frame": base + 2_000_000,
+            "depth_frame": base + 3_000_000,
             "odom": base + 1_000_000,
         }
         for port, stamp in stamps.items():
@@ -160,7 +160,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
                         "height": 480,
                         "calibration_id": "g1-camera-a",
                     }
-                    if port == "rgb_v2"
+                    if port == "rgb_frame"
                     else {"frame_id": port}
                 ),
             )
@@ -172,14 +172,14 @@ class FastLivo2CollectionTest(unittest.TestCase):
         self.assertEqual(alignment["clock_domain"], "ros_system_time")
         self.assertFalse(alignment["hardware_synchronized"])
         self.assertEqual(
-            alignment["pairs"]["rgb_v2_lidar"]["nearest_skew_ms"]["p95"],
+            alignment["pairs"]["rgb_frame_lidar"]["nearest_skew_ms"]["p95"],
             2.0,
         )
         self.assertEqual(
-            status["sources"]["rgb_v2"]["source_timestamp_coverage"], 1.0
+            status["sources"]["rgb_frame"]["source_timestamp_coverage"], 1.0
         )
         self.assertEqual(
-            status["sources"]["rgb_v2"]["metadata"]["calibration_id"],
+            status["sources"]["rgb_frame"]["metadata"]["calibration_id"],
             "g1-camera-a",
         )
 
@@ -190,8 +190,8 @@ class FastLivo2CollectionTest(unittest.TestCase):
         stamps = {
             "lidar": base,
             "imu": base + 1_000_000,
-            "rgb_v2": base + 200_000_000,
-            "depth_v2": base + 210_000_000,
+            "rgb_frame": base + 200_000_000,
+            "depth_frame": base + 210_000_000,
             "odom": base + 1_000_000,
         }
         for port, stamp in stamps.items():
@@ -210,7 +210,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
             status["time_alignment"]["reasons"],
         )
         self.assertIn(
-            "rgb_v2_lidar:nearest_skew",
+            "rgb_frame_lidar:nearest_skew",
             status["time_alignment"]["reasons"],
         )
         self.assertTrue(status["failure_reason"].startswith("timestamp_alignment:"))
@@ -243,7 +243,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
         base = 1_700_000_000_000_000_000
 
         for port, offset_ms in (
-            ("depth_v2", -60),
+            ("depth_frame", -60),
             ("lidar", -30),
             ("imu", -15),
             ("odom", -80),
@@ -258,16 +258,16 @@ class FastLivo2CollectionTest(unittest.TestCase):
                 )
             )
         bundle = sampler.observe(
-            "rgb_v2",
+            "rgb_frame",
             source_stamp_ns=base,
             message="rgb",
-            metadata={"port": "rgb_v2"},
+            metadata={"port": "rgb_frame"},
             now_monotonic=10.0,
         )
         self.assertEqual(set(bundle), {item["port"] for item in COLLECTION_SOURCES})
         self.assertIsNone(
             sampler.observe(
-                "rgb_v2",
+                "rgb_frame",
                 source_stamp_ns=base + 100_000_000,
                 message="rgb-too-soon",
                 metadata=None,
@@ -280,7 +280,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
         sampler.start()
         base = 1_700_000_000_000_000_000
         for port, offset_ms in (
-            ("depth_v2", 100),
+            ("depth_frame", 100),
             ("lidar", 50),
             ("imu", 51),
             ("odom", 0),
@@ -294,10 +294,10 @@ class FastLivo2CollectionTest(unittest.TestCase):
             )
 
         bundle = sampler.observe(
-            "rgb_v2",
+            "rgb_frame",
             source_stamp_ns=base,
             message="rgb",
-            metadata={"port": "rgb_v2"},
+            metadata={"port": "rgb_frame"},
             now_monotonic=10.0,
         )
 
@@ -311,7 +311,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
 
         self.assertIsNone(
             sampler.observe(
-                "rgb_v2",
+                "rgb_frame",
                 source_stamp_ns=1_700_000_000_000_000_000,
                 message="rgb",
                 metadata=None,
@@ -321,8 +321,8 @@ class FastLivo2CollectionTest(unittest.TestCase):
 
         status = sampler.snapshot()
         self.assertEqual(status["emitted_count"], 0)
-        self.assertEqual(status["last_rejection_reason"], "missing_depth_v2")
-        self.assertEqual(status["rejections"], {"missing_depth_v2": 1})
+        self.assertEqual(status["last_rejection_reason"], "missing_depth_frame")
+        self.assertEqual(status["rejections"], {"missing_depth_frame": 1})
 
     def test_health_separates_source_arrival_from_sampled_count(self) -> None:
         health = CollectionHealth()

@@ -1,4 +1,4 @@
-"""Decode the Driver-owned PSE2 depth envelope used by data collection."""
+"""Decode the Driver-owned PSE1 depth envelope used by data collection."""
 
 from __future__ import annotations
 
@@ -7,33 +7,33 @@ import math
 import struct
 
 
-MAGIC = b"PSE2"
-SCHEMA = "phanthy.sensor.camera_depth.v2"
-ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v2"
+MAGIC = b"PSE1"
+SCHEMA = "phanthy.sensor.camera_depth_frame.v1"
+ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v1"
 _HEADER = struct.Struct("<4sII")
 _MAX_METADATA_BYTES = 64 * 1024
 _MAX_DEPTH_BYTES = 32 * 1024 * 1024
 
 
-class InvalidCameraDepthV2(ValueError):
+class InvalidCameraDepthFrame(ValueError):
     pass
 
 
 def _object(value: object, *, field: str) -> dict:
     if not isinstance(value, dict):
-        raise InvalidCameraDepthV2(f"{field} must be an object")
+        raise InvalidCameraDepthFrame(f"{field} must be an object")
     return dict(value)
 
 
 def _positive_int(value: object, *, field: str) -> int:
     if isinstance(value, bool):
-        raise InvalidCameraDepthV2(f"{field} must be a positive integer")
+        raise InvalidCameraDepthFrame(f"{field} must be a positive integer")
     try:
         result = int(value)
     except (TypeError, ValueError) as exc:
-        raise InvalidCameraDepthV2(f"{field} must be a positive integer") from exc
+        raise InvalidCameraDepthFrame(f"{field} must be a positive integer") from exc
     if result <= 0:
-        raise InvalidCameraDepthV2(f"{field} must be a positive integer")
+        raise InvalidCameraDepthFrame(f"{field} must be a positive integer")
     return result
 
 
@@ -41,44 +41,44 @@ def _positive_float(value: object, *, field: str) -> float:
     try:
         result = float(value)
     except (TypeError, ValueError) as exc:
-        raise InvalidCameraDepthV2(f"{field} must be positive and finite") from exc
+        raise InvalidCameraDepthFrame(f"{field} must be positive and finite") from exc
     if not math.isfinite(result) or result <= 0.0:
-        raise InvalidCameraDepthV2(f"{field} must be positive and finite")
+        raise InvalidCameraDepthFrame(f"{field} must be positive and finite")
     return result
 
 
 def _text(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise InvalidCameraDepthV2(f"{field} must be a non-empty string")
+        raise InvalidCameraDepthFrame(f"{field} must be a non-empty string")
     return value.strip()
 
 
 def _matrix(value: object, *, field: str) -> list[float]:
     if not isinstance(value, list) or len(value) != 16:
-        raise InvalidCameraDepthV2(f"{field} must contain 16 finite numbers")
+        raise InvalidCameraDepthFrame(f"{field} must contain 16 finite numbers")
     try:
         result = [float(item) for item in value]
     except (TypeError, ValueError) as exc:
-        raise InvalidCameraDepthV2(
+        raise InvalidCameraDepthFrame(
             f"{field} must contain 16 finite numbers"
         ) from exc
     if not all(math.isfinite(item) for item in result):
-        raise InvalidCameraDepthV2(f"{field} must contain 16 finite numbers")
+        raise InvalidCameraDepthFrame(f"{field} must contain 16 finite numbers")
     if any(
         abs(actual - expected) > 1e-6
         for actual, expected in zip(result[12:], (0.0, 0.0, 0.0, 1.0))
     ):
-        raise InvalidCameraDepthV2(f"{field} homogeneous bottom row is invalid")
+        raise InvalidCameraDepthFrame(f"{field} homogeneous bottom row is invalid")
     return result
 
 
 def _transform(value: object, *, field: str) -> list[float]:
     entry = _object(value, field=field)
     if entry.get("status") == "unavailable":
-        raise InvalidCameraDepthV2(f"{field} is unavailable")
+        raise InvalidCameraDepthFrame(f"{field} is unavailable")
     transform = _object(entry.get("transform", entry), field=f"{field}.transform")
     if transform.get("convention") != "target_from_source":
-        raise InvalidCameraDepthV2(
+        raise InvalidCameraDepthFrame(
             f"{field}.transform convention must be target_from_source"
         )
     return _matrix(
@@ -90,7 +90,7 @@ def _transform(value: object, *, field: str) -> list[float]:
 def validate_metadata(value: object) -> dict:
     metadata = _object(value, field="metadata")
     if metadata.get("schema") != SCHEMA:
-        raise InvalidCameraDepthV2(f"schema must be {SCHEMA}")
+        raise InvalidCameraDepthFrame(f"schema must be {SCHEMA}")
     header = _object(metadata.get("header"), field="header")
     timing = _object(metadata.get("timing"), field="timing")
     image = _object(metadata.get("image"), field="image")
@@ -103,11 +103,11 @@ def validate_metadata(value: object) -> dict:
         timing.get("source_stamp_ns"), field="timing.source_stamp_ns"
     )
     if source_stamp_ns != timing_stamp_ns:
-        raise InvalidCameraDepthV2(
+        raise InvalidCameraDepthFrame(
             "header.stamp_ns must equal timing.source_stamp_ns"
         )
     if timing.get("clock_domain") != "ros_system_time":
-        raise InvalidCameraDepthV2("timing.clock_domain must be ros_system_time")
+        raise InvalidCameraDepthFrame("timing.clock_domain must be ros_system_time")
     receive_stamp_ns = _positive_int(
         timing.get("driver_receive_stamp_ns"),
         field="timing.driver_receive_stamp_ns",
@@ -119,16 +119,16 @@ def validate_metadata(value: object) -> dict:
         image.get("payload_size"), field="image.payload_size"
     )
     if image.get("encoding") != "z16_le":
-        raise InvalidCameraDepthV2("image.encoding must be z16_le")
+        raise InvalidCameraDepthFrame("image.encoding must be z16_le")
     if step_bytes != width * 2 or payload_size != step_bytes * height:
-        raise InvalidCameraDepthV2("depth dimensions, step, and payload size disagree")
+        raise InvalidCameraDepthFrame("depth dimensions, step, and payload size disagree")
     depth_scale_m = _positive_float(
         image.get("depth_scale_m"), field="image.depth_scale_m"
     )
     if image.get("unit") != "meter":
-        raise InvalidCameraDepthV2("image.unit must be meter")
+        raise InvalidCameraDepthFrame("image.unit must be meter")
     if image.get("aligned_to_rgb") is not False:
-        raise InvalidCameraDepthV2("image.aligned_to_rgb must be false")
+        raise InvalidCameraDepthFrame("image.aligned_to_rgb must be false")
 
     calibration_id = _text(
         calibration.get("calibration_id"), field="calibration.calibration_id"
@@ -137,14 +137,14 @@ def validate_metadata(value: object) -> dict:
         _positive_int(calibration.get("width"), field="calibration.width"),
         _positive_int(calibration.get("height"), field="calibration.height"),
     ) != (width, height):
-        raise InvalidCameraDepthV2(
+        raise InvalidCameraDepthFrame(
             "calibration dimensions must match image dimensions"
         )
     calibration_scale = _positive_float(
         calibration.get("depth_scale_m"), field="calibration.depth_scale_m"
     )
     if not math.isclose(depth_scale_m, calibration_scale, rel_tol=0.0, abs_tol=1e-12):
-        raise InvalidCameraDepthV2("image and calibration depth scales disagree")
+        raise InvalidCameraDepthFrame("image and calibration depth scales disagree")
     _transform(calibration.get("depth_to_rgb"), field="calibration.depth_to_rgb")
     _transform(
         calibration.get("lidar_to_camera"), field="calibration.lidar_to_camera"
@@ -170,18 +170,18 @@ def validate_metadata(value: object) -> dict:
 def decode(payload: bytes) -> tuple[dict, bytes]:
     raw = bytes(payload)
     if len(raw) < _HEADER.size:
-        raise InvalidCameraDepthV2("camera depth v2 payload is truncated")
+        raise InvalidCameraDepthFrame("camera depth frame payload is truncated")
     magic, metadata_size, payload_size = _HEADER.unpack_from(raw)
     if magic != MAGIC:
-        raise InvalidCameraDepthV2("camera depth v2 magic is invalid")
+        raise InvalidCameraDepthFrame("camera depth frame magic is invalid")
     if metadata_size <= 0 or metadata_size > _MAX_METADATA_BYTES:
-        raise InvalidCameraDepthV2("camera depth v2 metadata size is invalid")
+        raise InvalidCameraDepthFrame("camera depth frame metadata size is invalid")
     if payload_size <= 0 or payload_size > _MAX_DEPTH_BYTES:
-        raise InvalidCameraDepthV2("camera depth v2 payload size is invalid")
+        raise InvalidCameraDepthFrame("camera depth frame payload size is invalid")
     expected_size = _HEADER.size + metadata_size + payload_size
     if len(raw) != expected_size:
-        raise InvalidCameraDepthV2(
-            f"camera depth v2 envelope length mismatch: expected {expected_size}, got {len(raw)}"
+        raise InvalidCameraDepthFrame(
+            f"camera depth frame envelope length mismatch: expected {expected_size}, got {len(raw)}"
         )
     metadata_end = _HEADER.size + metadata_size
     try:
@@ -189,13 +189,13 @@ def decode(payload: bytes) -> tuple[dict, bytes]:
             raw[_HEADER.size:metadata_end].decode("utf-8")
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise InvalidCameraDepthV2(
-            "camera depth v2 metadata is invalid JSON"
+        raise InvalidCameraDepthFrame(
+            "camera depth frame metadata is invalid JSON"
         ) from exc
     metadata = validate_metadata(driver_metadata)
     depth = raw[metadata_end:]
     if len(depth) != metadata["step_bytes"] * metadata["height"]:
-        raise InvalidCameraDepthV2("depth payload length does not match metadata")
+        raise InvalidCameraDepthFrame("depth payload length does not match metadata")
     return metadata, depth
 
 
@@ -216,13 +216,13 @@ def encode(metadata: dict, depth: bytes) -> bytes:
         allow_nan=False,
     ).encode("utf-8")
     if len(encoded) > _MAX_METADATA_BYTES:
-        raise InvalidCameraDepthV2("camera depth v2 metadata is too large")
+        raise InvalidCameraDepthFrame("camera depth frame metadata is too large")
     return _HEADER.pack(MAGIC, len(encoded), len(raw_depth)) + encoded + raw_depth
 
 
 __all__ = [
     "ENVELOPE_FORMAT",
-    "InvalidCameraDepthV2",
+    "InvalidCameraDepthFrame",
     "MAGIC",
     "SCHEMA",
     "decode",

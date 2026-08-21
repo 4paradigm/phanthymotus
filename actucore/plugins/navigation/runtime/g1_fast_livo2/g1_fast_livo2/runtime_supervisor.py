@@ -22,11 +22,11 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, PointCloud2
 from std_msgs.msg import String, UInt8MultiArray
 
-from .camera_depth_v2 import (
-    InvalidCameraDepthV2,
-    decode as decode_camera_depth_v2,
+from .camera_depth_frame import (
+    InvalidCameraDepthFrame,
+    decode as decode_camera_depth_frame,
 )
-from .camera_rgb_v2 import InvalidCameraRgbV2, decode as decode_camera_rgb_v2
+from .camera_rgb_frame import InvalidCameraRgbFrame, decode as decode_camera_rgb_frame
 from .collection_core import (
     COLLECTION_SOURCES,
     CollectionHealth,
@@ -140,8 +140,8 @@ class FastLivo2Supervisor(Node):
         return {
             "lidar": PointCloud2,
             "imu": Imu,
-            "rgb_v2": UInt8MultiArray,
-            "depth_v2": UInt8MultiArray,
+            "rgb_frame": UInt8MultiArray,
+            "depth_frame": UInt8MultiArray,
             "odom": Odometry,
         }
 
@@ -194,13 +194,13 @@ class FastLivo2Supervisor(Node):
         with self._lock:
             if not self._collection_sampler.enabled:
                 return
-        if port in {"rgb_v2", "depth_v2"}:
+        if port in {"rgb_frame", "depth_frame"}:
             source_stamp_ns = None
             try:
-                if port == "rgb_v2":
-                    metadata, _ = decode_camera_rgb_v2(bytes(message.data))
+                if port == "rgb_frame":
+                    metadata, _ = decode_camera_rgb_frame(bytes(message.data))
                 else:
-                    metadata, _ = decode_camera_depth_v2(bytes(message.data))
+                    metadata, _ = decode_camera_depth_frame(bytes(message.data))
                 source_stamp_ns = int(metadata["source_stamp_ns"])
                 metadata = {
                     "frame_id": metadata["frame_id"],
@@ -209,7 +209,7 @@ class FastLivo2Supervisor(Node):
                     "calibration_id": metadata["calibration_id"],
                     "receive_stamp_ns": metadata["receive_stamp_ns"],
                 }
-            except (InvalidCameraRgbV2, InvalidCameraDepthV2) as exc:
+            except (InvalidCameraRgbFrame, InvalidCameraDepthFrame) as exc:
                 metadata = {"decode_error": str(exc)}
         else:
             header = getattr(message, "header", None)

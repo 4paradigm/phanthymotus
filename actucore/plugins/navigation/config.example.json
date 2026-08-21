@@ -27,7 +27,7 @@
     "proposal_ttl_ms": 250
   },
   "semantic": {
-    "camera_topic": "/ubuntu/camera/rgb",
+    "camera_topic": "/ubuntu/camera/rgb_frame",
     "odometry_topic": "/ubuntu/navigation/odom",
     "fast_livo2_status_topic": "/ubuntu/navigation/fast_livo2/status",
     "goal_topic": "/ubuntu/navigation/goal_pose",

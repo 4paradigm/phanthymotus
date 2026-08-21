@@ -18,7 +18,7 @@
 
 | 数据 | topic | 来源 |
 | --- | --- | --- |
-| RGB | `/ubuntu/camera/rgb` | Canvas 外部输入 |
+| RGB | `/ubuntu/camera/rgb_frame` | Canvas 唯一 RGB 外部输入；语义导航直接解码 PSE1 内的 JPEG |
 | odom | `/ubuntu/navigation/odom` | 同卡片 FAST-LIVO2 模块 |
 | map status | `/ubuntu/navigation/fast_livo2/status` | 同卡片 FAST-LIVO2 模块 |
 

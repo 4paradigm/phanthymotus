@@ -447,7 +447,7 @@ class NavigationPlugin:
             and mapping_info["config"].get("collection_enabled") is True
         )
         if collection_enabled:
-            required.update({"rgb_v2", "depth_v2"})
+            required.add("depth_frame")
         bindings = args.get("input_bindings") or []
         raw_topics = args.get("input_topics") or []
         if isinstance(raw_topics, str):

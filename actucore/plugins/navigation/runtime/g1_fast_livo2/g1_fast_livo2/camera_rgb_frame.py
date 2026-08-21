@@ -1,9 +1,9 @@
-"""Decode the released Driver camera RGB v2 envelope for offline annotation.
+"""Decode the released Driver camera RGB frame envelope for offline annotation.
 
 The ROS carrier is ``std_msgs/msg/UInt8MultiArray`` on the Driver-owned topic
-``/ubuntu/navigation/camera/rgb``. Its payload is the existing sensor envelope:
+``/ubuntu/camera/rgb_frame``. Its payload is the existing sensor envelope:
 
-``PSE2`` + little-endian uint32 JSON length + uint32 payload length + JSON + JPEG.
+``PSE1`` + little-endian uint32 JSON length + uint32 payload length + JSON + JPEG.
 
 Driver metadata stays authoritative. This adapter validates its nested
 header/timing/image/calibration objects and returns the flat internal view used
@@ -17,9 +17,9 @@ import math
 import struct
 
 
-MAGIC = b"PSE2"
-SCHEMA = "phanthy.sensor.camera_rgb.v2"
-ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v2"
+MAGIC = b"PSE1"
+SCHEMA = "phanthy.sensor.camera_rgb_frame.v1"
+ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v1"
 _HEADER = struct.Struct("<4sII")
 _MAX_METADATA_BYTES = 64 * 1024
 _MAX_JPEG_BYTES = 32 * 1024 * 1024
@@ -36,50 +36,50 @@ _BASE_TO_LIDAR_XYZ_RPY = (
 )
 
 
-class InvalidCameraRgbV2(ValueError):
+class InvalidCameraRgbFrame(ValueError):
     pass
 
 
 def _finite_numbers(values, *, count: int, field: str) -> list[float]:
     if not isinstance(values, list) or len(values) != count:
-        raise InvalidCameraRgbV2(f"{field} must contain {count} numbers")
+        raise InvalidCameraRgbFrame(f"{field} must contain {count} numbers")
     result = []
     for value in values:
         if isinstance(value, bool):
-            raise InvalidCameraRgbV2(f"{field} must contain finite numbers")
+            raise InvalidCameraRgbFrame(f"{field} must contain finite numbers")
         try:
             number = float(value)
         except (TypeError, ValueError) as exc:
-            raise InvalidCameraRgbV2(
+            raise InvalidCameraRgbFrame(
                 f"{field} must contain finite numbers"
             ) from exc
         if not math.isfinite(number):
-            raise InvalidCameraRgbV2(f"{field} must contain finite numbers")
+            raise InvalidCameraRgbFrame(f"{field} must contain finite numbers")
         result.append(number)
     return result
 
 
 def _positive_int(value: object, *, field: str) -> int:
     if isinstance(value, bool):
-        raise InvalidCameraRgbV2(f"{field} must be a positive integer")
+        raise InvalidCameraRgbFrame(f"{field} must be a positive integer")
     try:
         result = int(value)
     except (TypeError, ValueError) as exc:
-        raise InvalidCameraRgbV2(f"{field} must be a positive integer") from exc
+        raise InvalidCameraRgbFrame(f"{field} must be a positive integer") from exc
     if result <= 0:
-        raise InvalidCameraRgbV2(f"{field} must be a positive integer")
+        raise InvalidCameraRgbFrame(f"{field} must be a positive integer")
     return result
 
 
 def _text(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise InvalidCameraRgbV2(f"{field} must be a non-empty string")
+        raise InvalidCameraRgbFrame(f"{field} must be a non-empty string")
     return value.strip()
 
 
 def _object(value: object, *, field: str) -> dict:
     if not isinstance(value, dict):
-        raise InvalidCameraRgbV2(f"{field} must be an object")
+        raise InvalidCameraRgbFrame(f"{field} must be an object")
     return dict(value)
 
 
@@ -89,7 +89,7 @@ def _matrix(value: object, *, field: str) -> list[float]:
         abs(a - b) > 1e-6
         for a, b in zip(matrix[12:], (0.0, 0.0, 0.0, 1.0))
     ):
-        raise InvalidCameraRgbV2(f"{field} homogeneous bottom row is invalid")
+        raise InvalidCameraRgbFrame(f"{field} homogeneous bottom row is invalid")
     return matrix
 
 
@@ -151,12 +151,12 @@ def _base_to_lidar_matrix() -> list[float]:
 def _transform_matrix(value: object, *, field: str) -> list[float]:
     entry = _object(value, field=field)
     if entry.get("status") == "unavailable":
-        raise InvalidCameraRgbV2(f"{field} is unavailable")
+        raise InvalidCameraRgbFrame(f"{field} is unavailable")
     transform = _object(
         entry.get("transform", entry), field=f"{field}.transform"
     )
     if transform.get("convention") != "target_from_source":
-        raise InvalidCameraRgbV2(
+        raise InvalidCameraRgbFrame(
             f"{field}.transform convention must be target_from_source"
         )
     return _matrix(
@@ -168,7 +168,7 @@ def _transform_matrix(value: object, *, field: str) -> list[float]:
 def validate_metadata(value: object) -> dict:
     metadata = _object(value, field="metadata")
     if metadata.get("schema") != SCHEMA:
-        raise InvalidCameraRgbV2(f"schema must be {SCHEMA}")
+        raise InvalidCameraRgbFrame(f"schema must be {SCHEMA}")
 
     header = _object(metadata.get("header"), field="header")
     timing = _object(metadata.get("timing"), field="timing")
@@ -182,11 +182,11 @@ def validate_metadata(value: object) -> dict:
         timing.get("source_stamp_ns"), field="timing.source_stamp_ns"
     )
     if source_stamp_ns != timing_stamp_ns:
-        raise InvalidCameraRgbV2(
+        raise InvalidCameraRgbFrame(
             "header.stamp_ns must equal timing.source_stamp_ns"
         )
     if timing.get("clock_domain") != "ros_system_time":
-        raise InvalidCameraRgbV2("timing.clock_domain must be ros_system_time")
+        raise InvalidCameraRgbFrame("timing.clock_domain must be ros_system_time")
     receive_stamp_ns = _positive_int(
         timing.get("driver_receive_stamp_ns"),
         field="timing.driver_receive_stamp_ns",
@@ -196,9 +196,9 @@ def validate_metadata(value: object) -> dict:
     width = _positive_int(image.get("width"), field="image.width")
     height = _positive_int(image.get("height"), field="image.height")
     if width > 16384 or height > 16384:
-        raise InvalidCameraRgbV2("image dimensions must be within [1, 16384]")
+        raise InvalidCameraRgbFrame("image dimensions must be within [1, 16384]")
     if image.get("encoding") != "jpeg":
-        raise InvalidCameraRgbV2("image.encoding must be jpeg")
+        raise InvalidCameraRgbFrame("image.encoding must be jpeg")
 
     calibration_id = _text(
         calibration.get("calibration_id"), field="calibration.calibration_id"
@@ -210,7 +210,7 @@ def validate_metadata(value: object) -> dict:
         calibration.get("height"), field="calibration.height"
     )
     if (calibration_width, calibration_height) != (width, height):
-        raise InvalidCameraRgbV2(
+        raise InvalidCameraRgbFrame(
             "calibration dimensions must match image dimensions"
         )
     k = _finite_numbers(
@@ -218,7 +218,7 @@ def validate_metadata(value: object) -> dict:
     )
     fx, fy, cx, cy = k[0], k[4], k[2], k[5]
     if fx <= 0.0 or fy <= 0.0:
-        raise InvalidCameraRgbV2("calibration focal lengths must be positive")
+        raise InvalidCameraRgbFrame("calibration focal lengths must be positive")
     distortion_model = str(
         calibration.get("distortion_model", "none")
     ).strip().lower()
@@ -231,13 +231,13 @@ def validate_metadata(value: object) -> dict:
         "rational_polynomial",
     }
     if distortion_model not in supported_models:
-        raise InvalidCameraRgbV2(
+        raise InvalidCameraRgbFrame(
             "calibration.distortion_model must be one of "
             + ",".join(sorted(supported_models))
         )
     coefficients = calibration.get("d", [])
     if not isinstance(coefficients, list) or len(coefficients) > 16:
-        raise InvalidCameraRgbV2(
+        raise InvalidCameraRgbFrame(
             "calibration.d must contain at most 16 numbers"
         )
     coefficients = _finite_numbers(
@@ -252,7 +252,7 @@ def validate_metadata(value: object) -> dict:
         "rational_polynomial": 8,
     }[distortion_model]
     if len(coefficients) < minimum_coefficients:
-        raise InvalidCameraRgbV2(
+        raise InvalidCameraRgbFrame(
             "calibration.d is too short for " + distortion_model
         )
 
@@ -278,15 +278,15 @@ def validate_metadata(value: object) -> dict:
 
     sequence = metadata.get("sequence")
     if isinstance(sequence, bool):
-        raise InvalidCameraRgbV2("sequence must be a non-negative integer")
+        raise InvalidCameraRgbFrame("sequence must be a non-negative integer")
     try:
         sequence = int(sequence)
     except (TypeError, ValueError) as exc:
-        raise InvalidCameraRgbV2(
+        raise InvalidCameraRgbFrame(
             "sequence must be a non-negative integer"
         ) from exc
     if sequence < 0:
-        raise InvalidCameraRgbV2("sequence must be a non-negative integer")
+        raise InvalidCameraRgbFrame("sequence must be a non-negative integer")
 
     return {
         "schema": SCHEMA,
@@ -320,25 +320,25 @@ def _validate_jpeg(image: bytes) -> bytes:
         or not image.startswith(b"\xff\xd8")
         or not image.endswith(b"\xff\xd9")
     ):
-        raise InvalidCameraRgbV2("camera RGB v2 JPEG size is invalid")
+        raise InvalidCameraRgbFrame("camera RGB frame JPEG size is invalid")
     return image
 
 
 def decode(payload: bytes) -> tuple[dict, bytes]:
     raw = bytes(payload)
     if len(raw) < _HEADER.size:
-        raise InvalidCameraRgbV2("camera RGB v2 payload is truncated")
+        raise InvalidCameraRgbFrame("camera RGB frame payload is truncated")
     magic, metadata_size, payload_size = _HEADER.unpack_from(raw)
     if magic != MAGIC:
-        raise InvalidCameraRgbV2("camera RGB v2 magic is invalid")
+        raise InvalidCameraRgbFrame("camera RGB frame magic is invalid")
     if metadata_size <= 0 or metadata_size > _MAX_METADATA_BYTES:
-        raise InvalidCameraRgbV2("camera RGB v2 metadata size is invalid")
+        raise InvalidCameraRgbFrame("camera RGB frame metadata size is invalid")
     if payload_size <= 0 or payload_size > _MAX_JPEG_BYTES:
-        raise InvalidCameraRgbV2("camera RGB v2 payload size is invalid")
+        raise InvalidCameraRgbFrame("camera RGB frame payload size is invalid")
     expected_size = _HEADER.size + metadata_size + payload_size
     if len(raw) != expected_size:
-        raise InvalidCameraRgbV2(
-            "camera RGB v2 envelope length mismatch: "
+        raise InvalidCameraRgbFrame(
+            "camera RGB frame envelope length mismatch: "
             f"expected {expected_size}, got {len(raw)}"
         )
     metadata_end = _HEADER.size + metadata_size
@@ -347,8 +347,8 @@ def decode(payload: bytes) -> tuple[dict, bytes]:
             raw[_HEADER.size:metadata_end].decode("utf-8")
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise InvalidCameraRgbV2(
-            "camera RGB v2 metadata is invalid JSON"
+        raise InvalidCameraRgbFrame(
+            "camera RGB frame metadata is invalid JSON"
         ) from exc
     metadata = validate_metadata(driver_metadata)
     jpeg = _validate_jpeg(raw[metadata_end:])
@@ -357,7 +357,7 @@ def decode(payload: bytes) -> tuple[dict, bytes]:
         image.get("payload_size"), field="image.payload_size"
     )
     if declared_payload_size != payload_size:
-        raise InvalidCameraRgbV2(
+        raise InvalidCameraRgbFrame(
             "image.payload_size must equal the envelope payload size"
         )
     return metadata, jpeg
@@ -380,13 +380,13 @@ def encode(metadata: dict, jpeg: bytes) -> bytes:
         allow_nan=False,
     ).encode("utf-8")
     if len(encoded) > _MAX_METADATA_BYTES:
-        raise InvalidCameraRgbV2("camera RGB v2 metadata is too large")
+        raise InvalidCameraRgbFrame("camera RGB frame metadata is too large")
     return _HEADER.pack(MAGIC, len(encoded), len(image)) + encoded + image
 
 
 __all__ = [
     "ENVELOPE_FORMAT",
-    "InvalidCameraRgbV2",
+    "InvalidCameraRgbFrame",
     "MAGIC",
     "SCHEMA",
     "decode",

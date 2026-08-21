@@ -30,15 +30,15 @@ COLLECTION_SOURCES = (
         "qos": "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
     },
     {
-        "port": "rgb_v2",
-        "topic": "/ubuntu/navigation/camera/rgb",
+        "port": "rgb_frame",
+        "topic": "/ubuntu/camera/rgb_frame",
         "record_topic": "/ubuntu/navigation/collection/camera/rgb",
         "ros_type": "std_msgs/msg/UInt8MultiArray",
         "qos": "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
     },
     {
-        "port": "depth_v2",
-        "topic": "/ubuntu/navigation/camera/depth",
+        "port": "depth_frame",
+        "topic": "/ubuntu/camera/depth_frame",
         "record_topic": "/ubuntu/navigation/collection/camera/depth",
         "ros_type": "std_msgs/msg/UInt8MultiArray",
         "qos": "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
@@ -53,15 +53,15 @@ COLLECTION_SOURCES = (
 )
 ALIGNMENT_SAMPLE_LIMIT = 4096
 ALIGNMENT_PAIRS = (
-    ("rgb_v2", "depth_v2", 150.0),
+    ("rgb_frame", "depth_frame", 150.0),
     ("lidar", "imu", 20.0),
-    ("rgb_v2", "lidar", 60.0),
-    ("rgb_v2", "odom", 120.0),
-    ("depth_v2", "lidar", 60.0),
+    ("rgb_frame", "lidar", 60.0),
+    ("rgb_frame", "odom", 120.0),
+    ("depth_frame", "lidar", 60.0),
 )
 COLLECTION_SAMPLE_INTERVAL_SEC = 1.0
 _RGB_ANCHOR_MATCH_LIMIT_MS = {
-    "depth_v2": 150.0,
+    "depth_frame": 150.0,
     "lidar": 60.0,
     "odom": 120.0,
 }
@@ -210,8 +210,8 @@ class CollectionSampler:
         limits = {
             "lidar": 32,
             "imu": 256,
-            "rgb_v2": 16,
-            "depth_v2": 16,
+            "rgb_frame": 16,
+            "depth_frame": 16,
             "odom": 16,
         }
         self._buffers = {
@@ -274,7 +274,7 @@ class CollectionSampler:
             "metadata": None if metadata is None else dict(metadata),
         }
         self._buffers[port].append(sample)
-        if port != "rgb_v2":
+        if port != "rgb_frame":
             return None
         if (
             self._last_emit_monotonic is not None
@@ -283,7 +283,7 @@ class CollectionSampler:
             return None
 
         anchor = int(source_stamp_ns)
-        bundle = {"rgb_v2": sample}
+        bundle = {"rgb_frame": sample}
         for candidate_port, limit_ms in _RGB_ANCHOR_MATCH_LIMIT_MS.items():
             candidates = self._buffers[candidate_port]
             if not candidates:
@@ -296,7 +296,7 @@ class CollectionSampler:
                 abs(int(nearest["source_stamp_ns"]) - anchor)
                 > int(limit_ms * 1_000_000)
             ):
-                return self._reject(f"skew_rgb_v2_{candidate_port}")
+                return self._reject(f"skew_rgb_frame_{candidate_port}")
             bundle[candidate_port] = nearest
         imu_candidates = self._buffers["imu"]
         if not imu_candidates:
@@ -528,7 +528,7 @@ class CollectionHealth:
         ]
 
         alignment_reasons = []
-        for port in ("lidar", "imu", "rgb_v2", "depth_v2", "odom"):
+        for port in ("lidar", "imu", "rgb_frame", "depth_frame", "odom"):
             source = sources[port]
             if source["count"] == 0:
                 alignment_reasons.append(f"{port}:missing")

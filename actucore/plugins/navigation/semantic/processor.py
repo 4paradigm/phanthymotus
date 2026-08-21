@@ -388,8 +388,9 @@ class Processor:
                 {
                     "port": "rgb",
                     "topic": camera_topic,
-                    "format": "image/jpeg",
-                    "ros_type": "sensor_msgs/msg/CompressedImage",
+                    "format": "application/vnd.phanthy.sensor-envelope.v1",
+                    "ros_type": "std_msgs/msg/UInt8MultiArray",
+                    "schema": "phanthy.sensor.camera_rgb_frame.v1",
                 },
                 {
                     "port": "livo_odom",
