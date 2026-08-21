@@ -25,6 +25,7 @@ CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME = "ControlledSemanticSpatial"
 NAVIGATION_PUBLIC_OUTPUT_PORTS = (
     "map_view",
     "status",
+    "collection_status",
     "velocity_proposal",
     "plan",
     "costmap",
@@ -144,6 +145,36 @@ def navigation_tool_definition(namespace: str) -> dict:
     )
     external_inputs = [deepcopy(item) for item in mapping["topic_in"]]
     external_inputs.append(deepcopy(semantic["topic_in"][0]))
+    external_inputs.extend(
+        [
+            {
+                "port": "depth",
+                "topic": f"/{namespace.strip('/')}/camera/depth",
+                "format": "sensor/image",
+                "ros_type": "sensor_msgs/msg/Image",
+                "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
+                "required": False,
+                "timestamp": "camera source header stamp",
+                "desc": (
+                    "Optional raw depth stream recorded when collection_enabled=true"
+                ),
+            },
+            {
+                "port": "rgb_v2",
+                "topic": f"/{namespace.strip('/')}/navigation/camera_rgb",
+                "format": "data/binary",
+                "ros_type": "std_msgs/msg/UInt8MultiArray",
+                "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
+                "required": False,
+                "schema": "phanthy.sensor.camera_rgb.v2",
+                "timestamp": "source_stamp_ns in the versioned RGB envelope",
+                "desc": (
+                    "Versioned RGB JPEG with calibration and LiDAR/camera/base "
+                    "extrinsics used for automatic offline obstacle annotation"
+                ),
+            },
+        ]
+    )
     goal_input = next(
         item for item in planning["topic_in"] if item["port"] == "goal_pose"
     )

@@ -7,10 +7,10 @@
 ## 运行边界
 
 ```text
-Driver lidar + imu ─┐
-camera rgb ─────────┼─> ControlledSemanticSpatial card (ActuCore container)
-optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child process
-                            ├─ Nav2 planner/controller child process
+Driver lidar + imu ────────┐
+camera rgb ────────────────┼─> ControlledSemanticSpatial card (ActuCore container)
+optional rgb_v2 + depth ───┤      ├─ FAST-LIVO2 mapping/localization child process
+optional goal_pose ────────┘      ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
                                       |
                                       `─ velocity_proposal -> Driver loco
@@ -19,8 +19,9 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
 - `NavigationPlugin` 是唯一 MCP/Canvas 生命周期所有者。
 - FAST-LIVO2 和 Nav2 ROS launch 由 `NavigationRuntime` 作为同容器子进程组
   启停；运行时不调用 Docker，也不需要 Docker socket。
-- odom、registered cloud、obstacle map 和 collection status 是卡片内部 ROS
-  边，不再作为 Canvas 公共连线端口。
+- odom、registered cloud 和 obstacle map 是卡片内部 ROS 边；
+  `collection_status` 作为只读公共输出供 Canvas 查看录制健康、
+  时间对齐、离线标注进度与失败原因。
 - VLN 命中地点后直接调用同卡片 planner；无论是 Canvas、
   `goal_pose` topic 还是 VLN 入口，planner 都为每个新任务生成独立
   `nav_id`。终态到达时只发布一次零速 proposal，不会继续以 5 Hz
@@ -35,6 +36,8 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
 | `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `imu` | `/ubuntu/navigation/imu` | 是 |
 | `rgb` | `/ubuntu/camera/rgb` | 是 |
+| `rgb_v2` | `/ubuntu/navigation/camera_rgb` | 否；启用完整数采时必须连接，自带标定与外参 |
+| `depth` | `/ubuntu/camera/depth` | 否；启用数采时建议连接 |
 | `goal_pose` | `/ubuntu/navigation/goal_pose` | 否 |
 
 ## 公共输出
@@ -43,14 +46,14 @@ optional goal_pose ─┘      ├─ FAST-LIVO2 mapping/localization child proc
 | --- | --- | --- |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
 | `status` | `/ubuntu/navigation/fast_livo2/status` | 定位、建图和运行状态 |
+| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_status` | 录制健康、同步质量、离线标注进度和失败原因 |
 | `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | 连接 Driver `loco` 执行器 |
 | `plan` | `/plan` | 当前二维全局路径 |
 | `costmap` | `/global_costmap/costmap` | 实时全局代价地图 |
 
-`livo_odom`、registered cloud、confirmed static map、obstacle map 和
-collection status topic 仍由
-同容器内的定位、规划、语义和数据采集逻辑消费或发布，只是不再生成 Canvas
-右侧连线端口。详细 frame、QoS、freshness 和速度约束见内部实现说明：
+`livo_odom`、registered cloud、confirmed static map 和 obstacle map 仍只由
+同容器内的定位、规划和语义逻辑消费，不生成 Canvas 右侧连线端口。详细
+frame、QoS、freshness、数采和速度约束见内部实现说明：
 
 - [mapping/README.md](mapping/README.md)
 - [planning/README.md](planning/README.md)

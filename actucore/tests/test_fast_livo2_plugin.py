@@ -130,6 +130,44 @@ class RetryableLocalizationStopBackend(ReadyBackend):
         return super().execute(action, args)
 
 
+class ReceiptBackend(ReadyBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "configure_collection" and not args["enabled"]:
+            self.calls.append((action, dict(args)))
+            return {
+                "status": "collection_saved",
+                "receipt": {
+                    "state": "complete",
+                    "storage_complete": True,
+                    "directory": (
+                        "/opt/phanthy-motus/data/fast_livo2/recordings/"
+                        "ubuntu/2026-08-21/session-a"
+                    ),
+                },
+            }
+        return super().execute(action, args)
+
+
+class FakeCollectionController:
+    def __init__(self) -> None:
+        self.runtime_states = []
+        self.receipts = []
+        self.roots = []
+
+    def set_runtime_active(self, active: bool) -> None:
+        self.runtime_states.append(bool(active))
+
+    def enqueue_receipt(self, receipt: dict | None) -> bool:
+        self.receipts.append(receipt)
+        return True
+
+    def update_root(self, root_directory: str) -> None:
+        self.roots.append(root_directory)
+
+    def snapshot(self) -> dict:
+        return {"postprocess": {"state": "idle"}}
+
+
 def _bindings(plugin: FastLivo2Plugin) -> list[dict]:
     return [
         {"port": item["port"], "topic": item["topic"]}
@@ -248,6 +286,26 @@ class FastLivo2PluginTest(unittest.TestCase):
             stopped["collection_stop_result"]["status"], "disabled"
         )
         self.assertFalse(backend.calls[-1][1]["enabled"])
+
+    def test_completed_collection_is_enqueued_for_background_annotation(self) -> None:
+        backend = ReceiptBackend()
+        controller = FakeCollectionController()
+        plugin = FastLivo2Plugin(
+            {"collection_enabled": True},
+            None,
+            backend=backend,
+            collection_controller=controller,
+        )
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+
+        stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(len(controller.receipts), 1)
+        self.assertTrue(controller.receipts[0]["storage_complete"])
+        self.assertTrue(controller.runtime_states[0])
 
     def test_collection_directory_is_confined_to_mounted_root(self) -> None:
         for directory in ("relative", "/tmp/recordings", "/opt/../tmp"):

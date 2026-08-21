@@ -470,13 +470,17 @@ RUN source /opt/ros/humble/install/setup.bash && \
     cd /ros_ws && \
     MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
       --packages-select audio_msgs g1_fast_livo2 g1_nav2 \
-      --symlink-install
+      --symlink-install && \
+    source /ros_ws/install/setup.bash && \
+    python3 -c "import numpy, rosbag2_py; from g1_fast_livo2.camera_rgb_v2 import decode" && \
+    ros2 bag record --help >/dev/null
 
 COPY actucore/plugins/navigation/runtime/g1_lio.yaml /config/g1_lio.yaml
 
 # ── Python 依赖 ────────────────────────────────────────────────────
-# 导航卡片本身只用标准库 + ROS 消息包（语义航点的 VLM 走 urllib 调远端），
-# 所以这层没有任何模型/视觉依赖 —— torch、CLIP、YOLO、ASR 那些属于
+# 导航卡片本身只用标准库 + NumPy + ROS 消息包（语义航点的 VLM 走
+# urllib 调远端），所以这层没有任何模型/视觉依赖 ——
+# torch、CLIP、YOLO、ASR 那些属于
 # perception，别往这里加。
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests

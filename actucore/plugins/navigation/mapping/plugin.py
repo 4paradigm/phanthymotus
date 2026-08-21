@@ -10,6 +10,7 @@ import threading
 import time
 
 from .backend import RosTopicFastLivo2Backend
+from .collection_postprocess import build_collection_controller
 from .contract import (
     FAST_LIVO2_ACTIONS,
     FAST_LIVO2_CONFIG_DEFAULTS,
@@ -90,7 +91,14 @@ def _validated_config(base: dict, updates: dict) -> dict:
 class FastLivo2Plugin:
     PREFIX = "fast_livo2"
 
-    def __init__(self, plugin_cfg: dict, executor, *, backend=None):
+    def __init__(
+        self,
+        plugin_cfg: dict,
+        executor,
+        *,
+        backend=None,
+        collection_controller=None,
+    ):
         raw_cfg = dict(plugin_cfg or {})
         raw_cfg.pop("enabled", None)
         self._executor = executor
@@ -106,6 +114,15 @@ class FastLivo2Plugin:
         except ConfigError as exc:
             self._cfg = dict(FAST_LIVO2_CONFIG_DEFAULTS)
             self._config_error = str(exc)
+        self._collection_controller = (
+            collection_controller
+            if collection_controller is not None
+            else build_collection_controller(
+                self._cfg["collection_directory"],
+                self._cfg["namespace"],
+                executor,
+            )
+        )
 
     def get_tools(self) -> list:
         return [fast_livo2_tool_definition(self._cfg["namespace"])]
@@ -138,6 +155,11 @@ class FastLivo2Plugin:
     def stop(self) -> None:
         self._stop_canvas()
 
+    def set_runtime_active(self, active: bool) -> None:
+        """Pause offline work while any owned navigation child is active."""
+
+        self._collection_controller.set_runtime_active(active)
+
     @staticmethod
     def _error(code: str, message: str) -> dict:
         return {
@@ -163,6 +185,9 @@ class FastLivo2Plugin:
                 self._config_error = str(exc)
                 return self._error("invalid_config", str(exc))
             self._config_error = None
+            self._collection_controller.update_root(
+                self._cfg["collection_directory"]
+            )
             return {"state": "configured", "config": dict(self._cfg), "physical_execution": False}
 
     def _start_canvas(self, args: dict) -> dict:
@@ -176,6 +201,7 @@ class FastLivo2Plugin:
         wiring = self._validate_wiring(args)
         if "error_code" in wiring:
             return wiring
+        self._collection_controller.set_runtime_active(True)
         core = self._ensure_core()
         deadline = time.monotonic() + self._cfg["discovery_timeout_sec"]
         while True:
@@ -186,6 +212,7 @@ class FastLivo2Plugin:
                 break
             if time.monotonic() >= deadline:
                 self._release_core()
+                self._collection_controller.set_runtime_active(False)
                 return self._error(
                     "fast_livo2_runtime_unavailable",
                     "in-container FAST-LIVO2 runtime is not subscribed to the command topic",
@@ -193,6 +220,7 @@ class FastLivo2Plugin:
             time.sleep(0.05)
         if info.get("state") in {"unavailable", "error"}:
             self._release_core()
+            self._collection_controller.set_runtime_active(False)
             return self._error("backend_not_ready", str(info.get("reason", info["state"])))
         obstacle_result = core.configure_obstacle_filter(
             {
@@ -202,6 +230,7 @@ class FastLivo2Plugin:
         )
         if obstacle_result.get("status") == "error":
             self._release_core()
+            self._collection_controller.set_runtime_active(False)
             return self._error(
                 str(obstacle_result.get("error_code", "obstacle_filter_failed")),
                 str(
@@ -219,6 +248,7 @@ class FastLivo2Plugin:
         )
         if collection_result.get("status") == "error":
             self._release_core()
+            self._collection_controller.set_runtime_active(False)
             return self._error(
                 str(collection_result.get("error_code", "collection_start_failed")),
                 str(collection_result.get("error", "data collection could not start")),
@@ -296,6 +326,7 @@ class FastLivo2Plugin:
             retryable = any(result.get("retryable") is True for result in failures)
             if not retryable:
                 self._release_core()
+                self._collection_controller.set_runtime_active(False)
             return {
                 "state": "error",
                 "status": "error",
@@ -310,6 +341,10 @@ class FastLivo2Plugin:
                 "retryable": retryable,
                 "physical_execution": False,
             }
+        if isinstance(collection_stop_result, dict):
+            self._collection_controller.enqueue_receipt(
+                collection_stop_result.get("receipt")
+            )
         self._release_core()
         return {
             "state": "idle",
@@ -372,6 +407,7 @@ class FastLivo2Plugin:
         }
         if config_error:
             result.update({"error_code": "invalid_config", "error": config_error})
+        result["collection"] = self._collection_controller.snapshot()
         result.update(
             {
                 "name": "FAST-LIVO2",

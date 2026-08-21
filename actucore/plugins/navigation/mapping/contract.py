@@ -77,8 +77,9 @@ FAST_LIVO2_CONFIG_SCHEMA = {
             "type": "boolean",
             "default": False,
             "description": (
-                "Automatically record LiDAR, IMU, RGB, depth and CameraInfo "
-                "while this Canvas card is running"
+                "Automatically record LiDAR, IMU, versioned RGB, depth and odom "
+                "while this Canvas card is running, then generate obstacle "
+                "annotations in the background"
             ),
         },
         "collection_directory": {
@@ -280,8 +281,8 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "schema": "phanthy.navigation.fast_livo2_collection_status.v1",
                 "rate_hz": 1,
                 "desc": (
-                    "Automatic data collection state, per-source counts and "
-                    "explicit failure reason"
+                    "Automatic data collection, software timestamp alignment, "
+                    "offline annotation progress and explicit failure reasons"
                 ),
             },
         ],

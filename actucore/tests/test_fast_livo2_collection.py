@@ -62,7 +62,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
         self.assertIsNone(starting["failure_reason"])
 
         for index, item in enumerate(COLLECTION_SOURCES):
-            if item["port"] == "camera_info":
+            if item["port"] == "rgb_v2":
                 continue
             health.observe(
                 item["port"],
@@ -71,9 +71,9 @@ class FastLivo2CollectionTest(unittest.TestCase):
             )
         degraded = health.snapshot(process_running=True, now_monotonic=16.0)
         self.assertEqual(degraded["state"], "degraded")
-        self.assertEqual(degraded["missing_sources"], ["camera_info"])
+        self.assertEqual(degraded["missing_sources"], ["rgb_v2"])
         self.assertEqual(
-            degraded["failure_reason"], "missing_sources:camera_info"
+            degraded["failure_reason"], "missing_sources:rgb_v2"
         )
 
         for index, item in enumerate(COLLECTION_SOURCES):
@@ -108,6 +108,85 @@ class FastLivo2CollectionTest(unittest.TestCase):
         )
         self.assertEqual(status["state"], "error")
         self.assertEqual(status["failure_reason"], "rosbag_exited:7")
+
+    def test_time_alignment_reports_software_sync_and_pair_skew(self) -> None:
+        health = CollectionHealth(grace_sec=5.0, stale_sec=2.0)
+        health.start("session-sync", "/recordings/session-sync", now_monotonic=1.0)
+        base = 1_700_000_000_000_000_000
+        stamps = {
+            "lidar": base,
+            "imu": base + 1_000_000,
+            "rgb_v2": base + 2_000_000,
+            "depth": base + 3_000_000,
+            "odom": base + 1_000_000,
+        }
+        for port, stamp in stamps.items():
+            health.observe(
+                port,
+                source_stamp_ns=stamp,
+                now_monotonic=6.0,
+                receive_epoch_ns=base + 10_000_000,
+                metadata=(
+                    {
+                        "frame_id": "camera_color_optical_frame",
+                        "width": 640,
+                        "height": 480,
+                        "calibration_id": "g1-camera-a",
+                    }
+                    if port == "rgb_v2"
+                    else {"frame_id": port}
+                ),
+            )
+
+        status = health.snapshot(process_running=True, now_monotonic=6.5)
+        alignment = status["time_alignment"]
+        self.assertEqual(status["state"], "recording")
+        self.assertTrue(alignment["alignment_ready"])
+        self.assertEqual(alignment["clock_domain"], "ros_system_time")
+        self.assertFalse(alignment["hardware_synchronized"])
+        self.assertEqual(
+            alignment["pairs"]["rgb_v2_lidar"]["nearest_skew_ms"]["p95"],
+            2.0,
+        )
+        self.assertEqual(
+            status["sources"]["rgb_v2"]["source_timestamp_coverage"], 1.0
+        )
+        self.assertEqual(
+            status["sources"]["rgb_v2"]["metadata"]["calibration_id"],
+            "g1-camera-a",
+        )
+
+    def test_time_alignment_degrades_on_skew_or_non_monotonic_stamp(self) -> None:
+        health = CollectionHealth(grace_sec=1.0, stale_sec=2.0)
+        health.start("session-skew", "/recordings/session-skew", now_monotonic=1.0)
+        base = 1_700_000_000_000_000_000
+        stamps = {
+            "lidar": base,
+            "imu": base + 1_000_000,
+            "rgb_v2": base + 50_000_000,
+            "depth": base + 52_000_000,
+            "odom": base + 1_000_000,
+        }
+        for port, stamp in stamps.items():
+            health.observe(port, source_stamp_ns=stamp, now_monotonic=2.0)
+        health.observe(
+            "imu",
+            source_stamp_ns=base - 1_000_000,
+            now_monotonic=2.1,
+        )
+
+        status = health.snapshot(process_running=True, now_monotonic=2.5)
+        self.assertEqual(status["state"], "degraded")
+        self.assertFalse(status["time_alignment"]["alignment_ready"])
+        self.assertIn(
+            "imu:source_timestamp_out_of_order",
+            status["time_alignment"]["reasons"],
+        )
+        self.assertIn(
+            "rgb_v2_lidar:nearest_skew",
+            status["time_alignment"]["reasons"],
+        )
+        self.assertTrue(status["failure_reason"].startswith("timestamp_alignment:"))
 
     def test_finalize_writes_receipt_and_only_renames_complete_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_root:

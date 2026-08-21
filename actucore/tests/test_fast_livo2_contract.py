@@ -118,6 +118,11 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn(
             "APT_UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn", source_lock
         )
+        self.assertIn("import numpy, rosbag2_py", dockerfile)
+        self.assertIn("ros2 bag record --help", dockerfile)
+        self.assertIn(
+            "from g1_fast_livo2.camera_rgb_v2 import decode", dockerfile
+        )
         # 基础镜像不再由锁文件钉住 digest：ActuCore 走 jetson-base，
         # 具体标签由 --jp-version 选（容器的 JetPack 用户态要和宿主 L4T 对齐）。
         self.assertNotIn("ROS_BASE_IMAGE=", source_lock)

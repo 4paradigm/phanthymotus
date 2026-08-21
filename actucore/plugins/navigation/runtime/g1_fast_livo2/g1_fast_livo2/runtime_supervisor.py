@@ -18,9 +18,11 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu, PointCloud2
-from std_msgs.msg import String
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Image, Imu, PointCloud2
+from std_msgs.msg import String, UInt8MultiArray
 
+from .camera_rgb_v2 import InvalidCameraRgbV2, decode as decode_camera_rgb_v2
 from .collection_core import (
     COLLECTION_SOURCES,
     CollectionHealth,
@@ -54,7 +56,7 @@ class FastLivo2Supervisor(Node):
         self.declare_parameter("status_topic", "/ubuntu/navigation/fast_livo2/status")
         self.declare_parameter(
             "collection_status_topic",
-            "/ubuntu/navigation/fast_livo2/collection_status",
+            "/ubuntu/navigation/fast_livo2/collection_status_raw",
         )
         self.declare_parameter("diagnostics_topic", "/ubuntu/navigation/fast_livo2/diagnostics")
         self.declare_parameter("reset_topic", "/ubuntu/navigation/fast_livo2/reset_map")
@@ -141,9 +143,9 @@ class FastLivo2Supervisor(Node):
         message_types = {
             "lidar": PointCloud2,
             "imu": Imu,
-            "rgb": CompressedImage,
+            "rgb_v2": UInt8MultiArray,
             "depth": Image,
-            "camera_info": CameraInfo,
+            "odom": Odometry,
         }
         subscriptions = []
         for item in COLLECTION_SOURCES:
@@ -162,16 +164,40 @@ class FastLivo2Supervisor(Node):
         return subscriptions
 
     def _on_collection_sample(self, port: str, message) -> None:
-        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        if port == "rgb_v2":
+            source_stamp_ns = None
+            try:
+                metadata, _ = decode_camera_rgb_v2(bytes(message.data))
+                source_stamp_ns = int(metadata["source_stamp_ns"])
+                metadata = {
+                    "frame_id": metadata["frame_id"],
+                    "width": metadata["width"],
+                    "height": metadata["height"],
+                    "calibration_id": metadata["calibration_id"],
+                    "receive_stamp_ns": metadata["receive_stamp_ns"],
+                }
+            except InvalidCameraRgbV2 as exc:
+                metadata = {"decode_error": str(exc)}
+            with self._lock:
+                self._collection_health.observe(
+                    port,
+                    source_stamp_ns=source_stamp_ns,
+                    metadata=metadata,
+                )
+            return
+        header = getattr(message, "header", None)
+        stamp = getattr(header, "stamp", None)
         source_stamp_ns = None
         if stamp is not None:
             candidate = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
             if candidate > 0:
                 source_stamp_ns = candidate
+        metadata = {"frame_id": str(getattr(header, "frame_id", "") or "")}
         with self._lock:
             self._collection_health.observe(
                 port,
                 source_stamp_ns=source_stamp_ns,
+                metadata=metadata,
             )
 
     def _on_diagnostics(self, message: String) -> None:
@@ -372,6 +398,7 @@ class FastLivo2Supervisor(Node):
                             "return_code": None if process is None else process.poll(),
                             "failure_reason": failure,
                             "sources": failed_status["sources"],
+                            "time_alignment": failed_status["time_alignment"],
                         },
                         storage_complete=False,
                     )
@@ -464,6 +491,7 @@ class FastLivo2Supervisor(Node):
                 )
             ),
             "sources": source_status["sources"],
+            "time_alignment": source_status["time_alignment"],
         }
         if partial_dir is not None and partial_dir.is_dir():
             try:

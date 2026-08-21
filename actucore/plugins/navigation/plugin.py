@@ -143,6 +143,7 @@ class NavigationPlugin:
 
         started: list[tuple[str, object]] = []
         try:
+            self._set_mapping_runtime_active(True)
             runtime_result = self._runtime.start()
             if runtime_result.get("state") != "running":
                 raise RuntimeError("navigation child processes did not stay running")
@@ -235,6 +236,7 @@ class NavigationPlugin:
                 exc_info=True,
             )
             cleanup = self._stop_started(started)
+            self._set_mapping_runtime_active(False)
             return self._error(
                 "navigation_start_failed",
                 str(exc),
@@ -295,6 +297,7 @@ class NavigationPlugin:
             results["runtime"] = self._runtime.stop()
         except Exception as exc:
             results["runtime"] = self._error("runtime_stop_failed", str(exc))
+        self._set_mapping_runtime_active(False)
         with self._lock:
             self._started = False
             self._instance_id = ""
@@ -319,6 +322,11 @@ class NavigationPlugin:
             "shadow_only": True,
             "physical_execution": False,
         }
+
+    def _set_mapping_runtime_active(self, active: bool) -> None:
+        setter = getattr(self._mapping, "set_runtime_active", None)
+        if callable(setter):
+            setter(active)
 
     def _configure(self, args: dict) -> dict:
         with self._transition_lock:

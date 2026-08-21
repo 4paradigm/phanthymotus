@@ -169,17 +169,28 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(tool["displayName"], "ControlledSemanticSpatial")
         self.assertEqual(
             {item["port"] for item in tool["topic_in"]},
-            {"lidar", "imu", "rgb", "goal_pose"},
+            {"lidar", "imu", "rgb", "rgb_v2", "depth", "goal_pose"},
         )
-        self.assertFalse(
-            next(item for item in tool["topic_in"] if item["port"] == "goal_pose")[
-                "required"
-            ]
+        optional_inputs = {
+            item["port"]
+            for item in tool["topic_in"]
+            if not item.get("required", True)
+        }
+        self.assertEqual(
+            optional_inputs,
+            {"rgb_v2", "depth", "goal_pose"},
         )
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
         self.assertEqual(
             [item["port"] for item in tool["topic_out"]],
-            ["map_view", "status", "velocity_proposal", "plan", "costmap"],
+            [
+                "map_view",
+                "status",
+                "collection_status",
+                "velocity_proposal",
+                "plan",
+                "costmap",
+            ],
         )
         self.assertTrue(
             {
@@ -187,7 +198,6 @@ class NavigationContractTest(unittest.TestCase):
                 "registered_cloud",
                 "obstacle_map",
                 "static_map",
-                "collection_status",
             }.isdisjoint({item["port"] for item in tool["topic_out"]})
         )
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
