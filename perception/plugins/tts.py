@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import queue
-import struct
 import sys
 import threading
 import time
@@ -221,18 +220,22 @@ class TRTTSAdapter(TTSAdapter):
         self._speed = speed
         self._trt_dir = trt_dir
 
-        # ── TRT 版本检查：engine 仅按 JP5 / TRT 8.5.x 构建，JP6 不兼容 ──
+        # ── 按 TRT 版本选择 engine：JP5=8.5.x / JP6=10.x ──
         import tensorrt as trt
-        if not trt.__version__.startswith("8.5"):
+        trt_ver = trt.__version__
+        if trt_ver.startswith("8.5"):
+            engine_name = "vits2_trt_mel20full_d50_jp5"
+        elif trt_ver.startswith("10."):
+            engine_name = "vits2_trt_mel20full_d50_jp6"
+        else:
             raise RuntimeError(
-                f"VITS2 TRT engine 仅支持 JP5 / TRT 8.5.x，当前为 TRT {trt.__version__}；"
-                f"请勿在 JP6 镜像启用 backend: trt"
+                f"VITS2 TRT engine 仅支持 TRT 8.5.x（JP5）或 10.x（JP6），当前为 TRT {trt_ver}"
             )
 
         # ── 运行时下载模型资产（不 bake 进镜像：/models 会被 bind-mount 覆盖）──
         from utils.model_downloader import ensure_model
         ensure_model("vits2_mix", model_dir)
-        ensure_model("vits2_trt_mel20full_d50", trt_dir)
+        ensure_model(engine_name, trt_dir)
 
         # ── Frontend (G2P) ──
         sys.path.insert(0, model_dir)

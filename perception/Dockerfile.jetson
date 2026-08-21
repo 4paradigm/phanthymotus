@@ -5,7 +5,8 @@
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
-#   ./deploy/build_perception.sh --variant jetson --mirror tuna
+#   ./deploy/build_perception.sh --jp-version 5.11 --mirror tuna   # JetPack 5.11
+#   ./deploy/build_perception.sh --jp-version 6.1  --mirror tuna   # JetPack 6.1
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
