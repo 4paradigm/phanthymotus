@@ -57,6 +57,46 @@ def metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
     }
 
 
+def driver_metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
+    identity = np.eye(4).reshape(-1).tolist()
+    return {
+        "schema": "phanthy.sensor.camera_rgb.v2",
+        "header": {
+            "stamp_ns": stamp,
+            "frame_id": "camera_color_optical_frame",
+        },
+        "timing": {
+            "source_stamp_ns": stamp,
+            "driver_receive_stamp_ns": stamp + 1_000_000,
+            "clock_domain": "ros_system_time",
+        },
+        "sequence": 7,
+        "image": {
+            "encoding": "jpeg",
+            "width": 100,
+            "height": 100,
+            "payload_size": 4,
+        },
+        "calibration": {
+            "calibration_id": "sha256:test",
+            "width": 100,
+            "height": 100,
+            "distortion_model": "none",
+            "k": [100.0, 0.0, 50.0, 0.0, 100.0, 50.0, 0.0, 0.0, 1.0],
+            "d": [],
+            "lidar_to_camera": {
+                "status": "factory_nominal",
+                "transform": {
+                    "source_frame": "livox_frame",
+                    "target_frame": "camera_color_optical_frame",
+                    "convention": "target_from_source",
+                    "matrix_row_major": identity,
+                },
+            },
+        },
+    }
+
+
 def synthetic_points() -> np.ndarray:
     ground = np.asarray(
         [(x, y, 0.0) for x in np.linspace(-1.0, 1.0, 8) for y in np.linspace(-1.0, 1.0, 8)],
@@ -88,22 +128,34 @@ class FakeReader:
 class NavigationCollectionPostprocessTest(unittest.TestCase):
     def test_camera_rgb_v2_round_trip_and_rejects_missing_calibration(self) -> None:
         jpeg = b"\xff\xd8\xff\xd9"
-        decoded_metadata, decoded_jpeg = decode(encode(metadata(), jpeg))
+        payload = encode(driver_metadata(), jpeg)
+        self.assertEqual(payload[:4], b"PSE2")
+        decoded_metadata, decoded_jpeg = decode(payload)
         self.assertEqual(decoded_metadata["calibration_id"], "sha256:test")
+        self.assertEqual(
+            decoded_metadata["base_transform_source"],
+            "actucore_g1_base_to_lidar+driver_lidar_to_camera",
+        )
+        self.assertEqual(len(decoded_metadata["t_base_camera"]), 16)
         self.assertEqual(decoded_jpeg, jpeg)
 
-        invalid = metadata()
-        invalid.pop("t_camera_lidar")
-        with self.assertRaisesRegex(InvalidCameraRgbV2, "t_camera_lidar"):
+        invalid = driver_metadata()
+        invalid["calibration"].pop("lidar_to_camera")
+        with self.assertRaisesRegex(InvalidCameraRgbV2, "lidar_to_camera"):
             encode(invalid, jpeg)
 
-        unsupported = metadata()
-        unsupported["intrinsics"]["distortion_model"] = "inverse_brown_conrady"
+        unsupported = driver_metadata()
+        unsupported["calibration"]["distortion_model"] = (
+            "inverse_brown_conrady"
+        )
         with self.assertRaisesRegex(InvalidCameraRgbV2, "distortion_model"):
             encode(unsupported, jpeg)
 
         with self.assertRaisesRegex(InvalidCameraRgbV2, "JPEG"):
-            encode(metadata(), b"not-a-jpeg")
+            encode(driver_metadata(), b"not-a-jpeg")
+
+        with self.assertRaisesRegex(InvalidCameraRgbV2, "magic"):
+            decode(b"CRGB" + payload[4:])
 
     def test_annotation_outputs_session_id_nearest_point_and_distance(self) -> None:
         stamp = metadata()["source_stamp_ns"]

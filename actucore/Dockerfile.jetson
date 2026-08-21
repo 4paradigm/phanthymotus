@@ -472,7 +472,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
       --packages-select audio_msgs g1_fast_livo2 g1_nav2 \
       --symlink-install && \
     source /ros_ws/install/setup.bash && \
-    python3 -c "import numpy, rosbag2_py; from g1_fast_livo2.camera_rgb_v2 import decode" && \
+    python3 -c "import numpy, rosbag2_py; from g1_fast_livo2.camera_rgb_v2 import decode, MAGIC; assert MAGIC == b'PSE2'" && \
     ros2 bag record --help >/dev/null
 
 COPY actucore/plugins/navigation/runtime/g1_lio.yaml /config/g1_lio.yaml

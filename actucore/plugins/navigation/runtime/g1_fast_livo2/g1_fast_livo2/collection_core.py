@@ -27,7 +27,7 @@ COLLECTION_SOURCES = (
     },
     {
         "port": "rgb_v2",
-        "topic": "/ubuntu/navigation/camera_rgb",
+        "topic": "/ubuntu/navigation/camera/rgb",
         "ros_type": "std_msgs/msg/UInt8MultiArray",
         "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
     },

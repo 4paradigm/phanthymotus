@@ -254,15 +254,23 @@ fail closed。
 | --- | --- | --- |
 | LiDAR | `/ubuntu/navigation/lidar` | `PointCloud2`; `RELIABLE + KEEP_LAST(2) + VOLATILE` |
 | IMU | `/ubuntu/navigation/imu` | `Imu`; `RELIABLE + KEEP_LAST(200) + VOLATILE` |
-| RGB v2 | `/ubuntu/navigation/camera_rgb` | `UInt8MultiArray`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE`; `phanthy.sensor.camera_rgb.v2` |
+| RGB v2 | `/ubuntu/navigation/camera/rgb` | `UInt8MultiArray`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE`; `phanthy.sensor.camera_rgb.v2` |
 | Depth | `/ubuntu/camera/depth` | `Image`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE` |
 | Odom | `/ubuntu/navigation/odom` | `Odometry`; `BEST_EFFORT + KEEP_LAST(20) + VOLATILE` |
 
-RGB v2 使用 `CRGBV2\0\0 + uint32_le(metadata_size) + JSON + JPEG` 封装。
-JSON 必须逐帧携带图像源/接收时间、尺寸、`frame_id`、
-`calibration_id`、内参/畸变、`T_camera_lidar` 和 `T_base_camera`。
-矩阵均为 row-major 4x4 齐次变换：`T_camera_lidar` 把 LiDAR 点变换到
-相机 optical frame，`T_base_camera` 把相机点变换到 `base_link`。
+RGB v2 直接沿用 Driver 已发布的
+`PSE2 + uint32_le(metadata_size) + uint32_le(payload_size) + JSON + JPEG`
+封装（`application/vnd.phanthy.sensor-envelope.v2`），不引入卡片私有
+wire format。JSON 必须逐帧携带 `header.stamp_ns`、
+`timing.source_stamp_ns`、`timing.driver_receive_stamp_ns`、尺寸、
+`frame_id`、`calibration_id`、内参/畸变以及 Driver 标定的
+LiDAR-to-camera 外参。该外参矩阵为 row-major 4x4 齐次变换，
+按 `target_from_source` 把 LiDAR 点变换到相机 optical frame。
+
+Driver 不需要另外发布 `T_base_camera`。ActuCore 使用与 G1 实时
+adapter 相同的 `base_link -> livox_frame` 外参，与 Driver 的
+`livox_frame -> camera` 标定组合出离线投影所需的
+`T_base_camera`。
 畸变模型只接受 `none`、`plumb_bob` / `brown_conrady` 或
 `rational_polynomial`；其他模型明确拒绝，不会忽略畸变继续投影。
 因此不再依赖独立 `CameraInfo` topic，也不在 ActuCore 伪造或推断

@@ -36,7 +36,7 @@ optional goal_pose ────────┘      ├─ Nav2 planner/controll
 | `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `imu` | `/ubuntu/navigation/imu` | 是 |
 | `rgb` | `/ubuntu/camera/rgb` | 是 |
-| `rgb_v2` | `/ubuntu/navigation/camera_rgb` | 否；启用完整数采时必须连接，自带标定与外参 |
+| `rgb_v2` | `/ubuntu/navigation/camera/rgb` | 否；启用完整数采时必须连接，沿用 Driver `PSE2` 封装中的标定与外参 |
 | `depth` | `/ubuntu/camera/depth` | 否；启用数采时建议连接 |
 | `goal_pose` | `/ubuntu/navigation/goal_pose` | 否 |
 

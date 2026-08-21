@@ -180,6 +180,15 @@ class NavigationContractTest(unittest.TestCase):
             optional_inputs,
             {"rgb_v2", "depth", "goal_pose"},
         )
+        inputs = {item["port"]: item for item in tool["topic_in"]}
+        self.assertEqual(
+            inputs["rgb_v2"]["topic"],
+            "/ubuntu/navigation/camera/rgb",
+        )
+        self.assertEqual(
+            inputs["rgb_v2"]["format"],
+            "application/vnd.phanthy.sensor-envelope.v2",
+        )
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
         self.assertEqual(
             [item["port"] for item in tool["topic_out"]],

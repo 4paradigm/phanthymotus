@@ -423,7 +423,7 @@ class RosbagRecordReader:
         except ImportError as exc:
             raise PostprocessError(f"offline_reader_dependency_unavailable:{exc}") from exc
         topics = {
-            "/ubuntu/navigation/camera_rgb": ("rgb_v2", UInt8MultiArray),
+            "/ubuntu/navigation/camera/rgb": ("rgb_v2", UInt8MultiArray),
             "/ubuntu/navigation/lidar": ("lidar", PointCloud2),
             "/ubuntu/navigation/imu": ("imu", Imu),
             "/ubuntu/navigation/odom": ("odom", Odometry),

@@ -161,16 +161,19 @@ def navigation_tool_definition(namespace: str) -> dict:
             },
             {
                 "port": "rgb_v2",
-                "topic": f"/{namespace.strip('/')}/navigation/camera_rgb",
-                "format": "data/binary",
+                "topic": f"/{namespace.strip('/')}/navigation/camera/rgb",
+                "format": "application/vnd.phanthy.sensor-envelope.v2",
                 "ros_type": "std_msgs/msg/UInt8MultiArray",
                 "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
                 "required": False,
                 "schema": "phanthy.sensor.camera_rgb.v2",
-                "timestamp": "source_stamp_ns in the versioned RGB envelope",
+                "timestamp": (
+                    "header.stamp_ns / timing.source_stamp_ns in the PSE2 envelope"
+                ),
                 "desc": (
-                    "Versioned RGB JPEG with calibration and LiDAR/camera/base "
-                    "extrinsics used for automatic offline obstacle annotation"
+                    "Driver RGB JPEG with calibration and LiDAR-to-camera "
+                    "extrinsics; ActuCore derives the base transform for "
+                    "automatic offline obstacle annotation"
                 ),
             },
         ]
