@@ -18,8 +18,10 @@ sys.path.insert(0, str(RUNTIME_PACKAGE))
 from g1_fast_livo2.collection_core import (  # noqa: E402
     COLLECTION_SOURCES,
     CollectionHealth,
+    CollectionSampler,
     finalize_collection_session,
     normalize_collection_directory,
+    read_rosbag_recording_summary,
     rosbag_record_command,
 )
 
@@ -49,13 +51,19 @@ class FastLivo2CollectionTest(unittest.TestCase):
             "/safe/session.partial",
         ])
         self.assertEqual(
-            command[7:], [item["topic"] for item in COLLECTION_SOURCES]
+            command[7:], [item["record_topic"] for item in COLLECTION_SOURCES]
         )
         self.assertEqual(COLLECTION_SOURCES[0]["topic"], "/ubuntu/navigation/lidar")
         rgb_v2 = next(
             item for item in COLLECTION_SOURCES if item["port"] == "rgb_v2"
         )
         self.assertEqual(rgb_v2["topic"], "/ubuntu/navigation/camera/rgb")
+        depth_v2 = next(
+            item for item in COLLECTION_SOURCES if item["port"] == "depth_v2"
+        )
+        self.assertEqual(
+            depth_v2["topic"], "/ubuntu/navigation/camera/depth"
+        )
 
     def test_health_exposes_normal_and_missing_source_failure(self) -> None:
         health = CollectionHealth(grace_sec=5.0, stale_sec=2.0)
@@ -113,6 +121,21 @@ class FastLivo2CollectionTest(unittest.TestCase):
         self.assertEqual(status["state"], "error")
         self.assertEqual(status["failure_reason"], "rosbag_exited:7")
 
+    def test_decode_error_is_visible_in_collection_status(self) -> None:
+        health = CollectionHealth(grace_sec=0.0)
+        health.start("session-decode", "/recordings/session-decode")
+        health.observe_error("rgb_v2", "unsupported distortion model")
+        status = health.snapshot(process_running=True)
+        self.assertEqual(status["state"], "degraded")
+        self.assertEqual(status["source_errors"], ["rgb_v2"])
+        self.assertEqual(
+            status["failure_reason"], "source_decode_errors:rgb_v2"
+        )
+        self.assertIn(
+            "unsupported distortion",
+            status["sources"]["rgb_v2"]["error"],
+        )
+
     def test_time_alignment_reports_software_sync_and_pair_skew(self) -> None:
         health = CollectionHealth(grace_sec=5.0, stale_sec=2.0)
         health.start("session-sync", "/recordings/session-sync", now_monotonic=1.0)
@@ -121,7 +144,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
             "lidar": base,
             "imu": base + 1_000_000,
             "rgb_v2": base + 2_000_000,
-            "depth": base + 3_000_000,
+            "depth_v2": base + 3_000_000,
             "odom": base + 1_000_000,
         }
         for port, stamp in stamps.items():
@@ -167,8 +190,8 @@ class FastLivo2CollectionTest(unittest.TestCase):
         stamps = {
             "lidar": base,
             "imu": base + 1_000_000,
-            "rgb_v2": base + 50_000_000,
-            "depth": base + 52_000_000,
+            "rgb_v2": base + 200_000_000,
+            "depth_v2": base + 210_000_000,
             "odom": base + 1_000_000,
         }
         for port, stamp in stamps.items():
@@ -191,6 +214,102 @@ class FastLivo2CollectionTest(unittest.TestCase):
             status["time_alignment"]["reasons"],
         )
         self.assertTrue(status["failure_reason"].startswith("timestamp_alignment:"))
+
+    def test_alignment_only_compares_overlapping_long_session_history(self) -> None:
+        health = CollectionHealth(grace_sec=1.0, stale_sec=2.0)
+        health.start("session-long", "/recordings/session-long", now_monotonic=1.0)
+        base = 1_700_000_000_000_000_000
+        for offset_ms in range(0, 60_000, 100):
+            health.observe(
+                "lidar",
+                source_stamp_ns=base + offset_ms * 1_000_000,
+                now_monotonic=2.0,
+            )
+        for offset_ms in range(0, 60_000, 5):
+            health.observe(
+                "imu",
+                source_stamp_ns=base + offset_ms * 1_000_000,
+                now_monotonic=2.0,
+            )
+        pair = health.snapshot(
+            process_running=True, now_monotonic=2.5
+        )["time_alignment"]["pairs"]["lidar_imu"]
+        self.assertTrue(pair["ready"], pair)
+        self.assertLessEqual(pair["nearest_skew_ms"]["p95"], 5.0)
+
+    def test_sampler_emits_one_aligned_bundle_per_second(self) -> None:
+        sampler = CollectionSampler(interval_sec=1.0)
+        sampler.start()
+        base = 1_700_000_000_000_000_000
+
+        for port, offset_ms in (
+            ("depth_v2", -60),
+            ("lidar", -30),
+            ("imu", -15),
+            ("odom", -80),
+        ):
+            self.assertIsNone(
+                sampler.observe(
+                    port,
+                    source_stamp_ns=base + offset_ms * 1_000_000,
+                    message=port,
+                    metadata={"port": port},
+                    now_monotonic=10.0,
+                )
+            )
+        bundle = sampler.observe(
+            "rgb_v2",
+            source_stamp_ns=base,
+            message="rgb",
+            metadata={"port": "rgb_v2"},
+            now_monotonic=10.0,
+        )
+        self.assertEqual(set(bundle), {item["port"] for item in COLLECTION_SOURCES})
+        self.assertIsNone(
+            sampler.observe(
+                "rgb_v2",
+                source_stamp_ns=base + 100_000_000,
+                message="rgb-too-soon",
+                metadata=None,
+                now_monotonic=10.1,
+            )
+        )
+
+    def test_recording_summary_exposes_rosbag_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            observed = {
+                item["port"]: {"count": 10} for item in COLLECTION_SOURCES
+            }
+            entries = []
+            for item in COLLECTION_SOURCES:
+                entries.append(
+                    {
+                        "topic_metadata": {"name": item["record_topic"]},
+                        "message_count": 2 if item["port"] == "imu" else 10,
+                    }
+                )
+            Path(temporary, "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n"
+                "  message_count: 42\n"
+                "  duration:\n"
+                "    nanoseconds: 10000000000\n"
+                "  topics_with_message_count:\n"
+                + "".join(
+                    "  - topic_metadata:\n"
+                    f"      name: {entry['topic_metadata']['name']}\n"
+                    f"    message_count: {entry['message_count']}\n"
+                    for entry in entries
+                ),
+                encoding="utf-8",
+            )
+            summary = read_rosbag_recording_summary(temporary, observed)
+            self.assertFalse(summary["healthy"])
+            self.assertEqual(
+                summary["failure_reasons"], ["imu:recording_coverage"]
+            )
+            self.assertEqual(
+                summary["topics"]["imu"]["recording_coverage"], 0.2
+            )
 
     def test_finalize_writes_receipt_and_only_renames_complete_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_root:

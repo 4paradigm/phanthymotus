@@ -447,6 +447,14 @@ class NavigationPlugin:
             for item in tool["topic_in"]
             if item.get("required", True)
         }
+        mapping_info = self._mapping.dispatch("fast_livo2", {"action": "info"})
+        collection_enabled = (
+            isinstance(mapping_info, dict)
+            and isinstance(mapping_info.get("config"), dict)
+            and mapping_info["config"].get("collection_enabled") is True
+        )
+        if collection_enabled:
+            required.update({"rgb_v2", "depth_v2"})
         bindings = args.get("input_bindings") or []
         raw_topics = args.get("input_topics") or []
         if isinstance(raw_topics, str):

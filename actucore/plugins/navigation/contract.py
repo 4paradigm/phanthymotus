@@ -148,15 +148,19 @@ def navigation_tool_definition(namespace: str) -> dict:
     external_inputs.extend(
         [
             {
-                "port": "depth",
-                "topic": f"/{namespace.strip('/')}/camera/depth",
-                "format": "sensor/image",
-                "ros_type": "sensor_msgs/msg/Image",
+                "port": "depth_v2",
+                "topic": f"/{namespace.strip('/')}/navigation/camera/depth",
+                "format": "application/vnd.phanthy.sensor-envelope.v2",
+                "ros_type": "std_msgs/msg/UInt8MultiArray",
                 "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
                 "required": False,
-                "timestamp": "camera source header stamp",
+                "schema": "phanthy.sensor.camera_depth.v2",
+                "timestamp": (
+                    "header.stamp_ns / timing.source_stamp_ns in the PSE2 envelope"
+                ),
                 "desc": (
-                    "Optional raw depth stream recorded when collection_enabled=true"
+                    "Driver Z16 depth with scale, calibration, RGB alignment metadata, "
+                    "and source time; required when collection_enabled=true"
                 ),
             },
             {
@@ -173,7 +177,8 @@ def navigation_tool_definition(namespace: str) -> dict:
                 "desc": (
                     "Driver RGB JPEG with calibration and LiDAR-to-camera "
                     "extrinsics; ActuCore derives the base transform for "
-                    "automatic offline obstacle annotation"
+                    "automatic offline obstacle annotation; required when "
+                    "collection_enabled=true"
                 ),
             },
         ]

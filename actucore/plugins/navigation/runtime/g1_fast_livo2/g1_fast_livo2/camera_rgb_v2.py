@@ -226,6 +226,8 @@ def validate_metadata(value: object) -> dict:
         "none",
         "plumb_bob",
         "brown_conrady",
+        "inverse_brown_conrady",
+        "realsense_inverse_brown_conrady",
         "rational_polynomial",
     }
     if distortion_model not in supported_models:
@@ -245,6 +247,8 @@ def validate_metadata(value: object) -> dict:
         "none": 0,
         "plumb_bob": 5,
         "brown_conrady": 5,
+        "inverse_brown_conrady": 5,
+        "realsense_inverse_brown_conrady": 5,
         "rational_polynomial": 8,
     }[distortion_model]
     if len(coefficients) < minimum_coefficients:

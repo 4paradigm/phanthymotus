@@ -79,6 +79,17 @@ class FakeComponent:
         return {"status": action, "component": self.name}
 
 
+class CollectionMappingComponent(FakeComponent):
+    def dispatch(self, prefix, args):
+        if args.get("action") == "info":
+            self.calls.append((prefix, dict(args)))
+            return {
+                "state": "ready" if self.started else "idle",
+                "config": {"collection_enabled": True},
+            }
+        return super().dispatch(prefix, args)
+
+
 class TransientPlanningComponent(FakeComponent):
     def __init__(self):
         super().__init__("planning")
@@ -169,7 +180,7 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(tool["displayName"], "ControlledSemanticSpatial")
         self.assertEqual(
             {item["port"] for item in tool["topic_in"]},
-            {"lidar", "imu", "rgb", "rgb_v2", "depth", "goal_pose"},
+            {"lidar", "imu", "rgb", "rgb_v2", "depth_v2", "goal_pose"},
         )
         optional_inputs = {
             item["port"]
@@ -178,7 +189,7 @@ class NavigationContractTest(unittest.TestCase):
         }
         self.assertEqual(
             optional_inputs,
-            {"rgb_v2", "depth", "goal_pose"},
+            {"rgb_v2", "depth_v2", "goal_pose"},
         )
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(
@@ -188,6 +199,14 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(
             inputs["rgb_v2"]["format"],
             "application/vnd.phanthy.sensor-envelope.v2",
+        )
+        self.assertEqual(
+            inputs["depth_v2"]["topic"],
+            "/ubuntu/navigation/camera/depth",
+        )
+        self.assertEqual(
+            inputs["depth_v2"]["schema"],
+            "phanthy.sensor.camera_depth.v2",
         )
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
         self.assertEqual(
@@ -497,6 +516,29 @@ class NavigationPluginTest(unittest.TestCase):
         stopped = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(runtime.stop_calls, 1)
+
+    def test_collection_requires_versioned_rgb_and_depth_bindings(self):
+        mapping = CollectionMappingComponent("mapping")
+        plugin = self.make_plugin(mapping=mapping)
+
+        missing = plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+        self.assertEqual(missing["error_code"], "invalid_canvas_wiring")
+        self.assertIn("depth_v2", missing["error"])
+        self.assertIn("rgb_v2", missing["error"])
+
+        all_bindings = [
+            {"port": item["port"], "topic": item["topic"]}
+            for item in navigation_tool_definition("ubuntu")["topic_in"]
+            if item["port"] != "goal_pose"
+        ]
+        started = plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": all_bindings},
+        )
+        self.assertEqual(started["state"], "ready")
 
     def test_start_failure_releases_every_acquired_resource(self):
         runtime = FakeRuntime()

@@ -19,15 +19,21 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Image, Imu, PointCloud2
+from sensor_msgs.msg import Imu, PointCloud2
 from std_msgs.msg import String, UInt8MultiArray
 
+from .camera_depth_v2 import (
+    InvalidCameraDepthV2,
+    decode as decode_camera_depth_v2,
+)
 from .camera_rgb_v2 import InvalidCameraRgbV2, decode as decode_camera_rgb_v2
 from .collection_core import (
     COLLECTION_SOURCES,
     CollectionHealth,
+    CollectionSampler,
     finalize_collection_session,
     normalize_collection_directory,
+    read_rosbag_recording_summary,
     rosbag_record_command,
 )
 from .frame_adapter_core import normalize_obstacle_height_range
@@ -91,6 +97,7 @@ class FastLivo2Supervisor(Node):
         self._collection_error: str | None = None
         self._collection_last_receipt: dict | None = None
         self._collection_health = CollectionHealth()
+        self._collection_sampler = CollectionSampler()
         self._condition = threading.Condition(self._lock)
         self._map_root = Path(str(self.get_parameter("map_root").value))
         self._map_root.mkdir(parents=True, exist_ok=True)
@@ -124,8 +131,34 @@ class FastLivo2Supervisor(Node):
             callback_group=callbacks,
         )
         self.create_subscription(String, str(self.get_parameter("diagnostics_topic").value), self._on_diagnostics, 10)
+        self._collection_record_publishers = self._create_collection_publishers()
         self._collection_subscriptions = self._create_collection_subscriptions()
         self.create_timer(1.0, self._publish_heartbeat)
+
+    @staticmethod
+    def _collection_message_types() -> dict:
+        return {
+            "lidar": PointCloud2,
+            "imu": Imu,
+            "rgb_v2": UInt8MultiArray,
+            "depth_v2": UInt8MultiArray,
+            "odom": Odometry,
+        }
+
+    def _create_collection_publishers(self) -> dict:
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        message_types = self._collection_message_types()
+        return {
+            item["port"]: self.create_publisher(
+                message_types[item["port"]], item["record_topic"], qos
+            )
+            for item in COLLECTION_SOURCES
+        }
 
     def _create_collection_subscriptions(self) -> list:
         reliable_qos = QoSProfile(
@@ -140,13 +173,7 @@ class FastLivo2Supervisor(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
-        message_types = {
-            "lidar": PointCloud2,
-            "imu": Imu,
-            "rgb_v2": UInt8MultiArray,
-            "depth": Image,
-            "odom": Odometry,
-        }
+        message_types = self._collection_message_types()
         subscriptions = []
         for item in COLLECTION_SOURCES:
             port = item["port"]
@@ -164,10 +191,16 @@ class FastLivo2Supervisor(Node):
         return subscriptions
 
     def _on_collection_sample(self, port: str, message) -> None:
-        if port == "rgb_v2":
+        with self._lock:
+            if not self._collection_sampler.enabled:
+                return
+        if port in {"rgb_v2", "depth_v2"}:
             source_stamp_ns = None
             try:
-                metadata, _ = decode_camera_rgb_v2(bytes(message.data))
+                if port == "rgb_v2":
+                    metadata, _ = decode_camera_rgb_v2(bytes(message.data))
+                else:
+                    metadata, _ = decode_camera_depth_v2(bytes(message.data))
                 source_stamp_ns = int(metadata["source_stamp_ns"])
                 metadata = {
                     "frame_id": metadata["frame_id"],
@@ -176,29 +209,41 @@ class FastLivo2Supervisor(Node):
                     "calibration_id": metadata["calibration_id"],
                     "receive_stamp_ns": metadata["receive_stamp_ns"],
                 }
-            except InvalidCameraRgbV2 as exc:
+            except (InvalidCameraRgbV2, InvalidCameraDepthV2) as exc:
                 metadata = {"decode_error": str(exc)}
-            with self._lock:
-                self._collection_health.observe(
-                    port,
-                    source_stamp_ns=source_stamp_ns,
-                    metadata=metadata,
-                )
-            return
-        header = getattr(message, "header", None)
-        stamp = getattr(header, "stamp", None)
-        source_stamp_ns = None
-        if stamp is not None:
-            candidate = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
-            if candidate > 0:
-                source_stamp_ns = candidate
-        metadata = {"frame_id": str(getattr(header, "frame_id", "") or "")}
+        else:
+            header = getattr(message, "header", None)
+            stamp = getattr(header, "stamp", None)
+            source_stamp_ns = None
+            if stamp is not None:
+                candidate = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+                if candidate > 0:
+                    source_stamp_ns = candidate
+            metadata = {"frame_id": str(getattr(header, "frame_id", "") or "")}
+
         with self._lock:
-            self._collection_health.observe(
+            if source_stamp_ns is None and metadata.get("decode_error"):
+                self._collection_health.observe_error(
+                    port, str(metadata["decode_error"])
+                )
+            bundle = self._collection_sampler.observe(
                 port,
                 source_stamp_ns=source_stamp_ns,
+                message=message,
                 metadata=metadata,
             )
+        if bundle is None:
+            return
+        for source_port, sample in bundle.items():
+            self._collection_record_publishers[source_port].publish(
+                sample["message"]
+            )
+            with self._lock:
+                self._collection_health.observe(
+                    source_port,
+                    source_stamp_ns=int(sample["source_stamp_ns"]),
+                    metadata=sample["metadata"],
+                )
 
     def _on_diagnostics(self, message: String) -> None:
         try:
@@ -423,6 +468,7 @@ class FastLivo2Supervisor(Node):
             self._collection_directory = directory
             self._collection_error = None
             self._collection_health.start(session_id, str(final_dir))
+            self._collection_sampler.start()
         return {"status": "recording", "collection": self._collection_snapshot()}
 
     def _stop_collection(self) -> dict:
@@ -430,6 +476,7 @@ class FastLivo2Supervisor(Node):
             process = self._collection_process
             partial_dir = self._collection_partial_dir
             final_dir = self._collection_final_dir
+            self._collection_sampler.stop()
             source_status = self._collection_health.snapshot(
                 process_running=process is not None and process.poll() is None,
                 process_return_code=None if process is None else process.poll(),
@@ -471,11 +518,34 @@ class FastLivo2Supervisor(Node):
                     }
 
         storage_ok = stop_error is None and return_code == 0 and partial_dir is not None
+        recording = (
+            read_rosbag_recording_summary(
+                str(partial_dir), source_status["sources"]
+            )
+            if storage_ok
+            else {
+                "healthy": False,
+                "failure_reasons": ["recording_incomplete"],
+                "error": stop_error or f"rosbag_exited:{return_code}",
+                "topics": {},
+            }
+        )
+        recording_reasons = list(recording.get("failure_reasons", []))
+        for port, topic_status in recording.get("topics", {}).items():
+            source_status["sources"][port].update(
+                {
+                    "recorded_count": topic_status["recorded_count"],
+                    "recording_coverage": topic_status["recording_coverage"],
+                }
+            )
+        receipt_healthy = source_status["healthy"] and recording.get(
+            "healthy", False
+        )
         receipt = {
             "schema": "phanthy.navigation.fast_livo2_collection_receipt.v1",
             "state": (
                 "complete"
-                if storage_ok and source_status["healthy"]
+                if storage_ok and receipt_healthy
                 else "degraded" if storage_ok else "failed"
             ),
             "stopped_unix_ms": int(time.time() * 1000),
@@ -483,6 +553,11 @@ class FastLivo2Supervisor(Node):
             "return_code": return_code,
             "failure_reason": (
                 stop_error
+                or (
+                    "recording_integrity:" + ",".join(recording_reasons)
+                    if recording_reasons
+                    else None
+                )
                 or source_status.get("failure_reason")
                 or (
                     "missing_sources:" + ",".join(source_status["missing_sources"])
@@ -492,6 +567,7 @@ class FastLivo2Supervisor(Node):
             ),
             "sources": source_status["sources"],
             "time_alignment": source_status["time_alignment"],
+            "recording": recording,
         }
         if partial_dir is not None and partial_dir.is_dir():
             try:

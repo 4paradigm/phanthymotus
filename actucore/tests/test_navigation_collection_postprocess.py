@@ -21,6 +21,11 @@ RUNTIME_PACKAGE = (
 sys.path.insert(0, str(ACTUCORE_ROOT))
 sys.path.insert(0, str(RUNTIME_PACKAGE))
 
+from g1_fast_livo2.camera_depth_v2 import (  # noqa: E402
+    InvalidCameraDepthV2,
+    decode as decode_depth,
+    encode as encode_depth,
+)
 from g1_fast_livo2.camera_rgb_v2 import (  # noqa: E402
     InvalidCameraRgbV2,
     decode,
@@ -97,6 +102,61 @@ def driver_metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
     }
 
 
+def depth_driver_metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
+    identity = np.eye(4).reshape(-1).tolist()
+    intrinsics = {
+        "width": 2,
+        "height": 2,
+        "distortion_model": "plumb_bob",
+        "k": [100.0, 0.0, 1.0, 0.0, 100.0, 1.0, 0.0, 0.0, 1.0],
+        "d": [0.0] * 5,
+    }
+    transform = {
+        "source_frame": "camera_depth_optical_frame",
+        "target_frame": "camera_color_optical_frame",
+        "convention": "target_from_source",
+        "matrix_row_major": identity,
+    }
+    return {
+        "schema": "phanthy.sensor.camera_depth.v2",
+        "header": {
+            "stamp_ns": stamp,
+            "frame_id": "camera_depth_optical_frame",
+        },
+        "timing": {
+            "source_stamp_ns": stamp,
+            "driver_receive_stamp_ns": stamp + 1_000_000,
+            "clock_domain": "ros_system_time",
+        },
+        "sequence": 8,
+        "image": {
+            "encoding": "z16_le",
+            "width": 2,
+            "height": 2,
+            "step_bytes": 4,
+            "payload_size": 8,
+            "unit": "meter",
+            "depth_scale_m": 0.001,
+            "aligned_to_rgb": False,
+        },
+        "calibration": {
+            "calibration_id": "sha256:test",
+            **intrinsics,
+            "depth_scale_m": 0.001,
+            "aligned_to_rgb": False,
+            "depth_to_rgb": transform,
+            "rgb_intrinsics": intrinsics,
+            "lidar_to_camera": {
+                "status": "factory_nominal",
+                "transform": {
+                    **transform,
+                    "source_frame": "livox_frame",
+                },
+            },
+        },
+    }
+
+
 def synthetic_points() -> np.ndarray:
     ground = np.asarray(
         [(x, y, 0.0) for x in np.linspace(-1.0, 1.0, 8) for y in np.linspace(-1.0, 1.0, 8)],
@@ -144,18 +204,35 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
         with self.assertRaisesRegex(InvalidCameraRgbV2, "lidar_to_camera"):
             encode(invalid, jpeg)
 
-        unsupported = driver_metadata()
-        unsupported["calibration"]["distortion_model"] = (
-            "inverse_brown_conrady"
+        inverse = driver_metadata()
+        inverse["calibration"]["distortion_model"] = (
+            "realsense_inverse_brown_conrady"
         )
-        with self.assertRaisesRegex(InvalidCameraRgbV2, "distortion_model"):
-            encode(unsupported, jpeg)
+        inverse["calibration"]["d"] = [0.01, -0.01, 0.0, 0.0, 0.0]
+        decoded_inverse, _ = decode(encode(inverse, jpeg))
+        self.assertEqual(
+            decoded_inverse["intrinsics"]["distortion_model"],
+            "realsense_inverse_brown_conrady",
+        )
 
         with self.assertRaisesRegex(InvalidCameraRgbV2, "JPEG"):
             encode(driver_metadata(), b"not-a-jpeg")
 
         with self.assertRaisesRegex(InvalidCameraRgbV2, "magic"):
             decode(b"CRGB" + payload[4:])
+
+    def test_camera_depth_v2_round_trip_and_rejects_scale_mismatch(self) -> None:
+        raw_depth = np.asarray((100, 200, 300, 400), dtype="<u2").tobytes()
+        payload = encode_depth(depth_driver_metadata(), raw_depth)
+        decoded, depth = decode_depth(payload)
+        self.assertEqual(decoded["calibration_id"], "sha256:test")
+        self.assertEqual(decoded["depth_scale_m"], 0.001)
+        self.assertEqual(depth, raw_depth)
+
+        invalid = depth_driver_metadata()
+        invalid["calibration"]["depth_scale_m"] = 0.002
+        with self.assertRaisesRegex(InvalidCameraDepthV2, "scales disagree"):
+            encode_depth(invalid, raw_depth)
 
     def test_annotation_outputs_session_id_nearest_point_and_distance(self) -> None:
         stamp = metadata()["source_stamp_ns"]

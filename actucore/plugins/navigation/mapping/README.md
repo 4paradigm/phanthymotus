@@ -247,16 +247,23 @@ fail closed。
 | `collection_enabled` | `false` | Canvas 启动该卡片时自动开始采集，停止卡片时自动收口 |
 | `collection_directory` | `/opt/phanthy-motus/data/fast_livo2/recordings` | ActuCore 容器内持久化根目录；只能配置为该挂载目录或其子目录 |
 
-启用后，同容器 adapter 使用 ROS 2 原生 rosbag2 MCAP 后端记录以下原始 topic，
-保留消息自身的 CDR payload 和源时间戳：
+启用后，同容器 adapter 从以下 Driver/卡片输入中选择每秒一组时间戳对齐的
+多模态快照，再通过内部 `collection/*` topic 交给 ROS 2 原生 rosbag2 MCAP
+后端。FAST-LIVO2 和 Nav2 仍按原始频率消费输入；1 Hz 只限制数采旁路，不会
+降低定位或避障频率。每条被选消息保留原始 CDR payload 和源时间戳：
 
 | 数据 | topic | ROS type / QoS |
 | --- | --- | --- |
-| LiDAR | `/ubuntu/navigation/lidar` | `PointCloud2`; `RELIABLE + KEEP_LAST(2) + VOLATILE` |
-| IMU | `/ubuntu/navigation/imu` | `Imu`; `RELIABLE + KEEP_LAST(200) + VOLATILE` |
-| RGB v2 | `/ubuntu/navigation/camera/rgb` | `UInt8MultiArray`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE`; `phanthy.sensor.camera_rgb.v2` |
-| Depth | `/ubuntu/camera/depth` | `Image`; `BEST_EFFORT + KEEP_LAST(4) + VOLATILE` |
-| Odom | `/ubuntu/navigation/odom` | `Odometry`; `BEST_EFFORT + KEEP_LAST(20) + VOLATILE` |
+| LiDAR | `/ubuntu/navigation/lidar` | `PointCloud2` |
+| IMU | `/ubuntu/navigation/imu` | `Imu` |
+| RGB v2 | `/ubuntu/navigation/camera/rgb` | `UInt8MultiArray`; `phanthy.sensor.camera_rgb.v2` |
+| Depth v2 | `/ubuntu/navigation/camera/depth` | `UInt8MultiArray`; `phanthy.sensor.camera_depth.v2` |
+| Odom | `/ubuntu/navigation/odom` | `Odometry` |
+
+启用数采时 RGB v2 和 Depth v2 都是条件必需输入。Depth v2 的 PSE2 元数据已
+包含 Z16 编码、`depth_scale_m`、深度/RGB 内参、`depth_to_rgb` 和
+LiDAR-to-camera 外参，因此不再需要单独的 `CameraInfo` topic。任一 PSE2
+封装、尺寸、尺度、标定或时间戳校验失败，该帧不会进入对齐快照。
 
 RGB v2 直接沿用 Driver 已发布的
 `PSE2 + uint32_le(metadata_size) + uint32_le(payload_size) + JSON + JPEG`
@@ -271,20 +278,22 @@ Driver 不需要另外发布 `T_base_camera`。ActuCore 使用与 G1 实时
 adapter 相同的 `base_link -> livox_frame` 外参，与 Driver 的
 `livox_frame -> camera` 标定组合出离线投影所需的
 `T_base_camera`。
-畸变模型只接受 `none`、`plumb_bob` / `brown_conrady` 或
-`rational_polynomial`；其他模型明确拒绝，不会忽略畸变继续投影。
+畸变模型接受 `none`、`plumb_bob` / `brown_conrady`、
+`rational_polynomial` 和 Driver 实际发布的
+`realsense_inverse_brown_conrady`；逆 Brown 模型按 RealSense 语义迭代求
+投影坐标，不会忽略畸变继续投影。
 因此不再依赖独立 `CameraInfo` topic，也不在 ActuCore 伪造或推断
 标定。原有 `/ubuntu/camera/rgb` 仍供语义模块使用，不是离线投影
 真值输入。
 
-MCAP 保留实际收到消息的 CDR payload，但 `BEST_EFFORT` 源在网络或系统
-负载下允许丢帧。在线状态不会改写或伪造时间戳，而是基于原始
-source stamp 做有界的软件对齐诊断：检查每路时间戳覆盖率和单调性，
+MCAP 只保存通过对齐门槛的 1 Hz 快照。在线状态不会改写或伪造时间戳，而是
+基于原始 source stamp 做有界的软件对齐诊断：检查每路时间戳覆盖率和单调性，
 并计算 RGB-v2/Depth、LiDAR/IMU、RGB-v2/LiDAR、RGB-v2/Odom、
-Depth/LiDAR 的最近邻时间偏差。五组的
-P95 目标均为 `20 ms`；超限、时间戳缺失或倒序会令状态进入 `degraded`，但
-不会中断导航或丢弃已经录下的原始消息。这是 ROS system-time 时钟域的软件
-对齐证据，不等同于 PTP、外部触发或硬件帧同步。
+Depth/LiDAR 的最近邻时间偏差。P95 门槛分别是 `150 / 20 / 60 / 120 /
+60 ms`，对应 G1 当前 10 Hz RGB、5 Hz Depth、10 Hz LiDAR、高频 IMU 和约
+5 Hz Odom 的异步采样上限；它们是数据健康门槛，不是硬件同步声明。超限、
+时间戳缺失或倒序会令状态进入 `degraded`，但不会中断导航。这是 ROS
+system-time 时钟域的软件对齐证据，不等同于 PTP、外部触发或硬件帧同步。
 
 录制目录按 `ubuntu/YYYY-MM-DD/<session_id>` 分层。录制期间目录名带
 `.partial`；Canvas 正常停止、rosbag2 完成 flush 且 receipt 写入后才原子改为
@@ -300,6 +309,8 @@ P95 目标均为 `20 ms`；超限、时间戳缺失或倒序会令状态进入 `
 - `time_alignment.alignment_ready`、每路时间戳覆盖率/单调性，以及五组
   `nearest_skew_ms` 的 P50、P95、最大值和阈值；
 - 上一次停止时的 receipt 和最终目录；
+- receipt 中每路 `recorded_count` / `recording_coverage`，用于直接暴露
+  rosbag 实际落盘数量与卡片发出的快照数量是否一致；
 - `postprocess.state/stage`: `queued` / `scanning` / `processing` / `paused` /
   `finalizing` / `complete` / `degraded` / `error`；
 - `processed_images`、`total_images`、`percent`、`paused_reason` 与
@@ -314,9 +325,9 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 采集启停在内部串行；rosbag 启动早退时会保留 `.partial`
 并写入 `state=failed/storage_complete=false` receipt，不会冒充完整 session。
 
-完整标注依赖 Driver 另行发布上述 RGB v2 topic。缺失或封装校验失败时，
+完整标注依赖 Driver 发布上述 RGB v2 与 Depth v2 topic。缺失或封装校验失败时，
 原始 MCAP 仍按实际收到的数据收口，但状态明确显示
-`missing_sources:rgb_v2` 或解码失败；不会回退到无标定的旧 RGB。
+`missing_sources` 或解码失败；不会回退到无标定的旧 RGB/Depth。
 
 停止 receipt 保存 `time_alignment`。MCAP 完成并原子收口后，ActuCore
 父进程的后台 worker 自动生成 `derived/`：
@@ -329,7 +340,8 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 - `postprocess.json`：可读回的任务进度/错误日志。
 
 流程使用 IMU 重力方向移除地面、LiDAR 点云做几何聚类，再通过
-标定外参投影到每张 RGB；Depth v1 只录制，不参与真值。卡片或
+标定外参投影到每张 RGB；Depth v2 当前作为同步原始证据保存，尚不参与
+障碍物最近点真值计算。卡片或
 导航 runtime 活跃时 worker 自动暂停，卡片停止后继续，避免与定位/
 规划抢占 G1 CPU。ActuCore 重启后会重新发现已完成但尚无
 `derived/manifest.json` 的 session 并继续生成。最终目录只在 manifest
@@ -343,7 +355,7 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 
 Canvas 把 Driver `navigation_lidar`、`navigation_imu` 和相机 `rgb` 接到公开
 `ControlledSemanticSpatial` 卡片；启用完整数采时再连接可选的 `rgb_v2`
-与 `depth`。`livo_odom`、registered cloud、obstacle map 都在同一容器内
+与 `depth_v2`。`livo_odom`、registered cloud、obstacle map 都在同一容器内
 交给 planning/semantic 模块。`collection_status` 是唯一新增的只读公共诊断
 输出，用于直接查看数采是否正常及失败原因。
 

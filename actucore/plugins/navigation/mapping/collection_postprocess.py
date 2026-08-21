@@ -18,7 +18,11 @@ import numpy as np
 
 ANNOTATION_SCHEMA = "phanthy.navigation.obstacle_frame.v1"
 POSTPROCESS_SCHEMA = "phanthy.navigation.collection_postprocess.v1"
-_SYNC_TOLERANCE_NS = 20_000_000
+_SYNC_TOLERANCE_NS = {
+    "lidar": 60_000_000,
+    "imu": 20_000_000,
+    "odom": 120_000_000,
+}
 _MAX_PENDING_IMAGES = 32
 _MAX_PENDING_IMAGE_BYTES = 64 * 1024 * 1024
 _MIN_CLUSTER_POINTS = 4
@@ -211,6 +215,39 @@ def visible_cluster_points(
             + p1 * (radius2 + 2.0 * normalized_y * normalized_y)
             + 2.0 * p2 * normalized_x * normalized_y
         )
+    elif model in {
+        "inverse_brown_conrady",
+        "realsense_inverse_brown_conrady",
+    }:
+        k1, k2, p1, p2, k3 = coefficients[:5]
+        distorted_x = normalized_x.copy()
+        distorted_y = normalized_y.copy()
+        for _ in range(10):
+            radius2 = distorted_x * distorted_x + distorted_y * distorted_y
+            radius4 = radius2 * radius2
+            radius6 = radius4 * radius2
+            radial = 1.0 + k1 * radius2 + k2 * radius4 + k3 * radius6
+            delta_x = (
+                2.0 * p1 * distorted_x * distorted_y
+                + p2 * (radius2 + 2.0 * distorted_x * distorted_x)
+            )
+            delta_y = (
+                p1 * (radius2 + 2.0 * distorted_y * distorted_y)
+                + 2.0 * p2 * distorted_x * distorted_y
+            )
+            valid = np.abs(radial) > 1e-12
+            distorted_x = np.divide(
+                normalized_x - delta_x,
+                radial,
+                out=np.full_like(radial, np.nan),
+                where=valid,
+            )
+            distorted_y = np.divide(
+                normalized_y - delta_y,
+                radial,
+                out=np.full_like(radial, np.nan),
+                where=valid,
+            )
     else:
         distorted_x, distorted_y = normalized_x, normalized_y
     finite_projection = np.isfinite(distorted_x) & np.isfinite(distorted_y)
@@ -346,7 +383,10 @@ def annotate_frame(
         for name, value in (("lidar", lidar), ("imu", imu), ("odom", odom))
     }
     base["time_skew_ms"] = {key: round(value, 3) for key, value in skews.items()}
-    if any(value > _SYNC_TOLERANCE_NS / 1_000_000.0 for value in skews.values()):
+    if any(
+        value > _SYNC_TOLERANCE_NS[name] / 1_000_000.0
+        for name, value in skews.items()
+    ):
         return {**base, "status": "invalid", "failure_reason": "time_skew_exceeded"}
     try:
         metadata = image["metadata"]
@@ -424,9 +464,16 @@ class RosbagRecordReader:
             raise PostprocessError(f"offline_reader_dependency_unavailable:{exc}") from exc
         topics = {
             "/ubuntu/navigation/camera/rgb": ("rgb_v2", UInt8MultiArray),
+            "/ubuntu/navigation/collection/camera/rgb": (
+                "rgb_v2",
+                UInt8MultiArray,
+            ),
             "/ubuntu/navigation/lidar": ("lidar", PointCloud2),
+            "/ubuntu/navigation/collection/lidar": ("lidar", PointCloud2),
             "/ubuntu/navigation/imu": ("imu", Imu),
+            "/ubuntu/navigation/collection/imu": ("imu", Imu),
             "/ubuntu/navigation/odom": ("odom", Odometry),
+            "/ubuntu/navigation/collection/odom": ("odom", Odometry),
         }
         reader = self._reader()
         while reader.has_next():
@@ -500,11 +547,14 @@ class OfflineAnnotationProcessor:
         self._reader_factory = reader_factory
 
     @staticmethod
-    def _nearest(records: deque, stamp_ns: int) -> dict | None:
+    def _nearest(records: deque, stamp_ns: int, kind: str) -> dict | None:
         if not records:
             return None
         candidate = min(records, key=lambda value: abs(int(value["stamp_ns"]) - stamp_ns))
-        if abs(int(candidate["stamp_ns"]) - stamp_ns) > _SYNC_TOLERANCE_NS:
+        if (
+            abs(int(candidate["stamp_ns"]) - stamp_ns)
+            > _SYNC_TOLERANCE_NS[kind]
+        ):
             return None
         return candidate
 
@@ -550,9 +600,9 @@ class OfflineAnnotationProcessor:
             }
             annotation = annotate_frame(
                 normalized,
-                self._nearest(buffers["lidar"], int(image["stamp_ns"])),
-                self._nearest(buffers["imu"], int(image["stamp_ns"])),
-                self._nearest(buffers["odom"], int(image["stamp_ns"])),
+                self._nearest(buffers["lidar"], int(image["stamp_ns"]), "lidar"),
+                self._nearest(buffers["imu"], int(image["stamp_ns"]), "imu"),
+                self._nearest(buffers["odom"], int(image["stamp_ns"]), "odom"),
                 tracker,
                 processed,
             )
@@ -580,7 +630,7 @@ class OfflineAnnotationProcessor:
             while pending and all(
                 buffers[name]
                 and int(buffers[name][-1]["stamp_ns"])
-                >= int(pending[0]["stamp_ns"]) + _SYNC_TOLERANCE_NS
+                >= int(pending[0]["stamp_ns"]) + _SYNC_TOLERANCE_NS[name]
                 for name in buffers
             ):
                 image = pending.popleft()
