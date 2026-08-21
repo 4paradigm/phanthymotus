@@ -180,7 +180,7 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(tool["displayName"], "ControlledSemanticSpatial")
         self.assertEqual(
             {item["port"] for item in tool["topic_in"]},
-            {"lidar", "imu", "rgb", "rgb_v2", "depth_v2", "goal_pose"},
+            {"lidar", "imu", "rgb", "rgb_v2", "depth_v2"},
         )
         optional_inputs = {
             item["port"]
@@ -189,7 +189,7 @@ class NavigationContractTest(unittest.TestCase):
         }
         self.assertEqual(
             optional_inputs,
-            {"rgb_v2", "depth_v2", "goal_pose"},
+            {"rgb_v2", "depth_v2"},
         )
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(
@@ -216,10 +216,10 @@ class NavigationContractTest(unittest.TestCase):
                 "status",
                 "collection_status",
                 "velocity_proposal",
-                "plan",
                 "costmap",
             ],
         )
+        self.assertNotIn("x-topic-actions", tool)
         self.assertTrue(
             {
                 "livo_odom",
@@ -532,7 +532,6 @@ class NavigationPluginTest(unittest.TestCase):
         all_bindings = [
             {"port": item["port"], "topic": item["topic"]}
             for item in navigation_tool_definition("ubuntu")["topic_in"]
-            if item["port"] != "goal_pose"
         ]
         started = plugin.dispatch(
             "ControlledSemanticSpatial",

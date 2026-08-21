@@ -177,13 +177,6 @@ class NavigationPlugin:
                     "topic": f"/{self._namespace}/navigation/static_map",
                 },
             ]
-            if "goal_pose" in wiring["wired_topics"]:
-                planner_bindings.append(
-                    {
-                        "port": "goal_pose",
-                        "topic": wiring["wired_topics"]["goal_pose"],
-                    }
-                )
             planning_start = {
                 "action": "start",
                 "instance_id": args.get("instance_id"),

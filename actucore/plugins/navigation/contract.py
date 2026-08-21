@@ -27,7 +27,6 @@ NAVIGATION_PUBLIC_OUTPUT_PORTS = (
     "status",
     "collection_status",
     "velocity_proposal",
-    "plan",
     "costmap",
 )
 
@@ -140,8 +139,7 @@ def navigation_tool_definition(namespace: str) -> dict:
     semantic = build_manifest(
         f"/{namespace.strip('/')}/camera/rgb",
         f"/{namespace.strip('/')}/navigation/odom",
-        f"/{namespace.strip('/')}/navigation/goal_pose",
-        f"/{namespace.strip('/')}/navigation/fast_livo2/status",
+        status_topic=f"/{namespace.strip('/')}/navigation/fast_livo2/status",
     )
     external_inputs = [deepcopy(item) for item in mapping["topic_in"]]
     external_inputs.append(deepcopy(semantic["topic_in"][0]))
@@ -183,11 +181,6 @@ def navigation_tool_definition(namespace: str) -> dict:
             },
         ]
     )
-    goal_input = next(
-        item for item in planning["topic_in"] if item["port"] == "goal_pose"
-    )
-    external_inputs.append(deepcopy(goal_input))
-
     component_outputs = {
         str(item.get("port", "")): item
         for item in [*mapping["topic_out"], *planning["topic_out"]]
@@ -208,7 +201,6 @@ def navigation_tool_definition(namespace: str) -> dict:
             "inside the ActuCore container; only bounded velocity proposals "
             "leave the card."
         ),
-        "x-topic-actions": deepcopy(planning["x-topic-actions"]),
         "topic_in": external_inputs,
         "topic_out": outputs,
         "inputSchema": {

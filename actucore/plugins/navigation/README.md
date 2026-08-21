@@ -10,7 +10,7 @@
 Driver lidar + imu ────────┐
 camera rgb ────────────────┼─> ControlledSemanticSpatial card (ActuCore container)
 collection rgb_v2 + depth_v2 ─┤   ├─ FAST-LIVO2 mapping/localization child process
-optional goal_pose ────────┘      ├─ Nav2 planner/controller child process
+                            ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
                                       |
                                       `─ velocity_proposal -> Driver loco
@@ -23,8 +23,8 @@ optional goal_pose ────────┘      ├─ Nav2 planner/controll
   `collection_status` 作为只读公共图像输出，供 Canvas 查看最新同步 RGB、
   当前采集帧号和 LiDAR 障碍物距离标注；停止后同一端口切换为离线导出
   进度与失败原因。机器诊断保留在内部 JSON topic。
-- VLN 命中地点后直接调用同卡片 planner；无论是 Canvas、
-  `goal_pose` topic 还是 VLN 入口，planner 都为每个新任务生成独立
+- VLN 命中地点后直接调用同卡片 planner；无论是 Canvas 还是 VLN 入口，
+  planner 都为每个新任务生成独立
   `nav_id`。终态到达时只发布一次零速 proposal，不会继续以 5 Hz
   刷新已结束任务；终态结果本身仍可查询和幂等重放。
 - Nav2 仍只发布 `phanthy.navigation.velocity_proposal.v1`，Driver 继续负责
@@ -39,7 +39,6 @@ optional goal_pose ────────┘      ├─ Nav2 planner/controll
 | `rgb` | `/ubuntu/camera/rgb` | 是 |
 | `rgb_v2` | `/ubuntu/navigation/camera/rgb` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE2` 封装中的标定与外参 |
 | `depth_v2` | `/ubuntu/navigation/camera/depth` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE2` 封装中的深度尺度、标定与源时间戳 |
-| `goal_pose` | `/ubuntu/navigation/goal_pose` | 否 |
 
 ## 公共输出
 
@@ -49,7 +48,6 @@ optional goal_pose ────────┘      ├─ Nav2 planner/controll
 | `status` | `/ubuntu/navigation/fast_livo2/status` | 定位、建图和运行状态 |
 | `collection_status` | `/ubuntu/navigation/fast_livo2/collection_preview` | 采集中显示 RGB/帧号/距离，停止后显示导出进度 |
 | `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | 连接 Driver `loco` 执行器 |
-| `plan` | `/plan` | 当前二维全局路径 |
 | `costmap` | `/global_costmap/costmap` | 实时全局代价地图 |
 
 `livo_odom`、registered cloud、confirmed static map 和 obstacle map 仍只由
