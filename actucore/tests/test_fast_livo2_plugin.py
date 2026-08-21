@@ -148,6 +148,18 @@ class ReceiptBackend(ReadyBackend):
         return super().execute(action, args)
 
 
+class RetryableMappingStopReceiptBackend(ReceiptBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "stop_mapping":
+            self.calls.append((action, dict(args)))
+            raise FastLivo2BackendError(
+                "manifest_write_failed",
+                "temporary persistence failure",
+                details={"retryable": True},
+            )
+        return super().execute(action, args)
+
+
 class FakeCollectionController:
     def __init__(self) -> None:
         self.runtime_states = []
@@ -306,6 +318,29 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(len(controller.receipts), 1)
         self.assertTrue(controller.receipts[0]["storage_complete"])
         self.assertTrue(controller.runtime_states[0])
+
+    def test_completed_collection_is_enqueued_when_mapping_stop_fails(self) -> None:
+        backend = RetryableMappingStopReceiptBackend()
+        controller = FakeCollectionController()
+        plugin = FastLivo2Plugin(
+            {"collection_enabled": True},
+            None,
+            backend=backend,
+            collection_controller=controller,
+        )
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch(
+            "fast_livo2", {"action": "start_mapping", "map_name": "office"}
+        )
+
+        stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(stopped["error_code"], "canvas_stop_failed")
+        self.assertTrue(stopped["retryable"])
+        self.assertEqual(len(controller.receipts), 1)
+        self.assertTrue(controller.receipts[0]["storage_complete"])
 
     def test_collection_directory_is_confined_to_mounted_root(self) -> None:
         for directory in ("relative", "/tmp/recordings", "/opt/../tmp"):

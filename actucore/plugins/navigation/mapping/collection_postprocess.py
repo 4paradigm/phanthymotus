@@ -57,6 +57,64 @@ def _atomic_bytes(path: Path, value: bytes) -> None:
     temporary.replace(path)
 
 
+def _camera_parameters(metadata: dict) -> dict:
+    try:
+        intrinsics = metadata["intrinsics"]
+        fx = float(intrinsics["fx"])
+        fy = float(intrinsics["fy"])
+        cx = float(intrinsics["cx"])
+        cy = float(intrinsics["cy"])
+        width = int(metadata["width"])
+        height = int(metadata["height"])
+        coefficients = [float(value) for value in intrinsics.get("coefficients", [])]
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise PostprocessError("camera_intrinsics_invalid") from exc
+    values = [fx, fy, cx, cy, *coefficients]
+    if (
+        fx <= 0.0
+        or fy <= 0.0
+        or width <= 0
+        or height <= 0
+        or not all(math.isfinite(value) for value in values)
+    ):
+        raise PostprocessError("camera_intrinsics_invalid")
+    return {
+        "calibration_id": metadata.get("calibration_id"),
+        "frame_id": metadata.get("frame_id"),
+        "width_px": width,
+        "height_px": height,
+        "fx_px": fx,
+        "fy_px": fy,
+        "cx_px": cx,
+        "cy_px": cy,
+        "equivalent_focal_length_px": round(math.sqrt(fx * fy), 6),
+        "distortion_model": str(intrinsics.get("distortion_model", "none")),
+        "distortion_coefficients": coefficients,
+    }
+
+
+def _pcd_bytes(points: np.ndarray) -> bytes:
+    cloud = np.asarray(points, dtype=np.float64)
+    if cloud.ndim != 2 or cloud.shape[1] != 3:
+        raise PostprocessError("lidar_points_must_be_n_by_3")
+    cloud = cloud[np.isfinite(cloud).all(axis=1)].astype("<f4", copy=False)
+    point_count = int(len(cloud))
+    header = (
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        f"WIDTH {point_count}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {point_count}\n"
+        "DATA binary\n"
+    ).encode("ascii")
+    return header + cloud.tobytes(order="C")
+
+
 def _matrix(value, field: str) -> np.ndarray:
     array = np.asarray(value, dtype=np.float64)
     if array.shape != (16,) or not np.isfinite(array).all():
@@ -362,30 +420,55 @@ def annotate_frame(
     tracker: SessionTracker,
     frame_index: int,
 ) -> dict:
+    image_stamp_ns = int(image["stamp_ns"])
+    lidar_stamp_ns = None if lidar is None else int(lidar["stamp_ns"])
+    imu_stamp_ns = None if imu is None else int(imu["stamp_ns"])
+    odom_stamp_ns = None if odom is None else int(odom["stamp_ns"])
     base = {
         "schema": ANNOTATION_SCHEMA,
         "image_id": image["image_id"],
-        "image_stamp_ns": int(image["stamp_ns"]),
+        "image_stamp_ns": image_stamp_ns,
         "image_path": image["image_path"],
+        "lidar_id": None if lidar is None else lidar.get("lidar_id"),
+        "lidar_path": None if lidar is None else lidar.get("lidar_path"),
+        "lidar_frame_id": None if lidar is None else lidar.get("frame_id"),
         "calibration_id": image["metadata"].get("calibration_id"),
         "frame_id": image["metadata"].get("frame_id"),
         "coordinate_convention": "camera_optical_x_right_y_down_z_forward",
-        "matched_lidar_stamp_ns": None if lidar is None else int(lidar["stamp_ns"]),
-        "matched_imu_stamp_ns": None if imu is None else int(imu["stamp_ns"]),
-        "matched_odom_stamp_ns": None if odom is None else int(odom["stamp_ns"]),
+        "timestamps_ns": {
+            "image_source": image_stamp_ns,
+            "image_driver_receive": image["metadata"].get("receive_stamp_ns"),
+            "lidar_source": lidar_stamp_ns,
+            "imu_source": imu_stamp_ns,
+            "odom_source": odom_stamp_ns,
+        },
+        "matched_lidar_stamp_ns": lidar_stamp_ns,
+        "matched_imu_stamp_ns": imu_stamp_ns,
+        "matched_odom_stamp_ns": odom_stamp_ns,
+        "distance_ground_truth": {
+            "source": "matched_lidar_nearest_visible_point",
+            "unit": "meter",
+            "nearest_obstacle_distance_m": None,
+        },
         "obstacles": [],
     }
+    try:
+        base["camera_parameters"] = _camera_parameters(image["metadata"])
+    except (KeyError, TypeError, ValueError, PostprocessError) as exc:
+        return {**base, "status": "invalid", "failure_reason": str(exc)}
     missing = [name for name, value in (("lidar", lidar), ("imu", imu), ("odom", odom)) if value is None]
     if missing:
         return {**base, "status": "invalid", "failure_reason": "missing_time_match:" + ",".join(missing)}
     skews = {
-        name: abs(int(value["stamp_ns"]) - int(image["stamp_ns"])) / 1_000_000.0
-        for name, value in (("lidar", lidar), ("imu", imu), ("odom", odom))
+        "image_lidar": abs(lidar_stamp_ns - image_stamp_ns) / 1_000_000.0,
+        "lidar_imu": abs(imu_stamp_ns - lidar_stamp_ns) / 1_000_000.0,
+        "image_odom": abs(odom_stamp_ns - image_stamp_ns) / 1_000_000.0,
     }
     base["time_skew_ms"] = {key: round(value, 3) for key, value in skews.items()}
-    if any(
-        value > _SYNC_TOLERANCE_NS[name] / 1_000_000.0
-        for name, value in skews.items()
+    if (
+        skews["image_lidar"] > _SYNC_TOLERANCE_NS["lidar"] / 1_000_000.0
+        or skews["lidar_imu"] > _SYNC_TOLERANCE_NS["imu"] / 1_000_000.0
+        or skews["image_odom"] > _SYNC_TOLERANCE_NS["odom"] / 1_000_000.0
     ):
         return {**base, "status": "invalid", "failure_reason": "time_skew_exceeded"}
     try:
@@ -422,11 +505,26 @@ def annotate_frame(
                         "z": round(float(nearest[2]), 6),
                     },
                     "distance_m": round(distance, 6),
+                    "distance_ground_truth_m": round(distance, 6),
                     "visible_point_count": int(len(visible_indices)),
                     "point_source": "lidar",
                 }
             )
-        return {**base, "status": "valid", "failure_reason": None, "obstacles": output}
+        ground_truth = {
+            **base["distance_ground_truth"],
+            "nearest_obstacle_distance_m": (
+                None
+                if not output
+                else min(item["distance_ground_truth_m"] for item in output)
+            ),
+        }
+        return {
+            **base,
+            "status": "valid",
+            "failure_reason": None,
+            "distance_ground_truth": ground_truth,
+            "obstacles": output,
+        }
     except (KeyError, TypeError, ValueError, PostprocessError) as exc:
         return {**base, "status": "invalid", "failure_reason": str(exc)}
 
@@ -500,6 +598,7 @@ class RosbagRecordReader:
                 yield {
                     "kind": kind,
                     "stamp_ns": stamp_ns,
+                    "frame_id": str(message.header.frame_id),
                     "points": decode_xyz_array(
                         fields=message.fields,
                         data=bytes(message.data),
@@ -576,6 +675,7 @@ class OfflineAnnotationProcessor:
             return json.loads((final / "manifest.json").read_text(encoding="utf-8"))
         partial.mkdir(parents=True, exist_ok=True)
         (partial / "rgb").mkdir(exist_ok=True)
+        (partial / "lidar").mkdir(exist_ok=True)
         (partial / "frames").mkdir(exist_ok=True)
         buffers = {
             "lidar": deque(maxlen=8),
@@ -586,6 +686,7 @@ class OfflineAnnotationProcessor:
         pending_bytes = 0
         tracker = SessionTracker()
         processed = valid = invalid = 0
+        lidar_ids: set[str] = set()
 
         def consume(image: dict) -> None:
             nonlocal processed, valid, invalid
@@ -598,10 +699,32 @@ class OfflineAnnotationProcessor:
                 "image_id": image_id,
                 "image_path": f"rgb/{image_id}.jpg",
             }
+            lidar = self._nearest(
+                buffers["lidar"], int(image["stamp_ns"]), "lidar"
+            )
+            if lidar is not None:
+                lidar_id = f"lidar-{int(lidar['stamp_ns']):019d}"
+                lidar_relative_path = f"lidar/{lidar_id}.pcd"
+                if lidar_id not in lidar_ids:
+                    _atomic_bytes(
+                        partial / lidar_relative_path,
+                        _pcd_bytes(lidar["points"]),
+                    )
+                    lidar_ids.add(lidar_id)
+                lidar = {
+                    **lidar,
+                    "lidar_id": lidar_id,
+                    "lidar_path": lidar_relative_path,
+                }
+            imu_reference_stamp_ns = (
+                int(image["stamp_ns"])
+                if lidar is None
+                else int(lidar["stamp_ns"])
+            )
             annotation = annotate_frame(
                 normalized,
-                self._nearest(buffers["lidar"], int(image["stamp_ns"]), "lidar"),
-                self._nearest(buffers["imu"], int(image["stamp_ns"]), "imu"),
+                lidar,
+                self._nearest(buffers["imu"], imu_reference_stamp_ns, "imu"),
                 self._nearest(buffers["odom"], int(image["stamp_ns"]), "odom"),
                 tracker,
                 processed,
@@ -616,7 +739,13 @@ class OfflineAnnotationProcessor:
                 "processing",
                 processed,
                 total,
-                {"current_image_stamp_ns": int(image["stamp_ns"])},
+                {
+                    "current_image_stamp_ns": int(image["stamp_ns"]),
+                    "current_lidar_id": (
+                        None if lidar is None else lidar["lidar_id"]
+                    ),
+                    "generated_lidar_frames": len(lidar_ids),
+                },
             )
 
         for record in reader.iter_records():
@@ -655,8 +784,17 @@ class OfflineAnnotationProcessor:
             "session_directory": str(session),
             "total_images": total,
             "processed_images": processed,
+            "lidar_frames": len(lidar_ids),
             "valid_images": valid,
             "invalid_images": invalid,
+            "artifacts": {
+                "rgb": {"directory": "rgb", "format": "jpeg"},
+                "lidar": {
+                    "directory": "lidar",
+                    "format": "pcd_binary_xyz_float32_m",
+                },
+                "frames": {"directory": "frames", "format": "json"},
+            },
             "completed_unix_ms": int(time.time() * 1000),
         }
         _atomic_json(partial / "manifest.json", manifest)
@@ -707,6 +845,7 @@ class CollectionPostprocessManager:
             "session_id": None,
             "processed_images": 0,
             "total_images": 0,
+            "generated_lidar_frames": 0,
             "percent": 0.0,
             "output_directory": None,
             "paused_reason": None,
@@ -865,6 +1004,9 @@ class CollectionPostprocessManager:
                         percent=100.0,
                         processed_images=int(manifest.get("processed_images", 0)),
                         total_images=int(manifest.get("total_images", 0)),
+                        generated_lidar_frames=int(
+                            manifest.get("lidar_frames", 0)
+                        ),
                         failure_reason=(
                             "invalid_frames_present" if final_state == "degraded" else None
                         ),

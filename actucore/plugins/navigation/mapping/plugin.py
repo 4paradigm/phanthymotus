@@ -317,6 +317,10 @@ class FastLivo2Plugin:
             )
         else:
             collection_stop_result = None
+        if isinstance(collection_stop_result, dict):
+            self._collection_controller.enqueue_receipt(
+                collection_stop_result.get("receipt")
+            )
         failures = [
             result
             for result in (stop_result, collection_stop_result)
@@ -341,10 +345,6 @@ class FastLivo2Plugin:
                 "retryable": retryable,
                 "physical_execution": False,
             }
-        if isinstance(collection_stop_result, dict):
-            self._collection_controller.enqueue_receipt(
-                collection_stop_result.get("receipt")
-            )
         self._release_core()
         return {
             "state": "idle",

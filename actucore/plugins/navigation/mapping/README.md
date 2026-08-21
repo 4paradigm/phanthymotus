@@ -321,8 +321,8 @@ system-time 时钟域的软件对齐证据，不等同于 PTP、外部触发或�
   `recording_empty` 明确标记为不健康；
 - `postprocess.state/stage`: `queued` / `scanning` / `processing` / `paused` /
   `finalizing` / `complete` / `degraded` / `error`；
-- `processed_images`、`total_images`、`percent`、`paused_reason` 与
-  `failure_reason`。
+- `processed_images`、`total_images`、`generated_lidar_frames`、`percent`、
+  `paused_reason` 与 `failure_reason`。
 
 Canvas `stop` 只有在算法和采集都确认停止后才返回
 `state/status=idle`；任一收口失败时返回顶层
@@ -330,6 +330,8 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 `collection_stop_result.status`、`receipt.storage_complete` 和 `receipt.state`：
 只有 `storage_complete=true` 才会将 `.partial` 改名为最终目录；
 `state=degraded` 表示存储完整但存在缺失/过期源，仍应按降级验收。
+已经原子落盘的 receipt 会立即交给后台处理器，即使同一次 Canvas `stop`
+还因地图 manifest 等独立问题返回失败，也不会阻断数据集生成。
 采集启停在内部串行；rosbag 启动早退时会保留 `.partial`
 并写入 `state=failed/storage_complete=false` receipt，不会冒充完整 session。
 
@@ -338,14 +340,23 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 `missing_sources` 或解码失败；不会回退到无标定的旧 RGB/Depth。
 
 停止 receipt 保存 `time_alignment`。MCAP 完成并原子收口后，ActuCore
-父进程的后台 worker 自动生成 `derived/`：
+父进程的后台 worker 直接在 G1 本体生成可交付的 `derived/`，用户不需要安装
+MCAP/ROS 工具再手工解包：
 
 - `rgb/frame-XXXXXXXX.jpg`：原始 JPEG；
-- `frames/frame-XXXXXXXX.json`：每帧的障碍物 ID、相机光学坐标系最近
-  LiDAR 三维点、直线距离、匹配时间戳与失败原因；
+- `lidar/lidar-<source_stamp_ns>.pcd`：与图片配对的 binary PCD，XYZ 为
+  little-endian float32 米；同一雷达帧被多张图片复用时只保存一份；
+- `frames/frame-XXXXXXXX.json`：逐图记录图片 ID/路径、雷达 ID/路径、各路
+  source timestamp、相机宽高与 `fx/fy/cx/cy`、像素单位等效焦距
+  `sqrt(fx*fy)`、畸变参数、障碍物 ID、相机光学坐标系最近 LiDAR 三维点、
+  LiDAR 距离真值与失败原因；
 - `tracks.json`：session 内稳定的 `obs-XXXXXX` 轨迹 ID；
-- `manifest.json`：总帧数、有效/无效帧数与最终状态；
+- `manifest.json`：总图片/雷达帧数、有效/无效帧数、产物格式与最终状态；
 - `postprocess.json`：可读回的任务进度/错误日志。
+
+这里的“等效焦距”明确使用像素单位；没有传感器物理尺寸时不会伪造毫米焦距。
+“距离真值”来自配对 LiDAR 中投影到该图片且属于障碍物的最近可见三维点，
+不是单目估计值。原始 MCAP 继续保留完整 ROS 消息，作为可追溯源数据。
 
 流程使用 IMU 重力方向移除地面、LiDAR 点云做几何聚类，再通过
 标定外参投影到每张 RGB；Depth v2 当前作为同步原始证据保存，尚不参与

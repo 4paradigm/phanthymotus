@@ -243,7 +243,13 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
                 "stamp_ns": stamp,
                 "metadata": metadata(stamp),
             },
-            {"stamp_ns": stamp, "points": synthetic_points()},
+            {
+                "stamp_ns": stamp,
+                "frame_id": "livox_frame",
+                "lidar_id": f"lidar-{stamp:019d}",
+                "lidar_path": f"lidar/lidar-{stamp:019d}.pcd",
+                "points": synthetic_points(),
+            },
             {"stamp_ns": stamp, "gravity": np.asarray((0.0, 0.0, -9.81))},
             {"stamp_ns": stamp, "t_map_base": np.eye(4)},
             SessionTracker(),
@@ -256,12 +262,33 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
         point = obstacle["nearest_point_camera_m"]
         expected = (point["x"] ** 2 + point["y"] ** 2 + point["z"] ** 2) ** 0.5
         self.assertAlmostEqual(obstacle["distance_m"], expected, places=5)
+        self.assertAlmostEqual(
+            obstacle["distance_ground_truth_m"], expected, places=5
+        )
+        self.assertEqual(result["lidar_frame_id"], "livox_frame")
+        self.assertEqual(result["camera_parameters"]["equivalent_focal_length_px"], 100.0)
+        self.assertAlmostEqual(
+            result["distance_ground_truth"]["nearest_obstacle_distance_m"],
+            expected,
+            places=5,
+        )
 
     def test_processor_writes_one_json_per_image_and_atomic_manifest(self) -> None:
         stamp = metadata()["source_stamp_ns"]
+        lidar_stamp = stamp + 50_000_000
+        imu_stamp = lidar_stamp + 1_000_000
         records = [
-            {"kind": "lidar", "stamp_ns": stamp, "points": synthetic_points()},
-            {"kind": "imu", "stamp_ns": stamp, "gravity": np.asarray((0.0, 0.0, -9.81))},
+            {
+                "kind": "lidar",
+                "stamp_ns": lidar_stamp,
+                "frame_id": "livox_frame",
+                "points": synthetic_points(),
+            },
+            {
+                "kind": "imu",
+                "stamp_ns": imu_stamp,
+                "gravity": np.asarray((0.0, 0.0, -9.81)),
+            },
             {"kind": "odom", "stamp_ns": stamp, "t_map_base": np.eye(4)},
             {
                 "kind": "rgb_v2",
@@ -281,11 +308,36 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
                 lambda: None,
             )
             self.assertEqual(manifest["processed_images"], 1)
+            self.assertEqual(manifest["lidar_frames"], 1)
             self.assertTrue((session / "derived" / "rgb" / "frame-00000001.jpg").is_file())
+            lidar_id = f"lidar-{lidar_stamp:019d}"
+            lidar_path = session / "derived" / "lidar" / f"{lidar_id}.pcd"
+            self.assertTrue(lidar_path.is_file())
+            lidar_payload = lidar_path.read_bytes()
+            self.assertIn(b"FIELDS x y z\n", lidar_payload[:256])
+            lidar_header, lidar_binary = lidar_payload.split(b"DATA binary\n", 1)
+            self.assertIn(
+                f"POINTS {len(synthetic_points())}\n".encode("ascii"), lidar_header
+            )
+            self.assertEqual(len(lidar_binary), len(synthetic_points()) * 3 * 4)
             frame_path = session / "derived" / "frames" / "frame-00000001.json"
             self.assertTrue(frame_path.is_file())
             frame = json.loads(frame_path.read_text(encoding="utf-8"))
             self.assertEqual(frame["schema"], "phanthy.navigation.obstacle_frame.v1")
+            self.assertEqual(frame["lidar_id"], lidar_id)
+            self.assertEqual(frame["lidar_path"], f"lidar/{lidar_id}.pcd")
+            self.assertEqual(frame["timestamps_ns"]["image_source"], stamp)
+            self.assertEqual(frame["timestamps_ns"]["lidar_source"], lidar_stamp)
+            self.assertEqual(frame["timestamps_ns"]["imu_source"], imu_stamp)
+            self.assertEqual(frame["time_skew_ms"]["image_lidar"], 50.0)
+            self.assertEqual(frame["time_skew_ms"]["lidar_imu"], 1.0)
+            self.assertEqual(
+                frame["camera_parameters"]["equivalent_focal_length_px"], 100.0
+            )
+            self.assertEqual(
+                manifest["artifacts"]["lidar"]["format"],
+                "pcd_binary_xyz_float32_m",
+            )
             self.assertFalse((session / "derived.partial").exists())
             self.assertEqual(events[-1][0], "finalizing")
 
