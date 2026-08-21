@@ -48,8 +48,9 @@ Driver navigation_sensors
 frame 不符时同容器 adapter 不发布伪造的 canonical odom/cloud。
 adapter 对 FAST-LIVO2 原始 odom/cloud 使用
 `BEST_EFFORT + KEEP_LAST(1)`，慢回调只保留最新样本，不把旧帧排成约
-0.5 秒的内部积压。接收 age 仍使用 500 ms 上限，对源时间戳另保留
-50 ms 有界调度抖动；约 0.51 s 的边界帧可接受，超过 0.55 s 仍拒绝。live
+0.5 秒的内部积压。Nav2 readiness 容许最多 `0.8 s` 接收调度抖动，
+并每次从最新 header stamp 重算源数据 age；源 age 超过 `1.0 s`
+仍 fail closed，不会因为缓存的旧 age 伪装成新鲜数据。live
 PointCloud2 的 XYZ 解码、刚体变换、高度过滤和 float32 输出打包走 NumPy
 批处理；边界、字段、有限值、点数和字节上限仍在发布前 fail closed。
 
@@ -250,7 +251,9 @@ fail closed。
 启用后，同容器 adapter 从以下 Driver/卡片输入中选择每秒一组时间戳对齐的
 多模态快照，再通过内部 `collection/*` topic 交给 ROS 2 原生 rosbag2 MCAP
 后端。FAST-LIVO2 和 Nav2 仍按原始频率消费输入；1 Hz 只限制数采旁路，不会
-降低定位或避障频率。每条被选消息保留原始 CDR payload 和源时间戳：
+降低定位或避障频率。数采旁路对五路输入统一使用
+`BEST_EFFORT + KEEP_LAST(4)`；CPU 拥堵时丢弃过时样本，不回放高频 IMU/LiDAR
+积压。每条被选消息保留原始 CDR payload 和源时间戳：
 每次以 RGB frame 为快照锚点，先选取最近的 Depth frame、LiDAR 和 Odom，
 再以已选 LiDAR 的时间戳选取最近 IMU。因此 `20 ms` 门槛限制的是
 LiDAR/IMU 运动对齐，不会错误要求高频 IMU 同时贴近 RGB 锚点。

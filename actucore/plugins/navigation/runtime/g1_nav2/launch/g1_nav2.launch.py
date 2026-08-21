@@ -119,7 +119,7 @@ def generate_launch_description() -> LaunchDescription:
                         "obstacle_cloud_topic": obstacle_cloud_topic,
                         "global_costmap_topic": "/global_costmap/costmap",
                         "goal_costmap_max_age_sec": 2.0,
-                        "sensor_max_age_sec": 0.5,
+                        "sensor_max_age_sec": 0.8,
                         "sensor_source_max_age_sec": 1.0,
                         "terminal_xy_tolerance_m": 0.18,
                         "terminal_yaw_tolerance_rad": 0.45,

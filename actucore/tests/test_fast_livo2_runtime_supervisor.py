@@ -121,6 +121,21 @@ def _prepare_adapter_concurrency(adapter) -> None:
 
 
 class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
+    def test_collection_subscriptions_drop_backlog_instead_of_replaying_it(self) -> None:
+        source = (
+            PACKAGE_ROOT
+            / "g1_fast_livo2"
+            / "runtime_supervisor.py"
+        ).read_text(encoding="utf-8")
+        method = source.split(
+            "    def _create_collection_subscriptions", 1
+        )[1].split("    def _on_collection_sample", 1)[0]
+
+        self.assertIn("depth=4", method)
+        self.assertIn("ReliabilityPolicy.BEST_EFFORT", method)
+        self.assertNotIn("ReliabilityPolicy.RELIABLE", method)
+        self.assertNotIn("depth=200", method)
+
     def test_cached_map_view_refreshes_pose_without_reencoding_points(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()

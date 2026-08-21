@@ -161,12 +161,6 @@ class FastLivo2Supervisor(Node):
         }
 
     def _create_collection_subscriptions(self) -> list:
-        reliable_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=200,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
         sensor_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=4,
@@ -177,7 +171,6 @@ class FastLivo2Supervisor(Node):
         subscriptions = []
         for item in COLLECTION_SOURCES:
             port = item["port"]
-            qos = reliable_qos if port in {"lidar", "imu"} else sensor_qos
             subscriptions.append(
                 self.create_subscription(
                     message_types[port],
@@ -185,7 +178,7 @@ class FastLivo2Supervisor(Node):
                     lambda message, source_port=port: self._on_collection_sample(
                         source_port, message
                     ),
-                    qos,
+                    sensor_qos,
                 )
             )
         return subscriptions

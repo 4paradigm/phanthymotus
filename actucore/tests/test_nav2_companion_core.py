@@ -390,6 +390,24 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(boundary_jitter["sensor_receive_max_age_sec"], 0.5)
         self.assertEqual(boundary_jitter["sensor_source_max_age_sec"], 1.0)
 
+        scheduler_jitter = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.8,
+            source_max_age_sec=1.0,
+            odom_received_at=9.37,
+            odom_source_age_sec=0.63,
+            odom_frame_ready=True,
+            obstacle_received_at=9.37,
+            obstacle_source_age_sec=0.63,
+            obstacle_frame_ready=True,
+            source_transform_ready=True,
+            source_stamp_skew_sec=0.01,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertTrue(scheduler_jitter["navigation_ready"])
+
     def test_goal_cell_is_checked_before_nav2_action_dispatch(self) -> None:
         snapshot = CostmapSnapshot.from_values(
             frame_id="map",
@@ -647,8 +665,18 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertIn('"terminal_xy_tolerance_m": 0.18', launch)
         self.assertIn('"terminal_yaw_tolerance_rad": 0.45', launch)
-        self.assertIn('"sensor_max_age_sec": 0.5', launch)
+        self.assertIn('"sensor_max_age_sec": 0.8', launch)
         self.assertIn('"sensor_source_max_age_sec": 1.0', launch)
+        self.assertIn(
+            "odom_source_age = self._source_age(odom_source_stamp_ns)",
+            command,
+        )
+        self.assertIn(
+            "obstacle_source_age = self._source_age(obstacle_source_stamp_ns)",
+            command,
+        )
+        self.assertNotIn("_last_odom_source_age_sec", command)
+        self.assertNotIn("_last_obstacle_source_age_sec", command)
         self.assertIn('"goal_xy_tolerance_m": 0.20', launch)
         self.assertIn('"goal_yaw_tolerance_rad": 0.50', launch)
         self.assertIn("xy_goal_tolerance: 0.20", params)

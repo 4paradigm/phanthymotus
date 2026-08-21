@@ -108,7 +108,7 @@ class PlannerCommandNode(Node):
         )
         self.declare_parameter("global_costmap_topic", "/global_costmap/costmap")
         self.declare_parameter("goal_costmap_max_age_sec", 2.0)
-        self.declare_parameter("sensor_max_age_sec", 0.5)
+        self.declare_parameter("sensor_max_age_sec", 0.8)
         self.declare_parameter("sensor_source_max_age_sec", 1.0)
         self.declare_parameter("terminal_xy_tolerance_m", 0.18)
         self.declare_parameter("terminal_yaw_tolerance_rad", 0.45)
@@ -347,12 +347,10 @@ class PlannerCommandNode(Node):
         self._latest_proposal_candidate: dict | None = None
         self._last_published_proposal: dict | None = None
         self._last_odom_monotonic: float | None = None
-        self._last_odom_source_age_sec: float | None = None
         self._last_odom_source_stamp_ns: int | None = None
         self._last_odom_frame_ready = False
         self._last_odom_pose: Pose2D | None = None
         self._last_obstacle_monotonic: float | None = None
-        self._last_obstacle_source_age_sec: float | None = None
         self._last_obstacle_source_stamp_ns: int | None = None
         self._last_obstacle_frame_ready = False
         self._global_costmap: CostmapSnapshot | None = None
@@ -379,7 +377,6 @@ class PlannerCommandNode(Node):
         )
         with self._lock:
             self._last_odom_monotonic = time.monotonic()
-            self._last_odom_source_age_sec = self._source_age(stamp_ns)
             self._last_odom_source_stamp_ns = stamp_ns
             self._last_odom_frame_ready = (
                 message.header.frame_id.strip("/") == self._global_frame.strip("/")
@@ -395,7 +392,6 @@ class PlannerCommandNode(Node):
         stamp_ns = _stamp_ns(message)
         with self._lock:
             self._last_obstacle_monotonic = time.monotonic()
-            self._last_obstacle_source_age_sec = self._source_age(stamp_ns)
             self._last_obstacle_source_stamp_ns = stamp_ns
             self._last_obstacle_frame_ready = (
                 message.header.frame_id.strip("/") == self._global_frame.strip("/")
@@ -458,14 +454,14 @@ class PlannerCommandNode(Node):
     def _readiness(self) -> dict:
         with self._lock:
             odom_received_at = self._last_odom_monotonic
-            odom_source_age = self._last_odom_source_age_sec
             odom_source_stamp_ns = self._last_odom_source_stamp_ns
             odom_frame_ready = self._last_odom_frame_ready
             obstacle_received_at = self._last_obstacle_monotonic
-            obstacle_source_age = self._last_obstacle_source_age_sec
             obstacle_source_stamp_ns = self._last_obstacle_source_stamp_ns
             obstacle_frame_ready = self._last_obstacle_frame_ready
             lifecycle_states = dict(self._lifecycle_states)
+        odom_source_age = self._source_age(odom_source_stamp_ns)
+        obstacle_source_age = self._source_age(obstacle_source_stamp_ns)
         source_skew = None
         if odom_source_stamp_ns is not None and obstacle_source_stamp_ns is not None:
             source_skew = abs(
