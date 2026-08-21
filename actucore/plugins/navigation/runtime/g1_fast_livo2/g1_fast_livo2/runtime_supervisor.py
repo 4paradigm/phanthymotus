@@ -223,9 +223,19 @@ class FastLivo2Supervisor(Node):
 
         with self._lock:
             if source_stamp_ns is None and metadata.get("decode_error"):
+                self._collection_health.observe(
+                    port,
+                    source_stamp_ns=None,
+                )
                 self._collection_health.observe_error(
                     port, str(metadata["decode_error"])
                 )
+                return
+            self._collection_health.observe(
+                port,
+                source_stamp_ns=source_stamp_ns,
+                metadata=metadata,
+            )
             bundle = self._collection_sampler.observe(
                 port,
                 source_stamp_ns=source_stamp_ns,
@@ -239,11 +249,7 @@ class FastLivo2Supervisor(Node):
                 sample["message"]
             )
             with self._lock:
-                self._collection_health.observe(
-                    source_port,
-                    source_stamp_ns=int(sample["source_stamp_ns"]),
-                    metadata=sample["metadata"],
-                )
+                self._collection_health.observe_sampled(source_port)
 
     def _on_diagnostics(self, message: String) -> None:
         try:
@@ -477,11 +483,13 @@ class FastLivo2Supervisor(Node):
             partial_dir = self._collection_partial_dir
             final_dir = self._collection_final_dir
             self._collection_sampler.stop()
+            sampling_status = self._collection_sampler.snapshot()
             source_status = self._collection_health.snapshot(
                 process_running=process is not None and process.poll() is None,
                 process_return_code=None if process is None else process.poll(),
                 process_error=self._collection_error,
             )
+            source_status["sampling"] = sampling_status
             was_enabled = source_status["enabled"]
         if process is None and not was_enabled:
             return {
@@ -567,6 +575,7 @@ class FastLivo2Supervisor(Node):
             ),
             "sources": source_status["sources"],
             "time_alignment": source_status["time_alignment"],
+            "sampling": source_status["sampling"],
             "recording": recording,
         }
         if partial_dir is not None and partial_dir.is_dir():
@@ -614,6 +623,7 @@ class FastLivo2Supervisor(Node):
                 process_return_code=return_code,
                 process_error=self._collection_error,
             )
+            result["sampling"] = self._collection_sampler.snapshot()
             result["pid"] = (
                 process.pid if process is not None and return_code is None else None
             )

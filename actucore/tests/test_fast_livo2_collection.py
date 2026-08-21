@@ -275,10 +275,70 @@ class FastLivo2CollectionTest(unittest.TestCase):
             )
         )
 
+    def test_sampler_matches_imu_to_selected_lidar_not_rgb(self) -> None:
+        sampler = CollectionSampler(interval_sec=1.0)
+        sampler.start()
+        base = 1_700_000_000_000_000_000
+        for port, offset_ms in (
+            ("depth_v2", 100),
+            ("lidar", 50),
+            ("imu", 51),
+            ("odom", 0),
+        ):
+            sampler.observe(
+                port,
+                source_stamp_ns=base + offset_ms * 1_000_000,
+                message=port,
+                metadata={"port": port},
+                now_monotonic=10.0,
+            )
+
+        bundle = sampler.observe(
+            "rgb_v2",
+            source_stamp_ns=base,
+            message="rgb",
+            metadata={"port": "rgb_v2"},
+            now_monotonic=10.0,
+        )
+
+        self.assertIsNotNone(bundle)
+        self.assertEqual(bundle["imu"]["source_stamp_ns"], base + 51_000_000)
+        self.assertEqual(sampler.snapshot()["emitted_count"], 1)
+
+    def test_sampler_exposes_rejection_reason(self) -> None:
+        sampler = CollectionSampler(interval_sec=1.0)
+        sampler.start()
+
+        self.assertIsNone(
+            sampler.observe(
+                "rgb_v2",
+                source_stamp_ns=1_700_000_000_000_000_000,
+                message="rgb",
+                metadata=None,
+                now_monotonic=10.0,
+            )
+        )
+
+        status = sampler.snapshot()
+        self.assertEqual(status["emitted_count"], 0)
+        self.assertEqual(status["last_rejection_reason"], "missing_depth_v2")
+        self.assertEqual(status["rejections"], {"missing_depth_v2": 1})
+
+    def test_health_separates_source_arrival_from_sampled_count(self) -> None:
+        health = CollectionHealth()
+        health.start("session-counts", "/recordings/session-counts")
+        health.observe("lidar", source_stamp_ns=1_700_000_000_000_000_000)
+        health.observe_sampled("lidar")
+
+        source = health.snapshot(process_running=True)["sources"]["lidar"]
+        self.assertEqual(source["count"], 1)
+        self.assertEqual(source["sampled_count"], 1)
+
     def test_recording_summary_exposes_rosbag_loss(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             observed = {
-                item["port"]: {"count": 10} for item in COLLECTION_SOURCES
+                item["port"]: {"count": 100, "sampled_count": 10}
+                for item in COLLECTION_SOURCES
             }
             entries = []
             for item in COLLECTION_SOURCES:
@@ -310,6 +370,33 @@ class FastLivo2CollectionTest(unittest.TestCase):
             self.assertEqual(
                 summary["topics"]["imu"]["recording_coverage"], 0.2
             )
+            self.assertEqual(
+                summary["topics"]["imu"]["source_observed_count"], 100
+            )
+
+    def test_empty_rosbag_is_never_reported_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n"
+                "  message_count: 0\n"
+                "  duration:\n"
+                "    nanoseconds: 0\n"
+                "  topics_with_message_count: []\n",
+                encoding="utf-8",
+            )
+            observed = {
+                item["port"]: {"count": 12, "sampled_count": 0}
+                for item in COLLECTION_SOURCES
+            }
+
+            summary = read_rosbag_recording_summary(temporary, observed)
+
+            self.assertFalse(summary["healthy"])
+            self.assertEqual(summary["failure_reasons"], ["recording_empty"])
+            self.assertEqual(
+                summary["topics"]["lidar"]["source_observed_count"], 12
+            )
+            self.assertEqual(summary["topics"]["lidar"]["sampled_count"], 0)
 
     def test_finalize_writes_receipt_and_only_renames_complete_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_root:

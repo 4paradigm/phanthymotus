@@ -60,10 +60,9 @@ ALIGNMENT_PAIRS = (
     ("depth_v2", "lidar", 60.0),
 )
 COLLECTION_SAMPLE_INTERVAL_SEC = 1.0
-_COLLECTION_MATCH_LIMIT_MS = {
+_RGB_ANCHOR_MATCH_LIMIT_MS = {
     "depth_v2": 150.0,
     "lidar": 60.0,
-    "imu": 20.0,
     "odom": 120.0,
 }
 
@@ -167,28 +166,33 @@ def read_rosbag_recording_summary(
             "topics": {},
         }
 
-    reasons = []
+    message_count = int(information.get("message_count", 0))
+    reasons = ["recording_empty"] if message_count == 0 else []
     topics = {}
     for item in COLLECTION_SOURCES:
         port = item["port"]
-        observed = int(observed_sources.get(port, {}).get("count", 0))
+        source = observed_sources.get(port, {})
+        source_observed = int(source.get("count", 0))
+        sampled = int(source.get("sampled_count", source_observed))
         recorded = int(topic_counts.get(item["record_topic"], 0))
-        coverage = min(1.0, recorded / observed) if observed else 0.0
+        coverage = min(1.0, recorded / sampled) if sampled else 0.0
         topics[port] = {
             "source_topic": item["topic"],
             "record_topic": item["record_topic"],
-            "observed_count": observed,
+            "source_observed_count": source_observed,
+            "observed_count": sampled,
+            "sampled_count": sampled,
             "recorded_count": recorded,
             "recording_coverage": round(coverage, 6),
         }
-        if observed > 0 and coverage < 0.9:
+        if sampled > 0 and coverage < 0.9:
             reasons.append(f"{port}:recording_coverage")
     return {
         "healthy": not reasons,
         "failure_reasons": reasons,
         "error": None,
         "topics": topics,
-        "message_count": int(information.get("message_count", 0)),
+        "message_count": message_count,
         "duration_ns": int(information.get("duration", {}).get("nanoseconds", 0)),
     }
 
@@ -200,6 +204,9 @@ class CollectionSampler:
         self._interval_sec = float(interval_sec)
         self._enabled = False
         self._last_emit_monotonic: float | None = None
+        self._emitted_count = 0
+        self._rejections: dict[str, int] = {}
+        self._last_rejection_reason: str | None = None
         limits = {
             "lidar": 32,
             "imu": 256,
@@ -215,6 +222,9 @@ class CollectionSampler:
     def start(self) -> None:
         self._enabled = True
         self._last_emit_monotonic = None
+        self._emitted_count = 0
+        self._rejections.clear()
+        self._last_rejection_reason = None
         for buffer in self._buffers.values():
             buffer.clear()
 
@@ -226,6 +236,20 @@ class CollectionSampler:
         self._enabled = False
         for buffer in self._buffers.values():
             buffer.clear()
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": self._enabled,
+            "sample_interval_sec": self._interval_sec,
+            "emitted_count": self._emitted_count,
+            "rejections": dict(sorted(self._rejections.items())),
+            "last_rejection_reason": self._last_rejection_reason,
+        }
+
+    def _reject(self, reason: str) -> None:
+        self._rejections[reason] = self._rejections.get(reason, 0) + 1
+        self._last_rejection_reason = reason
+        return None
 
     def observe(
         self,
@@ -260,10 +284,10 @@ class CollectionSampler:
 
         anchor = int(source_stamp_ns)
         bundle = {"rgb_v2": sample}
-        for candidate_port, limit_ms in _COLLECTION_MATCH_LIMIT_MS.items():
+        for candidate_port, limit_ms in _RGB_ANCHOR_MATCH_LIMIT_MS.items():
             candidates = self._buffers[candidate_port]
             if not candidates:
-                return None
+                return self._reject(f"missing_{candidate_port}")
             nearest = min(
                 candidates,
                 key=lambda value: abs(int(value["source_stamp_ns"]) - anchor),
@@ -272,8 +296,18 @@ class CollectionSampler:
                 abs(int(nearest["source_stamp_ns"]) - anchor)
                 > int(limit_ms * 1_000_000)
             ):
-                return None
+                return self._reject(f"skew_rgb_v2_{candidate_port}")
             bundle[candidate_port] = nearest
+        imu_candidates = self._buffers["imu"]
+        if not imu_candidates:
+            return self._reject("missing_imu")
+        lidar_stamp = int(bundle["lidar"]["source_stamp_ns"])
+        bundle["imu"] = min(
+            imu_candidates,
+            key=lambda value: abs(
+                int(value["source_stamp_ns"]) - lidar_stamp
+            ),
+        )
         for first, second, limit_ms in ALIGNMENT_PAIRS:
             if (
                 abs(
@@ -282,8 +316,9 @@ class CollectionSampler:
                 )
                 > int(limit_ms * 1_000_000)
             ):
-                return None
+                return self._reject(f"skew_{first}_{second}")
         self._last_emit_monotonic = now
+        self._emitted_count += 1
         return bundle
 
 
@@ -330,6 +365,9 @@ class CollectionHealth:
         self._session_id: str | None = None
         self._directory: str | None = None
         self._counts = {item["port"]: 0 for item in COLLECTION_SOURCES}
+        self._sampled_counts = {
+            item["port"]: 0 for item in COLLECTION_SOURCES
+        }
         self._last_receive_monotonic = {
             item["port"]: None for item in COLLECTION_SOURCES
         }
@@ -372,6 +410,7 @@ class CollectionHealth:
         self._directory = str(directory)
         for port in self._counts:
             self._counts[port] = 0
+            self._sampled_counts[port] = 0
             self._last_receive_monotonic[port] = None
             self._last_source_stamp_ns[port] = None
             self._source_stamp_counts[port] = 0
@@ -380,6 +419,11 @@ class CollectionHealth:
             self._receive_delays_ns[port].clear()
             self._source_metadata[port] = None
             self._source_errors[port] = None
+
+    def observe_sampled(self, port: str) -> None:
+        if not self._enabled or port not in self._sampled_counts:
+            return
+        self._sampled_counts[port] += 1
 
     def observe_error(self, port: str, error: str) -> None:
         if not self._enabled or port not in self._source_errors:
@@ -446,6 +490,7 @@ class CollectionHealth:
             sources[port] = {
                 **item,
                 "count": count,
+                "sampled_count": int(self._sampled_counts[port]),
                 "last_receive_age_sec": (
                     None if last is None else round(max(0.0, now - last), 3)
                 ),
@@ -558,6 +603,12 @@ class CollectionHealth:
                     "source_decode_errors:" + ",".join(source_errors)
                     if source_errors
                     else "missing_sources:" + ",".join(missing)
+                )
+            elif source_errors:
+                state = "degraded"
+                healthy = False
+                failure_reason = "source_decode_errors:" + ",".join(
+                    source_errors
                 )
             elif stale:
                 state = "degraded"

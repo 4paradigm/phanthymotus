@@ -251,6 +251,9 @@ fail closed。
 多模态快照，再通过内部 `collection/*` topic 交给 ROS 2 原生 rosbag2 MCAP
 后端。FAST-LIVO2 和 Nav2 仍按原始频率消费输入；1 Hz 只限制数采旁路，不会
 降低定位或避障频率。每条被选消息保留原始 CDR payload 和源时间戳：
+每次以 RGB v2 为快照锚点，先选取最近的 Depth v2、LiDAR 和 Odom，
+再以已选 LiDAR 的时间戳选取最近 IMU。因此 `20 ms` 门槛限制的是
+LiDAR/IMU 运动对齐，不会错误要求高频 IMU 同时贴近 RGB 锚点。
 
 | 数据 | topic | ROS type / QoS |
 | --- | --- | --- |
@@ -304,13 +307,18 @@ system-time 时钟域的软件对齐证据，不等同于 PTP、外部触发或�
 
 - 录制 `state`: `disabled | starting | recording | degraded | error`；
 - 当前 session、落盘目录和 rosbag PID；
-- 每路 topic 的消息计数、最近接收年龄、源时间戳和 publisher 数量；
+- 每路 topic 的原始到达 `count`、1 Hz 对齐快照 `sampled_count`、
+  最近接收年龄、源时间戳和 publisher 数量；
 - `missing_sources`、`stale_sources` 与 `failure_reason`；
+- `sampling.emitted_count`、`sampling.rejections` 和
+  `sampling.last_rejection_reason`，用于区分缺源与具体时间对齐失败；
 - `time_alignment.alignment_ready`、每路时间戳覆盖率/单调性，以及五组
   `nearest_skew_ms` 的 P50、P95、最大值和阈值；
 - 上一次停止时的 receipt 和最终目录；
-- receipt 中每路 `recorded_count` / `recording_coverage`，用于直接暴露
-  rosbag 实际落盘数量与卡片发出的快照数量是否一致；
+- receipt 中每路 `sampled_count` / `recorded_count` /
+  `recording_coverage`，用于直接暴露 rosbag 实际落盘数量与卡片发出的
+  快照数量是否一致；即使各路采样数都为 0，空 MCAP 也会以
+  `recording_empty` 明确标记为不健康；
 - `postprocess.state/stage`: `queued` / `scanning` / `processing` / `paused` /
   `finalizing` / `complete` / `degraded` / `error`；
 - `processed_images`、`total_images`、`percent`、`paused_reason` 与
