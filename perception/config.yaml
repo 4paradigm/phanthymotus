@@ -21,9 +21,13 @@ plugins:
 
   tts:
     enabled: true
-    model_dir: /models/sherpa-onnx/tts
+    engine: vits2_trt
+    backend: trt
+    model_dir: /models/vits2
     speaker_id: 0
     speed: 1.0
+    warmup: true
+    max_chunk_tokens: 256
 
   htmsg:
     enabled: true

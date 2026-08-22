@@ -485,7 +485,7 @@ class _TTSNode(Node):
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
 
-class TTSPlugin:
+class SherpaOnnxTTSPlugin:
     PREFIX = "tts"
 
     def __init__(self, plugin_cfg: dict, executor):
@@ -713,3 +713,17 @@ class TTSPlugin:
         if not self._adapter:
             raise RuntimeError("TTS adapter not configured")
         return self._adapter.synthesize(text)
+
+
+class TTSPlugin:
+    """The single public TTS plugin, with a config-selected implementation."""
+
+    def __new__(cls, plugin_cfg: dict, executor):
+        engine = str(plugin_cfg.get("engine", "sherpa_onnx")).strip().lower()
+        if engine == "vits2_trt":
+            from plugins.vits2_tts import Vits2TTSPlugin
+
+            return Vits2TTSPlugin(plugin_cfg, executor)
+        if engine == "sherpa_onnx":
+            return SherpaOnnxTTSPlugin(plugin_cfg, executor)
+        raise ValueError(f"Unsupported TTS engine: {engine}")

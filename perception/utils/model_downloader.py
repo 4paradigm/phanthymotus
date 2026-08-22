@@ -6,10 +6,17 @@ from __future__ import annotations
 
 import logging
 import os
+import fcntl
+import hashlib
+import json
+import shutil
 import tarfile
 import tempfile
 import zipfile
+from pathlib import Path
+from urllib.parse import quote
 from urllib.request import urlretrieve
+from urllib.request import urlopen
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +88,11 @@ MODELS = {
         "check_file": "gtcrn_simple.onnx",
         "single_file": True,
     },
+    # Manifest-based release; handled by ensure_vits2_model below.
+    "vits2": {
+        "manifest": True,
+        "check_file": ".release_manifest.json",
+    },
 }
 
 
@@ -89,6 +101,9 @@ def ensure_model(name: str, model_dir: str) -> None:
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
+    if info.get("manifest"):
+        ensure_vits2_model(model_dir)
+        return
 
     check_path = os.path.join(model_dir, info["check_file"])
     if os.path.exists(check_path):
@@ -186,3 +201,188 @@ def _common_prefix_from_names(names: list[str]) -> str:
     if len(first_parts) == 1:
         return first_parts.pop() + "/"
     return ""
+
+
+# VITS2 uses a file-level manifest rather than the archive format above.
+VITS2_MODEL_ID = "Starlight777/VITS2-ZH-EN-Male-16k"
+VITS2_MODEL_REVISION = "14954122c4baf4e80b44436c4b2b167e38db4103"
+VITS2_MANIFEST_SHA256 = "2a8537b3abe7faffa81b20120136745e14e6f6d9e1599271f873e4d9192ab0f8"
+VITS2_BASE_URL = f"https://www.modelscope.cn/models/{VITS2_MODEL_ID}/resolve"
+VITS2_LOCAL_MANIFEST = ".release_manifest.json"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _vits2_runtime_target() -> tuple[str, int]:
+    try:
+        import tensorrt
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("TensorRT is required for the VITS2 TTS runtime") from exc
+
+    version = str(tensorrt.__version__)
+    try:
+        major = int(version.split(".", 1)[0])
+    except ValueError as exc:
+        raise RuntimeError(f"Unrecognized TensorRT version: {version}") from exc
+
+    targets = {8: "jp511", 10: "jp61"}
+    target = targets.get(major)
+    if target is None:
+        raise RuntimeError(
+            f"No VITS2 runtime target is defined for TensorRT {version}"
+        )
+    return target, major
+
+
+def _vits2_runtime_path(remote_path: str, target_name: str) -> str:
+    prefix = f"engines/{target_name}/"
+    return "engines/" + remote_path[len(prefix):] if remote_path.startswith(prefix) else remote_path
+
+
+def _manifest_runtime_target(manifest: dict, target_name: str) -> dict | None:
+    targets = manifest.get("runtime_targets")
+    if isinstance(targets, dict):
+        target = targets.get(target_name)
+        return target if isinstance(target, dict) else None
+    if isinstance(targets, list):
+        for target in targets:
+            if isinstance(target, dict) and target.get("name") == target_name:
+                return target
+        return None
+    target = manifest.get("runtime_target")
+    return target if isinstance(target, dict) else None
+
+
+def _load_vits2_manifest(path: Path, target_name: str, tensorrt_major: int) -> dict:
+    if _sha256_file(path) != VITS2_MANIFEST_SHA256:
+        raise RuntimeError("VITS2 release manifest SHA256 mismatch")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1 or manifest.get("model_id") != VITS2_MODEL_ID:
+        raise RuntimeError("Unsupported VITS2 release manifest")
+    target = _manifest_runtime_target(manifest, target_name)
+    if target is None:
+        raise RuntimeError(
+            f"The VITS2 release has no runtime target for {target_name}/"
+            f"TensorRT {tensorrt_major}"
+        )
+    if target.get("name") != target_name or target.get("tensorrt_major") != tensorrt_major:
+        raise RuntimeError(
+            f"The VITS2 release target does not match {target_name}/"
+            f"TensorRT {tensorrt_major}"
+        )
+    return manifest
+
+
+def _vits2_entry_target(entry: dict) -> str | None:
+    target = entry.get("runtime_target")
+    if isinstance(target, str):
+        return target
+    path = entry.get("path", "")
+    for target_name in ("jp511", "jp61"):
+        if path.startswith(f"engines/{target_name}/"):
+            return target_name
+    return None
+
+
+def _vits2_required_files(manifest: dict, target_name: str) -> list[dict]:
+    files = [
+        entry for entry in manifest.get("files", [])
+        if entry.get("runtime_required")
+        and _vits2_entry_target(entry) in (None, target_name)
+    ]
+    if not files:
+        raise RuntimeError("VITS2 release manifest has no runtime files")
+    return files
+
+
+def _vits2_complete(model_dir: Path, target_name: str, tensorrt_major: int) -> bool:
+    manifest_path = model_dir / VITS2_LOCAL_MANIFEST
+    if not manifest_path.is_file():
+        return False
+    try:
+        manifest = _load_vits2_manifest(manifest_path, target_name, tensorrt_major)
+        for entry in _vits2_required_files(manifest, target_name):
+            path = model_dir / _vits2_runtime_path(entry["path"], target_name)
+            if (not path.is_file() or path.stat().st_size != int(entry["bytes"])
+                    or _sha256_file(path) != entry["sha256"]):
+                return False
+    except (KeyError, OSError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _vits2_file_url(base_url: str, revision: str, path: str) -> str:
+    encoded = "/".join(quote(part, safe="") for part in path.split("/"))
+    return f"{base_url.rstrip('/')}/{quote(revision, safe='')}/{encoded}"
+
+
+def _download_verified(url: str, destination: Path, expected_bytes: int, expected_sha256: str) -> None:
+    digest = hashlib.sha256()
+    size = 0
+    with urlopen(url, timeout=120) as response, destination.open("wb") as output:
+        while True:
+            block = response.read(1024 * 1024)
+            if not block:
+                break
+            output.write(block)
+            digest.update(block)
+            size += len(block)
+    if (expected_bytes >= 0 and size != expected_bytes) or digest.hexdigest() != expected_sha256:
+        raise RuntimeError(f"VITS2 release file verification failed: {destination.name}")
+
+
+def ensure_vits2_model(model_dir: str) -> None:
+    """Install a complete verified VITS2 TensorRT release on first use."""
+    target_name, tensorrt_major = _vits2_runtime_target()
+    target = Path(model_dir).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.parent / f".{target.name}.download.lock"
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if _vits2_complete(target, target_name, tensorrt_major):
+            log.info("[model_downloader] vits2: verified release at %s", target)
+            return
+        revision = os.getenv("VITS2_MODEL_REVISION", VITS2_MODEL_REVISION).strip()
+        if not revision or revision == "REPLACE_WITH_MODELSCOPE_COMMIT":
+            raise RuntimeError("VITS2 ModelScope revision is not configured")
+        base_url = os.getenv("VITS2_MODEL_BASE_URL", VITS2_BASE_URL).strip()
+        if not base_url:
+            raise RuntimeError("VITS2 model base URL is empty")
+
+        staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+        backup = target.parent / f".{target.name}.previous"
+        try:
+            manifest_path = staging / VITS2_LOCAL_MANIFEST
+            _download_verified(_vits2_file_url(base_url, revision, "release_manifest.json"),
+                               manifest_path, -1, VITS2_MANIFEST_SHA256)
+            manifest = _load_vits2_manifest(
+                manifest_path, target_name, tensorrt_major
+            )
+            for entry in _vits2_required_files(manifest, target_name):
+                destination = staging / _vits2_runtime_path(entry["path"], target_name)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _download_verified(_vits2_file_url(base_url, revision, entry["path"]),
+                                   destination, int(entry["bytes"]), entry["sha256"])
+            if not _vits2_complete(staging, target_name, tensorrt_major):
+                raise RuntimeError("Downloaded VITS2 release is incomplete")
+            if backup.exists():
+                shutil.rmtree(backup)
+            if target.exists():
+                target.rename(backup)
+            staging.rename(target)
+            if backup.exists():
+                shutil.rmtree(backup)
+            log.info("[model_downloader] vits2: installed verified release at %s", target)
+        except Exception:
+            if not target.exists() and backup.exists():
+                backup.rename(target)
+            raise
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)

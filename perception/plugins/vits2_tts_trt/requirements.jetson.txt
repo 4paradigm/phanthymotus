@@ -1,0 +1,11 @@
+# JP5/Python 3.8 keeps compatibility with a legacy frontend dependency that
+# still accesses the NumPy 1.23 ``np.bool`` alias.
+numpy==1.23.5; python_version < "3.9"
+numpy==1.24.4; python_version >= "3.9"
+wetext==0.1.6
+importlib_resources==5.12.0; python_version < "3.9"
+pypinyin==0.55.0
+jieba==0.42.1
+g2p-en==2.1.0
+inflect==7.4.0
+nltk==3.9.1

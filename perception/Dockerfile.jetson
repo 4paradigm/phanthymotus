@@ -1,5 +1,7 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
 # Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
+# JP_VERSION selects the corresponding Jetson base; TensorRT plans are loaded
+# only when the runtime target matches the host TensorRT major version.
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
@@ -11,8 +13,12 @@
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
+ARG ENABLE_VITS2_TRT=1
+
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR
+ARG ENABLE_VITS2_TRT
+ARG JP_VERSION
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -133,12 +139,22 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
+# VITS2 frontend dependencies.  The model release contains compiled TN FSTs;
+# the container executes them with WeText/kaldifst and does not build Pynini.
+COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
+RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
+        -r /tmp/vits2-requirements.txt && \
+      python3 -c "import kaldifst,numpy"; \
+    fi && rm -f /tmp/vits2-requirements.txt
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/deploy/    /deploy/
 
 EXPOSE 15720
 EXPOSE 15721
