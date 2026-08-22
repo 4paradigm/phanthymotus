@@ -21,9 +21,12 @@ plugins:
 
   tts:
     enabled: true
-    model_dir: /models/sherpa-onnx/tts
+    model_dir: /models/sherpa-onnx/tts   # for TRT: /models/vits2-mix
     speaker_id: 0
     speed: 1.0
+    # backend: trt                        # uncomment to use VITS2 TRT TTS
+    # trt_dir: /models/vits2-mix/trt_mel20full_d50
+    # model_type: "mel20full_d50"
 
   htmsg:
     enabled: true

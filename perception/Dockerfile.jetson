@@ -5,7 +5,8 @@
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
-#   ./deploy/build_perception.sh --variant jetson --mirror tuna
+#   ./deploy/build_perception.sh --jp-version 5.11 --mirror tuna   # JetPack 5.11
+#   ./deploy/build_perception.sh --jp-version 6.1  --mirror tuna   # JetPack 6.1
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
@@ -152,6 +153,21 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
+
+# ── VITS2 TRT TTS (optional backend, JP5 TRT 8.5.2) ──────────────
+# 模型资产（frontend / vits2 源码 / nltk / TRT engine）运行时由
+# model_downloader.ensure_model 下载（/models 会被 bind-mount 覆盖，
+# 故不 bake 进镜像）。这里只装 Python 依赖。
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    numpy pypinyin jieba inflect g2p-en nltk kaldifst
+
+# wetext（Python 依赖，含预构建 fst）装到 site-packages
+ARG WETEXT_URL=https://dou-1257995901.cos.ap-guangzhou.myqcloud.com/source_code
+RUN curl -fsSL -o /tmp/wetext_with_fsts.tar.gz "${WETEXT_URL}/wetext_with_fsts.tar.gz" && \
+    tar -xzf /tmp/wetext_with_fsts.tar.gz -C "$(python3 -c 'import site; print(site.getsitepackages()[0])')" && \
+    rm /tmp/wetext_with_fsts.tar.gz && \
+    echo "wetext (with fst) installed"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
