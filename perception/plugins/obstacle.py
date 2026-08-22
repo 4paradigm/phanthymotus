@@ -58,12 +58,17 @@ TOOLS = [
             },
             "required": ["action"]
         },
+        # Deliberately minimal: only what an operator meaningfully decides.
+        # provider (single valid value), model_dir, ROI/percentile/calibration
+        # tuning and the per-scene expert blocks stay config.yaml-only — the
+        # dispatch below still honors them, they are just not advertised to
+        # the config UI.
         "configSchema": {
             "type": "object",
             "properties": {
-                "provider": {"type": "string", "enum": ["local"], "description": "Distance estimation provider", "scope": "shared"},
+                "fixed_scene": {"type": "string", "enum": ["indoor", "vehicle"], "default": "indoor", "description": "部署场景（固定场景模式下生效）：indoor=室内 ZipDepth，vehicle=车载 YOLO 深度", "scope": "shared"},
+                "decision_threshold_m": {"type": "number", "exclusiveMinimum": 0, "default": 2.0, "description": "近障判定距离(米)：估算距离小于该值时 near_obstacle=true", "scope": "shared"},
             },
-            "required": ["provider"]
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
         "topic_out": [{"format": "data/json",  "desc": "obstacle distance estimation result"}],
