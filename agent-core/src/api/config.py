@@ -235,7 +235,13 @@ async def _do_start_project():
                 except Exception:
                     pass  # info() failure is non-fatal
             else:
-                msg = str(result.get('detail', result.get('data', '')))[:100]
+                # `message` is where mcp_call_tool puts the human-readable
+                # reason; `data` is None on those responses, so reading data
+                # first surfaced the literal string "None" to the operator.
+                msg = str(result.get('message')
+                          or result.get('detail')
+                          or result.get('data')
+                          or f'启动失败 (code={result.get("code")})')[:200]
                 print(f'[start-project] {tool_name} error: {result}')
                 await push_event({'type': 'project_start_item', 'payload': {
                     'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': msg,

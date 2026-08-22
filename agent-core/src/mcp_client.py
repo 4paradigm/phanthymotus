@@ -403,6 +403,12 @@ async def call_tool(full_name: str, args: dict) -> str:
         if meta.get('has_config_schema'):
             saved_cfg = _get_tool_config(mcp_id, tool_name)
             if saved_cfg:
+                # Drop keys the current schema no longer advertises; a stale row
+                # would otherwise be replayed on every start. See tool_config.
+                from tool_config import find_tool, split_config_by_scope
+                _shared, _inst = split_config_by_scope(find_tool(mcp_id, tool_name), saved_cfg)
+                saved_cfg = {**_shared, **_inst}
+            if saved_cfg:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     cfg_result = await _jrpc(session, url, 'tools/call', {
                         'name':      tool_name,

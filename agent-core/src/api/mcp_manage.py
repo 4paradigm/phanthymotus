@@ -9,6 +9,8 @@ from pydantic import BaseModel
 
 import config
 import mcp_client
+from tool_config import (missing_required_config, plan_config_calls,
+                         split_config_by_scope)
 
 router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 
@@ -405,10 +407,16 @@ async def _restore_saved_configs(mcp_id: str, url: str, tools: list) -> None:
                 saved_cfg = config.main.get(f'tool_config:{mcp_id}:{tool_name}', None)
                 if not saved_cfg:
                     continue
+                # Drop keys the current schema no longer advertises, same as the
+                # start path — a stale row must not be replayed on every reconnect.
+                shared_cfg, instance_cfg = split_config_by_scope(tool, saved_cfg)
+                restore_cfg = {**shared_cfg, **instance_cfg}
+                if not restore_cfg:
+                    continue
                 cfg_payload = {
                     'jsonrpc': '2.0', 'id': 99,
                     'method': 'tools/call',
-                    'params': {'name': tool_name, 'arguments': {'action': 'config', **saved_cfg}},
+                    'params': {'name': tool_name, 'arguments': {'action': 'config', **restore_cfg}},
                 }
                 await session.post(url, json=cfg_payload, headers=headers)
                 sent.append(tool_name)
@@ -959,34 +967,48 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             }
             await session.post(url, json=init_payload, headers=headers)
 
-            # Auto-config: start 前自动 apply 已保存的 config (shared + instance merged)
+            # Auto-config: start 前自动 apply 已保存的 config
             # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
             _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
             if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
-                # Check if this tool has configSchema (requires config before start)
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
-                has_config_schema = bool(tool_obj and tool_obj.get('configSchema'))
 
                 instance_id = req.arguments.get('instance_id', '')
-                shared_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None) or {}
-                instance_cfg = {}
+                saved_shared = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None) or {}
+                saved_instance = {}
                 if instance_id:
-                    instance_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}:{instance_id}', None) or {}
-                merged_cfg = {**shared_cfg, **instance_cfg}
+                    saved_instance = config.main.get(f'tool_config:{mcp_id}:{req.tool}:{instance_id}', None) or {}
 
-                if merged_cfg:
-                    cfg_args = {'action': 'config', **merged_cfg}
-                    if instance_id:
-                        cfg_args['instance_id'] = instance_id
+                # Partition both rows by declared scope, dropping keys the
+                # current schema no longer advertises. Either row can hold
+                # either kind of key: older UI builds saved without filtering.
+                shared_cfg, instance_cfg = split_config_by_scope(tool_obj, saved_shared)
+                inst_shared, inst_own = split_config_by_scope(tool_obj, saved_instance)
+                merged_for_required = {**shared_cfg, **inst_shared, **instance_cfg, **inst_own}
+
+                missing = missing_required_config(tool_obj, merged_for_required)
+                if missing:
+                    return {'code': 400,
+                            'message': f'[{req.tool}] 尚未配置：缺少 {"、".join(missing)}，请先在卡片配置里填写后再启动。',
+                            'data': None}
+
+                for cfg_body, extra_args in plan_config_calls(
+                        tool_obj, saved_shared, saved_instance, instance_id):
                     cfg_payload = {
                         'jsonrpc': '2.0', 'id': 2,
                         'method': 'tools/call',
-                        'params': {'name': req.tool, 'arguments': cfg_args},
+                        'params': {'name': req.tool,
+                                   'arguments': {'action': 'config', **cfg_body, **extra_args}},
                     }
                     async with session.post(url, json=cfg_payload, headers=headers) as resp:
                         cfg_data = await resp.json(content_type=None)
+                        cfg_error = cfg_data.get('error')
+                        if cfg_error:
+                            return {'code': 400,
+                                    'message': f'[{req.tool}] 配置失败：{cfg_error.get("message", "unknown error")}',
+                                    'data': None}
                         cfg_result = cfg_data.get('result', {})
                         cfg_content = (cfg_result.get('content') or [{}])[0].get('text', '{}')
                         try:
@@ -995,8 +1017,6 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                                 return {'code': 400, 'message': f'[{req.tool}] 配置无效（缺少 url/key），请检查配置。', 'data': None}
                         except (json.JSONDecodeError, IndexError):
                             pass
-                elif has_config_schema:
-                    return {'code': 400, 'message': f'[{req.tool}] 尚未配置，请先完成配置后再启动。', 'data': None}
 
             call_payload = {
                 'jsonrpc': '2.0', 'id': 3,

@@ -147,19 +147,30 @@ def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
     Shared by the tool-config endpoints below and by api/solutions.py when a
     solution is applied, so both paths send the exact same `action: config`
     call shape.
+
+    The body is partitioned by declared scope — shared settings are sent
+    without instance_id even when saved under an instance key, because plugins
+    holding one engine per process reject shared keys addressed to a single
+    instance. See split_config_by_scope for why unknown keys are dropped.
     """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from tool_config import find_tool, plan_config_calls
 
-    args = dict(body) if isinstance(body, dict) else {}
+    cfg = dict(body) if isinstance(body, dict) else {}
+    tool_obj = find_tool(mcp_id, tool_name)
     if instance_id:
-        args['instance_id'] = instance_id
+        calls = plan_config_calls(tool_obj, {}, cfg, instance_id)
+    else:
+        calls = plan_config_calls(tool_obj, cfg, {}, '')
 
     async def _apply():
-        try:
-            req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', **args})
-            await mcp_call_tool(mcp_id, req)
-        except Exception:
-            pass
+        for cfg_body, extra_args in calls:
+            try:
+                req = MCPCallRequest(tool=tool_name,
+                                     arguments={'action': 'config', **cfg_body, **extra_args})
+                await mcp_call_tool(mcp_id, req)
+            except Exception:
+                pass
 
     try:
         asyncio.create_task(_apply())
