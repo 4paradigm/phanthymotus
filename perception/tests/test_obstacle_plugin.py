@@ -395,3 +395,36 @@ def test_obstacle_model_dir_confined_to_models_tree(monkeypatch):
         md.ensure_obstacle_models("/etc/cron.d")
     with pytest.raises(ValueError):
         md.ensure_obstacle_models("/models/../root")
+
+
+# ── config surface (培育→配置) ───────────────────────────────────────────────
+
+def test_obstacle_config_schema_exposes_only_operator_fields():
+    """The config UI renders configSchema verbatim. provider (one valid
+    value) and the expert tuning blocks live in config.yaml only; what
+    remains are the two genuine operator decisions, and no object-typed
+    property may appear (the frontend renders those as [object Object])."""
+    from plugins.obstacle import TOOLS
+
+    schema = TOOLS[0]["configSchema"]
+    assert set(schema["properties"]) == {"fixed_scene", "decision_threshold_m"}
+    for name, spec in schema["properties"].items():
+        assert spec["type"] != "object", name
+    assert "required" not in schema
+    assert schema["properties"]["fixed_scene"]["enum"] == ["indoor", "vehicle"]
+
+
+def test_obstacle_config_fields_reach_the_adapter(monkeypatch):
+    """fixed_scene / decision_threshold_m set via the config action land in
+    the adapter cfg on the next start (adapter rebuild path)."""
+    plugin, executor, builder = _make_obstacle(monkeypatch)
+    plugin.dispatch("obstacle", {
+        "action": "config",
+        "fixed_scene": "vehicle",
+        "decision_threshold_m": 3.5,
+    })
+    _obstacle_start_and_wait(plugin, executor, "/cam/a")
+    cfg = builder.built[-1].cfg
+    assert cfg["fixed_scene"] == "vehicle"
+    assert cfg["decision_threshold_m"] == 3.5
+    plugin.dispatch("obstacle", {"action": "stop"})
