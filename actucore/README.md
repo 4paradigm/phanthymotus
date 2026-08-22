@@ -113,6 +113,6 @@ TOOLS = [
 4. 该卡片需要的依赖加到 `Dockerfile`（以及 `Dockerfile.jetson`，如果要跑 GPU）
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
-需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 htmsg / vop 的注册块。
+需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 vop 的注册块。
 
-完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/htmsg/plugin.py` —— 它是最干净的范例。
+完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/vop.py` —— 它是最干净的范例。

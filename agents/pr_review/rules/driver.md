@@ -92,7 +92,7 @@ conventionally the MCP port + 1.
 wrong visualisation rather than an error. Valid values include `audio/*`,
 `video/*`, `image/jpeg`, `image/depth-z16`, `image/depth-zlib`, `data/json`,
 `text/*`, `sensor/skeleton`, `sensor/lidar*`, `sensor/pointcloud`,
-`sensor/mapping`, `sensor/htmsg`.
+`sensor/mapping`.
 
 Prefer `image/depth-zlib` over `image/depth-z16`: the raw form is ~614 KB/frame
 and saturates ARM64 CPU, the compressed form ~10–15 KB.

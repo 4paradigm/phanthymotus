@@ -74,20 +74,16 @@ RUN cd /ros_ws && \
 #   thus we cannot accurately determine which files belong to it which would
 #   lead to only a partial uninstall.
 #
-# dashscope depends on PyYAML, so it triggers exactly that. Installing PyYAML
-# by itself with --ignore-installed leaves the apt egg-info in place and writes
-# a proper dist-info alongside it; the next pip invocation then sees a version
-# it can reason about and never attempts the uninstall. --ignore-installed is a
-# per-invocation flag, which is why this is a separate command rather than an
-# extra argument on the one below — we do not want it applied to everything.
+# omegaconf (OCR layer below) depends on PyYAML>=5.1.0, so it triggers exactly
+# that. Installing PyYAML by itself with --ignore-installed leaves the apt
+# egg-info in place and writes a proper dist-info alongside it; the next pip
+# invocation then sees a version it can reason about and never attempts the
+# uninstall. --ignore-installed is a per-invocation flag, which is why this is
+# a separate command rather than an extra argument on the one below — we do not
+# want it applied to everything.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --ignore-installed PyYAML && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    requests websockets webrtcvad websocket-client dashscope && \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
-
-# ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    kiss-icp scipy
+    websockets webrtcvad
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)

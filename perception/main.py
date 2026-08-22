@@ -43,7 +43,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelna
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 # suppress noisy third-party loggers
-for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx', 'dashscope'):
+for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
@@ -92,17 +92,6 @@ class PerceptionBundle:
             from plugins.tts import TTSPlugin
             self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
             log.info("TTSPlugin loaded")
-
-        if plugins_cfg.get("htmsg", {}).get("enabled", False):
-            import re, socket
-            namespace = plugins_cfg["htmsg"].get("namespace", "").strip()
-            if not namespace:
-                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
-            from plugins.htmsg import HTMSGPlugin
-            plugin = HTMSGPlugin(plugins_cfg["htmsg"], namespace, executor)
-            self._plugins.append(plugin)
-            plugin.start()
-            log.info("HTMSGPlugin loaded (namespace=%s)", namespace)
 
         if plugins_cfg.get("vop", {}).get("enabled", False):
             import re, socket
@@ -243,19 +232,16 @@ def make_handler():
                     if not text:
                         self._send(200, json.dumps({"ok": False, "info": "text is required"}))
                         return
-                    # Build ad-hoc adapter from inline credentials if provided
-                    api_key = req.get("api_key", "")
-                    if api_key:
-                        from plugins.tts import AliyunDashScopeTTSAdapter
-                        adapter = AliyunDashScopeTTSAdapter(
-                            api_key=api_key,
-                            model=req.get("model", ""),
-                            voice=req.get("voice", ""),
-                            url=req.get("url", ""),
-                        )
-                        pcm = adapter.synthesize(text)
-                    else:
-                        pcm = _bundle.tts_synthesize_raw(text)
+                    # Inline cloud credentials are not supported: this endpoint
+                    # tests the on-device sherpa-onnx TTS the plugin actually
+                    # serves. Fail loudly rather than silently ignoring the key.
+                    if req.get("api_key", ""):
+                        self._send(200, json.dumps({
+                            "ok": False,
+                            "info": "inline api_key is not supported; /tts/test exercises the on-device TTS plugin",
+                        }))
+                        return
+                    pcm = _bundle.tts_synthesize_raw(text)
                     import base64 as _b64, io, wave
                     buf = io.BytesIO()
                     with wave.open(buf, 'wb') as w:

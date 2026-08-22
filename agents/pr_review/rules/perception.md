@@ -25,7 +25,7 @@ Known failure modes to check for:
 ## Structure
 
 - `main.py` — MCP server entry
-- `plugins/` — `asr`, `tts`, `vop`, `htmsg`, `kws`. Read a sibling plugin to
+- `plugins/` — `asr`, `tts`, `vop`, `ocr`, `kws`. Read a sibling plugin to
   learn the local convention before judging a new one.
 - `config.yaml` — per-plugin enable/disable
 - `utils/model_downloader.py` — the model manifest. **Models belong here, fetched

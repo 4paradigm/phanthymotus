@@ -1661,12 +1661,40 @@ def _vad_segment_sync(audio_bytes: bytes, model: str = 'silero',
             try: return vad_engine.is_speech(chunk, SAMPLE_RATE)
             except Exception: return False
     else:
-        import torch
-        silero = _get_silero_model()
+        # Same Silero VAD the streaming worker uses, via sherpa-onnx's ONNX
+        # runtime rather than the PyTorch `silero-vad` package — one model file,
+        # one runtime, no torch on this path.
+        import sherpa_onnx
+        from utils.model_downloader import ensure_model
+
+        vad_model_dir = '/models/sherpa-onnx/vad'
+        ensure_model("vad", vad_model_dir)
+        # min_silence_duration is deliberately short: the loop below owns
+        # segmentation via SILENCE_FRAMES. Passing silence_ms here too would
+        # make sherpa hold the segment open for silence_ms *before* the loop
+        # starts counting its own, doubling every segment's trailing silence.
+        vad_engine = sherpa_onnx.VoiceActivityDetector(
+            sherpa_onnx.VadModelConfig(
+                silero_vad=sherpa_onnx.SileroVadModelConfig(
+                    model=os.path.join(vad_model_dir, "silero_vad.onnx"),
+                    threshold=threshold,
+                    min_silence_duration=0.1,
+                    min_speech_duration=0.1,
+                    window_size=CHUNK_SAMPLES,
+                    max_speech_duration=30,
+                ),
+                sample_rate=SAMPLE_RATE,
+                num_threads=1,
+                provider="cpu",
+            ),
+            buffer_size_in_seconds=30,
+        )
+
         def is_speech(chunk):
             n = len(chunk) // 2
-            t = torch.tensor(struct.unpack(f'<{n}h', chunk), dtype=torch.float32, device=_get_torch_device()) / 32768.0
-            return silero(t, SAMPLE_RATE).item() >= threshold
+            float_samples = [s / 32768.0 for s in struct.unpack(f'<{n}h', chunk)]
+            vad_engine.accept_waveform(float_samples)
+            return vad_engine.is_speech_detected()
 
     preroll: _col.deque = _col.deque(maxlen=8)
     state = 'idle'

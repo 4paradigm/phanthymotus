@@ -9,7 +9,7 @@ plugins:
     num_threads: 2
     language: zh-CN
     vad:
-      model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
+      model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
       threshold: 0.5
       silence_ms: 400
       pre_roll_ms: 500
@@ -24,20 +24,6 @@ plugins:
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
-
-  htmsg:
-    enabled: true
-    namespace: ""       # auto-detect from hostname if empty
-    keyframe:
-      dist_thresh: 1.0    # meters — insert keyframe when moved this far
-      angle_thresh: 0.35  # radians (~20°) — or rotated this much
-    semantic:
-      model: "mobileclip"
-      sam_model: "sam2_tiny"
-      confidence_decay: 0.95
-    graph:
-      db_path: "/opt/phanthy-motus/data/htmsg"
-      max_nodes: 500
 
   vop:
     enabled: true
