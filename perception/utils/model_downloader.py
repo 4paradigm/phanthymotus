@@ -4,6 +4,7 @@ utils/model_downloader.py — Auto-download sherpa-onnx models from COS if missi
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import tarfile
@@ -103,7 +104,11 @@ MODELS = {
 
 
 def ensure_model(name: str, model_dir: str) -> None:
-    """Ensure model files exist in model_dir. Download from COS if missing."""
+    """Ensure model files exist in model_dir. Download from COS if missing.
+
+    用文件锁串行化下载，避免多个进程共享同一 model_dir 时并发解压冲突 /
+    重复下载。check_file 作为完成标记，锁内做二次检查。
+    """
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
@@ -113,48 +118,60 @@ def ensure_model(name: str, model_dir: str) -> None:
         log.info(f"[model_downloader] {name}: already exists at {model_dir}")
         return
 
-    url = info["url"]
     os.makedirs(model_dir, exist_ok=True)
-    log.info(f"[model_downloader] {name}: downloading from {url} ...")
+    lock_path = os.path.join(model_dir, ".download.lock")
 
-    if info.get("single_file"):
-        # Direct file download (not an archive)
-        dest = os.path.join(model_dir, info["check_file"])
-        urlretrieve(url, dest, reporthook=_progress_hook(name))
-        log.info(f"[model_downloader] {name}: done.")
-        return
+    with open(lock_path, "w") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)  # 阻塞：同一时间只有一个进程下载
+        try:
+            # 二次检查：等锁期间别的进程可能已经下载完成
+            if os.path.exists(check_path):
+                log.info(f"[model_downloader] {name}: downloaded by another process")
+                return
 
-    # Determine suffix from URL
-    if url.endswith(".zip"):
-        suffix = ".zip"
-    elif url.endswith(".tar.gz") or url.endswith(".tgz"):
-        suffix = ".tar.gz"
-    else:
-        suffix = ".tar.bz2"
+            url = info["url"]
+            log.info(f"[model_downloader] {name}: downloading from {url} ...")
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp_path = tmp.name
+            if info.get("single_file"):
+                # Direct file download (not an archive)
+                dest = os.path.join(model_dir, info["check_file"])
+                urlretrieve(url, dest, reporthook=_progress_hook(name))
+                log.info(f"[model_downloader] {name}: done.")
+                return
 
-    try:
-        urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
-        log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
+            # Determine suffix from URL
+            if url.endswith(".zip"):
+                suffix = ".zip"
+            elif url.endswith(".tar.gz") or url.endswith(".tgz"):
+                suffix = ".tar.gz"
+            else:
+                suffix = ".tar.bz2"
 
-        if suffix == ".zip":
-            _extract_zip(tmp_path, model_dir)
-        else:
-            _extract_tar(tmp_path, model_dir)
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
 
-        log.info(f"[model_downloader] {name}: done.")
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            try:
+                urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+                log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
 
-    # Verify
-    if not os.path.exists(check_path):
-        raise RuntimeError(
-            f"[model_downloader] {name}: download completed but {info['check_file']} "
-            f"not found in {model_dir}"
-        )
+                if suffix == ".zip":
+                    _extract_zip(tmp_path, model_dir)
+                else:
+                    _extract_tar(tmp_path, model_dir)
+
+                log.info(f"[model_downloader] {name}: done.")
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+            # Verify
+            if not os.path.exists(check_path):
+                raise RuntimeError(
+                    f"[model_downloader] {name}: download completed but {info['check_file']} "
+                    f"not found in {model_dir}"
+                )
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
 
 
 def _extract_zip(zip_path: str, model_dir: str) -> None:
