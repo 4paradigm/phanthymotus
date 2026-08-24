@@ -162,6 +162,8 @@ class FastLivo2Adapter(Node):
         self._mapping_work_condition = threading.Condition()
         self._mapping_work = None
         self._mapping_generation = 0
+        self._mapping_work_generation = 0
+        self._mapping_work_latest_monotonic: float | None = None
         self._mapping_work_dropped = 0
         self._mapping_worker_stop = False
         self._latest_pose: Pose3 | None = None
@@ -282,6 +284,8 @@ class FastLivo2Adapter(Node):
         self._mapping_generation += 1
         with self._mapping_work_condition:
             self._mapping_work = None
+            self._mapping_work_generation = self._mapping_generation
+            self._mapping_work_latest_monotonic = None
 
     def _invalidate_map_view_cache_locked(self) -> None:
         self._map_view_cache = None
@@ -300,8 +304,19 @@ class FastLivo2Adapter(Node):
 
     def _queue_mapping_scan(self, work: dict) -> None:
         with self._mapping_work_condition:
+            generation = int(work["generation"])
+            receive_monotonic = float(work["receive_monotonic"])
+            if generation < self._mapping_work_generation or (
+                generation == self._mapping_work_generation
+                and self._mapping_work_latest_monotonic is not None
+                and receive_monotonic <= self._mapping_work_latest_monotonic
+            ):
+                self._mapping_work_dropped += 1
+                return
             if self._mapping_work is not None:
                 self._mapping_work_dropped += 1
+            self._mapping_work_generation = generation
+            self._mapping_work_latest_monotonic = receive_monotonic
             self._mapping_work = work
             self._mapping_work_condition.notify()
 

@@ -117,6 +117,8 @@ def _prepare_adapter_concurrency(adapter) -> None:
     adapter._mapping_work_condition = threading.Condition()
     adapter._mapping_work = None
     adapter._mapping_generation = 0
+    adapter._mapping_work_generation = 0
+    adapter._mapping_work_latest_monotonic = None
     adapter._mapping_work_dropped = 0
 
 
@@ -585,11 +587,37 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter = object.__new__(FastLivo2Adapter)
         _prepare_adapter_concurrency(adapter)
 
-        adapter._queue_mapping_scan({"generation": 1, "sample": "old"})
-        adapter._queue_mapping_scan({"generation": 1, "sample": "latest"})
+        adapter._queue_mapping_scan(
+            {"generation": 0, "receive_monotonic": 10.0, "sample": "old"}
+        )
+        adapter._queue_mapping_scan(
+            {"generation": 0, "receive_monotonic": 11.0, "sample": "latest"}
+        )
 
         self.assertEqual(adapter._mapping_work["sample"], "latest")
         self.assertEqual(adapter._mapping_work_dropped, 1)
+
+    def test_mapping_work_queue_drops_late_completion_from_older_scan(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        _prepare_adapter_concurrency(adapter)
+
+        adapter._queue_mapping_scan(
+            {"generation": 0, "receive_monotonic": 11.0, "sample": "newer"}
+        )
+        adapter._mapping_work = None
+        adapter._queue_mapping_scan(
+            {"generation": 0, "receive_monotonic": 10.0, "sample": "late-old"}
+        )
+
+        self.assertIsNone(adapter._mapping_work)
+        self.assertEqual(adapter._mapping_work_dropped, 1)
+
+        adapter._invalidate_mapping_work_locked()
+        adapter._queue_mapping_scan(
+            {"generation": 0, "receive_monotonic": 12.0, "sample": "old-generation"}
+        )
+        self.assertIsNone(adapter._mapping_work)
+        self.assertEqual(adapter._mapping_work_dropped, 2)
 
     def test_late_terminal_mapping_failure_is_replayed_on_retry(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
