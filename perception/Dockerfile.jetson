@@ -140,7 +140,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 # 故不 bake 进镜像）。这里只装 Python 依赖。
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    numpy pypinyin jieba inflect g2p-en nltk kaldifst
+    numpy pypinyin jieba inflect g2p-en nltk kaldifst contractions
 
 # wetext（Python 依赖，含预构建 fst）装到 site-packages
 ARG WETEXT_URL=https://dou-1257995901.cos.ap-guangzhou.myqcloud.com/source_code
