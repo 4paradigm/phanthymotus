@@ -280,6 +280,11 @@ class TRTTSAdapter(TTSAdapter):
         self._cuda.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                            ctypes.c_size_t, ctypes.c_int]
 
+        # ── 复用的 execution context + buffer（避免每次推理 create/malloc/free）──
+        self._ctx_cache = {}   # engine -> execution context
+        self._gpu_buf = {}     # (id(engine), name) -> (ptr, size)
+        self._cpu_buf = {}     # (id(engine), name) -> np.ndarray
+
         log.info("[tts] TRT adapter loaded: model=%s n_fft=%d hop=%d gain=%.4f",
                  model_type, self._n_fft, self._hop, self._gain)
 
@@ -288,30 +293,59 @@ class TRTTSAdapter(TTSAdapter):
         self._cuda.cudaMalloc(ctypes.byref(ptr), size)
         return ptr
 
+    def _get_ctx(self, engine):
+        ctx = self._ctx_cache.get(engine)
+        if ctx is None:
+            ctx = engine.create_execution_context()
+            self._ctx_cache[engine] = ctx
+        return ctx
+
+    def _gpu_buf_for(self, engine, name, size):
+        """复用 GPU buffer（不够大才重新分配），避免每次推理 malloc/free。"""
+        key = (id(engine), name)
+        entry = self._gpu_buf.get(key)
+        if entry is not None and entry[1] >= size:
+            return entry[0]
+        if entry is not None:
+            self._cuda.cudaFree(entry[0])
+        ptr = self._gpu_alloc(size)
+        self._gpu_buf[key] = (ptr, size)
+        return ptr
+
+    def _cpu_buf_for(self, engine, name, shape):
+        """复用 CPU buffer（取前 N 元素 reshape 到目标 shape，避免反复分配）。"""
+        key = (id(engine), name)
+        arr = self._cpu_buf.get(key)
+        need = int(np.prod(shape))
+        if arr is None or arr.size < need:
+            arr = np.empty(shape, dtype=np.float32)
+            self._cpu_buf[key] = arr
+            return arr
+        return arr.ravel()[:need].reshape(shape)
+
     def _trt_run(self, engine, inputs, output_names):
         import tensorrt as trt
-        ctx = engine.create_execution_context()
+        ctx = self._get_ctx(engine)
         gpu_ptrs, outputs = {}, {}
         for i in range(engine.num_io_tensors):
             name = engine.get_tensor_name(i)
             if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                 data = inputs[name].astype(np.float32)
                 ctx.set_input_shape(name, data.shape)
-                ptr = self._gpu_alloc(data.nbytes)
+                ptr = self._gpu_buf_for(engine, name, data.nbytes)
                 self._cuda.cudaMemcpy(ptr, data.ctypes.data, data.nbytes, 1)  # H2D
                 gpu_ptrs[name] = ptr
             else:
                 shape = tuple(ctx.get_tensor_shape(name))
-                outputs[name] = np.empty(shape, dtype=np.float32)
-                ptr = self._gpu_alloc(outputs[name].nbytes)
+                arr = self._cpu_buf_for(engine, name, shape)
+                outputs[name] = arr
+                ptr = self._gpu_buf_for(engine, name, arr.nbytes)
                 gpu_ptrs[name] = ptr
         bindings = [gpu_ptrs[engine.get_tensor_name(i)].value
                      for i in range(engine.num_io_tensors)]
         ctx.execute_v2(bindings)
         for name, arr in outputs.items():
             self._cuda.cudaMemcpy(arr.ctypes.data, gpu_ptrs[name], arr.nbytes, 2)  # D2H
-        for p in gpu_ptrs.values():
-            self._cuda.cudaFree(p)
         return tuple(outputs[n] for n in output_names)
 
     @staticmethod
