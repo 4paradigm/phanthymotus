@@ -594,8 +594,8 @@ class _TTSNode(Node):
         import time as _time
 
         # Real-time pacing: publish frames at playback rate to avoid bursts/gaps.
-        # 可配置：TTS_PACING=0 关闭节流（burst 发布，评测用；默认开启模拟实时播放）。
-        _pacing = os.environ.get("TTS_PACING", "1").strip().lower() not in ("0", "false", "no", "off")
+        # 默认关闭节流（burst 发布）；需要模拟实时播放时设 TTS_PACING=1。
+        _pacing = os.environ.get("TTS_PACING", "0").strip().lower() not in ("0", "false", "no", "off")
         FRAME_DURATION = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s per 3200-byte frame
         PREBUF_FRAMES  = 3 if _pacing else 0  # 关闭节流时无需预缓冲
 
