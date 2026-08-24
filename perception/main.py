@@ -452,6 +452,9 @@ def main():
              f"model={asr_cfg.get('model','') or '(default)'}, key={'set' if asr_cfg.get('key') else 'MISSING'}")
     log.info(f"  tts: provider={tts_cfg.get('provider')}, model={tts_cfg.get('model','') or '(default)'}, "
              f"api_key={'set' if tts_cfg.get('api_key') else 'MISSING'}")
+    log.info(f"  tts: backend={tts_cfg.get('backend','(unset->sherpa-onnx)')}, "
+             f"model_dir={tts_cfg.get('model_dir','(unset)')}, "
+             f"trt_dir={tts_cfg.get('trt_dir','(unset)')}, model_type={tts_cfg.get('model_type','(unset)')}")
 
     os.environ.setdefault("RCUTILS_LOGGING_SEVERITY_THRESHOLD", "50")
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")

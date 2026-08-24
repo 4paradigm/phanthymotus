@@ -169,11 +169,16 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
 
+    log.info(f"[tts] _build_tts_adapter: backend={backend}, model_dir={model_dir}, "
+             f"speaker_id={speaker_id}, speed={speed}")
+
     if backend == 'trt':
         trt_dir = cfg.get('trt_dir', os.path.join(model_dir, 'trt'))
         model_type = cfg.get('model_type', 'mel20full_d50')
+        log.info(f"[tts] _build_tts_adapter: -> TRT backend (trt_dir={trt_dir}, model_type={model_type})")
         return TRTTSAdapter(model_dir, trt_dir, speaker_id, speed, model_type)
 
+    log.info("[tts] _build_tts_adapter: -> sherpa-onnx backend")
     return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
 
 
@@ -231,11 +236,14 @@ class TRTTSAdapter(TTSAdapter):
             raise RuntimeError(
                 f"VITS2 TRT engine 仅支持 TRT 8.5.x（JP5）或 10.x（JP6），当前为 TRT {trt_ver}"
             )
+        log.info(f"[tts] TRT adapter init: TRT={trt_ver}, engine={engine_name}, "
+                 f"model_dir={model_dir}, trt_dir={trt_dir}")
 
         # ── 运行时下载模型资产（不 bake 进镜像：/models 会被 bind-mount 覆盖）──
         from utils.model_downloader import ensure_model
         ensure_model("vits2_mix", model_dir)
         ensure_model(engine_name, trt_dir)
+        log.info(f"[tts] TRT adapter init: assets ready (model_dir={model_dir}, trt_dir={trt_dir})")
 
         # ── Frontend (G2P) ──
         sys.path.insert(0, model_dir)
@@ -800,6 +808,8 @@ class TTSPlugin:
         self._cfg      = plugin_cfg
         self._loading  = False
         self._load_error = None
+        log.info(f"[tts] plugin init: cfg keys={sorted(plugin_cfg.keys())}, "
+                 f"backend={plugin_cfg.get('backend', '(unset->sherpa-onnx)')}")
         try:
             self._adapter  = _build_tts_adapter(plugin_cfg)
         except Exception as e:
@@ -817,7 +827,9 @@ class TTSPlugin:
         # RLock: dispatch paths nest (start → _dispose_node).
         self._nodes_lock = threading.RLock()
         self._executor = executor
-        log.info(f"[tts] plugin init: sherpa-onnx VITS, "
+        adapter_type = type(self._adapter).__name__ if self._adapter else "None"
+        log.info(f"[tts] plugin init: adapter={adapter_type}, backend={plugin_cfg.get('backend','(unset)')}, "
+                 f"load_error={self._load_error or '(none)'}, "
                  f"speaker_id={plugin_cfg.get('speaker_id', 0)}, speed={plugin_cfg.get('speed', 1.0)}")
 
     def _dispose_node(self, node: _TTSNode, key: str = "") -> dict:
