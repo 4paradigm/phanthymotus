@@ -593,9 +593,11 @@ class _TTSNode(Node):
         from audio_msgs.msg import AudioChunk
         import time as _time
 
-        # Real-time pacing: publish frames at playback rate to avoid bursts/gaps
+        # Real-time pacing: publish frames at playback rate to avoid bursts/gaps.
+        # 可配置：TTS_PACING=0 关闭节流（burst 发布，评测用；默认开启模拟实时播放）。
+        _pacing = os.environ.get("TTS_PACING", "1").strip().lower() not in ("0", "false", "no", "off")
         FRAME_DURATION = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s per 3200-byte frame
-        PREBUF_FRAMES  = 3  # buffer 3 frames (~300ms) before starting real-time pacing
+        PREBUF_FRAMES  = 3 if _pacing else 0  # 关闭节流时无需预缓冲
 
         while not self._stop_event.is_set():
             try:
@@ -672,11 +674,12 @@ class _TTSNode(Node):
                                 prebuf = []
                             continue
 
-                        # Real-time pacing
-                        target = t0 + frames_sent * FRAME_DURATION
-                        now = _time.monotonic()
-                        if now < target:
-                            _time.sleep(target - now)
+                        # Real-time pacing（TTS_PACING=0 时跳过，直接 burst 发布）
+                        if _pacing:
+                            target = t0 + frames_sent * FRAME_DURATION
+                            now = _time.monotonic()
+                            if now < target:
+                                _time.sleep(target - now)
                         msg = AudioChunk()
                         msg.header.stamp = self.get_clock().now().to_msg()
                         msg.format = "audio/pcm-16k"
