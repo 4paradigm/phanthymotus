@@ -84,7 +84,7 @@ start() {
     --volume "${RECORDING_DIR}:/opt/phanthy-motus/data/fast_livo2/recordings:rw" \
     --env ROS_DOMAIN_ID=42 \
     --env RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
-    --env FASTDDS_BUILTIN_TRANSPORTS=UDPv4 \
+    --env FASTDDS_BUILTIN_TRANSPORTS=DEFAULT \
     --env PYTHONUNBUFFERED=1 \
     --restart no \
     "${ACTUCORE_IMAGE}" >/dev/null

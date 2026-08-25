@@ -14,8 +14,8 @@ actucore:
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    # UDPv4 而非 DEFAULT：与 perception / driver 侧一致，也是 G1 上验证过的组合
-    - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+    # DEFAULT 同时启用 SHM 和 UDPv4；同机 Driver / ActuCore 优先走 SHM，并保留 UDP fallback
+    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
   logging:
     driver: local
     options:

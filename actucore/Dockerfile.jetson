@@ -524,7 +524,7 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/ros_ws/install/g1_fast_livo2:
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42
-ENV FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 ENV RCUTILS_LOGGING_BUFFERED_STREAM=1
 
 LABEL org.opencontainers.image.title="Phanthy Motus ActuCore" \

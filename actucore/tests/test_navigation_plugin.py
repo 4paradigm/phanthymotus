@@ -289,6 +289,35 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn('plugins_cfg.get("nav2"', main)
         self.assertNotIn('plugins_cfg.get("vln"', main)
 
+    def test_navigation_runtime_uses_default_fastdds_transport(self):
+        manifests = (
+            ACTUCORE_ROOT / "Dockerfile.jetson",
+            ACTUCORE_ROOT / "deploy" / "service.yml",
+            ACTUCORE_ROOT
+            / "plugins"
+            / "navigation"
+            / "deploy"
+            / "scripts"
+            / "owner-start-g1-test-containers.sh",
+        )
+        for manifest in manifests:
+            content = manifest.read_text(encoding="utf-8")
+            self.assertIn("FASTDDS_BUILTIN_TRANSPORTS=DEFAULT", content)
+            self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS=UDPv4", content)
+
+        for source_lock in (
+            "nav2-source-lock.env",
+            "fast_livo2-source-lock.env",
+        ):
+            content = (
+                ACTUCORE_ROOT
+                / "plugins"
+                / "navigation"
+                / "runtime"
+                / source_lock
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS", content)
+
     def test_actucore_image_stays_free_of_perception_model_dependencies(self):
         """卡片只用标准库 + ROS 消息包，镜像不该被拖成第二个 perception。
 

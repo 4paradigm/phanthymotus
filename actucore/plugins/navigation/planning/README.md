@@ -239,7 +239,7 @@ cloud、odom、TF、global path、rolling costmap 和 footprint，不包含
 source /opt/ros/humble/setup.bash
 export ROS_DOMAIN_ID=42
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+export FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 ros2 topic info /ubuntu/navigation/odom -v
 ros2 topic info /ubuntu/navigation/cloud_registered -v
