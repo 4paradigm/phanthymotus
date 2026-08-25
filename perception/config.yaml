@@ -23,8 +23,8 @@ plugins:
     enabled: true
     backend: trt
     model_dir: /models/vits2-mix
-    trt_dir: /models/vits2-mix/trt_mel20full_d50
-    model_type: "mel20full_d50"
+    trt_dir: /models/vits2-mix/trt_mel20full_d50_mxd
+    model_type: "mel20full_d50_mxd"
     speaker_id: 0
     speed: 1.0
 
