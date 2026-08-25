@@ -100,6 +100,16 @@ MODELS = {
         "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_jp6.tar.gz",
         "check_file": "encoder.trt",
     },
+    # VITS2 TRT engine（JP5 / TRT 8.5.2，mxd_m45d5e6 微调解码器）
+    "vits2_trt_mel20full_d50_mxd_jp5": {
+        "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_mxd.tar.gz",
+        "check_file": "encoder.trt",
+    },
+    # VITS2 TRT engine（JP6 / TRT 10.4，mxd_m45d5e6 微调解码器）
+    "vits2_trt_mel20full_d50_mxd_jp6": {
+        "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_mxd_jp6.tar.gz",
+        "check_file": "encoder.trt",
+    },
 }
 
 

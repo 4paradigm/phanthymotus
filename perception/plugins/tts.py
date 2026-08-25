@@ -232,13 +232,15 @@ def _get_trt_engine(path):
 class TRTTSAdapter(TTSAdapter):
     """VITS2-Mix TensorRT TTS adapter — no PyTorch dependency.
 
-    Uses ONNX Runtime for encoder, TRT engines for flow + decoder,
-    and NumPy for iSTFT. Long text is split by sentence boundaries,
-    each chunk always runs through TRT (no ORT fallback).
+    encoder + flow + decoder 全部走 TRT，NumPy 做 MAS/iSTFT。长文本按句切分，
+    每个 chunk 始终走 TRT（不回退 ORT）；超长 chunk 再按 phone 数截断分次。
     """
 
     _MODEL_CFG = {
         "mel20full_d50": {"n_fft": 128, "hop": 4, "gain": 0.0833},
+        # mxd_m45d5e6 微调：encoder/flow/dp 与 mel20full_d50 冻结，仅 decoder 不同，
+        # 因此 n_fft/hop/gain 完全一致，只换 decoder.trt。
+        "mel20full_d50_mxd": {"n_fft": 128, "hop": 4, "gain": 0.0833},
     }
 
     # 每个 chunk 最大字符数，保证 decoder 输入 Ty 不超过 TRT max shape (JP5=1500)
@@ -250,13 +252,13 @@ class TRTTSAdapter(TTSAdapter):
         self._speed = speed
         self._trt_dir = trt_dir
 
-        # ── 按 TRT 版本选择 engine：JP5=8.5.x / JP6=10.x ──
+        # ── 按 model_type + TRT 版本选择 engine：JP5=8.5.x / JP6=10.x ──
         import tensorrt as trt
         trt_ver = trt.__version__
         if trt_ver.startswith("8.5"):
-            engine_name = "vits2_trt_mel20full_d50_jp5"
+            engine_name = f"vits2_trt_{model_type}_jp5"
         elif trt_ver.startswith("10."):
-            engine_name = "vits2_trt_mel20full_d50_jp6"
+            engine_name = f"vits2_trt_{model_type}_jp6"
         else:
             raise RuntimeError(
                 f"VITS2 TRT engine 仅支持 TRT 8.5.x（JP5）或 10.x（JP6），当前为 TRT {trt_ver}"
