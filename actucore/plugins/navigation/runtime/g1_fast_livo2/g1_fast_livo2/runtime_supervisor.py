@@ -817,10 +817,31 @@ class FastLivo2Supervisor(Node):
                     "static_point_count": point_count,
                     "retryable": True,
                 }
+            stop_timeout_sec = float(
+                self.get_parameter("stop_timeout_sec").value
+            )
+            stop_deadline = time.monotonic() + stop_timeout_sec
+            flush_result = self._flush_raw_pcd(
+                process,
+                timeout_sec=max(0.1, stop_timeout_sec - 10.0),
+            )
+            if flush_result.get("status") != "flushed":
+                result = {
+                    **flush_result,
+                    "map_name": map_name,
+                    "pcd_files": self._changed_pcd_files(),
+                    "manifest": None,
+                }
+                if process.poll() is not None:
+                    self._finish_mapping_runtime(
+                        process,
+                        terminal_result=result,
+                    )
+                return result
             os.killpg(process.pid, signal.SIGINT)
             try:
                 return_code = process.wait(
-                    timeout=float(self.get_parameter("stop_timeout_sec").value)
+                    timeout=max(0.1, stop_deadline - time.monotonic())
                 )
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -1472,6 +1493,56 @@ class FastLivo2Supervisor(Node):
             "-r", "/tf:=/ubuntu/navigation/fast_livo2/raw/tf",
             "-r", "/tf_static:=/ubuntu/navigation/fast_livo2/raw/tf_static",
         ]
+
+    def _flush_raw_pcd(
+        self,
+        process: subprocess.Popen,
+        *,
+        timeout_sec: float,
+    ) -> dict:
+        sequence = time.monotonic_ns() & ((1 << 63) - 1)
+        try:
+            completed = subprocess.run(
+                [
+                    "ros2",
+                    "param",
+                    "set",
+                    "/laserMapping",
+                    "pcd_save.flush_sequence",
+                    str(sequence),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=max(0.1, float(timeout_sec)),
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "error",
+                "error_code": "map_artifact_flush_timeout",
+                "error": "timed out while flushing FAST-LIVO2 raw PCD",
+                "retryable": process.poll() is None,
+            }
+        except OSError as exc:
+            return {
+                "status": "error",
+                "error_code": "map_artifact_flush_failed",
+                "error": f"cannot request FAST-LIVO2 raw PCD flush: {exc}",
+                "retryable": process.poll() is None,
+            }
+        files = self._changed_pcd_files()
+        if completed.returncode == 0 and files:
+            return {"status": "flushed", "pcd_files": files}
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return {
+            "status": "error",
+            "error_code": "map_artifact_flush_failed",
+            "error": (
+                "FAST-LIVO2 raw PCD flush failed"
+                + (f": {detail[:512]}" if detail else "")
+            ),
+            "retryable": process.poll() is None,
+        }
 
     def _pcd_files(self) -> dict[str, tuple[int, int]]:
         files = {}

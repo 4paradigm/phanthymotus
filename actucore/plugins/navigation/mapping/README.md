@@ -137,7 +137,7 @@ freshness 门禁。
 | action          | 参数                                                                                    | 语义                                                    |
 | --------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | `start_mapping` | `map_name`                                                                            | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程                    |
-| `stop_mapping`  | 无                                                                                     | 先检查静态证据，再 `SIGINT` 停止算法；分别保存 raw PCD 与 confirmed static PCD 后原子写 session manifest；保存失败可用同一 action 重试 |
+| `stop_mapping`  | 无                                                                                     | 先检查静态证据，通过 FAST-LIVO2 参数服务同步落盘 raw PCD，再 `SIGINT` 停止算法；随后保存 confirmed static PCD 并原子写 session manifest |
 | `load_map`      | `map_name`                                                                            | 先校验新旧 manifest/PCD，再串行替换定位前端，失败时尝试回滚旧图 |
 | `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
 
@@ -155,6 +155,10 @@ FAST-LIVO2 在受控 `SIGINT` 收口期间可因上游 C++ 析构路径返回
 `-SIGABRT (-6)`。supervisor 仅在自己已发出停止信号的路径将 `0/-SIGINT/-SIGABRT`
 视为受控停止，并在回执保留原始 `algorithm_return_code`；运行中自行 `-6`
 或其他退出码仍按 `algorithm_exited/algorithm_stop_failed` fail closed。
+raw PCD 不再依赖上述退出路径触发析构：supervisor 先设置内部
+`pcd_save.flush_sequence`，只有 FAST-LIVO2 同线程完成原子写盘且本会话出现新
+PCD 后才发送停止信号。落盘失败或超时会返回可重试错误并保持建图进程运行，
+不会先停算法再留下无法恢复的 `map_artifact_missing`。
 
 重定位的操作顺序为：
 

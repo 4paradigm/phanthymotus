@@ -676,6 +676,65 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertIs(supervisor._process, process)
         killpg.assert_not_called()
 
+    def test_raw_pcd_flush_uses_algorithm_parameter_service(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._changed_pcd_files = mock.Mock(
+            return_value=["tail_raw_points.pcd"]
+        )
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        with mock.patch.object(
+            SUPERVISOR_MODULE.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ) as run:
+            result = supervisor._flush_raw_pcd(process, timeout_sec=12.0)
+
+        self.assertEqual(result["status"], "flushed")
+        self.assertEqual(result["pcd_files"], ["tail_raw_points.pcd"])
+        command = run.call_args.args[0]
+        self.assertEqual(command[:5], ["ros2", "param", "set", "/laserMapping", "pcd_save.flush_sequence"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 12.0)
+
+    def test_stop_mapping_keeps_algorithm_running_when_raw_flush_fails(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        process = mock.Mock()
+        process.poll.return_value = None
+        supervisor._lock = threading.RLock()
+        supervisor._process = process
+        supervisor._active_map = "map-a"
+        supervisor._loaded_map = None
+        supervisor._runtime_mode = "mapping"
+        supervisor._started_unix_ms = 123
+        supervisor._pending_mapping_finalize = None
+        supervisor._last_mapping_result = None
+        supervisor._diagnostics = {
+            "session_name": "map-a",
+            "localization_state": "mapping",
+            "map_point_count": 100,
+        }
+        supervisor._diagnostics_monotonic = time.monotonic()
+        supervisor.get_parameter = lambda _name: SimpleNamespace(value=120.0)
+        supervisor._changed_pcd_files = mock.Mock(return_value=[])
+        supervisor._flush_raw_pcd = mock.Mock(
+            return_value={
+                "status": "error",
+                "error_code": "map_artifact_flush_failed",
+                "error": "flush rejected",
+                "retryable": True,
+            }
+        )
+
+        with mock.patch.object(SUPERVISOR_MODULE.os, "killpg") as killpg:
+            result = supervisor._stop_mapping("map-a")
+
+        self.assertEqual(result["error_code"], "map_artifact_flush_failed")
+        self.assertTrue(result["retryable"])
+        self.assertIs(supervisor._process, process)
+        self.assertEqual(supervisor._runtime_mode, "mapping")
+        killpg.assert_not_called()
+
     def test_stale_stop_request_cannot_finalize_other_pending_session(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
         process = mock.Mock()

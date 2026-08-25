@@ -42,6 +42,7 @@ ARG FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye
 ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
 ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b
 ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=b3afa3e64b5743898c829fe34891f828027eb372324d05a8c94357f9cacd6ec4
+ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=1484bfba11408e3efd87360a63fef1787f2b2ceaf75e8d8abdd5a17e3474beeb
 ARG RPG_VIKIT_REPO=https://github.com/Rhymer-Lcy/rpg_vikit_ros2_fisheye.git
 ARG RPG_VIKIT_COMMIT=0b5548d9adab58128f3a59a507e96a83acfa8fdf
 ARG LIVOX_ROS_DRIVER2_REPO=https://github.com/Livox-SDK/livox_ros_driver2.git
@@ -322,19 +323,29 @@ COPY actucore/plugins/navigation/runtime/patches/fast-livo2-runtime.patch \
      /tmp/fast-livo2-runtime.patch
 COPY actucore/plugins/navigation/runtime/patches/fast-livo2-pcd-save.patch \
      /tmp/fast-livo2-pcd-save.patch
+COPY actucore/plugins/navigation/runtime/patches/fast-livo2-pcd-flush.patch \
+     /tmp/fast-livo2-pcd-flush.patch
 RUN [[ "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
     [[ "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    [[ "${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
     printf '%s  %s\n' \
       "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" \
       /tmp/fast-livo2-runtime.patch | sha256sum -c - && \
     printf '%s  %s\n' \
       "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" \
       /tmp/fast-livo2-pcd-save.patch | sha256sum -c - && \
+    printf '%s  %s\n' \
+      "${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" \
+      /tmp/fast-livo2-pcd-flush.patch | sha256sum -c - && \
     cd /opt/fast_livo_ws/src/fast_livo && \
     git apply --check /tmp/fast-livo2-runtime.patch && \
     git apply /tmp/fast-livo2-runtime.patch && \
     git apply --check /tmp/fast-livo2-pcd-save.patch && \
     git apply /tmp/fast-livo2-pcd-save.patch && \
+    patch --dry-run --batch --fuzz=0 --ignore-whitespace -p1 \
+      -i /tmp/fast-livo2-pcd-flush.patch && \
+    patch --batch --fuzz=0 --ignore-whitespace -p1 \
+      -i /tmp/fast-livo2-pcd-flush.patch && \
     git diff --check
 
 WORKDIR /opt/fast_livo_ws
@@ -353,13 +364,14 @@ RUN source /opt/ros/humble/install/setup.bash && \
       --packages-select fast_livo \
       --cmake-args -DCMAKE_BUILD_TYPE=Release
 
-# 两个 G1 patch 是否真的进了二进制 —— 打错分支时这里就会红，而不是等到真机
+# G1 patches 是否真的进了二进制 —— 打错分支时这里就会红，而不是等到真机
 RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
       > /tmp/fastlivo_mapping.strings && \
     grep -Fq "accepting current sample to resynchronize" \
       /tmp/fastlivo_mapping.strings && \
     grep -Fq "PCD checkpoint completed" /tmp/fastlivo_mapping.strings && \
     grep -Fq "PCD finalization completed" /tmp/fastlivo_mapping.strings && \
+    grep -Fq "raw PCD flush failed" /tmp/fastlivo_mapping.strings && \
     ! grep -Fq "imu time stamp Jumps" /tmp/fastlivo_mapping.strings && \
     rm /tmp/fastlivo_mapping.strings
 
@@ -521,6 +533,7 @@ LABEL org.opencontainers.image.title="Phanthy Motus ActuCore" \
       org.opencontainers.image.fast-livo2-revision="${FAST_LIVO2_COMMIT}" \
       org.opencontainers.image.fast-livo2-runtime-patch="${FAST_LIVO2_RUNTIME_PATCH_SHA256}" \
       org.opencontainers.image.fast-livo2-pcd-save-patch="${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" \
+      org.opencontainers.image.fast-livo2-pcd-flush-patch="${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" \
       org.opencontainers.image.navigation2-revision="${NAVIGATION2_COMMIT}"
 
 CMD ["/bin/bash", "-c", \

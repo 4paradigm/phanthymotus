@@ -111,6 +111,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         main = (ACTUCORE_ROOT / "main.py").read_text(encoding="utf-8")
         runtime_patch = runtime / "patches" / "fast-livo2-runtime.patch"
         pcd_patch = runtime / "patches" / "fast-livo2-pcd-save.patch"
+        flush_patch = runtime / "patches" / "fast-livo2-pcd-flush.patch"
 
         self.assertIn(
             "FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea",
@@ -124,6 +125,12 @@ class FastLivo2ContractTest(unittest.TestCase):
             "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=b3afa3e64b5743898c829fe34891f828027eb372324d05a8c94357f9cacd6ec4",
             source_lock,
         )
+        self.assertIn(
+            "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=1484bfba11408e3efd87360a63fef1787f2b2ceaf75e8d8abdd5a17e3474beeb",
+            source_lock,
+        )
+        self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
+        self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
         self.assertIn(
             "APT_UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn", source_lock
         )
@@ -164,6 +171,10 @@ class FastLivo2ContractTest(unittest.TestCase):
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
             "b3afa3e64b5743898c829fe34891f828027eb372324d05a8c94357f9cacd6ec4",
         )
+        self.assertEqual(
+            hashlib.sha256(flush_patch.read_bytes()).hexdigest(),
+            "1484bfba11408e3efd87360a63fef1787f2b2ceaf75e8d8abdd5a17e3474beeb",
+        )
         # base 是 Focal，packages.ros.org 上没有 humble 二进制，所以镜像必须
         # 把 ROS 的 apt 源整体删掉，ROS 侧全部来自源码编译。
         self.assertIn("rm -f /etc/apt/sources.list.d/*.list", dockerfile)
@@ -177,6 +188,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE", dockerfile)
         self.assertIn("git fetch --depth 1 origin", dockerfile)
         self.assertIn("git apply --check /tmp/fast-livo2-runtime.patch", dockerfile)
+        self.assertIn(
+            "patch --dry-run --batch --fuzz=0 --ignore-whitespace -p1",
+            dockerfile,
+        )
         self.assertIn("git apply --check /tmp/fast-livo2-pcd-save.patch", dockerfile)
         self.assertIn("--packages-select livox_ros_driver2 vikit_common vikit_ros", dockerfile)
         self.assertIn("--packages-select fast_livo", dockerfile)

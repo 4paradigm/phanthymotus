@@ -355,6 +355,7 @@ class NavigationContractTest(unittest.TestCase):
             "FAST_LIVO2_REPO",
             "FAST_LIVO2_RUNTIME_PATCH_SHA256",
             "FAST_LIVO2_PCD_SAVE_PATCH_SHA256",
+            "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256",
             "RPG_VIKIT_REPO",
             "LIVOX_ROS_DRIVER2_REPO",
             "LIVOX_SDK2_REPO",
