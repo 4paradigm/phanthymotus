@@ -77,7 +77,15 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "speaker_id": {"type": "integer", "description": "Speaker ID", "default": 0, "scope": "shared"},
+                # Engine belongs here, not only in config.yaml: the dashboard
+                # builds the config form from configSchema, so an engine that
+                # exists solely as a baked YAML key cannot be seen or switched
+                # without rebuilding the image. Mirrors asr_model in asr.py.
+                "tts_engine": {"type": "string", "enum": ["vits2_trt", "sherpa_onnx"],
+                               "description": "TTS engine (vits2_trt = VITS2 TensorRT on Jetson, "
+                                              "sherpa_onnx = sherpa-onnx Matcha on CPU)",
+                               "default": "vits2_trt", "scope": "shared"},
+                "speaker_id": {"type": "integer", "description": "Speaker ID (VITS2 supports 0 only)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
             "required": []
@@ -907,7 +915,7 @@ class _TTSNode(Node):
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
 
-class TTSPlugin:
+class SherpaOnnxTTSPlugin:
     PREFIX = "tts"
 
     def __init__(self, plugin_cfg: dict, executor):
@@ -1140,3 +1148,219 @@ class TTSPlugin:
         if not self._adapter:
             raise RuntimeError("TTS adapter not configured")
         return self._adapter.synthesize(text)
+
+
+DEFAULT_TTS_ENGINE = "vits2_trt"
+TTS_ENGINES = ("vits2_trt", "sherpa_onnx")
+# Where each engine keeps its own model files. Used for any engine other than
+# the one config.yaml was written for; see TTSPlugin._model_dir_for.
+ENGINE_MODEL_DIRS = {
+    "vits2_trt": "/models/vits2",
+    "sherpa_onnx": "/models/sherpa-onnx/tts",
+}
+
+
+class TTSPlugin:
+    """The single public TTS plugin, delegating to a config-selected engine.
+
+    A facade rather than a `__new__` switch: the engine is a configSchema field,
+    so it can change at runtime (`action=config`, `tts_engine=...`) and not only
+    at process start. Switching disposes the previous engine's nodes and builds
+    the new one in the background — sherpa-onnx downloads its Matcha model in
+    its constructor, which would otherwise blow through the 60 s Agent Core
+    allows a processor call.
+    """
+
+    PREFIX = "tts"
+
+    def __init__(self, plugin_cfg: dict, executor):
+        self._cfg = dict(plugin_cfg)
+        self._executor = executor
+        self._lock = threading.Lock()
+        self._impl = None
+        self._impl_engine = ""
+        self._building = ""          # engine name while a build is in flight
+        self._build_error = None
+        engine = self._select_engine(self._cfg.get("engine")
+                                     or self._cfg.get("tts_engine"))
+        self._engine = engine
+        # model_dir is per engine: sherpa-onnx wants its Matcha/vocoder pair,
+        # VITS2 wants its TensorRT release. config.yaml carries one model_dir,
+        # written for the engine it also declares — handing that same path to the
+        # other engine made sherpa download its models into /models/vits2 and
+        # then try to load them from there. So the configured path applies only
+        # to the configured engine; every other engine gets its own default.
+        self._configured_engine = engine
+        self._configured_model_dir = self._cfg.get("model_dir") or ""
+        # Built inline at startup so info/start are immediately truthful, and so
+        # a misconfigured engine shows up in the boot log rather than on the
+        # first utterance. Runtime switches take the background path below.
+        try:
+            self._impl = self._build(engine)
+            self._impl_engine = engine
+        except Exception as error:  # noqa: BLE001 - surfaced via info/start
+            log.error("[tts] failed to build engine %r: %s", engine, error, exc_info=True)
+            self._build_error = str(error)
+
+    # ── engine plumbing ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _select_engine(value) -> str:
+        engine = str(value or DEFAULT_TTS_ENGINE).strip().lower()
+        if engine not in TTS_ENGINES:
+            raise ValueError(f"Unsupported TTS engine: {engine}")
+        return engine
+
+    def _model_dir_for(self, engine: str) -> str:
+        if engine == self._configured_engine and self._configured_model_dir:
+            return self._configured_model_dir
+        return ENGINE_MODEL_DIRS[engine]
+
+    def _build(self, engine: str):
+        cfg = dict(self._cfg)
+        cfg["engine"] = engine
+        cfg["model_dir"] = self._model_dir_for(engine)
+        impl = (self._build_vits2(cfg) if engine == "vits2_trt"
+                else SherpaOnnxTTSPlugin(cfg, self._executor))
+        # An implementation may swallow its own model-load failure and come back
+        # as an object that reports error through info (sherpa does exactly
+        # that). Installing it would make the facade claim ready and let a start
+        # or a speak "succeed" against a model that never loaded, so ask it.
+        state = impl.dispatch("tts", {"action": "info"}) or {}
+        if state.get("state") == "error":
+            raise RuntimeError(
+                state.get("error") or state.get("desc")
+                or f"engine {engine} reported an error after construction"
+            )
+        return impl
+
+    def _build_vits2(self, cfg: dict):
+        from plugins.vits2_tts import Vits2TTSPlugin
+
+        return Vits2TTSPlugin(cfg, self._executor)
+
+    def _build_async(self, engine: str) -> None:
+        """Build an engine off the request thread; the old one is already gone."""
+        def _run():
+            try:
+                impl = self._build(engine)
+            except Exception as error:  # noqa: BLE001
+                log.error("[tts] failed to build engine %r: %s", engine, error,
+                          exc_info=True)
+                with self._lock:
+                    if self._building == engine:
+                        self._building = ""
+                        self._build_error = str(error)
+                return
+            stale = None
+            with self._lock:
+                if self._building != engine:
+                    stale = impl          # another switch superseded this one
+                else:
+                    self._impl = impl
+                    self._impl_engine = engine
+                    self._building = ""
+                    self._build_error = None
+            if stale is not None:
+                _dispose_impl(stale)
+
+        threading.Thread(target=_run, name=f"tts-engine-{engine}", daemon=True).start()
+
+    def get_tools(self) -> list:
+        return TOOLS
+
+    # ── dispatch ────────────────────────────────────────────────────────
+
+    def dispatch(self, name: str, args: dict) -> dict | None:
+        action = args.get("action") if name == "tts" else name
+        if action == "config":
+            return self._config(name, args)
+
+        with self._lock:
+            impl = self._impl
+            building = self._building
+            error = self._build_error
+            engine = self._engine
+        if impl is not None:
+            result = impl.dispatch(name, args)
+            if isinstance(result, dict) and action == "info":
+                result.setdefault("engine", engine)
+            return result
+
+        # No engine resident: only happens while a switch is building, or after
+        # a build failure. Never block the caller waiting for it.
+        if action == "info":
+            state = "loading" if building else "error"
+            result = {
+                "name": "TTS", "manufacture": "Embodied", "model": engine,
+                "engine": engine, "state": state,
+                "desc": (f"Switching to the {building} engine..." if building
+                         else f"Engine {engine} failed to load: {error}"),
+            }
+            if state == "error" and error:
+                result["error"] = error
+            return result
+        if building:
+            return {"state": "loading",
+                    "message": f"TTS engine {building} is initializing, retry shortly"}
+        return {"state": "error", "message": f"TTS engine {engine} failed: {error}"}
+
+    def _config(self, name: str, args: dict) -> dict:
+        """Apply shared config, switching engines when tts_engine changes."""
+        requested = args.get("tts_engine") or args.get("engine")
+        forwarded = {k: v for k, v in args.items()
+                     if k not in ("tts_engine", "engine")}
+        for key in ("speaker_id", "speed"):
+            if key in args:
+                self._cfg[key] = args[key]
+
+        if requested:
+            engine = self._select_engine(requested)
+            with self._lock:
+                switching = engine != self._impl_engine or self._impl is None
+                if switching:
+                    outgoing, self._impl = self._impl, None
+                    self._impl_engine = ""
+                    self._engine = engine
+                    self._cfg["engine"] = engine
+                    self._building = engine
+                    self._build_error = None
+            if switching:
+                # Stop the old engine's nodes before the new one publishes on
+                # the same topics — two live TTS publishers on one topic is the
+                # duplicate-audio failure mode in README § Plugin Concurrency.
+                if outgoing is not None:
+                    _dispose_impl(outgoing)
+                self._build_async(engine)
+                log.info("[tts] switching engine to %s", engine)
+                return {"status": "configured", "state": "loading",
+                        "engine": engine,
+                        "message": f"loading the {engine} engine"}
+
+        with self._lock:
+            impl = self._impl
+            engine = self._engine
+        if impl is None:
+            return {"status": "configured", "state": "loading", "engine": engine}
+        result = impl.dispatch(name, {**forwarded, "action": "config"})
+        if isinstance(result, dict):
+            result.setdefault("engine", engine)
+        return result
+
+    def synthesize_raw(self, text: str) -> bytes:
+        """Synthesize text and return raw PCM bytes (16kHz 16-bit mono)."""
+        with self._lock:
+            impl = self._impl
+            engine = self._engine
+            error = self._build_error
+        if impl is None:
+            raise RuntimeError(f"TTS engine {engine} not ready: {error or 'loading'}")
+        return impl.synthesize_raw(text)
+
+
+def _dispose_impl(impl) -> None:
+    """Stop every node an engine implementation owns before dropping it."""
+    try:
+        impl.dispatch("tts", {"action": "stop"})
+    except Exception:
+        log.error("[tts] failed to stop the outgoing engine", exc_info=True)

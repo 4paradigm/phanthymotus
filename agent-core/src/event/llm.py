@@ -16,6 +16,7 @@ event/llm.py — 事件驱动的 Agent Loop。
 import asyncio
 import json
 import pathlib
+import re
 import time
 import typing
 
@@ -113,6 +114,21 @@ def _trim(message_list: list[dict], max_messages: int = 100, max_images: int = 5
         message_list = message_list[start:]
 
     return message_list
+
+
+def _trigger_channel_ids(trigger_event: dict) -> list[str]:
+    """本轮触发事件里涉及的 channel_id 列表（消息平台来源）。
+
+    collector 组装的 trigger 带 payload.sources，形如 ['dds:/channel/request/feishu_r1']
+    （见 collector._emit_batch）。用于判断「这一轮有人在某个渠道等回复」。
+    """
+    sources = (trigger_event.get('payload') or {}).get('sources') or []
+    ids = []
+    for s in sources:
+        m = re.search(r'/channel/request/([^/\s]+)', str(s))
+        if m and m.group(1) not in ids:
+            ids.append(m.group(1))
+    return ids
 
 
 def _estimate_chars(turns: list[list[dict]]) -> int:
@@ -1132,6 +1148,15 @@ class Event:
                 ]
             else:
                 decisions.append({'round': round_idx, 'text': text, 'tool_calls': []})
+                # 本轮由某个消息渠道触发，却一个工具都没调 → 用户那边是纯沉默：
+                # content 不会送达任何人。曾经因为这个丢过回复，而日志里只有
+                # 「turn complete: 1 rounds」看不出异常，只能去翻 llm_recent_request。
+                if round_idx == 0 and _trigger_channel_ids(trigger_event):
+                    warn = (f'[decision] WARNING: channel-triggered turn produced no tool call — '
+                            f'nothing was delivered to {", ".join(_trigger_channel_ids(trigger_event))}. '
+                            f'content was: {(text or "")[:200]}')
+                    print(warn)
+                    await push_event({'type': 'error', 'payload': {'message': warn}})
                 break
 
             # ── finish 检测 ───────────────────────────────────────────────

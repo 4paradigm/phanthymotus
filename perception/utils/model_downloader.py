@@ -4,13 +4,21 @@ utils/model_downloader.py — Auto-download sherpa-onnx models from COS if missi
 
 from __future__ import annotations
 
-import fcntl
+import hashlib
 import logging
 import os
 import tarfile
 import tempfile
+import time
 import zipfile
-from urllib.request import urlretrieve
+from urllib.error import URLError
+from urllib.parse import quote
+from urllib.request import urlopen, urlretrieve
+
+try:  # Linux only; the perception images are Linux, dev hosts may not be.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows/macOS dev hosts
+    fcntl = None
 
 log = logging.getLogger(__name__)
 
@@ -116,8 +124,13 @@ MODELS = {
 def ensure_model(name: str, model_dir: str) -> None:
     """Ensure model files exist in model_dir. Download from COS if missing.
 
-    用文件锁串行化下载，避免多个进程共享同一 model_dir 时并发解压冲突 /
-    重复下载。check_file 作为完成标记，锁内做二次检查。
+    Serialized per (model_dir, name) with a file lock, and every download lands
+    through a temporary file in the destination directory: the check_file must
+    not exist until the model behind it is complete. Writing the final name
+    directly meant a second caller saw check_file the moment the transfer
+    started and loaded a partial model — observed as
+    "Load model from .../vocos-16khz-univ.onnx failed: Protobuf parsing failed"
+    while the log still showed that file at 30%.
     """
     info = MODELS.get(name)
     if not info:
@@ -129,59 +142,79 @@ def ensure_model(name: str, model_dir: str) -> None:
         return
 
     os.makedirs(model_dir, exist_ok=True)
-    lock_path = os.path.join(model_dir, ".download.lock")
-
-    with open(lock_path, "w") as lock_f:
-        fcntl.flock(lock_f, fcntl.LOCK_EX)  # 阻塞：同一时间只有一个进程下载
+    lock_path = os.path.join(model_dir, f".{name}.lock")
+    with open(lock_path, "a+b") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
-            # 二次检查：等锁期间别的进程可能已经下载完成
             if os.path.exists(check_path):
-                log.info(f"[model_downloader] {name}: downloaded by another process")
+                log.info(f"[model_downloader] {name}: fetched by another instance")
                 return
-
-            url = info["url"]
-            log.info(f"[model_downloader] {name}: downloading from {url} ...")
-
-            if info.get("single_file"):
-                # Direct file download (not an archive)
-                dest = os.path.join(model_dir, info["check_file"])
-                urlretrieve(url, dest, reporthook=_progress_hook(name))
-                log.info(f"[model_downloader] {name}: done.")
-                return
-
-            # Determine suffix from URL
-            if url.endswith(".zip"):
-                suffix = ".zip"
-            elif url.endswith(".tar.gz") or url.endswith(".tgz"):
-                suffix = ".tar.gz"
-            else:
-                suffix = ".tar.bz2"
-
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp_path = tmp.name
-
-            try:
-                urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
-                log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
-
-                if suffix == ".zip":
-                    _extract_zip(tmp_path, model_dir)
-                else:
-                    _extract_tar(tmp_path, model_dir)
-
-                log.info(f"[model_downloader] {name}: done.")
-            finally:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-
-            # Verify
-            if not os.path.exists(check_path):
-                raise RuntimeError(
-                    f"[model_downloader] {name}: download completed but {info['check_file']} "
-                    f"not found in {model_dir}"
-                )
+            _download_model(name, info, model_dir, check_path)
         finally:
-            fcntl.flock(lock_f, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _download_model(name: str, info: dict, model_dir: str, check_path: str) -> None:
+    """Fetch one legacy model into model_dir. Caller holds the per-model lock."""
+    url = info["url"]
+    log.info(f"[model_downloader] {name}: downloading from {url} ...")
+
+    if info.get("single_file"):
+        # Direct file download (not an archive). Staged in the destination
+        # directory so the rename is atomic (same filesystem).
+        with tempfile.NamedTemporaryFile(dir=model_dir, suffix=".part",
+                                         delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, check_path)
+            log.info(f"[model_downloader] {name}: done.")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        return
+
+    # Determine suffix from URL
+    if url.endswith(".zip"):
+        suffix = ".zip"
+    else:
+        suffix = ".tar.bz2"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+        log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
+
+        # Extract beside the destination, then move the files in, so a partly
+        # extracted archive never publishes check_file either.
+        with tempfile.TemporaryDirectory(prefix=f".{name}-", dir=model_dir) as staging:
+            if suffix == ".zip":
+                _extract_zip(tmp_path, staging)
+            else:
+                _extract_tar(tmp_path, staging)
+            if not os.path.exists(os.path.join(staging, info["check_file"])):
+                raise RuntimeError(
+                    f"[model_downloader] {name}: download completed but "
+                    f"{info['check_file']} not found in the archive"
+                )
+            _merge_tree(staging, model_dir)
+
+        log.info(f"[model_downloader] {name}: done.")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    # Verify
+    if not os.path.exists(check_path):
+        raise RuntimeError(
+            f"[model_downloader] {name}: download completed but {info['check_file']} "
+            f"not found in {model_dir}"
+        )
 
 
 def _extract_zip(zip_path: str, model_dir: str) -> None:
@@ -205,9 +238,8 @@ def _extract_zip(zip_path: str, model_dir: str) -> None:
 
 
 def _extract_tar(tar_path: str, model_dir: str) -> None:
-    """Extract tar.bz2 / tar.gz, stripping common top-level directory prefix."""
-    mode = "r:gz" if tar_path.endswith((".gz", ".tgz")) else "r:bz2"
-    with tarfile.open(tar_path, mode) as tf:
+    """Extract tar.bz2, stripping common top-level directory prefix."""
+    with tarfile.open(tar_path, "r:bz2") as tf:
         members = tf.getmembers()
         if not members:
             raise RuntimeError(f"Empty archive: {tar_path}")
@@ -234,3 +266,435 @@ def _common_prefix_from_names(names: list[str]) -> str:
     if len(first_parts) == 1:
         return first_parts.pop() + "/"
     return ""
+
+
+# ── Verified bundles (OCR / obstacle TensorRT artefacts) ─────────────────────
+# Pure additions consumed by the vision plugins' thin wrappers. The legacy
+# ensure_model() above (sherpa-onnx archives, X-ASR) is intentionally left
+# untouched. Every file in a verified bundle carries a pinned size and SHA256:
+# existing files are re-verified before reuse, downloads are staged next to
+# the destination, verified, and only then moved into place. Concurrent
+# instances sharing /models serialize on a per-bundle file lock. Entries that
+# ship one bundle per JetPack family use {"jp511": {...}, "jp61": {...}} keys
+# selected by the TensorRT that is actually importable
+# (see utils.tensorrt_runtime).
+
+
+MODELS_ROOT = "/models"
+
+
+def require_models_subpath(path: str, root: str = MODELS_ROOT) -> str:
+    """Validate that a caller-supplied model_dir stays inside the models tree.
+
+    model_dir is accepted over MCP config and the downloader runs as root in
+    the container, so an unchecked value would let a caller create or
+    overwrite files at arbitrary container paths.
+
+    A lexical check is not enough: ``/models/link`` passes it while ``link``
+    is a symlink pointing outside the tree, and every later makedirs/open/
+    os.replace would follow it. Resolve symlinks on both sides — for the
+    deepest component that exists, since the target directory is usually
+    created later — and compare the resolved paths. Returns the resolved
+    absolute path, which callers must use for all filesystem work.
+    """
+    candidate = os.path.normpath(os.path.join("/", str(path)))
+    root_real = os.path.realpath(root)
+
+    # Resolve the longest existing prefix, then re-attach the missing tail:
+    # realpath() on a not-yet-created directory cannot detect a symlinked
+    # parent otherwise.
+    existing = candidate
+    tail: list[str] = []
+    while not os.path.exists(existing) and existing not in ("/", ""):
+        existing, name = os.path.split(existing)
+        tail.append(name)
+    resolved = os.path.join(os.path.realpath(existing), *reversed(tail))
+    resolved = os.path.normpath(resolved)
+
+    if resolved != root_real and not resolved.startswith(root_real + os.sep):
+        raise ValueError(
+            f"model_dir must resolve under {root_real}/: got {path!r}"
+        )
+    return resolved
+
+
+def select_bundle_family(bundles: dict, family: str | None = None) -> str:
+    """Pick the bundle key ("jp511"/"jp61") for the runtime TensorRT.
+
+    An explicit ``family`` (or alias such as "61"/"511") wins; otherwise the
+    family is derived from the importable TensorRT major version. Never
+    depends on a Docker build argument or image ENV.
+    """
+    from utils.tensorrt_runtime import normalize_family, tensorrt_family
+
+    if family is not None:
+        key = normalize_family(family)
+        if key is None:
+            raise ValueError(f"Unknown model bundle family: {family!r}")
+    else:
+        key = tensorrt_family()
+    if key not in bundles:
+        raise RuntimeError(
+            f"No model bundle for TensorRT family {key}; available: {sorted(bundles)}"
+        )
+    return key
+
+
+def ensure_verified_bundle(
+    name: str, model_dir: str, base_url: str, files: dict
+) -> dict[str, str]:
+    """Ensure a size/SHA256-pinned bundle is present and valid in model_dir.
+
+    existing files → size check → SHA256 check → reuse
+    otherwise      → lock → re-check → download (retry) → verify → replace
+    Returns ``{filename: absolute path}``.
+    """
+    paths = {
+        filename: os.path.join(model_dir, filename) for filename in files
+    }
+    if _bundle_matches(model_dir, files):
+        log.info(f"[model_downloader] {name}: verified bundle already at {model_dir}")
+        return paths
+
+    os.makedirs(model_dir, exist_ok=True)
+    # Platform instances share /models. Serialize the download so a cold
+    # multi-instance launch fetches one copy instead of one per process; a
+    # waiter re-checks the bundle once it gets the lock.
+    lock_path = os.path.join(model_dir, f".{name.replace('/', '_')}.lock")
+    with open(lock_path, "a+b") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if _bundle_matches(model_dir, files):
+                log.info(f"[model_downloader] {name}: verified by another instance")
+                return paths
+            _download_verified_bundle(name, base_url, model_dir, files)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    return paths
+
+
+def _file_matches(path: str, metadata: dict) -> bool:
+    """Return whether one file exists and matches its pinned size and SHA256."""
+    try:
+        if not os.path.isfile(path):
+            return False
+        _verify_pinned_file(path, metadata)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _bundle_matches(model_dir: str, files: dict) -> bool:
+    """Return whether every bundle file matches its pinned size and SHA256."""
+    return all(
+        _file_matches(os.path.join(model_dir, filename), metadata)
+        for filename, metadata in files.items()
+    )
+
+
+def _check_bundle_relpath(filename: str) -> None:
+    """Reject a bundle key that would escape model_dir or break the URL join.
+
+    Keys are relative paths, not bare filenames: the VITS2 release ships
+    ``engines/jp61/flow.plan`` and ``nltk_data/taggers/...`` and its consumers
+    expect that layout on disk. A key is only allowed to descend — no absolute
+    path, no ``..``, no empty or ``.`` segment, no backslash (which is a plain
+    character in a POSIX name but a separator once it reaches a URL).
+    """
+    if not filename or filename != filename.strip():
+        raise ValueError(f"Invalid model filename: {filename!r}")
+    if filename.startswith("/") or "\\" in filename:
+        raise ValueError(f"Invalid model filename: {filename!r}")
+    parts = filename.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"Invalid model filename: {filename!r}")
+
+
+def _verify_pinned_file(path: str, metadata: dict) -> None:
+    actual_size = os.path.getsize(path)
+    if actual_size != metadata["size"]:
+        raise ValueError(
+            f"size mismatch for {os.path.basename(path)}: "
+            f"expected {metadata['size']}, got {actual_size}"
+        )
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != metadata["sha256"]:
+        raise ValueError(
+            f"SHA256 mismatch for {os.path.basename(path)}: "
+            f"expected {metadata['sha256']}, got {actual_sha256}"
+        )
+
+
+def _fetch_pinned_file(
+    name: str, url: str, destination: str, metadata: dict, label: str = ""
+) -> None:
+    """Download one URL to destination, verifying its pinned size and SHA256.
+
+    Retries three times with a short backoff, leaving no partial file behind:
+    a truncated download fails _verify_pinned_file, which is caught here, so a
+    flaky link costs a retry rather than a corrupt model.
+    """
+    label = label or os.path.basename(destination)
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            log.info(
+                f"[model_downloader] {name}: downloading {label} "
+                f"(attempt {attempt}/3)"
+            )
+            with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            _verify_pinned_file(destination, metadata)
+            os.chmod(destination, 0o644)
+            return
+        except (URLError, TimeoutError, OSError, ValueError) as error:
+            last_error = error
+            if os.path.exists(destination):
+                os.unlink(destination)
+            if attempt < 3:
+                time.sleep(3)
+    raise RuntimeError(
+        f"[model_downloader] {name}: failed to download {label}"
+    ) from last_error
+
+
+def _download_verified_bundle(
+    name: str, base_url: str, model_dir: str, files: dict
+) -> None:
+    """Download and verify a multi-file model before replacing its destination."""
+    os.makedirs(model_dir, exist_ok=True)
+    staging_prefix = f".{name.replace('/', '_')}-"
+    with tempfile.TemporaryDirectory(prefix=staging_prefix, dir=model_dir) as staging:
+        for filename, metadata in files.items():
+            _check_bundle_relpath(filename)
+            url = "/".join(
+                [base_url.rstrip("/")] + [quote(part) for part in filename.split("/")]
+            )
+            destination = os.path.join(staging, filename)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            _fetch_pinned_file(name, url, destination, metadata, label=filename)
+
+        for filename in files:
+            final = os.path.join(model_dir, filename)
+            os.makedirs(os.path.dirname(final), exist_ok=True)
+            os.replace(os.path.join(staging, filename), final)
+    log.info(f"[model_downloader] {name}: verified bundle ready at {model_dir}")
+
+
+
+# ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
+# The engines are built per TensorRT major and are not portable, so the
+# bundle is chosen from the TensorRT that is importable at runtime. Only the
+# base URL is provenance-specific: switching the distribution host (e.g. to
+# COS) means changing OCR_MODEL_BASE only.
+OCR_MODEL_BASE = os.environ.get(
+    "OCR_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    "ppocrv6-small-edge-ocr/resolve/"
+    "0301e9299b3abe09c6a60796d7bed74c23fcc525",
+)
+_OCR_KEYS = {
+    "size": 74947,
+    "sha256": "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+}
+OCR_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp6-trt10.4-orin-batch8-cls8",
+        "files": {
+            "det.engine": {
+                "size": 11194324,
+                "sha256": "3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef",
+            },
+            "rec.engine": {
+                "size": 23303292,
+                "sha256": "8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641",
+            },
+            "cls.engine": {
+                "size": 1046484,
+                "sha256": "148a6895260d3b6b6f86e0c5787121fc1bba316f3427397f654421196c13cb77",
+            },
+            "keys.txt": _OCR_KEYS,
+        },
+    },
+    "jp511": {
+        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp511-trt8.5-orin-batch8-cls8",
+        "files": {
+            "det.engine": {
+                "size": 12334256,
+                "sha256": "1bb32a027e93b06d5319ac61e38bb3e447137b01465eacefa7a652f58130ebdf",
+            },
+            "rec.engine": {
+                "size": 19915466,
+                "sha256": "1e204f0469beba33d8590b29c06419cf1073d98d41243b5ee316d2f877340b61",
+            },
+            "cls.engine": {
+                "size": 1038858,
+                "sha256": "02c722e56e621b56a36678cc8aa124a31b41e9e3c9ca350b11e4de0d5bbd0a35",
+            },
+            "keys.txt": _OCR_KEYS,
+        },
+    },
+}
+
+
+def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+    """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(OCR_MODEL_BUNDLES, family)
+    entry = OCR_MODEL_BUNDLES[key]
+    log.info(f"[model_downloader] ocr: using {key} bundle")
+    return ensure_verified_bundle(
+        f"ocr/{key}", model_dir, entry["base_url"], entry["files"]
+    )
+
+
+def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:
+    """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
+
+    The bundle helper above fetches one URL per file, which is right for a
+    handful of engines. A release that also carries its frontend data (VITS2
+    ships ~30 files, most of them small NLTK corpora) is cheaper as a single
+    compressed download, so this variant pins the archive instead: one size +
+    SHA256 covers every member, and 154 MB of engines and FSTs travel as 60 MB.
+
+    A ``.<name>.installed`` marker holding the archive's SHA256 records what is
+    unpacked, so a warm start costs one small read instead of re-hashing every
+    engine. Delete the marker (or the directory) to force a reinstall.
+    """
+    flat = name.replace("/", "_")
+    marker = os.path.join(model_dir, f".{flat}.installed")
+    if _archive_installed(marker, entry["sha256"]):
+        log.info(f"[model_downloader] {name}: verified archive already at {model_dir}")
+        return
+
+    os.makedirs(model_dir, exist_ok=True)
+    # Same rationale as ensure_verified_bundle: instances share /models, so a
+    # cold multi-instance launch must fetch one copy, not one per process.
+    lock_path = os.path.join(model_dir, f".{flat}.lock")
+    with open(lock_path, "a+b") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if _archive_installed(marker, entry["sha256"]):
+                log.info(f"[model_downloader] {name}: installed by another instance")
+                return
+            with tempfile.TemporaryDirectory(prefix=f".{flat}-", dir=model_dir) as staging:
+                archive = os.path.join(staging, os.path.basename(url))
+                _fetch_pinned_file(name, url, archive, entry)
+                payload = os.path.join(staging, "payload")
+                os.makedirs(payload)
+                _extract_verified_tar(archive, payload)
+                os.unlink(archive)
+                _merge_tree(payload, model_dir)
+            # Written last: until the marker exists the install is incomplete
+            # and the next call redoes it, so a crash mid-extract cannot leave
+            # a half-unpacked release looking ready.
+            tmp_marker = f"{marker}.tmp"
+            with open(tmp_marker, "w") as handle:
+                handle.write(entry["sha256"])
+            os.replace(tmp_marker, marker)
+            log.info(f"[model_downloader] {name}: unpacked verified archive to {model_dir}")
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _archive_installed(marker: str, sha256: str) -> bool:
+    """Return whether the marker records this exact archive as unpacked."""
+    try:
+        with open(marker) as handle:
+            return handle.read().strip() == sha256
+    except OSError:
+        return False
+
+
+def _extract_verified_tar(archive: str, destination: str) -> None:
+    """Extract a tar archive, refusing anything that could escape destination.
+
+    tarfile's ``filter="data"`` would cover this, but it only exists from
+    Python 3.12 and the jp511 image is on 3.8 — so the member checks are
+    explicit: regular files and directories only, relative paths only, no
+    symlink or device entries.
+    """
+    with tarfile.open(archive, "r:*") as handle:
+        members = handle.getmembers()
+        if not members:
+            raise RuntimeError(f"Empty archive: {archive}")
+        for member in members:
+            if not (member.isfile() or member.isdir()):
+                raise ValueError(f"Unsupported archive entry: {member.name}")
+            _check_bundle_relpath(member.name)
+        handle.extractall(destination, members=members)
+
+
+def _merge_tree(source: str, destination: str) -> None:
+    """Move every file under source into destination, creating parents."""
+    for root, _, files in os.walk(source):
+        for filename in files:
+            src = os.path.join(root, filename)
+            final = os.path.join(destination, os.path.relpath(src, source))
+            os.makedirs(os.path.dirname(final), exist_ok=True)
+            os.replace(src, final)
+
+
+# ── VITS2 TTS (ZH/EN VITS2 16 kHz, TensorRT engines; one archive per JetPack) ──
+# TensorRT plans are not portable across TensorRT majors, so the archive is
+# chosen from the TensorRT that is importable at runtime, never from a build
+# argument — same rule as OCR above.
+#
+# Each archive carries the frontend the engines need, unpacked to the layout
+# frontend/release_paths.py expects: engines/<family>/*.plan, config.json,
+# frontend_data/, tn_cache/ (compiled WeText TN FSTs) and nltk_data/ (cmudict +
+# perceptron tagger — shipped precisely so the container never has to call
+# nltk.download() at runtime). Upstream is
+# modelscope.cn/models/Starlight777/VITS2-ZH-EN-Male-16k at revision
+# 14954122c4baf4e80b44436c4b2b167e38db4103; the runtime-required files of that
+# revision were repacked per family and mirrored to COS, so devices pull one
+# 60 MB file from the same host as every other model here. The fp32 ONNX graphs
+# the plans were built from are not included — they are build inputs, not
+# runtime files.
+VITS2_MODEL_BASE = os.environ.get("VITS2_MODEL_BASE_URL", COS_BASE)
+VITS2_MODEL_ARCHIVES = {
+    "jp61": {
+        "archive": "vits2-zh-en-male-16k-tensorrt-jp61-trt10.4-orin.tar.gz",
+        "size": 61834952,
+        "sha256": "f04ab439588cd3106ccd245f64af548199ba888d31627827c07ac28368225805",
+    },
+    "jp511": {
+        "archive": "vits2-zh-en-male-16k-tensorrt-jp511-trt8.5-orin.tar.gz",
+        "size": 62994881,
+        "sha256": "01ffce0516f1a68f3fcedce6ff9caff784f428a1d09da2d760fcba599116e8c7",
+    },
+}
+
+
+def ensure_vits2_model(model_dir: str, family: str | None = None) -> str:
+    """Ensure the VITS2 release matching the runtime TensorRT is installed.
+
+    Returns the engine directory for this runtime, which is what the adapter
+    hands to TensorRT — the caller never has to work out the family itself.
+    """
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(VITS2_MODEL_ARCHIVES, family)
+    entry = VITS2_MODEL_ARCHIVES[key]
+    log.info(f"[model_downloader] vits2: using {key} archive")
+    ensure_verified_archive(
+        f"vits2/{key}",
+        model_dir,
+        f"{VITS2_MODEL_BASE.rstrip('/')}/{entry['archive']}",
+        entry,
+    )
+    return os.path.join(model_dir, "engines", key)

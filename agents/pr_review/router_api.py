@@ -36,6 +36,7 @@ async def status(request: Request):
             "max_concurrent_jobs": config.max_concurrent_jobs,
             "job_timeout_seconds": config.job_timeout_seconds,
             "build_timeout_seconds": config.build_timeout_seconds,
+            "build_idle_timeout_seconds": config.build_idle_timeout_seconds,
             "max_attempts": config.max_attempts,
             "job_history_days": config.job_history_days,
             "mirror": config.mirror,

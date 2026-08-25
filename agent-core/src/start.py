@@ -124,6 +124,7 @@ def _register_core_mcp(silent=False):
                         'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
+                        'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
                         'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
                         'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
                         'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
@@ -208,7 +209,12 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_request',
                 'type': 'sensor',
-                'description': 'Channel message input — receive messages from Telegram/Slack and other platforms',
+                'description': (
+                    'Inbound gateway for messaging platforms (Feishu / Telegram / Slack): delivers '
+                    'messages users send from a chat app — including image and file attachments — '
+                    'into the decision core. You never call this tool. The events it produces carry '
+                    'channel="channel:<platform>"; reply to those with channel_reply.'
+                ),
                 'inputSchema': {'type': 'object', 'properties': {}},
                 'configSchema': {
                     'type': 'object',
@@ -227,14 +233,38 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
-                'description': 'Reply to a message from a messaging platform (Feishu/Telegram/Slack). ONLY use this tool when the triggering event has channel="channel:*". Never use for local_mic/remote_mic/remote_web events — those should be answered via TTS/speaker on the robot body.',
+                'description': (
+                    'Send a reply to a user on a messaging platform (Feishu / Telegram / Slack). '
+                    'This is the ONLY way those users receive anything from you — text left in '
+                    '`content` reaches nobody. When the triggering event\'s channel attribute starts '
+                    'with "channel:" (for example channel="channel:feishu"), any reply must go through '
+                    'this tool, and only to that channel. Whether the event warrants a response at all '
+                    'is a separate judgement — see the response rules; when it does not, just finish. '
+                    'Send text, and/or attach files (images, video, documents) through `files` — paths '
+                    'must be under /work or /tmp. Do not use it for on-body channels '
+                    '(local_mic / remote_mic / remote_web); answer those with the robot\'s own output tools.'
+                ),
                 'inputSchema': {
                     'type': 'object',
                     'properties': {
                         'action': {'type': 'string', 'enum': ['send'], 'description': 'Action'},
                         'text': {'type': 'string', 'description': 'Reply text to send to the user'},
+                        'files': {
+                            'type': 'array',
+                            'description': ('Optional files to send. Each item is {"path": "<absolute path inside the container>", '
+                                            '"caption": "<optional>"}. Paths must be under /work or /tmp (e.g. camera snapshots '
+                                            'or files received earlier at /work/resource/channel_files/...). Images ≤10MB, other files ≤30MB on Feishu.'),
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'path': {'type': 'string', 'description': 'Absolute path of the file to send'},
+                                    'caption': {'type': 'string', 'description': 'Optional caption sent with the file'},
+                                },
+                                'required': ['path'],
+                            },
+                        },
                     },
-                    'required': ['action', 'text'],
+                    'required': ['action'],
                 },
                 'configSchema': {
                     'type': 'object',
@@ -301,6 +331,11 @@ async def lifespan(app):
     # 检查宿主是否有 ROS2 DDS 服务
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check_dds)
+
+    # 探测宿主架构（用于向 resource-center 过滤镜像目录）。只是预热 memo 并把值写进
+    # 日志 —— 「为什么这个组件不显示在驱动市场」全靠这一行排查。
+    import hostarch
+    print(f'[startup] host facets: acc_arch={hostarch.acc_arch()} cpu_arch={hostarch.cpu_arch()}')
 
     # 启动 ROS2 bridge（用于 DDS topic 订阅）
     import ros2_bridge
@@ -418,6 +453,12 @@ app_api.include_router(api.agent_definition.router)
 
 import api.skills
 app_api.include_router(api.skills.router)
+
+import api.account
+app_api.include_router(api.account.router)
+
+import api.solutions
+app_api.include_router(api.solutions.router)
 
 import api.history
 app_api.include_router(api.history.router)

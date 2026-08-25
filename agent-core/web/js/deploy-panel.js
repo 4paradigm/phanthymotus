@@ -17,6 +17,12 @@ const _CAT_DESC = {
   actucore:   '执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制',
 };
 let _statuses = {};   // driver_id → { running, status, running_image, image, last_deploy }
+
+// 本机架构 facet，由 /api/registry/catalog 返回；resource-center 据此过滤掉跑不了的镜像。
+// _filter.applied 为 false 说明服务端不认识这两个参数（老版本），此时目录未经过滤。
+let _facets = null;   // { acc_arch, cpu_arch }
+let _filter = { applied: false, hidden_tags: 0, hidden_images: 0 };
+
 let _logPolls = {};   // driver_id → intervalId
 let _currentChannel = 'ga'; // mirrors config.core.update_channel; kept in sync by _loadChannel/_onChannelChange
 
@@ -143,6 +149,10 @@ async function _loadCatalog(refresh = false) {
     const res  = await fetch(url);
     const json = await res.json();
     if (json.data) _catalog = json.data;
+    if (json.facets) _facets = json.facets;
+    // Only applied=true when resource-center actually understands the arch params — an
+    // older one returns everything, and we must not claim the list was filtered.
+    if (json.filter) _filter = json.filter;
   } catch { /* keep existing */ }
 }
 
@@ -201,6 +211,30 @@ function _renderMyServices() {
     if (!s) return false;
     return s.running || s.last_deploy || item._cat === 'core';
   });
+
+  // Orphan guard: the catalog is arch-filtered by resource-center, so a service that
+  // was installed with a wrong-arch image (e.g. a jp5 perception on a JetPack 6 robot,
+  // installed before that filtering existed) has no catalog entry any more. Without
+  // this it would vanish from 我的服务 entirely — no way to stop, uninstall, or read
+  // its logs. The manifest and GET /api/drivers still know about it, so rebuild a
+  // minimal item from the status. tags: [] makes _svcRowHTML drop the version switcher
+  // while keeping 启动 / 停止 / 卸载 / 日志.
+  const seenIds = new Set(deployed.map(it => _driverIdForItem(it, it._cat)));
+  for (const [id, s] of Object.entries(_statuses)) {
+    if (seenIds.has(id) || !(s.running || s.last_deploy)) continue;
+    const friendly = s.name || id;
+    deployed.push({
+      _cat:      s.category || 'driver',
+      _id:       id,
+      _orphan:   true,
+      // _svcRowHTML 取 model（driver）或 name（其余），两个都给，否则会退化成裸镜像地址
+      name:      friendly,
+      model:     friendly,
+      image:     id,
+      full_repo: (s.image || s.running_image || '').split(':')[0],
+      tags:      [],
+    });
+  }
 
   if (deployed.length === 0) {
     container.innerHTML = `<div class="svc-empty">
@@ -367,7 +401,12 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
   // Log button (always available)
   actions += `<button class="svc-btn svc-btn-log" data-action="log" data-driver-id="${id}">日志</button>`;
 
-  const versionText = currentTag || (s.running_image?.split(':').pop()) || '—';
+  // 孤儿服务没有 catalog 条目，停止时 running_image 也是空的 —— 退回到 manifest 里记录的
+  // 镜像，否则用户看到的只有一个「—」，没法知道自己装的到底是哪个版本。
+  const versionText = currentTag
+    || (s.running_image?.split(':').pop())
+    || (item._orphan ? (s.image || s.last_deploy?.image || '').split(':').pop() : '')
+    || '—';
 
   return `
     <div class="svc-row" id="card-${id}">
@@ -376,6 +415,7 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
         <span class="svc-row-name">${label}</span>
         <div class="svc-row-version-line">
           <span class="svc-row-version">${versionText}</span>
+          ${item._orphan ? '<span class="svc-ver-channel" title="该镜像与本机架构不匹配，或已从资源中心下架">架构不匹配</span>' : ''}
           ${hasUpdate ? `<span class="svc-row-arrow">→</span><span class="svc-row-new-version">${latestTag}</span>` : ''}
         </div>
       </div>
@@ -430,6 +470,8 @@ function _renderMarketplace() {
 
   // Render grid
   const gridEl = document.getElementById('marketplace-grid');
+  const hintEl = document.getElementById('marketplace-host-hint');
+  if (hintEl) hintEl.innerHTML = _hostHintHTML();
   if (filtered.length === 0) {
     gridEl.innerHTML = `<div class="svc-empty">
       <div class="svc-empty-title">未找到驱动</div>
@@ -493,6 +535,7 @@ function _mpCardHTML(item) {
     return `<div class="mp-version-opt" data-driver-id="${driverId}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}" data-channel="${t.channel || ''}">
       <span class="mp-version-tag">${t.tag}</span>
       ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
+      ${_archBadgeHTML(t)}
       ${t.created ? `<span class="mp-version-date">${t.created.replace(/\s+\d{2}:\d{2}$/, '')}</span>` : ''}
     </div>`;
   }).join('');
@@ -729,6 +772,8 @@ function _showVersionSheet(optionsHTML) {
 }
 
 function _driverIdForItem(item, category) {
+  // Orphan items (rebuilt from _statuses, not from the catalog) carry their id directly
+  if (item._id) return item._id;
   if (category === 'driver') return `${item.provider}-${item.model}`;
   return item.image;
 }
@@ -738,6 +783,61 @@ function _channelLabel(channel) {
   if (channel === 'release') return 'Release';
   if (channel === 'preview') return 'Preview';
   return '';
+}
+
+// ── 架构展示 ──────────────────────────────────────────────────────────────
+
+const _ACC_LABEL = {
+  'jetson-jp4': 'JetPack 4',
+  'jetson-jp5': 'JetPack 5',
+  'jetson-jp6': 'JetPack 6',
+  'agnostic':   '通用',
+  'none':       '无 NVIDIA 加速器',
+};
+
+function _accLabel(v) {
+  return _ACC_LABEL[v] || v || '未知';
+}
+
+/**
+ * 单个版本的架构徽标。只在版本确实绑定了某种加速器时显示 —— agnostic / 未知不显示，
+ * 免得给每个 driver 都挂一个没信息量的「通用」。
+ */
+function _archBadgeHTML(t) {
+  const acc = t.acc_arch;
+  if (!acc || acc === 'agnostic') return '';
+  return `<span class="mp-version-arch">${_accLabel(acc)}</span>`;
+}
+
+/**
+ * 本机架构提示条。
+ *
+ * 存在的理由：市场里的列表是按本机架构过滤过的，跟官网 motus.phanthy.com 看到的**不一样**。
+ * 用户如果不知道这件事，只会以为某个组件消失了。所以把本机架构和被隐藏的数量都摊开讲清楚。
+ */
+function _hostHintHTML() {
+  if (!_facets) return '';
+
+  const arch = `${_accLabel(_facets.acc_arch)} · ${_facets.cpu_arch || '未知'}`;
+
+  if (!_filter.applied) {
+    // 老 resource-center 忽略了架构参数 —— 不能谎称已过滤，但要提醒用户自己看清版本后缀
+    return `<div class="mp-host-hint mp-host-hint-warn">
+      <span class="mp-host-hint-label">本机架构</span>
+      <span class="mp-host-hint-arch">${arch}</span>
+      <span class="mp-host-hint-note">资源中心版本较旧，未按架构过滤 —— 安装前请自行核对版本后缀</span>
+    </div>`;
+  }
+
+  const hidden = _filter.hidden_tags > 0
+    ? `已为你隐藏 ${_filter.hidden_tags} 个跑不了的版本${_filter.hidden_images > 0 ? `（含 ${_filter.hidden_images} 个组件）` : ''}，因此这里比官网少`
+    : '当前所有版本都能在本机运行';
+
+  return `<div class="mp-host-hint">
+    <span class="mp-host-hint-label">本机架构</span>
+    <span class="mp-host-hint-arch">${arch}</span>
+    <span class="mp-host-hint-note">${hidden}</span>
+  </div>`;
 }
 
 function _updateStatusDots() {

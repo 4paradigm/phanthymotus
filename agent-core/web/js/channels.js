@@ -55,8 +55,10 @@ function _renderChannels(channels) {
         <span class="channel-item-icon">${_platformIcon(ch.platform)}</span>
         <span class="channel-item-name">${_esc(ch.id)}</span>
         <span class="channel-item-platform">${_esc(ch.platform)}</span>
-        <span class="channel-item-status ${ch.status === 'connected' ? 'online' : 'offline'}">${_esc(ch.status)}</span>
+        <span class="channel-item-status ${ch.status === 'connected' ? 'online' : 'offline'}"
+              title="${_esc(ch.health_error || '')}">${_esc(ch.status)}</span>
       </div>
+      ${ch.health_error ? `<div class="channel-item-error">${_esc(ch.health_error)}</div>` : ''}
       <div class="channel-item-actions">
         <button class="btn-ghost btn-sm" onclick="window._channelStop('${_esc(ch.id)}')">Stop</button>
         <button class="btn-ghost btn-sm" onclick="window._channelRestart('${_esc(ch.id)}')">Restart</button>

@@ -12,6 +12,8 @@ import { initActivityLog }   from './activity-log.js';
 import { initDetailPanel }   from './detail-panel.js';
 import { initMonitorMode }   from './monitor-mode.js';
 import { initSkills }        from './skills.js';
+import { initSolutions }     from './solutions.js';
+import { initAccount }       from './account.js';
 import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
 import { initChannels }      from './channels.js';
@@ -42,6 +44,8 @@ async function main() {
   initMonitorMode();
   initDeployPanel();
   initSkills();
+  initSolutions();
+  initAccount();
   initHistory();
   initNetwork();
   initChannels();

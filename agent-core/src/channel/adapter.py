@@ -1,7 +1,19 @@
 """
 channel/adapter.py — Channel Adapter ABC。
 
-每个消息平台（Telegram、Slack 等）实现此接口。
+每个消息平台（Telegram、Slack、飞书 等）实现此接口。
+
+## 附件（Attachment）
+
+入站与出站共用 `Attachment` 描述媒体：入站由平台下载后落盘（见 channel/store.py），
+`path` 指向容器内持久化目录；出站由 LLM 给出容器内路径（见 channel/media.py 做白名单校验），
+adapter 负责上传到平台。
+
+## 健康状态
+
+`status()` 不能只看「start() 有没有抛异常」——WS 长连接可能静默断开、凭据可能被吊销。
+每个 adapter 应重写 `health_check()` 返回真实可观测的连通性；`ChannelManager` 的 watchdog
+和「启动控制」时的卡片自检都依赖它。
 """
 
 from abc import ABC, abstractmethod
@@ -9,16 +21,44 @@ from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
 
+# 附件类别 → 各平台据此选择上传/发送接口
+KIND_IMAGE = 'image'
+KIND_VIDEO = 'video'
+KIND_AUDIO = 'audio'
+KIND_FILE  = 'file'
+
+
+@dataclass
+class Attachment:
+    """一个媒体文件（入站已落盘 / 出站待上传）。"""
+    kind: str = KIND_FILE       # image | video | audio | file
+    path: str = ''              # 容器内绝对路径
+    name: str = ''              # 展示用文件名
+    mime: str = ''              # MIME 类型（可空）
+    size: int = 0               # 字节数
+    caption: str = ''           # 出站时的附带说明（部分平台支持）
+
+    def to_dict(self) -> dict:
+        return {
+            'kind': self.kind,
+            'path': self.path,
+            'name': self.name,
+            'mime': self.mime,
+            'size': self.size,
+        }
+
+
 @dataclass
 class InboundMessage:
     """适配器解析后的统一入站消息格式。"""
-    platform: str           # 'telegram', 'slack', ...
+    platform: str           # 'telegram', 'slack', 'feishu', ...
     channel_id: str         # 配置 ID（channel_configs.id）
     user_id: str            # 平台用户 ID
     chat_id: str            # 会话/频道 ID（用于回复路由）
     display_name: str       # 用户显示名
-    text: str               # 消息文本
-    attachments: list = field(default_factory=list)  # 附件列表（future）
+    text: str               # 消息文本（无文本时为附件占位描述，如 "[图片]"）
+    message_id: str = ''    # 平台消息 ID（用于去重）
+    attachments: list[Attachment] = field(default_factory=list)
 
 
 @dataclass
@@ -26,7 +66,9 @@ class OutboundMessage:
     """发送给平台的统一出站消息格式。"""
     chat_id: str            # 目标会话 ID
     text: str = ''          # 文本内容
-    image_bytes: bytes | None = None  # 图片（可选）
+    files: list[Attachment] = field(default_factory=list)  # 附件（图片/视频/文件）
+    # 兼容旧调用方：直接给字节的图片
+    image_bytes: bytes | None = None
     image_caption: str = ''
 
 
@@ -34,8 +76,30 @@ class OutboundMessage:
 OnMessageCallback = Callable[[InboundMessage], Awaitable[None]]
 
 
+class PartialSendError(RuntimeError):
+    """一条出站消息里，部分内容发出去了、部分失败了。
+
+    文本与每个附件在平台侧是**独立的**几次调用（飞书要先上传再发一条 image/file 消息）。
+    如果附件失败就整体抛异常，上层只看到「失败」，LLM 会把已经送达的文本重发一遍
+    —— 用户那边收到两条一样的话。带上 sent 让上层能如实回报「文本已达、文件没成功」。
+    """
+
+    def __init__(self, sent: list[str], failures: list[str]):
+        self.sent = sent
+        self.failures = failures
+        parts = []
+        if sent:
+            parts.append('已发送：' + '、'.join(sent) + '（不要重发这部分）')
+        if failures:
+            parts.append('失败：\n' + '\n'.join(failures))
+        super().__init__('\n'.join(parts))
+
+
 class ChannelAdapter(ABC):
     """消息平台适配器基类。"""
+
+    # 该平台支持发送的附件类别；send_message 遇到不支持的类别应抛异常而非静默丢弃
+    SUPPORTED_FILE_KINDS: tuple[str, ...] = ()
 
     def __init__(self, channel_id: str, platform: str, config: dict,
                  on_message: OnMessageCallback):
@@ -51,7 +115,11 @@ class ChannelAdapter(ABC):
 
     @abstractmethod
     async def start(self) -> None:
-        """启动适配器（开始接收消息）。"""
+        """启动适配器（开始接收消息）。
+
+        实现约定：凭据无效 / 无法连接时必须抛异常，不要「起个线程就返回」——
+        上层据此决定是否重试、是否把状态标成 error。
+        """
         ...
 
     @abstractmethod
@@ -61,9 +129,16 @@ class ChannelAdapter(ABC):
 
     @abstractmethod
     async def send_message(self, msg: OutboundMessage) -> None:
-        """发送消息到平台。"""
+        """发送消息到平台。失败必须抛异常（上层据此回报给 LLM/用户）。"""
         ...
 
+    async def health_check(self) -> tuple[bool, str]:
+        """返回 (是否连通, 失败原因)。默认只看 _running，子类应重写为真实探测。"""
+        return (self._running, '' if self._running else 'adapter not running')
+
     def status(self) -> str:
-        """返回当前状态。"""
+        """返回当前状态：connected / degraded / disconnected。
+
+        默认实现无法区分 degraded；重写 health_check() 的子类应同时重写本方法。
+        """
         return 'connected' if self._running else 'disconnected'

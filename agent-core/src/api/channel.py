@@ -89,6 +89,10 @@ async def restart_channel(channel_id: str):
     ch = get_channel_config(channel_id)
     if ch is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    # Restart implies "I want this running" — otherwise restart_adapter is a no-op
+    # for a previously stopped (disabled) channel.
+    if not ch.get('enabled'):
+        update_channel_config(channel_id, enabled=True)
     await manager.restart_adapter(channel_id)
     return {'status': 'ok'}
 
@@ -98,6 +102,9 @@ async def stop_channel(channel_id: str):
     ch = get_channel_config(channel_id)
     if ch is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    # Persist the intent: the manager watchdog reconnects any *enabled* channel,
+    # so without this a stopped channel would come back within 30s.
+    update_channel_config(channel_id, enabled=False)
     if channel_id in manager._adapters:
         await manager._adapters[channel_id].stop()
         del manager._adapters[channel_id]

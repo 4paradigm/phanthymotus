@@ -122,6 +122,10 @@ class JobStore:
              "ALTER TABLE build_results ADD COLUMN container_name TEXT"),
             ("variant",
              "ALTER TABLE build_results ADD COLUMN variant TEXT"),
+            ("duration_seconds",
+             "ALTER TABLE build_results ADD COLUMN duration_seconds REAL"),
+            ("timeout_kind",
+             "ALTER TABLE build_results ADD COLUMN timeout_kind TEXT"),
         ):
             if column not in br_existing:
                 conn.execute(ddl)
@@ -286,8 +290,9 @@ class JobStore:
                 INSERT OR REPLACE INTO build_results (
                   job_id, idx, target, driver_path,
                   success, image_tag, log_path,
-                  container_name, created_at, variant
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                  container_name, created_at, variant,
+                  duration_seconds, timeout_kind
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job_id,
@@ -302,6 +307,8 @@ class JobStore:
                     result.container_name,
                     time.time(),
                     result.variant,
+                    result.duration_seconds,
+                    result.timeout_kind,
                 ),
             )
             conn.commit()
@@ -430,6 +437,13 @@ class JobStore:
                     "has_log": bool(r["log_path"]) and Path(r["log_path"]).exists(),
                     "container_name": _col(r, "container_name"),
                     "variant": _col(r, "variant", ""),
+                    # Not _col(): it collapses a falsy value to the default, and
+                    # a duration is a number where 0 is a legitimate reading.
+                    "duration_seconds": (
+                        r["duration_seconds"]
+                        if "duration_seconds" in r.keys() else None
+                    ),
+                    "timeout_kind": _col(r, "timeout_kind", ""),
                 }
                 for r in br
             ]

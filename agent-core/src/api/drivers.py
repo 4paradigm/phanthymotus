@@ -256,6 +256,12 @@ def _deploy_sync_legacy(driver: dict) -> dict:
         restart_policy={'Name': 'unless-stopped'},
     )
 
+    # Second consumer of the `-jetson` tag suffix, alongside hostarch.py /
+    # resource-center's lib/arch.ts — but a different question: does this image want
+    # the nvidia runtime? Keep it even though the catalog is now arch-filtered:
+    # POST /api/drivers/{id}/deploy still accepts an arbitrary image, so the UI being
+    # unable to pick a mismatched one is not a guarantee. If tags ever stop carrying
+    # `-jetson`, this silently falls back to privileged without the nvidia runtime.
     if '-jetson' in target_image:
         # Only use nvidia runtime if available on host
         try:
@@ -391,6 +397,14 @@ def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
             # Also sync port from registry catalog for hardware drivers
             if item.get('port') and not existing.get('port'):
                 existing['port'] = item['port']
+            # Backfill provider/model on manifests written before these were stored.
+            # The id alone can't be split back apart ('x-humanoid-tianyi2.0' — the
+            # provider itself contains a hyphen), and 适用机型 is derived from model.
+            if category == 'driver':
+                if item.get('provider'):
+                    existing['provider'] = item['provider']
+                if item.get('model'):
+                    existing['model'] = item['model']
             updated += 1
         else:
             # Build human-readable name
@@ -408,6 +422,9 @@ def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
                 'description':    '',
                 **_SERVICE_ENDPOINTS.get(image_name, {}),
             }
+            if category == 'driver':
+                new_entry['provider'] = item.get('provider', '')
+                new_entry['model'] = item.get('model', '')
             # Preserve port from registry catalog for hardware drivers (used to derive mcp_url)
             if item.get('port') and 'port' not in new_entry:
                 new_entry['port'] = item['port']
@@ -463,7 +480,9 @@ async def drivers_list():
 @router.post('/sync')
 async def drivers_sync():
     """Fetch registry catalog and upsert drivers in DB."""
-    from api.registry import _build_catalog_sync, _current_channel, _cache as _registry_cache
+    from api.registry import (
+        _build_catalog_sync, _current_channel, cache_key, _cache as _registry_cache,
+    )
     channel = _current_channel()
     loop = asyncio.get_event_loop()
     try:
@@ -471,8 +490,9 @@ async def drivers_sync():
     except Exception as e:
         return {'code': 500, 'message': str(e)}
 
-    # Update registry cache with fresh data so next GET /registry/catalog is immediate
-    _registry_cache[channel] = {'data': catalog, 'ts': __import__('time').time()}
+    # Update registry cache with fresh data so next GET /registry/catalog is immediate.
+    # Must use cache_key(): the key includes the host arch facets, not just the channel.
+    _registry_cache[cache_key(channel)] = {'data': catalog, 'ts': __import__('time').time()}
 
     manifest = _load_manifest()
     added, updated = _upsert_from_catalog(manifest, catalog)

@@ -403,6 +403,12 @@ async def call_tool(full_name: str, args: dict) -> str:
         if meta.get('has_config_schema'):
             saved_cfg = _get_tool_config(mcp_id, tool_name)
             if saved_cfg:
+                # Drop keys the current schema no longer advertises; a stale row
+                # would otherwise be replayed on every start. See tool_config.
+                from tool_config import find_tool, split_config_by_scope
+                _shared, _inst = split_config_by_scope(find_tool(mcp_id, tool_name), saved_cfg)
+                saved_cfg = {**_shared, **_inst}
+            if saved_cfg:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     cfg_result = await _jrpc(session, url, 'tools/call', {
                         'name':      tool_name,
@@ -452,6 +458,18 @@ async def call_tool(full_name: str, args: dict) -> str:
     texts  = [c.get('text', '') for c in content_items if c.get('type') == 'text']
 
     if images:
+        # 与 Read 读图同一个开关。关闭时按**失败**返回，不要返回「成功但没有图像」——
+        # 模型会把成功结果当成「我拿到了这张图」，然后凭 mime 和字节数编出画面内容。
+        from event.desktop import vision_input_enabled
+        if not vision_input_enabled():
+            lines = list(texts)
+            for img in images:
+                mime = img.get('mimeType', 'image/jpeg')
+                approx = len(img.get('data', '')) * 3 // 4
+                lines.append(
+                    f'Error: cannot parse image contents — this model does not accept '
+                    f'image input. Image: [{mime} | {approx} bytes]')
+            return '\n'.join(lines)
         parts_list = []
         for img in images:
             data   = img.get('data', '')
@@ -545,20 +563,16 @@ async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
     if tool_name == 'channel_reply':
         action = args.get('action', '')
         if action == 'send':
-            text = args.get('text', '')
-            if not text:
-                return 'Error: "text" field is required.'
+            text = args.get('text', '') or ''
+            files = args.get('files', []) or []
+            if not text and not files:
+                return 'Error: provide "text" and/or "files".'
             from channel.manager import manager as channel_mgr
-            channels_with_context = list(channel_mgr._get_last_context().keys())
-            if not channels_with_context:
-                return (
-                    'Error: No active conversation context. '
-                    'A user must send a message to the bot first before it can reply. '
-                    'Ask the user to send a message in Feishu/Telegram/Slack.'
-                )
-            channel_id = channels_with_context[-1]
-            return await channel_mgr.send_to_channel(channel_id, text)
-        return f'Error: Unknown action "{action}". Use action="send" with a "text" field.'
+            # instance_id 由 llm.py 从画布绑定注入（_bound_instance_ids），
+            # 用它解析卡片上选的 channel —— 卡片配置必须真正决定回复去向
+            return await channel_mgr.send_reply(
+                instance_id=args.get('instance_id', ''), text=text, files=files)
+        return f'Error: Unknown action "{action}". Use action="send" with "text" and/or "files".'
 
     # Default: return info for other internal tools
     return json.dumps({'status': 'ok', 'tool': tool_name})

@@ -284,7 +284,7 @@ function _buildChip(mcp, tool) {
     chip.querySelector('.chip-config-btn').addEventListener('click', (e) => {
       e.stopPropagation();
       e.preventDefault();
-      _openToolConfigModal(mcp.id, tool.name, configSchema);
+      openToolConfigModal(mcp.id, tool.name, configSchema);
     });
   }
 
@@ -419,7 +419,7 @@ function _buildToolCard(mcp, tool) {
   if (hasSharedFields) {
     card.querySelector('.tool-card-config-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      _openToolConfigModal(mcp.id, tool.name, configSchema);
+      openToolConfigModal(mcp.id, tool.name, configSchema);
     });
   }
 
@@ -443,6 +443,70 @@ function _buildToolCard(mcp, tool) {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
+/**
+ * True for schema types that cannot round-trip through a plain text input.
+ *
+ * Setting `input.value` to an object coerces it to the literal string
+ * "[object Object]", which then gets persisted and pushed to the plugin — where
+ * e.g. perception's ocr does `dict("[object Object]")` and dies. Arrays fail the
+ * same way: the plugin expects a list and gets a string.
+ */
+function _isStructuredField(def) {
+  return def.type === 'object' || def.type === 'array';
+}
+
+/** A comma-separated line is friendlier than JSON for a plain list of strings. */
+function _isStringList(def) {
+  return def.type === 'array' && (def.items || {}).type === 'string';
+}
+
+/** Build the input element for a structured (object/array) config field. */
+function _makeStructuredInput(key, def, saved) {
+  const value = saved !== undefined ? saved : def.default;
+  if (_isStringList(def)) {
+    const input = document.createElement('input');
+    input.className = 'tool-config-input';
+    input.dataset.key = key;
+    input.dataset.valueKind = 'string-list';
+    input.type = 'text';
+    input.placeholder = '逗号分隔，如 person, chair';
+    input.value = Array.isArray(value) ? value.join(', ') : (value == null ? '' : String(value));
+    return input;
+  }
+  const input = document.createElement('textarea');
+  input.className = 'tool-config-input';
+  input.dataset.key = key;
+  input.dataset.valueKind = 'json';
+  input.rows = 4;
+  input.placeholder = def.default != null ? JSON.stringify(def.default, null, 2) : '{ }';
+  input.value = value == null ? '' : JSON.stringify(value, null, 2);
+  return input;
+}
+
+/**
+ * Read one config input into its schema-typed value.
+ * Throws with a field-scoped message when a JSON field will not parse, so the
+ * modal can refuse to save rather than persist a corrupt value.
+ */
+function _readConfigValue(input, def) {
+  const raw = input.value.trim();
+  const kind = input.dataset.valueKind;
+  if (kind === 'string-list') {
+    return raw.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  if (kind === 'json') {
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`${def?.title || input.dataset.key}: JSON 格式错误 — ${err.message}`);
+    }
+  }
+  if (def?.type === 'integer') return parseInt(raw, 10);
+  if (def?.type === 'number')  return parseFloat(raw);
+  if (def?.type === 'boolean') return raw === 'true';
+  return raw;
+}
+
 /** Check if a configSchema has any instance-scope fields. */
 function _hasInstanceFields(configSchema) {
   if (!configSchema || !configSchema.properties) return false;
@@ -459,7 +523,7 @@ export function hasSharedRequired(configSchema) {
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
-async function _openToolConfigModal(mcpId, toolName, configSchema) {
+export async function openToolConfigModal(mcpId, toolName, configSchema) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
@@ -615,6 +679,8 @@ async function _openToolConfigModal(mcpId, toolName, configSchema) {
         errOpt.textContent = 'Failed to load channels';
         input.appendChild(errOpt);
       });
+    } else if (_isStructuredField(def)) {
+      input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -672,18 +738,18 @@ async function _openToolConfigModal(mcpId, toolName, configSchema) {
   const save = async () => {
     if (!(await ensureEdit())) return;
     const values = {};
-    bodyEl.querySelectorAll('[data-key]').forEach(input => {
-      const v = input.value.trim();
-      if (!v) return;
+    for (const input of bodyEl.querySelectorAll('[data-key]')) {
+      if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') return;
-      const fieldDef = props[input.dataset.key];
-      if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
-      else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
-      else if (fieldDef?.type === 'boolean') values[input.dataset.key] = v === 'true';
-      else values[input.dataset.key] = v;
-    });
+      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      try {
+        values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
+      } catch (err) {
+        alert(err.message);
+        return;
+      }
+    }
 
     // Save to per-tool API
     try {
@@ -937,6 +1003,8 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         errOpt.textContent = 'Failed to load channels';
         input.appendChild(errOpt);
       });
+    } else if (_isStructuredField(def)) {
+      input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -959,18 +1027,18 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const save = async () => {
     if (!(await ensureEdit())) return;
     const values = {};
-    bodyEl.querySelectorAll('[data-key]').forEach(input => {
-      const v = input.value.trim();
-      if (!v) return;
+    for (const input of bodyEl.querySelectorAll('[data-key]')) {
+      if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') return;
-      const fieldDef = props[input.dataset.key];
-      if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
-      else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
-      else if (fieldDef?.type === 'boolean') values[input.dataset.key] = v === 'true';
-      else values[input.dataset.key] = v;
-    });
+      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      try {
+        values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
+      } catch (err) {
+        alert(err.message);
+        return;
+      }
+    }
 
     try {
       const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {

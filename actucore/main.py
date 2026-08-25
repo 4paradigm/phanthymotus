@@ -96,7 +96,7 @@ class ActuCoreBundle:
         #            log.info("XPlugin loaded")
         #
         # 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步，参照
-        # perception/main.py 里 htmsg/vop 的写法：namespace 为空时用
+        # perception/main.py 里 vop 的写法：namespace 为空时用
         # re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname()) 兜底。
         #
         # 卡片契约（PREFIX 不能含下划线、action.enum 必须含 "info" 等）见 README.md。

@@ -80,7 +80,8 @@ def format_building(
 | Build targets | {listed} |
 | Status | Building... |
 
-Builds usually take 5–20 minutes. This comment will be updated when done.
+Builds usually take 5–20 minutes, and longer when something compiles from source.
+This comment will be updated when done.
 """
 
 
@@ -89,24 +90,31 @@ def format_build_result(head_sha: str, results: list[BuildResult]) -> str:
     rows = []
     for r in results:
         name = r.label()
+        took = _fmt_took(r.duration_seconds)
         if r.success:
             _, tag = split_image_ref(r.image_tag)
             version = f"`{tag}`" if tag else "—"
-            rows.append(f"| {name} | :white_check_mark: Success | {version} |")
+            rows.append(
+                f"| {name} | :white_check_mark: Success | {version} | {took} |"
+            )
+        elif r.timeout_kind:
+            rows.append(f"| {name} | :hourglass: Killed | — | {took} |")
         else:
-            rows.append(f"| {name} | :x: Failed | — |")
+            rows.append(f"| {name} | :x: Failed | — | {took} |")
 
     table = (
-        "| Target | Status | Version |\n"
-        "|--------|--------|---------|\n" + "\n".join(rows)
+        "| Target | Status | Version | Took |\n"
+        "|--------|--------|---------|------|\n" + "\n".join(rows)
     )
 
     all_ok = all(r.success for r in results)
-    headline = (
-        "All builds succeeded."
-        if all_ok
-        else "Build failed. See the collapsed logs below."
-    )
+    killed = [r for r in results if r.timeout_kind]
+    if all_ok:
+        headline = "All builds succeeded."
+    elif killed and not [r for r in results if not r.success and not r.timeout_kind]:
+        headline = "A build did not finish — the agent stopped it. See below."
+    else:
+        headline = "Build failed. See the collapsed logs below."
 
     body = f"""{BOT_MARKER}
 ## PR Review Agent — Build Result
@@ -117,6 +125,27 @@ Commit: `{head_sha[:7]}`
 
 {table}
 """
+
+    # A killed build is not a failed build, and reading the log tail alone would
+    # suggest the last compiler line was the error. Said before the logs so it is
+    # visible without expanding them.
+    for r in killed:
+        took = _fmt_took(r.duration_seconds)
+        if r.timeout_kind == "idle":
+            body += (
+                f"\n> :hourglass: `{r.label()}` was killed for going quiet, not "
+                f"for failing to build: it ran for {took} and then produced no "
+                f"output for long enough to be presumed stuck. The log below "
+                f"ends where it went silent. If this build legitimately goes "
+                f"quiet for that long, raise `BUILD_IDLE_TIMEOUT_SECONDS`.\n"
+            )
+        else:
+            body += (
+                f"\n> :hourglass: `{r.label()}` hit the absolute build time "
+                f"limit after {took} and was killed while still producing "
+                f"output. Raise `BUILD_TIMEOUT_SECONDS` if this build is meant "
+                f"to take that long.\n"
+            )
 
     # Full refs, so the image can be pulled or deployed without hunting through
     # the log for it.
@@ -162,6 +191,25 @@ Commit: `{head_sha[:7]}`
         )
 
     return body
+
+
+def _fmt_took(seconds: float | None) -> str:
+    """A build's wall clock, for the result table. "—" while still building.
+
+    Minutes are the unit that matters here: a build is either a few minutes or
+    the better part of an hour, and seconds-only would read as a raw number for
+    every real build.
+    """
+    if seconds is None:
+        return "—"
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
 
 
 def _log_details(name: str, log_tail: str, budget: int) -> str:
@@ -212,7 +260,7 @@ def _log_details(name: str, log_tail: str, budget: int) -> str:
     elif cut_mid_line:
         note = f"tail only — this log has no line breaks to cut on; {where}"
     else:
-        note = f"complete log, {len(lines)} lines"
+        note = f"complete log, {len(lines)} line{'' if len(lines) == 1 else 's'}"
 
     # A four-backtick fence, because build output can itself contain ``` — an
     # npm or docker step echoing a README would otherwise close the block early

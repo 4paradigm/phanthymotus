@@ -1,5 +1,7 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
 # Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
+# JP_VERSION selects the corresponding Jetson base; TensorRT plans are loaded
+# only when the runtime target matches the host TensorRT major version.
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
@@ -12,8 +14,10 @@
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
+ARG ENABLE_VITS2_TRT=1
+
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
-ARG PYPI_MIRROR APT_MIRROR
+ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -51,7 +55,7 @@ RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib
     printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
     chmod +x /usr/sbin/ldconfig && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg libvips42 && \
     mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -75,20 +79,16 @@ RUN cd /ros_ws && \
 #   thus we cannot accurately determine which files belong to it which would
 #   lead to only a partial uninstall.
 #
-# dashscope depends on PyYAML, so it triggers exactly that. Installing PyYAML
-# by itself with --ignore-installed leaves the apt egg-info in place and writes
-# a proper dist-info alongside it; the next pip invocation then sees a version
-# it can reason about and never attempts the uninstall. --ignore-installed is a
-# per-invocation flag, which is why this is a separate command rather than an
-# extra argument on the one below — we do not want it applied to everything.
+# omegaconf (OCR layer below) depends on PyYAML>=5.1.0, so it triggers exactly
+# that. Installing PyYAML by itself with --ignore-installed leaves the apt
+# egg-info in place and writes a proper dist-info alongside it; the next pip
+# invocation then sees a version it can reason about and never attempts the
+# uninstall. --ignore-installed is a per-invocation flag, which is why this is
+# a separate command rather than an extra argument on the one below — we do not
+# want it applied to everything.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --ignore-installed PyYAML && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    requests websockets webrtcvad websocket-client dashscope && \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
-
-# ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    kiss-icp scipy
+    websockets webrtcvad
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
@@ -119,6 +119,26 @@ ENV YOLO_CONFIG_DIR=/work
 
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
+
+# ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
+# libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
+# + downscale; rapidocr is used --no-deps for its pure-Python DB/CTC post-
+# processing only (its bundled ONNX models are deleted, onnxruntime is not
+# installed). Every package is version-pinned; six and Pillow are NOT listed
+# because both bases already ship them (jp511: 1.14.0/10.4.0 via the VOP
+# layer, jp61: 1.16.0/9.0.1) and re-listing them unpinned would make the
+# resolution nondeterministic. numpy is pinned to the version each JetPack's
+# torch/cv2 stack already ships so nothing in the base image is upgraded.
+# Measured layer growth: apt (ffmpeg+libvips42) 17.2 MB + this step 24.5 MB
+# ≈ 42 MB on a ~14.6 GB image (<0.3%).
+RUN if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION=1.24.4; fi; \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+      "numpy==${NUMPY_VERSION}" pyclipper==1.3.0.post3 Shapely==2.0.5 \
+      omegaconf==2.3.0 colorlog==6.12.0 && \
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} rapidocr==3.9.1 && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pyvips==3.1.0" && \
+    RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
+    find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the
@@ -155,6 +175,7 @@ COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/deploy/    /deploy/
 
 EXPOSE 15720
 EXPOSE 15721

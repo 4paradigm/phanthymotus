@@ -161,6 +161,21 @@ All runtime configuration is managed through the Web UI and persisted to SQLite 
 3. Ensure code runs locally
 4. Submit a PR with a clear description
 
+### Review Checklist
+
+- [ ] **Sensitive config fields are declared.** Any perception/actucore plugin
+      `configSchema` property holding a credential, token or private endpoint
+      declares `"format": "password"` or `"x-sensitive": true`. Canvas config gets
+      packaged into shareable Solutions and uploaded to the Resource Center, and
+      packaging only blanks declared fields — an unmarked secret is published in
+      clear text. Spec: `phanthymotus-driver/README_dev.md` § "Marking sensitive fields".
+- [ ] Plugins holding per-instance state follow the concurrency rules in
+      [perception/README.md](perception/README.md) (`tools/call` runs per-thread;
+      `stop` must be able to cancel a concurrent `start`; `destroy_node()` on stop)
+- [ ] Actuator paths keep the confirmation/safety behaviour intact
+- [ ] New API routes are registered in `agent-core/src/start.py` and, if they must
+      skip auth, listed in `agent-core/src/auth.py`
+
 ## Code Style
 
 - Python: Follow PEP 8, use type hints where practical

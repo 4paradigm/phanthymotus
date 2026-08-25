@@ -207,3 +207,25 @@ ASR result JSON:
   "asr_complete_ts": 1234567891.789
 }
 ```
+
+## Sensitive Config Fields
+
+Perception plugins hold real credentials (ASR/TTS API keys). Canvas configuration
+gets packaged into shareable **Solutions** and uploaded to the Resource Center,
+so every credential field must declare itself sensitive in its `configSchema` —
+packaging blanks declared fields only, there is no field-name blocklist:
+
+```python
+"configSchema": {
+    "type": "object",
+    "properties": {
+        "api_key": {"type": "string", "format": "password"},   # masked input + never packaged
+        "app_key": {"type": "string", "x-sensitive": True},    # visible input + never packaged
+        "model":   {"type": "string"},                         # packaged as-is
+    },
+}
+```
+
+An unmarked credential is uploaded in clear text and readable by anyone who
+downloads the solution. Full spec: `phanthymotus-driver/README_dev.md`
+§ "Marking sensitive fields".

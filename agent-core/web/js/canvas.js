@@ -14,6 +14,8 @@
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
+import { sessionId } from './session.js';
+import { getToken } from './auth.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -24,14 +26,11 @@ let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
 
 // ── Editor Lock ──────────────────────────────────────────────────────────────
-// sessionStorage (not localStorage) so each tab/window gets its own session_id —
-// otherwise all tabs of the same browser would share one id and be treated as
-// the same editor, letting them edit concurrently and silently clobber each other's autosave.
-let _sessionId = sessionStorage.getItem('canvas_session_id');
-if (!_sessionId) {
-  _sessionId = 'sess-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  sessionStorage.setItem('canvas_session_id', _sessionId);
-}
+// The session id comes from session.js (per-tab, see the rationale there) and is
+// also sent on the /ws/motus connection — the backend releases this session's
+// lock shortly after that socket drops, so closing/killing the tab frees the
+// canvas without depending on an unload handler firing.
+const _sessionId = sessionId();
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
 
@@ -88,6 +87,14 @@ export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
 export function ensureEdit() { return _ensureEdit(); }
 export function isEditor() { return _isEditor; }
+
+/**
+ * Discard the in-memory canvas and re-read it from the server.
+ * Used after a solution is loaded — the backend rewrote canvas_layout directly,
+ * so what's on screen is stale.
+ */
+export function reloadFromServer() { return _reloadLayout(); }
+
 
 /**
  * Programmatically add a card to the canvas (used by mobile tap-to-add).
@@ -185,7 +192,7 @@ export async function initCanvas(initialMcps) {
 
     // Initialize editor lock state from layout response
     _currentEditor = layoutJson.editor || null;
-    if (_currentEditor === _sessionId) _isEditor = true;
+    _isEditor = _currentEditor === _sessionId;
   } catch { /* start empty */ }
 
   // Show editor status bar
@@ -202,7 +209,7 @@ export async function initCanvas(initialMcps) {
     }
   } catch { /* ignore */ }
 
-  // Cross-tab sync: listen for project_state events via WebSocket
+  // Cross-tab sync: listen for project_state / editor-lock / layout events via WebSocket
   const { onMotusEvent } = await import('./motus-stream.js');
   onMotusEvent(null, (event) => {
     if (event.type === 'project_state') {
@@ -214,12 +221,18 @@ export async function initCanvas(initialMcps) {
           btn.classList.toggle('locked', !_projectRunning);
         });
       }
+    } else if (event.type === 'canvas_editor') {
+      _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
+    } else if (event.type === 'canvas_layout') {
+      // Ignore the echo of our own autosave; readers reload to follow the editor.
+      if ((event.payload?.editor || '') !== _sessionId) _scheduleReload();
     }
   });
 
   // Re-sync state when tab becomes visible (fallback for WS disconnect)
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
+      _checkEditStatus();
       fetch('/api/config/project-running').then(r => r.json()).then(d => {
         if (d.running !== _projectRunning) {
           _projectRunning = d.running;
@@ -1552,6 +1565,18 @@ async function _startProject() {
   // Subscribe to startup progress events
   let modal = null;
   let itemIndex = {};  // tool_name -> index in modal
+  // Cards that accepted start but are still loading a model (perception TTS/OCR
+  // fetch and warm one up). The backend settles them with a later ready/error
+  // event, so the subscription has to outlive project_start_done — otherwise
+  // the modal would sit at "启动中..." forever, or worse, close claiming success.
+  const loading = new Set();
+  let sequenceDone = false;
+
+  function _finishIfSettled() {
+    if (!sequenceDone || loading.size > 0) return;
+    if (modal) modal.startCountdown(15);
+    offMotusEvent(_onEvent);
+  }
 
   function _onEvent(event) {
     const p = event.payload || {};
@@ -1560,17 +1585,27 @@ async function _startProject() {
       const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
       modal = _showStartupModal(items);
       cards.forEach((c, i) => { itemIndex[`${c.mcp_id}:${c.tool}`] = i; });
-    } else if (event.type === 'project_start_item' && modal) {
-      const idx = itemIndex[`${p.mcp_id}:${p.tool}`];
-      if (idx !== undefined) {
+    } else if (event.type === 'project_start_item') {
+      const key = `${p.mcp_id}:${p.tool}`;
+      const idx = itemIndex[key];
+      // Anything other than 'loading' is terminal for the wait: ready, error,
+      // cancelled, or a status added later.
+      if (p.status === 'loading') loading.add(key);
+      else loading.delete(key);
+      if (modal && idx !== undefined) {
         modal.updateItem(idx, p.status, p.message || '');
       }
+      _finishIfSettled();
     } else if (event.type === 'project_start_done') {
-      if (modal && !p.has_error) {
-        // Show countdown close button, auto-close after 15s
-        modal.startCountdown(15);
+      sequenceDone = true;
+      if (p.has_error) {
+        offMotusEvent(_onEvent);
+        return;
       }
-      offMotusEvent(_onEvent);
+      if (modal && loading.size > 0) {
+        modal.setWaiting(loading.size);
+      }
+      _finishIfSettled();
     }
   }
 
@@ -1729,7 +1764,10 @@ function _showStartupModal(items) {
   });
   document.body.appendChild(overlay);
 
-  const STATUS_TEXT = { starting: '启动中...', ready: '已就绪', error: '启动失败' };
+  const STATUS_TEXT = {
+    starting: '启动中...', loading: '模型加载中...', ready: '已就绪',
+    error: '启动失败', cancelled: '已取消',
+  };
   function updateItem(i, state, msg) {
     dots[i].className = 'startup-dot ' + state;
     statuses[i].textContent = msg || STATUS_TEXT[state] || '';
@@ -1740,6 +1778,13 @@ function _showStartupModal(items) {
   }
 
   let _countdownTimer = null;
+  function setWaiting(count) {
+    // Every card was accepted, but some are still fetching or warming a model.
+    // Say so instead of auto-closing on a success the operator does not have yet.
+    const title = modal.querySelector('.modal-title');
+    if (title) title.textContent = `等待模型加载（${count}）`;
+  }
+
   function startCountdown(seconds) {
     const footer = modal.querySelector('.startup-modal-footer');
     const title = modal.querySelector('.modal-title');
@@ -1765,7 +1810,7 @@ function _showStartupModal(items) {
     // Actually stop the project when user cancels during startup
     _stopProject();
   });
-  return { modal, updateItem, close, startCountdown };
+  return { modal, updateItem, close, startCountdown, setWaiting };
 }
 
 /**
@@ -2083,7 +2128,9 @@ function _updateEditorUI() {
     bar.querySelector('#canvas-release-btn').onclick = _releaseEdit;
     _setCanvasReadonly(false);
   } else if (_currentEditor) {
-    bar.innerHTML = `${_SVG_LOCK}<span class="editor-label editor-label--locked">画布被占用，无法编辑</span>`;
+    // Read-only, not broken: reading the canvas and its data streams stays open to
+    // everyone, only writes need the lock.
+    bar.innerHTML = `${_SVG_LOCK}<span class="editor-label editor-label--locked">画布由其他人编辑中（只读）</span>`;
     _setCanvasReadonly(true);
   } else {
     bar.innerHTML = `${_SVG_PEN}<button class="editor-btn editor-btn--claim" id="canvas-claim-btn">编辑</button>`;
@@ -2112,21 +2159,53 @@ async function _releaseEdit() {
   _updateEditorUI();
 }
 
+/**
+ * Adopt a lock state pushed by the server (canvas_editor event) or read from a
+ * poll. Readers reload once the canvas is freed so they end up on the editor's
+ * final layout.
+ */
+function _applyEditorState(editor, reason) {
+  const wasEditor = _isEditor;
+  _currentEditor = editor;
+  _isEditor = editor === _sessionId;
+  _updateEditorUI();
+
+  if (!editor) {
+    if (!wasEditor) {
+      // Canvas just went free — pick up whatever the last editor left behind.
+      _scheduleReload(reason === 'release');
+      if (reason === 'release') _showToast('画布编辑权已释放，可点击「编辑」接管');
+    }
+  } else if (wasEditor && !_isEditor) {
+    _showToast('编辑权已被释放，画布转为只读');
+  }
+}
+
+// Reload debounce: an editor dragging cards autosaves repeatedly, and readers
+// should not refetch on every one of those.
+let _reloadTimer = null;
+let _lastReloadToast = 0;
+
+function _scheduleReload(silent = false) {
+  clearTimeout(_reloadTimer);
+  _reloadTimer = setTimeout(async () => {
+    await _reloadLayout();
+    // Throttled, and skipped when the caller already explained what happened —
+    // otherwise the reload toast would immediately replace that message.
+    if (!silent && Date.now() - _lastReloadToast > 5000) {
+      _lastReloadToast = Date.now();
+      _showToast('画布已更新');
+    }
+  }, 800);
+}
+
 async function _checkEditStatus() {
   try {
-    const resp = await fetch('/api/canvas/edit-status');
+    const resp = await fetch(`/api/canvas/edit-status?session_id=${encodeURIComponent(_sessionId)}`);
     const data = await resp.json();
-    const prevEditor = _isEditor;
-    _currentEditor = data.editor || null;
-    if (_currentEditor === _sessionId) {
-      _isEditor = true;
-    } else if (_isEditor) {
-      // We lost editor status (timeout)
-      _isEditor = false;
-      _logActivity('warn', '编辑权已超时释放（60秒无操作）');
-      _showToast('编辑权已超时释放，请重新操作');
-    }
-    _updateEditorUI();
+    const editor = data.editor || null;
+    if (editor === _currentEditor) return;   // no change — don't re-render or reload
+    _applyEditorState(editor, '');
   } catch { /* silent */ }
 }
 
@@ -2150,17 +2229,31 @@ async function _reloadLayout() {
     _syncEmptyState();
     // Update editor info
     _currentEditor = layoutJson.editor || null;
-    if (_currentEditor === _sessionId) _isEditor = true;
+    _isEditor = _currentEditor === _sessionId;
     _updateEditorUI();
   } catch { /* silent */ }
 }
 
-// Release on page close
-window.addEventListener('beforeunload', () => {
-  if (_isEditor) {
-    navigator.sendBeacon('/api/canvas/release-edit', JSON.stringify({ session_id: _sessionId }));
-  }
-});
+// Release on page close — a fast path only: correctness comes from the backend
+// dropping the lock when this tab's /ws/motus connection closes, since these
+// events never fire on a killed process or a reclaimed mobile tab.
+//
+// The beacon has to carry an application/json Blob (a plain string is sent as
+// text/plain, which FastAPI refuses to JSON-decode) and its own ?token= (it
+// bypasses the fetch patch in auth.js that injects the Authorization header).
+function _releaseBeacon() {
+  if (!_isEditor) return;
+  const token = getToken();
+  const url = '/api/canvas/release-edit' + (token ? `?token=${encodeURIComponent(token)}` : '');
+  const blob = new Blob([JSON.stringify({ session_id: _sessionId })],
+                        { type: 'application/json' });
+  navigator.sendBeacon(url, blob);
+}
+window.addEventListener('pagehide', _releaseBeacon);
+window.addEventListener('beforeunload', _releaseBeacon);
+// Restored from the back/forward cache: the beacon already released our lock, so
+// re-read the real state instead of trusting the stale in-memory flag.
+window.addEventListener('pageshow', (e) => { if (e.persisted) _checkEditStatus(); });
 
 // Periodically check edit status (piggyback on existing polling interval)
 setInterval(_checkEditStatus, 10000);

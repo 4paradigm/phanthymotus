@@ -9,7 +9,7 @@ plugins:
     num_threads: 2
     language: zh-CN
     vad:
-      model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
+      model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
       threshold: 0.5
       silence_ms: 400
       pre_roll_ms: 500
@@ -28,20 +28,6 @@ plugins:
     speaker_id: 0
     speed: 1.0
 
-  htmsg:
-    enabled: true
-    namespace: ""       # auto-detect from hostname if empty
-    keyframe:
-      dist_thresh: 1.0    # meters — insert keyframe when moved this far
-      angle_thresh: 0.35  # radians (~20°) — or rotated this much
-    semantic:
-      model: "mobileclip"
-      sam_model: "sam2_tiny"
-      confidence_decay: 0.95
-    graph:
-      db_path: "/opt/phanthy-motus/data/htmsg"
-      max_nodes: 500
-
   vop:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
@@ -49,3 +35,27 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: true
+    provider: rapidocr
+    model_dir: /models/ocr/ppocrv6-small-trt
+    device_id: 0
+    language: zh
+    use_angle_cls: true
+    max_side_len: 1600
+    det_unclip_ratio: 0.7
+    det_thresh: 0.3
+    det_box_thresh: 0.5
+    rec_min_score: 0.9
+    crop_refinement:
+      enabled: true
+      min_score: 0.9
+      min_gain: 0.12
+      min_text_length: 2
+      profiles: [prefix_65, upper_center, upper_tight]
+    empty_result_retry:
+      enabled: true
+      det_thresh: 0.1
+      det_box_thresh: 0.1
+    min_interval_ms: 0

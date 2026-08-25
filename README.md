@@ -131,6 +131,32 @@ A community-driven Skill Marketplace where users share and discover skills. Brow
 
 ![Skills](docs/images/skills.png)
 
+### Solutions — Package & Load a Whole Setup
+
+Open **Solutions** from the top-left of the dashboard. A solution bundles everything
+that makes one robot work — canvas topology and per-card config, active skills,
+prompt files, and tasks — into one shareable package on the Resource Center
+marketplace.
+
+- **Save**: pick which blocks to package. The canvas is mandatory; skills, each of
+  the three prompt files, and tasks are optional. Only skills that are already
+  published on the Skill Marketplace can be packaged, so recipients can actually
+  install them.
+- **Load**: Agent Core first checks that every required driver / perception /
+  actucore image is installed (offering one-click install for images already in
+  the local catalog), then lists exactly what will be overwritten before applying.
+- **Align versions** (optional): tick it and each involved container is redeployed
+  at the image tag recorded in the package before the solution is applied — only
+  the tag is taken, the local registry is kept. Agent Core itself is never
+  auto-aligned, since restarting it would abort the load; the dashboard shows the
+  recorded core version so you can upgrade manually if needed.
+- **Secrets stay home**: fields a tool declares sensitive (`format: password` or
+  `x-sensitive: true` in its `configSchema`) are blanked during packaging and
+  reported to the loading user as "needs configuration".
+
+Cards reference devices by MCP `server_name`, not by the machine-local
+`mcp-<timestamp>` id, so a package loads onto a different robot of the same model.
+
 ### Service Deployment
 
 Deploy and manage Agent Core and hardware driver containers from the dashboard.
@@ -240,6 +266,7 @@ on the host — schedule it rather than doing it mid-session.
 The platform can optionally connect to a [Resource Center](https://motus.phanthy.com) for:
 - Browsing and deploying pre-built driver/perception images
 - Managing skills and extensions
+- Publishing and installing solutions (canvas + skills + prompt + tasks bundles)
 - OTA updates
 
 Configure via the `RESOURCE_CENTER_URL` environment variable.

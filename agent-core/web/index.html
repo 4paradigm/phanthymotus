@@ -52,7 +52,6 @@
           <button class="settings-dropdown-item" data-target="btn-network">网络</button>
           <button class="settings-dropdown-item" data-target="btn-history">历史日志</button>
           <button class="settings-dropdown-item" data-target="btn-agent-def">智能体定义</button>
-          <button class="settings-dropdown-item" data-target="btn-skills">技能</button>
           <button class="settings-dropdown-item" data-target="btn-channels">渠道</button>
           <button class="settings-dropdown-item" data-target="btn-deploy">部署</button>
           <button class="settings-dropdown-item" data-target="btn-performance">性能</button>
@@ -61,11 +60,18 @@
           <button class="settings-dropdown-item settings-dropdown-item--danger" data-target="btn-reset">重启与重置</button>
         </div>
       </div>
+      <!-- 我的：Resource Center 账号 + 技能广场 / 解决方案市场 -->
+      <button class="topbar-settings-btn topbar-account-btn" id="btn-account">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>
+        <span>我的</span>
+        <span class="topbar-account-badge hidden" id="account-badge"></span>
+      </button>
       <!-- Hidden buttons for existing JS handlers -->
       <button class="btn-ghost topbar-btn hidden" id="btn-network">网络</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-history">历史日志</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-agent-def">智能体定义</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-skills">技能</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-solutions">解决方案</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-channels">渠道</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-reset">重置</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
@@ -196,10 +202,6 @@
           <span class="settings-item-label">智能体定义</span>
           <span class="settings-item-arrow">›</span>
         </button>
-        <button class="settings-item" data-action="skills">
-          <span class="settings-item-label">技能</span>
-          <span class="settings-item-arrow">›</span>
-        </button>
         <button class="settings-item" data-action="channels">
           <span class="settings-item-label">渠道</span>
           <span class="settings-item-arrow">›</span>
@@ -221,6 +223,12 @@
           <span class="settings-item-arrow">›</span>
         </button>
       </div>
+    </div>
+
+    <!-- 我的（移动端第四个 tab；内容由 js/account.js 渲染，与桌面 modal 共用） -->
+    <div class="mobile-settings-panel mobile-account-panel hidden" id="mobile-account-panel">
+      <h2 class="settings-title">我的</h2>
+      <div class="account-content" id="mobile-account-content"></div>
     </div>
   </div>
 
@@ -246,6 +254,10 @@
     <button class="tabbar-btn" data-tab="settings">
       <span class="tabbar-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15 1.65 1.65 0 0 0 3.17 14H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span class="tabbar-badge hidden" id="settings-badge"></span></span>
       <span class="tabbar-label">设置</span>
+    </button>
+    <button class="tabbar-btn" data-tab="account">
+      <span class="tabbar-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg><span class="tabbar-badge hidden" id="account-tab-badge"></span></span>
+      <span class="tabbar-label">我的</span>
     </button>
   </nav>
 
@@ -354,6 +366,7 @@
         <input id="marketplace-search" type="search" placeholder="搜索驱动…" autocomplete="off" spellcheck="false">
       </div>
       <div class="marketplace-filters" id="marketplace-filters"></div>
+      <div id="marketplace-host-hint"></div>
       <div class="marketplace-grid" id="marketplace-grid"></div>
     </div>
     <div class="modal-footer" id="deploy-modal-footer" style="display:none">
@@ -394,7 +407,6 @@
   <div class="modal skill-modal">
     <div class="modal-header">
       <span class="modal-title">技能管理</span>
-      <div class="skill-rc-login-status" id="skill-rc-login-status"></div>
       <button class="btn-icon" id="skill-close">✕</button>
     </div>
     <div class="skill-tabs">
@@ -408,15 +420,10 @@
         <div class="skill-list" id="skill-installed-list"></div>
       </div>
       <div class="skill-panel" data-panel="mine" id="skill-mine-panel">
-        <!-- Login form (shown when not logged in) -->
+        <!-- 未登录：登录统一在「我的」里做，这里只给入口 -->
         <div id="skill-rc-login-form" class="skill-rc-login">
-          <p class="skill-rc-login-hint">登录 Resource Center 以管理您的技能</p>
-          <form id="skill-rc-login-form-el">
-            <input type="text" id="skill-rc-email" placeholder="账号" required autocomplete="username">
-            <input type="password" id="skill-rc-password" placeholder="密码" required autocomplete="current-password">
-            <button type="submit" class="skill-btn skill-btn-primary">登录</button>
-          </form>
-          <p class="skill-rc-login-error hidden" id="skill-rc-login-error"></p>
+          <p class="skill-rc-login-hint">管理自己的技能需要先登录 Resource Center</p>
+          <button class="skill-btn skill-btn-primary" id="skill-rc-login-btn">去「我的」登录</button>
         </div>
         <!-- My skills list (shown when logged in) -->
         <div id="skill-mine-content" class="hidden">
@@ -503,6 +510,63 @@
           <button type="submit" class="skill-btn skill-btn-primary" id="skill-form-submit-btn">保存</button>
         </div>
       </form>
+    </div>
+  </div>
+</div>
+
+<!-- 我的（桌面 modal；内容与移动端面板共用 account.js 的渲染） -->
+<div class="modal-overlay hidden" id="account-overlay">
+  <div class="modal account-modal">
+    <div class="modal-header">
+      <span class="modal-title">我的</span>
+      <button class="btn-icon" id="account-close">✕</button>
+    </div>
+    <div class="modal-body account-modal-body">
+      <div class="account-content" id="account-content"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Solution Modal (载入 / 市场 / 保存) -->
+<div class="modal-overlay hidden" id="solution-overlay">
+  <div class="modal skill-modal solution-modal">
+    <div class="modal-header">
+      <span class="modal-title">解决方案</span>
+      <button class="btn-icon" id="solution-close">✕</button>
+    </div>
+    <div class="skill-tabs">
+      <button class="skill-tab active" data-tab="current">当前方案</button>
+      <button class="skill-tab" data-tab="market">方案市场</button>
+      <button class="skill-tab" data-tab="save">保存当前方案</button>
+    </div>
+    <div class="modal-body skill-modal-body">
+      <div class="skill-panel active" data-panel="current" id="solution-current-panel"></div>
+
+      <div class="skill-panel" data-panel="market" id="solution-market-panel">
+        <div class="skill-search-bar solution-market-bar">
+          <input type="text" id="solution-search" placeholder="搜索解决方案…" autocomplete="off" spellcheck="false">
+          <select id="solution-industry-filter"></select>
+        </div>
+        <div class="skill-list" id="solution-market-list"></div>
+        <div class="skill-empty hidden" id="solution-market-empty">未找到解决方案</div>
+      </div>
+
+      <div class="skill-panel" data-panel="save" id="solution-save-panel"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Solution Load Confirm Modal (缺失驱动 + 覆盖提示) -->
+<div class="modal-overlay hidden" id="solution-load-overlay">
+  <div class="modal solution-load-modal">
+    <div class="modal-header">
+      <span class="modal-title" id="solution-load-title">载入解决方案</span>
+      <button class="btn-icon" id="solution-load-close">✕</button>
+    </div>
+    <div class="modal-body" id="solution-load-body"></div>
+    <div class="skill-form-footer">
+      <button type="button" class="skill-btn" id="solution-load-cancel">取消</button>
+      <button type="button" class="skill-btn skill-btn-primary" id="solution-load-confirm">确认载入</button>
     </div>
   </div>
 </div>

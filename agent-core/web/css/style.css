@@ -172,7 +172,10 @@ html, body {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 8px;
+  /* 2px 而不是 8px：设置 / 我的 两个按钮自己还有 10px 内边距，pill 边到图标已经隔了
+     12px；原来 gap:8 + padding:14 是 22px，读起来像两个不相干的入口。
+     更新提示不属于这一组，用自己的 margin-right 补回间距。 */
+  gap: 2px;
 }
 
 .topbar-btn {
@@ -187,7 +190,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 14px;
+  padding: 6px 10px;
   font-size: 12px;
   font-weight: 500;
   border: none;
@@ -279,6 +282,8 @@ html, body {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* .topbar-actions 的 gap 收成 2px 是为了让设置/我的靠成一组，更新提示不属于那一组 */
+  margin-right: 8px;
   background: var(--yellow-bg);
   border: 1px solid var(--yellow);
   border-radius: var(--radius-sm);
@@ -2361,6 +2366,61 @@ html, body {
   font-size: 10px;
   color: var(--text-dim);
 }
+/* 版本所需的加速器架构（JetPack 5 / 6）；agnostic 的版本不挂徽标 */
+.mp-version-arch {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-radius: 3px;
+  padding: 2px 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ── 本机架构提示 ─────────────────────────────────────────────────────────
+   驱动市场的列表按本机架构过滤过，跟官网看到的不一样。不解释的话用户只会以为
+   某个组件消失了，所以把本机架构和被隐藏的数量摊开讲清楚。 */
+.mp-host-hint {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  font-size: 11px;
+}
+.mp-host-hint-label {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.mp-host-hint-arch {
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-radius: 3px;
+  padding: 2px 8px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.mp-host-hint-note {
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.mp-host-hint-warn {
+  border-color: var(--yellow);
+  background: var(--yellow-bg);
+}
+.mp-host-hint-warn .mp-host-hint-label,
+.mp-host-hint-warn .mp-host-hint-note { color: var(--yellow); }
+.mp-host-hint-warn .mp-host-hint-arch {
+  color: var(--yellow);
+  background: transparent;
+  border: 1px solid var(--yellow);
+}
 
 /* ── Driver detail (in-pane view) ────────────────────────────────────────── */
 .mp-detail {
@@ -2640,6 +2700,12 @@ html, body {
   overflow: hidden;
   box-shadow: var(--shadow-lg);
 }
+/* .modal-body 没有基础样式，是有意的：history 那种左右分栏的 body 需要
+   padding:0 + overflow:hidden，由内层面板各自滚动。代价是每个新弹窗都必须自己声明
+   padding 和 overflow-y —— 漏了的表现是：内容贴着弹窗边框（标题却是缩进的，看起来
+   就是"挤在一起"），且因为上面 .modal 是 max-height + overflow:hidden，超出的内容会
+   被直接裁掉而不是滚动。这个坑已经踩过三次（account / solution-load 都是事后才修），
+   加新弹窗时记得写。刻意不声明的只有 .history-body。 */
 .modal-header {
   display: flex;
   align-items: center;
@@ -4185,7 +4251,8 @@ html, body {
   text-align: center;
   color: var(--text-dim);
   font-size: 13px;
-  padding: 40px 0;
+  line-height: 1.8;
+  padding: 40px 24px;
 }
 .skill-empty.hidden { display: none; }
 
@@ -5426,6 +5493,13 @@ html, body {
 }
 .startup-dot.ready { background: #22c55e; opacity: 1; }
 .startup-dot.error { background: #ef4444; opacity: 1; }
+/* Accepted the start, but still fetching or warming a model — the same pulse as
+   starting, in amber, so "not usable yet" never reads as ready. */
+.startup-dot.loading {
+  background: #f59e0b;
+  opacity: 1;
+  animation: pulse-dot 1s infinite;
+}
 @keyframes pulse-dot {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
@@ -5435,6 +5509,11 @@ html, body {
   color: var(--text-muted);
   font-size: 12px;
   margin-left: auto;
+  /* Right-aligned like the one-word statuses beside it: a tool's own message
+     (e.g. the TTS model-loading notice) wraps onto two lines, and left-aligning
+     that made it read as a stray paragraph rather than this row's status. */
+  text-align: right;
+  max-width: 62%;
 }
 .startup-modal-footer {
   display: flex;
@@ -6148,6 +6227,14 @@ html, body {
   background: rgba(239, 68, 68, 0.1);
   color: #ef4444;
 }
+.channel-item-error {
+  margin-top: 6px;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: #ef4444;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .channel-item-actions {
   display: flex;
   gap: 6px;
@@ -6779,3 +6866,534 @@ html, body {
   white-space: nowrap;
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Solutions — 解决方案（入口在「我的」里 + 当前方案 / 市场 / 保存）
+   复用 .skill-* 的 modal / card / button 语言，这里只加方案特有的部件。
+   ══════════════════════════════════════════════════════════════════════════ */
+
+.solution-modal { width: 680px; }
+.solution-load-modal {
+  width: 680px;
+  max-width: 95vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+/* padding + overflow-y 必须自己声明，原因见 .modal 上方那段注释 */
+.solution-load-modal .modal-body {
+  padding: 18px 24px 22px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.solution-section-label {
+  margin: 22px 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.solution-section-label:first-child { margin-top: 0; }
+.solution-warn { color: var(--yellow); }
+
+.solution-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.solution-pill {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-input);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.solution-pill-sm { font-size: 10px; padding: 1px 6px; }
+.solution-pill-driver {
+  border-color: var(--accent-glow);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+/* ── 当前方案 ── */
+
+.solution-current-card {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+.solution-current-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.solution-current-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.solution-current-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.solution-driver-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* 两行布局：第一行是"是什么"（名字 / 类别 / 状态），第二行是"哪个版本"。
+   之前挤在一行里的 5 个元素（图标 + 名字 + 类别 + 长 tag + 镜像 + 按钮）在 620px 下
+   正好塞满，jetson tag 一来就把「一键安装」压成两个字宽。 */
+.solution-driver-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  /* start 而不是 center：行会有 2~3 行高（版本 + 镜像），图标和按钮要跟"名字"那一行
+     对齐，居中的话会飘到镜像地址旁边 */
+  align-items: start;
+  column-gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  font-size: 12px;
+}
+.solution-driver-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.solution-driver-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.solution-driver-row-warn  { border-color: var(--yellow); background: var(--yellow-bg); }
+.solution-driver-row-error { border-color: var(--red);    background: var(--red-bg); }
+.solution-driver-name { font-weight: 500; color: var(--text); }
+/* 状态词（已就绪 / 待安装 / 缺失）—— 不再重复左边已经写过的驱动名 */
+.solution-driver-state {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.solution-driver-row-warn  .solution-driver-state { color: var(--yellow); }
+.solution-driver-row-error .solution-driver-state { color: var(--red); }
+/* 第二行：镜像 / 版本。长 tag 在这里换行，不再挤压同行的其它元素 */
+.solution-driver-sub {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.solution-driver-row .skill-btn { flex-shrink: 0; white-space: nowrap; }
+/* 图标和按钮跟第一行文字对齐（.solution-driver-line 的行高约 18px） */
+.solution-driver-ok,
+.solution-driver-warn,
+.solution-driver-err { line-height: 18px; }
+.solution-driver-ok   { color: var(--green);  font-weight: 700; }
+.solution-driver-warn { color: var(--yellow); font-weight: 700; }
+.solution-driver-err  { color: var(--red);    font-weight: 700; }
+
+.solution-needs-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+/* 适用机型：由画布上的硬件驱动推出，是展示而不是输入。高度对齐同一行的
+   「标签」输入框，两个 field 才不会一高一低。 */
+.solution-robots {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-height: 34px;
+}
+.solution-robots-none {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.solution-need-item {
+  padding: 3px 8px;
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius);
+  background: var(--yellow-bg);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--yellow);
+  cursor: pointer;
+}
+.solution-need-item:hover { filter: brightness(.97); }
+.solution-need-item-static { cursor: default; }
+
+/* ── 市场 ── */
+
+.solution-market-bar {
+  display: flex;
+  gap: 8px;
+}
+.solution-market-bar select {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+}
+.solution-market-card .skill-card-header { align-items: center; }
+.solution-market-card .solution-pills { margin-top: 8px; }
+
+/* ── 载入确认 ── */
+
+.solution-load-error {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--red);
+  border-radius: var(--radius);
+  background: var(--red-bg);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--red);
+}
+.solution-load-error code {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+.solution-overwrite-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--text-muted);
+}
+
+/* ── 保存 / 打包 ── */
+
+/* 保存面板是 div 而不是 form，拿不到 .skill-form-body form 的 gap:12px，
+   所以这里显式给字段行之间留出竖向节奏 —— 否则每一行的 label 会紧贴上一行的
+   输入框，密到看不出分组。 */
+.solution-save-form { padding-bottom: 8px; }
+.solution-save-form .skill-form-row,
+.solution-save-form > .skill-form-field { margin-top: 14px; }
+/* 紧跟小标题的第一行不再叠加：标题自己的 8px 下边距就够了 */
+.solution-save-form .solution-section-label + .skill-form-row,
+.solution-save-form .solution-section-label + .skill-form-field,
+.solution-save-form .solution-section-label + .solution-check-group { margin-top: 0; }
+.solution-save-form .skill-form-field { gap: 6px; }
+.solution-save-form .skill-form-field textarea { min-height: 76px; }
+.solution-save-form .skill-form-error { margin-top: 14px; }
+.solution-save-form .skill-form-footer {
+  margin-top: 20px;
+  padding-top: 14px;
+  align-items: center;
+  gap: 12px;
+}
+.solution-check-group {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+.solution-check-group-title {
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.solution-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.solution-check input { margin-top: 2px; }
+.solution-check em {
+  font-style: normal;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.solution-check code {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.solution-check-locked,
+.solution-check-disabled { cursor: default; opacity: .75; }
+.solution-hint {
+  margin: 4px 0;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+.solution-hint code {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted);
+}
+
+/* 中等宽度下 topbar 挤，「我的」收成纯图标（角标里的账号名先省略） */
+@media (max-width: 1100px) {
+  .topbar-account-btn > span:not(.topbar-account-badge) { display: none; }
+  .topbar-account-badge { max-width: 72px; }
+}
+
+/* 载入弹窗里的容器版本格挡：本机 tag → 方案 tag */
+/* 版本 chip。在驱动行里它自己占一行（.solution-driver-main 是纵向 flex），所以用
+   align-self 收窄到内容宽度，而不是撑满整行。long tag 允许换行，不再压缩兄弟元素。 */
+.solution-ver {
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.solution-ver-diff {
+  border-color: var(--yellow);
+  background: var(--yellow-bg);
+  color: var(--yellow);
+}
+.solution-ver-unknown { color: var(--text-dim); }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   我的（账号）—— 顶栏按钮 + 桌面 modal + 移动端整页面板
+   桌面与移动共用 .account-content 里的同一份 HTML（js/account.js 渲染），
+   所以这里的样式不区分端，只在移动端断点里放大触摸目标。
+   ══════════════════════════════════════════════════════════════════════════ */
+
+.topbar-account-btn { position: relative; }
+.topbar-account-badge {
+  max-width: 110px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar-account-badge.hidden { display: none; }
+
+.account-modal { width: 480px; }
+/* padding + overflow-y 必须自己声明，原因见 .modal 上方那段注释 */
+.account-modal-body {
+  padding: 18px 24px 26px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.account-notice {
+  margin-bottom: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  background: var(--yellow-bg);
+  font-size: 12px;
+  color: var(--yellow);
+}
+
+.account-card {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+.account-card-signed {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.account-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.account-avatar {
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 16px;
+  font-weight: 600;
+}
+.account-avatar-empty {
+  background: var(--bg-input);
+  color: var(--text-dim);
+}
+.account-identity { flex: 1; min-width: 0; }
+.account-identity-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-identity-sub,
+.account-identity-meta {
+  margin-top: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  flex-wrap: wrap;
+}
+.account-role {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-weight: 600;
+}
+.account-id {
+  font-family: var(--font-mono);
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-copy-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.account-form input {
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+.account-form input:focus { border-color: var(--accent); }
+.account-form-error {
+  margin: 0;
+  font-size: 11px;
+  color: var(--red);
+}
+.account-submit-btn {
+  height: 40px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.account-submit-btn:disabled { opacity: .6; cursor: default; }
+/* 一行只放一件事，且居中：三项 space-between 会把"注册"甩到左右之间的随机位置 */
+.account-switch {
+  margin-top: 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.account-web-link {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  text-align: center;
+}
+.account-link {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.account-section-label {
+  margin: 18px 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+/* 桌面 modal 里的入口行比移动端的 52px 紧一些 */
+.account-entry-list .settings-item {
+  padding: 12px 14px;
+  min-height: 0;
+  font-size: 13px;
+}
+.settings-item-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  text-align: left;
+}
+.settings-item-sub {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-hint {
+  /* 最后一个元素，和容器下边界之间要留出呼吸感（否则贴着描边） */
+  margin: 14px 0 2px;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+
+@media (max-width: 768px) {
+  /* 移动端是整页面板，触摸目标放大回 52px（与设置列表一致） */
+  .account-entry-list .settings-item {
+    padding: 14px 18px;
+    min-height: 52px;
+    font-size: 15px;
+  }
+  .account-card { padding: 18px 16px; }
+  .account-form input { height: 44px; font-size: 15px; }
+  .account-submit-btn { height: 46px; font-size: 15px; }
+  .account-id { max-width: 40vw; }
+}
+
+/* 「我的」tab 上的圆点表示"已登录"，不是未读/告警，所以不用 .tabbar-badge 的红色 */
+#account-tab-badge { background: var(--accent); }

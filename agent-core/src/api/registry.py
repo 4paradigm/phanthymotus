@@ -7,6 +7,7 @@ GET /registry/catalog  → 返回按 category 分组的镜像列表及 release.*
 import json
 import os
 import time
+import urllib.parse
 import urllib.request
 
 import fastapi
@@ -25,11 +26,20 @@ def empty_catalog() -> dict:
 
 
 # ── Simple in-memory cache ──────────────────────────────────────────────────
-# Keyed by channel: without this, switching channels while a stale cache entry
-# from the previous channel is still within TTL would serve mismatched data to
-# any caller that doesn't pass refresh=true.
+# Keyed by channel + host arch facets: without this, switching channels while a
+# stale cache entry from the previous channel is still within TTL would serve
+# mismatched data to any caller that doesn't pass refresh=true. The facets are in
+# the key for the same reason — they're constant per process today, but the
+# ACC_ARCH / CPU_ARCH overrides make that a convention rather than a fact.
 _cache: dict[str, dict] = {}
 _CACHE_TTL = 300  # 5 minutes
+
+# What the last successful fetch reported about arch filtering. `applied` is False when
+# resource-center is an older build that ignored the params and returned everything —
+# the dashboard must not then claim the list was filtered for this host. The hidden_*
+# counts let it tell the user exactly how many variants the website has that this
+# machine can't run.
+_last_filter = {'applied': False, 'hidden_tags': 0, 'hidden_images': 0}
 
 
 def _current_channel() -> str:
@@ -40,10 +50,26 @@ def _current_channel() -> str:
         return 'ga'
 
 
+def cache_key(channel: str) -> str:
+    """Cache key for a catalog fetch. Callers that write into `_cache` must use this."""
+    import hostarch
+    return f'{channel}|{hostarch.acc_arch()}|{hostarch.cpu_arch()}'
+
+
 # ── Catalog fetch ─────────────────────────────────────────────────────────
 
 def _build_catalog_sync(channel: str) -> dict:
-    url = f'{RESOURCE_CENTER_URL}/api/images?channel={channel}'
+    # Host arch facets are a property of this process, not of the call site, so they
+    # are resolved here rather than threaded through all three callers. resource-center
+    # drops images that can't run on this host (e.g. a jp5.11 perception on a JetPack 6
+    # robot); images with no arch marker are arch-agnostic and always returned.
+    import hostarch
+    query = {
+        'channel': channel,
+        'acc_arch': hostarch.acc_arch(),
+        'cpu_arch': hostarch.cpu_arch(),
+    }
+    url = f'{RESOURCE_CENTER_URL}/api/images?' + urllib.parse.urlencode(query)
 
     print(f'[registry] fetching catalog from resource-center: {url}')
 
@@ -58,6 +84,21 @@ def _build_catalog_sync(channel: str) -> dict:
     if not payload.get('ok') or not isinstance(payload.get('data'), list):
         print(f'[registry] unexpected response: {str(payload)[:200]}')
         return empty_catalog()
+
+    # An arch-aware resource-center echoes the filter it applied.
+    flt = payload.get('filter')
+    if isinstance(flt, dict):
+        _last_filter.update(
+            applied=True,
+            hidden_tags=flt.get('hidden_tags', 0) or 0,
+            hidden_images=flt.get('hidden_images', 0) or 0,
+        )
+        print(f'[registry] arch filter applied: {flt.get("acc_arch")}/{flt.get("cpu_arch")} '
+              f'— hid {_last_filter["hidden_tags"]} versions, '
+              f'{_last_filter["hidden_images"]} components')
+    else:
+        _last_filter.update(applied=False, hidden_tags=0, hidden_images=0)
+        print('[registry] resource-center did not echo a filter — catalog is unfiltered')
 
     result: dict = empty_catalog()
 
@@ -91,6 +132,9 @@ def _build_catalog_sync(channel: str) -> dict:
                 'size': '',
                 'imageRef': t.get('imageRef', ''),
                 'channel': t.get('channel', ''),
+                # Which host this version needs. Absent from older resource-centers.
+                'acc_arch': t.get('accArch'),
+                'cpu_arch': t.get('cpuArch'),
             })
 
         entry = {
@@ -120,11 +164,14 @@ def _build_catalog_sync(channel: str) -> dict:
 
 @router.get('/catalog')
 async def registry_catalog(refresh: bool = False):
+    import hostarch
     channel = _current_channel()
+    key = cache_key(channel)
     now = time.time()
-    cached = _cache.get(channel)
+    cached = _cache.get(key)
     if not refresh and cached and (now - cached['ts']) < _CACHE_TTL:
-        return {'code': 200, 'data': cached['data'], 'cached': True}
+        return {'code': 200, 'data': cached['data'], 'cached': True,
+                'facets': hostarch.facets(), 'filter': dict(_last_filter)}
 
     import asyncio
     loop = asyncio.get_event_loop()
@@ -133,5 +180,6 @@ async def registry_catalog(refresh: bool = False):
     except Exception as e:
         return {'code': 500, 'message': str(e), 'data': empty_catalog()}
 
-    _cache[channel] = {'data': data, 'ts': now}
-    return {'code': 200, 'data': data, 'cached': False}
+    _cache[key] = {'data': data, 'ts': now}
+    return {'code': 200, 'data': data, 'cached': False,
+            'facets': hostarch.facets(), 'filter': dict(_last_filter)}

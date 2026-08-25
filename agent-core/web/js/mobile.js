@@ -4,6 +4,7 @@
  */
 
 import { enterMonitorMode, exitMonitorMode } from './monitor-mode.js';
+import { refreshAccount } from './account.js';
 
 const MQ = window.matchMedia('(max-width: 768px)');
 let _isMobile = MQ.matches;
@@ -109,42 +110,55 @@ function _switchTab(tab) {
   // Log fab: in configure and monitor
   const logFab = document.getElementById('mobile-log-fab');
   if (logFab) {
-    logFab.classList.toggle('hidden', tab === 'settings');
+    logFab.classList.toggle('hidden', tab === 'settings' || tab === 'account');
   }
 
   const settingsPanel = document.getElementById('mobile-settings-panel');
 
   if (tab === 'configure') {
     exitMonitorMode();
-    _hideSettingsPanel();
+    _hidePanels();
   } else if (tab === 'monitor') {
-    _hideSettingsPanel();
+    _hidePanels();
     enterMonitorMode();
   } else if (tab === 'settings') {
     exitMonitorMode();
-    _showSettingsPanel();
+    _showPanel('mobile-settings-panel');
+  } else if (tab === 'account') {
+    exitMonitorMode();
+    _showPanel('mobile-account-panel');
+    refreshAccount();
   }
 }
 
-function _showSettingsPanel() {
-  const panel = document.getElementById('mobile-settings-panel');
+// 设置与「我的」是两个同构的整页面板，共用 .settings-active 那套让画布/监控
+// 让位的布局状态，所以切换时必须先把另一个收起来。
+const _PANEL_IDS = ['mobile-settings-panel', 'mobile-account-panel'];
+
+function _showPanel(id) {
   const app = document.getElementById('app');
-  if (panel) {
-    panel.classList.remove('hidden');
-    panel.classList.add('active');
-  }
+  _PANEL_IDS.forEach(pid => {
+    const panel = document.getElementById(pid);
+    if (!panel) return;
+    const on = pid === id;
+    panel.classList.toggle('hidden', !on);
+    panel.classList.toggle('active', on);
+  });
   app?.classList.add('settings-active');
 }
 
-function _hideSettingsPanel() {
-  const panel = document.getElementById('mobile-settings-panel');
+function _hidePanels() {
   const app = document.getElementById('app');
-  if (panel) {
+  _PANEL_IDS.forEach(pid => {
+    const panel = document.getElementById(pid);
+    if (!panel) return;
     panel.classList.add('hidden');
     panel.classList.remove('active');
-  }
+  });
   app?.classList.remove('settings-active');
 }
+
+function _hideSettingsPanel() { _hidePanels(); }
 
 // ── Settings Panel ───────────────────────────────────────────────────────────
 
@@ -165,7 +179,6 @@ function _triggerSettingsAction(action) {
     'network': 'btn-network',
     'history': 'btn-history',
     'agent-def': 'btn-agent-def',
-    'skills': 'btn-skills',
     'channels': 'btn-channels',
     'deploy': 'btn-deploy',
     'performance': 'btn-performance',
