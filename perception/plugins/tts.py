@@ -474,14 +474,21 @@ class TRTTSAdapter(TTSAdapter):
                 buf = cand
         if buf:
             pieces.append(buf)
-        # 极端情况下单个词本身超限 → 退化为按字符切
+        # 兜底：仍超限的片段（如无空格的超长数字/URL）按实际 phone 数递归二分，
+        # 绝不按字符数硬切 —— 1 字符 ≈ 2 phone，按字符切会仍然超限。
         out = []
         for p in pieces:
-            if self._encode_phones(p)[3].item() > limit:
-                out.extend(p[i:i + limit] for i in range(0, len(p), limit))
-            else:
-                out.append(p)
+            out.extend(self._hard_split_under_phones(p))
         return out or [text]
+
+    def _hard_split_under_phones(self, text: str) -> list:
+        """递归二分，直到每段编码后的 phone 数 ≤ _enc_max_T。"""
+        if self._encode_phones(text)[3].item() <= self._enc_max_T:
+            return [text]
+        mid = len(text) // 2
+        if mid == 0:
+            return [text]  # 单字符仍超限（几乎不可能），交给 encoder 暴露错误
+        return self._hard_split_under_phones(text[:mid]) + self._hard_split_under_phones(text[mid:])
 
     def _synth_phones(self, ph, to, la, xl, T, noise_scale):
         """phone ID 序列 → audio float32（encoder + flow + decoder + iSTFT，全 TRT）。"""
