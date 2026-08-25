@@ -194,6 +194,31 @@ def _get_ort_session(path):
     return _ORT_SESSIONS[path]
 
 
+_TRT_NP_DTYPE = None
+
+
+def _trt_np_dtype(trt, dt):
+    """TRT DataType → numpy dtype.
+
+    不用 trt.nptype()：TRT 8.5 的实现里引用了 np.bool，而 numpy>=1.24 已移除该别名，
+    JP5 镜像上一调用就 AttributeError。
+    """
+    global _TRT_NP_DTYPE
+    if _TRT_NP_DTYPE is None:
+        m = {trt.DataType.FLOAT: np.float32, trt.DataType.HALF: np.float16,
+             trt.DataType.INT32: np.int32, trt.DataType.INT8: np.int8,
+             trt.DataType.BOOL: np.bool_}
+        for attr, npt in (("UINT8", np.uint8), ("INT64", np.int64)):
+            d = getattr(trt.DataType, attr, None)
+            if d is not None:
+                m[d] = npt
+        _TRT_NP_DTYPE = m
+    try:
+        return _TRT_NP_DTYPE[dt]
+    except KeyError:
+        raise RuntimeError(f"unsupported TRT tensor dtype: {dt}")
+
+
 def _get_trt_engine(path):
     if path not in _TRT_ENGINES:
         import tensorrt as trt
@@ -266,9 +291,21 @@ class TRTTSAdapter(TTSAdapter):
         w = np.hanning(self._n_fft + 1)[:self._n_fft].astype(np.float32)
         self._window = w.reshape(1, self._n_fft, 1)
 
-        # ── ONNX Runtime encoder (shared across instances) ──
-        encoder_path = os.path.join(trt_dir, "encoder_duration.onnx")
-        self._encoder = _get_ort_session(encoder_path)
+        # ── Encoder（纯 TRT，不回退 ORT）──
+        # encoder.trt 的 profile 上限是 ph:1x1000（见 tools/trt 构建命令）；
+        # 超过该上限的文本在 _synthesize_chunk 里按词截断、分次编码，绝不回退 ORT。
+        enc_trt_path = os.path.join(trt_dir, "encoder.trt")
+        if not os.path.exists(enc_trt_path):
+            raise RuntimeError(
+                f"VITS2 TRT encoder engine not found: {enc_trt_path}. "
+                f"请先用 trtexec 从 encoder_duration.onnx（opset 16）构建 encoder.trt"
+            )
+        self._enc_eng = _get_trt_engine(enc_trt_path)
+        if self._enc_eng is None:
+            raise RuntimeError(f"Failed to deserialize encoder engine {enc_trt_path}")
+        self._enc_max_T = int(self._enc_eng.get_tensor_profile_shape("ph", 0)[2][1])
+        log.info("[tts] encoder backend=TRT (%s, max T_phone=%d)",
+                 enc_trt_path, self._enc_max_T)
 
         # ── TRT engines (shared across instances via module cache) ──
         flow_path = os.path.join(trt_dir, "flow.trt")
@@ -292,6 +329,7 @@ class TRTTSAdapter(TTSAdapter):
         self._ctx_cache = {}   # engine -> execution context
         self._gpu_buf = {}     # (id(engine), name) -> (ptr, size)
         self._cpu_buf = {}     # (id(engine), name) -> np.ndarray
+        self._bound_shape = {}  # (id(engine), name) -> tuple  (只在 shape 变化时才 set_input_shape)
 
         log.info("[tts] TRT adapter loaded: model=%s n_fft=%d hop=%d gain=%.4f",
                  model_type, self._n_fft, self._hop, self._gain)
@@ -320,13 +358,13 @@ class TRTTSAdapter(TTSAdapter):
         self._gpu_buf[key] = (ptr, size)
         return ptr
 
-    def _cpu_buf_for(self, engine, name, shape):
+    def _cpu_buf_for(self, engine, name, shape, dtype=np.float32):
         """复用 CPU buffer（取前 N 元素 reshape 到目标 shape，避免反复分配）。"""
-        key = (id(engine), name)
+        key = (id(engine), name, np.dtype(dtype).str)
         arr = self._cpu_buf.get(key)
         need = int(np.prod(shape))
         if arr is None or arr.size < need:
-            arr = np.empty(shape, dtype=np.float32)
+            arr = np.empty(shape, dtype=dtype)
             self._cpu_buf[key] = arr
             return arr
         return arr.ravel()[:need].reshape(shape)
@@ -337,15 +375,22 @@ class TRTTSAdapter(TTSAdapter):
         gpu_ptrs, outputs = {}, {}
         for i in range(engine.num_io_tensors):
             name = engine.get_tensor_name(i)
+            # encoder 的 ph/to/la/xl 是 int32，flow/decoder 是 float32 —— 按 engine 声明的 dtype 走
+            dt = _trt_np_dtype(trt, engine.get_tensor_dtype(name))
             if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                data = inputs[name].astype(np.float32)
-                ctx.set_input_shape(name, data.shape)
+                data = np.ascontiguousarray(inputs[name], dtype=dt)
+                key = (id(engine), name)
+                if self._bound_shape.get(key) != data.shape:
+                    # TRT 10.x 每次 set_input_shape 都会触发 re-optimize（实测 ~1s），
+                    # 只有 shape 变化时才需要重新 bind。
+                    ctx.set_input_shape(name, data.shape)
+                    self._bound_shape[key] = data.shape
                 ptr = self._gpu_buf_for(engine, name, data.nbytes)
                 self._cuda.cudaMemcpy(ptr, data.ctypes.data, data.nbytes, 1)  # H2D
                 gpu_ptrs[name] = ptr
             else:
                 shape = tuple(ctx.get_tensor_shape(name))
-                arr = self._cpu_buf_for(engine, name, shape)
+                arr = self._cpu_buf_for(engine, name, shape, dt)
                 outputs[name] = arr
                 ptr = self._gpu_buf_for(engine, name, arr.nbytes)
                 gpu_ptrs[name] = ptr
@@ -397,27 +442,55 @@ class TRTTSAdapter(TTSAdapter):
     def synthesize(self, text: str) -> bytes:
         return b"".join(self.synthesize_stream(text))
 
-    def _synthesize_chunk(self, text: str, noise_scale: float = 0.667):
-        """Synthesize a single text chunk through TRT, returning float32 numpy array."""
-        t0 = time.perf_counter()
-        # ── 1. Text → phoneme IDs ──
-        norm_text, phones, tones, langs, _ = self._clean_text(text)
+    def _encode_phones(self, text: str):
+        """Text → interleaved phone/tone/lang ID 序列，返回 (ph, to, la, T)。"""
+        _, phones, tones, langs, _ = self._clean_text(text)
         phone_ids, tone_ids, lang_ids = self._seq_mix(phones, tones, langs)
         phone_ids = [0] + [p for pid in phone_ids for p in (pid, 0)]
         tone_ids = [0] + [t for tid in tone_ids for t in (tid, 0)]
         lang_ids = [0] + [l for lid in lang_ids for l in (lid, 0)]
         T = len(phone_ids)
+        return (np.array([phone_ids], dtype=np.int32),
+                np.array([tone_ids], dtype=np.int32),
+                np.array([lang_ids], dtype=np.int32),
+                np.array([T], dtype=np.int32))
 
-        ph = np.array([phone_ids], dtype=np.int32)
-        to = np.array([tone_ids], dtype=np.int32)
-        la = np.array([lang_ids], dtype=np.int32)
-        xl = np.array([T], dtype=np.int32)
+    def _split_text_under_phones(self, text: str) -> list:
+        """把一段文本按词贪心拆成多段，保证每段的 phone 数 ≤ _enc_max_T。
 
-        # ── 2. Encoder (ORT) ──
-        m_p, logs_p, logw, x_mask = self._encoder.run(None,
-            {"ph": ph, "to": to, "la": la, "xl": xl})
+        只在极少数超长/高音素密度文本（如整段英文）触发；正常中文 MAX_CHUNK_CHARS=100
+        对应 T≈400，远低于 encoder.trt 的 1000 上限，不会走到这里。
+        """
+        import re
+        limit = self._enc_max_T
+        tokens = re.findall(r"\S+\s*", text) or [text]
+        pieces, buf = [], ""
+        for tok in tokens:
+            cand = buf + tok
+            if buf and self._encode_phones(cand)[3].item() > limit:
+                pieces.append(buf)
+                buf = tok
+            else:
+                buf = cand
+        if buf:
+            pieces.append(buf)
+        # 极端情况下单个词本身超限 → 退化为按字符切
+        out = []
+        for p in pieces:
+            if self._encode_phones(p)[3].item() > limit:
+                out.extend(p[i:i + limit] for i in range(0, len(p), limit))
+            else:
+                out.append(p)
+        return out or [text]
 
-        # ── 3. Duration expansion (pure NumPy MAS) ──
+    def _synth_phones(self, ph, to, la, xl, T, noise_scale):
+        """phone ID 序列 → audio float32（encoder + flow + decoder + iSTFT，全 TRT）。"""
+        # ── 1. Encoder (TRT) ──
+        m_p, logs_p, logw, x_mask = self._trt_run(
+            self._enc_eng, {"ph": ph, "to": to, "la": la, "xl": xl},
+            ("m_p", "logs_p", "logw", "x_mask"))
+
+        # ── 2. Duration expansion (pure NumPy MAS) ──
         w = np.exp(logw[0, 0, :T]) * x_mask[0, 0, :T]
         w_ceil = np.ceil(w).astype(np.int32)
         Ty = max(1, int(w_ceil.sum()))
@@ -437,13 +510,13 @@ class TRTTSAdapter(TTSAdapter):
         logs_p_exp = np.matmul(logs_p[:, :, :T], attn)
         z_p = m_p_exp + np.random.randn(1, 256, Ty).astype(np.float32) * np.exp(logs_p_exp) * noise_scale
 
-        # ── 4. Flow (TRT) ──
+        # ── 3. Flow (TRT) ──
         z, = self._trt_run(self._flow_eng, {"z_p": z_p, "y_mask": y_mask}, ["z"])
 
-        # ── 5. Decoder (TRT) ──
+        # ── 4. Decoder (TRT) ──
         spec, phase = self._trt_run(self._dec_eng, {"z": z}, ["spec", "phase"])
 
-        # ── 6. iSTFT (NumPy bincount overlap-add) ──
+        # ── 5. iSTFT (NumPy bincount overlap-add) ──
         tf = np.fft.irfft(spec * np.exp(1j * phase), n=self._n_fft, axis=1)
         wf2d = tf[0] * self._window[0]
         _, T_frames = wf2d.shape
@@ -461,14 +534,35 @@ class TRTTSAdapter(TTSAdapter):
             x = np.linspace(0, 1, target_len)
             audio = np.interp(x, xp, audio[0]).reshape(1, -1).astype(np.float32)
 
-        # ── 7. Convert to PCM ──
-        audio_f32 = audio[0]
+        return audio[0]
+
+    def _synthesize_chunk(self, text: str, noise_scale: float = 0.667):
+        """Synthesize a single text chunk through TRT, returning float32 numpy array.
+
+        若 phone 序列超过 encoder.trt 的 max profile，则按词截断、分次编码后拼接，
+        绝不回退 ORT。
+        """
+        t0 = time.perf_counter()
+        ph, to, la, xl = self._encode_phones(text)
+        T = int(xl.item())
+
+        if T <= self._enc_max_T:
+            audio_f32 = self._synth_phones(ph, to, la, xl, T, noise_scale)
+        else:
+            log.info("[tts] T_phone=%d exceeds encoder max %d, splitting text into pieces",
+                     T, self._enc_max_T)
+            audios = []
+            for piece in self._split_text_under_phones(text):
+                pph, pto, pla, pxl = self._encode_phones(piece)
+                audios.append(self._synth_phones(pph, pto, pla, pxl, int(pxl.item()), noise_scale))
+            audio_f32 = np.concatenate(audios)
+
         peak = max(abs(audio_f32.max()), abs(audio_f32.min()), 1.0)
         if peak > 1.5:
             audio_f32 = audio_f32 * (1.0 / peak)
         t1 = time.perf_counter()
-        log.info("[tts] chunk %d chars %d phones → Ty=%d T_frames=%d | total=%dms audio=%.1fs",
-                 len(text), T, Ty, T_frames, int((t1 - t0) * 1000), len(audio_f32) / 16000)
+        log.info("[tts] chunk %d chars %d phones → audio=%.2fs | total=%dms",
+                 len(text), T, len(audio_f32) / 16000, int((t1 - t0) * 1000))
         return audio_f32
 
     def synthesize_stream(self, text: str):

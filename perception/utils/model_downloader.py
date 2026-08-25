@@ -93,12 +93,12 @@ MODELS = {
     # VITS2 TRT engine（JP5 / TRT 8.5.2）
     "vits2_trt_mel20full_d50_jp5": {
         "url": f"{VITS2_COS_BASE}/trt_mel20full_d50.tar.gz",
-        "check_file": "flow.trt",
+        "check_file": "encoder.trt",
     },
     # VITS2 TRT engine（JP6 / TRT 10.4）
     "vits2_trt_mel20full_d50_jp6": {
         "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_jp6.tar.gz",
-        "check_file": "flow.trt",
+        "check_file": "encoder.trt",
     },
 }
 
