@@ -118,7 +118,44 @@ RUN mkdir -p /work/weights/clip && \
 ENV YOLO_CONFIG_DIR=/work
 
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
+# jp5.11 installs a CUDA-enabled wheel built on an Orin against onnxruntime-gpu
+# 1.16.0 (CUDA 11.4, cuDNN 8) with -DSHERPA_ONNX_ENABLE_GPU=ON.
+#
+# Installing it does NOT move anything to the GPU on its own: that is opt-in via
+# `device: gpu` in the ASR/TTS config, and only for the (model, device) pairs
+# ASR_MODELS lists. int8 weights are *slower* on CUDA — ONNX Runtime's CUDA
+# provider has no int8 kernels and falls back per node — so `device: gpu` loads
+# different, non-quantised weights. Measured on an Orin NX at matched num_threads:
+# SenseVoice fp16 5.8x faster, streaming paraformer fp32 1.8x faster, while the
+# same models' int8 weights were 0.4-0.7x, i.e. worse. The numbers, the thread
+# sweep and the reasoning are in perception/README.md § sherpa-onnx Device
+# Selection, along with how to rebuild this wheel.
+#
+# The gate is on JP_VERSION, not on "is this a Jetson": the wheel links
+# libcudart.so.11.0, which jp6.1 (CUDA 12.6) does not provide. jp6.1 would need
+# its own build against onnxruntime-gpu 1.18.1 on a JetPack 6 host, so until then
+# it keeps the CPU wheel from PyPI and `device: gpu` falls back to cpu there.
+#
+# Cost: 74 MB compressed / ~250 MB unpacked, nearly all of it
+# libonnxruntime_providers_cuda.so, versus ~30 MB for the CPU wheel.
+#
+# The URL needs %2B for the '+cuda' local version, but the file on disk must
+# keep the literal '+' or pip refuses to parse the version out of the filename.
+ARG SHERPA_GPU_WHEEL=sherpa_onnx-1.13.6+cuda-cp38-cp38-linux_aarch64.whl
+RUN if [ "${JP_VERSION}" = "511" ]; then \
+        python3 -c "import urllib.request, urllib.parse, sys; \
+name = sys.argv[1]; \
+urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(name), '/tmp/' + name)" \
+            "${SHERPA_GPU_WHEEL}" && \
+        pip3 install --no-cache-dir "/tmp/${SHERPA_GPU_WHEEL}" && \
+        rm -f "/tmp/${SHERPA_GPU_WHEEL}" && \
+        python3 -c "import sherpa_onnx, pathlib; \
+lib = pathlib.Path(sherpa_onnx.__file__).parent / 'lib' / 'libonnxruntime_providers_cuda.so'; \
+assert lib.is_file(), 'CUDA provider missing from the installed wheel'; \
+print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
+    else \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx; \
+    fi
 
 # ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
 # libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
@@ -153,6 +190,15 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
+# phonemizer finds libespeak-ng with ctypes.util.find_library, which shells out to
+# `ldconfig -p` — and the ldconfig shimming above means libespeak-ng never makes it
+# into the cache, so find_library returns None and EspeakBackend raises "espeak not
+# installed" even though the package is installed. Pointing at the library directly
+# skips that lookup entirely. Without it asr_kws degrades to matching raw characters
+# *and* spends 5.2 s per utterance forking ldconfig from a multi-GB process — see
+# plugins/asr.py _phonemize_safe. asr.py also probes for it at runtime, so an image
+# built before this line still recovers; this makes it not depend on that.
+ENV PHONEMIZER_ESPEAK_LIBRARY=/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1
 
 # ── VITS2 TRT TTS (optional backend, JP5 TRT 8.5.2) ──────────────
 # 模型资产（frontend / vits2 源码 / nltk / TRT engine）运行时由

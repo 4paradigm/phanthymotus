@@ -495,6 +495,78 @@ def _download_verified_bundle(
 
 
 
+# ── sherpa-onnx GPU weight variants (device: gpu) ──────────────────────────
+# The bundles in MODELS above are all int8, which is the right choice for the CPU
+# and the wrong one for the GPU: ONNX Runtime's CUDA provider has no int8 kernels,
+# falls back to CPU node by node, and measured 1.25x-3.3x *slower* than the CPU on
+# the same audio. These are the non-quantised variants that `device: gpu` loads —
+# which weights belong to which model is declared in plugins/asr.py ASR_MODELS.
+#
+# These use ensure_verified_bundle rather than ensure_model because they are the
+# largest downloads in the stack (the paraformer encoder alone is 636 MB) and
+# ensure_model's only integrity check is "does check_file exist in the archive".
+# A truncated 780 MB transfer passes that and then fails at session creation in a
+# way nobody can diagnose. Here every file is pinned by size and SHA256.
+#
+# Provenance: derived from pengzhendong's ModelScope mirrors of the k2-fsa model
+# zoo, accepted only after that mirror's int8 weights were confirmed byte-identical
+# to the copies we already deploy from COS. The fp16 files are converted from the
+# mirror's fp32 with tools/convert_onnx_fp16.py.
+SHERPA_GPU_MODEL_BASE = os.environ.get(
+    "SHERPA_GPU_MODEL_BASE_URL", f"{COS_BASE}/sherpa-onnx-gpu"
+)
+SHERPA_GPU_BUNDLES = {
+    # Streaming paraformer, fp32. fp16 exists but is NOT used here: on CUDA it
+    # emits nothing but </s> (correct on CPU, so the conversion is fine and the
+    # CUDA+fp16+streaming combination is not), and it is slower than fp32 anyway
+    # (2077 ms vs 1859 ms).
+    "asr_gpu": {
+        "base_url": f"{SHERPA_GPU_MODEL_BASE}/streaming-paraformer-bilingual-zh-en-fp32",
+        "files": {
+            "encoder.onnx": {
+                "size": 636348877,
+                "sha256": "832c8e8d3f758f4ab0fcfc011eec91154ecd129b7305564a7b461b20064ebcc6",
+            },
+            "decoder.onnx": {
+                "size": 228464044,
+                "sha256": "e178f5a7dd4efbf5905a797807006d773b12116eb39fed3d16758e68f9f50921",
+            },
+            "tokens.txt": {
+                "size": 75756,
+                "sha256": "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6",
+            },
+        },
+    },
+    # Offline SenseVoice, fp16 — faster than fp32 on CUDA (344 ms vs 416 ms), half
+    # the size, and transcript-identical to fp32 on both providers.
+    "asr_sensevoice_gpu": {
+        "base_url": f"{SHERPA_GPU_MODEL_BASE}/sense-voice-zh-en-ja-ko-yue-2024-07-17-fp16",
+        "files": {
+            "model.fp16.onnx": {
+                "size": 470225401,
+                "sha256": "b6b71a306afa7ccb48d2319b91567dfeefeb51f0f4eed9c88ec139cb10c14e09",
+            },
+            "tokens.txt": {
+                "size": 315894,
+                "sha256": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+            },
+        },
+    },
+}
+
+
+def ensure_gpu_model(name: str, model_dir: str) -> dict[str, str]:
+    """Ensure a `device: gpu` weight bundle is present and SHA256-verified."""
+    bundle = SHERPA_GPU_BUNDLES.get(name)
+    if bundle is None:
+        raise KeyError(
+            f"No GPU weight bundle named {name!r}; "
+            f"available: {sorted(SHERPA_GPU_BUNDLES)}"
+        )
+    return ensure_verified_bundle(name, model_dir, bundle["base_url"],
+                                  bundle["files"])
+
+
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
 # The engines are built per TensorRT major and are not portable, so the
 # bundle is chosen from the TensorRT that is importable at runtime. Only the

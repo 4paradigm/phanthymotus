@@ -980,8 +980,8 @@ async def apply(request: fastapi.Request, req: LoadRequest):
 
     # 1) 画布 —— deviceRef 换回本机 mcpId
     if BLOCK_CANVAS in includes:
-        applied['canvas'] = _apply_canvas(payload.get('canvas') or {},
-                                          resolved['mapping'])
+        applied['canvas'] = await _apply_canvas(payload.get('canvas') or {},
+                                                resolved['mapping'])
 
     # 2) 技能
     if BLOCK_SKILLS in includes:
@@ -1018,7 +1018,7 @@ async def apply(request: fastapi.Request, req: LoadRequest):
     return {'code': 200, 'data': {'applied': applied, 'needsConfig': needs_config}}
 
 
-def _apply_canvas(canvas: dict, mapping: dict) -> dict:
+async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     """写画布布局与卡片配置。"""
     from api.canvas import (apply_tool_config, delete_all_tool_configs,
                             notify_layout_changed, tool_config_key)
@@ -1051,12 +1051,16 @@ def _apply_canvas(canvas: dict, mapping: dict) -> dict:
             c['toMcpId'] = target['mcpId']
         exec_connections.append(c)
 
+    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
     config.main['canvas_layout'] = {
         'cards':           cards,
         'connections':     connections,
         'execConnections': exec_connections,
         'transform':       canvas.get('transform') or {},
     }
+    # 方案里的卡片是整套替换的，被换掉的那些卡片的实例不会再有人来停它
+    from api.config import stop_removed_cards
+    await stop_removed_cards(old_cards, cards)
     # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
     notify_layout_changed()
 

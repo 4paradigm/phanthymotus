@@ -642,7 +642,14 @@ async function _removeCard(id) {
   if (!(await _ensureEdit())) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
-  _cards[idx].el.remove();
+  const removed = _cards[idx];
+  // Stop the instance this card owns, before it stops being reachable. Nothing
+  // else can: stop-project walks the saved layout, and this card is about to
+  // leave it, so its ROS node, subscription and any CUDA context would live
+  // until perception exits — publishing to a topic no card accounts for.
+  // `stop` is idempotent, so doing this to a card that was never started is fine.
+  _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
+  removed.el.remove();
   _cards.splice(idx, 1);
   // Trigger stop for connections where this card was the source
   const outgoing = _connections.filter(c => c.fromCardId === id);
@@ -1546,7 +1553,11 @@ function _resolveAllTopics() {
 // ── Project lifecycle ─────────────────────────────────────────────────────────
 
 function _autoStopOnDisconnect(cardId, portIdx, topic) {
-  if (!_projectRunning) return;
+  // No `if (!_projectRunning) return` here. Every call site already refuses to
+  // edit while the project runs, so that check made this function a no-op at all
+  // of them — a card left subscribed to a topic the canvas no longer connects,
+  // which is how an old TTS node kept speaking on a deleted link. Stopping a
+  // stopped instance just returns {"state": "idle"}.
   // Only stop if no other connection still feeds this port
   const stillConnected = _connections.some(c => c.toCardId === cardId && c.toPortIdx === portIdx);
   if (stillConnected) return;

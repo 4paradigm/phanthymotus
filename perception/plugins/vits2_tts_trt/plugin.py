@@ -463,9 +463,11 @@ class TTSPlugin:
     """VITS2 TensorRT implementation behind the standard ``tts`` tool.
 
     Lifecycle mirrors plugins/ocr.py, for the same reason: the slow work (a
-    60 MB release download, three TensorRT engines, a warmup pass) takes far
-    longer than the 60 s Agent Core allows a processor tools/call
-    (agent-core/src/mcp_client.py), so it must not run on the request thread.
+    60 MB release download, three TensorRT engines, a warmup pass) is open-ended,
+    so it must not run on the request thread. The bound it would blow through is
+    the 60 s the *LLM* tool path allows a processor tools/call
+    (agent-core/src/mcp_client.py); the dashboard's start-project path sets no
+    client timeout, but a download still has no upper bound worth blocking on.
 
         idle --start--> loading --ok--> ready/running
                           |               ^

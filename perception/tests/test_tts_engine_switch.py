@@ -124,29 +124,56 @@ def test_actions_are_forwarded_to_the_active_engine(_fake_engines):
     assert _fake_engines["vits2_trt"].calls[-1]["input_topic"] == "/say"
 
 
-def test_switch_stops_the_old_engine_and_never_blocks(_fake_engines):
+def test_switch_stops_the_old_engine_and_waits_for_the_new_one(_fake_engines):
+    """config waits for the bounded part of a build instead of making the caller
+    poll. Answering `loading` for a 5 s session construction is what made the
+    dashboard send a start the engine could not honour — see the deferred-start
+    tests at the bottom for the case where waiting is not enough."""
     plugin = _plugin()
     outgoing = _fake_engines["vits2_trt"]
 
-    began = time.monotonic()
     result = plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
-    elapsed = time.monotonic() - began
 
     assert result["status"] == "configured"
-    assert result["state"] == "loading"
-    # sherpa-onnx downloads its model in the constructor; the config call must
-    # not wait for that (Agent Core gives a processor call 60 s).
-    assert elapsed < 0.2, f"config blocked for {elapsed:.2f}s"
+    assert "state" not in result, "a completed switch must not report loading"
+    assert result["engine"] == "sherpa_onnx"
     # The outgoing engine is stopped before the new one can publish.
     assert outgoing.stopped is True
-
-    assert _wait_until(
-        lambda: plugin.dispatch("tts", {"action": "info"}).get("model") == "sherpa_onnx"
-    )
+    # And the engine is live *now*, so the start that follows lands on it.
     assert plugin.dispatch("tts", {"action": "info"})["engine"] == "sherpa_onnx"
+    assert plugin.dispatch("tts", {"action": "start",
+                                   "input_topic": "/say"})["state"] == "running"
 
 
-def test_info_reports_loading_while_the_new_engine_builds(_fake_engines):
+def test_config_gives_up_waiting_and_reports_loading(monkeypatch, _fake_engines):
+    """A build slower than the bound — a cold model download — still goes async."""
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
+    result = _plugin().dispatch("tts", {"action": "config",
+                                        "tts_engine": "sherpa_onnx"})
+    assert result["status"] == "configured"
+    assert result["state"] == "loading"
+
+
+def test_config_reports_a_build_failure_instead_of_loading(monkeypatch):
+    class _Boom:
+        def __init__(self, cfg, executor):
+            raise RuntimeError("Protobuf parsing failed")
+
+    monkeypatch.setattr(tts, "SherpaOnnxTTSPlugin", _Boom)
+    monkeypatch.setattr(
+        tts.TTSPlugin, "_build_vits2",
+        lambda self, cfg: _FakeEngine("vits2_trt", cfg, self._executor, lambda i: None),
+    )
+    plugin = tts.TTSPlugin({"engine": "vits2_trt"}, _FakeExecutor())
+    result = plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+    assert result["status"] == "error"
+    assert "Protobuf parsing failed" in result["message"]
+
+
+def test_info_reports_loading_while_the_new_engine_builds(monkeypatch, _fake_engines):
+    """Only reachable once config has stopped waiting; until then there is no
+    window in which the facade has no engine."""
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
     plugin = _plugin()
     plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
 
@@ -154,7 +181,7 @@ def test_info_reports_loading_while_the_new_engine_builds(_fake_engines):
     assert info["state"] == "loading"
     assert "sherpa_onnx" in info["desc"]
     # Other actions answer loading too, rather than hanging or lying.
-    assert plugin.dispatch("tts", {"action": "start"})["state"] == "loading"
+    assert plugin.dispatch("tts", {"action": "speak", "text": "hi"})["state"] == "loading"
 
 
 def test_switching_back_and_forth_keeps_one_engine_live(_fake_engines):
@@ -306,3 +333,78 @@ def test_engine_that_reports_error_after_construction_is_not_installed(monkeypat
     # And no action may claim success against it.
     assert plugin.dispatch("tts", {"action": "start"})["state"] == "error"
     assert plugin.dispatch("tts", {"action": "speak", "text": "hi"})["state"] == "error"
+
+
+# ── starts that arrive mid-build ─────────────────────────────────────────────
+#
+# The dashboard sends config (which triggers the switch) and start back to back,
+# so a start during a build is the normal path, not a rare race. Answering
+# `state: loading` and dropping it left the engine idle once it finished, and
+# Agent Core — which polls `info` after a loading start and reports "启动已取消"
+# if it ever sees idle — cancelled the card even though the engine loaded fine.
+
+def test_start_during_a_switch_is_replayed_once_the_engine_is_up(monkeypatch, _fake_engines):
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+
+    # The build is still in flight, so the call cannot start anything yet.
+    result = plugin.dispatch("tts", {"action": "start",
+                                     "instance_id": "card-1",
+                                     "input_topic": "/say"})
+    assert result["state"] == "loading"
+
+    _wait_until(lambda: "sherpa_onnx" in _fake_engines)
+    incoming = _fake_engines["sherpa_onnx"]
+    _wait_until(lambda: any(c.get("action") == "start" for c in incoming.calls))
+
+    started = [c for c in incoming.calls if c.get("action") == "start"]
+    assert len(started) == 1, "the deferred start must be replayed exactly once"
+    assert started[0]["input_topic"] == "/say"
+    assert started[0]["instance_id"] == "card-1"
+
+
+def test_a_stop_during_a_switch_cancels_the_deferred_start(monkeypatch, _fake_engines):
+    """Otherwise the node reappears after the operator asked for it to stop."""
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+    plugin.dispatch("tts", {"action": "start", "instance_id": "card-1",
+                            "input_topic": "/say"})
+    assert plugin.dispatch("tts", {"action": "stop",
+                                   "instance_id": "card-1"})["state"] == "idle"
+
+    _wait_until(lambda: "sherpa_onnx" in _fake_engines)
+    incoming = _fake_engines["sherpa_onnx"]
+    time.sleep(0.4)   # past the fake build delay, so a replay would have landed
+    assert not [c for c in incoming.calls if c.get("action") == "start"]
+
+
+def test_deferred_starts_are_per_instance(monkeypatch, _fake_engines):
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+    for card, topic in (("card-1", "/say/a"), ("card-2", "/say/b")):
+        plugin.dispatch("tts", {"action": "start", "instance_id": card,
+                                "input_topic": topic})
+
+    _wait_until(lambda: "sherpa_onnx" in _fake_engines)
+    incoming = _fake_engines["sherpa_onnx"]
+    _wait_until(lambda: len([c for c in incoming.calls
+                             if c.get("action") == "start"]) == 2)
+    topics = sorted(c["input_topic"] for c in incoming.calls
+                    if c.get("action") == "start")
+    assert topics == ["/say/a", "/say/b"]
+
+
+def test_start_after_the_build_finishes_is_not_replayed_twice(_fake_engines):
+    """A start that the live engine already handled must not also be queued."""
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+    _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] != "loading")
+
+    plugin.dispatch("tts", {"action": "start", "instance_id": "card-1",
+                            "input_topic": "/say"})
+    time.sleep(0.2)
+    incoming = _fake_engines["sherpa_onnx"]
+    assert len([c for c in incoming.calls if c.get("action") == "start"]) == 1

@@ -197,12 +197,19 @@ export const AudioRenderer = {
 
     const cw = this._canvas.offsetWidth;
     const ch = this._canvas.offsetHeight;
-    if (cw > 0 && (this._canvas.width !== cw || this._canvas.height !== ch)) {
-      this._canvas.width  = cw * devicePixelRatio;
-      this._canvas.height = ch * devicePixelRatio;
+    // Compare against the backing-store size, not the CSS size: after a resize
+    // canvas.width is cw * devicePixelRatio, so `canvas.width !== cw` is always
+    // true on a HiDPI display and this reallocated the canvas and reset the
+    // transform on every animation frame.
+    const wantW = Math.round(cw * devicePixelRatio);
+    const wantH = Math.round(ch * devicePixelRatio);
+    if (cw > 0 && (this._canvas.width !== wantW || this._canvas.height !== wantH)) {
+      this._canvas.width  = wantW;
+      this._canvas.height = wantH;
       this._canvas.style.width  = cw + 'px';
       this._canvas.style.height = ch + 'px';
-      this._ctx2d.scale(devicePixelRatio, devicePixelRatio);
+      // Setting width/height resets the transform, so re-apply the DPR scale.
+      this._ctx2d.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
     }
     if (!this._canvas.width) {
       this._raf = requestAnimationFrame(() => this._draw());
@@ -249,6 +256,12 @@ export const AudioRenderer = {
     for (let col = 0; col < cols; col++) {
       const sampleStart = Math.floor(col * samplesPerCol);
       const sampleEnd   = Math.floor((col + 1) * samplesPerCol);
+      // A column with no samples of its own must draw nothing. Falling through
+      // with the sentinels below left mx at -1, which reads as "full negative
+      // amplitude" and painted a 1px bar at mid + amp — a solid line across the
+      // bottom of the panel whenever the buffer held fewer samples than the
+      // canvas is wide, which is every frame while the stream is silent.
+      if (sampleEnd <= sampleStart) continue;
       let mn = 1, mx = -1;
       for (let s = sampleStart; s < sampleEnd; s++) {
         const idx = (startIdx + s) % ringLen;

@@ -77,9 +77,11 @@ class XASRAdapter:
     def __init__(
         self,
         model_dir: str,
-        hw_provider: str = "cpu",
+        device: str = "cpu",
         num_threads: int = 2,
     ):
+        from utils.onnx_provider import provider_for_device
+
         root = Path(model_dir)
         encoder = root / "encoder-epoch-99-avg-1.int8.onnx"
         decoder = root / "decoder-epoch-99-avg-1.onnx"
@@ -105,6 +107,11 @@ class XASRAdapter:
 
         import sherpa_onnx
 
+        # This bundle only exists in mixed int8/fp32 form, so ASR_MODELS lists no
+        # gpu entry for it and device is effectively always cpu. The call stays so
+        # a forced device=gpu is reported rather than silently honoured.
+        provider = provider_for_device(device,
+                                       (str(encoder), str(decoder), str(joiner)))
         encoded_hotwords = _prepare_hotwords_file(hotwords)
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=str(encoder),
@@ -112,7 +119,7 @@ class XASRAdapter:
             joiner=str(joiner),
             tokens=str(tokens),
             num_threads=int(num_threads),
-            provider=hw_provider,
+            provider=provider,
             sample_rate=SAMPLE_RATE,
             feature_dim=80,
             decoding_method="modified_beam_search",
@@ -124,10 +131,11 @@ class XASRAdapter:
         )
         self._decode_lock = threading.Lock()
         log.info(
-            "[asr] X-ASR adapter loaded: encoder=%s, provider=%s, "
+            "[asr] X-ASR adapter loaded: encoder=%s, device=%s, provider=%s, "
             "max_active_paths=%d, hotwords_score=%.1f",
             encoder,
-            hw_provider,
+            device,
+            provider,
             MAX_ACTIVE_PATHS,
             HOTWORDS_SCORE,
         )

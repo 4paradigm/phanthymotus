@@ -432,14 +432,16 @@ async def _do_start_project():
     return True
 
 
-async def _do_stop_project():
-    """停止所有 canvas cards。"""
+async def _stop_cards(cards) -> int:
+    """Send `stop` to each card's instance. Returns how many calls were made.
+
+    `stop` is idempotent — a plugin that is already idle returns
+    `{"state": "idle"}` — so this is safe to call on cards that were never
+    started.
+    """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
-    from api.motus_stream import push_event
 
-    layout = config.main.get('canvas_layout', {})
-    cards = layout.get('cards', [])
-
+    stopped = 0
     for card in cards:
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -449,8 +451,44 @@ async def _do_stop_project():
         try:
             req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
             await mcp_call_tool(mcp_id, req)
+            stopped += 1
         except Exception:
             pass
+    return stopped
+
+
+async def stop_removed_cards(old_cards, new_cards) -> int:
+    """Stop instances belonging to cards that just left the layout.
+
+    `_do_stop_project` stops what the *saved layout* lists, so a card removed
+    from the layout can never be reached again: its plugin instance keeps its ROS
+    node, its subscription, and any subprocess or CUDA context until perception
+    exits. The symptoms are a topic with a publisher nothing on the canvas
+    accounts for (an old TTS node still publishing to a topic whose connection
+    was deleted), duplicate output when a replacement card publishes alongside
+    it, and rclpy refusing the node name on restart.
+
+    The frontend stops the card it deletes itself, but that only covers one path.
+    Layout reload, loading a solution, and a browser that dies between removing
+    the card and saving all go through a layout write, so the diff is enforced
+    here where every path meets.
+    """
+    live = {c.get('id', '') for c in (new_cards or []) if c.get('id')}
+    removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
+    if not removed:
+        return 0
+    count = await _stop_cards(removed)
+    print(f'[layout] stopped {count} instance(s) for removed card(s): '
+          f'{", ".join(c.get("id", "") for c in removed)}')
+    return count
+
+
+async def _do_stop_project():
+    """停止所有 canvas cards。"""
+    from api.motus_stream import push_event
+
+    layout = config.main.get('canvas_layout', {})
+    await _stop_cards(layout.get('cards', []))
 
     core = config.main.get('core', {})
     core['project_running'] = False

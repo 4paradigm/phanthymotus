@@ -696,14 +696,21 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     bodyEl.appendChild(fieldWrapper);
   }
 
-  // x-show-when / x-hide-when: toggle field visibility based on controlling field value
+  // x-show-when / x-hide-when: toggle field visibility based on controlling field value.
+  // A condition value may be a single value or an array; an array means "any of
+  // these". That is what lets one field depend on a subset of another field's enum
+  // — e.g. the ASR device selector only applies to the models that have GPU
+  // weights, so it hides itself for the rest instead of offering a choice the
+  // plugin would reject.
+  const _condMatches = (condVal, actual) =>
+    Array.isArray(condVal) ? condVal.includes(actual) : actual === condVal;
   function _applyShowWhen() {
     bodyEl.querySelectorAll('.tool-config-field[data-show-when]').forEach(el => {
       const cond = JSON.parse(el.dataset.showWhen);
       let visible = true;
       for (const [condKey, condVal] of Object.entries(cond)) {
         const ctrl = bodyEl.querySelector(`[data-key="${condKey}"]`);
-        if (ctrl && ctrl.value !== condVal) { visible = false; break; }
+        if (ctrl && !_condMatches(condVal, ctrl.value)) { visible = false; break; }
       }
       el.style.display = visible ? '' : 'none';
     });
@@ -712,7 +719,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       let hidden = false;
       for (const [condKey, condVal] of Object.entries(cond)) {
         const ctrl = bodyEl.querySelector(`[data-key="${condKey}"]`);
-        if (ctrl && ctrl.value === condVal) { hidden = true; break; }
+        if (ctrl && _condMatches(condVal, ctrl.value)) { hidden = true; break; }
       }
       el.style.display = hidden ? 'none' : '';
     });

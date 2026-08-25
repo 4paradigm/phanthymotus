@@ -2,11 +2,29 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: false
-    asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
-    model_dir: /models/sherpa-onnx/asr
-    hw_provider: cpu
-    num_threads: 2
+    enabled: true
+    # Matches the configSchema default. SenseVoice on CPU is also the faster of
+    # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
+    # the largest gpu upside (fp16).
+    asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | sensevoice-small
+    # cpu | gpu — which weights get loaded is per (model, device) in
+    # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
+    # jp5.11 only) and is only offered for models where it was benchmarked and
+    # the transcripts were read: sensevoice-small (fp16) and paraformer-zh-en
+    # (fp32). Everything else is cpu-only — int8 weights are slower on CUDA, not
+    # faster, because ONNX Runtime's CUDA provider has no int8 kernels.
+    #
+    # gpu is ~3.4x faster per utterance (58 ms vs 195 ms p50 on 1-4 s of speech)
+    # and costs ~2 GB RAM against ~0.5 GB on cpu, ~1.4 GB of it a CUDA context
+    # the process never returns. On a 7.4 GB Orin already running vop + OCR +
+    # TTS that is enough to run the box out of memory, so cpu is the default
+    # even on images that could use the GPU. Numbers in utils/onnx_provider.py.
+    device: cpu
+    num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
+    # Decode 1 s of silence after the model loads. On gpu the first inference
+    # costs ~1.7 s (lazy kernels, cuDNN autotune, memory pool) against a 58 ms
+    # steady state; without this the operator pays it on their first utterance.
+    warmup: true
     language: zh-CN
     vad:
       model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
@@ -27,6 +45,7 @@ plugins:
     model_type: "mel20full_d50_mxd"
     speaker_id: 0
     speed: 1.0
+    device: cpu   # 仅 sherpa-onnx backend 使用；backend=trt 时忽略
 
   vop:
     enabled: true
