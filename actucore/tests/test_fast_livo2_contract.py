@@ -253,7 +253,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("self._collection_lifecycle_lock = threading.Lock()", supervisor)
         self.assertIn('"rollback_status"', supervisor)
         self.assertIn("finalize_collection_session(", supervisor)
-        self.assertIn("self._reference_points = loaded.points", adapter)
+        self.assertIn("self._reference_points = static_loaded.points", adapter)
         self.assertIn("reference = self._reference_points", adapter)
         self.assertIn('"obstacle_min_height_m", -0.30', adapter)
         self.assertIn('"obstacle_max_height_m", 0.30', adapter)

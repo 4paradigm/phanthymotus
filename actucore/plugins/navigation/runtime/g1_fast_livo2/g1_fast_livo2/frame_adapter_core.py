@@ -85,6 +85,21 @@ class RelocalizationResult:
     evaluated_points: int
 
 
+class RelocalizationRejected(InvalidFastLivo2Frame):
+    """A safe rejection that still exposes the best bounded candidate."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: RelocalizationResult,
+        reason: str,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class OccupancyGridSnapshot:
     """ROS-independent full occupancy snapshot for Nav2 StaticLayer."""
@@ -612,26 +627,44 @@ def estimate_planar_relocalization(
     if min_z >= max_z or not 0.0 < min_match_ratio <= 1.0:
         raise InvalidFastLivo2Frame("relocalization thresholds are invalid")
 
-    reference_cells = {
-        (math.floor(x / match_voxel_m), math.floor(y / match_voxel_m))
-        for x, y, z in reference_points
-        if all(math.isfinite(value) for value in (x, y, z)) and min_z <= z <= max_z
-    }
-    if len(reference_cells) < min_points:
+    reference_accumulators = {}
+    for x, y, z in reference_points:
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            continue
+        if not min_z <= z <= max_z:
+            continue
+        key = (math.floor(x / match_voxel_m), math.floor(y / match_voxel_m))
+        total_x, total_y, count = reference_accumulators.get(
+            key,
+            (0.0, 0.0, 0),
+        )
+        reference_accumulators[key] = (total_x + x, total_y + y, count + 1)
+    if len(reference_accumulators) < min_points:
         raise InvalidFastLivo2Frame("saved map has too few obstacle points")
-    expanded_reference_cells = {
-        (ix + dx, iy + dy)
-        for ix, iy in reference_cells
-        for dx in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-    }
+    match_radius_m = match_voxel_m * 2.0
+    reference_distance_field = {}
+    for (ix, iy), (total_x, total_y, count) in reference_accumulators.items():
+        reference_x = total_x / count
+        reference_y = total_y / count
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                key = (ix + dx, iy + dy)
+                distance_sq = (dx * match_voxel_m) ** 2 + (
+                    dy * match_voxel_m
+                ) ** 2
+                previous = reference_distance_field.get(key)
+                if previous is None or distance_sq < previous[0]:
+                    reference_distance_field[key] = (
+                        distance_sq,
+                        reference_x,
+                        reference_y,
+                    )
 
     scan_voxels: dict[tuple[int, int], tuple[float, float]] = {}
-    relative_z_offset = initial_map_base_pose.z - session_base_pose.z
     for x, y, z in session_points:
         if not all(math.isfinite(value) for value in (x, y, z)):
             continue
-        if not min_z <= z + relative_z_offset <= max_z:
+        if not min_z <= z <= max_z:
             continue
         key = (math.floor(x / match_voxel_m), math.floor(y / match_voxel_m))
         scan_voxels.setdefault(key, (x, y))
@@ -658,12 +691,14 @@ def estimate_planar_relocalization(
             my = sine * x + cosine * y + ty
             ix = math.floor(mx / match_voxel_m)
             iy = math.floor(my / match_voxel_m)
-            if (ix, iy) in reference_cells:
+            nearest = reference_distance_field.get((ix, iy))
+            if nearest is None:
+                continue
+            distance = math.hypot(mx - nearest[1], my - nearest[2])
+            point_quality = max(0.0, 1.0 - distance / match_radius_m)
+            if point_quality > 0.0:
                 hits += 1
-                quality += 1.0
-            elif (ix, iy) in expanded_reference_cells:
-                hits += 1
-                quality += 0.25
+                quality += point_quality
         return quality / len(samples), hits
 
     def correction_distance(base_x: float, base_y: float, base_yaw: float) -> float:
@@ -686,8 +721,12 @@ def estimate_planar_relocalization(
             return current
         score, hits = evaluate(base_x, base_y, base_yaw)
         distance = correction_distance(base_x, base_y, base_yaw)
-        if current is None or score > current[0] + 1e-12 or (
-            abs(score - current[0]) <= 1e-12
+        ranked_score = score - 0.04 * distance
+        current_ranked_score = (
+            None if current is None else current[0] - 0.04 * current[5]
+        )
+        if current is None or ranked_score > current_ranked_score + 1e-12 or (
+            abs(ranked_score - current_ranked_score) <= 1e-12
             and (hits > current[1] or (hits == current[1] and distance < current[5]))
         ):
             return (score, hits, base_x, base_y, base_yaw, distance)
@@ -721,9 +760,24 @@ def estimate_planar_relocalization(
                     best,
                 )
 
+    map_base = Pose3(
+        best[2],
+        best[3],
+        initial_map_base_pose.z,
+        quaternion_from_rpy(0.0, 0.0, best[4]),
+    )
+    result = RelocalizationResult(
+        map_from_session=compose_pose(map_base, inverse_pose(session_base_pose)),
+        map_base_pose=map_base,
+        match_ratio=best[0],
+        matched_points=best[1],
+        evaluated_points=len(samples),
+    )
     if best[0] < min_match_ratio:
-        raise InvalidFastLivo2Frame(
-            f"scan-to-map match ratio {best[0]:.3f} is below {min_match_ratio:.3f}"
+        raise RelocalizationRejected(
+            f"scan-to-map match ratio {best[0]:.3f} is below {min_match_ratio:.3f}",
+            result=result,
+            reason="match_ratio_below_threshold",
         )
     boundary_margin_xy = fine_xy * 0.5
     boundary_margin_yaw = fine_yaw * 0.5
@@ -735,23 +789,13 @@ def estimate_planar_relocalization(
         or correction_y >= search_xy_m - boundary_margin_xy
         or correction_yaw >= search_yaw_rad - boundary_margin_yaw
     ):
-        raise InvalidFastLivo2Frame(
+        raise RelocalizationRejected(
             "best relocalization candidate lies on the search boundary; "
-            "increase the search radius or improve the initial pose"
+            "increase the search radius or improve the initial pose",
+            result=result,
+            reason="candidate_on_search_boundary",
         )
-    map_base = Pose3(
-        best[2],
-        best[3],
-        initial_map_base_pose.z,
-        quaternion_from_rpy(0.0, 0.0, best[4]),
-    )
-    return RelocalizationResult(
-        map_from_session=compose_pose(map_base, inverse_pose(session_base_pose)),
-        map_base_pose=map_base,
-        match_ratio=best[0],
-        matched_points=best[1],
-        evaluated_points=len(samples),
-    )
+    return result
 
 
 def _field_value(field, key: str):
@@ -1583,6 +1627,7 @@ __all__ = [
     "OccupancyGridSnapshot",
     "Pose3",
     "Quaternion",
+    "RelocalizationRejected",
     "RelocalizationResult",
     "TemporalOccupancyMap",
     "VoxelMap",

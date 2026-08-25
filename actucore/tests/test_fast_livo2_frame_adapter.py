@@ -25,6 +25,7 @@ from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     InvalidFastLivo2Frame,
     Pose3,
     Quaternion,
+    RelocalizationRejected,
     TemporalOccupancyMap,
     VoxelMap,
     bracketed_stamped_pose,
@@ -762,6 +763,83 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
                 min_z=-0.5,
                 max_z=0.5,
             )
+
+    def test_planar_relocalization_does_not_depend_on_initial_height(self) -> None:
+        reference = [
+            (index * 0.10, 0.0, 0.0)
+            for index in range(60)
+        ] + [
+            (0.0, index * 0.10, 0.0)
+            for index in range(60)
+        ]
+        expected = Pose3(
+            2.0,
+            -1.0,
+            0.0,
+            quaternion_from_rpy(0.0, 0.0, 0.30),
+        )
+        session_points = tuple(transform_points(inverse_pose(expected), reference))
+
+        result = estimate_planar_relocalization(
+            reference_points=reference,
+            session_points=session_points,
+            session_base_pose=Pose3(
+                0.0,
+                0.0,
+                -3.0,
+                Quaternion(0.0, 0.0, 0.0, 1.0),
+            ),
+            initial_map_base_pose=Pose3(
+                2.1,
+                -1.1,
+                5.0,
+                quaternion_from_rpy(0.0, 0.0, 0.35),
+            ),
+            search_xy_m=0.5,
+            search_yaw_rad=0.25,
+            min_z=-0.5,
+            max_z=0.5,
+            min_match_ratio=0.5,
+        )
+
+        self.assertAlmostEqual(result.map_base_pose.x, expected.x, delta=0.15)
+        self.assertAlmostEqual(result.map_base_pose.y, expected.y, delta=0.15)
+        self.assertEqual(result.map_base_pose.z, 5.0)
+
+    def test_relocalization_rejection_exposes_best_candidate(self) -> None:
+        points = [
+            (index * 0.10, 0.0, 0.0)
+            for index in range(60)
+        ] + [
+            (0.0, index * 0.10, 0.0)
+            for index in range(60)
+        ]
+
+        with self.assertRaises(RelocalizationRejected) as caught:
+            estimate_planar_relocalization(
+                reference_points=points,
+                session_points=points,
+                session_base_pose=Pose3(
+                    0.0,
+                    0.0,
+                    0.0,
+                    Quaternion(0.0, 0.0, 0.0, 1.0),
+                ),
+                initial_map_base_pose=Pose3(
+                    5.0,
+                    5.0,
+                    0.0,
+                    Quaternion(0.0, 0.0, 0.0, 1.0),
+                ),
+                search_xy_m=0.5,
+                search_yaw_rad=0.2,
+                min_z=-0.5,
+                max_z=0.5,
+            )
+
+        self.assertEqual(caught.exception.reason, "match_ratio_below_threshold")
+        self.assertLess(caught.exception.result.match_ratio, 0.35)
+        self.assertAlmostEqual(caught.exception.result.map_base_pose.x, 5.0)
 
     def test_relocalization_ties_prefer_operator_guess_and_stay_bounded(self) -> None:
         session = []

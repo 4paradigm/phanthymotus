@@ -197,6 +197,12 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             Quaternion(0.0, 0.0, 0.0, 1.0),
         )
         adapter._latest_session_points = ((0.0, 0.0, 0.0),) * 40
+        adapter._relocalization_cloud_history = [
+            (time.monotonic(), adapter._latest_session_points),
+            (time.monotonic(), ((1.0, 0.0, 0.0),) * 40),
+        ]
+        adapter._relocalization_preview_pose = object()
+        adapter._relocalization_preview_points = ((8.0, 8.0, 0.0),)
         adapter._last_odom_monotonic = time.monotonic()
         adapter._last_cloud_monotonic = time.monotonic()
         adapter._source_max_age = 0.5
@@ -251,11 +257,91 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertIsNone(adapter._map_view_cache)
         self.assertIsNone(adapter._map_view_cache_monotonic)
         self.assertEqual(adapter._map_from_session, map_from_session)
+        self.assertIsNone(adapter._relocalization_preview_pose)
+        self.assertEqual(adapter._relocalization_preview_points, ())
         estimate.assert_called_once()
         self.assertEqual(
             estimate.call_args.kwargs["min_match_ratio"],
             ADAPTER_MODULE._RELOCALIZATION_MIN_MATCH_RATIO,
         )
+        self.assertEqual(
+            len(estimate.call_args.kwargs["session_points"]),
+            80,
+        )
+        self.assertEqual(result["input_frame_count"], 2)
+
+    def test_relocalization_rejection_returns_and_previews_best_candidate(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._mode = "awaiting_relocalization"
+        adapter._session_name = "office"
+        adapter._latest_session_pose = Pose3(
+            0.0,
+            0.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        points = tuple((index * 0.1, 0.0, 0.0) for index in range(40))
+        adapter._latest_session_points = points
+        adapter._relocalization_cloud_history = [(time.monotonic(), points)]
+        adapter._relocalization_preview_pose = None
+        adapter._relocalization_preview_points = ()
+        adapter._last_odom_monotonic = time.monotonic()
+        adapter._last_cloud_monotonic = time.monotonic()
+        adapter._source_max_age = 0.5
+        adapter._reference_points = points
+        adapter._obstacle_min_height = -0.3
+        adapter._obstacle_max_height = 0.3
+        adapter._map_view_cache = b"old-cache"
+        adapter._map_view_cache_monotonic = time.monotonic()
+        adapter._last_match = None
+        adapter._map_control_status_pub = _CapturePublisher()
+        candidate = Pose3(
+            1.0,
+            2.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        rejected = ADAPTER_MODULE.RelocalizationRejected(
+            "match too low",
+            result=SimpleNamespace(
+                map_from_session=candidate,
+                map_base_pose=candidate,
+                match_ratio=0.31,
+                matched_points=35,
+                evaluated_points=40,
+            ),
+            reason="match_ratio_below_threshold",
+        )
+        request = SimpleNamespace(
+            data=json.dumps(
+                {
+                    "request_id": "relocalize-1",
+                    "action": "relocalize",
+                    "args": {
+                        "initial_x": 1.0,
+                        "initial_y": 2.0,
+                        "initial_yaw": 0.0,
+                    },
+                    "operation_deadline_monotonic": time.monotonic() + 1.0,
+                }
+            )
+        )
+
+        with mock.patch.object(
+            ADAPTER_MODULE,
+            "estimate_planar_relocalization",
+            side_effect=rejected,
+        ):
+            adapter._on_map_control(request)
+
+        response = json.loads(adapter._map_control_status_pub.messages[-1].data)
+        self.assertTrue(response["retryable"])
+        self.assertEqual(response["candidate_pose"]["x"], 1.0)
+        self.assertTrue(response["preview_available"])
+        self.assertEqual(adapter._relocalization_preview_pose, candidate)
+        self.assertEqual(adapter._last_match["input_frame_count"], 1)
+        self.assertIsNone(adapter._map_view_cache)
 
     def test_adapter_execute_waits_for_bidirectional_discovery(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)

@@ -46,6 +46,11 @@ Driver navigation_sensors
 
 这两路输入来自既有 Driver `navigation_sensors` sensor cards。缺失、过期或
 frame 不符时同容器 adapter 不发布伪造的 canonical odom/cloud。
+FAST-LIVO2 使用与 LiDAR 刚性安装的 MID360 IMU 做重力对齐，因此整套传感器
+相对机身的小角度倾斜不会直接把地图永久建斜；adapter 再用实测
+`base_link -> livox_frame` 外参恢复机器人机身位姿。若实际安装角度发生变化、
+LiDAR 与 IMU frame 不一致，或外参仍沿用旧值，影响会同时出现在机器人箭头、
+高度带过滤、重定位和 costmap，必须重新标定外参，不能靠放宽匹配阈值掩盖。
 adapter 对 FAST-LIVO2 原始 odom/cloud 使用
 `BEST_EFFORT + KEEP_LAST(1)`，慢回调只保留最新样本，不把旧帧排成约
 0.5 秒的内部积压。Nav2 readiness 容许最多 `0.8 s` 接收调度抖动，
@@ -95,7 +100,8 @@ registered cloud、累计静态图或 Nav2 costmap。`map_view` 最多编码 80,
 Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
 `map_view` 点数组语义，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
-重定位成功前不显示伪造的机器人位姿。地图卡片支持三维
+首次重定位失败时只显示明确标记为未确认的最佳候选预览；不发布对应 TF、
+odom/cloud 或规划输入。地图卡片支持三维
 浏览和正上方二维投影切换；二维模式只是同一三维点云的平面显示，不是另存
 一份 occupancy grid。绿色机器人箭头沿 canonical `base_link` 的 `+X` 前向，
 并保持 ROS `map` frame 的 yaw 正方向。它是监控视图，不是
@@ -142,8 +148,11 @@ freshness 门禁。
 | `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
 
 重定位只有在匹配率至少为 0.35、且最优候选未贴住 XY/yaw 搜索边界时才提交新的
-`map -> base_link` 对齐；否则明确拒绝并要求扩大搜索范围或修正初始位姿。重复
-重定位提交时会先丢弃旧对齐下生成的实时点和 Canvas 缓存，等待新对齐下的下一帧，
+`map -> base_link` 对齐；否则明确拒绝并要求扩大搜索范围或修正初始位姿。失败
+回执仍返回 `candidate_pose`、匹配率和拒绝原因，Canvas `map_view` 显示该未确认
+候选与当前点云，方便操作者修正初值；预览不会发布 TF、canonical odom/cloud
+或启动 Nav2。重复重定位提交时会先丢弃旧对齐下生成的实时点和 Canvas 缓存，
+等待新对齐下的下一帧，
 避免新箭头叠加旧扫描造成显示错位。该对齐同时供 Canvas、TF、costmap 和寻路使用，
 因此拒绝低质量结果是导航安全边界，不只是显示策略。
 
@@ -183,9 +192,13 @@ PCD 后才发送停止信号。落盘失败或超时会返回可重试错误并�
 闭环校正。匹配分数不足、点数不足、数据过期、manifest/PCD 损坏时全部
 fail closed。
 
-当前有界匹配使用 `0.20 m` 二维体素，旧图和当前 scan 都至少需要
-40 个有效障碍体素，scan 最多参与 1,200 点，最低匹配比为 `0.20`。
-成功回执会返回 `match_ratio`、`matched_points` 和 `evaluated_points`；
+当前有界匹配以 confirmed static PCD 为参考，缓存最近 `2 s`、最多 20 帧，
+每帧最多保留 2,000 点后合并；最终使用 `0.20 m` 二维体素去重并最多评分
+1,200 点。评分按点到参考体素的距离连续衰减，并对偏离人工初值的候选施加
+轻微先验代价。旧图和当前数据都至少需要 40 个有效障碍体素，最低匹配比为
+`0.35`。`initial_z` 只决定成功后垂直对齐，二维 XY/yaw 评分不再用它平移
+当前点云的 Z 高度带。成功回执会返回 `match_ratio`、`matched_points`、
+`evaluated_points`、输入帧数和输入点数；
 `status=relocalized` 只证明本次有界匹配过关，不等同于长时间全局定位
 可靠性已验收。
 

@@ -13,6 +13,7 @@ import time
 
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
+import numpy as np
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -32,6 +33,7 @@ from .frame_adapter_core import (
     InvalidFastLivo2Frame,
     Pose3,
     Quaternion,
+    RelocalizationRejected,
     TemporalOccupancyMap,
     VoxelMap,
     bracketed_stamped_pose,
@@ -59,6 +61,9 @@ _MAP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _MAP_VIEW_MAX_POINTS = 40_000
 _MAP_VIEW_POSE_REFRESH_HZ = 2.0
 _RELOCALIZATION_MIN_MATCH_RATIO = 0.35
+_RELOCALIZATION_HISTORY_SEC = 2.0
+_RELOCALIZATION_MAX_FRAMES = 20
+_RELOCALIZATION_MAX_POINTS_PER_FRAME = 2_000
 
 
 def _stamp_ns(stamp) -> int:
@@ -170,6 +175,11 @@ class FastLivo2Adapter(Node):
         self._pose_history = deque(maxlen=128)
         self._latest_session_pose: Pose3 | None = None
         self._latest_session_points = ()
+        self._relocalization_cloud_history = deque(
+            maxlen=_RELOCALIZATION_MAX_FRAMES
+        )
+        self._relocalization_preview_pose: Pose3 | None = None
+        self._relocalization_preview_points = ()
         self._latest_mapped_points = ()
         self._reference_points: tuple[tuple[float, float, float], ...] = ()
         self._map_from_session: Pose3 | None = None
@@ -495,6 +505,27 @@ class FastLivo2Adapter(Node):
             self._latest_session_points = sample[1]
             self._last_cloud_monotonic = receive_monotonic
             self._last_cloud_source_age = source_age
+            if self._mode in {"awaiting_relocalization", "relocalized"}:
+                stride = max(
+                    1,
+                    math.ceil(
+                        len(points) / _RELOCALIZATION_MAX_POINTS_PER_FRAME
+                    ),
+                )
+                self._relocalization_cloud_history.append(
+                    (
+                        receive_monotonic,
+                        points[
+                            ::stride
+                        ][:_RELOCALIZATION_MAX_POINTS_PER_FRAME].copy(),
+                    )
+                )
+                cutoff = receive_monotonic - _RELOCALIZATION_HISTORY_SEC
+                while (
+                    self._relocalization_cloud_history
+                    and self._relocalization_cloud_history[0][0] < cutoff
+                ):
+                    self._relocalization_cloud_history.popleft()
             self._record_latency_locked(
                 "cloud_decode",
                 decode_end_monotonic - receive_monotonic,
@@ -626,6 +657,9 @@ class FastLivo2Adapter(Node):
             self._pose_history.clear()
             self._latest_session_pose = None
             self._latest_session_points = ()
+            self._relocalization_cloud_history.clear()
+            self._relocalization_preview_pose = None
+            self._relocalization_preview_points = ()
             self._latest_mapped_points = ()
             self._reference_points = ()
             self._last_match = None
@@ -697,6 +731,26 @@ class FastLivo2Adapter(Node):
                 "error_code": "map_control_io_failed",
                 "error": str(exc),
                 "retryable": True,
+            }
+        except RelocalizationRejected as exc:
+            candidate = exc.result.map_base_pose
+            result = {
+                "status": "error",
+                "error_code": "map_control_failed",
+                "error": str(exc),
+                "retryable": True,
+                "reject_reason": exc.reason,
+                "match_ratio": exc.result.match_ratio,
+                "matched_points": exc.result.matched_points,
+                "evaluated_points": exc.result.evaluated_points,
+                "required_match_ratio": _RELOCALIZATION_MIN_MATCH_RATIO,
+                "preview_available": True,
+                "candidate_pose": {
+                    "x": candidate.x,
+                    "y": candidate.y,
+                    "z": candidate.z,
+                    "yaw": yaw_from_quaternion(candidate.q),
+                },
             }
         except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
             result = {
@@ -958,11 +1012,13 @@ class FastLivo2Adapter(Node):
                     self._reference_points,
                     self._pose_history,
                     self._latest_session_points,
+                    self._relocalization_cloud_history,
+                    self._relocalization_preview_points,
                     self._latest_mapped_points,
                     self._map_view_context,
                 )
             self._static_map_load_time = self.get_clock().now().to_msg()
-            self._reference_points = loaded.points
+            self._reference_points = static_loaded.points
             self._session_name = map_name
             self._mode = "awaiting_relocalization"
             self._map_from_session = None
@@ -970,6 +1026,11 @@ class FastLivo2Adapter(Node):
             self._pose_history = deque(maxlen=128)
             self._latest_session_pose = None
             self._latest_session_points = ()
+            self._relocalization_cloud_history = deque(
+                maxlen=_RELOCALIZATION_MAX_FRAMES
+            )
+            self._relocalization_preview_pose = None
+            self._relocalization_preview_points = ()
             self._latest_mapped_points = ()
             self._map_view_context = map_view_context
             self._last_odom_monotonic = None
@@ -1006,36 +1067,83 @@ class FastLivo2Adapter(Node):
             if self._mode not in {"awaiting_relocalization", "relocalized"}:
                 raise InvalidFastLivo2Frame("no saved map is loaded")
             session_pose = self._latest_session_pose
-            session_points = self._latest_session_points
-            odom_age = None if self._last_odom_monotonic is None else time.monotonic() - self._last_odom_monotonic
-            cloud_age = None if self._last_cloud_monotonic is None else time.monotonic() - self._last_cloud_monotonic
+            now = time.monotonic()
+            while (
+                self._relocalization_cloud_history
+                and self._relocalization_cloud_history[0][0]
+                < now - _RELOCALIZATION_HISTORY_SEC
+            ):
+                self._relocalization_cloud_history.popleft()
+            session_frames = tuple(
+                points for _stamp, points in self._relocalization_cloud_history
+            )
+            odom_age = None if self._last_odom_monotonic is None else now - self._last_odom_monotonic
+            cloud_age = None if self._last_cloud_monotonic is None else now - self._last_cloud_monotonic
             reference = self._reference_points
             map_name = self._session_name
-        if session_pose is None or len(session_points) == 0:
+        if session_pose is None or not session_frames:
             raise InvalidFastLivo2Frame("FAST-LIVO2 odom and registered cloud are not ready")
         if odom_age is None or cloud_age is None or max(odom_age, cloud_age) > self._source_max_age:
             raise InvalidFastLivo2Frame("FAST-LIVO2 odom or registered cloud is stale")
+        session_points = np.concatenate(
+            tuple(
+                np.asarray(points, dtype=np.float64).reshape((-1, 3))
+                for points in session_frames
+            ),
+            axis=0,
+        )
+        if len(session_points) == 0:
+            raise InvalidFastLivo2Frame("FAST-LIVO2 registered cloud is empty")
         initial = Pose3(
             float(args["initial_x"]),
             float(args["initial_y"]),
             float(args.get("initial_z", 0.0)),
             quaternion_from_rpy(0.0, 0.0, float(args["initial_yaw"])),
         )
-        result = estimate_planar_relocalization(
-            reference_points=reference,
-            session_points=session_points,
-            session_base_pose=session_pose,
-            initial_map_base_pose=initial,
-            search_xy_m=float(args.get("search_xy_m", 1.0)),
-            search_yaw_rad=float(args.get("search_yaw_rad", 0.35)),
-            min_z=self._obstacle_min_height,
-            max_z=self._obstacle_max_height,
-            min_match_ratio=_RELOCALIZATION_MIN_MATCH_RATIO,
-        )
+        try:
+            result = estimate_planar_relocalization(
+                reference_points=reference,
+                session_points=session_points,
+                session_base_pose=session_pose,
+                initial_map_base_pose=initial,
+                search_xy_m=float(args.get("search_xy_m", 1.0)),
+                search_yaw_rad=float(args.get("search_yaw_rad", 0.35)),
+                min_z=self._obstacle_min_height,
+                max_z=self._obstacle_max_height,
+                min_match_ratio=_RELOCALIZATION_MIN_MATCH_RATIO,
+            )
+        except RelocalizationRejected as exc:
+            self._require_map_control_deadline(
+                args,
+                stage="relocalization preview",
+            )
+            preview_points = transform_xyz_array(
+                exc.result.map_from_session,
+                session_points,
+            )
+            with self._lock:
+                self._relocalization_preview_pose = exc.result.map_base_pose
+                self._relocalization_preview_points = preview_points
+                self._last_match = {
+                    "accepted": False,
+                    "reject_reason": exc.reason,
+                    "match_ratio": exc.result.match_ratio,
+                    "matched_points": exc.result.matched_points,
+                    "evaluated_points": exc.result.evaluated_points,
+                    "required_match_ratio": _RELOCALIZATION_MIN_MATCH_RATIO,
+                    "input_frame_count": len(session_frames),
+                    "input_point_count": len(session_points),
+                }
+                self._invalidate_map_view_cache_locked()
+            raise
         match = {
+            "accepted": True,
             "match_ratio": result.match_ratio,
             "matched_points": result.matched_points,
             "evaluated_points": result.evaluated_points,
+            "required_match_ratio": _RELOCALIZATION_MIN_MATCH_RATIO,
+            "input_frame_count": len(session_frames),
+            "input_point_count": len(session_points),
         }
         self._require_map_control_deadline(
             args,
@@ -1044,6 +1152,8 @@ class FastLivo2Adapter(Node):
         with self._lock:
             self._map_from_session = result.map_from_session
             self._latest_pose = result.map_base_pose
+            self._relocalization_preview_pose = None
+            self._relocalization_preview_points = ()
             self._latest_mapped_points = ()
             self._pending_cloud = None
             self._last_cloud_pose_skew_sec = None
@@ -1084,6 +1194,8 @@ class FastLivo2Adapter(Node):
                     self._reference_points,
                     self._pose_history,
                     self._latest_session_points,
+                    self._relocalization_cloud_history,
+                    self._relocalization_preview_points,
                     self._latest_mapped_points,
                     self._map_view_context,
                 )
@@ -1095,6 +1207,11 @@ class FastLivo2Adapter(Node):
             self._pose_history = deque(maxlen=128)
             self._latest_session_pose = None
             self._latest_session_points = ()
+            self._relocalization_cloud_history = deque(
+                maxlen=_RELOCALIZATION_MAX_FRAMES
+            )
+            self._relocalization_preview_pose = None
+            self._relocalization_preview_points = ()
             self._latest_mapped_points = ()
             self._map_view_context = VoxelMap(self._map_view_voxel_size)
             self._reference_points = ()
@@ -1144,7 +1261,7 @@ class FastLivo2Adapter(Node):
         started = time.monotonic()
         with self._lock:
             cached = self._map_view_cache
-            pose = self._latest_pose
+            pose = self._latest_pose or self._relocalization_preview_pose
         if cached is None or pose is None:
             return
         try:
@@ -1181,7 +1298,8 @@ class FastLivo2Adapter(Node):
         encoded_map_view = None
         map_view_encode_sec = None
         with self._lock:
-            pose = self._latest_pose
+            confirmed_pose = self._latest_pose
+            pose = confirmed_pose or self._relocalization_preview_pose
             odom_age = None if self._last_odom_monotonic is None else now - self._last_odom_monotonic
             cloud_age = None if self._last_cloud_monotonic is None else now - self._last_cloud_monotonic
             navigation_cloud_age = (
@@ -1194,6 +1312,8 @@ class FastLivo2Adapter(Node):
             live_points = ()
             if cloud_age is not None and cloud_age <= self._source_max_age:
                 live_points = self._latest_mapped_points
+            if confirmed_pose is None and self._relocalization_preview_pose is not None:
+                live_points = self._relocalization_preview_points
             map_view_context = self._map_view_context
             state = {
                 "session_name": self._session_name,
@@ -1203,6 +1323,16 @@ class FastLivo2Adapter(Node):
                 "odom_source_age": self._last_odom_source_age,
                 "cloud_source_age": self._last_cloud_source_age,
                 "reference_map_point_count": len(self._reference_points),
+                "relocalization_history_frame_count": len(
+                    self._relocalization_cloud_history
+                ),
+                "relocalization_history_point_count": sum(
+                    len(points)
+                    for _stamp, points in self._relocalization_cloud_history
+                ),
+                "relocalization_preview_available": (
+                    self._relocalization_preview_pose is not None
+                ),
                 "cloud_pose_skew_sec": self._last_cloud_pose_skew_sec,
                 "pending_navigation_cloud": self._pending_cloud is not None,
                 "unmatched_navigation_cloud": self._unmatched_navigation_cloud,
@@ -1225,14 +1355,15 @@ class FastLivo2Adapter(Node):
                 for point in live_points
                 if not obstacle_min_height <= point[2] <= obstacle_max_height
             )
-            if pose is not None:
+            if confirmed_pose is not None:
                 snapshot = self._static_map.occupancy_snapshot(
-                    center_x=pose.x,
-                    center_y=pose.y,
+                    center_x=confirmed_pose.x,
+                    center_y=confirmed_pose.y,
                     min_z=obstacle_min_height,
                     max_z=obstacle_max_height,
                 )
                 static_grid = self._occupancy_grid(snapshot)
+            if pose is not None:
                 map_view_encode_started = time.monotonic()
                 encoded_map_view = encode_map_view_points(
                     chain(
@@ -1287,6 +1418,16 @@ class FastLivo2Adapter(Node):
             "odom_source_age_sec": state["odom_source_age"],
             "cloud_source_age_sec": state["cloud_source_age"],
             "reference_map_point_count": state["reference_map_point_count"],
+            "relocalization_history_sec": _RELOCALIZATION_HISTORY_SEC,
+            "relocalization_history_frame_count": state[
+                "relocalization_history_frame_count"
+            ],
+            "relocalization_history_point_count": state[
+                "relocalization_history_point_count"
+            ],
+            "relocalization_preview_available": state[
+                "relocalization_preview_available"
+            ],
             **static_diagnostics,
             "static_pose_match_tolerance_sec": self._static_pose_match_tolerance,
             "cloud_pose_skew_sec": state["cloud_pose_skew_sec"],
