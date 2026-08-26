@@ -180,6 +180,9 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   再叠加一个以“上次命令”作为反馈的平滑器会推迟首个可执行动作。
   上游 `nav2_bringup` 仍会启动 smoother，但它的输出不进入 Driver 提案链。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
+- 直线段因实时代价地图进入 `BLOCKED` 后保持零速；下一条全局路径
+  到来时丢弃旧线段并重新选择可通直线段，不会在障碍清除或规划绕行后
+  永久停留在上一次 `segment_blocked`。
 - 非零 proposal 以 5 Hz 发送，因此 Driver 不会被 20 Hz 重复动作淹没；
   切段、障碍、readiness blocker、协议错误和任务终态的首个零速
   直接发布，不等待 5 Hz 定时器。proposal topic 使用

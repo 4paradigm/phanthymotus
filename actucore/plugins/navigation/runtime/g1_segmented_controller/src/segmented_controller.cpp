@@ -132,7 +132,7 @@ void SegmentedController::setPlan(const nav_msgs::msg::Path & path)
   }
 
   bool preserve = false;
-  if (has_segment_) {
+  if (phase_ != Phase::BLOCKED && has_segment_) {
     for (std::size_t index = 0; index < plan_.poses.size(); ++index) {
       const auto & pose = plan_.poses[index].pose.position;
       if (std::hypot(pose.x - segment_end_x_, pose.y - segment_end_y_) <= preserve_endpoint_m_) {

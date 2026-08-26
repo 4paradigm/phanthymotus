@@ -644,6 +644,11 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("command.twist.linear.x", source)
         self.assertIn("command.twist.angular.z", source)
         self.assertNotIn("command.twist.linear.y", source)
+        set_plan = source.split(
+            "void SegmentedController::setPlan", 1
+        )[1].split("geometry_msgs::msg::TwistStamped", 1)[0]
+        self.assertIn("phase_ != Phase::BLOCKED && has_segment_", set_plan)
+        self.assertIn('enterStopCheck(Phase::SELECT, "path_updated")', set_plan)
         self.assertIn("nav2_costmap_2d::LETHAL_OBSTACLE", source)
         self.assertNotIn("nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE", source)
         self.assertIn("max_velocity: [1.0, 0.0, 2.0]", smoother)
