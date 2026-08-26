@@ -379,6 +379,7 @@ class NavigationContractTest(unittest.TestCase):
             for block in dockerfile.split("--packages-select")[1:]
         ]
         nav2_select = next(b for b in select_blocks if "nav2_bringup" in b)
+        self.assertIn("navigation2", nav2_select)
         for unused in (
             "nav2_dwb_controller",
             "dwb_core",

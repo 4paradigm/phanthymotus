@@ -377,7 +377,6 @@ RUN git init navigation2 && \
         nav2_smac_planner \
         nav2_system_tests \
         nav2_theta_star_planner \
-        navigation2 \
         dwb_core \
         dwb_critics \
         dwb_msgs \
@@ -412,6 +411,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
         nav_2d_msgs \
         nav_2d_utils \
         costmap_queue \
+        navigation2 \
         nav2_bringup \
       --cmake-args -DCMAKE_BUILD_TYPE=Release
 

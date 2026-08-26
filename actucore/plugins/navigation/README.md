@@ -199,7 +199,8 @@ FAST-LIVO2 编译所需的两条 Livox 消息定义，不再编译未运行的 L
 迁移前的 `ros-humble-navigation2=1.1.20-1jammy` 是同一个上游 release，运行行为
 不随打包形态变化。运行时加载 planner/controller/smoother/
 behavior/bt_navigator/waypoint_follower/velocity_smoother + navfn、costmap 三层，
-以及卡片自带的 `g1_segmented_controller`。amcl、map_server、DWB、rotation shim、
+以及卡片自带的 `g1_segmented_controller`；`nav2_bringup` 编译所需的轻量
+`navigation2` 元数据包也保留。amcl、map_server、DWB、rotation shim、
 smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们已被当前
 链路取代，或会把 ompl、ceres、xtensor、Qt5 等无用依赖拖进镜像。
 

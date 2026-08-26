@@ -33,6 +33,7 @@ ActuCore 的 base 是 `jetson-base:jp*-torch`（Ubuntu 20.04 Focal，ROS Humble 
 `navigation_launch.py` 起的 controller / planner / smoother / behavior /
 bt_navigator / waypoint_follower / velocity_smoother / lifecycle_manager，加上
 `nav2_params.yaml` 点名的 navfn 和 costmap static/obstacle/inflation 三层。
+`navigation2` 元数据包由 `nav2_bringup` 在编译期显式查找，因此保留。
 DWB 与 rotation shim 已由卡片内的 `g1_segmented_controller` 取代；
 `nav2_map_server` 也不参与 rolling static layer 的订阅链路，因此不编译。
 刻意不编 `nav2_amcl`、`nav2_smac_planner`、
