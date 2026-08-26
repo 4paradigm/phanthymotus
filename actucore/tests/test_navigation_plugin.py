@@ -390,6 +390,15 @@ class NavigationContractTest(unittest.TestCase):
             "nav2_map_server",
         ):
             self.assertNotIn(unused, nav2_select)
+        for ignored_dwb in (
+            "nav2_dwb_controller/dwb_core",
+            "nav2_dwb_controller/dwb_critics",
+            "nav2_dwb_controller/dwb_msgs",
+            "nav2_dwb_controller/dwb_plugins",
+            "nav2_dwb_controller/nav2_dwb_controller",
+        ):
+            self.assertIn(ignored_dwb, dockerfile)
+        self.assertIn('test -d "${excluded}"', dockerfile)
         # 刻意不编的那批：会把 ompl / ceres / xtensor / Qt5 拖进来。
         # 只靠 --packages-select 挡不住 colcon 顺 test_depend 去要它们，
         # 所以镜像里还会给这些目录放 COLCON_IGNORE。

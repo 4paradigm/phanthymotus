@@ -377,11 +377,12 @@ RUN git init navigation2 && \
         nav2_smac_planner \
         nav2_system_tests \
         nav2_theta_star_planner \
-        dwb_core \
-        dwb_critics \
-        dwb_msgs \
-        dwb_plugins \
-        nav2_dwb_controller; do \
+        nav2_dwb_controller/dwb_core \
+        nav2_dwb_controller/dwb_critics \
+        nav2_dwb_controller/dwb_msgs \
+        nav2_dwb_controller/dwb_plugins \
+        nav2_dwb_controller/nav2_dwb_controller; do \
+      test -d "${excluded}" || { echo "missing excluded Nav2 package: ${excluded}" >&2; exit 4; }; \
       touch "${excluded}/COLCON_IGNORE"; \
     done
 
