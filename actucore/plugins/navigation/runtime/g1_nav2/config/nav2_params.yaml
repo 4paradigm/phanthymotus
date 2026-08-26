@@ -85,7 +85,7 @@ controller_server:
     general_goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
       xy_goal_tolerance: 0.20
-      yaw_goal_tolerance: 0.50
+      yaw_goal_tolerance: 0.10
       stateful: true
     FollowPath:
       plugin: g1_segmented_controller::SegmentedController
@@ -96,7 +96,7 @@ controller_server:
       approach_speed_mps: 0.30
       cruise_speed_mps: 1.0
       segment_tolerance_m: 0.18
-      final_yaw_tolerance_rad: 0.45
+      final_yaw_tolerance_rad: 0.10
       stop_linear_mps: 0.05
       stop_yaw_rps: 0.10
       stop_cycles_required: 2
