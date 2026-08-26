@@ -24,6 +24,31 @@ log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms @ 16kHz 16-bit mono
+PCM_FRAME_S = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s of audio per frame
+
+# Frames held back before pacing starts, then published in one burst, so the
+# consumer begins with a real cushion. 5 frames = 500ms, matching the
+# vits2_tts_trt engine's MIX_VITS_PREBUFFER_FRAMES default.
+PREBUF_FRAMES = 5
+# Deliberately shorter than PCM_FRAME_S: sending 100ms frames every 70ms accrues
+# 30ms of cushion per frame, so downstream keeps building margin instead of
+# living on whatever it started with. Pacing at exactly PCM_FRAME_S — what this
+# engine used to do — means the cushion never grows and every jitter spike above
+# it is an audible gap. Safe here because this adapter synthesizes the whole
+# utterance before publishing anything, so there is no risk of outrunning it.
+FRAME_INTERVAL_S = 0.07
+if FRAME_INTERVAL_S > PCM_FRAME_S:
+    log.warning(
+        "[tts] FRAME_INTERVAL_S=%.3fs is slower than the %.3fs of audio each "
+        "frame carries; downstream will underrun on every utterance",
+        FRAME_INTERVAL_S, PCM_FRAME_S,
+    )
+# Depth of the synthesis→publish handoff queue, in frames (20s of audio).
+SYNTH_QUEUE_FRAMES = 200
+
+# Sentinel closing the synthesis→publish queue. A dedicated object rather than
+# None so a genuinely empty frame could never be mistaken for end-of-stream.
+_SYNTH_DONE = object()
 
 # EOF magic: 8 bytes (4 samples [1, -1, 1, -1])，标记 utterance 结束
 # 正常 chunk 始终 3200 bytes，8 bytes 短 chunk 不会被误判
@@ -36,6 +61,73 @@ _LOW_LAT_QOS = QoSProfile(
     depth=200,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+
+def _agent_core_url() -> str:
+    import os
+    return os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+
+
+def _unverified_ssl_context():
+    """Agent Core serves HTTPS with a self-signed certificate."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _post_json(path: str, payload: dict, timeout: float) -> None:
+    import urllib.request
+    request = urllib.request.Request(
+        f"{_agent_core_url()}{path}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    urllib.request.urlopen(request, timeout=timeout, context=_unverified_ssl_context())
+
+
+def fire_hook(name: str) -> None:
+    """Fire an agent-core hook without blocking the caller.
+
+    on_speaking used to be a synchronous urlopen(timeout=2) inside the publish
+    loop, fired after the pacing clock had already been latched — so the request
+    latency was charged to the utterance's pacing budget and every frame after
+    the prebuffer went out late. Hooks are advisory (LED state); they must never
+    sit between two audio frames.
+    """
+    def _send():
+        try:
+            _post_json("/api/hooks/fire", {"hook": name}, timeout=2)
+        except Exception as exc:
+            log.debug("[tts] hook %s failed: %s", name, exc)
+
+    threading.Thread(target=_send, name=f"tts-hook-{name}", daemon=True).start()
+
+
+def _complete_action(action_id: str, text: str, frames_sent: int,
+                     interrupted: bool) -> None:
+    """Notify Agent Core that a speak action has terminated.
+
+    Module level, not a node method: an utterance can also die before the worker
+    ever sees it (interrupt/stop drains the queue), and the ACP barrier in
+    agent-core waits out its full timeout for every action it registered but
+    never heard back about.
+    """
+    if not action_id:
+        return
+    try:
+        _post_json("/api/acp/complete", {
+            "action_id": action_id,
+            "status": "cancelled" if interrupted else "completed",
+            "result": {"text": text[:100], "frames": frames_sent},
+        }, timeout=3)
+        log.info("[tts] ACP complete: %s (%s)", action_id,
+                 "cancelled" if interrupted else "completed")
+    except Exception as exc:
+        log.warning("[tts] ACP callback failed: %s", exc)
+
 
 TOOLS = [
     {
@@ -236,21 +328,35 @@ class _TTSNode(Node):
 
     def stop(self) -> dict:
         self._stop_event.set()
+        self._complete_discarded_actions()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
         self.state = "idle"
         return {"state": "idle"}
 
-    def interrupt(self) -> dict:
-        """立即中止当前播放：清空队列 + 设置 interrupt flag 让 worker 停止当前 utterance。"""
-        # 清空待播放队列
-        cleared = 0
-        while not self._text_queue.empty():
+    def _complete_discarded_actions(self) -> int:
+        """Cancel queued ACP actions that will never reach the worker."""
+        discarded = []
+        while True:
             try:
-                self._text_queue.get_nowait()
-                cleared += 1
+                item = self._text_queue.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(item, tuple):
+                text = str(item[0])
+                action_id = item[2] if len(item) >= 3 else ''
+            else:
+                text, action_id = str(item), ''
+            discarded.append((text, action_id))
+        for text, action_id in discarded:
+            _complete_action(action_id, text, 0, interrupted=True)
+        return len(discarded)
+
+    def interrupt(self) -> dict:
+        """立即中止当前播放：清空队列 + 设置 interrupt flag 让 worker 停止当前 utterance。"""
+        # 清空待播放队列。丢掉的 item 必须逐个回 ACP cancelled，否则 agent-core
+        # 的 barrier 会为每个注册过的 action 干等到超时。
+        cleared = self._complete_discarded_actions()
         # 设置 interrupt flag（worker 在每个 frame 前检查）
         self._interrupt_flag.set()
         log.info(f"[tts] interrupted: cleared {cleared} queued item(s)")
@@ -259,16 +365,12 @@ class _TTSNode(Node):
     def enqueue(self, text: str, trace_id: str = '', action_id: str = ''):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
-        # 分段：超过 280 字按标点切分，避免超长合成导致延迟或失败
-        segments = self._split_text(text, max_chars=280)
-        if len(segments) <= 1:
-            self._text_queue.put((text, trace_id, action_id))
-        else:
-            # 只有最后一段带 action_id（触发 ACP callback）
-            for i, seg in enumerate(segments):
-                is_last = (i == len(segments) - 1)
-                self._text_queue.put((seg, trace_id, action_id if is_last else ''))
-            log.info(f"[tts] split {len(text)} chars into {len(segments)} segments")
+        # One queue item = one utterance = one EOF = one ACP action. The 280-char
+        # split happens inside the worker instead: splitting here put each
+        # segment on the queue as its own utterance, so a long text emitted an
+        # EOF and reset the pacing clock every 280 characters, and the gap
+        # between segments was a full synthesis with no audio flowing at all.
+        self._text_queue.put((text, trace_id, action_id))
 
     @staticmethod
     def _split_text(text: str, max_chars: int = 280) -> list:
@@ -303,10 +405,6 @@ class _TTSNode(Node):
         from audio_msgs.msg import AudioChunk
         import time as _time
 
-        # Real-time pacing: publish frames at playback rate to avoid bursts/gaps
-        FRAME_DURATION = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s per 3200-byte frame
-        PREBUF_FRAMES  = 3  # buffer 3 frames (~300ms) before starting real-time pacing
-
         while not self._stop_event.is_set():
             try:
                 item = self._text_queue.get(timeout=1)
@@ -323,103 +421,154 @@ class _TTSNode(Node):
                     text, _trace_id, _action_id = str(item[0]), '', ''
             else:
                 text, _trace_id, _action_id = item, '', ''
+            synth_thread = None
+            # Set on every exit path. The stop/interrupt flags are not enough to
+            # release the synth thread: if the consumer dies on an exception,
+            # nothing is cancelled and nothing is draining, so a blocking put
+            # would wedge that thread forever. Bound before the try so the
+            # finally can always reach it.
+            utterance_abort = threading.Event()
             try:
-                import time as _time
                 t_start = _time.monotonic()
                 t_start_wall = _time.time()  # wall-clock for perf span
                 t0_wall = None  # wall-clock when playback starts (prebuf complete)
                 total = 0
-                buf   = b''
-                t0    = None  # wall-clock start of playback
+                buf = b''
+                t0 = None  # monotonic start of the pacing schedule
                 frames_sent = 0
                 prebuf = []   # pre-buffer queue
 
-                for raw_chunk in self._adapter.synthesize_stream(text):
-                    if self._stop_event.is_set() or self._interrupt_flag.is_set():
-                        break
-                    buf  += raw_chunk
-                    total += len(raw_chunk)
-                    # split into CHUNK_BYTES frames
-                    while len(buf) >= CHUNK_BYTES:
-                        frame = buf[:CHUNK_BYTES]
-                        buf   = buf[CHUNK_BYTES:]
-
-                        # Check interrupt before publishing each frame
-                        if self._interrupt_flag.is_set():
-                            break
-
-                        # Pre-buffer phase: accumulate a few frames before pacing
-                        if t0 is None:
-                            prebuf.append(frame)
-                            if len(prebuf) >= PREBUF_FRAMES:
-                                # Flush pre-buffer and start real-time clock
-                                t0 = _time.monotonic()
-                                t0_wall = _time.time()
-                                # Fire on_speaking hook (playback starting)
-                                try:
-                                    import urllib.request as _ureq
-                                    import json as _jhook
-                                    _hreq = _ureq.Request(
-                                        "https://localhost:15678/api/hooks/fire",
-                                        data=_jhook.dumps({"hook": "on_speaking"}).encode(),
-                                        headers={"Content-Type": "application/json"},
-                                        method="POST"
-                                    )
-                                    import ssl as _ssl
-                                    _sctx = _ssl.create_default_context()
-                                    _sctx.check_hostname = False
-                                    _sctx.verify_mode = _ssl.CERT_NONE
-                                    _ureq.urlopen(_hreq, timeout=2, context=_sctx)
-                                except Exception:
-                                    pass
-                                for pf in prebuf:
-                                    msg = AudioChunk()
-                                    msg.header.stamp = self.get_clock().now().to_msg()
-                                    msg.format = "audio/pcm-16k"
-                                    msg.data   = list(pf)
-                                    self._pub.publish(msg)
-                                    frames_sent += 1
-                                prebuf = []
-                            continue
-
-                        # Real-time pacing
-                        target = t0 + frames_sent * FRAME_DURATION
-                        now = _time.monotonic()
-                        if now < target:
-                            _time.sleep(target - now)
-                        msg = AudioChunk()
-                        msg.header.stamp = self.get_clock().now().to_msg()
-                        msg.format = "audio/pcm-16k"
-                        msg.data   = list(frame)
-                        self._pub.publish(msg)
-                        frames_sent += 1
-
-                # Flush any remaining pre-buffer (short utterances < PREBUF_FRAMES)
-                if prebuf and not self._stop_event.is_set() and not self._interrupt_flag.is_set():
-                    t0 = _time.monotonic()
-                    for pf in prebuf:
-                        msg = AudioChunk()
-                        msg.header.stamp = self.get_clock().now().to_msg()
-                        msg.format = "audio/pcm-16k"
-                        msg.data   = list(pf)
-                        self._pub.publish(msg)
-                        frames_sent += 1
-
-                # flush remainder
-                if buf and not self._stop_event.is_set() and not self._interrupt_flag.is_set():
-                    if t0 is not None:
-                        target = t0 + frames_sent * FRAME_DURATION
-                        now = _time.monotonic()
-                        if now < target:
-                            _time.sleep(target - now)
+                def publish(frame: bytes) -> None:
+                    nonlocal frames_sent
                     msg = AudioChunk()
                     msg.header.stamp = self.get_clock().now().to_msg()
                     msg.format = "audio/pcm-16k"
-                    msg.data   = list(buf)
+                    msg.data = list(frame)
                     self._pub.publish(msg)
+                    frames_sent += 1
 
+                def emit(frame: bytes) -> None:
+                    """Pace and publish one frame; latches the clock on the first."""
+                    nonlocal t0, t0_wall
+                    if t0 is None:
+                        # Backdate by the frames already in the prebuffer so all
+                        # of them are due in the past and go out in one burst —
+                        # the consumer then starts holding PREBUF_FRAMES of audio.
+                        now = _time.monotonic()
+                        t0 = now - max(0, len(prebuf) - 1) * FRAME_INTERVAL_S
+                        t0_wall = _time.time()
+                        fire_hook("on_speaking")
+                    target = t0 + frames_sent * FRAME_INTERVAL_S
+                    now = _time.monotonic()
+                    if now < target:
+                        _time.sleep(target - now)
+                    # No rebase when behind: publishing immediately is the
+                    # catch-up, since the schedule is already ahead of realtime.
+                    publish(frame)
+
+                def flush_prebuf() -> None:
+                    while prebuf:
+                        emit(prebuf[0])
+                        prebuf.pop(0)
+
+                # 分段：超过 280 字按标点切分，避免超长合成导致延迟或失败。分段是
+                # 合成的实现细节 —— pacing/prebuffer/EOF 都跨段延续，下游看到的
+                # 仍然是一句完整的话。
+                segments = self._split_text(text, max_chars=280)
+                if len(segments) > 1:
+                    log.info(f"[tts] split {len(text)} chars into {len(segments)} segments")
+
+                # Synthesis runs on its own thread. This adapter's
+                # synthesize_stream calls generate() once per segment and blocks
+                # until the whole segment's audio exists, so doing it on the
+                # publishing thread meant no frame at all went out for the
+                # duration of every segment after the first — a guaranteed gap
+                # every 280 characters, as long as the synthesis took. Here
+                # segment N+1 is synthesized while segment N is still playing.
+                frame_queue: queue.Queue = queue.Queue(maxsize=SYNTH_QUEUE_FRAMES)
+                synth_state: dict = {"total": 0}
+
+                def enqueue_frame(frame) -> bool:
+                    """Blocking put that still honours interrupt/stop/abort."""
+                    while True:
+                        if (self._stop_event.is_set() or self._interrupt_flag.is_set()
+                                or utterance_abort.is_set()):
+                            return False
+                        try:
+                            frame_queue.put(frame, timeout=0.1)
+                            return True
+                        except queue.Full:
+                            continue
+
+                def synthesize_into_queue() -> None:
+                    pending = b''
+                    try:
+                        for seg in segments:
+                            for raw_chunk in self._adapter.synthesize_stream(seg):
+                                pending += raw_chunk
+                                synth_state["total"] += len(raw_chunk)
+                                while len(pending) >= CHUNK_BYTES:
+                                    frame, pending = pending[:CHUNK_BYTES], pending[CHUNK_BYTES:]
+                                    if not enqueue_frame(frame):
+                                        return
+                        if pending:
+                            enqueue_frame(pending)
+                    except BaseException as exc:  # surfaced on the worker thread
+                        synth_state["error"] = exc
+                    finally:
+                        # Unblock the consumer on every exit path.
+                        enqueue_frame(_SYNTH_DONE)
+
+                synth_thread = threading.Thread(
+                    target=synthesize_into_queue, name="tts-synth", daemon=True)
+                synth_thread.start()
+
+                interrupted = False
+                while True:
+                    if self._stop_event.is_set() or self._interrupt_flag.is_set():
+                        interrupted = True
+                        break
+                    try:
+                        frame = frame_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if frame is _SYNTH_DONE:
+                        break
+                    if len(frame) < CHUNK_BYTES:
+                        # Trailing partial frame — paced, then done.
+                        buf = frame
+                        break
+                    if t0 is None:
+                        prebuf.append(frame)
+                        if len(prebuf) >= PREBUF_FRAMES:
+                            flush_prebuf()
+                        continue
+                    emit(frame)
+
+                cancelled = self._stop_event.is_set() or self._interrupt_flag.is_set()
+                synth_thread.join(timeout=5)
+                if "error" in synth_state and not cancelled:
+                    raise synth_state["error"]
+                total = synth_state["total"]  # read after join, not concurrently
+                # Flush any remaining pre-buffer (utterances < PREBUF_FRAMES)
+                if prebuf and not cancelled:
+                    flush_prebuf()
+
+                # flush remainder
+                if buf and not cancelled:
+                    if t0 is not None:
+                        target = t0 + frames_sent * FRAME_INTERVAL_S
+                        now = _time.monotonic()
+                        if now < target:
+                            _time.sleep(target - now)
+                    publish(buf)
+
+                # Capture before clearing: reading the flag after the clear below
+                # made this always False, so an interrupted utterance reported ACP
+                # "completed" instead of "cancelled".
+                was_interrupted = self._interrupt_flag.is_set()
                 # Clear interrupt flag after utterance is done (interrupted or complete)
-                if self._interrupt_flag.is_set():
+                if was_interrupted:
                     self._interrupt_flag.clear()
                     log.info(f"[tts] utterance interrupted after {frames_sent} frames")
                 else:
@@ -457,40 +606,21 @@ class _TTSNode(Node):
                 # ACP: 推送动作完成回调到 Agent Core
                 # Also fire on_idle hook (LED off immediately after playback)
                 if _action_id:
-                    try:
-                        import urllib.request as _urllib
-                        import ssl as _ssl
-                        import os as _os
-                        _agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-                        _ctx = _ssl.create_default_context()
-                        _ctx.check_hostname = False
-                        _ctx.verify_mode = _ssl.CERT_NONE
-                        # Fire on_idle to turn off LED
-                        _idle_req = _urllib.Request(
-                            f"{_agent_core_url}/api/hooks/fire",
-                            data=json.dumps({"hook": "on_idle"}).encode(),
-                            headers={"Content-Type": "application/json"},
-                            method="POST"
-                        )
-                        _urllib.urlopen(_idle_req, timeout=2, context=_ctx)
-                        was_interrupted = self._interrupt_flag.is_set()
-                        _payload = json.dumps({
-                            "action_id": _action_id,
-                            "status": "cancelled" if was_interrupted else "completed",
-                            "result": {"text": text[:100], "frames": frames_sent},
-                        }).encode()
-                        _req = _urllib.Request(
-                            f"{_agent_core_url}/api/acp/complete",
-                            data=_payload,
-                            headers={"Content-Type": "application/json"},
-                            method="POST",
-                        )
-                        _urllib.urlopen(_req, timeout=3, context=_ctx)
-                        log.info(f"[tts] ACP complete: {_action_id} ({'cancelled' if was_interrupted else 'completed'})")
-                    except Exception as e:
-                        log.warning(f"[tts] ACP callback failed: {e}")
+                    fire_hook("on_idle")
+                    _complete_action(_action_id, text, frames_sent, was_interrupted)
             except Exception as e:
                 log.error(f"[tts] synthesis error: {e}", exc_info=True)
+                _complete_action(_action_id, text, 0, interrupted=True)
+                self._publish_eof()
+            finally:
+                # Release the synth thread on every path, including the one where
+                # the consumer above died: it can otherwise sit on a blocking put
+                # forever, holding a reference to the adapter.
+                utterance_abort.set()
+                if synth_thread is not None and synth_thread.is_alive():
+                    synth_thread.join(timeout=5)
+                    if synth_thread.is_alive():
+                        log.error("[tts] synth thread did not exit")
 
     def _status_dict(self) -> dict:
         return {
@@ -686,12 +816,14 @@ class SherpaOnnxTTSPlugin:
                     node = self._nodes.get(node_key)
                     if node is None:
                         input_topic = args.get("input_topic") or None
-                        adapter = self._adapter
-                        if instance_id and instance_id in self._instance_configs:
-                            inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
-                            if inst_adapter:
-                                adapter = inst_adapter
-                        node = _TTSNode(input_topic, adapter,
+                        # No per-instance adapter: `config` writes into self._cfg
+                        # globally (it strips instance_id), so there has never
+                        # been anywhere to read a per-instance config from. This
+                        # used to consult a self._instance_configs that is never
+                        # assigned anywhere, i.e. `speak` with an instance_id and
+                        # no running node raised AttributeError instead of
+                        # synthesizing.
+                        node = _TTSNode(input_topic, self._adapter,
                                         node_suffix=node_key.replace('/', '_').replace('-', '_'))
                         self._executor.add_node(node)
                         self._nodes[node_key] = node
