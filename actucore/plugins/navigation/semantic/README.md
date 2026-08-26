@@ -28,8 +28,9 @@ Canvas 自连线缺失导致目标丢失。
 
 ## 限制
 
-- FAST-LIVO2 坐标是 session-local；bridge 重启、心跳 stale、非 mapping 状态
-  或 session 变化都会阻止复用旧坐标。
+- `capture` 只接受正在建图，或已加载地图且对齐确认的 `relocalized`
+  状态。FAST-LIVO2 坐标仍绑定当前进程会话；bridge 重启、心跳 stale、
+  重定位失效或 session 变化都会阻止复用旧坐标。
 - 默认按 ROS 接收时间配对传感器；只有确认上游共享 header 时钟域后才使用
   `source_timestamp`。
 - VLM 匹配成功不等于物理执行；proposal 仍必须经过 Driver

@@ -220,6 +220,7 @@ class RosBridge:
         self._status_received_monotonic: float | None = None
         self._status_companion_ready = False
         self._status_algorithm_running = False
+        self._status_session_ready = False
         # Recorded points can outlive a bridge node, so every bridge needs its
         # own epoch even before status arrives.
         self._bridge_instance_id = uuid.uuid4().hex
@@ -348,11 +349,18 @@ class RosBridge:
         algorithm_running = payload.get("algorithm_running") is True
         diagnostics = payload.get("diagnostics")
         diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        loaded_map = str(payload.get("loaded_map") or "").strip()
         map_name = str(
             payload.get("active_map")
+            or loaded_map
             or diagnostics.get("session_name")
             or "unnamed"
         ).strip()
+        session_ready = state == "mapping" or (
+            state == "relocalized"
+            and bool(loaded_map)
+            and diagnostics.get("map_alignment_confirmed") is True
+        )
         now = time.monotonic()
         with self._condition:
             if self._closed:
@@ -363,20 +371,20 @@ class RosBridge:
                 if self._status_received_monotonic is not None
                 else None
             )
-            began_mapping = state == "mapping" and self._status_state != "mapping"
-            changed_map = state == "mapping" and map_name != self._status_map_name
+            began_session = session_ready and not self._status_session_ready
+            changed_map = session_ready and map_name != self._status_map_name
             restarted_after_gap = (
-                state == "mapping"
+                session_ready
                 and gap is not None
                 and gap > self._status_restart_gap_sec
             )
             incoming_ready = (
-                state == "mapping" and companion_ready and algorithm_running
+                session_ready and companion_ready and algorithm_running
             )
             recovered_to_ready = incoming_ready and previous_health != "ready"
             if incoming_ready and (
                 self._status_generation == 0
-                or began_mapping
+                or began_session
                 or changed_map
                 or restarted_after_gap
                 or recovered_to_ready
@@ -386,6 +394,7 @@ class RosBridge:
             self._status_map_name = map_name
             self._status_companion_ready = companion_ready
             self._status_algorithm_running = algorithm_running
+            self._status_session_ready = session_ready
             self._status_received_monotonic = now
             self._condition.notify_all()
 
@@ -500,7 +509,7 @@ class RosBridge:
     def _map_session_id_locked(self) -> str | None:
         if self._map_session_health_locked() != "ready":
             return None
-        if self._status_state != "mapping" or self._status_generation <= 0:
+        if self._status_generation <= 0:
             return None
         return f"{self._status_map_name}#local-{self._status_generation}"
 
@@ -530,7 +539,7 @@ class RosBridge:
             return "companion_not_ready"
         if not self._status_algorithm_running:
             return "algorithm_not_running"
-        if self._status_state != "mapping" or self._status_generation <= 0:
+        if not self._status_session_ready or self._status_generation <= 0:
             return "not_mapping"
         return "ready"
 

@@ -435,7 +435,7 @@ class Processor:
             if not _wait_for_map_session(bridge, min(self._sensor_timeout, 2.0)):
                 return self.error(
                     "map_session_unavailable",
-                    "FAST-LIVO2 尚未处于心跳正常的 mapping 状态，"
+                    "FAST-LIVO2 尚未处于心跳正常的 mapping 或已确认重定位状态，"
                     "不会录制可能失效的 session-local 坐标。",
                     action="capture",
                     map_session_issue=_bridge_map_session_issue(bridge),

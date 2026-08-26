@@ -801,6 +801,7 @@ class PureHelperTests(unittest.TestCase):
         bridge._status_received_monotonic = None
         bridge._status_companion_ready = False
         bridge._status_algorithm_running = False
+        bridge._status_session_ready = False
         bridge._status_stale_after_sec = 3.5
         bridge._status_restart_gap_sec = 5.0
         bridge._bridge_instance_id = "test-bridge"
@@ -1019,6 +1020,27 @@ class PureHelperTests(unittest.TestCase):
         bridge._on_status(SimpleNamespace(data=json.dumps(heartbeat)))
         self.assertEqual(bridge.current_map_session_id, "demo#local-3")
         self.assertNotEqual(bridge.current_map_session_token, second_token)
+
+    def test_confirmed_relocalization_is_a_ready_map_session(self):
+        bridge = self._bare_ros_bridge()
+        bridge.status_topic = "/ubuntu/navigation/fast_livo2/status"
+        heartbeat = {
+            "schema": "phanthy.navigation.fast_livo2_status.v1",
+            "state": "relocalized",
+            "loaded_map": "office",
+            "algorithm_running": True,
+            "companion_ready": True,
+            "diagnostics": {"map_alignment_confirmed": True},
+        }
+
+        bridge._on_status(SimpleNamespace(data=json.dumps(heartbeat)))
+
+        self.assertTrue(bridge.map_session_ready)
+        self.assertEqual(bridge.current_map_session_id, "office#local-1")
+
+        heartbeat["diagnostics"] = {"map_alignment_confirmed": False}
+        bridge._on_status(SimpleNamespace(data=json.dumps(heartbeat)))
+        self.assertFalse(bridge.map_session_ready)
 
     def test_ros_goal_publish_checks_session_and_serializes_exact_json(self):
         bridge = self._bare_ros_bridge()
