@@ -1,4 +1,21 @@
 /** audio.js — Rolling waveform renderer for audio/pcm stream (min/max per column) + live playback. */
+
+/**
+ * End-of-utterance marker on the TTS audio protocol, published by both TTS
+ * engines after every utterance and consumed by the speaker drivers
+ * (`unitree/g1/device.py`, `unitree/r1/device.py`) as `len(pcm) == 8 and pcm ==
+ * AUDIO_EOF_MAGIC`. It is protocol, not audio: fed to the waveform as samples it
+ * reported `音频流 0ms/帧` after every announcement — 8 bytes is 4 samples, which
+ * rounds to 0 ms — which reads as a broken stream.
+ */
+const AUDIO_EOF = [0x01, 0x00, 0xff, 0xff, 0x01, 0x00, 0xff, 0xff];
+
+export function isAudioEof(buffer) {
+  if (!buffer || buffer.byteLength !== AUDIO_EOF.length) return false;
+  const b = new Uint8Array(buffer);
+  return AUDIO_EOF.every((v, i) => b[i] === v);
+}
+
 export const AudioRenderer = {
   name: 'audio',
   canRender: (hint) => hint && hint.startsWith('audio/'),
@@ -57,6 +74,12 @@ export const AudioRenderer = {
 
   onData(buffer, fmt) {
     if (!buffer || buffer.byteLength === 0 || buffer.byteLength % 2 !== 0) return;
+    if (isAudioEof(buffer)) {
+      // Protocol frame, not samples. Keep the tail of the waveform on screen and
+      // say what happened instead of reporting a 0 ms frame.
+      if (this._label) this._label.textContent = '○ 音频流  本句结束';
+      return;
+    }
     const pcm = new Int16Array(buffer);
     const ring = this._ring;
     const len = this._ringLen;
@@ -75,6 +98,7 @@ export const AudioRenderer = {
 
   onDataSilent(buffer) {
     if (!buffer || buffer.byteLength === 0 || buffer.byteLength % 2 !== 0) return;
+    if (isAudioEof(buffer)) return;
     const pcm = new Int16Array(buffer);
     const ring = this._ring;
     const len = this._ringLen;

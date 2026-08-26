@@ -52,22 +52,9 @@ TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
 BUILD_ARGS=""
 # ── 根据 jp_version 选择 base image  ────────────────────────
-# ACC_ARCH 是 resource-center 的过滤依据（大版本粒度，见 resource-center/lib/arch.ts）：
-# 机器上报自己的 JetPack 线，跑不了的镜像就不会出现在驱动市场里。
-case "${JP_VERSION}" in
-    5.11)
-        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=511"
-        ACC_ARCH="jetson-jp5"
-        ;;
-    6.1)
-        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=61"
-        ACC_ARCH="jetson-jp6"
-        ;;
-    *)
-        echo "Unknown JetPack version: ${JP_VERSION} (support: 5.11, 6.1)"
-        exit 1
-        ;;
-esac
+# 表在 build_common.sh 的 jetpack_vars 里，build_actucore.sh 共用同一份。
+jetpack_vars "${JP_VERSION}" || exit 1
+BUILD_ARGS="${BUILD_ARGS} JP_VERSION=${JP_ARG}"
 
 # Dockerfile.jetson 基于 L4T base image —— 只有 arm64
 CPU_ARCH="arm64"

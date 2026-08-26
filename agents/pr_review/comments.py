@@ -428,9 +428,16 @@ def _format_review_budget(job) -> str:
 
     note = ""
     if reason == "max_rounds":
+        # No retrigger invitation. Exhausting the round budget is deterministic —
+        # same files, same caps, same budget — so the old "retrigger for another
+        # pass" produced 21 jobs on phanthymotus-driver PR #174, three of them on
+        # one SHA, each reproducing the same cut-short review.
         note = (
             f"\n> :warning: **This review was cut short** after {rounds} rounds "
-            "(round limit). It may be incomplete — retrigger for another pass.\n"
+            "(round limit) and may not cover the whole change — what follows is "
+            "what it did reach. Re-triggering runs the same budget over the same "
+            "files, so it will not get further on its own; for a change this "
+            "large, splitting the PR is what helps.\n"
         )
     elif reason == "timeout":
         note = (

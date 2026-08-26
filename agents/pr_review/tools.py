@@ -34,9 +34,26 @@ from .reviewer import is_sensitive_name
 
 logger = logging.getLogger(__name__)
 
-# Per-result cap. One `read_file` of a generated 5 MB file would otherwise
-# consume the whole context window.
-MAX_RESULT_CHARS = 4000
+# Per-result char budgets, one per tool. A single shared 4000 made every one of
+# the item-count caps below unreachable: 400 numbered lines of Python is ~20 KB,
+# so `max_lines` was dead — every read returned ~65 lines whatever was asked
+# for, and `grep` announced "60 match(es)" after delivering 30.
+#
+# These move together with review_agent.MAX_TOOL_RESULT and
+# review_trace.MAX_FIELD_CHARS. Raising one alone accomplishes nothing: the
+# transcript independently re-truncates every tool result, and the trace
+# under-reports what the model actually saw — which is how a truncation bug
+# stayed invisible across several passes over the traces.
+MAX_READ_CHARS = 12000
+MAX_DIFF_CHARS = 12000
+MAX_GREP_CHARS = 8000
+MAX_LIST_CHARS = 8000
+
+# Backstop for any path that still calls `_cap` without an explicit limit. Not
+# what bounds normal tool output any more — each tool below counts characters
+# while it builds its result, so the size is bounded by construction.
+MAX_RESULT_CHARS = 12000
+
 MAX_READ_LINES = 400
 MAX_GREP_MATCHES = 60
 MAX_LIST_ENTRIES = 200
@@ -177,11 +194,28 @@ def list_dir(sb: Sandbox, path: str = ".") -> str:
         else:
             rows.append(f"  {e.name}  ({_human(st.st_size)})")
 
-    header = f"{sb.rel(target)}/  —  {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}"
+    # Counted while accumulating. Capping the joined string truncated entries
+    # the header had already counted, and the "… N more entries not shown"
+    # footer was itself among the first things removed — so a half-listed
+    # directory looked complete.
+    shown: list[str] = []
+    used = 0
+    for r in rows:
+        if shown and used + len(r) + 1 > MAX_LIST_CHARS:
+            break
+        shown.append(r)
+        used += len(r) + 1
+
+    header = (
+        f"{sb.rel(target)}/  —  {len(shown)} entr"
+        f"{'y' if len(shown) == 1 else 'ies'}"
+    )
+    hidden = (len(entries) - MAX_LIST_ENTRIES if len(entries) > MAX_LIST_ENTRIES
+              else 0) + (len(rows) - len(shown))
     more = ""
-    if len(entries) > MAX_LIST_ENTRIES:
-        more = f"\n  … {len(entries) - MAX_LIST_ENTRIES} more entries not shown"
-    return _cap(header + "\n" + "\n".join(rows) + more)
+    if hidden:
+        more = f"\n  … {hidden} more entries not shown"
+    return header + "\n" + "\n".join(shown) + more
 
 
 def read_file(
@@ -217,17 +251,37 @@ def read_file(
     lines = text.splitlines()
     start = max(1, start_line)
     limit = max(1, min(max_lines, MAX_READ_LINES))
-    chunk = lines[start - 1: start - 1 + limit]
 
-    if not chunk:
+    # The header counts against the budget too. Sizing only the body returned
+    # MAX_READ_CHARS + header, which the transcript's own cap then trimmed —
+    # putting the lie back one layer up. The allowance covers the longest header
+    # this function can write: the path appears twice, once in the resume hint.
+    header_allowance = 2 * len(path) + 160
+    body_lines, shown_to, hit_budget = _emit_lines(
+        lines, start, limit, max(MAX_READ_CHARS - header_allowance, 500)
+    )
+    if not body_lines:
         return f"{path}: no lines at {start} (file has {len(lines)})"
 
-    body = "\n".join(f"{start + i:5d}  {ln}" for i, ln in enumerate(chunk))
-    shown_to = start + len(chunk) - 1
     header = f"{path}  (lines {start}-{shown_to} of {len(lines)})"
     if shown_to < len(lines):
-        header += f" — {len(lines) - shown_to} more lines below"
-    return _cap(header + "\n" + body)
+        remaining = len(lines) - shown_to
+        why = (
+            "stopped at the result-size limit"
+            if hit_budget
+            else f"returned the {len(body_lines)} lines requested"
+        )
+        # The resume hint is the load-bearing half. An honest range alone is not
+        # enough: the model still has to work out the next call, and getting
+        # that wrong is precisely what the overlapping-read loop was.
+        header += (
+            f" — {why}; {remaining} lines remain. Continue with "
+            f'read_file("{path}", start_line={shown_to + 1}).'
+        )
+    # No _cap: the budget is enforced per line above, so this is bounded by
+    # construction. Wrapping it would re-introduce the post-hoc truncation this
+    # function was rewritten to remove.
+    return header + "\n" + "\n".join(body_lines)
 
 
 def grep(sb: Sandbox, pattern: str, path: str = ".", glob: str = "") -> str:
@@ -264,10 +318,30 @@ def grep(sb: Sandbox, pattern: str, path: str = ".", glob: str = "") -> str:
 
     if not matches:
         return f"no matches for {pattern!r} under {path}"
-    head = f"{len(matches)} match(es) for {pattern!r}"
-    if len(matches) >= MAX_GREP_MATCHES:
-        head += " (capped)"
-    return _cap(head + "\n" + "\n".join(matches))
+
+    # Counted while accumulating, not by capping the joined string: the old
+    # `_cap(head + matches)` silently dropped about half of a full result set
+    # while the header still claimed all 60, so "60 match(es) … (capped)" was a
+    # lie about a lie.
+    shown: list[str] = []
+    used = 0
+    for m in matches:
+        if shown and used + len(m) + 1 > MAX_GREP_CHARS:
+            break
+        shown.append(m)
+        used += len(m) + 1
+
+    if len(shown) < len(matches):
+        head = (
+            f"showing {len(shown)} of {len(matches)}"
+            f"{'+' if len(matches) >= MAX_GREP_MATCHES else ''} matches for "
+            f"{pattern!r} (result-size limit) — narrow with path= or glob="
+        )
+    else:
+        head = f"{len(shown)} match(es) for {pattern!r}"
+        if len(matches) >= MAX_GREP_MATCHES:
+            head += f" (stopped at the first {MAX_GREP_MATCHES}; there may be more)"
+    return head + "\n" + "\n".join(shown)
 
 
 def file_diff(sb: Sandbox, path: str = "") -> str:
@@ -296,10 +370,167 @@ def file_diff(sb: Sandbox, path: str = "") -> str:
     body = out.stdout.strip()
     if not body:
         return f"no diff for {path or 'this PR'}"
-    return _cap(body)
+
+    preamble, hunks = _split_hunks(body)
+    if not hunks:
+        # A --stat summary, or a pure rename/mode change: nothing to cut at.
+        return _cap(body, MAX_DIFF_CHARS)
+    return _fit_hunks(preamble, hunks, MAX_DIFF_CHARS)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+# `@@ -old,count +new,count @@ trailing`. The post-image start (group 2) is what
+# a resume hint needs: it is the line number the reader would open the file at.
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+# Dropped-hunk rows in the footer. A 500-hunk diff should say so, not list them.
+_MAX_FOOTER_ROWS = 20
+
+# Per-row width in that footer. A hunk header carries trailing context (the
+# enclosing function), which is useful but unbounded — 20 unbounded rows
+# overflowed the space reserved for them, which is the one thing the footer
+# must never do.
+_FOOTER_ROW_CHARS = 116
+
+
+def _split_hunks(diff: str) -> tuple[str, list[dict]]:
+    """Split a unified diff into its leading file headers and its hunks.
+
+    Each hunk carries the file it belongs to and its post-image start line, so a
+    dropped hunk can be named as a `read_file` call rather than silently lost.
+    Any `diff --git` / `+++` header lines between two hunks are folded into the
+    following hunk's text, so re-joining the pieces reproduces the input.
+    """
+    preamble_lines: list[str] = []
+    hunks: list[dict] = []
+    pending: list[str] = []      # header lines seen since the last hunk closed
+    cur: dict | None = None
+    cur_file = ""
+
+    for ln in diff.split("\n"):
+        if ln.startswith("+++ b/"):
+            cur_file = ln[6:].strip()
+        elif ln.startswith("+++ ") and not ln.startswith("+++ /dev/null"):
+            cur_file = ln[4:].strip()
+
+        m = _HUNK_RE.match(ln)
+        if m:
+            if cur is not None:
+                hunks.append(cur)
+            # `pending` holds whatever preceded this hunk. Before the first hunk
+            # that is the diff's own header and becomes the preamble; between
+            # hunks it is a new file's `diff --git` block and belongs to this
+            # hunk, so that re-joining the pieces reproduces the input.
+            if not hunks and cur is None:
+                preamble_lines = pending
+                head: list[str] = []
+            else:
+                head = pending
+            cur = {
+                "file": cur_file,
+                "post_start": int(m.group(2)),
+                "header": ln,
+                "text": "\n".join(head + [ln]),
+            }
+            pending = []
+            continue
+
+        if cur is None:
+            pending.append(ln)
+        elif ln.startswith("diff --git "):
+            # A new file section closes the open hunk.
+            hunks.append(cur)
+            cur = None
+            pending = [ln]
+        else:
+            cur["text"] += "\n" + ln
+
+    if cur is not None:
+        hunks.append(cur)
+    elif pending and hunks:
+        # Trailing lines after the last hunk with nothing open — keep them.
+        hunks[-1]["text"] += "\n" + "\n".join(pending)
+
+    if not hunks:
+        return diff, []
+    return "\n".join(preamble_lines), hunks
+
+
+def _dropped_footer(dropped: list[dict], total: int, budget: int) -> str:
+    """Name the omitted hunks as the `read_file` calls that would show them."""
+    rows = []
+    for h in dropped[:_MAX_FOOTER_ROWS]:
+        row = (
+            f'  read_file("{h["file"]}", start_line={h["post_start"]})'
+            f'   ({h["header"].strip()})'
+        )
+        rows.append(row[:_FOOTER_ROW_CHARS])
+    if len(dropped) > _MAX_FOOTER_ROWS:
+        rows.append(f"  … and {len(dropped) - _MAX_FOOTER_ROWS} more")
+    return (
+        f"… {len(dropped)} of {total} hunks omitted at the {budget}-char "
+        "result limit. The omitted hunks touch these ranges — read them "
+        "directly:\n" + "\n".join(rows)
+    )
+
+
+def _fit_hunks(preamble: str, hunks: list[dict], budget: int) -> str:
+    """As many whole hunks as fit, then say which ranges were dropped.
+
+    Cutting mid-hunk is worse than dropping a hunk: a half-hunk looks like a
+    complete one. On phanthymotus-driver PR #174 a diff truncated at 4000 chars
+    with no header, no line numbers and no way to ask for the rest is what sent
+    the reviewer off to page through a 4741-line file by hand for 13 rounds. A
+    hunk boundary plus the dropped ranges lets it read exactly what it is
+    missing with `read_file`, which now reports honest ranges.
+    """
+    def fit(limit: int) -> tuple[list[str], int]:
+        out: list[str] = []
+        used = 0
+        if preamble:
+            out.append(preamble)
+            used = len(preamble) + 1
+        kept = 0
+        for h in hunks:
+            text = h["text"]
+            if used + len(text) + 1 <= limit:
+                out.append(text)
+                used += len(text) + 1
+                kept += 1
+                continue
+            if kept == 0:
+                # One hunk larger than the whole budget. Returning only a footer
+                # would say nothing about the change, so emit what fits and mark
+                # the boundary explicitly rather than letting it pass as whole.
+                room = max(limit - used - 200, 500)
+                out.append(
+                    text[:room]
+                    + f"\n…[hunk truncated at {room} chars; "
+                    + f'read_file("{h["file"]}", start_line={h["post_start"]}) '
+                    + "for the rest]"
+                )
+                kept = 1
+            break
+        return out, kept
+
+    # The footer's size depends on how many hunks are dropped, which depends on
+    # the space left for it — so reserve nothing, measure, and re-fit. Converges
+    # in at most a couple of passes because the footer is bounded at
+    # _MAX_FOOTER_ROWS rows of _FOOTER_ROW_CHARS. Guessing a fixed reserve
+    # instead both overflowed the budget on a 371-hunk diff and threw away a
+    # fifth of it on diffs that had nothing to drop.
+    reserve = 0
+    for _ in range(4):
+        out, kept = fit(budget - reserve)
+        if kept >= len(hunks):
+            return "\n".join(out)
+        footer = _dropped_footer(hunks[kept:], len(hunks), budget)
+        if len(footer) + 1 <= reserve:
+            break
+        reserve = len(footer) + 1
+    return "\n".join(out + [footer])
 
 
 def _walk(sb: Sandbox, root: Path) -> list[Path]:
@@ -336,13 +567,60 @@ def _human(n: int) -> str:
     return f"{n}B"
 
 
-def _cap(s: str) -> str:
-    if len(s) <= MAX_RESULT_CHARS:
+def _cap(s: str, limit: int = MAX_RESULT_CHARS) -> str:
+    """Last-resort truncation. Prefer counting while building — see `_emit_lines`.
+
+    Truncating a finished string is what caused the bug this module was
+    rewritten for: the caller had already written a header describing content
+    that `_cap` then removed, and the model has no way to see where its own
+    input was cut.
+    """
+    if len(s) <= limit:
         return s
-    return (
-        s[:MAX_RESULT_CHARS]
-        + f"\n… truncated at {MAX_RESULT_CHARS} chars — narrow the request"
-    )
+    # The note counts against the limit. Appending it afterwards returned
+    # limit+48 chars, which then tripped the transcript's own cap — the same
+    # mistake one layer down.
+    note = f"\n… truncated at {limit} chars — narrow the request"
+    return s[: max(limit - len(note), 0)] + note
+
+
+def _emit_lines(
+    lines: list[str], start: int, limit: int, budget: int
+) -> tuple[list[str], int, bool]:
+    """Numbered lines that fit `budget` chars, the last line number reached, and
+    whether the budget (rather than `limit`) is what stopped it.
+
+    The cap has to be applied *while* building the body, never to the finished
+    string. `_cap(header + body)` truncated after the header was already
+    written, so a read of lines 2200-2719 announced 520 lines, delivered 65, and
+    put no marker at the boundary. The model cannot see where its input was cut,
+    so it guesses the next window: on phanthymotus-driver PR #174 that produced
+    13 consecutive overlapping reads of one 4741-line file — 2200-2719,
+    2280-2779, 2338-2777, 2700-3319, 2650-3299, … — and spent the entire round
+    budget without ever calling finish_review.
+    """
+    out: list[str] = []
+    used = 0
+    stop = min(start - 1 + limit, len(lines))
+    hit_budget = False
+    marker = " …[single line truncated]"
+    for i in range(start - 1, stop):
+        row = f"{i + 1:5d}  {lines[i]}"
+        # A single line longer than the whole budget — minified JS, a generated
+        # header, a one-line JSON blob — would otherwise return zero lines and
+        # read as an empty file, indistinguishable from a bad start_line.
+        # Hard-truncate that one line and say so, marker included in the budget.
+        if len(row) > budget:
+            row = row[: max(budget - len(marker), 0)] + marker
+        # `out and` guarantees at least one line always comes back, so the
+        # resume hint the caller builds from `shown_to` always advances and
+        # cannot suggest the same window forever.
+        if out and used + len(row) + 1 > budget:
+            hit_budget = True
+            break
+        out.append(row)
+        used += len(row) + 1
+    return out, start + len(out) - 1, hit_budget
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -384,7 +662,15 @@ SCHEMAS = [
                 "properties": {
                     "path": {"type": "string", "description": "Repo-relative file path."},
                     "start_line": {"type": "integer", "description": "First line (default 1)."},
-                    "max_lines": {"type": "integer", "description": "Lines to return (default 200, max 400)."},
+                    "max_lines": {
+                        "type": "integer",
+                        "description": (
+                            "Lines to return (default 200, max 400). If the "
+                            "result does not fit the size limit, the header "
+                            "names the exact line to resume from — use that "
+                            "number rather than guessing a new window."
+                        ),
+                    },
                 },
                 "required": ["path"],
             },
@@ -415,7 +701,9 @@ SCHEMAS = [
             "name": "file_diff",
             "description": (
                 "This PR's diff. With no path, returns the --stat summary; with "
-                "a path, the full diff for that file."
+                "a path, the full diff for that file. A diff too large for one "
+                "result is returned as whole hunks, and the omitted hunks are "
+                "listed as the read_file calls that would show them."
             ),
             "parameters": {
                 "type": "object",

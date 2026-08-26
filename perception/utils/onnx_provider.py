@@ -85,11 +85,14 @@ def cuda_available() -> bool:
     """True when the installed sherpa_onnx wheel bundles the CUDA provider.
 
     The marker is `sherpa_onnx/lib/libonnxruntime_providers_cuda.so`, which only a
-    `-DSHERPA_ONNX_ENABLE_GPU=ON` build ships. jetson jp5.11 installs such a wheel
-    from COS; jp6.1 is CUDA 12.6 and cannot use it, and x86 dev hosts get the PyPI
-    CPU wheel — see Dockerfile.jetson. This deliberately does not probe the driver
-    or create a session: on Jetson the wheel is built for the same L4T release it
-    is deployed on, and a probe would cost a full ONNX Runtime session at import.
+    `-DSHERPA_ONNX_ENABLE_GPU=ON` build ships. Both Jetson lines install such a
+    wheel from COS — jp5.11 and jp6.1 have separate builds, because the wheel is
+    tied to an ONNX Runtime version (and through it a CUDA/cuDNN pair) and to a
+    CPython ABI. A JetPack line we have not built a wheel for, and x86 dev hosts,
+    get the PyPI CPU wheel — see Dockerfile.jetson. This deliberately does not
+    probe the driver or create a session: on Jetson the wheel is built for the same
+    L4T release it is deployed on, and a probe would cost a full ONNX Runtime
+    session at import.
     """
     try:
         import sherpa_onnx

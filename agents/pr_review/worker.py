@@ -351,11 +351,24 @@ async def _run_once(
         job.review_stopped_reason = result.stopped_reason
         job.review_tool_calls = result.tool_calls
 
-        if result.stopped_reason == "error" and result.empty:
+        if result.empty:
+            # A wholly empty review is never posted. The placeholder reads as
+            # "the reviewer had no comments", which is worse than an error
+            # comment saying what happened — and on PR #174 the comment that got
+            # posted invited a retrigger, which reproduced it 21 times.
+            #
+            # Note the asymmetry with the in-place retry above, which stays
+            # error-only on purpose. An `error` is the gateway having a bad
+            # minute and a second pass may well work. A `max_rounds` or
+            # `timeout` exit is deterministic — same files, same caps, same
+            # budget — so a second pass would spend the whole review budget
+            # reproducing it exactly. EmptyReviewError is non-retryable, so this
+            # posts one error comment and rebuilds nothing.
             await store.save_job(job)
+            why = result.error or f"stopped on {result.stopped_reason}"
             raise EmptyReviewError(
                 f"the reviewer produced nothing after {REVIEW_ATTEMPTS} "
-                f"attempts: {result.error or 'unknown error'}"
+                f"attempts: {why}"
             )
 
         job.set_stage(Stage.POSTING)

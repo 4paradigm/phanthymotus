@@ -78,14 +78,29 @@ def tensorrt_family(version: str | None = None) -> str:
 
     Passing an explicit `version` skips importing tensorrt (used by tests and
     by manifests that want to describe both families).
+
+    A major newer than any family we ship engines for is treated as the newest
+    family and warned about, rather than refused: refusing would take a device
+    down on a JetPack upgrade, and the engines may well still load. But plans are
+    not guaranteed portable across TensorRT majors, so the warning is the only
+    thing standing between a silent mismatch and a confusing runtime failure —
+    when it appears, build engines for that major.
     """
     text = tensorrt_version() if version is None else str(version)
     try:
         major = int(text.split(".", 1)[0])
     except ValueError as error:
         raise TensorRTError(f"Unsupported TensorRT version: {text or 'unknown'}") from error
-    if major >= 10:
-        return "jp61"
+    newest_major = max(_TRT_FAMILIES)
+    if major > newest_major:
+        newest = _TRT_FAMILIES[newest_major]
+        log.warning(
+            "[tensorrt] TensorRT %s is newer than any engine family we ship; "
+            "using '%s' engines, which were built for TensorRT %d. Plans are not "
+            "portable across majors — build a '%s' bundle for TensorRT %d.",
+            text, newest, newest_major, newest, major,
+        )
+        return newest
     family = _TRT_FAMILIES.get(major)
     if family is None:
         raise TensorRTError(f"Unsupported TensorRT version: {text}")

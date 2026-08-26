@@ -48,6 +48,29 @@ def test_tensorrt_family_rejects_unknown(version):
         trt_rt.tensorrt_family(version)
 
 
+@pytest.mark.parametrize("version", ["11.0.0", "12.2.1"])
+def test_tensorrt_family_warns_for_a_major_newer_than_any_bundle(version, caplog):
+    """A newer major still resolves, but must not do so silently.
+
+    Refusing would take a device down on a JetPack upgrade, and the engines may
+    well still load. But plans are not guaranteed portable across TensorRT
+    majors, so without the warning a mismatch surfaces later as an unexplained
+    deserialization failure. Needs PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 — caplog
+    captures nothing inside a perception image otherwise (see perception/README).
+    """
+    with caplog.at_level("WARNING"):
+        assert trt_rt.tensorrt_family(version) == "jp61"
+    assert any("not portable across majors" in r.getMessage()
+               for r in caplog.records), caplog.records
+
+
+@pytest.mark.parametrize("version", ["8.5.2.2", "10.3.0"])
+def test_tensorrt_family_is_quiet_for_a_known_major(version, caplog):
+    with caplog.at_level("WARNING"):
+        trt_rt.tensorrt_family(version)
+    assert not [r for r in caplog.records if "tensorrt" in r.getMessage().lower()]
+
+
 def test_normalize_family_aliases():
     assert trt_rt.normalize_family("61") == "jp61"
     assert trt_rt.normalize_family("JP511") == "jp511"

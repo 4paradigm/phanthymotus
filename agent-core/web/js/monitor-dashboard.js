@@ -15,6 +15,7 @@ import { MappingRenderer }   from './renderers/mapping.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
+import { resolveDerivedTopics } from './topic-derive.js';
 
 const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
@@ -85,6 +86,9 @@ async function _fetchAndBuild() {
   const canvasCards = layout.cards || [];
   const connections = layout.connections || [];
   const canvasTools = new Set(canvasCards.map(c => `${c.mcpId}:${c.toolName}`));
+
+  // The layout is not a reliable record of derived topics — see topic-derive.js.
+  await resolveDerivedTopics(canvasCards, connections);
 
   const topicSet = new Set();
   _topicMcpMap = {};  // reset

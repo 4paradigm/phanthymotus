@@ -165,17 +165,11 @@ export async function initCanvas(initialMcps) {
     _resolveAllTopics();
     _redrawConnections();
 
-    // Fetch driver-inferred output topics for processor cards with empty outputs
-    for (const card of _cards) {
-      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-      const hasEmptyOut = outPorts.some(p => !p.dataset.topic);
-      if (!hasEmptyOut) continue;
-      const hasOutConn = _connections.some(c => c.fromCardId === card.id);
-      if (!hasOutConn) continue;
-      const inConn = _connections.find(c => c.toCardId === card.id && c.fromTopic);
-      const inputTopic = inConn?.fromTopic || '';
-      _fetchTopicsFromDriver(card, inputTopic);
-    }
+    // Cards whose topic_out is derived resolve inside _resolveAllTopics now
+    // (_revalidateDerivedTopics). The bespoke recovery that used to live here
+    // only fetched for cards with an *empty* out-port that also had an outgoing
+    // connection, which missed both a stale non-empty topic and a leaf card like
+    // TTS.
 
     // Restore viewport transform if saved
     if (layoutJson.data?.transform) {
@@ -1237,10 +1231,11 @@ function _setupPortDrag() {
           const resolvedTopic = resolvedInPort?.dataset.topic || _draggingConn.topic;
           _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic, instance_id: toCardData.id });
         }
-        // Ask driver to infer output topics for the destination card based on connected input topic
-        if (toCardData && _draggingConn.topic) {
-          _fetchTopicsFromDriver(toCardData, _draggingConn.topic);
-        }
+        // The destination's output topic is derived from this new input;
+        // _resolveAllTopics above already scheduled that refetch, and doing it
+        // here as well raced it — this path passes the dragged topic, which is
+        // empty when the source's own topic has not resolved yet, and whichever
+        // reply landed last won.
       }
     }
 
@@ -1547,7 +1542,9 @@ function _resolveAllTopics() {
     }
   }
 
-  // (debug logs removed)
+  // A derived topic_out is only valid for the input it came from, so the walk
+  // ends by checking that and refetching whatever no longer matches.
+  _revalidateDerivedTopics();
 }
 
 // ── Project lifecycle ─────────────────────────────────────────────────────────
@@ -1847,6 +1844,9 @@ function _parseMcpCallResult(json) {
  * Updates card.topicOut and DOM out-ports if driver returns non-empty topics.
  */
 async function _fetchTopicsFromDriver(card, inputTopic) {
+  const want = inputTopic || '';
+  if (card._topicFetchFor === want) return;   // identical request already in flight
+  card._topicFetchFor = want;
   try {
     const resp = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
       method: 'POST',
@@ -1856,15 +1856,82 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
     const data = await resp.json();
     const parsed = _parseMcpCallResult(data);
     const topicOut = parsed?.topic_out;
+    // Remember which input produced this answer. A derived topic is only valid
+    // for the input it was derived from, and without this the cache could never
+    // be told apart from a still-correct one — see _revalidateDerivedTopics.
+    card.topicOutFrom = want;
     if (topicOut?.some(t => t.topic)) {
       card.topicOut = topicOut;
       const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
       topicOut.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      // A resolved topic is some downstream card's input, so the graph below this
+      // one has to be re-walked — otherwise a chain (mic → asr → tts) only ever
+      // resolves its first hop.
+      _resolveAllTopics();
+      _redrawConnections();
+      _debouncedSave();
+    } else if (card.topicOut?.some(t => t.topic)) {
+      // The driver cannot infer an output for this input, so whatever we are
+      // holding was derived from a different one and is now wrong. Dropping it is
+      // what stops a deleted connection's topic from outliving the connection.
+      card.topicOut = [];
+      _resolveAllTopics();
       _redrawConnections();
       _debouncedSave();
     }
   } catch (e) {
+    card._topicFetchFor = null;   // let a later resolve retry after a failure
     console.warn('[canvas] info fetch failed:', e);
+  }
+}
+
+/**
+ * The input topic a card is currently fed, per the resolved graph.
+ *
+ * Read from the in-port dataset, which _resolveAllTopics' BFS has just written.
+ * Deliberately *not* falling back to connection.fromTopic: that field holds
+ * whatever was known when the link was drawn, so falling back to it would feed a
+ * card the leftover topic of a link that has since been deleted — the very thing
+ * this revalidation exists to undo. An empty string means "not known yet", which
+ * is the honest answer.
+ */
+function _inputTopicFor(card) {
+  const inConn = _connections.find(c => c.toCardId === card.id);
+  if (!inConn) return '';
+  const inPort = card.el.querySelector(`.canvas-port.in[data-idx="${inConn.toPortIdx}"]`);
+  return inPort?.dataset.topic || '';
+}
+
+/**
+ * Refetch any card whose cached topic_out no longer matches its input.
+ *
+ * card.topicOut for a multiInstance tool is *derived*: the driver infers it from
+ * the connected input topic (`/remote_control/mic` + asr → `/remote_control/mic/asr`).
+ * It was cached with no record of which input produced it and given top priority
+ * in _resolveAllTopics, so it survived the input changing under it. Connect TTS to
+ * remote_message, delete that connection, connect it to ASR instead, and the card
+ * kept publishing to `/remote_control/message/tts`: the dashboard panel watched a
+ * topic nothing fed, and the audio panel stayed silent.
+ *
+ * Nothing recomputed it either — the disconnect paths never refetched, and the
+ * page-load recovery only looks at cards with an *empty* out-port that also have
+ * an outgoing connection, which a stale leaf card like TTS satisfies neither of.
+ */
+function _revalidateDerivedTopics() {
+  for (const card of _cards) {
+    const want = _inputTopicFor(card);
+    const known = card.topicOutFrom;
+    const hasReal = card.topicOut?.some(t => t.topic);
+    // Nothing verified this card's topics in this page's lifetime. The saved
+    // layout is not evidence — a stale derived topic is exactly what gets
+    // persisted — so re-derive it whenever the card has an input to derive from.
+    // Once per card per page load: _fetchTopicsFromDriver drops a repeat request
+    // for the same input.
+    if (known === undefined) {
+      if (want || !hasReal) _fetchTopicsFromDriver(card, want);
+      continue;
+    }
+    if (known !== want) _fetchTopicsFromDriver(card, want);
   }
 }
 

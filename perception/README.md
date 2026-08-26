@@ -88,11 +88,16 @@ just a different provider string.
 
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
-| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance |
+| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance ⚠️ |
 | `paraformer-zh-en` (streaming) | int8, 226 MB | **fp32, 825 MB** | **1.77x** |
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
 | `paraformer-offline` | int8 | — not offered | unmeasured |
 | `zipformer-en` | int8 | — not offered | unmeasured |
+
+⚠️ **`sensevoice-small` on gpu drops some utterances entirely** — fp16 under the
+CUDA provider returns an empty transcript for certain inputs, silently and
+reproducibly, on both JetPack lines. Read § jp6.1, and a silent failure the gpu
+path has always had before enabling it; the speed-up is real but so is the loss.
 
 **gpu costs about 2 GB of RAM, and ~1.4 GB of that is unreturnable.** Measured with
 only ASR resident: the cpu adapter adds 542 MB and drops back to 129 MB when
@@ -107,9 +112,11 @@ TTS is simpler: Matcha is fp32 only, so both devices load the same files and
 `device` only picks the provider (gpu measured ~4.3x). The `vits2_trt` engine
 ignores `device` entirely — it is a TensorRT engine and never touches ONNX Runtime.
 
-`device: gpu` also needs the CUDA sherpa-onnx wheel, which only the jp5.11 image
-installs (see § The jp5.11 CUDA wheel). On jp6.1 and x86 dev hosts it falls back to
-`cpu` with a warning rather than failing to start.
+`device: gpu` also needs a CUDA sherpa-onnx wheel. Both Jetson images install one —
+jp5.11 and jp6.1 each have their own build, because the wheel is tied to a
+CUDA/cuDNN pair and a CPython ABI (see § The CUDA wheels). On x86 dev hosts, and on
+any JetPack line we have not built a wheel for, it falls back to `cpu` with a
+warning rather than failing to start.
 
 ### Latency per utterance, which is what an operator feels
 
@@ -160,6 +167,51 @@ unwarmed adapter earlier in the same process had already paid the CUDA init.)
 The batch figures in § Measurements are larger (up to 23x) because they decode the
 model's own `test_wavs`, which are 7 s each. Those compare dtypes with each other;
 this table is what a user experiences.
+
+### jp6.1, and a silent failure the gpu path has always had
+
+Same measurement on orin6 (Orin NX, JetPack 6.1, CUDA 12.6, onnxruntime-gpu
+1.18.1, 6 cores), SenseVoice, `num_threads=2`, through `_build_asr_adapter` so the
+registry and provider selection are the production ones. `provider_for_device('gpu',
+fp16)` returns `'cuda'`, and 120 calls per device:
+
+| audio | cpu (int8) p50 / p99 | gpu (fp16) p50 / p99 | speed-up |
+|---|---|---|---|
+| rig's own VAD captures, 0.8–2.1 s | 119 / 194 ms | **49 / 58 ms** | 2.4x / 3.3x |
+| KWS bundle test_wavs, 4.5–16.7 s | 462 / 1305 ms | **67 / 169 ms** | 6.9x / 7.7x |
+
+The gpu p99 is below the cpu *minimum* in both rows, which is the useful sanity
+check that CUDA is actually doing the work. Longer audio wins more, consistent with
+the jp5.11 numbers. Building the gpu adapter took 3.7 s with weights already
+local, 86.3 s including the 449 MB fp16 download. Whole-box `MemAvailable` fell
+~605 MB while gpu was resident — well short of the ~2 GB the jp5.11 table reports,
+so budget from a measurement on the box you are deploying to rather than from
+either figure.
+
+**But `device: gpu` can lose an utterance outright.** SenseVoice fp16 under the
+CUDA provider returns an **empty** transcript for some inputs — deterministically,
+5/5 attempts, on the KWS bundle's own `en_0.wav`: 6.6 s of clear English peaking at
+0.535 FS, louder than the `en_1.wav` that decodes fine. Eight of the nine files in
+that bundle match cpu exactly.
+
+Isolated by varying one thing at a time, since dtype and provider normally change
+together:
+
+| | en_0.wav |
+|---|---|
+| `model.int8.onnx` + cpu | correct |
+| `model.fp16.onnx` + cpu | correct |
+| `model.fp16.onnx` + cuda | **empty** |
+
+So the fp16 export is fine and the CUDA provider is at fault. Reproduced on **both**
+lines — onnxruntime-gpu 1.16.0 on orin5 and 1.18.1 on orin6, byte-identical
+`model.fp16.onnx` — so it is not a property of either wheel and not new. An earlier
+note in `ASR_MODELS` claimed fp16 was "transcript-identical to fp32 on both
+providers"; that was wrong, and the failure is silent. An empty transcript is
+indistinguishable from silence, so the utterance is dropped with nothing in the
+log to say so. Untested alternative: SenseVoice fp32 on CUDA, which measured
+11.52x on jp5.11 and would still beat cpu — no fp32 bundle is published, so
+switching the registry to it means building one first.
 
 ### Switching engine or device blocks for the bounded part
 
@@ -303,14 +355,44 @@ are converted from those with `tools/convert_onnx_fp16.py`.
 
 ---
 
-### The jp5.11 CUDA wheel
+### The CUDA wheels
 
 PyPI ships CPU-only `sherpa-onnx`, so `Dockerfile.jetson` downloads a wheel built
-in-house for JetPack 5.11 from COS
-(`public/sherpa-onnx/sherpa_onnx-<ver>+cuda-cp38-cp38-linux_aarch64.whl`) and
-falls back to the PyPI CPU wheel for every other `JP_VERSION`.
+in-house from COS under `public/sherpa-onnx/<jp>/`, one per JetPack line, and falls
+back to the PyPI CPU wheel for any `JP_VERSION` without one:
 
-To rebuild it, build **inside a container started from the perception image** for
+| | onnxruntime-gpu | CUDA / cuDNN | COS key |
+|---|---|---|---|
+| jp5.11 (focal, L4T R35) | 1.16.0 | 11.4 / 8 | `jp511/sherpa_onnx-<ver>+cuda-cp38-cp38-linux_aarch64.whl` |
+| jp6.1 (jammy, L4T R36) | 1.18.1 | 12.6 / 9 | `jp61/sherpa_onnx-<ver>+cuda-cp310-cp310-linux_aarch64.whl` |
+
+Neither the ONNX Runtime pairing nor the CPython ABI is portable, which is why
+there are two wheels rather than one. `cmake/onnxruntime-linux-aarch64-gpu.cmake`
+in sherpa-onnx pins the URL and SHA256 per version and names the target board for
+each; 1.18.1 is the one it lists for L4T R36 + CUDA 12.6.
+
+**The directory carries the JetPack, because the filename cannot.** Upstream's
+`setup.py` tags the wheel `<ver>+cuda-cp<abi>`, so in a flat directory the only
+thing separating the two builds is `cp38` vs `cp310` — a *Python* discriminator,
+not a CUDA one. It selects correctly today, since each image ships exactly one
+Python and pip refuses a wheel built for another, but a second cp310 build for
+another JetPack 6.x on a different CUDA would collide. Renaming the file is not an
+option: pip parses the version out of it and it has to match the wheel metadata.
+
+**Check the cuDNN soname before committing to a build.** ONNX Runtime's aarch64 GPU
+packages do not encode it in the filename past 1.18.0, and it is what decides
+whether the provider loads at all. Two minutes with `readelf` beats an hour of
+compiling:
+
+```bash
+readelf -d libonnxruntime_providers_cuda.so | grep NEEDED
+```
+
+1.18.1 needs `libcudnn.so.9` / `libcudart.so.12` / `libcublas.so.12`, all of which
+the jp6.1 image resolves (cuDNN 9.4.0, CUDA 12.6). 1.18.0 would not — it is built
+against cuDNN 8.9.4, which that image does not carry.
+
+To build one, build **inside a container started from the perception image** for
 the target JetPack — that image already carries cmake, g++, the matching CPython
 headers and CUDA, so the pybind extension lands on the right CPython ABI and
 glibc. Building on the host instead is what produces an unusable wheel: the
@@ -319,20 +401,21 @@ Python.
 
 ```bash
 # on the build host (must match the target JetPack: jp5.11 → L4T R35, jp6.1 → R36)
-docker run -d --name sherpa-build \
+docker run -d --name sherpa-build --runtime nvidia \
   -v /path/to/k2-fsa/sherpa-onnx:/src:ro -v /path/to/outdir:/out \
   --entrypoint bash <perception-image-for-that-jp> /out/build.sh
 
-# inside, against a *writable* copy of the tree (setup.py appends __version__ to it):
+# inside, against a *writable* copy of the tree (setup.py appends __version__ to it).
+# jp6.1 shown; for jp5.11 use 1.16.0 and python3.8.
 export SHERPA_ONNX_ENABLE_GPU=ON
-export SHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.16.0   # jp5.11 / CUDA 11.4
-export SHERPA_ONNX_MAKE_ARGS="-j2"                              # Orin has 6 cores but ~4 GB free
+export SHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.18.1   # jp6.1 / CUDA 12.6
+export SHERPA_ONNX_MAKE_ARGS="-j2"                              # Orin has 6 cores but ~3 GB free
 SHERPA_ONNX_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release \
   -DSHERPA_ONNX_ENABLE_GPU=ON \
-  -DSHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.16.0 \
-  -DPYTHON_EXECUTABLE=/usr/bin/python3.8 \
-  -DPython_EXECUTABLE=/usr/bin/python3.8" \
-  python3.8 setup.py bdist_wheel
+  -DSHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.18.1 \
+  -DPYTHON_EXECUTABLE=/usr/bin/python3.10 \
+  -DPython_EXECUTABLE=/usr/bin/python3.10" \
+  python3.10 setup.py bdist_wheel
 ```
 
 Notes:
@@ -343,17 +426,15 @@ Notes:
   not reusable — expect a full compile.
 - To avoid re-downloading onnxruntime, drop
   `onnxruntime-linux-aarch64-gpu-<ver>.tar.bz2` in `/tmp/`;
-  `cmake/onnxruntime-linux-aarch64-gpu.cmake` checks there before GitHub.
-- Upload the result under the `public/` COS prefix (anonymous read, same prefix
-  `utils/model_downloader.py` uses) and bump `SHERPA_GPU_WHEEL` in
-  `Dockerfile.jetson`.
-
-**TODO — jp6.1.** The jp5.11 wheel links `libcudart.so.11.0` and cannot run on
-jp6.1 (CUDA 12.6). That target needs its own build with
-`SHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.18.1` and
-`PYTHON_EXECUTABLE=python3.10`, run on a JetPack 6 host inside
-`jetson-base:jp61-torch`. Until then jp6.1 stays on the CPU wheel and
-`device: gpu` falls back to `cpu` there.
+  `cmake/onnxruntime-linux-aarch64-gpu.cmake` checks there before GitHub. Use that
+  exact generic name even when the release asset is called something else — the
+  hash it checks is the one for the asset it would have downloaded.
+- Upload the result to `public/sherpa-onnx/<jp>/` (anonymous read, same `public/`
+  prefix `utils/model_downloader.py` uses) and bump the matching
+  `SHERPA_GPU_WHEEL_<jp>` in `Dockerfile.jetson` — the ARG holds the key *with* its
+  directory, and the build downloads it to `/tmp/$(basename …)`. COS credentials
+  live in `resource-center/deploy/values.env` (`COS_SECRET_ID` / `COS_SECRET_KEY`);
+  the bucket is `agi-phanthy-dev-1252788780` in `ap-beijing`.
 
 ---
 
@@ -590,3 +671,31 @@ packaging blanks declared fields only, there is no field-name blocklist:
 An unmarked credential is uploaded in clear text and readable by anyone who
 downloads the solution. Full spec: `phanthymotus-driver/README_dev.md`
 § "Marking sensitive fields".
+
+---
+
+## Running the tests inside a perception image
+
+`python3 -m pytest tests -q` from a checkout works anywhere. Running the same
+suite **inside a perception container** — which is how you confirm a fix behaves on
+the Python the device actually ships — needs one flag:
+
+```bash
+docker cp tests <container>:/work/
+docker exec <container> bash -c 'source /opt/ros/humble/install/setup.bash && \
+  source /ros_ws/install/setup.bash && cd /work && \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q -p pytest_mock'
+```
+
+Without `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, **`caplog` captures nothing** and every
+test that asserts on a log record fails while the log line is plainly there in the
+captured stderr. The image inherits ROS 2's own pytest plugins from the base
+(`launch_testing`, `launch_testing_ros`, six `ament_*`, `colcon-core`) alongside
+`pytest-cov 3.0.0` / `pytest-timeout 2.1.0`, and something in that set breaks
+`_pytest.logging`'s capture handler under pytest 8. Verified by reduction: a
+two-line test logging to a plain `logging.getLogger("probe")` fails the same way,
+and passes the moment autoload is off. It is not the tests, and not a Python 3.10
+difference.
+
+Measured on jp6.1 (Python 3.10.12, pytest 8.3.3): 175 passed / 1 failed with
+autoload on, **176 passed** with it off.

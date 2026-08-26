@@ -113,6 +113,29 @@ Live sensor data visualization — audio waveforms, battery status, 3D skeleton/
 
 ![Monitoring Dashboard](docs/images/dashboard.png)
 
+#### Derived topics
+
+A `multiInstance` tool (ASR, TTS, OCR) does not have a fixed output topic. The
+driver infers it from the input topic the card is connected to —
+`/remote_control/mic` + `asr` → `/remote_control/mic/asr` — so the same tool on two
+cards publishes to two different topics, and a card's topic only exists once
+something has asked the driver (`action: info` with `input_topic`, a read).
+
+Two rules follow, both of which were learned the hard way:
+
+- **A derived topic is only valid for the input it was derived from.** The canvas
+  records which input produced each answer and refetches when the graph changes
+  underneath it (`_revalidateDerivedTopics` in `web/js/canvas.js`). Without that,
+  re-pointing a TTS card from one source to another left it publishing to the old
+  source's topic: the dashboard panel watched a topic nothing fed, and there was no
+  sound.
+- **The saved layout is not a source of truth for them.** The monitor dashboard
+  resolves them itself (`web/js/topic-derive.js`), rather than depending on someone
+  having had the canvas page open — which is why the ASR panel used not to be there
+  until you visited the canvas.
+
+Frontend tests: `node --test "agent-core/web/js/*.test.mjs"` (no dependencies).
+
 ### Agent Definition
 
 Define the agent's identity, system prompt, and long-term memory directly from the UI.

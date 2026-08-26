@@ -545,9 +545,10 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
-        # The gpu bundle ships fp16 (fastest here and transcript-identical to
-        # fp32); the cpu bundle ships int8. fp32 is listed as a middle fallback
-        # for a hand-assembled directory.
+        # The gpu bundle ships fp16 (fastest here); the cpu bundle ships int8.
+        # fp32 is listed as a middle fallback for a hand-assembled directory.
+        # fp16 on CUDA is NOT transcript-identical — see the note on the
+        # sensevoice gpu entry in ASR_MODELS.
         names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
             if device == "gpu" else \
             ("model.int8.onnx", "model.onnx")
@@ -702,8 +703,22 @@ ASR_MODELS = {
         "devices": {
             "cpu": {"download": "asr_sensevoice", "dtype": "int8",
                     "dir": "/models/sherpa-onnx/sensevoice"},
-            # fp16: 344 ms vs 416 ms for fp32 on CUDA, half the size, and
-            # transcript-identical to fp32 on both providers.
+            # fp16: 344 ms vs 416 ms for fp32 on CUDA, and half the size.
+            #
+            # KNOWN DEFECT, not fixed here: fp16 under the CUDA provider returns an
+            # **empty** transcript for some inputs. Reproduced deterministically
+            # (5/5) on the KWS bundle's own en_0.wav, 6.6 s of clear English at
+            # 0.535 FS, while en_1.wav and all seven Chinese files decode
+            # identically to cpu. Isolated to the provider, not the weights: the
+            # same model.fp16.onnx on the *cpu* provider transcribes en_0
+            # correctly. Present on both lines — onnxruntime-gpu 1.16.0 (jp5.11)
+            # and 1.18.1 (jp6.1) — so it is not a property of either wheel.
+            #
+            # An earlier comment here claimed fp16 was "transcript-identical to
+            # fp32 on both providers". It is not, and the failure mode is silent:
+            # an empty transcript is indistinguishable from silence, so the
+            # utterance is simply lost. Weigh that against the ~7x latency win
+            # before turning `device: gpu` on for this model.
             "gpu": {"download": "asr_sensevoice_gpu", "dtype": "fp16",
                     "dir": "/models/sherpa-onnx/sensevoice-gpu"},
         },
