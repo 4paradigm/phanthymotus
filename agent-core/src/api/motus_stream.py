@@ -54,6 +54,13 @@ async def motus_ws(websocket: fastapi.WebSocket):
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)
     _clients.add(queue)
 
+    # This connection is also the canvas editor lock's liveness signal: the lock
+    # is held by a session_id, and api/canvas releases it shortly after that
+    # session's last connection drops (see canvas.session_disconnected).
+    from api import canvas
+    session_id = websocket.query_params.get('session_id', '')
+    canvas.session_connected(session_id)
+
     # Send a welcome / connection-established event
     await websocket.send_text(json.dumps({
         'type': 'status',
@@ -75,3 +82,4 @@ async def motus_ws(websocket: fastapi.WebSocket):
         pass
     finally:
         _clients.discard(queue)
+        canvas.session_disconnected(session_id)

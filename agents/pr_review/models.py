@@ -151,6 +151,14 @@ class BuildResult:
     # the build's identity, not a detail of it: one job can produce two
     # perception images, and only this tells them apart.
     variant: str = ""
+    # Wall clock for the whole script invocation, None while still building.
+    # Recorded because "was it slow or was it stuck?" is the first question
+    # asked of a long build, and reading it off log timestamps is tedious.
+    duration_seconds: float | None = None
+    # Why the agent killed this build, if it did: "idle" (went quiet) or "cap"
+    # (hit the absolute wall clock). "" for a build that ended on its own,
+    # including one that failed to compile — that distinction is the point.
+    timeout_kind: str = ""
 
     def label(self) -> str:
         return build_label(self.target, self.driver_path, self.variant)

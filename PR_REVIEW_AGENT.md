@@ -205,14 +205,51 @@ makes the poller replay up to `POLL_INITIAL_LOOKBACK_MINUTES` of comments.
 
 ## Timeouts and retries
 
-Two independent timeouts:
+Three bounds, only one of which normally fires:
 
-- `BUILD_TIMEOUT_SECONDS` (default 1800) — one `docker build` invocation
-- `JOB_TIMEOUT_SECONDS` (default 3600) — the whole pipeline for one attempt
+| Var | Default | Bounds |
+|---|---|---|
+| `BUILD_IDLE_TIMEOUT_SECONDS` | 600 | time since one build's **last line of output** |
+| `BUILD_TIMEOUT_SECONDS` | 7200 | one `docker build` invocation, absolute |
+| `JOB_TIMEOUT_SECONDS` | 14400 | the whole pipeline for one attempt, absolute |
 
 A job exceeding the job timeout is presumed lost and retried, up to
 `MAX_ATTEMPTS` (default 3) with `RETRY_BACKOFF_SECONDS` between attempts. When
 attempts run out, the PR gets a failure comment listing each attempt's reason.
+
+### Silence, not slowness
+
+A build is bounded by how long it has been **quiet**, because that is what
+separates a wedged build from a slow one. A live `docker build` prints
+constantly — buildx progress lines, compiler output, layer exports — while one
+stuck on a network read or a lock prints nothing at all. Every chunk of output
+resets the clock, so a slow-but-progressing build keeps extending its own lease.
+
+This replaced a plain wall-clock bound of 1800s, which could not tell the two
+apart. It killed a build that was compiling openfst's `src/script/` one file at
+a time — output flowing the whole way, longest gap between lines about 100s —
+and then reported a **build failure** on the PR. Wrong verdict, and half an hour
+of build cache discarded. Compiling openfst, torch extensions or ROS packages
+from source on ARM routinely runs past an hour; none of it is ever silent for ten
+minutes.
+
+`BUILD_TIMEOUT_SECONDS` remains only as a backstop for what the idle bound
+cannot see: a build that prints forever without finishing.
+
+`JOB_TIMEOUT_SECONDS` is loose for the same reason — every stage under it is
+already bounded on its own: git by `FETCH_TIMEOUT` / `GIT_LOCAL_TIMEOUT`, the
+review loop by `REVIEW_TIMEOUT_SECONDS` and `LLM_TIMEOUT_SECONDS`, builds by
+silence. It no longer means "how long may a job take" but "the agent itself is
+stuck".
+
+A killed build is reported as *killed*, not failed: the comment says which bound
+fired and which knob to raise, the result table shows how long it ran, and the
+dashboard's pill reads `stalled` or `timed out` rather than `failed`. Without
+that, the log tail alone reads as though the last compiler line was the error.
+
+Every build's wall clock is recorded (`duration_seconds`) and shown in the
+result table's **Took** column, so "was it slow or was it stuck?" does not need
+log timestamps to answer.
 
 Not everything is retried. Retrying costs an hour, so it is reserved for
 failures another attempt could plausibly fix:
@@ -223,12 +260,8 @@ failures another attempt could plausibly fix:
 | Network / git / registry error | yes | Usually transient |
 | Merge conflict | no | Only the author can resolve it |
 | Build failure (non-zero exit) | no | A real result — rebuilding says the same thing |
+| Build killed for going quiet | no | A build that wedges usually wedges again, and the author needs to see where |
 | Reviewer produced nothing | no | Already re-tried in place, twice over (below) |
-
-> **Sizing note.** Builds run sequentially, so a PR touching N drivers needs
-> roughly N × `BUILD_TIMEOUT_SECONDS`. With the defaults, three drivers can
-> exceed the 1h job timeout and be retried as "lost" even though the build was
-> progressing. Raise `JOB_TIMEOUT_SECONDS` if that is common.
 
 When a job is cancelled or times out, the build subprocess is killed by process
 group — `bash`, `docker`, and `buildx` all die together. Without that, an

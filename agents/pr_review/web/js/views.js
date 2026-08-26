@@ -141,7 +141,10 @@ export function renderConfig(el, c) {
     <dl class="kv">
       <dt>Repos</dt><dd>${(c.repos || []).map((r) => esc(r)).join('<br>') || '—'}</dd>
       <dt>Concurrency</dt><dd>${esc(c.max_concurrent_jobs)}</dd>
-      <dt>Build timeout</dt><dd>${esc(fmtDuration(c.build_timeout_seconds))}</dd>
+      <dt title="No output for this long means a build is stuck, and it is killed. This is the bound that normally fires.">Build idle timeout</dt>
+      <dd>${esc(fmtDuration(c.build_idle_timeout_seconds))}</dd>
+      <dt title="Absolute backstop for one build, for a build that prints forever without finishing.">Build timeout</dt>
+      <dd>${esc(fmtDuration(c.build_timeout_seconds))}</dd>
       <dt>Job timeout</dt><dd>${esc(fmtDuration(c.job_timeout_seconds))}</dd>
       <dt>Max attempts</dt><dd>${esc(c.max_attempts)}</dd>
       <dt>Mirror</dt><dd>${esc(c.mirror)}</dd>
@@ -217,7 +220,12 @@ function buildPill(b) {
 
 function buildLabel(b) {
   if (b.success === null || b.success === undefined) return 'building';
-  return b.success ? 'success' : 'failed';
+  if (b.success) return 'success';
+  // A build the agent killed is a different fact from one that failed to
+  // compile, and the fix is different too — so it does not read as "failed".
+  if (b.timeout_kind === 'idle') return 'stalled';
+  if (b.timeout_kind === 'cap') return 'timed out';
+  return 'failed';
 }
 
 function _buildSummary(results) {
@@ -319,6 +327,7 @@ function _detailBuilds(j) {
           <span class="mono">${esc(b.image_tag)}</span>
           <button class="btn-copy" data-copy="${esc(b.image_tag)}">copy</button>
         </div>` : '<span style="color:var(--text-dim)">—</span>'}</td>
+      <td>${esc(fmtDuration(b.duration_seconds))}</td>
     </tr>`).join('');
 
   // Each build gets its own log pane; app.js attaches the tailing loop by
@@ -339,7 +348,7 @@ function _detailBuilds(j) {
       <div class="card-header"><h2 class="card-title">Builds</h2></div>
       <div class="card-body no-pad">
         <table class="tbl">
-          <thead><tr><th>Target</th><th>Status</th><th>Image</th></tr></thead>
+          <thead><tr><th>Target</th><th>Status</th><th>Image</th><th>Took</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>

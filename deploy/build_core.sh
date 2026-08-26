@@ -72,6 +72,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     fi
     if [[ ! "${SYNC_CONFIRM}" =~ ^[Nn] ]]; then
         echo "Registering image to resource-center (${RESOURCE_CENTER_URL})..."
+        # acc_arch=agnostic 是硬要求：core 不依赖 CUDA，且必须在所有主机可见 —— 一旦被架构
+        # 过滤掉，agent-core 的 api/system.py:_check_update_sync 会默默报「已是最新」。
         HTTP_STATUS=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
             -X POST "${RESOURCE_CENTER_URL}/api/admin/register" \
             -H "Content-Type: application/json" \
@@ -81,6 +83,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"registryImage\": \"core\",
                 \"tag\": \"${TAG}\",
                 \"category\": \"core\",
+                \"acc_arch\": \"agnostic\",
+                \"cpu_arch\": \"arm64\",
                 \"name\": \"Agent Core\"
             }")
 

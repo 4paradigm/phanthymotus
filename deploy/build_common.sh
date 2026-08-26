@@ -133,3 +133,25 @@ parse_mirror_arg() {
     fi
     echo ""
 }
+
+# ── JetPack 线 ────────────────────────────────────────────────────────
+# jetpack_vars <5.11|6.1> —— 把一条 JetPack 线的构建期事实解析出来，设置：
+#   JP_ARG    传给 Dockerfile 的 JP_VERSION build arg（511 / 61），它同时选定
+#             base 镜像，并在镜像内解析出 numpy pin 与 sherpa wheel
+#             （见 perception/Dockerfile.jetson 的 /etc/jetpack.env）
+#   ACC_ARCH  resource-center 的过滤依据（大版本粒度，见 resource-center/lib/arch.ts）：
+#             机器上报自己的 JetPack 线，跑不了的镜像就不会出现在驱动市场里
+#
+# build_perception.sh 与 build_actucore.sh 此前各带一份逐字节相同的 case 块。
+# 新增一条 JetPack 线时改这里一处即可，不必记得还有另一个脚本。
+jetpack_vars() {
+    case "$1" in
+        5.11) JP_ARG=511; ACC_ARCH="jetson-jp5" ;;
+        6.1)  JP_ARG=61;  ACC_ARCH="jetson-jp6" ;;
+        *)
+            echo "Unknown JetPack version: $1 (support: 5.11, 6.1)" >&2
+            return 1
+            ;;
+    esac
+    export JP_ARG ACC_ARCH
+}

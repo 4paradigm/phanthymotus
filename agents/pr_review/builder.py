@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import signal
+import time
 from pathlib import Path
 
 from .config import Config
@@ -199,14 +200,17 @@ async def _build_with_script(
     if env_overrides:
         env.update(env_overrides)
 
-    success = await _run_build(
+    started = time.monotonic()
+    success, timeout_kind = await _run_build(
         ["bash", str(script), *args],
         cwd=str(cwd),
         env=env,
         timeout=config.build_timeout_seconds,
+        idle_timeout=config.build_idle_timeout_seconds,
         log_path=log_path,
         label=label,
     )
+    duration = time.monotonic() - started
 
     return BuildResult(
         target=target,
@@ -216,6 +220,8 @@ async def _build_with_script(
         log_tail=_read_tail(log_path),
         log_path=str(log_path),
         variant=variant,
+        duration_seconds=duration,
+        timeout_kind=timeout_kind,
     )
 
 
@@ -227,10 +233,28 @@ async def _run_build(
     cwd: str,
     env: dict[str, str],
     timeout: int,
+    idle_timeout: int,
     log_path: Path,
     label: str,
-) -> bool:
-    """Run a build, streaming its output to `log_path`. Returns success.
+) -> tuple[bool, str]:
+    """Run a build, streaming its output to `log_path`.
+
+    Returns `(success, timeout_kind)`, where `timeout_kind` is `""` for a build
+    that ended on its own, `"idle"` for one killed for going quiet, and `"cap"`
+    for one killed by the absolute bound.
+
+    Two bounds, because "too slow" and "stuck" are different failures:
+
+    - `idle_timeout` — time since the last byte of output. This is the one that
+      catches a real hang, and the one that should normally fire: a live docker
+      build prints buildx progress, compiler lines, layer exports. A wedged one
+      (network read, lock) prints nothing at all.
+    - `timeout` — total wall clock, as a backstop for a build that prints
+      forever without finishing.
+
+    The wall clock alone used to be the only bound, and it killed a build that
+    was compiling openfst one file at a time, output flowing the whole way —
+    then reported it on the PR as a build failure. Slowness is not a hang.
 
     The subprocess is killed on both timeout and cancellation. Cancellation
     matters because the whole-job timeout cancels this coroutine from the
@@ -260,6 +284,9 @@ async def _run_build(
     # rather than one block per flush.
     log_file = open(log_path, "wb", buffering=0)
 
+    started = time.monotonic()
+    last_output = started
+
     async def pump_and_wait() -> int:
         """Copy the child's output to disk until EOF, then reap it.
 
@@ -267,28 +294,63 @@ async def _run_build(
         raises ValueError once a line exceeds the stream limit (64 KiB by
         default), and docker build output can contain very long single lines.
 
+        Every chunk stamps `last_output` — that timestamp is the liveness
+        signal the idle bound below is built on.
+
         The reap is inside the timed region deliberately — a process that
         closes stdout without exiting would otherwise hang past the timeout.
         """
+        nonlocal last_output
         while True:
             chunk = await proc.stdout.read(READ_CHUNK)
             if not chunk:
                 break
+            last_output = time.monotonic()
             log_file.write(chunk)
         return await proc.wait()
 
     task = asyncio.create_task(pump_and_wait())
 
     try:
-        # Shielded so a timeout or outer cancellation does not kill the task
-        # mid-write; it is drained explicitly below so the partial log survives.
-        returncode = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-    except asyncio.TimeoutError:
-        await _terminate(proc)
-        await _drain(task)
-        log_file.write(f"\n[agent] Build timed out after {timeout}s\n".encode())
-        logger.error(f"Build timed out after {timeout}s: {label}")
-        return False
+        # Waits for whichever bound expires first, then re-checks: output that
+        # arrives while waiting moves the idle deadline, so a slow-but-alive
+        # build keeps extending its own lease.
+        while True:
+            now = time.monotonic()
+            idle_left = idle_timeout - (now - last_output)
+            cap_left = timeout - (now - started)
+            if idle_left <= 0 or cap_left <= 0:
+                quiet_for = int(now - last_output)
+                elapsed = int(now - started)
+                await _terminate(proc)
+                await _drain(task)
+                if idle_left <= 0:
+                    kind = "idle"
+                    note = (
+                        f"no output for {idle_timeout}s "
+                        f"({elapsed:,}s into the build)"
+                    )
+                else:
+                    kind = "cap"
+                    note = (
+                        f"absolute cap of {timeout}s reached; "
+                        f"last output {quiet_for}s ago"
+                    )
+                log_file.write(f"\n[agent] Build killed: {note}\n".encode())
+                logger.error(f"Build killed ({kind}): {label} — {note}")
+                return False, kind
+            try:
+                # Shielded so a timeout or outer cancellation does not kill the
+                # task mid-write; it is drained explicitly below so the partial
+                # log survives.
+                returncode = await asyncio.wait_for(
+                    asyncio.shield(task), timeout=min(idle_left, cap_left)
+                )
+                break
+            except asyncio.TimeoutError:
+                # A bound elapsed — the loop decides which, since output may
+                # have arrived in the meantime.
+                continue
     except asyncio.CancelledError:
         await _terminate(proc)
         await _drain(task)
@@ -301,11 +363,12 @@ async def _run_build(
         log_file.close()
 
     success = returncode == 0
+    took = time.monotonic() - started
     if success:
-        logger.info(f"Build succeeded: {label}")
+        logger.info(f"Build succeeded in {took:.0f}s: {label}")
     else:
-        logger.error(f"Build failed (rc={returncode}): {label}")
-    return success
+        logger.error(f"Build failed (rc={returncode}) after {took:.0f}s: {label}")
+    return success, ""
 
 
 async def _drain(task: asyncio.Task):

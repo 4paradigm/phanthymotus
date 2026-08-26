@@ -1,30 +1,13 @@
 /**
- * skills.js — 技能管理 modal（安装/卸载/浏览/详情/编辑/发布/我的技能/RC登录）
+ * skills.js — 技能管理 modal（安装/卸载/浏览/详情/编辑/发布/我的技能）
+ * 账号登录统一在「我的」（js/account.js）里，这里只留一个入口。
  */
+
+import { isRcLoggedIn as _isRcLoggedIn, rcHeaders as _rcHeaders, showAccount } from './account.js';
 
 let _overlay, _closeBtn, _tabs, _panels;
 let _installedList, _installedEmpty, _browseList, _browseEmpty, _searchInput;
 let _mineList, _mineEmpty, _mineContent, _loginForm;
-
-// ── RC Auth State ────────────────────────────────────────────────────────────
-
-function _getRcToken() { return localStorage.getItem('rc_token'); }
-function _setRcToken(token, role) {
-  localStorage.setItem('rc_token', token);
-  if (role) localStorage.setItem('rc_role', role);
-}
-function _clearRcToken() {
-  localStorage.removeItem('rc_token');
-  localStorage.removeItem('rc_role');
-}
-function _isRcLoggedIn() { return !!_getRcToken(); }
-
-function _rcHeaders() {
-  const h = { 'Content-Type': 'application/json' };
-  const token = _getRcToken();
-  if (token) h['X-RC-Token'] = token;
-  return h;
-}
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 
@@ -67,8 +50,8 @@ export function initSkills() {
     _searchTimer = setTimeout(_loadBrowse, 300);
   });
 
-  // RC Login form
-  document.getElementById('skill-rc-login-form-el').addEventListener('submit', _handleRcLogin);
+  // 登录统一在「我的」里做，这里只留一个入口
+  document.getElementById('skill-rc-login-btn')?.addEventListener('click', () => showAccount());
 
   // My Skills create button
   document.getElementById('skill-mine-create-btn').addEventListener('click', () => _openSkillForm(null));
@@ -81,8 +64,6 @@ export function initSkills() {
   });
   document.getElementById('skill-form-el').addEventListener('submit', _handleSkillFormSubmit);
 
-  // Update login status display
-  _updateLoginStatus();
 }
 
 export function show() {
@@ -93,52 +74,6 @@ export function show() {
 
 export function hide() {
   _overlay.classList.add('hidden');
-}
-
-// ── RC Login ─────────────────────────────────────────────────────────────────
-
-function _updateLoginStatus() {
-  const el = document.getElementById('skill-rc-login-status');
-  if (_isRcLoggedIn()) {
-    el.innerHTML = `<span class="rc-logged-in">RC 已登录</span> <button class="rc-logout-btn" id="rc-logout-btn">退出</button>`;
-    el.querySelector('#rc-logout-btn').addEventListener('click', _handleRcLogout);
-  } else {
-    el.innerHTML = '';
-  }
-}
-
-async function _handleRcLogin(e) {
-  e.preventDefault();
-  const email = document.getElementById('skill-rc-email').value.trim();
-  const password = document.getElementById('skill-rc-password').value;
-  const errorEl = document.getElementById('skill-rc-login-error');
-  errorEl.classList.add('hidden');
-
-  try {
-    const res = await fetch('/api/skills/rc/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier: email, password }),
-    });
-    const data = await res.json();
-    if (data.code === 200 && data.data?.token) {
-      _setRcToken(data.data.token, data.data.role);
-      _updateLoginStatus();
-      _loadMine();
-    } else {
-      errorEl.textContent = data.error || '登录失败';
-      errorEl.classList.remove('hidden');
-    }
-  } catch (err) {
-    errorEl.textContent = '网络错误: ' + err.message;
-    errorEl.classList.remove('hidden');
-  }
-}
-
-function _handleRcLogout() {
-  _clearRcToken();
-  _updateLoginStatus();
-  _loadMine();
 }
 
 // ── Installed tab ─────────────────────────────────────────────────────────
@@ -235,6 +170,7 @@ async function _loadMine() {
     _mineContent.classList.add('hidden');
     return;
   }
+
   _loginForm.classList.add('hidden');
   _mineContent.classList.remove('hidden');
 
@@ -243,8 +179,8 @@ async function _loadMine() {
     const res = await fetch('/api/skills/rc/mine', { headers: _rcHeaders() });
     const json = await res.json();
     if (json.code === 401) {
-      _clearRcToken();
-      _updateLoginStatus();
+      // token 失效：交给「我的」清理并提示，这里只回到未登录态
+      showAccount('登录已过期，请重新登录');
       _loadMine();
       return;
     }

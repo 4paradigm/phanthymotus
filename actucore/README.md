@@ -113,6 +113,6 @@ TOOLS = [
 4. 该卡片需要的依赖加到 `Dockerfile.jetson` 自己的 `RUN` 层
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
-需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照本目录 `main.py` 里 `navigation` 的注册块。
+需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `main.py` 里 `navigation` 的注册块。
 
-本层最完整的范例就是 `plugins/navigation/` —— 一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管两组 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/htmsg/plugin.py`。
+本层最完整的范例是 `plugins/navigation/`：一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/vop.py`。

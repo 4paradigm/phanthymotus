@@ -81,6 +81,49 @@ Flag any added or modified `.env`, key, certificate or credential file.
 `*.example` and `*.sample` are templates and are fine. Look for hardcoded tokens,
 passwords and registry credentials in code and in Dockerfiles.
 
+## Container logs: stdout is a framed stream, not a console
+
+A container's stdout/stderr **is** its Docker log, and the daemon frames every
+write into a record. Two mistakes break that framing badly enough that
+`docker logs` returns nothing at all for the life of the container:
+
+```
+Error grabbing logs: invalid character '\x00' looking for beginning of value
+Error grabbing logs: error unmarshalling log entry: proto: illegal tag 0 (wire type 6)
+```
+
+Flag these:
+
+1. **Any `dup2` / `os.dup` on fd 1 or 2.** `fd 1 == the container log` is an
+   invariant. Redirecting it leaves two buffered writers on one pipe (writes above
+   `PIPE_BUF` are not atomic, so lines interleave and tear a record) and costs
+   every `multiprocessing`/`subprocess` child its stdout, silently. If a native
+   library is noisy, silence it with its own env var, not with fd surgery.
+2. **`truncate`/`> file` against anything under `/var/lib/docker/containers/`.**
+   Truncating a live log resets the file size but not the daemon's write offset;
+   the next write lands past EOF and the kernel NUL-fills the gap, producing the
+   errors above. `docker restart <c>` is the correct way to reclaim log space.
+3. **New `print`/log calls inside a per-frame or per-message callback** (audio
+   chunk, camera frame, IMU, DDS handler, per-RPC). At 10–30 Hz these dominate
+   the log on their own. Require the repo's throttle pattern: log the state
+   *transition* unthrottled, then sample (`if n == 1 or n % 100 == 0`).
+4. **Logging a value that could be `bytes` or attacker-controlled** — audio
+   payloads, image buffers, DDS `response.data`, an HTTP request line. Log
+   `len(...)` or escape and cap (`s.encode('unicode_escape').decode('ascii')[:200]`).
+   With `network_mode: host` a request line is remote input going straight into
+   the log framer.
+5. **A new container or `docker run` without log rotation.** Every
+   `deploy/service.yml` and compose fragment must carry
+   `logging: {driver: local, options: {max-size: 10m, max-file: 3}}`. Note
+   `json-file` with no options is **unbounded** — `local` at least defaults to
+   20m x 5.
+
+New long-running Python entry points, and every `multiprocessing` child entry
+point, should install the atomic line writer (`logsafe.install()`); a spawned
+child does not inherit the parent's `sys.stdout`. See
+`phanthymotus/README.md` § Container Logs and
+`phanthymotus-driver/README_dev.md` § Logging.
+
 ## Correctness, in priority order
 
 1. **Correctness** — bugs, races, unhandled errors, wrong logic. State the

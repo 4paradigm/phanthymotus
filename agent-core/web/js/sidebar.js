@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, canEdit } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 
 let _scroll = null;
@@ -267,10 +267,10 @@ function _buildChip(mcp, tool) {
   chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span><button class="mobile-add-btn" title="添加到画布">+</button>${configBtnHtml}`;
 
   // Mobile add-to-canvas button
-  chip.querySelector('.mobile-add-btn').addEventListener('click', (e) => {
+  chip.querySelector('.mobile-add-btn').addEventListener('click', async (e) => {
     e.stopPropagation();
     e.preventDefault();
-    const added = addCardFromSidebar({
+    const added = await addCardFromSidebar({
       mcpId: mcp.id, toolName: tool.name,
       driverName: mcp.server_name || mcp.name || mcp.id,
       hasConfig: !!hasSharedFields,
@@ -284,7 +284,7 @@ function _buildChip(mcp, tool) {
     chip.querySelector('.chip-config-btn').addEventListener('click', (e) => {
       e.stopPropagation();
       e.preventDefault();
-      _openToolConfigModal(mcp.id, tool.name, configSchema);
+      openToolConfigModal(mcp.id, tool.name, configSchema);
     });
   }
 
@@ -294,8 +294,9 @@ function _buildChip(mcp, tool) {
     _showDetail(mcp, tool);
   });
 
+  chip.addEventListener('pointerdown', () => { ensureEdit(); });
   chip.addEventListener('dragstart', (e) => {
-    if (!canEdit()) { e.preventDefault(); return; }
+    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     chip.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -402,10 +403,10 @@ function _buildToolCard(mcp, tool) {
   });
 
   // Mobile add-to-canvas button
-  card.querySelector('.mobile-add-btn').addEventListener('click', (e) => {
+  card.querySelector('.mobile-add-btn').addEventListener('click', async (e) => {
     e.stopPropagation();
     e.preventDefault();
-    const added = addCardFromSidebar({
+    const added = await addCardFromSidebar({
       mcpId: mcp.id, toolName: tool.name,
       driverName: mcp.server_name || mcp.name || mcp.id,
       hasConfig: !!hasSharedFields,
@@ -418,13 +419,14 @@ function _buildToolCard(mcp, tool) {
   if (hasSharedFields) {
     card.querySelector('.tool-card-config-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      _openToolConfigModal(mcp.id, tool.name, configSchema);
+      openToolConfigModal(mcp.id, tool.name, configSchema);
     });
   }
 
   // Drag (for canvas drop)
+  card.addEventListener('pointerdown', () => { ensureEdit(); });
   card.addEventListener('dragstart', (e) => {
-    if (!canEdit()) { e.preventDefault(); return; }
+    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     card.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -440,6 +442,70 @@ function _buildToolCard(mcp, tool) {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+/**
+ * True for schema types that cannot round-trip through a plain text input.
+ *
+ * Setting `input.value` to an object coerces it to the literal string
+ * "[object Object]", which then gets persisted and pushed to the plugin — where
+ * e.g. perception's ocr does `dict("[object Object]")` and dies. Arrays fail the
+ * same way: the plugin expects a list and gets a string.
+ */
+function _isStructuredField(def) {
+  return def.type === 'object' || def.type === 'array';
+}
+
+/** A comma-separated line is friendlier than JSON for a plain list of strings. */
+function _isStringList(def) {
+  return def.type === 'array' && (def.items || {}).type === 'string';
+}
+
+/** Build the input element for a structured (object/array) config field. */
+function _makeStructuredInput(key, def, saved) {
+  const value = saved !== undefined ? saved : def.default;
+  if (_isStringList(def)) {
+    const input = document.createElement('input');
+    input.className = 'tool-config-input';
+    input.dataset.key = key;
+    input.dataset.valueKind = 'string-list';
+    input.type = 'text';
+    input.placeholder = '逗号分隔，如 person, chair';
+    input.value = Array.isArray(value) ? value.join(', ') : (value == null ? '' : String(value));
+    return input;
+  }
+  const input = document.createElement('textarea');
+  input.className = 'tool-config-input';
+  input.dataset.key = key;
+  input.dataset.valueKind = 'json';
+  input.rows = 4;
+  input.placeholder = def.default != null ? JSON.stringify(def.default, null, 2) : '{ }';
+  input.value = value == null ? '' : JSON.stringify(value, null, 2);
+  return input;
+}
+
+/**
+ * Read one config input into its schema-typed value.
+ * Throws with a field-scoped message when a JSON field will not parse, so the
+ * modal can refuse to save rather than persist a corrupt value.
+ */
+function _readConfigValue(input, def) {
+  const raw = input.value.trim();
+  const kind = input.dataset.valueKind;
+  if (kind === 'string-list') {
+    return raw.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  if (kind === 'json') {
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`${def?.title || input.dataset.key}: JSON 格式错误 — ${err.message}`);
+    }
+  }
+  if (def?.type === 'integer') return parseInt(raw, 10);
+  if (def?.type === 'number')  return parseFloat(raw);
+  if (def?.type === 'boolean') return raw === 'true';
+  return raw;
+}
 
 /** Check if a configSchema has any instance-scope fields. */
 function _hasInstanceFields(configSchema) {
@@ -457,12 +523,12 @@ export function hasSharedRequired(configSchema) {
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
-function _openToolConfigModal(mcpId, toolName, configSchema) {
+export async function openToolConfigModal(mcpId, toolName, configSchema) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
   }
-  if (!canEdit()) return;
+  if (!(await ensureEdit())) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
@@ -613,6 +679,8 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
         errOpt.textContent = 'Failed to load channels';
         input.appendChild(errOpt);
       });
+    } else if (_isStructuredField(def)) {
+      input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -628,14 +696,21 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     bodyEl.appendChild(fieldWrapper);
   }
 
-  // x-show-when / x-hide-when: toggle field visibility based on controlling field value
+  // x-show-when / x-hide-when: toggle field visibility based on controlling field value.
+  // A condition value may be a single value or an array; an array means "any of
+  // these". That is what lets one field depend on a subset of another field's enum
+  // — e.g. the ASR device selector only applies to the models that have GPU
+  // weights, so it hides itself for the rest instead of offering a choice the
+  // plugin would reject.
+  const _condMatches = (condVal, actual) =>
+    Array.isArray(condVal) ? condVal.includes(actual) : actual === condVal;
   function _applyShowWhen() {
     bodyEl.querySelectorAll('.tool-config-field[data-show-when]').forEach(el => {
       const cond = JSON.parse(el.dataset.showWhen);
       let visible = true;
       for (const [condKey, condVal] of Object.entries(cond)) {
         const ctrl = bodyEl.querySelector(`[data-key="${condKey}"]`);
-        if (ctrl && ctrl.value !== condVal) { visible = false; break; }
+        if (ctrl && !_condMatches(condVal, ctrl.value)) { visible = false; break; }
       }
       el.style.display = visible ? '' : 'none';
     });
@@ -644,7 +719,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       let hidden = false;
       for (const [condKey, condVal] of Object.entries(cond)) {
         const ctrl = bodyEl.querySelector(`[data-key="${condKey}"]`);
-        if (ctrl && ctrl.value === condVal) { hidden = true; break; }
+        if (ctrl && _condMatches(condVal, ctrl.value)) { hidden = true; break; }
       }
       el.style.display = hidden ? 'none' : '';
     });
@@ -668,20 +743,20 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   // Handlers
   const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {
-    if (!canEdit()) return;
+    if (!(await ensureEdit())) return;
     const values = {};
-    bodyEl.querySelectorAll('[data-key]').forEach(input => {
-      const v = input.value.trim();
-      if (!v) return;
+    for (const input of bodyEl.querySelectorAll('[data-key]')) {
+      if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') return;
-      const fieldDef = props[input.dataset.key];
-      if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
-      else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
-      else if (fieldDef?.type === 'boolean') values[input.dataset.key] = v === 'true';
-      else values[input.dataset.key] = v;
-    });
+      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      try {
+        values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
+      } catch (err) {
+        alert(err.message);
+        return;
+      }
+    }
 
     // Save to per-tool API
     try {
@@ -784,12 +859,12 @@ function _hideDetail() {
  * Open a config modal for a specific canvas card instance.
  * Only shows fields with scope === "instance".
  */
-export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
+export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
   }
-  if (!canEdit()) return;
+  if (!(await ensureEdit())) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
@@ -935,6 +1010,8 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
         errOpt.textContent = 'Failed to load channels';
         input.appendChild(errOpt);
       });
+    } else if (_isStructuredField(def)) {
+      input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -955,20 +1032,20 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
 
   const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {
-    if (!canEdit()) return;
+    if (!(await ensureEdit())) return;
     const values = {};
-    bodyEl.querySelectorAll('[data-key]').forEach(input => {
-      const v = input.value.trim();
-      if (!v) return;
+    for (const input of bodyEl.querySelectorAll('[data-key]')) {
+      if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') return;
-      const fieldDef = props[input.dataset.key];
-      if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
-      else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
-      else if (fieldDef?.type === 'boolean') values[input.dataset.key] = v === 'true';
-      else values[input.dataset.key] = v;
-    });
+      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      try {
+        values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
+      } catch (err) {
+        alert(err.message);
+        return;
+      }
+    }
 
     try {
       const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {

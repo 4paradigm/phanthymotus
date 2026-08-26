@@ -1,3 +1,6 @@
+import logsafe
+logsafe.install()
+
 import contextlib
 import asyncio
 import json
@@ -121,6 +124,7 @@ def _register_core_mcp(silent=False):
                         'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
+                        'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
                         'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
                         'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
                         'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
@@ -175,9 +179,19 @@ def _register_core_mcp(silent=False):
                     'audio_file': {'type': 'string', 'format': 'file', 'accept': 'audio/*', 'description': '音频文件'},
                 }, 'required': ['action', 'audio_file']},
                 'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}],
+            },
+            {
+                'name': 'remote_image',
+                'type': 'sensor',
+                'description': '远程图片 — 从浏览器上传图片文件，转换为 JPEG 发布到 DDS',
+                'inputSchema': {'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['send_image'], 'description': 'Action to perform'},
+                    'image_file': {'type': 'string', 'format': 'file', 'accept': 'image/*', 'description': '图片文件'},
+                }, 'required': ['action', 'image_file']},
+                'topic_out': [{'topic': '/remote_control/image', 'format': 'image/jpeg'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}],
         'topic_in': [{'format': 'data/json'}],
     })
 
@@ -195,7 +209,12 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_request',
                 'type': 'sensor',
-                'description': 'Channel message input — receive messages from Telegram/Slack and other platforms',
+                'description': (
+                    'Inbound gateway for messaging platforms (Feishu / Telegram / Slack): delivers '
+                    'messages users send from a chat app — including image and file attachments — '
+                    'into the decision core. You never call this tool. The events it produces carry '
+                    'channel="channel:<platform>"; reply to those with channel_reply.'
+                ),
                 'inputSchema': {'type': 'object', 'properties': {}},
                 'configSchema': {
                     'type': 'object',
@@ -214,14 +233,38 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
-                'description': 'Reply to a message from a messaging platform (Feishu/Telegram/Slack). ONLY use this tool when the triggering event has channel="channel:*". Never use for local_mic/remote_mic/remote_web events — those should be answered via TTS/speaker on the robot body.',
+                'description': (
+                    'Send a reply to a user on a messaging platform (Feishu / Telegram / Slack). '
+                    'This is the ONLY way those users receive anything from you — text left in '
+                    '`content` reaches nobody. When the triggering event\'s channel attribute starts '
+                    'with "channel:" (for example channel="channel:feishu"), any reply must go through '
+                    'this tool, and only to that channel. Whether the event warrants a response at all '
+                    'is a separate judgement — see the response rules; when it does not, just finish. '
+                    'Send text, and/or attach files (images, video, documents) through `files` — paths '
+                    'must be under /work or /tmp. Do not use it for on-body channels '
+                    '(local_mic / remote_mic / remote_web); answer those with the robot\'s own output tools.'
+                ),
                 'inputSchema': {
                     'type': 'object',
                     'properties': {
                         'action': {'type': 'string', 'enum': ['send'], 'description': 'Action'},
                         'text': {'type': 'string', 'description': 'Reply text to send to the user'},
+                        'files': {
+                            'type': 'array',
+                            'description': ('Optional files to send. Each item is {"path": "<absolute path inside the container>", '
+                                            '"caption": "<optional>"}. Paths must be under /work or /tmp (e.g. camera snapshots '
+                                            'or files received earlier at /work/resource/channel_files/...). Images ≤10MB, other files ≤30MB on Feishu.'),
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'path': {'type': 'string', 'description': 'Absolute path of the file to send'},
+                                    'caption': {'type': 'string', 'description': 'Optional caption sent with the file'},
+                                },
+                                'required': ['path'],
+                            },
+                        },
                     },
-                    'required': ['action', 'text'],
+                    'required': ['action'],
                 },
                 'configSchema': {
                     'type': 'object',
@@ -288,6 +331,11 @@ async def lifespan(app):
     # 检查宿主是否有 ROS2 DDS 服务
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check_dds)
+
+    # 探测宿主架构（用于向 resource-center 过滤镜像目录）。只是预热 memo 并把值写进
+    # 日志 —— 「为什么这个组件不显示在驱动市场」全靠这一行排查。
+    import hostarch
+    print(f'[startup] host facets: acc_arch={hostarch.acc_arch()} cpu_arch={hostarch.cpu_arch()}')
 
     # 启动 ROS2 bridge（用于 DDS topic 订阅）
     import ros2_bridge
@@ -405,6 +453,12 @@ app_api.include_router(api.agent_definition.router)
 
 import api.skills
 app_api.include_router(api.skills.router)
+
+import api.account
+app_api.include_router(api.account.router)
+
+import api.solutions
+app_api.include_router(api.solutions.router)
 
 import api.history
 app_api.include_router(api.history.router)
@@ -598,6 +652,69 @@ async def _remote_audio_upload(file: fastapi.UploadFile = fastapi.File()):
         return await publish_audio_file(tmp_path)
     finally:
         os.unlink(tmp_path)
+
+# ── Remote Image: convert file to JPEG and publish to ROS2 ─────────────────────
+_image_pub = None
+
+def _ensure_image_pub():
+    """Lazily create the ROS2 publisher for /remote_control/image."""
+    global _image_pub
+    if _image_pub is not None:
+        return _image_pub
+    try:
+        from sensor_msgs.msg import CompressedImage
+        import ros2_bridge
+        node = ros2_bridge._node_main
+        if node:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=1,
+                             durability=DurabilityPolicy.VOLATILE)
+            _image_pub = node.create_publisher(CompressedImage, "/remote_control/image", qos)
+    except Exception:
+        pass
+    return _image_pub
+
+async def publish_image_file(file_path: str) -> dict:
+    """Re-encode arbitrary uploaded image to JPEG (if needed) and publish once to DDS."""
+    import os
+    import subprocess
+    pub = _ensure_image_pub()
+    if not pub:
+        return {'code': 500, 'message': 'ROS2 not available'}
+    if not os.path.isfile(file_path):
+        return {'code': 400, 'message': f'文件不存在: {file_path}'}
+
+    proc = subprocess.run(
+        ['ffmpeg', '-y', '-i', file_path, '-frames:v', '1', '-f', 'mjpeg', 'pipe:1'],
+        capture_output=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return {'code': 400, 'message': f'图片解码失败: {proc.stderr.decode(errors="replace")[:200]}'}
+    jpeg_bytes = proc.stdout
+    if not jpeg_bytes:
+        return {'code': 400, 'message': 'No image data after conversion'}
+
+    width = height = 0
+    try:
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file_path],
+            capture_output=True, timeout=10,
+        )
+        if probe.returncode == 0:
+            w, h = probe.stdout.decode().strip().split(',')
+            width, height = int(w), int(h)
+    except Exception:
+        pass
+
+    from sensor_msgs.msg import CompressedImage
+    msg = CompressedImage()
+    msg.format = "jpeg"
+    msg.data = list(jpeg_bytes)
+    pub.publish(msg)
+
+    return {'code': 200, 'data': {'width': width, 'height': height, 'bytes': len(jpeg_bytes)}}
 
 # ── Mic WebSocket endpoint (receive browser PCM and publish to ROS2) ──────────
 _mic_pub = None

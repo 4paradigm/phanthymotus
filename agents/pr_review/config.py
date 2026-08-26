@@ -66,10 +66,21 @@ class Config:
 
     # Worker
     max_concurrent_jobs: int = 2
-    # Timeout for a single docker build invocation.
-    build_timeout_seconds: int = 1800
-    # Whole-job timeout. A job exceeding this is treated as lost and retried.
-    job_timeout_seconds: int = 3600
+    # What actually bounds a build: time since its last line of output. A live
+    # docker build prints constantly (buildx progress, compiler lines, layer
+    # exports); a wedged one prints nothing. Slowness is not a hang — bounding
+    # by total wall clock killed a build that was compiling openfst one file at
+    # a time, output flowing the whole way, and reported it as a build failure.
+    build_idle_timeout_seconds: int = 600
+    # Absolute backstop for one build, for the case the idle bound cannot see:
+    # a build that prints forever without finishing.
+    build_timeout_seconds: int = 7200
+    # Whole-job backstop. A job exceeding this is treated as lost and retried.
+    # Loose on purpose: every stage below it is already bounded on its own —
+    # git by FETCH_TIMEOUT/GIT_LOCAL_TIMEOUT, the review loop by
+    # review_timeout_seconds, builds by silence — so this is no longer "how long
+    # may a job take" but "the agent itself is stuck".
+    job_timeout_seconds: int = 14400
     # Total attempts per job including the first (3 = two retries).
     max_attempts: int = 3
     retry_backoff_seconds: int = 60
@@ -172,8 +183,9 @@ def load_config() -> Config:
         pr_context_max_chars=_env_int("PR_CONTEXT_MAX_CHARS", 4000),
         pr_context_max_comments=_env_int("PR_CONTEXT_MAX_COMMENTS", 20),
         max_concurrent_jobs=_env_int("MAX_CONCURRENT_JOBS", 2),
-        build_timeout_seconds=_env_int("BUILD_TIMEOUT_SECONDS", 1800),
-        job_timeout_seconds=_env_int("JOB_TIMEOUT_SECONDS", 3600),
+        build_idle_timeout_seconds=_env_int("BUILD_IDLE_TIMEOUT_SECONDS", 600),
+        build_timeout_seconds=_env_int("BUILD_TIMEOUT_SECONDS", 7200),
+        job_timeout_seconds=_env_int("JOB_TIMEOUT_SECONDS", 14400),
         max_attempts=_env_int("MAX_ATTEMPTS", 3),
         retry_backoff_seconds=_env_int("RETRY_BACKOFF_SECONDS", 60),
         job_history_days=_env_int("JOB_HISTORY_DAYS", 30),

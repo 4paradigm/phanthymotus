@@ -1,11 +1,20 @@
 /**
  * motus-stream.js — WebSocket client for /ws/motus.
  * Emits events to registered listeners.
+ *
+ * The connection also carries the tab's session_id: the backend treats it as the
+ * canvas editor lock's liveness signal and releases the lock shortly after this
+ * socket drops. So there must be exactly one connection per tab — connectMotus()
+ * is idempotent for that reason (it is called from both app.js and dashboard.js).
  */
+
+import { sessionId } from './session.js';
 
 let _ws = null;
 let _retryDelay = 1000;
 let _listeners = [];  // Array of { mcpId: string|null, fn: Function }
+let _statusCbs = [];  // Status callbacks from every connectMotus() caller
+let _lastStatus = 'connecting';
 
 export function onMotusEvent(mcpId, fn) {
   _listeners.push({ mcpId, fn });
@@ -15,16 +24,31 @@ export function offMotusEvent(fn) {
   _listeners = _listeners.filter(l => l.fn !== fn);
 }
 
+function _notify(state) {
+  _lastStatus = state;
+  _statusCbs.forEach(cb => { try { cb(state); } catch { /* ignore */ } });
+}
+
 export function connectMotus(onStatusChange) {
-  const _cb = onStatusChange || (() => {});
+  if (onStatusChange) {
+    _statusCbs.push(onStatusChange);
+    onStatusChange(_lastStatus);   // late caller still gets the current state
+  }
+  // Already connected/connecting: reuse it. Opening a second socket would leak
+  // the old one (still open, just unreferenced) and make this tab look like two
+  // live sessions to the editor lock.
+  if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const token = localStorage.getItem('phanthy_access_token') || '';
-    _ws = new WebSocket(`${proto}://${location.host}/ws/motus?token=${encodeURIComponent(token)}`);
+    _ws = new WebSocket(`${proto}://${location.host}/ws/motus`
+      + `?token=${encodeURIComponent(token)}&session_id=${encodeURIComponent(sessionId())}`);
 
     _ws.onopen = () => {
       _retryDelay = 1000;
-      _cb('connected');
+      _notify('connected');
     };
 
     _ws.onmessage = (e) => {
@@ -34,13 +58,13 @@ export function connectMotus(onStatusChange) {
     };
 
     _ws.onclose = () => {
-      _cb('connecting');
+      _notify('connecting');
       setTimeout(connect, _retryDelay);
       _retryDelay = Math.min(_retryDelay * 2, 30000);
     };
 
     _ws.onerror = () => {
-      _cb('error');
+      _notify('error');
     };
   }
   connect();

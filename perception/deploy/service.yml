@@ -1,6 +1,14 @@
 perception:
   image: __IMAGE__
   container_name: embodied-perception
+  # The L4T base image ships zero-length placeholders for the driver libraries
+  # (/usr/lib/aarch64-linux-gnu/nvidia/libnvdla_compiler.so and friends); only
+  # the nvidia runtime bind-mounts the host's real ones over them. Under the
+  # default runc runtime the placeholders stay, so `import tensorrt` dies with
+  # "libnvdla_compiler.so: file too short" and torch.cuda.is_available() is
+  # False — i.e. no GPU at all for OCR, VOP or VITS2 TTS, whatever privileged
+  # and /dev:/dev suggest. Same flag the adam driver uses.
+  runtime: nvidia
   network_mode: host
   ipc: host
   pid: host

@@ -57,13 +57,55 @@ _LOW_LAT_QOS = QoSProfile(
 import re as _re
 
 # ── Persistent EspeakBackend instances (avoid 70ms+ re-init per call) ─────────
+#
+# The espeak library has to be pointed at explicitly. phonemizer locates it with
+# ctypes.util.find_library('espeak-ng'), which on Linux shells out to `ldconfig -p`
+# — and libespeak-ng is absent from the ld cache in the jetson image, because
+# Dockerfile.jetson stubs ldconfig out during apt installs to survive qemu and the
+# cache is never rebuilt. So find_library returns None, EspeakBackend raises
+# "espeak not installed", and phonemization silently degrades to matching raw
+# characters.
+#
+# That cost 5.2 s per utterance in production, measured from the plugin's own
+# kws_phonemize span. _text_to_ipa splits an utterance into CJK/non-CJK segments
+# (4 for '小范小范，你好。', since fullwidth punctuation is not in the CJK range),
+# _phonemize_safe used to retry each failure once, and every attempt forked
+# `ldconfig` from a 3.6 GB multi-threaded process. Eight subprocess spawns per
+# utterance. Out of process the same call took 320 ms, which is why this only ever
+# showed up in the span data.
 _ESPEAK_BACKENDS = {}  # lang -> EspeakBackend instance
 _ESPEAK_SEP = None
+_ESPEAK_UNAVAILABLE = None   # str reason once probing has failed; see below
+_ESPEAK_LIB_CANDIDATES = (
+    "/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1",
+    "/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1",
+    "/usr/lib/libespeak-ng.so.1",
+    "/usr/local/lib/libespeak-ng.so.1",
+)
+
+
+def _point_phonemizer_at_espeak() -> None:
+    """Tell phonemizer where libespeak-ng is, since the ld cache will not.
+
+    PHONEMIZER_ESPEAK_LIBRARY wins if the deployment already set it. Otherwise the
+    first candidate that exists is used — cheap `os.path.exists` checks rather than
+    find_library's subprocess.
+    """
+    if os.environ.get("PHONEMIZER_ESPEAK_LIBRARY"):
+        return
+    for path in _ESPEAK_LIB_CANDIDATES:
+        if os.path.exists(path):
+            os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = path
+            log.info("[asr] phonemizer: using espeak library at %s", path)
+            return
+    log.warning("[asr] phonemizer: no libespeak-ng found in %s",
+                ", ".join(_ESPEAK_LIB_CANDIDATES))
 
 
 def _get_espeak_backend(lang):
     global _ESPEAK_SEP
     if _ESPEAK_SEP is None:
+        _point_phonemizer_at_espeak()
         from phonemizer.separator import Separator
         _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
     if lang not in _ESPEAK_BACKENDS:
@@ -73,51 +115,126 @@ def _get_espeak_backend(lang):
 
 
 def _phonemize_safe(text: str, lang: str) -> str:
-    """Phonemize with persistent backend; auto-rebuild on failure."""
-    backend = _get_espeak_backend(lang)
+    """Phonemize with a persistent backend, rebuilding once if espeak crashed.
+
+    A construction failure is remembered and never retried: espeak either resolves
+    or it does not, and retrying it per segment per utterance is what turned a
+    misconfiguration into 5.2 s of latency. `_text_to_ipa` still falls back to
+    characters, so a genuinely missing espeak degrades in quality, not in speed.
+    """
+    global _ESPEAK_UNAVAILABLE
+    if _ESPEAK_UNAVAILABLE is not None:
+        raise RuntimeError(_ESPEAK_UNAVAILABLE)
+    try:
+        backend = _get_espeak_backend(lang)
+    except Exception as error:  # noqa: BLE001 - espeak absent or unloadable
+        _ESPEAK_UNAVAILABLE = f"espeak unavailable: {error}"
+        log.error("[asr] phonemizer unusable, asr_kws will match on characters "
+                  "instead of phonemes: %s", error)
+        raise
     try:
         return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
     except Exception:
-        # espeak-ng may have crashed — rebuild backend and retry once
+        # espeak-ng may have crashed mid-run — rebuild the backend and retry once.
+        # Only reachable when construction previously succeeded.
         _ESPEAK_BACKENDS.pop(lang, None)
         backend = _get_espeak_backend(lang)
         return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
 
 
-def _text_to_ipa(text: str) -> list:
-    """Convert text to IPA phoneme sequence using persistent espeak-ng backend.
-    Returns a list of IPA phoneme strings (one per word/character).
-    """
-    # Separate Chinese and non-Chinese segments
-    segments = []
-    current = ''
-    current_is_cjk = None
-    for char in text:
-        is_cjk = '\u4e00' <= char <= '\u9fff'
-        if current_is_cjk is None:
-            current_is_cjk = is_cjk
-        if is_cjk != current_is_cjk:
-            if current.strip():
-                segments.append((current.strip(), current_is_cjk))
-            current = ''
-            current_is_cjk = is_cjk
-        current += char
-    if current.strip():
-        segments.append((current.strip(), current_is_cjk))
 
+def _text_segments(text: str):
+    """Runs of CJK / non-CJK as `(start, end, is_cjk)` offsets into `text`.
+
+    Offsets rather than substrings because a phoneme index has to be mapped back to
+    a character index, and the previous code `strip()`ed each run before handing it
+    on, which silently broke that correspondence.
+    """
+    spans = []
+    run_start = None
+    run_is_cjk = None
+    for i, char in enumerate(text):
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        if run_is_cjk is None:
+            run_start, run_is_cjk = i, is_cjk
+        elif is_cjk != run_is_cjk:
+            spans.append((run_start, i, run_is_cjk))
+            run_start, run_is_cjk = i, is_cjk
+    if run_is_cjk is not None:
+        spans.append((run_start, len(text), run_is_cjk))
+
+    trimmed = []
+    for seg_start, seg_end, is_cjk in spans:
+        while seg_start < seg_end and text[seg_start].isspace():
+            seg_start += 1
+        while seg_end > seg_start and text[seg_end - 1].isspace():
+            seg_end -= 1
+        if seg_start < seg_end:
+            trimmed.append((seg_start, seg_end, is_cjk))
+    return trimmed
+
+
+def _segment_phones(seg_text: str, lang: str):
+    """``(phones, phonemized)``; phonemized is False on the character fallback."""
+    try:
+        ipa = _phonemize_safe(seg_text, lang)
+        # Remove tone numbers and diacritics for fuzzy matching
+        ipa = _re.sub(r'[0-9\u02e5\u02e6\u02e7\u02e8\u02e9\xb9\xb2\xb3\u2074\u2075]', '', ipa)
+        return [p for p in ipa.split() if p], True
+    except Exception:
+        return list(seg_text), False
+
+
+def _phone_char_ends(text: str, start: int, end: int, lang: str,
+                     phones: list, phonemized: bool) -> list:
+    """For one segment, the character offset each of its phonemes ends at.
+
+    Counted from growing prefixes of the segment, phonemized with the same function
+    that produced ``phones``, so the mapping is exact. The previous code
+    extrapolated it from a phonemes-per-character ratio, which ate a character
+    whenever that ratio was not uniform: for '\u5c0f\u6f58\u5c0f\u6f58\uff0c\u73b0\u5728\u53d1\u751f\u4ec0\u4e48\u4e86\uff1f' with end_pos=12 it
+    computed round(12 * 11 / 29) = 5 and cut five characters, dropping \u73b0 from the
+    result. It also measured that ratio over a *different* segmentation, since it
+    skipped punctuation where _text_to_ipa splits on it.
+    """
+    if not phonemized:
+        # One "phoneme" per character, so the mapping is the identity.
+        return list(range(start + 1, end + 1))
+    ends = []
+    for i in range(start + 1, end + 1):
+        prefix_phones, ok = _segment_phones(text[start:i], lang)
+        if not ok:
+            break
+        target = min(len(prefix_phones), len(phones))
+        while len(ends) < target:
+            ends.append(i)
+    # Phonemizing the whole segment can yield more phonemes than any prefix did —
+    # espeak is context-sensitive and warns about word-count mismatches on Chinese.
+    # Attribute the remainder to the segment's last character.
+    while len(ends) < len(phones):
+        ends.append(end)
+    return ends
+
+
+def _text_to_ipa(text: str, with_positions: bool = False):
+    """Convert text to an IPA phoneme sequence using the persistent espeak backend.
+
+    Returns the phoneme list, or ``(phones, char_ends)`` when ``with_positions`` is
+    set, where ``char_ends[i]`` is the offset in ``text`` just past the last
+    character that produced ``phones[i]``. Positions cost one phonemize call per
+    character, so they are opt-in — only asr_kws needs them, to find where the wake
+    word ends.
+    """
     ipa_seq = []
-    for seg_text, is_cjk in segments:
+    char_ends = []
+    for seg_start, seg_end, is_cjk in _text_segments(text):
         lang = 'cmn' if is_cjk else 'en-us'
-        try:
-            ipa = _phonemize_safe(seg_text, lang)
-            # Remove tone numbers and diacritics for fuzzy matching
-            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
-            phones = [p for p in ipa.split() if p]
-            ipa_seq.extend(phones)
-        except Exception:
-            # Fallback: use characters as-is
-            ipa_seq.extend(list(seg_text))
-    return ipa_seq
+        phones, phonemized = _segment_phones(text[seg_start:seg_end], lang)
+        if with_positions:
+            char_ends.extend(_phone_char_ends(text, seg_start, seg_end, lang,
+                                              phones, phonemized))
+        ipa_seq.extend(phones)
+    return (ipa_seq, char_ends) if with_positions else ipa_seq
 
 
 def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
@@ -196,70 +313,20 @@ def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
     return best_dist <= threshold, best_end
 
 
-def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
-    """Extract text after the matched keyword using IPA end_pos to locate cut point.
+def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
+    """The text following the phoneme at ``end_pos - 1``, by exact character offset.
 
-    end_pos is the IPA phoneme index where the keyword match ends.
-    We map this back to the original text by counting phoneme-producing
-    characters and their IPA token counts per segment.
+    ``char_ends`` comes from ``_text_to_ipa(text, with_positions=True)``, so this is
+    a lookup rather than the estimate it replaces — and it needs no second
+    phonemization pass, which used to redo the work with a *different* segmentation
+    (it skipped punctuation where _text_to_ipa splits on it) and therefore could not
+    have agreed with the index it was given.
     """
-    # Build segments of phoneme-producing characters
-    segments = []
-    current = ''
-    current_is_cjk = None
-    for char in text:
-        is_cjk = '\u4e00' <= char <= '\u9fff'
-        is_alpha = char.isalpha()
-        if not is_cjk and not is_alpha:
-            continue
-        if current_is_cjk is None:
-            current_is_cjk = is_cjk
-        if is_cjk != current_is_cjk:
-            if current.strip():
-                segments.append((current.strip(), current_is_cjk))
-            current = ''
-            current_is_cjk = is_cjk
-        current += char
-    if current.strip():
-        segments.append((current.strip(), current_is_cjk))
+    if end_pos <= 0 or not char_ends:
+        return ''
+    cut = char_ends[min(end_pos, len(char_ends)) - 1]
+    return text[cut:].lstrip('\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a,.!?;: ')
 
-    # Count IPA tokens per segment to find the text position for end_pos
-    ipa_idx = 0
-    phoneme_char_pos = 0
-
-    for seg_text, is_cjk in segments:
-        lang = 'cmn' if is_cjk else 'en-us'
-        try:
-            ipa = _phonemize_safe(seg_text, lang)
-            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
-            phones = [p for p in ipa.split() if p]
-        except Exception:
-            phones = list(seg_text)
-
-        seg_ipa_count = len(phones)
-        if ipa_idx + seg_ipa_count >= end_pos:
-            offset_in_seg = end_pos - ipa_idx
-            chars_in_seg = len(seg_text)
-            if seg_ipa_count > 0:
-                cut_chars = round(offset_in_seg * chars_in_seg / seg_ipa_count)
-            else:
-                cut_chars = chars_in_seg
-            cut_chars = min(cut_chars, chars_in_seg)
-
-            found = 0
-            for i, c in enumerate(text):
-                if '\u4e00' <= c <= '\u9fff' or c.isalpha():
-                    found += 1
-                if found >= phoneme_char_pos + cut_chars:
-                    cut_idx = i + 1
-                    remaining = text[cut_idx:]
-                    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
-                    return remaining
-            return ''
-        ipa_idx += seg_ipa_count
-        phoneme_char_pos += len(seg_text)
-
-    return ''
 
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -293,6 +360,18 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                # Which weights each device loads is in ASR_MODELS; only models
+                # with a verified gpu entry list one, so x-show-when hides this
+                # field for the rest rather than offering a choice that would be
+                # rejected. Keep the list in sync with ASR_MODELS — the unit test
+                # test_asr_device_registry.py asserts they match.
+                "device":        {"type": "string", "enum": ["cpu", "gpu"],
+                                  "description": "Inference device. gpu loads non-quantised weights "
+                                                 "(~2.5x faster per utterance) but costs ~2 GB RAM "
+                                                 "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
+                                                 "never gives back — check headroom before enabling",
+                                  "default": "cpu", "scope": "shared",
+                                  "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small"]}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -333,30 +412,33 @@ class ASRAdapter(ABC):
 class SherpaOnnxASRAdapter(ASRAdapter):
     """On-device streaming ASR using sherpa-onnx paraformer (no network required)."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
-        ensure_model("asr", model_dir)
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
-        # Streaming paraformer uses encoder + decoder (not a single model file)
-        encoder_path = os.path.join(model_dir, "encoder.int8.onnx")
-        if not os.path.exists(encoder_path):
-            encoder_path = os.path.join(model_dir, "encoder.onnx")
-        decoder_path = os.path.join(model_dir, "decoder.int8.onnx")
-        if not os.path.exists(decoder_path):
-            decoder_path = os.path.join(model_dir, "decoder.onnx")
+        # Streaming paraformer uses encoder + decoder (not a single model file).
+        # Candidate order flips with the device: a gpu bundle holds fp32 weights,
+        # a cpu bundle holds int8. See utils/onnx_provider.py for why.
+        enc = ("encoder.onnx", "encoder.int8.onnx") if device == "gpu" else \
+              ("encoder.int8.onnx", "encoder.onnx")
+        dec = ("decoder.onnx", "decoder.int8.onnx") if device == "gpu" else \
+              ("decoder.int8.onnx", "decoder.onnx")
+        encoder_path = pick_weights(model_dir, *enc)
+        decoder_path = pick_weights(model_dir, *dec)
         tokens_path = os.path.join(model_dir, "tokens.txt")
+        provider = provider_for_device(device, (encoder_path, decoder_path))
 
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
             encoder=encoder_path,
             decoder=decoder_path,
             tokens=tokens_path,
             num_threads=num_threads,
-            provider=hw_provider,
+            provider=provider,
             sample_rate=SAMPLE_RATE,
             decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx paraformer adapter loaded: encoder={encoder_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx paraformer adapter loaded: encoder={encoder_path}, "
+                 f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -382,14 +464,16 @@ class SherpaOnnxASRAdapter(ASRAdapter):
 class SherpaOnnxZipformerAdapter(ASRAdapter):
     """On-device streaming ASR using sherpa-onnx zipformer transducer (English)."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
-        ensure_model("asr_en", model_dir)
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import provider_for_device
 
         import sherpa_onnx
         import glob as _glob
 
-        # Find encoder/decoder/joiner (prefer int8 + chunk-16)
+        # Find encoder/decoder/joiner (prefer chunk-16; dtype follows the device —
+        # int8 for cpu, non-int8 for gpu, see utils/onnx_provider.py)
+        prefer_int8 = device != "gpu"
+
         def _find(prefix, prefer_int8=True):
             pattern = os.path.join(model_dir, f"{prefix}-*.onnx")
             files = _glob.glob(pattern)
@@ -407,25 +491,29 @@ class SherpaOnnxZipformerAdapter(ASRAdapter):
                     return fp32f[0]
             return cands[0]
 
-        encoder_path = _find("encoder", prefer_int8=True)
+        encoder_path = _find("encoder", prefer_int8=prefer_int8)
+        # The decoder is tiny, so the fp32 copy is preferred on both devices.
         decoder_path = _find("decoder", prefer_int8=False)
-        joiner_path = _find("joiner", prefer_int8=True)
+        joiner_path = _find("joiner", prefer_int8=prefer_int8)
         tokens_path = os.path.join(model_dir, "tokens.txt")
 
         if not all([encoder_path, decoder_path, joiner_path]):
             raise RuntimeError(f"[asr] zipformer model files not found in {model_dir}")
 
+        provider = provider_for_device(
+            device, (encoder_path, decoder_path, joiner_path))
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
             encoder=encoder_path,
             decoder=decoder_path,
             joiner=joiner_path,
             tokens=tokens_path,
             num_threads=num_threads,
-            provider=hw_provider,
+            provider=provider,
             sample_rate=SAMPLE_RATE,
             decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx zipformer adapter loaded: encoder={encoder_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx zipformer adapter loaded: encoder={encoder_path}, "
+                 f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -453,25 +541,31 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
     code-switching scenarios. Uses sherpa_onnx.OfflineRecognizer.
     """
 
-    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
-        ensure_model("asr_sensevoice", model_dir)
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
-        model_path = os.path.join(model_dir, "model.int8.onnx")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(model_dir, "model.onnx")
+        # The gpu bundle ships fp16 (fastest here); the cpu bundle ships int8.
+        # fp32 is listed as a middle fallback for a hand-assembled directory.
+        # fp16 on CUDA is NOT transcript-identical — see the note on the
+        # sensevoice gpu entry in ASR_MODELS.
+        names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
+            if device == "gpu" else \
+            ("model.int8.onnx", "model.onnx")
+        model_path = pick_weights(model_dir, *names)
         tokens_path = os.path.join(model_dir, "tokens.txt")
+        provider = provider_for_device(device, (model_path,))
 
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=model_path,
             tokens=tokens_path,
             num_threads=num_threads,
-            provider=hw_provider,
+            provider=provider,
             use_itn=True,
             language="auto",
         )
-        log.info(f"[asr] sherpa-onnx sensevoice adapter loaded: model={model_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx sensevoice adapter loaded: model={model_path}, "
+                 f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -497,25 +591,27 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
     Uses sherpa_onnx.OfflineRecognizer.from_paraformer.
     """
 
-    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
-        ensure_model("asr_paraformer_offline", model_dir)
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
-        model_path = os.path.join(model_dir, "model.int8.onnx")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(model_dir, "model.onnx")
+        names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
+            if device == "gpu" else \
+            ("model.int8.onnx", "model.onnx")
+        model_path = pick_weights(model_dir, *names)
         tokens_path = os.path.join(model_dir, "tokens.txt")
+        provider = provider_for_device(device, (model_path,))
 
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
             paraformer=model_path,
             tokens=tokens_path,
             num_threads=num_threads,
-            provider=hw_provider,
+            provider=provider,
             sample_rate=SAMPLE_RATE,
             decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx offline paraformer adapter loaded: model={model_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx offline paraformer adapter loaded: "
+                 f"model={model_path}, device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -535,64 +631,201 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
 class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "cpu", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
         from plugins.x_asr import XASRAdapter
 
-        ensure_model("asr_x_asr", model_dir)
-        self._delegate = XASRAdapter(model_dir, hw_provider, num_threads)
+        self._delegate = XASRAdapter(model_dir, device, num_threads)
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self._delegate.transcribe(wav_bytes, language)
 
 
-# ASR model registry
+# ASR model registry.
+#
+# `devices` maps the config's `device` value to the weights that device loads.
+# Quantised weights are the right choice on the CPU and the wrong one on the GPU
+# (ONNX Runtime's CUDA provider has no int8 kernels and falls back per node), so
+# the two devices generally want different files — which is the whole reason this
+# is a table rather than one directory per model. `download` is the
+# model_downloader key; `gpu` entries are size/SHA256-pinned bundles fetched with
+# ensure_gpu_model, `cpu` entries are the legacy archives fetched with ensure_model.
+#
+# A `gpu` entry is only listed after that (model, device) pair was benchmarked AND
+# its transcripts were read. Speed and self-consistency are not sufficient
+# evidence: streaming paraformer fp16 on CUDA was fast, identical across thread
+# counts, and emitted nothing but `</s>`. See utils/onnx_provider.py for the
+# measurements and perception/README.md for the admission checklist.
 ASR_MODELS = {
     "x-asr-zh-en": {
         "label": "X-ASR Bilingual (zh+en, offline transducer)",
         "adapter": SherpaOnnxXASRAdapter,
-        "default_model_dir": "/models/sherpa-onnx/x-asr-zh-en",
+        "devices": {
+            # No gpu entry: measured 0.80x on CUDA at matched threads. Its bundle
+            # is mixed precision (int8 encoder+joiner, fp32 decoder) and the int8
+            # parts are enough to make the GPU lose.
+            "cpu": {"download": "asr_x_asr", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/x-asr-zh-en"},
+        },
     },
     "paraformer-zh-en": {
         "label": "Paraformer Bilingual (zh+en, streaming)",
         "adapter": SherpaOnnxASRAdapter,
-        "default_model_dir": "/models/sherpa-onnx/asr",
+        "devices": {
+            "cpu": {"download": "asr", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/asr"},
+            # fp32, not fp16: fp16 on CUDA emits only `</s>` for this model, and
+            # is slower than fp32 anyway (2077 ms vs 1859 ms).
+            "gpu": {"download": "asr_gpu", "dtype": "fp32",
+                    "dir": "/models/sherpa-onnx/asr-gpu"},
+        },
     },
     "paraformer-offline": {
         "label": "Paraformer Offline (zh+en, small)",
         "adapter": SherpaOnnxOfflineParaformerAdapter,
-        "default_model_dir": "/models/sherpa-onnx/asr-paraformer-offline",
+        "devices": {
+            # No gpu entry: no non-quantised variant has been built or measured.
+            "cpu": {"download": "asr_paraformer_offline", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/asr-paraformer-offline"},
+        },
     },
     "zipformer-en": {
         "label": "Zipformer English (streaming)",
         "adapter": SherpaOnnxZipformerAdapter,
-        "default_model_dir": "/models/sherpa-onnx/asr-en",
+        "devices": {
+            # No gpu entry: not measured.
+            "cpu": {"download": "asr_en", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/asr-en"},
+        },
     },
     "sensevoice-small": {
         "label": "SenseVoice Small (zh+en+ja+ko+yue)",
         "adapter": SherpaOnnxSenseVoiceAdapter,
-        "default_model_dir": "/models/sherpa-onnx/sensevoice",
+        "devices": {
+            "cpu": {"download": "asr_sensevoice", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/sensevoice"},
+            # fp16: 344 ms vs 416 ms for fp32 on CUDA, and half the size.
+            #
+            # KNOWN DEFECT, not fixed here: fp16 under the CUDA provider returns an
+            # **empty** transcript for some inputs. Reproduced deterministically
+            # (5/5) on the KWS bundle's own en_0.wav, 6.6 s of clear English at
+            # 0.535 FS, while en_1.wav and all seven Chinese files decode
+            # identically to cpu. Isolated to the provider, not the weights: the
+            # same model.fp16.onnx on the *cpu* provider transcribes en_0
+            # correctly. Present on both lines — onnxruntime-gpu 1.16.0 (jp5.11)
+            # and 1.18.1 (jp6.1) — so it is not a property of either wheel.
+            #
+            # An earlier comment here claimed fp16 was "transcript-identical to
+            # fp32 on both providers". It is not, and the failure mode is silent:
+            # an empty transcript is indistinguishable from silence, so the
+            # utterance is simply lost. Weigh that against the ~7x latency win
+            # before turning `device: gpu` on for this model.
+            "gpu": {"download": "asr_sensevoice_gpu", "dtype": "fp16",
+                    "dir": "/models/sherpa-onnx/sensevoice-gpu"},
+        },
     },
 }
 
+DEFAULT_ASR_MODEL = "sensevoice-small"
+
+
+def asr_models_supporting(device: str) -> list[str]:
+    """Model names whose registry entry has weights for this device."""
+    return sorted(name for name, info in ASR_MODELS.items()
+                  if device in info["devices"])
+
+
+_REGISTRY_DIRS = {spec["dir"]
+                  for info in ASR_MODELS.values()
+                  for spec in info["devices"].values()}
+
+
+def _model_dir_for(cfg: dict, spec: dict) -> str:
+    """Honour an explicit `model_dir`, unless it is another entry's default.
+
+    config.yaml ships a `model_dir` for the one bundle it was written for. Carrying
+    that path over to a different model — or to the same model's other device —
+    would download the wrong weights into it. Same intent as the pre-`device`
+    guard, extended across devices.
+    """
+    requested = cfg.get('model_dir')
+    if not requested or (requested in _REGISTRY_DIRS and requested != spec["dir"]):
+        return spec["dir"]
+    return requested
+
 
 def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
-    model_name = cfg.get('asr_model', 'paraformer-zh-en')
+    from utils.onnx_provider import normalize_device
+
+    model_name = cfg.get('asr_model', DEFAULT_ASR_MODEL)
     model_info = ASR_MODELS.get(model_name)
     if not model_info:
-        log.warning(f"[asr] unknown model '{model_name}', falling back to paraformer-zh-en")
-        model_info = ASR_MODELS["paraformer-zh-en"]
-        model_name = "paraformer-zh-en"
+        log.warning(f"[asr] unknown model '{model_name}', falling back to "
+                    f"{DEFAULT_ASR_MODEL}")
+        model_name = DEFAULT_ASR_MODEL
+        model_info = ASR_MODELS[model_name]
 
-    model_dir = cfg.get('model_dir', model_info["default_model_dir"])
-    # If model_dir points to another model's default, use correct default
-    other_defaults = [v["default_model_dir"] for k, v in ASR_MODELS.items() if k != model_name]
-    if model_dir in other_defaults:
-        model_dir = model_info["default_model_dir"]
+    device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    if device not in model_info["devices"]:
+        # Degrade rather than refuse to boot: a baked config.yaml asking for a
+        # device this model has no verified weights for should still come up on
+        # CPU. The `config` action validates up front and reports the error there,
+        # where someone is watching.
+        log.warning("[asr] model '%s' has no '%s' weights — it was either measured "
+                    "slower there or never verified. Using cpu. Models with %s "
+                    "support: %s", model_name, device, device,
+                    ", ".join(asr_models_supporting(device)) or "(none)")
+        device = "cpu"
+    spec = model_info["devices"][device]
 
-    hw_provider = cfg.get('hw_provider', 'cpu')
+    model_dir = _model_dir_for(cfg, spec)
+    if device == "gpu":
+        # Size/SHA256-pinned: these are the largest downloads in the stack.
+        from utils.model_downloader import ensure_gpu_model
+        ensure_gpu_model(spec["download"], model_dir)
+    else:
+        from utils.model_downloader import ensure_model
+        ensure_model(spec["download"], model_dir)
+
     num_threads = int(cfg.get('num_threads', 2))
-    return model_info["adapter"](model_dir, hw_provider, num_threads)
+    adapter = model_info["adapter"](model_dir, device, num_threads)
+    if cfg.get('warmup', True):
+        _warmup_adapter(adapter, model_name, device)
+    return adapter
+
+
+def _silence_wav(seconds: float = 1.0) -> bytes:
+    import io
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(b'\x00\x00' * int(SAMPLE_RATE * seconds))
+    return buf.getvalue()
+
+
+def _warmup_adapter(adapter: ASRAdapter, model_name: str, device: str) -> None:
+    """Decode one second of silence so the first real utterance is not the one
+    that pays initialisation.
+
+    On CUDA the first inference measured 1777 ms against a 77 ms steady state —
+    lazy kernel loading, cuDNN autotuning and the memory pool all land on it. That
+    is precisely the utterance an operator notices, because it arrives right after
+    the model finished loading. Warming up here moves the cost inside the `loading`
+    window the dashboard is already showing.
+
+    Best-effort: a model that cannot decode silence is not necessarily broken (and
+    would fail loudly on the first real utterance anyway), so a failure here is
+    logged and does not stop the plugin from coming up.
+    """
+    t0 = time.monotonic()
+    try:
+        adapter.transcribe(_silence_wav(), 'zh-CN')
+    except Exception as error:  # noqa: BLE001
+        log.warning("[asr] warmup of %s on %s failed: %s", model_name, device, error)
+        return
+    log.info("[asr] warmup: %s on %s took %.0f ms", model_name, device,
+             (time.monotonic() - t0) * 1000)
 
 
 # ── VAD Worker Process ────────────────────────────────────────────────────────
@@ -602,14 +835,27 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 backend: str, threshold: float, silence_ms: int,
                 kws_cfg: dict = None,
                 save_vad_segments: bool = False, max_saved_segments: int = 1000,
-                pre_roll_ms: int = 500):
+                pre_roll_ms: int = 500, log_level: int = logging.INFO):
     """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
     - If kws_cfg is provided and enabled, only output utterances after keyword detected
     - Otherwise (kws disabled), output all utterances (backward compat)
     """
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
+    # A spawned child gets a fresh interpreter and does not inherit the parent's
+    # sys.stdout object, so the atomic writer has to be reinstalled here.
+    try:
+        from utils import logsafe
+        logsafe.install(check_fd=False)
+    except Exception:
+        pass
+
+    # This runs in a spawned child, which has no handlers of its own — so
+    # basicConfig is right here. The level comes from the parent rather than
+    # being hardcoded to DEBUG: this is the per-audio-frame path, and a child
+    # quietly logging at DEBUG while the parent is at INFO was the single
+    # largest log-volume amplifier in the stack.
+    logging.basicConfig(level=log_level, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                         datefmt='%H:%M:%S')
     _log = logging.getLogger("asr.vad_worker")
 
@@ -632,6 +878,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         ),
         sample_rate=SAMPLE_RATE,
         num_threads=1,
+        # CPU on purpose, even when the image has the CUDA-enabled wheel and ASR
+        # runs on the GPU: silero VAD infers one 512-sample window at a time, so
+        # a CUDA session pays a kernel launch plus a H2D/D2H copy per 32 ms of
+        # audio for a model small enough to finish on one core. It would also
+        # hold a second CUDA context in this child process. Only ASR, KWS and
+        # hold a second CUDA context in this child process. Only ASR and the
+        # sherpa TTS engine follow `device`.
         provider="cpu",
     )
     vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
@@ -697,6 +950,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     joiner=joiner,
                     keywords_file=kws_keywords_file,
                     num_threads=1,
+                    # KWS is pinned to CPU. Its zipformer bundle ships int8 only,
+                    # and int8 on CUDA measured slower than CPU on every model
+                    # tried — so there is nothing to gain and the `device` setting
+                    # deliberately does not reach here. See utils/onnx_provider.py.
                     provider="cpu",
                     keywords_score=1.5,
                     keywords_threshold=0.1,
@@ -1000,7 +1257,7 @@ class _ASRNode(Node):
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                   self._kws_cfg, self._save_vad_segments, self._max_saved_segments,
-                  self._vad_pre_roll_ms),
+                  self._vad_pre_roll_ms, log.getEffectiveLevel()),
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
@@ -1236,7 +1493,8 @@ class _ASRNode(Node):
                 # ASR-based keyword spotting
                 if trigger_mode == 'asr_kws' and keyword_ipa:
                     _t1 = time.time()
-                    text_ipa = _text_to_ipa(text)
+                    text_ipa, text_char_ends = _text_to_ipa(
+                        text, with_positions=True)
                     _spans.append({"span": "kws_phonemize", "component": "perception",
                                    "start_ts": _t1, "end_ts": time.time(),
                                    "meta": {"text": text[:20]}})
@@ -1251,7 +1509,7 @@ class _ASRNode(Node):
                     if not matched:
                         continue
                     # Extract text after keyword
-                    remaining = _extract_after_keyword(text, kw_text, end_pos)
+                    remaining = _text_after_phoneme(text, text_char_ends, end_pos)
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
                     _kws_triggered = True
                     if not remaining.strip():
@@ -1288,8 +1546,16 @@ class ASRPlugin:
     PREFIX = "asr"
 
     def __init__(self, plugin_cfg: dict, executor):
+        from utils.onnx_provider import normalize_device
         self._language     = plugin_cfg.get('language', 'zh-CN')
-        self._asr_model    = plugin_cfg.get('asr_model', 'paraformer-zh-en')
+        self._asr_model    = plugin_cfg.get('asr_model', DEFAULT_ASR_MODEL)
+        # Mirrors what _build_asr_adapter resolved, including its fall back to cpu
+        # for a model with no weights for the requested device, so `info` and the
+        # next `config` comparison report what is actually loaded.
+        self._device       = normalize_device(plugin_cfg.get('device'),
+                                             plugin_cfg.get('hw_provider'))
+        if self._device not in ASR_MODELS.get(self._asr_model, {}).get("devices", {}):
+            self._device = "cpu"
         self._plugin_cfg   = plugin_cfg
         self._loading      = False
         self._load_error   = None
@@ -1314,7 +1580,8 @@ class ASRPlugin:
         # cancel it. See perception/README.md § Plugin Concurrency.
         self._nodes_lock = threading.RLock()
         self._executor = executor
-        log.info(f"[asr] plugin init: model={self._asr_model}, vad={self._vad_backend}, threshold={self._vad_threshold}, "
+        log.info(f"[asr] plugin init: model={self._asr_model}, device={self._device}, "
+                 f"vad={self._vad_backend}, threshold={self._vad_threshold}, "
                  f"silence_ms={self._vad_silence_ms}, pre_roll_ms={self._vad_pre_roll_ms}, "
                  f"kws_enabled={self._kws_cfg.get('enabled', False)}")
 
@@ -1549,8 +1816,32 @@ class ASRPlugin:
                 self._max_saved_segments = int(cfg['max_saved_segments'])
             if 'vad_pre_roll_ms' in cfg:
                 self._vad_pre_roll_ms = int(cfg['vad_pre_roll_ms'])
-            # ASR model switch — load in background if changed
-            if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
+            # Model or device switch — either one changes which weights are loaded,
+            # so both go through the same background reload. Validated together
+            # because a request can change both at once, and whether a device is
+            # allowed depends on the model.
+            from utils.onnx_provider import normalize_device
+            new_model = cfg.get('asr_model', self._asr_model)
+            new_device = (normalize_device(cfg['device']) if 'device' in cfg
+                          else self._device)
+            if new_model not in ASR_MODELS:
+                return {"status": "error", "asr_model": self._asr_model,
+                        "message": f"Unknown asr_model '{new_model}'; "
+                                   f"available: {', '.join(sorted(ASR_MODELS))}"}
+            if new_device not in ASR_MODELS[new_model]["devices"]:
+                # Reject rather than silently degrade: someone is looking at the
+                # result of this call, and a request for gpu that quietly runs on
+                # cpu is how a "GPU is not faster" bug report gets written.
+                supported = asr_models_supporting(new_device)
+                return {"status": "error",
+                        "asr_model": self._asr_model, "device": self._device,
+                        "message": (
+                            f"Model '{new_model}' has no '{new_device}' weights — it "
+                            f"was either measured slower there or never verified. "
+                            f"Models with {new_device} support: "
+                            f"{', '.join(supported) or '(none)'}")}
+
+            if (new_model, new_device) != (self._asr_model, self._device):
                 # Stop all running nodes first
                 with self._nodes_lock:
                     nodes = [(k, self._nodes.pop(k)) for k in list(self._nodes.keys())]
@@ -1558,10 +1849,14 @@ class ASRPlugin:
                     node.request_stop()
                 for key, node in nodes:
                     self._dispose_node(node, key)
-                self._asr_model = cfg['asr_model']
+                self._asr_model = new_model
+                self._device = new_device
+                self._plugin_cfg['device'] = new_device
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
-                        "message": f"Switching to model '{self._asr_model}', downloading..."}
+                        "device": self._device,
+                        "message": f"Switching to model '{self._asr_model}' on "
+                                   f"{self._device}, downloading..."}
             # Hot-reload: stop running nodes, apply new config, restart automatically
             with self._nodes_lock:
                 was_running = [(key, node) for key, node in self._nodes.items()
@@ -1648,12 +1943,42 @@ def _vad_segment_sync(audio_bytes: bytes, model: str = 'silero',
             try: return vad_engine.is_speech(chunk, SAMPLE_RATE)
             except Exception: return False
     else:
-        import torch
-        silero = _get_silero_model()
+        # Same Silero VAD the streaming worker uses, via sherpa-onnx's ONNX
+        # runtime rather than the PyTorch `silero-vad` package — one model file,
+        # one runtime, no torch on this path.
+        import sherpa_onnx
+        from utils.model_downloader import ensure_model
+
+        vad_model_dir = '/models/sherpa-onnx/vad'
+        ensure_model("vad", vad_model_dir)
+        # min_silence_duration is deliberately short: the loop below owns
+        # segmentation via SILENCE_FRAMES. Passing silence_ms here too would
+        # make sherpa hold the segment open for silence_ms *before* the loop
+        # starts counting its own, doubling every segment's trailing silence.
+        vad_engine = sherpa_onnx.VoiceActivityDetector(
+            sherpa_onnx.VadModelConfig(
+                silero_vad=sherpa_onnx.SileroVadModelConfig(
+                    model=os.path.join(vad_model_dir, "silero_vad.onnx"),
+                    threshold=threshold,
+                    min_silence_duration=0.1,
+                    min_speech_duration=0.1,
+                    window_size=CHUNK_SAMPLES,
+                    max_speech_duration=30,
+                ),
+                sample_rate=SAMPLE_RATE,
+                num_threads=1,
+                # CPU on purpose — same reasoning as the _vad_worker VAD above:
+                # per-window inference is too small to amortise a CUDA session.
+                provider="cpu",
+            ),
+            buffer_size_in_seconds=30,
+        )
+
         def is_speech(chunk):
             n = len(chunk) // 2
-            t = torch.tensor(struct.unpack(f'<{n}h', chunk), dtype=torch.float32, device=_get_torch_device()) / 32768.0
-            return silero(t, SAMPLE_RATE).item() >= threshold
+            float_samples = [s / 32768.0 for s in struct.unpack(f'<{n}h', chunk)]
+            vad_engine.accept_waveform(float_samples)
+            return vad_engine.is_speech_detected()
 
     preroll: _col.deque = _col.deque(maxlen=8)
     state = 'idle'

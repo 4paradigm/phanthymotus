@@ -9,24 +9,56 @@ from pydantic import BaseModel
 
 import config
 import mcp_client
+from tool_config import (missing_required_config, plan_config_calls,
+                         split_config_by_scope)
 
 router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
 
 
-async def _notify_inspector(mcp_id: str, topics: list) -> None:
-    """Register topics with the embedded inspection module (process-internal call)."""
+async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
+    """Register topics with the embedded inspection module (process-internal call).
+
+    生产者（topic_out）与消费者（topic_in）分开登记：一个 topic 的数据格式由**发布方**
+    决定。消费者声明的 format 只是「我要吃什么」，不能拿它改写别人发布的总线格式 ——
+    否则 ocr 的 image/jpeg 输入会把 /decision_core 注册成图片总线，仪表盘按图片渲染、
+    DDS 订阅也会用错消息类型。
+    """
     from api.inspection import register_topic_internal
-    for t in topics:
-        topic     = t.get('topic', '')
-        fmt       = t.get('format', '')
-        if not topic:
-            continue
-        try:
-            await register_topic_internal(topic, fmt, mcp_id)
-        except Exception:
-            pass
+    for producer, topics in ((True, topic_out or []), (False, topic_in or [])):
+        for t in topics:
+            topic = t.get('topic', '')
+            fmt   = t.get('format', '')
+            if not topic:
+                continue
+            try:
+                await register_topic_internal(topic, fmt, mcp_id, producer=producer)
+            except Exception:
+                pass
+
+
+def _fmt_match(required: str, available: str) -> bool:
+    """数据格式是否兼容。与前端 setup.js 的 _fmtMatch 保持一致：精确相等，或 `audio/*` 前缀通配。"""
+    if not required or not available:
+        return False
+    if required == available:
+        return True
+    if required.endswith('/*'):
+        return available.startswith(required[:-1])
+    return False
+
+
+# 已经提示过「上游没有匹配格式」的 (mcp_id, format)，避免每次 ping 都刷日志
+_unmatched_logged: set = set()
+
+
+def _upstream_topic_for(fmt: str, upstream_out: list) -> str:
+    """在上游的 topic_out 里找格式匹配的那条 topic。"""
+    for t in upstream_out:
+        if t.get('topic') and _fmt_match(fmt, t.get('format', '')):
+            return t['topic']
+    return ''
 
 
 def _get_mcp_list() -> list:
@@ -379,10 +411,16 @@ async def _restore_saved_configs(mcp_id: str, url: str, tools: list) -> None:
                 saved_cfg = config.main.get(f'tool_config:{mcp_id}:{tool_name}', None)
                 if not saved_cfg:
                     continue
+                # Drop keys the current schema no longer advertises, same as the
+                # start path — a stale row must not be replayed on every reconnect.
+                shared_cfg, instance_cfg = split_config_by_scope(tool, saved_cfg)
+                restore_cfg = {**shared_cfg, **instance_cfg}
+                if not restore_cfg:
+                    continue
                 cfg_payload = {
                     'jsonrpc': '2.0', 'id': 99,
                     'method': 'tools/call',
-                    'params': {'name': tool_name, 'arguments': {'action': 'config', **saved_cfg}},
+                    'params': {'name': tool_name, 'arguments': {'action': 'config', **restore_cfg}},
                 }
                 await session.post(url, json=cfg_payload, headers=headers)
                 sent.append(tool_name)
@@ -410,9 +448,10 @@ async def _do_ping(mcp_id: str) -> dict:
         is_internal = transport == 'internal'
         # Register topics for internal MCPs (so inspection/monitoring works)
         if is_internal:
-            topics = target.get('topic_out', []) + target.get('topic_in', [])
-            if topics:
-                asyncio.create_task(_notify_inspector(mcp_id, topics))
+            t_out = target.get('topic_out', []) or []
+            t_in  = target.get('topic_in', []) or []
+            if t_out or t_in:
+                asyncio.create_task(_notify_inspector(mcp_id, t_out, t_in))
         return {
             'online':      is_internal and target.get('online', False),
             'tools':       target.get('tools', []),
@@ -459,17 +498,29 @@ async def _do_ping(mcp_id: str) -> dict:
     topic_in  = [dict(t) for t in caps.get('topic_in',  [])]
     topic_out = [dict(t) for t in caps.get('topic_out', [])]
 
-    upstream_topic = ''
+    upstream_out = []
     depends_on = target.get('depends_on', '')
     if depends_on:
         upstream = next((m for m in mcps if m.get('id') == depends_on), None)
-        upstream_topic = ((upstream or {}).get('topic_out') or [{}])[0].get('topic', '')
+        upstream_out = (upstream or {}).get('topic_out') or []
 
-    # Fill empty topic_in from upstream (depends_on relationship)
-    if upstream_topic:
-        for t in topic_in:
-            if not t.get('topic'):
-                t['topic'] = upstream_topic
+    # Fill empty topic_in from upstream — **按格式匹配**，不是无脑取 topic_out[0]。
+    # agentcore 的 topic_out[0] 是 /decision_core (data/json)，取 [0] 会把 ocr/vop 的
+    # image/jpeg 输入挂到决策总线上，进而把 /decision_core 注册成图片格式：仪表盘按图片
+    # 渲染，DDS 订阅也会拿 CompressedImage 去订阅 std_msgs/String。
+    # 匹配不到就留空 —— UI 上显示「未连接」是对的，硬塞一个格式不符的总线不是。
+    for t in topic_in:
+        if t.get('topic'):
+            continue
+        fmt = t.get('format', '')
+        picked = _upstream_topic_for(fmt, upstream_out)
+        if picked:
+            t['topic'] = picked
+        elif upstream_out and (mcp_id, fmt) not in _unmatched_logged:
+            _unmatched_logged.add((mcp_id, fmt))
+            avail = ', '.join(f'{x.get("topic", "?")}({x.get("format", "?")})' for x in upstream_out)
+            print(f'[mcp/ping] {mcp_id}: upstream {depends_on} has no {fmt!r} topic — '
+                  f'input left unbound (upstream offers: {avail})')
 
     # Log only when tools change (first ping or tool list updated)
     current_tool_names = [t.get('name', '') if isinstance(t, dict) else t for t in caps['tools']]
@@ -574,7 +625,7 @@ async def _do_ping(mcp_id: str) -> dict:
             hooks.register(mcp_id, tool.get('name', ''), x_hooks)
 
     # Notify inspection module about all topics from this device
-    asyncio.create_task(_notify_inspector(mcp_id, topic_out + topic_in))
+    asyncio.create_task(_notify_inspector(mcp_id, topic_out, topic_in))
 
     # Auto-restore saved configs when device comes online (first ping or after offline)
     if not was_online:
@@ -702,6 +753,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             'topic_in': topic_in_list,
             'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
             'trigger_interval_ms': trigger_interval_ms,
+            'vision_input': bool(llm_cfg.get('vision_input', False)),
         }}
 
     elif action == 'config':
@@ -723,6 +775,14 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             event_cfg = config.main.get('event', {})
             llm_cfg = event_cfg.get('llm', {})
             llm_cfg['trigger_interval_ms'] = int(trigger_interval)
+            event_cfg['llm'] = llm_cfg
+            config.main['event'] = event_cfg
+        # 图片输入开关：模型不支持时把图像内容内联进请求，只会换来一个 400 和一轮失败
+        vision_input = req.arguments.get('vision_input')
+        if vision_input is not None:
+            event_cfg = config.main.get('event', {})
+            llm_cfg = event_cfg.get('llm', {})
+            llm_cfg['vision_input'] = bool(vision_input)
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
         # Save search config to desktop_tools.search
@@ -816,68 +876,75 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             elif action == 'info':
                 return {'code': 200, 'data': {'state': 'running', 'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}]}}
             return {'code': 200, 'data': None}
+        if req.tool == 'remote_image':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'send_image':
+                image_file = req.arguments.get('image_file', '')
+                if not image_file:
+                    return {'code': 400, 'message': '缺少 image_file 参数', 'data': None}
+                from start import publish_image_file
+                return await publish_image_file(image_file)
+            elif action == 'info':
+                return {'code': 200, 'data': {'state': 'running', 'topic_out': [{'topic': '/remote_control/image', 'format': 'image/jpeg'}]}}
+            return {'code': 200, 'data': None}
         return await _handle_agentcore_call(req)
 
     # ── Handle internal channel MCP ──
     if mcp_id == 'channel':
+        from channel.manager import manager as channel_mgr
+
+        def _card_channel(tool: str, instance_id: str) -> str:
+            if not instance_id:
+                return ''
+            cfg = config.main.get(f'tool_config:channel:{tool}:{instance_id}', None)
+            return (cfg or {}).get('channel_id', '')
+
         if req.tool == 'channel_request':
             action = req.arguments.get('action', 'start')
+            instance_id = req.arguments.get('instance_id', '')
             if action == 'start':
-                # Self-check: verify channel adapter is connected (with retry wait)
-                from channel.manager import manager as channel_mgr
-                import asyncio
-                instance_id = req.arguments.get('instance_id', '')
-                channel_id = ''
-                if instance_id:
-                    cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
-                    if cfg:
-                        channel_id = cfg.get('channel_id', '')
-                if channel_id:
-                    # Wait up to 10s for adapter to connect
-                    for _ in range(20):  # 20 × 0.5s = 10s
-                        if channel_id in channel_mgr._adapters:
-                            adapter = channel_mgr._adapters[channel_id]
-                            if adapter.status() == 'connected':
-                                return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
-                        await asyncio.sleep(0.5)
-                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel {channel_id} adapter not connected (10s timeout)'}}
-                return {'code': 200, 'data': {'state': 'running'}}
+                # 自检：卡片必须选了一个存在且启用的 channel，且 adapter 真的连通。
+                # ensure_connected 会顺手把被 Stop 过的 adapter 拉起来（自愈）。
+                channel_id = _card_channel('channel_request', instance_id)
+                ok, reason = await channel_mgr.ensure_connected(channel_id)
+                if not ok:
+                    print(f'[channel_request] self-check failed: {reason}')
+                    return {'code': 200, 'data': {'state': 'error', 'message': reason}}
+                return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                channel_id = req.arguments.get('channel_id', '')
-                if not channel_id:
-                    instance_id = req.arguments.get('instance_id', '')
-                    if instance_id:
-                        cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
-                        if cfg:
-                            channel_id = cfg.get('channel_id', '')
+                channel_id = req.arguments.get('channel_id', '') or _card_channel(
+                    'channel_request', instance_id)
                 topic_id = channel_id.replace(' ', '_') if channel_id else ''
                 topic = f'/channel/request/{topic_id}' if topic_id else '/channel/request'
                 return {'code': 200, 'data': {'topic_out': [{'topic': topic, 'format': 'data/json'}]}}
             return {'code': 200, 'data': None}
         if req.tool == 'channel_reply':
             action = req.arguments.get('action', 'send')
+            instance_id = req.arguments.get('instance_id', '')
             if action == 'start':
-                # Self-check: send a greeting to verify channel is working
-                from channel.manager import manager as channel_mgr
-                try:
-                    import asyncio
-                    result = await channel_mgr.send_to_channel_any("我上线啦！我可以通过飞书与您交流。")
-                    if result:
-                        return {'code': 200, 'data': {'state': 'running', 'self_check': 'greeting sent'}}
-                    else:
-                        return {'code': 200, 'data': {'state': 'error', 'message': 'failed to send greeting — channel not connected'}}
-                except Exception as e:
-                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel send failed: {e}'}}
+                # 自检：静默探测（校验配置 + adapter 健康），不给用户发问候消息。
+                # 旧实现发「我上线啦！」并用 `if result:` 判断，而返回值恒为非空字符串 —— 永远「通过」。
+                channel_id = _card_channel('channel_reply', instance_id)
+                ok, reason = await channel_mgr.ensure_connected(channel_id)
+                if not ok:
+                    print(f'[channel_reply] self-check failed: {reason}')
+                    return {'code': 200, 'data': {'state': 'error', 'message': reason}}
+                return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'send':
                 text = req.arguments.get('text', '')
-                if not text:
-                    return {'code': 200, 'data': {'error': 'text is required'}}
-                from channel.manager import manager as channel_mgr
-                result = await channel_mgr.send_to_channel_any(text)
+                files = req.arguments.get('files', []) or []
+                if not text and not files:
+                    return {'code': 200, 'data': {'error': 'text or files is required'}}
+                result = await channel_mgr.send_reply(instance_id=instance_id,
+                                                     text=text, files=files)
                 return {'code': 200, 'data': {'result': result}}
             return {'code': 200, 'data': None}
         return {'code': 200, 'data': None}
@@ -905,34 +972,48 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             }
             await session.post(url, json=init_payload, headers=headers)
 
-            # Auto-config: start 前自动 apply 已保存的 config (shared + instance merged)
+            # Auto-config: start 前自动 apply 已保存的 config
             # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
             _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
             if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
-                # Check if this tool has configSchema (requires config before start)
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
-                has_config_schema = bool(tool_obj and tool_obj.get('configSchema'))
 
                 instance_id = req.arguments.get('instance_id', '')
-                shared_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None) or {}
-                instance_cfg = {}
+                saved_shared = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None) or {}
+                saved_instance = {}
                 if instance_id:
-                    instance_cfg = config.main.get(f'tool_config:{mcp_id}:{req.tool}:{instance_id}', None) or {}
-                merged_cfg = {**shared_cfg, **instance_cfg}
+                    saved_instance = config.main.get(f'tool_config:{mcp_id}:{req.tool}:{instance_id}', None) or {}
 
-                if merged_cfg:
-                    cfg_args = {'action': 'config', **merged_cfg}
-                    if instance_id:
-                        cfg_args['instance_id'] = instance_id
+                # Partition both rows by declared scope, dropping keys the
+                # current schema no longer advertises. Either row can hold
+                # either kind of key: older UI builds saved without filtering.
+                shared_cfg, instance_cfg = split_config_by_scope(tool_obj, saved_shared)
+                inst_shared, inst_own = split_config_by_scope(tool_obj, saved_instance)
+                merged_for_required = {**shared_cfg, **inst_shared, **instance_cfg, **inst_own}
+
+                missing = missing_required_config(tool_obj, merged_for_required)
+                if missing:
+                    return {'code': 400,
+                            'message': f'[{req.tool}] 尚未配置：缺少 {"、".join(missing)}，请先在卡片配置里填写后再启动。',
+                            'data': None}
+
+                for cfg_body, extra_args in plan_config_calls(
+                        tool_obj, saved_shared, saved_instance, instance_id):
                     cfg_payload = {
                         'jsonrpc': '2.0', 'id': 2,
                         'method': 'tools/call',
-                        'params': {'name': req.tool, 'arguments': cfg_args},
+                        'params': {'name': req.tool,
+                                   'arguments': {'action': 'config', **cfg_body, **extra_args}},
                     }
                     async with session.post(url, json=cfg_payload, headers=headers) as resp:
                         cfg_data = await resp.json(content_type=None)
+                        cfg_error = cfg_data.get('error')
+                        if cfg_error:
+                            return {'code': 400,
+                                    'message': f'[{req.tool}] 配置失败：{cfg_error.get("message", "unknown error")}',
+                                    'data': None}
                         cfg_result = cfg_data.get('result', {})
                         cfg_content = (cfg_result.get('content') or [{}])[0].get('text', '{}')
                         try:
@@ -941,8 +1022,6 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                                 return {'code': 400, 'message': f'[{req.tool}] 配置无效（缺少 url/key），请检查配置。', 'data': None}
                         except (json.JSONDecodeError, IndexError):
                             pass
-                elif has_config_schema:
-                    return {'code': 400, 'message': f'[{req.tool}] 尚未配置，请先完成配置后再启动。', 'data': None}
 
             call_payload = {
                 'jsonrpc': '2.0', 'id': 3,
@@ -963,9 +1042,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                             try:
                                 parsed = json.loads(item.get('text', ''))
                                 if isinstance(parsed, dict):
-                                    topics_to_reg = parsed.get('topic_out', []) + parsed.get('topic_in', [])
-                                    if any(t.get('topic') for t in topics_to_reg):
-                                        asyncio.create_task(_notify_inspector(mcp_id, topics_to_reg))
+                                    t_out = parsed.get('topic_out', []) or []
+                                    t_in  = parsed.get('topic_in', []) or []
+                                    if any(t.get('topic') for t in t_out + t_in):
+                                        asyncio.create_task(_notify_inspector(mcp_id, t_out, t_in))
                             except Exception:
                                 pass
                 return {'code': 200, 'data': result.get('content', result)}

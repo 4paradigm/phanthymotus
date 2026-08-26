@@ -3,13 +3,31 @@ mcp_port: 15720
 plugins:
   asr:
     enabled: true
-    asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
-    model_dir: /models/sherpa-onnx/asr
-    hw_provider: cpu
-    num_threads: 2
+    # Matches the configSchema default. SenseVoice on CPU is also the faster of
+    # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
+    # the largest gpu upside (fp16).
+    asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | sensevoice-small
+    # cpu | gpu — which weights get loaded is per (model, device) in
+    # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
+    # jp5.11 only) and is only offered for models where it was benchmarked and
+    # the transcripts were read: sensevoice-small (fp16) and paraformer-zh-en
+    # (fp32). Everything else is cpu-only — int8 weights are slower on CUDA, not
+    # faster, because ONNX Runtime's CUDA provider has no int8 kernels.
+    #
+    # gpu is ~3.4x faster per utterance (58 ms vs 195 ms p50 on 1-4 s of speech)
+    # and costs ~2 GB RAM against ~0.5 GB on cpu, ~1.4 GB of it a CUDA context
+    # the process never returns. On a 7.4 GB Orin already running vop + OCR +
+    # TTS that is enough to run the box out of memory, so cpu is the default
+    # even on images that could use the GPU. Numbers in utils/onnx_provider.py.
+    device: cpu
+    num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
+    # Decode 1 s of silence after the model loads. On gpu the first inference
+    # costs ~1.7 s (lazy kernels, cuDNN autotune, memory pool) against a 58 ms
+    # steady state; without this the operator pays it on their first utterance.
+    warmup: true
     language: zh-CN
     vad:
-      model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
+      model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
       threshold: 0.5
       silence_ms: 400
       pre_roll_ms: 500
@@ -21,23 +39,17 @@ plugins:
 
   tts:
     enabled: true
-    model_dir: /models/sherpa-onnx/tts
+    engine: vits2_trt
+    backend: trt
+    model_dir: /models/vits2
     speaker_id: 0
     speed: 1.0
-
-  htmsg:
-    enabled: true
-    namespace: ""       # auto-detect from hostname if empty
-    keyframe:
-      dist_thresh: 1.0    # meters — insert keyframe when moved this far
-      angle_thresh: 0.35  # radians (~20°) — or rotated this much
-    semantic:
-      model: "mobileclip"
-      sam_model: "sam2_tiny"
-      confidence_decay: 0.95
-    graph:
-      db_path: "/opt/phanthy-motus/data/htmsg"
-      max_nodes: 500
+    warmup: true
+    max_chunk_tokens: 256
+    # sherpa_onnx engine only — vits2_trt runs on TensorRT and ignores this.
+    # Matcha is fp32, so both devices load the same weights and only the provider
+    # changes; gpu measured ~4.3x faster at num_threads=2.
+    device: cpu
 
   vop:
     enabled: true
@@ -46,3 +58,27 @@ plugins:
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: true
+    provider: rapidocr
+    model_dir: /models/ocr/ppocrv6-small-trt
+    device_id: 0
+    language: zh
+    use_angle_cls: true
+    max_side_len: 1600
+    det_unclip_ratio: 0.7
+    det_thresh: 0.3
+    det_box_thresh: 0.5
+    rec_min_score: 0.9
+    crop_refinement:
+      enabled: true
+      min_score: 0.9
+      min_gain: 0.12
+      min_text_length: 2
+      profiles: [prefix_65, upper_center, upper_tight]
+    empty_result_retry:
+      enabled: true
+      det_thresh: 0.1
+      det_box_thresh: 0.1
+    min_interval_ms: 0

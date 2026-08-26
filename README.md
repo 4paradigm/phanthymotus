@@ -113,6 +113,29 @@ Live sensor data visualization — audio waveforms, battery status, 3D skeleton/
 
 ![Monitoring Dashboard](docs/images/dashboard.png)
 
+#### Derived topics
+
+A `multiInstance` tool (ASR, TTS, OCR) does not have a fixed output topic. The
+driver infers it from the input topic the card is connected to —
+`/remote_control/mic` + `asr` → `/remote_control/mic/asr` — so the same tool on two
+cards publishes to two different topics, and a card's topic only exists once
+something has asked the driver (`action: info` with `input_topic`, a read).
+
+Two rules follow, both of which were learned the hard way:
+
+- **A derived topic is only valid for the input it was derived from.** The canvas
+  records which input produced each answer and refetches when the graph changes
+  underneath it (`_revalidateDerivedTopics` in `web/js/canvas.js`). Without that,
+  re-pointing a TTS card from one source to another left it publishing to the old
+  source's topic: the dashboard panel watched a topic nothing fed, and there was no
+  sound.
+- **The saved layout is not a source of truth for them.** The monitor dashboard
+  resolves them itself (`web/js/topic-derive.js`), rather than depending on someone
+  having had the canvas page open — which is why the ASR panel used not to be there
+  until you visited the canvas.
+
+Frontend tests: `node --test "agent-core/web/js/*.test.mjs"` (no dependencies).
+
 ### Agent Definition
 
 Define the agent's identity, system prompt, and long-term memory directly from the UI.
@@ -130,6 +153,32 @@ Browse past agent sessions with full event traces and tool call results.
 A community-driven Skill Marketplace where users share and discover skills. Browse and install skills contributed by others, or teach your robot new capabilities using natural language — no coding required.
 
 ![Skills](docs/images/skills.png)
+
+### Solutions — Package & Load a Whole Setup
+
+Open **Solutions** from the top-left of the dashboard. A solution bundles everything
+that makes one robot work — canvas topology and per-card config, active skills,
+prompt files, and tasks — into one shareable package on the Resource Center
+marketplace.
+
+- **Save**: pick which blocks to package. The canvas is mandatory; skills, each of
+  the three prompt files, and tasks are optional. Only skills that are already
+  published on the Skill Marketplace can be packaged, so recipients can actually
+  install them.
+- **Load**: Agent Core first checks that every required driver / perception /
+  actucore image is installed (offering one-click install for images already in
+  the local catalog), then lists exactly what will be overwritten before applying.
+- **Align versions** (optional): tick it and each involved container is redeployed
+  at the image tag recorded in the package before the solution is applied — only
+  the tag is taken, the local registry is kept. Agent Core itself is never
+  auto-aligned, since restarting it would abort the load; the dashboard shows the
+  recorded core version so you can upgrade manually if needed.
+- **Secrets stay home**: fields a tool declares sensitive (`format: password` or
+  `x-sensitive: true` in its `configSchema`) are blanked during packaging and
+  reported to the loading user as "needs configuration".
+
+Cards reference devices by MCP `server_name`, not by the machine-local
+`mcp-<timestamp>` id, so a package loads onto a different robot of the same model.
 
 ### Service Deployment
 
@@ -192,11 +241,60 @@ services:
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
 
+## Container Logs
+
+Every container declares log rotation in its `deploy/service.yml` (or compose
+fragment): the `local` driver, `max-size: 10m`, `max-file: 3` — so ~30 MB per
+container, compressed. Agent Core injects that same policy as a default when a
+driver image's fragment omits it.
+
+### Do not truncate a live container's log file
+
+**`truncate -s 0` on `/var/lib/docker/containers/<id>/**/*.log` corrupts the
+log.** The file size is reset but the Docker daemon keeps its write offset, so
+the next write lands past the new end-of-file and the kernel fills the gap with
+NUL bytes. `docker logs` then fails outright:
+
+```
+Error grabbing logs: invalid character '\x00' looking for beginning of value   # json-file
+Error grabbing logs: error unmarshalling log entry: proto: illegal tag 0       # local
+```
+
+Once that happens the log is unreadable until the file is replaced. A
+`truncate_log.sh` helper used to live in `deploy/` and was removed for exactly
+this reason.
+
+### What to do instead
+
+| Goal | Command |
+|------|---------|
+| Read recent logs | `docker logs --tail 500 -f <container>` |
+| Reclaim log space now | `docker restart <container>` — the daemon reopens and rotates its writer cleanly |
+| Reclaim disk generally | `docker image prune -a --filter until=168h` (stale images usually dwarf logs) |
+| Check log size | `du -sh /var/lib/docker/containers/*/local-logs` |
+
+### Host baseline (recommended, not applied automatically)
+
+Containers started outside the compose/service.yml paths inherit the daemon
+default, which for `json-file` is unbounded. Set a floor in
+`/etc/docker/daemon.json` so nothing can escape rotation:
+
+```json
+{
+  "log-driver": "local",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+```
+
+Applying this requires restarting the Docker daemon, which stops every container
+on the host — schedule it rather than doing it mid-session.
+
 ## Resource Center (Optional)
 
 The platform can optionally connect to a [Resource Center](https://motus.phanthy.com) for:
 - Browsing and deploying pre-built driver/perception images
 - Managing skills and extensions
+- Publishing and installing solutions (canvas + skills + prompt + tasks bundles)
 - OTA updates
 
 Configure via the `RESOURCE_CENTER_URL` environment variable.

@@ -13,6 +13,28 @@ from uuid import uuid4
 llm = client.llm.Client()
 
 
+def _get_logger_safely():
+    """LLMLogger, or None if it cannot be constructed.
+
+    `get_logger()` only caches the singleton on success, so anything that makes
+    __init__ raise repeats on every single call. That is how a truncated
+    `llm_request_*.jsonl` took the whole agent loop down.
+    """
+    try:
+        return _llm_logger.get_logger()
+    except Exception as e:
+        print(f'[client] LLM logging unavailable ({type(e).__name__}: {e}) — continuing without it')
+        return None
+
+
+async def _log_safely(coro, what: str) -> None:
+    """Await a logging coroutine, swallowing (but reporting) any failure."""
+    try:
+        await coro
+    except Exception as e:
+        print(f'[client] {what} failed ({type(e).__name__}: {e}) — ignored')
+
+
 async def call(
     message_list: list[dict],
     tool_list: list[dict],
@@ -44,9 +66,15 @@ async def call(
     configs = config.main.get('client', {}).get('llm', [])
     model_name = model_override or (configs[0]['model'] if configs else 'unknown')
 
-    # Log request
-    logger = _llm_logger.get_logger()
-    await logger.log_request(request_id, trace_id, caller_info, message_list, tool_list, model_name)
+    # Log request. Diagnostics must never be able to stop the agent loop — a
+    # corrupt JSONL file used to raise here and kill every turn before the HTTP
+    # call was even attempted.
+    logger = _get_logger_safely()
+    if logger is not None:
+        await _log_safely(
+            logger.log_request(request_id, trace_id, caller_info,
+                               message_list, tool_list, model_name),
+            'log_request')
 
     response = await llm(
         message_list=message_list,
@@ -56,11 +84,17 @@ async def call(
     )
 
     # Log response
-    await logger.log_response(request_id, trace_id, caller_info, response)
+    if logger is not None:
+        await _log_safely(
+            logger.log_response(request_id, trace_id, caller_info, response),
+            'log_response')
 
     # Record usage
     usage = response.get('_usage')
     if usage:
-        perf_log.record_usage(trace_id or 'unknown', usage)
+        try:
+            perf_log.record_usage(trace_id or 'unknown', usage)
+        except Exception as e:
+            print(f'[client] usage recording failed ({type(e).__name__}: {e}) — ignored')
 
     return response

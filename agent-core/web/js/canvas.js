@@ -14,6 +14,8 @@
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
+import { sessionId } from './session.js';
+import { getToken } from './auth.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -24,22 +26,42 @@ let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
 
 // ── Editor Lock ──────────────────────────────────────────────────────────────
-let _sessionId = localStorage.getItem('canvas_session_id');
-if (!_sessionId) {
-  _sessionId = 'sess-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  localStorage.setItem('canvas_session_id', _sessionId);
-}
+// The session id comes from session.js (per-tab, see the rationale there) and is
+// also sent on the /ws/motus connection — the backend releases this session's
+// lock shortly after that socket drops, so closing/killing the tab frees the
+// canvas without depending on an unload handler firing.
+const _sessionId = sessionId();
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
 
-/** Check if current session can modify. If not, show warning and return false. */
-function _canEdit() {
-  if (!_isEditor) {
-    const msg = _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先点击「编辑」进入编辑状态';
-    _showToast(msg);
+/**
+ * Ensure current session holds the edit lock, auto-claiming it if free.
+ * Returns true if editing may proceed, false if the canvas is occupied by
+ * another session (in which case a toast + locked UI state is shown).
+ */
+async function _ensureEdit() {
+  if (_isEditor) return true;
+  try {
+    const resp = await fetch('/api/canvas/claim-edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _sessionId }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      _isEditor = true;
+      _currentEditor = _sessionId;
+      _updateEditorUI();
+      _showToast('已自动获取编辑权限');
+      return true;
+    }
+    _currentEditor = data.editor || null;
+    _updateEditorUI();
+    _showToast('画布正被其他用户编辑，请稍后重试');
+    return false;
+  } catch {
+    _showToast('无法获取编辑权限，请检查网络');
     return false;
   }
-  return true;
 }
 
 function _showToast(msg) {
@@ -63,14 +85,24 @@ let _projectRunning = false;
 
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
-export function canEdit() { return _canEdit(); }
+export function ensureEdit() { return _ensureEdit(); }
+export function isEditor() { return _isEditor; }
+
+/**
+ * Discard the in-memory canvas and re-read it from the server.
+ * Used after a solution is loaded — the backend rewrote canvas_layout directly,
+ * so what's on screen is stale.
+ */
+export function reloadFromServer() { return _reloadLayout(); }
+
 
 /**
  * Programmatically add a card to the canvas (used by mobile tap-to-add).
  * Returns true if added, false if rejected.
  */
-export function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
+export async function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
   if (_projectRunning) return false;
+  if (!(await _ensureEdit())) return false;
   if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
   if (!multiInstance) {
     const existing = _cards.find(c => c.mcpId === mcpId && c.toolName === toolName);
@@ -133,17 +165,11 @@ export async function initCanvas(initialMcps) {
     _resolveAllTopics();
     _redrawConnections();
 
-    // Fetch driver-inferred output topics for processor cards with empty outputs
-    for (const card of _cards) {
-      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-      const hasEmptyOut = outPorts.some(p => !p.dataset.topic);
-      if (!hasEmptyOut) continue;
-      const hasOutConn = _connections.some(c => c.fromCardId === card.id);
-      if (!hasOutConn) continue;
-      const inConn = _connections.find(c => c.toCardId === card.id && c.fromTopic);
-      const inputTopic = inConn?.fromTopic || '';
-      _fetchTopicsFromDriver(card, inputTopic);
-    }
+    // Cards whose topic_out is derived resolve inside _resolveAllTopics now
+    // (_revalidateDerivedTopics). The bespoke recovery that used to live here
+    // only fetched for cards with an *empty* out-port that also had an outgoing
+    // connection, which missed both a stale non-empty topic and a leaf card like
+    // TTS.
 
     // Restore viewport transform if saved
     if (layoutJson.data?.transform) {
@@ -160,7 +186,7 @@ export async function initCanvas(initialMcps) {
 
     // Initialize editor lock state from layout response
     _currentEditor = layoutJson.editor || null;
-    if (_currentEditor === _sessionId) _isEditor = true;
+    _isEditor = _currentEditor === _sessionId;
   } catch { /* start empty */ }
 
   // Show editor status bar
@@ -177,7 +203,7 @@ export async function initCanvas(initialMcps) {
     }
   } catch { /* ignore */ }
 
-  // Cross-tab sync: listen for project_state events via WebSocket
+  // Cross-tab sync: listen for project_state / editor-lock / layout events via WebSocket
   const { onMotusEvent } = await import('./motus-stream.js');
   onMotusEvent(null, (event) => {
     if (event.type === 'project_state') {
@@ -189,12 +215,18 @@ export async function initCanvas(initialMcps) {
           btn.classList.toggle('locked', !_projectRunning);
         });
       }
+    } else if (event.type === 'canvas_editor') {
+      _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
+    } else if (event.type === 'canvas_layout') {
+      // Ignore the echo of our own autosave; readers reload to follow the editor.
+      if ((event.payload?.editor || '') !== _sessionId) _scheduleReload();
     }
   });
 
   // Re-sync state when tab becomes visible (fallback for WS disconnect)
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
+      _checkEditStatus();
       fetch('/api/config/project-running').then(r => r.json()).then(d => {
         if (d.running !== _projectRunning) {
           _projectRunning = d.running;
@@ -596,15 +628,22 @@ function _addCard(data, save = true) {
   if (save) _saveLayout();
 }
 
-function _removeCard(id) {
+async function _removeCard(id) {
   if (_projectRunning) {
     _logActivity('warn', '请停止智能控制后修改');
     return;
   }
-  if (!_canEdit()) return;
+  if (!(await _ensureEdit())) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
-  _cards[idx].el.remove();
+  const removed = _cards[idx];
+  // Stop the instance this card owns, before it stops being reachable. Nothing
+  // else can: stop-project walks the saved layout, and this card is about to
+  // leave it, so its ROS node, subscription and any CUDA context would live
+  // until perception exits — publishing to a topic no card accounts for.
+  // `stop` is idempotent, so doing this to a card that was never started is fine.
+  _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
+  removed.el.remove();
   _cards.splice(idx, 1);
   // Trigger stop for connections where this card was the source
   const outgoing = _connections.filter(c => c.fromCardId === id);
@@ -818,7 +857,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (sensorExecBtn) {
       sensorExecBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (!_canEdit()) return;
+        if (!(await _ensureEdit())) return;
         await _executeCard(el, mcpId, toolName, id);
       });
     }
@@ -953,8 +992,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             field.style.display = paramKeys.includes(key) ? '' : 'none';
           });
         };
-        actionSelect.addEventListener('change', () => {
-          if (!_canEdit()) {
+        actionSelect.addEventListener('change', async () => {
+          if (!(await _ensureEdit())) {
             _applyActionParams();  // revert visual to match current state
             return;
           }
@@ -993,7 +1032,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (execBtn) {
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (!_canEdit()) return;
+        if (!(await _ensureEdit())) return;
         await _executeCard(el, mcpId, toolName);
       });
     }
@@ -1201,10 +1240,11 @@ function _setupPortDrag() {
           const resolvedTopic = resolvedInPort?.dataset.topic || _draggingConn.topic;
           _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic, instance_id: toCardData.id });
         }
-        // Ask driver to infer output topics for the destination card based on connected input topic
-        if (toCardData && _draggingConn.topic) {
-          _fetchTopicsFromDriver(toCardData, _draggingConn.topic);
-        }
+        // The destination's output topic is derived from this new input;
+        // _resolveAllTopics above already scheduled that refetch, and doing it
+        // here as well raced it — this path passes the dragged topic, which is
+        // empty when the source's own topic has not resolved yet, and whichever
+        // reply landed last won.
       }
     }
 
@@ -1214,7 +1254,7 @@ function _setupPortDrag() {
   });
 
   // Delegate pointerdown on out ports and executor ports
-  _viewport.addEventListener('pointerdown', (e) => {
+  _viewport.addEventListener('pointerdown', async (e) => {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;
@@ -1222,7 +1262,7 @@ function _setupPortDrag() {
       _logActivity('warn', '请停止智能控制后修改');
       return;
     }
-    if (!_canEdit()) return;
+    if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -1333,13 +1373,13 @@ function _redrawConnections() {
     line.addEventListener('mouseenter', showBtn);
     line.addEventListener('mouseleave', hideBtn);
     delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
-    delBtn.addEventListener('click', (e) => {
+    delBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (_projectRunning) {
         _logActivity('warn', '请停止智能控制后修改');
         return;
       }
-      if (!_canEdit()) return;
+      if (!(await _ensureEdit())) return;
       _connections = _connections.filter(c => c.id !== conn.id);
       _resolveAllTopics();
       _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
@@ -1414,8 +1454,8 @@ function _redrawConnections() {
     line.addEventListener('mouseleave', hideBtn);
     delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
 
-    const removeExec = () => {
-      if (!_canEdit()) return;
+    const removeExec = async () => {
+      if (!(await _ensureEdit())) return;
       _execConnections = _execConnections.filter(c => c.id !== conn.id);
       _logActivity('executor', `解绑执行器: ${conn.toToolName || conn.toCardId}`);
       _redrawConnections();
@@ -1511,13 +1551,19 @@ function _resolveAllTopics() {
     }
   }
 
-  // (debug logs removed)
+  // A derived topic_out is only valid for the input it came from, so the walk
+  // ends by checking that and refetching whatever no longer matches.
+  _revalidateDerivedTopics();
 }
 
 // ── Project lifecycle ─────────────────────────────────────────────────────────
 
 function _autoStopOnDisconnect(cardId, portIdx, topic) {
-  if (!_projectRunning) return;
+  // No `if (!_projectRunning) return` here. Every call site already refuses to
+  // edit while the project runs, so that check made this function a no-op at all
+  // of them — a card left subscribed to a topic the canvas no longer connects,
+  // which is how an old TTS node kept speaking on a deleted link. Stopping a
+  // stopped instance just returns {"state": "idle"}.
   // Only stop if no other connection still feeds this port
   const stillConnected = _connections.some(c => c.toCardId === cardId && c.toPortIdx === portIdx);
   if (stillConnected) return;
@@ -1536,6 +1582,18 @@ async function _startProject() {
   // Subscribe to startup progress events
   let modal = null;
   let itemIndex = {};  // tool_name -> index in modal
+  // Cards that accepted start but are still loading a model (perception TTS/OCR
+  // fetch and warm one up). The backend settles them with a later ready/error
+  // event, so the subscription has to outlive project_start_done — otherwise
+  // the modal would sit at "启动中..." forever, or worse, close claiming success.
+  const loading = new Set();
+  let sequenceDone = false;
+
+  function _finishIfSettled() {
+    if (!sequenceDone || loading.size > 0) return;
+    if (modal) modal.startCountdown(15);
+    offMotusEvent(_onEvent);
+  }
 
   function _onEvent(event) {
     const p = event.payload || {};
@@ -1544,17 +1602,27 @@ async function _startProject() {
       const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
       modal = _showStartupModal(items);
       cards.forEach((c, i) => { itemIndex[`${c.mcp_id}:${c.tool}`] = i; });
-    } else if (event.type === 'project_start_item' && modal) {
-      const idx = itemIndex[`${p.mcp_id}:${p.tool}`];
-      if (idx !== undefined) {
+    } else if (event.type === 'project_start_item') {
+      const key = `${p.mcp_id}:${p.tool}`;
+      const idx = itemIndex[key];
+      // Anything other than 'loading' is terminal for the wait: ready, error,
+      // cancelled, or a status added later.
+      if (p.status === 'loading') loading.add(key);
+      else loading.delete(key);
+      if (modal && idx !== undefined) {
         modal.updateItem(idx, p.status, p.message || '');
       }
+      _finishIfSettled();
     } else if (event.type === 'project_start_done') {
-      if (modal && !p.has_error) {
-        // Show countdown close button, auto-close after 15s
-        modal.startCountdown(15);
+      sequenceDone = true;
+      if (p.has_error) {
+        offMotusEvent(_onEvent);
+        return;
       }
-      offMotusEvent(_onEvent);
+      if (modal && loading.size > 0) {
+        modal.setWaiting(loading.size);
+      }
+      _finishIfSettled();
     }
   }
 
@@ -1713,7 +1781,10 @@ function _showStartupModal(items) {
   });
   document.body.appendChild(overlay);
 
-  const STATUS_TEXT = { starting: '启动中...', ready: '已就绪', error: '启动失败' };
+  const STATUS_TEXT = {
+    starting: '启动中...', loading: '模型加载中...', ready: '已就绪',
+    error: '启动失败', cancelled: '已取消',
+  };
   function updateItem(i, state, msg) {
     dots[i].className = 'startup-dot ' + state;
     statuses[i].textContent = msg || STATUS_TEXT[state] || '';
@@ -1724,6 +1795,13 @@ function _showStartupModal(items) {
   }
 
   let _countdownTimer = null;
+  function setWaiting(count) {
+    // Every card was accepted, but some are still fetching or warming a model.
+    // Say so instead of auto-closing on a success the operator does not have yet.
+    const title = modal.querySelector('.modal-title');
+    if (title) title.textContent = `等待模型加载（${count}）`;
+  }
+
   function startCountdown(seconds) {
     const footer = modal.querySelector('.startup-modal-footer');
     const title = modal.querySelector('.modal-title');
@@ -1749,7 +1827,7 @@ function _showStartupModal(items) {
     // Actually stop the project when user cancels during startup
     _stopProject();
   });
-  return { modal, updateItem, close, startCountdown };
+  return { modal, updateItem, close, startCountdown, setWaiting };
 }
 
 /**
@@ -1775,6 +1853,9 @@ function _parseMcpCallResult(json) {
  * Updates card.topicOut and DOM out-ports if driver returns non-empty topics.
  */
 async function _fetchTopicsFromDriver(card, inputTopic) {
+  const want = inputTopic || '';
+  if (card._topicFetchFor === want) return;   // identical request already in flight
+  card._topicFetchFor = want;
   try {
     const resp = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
       method: 'POST',
@@ -1784,15 +1865,82 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
     const data = await resp.json();
     const parsed = _parseMcpCallResult(data);
     const topicOut = parsed?.topic_out;
+    // Remember which input produced this answer. A derived topic is only valid
+    // for the input it was derived from, and without this the cache could never
+    // be told apart from a still-correct one — see _revalidateDerivedTopics.
+    card.topicOutFrom = want;
     if (topicOut?.some(t => t.topic)) {
       card.topicOut = topicOut;
       const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
       topicOut.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      // A resolved topic is some downstream card's input, so the graph below this
+      // one has to be re-walked — otherwise a chain (mic → asr → tts) only ever
+      // resolves its first hop.
+      _resolveAllTopics();
+      _redrawConnections();
+      _debouncedSave();
+    } else if (card.topicOut?.some(t => t.topic)) {
+      // The driver cannot infer an output for this input, so whatever we are
+      // holding was derived from a different one and is now wrong. Dropping it is
+      // what stops a deleted connection's topic from outliving the connection.
+      card.topicOut = [];
+      _resolveAllTopics();
       _redrawConnections();
       _debouncedSave();
     }
   } catch (e) {
+    card._topicFetchFor = null;   // let a later resolve retry after a failure
     console.warn('[canvas] info fetch failed:', e);
+  }
+}
+
+/**
+ * The input topic a card is currently fed, per the resolved graph.
+ *
+ * Read from the in-port dataset, which _resolveAllTopics' BFS has just written.
+ * Deliberately *not* falling back to connection.fromTopic: that field holds
+ * whatever was known when the link was drawn, so falling back to it would feed a
+ * card the leftover topic of a link that has since been deleted — the very thing
+ * this revalidation exists to undo. An empty string means "not known yet", which
+ * is the honest answer.
+ */
+function _inputTopicFor(card) {
+  const inConn = _connections.find(c => c.toCardId === card.id);
+  if (!inConn) return '';
+  const inPort = card.el.querySelector(`.canvas-port.in[data-idx="${inConn.toPortIdx}"]`);
+  return inPort?.dataset.topic || '';
+}
+
+/**
+ * Refetch any card whose cached topic_out no longer matches its input.
+ *
+ * card.topicOut for a multiInstance tool is *derived*: the driver infers it from
+ * the connected input topic (`/remote_control/mic` + asr → `/remote_control/mic/asr`).
+ * It was cached with no record of which input produced it and given top priority
+ * in _resolveAllTopics, so it survived the input changing under it. Connect TTS to
+ * remote_message, delete that connection, connect it to ASR instead, and the card
+ * kept publishing to `/remote_control/message/tts`: the dashboard panel watched a
+ * topic nothing fed, and the audio panel stayed silent.
+ *
+ * Nothing recomputed it either — the disconnect paths never refetched, and the
+ * page-load recovery only looks at cards with an *empty* out-port that also have
+ * an outgoing connection, which a stale leaf card like TTS satisfies neither of.
+ */
+function _revalidateDerivedTopics() {
+  for (const card of _cards) {
+    const want = _inputTopicFor(card);
+    const known = card.topicOutFrom;
+    const hasReal = card.topicOut?.some(t => t.topic);
+    // Nothing verified this card's topics in this page's lifetime. The saved
+    // layout is not evidence — a stale derived topic is exactly what gets
+    // persisted — so re-derive it whenever the card has an input to derive from.
+    // Once per card per page load: _fetchTopicsFromDriver drops a repeat request
+    // for the same input.
+    if (known === undefined) {
+      if (want || !hasReal) _fetchTopicsFromDriver(card, want);
+      continue;
+    }
+    if (known !== want) _fetchTopicsFromDriver(card, want);
   }
 }
 
@@ -1956,12 +2104,12 @@ function _makeDraggable(el, cardData) {
 
   let startClientX, startClientY, startWorldX, startWorldY, isDragging = false;
 
-  header.addEventListener('pointerdown', (e) => {
+  header.addEventListener('pointerdown', async (e) => {
     if (e.target.closest('.canvas-card-close')) return;
     if (e.target.closest('.canvas-card-info-btn')) return;
     if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
     if (_projectRunning) return;
-    if (!_canEdit()) return;
+    if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -2007,7 +2155,7 @@ function _debouncedSave() {
 }
 
 async function _saveLayout() {
-  if (!_isEditor) return;  // Only editor can save
+  if (!_isEditor) return;  // only the current editor may persist; system-triggered saves must not auto-claim
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
@@ -2060,44 +2208,30 @@ function _createEditorBar() {
 function _updateEditorUI() {
   let bar = document.getElementById('canvas-editor-bar');
   if (!bar) bar = _createEditorBar();
+  bar.classList.toggle('canvas-editor-bar--locked', !_isEditor && !!_currentEditor);
 
   if (_isEditor) {
     bar.innerHTML = `${_SVG_PEN}<span class="editor-label editor-label--active">编辑中</span><button class="editor-btn" id="canvas-release-btn">释放</button>`;
     bar.querySelector('#canvas-release-btn').onclick = _releaseEdit;
     _setCanvasReadonly(false);
   } else if (_currentEditor) {
-    bar.innerHTML = `${_SVG_LOCK}<span class="editor-label editor-label--locked">已锁定</span>`;
+    // Read-only, not broken: reading the canvas and its data streams stays open to
+    // everyone, only writes need the lock.
+    bar.innerHTML = `${_SVG_LOCK}<span class="editor-label editor-label--locked">画布由其他人编辑中（只读）</span>`;
     _setCanvasReadonly(true);
   } else {
     bar.innerHTML = `${_SVG_PEN}<button class="editor-btn editor-btn--claim" id="canvas-claim-btn">编辑</button>`;
-    bar.querySelector('#canvas-claim-btn').onclick = _claimEdit;
+    bar.querySelector('#canvas-claim-btn').onclick = _ensureEdit;
     _setCanvasReadonly(true);
   }
 }
 
 function _setCanvasReadonly(readonly) {
   // Don't use pointer-events: none — it blocks all interaction including toast triggers.
-  // Instead, each action handler checks _canEdit() individually.
+  // Instead, each action handler calls _ensureEdit() individually.
   document.querySelectorAll('.sidebar-tool-item').forEach(el => {
     el.draggable = !readonly;
   });
-}
-
-async function _claimEdit() {
-  try {
-    const resp = await fetch('/api/canvas/claim-edit', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: _sessionId }),
-    });
-    const data = await resp.json();
-    if (resp.ok) {
-      _isEditor = true;
-      _currentEditor = _sessionId;
-    } else {
-      _currentEditor = data.editor || null;
-    }
-  } catch { /* silent */ }
-  _updateEditorUI();
 }
 
 async function _releaseEdit() {
@@ -2112,20 +2246,53 @@ async function _releaseEdit() {
   _updateEditorUI();
 }
 
+/**
+ * Adopt a lock state pushed by the server (canvas_editor event) or read from a
+ * poll. Readers reload once the canvas is freed so they end up on the editor's
+ * final layout.
+ */
+function _applyEditorState(editor, reason) {
+  const wasEditor = _isEditor;
+  _currentEditor = editor;
+  _isEditor = editor === _sessionId;
+  _updateEditorUI();
+
+  if (!editor) {
+    if (!wasEditor) {
+      // Canvas just went free — pick up whatever the last editor left behind.
+      _scheduleReload(reason === 'release');
+      if (reason === 'release') _showToast('画布编辑权已释放，可点击「编辑」接管');
+    }
+  } else if (wasEditor && !_isEditor) {
+    _showToast('编辑权已被释放，画布转为只读');
+  }
+}
+
+// Reload debounce: an editor dragging cards autosaves repeatedly, and readers
+// should not refetch on every one of those.
+let _reloadTimer = null;
+let _lastReloadToast = 0;
+
+function _scheduleReload(silent = false) {
+  clearTimeout(_reloadTimer);
+  _reloadTimer = setTimeout(async () => {
+    await _reloadLayout();
+    // Throttled, and skipped when the caller already explained what happened —
+    // otherwise the reload toast would immediately replace that message.
+    if (!silent && Date.now() - _lastReloadToast > 5000) {
+      _lastReloadToast = Date.now();
+      _showToast('画布已更新');
+    }
+  }, 800);
+}
+
 async function _checkEditStatus() {
   try {
-    const resp = await fetch('/api/canvas/edit-status');
+    const resp = await fetch(`/api/canvas/edit-status?session_id=${encodeURIComponent(_sessionId)}`);
     const data = await resp.json();
-    const prevEditor = _isEditor;
-    _currentEditor = data.editor || null;
-    if (_currentEditor === _sessionId) {
-      _isEditor = true;
-    } else if (_isEditor) {
-      // We lost editor status (timeout)
-      _isEditor = false;
-      _logActivity('warn', '编辑权已超时释放（60秒无操作）');
-    }
-    _updateEditorUI();
+    const editor = data.editor || null;
+    if (editor === _currentEditor) return;   // no change — don't re-render or reload
+    _applyEditorState(editor, '');
   } catch { /* silent */ }
 }
 
@@ -2149,17 +2316,31 @@ async function _reloadLayout() {
     _syncEmptyState();
     // Update editor info
     _currentEditor = layoutJson.editor || null;
-    if (_currentEditor === _sessionId) _isEditor = true;
+    _isEditor = _currentEditor === _sessionId;
     _updateEditorUI();
   } catch { /* silent */ }
 }
 
-// Release on page close
-window.addEventListener('beforeunload', () => {
-  if (_isEditor) {
-    navigator.sendBeacon('/api/canvas/release-edit', JSON.stringify({ session_id: _sessionId }));
-  }
-});
+// Release on page close — a fast path only: correctness comes from the backend
+// dropping the lock when this tab's /ws/motus connection closes, since these
+// events never fire on a killed process or a reclaimed mobile tab.
+//
+// The beacon has to carry an application/json Blob (a plain string is sent as
+// text/plain, which FastAPI refuses to JSON-decode) and its own ?token= (it
+// bypasses the fetch patch in auth.js that injects the Authorization header).
+function _releaseBeacon() {
+  if (!_isEditor) return;
+  const token = getToken();
+  const url = '/api/canvas/release-edit' + (token ? `?token=${encodeURIComponent(token)}` : '');
+  const blob = new Blob([JSON.stringify({ session_id: _sessionId })],
+                        { type: 'application/json' });
+  navigator.sendBeacon(url, blob);
+}
+window.addEventListener('pagehide', _releaseBeacon);
+window.addEventListener('beforeunload', _releaseBeacon);
+// Restored from the back/forward cache: the beacon already released our lock, so
+// re-read the real state instead of trusting the stale in-memory flag.
+window.addEventListener('pageshow', (e) => { if (e.persisted) _checkEditStatus(); });
 
 // Periodically check edit status (piggyback on existing polling interval)
 setInterval(_checkEditStatus, 10000);

@@ -1,0 +1,29 @@
+# VITS2 TTS frontend runtime.
+#
+# numpy is deliberately absent. Dockerfile.jetson pins it once, to the version
+# each JetPack's torch/cv2/rapidocr stack was built against, and passes that
+# same pin to this install. Pinning it here downgraded it instead (jp511
+# 1.24.4 -> 1.23.5, jp61 1.26.4 -> 1.24.4), which breaks the numpy C-ABI those
+# wheels were built against. Nothing in this dependency set needs the aliases
+# numpy 1.24 removed: g2p-en 2.1.0, nltk 3.9.1, inflect 7.4.0 and wetext 0.1.6
+# contain no np.bool/np.float/np.int reference, and neither does this plugin.
+#
+# kaldifst is pinned even though wetext only requires it unpinned: 1.7.8 is the
+# newest release with manylinux2014 (glibc 2.17) aarch64 wheels for BOTH cp38
+# (jp511/focal) and cp310 (jp61/jammy). Later releases moved to
+# manylinux_2_26+, and 1.7.9 dropped cp310 entirely, so leaving it unpinned
+# makes the two JetPack builds resolve differently — or fall back to compiling
+# OpenFST from source.
+#
+# wetext also pulls contractions -> textsearch -> pyahocorasick, which has
+# never published a cp38 aarch64 wheel, so jp511 compiles that one C extension
+# during the build (fast natively, slow under qemu). wetext imports
+# contractions at module scope, so it cannot be skipped.
+wetext==0.1.6
+kaldifst==1.7.8
+importlib_resources==5.12.0; python_version < "3.9"
+pypinyin==0.55.0
+jieba==0.42.1
+g2p-en==2.1.0
+inflect==7.4.0
+nltk==3.9.1

@@ -475,6 +475,13 @@ class Subagent:
             try:
                 fn = _event_instance._sys_tools[name]['object']
                 result = await fn(**args)
+                if isinstance(result, list):
+                    # 多模态结果（如 Read 读图片）——子代理的消息装配是纯文本的，
+                    # 直接 str() 会把整段 base64 塞进上下文，只保留文字部分
+                    texts = [p.get('text', '') for p in result
+                             if isinstance(p, dict) and p.get('type') == 'text']
+                    return ('\n'.join(t for t in texts if t) +
+                            '\n(图片内容无法在子代理中查看，请把该路径交给主代理处理)')
                 result_str = str(result) if result else '(no output)'
                 # 截断大结果（WebSearch/WebFetch 等可能返回 6K+ chars）
                 _MAX_TOOL_RESULT = 2500

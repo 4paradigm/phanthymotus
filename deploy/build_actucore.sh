@@ -55,18 +55,12 @@ TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
 BUILD_ARGS=()
 # ── 根据 jp_version 选择 base image  ────────────────────────
-case "${JP_VERSION}" in
-    5.11)
-        BUILD_ARGS+=("JP_VERSION=511")
-        ;;
-    6.1)
-        BUILD_ARGS+=("JP_VERSION=61")
-        ;;
-    *)
-        echo "Unknown JetPack version: ${JP_VERSION} (support: 5.11, 6.1)"
-        exit 1
-        ;;
-esac
+# 表在 build_common.sh 的 jetpack_vars 里，build_perception.sh 共用同一份。
+jetpack_vars "${JP_VERSION}" || exit 1
+BUILD_ARGS+=("JP_VERSION=${JP_ARG}")
+
+# Dockerfile.jetson 基于 L4T base image —— 只有 arm64
+CPU_ARCH="arm64"
 
 # ── navigation 卡片的源码锁 ──────────────────────────────────────────
 # FAST-LIVO2 与 Nav2 都在本镜像里从锁定源码编译（base 是 Focal，没有
@@ -113,6 +107,7 @@ echo "Building actucore image (Jetson only)"
 echo "PyTorch for JetPack: JP${JP_VERSION}"
 echo "Image  : ${FULL_IMAGE}"
 echo "Arch   : ${ARCH} (native=${IS_ARM64})"
+echo "Runs on: ${ACC_ARCH} / ${CPU_ARCH}"
 echo "Push   : ${PUSH_ENABLED}"
 echo "============================================"
 
@@ -156,6 +151,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"registryImage\": \"actucore\",
                 \"tag\": \"${TAG}\",
                 \"category\": \"actucore\",
+                \"acc_arch\": \"${ACC_ARCH}\",
+                \"cpu_arch\": \"${CPU_ARCH}\",
                 \"name\": \"ActuCore\",
                 \"port\": 15730,
                 \"description\": \"执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制，以 processor 卡片接入\"

@@ -130,7 +130,114 @@ async def _do_start_project():
     """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
+    import asyncio as _asyncio
     import json as _json
+
+    LOADING_POLL_S = 3
+    LOADING_TIMEOUT_S = 900
+
+    def _payload(result) -> dict:
+        """Unwrap an MCP call result of either shape into a dict."""
+        if result.get('code') != 200:
+            return {}
+        payload = result.get('data')
+        if isinstance(payload, list) and payload:
+            try:
+                payload = _json.loads(payload[0].get('text', '{}'))
+            except Exception:
+                payload = {}
+        elif isinstance(payload, str):
+            try:
+                payload = _json.loads(payload)
+            except Exception:
+                payload = {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _tool_state(result) -> tuple[str | None, str]:
+        """Pull (state, message) out of an MCP call result of either shape."""
+        if result.get('code') != 200:
+            return None, str(result.get('message') or '')[:200]
+        payload = _payload(result)
+        if not payload:
+            return None, ''
+        return payload.get('state'), str(
+            payload.get('error') or payload.get('message') or payload.get('desc') or ''
+        )[:200]
+
+    async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
+                                   info_args: dict) -> dict:
+        """info() the card, register its topic_out on the bus, return the payload.
+
+        info_args carries the input_topic the card was started with: without it a
+        tool that has no live node yet can only report its fallback output topic
+        (perception TTS answers /perception/tts), and that wrong topic is what
+        the dashboard would then subscribe to — no waveform, while audio flows on
+        the real one.
+        """
+        info = await mcp_call_tool(mcp_id, MCPCallRequest(
+            tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
+                                       **info_args},
+        ))
+        data = _payload(info)
+        topic_out = data.get('topic_out') or []
+        if topic_out:
+            resolved_topics[card_id] = topic_out
+            from api.inspection import register_topic_internal
+            for tp in topic_out:
+                if tp.get('topic') and tp.get('format'):
+                    await register_topic_internal(tp['topic'], tp['format'], mcp_id)
+        return data
+
+    async def _settle_loading_item(mcp_id: str, tool_name: str, card_id: str,
+                                  info_args: dict) -> None:
+        """Poll a card that started into `loading` and report its real outcome.
+
+        Runs detached: a 60 MB model download must not hold up the other cards,
+        and the operator must not be told 已就绪 before the tool can do its job.
+        On success the topics are registered again: they were resolved before the
+        node existed, so only now can the card report the real ones.
+        """
+        deadline = time.time() + LOADING_TIMEOUT_S
+        while time.time() < deadline:
+            await _asyncio.sleep(LOADING_POLL_S)
+            try:
+                info = await mcp_call_tool(mcp_id, MCPCallRequest(
+                    tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
+                                               **info_args},
+                ))
+            except Exception as error:
+                print(f'[start-project] {tool_name} info during load failed: {error}')
+                continue
+            state, message = _tool_state(info)
+            if state == 'loading' or state is None:
+                continue
+            if state == 'idle':
+                # The start was cancelled or the project stopped while the model
+                # was loading. Saying "ready" here would claim a card that is
+                # deliberately not running, so report it as cancelled — which
+                # also releases the frontend's wait on this item.
+                print(f'[start-project] {tool_name} ({mcp_id}) load abandoned (idle)')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'cancelled',
+                    'message': '启动已取消',
+                }})
+                return
+            status = 'error' if state == 'error' else 'ready'
+            print(f'[start-project] {tool_name} ({mcp_id}) settled: {state}')
+            if status == 'ready':
+                try:
+                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+                except Exception as error:
+                    print(f'[start-project] {tool_name} topic re-register failed: {error}')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name, 'mcp_id': mcp_id, 'status': status,
+                'message': message if status == 'error' else '',
+            }})
+            return
+        await push_event({'type': 'project_start_item', 'payload': {
+            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+            'message': f'模型加载超过 {LOADING_TIMEOUT_S // 60} 分钟仍未就绪',
+        }})
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
@@ -170,10 +277,13 @@ async def _do_start_project():
         }})
 
         args = {'action': 'start', 'instance_id': card_id}
+        info_args: dict = {}
         if input_topics and len(input_topics) > 1:
             args['input_topics'] = input_topics
+            info_args['input_topics'] = input_topics
         elif input_topic:
             args['input_topic'] = input_topic
+            info_args['input_topic'] = input_topic
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -200,42 +310,42 @@ async def _do_start_project():
                         'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
                     }})
                     errors.append(tool_name)
+                elif tool_state == 'loading':
+                    # The tool accepted the start but is not usable yet — it is
+                    # fetching or building a model (perception TTS/OCR do this;
+                    # a cold VITS2 release is a 60 MB download plus a TensorRT
+                    # warmup). Reporting "已就绪" here is how the operator ended
+                    # up with a card that claimed ready ~25 s before it could
+                    # speak. Keep it visibly starting and let a watcher settle
+                    # it, so the rest of the pipeline is not held up either.
+                    message = tool_message or '模型加载中，就绪后自动开始'
+                    print(f'[start-project] {tool_name} ({mcp_id}) loading: {message}')
+                    await push_event({'type': 'project_start_item', 'payload': {
+                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'loading',
+                        'message': message,
+                    }})
+                    _asyncio.create_task(
+                        _settle_loading_item(mcp_id, tool_name, card_id, info_args)
+                    )
                 else:
                     print(f'[start-project] started {tool_name} ({mcp_id})')
                     await push_event({'type': 'project_start_item', 'payload': {
                         'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
                     }})
-                # After successful start, query info() to get resolved topic_out
+                # Resolve topic_out for the downstream cards and register it on
+                # the bus. Non-fatal: a card that cannot answer info() still runs.
                 try:
-                    info_req = MCPCallRequest(tool=tool_name, arguments={'action': 'info', 'instance_id': card_id})
-                    info_result = await mcp_call_tool(mcp_id, info_req)
-                    if info_result.get('code') == 200:
-                        data = info_result.get('data')
-                        # Parse MCP JSON-RPC content format: [{"type":"text","text":"..."}]
-                        if isinstance(data, list) and data:
-                            text = data[0].get('text', '{}') if isinstance(data[0], dict) else '{}'
-                            try:
-                                data = _json.loads(text)
-                            except Exception:
-                                data = {}
-                        elif isinstance(data, str):
-                            try:
-                                data = _json.loads(data)
-                            except Exception:
-                                data = {}
-                        if isinstance(data, dict):
-                            topic_out = data.get('topic_out', [])
-                            if topic_out:
-                                resolved_topics[card_id] = topic_out
-                                # Register resolved topics so WebSocket relay works
-                                from api.inspection import register_topic_internal
-                                for tp in topic_out:
-                                    if tp.get('topic') and tp.get('format'):
-                                        await register_topic_internal(tp['topic'], tp['format'], mcp_id)
-                except Exception:
-                    pass  # info() failure is non-fatal
+                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+                except Exception as error:
+                    print(f'[start-project] {tool_name} info() failed: {error}')
             else:
-                msg = str(result.get('detail', result.get('data', '')))[:100]
+                # `message` is where mcp_call_tool puts the human-readable
+                # reason; `data` is None on those responses, so reading data
+                # first surfaced the literal string "None" to the operator.
+                msg = str(result.get('message')
+                          or result.get('detail')
+                          or result.get('data')
+                          or f'启动失败 (code={result.get("code")})')[:200]
                 print(f'[start-project] {tool_name} error: {result}')
                 await push_event({'type': 'project_start_item', 'payload': {
                     'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': msg,
@@ -281,6 +391,19 @@ async def _do_start_project():
             return topics[0], []
         return '', []
 
+    # 先确保 channel adapters 已连接（被 Stop 过 / 上次启动失败的在此拉起）。
+    # 必须在卡片启动之前：channel 卡片的自检要求 adapter 真的连通，
+    # 放在最后会让自检先失败触发整体回滚，永远走不到这里。
+    from channel.manager import manager as channel_mgr, _get_channel_configs
+    channel_mgr.sync_from_canvas()
+    for ch_cfg in _get_channel_configs():
+        ch_id = ch_cfg.get('id', '')
+        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
+            try:
+                await channel_mgr.restart_adapter(ch_id, retries=1)
+            except Exception as e:
+                print(f'[start-project] channel {ch_id} restart failed: {e}')
+
     # Phase 1: start sources (no input_topic needed) and collect their topic_out
     for card in sources:
         await _start_and_resolve(card)
@@ -314,17 +437,6 @@ async def _do_start_project():
         await _do_stop_project()
         return False
 
-    # 确保 channel adapters 已连接（restart 断开的 adapter）
-    from channel.manager import manager as channel_mgr, _get_channel_configs
-    channel_mgr.sync_from_canvas()
-    for ch_cfg in _get_channel_configs():
-        ch_id = ch_cfg.get('id', '')
-        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
-            try:
-                await channel_mgr.restart_adapter(ch_id)
-            except Exception as e:
-                print(f'[start-project] channel {ch_id} restart failed: {e}')
-
     # 广播启动完成
     await push_event({'type': 'project_start_done', 'payload': {'has_error': False}})
     await push_event({'type': 'project_state', 'payload': {'running': True}})
@@ -332,21 +444,16 @@ async def _do_start_project():
     return True
 
 
-async def _do_stop_project():
-    """停止所有 canvas cards。"""
+async def _stop_cards(cards) -> int:
+    """Send `stop` to each card's instance. Returns how many calls were made.
+
+    `stop` is idempotent — a plugin that is already idle returns
+    `{"state": "idle"}` — so this is safe to call on cards that were never
+    started.
+    """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
-    from api.motus_stream import push_event
 
-    layout = config.main.get('canvas_layout', {})
-    cards = layout.get('cards', [])
-
-    # 先关运行态和 topic actions，避免停卡过程再接收新动作。
-    core = config.main.get('core', {})
-    core['project_running'] = False
-    config.main['core'] = core
-    from topic_actions import manager as topic_action_mgr
-    await topic_action_mgr.stop()
-
+    stopped = 0
     for card in cards:
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -356,8 +463,51 @@ async def _do_stop_project():
         try:
             req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
             await mcp_call_tool(mcp_id, req)
+            stopped += 1
         except Exception:
             pass
+    return stopped
+
+
+async def stop_removed_cards(old_cards, new_cards) -> int:
+    """Stop instances belonging to cards that just left the layout.
+
+    `_do_stop_project` stops what the *saved layout* lists, so a card removed
+    from the layout can never be reached again: its plugin instance keeps its ROS
+    node, its subscription, and any subprocess or CUDA context until perception
+    exits. The symptoms are a topic with a publisher nothing on the canvas
+    accounts for (an old TTS node still publishing to a topic whose connection
+    was deleted), duplicate output when a replacement card publishes alongside
+    it, and rclpy refusing the node name on restart.
+
+    The frontend stops the card it deletes itself, but that only covers one path.
+    Layout reload, loading a solution, and a browser that dies between removing
+    the card and saving all go through a layout write, so the diff is enforced
+    here where every path meets.
+    """
+    live = {c.get('id', '') for c in (new_cards or []) if c.get('id')}
+    removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
+    if not removed:
+        return 0
+    count = await _stop_cards(removed)
+    print(f'[layout] stopped {count} instance(s) for removed card(s): '
+          f'{", ".join(c.get("id", "") for c in removed)}')
+    return count
+
+
+async def _do_stop_project():
+    """停止所有 canvas cards。"""
+    from api.motus_stream import push_event
+
+    # 先关运行态和 topic actions，避免停卡过程再接收新动作。
+    core = config.main.get('core', {})
+    core['project_running'] = False
+    config.main['core'] = core
+    from topic_actions import manager as topic_action_mgr
+    await topic_action_mgr.stop()
+
+    layout = config.main.get('canvas_layout', {})
+    await _stop_cards(layout.get('cards', []))
 
     await push_event({'type': 'project_state', 'payload': {'running': False}})
     print('[stop-project] done')
@@ -919,4 +1069,3 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
-
