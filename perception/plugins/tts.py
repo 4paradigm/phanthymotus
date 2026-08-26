@@ -267,6 +267,8 @@ class TRTTSAdapter(TTSAdapter):
         # mxd_m45d5e6 微调：encoder/flow/dp 与 mel20full_d50 冻结，仅 decoder 不同，
         # 因此 n_fft/hop/gain 完全一致，只换 decoder.trt。
         "mel20full_d50_mxd": {"n_fft": 128, "hop": 4, "gain": 0.0833},
+        # mxd_m45d5e6_wav1 微调：同样只 decoder 不同（encoder/flow/dp 冻结）。
+        "mel20full_d50_mxd_wav1": {"n_fft": 128, "hop": 4, "gain": 0.0833},
     }
 
     # 每个 chunk 最大字符数，保证 decoder 输入 Ty 不超过 TRT max shape (JP5=1500)
