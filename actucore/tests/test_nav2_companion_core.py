@@ -633,6 +633,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("command.twist.linear.x", source)
         self.assertIn("command.twist.angular.z", source)
         self.assertNotIn("command.twist.linear.y", source)
+        self.assertIn("nav2_costmap_2d::LETHAL_OBSTACLE", source)
+        self.assertNotIn("nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE", source)
         self.assertIn("max_velocity: [1.0, 0.0, 2.0]", smoother)
         self.assertIn("min_velocity: [0.0, 0.0, -2.0]", smoother)
         self.assertIn("odom_topic: /ubuntu/navigation/odom", smoother)

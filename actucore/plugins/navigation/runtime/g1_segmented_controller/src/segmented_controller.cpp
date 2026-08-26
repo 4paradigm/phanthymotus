@@ -366,7 +366,7 @@ bool SegmentedController::straightPathSafe(
     const double ratio = static_cast<double>(sample) / samples;
     const double cost = collision_checker_->footprintCostAtPose(
       x + (end_x - x) * ratio, y + (end_y - y) * ratio, yaw, footprint);
-    if (cost < 0.0 || cost >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+    if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
       return false;
     }
   }
@@ -382,7 +382,7 @@ bool SegmentedController::rotationSafe(
   for (int sample = 0; sample <= samples; ++sample) {
     const double yaw = from_yaw + delta * static_cast<double>(sample) / samples;
     const double cost = collision_checker_->footprintCostAtPose(x, y, yaw, footprint);
-    if (cost < 0.0 || cost >= nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+    if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
       return false;
     }
   }

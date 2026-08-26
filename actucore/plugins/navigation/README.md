@@ -32,6 +32,8 @@ camera RGB + depth frame ──┴─> ControlledSemanticSpatial card (ActuCore 
 - Nav2 保留 NavFn、rolling costmap 和重规划，局部执行改为 G1 分段
   `停稳 -> 原地转向 -> 直行 -> 停稳复查`。控制和位姿检查为
   20 Hz，非零 proposal 仍为 5 Hz，零速立即发布。
+- 分段执行的转向和直行预检只在 footprint 命中 Nav2
+  `LETHAL_OBSTACLE` 时拒绝；膨胀安全带仅用于代价与规划，不冒充实体碰撞。
 
 ## 外部输入
 
