@@ -352,7 +352,9 @@ class NavigationContractTest(unittest.TestCase):
             "torchaudio",
         ):
             self.assertNotIn(perception_only, dockerfile)
-        self.assertIn("pyyaml requests", dockerfile)
+        self.assertNotIn("pip3 install", dockerfile)
+        self.assertNotIn("python3-pip", dockerfile)
+        self.assertNotIn("deploy/ros-base/audio_msgs", dockerfile)
         self.assertIn("COPY actucore/main.py", dockerfile)
         self.assertIn("COPY actucore/utils/", dockerfile)
         self.assertIn("COPY actucore/deploy/     /deploy/", dockerfile)
@@ -377,8 +379,16 @@ class NavigationContractTest(unittest.TestCase):
             for block in dockerfile.split("--packages-select")[1:]
         ]
         nav2_select = next(b for b in select_blocks if "nav2_bringup" in b)
-        self.assertIn("nav2_dwb_controller", nav2_select)
-        self.assertIn("nav2_rotation_shim_controller", nav2_select)
+        for unused in (
+            "nav2_dwb_controller",
+            "dwb_core",
+            "dwb_critics",
+            "dwb_msgs",
+            "dwb_plugins",
+            "nav2_rotation_shim_controller",
+            "nav2_map_server",
+        ):
+            self.assertNotIn(unused, nav2_select)
         # 刻意不编的那批：会把 ompl / ceres / xtensor / Qt5 拖进来。
         # 只靠 --packages-select 挡不住 colcon 顺 test_depend 去要它们，
         # 所以镜像里还会给这些目录放 COLCON_IGNORE。
@@ -399,14 +409,20 @@ class NavigationContractTest(unittest.TestCase):
             "FAST_LIVO2_PCD_SAVE_PATCH_SHA256",
             "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256",
             "RPG_VIKIT_REPO",
-            "LIVOX_ROS_DRIVER2_REPO",
-            "LIVOX_SDK2_REPO",
             "SOPHUS_REPO",
             "NAVIGATION2_REPO",
             "NAVIGATION2_COMMIT",
             "BEHAVIORTREE_CPP_COMMIT",
         ):
             self.assertIn(f'"{variable}=${{{variable}}}"', build_script)
+        for removed in (
+            "LIVOX_ROS_DRIVER2_REPO",
+            "LIVOX_ROS_DRIVER2_COMMIT",
+            "LIVOX_SDK2_REPO",
+            "LIVOX_SDK2_COMMIT",
+        ):
+            self.assertNotIn(removed, build_script)
+        self.assertIn("ACTUCORE_BUILD_DURATION_SEC=", build_script)
 
     def test_g1_deploy_uses_default_actucore_builder(self):
         deploy_script = (

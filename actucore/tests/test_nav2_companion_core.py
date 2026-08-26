@@ -570,7 +570,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn(
-            "--packages-select audio_msgs g1_fast_livo2 g1_segmented_controller g1_nav2",
+            "--packages-select g1_fast_livo2 g1_segmented_controller g1_nav2",
             dockerfile,
         )
         self.assertIn("ros2 pkg prefix g1_segmented_controller", dockerfile)

@@ -112,6 +112,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         runtime_patch = runtime / "patches" / "fast-livo2-runtime.patch"
         pcd_patch = runtime / "patches" / "fast-livo2-pcd-save.patch"
         flush_patch = runtime / "patches" / "fast-livo2-pcd-flush.patch"
+        livox_messages = runtime / "livox_ros_driver2_msgs"
 
         self.assertIn(
             "FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea",
@@ -131,9 +132,6 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
         self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
-        self.assertIn(
-            "APT_UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn", source_lock
-        )
         self.assertIn("import numpy, rosbag2_py", dockerfile)
         self.assertIn("ros2 bag record --help", dockerfile)
         self.assertIn(
@@ -154,15 +152,26 @@ class FastLivo2ContractTest(unittest.TestCase):
             "FAST_LIVO2_COMMIT",
             "RPG_VIKIT_REPO",
             "RPG_VIKIT_COMMIT",
-            "LIVOX_ROS_DRIVER2_REPO",
-            "LIVOX_ROS_DRIVER2_COMMIT",
-            "LIVOX_SDK2_REPO",
-            "LIVOX_SDK2_COMMIT",
             "SOPHUS_REPO",
             "SOPHUS_COMMIT",
         ):
             self.assertIn(f"{variable}=", source_lock)
             self.assertIn(f"${{{variable}}}", dockerfile)
+        for removed in (
+            "LIVOX_ROS_DRIVER2_REPO",
+            "LIVOX_ROS_DRIVER2_COMMIT",
+            "LIVOX_SDK2_REPO",
+            "LIVOX_SDK2_COMMIT",
+        ):
+            self.assertNotIn(removed, source_lock)
+            self.assertNotIn(removed, dockerfile)
+        self.assertTrue((livox_messages / "msg" / "CustomMsg.msg").is_file())
+        self.assertTrue((livox_messages / "msg" / "CustomPoint.msg").is_file())
+        self.assertIn(
+            "COPY actucore/plugins/navigation/runtime/livox_ros_driver2_msgs/",
+            dockerfile,
+        )
+        self.assertIn('test -z "$(ros2 pkg executables livox_ros_driver2)"', dockerfile)
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
             "534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b",
@@ -194,6 +203,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertIn("git apply --check /tmp/fast-livo2-pcd-save.patch", dockerfile)
         self.assertIn("--packages-select livox_ros_driver2 vikit_common vikit_ros", dockerfile)
+        self.assertNotIn("/tmp/livox-sdk2", dockerfile)
         self.assertIn("--packages-select fast_livo", dockerfile)
         self.assertIn("PCD finalization completed", dockerfile)
         self.assertIn("g1_fast_livo2", dockerfile)

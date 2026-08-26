@@ -188,8 +188,9 @@ planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第�
 
 统一镜像基于 `jetson-base:jp<JP_VERSION>-torch`（Ubuntu 20.04 / Python 3.8，
 ROS Humble 是 `/opt/ros/humble/install` 下的**源码 install-space**）。构建时按
-完整 SHA 拉取 Livox SDK2、Livox ROS Driver2、Sophus、Vikit 和 FAST-LIVO2，校验
-并应用两份 G1 补丁，再编译 FAST-LIVO2、Nav2 与两套 ROS adapter。
+完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并应用三份 G1 补丁，再编译
+FAST-LIVO2、Nav2 与两套 ROS adapter。G1 输入使用标准 PointCloud2；镜像只内置
+FAST-LIVO2 编译所需的两条 Livox 消息定义，不再编译未运行的 Livox SDK2/Driver。
 
 **Nav2 也是源码编译**，不是 apt：base 是 Focal，而 `ros-humble-*` 的 Debian 包
 只有 Jammy 版本，所以 `navigation2` 连同 base 里缺的
@@ -198,9 +199,9 @@ ROS Humble 是 `/opt/ros/humble/install` 下的**源码 install-space**）。构
 迁移前的 `ros-humble-navigation2=1.1.20-1jammy` 是同一个上游 release，运行行为
 不随打包形态变化。运行时加载 planner/controller/smoother/
 behavior/bt_navigator/waypoint_follower/velocity_smoother + navfn、costmap 三层，
-以及卡片自带的 `g1_segmented_controller`。DWB/rotation shim 包仅作为
-上游 navigation2 组合构建兼容项保留，配置不加载；amcl、smac、mppi、constrained_smoother、route、
-rviz_plugins 刻意不编，它们会把 ompl、ceres、xtensor、Qt5 拖进镜像。
+以及卡片自带的 `g1_segmented_controller`。amcl、map_server、DWB、rotation shim、
+smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们已被当前
+链路取代，或会把 ompl、ceres、xtensor、Qt5 等无用依赖拖进镜像。
 
 镜像里**没有** torch / CLIP / YOLO / ASR 依赖 —— 卡片自身只用标准库 + ROS
 消息包，语义航点是 HTTP 调远端 VLM。那些模型依赖属于 perception。
@@ -213,7 +214,8 @@ FetchContent 也经同一镜像重写）。
 
 这是仓库默认的 ActuCore 构建入口，只有 Jetson 一个变体，无需 Navigation 专用
 wrapper，也无需预构建 FAST-LIVO2 或 Nav2 镜像。首次构建约 1-3 小时（源码编译
-Nav2 是主要开销），之后走 layer 缓存。
+Nav2 是主要开销），之后走 layer 缓存。构建成功后脚本输出
+`ACTUCORE_BUILD_DURATION_SEC=<秒数>`，用于比较依赖精简前后的真机构建耗时。
 
 G1 临时验收只创建一个容器。将构建输出的精确镜像名传入：
 

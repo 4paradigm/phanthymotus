@@ -17,8 +17,7 @@
 # 编译顺序按"越贵越靠后"排：系统依赖 → 缺失的 ROS 依赖 → FAST-LIVO2（成熟
 # 配方）→ Nav2（最重）→ 应用代码。失败重来时前面的 layer 都还在缓存里。
 #
-# Build context: repo root (phanthymotus/) so we can access both
-# actucore/ and deploy/ros-base/audio_msgs/
+# Build context: repo root (phanthymotus/).
 #
 # Usage:
 #   ./deploy/build_actucore.sh --mirror tuna
@@ -33,7 +32,7 @@ ARG PYPI_MIRROR APT_MIRROR
 # colcon 的 source / bash 数组都要 bash，pipefail 保证管道里的失败不被吞掉
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# 并行度：Orin 8 核 16G 上 -j4 是不 OOM 的上限（nav2_costmap_2d / dwb 最吃内存）
+# 并行度：Orin 8 核 16G 上 -j4 是不 OOM 的上限（nav2_costmap_2d 最吃内存）
 ARG BUILD_JOBS=4
 
 # ── 源码锁（由 deploy/build_actucore.sh 从 *-source-lock.env 传入）────
@@ -45,10 +44,6 @@ ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=b3afa3e64b5743898c829fe34891f828027eb372324
 ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=1484bfba11408e3efd87360a63fef1787f2b2ceaf75e8d8abdd5a17e3474beeb
 ARG RPG_VIKIT_REPO=https://github.com/Rhymer-Lcy/rpg_vikit_ros2_fisheye.git
 ARG RPG_VIKIT_COMMIT=0b5548d9adab58128f3a59a507e96a83acfa8fdf
-ARG LIVOX_ROS_DRIVER2_REPO=https://github.com/Livox-SDK/livox_ros_driver2.git
-ARG LIVOX_ROS_DRIVER2_COMMIT=13eb05e4e6dd7a765b934d0c5fd6236676a57b49
-ARG LIVOX_SDK2_REPO=https://github.com/Livox-SDK/Livox-SDK2.git
-ARG LIVOX_SDK2_COMMIT=f5d9375f84efe2b15bc0a052d3e18482ed13adf4
 ARG SOPHUS_REPO=https://github.com/strasdat/Sophus.git
 ARG SOPHUS_COMMIT=de0f8d3d92bf776271e16de56d1803940ebccab9
 ARG NAVIGATION2_REPO=https://github.com/ros-navigation/navigation2.git
@@ -76,8 +71,6 @@ ARG ROSBAG2_STORAGE_MCAP_COMMIT=c1c2159679921a4f4392f370172c28e7b3b01452
 RUN for revision in \
       "${FAST_LIVO2_COMMIT}" \
       "${RPG_VIKIT_COMMIT}" \
-      "${LIVOX_ROS_DRIVER2_COMMIT}" \
-      "${LIVOX_SDK2_COMMIT}" \
       "${SOPHUS_COMMIT}" \
       "${NAVIGATION2_COMMIT}" \
       "${BEHAVIORTREE_CPP_COMMIT}" \
@@ -109,8 +102,8 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
     fi
 
 # ── 系统依赖 ────────────────────────────────────────────────────────
-# FAST-LIVO2: eigen / boost / pcl / fmt / apr
-# Nav2:       graphicsmagick（nav2_map_server）、boost-program-options
+# FAST-LIVO2: eigen / boost / pcl / fmt
+# Nav2:       boost-program-options
 # OpenCV 特意不装：base 里已经有 L4T 那份带 CUDA 的 4.5，apt 的 4.2 会抢赢
 # find_package 并和 python cv2 对不上；只在确实缺的时候才补。
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
@@ -119,19 +112,13 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
       cmake \
       git \
       pkg-config \
-      libapr1-dev \
       libboost-all-dev \
       libeigen3-dev \
       libfmt-dev \
-      libgraphicsmagick++1-dev \
-      libpcl-dev \
-      python3-pip && \
+      libpcl-dev && \
     { pkg-config --exists opencv4 || \
       apt-get install -y --no-install-recommends --allow-unauthenticated libopencv-dev; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
 
 # ── base 之外缺的 ROS 依赖 ──────────────────────────────────────────
 # 全部克隆下来，但只编 base 里查不到的那些：重复 overlay 一个消息包会让
@@ -267,19 +254,7 @@ RUN for header in $(find /opt/ros/humble/install/include -path '*tf2*' -name '*.
     test -f /opt/ros/humble/install/include/tf2/tf2/LinearMath/Quaternion.hpp && \
     test -f /opt/ros/humble/install/include/tf2/tf2/utils.hpp
 
-# ── FAST-LIVO2 依赖图（锁定源码，两个 G1 patch 先验 sha256 再打）────────
-RUN git init /tmp/livox-sdk2 && \
-    cd /tmp/livox-sdk2 && \
-    git remote add origin "${GIT_MIRROR_PREFIX}${LIVOX_SDK2_REPO}" && \
-    git fetch --depth 1 origin "${LIVOX_SDK2_COMMIT}" && \
-    git checkout --detach FETCH_HEAD && \
-    test "$(git rev-parse HEAD)" = "${LIVOX_SDK2_COMMIT}" && \
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
-    cmake --build build --parallel "${BUILD_JOBS}" && \
-    cmake --install build && \
-    rm -rf /tmp/livox-sdk2 && \
-    ldconfig
-
+# ── FAST-LIVO2 依赖图（锁定源码，三个 G1 patch 先验 sha256 再打）────────
 RUN git init /tmp/sophus && \
     cd /tmp/sophus && \
     git remote add origin "${GIT_MIRROR_PREFIX}${SOPHUS_REPO}" && \
@@ -296,14 +271,11 @@ RUN git init /tmp/sophus && \
 
 WORKDIR /opt/fast_livo_ws/src
 
-RUN git init livox_ros_driver2 && \
-    cd livox_ros_driver2 && \
-    git remote add origin "${GIT_MIRROR_PREFIX}${LIVOX_ROS_DRIVER2_REPO}" && \
-    git fetch --depth 1 origin "${LIVOX_ROS_DRIVER2_COMMIT}" && \
-    git checkout --detach FETCH_HEAD && \
-    test "$(git rev-parse HEAD)" = "${LIVOX_ROS_DRIVER2_COMMIT}" && \
-    cp package_ROS2.xml package.xml && \
-    cp -r launch_ROS2 launch
+# 当前 G1 输入是标准 PointCloud2（lidar_type=7），不会启动 Livox Driver。
+# FAST-LIVO2 上游仍编译引用两条 CustomMsg 类型，因此只保留 message-only 接口，
+# 不再拉取或编译 Livox SDK2/Driver 实现。
+COPY actucore/plugins/navigation/runtime/livox_ros_driver2_msgs/ \
+     /opt/fast_livo_ws/src/livox_ros_driver2/
 
 RUN git init rpg_vikit_ros2_fisheye && \
     cd rpg_vikit_ros2_fisheye && \
@@ -359,6 +331,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
         -DDISTRO_ROS=humble \
         -DCMAKE_BUILD_TYPE=Release && \
     source install/setup.bash && \
+    test -z "$(ros2 pkg executables livox_ros_driver2)" && \
     MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
       --executor sequential \
       --packages-select fast_livo \
@@ -378,8 +351,7 @@ RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
 # ── Nav2（最重的一层，放最后编）─────────────────────────────────────
 # 只编卡片真正会加载的那一档：navigation_launch.py 起的 planner/controller/
 # smoother/behavior/bt_navigator/waypoint_follower/velocity_smoother +
-# nav2_params.yaml 里点名的 navfn / costmap 三层。DWB / rotation shim 仍
-# 作为上游 navigation2 组合包的构建兼容依赖保留，运行配置不加载。
+# nav2_params.yaml 里点名的 navfn / costmap 三层。
 # 用不到的包直接放 COLCON_IGNORE：光靠 --packages-select 挡不住 colcon 顺着
 # test_depend 去要它们（nav2_rotation_shim_controller test-depend 了 RPP），
 # 而它们会把 ompl、ceres、xtensor、Qt5 拖进镜像。
@@ -396,13 +368,21 @@ RUN git init navigation2 && \
         nav2_constrained_smoother \
         nav2_graceful_controller \
         nav2_mppi_controller \
+        nav2_map_server \
         nav2_regulated_pure_pursuit_controller \
+        nav2_rotation_shim_controller \
         nav2_route \
         nav2_rviz_plugins \
         nav2_simple_commander \
         nav2_smac_planner \
         nav2_system_tests \
-        nav2_theta_star_planner; do \
+        nav2_theta_star_planner \
+        navigation2 \
+        dwb_core \
+        dwb_critics \
+        dwb_msgs \
+        dwb_plugins \
+        nav2_dwb_controller; do \
       touch "${excluded}/COLCON_IGNORE"; \
     done
 
@@ -419,7 +399,6 @@ RUN source /opt/ros/humble/install/setup.bash && \
         nav2_core \
         nav2_voxel_grid \
         nav2_costmap_2d \
-        nav2_map_server \
         nav2_behavior_tree \
         nav2_behaviors \
         nav2_bt_navigator \
@@ -430,16 +409,9 @@ RUN source /opt/ros/humble/install/setup.bash && \
         nav2_velocity_smoother \
         nav2_waypoint_follower \
         nav2_lifecycle_manager \
-        nav2_rotation_shim_controller \
         nav_2d_msgs \
         nav_2d_utils \
         costmap_queue \
-        dwb_msgs \
-        dwb_core \
-        dwb_critics \
-        dwb_plugins \
-        nav2_dwb_controller \
-        navigation2 \
         nav2_bringup \
       --cmake-args -DCMAKE_BUILD_TYPE=Release
 
@@ -470,10 +442,9 @@ RUN source /opt/ros/humble/install/setup.bash && \
     done && \
     ros2 pkg list | sort > /opt/actucore-ros-package-lock.txt && \
     grep -Fqx nav2_bringup /opt/actucore-ros-package-lock.txt && \
-    grep -Fqx nav2_dwb_controller /opt/actucore-ros-package-lock.txt
+    ! grep -Fqx nav2_dwb_controller /opt/actucore-ros-package-lock.txt
 
-# ── 自研 ROS 包（audio_msgs + 导航卡片 runtime）──────────────────
-COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
+# ── 自研导航卡片 ROS runtime ───────────────────────────────────────
 COPY actucore/plugins/navigation/runtime/g1_fast_livo2/ /ros_ws/src/g1_fast_livo2/
 COPY actucore/plugins/navigation/runtime/g1_nav2/ /ros_ws/src/g1_nav2/
 COPY actucore/plugins/navigation/runtime/g1_segmented_controller/ /ros_ws/src/g1_segmented_controller/
@@ -483,7 +454,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
     source /opt/fast_livo_ws/install/setup.bash && \
     cd /ros_ws && \
     MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
-      --packages-select audio_msgs g1_fast_livo2 g1_segmented_controller g1_nav2 \
+      --packages-select g1_fast_livo2 g1_segmented_controller g1_nav2 \
       --symlink-install && \
     source /ros_ws/install/setup.bash && \
     ros2 pkg prefix g1_segmented_controller >/dev/null && \
@@ -491,14 +462,6 @@ RUN source /opt/ros/humble/install/setup.bash && \
     ros2 bag record --help >/dev/null
 
 COPY actucore/plugins/navigation/runtime/g1_lio.yaml /config/g1_lio.yaml
-
-# ── Python 依赖 ────────────────────────────────────────────────────
-# 导航卡片本身只用标准库 + NumPy + ROS 消息包（语义航点的 VLM 走
-# urllib 调远端），所以这层没有任何模型/视觉依赖 ——
-# torch、CLIP、YOLO、ASR 那些属于
-# perception，别往这里加。
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml requests
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
@@ -519,11 +482,11 @@ RUN find /ros_ws/install /opt/nav2_ws/install /opt/ros_deps_ws/install \
     find /opt/ros/humble/install -name "site-packages" -type d \
       >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth
 
-# ROS2 shared libraries（audio_msgs / nav2_msgs / fast_livo .so 等）
+# ROS2 shared libraries（nav2_msgs / fast_livo .so 等）
 # 三个 merge-install 工作区各有一个 lib/；/ros_ws 与 fast_livo_ws 是按包安装的，
 # 所以要逐个列。CMD 里 source setup.bash 才是主路径，这里是不 source 时的兜底。
-ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/install/livox_ros_driver2/lib:/opt/fast_livo_ws/install/vikit_common/lib:/opt/fast_livo_ws/install/vikit_ros/lib:/opt/nav2_ws/install/lib:/opt/ros_deps_ws/install/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
-ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/ros_ws/install/g1_fast_livo2:/ros_ws/install/g1_segmented_controller:/ros_ws/install/g1_nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
+ENV LD_LIBRARY_PATH="/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/install/livox_ros_driver2/lib:/opt/fast_livo_ws/install/vikit_common/lib:/opt/fast_livo_ws/install/vikit_ros/lib:/opt/nav2_ws/install/lib:/opt/ros_deps_ws/install/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV AMENT_PREFIX_PATH="/ros_ws/install/g1_fast_livo2:/ros_ws/install/g1_segmented_controller:/ros_ws/install/g1_nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42
