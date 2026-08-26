@@ -265,18 +265,29 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIsNone(
             control_odom_motion_blocker(
                 ready,
-                receive_max_age_sec=0.20,
-                source_max_age_sec=0.25,
+                receive_max_age_sec=0.60,
+                source_max_age_sec=0.80,
+            )
+        )
+
+        scheduling_spike = dict(ready)
+        scheduling_spike["odom_status_age_sec"] = 0.316
+        scheduling_spike["odom_source_age_sec"] = 0.499
+        self.assertIsNone(
+            control_odom_motion_blocker(
+                scheduling_spike,
+                receive_max_age_sec=0.60,
+                source_max_age_sec=0.80,
             )
         )
 
         control_stale = dict(ready)
-        control_stale["odom_status_age_sec"] = 0.21
+        control_stale["odom_status_age_sec"] = 0.61
         self.assertEqual(
             control_odom_motion_blocker(
                 control_stale,
-                receive_max_age_sec=0.20,
-                source_max_age_sec=0.25,
+                receive_max_age_sec=0.60,
+                source_max_age_sec=0.80,
             ),
             "navigation_not_ready:control_odom_stale",
         )
@@ -692,8 +703,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertIn('"sensor_max_age_sec": 0.8', launch)
         self.assertIn('"sensor_source_max_age_sec": 1.0', launch)
-        self.assertIn('"control_odom_max_age_sec": 0.20', launch)
-        self.assertIn('"control_odom_source_max_age_sec": 0.25', launch)
+        self.assertIn('"control_odom_max_age_sec": 0.60', launch)
+        self.assertIn('"control_odom_source_max_age_sec": 0.80', launch)
         self.assertIn(
             "odom_source_age = self._source_age(odom_source_stamp_ns)",
             command,

@@ -128,8 +128,8 @@ def generate_launch_description() -> LaunchDescription:
                         "goal_costmap_max_age_sec": 2.0,
                         "sensor_max_age_sec": 0.8,
                         "sensor_source_max_age_sec": 1.0,
-                        "control_odom_max_age_sec": 0.20,
-                        "control_odom_source_max_age_sec": 0.25,
+                        "control_odom_max_age_sec": 0.60,
+                        "control_odom_source_max_age_sec": 0.80,
                     }
                 ],
             ),

@@ -111,8 +111,8 @@ class PlannerCommandNode(Node):
         self.declare_parameter("goal_costmap_max_age_sec", 2.0)
         self.declare_parameter("sensor_max_age_sec", 0.8)
         self.declare_parameter("sensor_source_max_age_sec", 1.0)
-        self.declare_parameter("control_odom_max_age_sec", 0.20)
-        self.declare_parameter("control_odom_source_max_age_sec", 0.25)
+        self.declare_parameter("control_odom_max_age_sec", 0.60)
+        self.declare_parameter("control_odom_source_max_age_sec", 0.80)
         self.declare_parameter(
             "required_lifecycle_nodes",
             [
