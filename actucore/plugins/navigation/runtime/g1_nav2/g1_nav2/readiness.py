@@ -96,4 +96,31 @@ def navigation_motion_blocker(readiness: dict) -> str | None:
     return "navigation_not_ready:" + ",".join(str(item) for item in blockers)
 
 
-__all__ = ["evaluate_readiness", "navigation_motion_blocker"]
+def control_odom_motion_blocker(
+    readiness: dict,
+    *,
+    receive_max_age_sec: float,
+    source_max_age_sec: float,
+) -> str | None:
+    """Require fresher odometry for motion than for goal admission."""
+
+    blocker = navigation_motion_blocker(readiness)
+    if blocker is not None:
+        return blocker
+    receive_age = readiness.get("odom_status_age_sec")
+    source_age = readiness.get("odom_source_age_sec")
+    if (
+        not isinstance(receive_age, (int, float))
+        or receive_age > receive_max_age_sec
+        or not isinstance(source_age, (int, float))
+        or not -0.1 <= source_age <= source_max_age_sec
+    ):
+        return "navigation_not_ready:control_odom_stale"
+    return None
+
+
+__all__ = [
+    "control_odom_motion_blocker",
+    "evaluate_readiness",
+    "navigation_motion_blocker",
+]

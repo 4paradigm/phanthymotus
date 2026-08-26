@@ -14,6 +14,7 @@ PACKAGE_ROOT = (
     / "runtime"
     / "g1_nav2"
 )
+SEGMENTED_CONTROLLER_ROOT = PACKAGE_ROOT.parent / "g1_segmented_controller"
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from g1_nav2.costmap_validation import (  # noqa: E402
@@ -25,7 +26,6 @@ from g1_nav2.costmap_validation import (  # noqa: E402
 )
 from g1_nav2.execution_protocol import (  # noqa: E402
     MotionLimits,
-    Pose2D,
     ProtocolError,
     Velocity,
     VelocityProposal,
@@ -35,9 +35,9 @@ from g1_nav2.execution_protocol import (  # noqa: E402
     limit_forward_velocity,
     proposal_context_is_current,
     proposal_context_is_publishable,
-    shape_terminal_approach,
 )
 from g1_nav2.readiness import (  # noqa: E402
+    control_odom_motion_blocker,
     evaluate_readiness,
     navigation_motion_blocker,
 )
@@ -80,68 +80,32 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertEqual(reverse, Velocity.zero())
 
-    def test_g1_motion_policy_is_axis_exclusive_and_clears_dead_zones(self) -> None:
+    def test_g1_motion_policy_is_axis_exclusive_without_amplification(self) -> None:
         self.assertEqual(apply_g1_motion_floor(Velocity.zero()), Velocity.zero())
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=0.0)),
-            Velocity(x=0.30, y=0.0, yaw=0.0),
+            Velocity.zero(),
         )
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=0.0, y=0.0, yaw=-0.02)),
-            Velocity(x=0.0, y=0.0, yaw=-1.00),
+            Velocity.zero(),
         )
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.19)),
-            Velocity(x=0.30, y=0.0, yaw=0.0),
+            Velocity.zero(),
         )
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=-0.05, y=0.0, yaw=0.20)),
-            Velocity(x=0.0, y=0.0, yaw=1.00),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_g1_motion_floor(Velocity(x=0.35, y=0.0, yaw=0.0)),
+            Velocity(x=0.35, y=0.0, yaw=0.0),
         )
         self.assertEqual(
             apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=-2.0)),
             Velocity(x=0.0, y=0.0, yaw=-2.0),
         )
-
-    def test_terminal_approach_suppresses_floor_amplification_without_a_lock(self) -> None:
-        target = Pose2D(x=1.0, y=2.0, yaw=-math.pi + 0.05)
-        raw = Velocity(x=0.04, y=0.0, yaw=0.08)
-
-        approaching, phase = shape_terminal_approach(
-            raw,
-            current_pose=Pose2D(x=0.70, y=2.0, yaw=0.0),
-            target_pose=target,
-        )
-        self.assertEqual((approaching, phase), (raw, "approach"))
-
-        rotating, phase = shape_terminal_approach(
-            raw,
-            current_pose=Pose2D(x=0.90, y=2.0, yaw=0.0),
-            target_pose=target,
-        )
-        self.assertEqual((rotating, phase), (Velocity(yaw=0.08), "rotate"))
-
-        reached, phase = shape_terminal_approach(
-            raw,
-            current_pose=Pose2D(x=0.90, y=2.0, yaw=math.pi - 0.05),
-            target_pose=target,
-        )
-        self.assertEqual((reached, phase), (Velocity.zero(), "reached"))
-
-        latched, phase = shape_terminal_approach(
-            raw,
-            current_pose=Pose2D(x=0.70, y=2.0, yaw=0.0),
-            target_pose=target,
-            position_reached=True,
-        )
-        self.assertEqual((latched, phase), (Velocity(yaw=0.08), "rotate"))
-
-        next_goal, phase = shape_terminal_approach(
-            raw,
-            current_pose=Pose2D(x=0.90, y=2.0, yaw=math.pi - 0.05),
-            target_pose=Pose2D(x=2.0, y=2.0, yaw=0.0),
-        )
-        self.assertEqual((next_goal, phase), (raw, "approach"))
 
     def test_stale_async_proposal_context_is_rejected(self) -> None:
         active = {"nav_id": "nav-1", "attempt": 2, "status": "navigating"}
@@ -187,7 +151,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                     )
                 )
 
-    def test_card_motion_limits_apply_axis_floors_caps_and_disable_lateral(self) -> None:
+    def test_card_motion_limits_apply_deadbands_caps_and_disable_lateral(self) -> None:
         limits = MotionLimits(
             min_x_mps=0.40,
             max_x_mps=0.80,
@@ -200,7 +164,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             apply_g1_motion_limits(
                 Velocity(x=0.05), limits=limits, max_forward_mps=0.50
             ),
-            Velocity(x=0.40),
+            Velocity.zero(),
         )
         self.assertEqual(
             apply_g1_motion_limits(
@@ -214,7 +178,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 limits=MotionLimits(min_x_mps=0.80, max_x_mps=1.0),
                 max_forward_mps=0.50,
             ),
-            Velocity(x=0.50),
+            Velocity.zero(),
         )
         self.assertEqual(
             apply_g1_motion_limits(
@@ -226,7 +190,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             apply_g1_motion_limits(
                 Velocity(y=-0.02), limits=limits, max_forward_mps=0.50
             ),
-            Velocity(y=-0.10),
+            Velocity.zero(),
         )
         self.assertEqual(
             apply_g1_motion_limits(
@@ -240,7 +204,15 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 limits=limits,
                 max_forward_mps=0.50,
             ),
-            Velocity(y=0.0, yaw=-1.20),
+            Velocity(y=0.20, yaw=0.0),
+        )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(y=0.20, yaw=-1.30),
+                limits=limits,
+                max_forward_mps=0.50,
+            ),
+            Velocity(y=0.0, yaw=-1.30),
         )
         self.assertEqual(
             apply_g1_motion_limits(
@@ -290,6 +262,24 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertTrue(ready["navigation_ready"])
         self.assertIsNone(navigation_motion_blocker(ready))
+        self.assertIsNone(
+            control_odom_motion_blocker(
+                ready,
+                receive_max_age_sec=0.20,
+                source_max_age_sec=0.25,
+            )
+        )
+
+        control_stale = dict(ready)
+        control_stale["odom_status_age_sec"] = 0.21
+        self.assertEqual(
+            control_odom_motion_blocker(
+                control_stale,
+                receive_max_age_sec=0.20,
+                source_max_age_sec=0.25,
+            ),
+            "navigation_not_ready:control_odom_stale",
+        )
 
         stale = evaluate_readiness(
             now_monotonic=10.0,
@@ -524,6 +514,12 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         service = (
             Path(__file__).resolve().parents[1] / "deploy" / "service.yml"
         ).read_text(encoding="utf-8")
+        segmented_cmake = (SEGMENTED_CONTROLLER_ROOT / "CMakeLists.txt").read_text(
+            encoding="utf-8"
+        )
+        segmented_plugin = (
+            SEGMENTED_CONTROLLER_ROOT / "g1_segmented_controller.xml"
+        ).read_text(encoding="utf-8")
 
         self.assertIn(
             "planner_command_bridge = g1_nav2.planner_command_node:main", setup
@@ -548,6 +544,17 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertNotIn("pointcloud_to_laserscan", dockerfile)
         self.assertNotIn("NAV2_MODE", service)
         self.assertNotIn("container_name: embodied-perception-nav2", service)
+        self.assertIn("pluginlib_export_plugin_description_file", segmented_cmake)
+        self.assertIn("g1_segmented_controller::SegmentedController", segmented_plugin)
+        self.assertIn(
+            "COPY actucore/plugins/navigation/runtime/g1_segmented_controller/",
+            dockerfile,
+        )
+        self.assertIn(
+            "--packages-select audio_msgs g1_fast_livo2 g1_segmented_controller g1_nav2",
+            dockerfile,
+        )
+        self.assertIn("ros2 pkg prefix g1_segmented_controller", dockerfile)
 
     def test_costmaps_combine_confirmed_static_map_and_live_clearing(self) -> None:
         params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
@@ -590,26 +597,42 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertGreater(0.55 - footprint_radius, 0.12)
         self.assertLess(0.55 - footprint_radius, 0.13)
 
-    def test_controller_faces_path_and_disables_lateral_motion(self) -> None:
+    def test_controller_executes_stop_turn_drive_segments(self) -> None:
         params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
             encoding="utf-8"
         )
+        source = (
+            SEGMENTED_CONTROLLER_ROOT / "src" / "segmented_controller.cpp"
+        ).read_text(encoding="utf-8")
         follow_path = params.split("    FollowPath:\n", 1)[1].split(
             "\n\nlocal_costmap:", 1
         )[0]
         smoother = params.split("velocity_smoother:\n", 1)[1]
         for expected in (
-            "plugin: nav2_rotation_shim_controller::RotationShimController",
-            "primary_controller: dwb_core::DWBLocalPlanner",
-            "min_vel_y: 0.0",
-            "max_vel_y: 0.0",
-            "min_speed_xy: 0.30",
-            "vy_samples: 1",
+            "plugin: g1_segmented_controller::SegmentedController",
+            "rotate_exit_rad: 0.15",
+            "rotate_reengage_rad: 0.35",
+            "approach_speed_mps: 0.30",
+            "cruise_speed_mps: 1.0",
+            "segment_tolerance_m: 0.18",
+            "stop_cycles_required: 2",
+            "status_topic: /ubuntu/navigation/nav2/segment_status",
         ):
             self.assertIn(expected, follow_path)
-        self.assertIn("rotate_to_heading_angular_vel: 1.00", follow_path)
-        self.assertIn("min_speed_theta: 1.00", follow_path)
-        self.assertIn("max_vel_theta: 2.00", follow_path)
+        self.assertNotIn("RotationShimController", follow_path)
+        self.assertNotIn("DWBLocalPlanner", follow_path)
+        for phase in (
+            "STOP_CHECK",
+            "ROTATE",
+            "DRIVE",
+            "FINAL_ROTATE",
+            "ARRIVED",
+            "BLOCKED",
+        ):
+            self.assertIn(f"Phase::{phase}", source)
+        self.assertIn("command.twist.linear.x", source)
+        self.assertIn("command.twist.angular.z", source)
+        self.assertNotIn("command.twist.linear.y", source)
         self.assertIn("max_velocity: [1.0, 0.0, 2.0]", smoother)
         self.assertIn("min_velocity: [0.0, 0.0, -2.0]", smoother)
         self.assertIn("odom_topic: /ubuntu/navigation/odom", smoother)
@@ -658,15 +681,17 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
         self.assertIn("MotionLimits.from_payload", command)
         self.assertIn("apply_g1_motion_limits", command)
-        self.assertIn("shape_terminal_approach", command)
-        self.assertIn('"terminal_phase": "approach"', command)
+        self.assertIn("control_odom_motion_blocker", command)
+        self.assertIn("self._on_segment_status", command)
+        self.assertIn('payload["execution"] = self._execution_status', command)
         self.assertIn(
-            'position_reached=terminal_phase in {"rotate", "reached"}', command
+            '"segment_status_topic": (\n                            "/ubuntu/navigation/nav2/segment_status"',
+            launch,
         )
-        self.assertIn('"terminal_xy_tolerance_m": 0.18', launch)
-        self.assertIn('"terminal_yaw_tolerance_rad": 0.45', launch)
         self.assertIn('"sensor_max_age_sec": 0.8', launch)
         self.assertIn('"sensor_source_max_age_sec": 1.0', launch)
+        self.assertIn('"control_odom_max_age_sec": 0.20', launch)
+        self.assertIn('"control_odom_source_max_age_sec": 0.25', launch)
         self.assertIn(
             "odom_source_age = self._source_age(odom_source_stamp_ns)",
             command,
@@ -677,14 +702,18 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertNotIn("_last_odom_source_age_sec", command)
         self.assertNotIn("_last_obstacle_source_age_sec", command)
-        self.assertIn('"goal_xy_tolerance_m": 0.20', launch)
-        self.assertIn('"goal_yaw_tolerance_rad": 0.50', launch)
         self.assertIn("xy_goal_tolerance: 0.20", params)
         self.assertIn("yaw_goal_tolerance: 0.50", params)
-        self.assertIn("controller_frequency: 5.0", params)
+        self.assertIn("controller_frequency: 20.0", params)
         self.assertIn("bt_loop_duration: 50", params)
         self.assertIn("smoothing_frequency: 5.0", params)
         self.assertIn('self.declare_parameter("proposal_frequency_hz", 5.0)', command)
+        self.assertIn('"shadow_topic": cmd_vel_raw_topic', launch)
+        self.assertIn('endpoint.node_name == "velocity_smoother"', command)
+        lifecycle_defaults = command.split(
+            '"required_lifecycle_nodes",', 1
+        )[1].split(")\n", 1)[0]
+        self.assertNotIn("velocity_smoother", lifecycle_defaults)
         self.assertIn("depth=1", command)
         self.assertIn("proposal_context_is_publishable", command)
         self.assertIn('payload.get("velocity_limits")', command)

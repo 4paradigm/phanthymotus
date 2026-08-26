@@ -378,7 +378,8 @@ RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
 # ── Nav2（最重的一层，放最后编）─────────────────────────────────────
 # 只编卡片真正会加载的那一档：navigation_launch.py 起的 planner/controller/
 # smoother/behavior/bt_navigator/waypoint_follower/velocity_smoother +
-# nav2_params.yaml 里点名的插件（navfn / DWB / rotation shim / costmap 三层）。
+# nav2_params.yaml 里点名的 navfn / costmap 三层。DWB / rotation shim 仍
+# 作为上游 navigation2 组合包的构建兼容依赖保留，运行配置不加载。
 # 用不到的包直接放 COLCON_IGNORE：光靠 --packages-select 挡不住 colcon 顺着
 # test_depend 去要它们（nav2_rotation_shim_controller test-depend 了 RPP），
 # 而它们会把 ompl、ceres、xtensor、Qt5 拖进镜像。
@@ -471,19 +472,21 @@ RUN source /opt/ros/humble/install/setup.bash && \
     grep -Fqx nav2_bringup /opt/actucore-ros-package-lock.txt && \
     grep -Fqx nav2_dwb_controller /opt/actucore-ros-package-lock.txt
 
-# ── 自研 ROS 包（audio_msgs + 导航卡片的两个 runtime 包）──────────────
+# ── 自研 ROS 包（audio_msgs + 导航卡片 runtime）──────────────────
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
 COPY actucore/plugins/navigation/runtime/g1_fast_livo2/ /ros_ws/src/g1_fast_livo2/
 COPY actucore/plugins/navigation/runtime/g1_nav2/ /ros_ws/src/g1_nav2/
+COPY actucore/plugins/navigation/runtime/g1_segmented_controller/ /ros_ws/src/g1_segmented_controller/
 RUN source /opt/ros/humble/install/setup.bash && \
     source /opt/ros_deps_ws/install/setup.bash && \
     source /opt/nav2_ws/install/setup.bash && \
     source /opt/fast_livo_ws/install/setup.bash && \
     cd /ros_ws && \
     MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
-      --packages-select audio_msgs g1_fast_livo2 g1_nav2 \
+      --packages-select audio_msgs g1_fast_livo2 g1_segmented_controller g1_nav2 \
       --symlink-install && \
     source /ros_ws/install/setup.bash && \
+    ros2 pkg prefix g1_segmented_controller >/dev/null && \
     python3 -c "import numpy, rosbag2_py; import cv2; from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; from g1_fast_livo2.camera_depth_frame import decode as decode_depth, MAGIC as DEPTH_MAGIC; assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'" && \
     ros2 bag record --help >/dev/null
 
@@ -520,7 +523,7 @@ RUN find /ros_ws/install /opt/nav2_ws/install /opt/ros_deps_ws/install \
 # 三个 merge-install 工作区各有一个 lib/；/ros_ws 与 fast_livo_ws 是按包安装的，
 # 所以要逐个列。CMD 里 source setup.bash 才是主路径，这里是不 source 时的兜底。
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/install/livox_ros_driver2/lib:/opt/fast_livo_ws/install/vikit_common/lib:/opt/fast_livo_ws/install/vikit_ros/lib:/opt/nav2_ws/install/lib:/opt/ros_deps_ws/install/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
-ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/ros_ws/install/g1_fast_livo2:/ros_ws/install/g1_nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
+ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/ros_ws/install/g1_fast_livo2:/ros_ws/install/g1_segmented_controller:/ros_ws/install/g1_nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42

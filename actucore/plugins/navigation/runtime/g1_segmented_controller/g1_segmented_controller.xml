@@ -1,0 +1,9 @@
+<class_libraries>
+  <library path="g1_segmented_controller">
+    <class
+      type="g1_segmented_controller::SegmentedController"
+      base_class_type="nav2_core::Controller">
+      <description>Collision-checked stop-turn-drive controller for G1.</description>
+    </class>
+  </library>
+</class_libraries>

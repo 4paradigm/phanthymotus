@@ -95,8 +95,15 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "command_topic": command_topic,
                         "status_topic": status_topic,
+                        "segment_status_topic": (
+                            "/ubuntu/navigation/nav2/segment_status"
+                        ),
                         "action_name": "/navigate_to_pose",
-                        "shadow_topic": cmd_vel_shadow_topic,
+                        # G1 consumes discrete 5 Hz proposals. Feeding the
+                        # bridge from the OPEN_LOOP smoother adds a second,
+                        # unobserved motion model and delays crossing the
+                        # humanoid's effective velocity deadbands.
+                        "shadow_topic": cmd_vel_raw_topic,
                         "proposal_topic": velocity_proposal_topic,
                         "controller_speed_limit_topic": (
                             "/ubuntu/navigation/nav2/speed_limit"
@@ -121,10 +128,8 @@ def generate_launch_description() -> LaunchDescription:
                         "goal_costmap_max_age_sec": 2.0,
                         "sensor_max_age_sec": 0.8,
                         "sensor_source_max_age_sec": 1.0,
-                        "terminal_xy_tolerance_m": 0.18,
-                        "terminal_yaw_tolerance_rad": 0.45,
-                        "goal_xy_tolerance_m": 0.20,
-                        "goal_yaw_tolerance_rad": 0.50,
+                        "control_odom_max_age_sec": 0.20,
+                        "control_odom_source_max_age_sec": 0.25,
                     }
                 ],
             ),

@@ -38,6 +38,9 @@ def _import_ros_runtime_modules():
 
     rclpy = module("rclpy")
     callbacks = module("rclpy.callback_groups")
+    callbacks.MutuallyExclusiveCallbackGroup = type(
+        "MutuallyExclusiveCallbackGroup", (), {}
+    )
     callbacks.ReentrantCallbackGroup = type("ReentrantCallbackGroup", (), {})
     executors = module("rclpy.executors")
     executors.MultiThreadedExecutor = type("MultiThreadedExecutor", (), {})

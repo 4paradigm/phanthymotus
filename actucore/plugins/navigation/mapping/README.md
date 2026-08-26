@@ -95,7 +95,9 @@ Nav2，也不会进入累计。不匹配帧进入 diagnostics 计数，不能拿
 registered cloud、累计静态图或 Nav2 costmap。`map_view` 最多编码 80,000 点，
 对低于、位于和高于导航高度带的点分别保留预算，因此地面不会被先写入的
 障碍点挤出前端上限。地图点主体每秒编码一次并缓存，机器人 `x/y/yaw` 只更新
-固定 12 字节头部并以 5 Hz 发布；位姿刷新不再重复编码整张地图。现有渲染器
+固定 12 字节头部并以 1 Hz 发布；两个 Canvas 定时任务串行且只保留最新一帧，
+避免大帧 DDS 发布堆积后抢占 odom/registered cloud 回调。位姿刷新不再重复编码
+整张地图。现有渲染器
 继续按高度显示范围外点为蓝色/粉色。
 Agent Core 在显示层
 把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
@@ -133,8 +135,8 @@ Nav2 的全局静态层使用 `/ubuntu/navigation/static_map`，实时动态层�
 `cloud_pack_publish`、`cloud_end_to_end`、`map_view_encode` 和
 `map_view_pose_publish` 分段耗时，`latency_max_ms` 保留本进程最大值；同时发布
 `map_view_cache_age_sec`、`map_view_point_refresh_hz=1` 和
-`map_view_pose_refresh_hz=2`。Canvas 帧最多携带 40,000 点，避免在 G1 上以
-5 Hz 重复序列化近 1 MiB 帧并阻塞 odom/registered cloud；这些字段用于区分
+`map_view_pose_refresh_hz=1`。Canvas 帧最多携带 40,000 点，避免在 G1 上高频
+重复序列化近 1 MiB 帧并阻塞 odom/registered cloud；这些字段用于区分
 传感器/TF 等待、点云计算、DDS 发布和 Canvas 编码延迟，不改变 500 ms
 freshness 门禁。
 

@@ -56,8 +56,9 @@ registered cloud。Nav2 readiness 直接检查该 cloud 时间点的
 `map -> base_link` TF；“最新 odom 与最新 cloud”的时间差只作诊断，不再冒充
 配对结果阻塞导航。静态图累计和 1 Hz Canvas/OccupancyGrid 编码不在该发布
 快路径执行；它们使用独立 latest-only 后台任务和锁，因此不会周期性把
-registered cloud 的接收 age 推过 500 ms。BT 主循环为 20 Hz，仍快于 5 Hz
-局部控制输出，但不会在 Jetson 上用 100 Hz 空转与定位、点云序列化争抢调度。
+registered cloud 的接收 age 推过 500 ms。BT 和分段控制器均为 20 Hz，
+可以用最新位姿在每个控制周期检查过点、转向和障碍；非零
+`velocity_proposal` 仍仅以 5 Hz 刷新，停车零速不等待下一个 5 Hz 周期。
 
 `goal_pose` 最小样例：
 
@@ -82,7 +83,7 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 
 | port | topic | type / QoS | 语义 |
 | --- | --- | --- | --- |
-| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.velocity_proposal.v1`，导航活动期间固定 5 Hz、只保留最新值，`base_link`，TTL 最大 250 ms |
+| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.velocity_proposal.v1`，非零动作最多 5 Hz，零速立即发布，只保留最新值，`base_link`，TTL 最大 250 ms |
 | `plan` | `/plan` | `nav_msgs/msg/Path`; `RELIABLE + KEEP_LAST(1)` | Nav2 原生 `map` 全局路径，Canvas 显示起点、终点、路径长度和折线 |
 | `costmap` | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | Nav2 实时二维全局代价地图，作为卡片默认预览，叠加路径、位姿、终点和膨胀障碍 |
 
@@ -97,25 +98,21 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 - X 轴为仅前进合同：Nav2 controller、velocity smoother 或恢复树产生的
   负 X 均在 proposal 边界强制归零，不会向 Driver 发布倒退命令；
 - `config` 动作可配置 `min_x_mps/max_x_mps`、`min_y_mps/max_y_mps`
-  和 `min_yaw_rps/max_yaw_rps`；这些值都是非零速度的绝对值，
-  Nav2 原始方向符号保持不变；
+  和 `min_yaw_rps/max_yaw_rps`；`min_*` 是死区而不是速度抬升下限，
+  绝对值低于死区的非零提案归零，其余值保持 Nav2 原值和方向；
 - 默认 `X=0.30–1.00 m/s`、`Y=0–0 m/s`、`yaw=1.00–2.00 rad/s`；
   `max_y_mps=0` 保持当前禁止横移的行为；
-- 每次导航的 `speed` 继续作为正向 X 上限，它比卡片配置的
-  X 最小值优先，不会被速度下限反向放大；
-- 平移与转向强制互斥：混合提案的原始 `|yaw| >= 0.20 rad/s` 时只原地
-  转向（`x=y=0`），低于该阈值时只平移（`yaw=0`），不会向
+- 每次导航的 `speed` 继续作为正向 X 上限；当该上限小于 X 死区时，
+  它同时成为有效死区，不会把提案反向放大；
+- 平移与转向强制互斥：先应用各轴死区，保留的 `|yaw| >= 0.20 rad/s` 时
+  只原地转向（`x=y=0`），低于该阈值时只平移（`yaw=0`），不会向
   Driver 发布同时包含平移和转向的动作；
-- 上述最小值只处理非零运动提案；readiness blocker、暂停和终态零速
-  仍保持严格零值；
-- 终点内层容差为 `0.18 m / 0.45 rad`：进入位置容差后不再发布平移，
-  只保留 Nav2 的朝向校正；位置和朝向都进入容差后发布严格零速，避免
-  速度下限把尾段微调放大成终点徘徊。位置容差首次满足后，当前
-  `nav_id` 的终点阶段保持为“只转向”，不因定位边界抖动重新启用平移；
-  新导航创建独立阶段，不会锁住下一次导航。该判断只在 fresh canonical
-  odom 和当前 target 都存在时生效；
-  `goal_tolerance_reached` 只是零速 proposal reason，最终 `arrived` 仍以
-  Nav2 action result 为准；
+- 上述死区会把低于硬件有效阈值的减速提案收敛为零，不再把
+  它们抬高成大动作；readiness blocker、暂停和终态零速仍保持严格零值；
+- 分段控制器的终点容差为 `0.18 m / 0.45 rad`，严于 Nav2
+  GoalChecker 的 `0.20 m / 0.50 rad`；位置到达后只进入最终原地转向，
+  位置和朝向都达标后立即输出零速，最终 `arrived` 仍以 Nav2
+  action result 为准；
 - Nav2 Humble 固定创建 pose 与 through-poses 两个内部 navigator；卡片为二者
   显式加载无 BackUp 的恢复树，只使用清除代价地图、原地转向和等待。公开动作
   仍只有 `navigate_to_pose`；
@@ -167,14 +164,24 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   heartbeat/status 的 `global_costmap` 字段现在分别给出 inflated、inscribed、
   lethal 数量及比例，用于独立评估静态图与实时层是否过度占用，不通过
   缩小安全边界掩盖问题。
-- Rotation Shim 在航向偏差大时先旋转；当前 DWB 仍只采样 `x/yaw`，
-  proposal 出口把弧线速度离散成“只转”或“只走”，并对 X/Y/yaw
-  三轴应用卡片配置的最小/最大绝对值。Y 默认上限为零。
-- velocity smoother 使用 `/ubuntu/navigation/odom` 作为反馈。
+- NavFn 仍生成全局路径，local/global costmap 仍以各自频率重规划和
+  更新障碍。本地 DWB/Rotation Shim 替换为 20 Hz G1 分段控制器：
+  从最新全局路径上选当前 local costmap 内最远的直线可通点，执行
+  `STOP_CHECK -> ROTATE -> DRIVE -> FINAL_ROTATE -> ARRIVED`。任一
+  转向或直线 footprint 检查失败时进入 `BLOCKED` 并立即给零。
+- 控制器每 50 ms 使用最新 `map -> base_link` 位姿检查是否已经过
+  线段终点、航向是否偏离和下一段是否可通。切段前必须连续两个
+  周期观测到接近零速；控制 odom 的接收/source age 上限另外收紧为
+  `0.20 s / 0.25 s`，超时只发布零速。一旦位姿证明已经越过当前线段
+  终点，无论横向误差是否还在容差内都先立即给零，停稳后再判断到达或重新选段。
+- proposal bridge 直接消费 controller 的 raw 输出，不经过
+  `OPEN_LOOP velocity_smoother`。G1 的可执行死区已在 proposal 出口处理；
+  再叠加一个以“上次命令”作为反馈的平滑器会推迟首个可执行动作。
+  上游 `nav2_bringup` 仍会启动 smoother，但它的输出不进入 Driver 提案链。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
-- 局部 controller、velocity smoother 与 proposal bridge 统一为 5 Hz，匹配
-  G1 实际执行能力；costmap 和传感器更新仍保持独立高频。安全 blocker、协议
-  错误和任务终态的首个零速不等待下一个周期。proposal topic 使用
+- 非零 proposal 以 5 Hz 发送，因此 Driver 不会被 20 Hz 重复动作淹没；
+  切段、障碍、readiness blocker、协议错误和任务终态的首个零速
+  直接发布，不等待 5 Hz 定时器。proposal topic 使用
   `KEEP_LAST(1)`，避免 Driver 排队执行过期轨迹。
 - Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；
   proposal bridge 始终检查真正的根 `/cmd_vel`，发现外部发布者仍会拒绝导航。
@@ -188,13 +195,12 @@ ASCII token 布局和数据行必须与声明精确一致。`load_map` 会在
 机器人周围的有界 OccupancyGrid 滚动窗口，因此 planning 不会在未验证新图上
 切换 StaticLayer，也不会按全图包围盒分配稠密数组。
 
-### 终点整形与并发保护
+### 分段状态与并发保护
 
-当前整形容差 `0.18 m / 0.45 rad` 严于 Nav2 GoalChecker 的
-`0.20 m / 0.50 rad`。planner bridge 同时接收这组 GoalChecker 容差用于
-启动校验；终点整形容差非正、非有限，或大于对应 GoalChecker
-容差时直接拒绝启动。自定义 Nav2 params 时仍必须同步更新 bridge
-中的 paired tolerance。
+控制器把 `phase` / `segment_index` / `remaining_distance_m` /
+`heading_error_rad` / `stop_reason` / `pose_stamp_ns` 发到内部
+`/ubuntu/navigation/nav2/segment_status`，planner bridge 将它合并到现有
+status 的 `execution`，不新增 Canvas 连线点。
 
 shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互斥区内
 二次校验 `nav_id/attempt/status`；5 Hz 发布定时器在真正发布前再次校验任务

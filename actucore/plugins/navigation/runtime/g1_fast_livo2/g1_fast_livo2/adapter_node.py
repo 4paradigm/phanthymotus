@@ -15,7 +15,10 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 import numpy as np
 import rclpy
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import (
+    MutuallyExclusiveCallbackGroup,
+    ReentrantCallbackGroup,
+)
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
@@ -59,7 +62,7 @@ from .vectorized_cloud import (
 
 _MAP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _MAP_VIEW_MAX_POINTS = 40_000
-_MAP_VIEW_POSE_REFRESH_HZ = 2.0
+_MAP_VIEW_POSE_REFRESH_HZ = 1.0
 _RELOCALIZATION_MIN_MATCH_RATIO = 0.35
 _RELOCALIZATION_HISTORY_SEC = 2.0
 _RELOCALIZATION_MAX_FRAMES = 20
@@ -205,6 +208,7 @@ class FastLivo2Adapter(Node):
         self._latency_max_ms: dict[str, float] = {}
         self._static_map_load_time = self.get_clock().now().to_msg()
         self._callbacks = ReentrantCallbackGroup()
+        self._display_callbacks = MutuallyExclusiveCallbackGroup()
 
         self._odom_pub = self.create_publisher(Odometry, str(self.get_parameter("odom_topic").value), qos_profile_sensor_data)
         self._cloud_pub = self.create_publisher(PointCloud2, str(self.get_parameter("cloud_topic").value), qos_profile_sensor_data)
@@ -224,7 +228,17 @@ class FastLivo2Adapter(Node):
             str(self.get_parameter("static_map_topic").value),
             static_map_qos,
         )
-        self._map_view_pub = self.create_publisher(UInt8MultiArray, str(self.get_parameter("map_view_topic").value), qos_profile_sensor_data)
+        map_view_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._map_view_pub = self.create_publisher(
+            UInt8MultiArray,
+            str(self.get_parameter("map_view_topic").value),
+            map_view_qos,
+        )
         self._diagnostics_pub = self.create_publisher(String, str(self.get_parameter("diagnostics_topic").value), 10)
         self._map_control_status_pub = self.create_publisher(
             String, str(self.get_parameter("map_control_status_topic").value), 10
@@ -267,12 +281,12 @@ class FastLivo2Adapter(Node):
         self.create_timer(
             1.0,
             self._publish_periodic,
-            callback_group=self._callbacks,
+            callback_group=self._display_callbacks,
         )
         self.create_timer(
             1.0 / _MAP_VIEW_POSE_REFRESH_HZ,
             self._publish_map_view,
-            callback_group=self._callbacks,
+            callback_group=self._display_callbacks,
         )
         self._mapping_worker = threading.Thread(
             target=self._mapping_worker_main,

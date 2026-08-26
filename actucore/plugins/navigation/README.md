@@ -29,6 +29,9 @@ camera RGB + depth frame ──┴─> ControlledSemanticSpatial card (ActuCore 
   刷新已结束任务；终态结果本身仍可查询和幂等重放。
 - Nav2 仍只发布 `phanthy.navigation.velocity_proposal.v1`，Driver 继续负责
   物理执行、TTL、急停、二次限幅和停车确认。
+- Nav2 保留 NavFn、rolling costmap 和重规划，局部执行改为 G1 分段
+  `停稳 -> 原地转向 -> 直行 -> 停稳复查`。控制和位姿检查为
+  20 Hz，非零 proposal 仍为 5 Hz，零速立即发布。
 
 ## 外部输入
 
@@ -96,7 +99,8 @@ Canvas 编码在 latest-only 后台任务中执行，
 影响监控，不改变规划输入。显示帧直接编码已经分别有界的静态、范围外和实时
 点源，不再构造一次性全图体素副本，避免 Canvas 更新拖慢 Nav2 所依赖的 odom
 与 registered cloud。点云主体按 1 Hz 重编码并缓存；缓存帧只替换前 12 字节的
-机器人 `x/y/yaw`，以 5 Hz 发布，因此位姿刷新不再重复打包最多 80,000 个地图点。
+机器人 `x/y/yaw`，以 1 Hz 发布；Canvas 编码/发布串行且 DDS 只保留最新一帧，
+因此慢显示不会堆积并挤占 odom/registered cloud 回调。
 FAST-LIVO2 diagnostics 的 `latency_ms` / `latency_max_ms` 分别报告最近值和进程内
 最大值，包含 `cloud_decode`、`cloud_pose_wait`、`cloud_transform_filter`、
 `cloud_pack_publish`、`cloud_end_to_end`、`map_view_encode` 和
@@ -185,9 +189,10 @@ ROS Humble 是 `/opt/ros/humble/install` 下的**源码 install-space**）。构
 `behaviortree_cpp_v3` / `bond_core` / `diagnostic_updater` / `pcl_ros` /
 `rosbag2_storage_mcap` 一起按锁定 SHA 自编。`navigation2` 钉在 **1.1.20**，与
 迁移前的 `ros-humble-navigation2=1.1.20-1jammy` 是同一个上游 release，运行行为
-不随打包形态变化。只编卡片真正加载的那一档（planner/controller/smoother/
-behavior/bt_navigator/waypoint_follower/velocity_smoother + navfn、DWB、
-rotation shim、costmap 三层）；amcl、smac、mppi、constrained_smoother、route、
+不随打包形态变化。运行时加载 planner/controller/smoother/
+behavior/bt_navigator/waypoint_follower/velocity_smoother + navfn、costmap 三层，
+以及卡片自带的 `g1_segmented_controller`。DWB/rotation shim 包仅作为
+上游 navigation2 组合构建兼容项保留，配置不加载；amcl、smac、mppi、constrained_smoother、route、
 rviz_plugins 刻意不编，它们会把 ompl、ceres、xtensor、Qt5 拖进镜像。
 
 镜像里**没有** torch / CLIP / YOLO / ASR 依赖 —— 卡片自身只用标准库 + ROS

@@ -77,7 +77,7 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "minimum": 0.0,
             "maximum": 1.0,
             "default": 0.30,
-            "description": "Minimum magnitude of a nonzero X proposal",
+            "description": "X deadband; smaller nonzero proposals are suppressed",
         },
         "max_x_mps": {
             "type": "number",
@@ -91,7 +91,7 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "minimum": 0.0,
             "maximum": 1.0,
             "default": 0.0,
-            "description": "Minimum magnitude of a nonzero Y proposal",
+            "description": "Y deadband; smaller nonzero proposals are suppressed",
         },
         "max_y_mps": {
             "type": "number",
@@ -105,7 +105,7 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "minimum": 0.0,
             "maximum": 2.0,
             "default": 1.0,
-            "description": "Minimum magnitude of a nonzero yaw proposal",
+            "description": "Yaw deadband; smaller nonzero proposals are suppressed",
         },
         "max_yaw_rps": {
             "type": "number",

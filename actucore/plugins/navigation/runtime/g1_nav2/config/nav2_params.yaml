@@ -69,7 +69,7 @@ bt_navigator_navigate_through_poses_rclcpp_node:
 controller_server:
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 5.0
+    controller_frequency: 20.0
     speed_limit_topic: /ubuntu/navigation/nav2/speed_limit
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
@@ -88,58 +88,20 @@ controller_server:
       yaw_goal_tolerance: 0.50
       stateful: true
     FollowPath:
-      plugin: nav2_rotation_shim_controller::RotationShimController
-      primary_controller: dwb_core::DWBLocalPlanner
-      angular_dist_threshold: 0.35
-      forward_sampling_distance: 0.40
-      rotate_to_heading_angular_vel: 1.00
-      max_angular_accel: 0.40
-      simulate_ahead_time: 1.0
-      rotate_to_goal_heading: false
-      debug_trajectory_details: true
-      min_vel_x: 0.0
-      max_vel_x: 1.0
-      min_vel_y: 0.0
-      max_vel_y: 0.0
-      max_vel_theta: 2.00
-      min_speed_xy: 0.30
-      max_speed_xy: 1.0
-      min_speed_theta: 1.00
-      acc_lim_x: 0.30
-      acc_lim_y: 0.0
-      acc_lim_theta: 0.40
-      decel_lim_x: -0.30
-      decel_lim_y: 0.0
-      decel_lim_theta: -0.40
-      vx_samples: 16
-      vy_samples: 1
-      vtheta_samples: 20
-      sim_time: 1.5
-      linear_granularity: 0.05
-      angular_granularity: 0.025
-      transform_tolerance: 0.3
-      xy_goal_tolerance: 0.20
-      trans_stopped_velocity: 0.05
-      short_circuit_trajectory_evaluation: true
-      stateful: true
-      critics:
-        - RotateToGoal
-        - Oscillation
-        - BaseObstacle
-        - GoalAlign
-        - PathAlign
-        - PathDist
-        - GoalDist
-      BaseObstacle.scale: 0.05
-      PathAlign.scale: 24.0
-      PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 20.0
-      GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 28.0
-      GoalDist.scale: 24.0
-      RotateToGoal.scale: 24.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
+      plugin: g1_segmented_controller::SegmentedController
+      rotate_exit_rad: 0.15
+      rotate_reengage_rad: 0.35
+      rotate_speed_rps: 1.0
+      approach_distance_m: 0.50
+      approach_speed_mps: 0.30
+      cruise_speed_mps: 1.0
+      segment_tolerance_m: 0.18
+      final_yaw_tolerance_rad: 0.45
+      stop_linear_mps: 0.05
+      stop_yaw_rps: 0.10
+      stop_cycles_required: 2
+      preserve_endpoint_m: 0.25
+      status_topic: /ubuntu/navigation/nav2/segment_status
 
 local_costmap:
   local_costmap:

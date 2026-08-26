@@ -35,13 +35,11 @@ from tf2_ros import Buffer, TransformListener
 
 from .execution_protocol import (
     MotionLimits,
-    Pose2D,
     ProtocolError,
     Velocity,
     apply_g1_motion_limits,
     build_velocity_proposal,
     proposal_context_is_publishable,
-    shape_terminal_approach,
 )
 from .costmap_validation import (
     CostmapError,
@@ -49,7 +47,7 @@ from .costmap_validation import (
     GoalCellRejected,
     validated_goal_cell_receipt,
 )
-from .readiness import evaluate_readiness, navigation_motion_blocker
+from .readiness import control_odom_motion_blocker, evaluate_readiness
 
 
 _TERMINAL_STATES = {
@@ -82,6 +80,9 @@ class PlannerCommandNode(Node):
         super().__init__("g1_nav2_planner_command")
         self.declare_parameter("command_topic", "/ubuntu/navigation/nav2/command")
         self.declare_parameter("status_topic", "/ubuntu/navigation/nav2/status")
+        self.declare_parameter(
+            "segment_status_topic", "/ubuntu/navigation/nav2/segment_status"
+        )
         self.declare_parameter("action_name", "/navigate_to_pose")
         self.declare_parameter(
             "shadow_topic", "/ubuntu/navigation/nav2/cmd_vel_shadow"
@@ -110,15 +111,12 @@ class PlannerCommandNode(Node):
         self.declare_parameter("goal_costmap_max_age_sec", 2.0)
         self.declare_parameter("sensor_max_age_sec", 0.8)
         self.declare_parameter("sensor_source_max_age_sec", 1.0)
-        self.declare_parameter("terminal_xy_tolerance_m", 0.18)
-        self.declare_parameter("terminal_yaw_tolerance_rad", 0.45)
-        self.declare_parameter("goal_xy_tolerance_m", 0.20)
-        self.declare_parameter("goal_yaw_tolerance_rad", 0.50)
+        self.declare_parameter("control_odom_max_age_sec", 0.20)
+        self.declare_parameter("control_odom_source_max_age_sec", 0.25)
         self.declare_parameter(
             "required_lifecycle_nodes",
             [
                 "controller_server",
-                "velocity_smoother",
                 "planner_server",
                 "bt_navigator",
             ],
@@ -126,6 +124,9 @@ class PlannerCommandNode(Node):
 
         self._command_topic = str(self.get_parameter("command_topic").value)
         self._status_topic = str(self.get_parameter("status_topic").value)
+        self._segment_status_topic = str(
+            self.get_parameter("segment_status_topic").value
+        )
         self._action_name = str(self.get_parameter("action_name").value)
         self._shadow_topic = str(self.get_parameter("shadow_topic").value)
         self._proposal_topic = str(self.get_parameter("proposal_topic").value)
@@ -170,17 +171,11 @@ class PlannerCommandNode(Node):
         self._sensor_source_max_age_sec = float(
             self.get_parameter("sensor_source_max_age_sec").value
         )
-        self._terminal_xy_tolerance_m = float(
-            self.get_parameter("terminal_xy_tolerance_m").value
+        self._control_odom_max_age_sec = float(
+            self.get_parameter("control_odom_max_age_sec").value
         )
-        self._terminal_yaw_tolerance_rad = float(
-            self.get_parameter("terminal_yaw_tolerance_rad").value
-        )
-        self._goal_xy_tolerance_m = float(
-            self.get_parameter("goal_xy_tolerance_m").value
-        )
-        self._goal_yaw_tolerance_rad = float(
-            self.get_parameter("goal_yaw_tolerance_rad").value
+        self._control_odom_source_max_age_sec = float(
+            self.get_parameter("control_odom_source_max_age_sec").value
         )
         self._required_lifecycle_nodes = [
             str(item).strip("/")
@@ -218,22 +213,18 @@ class PlannerCommandNode(Node):
             )
         if self._goal_costmap_max_age_sec <= 0:
             raise ValueError("goal_costmap_max_age_sec must be positive")
-        tolerances = {
-            "terminal_xy_tolerance_m": self._terminal_xy_tolerance_m,
-            "terminal_yaw_tolerance_rad": self._terminal_yaw_tolerance_rad,
-            "goal_xy_tolerance_m": self._goal_xy_tolerance_m,
-            "goal_yaw_tolerance_rad": self._goal_yaw_tolerance_rad,
-        }
-        for name, value in tolerances.items():
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be positive and finite")
-        if self._terminal_xy_tolerance_m > self._goal_xy_tolerance_m:
+        if not 0.0 < self._control_odom_max_age_sec <= self._sensor_max_age_sec:
             raise ValueError(
-                "terminal_xy_tolerance_m must not exceed Nav2 xy_goal_tolerance"
+                "control_odom_max_age_sec must be within (0, sensor_max_age_sec]"
             )
-        if self._terminal_yaw_tolerance_rad > self._goal_yaw_tolerance_rad:
+        if not (
+            self._control_odom_max_age_sec
+            <= self._control_odom_source_max_age_sec
+            <= self._sensor_source_max_age_sec
+        ):
             raise ValueError(
-                "terminal_yaw_tolerance_rad must not exceed Nav2 yaw_goal_tolerance"
+                "control_odom_source_max_age_sec must be within "
+                "[control_odom_max_age_sec, sensor_source_max_age_sec]"
             )
         if not self._required_lifecycle_nodes or any(
             not item for item in self._required_lifecycle_nodes
@@ -280,6 +271,13 @@ class PlannerCommandNode(Node):
             self._shadow_topic,
             self._on_shadow_velocity,
             latest_command_qos,
+            callback_group=self._callbacks,
+        )
+        self._segment_status_sub = self.create_subscription(
+            String,
+            self._segment_status_topic,
+            self._on_segment_status,
+            qos_profile_sensor_data,
             callback_group=self._callbacks,
         )
         self._odom_sub = self.create_subscription(
@@ -349,7 +347,7 @@ class PlannerCommandNode(Node):
         self._last_odom_monotonic: float | None = None
         self._last_odom_source_stamp_ns: int | None = None
         self._last_odom_frame_ready = False
-        self._last_odom_pose: Pose2D | None = None
+        self._segment_status: dict = {}
         self._last_obstacle_monotonic: float | None = None
         self._last_obstacle_source_stamp_ns: int | None = None
         self._last_obstacle_frame_ready = False
@@ -367,14 +365,6 @@ class PlannerCommandNode(Node):
 
     def _on_odom(self, message: Odometry) -> None:
         stamp_ns = _stamp_ns(message)
-        position = message.pose.pose.position
-        orientation = message.pose.pose.orientation
-        yaw = math.atan2(
-            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
-            1.0
-            - 2.0
-            * (orientation.y * orientation.y + orientation.z * orientation.z),
-        )
         with self._lock:
             self._last_odom_monotonic = time.monotonic()
             self._last_odom_source_stamp_ns = stamp_ns
@@ -382,11 +372,16 @@ class PlannerCommandNode(Node):
                 message.header.frame_id.strip("/") == self._global_frame.strip("/")
                 and message.child_frame_id.strip("/") == self._base_frame.strip("/")
             )
-            self._last_odom_pose = Pose2D(
-                x=float(position.x),
-                y=float(position.y),
-                yaw=float(yaw),
-            )
+
+    def _on_segment_status(self, message: String) -> None:
+        try:
+            status = json.loads(message.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(status, dict) or not isinstance(status.get("phase"), str):
+            return
+        with self._lock:
+            self._segment_status = status
 
     def _on_obstacle_cloud(self, message: PointCloud2) -> None:
         stamp_ns = _stamp_ns(message)
@@ -544,9 +539,6 @@ class PlannerCommandNode(Node):
             status = self._active.get("status", "error")
             forward_speed_limit = self._active.get("effective_speed_limit")
             motion_limits = self._active.get("motion_limits")
-            target = self._active.get("target_pose")
-            current_pose = self._last_odom_pose
-            terminal_phase = self._active.get("terminal_phase", "approach")
         if not isinstance(nav_id, str) or not nav_id:
             return
         if not isinstance(motion_limits, MotionLimits):
@@ -562,26 +554,14 @@ class PlannerCommandNode(Node):
             velocity = Velocity.zero()
             reason = f"navigation_{status}"
         else:
-            reason = navigation_motion_blocker(self._readiness())
+            reason = control_odom_motion_blocker(
+                self._readiness(),
+                receive_max_age_sec=self._control_odom_max_age_sec,
+                source_max_age_sec=self._control_odom_source_max_age_sec,
+            )
             if reason is not None:
                 velocity = Velocity.zero()
         try:
-            if reason is None:
-                if isinstance(current_pose, Pose2D) and isinstance(target, dict):
-                    velocity, terminal_phase = shape_terminal_approach(
-                        velocity,
-                        current_pose=current_pose,
-                        target_pose=Pose2D(
-                            x=float(target["x"]),
-                            y=float(target["y"]),
-                            yaw=float(target["yaw"]),
-                        ),
-                        position_reached=terminal_phase in {"rotate", "reached"},
-                        xy_tolerance_m=self._terminal_xy_tolerance_m,
-                        yaw_tolerance_rad=self._terminal_yaw_tolerance_rad,
-                    )
-                    if terminal_phase == "reached":
-                        reason = "goal_tolerance_reached"
             if reason is None:
                 velocity = apply_g1_motion_limits(
                     velocity,
@@ -596,7 +576,6 @@ class PlannerCommandNode(Node):
                     status=status,
                 ):
                     return
-                self._active["terminal_phase"] = terminal_phase
                 self._latest_proposal_candidate = {
                     "nav_id": nav_id,
                     "attempt": attempt,
@@ -764,7 +743,6 @@ class PlannerCommandNode(Node):
                 "last_distance": None,
                 "last_pose": None,
                 "last_feedback_publish": 0.0,
-                "terminal_phase": "approach",
             }
             self._latest_proposal_candidate = None
             self._last_published_proposal = None
@@ -1128,6 +1106,13 @@ class PlannerCommandNode(Node):
             endpoint_namespace = endpoint.node_namespace.rstrip("/") or "/"
             if endpoint.node_name == self.get_name() and endpoint_namespace == own_namespace:
                 continue
+            if (
+                endpoint.node_name == "velocity_smoother"
+                and endpoint_namespace == own_namespace
+            ):
+                # nav2_bringup always starts this internal subscriber. Its
+                # output is deliberately outside the G1 proposal path.
+                continue
             foreign_subscribers.append(endpoint)
         if foreign_subscribers:
             names = sorted(
@@ -1205,7 +1190,11 @@ class PlannerCommandNode(Node):
             velocity = Velocity.zero()
             reason = "shadow_velocity_stale"
         else:
-            blocker = navigation_motion_blocker(self._readiness())
+            blocker = control_odom_motion_blocker(
+                self._readiness(),
+                receive_max_age_sec=self._control_odom_max_age_sec,
+                source_max_age_sec=self._control_odom_source_max_age_sec,
+            )
             if blocker is not None:
                 velocity = Velocity.zero()
                 reason = blocker
@@ -1283,7 +1272,9 @@ class PlannerCommandNode(Node):
                     "global_frame": self._global_frame,
                 }
             )
-        payload.update(self._readiness())
+        readiness = self._readiness()
+        payload.update(readiness)
+        payload["execution"] = self._execution_status(readiness)
         payload["global_costmap"] = self._global_costmap_diagnostics()
         self._emit(payload)
         if stop_proposal is not None:
@@ -1326,9 +1317,24 @@ class PlannerCommandNode(Node):
                     else None
                 ),
             }
-        payload.update(self._readiness())
+        readiness = self._readiness()
+        payload.update(readiness)
+        payload["execution"] = self._execution_status(readiness)
         payload["global_costmap"] = self._global_costmap_diagnostics()
         self._emit(payload)
+
+    def _execution_status(self, readiness: dict) -> dict:
+        with self._lock:
+            execution = dict(self._segment_status)
+        execution.update(
+            {
+                "odom_receive_age_sec": readiness.get("odom_status_age_sec"),
+                "odom_source_age_sec": readiness.get("odom_source_age_sec"),
+                "odom_receive_max_age_sec": self._control_odom_max_age_sec,
+                "odom_source_max_age_sec": self._control_odom_source_max_age_sec,
+            }
+        )
+        return execution
 
     def _emit(self, payload: dict) -> None:
         message = String()

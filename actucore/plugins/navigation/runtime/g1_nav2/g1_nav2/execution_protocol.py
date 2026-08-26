@@ -19,8 +19,6 @@ VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
 MIN_EFFECTIVE_LINEAR_MPS = 0.30
 MIN_EFFECTIVE_YAW_RADPS = 1.00
 TURN_ONLY_YAW_THRESHOLD_RADPS = 0.20
-TERMINAL_XY_TOLERANCE_M = 0.18
-TERMINAL_YAW_TOLERANCE_RAD = 0.45
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _MOTION_STATUSES = {"planning", "navigating", "replanning", "running", "active"}
@@ -65,67 +63,6 @@ class Velocity:
         return {"x": self.x, "y": self.y, "yaw": self.yaw}
 
 
-@dataclass(frozen=True)
-class Pose2D:
-    x: float
-    y: float
-    yaw: float
-
-
-def _normalized_angle(value: float) -> float:
-    return math.atan2(math.sin(value), math.cos(value))
-
-
-def shape_terminal_approach(
-    velocity: Velocity,
-    *,
-    current_pose: Pose2D,
-    target_pose: Pose2D,
-    position_reached: bool = False,
-    xy_tolerance_m: float = TERMINAL_XY_TOLERANCE_M,
-    yaw_tolerance_rad: float = TERMINAL_YAW_TOLERANCE_RAD,
-) -> tuple[Velocity, str]:
-    """Prevent configured motion floors from amplifying terminal corrections.
-
-    Once position is reached for the current navigation, the caller keeps that
-    phase latched so localization jitter cannot re-enable the configured linear
-    speed floor.  A new navigation owns a fresh phase.  Once both errors are
-    within tolerance, the proposal is forced to exact zero and Nav2 remains
-    responsible for reporting the action result.
-    """
-
-    values = (
-        current_pose.x,
-        current_pose.y,
-        current_pose.yaw,
-        target_pose.x,
-        target_pose.y,
-        target_pose.yaw,
-        xy_tolerance_m,
-        yaw_tolerance_rad,
-    )
-    if any(not math.isfinite(float(value)) for value in values):
-        raise ProtocolError(
-            "non_finite_pose", "terminal pose and tolerances must be finite"
-        )
-    if xy_tolerance_m <= 0.0 or yaw_tolerance_rad <= 0.0:
-        raise ProtocolError(
-            "invalid_goal_tolerance", "terminal tolerances must be positive"
-        )
-
-    xy_error = math.hypot(
-        target_pose.x - current_pose.x,
-        target_pose.y - current_pose.y,
-    )
-    if not position_reached and xy_error > xy_tolerance_m:
-        return velocity, "approach"
-
-    yaw_error = abs(_normalized_angle(target_pose.yaw - current_pose.yaw))
-    if yaw_error > yaw_tolerance_rad:
-        return Velocity(yaw=velocity.yaw), "rotate"
-    return Velocity.zero(), "reached"
-
-
 def proposal_context_is_current(
     active: dict | None,
     *,
@@ -162,7 +99,7 @@ def proposal_context_is_publishable(
 
 @dataclass(frozen=True)
 class MotionLimits:
-    """Per-navigation nonzero magnitude floors and hard axis caps."""
+    """Per-navigation motion deadbands and hard axis caps."""
 
     min_x_mps: float = MIN_EFFECTIVE_LINEAR_MPS
     max_x_mps: float = 1.0
@@ -252,10 +189,11 @@ def limit_forward_velocity(
     return Velocity(x=forward, y=velocity.y, yaw=velocity.yaw)
 
 
-def _apply_axis_magnitude(value: float, minimum: float, maximum: float) -> float:
-    if value == 0.0 or maximum == 0.0:
+def _apply_axis_deadband(value: float, minimum: float, maximum: float) -> float:
+    threshold = min(minimum, maximum)
+    if value == 0.0 or maximum == 0.0 or abs(value) < threshold:
         return 0.0
-    magnitude = min(max(abs(value), min(minimum, maximum)), maximum)
+    magnitude = min(abs(value), maximum)
     return math.copysign(magnitude, value)
 
 
@@ -265,13 +203,15 @@ def apply_g1_motion_limits(
     limits: MotionLimits,
     max_forward_mps: float,
 ) -> Velocity:
-    """Make translation/rotation exclusive and enforce configured magnitudes.
+    """Make translation/rotation exclusive and apply deadbands and caps.
 
     Exact zeros remain zeros so readiness, pause, terminal and watchdog stops
-    preserve their fail-closed semantics.  A mixed Nav2 command turns in place
-    when its raw yaw demand is significant; otherwise it moves without yaw.
-    Lateral and yaw signs are preserved, while negative X is suppressed. The
-    navigation request's forward cap always wins over the configured X floor.
+    preserve their fail-closed semantics. Values below a configured minimum are
+    suppressed instead of being amplified, so Nav2 deceleration remains a
+    deceleration. A mixed command turns in place only when its retained yaw
+    demand is significant; otherwise it moves without yaw. Lateral and yaw
+    signs are preserved, while negative X is suppressed. The navigation
+    request's forward cap always wins over the configured X deadband.
     """
 
     limits.validate()
@@ -279,28 +219,27 @@ def apply_g1_motion_limits(
         velocity,
         max_forward_mps=max_forward_mps,
     )
-    x = limited.x
-    y = limited.y
-    yaw = limited.yaw
+    x_max = limits.max_x_mps
+    if limited.x > 0.0:
+        x_max = min(x_max, float(max_forward_mps))
+    x = _apply_axis_deadband(limited.x, limits.min_x_mps, x_max)
+    y = _apply_axis_deadband(
+        limited.y,
+        limits.min_y_mps,
+        limits.max_y_mps,
+    )
+    yaw = _apply_axis_deadband(
+        limited.yaw,
+        limits.min_yaw_rps,
+        limits.max_yaw_rps,
+    )
     if (x != 0.0 or y != 0.0) and yaw != 0.0:
         if abs(yaw) >= TURN_ONLY_YAW_THRESHOLD_RADPS:
             x = 0.0
             y = 0.0
         else:
             yaw = 0.0
-
-    x_max = limits.max_x_mps
-    if x > 0.0:
-        x_max = min(x_max, float(max_forward_mps))
-    return Velocity(
-        x=_apply_axis_magnitude(x, limits.min_x_mps, x_max),
-        y=_apply_axis_magnitude(y, limits.min_y_mps, limits.max_y_mps),
-        yaw=_apply_axis_magnitude(
-            yaw,
-            limits.min_yaw_rps,
-            limits.max_yaw_rps,
-        ),
-    )
+    return Velocity(x=x, y=y, yaw=yaw)
 
 
 def apply_g1_motion_floor(velocity: Velocity) -> Velocity:
@@ -514,9 +453,6 @@ __all__ = [
     "MIN_EFFECTIVE_LINEAR_MPS",
     "MIN_EFFECTIVE_YAW_RADPS",
     "MotionLimits",
-    "Pose2D",
-    "TERMINAL_XY_TOLERANCE_M",
-    "TERMINAL_YAW_TOLERANCE_RAD",
     "TURN_ONLY_YAW_THRESHOLD_RADPS",
     "ProtocolError",
     "SCHEMA_VERSION",
@@ -531,5 +467,4 @@ __all__ = [
     "limit_forward_velocity",
     "proposal_context_is_current",
     "proposal_context_is_publishable",
-    "shape_terminal_approach",
 ]
