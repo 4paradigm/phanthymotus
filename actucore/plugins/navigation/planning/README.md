@@ -98,9 +98,9 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 - X 轴为仅前进合同：Nav2 controller、velocity smoother 或恢复树产生的
   负 X 均在 proposal 边界强制归零，不会向 Driver 发布倒退命令；
 - `config` 动作可配置 `min_x_mps/max_x_mps`、`min_y_mps/max_y_mps`
-  和 `min_yaw_rps/max_yaw_rps`；`min_*` 是死区而不是速度抬升下限，
-  绝对值低于死区的非零提案归零，其余值保持 Nav2 原值和方向；
-- 默认 `X=0.30–1.00 m/s`、`Y=0–0 m/s`、`yaw=1.00–2.00 rad/s`；
+  和单一 `rotate_speed_rps`；X/Y 的 `min_*` 是死区，yaw 则保留
+  方向并固定为 `rotate_speed_rps` 的幅值；
+- 默认 `X=0.30–1.00 m/s`、`Y=0–0 m/s`、`yaw=0.30 rad/s`；
   `max_y_mps=0` 保持当前禁止横移的行为；
 - 每次导航的 `speed` 继续作为正向 X 上限；当该上限小于 X 死区时，
   它同时成为有效死区，不会把提案反向放大；

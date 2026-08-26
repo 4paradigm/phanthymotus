@@ -27,8 +27,8 @@ NAV2_CONFIG_DEFAULTS = {
     "max_x_mps": 1.0,
     "min_y_mps": 0.0,
     "max_y_mps": 0.0,
-    "min_yaw_rps": 1.0,
-    "max_yaw_rps": 2.0,
+    "min_yaw_rps": 0.3,
+    "max_yaw_rps": 0.3,
     "proposal_ttl_ms": 250,
     "proposal_frequency_hz": 5.0,
 }
@@ -104,14 +104,14 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "type": "number",
             "minimum": 0.0,
             "maximum": 2.0,
-            "default": 1.0,
+            "default": 0.3,
             "description": "Yaw deadband; smaller nonzero proposals are suppressed",
         },
         "max_yaw_rps": {
             "type": "number",
             "minimum": 0.0,
             "maximum": 2.0,
-            "default": 2.0,
+            "default": 0.3,
             "description": "Maximum magnitude of a yaw proposal; zero disables rotation",
         },
         "proposal_ttl_ms": {

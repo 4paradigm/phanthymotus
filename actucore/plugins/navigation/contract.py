@@ -54,10 +54,15 @@ def _config_properties() -> dict:
         "max_x_mps",
         "min_y_mps",
         "max_y_mps",
-        "min_yaw_rps",
-        "max_yaw_rps",
     ):
         result[key] = deepcopy(planning[key])
+    result["rotate_speed_rps"] = {
+        "type": "number",
+        "minimum": 0.3,
+        "maximum": 2.0,
+        "default": 0.3,
+        "description": "Fixed magnitude of every nonzero yaw proposal",
+    }
     result.update(
         {
             "vlm_base_url": deepcopy(semantic["base_url"]),

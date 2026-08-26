@@ -164,8 +164,8 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(full_config["max_x_mps"]["default"], 1.0)
         self.assertEqual(full_config["min_y_mps"]["default"], 0.0)
         self.assertEqual(full_config["max_y_mps"]["default"], 0.0)
-        self.assertEqual(full_config["min_yaw_rps"]["default"], 1.0)
-        self.assertEqual(full_config["max_yaw_rps"]["default"], 2.0)
+        self.assertEqual(full_config["min_yaw_rps"]["default"], 0.3)
+        self.assertEqual(full_config["max_yaw_rps"]["default"], 0.3)
         for field in (
             "min_x_mps",
             "max_x_mps",

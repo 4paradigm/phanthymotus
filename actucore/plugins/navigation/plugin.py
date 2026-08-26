@@ -384,12 +384,15 @@ class NavigationPlugin:
                     ("max_x_mps", "max_x_mps"),
                     ("min_y_mps", "min_y_mps"),
                     ("max_y_mps", "max_y_mps"),
-                    ("min_yaw_rps", "min_yaw_rps"),
-                    ("max_yaw_rps", "max_yaw_rps"),
                 )
                 if source in updates
             },
         }
+        if "rotate_speed_rps" in updates:
+            planning_updates.update(
+                min_yaw_rps=updates["rotate_speed_rps"],
+                max_yaw_rps=updates["rotate_speed_rps"],
+            )
         results = {
             "mapping": self._mapping.dispatch("fast_livo2", mapping_updates),
             "planning": self._planning.dispatch("nav2", planning_updates),

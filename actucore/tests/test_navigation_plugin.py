@@ -255,6 +255,19 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("planning_request_timeout_sec", properties)
         self.assertIn("obstacle_min_height_m", properties)
         self.assertIn("obstacle_max_height_m", properties)
+        self.assertIn("rotate_speed_rps", properties)
+        self.assertEqual(
+            tool["configSchema"]["properties"]["rotate_speed_rps"],
+            {
+                "type": "number",
+                "minimum": 0.3,
+                "maximum": 2.0,
+                "default": 0.3,
+                "description": "Fixed magnitude of every nonzero yaw proposal",
+            },
+        )
+        self.assertNotIn("min_yaw_rps", properties)
+        self.assertNotIn("max_yaw_rps", properties)
         self.assertNotIn("backend", properties)
         self.assertNotIn("request_timeout_sec", properties)
         self.assertNotIn("base_url", properties)
@@ -792,6 +805,7 @@ class NavigationPluginTest(unittest.TestCase):
                 "action": "config",
                 "obstacle_min_height_m": -0.8,
                 "obstacle_max_height_m": 0.4,
+                "rotate_speed_rps": 0.3,
             },
         )
         self.assertEqual(configured["state"], "configured")
@@ -805,6 +819,17 @@ class NavigationPluginTest(unittest.TestCase):
                 },
             ),
             plugin._mapping.calls,
+        )
+        self.assertIn(
+            (
+                "nav2",
+                {
+                    "action": "config",
+                    "min_yaw_rps": 0.3,
+                    "max_yaw_rps": 0.3,
+                },
+            ),
+            plugin._planning.calls,
         )
 
 

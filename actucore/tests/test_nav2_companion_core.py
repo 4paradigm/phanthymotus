@@ -222,6 +222,14 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             ),
             Velocity.zero(),
         )
+        self.assertEqual(
+            apply_g1_motion_limits(
+                Velocity(yaw=-2.0),
+                limits=MotionLimits(min_yaw_rps=0.3, max_yaw_rps=0.3),
+                max_forward_mps=0.50,
+            ),
+            Velocity(yaw=-0.3),
+        )
 
     def test_motion_limit_payload_is_complete_and_validated(self) -> None:
         limits = MotionLimits.from_payload(

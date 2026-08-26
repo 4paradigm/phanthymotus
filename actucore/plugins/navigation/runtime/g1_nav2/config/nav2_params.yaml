@@ -91,7 +91,8 @@ controller_server:
       plugin: g1_segmented_controller::SegmentedController
       rotate_exit_rad: 0.15
       rotate_reengage_rad: 0.35
-      rotate_speed_rps: 1.0
+      # The proposal bridge applies the card's fixed rotate_speed_rps cap.
+      rotate_speed_rps: 2.0
       approach_distance_m: 0.50
       approach_speed_mps: 0.30
       cruise_speed_mps: 1.0
