@@ -7,13 +7,18 @@ On-device text-to-speech using sherpa-onnx MeloTTS (Chinese + English).
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
+import os
 import queue
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
+
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
@@ -182,12 +187,428 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
 
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     import os
-    from utils.onnx_provider import normalize_device
+    backend = cfg.get('backend', 'sherpa-onnx')
     model_dir = cfg.get('model_dir', '/models/sherpa-onnx/tts')
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
+
+    log.info(f"[tts] _build_tts_adapter: backend={backend}, model_dir={model_dir}, "
+             f"speaker_id={speaker_id}, speed={speed}")
+
+    if backend == 'trt':
+        trt_dir = cfg.get('trt_dir', os.path.join(model_dir, 'trt'))
+        model_type = cfg.get('model_type', 'mel20full_d50')
+        log.info(f"[tts] _build_tts_adapter: -> TRT backend (trt_dir={trt_dir}, model_type={model_type})")
+        return TRTTSAdapter(model_dir, trt_dir, speaker_id, speed, model_type)
+
+    # sherpa-onnx backend（保留 upstream 的 device 支持）
+    from utils.onnx_provider import normalize_device
     device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    log.info("[tts] _build_tts_adapter: -> sherpa-onnx backend")
     return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed, device)
+
+
+# ── ORT Session Cache ────────────────────────────────────────────────────────
+_ORT_SESSIONS = {}
+_TRT_ENGINES = {}
+
+
+def _get_ort_session(path):
+    if path not in _ORT_SESSIONS:
+        import onnxruntime as ort
+        _ORT_SESSIONS[path] = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    return _ORT_SESSIONS[path]
+
+
+_TRT_NP_DTYPE = None
+
+
+def _trt_np_dtype(trt, dt):
+    """TRT DataType → numpy dtype.
+
+    不用 trt.nptype()：TRT 8.5 的实现里引用了 np.bool，而 numpy>=1.24 已移除该别名，
+    JP5 镜像上一调用就 AttributeError。
+    """
+    global _TRT_NP_DTYPE
+    if _TRT_NP_DTYPE is None:
+        m = {trt.DataType.FLOAT: np.float32, trt.DataType.HALF: np.float16,
+             trt.DataType.INT32: np.int32, trt.DataType.INT8: np.int8,
+             trt.DataType.BOOL: np.bool_}
+        for attr, npt in (("UINT8", np.uint8), ("INT64", np.int64)):
+            d = getattr(trt.DataType, attr, None)
+            if d is not None:
+                m[d] = npt
+        _TRT_NP_DTYPE = m
+    try:
+        return _TRT_NP_DTYPE[dt]
+    except KeyError:
+        raise RuntimeError(f"unsupported TRT tensor dtype: {dt}")
+
+
+def _get_trt_engine(path):
+    if path not in _TRT_ENGINES:
+        import tensorrt as trt
+        with open(path, "rb") as f:
+            _TRT_ENGINES[path] = trt.Runtime(trt.Logger(trt.Logger.WARNING)).deserialize_cuda_engine(f.read())
+    return _TRT_ENGINES[path]
+
+
+# ── TRT TTS Adapter (VITS2-Mix, no PyTorch) ────────────────────────────────
+
+class TRTTSAdapter(TTSAdapter):
+    """VITS2-Mix TensorRT TTS adapter — no PyTorch dependency.
+
+    encoder + flow + decoder 全部走 TRT，NumPy 做 MAS/iSTFT。长文本按句切分，
+    每个 chunk 始终走 TRT（不回退 ORT）；超长 chunk 再按 phone 数截断分次。
+    """
+
+    _MODEL_CFG = {
+        "mel20full_d50": {"n_fft": 128, "hop": 4, "gain": 0.0833},
+        # mxd_m45d5e6 微调：encoder/flow/dp 与 mel20full_d50 冻结，仅 decoder 不同，
+        # 因此 n_fft/hop/gain 完全一致，只换 decoder.trt。
+        "mel20full_d50_mxd": {"n_fft": 128, "hop": 4, "gain": 0.0833},
+        # mxd_m45d5e6_wav1 微调：同样只 decoder 不同（encoder/flow/dp 冻结）。
+        "mel20full_d50_mxd_wav1": {"n_fft": 128, "hop": 4, "gain": 0.0833},
+    }
+
+    # 每个 chunk 最大字符数，保证 decoder 输入 Ty 不超过 TRT max shape (JP5=1500)
+    MAX_CHUNK_CHARS = 100
+
+    def __init__(self, model_dir: str, trt_dir: str,
+                 speaker_id: int = 0, speed: float = 1.0,
+                 model_type: str = "mel20full_d50"):
+        self._speed = speed
+        self._trt_dir = trt_dir
+
+        # ── 按 model_type + TRT 版本选择 engine：JP5=8.5.x / JP6=10.x ──
+        import tensorrt as trt
+        trt_ver = trt.__version__
+        if trt_ver.startswith("8.5"):
+            engine_name = f"vits2_trt_{model_type}_jp5"
+        elif trt_ver.startswith("10."):
+            engine_name = f"vits2_trt_{model_type}_jp6"
+        else:
+            raise RuntimeError(
+                f"VITS2 TRT engine 仅支持 TRT 8.5.x（JP5）或 10.x（JP6），当前为 TRT {trt_ver}"
+            )
+        log.info(f"[tts] TRT adapter init: TRT={trt_ver}, engine={engine_name}, "
+                 f"model_dir={model_dir}, trt_dir={trt_dir}")
+
+        # ── 运行时下载模型资产（不 bake 进镜像：/models 会被 bind-mount 覆盖）──
+        from utils.model_downloader import ensure_model
+        ensure_model("vits2_mix", model_dir)
+        ensure_model(engine_name, trt_dir)
+        log.info(f"[tts] TRT adapter init: assets ready (model_dir={model_dir}, trt_dir={trt_dir})")
+
+        # ── Frontend (G2P) ──
+        sys.path.insert(0, model_dir)
+        from frontend.cleaner import clean_text_mix
+        from frontend import cleaned_text_to_sequence_mix
+        self._clean_text = clean_text_mix
+        self._seq_mix = cleaned_text_to_sequence_mix
+
+        # ── Model-specific iSTFT parameters ──
+        if model_type not in self._MODEL_CFG:
+            raise ValueError(
+                f"Unknown model_type: {model_type!r}; supported: {sorted(self._MODEL_CFG)}"
+            )
+        mc = self._MODEL_CFG[model_type]
+        self._n_fft = mc["n_fft"]
+        self._hop = mc["hop"]
+        self._gain = mc["gain"]
+
+        # Periodic Hann window (matches TorchSTFT fftbins=True)
+        w = np.hanning(self._n_fft + 1)[:self._n_fft].astype(np.float32)
+        self._window = w.reshape(1, self._n_fft, 1)
+
+        # ── Encoder（纯 TRT，不回退 ORT）──
+        # encoder.trt 的 profile 上限是 ph:1x1000（见 tools/trt 构建命令）；
+        # 超过该上限的文本在 _synthesize_chunk 里按词截断、分次编码，绝不回退 ORT。
+        enc_trt_path = os.path.join(trt_dir, "encoder.trt")
+        if not os.path.exists(enc_trt_path):
+            raise RuntimeError(
+                f"VITS2 TRT encoder engine not found: {enc_trt_path}. "
+                f"请先用 trtexec 从 encoder_duration.onnx（opset 16）构建 encoder.trt"
+            )
+        self._enc_eng = _get_trt_engine(enc_trt_path)
+        if self._enc_eng is None:
+            raise RuntimeError(f"Failed to deserialize encoder engine {enc_trt_path}")
+        self._enc_max_T = int(self._enc_eng.get_tensor_profile_shape("ph", 0)[2][1])
+        log.info("[tts] encoder backend=TRT (%s, max T_phone=%d)",
+                 enc_trt_path, self._enc_max_T)
+
+        # ── TRT engines (shared across instances via module cache) ──
+        flow_path = os.path.join(trt_dir, "flow.trt")
+        dec_path = os.path.join(trt_dir, "decoder.trt")
+        self._flow_eng = _get_trt_engine(flow_path)
+        self._dec_eng = _get_trt_engine(dec_path)
+        if self._flow_eng is None or self._dec_eng is None:
+            raise RuntimeError(f"Failed to load TRT engines from {trt_dir}")
+
+        # ── CUDA allocator ──
+        self._cuda = ctypes.CDLL("libcudart.so")
+        self._cuda.cudaMalloc.restype = int
+        self._cuda.cudaMalloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self._cuda.cudaFree.restype = int
+        self._cuda.cudaFree.argtypes = [ctypes.c_void_p]
+        self._cuda.cudaMemcpy.restype = int
+        self._cuda.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                           ctypes.c_size_t, ctypes.c_int]
+
+        # ── 复用的 execution context + buffer（避免每次推理 create/malloc/free）──
+        self._ctx_cache = {}   # engine -> execution context
+        self._gpu_buf = {}     # (id(engine), name) -> (ptr, size)
+        self._cpu_buf = {}     # (id(engine), name) -> np.ndarray
+        self._bound_shape = {}  # (id(engine), name) -> tuple  (只在 shape 变化时才 set_input_shape)
+
+        log.info("[tts] TRT adapter loaded: model=%s n_fft=%d hop=%d gain=%.4f",
+                 model_type, self._n_fft, self._hop, self._gain)
+
+    def _gpu_alloc(self, size):
+        ptr = ctypes.c_void_p(0)
+        self._cuda.cudaMalloc(ctypes.byref(ptr), size)
+        return ptr
+
+    def _get_ctx(self, engine):
+        ctx = self._ctx_cache.get(engine)
+        if ctx is None:
+            ctx = engine.create_execution_context()
+            self._ctx_cache[engine] = ctx
+        return ctx
+
+    def _gpu_buf_for(self, engine, name, size):
+        """复用 GPU buffer（不够大才重新分配），避免每次推理 malloc/free。"""
+        key = (id(engine), name)
+        entry = self._gpu_buf.get(key)
+        if entry is not None and entry[1] >= size:
+            return entry[0]
+        if entry is not None:
+            self._cuda.cudaFree(entry[0])
+        ptr = self._gpu_alloc(size)
+        self._gpu_buf[key] = (ptr, size)
+        return ptr
+
+    def _cpu_buf_for(self, engine, name, shape, dtype=np.float32):
+        """复用 CPU buffer（取前 N 元素 reshape 到目标 shape，避免反复分配）。"""
+        key = (id(engine), name, np.dtype(dtype).str)
+        arr = self._cpu_buf.get(key)
+        need = int(np.prod(shape))
+        if arr is None or arr.size < need:
+            arr = np.empty(shape, dtype=dtype)
+            self._cpu_buf[key] = arr
+            return arr
+        return arr.ravel()[:need].reshape(shape)
+
+    def _trt_run(self, engine, inputs, output_names):
+        import tensorrt as trt
+        ctx = self._get_ctx(engine)
+        gpu_ptrs, outputs = {}, {}
+        for i in range(engine.num_io_tensors):
+            name = engine.get_tensor_name(i)
+            # encoder 的 ph/to/la/xl 是 int32，flow/decoder 是 float32 —— 按 engine 声明的 dtype 走
+            dt = _trt_np_dtype(trt, engine.get_tensor_dtype(name))
+            if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                data = np.ascontiguousarray(inputs[name], dtype=dt)
+                key = (id(engine), name)
+                if self._bound_shape.get(key) != data.shape:
+                    # TRT 10.x 每次 set_input_shape 都会触发 re-optimize（实测 ~1s），
+                    # 只有 shape 变化时才需要重新 bind。
+                    ctx.set_input_shape(name, data.shape)
+                    self._bound_shape[key] = data.shape
+                ptr = self._gpu_buf_for(engine, name, data.nbytes)
+                self._cuda.cudaMemcpy(ptr, data.ctypes.data, data.nbytes, 1)  # H2D
+                gpu_ptrs[name] = ptr
+            else:
+                shape = tuple(ctx.get_tensor_shape(name))
+                arr = self._cpu_buf_for(engine, name, shape, dt)
+                outputs[name] = arr
+                ptr = self._gpu_buf_for(engine, name, arr.nbytes)
+                gpu_ptrs[name] = ptr
+        bindings = [gpu_ptrs[engine.get_tensor_name(i)].value
+                     for i in range(engine.num_io_tensors)]
+        ctx.execute_v2(bindings)
+        for name, arr in outputs.items():
+            self._cuda.cudaMemcpy(arr.ctypes.data, gpu_ptrs[name], arr.nbytes, 2)  # D2H
+        return tuple(outputs[n] for n in output_names)
+
+    @staticmethod
+    def _split_sentences(text: str) -> list:
+        """按句号截断，超长文本分批，每批不超过 MAX_CHUNK_CHARS 字符。
+
+        单个无标点句子超过上限时也会切成多个片段，保证 decoder Ty 不超过
+        TRT engine 的 max shape（JP5 约 1500）。
+        """
+        import re
+        sentences = re.split(r'(?<=[。！？\n])', text)
+        limit = TRTTSAdapter.MAX_CHUNK_CHARS
+        chunks, buf = [], ""
+
+        def flush():
+            nonlocal buf
+            if buf:
+                chunks.append(buf)
+                buf = ""
+
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            while s:
+                room = limit - len(buf)
+                if room >= len(s):
+                    buf += s
+                    break
+                if room > 0:
+                    buf += s[:room]
+                    s = s[room:]
+                flush()
+                # 此时 buf 为空；若 s 仍超长，切成完整片段
+                while len(s) >= limit:
+                    chunks.append(s[:limit])
+                    s = s[limit:]
+        flush()
+        return chunks if chunks else [text]
+
+    def synthesize(self, text: str) -> bytes:
+        return b"".join(self.synthesize_stream(text))
+
+    def _encode_phones(self, text: str):
+        """Text → interleaved phone/tone/lang ID 序列，返回 (ph, to, la, T)。"""
+        _, phones, tones, langs, _ = self._clean_text(text)
+        phone_ids, tone_ids, lang_ids = self._seq_mix(phones, tones, langs)
+        phone_ids = [0] + [p for pid in phone_ids for p in (pid, 0)]
+        tone_ids = [0] + [t for tid in tone_ids for t in (tid, 0)]
+        lang_ids = [0] + [l for lid in lang_ids for l in (lid, 0)]
+        T = len(phone_ids)
+        return (np.array([phone_ids], dtype=np.int32),
+                np.array([tone_ids], dtype=np.int32),
+                np.array([lang_ids], dtype=np.int32),
+                np.array([T], dtype=np.int32))
+
+    def _split_text_under_phones(self, text: str) -> list:
+        """把一段文本按词贪心拆成多段，保证每段的 phone 数 ≤ _enc_max_T。
+
+        只在极少数超长/高音素密度文本（如整段英文）触发；正常中文 MAX_CHUNK_CHARS=100
+        对应 T≈400，远低于 encoder.trt 的 1000 上限，不会走到这里。
+        """
+        import re
+        limit = self._enc_max_T
+        tokens = re.findall(r"\S+\s*", text) or [text]
+        pieces, buf = [], ""
+        for tok in tokens:
+            cand = buf + tok
+            if buf and self._encode_phones(cand)[3].item() > limit:
+                pieces.append(buf)
+                buf = tok
+            else:
+                buf = cand
+        if buf:
+            pieces.append(buf)
+        # 兜底：仍超限的片段（如无空格的超长数字/URL）按实际 phone 数递归二分，
+        # 绝不按字符数硬切 —— 1 字符 ≈ 2 phone，按字符切会仍然超限。
+        out = []
+        for p in pieces:
+            out.extend(self._hard_split_under_phones(p))
+        return out or [text]
+
+    def _hard_split_under_phones(self, text: str) -> list:
+        """递归二分，直到每段编码后的 phone 数 ≤ _enc_max_T。"""
+        if self._encode_phones(text)[3].item() <= self._enc_max_T:
+            return [text]
+        mid = len(text) // 2
+        if mid == 0:
+            return [text]  # 单字符仍超限（几乎不可能），交给 encoder 暴露错误
+        return self._hard_split_under_phones(text[:mid]) + self._hard_split_under_phones(text[mid:])
+
+    def _synth_phones(self, ph, to, la, xl, T, noise_scale):
+        """phone ID 序列 → audio float32（encoder + flow + decoder + iSTFT，全 TRT）。"""
+        # ── 1. Encoder (TRT) ──
+        m_p, logs_p, logw, x_mask = self._trt_run(
+            self._enc_eng, {"ph": ph, "to": to, "la": la, "xl": xl},
+            ("m_p", "logs_p", "logw", "x_mask"))
+
+        # ── 2. Duration expansion (pure NumPy MAS) ──
+        w = np.exp(logw[0, 0, :T]) * x_mask[0, 0, :T]
+        w_ceil = np.ceil(w).astype(np.int32)
+        Ty = max(1, int(w_ceil.sum()))
+        y_mask = np.ones((1, 1, Ty), dtype=np.float32)
+
+        cum_dur = np.cumsum(w_ceil)
+        attn = np.zeros((1, T, Ty), dtype=np.float32)
+        for tx in range(T):
+            end_pos = int(cum_dur[tx])
+            start_pos = end_pos - int(w_ceil[tx])
+            if start_pos < Ty and end_pos > 0:
+                lo, hi = max(start_pos, 0), min(end_pos, Ty)
+                if hi > lo:
+                    attn[0, tx, lo:hi] = 1.0
+
+        m_p_exp = np.matmul(m_p[:, :, :T], attn)
+        logs_p_exp = np.matmul(logs_p[:, :, :T], attn)
+        z_p = m_p_exp + np.random.randn(1, 256, Ty).astype(np.float32) * np.exp(logs_p_exp) * noise_scale
+
+        # ── 3. Flow (TRT) ──
+        z, = self._trt_run(self._flow_eng, {"z_p": z_p, "y_mask": y_mask}, ["z"])
+
+        # ── 4. Decoder (TRT) ──
+        spec, phase = self._trt_run(self._dec_eng, {"z": z}, ["spec", "phase"])
+
+        # ── 5. iSTFT (NumPy bincount overlap-add) ──
+        tf = np.fft.irfft(spec * np.exp(1j * phase), n=self._n_fft, axis=1)
+        wf2d = tf[0] * self._window[0]
+        _, T_frames = wf2d.shape
+        out_len = (T_frames - 1) * self._hop + self._n_fft
+        base = np.arange(T_frames, dtype=np.int32) * self._hop
+        offsets = np.arange(self._n_fft, dtype=np.int32)[:, None]
+        indices = (base + offsets).ravel()
+        audio = np.bincount(indices, weights=wf2d.ravel().astype(np.float64),
+                            minlength=out_len).astype(np.float32)
+        audio = audio[self._n_fft // 2:out_len - self._n_fft // 2].reshape(1, -1) * self._gain
+
+        if self._speed and self._speed != 1.0:
+            target_len = int(audio.shape[1] / self._speed)
+            xp = np.linspace(0, 1, audio.shape[1])
+            x = np.linspace(0, 1, target_len)
+            audio = np.interp(x, xp, audio[0]).reshape(1, -1).astype(np.float32)
+
+        return audio[0]
+
+    def _synthesize_chunk(self, text: str, noise_scale: float = 0.667):
+        """Synthesize a single text chunk through TRT, returning float32 numpy array.
+
+        若 phone 序列超过 encoder.trt 的 max profile，则按词截断、分次编码后拼接，
+        绝不回退 ORT。
+        """
+        t0 = time.perf_counter()
+        ph, to, la, xl = self._encode_phones(text)
+        T = int(xl.item())
+
+        if T <= self._enc_max_T:
+            audio_f32 = self._synth_phones(ph, to, la, xl, T, noise_scale)
+        else:
+            log.info("[tts] T_phone=%d exceeds encoder max %d, splitting text into pieces",
+                     T, self._enc_max_T)
+            audios = []
+            for piece in self._split_text_under_phones(text):
+                pph, pto, pla, pxl = self._encode_phones(piece)
+                audios.append(self._synth_phones(pph, pto, pla, pxl, int(pxl.item()), noise_scale))
+            audio_f32 = np.concatenate(audios)
+
+        peak = max(abs(audio_f32.max()), abs(audio_f32.min()), 1.0)
+        if peak > 1.5:
+            audio_f32 = audio_f32 * (1.0 / peak)
+        t1 = time.perf_counter()
+        log.info("[tts] chunk %d chars %d phones → audio=%.2fs | total=%dms",
+                 len(text), T, len(audio_f32) / 16000, int((t1 - t0) * 1000))
+        return audio_f32
+
+    def synthesize_stream(self, text: str):
+        chunks = self._split_sentences(text)
+        for chunk_text in chunks:
+            audio_f32 = self._synthesize_chunk(chunk_text)
+            pcm = np.clip(audio_f32 * 32767, -32768, 32767).astype(np.int16).tobytes()
+            for i in range(0, len(pcm), CHUNK_BYTES):
+                yield pcm[i:i + CHUNK_BYTES]
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
@@ -303,9 +724,11 @@ class _TTSNode(Node):
         from audio_msgs.msg import AudioChunk
         import time as _time
 
-        # Real-time pacing: publish frames at playback rate to avoid bursts/gaps
+        # Real-time pacing: publish frames at playback rate to avoid bursts/gaps.
+        # 默认关闭节流（burst 发布）；需要模拟实时播放时设 TTS_PACING=1。
+        _pacing = os.environ.get("TTS_PACING", "0").strip().lower() not in ("0", "false", "no", "off")
         FRAME_DURATION = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s per 3200-byte frame
-        PREBUF_FRAMES  = 3  # buffer 3 frames (~300ms) before starting real-time pacing
+        PREBUF_FRAMES  = 3 if _pacing else 0  # 关闭节流时无需预缓冲
 
         while not self._stop_event.is_set():
             try:
@@ -382,11 +805,12 @@ class _TTSNode(Node):
                                 prebuf = []
                             continue
 
-                        # Real-time pacing
-                        target = t0 + frames_sent * FRAME_DURATION
-                        now = _time.monotonic()
-                        if now < target:
-                            _time.sleep(target - now)
+                        # Real-time pacing（TTS_PACING=0 时跳过，直接 burst 发布）
+                        if _pacing:
+                            target = t0 + frames_sent * FRAME_DURATION
+                            now = _time.monotonic()
+                            if now < target:
+                                _time.sleep(target - now)
                         msg = AudioChunk()
                         msg.header.stamp = self.get_clock().now().to_msg()
                         msg.format = "audio/pcm-16k"
@@ -518,6 +942,8 @@ class SherpaOnnxTTSPlugin:
         self._cfg      = plugin_cfg
         self._loading  = False
         self._load_error = None
+        log.info(f"[tts] plugin init: cfg keys={sorted(plugin_cfg.keys())}, "
+                 f"backend={plugin_cfg.get('backend', '(unset->sherpa-onnx)')}")
         try:
             self._adapter  = _build_tts_adapter(plugin_cfg)
         except Exception as e:
@@ -525,6 +951,7 @@ class SherpaOnnxTTSPlugin:
             self._adapter = None
             self._load_error = str(e)
         self._nodes: dict[str, _TTSNode] = {}
+        self._instance_configs: dict = {}
         # main.py serves MCP over ThreadingHTTPServer, so start/stop/speak/config
         # can run concurrently. Every read-modify-write of _nodes must hold this:
         # otherwise two threads both pass a "key not in _nodes" check, both build
@@ -534,7 +961,9 @@ class SherpaOnnxTTSPlugin:
         # RLock: dispatch paths nest (start → _dispose_node).
         self._nodes_lock = threading.RLock()
         self._executor = executor
-        log.info(f"[tts] plugin init: sherpa-onnx VITS, "
+        adapter_type = type(self._adapter).__name__ if self._adapter else "None"
+        log.info(f"[tts] plugin init: adapter={adapter_type}, backend={plugin_cfg.get('backend','(unset)')}, "
+                 f"load_error={self._load_error or '(none)'}, "
                  f"speaker_id={plugin_cfg.get('speaker_id', 0)}, speed={plugin_cfg.get('speed', 1.0)}")
 
     def _dispose_node(self, node: _TTSNode, key: str = "") -> dict:

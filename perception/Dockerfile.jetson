@@ -7,7 +7,8 @@
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
-#   ./deploy/build_perception.sh --variant jetson --mirror tuna
+#   ./deploy/build_perception.sh --jp-version 5.11 --mirror tuna   # JetPack 5.11
+#   ./deploy/build_perception.sh --jp-version 6.1  --mirror tuna   # JetPack 6.1
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
@@ -277,47 +278,20 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 # built before this line still recovers; this makes it not depend on that.
 ENV PHONEMIZER_ESPEAK_LIBRARY=/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1
 
-# ── VITS2 TTS frontend deps ───────────────────────────────────────
-# The model release contains compiled TN FSTs; the container executes them with
-# WeText/kaldifst and does not build Pynini.
-#
-# numpy is NOT pinned in the requirements file: the OCR layer above already
-# pins it to whatever each JetPack's torch/cv2 stack ships, and a second pin
-# here would silently downgrade it (jp61 1.26.4 → 1.24.4, jp511 1.24.4 →
-# 1.23.5), breaking the numpy C-ABI those wheels were built against. The same
-# NUMPY_VERSION is re-stated on this pip invocation, and asserted afterwards,
-# so a transitive requirement of wetext/g2p-en/nltk cannot move it either.
-#
-# CPython headers: on jp511 (focal, cp38) one transitive dependency has to be
-# compiled — pyahocorasick, pulled in by wetext → contractions → textsearch,
-# has never published a cp38 aarch64 wheel. Every other package in the set
-# resolves to a wheel on both lines. Installed only when Python.h is actually
-# missing, so jp61 (where nothing compiles) is untouched, and the ldconfig
-# shim is the same workaround as every other apt step in this file.
-COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
-RUN if [ "${ENABLE_VITS2_TRT}" = "1" ] && \
-       ! python3 -c "import os,sysconfig;raise SystemExit(0 if os.path.exists(os.path.join(sysconfig.get_paths()['include'],'Python.h')) else 1)"; then \
-      echo '[build] CPython headers missing — installing python3-dev for the source builds' && \
-      mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
-      printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
-      chmod +x /usr/sbin/ldconfig && \
-      apt-get update && \
-      apt-get install -y --no-install-recommends python3-dev && \
-      mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
-      { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
-      rm -rf /var/lib/apt/lists/*; \
-    fi
-RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
-      . /etc/jetpack.env; \
-      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
-        "numpy==${NUMPY_VERSION}" -r /tmp/vits2-requirements.txt && \
-      python3 -c "import importlib.util as u, sys, numpy, kaldifst, pypinyin, jieba, inflect, nltk; \
-need = ['wetext', 'g2p_en', 'contractions'] + (['importlib_resources'] if sys.version_info < (3, 9) else []); \
-missing = [m for m in need if u.find_spec(m) is None]; \
-assert not missing, 'missing: %s' % missing; \
-assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; \
-print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
-    fi && rm -f /tmp/vits2-requirements.txt
+# ── VITS2 TRT TTS (optional backend, JP5 TRT 8.5.2) ──────────────
+# 模型资产（frontend / vits2 源码 / nltk / TRT engine）运行时由
+# model_downloader.ensure_model 下载（/models 会被 bind-mount 覆盖，
+# 故不 bake 进镜像）。这里只装 Python 依赖。
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    numpy pypinyin jieba inflect g2p-en nltk kaldifst contractions
+
+# wetext（Python 依赖，含预构建 fst）装到 site-packages
+ARG WETEXT_URL=https://dou-1257995901.cos.ap-guangzhou.myqcloud.com/source_code
+RUN curl -fsSL -o /tmp/wetext_with_fsts.tar.gz "${WETEXT_URL}/wetext_with_fsts.tar.gz" && \
+    tar -xzf /tmp/wetext_with_fsts.tar.gz -C "$(python3 -c 'import site; print(site.getsitepackages()[0])')" && \
+    rm /tmp/wetext_with_fsts.tar.gz && \
+    echo "wetext (with fst) installed"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work

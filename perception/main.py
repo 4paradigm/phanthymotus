@@ -439,8 +439,8 @@ def main():
     global _bundle
 
     cfg      = _load_config()
-    mcp_port = int(cfg.get("mcp_port", 15720))
-    ws_port  = int(cfg.get("ws_port",  15721))
+    mcp_port = int(os.environ.get("MCP_PORT") or cfg.get("mcp_port", 15720))
+    ws_port  = int(os.environ.get("WS_PORT") or cfg.get("ws_port", 15721))
 
     log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "
@@ -451,6 +451,9 @@ def main():
              f"model={asr_cfg.get('model','') or '(default)'}, key={'set' if asr_cfg.get('key') else 'MISSING'}")
     log.info(f"  tts: provider={tts_cfg.get('provider')}, model={tts_cfg.get('model','') or '(default)'}, "
              f"api_key={'set' if tts_cfg.get('api_key') else 'MISSING'}")
+    log.info(f"  tts: backend={tts_cfg.get('backend','(unset->sherpa-onnx)')}, "
+             f"model_dir={tts_cfg.get('model_dir','(unset)')}, "
+             f"trt_dir={tts_cfg.get('trt_dir','(unset)')}, model_type={tts_cfg.get('model_type','(unset)')}")
 
     os.environ.setdefault("RCUTILS_LOGGING_SEVERITY_THRESHOLD", "50")
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")

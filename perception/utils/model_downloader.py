@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
 
+# VITS2 TRT TTS 资产（frontend / vits2 源码 / nltk / TRT engine）
+VITS2_COS_BASE = "https://dou-1257995901.cos.ap-guangzhou.myqcloud.com/source_code"
+
 
 def _progress_hook(name: str):
     """Create a reporthook for urlretrieve that logs download progress."""
@@ -89,6 +92,41 @@ MODELS = {
         "url": f"{COS_BASE}/gtcrn_simple.onnx",
         "check_file": "gtcrn_simple.onnx",
         "single_file": True,
+    },
+    # VITS2 TRT TTS：前端 G2P + vits2 源码 + nltk 数据（解压到 model_dir 根）
+    "vits2_mix": {
+        "url": f"{VITS2_COS_BASE}/vits2_model.tar.gz",
+        "check_file": "frontend/cleaner.py",
+    },
+    # VITS2 TRT engine（JP5 / TRT 8.5.2）
+    "vits2_trt_mel20full_d50_jp5": {
+        "url": f"{VITS2_COS_BASE}/trt_mel20full_d50.tar.gz",
+        "check_file": "encoder.trt",
+    },
+    # VITS2 TRT engine（JP6 / TRT 10.4）
+    "vits2_trt_mel20full_d50_jp6": {
+        "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_jp6.tar.gz",
+        "check_file": "encoder.trt",
+    },
+    # VITS2 TRT engine（JP5 / TRT 8.5.2，mxd_m45d5e6 微调解码器）
+    "vits2_trt_mel20full_d50_mxd_jp5": {
+        "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_mxd.tar.gz",
+        "check_file": "encoder.trt",
+    },
+    # VITS2 TRT engine（JP6 / TRT 10.4，mxd_m45d5e6 微调解码器）
+    "vits2_trt_mel20full_d50_mxd_jp6": {
+        "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_mxd_jp6.tar.gz",
+        "check_file": "encoder.trt",
+    },
+    # VITS2 TRT engine（JP5 / TRT 8.5.2，mxd_m45d5e6_wav1 微调解码器）
+    "vits2_trt_mel20full_d50_mxd_wav1_jp5": {
+        "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_mxd_wav1.tar.gz",
+        "check_file": "encoder.trt",
+    },
+    # VITS2 TRT engine（JP6 / TRT 10.4，mxd_m45d5e6_wav1 微调解码器）
+    "vits2_trt_mel20full_d50_mxd_wav1_jp6": {
+        "url": f"{VITS2_COS_BASE}/trt_mel20full_d50_mxd_wav1_jp6.tar.gz",
+        "check_file": "encoder.trt",
     },
 }
 

@@ -39,17 +39,13 @@ plugins:
 
   tts:
     enabled: true
-    engine: vits2_trt
     backend: trt
-    model_dir: /models/vits2
+    model_dir: /models/vits2-mix
+    trt_dir: /models/vits2-mix/trt_mel20full_d50_mxd
+    model_type: "mel20full_d50_mxd"
     speaker_id: 0
     speed: 1.0
-    warmup: true
-    max_chunk_tokens: 256
-    # sherpa_onnx engine only — vits2_trt runs on TensorRT and ignores this.
-    # Matcha is fp32, so both devices load the same weights and only the provider
-    # changes; gpu measured ~4.3x faster at num_threads=2.
-    device: cpu
+    device: cpu   # 仅 sherpa-onnx backend 使用；backend=trt 时忽略
 
   vop:
     enabled: true
