@@ -259,7 +259,7 @@ def make_handler():
                     is_info = (args.get('action') == 'info')
                     if not is_info:
                         log.info(
-                            "[mcp] tools/call: %s(%s)",
+                            "[mcp] tools/call: %.200r(%s)",
                             name,
                             redact_sensitive(args),
                         )

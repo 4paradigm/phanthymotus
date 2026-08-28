@@ -182,7 +182,7 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(tool["displayName"], "ControlledSemanticSpatial")
         self.assertEqual(
             {item["port"] for item in tool["topic_in"]},
-            {"lidar", "imu", "rgb", "depth_frame"},
+            {"lidar", "imu", "rgb", "depth_frame", "goal_pose"},
         )
         optional_inputs = {
             item["port"]
@@ -191,7 +191,7 @@ class NavigationContractTest(unittest.TestCase):
         }
         self.assertEqual(
             optional_inputs,
-            {"depth_frame"},
+            {"rgb", "depth_frame", "goal_pose"},
         )
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(
@@ -211,6 +211,8 @@ class NavigationContractTest(unittest.TestCase):
             inputs["depth_frame"]["schema"],
             "phanthy.sensor.camera_depth_frame.v1",
         )
+        self.assertEqual(inputs["goal_pose"]["topic"], "/ubuntu/navigation/goal_pose")
+        self.assertEqual(inputs["goal_pose"]["schema"], "phanthy.navigation.goal.v1")
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
         self.assertEqual(
             [item["port"] for item in tool["topic_out"]],
@@ -222,7 +224,8 @@ class NavigationContractTest(unittest.TestCase):
                 "costmap",
             ],
         )
-        self.assertNotIn("x-topic-actions", tool)
+        self.assertEqual(tool["x-topic-actions"][0]["action"], "navigate_to_pose")
+        self.assertEqual(tool["x-topic-actions"][0]["port"], "goal_pose")
         self.assertTrue(
             {
                 "livo_odom",
@@ -407,15 +410,16 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE}", dockerfile)
-        self.assertRegex(
-            dockerfile,
-            r"ARG ACTUCORE_NAVIGATION_BASE_IMAGE="
-            r"bj-warehouse\.tencentcloudcr\.com/phanthy-motus/"
-            r"actucore-navigation-base@sha256:[0-9a-f]{64}",
-        )
+        self.assertIn("ARG ACTUCORE_NAVIGATION_BASE_IMAGE\n", dockerfile)
+        self.assertNotIn("actucore-navigation-base@sha256:", dockerfile)
         self.assertNotIn("missing-digest", dockerfile)
         self.assertIn("--base", build_script)
         self.assertIn("ACTUCORE_NAVIGATION_BASE_IMAGE override", build_script)
+        self.assertIn("JP${JP_VERSION} navigation base is not published", build_script)
+        self.assertIn(
+            "actucore-navigation-base@sha256:ce5c52b9fe7451a8c202632267b270460f20483fe94f35e9a130e580aaecddc9",
+            build_script,
+        )
         self.assertIn(
             "build the navigation base on native ARM64, not through QEMU",
             build_script,
@@ -638,19 +642,20 @@ class NavigationPluginTest(unittest.TestCase):
             planning_topics["static_map"],
             "/ubuntu/navigation/static_map",
         )
-        semantic_start = next(args for _, args in semantic.calls if args["action"] == "start")
-        self.assertEqual(
-            {item["port"] for item in semantic_start["input_bindings"]},
-            {"rgb", "livo_odom", "livo_status"},
-        )
+        self.assertFalse(any(args["action"] == "start" for _, args in semantic.calls))
         stopped = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(runtime.stop_calls, 1)
 
     def test_custom_external_topics_reach_child_runtime(self):
         runtime = FakeRuntime()
-        plugin = self.make_plugin(runtime=runtime)
-        bindings = _external_bindings()
+        semantic = FakeComponent("semantic")
+        plugin = self.make_plugin(runtime=runtime, semantic=semantic)
+        bindings = [
+            {"port": item["port"], "topic": item["topic"]}
+            for item in navigation_tool_definition("ubuntu")["topic_in"]
+            if item["port"] in {"lidar", "imu", "rgb"}
+        ]
         custom = {
             "lidar": "/robot/sensors/lidar",
             "imu": "/robot/sensors/imu",
@@ -666,6 +671,13 @@ class NavigationPluginTest(unittest.TestCase):
 
         self.assertEqual(result["state"], "ready")
         self.assertEqual(runtime.start_kwargs["input_topics"], custom)
+        semantic_start = next(
+            args for _, args in semantic.calls if args["action"] == "start"
+        )
+        self.assertEqual(
+            {item["port"] for item in semantic_start["input_bindings"]},
+            {"rgb", "livo_odom", "livo_status"},
+        )
 
     def test_collection_reuses_rgb_and_requires_depth_binding(self):
         mapping = CollectionMappingComponent("mapping")
@@ -676,8 +688,8 @@ class NavigationPluginTest(unittest.TestCase):
             {"action": "start", "input_bindings": _external_bindings()},
         )
         self.assertEqual(missing["error_code"], "invalid_canvas_wiring")
+        self.assertIn("rgb", missing["error"])
         self.assertIn("depth_frame", missing["error"])
-        self.assertNotIn("rgb_frame", missing["error"])
 
         all_bindings = [
             {"port": item["port"], "topic": item["topic"]}

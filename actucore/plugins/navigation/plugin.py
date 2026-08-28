@@ -104,7 +104,7 @@ class NavigationPlugin:
             if not self._started:
                 return self._error(
                     "canvas_not_started",
-                    "connect LiDAR, IMU and RGB, then start the "
+                    "connect LiDAR and IMU, then start the "
                     "ControlledSemanticSpatial card",
                 )
         if not self._runtime.info().get("running", False):
@@ -201,30 +201,29 @@ class NavigationPlugin:
             self._require_started("planning", planning_result)
             started.append(("planning", self._planning))
 
-            semantic_result = self._semantic.dispatch(
-                "vln",
-                {
-                    "action": "start",
-                    "input_bindings": [
-                        {
-                            "port": "rgb",
-                            "topic": wiring["wired_topics"]["rgb"],
-                        },
-                        {
-                            "port": "livo_odom",
-                            "topic": f"/{self._namespace}/navigation/odom",
-                        },
-                        {
-                            "port": "livo_status",
-                            "topic": (
-                                f"/{self._namespace}/navigation/fast_livo2/status"
-                            ),
-                        },
-                    ],
-                },
-            )
-            self._require_started("semantic", semantic_result)
-            started.append(("semantic", self._semantic))
+            rgb_topic = wiring["wired_topics"].get("rgb")
+            if rgb_topic:
+                semantic_result = self._semantic.dispatch(
+                    "vln",
+                    {
+                        "action": "start",
+                        "input_bindings": [
+                            {"port": "rgb", "topic": rgb_topic},
+                            {
+                                "port": "livo_odom",
+                                "topic": f"/{self._namespace}/navigation/odom",
+                            },
+                            {
+                                "port": "livo_status",
+                                "topic": (
+                                    f"/{self._namespace}/navigation/fast_livo2/status"
+                                ),
+                            },
+                        ],
+                    },
+                )
+                self._require_started("semantic", semantic_result)
+                started.append(("semantic", self._semantic))
         except Exception as exc:
             log.error(
                 "[ControlledSemanticSpatial] start failed: %s",
@@ -453,7 +452,7 @@ class NavigationPlugin:
             and mapping_info["config"].get("collection_enabled") is True
         )
         if collection_enabled:
-            required.add("depth_frame")
+            required.update(("rgb", "depth_frame"))
         bindings = args.get("input_bindings") or []
         raw_topics = args.get("input_topics") or []
         if isinstance(raw_topics, str):

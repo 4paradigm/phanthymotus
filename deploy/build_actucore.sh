@@ -110,13 +110,24 @@ else
     DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
     IMAGE_NAME="actucore"
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
-    if [ -n "${ACTUCORE_NAVIGATION_BASE_IMAGE:-}" ]; then
-        if [[ ! "${ACTUCORE_NAVIGATION_BASE_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
-            echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE override must use an exact @sha256 digest" >&2
-            exit 2
-        fi
-        BUILD_ARGS+=("ACTUCORE_NAVIGATION_BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}")
+    case "${JP_VERSION}" in
+        5.11)
+            DEFAULT_NAVIGATION_BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:ce5c52b9fe7451a8c202632267b270460f20483fe94f35e9a130e580aaecddc9"
+            ;;
+        6.1)
+            DEFAULT_NAVIGATION_BASE_IMAGE=""
+            ;;
+    esac
+    ACTUCORE_NAVIGATION_BASE_IMAGE="${ACTUCORE_NAVIGATION_BASE_IMAGE:-${DEFAULT_NAVIGATION_BASE_IMAGE}}"
+    if [ -z "${ACTUCORE_NAVIGATION_BASE_IMAGE}" ]; then
+        echo "ERROR=JP${JP_VERSION} navigation base is not published; set ACTUCORE_NAVIGATION_BASE_IMAGE to its exact @sha256 digest" >&2
+        exit 2
     fi
+    if [[ ! "${ACTUCORE_NAVIGATION_BASE_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+        echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE override must use an exact @sha256 digest" >&2
+        exit 2
+    fi
+    BUILD_ARGS+=("ACTUCORE_NAVIGATION_BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}")
 fi
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${TAG}"

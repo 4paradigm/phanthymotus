@@ -212,6 +212,7 @@ class RosBridge:
         self._latest_image: _ImageSample | None = None
         self._latest_pose: _PoseSample | None = None
         self._closed = False
+        self._rejection_counts: dict[str, int] = {}
         self._String = String
         self._decode_camera_rgb_frame = decode_camera_rgb_frame
         self._status_state = ""
@@ -285,8 +286,9 @@ class RosBridge:
         try:
             metadata, jpeg = self._decode_camera_rgb_frame(bytes(message.data))
         except (AttributeError, TypeError, ValueError) as exc:
-            log.warning("[vln] ignored invalid camera RGB frame frame: %s", exc)
+            self._warn_rejected("camera RGB frame", exc)
             return
+        self._mark_valid("camera RGB frame")
         received_at = time.time()
         received_monotonic = time.monotonic()
         sample = _ImageSample(
@@ -308,31 +310,45 @@ class RosBridge:
         try:
             pose = pose_from_odometry(message, self.odometry_topic, received_at)
         except ValueError as exc:
-            log.warning("[vln] ignored invalid FAST-LIVO2 odometry: %s", exc)
+            self._warn_rejected("FAST-LIVO2 odometry", exc)
             return
         if self.required_frame_id and pose.frame_id != self.required_frame_id:
-            log.warning(
-                "[vln] ignored odometry in frame %r; expected %r",
-                pose.frame_id,
-                self.required_frame_id,
+            self._warn_rejected(
+                "FAST-LIVO2 odometry",
+                f"frame {pose.frame_id!r}; expected {self.required_frame_id!r}",
             )
             return
         if (
             self.required_child_frame_id
             and pose.child_frame_id != self.required_child_frame_id
         ):
-            log.warning(
-                "[vln] ignored odometry child frame %r; expected %r",
-                pose.child_frame_id,
-                self.required_child_frame_id,
+            self._warn_rejected(
+                "FAST-LIVO2 odometry",
+                "child frame "
+                f"{pose.child_frame_id!r}; expected {self.required_child_frame_id!r}",
             )
             return
+        self._mark_valid("FAST-LIVO2 odometry")
         sample = _PoseSample(pose=pose, received_monotonic=time.monotonic())
         with self._condition:
             if self._closed:
                 return
             self._latest_pose = sample
             self._condition.notify_all()
+
+    def _warn_rejected(self, stream: str, detail) -> None:
+        with self._condition:
+            count = self._rejection_counts.get(stream, 0) + 1
+            self._rejection_counts[stream] = count
+        if count == 1 or count % 100 == 0:
+            bounded = str(detail).replace("\r", "\\r").replace("\n", "\\n")[:200]
+            log.warning("[vln] rejected %s count=%d: %s", stream, count, bounded)
+
+    def _mark_valid(self, stream: str) -> None:
+        with self._condition:
+            rejected = self._rejection_counts.pop(stream, 0)
+        if rejected:
+            log.info("[vln] %s recovered after %d rejected samples", stream, rejected)
 
     def _on_status(self, message) -> None:
         try:

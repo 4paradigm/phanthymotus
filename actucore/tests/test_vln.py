@@ -806,6 +806,7 @@ class PureHelperTests(unittest.TestCase):
         bridge._status_stale_after_sec = 3.5
         bridge._status_restart_gap_sec = 5.0
         bridge._bridge_instance_id = "test-bridge"
+        bridge._rejection_counts = {}
         bridge._latest_image = _ImageSample(
             data=b"jpeg",
             image_format="jpeg",
@@ -849,6 +850,18 @@ class PureHelperTests(unittest.TestCase):
 
         self.assertEqual(bridge._latest_image.data, b"jpeg-frame")
         self.assertEqual(bridge._latest_image.source_timestamp, 12.5)
+
+    def test_rejected_sensor_logs_are_sampled_and_recovery_is_reported(self):
+        bridge = self._bare_ros_bridge()
+        with mock.patch("plugins.navigation.semantic.ros.log") as logger:
+            for _ in range(101):
+                bridge._warn_rejected("camera RGB frame", "bad\nframe")
+            self.assertEqual(logger.warning.call_count, 2)
+            self.assertNotIn("\n", logger.warning.call_args.args[-1])
+
+            bridge._mark_valid("camera RGB frame")
+            logger.info.assert_called_once()
+            self.assertEqual(bridge._rejection_counts, {})
 
     def test_vlm_json_parser_handles_markdown_and_rejects_non_json(self):
         self.assertEqual(_parse_json("```json\n{\"ok\": true}\n```"), {"ok": True})

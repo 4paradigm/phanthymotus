@@ -11,8 +11,8 @@
 ## 运行边界
 
 ```text
-Driver lidar + imu ────────┐
-camera RGB + depth frame ──┴─> ControlledSemanticSpatial card (ActuCore container)
+Driver lidar + imu ──────────> ControlledSemanticSpatial card (ActuCore container)
+optional RGB + depth frame ──┴─> semantic navigation / data collection
                             ├─ FAST-LIVO2 mapping/localization child process
                             ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
@@ -45,8 +45,9 @@ camera RGB + depth frame ──┴─> ControlledSemanticSpatial card (ActuCore 
 | --- | --- | --- |
 | `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `imu` | `/ubuntu/navigation/imu` | 是 |
-| `rgb` | `/ubuntu/camera/rgb_frame` | 是；语义导航与数采共用 Driver `PSE1` 中的 JPEG、源时间戳、标定和外参 |
+| `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航，`collection_enabled=true` 时必需 |
 | `depth_frame` | `/ubuntu/camera/depth_frame` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE1` 封装中的深度尺度、标定与源时间戳 |
+| `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由 Agent Core `x-topic-actions` 转换为 `navigate_to_pose` |
 
 ## 公共输出
 
@@ -66,10 +67,11 @@ frame、QoS、freshness、数采和速度约束见内部实现说明：
 - [planning/README.md](planning/README.md)
 - [semantic/README.md](semantic/README.md)
 
-Canvas 的静态卡片规格无法随 `collection_enabled` 动态改变端口外观，所以
-`depth_frame` 仍显示为可选端口；统一卡片在启动时执行条件校验。启用
-数采却缺少该输入，会返回明确的 `invalid_canvas_wiring`，而不是启动一份
-不完整的数据集。
+RGB 和 depth 均为可选端口：只连 LiDAR + IMU 即可启动建图、定位与
+Nav2 规划控制；连接 RGB 后才启动语义导航。Canvas 的静态卡片规格无法随
+`collection_enabled` 动态改变端口外观，因此统一卡片在启动时执行条件
+校验：启用数采时 RGB 和 depth 都必须连接，否则返回明确的
+`invalid_canvas_wiring`，而不是启动一份不完整的数据集。
 
 完整的静态插件配置样例见 [config.example.json](config.example.json)；其中
 `semantic.vlm.api_key` 必须通过部署配置或环境注入真实值，不能提交凭据。
@@ -228,8 +230,11 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 
 这是仓库默认的 ActuCore 构建入口，只有 Jetson 一个变体，无需 Navigation
 专用 wrapper。FAST-LIVO2/Nav2 不在日常 PR 镜像中重编，避免 ARM64 QEMU 构建
-超过 review 时限。基础镜像 digest 已锁定在 `Dockerfile.jetson`；临时覆盖时可
-显式设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，且必须使用精确 `@sha256` 引用。
+超过 review 时限。默认构建入口会按 JetPack 选择基础镜像：JP 5.11
+使用已发布的 digest-pinned navigation base；JP 6.1 在对应基础镜像
+发布前直接拒绝构建，需维护者显式设置与 JP 6.1 匹配的
+`ACTUCORE_NAVIGATION_BASE_IMAGE`。所有覆盖都必须使用精确 `@sha256`
+引用，不会默认回退到其他 JetPack 的基础镜像。
 只有锁定源码、补丁或系统依赖变化时，维护者才执行：
 
 ```bash

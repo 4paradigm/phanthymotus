@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 CORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CORE_ROOT / "src"))
+sys.path.insert(1, str(CORE_ROOT.parent / "actucore"))
 
 config = types.ModuleType("config")
 config.main = {}
@@ -165,6 +166,26 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routes[0].topic, "/ubuntu/navigation/goal_pose")
         self.assertEqual(routes[0].action, "navigate_to_pose")
         self.assertEqual(routes[0].required_fields, ("x", "y", "yaw"))
+
+    def test_unified_navigation_contract_builds_goal_route(self) -> None:
+        from plugins.navigation.contract import navigation_tool_definition
+
+        tool = navigation_tool_definition("ubuntu")
+        mcp_client.registry["perception"] = {"tool_definitions": [tool]}
+        goal_index = next(
+            index
+            for index, item in enumerate(tool["topic_in"])
+            if item["port"] == "goal_pose"
+        )
+        layout = _layout()
+        layout["cards"][1]["toolName"] = tool["name"]
+        layout["connections"][0]["toPortIdx"] = str(goal_index)
+
+        routes = topic_actions.build_routes(layout)
+
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0].action, "navigate_to_pose")
+        self.assertEqual(routes[0].schema, "phanthy.navigation.goal.v1")
 
     async def test_valid_goal_dispatches_once_and_stop_unsubscribes(self) -> None:
         callbacks = {}

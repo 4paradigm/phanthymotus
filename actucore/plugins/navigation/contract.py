@@ -147,7 +147,9 @@ def navigation_tool_definition(namespace: str) -> dict:
         status_topic=f"/{namespace.strip('/')}/navigation/fast_livo2/status",
     )
     external_inputs = [deepcopy(item) for item in mapping["topic_in"]]
-    external_inputs.append(deepcopy(semantic["topic_in"][0]))
+    rgb_input = deepcopy(semantic["topic_in"][0])
+    rgb_input["required"] = False
+    external_inputs.append(rgb_input)
     external_inputs.extend(
         [
             {
@@ -167,6 +169,11 @@ def navigation_tool_definition(namespace: str) -> dict:
                 ),
             },
         ]
+    )
+    external_inputs.append(
+        deepcopy(
+            next(item for item in planning["topic_in"] if item["port"] == "goal_pose")
+        )
     )
     component_outputs = {
         str(item.get("port", "")): item
@@ -189,6 +196,7 @@ def navigation_tool_definition(namespace: str) -> dict:
             "processes inside the ActuCore container; only bounded velocity "
             "proposals leave the card."
         ),
+        "x-topic-actions": deepcopy(planning["x-topic-actions"]),
         "topic_in": external_inputs,
         "topic_out": outputs,
         "inputSchema": {
