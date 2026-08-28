@@ -1,7 +1,7 @@
 # ── Jetson ActuCore runtime ─────────────────────────────────────────
 # Expensive locked third-party navigation dependencies live in the digest-pinned
 # navigation base. This image only rebuilds repository-owned ROS packages and app code.
-ARG ACTUCORE_NAVIGATION_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:c39a4a2644dad0421679f10360e1aaff61bfd2e980730b0dba27853a86270fd8
+ARG ACTUCORE_NAVIGATION_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:ce5c52b9fe7451a8c202632267b270460f20483fe94f35e9a130e580aaecddc9
 FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE}
 ARG ACTUCORE_NAVIGATION_BASE_IMAGE
 
