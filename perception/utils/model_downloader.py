@@ -594,8 +594,8 @@ OCR_MODEL_BUNDLES = {
 }
 
 
-# ── Obstacle distance (ZipDepth + YOLO26n TensorRT INT8 engines) ─────────
-OBSTACLE_MODEL_REVISION = "b8ba6d69a819b5ed6f0c1c5723b37c8775fa737b"
+# ── Obstacle distance (ZipDepth + YOLO26n TensorRT engines) ─────────────
+OBSTACLE_MODEL_REVISION = "8c50e1f5faf6b588b90e0bab4b6a696b5ef207ac"
 OBSTACLE_MODEL_BASE = os.environ.get(
     "OBSTACLE_MODEL_BASE_URL",
     "https://www.modelscope.cn/models/Flame4pd/"
@@ -623,8 +623,8 @@ OBSTACLE_MODEL_BUNDLES = {
         "base_url": f"{OBSTACLE_MODEL_BASE}/jp511",
         "files": {
             "zipdepth-base-npu-512x384-int8.engine": {
-                "size": 7936960,
-                "sha256": "61d9b81c81bcd26660d3647bfb86fd133f865ad5b73b4177efcad2884f7a2d1c",
+                "size": 14259938,
+                "sha256": "2b3f81cf5162136e25b0d26e2a8bb453d13158d2884c2eacbf17e0105682f684",
             },
             "yolo26n-depth-int8.engine": {
                 "size": 6746230,
