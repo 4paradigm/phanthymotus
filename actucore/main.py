@@ -98,20 +98,25 @@ class ActuCoreBundle:
         #            self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
         #            log.info("XPlugin loaded")
         #
-        # 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步，参照
-        # perception/main.py 里 vop 的写法：namespace 为空时用
-        # re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname()) 兜底。
+        # 需要 ROS 命名空间的卡片必须在自己的注册块里校验运行时支持范围。
         #
         # 卡片契约（PREFIX 不能含下划线、action.enum 必须含 "info" 等）见 README.md。
         # ──────────────────────────────────────────────────────────────────
 
-        if plugins_cfg.get("navigation", {}).get("enabled", False):
-            import re, socket
-            namespace = plugins_cfg["navigation"].get("namespace", "").strip()
-            if not namespace:
-                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+        navigation_cfg = plugins_cfg.get("navigation", {})
+        if not isinstance(navigation_cfg, dict):
+            raise ValueError("plugins.navigation must be an object")
+        if navigation_cfg.get("enabled", False):
+            namespace = navigation_cfg.get("namespace", "ubuntu")
+            if not isinstance(namespace, str):
+                raise ValueError("plugins.navigation.namespace must be a string")
+            namespace = namespace.strip().strip("/")
+            if namespace != "ubuntu":
+                raise ValueError(
+                    "built-in navigation runtime currently requires namespace=ubuntu"
+                )
             from plugins.navigation import NavigationPlugin
-            plugin = NavigationPlugin(plugins_cfg["navigation"], namespace, executor)
+            plugin = NavigationPlugin(navigation_cfg, namespace, executor)
             self._plugins.append(plugin)
             log.info(
                 "NavigationPlugin loaded (single-container runtime, namespace=%s)",

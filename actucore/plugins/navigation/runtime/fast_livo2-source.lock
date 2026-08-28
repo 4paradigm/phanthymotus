@@ -2,7 +2,6 @@
 #
 # Every checkout below is an immutable full Git SHA; the G1 patches are
 # additionally verified by sha256 before they are applied.
-GIT_MIRROR_PREFIX=https://ghfast.top/
 FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git
 FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
 FAST_LIVO2_RUNTIME_PATCH_SHA256=534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b

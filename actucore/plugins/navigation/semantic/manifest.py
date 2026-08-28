@@ -40,9 +40,9 @@ _MANIFEST = {
                 "description": "Natural-language description of the destination",
             },
         },
-        # Phanthy Agent Core builds the action-specific required list from this
-        # top-level list. x-action-params removes query from capture's schema.
-        "required": ["action", "query"],
+        # Only fields shared by every action belong here. x-action-params makes
+        # query mandatory for navigate without leaking it into zero-arg capture.
+        "required": ["action"],
         "x-action-params": {
             "capture": {
                 "params": [],

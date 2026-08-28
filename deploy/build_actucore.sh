@@ -71,6 +71,7 @@ if ${BUILD_BASE}; then
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
     NAV_RUNTIME_DIR="${REPO_ROOT}/actucore/plugins/navigation/runtime"
+    GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"
     source "${NAV_RUNTIME_DIR}/fast_livo2-source.lock"
     source "${NAV_RUNTIME_DIR}/nav2-source.lock"
     case "${JP_VERSION}" in

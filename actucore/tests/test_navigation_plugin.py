@@ -302,6 +302,9 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn('plugins_cfg.get("fast_livo2"', main)
         self.assertNotIn('plugins_cfg.get("nav2"', main)
         self.assertNotIn('plugins_cfg.get("vln"', main)
+        self.assertIn("plugins.navigation.namespace must be a string", main)
+        self.assertIn("requires namespace=ubuntu", main)
+        self.assertNotIn("socket.gethostname()", main)
 
     def test_navigation_runtime_uses_default_fastdds_transport(self):
         manifests = (
@@ -372,6 +375,16 @@ class NavigationContractTest(unittest.TestCase):
         build_script = (
             ACTUCORE_ROOT.parent / "deploy" / "build_actucore.sh"
         ).read_text(encoding="utf-8")
+        source_locks = [
+            (
+                ACTUCORE_ROOT
+                / "plugins"
+                / "navigation"
+                / "runtime"
+                / name
+            ).read_text(encoding="utf-8")
+            for name in ("fast_livo2-source.lock", "nav2-source.lock")
+        ]
 
         self.assertRegex(
             base_dockerfile,
@@ -380,6 +393,16 @@ class NavigationContractTest(unittest.TestCase):
             r"jetson-base:jp511-torch@sha256:[0-9a-f]{64}",
         )
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
+        self.assertIn("ARG GIT_MIRROR_PREFIX=", base_dockerfile)
+        self.assertNotIn(
+            "ARG GIT_MIRROR_PREFIX=https://ghfast.top/", base_dockerfile
+        )
+        self.assertIn(
+            'GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"', build_script
+        )
+        for source_lock in source_locks:
+            self.assertNotIn("GIT_MIRROR_PREFIX=", source_lock)
+            self.assertNotIn("APT_UBUNTU_MIRROR=", source_lock)
         self.assertIn("jetson-base:jp61-torch@sha256:", build_script)
         self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)

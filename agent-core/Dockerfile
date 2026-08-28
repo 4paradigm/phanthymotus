@@ -1,8 +1,7 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
-ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
-ARG PYPI_MIRROR APT_MIRROR
+ARG PYPI_MIRROR
 
 # Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault).
 # --retry survives the transient TLS drops this network path has hit more than
@@ -13,12 +12,7 @@ ARG PYPI_MIRROR APT_MIRROR
 # offender. The compose plugin is proxied through ghfast.top (same GitHub
 # mirror already used in perception/Dockerfile.jetson).
 ARG DOCKER_CLI_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/docker-27.5.1-aarch64.tgz
-RUN if [ -n "${APT_MIRROR}" ]; then \
-        find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
-            -exec sed -E -i \
-            "s#https?://(mirrors\.tencentyun\.com|ports\.ubuntu\.com)/ubuntu-ports/?#https://${APT_MIRROR}/ubuntu-ports/#g" {} +; \
-    fi && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip python3-dbus ffmpeg curl && \
     curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --retry-max-time 60 \

@@ -5,6 +5,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
@@ -148,6 +150,20 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(
             proposal_schema["properties"]["velocity"]["properties"]["y"],
             {"type": "number", "minimum": -1.0, "maximum": 1.0},
+        )
+
+        params = yaml.safe_load(
+            (companion_root / "config" / "nav2_params.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(
+            params["global_costmap"]["global_costmap"]["ros__parameters"]
+            ["track_unknown_space"]
+        )
+        self.assertFalse(
+            params["planner_server"]["ros__parameters"]["GridBased"]
+            ["allow_unknown"]
         )
 
     def test_config_and_speed_bounds_are_fail_closed(self) -> None:

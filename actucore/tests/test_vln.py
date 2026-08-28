@@ -181,7 +181,7 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("info", schema["properties"]["action"]["enum"])
         self.assertEqual(schema["x-action-params"]["capture"]["params"], [])
         self.assertEqual(schema["x-action-params"]["navigate"]["params"], ["query"])
-        self.assertIn("query", schema["required"])
+        self.assertEqual(schema["required"], ["action"])
 
     def test_vlm_gear_config_schema_uses_a_password_field(self):
         schema = MANIFEST["inputSchema"]

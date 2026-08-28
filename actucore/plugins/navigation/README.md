@@ -4,6 +4,10 @@
 **ActuCore（执行模型层）**：把意图/目标变成运动指令。Canvas 只看到这一张
 `processor` 卡片，正式部署只运行一个 ActuCore 容器。
 
+卡片的公开 action/topic 契约和单容器架构不绑定具体机器人；本版本随镜像提供的
+传感器与运动适配器目前只验证并限制为 G1 的 `ubuntu` namespace。适配其他机器人
+需要替换 topic/frame/执行器绑定，而不是只改 namespace 字符串。
+
 ## 运行边界
 
 ```text
@@ -208,9 +212,15 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 链路取代，或会把 ompl、ceres、xtensor、Qt5 等无用依赖拖进镜像。
 
 镜像里**没有** torch / CLIP / YOLO / ASR 依赖 —— 卡片自身只用标准库 + ROS
-消息包，语义航点是 HTTP 调远端 VLM。那些模型依赖属于 perception。
-APT、PyPI、Git 源码下载均走国内可达入口（`GIT_MIRROR_PREFIX`，mcap_vendor 的
-FetchContent 也经同一镜像重写）。
+消息包，语义航点是 HTTP 调远端 VLM。那些模型依赖属于 perception。G1 实测的
+上游 ActuCore 镜像为 `13,786,589,503` bytes，加入导航栈后的镜像为
+`14,674,555,445` bytes，增加 `887,965,942` bytes（约 `6.4%`）。稳定且昂贵的
+第三方依赖因此预编译进可复用、digest-pinned 的 navigation base，日常 PR 构建
+不再重复编译它们。
+
+`--mirror tuna` 只选择国内 APT/PyPI 源；Git 默认直连官方仓库，避免把公共代理
+隐式固化进可复现构建。网络环境需要代理时由维护者显式传入
+`GIT_MIRROR_PREFIX`，mcap_vendor 的 FetchContent 也沿用该值。
 
 ```bash
 ./deploy/build_actucore.sh --mirror tuna
@@ -223,7 +233,8 @@ FetchContent 也经同一镜像重写）。
 只有锁定源码、补丁或系统依赖变化时，维护者才执行：
 
 ```bash
-./deploy/build_actucore.sh --base --mirror tuna
+GIT_MIRROR_PREFIX=https://ghfast.top/ \
+  ./deploy/build_actucore.sh --base --mirror tuna
 ```
 
 基础镜像必须在原生 ARM64 构建；成功并推送后会输出可写回构建配置的精确

@@ -183,10 +183,11 @@ def navigation_tool_definition(namespace: str) -> dict:
         "type": "processor",
         "multiInstance": False,
         "description": (
-            "Unified G1 mapping, localization, semantic waypoint and Nav2 "
-            "planner/controller card. FAST-LIVO2 and Nav2 run as child processes "
-            "inside the ActuCore container; only bounded velocity proposals "
-            "leave the card."
+            "Unified mapping, localization, semantic waypoint and Nav2 "
+            "planner/controller card. The bundled runtime adapter currently "
+            "targets the G1 ubuntu namespace. FAST-LIVO2 and Nav2 run as child "
+            "processes inside the ActuCore container; only bounded velocity "
+            "proposals leave the card."
         ),
         "topic_in": external_inputs,
         "topic_out": outputs,

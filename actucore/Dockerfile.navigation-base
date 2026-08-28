@@ -15,8 +15,8 @@
 #
 # Build context: repo root (phanthymotus/).
 #
-# Usage:
-#   ./deploy/build_actucore.sh --base --mirror tuna
+# Usage (direct GitHub by default; opt in to a Git proxy when needed):
+#   GIT_MIRROR_PREFIX=https://ghfast.top/ ./deploy/build_actucore.sh --base --mirror tuna
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
@@ -32,7 +32,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG BUILD_JOBS=4
 
 # ── 源码锁（由 deploy/build_actucore.sh 从 *-source.lock 传入）───────
-ARG GIT_MIRROR_PREFIX=https://ghfast.top/
+ARG GIT_MIRROR_PREFIX=
 ARG FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git
 ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
 ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b

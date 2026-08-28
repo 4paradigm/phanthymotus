@@ -11,6 +11,10 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 **当前卡片：`navigation`**，公开工具名 `ControlledSemanticSpatial` —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket），对外只发布 bounded `velocity_proposal`，物理执行仍归 Driver。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/navigation/README.md](plugins/navigation/README.md)。
 
+该卡片的公开契约可复用于其他机器人；当前镜像内置的 runtime adapter 只验证并
+限制为 G1 的 `ubuntu` namespace，其他机器人需要提供自己的 topic/frame/执行器
+适配。
+
 | | |
 |---|---|
 | MCP HTTP | `http://<host>:15730/mcp` |
@@ -40,7 +44,8 @@ ActuCore 构建只编译仓库自有 ROS 包和复制应用代码。临时验证
 重新构建并推送基础镜像：
 
 ```bash
-./deploy/build_actucore.sh --base --mirror tuna
+GIT_MIRROR_PREFIX=https://ghfast.top/ \
+  ./deploy/build_actucore.sh --base --mirror tuna
 ```
 
 基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时仍把普通依赖
@@ -127,6 +132,7 @@ TOOLS = [
 4. 该卡片需要的依赖加到 `Dockerfile.jetson` 自己的 `RUN` 层
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
-需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `main.py` 里 `navigation` 的注册块。
+需要 ROS 命名空间的卡片（topic 里要带机器人名）必须在注册块中校验类型和该
+runtime adapter 的支持范围；不要用 hostname 猜测机器人 namespace。
 
 本层最完整的范例是 `plugins/navigation/`：一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/vop.py`。

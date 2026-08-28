@@ -4,9 +4,6 @@
 # install-space under /opt/ros/humble/install. The ros-humble-* Debian archive
 # only exists for Jammy, so Nav2 and its missing dependencies are built from
 # immutable source revisions.
-APT_UBUNTU_MIRROR=mirrors.tuna.tsinghua.edu.cn
-GIT_MIRROR_PREFIX=https://ghfast.top/
-
 # navigation2 tag 1.1.20 — matches the retired ros-humble-navigation2 package
 NAVIGATION2_REPO=https://github.com/ros-navigation/navigation2.git
 NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db
