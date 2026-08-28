@@ -266,6 +266,11 @@ function setupGlobalCtrl() {
 
 function _wsUrlFor(path) {
   if (!path) return null;
+  // A bus path with no topic after it (an unresolved card) matches no route —
+  // the endpoint is `/ws/bus/{topic:path}` — so the handshake fails and uvicorn
+  // logs `ASGI callable returned without completing handshake` + a 500. Treat
+  // it as "no stream yet" rather than opening a doomed connection.
+  if (path === '/ws/bus' || path === '/ws/bus/') return null;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   return `${proto}://${location.host}${path}`;
 }

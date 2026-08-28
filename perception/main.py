@@ -132,6 +132,16 @@ class PerceptionBundle:
                 return p.dispatch(name, args)
         return None
 
+    def owns(self, full_name: str) -> bool:
+        """True when some loaded plugin claims this tool name.
+
+        Lets the caller tell a genuinely unknown tool apart from a loaded
+        plugin returning None for an action it does not handle. Mirrors
+        `dispatch`'s prefix split so the two can never disagree.
+        """
+        prefix, _, _ = full_name.partition("_")
+        return any(p.PREFIX == prefix for p in self._plugins)
+
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:
             if getattr(p, 'PREFIX', None) == 'tts':
@@ -310,7 +320,20 @@ def make_handler():
                         log.info(f"[mcp] tools/call: {name}({args})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
-                        err(-32601, f"Unknown tool: {name}")
+                        # `dispatch` returns None for two very different things:
+                        # no plugin owns the name, or a plugin owns it and
+                        # declined the action. Reporting both as "Unknown tool"
+                        # is actively misleading — it sent a debugging session
+                        # hunting a tool-registration race that did not exist,
+                        # when the tool was registered the whole time.
+                        if _bundle.owns(name):
+                            log.warning(
+                                "[mcp] %s declined action %r", name, args.get("action")
+                            )
+                            err(-32603, f"Tool {name} does not handle action "
+                                        f"{args.get('action')!r}")
+                        else:
+                            err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
                             log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")

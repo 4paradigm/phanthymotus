@@ -57,17 +57,45 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return value
 
 
-FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", 70, 0, 1000)
+# Pace at exactly the audio duration each frame carries. It used to be 70ms for
+# a 100ms frame, which over-delivers by 1.43x *forever*: that was this engine's
+# way of slowly accruing a downstream cushion at 30ms/frame back when it had no
+# prebuffer, and it cost an unbounded lead. PREBUFFER_FRAMES now hands the
+# consumer its whole cushion up front, so the accrual is pure surplus — and
+# surplus with no end has no safe landing. A consumer can only absorb it by
+# buffering without bound or by discarding audio; the browser player tried to
+# cap its lead instead and rewound its own schedule into audio it had already
+# queued, which played back overlapped and 1.43x too fast.
+FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", int(PCM_FRAME_MS), 0, 1000)
 FIRST_FRAME_DELAY_MS = _env_int("MIX_VITS_FIRST_FRAME_DELAY_MS", 0, 0, 1000)
+# Frames held back before pacing starts, then published in one burst so every
+# consumer begins with a real cushion instead of zero. This — not the pacing
+# interval — is where the downstream margin comes from. The sherpa engine has
+# always done this (plugins/tts.py PREBUF_FRAMES); same idea on this engine.
+PREBUFFER_FRAMES = _env_int("MIX_VITS_PREBUFFER_FRAMES", 5, 0, 100)
+# Depth of the synthesis→publish handoff queue, in frames. Bounds memory while
+# still letting TensorRT run a whole text chunk ahead of the paced publisher.
+SYNTH_QUEUE_FRAMES = _env_int("MIX_VITS_SYNTH_QUEUE_FRAMES", 200, 1, 4000)
+# How many frames may be published back-to-back while catching up after a
+# stall. agent-core subscribes BEST_EFFORT with depth=20 (agent-core/src/
+# ros2_bridge.py), so an unbounded catch-up burst is dropped frames, not
+# recovered audio.
+MAX_BURST_FRAMES = _env_int("MIX_VITS_MAX_BURST_FRAMES", 20, 1, 200)
 SUBSCRIBER_WAIT_MS = _env_int("MIX_VITS_SUBSCRIBER_WAIT_MS", 5000, 0, 60000)
 SUBSCRIBER_POLL_MS = _env_int("MIX_VITS_SUBSCRIBER_POLL_MS", 10, 1, 1000)
 SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 500, 0, 5000)
-ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "1") == "1"
+# Off by default: sending faster than realtime has no safe landing on a live
+# consumer. It either buffers without bound or has to discard audio, and the
+# browser player's attempt to bound its lead instead produced overlapped,
+# 1.43x-fast playback. Only useful for an offline benchmark that drains as fast
+# as it can, so it must be asked for explicitly.
+ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "0") == "1"
 if FRAME_INTERVAL_MS < PCM_FRAME_MS and not ALLOW_FAST_DELIVERY:
     log.warning(
         "[vits2_tts_trt] MIX_VITS_FRAME_INTERVAL_MS=%d sends %.0fms PCM frames "
-        "faster than realtime; pacing at %.0fms instead (set "
-        "MIX_VITS_ALLOW_FAST_DELIVERY=1 for an offline benchmark)",
+        "faster than realtime, which a live consumer cannot absorb; pacing at "
+        "%.0fms instead (set MIX_VITS_ALLOW_FAST_DELIVERY=1 for an offline "
+        "benchmark)",
         FRAME_INTERVAL_MS, PCM_FRAME_MS, PCM_FRAME_MS,
     )
     FRAME_INTERVAL_MS = int(PCM_FRAME_MS)
@@ -78,6 +106,10 @@ _LOW_LAT_QOS = QoSProfile(
     depth=200,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+# Sentinel closing the synthesis→publish queue. A dedicated object rather than
+# None so a genuinely empty frame could never be mistaken for end-of-stream.
+_SYNTH_DONE = object()
 
 # The tool contract (actions, x-completion, x-hooks, configSchema) is owned by
 # plugins/tts.py — this package is one implementation behind it. Importing it
@@ -336,19 +368,36 @@ class _Vits2TTSNode(Node):
             # become pure TTFT overhead.
             subscriber_gate_thread.start()
             eof_published = False
+            synth_thread = None
+            # Set on every exit path. `_utterance_cancelled()` alone is not
+            # enough to release the synth thread: if the consumer dies on an
+            # exception (a subscriber-gate failure, say) nothing is cancelled
+            # and nothing is draining, so a blocking put would wedge that
+            # thread forever — holding the adapter lock, which would then
+            # deadlock every later utterance. Bound before the try so the
+            # finally can always reach it.
+            utterance_abort = threading.Event()
             try:
                 task_started = time.monotonic()
                 first_published_at = None
+                last_published_at = None
+                max_frame_gap = 0.0
                 total_bytes = 0
                 started = None
                 frames_sent = 0
-                buffer = bytearray()
+                burst_frames = 0
+                burst_limit = max(MAX_BURST_FRAMES, PREBUFFER_FRAMES)
+                prebuffer: list[bytes] = []
+                prebuffering = PREBUFFER_FRAMES > 0
                 subscriber_wait_seconds = None
                 subscriber_settle_seconds = None
                 subscriber_count = 0
+                frame_queue: queue.Queue = queue.Queue(maxsize=SYNTH_QUEUE_FRAMES)
+                synth_result: dict = {}
 
-                def publish_frame(frame: bytes) -> bool:
+                def emit(frame: bytes) -> bool:
                     nonlocal started, frames_sent, first_published_at, total_bytes
+                    nonlocal last_published_at, max_frame_gap, burst_frames
                     nonlocal subscriber_wait_seconds, subscriber_settle_seconds
                     nonlocal subscriber_count
                     if self._utterance_cancelled():
@@ -369,43 +418,141 @@ class _Vits2TTSNode(Node):
                         ) = subscriber_gate_result["value"]
                         if FIRST_FRAME_DELAY_MS:
                             time.sleep(FIRST_FRAME_DELAY_MS / 1000.0)
-                        started = time.monotonic()
-                        now = started
+                        now = time.monotonic()
+                        # Backdate the schedule origin by the frames already
+                        # waiting in the prebuffer so every one of them is due
+                        # in the past and they go out in a single burst. The
+                        # consumer therefore starts holding PREBUFFER_FRAMES
+                        # worth of audio, and the frame after them is due one
+                        # interval from now — pacing continues untouched.
+                        started = now - max(0, len(prebuffer) - 1) * frame_interval
                     if frame_interval:
                         target = started + frames_sent * frame_interval
-                        if target < now - frame_interval:
-                            started = now - frames_sent * frame_interval
-                            target = now
                         delay = target - now
                         if delay > 0:
                             time.sleep(delay)
+                            burst_frames = 0
+                        else:
+                            # Behind schedule (a synthesis stall, a slow
+                            # publish). Publishing immediately *is* the
+                            # catch-up: the schedule emits 100ms frames every
+                            # 70ms, so racing back onto it is what refills the
+                            # consumer's buffer. Rebasing `started` to `now`
+                            # here — what this used to do unconditionally —
+                            # threw the whole accumulated cushion away instead,
+                            # so the next hiccup had nothing to absorb it and
+                            # one stall reliably became a run of them.
+                            burst_frames += 1
+                            if burst_frames > burst_limit:
+                                # Too far behind to recover on this schedule.
+                                # Give up the cushion rather than dump an
+                                # unbounded burst into a BEST_EFFORT reader.
+                                started = now - frames_sent * frame_interval
+                                burst_frames = 0
                     if self._utterance_cancelled():
                         return False
                     self._publish(frame)
+                    published_at = time.monotonic()
                     if first_published_at is None:
-                        first_published_at = time.monotonic()
+                        first_published_at = published_at
+                    else:
+                        max_frame_gap = max(
+                            max_frame_gap, published_at - last_published_at
+                        )
+                    last_published_at = published_at
                     total_bytes += len(frame)
                     frames_sent += 1
                     return True
 
+                def flush_prebuffer() -> bool:
+                    nonlocal prebuffering
+                    prebuffering = False
+                    while prebuffer:
+                        if not emit(prebuffer[0]):
+                            return False
+                        prebuffer.pop(0)
+                    return True
+
+                def publish_frame(frame: bytes) -> bool:
+                    if prebuffering:
+                        prebuffer.append(frame)
+                        if len(prebuffer) < PREBUFFER_FRAMES:
+                            return True
+                        return flush_prebuffer()
+                    return emit(frame)
+
+                def enqueue_frame(item) -> bool:
+                    """Blocking put that still honours interrupt/stop/abort."""
+                    while True:
+                        if self._utterance_cancelled() or utterance_abort.is_set():
+                            return False
+                        try:
+                            frame_queue.put(item, timeout=0.1)
+                            return True
+                        except queue.Full:
+                            continue
+
+                def synthesize_into_queue() -> None:
+                    """Run TensorRT ahead of the paced publisher.
+
+                    `synthesize_stream` blocks for a whole text chunk at a time
+                    (the adapter calls the engine once per chunk and only then
+                    slices the result into frames), so running it on the
+                    publishing thread meant not one frame went out for the
+                    duration of every chunk after the first. That stall was the
+                    root cause of the audible gaps in both the browser player
+                    and the robot speakers: the only margin the consumer had
+                    was the 30ms/frame the 70ms-for-100ms schedule accrues, and
+                    a 256-token chunk takes far longer than that to synthesize.
+                    """
+                    buffer = bytearray()
+                    try:
+                        for pcm in self._adapter.synthesize_stream(text):
+                            buffer.extend(pcm)
+                            while len(buffer) >= CHUNK_BYTES:
+                                frame = bytes(buffer[:CHUNK_BYTES])
+                                del buffer[:CHUNK_BYTES]
+                                if not enqueue_frame(frame):
+                                    return
+                        if buffer:
+                            enqueue_frame(bytes(buffer))
+                    except BaseException as exc:  # surfaced on the worker thread
+                        synth_result["error"] = exc
+                    finally:
+                        # Unblock the consumer on every exit path. If it has
+                        # already given up, enqueue_frame sees the cancellation
+                        # and returns rather than blocking on a full queue.
+                        enqueue_frame(_SYNTH_DONE)
+
+                synth_thread = threading.Thread(
+                    target=synthesize_into_queue,
+                    name="vits2-trt-synth",
+                    daemon=True,
+                )
+                synth_thread.start()
+
                 interrupted = False
-                for pcm in self._adapter.synthesize_stream(text):
+                while True:
                     if self._utterance_cancelled():
                         interrupted = True
                         break
-                    buffer.extend(pcm)
-                    while len(buffer) >= CHUNK_BYTES:
-                        frame = bytes(buffer[:CHUNK_BYTES])
-                        del buffer[:CHUNK_BYTES]
-                        if not publish_frame(frame):
-                            interrupted = True
-                            break
-                    if interrupted:
+                    try:
+                        item = frame_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if item is _SYNTH_DONE:
+                        break
+                    if not publish_frame(item):
+                        interrupted = True
                         break
 
-                if buffer and not self._utterance_cancelled():
-                    if not publish_frame(bytes(buffer)):
+                if not interrupted and prebuffer:
+                    # Utterance shorter than the prebuffer — nothing emitted yet.
+                    if not flush_prebuffer():
                         interrupted = True
+                synth_thread.join(timeout=5)
+                if "error" in synth_result and not interrupted:
+                    raise synth_result["error"]
                 interrupted = interrupted or self._interrupt_event.is_set()
                 if total_bytes:
                     finished_at = time.monotonic()
@@ -415,6 +562,7 @@ class _Vits2TTSNode(Node):
                         "[vits2_tts_trt] server delivery: bytes=%d frames=%d "
                         "ttft=%.3fs elapsed=%.3fs audio=%.3fs rtf=%.4f "
                         "chunk_bytes=%d frame_interval_ms=%d "
+                        "max_frame_gap_ms=%.1f prebuffer_frames=%d "
                         "first_frame_delay_ms=%d subscriber_wait_ms=%.1f "
                         "subscriber_settle_ms=%.1f subscriber_count=%d",
                         total_bytes,
@@ -425,6 +573,8 @@ class _Vits2TTSNode(Node):
                         elapsed / audio_seconds,
                         CHUNK_BYTES,
                         FRAME_INTERVAL_MS,
+                        max_frame_gap * 1000.0,
+                        PREBUFFER_FRAMES,
                         FIRST_FRAME_DELAY_MS,
                         (subscriber_wait_seconds or 0.0) * 1000.0,
                         (subscriber_settle_seconds or 0.0) * 1000.0,
@@ -447,6 +597,17 @@ class _Vits2TTSNode(Node):
                     self._publish_eof()
                 subscriber_gate_cancel.set()
                 subscriber_gate_thread.join(timeout=0.1)
+                # The synth thread holds the adapter lock for the whole
+                # generator; leaving it running would make the next utterance
+                # block on it inside synthesize_stream.
+                utterance_abort.set()
+                if synth_thread is not None and synth_thread.is_alive():
+                    synth_thread.join(timeout=5)
+                    if synth_thread.is_alive():
+                        log.error(
+                            "[vits2_tts_trt] synth thread did not exit; the "
+                            "adapter lock may still be held"
+                        )
 
     def status(self):
         return {

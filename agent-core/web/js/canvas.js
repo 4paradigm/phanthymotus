@@ -16,6 +16,7 @@ import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceCon
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
+import { selectPreviewTopic } from './topic-derive.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -710,7 +711,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     const fmtShort = fmt.split('/').pop() || '?';
     const colorCls = _fmtColorClass(fmt);
     const staticAttr = t.topic ? `data-static-topic="${_esc(t.topic)}"` : '';
-    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}" title="${_esc(fmt)}"><span class="canvas-port-label">${_esc(fmtShort)}</span></div>`;
+    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-port="${_esc(t.port || '')}" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}" title="${_esc(fmt)}"><span class="canvas-port-label">${_esc(fmtShort)}</span></div>`;
   }).join('');
 
   if (effectiveType === 'controller') {
@@ -848,9 +849,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     el.querySelector('.canvas-view-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      const liveMcp = _allMcps.find(m => m.id === mcpId);
-      const topics = topicOut.length ? topicOut : (liveMcp?.topic_out || []);
-      if (topics.length) showTopicDetail(topics[0].topic, topics[0].format || '');
+      _openTopicDetailFor(el, mcpId, topicOut, toolTopicOut);
     });
 
     const sensorExecBtn = el.querySelector('.canvas-exec-btn');
@@ -1041,18 +1040,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (viewBtn) {
       viewBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        const liveMcp = _allMcps.find(m => m.id === mcpId);
-        const topics = topicOut.length ? topicOut : (liveMcp?.topic_out || []);
-        const declaredPreview = toolTopicOut.find(t => t.default_preview === true);
-        const previewTopic = declaredPreview
-          ? topics.find(t =>
-              (declaredPreview.port && t.port === declaredPreview.port)
-              || t.topic === declaredPreview.topic
-            ) || declaredPreview
-          : topics[0];
-        if (previewTopic?.topic) {
-          showTopicDetail(previewTopic.topic, previewTopic.format || '');
-        }
+        _openTopicDetailFor(el, mcpId, topicOut, toolTopicOut);
       });
     }
 
@@ -1904,11 +1892,45 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
  * this revalidation exists to undo. An empty string means "not known yet", which
  * is the honest answer.
  */
+/**
+ * Open the data-stream detail panel for a card's output topic.
+ *
+ * Two things this must not do, both of which it used to:
+ *
+ * 1. Trust the `topicOut` captured when the card was rendered. That closure
+ *    goes stale as soon as a connection changes; the out-port dataset is the
+ *    live value, kept current by _resolveAllTopics. Same idiom as the topic
+ *    reads elsewhere in this file.
+ *
+ * 2. Accept an entry just because the array is non-empty. The old test was
+ *    `topics.length`, and for a multiInstance tool the MCP-level `topic_out` is
+ *    format-only by design — mcp_manage deliberately does not back-fill
+ *    per-instance topics, since those live on the cards. So `tts` reported
+ *    `[{format: 'audio/pcm-16k'}]`, which passed a length check with
+ *    `topic === undefined`; showTopicDetail then built `/ws/bus` + undefined,
+ *    matching no route (`/ws/bus/{topic:path}`). That is why "查看数据流" on a
+ *    TTS card opened a panel that never showed a waveform, and why the server
+ *    log filled with `ASGI callable returned without completing handshake`.
+ */
+function _openTopicDetailFor(el, mcpId, cachedTopicOut, declaredTopicOut) {
+  const livePorts = [...el.querySelectorAll('.canvas-port.out')]
+    .map(p => ({ port: p.dataset.port, topic: p.dataset.topic, format: p.dataset.format }));
+  const liveMcp = _allMcps.find(m => m.id === mcpId);
+  const candidate = selectPreviewTopic(
+    [...livePorts, ...(cachedTopicOut || []), ...(liveMcp?.topic_out || [])],
+    declaredTopicOut,
+  );
+  if (!candidate) {
+    _showToast('该卡片还没有解析出输出 topic —— 先点「开始控制」把它启动起来');
+    return;
+  }
+  showTopicDetail(candidate.topic, candidate.format || '');
+}
+
 function _inputTopicFor(card) {
   const inConn = _connections.find(c => c.toCardId === card.id);
   if (!inConn) return '';
-  const inPort = card.el.querySelector(`.canvas-port.in[data-idx="${inConn.toPortIdx}"]`);
-  return inPort?.dataset.topic || '';
+  const inPort = card.el.querySelector(`.canvas-port.in[data-idx="${inConn.toPortIdx}"]`);  return inPort?.dataset.topic || '';
 }
 
 /**

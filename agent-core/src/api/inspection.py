@@ -73,30 +73,42 @@ def _push_factory(topic: str):
         # 处理 perf_span 类型消息（来自 perception TTS 等组件）
         if topic == '/perception/perf_spans':
             try:
-                import json, perf_log, config
+                import json
                 text = data.decode('utf-8') if isinstance(data, bytes) else data
                 span_data = json.loads(text)
                 if span_data.get('type') == 'perf_span':
-                    trace_id = span_data.pop('trace_id', None)
-                    if trace_id:
-                        # 直接归属（trace_id 由 agent-core 透传）
-                        perf_log.commit_spans(trace_id, [span_data], source='perception')
-                    else:
-                        # 兼容旧版本 perception: fallback 到时间窗口匹配
-                        span_start = span_data.get('start_ts', 0)
-                        conn = config._get_conn()
-                        row = conn.execute(
-                            '''SELECT trace_id FROM perf_spans
-                               WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
-                               ORDER BY start_ts DESC LIMIT 1''',
-                            (span_start, span_start)
-                        ).fetchone()
-                        conn.close()
-                        if row:
-                            perf_log.commit_spans(row[0], [span_data], source='perception')
+                    # commit_spans and the fallback lookup are both synchronous
+                    # SQLite. Running them here blocked the event loop — and so
+                    # every audio WS send on it — once per utterance, exactly at
+                    # the utterance boundary where playback is most sensitive.
+                    await asyncio.to_thread(_commit_perf_span, span_data)
             except Exception:
                 pass
     return _push
+
+
+def _commit_perf_span(span_data: dict) -> None:
+    """Attribute one perception perf span to a trace. Blocking; off-loop only."""
+    import perf_log, config
+    trace_id = span_data.pop('trace_id', None)
+    if trace_id:
+        # 直接归属（trace_id 由 agent-core 透传）
+        perf_log.commit_spans(trace_id, [span_data], source='perception')
+        return
+    # 兼容旧版本 perception: fallback 到时间窗口匹配
+    span_start = span_data.get('start_ts', 0)
+    conn = config._get_conn()
+    try:
+        row = conn.execute(
+            '''SELECT trace_id FROM perf_spans
+               WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
+               ORDER BY start_ts DESC LIMIT 1''',
+            (span_start, span_start)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row:
+        perf_log.commit_spans(row[0], [span_data], source='perception')
 
 
 def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
