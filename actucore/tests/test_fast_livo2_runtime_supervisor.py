@@ -860,6 +860,45 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertIs(supervisor._process, process)
         killpg.assert_not_called()
 
+    def test_stop_mapping_without_persistable_map_releases_session(self) -> None:
+        for diagnostics, diagnostics_monotonic, warning_code in (
+            ({}, None, "static_map_status_unavailable"),
+            (
+                {
+                    "session_name": "map-a",
+                    "localization_state": "mapping",
+                    "map_point_count": 0,
+                },
+                time.monotonic(),
+                "static_map_not_ready",
+            ),
+        ):
+            with self.subTest(warning_code=warning_code):
+                supervisor = object.__new__(FastLivo2Supervisor)
+                process = mock.Mock()
+                process.poll.return_value = None
+                supervisor._lock = threading.RLock()
+                supervisor._process = process
+                supervisor._active_map = "map-a"
+                supervisor._loaded_map = None
+                supervisor._runtime_mode = "mapping"
+                supervisor._started_unix_ms = 123
+                supervisor._pending_mapping_finalize = None
+                supervisor._last_mapping_result = None
+                supervisor._diagnostics = diagnostics
+                supervisor._diagnostics_monotonic = diagnostics_monotonic
+                supervisor._terminate_process = mock.Mock(return_value=None)
+
+                result = supervisor._stop_mapping("map-a")
+
+                self.assertEqual(result["status"], "stopped")
+                self.assertFalse(result["map_saved"])
+                self.assertEqual(result["warning_code"], warning_code)
+                self.assertIsNone(supervisor._process)
+                self.assertIsNone(supervisor._active_map)
+                self.assertEqual(supervisor._runtime_mode, "idle")
+                supervisor._terminate_process.assert_called_once_with(process)
+
     def test_raw_pcd_flush_uses_algorithm_parameter_service(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
         supervisor._changed_pcd_files = mock.Mock(

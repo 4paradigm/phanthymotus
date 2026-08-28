@@ -151,7 +151,7 @@ freshness 门禁。
 | action          | 参数                                                                                    | 语义                                                    |
 | --------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | `start_mapping` | `map_name`                                                                            | 清空 Canvas 会话图并启动一个新的 FAST-LIVO2 进程                    |
-| `stop_mapping`  | 无                                                                                     | 先检查静态证据，通过 FAST-LIVO2 参数服务同步落盘 raw PCD，再 `SIGINT` 停止算法；随后保存 confirmed static PCD 并原子写 session manifest |
+| `stop_mapping`  | 无                                                                                     | 停止当前建图 session；静态证据足够时同步落盘 raw/static PCD 和 manifest，否则返回 `status=stopped, map_saved=false` 及 warning |
 | `load_map`      | `map_name`                                                                            | 先校验新旧 manifest/PCD，再串行替换定位前端，失败时尝试回滚旧图 |
 | `relocalize`    | `initial_x`, `initial_y`, `initial_z`, `initial_yaw`, `search_xy_m`, `search_yaw_rad` | 以操作者给定位姿为中心做有界二维 scan-to-map 匹配                       |
 
@@ -222,9 +222,10 @@ fail closed。
   executor callback 线程。`stop_mapping` 的外层等待预算至少 360 s，覆盖算法
   最长 120 s 受控停止、adapter 最长 130 s 保存及有界快照/fsync；`load_map`
   的外层等待预算至少 900 s。两者不会被较小的普通请求超时配置缩短。
-- `stop_mapping` 在发送停止信号前要求收到当前 session 的新鲜静态图诊断，
-  且至少已有 40 个 confirmed 点；否则保留建图进程并返回可重试错误。算法
-  已正常停止后进入 `finalizing`，静态 PCD 或 manifest 写失败不会清除会话，
+- `stop_mapping` 总会结束当前 session。当前 session 缺少新鲜静态图诊断，
+  或不足 40 个 confirmed 点时，不生成可加载地图，返回
+  `status=stopped, map_saved=false` 和明确 warning，随后可直接开始新的建图。算法
+  已正常停止并开始持久化后进入 `finalizing`，静态 PCD 或 manifest 写失败不会清除会话，
   再次执行 `stop_mapping` 会继续同一事务；adapter 会复用已成功保存的静态
   PCD，避免重试生成重复文件。I/O 或响应超时属于可重试失败，mapping core、
   Canvas wiring 和 pending transaction 均保留；结构、路径或资源上限错误属于

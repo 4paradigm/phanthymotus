@@ -811,31 +811,30 @@ class FastLivo2Supervisor(Node):
                 diagnostics_current
                 and diagnostics.get("localization_state") == "mapping"
             )
-            if not diagnostics_ready:
-                return {
-                    "status": "error",
-                    "error_code": "static_map_status_unavailable",
-                    "error": (
-                        "fresh static-map diagnostics are required before "
-                        "stopping; keep mapping and retry stop_mapping"
-                    ),
+            if not diagnostics_ready or point_count < 40:
+                warning_code = (
+                    "static_map_not_ready"
+                    if diagnostics_ready
+                    else "static_map_status_unavailable"
+                )
+                warning = (
+                    "confirmed static map has too few points to persist"
+                    if diagnostics_ready
+                    else "fresh static-map diagnostics were unavailable"
+                )
+                stop_error = self._terminate_process(process)
+                result = {
+                    "status": "stopped",
                     "map_name": map_name,
-                    "retryable": True,
+                    "map_saved": False,
+                    "warning_code": warning_code,
+                    "warning": warning,
+                    "algorithm_stop_error": stop_error,
                 }
-            if (
-                point_count < 40
-            ):
-                return {
-                    "status": "error",
-                    "error_code": "static_map_not_ready",
-                    "error": (
-                        "confirmed static map has too few points to persist; "
-                        "continue mapping and retry stop_mapping"
-                    ),
-                    "map_name": map_name,
-                    "static_point_count": point_count,
-                    "retryable": True,
-                }
+                if diagnostics_ready:
+                    result["static_point_count"] = point_count
+                self._finish_mapping_runtime(process, terminal_result=result)
+                return result
             stop_timeout_sec = float(
                 self.get_parameter("stop_timeout_sec").value
             )
