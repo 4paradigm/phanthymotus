@@ -28,7 +28,7 @@ Driver navigation_sensors
 - 使用已验证的 Driver `navigation_sensors` 接口，不读取 Canvas 旧
   `/ubuntu/lidar/cloud` envelope，也不在 ActuCore 内复制设备 SDK。
 - FAST-LIVO2 原始输出是 `camera_init -> aft_mapped`，其中状态位姿是传感器
-  位姿。adapter 使用实测 `base_link -> livox_frame` 外参计算
+  位姿。adapter 从 Driver 的 `/tf_static` 解析 `base_link -> sensor_frame` 计算
   `T_map_base = T_map_sensor * inverse(T_base_sensor)`，不能仅重命名 frame。
 - 原始 `/tf`、debug cloud 和 marker 全部隔离在
   `/ubuntu/navigation/fast_livo2/raw/*`，只有 adapter 发布权威
@@ -41,14 +41,14 @@ Driver navigation_sensors
 
 | port | topic | type / QoS | 约束 |
 | --- | --- | --- | --- |
-| `lidar` | `/ubuntu/navigation/lidar` | `sensor_msgs/msg/PointCloud2`; `RELIABLE + KEEP_LAST(2)` | MID360 `livox_frame`，ROS system time，逐点 offset 保留 |
-| `imu` | `/ubuntu/navigation/imu` | `sensor_msgs/msg/Imu`; `RELIABLE + KEEP_LAST(200)` | 与点云相同时钟域和安装旋转，约 200 Hz |
+| `lidar` | `/ubuntu/navigation/lidar` | `sensor_msgs/msg/PointCloud2`; `RELIABLE + KEEP_LAST(2)` | REP-103 `sensor_frame`，ROS system time，逐点 `timestamp=float64` 绝对纳秒 |
+| `imu` | `/ubuntu/navigation/imu` | `sensor_msgs/msg/Imu`; `RELIABLE + KEEP_LAST(200)` | 与点云同 `sensor_frame`、同一源时钟域，约 200 Hz |
 
 这两路输入来自既有 Driver `navigation_sensors` sensor cards。缺失、过期或
 frame 不符时同容器 adapter 不发布伪造的 canonical odom/cloud。
-FAST-LIVO2 使用与 LiDAR 刚性安装的 MID360 IMU 做重力对齐，因此整套传感器
+FAST-LIVO2 使用与 LiDAR 同 frame 的 IMU 做重力对齐，因此整套传感器
 相对机身的小角度倾斜不会直接把地图永久建斜；adapter 再用实测
-`base_link -> livox_frame` 外参恢复机器人机身位姿。若实际安装角度发生变化、
+`base_link -> sensor_frame` 静态 TF 恢复机器人机身位姿。若实际安装角度发生变化、
 LiDAR 与 IMU frame 不一致，或外参仍沿用旧值，影响会同时出现在机器人箭头、
 高度带过滤、重定位和 costmap，必须重新标定外参，不能靠放宽匹配阈值掩盖。
 adapter 对 FAST-LIVO2 原始 odom/cloud 使用
@@ -58,6 +58,12 @@ adapter 对 FAST-LIVO2 原始 odom/cloud 使用
 仍 fail closed，不会因为缓存的旧 age 伪装成新鲜数据。live
 PointCloud2 的 XYZ 解码、刚体变换、高度过滤和 float32 输出打包走 NumPy
 批处理；边界、字段、有限值、点数和字节上限仍在发布前 fail closed。
+每帧还必须包含单调 `timestamp`，且点时间位于 header 后 `200 ms` 内并具有
+非零跨度。adapter 只从 TF2 获取 `base_link -> sensor_frame`，不再保存本体
+专用六自由度外参。首个 raw odom 离会话原点超过 `2 m`、相邻线速度超过
+`10 m/s` 或角速度超过 `4π rad/s` 时进入 `raw_odom_discontinuity`；连续三个
+健康样本后才恢复。frame、TF、点时间或 odom 健康任一失败时，registered
+cloud、静态累计和 Nav2 输入全部 fail-closed。
 
 ## 输出
 

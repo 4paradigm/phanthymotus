@@ -76,6 +76,126 @@ class Pose3:
     q: Quaternion
 
 
+class OdomHealthMonitor:
+    """Reject impossible session-local odometry before it reaches maps or Nav2."""
+
+    def __init__(
+        self,
+        *,
+        max_initial_distance_m: float = 2.0,
+        max_linear_speed_mps: float = 10.0,
+        max_angular_speed_rps: float = 4.0 * math.pi,
+        recovery_samples: int = 3,
+    ) -> None:
+        self.max_initial_distance_m = float(max_initial_distance_m)
+        self.max_linear_speed_mps = float(max_linear_speed_mps)
+        self.max_angular_speed_rps = float(max_angular_speed_rps)
+        self.recovery_samples = int(recovery_samples)
+        if (
+            min(
+                self.max_initial_distance_m,
+                self.max_linear_speed_mps,
+                self.max_angular_speed_rps,
+            ) <= 0
+            or self.recovery_samples < 1
+        ):
+            raise ValueError("odometry health limits must be positive")
+        self.reset()
+
+    def reset(self, *, require_near_origin: bool = True) -> None:
+        self.state = "waiting"
+        self.reason: str | None = None
+        self.detail: str | None = None
+        self.healthy_streak = 0
+        self._last_stamp_ns: int | None = None
+        self._last_pose: Pose3 | None = None
+        self._require_near_origin = bool(require_near_origin)
+
+    @property
+    def ready(self) -> bool:
+        return self.state == "ready"
+
+    def diagnostics(self) -> dict:
+        return {
+            "state": self.state,
+            "reason": self.reason,
+            "detail": self.detail,
+            "healthy_streak": self.healthy_streak,
+        }
+
+    def observe(self, stamp_ns: int, pose: Pose3) -> bool:
+        stamp_ns = int(stamp_ns)
+        if stamp_ns <= 0:
+            return self._reject("source stamp must be positive")
+        position = (float(pose.x), float(pose.y), float(pose.z))
+        if not all(math.isfinite(value) for value in position):
+            return self._reject("position must be finite")
+        try:
+            normalized = Pose3(*position, normalize_quaternion(pose.q))
+        except InvalidFastLivo2Frame as exc:
+            return self._reject(str(exc))
+
+        if self._last_pose is None:
+            if self._require_near_origin and math.sqrt(
+                sum(value * value for value in position)
+            ) > self.max_initial_distance_m:
+                return self._reject(
+                    "initial position exceeds "
+                    f"{self.max_initial_distance_m:.3f} m"
+                )
+            return self._accept(stamp_ns, normalized)
+
+        elapsed = (stamp_ns - int(self._last_stamp_ns)) / 1_000_000_000.0
+        if elapsed <= 0:
+            return self._reject("source stamp did not advance")
+        distance = math.sqrt(
+            (normalized.x - self._last_pose.x) ** 2
+            + (normalized.y - self._last_pose.y) ** 2
+            + (normalized.z - self._last_pose.z) ** 2
+        )
+        if distance / elapsed > self.max_linear_speed_mps:
+            return self._reject(
+                f"linear speed {distance / elapsed:.3f} m/s exceeds "
+                f"{self.max_linear_speed_mps:.3f} m/s"
+            )
+        left = normalize_quaternion(self._last_pose.q)
+        right = normalized.q
+        cosine = min(
+            1.0,
+            abs(left.x * right.x + left.y * right.y + left.z * right.z + left.w * right.w),
+        )
+        angular_speed = 2.0 * math.acos(cosine) / elapsed
+        if angular_speed > self.max_angular_speed_rps:
+            return self._reject(
+                f"angular speed {angular_speed:.3f} rad/s exceeds "
+                f"{self.max_angular_speed_rps:.3f} rad/s"
+            )
+        return self._accept(stamp_ns, normalized)
+
+    def _accept(self, stamp_ns: int, pose: Pose3) -> bool:
+        recovering = self.state in {"fault", "recovering"}
+        self._last_stamp_ns = stamp_ns
+        self._last_pose = pose
+        self.reason = None
+        self.detail = None
+        if not recovering:
+            self.state = "ready"
+            self.healthy_streak = 1
+            return True
+        self.healthy_streak += 1
+        self.state = (
+            "ready" if self.healthy_streak >= self.recovery_samples else "recovering"
+        )
+        return self.ready
+
+    def _reject(self, detail: str) -> bool:
+        self.state = "fault"
+        self.reason = "raw_odom_discontinuity"
+        self.detail = detail
+        self.healthy_streak = 0
+        return False
+
+
 @dataclass(frozen=True)
 class RelocalizationResult:
     map_from_session: Pose3

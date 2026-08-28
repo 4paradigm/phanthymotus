@@ -19,7 +19,7 @@ setup(
     zip_safe=True,
     maintainer="Phanthy Motus",
     maintainer_email="devnull@example.com",
-    description="FAST-LIVO2 runtime ownership and canonical G1 frame adapter",
+    description="FAST-LIVO2 runtime ownership and canonical navigation frame adapter",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={

@@ -2,7 +2,7 @@
 <package format="3">
   <name>g1_fast_livo2</name>
   <version>0.1.0</version>
-  <description>FAST-LIVO2 runtime ownership and canonical G1 frame adapter.</description>
+  <description>FAST-LIVO2 runtime ownership and canonical navigation frame adapter.</description>
   <maintainer email="devnull@example.com">Phanthy Motus</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_python</buildtool_depend>

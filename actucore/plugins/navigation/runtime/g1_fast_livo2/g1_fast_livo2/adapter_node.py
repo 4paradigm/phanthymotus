@@ -28,12 +28,14 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from sensor_msgs.msg import PointCloud2, PointField
+from rclpy.time import Time
+from sensor_msgs.msg import Imu, PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
-from tf2_ros import TransformBroadcaster
+from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
 from .frame_adapter_core import (
     InvalidFastLivo2Frame,
+    OdomHealthMonitor,
     Pose3,
     Quaternion,
     RelocalizationRejected,
@@ -53,6 +55,7 @@ from .frame_adapter_core import (
     yaw_from_quaternion,
 )
 from .vectorized_cloud import (
+    absolute_point_time_span_ms,
     decode_xyz_array,
     map_view_with_pose,
     transform_xyz_array,
@@ -78,6 +81,8 @@ class FastLivo2Adapter(Node):
         super().__init__("g1_fast_livo2_adapter")
         self.declare_parameter("raw_odom_topic", "/ubuntu/navigation/fast_livo2/raw/odom")
         self.declare_parameter("raw_cloud_topic", "/ubuntu/navigation/fast_livo2/raw/cloud_registered")
+        self.declare_parameter("lidar_topic", "/ubuntu/navigation/lidar")
+        self.declare_parameter("imu_topic", "/ubuntu/navigation/imu")
         self.declare_parameter("odom_topic", "/ubuntu/navigation/odom")
         self.declare_parameter("cloud_topic", "/ubuntu/navigation/cloud_registered")
         self.declare_parameter("obstacle_map_topic", "/ubuntu/navigation/obstacle_map")
@@ -99,12 +104,6 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("static_pose_match_tolerance_sec", 0.05)
         self.declare_parameter("obstacle_min_height_m", -0.30)
         self.declare_parameter("obstacle_max_height_m", 0.30)
-        self.declare_parameter("base_to_sensor_x", -0.00368)
-        self.declare_parameter("base_to_sensor_y", 0.00003)
-        self.declare_parameter("base_to_sensor_z", 0.46018)
-        self.declare_parameter("base_to_sensor_roll", 0.0)
-        self.declare_parameter("base_to_sensor_pitch", 0.04014257279586953)
-        self.declare_parameter("base_to_sensor_yaw", 0.0)
 
         self._source_max_age = float(self.get_parameter("source_max_age_sec").value)
         self._source_age_tolerance = float(
@@ -126,16 +125,18 @@ class FastLivo2Adapter(Node):
             raise ValueError("map load point limits must be at least 40")
         if self._live_cloud_max_bytes < 1:
             raise ValueError("live_cloud_max_bytes must be positive")
-        self._base_to_sensor = Pose3(
-            float(self.get_parameter("base_to_sensor_x").value),
-            float(self.get_parameter("base_to_sensor_y").value),
-            float(self.get_parameter("base_to_sensor_z").value),
-            quaternion_from_rpy(
-                float(self.get_parameter("base_to_sensor_roll").value),
-                float(self.get_parameter("base_to_sensor_pitch").value),
-                float(self.get_parameter("base_to_sensor_yaw").value),
-            ),
-        )
+        self._base_to_sensor: Pose3 | None = None
+        self._sensor_frame: str | None = None
+        self._lidar_frame: str | None = None
+        self._imu_frame: str | None = None
+        self._last_lidar_source_stamp_ns: int | None = None
+        self._last_imu_source_stamp_ns: int | None = None
+        self._point_time_ready = False
+        self._imu_time_ready = False
+        self._point_time_span_ms: float | None = None
+        self._base_to_sensor_tf_ready = False
+        self._sensor_tf_error: str | None = None
+        self._odom_health = OdomHealthMonitor()
         map_voxel_size = float(self.get_parameter("map_voxel_size_m").value)
         self._map_view_voxel_size = max(map_voxel_size, 0.20)
         self._map_view_context = VoxelMap(self._map_view_voxel_size)
@@ -244,11 +245,31 @@ class FastLivo2Adapter(Node):
             String, str(self.get_parameter("map_control_status_topic").value), 10
         )
         self._tf = TransformBroadcaster(self)
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(
+            self._tf_buffer,
+            self,
+            spin_thread=False,
+        )
         latest_sensor_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            PointCloud2,
+            str(self.get_parameter("lidar_topic").value),
+            self._on_lidar_contract,
+            latest_sensor_qos,
+            callback_group=self._callbacks,
+        )
+        self.create_subscription(
+            Imu,
+            str(self.get_parameter("imu_topic").value),
+            self._on_imu_contract,
+            latest_sensor_qos,
+            callback_group=self._callbacks,
         )
         self.create_subscription(
             Odometry,
@@ -393,6 +414,166 @@ class FastLivo2Adapter(Node):
         source = float(stamp.sec) + float(stamp.nanosec) * 1e-9
         return self.get_clock().now().nanoseconds * 1e-9 - source
 
+    def _on_lidar_contract(self, message: PointCloud2) -> None:
+        try:
+            frame = message.header.frame_id.strip()
+            if not frame:
+                raise InvalidFastLivo2Frame("lidar frame_id is empty")
+            source_stamp_ns = _stamp_ns(message.header.stamp)
+            with self._lock:
+                previous = self._last_lidar_source_stamp_ns
+            if previous is not None and source_stamp_ns <= previous:
+                raise InvalidFastLivo2Frame("lidar source stamp did not advance")
+            span_ms = absolute_point_time_span_ms(
+                fields=message.fields,
+                data=bytes(message.data),
+                point_step=int(message.point_step),
+                row_step=int(message.row_step),
+                width=int(message.width),
+                height=int(message.height),
+                is_bigendian=bool(message.is_bigendian),
+                header_stamp_ns=source_stamp_ns,
+            )
+        except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
+            with self._lock:
+                self._point_time_ready = False
+                self._point_time_span_ms = None
+            self.get_logger().warning(
+                f"rejecting navigation lidar contract: {exc}"
+            )
+            return
+        with self._lock:
+            if frame != self._lidar_frame:
+                self._base_to_sensor = None
+                self._base_to_sensor_tf_ready = False
+            self._lidar_frame = frame
+            self._last_lidar_source_stamp_ns = source_stamp_ns
+            self._point_time_ready = True
+            self._point_time_span_ms = span_ms
+        self._refresh_sensor_contract()
+
+    def _on_imu_contract(self, message: Imu) -> None:
+        try:
+            frame = message.header.frame_id.strip()
+            if not frame:
+                raise InvalidFastLivo2Frame("imu frame_id is empty")
+            source_stamp_ns = _stamp_ns(message.header.stamp)
+            if source_stamp_ns <= 0:
+                raise InvalidFastLivo2Frame("imu source stamp must be positive")
+            with self._lock:
+                previous = self._last_imu_source_stamp_ns
+            if previous is not None and source_stamp_ns <= previous:
+                raise InvalidFastLivo2Frame("imu source stamp did not advance")
+        except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
+            with self._lock:
+                self._imu_time_ready = False
+            self.get_logger().warning(
+                f"rejecting navigation imu contract: {exc}"
+            )
+            return
+        with self._lock:
+            if frame != self._imu_frame:
+                self._base_to_sensor = None
+                self._base_to_sensor_tf_ready = False
+            self._imu_frame = frame
+            self._last_imu_source_stamp_ns = source_stamp_ns
+            self._imu_time_ready = True
+        self._refresh_sensor_contract()
+
+    def _refresh_sensor_contract(self) -> None:
+        with self._lock:
+            lidar_frame = self._lidar_frame
+            imu_frame = self._imu_frame
+            lidar_stamp = self._last_lidar_source_stamp_ns
+            imu_stamp = self._last_imu_source_stamp_ns
+            if (
+                not lidar_frame
+                or lidar_frame != imu_frame
+                or not self._point_time_ready
+                or not self._imu_time_ready
+                or lidar_stamp is None
+                or imu_stamp is None
+                or abs(lidar_stamp - imu_stamp) > 200_000_000
+            ):
+                self._sensor_frame = None
+                self._base_to_sensor = None
+                self._base_to_sensor_tf_ready = False
+                return
+            sensor_frame = lidar_frame
+            if (
+                self._sensor_frame == sensor_frame
+                and self._base_to_sensor_tf_ready
+                and self._base_to_sensor is not None
+            ):
+                return
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                "base_link",
+                sensor_frame,
+                Time(),
+            ).transform
+            base_to_sensor = Pose3(
+                float(transform.translation.x),
+                float(transform.translation.y),
+                float(transform.translation.z),
+                Quaternion(
+                    float(transform.rotation.x),
+                    float(transform.rotation.y),
+                    float(transform.rotation.z),
+                    float(transform.rotation.w),
+                ),
+            )
+            # Validate both translation and quaternion before caching the TF.
+            canonical_base_pose(base_to_sensor, base_to_sensor)
+        except (TransformException, InvalidFastLivo2Frame, TypeError, ValueError) as exc:
+            with self._lock:
+                self._sensor_frame = sensor_frame
+                self._base_to_sensor = None
+                self._base_to_sensor_tf_ready = False
+                self._sensor_tf_error = str(exc)
+            return
+        with self._lock:
+            if self._lidar_frame == self._imu_frame == sensor_frame:
+                self._sensor_frame = sensor_frame
+                self._base_to_sensor = base_to_sensor
+                self._base_to_sensor_tf_ready = True
+                self._sensor_tf_error = None
+
+    def _sensor_contract_ready_locked(self) -> bool:
+        return (
+            self._sensor_frame is not None
+            and self._point_time_ready
+            and self._imu_time_ready
+            and self._base_to_sensor_tf_ready
+            and self._base_to_sensor is not None
+        )
+
+    def _readiness_blockers_locked(self) -> list[str]:
+        blockers = []
+        if not self._lidar_frame or self._lidar_frame != self._imu_frame:
+            blockers.append("sensor_frame_mismatch")
+        if (
+            not self._point_time_ready
+            or not self._imu_time_ready
+            or self._last_lidar_source_stamp_ns is None
+            or self._last_imu_source_stamp_ns is None
+            or abs(
+                self._last_lidar_source_stamp_ns
+                - self._last_imu_source_stamp_ns
+            )
+            > 200_000_000
+        ):
+            blockers.append("point_time_invalid")
+        if (
+            self._lidar_frame
+            and self._lidar_frame == self._imu_frame
+            and not self._base_to_sensor_tf_ready
+        ):
+            blockers.append("sensor_tf_unavailable")
+        if self._odom_health.reason == "raw_odom_discontinuity":
+            blockers.append("raw_odom_discontinuity")
+        return blockers
+
     def _on_odom(self, message: Odometry) -> None:
         try:
             if message.header.frame_id.strip() != "camera_init" or message.child_frame_id.strip() != "aft_mapped":
@@ -405,19 +586,31 @@ class FastLivo2Adapter(Node):
             ):
                 raise InvalidFastLivo2Frame(f"raw odom source age {source_age:.3f}s is invalid")
             pose = message.pose.pose
-            session_pose = canonical_base_pose(
-                Pose3(
-                    float(pose.position.x),
-                    float(pose.position.y),
-                    float(pose.position.z),
-                    Quaternion(
-                        float(pose.orientation.x),
-                        float(pose.orientation.y),
-                        float(pose.orientation.z),
-                        float(pose.orientation.w),
-                    ),
+            raw_sensor_pose = Pose3(
+                float(pose.position.x),
+                float(pose.position.y),
+                float(pose.position.z),
+                Quaternion(
+                    float(pose.orientation.x),
+                    float(pose.orientation.y),
+                    float(pose.orientation.z),
+                    float(pose.orientation.w),
                 ),
-                self._base_to_sensor,
+            )
+            source_stamp_ns = _stamp_ns(message.header.stamp)
+            with self._lock:
+                if not self._sensor_contract_ready_locked():
+                    raise InvalidFastLivo2Frame(
+                        "navigation sensor contract is not ready"
+                    )
+                if not self._odom_health.observe(source_stamp_ns, raw_sensor_pose):
+                    raise InvalidFastLivo2Frame(
+                        self._odom_health.detail or "raw odom is unhealthy"
+                    )
+                base_to_sensor = self._base_to_sensor
+            session_pose = canonical_base_pose(
+                raw_sensor_pose,
+                base_to_sensor,
             )
         except (InvalidFastLivo2Frame, ValueError, TypeError) as exc:
             self._invalid_odom += 1
@@ -432,7 +625,6 @@ class FastLivo2Adapter(Node):
         if map_from_session is None:
             return
         canonical = compose_pose(map_from_session, session_pose)
-        source_stamp_ns = _stamp_ns(message.header.stamp)
         with self._lock:
             if self._map_from_session != map_from_session:
                 return
@@ -467,6 +659,14 @@ class FastLivo2Adapter(Node):
     def _on_cloud(self, message: PointCloud2) -> None:
         receive_monotonic = time.monotonic()
         try:
+            with self._lock:
+                if (
+                    not self._sensor_contract_ready_locked()
+                    or not self._odom_health.ready
+                ):
+                    raise InvalidFastLivo2Frame(
+                        "navigation sensor or odom contract is not ready"
+                    )
             if message.header.frame_id.strip() != "camera_init":
                 raise InvalidFastLivo2Frame("raw registered cloud must use camera_init")
             source_age = self._source_age(message.header.stamp)
@@ -635,7 +835,11 @@ class FastLivo2Adapter(Node):
                 publish_end_monotonic - receive_monotonic,
             )
         if mode == "mapping":
-            sensor_pose = compose_pose(matched_pose, self._base_to_sensor)
+            with self._lock:
+                base_to_sensor = self._base_to_sensor
+            if base_to_sensor is None:
+                return
+            sensor_pose = compose_pose(matched_pose, base_to_sensor)
             self._queue_mapping_scan(
                 {
                     "generation": generation,
@@ -655,6 +859,7 @@ class FastLivo2Adapter(Node):
 
     def _on_reset(self, message: String) -> None:
         with self._lock:
+            self._odom_health.reset()
             self._invalidate_mapping_work_locked()
             with self._static_lock:
                 cleared = self._static_map.cleared_snapshot()
@@ -1033,6 +1238,7 @@ class FastLivo2Adapter(Node):
                 )
             self._static_map_load_time = self.get_clock().now().to_msg()
             self._reference_points = static_loaded.points
+            self._odom_health.reset(require_near_origin=False)
             self._session_name = map_name
             self._mode = "awaiting_relocalization"
             self._map_from_session = None
@@ -1165,6 +1371,7 @@ class FastLivo2Adapter(Node):
         )
         with self._lock:
             self._map_from_session = result.map_from_session
+            self._odom_health.reset(require_near_origin=False)
             self._latest_pose = result.map_base_pose
             self._relocalization_preview_pose = None
             self._relocalization_preview_points = ()
@@ -1215,6 +1422,7 @@ class FastLivo2Adapter(Node):
                 )
             self._static_map_load_time = self.get_clock().now().to_msg()
             self._session_name = None
+            self._odom_health.reset(require_near_origin=False)
             self._mode = "idle"
             self._map_from_session = None
             self._latest_pose = None
@@ -1357,6 +1565,13 @@ class FastLivo2Adapter(Node):
                 "latency_ms": dict(self._latency_ms),
                 "latency_max_ms": dict(self._latency_max_ms),
                 "map_view_cache_monotonic": self._map_view_cache_monotonic,
+                "sensor_frame": self._sensor_frame,
+                "sensor_contract_ready": self._sensor_contract_ready_locked(),
+                "base_to_sensor_tf_ready": self._base_to_sensor_tf_ready,
+                "sensor_tf_error": self._sensor_tf_error,
+                "point_time_span_ms": self._point_time_span_ms,
+                "odom_health": self._odom_health.diagnostics(),
+                "readiness_blockers": self._readiness_blockers_locked(),
             }
 
         with self._static_lock:
@@ -1418,6 +1633,7 @@ class FastLivo2Adapter(Node):
             and odom_age <= self._source_max_age
             and cloud_age <= self._source_max_age
             and navigation_cloud_age <= self._source_max_age
+            and not state["readiness_blockers"]
         )
         payload = {
             "schema": "phanthy.navigation.fast_livo2_diagnostics.v1",
@@ -1470,6 +1686,13 @@ class FastLivo2Adapter(Node):
             "canonical_cloud_frame": "map",
             "obstacle_map_frame": "map",
             "static_map_frame": "map",
+            "sensor_frame": state["sensor_frame"],
+            "sensor_contract_ready": state["sensor_contract_ready"],
+            "base_to_sensor_tf_ready": state["base_to_sensor_tf_ready"],
+            "sensor_tf_error": state["sensor_tf_error"],
+            "point_time_span_ms": state["point_time_span_ms"],
+            "odom_health": state["odom_health"],
+            "readiness_blockers": state["readiness_blockers"],
         }
         if static_grid is not None:
             self._static_map_pub.publish(static_grid)

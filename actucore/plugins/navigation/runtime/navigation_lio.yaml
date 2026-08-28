@@ -81,7 +81,7 @@
       pub_scan_num: 1
       blind_rgb_points: 0.0
     evo:
-      seq_name: "g1_fast_livo2_perception"
+      seq_name: "navigation_fast_livo2"
       pose_output_en: false
     pcd_save:
       pcd_save_en: false

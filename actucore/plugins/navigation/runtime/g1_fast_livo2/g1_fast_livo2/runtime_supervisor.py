@@ -80,7 +80,7 @@ class FastLivo2Supervisor(Node):
             "raw_cloud_topic",
             "/ubuntu/navigation/fast_livo2/raw/cloud_registered",
         )
-        self.declare_parameter("config_path", "/config/g1_lio.yaml")
+        self.declare_parameter("config_path", "/config/navigation_lio.yaml")
         self.declare_parameter("map_root", "/opt/fast_livo_ws/src/fast_livo/Log/pcd")
         self.declare_parameter("pcd_save_interval", 600)
         self.declare_parameter("stop_timeout_sec", 120.0)
@@ -1756,6 +1756,7 @@ class FastLivo2Supervisor(Node):
                 if self._runtime_mode == "finalizing"
                 else "idle"
             )
+            diagnostics = dict(self._diagnostics)
             payload = {
                 "event": "heartbeat",
                 "schema": "phanthy.navigation.fast_livo2_status.v1",
@@ -1765,11 +1766,23 @@ class FastLivo2Supervisor(Node):
                 "loaded_map": self._loaded_map,
                 "runtime_mode": self._runtime_mode,
                 "algorithm_running": running,
-                "companion_ready": True,
+                "companion_ready": bool(diagnostics.get("ready", False)),
+                "sensor_frame": diagnostics.get("sensor_frame"),
+                "sensor_contract_ready": bool(
+                    diagnostics.get("sensor_contract_ready", False)
+                ),
+                "base_to_sensor_tf_ready": bool(
+                    diagnostics.get("base_to_sensor_tf_ready", False)
+                ),
+                "point_time_span_ms": diagnostics.get("point_time_span_ms"),
+                "odom_health": diagnostics.get("odom_health", {}),
+                "readiness_blockers": list(
+                    diagnostics.get("readiness_blockers", [])
+                ),
                 "session_local": True,
                 "global_relocalization_supported": False,
                 "bounded_relocalization_supported": True,
-                "diagnostics": dict(self._diagnostics),
+                "diagnostics": diagnostics,
                 "collection": collection,
             }
         self._publish(payload)

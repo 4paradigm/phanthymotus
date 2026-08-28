@@ -45,6 +45,8 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         key: topics[key]
                         for key in (
+                            "lidar_topic",
+                            "imu_topic",
                             "raw_odom_topic",
                             "raw_cloud_topic",
                             "odom_topic",

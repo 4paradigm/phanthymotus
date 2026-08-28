@@ -4,9 +4,10 @@
 **ActuCore（执行模型层）**：把意图/目标变成运动指令。Canvas 只看到这一张
 `processor` 卡片，正式部署只运行一个 ActuCore 容器。
 
-卡片的公开 action/topic 契约和单容器架构不绑定具体机器人；本版本随镜像提供的
-传感器与运动适配器目前只验证并限制为 G1 的 `ubuntu` namespace。适配其他机器人
-需要替换 topic/frame/执行器绑定，而不是只改 namespace 字符串。
+卡片的公开 action/topic 契约和单容器架构不绑定具体机器人。Driver 必须把
+LiDAR/IMU 转为同一个 REP-103 `sensor_frame`，提供
+`base_link -> sensor_frame` 静态 TF，并使用同一 ROS system time；当前真机证据
+覆盖 G1，其他本体仍需分别验收。
 
 ## 运行边界
 
@@ -48,6 +49,11 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 | `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航，`collection_enabled=true` 时必需 |
 | `depth_frame` | `/ubuntu/camera/depth_frame` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE1` 封装中的深度尺度、标定与源时间戳 |
 | `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由 Agent Core `x-topic-actions` 转换为 `navigate_to_pose` |
+
+LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
+`(0, 200] ms`。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
+契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable`、
+`point_time_invalid` 或 `raw_odom_discontinuity`，不会继续生成伪正常地图。
 
 ## 公共输出
 

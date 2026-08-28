@@ -23,6 +23,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     FastLivo2PersistenceError,
     InvalidFastLivo2Frame,
+    OdomHealthMonitor,
     Pose3,
     Quaternion,
     RelocalizationRejected,
@@ -49,6 +50,42 @@ from g1_fast_livo2.runtime_core import controlled_stop_succeeded  # noqa: E402
 
 
 class FastLivo2FrameAdapterTest(unittest.TestCase):
+    def test_raw_odom_discontinuity_recovers_after_three_healthy_samples(self) -> None:
+        monitor = OdomHealthMonitor()
+        identity = Quaternion(0.0, 0.0, 0.0, 1.0)
+
+        self.assertTrue(monitor.observe(1_000_000_000, Pose3(0.0, 0.0, 0.0, identity)))
+        self.assertFalse(
+            monitor.observe(1_100_000_000, Pose3(1000.0, 0.0, 0.0, identity))
+        )
+        self.assertEqual(monitor.reason, "raw_odom_discontinuity")
+        self.assertFalse(monitor.observe(1_100_000_000, Pose3(0.1, 0.0, 0.0, identity)))
+        self.assertFalse(monitor.observe(1_200_000_000, Pose3(0.2, 0.0, 0.0, identity)))
+        self.assertTrue(monitor.observe(1_300_000_000, Pose3(0.3, 0.0, 0.0, identity)))
+        self.assertEqual(monitor.state, "ready")
+
+    def test_raw_odom_initial_pose_and_rotation_rate_fail_closed(self) -> None:
+        identity = Quaternion(0.0, 0.0, 0.0, 1.0)
+        monitor = OdomHealthMonitor()
+        self.assertFalse(monitor.observe(1_000_000_000, Pose3(2.1, 0.0, 0.0, identity)))
+
+        monitor.reset()
+        self.assertTrue(monitor.observe(1_000_000_000, Pose3(0.0, 0.0, 0.0, identity)))
+        self.assertFalse(
+            monitor.observe(
+                1_010_000_000,
+                Pose3(0.0, 0.0, 0.0, quaternion_from_rpy(0.0, 0.0, math.pi)),
+            )
+        )
+
+        monitor.reset()
+        self.assertFalse(
+            monitor.observe(
+                1_000_000_000,
+                Pose3(0.0, 0.0, 0.0, Quaternion(math.nan, 0.0, 0.0, 1.0)),
+            )
+        )
+
     def test_persisted_obstacle_height_range_is_strictly_validated(self) -> None:
         self.assertEqual(
             normalize_obstacle_height_range([-0.30, 0.30]),

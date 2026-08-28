@@ -46,6 +46,8 @@ def _import_ros_runtime_modules():
     executors.MultiThreadedExecutor = type("MultiThreadedExecutor", (), {})
     node = module("rclpy.node")
     node.Node = type("Node", (), {})
+    rclpy_time = module("rclpy.time")
+    rclpy_time.Time = type("Time", (), {})
     qos = module("rclpy.qos")
     policy = type(
         "Policy",
@@ -78,12 +80,21 @@ def _import_ros_runtime_modules():
             "PointField",
         ),
         "std_msgs.msg": ("String", "UInt8MultiArray"),
-        "tf2_ros": ("TransformBroadcaster",),
+        "tf2_ros": (
+            "Buffer",
+            "TransformBroadcaster",
+            "TransformException",
+            "TransformListener",
+        ),
     }
     for module_name, names in message_modules.items():
         target = module(module_name)
         for name in names:
-            setattr(target, name, Message if name == "String" else type(name, (), {}))
+            if name == "TransformException":
+                value = type(name, (Exception,), {})
+            else:
+                value = Message if name == "String" else type(name, (), {})
+            setattr(target, name, value)
 
     try:
         from g1_fast_livo2 import adapter_node, runtime_supervisor
@@ -188,6 +199,72 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertAlmostEqual(adapter._latency_ms["cloud_decode"], 4.0)
         self.assertAlmostEqual(adapter._latency_max_ms["cloud_decode"], 12.0)
 
+    def test_sensor_contract_accepts_arbitrary_shared_frame_and_static_tf(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._lidar_frame = "front_navigation_sensor"
+        adapter._imu_frame = "front_navigation_sensor"
+        adapter._last_lidar_source_stamp_ns = 1_000_000_000
+        adapter._last_imu_source_stamp_ns = 1_050_000_000
+        adapter._point_time_ready = True
+        adapter._imu_time_ready = True
+        adapter._point_time_span_ms = 80.0
+        adapter._base_to_sensor = None
+        adapter._base_to_sensor_tf_ready = False
+        adapter._sensor_frame = None
+        adapter._sensor_tf_error = None
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._tf_buffer = mock.Mock()
+        adapter._tf_buffer.lookup_transform.return_value = SimpleNamespace(
+            transform=SimpleNamespace(
+                translation=SimpleNamespace(x=0.2, y=-0.1, z=0.8),
+                rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+        )
+
+        adapter._refresh_sensor_contract()
+        adapter._refresh_sensor_contract()
+
+        self.assertTrue(adapter._sensor_contract_ready_locked())
+        self.assertEqual(adapter._sensor_frame, "front_navigation_sensor")
+        self.assertAlmostEqual(adapter._base_to_sensor.z, 0.8)
+        self.assertEqual(adapter._readiness_blockers_locked(), [])
+        adapter._tf_buffer.lookup_transform.assert_called_once_with(
+            "base_link",
+            "front_navigation_sensor",
+            mock.ANY,
+        )
+
+    def test_sensor_contract_reports_frame_mismatch_and_missing_tf(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._lidar_frame = "lidar_frame"
+        adapter._imu_frame = "imu_frame"
+        adapter._last_lidar_source_stamp_ns = 1_000_000_000
+        adapter._last_imu_source_stamp_ns = 1_050_000_000
+        adapter._point_time_ready = True
+        adapter._imu_time_ready = True
+        adapter._point_time_span_ms = 50.0
+        adapter._base_to_sensor = None
+        adapter._base_to_sensor_tf_ready = False
+        adapter._sensor_frame = None
+        adapter._sensor_tf_error = None
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._tf_buffer = mock.Mock()
+
+        adapter._refresh_sensor_contract()
+
+        self.assertIn("sensor_frame_mismatch", adapter._readiness_blockers_locked())
+        adapter._tf_buffer.lookup_transform.assert_not_called()
+
+        adapter._imu_frame = "lidar_frame"
+        adapter._tf_buffer.lookup_transform.side_effect = (
+            ADAPTER_MODULE.TransformException("no static transform")
+        )
+        adapter._refresh_sensor_contract()
+        self.assertIn("sensor_tf_unavailable", adapter._readiness_blockers_locked())
+        self.assertFalse(adapter._sensor_contract_ready_locked())
+
     def test_relocalize_discards_live_points_encoded_under_old_alignment(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
@@ -218,6 +295,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._last_navigation_cloud_monotonic = time.monotonic()
         adapter._map_view_cache = b"old-cache"
         adapter._map_view_cache_monotonic = time.monotonic()
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
         map_from_session = Pose3(
             1.0,
             2.0,
@@ -435,6 +513,23 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._pose_history = []
         adapter._obstacle_min_height = -0.30
         adapter._obstacle_max_height = 0.30
+        adapter._sensor_frame = "sensor_frame"
+        adapter._lidar_frame = "sensor_frame"
+        adapter._imu_frame = "sensor_frame"
+        adapter._point_time_ready = True
+        adapter._imu_time_ready = True
+        adapter._base_to_sensor_tf_ready = True
+        adapter._base_to_sensor = Pose3(
+            0.0,
+            0.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_health.observe(
+            1_000_000_000,
+            Pose3(0.0, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0)),
+        )
         adapter.get_logger = lambda: SimpleNamespace(warning=lambda _msg: None)
         message = SimpleNamespace(
             header=SimpleNamespace(

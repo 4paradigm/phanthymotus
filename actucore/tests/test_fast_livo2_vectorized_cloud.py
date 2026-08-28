@@ -28,6 +28,7 @@ from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     transform_points,
 )
 from g1_fast_livo2.vectorized_cloud import (  # noqa: E402
+    absolute_point_time_span_ms,
     decode_xyz_array,
     map_view_with_pose,
     transform_xyz_array,
@@ -40,6 +41,65 @@ def _field(name: str, offset: int, datatype: int = 7):
 
 
 class FastLivo2VectorizedCloudTest(unittest.TestCase):
+    def test_navigation_point_times_are_absolute_monotonic_and_nonzero(self) -> None:
+        header_ns = 1_800_000_000_000_000_000
+        fields = [
+            _field("x", 0),
+            _field("y", 4),
+            _field("z", 8),
+            _field("timestamp", 16, 8),
+        ]
+        data = b"".join(
+            struct.pack("<fffxxxxd", 1.0, 2.0, 3.0, float(stamp))
+            for stamp in (header_ns, header_ns + 25_000_000, header_ns + 80_000_000)
+        )
+
+        self.assertAlmostEqual(
+            absolute_point_time_span_ms(
+                fields=fields,
+                data=data,
+                point_step=24,
+                row_step=72,
+                width=3,
+                height=1,
+                is_bigendian=False,
+                header_stamp_ns=header_ns,
+            ),
+            80.0,
+            places=3,
+        )
+
+        collapsed = b"".join(
+            struct.pack("<fffxxxxd", 1.0, 2.0, 3.0, float(header_ns))
+            for _ in range(2)
+        )
+        with self.assertRaisesRegex(InvalidFastLivo2Frame, "span"):
+            absolute_point_time_span_ms(
+                fields=fields,
+                data=collapsed,
+                point_step=24,
+                row_step=48,
+                width=2,
+                height=1,
+                is_bigendian=False,
+                header_stamp_ns=header_ns,
+            )
+
+        regressing = b"".join(
+            struct.pack("<fffxxxxd", 1.0, 2.0, 3.0, float(stamp))
+            for stamp in (header_ns + 20_000_000, header_ns + 10_000_000)
+        )
+        with self.assertRaisesRegex(InvalidFastLivo2Frame, "monotonic"):
+            absolute_point_time_span_ms(
+                fields=fields,
+                data=regressing,
+                point_step=24,
+                row_step=48,
+                width=2,
+                height=1,
+                is_bigendian=False,
+                header_stamp_ns=header_ns,
+            )
     def test_decode_supports_padded_rows_and_drops_nonfinite_points(self) -> None:
         row_one = struct.pack("<fff", 1.0, 2.0, 3.0) + b"PAD!"
         row_two = struct.pack("<fff", math.nan, 5.0, 6.0) + b"PAD!"

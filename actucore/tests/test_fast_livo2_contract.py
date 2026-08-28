@@ -45,6 +45,9 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertEqual(
             inputs["imu"]["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE"
         )
+        self.assertIn("sensor_frame", inputs["lidar"]["frame_id"])
+        self.assertIn("sensor_frame", inputs["imu"]["frame_id"])
+        self.assertNotIn("livox_frame", str(tool))
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
         self.assertEqual(
@@ -108,6 +111,9 @@ class FastLivo2ContractTest(unittest.TestCase):
         dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
+        adapter = (
+            runtime / "g1_fast_livo2" / "g1_fast_livo2" / "adapter_node.py"
+        ).read_text(encoding="utf-8")
         service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text(
             encoding="utf-8"
         )
@@ -146,6 +152,10 @@ class FastLivo2ContractTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn("assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'", dockerfile)
+        self.assertTrue((runtime / "navigation_lio.yaml").is_file())
+        self.assertIn("/config/navigation_lio.yaml", dockerfile)
+        self.assertNotIn("base_to_sensor_x", adapter)
+        self.assertNotIn("base_to_sensor_pitch", adapter)
         # 基础镜像 digest 由构建脚本按 --jp-version 选择，不放在源码锁中。
         self.assertNotIn("ROS_BASE_IMAGE=", source_lock)
         self.assertNotIn("APT_ROS_MIRROR=", source_lock)

@@ -191,8 +191,9 @@ def navigation_tool_definition(namespace: str) -> dict:
         "multiInstance": False,
         "description": (
             "Unified mapping, localization, semantic waypoint and Nav2 "
-            "planner/controller card. The bundled runtime adapter currently "
-            "targets the G1 ubuntu namespace. FAST-LIVO2 and Nav2 run as child "
+            "planner/controller card. The runtime consumes a robot-independent "
+            "REP-103 sensor frame and Driver-owned static TF. FAST-LIVO2 and "
+            "Nav2 run as child "
             "processes inside the ActuCore container; only bounded velocity "
             "proposals leave the card."
         ),
