@@ -27,12 +27,25 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 只有 Jetson 版 —— 执行模型多数要 GPU（VLA、抓取策略、locomotion），没有 CPU 变体。`navigation` 卡片本身不用 GPU，但和它们共用这一个镜像。
 
 ```bash
+export ACTUCORE_NAVIGATION_BASE_IMAGE='bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:<digest>'
 ./deploy/build_actucore.sh                    # JetPack 5.11（默认）
 ./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1
 ./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
 ```
 
-base（`jetson-base:jp*-torch`）是 Ubuntu 20.04 + 源码 install-space 的 ROS Humble，`ros-humble-*` 的 Debian 包只有 Jammy 版，所以 `navigation` 卡片需要的 Nav2 与 FAST-LIVO2 都在镜像里**从锁定源码编译**：首次构建约 1-3 小时，之后走 layer 缓存。加新卡片时把该卡片的依赖放在它自己的 `RUN` 层，不要预装在基础层里。
+`ACTUCORE_NAVIGATION_BASE_IMAGE` 必须是精确的 `@sha256` 引用。它预编译了
+锁定版本的 FAST-LIVO2、Nav2 和系统依赖；日常 ActuCore 构建只编译仓库自有
+ROS 包和复制应用代码。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
+重新构建并推送基础镜像：
+
+```bash
+./deploy/build_actucore.sh --base --mirror tuna
+```
+
+基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时仍把普通依赖
+放在 `Dockerfile.jetson`；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈
+才进入 `Dockerfile.navigation-base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
+再次走耗时且容易超时的 x86 QEMU 交叉编译。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 

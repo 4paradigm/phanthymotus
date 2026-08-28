@@ -97,9 +97,12 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("start_recording", actions)
         self.assertNotIn("stop_recording", actions)
 
-    def test_runtime_is_locked_inside_the_single_actucore_image(self) -> None:
+    def test_runtime_is_locked_in_navigation_base_and_actucore_image(self) -> None:
         runtime = ACTUCORE_ROOT / "plugins" / "navigation" / "runtime"
         source_lock = (runtime / "fast_livo2-source-lock.env").read_text(
+            encoding="utf-8"
+        )
+        base_dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation-base").read_text(
             encoding="utf-8"
         )
         dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
@@ -156,7 +159,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             "SOPHUS_COMMIT",
         ):
             self.assertIn(f"{variable}=", source_lock)
-            self.assertIn(f"${{{variable}}}", dockerfile)
+            self.assertIn(f"${{{variable}}}", base_dockerfile)
         for removed in (
             "LIVOX_ROS_DRIVER2_REPO",
             "LIVOX_ROS_DRIVER2_COMMIT",
@@ -164,14 +167,17 @@ class FastLivo2ContractTest(unittest.TestCase):
             "LIVOX_SDK2_COMMIT",
         ):
             self.assertNotIn(removed, source_lock)
-            self.assertNotIn(removed, dockerfile)
+            self.assertNotIn(removed, base_dockerfile)
         self.assertTrue((livox_messages / "msg" / "CustomMsg.msg").is_file())
         self.assertTrue((livox_messages / "msg" / "CustomPoint.msg").is_file())
         self.assertIn(
             "COPY actucore/plugins/navigation/runtime/livox_ros_driver2_msgs/",
-            dockerfile,
+            base_dockerfile,
         )
-        self.assertIn('test -z "$(ros2 pkg executables livox_ros_driver2)"', dockerfile)
+        self.assertIn(
+            'test -z "$(ros2 pkg executables livox_ros_driver2)"',
+            base_dockerfile,
+        )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
             "534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b",
@@ -186,28 +192,38 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         # base 是 Focal，packages.ros.org 上没有 humble 二进制，所以镜像必须
         # 把 ROS 的 apt 源整体删掉，ROS 侧全部来自源码编译。
-        self.assertIn("rm -f /etc/apt/sources.list.d/*.list", dockerfile)
+        self.assertIn("rm -f /etc/apt/sources.list.d/*.list", base_dockerfile)
         self.assertIn(
-            "ROS APT source remains; humble has no Focal binaries", dockerfile
+            "ROS APT source remains; humble has no Focal binaries",
+            base_dockerfile,
         )
-        self.assertNotIn("ros-humble-navigation2", dockerfile)
-        self.assertNotIn("ros-humble-nav2-bringup", dockerfile)
-        self.assertIn("GPL-2.0-only AND GPL-3.0-only", dockerfile)
-        self.assertIn("jetson-base:jp${JP_VERSION}-torch", dockerfile)
-        self.assertNotIn("FAST_LIVO2_BASE_IMAGE", dockerfile)
-        self.assertIn("git fetch --depth 1 origin", dockerfile)
-        self.assertIn("git apply --check /tmp/fast-livo2-runtime.patch", dockerfile)
+        self.assertNotIn("ros-humble-navigation2", base_dockerfile)
+        self.assertNotIn("ros-humble-nav2-bringup", base_dockerfile)
+        self.assertIn("GPL-2.0-only AND GPL-3.0-only", base_dockerfile)
+        self.assertIn("jetson-base:jp${JP_VERSION}-torch", base_dockerfile)
+        self.assertNotIn("FAST_LIVO2_BASE_IMAGE", base_dockerfile)
+        self.assertIn("git fetch --depth 1 origin", base_dockerfile)
+        self.assertIn(
+            "git apply --check /tmp/fast-livo2-runtime.patch", base_dockerfile
+        )
         self.assertIn(
             "patch --dry-run --batch --fuzz=0 --ignore-whitespace -p1",
-            dockerfile,
+            base_dockerfile,
         )
-        self.assertIn("git apply --check /tmp/fast-livo2-pcd-save.patch", dockerfile)
-        self.assertIn("--packages-select livox_ros_driver2 vikit_common vikit_ros", dockerfile)
-        self.assertNotIn("/tmp/livox-sdk2", dockerfile)
-        self.assertIn("--packages-select fast_livo", dockerfile)
-        self.assertIn("PCD finalization completed", dockerfile)
+        self.assertIn(
+            "git apply --check /tmp/fast-livo2-pcd-save.patch", base_dockerfile
+        )
+        self.assertIn(
+            "--packages-select livox_ros_driver2 vikit_common vikit_ros",
+            base_dockerfile,
+        )
+        self.assertNotIn("/tmp/livox-sdk2", base_dockerfile)
+        self.assertIn("--packages-select fast_livo", base_dockerfile)
+        self.assertIn("PCD finalization completed", base_dockerfile)
         self.assertIn("g1_fast_livo2", dockerfile)
         self.assertIn("g1_nav2", dockerfile)
+        self.assertNotIn("FAST_LIVO2_REPO", dockerfile)
+        self.assertNotIn("NAVIGATION2_REPO", dockerfile)
         self.assertNotIn("container_name: embodied-perception-fast-livo2", service)
         self.assertNotIn("container_name: embodied-perception-nav2", service)
         self.assertEqual(service.count("container_name:"), 1)
@@ -217,10 +233,12 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         # 录包用 mcap，它由 base（dustynv 的 rosinstall 列表里带）提供，
         # 卡片侧只声明 exec_depend；镜像必须留下可核对的 ROS 包清单。
-        self.assertIn("> /opt/actucore-ros-package-lock.txt", dockerfile)
+        self.assertIn(
+            "> /opt/actucore-ros-package-lock.txt", base_dockerfile
+        )
         self.assertIn(
             "grep -Fqx nav2_bringup /opt/actucore-ros-package-lock.txt",
-            dockerfile,
+            base_dockerfile,
         )
         # 工具名不含下划线，所以 ActuCoreBundle 上游那套朴素的
         # partition("_") 路由就够用了 —— 不需要给宿主打 exact-match 补丁。

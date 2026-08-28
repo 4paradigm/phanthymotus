@@ -359,7 +359,12 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("COPY actucore/utils/", dockerfile)
         self.assertIn("COPY actucore/deploy/     /deploy/", dockerfile)
 
-    def test_unified_image_builds_fast_livo2_and_nav2_from_locked_sources(self):
+    def test_navigation_base_owns_locked_third_party_builds(self):
+        base_dockerfile = (
+            ACTUCORE_ROOT / "Dockerfile.navigation-base"
+        ).read_text(
+            encoding="utf-8"
+        )
         dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
@@ -367,16 +372,27 @@ class NavigationContractTest(unittest.TestCase):
             ACTUCORE_ROOT.parent / "deploy" / "build_actucore.sh"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("jetson-base:jp${JP_VERSION}-torch", dockerfile)
-        self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", dockerfile)
+        self.assertIn("jetson-base:jp${JP_VERSION}-torch", base_dockerfile)
+        self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)
+        self.assertIn("FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE}", dockerfile)
+        self.assertIn("--base", build_script)
+        self.assertIn("@sha256:[0-9a-f]{64}", build_script)
+        self.assertIn(
+            "build the navigation base on native ARM64, not through QEMU",
+            build_script,
+        )
+        self.assertNotIn("git fetch", dockerfile)
+        self.assertNotIn("FAST_LIVO2_REPO", dockerfile)
+        self.assertNotIn("NAVIGATION2_REPO", dockerfile)
+        self.assertIn("g1_fast_livo2 g1_segmented_controller g1_nav2", dockerfile)
         # base 是 Focal，humble 没有对应的 Debian 包 → Nav2 也只能源码编
-        self.assertNotIn("ros-humble-navigation2", dockerfile)
-        self.assertIn("--packages-select", dockerfile)
+        self.assertNotIn("ros-humble-navigation2", base_dockerfile)
+        self.assertIn("--packages-select", base_dockerfile)
         # 找到 nav2 那次 colcon build 的选择列表
         select_blocks = [
             block.split("--cmake-args")[0]
-            for block in dockerfile.split("--packages-select")[1:]
+            for block in base_dockerfile.split("--packages-select")[1:]
         ]
         nav2_select = next(b for b in select_blocks if "nav2_bringup" in b)
         self.assertIn("navigation2", nav2_select)
@@ -397,8 +413,8 @@ class NavigationContractTest(unittest.TestCase):
             "nav2_dwb_controller/dwb_plugins",
             "nav2_dwb_controller/nav2_dwb_controller",
         ):
-            self.assertIn(ignored_dwb, dockerfile)
-        self.assertIn('test -d "${excluded}"', dockerfile)
+            self.assertIn(ignored_dwb, base_dockerfile)
+        self.assertIn('test -d "${excluded}"', base_dockerfile)
         # 刻意不编的那批：会把 ompl / ceres / xtensor / Qt5 拖进来。
         # 只靠 --packages-select 挡不住 colcon 顺 test_depend 去要它们，
         # 所以镜像里还会给这些目录放 COLCON_IGNORE。
@@ -410,8 +426,8 @@ class NavigationContractTest(unittest.TestCase):
             "nav2_regulated_pure_pursuit_controller",
         ):
             self.assertNotIn(excluded, nav2_select)
-            self.assertIn(excluded, dockerfile)
-        self.assertIn('touch "${excluded}/COLCON_IGNORE"', dockerfile)
+            self.assertIn(excluded, base_dockerfile)
+        self.assertIn('touch "${excluded}/COLCON_IGNORE"', base_dockerfile)
         for variable in (
             "GIT_MIRROR_PREFIX",
             "FAST_LIVO2_REPO",

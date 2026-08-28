@@ -186,11 +186,13 @@ planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第�
 
 ## 构建与本地部署验收
 
-统一镜像基于 `jetson-base:jp<JP_VERSION>-torch`（Ubuntu 20.04 / Python 3.8，
-ROS Humble 是 `/opt/ros/humble/install` 下的**源码 install-space**）。构建时按
-完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并应用三份 G1 补丁，再编译
-FAST-LIVO2、Nav2 与两套 ROS adapter。G1 输入使用标准 PointCloud2；镜像只内置
-FAST-LIVO2 编译所需的两条 Livox 消息定义，不再编译未运行的 Livox SDK2/Driver。
+导航基础镜像基于 `jetson-base:jp<JP_VERSION>-torch`（Ubuntu 20.04 / Python
+3.8，ROS Humble 是 `/opt/ros/humble/install` 下的源码 install-space）。基础镜像
+按完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并应用三份 G1 补丁，再编译
+FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过 `@sha256` 固定该基础镜像，只重编
+仓库自有的 `g1_fast_livo2`、`g1_nav2`、`g1_segmented_controller`。G1 输入使用
+标准 PointCloud2；基础镜像只内置 FAST-LIVO2 编译所需的两条 Livox 消息定义，
+不再编译未运行的 Livox SDK2/Driver。
 
 **Nav2 也是源码编译**，不是 apt：base 是 Focal，而 `ros-humble-*` 的 Debian 包
 只有 Jammy 版本，所以 `navigation2` 连同 base 里缺的
@@ -210,12 +212,20 @@ APT、PyPI、Git 源码下载均走国内可达入口（`GIT_MIRROR_PREFIX`，mc
 FetchContent 也经同一镜像重写）。
 
 ```bash
+export ACTUCORE_NAVIGATION_BASE_IMAGE='bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:<digest>'
 ./deploy/build_actucore.sh --mirror tuna
 ```
 
-这是仓库默认的 ActuCore 构建入口，只有 Jetson 一个变体，无需 Navigation 专用
-wrapper，也无需预构建 FAST-LIVO2 或 Nav2 镜像。首次构建约 1-3 小时（源码编译
-Nav2 是主要开销），之后走 layer 缓存。构建成功后脚本输出
+这是仓库默认的 ActuCore 构建入口，只有 Jetson 一个变体，无需 Navigation
+专用 wrapper。FAST-LIVO2/Nav2 不在日常 PR 镜像中重编，避免 ARM64 QEMU 构建
+超过 review 时限。只有锁定源码、补丁或系统依赖变化时，维护者才执行：
+
+```bash
+./deploy/build_actucore.sh --base --mirror tuna
+```
+
+基础镜像必须在原生 ARM64 构建；成功并推送后会输出可写回构建配置的精确
+digest。它不是运行时 service，也不注册 Resource Center。日常构建成功后脚本输出
 `ACTUCORE_BUILD_DURATION_SEC=<秒数>`，用于比较依赖精简前后的真机构建耗时。
 
 G1 临时验收只创建一个容器。将构建输出的精确镜像名传入：
@@ -233,7 +243,8 @@ bash actucore/plugins/navigation/deploy/scripts/deploy-g1.sh
 ```
 
 `deploy-g1.sh` 不实现另一套构建逻辑；它只调用仓库默认的
-`./deploy/build_actucore.sh --mirror tuna`，再调用上述容器生命周期脚本。
+`./deploy/build_actucore.sh --mirror tuna`，因此也需要提前导出精确的
+`ACTUCORE_NAVIGATION_BASE_IMAGE`，再调用上述容器生命周期脚本。
 旧容器只有带 `com.phanthymotus.test-owner=navigation-card`，或迁移前已知值
 `com.phanthymotus.test-owner=nav2-card` 时才会被替换；其他 owner 仍会安全拒绝。
 脚本不发送导航目标或速度指令。
