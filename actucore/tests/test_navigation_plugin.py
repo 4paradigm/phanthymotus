@@ -376,8 +376,15 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE}", dockerfile)
+        self.assertRegex(
+            dockerfile,
+            r"ARG ACTUCORE_NAVIGATION_BASE_IMAGE="
+            r"bj-warehouse\.tencentcloudcr\.com/phanthy-motus/"
+            r"actucore-navigation-base@sha256:[0-9a-f]{64}",
+        )
+        self.assertNotIn("missing-digest", dockerfile)
         self.assertIn("--base", build_script)
-        self.assertIn("@sha256:[0-9a-f]{64}", build_script)
+        self.assertIn("ACTUCORE_NAVIGATION_BASE_IMAGE override", build_script)
         self.assertIn(
             "build the navigation base on native ARM64, not through QEMU",
             build_script,

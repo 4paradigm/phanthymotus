@@ -104,11 +104,13 @@ else
     DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
     IMAGE_NAME="actucore"
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
-    if [[ ! "${ACTUCORE_NAVIGATION_BASE_IMAGE:-}" =~ @sha256:[0-9a-f]{64}$ ]]; then
-        echo "ERROR=set ACTUCORE_NAVIGATION_BASE_IMAGE to an exact @sha256 digest" >&2
-        exit 2
+    if [ -n "${ACTUCORE_NAVIGATION_BASE_IMAGE:-}" ]; then
+        if [[ ! "${ACTUCORE_NAVIGATION_BASE_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE override must use an exact @sha256 digest" >&2
+            exit 2
+        fi
+        BUILD_ARGS+=("ACTUCORE_NAVIGATION_BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}")
     fi
-    BUILD_ARGS+=("ACTUCORE_NAVIGATION_BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}")
 fi
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${TAG}"

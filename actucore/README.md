@@ -27,15 +27,16 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 只有 Jetson 版 —— 执行模型多数要 GPU（VLA、抓取策略、locomotion），没有 CPU 变体。`navigation` 卡片本身不用 GPU，但和它们共用这一个镜像。
 
 ```bash
-export ACTUCORE_NAVIGATION_BASE_IMAGE='bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:<digest>'
 ./deploy/build_actucore.sh                    # JetPack 5.11（默认）
 ./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1
 ./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
 ```
 
-`ACTUCORE_NAVIGATION_BASE_IMAGE` 必须是精确的 `@sha256` 引用。它预编译了
-锁定版本的 FAST-LIVO2、Nav2 和系统依赖；日常 ActuCore 构建只编译仓库自有
-ROS 包和复制应用代码。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
+`Dockerfile.jetson` 默认继承仓库锁定的 `@sha256` 基础镜像，无需额外
+环境变量。它预编译了锁定版本的 FAST-LIVO2、Nav2 和系统依赖；日常
+ActuCore 构建只编译仓库自有 ROS 包和复制应用代码。临时验证另一个基线时
+可显式设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，覆盖值仍必须是精确的
+`@sha256` 引用。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
 重新构建并推送基础镜像：
 
 ```bash

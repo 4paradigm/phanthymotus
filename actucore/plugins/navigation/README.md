@@ -212,13 +212,14 @@ APT、PyPI、Git 源码下载均走国内可达入口（`GIT_MIRROR_PREFIX`，mc
 FetchContent 也经同一镜像重写）。
 
 ```bash
-export ACTUCORE_NAVIGATION_BASE_IMAGE='bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:<digest>'
 ./deploy/build_actucore.sh --mirror tuna
 ```
 
 这是仓库默认的 ActuCore 构建入口，只有 Jetson 一个变体，无需 Navigation
 专用 wrapper。FAST-LIVO2/Nav2 不在日常 PR 镜像中重编，避免 ARM64 QEMU 构建
-超过 review 时限。只有锁定源码、补丁或系统依赖变化时，维护者才执行：
+超过 review 时限。基础镜像 digest 已锁定在 `Dockerfile.jetson`；临时覆盖时可
+显式设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，且必须使用精确 `@sha256` 引用。
+只有锁定源码、补丁或系统依赖变化时，维护者才执行：
 
 ```bash
 ./deploy/build_actucore.sh --base --mirror tuna
@@ -243,8 +244,8 @@ bash actucore/plugins/navigation/deploy/scripts/deploy-g1.sh
 ```
 
 `deploy-g1.sh` 不实现另一套构建逻辑；它只调用仓库默认的
-`./deploy/build_actucore.sh --mirror tuna`，因此也需要提前导出精确的
-`ACTUCORE_NAVIGATION_BASE_IMAGE`，再调用上述容器生命周期脚本。
+`./deploy/build_actucore.sh --mirror tuna`，使用仓库锁定的默认基础镜像，再调用
+上述容器生命周期脚本。
 旧容器只有带 `com.phanthymotus.test-owner=navigation-card`，或迁移前已知值
 `com.phanthymotus.test-owner=nav2-card` 时才会被替换；其他 owner 仍会安全拒绝。
 脚本不发送导航目标或速度指令。
