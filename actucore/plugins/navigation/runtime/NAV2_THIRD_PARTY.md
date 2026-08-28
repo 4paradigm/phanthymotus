@@ -1,7 +1,7 @@
 # 第三方依赖锁
 
-统一 ActuCore 镜像里的 Nav2 **从源码编译**，版本按 `nav2-source-lock.env` 中的
-完整 Git SHA 锁定，构建时在 `actucore/Dockerfile.jetson` 里逐个校验为 40 位 SHA。
+统一 ActuCore 镜像里的 Nav2 **从源码编译**，版本按 `nav2-source.lock` 中的
+完整 Git SHA 锁定，构建时在 `actucore/Dockerfile.navigation-base` 里逐个校验为 40 位 SHA。
 镜像内同时生成 `/opt/actucore-ros-package-lock.txt`（`ros2 pkg list` 快照）供
 部署审计。Nav2 作为同容器子进程运行，不存在独立 Nav2 service 或 companion image。
 
@@ -30,9 +30,11 @@ ActuCore 的 base 是 `jetson-base:jp*-torch`（Ubuntu 20.04 Focal，ROS Humble 
 
 ## 只编卡片会加载的子集
 
-`navigation_launch.py` 起的 controller / planner / smoother / behavior /
-bt_navigator / waypoint_follower / velocity_smoother / lifecycle_manager，加上
+`navigation_launch.py` 起的 controller / planner / behavior /
+bt_navigator / waypoint_follower / lifecycle_manager，加上
 `nav2_params.yaml` 点名的 navfn 和 costmap static/obstacle/inflation 三层。
+`velocity_smoother` 不在 G1 proposal 执行链上，已通过校验 hash 的最小
+launch patch 移除，避免构建、启动和监控一个无消费者的节点。
 `navigation2` 元数据包由 `nav2_bringup` 在编译期显式查找，因此保留。
 DWB 父目录中的 `nav_2d_msgs` / `nav_2d_utils` / `costmap_queue` 仍是 controller
 的编译依赖；只忽略五个 DWB 子包，不忽略整个父目录。

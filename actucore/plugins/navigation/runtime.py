@@ -78,7 +78,12 @@ class NavigationRuntime:
             ),
         ]
 
-    def start(self) -> dict:
+    def start(
+        self,
+        *,
+        namespace: str = "ubuntu",
+        input_topics: dict[str, str] | None = None,
+    ) -> dict:
         with self._lock:
             running = [child for child in self._children if self._is_running(child)]
             if len(running) == len(self._children):
@@ -88,9 +93,16 @@ class NavigationRuntime:
 
             started: list[_Child] = []
             try:
+                launch_arguments = self._launch_arguments(
+                    namespace, input_topics or {}
+                )
                 for child in self._children:
+                    command = [
+                        *child.command,
+                        *launch_arguments.get(child.name, ()),
+                    ]
                     child.process = self._popen_factory(
-                        list(child.command),
+                        command,
                         stdin=subprocess.DEVNULL,
                         stdout=None,
                         stderr=None,
@@ -115,6 +127,59 @@ class NavigationRuntime:
                 self._terminate(started)
                 raise
             return self.info()
+
+    @staticmethod
+    def _launch_arguments(
+        namespace: str, input_topics: dict[str, str]
+    ) -> dict[str, tuple[str, ...]]:
+        root = "/" + str(namespace or "ubuntu").strip("/")
+        navigation = f"{root}/navigation"
+        fast_livo2 = f"{navigation}/fast_livo2"
+        nav2 = f"{navigation}/nav2"
+
+        def topic(port: str, default: str) -> str:
+            return str(input_topics.get(port) or default).strip()
+
+        fast_values = {
+            "lidar_topic": topic("lidar", f"{navigation}/lidar"),
+            "imu_topic": topic("imu", f"{navigation}/imu"),
+            "rgb_topic": topic("rgb", f"{root}/camera/rgb_frame"),
+            "depth_topic": topic(
+                "depth_frame", f"{root}/camera/depth_frame"
+            ),
+            "raw_odom_topic": f"{fast_livo2}/raw/odom",
+            "raw_cloud_topic": f"{fast_livo2}/raw/cloud_registered",
+            "odom_topic": f"{navigation}/odom",
+            "cloud_topic": f"{navigation}/cloud_registered",
+            "obstacle_map_topic": f"{navigation}/obstacle_map",
+            "static_map_topic": f"{navigation}/static_map",
+            "map_view_topic": f"{fast_livo2}/map_view",
+            "diagnostics_topic": f"{fast_livo2}/diagnostics",
+            "reset_topic": f"{fast_livo2}/reset_map",
+            "map_control_topic": f"{fast_livo2}/map_control",
+            "map_control_status_topic": f"{fast_livo2}/map_control_status",
+            "command_topic": f"{fast_livo2}/command",
+            "status_topic": f"{fast_livo2}/status",
+            "collection_status_topic": f"{fast_livo2}/collection_status_raw",
+        }
+        nav2_values = {
+            "odom_topic": f"{navigation}/odom",
+            "obstacle_cloud_topic": f"{navigation}/cloud_registered",
+            "cmd_vel_raw_topic": f"{nav2}/cmd_vel_raw",
+            "velocity_proposal_topic": f"{nav2}/velocity_proposal",
+            "command_topic": f"{nav2}/command",
+            "status_topic": f"{nav2}/status",
+            "segment_status_topic": f"{nav2}/segment_status",
+            "speed_limit_topic": f"{nav2}/speed_limit",
+        }
+        return {
+            "fast_livo2": tuple(
+                f"{key}:={value}" for key, value in fast_values.items()
+            ),
+            "nav2": tuple(
+                f"{key}:={value}" for key, value in nav2_values.items()
+            ),
+        }
 
     def stop(self) -> dict:
         with self._lock:

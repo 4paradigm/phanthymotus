@@ -146,9 +146,24 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         stopped = plugin.dispatch("nav2", {"action": "stop"})
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(backend.stop_calls, 1)
+
+        custom = _bindings(plugin)
+        for index, binding in enumerate(custom):
+            binding["topic"] = f"/robot/navigation/input_{index}"
+        ready = plugin.dispatch(
+            "nav2", {"action": "start", "input_bindings": custom}
+        )
+        self.assertEqual(ready["state"], "ready")
+        self.assertTrue(
+            all(
+                item["connected"]
+                for item in ready["topic_in"]
+                if item.get("required", True)
+            )
+        )
         stopped_again = plugin.dispatch("nav2", {"action": "stop"})
         self.assertEqual(stopped_again["state"], "idle")
-        self.assertEqual(backend.stop_calls, 1)
+        self.assertEqual(backend.stop_calls, 2)
 
     def test_invalid_configuration_and_missing_runtime_fail_closed(self) -> None:
         invalid = Nav2Plugin({"shadow_only": False}, None, backend=ReadyBackend())

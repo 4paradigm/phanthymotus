@@ -1106,13 +1106,6 @@ class PlannerCommandNode(Node):
             endpoint_namespace = endpoint.node_namespace.rstrip("/") or "/"
             if endpoint.node_name == self.get_name() and endpoint_namespace == own_namespace:
                 continue
-            if (
-                endpoint.node_name == "velocity_smoother"
-                and endpoint_namespace == own_namespace
-            ):
-                # nav2_bringup always starts this internal subscriber. Its
-                # output is deliberately outside the G1 proposal path.
-                continue
             foreign_subscribers.append(endpoint)
         if foreign_subscribers:
             names = sorted(

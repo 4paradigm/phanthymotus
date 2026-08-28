@@ -284,17 +284,17 @@ class FastLivo2Plugin:
                 return self._error("invalid_canvas_wiring", "input_topics must be an array")
             selected = {item.strip() for item in topics}
             wired = {port: topic for port, topic in expected.items() if topic in selected}
-        missing = sorted(port for port, topic in expected.items() if wired.get(port) != topic)
+        missing = sorted(port for port in expected if not wired.get(port))
         unknown = sorted(set(wired) - set(expected))
         if missing or unknown:
             details = []
             if missing:
-                details.append("missing_or_wrong=" + ",".join(missing))
+                details.append("missing=" + ",".join(missing))
             if unknown:
                 details.append("unexpected=" + ",".join(unknown))
             return self._error(
                 "invalid_canvas_wiring",
-                "FAST-LIVO2 requires exact LiDAR/IMU bindings (" + "; ".join(details) + ")",
+                "FAST-LIVO2 requires port-aware LiDAR/IMU bindings (" + "; ".join(details) + ")",
             )
         return {"wired_topics": wired}
 
@@ -416,7 +416,7 @@ class FastLivo2Plugin:
                 "instance_id": instance_id or None,
                 "config": dict(self._cfg),
                 "topic_in": [
-                    {**item, "connected": wired.get(item["port"]) == item["topic"]}
+                    {**item, "connected": bool(wired.get(item["port"]))}
                     for item in tool["topic_in"]
                 ],
                 "topic_out": tool["topic_out"],

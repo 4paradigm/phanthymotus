@@ -233,6 +233,16 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(backend.calls[1][0], "configure_collection")
         self.assertFalse(backend.calls[1][1]["enabled"])
 
+        plugin.dispatch("fast_livo2", {"action": "stop"})
+        custom = _bindings(plugin)
+        custom[0]["topic"] = "/robot/lidar"
+        custom[1]["topic"] = "/robot/imu"
+        ready = plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": custom}
+        )
+        self.assertEqual(ready["state"], "ready")
+        self.assertTrue(all(item["connected"] for item in ready["topic_in"]))
+
     def test_canvas_stop_finalizes_mapping_before_backend_release(self) -> None:
         backend = ReadyBackend()
         plugin = FastLivo2Plugin({}, None, backend=backend)

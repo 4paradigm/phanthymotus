@@ -58,7 +58,11 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
         dockerfile = (REPO_ROOT / "agent-core" / "Dockerfile").read_text(
             encoding="utf-8"
         )
-        self.assertIn("ros-humble-nav-msgs", dockerfile)
+        self.assertIn(
+            'from nav_msgs.msg import OccupancyGrid, Odometry, Path',
+            dockerfile,
+        )
+        self.assertNotIn("ros-humble-nav-msgs", dockerfile)
 
     def test_dashboard_registers_odometry_and_path_renderers(self) -> None:
         renderer = (

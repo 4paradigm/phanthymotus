@@ -178,7 +178,7 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 - proposal bridge 直接消费 controller 的 raw 输出，不经过
   `OPEN_LOOP velocity_smoother`。G1 的可执行死区已在 proposal 出口处理；
   再叠加一个以“上次命令”作为反馈的平滑器会推迟首个可执行动作。
-  上游 `nav2_bringup` 仍会启动 smoother，但它的输出不进入 Driver 提案链。
+  构建时用校验过 hash 的最小上游补丁移除该节点，镜像也不编译对应包。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
 - 直线段因实时代价地图进入 `BLOCKED` 后保持零速；下一条全局路径
   到来时丢弃旧线段并重新选择可通直线段，不会在障碍清除或规划绕行后

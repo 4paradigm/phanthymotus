@@ -301,30 +301,22 @@ class Nav2Plugin:
                 and str(binding.get("topic", "")).strip()
             }
             missing = sorted(required_ports - set(bound_topics))
-            wrong = sorted(
-                port
-                for port in required_ports
-                if bound_topics.get(port) != expected[port]
-            )
         else:
             unknown = sorted(unique_topics - set(expected.values()))
             bound_topics = {
                 port: topic for port, topic in expected.items() if topic in unique_topics
             }
             missing = sorted(required_ports - set(bound_topics))
-            wrong = []
 
-        if unknown or missing or wrong:
+        if unknown or missing:
             details = []
             if missing:
                 details.append("missing=" + ",".join(missing))
-            if wrong:
-                details.append("wrong_topic=" + ",".join(wrong))
             if unknown:
                 details.append("unexpected=" + ",".join(unknown))
             return self._error(
                 "invalid_canvas_wiring",
-                "Nav2 requires exact FAST-LIVO2 bindings (" + "; ".join(details) + ")",
+                "Nav2 requires port-aware FAST-LIVO2 bindings (" + "; ".join(details) + ")",
             )
         return {"wired_topics": bound_topics}
 
@@ -419,7 +411,7 @@ class Nav2Plugin:
                 "topic_in": [
                     {
                         **item,
-                        "connected": wired_topics.get(item["port"]) == item["topic"],
+                        "connected": bool(wired_topics.get(item["port"])),
                     }
                     for item in tool["topic_in"]
                 ],

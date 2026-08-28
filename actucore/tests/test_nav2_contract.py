@@ -115,7 +115,7 @@ class Nav2ContractTest(unittest.TestCase):
         service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text(
             encoding="utf-8"
         )
-        source_lock = (runtime_dir / "nav2-source-lock.env").read_text(
+        source_lock = (runtime_dir / "nav2-source.lock").read_text(
             encoding="utf-8"
         )
         goal_schema = json.loads(

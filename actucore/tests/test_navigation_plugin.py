@@ -32,10 +32,12 @@ class FakeRuntime:
         self.fail = fail
         self.started = False
         self.stop_calls = 0
+        self.start_kwargs = None
 
-    def start(self):
+    def start(self, **kwargs):
         if self.fail:
             raise RuntimeError("runtime boom")
+        self.start_kwargs = dict(kwargs)
         self.started = True
         return self.info()
 
@@ -247,11 +249,10 @@ class NavigationContractTest(unittest.TestCase):
         config_fields = list(tool["configSchema"]["properties"])
 
         self.assertEqual(action_params["config"]["params"], config_fields)
-        self.assertEqual(
-            tool["configSchema"]["required"],
-            ["vlm_base_url", "vlm_api_key", "vlm_model"],
-        )
+        self.assertEqual(tool["configSchema"]["required"], [])
         self.assertIn("vlm_api_key", properties)
+        self.assertEqual(properties["vlm_api_key"]["format"], "password")
+        self.assertTrue(properties["vlm_api_key"]["x-sensitive"])
         self.assertIn("planning_request_timeout_sec", properties)
         self.assertIn("obstacle_min_height_m", properties)
         self.assertIn("obstacle_max_height_m", properties)
@@ -319,8 +320,8 @@ class NavigationContractTest(unittest.TestCase):
             self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS=UDPv4", content)
 
         for source_lock in (
-            "nav2-source-lock.env",
-            "fast_livo2-source-lock.env",
+            "nav2-source.lock",
+            "fast_livo2-source.lock",
         ):
             content = (
                 ACTUCORE_ROOT
@@ -372,7 +373,14 @@ class NavigationContractTest(unittest.TestCase):
             ACTUCORE_ROOT.parent / "deploy" / "build_actucore.sh"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("jetson-base:jp${JP_VERSION}-torch", base_dockerfile)
+        self.assertRegex(
+            base_dockerfile,
+            r"ARG ACTUCORE_NAVIGATION_PARENT_IMAGE="
+            r"bj-warehouse\.tencentcloudcr\.com/phanthy-motus/"
+            r"jetson-base:jp511-torch@sha256:[0-9a-f]{64}",
+        )
+        self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
+        self.assertIn("jetson-base:jp61-torch@sha256:", build_script)
         self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE}", dockerfile)
@@ -445,6 +453,7 @@ class NavigationContractTest(unittest.TestCase):
             "SOPHUS_REPO",
             "NAVIGATION2_REPO",
             "NAVIGATION2_COMMIT",
+            "NAVIGATION2_RUNTIME_PATCH_SHA256",
             "BEHAVIORTREE_CPP_COMMIT",
         ):
             self.assertIn(f'"{variable}=${{{variable}}}"', build_script)
@@ -583,6 +592,11 @@ class NavigationPluginTest(unittest.TestCase):
 
         self.assertEqual(result["state"], "ready")
         self.assertTrue(runtime.started)
+        self.assertEqual(runtime.start_kwargs["namespace"], "ubuntu")
+        self.assertEqual(
+            runtime.start_kwargs["input_topics"]["lidar"],
+            "/ubuntu/navigation/lidar",
+        )
         mapping_start = next(args for _, args in mapping.calls if args["action"] == "start")
         self.assertEqual(
             {item["port"] for item in mapping_start["input_bindings"]},
@@ -609,6 +623,26 @@ class NavigationPluginTest(unittest.TestCase):
         stopped = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(runtime.stop_calls, 1)
+
+    def test_custom_external_topics_reach_child_runtime(self):
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(runtime=runtime)
+        bindings = _external_bindings()
+        custom = {
+            "lidar": "/robot/sensors/lidar",
+            "imu": "/robot/sensors/imu",
+            "rgb": "/robot/camera/rgb",
+        }
+        for binding in bindings:
+            binding["topic"] = custom[binding["port"]]
+
+        result = plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": bindings},
+        )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["input_topics"], custom)
 
     def test_collection_reuses_rgb_and_requires_depth_binding(self):
         mapping = CollectionMappingComponent("mapping")
@@ -908,12 +942,30 @@ class NavigationRuntimeTest(unittest.TestCase):
             return self.Process(command)
 
         runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
-        started = runtime.start()
+        started = runtime.start(
+            namespace="robot",
+            input_topics={
+                "lidar": "/sensors/lidar",
+                "imu": "/sensors/imu",
+                "rgb": "/camera/rgb",
+            },
+        )
         self.assertEqual(started["state"], "running")
         self.assertEqual([item[0][2] for item in commands], ["g1_fast_livo2", "g1_nav2"])
         self.assertTrue(all(item[1]["start_new_session"] for item in commands))
         self.assertFalse(started["docker_runtime_dependency"])
         self.assertNotIn("docker", str(commands))
+        fast_command = commands[0][0]
+        nav2_command = commands[1][0]
+        self.assertIn("lidar_topic:=/sensors/lidar", fast_command)
+        self.assertIn("imu_topic:=/sensors/imu", fast_command)
+        self.assertIn("rgb_topic:=/camera/rgb", fast_command)
+        self.assertIn("odom_topic:=/robot/navigation/odom", fast_command)
+        self.assertIn("odom_topic:=/robot/navigation/odom", nav2_command)
+        self.assertIn(
+            "velocity_proposal_topic:=/robot/navigation/nav2/velocity_proposal",
+            nav2_command,
+        )
         with mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
             stopped = runtime.stop()
         self.assertEqual(stopped["state"], "idle")

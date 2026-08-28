@@ -186,7 +186,8 @@ planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第�
 
 ## 构建与本地部署验收
 
-导航基础镜像基于 `jetson-base:jp<JP_VERSION>-torch`（Ubuntu 20.04 / Python
+导航基础镜像按 JetPack 版本选择精确的
+`jetson-base:jp<JP_VERSION>-torch@sha256:<digest>`（Ubuntu 20.04 / Python
 3.8，ROS Humble 是 `/opt/ros/humble/install` 下的源码 install-space）。基础镜像
 按完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并应用三份 G1 补丁，再编译
 FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过 `@sha256` 固定该基础镜像，只重编
@@ -199,8 +200,8 @@ FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过 `@sha256` 固定该基础镜�
 `behaviortree_cpp_v3` / `bond_core` / `diagnostic_updater` / `pcl_ros` /
 `rosbag2_storage_mcap` 一起按锁定 SHA 自编。`navigation2` 钉在 **1.1.20**，与
 迁移前的 `ros-humble-navigation2=1.1.20-1jammy` 是同一个上游 release，运行行为
-不随打包形态变化。运行时加载 planner/controller/smoother/
-behavior/bt_navigator/waypoint_follower/velocity_smoother + navfn、costmap 三层，
+不随打包形态变化。运行时加载 planner/controller/
+behavior/bt_navigator/waypoint_follower + navfn、costmap 三层，
 以及卡片自带的 `g1_segmented_controller`；`nav2_bringup` 编译所需的轻量
 `navigation2` 元数据包也保留。amcl、map_server、DWB、rotation shim、
 smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们已被当前
@@ -252,6 +253,16 @@ bash actucore/plugins/navigation/deploy/scripts/deploy-g1.sh
 
 正式 `actucore/deploy/service.yml` 也只有 `actucore` 一个 service。地图和
 录制目录作为该容器的持久化 volume；不再定义 `fast_livo2` 或 `nav2` service。
+首次部署前由现场操作者创建可写目录：
+
+```bash
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 \
+  /opt/phanthy-motus/data/fast_livo2/maps \
+  /opt/phanthy-motus/data/fast_livo2/recordings
+```
+
+数采默认关闭。两类目录都不会自动清理：单次地图会话仍受 512 MiB 安全上限，
+但总历史和录制数据会持续占用磁盘，操作者需在停卡后自行归档或删除旧目录。
 
 ## 第三方与验收边界
 

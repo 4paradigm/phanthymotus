@@ -626,7 +626,6 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         follow_path = params.split("    FollowPath:\n", 1)[1].split(
             "\n\nlocal_costmap:", 1
         )[0]
-        smoother = params.split("velocity_smoother:\n", 1)[1]
         for expected in (
             "plugin: g1_segmented_controller::SegmentedController",
             "rotate_exit_rad: 0.15",
@@ -659,9 +658,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn('enterStopCheck(Phase::SELECT, "path_updated")', set_plan)
         self.assertIn("nav2_costmap_2d::LETHAL_OBSTACLE", source)
         self.assertNotIn("nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE", source)
-        self.assertIn("max_velocity: [1.0, 0.0, 2.0]", smoother)
-        self.assertIn("min_velocity: [0.0, 0.0, -2.0]", smoother)
-        self.assertIn("odom_topic: /ubuntu/navigation/odom", smoother)
+        self.assertNotIn("velocity_smoother:", params)
 
     def test_speed_limit_and_behavior_tree_reach_planner_bridge(self) -> None:
         command = (
@@ -710,10 +707,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("control_odom_motion_blocker", command)
         self.assertIn("self._on_segment_status", command)
         self.assertIn('payload["execution"] = self._execution_status', command)
-        self.assertIn(
-            '"segment_status_topic": (\n                            "/ubuntu/navigation/nav2/segment_status"',
-            launch,
-        )
+        self.assertIn('"segment_status_topic": segment_status_topic', launch)
+        self.assertIn('"speed_limit_topic"', launch)
         self.assertIn('"sensor_max_age_sec": 0.8', launch)
         self.assertIn('"sensor_source_max_age_sec": 1.0', launch)
         self.assertIn('"control_odom_max_age_sec": 0.60', launch)
@@ -733,10 +728,10 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("final_yaw_tolerance_rad: 0.10", params)
         self.assertIn("controller_frequency: 20.0", params)
         self.assertIn("bt_loop_duration: 50", params)
-        self.assertIn("smoothing_frequency: 5.0", params)
+        self.assertNotIn("smoothing_frequency:", params)
         self.assertIn('self.declare_parameter("proposal_frequency_hz", 5.0)', command)
         self.assertIn('"shadow_topic": cmd_vel_raw_topic', launch)
-        self.assertIn('endpoint.node_name == "velocity_smoother"', command)
+        self.assertNotIn('endpoint.node_name == "velocity_smoother"', command)
         lifecycle_defaults = command.split(
             '"required_lifecycle_nodes",', 1
         )[1].split(")\n", 1)[0]

@@ -24,10 +24,11 @@ def generate_launch_description() -> LaunchDescription:
     odom_topic = LaunchConfiguration("odom_topic")
     obstacle_cloud_topic = LaunchConfiguration("obstacle_cloud_topic")
     cmd_vel_raw_topic = LaunchConfiguration("cmd_vel_raw_topic")
-    cmd_vel_shadow_topic = LaunchConfiguration("cmd_vel_shadow_topic")
     velocity_proposal_topic = LaunchConfiguration("velocity_proposal_topic")
     command_topic = LaunchConfiguration("command_topic")
     status_topic = LaunchConfiguration("status_topic")
+    segment_status_topic = LaunchConfiguration("segment_status_topic")
+    speed_limit_topic = LaunchConfiguration("speed_limit_topic")
 
     return LaunchDescription(
         [
@@ -49,10 +50,6 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/ubuntu/navigation/nav2/cmd_vel_raw",
             ),
             DeclareLaunchArgument(
-                "cmd_vel_shadow_topic",
-                default_value="/ubuntu/navigation/nav2/cmd_vel_shadow",
-            ),
-            DeclareLaunchArgument(
                 "velocity_proposal_topic",
                 default_value="/ubuntu/navigation/nav2/velocity_proposal",
             ),
@@ -64,13 +61,19 @@ def generate_launch_description() -> LaunchDescription:
                 "status_topic",
                 default_value="/ubuntu/navigation/nav2/status",
             ),
+            DeclareLaunchArgument(
+                "segment_status_topic",
+                default_value="/ubuntu/navigation/nav2/segment_status",
+            ),
+            DeclareLaunchArgument(
+                "speed_limit_topic",
+                default_value="/ubuntu/navigation/nav2/speed_limit",
+            ),
             GroupAction(
                 scoped=True,
                 actions=[
                     SetRemap(src="/cmd_vel", dst=cmd_vel_raw_topic),
                     SetRemap(src="cmd_vel", dst=cmd_vel_raw_topic),
-                    SetRemap(src="/cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
-                    SetRemap(src="cmd_vel_smoothed", dst=cmd_vel_shadow_topic),
                     IncludeLaunchDescription(
                         PythonLaunchDescriptionSource(
                             os.path.join(
@@ -95,9 +98,7 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "command_topic": command_topic,
                         "status_topic": status_topic,
-                        "segment_status_topic": (
-                            "/ubuntu/navigation/nav2/segment_status"
-                        ),
+                        "segment_status_topic": segment_status_topic,
                         "action_name": "/navigate_to_pose",
                         # G1 consumes discrete 5 Hz proposals. Feeding the
                         # bridge from the OPEN_LOOP smoother adds a second,
@@ -105,9 +106,7 @@ def generate_launch_description() -> LaunchDescription:
                         # humanoid's effective velocity deadbands.
                         "shadow_topic": cmd_vel_raw_topic,
                         "proposal_topic": velocity_proposal_topic,
-                        "controller_speed_limit_topic": (
-                            "/ubuntu/navigation/nav2/speed_limit"
-                        ),
+                        "controller_speed_limit_topic": speed_limit_topic,
                         "speed_limit_timeout": 3.0,
                         "behavior_tree_path": os.path.join(
                             package_share,

@@ -144,7 +144,10 @@ class NavigationPlugin:
         started: list[tuple[str, object]] = []
         try:
             self._set_mapping_runtime_active(True)
-            runtime_result = self._runtime.start()
+            runtime_result = self._runtime.start(
+                namespace=self._namespace,
+                input_topics=wiring["wired_topics"],
+            )
             if runtime_result.get("state") != "running":
                 raise RuntimeError("navigation child processes did not stay running")
             started.append(("runtime", self._runtime))
@@ -485,23 +488,23 @@ class NavigationPlugin:
                 port: topic for port, topic in expected.items() if topic in selected
             }
         unknown = sorted(set(wired) - set(expected))
-        missing = sorted(port for port in required if wired.get(port) != expected[port])
-        wrong = sorted(
+        missing = sorted(port for port in required if not wired.get(port))
+        empty = sorted(
             port
             for port, topic in wired.items()
-            if port in expected and topic != expected[port]
+            if port in expected and not topic
         )
-        if unknown or missing or wrong:
+        if unknown or missing or empty:
             details = []
             if missing:
                 details.append("missing=" + ",".join(missing))
-            if wrong:
-                details.append("wrong_topic=" + ",".join(wrong))
+            if empty:
+                details.append("empty_topic=" + ",".join(empty))
             if unknown:
                 details.append("unexpected=" + ",".join(unknown))
             return self._error(
                 "invalid_canvas_wiring",
-                "ControlledSemanticSpatial requires exact external bindings ("
+                "ControlledSemanticSpatial requires port-aware external bindings ("
                 + "; ".join(details)
                 + ")",
             )
@@ -550,7 +553,7 @@ class NavigationPlugin:
             "planning": self._planning.dispatch("nav2", {"action": "info"}),
             "semantic": self._semantic.dispatch("vln", {"action": "info"}),
             "topic_in": [
-                {**item, "connected": wired.get(item["port"]) == item["topic"]}
+                {**item, "connected": bool(wired.get(item["port"]))}
                 for item in tool["topic_in"]
             ],
             "topic_out": tool["topic_out"],

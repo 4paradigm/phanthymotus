@@ -57,7 +57,6 @@ BUILD_ARGS=()
 # ── 根据 jp_version 选择 base image  ────────────────────────
 # 表在 build_common.sh 的 jetpack_vars 里，build_perception.sh 共用同一份。
 jetpack_vars "${JP_VERSION}" || exit 1
-BUILD_ARGS+=("JP_VERSION=${JP_ARG}")
 
 # Dockerfile.jetson 基于 L4T base image —— 只有 arm64
 CPU_ARCH="arm64"
@@ -72,9 +71,14 @@ if ${BUILD_BASE}; then
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
     NAV_RUNTIME_DIR="${REPO_ROOT}/actucore/plugins/navigation/runtime"
-    source "${NAV_RUNTIME_DIR}/fast_livo2-source-lock.env"
-    source "${NAV_RUNTIME_DIR}/nav2-source-lock.env"
+    source "${NAV_RUNTIME_DIR}/fast_livo2-source.lock"
+    source "${NAV_RUNTIME_DIR}/nav2-source.lock"
+    case "${JP_VERSION}" in
+        5.11) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
+        6.1) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
+    esac
     BUILD_ARGS+=(
+        "ACTUCORE_NAVIGATION_PARENT_IMAGE=${NAVIGATION_PARENT_IMAGE}"
         "GIT_MIRROR_PREFIX=${GIT_MIRROR_PREFIX}"
         "FAST_LIVO2_REPO=${FAST_LIVO2_REPO}"
         "FAST_LIVO2_COMMIT=${FAST_LIVO2_COMMIT}"
@@ -87,6 +91,7 @@ if ${BUILD_BASE}; then
         "SOPHUS_COMMIT=${SOPHUS_COMMIT}"
         "NAVIGATION2_REPO=${NAVIGATION2_REPO}"
         "NAVIGATION2_COMMIT=${NAVIGATION2_COMMIT}"
+        "NAVIGATION2_RUNTIME_PATCH_SHA256=${NAVIGATION2_RUNTIME_PATCH_SHA256}"
         "BEHAVIORTREE_CPP_REPO=${BEHAVIORTREE_CPP_REPO}"
         "BEHAVIORTREE_CPP_COMMIT=${BEHAVIORTREE_CPP_COMMIT}"
         "ANGLES_REPO=${ANGLES_REPO}"

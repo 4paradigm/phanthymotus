@@ -11,7 +11,9 @@
 ## VLM 配置
 
 统一卡片配置字段为 `vlm_base_url`、`vlm_api_key`、`vlm_model` 和
-`vlm_timeout_sec`。API key 无源码或 YAML 默认值，不出现在 action 回执、状态
+`vlm_timeout_sec`。这些字段对建图和坐标导航均为可选；未配置 API key
+时卡片仍可启动，但 `capture` 和语义 `navigate` 会明确返回
+`vlm_not_configured`。API key 只保存在进程内，不出现在 action 回执、状态
 或日志中。`capture` 会把相机 JPEG 发送到所配置的外部 VLM 服务。
 
 ## 内部数据边

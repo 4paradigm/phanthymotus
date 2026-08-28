@@ -21,8 +21,8 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG JP_VERSION=511
-FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
+ARG ACTUCORE_NAVIGATION_PARENT_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6
+FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
 
 # colcon 的 source / bash 数组都要 bash，pipefail 保证管道里的失败不被吞掉
@@ -31,7 +31,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # 并行度：Orin 8 核 16G 上 -j4 是不 OOM 的上限（nav2_costmap_2d 最吃内存）
 ARG BUILD_JOBS=4
 
-# ── 源码锁（由 deploy/build_actucore.sh 从 *-source-lock.env 传入）────
+# ── 源码锁（由 deploy/build_actucore.sh 从 *-source.lock 传入）───────
 ARG GIT_MIRROR_PREFIX=https://ghfast.top/
 ARG FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git
 ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
@@ -44,6 +44,7 @@ ARG SOPHUS_REPO=https://github.com/strasdat/Sophus.git
 ARG SOPHUS_COMMIT=de0f8d3d92bf776271e16de56d1803940ebccab9
 ARG NAVIGATION2_REPO=https://github.com/ros-navigation/navigation2.git
 ARG NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db
+ARG NAVIGATION2_RUNTIME_PATCH_SHA256=ccf9b2d64ef9332aa1d3b9792c2ef1ae70cde87f3ef7c71ed467a8d5b4f06383
 ARG BEHAVIORTREE_CPP_REPO=https://github.com/BehaviorTree/BehaviorTree.CPP.git
 ARG BEHAVIORTREE_CPP_COMMIT=9d624dc7797b4752e5f8616793ffcee4b540a185
 ARG ANGLES_REPO=https://github.com/ros/angles.git
@@ -346,18 +347,28 @@ RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
 
 # ── Nav2（最重的一层，放最后编）─────────────────────────────────────
 # 只编卡片真正会加载的那一档：navigation_launch.py 起的 planner/controller/
-# smoother/behavior/bt_navigator/waypoint_follower/velocity_smoother +
+# behavior/bt_navigator/waypoint_follower +
 # nav2_params.yaml 里点名的 navfn / costmap 三层。
 # 用不到的包直接放 COLCON_IGNORE：光靠 --packages-select 挡不住 colcon 顺着
 # test_depend 去要它们（nav2_rotation_shim_controller test-depend 了 RPP），
 # 而它们会把 ompl、ceres、xtensor、Qt5 拖进镜像。
 WORKDIR /opt/nav2_ws/src
+COPY actucore/plugins/navigation/runtime/patches/nav2-without-velocity-smoother.patch \
+     /tmp/nav2-without-velocity-smoother.patch
 RUN git init navigation2 && \
     cd navigation2 && \
     git remote add origin "${GIT_MIRROR_PREFIX}${NAVIGATION2_REPO}" && \
     git fetch --depth 1 origin "${NAVIGATION2_COMMIT}" && \
     git checkout --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "${NAVIGATION2_COMMIT}" && \
+    [[ "${NAVIGATION2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    printf '%s  %s\n' \
+      "${NAVIGATION2_RUNTIME_PATCH_SHA256}" \
+      /tmp/nav2-without-velocity-smoother.patch | sha256sum -c - && \
+    patch --dry-run --batch --fuzz=0 -p1 \
+      -i /tmp/nav2-without-velocity-smoother.patch && \
+    patch --batch --fuzz=0 -p1 \
+      -i /tmp/nav2-without-velocity-smoother.patch && \
     for excluded in \
         nav2_amcl \
         nav2_collision_monitor \
@@ -373,6 +384,7 @@ RUN git init navigation2 && \
         nav2_smac_planner \
         nav2_system_tests \
         nav2_theta_star_planner \
+        nav2_velocity_smoother \
         nav2_dwb_controller/dwb_core \
         nav2_dwb_controller/dwb_critics \
         nav2_dwb_controller/dwb_msgs \
@@ -402,7 +414,6 @@ RUN source /opt/ros/humble/install/setup.bash && \
         nav2_planner \
         nav2_navfn_planner \
         nav2_smoother \
-        nav2_velocity_smoother \
         nav2_waypoint_follower \
         nav2_lifecycle_manager \
         nav_2d_msgs \
@@ -428,7 +439,6 @@ RUN source /opt/ros/humble/install/setup.bash && \
         nav2_behaviors:behavior_server \
         nav2_bt_navigator:bt_navigator \
         nav2_waypoint_follower:waypoint_follower \
-        nav2_velocity_smoother:velocity_smoother \
         nav2_lifecycle_manager:lifecycle_manager; do \
       package="${entry%%:*}"; \
       executable="${entry##*:}"; \

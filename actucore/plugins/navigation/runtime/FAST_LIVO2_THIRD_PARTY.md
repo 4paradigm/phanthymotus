@@ -1,9 +1,8 @@
 # FAST-LIVO2 第三方依赖锁
 
-统一 ActuCore 镜像基于 `jetson-base:jp<JP_VERSION>-torch`，不再继承或拉取
-`phanthy-fast-livo2`。`fast_livo2-source-lock.env` 锁定 3 个上游仓库 revision
-和三个 G1 补丁哈希（基础镜像不在锁文件里：它由 `--jp-version` 选择，容器的
-JetPack 用户态要和宿主 L4T 对齐）；`actucore/Dockerfile.jetson` 在同一构建中
+统一 ActuCore 镜像基于按 JetPack 版本锁定 digest 的 `jetson-base`，不再继承或拉取
+`phanthy-fast-livo2`。`fast_livo2-source.lock` 锁定 3 个上游仓库 revision
+和三个 G1 补丁哈希；`actucore/Dockerfile.navigation-base` 在同一构建中
 校验、应用补丁并从源码编译完整 FAST-LIVO2 工作区。
 
 - FAST-LIVO2 ROS 2/MID360 fork:

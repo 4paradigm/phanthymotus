@@ -77,6 +77,7 @@ _MANIFEST = {
                 "title": "VLM API Key",
                 "description": "Credential for the configured VLM service",
                 "format": "password",
+                "x-sensitive": True,
                 "scope": "shared",
             },
             "model": {
@@ -96,7 +97,7 @@ _MANIFEST = {
                 "scope": "shared",
             },
         },
-        "required": ["base_url", "api_key", "model"],
+        "required": [],
     },
     "topic_in": [
         {

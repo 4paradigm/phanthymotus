@@ -34,7 +34,7 @@ plugins:
       max_yaw_rps: 0.3
       proposal_ttl_ms: 250
     semantic:
-      camera_topic: "/ubuntu/camera/rgb"
+      camera_topic: "/ubuntu/camera/rgb_frame"
       odometry_topic: "/ubuntu/navigation/odom"
       fast_livo2_status_topic: "/ubuntu/navigation/fast_livo2/status"
       goal_topic: "/ubuntu/navigation/goal_pose"
@@ -50,3 +50,8 @@ plugins:
       match_threshold: 0.55
       navigation_speed: 0.30
       auto_start_on_action: true
+      vlm:
+        base_url: "https://ark.cn-beijing.volces.com/api/v3"
+        api_key: ""
+        model: "doubao-seed-2-1-pro-260628"
+        timeout_sec: 18.0

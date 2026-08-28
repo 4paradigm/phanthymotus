@@ -1,9 +1,8 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG ROS_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
-ARG PYPI_MIRROR APT_MIRROR ROS_MIRROR
+ARG PYPI_MIRROR APT_MIRROR
 
 # Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault).
 # --retry survives the transient TLS drops this network path has hit more than
@@ -13,22 +12,15 @@ ARG PYPI_MIRROR APT_MIRROR ROS_MIRROR
 # cyclonedds) rather than Tsinghua's mirror, which was the more frequent
 # offender. The compose plugin is proxied through ghfast.top (same GitHub
 # mirror already used in perception/Dockerfile.jetson).
-# ros-humble-nav-msgs is needed by the navigation canvas renderers (odom / path
-# / costmap), which decode nav_msgs on the Agent Core side.
 ARG DOCKER_CLI_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/docker-27.5.1-aarch64.tgz
 RUN if [ -n "${APT_MIRROR}" ]; then \
         find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
             -exec sed -E -i \
             "s#https?://(mirrors\.tencentyun\.com|ports\.ubuntu\.com)/ubuntu-ports/?#https://${APT_MIRROR}/ubuntu-ports/#g" {} +; \
     fi && \
-    if [ -n "${ROS_MIRROR}" ]; then \
-        find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
-            -exec sed -E -i \
-            "s#https?://packages\.ros\.org/ros2/ubuntu#${ROS_MIRROR}#g" {} +; \
-    fi && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip python3-dbus ffmpeg curl ros-humble-nav-msgs && \
+        python3-pip python3-dbus ffmpeg curl && \
     curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --retry-max-time 60 \
         ${DOCKER_CLI_URL} \
         | tar -xz --strip-components=1 -C /usr/local/bin/ docker/docker && \
@@ -52,7 +44,8 @@ RUN uv lock && uv sync --no-dev --no-install-project
 RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/opt/ros/humble/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
-    echo "/usr/lib/python3/dist-packages" >> .venv/lib/python3.10/site-packages/system.pth
+    echo "/usr/lib/python3/dist-packages" >> .venv/lib/python3.10/site-packages/system.pth && \
+    .venv/bin/python -c "from nav_msgs.msg import OccupancyGrid, Odometry, Path"
 
 COPY web/      /work/web/
 COPY src/      /work/src/

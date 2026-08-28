@@ -77,7 +77,7 @@ def _config_properties() -> dict:
 NAVIGATION_CONFIG_SCHEMA = {
     "type": "object",
     "properties": _config_properties(),
-    "required": ["vlm_base_url", "vlm_api_key", "vlm_model"],
+    "required": [],
     "additionalProperties": False,
 }
 

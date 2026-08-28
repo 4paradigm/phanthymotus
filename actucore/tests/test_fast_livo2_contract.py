@@ -99,7 +99,7 @@ class FastLivo2ContractTest(unittest.TestCase):
 
     def test_runtime_is_locked_in_navigation_base_and_actucore_image(self) -> None:
         runtime = ACTUCORE_ROOT / "plugins" / "navigation" / "runtime"
-        source_lock = (runtime / "fast_livo2-source-lock.env").read_text(
+        source_lock = (runtime / "fast_livo2-source.lock").read_text(
             encoding="utf-8"
         )
         base_dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation-base").read_text(
@@ -146,8 +146,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn("assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'", dockerfile)
-        # 基础镜像不再由锁文件钉住 digest：ActuCore 走 jetson-base，
-        # 具体标签由 --jp-version 选（容器的 JetPack 用户态要和宿主 L4T 对齐）。
+        # 基础镜像 digest 由构建脚本按 --jp-version 选择，不放在源码锁中。
         self.assertNotIn("ROS_BASE_IMAGE=", source_lock)
         self.assertNotIn("APT_ROS_MIRROR=", source_lock)
         for variable in (
@@ -200,7 +199,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("ros-humble-navigation2", base_dockerfile)
         self.assertNotIn("ros-humble-nav2-bringup", base_dockerfile)
         self.assertIn("GPL-2.0-only AND GPL-3.0-only", base_dockerfile)
-        self.assertIn("jetson-base:jp${JP_VERSION}-torch", base_dockerfile)
+        self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE", base_dockerfile)
         self.assertIn("git fetch --depth 1 origin", base_dockerfile)
         self.assertIn(
@@ -274,7 +273,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         adapter = (runtime_package / "adapter_node.py").read_text(encoding="utf-8")
         self.assertIn("_MAP_NAME_RE.fullmatch(map_name)", supervisor)
         self.assertIn("self._algorithm_command(save_pcd=False)", supervisor)
-        self.assertIn('"/livox/lidar:=/ubuntu/navigation/lidar"', supervisor)
+        self.assertIn(
+            'f"/livox/lidar:={self.get_parameter(\'lidar_topic\').value}"',
+            supervisor,
+        )
         self.assertNotIn("lidar_fast_livo", supervisor)
         self.assertIn('self._adapter_execute("unload_map", {})', supervisor)
         self.assertIn("self._runtime_lifecycle_lock = threading.Lock()", supervisor)

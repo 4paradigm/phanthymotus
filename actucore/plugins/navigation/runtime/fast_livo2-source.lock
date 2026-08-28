@@ -2,11 +2,6 @@
 #
 # Every checkout below is an immutable full Git SHA; the G1 patches are
 # additionally verified by sha256 before they are applied.
-#
-# The base image is NOT pinned here any more.  ActuCore builds on
-# jetson-base:jp${JP_VERSION}-torch, selected by --jp-version, because the
-# container's JetPack userspace has to match the L4T version of the G1 host it
-# runs on — a digest pin cannot express that choice.  See actucore/Dockerfile.jetson.
 GIT_MIRROR_PREFIX=https://ghfast.top/
 FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git
 FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea

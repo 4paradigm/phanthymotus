@@ -238,18 +238,3 @@ waypoint_follower:
       plugin: nav2_waypoint_follower::WaitAtWaypoint
       enabled: true
       waypoint_pause_duration: 200
-
-velocity_smoother:
-  ros__parameters:
-    use_sim_time: false
-    smoothing_frequency: 5.0
-    scale_velocities: false
-    feedback: OPEN_LOOP
-    max_velocity: [1.0, 0.0, 2.0]
-    min_velocity: [0.0, 0.0, -2.0]
-    max_accel: [0.30, 0.0, 0.40]
-    max_decel: [-0.30, 0.0, -0.40]
-    odom_topic: /ubuntu/navigation/odom
-    odom_duration: 0.2
-    deadband_velocity: [0.0, 0.0, 0.0]
-    velocity_timeout: 0.5

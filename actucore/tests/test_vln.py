@@ -191,8 +191,9 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("config", schema["properties"]["action"]["enum"])
         self.assertNotIn("config", schema["x-action-params"])
         self.assertEqual(properties["api_key"]["format"], "password")
+        self.assertTrue(properties["api_key"]["x-sensitive"])
         self.assertEqual(properties["api_key"]["scope"], "shared")
-        self.assertIn("api_key", config_schema["required"])
+        self.assertEqual(config_schema["required"], [])
         self.assertNotIn("default", properties["api_key"])
 
     def test_ros_contract_is_explicit(self):

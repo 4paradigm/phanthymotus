@@ -68,6 +68,18 @@ class FastLivo2Supervisor(Node):
         self.declare_parameter("reset_topic", "/ubuntu/navigation/fast_livo2/reset_map")
         self.declare_parameter("map_control_topic", "/ubuntu/navigation/fast_livo2/map_control")
         self.declare_parameter("map_control_status_topic", "/ubuntu/navigation/fast_livo2/map_control_status")
+        self.declare_parameter("lidar_topic", "/ubuntu/navigation/lidar")
+        self.declare_parameter("imu_topic", "/ubuntu/navigation/imu")
+        self.declare_parameter("rgb_topic", "/ubuntu/camera/rgb_frame")
+        self.declare_parameter("depth_topic", "/ubuntu/camera/depth_frame")
+        self.declare_parameter("odom_topic", "/ubuntu/navigation/odom")
+        self.declare_parameter(
+            "raw_odom_topic", "/ubuntu/navigation/fast_livo2/raw/odom"
+        )
+        self.declare_parameter(
+            "raw_cloud_topic",
+            "/ubuntu/navigation/fast_livo2/raw/cloud_registered",
+        )
         self.declare_parameter("config_path", "/config/g1_lio.yaml")
         self.declare_parameter("map_root", "/opt/fast_livo_ws/src/fast_livo/Log/pcd")
         self.declare_parameter("pcd_save_interval", 600)
@@ -98,6 +110,13 @@ class FastLivo2Supervisor(Node):
         self._collection_last_receipt: dict | None = None
         self._collection_health = CollectionHealth()
         self._collection_sampler = CollectionSampler()
+        self._collection_input_topics = {
+            "lidar": str(self.get_parameter("lidar_topic").value),
+            "imu": str(self.get_parameter("imu_topic").value),
+            "rgb_frame": str(self.get_parameter("rgb_topic").value),
+            "depth_frame": str(self.get_parameter("depth_topic").value),
+            "odom": str(self.get_parameter("odom_topic").value),
+        }
         self._condition = threading.Condition(self._lock)
         self._map_root = Path(str(self.get_parameter("map_root").value))
         self._map_root.mkdir(parents=True, exist_ok=True)
@@ -174,7 +193,7 @@ class FastLivo2Supervisor(Node):
             subscriptions.append(
                 self.create_subscription(
                     message_types[port],
-                    item["topic"],
+                    self._collection_input_topics[port],
                     lambda message, source_port=port: self._on_collection_sample(
                         source_port, message
                     ),
@@ -1471,11 +1490,11 @@ class FastLivo2Supervisor(Node):
             "-p", f"pcd_save.interval:={interval}",
             "-p", "pcd_save.type:=0",
             "--log-level", "warn",
-            "-r", "/livox/lidar:=/ubuntu/navigation/lidar",
-            "-r", "/livox/imu:=/ubuntu/navigation/imu",
+            "-r", f"/livox/lidar:={self.get_parameter('lidar_topic').value}",
+            "-r", f"/livox/imu:={self.get_parameter('imu_topic').value}",
             "-r", "/left_camera/image:=/ubuntu/navigation/camera_disabled",
-            "-r", "/cloud_registered:=/ubuntu/navigation/fast_livo2/raw/cloud_registered",
-            "-r", "/aft_mapped_to_init:=/ubuntu/navigation/fast_livo2/raw/odom",
+            "-r", f"/cloud_registered:={self.get_parameter('raw_cloud_topic').value}",
+            "-r", f"/aft_mapped_to_init:={self.get_parameter('raw_odom_topic').value}",
             "-r", "/path:=/ubuntu/navigation/fast_livo2/raw/path",
             "-r", "/Laser_map:=/ubuntu/navigation/fast_livo2/raw/laser_map",
             "-r", "/LIVO2/imu_propagate:=/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom",
