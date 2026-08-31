@@ -167,6 +167,22 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routes[0].action, "navigate_to_pose")
         self.assertEqual(routes[0].required_fields, ("x", "y", "yaw"))
 
+    def test_hot_path_logs_are_sampled_and_escaped(self) -> None:
+        runtime = topic_actions.RouteRuntime(
+            route=topic_actions.build_routes(_layout())[0]
+        )
+        with patch("builtins.print") as log:
+            for _ in range(101):
+                topic_actions._log_hot_path(runtime, "rejected", "bad\n\x1b[31m")
+
+        lines = [call.args[0] for call in log.call_args_list]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("count=1", lines[0])
+        self.assertIn("count=100", lines[1])
+        self.assertIn(r"bad\n\x1b[31m", lines[0])
+        self.assertNotIn("\n", lines[0])
+        self.assertNotIn("\x1b", lines[0])
+
     def test_unified_navigation_contract_builds_goal_route(self) -> None:
         from plugins.navigation.contract import navigation_tool_definition
 
@@ -209,7 +225,9 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(topic_actions.ros2_bridge, "subscribe", side_effect=subscribe), patch.object(
             topic_actions.ros2_bridge, "unsubscribe"
-        ) as unsubscribe, patch.dict(sys.modules, {"api.mcp_manage": fake_api}):
+        ) as unsubscribe, patch.dict(sys.modules, {"api.mcp_manage": fake_api}), patch(
+            "builtins.print"
+        ) as log:
             await self.manager.start(_layout())
             callback = next(iter(callbacks.values()))
             payload = {
@@ -244,6 +262,9 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stats["received"], 2)
             self.assertEqual(stats["dispatched"], 1)
             self.assertEqual(stats["duplicates"], 1)
+            self.assertNotIn(
+                "goal-001", "\n".join(call.args[0] for call in log.call_args_list)
+            )
 
             await self.manager.stop()
             unsubscribe.assert_called_once_with("__topic_action__#nav2-card#goal_pose")

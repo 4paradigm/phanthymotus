@@ -89,13 +89,26 @@ RUN for revision in \
 # packages.ros.org 上没有对应的 humble 二进制包，留着只会让 apt-get update
 # 因为过期 key 而失败。ROS 侧的一切都来自源码编译。
 RUN if [ -n "${APT_MIRROR}" ]; then \
-        sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
+        sed -E -i \
+          "s|https?://archive\\.ubuntu\\.com/ubuntu|https://${APT_MIRROR}/ubuntu|g; \
+           s|https?://ports\\.ubuntu\\.com/ubuntu-ports|https://${APT_MIRROR}/ubuntu-ports|g" \
+          /etc/apt/sources.list; \
     fi && \
-    rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    sed -i '\|packages\.ros\.org/ros2/ubuntu|d' /etc/apt/sources.list && \
+    for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+      [ -f "${source}" ] || continue; \
+      if grep -qE 'packages\.ros\.org/ros2/ubuntu' "${source}"; then \
+        rm -f "${source}"; \
+      fi; \
+    done && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* && \
     if grep -R -E 'packages\.ros\.org/ros2/ubuntu' \
          /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then \
       echo 'ROS APT source remains; humble has no Focal binaries' >&2; exit 1; \
+    fi && \
+    if grep -R -E 'trusted=yes' \
+         /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then \
+      echo 'unauthenticated APT source is not allowed' >&2; exit 1; \
     fi
 
 # ── 系统依赖 ────────────────────────────────────────────────────────
@@ -103,8 +116,8 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
 # Nav2:       boost-program-options
 # OpenCV 特意不装：base 里已经有 L4T 那份带 CUDA 的 4.5，apt 的 4.2 会抢赢
 # find_package 并和 python cv2 对不上；只在确实缺的时候才补。
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
       build-essential \
       cmake \
       git \
@@ -114,7 +127,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
       libfmt-dev \
       libpcl-dev && \
     { pkg-config --exists opencv4 || \
-      apt-get install -y --no-install-recommends --allow-unauthenticated libopencv-dev; } && \
+      apt-get install -y --no-install-recommends libopencv-dev; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # ── base 之外缺的 ROS 依赖 ──────────────────────────────────────────

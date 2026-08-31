@@ -446,6 +446,12 @@ class NavigationContractTest(unittest.TestCase):
             r"jetson-base:jp511-torch@sha256:[0-9a-f]{64}",
         )
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
+        self.assertNotIn("AllowInsecureRepositories", base_dockerfile)
+        self.assertNotIn("--allow-unauthenticated", base_dockerfile)
+        self.assertNotIn(
+            "rm -f /etc/apt/sources.list.d/*.list", base_dockerfile
+        )
+        self.assertIn("unauthenticated APT source is not allowed", base_dockerfile)
         self.assertIn("ARG GIT_MIRROR_PREFIX=", base_dockerfile)
         self.assertNotIn(
             "ARG GIT_MIRROR_PREFIX=https://ghfast.top/", base_dockerfile

@@ -225,7 +225,9 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 镜像里**没有** torch / CLIP / YOLO / ASR 依赖 —— 卡片自身只用标准库 + ROS
 消息包，语义航点是 HTTP 调远端 VLM。那些模型依赖属于 perception。G1 实测的
 上游 ActuCore 镜像为 `13,786,589,503` bytes，加入导航栈后的镜像为
-`14,674,555,445` bytes，增加 `887,965,942` bytes（约 `6.4%`）。稳定且昂贵的
+`14,665,479,002` bytes，增加 `878,889,499` bytes（约 `0.82 GiB` / `6.38%`）。
+该数据由上海 G1 上的 `docker image inspect --format '{{.Size}}'` 实测；增加的是
+磁盘、首次拉取和部署传输成本，不代表同等幅度的运行时 CPU/内存增长。稳定且昂贵的
 第三方依赖因此预编译进可复用、digest-pinned 的 navigation base，日常 PR 构建
 不再重复编译它们。
 该固定 base 同时提供 `colcon` / `empy` 和 PyYAML；日常镜像构建会实际执行

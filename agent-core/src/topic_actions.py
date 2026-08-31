@@ -21,6 +21,7 @@ import ros2_bridge
 
 
 _MAX_SEEN_IDS = 1024
+_LOG_SAMPLE_EVERY = 100
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,23 @@ class RouteRuntime:
     invalid: int = 0
     errors: int = 0
     last_error: str | None = None
+    log_outcome: str | None = None
+    log_occurrence: int = 0
+
+
+def _log_hot_path(runtime: RouteRuntime, outcome: str, detail: object) -> None:
+    if outcome != runtime.log_outcome:
+        runtime.log_outcome = outcome
+        runtime.log_occurrence = 1
+    else:
+        runtime.log_occurrence += 1
+    if runtime.log_occurrence != 1 and runtime.log_occurrence % _LOG_SAMPLE_EVERY:
+        return
+    safe_detail = str(detail).encode("unicode_escape").decode("ascii")[:200]
+    print(
+        f"[topic-actions] {outcome} count={runtime.log_occurrence}: "
+        f"{safe_detail}"
+    )
 
 
 def _tool_definition(mcp_id: str, tool_name: str) -> dict[str, Any] | None:
@@ -236,7 +254,7 @@ class TopicActionManager:
             except (UnicodeDecodeError, ValueError, json.JSONDecodeError, jsonschema.ValidationError) as exc:
                 runtime.invalid += 1
                 runtime.last_error = str(exc)
-                print(f"[topic-actions] rejected {runtime.route.topic}: {exc}")
+                _log_hot_path(runtime, "rejected", exc)
                 return
 
             if message_id in runtime.seen_ids:
@@ -264,17 +282,16 @@ class TopicActionManager:
                         )
                     runtime.dispatched += 1
                     runtime.last_error = None
-                    print(
-                        f"[topic-actions] dispatched id={message_id} "
+                    _log_hot_path(
+                        runtime,
+                        "dispatched",
                         f"target={runtime.route.mcp_id}/{runtime.route.tool_name}:"
-                        f"{runtime.route.action}"
+                        f"{runtime.route.action}",
                     )
                 except Exception as exc:
                     runtime.errors += 1
                     runtime.last_error = str(exc)
-                    print(
-                        f"[topic-actions] dispatch failed id={message_id}: {exc}"
-                    )
+                    _log_hot_path(runtime, "dispatch_failed", exc)
         finally:
             if task is not None:
                 self._inflight.discard(task)
