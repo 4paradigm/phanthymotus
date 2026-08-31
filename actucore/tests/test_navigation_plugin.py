@@ -958,7 +958,7 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertFalse(any(args["action"] == "stop" for _, args in planning.calls))
         self.assertFalse(any(args["action"] == "stop" for _, args in semantic.calls))
 
-    def test_unified_config_rejects_unknown_and_partial_vlm_fields(self):
+    def test_unified_config_rejects_unknown_and_forwards_partial_vlm_fields(self):
         plugin = self.make_plugin()
 
         unknown = plugin.dispatch(
@@ -972,10 +972,13 @@ class NavigationPluginTest(unittest.TestCase):
             "ControlledSemanticSpatial",
             {"action": "config", "vlm_base_url": "https://vlm.example.test"},
         )
-        self.assertEqual(partial["error_code"], "invalid_config")
-        self.assertIn("vlm_api_key", partial["error"])
-        self.assertFalse(
-            any(args["action"] == "config" for _, args in plugin._semantic.calls)
+        self.assertEqual(partial["state"], "configured")
+        self.assertIn(
+            (
+                "vln",
+                {"action": "config", "base_url": "https://vlm.example.test"},
+            ),
+            plugin._semantic.calls,
         )
 
         configured = plugin.dispatch(

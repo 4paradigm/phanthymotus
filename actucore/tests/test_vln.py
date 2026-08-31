@@ -235,6 +235,17 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(info["vlm_timeout_sec"], 12.0)
         self.assertNotIn(secret, json.dumps(info))
 
+        partial = plugin.dispatch(
+            "vln",
+            {"action": "config", "timeout_sec": 19, "api_key": "****"},
+        )
+        self.assertTrue(partial["ok"])
+        self.assertTrue(partial["vlm_api_key_configured"])
+        self.assertEqual(partial["vlm_base_url"], "https://vlm.example.test/v1")
+        self.assertEqual(partial["vlm_model"], "vision-model")
+        self.assertEqual(partial["vlm_timeout_sec"], 19.0)
+        self.assertNotIn(secret, json.dumps(partial))
+
     def test_invalid_gear_config_preserves_previous_vlm_client(self):
         invalid_configs = [
             {

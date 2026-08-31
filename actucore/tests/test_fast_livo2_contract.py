@@ -199,9 +199,12 @@ class FastLivo2ContractTest(unittest.TestCase):
             hashlib.sha256(flush_patch.read_bytes()).hexdigest(),
             "1484bfba11408e3efd87360a63fef1787f2b2ceaf75e8d8abdd5a17e3474beeb",
         )
-        # base 是 Focal，packages.ros.org 上没有 humble 二进制，所以镜像必须
-        # 把 ROS 的 apt 源整体删掉，ROS 侧全部来自源码编译。
-        self.assertIn("rm -f /etc/apt/sources.list.d/*.list", base_dockerfile)
+        # base 是 Focal，packages.ros.org 上没有 humble 二进制，所以只移除
+        # ROS 源；Ubuntu/NVIDIA 签名源仍需保留并认证系统依赖。
+        self.assertIn("packages\\.ros\\.org/ros2/ubuntu", base_dockerfile)
+        self.assertNotIn("rm -f /etc/apt/sources.list.d/*.list", base_dockerfile)
+        self.assertNotIn("AllowInsecureRepositories", base_dockerfile)
+        self.assertNotIn("--allow-unauthenticated", base_dockerfile)
         self.assertIn(
             "ROS APT source remains; humble has no Focal binaries",
             base_dockerfile,

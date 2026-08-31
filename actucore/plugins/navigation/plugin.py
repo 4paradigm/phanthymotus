@@ -26,10 +26,6 @@ from .planning.plugin import (
 )
 from .runtime import NavigationRuntime
 from .semantic.plugin import VisionAndLanguageNavigationPlugin
-from .semantic.vlm import (
-    TIMEOUT_SEC as VLM_TIMEOUT_SEC,
-    validate_configuration as validate_vlm_configuration,
-)
 
 
 log = logging.getLogger(__name__)
@@ -373,18 +369,6 @@ class NavigationPlugin:
                 "invalid_config",
                 "unsupported navigation config fields: " + ",".join(unknown),
             )
-        vlm_required = {"vlm_base_url", "vlm_api_key", "vlm_model"}
-        vlm_supplied = set(updates) & {
-            *vlm_required,
-            "vlm_timeout_sec",
-        }
-        if vlm_supplied and not vlm_required <= set(updates):
-            missing = sorted(vlm_required - set(updates))
-            return self._error(
-                "invalid_config",
-                "VLM config must include vlm_base_url, vlm_api_key and vlm_model; "
-                "missing=" + ",".join(missing),
-            )
         mapping_updates = {
             "action": "config",
             **{
@@ -453,13 +437,6 @@ class NavigationPlugin:
                 planning_previous,
                 {key: value for key, value in planning_updates.items() if key != "action"},
             )
-            if semantic_updates is not None:
-                validate_vlm_configuration(
-                    semantic_updates.get("base_url"),
-                    semantic_updates.get("api_key"),
-                    semantic_updates.get("model"),
-                    semantic_updates.get("timeout_sec", VLM_TIMEOUT_SEC),
-                )
         except (MappingConfigError, PlanningConfigError, TypeError, ValueError) as exc:
             return self._error("invalid_config", str(exc))
 

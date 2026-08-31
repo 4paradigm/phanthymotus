@@ -155,32 +155,38 @@ class Processor:
 
         raw_vlm_config = self._config.get("vlm")
         vlm_config = raw_vlm_config if isinstance(raw_vlm_config, dict) else {}
-        self._client_factory = client_factory
-        self._client = client or self._client_factory(
-            base_url=_startup_vlm_setting(
+        self._vlm_config = {
+            "base_url": _startup_vlm_setting(
                 vlm_config,
                 "base_url",
                 "VISION_AND_LANGUAGE_NAVIGATION_VLM_BASE_URL",
                 BASE_URL,
             ),
-            api_key=_startup_vlm_setting(
+            "api_key": _startup_vlm_setting(
                 vlm_config,
                 "api_key",
                 "VISION_AND_LANGUAGE_NAVIGATION_VLM_API_KEY",
                 "",
             ),
-            model=_startup_vlm_setting(
+            "model": _startup_vlm_setting(
                 vlm_config,
                 "model",
                 "VISION_AND_LANGUAGE_NAVIGATION_VLM_MODEL",
                 MODEL,
             ),
-            timeout=_startup_vlm_setting(
+            "timeout_sec": _startup_vlm_setting(
                 vlm_config,
                 "timeout_sec",
                 "VISION_AND_LANGUAGE_NAVIGATION_VLM_TIMEOUT_SEC",
                 TIMEOUT_SEC,
             ),
+        }
+        self._client_factory = client_factory
+        self._client = client or self._client_factory(
+            base_url=self._vlm_config["base_url"],
+            api_key=self._vlm_config["api_key"],
+            model=self._vlm_config["model"],
+            timeout=self._vlm_config["timeout_sec"],
         )
         self._bridge_factory = bridge_factory
         self._goal_handler = goal_handler
@@ -291,15 +297,21 @@ class Processor:
             return self._info_locked()
 
     def configure(self, args: dict) -> dict:
-        """Validate one complete gear config and atomically replace the VLM client."""
+        """Merge a partial gear config and atomically replace the VLM client."""
 
         with self._operation_lock:
             try:
+                updates = {
+                    key: args[key]
+                    for key in ("base_url", "api_key", "model", "timeout_sec")
+                    if key in args and not (key == "api_key" and args[key] == "****")
+                }
+                candidate_config = {**self._vlm_config, **updates}
                 base_url, api_key, model, timeout_sec = validate_configuration(
-                    args.get("base_url"),
-                    args.get("api_key"),
-                    args.get("model"),
-                    args.get("timeout_sec", TIMEOUT_SEC),
+                    candidate_config["base_url"],
+                    candidate_config["api_key"],
+                    candidate_config["model"],
+                    candidate_config["timeout_sec"],
                 )
                 candidate = self._client_factory(
                     base_url=base_url,
@@ -334,6 +346,12 @@ class Processor:
 
             # capture, navigate, stop, info, and config share _operation_lock, so
             # no in-flight operation can observe a partially updated client.
+            self._vlm_config = {
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model,
+                "timeout_sec": timeout_sec,
+            }
             self._client = candidate
             return {
                 "ok": True,

@@ -14,7 +14,8 @@
 `vlm_timeout_sec`。这些字段对建图和坐标导航均为可选；未配置 API key
 时卡片仍可启动，但 `capture` 和语义 `navigate` 会明确返回
 `vlm_not_configured`。API key 只保存在进程内，不出现在 action 回执、状态
-或日志中。`capture` 会把相机 JPEG 发送到所配置的外部 VLM 服务。
+或日志中。配置支持单字段增量更新；未提交或以 `****` 占位的 API key 会保留
+当前进程内密钥。`capture` 会把相机 JPEG 发送到所配置的外部 VLM 服务。
 
 ## 内部数据边
 
