@@ -9,7 +9,6 @@
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
-#   ./build_actucore.sh --jp-version 6.1         # JetPack 6.1
 #   ./build_actucore.sh --mirror tuna
 #   ./build_actucore.sh --base --mirror tuna     # 依赖变化时才构建 navigation base
 set -euo pipefail

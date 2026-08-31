@@ -236,11 +236,11 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 
 这是仓库默认的 ActuCore 构建入口，只有 Jetson 一个变体，无需 Navigation
 专用 wrapper。FAST-LIVO2/Nav2 不在日常 PR 镜像中重编，避免 ARM64 QEMU 构建
-超过 review 时限。默认构建入口会按 JetPack 选择基础镜像：JP 5.11
-使用已发布的 digest-pinned navigation base；JP 6.1 在对应基础镜像
-发布前直接拒绝构建，需维护者显式设置与 JP 6.1 匹配的
-`ACTUCORE_NAVIGATION_BASE_IMAGE`。所有覆盖都必须使用精确 `@sha256`
-引用，不会默认回退到其他 JetPack 的基础镜像。
+超过 review 时限。当前正式构建只支持 JP 5.11，并使用已发布的
+digest-pinned navigation base。JP 6.1 的对应基础镜像尚未发布；必须
+先构建、发布并在仓库中固定匹配的精确 `@sha256` digest，才能恢复
+JP 6.1 支持。构建脚本在此之前会拒绝普通 JP 6.1 构建，不会回退到
+其他 JetPack 的基础镜像。
 只有锁定源码、补丁或系统依赖变化时，维护者才执行：
 
 ```bash
