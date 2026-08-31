@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 
 CORE_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +37,28 @@ def _header(frame_id="map", sec=12, nanosec=34):
 
 
 class Ros2BridgeNavigationEncodingTest(unittest.TestCase):
+    def test_pointcloud_is_encoded_for_the_existing_renderer(self) -> None:
+        fields = [
+            SimpleNamespace(name=name, offset=offset, datatype=7, count=1)
+            for name, offset in (("x", 0), ("y", 4), ("z", 8))
+        ]
+        first_row = struct.pack("<ffffff", 1, 2, 3, 4, 5, 6)
+        second_row = struct.pack("<ffffff", 7, 8, 9, 10, 11, 12)
+        message = SimpleNamespace(
+            point_step=12,
+            row_step=28,
+            width=2,
+            height=2,
+            is_bigendian=False,
+            fields=fields,
+            data=first_row + b"pad!" + second_row,
+        )
+
+        payload = ros2_bridge._encode_message(message, "sensor/pointcloud")
+
+        self.assertEqual(struct.unpack_from("<II", payload), (12, 4))
+        self.assertEqual(payload[8:], first_row + second_row)
+
     def test_odometry_is_encoded_as_navigation_json(self) -> None:
         message = SimpleNamespace(
             header=_header(),
@@ -93,6 +117,55 @@ class Ros2BridgeNavigationEncodingTest(unittest.TestCase):
         self.assertEqual(payload["poses"][1]["x"], 1.0)
         self.assertEqual(payload["poses"][1]["y"], 2.0)
         self.assertAlmostEqual(payload["poses"][1]["yaw"], 1.2)
+
+    def test_occupancy_grid_uses_the_costmap_json_contract(self) -> None:
+        message = SimpleNamespace(
+            header=_header(),
+            info=SimpleNamespace(
+                resolution=0.05,
+                width=2,
+                height=1,
+                origin=SimpleNamespace(
+                    position=_vector(-1.0, -2.0, 0.0),
+                    orientation=_orientation(0.2),
+                ),
+            ),
+            data=[-1, 100],
+        )
+
+        payload = json.loads(
+            ros2_bridge._encode_message(message, "sensor/occupancy-grid")
+        )
+
+        self.assertEqual(payload["schema"], "phanthy.navigation.costmap.v1")
+        self.assertEqual(payload["data"], [-1, 100])
+
+    def test_navigation_formats_resolve_to_their_declared_ros_types(self) -> None:
+        sensor_msgs = ModuleType("sensor_msgs")
+        sensor_msgs_msg = ModuleType("sensor_msgs.msg")
+        pointcloud_type = type("PointCloud2", (), {})
+        sensor_msgs_msg.PointCloud2 = pointcloud_type
+        sensor_msgs.msg = sensor_msgs_msg
+        nav_msgs = ModuleType("nav_msgs")
+        nav_msgs_msg = ModuleType("nav_msgs.msg")
+        occupancy_type = type("OccupancyGrid", (), {})
+        nav_msgs_msg.OccupancyGrid = occupancy_type
+        nav_msgs.msg = nav_msgs_msg
+
+        with patch.dict(sys.modules, {
+            "sensor_msgs": sensor_msgs,
+            "sensor_msgs.msg": sensor_msgs_msg,
+            "nav_msgs": nav_msgs,
+            "nav_msgs.msg": nav_msgs_msg,
+        }):
+            self.assertIs(
+                ros2_bridge._resolve_msg_type("sensor/pointcloud"),
+                pointcloud_type,
+            )
+            self.assertIs(
+                ros2_bridge._resolve_msg_type("sensor/occupancy-grid"),
+                occupancy_type,
+            )
 
     def test_existing_byte_array_and_text_messages_are_unchanged(self) -> None:
         self.assertEqual(

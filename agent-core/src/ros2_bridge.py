@@ -24,6 +24,7 @@ cb 签名: async def cb(data: bytes, fmt: str) -> None
 import asyncio
 import json
 import math
+import struct
 import sys
 import threading
 
@@ -269,8 +270,49 @@ def _occupancy_grid_payload(msg) -> dict:
     }
 
 
+def _pointcloud_payload(msg) -> bytes:
+    point_step = int(msg.point_step)
+    width = int(msg.width)
+    height = int(msg.height)
+    if bool(msg.is_bigendian):
+        raise ValueError('big-endian PointCloud2 is unsupported')
+    if not 12 <= point_step < 256 or width < 0 or height < 0:
+        raise ValueError('invalid PointCloud2 dimensions')
+    layout = {
+        str(field.name): (int(field.offset), int(field.datatype), int(field.count))
+        for field in msg.fields
+        if str(field.name) in {'x', 'y', 'z'}
+    }
+    expected_layout = {
+        'x': (0, 7, 1),
+        'y': (4, 7, 1),
+        'z': (8, 7, 1),
+    }
+    if layout != expected_layout:
+        raise ValueError('PointCloud2 requires leading float32 x/y/z fields')
+
+    row_bytes = width * point_step
+    row_step = int(msg.row_step) or row_bytes
+    if row_step < row_bytes:
+        raise ValueError('PointCloud2 row_step is too small')
+    raw = bytes(msg.data)
+    required = (height - 1) * row_step + row_bytes if height else 0
+    if len(raw) < required:
+        raise ValueError('PointCloud2 data is truncated')
+    if row_step == row_bytes:
+        packed = raw[:width * height * point_step]
+    else:
+        packed = b''.join(
+            raw[row * row_step:row * row_step + row_bytes]
+            for row in range(height)
+        )
+    return struct.pack('<II', point_step, width * height) + packed
+
+
 def _encode_message(msg, fmt: str) -> bytes:
     """Convert supported ROS messages to the dashboard wire representation."""
+    if fmt == 'sensor/pointcloud':
+        return _pointcloud_payload(msg)
     if fmt == 'sensor/odometry':
         return json.dumps(
             _odometry_payload(msg), separators=(',', ':'), allow_nan=False
@@ -279,7 +321,7 @@ def _encode_message(msg, fmt: str) -> bytes:
         return json.dumps(
             _path_payload(msg), separators=(',', ':'), allow_nan=False
         ).encode('utf-8')
-    if fmt == 'sensor/costmap':
+    if fmt in ('sensor/costmap', 'sensor/occupancy-grid'):
         return json.dumps(
             _occupancy_grid_payload(msg), separators=(',', ':'), allow_nan=False
         ).encode('utf-8')
@@ -302,7 +344,14 @@ def _resolve_msg_type(fmt: str):
             pass
         # Unitree G1: DDS AudioData_ — 不经 ROS2，此处不需要订阅
         return None
-    if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+    if fmt == 'sensor/pointcloud':
+        try:
+            from sensor_msgs.msg import PointCloud2
+            return PointCloud2
+        except ImportError:
+            pass
+        return None
+    if fmt == 'sensor/mapping':
         try:
             from std_msgs.msg import UInt8MultiArray
             return UInt8MultiArray
@@ -323,7 +372,7 @@ def _resolve_msg_type(fmt: str):
         except ImportError:
             pass
         return None
-    if fmt == 'sensor/costmap':
+    if fmt in ('sensor/costmap', 'sensor/occupancy-grid'):
         try:
             from nav_msgs.msg import OccupancyGrid
             return OccupancyGrid

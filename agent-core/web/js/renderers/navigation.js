@@ -184,7 +184,7 @@ export const PathRenderer = {
 
 export const CostmapRenderer = {
   name: 'costmap',
-  canRender: (hint) => hint === 'sensor/costmap',
+  canRender: (hint) => hint === 'sensor/costmap' || hint === 'sensor/occupancy-grid',
   _el: null,
   _canvas: null,
   _ctx: null,
