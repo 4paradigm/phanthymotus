@@ -147,6 +147,8 @@ def navigation_tool_definition(namespace: str) -> dict:
         status_topic=f"/{namespace.strip('/')}/navigation/fast_livo2/status",
     )
     external_inputs = [deepcopy(item) for item in mapping["topic_in"]]
+    for item in external_inputs:
+        item["required"] = True
     rgb_input = deepcopy(semantic["topic_in"][0])
     rgb_input["required"] = False
     external_inputs.append(rgb_input)
@@ -170,11 +172,11 @@ def navigation_tool_definition(namespace: str) -> dict:
             },
         ]
     )
-    external_inputs.append(
-        deepcopy(
-            next(item for item in planning["topic_in"] if item["port"] == "goal_pose")
-        )
+    goal_input = deepcopy(
+        next(item for item in planning["topic_in"] if item["port"] == "goal_pose")
     )
+    goal_input["required"] = False
+    external_inputs.append(goal_input)
     component_outputs = {
         str(item.get("port", "")): item
         for item in [*mapping["topic_out"], *planning["topic_out"]]

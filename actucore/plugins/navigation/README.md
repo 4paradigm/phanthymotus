@@ -50,6 +50,9 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 | `depth_frame` | `/ubuntu/camera/depth_frame` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE1` 封装中的深度尺度、标定与源时间戳 |
 | `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由 Agent Core `x-topic-actions` 转换为 `navigate_to_pose` |
 
+这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
+`lidar` 和 `imu`。`goal_pose` 是可选的外部 topic action，不是启动时内部连线。
+
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
 `(0, 200] ms`。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
 契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable`、

@@ -183,7 +183,7 @@ def _external_bindings():
     return [
         {"port": item["port"], "topic": item["topic"]}
         for item in navigation_tool_definition("ubuntu")["topic_in"]
-        if item.get("required", True)
+        if item["required"]
     ]
 
 
@@ -204,6 +204,14 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(
             optional_inputs,
             {"rgb", "depth_frame", "goal_pose"},
+        )
+        self.assertEqual(
+            {
+                item["port"]
+                for item in tool["topic_in"]
+                if item["required"]
+            },
+            {"lidar", "imu"},
         )
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(

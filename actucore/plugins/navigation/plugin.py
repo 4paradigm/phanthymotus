@@ -519,7 +519,7 @@ class NavigationPlugin:
         required = {
             item["port"]
             for item in tool["topic_in"]
-            if item.get("required", True)
+            if item["required"]
         }
         mapping_info = self._mapping.dispatch("fast_livo2", {"action": "info"})
         collection_enabled = (
