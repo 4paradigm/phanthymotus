@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from utils import logsafe
+
+logsafe.install()
+
 from collections import deque
 from itertools import chain
 import json
@@ -1726,9 +1730,6 @@ class FastLivo2Adapter(Node):
 
 
 def main(args=None) -> None:
-    from utils import logsafe
-
-    logsafe.install()
     rclpy.init(args=args)
     node = FastLivo2Adapter()
     executor = MultiThreadedExecutor(num_threads=4)

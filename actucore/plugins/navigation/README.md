@@ -229,7 +229,9 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 该数据由上海 G1 上的 `docker image inspect --format '{{.Size}}'` 实测；增加的是
 磁盘、首次拉取和部署传输成本，不代表同等幅度的运行时 CPU/内存增长。稳定且昂贵的
 第三方依赖因此预编译进可复用、digest-pinned 的 navigation base，日常 PR 构建
-不再重复编译它们。
+不再重复编译它们。发布该 base 并把精确 digest 写回构建脚本是正式发版前置条件；
+只有 ActuCore 导航镜像继承它，Core、Perception 和不含导航的镜像不会承担这部分
+体积。
 该固定 base 同时提供 `colcon` / `empy` 和 PyYAML；日常镜像构建会实际执行
 `colcon build` 并显式导入 `em` / `yaml`，避免把基础镜像的偶然环境冒充成依赖
 契约。VLM 客户端使用 Python 标准库 `urllib`，不额外安装未使用的

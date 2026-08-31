@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from utils import logsafe
+
+logsafe.install()
+
 import json
 import math
 import os
@@ -1345,9 +1349,6 @@ class PlannerCommandNode(Node):
 
 
 def main(args=None) -> None:
-    from utils import logsafe
-
-    logsafe.install()
     rclpy.init(args=args)
     node = PlannerCommandNode()
     executor = MultiThreadedExecutor(num_threads=4)

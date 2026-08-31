@@ -84,6 +84,12 @@ RUN for revision in \
       }; \
     done
 
+# The digest-pinned Jetson parent owns these ROS build tools. Verify that
+# contract before any expensive source checkout/build instead of reinstalling
+# them into the deployable image.
+RUN command -v colcon >/dev/null && \
+    python3 -c "import em; assert int(em.__version__.split('.')[0]) < 4, em.__version__"
+
 # ── APT 源 ────────────────────────────────────────────────────────
 # Ubuntu 源换镜像；ROS 的 apt 源整体删掉 —— 这个 base 是 Focal，
 # packages.ros.org 上没有对应的 humble 二进制包，留着只会让 apt-get update

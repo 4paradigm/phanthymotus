@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from utils import logsafe
+
+logsafe.install()
+
 import json
 import os
 from pathlib import Path
@@ -1840,9 +1844,6 @@ class FastLivo2Supervisor(Node):
 
 
 def main(args=None) -> None:
-    from utils import logsafe
-
-    logsafe.install()
     rclpy.init(args=args)
     node = FastLivo2Supervisor()
     executor = MultiThreadedExecutor(num_threads=3)

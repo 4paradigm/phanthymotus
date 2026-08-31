@@ -411,6 +411,9 @@ class NavigationContractTest(unittest.TestCase):
             content = source.read_text(encoding="utf-8")
             self.assertIn("from utils import logsafe", content)
             self.assertIn("logsafe.install()", content)
+            self.assertLess(
+                content.index("logsafe.install()"), content.index("import rclpy")
+            )
         self.assertEqual(
             (ACTUCORE_ROOT / "utils" / "logsafe.py").read_bytes(),
             (ACTUCORE_ROOT.parent / "perception" / "utils" / "logsafe.py").read_bytes(),
@@ -446,6 +449,8 @@ class NavigationContractTest(unittest.TestCase):
             r"jetson-base:jp511-torch@sha256:[0-9a-f]{64}",
         )
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
+        self.assertIn("command -v colcon", base_dockerfile)
+        self.assertIn("int(em.__version__.split('.')[0]) < 4", base_dockerfile)
         self.assertNotIn("AllowInsecureRepositories", base_dockerfile)
         self.assertNotIn("--allow-unauthenticated", base_dockerfile)
         self.assertNotIn(
