@@ -135,6 +135,7 @@ class FastLivo2Adapter(Node):
         self._imu_frame: str | None = None
         self._last_lidar_source_stamp_ns: int | None = None
         self._last_imu_source_stamp_ns: int | None = None
+        self._last_sensor_pair_monotonic: float | None = None
         self._point_time_ready = False
         self._imu_time_ready = False
         self._point_time_span_ms: float | None = None
@@ -462,9 +463,6 @@ class FastLivo2Adapter(Node):
                 header_stamp_ns=source_stamp_ns,
             )
         except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
-            with self._lock:
-                self._point_time_ready = False
-                self._point_time_span_ms = None
             self._warn_rejected("navigation lidar contract", exc)
             return
         self._mark_valid("navigation lidar contract")
@@ -491,8 +489,6 @@ class FastLivo2Adapter(Node):
             if previous is not None and source_stamp_ns <= previous:
                 raise InvalidFastLivo2Frame("imu source stamp did not advance")
         except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
-            with self._lock:
-                self._imu_time_ready = False
             self._warn_rejected("navigation imu contract", exc)
             return
         self._mark_valid("navigation imu contract")
@@ -506,25 +502,29 @@ class FastLivo2Adapter(Node):
         self._refresh_sensor_contract()
 
     def _refresh_sensor_contract(self) -> None:
+        now = time.monotonic()
         with self._lock:
             lidar_frame = self._lidar_frame
             imu_frame = self._imu_frame
             lidar_stamp = self._last_lidar_source_stamp_ns
             imu_stamp = self._last_imu_source_stamp_ns
+            if lidar_frame and imu_frame and lidar_frame != imu_frame:
+                self._sensor_frame = None
+                self._base_to_sensor = None
+                self._base_to_sensor_tf_ready = False
+                self._last_sensor_pair_monotonic = None
+                return
             if (
                 not lidar_frame
-                or lidar_frame != imu_frame
                 or not self._point_time_ready
                 or not self._imu_time_ready
                 or lidar_stamp is None
                 or imu_stamp is None
                 or abs(lidar_stamp - imu_stamp) > 200_000_000
             ):
-                self._sensor_frame = None
-                self._base_to_sensor = None
-                self._base_to_sensor_tf_ready = False
                 return
             sensor_frame = lidar_frame
+            self._last_sensor_pair_monotonic = now
             if (
                 self._sensor_frame == sensor_frame
                 and self._base_to_sensor_tf_ready
@@ -564,11 +564,19 @@ class FastLivo2Adapter(Node):
                 self._base_to_sensor_tf_ready = True
                 self._sensor_tf_error = None
 
+    def _sensor_pair_fresh_locked(self) -> bool:
+        return (
+            self._last_sensor_pair_monotonic is not None
+            and time.monotonic() - self._last_sensor_pair_monotonic
+            <= self._source_max_age
+        )
+
     def _sensor_contract_ready_locked(self) -> bool:
         return (
             self._sensor_frame is not None
             and self._point_time_ready
             and self._imu_time_ready
+            and self._sensor_pair_fresh_locked()
             and self._base_to_sensor_tf_ready
             and self._base_to_sensor is not None
         )
@@ -577,17 +585,7 @@ class FastLivo2Adapter(Node):
         blockers = []
         if not self._lidar_frame or self._lidar_frame != self._imu_frame:
             blockers.append("sensor_frame_mismatch")
-        if (
-            not self._point_time_ready
-            or not self._imu_time_ready
-            or self._last_lidar_source_stamp_ns is None
-            or self._last_imu_source_stamp_ns is None
-            or abs(
-                self._last_lidar_source_stamp_ns
-                - self._last_imu_source_stamp_ns
-            )
-            > 200_000_000
-        ):
+        if not self._sensor_pair_fresh_locked():
             blockers.append("point_time_invalid")
         if (
             self._lidar_frame

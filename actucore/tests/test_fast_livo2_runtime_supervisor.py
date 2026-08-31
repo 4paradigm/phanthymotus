@@ -232,6 +232,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._imu_frame = "front_navigation_sensor"
         adapter._last_lidar_source_stamp_ns = 1_000_000_000
         adapter._last_imu_source_stamp_ns = 1_050_000_000
+        adapter._last_sensor_pair_monotonic = None
+        adapter._source_max_age = 0.5
         adapter._point_time_ready = True
         adapter._imu_time_ready = True
         adapter._point_time_span_ms = 80.0
@@ -261,6 +263,54 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             mock.ANY,
         )
 
+    def test_sensor_contract_ignores_one_duplicate_until_valid_pair_is_stale(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._rejection_counts = {}
+        adapter._lidar_frame = "livox_frame"
+        adapter._imu_frame = "livox_frame"
+        adapter._last_lidar_source_stamp_ns = 1_000_000_000
+        adapter._last_imu_source_stamp_ns = 1_050_000_000
+        adapter._last_sensor_pair_monotonic = None
+        adapter._source_max_age = 0.5
+        adapter._point_time_ready = True
+        adapter._imu_time_ready = True
+        adapter._point_time_span_ms = 100.0
+        adapter._base_to_sensor = None
+        adapter._base_to_sensor_tf_ready = False
+        adapter._sensor_frame = None
+        adapter._sensor_tf_error = None
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._tf_buffer = mock.Mock()
+        adapter._tf_buffer.lookup_transform.return_value = SimpleNamespace(
+            transform=SimpleNamespace(
+                translation=SimpleNamespace(x=0.0, y=0.0, z=0.46),
+                rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+        )
+        adapter.get_logger = lambda: SimpleNamespace(
+            warning=lambda _message: None,
+            info=lambda _message: None,
+        )
+
+        adapter._refresh_sensor_contract()
+        duplicate = SimpleNamespace(
+            header=SimpleNamespace(
+                frame_id="livox_frame",
+                stamp=SimpleNamespace(sec=1, nanosec=50_000_000),
+            )
+        )
+        adapter._on_imu_contract(duplicate)
+
+        self.assertTrue(adapter._sensor_contract_ready_locked())
+        self.assertEqual(adapter._readiness_blockers_locked(), [])
+        self.assertIsNotNone(adapter._base_to_sensor)
+
+        adapter._last_sensor_pair_monotonic = time.monotonic() - 0.6
+        self.assertFalse(adapter._sensor_contract_ready_locked())
+        self.assertIn("point_time_invalid", adapter._readiness_blockers_locked())
+        self.assertIsNotNone(adapter._base_to_sensor)
+
     def test_sensor_contract_reports_frame_mismatch_and_missing_tf(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
@@ -268,6 +318,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._imu_frame = "imu_frame"
         adapter._last_lidar_source_stamp_ns = 1_000_000_000
         adapter._last_imu_source_stamp_ns = 1_050_000_000
+        adapter._last_sensor_pair_monotonic = None
+        adapter._source_max_age = 0.5
         adapter._point_time_ready = True
         adapter._imu_time_ready = True
         adapter._point_time_span_ms = 50.0
@@ -544,6 +596,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._imu_frame = "sensor_frame"
         adapter._point_time_ready = True
         adapter._imu_time_ready = True
+        adapter._last_sensor_pair_monotonic = time.monotonic()
         adapter._base_to_sensor_tf_ready = True
         adapter._base_to_sensor = Pose3(
             0.0,
