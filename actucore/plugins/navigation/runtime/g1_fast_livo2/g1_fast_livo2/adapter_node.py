@@ -167,6 +167,7 @@ class FastLivo2Adapter(Node):
         if self._obstacle_min_height >= self._obstacle_max_height:
             raise ValueError("obstacle_min_height_m must be less than obstacle_max_height_m")
         self._lock = threading.Lock()
+        self._rejection_counts: dict[str, int] = {}
         self._static_lock = threading.Lock()
         self._mapping_work_condition = threading.Condition()
         self._mapping_work = None
@@ -414,6 +415,28 @@ class FastLivo2Adapter(Node):
         source = float(stamp.sec) + float(stamp.nanosec) * 1e-9
         return self.get_clock().now().nanoseconds * 1e-9 - source
 
+    def _warn_rejected(self, stream: str, detail) -> None:
+        with self._lock:
+            counts = getattr(self, "_rejection_counts", None)
+            if counts is None:
+                counts = self._rejection_counts = {}
+            count = counts.get(stream, 0) + 1
+            counts[stream] = count
+        if count == 1 or count % 100 == 0:
+            bounded = str(detail).replace("\r", "\\r").replace("\n", "\\n")[:200]
+            self.get_logger().warning(
+                f"rejecting {stream} count={count}: {bounded}"
+            )
+
+    def _mark_valid(self, stream: str) -> None:
+        with self._lock:
+            counts = getattr(self, "_rejection_counts", None)
+            rejected = counts.pop(stream, 0) if counts else 0
+        if rejected:
+            self.get_logger().info(
+                f"{stream} recovered after {rejected} rejected samples"
+            )
+
     def _on_lidar_contract(self, message: PointCloud2) -> None:
         try:
             frame = message.header.frame_id.strip()
@@ -438,10 +461,9 @@ class FastLivo2Adapter(Node):
             with self._lock:
                 self._point_time_ready = False
                 self._point_time_span_ms = None
-            self.get_logger().warning(
-                f"rejecting navigation lidar contract: {exc}"
-            )
+            self._warn_rejected("navigation lidar contract", exc)
             return
+        self._mark_valid("navigation lidar contract")
         with self._lock:
             if frame != self._lidar_frame:
                 self._base_to_sensor = None
@@ -467,10 +489,9 @@ class FastLivo2Adapter(Node):
         except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
             with self._lock:
                 self._imu_time_ready = False
-            self.get_logger().warning(
-                f"rejecting navigation imu contract: {exc}"
-            )
+            self._warn_rejected("navigation imu contract", exc)
             return
+        self._mark_valid("navigation imu contract")
         with self._lock:
             if frame != self._imu_frame:
                 self._base_to_sensor = None
@@ -614,8 +635,9 @@ class FastLivo2Adapter(Node):
             )
         except (InvalidFastLivo2Frame, ValueError, TypeError) as exc:
             self._invalid_odom += 1
-            self.get_logger().warning(f"rejecting FAST-LIVO2 odom: {exc}")
+            self._warn_rejected("FAST-LIVO2 odom", exc)
             return
+        self._mark_valid("FAST-LIVO2 odom")
 
         with self._lock:
             self._latest_session_pose = session_pose
@@ -704,8 +726,9 @@ class FastLivo2Adapter(Node):
             )
         except (InvalidFastLivo2Frame, ValueError, TypeError) as exc:
             self._invalid_cloud += 1
-            self.get_logger().warning(f"rejecting FAST-LIVO2 cloud: {exc}")
+            self._warn_rejected("FAST-LIVO2 cloud", exc)
             return
+        self._mark_valid("FAST-LIVO2 cloud")
 
         decode_end_monotonic = time.monotonic()
         sample = (
@@ -804,10 +827,9 @@ class FastLivo2Adapter(Node):
             )
         except (InvalidFastLivo2Frame, OverflowError) as exc:
             self._invalid_cloud += 1
-            self.get_logger().warning(
-                f"rejecting transformed FAST-LIVO2 cloud: {exc}"
-            )
+            self._warn_rejected("transformed FAST-LIVO2 cloud", exc)
             return
+        self._mark_valid("transformed FAST-LIVO2 cloud")
         with self._lock:
             if self._map_from_session != map_from_session:
                 return
@@ -1489,8 +1511,9 @@ class FastLivo2Adapter(Node):
         try:
             data = map_view_with_pose(cached, pose)
         except InvalidFastLivo2Frame as exc:
-            self.get_logger().warning(f"rejecting cached map view: {exc}")
+            self._warn_rejected("cached map view", exc)
             return
+        self._mark_valid("cached map view")
         frame = UInt8MultiArray()
         frame.data = data
         self._map_view_pub.publish(frame)

@@ -137,6 +137,32 @@ def _prepare_adapter_concurrency(adapter) -> None:
 
 
 class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
+    def test_adapter_rejection_logs_are_sampled_and_recovery_is_reported(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._rejection_counts = {}
+        warnings = []
+        infos = []
+        adapter.get_logger = lambda: SimpleNamespace(
+            warning=warnings.append,
+            info=infos.append,
+        )
+
+        for _ in range(101):
+            adapter._warn_rejected("FAST-LIVO2 cloud", "bad\nframe")
+
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("count=1", warnings[0])
+        self.assertIn("count=100", warnings[1])
+        self.assertNotIn("\n", warnings[0])
+
+        adapter._mark_valid("FAST-LIVO2 cloud")
+        self.assertEqual(
+            infos,
+            ["FAST-LIVO2 cloud recovered after 101 rejected samples"],
+        )
+        self.assertEqual(adapter._rejection_counts, {})
+
     def test_collection_subscriptions_drop_backlog_instead_of_replaying_it(self) -> None:
         source = (
             PACKAGE_ROOT

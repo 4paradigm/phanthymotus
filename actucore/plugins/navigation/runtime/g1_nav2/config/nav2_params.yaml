@@ -125,6 +125,8 @@ local_costmap:
         registered_cloud:
           topic: /ubuntu/navigation/cloud_registered
           data_type: PointCloud2
+          # Nav2 uses sensor_frame only as the raytrace origin. Cloud points
+          # remain in their header.frame_id (map) and are not reinterpreted.
           sensor_frame: base_link
           clearing: true
           marking: true
@@ -170,6 +172,8 @@ global_costmap:
         registered_cloud:
           topic: /ubuntu/navigation/cloud_registered
           data_type: PointCloud2
+          # Nav2 uses sensor_frame only as the raytrace origin. Cloud points
+          # remain in their header.frame_id (map) and are not reinterpreted.
           sensor_frame: base_link
           clearing: true
           marking: true
