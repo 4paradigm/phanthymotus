@@ -190,6 +190,9 @@ mapping 控制对象，并继续回收其他模块和运行时。已完成的同
 Fast DDS 在首个发现窗口内暂未报告 command subscriber，只重建一次
 planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第二次仍失败
 才执行完整回滚。
+`config` 在修改任一子组件前先校验 mapping、planning 和 semantic 的全部
+候选参数；若子组件在应用阶段仍意外拒绝，已应用组件会恢复到请求前
+配置，不会在返回 `invalid_config` 的同时留下半更新状态。
 
 `stop` 始终尝试停止所有内部模块和两个 launch 子进程组，并保留各模块回执，
 避免部分停止冒充成功。Runtime 还跟踪 launch 进程派生的独立 Linux 进程组；
@@ -225,6 +228,11 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 `14,674,555,445` bytes，增加 `887,965,942` bytes（约 `6.4%`）。稳定且昂贵的
 第三方依赖因此预编译进可复用、digest-pinned 的 navigation base，日常 PR 构建
 不再重复编译它们。
+该固定 base 同时提供 `colcon` / `empy` 和 PyYAML；日常镜像构建会实际执行
+`colcon build` 并显式导入 `em` / `yaml`，避免把基础镜像的偶然环境冒充成依赖
+契约。VLM 客户端使用 Python 标准库 `urllib`，不额外安装未使用的
+`requests`。ActuCore 主进程和三个 Python ROS 入口都安装同一份原子
+标准输出 writer，避免并发输出破坏 Docker 日志记录。
 
 `--mirror tuna` 只选择国内 APT/PyPI 源；Git 默认直连官方仓库，避免把公共代理
 隐式固化进可复现构建。网络环境需要代理时由维护者显式传入

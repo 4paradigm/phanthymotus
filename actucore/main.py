@@ -19,6 +19,12 @@ MCP server 端口: config.mcp_port（默认 15730）
 
 from __future__ import annotations
 
+# Install before any thread, ROS runtime, or HTTP handler can write a partial
+# Docker log record. Child ROS entry points install the same writer themselves.
+from utils import logsafe
+
+logsafe.install()
+
 import json
 import logging
 import os

@@ -13,11 +13,23 @@ from .contract import (
     navigation_tool_definition,
 )
 from .mapping.contract import FAST_LIVO2_ACTIONS
-from .mapping.plugin import FastLivo2Plugin
+from .mapping.plugin import (
+    ConfigError as MappingConfigError,
+    FastLivo2Plugin,
+    _validated_config as validated_mapping_config,
+)
 from .planning.contract import NAV2_ACTIONS
-from .planning.plugin import Nav2Plugin
+from .planning.plugin import (
+    ConfigError as PlanningConfigError,
+    Nav2Plugin,
+    _validated_config as validated_planning_config,
+)
 from .runtime import NavigationRuntime
 from .semantic.plugin import VisionAndLanguageNavigationPlugin
+from .semantic.vlm import (
+    TIMEOUT_SEC as VLM_TIMEOUT_SEC,
+    validate_configuration as validate_vlm_configuration,
+)
 
 
 log = logging.getLogger(__name__)
@@ -327,6 +339,20 @@ class NavigationPlugin:
         with self._transition_lock:
             return self._configure_serialized(args)
 
+    @staticmethod
+    def _component_config(component, prefix: str, validator) -> dict:
+        info = component.dispatch(prefix, {"action": "info"})
+        current = info.get("config") if isinstance(info, dict) else None
+        return validator(dict(current) if isinstance(current, dict) else {}, {})
+
+    @staticmethod
+    def _config_failed(result) -> bool:
+        return (
+            not isinstance(result, dict)
+            or result.get("status") in {"error", "invalid_config"}
+            or result.get("state") == "error"
+        )
+
     def _configure_serialized(self, args: dict) -> dict:
         with self._lock:
             if self._started:
@@ -395,16 +421,13 @@ class NavigationPlugin:
                 min_yaw_rps=updates["rotate_speed_rps"],
                 max_yaw_rps=updates["rotate_speed_rps"],
             )
-        results = {
-            "mapping": self._mapping.dispatch("fast_livo2", mapping_updates),
-            "planning": self._planning.dispatch("nav2", planning_updates),
-        }
         semantic_keys = {
             "vlm_base_url": "base_url",
             "vlm_api_key": "api_key",
             "vlm_model": "model",
             "vlm_timeout_sec": "timeout_sec",
         }
+        semantic_updates = None
         if any(key in updates for key in semantic_keys):
             semantic_updates = {
                 "action": "config",
@@ -414,20 +437,96 @@ class NavigationPlugin:
                     if source in updates
                 },
             }
-            results["semantic"] = self._semantic.dispatch("vln", semantic_updates)
-        failures = [
-            name
-            for name, result in results.items()
-            if not isinstance(result, dict)
-            or result.get("status") in {"error", "invalid_config"}
-            or result.get("state") == "error"
-        ]
-        if failures:
-            return self._error(
-                "invalid_config",
-                "invalid component config: " + ",".join(failures),
-                component_results=results,
+
+        try:
+            mapping_previous = self._component_config(
+                self._mapping, "fast_livo2", validated_mapping_config
             )
+            planning_previous = self._component_config(
+                self._planning, "nav2", validated_planning_config
+            )
+            validated_mapping_config(
+                mapping_previous,
+                {key: value for key, value in mapping_updates.items() if key != "action"},
+            )
+            validated_planning_config(
+                planning_previous,
+                {key: value for key, value in planning_updates.items() if key != "action"},
+            )
+            if semantic_updates is not None:
+                validate_vlm_configuration(
+                    semantic_updates.get("base_url"),
+                    semantic_updates.get("api_key"),
+                    semantic_updates.get("model"),
+                    semantic_updates.get("timeout_sec", VLM_TIMEOUT_SEC),
+                )
+        except (MappingConfigError, PlanningConfigError, TypeError, ValueError) as exc:
+            return self._error("invalid_config", str(exc))
+
+        components = [
+            (
+                "mapping",
+                self._mapping,
+                "fast_livo2",
+                mapping_updates,
+                mapping_previous,
+            ),
+            (
+                "planning",
+                self._planning,
+                "nav2",
+                planning_updates,
+                planning_previous,
+            ),
+        ]
+        if semantic_updates is not None:
+            components.append(
+                ("semantic", self._semantic, "vln", semantic_updates, None)
+            )
+
+        results = {}
+        applied = []
+        for name, component, prefix, request, previous in components:
+            try:
+                result = component.dispatch(prefix, request)
+            except Exception as exc:
+                result = self._error("component_config_failed", str(exc))
+            results[name] = result
+            if self._config_failed(result):
+                rollback_results = {}
+                rollback_failures = []
+                for (
+                    applied_name,
+                    applied_component,
+                    applied_prefix,
+                    _applied_request,
+                    applied_previous,
+                ) in reversed(applied):
+                    try:
+                        rollback = applied_component.dispatch(
+                            applied_prefix,
+                            {"action": "config", **applied_previous},
+                        )
+                    except Exception as exc:
+                        rollback = self._error("config_rollback_failed", str(exc))
+                    rollback_results[applied_name] = rollback
+                    if self._config_failed(rollback):
+                        rollback_failures.append(applied_name)
+                if rollback_failures:
+                    return self._error(
+                        "config_rollback_failed",
+                        "component config failed and rollback failed: "
+                        + ",".join(rollback_failures),
+                        component_results=results,
+                        rollback_component_results=rollback_results,
+                    )
+                return self._error(
+                    "invalid_config",
+                    "invalid component config: " + name,
+                    component_results=results,
+                    rollback_component_results=rollback_results,
+                )
+            applied.append((name, component, prefix, request, previous))
         return {
             "state": "configured",
             "status": "configured",

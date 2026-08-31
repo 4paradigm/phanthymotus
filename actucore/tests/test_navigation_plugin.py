@@ -81,6 +81,18 @@ class FakeComponent:
         return {"status": action, "component": self.name}
 
 
+class FailingConfigComponent(FakeComponent):
+    def dispatch(self, prefix, args):
+        if args.get("action") == "config":
+            self.calls.append((prefix, dict(args)))
+            return {
+                "state": "error",
+                "status": "invalid_config",
+                "error": "rejected test config",
+            }
+        return super().dispatch(prefix, args)
+
+
 class CollectionMappingComponent(FakeComponent):
     def dispatch(self, prefix, args):
         if args.get("action") == "info":
@@ -361,10 +373,46 @@ class NavigationContractTest(unittest.TestCase):
             self.assertNotIn(perception_only, dockerfile)
         self.assertNotIn("pip3 install", dockerfile)
         self.assertNotIn("python3-pip", dockerfile)
+        self.assertIn("import numpy, rosbag2_py, yaml, em", dockerfile)
+        self.assertNotIn("import requests", dockerfile)
         self.assertNotIn("deploy/ros-base/audio_msgs", dockerfile)
         self.assertIn("COPY actucore/main.py", dockerfile)
         self.assertIn("COPY actucore/utils/", dockerfile)
         self.assertIn("COPY actucore/deploy/     /deploy/", dockerfile)
+
+    def test_every_python_process_installs_the_atomic_log_writer(self):
+        sources = [
+            ACTUCORE_ROOT / "main.py",
+            ACTUCORE_ROOT
+            / "plugins"
+            / "navigation"
+            / "runtime"
+            / "g1_fast_livo2"
+            / "g1_fast_livo2"
+            / "adapter_node.py",
+            ACTUCORE_ROOT
+            / "plugins"
+            / "navigation"
+            / "runtime"
+            / "g1_fast_livo2"
+            / "g1_fast_livo2"
+            / "runtime_supervisor.py",
+            ACTUCORE_ROOT
+            / "plugins"
+            / "navigation"
+            / "runtime"
+            / "g1_nav2"
+            / "g1_nav2"
+            / "planner_command_node.py",
+        ]
+        for source in sources:
+            content = source.read_text(encoding="utf-8")
+            self.assertIn("from utils import logsafe", content)
+            self.assertIn("logsafe.install()", content)
+        self.assertEqual(
+            (ACTUCORE_ROOT / "utils" / "logsafe.py").read_bytes(),
+            (ACTUCORE_ROOT.parent / "perception" / "utils" / "logsafe.py").read_bytes(),
+        )
 
     def test_navigation_base_owns_locked_third_party_builds(self):
         base_dockerfile = (
@@ -948,6 +996,73 @@ class NavigationPluginTest(unittest.TestCase):
                 },
             ),
             plugin._planning.calls,
+        )
+
+    def test_unified_config_validates_all_components_before_mutating_any(self):
+        plugin = NavigationPlugin(
+            {"namespace": "ubuntu"},
+            "ubuntu",
+            executor=None,
+            runtime=FakeRuntime(),
+            semantic_plugin=FakeComponent("semantic"),
+        )
+        before = plugin._mapping.dispatch("fast_livo2", {"action": "info"})[
+            "config"
+        ]
+
+        result = plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {
+                "action": "config",
+                "mapping_request_timeout_sec": 77.0,
+                "rotate_speed_rps": 99.0,
+            },
+        )
+
+        self.assertEqual(result["error_code"], "invalid_config")
+        after = plugin._mapping.dispatch("fast_livo2", {"action": "info"})[
+            "config"
+        ]
+        self.assertEqual(after, before)
+
+    def test_unified_config_rolls_back_if_last_component_rejects(self):
+        plugin = NavigationPlugin(
+            {"namespace": "ubuntu"},
+            "ubuntu",
+            executor=None,
+            runtime=FakeRuntime(),
+            semantic_plugin=FailingConfigComponent("semantic"),
+        )
+        mapping_before = plugin._mapping.dispatch(
+            "fast_livo2", {"action": "info"}
+        )["config"]
+        planning_before = plugin._planning.dispatch("nav2", {"action": "info"})[
+            "config"
+        ]
+
+        result = plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {
+                "action": "config",
+                "mapping_request_timeout_sec": 77.0,
+                "rotate_speed_rps": 0.3,
+                "vlm_base_url": "https://vlm.example.test/v1",
+                "vlm_api_key": "test-secret",
+                "vlm_model": "test-model",
+            },
+        )
+
+        self.assertEqual(result["error_code"], "invalid_config")
+        self.assertEqual(
+            plugin._mapping.dispatch("fast_livo2", {"action": "info"})["config"],
+            mapping_before,
+        )
+        self.assertEqual(
+            plugin._planning.dispatch("nav2", {"action": "info"})["config"],
+            planning_before,
+        )
+        self.assertEqual(
+            set(result["rollback_component_results"]), {"mapping", "planning"}
         )
 
 

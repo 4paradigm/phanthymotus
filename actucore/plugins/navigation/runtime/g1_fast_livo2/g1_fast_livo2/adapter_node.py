@@ -1726,6 +1726,9 @@ class FastLivo2Adapter(Node):
 
 
 def main(args=None) -> None:
+    from utils import logsafe
+
+    logsafe.install()
     rclpy.init(args=args)
     node = FastLivo2Adapter()
     executor = MultiThreadedExecutor(num_threads=4)
