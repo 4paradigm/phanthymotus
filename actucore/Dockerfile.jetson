@@ -39,7 +39,10 @@ RUN find /ros_ws/install /opt/nav2_ws/install /opt/ros_deps_ws/install \
       /opt/fast_livo_ws/install -name "site-packages" -type d \
       > /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
     find /opt/ros/humble/install -name "site-packages" -type d \
-      >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth
+      >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    echo /work \
+      >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    cd / && python3 -c "from utils import logsafe"
 
 ENV LD_LIBRARY_PATH="/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/install/livox_ros_driver2/lib:/opt/fast_livo_ws/install/vikit_common/lib:/opt/fast_livo_ws/install/vikit_ros/lib:/opt/nav2_ws/install/lib:/opt/ros_deps_ws/install/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/g1_fast_livo2:/ros_ws/install/g1_segmented_controller:/ros_ws/install/g1_nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"

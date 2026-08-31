@@ -379,6 +379,8 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("COPY actucore/main.py", dockerfile)
         self.assertIn("COPY actucore/utils/", dockerfile)
         self.assertIn("COPY actucore/deploy/     /deploy/", dockerfile)
+        self.assertIn("echo /work", dockerfile)
+        self.assertIn('python3 -c "from utils import logsafe"', dockerfile)
 
     def test_every_python_process_installs_the_atomic_log_writer(self):
         sources = [
