@@ -34,12 +34,15 @@ COPY pyproject.toml /work/
 ENV UV_INDEX_URL=${PYPI_MIRROR}
 RUN uv lock && uv sync --no-dev --no-install-project
 
-# Link system ROS2 packages into venv so sensor_msgs/nav_msgs/rclpy are importable
+# ROS_BASE_IMAGE contract: the ROS Humble ros-base install supplies rclpy and
+# standard sensor_msgs/nav_msgs packages. Link that install into the venv and
+# fail the build if the bridge's concrete message types are missing; no extra
+# package or image layer is installed here.
 RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/opt/ros/humble/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/usr/lib/python3/dist-packages" >> .venv/lib/python3.10/site-packages/system.pth && \
-    .venv/bin/python -c "from nav_msgs.msg import OccupancyGrid, Odometry, Path"
+    .venv/bin/python -c "import rclpy; from sensor_msgs.msg import PointCloud2; from nav_msgs.msg import OccupancyGrid, Odometry, Path"
 
 COPY web/      /work/web/
 COPY src/      /work/src/

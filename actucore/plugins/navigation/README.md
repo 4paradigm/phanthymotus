@@ -110,7 +110,10 @@ Canvas 的转向速度只暴露单一 `rotate_speed_rps`，默认
 
 实时避障与累计地图彼此独立：当前 registered cloud 继续进入 Nav2 开启
 marking/raytrace clearing 的 live ObstacleLayer，所以导航期间新出现或移动的
-物体仍参与即时避障。原始 FAST-LIVO2 odom/cloud 使用 latest-only 订阅；cloud
+物体仍参与即时避障。锁定版本的 Nav2 `ObservationBuffer::bufferCloud` 分别用
+`sensor_frame` 计算射线原点、用 PointCloud2 `header.frame_id` 变换点坐标；因此
+配置以动态 `base_link` 作为机身射线原点，而 registered cloud 的点仍按 `map`
+坐标解释。原始 FAST-LIVO2 odom/cloud 使用 latest-only 订阅；cloud
 只有在其源时间戳已被前后 odom/TF 包围且最近位姿差不超过 50 ms 时才对
 Nav2 发布，避免 adapter 排队旧帧或让点云早于 TF。canonical registered cloud
 发布是独立快路径：PointCloud2 的 XYZ 解码、`map` 坐标变换、高度过滤和
@@ -249,6 +252,10 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 隐式固化进可复现构建。网络环境需要代理时由维护者显式传入
 `GIT_MIRROR_PREFIX`；全局 Git 重写会保留到 FAST-LIVO2/Nav2 编译完成，使
 FetchContent 也沿用该值，最终镜像再删除该重写。
+
+Canvas 外部连线 topic 必须是完整绝对 ROS 名称：以 `/` 开头，每段只使用
+字母、数字和下划线且不能以数字开头；空值、相对名称和重复 `/` 会在启动子进程
+前返回 `invalid_canvas_wiring`。
 
 ```bash
 ./deploy/build_actucore.sh --mirror tuna

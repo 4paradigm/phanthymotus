@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 
@@ -29,6 +30,9 @@ from .semantic.plugin import VisionAndLanguageNavigationPlugin
 
 
 log = logging.getLogger(__name__)
+_ABSOLUTE_ROS_TOPIC_RE = re.compile(
+    r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$"
+)
 
 
 class NavigationPlugin:
@@ -569,12 +573,24 @@ class NavigationPlugin:
             for port, topic in wired.items()
             if port in expected and not topic
         )
-        if unknown or missing or empty:
+        invalid = sorted(
+            port
+            for port, topic in wired.items()
+            if port in expected
+            and topic
+            and (
+                len(topic) > 255
+                or _ABSOLUTE_ROS_TOPIC_RE.fullmatch(topic) is None
+            )
+        )
+        if unknown or missing or empty or invalid:
             details = []
             if missing:
                 details.append("missing=" + ",".join(missing))
             if empty:
                 details.append("empty_topic=" + ",".join(empty))
+            if invalid:
+                details.append("invalid_topic=" + ",".join(invalid))
             if unknown:
                 details.append("unexpected=" + ",".join(unknown))
             return self._error(

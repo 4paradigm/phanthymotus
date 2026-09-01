@@ -768,6 +768,30 @@ class NavigationPluginTest(unittest.TestCase):
             {"rgb", "livo_odom", "livo_status"},
         )
 
+    def test_start_rejects_invalid_external_topic_names(self):
+        for topic in (
+            "   ",
+            "relative/lidar",
+            "/robot//lidar",
+            "/robot/9lidar",
+            "/robot/lidar?",
+        ):
+            with self.subTest(topic=topic):
+                runtime = FakeRuntime()
+                plugin = self.make_plugin(runtime=runtime)
+                bindings = _external_bindings()
+                next(item for item in bindings if item["port"] == "lidar")[
+                    "topic"
+                ] = topic
+
+                result = plugin.dispatch(
+                    "ControlledSemanticSpatial",
+                    {"action": "start", "input_bindings": bindings},
+                )
+
+                self.assertEqual(result["error_code"], "invalid_canvas_wiring")
+                self.assertFalse(runtime.started)
+
     def test_collection_reuses_rgb_and_requires_depth_binding(self):
         mapping = CollectionMappingComponent("mapping")
         plugin = self.make_plugin(mapping=mapping)

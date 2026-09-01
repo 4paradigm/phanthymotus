@@ -188,6 +188,9 @@ For a local Agent Core build, `./deploy/build_core.sh --mirror tuna` passes the
 selected Ubuntu, ROS 2, and PyPI mirrors into the Docker build. The Dockerfile
 rewrites inherited base-image APT sources before installing additional ROS 2
 packages, so a stale Tencent VPC source cannot block a TUNA build.
+The Agent Core `ROS_BASE_IMAGE` contract includes ROS Humble `rclpy`,
+`sensor_msgs`, and `nav_msgs`; the downstream build imports the concrete bridge
+message types and fails immediately if a replacement base omits that contract.
 
 ![Deploy](docs/images/deploy.png)
 
