@@ -217,6 +217,7 @@ class RosBridge:
         self._decode_camera_rgb_frame = decode_camera_rgb_frame
         self._status_state = ""
         self._status_map_name = ""
+        self._status_session_id = ""
         self._status_generation = 0
         self._status_received_monotonic: float | None = None
         self._status_companion_ready = False
@@ -366,6 +367,7 @@ class RosBridge:
         diagnostics = payload.get("diagnostics")
         diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
         loaded_map = str(payload.get("loaded_map") or "").strip()
+        session_id = str(payload.get("map_session_id") or "").strip()
         map_name = str(
             payload.get("active_map")
             or loaded_map
@@ -398,7 +400,9 @@ class RosBridge:
                 session_ready and companion_ready and algorithm_running
             )
             recovered_to_ready = incoming_ready and previous_health != "ready"
-            if incoming_ready and (
+            if session_id:
+                self._status_generation = 0
+            elif incoming_ready and (
                 self._status_generation == 0
                 or began_session
                 or changed_map
@@ -408,6 +412,7 @@ class RosBridge:
                 self._status_generation += 1
             self._status_state = state
             self._status_map_name = map_name
+            self._status_session_id = session_id
             self._status_companion_ready = companion_ready
             self._status_algorithm_running = algorithm_running
             self._status_session_ready = session_ready
@@ -525,6 +530,8 @@ class RosBridge:
     def _map_session_id_locked(self) -> str | None:
         if self._map_session_health_locked() != "ready":
             return None
+        if self._status_session_id:
+            return f"{self._status_map_name}#{self._status_session_id}"
         if self._status_generation <= 0:
             return None
         return f"{self._status_map_name}#local-{self._status_generation}"
@@ -533,6 +540,14 @@ class RosBridge:
         # This is deliberately a process-local identity. Its purpose is to
         # prevent points from crossing a bridge restart or an observed map
         # state transition while recorded points remain available.
+        if self._status_session_id:
+            return "|".join(
+                (
+                    self._bridge_instance_id,
+                    self._status_session_id,
+                    self._status_map_name or "unknown",
+                )
+            )
         return "|".join(
             (
                 self._bridge_instance_id,
@@ -555,7 +570,9 @@ class RosBridge:
             return "companion_not_ready"
         if not self._status_algorithm_running:
             return "algorithm_not_running"
-        if not self._status_session_ready or self._status_generation <= 0:
+        if not self._status_session_ready or (
+            not self._status_session_id and self._status_generation <= 0
+        ):
             return "not_mapping"
         return "ready"
 

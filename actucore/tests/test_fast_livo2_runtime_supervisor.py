@@ -178,6 +178,34 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertNotIn("ReliabilityPolicy.RELIABLE", method)
         self.assertNotIn("depth=200", method)
 
+    def test_heartbeat_keeps_runtime_session_id_across_readiness_changes(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lock = threading.RLock()
+        supervisor._process = mock.Mock()
+        supervisor._process.poll.return_value = None
+        supervisor._active_map = None
+        supervisor._loaded_map = "office"
+        supervisor._runtime_mode = "localization"
+        supervisor._runtime_session_id = "runtime-a"
+        supervisor._diagnostics = {"ready": True}
+        supervisor._collection_snapshot = lambda: {}
+        supervisor._collection_status_pub = _CapturePublisher()
+        payloads = []
+        supervisor._publish = payloads.append
+
+        supervisor._publish_heartbeat()
+        supervisor._diagnostics = {"ready": False}
+        supervisor._publish_heartbeat()
+
+        self.assertEqual(
+            [payload["map_session_id"] for payload in payloads],
+            ["runtime-a", "runtime-a"],
+        )
+        self.assertEqual(
+            [payload["companion_ready"] for payload in payloads],
+            [True, False],
+        )
+
     def test_cached_map_view_refreshes_pose_without_reencoding_points(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()

@@ -99,6 +99,7 @@ class FastLivo2Supervisor(Node):
         self._loaded_map: str | None = None
         self._runtime_mode = "idle"
         self._started_unix_ms: int | None = None
+        self._runtime_session_id: str | None = None
         self._files_before: dict[str, tuple[int, int]] = {}
         self._pending_mapping_finalize: dict | None = None
         self._last_mapping_result: dict | None = None
@@ -673,6 +674,7 @@ class FastLivo2Supervisor(Node):
             self._files_before = self._pcd_files()
             self._diagnostics = {}
             self._diagnostics_monotonic = None
+            self._runtime_session_id = None
             reset = String()
             reset.data = map_name
             self._reset_pub.publish(reset)
@@ -691,6 +693,7 @@ class FastLivo2Supervisor(Node):
             self._loaded_map = None
             self._runtime_mode = "mapping"
             self._started_unix_ms = int(time.time() * 1000)
+            self._runtime_session_id = uuid.uuid4().hex
             self._last_mapping_result = None
             return {"status": "mapping", "map_name": map_name, "pid": self._process.pid, "session_local": True}
 
@@ -708,6 +711,7 @@ class FastLivo2Supervisor(Node):
             self._process = None
             self._active_map = None
             self._started_unix_ms = None
+            self._runtime_session_id = None
             self._runtime_mode = "idle"
             self._pending_mapping_finalize = None
 
@@ -1204,6 +1208,7 @@ class FastLivo2Supervisor(Node):
                     self._loaded_map = map_name
                     self._runtime_mode = "localization"
                     self._started_unix_ms = None
+                    self._runtime_session_id = None
                 return {
                     **cleanup,
                     "error_code": "algorithm_start_cleanup_pending",
@@ -1231,6 +1236,7 @@ class FastLivo2Supervisor(Node):
                     self._loaded_map = map_name
                     self._runtime_mode = "localization"
                     self._started_unix_ms = None
+                    self._runtime_session_id = None
                 return {
                     **cleanup,
                     "error_code": "algorithm_start_cleanup_pending",
@@ -1253,6 +1259,7 @@ class FastLivo2Supervisor(Node):
             self._loaded_map = map_name
             self._runtime_mode = "localization"
             self._started_unix_ms = int(time.time() * 1000)
+            self._runtime_session_id = uuid.uuid4().hex
         return {
             **loaded,
             "pid": process.pid,
@@ -1298,6 +1305,7 @@ class FastLivo2Supervisor(Node):
             self._loaded_map = None
             self._runtime_mode = "idle"
             self._started_unix_ms = None
+            self._runtime_session_id = None
         if stop_error is not None:
             return {
                 **stop_error,
@@ -1767,6 +1775,7 @@ class FastLivo2Supervisor(Node):
                 "status": runtime_state,
                 "active_map": self._active_map,
                 "loaded_map": self._loaded_map,
+                "map_session_id": self._runtime_session_id,
                 "runtime_mode": self._runtime_mode,
                 "algorithm_running": running,
                 "companion_ready": bool(diagnostics.get("ready", False)),
@@ -1835,6 +1844,7 @@ class FastLivo2Supervisor(Node):
                     self._active_map = None
                     self._loaded_map = None
                     self._started_unix_ms = None
+                    self._runtime_session_id = None
                     self._runtime_mode = "idle"
                     self._pending_mapping_finalize = None
             with self._collection_lifecycle_lock:

@@ -809,6 +809,7 @@ class PureHelperTests(unittest.TestCase):
         bridge.status_topic = ""
         bridge._status_state = ""
         bridge._status_map_name = ""
+        bridge._status_session_id = ""
         bridge._status_generation = 0
         bridge._status_received_monotonic = None
         bridge._status_companion_ready = False
@@ -1018,33 +1019,39 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(bridge.current_map_session_id, "demo#local-2")
         self.assertNotEqual(bridge.current_map_session_token, ready_token)
 
-    def test_algorithm_and_companion_recovery_roll_session_epoch(self):
+    def test_runtime_session_id_survives_health_recovery_but_changes_on_restart(self):
         bridge = self._bare_ros_bridge()
         bridge.status_topic = "/ubuntu/navigation/fast_livo2/status"
         heartbeat = {
             "schema": "phanthy.navigation.fast_livo2_status.v1",
             "state": "mapping",
             "active_map": "demo",
+            "map_session_id": "runtime-a",
             "algorithm_running": True,
             "companion_ready": True,
         }
         bridge._on_status(SimpleNamespace(data=json.dumps(heartbeat)))
+        self.assertEqual(bridge.current_map_session_id, "demo#runtime-a")
         first_token = bridge.current_map_session_token
 
         algorithm_down = {**heartbeat, "algorithm_running": False}
         bridge._on_status(SimpleNamespace(data=json.dumps(algorithm_down)))
         self.assertFalse(bridge.map_session_ready)
         bridge._on_status(SimpleNamespace(data=json.dumps(heartbeat)))
-        self.assertEqual(bridge.current_map_session_id, "demo#local-2")
-        second_token = bridge.current_map_session_token
-        self.assertNotEqual(second_token, first_token)
+        self.assertEqual(bridge.current_map_session_id, "demo#runtime-a")
+        self.assertEqual(bridge.current_map_session_token, first_token)
 
         companion_down = {**heartbeat, "companion_ready": False}
         bridge._on_status(SimpleNamespace(data=json.dumps(companion_down)))
         self.assertFalse(bridge.map_session_ready)
         bridge._on_status(SimpleNamespace(data=json.dumps(heartbeat)))
-        self.assertEqual(bridge.current_map_session_id, "demo#local-3")
-        self.assertNotEqual(bridge.current_map_session_token, second_token)
+        self.assertEqual(bridge.current_map_session_id, "demo#runtime-a")
+        self.assertEqual(bridge.current_map_session_token, first_token)
+
+        restarted = {**heartbeat, "map_session_id": "runtime-b"}
+        bridge._on_status(SimpleNamespace(data=json.dumps(restarted)))
+        self.assertEqual(bridge.current_map_session_id, "demo#runtime-b")
+        self.assertNotEqual(bridge.current_map_session_token, first_token)
 
     def test_confirmed_relocalization_is_a_ready_map_session(self):
         bridge = self._bare_ros_bridge()
