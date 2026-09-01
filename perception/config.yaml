@@ -59,6 +59,13 @@ plugins:
     classes: []         # empty = default broad set
     fps: 5
 
+  person_area:
+    enabled: true
+    # Visual area only: this does not estimate metres and never drives the robot.
+    model: "yolov8s-worldv2"
+    confidence: 0.5
+    fps: 5
+
   ocr:
     enabled: true
     provider: rapidocr

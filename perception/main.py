@@ -111,6 +111,15 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("person_area", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["person_area"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.person_area import PersonAreaPlugin
+            self._plugins.append(PersonAreaPlugin(plugins_cfg["person_area"], namespace, executor))
+            log.info("PersonAreaPlugin loaded (namespace=%s)", namespace)
+
         if plugins_cfg.get("ocr", {}).get("enabled", False):
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
