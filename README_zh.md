@@ -82,6 +82,10 @@ Dashboard（`http://<设备IP>:15678`）提供：
 
 ![智能体定义](docs/images/agent-definition.png)
 
+### 飞书消息渠道
+
+通过飞书自建应用与 Agent 双向收发文本和附件。完整步骤见[飞书 Channel 配置与收发验收](docs/feishu-channel-setup.md)。
+
 ### 历史日志
 
 浏览历史 Agent 会话，查看完整事件轨迹和工具调用结果。

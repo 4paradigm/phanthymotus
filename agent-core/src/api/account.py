@@ -90,14 +90,13 @@ async def register(req: RegisterRequest):
     而仪表盘是跨域调用、拿不到那个 cookie，所以注册成功后必须再走一次登录。
     """
     identifier = req.identifier.strip()
-    if not identifier or not req.password:
-        return {'code': 422, 'error': '请输入账号和密码'}
+    name = req.name.strip()
+    if not identifier or not req.password or not name:
+        return {'code': 422, 'error': '请输入账号、密码和昵称'}
     if len(req.password) < 8:
         return {'code': 422, 'error': '密码至少 8 位'}
 
-    body = {'identifier': identifier, 'password': req.password}
-    if req.name.strip():
-        body['name'] = req.name.strip()
+    body = {'identifier': identifier, 'password': req.password, 'name': name}
 
     result = await _rc('POST', '/api/auth/register', None, body)
     if not result['ok']:

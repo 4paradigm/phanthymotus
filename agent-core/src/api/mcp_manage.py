@@ -895,7 +895,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
 
     # ── Handle internal channel MCP ──
     if mcp_id == 'channel':
-        from channel.manager import manager as channel_mgr
+        from channel.manager import channel_request_topic, manager as channel_mgr
 
         def _card_channel(tool: str, instance_id: str) -> str:
             if not instance_id:
@@ -920,8 +920,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             elif action == 'info':
                 channel_id = req.arguments.get('channel_id', '') or _card_channel(
                     'channel_request', instance_id)
-                topic_id = channel_id.replace(' ', '_') if channel_id else ''
-                topic = f'/channel/request/{topic_id}' if topic_id else '/channel/request'
+                topic = channel_request_topic(channel_id)
                 return {'code': 200, 'data': {'topic_out': [{'topic': topic, 'format': 'data/json'}]}}
             return {'code': 200, 'data': None}
         if req.tool == 'channel_reply':
@@ -941,10 +940,21 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             elif action == 'send':
                 text = req.arguments.get('text', '')
                 files = req.arguments.get('files', []) or []
+                mention_open_id = req.arguments.get('mention_open_id', '')
+                source_message_id = req.arguments.get('source_message_id', '')
+                trusted_bot_id = req.arguments.get('trusted_bot_id', '')
+                expect_reply = req.arguments.get('expect_reply', False)
                 if not text and not files:
                     return {'code': 200, 'data': {'error': 'text or files is required'}}
-                result = await channel_mgr.send_reply(instance_id=instance_id,
-                                                     text=text, files=files)
+                result = await channel_mgr.send_reply(
+                    instance_id=instance_id,
+                    text=text,
+                    files=files,
+                    mention_open_id=mention_open_id,
+                    source_message_id=source_message_id,
+                    expect_reply=expect_reply,
+                    trusted_bot_id=trusted_bot_id,
+                )
                 return {'code': 200, 'data': {'result': result}}
             return {'code': 200, 'data': None}
         return {'code': 200, 'data': None}

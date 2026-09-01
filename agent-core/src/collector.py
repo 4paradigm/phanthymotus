@@ -182,6 +182,11 @@ async def drain_steering() -> list[dict]:
     return items
 
 
+def defer_priority(events: list[dict]) -> None:
+    """Queue events for isolated follow-up turns after the current turn."""
+    _priority_pending.extend(events)
+
+
 async def next_trigger() -> dict:
     """阻塞等待下一批 P>0 事件（main agent 消费端）。"""
     # Fallback: 每次等待前再检查一次 pending 队列，防止遗漏
@@ -202,6 +207,163 @@ def get_available_sources() -> list[str]:
     return list(_source_ring.keys())
 
 
+def _channel_payloads(events: list[dict]) -> list[dict]:
+    payloads = []
+    for ev in events:
+        if '/channel/request/' not in str(ev.get('source', '')):
+            continue
+        text = ev.get('text', '')
+        if not isinstance(text, str) or not text.startswith('{'):
+            continue
+        try:
+            payload = _json.loads(text)
+            if isinstance(payload, dict):
+                payloads.append(payload)
+        except (ValueError, TypeError):
+            continue
+    return payloads
+
+
+def _bot_channel_payloads(events: list[dict]) -> list[dict]:
+    return [payload for payload in _channel_payloads(events)
+            if payload.get('sender_type') in ('bot', 'app')]
+
+
+def _human_channel_payloads(events: list[dict]) -> list[dict]:
+    return [payload for payload in _channel_payloads(events)
+            if payload.get('sender_type') not in ('bot', 'app')]
+
+
+def has_viewer_only_channel_event(events: list[dict]) -> bool:
+    """Return whether a batch has human Channel message(s) but none from an
+    operator/owner-role user — i.e. every human sender here is read-only.
+
+    ACL role has historically only ever been passed to the LLM as informational
+    text (see channel/acl.py); nothing gated the tool set on it. This flag lets
+    event/llm.py actually restrict a viewer-only turn the same way it already
+    restricts untrusted-bot turns.
+    """
+    human_payloads = _human_channel_payloads(events)
+    if not human_payloads:
+        return False
+    return not any(p.get('user_role') in ('operator', 'owner') for p in human_payloads)
+
+
+def channel_message_ids(events: list[dict]) -> list[str]:
+    """Return message IDs for every Channel payload (human + bot) in a batch."""
+    return [payload['message_id'] for payload in _channel_payloads(events)
+            if isinstance(payload.get('message_id'), str) and payload['message_id']]
+
+
+def bot_channel_message_ids(events: list[dict]) -> list[str]:
+    """Return bot/app message IDs from trusted Channel event payloads."""
+    return [payload['message_id'] for payload in _bot_channel_payloads(events)
+            if isinstance(payload.get('message_id'), str) and payload['message_id']]
+
+
+def has_bot_channel_event(events: list[dict]) -> bool:
+    """Return whether a batch contains a trusted Channel bot/app marker."""
+    return bool(_bot_channel_payloads(events))
+
+
+def _trusted_bot_channel_payloads(events: list[dict]) -> list[dict]:
+    from channel.manager import manager as channel_manager
+    return [payload for payload in _bot_channel_payloads(events)
+            if channel_manager.is_trusted_bot_message(payload)]
+
+
+def has_trusted_bot_channel_event(events: list[dict]) -> bool:
+    return bool(_trusted_bot_channel_payloads(events))
+
+
+def _bot_trust_class(events: list[dict]) -> int:
+    if has_trusted_bot_channel_event(events):
+        return 2
+    return 1 if has_bot_channel_event(events) else 0
+
+
+def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
+    """Keep trusted bots, other bots, and people in separate LLM turns."""
+    batches = []
+    for ev in events:
+        if not batches or _bot_trust_class([batches[-1][0]]) != _bot_trust_class([ev]):
+            batches.append([])
+        batches[-1].append(ev)
+    return batches
+
+
+def _chat_history_blocks(batch: list[dict]) -> str:
+    """Prepend each distinct (channel_id, chat_id)'s own recent recap (see
+    channel/manager.py:get_chat_history) ahead of this batch's <event> blocks.
+
+    The shared global turn history (event/llm.py:self._turns) doesn't separate
+    by chat — this gives the model an explicit, scoped reminder of what this
+    exact conversation said, so it's less likely to answer person A with
+    context that only came from person B.
+    """
+    from channel.manager import manager as channel_manager
+    seen = set()
+    blocks = []
+    for payload in _channel_payloads(batch):
+        channel_id = payload.get('channel_id')
+        chat_id = payload.get('chat_id')
+        if not isinstance(channel_id, str) or not isinstance(chat_id, str):
+            continue
+        if not channel_id or not chat_id or (channel_id, chat_id) in seen:
+            continue
+        seen.add((channel_id, chat_id))
+        history = channel_manager.get_chat_history(channel_id, chat_id)
+        if not history:
+            continue
+        lines = []
+        for entry in history:
+            label = f' ({entry["user_label"]})' if entry.get('user_label') else ''
+            lines.append(f'{entry.get("role", "user")}{label}: {entry.get("text", "")}')
+        blocks.append(
+            f'<chat_history channel="{channel_id}" chat_id="{chat_id}">\n'
+            + '\n'.join(lines) + '\n</chat_history>'
+        )
+    return '\n'.join(blocks)
+
+
+def _build_trigger(batch: list[dict], urgent: bool) -> dict:
+    channel_ids = []
+    for payload in _channel_payloads(batch):
+        channel_id = payload.get('channel_id')
+        if isinstance(channel_id, str) and channel_id and channel_id not in channel_ids:
+            channel_ids.append(channel_id)
+    bot_payloads = _bot_channel_payloads(batch)
+    trusted_payloads = _trusted_bot_channel_payloads(batch)
+    history_text = _chat_history_blocks(batch)
+    formatted = _format_priority_batch(batch)
+    trigger = {
+        'source': 'collector',
+        'text': f'{history_text}\n{formatted}' if history_text else formatted,
+        'payload': {
+            'event_count': len(batch),
+            'sources': [e['source'] for e in batch],
+            'channel_ids': channel_ids,
+        },
+        'ts': batch[-1]['ts'],
+        '_perf_trigger_emit_ts': time.time(),
+        '_urgent': urgent,
+        '_bot_channel_event': bool(bot_payloads),
+        '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
+        '_viewer_channel_event': has_viewer_only_channel_event(batch),
+        '_channel_message_ids': channel_message_ids(batch),
+        '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
+                                     if isinstance(p.get('message_id'), str) and p['message_id']],
+    }
+    from channel.manager import manager as channel_manager
+    for payload in trusted_payloads:
+        channel_manager.consume_trusted_bot_message(payload.get('message_id', ''))
+    for ev in reversed(batch):
+        if '_perf_spans' in ev:
+            trigger['_perf_spans'] = ev['_perf_spans']
+            break
+    return trigger
+
+
 # ── 内部：P>0 管道 ────────────────────────────────────────────────────────────
 
 def _flush_all_pending():
@@ -215,26 +377,14 @@ def _flush_all_pending():
             break
     # 再把 _priority_pending 全部 emit 到 _output
     if _priority_pending:
-        batch = list(_priority_pending)
+        pending = list(_priority_pending)
         _priority_pending.clear()
         # 同步放入 _output（非 async，避免 fire-and-forget 丢失）
-        formatted = _format_priority_batch(batch)
-        trigger = {
-            'source': 'collector',
-            'text': formatted,
-            'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
-            'ts': batch[-1]['ts'],
-            '_perf_trigger_emit_ts': time.time(),
-            '_urgent': True,
-        }
-        for ev in reversed(batch):
-            if '_perf_spans' in ev:
-                trigger['_perf_spans'] = ev['_perf_spans']
-                break
-        try:
-            _output.put_nowait(trigger)
-        except asyncio.QueueFull:
-            print('[collector] WARNING: _output queue full, pending messages dropped')
+        for batch in _split_by_bot_trust(pending):
+            try:
+                _output.put_nowait(_build_trigger(batch, urgent=True))
+            except asyncio.QueueFull:
+                print('[collector] WARNING: _output queue full, pending messages dropped')
 
 
 async def _emit_priority():
@@ -248,20 +398,8 @@ async def _emit_priority():
 
 async def _emit_batch(batch: list[dict], urgent: bool = False):
     """将 P>0 事件格式化并放入 output。"""
-    formatted = _format_priority_batch(batch)
-    trigger = {
-        'source': 'collector',
-        'text': formatted,
-        'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
-        'ts': batch[-1]['ts'],
-        '_perf_trigger_emit_ts': time.time(),
-        '_urgent': urgent,
-    }
-    for ev in reversed(batch):
-        if '_perf_spans' in ev:
-            trigger['_perf_spans'] = ev['_perf_spans']
-            break
-    await _output.put(trigger)
+    for trusted_batch in _split_by_bot_trust(batch):
+        await _output.put(_build_trigger(trusted_batch, urgent))
 
 
 # 对 LLM 决策无意义的 perf/trace 字段（已独立存入 perf_spans 表）
@@ -497,6 +635,9 @@ async def _drain_loop():
 
                 # 按模式处理
                 if _interrupt_mode == 'steer':
+                    if has_bot_channel_event([ev]):
+                        _priority_pending.append(ev)
+                        continue
                     # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过
                     if 'scheduler:' in source.lower():
                         _dedup = False
@@ -515,12 +656,13 @@ async def _drain_loop():
                 elif _interrupt_mode == 'interrupt':
                     # Interrupt: 缓存事件并触发 cancel
                     _priority_pending.append(ev)
-                    if _cancel_event:
+                    if _cancel_event and not has_bot_channel_event([ev]):
                         _cancel_event.set()
                 else:
                     # Followup: 暂存，等 turn 结束后 drain（原有行为）
                     _priority_pending.append(ev)
-                    if priority > _current_turn_priority and _cancel_event:
+                    if (priority > _current_turn_priority and _cancel_event
+                            and not has_bot_channel_event([ev])):
                         _cancel_event.set()
         else:
             # ── P=0: 送 bg buffer ──

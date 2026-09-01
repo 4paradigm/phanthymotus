@@ -690,6 +690,29 @@
       <div class="channel-list" id="channel-list">
         <div class="channel-empty">Loading...</div>
       </div>
+      <div class="channel-users-panel" id="channel-users-panel">
+        <div class="channel-users-header">
+          <span class="channel-users-title">Users</span>
+          <span class="channel-users-hint">Role controls what a Channel-triggered turn may do — see docs/feishu-channel-setup.md</span>
+        </div>
+        <div class="channel-users-list" id="channel-users-list"></div>
+        <div class="channel-users-add">
+          <select id="channel-user-form-platform">
+            <option value="telegram">Telegram</option>
+            <option value="slack">Slack</option>
+            <option value="feishu">Feishu</option>
+          </select>
+          <input type="text" id="channel-user-form-id" placeholder="user_id" title="Platform user ID, e.g. ou_... for Feishu" />
+          <input type="text" id="channel-user-form-name" placeholder="Name (optional)" />
+          <select id="channel-user-form-role">
+            <option value="owner">Owner</option>
+            <option value="operator">Operator</option>
+            <option value="viewer" selected>Viewer</option>
+            <option value="blocked">Blocked</option>
+          </select>
+          <button class="btn-primary btn-sm" id="channel-user-form-add">Add</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>

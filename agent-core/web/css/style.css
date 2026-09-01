@@ -1987,7 +1987,8 @@ html, body {
 .svc-row-version-line {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;          /* 版本太长时「→ 新版本」整块换行，而不是把当前版本挤没 */
+  gap: 2px 6px;
   min-width: 0;
 }
 .svc-row-version {
@@ -1999,6 +2000,14 @@ html, body {
   white-space: nowrap;
   min-width: 0;
 }
+/* 箭头和新版本号必须同进同退，否则换行会把「→」单独留在上一行 */
+.svc-row-update {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
 .svc-row-arrow {
   font-size: 12px;
   color: var(--text-dim);
@@ -2009,7 +2018,10 @@ html, body {
   font-family: var(--font-mono);
   color: var(--accent);
   font-weight: 600;
-  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .svc-row-actions {
@@ -6156,7 +6168,7 @@ html, body {
 /* ── Channel Settings Modal ─────────────────────────────────────────────────── */
 
 .channel-modal {
-  width: 520px;
+  width: 640px;
 }
 @media (max-width: 768px) {
   .channel-modal {
@@ -6176,6 +6188,7 @@ html, body {
 .channel-toolbar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-bottom: 12px;
 }
 .channel-list {
@@ -6247,6 +6260,12 @@ html, body {
   padding: 16px;
   margin-bottom: 12px;
 }
+/* Appended straight after .channel-item-actions with insertAdjacentHTML —
+   .channel-add-form's own margin is margin-bottom only, so without this the
+   button row above sits flush against this box's border. */
+.channel-trusted-form {
+  margin-top: 12px;
+}
 .channel-form-row {
   margin-bottom: 10px;
 }
@@ -6259,6 +6278,7 @@ html, body {
 }
 .channel-form-row input[type="text"],
 .channel-form-row input[type="password"],
+.channel-form-row textarea,
 .channel-form-row select {
   width: 100%;
   padding: 6px 10px;
@@ -6273,6 +6293,200 @@ html, body {
   gap: 8px;
   margin-top: 12px;
 }
+/* Trusted Bots — one card per Bot instead of a table row, since a group
+   chat_id + open_id pair is long enough that a 4-column grid forces every
+   field below a usable width in a 640px modal. Name/ID share a row (short,
+   human-facing); chat_id/open_id share the row below (long, monospace,
+   looked up from Feishu rather than typed from memory). */
+.trusted-bot-card {
+  position: relative;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 40px 10px 12px;
+  margin-bottom: 8px;
+}
+.trusted-bot-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 10px;
+}
+.tb-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.tb-field span {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.tb-field input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-family: var(--font-ui);
+}
+.tb-field input.mono {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+.trusted-bot-remove {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.trusted-bot-remove:hover {
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+/* ── Users panel ──────────────────────────────────────────────────────────── */
+
+.channel-users-panel {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.channel-users-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.channel-users-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.channel-users-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+.channel-users-list {
+  margin-bottom: 4px;
+}
+/* Flex, not a grid: identity is the only column that should truncate —
+   role/platform/dot stay fixed-width and always fully readable, since role
+   is the one field this whole panel exists to let someone scan at a glance. */
+.user-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.user-role-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.user-role-dot[data-role="owner"]    { background: var(--accent); }
+.user-role-dot[data-role="operator"] { background: var(--green); }
+.user-role-dot[data-role="viewer"]   { background: var(--text-dim); }
+.user-role-dot[data-role="blocked"]  { background: var(--red); }
+.user-platform-badge {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: var(--bg-input);
+  border-radius: var(--radius-xs);
+  padding: 2px 6px;
+}
+.user-identity {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  overflow: hidden;
+}
+.user-name {
+  color: var(--text);
+  white-space: nowrap;
+}
+.user-name.mono {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.user-id {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-role-select {
+  flex: 0 0 100px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-family: var(--font-ui);
+}
+.user-remove {
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.user-remove:hover {
+  background: var(--red-bg);
+  color: var(--red);
+}
+/* Quiet inline row, not the accent-bordered .channel-add-form treatment —
+   that border means "you're mid-edit" elsewhere in this modal (Add Channel,
+   Trusted Bots); this row is always present, so wrapping it the same way
+   would falsely read as an open edit state. */
+.channel-users-add {
+  display: flex;
+  gap: 8px;
+  padding-top: 10px;
+}
+.channel-users-add select,
+.channel-users-add input {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 0.8rem;
+  font-family: var(--font-ui);
+}
+.channel-users-add select:first-child { flex: 0 0 92px; }
+#channel-user-form-id   { flex: 1 1 120px; min-width: 0; }
+#channel-user-form-name { flex: 1 1 100px; min-width: 0; }
+.channel-users-add select:last-of-type { flex: 0 0 88px; }
 
 /* ── Login Screen ───────────────────────────────────────────────────────────── */
 
@@ -7289,6 +7503,29 @@ html, body {
   font-size: 11px;
   cursor: pointer;
 }
+.account-token-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.account-token-value {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-token-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.account-token-reset { color: var(--red); }
 
 .account-form {
   display: flex;

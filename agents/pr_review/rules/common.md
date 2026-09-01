@@ -50,7 +50,7 @@ https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/
 The established patterns, in rough order of preference:
 
 1. **Dockerfile `ARG` pointing at COS** — how `unitree/g1`, `unitree/go2`,
-   `unitree/r1` and `pnpbotics/adam` all obtain `cyclonedds-0.10.5.tar.gz`.
+   `unitree/r1` and `pndbotics/adam` all obtain `cyclonedds-0.10.5.tar.gz`.
    This is the right answer for a driver needing an SDK tarball.
 2. **A manifest entry downloaded at runtime** — `perception/utils/model_downloader.py`
    does this for every ASR/TTS/KWS/VAD model.

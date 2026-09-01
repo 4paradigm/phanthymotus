@@ -59,6 +59,10 @@ class InboundMessage:
     text: str               # 消息文本（无文本时为附件占位描述，如 "[图片]"）
     message_id: str = ''    # 平台消息 ID（用于去重）
     attachments: list[Attachment] = field(default_factory=list)
+    sender_type: str = 'user'  # user | bot（部分旧事件使用 app）
+    chat_type: str = ''        # p2p | group
+    mentions: list[dict] = field(default_factory=list)
+    expect_reply: bool | None = None  # 机器人协作消息是否明确要求继续 @
 
 
 @dataclass
@@ -67,6 +71,8 @@ class OutboundMessage:
     chat_id: str            # 目标会话 ID
     text: str = ''          # 文本内容
     files: list[Attachment] = field(default_factory=list)  # 附件（图片/视频/文件）
+    mention_open_id: str = ''  # Feishu 群聊中的目标机器人 open_id
+    expect_reply: bool = False  # @ 消息是否要求目标机器人继续回复
     # 兼容旧调用方：直接给字节的图片
     image_bytes: bytes | None = None
     image_caption: str = ''

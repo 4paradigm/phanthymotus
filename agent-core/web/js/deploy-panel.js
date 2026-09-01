@@ -416,7 +416,7 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
         <div class="svc-row-version-line">
           <span class="svc-row-version">${versionText}</span>
           ${item._orphan ? '<span class="svc-ver-channel" title="该镜像与本机架构不匹配，或已从资源中心下架">架构不匹配</span>' : ''}
-          ${hasUpdate ? `<span class="svc-row-arrow">→</span><span class="svc-row-new-version">${latestTag}</span>` : ''}
+          ${hasUpdate ? `<span class="svc-row-update"><span class="svc-row-arrow">→</span><span class="svc-row-new-version">${latestTag}</span></span>` : ''}
         </div>
       </div>
       <div class="svc-row-actions">${actions}</div>

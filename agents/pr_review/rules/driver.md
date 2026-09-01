@@ -112,7 +112,7 @@ Pick the closest existing driver and check the new one against it. Good models:
 - `robotera/q5_bundle/` — best decomposition, one module per capability
 - `x-humanoid/tianyi2.0/` — largest complete bundle (30 plugins), has tests
 - `unitree/r1/`, `noetix/bumi/` — compact, conventional; good for a small driver
-- `dji/mavic3e/` — native-SDK C bridge; `pnpbotics/adam/` — gRPC vendor SDK;
+- `dji/mavic3e/` — native-SDK C bridge; `pndbotics/adam/` — gRPC vendor SDK;
   `unitree/go2/` — SLAM and spatial work
 
 Not models to copy: `deep_robotics/lynx_m20/` (empty `plugins:`, no

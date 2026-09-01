@@ -2,15 +2,18 @@
 channel/adapters/feishu.py — Feishu (Lark) adapter。
 
 **接收**用 lark-oapi SDK 的 WebSocket 长连接（出网连接，无需公网 IP / webhook），
-**所有 REST 调用**（发消息、上传/下载资源、健康探测）走 aiohttp 直连开放平台，
-不经过 SDK 的同步客户端——这样错误码可以统一处理，也不用为每个调用开线程池。
+**所有 REST 调用**（发消息、上传/下载资源、健康探测）走 aiohttp，
+并遵循标准的 HTTP(S) 代理环境变量。这些调用不经过 SDK 的同步客户端，
+便于统一处理错误码，也无需为每个调用开线程池。
 
 Requires: pip install lark-oapi
-Config: {app_id, app_secret, domain?}
+Config: {app_id, app_secret, domain?, bot_to_bot_enabled?}
 
 Required Feishu permissions:
 - im:message                — 接收消息
 - im:message:send_as_bot    — 以机器人身份发消息（只发文本时够了）
+- im:message.group_at_msg.include_bot:readonly
+                            — 接收群内其他机器人明确 @ 当前机器人（Bot @ Bot 时必需）
 - im:resource               — 上传/下载图片与文件（收发附件必需；仅发送也可用
                               im:resource:upload。缺它时文本能发出去、附件一律 99991672）
 - im:chat:readonly          — 列出会话（可选）
@@ -23,6 +26,7 @@ Event subscription:
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 
@@ -53,9 +57,14 @@ _TEXT_CHUNK = 3500
 
 # 探测结果缓存时长（秒）——status() 可能被前端高频轮询
 _PROBE_TTL = 15
+_BOT_ID_LOG_INTERVAL = 60
 
 # 去重窗口：飞书可能重投递同一事件
 _DEDUP_MAX = 512
+
+_BOT_REQUEST_LABEL = '【机器人协作请求·需要回复】'
+_BOT_FINAL_LABEL = '【机器人协作答复·无需回复】'
+_BOT_OPEN_ID_RE = re.compile(r'^ou_[A-Za-z0-9_-]+$')
 
 # 上传时的 file_type（飞书只认这几种，其余用 stream）
 _FILE_TYPE_BY_EXT = {
@@ -66,6 +75,19 @@ _FILE_TYPE_BY_EXT = {
 
 # SDK 把事件循环存在模块级变量里，多个飞书 channel 同时启动会互相覆盖
 _ws_loop_lock = threading.Lock()
+
+
+def _enable_sdk_env_proxy(ws_mod) -> None:
+    """Remove the SDK's explicit proxy disable once per imported module."""
+    current = getattr(ws_mod, '_ws_connect_kwargs', None)
+    if current is None or getattr(current, '_phanthy_env_proxy', False) is True:
+        return
+
+    def connect_kwargs():
+        return {key: value for key, value in current().items() if key != 'proxy'}
+
+    connect_kwargs._phanthy_env_proxy = True
+    ws_mod._ws_connect_kwargs = connect_kwargs
 
 
 class FeishuError(RuntimeError):
@@ -101,6 +123,11 @@ class FeishuAdapter(ChannelAdapter):
         self._last_event_ts = 0.0
         self._seen_ids: list[str] = []
         self._seen_set: set[str] = set()
+        self._duplicate_drops = 0
+        self._attachment_send_failures = 0
+        self._bot_open_id = ''
+        self._missing_bot_id_drops = 0
+        self._missing_bot_id_log_ts = 0.0
 
     # ── 基础设施：token / REST ────────────────────────────────────────────────
 
@@ -118,7 +145,7 @@ class FeishuAdapter(ChannelAdapter):
             }
             url = f'{self._domain}/open-apis/auth/v3/tenant_access_token/internal'
             timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as s:
                 async with s.post(url, json=payload) as resp:
                     data = await resp.json(content_type=None)
             code = data.get('code', -1)
@@ -136,14 +163,15 @@ class FeishuAdapter(ChannelAdapter):
 
     async def _request(self, method: str, path: str, *, json_body: dict | None = None,
                        params: dict | None = None, data=None,
-                       raw: bool = False, retry_auth: bool = True):
-        """调用开放平台 REST。raw=True 时返回 (bytes, headers)，否则返回 data 字段。"""
+                       raw: bool = False, return_body: bool = False,
+                       retry_auth: bool = True):
+        """调用开放平台 REST。raw=True 返回二进制；return_body=True 返回完整 JSON。"""
         token = await self._tenant_token()
         url = f'{self._domain}{path}'
         headers = {'Authorization': f'Bearer {token}'}
         timeout = aiohttp.ClientTimeout(total=120 if (data is not None or raw) else 20)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as s:
                 async with s.request(method, url, headers=headers, json=json_body,
                                      params=params, data=data) as resp:
                     ctype = resp.headers.get('Content-Type', '')
@@ -165,9 +193,10 @@ class FeishuAdapter(ChannelAdapter):
             if retry_auth and code in (99991663, 99991668, 99991661):
                 await self._tenant_token(force=True)
                 return await self._request(method, path, json_body=json_body, params=params,
-                                          data=data, raw=raw, retry_auth=False)
+                                          data=data, raw=raw, return_body=return_body,
+                                          retry_auth=False)
             raise FeishuError(code, body.get('msg', ''), self._hint(code))
-        return body.get('data', {})
+        return body if return_body else body.get('data', {})
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
@@ -229,6 +258,7 @@ class FeishuAdapter(ChannelAdapter):
         asyncio.set_event_loop(new_loop)
         with _ws_loop_lock:
             ws_mod.loop = new_loop
+            _enable_sdk_env_proxy(ws_mod)
         try:
             self._client.start()
         except Exception as e:
@@ -271,10 +301,18 @@ class FeishuAdapter(ChannelAdapter):
         if not force and time.time() - self._probe_ts < _PROBE_TTL:
             return self._probe_ok, self._probe_err
         try:
-            await self._request('GET', '/open-apis/bot/v3/info')
-            self._probe_ok, self._probe_err = True, ''
+            body = await self._request('GET', '/open-apis/bot/v3/info', return_body=True)
+            self._bot_open_id = ((body.get('bot') or {}).get('open_id') or '')
+            if self._bot_open_id:
+                self._missing_bot_id_drops = 0
+                self._missing_bot_id_log_ts = 0.0
+            if self.config.get('bot_to_bot_enabled') and not self._bot_open_id:
+                self._probe_ok = False
+                self._probe_err = 'bot-to-bot is enabled but /bot/v3/info returned no bot.open_id'
+            else:
+                self._probe_ok, self._probe_err = True, ''
         except FeishuError as e:
-            if e.code == 99991672:
+            if e.code == 99991672 and not self.config.get('bot_to_bot_enabled'):
                 self._probe_ok, self._probe_err = True, ''
             else:
                 self._probe_ok, self._probe_err = False, str(e)
@@ -303,6 +341,17 @@ class FeishuAdapter(ChannelAdapter):
 
     # ── 发送 ─────────────────────────────────────────────────────────────────
 
+    def _attachment_failure(self, att: Attachment, error: Exception) -> str:
+        """Return a bounded error and sample repeated attachment failure logs."""
+        self._attachment_send_failures += 1
+        identifier = str(att.name or att.path)[:128]
+        error_text = str(error)[:256]
+        if self._attachment_send_failures == 1 or self._attachment_send_failures % 100 == 0:
+            print('[feishu] attachment sends failed: '
+                  f'count={self._attachment_send_failures} latest={identifier!r} '
+                  f'error_type={type(error).__name__}')
+        return f'- {identifier!r}: {error_text!r}'
+
     async def send_message(self, msg: OutboundMessage) -> None:
         """Send text and/or attachments via Feishu Open API."""
         if not self._running:
@@ -320,7 +369,68 @@ class FeishuAdapter(ChannelAdapter):
                                           kind=KIND_IMAGE, name='image.jpg',
                                           mime='image/jpeg', fallback_ext='.jpg'))
 
-        if msg.text:
+        if msg.mention_open_id:
+            if not self.config.get('bot_to_bot_enabled'):
+                raise ValueError('Feishu bot-to-bot is disabled for this channel')
+            if not _BOT_OPEN_ID_RE.fullmatch(msg.mention_open_id):
+                raise ValueError('mention_open_id must be a valid Feishu ou_... open_id')
+            if msg.mention_open_id == self._bot_open_id:
+                raise ValueError('Cannot @ this Feishu bot itself')
+            if not msg.text.strip():
+                raise ValueError('Bot mention requires a concrete text request or result')
+            label = _BOT_REQUEST_LABEL if msg.expect_reply else _BOT_FINAL_LABEL
+            wire_text = f'{label}\n<at user_id="{msg.mention_open_id}"></at> {msg.text}'
+            if len(wire_text) > _TEXT_CHUNK:
+                raise ValueError(
+                    f'Bot mention is too long ({len(wire_text)} chars); shorten it below '
+                    f'{_TEXT_CHUNK} chars so the @ is delivered in one message'
+                )
+            if files:
+                content = [[
+                    {'tag': 'text', 'text': f'{label}\n'},
+                    {'tag': 'at', 'user_id': msg.mention_open_id},
+                    {'tag': 'text', 'text': f' {msg.text}'},
+                ]]
+                sent_files = []
+                failures = []
+                standalone = []
+                for att in files:
+                    if att.kind not in (KIND_IMAGE, KIND_VIDEO):
+                        standalone.append(att)
+                        continue
+                    try:
+                        if att.kind == KIND_IMAGE:
+                            element = {
+                                'tag': 'img',
+                                'image_key': await self._upload_image(att.path),
+                            }
+                        else:
+                            element = {
+                                'tag': 'media',
+                                'file_key': await self._upload_file(att.path, att.name),
+                            }
+                        content.append([element])
+                        if att.caption:
+                            content.append([{'tag': 'text', 'text': att.caption}])
+                        sent_files.append(att.name or att.path)
+                    except Exception as e:
+                        failures.append(self._attachment_failure(att, e))
+
+                await self._send_raw(msg.chat_id, 'post', {
+                    'zh_cn': {'title': '', 'content': content},
+                })
+                sent = ['文本', *sent_files]
+                for att in standalone:
+                    try:
+                        await self._send_attachment(msg.chat_id, att)
+                        sent.append(att.name or att.path)
+                    except Exception as e:
+                        failures.append(self._attachment_failure(att, e))
+                if failures:
+                    raise PartialSendError(sent, failures)
+                return
+            await self._send_raw(msg.chat_id, 'text', {'text': wire_text})
+        elif msg.text:
             for chunk in _chunks(msg.text, _TEXT_CHUNK):
                 await self._send_raw(msg.chat_id, 'text', {'text': chunk})
 
@@ -335,8 +445,7 @@ class FeishuAdapter(ChannelAdapter):
                 await self._send_attachment(msg.chat_id, att)
                 sent.append(att.name or att.path)
             except Exception as e:
-                print(f'[feishu] send attachment failed ({att.name or att.path}): {e}')
-                failures.append(f'- {att.name or att.path}: {e}')
+                failures.append(self._attachment_failure(att, e))
         if failures:
             raise PartialSendError(sent, failures)
 
@@ -419,15 +528,32 @@ class FeishuAdapter(ChannelAdapter):
             message = event.message
             sender = event.sender
 
-            if sender.sender_type == 'app':
-                return  # 跳过机器人自己的消息
+            sender_id_obj = getattr(sender, 'sender_id', None)
+            sender_id = (
+                getattr(sender_id_obj, 'open_id', '')
+                or getattr(sender_id_obj, 'user_id', '')
+                or ''
+            )
+            mentions = []
+            for mention in (getattr(message, 'mentions', None) or []):
+                mention_id = getattr(mention, 'id', None)
+                mentions.append({
+                    'key': getattr(mention, 'key', '') or '',
+                    'open_id': getattr(mention_id, 'open_id', '') or '',
+                    'user_id': getattr(mention_id, 'user_id', '') or '',
+                    'name': getattr(mention, 'name', '') or '',
+                    'mentioned_type': getattr(mention, 'mentioned_type', '') or '',
+                })
 
             raw = {
                 'message_id': getattr(message, 'message_id', '') or '',
                 'message_type': getattr(message, 'message_type', '') or '',
                 'content': getattr(message, 'content', '') or '',
                 'chat_id': getattr(message, 'chat_id', '') or '',
-                'sender_id': (sender.sender_id.open_id or sender.sender_id.user_id or ''),
+                'chat_type': getattr(message, 'chat_type', '') or '',
+                'sender_id': sender_id,
+                'sender_type': getattr(sender, 'sender_type', '') or '',
+                'mentions': mentions,
             }
 
             self._last_event_ts = time.time()
@@ -449,6 +575,11 @@ class FeishuAdapter(ChannelAdapter):
         if not message_id:
             return False
         if message_id in self._seen_set:
+            self._duplicate_drops += 1
+            if self._duplicate_drops == 1 or self._duplicate_drops % 100 == 0:
+                safe_id = str(message_id)[:128]
+                print('[feishu] duplicate messages dropped: '
+                      f'count={self._duplicate_drops} latest_id={safe_id!r}')
             return True
         self._seen_set.add(message_id)
         self._seen_ids.append(message_id)
@@ -459,13 +590,55 @@ class FeishuAdapter(ChannelAdapter):
     async def _process_event(self, raw: dict) -> None:
         """在主 loop 上解析消息、下载附件、回调 manager。"""
         try:
+            sender_type = raw.get('sender_type', '')
+            if sender_type not in ('user', 'bot', 'app'):
+                return
+            is_bot = sender_type in ('bot', 'app')
+            if is_bot:
+                if not self.config.get('bot_to_bot_enabled'):
+                    return
+                if raw.get('chat_type') != 'group':
+                    return
+                if not self._bot_open_id:
+                    self._missing_bot_id_drops += 1
+                    now = time.time()
+                    if now - self._missing_bot_id_log_ts >= _BOT_ID_LOG_INTERVAL:
+                        print('[feishu] bot events dropped: own bot open_id unavailable '
+                              f'(count={self._missing_bot_id_drops})')
+                        self._missing_bot_id_drops = 0
+                        self._missing_bot_id_log_ts = now
+                    return
+                if raw.get('sender_id') == self._bot_open_id:
+                    return
+                if not any(
+                    mention.get('open_id') == self._bot_open_id
+                    for mention in raw.get('mentions', [])
+                ):
+                    return
+
             if self._is_duplicate(raw['message_id']):
-                print(f'[feishu] duplicate message dropped: {raw["message_id"]}')
                 return
 
             text, attachments = await self._parse_content(raw)
             if not text and not attachments:
                 return
+
+            expect_reply = None
+            if is_bot:
+                if text.startswith(_BOT_REQUEST_LABEL):
+                    expect_reply = True
+                    text = text[len(_BOT_REQUEST_LABEL):].lstrip()
+                elif text.startswith(_BOT_FINAL_LABEL):
+                    expect_reply = False
+                    text = text[len(_BOT_FINAL_LABEL):].lstrip()
+                else:
+                    # 兼容其他机器人：明确 @ 当前机器人视作一次协作请求。
+                    expect_reply = True
+
+            mentions = [
+                {**mention, 'is_self': mention.get('open_id') == self._bot_open_id}
+                for mention in raw.get('mentions', [])
+            ]
 
             msg = InboundMessage(
                 platform='feishu',
@@ -476,6 +649,10 @@ class FeishuAdapter(ChannelAdapter):
                 text=text,
                 message_id=raw['message_id'],
                 attachments=attachments,
+                sender_type=sender_type,
+                chat_type=raw.get('chat_type', ''),
+                mentions=mentions,
+                expect_reply=expect_reply,
             )
             await self._on_message(msg)
         except Exception as e:
@@ -531,6 +708,13 @@ class FeishuAdapter(ChannelAdapter):
                         if att:
                             attachments.append(att)
                             parts.append('[图片]')
+                    elif tag == 'media':
+                        att = await self._download(message_id, el.get('file_key', ''),
+                                                   'file', KIND_VIDEO,
+                                                   name='media.mp4', fallback_ext='.mp4')
+                        if att:
+                            attachments.append(att)
+                            parts.append('[视频]')
                 parts.append('\n')
             title = content.get('title', '')
             text = (f'{title}\n' if title else '') + ''.join(parts).strip()

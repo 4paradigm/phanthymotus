@@ -16,7 +16,6 @@ event/llm.py — 事件驱动的 Agent Loop。
 import asyncio
 import json
 import pathlib
-import re
 import time
 import typing
 
@@ -119,16 +118,99 @@ def _trim(message_list: list[dict], max_messages: int = 100, max_images: int = 5
 def _trigger_channel_ids(trigger_event: dict) -> list[str]:
     """本轮触发事件里涉及的 channel_id 列表（消息平台来源）。
 
-    collector 组装的 trigger 带 payload.sources，形如 ['dds:/channel/request/feishu_r1']
-    （见 collector._emit_batch）。用于判断「这一轮有人在某个渠道等回复」。
+    collector 从原始 Channel 事件 JSON 携带真实 ID；不能从 ROS-safe topic
+    反推，因为中文、空格等字符会被 slug/hash 转换。
     """
-    sources = (trigger_event.get('payload') or {}).get('sources') or []
+    channel_ids = (trigger_event.get('payload') or {}).get('channel_ids')
+    if not isinstance(channel_ids, list):
+        return []
     ids = []
-    for s in sources:
-        m = re.search(r'/channel/request/([^/\s]+)', str(s))
-        if m and m.group(1) not in ids:
-            ids.append(m.group(1))
+    for channel_id in channel_ids:
+        if isinstance(channel_id, str) and channel_id and channel_id not in ids:
+            ids.append(channel_id)
     return ids
+
+
+def _channel_tool_retry_message(trigger_event: dict, round_idx: int, text: str,
+                                retry_consumed: bool = False) -> str:
+    """首轮渠道回复漏掉工具调用时，给模型一次纠正机会。"""
+    channel_ids = _trigger_channel_ids(trigger_event)
+    if retry_consumed or round_idx != 0 or not channel_ids or not text.strip():
+        return ''
+    return (
+        '[system correction]\n'
+        f'This turn came from messaging channel(s): '
+        f'{json.dumps(channel_ids, ensure_ascii=False)}. '
+        'You produced reply text but called no tool, so nothing was delivered. '
+        'If a reply is warranted, call the bound channel_reply tool now with action="send" '
+        'and the reply text. If no reply is warranted, call finish. '
+        'Do not return content-only text again.'
+    )
+
+
+def _missed_channel_reply_warning(trigger_event: dict, replied_message_ids: set[str]) -> str:
+    """本轮触发涉及的 Channel 消息里，有没有一条都没被 channel_reply 覆盖到。
+
+    只检测「整轮零工具调用」（_channel_tool_retry_message）覆盖不了多人合批的场景：
+    一批里有 A、B 两条消息，模型只回复了 A，日志里看不出 B 被漏了。这里只产出一条
+    告警文本，不强制重试——模型判断"B 这条不需要回复"也是合法结果。
+    """
+    channel_ids = trigger_event.get('_channel_message_ids')
+    if not isinstance(channel_ids, list):
+        return ''
+    missed = [mid for mid in channel_ids if mid not in replied_message_ids]
+    if not missed:
+        return ''
+    return (f'{len(missed)} channel message(s) in this batch got no channel_reply: '
+            f'{json.dumps(missed, ensure_ascii=False)}')
+
+
+_BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
+
+
+def _restricted_channel_tool_allowed(name: str) -> bool:
+    """Shared allow-list for turns that must not mutate or actuate: untrusted-bot
+    Channel turns, and (see _viewer_channel_restricted) viewer-role human Channel
+    turns. May read state and reply, nothing else."""
+    if not name.startswith('mcp__'):
+        return name in _BOT_READ_ONLY_SYSTEM_TOOLS
+    if name == 'mcp__channel__channel_reply':
+        return True
+    parts = name.split('__')
+    entry = mcp_client.registry.get(parts[1] if len(parts) > 1 else '', {})
+    meta = entry.get('tool_meta', {}).get(name)
+    return bool(meta and meta.get('type') in ('sensor', 'resource'))
+
+
+def _bot_channel_restricted(trigger_event: dict) -> bool:
+    return bool(trigger_event.get('_bot_channel_event')) and not bool(
+        trigger_event.get('_trusted_bot_channel_event')
+    )
+
+
+def _viewer_channel_restricted(trigger_event: dict) -> bool:
+    """True when every human Channel message in this turn's batch came from a
+    'viewer' (or role-less) ACL user — no operator/owner present to justify
+    unlocking actuator/processor tools.
+
+    Before this, channel/acl.py's role levels were never enforced anywhere in
+    the dispatch path — `user_role` was only informational text handed to the
+    LLM. Any auto-approved Channel user could ask the model to call any bound
+    tool, actuators included, regardless of their recorded ACL role.
+    """
+    return bool(trigger_event.get('_viewer_channel_event'))
+
+
+def _channel_tool_restricted(trigger_event: dict) -> bool:
+    return _bot_channel_restricted(trigger_event) or _viewer_channel_restricted(trigger_event)
+
+
+def _bot_channel_reply_allowed(args: dict, source_message_ids: set[str]) -> bool:
+    """Keep bot replies on the current inbound message and text-only."""
+    return (
+        args.get('source_message_id') in source_message_ids
+        and not args.get('files')
+    )
 
 
 def _estimate_chars(turns: list[list[dict]]) -> int:
@@ -662,8 +744,9 @@ class Event:
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
                 # Fire on_error hook (LED feedback etc.)
-                import hooks
-                asyncio.create_task(hooks.fire('on_error'))
+                if not ev.get('_bot_channel_event'):
+                    import hooks
+                    asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
                 self._current_turn.append({
                     'role': 'assistant',
@@ -674,10 +757,11 @@ class Event:
                 collector.set_cancel_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)
-                import hooks as _hooks_idle
-                asyncio.create_task(_hooks_idle.fire('on_idle'))
-                # 无论成功失败，只要有消息就持久化
-                if self._current_turn:
+                if not ev.get('_bot_channel_event'):
+                    import hooks as _hooks_idle
+                    asyncio.create_task(_hooks_idle.fire('on_idle'))
+                # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
+                if self._current_turn and not ev.get('_bot_channel_event'):
                     self._save_current_turn(ev)
 
     def _save_current_turn(self, trigger_event: dict):
@@ -773,6 +857,11 @@ class Event:
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
+        bot_restricted = _bot_channel_restricted(trigger_event)
+        viewer_restricted = _viewer_channel_restricted(trigger_event)
+        tool_restricted = bot_restricted or viewer_restricted
+        bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
+        replied_message_ids: set[str] = set()
 
         # Reset Python sandbox namespace for this turn
         self._desktop_tools.reset_python_namespace()
@@ -802,10 +891,11 @@ class Event:
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
-        asyncio.create_task(hooks.fire('on_thinking'))
+        if not bot_restricted:
+            asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
-        if mcp_client.get_pending_actions():
+        if mcp_client.get_pending_actions() and not bot_restricted:
             _int_results = await hooks.fire('on_interrupt_all')
             if _int_results:
                 for aid in list(mcp_client._pending_actions.keys()):
@@ -835,8 +925,18 @@ class Event:
 
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
+        system_tools = list(self._sys_tools.values())
+        if tool_restricted:
+            system_tools = [
+                tool for tool in system_tools
+                if _restricted_channel_tool_allowed(tool['schema']['name'])
+            ]
+            bound_schemas = [
+                schema for schema in bound_schemas
+                if _restricted_channel_tool_allowed(schema['name'])
+            ]
         all_tool_list = (
-            [{'type': 'function', 'function': t['schema']} for t in self._sys_tools.values()]
+            [{'type': 'function', 'function': t['schema']} for t in system_tools]
             + [{'type': 'function', 'function': s} for s in bound_schemas]
         )
         # 绑定工具全名集合，用于 L2 环境快照过滤
@@ -857,6 +957,7 @@ class Event:
 
         round_idx = 0
         total_rounds = 0
+        channel_reply_retry_consumed = False
         while True:
             # ── 绝对上限检查 ──────────────────────────────────────────────
             if total_rounds >= absolute_max:
@@ -880,7 +981,7 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            history = self._build_history()
+            history = [] if bot_restricted else self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
             current_history = history + _sanitize(turn_messages)
 
@@ -943,7 +1044,7 @@ class Event:
                 if kind == LLMErrorKind.CONTEXT_OVERFLOW and round_idx == 0:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
-                    if len(self._turns) > 2:
+                    if len(self._turns) > 2 and not bot_restricted:
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
                         if self._summary:
@@ -1051,7 +1152,19 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if name in self._sys_tools:
+                if tool_restricted and not _restricted_channel_tool_allowed(name):
+                    reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
+                    result = (
+                        f'Error: this turn is tool-restricted ({reason}) and cannot call '
+                        'mutating, actuator, processor, or delegated execution tools.'
+                    )
+                elif (bot_restricted and name == 'mcp__channel__channel_reply'
+                      and not _bot_channel_reply_allowed(args, bot_reply_source_ids)):
+                    result = (
+                        'Error: bot-triggered replies must use the current source_message_id '
+                        'and cannot send files.'
+                    )
+                elif name in self._sys_tools:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
@@ -1086,6 +1199,10 @@ class Event:
                             print(f'[acp] interrupt: cancelled pending + fired {_hook_id} (source: {_tool}.{_act})')
                 else:
                     result = f'未知工具: {name}'
+
+                if (name == 'mcp__channel__channel_reply' and args.get('source_message_id')
+                        and isinstance(result, str) and not result.startswith('Error')):
+                    replied_message_ids.add(args['source_message_id'])
 
                 # 性能追踪：记录工具完成
                 _t_after = time.time()
@@ -1151,13 +1268,26 @@ class Event:
                 # 本轮由某个消息渠道触发，却一个工具都没调 → 用户那边是纯沉默：
                 # content 不会送达任何人。曾经因为这个丢过回复，而日志里只有
                 # 「turn complete: 1 rounds」看不出异常，只能去翻 llm_recent_request。
-                if round_idx == 0 and _trigger_channel_ids(trigger_event):
+                retry_message = _channel_tool_retry_message(
+                    trigger_event, round_idx, text, channel_reply_retry_consumed,
+                )
+                if retry_message:
+                    channel_reply_retry_consumed = True
+                    turn_messages.append({'role': 'user', 'content': retry_message})
+                    print('[decision] channel-triggered turn produced content without a tool call; retrying once')
+                    await push_event({'type': 'llm_retry', 'payload': {
+                        'reason': 'channel_reply_tool_missing',
+                    }})
+                elif (channel_ids := _trigger_channel_ids(trigger_event)):
                     warn = (f'[decision] WARNING: channel-triggered turn produced no tool call — '
-                            f'nothing was delivered to {", ".join(_trigger_channel_ids(trigger_event))}. '
+                            f'nothing was delivered to '
+                            f'{json.dumps(channel_ids, ensure_ascii=False)}. '
                             f'content was: {(text or "")[:200]}')
                     print(warn)
                     await push_event({'type': 'error', 'payload': {'message': warn}})
-                break
+                    break
+                else:
+                    break
 
             # ── finish 检测 ───────────────────────────────────────────────
             if finish_tool in [c['function']['name'] for c in tool_calls]:
@@ -1171,18 +1301,26 @@ class Event:
             # ── Steering: 检查是否有用户消息需要注入 ─────────────────────────
             steered = await collector.drain_steering()
             if steered:
-                for sev in steered:
-                    s_text = sev.get('text', '')
-                    s_source = sev.get('source', '')
-                    turn_messages.append({
-                        'role': 'user',
-                        'content': f'[system notification source={s_source}]\n{s_text}',
-                    })
-                await push_event({'type': 'turn_steered', 'payload': {
-                    'count': len(steered),
-                    'sources': [s.get('source', '') for s in steered],
-                }})
-                print(f'[decision] steered {len(steered)} user message(s) into current turn')
+                deferred = [
+                    sev for sev in steered
+                    if bot_restricted or collector.has_bot_channel_event([sev])
+                ]
+                if deferred:
+                    collector.defer_priority(deferred)
+                    steered = [sev for sev in steered if sev not in deferred]
+                if steered:
+                    for sev in steered:
+                        s_text = sev.get('text', '')
+                        s_source = sev.get('source', '')
+                        turn_messages.append({
+                            'role': 'user',
+                            'content': f'[system notification source={s_source}]\n{s_text}',
+                        })
+                    await push_event({'type': 'turn_steered', 'payload': {
+                        'count': len(steered),
+                        'sources': [s.get('source', '') for s in steered],
+                    }})
+                    print(f'[decision] steered {len(steered)} user message(s) into current turn')
 
             # ── 取消检查点：工具执行完毕后，下一轮 LLM 调用前 ────────────────
             if cancel_event and cancel_event.is_set():
@@ -1190,6 +1328,15 @@ class Event:
 
             round_idx += 1
             total_rounds += 1
+
+        # ── 漏回复检测：这一批触发里有 Channel 消息，但没被任何一次 channel_reply
+        # 覆盖到 —— 之前只检测「整轮零工具调用」，多人合批时漏回复其中一人完全
+        # 无法从日志看出来，这里补一条可见的告警（不强制重试，避免误伤「确实不
+        # 需要回复」的场景）。
+        _missed_warn = _missed_channel_reply_warning(trigger_event, replied_message_ids)
+        if _missed_warn:
+            print(f'[decision] WARNING: {_missed_warn}')
+            await push_event({'type': 'error', 'payload': {'message': f'[decision] {_missed_warn}'}})
 
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
         await self._maybe_compress()

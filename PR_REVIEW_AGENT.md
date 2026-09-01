@@ -476,7 +476,7 @@ which diverges more than once:
 
 For a new driver the reference is chosen by shape — `unitree/go1` for structure,
 `robotera/q5_bundle` for decomposition, `dji/mavic3e` for a native-SDK bridge,
-`pnpbotics/adam` for gRPC, `unitree/go2` for SLAM. `deep_robotics/lynx_m20` and
+`pndbotics/adam` for gRPC, `unitree/go2` for SLAM. `deep_robotics/lynx_m20` and
 `unitree/g1/device.py` are deliberately excluded as models.
 
 ### Sandbox

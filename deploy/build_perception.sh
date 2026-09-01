@@ -106,6 +106,9 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     fi
     if [[ ! "${SYNC_CONFIRM}" =~ ^[Nn] ]]; then
         echo "Registering image to resource-center (${RESOURCE_CENTER_URL})..."
+        # cards 与 plugins/{asr,tts,vop,ocr}.py 里各自的 TOOLS 声明手动保持一致（全部
+        # type: processor，且都常开，见 config.yaml 的 enabled 默认值）。新增插件时
+        # 别忘了在这里补一行。
         HTTP_STATUS=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
             -X POST "${RESOURCE_CENTER_URL}/api/admin/register" \
             -H "Content-Type: application/json" \
@@ -118,7 +121,13 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"acc_arch\": \"${ACC_ARCH}\",
                 \"cpu_arch\": \"${CPU_ARCH}\",
                 \"name\": \"Perception Stack\",
-                \"description\": \"语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测\"
+                \"description\": \"语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测\",
+                \"cards\": [
+                    {\"name\": \"asr\", \"type\": \"processor\"},
+                    {\"name\": \"tts\", \"type\": \"processor\"},
+                    {\"name\": \"vop\", \"type\": \"processor\"},
+                    {\"name\": \"ocr\", \"type\": \"processor\"}
+                ]
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then

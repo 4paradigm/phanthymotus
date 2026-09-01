@@ -12,12 +12,15 @@ LLM 通过 `channel_reply(files=[{path, caption}])` 指定要发送的容器内�
 
 import mimetypes
 import os
+import pathlib
 
 from channel.adapter import Attachment, KIND_AUDIO, KIND_FILE, KIND_IMAGE, KIND_VIDEO
 
 _IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 _VIDEO_EXT = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm'}
 _AUDIO_EXT = {'.opus', '.mp3', '.wav', '.m4a', '.aac', '.ogg'}
+_DEPLOY_DATA_DIR = '/opt/phanthy-motus/data'
+_DEPLOY_DATA_MOUNT = '/work/resource'
 
 # 平台上限（字节）。飞书：图片 10MB、文件 30MB。
 LIMITS: dict[str, dict[str, int]] = {
@@ -49,6 +52,18 @@ def limit_for(platform: str, kind: str) -> int:
     return table.get(kind, table['_default'])
 
 
+def _map_runtime_path(path: str) -> str:
+    """Map the deployed data volume to the path visible inside agent-core."""
+    if path == _DEPLOY_DATA_DIR:
+        return _DEPLOY_DATA_MOUNT
+    prefix = _DEPLOY_DATA_DIR + '/'
+    if path.startswith(prefix):
+        suffix = path[len(prefix):]
+        if '..' not in pathlib.PurePosixPath(suffix).parts:
+            return f'{_DEPLOY_DATA_MOUNT}/{suffix}'
+    return path
+
+
 def resolve_outbound(files: list, platform: str) -> tuple[list[Attachment], list[str]]:
     """把 LLM 给的 files 参数解析为 Attachment 列表。
 
@@ -75,7 +90,7 @@ def resolve_outbound(files: list, platform: str) -> tuple[list[Attachment], list
             errors.append('Invalid file entry: missing "path"')
             continue
 
-        p = _resolve_path(raw_path)
+        p = _resolve_path(_map_runtime_path(raw_path))
         err = _check_path_allowed(p)
         if err:
             errors.append(f'{raw_path}: {err}')

@@ -159,6 +159,7 @@ function _render() {
   const html = `
     ${_notice ? `<div class="account-notice">${_esc(_notice)}</div>` : ''}
     ${_user ? _renderIdentity() : _renderAuthForm()}
+    ${_renderTokenSection()}
     <div class="account-section-label">内容</div>
     <div class="settings-list account-entry-list">
       <button class="settings-item" data-entry="skills">
@@ -205,6 +206,24 @@ function _renderIdentity() {
     </div>`;
 }
 
+/** 登录后才有 token；单独一个 section，别再挤进 identity 卡片的元信息行里。 */
+function _renderTokenSection() {
+  const token = getRcToken();
+  if (!_user || !token) return '';
+  const shortToken = token.length > 20
+    ? `${token.slice(0, 10)}…${token.slice(-6)}`
+    : token;
+  return `
+    <div class="account-section-label">本机 Token</div>
+    <div class="account-card account-token-card">
+      <code class="account-token-value" title="${_esc(token)}">${_esc(shortToken)}</code>
+      <div class="account-token-actions">
+        <button class="account-copy-btn" data-copy="${_esc(token)}" title="复制完整 Token">复制</button>
+        <button class="account-link account-token-reset" data-action="reset-token" title="清除本机 Token 并重新登录">重置</button>
+      </div>
+    </div>`;
+}
+
 function _renderAuthForm() {
   const isRegister = _mode === 'register';
   return `
@@ -221,7 +240,7 @@ function _renderAuthForm() {
         <input type="password" name="password" placeholder="${isRegister ? '密码（至少 8 位）' : '密码'}"
                autocomplete="${isRegister ? 'new-password' : 'current-password'}" required
                ${isRegister ? 'minlength="8"' : ''}>
-        ${isRegister ? `<input type="text" name="name" placeholder="昵称（可选）" autocomplete="nickname">` : ''}
+        ${isRegister ? `<input type="text" name="name" placeholder="昵称" autocomplete="nickname" required>` : ''}
         ${_formError ? `<p class="account-form-error">${_esc(_formError)}</p>` : ''}
         <button type="submit" class="account-submit-btn" ${_busy ? 'disabled' : ''}>
           ${_busy ? '处理中…' : (isRegister ? '注册并登录' : '登录')}
@@ -297,6 +316,14 @@ function _onClick(e) {
     _notice = '';
     _mode = 'login';
     refreshAccount();
+  } else if (action === 'reset-token') {
+    // Token 是 Resource Center 签发的无状态 JWT，服务端不持有可撤销的会话记录，
+    // 所以"重置"只能清掉本机存的这一份——下次操作会引导重新登录换取新 token。
+    if (!confirm('重置后需要重新登录才能获得新的 Token，确定继续？')) return;
+    clearRcToken();
+    _notice = '';
+    _mode = 'login';
+    refreshAccount();
   } else if (action === 'to-register') {
     _mode = 'register'; _formError = ''; _render();
   } else if (action === 'to-login') {
@@ -315,7 +342,14 @@ async function _onSubmit(e) {
     identifier: form.identifier.value.trim(),
     password:   form.password.value,
   };
-  if (kind === 'register' && form.name) body.name = form.name.value.trim();
+  if (kind === 'register') {
+    body.name = form.name.value.trim();
+    if (!body.name) {
+      _formError = '请输入昵称';
+      _render();
+      return;
+    }
+  }
 
   _busy = true; _formError = ''; _render();
   try {

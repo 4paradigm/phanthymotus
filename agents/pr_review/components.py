@@ -37,7 +37,7 @@ DRIVER_REFERENCES = [
 # Extra references picked when the PR's shape suggests them.
 DRIVER_REFERENCE_HINTS = [
     (("dji/",), "dji/mavic3e", "native-SDK C bridge (psdk_bridge) pattern"),
-    (("grpc", "proto"), "pnpbotics/adam", "gRPC vendor-SDK pattern"),
+    (("grpc", "proto"), "pndbotics/adam", "gRPC vendor-SDK pattern"),
     (("lidar", "slam", "pointcloud", "icp", "mapping"),
      "unitree/go2", "SLAM / spatial reference"),
 ]
