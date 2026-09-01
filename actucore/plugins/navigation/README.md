@@ -240,7 +240,8 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 体积。
 该固定 base 同时提供 `colcon` / `empy` 和 PyYAML；日常镜像构建会实际执行
 `colcon build` 并显式导入 `em` / `yaml`，避免把基础镜像的偶然环境冒充成依赖
-契约。VLM 客户端使用 Python 标准库 `urllib`，不额外安装未使用的
+契约，并从最终安装的 `nav2_params.yaml` 逐个动态加载全部 BT 插件库，缺库或
+链接失败会直接终止镜像构建。VLM 客户端使用 Python 标准库 `urllib`，不额外安装未使用的
 `requests`。ActuCore 主进程和三个 Python ROS 入口都安装同一份原子
 标准输出 writer，避免并发输出破坏 Docker 日志记录。
 

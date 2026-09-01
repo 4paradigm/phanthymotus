@@ -499,6 +499,10 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn("FAST_LIVO2_REPO", dockerfile)
         self.assertNotIn("NAVIGATION2_REPO", dockerfile)
         self.assertIn("g1_fast_livo2 g1_segmented_controller g1_nav2", dockerfile)
+        self.assertIn("ros2 pkg prefix g1_nav2", dockerfile)
+        self.assertIn("plugin_lib_names", dockerfile)
+        self.assertIn("ctypes.CDLL", dockerfile)
+        self.assertIn("NAV2_BT_PLUGIN_LIBS=PASS", dockerfile)
         # base 是 Focal，humble 没有对应的 Debian 包 → Nav2 也只能源码编
         self.assertNotIn("ros-humble-navigation2", base_dockerfile)
         self.assertIn("--packages-select", base_dockerfile)

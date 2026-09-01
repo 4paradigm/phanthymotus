@@ -69,7 +69,7 @@ phanthymotus/
 │   └── plugins/       — ASR/TTS plugin implementations
 ├── actucore/          — Layer 2: ActuCore (execution models, MCP Server)
 │   ├── main.py        — MCP server entry point
-│   └── plugins/       — Execution model cards (none yet)
+│   └── plugins/       — Execution model cards, including ControlledSemanticSpatial navigation
 ├── deploy/            — Build & deployment scripts
 └── docker-compose.yml — Full stack orchestration
 ```
@@ -86,7 +86,7 @@ See the [architecture diagram](README.md#architecture) for how these layers conn
 |-------|-----------|-------------|
 | Layer 1 — Hardware Drivers | MCP HTTP Servers | Physical device interfaces ([phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)). A single driver exposes both the sensor side (video, audio, lidar, joints, battery, status) and the actuator side (motion, hand, head, waist, speaker, LED) |
 | Layer 2 — Perception Stack | ASR/TTS/VLM plugins | Raw streams → semantics, with local inference support (Jetson) |
-| Layer 2 — ActuCore | Execution models | The mirror of perception on the action side: VLA, navigation, grasp policies, locomotion, whole-body control. Lives in `actucore/`, structurally identical to the perception stack — each model attaches as a `processor` card. Ships no cards yet |
+| Layer 2 — ActuCore | Execution models | The mirror of perception on the action side: VLA, navigation, grasp policies, locomotion, whole-body control. Lives in `actucore/`, structurally identical to the perception stack — each model attaches as a `processor` card. Ships the robot-independent `ControlledSemanticSpatial` navigation contract; its bundled FAST-LIVO2/Nav2 runtime adapter and current hardware acceptance cover G1, while other bodies require compatible sensor/actuator adapters and their own acceptance |
 | Layer 3 — Agent Core | FastAPI + LLM Loop | Event-driven agent with DDS bridge and web dashboard |
 
 ### Communication
