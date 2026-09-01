@@ -42,6 +42,7 @@ import yaml
 
 import rclpy
 import rclpy.executors
+from rclpy._rclpy_pybind11 import InvalidHandle
 
 from utils.security import redact_sensitive
 
@@ -327,6 +328,19 @@ def _start_registration(mcp_port: int, name: str, category: str):
     threading.Thread(target=_run, daemon=True, name="register").start()
 
 
+def _spin_executor(executor) -> None:
+    """Keep the shared executor alive across concurrent ROS node teardown."""
+
+    while True:
+        try:
+            executor.spin()
+            return
+        except InvalidHandle:
+            if not rclpy.ok():
+                return
+            log.warning("ROS node was removed during spin; continuing executor")
+
+
 def main():
     global _bundle
 
@@ -345,10 +359,12 @@ def main():
     executor = rclpy.executors.MultiThreadedExecutor()
     _bundle  = ActuCoreBundle(cfg, executor)
 
-    def _spin():
-        executor.spin()
-
-    threading.Thread(target=_spin, daemon=True, name="actucore_spin").start()
+    threading.Thread(
+        target=_spin_executor,
+        args=(executor,),
+        daemon=True,
+        name="actucore_spin",
+    ).start()
 
     _start_registration(mcp_port, "ActuCore", "actucore")
 
