@@ -55,6 +55,21 @@ class DelayedReadyBackend(ReadyBackend):
         }
 
 
+class StopRejectingBackend(ReadyBackend):
+    def execute(self, action: str, args: dict, *, nav_id: str | None) -> dict:
+        self.execute_calls.append((action, dict(args), nav_id))
+        if action == "navigate_to_pose":
+            return {"status": "navigating"}
+        if action == "stop_nav":
+            return {
+                "state": "error",
+                "status": "error",
+                "error_code": "stop_unconfirmed",
+                "error": "stop was not confirmed",
+            }
+        return {"status": "ok"}
+
+
 def _bindings(plugin: Nav2Plugin) -> list[dict]:
     tool = plugin.get_tools()[0]
     return [
@@ -264,6 +279,31 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         plugin.stop()
         self.assertEqual(backend.execute_calls[-1][0], "stop_nav")
         self.assertEqual(backend.stop_calls, 1)
+
+    def test_unconfirmed_active_stop_keeps_nav2_runtime_for_retry(self) -> None:
+        backend = StopRejectingBackend()
+        plugin = Nav2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "nav2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch(
+            "nav2",
+            {
+                "action": "navigate_to_pose",
+                "x": 0.5,
+                "y": 0.0,
+                "yaw": 0.0,
+                "_control_nav_id": "lease-stop-pending",
+            },
+        )
+
+        result = plugin.dispatch("nav2", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "navigation_stop_pending")
+        self.assertTrue(result["retryable"])
+        self.assertTrue(result["canvas_wired"])
+        self.assertEqual(backend.stop_calls, 0)
+        self.assertTrue(plugin.dispatch("nav2", {"action": "info"})["canvas_wired"])
 
 
 if __name__ == "__main__":

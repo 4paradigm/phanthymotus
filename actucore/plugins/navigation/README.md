@@ -52,6 +52,8 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 
 这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
 `lidar` 和 `imu`。`goal_pose` 是可选的外部 topic action，不是启动时内部连线。
+Agent Core 会把消息里的 `goal_id` 作为私有任务 ID 传给 planner；同一消息在
+投递结果未知后重试时会幂等重放活动或终态回执，不会创建第二个导航任务。
 
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
 `(0, 200] ms`。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
@@ -204,7 +206,8 @@ planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第�
 候选参数；若子组件在应用阶段仍意外拒绝，已应用组件会恢复到请求前
 配置，不会在返回 `invalid_config` 的同时留下半更新状态。
 
-`stop` 始终尝试停止所有内部模块和两个 launch 子进程组，并保留各模块回执，
+`stop` 先确认活动 Nav2 任务已经停下；未确认时保留所有子进程并返回可重试
+错误。确认后才继续停止 mapping 和两个 launch 子进程组，并保留各模块回执，
 避免部分停止冒充成功。Runtime 还跟踪 launch 进程派生的独立 Linux 进程组；
 即使根进程快速退出，也会按有界的 `SIGINT -> SIGTERM -> SIGKILL` 阶梯回收，
 并在首次发送信号前用进程启动时刻校验，避免 PID 复用误杀。
@@ -234,14 +237,17 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 
 镜像里**没有** torch / CLIP / YOLO / ASR 依赖 —— 卡片自身只用标准库 + ROS
 消息包，语义航点是 HTTP 调远端 VLM。那些模型依赖属于 perception。G1 实测的
-上游 ActuCore 镜像为 `13,786,589,503` bytes，加入导航栈后的镜像为
+上游 ActuCore 镜像为 `13,786,589,503` bytes，首次加入导航栈的镜像为
 `14,665,479,002` bytes，增加 `878,889,499` bytes（约 `0.82 GiB` / `6.38%`）。
 该数据由上海 G1 上的 `docker image inspect --format '{{.Size}}'` 实测；增加的是
 磁盘、首次拉取和部署传输成本，不代表同等幅度的运行时 CPU/内存增长。稳定且昂贵的
 第三方依赖因此预编译进可复用、digest-pinned 的 navigation base，日常 PR 构建
 不再重复编译它们。发布该 base 并把精确 digest 写回构建脚本是正式发版前置条件；
 只有 ActuCore 导航镜像继承它，Core、Perception 和不含导航的镜像不会承担这部分
-体积。
+体积。基础镜像使用 builder/runtime 双阶段；最终阶段只复制三个 ROS install-space
+和包锁，不保留 `/opt/ros_deps_ws`、`/opt/fast_livo_ws`、`/opt/nav2_ws` 的源码、
+build 与 log 目录。上述 `0.82 GiB` 是清理前的历史测量，新的最终体积必须在原生
+ARM64 完整构建后重新记录。
 该固定 base 同时提供 `colcon` / `empy` 和 PyYAML；日常镜像构建会实际执行
 `colcon build` 并显式导入 `em` / `yaml`，避免把基础镜像的偶然环境冒充成依赖
 契约，并从最终安装的 `nav2_params.yaml` 逐个动态加载全部 BT 插件库，缺库或
@@ -253,6 +259,8 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 隐式固化进可复现构建。网络环境需要代理时由维护者显式传入
 `GIT_MIRROR_PREFIX`；全局 Git 重写会保留到 FAST-LIVO2/Nav2 编译完成，使
 FetchContent 也沿用该值，最终镜像再删除该重写。
+构建会核对 fetch 后的完整 Git SHA 和本仓补丁 SHA256，但不会验证上游仓库的
+签名提交或签名 tag；锁定 revision 可防漂移，不能替代上游身份签名。
 
 Canvas 外部连线 topic 必须是完整绝对 ROS 名称：以 `/` 开头，每段只使用
 字母、数字和下划线且不能以数字开头；空值、相对名称和重复 `/` 会在启动子进程

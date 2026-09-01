@@ -27,6 +27,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
 
+from api import canvas as canvas_api  # noqa: E402
 from api import config as config_api  # noqa: E402
 
 TTS_OLD = {'id': 'card_mt4rkb752py8', 'mcpId': 'mcp-1', 'toolName': 'tts'}
@@ -120,3 +121,129 @@ def test_none_layouts_are_tolerated(calls):
     assert _run(None, None) == 0
     assert _run(None, [TTS_NEW]) == 0
     assert calls == []
+
+
+def test_processor_wiring_preserves_destination_port_and_live_source_topic():
+    source = {
+        'id': 'lidar-source',
+        'topicOut': [{'port': 'cloud', 'topic': '/stale/cloud'}],
+    }
+    target = {
+        'id': 'navigation',
+        'topicIn': [
+            {'port': 'lidar', 'topic': '/default/lidar'},
+            {'port': 'imu', 'topic': '/default/imu'},
+        ],
+    }
+    connections = [{
+        'fromCardId': 'lidar-source',
+        'fromPortIdx': 0,
+        'fromTopic': '/cached/cloud',
+        'toCardId': 'navigation',
+        'toPortIdx': 0,
+    }]
+
+    single, multiple, bindings = config_api._resolve_processor_inputs(
+        target,
+        connections,
+        [source, target],
+        {'lidar-source': [{'port': 'cloud', 'topic': '/live/cloud'}]},
+    )
+
+    assert single == '/live/cloud'
+    assert multiple == []
+    assert bindings == [{'port': 'lidar', 'topic': '/live/cloud'}]
+
+
+def test_port_aware_wiring_requires_an_explicit_tool_contract(monkeypatch):
+    mcp_client = type(sys)('mcp_client')
+    mcp_client.registry = {
+        'actucore': {
+            'tool_definitions': [{
+                'name': 'ControlledSemanticSpatial',
+                'inputSchema': {
+                    'properties': {'input_bindings': {'type': 'array'}},
+                },
+            }],
+        },
+    }
+    monkeypatch.setitem(sys.modules, 'mcp_client', mcp_client)
+
+    assert config_api._tool_accepts_input_bindings(
+        'actucore', 'ControlledSemanticSpatial'
+    )
+    assert not config_api._tool_accepts_input_bindings('actucore', 'legacy_tool')
+
+
+def test_saving_a_running_layout_reconciles_topic_actions(monkeypatch):
+    started = []
+
+    class _TopicActions:
+        async def start(self, layout):
+            started.append(layout)
+
+    topic_actions = type(sys)('topic_actions')
+    topic_actions.manager = _TopicActions()
+    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
+    monkeypatch.setattr(config_api.config, 'main', {
+        'core': {'project_running': True},
+        'canvas_layout': {'cards': []},
+    })
+    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
+    monkeypatch.setattr(canvas_api, 'notify_layout_changed', lambda _session: None)
+
+    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
+        cards=[TTS_NEW],
+        connections=[],
+        session_id='editor-1',
+    )))
+
+    assert result == {'code': 200}
+    assert started == [{
+        'cards': [TTS_NEW],
+        'connections': [],
+        'execConnections': [],
+        'transform': {},
+    }]
+
+
+def test_project_stop_does_not_emit_terminal_state_until_every_card_confirms(
+    monkeypatch, calls
+):
+    async def _pending(_mcp_id, _req):
+        return {
+            'ok': False,
+            'state': 'error',
+            'status': 'error',
+            'error': 'mapping finalization is pending',
+            'retryable': True,
+        }
+
+    events = []
+
+    async def _push_event(event):
+        events.append(event)
+
+    class _TopicActions:
+        async def stop(self):
+            return None
+
+    motus_stream = type(sys)('api.motus_stream')
+    motus_stream.push_event = _push_event
+    topic_actions = type(sys)('topic_actions')
+    topic_actions.manager = _TopicActions()
+    monkeypatch.setitem(sys.modules, 'api.motus_stream', motus_stream)
+    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
+    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _pending)
+    monkeypatch.setattr(config_api.config, 'main', {
+        'core': {'project_running': True},
+        'canvas_layout': {'cards': [TTS_OLD]},
+    })
+
+    result = asyncio.run(config_api._do_stop_project())
+
+    assert result['ok'] is False
+    assert result['failures'][0]['card_id'] == TTS_OLD['id']
+    assert config_api.config.main['core']['project_running'] is False
+    assert not any(event.get('type') == 'project_state' for event in events)

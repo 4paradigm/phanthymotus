@@ -22,6 +22,7 @@ import ros2_bridge
 
 _MAX_SEEN_IDS = 1024
 _LOG_SAMPLE_EVERY = 100
+_DISPATCH_TIMEOUT_SEC = 30.0
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class TopicActionRoute:
     action: str
     schema: str
     id_field: str
+    id_argument: str | None
     allowed_fields: tuple[str, ...]
     required_fields: tuple[str, ...]
     input_schema: dict[str, Any]
@@ -88,10 +90,6 @@ def _tool_definition(mcp_id: str, tool_name: str) -> dict[str, Any] | None:
 
 
 def _connection_topic(connection: dict, cards_by_id: dict[str, dict]) -> str:
-    topic = str(connection.get("fromTopic") or "").strip()
-    if topic:
-        return topic
-
     source = cards_by_id.get(connection.get("fromCardId"), {})
     outputs = source.get("topicOut") or []
     try:
@@ -99,8 +97,32 @@ def _connection_topic(connection: dict, cards_by_id: dict[str, dict]) -> str:
     except (TypeError, ValueError):
         return ""
     if 0 <= port_idx < len(outputs):
-        return str(outputs[port_idx].get("topic") or "").strip()
-    return ""
+        topic = str(outputs[port_idx].get("topic") or "").strip()
+        if topic:
+            return topic
+    return str(connection.get("fromTopic") or "").strip()
+
+
+def _mcp_error(result: Any) -> str | None:
+    if not isinstance(result, dict):
+        return "invalid MCP response"
+    if result.get("code") != 200:
+        return str(result.get("message") or result.get("detail") or "MCP call failed")
+    payload = result.get("data")
+    if isinstance(payload, list) and payload:
+        payload = payload[0].get("text", "{}") if isinstance(payload[0], dict) else {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            payload = {}
+    if isinstance(payload, dict) and (
+        payload.get("ok") is False
+        or payload.get("state") == "error"
+        or payload.get("status") == "error"
+    ):
+        return str(payload.get("error") or payload.get("message") or "tool rejected action")
+    return None
 
 
 def build_routes(layout: dict[str, Any]) -> list[TopicActionRoute]:
@@ -159,10 +181,15 @@ def build_routes(layout: dict[str, Any]) -> list[TopicActionRoute]:
         action = declaration.get("action")
         schema = declaration.get("schema")
         id_field = declaration.get("id_field")
+        id_argument = declaration.get("id_argument")
         allowed_fields = declaration.get("allowed_fields")
         required_fields = declaration.get("required_fields", [])
         if not all(isinstance(value, str) and value for value in (action, schema, id_field)):
             raise ValueError(f"invalid x-topic-actions declaration for port {port!r}")
+        if id_argument is not None and (
+            not isinstance(id_argument, str) or not id_argument
+        ):
+            raise ValueError(f"invalid id_argument for x-topic-actions port {port!r}")
         if not isinstance(allowed_fields, list) or not all(
             isinstance(value, str) and value for value in allowed_fields
         ):
@@ -189,6 +216,7 @@ def build_routes(layout: dict[str, Any]) -> list[TopicActionRoute]:
                 action=action,
                 schema=schema,
                 id_field=id_field,
+                id_argument=id_argument,
                 allowed_fields=tuple(allowed_fields),
                 required_fields=tuple(required_fields),
                 input_schema=input_schema,
@@ -204,9 +232,10 @@ class TopicActionManager:
         self._inflight: set[asyncio.Task] = set()
 
     async def start(self, layout: dict[str, Any]) -> None:
+        routes = build_routes(layout)
         await self.stop()
         loop = asyncio.get_running_loop()
-        for route in build_routes(layout):
+        for route in routes:
             runtime = RouteRuntime(route=route)
             self._runtimes[route.key] = runtime
 
@@ -267,16 +296,16 @@ class TopicActionManager:
                 try:
                     from api.mcp_manage import MCPCallRequest, mcp_call_tool
 
-                    result = await mcp_call_tool(
-                        runtime.route.mcp_id,
-                        MCPCallRequest(tool=runtime.route.tool_name, arguments=args),
+                    result = await asyncio.wait_for(
+                        mcp_call_tool(
+                            runtime.route.mcp_id,
+                            MCPCallRequest(tool=runtime.route.tool_name, arguments=args),
+                        ),
+                        timeout=_DISPATCH_TIMEOUT_SEC,
                     )
-                    if result.get("code") != 200:
-                        raise RuntimeError(
-                            result.get("message")
-                            or result.get("detail")
-                            or "MCP call failed"
-                        )
+                    error = _mcp_error(result)
+                    if error:
+                        raise RuntimeError(error)
                     runtime.dispatched += 1
                     runtime.seen_ids[message_id] = None
                     while len(runtime.seen_ids) > _MAX_SEEN_IDS:
@@ -324,6 +353,8 @@ class TopicActionManager:
         }
         if route.input_schema:
             jsonschema.validate(instance=args, schema=route.input_schema)
+        if route.id_argument:
+            args[route.id_argument] = message_id
         return args, message_id
 
     def snapshot(self) -> dict[str, dict[str, Any]]:

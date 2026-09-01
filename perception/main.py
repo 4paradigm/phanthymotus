@@ -148,17 +148,6 @@ class PerceptionBundle:
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
 
-    def stop(self) -> None:
-        """Best-effort release for every plugin that owns runtime resources."""
-
-        for plugin in reversed(self._plugins):
-            stop = getattr(plugin, "stop", None)
-            if callable(stop):
-                try:
-                    stop()
-                except Exception:
-                    log.exception("failed to stop plugin %s", plugin.PREFIX)
-
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
@@ -498,17 +487,8 @@ def main():
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 
-    # The WebSocket endpoint belongs to ASR.  A bundle running without the ASR
-    # card must not acquire its dependency, port, or background thread.
-    if asr_cfg.get("enabled", False):
-        threading.Thread(
-            target=_start_ws_thread,
-            args=(ws_port,),
-            daemon=True,
-            name="ws_asr",
-        ).start()
-    else:
-        log.info("WebSocket ASR server disabled with ASRPlugin")
+    # Start WebSocket ASR server in a separate thread
+    threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 
@@ -525,7 +505,6 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop()
         executor.shutdown()
         rclpy.shutdown()
 

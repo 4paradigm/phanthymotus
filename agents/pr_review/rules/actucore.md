@@ -7,9 +7,9 @@ streams into semantics, ActuCore turns intent into motion commands. Execution
 models (VLA policies, navigation, grasp policies, locomotion, whole-body
 control) attach as cards.
 
-**It currently ships zero cards.** The first PRs here will either add a card or
-change the host. Judge them differently: a host change affects every future
-card, a card change is self-contained.
+It currently ships the `ControlledSemanticSpatial` navigation card as a
+`processor`. Judge host and card changes differently: a host change affects
+every card, while a navigation-card change should remain self-contained.
 
 ## The card contract
 

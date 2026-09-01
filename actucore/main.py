@@ -30,6 +30,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -159,10 +160,25 @@ class ActuCoreBundle:
         for plugin in reversed(self._plugins):
             stop = getattr(plugin, "stop", None)
             if callable(stop):
-                try:
-                    stop()
-                except Exception:
-                    log.exception("failed to stop card %s", plugin.PREFIX)
+                for attempt in range(3):
+                    try:
+                        result = stop()
+                    except Exception:
+                        log.exception("failed to stop card %s", plugin.PREFIX)
+                        break
+                    if not (
+                        isinstance(result, dict)
+                        and result.get("retryable") is True
+                        and (
+                            result.get("state") == "error"
+                            or result.get("status") == "error"
+                        )
+                    ):
+                        break
+                    if attempt < 2:
+                        time.sleep(0.25)
+                else:
+                    log.error("card %s stop remained unconfirmed", plugin.PREFIX)
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────

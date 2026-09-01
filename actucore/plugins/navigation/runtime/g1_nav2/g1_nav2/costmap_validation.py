@@ -135,6 +135,7 @@ def goal_cell_receipt(
     expected_frame: str,
     max_receive_age_sec: float,
     now_monotonic: float | None = None,
+    now_stamp_ns: int | None = None,
 ) -> dict:
     if snapshot is None:
         raise CostmapError("global costmap has not been received")
@@ -144,6 +145,13 @@ def goal_cell_receipt(
         raise CostmapError(
             f"global costmap receive age {receive_age:.3f}s is invalid"
         )
+    source_age = None
+    if now_stamp_ns is not None:
+        source_age = (int(now_stamp_ns) - snapshot.stamp_ns) / 1_000_000_000
+        if snapshot.stamp_ns <= 0 or abs(source_age) > max_receive_age_sec:
+            raise CostmapError(
+                f"global costmap source age {source_age:.3f}s is invalid"
+            )
     if snapshot.frame_id != expected_frame.strip("/"):
         raise CostmapError(
             f"global costmap frame is {snapshot.frame_id}, expected {expected_frame}"
@@ -157,6 +165,9 @@ def goal_cell_receipt(
         "unknown": cost < 0,
         "costmap_stamp_ns": snapshot.stamp_ns,
         "costmap_receive_age_sec": round(receive_age, 3),
+        "costmap_source_age_sec": (
+            None if source_age is None else round(source_age, 3)
+        ),
     }
 
 
@@ -168,6 +179,7 @@ def validated_goal_cell_receipt(
     expected_frame: str,
     max_receive_age_sec: float,
     now_monotonic: float | None = None,
+    now_stamp_ns: int | None = None,
 ) -> dict:
     try:
         receipt = goal_cell_receipt(
@@ -177,6 +189,7 @@ def validated_goal_cell_receipt(
             expected_frame=expected_frame,
             max_receive_age_sec=max_receive_age_sec,
             now_monotonic=now_monotonic,
+            now_stamp_ns=now_stamp_ns,
         )
     except CostmapError as exc:
         code = (

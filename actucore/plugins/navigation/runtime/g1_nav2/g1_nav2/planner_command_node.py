@@ -522,6 +522,7 @@ class PlannerCommandNode(Node):
                 y=float(target["y"]),
                 expected_frame=self._global_frame,
                 max_receive_age_sec=self._goal_costmap_max_age_sec,
+                now_stamp_ns=self.get_clock().now().nanoseconds,
             )
         except GoalCellRejected as exc:
             raise CommandError(exc.code, str(exc)) from exc

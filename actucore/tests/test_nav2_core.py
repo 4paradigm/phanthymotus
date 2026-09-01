@@ -129,6 +129,27 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(second["status"], "navigating")
         self.assertEqual(second["nav_id"], "lease-second")
 
+    def test_trusted_goal_id_replays_active_and_terminal_result(self) -> None:
+        request = {
+            "action": "navigate_to_pose",
+            "x": 0.5,
+            "y": 0.0,
+            "yaw": 0.0,
+            "_control_nav_id": "goal-idempotent",
+        }
+
+        first = self.core.dispatch(request)
+        active_replay = self.core.dispatch(request)
+        self.backend.emit_terminal("goal-idempotent")
+        terminal_replay = self.core.dispatch(request)
+
+        self.assertEqual(first["status"], "navigating")
+        self.assertTrue(active_replay["idempotent_replay"])
+        self.assertEqual(terminal_replay["status"], "arrived")
+        self.assertTrue(terminal_replay["idempotent_replay"])
+        navigate_calls = [call for call in self.backend.calls if call[0] == "navigate_to_pose"]
+        self.assertEqual(len(navigate_calls), 1)
+
     def test_consecutive_manual_goals_generate_distinct_task_ids(self) -> None:
         first = self.core.dispatch(
             {

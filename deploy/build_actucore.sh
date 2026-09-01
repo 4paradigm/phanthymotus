@@ -196,7 +196,8 @@ if ! ${BUILD_BASE} && ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; 
                 \"cpu_arch\": \"${CPU_ARCH}\",
                 \"name\": \"ActuCore\",
                 \"port\": 15730,
-                \"description\": \"执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制，以 processor 卡片接入\"
+                \"description\": \"执行模型层，内置 ControlledSemanticSpatial 导航 processor 卡片\",
+                \"cards\": [{\"name\": \"ControlledSemanticSpatial\", \"type\": \"processor\"}]
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then

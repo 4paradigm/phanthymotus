@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 RUNTIME_PACKAGE = (
@@ -67,6 +68,19 @@ class FastLivo2CollectionTest(unittest.TestCase):
         self.assertEqual(
             depth_frame["topic"], "/ubuntu/camera/depth_frame"
         )
+
+    def test_directory_rejects_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "recordings"
+            outside = Path(directory) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+
+            with patch(
+                "g1_fast_livo2.collection_core.COLLECTION_ROOT", root
+            ), self.assertRaisesRegex(ValueError, "must be within"):
+                normalize_collection_directory(str(root / "escape" / "session"))
 
     def test_health_exposes_normal_and_missing_source_failure(self) -> None:
         health = CollectionHealth(grace_sec=5.0, stale_sec=2.0)

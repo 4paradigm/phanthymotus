@@ -264,10 +264,40 @@ class NavigationPlugin:
 
     def _stop_serialized(self) -> dict:
         results = {}
+        # Block new semantic goals and motion before waiting for map persistence.
+        # Both stops are idempotent, so a retry can safely repeat them while the
+        # mapping process stays alive long enough to finish its transaction.
+        for name, plugin, prefix in (
+            ("semantic", self._semantic, "vln"),
+            ("planning", self._planning, "nav2"),
+        ):
+            try:
+                results[name] = plugin.dispatch(prefix, {"action": "stop"})
+            except Exception as exc:
+                results[name] = self._error("component_stop_failed", str(exc))
+
+        planning_result = results["planning"]
+        if (
+            isinstance(planning_result, dict)
+            and planning_result.get("retryable") is True
+            and (
+                planning_result.get("status") == "error"
+                or planning_result.get("state") == "error"
+            )
+        ):
+            return self._error(
+                "navigation_stop_pending",
+                "active navigation stop is unconfirmed; retry stop without "
+                "restarting ControlledSemanticSpatial",
+                component_results=results,
+                retryable=True,
+                canvas_wired=True,
+            )
+
         # Mapping owns the only operation that can legitimately require a
         # retryable stop: it must wait for FAST-LIVO2 to exit and persist the
-        # map transaction.  Do it first so a retry leaves all owned processes
-        # and the already-started Canvas lifecycle intact.
+        # map transaction. Keep its runtime and Canvas lifecycle intact until
+        # the operator retries and finalization succeeds.
         try:
             results["mapping"] = self._mapping.dispatch(
                 "fast_livo2", {"action": "stop"}
@@ -292,14 +322,6 @@ class NavigationPlugin:
                 canvas_wired=True,
             )
 
-        for name, plugin, prefix in (
-            ("semantic", self._semantic, "vln"),
-            ("planning", self._planning, "nav2"),
-        ):
-            try:
-                results[name] = plugin.dispatch(prefix, {"action": "stop"})
-            except Exception as exc:
-                results[name] = self._error("component_stop_failed", str(exc))
         try:
             results["runtime"] = self._runtime.stop()
         except Exception as exc:

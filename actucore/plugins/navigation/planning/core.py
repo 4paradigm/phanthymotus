@@ -213,10 +213,26 @@ class Nav2Core:
         nav_id = trusted_nav_id or uuid.uuid4().hex
         with self._lock:
             if self._active_nav_id:
+                if trusted_nav_id == self._active_nav_id:
+                    return {
+                        "action": action,
+                        "status": "navigating",
+                        "nav_id": trusted_nav_id,
+                        "idempotent_replay": True,
+                    }
                 raise NavigationBackendError(
                     "navigation_active",
                     f"navigation {self._active_nav_id} is already active",
                 )
+            if (
+                trusted_nav_id
+                and self._last_terminal_result is not None
+                and self._last_terminal_result.get("nav_id") == trusted_nav_id
+            ):
+                result = dict(self._last_terminal_result)
+                result["action"] = action
+                result["idempotent_replay"] = True
+                return result
             self._active_nav_id = nav_id
             self._last_terminal_result = None
         try:

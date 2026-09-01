@@ -1,7 +1,6 @@
 # Perception Stack
 
-Modular perception plugins running as an MCP HTTP server. They connect to Agent
-Core through MCP tool calls and exchange data over ROS2 DDS topics.
+Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
 
 ## Audio Requirements for ASR
 
@@ -642,7 +641,6 @@ instance_id ever showed up in the log.
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
 
 ASR result JSON:
-
 ```json
 {
   "text": "recognized speech text",
@@ -651,24 +649,6 @@ ASR result JSON:
   "asr_complete_ts": 1234567891.789
 }
 ```
-
----
-
-## 导航卡片已迁到 ActuCore
-
-`ControlledSemanticSpatial`（FAST-LIVO2 + Nav2 + 语义航点）曾经是 Perception 的
-一张卡片，现在属于 **ActuCore（执行模型层）**：Perception 把原始数据流变成语义，
-ActuCore 把意图/目标变成运动指令 —— 这张卡片输出的是 `velocity_proposal`，
-按定义在执行侧。
-
-代码、配置、镜像、部署脚本都在 `actucore/`：
-
-- 卡片实现与文档：[actucore/plugins/navigation/README.md](../actucore/plugins/navigation/README.md)
-- 镜像：`actucore/Dockerfile.jetson`，构建入口 `./deploy/build_actucore.sh --mirror tuna`
-- MCP 端口从 15720 变为 **15730**，容器从 `embodied-perception` 变为 `embodied-actucore`
-
-Perception 侧不再有 `navigation` 卡片、`navigation` 镜像 variant，也不再有
-`plugins/navigation/` 目录。
 
 ## Sensitive Config Fields
 

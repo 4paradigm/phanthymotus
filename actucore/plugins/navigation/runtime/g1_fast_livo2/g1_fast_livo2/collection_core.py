@@ -125,11 +125,13 @@ def _ns_to_ms(value: int | None) -> float | None:
 def normalize_collection_directory(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("collection_directory must be a non-empty absolute path")
-    path = PurePosixPath(value.strip())
-    if not path.is_absolute() or ".." in path.parts:
+    requested = Path(value.strip())
+    if not requested.is_absolute() or ".." in requested.parts:
         raise ValueError("collection_directory must be a safe absolute path")
+    root = Path(COLLECTION_ROOT).resolve(strict=False)
+    path = requested.resolve(strict=False)
     try:
-        path.relative_to(COLLECTION_ROOT)
+        path.relative_to(root)
     except ValueError as exc:
         raise ValueError(
             f"collection_directory must be within {COLLECTION_ROOT}"

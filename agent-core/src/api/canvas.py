@@ -291,6 +291,9 @@ async def save_layout(layout: CanvasLayout):
     save_data = layout.dict()
     save_data.pop('session_id', None)
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
+    if config.main.get('core', {}).get('project_running', False):
+        from topic_actions import manager as topic_action_mgr
+        await topic_action_mgr.start(save_data)
     config.main['canvas_layout'] = save_data
     # A card that leaves the layout is unreachable afterwards — stop-project only
     # walks the saved cards — so its plugin instance would keep running forever.

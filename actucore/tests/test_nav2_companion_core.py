@@ -520,6 +520,16 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 max_receive_age_sec=2.0,
                 now_monotonic=12.1,
             )
+        with self.assertRaisesRegex(CostmapError, "source age"):
+            goal_cell_receipt(
+                snapshot,
+                x=0.0,
+                y=0.0,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+                now_stamp_ns=snapshot.stamp_ns + 2_100_000_000,
+            )
 
     def test_runtime_is_planner_controller_only(self) -> None:
         setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")

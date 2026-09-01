@@ -74,6 +74,31 @@ class SpinExecutorTest(unittest.TestCase):
 
         self.assertEqual(executor.calls, 1)
 
+    def test_bundle_shutdown_retries_a_retryable_card_stop(self):
+        module = _load_main_module()
+
+        class Plugin:
+            PREFIX = "navigation"
+
+            def __init__(self):
+                self.calls = 0
+
+            def stop(self):
+                self.calls += 1
+                if self.calls < 3:
+                    return {"state": "error", "retryable": True}
+                return {"state": "idle"}
+
+        plugin = Plugin()
+        bundle = module.ActuCoreBundle.__new__(module.ActuCoreBundle)
+        bundle._plugins = [plugin]
+
+        with mock.patch.object(module.time, "sleep") as sleep:
+            bundle.stop()
+
+        self.assertEqual(plugin.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

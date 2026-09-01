@@ -459,6 +459,20 @@ class NavigationContractTest(unittest.TestCase):
             r"jetson-base:jp511-torch@sha256:[0-9a-f]{64}",
         )
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
+        self.assertIn(
+            "FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_builder",
+            base_dockerfile,
+        )
+        runtime_stage = base_dockerfile.split(
+            "FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_runtime", 1
+        )[1]
+        for workspace in ("ros_deps_ws", "fast_livo_ws", "nav2_ws"):
+            self.assertIn(
+                f"COPY --from=navigation_builder /opt/{workspace}/install/",
+                runtime_stage,
+            )
+            for directory in ("src", "build", "log"):
+                self.assertNotIn(f"/opt/{workspace}/{directory}/", runtime_stage)
         self.assertIn("command -v colcon", base_dockerfile)
         self.assertIn("int(em.__version__.split('.')[0]) < 4", base_dockerfile)
         self.assertNotIn("AllowInsecureRepositories", base_dockerfile)
@@ -581,6 +595,12 @@ class NavigationContractTest(unittest.TestCase):
         ):
             self.assertNotIn(removed, build_script)
         self.assertIn("ACTUCORE_BUILD_DURATION_SEC=", build_script)
+        self.assertIn(
+            r'\"cards\": [{\"name\": \"ControlledSemanticSpatial\", '
+            r'\"type\": \"processor\"}]',
+            build_script,
+        )
+        self.assertIn("内置 ControlledSemanticSpatial 导航 processor 卡片", build_script)
 
     def test_g1_deploy_uses_default_actucore_builder(self):
         deploy_script = (
@@ -970,8 +990,40 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertTrue(runtime.started)
         self.assertEqual(runtime.stop_calls, 0)
         self.assertTrue(plugin._started)
-        self.assertFalse(any(args["action"] == "stop" for _, args in planning.calls))
-        self.assertFalse(any(args["action"] == "stop" for _, args in semantic.calls))
+        self.assertTrue(any(args["action"] == "stop" for _, args in planning.calls))
+        self.assertTrue(any(args["action"] == "stop" for _, args in semantic.calls))
+
+    def test_retryable_planning_stop_keeps_every_owned_runtime_for_retry(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent("mapping")
+        planning = FakeComponent(
+            "planning",
+            stop_result={
+                "state": "error",
+                "status": "error",
+                "error_code": "navigation_stop_pending",
+                "error": "stop was not confirmed",
+                "retryable": True,
+            },
+        )
+        plugin = self.make_plugin(
+            runtime=runtime,
+            mapping=mapping,
+            planning=planning,
+        )
+        plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+
+        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "navigation_stop_pending")
+        self.assertTrue(result["retryable"])
+        self.assertTrue(runtime.started)
+        self.assertEqual(runtime.stop_calls, 0)
+        self.assertTrue(plugin._started)
+        self.assertFalse(any(args["action"] == "stop" for _, args in mapping.calls))
 
     def test_real_mapping_retryability_reaches_unified_lifecycle(self):
         runtime = FakeRuntime()
@@ -1007,8 +1059,8 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertTrue(
             mapping.dispatch("fast_livo2", {"action": "info"})["canvas_wired"]
         )
-        self.assertFalse(any(args["action"] == "stop" for _, args in planning.calls))
-        self.assertFalse(any(args["action"] == "stop" for _, args in semantic.calls))
+        self.assertTrue(any(args["action"] == "stop" for _, args in planning.calls))
+        self.assertTrue(any(args["action"] == "stop" for _, args in semantic.calls))
 
     def test_unified_config_rejects_unknown_and_forwards_partial_vlm_fields(self):
         plugin = self.make_plugin()

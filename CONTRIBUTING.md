@@ -93,6 +93,7 @@ See the [architecture diagram](README.md#architecture) for how these layers conn
 
 - **Data Plane**: ROS2 DDS → `ros2_bridge.py` (daemon thread) → `inspection.py` fan-out → WebSocket `/ws/bus/{topic}`
 - **Control Plane**: MCP HTTP JSON-RPC 2.0 (Agent Core → hardware/perception)
+- **Canvas Topic Actions**: a processor may declare `inputSchema.x-topic-actions` to translate a connected `data/json` ROS topic into one validated MCP action while the project is running. Agent Core resolves the live source port, rejects schema/field violations, de-duplicates only confirmed deliveries, reconciles routes on live layout saves, and may pass the message ID through a declared private `id_argument` for tool-level idempotency
 - **Activity Stream**: WebSocket `/ws/motus` (real-time agent decision broadcast)
 - **Tool Types**: every MCP tool declares a `type` — `sensor`, `actuator`, `processor`, or `resource`. The type drives dispatch behaviour: consecutive `sensor` calls are batched in parallel, while `actuator` and `processor` calls pass through the ACP barrier and wait for pending actions to complete first (`_needs_barrier()` in `agent-core/src/event/llm.py`). Tools with no declared type default to barrier-guarded
 

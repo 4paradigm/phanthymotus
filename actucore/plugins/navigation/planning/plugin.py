@@ -159,8 +159,9 @@ class Nav2Plugin:
         self._stop_canvas()
 
     @staticmethod
-    def _error(code: str, message: str) -> dict:
+    def _error(code: str, message: str, **extra) -> dict:
         return {
+            **extra,
             "state": "error",
             "status": "error",
             "error_code": code,
@@ -327,6 +328,19 @@ class Nav2Plugin:
         stop_result = None
         if was_started and core is not None and core.info().get("active_nav_id"):
             stop_result = core.dispatch({"action": "stop_nav"})
+            if (
+                not isinstance(stop_result, dict)
+                or stop_result.get("ok") is False
+                or stop_result.get("state") == "error"
+                or stop_result.get("status") == "error"
+            ):
+                return self._error(
+                    "navigation_stop_pending",
+                    "Nav2 did not confirm the active navigation stop; retry stop",
+                    stop_result=stop_result,
+                    retryable=True,
+                    canvas_wired=True,
+                )
         self._release_core()
         return {
             "state": "idle",

@@ -22,7 +22,7 @@
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG ACTUCORE_NAVIGATION_PARENT_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6
-FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}
+FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_builder
 ARG PYPI_MIRROR APT_MIRROR
 
 # colcon 的 source / bash 数组都要 bash，pipefail 保证管道里的失败不被吞掉
@@ -472,6 +472,74 @@ RUN source /opt/ros/humble/install/setup.bash && \
     ! grep -Fqx nav2_dwb_controller /opt/actucore-ros-package-lock.txt && \
     { git config --global --remove-section \
         "url.${GIT_MIRROR_PREFIX}https://github.com/" || true; }
+
+# The deployable base starts again from the digest-pinned parent. Only install
+# spaces cross this boundary; source, build and log trees stay in the builder.
+FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_runtime
+ARG APT_MIRROR
+ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b
+ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=b3afa3e64b5743898c829fe34891f828027eb372324d05a8c94357f9cacd6ec4
+ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=1484bfba11408e3efd87360a63fef1787f2b2ceaf75e8d8abdd5a17e3474beeb
+ARG NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -E -i \
+          "s|https?://archive\\.ubuntu\\.com/ubuntu|https://${APT_MIRROR}/ubuntu|g; \
+           s|https?://ports\\.ubuntu\\.com/ubuntu-ports|https://${APT_MIRROR}/ubuntu-ports|g" \
+          /etc/apt/sources.list; \
+    fi && \
+    sed -i '\|packages\.ros\.org/ros2/ubuntu|d' /etc/apt/sources.list && \
+    for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+      [ -f "${source}" ] || continue; \
+      if grep -qE 'packages\.ros\.org/ros2/ubuntu' "${source}"; then \
+        rm -f "${source}"; \
+      fi; \
+    done && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# These development packages remain because Dockerfile.jetson compiles the
+# three repository-owned ROS packages on top of this reusable build base.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      pkg-config \
+      libboost-all-dev \
+      libeigen3-dev \
+      libfmt-dev \
+      libpcl-dev && \
+    { pkg-config --exists opencv4 || \
+      apt-get install -y --no-install-recommends libopencv-dev; } && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Derived in the builder as well; the daily repository-owned packages compile
+# against the same Humble .hpp compatibility aliases.
+RUN for header in $(find /opt/ros/humble/install/include -path '*tf2*' -name '*.h'); do \
+      alias_header="${header%.h}.hpp"; \
+      [ -e "${alias_header}" ] || \
+        printf '#include "%s"\n' "$(basename "${header}")" > "${alias_header}"; \
+    done
+
+COPY --from=navigation_builder /opt/ros_deps_ws/install/ /opt/ros_deps_ws/install/
+COPY --from=navigation_builder /opt/fast_livo_ws/install/ /opt/fast_livo_ws/install/
+COPY --from=navigation_builder /opt/nav2_ws/install/ /opt/nav2_ws/install/
+COPY --from=navigation_builder /opt/actucore-ros-package-lock.txt /opt/actucore-ros-package-lock.txt
+
+RUN command -v colcon >/dev/null && \
+    python3 -c "import em; assert int(em.__version__.split('.')[0]) < 4, em.__version__" && \
+    source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    source /opt/nav2_ws/install/setup.bash && \
+    ros2 pkg prefix fast_livo >/dev/null && \
+    ros2 pkg prefix nav2_bringup >/dev/null && \
+    ! ldd /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping | grep -Fq 'not found' && \
+    ! ldd /opt/nav2_ws/install/lib/nav2_controller/controller_server | grep -Fq 'not found' && \
+    test ! -e /opt/ros_deps_ws/src && test ! -e /opt/ros_deps_ws/build && test ! -e /opt/ros_deps_ws/log && \
+    test ! -e /opt/fast_livo_ws/src && test ! -e /opt/fast_livo_ws/build && test ! -e /opt/fast_livo_ws/log && \
+    test ! -e /opt/nav2_ws/src && test ! -e /opt/nav2_ws/build && test ! -e /opt/nav2_ws/log
 
 LABEL org.opencontainers.image.title="Phanthy Motus ActuCore Navigation Base" \
       org.opencontainers.image.description="ActuCore navigation build base — locked FAST-LIVO2 and Nav2" \

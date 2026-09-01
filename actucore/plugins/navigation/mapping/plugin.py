@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
-from pathlib import PurePosixPath
+from pathlib import Path
 import re
 import threading
 import time
@@ -21,7 +21,7 @@ from .core import FastLivo2Core, UnavailableFastLivo2Backend
 
 log = logging.getLogger(__name__)
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,127}$")
-_COLLECTION_ROOT = PurePosixPath(
+_COLLECTION_ROOT = Path(
     "/opt/phanthy-motus/data/fast_livo2/recordings"
 )
 
@@ -75,14 +75,16 @@ def _validated_config(base: dict, updates: dict) -> dict:
     raw_directory = result.get("collection_directory")
     if not isinstance(raw_directory, str) or not raw_directory.strip():
         raise ConfigError("collection_directory must be a non-empty absolute path")
-    directory = PurePosixPath(raw_directory.strip())
+    directory = Path(raw_directory.strip())
     if not directory.is_absolute() or ".." in directory.parts:
         raise ConfigError("collection_directory must be a safe absolute path")
+    root = _COLLECTION_ROOT.resolve(strict=False)
+    directory = directory.resolve(strict=False)
     try:
-        directory.relative_to(_COLLECTION_ROOT)
+        directory.relative_to(root)
     except ValueError as exc:
         raise ConfigError(
-            f"collection_directory must be within {_COLLECTION_ROOT}"
+            f"collection_directory must be within {root}"
         ) from exc
     result["collection_directory"] = str(directory)
     return result

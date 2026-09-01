@@ -396,6 +396,7 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "stop_action": "stop_nav",
                     "schema": "phanthy.navigation.goal.v1",
                     "id_field": "goal_id",
+                    "id_argument": "_control_nav_id",
                     "allowed_fields": ["x", "y", "yaw", "speed"],
                     "required_fields": ["x", "y", "yaw"],
                 }

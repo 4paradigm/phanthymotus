@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
@@ -365,6 +367,32 @@ class FastLivo2PluginTest(unittest.TestCase):
                 )
                 info = plugin.dispatch("fast_livo2", {"action": "info"})
                 self.assertEqual(info["error_code"], "invalid_config")
+
+    def test_collection_directory_rejects_a_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "recordings"
+            outside = Path(directory) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+
+            with patch(
+                "plugins.navigation.mapping.plugin._COLLECTION_ROOT", root
+            ):
+                plugin = FastLivo2Plugin(
+                    {
+                        "collection_enabled": True,
+                        "collection_directory": str(root / "escape" / "session"),
+                    },
+                    None,
+                    backend=ReadyBackend(),
+                    collection_controller=FakeCollectionController(),
+                )
+
+            self.assertEqual(
+                plugin.dispatch("fast_livo2", {"action": "info"})["error_code"],
+                "invalid_config",
+            )
 
     def test_collection_start_failure_prevents_canvas_ready(self) -> None:
         backend = CollectionRejectingBackend()

@@ -94,6 +94,7 @@ def _tool_definition() -> dict:
                     "action": "navigate_to_pose",
                     "schema": "phanthy.navigation.goal.v1",
                     "id_field": "goal_id",
+                    "id_argument": "_control_nav_id",
                     "allowed_fields": ["x", "y", "yaw", "speed"],
                     "required_fields": ["x", "y", "yaw"],
                 }
@@ -173,6 +174,15 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routes[0].topic, "/ubuntu/navigation/goal_pose")
         self.assertEqual(routes[0].action, "navigate_to_pose")
         self.assertEqual(routes[0].required_fields, ("x", "y", "yaw"))
+        self.assertEqual(routes[0].id_argument, "_control_nav_id")
+
+    def test_live_source_topic_wins_over_stale_connection_cache(self) -> None:
+        layout = _layout()
+        layout["cards"][0]["topicOut"][0]["topic"] = "/live/goal_pose"
+
+        routes = topic_actions.build_routes(layout)
+
+        self.assertEqual(routes[0].topic, "/live/goal_pose")
 
     def test_hot_path_logs_are_sampled_and_escaped(self) -> None:
         runtime = topic_actions.RouteRuntime(
@@ -209,6 +219,22 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0].action, "navigate_to_pose")
         self.assertEqual(routes[0].schema, "phanthy.navigation.goal.v1")
+        self.assertEqual(routes[0].id_argument, "_control_nav_id")
+
+    async def test_invalid_live_route_change_keeps_current_subscription(self) -> None:
+        with patch.object(topic_actions.ros2_bridge, "subscribe"), patch.object(
+            topic_actions.ros2_bridge, "unsubscribe"
+        ) as unsubscribe:
+            await self.manager.start(_layout())
+            active_keys = set(self.manager._runtimes)
+            invalid = _layout()
+            invalid["connections"][0]["format"] = "raw"
+
+            with self.assertRaisesRegex(ValueError, "requires data/json"):
+                await self.manager.start(invalid)
+
+            self.assertEqual(set(self.manager._runtimes), active_keys)
+            unsubscribe.assert_not_called()
 
     async def test_valid_goal_dispatches_once_and_stop_unsubscribes(self) -> None:
         callbacks = {}
@@ -261,6 +287,7 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
                             "y": -0.8,
                             "yaw": 0.1,
                             "speed": 0.5,
+                            "_control_nav_id": "goal-001",
                         },
                     )
                 ],
@@ -325,7 +352,17 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         async def call_tool(mcp_id, request):
             attempts.append(request.arguments["x"])
             if len(attempts) == 1:
-                return {"code": 503, "message": "temporary failure"}
+                return {
+                    "code": 200,
+                    "data": [{
+                        "type": "text",
+                        "text": json.dumps({
+                            "ok": False,
+                            "status": "error",
+                            "error": "temporary domain failure",
+                        }),
+                    }],
+                }
             return {"code": 200, "data": []}
 
         class Request:
