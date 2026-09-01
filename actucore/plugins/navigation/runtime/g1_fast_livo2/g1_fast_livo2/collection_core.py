@@ -51,6 +51,13 @@ COLLECTION_SOURCES = (
         "qos": "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
     },
 )
+COLLECTION_EVENT_TOPICS = (
+    {
+        "name": "sensor_rejection",
+        "topic": "/ubuntu/navigation/fast_livo2/sensor_rejection",
+        "ros_type": "std_msgs/msg/String",
+    },
+)
 ALIGNMENT_SAMPLE_LIMIT = 4096
 ALIGNMENT_PAIRS = (
     ("rgb_frame", "depth_frame", 150.0),
@@ -140,6 +147,7 @@ def rosbag_record_command(output_directory: str) -> list[str]:
         "--output",
         output_directory,
         *(item["record_topic"] for item in COLLECTION_SOURCES),
+        *(item["topic"] for item in COLLECTION_EVENT_TOPICS),
     ]
 
 
@@ -192,6 +200,13 @@ def read_rosbag_recording_summary(
         "failure_reasons": reasons,
         "error": None,
         "topics": topics,
+        "events": {
+            item["name"]: {
+                **item,
+                "recorded_count": int(topic_counts.get(item["topic"], 0)),
+            }
+            for item in COLLECTION_EVENT_TOPICS
+        },
         "message_count": message_count,
         "duration_ns": int(information.get("duration", {}).get("nanoseconds", 0)),
     }
@@ -650,6 +665,7 @@ __all__ = [
     "COLLECTION_SOURCES",
     "ALIGNMENT_PAIRS",
     "COLLECTION_SAMPLE_INTERVAL_SEC",
+    "COLLECTION_EVENT_TOPICS",
     "CollectionSampler",
     "CollectionHealth",
     "finalize_collection_session",

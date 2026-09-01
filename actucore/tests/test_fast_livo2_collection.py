@@ -16,6 +16,7 @@ RUNTIME_PACKAGE = (
 sys.path.insert(0, str(RUNTIME_PACKAGE))
 
 from g1_fast_livo2.collection_core import (  # noqa: E402
+    COLLECTION_EVENT_TOPICS,
     COLLECTION_SOURCES,
     CollectionHealth,
     CollectionSampler,
@@ -51,7 +52,9 @@ class FastLivo2CollectionTest(unittest.TestCase):
             "/safe/session.partial",
         ])
         self.assertEqual(
-            command[7:], [item["record_topic"] for item in COLLECTION_SOURCES]
+            command[7:],
+            [item["record_topic"] for item in COLLECTION_SOURCES]
+            + [item["topic"] for item in COLLECTION_EVENT_TOPICS],
         )
         self.assertEqual(COLLECTION_SOURCES[0]["topic"], "/ubuntu/navigation/lidar")
         rgb_frame = next(
@@ -348,6 +351,14 @@ class FastLivo2CollectionTest(unittest.TestCase):
                         "message_count": 2 if item["port"] == "imu" else 10,
                     }
                 )
+            entries.append(
+                {
+                    "topic_metadata": {
+                        "name": COLLECTION_EVENT_TOPICS[0]["topic"]
+                    },
+                    "message_count": 3,
+                }
+            )
             Path(temporary, "metadata.yaml").write_text(
                 "rosbag2_bagfile_information:\n"
                 "  message_count: 42\n"
@@ -372,6 +383,9 @@ class FastLivo2CollectionTest(unittest.TestCase):
             )
             self.assertEqual(
                 summary["topics"]["imu"]["source_observed_count"], 100
+            )
+            self.assertEqual(
+                summary["events"]["sensor_rejection"]["recorded_count"], 3
             )
 
     def test_empty_rosbag_is_never_reported_healthy(self) -> None:

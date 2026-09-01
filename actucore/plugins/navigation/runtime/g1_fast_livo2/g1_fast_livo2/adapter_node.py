@@ -37,6 +37,7 @@ from sensor_msgs.msg import Imu, PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
+from .collection_core import COLLECTION_EVENT_TOPICS
 from .frame_adapter_core import (
     InvalidFastLivo2Frame,
     OdomHealthMonitor,
@@ -101,6 +102,7 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("static_map_load_max_points", 200000)
         self.declare_parameter("live_cloud_max_bytes", 67108864)
         self.declare_parameter("source_max_age_sec", 0.5)
+        self.declare_parameter("sensor_pair_max_age_sec", 3.0)
         self.declare_parameter("source_age_tolerance_sec", 0.05)
         self.declare_parameter("map_voxel_size_m", 0.10)
         self.declare_parameter("static_angular_bin_deg", 1.0)
@@ -110,6 +112,14 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("obstacle_max_height_m", 0.30)
 
         self._source_max_age = float(self.get_parameter("source_max_age_sec").value)
+        self._sensor_pair_max_age = float(
+            self.get_parameter("sensor_pair_max_age_sec").value
+        )
+        if not self._source_max_age <= self._sensor_pair_max_age <= 3.0:
+            raise ValueError(
+                "sensor_pair_max_age_sec must be within "
+                "[source_max_age_sec, 3.0]"
+            )
         self._source_age_tolerance = float(
             self.get_parameter("source_age_tolerance_sec").value
         )
@@ -247,6 +257,11 @@ class FastLivo2Adapter(Node):
             map_view_qos,
         )
         self._diagnostics_pub = self.create_publisher(String, str(self.get_parameter("diagnostics_topic").value), 10)
+        self._sensor_rejection_pub = self.create_publisher(
+            String,
+            COLLECTION_EVENT_TOPICS[0]["topic"],
+            10,
+        )
         self._map_control_status_pub = self.create_publisher(
             String, str(self.get_parameter("map_control_status_topic").value), 10
         )
@@ -420,18 +435,76 @@ class FastLivo2Adapter(Node):
         source = float(stamp.sec) + float(stamp.nanosec) * 1e-9
         return self.get_clock().now().nanoseconds * 1e-9 - source
 
-    def _warn_rejected(self, stream: str, detail) -> None:
+    def _warn_rejected(self, stream: str, detail, message=None) -> None:
+        receive_unix_ns = time.time_ns()
+        receive_monotonic_ns = time.monotonic_ns()
         with self._lock:
             counts = getattr(self, "_rejection_counts", None)
             if counts is None:
                 counts = self._rejection_counts = {}
             count = counts.get(stream, 0) + 1
             counts[stream] = count
+            lidar_stamp = getattr(self, "_last_lidar_source_stamp_ns", None)
+            imu_stamp = getattr(self, "_last_imu_source_stamp_ns", None)
+            last_pair = getattr(self, "_last_sensor_pair_monotonic", None)
         if count == 1 or count % 100 == 0:
             bounded = str(detail).replace("\r", "\\r").replace("\n", "\\n")[:200]
             self.get_logger().warning(
                 f"rejecting {stream} count={count}: {bounded}"
             )
+        if stream not in {
+            "navigation lidar contract",
+            "navigation imu contract",
+            "FAST-LIVO2 odom",
+            "FAST-LIVO2 cloud",
+        }:
+            return
+        header = getattr(message, "header", None)
+        stamp = getattr(header, "stamp", None)
+        try:
+            source_stamp_ns = _stamp_ns(stamp) if stamp is not None else None
+        except (AttributeError, TypeError, ValueError):
+            source_stamp_ns = None
+        pair_skew_ns = (
+            None
+            if lidar_stamp is None or imu_stamp is None
+            else abs(int(lidar_stamp) - int(imu_stamp))
+        )
+        pair_result = (
+            "unavailable"
+            if pair_skew_ns is None
+            else "matched" if pair_skew_ns <= 200_000_000 else "skew_exceeded"
+        )
+        payload = {
+            "schema": "phanthy.navigation.sensor_rejection.v1",
+            "event": "rejected",
+            "stream": stream,
+            "count": count,
+            "reason": str(detail)[:500],
+            "receive_unix_ns": receive_unix_ns,
+            "receive_monotonic_ns": receive_monotonic_ns,
+            "source_stamp_ns": source_stamp_ns,
+            "frame_id": str(getattr(header, "frame_id", "") or ""),
+            "lidar_source_stamp_ns": lidar_stamp,
+            "imu_source_stamp_ns": imu_stamp,
+            "lidar_imu_skew_ms": (
+                None if pair_skew_ns is None else round(pair_skew_ns / 1_000_000, 3)
+            ),
+            "lidar_imu_pair_result": pair_result,
+            "sensor_pair_max_age_sec": getattr(
+                self, "_sensor_pair_max_age", None
+            ),
+            "last_valid_pair_age_sec": (
+                None
+                if last_pair is None
+                else round(max(0.0, receive_monotonic_ns / 1e9 - last_pair), 6)
+            ),
+        }
+        publisher = getattr(self, "_sensor_rejection_pub", None)
+        if publisher is not None:
+            rejection = String()
+            rejection.data = json.dumps(payload, separators=(",", ":"))
+            publisher.publish(rejection)
 
     def _mark_valid(self, stream: str) -> None:
         with self._lock:
@@ -463,7 +536,7 @@ class FastLivo2Adapter(Node):
                 header_stamp_ns=source_stamp_ns,
             )
         except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
-            self._warn_rejected("navigation lidar contract", exc)
+            self._warn_rejected("navigation lidar contract", exc, message)
             return
         self._mark_valid("navigation lidar contract")
         with self._lock:
@@ -489,7 +562,7 @@ class FastLivo2Adapter(Node):
             if previous is not None and source_stamp_ns <= previous:
                 raise InvalidFastLivo2Frame("imu source stamp did not advance")
         except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
-            self._warn_rejected("navigation imu contract", exc)
+            self._warn_rejected("navigation imu contract", exc, message)
             return
         self._mark_valid("navigation imu contract")
         with self._lock:
@@ -568,7 +641,7 @@ class FastLivo2Adapter(Node):
         return (
             self._last_sensor_pair_monotonic is not None
             and time.monotonic() - self._last_sensor_pair_monotonic
-            <= self._source_max_age
+            <= self._sensor_pair_max_age
         )
 
     def _sensor_contract_ready_locked(self) -> bool:
@@ -637,7 +710,7 @@ class FastLivo2Adapter(Node):
             )
         except (InvalidFastLivo2Frame, ValueError, TypeError) as exc:
             self._invalid_odom += 1
-            self._warn_rejected("FAST-LIVO2 odom", exc)
+            self._warn_rejected("FAST-LIVO2 odom", exc, message)
             return
         self._mark_valid("FAST-LIVO2 odom")
 
@@ -728,7 +801,7 @@ class FastLivo2Adapter(Node):
             )
         except (InvalidFastLivo2Frame, ValueError, TypeError) as exc:
             self._invalid_cloud += 1
-            self._warn_rejected("FAST-LIVO2 cloud", exc)
+            self._warn_rejected("FAST-LIVO2 cloud", exc, message)
             return
         self._mark_valid("FAST-LIVO2 cloud")
 
@@ -1713,6 +1786,7 @@ class FastLivo2Adapter(Node):
             "static_map_frame": "map",
             "sensor_frame": state["sensor_frame"],
             "sensor_contract_ready": state["sensor_contract_ready"],
+            "sensor_pair_max_age_sec": self._sensor_pair_max_age,
             "base_to_sensor_tf_ready": state["base_to_sensor_tf_ready"],
             "sensor_tf_error": state["sensor_tf_error"],
             "point_time_span_ms": state["point_time_span_ms"],

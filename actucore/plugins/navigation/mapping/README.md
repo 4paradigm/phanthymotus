@@ -327,6 +327,17 @@ Depth/LiDAR 的最近邻时间偏差。P95 门槛分别是 `150 / 20 / 60 / 120 
 时间戳缺失或倒序会令状态进入 `degraded`，但不会中断导航。这是 ROS
 system-time 时钟域的软件对齐证据，不等同于 PTP、外部触发或硬件帧同步。
 
+FAST-LIVO2 adapter 另外只在拒绝 LiDAR、IMU、odom 或 registered cloud
+时发布 `/ubuntu/navigation/fast_livo2/sensor_rejection`。每条 JSON 证据包含
+接收时刻、源时间戳、当时最新 LiDAR/IMU 时间戳、配对差值、最近有效
+配对年龄与拒绝原因；正常帧不发布该 topic。`collection_enabled=true`
+时 rosbag2 将该低频事件 topic 一并写入 MCAP，但不把“本次没有拒绝事件”
+当作录制失败。
+
+LiDAR/IMU 最近有效配对允许最多 `3.0 s` 的短时断流；超时后才令
+sensor contract 失效。该容错不放宽实际用于控制的 odom 和 registered
+cloud，二者仍各自按 `0.5 s` source age 拒绝过期输出。
+
 录制目录按 `ubuntu/YYYY-MM-DD/<session_id>` 分层。录制期间目录名带
 `.partial`；Canvas 正常停止、rosbag2 完成 flush 且 receipt 写入后才原子改为
 最终目录。异常退出会保留 `.partial`，不会冒充完整数据。

@@ -141,6 +141,11 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
         adapter._rejection_counts = {}
+        adapter._last_lidar_source_stamp_ns = 1_000_000_000
+        adapter._last_imu_source_stamp_ns = 1_350_000_000
+        adapter._last_sensor_pair_monotonic = time.monotonic() - 0.6
+        adapter._sensor_pair_max_age = 3.0
+        adapter._sensor_rejection_pub = _CapturePublisher()
         warnings = []
         infos = []
         adapter.get_logger = lambda: SimpleNamespace(
@@ -148,13 +153,30 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             info=infos.append,
         )
 
+        rejected = SimpleNamespace(
+            header=SimpleNamespace(
+                frame_id="camera_init",
+                stamp=SimpleNamespace(sec=2, nanosec=50_000_000),
+            )
+        )
         for _ in range(101):
-            adapter._warn_rejected("FAST-LIVO2 cloud", "bad\nframe")
+            adapter._warn_rejected(
+                "FAST-LIVO2 cloud",
+                "bad\nframe",
+                rejected,
+            )
 
         self.assertEqual(len(warnings), 2)
         self.assertIn("count=1", warnings[0])
         self.assertIn("count=100", warnings[1])
         self.assertNotIn("\n", warnings[0])
+        self.assertEqual(len(adapter._sensor_rejection_pub.messages), 101)
+        evidence = json.loads(adapter._sensor_rejection_pub.messages[0].data)
+        self.assertEqual(evidence["event"], "rejected")
+        self.assertEqual(evidence["source_stamp_ns"], 2_050_000_000)
+        self.assertEqual(evidence["lidar_imu_skew_ms"], 350.0)
+        self.assertEqual(evidence["lidar_imu_pair_result"], "skew_exceeded")
+        self.assertGreaterEqual(evidence["last_valid_pair_age_sec"], 0.5)
 
         adapter._mark_valid("FAST-LIVO2 cloud")
         self.assertEqual(
@@ -262,6 +284,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._last_imu_source_stamp_ns = 1_050_000_000
         adapter._last_sensor_pair_monotonic = None
         adapter._source_max_age = 0.5
+        adapter._sensor_pair_max_age = 3.0
         adapter._point_time_ready = True
         adapter._imu_time_ready = True
         adapter._point_time_span_ms = 80.0
@@ -291,7 +314,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             mock.ANY,
         )
 
-    def test_sensor_contract_ignores_one_duplicate_until_valid_pair_is_stale(self) -> None:
+    def test_sensor_contract_tolerates_brief_pair_gap_but_rejects_three_seconds(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
         adapter._rejection_counts = {}
@@ -301,6 +324,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._last_imu_source_stamp_ns = 1_050_000_000
         adapter._last_sensor_pair_monotonic = None
         adapter._source_max_age = 0.5
+        adapter._sensor_pair_max_age = 3.0
         adapter._point_time_ready = True
         adapter._imu_time_ready = True
         adapter._point_time_span_ms = 100.0
@@ -335,6 +359,10 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertIsNotNone(adapter._base_to_sensor)
 
         adapter._last_sensor_pair_monotonic = time.monotonic() - 0.6
+        self.assertTrue(adapter._sensor_contract_ready_locked())
+        self.assertEqual(adapter._readiness_blockers_locked(), [])
+
+        adapter._last_sensor_pair_monotonic = time.monotonic() - 3.1
         self.assertFalse(adapter._sensor_contract_ready_locked())
         self.assertIn("point_time_invalid", adapter._readiness_blockers_locked())
         self.assertIsNotNone(adapter._base_to_sensor)
@@ -348,6 +376,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._last_imu_source_stamp_ns = 1_050_000_000
         adapter._last_sensor_pair_monotonic = None
         adapter._source_max_age = 0.5
+        adapter._sensor_pair_max_age = 3.0
         adapter._point_time_ready = True
         adapter._imu_time_ready = True
         adapter._point_time_span_ms = 50.0
@@ -601,6 +630,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter = object.__new__(FastLivo2Adapter)
         adapter._source_age = lambda _stamp: 0.0
         adapter._source_max_age = 0.5
+        adapter._sensor_pair_max_age = 3.0
         adapter._source_age_tolerance = 0.05
         adapter._map_load_max_points = 200_000
         adapter._live_cloud_max_bytes = 64 * 1024 * 1024
