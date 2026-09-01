@@ -42,7 +42,7 @@ RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/
     echo "/opt/ros/humble/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/usr/lib/python3/dist-packages" >> .venv/lib/python3.10/site-packages/system.pth && \
-    .venv/bin/python -c "import rclpy; from sensor_msgs.msg import PointCloud2; from nav_msgs.msg import OccupancyGrid, Odometry, Path"
+    /bin/bash -c "source /opt/ros/humble/setup.bash && .venv/bin/python -c 'import rclpy; from sensor_msgs.msg import PointCloud2; from nav_msgs.msg import OccupancyGrid, Odometry, Path'"
 
 COPY web/      /work/web/
 COPY src/      /work/src/
