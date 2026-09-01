@@ -194,7 +194,8 @@ class Nav2ContractTest(unittest.TestCase):
 
         action_params = tool["inputSchema"]["x-action-params"]
         self.assertNotIn("mode", action_params["navigate_to_pose"]["params"])
-        topic_action = tool["x-topic-actions"][0]
+        topic_action = tool["inputSchema"]["x-topic-actions"][0]
+        self.assertNotIn("x-topic-actions", tool)
         self.assertNotIn("mode", topic_action["allowed_fields"])
         self.assertEqual(topic_action["required_fields"], ["x", "y", "yaw"])
 

@@ -1,8 +1,8 @@
 """Canvas-scoped ROS topic to MCP action dispatch.
 
-Tools opt in with a top-level ``x-topic-actions`` declaration.  A declaration
-is activated only while the Canvas project is running and only when the
-declared input port has an actual Canvas connection.
+Tools opt in with an ``inputSchema.x-topic-actions`` declaration.  A
+declaration is activated only while the Canvas project is running and only
+when the declared input port has an actual Canvas connection.
 """
 
 from __future__ import annotations
@@ -119,7 +119,8 @@ def build_routes(layout: dict[str, Any]) -> list[TopicActionRoute]:
         mcp_id = str(target.get("mcpId") or "")
         tool_name = str(target.get("toolName") or "")
         tool = _tool_definition(mcp_id, tool_name)
-        declarations = (tool or {}).get("x-topic-actions")
+        input_schema = (tool or {}).get("inputSchema") or {}
+        declarations = input_schema.get("x-topic-actions")
         if not isinstance(declarations, list) or not declarations:
             continue
 
@@ -190,7 +191,7 @@ def build_routes(layout: dict[str, Any]) -> list[TopicActionRoute]:
                 id_field=id_field,
                 allowed_fields=tuple(allowed_fields),
                 required_fields=tuple(required_fields),
-                input_schema=(tool or {}).get("inputSchema") or {},
+                input_schema=input_schema,
             )
         )
 
@@ -257,15 +258,11 @@ class TopicActionManager:
                 _log_hot_path(runtime, "rejected", exc)
                 return
 
-            if message_id in runtime.seen_ids:
-                runtime.duplicates += 1
-                return
-            runtime.seen_ids[message_id] = None
-            while len(runtime.seen_ids) > _MAX_SEEN_IDS:
-                runtime.seen_ids.popitem(last=False)
-
             async with runtime.dispatch_lock:
                 if self._runtimes.get(key) is not runtime:
+                    return
+                if message_id in runtime.seen_ids:
+                    runtime.duplicates += 1
                     return
                 try:
                     from api.mcp_manage import MCPCallRequest, mcp_call_tool
@@ -281,6 +278,9 @@ class TopicActionManager:
                             or "MCP call failed"
                         )
                     runtime.dispatched += 1
+                    runtime.seen_ids[message_id] = None
+                    while len(runtime.seen_ids) > _MAX_SEEN_IDS:
+                        runtime.seen_ids.popitem(last=False)
                     runtime.last_error = None
                     _log_hot_path(
                         runtime,

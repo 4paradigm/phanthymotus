@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import struct
@@ -180,6 +181,98 @@ class Ros2BridgeNavigationEncodingTest(unittest.TestCase):
             ),
             b'{"ok":true}',
         )
+
+
+class Ros2BridgeSubscriptionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_callback_keeps_only_the_latest_pending_frame(self) -> None:
+        class FakeNode:
+            callback = None
+
+            def create_subscription(self, _msg_type, _topic, callback, _qos):
+                self.callback = callback
+                return object()
+
+            def destroy_subscription(self, _subscription):
+                pass
+
+        node = FakeNode()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        received = []
+
+        async def callback(data, _fmt):
+            received.append(data.decode())
+            if len(received) == 1:
+                first_started.set()
+                await release_first.wait()
+
+        loop = asyncio.get_running_loop()
+        with patch.object(ros2_bridge, "_HAS_RCLPY", True), patch.object(
+            ros2_bridge, "_running", True
+        ), patch.object(ros2_bridge, "_node_main", node), patch.object(
+            ros2_bridge, "_executor", None
+        ), patch.object(ros2_bridge, "_loop", loop), patch.object(
+            ros2_bridge, "_subs", {}
+        ), patch.object(
+            ros2_bridge, "_resolve_msg_type", return_value=object
+        ), patch.object(
+            ros2_bridge, "_low_lat_qos", return_value=object()
+        ):
+            ros2_bridge.subscribe(
+                "test", "/test", "data/json", loop, callback
+            )
+            node.callback(SimpleNamespace(data="one"))
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            node.callback(SimpleNamespace(data="two"))
+            node.callback(SimpleNamespace(data="three"))
+            release_first.set()
+            for _ in range(20):
+                if len(received) == 2:
+                    break
+                await asyncio.sleep(0)
+            ros2_bridge.unsubscribe("test")
+
+        self.assertEqual(received, ["one", "three"])
+
+    async def test_closed_loop_drops_frames_without_raising(self) -> None:
+        class FakeNode:
+            callback = None
+
+            def create_subscription(self, _msg_type, _topic, callback, _qos):
+                self.callback = callback
+                return object()
+
+            def destroy_subscription(self, _subscription):
+                pass
+
+        class ClosedLoop:
+            def call_soon_threadsafe(self, *_args):
+                raise RuntimeError("Event loop is closed")
+
+        node = FakeNode()
+        callback = unittest.mock.AsyncMock()
+        with patch.object(ros2_bridge, "_HAS_RCLPY", True), patch.object(
+            ros2_bridge, "_running", True
+        ), patch.object(ros2_bridge, "_node_main", node), patch.object(
+            ros2_bridge, "_executor", None
+        ), patch.object(ros2_bridge, "_loop", None), patch.object(
+            ros2_bridge, "_subs", {}
+        ), patch.object(
+            ros2_bridge, "_resolve_msg_type", return_value=object
+        ), patch.object(
+            ros2_bridge, "_low_lat_qos", return_value=object()
+        ), patch("sys.stderr") as stderr:
+            ros2_bridge.subscribe(
+                "test", "/test", "data/json", ClosedLoop(), callback
+            )
+            node.callback(SimpleNamespace(data="one"))
+            node.callback(SimpleNamespace(data="two"))
+            ros2_bridge.unsubscribe("test")
+
+        callback.assert_not_awaited()
+        self.assertIn("callback loop unavailable", "".join(
+            call.args[0] for call in stderr.write.call_args_list
+        ))
 
 
 if __name__ == "__main__":

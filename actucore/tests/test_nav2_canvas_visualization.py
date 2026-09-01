@@ -50,7 +50,9 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
         self.assertIn("from nav_msgs.msg import Odometry", bridge)
         self.assertIn("fmt == 'sensor/path'", bridge)
         self.assertIn("from nav_msgs.msg import Path", bridge)
-        self.assertIn("fmt == 'sensor/costmap'", bridge)
+        self.assertIn(
+            "fmt in ('sensor/costmap', 'sensor/occupancy-grid')", bridge
+        )
         self.assertIn("from nav_msgs.msg import OccupancyGrid", bridge)
         self.assertIn("_odometry_payload(msg)", bridge)
         self.assertIn("_path_payload(msg)", bridge)

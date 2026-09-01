@@ -244,8 +244,10 @@ class NavigationContractTest(unittest.TestCase):
                 "costmap",
             ],
         )
-        self.assertEqual(tool["x-topic-actions"][0]["action"], "navigate_to_pose")
-        self.assertEqual(tool["x-topic-actions"][0]["port"], "goal_pose")
+        topic_action = tool["inputSchema"]["x-topic-actions"][0]
+        self.assertNotIn("x-topic-actions", tool)
+        self.assertEqual(topic_action["action"], "navigate_to_pose")
+        self.assertEqual(topic_action["port"], "goal_pose")
         self.assertTrue(
             {
                 "livo_odom",

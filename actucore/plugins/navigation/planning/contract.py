@@ -211,18 +211,6 @@ def nav2_tool_definition(namespace: str) -> dict:
             "bounded velocity proposals with a fresh task ID; the Driver loco "
             "actuator owns any physical execution and task adoption."
         ),
-        "x-topic-actions": [
-            {
-                "port": "goal_pose",
-                "action": "navigate_to_pose",
-                "wait_action": "wait_navigation_done",
-                "stop_action": "stop_nav",
-                "schema": "phanthy.navigation.goal.v1",
-                "id_field": "goal_id",
-                "allowed_fields": ["x", "y", "yaw", "speed"],
-                "required_fields": ["x", "y", "yaw"],
-            }
-        ],
         "topic_in": [
             {
                 "port": "livo_odom",
@@ -400,6 +388,18 @@ def nav2_tool_definition(namespace: str) -> dict:
             },
             "required": ["action"],
             "x-action-params": NAV2_PUBLIC_ACTION_PARAMS,
+            "x-topic-actions": [
+                {
+                    "port": "goal_pose",
+                    "action": "navigate_to_pose",
+                    "wait_action": "wait_navigation_done",
+                    "stop_action": "stop_nav",
+                    "schema": "phanthy.navigation.goal.v1",
+                    "id_field": "goal_id",
+                    "allowed_fields": ["x", "y", "yaw", "speed"],
+                    "required_fields": ["x", "y", "yaw"],
+                }
+            ],
         },
         "configSchema": deepcopy(NAV2_CONFIG_SCHEMA),
     }

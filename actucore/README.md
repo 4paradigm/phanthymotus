@@ -99,6 +99,8 @@ TOOLS = [
             # "x-completion": {"actions": ["goto"], "timeout": 120},
             # 可选：系统 hook 绑定（打断等）
             # "x-hooks": {"on_interrupt_goto": {"action": "cancel"}},
+            # 可选：Canvas topic 输入转换为同工具 action
+            # "x-topic-actions": [{"port": "goal", "action": "goto", ...}],
         },
         "configSchema": {
             "type": "object",

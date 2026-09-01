@@ -199,7 +199,6 @@ def navigation_tool_definition(namespace: str) -> dict:
             "processes inside the ActuCore container; only bounded velocity "
             "proposals leave the card."
         ),
-        "x-topic-actions": deepcopy(planning["x-topic-actions"]),
         "topic_in": external_inputs,
         "topic_out": outputs,
         "inputSchema": {
@@ -208,6 +207,9 @@ def navigation_tool_definition(namespace: str) -> dict:
             "required": ["action"],
             "additionalProperties": False,
             "x-action-params": deepcopy(NAVIGATION_ACTION_PARAMS),
+            "x-topic-actions": deepcopy(
+                planning["inputSchema"]["x-topic-actions"]
+            ),
         },
         "configSchema": deepcopy(NAVIGATION_CONFIG_SCHEMA),
     }

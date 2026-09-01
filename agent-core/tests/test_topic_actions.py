@@ -66,16 +66,6 @@ with patch.dict(
 def _tool_definition() -> dict:
     return {
         "name": "nav2",
-        "x-topic-actions": [
-            {
-                "port": "goal_pose",
-                "action": "navigate_to_pose",
-                "schema": "phanthy.navigation.goal.v1",
-                "id_field": "goal_id",
-                "allowed_fields": ["x", "y", "yaw", "speed"],
-                "required_fields": ["x", "y", "yaw"],
-            }
-        ],
         "topic_in": [
             {"port": "odom", "topic": "/odom", "format": "sensor/odometry"},
             {
@@ -98,6 +88,16 @@ def _tool_definition() -> dict:
                 "speed": {"type": "number", "minimum": 0.3, "maximum": 1.0},
             },
             "required": ["action"],
+            "x-topic-actions": [
+                {
+                    "port": "goal_pose",
+                    "action": "navigate_to_pose",
+                    "schema": "phanthy.navigation.goal.v1",
+                    "id_field": "goal_id",
+                    "allowed_fields": ["x", "y", "yaw", "speed"],
+                    "required_fields": ["x", "y", "yaw"],
+                }
+            ],
         },
     }
 
@@ -157,6 +157,13 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         layout = _layout()
         layout["connections"] = []
         self.assertEqual(topic_actions.build_routes(layout), [])
+
+    def test_top_level_topic_action_extension_is_not_a_valid_route(self) -> None:
+        tool = _tool_definition()
+        tool["x-topic-actions"] = tool["inputSchema"].pop("x-topic-actions")
+        mcp_client.registry["perception"] = {"tool_definitions": [tool]}
+
+        self.assertEqual(topic_actions.build_routes(_layout()), [])
 
     def test_route_resolves_declared_port_and_topic(self) -> None:
         routes = topic_actions.build_routes(_layout())
@@ -307,6 +314,55 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stats["received"], 4)
             self.assertEqual(stats["invalid"], 4)
             self.assertEqual(stats["dispatched"], 0)
+
+    async def test_failed_delivery_can_retry_the_same_goal_id(self) -> None:
+        callbacks = {}
+        attempts = []
+
+        def subscribe(key, topic, fmt, loop, callback):
+            callbacks[key] = callback
+
+        async def call_tool(mcp_id, request):
+            attempts.append(request.arguments["x"])
+            if len(attempts) == 1:
+                return {"code": 503, "message": "temporary failure"}
+            return {"code": 200, "data": []}
+
+        class Request:
+            def __init__(self, tool, arguments):
+                self.tool = tool
+                self.arguments = arguments
+
+        fake_api = types.ModuleType("api.mcp_manage")
+        fake_api.MCPCallRequest = Request
+        fake_api.mcp_call_tool = call_tool
+        payload = {
+            "schema": "phanthy.navigation.goal.v1",
+            "goal_id": "retry-001",
+            "x": 1.0,
+            "y": 2.0,
+            "yaw": 0.0,
+        }
+
+        with patch.object(
+            topic_actions.ros2_bridge, "subscribe", side_effect=subscribe
+        ), patch.object(
+            topic_actions.ros2_bridge, "unsubscribe"
+        ), patch.dict(
+            sys.modules, {"api.mcp_manage": fake_api}
+        ), patch("builtins.print"):
+            await self.manager.start(_layout())
+            callback = next(iter(callbacks.values()))
+            encoded = json.dumps(payload).encode()
+            await callback(encoded, "data/json")
+            await callback(encoded, "data/json")
+            await callback(encoded, "data/json")
+
+        stats = next(iter(self.manager.snapshot().values()))
+        self.assertEqual(attempts, [1.0, 1.0])
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(stats["dispatched"], 1)
+        self.assertEqual(stats["duplicates"], 1)
 
 
 if __name__ == "__main__":

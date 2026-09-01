@@ -74,10 +74,12 @@ registered cloud 的接收 age 推过 500 ms。BT 和分段控制器均为 20 Hz
 ```
 
 Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
-`goal_pose` 端口时激活 `x-topic-actions`。Core 会把通过校验的
+`goal_pose` 端口时激活 `inputSchema.x-topic-actions`。Core 会把通过校验的
 `x/y/yaw/speed` 转为同一张卡片的 `navigate_to_pose` MCP 调用；
 `schema` 不符、缺坐标、夹带未声明字段或重复 `goal_id` 的消息
-都不会被执行。停止 Canvas 项目会先退订该 topic，再停止卡片。
+都不会被执行。只有 MCP 投递成功后 `goal_id` 才进入去重窗口；临时投递失败
+可以用同一 ID 重试。Bridge 对等待中的目标只保留最新一条，停止 Canvas 项目
+会退订并取消尚未投递的目标，再停止卡片。
 
 ## 输出合同
 

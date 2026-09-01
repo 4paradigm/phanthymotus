@@ -119,7 +119,15 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
         return  # already subscribed
 
     _active_primary_subs.add(topic)  # mark immediately to prevent race
-    ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
+    queue_depth = 20 if fmt.startswith('audio/') or topic == '/perception/perf_spans' else 1
+    ros2_bridge.subscribe(
+        key,
+        topic,
+        fmt,
+        loop,
+        _push_factory(topic),
+        queue_depth=queue_depth,
+    )
     print(f'[inspection] started primary sub: {topic}')
 
 

@@ -27,6 +27,7 @@ import math
 import struct
 import sys
 import threading
+from collections import deque
 
 _lock            = threading.Lock()
 _subs: dict      = {}   # mcp_id → {'node': Node, 'sub': Subscription}
@@ -90,6 +91,7 @@ def stop() -> None:
     _running = False
     with _lock:
         for info in _subs.values():
+            info.get('cancel', lambda: None)()
             try:
                 _node_main.destroy_subscription(info['sub'])
             except Exception:
@@ -107,8 +109,16 @@ def stop() -> None:
     print('[ros2_bridge] stopped')
 
 
-def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop, cb) -> None:
-    """订阅 topic；每收到一帧就在 loop 中 schedule cb(data: bytes, fmt: str)。"""
+def subscribe(
+    mcp_id: str,
+    topic: str,
+    fmt: str,
+    loop: asyncio.AbstractEventLoop,
+    cb,
+    *,
+    queue_depth: int = 1,
+) -> None:
+    """订阅 topic；有界转发到 loop，默认只保留等待中的最新一帧。"""
     if not _HAS_RCLPY or not _running:
         return
 
@@ -125,6 +135,50 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
         print(f'[ros2_bridge] unsupported format {fmt!r} for topic {topic}', file=sys.stderr)
         return
 
+    callback_queue = deque(maxlen=max(1, int(queue_depth)))
+    callback_lock = threading.Lock()
+    callback_state = {
+        'active': False,
+        'future': None,
+        'closed': False,
+        'generation': 0,
+    }
+
+    async def _drain_callbacks():
+        try:
+            while True:
+                with callback_lock:
+                    if callback_state['closed'] or not callback_queue:
+                        callback_state['active'] = False
+                        callback_state['future'] = None
+                        return
+                    data, msg_fmt = callback_queue.popleft()
+                try:
+                    await cb(data, msg_fmt)
+                except Exception as e:
+                    print(
+                        f'[ros2_bridge] callback error: {repr(e)}',
+                        file=sys.stderr,
+                    )
+        except asyncio.CancelledError:
+            with callback_lock:
+                callback_state['active'] = False
+                callback_state['future'] = None
+                callback_queue.clear()
+            raise
+
+    def _cancel_callback():
+        with callback_lock:
+            callback_state['closed'] = True
+            callback_queue.clear()
+            future = callback_state['future']
+            callback_state['future'] = None
+        if future is not None:
+            try:
+                future.cancel()
+            except RuntimeError:
+                pass
+
     def _on_msg(msg):
         try:
             data = _encode_message(msg, fmt)
@@ -133,11 +187,46 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
             print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
             return
         _last_seen[topic] = _time.time()
-        asyncio.run_coroutine_threadsafe(cb(data, msg_fmt), _cb_loop)
+        with callback_lock:
+            if callback_state['closed']:
+                return
+            callback_queue.append((data, msg_fmt))
+            if callback_state['active']:
+                return
+            callback_state['active'] = True
+            callback_state['generation'] += 1
+            generation = callback_state['generation']
+        coroutine = _drain_callbacks()
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, _cb_loop)
+        except RuntimeError as e:
+            coroutine.close()
+            with callback_lock:
+                callback_state['active'] = False
+                callback_state['closed'] = True
+                callback_queue.clear()
+            print(f'[ros2_bridge] callback loop unavailable: {e}', file=sys.stderr)
+            return
+        with callback_lock:
+            if callback_state['closed']:
+                try:
+                    future.cancel()
+                except RuntimeError:
+                    pass
+            elif (
+                callback_state['active']
+                and callback_state['generation'] == generation
+            ):
+                callback_state['future'] = future
 
     sub = _node_main.create_subscription(msg_type, topic, _on_msg, _low_lat_qos())
     with _lock:
-        _subs[mcp_id] = {'sub': sub, 'topic': topic, 'fmt': fmt}
+        _subs[mcp_id] = {
+            'sub': sub,
+            'topic': topic,
+            'fmt': fmt,
+            'cancel': _cancel_callback,
+        }
     if _executor:
         _executor.wake()
     print(f'[ros2_bridge] subscribed mcp_id={mcp_id} topic={topic}')
@@ -149,6 +238,7 @@ def unsubscribe(mcp_id: str) -> None:
     with _lock:
         info = _subs.pop(mcp_id, None)
     if info:
+        info.get('cancel', lambda: None)()
         try:
             _node_main.destroy_subscription(info['sub'])
         except Exception:
