@@ -55,11 +55,12 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
 `(0, 200] ms`。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
-契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable`、
-`point_time_invalid` 或 `raw_odom_discontinuity`，不会继续生成伪正常地图。
+几何契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable` 或
+`raw_odom_discontinuity`，不会继续生成伪正常地图。
 单个重复或乱序样本只会被丢弃，不会立即撤销已验证的传感器合同；
-只有在输入 freshness 窗口内持续没有新的有效 LiDAR/IMU 时间对时，
-才会 fail-closed 为 `point_time_invalid`。
+输入 freshness 窗口内持续没有新的有效 LiDAR/IMU 时间对时，状态会把
+`point_time_invalid` 放入 `sensor_contract_issues` 诊断，但只要 FAST-LIVO2
+自己的 odom/cloud 仍新鲜且 frame、TF 与 odom 连续性有效，就不会重复阻断输出。
 
 ## 公共输出
 

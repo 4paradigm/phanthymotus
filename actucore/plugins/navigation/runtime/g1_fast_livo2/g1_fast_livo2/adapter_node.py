@@ -654,12 +654,20 @@ class FastLivo2Adapter(Node):
             and self._base_to_sensor is not None
         )
 
+    def _sensor_geometry_ready_locked(self) -> bool:
+        return (
+            self._sensor_frame is not None
+            and self._base_to_sensor_tf_ready
+            and self._base_to_sensor is not None
+        )
+
+    def _sensor_contract_issues_locked(self) -> list[str]:
+        return [] if self._sensor_pair_fresh_locked() else ["point_time_invalid"]
+
     def _readiness_blockers_locked(self) -> list[str]:
         blockers = []
         if not self._lidar_frame or self._lidar_frame != self._imu_frame:
             blockers.append("sensor_frame_mismatch")
-        if not self._sensor_pair_fresh_locked():
-            blockers.append("point_time_invalid")
         if (
             self._lidar_frame
             and self._lidar_frame == self._imu_frame
@@ -695,9 +703,9 @@ class FastLivo2Adapter(Node):
             )
             source_stamp_ns = _stamp_ns(message.header.stamp)
             with self._lock:
-                if not self._sensor_contract_ready_locked():
+                if not self._sensor_geometry_ready_locked():
                     raise InvalidFastLivo2Frame(
-                        "navigation sensor contract is not ready"
+                        "navigation sensor geometry is not ready"
                     )
                 if not self._odom_health.observe(source_stamp_ns, raw_sensor_pose):
                     raise InvalidFastLivo2Frame(
@@ -758,7 +766,7 @@ class FastLivo2Adapter(Node):
         try:
             with self._lock:
                 if (
-                    not self._sensor_contract_ready_locked()
+                    not self._sensor_geometry_ready_locked()
                     or not self._odom_health.ready
                 ):
                     raise InvalidFastLivo2Frame(
@@ -1665,6 +1673,7 @@ class FastLivo2Adapter(Node):
                 "map_view_cache_monotonic": self._map_view_cache_monotonic,
                 "sensor_frame": self._sensor_frame,
                 "sensor_contract_ready": self._sensor_contract_ready_locked(),
+                "sensor_contract_issues": self._sensor_contract_issues_locked(),
                 "base_to_sensor_tf_ready": self._base_to_sensor_tf_ready,
                 "sensor_tf_error": self._sensor_tf_error,
                 "point_time_span_ms": self._point_time_span_ms,
@@ -1786,6 +1795,7 @@ class FastLivo2Adapter(Node):
             "static_map_frame": "map",
             "sensor_frame": state["sensor_frame"],
             "sensor_contract_ready": state["sensor_contract_ready"],
+            "sensor_contract_issues": state["sensor_contract_issues"],
             "sensor_pair_max_age_sec": self._sensor_pair_max_age,
             "base_to_sensor_tf_ready": state["base_to_sensor_tf_ready"],
             "sensor_tf_error": state["sensor_tf_error"],

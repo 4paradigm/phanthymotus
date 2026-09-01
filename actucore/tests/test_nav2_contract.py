@@ -157,11 +157,11 @@ class Nav2ContractTest(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             params["global_costmap"]["global_costmap"]["ros__parameters"]
             ["track_unknown_space"]
         )
-        self.assertFalse(
+        self.assertTrue(
             params["planner_server"]["ros__parameters"]["GridBased"]
             ["allow_unknown"]
         )

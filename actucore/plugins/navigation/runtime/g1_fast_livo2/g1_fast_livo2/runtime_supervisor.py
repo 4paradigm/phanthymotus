@@ -1783,6 +1783,9 @@ class FastLivo2Supervisor(Node):
                 "sensor_contract_ready": bool(
                     diagnostics.get("sensor_contract_ready", False)
                 ),
+                "sensor_contract_issues": list(
+                    diagnostics.get("sensor_contract_issues", [])
+                ),
                 "base_to_sensor_tf_ready": bool(
                     diagnostics.get("base_to_sensor_tf_ready", False)
                 ),

@@ -364,8 +364,94 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
 
         adapter._last_sensor_pair_monotonic = time.monotonic() - 3.1
         self.assertFalse(adapter._sensor_contract_ready_locked())
-        self.assertIn("point_time_invalid", adapter._readiness_blockers_locked())
+        self.assertTrue(adapter._sensor_geometry_ready_locked())
+        self.assertEqual(adapter._readiness_blockers_locked(), [])
+        self.assertEqual(
+            adapter._sensor_contract_issues_locked(),
+            ["point_time_invalid"],
+        )
         self.assertIsNotNone(adapter._base_to_sensor)
+
+    def test_stale_raw_sensor_pair_does_not_reject_fresh_fast_livo2_outputs(self) -> None:
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._source_age = lambda _stamp: 0.0
+        adapter._source_max_age = 0.5
+        adapter._source_age_tolerance = 0.05
+        adapter._sensor_pair_max_age = 3.0
+        adapter._map_load_max_points = 200_000
+        adapter._live_cloud_max_bytes = 64 * 1024 * 1024
+        adapter._invalid_odom = 0
+        adapter._invalid_cloud = 0
+        adapter._rejection_counts = {}
+        adapter._latency_ms = {}
+        adapter._latency_max_ms = {}
+        adapter._sensor_frame = "sensor_frame"
+        adapter._lidar_frame = "sensor_frame"
+        adapter._imu_frame = "sensor_frame"
+        adapter._point_time_ready = True
+        adapter._imu_time_ready = True
+        adapter._last_sensor_pair_monotonic = time.monotonic() - 3.1
+        adapter._base_to_sensor_tf_ready = True
+        adapter._base_to_sensor = Pose3(
+            0.0,
+            0.0,
+            0.0,
+            Quaternion(0.0, 0.0, 0.0, 1.0),
+        )
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._latest_session_pose = None
+        adapter._last_odom_monotonic = None
+        adapter._last_odom_source_age = None
+        adapter._latest_session_points = ()
+        adapter._last_cloud_monotonic = None
+        adapter._last_cloud_source_age = None
+        adapter._mode = "localization"
+        adapter._map_from_session = None
+        adapter.get_logger = lambda: SimpleNamespace(
+            warning=lambda _message: None,
+            info=lambda _message: None,
+        )
+        odom = SimpleNamespace(
+            header=SimpleNamespace(
+                frame_id="camera_init",
+                stamp=SimpleNamespace(sec=1, nanosec=0),
+            ),
+            child_frame_id="aft_mapped",
+            pose=SimpleNamespace(
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                    orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+                )
+            ),
+        )
+        message = SimpleNamespace(
+            header=SimpleNamespace(
+                frame_id="camera_init",
+                stamp=SimpleNamespace(sec=1, nanosec=0),
+            ),
+            width=1,
+            height=1,
+            point_step=24,
+            row_step=24,
+            is_bigendian=False,
+            fields=[
+                SimpleNamespace(name="x", offset=0, datatype=8, count=1),
+                SimpleNamespace(name="y", offset=8, datatype=8, count=1),
+                SimpleNamespace(name="z", offset=16, datatype=8, count=1),
+            ],
+            data=struct.pack("<ddd", 1.0, 2.0, 0.0),
+        )
+
+        adapter._on_odom(odom)
+        adapter._on_cloud(message)
+
+        self.assertEqual(adapter._invalid_odom, 0)
+        self.assertIsNotNone(adapter._latest_session_pose)
+        self.assertIsNotNone(adapter._last_odom_monotonic)
+        self.assertEqual(adapter._invalid_cloud, 0)
+        self.assertEqual(len(adapter._latest_session_points), 1)
+        self.assertIsNotNone(adapter._last_cloud_monotonic)
 
     def test_sensor_contract_reports_frame_mismatch_and_missing_tf(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)

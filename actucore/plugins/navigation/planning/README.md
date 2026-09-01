@@ -157,6 +157,9 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   高度带内的体素首次出现即写入 StaticLayer，不等待多帧确认、不做动态分量
   跟踪，也不通过后续自由射线删除。该模式保留稀疏墙面证据，但建图期间出现
   的人员或移动物体可能固化进地图，建图现场应尽量保持静止。
+- 稀疏点云地图不会把尚未观测的格子当成硬障碍；global costmap 不跟踪
+  unknown，NavFn 允许穿过未知格。已确认的静态/实时障碍、footprint 与目标格
+  碰撞检查仍然 fail-closed，避免大场景仅因地图稀疏而完全无路可走。
 - 两层都使用卡片的 `obstacle_min_height_m/obstacle_max_height_m` 预过滤；旧
   `/ubuntu/navigation/obstacle_map` 仅作兼容诊断，不再以 `clearing=false`
   驱动全局代价图。confirmed static PCD 加载时还要求保存的高度带与当前配置
