@@ -474,9 +474,23 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn(
             'GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"', build_script
         )
+        self.assertLess(
+            base_dockerfile.index("git config --global"),
+            base_dockerfile.index("WORKDIR /opt/ros_deps_ws/src"),
+        )
+        self.assertGreater(
+            base_dockerfile.rindex("--remove-section"),
+            base_dockerfile.index("WORKDIR /opt/nav2_ws"),
+        )
         for source_lock in source_locks:
             self.assertNotIn("GIT_MIRROR_PREFIX=", source_lock)
             self.assertNotIn("APT_UBUNTU_MIRROR=", source_lock)
+            for assignment in source_lock.splitlines():
+                if not assignment or assignment.startswith("#"):
+                    continue
+                variable, separator, _ = assignment.partition("=")
+                self.assertEqual(separator, "=")
+                self.assertIn(f'"{variable}=${{{variable}}}"', build_script)
         self.assertIn("jetson-base:jp61-torch@sha256:", build_script)
         self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)

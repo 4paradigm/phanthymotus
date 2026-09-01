@@ -136,6 +136,12 @@ RUN apt-get update && \
       apt-get install -y --no-install-recommends libopencv-dev; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
+# Keep nested CMake/FetchContent GitHub downloads on the selected mirror until
+# every source build is complete. Direct clones also retain explicit prefixes.
+RUN git config --global \
+      "url.${GIT_MIRROR_PREFIX}https://github.com/.insteadOf" \
+      "https://github.com/"
+
 # ── base 之外缺的 ROS 依赖 ──────────────────────────────────────────
 # 全部克隆下来，但只编 base 里查不到的那些：重复 overlay 一个消息包会让
 # 同一份 typesupport 在 AMENT_PREFIX_PATH 里出现两次，不如让 ros2 pkg prefix
@@ -212,9 +218,6 @@ RUN git init rosbag2_storage_mcap && \
 
 WORKDIR /opt/ros_deps_ws
 RUN source /opt/ros/humble/install/setup.bash && \
-    git config --global \
-      "url.${GIT_MIRROR_PREFIX}https://github.com/.insteadOf" \
-      "https://github.com/" && \
     missing=() && \
     for package in \
         behaviortree_cpp_v3 \
@@ -251,9 +254,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
     else \
       mkdir -p install && \
       printf '%s\n' '#!/usr/bin/env bash' 'true' > install/setup.bash; \
-    fi && \
-    { git config --global --remove-section \
-        "url.${GIT_MIRROR_PREFIX}https://github.com/" || true; }
+    fi
 
 # ── tf2 头文件后缀兼容 ─────────────────────────────────────────────
 # tf2 在 Humble 生命周期里把 include 从 .h 改名成 .hpp。base 的 ROS 是较早的
@@ -468,7 +469,9 @@ RUN source /opt/ros/humble/install/setup.bash && \
     done && \
     ros2 pkg list | sort > /opt/actucore-ros-package-lock.txt && \
     grep -Fqx nav2_bringup /opt/actucore-ros-package-lock.txt && \
-    ! grep -Fqx nav2_dwb_controller /opt/actucore-ros-package-lock.txt
+    ! grep -Fqx nav2_dwb_controller /opt/actucore-ros-package-lock.txt && \
+    { git config --global --remove-section \
+        "url.${GIT_MIRROR_PREFIX}https://github.com/" || true; }
 
 LABEL org.opencontainers.image.title="Phanthy Motus ActuCore Navigation Base" \
       org.opencontainers.image.description="ActuCore navigation build base — locked FAST-LIVO2 and Nav2" \

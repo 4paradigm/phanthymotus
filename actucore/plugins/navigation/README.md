@@ -247,7 +247,8 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 
 `--mirror tuna` 只选择国内 APT/PyPI 源；Git 默认直连官方仓库，避免把公共代理
 隐式固化进可复现构建。网络环境需要代理时由维护者显式传入
-`GIT_MIRROR_PREFIX`，mcap_vendor 的 FetchContent 也沿用该值。
+`GIT_MIRROR_PREFIX`；全局 Git 重写会保留到 FAST-LIVO2/Nav2 编译完成，使
+FetchContent 也沿用该值，最终镜像再删除该重写。
 
 ```bash
 ./deploy/build_actucore.sh --mirror tuna
