@@ -993,6 +993,76 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertTrue(any(args["action"] == "stop" for _, args in planning.calls))
         self.assertTrue(any(args["action"] == "stop" for _, args in semantic.calls))
 
+    def test_nonretryable_mapping_stop_still_keeps_runtime_for_retry(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent(
+            "mapping",
+            stop_result={
+                "state": "error",
+                "status": "error",
+                "error_code": "map_write_failed",
+                "error": "map transaction was not persisted",
+            },
+        )
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping)
+        plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+
+        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "navigation_stop_pending")
+        self.assertTrue(result["retryable"])
+        self.assertTrue(runtime.started)
+        self.assertEqual(runtime.stop_calls, 0)
+        self.assertTrue(plugin._started)
+
+    def test_confirmed_mapping_failure_releases_owned_runtime(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent(
+            "mapping",
+            stop_result={
+                "state": "error",
+                "status": "error",
+                "error_code": "map_write_failed",
+                "error": "map transaction failed after runtime shutdown",
+                "terminal_confirmed": True,
+            },
+        )
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping)
+        plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+
+        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "navigation_stop_failed")
+        self.assertTrue(result["terminal_confirmed"])
+        self.assertEqual(runtime.stop_calls, 1)
+        self.assertFalse(plugin._started)
+
+    def test_runtime_stop_exception_keeps_lifecycle_for_retry(self):
+        class FailingStopRuntime(FakeRuntime):
+            def stop(self):
+                self.stop_calls += 1
+                raise RuntimeError("runtime stop failed")
+
+        runtime = FailingStopRuntime()
+        plugin = self.make_plugin(runtime=runtime)
+        plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+
+        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "navigation_stop_pending")
+        self.assertTrue(result["retryable"])
+        self.assertTrue(plugin._started)
+        self.assertEqual(runtime.stop_calls, 1)
+
     def test_retryable_planning_stop_keeps_every_owned_runtime_for_retry(self):
         runtime = FakeRuntime()
         mapping = FakeComponent("mapping")
@@ -1021,6 +1091,36 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertEqual(result["error_code"], "navigation_stop_pending")
         self.assertTrue(result["retryable"])
         self.assertTrue(runtime.started)
+        self.assertEqual(runtime.stop_calls, 0)
+        self.assertTrue(plugin._started)
+        self.assertFalse(any(args["action"] == "stop" for _, args in mapping.calls))
+
+    def test_nonretryable_planning_stop_error_still_keeps_owned_runtime(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent("mapping")
+        planning = FakeComponent(
+            "planning",
+            stop_result={
+                "state": "error",
+                "status": "error",
+                "error_code": "stop_failed",
+                "error": "stop was not confirmed",
+            },
+        )
+        plugin = self.make_plugin(
+            runtime=runtime,
+            mapping=mapping,
+            planning=planning,
+        )
+        plugin.dispatch(
+            "ControlledSemanticSpatial",
+            {"action": "start", "input_bindings": _external_bindings()},
+        )
+
+        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "navigation_stop_pending")
+        self.assertTrue(result["retryable"])
         self.assertEqual(runtime.stop_calls, 0)
         self.assertTrue(plugin._started)
         self.assertFalse(any(args["action"] == "stop" for _, args in mapping.calls))
@@ -1224,7 +1324,7 @@ class NavigationRuntimeTest(unittest.TestCase):
         self.assertEqual([item[0][2] for item in commands], ["g1_fast_livo2", "g1_nav2"])
         self.assertTrue(all(item[1]["start_new_session"] for item in commands))
         self.assertFalse(started["docker_runtime_dependency"])
-        self.assertNotIn("docker", str(commands))
+        self.assertNotIn("docker", str([item[0] for item in commands]))
         fast_command = commands[0][0]
         nav2_command = commands[1][0]
         self.assertIn("lidar_topic:=/sensors/lidar", fast_command)

@@ -66,9 +66,10 @@ _IDLE_OR_TERMINAL_STATES = _TERMINAL_STATES | {"paused"}
 
 
 class CommandError(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, outcome_known: bool = True):
         super().__init__(message)
         self.code = code
+        self.outcome_known = outcome_known
 
 
 def _stamp_ns(message) -> int | None:
@@ -656,7 +657,12 @@ class PlannerCommandNode(Node):
                 request_id,
                 action,
                 nav_id,
-                {"status": "error", "error_code": exc.code, "error": str(exc)},
+                {
+                    "status": "error",
+                    "error_code": exc.code,
+                    "error": str(exc),
+                    "outcome_known": exc.outcome_known,
+                },
             )
         except Exception as exc:
             self.get_logger().error(
@@ -743,6 +749,7 @@ class PlannerCommandNode(Node):
                 "goal_cell": None,
                 "attempt": 0,
                 "goal_handle": None,
+                "goal_response_pending": False,
                 "cancel_intent": None,
                 "progress_seq": 0,
                 "last_distance": None,
@@ -753,6 +760,16 @@ class PlannerCommandNode(Node):
             self._last_published_proposal = None
         try:
             self._send_active_goal()
+        except CommandError as exc:
+            with self._lock:
+                if (
+                    exc.outcome_known
+                    and self._active
+                    and self._active.get("nav_id") == nav_id
+                ):
+                    self._active["status"] = "error"
+            self._publish_state()
+            raise
         except Exception:
             with self._lock:
                 if self._active and self._active.get("nav_id") == nav_id:
@@ -798,6 +815,7 @@ class PlannerCommandNode(Node):
             self._active["status"] = "starting"
             self._active["cancel_intent"] = None
             self._active["goal_handle"] = None
+            self._active["goal_response_pending"] = True
 
         self._publish_controller_speed_limit(speed_limit)
         goal = NavigateToPose.Goal()
@@ -825,13 +843,12 @@ class PlannerCommandNode(Node):
         if not accepted.wait(timeout=self._goal_response_timeout):
             with self._lock:
                 if self._active and self._active.get("nav_id") == nav_id:
-                    self._active["attempt"] += 1
-                    self._active["status"] = "error"
                     self._active["error_code"] = "goal_response_timeout"
             self._publish_state()
             raise CommandError(
                 "goal_response_timeout",
                 f"Nav2 did not answer within {self._goal_response_timeout:.1f}s",
+                outcome_known=False,
             )
         if not outcome.get("accepted"):
             raise CommandError(
@@ -874,6 +891,7 @@ class PlannerCommandNode(Node):
                     and self._active.get("nav_id") == nav_id
                     and self._active.get("attempt") == attempt
                 ):
+                    self._active["goal_response_pending"] = False
                     self._active["status"] = "error"
                     self._active["error"] = f"{type(exc).__name__}: {exc}"
             outcome.update(
@@ -904,6 +922,7 @@ class PlannerCommandNode(Node):
                     }
                 )
             elif not goal_handle.accepted:
+                self._active["goal_response_pending"] = False
                 self._active["status"] = "rejected"
                 outcome.update(
                     {
@@ -913,6 +932,7 @@ class PlannerCommandNode(Node):
                     }
                 )
             else:
+                self._active["goal_response_pending"] = False
                 self._active["goal_handle"] = goal_handle
                 self._active["status"] = "navigating"
                 goal_handle.get_result_async().add_done_callback(
@@ -1014,6 +1034,16 @@ class PlannerCommandNode(Node):
         self._assert_shadow_isolated()
         try:
             self._send_active_goal()
+        except CommandError as exc:
+            with self._lock:
+                if (
+                    exc.outcome_known
+                    and self._active
+                    and self._active.get("nav_id") == nav_id
+                ):
+                    self._active["status"] = "error"
+            self._publish_state()
+            raise
         except Exception:
             with self._lock:
                 if self._active and self._active.get("nav_id") == nav_id:
@@ -1034,6 +1064,12 @@ class PlannerCommandNode(Node):
                     "already_terminal": active["status"],
                 }
             has_goal = active.get("goal_handle") is not None
+            if not has_goal and active.get("goal_response_pending"):
+                raise CommandError(
+                    "cancel_terminal_unconfirmed",
+                    "Nav2 goal response is still pending; retry stop after it arrives",
+                    outcome_known=False,
+                )
             if not has_goal:
                 active["attempt"] += 1
                 active["status"] = "stopped"

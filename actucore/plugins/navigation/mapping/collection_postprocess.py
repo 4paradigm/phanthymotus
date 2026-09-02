@@ -1340,6 +1340,7 @@ class CollectionPostprocessManager:
         self._lock = threading.Condition()
         self._jobs: queue.Queue[Path] = queue.Queue()
         self._known: set[Path] = set()
+        self._retry_counts: dict[Path, int] = {}
         self._runtime_active = False
         self._paused_stage: str | None = None
         self._current_session: Path | None = None
@@ -1543,6 +1544,7 @@ class CollectionPostprocessManager:
                 )
                 final_state = str(manifest.get("state", "complete"))
                 with self._lock:
+                    self._retry_counts.pop(session, None)
                     self._status.update(
                         state=final_state,
                         stage="complete",
@@ -1563,6 +1565,9 @@ class CollectionPostprocessManager:
                 self._persist_status(session, status)
             except Exception as exc:
                 with self._lock:
+                    self._known.discard(session)
+                    failures = self._retry_counts.get(session, 0) + 1
+                    self._retry_counts[session] = failures
                     self._status.update(
                         state="error",
                         stage="error",
@@ -1573,6 +1578,10 @@ class CollectionPostprocessManager:
                     self._persist_status(session, status)
                 except OSError:
                     pass
+                if failures == 1:
+                    retry = threading.Timer(1.0, self.enqueue, args=(session,))
+                    retry.daemon = True
+                    retry.start()
             finally:
                 with self._lock:
                     self._current_session = None

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import uuid
+from collections import OrderedDict
 from typing import Protocol
 
 from .contract import NAV2_ACTIONS
@@ -13,9 +14,10 @@ from .contract import NAV2_ACTIONS
 class NavigationBackendError(RuntimeError):
     """A fail-closed backend error suitable for an MCP response."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, outcome_known: bool = False):
         super().__init__(message)
         self.code = code
+        self.outcome_known = outcome_known
 
 
 class NavigationBackend(Protocol):
@@ -46,7 +48,9 @@ class UnavailableNavigationBackend:
 
     def execute(self, action: str, args: dict, *, nav_id: str | None) -> dict:
         del action, args, nav_id
-        raise NavigationBackendError("backend_unavailable", self._reason)
+        raise NavigationBackendError(
+            "backend_unavailable", self._reason, outcome_known=True
+        )
 
     def stop(self) -> None:
         return None
@@ -69,6 +73,7 @@ _TERMINAL_STATUSES = {
     "aborted",
     "rejected",
 }
+_MAX_TRUSTED_NAV_IDS = 1024
 
 
 def _number(args: dict, key: str, *, default=None) -> float:
@@ -153,6 +158,10 @@ class Nav2Core:
         self._lock = threading.Lock()
         self._active_nav_id: str | None = None
         self._last_terminal_result: dict | None = None
+        self._trusted_requests: OrderedDict[str, tuple[tuple[str, object], ...]] = (
+            OrderedDict()
+        )
+        self._terminal_results: OrderedDict[str, dict] = OrderedDict()
         set_terminal_callback = getattr(backend, "set_terminal_callback", None)
         if callable(set_terminal_callback):
             set_terminal_callback(self._on_navigation_terminal)
@@ -211,7 +220,18 @@ class Nav2Core:
         self, action: str, args: dict, *, trusted_nav_id: str | None
     ) -> dict:
         nav_id = trusted_nav_id or uuid.uuid4().hex
+        fingerprint = tuple(sorted(args.items()))
         with self._lock:
+            previous = (
+                self._trusted_requests.get(trusted_nav_id)
+                if trusted_nav_id
+                else None
+            )
+            if previous is not None and previous != fingerprint:
+                raise NavigationBackendError(
+                    "control_nav_id_conflict",
+                    f"navigation id {trusted_nav_id} was already used for another goal",
+                )
             if self._active_nav_id:
                 if trusted_nav_id == self._active_nav_id:
                     return {
@@ -224,26 +244,43 @@ class Nav2Core:
                     "navigation_active",
                     f"navigation {self._active_nav_id} is already active",
                 )
-            if (
-                trusted_nav_id
-                and self._last_terminal_result is not None
-                and self._last_terminal_result.get("nav_id") == trusted_nav_id
-            ):
-                result = dict(self._last_terminal_result)
+            if trusted_nav_id and trusted_nav_id in self._terminal_results:
+                result = dict(self._terminal_results[trusted_nav_id])
+                self._terminal_results.move_to_end(trusted_nav_id)
                 result["action"] = action
                 result["idempotent_replay"] = True
                 return result
             self._active_nav_id = nav_id
             self._last_terminal_result = None
+            if trusted_nav_id:
+                self._trusted_requests[trusted_nav_id] = fingerprint
+                self._trusted_requests.move_to_end(trusted_nav_id)
+                while len(self._trusted_requests) > _MAX_TRUSTED_NAV_IDS:
+                    expired_id, _ = self._trusted_requests.popitem(last=False)
+                    self._terminal_results.pop(expired_id, None)
         try:
             result = self._result(
                 action,
                 self._backend.execute(action, args, nav_id=nav_id),
                 nav_id=nav_id,
             )
+        except NavigationBackendError as exc:
+            with self._lock:
+                if trusted_nav_id and exc.outcome_known:
+                    self._trusted_requests.pop(trusted_nav_id, None)
+                    self._terminal_results.pop(trusted_nav_id, None)
+                if (
+                    self._active_nav_id == nav_id
+                    and (
+                        trusted_nav_id is None
+                        or exc.outcome_known
+                    )
+                ):
+                    self._active_nav_id = None
+            raise
         except Exception:
             with self._lock:
-                if self._active_nav_id == nav_id:
+                if self._active_nav_id == nav_id and trusted_nav_id is None:
                     self._active_nav_id = None
             raise
         if result.get("status") in _TERMINAL_STATUSES:
@@ -298,6 +335,9 @@ class Nav2Core:
             result.setdefault("status", status)
             self._active_nav_id = None
             self._last_terminal_result = result
+            if nav_id in self._trusted_requests:
+                self._terminal_results[nav_id] = dict(result)
+                self._terminal_results.move_to_end(nav_id)
 
     @staticmethod
     def _result(action: str, raw: dict | None, *, nav_id: str | None = None) -> dict:

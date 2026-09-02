@@ -182,6 +182,7 @@ class FastLivo2Core:
                 "rollback_status",
                 "rollback_error",
                 "retryable",
+                "terminal_confirmed",
             ):
                 if key in exc.details:
                     error[key] = exc.details[key]

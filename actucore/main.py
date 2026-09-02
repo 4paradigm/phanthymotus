@@ -150,21 +150,33 @@ class ActuCoreBundle:
                 return p.dispatch(name, args)
         return None
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         """Best-effort release for every card that owns runtime resources.
 
         执行模型卡片常常持有真实资源（导航卡片在容器内跑 FAST-LIVO2 / Nav2
         子进程），进程退出时必须收回，否则重启会撞上残留的 ROS 节点。
         """
 
+        all_confirmed = True
         for plugin in reversed(self._plugins):
             stop = getattr(plugin, "stop", None)
             if callable(stop):
+                confirmed = False
                 for attempt in range(3):
                     try:
                         result = stop()
                     except Exception:
                         log.exception("failed to stop card %s", plugin.PREFIX)
+                        break
+                    confirmed = (
+                        isinstance(result, dict)
+                        and (
+                            result.get("terminal_confirmed") is True
+                            or (result.get("status") or result.get("state"))
+                            in {"idle", "stopped", "disabled"}
+                        )
+                    )
+                    if confirmed:
                         break
                     if not (
                         isinstance(result, dict)
@@ -177,8 +189,10 @@ class ActuCoreBundle:
                         break
                     if attempt < 2:
                         time.sleep(0.25)
-                else:
+                if not confirmed:
+                    all_confirmed = False
                     log.error("card %s stop remained unconfirmed", plugin.PREFIX)
+        return all_confirmed
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -397,7 +411,11 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop()
+        if not _bundle.stop():
+            log.critical(
+                "one or more card stops remained unconfirmed after retries; "
+                "forcing process shutdown so the container supervisor can recover"
+            )
         executor.shutdown()
         rclpy.shutdown()
 

@@ -137,6 +137,141 @@ def _prepare_adapter_concurrency(adapter) -> None:
 
 
 class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
+    def test_collection_finalize_failure_keeps_session_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            partial = Path(directory) / "capture.partial"
+            final = Path(directory) / "capture"
+            partial.mkdir()
+            supervisor = object.__new__(FastLivo2Supervisor)
+            supervisor._lock = threading.RLock()
+            supervisor._collection_process = mock.Mock()
+            supervisor._collection_process.poll.return_value = 0
+            supervisor._collection_partial_dir = partial
+            supervisor._collection_final_dir = final
+            supervisor._collection_directory = Path(directory)
+            supervisor._collection_error = None
+            supervisor._collection_last_receipt = None
+            supervisor._collection_sampler = mock.Mock()
+            supervisor._collection_sampler.snapshot.return_value = {}
+            supervisor._collection_health = mock.Mock()
+            supervisor._collection_health.snapshot.return_value = {
+                "enabled": True,
+                "healthy": True,
+                "sources": {},
+                "time_alignment": {},
+                "missing_sources": [],
+                "failure_reason": None,
+            }
+
+            complete = {"state": "complete", "storage_complete": True}
+            with mock.patch.object(
+                SUPERVISOR_MODULE,
+                "read_rosbag_recording_summary",
+                return_value={"healthy": True, "failure_reasons": [], "topics": {}},
+            ), mock.patch.object(
+                SUPERVISOR_MODULE,
+                "finalize_collection_session",
+                side_effect=[OSError("disk busy"), complete],
+            ):
+                failed = supervisor._stop_collection()
+                self.assertTrue(failed["retryable"])
+                self.assertEqual(supervisor._collection_partial_dir, partial)
+                supervisor._collection_health.stop.assert_not_called()
+
+                saved = supervisor._stop_collection()
+
+            self.assertEqual(saved["status"], "collection_saved")
+            self.assertIsNone(supervisor._collection_partial_dir)
+            supervisor._collection_health.stop.assert_called_once_with()
+
+    def test_permanent_collection_finalize_failure_confirms_terminal_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            partial = Path(directory) / "capture.partial"
+            final = Path(directory) / "capture"
+            partial.mkdir()
+            supervisor = object.__new__(FastLivo2Supervisor)
+            supervisor._lock = threading.RLock()
+            supervisor._collection_process = mock.Mock()
+            supervisor._collection_process.poll.return_value = 0
+            supervisor._collection_partial_dir = partial
+            supervisor._collection_final_dir = final
+            supervisor._collection_directory = Path(directory)
+            supervisor._collection_error = None
+            supervisor._collection_last_receipt = None
+            supervisor._collection_sampler = mock.Mock()
+            supervisor._collection_sampler.snapshot.return_value = {}
+            supervisor._collection_health = mock.Mock()
+            supervisor._collection_health.snapshot.return_value = {
+                "enabled": True,
+                "healthy": True,
+                "sources": {},
+                "time_alignment": {},
+                "missing_sources": [],
+                "failure_reason": None,
+            }
+
+            with mock.patch.object(
+                SUPERVISOR_MODULE,
+                "read_rosbag_recording_summary",
+                return_value={"healthy": True, "failure_reasons": [], "topics": {}},
+            ), mock.patch.object(
+                SUPERVISOR_MODULE,
+                "finalize_collection_session",
+                side_effect=FileExistsError("already exists"),
+            ):
+                failed = supervisor._stop_collection()
+
+            self.assertFalse(failed["retryable"])
+            self.assertTrue(failed["terminal_confirmed"])
+            self.assertEqual(failed["receipt"]["partial_directory"], str(partial))
+            self.assertIsNone(supervisor._collection_partial_dir)
+            supervisor._collection_health.stop.assert_called_once_with()
+
+    def test_collection_stop_reuses_an_already_finalized_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            partial = Path(directory) / "capture.partial"
+            final = Path(directory) / "capture"
+            final.mkdir()
+            complete = {"state": "complete", "storage_complete": True}
+            (final / "collection.json").write_text(
+                json.dumps(complete), encoding="utf-8"
+            )
+            supervisor = object.__new__(FastLivo2Supervisor)
+            supervisor._lock = threading.RLock()
+            supervisor._collection_process = mock.Mock()
+            supervisor._collection_process.poll.return_value = 0
+            supervisor._collection_partial_dir = partial
+            supervisor._collection_final_dir = final
+            supervisor._collection_directory = Path(directory)
+            supervisor._collection_error = None
+            supervisor._collection_last_receipt = None
+            supervisor._collection_sampler = mock.Mock()
+            supervisor._collection_sampler.snapshot.return_value = {}
+            supervisor._collection_health = mock.Mock()
+            supervisor._collection_health.snapshot.return_value = {
+                "enabled": True,
+                "healthy": True,
+                "sources": {},
+                "time_alignment": {},
+                "missing_sources": [],
+                "failure_reason": None,
+            }
+
+            with mock.patch.object(
+                SUPERVISOR_MODULE,
+                "read_rosbag_recording_summary",
+                return_value={"healthy": True, "failure_reasons": [], "topics": {}},
+            ), mock.patch.object(
+                SUPERVISOR_MODULE,
+                "finalize_collection_session",
+                side_effect=AssertionError("already finalized session was renamed again"),
+            ):
+                saved = supervisor._stop_collection()
+
+            self.assertEqual(saved, {"status": "collection_saved", "receipt": complete})
+            self.assertIsNone(supervisor._collection_partial_dir)
+            supervisor._collection_health.stop.assert_called_once_with()
+
     def test_adapter_rejection_logs_are_sampled_and_recovery_is_reported(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
@@ -1058,6 +1193,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(replay["status"], "error")
         self.assertEqual(replay["error_code"], "manifest_write_failed")
         self.assertFalse(replay["retryable"])
+        self.assertTrue(replay["terminal_confirmed"])
         self.assertTrue(replay["already_finalized"])
 
     def test_stale_stop_request_cannot_terminate_new_mapping_session(self) -> None:

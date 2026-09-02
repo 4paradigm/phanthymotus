@@ -6,6 +6,7 @@ from utils import logsafe
 
 logsafe.install()
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,14 @@ _MAX_MAP_ARTIFACT_TOTAL_BYTES = 536_870_912
 _MAX_MAP_MANIFEST_BYTES = 65_536
 _MAP_CONTROL_RESPONSE_GRACE_SEC = 5.0
 _MAP_CONTROL_DISCOVERY_TIMEOUT_SEC = 5.0
+_RETRYABLE_FINALIZE_ERRNOS = {
+    errno.EAGAIN,
+    errno.EBUSY,
+    errno.EINTR,
+    errno.EIO,
+    errno.ENOSPC,
+    errno.ETIMEDOUT,
+}
 
 
 class FastLivo2Supervisor(Node):
@@ -595,7 +604,46 @@ class FastLivo2Supervisor(Node):
             "sampling": source_status["sampling"],
             "recording": recording,
         }
-        if partial_dir is not None and partial_dir.is_dir():
+        if (
+            partial_dir is not None
+            and final_dir is not None
+            and final_dir.is_dir()
+            and not partial_dir.exists()
+        ):
+            try:
+                receipt = json.loads(
+                    (final_dir / "collection.json").read_text(encoding="utf-8")
+                )
+                storage_ok = receipt.get("storage_complete") is True
+            except (OSError, ValueError, TypeError) as exc:
+                storage_ok = False
+                stop_error = f"collection_finalize_failed:{exc}"
+                receipt.update(
+                    {
+                        "state": "failed",
+                        "storage_complete": False,
+                        "failure_reason": stop_error,
+                        "partial_directory": str(partial_dir),
+                        "final_directory": str(final_dir),
+                    }
+                )
+                with self._lock:
+                    self._collection_process = None
+                    self._collection_partial_dir = None
+                    self._collection_final_dir = None
+                    self._collection_directory = None
+                    self._collection_error = stop_error
+                    self._collection_last_receipt = dict(receipt)
+                self._collection_health.stop()
+                return {
+                    "status": "error",
+                    "error_code": "collection_stop_failed",
+                    "error": stop_error,
+                    "receipt": receipt,
+                    "retryable": False,
+                    "terminal_confirmed": True,
+                }
+        elif partial_dir is not None:
             try:
                 receipt = finalize_collection_session(
                     str(partial_dir),
@@ -606,13 +654,42 @@ class FastLivo2Supervisor(Node):
             except OSError as exc:
                 storage_ok = False
                 stop_error = f"collection_finalize_failed:{exc}"
+                retryable = (
+                    not isinstance(
+                        exc, (FileExistsError, FileNotFoundError, NotADirectoryError)
+                    )
+                    and (
+                        exc.errno is None
+                        or exc.errno in _RETRYABLE_FINALIZE_ERRNOS
+                    )
+                )
                 receipt.update(
                     {
                         "state": "failed",
                         "storage_complete": False,
                         "failure_reason": stop_error,
+                        "partial_directory": str(partial_dir),
+                        "final_directory": str(final_dir),
                     }
                 )
+                with self._lock:
+                    self._collection_error = stop_error
+                    self._collection_last_receipt = dict(receipt)
+                    if not retryable:
+                        self._collection_process = None
+                        self._collection_partial_dir = None
+                        self._collection_final_dir = None
+                        self._collection_directory = None
+                if not retryable:
+                    self._collection_health.stop()
+                return {
+                    "status": "error",
+                    "error_code": "collection_stop_failed",
+                    "error": stop_error,
+                    "receipt": receipt,
+                    "retryable": retryable,
+                    "terminal_confirmed": not retryable,
+                }
 
         with self._lock:
             self._collection_process = None
@@ -707,6 +784,7 @@ class FastLivo2Supervisor(Node):
             if self._process is not process:
                 return
             if terminal_result is not None and terminal_result.get("map_name"):
+                terminal_result.setdefault("terminal_confirmed", True)
                 self._last_mapping_result = dict(terminal_result)
             self._process = None
             self._active_map = None

@@ -600,6 +600,42 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             self.assertEqual(journal["state"], "complete")
             self.assertEqual(journal["processed_images"], 1)
 
+    def test_failed_postprocess_session_is_retried_once(self) -> None:
+        class FlakyProcessor:
+            calls = 0
+
+            def process_session(self, session, progress, wait_if_paused):
+                type(self).calls += 1
+                if type(self).calls == 1:
+                    raise OSError("temporary write failure")
+                derived = session / "derived"
+                derived.mkdir(exist_ok=True)
+                manifest = {
+                    "state": "complete",
+                    "processed_images": 1,
+                    "total_images": 1,
+                    "lidar_frames": 1,
+                    "depth_frames": 1,
+                }
+                (derived / "manifest.json").write_text(json.dumps(manifest))
+                return manifest
+
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Path(temporary) / "session-a"
+            session.mkdir()
+            manager = CollectionPostprocessManager(
+                temporary, processor_factory=FlakyProcessor
+            )
+            self.assertTrue(manager.enqueue(session))
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if manager.snapshot()["postprocess"]["state"] == "complete":
+                    break
+                time.sleep(0.01)
+
+            self.assertEqual(manager.snapshot()["postprocess"]["state"], "complete")
+            self.assertEqual(FlakyProcessor.calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -329,8 +329,10 @@ class FastLivo2Plugin:
             if isinstance(result, dict) and result.get("status") == "error"
         ]
         if failures:
-            retryable = any(result.get("retryable") is True for result in failures)
-            if not retryable:
+            terminal_confirmed = all(
+                result.get("terminal_confirmed") is True for result in failures
+            )
+            if terminal_confirmed:
                 self._release_core()
                 self._collection_controller.set_runtime_active(False)
             return {
@@ -341,10 +343,11 @@ class FastLivo2Plugin:
                     str(result.get("error", result.get("error_code", "stop failed")))
                     for result in failures
                 ),
-                "canvas_wired": retryable,
+                "canvas_wired": not terminal_confirmed,
                 "stop_result": stop_result,
                 "collection_stop_result": collection_stop_result,
-                "retryable": retryable,
+                "retryable": not terminal_confirmed,
+                "terminal_confirmed": terminal_confirmed,
                 "physical_execution": False,
             }
         self._release_core()

@@ -151,6 +151,7 @@ class RosTopicNavigationBackend:
             raise NavigationBackendError(
                 str(payload.get("error_code", "nav2_error")),
                 str(payload.get("error", "Nav2 runtime rejected the request")),
+                outcome_known=payload.get("outcome_known") is True,
             )
         return payload
 
@@ -200,11 +201,14 @@ class RosTopicNavigationBackend:
         deadline = time.monotonic() + self._discovery_timeout
         while self._command_pub.get_subscription_count() == 0:
             if self._closed:
-                raise NavigationBackendError("backend_closed", "backend is closed")
+                raise NavigationBackendError(
+                    "backend_closed", "backend is closed", outcome_known=True
+                )
             if time.monotonic() >= deadline:
                 raise NavigationBackendError(
                     "nav2_runtime_unavailable",
                     f"no subscriber on {self._command_topic}",
+                    outcome_known=True,
                 )
             time.sleep(0.05)
 

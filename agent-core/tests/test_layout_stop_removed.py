@@ -29,6 +29,7 @@ os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
 
 from api import canvas as canvas_api  # noqa: E402
 from api import config as config_api  # noqa: E402
+from api import solutions as solutions_api  # noqa: E402
 
 TTS_OLD = {'id': 'card_mt4rkb752py8', 'mcpId': 'mcp-1', 'toolName': 'tts'}
 TTS_NEW = {'id': 'card_mt8rck6q87qd', 'mcpId': 'mcp-1', 'toolName': 'tts'}
@@ -63,46 +64,46 @@ def _run(old, new):
 
 def test_the_orphan_case_stops_exactly_the_deleted_card(calls):
     """The reported layout: the old TTS card is replaced by a new one."""
-    assert _run([TTS_OLD, ASR], [TTS_NEW, ASR]) == 1
+    assert _run([TTS_OLD, ASR], [TTS_NEW, ASR]) == (1, [])
     assert calls == [('mcp-1', 'tts', {'action': 'stop', 'instance_id': 'card_mt4rkb752py8'})]
 
 
 def test_an_unchanged_layout_calls_nothing(calls):
     """Layout writes happen on every drag; only removals may have side effects."""
-    assert _run([TTS_OLD, ASR], [TTS_OLD, ASR]) == 0
+    assert _run([TTS_OLD, ASR], [TTS_OLD, ASR]) == (0, [])
     assert calls == []
 
 
 def test_a_moved_card_is_not_a_removed_card(calls):
     """Identity is the card id, not the dict — x/y change on every drag."""
     moved = dict(TTS_OLD, x=400, y=120)
-    assert _run([TTS_OLD], [moved]) == 0
+    assert _run([TTS_OLD], [moved]) == (0, [])
     assert calls == []
 
 
 def test_clearing_the_canvas_stops_every_card(calls):
-    assert _run([TTS_OLD, ASR], []) == 2
+    assert _run([TTS_OLD, ASR], []) == (2, [])
     assert {c[2]['instance_id'] for c in calls} == {'card_mt4rkb752py8', 'card_asr'}
 
 
 def test_adding_a_card_stops_nothing(calls):
-    assert _run([ASR], [ASR, TTS_NEW]) == 0
+    assert _run([ASR], [ASR, TTS_NEW]) == (0, [])
     assert calls == []
 
 
 def test_cards_without_a_device_are_skipped(calls):
     """A half-built card has no mcpId; there is nothing to stop and no crash."""
-    assert _run([{'id': 'card_x'}, {'id': 'card_y', 'mcpId': '', 'toolName': 'tts'}], []) == 0
+    assert _run([{'id': 'card_x'}, {'id': 'card_y', 'mcpId': '', 'toolName': 'tts'}], []) == (0, [])
     assert calls == []
 
 
 def test_a_card_with_no_id_is_ignored(calls):
-    assert _run([{'mcpId': 'mcp-1', 'toolName': 'tts'}], []) == 0
+    assert _run([{'mcpId': 'mcp-1', 'toolName': 'tts'}], []) == (0, [])
     assert calls == []
 
 
 def test_a_failing_stop_does_not_block_the_others(monkeypatch, calls):
-    """The layout must still be saved even if one device is unreachable."""
+    """All removals are attempted and unconfirmed stops are returned."""
     seen = []
 
     async def _flaky(mcp_id, req):
@@ -112,14 +113,28 @@ def test_a_failing_stop_does_not_block_the_others(monkeypatch, calls):
         return {'state': 'idle'}
 
     sys.modules['api.mcp_manage'].mcp_call_tool = _flaky
-    assert _run([TTS_OLD, ASR], []) == 1          # one of two succeeded
+    stopped, failures = _run([TTS_OLD, ASR], [])
+    assert stopped == 1
+    assert failures[0]['card_id'] == TTS_OLD['id']
     assert seen == ['card_mt4rkb752py8', 'card_asr']
+
+
+@pytest.mark.parametrize('response', [None, {}, {'state': 'stopping'}, {'status': 'finalizing'}])
+def test_only_an_explicit_terminal_stop_is_confirmed(monkeypatch, calls, response):
+    async def _unconfirmed(_mcp_id, _req):
+        return response
+
+    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _unconfirmed)
+    stopped, failures = _run([TTS_OLD], [])
+
+    assert stopped == 0
+    assert failures[0]['card_id'] == TTS_OLD['id']
 
 
 def test_none_layouts_are_tolerated(calls):
     """An empty ConfigDB gives `canvas_layout` as {} — .get('cards') is None."""
-    assert _run(None, None) == 0
-    assert _run(None, [TTS_NEW]) == 0
+    assert _run(None, None) == (0, [])
+    assert _run(None, [TTS_NEW]) == (0, [])
     assert calls == []
 
 
@@ -180,9 +195,12 @@ def test_saving_a_running_layout_reconciles_topic_actions(monkeypatch):
 
     class _TopicActions:
         async def start(self, layout):
+            assert config_api.config.main['core']['project_running'] is False
+            assert config_api.config.main['canvas_layout'] == layout
             started.append(layout)
 
     topic_actions = type(sys)('topic_actions')
+    topic_actions.build_routes = lambda _layout: []
     topic_actions.manager = _TopicActions()
     monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
     monkeypatch.setattr(config_api.config, 'main', {
@@ -206,6 +224,186 @@ def test_saving_a_running_layout_reconciles_topic_actions(monkeypatch):
         'execConnections': [],
         'transform': {},
     }]
+    assert config_api.config.main['core']['project_running'] is True
+
+
+def test_route_activation_failure_keeps_saved_layout_but_stops_project(
+    monkeypatch
+):
+    stopped = []
+
+    class _TopicActions:
+        async def start(self, _layout):
+            raise RuntimeError('DDS subscription failed')
+
+        async def stop(self):
+            stopped.append(True)
+
+    topic_actions = type(sys)('topic_actions')
+    topic_actions.build_routes = lambda _layout: []
+    topic_actions.manager = _TopicActions()
+    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
+    monkeypatch.setattr(config_api.config, 'main', {
+        'core': {'project_running': True},
+        'canvas_layout': {'cards': []},
+    })
+    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
+    monkeypatch.setattr(canvas_api, 'notify_layout_changed', lambda _session: None)
+
+    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
+        cards=[TTS_NEW], connections=[], session_id='editor-1'
+    )))
+
+    assert result.status_code == 409
+    assert config_api.config.main['canvas_layout']['cards'] == [TTS_NEW]
+    assert config_api.config.main['core']['project_running'] is False
+    assert stopped == [True]
+
+
+def test_layout_is_not_saved_when_removed_card_stop_is_unconfirmed(
+    monkeypatch, calls
+):
+    async def _pending(_mcp_id, _req):
+        return {'ok': False, 'state': 'error', 'error': 'stop pending'}
+
+    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _pending)
+    original = {'cards': [TTS_OLD], 'connections': []}
+    monkeypatch.setattr(config_api.config, 'main', {
+        'core': {'project_running': False},
+        'canvas_layout': original,
+    })
+    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
+
+    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
+        cards=[], connections=[], session_id='editor-1'
+    )))
+
+    assert result.status_code == 409
+    assert config_api.config.main['canvas_layout'] == original
+
+
+def test_route_failure_does_not_stop_a_removed_card(monkeypatch, calls):
+    topic_actions = type(sys)('topic_actions')
+    topic_actions.build_routes = lambda _layout: (_ for _ in ()).throw(
+        RuntimeError('invalid route')
+    )
+    topic_actions.manager = object()
+    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
+    original = {'cards': [TTS_OLD], 'connections': []}
+    monkeypatch.setattr(config_api.config, 'main', {
+        'core': {'project_running': True},
+        'canvas_layout': original,
+    })
+    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
+
+    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
+        cards=[], connections=[], session_id='editor-1'
+    )))
+
+    assert result.status_code == 409
+    assert calls == []
+    assert config_api.config.main['canvas_layout'] == original
+
+
+def test_partial_stop_failure_stops_routes_and_project_fail_closed(
+    monkeypatch, calls
+):
+    async def _pending(_mcp_id, req):
+        calls.append((_mcp_id, req.tool, dict(req.arguments)))
+        if req.arguments['instance_id'] == TTS_OLD['id']:
+            return {'state': 'error', 'error': 'stop pending'}
+        return {'state': 'idle'}
+
+    stopped = []
+
+    class _TopicActions:
+        async def stop(self):
+            stopped.append(True)
+
+    topic_actions = type(sys)('topic_actions')
+    topic_actions.build_routes = lambda _layout: []
+    topic_actions.manager = _TopicActions()
+    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
+    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _pending)
+    original = {'cards': [TTS_OLD, ASR], 'connections': []}
+    monkeypatch.setattr(config_api.config, 'main', {
+        'core': {'project_running': True},
+        'canvas_layout': original,
+    })
+    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
+
+    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
+        cards=[], connections=[], session_id='editor-1'
+    )))
+
+    assert result.status_code == 409
+    assert stopped == [True]
+    assert {call[2]['instance_id'] for call in calls} == {TTS_OLD['id'], ASR['id']}
+    assert config_api.config.main['core']['project_running'] is False
+    assert config_api.config.main['canvas_layout'] == original
+
+
+def test_applying_a_solution_reconciles_running_topic_actions(monkeypatch):
+    started = []
+
+    class _TopicActions:
+        async def start(self, layout):
+            assert config_api.config.main['core']['project_running'] is False
+            assert config_api.config.main['canvas_layout'] == layout
+            started.append(layout)
+
+    topic_actions = type(sys)('topic_actions')
+    topic_actions.build_routes = lambda _layout: []
+    topic_actions.manager = _TopicActions()
+    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
+    monkeypatch.setattr(config_api.config, 'main', {
+        'core': {'project_running': True},
+        'canvas_layout': {'cards': []},
+    })
+    monkeypatch.setattr(canvas_api, 'notify_layout_changed', lambda *_: None)
+
+    result = asyncio.run(solutions_api._apply_canvas(
+        {
+            'cards': [{
+                'id': 'nav-card',
+                'deviceRef': 'navigation-device',
+                'toolName': 'ControlledSemanticSpatial',
+            }],
+            'connections': [],
+        },
+        {'navigation-device': 'actucore'},
+    ))
+
+    assert result['cards'] == 1
+    assert started == [config_api.config.main['canvas_layout']]
+
+
+def test_solution_route_failure_does_not_stop_a_removed_card(monkeypatch, calls):
+    topic_actions = type(sys)('topic_actions')
+    topic_actions.build_routes = lambda _layout: (_ for _ in ()).throw(
+        RuntimeError('invalid route')
+    )
+    topic_actions.manager = object()
+    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
+    original = {'cards': [TTS_OLD], 'connections': []}
+    monkeypatch.setattr(config_api.config, 'main', {
+        'core': {'project_running': True},
+        'canvas_layout': original,
+    })
+
+    with pytest.raises(solutions_api.fastapi.HTTPException) as error:
+        asyncio.run(solutions_api._apply_canvas(
+            {'cards': [], 'connections': []},
+            {},
+        ))
+
+    assert error.value.status_code == 409
+    assert calls == []
+    assert config_api.config.main['canvas_layout'] == original
 
 
 def test_project_stop_does_not_emit_terminal_state_until_every_card_confirms(

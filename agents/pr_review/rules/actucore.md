@@ -46,23 +46,28 @@ defaults to barrier-guarded, which is the safe side.
 Execution models are normally `processor`. A card declaring `sensor` for
 something that moves the robot is a real bug — it would skip the barrier.
 
-Long-running actions (navigate to a point, execute a grasp) should declare
-`x-completion` so the barrier knows when they finish. A blocking `dispatch()`
-that holds the HTTP request for the duration of a motion is the wrong shape.
+Long-running actions must return promptly with a task ID and expose terminal
+state asynchronously. Use `x-completion` only when Agent Core can scope that
+completion barrier to the owned resource; otherwise use the card's status topic
+and an explicit wait action. A blocking `dispatch()` that holds the HTTP request
+for the duration of a motion is the wrong shape.
 
 ## Jetson only
 
-There is exactly one Dockerfile — `Dockerfile.jetson`. Execution models need the
-GPU, so `deploy/build_actucore.sh` takes no `--variant`, only `--jp-version`
-(5.11 / 6.1). Build context is the **repo root**, not `actucore/`, because the
-image also needs `deploy/ros-base/audio_msgs/` — so `COPY` paths inside it are
-`actucore/…`. A PR adding a `COPY` with a path relative to `actucore/` will fail
-the build.
+The daily image uses `Dockerfile.jetson`; locked navigation dependencies are
+built separately by `Dockerfile.navigation-base` and consumed through an exact
+`@sha256` base reference. `deploy/build_actucore.sh` takes no `--variant` and
+currently supports the published JP 5.11 navigation base; `--base` rebuilds the
+heavy base only on native ARM64. Build context is the **repo root**, not
+`actucore/`, because the image also needs `deploy/ros-base/audio_msgs/` — so
+`COPY` paths inside it are `actucore/…`. A PR adding a `COPY` with a path relative
+to `actucore/` will fail the build.
 
-The image is deliberately thin: base CUDA torch + ROS2 + `pyyaml requests`,
-nothing else. A card's dependencies belong in their own `RUN` layer. Watch for
-PRs that pile a card's heavyweight deps into the shared base layers — that is
-how perception's image reached several GB.
+Keep the daily image thin: FAST-LIVO2/Nav2 and their system dependencies belong
+in the digest-pinned navigation base, while repository-owned ROS packages are
+rebuilt in `Dockerfile.jetson`. Flag changes that silently rebuild the full
+third-party stack in every PR or add heavyweight dependencies to unrelated
+images.
 
 `COPY actucore/deploy/ /deploy/` must stay: Agent Core extracts
 `/deploy/service.yml` from the image to merge the compose fragment, and dropping

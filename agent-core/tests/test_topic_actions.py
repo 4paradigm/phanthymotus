@@ -236,6 +236,27 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(set(self.manager._runtimes), active_keys)
             unsubscribe.assert_not_called()
 
+    async def test_failed_live_subscription_restores_current_route(self) -> None:
+        calls = []
+
+        def subscribe(key, topic, fmt, loop, callback):
+            calls.append(topic)
+            return topic != "/robot/broken_goal"
+
+        with patch.object(
+            topic_actions.ros2_bridge, "subscribe", side_effect=subscribe
+        ), patch.object(topic_actions.ros2_bridge, "unsubscribe"):
+            await self.manager.start(_layout())
+            current = self.manager._runtimes.copy()
+            replacement = _layout()
+            replacement["cards"][0]["topicOut"][0]["topic"] = "/robot/broken_goal"
+
+            with self.assertRaisesRegex(RuntimeError, "failed to subscribe"):
+                await self.manager.start(replacement)
+
+            self.assertEqual(self.manager._runtimes, current)
+            self.assertEqual(calls[-1], "/ubuntu/navigation/goal_pose")
+
     async def test_valid_goal_dispatches_once_and_stop_unsubscribes(self) -> None:
         callbacks = {}
         dispatched = []

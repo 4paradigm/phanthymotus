@@ -759,6 +759,24 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertIn('"goal_costmap_max_age_sec": 2.0', launch)
         self.assertNotIn("source_age_tolerance_sec", launch)
+        self.assertIn('self._active["goal_response_pending"] = True', send_goal)
+        timeout_branch = send_goal.split("if not accepted.wait", 1)[1]
+        self.assertNotIn('self._active["attempt"] += 1', timeout_branch)
+        self.assertNotIn('self._active["status"] = "error"', timeout_branch)
+        navigate_method = command.split(
+            "    def _navigate_to_pose", 1
+        )[1].split("    def _send_active_goal", 1)[0]
+        resume_method = command.split(
+            "    def _resume", 1
+        )[1].split("    def _stop", 1)[0]
+        for method in (navigate_method, resume_method):
+            self.assertIn("except CommandError as exc:", method)
+            self.assertIn("exc.outcome_known", method)
+        stop_method = command.split("    def _stop(self, nav_id)", 1)[1].split(
+            "    def _cancel_active", 1
+        )[0]
+        self.assertIn('active.get("goal_response_pending")', stop_method)
+        self.assertIn('"cancel_terminal_unconfirmed"', stop_method)
 
 
 if __name__ == "__main__":

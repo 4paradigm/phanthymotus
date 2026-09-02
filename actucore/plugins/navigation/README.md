@@ -54,6 +54,11 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 `lidar` 和 `imu`。`goal_pose` 是可选的外部 topic action，不是启动时内部连线。
 Agent Core 会把消息里的 `goal_id` 作为私有任务 ID 传给 planner；同一消息在
 投递结果未知后重试时会幂等重放活动或终态回执，不会创建第二个导航任务。
+结果未知时 planner 保留活动 ID 而不再次下发；收到 runtime 的明确拒绝回执时
+则释放 ID，允许修正后重试。同一 ID 携带不同目标会被拒绝。活动及终态幂等
+回执最多保留 1024 个可信 ID，避免长时运行
+无界增长。Nav2 goal response 超时只表示结果未知，runtime 保持 pending 并继续
+接收迟到的 accepted/rejected 回调，不会先发布伪终态再让晚到 goal 独立运行。
 
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
 `(0, 200] ms`。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
@@ -193,10 +198,13 @@ Canvas、Core 或 Driver。Driver 在空闲订阅状态接纳首条新鲜、合�
 
 `start` 按 runtime → mapping → planning → semantic 顺序获取资源；任一步
 失败会按相反顺序回滚。`stop_mapping` 和 `load_map` 的 backend 等待预算分别
-至少为 360 s 和 900 s。可重试的地图收口失败会保留 Canvas wiring、运行时和
-`finalizing` 事务，下一次 `stop`/`stop_mapping` 从原事务继续；永久失败会释放
-mapping 控制对象，并继续回收其他模块和运行时。已完成的同名
+至少为 360 s 和 900 s。未确认的地图收口失败会保留 Canvas wiring、运行时和
+`finalizing` 事务，下一次 `stop`/`stop_mapping` 从原事务继续；只有明确终态
+才会释放 mapping 控制对象并继续回收其他模块和运行时。已完成的同名
 `stop_mapping` 终态可幂等重放原保存回执，避免迟到重试制造第二份成功结果。
+数采目录收口遇到暂时性 I/O 错误时保留原 `.partial` 路径供下一次 stop 重试；
+路径已丢失、目标目录冲突等不可恢复错误会保留路径证据并返回明确终态，避免
+Canvas 永久卡在 retryable stop。
 卡片级 `start`/`stop`/`config` 转换串行执行，不允许 Canvas 的迟到请求在
 前一次启动中途关闭 backend。若 Nav2 command bridge 子进程仍存活，但
 Fast DDS 在首个发现窗口内暂未报告 command subscriber，只重建一次
@@ -207,10 +215,13 @@ planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第�
 配置，不会在返回 `invalid_config` 的同时留下半更新状态。
 
 `stop` 先确认活动 Nav2 任务已经停下；未确认时保留所有子进程并返回可重试
-错误。确认后才继续停止 mapping 和两个 launch 子进程组，并保留各模块回执，
+错误；每个组件必须显式返回 `idle` / `stopped` / `disabled` 才算确认。
+确认后才继续停止 mapping 和两个 launch 子进程组，并保留各模块回执，
 避免部分停止冒充成功。Runtime 还跟踪 launch 进程派生的独立 Linux 进程组；
 即使根进程快速退出，也会按有界的 `SIGINT -> SIGTERM -> SIGKILL` 阶梯回收，
 并在首次发送信号前用进程启动时刻校验，避免 PID 复用误杀。
+容器退出时 ActuCore 最多重试停卡 3 次；仍未确认时记录 critical 后
+强制结束进程，交给容器管理器恢复，不伪装成安全停止。
 
 ## 构建与本地部署验收
 
@@ -321,6 +332,10 @@ sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 \
 
 数采默认关闭。两类目录都不会自动清理：单次地图会话仍受 512 MiB 安全上限，
 但总历史和录制数据会持续占用磁盘，操作者需在停卡后自行归档或删除旧目录。
+导出时若磁盘重命名失败，保留原 `.partial` 目录和会话路径并返回可重试错误；
+后续 `stop` 从同一会话继续导出，不会丢失未完成录制。
+离线标注遇到临时异常会在 1 秒后自动重试一次；再次失败时保留原始会话和
+错误状态，等待后续回执或进程恢复重新入队。
 
 ## 第三方与验收边界
 

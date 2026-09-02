@@ -117,10 +117,10 @@ def subscribe(
     cb,
     *,
     queue_depth: int = 1,
-) -> None:
+) -> bool:
     """订阅 topic；有界转发到 loop，默认只保留等待中的最新一帧。"""
     if not _HAS_RCLPY or not _running:
-        return
+        return False
 
     # Always use the loop captured at start() — the caller's loop may not be running
     # when run_coroutine_threadsafe is called from the rclpy spin thread.
@@ -133,7 +133,7 @@ def subscribe(
     msg_type = _resolve_msg_type(fmt)
     if msg_type is None:
         print(f'[ros2_bridge] unsupported format {fmt!r} for topic {topic}', file=sys.stderr)
-        return
+        return False
 
     callback_queue = deque(maxlen=max(1, int(queue_depth)))
     callback_lock = threading.Lock()
@@ -230,6 +230,7 @@ def subscribe(
     if _executor:
         _executor.wake()
     print(f'[ros2_bridge] subscribed mcp_id={mcp_id} topic={topic}')
+    return True
 
 
 def unsubscribe(mcp_id: str) -> None:

@@ -277,14 +277,7 @@ class NavigationPlugin:
                 results[name] = self._error("component_stop_failed", str(exc))
 
         planning_result = results["planning"]
-        if (
-            isinstance(planning_result, dict)
-            and planning_result.get("retryable") is True
-            and (
-                planning_result.get("status") == "error"
-                or planning_result.get("state") == "error"
-            )
-        ):
+        if not self._stop_confirmed(planning_result):
             return self._error(
                 "navigation_stop_pending",
                 "active navigation stop is unconfirmed; retry stop without "
@@ -294,10 +287,20 @@ class NavigationPlugin:
                 canvas_wired=True,
             )
 
-        # Mapping owns the only operation that can legitimately require a
-        # retryable stop: it must wait for FAST-LIVO2 to exit and persist the
-        # map transaction. Keep its runtime and Canvas lifecycle intact until
-        # the operator retries and finalization succeeds.
+        semantic_result = results["semantic"]
+        if not self._stop_confirmed(semantic_result):
+            return self._error(
+                "semantic_stop_pending",
+                "semantic navigation stop is unconfirmed; retry stop without "
+                "restarting ControlledSemanticSpatial",
+                component_results=results,
+                retryable=True,
+                canvas_wired=True,
+            )
+
+        # Mapping must persist its map transaction before its runtime and
+        # Canvas lifecycle can be released. Any non-terminal response is
+        # retryable here, regardless of how the child classified the error.
         try:
             results["mapping"] = self._mapping.dispatch(
                 "fast_livo2", {"action": "stop"}
@@ -305,17 +308,10 @@ class NavigationPlugin:
         except Exception as exc:
             results["mapping"] = self._error("component_stop_failed", str(exc))
         mapping_result = results["mapping"]
-        if (
-            isinstance(mapping_result, dict)
-            and mapping_result.get("retryable") is True
-            and (
-                mapping_result.get("status") == "error"
-                or mapping_result.get("state") == "error"
-            )
-        ):
+        if not self._stop_confirmed(mapping_result):
             return self._error(
                 "navigation_stop_pending",
-                "mapping finalization is retryable; retry stop without restarting "
+                "mapping finalization is unconfirmed; retry stop without restarting "
                 "ControlledSemanticSpatial",
                 component_results=results,
                 retryable=True,
@@ -326,6 +322,14 @@ class NavigationPlugin:
             results["runtime"] = self._runtime.stop()
         except Exception as exc:
             results["runtime"] = self._error("runtime_stop_failed", str(exc))
+            return self._error(
+                "navigation_stop_pending",
+                "runtime shutdown is unconfirmed; retry stop without restarting "
+                "ControlledSemanticSpatial",
+                component_results=results,
+                retryable=True,
+                canvas_wired=True,
+            )
         self._set_mapping_runtime_active(False)
         with self._lock:
             self._started = False
@@ -342,6 +346,8 @@ class NavigationPlugin:
                 "navigation_stop_failed",
                 "failed to stop: " + ",".join(failures),
                 component_results=results,
+                terminal_confirmed=True,
+                canvas_wired=False,
             )
         return {
             "state": "idle",
@@ -351,6 +357,20 @@ class NavigationPlugin:
             "shadow_only": True,
             "physical_execution": False,
         }
+
+    @staticmethod
+    def _stop_confirmed(result) -> bool:
+        return (
+            isinstance(result, dict)
+            and (
+                result.get("terminal_confirmed") is True
+                or (
+                    result.get("ok") is not False
+                    and (result.get("status") or result.get("state"))
+                    in {"idle", "stopped", "disabled"}
+                )
+            )
+        )
 
     def _set_mapping_runtime_active(self, active: bool) -> None:
         setter = getattr(self._mapping, "set_runtime_active", None)

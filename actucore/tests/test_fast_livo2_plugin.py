@@ -448,13 +448,14 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertTrue(info["canvas_wired"])
         self.assertEqual(info["active_map"], "office")
 
-    def test_permanent_mapping_stop_failure_releases_card_backend(self) -> None:
+    def test_confirmed_mapping_stop_failure_releases_card_backend(self) -> None:
         class PermanentStopBackend(ReadyBackend):
             def execute(self, action: str, args: dict) -> dict:
                 if action == "stop_mapping":
                     raise FastLivo2BackendError(
                         "static_map_accumulation_failed",
                         "static evidence exceeded its safety limit",
+                        details={"retryable": False, "terminal_confirmed": True},
                     )
                 return super().execute(action, args)
 
@@ -471,6 +472,7 @@ class FastLivo2PluginTest(unittest.TestCase):
 
         self.assertEqual(result["error_code"], "canvas_stop_failed")
         self.assertFalse(result["retryable"])
+        self.assertTrue(result["terminal_confirmed"])
         self.assertFalse(result["canvas_wired"])
         self.assertEqual(backend.stop_calls, 1)
         self.assertFalse(

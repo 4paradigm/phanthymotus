@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from urllib.parse import urlparse
@@ -11,6 +12,8 @@ import aiohttp
 import openai as openai_lib
 
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
+# ponytail: one project exists per Core process; split the lock only if that changes.
+layout_lifecycle_lock = asyncio.Lock()
 
 
 def _mcp_payload(result) -> dict:
@@ -30,6 +33,14 @@ def _mcp_payload(result) -> dict:
         except Exception:
             return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _stop_confirmed(payload: dict) -> bool:
+    return (
+        payload.get('terminal_confirmed') is True
+        or (payload.get('status') or payload.get('state'))
+        in {'idle', 'stopped', 'disabled'}
+    )
 
 
 def _tool_accepts_input_bindings(mcp_id: str, tool_name: str) -> bool:
@@ -188,7 +199,7 @@ async def get_project_running():
 
 # ── Start / Stop Project (统一入口) ─────────────────────────────────────────────
 
-async def _do_start_project():
+async def _do_start_project(*, _lock_held: bool = False):
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
 
     Topic resolution strategy:
@@ -197,6 +208,10 @@ async def _do_start_project():
       3. When starting processor cards, look up source card's topic_out via connections
       4. Fallback: use connection's persisted fromTopic if info() didn't return topic_out
     """
+    if not _lock_held:
+        async with layout_lifecycle_lock:
+            return await _do_start_project(_lock_held=True)
+
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
     import asyncio as _asyncio
@@ -441,14 +456,10 @@ async def _do_start_project():
     if errors:
         print(f'[start-project] {len(errors)} cards failed ({", ".join(errors)}), rolling back')
         await push_event({'type': 'project_start_done', 'payload': {'has_error': True, 'errors': errors}})
-        await _do_stop_project()
+        await _do_stop_project(_lock_held=True)
         return False
 
-    # 全部成功 → 标记 running，再激活 Canvas 连线声明的 topic actions。
-    core = config.main.get('core', {})
-    core['project_running'] = True
-    config.main['core'] = core
-
+    # 路由先在不可派发状态下安装；全部成功后再开放 project_running 门。
     try:
         from topic_actions import manager as topic_action_mgr
         await topic_action_mgr.start(layout)
@@ -458,8 +469,12 @@ async def _do_start_project():
         await push_event({'type': 'project_start_done', 'payload': {
             'has_error': True, 'errors': errors,
         }})
-        await _do_stop_project()
+        await _do_stop_project(_lock_held=True)
         return False
+
+    core = config.main.get('core', {})
+    core['project_running'] = True
+    config.main['core'] = core
 
     # 广播启动完成
     await push_event({'type': 'project_start_done', 'payload': {'has_error': False}})
@@ -492,12 +507,7 @@ async def _stop_cards(cards) -> tuple[int, list[dict]]:
             )
             result = await mcp_call_tool(mcp_id, req)
             payload = _mcp_payload(result)
-            if (
-                result.get('code', 200) != 200
-                or payload.get('ok') is False
-                or payload.get('state') == 'error'
-                or payload.get('status') == 'error'
-            ):
+            if result.get('code', 200) != 200 or not _stop_confirmed(payload):
                 raise RuntimeError(
                     payload.get('error')
                     or result.get('message')
@@ -513,7 +523,7 @@ async def _stop_cards(cards) -> tuple[int, list[dict]]:
     return stopped, failures
 
 
-async def stop_removed_cards(old_cards, new_cards) -> int:
+async def stop_removed_cards(old_cards, new_cards) -> tuple[int, list[dict]]:
     """Stop instances belonging to cards that just left the layout.
 
     `_do_stop_project` stops what the *saved layout* lists, so a card removed
@@ -532,17 +542,21 @@ async def stop_removed_cards(old_cards, new_cards) -> int:
     live = {c.get('id', '') for c in (new_cards or []) if c.get('id')}
     removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
     if not removed:
-        return 0
+        return 0, []
     count, failures = await _stop_cards(removed)
     print(f'[layout] stopped {count} instance(s) for removed card(s): '
           f'{", ".join(c.get("id", "") for c in removed)}')
     if failures:
         print(f'[layout] {len(failures)} removed card stop(s) unconfirmed: {failures}')
-    return count
+    return count, failures
 
 
-async def _do_stop_project():
+async def _do_stop_project(*, _lock_held: bool = False):
     """停止所有 canvas cards。"""
+    if not _lock_held:
+        async with layout_lifecycle_lock:
+            return await _do_stop_project(_lock_held=True)
+
     from api.motus_stream import push_event
 
     # 先关运行态和 topic actions，避免停卡过程再接收新动作。

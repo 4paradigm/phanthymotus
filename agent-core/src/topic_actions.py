@@ -233,16 +233,28 @@ class TopicActionManager:
 
     async def start(self, layout: dict[str, Any]) -> None:
         routes = build_routes(layout)
+        previous = dict(self._runtimes)
         await self.stop()
+        try:
+            self._activate({route.key: RouteRuntime(route=route) for route in routes})
+        except Exception:
+            await self.stop()
+            self._activate(previous)
+            raise
+
+    def _activate(self, runtimes: dict[str, RouteRuntime]) -> None:
         loop = asyncio.get_running_loop()
-        for route in routes:
-            runtime = RouteRuntime(route=route)
-            self._runtimes[route.key] = runtime
+        for runtime in runtimes.values():
+            route = runtime.route
 
             async def _callback(data: bytes, _fmt: str, *, key: str = route.key) -> None:
                 await self._handle(key, data)
 
-            ros2_bridge.subscribe(route.key, route.topic, route.fmt, loop, _callback)
+            if ros2_bridge.subscribe(
+                route.key, route.topic, route.fmt, loop, _callback
+            ) is False:
+                raise RuntimeError(f"failed to subscribe topic-action route {route.topic}")
+            self._runtimes[route.key] = runtime
             print(
                 f"[topic-actions] active topic={route.topic} "
                 f"target={route.mcp_id}/{route.tool_name}:{route.action}"

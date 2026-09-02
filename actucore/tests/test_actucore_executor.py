@@ -94,10 +94,47 @@ class SpinExecutorTest(unittest.TestCase):
         bundle._plugins = [plugin]
 
         with mock.patch.object(module.time, "sleep") as sleep:
-            bundle.stop()
+            confirmed = bundle.stop()
 
+        self.assertTrue(confirmed)
         self.assertEqual(plugin.calls, 3)
         self.assertEqual(sleep.call_count, 2)
+
+    def test_bundle_shutdown_reports_an_unconfirmed_card_stop(self):
+        module = _load_main_module()
+
+        class Plugin:
+            PREFIX = "navigation"
+
+            def __init__(self):
+                self.calls = 0
+
+            def stop(self):
+                self.calls += 1
+                return {"state": "error", "retryable": True}
+
+        plugin = Plugin()
+        bundle = module.ActuCoreBundle.__new__(module.ActuCoreBundle)
+        bundle._plugins = [plugin]
+
+        with mock.patch.object(module.time, "sleep") as sleep:
+            confirmed = bundle.stop()
+
+        self.assertFalse(confirmed)
+        self.assertEqual(plugin.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_bundle_shutdown_rejects_missing_or_nonterminal_status(self):
+        module = _load_main_module()
+
+        for result in (None, {}, {"state": "stopping"}, {"status": "finalizing"}):
+            with self.subTest(result=result):
+                plugin = mock.Mock(PREFIX="navigation")
+                plugin.stop.return_value = result
+                bundle = module.ActuCoreBundle.__new__(module.ActuCoreBundle)
+                bundle._plugins = [plugin]
+
+                self.assertFalse(bundle.stop())
 
 
 if __name__ == "__main__":
