@@ -40,19 +40,23 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 #                  at all (it happened to work only because the shell default
 #                  was hardcoded to 3.8) while jp6.1's sets 3.10. Asking python
 #                  is correct on any base, present or future.
+#   DLA_COMPILER_SO  COS key of the bundled libnvdla_compiler.so, or empty for a
+#                  line that does not need one (see the dla-fallback step).
 #
 # It is also a record: `docker exec <c> cat /etc/jetpack.env` says what line an
 # image was built for, which is otherwise guesswork from the tag alone.
 ARG SHERPA_GPU_WHEEL_511=jp511/sherpa_onnx-1.13.6+cuda-cp38-cp38-linux_aarch64.whl
 ARG SHERPA_GPU_WHEEL_61=jp61/sherpa_onnx-1.13.6+cuda-cp310-cp310-linux_aarch64.whl
+ARG DLA_COMPILER_SO_61=jp61/libnvdla_compiler.so
 RUN case "${JP_VERSION}" in \
-        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}" ;; \
-        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"  ;; \
-        *)   NUMPY=1.24.4; WHEEL= ;; \
+        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}"; DLA= ;; \
+        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; DLA="${DLA_COMPILER_SO_61}" ;; \
+        *)   NUMPY=1.24.4; WHEEL=; DLA= ;; \
     esac; \
-    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\n' \
+    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\nDLA_COMPILER_SO=%s\n' \
         "${NUMPY}" "${WHEEL}" \
         "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" \
+        "${DLA}" \
         > /etc/jetpack.env && \
     echo "[build] jp${JP_VERSION}:" && cat /etc/jetpack.env
 
@@ -234,6 +238,79 @@ print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
         pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx; \
     fi
 
+# ── libnvdla_compiler.so fallback (jp6.1) ────────────────────────────────────
+# `import tensorrt` on JetPack 6 has libnvdla_compiler.so as a hard DT_NEEDED,
+# and no image can ship it: /usr/lib/aarch64-linux-gnu/nvidia/ is owned by
+# nvidia-container-runtime, which bind-mounts the host's copies over the
+# zero-length placeholders the L4T base ships. A host that does not have the
+# library has nothing to mount, the placeholder stays 0 bytes, and TensorRT dies
+# with "libnvdla_compiler.so: cannot open shared object file" — taking down every
+# TensorRT plugin at once (VITS2 TTS, OCR, obstacle).
+#
+# That is not hypothetical: Bumi's Orin NX ships an L4T R36.5.0 vendor BSP with
+# no nvidia-l4t-dla-compiler, so drivers.csv line 85 names a file the host does
+# not have. Fixing the host would mean pushing an NVIDIA package into a vendor
+# BSP on every robot we ever ship to, and having it reverted by the next flash.
+#
+# So carry our own copy, at a path the CSV does not name — a second copy inside
+# /usr/lib/aarch64-linux-gnu/nvidia/ would just be another placeholder for the
+# runtime to overwrite or leave empty. It is reached only through the guard in
+# /etc/dla-fallback.env below, which leaves the host's copy in charge whenever
+# there is one. DLA itself is unused (our engines run on the GPU) — this
+# satisfies the dynamic linker, nothing more, which is also why a copy taken from
+# L4T R36.4.3 is fine on an R36.5.0 host (verified on Bumi: builder +
+# deserialize_cuda_engine both work).
+#
+# jp5.11 needs none of this: L4T R35 resolves both nvdla libraries out of
+# /usr/lib/aarch64-linux-gnu/tegra/, which its own base image populates, so
+# DLA_COMPILER_SO is empty for that line and this step is a no-op.
+RUN . /etc/jetpack.env; \
+    if [ -n "${DLA_COMPILER_SO}" ]; then \
+        mkdir -p /opt/nvidia/dla-fallback && \
+        echo "[build] dla-fallback: ${DLA_COMPILER_SO}" && \
+        python3 -c "import urllib.request, urllib.parse, sys; \
+key, dest = sys.argv[1], sys.argv[2]; \
+urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/nvidia/' + urllib.parse.quote(key), dest)" \
+            "${DLA_COMPILER_SO}" /opt/nvidia/dla-fallback/libnvdla_compiler.so && \
+        python3 -c "import pathlib; \
+p = pathlib.Path('/opt/nvidia/dla-fallback/libnvdla_compiler.so'); \
+assert p.read_bytes()[:4] == b'\177ELF', 'not an ELF object — COS served an error page?'; \
+print('[build] dla-fallback:', p.stat().st_size, 'bytes')"; \
+    else \
+        echo "[build] dla-fallback: not needed for jp${JP_VERSION}"; \
+    fi
+
+# The guard, sourced by CMD. Both conditions matter, and they test *size*, not
+# existence: the placeholder always exists, so `-e` is true even when there is no
+# usable library behind it.
+#
+#   libcuda.so.1 non-empty    → the nvidia runtime really did take over. Under
+#                               plain runc every file in that directory stays a
+#                               0-byte placeholder and the container has no GPU
+#                               at all (see `runtime: nvidia` in deploy/
+#                               service.yml). Papering the linker error over in
+#                               that case would trade one clear failure at import
+#                               for a confusing one much later, at engine build.
+#   libnvdla_compiler.so empty → the host BSP has no copy to mount. This is the
+#                               one case the fallback is for. When the host does
+#                               have one it is non-empty, this test is false, and
+#                               we leave TensorRT to use it: it matches the host
+#                               kernel and DLA hardware and ours does not.
+#
+# Appended, never prepended: LD_LIBRARY_PATH is searched before ld.so.cache, so
+# putting this directory first would let our copy shadow a correctly mounted host
+# library on every other robot.
+RUN printf '%s\n' \
+    '# Sourced by CMD. See the dla-fallback step in Dockerfile.jetson.' \
+    'DLA_FALLBACK_SO=/opt/nvidia/dla-fallback/libnvdla_compiler.so' \
+    'DLA_NV_LIB_DIR=/usr/lib/aarch64-linux-gnu/nvidia' \
+    'if [ -f "$DLA_FALLBACK_SO" ] && [ -s "$DLA_NV_LIB_DIR/libcuda.so.1" ] && [ ! -s "$DLA_NV_LIB_DIR/libnvdla_compiler.so" ]; then' \
+    '    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/nvidia/dla-fallback"' \
+    '    echo "[dla-fallback] host BSP has no libnvdla_compiler.so (missing nvidia-l4t-dla-compiler); using the copy bundled in this image" >&2' \
+    'fi' \
+    > /etc/dla-fallback.env && \
+    sh -n /etc/dla-fallback.env && echo "[build] /etc/dla-fallback.env ok"
+
 # ── OCR runtime deps (PP-OCRv6 TensorRT engines; TensorRT/CUDA come from base) ──
 # libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
 # + downscale; rapidocr is used --no-deps for its pure-Python DB/CTC post-
@@ -359,4 +436,5 @@ CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
+     source /etc/dla-fallback.env && \
      python3 /work/main.py"]

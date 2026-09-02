@@ -5302,6 +5302,19 @@ html, body {
   gap: 8px;
   padding: 3px 0;
 }
+.network-iface-policy-route {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+  padding: 6px 10px;
+}
+.network-iface-policy-route .network-iface-label {
+  min-width: 0;
+  text-transform: none;
+  letter-spacing: normal;
+}
 .network-iface-label {
   font-size: 0.7rem;
   color: var(--text-dim);

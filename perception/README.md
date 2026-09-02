@@ -438,6 +438,59 @@ Notes:
 
 ---
 
+### `libnvdla_compiler.so` — the jp6.1 image carries its own
+
+On JetPack 6, `import tensorrt` has `libnvdla_compiler.so` as a hard `DT_NEEDED`,
+and no image can ship it at its real path: `/usr/lib/aarch64-linux-gnu/nvidia/` is
+owned by nvidia-container-runtime, which bind-mounts the host's copies over the
+zero-length placeholders the L4T base ships. A host BSP without
+`nvidia-l4t-dla-compiler` has nothing to mount, the placeholder stays 0 bytes, and
+every TensorRT plugin is down at once — VITS2 TTS, OCR, obstacle:
+
+```
+ImportError: libnvdla_compiler.so: cannot open shared object file
+  → utils.tensorrt_runtime.TensorRTError: TensorRT is not available in this runtime
+```
+
+Bumi's Orin NX ships exactly that BSP (L4T R36.5.0, vendor-flashed): `drivers.csv`
+line 85 names the library, `dpkg -l | grep dla` finds nothing, and
+`find / -name 'libnvdla_compiler*'` on the host comes back empty. `torch.cuda` is
+fine on that host, so the symptom is TTS-only and reads like a TTS regression.
+
+So `Dockerfile.jetson` downloads a copy from COS
+(`public/nvidia/jp61/libnvdla_compiler.so`, taken from `nvidia-l4t-dla-compiler
+36.4.3`) into `/opt/nvidia/dla-fallback/` — **a path the CSV does not name**, or it
+would be just another placeholder for the runtime to leave empty. `/etc/dla-fallback.env`,
+sourced by `CMD`, appends that directory to `LD_LIBRARY_PATH` only when both hold:
+
+| test | why |
+|---|---|
+| `-s .../nvidia/libcuda.so.1` | the nvidia runtime really took over. Under plain runc every file there is a 0-byte placeholder and the container has no GPU at all — masking the linker error would trade one clear failure at import for a baffling one later at engine build. |
+| `! -s .../nvidia/libnvdla_compiler.so` | the host has no copy to mount. When it does have one, this is false and TensorRT uses it: the host's matches its kernel and DLA hardware, ours does not. |
+
+Both test **size**, not existence — the placeholder always exists, so `-e` is true
+even when nothing usable is behind it. And the directory is *appended*, never
+prepended: `LD_LIBRARY_PATH` is searched before `ld.so.cache`, so going first would
+shadow a correctly mounted host library on every other robot.
+
+DLA is never used — our engines run on the GPU and this only satisfies the linker,
+which is why an R36.4.3 copy works on an R36.5.0 host. Verified on Bumi (fallback
+fires, `build_serialized_network` + `deserialize_cuda_engine` both succeed), on Bumi
+under `--runtime=runc` (guard stays silent, import still fails loudly), and on orin6
+where the host has the library (guard silent, `/proc/self/maps` shows the host copy
+loaded, `LD_LIBRARY_PATH` untouched).
+
+jp5.11 needs none of this: L4T R35 resolves both nvdla libraries out of
+`/usr/lib/aarch64-linux-gnu/tegra/`, which its own base image populates, so
+`DLA_COMPILER_SO` is empty for that line and the build step is a no-op.
+
+**Corollary for debugging:** a `libnvdla_compiler.so` error is no longer proof that
+`runtime: nvidia` is missing from the compose fragment — but with the fallback in
+place it is again the *only* remaining cause, and the log line
+`[dla-fallback] host BSP has no libnvdla_compiler.so` tells you which case you are in.
+
+---
+
 ## asr_kws and espeak
 
 `trigger_mode: asr_kws` transcribes every utterance and gates on a phoneme-level

@@ -10,6 +10,7 @@ from unittest import mock
 
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
+sys.path.insert(0, str(ACTUCORE_ROOT.parent / "perception" / "utils"))
 
 
 class InvalidHandle(Exception):
@@ -17,7 +18,7 @@ class InvalidHandle(Exception):
 
 
 def _load_main_module():
-    import utils.logsafe as logsafe
+    import logsafe
 
     rclpy = types.ModuleType("rclpy")
     executors = types.ModuleType("rclpy.executors")

@@ -296,6 +296,100 @@ def test_speak_after_ready_reuses_the_running_node(monkeypatch):
     assert state["loads"] == 1
 
 
+# ── interrupt ────────────────────────────────────────────────────────────────
+
+def _running(monkeypatch):
+    """A plugin with one node up and its committed adapter."""
+    plugin, executor, state = _plugin(monkeypatch)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say",
+                            "instance_id": "a"})
+    assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
+    return plugin, executor, state
+
+
+def _record(completions, action_id):
+    matches = [c for c in completions if c[0] == action_id]
+    assert matches, f"no ACP completion for {action_id}"
+    return matches[0]
+
+
+def test_interrupt_while_idle_does_not_swallow_the_next_speak(
+    monkeypatch, completions
+):
+    """Regression, observed on R1: "别说了，说说现在几点了" stopped the robot but
+    the answer was never heard.
+
+    Two interrupts land back to back in the real sequence — agent-core's barge-in
+    fallback fires one, then the LLM calls tts(action=interrupt) itself a second
+    or two later. The second lands with nothing playing, and the interrupt flag
+    used to be consumed by the *next* dequeued utterance rather than by the
+    utterance being interrupted. So it survived and discarded the reply: the ACP
+    action completed within the same second with zero frames, the barrier cleared
+    happily, and no synthesis ever ran.
+    """
+    plugin, _, _ = _running(monkeypatch)
+    adapter = _installed(plugin)
+
+    plugin.dispatch("tts", {"action": "interrupt"})
+    plugin.dispatch("tts", {"action": "interrupt", "instance_id": "a"})
+
+    queued = plugin.dispatch("tts", {"action": "speak", "text": "现在是下午6点36分。",
+                                     "instance_id": "a"})
+    action_id = queued["action_id"]
+
+    assert _wait_until(lambda: any(c[0] == action_id for c in completions))
+    _aid, _text, frames, interrupted = _record(completions, action_id)
+    assert interrupted is False, "the reply after an idle interrupt was cancelled"
+    assert frames > 0, "the reply completed without publishing any audio"
+    assert "现在是下午6点36分。" in adapter.spoken
+
+
+def test_interrupt_still_drops_utterances_queued_before_it(monkeypatch, completions):
+    """The flip side: an interrupt must cancel what was already queued.
+
+    Guards the generation counter from the trivial "never discard anything" fix.
+    """
+    plugin, _, _ = _running(monkeypatch)
+    adapter = _installed(plugin)
+
+    # Hold the first utterance inside synthesis so the second stays queued and
+    # the interrupt lands with one playing and one waiting.
+    gate = threading.Event()
+    started = threading.Event()
+    real_stream = adapter.synthesize_stream
+
+    def gated_stream(text):
+        if text == "第一句":
+            started.set()
+            assert gate.wait(10), "test never released the synthesis gate"
+        yield from real_stream(text)
+
+    adapter.synthesize_stream = gated_stream
+
+    first = plugin.dispatch("tts", {"action": "speak", "text": "第一句",
+                                    "instance_id": "a"})
+    assert started.wait(5), "the first utterance never reached synthesis"
+    second = plugin.dispatch("tts", {"action": "speak", "text": "第二句",
+                                     "instance_id": "a"})
+
+    plugin.dispatch("tts", {"action": "interrupt", "instance_id": "a"})
+    gate.set()
+
+    assert _wait_until(lambda: any(c[0] == second["action_id"] for c in completions))
+    assert _record(completions, second["action_id"])[3] is True, \
+        "an utterance queued before the interrupt was played anyway"
+    assert "第二句" not in adapter.spoken
+    assert _wait_until(lambda: any(c[0] == first["action_id"] for c in completions))
+    assert _record(completions, first["action_id"])[3] is True
+
+    # ...and the node is still usable afterwards.
+    third = plugin.dispatch("tts", {"action": "speak", "text": "第三句",
+                                    "instance_id": "a"})
+    assert _wait_until(lambda: any(c[0] == third["action_id"] for c in completions))
+    assert _record(completions, third["action_id"])[3] is False
+    assert "第三句" in adapter.spoken
+
+
 # ── config ───────────────────────────────────────────────────────────────────
 
 def test_config_speed_updates_a_resident_model_without_a_reload(monkeypatch):
@@ -407,7 +501,10 @@ def test_load_error_keeps_the_underlying_cause(monkeypatch):
 
     def explode(model_dir, family=None):
         try:
-            raise ImportError("libnvdla_compiler.so: file too short")
+            raise ImportError(
+                "libnvdla_compiler.so: cannot open shared object file: "
+                "No such file or directory"
+            )
         except ImportError as cause:
             raise RuntimeError("TensorRT is not available in this runtime") from cause
 

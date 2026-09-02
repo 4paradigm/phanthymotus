@@ -51,10 +51,48 @@ async function _loadInterfaces() {
           ${i.gateway ? `<div class="network-iface-cell"><span class="network-iface-label">网关</span><span class="network-iface-value">${_esc(i.gateway)}</span></div>` : ''}
           ${i.mac ? `<div class="network-iface-cell"><span class="network-iface-label">MAC</span><span class="network-iface-value">${_esc(i.mac)}</span></div>` : ''}
         </div>` : ''}
+        ${i.state === 'connected' && i.gateway ? `<div class="network-iface-policy-route" title="开启后，来自此网卡的连接会强制从此网卡回复，用于此网卡不是主上行网络时避免外部无法访问其 IP。不影响此网卡作为默认出口。旧版 NetworkManager 上切换时可能会短暂断开重连此网卡">
+          <span class="network-iface-label">策略路由（防止回包走错网卡）</span>
+          <label class="toggle-switch">
+            <input type="checkbox" class="network-policy-route-toggle" data-device="${_attr(i.device)}" ${i.policy_route ? 'checked' : ''} />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>` : ''}
       </div>
     `).join('');
+
+    _interfacesList.querySelectorAll('.network-policy-route-toggle').forEach(el => {
+      el.addEventListener('change', () => _togglePolicyRoute(el));
+    });
   } catch {
     _interfacesList.innerHTML = '<div class="network-empty">无法获取接口信息</div>';
+  }
+}
+
+async function _togglePolicyRoute(el) {
+  const device = el.dataset.device;
+  const enable = el.checked;
+  if (!confirm(`此操作会重新应用 ${device} 的网络配置，旧版 NetworkManager 上可能短暂断开重连，确认继续？`)) {
+    el.checked = !enable;
+    return;
+  }
+  el.disabled = true;
+  try {
+    const res = await fetch('/api/network/policy-route', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device, enable }),
+    });
+    const json = await res.json();
+    if (!json.data?.success) {
+      el.checked = !enable;
+      alert('设置失败: ' + (json.data?.error || '未知错误'));
+    }
+  } catch (e) {
+    el.checked = !enable;
+    alert('设置失败: ' + e.message);
+  } finally {
+    el.disabled = false;
   }
 }
 

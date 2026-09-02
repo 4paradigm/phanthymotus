@@ -21,6 +21,10 @@ PACKAGE_ROOT = (
     / "g1_fast_livo2"
 )
 sys.path.insert(0, str(PACKAGE_ROOT))
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parents[2] / "perception" / "utils"),
+)
 
 
 def _import_ros_runtime_modules():

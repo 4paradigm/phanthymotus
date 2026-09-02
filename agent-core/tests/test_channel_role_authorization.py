@@ -76,11 +76,19 @@ class ViewerRoleAuthorizationTest(unittest.TestCase):
             },
         }
         with mock.patch.dict(mcp_client.registry, registry, clear=True):
-            self.assertTrue(_restricted_channel_tool_allowed('finish'))
-            self.assertTrue(_restricted_channel_tool_allowed('mcp__channel__channel_reply'))
-            self.assertTrue(_restricted_channel_tool_allowed('mcp__device__camera'))
-            self.assertFalse(_restricted_channel_tool_allowed('mcp__device__navigate'))
-            self.assertFalse(_restricted_channel_tool_allowed('mcp__device__load_map'))
+            self.assertTrue(_restricted_channel_tool_allowed('finish', bot_restricted=False))
+            self.assertTrue(_restricted_channel_tool_allowed('mcp__channel__channel_reply', bot_restricted=False))
+            self.assertTrue(_restricted_channel_tool_allowed('mcp__device__camera', bot_restricted=False))
+            self.assertFalse(_restricted_channel_tool_allowed('mcp__device__navigate', bot_restricted=False))
+            self.assertFalse(_restricted_channel_tool_allowed('mcp__device__load_map', bot_restricted=False))
+
+    def test_viewer_can_use_read_only_system_tools_but_bot_cannot(self):
+        for name in ('WebSearch', 'search_history', 'memory_recall', 'raw_input_info'):
+            self.assertTrue(_restricted_channel_tool_allowed(name, bot_restricted=False), name)
+            self.assertFalse(_restricted_channel_tool_allowed(name, bot_restricted=True), name)
+        # Still no mutating desktop tools for either — read-only means read-only.
+        for name in ('Bash', 'Write', 'Edit', 'WebFetch', 'subagent_spawn'):
+            self.assertFalse(_restricted_channel_tool_allowed(name, bot_restricted=False), name)
 
 
 if __name__ == '__main__':

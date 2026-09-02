@@ -64,6 +64,7 @@ RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/
 
 COPY web/      /work/web/
 COPY src/      /work/src/
+COPY tools/    /work/tools/
 COPY resource/ /work/resource/
 COPY deploy/   /deploy/
 

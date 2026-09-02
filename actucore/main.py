@@ -20,8 +20,8 @@ MCP server 端口: config.mcp_port（默认 15730）
 from __future__ import annotations
 
 # Install before any thread, ROS runtime, or HTTP handler can write a partial
-# Docker log record. Child ROS entry points install the same writer themselves.
-from utils import logsafe
+# Docker log record. The Dockerfile supplies perception's shared implementation.
+import logsafe
 
 logsafe.install()
 
@@ -53,6 +53,21 @@ log = logging.getLogger(__name__)
 # suppress noisy third-party loggers
 for _quiet in ('urllib3', 'httpcore', 'httpx'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
+
+# Cap on how much of an MCP argument/result dict reaches the log. Card configs
+# carry whole maps and voxel grids, so an unbounded repr here is how a single log
+# line grows past the point where Docker can frame it — the result side was
+# already capped, the argument side was not.
+_LOG_ARG_CHARS = 500
+
+
+def _brief(obj) -> str:
+    """One-line, length-capped repr for logging an MCP payload."""
+    text = repr(obj)
+    if len(text) <= _LOG_ARG_CHARS:
+        return text
+    return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
+
 
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
 
@@ -303,7 +318,7 @@ def make_handler():
                         log.info(
                             "[mcp] tools/call: %.200r(%s)",
                             name,
-                            redact_sensitive(args),
+                            _brief(redact_sensitive(args)),
                         )
                     result = _bundle.dispatch(name, args)
                     if result is None:

@@ -46,6 +46,21 @@ log = logging.getLogger(__name__)
 for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
+# Cap on how much of an MCP argument dict reaches the log. A tool call can carry
+# an image, a base64 payload or a long utterance, so an unbounded repr here is how
+# a single log line grows past the point where Docker can frame it — the result
+# side was already capped, the argument side was not.
+_LOG_ARG_CHARS = 500
+
+
+def _brief(obj) -> str:
+    """One-line, length-capped repr for logging an MCP payload."""
+    text = repr(obj)
+    if len(text) <= _LOG_ARG_CHARS:
+        return text
+    return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
+
+
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
 
 import queue as _queue
@@ -306,7 +321,7 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         # `dispatch` returns None for two very different things:

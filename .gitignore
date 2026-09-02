@@ -19,6 +19,26 @@ build/
 resource/world/
 resource/log/
 resource/frame_rgb.jpg
+# 以上带斜杠的模式锚定在本文件所在目录（仓库根），匹配不到子项目里的同名路径
+# —— agent-core/resource/log/ 其实一直没被挡住。下面统一用 **/ 前缀。
+#
+# 这些目录里是运行时数据，不该进仓库：
+#   llm_data / llm_recent_request —— src/llm_logger.py 落盘的真实请求历史，
+#     含用户原话，单个文件能到 20MB+（orin6 上 1101 条记录约 48MB）
+#   log            —— 运行日志
+#   llm_bench      —— tools/llm_bench 的报告与原始结果
+#   certs          —— TLS 私钥
+#   channel_files  —— IM 渠道收到的用户文件（此前只有 *.jpg 恰好被挡住）
+**/resource/llm_data/
+**/resource/llm_recent_request/
+**/resource/llm_bench/
+**/resource/log/
+**/resource/certs/
+**/resource/channel_files/
+
+# llm_bench 的实际配置里有明文密钥，只有 bench.yaml.example 进库。
+# 这个模式只匹配 bench.yaml 本身，不影响 bench.yaml.example。
+bench.yaml
 
 # Media (runtime captures)
 *.jpg

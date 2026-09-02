@@ -297,6 +297,12 @@ class _TTSNode(Node):
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event   = threading.Event()
         self._interrupt_flag = threading.Event()  # 打断标志：设置后立即停止当前 utterance
+        # 每次 interrupt 递增的「代」。入队时给 utterance 打上当时的代号，worker
+        # 就能区分「打断之前入队」（丢弃）和「打断之后入队」（正常播）。单靠
+        # _interrupt_flag 做不到：它是粘性的，空闲时收到的打断没有任何 utterance
+        # 循环去消费它，于是残留下来把**下一句**吞掉。
+        self._interrupt_lock = threading.Lock()
+        self._interrupt_gen = 0
         from audio_msgs.msg import AudioChunk
         self._pub = self.create_publisher(AudioChunk, self._output_topic, _LOW_LAT_QOS)
         self._perf_pub = self.create_publisher(String, '/perception/perf_spans', _LOW_LAT_QOS)
@@ -354,14 +360,25 @@ class _TTSNode(Node):
         return len(discarded)
 
     def interrupt(self) -> dict:
-        """立即中止当前播放：清空队列 + 设置 interrupt flag 让 worker 停止当前 utterance。"""
+        """立即中止当前播放：清空队列 + 设置 interrupt flag 让 worker 停止当前 utterance。
+
+        空闲时调用、或连续调用两次都是安全的 —— agent-core 的 barge-in 兜底打断和
+        LLM 自己显式调的 `tts(action=interrupt)` 经常在几秒内先后到达。
+        """
         # 清空待播放队列。丢掉的 item 必须逐个回 ACP cancelled，否则 agent-core
         # 的 barrier 会为每个注册过的 action 干等到超时。
         cleared = self._complete_discarded_actions()
-        # 设置 interrupt flag（worker 在每个 frame 前检查）
-        self._interrupt_flag.set()
+        with self._interrupt_lock:
+            self._interrupt_gen += 1
+            # 递增和置位放在同一个临界区：否则一个在新代号下入队的 utterance 可能
+            # 先被 worker 装载（清掉 flag），再被这里的 set() 误杀。
+            self._interrupt_flag.set()
         log.info(f"[tts] interrupted: cleared {cleared} queued item(s)")
         return {"status": "interrupted", "cleared": cleared}
+
+    def _current_gen(self) -> int:
+        with self._interrupt_lock:
+            return self._interrupt_gen
 
     def enqueue(self, text: str, trace_id: str = '', action_id: str = ''):
         if self.state != "running":
@@ -371,7 +388,7 @@ class _TTSNode(Node):
         # segment on the queue as its own utterance, so a long text emitted an
         # EOF and reset the pacing clock every 280 characters, and the gap
         # between segments was a full synthesis with no audio flowing at all.
-        self._text_queue.put((text, trace_id, action_id))
+        self._text_queue.put((text, trace_id, action_id, self._current_gen()))
 
     @staticmethod
     def _split_text(text: str, max_chars: int = 280) -> list:
@@ -400,7 +417,7 @@ class _TTSNode(Node):
             text = msg.data.strip()
         if text:
             log.info(f"[tts] received text from topic: {text[:50]}...")
-            self._text_queue.put((text, ''))
+            self._text_queue.put((text, '', '', self._current_gen()))
 
     def _worker(self):
         from audio_msgs.msg import AudioChunk
@@ -411,9 +428,14 @@ class _TTSNode(Node):
                 item = self._text_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            # Unpack queue item: (text, trace_id, action_id) or legacy formats
+            # Unpack queue item: (text, trace_id, action_id, gen) or legacy
+            # formats. A missing gen means "cannot be stale", so such an item is
+            # always played rather than silently dropped.
+            _gen = None
             if isinstance(item, tuple):
-                if len(item) == 3:
+                if len(item) >= 4:
+                    text, _trace_id, _action_id, _gen = item[:4]
+                elif len(item) == 3:
                     text, _trace_id, _action_id = item
                 elif len(item) == 2:
                     text, _trace_id = item
@@ -422,6 +444,18 @@ class _TTSNode(Node):
                     text, _trace_id, _action_id = str(item[0]), '', ''
             else:
                 text, _trace_id, _action_id = item, '', ''
+            # 只丢弃早于最后一次打断的 utterance。空闲时收到的打断不能碰下一句 ——
+            # 那正是以前把一整句回复吞掉的原因。
+            with self._interrupt_lock:
+                _stale = _gen is not None and _gen < self._interrupt_gen
+                if not _stale:
+                    # 为本句装载：上一次打断留下的 flag 到此为止，只有从现在起
+                    # 到达的打断才能取消它。
+                    self._interrupt_flag.clear()
+            if _stale:
+                self._publish_eof()
+                _complete_action(_action_id, text, 0, interrupted=True)
+                continue
             synth_thread = None
             # Set on every exit path. The stop/interrupt flags are not enough to
             # release the synth thread: if the consumer dies on an exception,
@@ -568,9 +602,10 @@ class _TTSNode(Node):
                 # made this always False, so an interrupted utterance reported ACP
                 # "completed" instead of "cancelled".
                 was_interrupted = self._interrupt_flag.is_set()
-                # Clear interrupt flag after utterance is done (interrupted or complete)
+                # 这里刻意不再 clear()。flag 的装载/解除只在出队时、_interrupt_lock
+                # 下进行；在这条路径上也清一次会和并发的 interrupt() 抢跑，把信号
+                # 丢给下一句。
                 if was_interrupted:
-                    self._interrupt_flag.clear()
                     log.info(f"[tts] utterance interrupted after {frames_sent} frames")
                 else:
                     log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames) in {_time.monotonic() - t_start:.2f}s")

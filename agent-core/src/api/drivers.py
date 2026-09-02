@@ -4,7 +4,11 @@ Manifest stored in SQLite config DB (key: 'drivers'). Populated via registry syn
 """
 
 import asyncio
+import contextlib
+import fcntl
 import os
+import threading
+import time
 from typing import Optional
 
 import fastapi
@@ -79,6 +83,157 @@ def _clear_deploy_log(driver_id: str):
     _deploy_logs.pop(driver_id, None)
 
 
+# ── Host compose file mutation ─────────────────────────────────────────────
+#
+# The host compose file has two independent writers: this module (merging each
+# image's deploy/service.yml fragment) and deploy/restart/entrypoint.sh (swapping
+# agent-core's image tag during a self-update). Neither used to lock, and both
+# wrote with a plain open(...,'w') — which truncates at open and flushes at
+# close, with no truncate in between. Two overlapping writers therefore left the
+# shorter document at offset 0 followed by the tail of the longer one, i.e. a
+# file that no YAML parser accepts and that nothing could repair afterwards
+# (every retry died in safe_load before it could write).
+#
+# Two deploys landing in the same second is not hypothetical: it is what a
+# double-clicked or retried deploy in the console does, since the
+# already-running-same-image guard only short-circuits a container that is
+# already up.
+
+_COMPOSE_LOCK_NAME = '.compose.lock'
+
+
+@contextlib.contextmanager
+def _compose_lock(compose_dir: str, timeout: float = 120.0):
+    """Hold an exclusive lock over the host compose file for the whole RMW cycle.
+
+    The lock file lives in COMPOSE_DIR, which is bind-mounted into both this
+    container and the restart helper, so both contend on one host inode.
+    deploy/restart/entrypoint.sh takes the same lock by name — keep them in sync.
+    """
+    lock_path = os.path.join(compose_dir, _COMPOSE_LOCK_NAME)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f'timed out after {timeout:.0f}s waiting for {lock_path}; '
+                        'another deploy or an agent-core self-update is in progress'
+                    )
+                time.sleep(0.2)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _merge_service_into_compose(compose_file: str, service_def: dict) -> tuple[bool, str]:
+    """Merge a service fragment into the host compose file under lock.
+
+    Returns (ok, error). On any doubt about the existing file this refuses to
+    write rather than guessing: a compose we cannot read is a compose whose other
+    services we cannot preserve, and silently dropping them is how agent-core
+    disappeared from the file on orin6.
+    """
+    import yaml
+
+    compose_dir = os.path.dirname(compose_file) or '.'
+    with _compose_lock(compose_dir):
+        try:
+            with open(compose_file) as f:
+                raw = f.read()
+        except FileNotFoundError:
+            # Genuine fresh install — install.sh has not run yet.
+            raw = ''
+            existing: dict = {}
+        else:
+            # An existing-but-empty file is NOT a fresh install; it is a
+            # truncated read or a damaged file. `safe_load(...) or {}` used to
+            # turn this into "no other services exist" and write a compose
+            # containing only the service being deployed.
+            if not raw.strip():
+                return False, f'{compose_file} exists but is empty — refusing to overwrite'
+            try:
+                loaded = yaml.safe_load(raw)
+            except yaml.YAMLError as e:
+                return False, f'{compose_file} is not valid YAML, refusing to overwrite: {e}'
+            if not isinstance(loaded, dict):
+                return False, f'{compose_file} is not a mapping, refusing to overwrite'
+            existing = loaded
+
+        services = existing.setdefault('services', {})
+        if not isinstance(services, dict):
+            return False, f'{compose_file}: services is not a mapping, refusing to overwrite'
+
+        preserved = set(services)
+        services.update(service_def)
+
+        text = yaml.dump(existing, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+        # Re-parse what we are about to write and confirm every service we
+        # started with survived. Cheap insurance: corruption here is otherwise
+        # invisible until the next `docker compose` call, by which point the
+        # last good copy is gone.
+        try:
+            check = yaml.safe_load(text) or {}
+        except yaml.YAMLError as e:
+            return False, f'refusing to write unparseable compose: {e}'
+        written = set((check.get('services') or {}))
+        missing = preserved - written
+        if missing:
+            return False, f'refusing to write: would drop service(s) {sorted(missing)}'
+
+        # Keep the last good copy before replacing.
+        if raw:
+            try:
+                with open(compose_file + '.bak', 'w') as f:
+                    f.write(raw)
+            except OSError as e:
+                return False, f'could not write backup {compose_file}.bak: {e}'
+
+        # Atomic replace: a concurrent reader sees either the old or the new
+        # file, never a half-written one.
+        tmp = compose_file + '.tmp'
+        with open(tmp, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, compose_file)
+
+    return True, ''
+
+
+# ── Per-driver in-flight guard ─────────────────────────────────────────────
+
+_deploy_inflight: set[str] = set()
+_deploy_inflight_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _deploy_slot(driver_id: str):
+    """Reject a second concurrent deploy of the same driver.
+
+    Yields True if this call owns the slot, False if a deploy is already running.
+    """
+    with _deploy_inflight_lock:
+        owned = driver_id not in _deploy_inflight
+        if owned:
+            _deploy_inflight.add(driver_id)
+    try:
+        yield owned
+    finally:
+        if owned:
+            with _deploy_inflight_lock:
+                _deploy_inflight.discard(driver_id)
+
+
 def _get_status_sync(driver_id: str, container_name_override: str = '') -> dict:
     try:
         client = _docker()
@@ -103,6 +258,22 @@ def _get_status_sync(driver_id: str, container_name_override: str = '') -> dict:
 
 
 def _deploy_sync(driver: dict) -> dict:
+    """Deploy a driver, rejecting a second concurrent deploy of the same driver.
+
+    The console retries and double-clicks; two deploys of one driver racing each
+    other is what corrupted the host compose file on orin6.
+    """
+    with _deploy_slot(driver['id']) as owned:
+        if not owned:
+            return {
+                'status':  'deploying',
+                'message': 'a deploy for this driver is already in progress',
+                'skipped': True,
+            }
+        return _deploy_sync_inner(driver)
+
+
+def _deploy_sync_inner(driver: dict) -> dict:
     """Deploy a driver/perception container via docker compose.
 
     Extracts service.yml from the target image and merges it into the host
@@ -184,17 +355,18 @@ def _deploy_sync(driver: dict) -> dict:
         'options': {'max-size': LOG_MAX_SIZE, 'max-file': LOG_MAX_FILE},
     })
 
-    # Read existing compose (or create minimal)
+    # Merge into the host compose under lock, atomically. Bail out before
+    # touching any container if the existing file cannot be read safely — a
+    # failed merge that still removed the old container would leave the driver
+    # both stopped and undeployable.
+    ok, err = False, ''
     try:
-        with open(compose_file) as f:
-            compose = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        compose = {'services': {}}
-
-    compose.setdefault('services', {}).update(service_def)
-
-    with open(compose_file, 'w') as f:
-        yaml.dump(compose, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        ok, err = _merge_service_into_compose(compose_file, service_def)
+    except TimeoutError as e:
+        err = str(e)
+    if not ok:
+        _log_deploy(driver['id'], f'[compose] {err}')
+        return {'status': 'error', 'error': err}
 
     # Remove old container if it exists (may be from legacy docker run)
     try:

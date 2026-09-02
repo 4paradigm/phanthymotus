@@ -182,6 +182,16 @@ async def drain_steering() -> list[dict]:
     return items
 
 
+def has_steering() -> bool:
+    """steering_queue 里有没有待处理的用户消息 —— 只看，不取走。
+
+    ACP barrier 用它做 barge-in 检测：steer 模式（默认）下 busy 时的用户消息
+    只入队、不 set cancel_event，barrier 光靠 cancel_event 醒不过来。
+    drain_steering() 会把消息取走，barrier 里不能用。
+    """
+    return not _steering_queue.empty() or bool(_priority_pending)
+
+
 def defer_priority(events: list[dict]) -> None:
     """Queue events for isolated follow-up turns after the current turn."""
     _priority_pending.extend(events)

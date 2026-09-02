@@ -397,9 +397,13 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn("deploy/ros-base/audio_msgs", dockerfile)
         self.assertIn("COPY actucore/main.py", dockerfile)
         self.assertIn("COPY actucore/utils/", dockerfile)
+        self.assertIn(
+            "COPY perception/utils/logsafe.py /work/logsafe.py",
+            dockerfile,
+        )
         self.assertIn("COPY actucore/deploy/     /deploy/", dockerfile)
         self.assertIn("echo /work", dockerfile)
-        self.assertIn('python3 -c "from utils import logsafe"', dockerfile)
+        self.assertIn('python3 -c "import logsafe"', dockerfile)
 
     def test_every_python_process_installs_the_atomic_log_writer(self):
         sources = [
@@ -428,15 +432,12 @@ class NavigationContractTest(unittest.TestCase):
         ]
         for source in sources:
             content = source.read_text(encoding="utf-8")
-            self.assertIn("from utils import logsafe", content)
+            self.assertIn("import logsafe", content)
             self.assertIn("logsafe.install()", content)
             self.assertLess(
                 content.index("logsafe.install()"), content.index("import rclpy")
             )
-        self.assertEqual(
-            (ACTUCORE_ROOT / "utils" / "logsafe.py").read_bytes(),
-            (ACTUCORE_ROOT.parent / "perception" / "utils" / "logsafe.py").read_bytes(),
-        )
+        self.assertFalse((ACTUCORE_ROOT / "utils" / "logsafe.py").exists())
 
     def test_navigation_base_owns_locked_third_party_builds(self):
         base_dockerfile = (

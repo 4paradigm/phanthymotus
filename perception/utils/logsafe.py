@@ -43,7 +43,9 @@ driver repo are separate contexts):
     phanthymotus/perception/utils/logsafe.py
     phanthymotus-driver/common/logsafe.py
 
-Keep them identical; `sha256sum` all three when changing one.
+Keep them identical; `sha256sum` all three when changing one. `actucore` does not
+add a fourth: its build context is the repo root, so its Dockerfile copies this
+very file to /work/logsafe.py.
 """
 
 from __future__ import annotations

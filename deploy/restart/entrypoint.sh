@@ -28,52 +28,91 @@ if [ ! -f /tmp/new-compose.yml ]; then
 fi
 
 # ── Step 2: Update compose file ──────────────────────────────────────────────
-# Strategy: if other services exist in current compose, preserve them and only
-# replace the target service definition. Otherwise use extracted file directly.
+# Merge the target service's new definition into the existing compose, preserving
+# every other service. Held under the same lock agent-core's driver deploy takes
+# (agent-core/src/api/drivers.py :: _compose_lock) — both write this one
+# host-mounted file, and without the lock two overlapping open(...,'w') writers
+# leave a truncated document that no parser accepts.
+#
+# The old code had an `else` branch that shutil.copy2'd the image's template over
+# the host compose whenever it saw no other services — including when it read a
+# momentarily-truncated file. That silently deleted every other service. There is
+# no wholesale-overwrite path any more: a compose we cannot parse aborts the
+# upgrade instead of being replaced.
 
-if [ -f "${COMPOSE_FILE}" ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "${COMPOSE_FILE}" /tmp/new-compose.yml "${NEW_IMAGE}" "${SERVICE}" <<'PY'
-import sys, yaml
+LOCK_FILE="${COMPOSE_DIR}/.compose.lock"
+exec 9>"${LOCK_FILE}"
+if ! flock -w 120 9; then
+    echo "[restart] ERROR: timed out waiting for ${LOCK_FILE}; a driver deploy is in progress"
+    exit 1
+fi
+
+python3 - "${COMPOSE_FILE}" /tmp/new-compose.yml "${NEW_IMAGE}" "${SERVICE}" <<'PY'
+import os, sys, yaml
 
 compose_path, new_path, new_image, service = sys.argv[1:5]
 
-with open(compose_path) as f:
-    existing = yaml.safe_load(f) or {}
+
+def die(msg):
+    sys.stderr.write(f'[restart] ERROR: {msg}\n')
+    sys.exit(1)
+
 
 with open(new_path) as f:
     new = yaml.safe_load(f) or {}
+new_services = new.get('services') or {}
+if service not in new_services:
+    die(f'{new_path} has no service {service!r}')
 
-existing_services = existing.get('services', {})
-new_services = new.get('services', {})
-
-# Check if there are other services beyond the target one
-other_services = {k: v for k, v in existing_services.items() if k != service}
-
-if other_services and service in new_services:
-    # Preserve other services, replace target service with new definition
-    new_services[service]['image'] = new_image
-    existing_services[service] = new_services[service]
-    existing['services'] = existing_services
-    with open(compose_path, 'w') as f:
-        yaml.dump(existing, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-else:
-    # No other services — use extracted compose directly (same as install.sh)
-    import shutil
-    shutil.copy2(new_path, compose_path)
-    # Replace __IMAGE__ placeholder and any existing image line for the service
+try:
     with open(compose_path) as f:
-        content = f.read()
-    content = content.replace('__IMAGE__', new_image)
-    with open(compose_path, 'w') as f:
-        f.write(content)
+        raw = f.read()
+except FileNotFoundError:
+    # Genuine fresh install — nothing to preserve.
+    raw, existing = '', {}
+else:
+    # Existing-but-empty means truncated or damaged, not fresh.
+    if not raw.strip():
+        die(f'{compose_path} exists but is empty — refusing to overwrite')
+    try:
+        existing = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        die(f'{compose_path} is not valid YAML, refusing to overwrite: {e}')
+    if not isinstance(existing, dict):
+        die(f'{compose_path} is not a mapping, refusing to overwrite')
+
+existing_services = existing.setdefault('services', {})
+if not isinstance(existing_services, dict):
+    die(f'{compose_path}: services is not a mapping, refusing to overwrite')
+
+preserved = set(existing_services)
+new_services[service]['image'] = new_image
+existing_services[service] = new_services[service]
+
+text = yaml.dump(existing, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+# Confirm the result parses and kept every service we started with.
+try:
+    check = yaml.safe_load(text) or {}
+except yaml.YAMLError as e:
+    die(f'refusing to write unparseable compose: {e}')
+missing = preserved - set(check.get('services') or {})
+if missing:
+    die(f'refusing to write: would drop service(s) {sorted(missing)}')
+
+if raw:
+    with open(compose_path + '.bak', 'w') as f:
+        f.write(raw)
+
+tmp = compose_path + '.tmp'
+with open(tmp, 'w') as f:
+    f.write(text)
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(tmp, compose_path)
 PY
-else
-    # No existing compose or no python3 — use extracted file with sed (same as install.sh)
-    cp /tmp/new-compose.yml "${COMPOSE_FILE}"
-    sed -i "s|image:.*__IMAGE__.*|image: ${NEW_IMAGE}|" "${COMPOSE_FILE}"
-    # Also replace any existing image line under the service block
-    sed -i "/^  ${SERVICE}:/,/^  [^ ]/{s|image:.*|image: ${NEW_IMAGE}|}" "${COMPOSE_FILE}"
-fi
+
+flock -u 9
 
 echo "[restart] compose file updated"
 

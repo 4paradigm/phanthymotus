@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from utils import logsafe
+import logsafe
 
 logsafe.install()
 

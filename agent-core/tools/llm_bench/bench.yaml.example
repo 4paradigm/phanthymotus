@@ -1,0 +1,63 @@
+# llm_bench 配置模板 —— 复制成 bench.yaml 再改
+#
+#   cp bench.yaml.example /opt/phanthy-motus/data/bench.yaml
+#   chmod 600 /opt/phanthy-motus/data/bench.yaml
+#
+# 所有配置（含密钥）都在这一个文件里。bench.yaml 已被 .gitignore 挡住，
+# 只有本模板进库。
+#
+# 机器人上 /opt/phanthy-motus/data/ 就是容器内的 /work/resource/，所以运行时
+#   --config /work/resource/bench.yaml
+
+corpus:
+  dir: resource/llm_data      # agent-core 自己的请求日志，由 src/llm_logger.py 写出
+  count: 50                   # 样本条数
+  # trace（默认）= 按整条 trace 取并保留轮次顺序，复现生产「每轮在上一轮 prompt
+  #   上追加」的形态。缓存率只有这样才可信：同 trace 相邻请求的消息前缀重叠中位
+  #   是 93.3%，而 even 打散后只剩 40.0%。
+  # even = 跨越整个文件均匀取，覆盖尽可能杂的 prompt 规模。只关心延迟时可用，
+  #   但测不出真实缓存率。
+  # recent / random 也可用。
+  sampling: trace
+  seed: 42                    # 仅 random 用，保证可复现
+  min_messages: 2             # 过滤退化样本
+
+request:
+  max_tokens: 10240           # 与生产 src/client/llm.py 一致
+  timeout_s: 180
+  extra_body:
+    # 生产在 think_mode=false 时会带这个（src/client/llm.py:136-139）
+    chat_template_kwargs:
+      enable_thinking: false
+
+run:
+  # 只跑一轮，每条 payload 每组各请求一次。总请求数 = count × 组数。
+  # 不做预热轮/重复轮：重放同一条 payload 量的是「同一个请求重发」，前缀缓存
+  # 必然命中，既不代表真实负载，也会把缓存数字污染成接近 100%。
+  order: rotate               # 逐条轮换组顺序，抵消时段漂移和「谁先跑吃冷缓存」
+  # 同一条 payload 的各组是否并行请求（payload 之间始终串行）。
+  # false（默认）= 各组互不干扰，绝对延迟最准，但墙钟时间是组数倍。
+  # true = 快 N 倍，且时段漂移被彻底消除（各组同时拿到同一条 payload）；
+  #   但各组共用上行链路或同一供应商配额时会互相争资源，绝对延迟偏高
+  #   —— 组间相对比较仍有效，绝对值别拿去和串行结果对比。
+  parallel: false
+  stop_after_consecutive_failures: 0   # 0 = 不早停；设 N 则某组连续失败 N 次后跳过该组
+
+# 每组一个 (url, key, model)。一个入口配多个 models 会自动展开成多组，
+# 组名 {name}/{model}，不必重复写 url 和 key。
+groups:
+  - name: router
+    url: https://router.phanthy.com/v1
+    key: sk-换成真的密钥
+    models: [glm-5.3, zai-org/glm-5.3]
+
+  - name: ppio
+    url: https://api.ppio.com/openai
+    key: sk_-换成真的密钥
+    models: [zai-org/glm-5.3]
+
+# 把 ConfigDB 里当前生产配置也加为一组 baseline（组名 current/{model}），
+# 用来回答「换过去会不会比现在差」。它的密钥从 ConfigDB 读，不用写在这里。
+# 命令行 --include-current / --no-include-current 可覆盖这一项。
+# 用它时记得给容器带 -e DB_PATH=/work/resource/data.db
+include_current: true

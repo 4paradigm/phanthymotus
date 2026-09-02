@@ -79,6 +79,36 @@ def _build_system_tools(named_functions: list[tuple[str, callable]]) -> dict:
 
 # ── History helpers ────────────────────────────────────────────────────────────
 
+def _scrub(message_list: list[dict]) -> list[dict]:
+    """丢弃结构非法的 tool_call，以及随之失去归属的 tool 结果。
+
+    glm 偶发在正常 tool_call 后追加一条 id/name 均为空串的条目。它一旦落盘，
+    历史续跑会把它一路带回去，之后每次请求都被服务端 400
+    （messages[N].tool_calls[M].function missing required field "name"），
+    直到那一轮从 tier1/tier2 里滚出去为止——表现就是「这台机器总是报错」。
+    """
+    from client.llm import _valid_tool_call
+    orphaned: set = set()
+    out: list[dict] = []
+    for msg in message_list:
+        if msg.get('role') == 'assistant' and msg.get('tool_calls'):
+            good = [tc for tc in msg['tool_calls'] if _valid_tool_call(tc)]
+            if len(good) != len(msg['tool_calls']):
+                orphaned.update(
+                    tc.get('id') for tc in msg['tool_calls']
+                    if isinstance(tc, dict) and not _valid_tool_call(tc)
+                )
+                msg = {k: v for k, v in msg.items() if k != 'tool_calls'}
+                if good:
+                    msg['tool_calls'] = good
+                elif not msg.get('content'):
+                    continue  # 既无文本也无有效调用，整条丢掉
+        elif msg.get('role') == 'tool' and msg.get('tool_call_id') in orphaned:
+            continue
+        out.append(msg)
+    return out
+
+
 def _sanitize(message_list: list[dict]) -> list[dict]:
     """移除末尾未被 tool 结果回应的 tool_calls（避免 API 报错）。"""
     responded_ids: set[str] = set()
@@ -165,15 +195,124 @@ def _missed_channel_reply_warning(trigger_event: dict, replied_message_ids: set[
             f'{json.dumps(missed, ensure_ascii=False)}')
 
 
+def _acp_barrier_log(name: str, acp_result: dict | None) -> None:
+    """记录 barrier 结果。timeout 与 completed 走同一条路（都清 pending 并放行），
+    所以不打这一行的话，一次静默超时看起来跟成功完全一样 —— ACP 回调发不出去
+    （自签证书、AGENT_CORE_URL 配错）时无从归因。"""
+    if not isinstance(acp_result, dict):
+        return
+    status = acp_result.get('status')
+    if status in ('timeout', 'cancelled', 'barge_in'):
+        actions = acp_result.get('actions')
+        detail = f": {actions}" if actions else ''
+        print(f"[acp] barrier {status} before {name}{detail}")
+
+
+# barrier 等待期间检查 steering_queue 的间隔。相对于它守护的动作时长（TTS 讲解
+# 数十秒、导航更久）足够细，又不会把事件循环打满。
+_STEERING_POLL_S = 0.1
+
+
+# finish 结束 turn 前必须等 pending 动作完成，否则 speak → finish 会在音频播完前
+# 结束本轮 —— 讲解被截断。其余系统工具不挡：task_update 等应能在播放期间调用，
+# 否则每站都要多等一整段音频。
+_ACP_BARRIER_SYSTEM_TOOLS = frozenset({'finish'})
+
+
+def _sys_tool_needs_barrier(name: str) -> bool:
+    return name in _ACP_BARRIER_SYSTEM_TOOLS
+
+
+async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
+                       interrupt_fallback=None,
+                       tool_name: str | None = None) -> dict | None:
+    """有 pending ACP 动作时等待其完成，并记录非正常结果。无 pending 则直接返回。
+
+    `barge_in=True` 时，等待还会被新的用户消息唤醒。这条路只给 finish 用，因为
+    只有 finish 的 barrier 会横跨整段播放：`cancel_event` 仅在 interrupt /
+    followup 模式下置位（collector.py 的 `_interrupt_mode` 分支），默认的 steer
+    模式把 busy 期间的用户消息塞进 steering_queue 就完事、不动 cancel_event，而
+    finish 检测在 steering drain（`:1377`）之前就 break 了 —— 队列里的消息在本轮
+    永远等不到消费，用户要一直等到讲解播完。唤醒后中止播放并放行，turn 正常结束，
+    消息由 `_flush_all_pending()` 转成下一轮的触发事件；这正是加 barrier 之前的打
+    断行为，只是不再依赖 "finish 提前返回" 这个副作用。
+
+    turn 中段的 mcp 工具 barrier 不走这条：那里 steering 的语义是注入当前 turn
+    （`:1377` 之后就会 drain），不是中止动作。
+    """
+    if not mcp_client.get_pending_actions():
+        return None
+
+    if not barge_in:
+        result = await mcp_client.await_pending(
+            cancel_event, timeout=120, tool_name=tool_name
+        )
+        _acp_barrier_log(name, result)
+        return result
+
+    barrier = asyncio.create_task(mcp_client.await_pending(cancel_event, timeout=120))
+    steering = asyncio.create_task(_wait_for_steering())
+    try:
+        done, _ = await asyncio.wait(
+            [barrier, steering], return_when=asyncio.FIRST_COMPLETED)
+        if barrier in done:
+            result = barrier.result()
+        else:
+            result = await _abort_pending_for_barge_in(interrupt_fallback)
+    finally:
+        # Reap, don't just request: cancel() alone leaves these pending until the
+        # loop resumes them, and dropping the reference here is what orphaned
+        # await_pending's inner tasks on every barge-in.
+        await mcp_client.cancel_and_reap((barrier, steering))
+    _acp_barrier_log(name, result)
+    return result
+
+
+async def _wait_for_steering(poll_s: float = _STEERING_POLL_S) -> None:
+    """轮询到 steering_queue 非空为止。asyncio.Queue 没有 "非破坏性等待"，
+    而 drain_steering() 会把消息取走 —— 取走了本轮 finish 之后就没人再放回去。"""
+    while not collector.has_steering():
+        await asyncio.sleep(poll_s)
+
+
+async def _abort_pending_for_barge_in(interrupt_fallback=None) -> dict:
+    """用户在播放期间说话：停掉正在进行的输出，清 pending，放 finish 过去。
+
+    `interrupt_fallback` 是没有 on_interrupt_all 绑定时的兜底（硬编码找 tts/loco），
+    与 run_forever 的 TurnCancelled 路径共用同一套逻辑。
+    """
+    import hooks
+    actions = mcp_client.get_pending_actions()
+    fired = await hooks.fire('on_interrupt_all')
+    if not fired and interrupt_fallback is not None:
+        await interrupt_fallback()
+    for aid in actions:
+        mcp_client._pending_actions.pop(aid, None)
+        mcp_client._pending_results.pop(aid, None)
+        mcp_client._pending_timeouts.pop(aid, None)
+        mcp_client._pending_tools.pop(aid, None)
+    return {"status": "barge_in", "actions": actions}
+
+
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 
+# viewer 是已注册的合法 ACL 用户（不是可以随便伪造身份的群里 Bot），"只读" 的定义
+# 可以松一档：纯信息检索、没有副作用的系统工具（联网搜索、历史/记忆检索、原始输入
+# 查询）都算读，不算 mutate。Bot 门禁维持只给 finish，因为群里任何人都能顶一个
+# Bot 身份，是更弱的信任边界。
+_VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
+    'WebSearch', 'search_history', 'memory_recall', 'raw_input_info',
+})
 
-def _restricted_channel_tool_allowed(name: str) -> bool:
+
+def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True) -> bool:
     """Shared allow-list for turns that must not mutate or actuate: untrusted-bot
     Channel turns, and (see _viewer_channel_restricted) viewer-role human Channel
-    turns. May read state and reply, nothing else."""
+    turns. May read state and reply, nothing else — viewer additionally gets the
+    read-only system tools (search, history/memory recall)."""
     if not name.startswith('mcp__'):
-        return name in _BOT_READ_ONLY_SYSTEM_TOOLS
+        allowed = _BOT_READ_ONLY_SYSTEM_TOOLS if bot_restricted else _VIEWER_READ_ONLY_SYSTEM_TOOLS
+        return name in allowed
     if name == 'mcp__channel__channel_reply':
         return True
     parts = name.split('__')
@@ -696,25 +835,49 @@ class Event:
             return
 
         # Fallback: hardcoded lookup (no hook registered)
+        #
+        # registry[mcp_id]['tools'] holds *bare* plugin names ('tts', 'loco') --
+        # mcp_client._connect_one does `tools.append(tool['name'])`. This used to
+        # hand those straight to call_tool(), which parses its argument as a full
+        # `mcp__<id>__<tool>` name: it split 'loco' into one segment, failed the
+        # `len(parts) != 3` check and returned the *string* '工具名格式错误: loco'.
+        # A returned string is not an exception, so the error check below never
+        # fired and the log still announced "interrupted N active output(s)" --
+        # while nothing had been interrupted, on any robot.
+        #
+        # call_tool_direct takes (mcp_id, bare_tool_name) and is the intended entry
+        # point for hooks: it also skips the ACP barrier, which an interrupt must.
+        #
+        # Deliberately not interrupting switch_mode: aborting a posture change
+        # partway is how a controlled descent becomes a fall, so a running
+        # stand-up/lie-down is left to finish.
         tasks = []
         for mcp_id, info in mcp_client.registry.items():
+            if not info.get('online'):
+                continue
             tools = info.get('tools', [])
-            for t in tools:
-                short_name = t.split('__')[-1] if '__' in t else t
-                if short_name == 'tts':
-                    tasks.append(mcp_client.call_tool(t, {'action': 'interrupt'}))
-                    break
-            for t in tools:
-                short_name = t.split('__')[-1] if '__' in t else t
-                if short_name == 'loco':
-                    tasks.append(mcp_client.call_tool(t, {'action': 'stop_move'}))
-                    break
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for i, r in enumerate(results):
-                if isinstance(r, Exception):
-                    print(f'[decision] interrupt_active_outputs: task {i} failed: {r}')
-            print(f'[decision] interrupted {len(tasks)} active output(s) (fallback)')
+            for short_name, action in (('tts', 'interrupt'), ('loco', 'stop_move')):
+                if short_name in tools:
+                    tasks.append((f'{mcp_id}:{short_name}',
+                                  mcp_client.call_tool_direct(mcp_id, short_name,
+                                                              {'action': action})))
+        if not tasks:
+            print('[decision] interrupt_active_outputs: no tts/loco tool registered')
+            return
+
+        labels = [label for label, _ in tasks]
+        results = await asyncio.gather(*[coro for _, coro in tasks],
+                                       return_exceptions=True)
+        ok = 0
+        for label, r in zip(labels, results):
+            if isinstance(r, Exception):
+                print(f'[decision] interrupt_active_outputs: {label} raised: {r}')
+            elif isinstance(r, dict) and r.get('error'):
+                print(f'[decision] interrupt_active_outputs: {label} failed: {r["error"]}')
+            else:
+                ok += 1
+        print(f'[decision] interrupted {ok}/{len(tasks)} active output(s) (fallback)')
+
 
     # ── 主循环 ───────────────────────────────────────────────────────────────
 
@@ -818,7 +981,7 @@ class Event:
             history.extend(_degrade_turn(turn))
         for turn in recent:
             history.extend(turn)
-        return _sanitize(history)
+        return _sanitize(_scrub(history))
 
     async def _maybe_compress(self):
         """检查历史是否需要压缩（基于轮数或字符数），压缩旧轮次为 rolling summary。"""
@@ -929,11 +1092,11 @@ class Event:
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools
-                if _restricted_channel_tool_allowed(tool['schema']['name'])
+                if _restricted_channel_tool_allowed(tool['schema']['name'], bot_restricted=bot_restricted)
             ]
             bound_schemas = [
                 schema for schema in bound_schemas
-                if _restricted_channel_tool_allowed(schema['name'])
+                if _restricted_channel_tool_allowed(schema['name'], bot_restricted=bot_restricted)
             ]
         all_tool_list = (
             [{'type': 'function', 'function': t['schema']} for t in system_tools]
@@ -983,7 +1146,7 @@ class Event:
             # ── 构建分层 prompt ────────────────────────────────────────────
             history = [] if bot_restricted else self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
-            current_history = history + _sanitize(turn_messages)
+            current_history = history + _sanitize(_scrub(turn_messages))
 
             if round_idx == 0:
                 # 首轮：加入 L4 触发事件（含 L2 动态快照）
@@ -1055,7 +1218,7 @@ class Event:
                         self._turns = self._turns[-2:]
                         # 重建 history 并重试（复用冻结的 system）
                         history = self._build_history()
-                        current_history = history + _sanitize(turn_messages)
+                        current_history = history + _sanitize(_scrub(turn_messages))
                         messages = prompt_mod.build(
                             system_msg    = frozen_system,
                             message_list  = current_history,
@@ -1164,7 +1327,7 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if tool_restricted and not _restricted_channel_tool_allowed(name):
+                if tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
@@ -1177,15 +1340,21 @@ class Event:
                         'and cannot send files.'
                     )
                 elif name in self._sys_tools:
+                    # ACP barrier: finish 之前等音频播完（见 _ACP_BARRIER_SYSTEM_TOOLS）。
+                    # 等待期间用户开口要能立刻打断 —— 故 barge_in=True。
+                    if _sys_tool_needs_barrier(name):
+                        await _acp_barrier(
+                            name, cancel_event, barge_in=True,
+                            interrupt_fallback=self._interrupt_active_outputs)
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
-                    # ACP barrier: only serialize unfinished work on this tool.
-                    if mcp_client.get_pending_actions() and _needs_barrier(name, args):
+                    # ACP barrier: serialize only unfinished work on this tool.
+                    if _needs_barrier(name, args):
                         _mcp_id, pending_tool, _action, _meta = _mcp_call_context(
                             name, args
                         )
-                        await mcp_client.await_pending(
-                            cancel_event, timeout=120, tool_name=pending_tool
+                        await _acp_barrier(
+                            name, cancel_event, tool_name=pending_tool
                         )
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event

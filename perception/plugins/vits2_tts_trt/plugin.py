@@ -121,8 +121,10 @@ def _error_chain(error: BaseException) -> str:
 
     The interesting part is usually the cause, not the wrapper: "TensorRT is not
     available in this runtime" says nothing, while
-    "... : libnvdla_compiler.so: file too short" points straight at a container
-    started without the nvidia runtime.
+    "... : libnvdla_compiler.so: cannot open shared object file" narrows it to two
+    container-level causes — no `runtime: nvidia` (see deploy/service.yml), or a
+    host BSP missing nvidia-l4t-dla-compiler. The image's dla-fallback covers the
+    second, so in practice this error now means the first.
     """
     parts = []
     seen = set()
@@ -145,6 +147,21 @@ def _release_actions(items) -> None:
 def _node_suffix(key: str) -> str:
     """Turn an instance key into a ROS-node-name-safe suffix."""
     return key.replace("/", "_").replace("-", "_")
+
+
+def _unpack_utterance(item) -> tuple:
+    """Normalise a queue item to (text, action_id, generation).
+
+    Accepts the older 2-tuple and bare-string shapes so a queue built by other
+    code paths still works; those carry no generation, and `None` means "cannot
+    be stale" so such an item is always played rather than silently dropped.
+    """
+    if isinstance(item, tuple):
+        text = str(item[0]) if item else ""
+        action_id = item[1] if len(item) >= 2 else ""
+        gen = item[2] if len(item) >= 3 else None
+        return text, action_id, gen
+    return str(item), "", None
 
 
 def _complete_action(
@@ -210,6 +227,14 @@ class _Vits2TTSNode(Node):
         self._worker_thread = None
         self._stop_event = threading.Event()
         self._interrupt_event = threading.Event()
+        # Generation counter, bumped by every interrupt. Each queued utterance
+        # carries the generation it was enqueued under, so the worker can tell
+        # "enqueued before the interrupt" (discard) from "enqueued after it"
+        # (play). _interrupt_event alone cannot: it is a sticky flag, and when an
+        # interrupt lands while nothing is playing there is no utterance loop to
+        # consume it, so it survives and swallows the *next* speak instead.
+        self._interrupt_lock = threading.Lock()
+        self._interrupt_gen = 0
         self._pub = self.create_publisher(AudioChunk, self._output_topic, _LOW_LAT_QOS)
         self._sub = (
             self.create_subscription(
@@ -242,10 +267,24 @@ class _Vits2TTSNode(Node):
         self._stop_event.set()
 
     def interrupt(self) -> dict:
-        """Cancel the active utterance and discard queued utterances."""
-        self._interrupt_event.set()
+        """Cancel the active utterance and discard queued utterances.
+
+        Safe to call when idle, and safe to call twice — the barge-in fallback in
+        agent-core and an explicit `tts(action=interrupt)` from the LLM routinely
+        both fire within a couple of seconds.
+        """
+        with self._interrupt_lock:
+            self._interrupt_gen += 1
+            # Bump and signal in one critical section, so an utterance enqueued
+            # under the new generation can never be armed by the worker before
+            # this set() lands and then be cancelled by it.
+            self._interrupt_event.set()
         cleared = self._complete_discarded_actions()
         return {"status": "interrupted", "cleared": cleared}
+
+    def _current_gen(self) -> int:
+        with self._interrupt_lock:
+            return self._interrupt_gen
 
     def _complete_discarded_actions(self) -> int:
         """Cancel queued MCP actions that will not reach the worker."""
@@ -255,10 +294,7 @@ class _Vits2TTSNode(Node):
                 item = self._text_queue.get_nowait()
             except queue.Empty:
                 break
-            if isinstance(item, tuple):
-                text, action_id = item
-            else:
-                text, action_id = str(item), ""
+            text, action_id, _gen = _unpack_utterance(item)
             discarded.append((text, action_id))
         for text, action_id in discarded:
             _complete_action(action_id, text, 0, interrupted=True)
@@ -267,7 +303,7 @@ class _Vits2TTSNode(Node):
     def enqueue(self, text: str, action_id: str = ""):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
-        self._text_queue.put((text, action_id))
+        self._text_queue.put((text, action_id, self._current_gen()))
 
     def _text_callback(self, message: String):
         if self.state != "running":
@@ -277,7 +313,7 @@ class _Vits2TTSNode(Node):
         except Exception:
             text = message.data.strip()
         if text:
-            self._text_queue.put((text, ""))
+            self._text_queue.put((text, "", self._current_gen()))
 
     def _publish(self, pcm: bytes):
         message = AudioChunk()
@@ -335,12 +371,18 @@ class _Vits2TTSNode(Node):
                 item = self._text_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            if isinstance(item, tuple):
-                text, action_id = item
-            else:
-                text, action_id = str(item), ""
-            if self._interrupt_event.is_set():
-                self._interrupt_event.clear()
+            text, action_id, gen = _unpack_utterance(item)
+            # Discard only utterances that predate the latest interrupt. An
+            # interrupt that landed while this node was idle must not touch the
+            # next speak — that is what used to swallow a whole reply.
+            with self._interrupt_lock:
+                stale = gen is not None and gen < self._interrupt_gen
+                if not stale:
+                    # Arm for this utterance: whatever the last interrupt left
+                    # behind is spent, and only an interrupt from here on may
+                    # cancel it.
+                    self._interrupt_event.clear()
+            if stale:
                 self._publish_eof()
                 _complete_action(action_id, text, 0, interrupted=True)
                 continue
@@ -588,7 +630,10 @@ class _Vits2TTSNode(Node):
                         "[vits2_tts_trt] utterance interrupted after %d frames",
                         frames_sent,
                     )
-                self._interrupt_event.clear()
+                # Deliberately no _interrupt_event.clear() here. The flag is
+                # armed/disarmed at dequeue time under _interrupt_lock; clearing
+                # it on this path as well would race with a concurrent
+                # interrupt() and drop the signal for the utterance that follows.
             except Exception:
                 log.exception("[vits2_tts_trt] synthesis failed")
                 _complete_action(action_id, text, 0, interrupted=True)

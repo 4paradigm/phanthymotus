@@ -608,6 +608,27 @@ def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
     return action in actions_list
 
 
+async def cancel_and_reap(tasks) -> None:
+    """Cancel tasks and wait for the cancellation to actually be delivered.
+
+    `Task.cancel()` only *requests* cancellation — the task stays pending until
+    the loop gets to resume it and raise CancelledError inside it. Cancelling and
+    then dropping the reference is what filled the log with
+
+        Task was destroyed but it is pending!
+        task: <Task pending ... coro=<Event.wait() ...>>
+        task: <Task pending ... coro=<await_pending.<locals>._wait_all() ...>>
+
+    on every barge-in: the barrier's outer task and the inner `Event.wait()`
+    children of its `gather` were both abandoned mid-cancellation.
+    """
+    live = [t for t in tasks if not t.done()]
+    for task in live:
+        task.cancel()
+    if live:
+        await asyncio.gather(*live, return_exceptions=True)
+
+
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
                         tool_name: str | None = None) -> dict:
     """等待冲突工具的 pending actions；未给 tool_name 时保持全局等待。"""
@@ -634,13 +655,20 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
         if cancel_event:
             wait_task = asyncio.create_task(_wait_all())
             cancel_task = asyncio.create_task(cancel_event.wait())
-            done, pending = await asyncio.wait(
-                [wait_task, cancel_task],
-                timeout=effective_timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for p in pending:
-                p.cancel()
+            try:
+                done, pending = await asyncio.wait(
+                    [wait_task, cancel_task],
+                    timeout=effective_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                # Also runs when *this* coroutine is cancelled from outside, which
+                # is the common case: on barge-in `_acp_barrier` cancels the task
+                # running await_pending as soon as a steering message arrives.
+                # Without the finally, CancelledError propagated straight out and
+                # left _wait_all and its Event.wait() children orphaned — the
+                # "Task was destroyed but it is pending!" pair in the R1 logs.
+                await cancel_and_reap([wait_task, cancel_task])
             if cancel_task in done:
                 # 用户打断：清理所有 pending
                 for aid in aids:
@@ -692,13 +720,13 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
         wait_task = asyncio.create_task(_wait_all())
         if cancel_event:
             cancel_task = asyncio.create_task(cancel_event.wait())
-            done, pending = await asyncio.wait(
-                [wait_task, cancel_task], return_when=asyncio.FIRST_COMPLETED
-            )
-            for p in pending:
-                p.cancel()
+            try:
+                done, _pending = await asyncio.wait(
+                    [wait_task, cancel_task], return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                await cancel_and_reap([wait_task, cancel_task])
             if cancel_task in done:
-                wait_task.cancel()
                 raise asyncio.CancelledError()
         else:
             await wait_task

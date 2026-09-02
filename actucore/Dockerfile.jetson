@@ -33,6 +33,12 @@ COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
 COPY actucore/utils/      /work/utils/
 COPY actucore/config.yaml /work/config.yaml
+# Atomic-write stdout guard. The build context is the repo root, so this reuses
+# perception's copy instead of adding a fourth one to keep in sync — see the
+# DUPLICATION note in perception/utils/logsafe.py.
+COPY perception/utils/logsafe.py /work/logsafe.py
+# Agent Core reads /deploy/service.yml out of the image to merge the compose
+# fragment — dropping this COPY silently falls back to the legacy docker-run path.
 COPY actucore/deploy/     /deploy/
 
 EXPOSE 15730
@@ -44,7 +50,7 @@ RUN find /ros_ws/install /opt/nav2_ws/install /opt/ros_deps_ws/install \
       >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
     echo /work \
       >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
-    cd / && python3 -c "from utils import logsafe"
+    cd / && python3 -c "import logsafe"
 
 ENV LD_LIBRARY_PATH="/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/install/livox_ros_driver2/lib:/opt/fast_livo_ws/install/vikit_common/lib:/opt/fast_livo_ws/install/vikit_ros/lib:/opt/nav2_ws/install/lib:/opt/ros_deps_ws/install/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/g1_fast_livo2:/ros_ws/install/g1_segmented_controller:/ros_ws/install/g1_nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"

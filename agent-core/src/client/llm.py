@@ -14,15 +14,33 @@ LOG_PATH = pathlib.Path('./resource/log')
 
 
 async def _log_request(request: httpx.Request):
-    """httpx event hook: dump the real HTTP request body to disk for debugging."""
-    if request.content:
+    """httpx event hook: dump the real HTTP request body to disk for debugging.
+
+    这个钩子在请求发出前执行，任何异常都会中断发送；而 openai SDK 把非超时异常
+    一律包成 APIConnectionError('Connection error.')，于是一个写文件失败会伪装成
+    「网络不通」并触发三次重试。所以这里既要保证文件名合法（模型名可能带厂商前缀
+    的斜杠，如 zai-org/glm-5.2），也要整体吞掉异常——调试日志不该拖垮真实请求。
+    """
+    try:
+        if not request.content:
+            return
         body = json.loads(request.content)
-        model = body.get('model', 'unknown')
+        model = str(body.get('model', 'unknown')).replace('/', '_')
         path = LOG_PATH / f'llm_request_{model}.json'
         path.write_text(json.dumps(body, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(f'[llm] request log failed (ignored): {type(e).__name__}: {e}')
 
 
 # ── 错误分类 ──────────────────────────────────────────────────────────────────
+
+def _valid_tool_call(tc) -> bool:
+    """tool_call 结构是否能被服务端接受：id 与 function.name 都必须是非空串。"""
+    if not isinstance(tc, dict) or not tc.get('id'):
+        return False
+    fn = tc.get('function')
+    return isinstance(fn, dict) and bool(fn.get('name'))
+
 
 class LLMErrorKind:
     RATE_LIMIT      = 'rate_limit'       # 429
@@ -68,6 +86,11 @@ def _classify_error(e: Exception) -> tuple[str, float | None]:
         return LLMErrorKind.SERVER_ERROR, 3.0
 
     # 模型生成了非法 tool call（arguments 非 JSON）：可重试，下次可能正确
+    # 但如果服务端指名道姓地怪某条历史消息（messages[24].tool_calls[1]...），
+    # payload 每次都一样，重试只是把同一个 400 再撞两遍。
+    if status == 400 and 'messages[' in body_msg:
+        return LLMErrorKind.UNKNOWN, None
+
     if status == 400 and any(kw in body_msg for kw in (
         'json format', 'invalid_parameter', 'must be in json',
     )):
@@ -162,11 +185,14 @@ class Client():
                 # OpenAI SDK 可能生成 tool_calls: None，清理以避免下游迭代报错
                 if 'tool_calls' in msg and msg['tool_calls'] is None:
                     del msg['tool_calls']
-                # glm 有时返回 tool_calls 内部缺少必要字段，清理无效条目
+                # glm 有时在正常 tool_call 之后追加一条 id/name 都是空串的重复条目
+                # （{"id": "", "function": {"name": "", "arguments": "{}"}}）。字段是齐的，
+                # 所以只判断 key 存在会放过去；一旦进历史并落盘，之后每次请求都会被
+                # 服务端以 messages[N].tool_calls[M].function missing required field "name"
+                # 拒掉，重启续跑也还在。这里按「值非空」筛。
                 if 'tool_calls' in msg and isinstance(msg['tool_calls'], list):
                     msg['tool_calls'] = [
-                        tc for tc in msg['tool_calls']
-                        if isinstance(tc, dict) and 'function' in tc and 'name' in tc.get('function', {})
+                        tc for tc in msg['tool_calls'] if _valid_tool_call(tc)
                     ]
                     if not msg['tool_calls']:
                         del msg['tool_calls']
