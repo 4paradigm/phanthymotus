@@ -27,3 +27,7 @@ PERCEPTION_PCL_REPO=https://github.com/ros-perception/perception_pcl.git
 PERCEPTION_PCL_COMMIT=67a5c2ba4c4de3ca21c5cd495812a01ced3fb69a
 ROSBAG2_STORAGE_MCAP_REPO=https://github.com/ros-tooling/rosbag2_storage_mcap.git
 ROSBAG2_STORAGE_MCAP_COMMIT=c1c2159679921a4f4392f370172c28e7b3b01452
+MCAP_REPO=https://github.com/foxglove/mcap.git
+MCAP_COMMIT=dc6561d9ba867901709e36526dcf7f7359861e9c
+LZ4_REPO=https://github.com/lz4/lz4.git
+LZ4_COMMIT=d44371841a2f1728a3f36839fd4b7e872d0927d3

@@ -249,7 +249,8 @@ FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过 `@sha256` 固定该基础镜�
 `behaviortree_cpp_v3` / `bond_core` / `diagnostic_updater` / `pcl_ros` /
 `rosbag2_storage_mcap` 一起按锁定 SHA 自编。`navigation2` 钉在 **1.1.20**，与
 迁移前的 `ros-humble-navigation2=1.1.20-1jammy` 是同一个上游 release，运行行为
-不随打包形态变化。运行时加载 planner/controller/
+不随打包形态变化。`mcap_vendor` 间接使用的 MCAP/LZ4 也按其上游
+锁定 SHA 预先浅克隆，不在 CMake 构建中重复全量下载。运行时加载 planner/controller/
 behavior/bt_navigator/waypoint_follower + navfn、costmap 三层，
 以及卡片自带的 `g1_segmented_controller`；`nav2_bringup` 编译所需的轻量
 `navigation2` 元数据包也保留。amcl、map_server、DWB、rotation shim、

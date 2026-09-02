@@ -504,6 +504,15 @@ class NavigationContractTest(unittest.TestCase):
             base_dockerfile.index("git config --global"),
             base_dockerfile.index("WORKDIR /opt/ros_deps_ws/src"),
         )
+        for dependency in ("MCAP", "LZ4"):
+            self.assertIn(
+                f"-DFETCHCONTENT_SOURCE_DIR_{dependency}=", base_dockerfile
+            )
+            self.assertIn(
+                f"/opt/ros_deps_ws/vendor/{dependency.lower()}",
+                base_dockerfile,
+            )
+        self.assertIn("GIT_LFS_SKIP_SMUDGE=1 git checkout", base_dockerfile)
         self.assertGreater(
             base_dockerfile.rindex("--remove-section"),
             base_dockerfile.index("WORKDIR /opt/nav2_ws"),

@@ -63,6 +63,10 @@ ARG PERCEPTION_PCL_REPO=https://github.com/ros-perception/perception_pcl.git
 ARG PERCEPTION_PCL_COMMIT=67a5c2ba4c4de3ca21c5cd495812a01ced3fb69a
 ARG ROSBAG2_STORAGE_MCAP_REPO=https://github.com/ros-tooling/rosbag2_storage_mcap.git
 ARG ROSBAG2_STORAGE_MCAP_COMMIT=c1c2159679921a4f4392f370172c28e7b3b01452
+ARG MCAP_REPO=https://github.com/foxglove/mcap.git
+ARG MCAP_COMMIT=dc6561d9ba867901709e36526dcf7f7359861e9c
+ARG LZ4_REPO=https://github.com/lz4/lz4.git
+ARG LZ4_COMMIT=d44371841a2f1728a3f36839fd4b7e872d0927d3
 
 # 每个 revision 都必须是完整 40 位 SHA —— 分支名/短 SHA 会让镜像不可复现
 RUN for revision in \
@@ -78,7 +82,9 @@ RUN for revision in \
       "${LASER_GEOMETRY_COMMIT}" \
       "${PCL_MSGS_COMMIT}" \
       "${PERCEPTION_PCL_COMMIT}" \
-      "${ROSBAG2_STORAGE_MCAP_COMMIT}"; do \
+      "${ROSBAG2_STORAGE_MCAP_COMMIT}" \
+      "${MCAP_COMMIT}" \
+      "${LZ4_COMMIT}"; do \
       [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] || { \
         echo "source revision is not a full Git SHA: ${revision}" >&2; exit 2; \
       }; \
@@ -206,8 +212,8 @@ RUN git init perception_pcl && \
     test "$(git rev-parse HEAD)" = "${PERCEPTION_PCL_COMMIT}"
 
 # mcap 存储插件：录包用 `ros2 bag record -s mcap`，旧镜像是 apt 装的
-# ros-humble-rosbag2-storage-mcap，这里改源码。mcap_vendor 会用 FetchContent
-# 再去拉 mcap/lz4（SHA 由上游钉死），所以这一层也要走 GitHub 镜像。
+# ros-humble-rosbag2-storage-mcap，这里改源码。上游 mcap_vendor 还会通过
+# FetchContent 拉 mcap/lz4；先按同一 SHA 浅克隆，避免 CMake 再做全量嵌套 clone。
 RUN git init rosbag2_storage_mcap && \
     cd rosbag2_storage_mcap && \
     git remote add origin "${GIT_MIRROR_PREFIX}${ROSBAG2_STORAGE_MCAP_REPO}" && \
@@ -215,6 +221,19 @@ RUN git init rosbag2_storage_mcap && \
     git checkout --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "${ROSBAG2_STORAGE_MCAP_COMMIT}" && \
     touch rosbag2_storage_mcap_testdata/COLCON_IGNORE
+
+RUN git init /opt/ros_deps_ws/vendor/mcap && \
+    cd /opt/ros_deps_ws/vendor/mcap && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${MCAP_REPO}" && \
+    git fetch --depth 1 origin "${MCAP_COMMIT}" && \
+    GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${MCAP_COMMIT}" && \
+    git init /opt/ros_deps_ws/vendor/lz4 && \
+    cd /opt/ros_deps_ws/vendor/lz4 && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${LZ4_REPO}" && \
+    git fetch --depth 1 origin "${LZ4_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${LZ4_COMMIT}"
 
 WORKDIR /opt/ros_deps_ws
 RUN source /opt/ros/humble/install/setup.bash && \
@@ -250,7 +269,9 @@ RUN source /opt/ros/humble/install/setup.bash && \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_EXAMPLES=OFF \
           -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_TOOLS=OFF; \
+          -DBUILD_TOOLS=OFF \
+          -DFETCHCONTENT_SOURCE_DIR_MCAP=/opt/ros_deps_ws/vendor/mcap \
+          -DFETCHCONTENT_SOURCE_DIR_LZ4=/opt/ros_deps_ws/vendor/lz4; \
     else \
       mkdir -p install && \
       printf '%s\n' '#!/usr/bin/env bash' 'true' > install/setup.bash; \
