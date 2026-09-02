@@ -265,6 +265,31 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         )
         self.assertNotIn("/ubuntu/navigation/collection/lidar", command)
 
+    def test_fault_capture_stays_in_runtime_process_group(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._fault_capture_lock = threading.Lock()
+        supervisor.get_parameter = lambda name: SimpleNamespace(
+            value={
+                "lidar_topic": "/navigation/lidar",
+                "imu_topic": "/navigation/imu",
+                "raw_odom_topic": "/navigation/raw_odom",
+            }[name]
+        )
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            SUPERVISOR_MODULE, "_FAULT_CAPTURE_ROOT", Path(directory)
+        ), mock.patch.object(
+            SUPERVISOR_MODULE.subprocess, "Popen", return_value=process
+        ) as popen, mock.patch.object(SUPERVISOR_MODULE.time, "sleep"):
+            supervisor._arm_fault_capture()
+
+        self.assertFalse(popen.call_args.kwargs["start_new_session"])
+        FastLivo2Supervisor._stop_fault_capture_process(process)
+        process.send_signal.assert_called_once_with(SUPERVISOR_MODULE.signal.SIGINT)
+        process.kill.assert_not_called()
+
     def test_permanent_collection_finalize_failure_confirms_terminal_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             partial = Path(directory) / "capture.partial"

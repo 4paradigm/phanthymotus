@@ -354,7 +354,9 @@ class FastLivo2Supervisor(Node):
                 self._fault_capture_command(directory),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
+                # Keep the recorder in the FAST-LIVO2 launch process group so
+                # runtime stop/restart cannot leave a full-rate recorder behind.
+                start_new_session=False,
             )
             time.sleep(0.25)
             if process.poll() is not None:
@@ -402,11 +404,11 @@ class FastLivo2Supervisor(Node):
     def _stop_fault_capture_process(process: subprocess.Popen) -> None:
         if process.poll() is not None:
             return
-        os.killpg(process.pid, signal.SIGINT)
+        process.send_signal(signal.SIGINT)
         try:
             process.wait(timeout=10.0)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            process.kill()
             process.wait(timeout=5.0)
 
     def _save_fault_capture(self) -> None:
