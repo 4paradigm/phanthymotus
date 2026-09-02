@@ -176,6 +176,7 @@ def navigation_tool_definition(namespace: str) -> dict:
         next(item for item in planning["topic_in"] if item["port"] == "goal_pose")
     )
     goal_input["required"] = False
+    goal_input["monitor"] = False
     external_inputs.append(goal_input)
     component_outputs = {
         str(item.get("port", "")): item
@@ -184,6 +185,16 @@ def navigation_tool_definition(namespace: str) -> dict:
     }
     outputs = [
         deepcopy(component_outputs[port]) for port in NAVIGATION_PUBLIC_OUTPUT_PORTS
+    ]
+    auxiliary_topics = [
+        deepcopy(
+            next(item for item in planning["topic_out"] if item["port"] == "plan")
+        ),
+        deepcopy(
+            next(
+                item for item in planning["topic_in"] if item["port"] == "livo_odom"
+            )
+        ),
     ]
 
     completion = deepcopy(planning["inputSchema"]["x-completion"])
@@ -204,6 +215,7 @@ def navigation_tool_definition(namespace: str) -> dict:
         ),
         "topic_in": external_inputs,
         "topic_out": outputs,
+        "topic_aux": auxiliary_topics,
         "inputSchema": {
             "type": "object",
             "properties": _action_properties(),

@@ -73,6 +73,9 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
         dashboard = (
             REPO_ROOT / "agent-core" / "web" / "js" / "monitor-dashboard.js"
         ).read_text(encoding="utf-8")
+        mcp_manage = (
+            REPO_ROOT / "agent-core" / "src" / "api" / "mcp_manage.py"
+        ).read_text(encoding="utf-8")
         detail = (
             REPO_ROOT / "agent-core" / "web" / "js" / "detail-panel.js"
         ).read_text(encoding="utf-8")
@@ -89,6 +92,10 @@ class Nav2CanvasVisualizationTest(unittest.TestCase):
         self.assertIn("OdometryRenderer", dashboard)
         self.assertIn("PathRenderer", dashboard)
         self.assertIn("CostmapRenderer", dashboard)
+        self.assertIn("item.monitor === false", dashboard)
+        self.assertIn("!hiddenTopics.has(conn.fromTopic)", dashboard)
+        self.assertIn("'topic_aux'", mcp_manage)
+        self.assertIn("(True, topic_aux or [])", mcp_manage)
         self.assertIn("OdometryRenderer", detail)
         self.assertIn("PathRenderer", detail)
         self.assertIn("CostmapRenderer", detail)

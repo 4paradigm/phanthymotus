@@ -49,7 +49,7 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 | `imu` | `/ubuntu/navigation/imu` | 是 |
 | `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航，`collection_enabled=true` 时必需 |
 | `depth_frame` | `/ubuntu/camera/depth_frame` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE1` 封装中的深度尺度、标定与源时间戳 |
-| `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由 Agent Core `x-topic-actions` 转换为 `navigate_to_pose` |
+| `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由 Agent Core `x-topic-actions` 转换为 `navigate_to_pose`，不生成独立监控卡片 |
 
 这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
 `lidar` 和 `imu`。`goal_pose` 是可选的外部 topic action，不是启动时内部连线。
@@ -87,7 +87,9 @@ LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一�
 | `costmap` | `/global_costmap/costmap` | 实时全局代价地图 |
 
 `livo_odom`、registered cloud、confirmed static map 和 obstacle map 仍只由
-同容器内的定位、规划和语义逻辑消费，不生成 Canvas 右侧连线端口。详细
+同容器内的定位、规划和语义逻辑消费，不生成 Canvas 右侧连线端口。
+`/plan` 和 `/ubuntu/navigation/odom` 注册为隐藏辅助流，只供 `map_view` 与
+`costmap` 叠加路径和位姿，不生成独立监控卡片。详细
 frame、QoS、freshness、数采和速度约束见内部实现说明：
 
 - [mapping/README.md](mapping/README.md)

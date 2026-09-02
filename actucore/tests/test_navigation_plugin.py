@@ -233,6 +233,7 @@ class NavigationContractTest(unittest.TestCase):
         )
         self.assertEqual(inputs["goal_pose"]["topic"], "/ubuntu/navigation/goal_pose")
         self.assertEqual(inputs["goal_pose"]["schema"], "phanthy.navigation.goal.v1")
+        self.assertFalse(inputs["goal_pose"]["monitor"])
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
         self.assertEqual(
             [item["port"] for item in tool["topic_out"]],
@@ -244,6 +245,12 @@ class NavigationContractTest(unittest.TestCase):
                 "costmap",
             ],
         )
+        auxiliary = {item["port"]: item for item in tool["topic_aux"]}
+        self.assertEqual(set(auxiliary), {"plan", "livo_odom"})
+        self.assertEqual(auxiliary["plan"]["topic"], "/plan")
+        self.assertEqual(auxiliary["plan"]["format"], "sensor/path")
+        self.assertEqual(auxiliary["livo_odom"]["topic"], "/ubuntu/navigation/odom")
+        self.assertEqual(auxiliary["livo_odom"]["format"], "sensor/odometry")
         topic_action = tool["inputSchema"]["x-topic-actions"][0]
         self.assertNotIn("x-topic-actions", tool)
         self.assertEqual(topic_action["action"], "navigate_to_pose")
