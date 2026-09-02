@@ -46,6 +46,8 @@ def _config_properties() -> dict:
         "map_voxel_size_m": deepcopy(mapping["map_voxel_size_m"]),
         "obstacle_min_height_m": deepcopy(mapping["obstacle_min_height_m"]),
         "obstacle_max_height_m": deepcopy(mapping["obstacle_max_height_m"]),
+        "map_view_enabled": deepcopy(mapping["map_view_enabled"]),
+        "fault_capture_enabled": deepcopy(mapping["fault_capture_enabled"]),
         "collection_enabled": deepcopy(mapping["collection_enabled"]),
         "collection_directory": deepcopy(mapping["collection_directory"]),
         "planning_request_timeout_sec": deepcopy(planning["request_timeout_sec"]),

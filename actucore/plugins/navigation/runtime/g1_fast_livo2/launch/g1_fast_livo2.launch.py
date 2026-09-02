@@ -18,6 +18,8 @@ def generate_launch_description() -> LaunchDescription:
         "static_map_topic": "/ubuntu/navigation/static_map",
         "map_view_topic": "/ubuntu/navigation/fast_livo2/map_view",
         "diagnostics_topic": "/ubuntu/navigation/fast_livo2/diagnostics",
+        "bridge_status_topic": "/ubuntu/navigation/_bridge_status",
+        "mapper_runtime_topic": "/ubuntu/navigation/fast_livo2/mapper_runtime",
         "reset_topic": "/ubuntu/navigation/fast_livo2/reset_map",
         "map_control_topic": "/ubuntu/navigation/fast_livo2/map_control",
         "map_control_status_topic": (
@@ -79,6 +81,8 @@ def generate_launch_description() -> LaunchDescription:
                             "raw_odom_topic",
                             "raw_cloud_topic",
                             "diagnostics_topic",
+                            "bridge_status_topic",
+                            "mapper_runtime_topic",
                             "reset_topic",
                             "map_control_topic",
                             "map_control_status_topic",

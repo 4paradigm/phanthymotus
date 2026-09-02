@@ -433,6 +433,8 @@ class NavigationPlugin:
                     ("map_voxel_size_m", "map_voxel_size_m"),
                     ("obstacle_min_height_m", "obstacle_min_height_m"),
                     ("obstacle_max_height_m", "obstacle_max_height_m"),
+                    ("map_view_enabled", "map_view_enabled"),
+                    ("fault_capture_enabled", "fault_capture_enabled"),
                     ("collection_enabled", "collection_enabled"),
                     ("collection_directory", "collection_directory"),
                 )

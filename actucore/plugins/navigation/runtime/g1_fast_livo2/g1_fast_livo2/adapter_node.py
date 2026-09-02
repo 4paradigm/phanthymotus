@@ -93,6 +93,7 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("obstacle_map_topic", "/ubuntu/navigation/obstacle_map")
         self.declare_parameter("static_map_topic", "/ubuntu/navigation/static_map")
         self.declare_parameter("map_view_topic", "/ubuntu/navigation/fast_livo2/map_view")
+        self.declare_parameter("map_view_enabled", True)
         self.declare_parameter("diagnostics_topic", "/ubuntu/navigation/fast_livo2/diagnostics")
         self.declare_parameter("reset_topic", "/ubuntu/navigation/fast_livo2/reset_map")
         self.declare_parameter("map_control_topic", "/ubuntu/navigation/fast_livo2/map_control")
@@ -221,6 +222,22 @@ class FastLivo2Adapter(Node):
         self._session_name: str | None = None
         self._map_view_cache: bytes | None = None
         self._map_view_cache_monotonic: float | None = None
+        self._map_view_enabled = bool(
+            self.get_parameter("map_view_enabled").value
+        )
+        self._pipeline_counters = {
+            "lidar_contract_received": 0,
+            "imu_contract_received": 0,
+            "raw_odom_received": 0,
+            "raw_cloud_received": 0,
+            "canonical_odom_published": 0,
+            "canonical_cloud_published": 0,
+            "mapping_work_processed": 0,
+            "map_view_encoded": 0,
+            "map_view_published": 0,
+        }
+        self._pipeline_last_receive_monotonic: dict[str, float] = {}
+        self._pipeline_interval_max_gap_sec: dict[str, float] = {}
         self._latency_ms: dict[str, float] = {}
         self._latency_max_ms: dict[str, float] = {}
         self._static_map_load_time = self.get_clock().now().to_msg()
@@ -363,6 +380,23 @@ class FastLivo2Adapter(Node):
             self._latency_max_ms.get(name, 0.0),
         )
 
+    def _observe_pipeline_event(self, name: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if not hasattr(self, "_pipeline_counters"):
+                self._pipeline_counters = {}
+                self._pipeline_last_receive_monotonic = {}
+                self._pipeline_interval_max_gap_sec = {}
+            self._pipeline_counters[name] = self._pipeline_counters.get(name, 0) + 1
+            previous = self._pipeline_last_receive_monotonic.get(name)
+            if previous is not None:
+                gap = max(0.0, now - previous)
+                self._pipeline_interval_max_gap_sec[name] = max(
+                    gap,
+                    self._pipeline_interval_max_gap_sec.get(name, 0.0),
+                )
+            self._pipeline_last_receive_monotonic[name] = now
+
     def _queue_mapping_scan(self, work: dict) -> None:
         with self._mapping_work_condition:
             generation = int(work["generation"])
@@ -412,6 +446,7 @@ class FastLivo2Adapter(Node):
                         obstacle_min_height_m=work["obstacle_min_height"],
                         obstacle_max_height_m=work["obstacle_max_height"],
                     )
+                self._observe_pipeline_event("mapping_work_processed")
             except ValueError as exc:
                 error = str(exc)
             if error is not None:
@@ -519,6 +554,7 @@ class FastLivo2Adapter(Node):
             )
 
     def _on_lidar_contract(self, message: PointCloud2) -> None:
+        self._observe_pipeline_event("lidar_contract_received")
         try:
             frame = message.header.frame_id.strip()
             if not frame:
@@ -553,6 +589,7 @@ class FastLivo2Adapter(Node):
         self._refresh_sensor_contract()
 
     def _on_imu_contract(self, message: Imu) -> None:
+        self._observe_pipeline_event("imu_contract_received")
         try:
             frame = message.header.frame_id.strip()
             if not frame:
@@ -682,6 +719,7 @@ class FastLivo2Adapter(Node):
         return blockers
 
     def _on_odom(self, message: Odometry) -> None:
+        self._observe_pipeline_event("raw_odom_received")
         error_code = None
         try:
             if message.header.frame_id.strip() != "camera_init" or message.child_frame_id.strip() != "aft_mapped":
@@ -760,6 +798,7 @@ class FastLivo2Adapter(Node):
         output.pose.covariance = message.pose.covariance
         output.twist = message.twist
         self._odom_pub.publish(output)
+        self._observe_pipeline_event("canonical_odom_published")
 
         transform = TransformStamped()
         transform.header = output.header
@@ -772,6 +811,7 @@ class FastLivo2Adapter(Node):
         self._drain_pending_cloud()
 
     def _on_cloud(self, message: PointCloud2) -> None:
+        self._observe_pipeline_event("raw_cloud_received")
         receive_monotonic = time.monotonic()
         try:
             with self._lock:
@@ -930,6 +970,7 @@ class FastLivo2Adapter(Node):
             self._latest_mapped_points = mapped_points
             generation = self._mapping_generation
         self._cloud_pub.publish(navigation_cloud)
+        self._observe_pipeline_event("canonical_cloud_published")
         publish_end_monotonic = time.monotonic()
         with self._lock:
             self._last_navigation_cloud_monotonic = publish_end_monotonic
@@ -1125,6 +1166,9 @@ class FastLivo2Adapter(Node):
             raise InvalidFastLivo2Frame(
                 "obstacle heights must satisfy -3.0 <= min < max <= 3.0"
             )
+        map_view_enabled = args.get("map_view_enabled", self._map_view_enabled)
+        if not isinstance(map_view_enabled, bool):
+            raise InvalidFastLivo2Frame("map_view_enabled must be a boolean")
         with self._lock:
             if self._mode != "idle":
                 raise InvalidFastLivo2Frame(
@@ -1133,9 +1177,13 @@ class FastLivo2Adapter(Node):
                 )
             self._obstacle_min_height = minimum
             self._obstacle_max_height = maximum
+            self._map_view_enabled = map_view_enabled
+            if not map_view_enabled:
+                self._invalidate_map_view_cache_locked()
         return {
             "status": "configured",
             "obstacle_height_range_m": [minimum, maximum],
+            "map_view_enabled": map_view_enabled,
         }
 
     def _save_static_map(self, args: dict) -> dict:
@@ -1595,6 +1643,8 @@ class FastLivo2Adapter(Node):
         return output
 
     def _publish_map_view(self) -> None:
+        if not getattr(self, "_map_view_enabled", True):
+            return
         started = time.monotonic()
         with self._lock:
             cached = self._map_view_cache
@@ -1610,6 +1660,7 @@ class FastLivo2Adapter(Node):
         frame = UInt8MultiArray()
         frame.data = data
         self._map_view_pub.publish(frame)
+        self._observe_pipeline_event("map_view_published")
         with self._lock:
             self._record_latency_locked(
                 "map_view_pose_publish",
@@ -1689,7 +1740,13 @@ class FastLivo2Adapter(Node):
                 "point_time_span_ms": self._point_time_span_ms,
                 "odom_health": self._odom_health.diagnostics(),
                 "readiness_blockers": self._readiness_blockers_locked(),
+                "map_view_enabled": self._map_view_enabled,
+                "pipeline_counters": dict(self._pipeline_counters),
+                "pipeline_interval_max_gap_sec": dict(
+                    self._pipeline_interval_max_gap_sec
+                ),
             }
+            self._pipeline_interval_max_gap_sec.clear()
 
         with self._static_lock:
             obstacle_points = self._static_map.project_xy(
@@ -1709,7 +1766,7 @@ class FastLivo2Adapter(Node):
                     max_z=obstacle_max_height,
                 )
                 static_grid = self._occupancy_grid(snapshot)
-            if pose is not None:
+            if pose is not None and state["map_view_enabled"]:
                 map_view_encode_started = time.monotonic()
                 encoded_map_view = encode_map_view_points(
                     chain(
@@ -1728,6 +1785,8 @@ class FastLivo2Adapter(Node):
                 "static_free_cell_count": self._static_map.free_cell_count,
                 "map_view_context_point_count": map_view_context.point_count,
             }
+        if encoded_map_view is not None:
+            self._observe_pipeline_event("map_view_encoded")
         if encoded_map_view is not None:
             with self._lock:
                 self._map_view_cache = encoded_map_view
@@ -1785,6 +1844,7 @@ class FastLivo2Adapter(Node):
             "mapping_work_dropped": mapping_work_dropped,
             "static_map_error": state["static_map_error"],
             "map_view_max_point_count": _MAP_VIEW_MAX_POINTS,
+            "map_view_enabled": state["map_view_enabled"],
             "map_view_point_refresh_hz": 1.0,
             "map_view_pose_refresh_hz": _MAP_VIEW_POSE_REFRESH_HZ,
             "map_view_cache_age_sec": (
@@ -1794,6 +1854,10 @@ class FastLivo2Adapter(Node):
             ),
             "latency_ms": state["latency_ms"],
             "latency_max_ms": state["latency_max_ms"],
+            "pipeline_counters": state["pipeline_counters"],
+            "pipeline_interval_max_gap_sec": state[
+                "pipeline_interval_max_gap_sec"
+            ],
             "map_view_live_out_of_band_point_count": len(live_out_of_band),
             "obstacle_point_count": len(obstacle_points),
             "obstacle_height_range_m": [obstacle_min_height, obstacle_max_height],

@@ -11,6 +11,8 @@
     "map_voxel_size_m": 0.1,
     "obstacle_min_height_m": -0.3,
     "obstacle_max_height_m": 0.3,
+    "map_view_enabled": true,
+    "fault_capture_enabled": true,
     "collection_enabled": false,
     "collection_directory": "/opt/phanthy-motus/data/fast_livo2/recordings"
   },

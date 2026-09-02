@@ -24,7 +24,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
     NAV2_PARAMS="$(ros2 pkg prefix g1_nav2)/share/g1_nav2/config/nav2_params.yaml" \
       python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
     python3 -c "import numpy, rosbag2_py, yaml, em; import cv2; from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; from g1_fast_livo2.camera_depth_frame import decode as decode_depth, MAGIC as DEPTH_MAGIC; assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'" && \
-    ros2 bag record --help >/dev/null
+    ros2 bag record --help | grep -F -- '--no-discovery' >/dev/null
 
 COPY actucore/plugins/navigation/runtime/navigation_lio.yaml /config/navigation_lio.yaml
 

@@ -8,13 +8,14 @@
  #include <vikit/camera_loader.h>
 
  class LIVMapper
-@@ -37,7 +38,7 @@
+@@ -37,8 +38,8 @@
    void stateEstimationAndMapping();
    void handleVIO();
    void handleLIO();
 -  void savePCD();
 +  bool savePCD();
    void processImu();
+   void publishRuntimeDiagnostics();
 
    bool sync_packages(LidarMeasureGroup &meas);
 @@ -182,6 +183,7 @@
@@ -127,9 +128,9 @@
  }
 
  void LIVMapper::run(rclcpp::Node::SharedPtr &node)
-@@ -811,7 +849,10 @@
-
-     stateEstimationAndMapping();
+@@ -904,7 +942,10 @@
+       std::chrono::steady_clock::now() - processing_started).count();
+     max_processing_ms = std::max(max_processing_ms, last_processing_ms);
    }
 -  savePCD();
 +  if (!savePCD())

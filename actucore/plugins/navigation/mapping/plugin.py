@@ -79,8 +79,13 @@ def _validated_config(base: dict, updates: dict) -> dict:
         )
     if result.get("input_max_age_ms") != 500:
         raise ConfigError("input_max_age_ms is fixed to 500")
-    if not isinstance(result.get("collection_enabled"), bool):
-        raise ConfigError("collection_enabled must be a boolean")
+    for key in (
+        "map_view_enabled",
+        "fault_capture_enabled",
+        "collection_enabled",
+    ):
+        if not isinstance(result.get(key), bool):
+            raise ConfigError(f"{key} must be a boolean")
     raw_directory = result.get("collection_directory")
     if not isinstance(raw_directory, str) or not raw_directory.strip():
         raise ConfigError("collection_directory must be a non-empty absolute path")
@@ -239,6 +244,8 @@ class FastLivo2Plugin:
                 "max_height_m": self._cfg["obstacle_max_height_m"],
                 "lidar_qos_depth": self._cfg["lidar_qos_depth"],
                 "imu_qos_depth": self._cfg["imu_qos_depth"],
+                "map_view_enabled": self._cfg["map_view_enabled"],
+                "fault_capture_enabled": self._cfg["fault_capture_enabled"],
             }
         )
         if obstacle_result.get("status") == "error":

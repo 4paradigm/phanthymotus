@@ -11,6 +11,7 @@
 #   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
 #   ./build_actucore.sh --mirror tuna
 #   ./build_actucore.sh --base --mirror tuna     # 依赖变化时才构建 navigation base
+#   BUILD_JOBS=2 ./build_actucore.sh --base --mirror tuna  # 小内存 ARM64 主机
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +53,12 @@ COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
 
 # ── Jetson-only：执行模型都要 GPU，没有 CPU 变体 ──────────────────────
 BUILD_CONTEXT="${REPO_ROOT}"
-BUILD_ARGS=()
+BUILD_JOBS="${BUILD_JOBS:-4}"
+if [[ ! "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR=BUILD_JOBS must be a positive integer" >&2
+    exit 2
+fi
+BUILD_ARGS=("BUILD_JOBS=${BUILD_JOBS}")
 # ── 根据 jp_version 选择 base image  ────────────────────────
 # 表在 build_common.sh 的 jetpack_vars 里，build_perception.sh 共用同一份。
 jetpack_vars "${JP_VERSION}" || exit 1

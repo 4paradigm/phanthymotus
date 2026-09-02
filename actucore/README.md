@@ -50,6 +50,9 @@ GIT_MIRROR_PREFIX=https://ghfast.top/ \
   ./deploy/build_actucore.sh --base --mirror tuna
 ```
 
+在 8 GB 等小内存 ARM64 构建机上可设置 `BUILD_JOBS=2`；该值会同时传给
+navigation base 和日常 ActuCore 的 C++ 编译步骤。
+
 基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时仍把普通依赖
 放在 `Dockerfile.jetson`；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈
 才进入 `Dockerfile.navigation-base`。基础镜像必须在原生 ARM64 构建，脚本拒绝

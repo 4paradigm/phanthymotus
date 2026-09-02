@@ -44,6 +44,13 @@ from .collection_core import (
     rosbag_record_command,
 )
 from .frame_adapter_core import normalize_obstacle_height_range
+from .fault_diagnostics import (
+    ADAPTER_DIAGNOSTICS_TOPIC,
+    BRIDGE_STATUS_TOPIC,
+    MAPPER_RUNTIME_TOPIC,
+    write_fault_summary,
+)
+from .pipeline_diagnostics import PipelineDiagnostics
 from .runtime_core import controlled_stop_succeeded
 
 
@@ -62,7 +69,7 @@ _MAP_CONTROL_RESPONSE_GRACE_SEC = 5.0
 _MAP_CONTROL_DISCOVERY_TIMEOUT_SEC = 5.0
 _FAULT_CAPTURE_PRE_SEC = 5.0
 _FAULT_CAPTURE_POST_SEC = 5.0
-_FAULT_CAPTURE_CACHE_BYTES = 64 * 1024 * 1024
+_FAULT_CAPTURE_CACHE_BYTES = 512 * 1024 * 1024
 _FAULT_CAPTURE_ROOT = Path(COLLECTION_ROOT) / "faults"
 _FAULT_CAPTURE_QOS_PATH = Path(__file__).with_name("fault_capture_qos.yaml")
 _DEFAULT_LIDAR_QOS_DEPTH = 2
@@ -90,6 +97,8 @@ class FastLivo2Supervisor(Node):
             "/ubuntu/navigation/fast_livo2/collection_status_raw",
         )
         self.declare_parameter("diagnostics_topic", "/ubuntu/navigation/fast_livo2/diagnostics")
+        self.declare_parameter("bridge_status_topic", BRIDGE_STATUS_TOPIC)
+        self.declare_parameter("mapper_runtime_topic", MAPPER_RUNTIME_TOPIC)
         self.declare_parameter("reset_topic", "/ubuntu/navigation/fast_livo2/reset_map")
         self.declare_parameter("map_control_topic", "/ubuntu/navigation/fast_livo2/map_control")
         self.declare_parameter("map_control_status_topic", "/ubuntu/navigation/fast_livo2/map_control_status")
@@ -128,6 +137,7 @@ class FastLivo2Supervisor(Node):
         self._last_mapping_result: dict | None = None
         self._diagnostics: dict = {}
         self._diagnostics_monotonic: float | None = None
+        self._pipeline_diagnostics = PipelineDiagnostics()
         self._map_control_responses: dict[str, dict] = {}
         self._pending_map_control_requests: set[str] = set()
         self._collection_process: subprocess.Popen | None = None
@@ -143,8 +153,10 @@ class FastLivo2Supervisor(Node):
         self._fault_capture_timer: threading.Timer | None = None
         self._fault_capture_directory: Path | None = None
         self._fault_capture_state = "starting"
+        self._fault_capture_enabled = True
         self._fault_capture_error: str | None = None
         self._fault_capture_trigger: dict | None = None
+        self._fault_capture_summary: str | None = None
         self._collection_input_topics = {
             "lidar": str(self.get_parameter("lidar_topic").value),
             "imu": str(self.get_parameter("imu_topic").value),
@@ -184,7 +196,32 @@ class FastLivo2Supervisor(Node):
             10,
             callback_group=callbacks,
         )
-        self.create_subscription(String, str(self.get_parameter("diagnostics_topic").value), self._on_diagnostics, 10)
+        diagnostic_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("diagnostics_topic").value),
+            self._on_diagnostics,
+            diagnostic_qos,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("bridge_status_topic").value),
+            self._on_bridge_status,
+            diagnostic_qos,
+            callback_group=callbacks,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("mapper_runtime_topic").value),
+            self._on_mapper_runtime,
+            diagnostic_qos,
+            callback_group=callbacks,
+        )
         self.create_subscription(
             String,
             COLLECTION_EVENT_TOPICS[0]["topic"],
@@ -312,9 +349,23 @@ class FastLivo2Supervisor(Node):
         except (TypeError, ValueError):
             return
         if isinstance(payload, dict):
+            self._pipeline_diagnostics.observe("adapter", payload)
             with self._lock:
                 self._diagnostics = payload
                 self._diagnostics_monotonic = time.monotonic()
+
+    def _observe_pipeline_json(self, layer: str, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError):
+            return
+        self._pipeline_diagnostics.observe(layer, payload)
+
+    def _on_bridge_status(self, message: String) -> None:
+        self._observe_pipeline_json("bridge", message)
+
+    def _on_mapper_runtime(self, message: String) -> None:
+        self._observe_pipeline_json("mapper", message)
 
     def _on_sensor_rejection(self, message: String) -> None:
         try:
@@ -339,6 +390,7 @@ class FastLivo2Supervisor(Node):
             "--max-cache-size",
             str(_FAULT_CAPTURE_CACHE_BYTES),
             "--snapshot-mode",
+            "--no-discovery",
             "--qos-profile-overrides-path",
             str(_FAULT_CAPTURE_QOS_PATH),
             str(self.get_parameter("lidar_topic").value),
@@ -346,9 +398,16 @@ class FastLivo2Supervisor(Node):
             str(self.get_parameter("raw_odom_topic").value),
             _RAW_IMU_PROPAGATED_ODOM_TOPIC,
             COLLECTION_EVENT_TOPICS[0]["topic"],
+            str(self.get_parameter("bridge_status_topic").value),
+            str(self.get_parameter("mapper_runtime_topic").value),
+            str(self.get_parameter("diagnostics_topic").value),
         ]
 
     def _arm_fault_capture(self) -> None:
+        if not getattr(self, "_fault_capture_enabled", True):
+            with self._fault_capture_lock:
+                self._fault_capture_state = "disabled"
+            return
         try:
             _FAULT_CAPTURE_ROOT.mkdir(parents=True, exist_ok=True)
             session = (
@@ -383,6 +442,7 @@ class FastLivo2Supervisor(Node):
             self._fault_capture_directory = directory
             self._fault_capture_state = "armed"
             self._fault_capture_error = None
+            self._fault_capture_summary = None
 
     def _trigger_fault_capture(self, event: dict) -> None:
         with self._fault_capture_lock:
@@ -426,6 +486,8 @@ class FastLivo2Supervisor(Node):
             directory = self._fault_capture_directory
             self._fault_capture_state = "saving"
         error = None
+        summary_error = None
+        summary_path = None
         try:
             if process is None or directory is None or process.poll() is not None:
                 raise RuntimeError("snapshot recorder is not running")
@@ -456,6 +518,13 @@ class FastLivo2Supervisor(Node):
                 directory.glob("*.mcap")
             ):
                 raise RuntimeError("snapshot did not produce an MCAP artifact")
+            try:
+                summary_path = write_fault_summary(
+                    directory,
+                    self._fault_capture_trigger,
+                )
+            except Exception as exc:  # The saved MCAP remains the primary receipt.
+                summary_error = f"{type(exc).__name__}: {exc}"
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             error = f"{type(exc).__name__}: {exc}"
             if process is not None:
@@ -467,11 +536,18 @@ class FastLivo2Supervisor(Node):
             self._fault_capture_process = None
             self._fault_capture_timer = None
             self._fault_capture_state = "saved" if error is None else "error"
-            self._fault_capture_error = error
+            self._fault_capture_error = error or summary_error
+            self._fault_capture_summary = (
+                None if summary_path is None else str(summary_path)
+            )
         if error is None:
             self.get_logger().warning(
                 f"saved first FAST-LIVO2 odom fault capture to {directory}"
             )
+            if summary_error is not None:
+                self.get_logger().error(
+                    f"fault capture summary failed but MCAP was retained: {summary_error}"
+                )
         else:
             self.get_logger().error(
                 f"cannot save FAST-LIVO2 odom fault capture: {error}"
@@ -514,6 +590,7 @@ class FastLivo2Supervisor(Node):
                     else dict(self._fault_capture_trigger)
                 ),
                 "error": self._fault_capture_error,
+                "summary": self._fault_capture_summary,
             }
 
     def _discard_armed_fault_capture(self) -> None:
@@ -659,11 +736,25 @@ class FastLivo2Supervisor(Node):
                     "error": f"{key} is outside the supported range",
                 }
             depths[key] = value
+        map_view_enabled = args.get("map_view_enabled", True)
+        fault_capture_enabled = args.get(
+            "fault_capture_enabled",
+            getattr(self, "_fault_capture_enabled", True),
+        )
+        if not isinstance(map_view_enabled, bool) or not isinstance(
+            fault_capture_enabled, bool
+        ):
+            return {
+                "status": "error",
+                "error_code": "invalid_runtime_feature_config",
+                "error": "map_view_enabled and fault_capture_enabled must be booleans",
+            }
         result = self._adapter_execute(
             "configure_obstacle_filter",
             {
                 "min_height_m": args.get("min_height_m"),
                 "max_height_m": args.get("max_height_m"),
+                "map_view_enabled": map_view_enabled,
             },
         )
         if result.get("status") != "error":
@@ -673,6 +764,20 @@ class FastLivo2Supervisor(Node):
             result["sensor_qos_depths"] = {
                 "lidar": self._lidar_qos_depth,
                 "imu": self._imu_qos_depth,
+            }
+            previous_fault_capture_enabled = getattr(
+                self, "_fault_capture_enabled", True
+            )
+            self._fault_capture_enabled = fault_capture_enabled
+            if previous_fault_capture_enabled and not fault_capture_enabled:
+                self._discard_armed_fault_capture()
+                with self._fault_capture_lock:
+                    self._fault_capture_state = "disabled"
+            elif not previous_fault_capture_enabled and fault_capture_enabled:
+                self._arm_fault_capture()
+            result["runtime_features"] = {
+                "map_view_enabled": map_view_enabled,
+                "fault_capture_enabled": fault_capture_enabled,
             }
         return result
 
@@ -1868,6 +1973,10 @@ class FastLivo2Supervisor(Node):
             "--params-file", config,
             "-p", f"lidar_qos_depth:={self._lidar_qos_depth}",
             "-p", f"imu_qos_depth:={self._imu_qos_depth}",
+            "-p", (
+                "runtime_diagnostics_topic:="
+                + str(self.get_parameter("mapper_runtime_topic").value)
+            ),
             "-p", f"pcd_save.pcd_save_en:={'true' if save_pcd else 'false'}",
             "-p", f"pcd_save.interval:={interval}",
             "-p", "pcd_save.type:=0",
@@ -2143,6 +2252,12 @@ class FastLivo2Supervisor(Node):
                 else "idle"
             )
             diagnostics = dict(self._diagnostics)
+            pipeline = getattr(self, "_pipeline_diagnostics", None)
+            if pipeline is None:
+                pipeline = self._pipeline_diagnostics = PipelineDiagnostics()
+            pipeline_diagnostics = pipeline.snapshot(
+                algorithm_running=running
+            )
             payload = {
                 "event": "heartbeat",
                 "schema": "phanthy.navigation.fast_livo2_status.v1",
@@ -2177,6 +2292,7 @@ class FastLivo2Supervisor(Node):
                 "global_relocalization_supported": False,
                 "bounded_relocalization_supported": True,
                 "diagnostics": diagnostics,
+                "pipeline_diagnostics": pipeline_diagnostics,
                 "collection": collection,
                 "fault_capture": fault_capture,
             }

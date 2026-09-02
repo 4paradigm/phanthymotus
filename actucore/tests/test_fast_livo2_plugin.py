@@ -235,6 +235,8 @@ class FastLivo2PluginTest(unittest.TestCase):
                 "max_height_m": 0.30,
                 "lidar_qos_depth": 2,
                 "imu_qos_depth": 400,
+                "map_view_enabled": True,
+                "fault_capture_enabled": True,
             },
         )
         self.assertEqual(backend.calls[1][0], "configure_collection")
@@ -537,6 +539,8 @@ class FastLivo2PluginTest(unittest.TestCase):
                     "max_height_m": 0.4,
                     "lidar_qos_depth": 3,
                     "imu_qos_depth": 600,
+                    "map_view_enabled": True,
+                    "fault_capture_enabled": True,
                 },
             ),
         )

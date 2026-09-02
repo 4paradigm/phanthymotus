@@ -92,6 +92,8 @@ class FastLivo2ContractTest(unittest.TestCase):
         config = tool["configSchema"]["properties"]
         self.assertEqual(config["obstacle_min_height_m"]["default"], -0.30)
         self.assertEqual(config["obstacle_max_height_m"]["default"], 0.30)
+        self.assertTrue(config["map_view_enabled"]["default"])
+        self.assertTrue(config["fault_capture_enabled"]["default"])
         self.assertFalse(config["collection_enabled"]["default"])
         self.assertEqual(
             config["collection_directory"]["default"],
@@ -128,7 +130,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=ee935900657541a4ab7a1c7096ab07273e4f63854f6addb8f375a0f29c7ba7e6",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=65a8d6a5a0854eabbc65a73da82f54222270028ae0cd44458e75696d44c80522",
             source_lock,
         )
         self.assertIn(
@@ -136,7 +138,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=1484bfba11408e3efd87360a63fef1787f2b2ceaf75e8d8abdd5a17e3474beeb",
+            "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=d9fbba62436e4b418a5b23c2539da76a6787e7bfd3db8305139d604280a9c6d0",
             source_lock,
         )
         self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
@@ -145,10 +147,14 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn('declare_parameter<int>("lidar_qos_depth", 2)', runtime_patch_text)
         self.assertIn('declare_parameter<int>("imu_qos_depth", 400)', runtime_patch_text)
         self.assertIn("rclcpp::SensorDataQoS", runtime_patch_text)
-        self.assertNotIn("@@ -13,", runtime_patch_text)
+        runtime_cpp_patch = runtime_patch_text.split(
+            "diff --git a/src/LIVMapper.cpp", 1
+        )[1]
+        self.assertNotIn("@@ -13,", runtime_cpp_patch)
+        self.assertIn("publishRuntimeDiagnostics", runtime_patch_text)
         self.assertIn("+#include <stdexcept>", pcd_patch.read_text(encoding="utf-8"))
         self.assertIn("import numpy, rosbag2_py", dockerfile)
-        self.assertIn("ros2 bag record --help", dockerfile)
+        self.assertIn("ros2 bag record --help | grep -F -- '--no-discovery'", dockerfile)
         self.assertIn(
             "from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb",
             dockerfile,
@@ -195,7 +201,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "ee935900657541a4ab7a1c7096ab07273e4f63854f6addb8f375a0f29c7ba7e6",
+            "65a8d6a5a0854eabbc65a73da82f54222270028ae0cd44458e75696d44c80522",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
@@ -203,7 +209,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(flush_patch.read_bytes()).hexdigest(),
-            "1484bfba11408e3efd87360a63fef1787f2b2ceaf75e8d8abdd5a17e3474beeb",
+            "d9fbba62436e4b418a5b23c2539da76a6787e7bfd3db8305139d604280a9c6d0",
         )
         # base 是 Focal，packages.ros.org 上没有 humble 二进制，所以只移除
         # ROS 源；Ubuntu/NVIDIA 签名源仍需保留并认证系统依赖。

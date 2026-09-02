@@ -252,6 +252,9 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             "lidar_topic": "/ubuntu/navigation/lidar",
             "imu_topic": "/ubuntu/navigation/imu",
             "raw_odom_topic": "/ubuntu/navigation/fast_livo2/raw/odom",
+            "bridge_status_topic": "/ubuntu/navigation/_bridge_status",
+            "mapper_runtime_topic": "/ubuntu/navigation/fast_livo2/mapper_runtime",
+            "diagnostics_topic": "/ubuntu/navigation/fast_livo2/diagnostics",
         }
         supervisor.get_parameter = lambda name: SimpleNamespace(
             value=topics[name]
@@ -260,6 +263,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         command = supervisor._fault_capture_command(Path("/recordings/fault"))
 
         self.assertIn("--snapshot-mode", command)
+        self.assertIn("--no-discovery", command)
         qos_flag = command.index("--qos-profile-overrides-path")
         qos_path = Path(command[qos_flag + 1])
         self.assertTrue(qos_path.is_file())
@@ -267,6 +271,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertIn("/ubuntu/navigation/lidar:", qos)
         self.assertIn("/ubuntu/navigation/imu:", qos)
         self.assertIn("reliability: best_effort", qos)
+        self.assertIn("depth: 400", qos)
         self.assertIn("/ubuntu/navigation/lidar", command)
         self.assertIn("/ubuntu/navigation/imu", command)
         self.assertIn("/ubuntu/navigation/fast_livo2/raw/odom", command)
@@ -274,6 +279,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             "/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom",
             command,
         )
+        self.assertIn("/ubuntu/navigation/_bridge_status", command)
+        self.assertIn("/ubuntu/navigation/fast_livo2/mapper_runtime", command)
         self.assertNotIn("/ubuntu/navigation/collection/lidar", command)
 
     def test_fault_capture_stays_in_runtime_process_group(self) -> None:
@@ -284,6 +291,9 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                 "lidar_topic": "/navigation/lidar",
                 "imu_topic": "/navigation/imu",
                 "raw_odom_topic": "/navigation/raw_odom",
+                "bridge_status_topic": "/navigation/bridge_status",
+                "mapper_runtime_topic": "/navigation/mapper_runtime",
+                "diagnostics_topic": "/navigation/diagnostics",
             }[name]
         )
         process = mock.Mock()
@@ -967,7 +977,11 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(supervisor._imu_qos_depth, 600)
         supervisor._adapter_execute.assert_called_once_with(
             "configure_obstacle_filter",
-            {"min_height_m": -0.3, "max_height_m": 0.3},
+            {
+                "min_height_m": -0.3,
+                "max_height_m": 0.3,
+                "map_view_enabled": True,
+            },
         )
         supervisor.get_parameter = lambda name: SimpleNamespace(
             value={
@@ -977,11 +991,13 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                 "imu_topic": "/imu",
                 "raw_cloud_topic": "/raw/cloud",
                 "raw_odom_topic": "/raw/odom",
+                "mapper_runtime_topic": "/mapper/runtime",
             }[name]
         )
         command = supervisor._algorithm_command()
         self.assertIn("lidar_qos_depth:=3", command)
         self.assertIn("imu_qos_depth:=600", command)
+        self.assertIn("runtime_diagnostics_topic:=/mapper/runtime", command)
 
         rejected = supervisor._configure_runtime(
             {

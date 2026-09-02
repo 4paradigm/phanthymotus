@@ -70,7 +70,9 @@ LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一�
 的全频 LiDAR、IMU、FAST-LIVO2 raw odom 和 IMU 传播 odom；首次
 `raw_odom_discontinuity` 后再采 5 秒，仅落盘一份 MCAP 到
 `/opt/phanthy-motus/data/fast_livo2/recordings/faults/`。`status.fault_capture`
-显示 `armed/post_trigger/saved/error`、触发原因和产物目录；没有故障时
+显示 `armed/post_trigger/saved/error`、触发原因、产物目录和
+`diagnostic_summary.json`；摘要会对齐 Driver 发布、FAST-LIVO2 callback/处理、
+adapter 接收/发布计数，因此旧录包中的低帧率不再被直接误判为雷达源降频。没有故障时
 停卡会丢弃空快照，不会将常态全频数据写入磁盘。录包进程不创建独立
 进程组，会随 FAST-LIVO2 runtime 的 stop/restart 一起回收，避免多个全频
 recorder 重复订阅传感器。FAST-LIVO2 输入使用 Best Effort：LiDAR 只保留
@@ -119,6 +121,9 @@ registered cloud、静态障碍图或 Nav2 costmap。高度带默认值是
 `-0.30...+0.30 m`；它采用 canonical `map` frame，不能按雷达物理安装高度
 直接填写。直接累计不会清除已经由错误高度带写入的静态占用，修改上下界后
 必须新建地图。
+`map_view_enabled` 和 `fault_capture_enabled` 默认均为 `true`，用于真机
+性能 A/B；只能停卡后配置，并在下次启动生效。关闭前者只停止 Canvas 点云
+编码/发布，不改变 FAST-LIVO2 或 Nav2 输入；关闭后者只停止短时故障快照。
 
 Canvas 的转向速度只暴露单一 `rotate_speed_rps`，默认
 `0.3 rad/s`。非零 yaw proposal 保留方向并固定为该幅值；不再让
@@ -159,6 +164,36 @@ FAST-LIVO2 diagnostics 的 `latency_ms` / `latency_max_ms` 分别报告最近值
 本身的开销。已保存的 confirmed static PCD 还会绑定建图时的障碍高度带；加载
 时若当前上下界不同会拒绝使用，需恢复原配置或重新建图，避免静态证据语义
 悄然变化。
+
+### 断流与算力诊断
+
+`status.pipeline_diagnostics` 以 60 秒窗口关联三层已有证据：Driver 隐藏
+`_bridge_status`、FAST-LIVO2 mapper 1 Hz 运行统计和 adapter diagnostics。
+输出每层计数增量/频率、跨层比率和以下归因之一：
+`driver_source_drop`、`dds_or_subscriber_drop`、
+`fast_livo_processing_backlog`、`scan_match_degraded`、
+`adapter_backlog`、`insufficient_evidence` 或 `healthy`。只有 Driver 自己的
+接收/发布频率或 drop counter 异常时才认定源端降频。
+
+ROS 2 topic 不做“定时清理”：DDS `KEEP_LAST` 会自动淘汰旧样本，清 daemon
+也不会清订阅者队列。需要观察的是各订阅 callback 的生产/消费差、
+FAST-LIVO2 内部 LiDAR/IMU buffer span、adapter latest-only 丢弃数和 rosbag
+录制覆盖率；对应字段已经进入上述状态和故障摘要。
+
+真机每个阶段运行 300 秒，只读采集容器 CPU/内存、Jetson `tegrastats`、进程
+CPU 和完整 pipeline 状态：
+
+```bash
+DURATION_SEC=300 \
+  bash actucore/plugins/navigation/deploy/scripts/collect-navigation-diagnostics.sh
+```
+
+依次测量静止定位、同一路线导航，并在停卡后分别配置：两项均关闭、只开
+`map_view_enabled`、只开 `fault_capture_enabled`、两项均开启。每阶段记录
+CPU 平均/P95、Driver LiDAR 发布率、mapper callback/处理率、最大帧间隔、
+adapter 丢弃和 odom discontinuity 次数。先用跨层计数确认丢帧发生在哪一层，
+再决定优化 Driver、DDS、FAST-LIVO2 或显示/录制；不能用“清 topic”掩盖
+持续生产过快或消费过慢。
 
 confirmed static map 以有点数上限的稀疏体素保存，不因覆盖范围变大而拒绝
 建图。面向 Nav2 StaticLayer 的稠密 OccupancyGrid 则始终发布机器人周围
@@ -305,6 +340,9 @@ JP 6.1 支持。构建脚本在此之前会拒绝普通 JP 6.1 构建，不会�
 GIT_MIRROR_PREFIX=https://ghfast.top/ \
   ./deploy/build_actucore.sh --base --mirror tuna
 ```
+
+构建机内存较小时可设置 `BUILD_JOBS=2`，限制 navigation base 与日常
+ActuCore 镜像的 C++ 并行编译数；默认值仍为 4。
 
 基础镜像必须在原生 ARM64 构建；成功并推送后会输出可写回构建配置的精确
 digest。它不是运行时 service，也不注册 Resource Center。日常构建成功后脚本输出
