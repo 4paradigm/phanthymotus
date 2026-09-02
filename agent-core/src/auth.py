@@ -84,6 +84,9 @@ async def auth_middleware(request: Request, call_next):
     # /ws/mic stays open (internal browser mic)
     if path == '/ws/mic':
         return await call_next(request)
+    # Peer inbox — authenticated by Ed25519 signature, not ACCESS_TOKEN
+    if path.startswith('/api/peer/inbox/'):
+        return await call_next(request)
 
     # Check token
     token = _extract_token(request)

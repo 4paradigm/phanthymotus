@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from channel.manager import (
     manager, get_channel_config, add_channel_config,
     update_channel_config, delete_channel_config,
-    _get_channel_configs,
+    _get_channel_configs, supports_bot_to_bot, uses_trusted_bots,
 )
 from channel import acl
 import config
@@ -48,10 +48,15 @@ class AddChannelReq(BaseModel):
 
 @router.post('/add')
 async def add_channel(req: AddChannelReq):
-    if req.bot_to_bot_enabled and req.platform != 'feishu':
-        raise fastapi.HTTPException(400, 'bot_to_bot_enabled is only supported by Feishu')
-    if req.trusted_bots and req.platform != 'feishu':
-        raise fastapi.HTTPException(400, 'trusted_bots is only supported by Feishu')
+    if req.bot_to_bot_enabled and not supports_bot_to_bot(req.platform):
+        raise fastapi.HTTPException(
+            400, f'bot_to_bot_enabled is not supported by platform "{req.platform}"')
+    if req.trusted_bots and not uses_trusted_bots(req.platform):
+        raise fastapi.HTTPException(
+            400,
+            f'trusted_bots is not used by platform "{req.platform}"'
+            + (' — lan peers are trusted via pairing (Settings → Peers), not this list.'
+               if req.platform == 'lan' else ''))
     try:
         entry = await asyncio.to_thread(
             add_channel_config,
@@ -87,13 +92,16 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     if current is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     target_platform = updates.get('platform', current['platform'])
-    if updates.get('bot_to_bot_enabled') and target_platform != 'feishu':
-        raise fastapi.HTTPException(400, 'bot_to_bot_enabled is only supported by Feishu')
-    if updates.get('trusted_bots') and target_platform != 'feishu':
-        raise fastapi.HTTPException(400, 'trusted_bots is only supported by Feishu')
-    if target_platform != 'feishu':
-        updates['bot_to_bot_enabled'] = False
+    if updates.get('bot_to_bot_enabled') and not supports_bot_to_bot(target_platform):
+        raise fastapi.HTTPException(
+            400, f'bot_to_bot_enabled is not supported by platform "{target_platform}"')
+    if updates.get('trusted_bots') and not uses_trusted_bots(target_platform):
+        raise fastapi.HTTPException(
+            400, f'trusted_bots is not used by platform "{target_platform}"')
+    if not uses_trusted_bots(target_platform):
         updates['trusted_bots'] = []
+    if not supports_bot_to_bot(target_platform):
+        updates['bot_to_bot_enabled'] = False
     try:
         result = await asyncio.to_thread(update_channel_config, channel_id, **updates)
     except ValueError as e:

@@ -60,6 +60,56 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 
 硬件驱动在独立仓库维护：**[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**。
 
+### 多机协同（Multi-Agent Peers）
+
+> **状态：设计已定，尚未实现。** 本节先把架构写下来，好让后续代码落在正确的形状上。目前真正可用的跨机协作
+> 只有飞书 bot 互通（`bot_to_bot_enabled` + `trusted_bots`，见[飞书渠道配置](docs/feishu-channel-setup.md)），
+> 且强依赖公网。
+
+![多机协同与安全](docs/images/peer-mesh.png)
+
+> 可编辑源文件：[`docs/peer-mesh.svg`](docs/peer-mesh.svg) —— 改完记得重新导出 PNG。
+
+机器人之间以**对等（peer）**方式协作：每一侧都跑自己的 Agent Core，各自保有自主权。发现、传输、信任是三个
+互相独立、可插拔的层，所以一个 peer 可以「mDNS 发现 + mTLS 通信」，也可以「云端名册发现 + 飞书通信」。
+
+**发现层** —— 所有 provider 产出同一种 `PeerAdvert`，主键是 `peer_id`（Ed25519 公钥指纹，**不是** IP，也不是
+平台账号）。因此同一个 peer 从多条路径被发现时，仍然是一条记录、多条链路 —— 这正是降级能成立的前提。
+
+| Provider | 依赖 | 用途 |
+|---|---|---|
+| mDNS / DNS-SD（`_motus._tcp.local`） | 同局域网 | 同场地，主力路径 |
+| DDS presence（`/motus/presence`） | 同 `ROS_DOMAIN_ID` | 同场地，零新依赖（DDS 多播本来就在跑） |
+| 云端名册 | 公网 | 跨地点、跨网段 |
+| BLE 广播 | 无 | 仅用于完全离网时的**配对引导**，不承载数据面 |
+| 静态清单 | 无 | 兜底，永远保留 |
+
+**传输层 —— 四种协作粒度：**
+
+1. **消息级** —— 新增一个 `lan` `ChannelAdapter`，于是 peer 对话原样复用现有渠道栈：`InboundMessage`/
+   `OutboundMessage`、ACL 角色、限频、`expect_reply` 防环、collector 按信任级别分批。飞书和局域网因此成为
+   语义完全相同的两条链路，天然得到「有网走公网、断网走局域网」。
+2. **能力级** —— peer 注册为合成 MCP 条目（`transport: 'peer'`），其工具以 `mcp__peer:<id>__<tool>` 出现，
+   直接继承画布绑定闸门、ACP barrier（跨机异步等待原样可用）、hooks 与 per-tool 配置。
+3. **状态级** —— 位姿、电量、任务状态等高频数据走 DDS topic。**DDS 没有鉴权**：同一个 `ROS_DOMAIN_ID` 下
+   任何人都能读写，所以这条链路只承载状态，绝不承载指令。
+4. **任务级** —— `peer_delegate` 把 `SubagentSpec` 发给 peer，由对方在本地 spawn 一个 subagent 并回传
+   `SubagentResult`。接收方会按 peer 自身角色对 `tool_filter` 二次裁剪 —— 发起方给的是请求上限，不是授权 ——
+   且 `hop_count > 2` 直接拒绝，避免委派链形成风暴。
+
+**信任层** —— 每个 Agent Core 首次启动生成 Ed25519 身份密钥；`ACCESS_TOKEN` 的职责收窄为「人类访问本机
+dashboard」，不再是跨机凭据。配对沿用蓝牙的做法：双方 dashboard 显示同一个 6 位短码（由双方公钥与 nonce
+派生），两边都由人确认。这样既能抗中间人、又不需要 CA，也是唯一在纯 BLE、完全无网时仍然成立的方案。链路
+随后跑在 pinned mTLS 上。peer 复用 `channel/acl.py` 的角色分级，默认 `viewer`（只读传感器）。
+
+**执行器双闸门 —— 不可协商。** 即使 peer 是 `operator`，它也只能「请求」。跨 agent 的执行器调用必须**同时**满足：
+
+1. 该工具在**本机**画布上连线到 `decision_core`（`_get_bound_tool_schemas`）；
+2. 本机 LLM 自主决定要调用它 —— peer 的消息进入 collector 时是「输入」，不是「命令」；
+3. 若配置了 `require_actuator_confirm`，仍需人工确认。
+
+**peer 永远无法直接驱动电机。**
+
 ## Web Dashboard
 
 Dashboard（`http://<设备IP>:15678`）提供：
@@ -115,6 +165,8 @@ Dashboard（`http://<设备IP>:15678`）提供：
 | PR Review Agent（可选） | 25000 |
 
 硬件驱动端口请参见 [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)。
+
+多机协同**不新增端口** —— peer 之间走 Agent Core 已有的 15678，路径为 `/api/peer/*`。防火墙上无需额外放行。
 
 ## Resource Center（可选）
 

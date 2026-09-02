@@ -15,6 +15,14 @@ dependencies = [
     "lark-oapi>=1.4.0",
     "python-telegram-bot>=21.0",
     "slack-sdk>=3.27",
+    "zeroconf>=0.136.0",
+    "bleak>=0.21.0",
+]
+
+[project.optional-dependencies]
+ble-advertise = [
+    "bluez-peripheral>=0.3.0",
+    "netifaces>=0.11.0",
 ]
 
 [[tool.uv.index]]

@@ -61,6 +61,66 @@ The platform runs a single **sense → think → act** loop:
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
 
+### Multi-Agent Peers
+
+> **Status: designed, not yet implemented.** This section describes the agreed architecture so the
+> pieces land in the right shape. The only cross-machine collaboration that works today is Feishu
+> bot-to-bot (`bot_to_bot_enabled` + `trusted_bots`, see [Feishu channel setup](docs/feishu-channel-setup.md)),
+> which requires the public internet.
+
+![Peer mesh & security](docs/images/peer-mesh.png)
+
+> Editable source: [`docs/peer-mesh.svg`](docs/peer-mesh.svg) — re-export the PNG after changing it.
+
+Robots collaborate as **peers**: each side runs its own Agent Core and keeps its own autonomy.
+Discovery, transport and trust are three independent, pluggable layers, so a peer can be found
+over mDNS and talked to over mTLS, or found via a cloud roster and talked to over Feishu.
+
+**Discovery** — providers all emit the same `PeerAdvert`, keyed by `peer_id` (an Ed25519 public-key
+fingerprint, *not* an IP or platform account). One peer discovered over several paths therefore
+stays one record with several links, which is what makes fallback possible.
+
+| Provider | Needs | Used for |
+|---|---|---|
+| mDNS / DNS-SD (`_motus._tcp.local`) | Same LAN | Same site — the primary path |
+| DDS presence (`/motus/presence`) | Same `ROS_DOMAIN_ID` | Same site, no new dependency (DDS multicast is already running) |
+| Cloud roster | Internet | Across sites and subnets |
+| BLE advert | Nothing | Fully offline **pairing bootstrap** only — not a data plane |
+| Static list | Nothing | Fallback, always kept |
+
+**Transport — four granularities of collaboration:**
+
+1. **Messages** — a `lan` `ChannelAdapter`, so peer conversations reuse the existing channel stack
+   unchanged: `InboundMessage`/`OutboundMessage`, ACL roles, rate limiting, `expect_reply` loop
+   guard, and collector batching by trust level. Feishu and LAN are then two links with identical
+   agent-side semantics, which gives "internet when available, LAN when not" for free.
+2. **Tools** — a peer registers as a synthetic MCP entry (`transport: 'peer'`), so its tools appear
+   as `mcp__peer:<id>__<tool>` and inherit the canvas binding gate, the ACP barrier (cross-machine
+   async waits work as-is), hooks, and per-tool config.
+3. **State** — high-rate pose/battery/task state over DDS topics. **DDS has no authentication**:
+   anything on the same `ROS_DOMAIN_ID` can read and write it, so this link carries state only,
+   never commands.
+4. **Tasks** — `peer_delegate` ships a `SubagentSpec` to a peer, which spawns a subagent locally and
+   returns a `SubagentResult`. The receiver re-clips `tool_filter` against the peer's own role — the
+   sender's list is a request, not a grant — and `hop_count > 2` is refused so delegation chains
+   cannot storm.
+
+**Trust** — every Agent Core generates an Ed25519 identity key on first boot; `ACCESS_TOKEN` narrows
+to "a human operating this dashboard" and is no longer the cross-machine credential. Pairing follows
+the Bluetooth model: both dashboards show the same 6-digit short code derived from both public keys
+plus nonces, and a human confirms on both sides. That resists a man-in-the-middle without needing a
+CA, and is the only scheme that also works over BLE with no network. Links then run over pinned
+mTLS. Peers reuse the `channel/acl.py` role ladder and default to `viewer` (read-only sensors).
+
+**The actuator double gate — non-negotiable.** Even an `operator` peer only ever *requests*. A
+cross-agent actuator call must additionally satisfy all of:
+
+1. the tool is wired to `decision_core` on the **local** canvas (`_get_bound_tool_schemas`);
+2. the local LLM decides to call it — a peer's message enters the collector as *input*, not as a command;
+3. human confirmation, when `require_actuator_confirm` is set.
+
+**A peer can never drive a motor directly.**
+
 ### Memory & Long-Running Agent Architecture
 
 The Agent Core is designed for **continuous operation over days or months**. The architecture separates real-time interaction from background intelligence:
@@ -235,6 +295,9 @@ services:
 | PR Review Agent (optional) | 25000 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
+
+Peer-to-peer collaboration adds **no new port** — peers talk to each other over the Agent Core's
+existing 15678, under `/api/peer/*`. There is nothing extra to open on a firewall.
 
 ## Container Logs
 

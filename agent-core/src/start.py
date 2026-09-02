@@ -419,6 +419,18 @@ async def lifespan(app):
     # 启动 Channel Manager（消息平台适配器）
     await channel_manager.start()
 
+    # peer discovery
+    from peer.registry import registry as peer_registry
+    await peer_registry.start()
+
+    # peer DDS state sharing (optional)
+    from peer import dds_state
+    dds_state.start()
+
+    # peer BLE bootstrap (optional)
+    from peer import ble_bootstrap
+    ble_bootstrap.start()
+
     async with event.llm:
         # Auto-start project if configured, otherwise reset running state
         if config.main.get('core', {}).get('auto_start', False):
@@ -448,6 +460,12 @@ async def lifespan(app):
             for t in tasks:
                 t.cancel()
             await channel_manager.stop()
+            from peer.registry import registry as peer_registry
+            await peer_registry.stop()
+            from peer import dds_state
+            dds_state.stop()
+            from peer import ble_bootstrap
+            ble_bootstrap.stop()
             try:
                 await loop.run_in_executor(None, ros2_bridge.stop)
             except (asyncio.CancelledError, RuntimeError):
@@ -517,6 +535,13 @@ app_api.include_router(api.network.router)
 
 import api.channel
 app_api.include_router(api.channel.router)
+
+import api.peer
+# CRITICAL: api.peer.router MUST come after auth_middleware is installed and
+# before any catch-all. The /api/peer/inbox/* paths are exempt in auth.py so
+# peers can authenticate with Ed25519 signatures instead of ACCESS_TOKEN, but
+# that exemption only works if the middleware sees the request first.
+app_api.include_router(api.peer.router)
 
 import api.performance
 app_api.include_router(api.performance.router)
