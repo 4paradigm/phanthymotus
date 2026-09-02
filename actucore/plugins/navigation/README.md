@@ -30,8 +30,9 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
   进度与失败原因。机器诊断保留在内部 JSON topic。
 - VLN 命中地点后直接调用同卡片 planner；无论是 Canvas 还是 VLN 入口，
   planner 都为每个新任务生成独立
-  `nav_id`。终态到达时只发布一次零速 proposal，不会继续以 5 Hz
-  刷新已结束任务；终态结果本身仍可查询和幂等重放。
+  `nav_id`。到达或手动停止时先发布一次终态零速 proposal，再确认
+  终态并允许下一个任务；已结束任务不会继续以 5 Hz 刷新，终态结果
+  本身仍可查询和幂等重放。
 - Nav2 仍只发布 `phanthy.navigation.velocity_proposal.v1`，Driver 继续负责
   物理执行、TTL、急停、二次限幅和停车确认。
 - Nav2 保留 NavFn、rolling costmap 和重规划，局部执行改为 G1 分段

@@ -151,6 +151,26 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                     )
                 )
 
+    def test_terminal_zero_precedes_status_and_stop_ack(self) -> None:
+        source = (
+            PACKAGE_ROOT / "g1_nav2" / "planner_command_node.py"
+        ).read_text(encoding="utf-8")
+        on_result = source.split("    def _on_result", 1)[1].split(
+            "    def _pause", 1
+        )[0]
+        publish_state = source.split("    def _publish_state", 1)[1].split(
+            "    def _publish_heartbeat", 1
+        )[0]
+
+        self.assertLess(
+            on_result.index("self._publish_state()"),
+            on_result.index("self._state_changed.notify_all()"),
+        )
+        self.assertLess(
+            publish_state.index("self._publish_velocity_proposal("),
+            publish_state.index("self._emit(payload)"),
+        )
+
     def test_card_motion_limits_apply_deadbands_caps_and_disable_lateral(self) -> None:
         limits = MotionLimits(
             min_x_mps=0.40,

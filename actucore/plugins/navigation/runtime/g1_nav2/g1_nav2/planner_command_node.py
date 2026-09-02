@@ -1008,8 +1008,11 @@ class PlannerCommandNode(Node):
                 self._active["status"] = "error"
                 self._active["error"] = error or f"unexpected goal status {status_code}"
             self._active["goal_handle"] = None
+            # Publish the terminal zero before stop_nav may return and admit a
+            # new nav_id.  The shared proposal publisher then preserves old
+            # terminal-zero -> new motion ordering at the Driver.
+            self._publish_state()
             self._state_changed.notify_all()
-        self._publish_state()
 
     def _pause(self, nav_id) -> dict:
         active = self._require_matching_navigation(nav_id)
@@ -1310,7 +1313,6 @@ class PlannerCommandNode(Node):
         payload.update(readiness)
         payload["execution"] = self._execution_status(readiness)
         payload["global_costmap"] = self._global_costmap_diagnostics()
-        self._emit(payload)
         if stop_proposal is not None:
             nav_id, status = stop_proposal
             self._publish_velocity_proposal(
@@ -1319,6 +1321,7 @@ class PlannerCommandNode(Node):
                 velocity=Velocity.zero(),
                 reason=f"navigation_{status}",
             )
+        self._emit(payload)
 
     def _publish_heartbeat(self) -> None:
         with self._lock:
