@@ -1,7 +1,25 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
-ARG PYPI_MIRROR
+ARG PYPI_MIRROR APT_MIRROR
+
+# The pinned ROS base may carry a site-local Ubuntu mirror. Honor the mirror
+# selected by deploy/build_core.sh before the first apt update.
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        for source in \
+          /etc/apt/sources.list \
+          /etc/apt/sources.list.d/*.list \
+          /etc/apt/sources.list.d/*.sources; do \
+            [ -f "${source}" ] || continue; \
+            sed -E -i \
+              "s|https?://archive\.ubuntu\.com|https://${APT_MIRROR}|g; \
+               s|https?://security\.ubuntu\.com|https://${APT_MIRROR}|g; \
+               s|https?://ports\.ubuntu\.com|https://${APT_MIRROR}|g; \
+               s|https?://mirrors\.tencentyun\.com|https://${APT_MIRROR}|g" \
+              "${source}"; \
+        done; \
+    fi && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault).
 # --retry survives the transient TLS drops this network path has hit more than
