@@ -64,7 +64,8 @@ Agent Core 会把消息里的 `goal_id` 作为私有任务 ID 传给 planner；�
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
 `(0, 200] ms`。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
 几何契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable` 或
-`raw_odom_discontinuity`，不会继续生成伪正常地图。
+`raw_odom_discontinuity`，不会继续生成伪正常地图；几何跳变会在当前
+地图会话内锁存，需要重置或切换地图会话才能恢复。
 每次 ActuCore 运行会话使用 rosbag2 snapshot 在内存中保留最近约 5 秒
 的全频 LiDAR、IMU、FAST-LIVO2 raw odom 和 IMU 传播 odom；首次
 `raw_odom_discontinuity` 后再采 5 秒，仅落盘一份 MCAP 到
@@ -72,9 +73,10 @@ LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一�
 显示 `armed/post_trigger/saved/error`、触发原因和产物目录；没有故障时
 停卡会丢弃空快照，不会将常态全频数据写入磁盘。录包进程不创建独立
 进程组，会随 FAST-LIVO2 runtime 的 stop/restart 一起回收，避免多个全频
-recorder 重复订阅传感器。FAST-LIVO2 输入和故障录包都使用 Best Effort
-小队列；计算出现瞬时积压时优先丢弃旧帧，避免旧 LiDAR/IMU 排队后继续
-参与实时估计或由诊断录包反压传感器链路。
+recorder 重复订阅传感器。FAST-LIVO2 输入使用 Best Effort：LiDAR 只保留
+最新 2 帧，IMU 保留 400 帧（按 200 Hz 约 2 秒）的积分历史。计算瞬时
+积压时丢弃旧点云，但不丢掉两帧 LiDAR 之间不可替代的 IMU 运动量；
+故障录包仍使用 Best Effort snapshot，不反压传感器链路。
 单个重复或乱序样本只会被丢弃，不会立即撤销已验证的传感器合同；
 输入 freshness 窗口内持续没有新的有效 LiDAR/IMU 时间对时，状态会把
 `point_time_invalid` 放入 `sensor_contract_issues` 诊断，但只要 FAST-LIVO2
@@ -147,8 +149,8 @@ Canvas 编码在 latest-only 后台任务中执行，
 导航高度带的三组点分别保留显示预算，避免地面被大量障碍点截断；该采样只
 影响监控，不改变规划输入。显示帧直接编码已经分别有界的静态、范围外和实时
 点源，不再构造一次性全图体素副本，避免 Canvas 更新拖慢 Nav2 所依赖的 odom
-与 registered cloud。点云主体按 1 Hz 重编码并缓存；缓存帧只替换前 12 字节的
-机器人 `x/y/yaw`，以 1 Hz 发布；Canvas 编码/发布串行且 DDS 只保留最新一帧，
+与 registered cloud。点云主体按 1 Hz 重编码并缓存，编码完成后在同一次
+回调中立即替换前 12 字节的机器人 `x/y/yaw` 并发布；DDS 只保留最新一帧，
 因此慢显示不会堆积并挤占 odom/registered cloud 回调。
 FAST-LIVO2 diagnostics 的 `latency_ms` / `latency_max_ms` 分别报告最近值和进程内
 最大值，包含 `cloud_decode`、`cloud_pose_wait`、`cloud_transform_filter`、

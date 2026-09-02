@@ -325,11 +325,6 @@ class FastLivo2Adapter(Node):
             self._publish_periodic,
             callback_group=self._display_callbacks,
         )
-        self.create_timer(
-            1.0 / _MAP_VIEW_POSE_REFRESH_HZ,
-            self._publish_map_view,
-            callback_group=self._display_callbacks,
-        )
         self._mapping_worker = threading.Thread(
             target=self._mapping_worker_main,
             name="g1-fast-livo2-static-map",
@@ -1744,6 +1739,7 @@ class FastLivo2Adapter(Node):
                 state["map_view_cache_monotonic"] = self._map_view_cache_monotonic
                 state["latency_ms"] = dict(self._latency_ms)
                 state["latency_max_ms"] = dict(self._latency_max_ms)
+            self._publish_map_view()
         with self._mapping_work_condition:
             mapping_work_dropped = self._mapping_work_dropped
         ready = (

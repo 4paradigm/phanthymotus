@@ -50,7 +50,7 @@ from g1_fast_livo2.runtime_core import controlled_stop_succeeded  # noqa: E402
 
 
 class FastLivo2FrameAdapterTest(unittest.TestCase):
-    def test_raw_odom_discontinuity_recovers_after_three_healthy_samples(self) -> None:
+    def test_geometric_raw_odom_discontinuity_latches_until_reset(self) -> None:
         monitor = OdomHealthMonitor()
         identity = Quaternion(0.0, 0.0, 0.0, 1.0)
 
@@ -59,10 +59,24 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
             monitor.observe(1_100_000_000, Pose3(1000.0, 0.0, 0.0, identity))
         )
         self.assertEqual(monitor.reason, "raw_odom_discontinuity")
+        self.assertTrue(monitor.diagnostics()["latched"])
+        self.assertFalse(monitor.observe(1_200_000_000, Pose3(0.2, 0.0, 0.0, identity)))
+        self.assertFalse(monitor.observe(1_300_000_000, Pose3(0.3, 0.0, 0.0, identity)))
+        self.assertFalse(monitor.observe(1_400_000_000, Pose3(0.4, 0.0, 0.0, identity)))
+        monitor.reset()
+        self.assertTrue(monitor.observe(1_500_000_000, Pose3(0.0, 0.0, 0.0, identity)))
+        self.assertEqual(monitor.state, "ready")
+
+    def test_nonadvancing_raw_odom_stamp_can_recover(self) -> None:
+        monitor = OdomHealthMonitor()
+        identity = Quaternion(0.0, 0.0, 0.0, 1.0)
+
+        self.assertTrue(monitor.observe(1_000_000_000, Pose3(0.0, 0.0, 0.0, identity)))
+        self.assertFalse(monitor.observe(1_000_000_000, Pose3(0.0, 0.0, 0.0, identity)))
+        self.assertFalse(monitor.diagnostics()["latched"])
         self.assertFalse(monitor.observe(1_100_000_000, Pose3(0.1, 0.0, 0.0, identity)))
         self.assertFalse(monitor.observe(1_200_000_000, Pose3(0.2, 0.0, 0.0, identity)))
         self.assertTrue(monitor.observe(1_300_000_000, Pose3(0.3, 0.0, 0.0, identity)))
-        self.assertEqual(monitor.state, "ready")
 
     def test_raw_odom_initial_pose_and_rotation_rate_fail_closed(self) -> None:
         identity = Quaternion(0.0, 0.0, 0.0, 1.0)

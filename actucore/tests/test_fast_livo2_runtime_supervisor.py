@@ -1397,7 +1397,19 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(result["status"], "flushed")
         self.assertEqual(result["pcd_files"], ["tail_raw_points.pcd"])
         command = run.call_args.args[0]
-        self.assertEqual(command[:5], ["ros2", "param", "set", "/laserMapping", "pcd_save.flush_sequence"])
+        self.assertEqual(
+            command[:-1],
+            [
+                "ros2",
+                "param",
+                "set",
+                "--no-daemon",
+                "--spin-time",
+                "5.0",
+                "/laserMapping",
+                "pcd_save.flush_sequence",
+            ],
+        )
         self.assertEqual(run.call_args.kwargs["timeout"], 12.0)
 
     def test_stop_mapping_keeps_algorithm_running_when_raw_flush_fails(self) -> None:

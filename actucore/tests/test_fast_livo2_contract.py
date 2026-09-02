@@ -128,7 +128,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=c4d6ebc202663464c796ce50b4cd82e6563c1ddab3edfbda90695e43ed214607",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=d4941c43262c82b5d1178af40de82e571da65c55a8e0b5157d1044f67aaf39b2",
             source_lock,
         )
         self.assertIn(
@@ -143,7 +143,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
         runtime_patch_text = runtime_patch.read_text(encoding="utf-8")
         self.assertIn("kPointCloudQueueDepth = 2", runtime_patch_text)
-        self.assertIn("kImuQueueDepth = 20", runtime_patch_text)
+        self.assertIn("kImuQueueDepth = 400", runtime_patch_text)
         self.assertIn("rclcpp::SensorDataQoS", runtime_patch_text)
         self.assertIn("import numpy, rosbag2_py", dockerfile)
         self.assertIn("ros2 bag record --help", dockerfile)
@@ -193,7 +193,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "c4d6ebc202663464c796ce50b4cd82e6563c1ddab3edfbda90695e43ed214607",
+            "d4941c43262c82b5d1178af40de82e571da65c55a8e0b5157d1044f67aaf39b2",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
@@ -338,6 +338,8 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("max_points=_MAP_VIEW_MAX_POINTS", adapter)
         self.assertIn("_MAP_VIEW_MAX_POINTS = 40_000", adapter)
         self.assertIn("_MAP_VIEW_POSE_REFRESH_HZ = 1.0", adapter)
+        self.assertNotIn("1.0 / _MAP_VIEW_POSE_REFRESH_HZ", adapter)
+        self.assertIn("            self._publish_map_view()", adapter)
         self.assertIn("MutuallyExclusiveCallbackGroup", adapter)
         self.assertIn("self._display_callbacks = MutuallyExclusiveCallbackGroup()", adapter)
         self.assertIn("map_view_qos = QoSProfile(", adapter)

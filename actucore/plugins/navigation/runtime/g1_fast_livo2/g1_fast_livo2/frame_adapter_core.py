@@ -107,6 +107,7 @@ class OdomHealthMonitor:
         self.reason: str | None = None
         self.detail: str | None = None
         self.healthy_streak = 0
+        self._latched = False
         self._last_stamp_ns: int | None = None
         self._last_pose: Pose3 | None = None
         self._require_near_origin = bool(require_near_origin)
@@ -121,9 +122,12 @@ class OdomHealthMonitor:
             "reason": self.reason,
             "detail": self.detail,
             "healthy_streak": self.healthy_streak,
+            "latched": self._latched,
         }
 
     def observe(self, stamp_ns: int, pose: Pose3) -> bool:
+        if self._latched:
+            return False
         stamp_ns = int(stamp_ns)
         if stamp_ns <= 0:
             return self._reject("source stamp must be positive")
@@ -141,7 +145,8 @@ class OdomHealthMonitor:
             ) > self.max_initial_distance_m:
                 return self._reject(
                     "initial position exceeds "
-                    f"{self.max_initial_distance_m:.3f} m"
+                    f"{self.max_initial_distance_m:.3f} m",
+                    latch=True,
                 )
             return self._accept(stamp_ns, normalized)
 
@@ -156,7 +161,8 @@ class OdomHealthMonitor:
         if distance / elapsed > self.max_linear_speed_mps:
             return self._reject(
                 f"linear speed {distance / elapsed:.3f} m/s exceeds "
-                f"{self.max_linear_speed_mps:.3f} m/s"
+                f"{self.max_linear_speed_mps:.3f} m/s",
+                latch=True,
             )
         left = normalize_quaternion(self._last_pose.q)
         right = normalized.q
@@ -168,7 +174,8 @@ class OdomHealthMonitor:
         if angular_speed > self.max_angular_speed_rps:
             return self._reject(
                 f"angular speed {angular_speed:.3f} rad/s exceeds "
-                f"{self.max_angular_speed_rps:.3f} rad/s"
+                f"{self.max_angular_speed_rps:.3f} rad/s",
+                latch=True,
             )
         return self._accept(stamp_ns, normalized)
 
@@ -188,11 +195,12 @@ class OdomHealthMonitor:
         )
         return self.ready
 
-    def _reject(self, detail: str) -> bool:
+    def _reject(self, detail: str, *, latch: bool = False) -> bool:
         self.state = "fault"
         self.reason = "raw_odom_discontinuity"
         self.detail = detail
         self.healthy_streak = 0
+        self._latched = bool(latch)
         return False
 
 

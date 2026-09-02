@@ -61,8 +61,10 @@ PointCloud2 的 XYZ 解码、刚体变换、高度过滤和 float32 输出打包
 每帧还必须包含单调 `timestamp`，且点时间位于 header 后 `200 ms` 内并具有
 非零跨度。adapter 只从 TF2 获取 `base_link -> sensor_frame`，不再保存本体
 专用六自由度外参。首个 raw odom 离会话原点超过 `2 m`、相邻线速度超过
-`10 m/s` 或角速度超过 `4π rad/s` 时进入 `raw_odom_discontinuity`；连续三个
-健康样本后才恢复。frame、TF、点时间或 odom 健康任一失败时，registered
+`10 m/s` 或角速度超过 `4π rad/s` 时进入 `raw_odom_discontinuity`，并在当前
+地图会话内锁存；仅 reset、新建/加载地图或成功重定位会解除。重复时间戳等
+非几何异常仍可在连续三个健康样本后自动恢复；普通输入 freshness 断流也
+仍在新有效帧到来后恢复。frame、TF、点时间或 odom 健康任一失败时，registered
 cloud、静态累计和 Nav2 输入全部 fail-closed。
 
 ## 输出
@@ -100,9 +102,10 @@ Nav2，也不会进入累计。不匹配帧进入 diagnostics 计数，不能拿
 累计；加载旧图时从 raw PCD 恢复。它们只用于 Canvas 阈值调试，不进入
 registered cloud、累计静态图或 Nav2 costmap。`map_view` 最多编码 80,000 点，
 对低于、位于和高于导航高度带的点分别保留预算，因此地面不会被先写入的
-障碍点挤出前端上限。地图点主体每秒编码一次并缓存，机器人 `x/y/yaw` 只更新
-固定 12 字节头部并以 1 Hz 发布；两个 Canvas 定时任务串行且只保留最新一帧，
-避免大帧 DDS 发布堆积后抢占 odom/registered cloud 回调。位姿刷新不再重复编码
+障碍点挤出前端上限。地图点主体每秒编码一次并缓存，编码完成后在同一定时
+回调中更新机器人 `x/y/yaw` 的固定 12 字节头部并立即发布，不再用第二个过期
+定时器争抢同一回调组；DDS 只保留最新一帧，避免大帧发布堆积后抢占
+odom/registered cloud 回调。位姿刷新不再重复编码
 整张地图。现有渲染器
 继续按高度显示范围外点为蓝色/粉色。
 Agent Core 在显示层
@@ -175,7 +178,8 @@ FAST-LIVO2 在受控 `SIGINT` 收口期间可因上游 C++ 析构路径返回
 raw PCD 不再依赖上述退出路径触发析构：supervisor 先设置内部
 `pcd_save.flush_sequence`，只有 FAST-LIVO2 同线程完成原子写盘且本会话出现新
 PCD 后才发送停止信号。落盘失败或超时会返回可重试错误并保持建图进程运行，
-不会先停算法再留下无法恢复的 `map_artifact_missing`。
+不会先停算法再留下无法恢复的 `map_artifact_missing`。参数写入使用不经 daemon 的
+直连 ROS 图发现并等待 5 秒，避免首次 stop 时 daemon 尚未发现 `/laserMapping`。
 
 重定位的操作顺序为：
 

@@ -4,11 +4,11 @@ diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
 @@ -309,11 +309,20 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node,
  {
    image_transport::ImageTransport it(this->node);
-+  // This node services subscriptions and mapping in one spin_some loop. Huge
-+  // reader histories preserve stale samples and can make the estimator lag
-+  // indefinitely when a transient load spike occurs.
++  // This node services subscriptions and mapping in one spin_some loop. Keep
++  // LiDAR latest-only, but retain enough high-rate IMU integration history to
++  // span transient mapping work without dropping motion between scans.
 +  constexpr size_t kPointCloudQueueDepth = 2;
-+  constexpr size_t kImuQueueDepth = 20;
++  constexpr size_t kImuQueueDepth = 400;
 +  rclcpp::SensorDataQoS point_cloud_qos;
 +  point_cloud_qos.keep_last(kPointCloudQueueDepth);
 +  rclcpp::SensorDataQoS imu_qos;
