@@ -114,6 +114,7 @@ class Nav2Plugin:
         raw_cfg.pop("enabled", None)
         self._executor = executor
         self._backend_override = backend
+        self._completion_callback = None
         self._lifecycle_lock = threading.RLock()
         self._core: Nav2Core | None = None
         self._canvas_started = False
@@ -128,6 +129,25 @@ class Nav2Plugin:
 
     def get_tools(self) -> list:
         return [nav2_tool_definition(self._cfg["namespace"])]
+
+    def set_completion_callback(self, callback) -> None:
+        with self._lifecycle_lock:
+            self._completion_callback = callback
+
+    def _emit_completion(self, result: dict) -> None:
+        with self._lifecycle_lock:
+            callback = self._completion_callback
+        action_id = result.get("nav_id")
+        if not callable(callback) or not isinstance(action_id, str):
+            return
+        callback(
+            {
+                "type": "action_complete",
+                "action_id": action_id,
+                "status": result.get("status") or result.get("state"),
+                "payload": dict(result),
+            }
+        )
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         if name != "nav2":
@@ -357,7 +377,9 @@ class Nav2Plugin:
                 backend = self._backend_override
                 if backend is None:
                     backend = self._build_backend()
-                self._core = Nav2Core(backend)
+                self._core = Nav2Core(
+                    backend, completion_callback=self._emit_completion
+                )
             return self._core
 
     def _release_core(self) -> None:

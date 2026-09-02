@@ -401,6 +401,19 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "required_fields": ["x", "y", "yaw"],
                 }
             ],
+            "x-completion": {
+                "actions": ["navigate_to_pose"],
+                "timeout": 3600,
+                "passthrough_actions": [
+                    "wait_navigation_done",
+                    "pause_nav",
+                    "resume_nav",
+                    "stop_nav",
+                ],
+            },
+            "x-hooks": {
+                "on_interrupt_navigation": {"action": "stop_nav"},
+            },
         },
         "configSchema": deepcopy(NAV2_CONFIG_SCHEMA),
     }

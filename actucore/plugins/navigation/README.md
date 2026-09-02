@@ -174,19 +174,14 @@ deadline 内只做原子状态切换，并在控制回执之后发布大栅格�
 `stop_nav` 解锁；终态后迟到的 `wait_navigation_done` 会幂等返回已保存的
 终态回执。不同 `nav_id` 的迟到消息不会解锁当前任务。
 
-### 为什么不声明 `x-completion`
+### ACP 完成事件
 
-ActuCore 契约允许长时动作用 `inputSchema.x-completion` 声明 ACP 完成回调，
-但本卡片**刻意不声明**：`agent-core/src/mcp_client.py::await_pending()` 是
-**全局 barrier**（"等所有 pending"），只有注册在 `on_interrupt_*` hook 里的
-tool+action 免除。一次导航可能持续几分钟，声明后这段时间里任何
-actuator/processor 调用都会被挡住 —— 包括 TTS 说话和本卡片自己的
-`stop_nav`，等于让机器人在移动中失去"叫停"通路。
-
-现有设计已经覆盖同一需求：调用立即返回 `nav_id`，终态通过 `status` topic
-异步上报，需要阻塞语义时显式调 `wait_navigation_done`。若将来确实要
-"导航到点并在到达时通知"，前置条件是 agent-core 先支持按资源作用域的
-barrier（而不是全局），那时再加 `x-completion` 与 SSE 完成事件。
+`navigate_to_pose` 在 `inputSchema.x-completion` 中声明为长时动作，接受目标后
+返回相同值的 `nav_id`/`action_id`。Nav2 上报终态时，ActuCore 通过 SSE 发布
+匹配的 `action_complete`，Agent Core 因而不会把“已开始导航”误当成“已到达”。
+ACP barrier 按原始工具名隔离，不阻塞 TTS 等其他卡片；本卡片的
+`wait_navigation_done`、`pause_nav`、`resume_nav`、`stop_nav` 是明确的控制旁路，
+系统打断则通过 `on_interrupt_navigation` 调用 `stop_nav`。
 
 Canvas 手动执行 `navigate_to_pose` 时，Agent Core 只透明转发 MCP
 请求。planner 接受目标后生成新 `nav_id`，并在整个任务的

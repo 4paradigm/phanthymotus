@@ -280,6 +280,45 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         self.assertEqual(backend.execute_calls[-1][0], "stop_nav")
         self.assertEqual(backend.stop_calls, 1)
 
+    def test_terminal_navigation_emits_matching_completion_event(self) -> None:
+        backend = ReadyBackend()
+        completions = []
+        plugin = Nav2Plugin({}, None, backend=backend)
+        plugin.set_completion_callback(completions.append)
+        plugin.dispatch(
+            "nav2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        moving = plugin.dispatch(
+            "nav2",
+            {
+                "action": "navigate_to_pose",
+                "x": 0.5,
+                "y": 0.0,
+                "yaw": 0.0,
+                "_control_nav_id": "lease-complete",
+            },
+        )
+
+        plugin._core._on_navigation_terminal(
+            {"status": "arrived", "nav_id": moving["nav_id"]}
+        )
+
+        self.assertEqual(
+            completions,
+            [
+                {
+                    "type": "action_complete",
+                    "action_id": "lease-complete",
+                    "status": "arrived",
+                    "payload": {
+                        "status": "arrived",
+                        "nav_id": "lease-complete",
+                        "action_id": "lease-complete",
+                    },
+                }
+            ],
+        )
+
     def test_unconfirmed_active_stop_keeps_nav2_runtime_for_retry(self) -> None:
         backend = StopRejectingBackend()
         plugin = Nav2Plugin({}, None, backend=backend)

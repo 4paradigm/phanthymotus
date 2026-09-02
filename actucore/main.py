@@ -124,7 +124,12 @@ class ActuCoreBundle:
                     "built-in navigation runtime currently requires namespace=ubuntu"
                 )
             from plugins.navigation import NavigationPlugin
-            plugin = NavigationPlugin(navigation_cfg, namespace, executor)
+            plugin = NavigationPlugin(
+                navigation_cfg,
+                namespace,
+                executor,
+                completion_callback=sse_push,
+            )
             self._plugins.append(plugin)
             log.info(
                 "NavigationPlugin loaded (single-container runtime, namespace=%s)",

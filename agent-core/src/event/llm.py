@@ -1109,34 +1109,46 @@ class Event:
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []
 
-            def _needs_barrier(name: str, call_args: dict = None) -> bool:
-                """actuator/processor 类型的 MCP 工具需要 ACP barrier。
-                例外：在 on_interrupt_* hook 中注册的 tool+action 免 barrier。"""
+            def _mcp_call_context(name: str, call_args: dict = None):
                 if not name.startswith('mcp__'):
-                    return False
+                    return '', '', '', {}
                 parts = name.split('__')
                 mcp_id = parts[1] if len(parts) > 1 else ''
-                # 从 split_map 获取原始 tool name + action
                 entry = mcp_client.registry.get(mcp_id)
                 if not entry:
-                    return False
+                    return mcp_id, '', '', {}
                 split_info = entry.get('split_map', {}).get(name, {})
                 if split_info:
-                    # Split tool: action is encoded in schema name
                     tool_name = split_info.get('tool', '')
                     action_name = split_info.get('action', '')
                 else:
-                    # Non-split tool: action comes from call args
                     tool_name = parts[-1] if len(parts) > 2 else ''
                     action_name = (call_args or {}).get('action', '')
+                return (
+                    mcp_id,
+                    tool_name,
+                    action_name,
+                    entry.get('tool_meta', {}).get(name, {}),
+                )
+
+            def _needs_barrier(name: str, call_args: dict = None) -> bool:
+                """Wait only for unfinished work owned by the same MCP tool."""
+                mcp_id, tool_name, action_name, meta = _mcp_call_context(
+                    name, call_args
+                )
+                if not mcp_id:
+                    return False
                 # 在 interrupt hook 中注册的 → 免 barrier
                 import hooks
                 if hooks.is_interrupt_binding(mcp_id, tool_name, action_name):
                     return False
-                meta = entry.get('tool_meta', {}).get(name)
                 if not meta:
-                    return True  # 无 meta 默认 barrier（安全）
-                return meta.get('type') not in ('sensor', 'resource')
+                    return bool(mcp_client.get_pending_for_tool(tool_name))
+                if meta.get('type') in ('sensor', 'resource'):
+                    return False
+                return mcp_client.pending_conflicts(
+                    tool_name, action_name, meta.get('completion')
+                )
 
             async def _dispatch(call: dict) -> dict:
                 name   = call['function']['name']
@@ -1167,9 +1179,14 @@ class Event:
                 elif name in self._sys_tools:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
-                    # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
+                    # ACP barrier: only serialize unfinished work on this tool.
                     if mcp_client.get_pending_actions() and _needs_barrier(name, args):
-                        await mcp_client.await_pending(cancel_event, timeout=120)
+                        _mcp_id, pending_tool, _action, _meta = _mcp_call_context(
+                            name, args
+                        )
+                        await mcp_client.await_pending(
+                            cancel_event, timeout=120, tool_name=pending_tool
+                        )
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     # Inject instance_id from canvas binding (multiInstance tools need it)
@@ -1179,12 +1196,7 @@ class Event:
                     # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
                     if not _needs_barrier(name, args) and mcp_client.get_pending_actions():
                         import hooks as _hooks
-                        parts = name.split('__')
-                        _mcp_id = parts[1] if len(parts) > 1 else ''
-                        _entry = mcp_client.registry.get(_mcp_id, {})
-                        _split = _entry.get('split_map', {}).get(name, {})
-                        _tool = _split.get('tool', parts[-1] if len(parts) > 2 else '')
-                        _act = _split.get('action', args.get('action', ''))
+                        _mcp_id, _tool, _act, _meta = _mcp_call_context(name, args)
                         if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
                             for aid in list(mcp_client._pending_actions.keys()):
                                 mcp_client._pending_results[aid] = {

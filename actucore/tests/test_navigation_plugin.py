@@ -300,16 +300,18 @@ class NavigationContractTest(unittest.TestCase):
         for action in action_params.values():
             self.assertTrue(set(action["params"]) <= set(properties))
 
-    def test_long_running_navigation_does_not_declare_acp_completion(self):
-        """agent-core 的 await_pending() 是全局 barrier，导航不能挂上去。
-
-        一次导航可能几分钟，声明 x-completion 会让这段时间里所有
-        actuator/processor 调用（含 TTS 与本卡片自己的 stop_nav）都被挡住，
-        等于移动中失去叫停通路。阻塞语义走显式 wait_navigation_done。
-        """
+    def test_long_running_navigation_declares_scoped_acp_completion(self):
         tool = navigation_tool_definition("ubuntu")
-        self.assertNotIn("x-completion", tool["inputSchema"])
-        self.assertNotIn("x-completion", tool)
+        completion = tool["inputSchema"]["x-completion"]
+        self.assertEqual(completion["actions"], ["navigate_to_pose"])
+        self.assertEqual(
+            set(completion["passthrough_actions"]),
+            {"wait_navigation_done", "pause_nav", "resume_nav", "stop_nav"},
+        )
+        self.assertEqual(
+            tool["inputSchema"]["x-hooks"]["on_interrupt_navigation"],
+            {"action": "stop_nav"},
+        )
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertIn("wait_navigation_done", actions)
         self.assertIn("stop_nav", actions)

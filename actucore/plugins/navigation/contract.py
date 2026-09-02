@@ -210,6 +210,8 @@ def navigation_tool_definition(namespace: str) -> dict:
             "x-topic-actions": deepcopy(
                 planning["inputSchema"]["x-topic-actions"]
             ),
+            "x-completion": deepcopy(planning["inputSchema"]["x-completion"]),
+            "x-hooks": deepcopy(planning["inputSchema"]["x-hooks"]),
         },
         "configSchema": deepcopy(NAVIGATION_CONFIG_SCHEMA),
     }

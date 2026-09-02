@@ -324,6 +324,30 @@ def _odometry_payload(msg) -> dict:
     }
 
 
+def _imu_payload(msg) -> dict:
+    return {
+        'schema': 'phanthy.sensor.imu.v1',
+        'frame_id': str(msg.header.frame_id),
+        'stamp_ns': _stamp_ns(msg.header),
+        'orientation': {
+            'x': float(msg.orientation.x),
+            'y': float(msg.orientation.y),
+            'z': float(msg.orientation.z),
+            'w': float(msg.orientation.w),
+        },
+        'angular_velocity': {
+            'x': float(msg.angular_velocity.x),
+            'y': float(msg.angular_velocity.y),
+            'z': float(msg.angular_velocity.z),
+        },
+        'linear_acceleration': {
+            'x': float(msg.linear_acceleration.x),
+            'y': float(msg.linear_acceleration.y),
+            'z': float(msg.linear_acceleration.z),
+        },
+    }
+
+
 def _path_payload(msg) -> dict:
     poses = []
     for stamped_pose in msg.poses:
@@ -408,6 +432,10 @@ def _encode_message(msg, fmt: str) -> bytes:
         return json.dumps(
             _odometry_payload(msg), separators=(',', ':'), allow_nan=False
         ).encode('utf-8')
+    if fmt == 'sensor/imu':
+        return json.dumps(
+            _imu_payload(msg), separators=(',', ':'), allow_nan=False
+        ).encode('utf-8')
     if fmt == 'sensor/path':
         return json.dumps(
             _path_payload(msg), separators=(',', ':'), allow_nan=False
@@ -439,6 +467,13 @@ def _resolve_msg_type(fmt: str):
         try:
             from sensor_msgs.msg import PointCloud2
             return PointCloud2
+        except ImportError:
+            pass
+        return None
+    if fmt == 'sensor/imu':
+        try:
+            from sensor_msgs.msg import Imu
+            return Imu
         except ImportError:
             pass
         return None

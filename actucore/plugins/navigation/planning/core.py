@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import uuid
@@ -9,6 +10,9 @@ from collections import OrderedDict
 from typing import Protocol
 
 from .contract import NAV2_ACTIONS
+
+
+log = logging.getLogger(__name__)
 
 
 class NavigationBackendError(RuntimeError):
@@ -153,8 +157,9 @@ def _trusted_nav_id(args: dict) -> str | None:
 class Nav2Core:
     """Validate the frozen contract and serialize one active navigation task."""
 
-    def __init__(self, backend: NavigationBackend):
+    def __init__(self, backend: NavigationBackend, *, completion_callback=None):
         self._backend = backend
+        self._completion_callback = completion_callback
         self._lock = threading.Lock()
         self._active_nav_id: str | None = None
         self._last_terminal_result: dict | None = None
@@ -238,6 +243,7 @@ class Nav2Core:
                         "action": action,
                         "status": "navigating",
                         "nav_id": trusted_nav_id,
+                        "action_id": trusted_nav_id,
                         "idempotent_replay": True,
                     }
                 raise NavigationBackendError(
@@ -283,6 +289,7 @@ class Nav2Core:
                 if self._active_nav_id == nav_id and trusted_nav_id is None:
                     self._active_nav_id = None
             raise
+        result.setdefault("action_id", nav_id)
         if result.get("status") in _TERMINAL_STATUSES:
             self._on_navigation_terminal(result)
         return result
@@ -329,15 +336,23 @@ class Nav2Core:
         status = result.get("status") or result.get("state")
         if not isinstance(nav_id, str) or status not in _TERMINAL_STATUSES:
             return
+        callback = None
         with self._lock:
             if self._active_nav_id != nav_id:
                 return
             result.setdefault("status", status)
+            result.setdefault("action_id", nav_id)
             self._active_nav_id = None
             self._last_terminal_result = result
             if nav_id in self._trusted_requests:
                 self._terminal_results[nav_id] = dict(result)
                 self._terminal_results.move_to_end(nav_id)
+            callback = self._completion_callback
+        if callable(callback):
+            try:
+                callback(dict(result))
+            except Exception:
+                log.exception("navigation completion callback failed")
 
     @staticmethod
     def _result(action: str, raw: dict | None, *, nav_id: str | None = None) -> dict:

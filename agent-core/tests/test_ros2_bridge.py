@@ -141,11 +141,29 @@ class Ros2BridgeNavigationEncodingTest(unittest.TestCase):
         self.assertEqual(payload["schema"], "phanthy.navigation.costmap.v1")
         self.assertEqual(payload["data"], [-1, 100])
 
+    def test_imu_is_encoded_as_sensor_json(self) -> None:
+        message = SimpleNamespace(
+            header=_header(frame_id="navigation_sensor"),
+            orientation=SimpleNamespace(x=0.1, y=0.2, z=0.3, w=0.9),
+            angular_velocity=_vector(1.0, 2.0, 3.0),
+            linear_acceleration=_vector(4.0, 5.0, 6.0),
+        )
+
+        payload = json.loads(ros2_bridge._encode_message(message, "sensor/imu"))
+
+        self.assertEqual(payload["schema"], "phanthy.sensor.imu.v1")
+        self.assertEqual(payload["frame_id"], "navigation_sensor")
+        self.assertEqual(payload["stamp_ns"], 12_000_000_034)
+        self.assertEqual(payload["angular_velocity"]["z"], 3.0)
+        self.assertEqual(payload["linear_acceleration"]["x"], 4.0)
+
     def test_navigation_formats_resolve_to_their_declared_ros_types(self) -> None:
         sensor_msgs = ModuleType("sensor_msgs")
         sensor_msgs_msg = ModuleType("sensor_msgs.msg")
         pointcloud_type = type("PointCloud2", (), {})
+        imu_type = type("Imu", (), {})
         sensor_msgs_msg.PointCloud2 = pointcloud_type
+        sensor_msgs_msg.Imu = imu_type
         sensor_msgs.msg = sensor_msgs_msg
         nav_msgs = ModuleType("nav_msgs")
         nav_msgs_msg = ModuleType("nav_msgs.msg")
@@ -163,6 +181,7 @@ class Ros2BridgeNavigationEncodingTest(unittest.TestCase):
                 ros2_bridge._resolve_msg_type("sensor/pointcloud"),
                 pointcloud_type,
             )
+            self.assertIs(ros2_bridge._resolve_msg_type("sensor/imu"), imu_type)
             self.assertIs(
                 ros2_bridge._resolve_msg_type("sensor/occupancy-grid"),
                 occupancy_type,

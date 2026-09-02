@@ -50,6 +50,7 @@ class NavigationPlugin:
         mapping_plugin=None,
         planning_plugin=None,
         semantic_plugin=None,
+        completion_callback=None,
     ):
         raw_cfg = dict(plugin_cfg or {})
         raw_cfg.pop("enabled", None)
@@ -79,6 +80,11 @@ class NavigationPlugin:
         self._runtime = runtime or NavigationRuntime()
         self._mapping = mapping_plugin or FastLivo2Plugin(mapping_cfg, executor)
         self._planning = planning_plugin or Nav2Plugin(planning_cfg, executor)
+        set_completion_callback = getattr(
+            self._planning, "set_completion_callback", None
+        )
+        if callable(set_completion_callback):
+            set_completion_callback(completion_callback)
         self._semantic = semantic_plugin or VisionAndLanguageNavigationPlugin(
             semantic_cfg,
             self._namespace,

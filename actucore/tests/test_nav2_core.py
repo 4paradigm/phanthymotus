@@ -54,7 +54,10 @@ class FakeBackend:
 class Nav2CoreTest(unittest.TestCase):
     def setUp(self) -> None:
         self.backend = FakeBackend()
-        self.core = Nav2Core(self.backend)
+        self.completions = []
+        self.core = Nav2Core(
+            self.backend, completion_callback=self.completions.append
+        )
 
     def test_navigation_uses_trusted_id_and_safe_default_speed(self) -> None:
         result = self.core.dispatch(
@@ -69,6 +72,7 @@ class Nav2CoreTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "navigating")
         self.assertEqual(result["nav_id"], "lease-001")
+        self.assertEqual(result["action_id"], "lease-001")
         action, args, nav_id = self.backend.calls[-1]
         self.assertEqual(action, "navigate_to_pose")
         self.assertEqual(nav_id, "lease-001")
@@ -80,6 +84,7 @@ class Nav2CoreTest(unittest.TestCase):
         )
         self.assertEqual(terminal["status"], "arrived")
         self.assertIsNone(self.core.info()["active_nav_id"])
+        self.assertEqual(self.completions[-1]["status"], "arrived")
 
     def test_minimum_navigation_speed_is_accepted(self) -> None:
         result = self.core.dispatch(
@@ -114,6 +119,7 @@ class Nav2CoreTest(unittest.TestCase):
         self.backend.emit_terminal("lease-first")
 
         self.assertIsNone(self.core.info()["active_nav_id"])
+        self.assertEqual(self.completions[-1]["action_id"], "lease-first")
         terminal = self.core.dispatch(
             {"action": "wait_navigation_done", "stall_timeout": 2}
         )
@@ -150,6 +156,7 @@ class Nav2CoreTest(unittest.TestCase):
         self.assertEqual(first["status"], "navigating")
         self.assertTrue(active_replay["idempotent_replay"])
         self.assertEqual(terminal_replay["status"], "arrived")
+        self.assertEqual(terminal_replay["action_id"], "goal-idempotent")
         self.assertTrue(terminal_replay["idempotent_replay"])
         navigate_calls = [call for call in self.backend.calls if call[0] == "navigate_to_pose"]
         self.assertEqual(len(navigate_calls), 1)
