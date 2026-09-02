@@ -139,9 +139,12 @@ def depth_driver_metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
             "width": 2,
             "height": 2,
             "step_bytes": 4,
-            "payload_size": 8,
-            "unit": "meter",
+            "compression": {"codec": "zlib", "level": 1},
+            "uncompressed_size": 8,
+            "payload_size": 16,
+            "unit": "realsense_depth_unit",
             "depth_scale_m": 0.001,
+            "depth_scale_semantics": "meters_per_realsense_depth_unit",
             "aligned_to_rgb": False,
         },
         "calibration": {
@@ -232,12 +235,24 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
         decoded, depth = decode_depth(payload)
         self.assertEqual(decoded["calibration_id"], "sha256:test")
         self.assertEqual(decoded["depth_scale_m"], 0.001)
+        self.assertEqual(decoded["compression"]["codec"], "zlib")
+        self.assertEqual(decoded["unit"], "realsense_depth_unit")
         self.assertEqual(depth, raw_depth)
 
         invalid = depth_driver_metadata()
         invalid["calibration"]["depth_scale_m"] = 0.002
         with self.assertRaisesRegex(InvalidCameraDepthFrame, "scales disagree"):
             encode_depth(invalid, raw_depth)
+
+        invalid = depth_driver_metadata()
+        invalid["image"]["compression"]["codec"] = "none"
+        with self.assertRaisesRegex(InvalidCameraDepthFrame, "codec must be zlib"):
+            encode_depth(invalid, raw_depth)
+
+        corrupted = bytearray(payload)
+        corrupted[-1] ^= 0xFF
+        with self.assertRaisesRegex(InvalidCameraDepthFrame, "zlib payload"):
+            decode_depth(bytes(corrupted))
 
     def test_annotation_outputs_session_id_nearest_point_and_distance(self) -> None:
         stamp = metadata()["source_stamp_ns"]

@@ -177,7 +177,11 @@ def read_rosbag_recording_summary(
         }
 
     message_count = int(information.get("message_count", 0))
-    reasons = ["recording_empty"] if message_count == 0 else []
+    sample_message_count = sum(
+        int(topic_counts.get(item["record_topic"], 0))
+        for item in COLLECTION_SOURCES
+    )
+    reasons = ["recording_empty"] if sample_message_count == 0 else []
     topics = {}
     for item in COLLECTION_SOURCES:
         port = item["port"]
@@ -210,6 +214,7 @@ def read_rosbag_recording_summary(
             for item in COLLECTION_EVENT_TOPICS
         },
         "message_count": message_count,
+        "sample_message_count": sample_message_count,
         "duration_ns": int(information.get("duration", {}).get("nanoseconds", 0)),
     }
 

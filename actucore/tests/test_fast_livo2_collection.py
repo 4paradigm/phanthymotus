@@ -426,6 +426,35 @@ class FastLivo2CollectionTest(unittest.TestCase):
             )
             self.assertEqual(summary["topics"]["lidar"]["sampled_count"], 0)
 
+    def test_event_only_rosbag_is_never_reported_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            event_topic = COLLECTION_EVENT_TOPICS[0]["topic"]
+            Path(temporary, "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n"
+                "  message_count: 4\n"
+                "  duration:\n"
+                "    nanoseconds: 1000000000\n"
+                "  topics_with_message_count:\n"
+                "  - topic_metadata:\n"
+                f"      name: {event_topic}\n"
+                "    message_count: 4\n",
+                encoding="utf-8",
+            )
+            observed = {
+                item["port"]: {"count": 12, "sampled_count": 0}
+                for item in COLLECTION_SOURCES
+            }
+
+            summary = read_rosbag_recording_summary(temporary, observed)
+
+            self.assertFalse(summary["healthy"])
+            self.assertEqual(summary["failure_reasons"], ["recording_empty"])
+            self.assertEqual(summary["message_count"], 4)
+            self.assertEqual(summary["sample_message_count"], 0)
+            self.assertEqual(
+                summary["events"]["sensor_rejection"]["recorded_count"], 4
+            )
+
     def test_finalize_writes_receipt_and_only_renames_complete_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_root:
             root = Path(temporary_root)

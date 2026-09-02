@@ -293,9 +293,14 @@ LiDAR/IMU 运动对齐，不会错误要求高频 IMU 同时贴近 RGB 锚点。
 | Odom | `/ubuntu/navigation/odom` | `Odometry` |
 
 启用数采时 RGB frame 和 Depth frame 都是条件必需输入。Depth frame 的 PSE1 元数据已
-包含 Z16 编码、`depth_scale_m`、深度/RGB 内参、`depth_to_rgb` 和
+包含 Z16 编码、zlib level-1 无损压缩、压缩/解压字节数、
+`depth_scale_m`、`unit=realsense_depth_unit`、
+`depth_scale_semantics=meters_per_realsense_depth_unit`、深度/RGB 内参、
+`depth_to_rgb` 和
 LiDAR-to-camera 外参，因此不再需要单独的 `CameraInfo` topic。任一 PSE1
-封装、尺寸、尺度、标定或时间戳校验失败，该帧不会进入对齐快照。
+封装、尺寸、压缩流、解压后大小、尺度、标定或时间戳校验失败，
+该帧不会进入对齐快照。ActuCore 按元数据声明的原始大小有界解压，
+不接受超长输出、拼接流或带额外尾部的 zlib payload。
 
 RGB frame 直接沿用 Driver 已发布的
 `PSE1 + uint32_le(metadata_size) + uint32_le(payload_size) + JSON + JPEG`
@@ -372,7 +377,8 @@ RGB/JSON、Depth PNG、LiDAR PCD 产物数以及暂停或失败原因。`complet
 - 上一次停止时的 receipt 和最终目录；
 - receipt 中每路 `sampled_count` / `recorded_count` /
   `recording_coverage`，用于直接暴露 rosbag 实际落盘数量与卡片发出的
-  快照数量是否一致；即使各路采样数都为 0，空 MCAP 也会以
+  快照数量是否一致；即使 MCAP 只包含 `sensor_rejection` 事件而五路
+  快照数都为 0，也会以
   `recording_empty` 明确标记为不健康；
 - `postprocess.state/stage`: `queued` / `scanning` / `processing` / `paused` /
   `finalizing` / `complete` / `degraded` / `error`；

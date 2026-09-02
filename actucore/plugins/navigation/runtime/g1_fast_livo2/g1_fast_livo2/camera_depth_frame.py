@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import struct
+import zlib
 
 
 MAGIC = b"PSE1"
@@ -13,6 +14,10 @@ ENVELOPE_FORMAT = "application/vnd.phanthy.sensor-envelope.v1"
 _HEADER = struct.Struct("<4sII")
 _MAX_METADATA_BYTES = 64 * 1024
 _MAX_DEPTH_BYTES = 32 * 1024 * 1024
+_DEPTH_COMPRESSION_CODEC = "zlib"
+_DEPTH_COMPRESSION_LEVEL = 1
+_DEPTH_UNIT = "realsense_depth_unit"
+_DEPTH_SCALE_SEMANTICS = "meters_per_realsense_depth_unit"
 
 
 class InvalidCameraDepthFrame(ValueError):
@@ -118,15 +123,37 @@ def validate_metadata(value: object) -> dict:
     payload_size = _positive_int(
         image.get("payload_size"), field="image.payload_size"
     )
+    uncompressed_size = _positive_int(
+        image.get("uncompressed_size"), field="image.uncompressed_size"
+    )
+    compression = _object(image.get("compression"), field="image.compression")
     if image.get("encoding") != "z16_le":
         raise InvalidCameraDepthFrame("image.encoding must be z16_le")
-    if step_bytes != width * 2 or payload_size != step_bytes * height:
+    expected_uncompressed_size = step_bytes * height
+    if (
+        step_bytes != width * 2
+        or uncompressed_size != expected_uncompressed_size
+        or uncompressed_size > _MAX_DEPTH_BYTES
+        or payload_size > _MAX_DEPTH_BYTES
+    ):
         raise InvalidCameraDepthFrame("depth dimensions, step, and payload size disagree")
+    if compression.get("codec") != _DEPTH_COMPRESSION_CODEC:
+        raise InvalidCameraDepthFrame(
+            f"image.compression.codec must be {_DEPTH_COMPRESSION_CODEC}"
+        )
+    if compression.get("level") != _DEPTH_COMPRESSION_LEVEL:
+        raise InvalidCameraDepthFrame(
+            f"image.compression.level must be {_DEPTH_COMPRESSION_LEVEL}"
+        )
     depth_scale_m = _positive_float(
         image.get("depth_scale_m"), field="image.depth_scale_m"
     )
-    if image.get("unit") != "meter":
-        raise InvalidCameraDepthFrame("image.unit must be meter")
+    if image.get("unit") != _DEPTH_UNIT:
+        raise InvalidCameraDepthFrame(f"image.unit must be {_DEPTH_UNIT}")
+    if image.get("depth_scale_semantics") != _DEPTH_SCALE_SEMANTICS:
+        raise InvalidCameraDepthFrame(
+            f"image.depth_scale_semantics must be {_DEPTH_SCALE_SEMANTICS}"
+        )
     if image.get("aligned_to_rgb") is not False:
         raise InvalidCameraDepthFrame("image.aligned_to_rgb must be false")
 
@@ -161,6 +188,14 @@ def validate_metadata(value: object) -> dict:
         "height": height,
         "encoding": "z16_le",
         "step_bytes": step_bytes,
+        "payload_size": payload_size,
+        "uncompressed_size": uncompressed_size,
+        "compression": {
+            "codec": _DEPTH_COMPRESSION_CODEC,
+            "level": _DEPTH_COMPRESSION_LEVEL,
+        },
+        "unit": _DEPTH_UNIT,
+        "depth_scale_semantics": _DEPTH_SCALE_SEMANTICS,
         "depth_scale_m": depth_scale_m,
         "aligned_to_rgb": False,
         "envelope_format": ENVELOPE_FORMAT,
@@ -193,9 +228,30 @@ def decode(payload: bytes) -> tuple[dict, bytes]:
             "camera depth frame metadata is invalid JSON"
         ) from exc
     metadata = validate_metadata(driver_metadata)
-    depth = raw[metadata_end:]
-    if len(depth) != metadata["step_bytes"] * metadata["height"]:
-        raise InvalidCameraDepthFrame("depth payload length does not match metadata")
+    compressed_depth = raw[metadata_end:]
+    if len(compressed_depth) != metadata["payload_size"]:
+        raise InvalidCameraDepthFrame(
+            "depth compressed payload length does not match metadata"
+        )
+    expected_size = metadata["uncompressed_size"]
+    try:
+        decompressor = zlib.decompressobj()
+        depth = decompressor.decompress(compressed_depth, expected_size + 1)
+        if decompressor.unconsumed_tail or len(depth) > expected_size:
+            raise InvalidCameraDepthFrame(
+                "depth decompressed payload exceeds declared size"
+            )
+        depth += decompressor.flush(expected_size - len(depth) + 1)
+    except zlib.error as exc:
+        raise InvalidCameraDepthFrame("depth zlib payload is invalid") from exc
+    if (
+        not decompressor.eof
+        or decompressor.unused_data
+        or len(depth) != expected_size
+    ):
+        raise InvalidCameraDepthFrame(
+            "depth decompressed payload length does not match metadata"
+        )
     return metadata, depth
 
 
@@ -205,7 +261,9 @@ def encode(metadata: dict, depth: bytes) -> bytes:
     raw_depth = bytes(depth)
     driver_metadata = dict(metadata)
     image = _object(driver_metadata.get("image"), field="image")
-    image["payload_size"] = len(raw_depth)
+    compressed_depth = zlib.compress(raw_depth, level=_DEPTH_COMPRESSION_LEVEL)
+    image["uncompressed_size"] = len(raw_depth)
+    image["payload_size"] = len(compressed_depth)
     driver_metadata["image"] = image
     validate_metadata(driver_metadata)
     encoded = json.dumps(
@@ -217,7 +275,11 @@ def encode(metadata: dict, depth: bytes) -> bytes:
     ).encode("utf-8")
     if len(encoded) > _MAX_METADATA_BYTES:
         raise InvalidCameraDepthFrame("camera depth frame metadata is too large")
-    return _HEADER.pack(MAGIC, len(encoded), len(raw_depth)) + encoded + raw_depth
+    return (
+        _HEADER.pack(MAGIC, len(encoded), len(compressed_depth))
+        + encoded
+        + compressed_depth
+    )
 
 
 __all__ = [
