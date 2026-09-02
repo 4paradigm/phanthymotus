@@ -273,6 +273,44 @@ class CollectionSampler:
         self._last_rejection_reason = reason
         return None
 
+    def _match_rgb(self, image: dict) -> tuple[dict | None, str | None]:
+        anchor = int(image["source_stamp_ns"])
+        bundle = {"rgb_frame": image}
+        for candidate_port, limit_ms in _RGB_ANCHOR_MATCH_LIMIT_MS.items():
+            candidates = self._buffers[candidate_port]
+            if not candidates:
+                return None, f"missing_{candidate_port}"
+            nearest = min(
+                candidates,
+                key=lambda value: abs(int(value["source_stamp_ns"]) - anchor),
+            )
+            if (
+                abs(int(nearest["source_stamp_ns"]) - anchor)
+                > int(limit_ms * 1_000_000)
+            ):
+                return None, f"skew_rgb_frame_{candidate_port}"
+            bundle[candidate_port] = nearest
+        imu_candidates = self._buffers["imu"]
+        if not imu_candidates:
+            return None, "missing_imu"
+        lidar_stamp = int(bundle["lidar"]["source_stamp_ns"])
+        bundle["imu"] = min(
+            imu_candidates,
+            key=lambda value: abs(
+                int(value["source_stamp_ns"]) - lidar_stamp
+            ),
+        )
+        for first, second, limit_ms in ALIGNMENT_PAIRS:
+            if (
+                abs(
+                    int(bundle[first]["source_stamp_ns"])
+                    - int(bundle[second]["source_stamp_ns"])
+                )
+                > int(limit_ms * 1_000_000)
+            ):
+                return None, f"skew_{first}_{second}"
+        return bundle, None
+
     def observe(
         self,
         port: str,
@@ -296,52 +334,24 @@ class CollectionSampler:
             "metadata": None if metadata is None else dict(metadata),
         }
         self._buffers[port].append(sample)
-        if port != "rgb_frame":
-            return None
         if (
             self._last_emit_monotonic is not None
             and now - self._last_emit_monotonic < self._interval_sec
         ):
             return None
 
-        anchor = int(source_stamp_ns)
-        bundle = {"rgb_frame": sample}
-        for candidate_port, limit_ms in _RGB_ANCHOR_MATCH_LIMIT_MS.items():
-            candidates = self._buffers[candidate_port]
-            if not candidates:
-                return self._reject(f"missing_{candidate_port}")
-            nearest = min(
-                candidates,
-                key=lambda value: abs(int(value["source_stamp_ns"]) - anchor),
-            )
-            if (
-                abs(int(nearest["source_stamp_ns"]) - anchor)
-                > int(limit_ms * 1_000_000)
-            ):
-                return self._reject(f"skew_rgb_frame_{candidate_port}")
-            bundle[candidate_port] = nearest
-        imu_candidates = self._buffers["imu"]
-        if not imu_candidates:
-            return self._reject("missing_imu")
-        lidar_stamp = int(bundle["lidar"]["source_stamp_ns"])
-        bundle["imu"] = min(
-            imu_candidates,
-            key=lambda value: abs(
-                int(value["source_stamp_ns"]) - lidar_stamp
-            ),
-        )
-        for first, second, limit_ms in ALIGNMENT_PAIRS:
-            if (
-                abs(
-                    int(bundle[first]["source_stamp_ns"])
-                    - int(bundle[second]["source_stamp_ns"])
-                )
-                > int(limit_ms * 1_000_000)
-            ):
-                return self._reject(f"skew_{first}_{second}")
-        self._last_emit_monotonic = now
-        self._emitted_count += 1
-        return bundle
+        rejection_reason = None
+        for image in reversed(self._buffers["rgb_frame"]):
+            bundle, rejection_reason = self._match_rgb(image)
+            if bundle is None:
+                continue
+            self._buffers["rgb_frame"].clear()
+            self._last_emit_monotonic = now
+            self._emitted_count += 1
+            return bundle
+        if port == "rgb_frame" and rejection_reason is not None:
+            return self._reject(rejection_reason)
+        return None
 
 
 def finalize_collection_session(

@@ -322,6 +322,40 @@ class FastLivo2CollectionTest(unittest.TestCase):
         self.assertEqual(bundle["imu"]["source_stamp_ns"], base + 51_000_000)
         self.assertEqual(sampler.snapshot()["emitted_count"], 1)
 
+    def test_sampler_retries_pending_rgb_when_depth_arrives_later(self) -> None:
+        sampler = CollectionSampler(interval_sec=1.0)
+        sampler.start()
+        base = 1_700_000_000_000_000_000
+        for port, offset_ms in (("lidar", 50), ("imu", 51), ("odom", 0)):
+            sampler.observe(
+                port,
+                source_stamp_ns=base + offset_ms * 1_000_000,
+                message=port,
+                metadata={"port": port},
+                now_monotonic=10.0,
+            )
+
+        self.assertIsNone(
+            sampler.observe(
+                "rgb_frame",
+                source_stamp_ns=base,
+                message="rgb",
+                metadata={"port": "rgb_frame"},
+                now_monotonic=10.0,
+            )
+        )
+        bundle = sampler.observe(
+            "depth_frame",
+            source_stamp_ns=base + 100_000_000,
+            message="depth",
+            metadata={"port": "depth_frame"},
+            now_monotonic=10.1,
+        )
+
+        self.assertIsNotNone(bundle)
+        self.assertEqual(bundle["rgb_frame"]["message"], "rgb")
+        self.assertEqual(sampler.snapshot()["emitted_count"], 1)
+
     def test_sampler_exposes_rejection_reason(self) -> None:
         sampler = CollectionSampler(interval_sec=1.0)
         sampler.start()

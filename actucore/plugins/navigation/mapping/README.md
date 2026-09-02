@@ -353,7 +353,8 @@ Canvas 公共 `/ubuntu/navigation/fast_livo2/collection_preview` 输出图像；
 顶部显示采集帧号，图中按现有离线
 算法投影 LiDAR 可见最近点，并在对应像素标出障碍物距离。预览只消费采样器已经
 生成的 1 Hz 录制快照，后台采用 latest-only 队列，不会提高录制频率或阻塞
-FAST-LIVO2/Nav2 回调。
+FAST-LIVO2/Nav2 回调。RGB 会在有界队列中等待随后到达的 Depth、LiDAR、IMU
+和 Odom；任一路新数据都可完成匹配，因此合法快照不依赖 ROS 回调到达顺序。
 
 停止智能控制并完成 MCAP 原子收口后，同一 `collection_status` 图像端口自动
 切换为本体离线导出进度卡；显示 session、阶段、已处理/总帧数、百分比、
