@@ -1,11 +1,12 @@
 --- a/src/LIVMapper.cpp
 +++ b/src/LIVMapper.cpp
-@@ -13,6 +13,87 @@
+@@ -13,6 +13,88 @@
  #include "LIVMapper.h"
  #include <vikit/camera_loader.h>
  #include <boost/filesystem.hpp>
 +#include <cmath>
 +#include <fstream>
++#include <stdexcept>
 +
 +namespace
 +{

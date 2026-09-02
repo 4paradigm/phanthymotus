@@ -238,7 +238,7 @@ planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第�
 导航基础镜像按 JetPack 版本选择精确的
 `jetson-base:jp<JP_VERSION>-torch@sha256:<digest>`（Ubuntu 20.04 / Python
 3.8，ROS Humble 是 `/opt/ros/humble/install` 下的源码 install-space）。基础镜像
-按完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并应用三份 G1 补丁，再编译
+按完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并按非重叠顺序应用三份 G1 补丁，再编译
 FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过 `@sha256` 固定该基础镜像，只重编
 仓库自有的 `g1_fast_livo2`、`g1_nav2`、`g1_segmented_controller`。G1 输入使用
 标准 PointCloud2；基础镜像只内置 FAST-LIVO2 编译所需的两条 Livox 消息定义，

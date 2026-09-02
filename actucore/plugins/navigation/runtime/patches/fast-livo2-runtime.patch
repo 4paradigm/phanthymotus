@@ -1,14 +1,6 @@
 diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
 --- a/src/LIVMapper.cpp
 +++ b/src/LIVMapper.cpp
-@@ -13,6 +13,7 @@ which is included as part of this source code package.
- #include "LIVMapper.h"
- #include <vikit/camera_loader.h>
- #include <boost/filesystem.hpp>
-+#include <stdexcept>
- 
- using namespace Sophus;
- LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options)
 @@ -309,11 +310,24 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node,
  {
    image_transport::ImageTransport it(this->node);
