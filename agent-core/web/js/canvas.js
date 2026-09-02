@@ -918,7 +918,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v));
         }
         if (!enumVals.length) return '';  // hide field entirely if no options left
-        const opts = enumVals.map(v => `<option value="${_esc(v)}"${String(v) === String(def.default) ? ' selected' : ''}>${_esc(v)}</option>`).join('');
+        const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(v)}</option>`).join('');
         inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
       } else if (def.format === 'file') {
         const accept = def.accept || '*/*';
@@ -926,10 +926,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
         const desc = def.description || '';
-        const defaultValue = Object.prototype.hasOwnProperty.call(def, 'default')
-          ? ` value="${_esc(String(def.default))}"`
-          : '';
-        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}"${defaultValue} placeholder="${_esc(desc.slice(0, 40))}">`;
+        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
       }
       return `
         <div class="canvas-field">
