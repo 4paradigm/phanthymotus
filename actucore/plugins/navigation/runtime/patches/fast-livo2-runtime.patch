@@ -1,23 +1,27 @@
 diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
 --- a/src/LIVMapper.cpp
 +++ b/src/LIVMapper.cpp
-@@ -309,11 +309,16 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node,
+@@ -309,11 +309,20 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node,
  {
    image_transport::ImageTransport it(this->node);
 +  // This node services subscriptions and mapping in one spin_some loop. Huge
 +  // reader histories preserve stale samples and can make the estimator lag
 +  // indefinitely when a transient load spike occurs.
-+  constexpr size_t kPointCloudQueueDepth = 8;
-+  constexpr size_t kImuQueueDepth = 400;
++  constexpr size_t kPointCloudQueueDepth = 2;
++  constexpr size_t kImuQueueDepth = 20;
++  rclcpp::SensorDataQoS point_cloud_qos;
++  point_cloud_qos.keep_last(kPointCloudQueueDepth);
++  rclcpp::SensorDataQoS imu_qos;
++  imu_qos.keep_last(kImuQueueDepth);
    if (p_pre->lidar_type == AVIA) {
 -    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
-+    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, kPointCloudQueueDepth, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
++    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, point_cloud_qos, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
    } else {
 -    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 200000, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
-+    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, kPointCloudQueueDepth, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
++    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, point_cloud_qos, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
    }
 -  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
-+  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, kImuQueueDepth, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
++  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, imu_qos, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
    if (enable_image_processing) {
      sub_img_compressed = this->node->create_subscription<sensor_msgs::msg::CompressedImage>(
        img_topic, 200000, std::bind(&LIVMapper::jpeg_callback, this, std::placeholders::_1));

@@ -245,9 +245,9 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
     def test_fault_capture_uses_full_rate_raw_topics_and_snapshot_mode(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
         topics = {
-            "lidar_topic": "/navigation/lidar",
-            "imu_topic": "/navigation/imu",
-            "raw_odom_topic": "/navigation/raw_odom",
+            "lidar_topic": "/ubuntu/navigation/lidar",
+            "imu_topic": "/ubuntu/navigation/imu",
+            "raw_odom_topic": "/ubuntu/navigation/fast_livo2/raw/odom",
         }
         supervisor.get_parameter = lambda name: SimpleNamespace(
             value=topics[name]
@@ -256,9 +256,16 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         command = supervisor._fault_capture_command(Path("/recordings/fault"))
 
         self.assertIn("--snapshot-mode", command)
-        self.assertIn("/navigation/lidar", command)
-        self.assertIn("/navigation/imu", command)
-        self.assertIn("/navigation/raw_odom", command)
+        qos_flag = command.index("--qos-profile-overrides-path")
+        qos_path = Path(command[qos_flag + 1])
+        self.assertTrue(qos_path.is_file())
+        qos = qos_path.read_text(encoding="utf-8")
+        self.assertIn("/ubuntu/navigation/lidar:", qos)
+        self.assertIn("/ubuntu/navigation/imu:", qos)
+        self.assertIn("reliability: best_effort", qos)
+        self.assertIn("/ubuntu/navigation/lidar", command)
+        self.assertIn("/ubuntu/navigation/imu", command)
+        self.assertIn("/ubuntu/navigation/fast_livo2/raw/odom", command)
         self.assertIn(
             "/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom",
             command,

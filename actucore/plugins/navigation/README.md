@@ -72,7 +72,9 @@ LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一�
 显示 `armed/post_trigger/saved/error`、触发原因和产物目录；没有故障时
 停卡会丢弃空快照，不会将常态全频数据写入磁盘。录包进程不创建独立
 进程组，会随 FAST-LIVO2 runtime 的 stop/restart 一起回收，避免多个全频
-recorder 重复订阅传感器。
+recorder 重复订阅传感器。FAST-LIVO2 输入和故障录包都使用 Best Effort
+小队列；计算出现瞬时积压时优先丢弃旧帧，避免旧 LiDAR/IMU 排队后继续
+参与实时估计或由诊断录包反压传感器链路。
 单个重复或乱序样本只会被丢弃，不会立即撤销已验证的传感器合同；
 输入 freshness 窗口内持续没有新的有效 LiDAR/IMU 时间对时，状态会把
 `point_time_invalid` 放入 `sensor_contract_issues` 诊断，但只要 FAST-LIVO2

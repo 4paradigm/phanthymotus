@@ -128,7 +128,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=c4d6ebc202663464c796ce50b4cd82e6563c1ddab3edfbda90695e43ed214607",
             source_lock,
         )
         self.assertIn(
@@ -141,6 +141,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
         self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
+        runtime_patch_text = runtime_patch.read_text(encoding="utf-8")
+        self.assertIn("kPointCloudQueueDepth = 2", runtime_patch_text)
+        self.assertIn("kImuQueueDepth = 20", runtime_patch_text)
+        self.assertIn("rclcpp::SensorDataQoS", runtime_patch_text)
         self.assertIn("import numpy, rosbag2_py", dockerfile)
         self.assertIn("ros2 bag record --help", dockerfile)
         self.assertIn(
@@ -189,7 +193,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "534b15ab7559d572b1be56611ab1b5f5d73809f91727de5e853cd04612f4fc3b",
+            "c4d6ebc202663464c796ce50b4cd82e6563c1ddab3edfbda90695e43ed214607",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),

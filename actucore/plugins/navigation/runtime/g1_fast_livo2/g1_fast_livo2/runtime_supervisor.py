@@ -64,6 +64,7 @@ _FAULT_CAPTURE_PRE_SEC = 5.0
 _FAULT_CAPTURE_POST_SEC = 5.0
 _FAULT_CAPTURE_CACHE_BYTES = 64 * 1024 * 1024
 _FAULT_CAPTURE_ROOT = Path(COLLECTION_ROOT) / "faults"
+_FAULT_CAPTURE_QOS_PATH = Path(__file__).with_name("fault_capture_qos.yaml")
 _RAW_IMU_PROPAGATED_ODOM_TOPIC = (
     "/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom"
 )
@@ -334,6 +335,8 @@ class FastLivo2Supervisor(Node):
             "--max-cache-size",
             str(_FAULT_CAPTURE_CACHE_BYTES),
             "--snapshot-mode",
+            "--qos-profile-overrides-path",
+            str(_FAULT_CAPTURE_QOS_PATH),
             str(self.get_parameter("lidar_topic").value),
             str(self.get_parameter("imu_topic").value),
             str(self.get_parameter("raw_odom_topic").value),
