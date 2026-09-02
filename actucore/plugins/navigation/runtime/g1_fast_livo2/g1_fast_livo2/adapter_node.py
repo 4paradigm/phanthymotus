@@ -435,7 +435,14 @@ class FastLivo2Adapter(Node):
         source = float(stamp.sec) + float(stamp.nanosec) * 1e-9
         return self.get_clock().now().nanoseconds * 1e-9 - source
 
-    def _warn_rejected(self, stream: str, detail, message=None) -> None:
+    def _warn_rejected(
+        self,
+        stream: str,
+        detail,
+        message=None,
+        *,
+        error_code: str | None = None,
+    ) -> None:
         receive_unix_ns = time.time_ns()
         receive_monotonic_ns = time.monotonic_ns()
         with self._lock:
@@ -481,6 +488,7 @@ class FastLivo2Adapter(Node):
             "stream": stream,
             "count": count,
             "reason": str(detail)[:500],
+            "error_code": error_code,
             "receive_unix_ns": receive_unix_ns,
             "receive_monotonic_ns": receive_monotonic_ns,
             "source_stamp_ns": source_stamp_ns,
@@ -679,6 +687,7 @@ class FastLivo2Adapter(Node):
         return blockers
 
     def _on_odom(self, message: Odometry) -> None:
+        error_code = None
         try:
             if message.header.frame_id.strip() != "camera_init" or message.child_frame_id.strip() != "aft_mapped":
                 raise InvalidFastLivo2Frame("raw odom must be camera_init -> aft_mapped")
@@ -708,6 +717,7 @@ class FastLivo2Adapter(Node):
                         "navigation sensor geometry is not ready"
                     )
                 if not self._odom_health.observe(source_stamp_ns, raw_sensor_pose):
+                    error_code = self._odom_health.reason
                     raise InvalidFastLivo2Frame(
                         self._odom_health.detail or "raw odom is unhealthy"
                     )
@@ -718,7 +728,12 @@ class FastLivo2Adapter(Node):
             )
         except (InvalidFastLivo2Frame, ValueError, TypeError) as exc:
             self._invalid_odom += 1
-            self._warn_rejected("FAST-LIVO2 odom", exc, message)
+            self._warn_rejected(
+                "FAST-LIVO2 odom",
+                exc,
+                message,
+                error_code=error_code,
+            )
             return
         self._mark_valid("FAST-LIVO2 odom")
 

@@ -184,6 +184,87 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             self.assertIsNone(supervisor._collection_partial_dir)
             supervisor._collection_health.stop.assert_called_once_with()
 
+    def test_first_odom_discontinuity_triggers_one_delayed_snapshot(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._fault_capture_lock = threading.Lock()
+        supervisor._fault_capture_process = mock.Mock(pid=123)
+        supervisor._fault_capture_process.poll.return_value = None
+        supervisor._fault_capture_timer = None
+        supervisor._fault_capture_directory = Path("/recordings/fault")
+        supervisor._fault_capture_state = "armed"
+        supervisor._fault_capture_error = None
+        supervisor._fault_capture_trigger = None
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, callback):
+                self.interval = interval
+                self.callback = callback
+                self.daemon = False
+                self.started = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+        with mock.patch.object(SUPERVISOR_MODULE.threading, "Timer", FakeTimer):
+            supervisor._on_sensor_rejection(
+                SimpleNamespace(data=json.dumps({"error_code": "other"}))
+            )
+            supervisor._on_sensor_rejection(
+                SimpleNamespace(
+                    data=json.dumps(
+                        {
+                            "error_code": "raw_odom_discontinuity",
+                            "reason": "linear speed 13.221 m/s exceeds 10.000 m/s",
+                        }
+                    )
+                )
+            )
+            supervisor._on_sensor_rejection(
+                SimpleNamespace(
+                    data=json.dumps(
+                        {
+                            "error_code": "raw_odom_discontinuity",
+                            "reason": "later fault",
+                        }
+                    )
+                )
+            )
+
+        self.assertEqual(supervisor._fault_capture_state, "post_trigger")
+        self.assertEqual(len(timers), 1)
+        self.assertEqual(timers[0].interval, 5.0)
+        self.assertTrue(timers[0].started)
+        self.assertTrue(timers[0].daemon)
+        self.assertEqual(
+            supervisor._fault_capture_trigger["detail"],
+            "linear speed 13.221 m/s exceeds 10.000 m/s",
+        )
+
+    def test_fault_capture_uses_full_rate_raw_topics_and_snapshot_mode(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        topics = {
+            "lidar_topic": "/navigation/lidar",
+            "imu_topic": "/navigation/imu",
+            "raw_odom_topic": "/navigation/raw_odom",
+        }
+        supervisor.get_parameter = lambda name: SimpleNamespace(
+            value=topics[name]
+        )
+
+        command = supervisor._fault_capture_command(Path("/recordings/fault"))
+
+        self.assertIn("--snapshot-mode", command)
+        self.assertIn("/navigation/lidar", command)
+        self.assertIn("/navigation/imu", command)
+        self.assertIn("/navigation/raw_odom", command)
+        self.assertIn(
+            "/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom",
+            command,
+        )
+        self.assertNotIn("/ubuntu/navigation/collection/lidar", command)
+
     def test_permanent_collection_finalize_failure_confirms_terminal_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             partial = Path(directory) / "capture.partial"
@@ -294,11 +375,14 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                 stamp=SimpleNamespace(sec=2, nanosec=50_000_000),
             )
         )
-        for _ in range(101):
+        for index in range(101):
             adapter._warn_rejected(
                 "FAST-LIVO2 cloud",
                 "bad\nframe",
                 rejected,
+                error_code=(
+                    "raw_odom_discontinuity" if index == 0 else None
+                ),
             )
 
         self.assertEqual(len(warnings), 2)
@@ -308,6 +392,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(len(adapter._sensor_rejection_pub.messages), 101)
         evidence = json.loads(adapter._sensor_rejection_pub.messages[0].data)
         self.assertEqual(evidence["event"], "rejected")
+        self.assertEqual(evidence["error_code"], "raw_odom_discontinuity")
         self.assertEqual(evidence["source_stamp_ns"], 2_050_000_000)
         self.assertEqual(evidence["lidar_imu_skew_ms"], 350.0)
         self.assertEqual(evidence["lidar_imu_pair_result"], "skew_exceeded")

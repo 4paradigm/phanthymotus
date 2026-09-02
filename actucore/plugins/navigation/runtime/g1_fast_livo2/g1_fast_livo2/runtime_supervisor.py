@@ -33,6 +33,8 @@ from .camera_depth_frame import (
 )
 from .camera_rgb_frame import InvalidCameraRgbFrame, decode as decode_camera_rgb_frame
 from .collection_core import (
+    COLLECTION_EVENT_TOPICS,
+    COLLECTION_ROOT,
     COLLECTION_SOURCES,
     CollectionHealth,
     CollectionSampler,
@@ -58,6 +60,13 @@ _MAX_MAP_ARTIFACT_TOTAL_BYTES = 536_870_912
 _MAX_MAP_MANIFEST_BYTES = 65_536
 _MAP_CONTROL_RESPONSE_GRACE_SEC = 5.0
 _MAP_CONTROL_DISCOVERY_TIMEOUT_SEC = 5.0
+_FAULT_CAPTURE_PRE_SEC = 5.0
+_FAULT_CAPTURE_POST_SEC = 5.0
+_FAULT_CAPTURE_CACHE_BYTES = 64 * 1024 * 1024
+_FAULT_CAPTURE_ROOT = Path(COLLECTION_ROOT) / "faults"
+_RAW_IMU_PROPAGATED_ODOM_TOPIC = (
+    "/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom"
+)
 _RETRYABLE_FINALIZE_ERRNOS = {
     errno.EAGAIN,
     errno.EBUSY,
@@ -124,6 +133,13 @@ class FastLivo2Supervisor(Node):
         self._collection_last_receipt: dict | None = None
         self._collection_health = CollectionHealth()
         self._collection_sampler = CollectionSampler()
+        self._fault_capture_lock = threading.Lock()
+        self._fault_capture_process: subprocess.Popen | None = None
+        self._fault_capture_timer: threading.Timer | None = None
+        self._fault_capture_directory: Path | None = None
+        self._fault_capture_state = "starting"
+        self._fault_capture_error: str | None = None
+        self._fault_capture_trigger: dict | None = None
         self._collection_input_topics = {
             "lidar": str(self.get_parameter("lidar_topic").value),
             "imu": str(self.get_parameter("imu_topic").value),
@@ -164,9 +180,17 @@ class FastLivo2Supervisor(Node):
             callback_group=callbacks,
         )
         self.create_subscription(String, str(self.get_parameter("diagnostics_topic").value), self._on_diagnostics, 10)
+        self.create_subscription(
+            String,
+            COLLECTION_EVENT_TOPICS[0]["topic"],
+            self._on_sensor_rejection,
+            10,
+            callback_group=callbacks,
+        )
         self._collection_record_publishers = self._create_collection_publishers()
         self._collection_subscriptions = self._create_collection_subscriptions()
         self.create_timer(1.0, self._publish_heartbeat)
+        self._arm_fault_capture()
 
     @staticmethod
     def _collection_message_types() -> dict:
@@ -286,6 +310,233 @@ class FastLivo2Supervisor(Node):
             with self._lock:
                 self._diagnostics = payload
                 self._diagnostics_monotonic = time.monotonic()
+
+    def _on_sensor_rejection(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError):
+            return
+        if (
+            isinstance(payload, dict)
+            and payload.get("error_code") == "raw_odom_discontinuity"
+        ):
+            self._trigger_fault_capture(payload)
+
+    def _fault_capture_command(self, output_directory: Path) -> list[str]:
+        return [
+            "ros2",
+            "bag",
+            "record",
+            "--storage",
+            "mcap",
+            "--output",
+            str(output_directory),
+            "--max-cache-size",
+            str(_FAULT_CAPTURE_CACHE_BYTES),
+            "--snapshot-mode",
+            str(self.get_parameter("lidar_topic").value),
+            str(self.get_parameter("imu_topic").value),
+            str(self.get_parameter("raw_odom_topic").value),
+            _RAW_IMU_PROPAGATED_ODOM_TOPIC,
+            COLLECTION_EVENT_TOPICS[0]["topic"],
+        ]
+
+    def _arm_fault_capture(self) -> None:
+        try:
+            _FAULT_CAPTURE_ROOT.mkdir(parents=True, exist_ok=True)
+            session = (
+                time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                + "-"
+                + uuid.uuid4().hex[:8]
+            )
+            directory = _FAULT_CAPTURE_ROOT / session
+            process = subprocess.Popen(
+                self._fault_capture_command(directory),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            time.sleep(0.25)
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"ros2 bag snapshot recorder exited with {process.returncode}"
+                )
+        except (OSError, RuntimeError) as exc:
+            with self._fault_capture_lock:
+                self._fault_capture_state = "error"
+                self._fault_capture_error = f"{type(exc).__name__}: {exc}"
+            self.get_logger().error(
+                f"cannot arm FAST-LIVO2 fault capture: {exc}"
+            )
+            return
+        with self._fault_capture_lock:
+            self._fault_capture_process = process
+            self._fault_capture_directory = directory
+            self._fault_capture_state = "armed"
+            self._fault_capture_error = None
+
+    def _trigger_fault_capture(self, event: dict) -> None:
+        with self._fault_capture_lock:
+            process = self._fault_capture_process
+            if (
+                self._fault_capture_state != "armed"
+                or process is None
+                or process.poll() is not None
+            ):
+                return
+            self._fault_capture_state = "post_trigger"
+            self._fault_capture_trigger = {
+                "reason": "raw_odom_discontinuity",
+                "detail": str(event.get("reason", event.get("detail", "")))[:500],
+                "trigger_unix_ns": time.time_ns(),
+            }
+            timer = threading.Timer(
+                _FAULT_CAPTURE_POST_SEC,
+                self._save_fault_capture,
+            )
+            timer.daemon = True
+            self._fault_capture_timer = timer
+            timer.start()
+
+    @staticmethod
+    def _stop_fault_capture_process(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        os.killpg(process.pid, signal.SIGINT)
+        try:
+            process.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5.0)
+
+    def _save_fault_capture(self) -> None:
+        with self._fault_capture_lock:
+            if self._fault_capture_state != "post_trigger":
+                return
+            process = self._fault_capture_process
+            directory = self._fault_capture_directory
+            self._fault_capture_state = "saving"
+        error = None
+        try:
+            if process is None or directory is None or process.poll() is not None:
+                raise RuntimeError("snapshot recorder is not running")
+            completed = subprocess.run(
+                [
+                    "ros2",
+                    "service",
+                    "call",
+                    "/rosbag2_recorder/snapshot",
+                    "rosbag2_interfaces/srv/Snapshot",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10.0,
+            )
+            output = f"{completed.stdout}\n{completed.stderr}"
+            if completed.returncode != 0 or not re.search(
+                r"success\s*[=:]\s*true",
+                output,
+                re.IGNORECASE,
+            ):
+                raise RuntimeError(
+                    "rosbag2 snapshot service failed: " + output.strip()[:500]
+                )
+            self._stop_fault_capture_process(process)
+            if not (directory / "metadata.yaml").is_file() or not any(
+                directory.glob("*.mcap")
+            ):
+                raise RuntimeError("snapshot did not produce an MCAP artifact")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if process is not None:
+                try:
+                    self._stop_fault_capture_process(process)
+                except (OSError, subprocess.TimeoutExpired) as stop_exc:
+                    error += f"; stop_failed:{stop_exc}"
+        with self._fault_capture_lock:
+            self._fault_capture_process = None
+            self._fault_capture_timer = None
+            self._fault_capture_state = "saved" if error is None else "error"
+            self._fault_capture_error = error
+        if error is None:
+            self.get_logger().warning(
+                f"saved first FAST-LIVO2 odom fault capture to {directory}"
+            )
+        else:
+            self.get_logger().error(
+                f"cannot save FAST-LIVO2 odom fault capture: {error}"
+            )
+
+    def _fault_capture_snapshot(self) -> dict:
+        lock = getattr(self, "_fault_capture_lock", None)
+        if lock is None:
+            return {"state": "unavailable"}
+        with lock:
+            process = self._fault_capture_process
+            if (
+                self._fault_capture_state in {"armed", "post_trigger"}
+                and process is not None
+                and process.poll() is not None
+            ):
+                self._fault_capture_state = "error"
+                self._fault_capture_error = (
+                    "snapshot recorder exited with "
+                    f"{process.returncode}"
+                )
+            return {
+                "state": self._fault_capture_state,
+                "directory": (
+                    None
+                    if self._fault_capture_directory is None
+                    else str(self._fault_capture_directory)
+                ),
+                "pre_window_sec": _FAULT_CAPTURE_PRE_SEC,
+                "post_window_sec": _FAULT_CAPTURE_POST_SEC,
+                "cache_bytes": _FAULT_CAPTURE_CACHE_BYTES,
+                "pid": (
+                    process.pid
+                    if process is not None and process.poll() is None
+                    else None
+                ),
+                "trigger": (
+                    None
+                    if self._fault_capture_trigger is None
+                    else dict(self._fault_capture_trigger)
+                ),
+                "error": self._fault_capture_error,
+            }
+
+    def _discard_armed_fault_capture(self) -> None:
+        with self._fault_capture_lock:
+            timer = self._fault_capture_timer
+            process = self._fault_capture_process
+            directory = self._fault_capture_directory
+            state = self._fault_capture_state
+            if timer is not None:
+                timer.cancel()
+            self._fault_capture_timer = None
+        if state == "saving" and timer is not None:
+            timer.join(timeout=15.0)
+            with self._fault_capture_lock:
+                if self._fault_capture_state in {"saved", "error"}:
+                    return
+        if state == "post_trigger":
+            self._save_fault_capture()
+            return
+        if process is not None:
+            self._stop_fault_capture_process(process)
+        if (
+            state == "armed"
+            and directory is not None
+            and directory.parent.resolve() == _FAULT_CAPTURE_ROOT.resolve()
+            and directory.exists()
+        ):
+            shutil.rmtree(directory)
+        with self._fault_capture_lock:
+            self._fault_capture_process = None
+            if self._fault_capture_state == "armed":
+                self._fault_capture_state = "discarded"
 
     def _on_map_control_status(self, message: String) -> None:
         try:
@@ -1833,6 +2084,7 @@ class FastLivo2Supervisor(Node):
 
     def _publish_heartbeat(self) -> None:
         collection = self._collection_snapshot()
+        fault_capture = self._fault_capture_snapshot()
         with self._lock:
             process = self._process
             running = process is not None and process.poll() is None
@@ -1877,6 +2129,7 @@ class FastLivo2Supervisor(Node):
                 "bounded_relocalization_supported": True,
                 "diagnostics": diagnostics,
                 "collection": collection,
+                "fault_capture": fault_capture,
             }
         self._publish(payload)
         message = String()
@@ -1930,6 +2183,7 @@ class FastLivo2Supervisor(Node):
                     self._pending_mapping_finalize = None
             with self._collection_lifecycle_lock:
                 self._stop_collection()
+            self._discard_armed_fault_capture()
         finally:
             return super().destroy_node()
 

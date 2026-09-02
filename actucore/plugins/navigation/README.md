@@ -64,6 +64,12 @@ LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一�
 `(0, 200] ms`。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
 几何契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable` 或
 `raw_odom_discontinuity`，不会继续生成伪正常地图。
+每次 ActuCore 运行会话使用 rosbag2 snapshot 在内存中保留最近约 5 秒
+的全频 LiDAR、IMU、FAST-LIVO2 raw odom 和 IMU 传播 odom；首次
+`raw_odom_discontinuity` 后再采 5 秒，仅落盘一份 MCAP 到
+`/opt/phanthy-motus/data/fast_livo2/recordings/faults/`。`status.fault_capture`
+显示 `armed/post_trigger/saved/error`、触发原因和产物目录；没有故障时
+停卡会丢弃空快照，不会将常态全频数据写入磁盘。
 单个重复或乱序样本只会被丢弃，不会立即撤销已验证的传感器合同；
 输入 freshness 窗口内持续没有新的有效 LiDAR/IMU 时间对时，状态会把
 `point_time_invalid` 放入 `sensor_contract_issues` 诊断，但只要 FAST-LIVO2
