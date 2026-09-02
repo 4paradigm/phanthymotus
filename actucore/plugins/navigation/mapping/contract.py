@@ -20,6 +20,8 @@ FAST_LIVO2_CONFIG_DEFAULTS = {
     "request_timeout_sec": 130.0,
     "discovery_timeout_sec": 5.0,
     "input_max_age_ms": 500,
+    "lidar_qos_depth": 2,
+    "imu_qos_depth": 400,
     "map_voxel_size_m": 0.10,
     "obstacle_min_height_m": -0.30,
     "obstacle_max_height_m": 0.30,
@@ -46,6 +48,26 @@ FAST_LIVO2_CONFIG_SCHEMA = {
             "minimum": 0.5,
             "maximum": 30.0,
             "default": 5.0,
+        },
+        "lidar_qos_depth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32,
+            "default": 2,
+            "description": (
+                "FAST-LIVO2 LiDAR subscription queue depth; applied on the next "
+                "card start"
+            ),
+        },
+        "imu_qos_depth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4000,
+            "default": 400,
+            "description": (
+                "FAST-LIVO2 IMU subscription queue depth; applied on the next "
+                "card start"
+            ),
         },
         "map_voxel_size_m": {
             "type": "number",

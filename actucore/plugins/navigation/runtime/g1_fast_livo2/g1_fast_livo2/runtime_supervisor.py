@@ -65,6 +65,8 @@ _FAULT_CAPTURE_POST_SEC = 5.0
 _FAULT_CAPTURE_CACHE_BYTES = 64 * 1024 * 1024
 _FAULT_CAPTURE_ROOT = Path(COLLECTION_ROOT) / "faults"
 _FAULT_CAPTURE_QOS_PATH = Path(__file__).with_name("fault_capture_qos.yaml")
+_DEFAULT_LIDAR_QOS_DEPTH = 2
+_DEFAULT_IMU_QOS_DEPTH = 400
 _RAW_IMU_PROPAGATED_ODOM_TOPIC = (
     "/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom"
 )
@@ -119,6 +121,8 @@ class FastLivo2Supervisor(Node):
         self._runtime_mode = "idle"
         self._started_unix_ms: int | None = None
         self._runtime_session_id: str | None = None
+        self._lidar_qos_depth = _DEFAULT_LIDAR_QOS_DEPTH
+        self._imu_qos_depth = _DEFAULT_IMU_QOS_DEPTH
         self._files_before: dict[str, tuple[int, int]] = {}
         self._pending_mapping_finalize: dict | None = None
         self._last_mapping_result: dict | None = None
@@ -630,7 +634,7 @@ class FastLivo2Supervisor(Node):
                                 ),
                             }
                         else:
-                            result = self._adapter_execute(action, args)
+                            result = self._configure_runtime(args)
                     finally:
                         self._runtime_lifecycle_lock.release()
             else:
@@ -640,6 +644,37 @@ class FastLivo2Supervisor(Node):
             action = locals().get("action", "")
             result = {"status": "error", "error_code": "supervisor_error", "error": f"{type(exc).__name__}: {exc}"}
         self._publish({"event": "response", "request_id": request_id, "action": action, **result})
+
+    def _configure_runtime(self, args: dict) -> dict:
+        depths = {}
+        for key, default, maximum in (
+            ("lidar_qos_depth", _DEFAULT_LIDAR_QOS_DEPTH, 32),
+            ("imu_qos_depth", _DEFAULT_IMU_QOS_DEPTH, 4000),
+        ):
+            value = args.get(key, getattr(self, f"_{key}", default))
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                return {
+                    "status": "error",
+                    "error_code": "invalid_sensor_qos_config",
+                    "error": f"{key} is outside the supported range",
+                }
+            depths[key] = value
+        result = self._adapter_execute(
+            "configure_obstacle_filter",
+            {
+                "min_height_m": args.get("min_height_m"),
+                "max_height_m": args.get("max_height_m"),
+            },
+        )
+        if result.get("status") != "error":
+            with self._lock:
+                self._lidar_qos_depth = depths["lidar_qos_depth"]
+                self._imu_qos_depth = depths["imu_qos_depth"]
+            result["sensor_qos_depths"] = {
+                "lidar": self._lidar_qos_depth,
+                "imu": self._imu_qos_depth,
+            }
+        return result
 
     def _configure_collection(self, args: dict) -> dict:
         enabled = args.get("enabled")
@@ -1831,6 +1866,8 @@ class FastLivo2Supervisor(Node):
             "/opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping",
             "--ros-args",
             "--params-file", config,
+            "-p", f"lidar_qos_depth:={self._lidar_qos_depth}",
+            "-p", f"imu_qos_depth:={self._imu_qos_depth}",
             "-p", f"pcd_save.pcd_save_en:={'true' if save_pcd else 'false'}",
             "-p", f"pcd_save.interval:={interval}",
             "-p", "pcd_save.type:=0",
@@ -2115,6 +2152,10 @@ class FastLivo2Supervisor(Node):
                 "loaded_map": self._loaded_map,
                 "map_session_id": self._runtime_session_id,
                 "runtime_mode": self._runtime_mode,
+                "sensor_qos_depths": {
+                    "lidar": self._lidar_qos_depth,
+                    "imu": self._imu_qos_depth,
+                },
                 "algorithm_running": running,
                 "companion_ready": bool(diagnostics.get("ready", False)),
                 "sensor_frame": diagnostics.get("sensor_frame"),

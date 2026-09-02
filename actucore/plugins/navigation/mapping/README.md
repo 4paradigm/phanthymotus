@@ -46,6 +46,10 @@ Driver navigation_sensors
 
 这两路输入来自既有 Driver `navigation_sensors` sensor cards。缺失、过期或
 frame 不符时同容器 adapter 不发布伪造的 canonical odom/cloud。
+FAST-LIVO2 内部订阅队列默认保留最新 `2` 帧 LiDAR 和 `400` 帧 IMU；可在
+Canvas 停止卡片后通过 `lidar_qos_depth`（1..32）与 `imu_qos_depth`
+（1..4000）调整，下次启动卡片生效。该参数在启动算法子进程前传入 ROS，
+因此首次升级需要重建 navigation base，之后调值只需重启卡片，不再重建镜像。
 FAST-LIVO2 使用与 LiDAR 同 frame 的 IMU 做重力对齐，因此整套传感器
 相对机身的小角度倾斜不会直接把地图永久建斜；adapter 再用实测
 `base_link -> sensor_frame` 静态 TF 恢复机器人机身位姿。若实际安装角度发生变化、

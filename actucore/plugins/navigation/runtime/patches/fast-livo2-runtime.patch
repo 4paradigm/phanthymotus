@@ -1,18 +1,30 @@
 diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
 --- a/src/LIVMapper.cpp
 +++ b/src/LIVMapper.cpp
-@@ -309,11 +309,20 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node,
+@@ -13,6 +13,7 @@ which is included as part of this source code package.
+ #include "LIVMapper.h"
+ #include <vikit/camera_loader.h>
+ #include <boost/filesystem.hpp>
++#include <stdexcept>
+ 
+ using namespace Sophus;
+ LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options)
+@@ -309,11 +310,24 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node,
  {
    image_transport::ImageTransport it(this->node);
 +  // This node services subscriptions and mapping in one spin_some loop. Keep
 +  // LiDAR latest-only, but retain enough high-rate IMU integration history to
 +  // span transient mapping work without dropping motion between scans.
-+  constexpr size_t kPointCloudQueueDepth = 2;
-+  constexpr size_t kImuQueueDepth = 400;
++  const int point_cloud_queue_depth = this->node->declare_parameter<int>("lidar_qos_depth", 2);
++  const int imu_queue_depth = this->node->declare_parameter<int>("imu_qos_depth", 400);
++  if (point_cloud_queue_depth < 1 || point_cloud_queue_depth > 32 ||
++      imu_queue_depth < 1 || imu_queue_depth > 4000) {
++    throw std::out_of_range("FAST-LIVO2 QoS depth is outside the supported range");
++  }
 +  rclcpp::SensorDataQoS point_cloud_qos;
-+  point_cloud_qos.keep_last(kPointCloudQueueDepth);
++  point_cloud_qos.keep_last(static_cast<size_t>(point_cloud_queue_depth));
 +  rclcpp::SensorDataQoS imu_qos;
-+  imu_qos.keep_last(kImuQueueDepth);
++  imu_qos.keep_last(static_cast<size_t>(imu_queue_depth));
    if (p_pre->lidar_type == AVIA) {
 -    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
 +    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, point_cloud_qos, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
@@ -25,7 +37,7 @@ diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
    if (enable_image_processing) {
      sub_img_compressed = this->node->create_subscription<sensor_msgs::msg::CompressedImage>(
        img_topic, 200000, std::bind(&LIVMapper::jpeg_callback, this, std::placeholders::_1));
-@@ -929,14 +934,16 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
+@@ -929,14 +939,16 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
    if (!imu_en) return;
  
    if (last_timestamp_lidar < 0.0) return;
@@ -44,7 +56,7 @@ diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
    }
  
    if (ros_driver_fix_en) timestamp += std::round(last_timestamp_lidar - timestamp);
-@@ -962,15 +969,17 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
+@@ -962,15 +974,17 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
    if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 0.2)
    {
 -    RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds \n", timestamp - last_timestamp_imu);

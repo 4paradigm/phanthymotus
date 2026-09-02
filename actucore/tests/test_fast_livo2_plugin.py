@@ -230,7 +230,12 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertEqual(backend.calls[0][0], "configure_obstacle_filter")
         self.assertEqual(
             backend.calls[0][1],
-            {"min_height_m": -0.30, "max_height_m": 0.30},
+            {
+                "min_height_m": -0.30,
+                "max_height_m": 0.30,
+                "lidar_qos_depth": 2,
+                "imu_qos_depth": 400,
+            },
         )
         self.assertEqual(backend.calls[1][0], "configure_collection")
         self.assertFalse(backend.calls[1][1]["enabled"])
@@ -509,11 +514,15 @@ class FastLivo2PluginTest(unittest.TestCase):
                 "action": "config",
                 "obstacle_min_height_m": -0.8,
                 "obstacle_max_height_m": 0.4,
+                "lidar_qos_depth": 3,
+                "imu_qos_depth": 600,
             },
         )
         self.assertEqual(configured["state"], "configured")
         self.assertEqual(configured["config"]["obstacle_min_height_m"], -0.8)
         self.assertEqual(configured["config"]["obstacle_max_height_m"], 0.4)
+        self.assertEqual(configured["config"]["lidar_qos_depth"], 3)
+        self.assertEqual(configured["config"]["imu_qos_depth"], 600)
         started = configurable.dispatch(
             "fast_livo2",
             {"action": "start", "input_bindings": _bindings(configurable)},
@@ -523,9 +532,26 @@ class FastLivo2PluginTest(unittest.TestCase):
             configurable_backend.calls[0],
             (
                 "configure_obstacle_filter",
-                {"min_height_m": -0.8, "max_height_m": 0.4},
+                {
+                    "min_height_m": -0.8,
+                    "max_height_m": 0.4,
+                    "lidar_qos_depth": 3,
+                    "imu_qos_depth": 600,
+                },
             ),
         )
+
+        for key, value in (
+            ("lidar_qos_depth", 0),
+            ("lidar_qos_depth", 33),
+            ("imu_qos_depth", True),
+            ("imu_qos_depth", 4001),
+        ):
+            with self.subTest(key=key, value=value):
+                rejected = FastLivo2Plugin(
+                    {key: value}, None, backend=ReadyBackend()
+                ).dispatch("fast_livo2", {"action": "info"})
+                self.assertEqual(rejected["error_code"], "invalid_config")
 
     def test_obstacle_filter_failure_prevents_canvas_ready(self) -> None:
         backend = ObstacleFilterRejectingBackend()

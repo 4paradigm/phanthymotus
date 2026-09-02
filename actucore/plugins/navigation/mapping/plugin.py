@@ -64,6 +64,15 @@ def _validated_config(base: dict, updates: dict) -> dict:
         if not math.isfinite(value) or not minimum <= value <= maximum:
             raise ConfigError(f"{key} must be within [{minimum}, {maximum}]")
         result[key] = value
+    for key, minimum, maximum in (
+        ("lidar_qos_depth", 1, 32),
+        ("imu_qos_depth", 1, 4000),
+    ):
+        value = result.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"{key} must be an integer")
+        if not minimum <= value <= maximum:
+            raise ConfigError(f"{key} must be within [{minimum}, {maximum}]")
     if result["obstacle_min_height_m"] >= result["obstacle_max_height_m"]:
         raise ConfigError(
             "obstacle_min_height_m must be less than obstacle_max_height_m"
@@ -228,6 +237,8 @@ class FastLivo2Plugin:
             {
                 "min_height_m": self._cfg["obstacle_min_height_m"],
                 "max_height_m": self._cfg["obstacle_max_height_m"],
+                "lidar_qos_depth": self._cfg["lidar_qos_depth"],
+                "imu_qos_depth": self._cfg["imu_qos_depth"],
             }
         )
         if obstacle_result.get("status") == "error":

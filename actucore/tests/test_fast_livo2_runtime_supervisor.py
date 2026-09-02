@@ -465,6 +465,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         supervisor._loaded_map = "office"
         supervisor._runtime_mode = "localization"
         supervisor._runtime_session_id = "runtime-a"
+        supervisor._lidar_qos_depth = 2
+        supervisor._imu_qos_depth = 400
         supervisor._diagnostics = {"ready": True}
         supervisor._collection_snapshot = lambda: {}
         supervisor._collection_status_pub = _CapturePublisher()
@@ -941,6 +943,55 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(result["status"], "configured")
         self.assertEqual(sleep.call_count, 2)
         publisher.publish.assert_called_once()
+
+    def test_sensor_qos_config_is_applied_to_next_algorithm_start(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lock = threading.RLock()
+        supervisor._lidar_qos_depth = 2
+        supervisor._imu_qos_depth = 400
+        supervisor._adapter_execute = mock.Mock(
+            return_value={"status": "configured"}
+        )
+
+        result = supervisor._configure_runtime(
+            {
+                "min_height_m": -0.3,
+                "max_height_m": 0.3,
+                "lidar_qos_depth": 3,
+                "imu_qos_depth": 600,
+            }
+        )
+
+        self.assertEqual(result["sensor_qos_depths"], {"lidar": 3, "imu": 600})
+        self.assertEqual(supervisor._lidar_qos_depth, 3)
+        self.assertEqual(supervisor._imu_qos_depth, 600)
+        supervisor._adapter_execute.assert_called_once_with(
+            "configure_obstacle_filter",
+            {"min_height_m": -0.3, "max_height_m": 0.3},
+        )
+        supervisor.get_parameter = lambda name: SimpleNamespace(
+            value={
+                "pcd_save_interval": 600,
+                "config_path": "/config/lio.yaml",
+                "lidar_topic": "/lidar",
+                "imu_topic": "/imu",
+                "raw_cloud_topic": "/raw/cloud",
+                "raw_odom_topic": "/raw/odom",
+            }[name]
+        )
+        command = supervisor._algorithm_command()
+        self.assertIn("lidar_qos_depth:=3", command)
+        self.assertIn("imu_qos_depth:=600", command)
+
+        rejected = supervisor._configure_runtime(
+            {
+                "min_height_m": -0.3,
+                "max_height_m": 0.3,
+                "imu_qos_depth": 0,
+            }
+        )
+        self.assertEqual(supervisor._imu_qos_depth, 600)
+        self.assertEqual(rejected["error_code"], "invalid_sensor_qos_config")
 
     def test_adapter_execute_fails_fast_when_adapter_is_undiscovered(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)

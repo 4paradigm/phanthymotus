@@ -6,6 +6,8 @@
     "request_timeout_sec": 130.0,
     "discovery_timeout_sec": 5.0,
     "input_max_age_ms": 500,
+    "lidar_qos_depth": 2,
+    "imu_qos_depth": 400,
     "map_voxel_size_m": 0.1,
     "obstacle_min_height_m": -0.3,
     "obstacle_max_height_m": 0.3,

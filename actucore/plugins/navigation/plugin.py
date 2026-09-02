@@ -428,6 +428,8 @@ class NavigationPlugin:
                 for source, target in (
                     ("mapping_request_timeout_sec", "request_timeout_sec"),
                     ("mapping_discovery_timeout_sec", "discovery_timeout_sec"),
+                    ("lidar_qos_depth", "lidar_qos_depth"),
+                    ("imu_qos_depth", "imu_qos_depth"),
                     ("map_voxel_size_m", "map_voxel_size_m"),
                     ("obstacle_min_height_m", "obstacle_min_height_m"),
                     ("obstacle_max_height_m", "obstacle_max_height_m"),

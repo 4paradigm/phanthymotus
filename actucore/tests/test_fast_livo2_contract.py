@@ -128,7 +128,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=d4941c43262c82b5d1178af40de82e571da65c55a8e0b5157d1044f67aaf39b2",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=a0f2f01bb41638bd86b619637b7c102a1e5e53f3451d1f8eff2ca4edd978669c",
             source_lock,
         )
         self.assertIn(
@@ -142,8 +142,8 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
         self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
         runtime_patch_text = runtime_patch.read_text(encoding="utf-8")
-        self.assertIn("kPointCloudQueueDepth = 2", runtime_patch_text)
-        self.assertIn("kImuQueueDepth = 400", runtime_patch_text)
+        self.assertIn('declare_parameter<int>("lidar_qos_depth", 2)', runtime_patch_text)
+        self.assertIn('declare_parameter<int>("imu_qos_depth", 400)', runtime_patch_text)
         self.assertIn("rclcpp::SensorDataQoS", runtime_patch_text)
         self.assertIn("import numpy, rosbag2_py", dockerfile)
         self.assertIn("ros2 bag record --help", dockerfile)
@@ -193,7 +193,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "d4941c43262c82b5d1178af40de82e571da65c55a8e0b5157d1044f67aaf39b2",
+            "a0f2f01bb41638bd86b619637b7c102a1e5e53f3451d1f8eff2ca4edd978669c",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),

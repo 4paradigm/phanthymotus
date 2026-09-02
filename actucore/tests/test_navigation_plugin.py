@@ -288,6 +288,8 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("planning_request_timeout_sec", properties)
         self.assertIn("obstacle_min_height_m", properties)
         self.assertIn("obstacle_max_height_m", properties)
+        self.assertEqual(properties["lidar_qos_depth"]["default"], 2)
+        self.assertEqual(properties["imu_qos_depth"]["default"], 400)
         self.assertIn("rotate_speed_rps", properties)
         self.assertEqual(
             tool["configSchema"]["properties"]["rotate_speed_rps"],
@@ -1201,6 +1203,8 @@ class NavigationPluginTest(unittest.TestCase):
                 "action": "config",
                 "obstacle_min_height_m": -0.8,
                 "obstacle_max_height_m": 0.4,
+                "lidar_qos_depth": 3,
+                "imu_qos_depth": 600,
                 "rotate_speed_rps": 0.3,
             },
         )
@@ -1212,6 +1216,8 @@ class NavigationPluginTest(unittest.TestCase):
                     "action": "config",
                     "obstacle_min_height_m": -0.8,
                     "obstacle_max_height_m": 0.4,
+                    "lidar_qos_depth": 3,
+                    "imu_qos_depth": 600,
                 },
             ),
             plugin._mapping.calls,

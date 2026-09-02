@@ -41,6 +41,8 @@ def _config_properties() -> dict:
     result = {
         "mapping_request_timeout_sec": deepcopy(mapping["request_timeout_sec"]),
         "mapping_discovery_timeout_sec": deepcopy(mapping["discovery_timeout_sec"]),
+        "lidar_qos_depth": deepcopy(mapping["lidar_qos_depth"]),
+        "imu_qos_depth": deepcopy(mapping["imu_qos_depth"]),
         "map_voxel_size_m": deepcopy(mapping["map_voxel_size_m"]),
         "obstacle_min_height_m": deepcopy(mapping["obstacle_min_height_m"]),
         "obstacle_max_height_m": deepcopy(mapping["obstacle_max_height_m"]),
