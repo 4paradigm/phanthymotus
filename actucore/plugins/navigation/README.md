@@ -176,8 +176,8 @@ deadline 内只做原子状态切换，并在控制回执之后发布大栅格�
 
 ### ACP 完成事件
 
-`navigate_to_pose` 在 `inputSchema.x-completion` 中声明为长时动作，接受目标后
-返回相同值的 `nav_id`/`action_id`。Nav2 上报终态时，ActuCore 通过 SSE 发布
+`navigate_to_pose` 与语义 `navigate` 都在 `inputSchema.x-completion` 中声明为
+长时动作，接受目标后返回相同值的 `nav_id`/`action_id`。Nav2 上报终态时，ActuCore 通过 SSE 发布
 匹配的 `action_complete`，Agent Core 因而不会把“已开始导航”误当成“已到达”。
 ACP barrier 按原始工具名隔离，不阻塞 TTS 等其他卡片；本卡片的
 `wait_navigation_done`、`pause_nav`、`resume_nav`、`stop_nav` 是明确的控制旁路，

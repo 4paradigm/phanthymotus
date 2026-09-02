@@ -186,6 +186,9 @@ def navigation_tool_definition(namespace: str) -> dict:
         deepcopy(component_outputs[port]) for port in NAVIGATION_PUBLIC_OUTPUT_PORTS
     ]
 
+    completion = deepcopy(planning["inputSchema"]["x-completion"])
+    completion["actions"] = [*completion.get("actions", []), "navigate"]
+
     return {
         "name": CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
         "displayName": CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
@@ -210,7 +213,7 @@ def navigation_tool_definition(namespace: str) -> dict:
             "x-topic-actions": deepcopy(
                 planning["inputSchema"]["x-topic-actions"]
             ),
-            "x-completion": deepcopy(planning["inputSchema"]["x-completion"]),
+            "x-completion": completion,
             "x-hooks": deepcopy(planning["inputSchema"]["x-hooks"]),
         },
         "configSchema": deepcopy(NAVIGATION_CONFIG_SCHEMA),

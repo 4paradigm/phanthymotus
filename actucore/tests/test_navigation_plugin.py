@@ -303,7 +303,7 @@ class NavigationContractTest(unittest.TestCase):
     def test_long_running_navigation_declares_scoped_acp_completion(self):
         tool = navigation_tool_definition("ubuntu")
         completion = tool["inputSchema"]["x-completion"]
-        self.assertEqual(completion["actions"], ["navigate_to_pose"])
+        self.assertEqual(completion["actions"], ["navigate_to_pose", "navigate"])
         self.assertEqual(
             set(completion["passthrough_actions"]),
             {"wait_navigation_done", "pause_nav", "resume_nav", "stop_nav"},

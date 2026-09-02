@@ -621,7 +621,11 @@ class ProcessorTests(unittest.TestCase):
 
         def handle(goal, *, control_nav_id=None):
             calls.append((dict(goal), control_nav_id))
-            return {"status": "navigating", "nav_id": control_nav_id}
+            return {
+                "status": "navigating",
+                "nav_id": control_nav_id,
+                "action_id": control_nav_id,
+            }
 
         plugin = _plugin(client, factory, goal_handler=handle, navigation_speed=0.5)
         plugin.dispatch("vln", {"action": "capture"})
@@ -637,6 +641,8 @@ class ProcessorTests(unittest.TestCase):
         self.assertTrue(result["navigation_requested"])
         self.assertFalse(result["goal_published"])
         self.assertEqual(result["goal_delivery"], "in_process_planner")
+        self.assertEqual(result["nav_id"], "lease-unified-1")
+        self.assertEqual(result["action_id"], "lease-unified-1")
         self.assertEqual(calls[0][1], "lease-unified-1")
         self.assertEqual(calls[0][0]["speed"], 0.5)
         self.assertEqual(factory.instances[0].published, [])
