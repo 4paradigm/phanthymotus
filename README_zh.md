@@ -108,7 +108,11 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
    还是对画布闸门开一个例外。
 3. **状态级** —— 话题清单（以及后续的位姿、电量、任务状态）通过同一条签名 HTTPS 链路推送
    （`POST /api/peer/inbox/state`）。这里原本走 DDS topic；DDS 现已限制在本机，而 FastDDS 的传输隔离是
-   **进程级**的，没法为 peer 流量单独开一个参与者的例外。改动顺带补上了一个真实缺陷：原来的 peer DDS 总线
+   一份**默认** profile 会套住进程内所有参与者，因此没法只靠配置为 peer 流量单独放开。（按参与者
+   分别指定 profile 是可行的 —— 在每个参与者创建前设好 `FASTRTPS_DEFAULT_PROFILES_FILE` 即可，
+   天轶驱动的 bridge 正是这样给它的两个 domain 分别选 profile 的 —— 但那要求掌握所有创建点，而
+   agent-core、perception、actucore 加十几个驱动做不到这一点。而且签名 HTTPS 本身就是更好的答案：
+   它有身份校验。）改动顺带补上了一个真实缺陷：原来的 peer DDS 总线
    **没有任何鉴权**，同一个 `ROS_DOMAIN_ID` 上任何进程都能伪造另一台机器人的状态。现在仍然只承载状态，
    绝不承载指令。
 4. **任务级** —— `peer_delegate` 把 `SubagentSpec` 发给 peer，由对方在本地 spawn 一个 subagent 并回传

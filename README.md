@@ -113,8 +113,12 @@ stays one record with several links, which is what makes fallback possible.
    are exposed through the canvas (no UI for a peer card today) or exempted from it.
 3. **State** — topic lists and, later, pose/battery/task state, pushed over the same signed HTTPS
    link (`POST /api/peer/inbox/state`). This used to be DDS topics; DDS is now confined to the
-   local host, and FastDDS transport isolation is *process-wide*, so a per-participant exemption
-   for peer traffic is not implementable. The move fixed a real hole on the way: the DDS peer bus
+   local host, and a FastDDS *default* profile applies to every participant in the process, so the
+   loopback restriction cannot be lifted for peer traffic alone by configuration. (Per-participant
+   profiles are possible by setting `FASTRTPS_DEFAULT_PROFILES_FILE` around each participant's
+   creation — the Tianyi driver's bridge does exactly that for its two domains — but that requires
+   owning every creation site, which is not the case across agent-core, perception, actucore and a
+   dozen drivers. Signed HTTPS is also the better answer on its own terms: it authenticates.) The move fixed a real hole on the way: the DDS peer bus
    had **no authentication**, so anything on the same `ROS_DOMAIN_ID` could forge another robot's
    state. It still carries state only, never commands.
 4. **Tasks** — `peer_delegate` ships a `SubagentSpec` to a peer, which spawns a subagent locally and
