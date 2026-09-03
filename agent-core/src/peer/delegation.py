@@ -9,11 +9,77 @@ delegating a task cannot magically gain operator tools through the delegation.
 hop_count prevents infinite chains: A → B → C → D is capped at 2 hops.
 """
 
+import contextvars
+from typing import Annotated
+
 from subagent.protocol import SubagentSpec, SubagentResult
 from peer import store
 
 
 MAX_HOP_COUNT = 2
+
+# How many peer hops the *currently executing* agent is already at.
+#
+# The peer_delegate tool is a single shared function reachable from both the
+# main agent loop and from any subagent, and the dispatch path passes no caller
+# context. Without an ambient value the tool would always report hop 0, and a
+# chain A→B→C→D would look like a fresh delegation at every step — the limit
+# would only ever constrain the first hop.
+#
+# The main loop leaves this at 0 (it is the origin). A subagent spawned from an
+# inbound delegation sets it to its own spec.hop_count for the duration of the
+# run; see subagent/agent.py.
+current_hop_count: contextvars.ContextVar[int] = contextvars.ContextVar(
+    'peer_current_hop_count', default=0
+)
+
+
+async def peer_delegate(
+    peer_id: Annotated[str, 'Paired peer to hand the task to. Use the peer_id from the peers list.'],
+    goal: Annotated[str, 'What the remote agent should accomplish, stated as a complete instruction.'],
+    timeout_s: Annotated[float, 'Seconds to wait for the result before giving up.'] = 120.0,
+    max_rounds: Annotated[int, 'Maximum reasoning rounds the remote agent may use.'] = 10,
+) -> str:
+    """Ask a paired peer to carry out a task and wait for its result.
+
+    The peer runs it under *its own* permissions, not ours: it re-clips the
+    tool filter against the role it granted us, and its own actuator gates
+    still apply. This asks; it does not command.
+    """
+    from peer import store as _store, transport as _transport
+    from peer.registry import registry as _registry
+
+    peer = _store.get(peer_id)
+    if peer is None:
+        paired = ', '.join(f'{p["display_name"] or p["peer_id"][:12]}={p["peer_id"]}'
+                           for p in _store.list_peers()) or '(none)'
+        return f'Error: unknown peer "{peer_id}". Paired peers: {paired}'
+    if peer['role'] == 'blocked':
+        return f'Error: peer "{peer_id}" is blocked.'
+
+    endpoints = _registry.endpoints_for(peer_id)
+    if not endpoints:
+        return (f'Error: no known endpoint for "{peer_id}" — it has not been seen by any '
+                f'discovery provider since this agent started.')
+
+    # Send our *current* depth; the receiver increments and enforces the limit.
+    # Refuse locally too, so a doomed request never leaves the machine.
+    hop = current_hop_count.get()
+    if hop > MAX_HOP_COUNT:
+        return (f'Error: refusing to delegate — already {hop} peer hops deep '
+                f'(limit {MAX_HOP_COUNT}). This task has been passed along too many times.')
+
+    result, err = await _transport.post_json(
+        endpoints, '/api/peer/delegate',
+        {'goal': goal, 'timeout_s': timeout_s, 'max_rounds': max_rounds, 'hop_count': hop},
+        timeout=timeout_s + 10,
+    )
+    if result is None:
+        return f'Error: delegation to "{peer_id}" failed: {err}'
+    if result.get('status') != 'completed':
+        return (f'Peer "{peer["display_name"] or peer_id[:12]}" did not complete the task '
+                f'(status={result.get("status")}): {result.get("error") or "no detail"}')
+    return result.get('output') or '(peer returned an empty result)'
 
 
 def validate_delegation(peer_id: str, spec: SubagentSpec) -> tuple[bool, str]:

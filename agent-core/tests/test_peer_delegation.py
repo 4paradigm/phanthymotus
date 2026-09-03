@@ -122,6 +122,80 @@ class TestDelegation(unittest.TestCase):
         self.assertFalse(bad, 'hop_count > MAX must be refused')
         self.assertIn('hop_count', reason)
 
+    def test_peer_delegate_sends_current_hop_depth(self):
+        """peer_delegate 必须把当前深度发出去，而不是恒定 0。
+
+        没有这一步时，链上每台机器都以为自己是起点，hop 限制只能约束第一跳。
+        """
+        import asyncio
+        from unittest import mock
+
+        peer_id = 'chain_peer'
+        store.upsert(peer_id, identity.public_key_b64(), 'Chain', role='operator',
+                     endpoints=['https://192.0.2.9:15678'])
+
+        sent = {}
+
+        async def _fake_post(endpoints, path, payload, **kw):
+            sent.update(payload)
+            return {'status': 'completed', 'output': 'ok'}, ''
+
+        with mock.patch('peer.transport.post_json', _fake_post), \
+             mock.patch('peer.registry.registry.endpoints_for',
+                        lambda p: ['https://192.0.2.9:15678']):
+            token = delegation.current_hop_count.set(2)
+            try:
+                out = asyncio.run(delegation.peer_delegate(peer_id, 'do a thing'))
+            finally:
+                delegation.current_hop_count.reset(token)
+
+        self.assertEqual(out, 'ok')
+        self.assertEqual(sent.get('hop_count'), 2,
+                         'peer_delegate sent the wrong depth; the chain limit cannot work')
+
+    def test_peer_delegate_refuses_when_already_too_deep(self):
+        """本机就该拦下注定被拒的请求，不必发出去。"""
+        import asyncio
+        from unittest import mock
+
+        peer_id = 'deep_peer'
+        store.upsert(peer_id, identity.public_key_b64(), 'Deep', role='operator',
+                     endpoints=['https://192.0.2.9:15678'])
+
+        called = {'n': 0}
+
+        async def _fake_post(*a, **k):
+            called['n'] += 1
+            return {'status': 'completed', 'output': 'should not happen'}, ''
+
+        with mock.patch('peer.transport.post_json', _fake_post), \
+             mock.patch('peer.registry.registry.endpoints_for',
+                        lambda p: ['https://192.0.2.9:15678']):
+            token = delegation.current_hop_count.set(delegation.MAX_HOP_COUNT + 1)
+            try:
+                out = asyncio.run(delegation.peer_delegate(peer_id, 'do a thing'))
+            finally:
+                delegation.current_hop_count.reset(token)
+
+        self.assertIn('refusing to delegate', out)
+        self.assertEqual(called['n'], 0, 'a doomed request was still sent over the network')
+
+    def test_peer_delegate_rejects_unknown_peer(self):
+        """未配对的 peer 要给出可操作的错误，并列出可用的 peer。"""
+        import asyncio
+        out = asyncio.run(delegation.peer_delegate('nope', 'x'))
+        self.assertIn('unknown peer', out)
+        self.assertIn('Paired peers:', out)
+
+    def test_subagent_publishes_its_hop_depth(self):
+        """subagent 运行期间必须设置 contextvar，否则链上深度会丢失。"""
+        import inspect
+        from subagent.agent import Subagent
+        src = inspect.getsource(Subagent.run)
+        self.assertIn('current_hop_count', src,
+                      'subagent never publishes its hop depth; chained delegation loses count')
+        self.assertIn('reset', src, 'contextvar set without reset leaks across runs')
+
     def test_valid_delegation(self):
         """正常委托通过验证"""
         peer_id = 'test_peer'

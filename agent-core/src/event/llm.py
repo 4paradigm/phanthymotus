@@ -708,6 +708,7 @@ class Event:
         self._subagent_mgr = SubagentManager(llm_client=client.llm)
         _set_manager(self._subagent_mgr)
         _sa_tools = SubagentTools(self._subagent_mgr)
+        from peer import delegation as _peer_delegation
 
         # 注册桌面工具（文件操作 / Shell / Python / 搜索 / Web）
         from event.desktop import DesktopTools
@@ -734,6 +735,7 @@ class Event:
             ('subagent_cancel', _sa_tools.subagent_cancel),
             ('subagent_message', _sa_tools.subagent_message),
             ('subagent_result', _sa_tools.subagent_result),
+            ('peer_delegate', _peer_delegation.peer_delegate),
             # Desktop tools (Claude Code 风格)
             ('Bash', self._desktop_tools.Bash),
             ('PythonExec', self._desktop_tools.PythonExec),
