@@ -13,21 +13,26 @@ import { AudioRenderer } from './renderers/audio.js';
 
 function stubContext({ throwOnSampleRate = false } = {}) {
   const started = [];
+  const sources = [];
   const ctx = {
     state: 'suspended', sampleRate: 48000, currentTime: 0,
     resumed: false,
     resume() { this.resumed = true; this.state = 'running'; },
     createBuffer: (ch, len, rate) => ({ duration: len / rate, getChannelData: () => new Float32Array(len) }),
-    createBufferSource: () => ({
-      buffer: null, connect() {}, start(when) { started.push(when); }, stop() {},
-    }),
+    createBufferSource: () => {
+      const src = { buffer: null, loop: false, stopped: false,
+                    connect() {}, start(when) { started.push({ when, loop: this.loop }); },
+                    stop() { this.stopped = true; } };
+      sources.push(src);
+      return src;
+    },
     destination: {},
   };
   const Ctor = function (opts) {
     if (throwOnSampleRate && opts?.sampleRate) throw new TypeError('unsupported sampleRate');
     return ctx;
   };
-  return { ctx, Ctor, started };
+  return { ctx, Ctor, started, sources };
 }
 
 /** A renderer instance cloned the way detail-panel.js clones it. */
@@ -42,7 +47,27 @@ test('a source starts during the gesture, before any audio arrives', () => {
   const { Ctor, started } = stubContext();
   const r = renderer(Ctor);
   r._startPlay();
-  assert.equal(started.length, 1, 'WebKit stays silent without this');
+  assert.ok(started.length >= 1, 'WebKit stays silent without this');
+});
+
+test('a looping source keeps the output rendering after the gesture expires', () => {
+  // WebKit's transient activation lapses seconds after the click; an idle graph
+  // comes back silent while still reporting 'running'. Measured on R1: the first
+  // chunk arrived 7.9s after ▶ and played to nobody.
+  const { Ctor, started } = stubContext();
+  const r = renderer(Ctor);
+  r._startPlay();
+  assert.ok(started.some(s => s.loop), 'no keep-alive source was started');
+});
+
+test('the keep-alive stops when playback is paused', () => {
+  const { Ctor, sources } = stubContext();
+  const r = renderer(Ctor);
+  r._startPlay();
+  const keep = sources.find(s => s.loop);
+  r._stopPlay();
+  assert.equal(keep.stopped, true, 'a silent source would keep running forever');
+  assert.equal(r._keepAlive, null);
 });
 
 test('the context is resumed as well', () => {
@@ -59,7 +84,7 @@ test('unlocking happens once, not on every play/pause cycle', () => {
   r._startPlay();
   r._stopPlay();
   r._startPlay();
-  assert.equal(started.length, 1);
+  assert.equal(started.filter(s => !s.loop).length, 1, 'unlock ran more than once');
 });
 
 test('a context refusing a custom sampleRate still plays', () => {
@@ -68,5 +93,5 @@ test('a context refusing a custom sampleRate still plays', () => {
   const { Ctor, started } = stubContext({ throwOnSampleRate: true });
   const r = renderer(Ctor);
   r._startPlay();
-  assert.equal(started.length, 1);
+  assert.ok(started.length >= 1);
 });
