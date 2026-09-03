@@ -32,20 +32,24 @@ class TestApiImports(unittest.TestCase):
         """
         import api.peer  # noqa: F401
 
-    def test_router_is_mounted(self):
-        """router 存在且带正确前缀，否则端点静默不可达。"""
-        import api.peer
-        self.assertTrue(hasattr(api.peer, 'router'))
-        self.assertEqual(api.peer.router.prefix, '/api/peer')
+    def test_router_prefix_is_relative_to_mount(self):
+        """前缀不能带 '/api' —— start.py 已把 app_api 挂在 '/api' 下。
 
-    def test_inbox_routes_registered(self):
-        """peer 侧端点必须真的挂上了。
-
-        这些路径在 auth.py 里被豁免 ACCESS_TOKEN，如果路由没注册，
-        表现是 404 而不是报错，很难排查。
+        真实故障：前缀写成 '/api/peer' 时实际路径变成 '/api/api/peer'，
+        所有端点 404，而进程日志一切正常、看不出任何异常。
         """
         import api.peer
-        paths = {r.path for r in api.peer.router.routes}
+        self.assertTrue(hasattr(api.peer, 'router'))
+        self.assertEqual(api.peer.router.prefix, '/peer')
+
+    def test_effective_paths_under_mount(self):
+        """挂载后的实际路径必须是 /api/peer/*。
+
+        断言最终生效的 URL，而不是 router 内部的相对路径 —— 前者才是
+        peer 真正会去请求的东西，也是上面那次 404 唯一能暴露的地方。
+        """
+        import api.peer
+        effective = {'/api' + r.path for r in api.peer.router.routes}
         for expected in (
             '/api/peer/inbox/message',
             '/api/peer/inbox/ping',
@@ -53,8 +57,30 @@ class TestApiImports(unittest.TestCase):
             '/api/peer/tools/list',
             '/api/peer/tools/call',
             '/api/peer/delegate',
+            '/api/peer/identity',
+            '/api/peer/discovered',
         ):
-            self.assertIn(expected, paths, f'route missing: {expected}')
+            self.assertIn(expected, effective, f'route missing: {expected}')
+
+    def test_inbox_paths_match_auth_exemption(self):
+        """peer 侧路径必须落在 auth.py 豁免的前缀下。
+
+        豁免前缀与实际路径若对不上，签名请求会被要求 ACCESS_TOKEN 而 401，
+        且两边都"看起来是对的"。
+        """
+        import api.peer
+        from channel.adapters import lan
+        effective = {'/api' + r.path for r in api.peer.router.routes}
+        # auth.py 豁免的是这个前缀
+        exempt_prefix = '/api/peer/inbox/'
+        inbox = {p for p in effective if '/inbox/' in p}
+        self.assertTrue(inbox, 'no inbox routes registered')
+        for p in inbox:
+            self.assertTrue(p.startswith(exempt_prefix), f'{p} not covered by auth exemption')
+        # lan adapter 用来发送的常量也必须落在同一前缀下
+        for const in (lan.INBOX_MESSAGE_PATH, lan.INBOX_PING_PATH):
+            self.assertIn(const, effective,
+                          f'lan adapter posts to {const}, which no route serves')
 
     def test_all_peer_modules_import(self):
         """peer 包的每个模块都要能独立导入（含可选依赖缺失时的降级）。"""

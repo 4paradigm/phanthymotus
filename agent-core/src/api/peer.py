@@ -35,7 +35,10 @@ import mcp_client
 from subagent.protocol import SubagentSpec
 
 
-router = fastapi.APIRouter(prefix='/api/peer', tags=['peer'])
+# NOTE: no '/api' here — start.py mounts app_api at '/api', so this router's
+# prefix is relative to that. Spelling it '/api/peer' produced '/api/api/peer'
+# and every endpoint 404'd while the process looked perfectly healthy.
+router = fastapi.APIRouter(prefix='/peer', tags=['peer'])
 
 
 # ── dashboard-facing (ACCESS_TOKEN) ──────────────────────────────────────────
