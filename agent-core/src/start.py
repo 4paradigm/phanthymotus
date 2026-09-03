@@ -444,6 +444,10 @@ async def lifespan(app):
     from peer import dds_state
     dds_state.start()
 
+    # peer tools, offered to the local LLM as synthetic MCP entries
+    from peer import mcp_bridge as peer_mcp_bridge
+    peer_mcp_bridge.start()
+
     # peer BLE bootstrap (optional)
     from peer import ble_bootstrap
     ble_bootstrap.start()
@@ -481,6 +485,8 @@ async def lifespan(app):
             await peer_registry.stop()
             from peer import dds_state
             dds_state.stop()
+            from peer import mcp_bridge as peer_mcp_bridge
+            peer_mcp_bridge.stop()
             from peer import ble_bootstrap
             ble_bootstrap.stop()
             try:

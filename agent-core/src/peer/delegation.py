@@ -220,3 +220,54 @@ async def peer_list(
                  'peer_delegate. A peer can never drive an actuator here directly — an '
                  'inbound request is input to this agent, not a command.')
     return '\n'.join(lines)
+
+
+async def peer_state(
+    peer: Annotated[str, 'Name or peer_id of one peer, or empty for all of them.'] = '',
+) -> str:
+    """What other agents can currently see: their ROS topics and whether they can act.
+
+    This is the state each peer pushes here every few seconds over its signed link
+    (`/api/peer/inbox/state`). It answers "is the other robot's camera up?" without
+    calling anything on it, and it is the only way to know a peer's agent loop is
+    running before handing it a task — reachable and able to accept work are
+    different facts, and the second one is what a delegation needs.
+
+    The data was previously reachable only through the API, so the agent could not
+    see it at all — the same gap that had this agent answering "no, I cannot see
+    other robots" while paired with one.
+    """
+    from peer import dds_state as _state, liveness as _liveness, naming as _naming
+    from peer import store as _store
+
+    peers = _store.list_peers()
+    if not peers:
+        return 'No paired agents, so there is no peer state to report.'
+
+    if peer:
+        found, why = _naming.resolve(peer, peers)
+        if found is None:
+            return f'Error: {why}'
+        peers = [found]
+
+    shared = _state.get_peer_topics()
+    labels = _naming.labels(_store.list_peers())
+    lines = []
+    for p in peers:
+        live = _liveness.liveness(p)
+        info = shared.get(p['peer_id']) or {}
+        topics = info.get('topics') or []
+        name = labels[p['peer_id']]
+        if not live['online']:
+            lines.append(f'- {name}: offline, last contact '
+                         f'{_liveness.describe_age(live["contact_age_s"])}. '
+                         f'Topics below are the last it reported.'
+                         if topics else f'- {name}: offline, nothing reported yet.')
+        elif live['agent_running'] is False:
+            lines.append(f'- {name}: online, agent loop off (tools and state work, '
+                         f'it cannot take a delegated task)')
+        else:
+            lines.append(f'- {name}: online')
+        if topics:
+            lines.append(f'    topics ({len(topics)}): ' + ', '.join(topics))
+    return '\n'.join(lines)

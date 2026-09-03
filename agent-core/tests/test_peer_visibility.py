@@ -75,16 +75,74 @@ class TestPeerListTool(unittest.TestCase):
         self.assertIn('actuator', out)
 
 
+class TestPeerStateTool(unittest.TestCase):
+    """对端状态要能交到 LLM 手里。
+
+    这份数据（每个 peer 每几秒推过来的话题清单 + agent_running）此前只有 API 能读，
+    agent 完全拿不到 —— 和"它说自己发现不了其他机器人"是同一个缺口。
+    """
+
+    def _run(self, peers, shared, arg='', advert_age=5):
+        from peer import delegation
+        advert = type('A', (), {'last_seen': time.time() - advert_age})()
+        with mock.patch('peer.store.list_peers', return_value=peers), \
+             mock.patch('peer.registry.registry.get', return_value=advert), \
+             mock.patch('peer.registry.registry.endpoints_for', return_value=['https://x']), \
+             mock.patch('peer.dds_state.get_peer_topics', return_value=shared):
+            return asyncio.run(delegation.peer_state(arg) if arg else delegation.peer_state())
+
+    def test_reports_topics_and_readiness(self):
+        out = self._run(
+            [{'peer_id': 'a' * 32, 'display_name': 'Orin6', 'role': 'operator',
+              'last_seen': time.time() - 2}],
+            {'a' * 32: {'topics': ['/perception/tts', '/ubuntu/mic/audio'],
+                        'agent_running': False, 'last_seen': time.time()}},
+        )
+        self.assertIn('Orin6', out)
+        self.assertIn('/perception/tts', out)
+        self.assertIn('agent loop off', out)
+        self.assertIn('cannot take a delegated task', out)
+
+    def test_one_peer_can_be_named(self):
+        peers = [{'peer_id': 'a' * 32, 'display_name': 'A', 'role': 'operator',
+                  'last_seen': time.time() - 2},
+                 {'peer_id': 'b' * 32, 'display_name': 'B', 'role': 'operator',
+                  'last_seen': time.time() - 2}]
+        shared = {'a' * 32: {'topics': ['/a']}, 'b' * 32: {'topics': ['/b']}}
+        out = self._run(peers, shared, arg='B')
+        self.assertIn('/b', out)
+        self.assertNotIn('/a', out)
+
+    def test_unknown_name_fails_cleanly(self):
+        out = self._run([{'peer_id': 'a' * 32, 'display_name': 'A', 'role': 'operator',
+                          'last_seen': time.time()}], {}, arg='Nope')
+        self.assertIn('Error', out)
+        self.assertIn('A', out)
+
+    def test_no_peers_says_so(self):
+        self.assertIn('No paired agents', self._run([], {}))
+
+    def test_offline_peer_marks_its_topics_as_last_reported(self):
+        """离线时那份清单是历史，不能让 agent 当成现状。"""
+        out = self._run([{'peer_id': 'a' * 32, 'display_name': 'Gone', 'role': 'operator',
+                          'last_seen': time.time() - 99999}],
+                        {'a' * 32: {'topics': ['/stale']}}, advert_age=99999)
+        self.assertIn('offline', out)
+        self.assertIn('last it reported', out)
+
+
 class TestToolIsRegistered(unittest.TestCase):
     def test_registered_in_the_main_loop(self):
         src = (pathlib.Path(__file__).resolve().parents[1] / 'src/event/llm.py').read_text()
         self.assertIn("('peer_list', _peer_delegation.peer_list)", src)
+        self.assertIn("('peer_state', _peer_delegation.peer_state)", src)
 
     def test_reachable_from_a_subagent(self):
         """peer_delegate 就是因为漏在这个清单外面而变成过死代码。"""
         src = (pathlib.Path(__file__).resolve().parents[1] / 'src/subagent/agent.py').read_text()
         i = src.index('_DESKTOP_TOOLS = {')
         self.assertIn("'peer_list'", src[i:i + 400])
+        self.assertIn("'peer_state'", src[i:i + 400])
 
 
 class TestPromptMentionsPeers(unittest.TestCase):

@@ -40,13 +40,31 @@ def bound_tool_names() -> set[str]:
     return names
 
 
+def is_peer_tool(full_tool_name: str) -> bool:
+    """True for a tool that lives on a paired peer, not on this machine.
+
+    `mcp__peer:<id>__<tool>` — see peer/mcp_bridge.py.
+    """
+    return full_tool_name.startswith('mcp__peer:')
+
+
 def is_bound(full_tool_name: str) -> bool:
     """True if this tool is wired to the decision core on the local canvas.
 
     Split-out sub-tools (x-action-params) carry the parent's name plus a
     suffix, so a prefix match keeps them attached to the parent's binding
     rather than silently failing the gate.
+
+    A **peer's** tool is exempt. This canvas is this operator's authority over what
+    *this* machine exposes; a tool that runs on another robot is that operator's to
+    gate, and they do — by the peer's role, its `tool_filter`, and their own canvas.
+    Demanding a local card for a remote tool would mean inventing a peer card with
+    nothing behind it, and a local omission would then look like a remote refusal.
+    Inbound peer requests are unaffected: those name *local* tools, never `peer:`.
     """
+    if is_peer_tool(full_tool_name):
+        return True
+
     bound = bound_tool_names()
     if full_tool_name in bound:
         return True

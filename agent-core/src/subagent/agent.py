@@ -151,7 +151,7 @@ class Subagent:
         # and chains could only ever be one hop long.
         _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
                           'WebFetch', 'WebSearch', 'memory_recall',
-                          'peer_list', 'peer_delegate'}
+                          'peer_list', 'peer_state', 'peer_delegate'}
         return [
             info['schema']
             for name, info in _event_instance._sys_tools.items()

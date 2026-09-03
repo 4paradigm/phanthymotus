@@ -185,6 +185,7 @@ async def list_paired():
     state and answering tool calls, but /delegate returns 503.
     """
     from peer import liveness as _liveness, naming as _naming
+    from peer import mcp_bridge as _bridge
     peers = store.list_peers()
     labels = _naming.labels(peers)
     out = []
@@ -196,6 +197,11 @@ async def list_paired():
             'online': live['online'],
             'agent_running': live['agent_running'],
             'contact_age_s': live['contact_age_s'],
+            # What this agent can currently call on that peer. Worth surfacing:
+            # /api/mcp is built from the configured device list, so the synthetic
+            # peer entries never appear there, and a bridge offering nothing looks
+            # exactly like one that works.
+            'tools_offered': _bridge.offered.get(p['peer_id'], []),
         })
     return {'peers': out}
 
@@ -574,9 +580,17 @@ async def list_tools(req: Request):
     # Advertise only what the peer could actually invoke: role/tool_filter *and*
     # wired to the decision core. Listing unwired tools would have the peer's LLM
     # plan around capabilities that always 403 at call time.
+    #
+    # Another peer's tools are excluded. They are in all_schemas() now (the outbound
+    # bridge registers them so the local LLM can call them) and re-advertising them
+    # makes two agents mirror each other: A offers B's tools to B, B offers them back,
+    # and the list grows every refresh round. Observed as "offers 4 tools:
+    # tts_70461, tts_3177a, tts_70461, tts_3177a". A tool is ours to offer only if it
+    # runs here.
     import canvas_binding
     all_schemas = [s for s in mcp_client.all_schemas()
-                   if canvas_binding.is_bound(s.get('name', ''))]
+                   if not canvas_binding.is_peer_tool(s.get('name', ''))
+                   and canvas_binding.is_bound(s.get('name', ''))]
     allowed = peer_tools.filter_schemas(peer_id, all_schemas)
     return {'tools': allowed, 'count': len(allowed)}
 

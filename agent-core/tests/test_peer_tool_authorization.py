@@ -122,6 +122,16 @@ class TestRoleBoundary(_Registry):
         self.assertFalse(self._check('mcp__mcp-drv__loco', tool_filter='*battery*')[0])
         self.assertTrue(self._check('mcp__mcp-drv__loco', tool_filter='*loco*')[0])
 
+    def test_a_short_pattern_matches_the_full_name(self):
+        """人写的是 camera_*，真实名字是 mcp__mcp-1783771428__camera_main。
+
+        只匹配全名的话，短 pattern 一条都匹配不上 —— 而且是 fail closed，症状只是
+        "这个 peer 什么都调不动"，很难联想到是 filter 写法问题。
+        """
+        self.assertTrue(self._check('mcp__mcp-drv__battery', tool_filter='battery')[0])
+        self.assertTrue(self._check('mcp__mcp-drv__loco', tool_filter='loco,led')[0])
+        self.assertFalse(self._check('mcp__mcp-drv__loco', tool_filter='battery')[0])
+
     def test_refusal_says_what_to_do(self):
         _ok, why = self._check('mcp__mcp-drv__loco', role='viewer')
         self.assertIn('operator', why)

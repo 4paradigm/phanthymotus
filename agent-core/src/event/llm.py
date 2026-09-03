@@ -736,6 +736,7 @@ class Event:
             ('subagent_message', _sa_tools.subagent_message),
             ('subagent_result', _sa_tools.subagent_result),
             ('peer_list', _peer_delegation.peer_list),
+            ('peer_state', _peer_delegation.peer_state),
             ('peer_delegate', _peer_delegation.peer_delegate),
             # Desktop tools (Claude Code 风格)
             ('Bash', self._desktop_tools.Bash),

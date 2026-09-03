@@ -14,6 +14,9 @@ The trust boundary between robots. Access is decided by two things:
        * `blocked`  — nothing
   2. `tool_filter` — a comma-separated glob list narrowing further within the role,
      e.g. `camera_*,battery`. A bare `*` means "everything the role allows".
+     Patterns are matched against **both** the full `mcp__<id>__<tool>` name and the
+     bare tool name, because `camera_*` is what a human writes and it would
+     otherwise match nothing at all — silently granting less than intended.
 
 **What `operator` means, stated plainly:** an operator peer can drive this robot's
 actuators through `/api/peer/tools/call` with no local LLM in the path and no human
@@ -101,6 +104,19 @@ def is_read_only(full_name: str) -> bool:
     return category in READ_ONLY_CATEGORIES
 
 
+def _matches_filter(name: str, patterns: list[str]) -> bool:
+    """Whether any pattern selects this tool.
+
+    Matched against the full name and the bare tool name both: a human types
+    `camera_*`, while the real name is `mcp__mcp-1783771428__camera_main`. Matching
+    only the full name made every short pattern match nothing, which fails *closed*
+    and is therefore easy to miss — the peer just quietly cannot call anything.
+    """
+    short = name.split('__', 2)[-1]
+    return any(fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(short, pat)
+               for pat in patterns)
+
+
 def _role_allows(name: str, role: str) -> tuple[bool, str]:
     """Whether `role` may reach this tool at all."""
     if role == 'blocked':
@@ -138,7 +154,7 @@ def filter_schemas(peer_id: str, all_schemas: list[dict]) -> list[dict]:
         if not name:
             continue
 
-        if not any(fnmatch.fnmatch(name, pat) for pat in patterns):
+        if not _matches_filter(name, patterns):
             continue
 
         # Advertise only what a call would accept. Listing a tool that always 403s
@@ -169,7 +185,7 @@ def check_tool_permission(peer_id: str, tool_name: str) -> tuple[bool, str]:
     if not patterns:
         patterns = ['*']
 
-    if not any(fnmatch.fnmatch(tool_name, pat) for pat in patterns):
+    if not _matches_filter(tool_name, patterns):
         return False, f'tool "{tool_name}" not in filter: {tool_filter}'
 
     return _role_allows(tool_name, peer['role'])

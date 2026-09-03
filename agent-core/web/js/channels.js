@@ -95,6 +95,7 @@ function _showAddForm() {
           <option value="telegram">Telegram</option>
           <option value="slack">Slack</option>
           <option value="feishu">Feishu (飞书)</option>
+          <option value="lan">LAN (机器人之间)</option>
         </select>
       </div>
       <div class="channel-form-row">
@@ -116,6 +117,11 @@ function _showAddForm() {
       <div class="channel-form-row hidden" id="channel-form-app-secret-row">
         <label>App Secret</label>
         <input type="password" id="channel-form-app-secret" placeholder="App Secret" />
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-lan-hint">
+        <label>说明</label>
+        <span class="channel-users-hint">不需要凭据：peer 的信任来自「多机协同」里的配对（钉住公钥），
+          每个请求都带 Ed25519 签名。建一个就够 —— 所有已配对的机器人共用它收发消息。</span>
       </div>
       <div class="channel-form-row hidden" id="channel-form-bot-to-bot-row">
         <label title="Accept explicit @ messages from any bot in any group this app joins">
@@ -139,6 +145,13 @@ function _showAddForm() {
     const p = platformSel.value;
     const isSlack = p === 'slack';
     const isFeishu = p === 'feishu';
+    // lan needs no credentials at all: a peer is trusted because it is in the
+    // peers table with a pinned public key (Settings → 多机协同), and every
+    // request carries an Ed25519 signature. So every field below is hidden and
+    // the hint says where trust actually comes from — an empty form with no
+    // explanation reads like something failed to load.
+    const isLan = p === 'lan';
+    document.getElementById('channel-form-lan-hint').classList.toggle('hidden', !isLan);
 
     document.getElementById('channel-form-app-token-row').classList.toggle('hidden', !isSlack);
     document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu);
@@ -146,7 +159,7 @@ function _showAddForm() {
     document.getElementById('channel-form-bot-to-bot-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
       isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
-    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu);
+    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan);
   }
 
   platformSel.addEventListener('change', updateFormFields);
@@ -558,6 +571,7 @@ function _platformIcon(platform) {
     case 'telegram': return '✈';
     case 'slack':    return '◆';
     case 'feishu':   return '飞';
+    case 'lan':      return '⇄';
     case 'whatsapp': return '◉';
     default:         return '◇';
   }
