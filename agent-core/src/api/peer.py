@@ -41,6 +41,26 @@ from subagent.protocol import SubagentSpec
 router = fastapi.APIRouter(prefix='/peer', tags=['peer'])
 
 
+def _local_display_name() -> str:
+    """What to call this agent on the other side's pairing screen.
+
+    Falls back to the hostname: an operator confronted with two bare
+    fingerprints has no way to tell which robot is which.
+    """
+    import socket
+    import config
+    return (config.main.get('peer_settings', {}).get('display_name')
+            or socket.gethostname())
+
+
+def _peer_label(peer_id: str) -> str:
+    """Best known name for a peer — whatever discovery advertised, else the id."""
+    advert = registry.get(peer_id)
+    if advert is not None and advert.display_name:
+        return advert.display_name
+    return peer_id[:12]
+
+
 # ── dashboard-facing (ACCESS_TOKEN) ──────────────────────────────────────────
 
 @router.get('/identity')
@@ -97,7 +117,7 @@ async def start_pairing(req: StartPairingReq):
     payload = {
         'nonce': local_nonce,
         'public_key': local_pubkey,
-        'display_name': '',  # TODO: read from peer_settings
+        'display_name': _local_display_name(),
     }
     result, err = await transport.post_json(
         endpoints, '/api/peer/inbox/pair_request', payload,
@@ -240,6 +260,12 @@ async def inbox_pair_request(req: Request):
     Unpaired by definition, so `require_paired=False` — the consistency check
     (key hashes to peer_id) is what transport.verify_signed_request does, and
     the human comparing a short code on both screens is what stops a MITM.
+
+    Crucially this must *store* a PairingSession, not just answer with a nonce.
+    The whole security property of SAS is that a human sees the same six digits
+    on both dashboards; a receiver that discards its own nonce can neither
+    derive that code nor offer the operator anything to confirm, which reduces
+    pairing to "whoever asked first wins".
     """
     body = await req.body()
     peer_id, reason = transport.verify_signed_request(
@@ -258,12 +284,34 @@ async def inbox_pair_request(req: Request):
     if not remote_nonce or not remote_pubkey:
         raise fastapi.HTTPException(400, 'missing nonce or public_key')
 
+    try:
+        remote_pubkey_raw = base64.b64decode(remote_pubkey)
+    except (ValueError, TypeError):
+        raise fastapi.HTTPException(400, 'public_key is not valid base64')
+    if len(remote_pubkey_raw) != 32 or identity.fingerprint(remote_pubkey_raw) != peer_id:
+        raise fastapi.HTTPException(400, 'public_key does not match signing identity')
+
     local_nonce = pairing.new_nonce()
     local_pubkey = identity.public_key_b64()
+
+    # sas_code() sorts its inputs, so this derives the identical code the
+    # initiator computed — neither side needs to know who started.
+    session = pairing.PairingSession(
+        peer_id=peer_id,
+        peer_public_key=remote_pubkey_raw,
+        display_name=payload.get('display_name', '') or _peer_label(peer_id),
+        endpoints=registry.endpoints_for(peer_id),
+        local_nonce=local_nonce,
+        remote_nonce=remote_nonce,
+        local_public_key=identity.public_key_raw(),
+    )
+    pairing.put(session)
+    print(f'[peer] pairing requested by {peer_id[:12]} — code {session.code}')
+
     return {
         'nonce': local_nonce,
         'public_key': local_pubkey,
-        'display_name': '',  # TODO: read from peer_settings
+        'display_name': _local_display_name(),
     }
 
 
