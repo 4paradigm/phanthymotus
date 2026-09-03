@@ -144,13 +144,22 @@ domain 上每个订阅者都会收到一切。
   Agent Core 会在文件缺失时从镜像里补齐；但已经把那个幽灵目录挂进去的容器必须**重建**而不是重启，
   因为挂载类型在创建时就固化了。
 
-**执行器双闸门 —— 不可协商。** 即使 peer 是 `operator`，它也只能「请求」。跨 agent 的执行器调用必须**同时**满足：
+**peer 能碰到什么，分路径看。** 两条入向路径的保证不同，这个区别值得说准。
 
-1. 该工具在**本机**画布上连线到 `decision_core`（`_get_bound_tool_schemas`）；
-2. 本机 LLM 自主决定要调用它 —— peer 的消息进入 collector 时是「输入」，不是「命令」；
-3. 若配置了 `require_actuator_confirm`，仍需人工确认。
+*消息与委派* —— peer 的消息进 collector 时是**输入**而不是命令，由本机 LLM 决定怎么处理；委派的任务跑在
+subagent 里，其 tool_filter 会被接收方按该 peer 的角色重新裁剪。这两条路径上 peer 只能「请求」。
 
-**peer 永远无法直接驱动电机。**
+*`POST /api/peer/tools/call`* —— 直接分发到设备：不过 LLM、不进 collector、不写历史（实测：接收方的
+agent loop 完全关着时，调用照样执行）。三道检查：
+
+1. **角色** —— `viewer` 只能碰只读的：任意层的 `sensor`/`resource`，加上整个感知层（它的 `processor`
+   工具是对数据做计算并发到话题上）。`operator` 还能碰会动的：`actuator`、整个 actucore 层（执行层 ——
+   `vla` 和导航虽然声明成 `processor`，但会驱动机器人）、以及 `controller`。未声明 type 的算会动。
+2. **`tool_filter`** —— 在角色允许的范围内再收窄。
+3. **本机画布** —— 该工具必须在**这台**机器上连线到 `decision_core`。
+
+所以 `operator` 的 peer **确实能**直接驱动本机执行器。这是既定策略而不是疏漏：授予 `operator` 就是那个
+授权动作，这也正是新配对的 peer 默认 `viewer`、以及每次这类调用都会在活动流里留痕的原因。
 
 ## Web Dashboard
 

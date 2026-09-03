@@ -157,14 +157,27 @@ Two operational consequences:
   is absent; containers that already mounted the phantom directory must be **recreated**, not
   restarted, because the mount type is fixed at creation.
 
-**The actuator double gate — non-negotiable.** Even an `operator` peer only ever *requests*. A
-cross-agent actuator call must additionally satisfy all of:
+**What a peer may reach, per path.** The two inbound paths carry different guarantees, and it is
+worth being exact about which.
 
-1. the tool is wired to `decision_core` on the **local** canvas (`_get_bound_tool_schemas`);
-2. the local LLM decides to call it — a peer's message enters the collector as *input*, not as a command;
-3. human confirmation, when `require_actuator_confirm` is set.
+*Messages and delegation* — a peer's message enters the collector as **input**, not a command, and
+the local LLM decides what to do with it; a delegated task runs in a subagent whose tool filter the
+receiver re-clips against that peer's role. On these paths a peer only ever *requests*.
 
-**A peer can never drive a motor directly.**
+*`POST /api/peer/tools/call`* — a direct dispatch to the device: no LLM, no collector, no history
+(measured: a call executed while the receiver's agent loop was switched off). Three checks gate it:
+
+1. **role** — `viewer` reaches read-only tools only: `sensor`/`resource` from any layer, plus the
+   whole perception layer, whose `processor` tools compute on data and publish to a topic.
+   `operator` also reaches tools that act: `actuator`, the whole actucore layer (the execution
+   layer — `vla` and navigation drive the robot despite declaring `processor`), and `controller`.
+   An undeclared type counts as acting.
+2. **`tool_filter`** — narrows further within the role.
+3. **the local canvas** — the tool must be wired to `decision_core` on *this* machine.
+
+So an `operator` peer **can** drive this robot's actuators directly. That is the policy, not an
+oversight: granting `operator` is what authorises it, which is why a newly paired peer defaults to
+`viewer`, and why every such call is announced on the activity stream.
 
 ### Memory & Long-Running Agent Architecture
 
