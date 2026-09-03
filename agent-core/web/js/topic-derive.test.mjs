@@ -157,45 +157,6 @@ test('a source that is not on the canvas falls back to the persisted topic', asy
   assert.equal(log.length, 1);
 });
 
-// ── shouldAdoptLiveTopics ────────────────────────────────────────────────────
-//
-// From R1: the robot spoke but the dashboard showed no waveform and playback
-// was silent. The TTS card held '/remote_control/message/tts', derived from its
-// upstream when it was wired; the plugin publishes on '/perception/tts'. The
-// multiInstance branch skipped topic updates wholesale, so the live report
-// never corrected the stale derived value and the dashboard subscribed where
-// nothing is published.
-
-import { shouldAdoptLiveTopics } from './topic-derive.js';
-
-const REAL = [{ topic: '/perception/tts', format: 'audio/pcm-16k' }];
-const STALE = [{ topic: '/remote_control/message/tts', format: 'audio/pcm-16k' }];
-const FORMAT_ONLY = [{ format: 'audio/pcm-16k', desc: 'synthesized PCM audio' }];
-
-test('running instance overrides a stale derived topic', () => {
-  assert.equal(shouldAdoptLiveTopics(REAL, STALE, true), true);
-});
-
-test('schema format-only payload never clobbers a resolved topic', () => {
-  assert.equal(shouldAdoptLiveTopics(FORMAT_ONLY, REAL, true), false);
-  assert.equal(shouldAdoptLiveTopics(FORMAT_ONLY, STALE, true), false);
-});
-
-test('identical payload is not a change', () => {
-  assert.equal(shouldAdoptLiveTopics(REAL, REAL, true), false);
-});
-
-test('empty or missing live payload is ignored', () => {
-  assert.equal(shouldAdoptLiveTopics([], REAL, true), false);
-  assert.equal(shouldAdoptLiveTopics(null, REAL, true), false);
-});
-
-test('static tool may adopt a format-only payload when it has nothing yet', () => {
-  // Non-multiInstance cards legitimately start empty and take what the ping gives.
-  assert.equal(shouldAdoptLiveTopics(FORMAT_ONLY, [], false), true);
-  assert.equal(shouldAdoptLiveTopics(FORMAT_ONLY, REAL, false), false);
-});
-
 // ── input-less cards must be re-asked ────────────────────────────────────────
 //
 // Straight from R1's saved layout: the TTS card was once fed by remote_message

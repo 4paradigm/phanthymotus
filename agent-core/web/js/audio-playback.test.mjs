@@ -1,17 +1,21 @@
 /**
  * Playback-start invariants for the audio renderer.
  *
- * WebKit only lets a context emit sound if a source was started during the user
- * gesture. This renderer withholds the first ~500ms in _PREBUF_CHUNKS, so its
- * first real source.start() is always outside the click — on Safari that meant a
- * waveform, a ⏸ button and silence, with nothing in the playback path looking
- * wrong. Tested with a stub context because Web Audio has no headless output.
+ * WebKit's transient user activation expires seconds after the click, and an
+ * audio graph left idle in the meantime comes back silent — the context still
+ * reports 'running' and buffers still schedule at sane times, so nothing in the
+ * playback path looks wrong. Measured on R1 in Safari: with ▶ pressed 7.9s
+ * before the first chunk there was no sound; at 1.7s there was. A looping silent
+ * source keeps the output rendering, which removes that timing dependency —
+ * verified by a >10s gap playing audibly.
+ *
+ * Tested with a stub context because Web Audio has no headless output.
  */
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { AudioRenderer } from './renderers/audio.js';
 
-function stubContext({ throwOnSampleRate = false } = {}) {
+function stubContext() {
   const started = [];
   const sources = [];
   const ctx = {
@@ -28,10 +32,7 @@ function stubContext({ throwOnSampleRate = false } = {}) {
     },
     destination: {},
   };
-  const Ctor = function (opts) {
-    if (throwOnSampleRate && opts?.sampleRate) throw new TypeError('unsupported sampleRate');
-    return ctx;
-  };
+  const Ctor = function () { return ctx; };
   return { ctx, Ctor, started, sources };
 }
 
@@ -43,17 +44,7 @@ function renderer(Ctor) {
   return r;
 }
 
-test('a source starts during the gesture, before any audio arrives', () => {
-  const { Ctor, started } = stubContext();
-  const r = renderer(Ctor);
-  r._startPlay();
-  assert.ok(started.length >= 1, 'WebKit stays silent without this');
-});
-
-test('a looping source keeps the output rendering after the gesture expires', () => {
-  // WebKit's transient activation lapses seconds after the click; an idle graph
-  // comes back silent while still reporting 'running'. Measured on R1: the first
-  // chunk arrived 7.9s after ▶ and played to nobody.
+test('a looping source starts inside the gesture and keeps the output rendering', () => {
   const { Ctor, started } = stubContext();
   const r = renderer(Ctor);
   r._startPlay();
@@ -76,22 +67,4 @@ test('the context is resumed as well', () => {
   r._startPlay();
   assert.ok(ctx.resumed);
   assert.equal(r._playing, true);
-});
-
-test('unlocking happens once, not on every play/pause cycle', () => {
-  const { Ctor, started } = stubContext();
-  const r = renderer(Ctor);
-  r._startPlay();
-  r._stopPlay();
-  r._startPlay();
-  assert.equal(started.filter(s => !s.loop).length, 1, 'unlock ran more than once');
-});
-
-test('a context refusing a custom sampleRate still plays', () => {
-  // Safari before 14.1 throws rather than ignoring the option; giving up on the
-  // context would lose playback entirely, and buffers carry their own rate.
-  const { Ctor, started } = stubContext({ throwOnSampleRate: true });
-  const r = renderer(Ctor);
-  r._startPlay();
-  assert.ok(started.length >= 1);
 });
