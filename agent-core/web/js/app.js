@@ -17,6 +17,7 @@ import { initAccount }       from './account.js';
 import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
 import { initChannels }      from './channels.js';
+import { initPeers }         from './peers.js';
 import { initMobile }        from './mobile.js';
 import { initPerformance }   from './performance.js';
 import { initUsage }         from './usage.js';
@@ -49,6 +50,7 @@ async function main() {
   initHistory();
   initNetwork();
   initChannels();
+  initPeers();
   initPerformance();
   initUsage();
 

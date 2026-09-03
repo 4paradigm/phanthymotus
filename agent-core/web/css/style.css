@@ -7647,3 +7647,66 @@ html, body {
 
 /* 「我的」tab 上的圆点表示"已登录"，不是未读/告警，所以不用 .tabbar-badge 的红色 */
 #account-tab-badge { background: var(--accent); }
+
+/* ── Peer collaboration panel ───────────────────────────────────────────────
+   Reuses .user-row / .user-role-select / .user-role-dot from the channel user
+   list; only peer-specific pieces live here. */
+
+.peer-section { margin-bottom: 22px; }
+.peer-section--alert {
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 12px;
+  background: rgba(255, 255, 255, .03);
+}
+
+.peer-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 10px 0;
+  flex-wrap: wrap;
+}
+.peer-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.peer-input { flex: 1; min-width: 180px; padding: 6px 10px; border-radius: 6px; }
+
+.peer-identity { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.peer-identity-label { font-size: 12px; opacity: .7; }
+.peer-fingerprint, .peer-fingerprint-sm {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  opacity: .85;
+  word-break: break-all;
+}
+.peer-fingerprint-sm { font-size: 11px; opacity: .6; }
+
+.peer-providers { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+.peer-prov { font-size: 11.5px; padding: 2px 8px; border-radius: 10px; }
+.peer-prov--ok  { background: rgba(80, 200, 120, .15); }
+.peer-prov--err { background: rgba(220, 90, 70, .15); }
+
+.peer-pending {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 0;
+  flex-wrap: wrap;
+}
+.peer-pending-who { display: flex; flex-direction: column; gap: 2px; min-width: 120px; }
+.peer-pending-actions { display: flex; gap: 8px; margin-left: auto; }
+
+/* The short code exists to be compared by eye across two screens. Rendering it
+   as ordinary text would make that comparison unreliable, which is the whole
+   security property. Large, monospaced, widely tracked. */
+.peer-sas {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: .22em;
+  padding: 4px 12px;
+}
+
+@media (max-width: 640px) {
+  .peer-pending-actions { margin-left: 0; width: 100%; }
+  .peer-sas { font-size: 26px; }
+}

@@ -74,6 +74,92 @@ async def get_identity():
     }
 
 
+@router.get('/settings')
+async def get_settings():
+    """Peer settings as the dashboard needs them.
+
+    display_name is echoed resolved (hostname when unset) so the panel can show
+    what peers will actually see, rather than a blank field that means
+    "something else".
+    """
+    import config
+    s = config.main.get('peer_settings', {}) or {}
+    disc = s.get('discovery') or {}
+    return {
+        'enabled': bool(s.get('enabled', False)),
+        'display_name': s.get('display_name', ''),
+        'resolved_display_name': _local_display_name(),
+        'discovery': {
+            'mdns': bool(disc.get('mdns', True)),
+            'static': disc.get('static') or [],
+        },
+        'default_role': s.get('default_role', 'viewer'),
+        'clock_skew_s': s.get('clock_skew_s', 120),
+    }
+
+
+class PeerSettingsReq(BaseModel):
+    enabled: bool | None = None
+    display_name: str | None = None
+    mdns: bool | None = None
+    static: list | None = None
+    default_role: str | None = None
+    clock_skew_s: int | None = None
+
+
+@router.post('/settings')
+async def save_settings(req: PeerSettingsReq):
+    """Update peer settings and apply them without a container restart.
+
+    The discovery layer is torn down and rebuilt in place. Until this existed
+    the only way to turn peering on was editing the SQLite config by hand and
+    restarting the container, which is not something an operator can be asked
+    to do.
+    """
+    import config
+    from channel.acl import ROLES
+
+    s = dict(config.main.get('peer_settings', {}) or {})
+    disc = dict(s.get('discovery') or {})
+
+    if req.default_role is not None:
+        if req.default_role not in ROLES or req.default_role == 'owner':
+            raise fastapi.HTTPException(
+                400, f'default_role must be one of viewer/operator/blocked')
+        s['default_role'] = req.default_role
+    if req.enabled is not None:
+        s['enabled'] = bool(req.enabled)
+    if req.display_name is not None:
+        s['display_name'] = req.display_name.strip()
+    if req.clock_skew_s is not None:
+        if req.clock_skew_s < 5:
+            raise fastapi.HTTPException(400, 'clock_skew_s must be at least 5 seconds')
+        s['clock_skew_s'] = int(req.clock_skew_s)
+    if req.mdns is not None:
+        disc['mdns'] = bool(req.mdns)
+    if req.static is not None:
+        disc['static'] = req.static
+    s['discovery'] = disc
+    config.main['peer_settings'] = s
+
+    # Rebuild discovery in place. stop() is safe when nothing is running.
+    try:
+        await registry.stop()
+        registry.reset()
+        await registry.start()
+        applied, apply_error = True, ''
+    except Exception as e:
+        applied, apply_error = False, f'{type(e).__name__}: {e}'
+        print(f'[peer] settings applied to config but discovery restart failed: {apply_error}')
+
+    return {
+        'settings': await get_settings(),
+        'discovery_restarted': applied,
+        'error': apply_error,
+        'providers': registry.provider_status(),
+    }
+
+
 @router.get('/discovered')
 async def list_discovered(include_paired: bool = True):
     """Peers seen by any discovery provider, freshest first.
@@ -213,6 +299,25 @@ async def confirm_pairing(req: ConfirmPairingReq):
     return {'peer': peer, 'already_paired': False, 'code_verified': True}
 
 
+class RejectPairingReq(BaseModel):
+    peer_id: str
+
+
+@router.post('/pair/reject')
+async def reject_pairing(req: RejectPairingReq):
+    """Decline a pairing request outright.
+
+    Without this the only way to refuse was to wait out the five-minute
+    expiry, during which the requesting side keeps showing the pairing as
+    pending. Refusing should be as explicit an act as approving.
+    """
+    session = pairing.pop(req.peer_id)
+    if session is None:
+        raise fastapi.HTTPException(404, 'no active pairing session for this peer_id')
+    print(f'[peer] pairing rejected for {req.peer_id[:12]}')
+    return {'rejected': True, 'peer_id': req.peer_id}
+
+
 @router.get('/pair/active')
 async def active_pairings():
     """In-flight pairing sessions. For the dashboard to show the operator what
@@ -321,6 +426,25 @@ async def inbox_pair_request(req: Request):
     )
     pairing.put(session)
     print(f'[peer] pairing requested by {peer_id[:12]} — code {session.code}')
+
+    # Surface it in the activity stream. A pairing that only reaches the log
+    # requires the operator to already have the Peers panel open to notice it,
+    # which defeats the point of requiring human confirmation.
+    try:
+        from api.motus_stream import push_event
+        await push_event({
+            'type': 'peer_pair_request',
+            'mcp_id': f'peer:{peer_id[:12]}',
+            'payload': {
+                'peer_id': peer_id,
+                'display_name': session.display_name,
+                'code': session.code,
+                'expires_in': session.to_dict()['expires_in'],
+            },
+        })
+    except Exception as e:
+        # Never fail the handshake because the notification path is broken.
+        print(f'[peer] pair request notification failed: {type(e).__name__}: {e}')
 
     return {
         'nonce': local_nonce,

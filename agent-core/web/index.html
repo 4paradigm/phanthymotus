@@ -53,6 +53,7 @@
           <button class="settings-dropdown-item" data-target="btn-history">历史日志</button>
           <button class="settings-dropdown-item" data-target="btn-agent-def">智能体定义</button>
           <button class="settings-dropdown-item" data-target="btn-channels">渠道</button>
+          <button class="settings-dropdown-item" data-target="btn-peers">多机协同</button>
           <button class="settings-dropdown-item" data-target="btn-deploy">部署</button>
           <button class="settings-dropdown-item" data-target="btn-performance">性能</button>
           <button class="settings-dropdown-item" data-target="btn-usage">用量</button>
@@ -73,6 +74,7 @@
       <button class="btn-ghost topbar-btn hidden" id="btn-skills">技能</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-solutions">解决方案</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-channels">渠道</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-peers">多机协同</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-reset">重置</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-performance">性能</button>
@@ -204,6 +206,10 @@
         </button>
         <button class="settings-item" data-action="channels">
           <span class="settings-item-label">渠道</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="peers">
+          <span class="settings-item-label">多机协同</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item" data-action="deploy">
@@ -713,6 +719,18 @@
           <button class="btn-primary btn-sm" id="channel-user-form-add">Add</button>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="peer-overlay">
+  <div class="modal channel-modal">
+    <div class="modal-header">
+      <span class="modal-title">多机协同</span>
+      <button class="btn-icon" id="peer-close">✕</button>
+    </div>
+    <div class="modal-body channel-body" id="peer-body">
+      <div class="channel-empty">Loading...</div>
     </div>
   </div>
 </div>
