@@ -19,6 +19,15 @@ inline double normalize_angle(double value)
   return std::atan2(std::sin(value), std::cos(value));
 }
 
+inline bool same_goal_endpoint(
+  double old_x, double old_y, double old_yaw,
+  double new_x, double new_y, double new_yaw,
+  double position_epsilon, double yaw_epsilon)
+{
+  return std::hypot(new_x - old_x, new_y - old_y) <= position_epsilon &&
+         std::abs(normalize_angle(new_yaw - old_yaw)) <= yaw_epsilon;
+}
+
 inline SegmentProgress segment_progress(
   double start_x, double start_y, double end_x, double end_y,
   double current_x, double current_y)

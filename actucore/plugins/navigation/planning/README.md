@@ -111,8 +111,8 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
   Driver 发布同时包含平移和转向的动作；
 - 上述死区会把低于硬件有效阈值的减速提案收敛为零，不再把
   它们抬高成大动作；readiness blocker、暂停和终态零速仍保持严格零值；
-- 分段控制器的终点容差为 `0.18 m / 0.45 rad`，严于 Nav2
-  GoalChecker 的 `0.20 m / 0.50 rad`；位置到达后只进入最终原地转向，
+- 分段控制器的终点容差为 `0.18 m / 0.10 rad`，位置容差严于 Nav2
+  GoalChecker 的 `0.20 m / 0.10 rad`；位置到达后只进入最终原地转向，
   位置和朝向都达标后立即输出零速，最终 `arrived` 仍以 Nav2
   action result 为准；
 - Nav2 Humble 固定创建 pose 与 through-poses 两个内部 navigator；卡片为二者
@@ -173,7 +173,10 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   更新障碍。本地 DWB/Rotation Shim 替换为 20 Hz G1 分段控制器：
   从最新全局路径上选当前 local costmap 内最远的直线可通点，执行
   `STOP_CHECK -> ROTATE -> DRIVE -> FINAL_ROTATE -> ARRIVED`。任一
-  转向或直线 footprint 检查失败时进入 `BLOCKED` 并立即给零。
+  转向或直线 footprint 检查失败时进入 `BLOCKED` 并立即给零。同一
+  目标的周期重规划会保留最终停稳检查和 `FINAL_ROTATE`，不会因新路径
+  重新进入平移；
+  终点坐标或朝向真正改变时才重置状态。
 - 控制器每 50 ms 使用最新 `map -> base_link` 位姿检查是否已经过
   线段终点、航向是否偏离和下一段是否可通。切段前必须连续两个
   周期观测到接近零速；控制 odom 的接收/source age 上限另外收紧为

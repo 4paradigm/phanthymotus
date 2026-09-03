@@ -684,6 +684,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         set_plan = source.split(
             "void SegmentedController::setPlan", 1
         )[1].split("geometry_msgs::msg::TwistStamped", 1)[0]
+        self.assertIn("preserve_final_approach", set_plan)
+        self.assertIn("after_stop_ == Phase::FINAL_ROTATE", set_plan)
+        self.assertIn("same_goal_endpoint", set_plan)
         self.assertIn("phase_ != Phase::BLOCKED && has_segment_", set_plan)
         self.assertIn('enterStopCheck(Phase::SELECT, "path_updated")', set_plan)
         self.assertIn("nav2_costmap_2d::LETHAL_OBSTACLE", source)

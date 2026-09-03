@@ -123,11 +123,28 @@ void SegmentedController::deactivate()
 void SegmentedController::setPlan(const nav_msgs::msg::Path & path)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  bool preserve_final_approach = false;
+  const bool final_approach = phase_ == Phase::FINAL_ROTATE ||
+    (phase_ == Phase::STOP_CHECK && after_stop_ == Phase::FINAL_ROTATE);
+  if (final_approach && !plan_.poses.empty() && !path.poses.empty() &&
+    plan_.header.frame_id == path.header.frame_id)
+  {
+    const auto & old_goal = plan_.poses.back().pose;
+    const auto & new_goal = path.poses.back().pose;
+    preserve_final_approach = same_goal_endpoint(
+      old_goal.position.x, old_goal.position.y, tf2::getYaw(old_goal.orientation),
+      new_goal.position.x, new_goal.position.y, tf2::getYaw(new_goal.orientation),
+      0.001, 0.001);
+  }
   plan_ = path;
   if (plan_.poses.empty()) {
     has_segment_ = false;
     phase_ = Phase::BLOCKED;
     stop_reason_ = "empty_plan";
+    return;
+  }
+
+  if (preserve_final_approach) {
     return;
   }
 
