@@ -134,11 +134,11 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=b7817f50ff7e518d41dcff3ce6e1b1fee47fa43ac12df067b7ae7c896c699035",
+            "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb",
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=d9fbba62436e4b418a5b23c2539da76a6787e7bfd3db8305139d604280a9c6d0",
+            "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c",
             source_lock,
         )
         self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
@@ -209,11 +209,11 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
-            "b7817f50ff7e518d41dcff3ce6e1b1fee47fa43ac12df067b7ae7c896c699035",
+            "c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb",
         )
         self.assertEqual(
             hashlib.sha256(flush_patch.read_bytes()).hexdigest(),
-            "d9fbba62436e4b418a5b23c2539da76a6787e7bfd3db8305139d604280a9c6d0",
+            "9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c",
         )
         # base 是 Focal，packages.ros.org 上没有 humble 二进制，所以只移除
         # ROS 源；Ubuntu/NVIDIA 签名源仍需保留并认证系统依赖。

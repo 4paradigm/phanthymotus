@@ -26,13 +26,6 @@
 
    int frame_num = 0;
    double aver_time_consu = 0;
-@@ -192,4 +194,4 @@
-   // JPEG decoding callback function
-   void jpeg_callback(const sensor_msgs::msg::CompressedImage::SharedPtr msg);
- };
--#endif
-\ No newline at end of file
-+#endif
 --- a/src/LIVMapper.cpp
 +++ b/src/LIVMapper.cpp
 @@ -121,6 +121,26 @@

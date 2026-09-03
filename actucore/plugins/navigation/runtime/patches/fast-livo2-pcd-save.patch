@@ -171,10 +171,3 @@
      }
      
      if(LidarMeasures.lio_vio_flg == LIO || LidarMeasures.lio_vio_flg == LO)
-@@ -1525,4 +1633,4 @@
-   msg_body_pose.header.frame_id = "camera_init";
-   path.poses.push_back(msg_body_pose);
-   pubPath->publish(path);
--}
-\ No newline at end of file
-+}
