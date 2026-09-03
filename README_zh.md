@@ -62,9 +62,10 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 
 ### 多机协同（Multi-Agent Peers）
 
-> **状态：设计已定，尚未实现。** 本节先把架构写下来，好让后续代码落在正确的形状上。目前真正可用的跨机协作
-> 只有飞书 bot 互通（`bot_to_bot_enabled` + `trusted_bots`，见[飞书渠道配置](docs/feishu-channel-setup.md)），
-> 且强依赖公网。
+> **状态：已实现，在两台 Orin 测试机之间验证通过，尚未在多机队列上跑过。** 发现、配对、消息、工具代理、
+> 任务委派、状态共享都已运行。**没有**验证过的是超过两台 peer 的情形，以及跨地点（云端名册 provider 目前
+> 是桩）。飞书 bot 互通（`bot_to_bot_enabled` + `trusted_bots`，见[飞书渠道配置](docs/feishu-channel-setup.md)）
+> 仍然作为依赖公网的那条路径存在。
 
 ![多机协同与安全](docs/images/peer-mesh.png)
 
@@ -79,7 +80,7 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 | Provider | 依赖 | 用途 |
 |---|---|---|
 | mDNS / DNS-SD（`_motus._tcp.local`） | 同局域网 | 同场地，主力路径 |
-| DDS presence（`/motus/presence`） | 同 `ROS_DOMAIN_ID` | 同场地，零新依赖（DDS 多播本来就在跑） |
+| ~~DDS presence（`/motus/presence`）~~ | —— | **不可用。** DDS 现已锁在本机（见下），任何基于 DDS 的东西都不跨机 |
 | 云端名册 | 公网 | 跨地点、跨网段 |
 | BLE 广播 | 无 | 仅用于完全离网时的**配对引导**，不承载数据面 |
 | 静态清单 | 无 | 兜底，永远保留 |
@@ -91,8 +92,11 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
    语义完全相同的两条链路，天然得到「有网走公网、断网走局域网」。
 2. **能力级** —— peer 注册为合成 MCP 条目（`transport: 'peer'`），其工具以 `mcp__peer:<id>__<tool>` 出现，
    直接继承画布绑定闸门、ACP barrier（跨机异步等待原样可用）、hooks 与 per-tool 配置。
-3. **状态级** —— 位姿、电量、任务状态等高频数据走 DDS topic。**DDS 没有鉴权**：同一个 `ROS_DOMAIN_ID` 下
-   任何人都能读写，所以这条链路只承载状态，绝不承载指令。
+3. **状态级** —— 话题清单（以及后续的位姿、电量、任务状态）通过同一条签名 HTTPS 链路推送
+   （`POST /api/peer/inbox/state`）。这里原本走 DDS topic；DDS 现已限制在本机，而 FastDDS 的传输隔离是
+   **进程级**的，没法为 peer 流量单独开一个参与者的例外。改动顺带补上了一个真实缺陷：原来的 peer DDS 总线
+   **没有任何鉴权**，同一个 `ROS_DOMAIN_ID` 上任何进程都能伪造另一台机器人的状态。现在仍然只承载状态，
+   绝不承载指令。
 4. **任务级** —— `peer_delegate` 把 `SubagentSpec` 发给 peer，由对方在本地 spawn 一个 subagent 并回传
    `SubagentResult`。接收方会按 peer 自身角色对 `tool_filter` 二次裁剪 —— 发起方给的是请求上限，不是授权 ——
    且 `hop_count > 2` 直接拒绝，避免委派链形成风暴。
@@ -101,6 +105,26 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 dashboard」，不再是跨机凭据。配对沿用蓝牙的做法：双方 dashboard 显示同一个 6 位短码（由双方公钥与 nonce
 派生），两边都由人确认。这样既能抗中间人、又不需要 CA，也是唯一在纯 BLE、完全无网时仍然成立的方案。链路
 随后跑在 pinned mTLS 上。peer 复用 `channel/acl.py` 的角色分级，默认 `viewer`（只读传感器）。
+
+**内部总线只留在本机。** 所有机器人一律 `ROS_DOMAIN_ID=42`，并加载同一份 loopback-only 的 FastDDS
+profile（`agent-core/deploy/dds-local.xml`，挂到 `/opt/phanthy-motus/dds-local.xml`），白名单只有
+`127.0.0.1`。在 `network_mode: host` 下同一台机器上所有容器共享同一个 loopback，因此本机总线照常工作、
+数据出不了这台机器。各机器人配置**完全相同** —— 没有需要人去分配的 domain 编号，这正是重点：
+`ROS_DOMAIN_ID` 可用范围很窄，而克隆出来的镜像之间根本无法协调。
+
+为什么这不是可选项：`/remote_control/message` —— 一条**指令** —— 当时正在到达办公网上的每一台机器人。
+在 Orin5 上敲的一条指令被 Orin6 一起执行了，两边日志里的时间戳完全一致。DDS 没有寻址、没有鉴权，同一个
+domain 上每个订阅者都会收到一切。
+
+两条运维后果：
+
+- **所有 DDS 容器都必须加载这份 profile。** 漏掉的那个容器会把**自己**和本机其余部分隔开，症状是
+  「机器人突然什么都听不见」。Agent Core 启动时会自检，并暴露 `GET /api/peer/dds_isolation`；判据是进程的
+  UDP socket 是否绑在 `127.0.0.1`，而不是文件在不在。
+- **文件缺失是静默失败。** 宿主机上没有 `/opt/phanthy-motus/dds-local.xml` 时，Docker 的 bind mount 会
+  自动建一个同名**目录**，FastDDS 读不到有效 profile 就回退到所有网卡 —— 隔离失效，日志里什么都没有。
+  Agent Core 会在文件缺失时从镜像里补齐；但已经把那个幽灵目录挂进去的容器必须**重建**而不是重启，
+  因为挂载类型在创建时就固化了。
 
 **执行器双闸门 —— 不可协商。** 即使 peer 是 `operator`，它也只能「请求」。跨 agent 的执行器调用必须**同时**满足：
 

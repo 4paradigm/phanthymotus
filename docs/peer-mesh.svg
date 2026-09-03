@@ -13,7 +13,7 @@
   with the architecture diagram. After editing this file, re-export that
   PNG (2x, white background).
 -->
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="784" viewBox="0 0 1200 784" role="img" aria-label="PhanthyMotus peer mesh and security: five discovery providers converging on a peer registry; four collaboration links between two agent cores, with the unauthenticated DDS broadcast lane marked state-only; and a trust pipeline of identity, short-code pairing, pinned mTLS and role authorization, ending in the actuator double gate that prevents a peer from driving a motor directly">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="784" viewBox="0 0 1200 784" role="img" aria-label="PhanthyMotus peer mesh and security: four discovery providers converging on a peer registry; four collaboration links between two agent cores, every one signed and restricted to paired peers, with the state link marked state-only; and a trust pipeline of identity, short-code pairing, pinned mTLS and role authorization, ending in the actuator double gate that prevents a peer from driving a motor directly">
 <defs>
 <marker id="head-peer" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M 0 0 L 10 5 L 0 10 z" fill="#3F7A80">
@@ -21,10 +21,6 @@
 </marker>
 <marker id="head-trust" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M 0 0 L 10 5 L 0 10 z" fill="#9C4B3F">
-</path>
-</marker>
-<marker id="head-weak" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-<path d="M 0 0 L 10 5 L 0 10 z" fill="#94A3A8">
 </path>
 </marker>
 </defs>
@@ -43,36 +39,25 @@
 </g>
 </g>
 <g>
-<rect x="325" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
+<rect x="397" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
 </rect>
-<text x="339" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">DDS PRESENCE</text>
-<text x="339" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">same ROS_DOMAIN_ID</text>
+<text x="411" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">CLOUD ROSTER</text>
+<text x="411" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">across sites</text>
 <g>
-<rect x="339" y="90" width="104" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
+<rect x="411" y="90" width="116" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
 </rect>
-<text x="391" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">/motus/presence</text>
+<text x="469" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Feishu · registry</text>
 </g>
 </g>
 <g>
-<rect x="542" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
+<rect x="686" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
 </rect>
-<text x="556" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">CLOUD ROSTER</text>
-<text x="556" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">across sites</text>
+<text x="700" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">BLE ADVERT</text>
+<text x="700" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">fully offline</text>
 <g>
-<rect x="556" y="90" width="116" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
+<rect x="700" y="90" width="116" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
 </rect>
-<text x="614" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Feishu · registry</text>
-</g>
-</g>
-<g>
-<rect x="759" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
-</rect>
-<text x="773" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">BLE ADVERT</text>
-<text x="773" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">fully offline</text>
-<g>
-<rect x="773" y="90" width="116" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
-</rect>
-<text x="831" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">pairing bootstrap</text>
+<text x="758" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">pairing bootstrap</text>
 </g>
 </g>
 <g>
@@ -87,23 +72,19 @@
 </g>
 </g>
 <g>
-<path d="M 208 118 L 455.3333333333333 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
+<path d="M 208 118 L 474 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
 </path>
 </g>
 <g>
-<path d="M 425 118 L 548.6666666666666 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
+<path d="M 497 118 L 586 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
 </path>
 </g>
 <g>
-<path d="M 642 118 L 642 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
+<path d="M 786 118 L 698 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
 </path>
 </g>
 <g>
-<path d="M 859 118 L 735.3333333333333 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
-</path>
-</g>
-<g>
-<path d="M 1076 118 L 828.6666666666666 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
+<path d="M 1076 118 L 810 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
 </path>
 </g>
 <text x="342" y="144" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">PeerAdvert</text>
@@ -184,10 +165,10 @@
 <text x="642" y="426" fill="#A8A29E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9.5">SubagentSpec → / SubagentResult ← · hop_count ≤ 2</text>
 </g>
 <g>
-<path d="M 368 454 L 916 454" fill="none" stroke="#94A3A8" stroke-width="1.5" stroke-dasharray="4 5" stroke-opacity="0.6" marker-start="url(#head-weak)" marker-end="url(#head-weak)">
+<path d="M 368 454 L 916 454" fill="none" stroke="#3F7A80" stroke-width="1.5" stroke-opacity="0.75" marker-start="url(#head-peer)" marker-end="url(#head-peer)">
 </path>
-<text x="642" y="446" fill="#A8A29E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.02em">DDS state · broadcast</text>
-<text x="642" y="470" fill="#9C4B3F" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9.5">⚠ no auth · state only — never commands</text>
+<text x="642" y="446" fill="#3F7A80" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.02em">peer state · signed HTTPS</text>
+<text x="642" y="470" fill="#9C4B3F" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9.5">POST /api/peer/inbox/state · state only — never commands</text>
 </g>
 <g>
 <rect x="108" y="556" width="252" height="74" rx="10" fill="#FBEDEA" stroke="#9C4B3F" stroke-width="2">

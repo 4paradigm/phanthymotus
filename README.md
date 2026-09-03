@@ -63,10 +63,11 @@ Hardware drivers are maintained in a separate repository: **[phanthymotus-driver
 
 ### Multi-Agent Peers
 
-> **Status: designed, not yet implemented.** This section describes the agreed architecture so the
-> pieces land in the right shape. The only cross-machine collaboration that works today is Feishu
-> bot-to-bot (`bot_to_bot_enabled` + `trusted_bots`, see [Feishu channel setup](docs/feishu-channel-setup.md)),
-> which requires the public internet.
+> **Status: implemented; verified between two Orin test rigs, not yet on a fleet.** Discovery,
+> pairing, messaging, tool proxying, delegation and state sharing all run. What has *not* been
+> exercised is more than two peers, and anything across sites (the cloud roster provider is a
+> stub). Feishu bot-to-bot (`bot_to_bot_enabled` + `trusted_bots`, see
+> [Feishu channel setup](docs/feishu-channel-setup.md)) still exists as the internet-dependent path.
 
 ![Peer mesh & security](docs/images/peer-mesh.png)
 
@@ -83,7 +84,7 @@ stays one record with several links, which is what makes fallback possible.
 | Provider | Needs | Used for |
 |---|---|---|
 | mDNS / DNS-SD (`_motus._tcp.local`) | Same LAN | Same site — the primary path |
-| DDS presence (`/motus/presence`) | Same `ROS_DOMAIN_ID` | Same site, no new dependency (DDS multicast is already running) |
+| ~~DDS presence (`/motus/presence`)~~ | — | **Not usable.** DDS is now pinned to loopback (see below), so nothing DDS-based crosses machines |
 | Cloud roster | Internet | Across sites and subnets |
 | BLE advert | Nothing | Fully offline **pairing bootstrap** only — not a data plane |
 | Static list | Nothing | Fallback, always kept |
@@ -97,9 +98,12 @@ stays one record with several links, which is what makes fallback possible.
 2. **Tools** — a peer registers as a synthetic MCP entry (`transport: 'peer'`), so its tools appear
    as `mcp__peer:<id>__<tool>` and inherit the canvas binding gate, the ACP barrier (cross-machine
    async waits work as-is), hooks, and per-tool config.
-3. **State** — high-rate pose/battery/task state over DDS topics. **DDS has no authentication**:
-   anything on the same `ROS_DOMAIN_ID` can read and write it, so this link carries state only,
-   never commands.
+3. **State** — topic lists and, later, pose/battery/task state, pushed over the same signed HTTPS
+   link (`POST /api/peer/inbox/state`). This used to be DDS topics; DDS is now confined to the
+   local host, and FastDDS transport isolation is *process-wide*, so a per-participant exemption
+   for peer traffic is not implementable. The move fixed a real hole on the way: the DDS peer bus
+   had **no authentication**, so anything on the same `ROS_DOMAIN_ID` could forge another robot's
+   state. It still carries state only, never commands.
 4. **Tasks** — `peer_delegate` ships a `SubagentSpec` to a peer, which spawns a subagent locally and
    returns a `SubagentResult`. The receiver re-clips `tool_filter` against the peer's own role — the
    sender's list is a request, not a grant — and `hop_count > 2` is refused so delegation chains
@@ -111,6 +115,30 @@ the Bluetooth model: both dashboards show the same 6-digit short code derived fr
 plus nonces, and a human confirms on both sides. That resists a man-in-the-middle without needing a
 CA, and is the only scheme that also works over BLE with no network. Links then run over pinned
 mTLS. Peers reuse the `channel/acl.py` role ladder and default to `viewer` (read-only sensors).
+
+**The internal bus stays on one machine.** Every robot runs `ROS_DOMAIN_ID=42` and the same
+loopback-only FastDDS profile (`agent-core/deploy/dds-local.xml`, mounted at
+`/opt/phanthy-motus/dds-local.xml`), which whitelists `127.0.0.1`. Under `network_mode: host` all
+containers on a machine share one loopback, so the local bus works normally while nothing leaves
+the host. Configuration is identical everywhere — no per-robot domain numbers to hand out, which is
+the point: `ROS_DOMAIN_ID` has a narrow usable range and cloned images cannot coordinate.
+
+Why this is not optional: `/remote_control/message` — a *command* — was reaching every robot on the
+office LAN. One instruction typed on Orin5 was executed by Orin6 as well, with the identical
+timestamp in both logs. DDS has no addressing and no authentication; every subscriber on the domain
+receives everything.
+
+Two operational consequences:
+
+- **Every DDS container must load the profile.** A container that misses it isolates *itself* from
+  the rest of the machine — the symptom is a robot that suddenly hears nothing. Agent Core
+  self-checks at startup and exposes `GET /api/peer/dds_isolation`; the judgement is whether the
+  process's UDP sockets bind `127.0.0.1`, not whether the file exists.
+- **A missing file fails silently.** If the host lacks `/opt/phanthy-motus/dds-local.xml`, Docker's
+  bind mount creates a *directory* with that name, FastDDS ignores it and falls back to every
+  interface — isolation gone, nothing in the log. Agent Core writes the file from its image when it
+  is absent; containers that already mounted the phantom directory must be **recreated**, not
+  restarted, because the mount type is fixed at creation.
 
 **The actuator double gate — non-negotiable.** Even an `operator` peer only ever *requests*. A
 cross-agent actuator call must additionally satisfy all of:
