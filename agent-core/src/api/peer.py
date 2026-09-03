@@ -501,7 +501,12 @@ async def list_tools(req: Request):
     if not peer_id:
         raise fastapi.HTTPException(403, f'signature verification failed: {reason}')
 
-    all_schemas = mcp_client.all_schemas()
+    # Advertise only what the peer could actually invoke: role/tool_filter *and*
+    # wired to the decision core. Listing unwired tools would have the peer's LLM
+    # plan around capabilities that always 403 at call time.
+    import canvas_binding
+    all_schemas = [s for s in mcp_client.all_schemas()
+                   if canvas_binding.is_bound(s.get('name', ''))]
     allowed = peer_tools.filter_schemas(peer_id, all_schemas)
     return {'tools': allowed, 'count': len(allowed)}
 
@@ -515,11 +520,17 @@ class ToolCallReq(BaseModel):
 async def call_tool(req: Request):
     """Execute a tool on behalf of the peer.
 
-    The actuator double gate still applies: if the tool is bound to a canvas and
-    the peer's role is operator, the canvas must have a connection from the peer
-    for the call to succeed. That enforcement happens in mcp_client.call_tool or
-    event/llm.py, not here — this endpoint only pre-checks the peer's static
-    permission.
+    Two gates apply, and both are enforced here:
+
+      1. the peer's role and tool_filter (peer/tools.py), and
+      2. the tool being wired to the decision core on the local canvas.
+
+    Gate 2 used to be missing on this path. The docstring claimed
+    mcp_client.call_tool enforced it; it does not — that function performs no
+    canvas check at all, so an `operator` peer could invoke any tool its
+    tool_filter allowed, wired or not. The canvas is the operator's authority
+    over what a remote machine may touch, and a proxy that ignores it makes
+    that authority decorative.
     """
     body = await req.body()
     peer_id, reason = transport.verify_signed_request(
@@ -538,10 +549,19 @@ async def call_tool(req: Request):
     if not tool_name:
         raise fastapi.HTTPException(400, 'tool_name required')
 
-    # Pre-flight permission check
+    # Gate 1 — the peer's role and tool_filter
     allowed, perm_reason = peer_tools.check_tool_permission(peer_id, tool_name)
     if not allowed:
         raise fastapi.HTTPException(403, f'tool call denied: {perm_reason}')
+
+    # Gate 2 — the operator must have wired this tool to the decision core
+    import canvas_binding
+    if not canvas_binding.is_bound(tool_name):
+        raise fastapi.HTTPException(
+            403,
+            f'tool call denied: "{tool_name}" is not wired to the decision core on '
+            f'this agent\'s canvas. Connect it there to let a peer request it.'
+        )
 
     # Call the tool
     try:
