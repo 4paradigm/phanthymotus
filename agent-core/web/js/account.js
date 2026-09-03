@@ -163,6 +163,7 @@ function _render() {
     <div class="account-section-label">内容</div>
     <div class="settings-list account-entry-list">
       <button class="settings-item" data-entry="skills">
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.2l1.9 4.9 4.9 1.9-4.9 1.9L12 16.8l-1.9-4.9L5.2 10l4.9-1.9L12 3.2z"/><path d="M18.5 16.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8z"/></svg></span>
         <span class="settings-item-text">
           <span class="settings-item-label">技能广场</span>
           <span class="settings-item-sub" id="account-skills-sub">安装、激活、发布技能</span>
@@ -170,6 +171,7 @@ function _render() {
         <span class="settings-item-arrow">›</span>
       </button>
       <button class="settings-item" data-entry="solutions">
+        <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3.2 7.6 12 12.2l8.8-4.6L12 3z"/><path d="M3.2 12.4 12 17l8.8-4.6M3.2 16.8 12 21.4l8.8-4.6"/></svg></span>
         <span class="settings-item-text">
           <span class="settings-item-label">解决方案市场</span>
           <span class="settings-item-sub" id="account-solutions-sub">整套画布 / 技能 / Prompt / 任务</span>

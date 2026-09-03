@@ -215,7 +215,11 @@ html, body {
 }
 .topbar-settings-dropdown.hidden { display: none; }
 .settings-dropdown-item {
-  display: block;
+  /* was `display: block` with the label as the only child; flex so the leading
+     icon sits on the text baseline row rather than pushing the label down */
+  display: flex;
+  align-items: center;
+  gap: 10px;
   width: 100%;
   text-align: left;
   padding: 9px 16px;
@@ -226,6 +230,17 @@ html, body {
   cursor: pointer;
 }
 .settings-dropdown-item:hover { background: var(--bg-hover); }
+.settings-dropdown-icon {
+  flex: 0 0 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+.settings-dropdown-icon svg { width: 15px; height: 15px; }
+/* The danger row's text is already red; a neutral icon next to it would read as a
+   different class of item. */
+.settings-dropdown-item--danger .settings-dropdown-icon { color: inherit; }
 
 /* Think mode toggle in settings dropdown */
 .settings-dropdown-toggle {
@@ -5689,6 +5704,24 @@ html, body {
   font-size: 18px;
   font-weight: 300;
 }
+/* Leading icon on each settings / 我的 row.
+   The row is a space-between flex pair (label, arrow); adding a third child
+   would spread all three evenly, so the label takes the free space instead and
+   the icon and arrow stay hard against the edges. */
+.settings-item-icon {
+  flex: 0 0 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 12px;
+  color: var(--text-muted);
+}
+.settings-item-icon svg { width: 18px; height: 18px; }
+.settings-item-label,
+.settings-item-text { flex: 1; min-width: 0; text-align: left; }
+/* The danger row's label is already red; a neutral icon beside it reads as a
+   different kind of item, so it follows the label. */
+.settings-item--danger .settings-item-icon { color: #c0392b; }
 
 /* ── Mobile update banner (in settings panel) ── */
 .mobile-update-banner {
