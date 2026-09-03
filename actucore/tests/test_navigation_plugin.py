@@ -539,7 +539,7 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("ACTUCORE_NAVIGATION_BASE_IMAGE override", build_script)
         self.assertIn("JP${JP_VERSION} navigation base is not published", build_script)
         self.assertIn(
-            "actucore-navigation-base@sha256:b3971b0068eca18684f531c4b61144bab2d8cb9195f38e8ee068baa361f70283",
+            "actucore-navigation-base@sha256:c3721526b785293b93bd985e719b551cccf05b609f1291b83df2c7730d12eda9",
             build_script,
         )
         self.assertIn(
