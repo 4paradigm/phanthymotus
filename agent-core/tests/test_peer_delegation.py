@@ -89,6 +89,39 @@ class TestDelegation(unittest.TestCase):
         # Wildcard peer allows the spec's filter through
         self.assertEqual(augmented.tool_filter, ['move_*'])
 
+    def test_endpoint_parses_hop_count_from_payload(self):
+        """/delegate 必须从请求体里读 hop_count。
+
+        真机上发现：hop_count=3 被正常执行了。端点构造 SubagentSpec 时漏掉了
+        这个字段，于是它永远是默认值 0，validate_delegation 的上限**从未生效** ——
+        熔断器装了但没接线，A→B→C→D… 可以无限链下去。
+
+        原有测试只覆盖 validate_delegation() 这个纯函数（逻辑本身是对的），
+        没有人验证过端点是否真的把值传了进去。
+        """
+        import inspect
+        import api.peer as ap
+        src = inspect.getsource(ap.delegate_task)
+        self.assertIn('hop_count', src,
+                      '/delegate never reads hop_count; the limit cannot fire')
+        # 必须真的传进 SubagentSpec，而不只是读出来放着
+        self.assertRegex(src, r'hop_count\s*=\s*hop_count',
+                         'hop_count parsed but not passed into SubagentSpec')
+
+    def test_hop_count_limit_boundary(self):
+        """边界：等于上限放行，超过上限拒绝。"""
+        peer_id = 'boundary_peer'
+        store.upsert(peer_id, identity.public_key_b64(), 'B', role='operator')
+
+        ok, _ = delegation.validate_delegation(
+            peer_id, SubagentSpec(goal='x', hop_count=delegation.MAX_HOP_COUNT))
+        self.assertTrue(ok, 'hop_count == MAX must be allowed')
+
+        bad, reason = delegation.validate_delegation(
+            peer_id, SubagentSpec(goal='x', hop_count=delegation.MAX_HOP_COUNT + 1))
+        self.assertFalse(bad, 'hop_count > MAX must be refused')
+        self.assertIn('hop_count', reason)
+
     def test_valid_delegation(self):
         """正常委托通过验证"""
         peer_id = 'test_peer'

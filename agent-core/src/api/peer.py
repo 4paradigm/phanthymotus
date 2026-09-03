@@ -438,6 +438,9 @@ class DelegateReq(BaseModel):
     tool_deny: list[str] | None = None
     max_rounds: int = 10
     timeout_s: float = 300.0
+    # How many peers this task has already been handed through. The receiver
+    # increments it and refuses past delegation.MAX_HOP_COUNT.
+    hop_count: int = 0
 
 
 @router.post('/delegate')
@@ -459,7 +462,19 @@ async def delegate_task(req: Request):
     except Exception:
         raise fastapi.HTTPException(400, 'invalid JSON')
 
-    # Build SubagentSpec from request
+    # Build SubagentSpec from request.
+    #
+    # hop_count MUST be read from the payload. Omitting it left the field at its
+    # default of 0 on every request, so validate_delegation()'s limit could never
+    # trigger and the circuit breaker against delegation storms was inert —
+    # A→B→C→D… would have chained without bound.
+    try:
+        hop_count = int(payload.get('hop_count', 0) or 0)
+    except (TypeError, ValueError):
+        raise fastapi.HTTPException(400, 'hop_count must be an integer')
+    if hop_count < 0:
+        raise fastapi.HTTPException(400, 'hop_count must not be negative')
+
     spec = SubagentSpec(
         goal=payload.get('goal', ''),
         priority=payload.get('priority', 2),
@@ -468,6 +483,7 @@ async def delegate_task(req: Request):
         tool_deny=payload.get('tool_deny'),
         max_rounds=payload.get('max_rounds', 10),
         timeout_s=payload.get('timeout_s', 300.0),
+        hop_count=hop_count,
     )
     if not spec.goal:
         raise fastapi.HTTPException(400, 'goal required')
