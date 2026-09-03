@@ -127,7 +127,7 @@ else
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
     case "${JP_VERSION}" in
         5.11)
-            DEFAULT_NAVIGATION_BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:c3721526b785293b93bd985e719b551cccf05b609f1291b83df2c7730d12eda9"
+            DEFAULT_NAVIGATION_BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b"
             ;;
         6.1)
             DEFAULT_NAVIGATION_BASE_IMAGE=""
