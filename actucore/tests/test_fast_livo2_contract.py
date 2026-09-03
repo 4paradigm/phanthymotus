@@ -130,7 +130,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=cc51080e2b36848927bfd416e64ada457d43abcd86428eec1ff113423a94c318",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=baa9153c6a6bd204dd5577e59036aad6db7d48c167f76017404b6110bb611891",
             source_lock,
         )
         self.assertIn(
@@ -146,7 +146,9 @@ class FastLivo2ContractTest(unittest.TestCase):
         runtime_patch_text = runtime_patch.read_text(encoding="utf-8")
         self.assertIn('declare_parameter<int>("lidar_qos_depth", 2)', runtime_patch_text)
         self.assertIn('declare_parameter<int>("imu_qos_depth", 400)', runtime_patch_text)
-        self.assertIn("rclcpp::SensorDataQoS", runtime_patch_text)
+        self.assertIn("rclcpp::KeepLast", runtime_patch_text)
+        self.assertIn("point_cloud_qos.reliable().durability_volatile()", runtime_patch_text)
+        self.assertIn("imu_qos.reliable().durability_volatile()", runtime_patch_text)
         runtime_cpp_patch = runtime_patch_text.split(
             "diff --git a/src/LIVMapper.cpp", 1
         )[1]
@@ -205,7 +207,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "cc51080e2b36848927bfd416e64ada457d43abcd86428eec1ff113423a94c318",
+            "baa9153c6a6bd204dd5577e59036aad6db7d48c167f76017404b6110bb611891",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),

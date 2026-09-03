@@ -88,7 +88,7 @@ diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
 index 4b92dfe..4fa153e 100755
 --- a/src/LIVMapper.cpp
 +++ b/src/LIVMapper.cpp
-@@ -308,12 +308,31 @@ void LIVMapper::initializeFiles()
+@@ -308,12 +308,32 @@ void LIVMapper::initializeFiles()
  void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node, image_transport::ImageTransport &it_)
  {
    image_transport::ImageTransport it(this->node);
@@ -101,10 +101,11 @@ index 4b92dfe..4fa153e 100755
 +      imu_queue_depth < 1 || imu_queue_depth > 4000) {
 +    throw std::out_of_range("FAST-LIVO2 QoS depth is outside the supported range");
 +  }
-+  rclcpp::SensorDataQoS point_cloud_qos;
-+  point_cloud_qos.keep_last(static_cast<size_t>(point_cloud_queue_depth));
-+  rclcpp::SensorDataQoS imu_qos;
-+  imu_qos.keep_last(static_cast<size_t>(imu_queue_depth));
++  rclcpp::QoS point_cloud_qos(
++    rclcpp::KeepLast(static_cast<size_t>(point_cloud_queue_depth)));
++  point_cloud_qos.reliable().durability_volatile();
++  rclcpp::QoS imu_qos(rclcpp::KeepLast(static_cast<size_t>(imu_queue_depth)));
++  imu_qos.reliable().durability_volatile();
    if (p_pre->lidar_type == AVIA) {
 -    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
 +    sub_pcl = this->node->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, point_cloud_qos, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
