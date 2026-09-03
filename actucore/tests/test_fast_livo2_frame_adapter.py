@@ -16,11 +16,11 @@ PACKAGE_ROOT = (
     / "plugins"
     / "navigation"
     / "runtime"
-    / "g1_fast_livo2"
+    / "fast_livo2"
 )
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
+from fast_livo2.frame_adapter_core import (  # noqa: E402
     FastLivo2PersistenceError,
     InvalidFastLivo2Frame,
     OdomHealthMonitor,
@@ -46,7 +46,7 @@ from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     write_pcd_xyz_atomic,
     yaw_from_quaternion,
 )
-from g1_fast_livo2.runtime_core import controlled_stop_succeeded  # noqa: E402
+from fast_livo2.runtime_core import controlled_stop_succeeded  # noqa: E402
 
 
 class FastLivo2FrameAdapterTest(unittest.TestCase):
@@ -681,7 +681,7 @@ class FastLivo2FrameAdapterTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "deadline_monotonic"):
                 read_pcd_xyz(deadline, deadline_monotonic=math.nan)
             with mock.patch(
-                "g1_fast_livo2.frame_adapter_core.time.monotonic",
+                "fast_livo2.frame_adapter_core.time.monotonic",
                 side_effect=[0.0] * 9 + [2.0],
             ):
                 with self.assertRaisesRegex(TimeoutError, "ASCII parsing"):

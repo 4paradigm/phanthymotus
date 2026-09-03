@@ -292,7 +292,7 @@ RUN for header in $(find /opt/ros/humble/install/include -path '*tf2*' -name '*.
     test -f /opt/ros/humble/install/include/tf2/tf2/LinearMath/Quaternion.hpp && \
     test -f /opt/ros/humble/install/include/tf2/tf2/utils.hpp
 
-# ── FAST-LIVO2 依赖图（锁定源码，三个 G1 patch 先验 sha256 再打）────────
+# ── FAST-LIVO2 依赖图（锁定源码，三个运行时 patch 先验 sha256 再打）──────
 RUN git init /tmp/sophus && \
     cd /tmp/sophus && \
     git remote add origin "${GIT_MIRROR_PREFIX}${SOPHUS_REPO}" && \
@@ -309,7 +309,7 @@ RUN git init /tmp/sophus && \
 
 WORKDIR /opt/fast_livo_ws/src
 
-# 当前 G1 输入是标准 PointCloud2（lidar_type=7），不会启动 Livox Driver。
+# 当前输入契约是标准 PointCloud2（lidar_type=7），不会启动 Livox Driver。
 # FAST-LIVO2 上游仍编译引用两条 CustomMsg 类型，因此只保留 message-only 接口，
 # 不再拉取或编译 Livox SDK2/Driver 实现。
 COPY actucore/plugins/navigation/runtime/livox_ros_driver2_msgs/ \
@@ -377,7 +377,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
       --packages-select fast_livo \
       --cmake-args -DCMAKE_BUILD_TYPE=Release
 
-# G1 patches 是否真的进了二进制 —— 打错分支时这里就会红，而不是等到真机
+# 运行时 patches 是否真的进了二进制 —— 打错分支时这里就会红，而不是等到真机
 RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
       > /tmp/fastlivo_mapping.strings && \
     grep -Fq "accepting current sample to resynchronize" \
@@ -390,7 +390,7 @@ RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
 
 # The upstream node automatically declares ROS parameter overrides. Launch
 # once with the same overrides used by the supervisor so duplicate declarations
-# fail during the base build instead of later appearing as SIGABRT on G1.
+# fail during the base build instead of later appearing as an on-device SIGABRT.
 RUN source /opt/ros/humble/install/setup.bash && \
     source /opt/ros_deps_ws/install/setup.bash && \
     source /opt/fast_livo_ws/install/setup.bash && \

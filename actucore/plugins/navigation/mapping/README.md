@@ -92,7 +92,7 @@ Nav2，也不会进入累计。不匹配帧进入 diagnostics 计数，不能拿
 直接累计可以恢复墙面和稀疏结构密度，但不提供人员语义分割或动态物体清除，
 建图时经过的人可能固化进地图，现场应尽量保持环境静止。
 
-高度阈值是 canonical `map` frame 的 Z，不是雷达安装高度。G1 默认从
+高度阈值是 canonical `map` frame 的 Z，不是雷达安装高度。默认从
 `-0.30...+0.30 m` 开始；若把下界放到地面带（北京现场 `-1.0 m` 会纳入大量
 `-0.8...-0.4 m` 点），这些点会立即成为静态占用。直接累计不会因之后调回
 阈值而删除旧证据，因此修改高度带后必须开始一张新地图，不能继续使用已经
@@ -148,7 +148,7 @@ Nav2 的全局静态层使用 `/ubuntu/navigation/static_map`，实时动态层�
 `cloud_pack_publish`、`cloud_end_to_end`、`map_view_encode` 和
 `map_view_pose_publish` 分段耗时，`latency_max_ms` 保留本进程最大值；同时发布
 `map_view_cache_age_sec`、`map_view_point_refresh_hz=1` 和
-`map_view_pose_refresh_hz=1`。Canvas 帧最多携带 40,000 点，避免在 G1 上高频
+`map_view_pose_refresh_hz=1`。Canvas 帧最多携带 40,000 点，避免在机载计算平台上高频
 重复序列化近 1 MiB 帧并阻塞 odom/registered cloud；这些字段用于区分
 传感器/TF 等待、点云计算、DDS 发布和 Canvas 编码延迟，不改变 500 ms
 freshness 门禁。
@@ -319,10 +319,12 @@ wire format。JSON 必须逐帧携带 `header.stamp_ns`、
 LiDAR-to-camera 外参。该外参矩阵为 row-major 4x4 齐次变换，
 按 `target_from_source` 把 LiDAR 点变换到相机 optical frame。
 
-Driver 不需要另外发布 `T_base_camera`。ActuCore 使用与 G1 实时
-adapter 相同的 `base_link -> livox_frame` 外参，与 Driver 的
-`livox_frame -> camera` 标定组合出离线投影所需的
-`T_base_camera`。
+Driver 必须在 RGB PSE1 的 `calibration.base_to_camera` 中逐帧提供
+row-major 4x4 `target_from_source` 变换，把 camera optical frame 变换到
+`base_link`；RGB 与 Depth 应使用相同 `calibration_id`。设备型号相关的
+外参预设和校准属于 Driver，ActuCore 不再内置或推断任何本体安装参数。
+缺少该变换时，原始 RGB、Depth、LiDAR 和 JSON 仍会导出，但障碍物
+三维标注明确记为 `calibration_unavailable:base_to_camera`。
 畸变模型接受 `none`、`plumb_bob` / `brown_conrady`、
 `rational_polynomial` 和 Driver 实际发布的
 `realsense_inverse_brown_conrady`；逆 Brown 模型按 RealSense 语义迭代求
@@ -335,7 +337,7 @@ MCAP 只保存通过对齐门槛的 1 Hz 快照。在线状态不会改写或伪
 基于原始 source stamp 做有界的软件对齐诊断：检查每路时间戳覆盖率和单调性，
 并计算 RGB/Depth、LiDAR/IMU、RGB/LiDAR、RGB/Odom、
 Depth/LiDAR 的最近邻时间偏差。P95 门槛分别是 `150 / 20 / 60 / 120 /
-60 ms`，对应 G1 当前 10 Hz RGB、5 Hz Depth、10 Hz LiDAR、高频 IMU 和约
+60 ms`，对应当前已验收数据的 10 Hz RGB、5 Hz Depth、10 Hz LiDAR、高频 IMU 和约
 5 Hz Odom 的异步采样上限；它们是数据健康门槛，不是硬件同步声明。超限、
 时间戳缺失或倒序会令状态进入 `degraded`，但不会中断导航。这是 ROS
 system-time 时钟域的软件对齐证据，不等同于 PTP、外部触发或硬件帧同步。
@@ -410,7 +412,7 @@ Canvas `stop` 只有在算法和采集都确认停止后才返回
 `missing_sources` 或解码失败；不会回退到无标定的旧 RGB/Depth。
 
 停止 receipt 保存 `time_alignment`。MCAP 完成并原子收口后，ActuCore
-父进程的后台 worker 直接在 G1 本体生成可交付的 `derived/`，用户不需要安装
+父进程的后台 worker 直接在机器人本体生成可交付的 `derived/`，用户不需要安装
 MCAP/ROS 工具再手工解包：
 
 - `rgb/frame-XXXXXXXX.jpg`：原始 JPEG；
@@ -439,7 +441,7 @@ MCAP/ROS 工具再手工解包：
 16-bit PNG 产物中，当前尚不参与
 障碍物最近点真值计算。卡片或
 导航 runtime 活跃时 worker 自动暂停，卡片停止后继续，避免与定位/
-规划抢占 G1 CPU。ActuCore 重启后会重新发现已完成但尚无
+规划抢占机载 CPU。ActuCore 重启后会重新发现已完成但尚无
 `derived/manifest.json` 的 session 并继续生成。最终目录只在 manifest
 写入后由 `derived.partial` 原子改名。
 

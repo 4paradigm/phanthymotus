@@ -10,17 +10,17 @@ PACKAGE_ROOT = (
     / "plugins"
     / "navigation"
     / "runtime"
-    / "g1_fast_livo2"
+    / "fast_livo2"
 )
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from g1_fast_livo2.fault_diagnostics import (  # noqa: E402
+from fast_livo2.fault_diagnostics import (  # noqa: E402
     BRIDGE_STATUS_TOPIC,
     MAPPER_RUNTIME_TOPIC,
     SENSOR_REJECTION_TOPIC,
     build_fault_summary,
 )
-from g1_fast_livo2.pipeline_diagnostics import PipelineDiagnostics  # noqa: E402
+from fast_livo2.pipeline_diagnostics import PipelineDiagnostics  # noqa: E402
 
 
 def _bridge(cloud: int, imu: int, *, dropped: int = 0) -> dict:

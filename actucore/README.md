@@ -11,9 +11,8 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 **当前卡片：`navigation`**，公开工具名 `ControlledSemanticSpatial` —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket），对外只发布 bounded `velocity_proposal`，物理执行仍归 Driver。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/navigation/README.md](plugins/navigation/README.md)。
 
-该卡片的公开契约可复用于其他机器人；当前镜像内置的 runtime adapter 只验证并
-限制为 G1 的 `ubuntu` namespace，其他机器人需要提供自己的 topic/frame/执行器
-适配。
+该卡片的公开契约可复用于不同机器人；当前 runtime adapter 使用兼容性
+`ubuntu` namespace，各本体由 Driver 提供符合契约的 topic、frame、标定和执行器。
 
 | | |
 |---|---|

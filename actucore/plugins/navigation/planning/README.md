@@ -164,13 +164,13 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   `/ubuntu/navigation/obstacle_map` 仅作兼容诊断，不再以 `clearing=false`
   驱动全局代价图。confirmed static PCD 加载时还要求保存的高度带与当前配置
   完全一致，不一致则拒绝加载并要求恢复配置或重新建图。
-- 两张 costmap 保留 `inflation_radius=0.55 m`。G1 矩形 footprint 的外接半径
+- 两张 costmap 保留 `inflation_radius=0.55 m`。当前矩形 footprint 的外接半径
   约 `0.425 m`，该配置实际额外余量约 `0.125 m`，不是这次过度占用的首要根因。
   heartbeat/status 的 `global_costmap` 字段现在分别给出 inflated、inscribed、
   lethal 数量及比例，用于独立评估静态图与实时层是否过度占用，不通过
   缩小安全边界掩盖问题。
 - NavFn 仍生成全局路径，local/global costmap 仍以各自频率重规划和
-  更新障碍。本地 DWB/Rotation Shim 替换为 20 Hz G1 分段控制器：
+  更新障碍。本地 DWB/Rotation Shim 替换为 20 Hz 分段控制器：
   从最新全局路径上选当前 local costmap 内最远的直线可通点，执行
   `STOP_CHECK -> ROTATE -> DRIVE -> FINAL_ROTATE -> ARRIVED`。任一
   转向或直线 footprint 检查失败时进入 `BLOCKED` 并立即给零。同一
@@ -184,7 +184,7 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   `0.80 s / 1.00 s` 更严；超时只发布零速。一旦位姿证明已经越过当前线段
   终点，无论横向误差是否还在容差内都先立即给零，停稳后再判断到达或重新选段。
 - proposal bridge 直接消费 controller 的 raw 输出，不经过
-  `OPEN_LOOP velocity_smoother`。G1 的可执行死区已在 proposal 出口处理；
+  `OPEN_LOOP velocity_smoother`。执行器的可执行死区已在 proposal 出口处理；
   再叠加一个以“上次命令”作为反馈的平滑器会推迟首个可执行动作。
   构建时用校验过 hash 的最小上游补丁移除该节点，镜像也不编译对应包。
 - 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
@@ -218,7 +218,7 @@ shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互
 二次校验 `nav_id/attempt/status`；5 Hz 发布定时器在真正发布前再次校验任务
 上下文和 readiness。Nav2 action result、pause/resume 或新任务已使样本过期时，
 该样本不发布；因此终态零速不会被旧回调用更高 `sequence` 覆盖。当前自动证据覆盖纯函数和源码
-合同；终点不徘徊及真机时序仍需 G1 验收。
+合同；终点不徘徊及真机时序仍需目标本体验收。
 
 ## 统一卡片连线
 
@@ -249,7 +249,7 @@ Core 镜像因此需要包含 `ros-humble-nav-msgs`；单独重建 ActuCore/Nav2
 
 ## RViz 调试
 
-[nav2.rviz](../runtime/g1_nav2/rviz/nav2.rviz) 只读显示 FAST-LIVO2 registered
+[nav2.rviz](../runtime/nav2/rviz/nav2.rviz) 只读显示 FAST-LIVO2 registered
 cloud、odom、TF、global path、rolling costmap 和 footprint，不包含
 `SetGoal` 或 `InitialPose` 工具。
 
@@ -261,7 +261,7 @@ export FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 ros2 topic info /ubuntu/navigation/odom -v
 ros2 topic info /ubuntu/navigation/cloud_registered -v
-rviz2 -d actucore/plugins/navigation/runtime/g1_nav2/rviz/nav2.rviz
+rviz2 -d actucore/plugins/navigation/runtime/nav2/rviz/nav2.rviz
 ```
 
 ## 构建与部署

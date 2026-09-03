@@ -409,22 +409,22 @@ class NavigationContractTest(unittest.TestCase):
             / "plugins"
             / "navigation"
             / "runtime"
-            / "g1_fast_livo2"
-            / "g1_fast_livo2"
+            / "fast_livo2"
+            / "fast_livo2"
             / "adapter_node.py",
             ACTUCORE_ROOT
             / "plugins"
             / "navigation"
             / "runtime"
-            / "g1_fast_livo2"
-            / "g1_fast_livo2"
+            / "fast_livo2"
+            / "fast_livo2"
             / "runtime_supervisor.py",
             ACTUCORE_ROOT
             / "plugins"
             / "navigation"
             / "runtime"
-            / "g1_nav2"
-            / "g1_nav2"
+            / "nav2"
+            / "nav2"
             / "planner_command_node.py",
         ]
         for source in sources:
@@ -542,8 +542,8 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn("git fetch", dockerfile)
         self.assertNotIn("FAST_LIVO2_REPO", dockerfile)
         self.assertNotIn("NAVIGATION2_REPO", dockerfile)
-        self.assertIn("g1_fast_livo2 g1_segmented_controller g1_nav2", dockerfile)
-        self.assertIn("ros2 pkg prefix g1_nav2", dockerfile)
+        self.assertIn("fast_livo2 segmented_controller nav2", dockerfile)
+        self.assertIn("ros2 pkg prefix nav2", dockerfile)
         self.assertIn("plugin_lib_names", dockerfile)
         self.assertIn("ctypes.CDLL", dockerfile)
         self.assertIn("NAV2_BT_PLUGIN_LIBS=PASS", dockerfile)
@@ -1266,7 +1266,7 @@ class NavigationRuntimeTest(unittest.TestCase):
             },
         )
         self.assertEqual(started["state"], "running")
-        self.assertEqual([item[0][2] for item in commands], ["g1_fast_livo2", "g1_nav2"])
+        self.assertEqual([item[0][2] for item in commands], ["fast_livo2", "nav2"])
         self.assertTrue(all(item[1]["start_new_session"] for item in commands))
         self.assertFalse(started["docker_runtime_dependency"])
         self.assertNotIn("docker", str([item[0] for item in commands]))

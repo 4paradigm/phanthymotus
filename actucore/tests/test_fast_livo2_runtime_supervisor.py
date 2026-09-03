@@ -18,7 +18,7 @@ PACKAGE_ROOT = (
     / "plugins"
     / "navigation"
     / "runtime"
-    / "g1_fast_livo2"
+    / "fast_livo2"
 )
 sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(
@@ -101,7 +101,7 @@ def _import_ros_runtime_modules():
             setattr(target, name, value)
 
     try:
-        from g1_fast_livo2 import adapter_node, runtime_supervisor
+        from fast_livo2 import adapter_node, runtime_supervisor
     finally:
         for name in reversed(inserted):
             sys.modules.pop(name, None)
@@ -454,7 +454,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
     def test_collection_subscriptions_drop_backlog_instead_of_replaying_it(self) -> None:
         source = (
             PACKAGE_ROOT
-            / "g1_fast_livo2"
+            / "fast_livo2"
             / "runtime_supervisor.py"
         ).read_text(encoding="utf-8")
         method = source.split(

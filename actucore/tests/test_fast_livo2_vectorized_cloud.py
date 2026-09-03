@@ -15,11 +15,11 @@ PACKAGE_ROOT = (
     / "plugins"
     / "navigation"
     / "runtime"
-    / "g1_fast_livo2"
+    / "fast_livo2"
 )
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
+from fast_livo2.frame_adapter_core import (  # noqa: E402
     InvalidFastLivo2Frame,
     Pose3,
     Quaternion,
@@ -27,7 +27,7 @@ from g1_fast_livo2.frame_adapter_core import (  # noqa: E402
     quaternion_from_rpy,
     transform_points,
 )
-from g1_fast_livo2.vectorized_cloud import (  # noqa: E402
+from fast_livo2.vectorized_cloud import (  # noqa: E402
     absolute_point_time_span_ms,
     decode_xyz_array,
     map_view_with_pose,

@@ -35,7 +35,7 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
   本身仍可查询和幂等重放。
 - Nav2 仍只发布 `phanthy.navigation.velocity_proposal.v1`，Driver 继续负责
   物理执行、TTL、急停、二次限幅和停车确认。
-- Nav2 保留 NavFn、rolling costmap 和重规划，局部执行改为 G1 分段
+- Nav2 保留 NavFn、rolling costmap 和重规划，局部执行改为分段
   `停稳 -> 原地转向 -> 直行 -> 停稳复查`。控制和位姿检查为
   20 Hz，非零 proposal 仍为 5 Hz，零速立即发布。
 - 分段执行的转向和直行预检只在 footprint 命中 Nav2
@@ -275,9 +275,9 @@ planning bridge 并重试发现，不重启 FAST-LIVO2 或 Nav2 子进程；第�
 导航基础镜像按 JetPack 版本选择精确的
 `jetson-base:jp<JP_VERSION>-torch@sha256:<digest>`（Ubuntu 20.04 / Python
 3.8，ROS Humble 是 `/opt/ros/humble/install` 下的源码 install-space）。基础镜像
-按完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并按非重叠顺序应用三份 G1 补丁，再编译
+按完整 SHA 拉取 Sophus、Vikit 和 FAST-LIVO2，校验并按非重叠顺序应用三份运行时补丁，再编译
 FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过 `@sha256` 固定该基础镜像，只重编
-仓库自有的 `g1_fast_livo2`、`g1_nav2`、`g1_segmented_controller`。G1 输入使用
+仓库自有的 `fast_livo2`、`nav2`、`segmented_controller`。默认输入使用
 标准 PointCloud2；基础镜像只内置 FAST-LIVO2 编译所需的两条 Livox 消息定义，
 不再编译未运行的 Livox SDK2/Driver。
 
@@ -289,7 +289,7 @@ FAST-LIVO2 与 Nav2。日常 ActuCore 镜像通过 `@sha256` 固定该基础镜�
 不随打包形态变化。`mcap_vendor` 间接使用的 MCAP/LZ4 也按其上游
 锁定 SHA 预先浅克隆，不在 CMake 构建中重复全量下载。运行时加载 planner/controller/
 behavior/bt_navigator/waypoint_follower + navfn、costmap 三层，
-以及卡片自带的 `g1_segmented_controller`；`nav2_bringup` 编译所需的轻量
+以及卡片自带的 `segmented_controller`；`nav2_bringup` 编译所需的轻量
 `navigation2` 元数据包也保留。amcl、map_server、DWB、rotation shim、
 smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们已被当前
 链路取代，或会把 ompl、ceres、xtensor、Qt5 等无用依赖拖进镜像。
@@ -379,5 +379,5 @@ sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 \
 [runtime/NAV2_THIRD_PARTY.md](runtime/NAV2_THIRD_PARTY.md)。
 
 本地自动测试只能证明合同、生命周期、进程托管、失败回滚和无额外 service。
-当前交付状态为 **待 G1 实机测试**：真实传感器、地图质量、重定位、路径和
-物理运动仍需 owner 按上述 G1 脚本另行验收。
+自动测试之外，已有 G1 真机调试证据；其他本体的真实传感器、地图质量、
+重定位、路径和物理运动仍需对应 owner 独立验收。

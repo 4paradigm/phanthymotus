@@ -17,17 +17,17 @@ RUNTIME_PACKAGE = (
     / "plugins"
     / "navigation"
     / "runtime"
-    / "g1_fast_livo2"
+    / "fast_livo2"
 )
 sys.path.insert(0, str(ACTUCORE_ROOT))
 sys.path.insert(0, str(RUNTIME_PACKAGE))
 
-from g1_fast_livo2.camera_depth_frame import (  # noqa: E402
+from fast_livo2.camera_depth_frame import (  # noqa: E402
     InvalidCameraDepthFrame,
     decode as decode_depth,
     encode as encode_depth,
 )
-from g1_fast_livo2.camera_rgb_frame import (  # noqa: E402
+from fast_livo2.camera_rgb_frame import (  # noqa: E402
     InvalidCameraRgbFrame,
     decode,
     encode,
@@ -99,6 +99,15 @@ def driver_metadata(stamp: int = 1_700_000_000_000_000_000) -> dict:
                 "transform": {
                     "source_frame": "livox_frame",
                     "target_frame": "camera_color_optical_frame",
+                    "convention": "target_from_source",
+                    "matrix_row_major": identity,
+                },
+            },
+            "base_to_camera": {
+                "status": "factory_nominal",
+                "transform": {
+                    "source_frame": "camera_color_optical_frame",
+                    "target_frame": "base_link",
                     "convention": "target_from_source",
                     "matrix_row_major": identity,
                 },
@@ -194,7 +203,7 @@ class FakeReader:
 
 
 class NavigationCollectionPostprocessTest(unittest.TestCase):
-    def test_camera_rgb_frame_round_trip_and_rejects_missing_calibration(self) -> None:
+    def test_camera_rgb_frame_uses_driver_base_calibration(self) -> None:
         jpeg = b"\xff\xd8\xff\xd9"
         payload = encode(driver_metadata(), jpeg)
         self.assertEqual(payload[:4], b"PSE1")
@@ -202,10 +211,38 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
         self.assertEqual(decoded_metadata["calibration_id"], "sha256:test")
         self.assertEqual(
             decoded_metadata["base_transform_source"],
-            "actucore_g1_base_to_lidar+driver_lidar_to_camera",
+            "driver_calibration",
         )
         self.assertEqual(len(decoded_metadata["t_base_camera"]), 16)
         self.assertEqual(decoded_jpeg, jpeg)
+
+        missing_base = driver_metadata()
+        missing_base["calibration"].pop("base_to_camera")
+        decoded_missing, _ = decode(encode(missing_base, jpeg))
+        self.assertIsNone(decoded_missing["t_base_camera"])
+        self.assertEqual(decoded_missing["base_transform_source"], "unavailable")
+        self.assertEqual(
+            decoded_missing["base_transform_error"],
+            "calibration_unavailable:base_to_camera",
+        )
+        annotation = annotate_frame(
+            {
+                "image_id": "frame-00000001",
+                "image_path": "rgb/frame-00000001.jpg",
+                "stamp_ns": decoded_missing["source_stamp_ns"],
+                "metadata": decoded_missing,
+            },
+            None,
+            None,
+            None,
+            SessionTracker(),
+            0,
+        )
+        self.assertEqual(annotation["status"], "invalid")
+        self.assertEqual(
+            annotation["failure_reason"],
+            "calibration_unavailable:base_to_camera",
+        )
 
         invalid = driver_metadata()
         invalid["calibration"].pop("lidar_to_camera")

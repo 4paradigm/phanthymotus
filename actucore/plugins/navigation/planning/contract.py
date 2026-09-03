@@ -40,7 +40,7 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "type": "string",
             "const": "ubuntu",
             "default": "ubuntu",
-            "description": "First-release G1 Driver namespace",
+            "description": "Driver namespace for the compatibility topic contract",
         },
         "backend": {
             "type": "string",
@@ -125,7 +125,7 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "type": "number",
             "const": 5.0,
             "default": 5.0,
-            "description": "Latest-only G1 velocity proposal cadence",
+            "description": "Latest-only velocity proposal cadence",
         },
     },
     "additionalProperties": False,

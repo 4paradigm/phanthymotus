@@ -12,31 +12,31 @@ PACKAGE_ROOT = (
     / "plugins"
     / "navigation"
     / "runtime"
-    / "g1_nav2"
+    / "nav2"
 )
-SEGMENTED_CONTROLLER_ROOT = PACKAGE_ROOT.parent / "g1_segmented_controller"
+SEGMENTED_CONTROLLER_ROOT = PACKAGE_ROOT.parent / "segmented_controller"
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from g1_nav2.costmap_validation import (  # noqa: E402
+from nav2.costmap_validation import (  # noqa: E402
     CostmapError,
     CostmapSnapshot,
     GoalCellRejected,
     goal_cell_receipt,
     validated_goal_cell_receipt,
 )
-from g1_nav2.execution_protocol import (  # noqa: E402
+from nav2.execution_protocol import (  # noqa: E402
     MotionLimits,
     ProtocolError,
     Velocity,
     VelocityProposal,
-    apply_g1_motion_floor,
-    apply_g1_motion_limits,
+    apply_motion_floor,
+    apply_motion_limits,
     build_velocity_proposal,
     limit_forward_velocity,
     proposal_context_is_current,
     proposal_context_is_publishable,
 )
-from g1_nav2.readiness import (  # noqa: E402
+from nav2.readiness import (  # noqa: E402
     control_odom_motion_blocker,
     evaluate_readiness,
     navigation_motion_blocker,
@@ -80,30 +80,30 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertEqual(reverse, Velocity.zero())
 
-    def test_g1_motion_policy_is_axis_exclusive_without_amplification(self) -> None:
-        self.assertEqual(apply_g1_motion_floor(Velocity.zero()), Velocity.zero())
+    def test_motion_policy_is_axis_exclusive_without_amplification(self) -> None:
+        self.assertEqual(apply_motion_floor(Velocity.zero()), Velocity.zero())
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=0.0)),
+            apply_motion_floor(Velocity(x=0.01, y=0.0, yaw=0.0)),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=0.0, y=0.0, yaw=-0.02)),
+            apply_motion_floor(Velocity(x=0.0, y=0.0, yaw=-0.02)),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.19)),
+            apply_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.19)),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=-0.05, y=0.0, yaw=0.20)),
+            apply_motion_floor(Velocity(x=-0.05, y=0.0, yaw=0.20)),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=0.35, y=0.0, yaw=0.0)),
+            apply_motion_floor(Velocity(x=0.35, y=0.0, yaw=0.0)),
             Velocity(x=0.35, y=0.0, yaw=0.0),
         )
         self.assertEqual(
-            apply_g1_motion_floor(Velocity(x=0.50, y=0.0, yaw=-2.0)),
+            apply_motion_floor(Velocity(x=0.50, y=0.0, yaw=-2.0)),
             Velocity(x=0.0, y=0.0, yaw=-2.0),
         )
 
@@ -153,7 +153,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
 
     def test_terminal_zero_precedes_status_and_stop_ack(self) -> None:
         source = (
-            PACKAGE_ROOT / "g1_nav2" / "planner_command_node.py"
+            PACKAGE_ROOT / "nav2" / "planner_command_node.py"
         ).read_text(encoding="utf-8")
         on_result = source.split("    def _on_result", 1)[1].split(
             "    def _pause", 1
@@ -181,19 +181,19 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             max_yaw_rps=1.60,
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(x=0.05), limits=limits, max_forward_mps=0.50
             ),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(x=0.90), limits=limits, max_forward_mps=0.50
             ),
             Velocity(x=0.50),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(x=0.05),
                 limits=MotionLimits(min_x_mps=0.80, max_x_mps=1.0),
                 max_forward_mps=0.50,
@@ -201,25 +201,25 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(x=-0.90), limits=limits, max_forward_mps=0.50
             ),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(y=-0.02), limits=limits, max_forward_mps=0.50
             ),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(y=0.8), limits=limits, max_forward_mps=0.50
             ),
             Velocity(y=0.30),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(y=0.20, yaw=-0.30),
                 limits=limits,
                 max_forward_mps=0.50,
@@ -227,7 +227,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             Velocity(y=0.20, yaw=0.0),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(y=0.20, yaw=-1.30),
                 limits=limits,
                 max_forward_mps=0.50,
@@ -235,7 +235,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             Velocity(y=0.0, yaw=-1.30),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(y=0.20),
                 limits=MotionLimits(max_y_mps=0.0),
                 max_forward_mps=0.50,
@@ -243,7 +243,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_g1_motion_limits(
+            apply_motion_limits(
                 Velocity(yaw=-2.0),
                 limits=MotionLimits(min_yaw_rps=0.3, max_yaw_rps=0.3),
                 max_forward_mps=0.50,
@@ -553,7 +553,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
 
     def test_runtime_is_planner_controller_only(self) -> None:
         setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
-        launch = (PACKAGE_ROOT / "launch" / "g1_nav2.launch.py").read_text(
+        launch = (PACKAGE_ROOT / "launch" / "nav2.launch.py").read_text(
             encoding="utf-8"
         )
         package = (PACKAGE_ROOT / "package.xml").read_text(encoding="utf-8")
@@ -567,11 +567,11 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             encoding="utf-8"
         )
         segmented_plugin = (
-            SEGMENTED_CONTROLLER_ROOT / "g1_segmented_controller.xml"
+            SEGMENTED_CONTROLLER_ROOT / "segmented_controller.xml"
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            "planner_command_bridge = g1_nav2.planner_command_node:main", setup
+            "planner_command_bridge = nav2.planner_command_node:main", setup
         )
         for removed in (
             "runtime_supervisor",
@@ -594,16 +594,16 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertNotIn("NAV2_MODE", service)
         self.assertNotIn("container_name: embodied-perception-nav2", service)
         self.assertIn("pluginlib_export_plugin_description_file", segmented_cmake)
-        self.assertIn("g1_segmented_controller::SegmentedController", segmented_plugin)
+        self.assertIn("segmented_controller::SegmentedController", segmented_plugin)
         self.assertIn(
-            "COPY actucore/plugins/navigation/runtime/g1_segmented_controller/",
+            "COPY actucore/plugins/navigation/runtime/segmented_controller/",
             dockerfile,
         )
         self.assertIn(
-            "--packages-select g1_fast_livo2 g1_segmented_controller g1_nav2",
+            "--packages-select fast_livo2 segmented_controller nav2",
             dockerfile,
         )
-        self.assertIn("ros2 pkg prefix g1_segmented_controller", dockerfile)
+        self.assertIn("ros2 pkg prefix segmented_controller", dockerfile)
 
     def test_costmaps_combine_confirmed_static_map_and_live_clearing(self) -> None:
         params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
@@ -657,7 +657,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             "\n\nlocal_costmap:", 1
         )[0]
         for expected in (
-            "plugin: g1_segmented_controller::SegmentedController",
+            "plugin: segmented_controller::SegmentedController",
             "rotate_exit_rad: 0.15",
             "rotate_reengage_rad: 0.35",
             "approach_speed_mps: 0.30",
@@ -695,9 +695,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
 
     def test_speed_limit_and_behavior_tree_reach_planner_bridge(self) -> None:
         command = (
-            PACKAGE_ROOT / "g1_nav2" / "planner_command_node.py"
+            PACKAGE_ROOT / "nav2" / "planner_command_node.py"
         ).read_text(encoding="utf-8")
-        launch = (PACKAGE_ROOT / "launch" / "g1_nav2.launch.py").read_text(
+        launch = (PACKAGE_ROOT / "launch" / "nav2.launch.py").read_text(
             encoding="utf-8"
         )
         params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
@@ -722,13 +722,13 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertIn(
             "default_nav_to_pose_bt_xml: "
-            "/ros_ws/install/g1_nav2/share/g1_nav2/behavior_trees/"
+            "/ros_ws/install/nav2/share/nav2/behavior_trees/"
             "navigate_to_pose_w_replanning_and_recovery.xml",
             params,
         )
         self.assertIn(
             "default_nav_through_poses_bt_xml: "
-            "/ros_ws/install/g1_nav2/share/g1_nav2/behavior_trees/"
+            "/ros_ws/install/nav2/share/nav2/behavior_trees/"
             "navigate_through_poses_w_replanning_and_recovery.xml",
             params,
         )
@@ -736,7 +736,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
         self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
         self.assertIn("MotionLimits.from_payload", command)
-        self.assertIn("apply_g1_motion_limits", command)
+        self.assertIn("apply_motion_limits", command)
         self.assertIn("control_odom_motion_blocker", command)
         self.assertIn("self._on_segment_status", command)
         self.assertIn('payload["execution"] = self._execution_status', command)

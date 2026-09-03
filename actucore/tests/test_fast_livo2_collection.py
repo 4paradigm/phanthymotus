@@ -12,11 +12,11 @@ RUNTIME_PACKAGE = (
     / "plugins"
     / "navigation"
     / "runtime"
-    / "g1_fast_livo2"
+    / "fast_livo2"
 )
 sys.path.insert(0, str(RUNTIME_PACKAGE))
 
-from g1_fast_livo2.collection_core import (  # noqa: E402
+from fast_livo2.collection_core import (  # noqa: E402
     COLLECTION_EVENT_TOPICS,
     COLLECTION_SOURCES,
     CollectionHealth,
@@ -78,7 +78,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
             (root / "escape").symlink_to(outside, target_is_directory=True)
 
             with patch(
-                "g1_fast_livo2.collection_core.COLLECTION_ROOT", root
+                "fast_livo2.collection_core.COLLECTION_ROOT", root
             ), self.assertRaisesRegex(ValueError, "must be within"):
                 normalize_collection_directory(str(root / "escape" / "session"))
 
@@ -175,7 +175,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
                         "frame_id": "camera_color_optical_frame",
                         "width": 640,
                         "height": 480,
-                        "calibration_id": "g1-camera-a",
+                        "calibration_id": "camera-a",
                     }
                     if port == "rgb_frame"
                     else {"frame_id": port}
@@ -197,7 +197,7 @@ class FastLivo2CollectionTest(unittest.TestCase):
         )
         self.assertEqual(
             status["sources"]["rgb_frame"]["metadata"]["calibration_id"],
-            "g1-camera-a",
+            "camera-a",
         )
 
     def test_time_alignment_degrades_on_skew_or_non_monotonic_stamp(self) -> None:

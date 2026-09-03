@@ -8,22 +8,22 @@ ARG ACTUCORE_NAVIGATION_BASE_IMAGE
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG BUILD_JOBS=4
 
-COPY actucore/plugins/navigation/runtime/g1_fast_livo2/ /ros_ws/src/g1_fast_livo2/
-COPY actucore/plugins/navigation/runtime/g1_nav2/ /ros_ws/src/g1_nav2/
-COPY actucore/plugins/navigation/runtime/g1_segmented_controller/ /ros_ws/src/g1_segmented_controller/
+COPY actucore/plugins/navigation/runtime/fast_livo2/ /ros_ws/src/fast_livo2/
+COPY actucore/plugins/navigation/runtime/nav2/ /ros_ws/src/nav2/
+COPY actucore/plugins/navigation/runtime/segmented_controller/ /ros_ws/src/segmented_controller/
 RUN source /opt/ros/humble/install/setup.bash && \
     source /opt/ros_deps_ws/install/setup.bash && \
     source /opt/nav2_ws/install/setup.bash && \
     source /opt/fast_livo_ws/install/setup.bash && \
     cd /ros_ws && \
     MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
-      --packages-select g1_fast_livo2 g1_segmented_controller g1_nav2 \
+      --packages-select fast_livo2 segmented_controller nav2 \
       --symlink-install && \
     source /ros_ws/install/setup.bash && \
-    ros2 pkg prefix g1_segmented_controller >/dev/null && \
-    NAV2_PARAMS="$(ros2 pkg prefix g1_nav2)/share/g1_nav2/config/nav2_params.yaml" \
+    ros2 pkg prefix segmented_controller >/dev/null && \
+    NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
       python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
-    python3 -c "import numpy, rosbag2_py, yaml, em; import cv2; from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; from g1_fast_livo2.camera_depth_frame import decode as decode_depth, MAGIC as DEPTH_MAGIC; assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'" && \
+    python3 -c "import numpy, rosbag2_py, yaml, em; import cv2; from fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; from fast_livo2.camera_depth_frame import decode as decode_depth, MAGIC as DEPTH_MAGIC; assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'" && \
     ros2 bag record --help | grep -F -- '--no-discovery' >/dev/null
 
 COPY actucore/plugins/navigation/runtime/navigation_lio.yaml /config/navigation_lio.yaml
@@ -53,7 +53,7 @@ RUN find /ros_ws/install /opt/nav2_ws/install /opt/ros_deps_ws/install \
     cd / && python3 -c "import logsafe"
 
 ENV LD_LIBRARY_PATH="/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/install/livox_ros_driver2/lib:/opt/fast_livo_ws/install/vikit_common/lib:/opt/fast_livo_ws/install/vikit_ros/lib:/opt/nav2_ws/install/lib:/opt/ros_deps_ws/install/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
-ENV AMENT_PREFIX_PATH="/ros_ws/install/g1_fast_livo2:/ros_ws/install/g1_segmented_controller:/ros_ws/install/g1_nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
+ENV AMENT_PREFIX_PATH="/ros_ws/install/fast_livo2:/ros_ws/install/segmented_controller:/ros_ws/install/nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42
 ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT

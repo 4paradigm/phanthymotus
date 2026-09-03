@@ -114,7 +114,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         adapter = (
-            runtime / "g1_fast_livo2" / "g1_fast_livo2" / "adapter_node.py"
+            runtime / "fast_livo2" / "fast_livo2" / "adapter_node.py"
         ).read_text(encoding="utf-8")
         service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text(
             encoding="utf-8"
@@ -185,11 +185,11 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("import numpy, rosbag2_py", dockerfile)
         self.assertIn("ros2 bag record --help | grep -F -- '--no-discovery'", dockerfile)
         self.assertIn(
-            "from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb",
+            "from fast_livo2.camera_rgb_frame import decode as decode_rgb",
             dockerfile,
         )
         self.assertIn(
-            "from g1_fast_livo2.camera_depth_frame import decode as decode_depth",
+            "from fast_livo2.camera_depth_frame import decode as decode_depth",
             dockerfile,
         )
         self.assertIn("assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'", dockerfile)
@@ -273,8 +273,8 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("/tmp/livox-sdk2", base_dockerfile)
         self.assertIn("--packages-select fast_livo", base_dockerfile)
         self.assertIn("PCD finalization completed", base_dockerfile)
-        self.assertIn("g1_fast_livo2", dockerfile)
-        self.assertIn("g1_nav2", dockerfile)
+        self.assertIn("fast_livo2", dockerfile)
+        self.assertIn("nav2", dockerfile)
         self.assertNotIn("FAST_LIVO2_REPO", dockerfile)
         self.assertNotIn("NAVIGATION2_REPO", dockerfile)
         self.assertNotIn("container_name: embodied-perception-fast-livo2", service)
@@ -318,8 +318,8 @@ class FastLivo2ContractTest(unittest.TestCase):
             / "plugins"
             / "navigation"
             / "runtime"
-            / "g1_fast_livo2"
-            / "g1_fast_livo2"
+            / "fast_livo2"
+            / "fast_livo2"
         )
         supervisor = (runtime_package / "runtime_supervisor.py").read_text(
             encoding="utf-8"

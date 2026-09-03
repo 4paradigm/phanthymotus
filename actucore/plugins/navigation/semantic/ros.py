@@ -177,7 +177,7 @@ class RosBridge:
         status_stale_after_sec: float = 3.5,
         synchronization_mode: str = "receive_time",
     ):
-        from g1_fast_livo2.camera_rgb_frame import decode as decode_camera_rgb_frame
+        from fast_livo2.camera_rgb_frame import decode as decode_camera_rgb_frame
         from nav_msgs.msg import Odometry
         from rclpy.node import Node
         from rclpy.qos import (

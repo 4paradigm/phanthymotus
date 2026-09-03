@@ -518,6 +518,13 @@ def annotate_frame(
         base["camera_parameters"] = _camera_parameters(image["metadata"])
     except (KeyError, TypeError, ValueError, PostprocessError) as exc:
         return {**base, "status": "invalid", "failure_reason": str(exc)}
+    if image["metadata"].get("t_base_camera") is None:
+        return {
+            **base,
+            "status": "invalid",
+            "failure_reason": image["metadata"].get("base_transform_error")
+            or "calibration_unavailable:base_to_camera",
+        }
     missing = [
         name
         for name, value in (
@@ -1023,9 +1030,9 @@ class RosbagRecordReader:
 
     def iter_records(self) -> Iterable[dict]:
         try:
-            from g1_fast_livo2.camera_depth_frame import decode as decode_depth_frame
-            from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb_frame
-            from g1_fast_livo2.vectorized_cloud import decode_xyz_array
+            from fast_livo2.camera_depth_frame import decode as decode_depth_frame
+            from fast_livo2.camera_rgb_frame import decode as decode_rgb_frame
+            from fast_livo2.vectorized_cloud import decode_xyz_array
             from nav_msgs.msg import Odometry
             from rclpy.serialization import deserialize_message
             from sensor_msgs.msg import Imu, PointCloud2
@@ -1613,9 +1620,9 @@ class RosCollectionController:
     """Publish a human-readable Canvas preview and retain machine diagnostics."""
 
     def __init__(self, root_directory: str, namespace: str, executor):
-        from g1_fast_livo2.camera_depth_frame import decode as decode_depth_frame
-        from g1_fast_livo2.camera_rgb_frame import decode as decode_rgb_frame
-        from g1_fast_livo2.vectorized_cloud import decode_xyz_array
+        from fast_livo2.camera_depth_frame import decode as decode_depth_frame
+        from fast_livo2.camera_rgb_frame import decode as decode_rgb_frame
+        from fast_livo2.vectorized_cloud import decode_xyz_array
         from nav_msgs.msg import Odometry
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy

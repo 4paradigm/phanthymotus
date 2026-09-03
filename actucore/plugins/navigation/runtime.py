@@ -68,13 +68,13 @@ class NavigationRuntime:
                 (
                     "ros2",
                     "launch",
-                    "g1_fast_livo2",
-                    "g1_fast_livo2.launch.py",
+                    "fast_livo2",
+                    "fast_livo2.launch.py",
                 ),
             ),
             _Child(
                 "nav2",
-                ("ros2", "launch", "g1_nav2", "g1_nav2.launch.py"),
+                ("ros2", "launch", "nav2", "nav2.launch.py"),
             ),
         ]
 

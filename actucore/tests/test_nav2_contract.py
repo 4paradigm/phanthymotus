@@ -99,13 +99,13 @@ class Nav2ContractTest(unittest.TestCase):
             / "plugins"
             / "navigation"
             / "runtime"
-            / "g1_nav2"
+            / "nav2"
         )
-        launch = (companion_root / "launch" / "g1_nav2.launch.py").read_text(
+        launch = (companion_root / "launch" / "nav2.launch.py").read_text(
             encoding="utf-8"
         )
         planner_bridge = (
-            companion_root / "g1_nav2" / "planner_command_node.py"
+            companion_root / "nav2" / "planner_command_node.py"
         ).read_text(encoding="utf-8")
         package_xml = (companion_root / "package.xml").read_text(
             encoding="utf-8"
