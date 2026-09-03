@@ -164,8 +164,12 @@ class PeerRegistry:
                 self._provider_errors.pop(provider.name, None)
                 print(f'[peer] discovery provider "{provider.name}" started')
             except Exception as e:
-                self._provider_errors[provider.name] = str(e)
-                print(f'[peer] discovery provider "{provider.name}" unavailable: {e}')
+                # Always include the exception type: several failures here
+                # (zeroconf's EventLoopBlocked among them) carry an empty
+                # str(), which logged as 'unavailable: ' and said nothing.
+                detail = f'{type(e).__name__}: {e}' if str(e) else type(e).__name__
+                self._provider_errors[provider.name] = detail
+                print(f'[peer] discovery provider "{provider.name}" unavailable: {detail}')
 
     async def stop(self) -> None:
         for provider in self._providers:

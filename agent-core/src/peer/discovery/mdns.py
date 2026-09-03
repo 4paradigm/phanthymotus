@@ -85,14 +85,21 @@ class MdnsProvider(DiscoveryProvider):
     def __init__(self, on_advert, port: int = 15678):
         super().__init__(on_advert)
         self._port = port
-        self._zc = None
+        self._aiozc = None
         self._browser = None
         self._info = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._resolving: set = set()
 
     async def start(self) -> None:
+        # The *async* API is mandatory here, not a preference. The synchronous
+        # Zeroconf class dispatches its work onto an internal event loop and
+        # blocks waiting for it; called from inside a running loop — which is
+        # where this provider lives — it raises EventLoopBlocked and the
+        # provider never comes up.
         try:
-            from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf
+            from zeroconf import ServiceInfo
+            from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
         except ImportError as e:
             raise RuntimeError(
                 'mDNS discovery unavailable (missing zeroconf). '
@@ -100,31 +107,27 @@ class MdnsProvider(DiscoveryProvider):
             ) from e
 
         self._loop = asyncio.get_running_loop()
-        self._zc = Zeroconf()
-        self._register_self(ServiceInfo)
-        # zeroconf calls back on its own thread; _emit hops to the loop.
-        self._browser = ServiceBrowser(self._zc, SERVICE_TYPE, handlers=[self._on_change])
+        self._aiozc = AsyncZeroconf()
+        await self._register_self(ServiceInfo)
+        self._browser = AsyncServiceBrowser(
+            self._aiozc.zeroconf, SERVICE_TYPE, handlers=[self._on_change]
+        )
         self._running = True
 
     async def stop(self) -> None:
         self._running = False
-        if self._zc is not None:
-            zc, info = self._zc, self._info
-            self._zc, self._browser, self._info = None, None, None
-
-            def _close():
-                try:
-                    if info is not None:
-                        zc.unregister_service(info)
-                finally:
-                    zc.close()
-
-            # Both calls block on network I/O; keep them off the event loop.
-            await asyncio.to_thread(_close)
+        aiozc, browser, info = self._aiozc, self._browser, self._info
+        self._aiozc, self._browser, self._info = None, None, None
+        if browser is not None:
+            await browser.async_cancel()
+        if aiozc is not None:
+            if info is not None:
+                await aiozc.async_unregister_service(info)
+            await aiozc.async_close()
 
     # ── advertising ──────────────────────────────────────────────────────────
 
-    def _register_self(self, ServiceInfo) -> None:
+    async def _register_self(self, ServiceInfo) -> None:
         ident = identity.ensure_identity()
         settings = config.main.get('peer_settings', {})
         name = settings.get('display_name') or socket.gethostname()
@@ -145,7 +148,12 @@ class MdnsProvider(DiscoveryProvider):
             properties=props,
             server=f'motus-{ident["peer_id"][:12]}.local.',
         )
-        self._zc.register_service(info)
+        # allow_name_change: the instance name is cosmetic — identity comes from
+        # the TXT 'pid' record, which advert_from_txt verifies against the
+        # public key. Without this, a stale registration left by a restart (or a
+        # second Agent Core on the same host) raises NonUniqueNameException and
+        # kills discovery until the old record ages out.
+        await self._aiozc.async_register_service(info, allow_name_change=True)
         self._info = info
 
     @staticmethod
@@ -184,25 +192,41 @@ class MdnsProvider(DiscoveryProvider):
     # ── browsing ─────────────────────────────────────────────────────────────
 
     def _on_change(self, zeroconf, service_type, name, state_change):
+        """Browser callback. Runs *on the event loop* with AsyncServiceBrowser.
+
+        Resolving a service is a network round-trip, so it must not happen
+        here — the synchronous get_service_info() would stall the loop that
+        zeroconf itself needs to receive the reply, and deadlock until timeout.
+        Hand it to a task instead.
+        """
         from zeroconf import ServiceStateChange
         if state_change is ServiceStateChange.Removed:
             return
-        info = zeroconf.get_service_info(service_type, name, timeout=1500)
-        if info is None:
-            return
-        addresses = []
-        for packed in info.addresses or []:
-            try:
-                addresses.append(socket.inet_ntoa(packed))
-            except OSError:
-                continue
-        advert = advert_from_txt(info.properties, addresses, info.port or self._port)
-        if advert is None or advert.peer_id == identity.peer_id():
-            return  # ignore malformed records and our own advert
-        self._emit(advert)
+        if name in self._resolving:
+            return  # a resolve for this service is already in flight
+        self._resolving.add(name)
+        asyncio.ensure_future(self._resolve(service_type, name))
 
-    def _emit(self, advert: PeerAdvert) -> None:
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            return
-        loop.call_soon_threadsafe(self._on_advert, advert)
+    async def _resolve(self, service_type: str, name: str) -> None:
+        from zeroconf.asyncio import AsyncServiceInfo
+        try:
+            aiozc = self._aiozc
+            if aiozc is None:
+                return
+            info = AsyncServiceInfo(service_type, name)
+            if not await info.async_request(aiozc.zeroconf, 3000):
+                return
+            addresses = []
+            for packed in info.addresses or []:
+                try:
+                    addresses.append(socket.inet_ntoa(packed))
+                except OSError:
+                    continue
+            advert = advert_from_txt(info.properties, addresses, info.port or self._port)
+            if advert is None or advert.peer_id == identity.peer_id():
+                return  # ignore malformed records and our own advert
+            self._on_advert(advert)
+        except Exception as e:
+            print(f'[peer] mdns resolve failed for {name}: {type(e).__name__}: {e}')
+        finally:
+            self._resolving.discard(name)
