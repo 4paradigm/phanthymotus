@@ -65,6 +65,21 @@ def _fake_rclpy(ok: bool):
     return m
 
 
+class _FakeExecutor:
+    """Stands in for SingleThreadedExecutor; records lifecycle for assertions."""
+
+    def __init__(self):
+        self.nodes = []
+        self.removed = []
+        self.shutdown_called = False
+        self.on_spin = lambda: None
+
+    def add_node(self, n): self.nodes.append(n)
+    def remove_node(self, n): self.removed.append(n)
+    def shutdown(self): self.shutdown_called = True
+    def spin_once(self, timeout_sec=None): self.on_spin()
+
+
 class TestDdsState(unittest.TestCase):
     def setUp(self):
         dds_state._running = False
@@ -74,13 +89,19 @@ class TestDdsState(unittest.TestCase):
         dds_state._subscribers.clear()
         dds_state._peer_topics.clear()
 
-    def _run_once(self, fake):
-        """Run _run_loop for a single iteration with a fake rclpy."""
+    def _run_once(self, fake, on_spin=None, auto_stop=True):
+        """Run _run_loop for a single iteration with a fake rclpy + executor.
+
+        Returns the fake executor so lifecycle can be asserted.
+        """
         node_mod = types.SimpleNamespace(Node=_FakeNode)
         msg_mod = types.SimpleNamespace(String=lambda: types.SimpleNamespace(data=''))
+        ex = _FakeExecutor()
+        exec_mod = types.SimpleNamespace(SingleThreadedExecutor=lambda: ex)
         modules = {
             'rclpy': fake,
             'rclpy.node': node_mod,
+            'rclpy.executors': exec_mod,
             'std_msgs': types.SimpleNamespace(msg=msg_mod),
             'std_msgs.msg': msg_mod,
         }
@@ -88,12 +109,16 @@ class TestDdsState(unittest.TestCase):
             dds_state._running = True
 
             # Stop after the first spin so the loop terminates.
-            def _spin(node, timeout_sec=None):
-                dds_state._running = False
+            def _spin():
+                if on_spin:
+                    on_spin()
+                if auto_stop:
+                    dds_state._running = False
 
-            fake.spin_once = _spin
+            ex.on_spin = _spin
             with mock.patch.object(dds_state, '_subscribe_to_peers', lambda: None):
                 dds_state._run_loop()
+        return ex
 
     def test_reuses_existing_context(self):
         """ros2_bridge 已初始化时，绝不能再调用 rclpy.init()。"""
@@ -120,6 +145,83 @@ class TestDdsState(unittest.TestCase):
         fake = _fake_rclpy(ok=False)
         self._run_once(fake)
         self.assertEqual(fake.state['shutdown_calls'], 1)
+
+    def test_uses_a_persistent_executor(self):
+        """必须用长期 executor，不能用 rclpy.spin_once(node)。
+
+        真机上 Orin5 的 dds_state 线程崩了：
+
+            IndexError: wait set index too big   (rclpy/qos_event.py is_ready)
+
+        spin_once(node) 每次都新建一个临时 executor；而这个循环会随 peer 出现
+        动态加订阅，于是上一轮 wait set 分配的 entity 索引对下一轮失效。
+        """
+        import inspect
+        src = inspect.getsource(dds_state._run_loop)
+        self.assertIn('SingleThreadedExecutor', src,
+                      'must hold one executor; spin_once(node) rebuilds one per call')
+        self.assertNotIn('rclpy.spin_once(_node', src,
+                         'rclpy.spin_once(node) is the pattern that produced the stale wait set')
+
+    def test_loop_survives_one_bad_iteration(self):
+        """单次异常不能杀死线程。
+
+        线程死掉是静默的 —— 容器照常运行，DDS 共享此后永久失效，日志里只有
+        一条 traceback。这与 rclpy.init 那次的失败模式完全一样。
+        """
+        import inspect
+        src = inspect.getsource(dds_state._run_loop)
+        body = src[src.find('while _running'):]
+        self.assertIn('except Exception', body,
+                      'the spin loop must not let one failure end the thread')
+
+    def test_executor_released_on_exit(self):
+        """退出时要摘掉 node 并关闭 executor，否则热重启会留下残留。"""
+        fake = _fake_rclpy(ok=True)
+        ex = self._run_once(fake)
+        self.assertIn(dds_state._node or ex.nodes[0], ex.nodes + ex.removed)
+        self.assertTrue(ex.shutdown_called, 'executor was never shut down')
+        self.assertTrue(ex.removed, 'node was never removed from the executor')
+
+    def test_transient_spin_error_is_survived(self):
+        """一次失败之后循环要继续，而不是把线程炸掉。
+
+        这正是真机上发生的事 —— IndexError 冒到线程顶层，线程死亡，
+        容器照常运行，功能此后静默失效。
+        """
+        fake = _fake_rclpy(ok=True)
+        calls = {'n': 0}
+
+        def _flaky():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise IndexError('wait set index too big')
+            # 第二次成功后停下，证明循环挺过了第一次失败
+            dds_state._running = False
+
+        ex = self._run_once(fake, on_spin=_flaky, auto_stop=False)
+        self.assertEqual(calls['n'], 2, 'loop did not continue after a failure')
+        self.assertTrue(ex.shutdown_called)
+
+    def test_persistent_failure_gives_up_instead_of_spinning_forever(self):
+        """持续失败必须放弃，不能每秒刷一条错误刷到进程结束。
+
+        第一版「扛住异常」写成了无限重试 —— 这个测试当时直接挂死，
+        暴露的是生产代码的问题，不是测试的问题。
+        """
+        fake = _fake_rclpy(ok=True)
+        calls = {'n': 0}
+
+        def _always_broken():
+            calls['n'] += 1
+            raise IndexError('wait set index too big')
+
+        with mock.patch.object(dds_state.time, 'sleep', lambda s: None):
+            ex = self._run_once(fake, on_spin=_always_broken, auto_stop=False)
+
+        self.assertEqual(calls['n'], dds_state._MAX_CONSECUTIVE_FAILURES,
+                         'loop must stop after the failure budget, not retry forever')
+        self.assertTrue(ex.shutdown_called, 'gave up without releasing the executor')
 
     def test_is_available_without_rclpy(self):
         """rclpy 缺失时 is_available() 返回 False 而不是抛异常。"""

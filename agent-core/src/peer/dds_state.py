@@ -30,6 +30,10 @@ _thread: threading.Thread | None = None
 # out from under the inspection API.
 _owns_rclpy = False
 
+# Consecutive spin failures before the loop stops trying. Tolerates a transient
+# hiccup without turning a permanent fault into one log line per second forever.
+_MAX_CONSECUTIVE_FAILURES = 5
+
 
 def topic_for(peer_id: str) -> str:
     """ROS topic carrying a peer's topic list.
@@ -121,19 +125,58 @@ def _run_loop():
     topic_name = topic_for(my_peer_id)
     _publisher = _node.create_publisher(String, topic_name, 10)
 
+    # One long-lived executor, not rclpy.spin_once(node).
+    #
+    # spin_once() builds a throwaway executor on every call. This loop adds
+    # subscriptions as peers appear, so entity indices assigned by one
+    # short-lived wait set went stale for the next, and rclpy eventually raised
+    #     IndexError: wait set index too big   (rclpy/qos_event.py, is_ready)
+    # which killed the thread. A persistent executor rebuilds its wait set
+    # correctly when the node's entities change.
+    from rclpy.executors import SingleThreadedExecutor
+    executor = SingleThreadedExecutor()
+    executor.add_node(_node)
+
     # Subscribe to all peers we know about (discovered via mDNS/static)
     _subscribe_to_peers()
 
     last_publish = 0.0
+    consecutive_failures = 0
     while _running:
-        now = time.time()
-        if now - last_publish > 5.0:
-            _publish_our_topics()
-            last_publish = now
-            # Refresh subscriptions in case new peers appeared
-            _subscribe_to_peers()
-        rclpy.spin_once(_node, timeout_sec=1.0)
+        try:
+            now = time.time()
+            if now - last_publish > 5.0:
+                _publish_our_topics()
+                last_publish = now
+                # Refresh subscriptions in case new peers appeared
+                _subscribe_to_peers()
+            executor.spin_once(timeout_sec=1.0)
+            consecutive_failures = 0
+        except Exception as e:
+            # A single bad iteration must not take the thread down: when it did,
+            # DDS sharing stopped for the rest of the process lifetime with one
+            # traceback in the log, the container still running, and the feature
+            # silently dead.
+            #
+            # Persistent failure is a different thing and must not become an
+            # error printed every second forever. Give up, loudly, so the log
+            # says the feature is off instead of burying the reason in noise.
+            consecutive_failures += 1
+            print(f'[peer] dds_state iteration failed '
+                  f'({consecutive_failures}/{_MAX_CONSECUTIVE_FAILURES}): '
+                  f'{type(e).__name__}: {e}')
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                print('[peer] dds_state giving up — state sharing is now off for '
+                      'this process. Peer messaging, tools and delegation are '
+                      'unaffected; they do not use DDS.')
+                break
+            time.sleep(1.0)
 
+    try:
+        executor.remove_node(_node)
+    except Exception:
+        pass
+    executor.shutdown()
     _cleanup()
     # Only tear down the context if we created it. ros2_bridge.py's bus, the
     # inspection API and every /ws/bus/{topic} subscriber share this context —
