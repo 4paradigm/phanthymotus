@@ -54,6 +54,7 @@ PEER_FACING_PATHS = frozenset({
     '/api/peer/inbox/pair_request',
     '/api/peer/inbox/ping',
     '/api/peer/inbox/message',
+    '/api/peer/inbox/state',
     '/api/peer/tools/list',
     '/api/peer/tools/call',
     '/api/peer/delegate',

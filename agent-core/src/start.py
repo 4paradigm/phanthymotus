@@ -440,7 +440,7 @@ async def lifespan(app):
     from peer.registry import registry as peer_registry
     await peer_registry.start()
 
-    # peer DDS state sharing (optional)
+    # peer state sharing (topic lists over signed HTTPS; DDS is loopback-only)
     from peer import dds_state
     dds_state.start()
 

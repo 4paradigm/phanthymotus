@@ -370,10 +370,11 @@ async def dds_isolation_status():
 
 @router.get('/dds_topology')
 async def dds_topology():
-    """ROS2 topic lists from all peers (DDS state sharing).
+    """每个 peer 各自看得见哪些 ROS2 话题。
 
-    Returns {peer_id: {topics: [...], last_seen: float}}. Empty if DDS sharing
-    is disabled (no rclpy or ROS_DOMAIN_ID).
+    返回 {peer_id: {topics: [...], last_seen: float}}。内容仍是 DDS 状态，但
+    自从 DDS 被锁在本机之后，它是各 peer 通过签名 HTTPS 推过来的 —— 前端不受
+    影响，结构没变。
     """
     from peer import dds_state
     if not dds_state.is_available():
@@ -475,6 +476,38 @@ async def inbox_ping(req: Request):
         raise fastapi.HTTPException(403, f'signature verification failed: {reason}')
     store.touch(peer_id)
     return {'pong': True, 'timestamp': time.time()}
+
+
+@router.post('/inbox/state')
+async def inbox_state(req: Request):
+    """一个已配对 peer 推过来的话题清单。
+
+    只接受状态，绝不接受指令 —— 这条规则比它原来的 DDS 通道活得久。改走签名
+    链路顺带补上了一个真实缺陷：原来的 peer DDS 总线没有任何鉴权，同一个
+    ROS_DOMAIN_ID 上任何进程都能伪造另一台机器人的话题清单。
+    """
+    body = await req.body()
+    peer_id, reason = transport.verify_signed_request(
+        req.method, req.url.path, req.headers, body, require_paired=True
+    )
+    if not peer_id:
+        raise fastapi.HTTPException(403, f'signature verification failed: {reason}')
+
+    try:
+        payload = await req.json()
+    except Exception:
+        raise fastapi.HTTPException(400, 'invalid JSON')
+
+    topics = payload.get('topics')
+    if not isinstance(topics, list):
+        raise fastapi.HTTPException(400, 'topics must be a list')
+    # 只保留字符串，并且设上限：对端是可以任意构造这个字段的，即便它已配对。
+    clean = [t for t in topics if isinstance(t, str)][:2000]
+
+    from peer import dds_state
+    dds_state.record_peer_topics(peer_id, clean)
+    store.touch(peer_id)
+    return {'accepted': len(clean)}
 
 
 @router.post('/inbox/message')
