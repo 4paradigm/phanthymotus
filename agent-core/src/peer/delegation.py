@@ -179,7 +179,13 @@ async def peer_list(
                 # Reachable but its agent loop is down: tools and state work,
                 # peer_delegate answers 503. Saying only "online" here is how an
                 # agent ends up promising work this peer cannot accept.
-                state = 'online, but its agent loop is off — cannot take delegated tasks'
+                # Measured, not assumed: with the loop off a peer still serves
+                # tools/list and executes tools/call (the canvas gate reads the
+                # saved layout, and its devices run independently of the loop).
+                # Only delegation fails, and downstream cards on its canvas may
+                # be stopped, so a call can dispatch and still have no effect.
+                state = ('online, agent loop off — tools and state work, but it cannot take '
+                         'delegated tasks and its downstream cards may be stopped')
             elif running is True:
                 state = 'online, agent loop running'
             else:
