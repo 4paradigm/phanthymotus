@@ -383,17 +383,26 @@ async def lifespan(app):
     import hostarch
     print(f'[startup] host facets: acc_arch={hostarch.acc_arch()} cpu_arch={hostarch.cpu_arch()}')
 
+    # Put the DDS profile in place *before* anything creates a participant —
+    # FastDDS reads it once, at first participant creation, so provisioning it
+    # after ros2_bridge.start() would have no effect until the next restart.
+    # This also self-heals hosts installed before the profile existed, and the
+    # bind-mount-created-a-directory case seen on R1.
+    import dds_isolation
+    _prov = dds_isolation.ensure_profile()
+    if _prov:
+        print(f'[dds] {_prov}')
+
     # 启动 ROS2 bridge（用于 DDS topic 订阅）
     import ros2_bridge
     _ros2_loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, ros2_bridge.start, _ros2_loop)
 
-    # Confirm DDS isolation actually took effect. A missing or malformed profile
+    # Confirm the isolation actually took effect. A missing or malformed profile
     # makes FastDDS fall back to every interface silently — the robot keeps
     # working and nothing looks wrong until another robot answers a command
     # meant for this one. Checked after the bridge starts so real DDS sockets
     # exist to inspect.
-    import dds_isolation
     dds_isolation.check_and_report()
 
     # Pre-create audio publisher so DDS discovery completes before first use

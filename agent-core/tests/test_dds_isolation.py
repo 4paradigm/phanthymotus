@@ -123,6 +123,89 @@ class TestDdsIsolation(unittest.TestCase):
         with mock.patch.dict(os.environ, {'ROS_DOMAIN_ID': '0'}):
             self.assertEqual(dds_isolation._dds_port_range(), (7400, 7649))
 
+    def test_directory_is_reported_distinctly(self):
+        """路径是目录时要单独报，不能笼统说"不可读"。
+
+        R1 上真实发生过：宿主机没有这个文件，compose 里的 bind mount 让 Docker
+        自动建了同名目录，FastDDS 静默回退，9 个 DDS 端口全绑在 0.0.0.0。
+        报成"不可读"会让人去查权限，而真正该做的是删目录、放文件、重启容器 ——
+        两件事修法完全不同。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {'FASTRTPS_DEFAULT_PROFILES_FILE': d}):
+                r = dds_isolation.check_and_report()
+        self.assertFalse(r['isolated'])
+        self.assertTrue(r['profile_is_directory'])
+        self.assertIn('目录', r['detail'])
+
+    def test_ensure_profile_writes_when_missing(self):
+        """文件缺失时从镜像自带的那份补齐 —— 已装机器升级 core 即自愈，
+        不必重跑 install.sh。"""
+        with tempfile.TemporaryDirectory() as d:
+            bundled = os.path.join(d, 'bundled.xml')
+            target = os.path.join(d, 'sub', 'dds-local.xml')
+            with open(bundled, 'w') as f:
+                f.write('<dds/>')
+            with mock.patch.object(dds_isolation, '_BUNDLED_PROFILE', bundled), \
+                 mock.patch.dict(os.environ, {'FASTRTPS_DEFAULT_PROFILES_FILE': target}):
+                msg = dds_isolation.ensure_profile()
+            self.assertTrue(os.path.isfile(target))
+            self.assertIn('缺失', msg)
+
+    def test_ensure_profile_replaces_the_phantom_directory(self):
+        """目录会被就地换成文件，并提示其它容器需要重启。"""
+        with tempfile.TemporaryDirectory() as d:
+            bundled = os.path.join(d, 'bundled.xml')
+            target = os.path.join(d, 'dds-local.xml')
+            with open(bundled, 'w') as f:
+                f.write('<dds/>')
+            os.mkdir(target)          # 复现 bind mount 造出来的空目录
+            with mock.patch.object(dds_isolation, '_BUNDLED_PROFILE', bundled), \
+                 mock.patch.dict(os.environ, {'FASTRTPS_DEFAULT_PROFILES_FILE': target}):
+                msg = dds_isolation.ensure_profile()
+            self.assertTrue(os.path.isfile(target))
+            self.assertIn('重启', msg, '必须提示其它容器要重启才能看到文件')
+
+    def test_ensure_profile_updates_stale_content(self):
+        """内容与镜像不一致时更新，一致则不动（避免每次启动都写盘）。"""
+        with tempfile.TemporaryDirectory() as d:
+            bundled = os.path.join(d, 'bundled.xml')
+            target = os.path.join(d, 'dds-local.xml')
+            with open(bundled, 'w') as f:
+                f.write('<dds>new</dds>')
+            with open(target, 'w') as f:
+                f.write('<dds>old</dds>')
+            with mock.patch.object(dds_isolation, '_BUNDLED_PROFILE', bundled), \
+                 mock.patch.dict(os.environ, {'FASTRTPS_DEFAULT_PROFILES_FILE': target}):
+                msg = dds_isolation.ensure_profile()
+                self.assertIn('不一致', msg)
+                self.assertEqual(open(target).read(), '<dds>new</dds>')
+                self.assertEqual(dds_isolation.ensure_profile(), '',
+                                 '内容一致时不应再写')
+
+    def test_provision_runs_before_dds_init(self):
+        """ensure_profile 必须早于 ros2_bridge.start()。
+
+        FastDDS 只在创建第一个参与者时读一次 profile，落盘晚了就要等下次重启
+        才生效 —— 那等于没修。
+        """
+        import pathlib as _p
+        lines = (_p.Path(__file__).resolve().parents[1] / 'src' / 'start.py').read_text().splitlines()
+
+        def line_of(pred):
+            for i, l in enumerate(lines):
+                code = l.split('#')[0]          # 注释里也提到这两个名字，按代码匹配
+                if pred(code):
+                    return i
+            return -1
+
+        i_prov = line_of(lambda c: 'dds_isolation.ensure_profile()' in c)
+        i_init = line_of(lambda c: 'ros2_bridge.start' in c)
+        self.assertGreater(i_prov, 0, 'ensure_profile() is not called at startup')
+        self.assertGreater(i_init, 0)
+        self.assertLess(i_prov, i_init,
+                        'profile must be written before the first DDS participant')
+
     def test_endpoint_exists(self):
         """/api/peer/dds_isolation 必须真的注册了，且属于 dashboard 侧。"""
         import api.peer

@@ -25,6 +25,70 @@ def _profile_path() -> str:
     return os.environ.get('FASTRTPS_DEFAULT_PROFILES_FILE', '')
 
 
+# 镜像里随代码一起打包的那份，作为落盘来源。
+_BUNDLED_PROFILE = '/deploy/dds-local.xml'
+
+
+def ensure_profile() -> str:
+    """确保 profile 文件真实存在，必要时从镜像里补齐。返回一行说明。
+
+    两个动机：
+
+    1. **已经装好的机器不该被要求重跑 install.sh。** 升级 core 镜像时，这里会
+       把新版 profile 自动落到 /opt/phanthy-motus/（该目录是可写挂载）。
+
+    2. **bind mount 会凭空造出一个目录。** compose 里写了
+       `- /opt/phanthy-motus/dds-local.xml:...:ro` 而宿主机上没有这个文件时，
+       Docker **自动建一个同名目录**，FastDDS 读不到有效 profile 就静默回退到
+       所有网卡 —— 隔离失效、外表毫无异常。R1 上真实发生过，而且当时那台机器
+       上 9 个 DDS 端口全绑在 0.0.0.0。
+
+    目录这种情况这里会就地清掉再写文件；但**已经把它当目录挂进去的容器必须重启**
+    才能看到文件，所以返回值会明确说出来。
+    """
+    path = _profile_path()
+    if not path:
+        return ''
+
+    try:
+        if os.path.isdir(path):
+            # 只删空目录：非空说明是别的东西，不该由我们处置。
+            try:
+                os.rmdir(path)
+            except OSError as e:
+                return (f'⚠ {path} 是目录且无法删除（{e}）—— 这是 bind mount 在宿主机'
+                        f'缺文件时自动创建的，隔离不会生效。请手工删除后重启相关容器')
+            _write_profile(path)
+            return (f'{path} 原本是个目录（bind mount 自动创建），已替换为文件。'
+                    f'**其它容器需要重启**才能看到它')
+
+        if not os.path.exists(path):
+            _write_profile(path)
+            return f'{path} 缺失，已从镜像补齐'
+
+        # 已存在且内容一致时不动它，避免每次启动都写盘
+        if os.path.isfile(_BUNDLED_PROFILE):
+            with open(_BUNDLED_PROFILE, 'rb') as f:
+                bundled = f.read()
+            with open(path, 'rb') as f:
+                current = f.read()
+            if current != bundled:
+                _write_profile(path)
+                return f'{path} 与镜像内版本不一致，已更新'
+    except OSError as e:
+        return f'⚠ 无法确保 profile 文件（{type(e).__name__}: {e}）'
+    return ''
+
+
+def _write_profile(path: str) -> None:
+    with open(_BUNDLED_PROFILE, 'rb') as src:
+        data = src.read()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as dst:
+        dst.write(data)
+    os.chmod(path, 0o644)
+
+
 # RTPS 端口分配：每个 domain 独占 250 个端口，块内布局为
 #   base+0 发现多播、base+1 用户多播、base+10+2i / base+11+2i 第 i 个参与者单播。
 # 这里的「参与者」是同一台机器上的 DDS 进程，与机器人数量无关
@@ -111,7 +175,8 @@ def check_and_report() -> dict:
     result = {
         'profile_configured': bool(profile),
         'profile_path': profile,
-        'profile_readable': bool(profile) and os.access(profile, os.R_OK),
+        'profile_readable': bool(profile) and os.path.isfile(profile) and os.access(profile, os.R_OK),
+        'profile_is_directory': False,
         'external_binds': [],
         'isolated': False,
         'detail': '',
@@ -120,6 +185,17 @@ def check_and_report() -> dict:
     if not profile:
         result['detail'] = ('未配置 FASTRTPS_DEFAULT_PROFILES_FILE —— DDS 未隔离，'
                             '同网段的其他机器人会收到本机的指令')
+        print(f'[dds] ⚠ {result["detail"]}')
+        return result
+
+    # 目录要单独报。报成"不可读"会让人去查权限，而真正的原因是宿主机缺文件、
+    # bind mount 自动建了同名目录 —— 这两件事的修法完全不同。
+    if os.path.isdir(profile):
+        result['profile_is_directory'] = True
+        result['detail'] = (
+            f'{profile} 是**目录**不是文件 —— 宿主机上缺这个文件时 bind mount 会自动'
+            f'建一个同名目录，FastDDS 静默回退到所有网卡，隔离失效。'
+            f'需在宿主机删除该目录、放上真正的 XML，然后重启所有 DDS 容器')
         print(f'[dds] ⚠ {result["detail"]}')
         return result
 
