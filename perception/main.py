@@ -131,6 +131,11 @@ class PerceptionBundle:
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
 
+        if plugins_cfg.get("soundevent", {}).get("enabled", False):
+            from plugins.soundevent import SoundEventPlugin
+            self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
+            log.info("SoundEventPlugin loaded")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:

@@ -539,6 +539,33 @@ def ensure_gpu_model(name: str, model_dir: str) -> dict[str, str]:
                                   bundle["files"])
 
 
+# ── SoundEvent (Google YAMNet TFLite) ───────────────────────────────────────
+SOUNDEVENT_MODEL_DIR = "/models/soundevent"
+SOUNDEVENT_MODEL_FILENAME = "yamnet_classification.tflite"
+SOUNDEVENT_MODEL_BASE = os.environ.get(
+    "SOUNDEVENT_MODEL_BASE_URL",
+    f"{COS_BASE}/soundevent",
+)
+SOUNDEVENT_MODEL_FILES = {
+    SOUNDEVENT_MODEL_FILENAME: {
+        "size": 4126810,
+        "sha256": "10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de",
+    },
+}
+
+
+def ensure_soundevent_model() -> str:
+    """Ensure the SHA256-pinned YAMNet TFLite model is available."""
+    model_dir = require_models_subpath(SOUNDEVENT_MODEL_DIR)
+    paths = ensure_verified_bundle(
+        "soundevent",
+        model_dir,
+        SOUNDEVENT_MODEL_BASE,
+        SOUNDEVENT_MODEL_FILES,
+    )
+    return paths[SOUNDEVENT_MODEL_FILENAME]
+
+
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
 # The engines are built per TensorRT major and are not portable, so the
 # bundle is chosen from the TensorRT that is importable at runtime. Only the
