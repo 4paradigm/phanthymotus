@@ -168,15 +168,28 @@ async def confirm_pairing(req: ConfirmPairingReq):
     """Complete pairing after the human confirms the short code matches.
 
     Creates the peer record with the pinned public key and a default role.
-    Idempotent: repeated calls for an already-paired peer succeed and return
-    the existing record.
+
+    Idempotent for an already-paired peer, but the response says so explicitly.
+    Once the session is consumed the submitted code cannot be checked against
+    anything, and answering a plain 200 made a wrong code look verified — the
+    caller had no way to tell "code matched" from "nothing was compared". No
+    access is granted either way (this endpoint needs ACCESS_TOKEN and only
+    echoes an existing record), but a confirmation step that reports success
+    without confirming anything is worth being loud about.
     """
     session = pairing.get(req.peer_id)
     if session is None:
         # Maybe already confirmed, check the store.
         peer = store.get(req.peer_id)
         if peer is not None:
-            return {'peer': peer}
+            return {
+                'peer': peer,
+                'already_paired': True,
+                'code_verified': False,
+                'note': ('no active pairing session — returned the existing pairing '
+                         'unchanged; the submitted code was not checked. To re-verify, '
+                         'unpair and pair again.'),
+            }
         raise fastapi.HTTPException(404, 'no active pairing session for this peer_id')
 
     if session.expired:
@@ -196,7 +209,8 @@ async def confirm_pairing(req: ConfirmPairingReq):
         endpoints=session.endpoints,
     )
     pairing.pop(req.peer_id)
-    return {'peer': peer}
+    print(f'[peer] paired with {req.peer_id[:12]} ({peer["display_name"]}) as {default_role}')
+    return {'peer': peer, 'already_paired': False, 'code_verified': True}
 
 
 @router.get('/pair/active')

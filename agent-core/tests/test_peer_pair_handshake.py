@@ -110,6 +110,22 @@ class TestPairHandshake(unittest.TestCase):
         self.assertNotEqual(code_a, code_b,
                             'MITM produced matching codes — SAS gives no protection')
 
+    def test_confirm_reports_whether_the_code_was_checked(self):
+        """已配对且无 session 时，响应必须声明「码未校验」。
+
+        真机上发现：对已配对的 peer 提交错误的码 000000，返回 200 且看起来
+        像确认成功。session 已被消费，码无从比对 —— 没有授予任何新权限
+        （该端点要 ACCESS_TOKEN，只回显既有记录），但一个「确认」接口在
+        什么都没确认的情况下回报成功，会让操作员误以为验证过了。
+        """
+        import inspect
+        import api.peer as ap
+        src = inspect.getsource(ap.confirm_pairing)
+        self.assertIn('code_verified', src,
+                      'confirm response must state whether the code was checked')
+        self.assertIn('already_paired', src,
+                      'confirm response must distinguish a fresh pairing from a repeat')
+
     def test_display_name_helpers_never_empty(self):
         """两端展示名不能为空 —— 光看指纹没法判断在跟哪台机器配对。"""
         import api.peer as ap
