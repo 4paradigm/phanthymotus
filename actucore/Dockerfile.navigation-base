@@ -35,7 +35,7 @@ ARG BUILD_JOBS=4
 ARG GIT_MIRROR_PREFIX=
 ARG FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git
 ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
-ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=baa9153c6a6bd204dd5577e59036aad6db7d48c167f76017404b6110bb611891
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d
 ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb
 ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c
 ARG RPG_VIKIT_REPO=https://github.com/Rhymer-Lcy/rpg_vikit_ros2_fisheye.git
@@ -335,6 +335,8 @@ COPY actucore/plugins/navigation/runtime/patches/fast-livo2-pcd-save.patch \
      /tmp/fast-livo2-pcd-save.patch
 COPY actucore/plugins/navigation/runtime/patches/fast-livo2-pcd-flush.patch \
      /tmp/fast-livo2-pcd-flush.patch
+COPY actucore/plugins/navigation/runtime/navigation_lio.yaml \
+     /tmp/navigation_lio.yaml
 RUN [[ "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
     [[ "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
     [[ "${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
@@ -385,6 +387,28 @@ RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
     grep -Fq "raw PCD flush failed" /tmp/fastlivo_mapping.strings && \
     ! grep -Fq "imu time stamp Jumps" /tmp/fastlivo_mapping.strings && \
     rm /tmp/fastlivo_mapping.strings
+
+# The upstream node automatically declares ROS parameter overrides. Launch
+# once with the same overrides used by the supervisor so duplicate declarations
+# fail during the base build instead of later appearing as SIGABRT on G1.
+RUN source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    ulimit -c 0 && \
+    { status=0; \
+      timeout --signal=INT --kill-after=2s 2s \
+        /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
+        --ros-args \
+        --params-file /tmp/navigation_lio.yaml \
+        -p lidar_qos_depth:=2 \
+        -p imu_qos_depth:=400 \
+        -p runtime_diagnostics_topic:=/fast_livo2/runtime_diagnostics \
+        >/tmp/fastlivo_startup.log 2>&1 || status=$?; \
+      if [ "${status}" -ne 124 ]; then \
+        cat /tmp/fastlivo_startup.log; \
+        exit 1; \
+      fi; \
+      rm /tmp/fastlivo_startup.log; }
 
 # ── Nav2（最重的一层，放最后编）─────────────────────────────────────
 # 只编卡片真正会加载的那一档：navigation_launch.py 起的 planner/controller/
@@ -499,7 +523,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
 FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_runtime
 ARG APT_MIRROR
 ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
-ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=baa9153c6a6bd204dd5577e59036aad6db7d48c167f76017404b6110bb611891
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d
 ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb
 ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c
 ARG NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db

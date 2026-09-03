@@ -130,7 +130,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=baa9153c6a6bd204dd5577e59036aad6db7d48c167f76017404b6110bb611891",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d",
             source_lock,
         )
         self.assertIn(
@@ -144,8 +144,31 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("pcd_save.flush_sequence", flush_patch.read_text(encoding="utf-8"))
         self.assertIn("raw PCD flush failed", flush_patch.read_text(encoding="utf-8"))
         runtime_patch_text = runtime_patch.read_text(encoding="utf-8")
-        self.assertIn('declare_parameter<int>("lidar_qos_depth", 2)', runtime_patch_text)
-        self.assertIn('declare_parameter<int>("imu_qos_depth", 400)', runtime_patch_text)
+        self.assertIn(
+            'get_parameter_or("lidar_qos_depth", point_cloud_queue_depth, 2)',
+            runtime_patch_text,
+        )
+        self.assertIn(
+            'get_parameter_or("imu_qos_depth", imu_queue_depth, 400)',
+            runtime_patch_text,
+        )
+        self.assertNotIn('declare_parameter<int>("lidar_qos_depth"', runtime_patch_text)
+        self.assertNotIn('declare_parameter<int>("imu_qos_depth"', runtime_patch_text)
+        self.assertNotIn(
+            'declare_parameter<std::string>(\n+    "runtime_diagnostics_topic"',
+            runtime_patch_text,
+        )
+        self.assertIn(
+            '"runtime_diagnostics_topic", runtime_diagnostics_topic,',
+            runtime_patch_text,
+        )
+        self.assertIn(
+            "timeout --signal=INT --kill-after=2s 2s",
+            base_dockerfile,
+        )
+        self.assertIn("--params-file /tmp/navigation_lio.yaml", base_dockerfile)
+        self.assertIn("-p lidar_qos_depth:=2", base_dockerfile)
+        self.assertIn("-p imu_qos_depth:=400", base_dockerfile)
         self.assertIn("rclcpp::KeepLast", runtime_patch_text)
         self.assertIn("point_cloud_qos.reliable().durability_volatile()", runtime_patch_text)
         self.assertIn("imu_qos.reliable().durability_volatile()", runtime_patch_text)
@@ -207,7 +230,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "baa9153c6a6bd204dd5577e59036aad6db7d48c167f76017404b6110bb611891",
+            "f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),

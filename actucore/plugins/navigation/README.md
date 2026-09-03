@@ -82,7 +82,9 @@ callback/处理和 adapter 输出计数，因此旧录包中的低帧率不再�
 进程组，会随 FAST-LIVO2 runtime 的 stop/restart 一起回收，避免多个全频
 recorder 重复订阅传感器。FAST-LIVO2 输入使用 Reliable：LiDAR 默认只保留
 最新 2 帧，IMU 默认保留 400 帧（按 200 Hz 约 2 秒）的积分历史，两个深度
-均可在卡片配置中调整。计算瞬时
+均可在卡片配置中调整。上游 NodeOptions 会自动声明命令行覆盖，
+因此运行补丁只读取这些值，不再二次 `declare_parameter`；基础镜像
+构建会使用同样的参数执行一次真实启动检查。计算瞬时
 积压时丢弃旧点云，但不丢掉两帧 LiDAR 之间不可替代的 IMU 运动量；
 故障录包仍使用 Best Effort snapshot，不反压传感器链路。
 mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale` 放入

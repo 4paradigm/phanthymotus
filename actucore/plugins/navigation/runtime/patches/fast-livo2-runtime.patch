@@ -88,15 +88,17 @@ diff --git a/src/LIVMapper.cpp b/src/LIVMapper.cpp
 index 4b92dfe..4fa153e 100755
 --- a/src/LIVMapper.cpp
 +++ b/src/LIVMapper.cpp
-@@ -308,12 +308,32 @@ void LIVMapper::initializeFiles()
+@@ -308,12 +308,36 @@ void LIVMapper::initializeFiles()
  void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node, image_transport::ImageTransport &it_)
  {
    image_transport::ImageTransport it(this->node);
 +  // This node services subscriptions and mapping in one spin_some loop. Keep
 +  // LiDAR latest-only, but retain enough high-rate IMU integration history to
 +  // span transient mapping work without dropping motion between scans.
-+  const int point_cloud_queue_depth = this->node->declare_parameter<int>("lidar_qos_depth", 2);
-+  const int imu_queue_depth = this->node->declare_parameter<int>("imu_qos_depth", 400);
++  int point_cloud_queue_depth = 2;
++  int imu_queue_depth = 400;
++  this->node->get_parameter_or("lidar_qos_depth", point_cloud_queue_depth, 2);
++  this->node->get_parameter_or("imu_qos_depth", imu_queue_depth, 400);
 +  if (point_cloud_queue_depth < 1 || point_cloud_queue_depth > 32 ||
 +      imu_queue_depth < 1 || imu_queue_depth > 4000) {
 +    throw std::out_of_range("FAST-LIVO2 QoS depth is outside the supported range");
@@ -115,8 +117,10 @@ index 4b92dfe..4fa153e 100755
    }
 -  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
 +  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, imu_qos, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
-+  const std::string runtime_diagnostics_topic = this->node->declare_parameter<std::string>(
-+    "runtime_diagnostics_topic", "/fast_livo2/runtime_diagnostics");
++  std::string runtime_diagnostics_topic;
++  this->node->get_parameter_or(
++    "runtime_diagnostics_topic", runtime_diagnostics_topic,
++    std::string("/fast_livo2/runtime_diagnostics"));
 +  runtime_diagnostics_pub = this->node->create_publisher<std_msgs::msg::String>(
 +    runtime_diagnostics_topic, rclcpp::SensorDataQoS().keep_last(1));
 +  runtime_diagnostics_timer = this->node->create_wall_timer(
