@@ -491,7 +491,15 @@ class _SoundEventNode(Node):
 
 
 class SoundEventPlugin:
-    """Perception facade around one shared YAMNet model."""
+    """Perception facade around one lazily loaded, shared YAMNet model.
+
+    Model download and TFLite initialization are intentionally deferred until
+    the first ``start``.  The bundle constructor must stay fast so a missing or
+    slow SoundEvent model cannot delay the MCP server or unrelated perception
+    cards.  Concurrent starts share one background load; requested instances
+    are brought up after the model is ready unless a concurrent stop cancelled
+    them in the meantime.
+    """
 
     PREFIX = "soundevent"
     _DESC = "On-device non-speech sound event detection with YAMNet"
@@ -499,15 +507,69 @@ class SoundEventPlugin:
     def __init__(self, plugin_cfg: Mapping[str, Any], executor: Any):
         self._executor = executor
         self._nodes = {}  # type: Dict[str, _SoundEventNode]
+        self._pending_starts = {}  # type: Dict[str, str]
         self._lock = threading.RLock()
-        self._lifecycle_lock = threading.Lock()
         self._model = None  # type: Optional[YamNetLite]
+        self._model_state = "idle"  # idle | loading | ready | error
         self._model_error = None  # type: Optional[str]
+
+    @staticmethod
+    def _loading_result(input_topic: str) -> Dict[str, Any]:
+        return {
+            "state": "loading",
+            "input": input_topic,
+            "output": "%s/soundevent" % input_topic,
+            "message": "Loading SoundEvent model...",
+        }
+
+    def _spawn_loader_locked(self) -> None:
+        """Start the single background model loader. Caller holds ``_lock``."""
+        if self._model_state == "loading":
+            return
+        self._model_state = "loading"
+        self._model_error = None
+        thread = threading.Thread(
+            target=self._loader,
+            name="soundevent-model-loader",
+            daemon=True,
+        )
+        thread.start()
+
+    def _loader(self) -> None:
         try:
-            self._model = _build_model()
+            model = _build_model()
         except Exception as error:
-            self._model_error = str(error)
             log.exception("[soundevent] model load failed")
+            with self._lock:
+                self._model_state = "error"
+                self._model_error = str(error)
+            return
+
+        with self._lock:
+            self._model = model
+            self._model_state = "ready"
+            self._model_error = None
+
+        log.info("[soundevent] model ready")
+
+        # Replay starts accepted while the model was loading. Take one pending
+        # request at a time and re-check its claim during registration so stop
+        # cannot resurrect an instance after cancelling it.
+        while True:
+            with self._lock:
+                if (
+                    self._model is not model
+                    or not self._pending_starts
+                ):
+                    return
+                key, input_topic = next(iter(self._pending_starts.items()))
+            try:
+                self._activate_pending(key, input_topic, model)
+            except Exception:
+                log.exception("[soundevent] failed to start pending instance %s", key)
+                with self._lock:
+                    if self._pending_starts.get(key) == input_topic:
+                        del self._pending_starts[key]
 
     def get_tools(self) -> List[Dict[str, Any]]:
         return TOOLS
@@ -527,47 +589,95 @@ class SoundEventPlugin:
             ],
         )
 
+    def _instance_state_locked(self, key: str) -> str:
+        node = self._nodes.get(key)
+        if node is not None:
+            return node.state
+        if key in self._pending_starts:
+            return "error" if self._model_state == "error" else "loading"
+        return "idle"
+
+    def _desc_locked(self, state: str) -> str:
+        if state == "loading":
+            return "Loading SoundEvent model..."
+        if state == "error" and self._model_error:
+            return "Model load failed: %s" % self._model_error
+        return self._DESC
+
     def _info(self, key: str, input_topic: str) -> Dict[str, Any]:
+        base = {
+            "name": "SoundEvent",
+            "manufacture": "Embodied",
+            "model": "yamnet",
+        }
         with self._lock:
             if key:
-                nodes = [self._nodes[key]] if key in self._nodes else []
-            else:
-                nodes = list(self._nodes.values())
-            model_error = self._model_error
+                node = self._nodes.get(key)
+                if node is not None:
+                    result = {**base, **node.status()}
+                    result["desc"] = self._desc_locked(result["state"])
+                    return result
 
-        if len(nodes) == 1:
-            result = nodes[0].status()
-        elif nodes:
-            statuses = [node.status() for node in nodes]
-            states = {status["state"] for status in statuses}
-            if "error" in states:
+                topic = self._pending_starts.get(key, input_topic)
+                topic_in, topic_out = self._topics(topic)
+                state = self._instance_state_locked(key)
+                result = {
+                    **base,
+                    "state": state,
+                    "desc": self._desc_locked(state),
+                    "topic_in": topic_in,
+                    "topic_out": topic_out,
+                }
+                if state == "error" and self._model_error:
+                    result["error"] = self._model_error
+                return result
+
+            keys = list(self._nodes) + [
+                pending_key
+                for pending_key in self._pending_starts
+                if pending_key not in self._nodes
+            ]
+            instances = {
+                instance_key: {"state": self._instance_state_locked(instance_key)}
+                for instance_key in keys
+            }
+            topics_in = []
+            topics_out = []
+            for instance_key in keys:
+                node = self._nodes.get(instance_key)
+                topic = (
+                    node.input_topic
+                    if node is not None
+                    else self._pending_starts[instance_key]
+                )
+                item_in, item_out = self._topics(topic)
+                topics_in.extend(item_in)
+                topics_out.extend(item_out)
+
+            states = {item["state"] for item in instances.values()}
+            if "error" in states or self._model_state == "error":
                 state = "error"
+            elif "loading" in states or self._model_state == "loading":
+                state = "loading"
             elif "running" in states:
                 state = "running"
             else:
                 state = "idle"
-            result = {
-                "state": state,
-                "topic_in": [item for status in statuses for item in status["topic_in"]],
-                "topic_out": [item for status in statuses for item in status["topic_out"]],
-            }
-        else:
-            topic_in, topic_out = self._topics(input_topic)
-            result = {
-                "state": "error" if model_error else "idle",
-                "topic_in": topic_in,
-                "topic_out": topic_out,
-            }
+            if not keys and input_topic:
+                topics_in, topics_out = self._topics(input_topic)
 
-        result.update(
-            {
-                "name": "SoundEvent",
-                "manufacture": "Embodied",
-                "model": "yamnet",
-                "desc": model_error or self._DESC,
+            result = {
+                **base,
+                "state": state,
+                "desc": self._desc_locked(state),
+                "topic_in": topics_in,
+                "topic_out": topics_out,
             }
-        )
-        return result
+            if instances:
+                result["instances"] = instances
+            if state == "error" and self._model_error:
+                result["error"] = self._model_error
+            return result
 
     def _dispose(self, key: str, node: _SoundEventNode) -> Dict[str, Any]:
         try:
@@ -575,84 +685,151 @@ class SoundEventPlugin:
         finally:
             dispose_node(self._executor, node, label="soundevent/%s" % key)
 
+    def _activate_pending(
+        self,
+        key: str,
+        input_topic: str,
+        model: YamNetLite,
+    ) -> Dict[str, Any]:
+        """Create and start one still-pending instance with a ready model."""
+        try:
+            node = _SoundEventNode(input_topic, model, node_suffix=key)
+        except Exception:
+            with self._lock:
+                if self._pending_starts.get(key) == input_topic:
+                    del self._pending_starts[key]
+            raise
+
+        registered = False
+        registration_error = None  # type: Optional[Exception]
+        current = None  # type: Optional[_SoundEventNode]
+        claimed = False
+        fresh = False
+        with self._lock:
+            claimed = self._pending_starts.get(key) == input_topic
+            current = self._nodes.get(key)
+            fresh = (
+                self._model is model
+                and self._model_state == "ready"
+            )
+            if claimed and current is None and fresh:
+                try:
+                    # Register before start: a concurrent stop must always be
+                    # able to find and retire this node.
+                    self._executor.add_node(node)
+                except Exception as error:
+                    registration_error = error
+                    del self._pending_starts[key]
+                else:
+                    self._nodes[key] = node
+                    del self._pending_starts[key]
+                    registered = True
+            elif claimed and current is not None:
+                # Another activation won the race for this key.
+                del self._pending_starts[key]
+
+        if not registered:
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+            if registration_error is not None:
+                raise registration_error
+            if current is not None:
+                return current.start()
+            if claimed and not fresh:
+                return self._loading_result(input_topic)
+            return {"state": "idle"}
+
+        try:
+            result = node.start()
+        except Exception:
+            with self._lock:
+                if self._nodes.get(key) is node:
+                    del self._nodes[key]
+            node.request_retire()
+            try:
+                self._dispose(key, node)
+            except Exception:
+                log.exception("[soundevent] failed to clean up start error")
+            raise
+
+        with self._lock:
+            still_ours = self._nodes.get(key) is node
+        if not still_ours:
+            # A concurrent stop retired the node while start() ran.
+            node.stop()
+            return {"state": "idle"}
+        return result
+
     def _start(self, key: str, input_topic: str) -> Dict[str, Any]:
         if not input_topic:
             raise ValueError("input_topic is required for start")
-        if self._model is None:
-            return {"state": "error", "message": self._model_error or "model unavailable"}
 
-        with self._lifecycle_lock:
-            with self._lock:
-                node = self._nodes.get(key)
-                reuse = (
-                    node is not None
-                    and node.input_topic == input_topic
-                    and node.state != "error"
-                )
-                previous = None if reuse else self._nodes.pop(key, None)
-                if previous is not None:
+        previous = None  # type: Optional[_SoundEventNode]
+        start_node = None  # type: Optional[_SoundEventNode]
+        model = None  # type: Optional[YamNetLite]
+        with self._lock:
+            existing = self._nodes.get(key)
+            if (
+                existing is not None
+                and existing.input_topic == input_topic
+                and existing.state != "error"
+            ):
+                start_node = existing
+            else:
+                if existing is not None:
+                    previous = self._nodes.pop(key)
                     previous.request_retire()
-            if previous is not None:
-                result = self._dispose(key, previous)
-                if result.get("state") != "idle":
-                    return result
+                # Claim the key before any blocking cleanup. A concurrent stop
+                # can now cancel this start even before the node exists.
+                self._pending_starts[key] = input_topic
+                if self._model_state == "ready" and self._model is not None:
+                    model = self._model
+                else:
+                    if self._model_state in ("idle", "error"):
+                        self._spawn_loader_locked()
 
-            if not reuse:
-                node = _SoundEventNode(input_topic, self._model, node_suffix=key)
+        if previous is not None:
+            result = self._dispose(key, previous)
+            if result.get("state") != "idle":
                 with self._lock:
-                    try:
-                        self._executor.add_node(node)
-                    except Exception:
-                        node.destroy_node()
-                        raise
-                    self._nodes[key] = node
+                    if self._pending_starts.get(key) == input_topic:
+                        del self._pending_starts[key]
+                return result
 
-            try:
-                return node.start()
-            except Exception:
-                with self._lock:
-                    if self._nodes.get(key) is node:
-                        del self._nodes[key]
-                node.request_retire()
-                try:
-                    self._dispose(key, node)
-                except Exception:
-                    log.exception("[soundevent] failed to clean up start error")
-                raise
+        if start_node is not None:
+            return start_node.start()
+        if model is None:
+            return self._loading_result(input_topic)
+        return self._activate_pending(key, input_topic, model)
 
     def _stop(self, instance_id: str) -> Dict[str, Any]:
-        # Signal before waiting for another lifecycle transition. A stop can
-        # therefore cancel a node that has been registered but not started yet.
+        items = []  # type: List[Tuple[str, _SoundEventNode]]
         with self._lock:
             if instance_id:
-                node = self._nodes.get(instance_id)
-                pending = [node] if node is not None else []
+                self._pending_starts.pop(instance_id, None)
+                node = self._nodes.pop(instance_id, None)
+                if node is not None:
+                    node.request_retire()
+                    items.append((instance_id, node))
             else:
-                pending = list(self._nodes.values())
-            for node in pending:
-                node.request_retire()
-
-        with self._lifecycle_lock:
-            with self._lock:
-                if instance_id:
-                    node = self._nodes.pop(instance_id, None)
-                    items = [(instance_id, node)] if node is not None else []
-                else:
-                    items = list(self._nodes.items())
-                    self._nodes.clear()
+                self._pending_starts.clear()
+                items = list(self._nodes.items())
+                self._nodes.clear()
                 for _, node in items:
                     node.request_retire()
 
-            failure = None
-            for key, node in items:
-                try:
-                    result = self._dispose(key, node)
-                except Exception as error:
-                    log.exception("[soundevent] failed to dispose %s", key)
-                    result = {"state": "error", "message": str(error)}
-                if result.get("state") != "idle" and failure is None:
-                    failure = result
-            return failure or {"state": "idle"}
+        failure = None
+        for key, node in items:
+            try:
+                result = self._dispose(key, node)
+            except Exception as error:
+                log.exception("[soundevent] failed to dispose %s", key)
+                result = {"state": "error", "message": str(error)}
+            if result.get("state") != "idle" and failure is None:
+                failure = result
+        return failure or {"state": "idle"}
 
     def dispatch(self, name: str, args: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         action = str(args.get("action", name))

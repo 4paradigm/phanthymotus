@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import threading
+import time
 import types
 import zipfile
 from pathlib import Path
@@ -11,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from vision_stubs import _FakeAudioChunk, _FakeNode, _wait_until
+from vision_stubs import _FakeAudioChunk, _FakeExecutor, _FakeNode, _wait_until
 
 import plugins.soundevent as soundevent
 from utils import model_downloader
@@ -44,6 +46,46 @@ def _audio_chunk(data: bytes, timestamp: float) -> _FakeAudioChunk:
     message.format = soundevent.AUDIO_FORMAT
     message.data = data
     return message
+
+
+@pytest.fixture(autouse=True)
+def _stub_destroy_subscription(monkeypatch):
+    monkeypatch.setattr(
+        _FakeNode,
+        "destroy_subscription",
+        lambda self, subscription: self.subscriptions.remove(subscription),
+        raising=False,
+    )
+
+
+class _LifecycleModel:
+    labels = ["Bark"]
+
+    def predict(self, waveform):
+        return np.asarray([0.9], dtype=np.float32)
+
+
+class _ModelBuilderProbe:
+    def __init__(self, release=None, failures=0):
+        self.release = release
+        self.failures = failures
+        self.started = threading.Event()
+        self.calls = 0
+        self.models = []
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        with self._lock:
+            self.calls += 1
+            call = self.calls
+        self.started.set()
+        if self.release is not None and not self.release.wait(timeout=3.0):
+            raise RuntimeError("test model loader was not released")
+        if call <= self.failures:
+            raise RuntimeError("download failed")
+        model = _LifecycleModel()
+        self.models.append(model)
+        return model
 
 
 def test_labels_from_metadata_bearing_tflite(tmp_path):
@@ -119,14 +161,216 @@ def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
     }
 
 
-def test_pcm_buffering_publishes_window_end_timestamps(monkeypatch):
-    monkeypatch.setattr(
-        _FakeNode,
-        "destroy_subscription",
-        lambda self, subscription: self.subscriptions.remove(subscription),
-        raising=False,
-    )
+def test_plugin_constructor_does_not_load_model(monkeypatch):
+    def unexpected_build():
+        raise AssertionError("model loading must not run during construction")
 
+    monkeypatch.setattr(soundevent, "_build_model", unexpected_build)
+    executor = _FakeExecutor()
+    plugin = soundevent.SoundEventPlugin({}, executor)
+
+    assert plugin.dispatch("soundevent", {"action": "info"})["state"] == "idle"
+    assert executor.nodes == []
+
+
+def test_start_loads_model_in_background_and_replays_pending(monkeypatch):
+    release = threading.Event()
+    builder = _ModelBuilderProbe(release=release)
+    monkeypatch.setattr(soundevent, "_build_model", builder)
+    executor = _FakeExecutor()
+    plugin = soundevent.SoundEventPlugin({}, executor)
+
+    try:
+        started = time.monotonic()
+        result = plugin.dispatch(
+            "soundevent",
+            {"action": "start", "input_topic": "/mic/a", "instance_id": "a"},
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.1, "start must not wait for model download or initialization"
+        assert result["state"] == "loading"
+        assert result["input"] == "/mic/a"
+        assert result["output"] == "/mic/a/soundevent"
+        assert builder.started.wait(timeout=1.0)
+
+        info_started = time.monotonic()
+        info = plugin.dispatch(
+            "soundevent", {"action": "info", "instance_id": "a"}
+        )
+        assert time.monotonic() - info_started < 0.1
+        assert info["state"] == "loading"
+        assert info["topic_out"][0]["topic"] == "/mic/a/soundevent"
+
+        release.set()
+        assert _wait_until(
+            lambda: plugin.dispatch(
+                "soundevent", {"action": "info", "instance_id": "a"}
+            )["state"]
+            == "running"
+        )
+        assert len(executor.nodes) == 1
+        assert executor.nodes[0]._model is builder.models[0]
+    finally:
+        release.set()
+        plugin.dispatch("soundevent", {"action": "stop"})
+
+
+def test_concurrent_starts_share_one_model_load(monkeypatch):
+    release = threading.Event()
+    builder = _ModelBuilderProbe(release=release)
+    monkeypatch.setattr(soundevent, "_build_model", builder)
+    executor = _FakeExecutor()
+    plugin = soundevent.SoundEventPlugin({}, executor)
+    results = []
+
+    def start(index):
+        results.append(
+            plugin.dispatch(
+                "soundevent",
+                {
+                    "action": "start",
+                    "input_topic": "/mic/%d" % index,
+                    "instance_id": "instance-%d" % index,
+                },
+            )
+        )
+
+    threads = [threading.Thread(target=start, args=(index,)) for index in range(8)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+        assert len(results) == 8
+        assert all(result["state"] == "loading" for result in results)
+        assert builder.calls == 1
+
+        release.set()
+        assert _wait_until(
+            lambda: len(executor.nodes) == 8
+            and all(node.state == "running" for node in executor.nodes)
+        )
+        assert builder.calls == 1
+        assert len({id(node._model) for node in executor.nodes}) == 1
+    finally:
+        release.set()
+        plugin.dispatch("soundevent", {"action": "stop"})
+
+
+def test_stop_during_loading_cancels_pending_instance(monkeypatch):
+    release = threading.Event()
+    builder = _ModelBuilderProbe(release=release)
+    monkeypatch.setattr(soundevent, "_build_model", builder)
+    executor = _FakeExecutor()
+    plugin = soundevent.SoundEventPlugin({}, executor)
+
+    try:
+        plugin.dispatch(
+            "soundevent",
+            {"action": "start", "input_topic": "/mic/a", "instance_id": "a"},
+        )
+        plugin.dispatch(
+            "soundevent",
+            {"action": "start", "input_topic": "/mic/b", "instance_id": "b"},
+        )
+        assert builder.started.wait(timeout=1.0)
+        assert plugin.dispatch(
+            "soundevent", {"action": "stop", "instance_id": "a"}
+        ) == {"state": "idle"}
+
+        release.set()
+        assert _wait_until(
+            lambda: plugin.dispatch(
+                "soundevent", {"action": "info", "instance_id": "b"}
+            )["state"]
+            == "running"
+        )
+        assert plugin.dispatch(
+            "soundevent", {"action": "info", "instance_id": "a"}
+        )["state"] == "idle"
+        assert [node.input_topic for node in executor.nodes] == ["/mic/b"]
+    finally:
+        release.set()
+        plugin.dispatch("soundevent", {"action": "stop"})
+
+
+def test_model_load_failure_reports_error_and_next_start_retries(monkeypatch):
+    builder = _ModelBuilderProbe(failures=1)
+    monkeypatch.setattr(soundevent, "_build_model", builder)
+    executor = _FakeExecutor()
+    plugin = soundevent.SoundEventPlugin({}, executor)
+
+    try:
+        first = plugin.dispatch(
+            "soundevent",
+            {"action": "start", "input_topic": "/mic/a", "instance_id": "a"},
+        )
+        assert first["state"] == "loading"
+        assert _wait_until(
+            lambda: plugin.dispatch(
+                "soundevent", {"action": "info", "instance_id": "a"}
+            )["state"]
+            == "error"
+        )
+        failed = plugin.dispatch(
+            "soundevent", {"action": "info", "instance_id": "a"}
+        )
+        assert "download failed" in failed["error"]
+
+        retry = plugin.dispatch(
+            "soundevent",
+            {"action": "start", "input_topic": "/mic/a", "instance_id": "a"},
+        )
+        assert retry["state"] == "loading"
+        assert _wait_until(
+            lambda: plugin.dispatch(
+                "soundevent", {"action": "info", "instance_id": "a"}
+            )["state"]
+            == "running"
+        )
+        assert builder.calls == 2
+    finally:
+        plugin.dispatch("soundevent", {"action": "stop"})
+
+
+def test_start_replaces_an_errored_node(monkeypatch):
+    builder = _ModelBuilderProbe()
+    monkeypatch.setattr(soundevent, "_build_model", builder)
+    executor = _FakeExecutor()
+    plugin = soundevent.SoundEventPlugin({}, executor)
+
+    try:
+        plugin.dispatch(
+            "soundevent",
+            {"action": "start", "input_topic": "/mic/a", "instance_id": "a"},
+        )
+        assert _wait_until(
+            lambda: plugin.dispatch(
+                "soundevent", {"action": "info", "instance_id": "a"}
+            )["state"]
+            == "running"
+        )
+        failed = executor.nodes[0]
+        failed._stop_event.set()
+        failed._queue.put_nowait(None)
+        failed._thread.join(timeout=1.0)
+        failed.state = "error"
+
+        result = plugin.dispatch(
+            "soundevent",
+            {"action": "start", "input_topic": "/mic/a", "instance_id": "a"},
+        )
+        assert result["state"] == "running"
+        assert len(executor.nodes) == 1
+        assert executor.nodes[0] is not failed
+        assert failed.destroyed
+    finally:
+        plugin.dispatch("soundevent", {"action": "stop"})
+
+
+def test_pcm_buffering_publishes_window_end_timestamps(monkeypatch):
     class FakeModel:
         labels = ["Bark"]
 
