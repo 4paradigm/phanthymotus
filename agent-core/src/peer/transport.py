@@ -43,6 +43,28 @@ import config
 from peer import identity, store
 
 
+# Paths a *peer* calls, authenticated by Ed25519 signature rather than by the
+# operator's ACCESS_TOKEN. auth.py consults this instead of hardcoding a prefix.
+#
+# Single source of truth on purpose: the exemption list and the routes drifted
+# once already — tool-proxy and delegation endpoints were added outside the
+# '/inbox/' prefix auth.py knew about, so every peer request to them got 401
+# while the endpoints themselves were perfectly correct.
+PEER_FACING_PATHS = frozenset({
+    '/api/peer/inbox/pair_request',
+    '/api/peer/inbox/ping',
+    '/api/peer/inbox/message',
+    '/api/peer/tools/list',
+    '/api/peer/tools/call',
+    '/api/peer/delegate',
+})
+
+
+def is_peer_facing(path: str) -> bool:
+    """True if `path` authenticates by peer signature, not ACCESS_TOKEN."""
+    return path in PEER_FACING_PATHS
+
+
 HEADER_PEER_ID = 'x-motus-peer-id'
 HEADER_TIMESTAMP = 'x-motus-timestamp'
 HEADER_NONCE = 'x-motus-nonce'

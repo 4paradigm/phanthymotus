@@ -62,22 +62,36 @@ class TestApiImports(unittest.TestCase):
         ):
             self.assertIn(expected, effective, f'route missing: {expected}')
 
-    def test_inbox_paths_match_auth_exemption(self):
-        """peer 侧路径必须落在 auth.py 豁免的前缀下。
+    def test_every_peer_facing_path_is_exempt_from_token_auth(self):
+        """所有 peer 侧端点都必须被 auth.py 豁免，不只是 /inbox/ 那几个。
 
-        豁免前缀与实际路径若对不上，签名请求会被要求 ACCESS_TOKEN 而 401，
-        且两边都"看起来是对的"。
+        真实故障：工具代理和委托端点放在 /inbox/ 之外，而 auth.py 当时硬编码
+        了 '/api/peer/inbox/' 前缀，于是 peer 的签名请求全部 401 —— 端点本身
+        完全正确，鉴权层却把它们挡在门外。
+
+        这里断言的是「豁免清单 ⊇ 实际 peer 侧路由」，而不是某个前缀，
+        所以以后新增 peer 端点忘了登记时会在这里失败。
         """
+        import api.peer
+        from peer.transport import PEER_FACING_PATHS, is_peer_facing
+
+        effective = {'/api' + r.path for r in api.peer.router.routes}
+        for p in PEER_FACING_PATHS:
+            self.assertIn(p, effective,
+                          f'{p} is exempt from auth but no route serves it')
+            self.assertTrue(is_peer_facing(p))
+
+        # dashboard 端点绝不能被误豁免
+        for p in ('/api/peer/identity', '/api/peer/paired', '/api/peer/pair/start',
+                  '/api/peer/pair/confirm', '/api/peer/discovered'):
+            self.assertFalse(is_peer_facing(p),
+                             f'{p} is operator-facing and must still require ACCESS_TOKEN')
+
+    def test_client_constants_have_routes(self):
+        """客户端发送用的路径常量必须真的有路由服务，否则静默 404。"""
         import api.peer
         from channel.adapters import lan
         effective = {'/api' + r.path for r in api.peer.router.routes}
-        # auth.py 豁免的是这个前缀
-        exempt_prefix = '/api/peer/inbox/'
-        inbox = {p for p in effective if '/inbox/' in p}
-        self.assertTrue(inbox, 'no inbox routes registered')
-        for p in inbox:
-            self.assertTrue(p.startswith(exempt_prefix), f'{p} not covered by auth exemption')
-        # lan adapter 用来发送的常量也必须落在同一前缀下
         for const in (lan.INBOX_MESSAGE_PATH, lan.INBOX_PING_PATH):
             self.assertIn(const, effective,
                           f'lan adapter posts to {const}, which no route serves')

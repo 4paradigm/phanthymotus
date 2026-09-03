@@ -84,9 +84,16 @@ async def auth_middleware(request: Request, call_next):
     # /ws/mic stays open (internal browser mic)
     if path == '/ws/mic':
         return await call_next(request)
-    # Peer inbox — authenticated by Ed25519 signature, not ACCESS_TOKEN
-    if path.startswith('/api/peer/inbox/'):
-        return await call_next(request)
+    # Peer-facing endpoints — authenticated by Ed25519 signature, not ACCESS_TOKEN.
+    # The list lives in peer/transport.py so it cannot drift from the routes;
+    # a hardcoded '/api/peer/inbox/' prefix here previously 401'd the tool-proxy
+    # and delegation endpoints, which are equally peer-facing.
+    try:
+        from peer.transport import is_peer_facing
+        if is_peer_facing(path):
+            return await call_next(request)
+    except ImportError:
+        pass
 
     # Check token
     token = _extract_token(request)
