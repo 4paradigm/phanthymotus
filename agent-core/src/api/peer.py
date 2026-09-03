@@ -633,14 +633,77 @@ async def call_tool(req: Request):
             f'this agent\'s canvas. Connect it there to let a peer request it.'
         )
 
-    # Call the tool
+    # Announce start and end on the activity stream.
+    #
+    # Without this a peer using this machine's tools is invisible to the person
+    # standing next to it: the call never enters the collector, never reaches the
+    # LLM's context and never touches conversation history — it only ever appeared
+    # in stdout. peer/tools.py claimed "same audit trail" as a human calling
+    # through a channel; that was not true.
+    #
+    # Shaped like ACP's own start/finish pair so the dashboard can pair them by
+    # `action_id`. For a tool that returns immediately the two arrive together;
+    # for an async one the driver's later /api/acp/complete carries the real end.
+    # Only tools that *act* are announced. A viewer polling battery or a camera
+    # frame would otherwise flood the stream, and the point of the announcement is
+    # that someone standing next to the robot learns a peer made it do something —
+    # reading its state is not that.
+    notify = not peer_tools.is_read_only(tool_name)
+
+    from api.motus_stream import push_event
+    peer_row = store.get(peer_id) or {}
+    who = peer_row.get('display_name') or peer_id[:12]
+    started = time.time()
+
+    async def _emit(kind: str, extra: dict) -> None:
+        if not notify:
+            return
+        try:
+            await push_event({
+                'type': kind,
+                'mcp_id': f'peer:{peer_id[:12]}',
+                'payload': {'peer_id': peer_id, 'peer': who, 'tool': tool_name,
+                            'action': arguments.get('action', ''), **extra},
+            })
+        except Exception as exc:      # 可见性不该影响调用本身
+            print(f'[peer] activity event {kind} failed: {type(exc).__name__}: {exc}')
+
+    await _emit('peer_tool_call', {})
     try:
         result = await mcp_client.call_tool(tool_name, arguments)
         store.touch(peer_id)
+        await _emit('peer_tool_result', {
+            'ok': True,
+            'elapsed_ms': round((time.time() - started) * 1000),
+            'action_id': _action_id_of(result),
+        })
         return {'result': result, 'error': None}
     except Exception as e:
+        await _emit('peer_tool_result', {
+            'ok': False, 'error': str(e),
+            'elapsed_ms': round((time.time() - started) * 1000),
+        })
         return {'result': None, 'error': str(e)}
 
+
+
+def _action_id_of(result) -> str:
+    """The ACP action_id in a tool result, or ''.
+
+    Async tools answer `{"status": "queued", "action_id": ...}`, sometimes wrapped
+    in MCP content items and sometimes as a JSON string. Pulled out so the
+    start/end events can be paired with the driver's later completion callback.
+    """
+    import json as _json
+    payload = result
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        payload = payload[0].get('text', '')
+    if isinstance(payload, str):
+        try:
+            payload = _json.loads(payload)
+        except Exception:
+            return ''
+    return str(payload.get('action_id', '')) if isinstance(payload, dict) else ''
 
 # ── task delegation (peer-facing, Ed25519 signature) ─────────────────────────
 
