@@ -11,6 +11,7 @@ test_peer_visibility.py — agent 要能看见 peer 的存在。
 
 import asyncio
 import os
+import time
 import pathlib
 import sys
 import tempfile
@@ -22,10 +23,16 @@ os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
 
 
 class TestPeerListTool(unittest.TestCase):
-    def _run(self, peers, endpoints=None, discovered=(), **kw):
+    def _run(self, peers, endpoints=None, discovered=(), advert_age=None, **kw):
         from peer import delegation
         endpoints = endpoints or {}
+        # Liveness needs a discovery advert too: "paired" and "reachable now" are
+        # separate facts, and peer_list has to be able to say which.
+        advert = None
+        if advert_age is not None:
+            advert = type('A', (), {'last_seen': time.time() - advert_age})()
         with mock.patch('peer.store.list_peers', return_value=peers), \
+             mock.patch('peer.registry.registry.get', return_value=advert), \
              mock.patch('peer.registry.registry.endpoints_for',
                         side_effect=lambda pid: endpoints.get(pid, [])), \
              mock.patch('peer.registry.registry.discovered', return_value=list(discovered)):
@@ -33,17 +40,20 @@ class TestPeerListTool(unittest.TestCase):
 
     def test_names_a_paired_peer_and_its_role(self):
         out = self._run(
-            [{'peer_id': 'dd39ab', 'display_name': 'orin6', 'role': 'operator'}],
+            [{'peer_id': 'dd39ab', 'display_name': 'orin6', 'role': 'operator',
+              'last_seen': time.time() - 2}],
             {'dd39ab': ['https://10.0.0.2:15678']},
+            advert_age=5,
         )
         self.assertIn('orin6', out)
         self.assertIn('dd39ab', out)
         self.assertIn('operator', out)
-        self.assertIn('reachable', out)
+        self.assertIn('online', out)
 
     def test_says_so_when_a_paired_peer_has_no_address(self):
         """配对了但联系不上，和没配对是两回事，答案里必须能分清。"""
         out = self._run([{'peer_id': 'x', 'display_name': 'off', 'role': 'viewer'}])
+        self.assertIn('offline', out)
         self.assertIn('no known address', out)
 
     def test_no_paired_peers_is_stated_plainly(self):

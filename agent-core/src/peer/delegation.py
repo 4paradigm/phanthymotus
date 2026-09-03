@@ -35,7 +35,7 @@ current_hop_count: contextvars.ContextVar[int] = contextvars.ContextVar(
 
 
 async def peer_delegate(
-    peer_id: Annotated[str, 'Paired peer to hand the task to. Use the peer_id from the peers list.'],
+    peer_id: Annotated[str, 'Paired peer to hand the task to — the name shown in the peers list, or its peer_id.'],
     goal: Annotated[str, 'What the remote agent should accomplish, stated as a complete instruction.'],
     timeout_s: Annotated[float, 'Seconds to wait for the result before giving up.'] = 120.0,
     max_rounds: Annotated[int, 'Maximum reasoning rounds the remote agent may use.'] = 10,
@@ -49,11 +49,15 @@ async def peer_delegate(
     from peer import store as _store, transport as _transport
     from peer.registry import registry as _registry
 
-    peer = _store.get(peer_id)
+    # Accept a name as well as a peer_id: the environment snapshot carries names,
+    # because a 32-char hex fingerprint per peer costs more tokens than the rest
+    # of the line, so a name is what the model has when it decides to delegate.
+    # Names collide, so peer/naming.py renders and resolves them as one contract.
+    from peer import naming as _naming
+    peer, why = _naming.resolve(peer_id, _store.list_peers())
     if peer is None:
-        paired = ', '.join(f'{p["display_name"] or p["peer_id"][:12]}={p["peer_id"]}'
-                           for p in _store.list_peers()) or '(none)'
-        return f'Error: unknown peer "{peer_id}". Paired peers: {paired}'
+        return f'Error: {why}'
+    peer_id = peer['peer_id']
     if peer['role'] == 'blocked':
         return f'Error: peer "{peer_id}" is blocked.'
 
@@ -162,13 +166,22 @@ async def peer_list(
     from peer import store as _store
     from peer.registry import registry as _registry
 
+    from peer import liveness as _liveness, naming as _naming
+
     lines = []
     paired = _store.list_peers()
+    lab = _naming.labels(paired)
     for p in paired:
-        endpoints = _registry.endpoints_for(p['peer_id'])
-        name = p['display_name'] or p['peer_id'][:12]
-        reach = 'reachable' if endpoints else 'no known address right now'
-        lines.append(f'- {name} (peer_id={p["peer_id"]}, role={p["role"]}, {reach})')
+        live = _liveness.liveness(p)
+        if live['online']:
+            state = 'online'
+        elif live['endpoints']:
+            # An address is known but nothing has been heard: paired-and-switched-off
+            # looks exactly like this, and it is not the same as never paired.
+            state = f'offline, last contact {_liveness.describe_age(live["contact_age_s"])}'
+        else:
+            state = 'offline, no known address'
+        lines.append(f'- {lab[p["peer_id"]]} (peer_id={p["peer_id"]}, role={p["role"]}, {state})')
     if not paired:
         lines.append('- (no paired agents)')
 
@@ -186,6 +199,7 @@ async def peer_list(
             lines.append('No unpaired agents discovered.')
 
     lines.append('')
+    lines.append('peer_delegate takes either the name shown above or the peer_id.')
     lines.append('What can be done with a paired agent: send it a message, call the tools '
                  'its role allows, read the topics it shares, or hand it a task with '
                  'peer_delegate. A peer can never drive an actuator here directly — an '
