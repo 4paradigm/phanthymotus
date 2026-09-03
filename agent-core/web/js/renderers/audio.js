@@ -36,6 +36,9 @@ export const AudioRenderer = {
   _nextStartTime: 0,
   _prebufCount:   0,
   _prebufQueue:   null,
+  // WebKit needs a source started inside the user gesture before it will emit
+  // anything — see _unlockOutput. Once done it holds for the context's life.
+  _unlocked:      false,
   // Scheduled buffers, so ⏸ can actually stop them. Created per instance in
   // mount(): renderers are cloned with Object.assign, so a Set built here on
   // the prototype would be shared and pausing one card would cut another's audio.
@@ -157,11 +160,22 @@ export const AudioRenderer = {
 
   _startPlay() {
     if (!this._audioCtx) {
-      this._audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      // Safari only accepted a custom sampleRate from 14.1 on, and throws
+      // rather than ignoring it. Falling back to the hardware rate costs
+      // nothing here: every buffer carries its own rate, so the context
+      // resamples them either way.
+      try {
+        this._audioCtx = new Ctor({ sampleRate: 16000 });
+      } catch {
+        this._audioCtx = new Ctor();
+      }
     }
     if (this._audioCtx.state === 'suspended') {
       this._audioCtx.resume();
     }
+    // Must happen inside the click handler — see _unlockOutput.
+    this._unlockOutput();
 
     this._playing = true;
     this._nextStartTime = 0;
@@ -195,6 +209,30 @@ export const AudioRenderer = {
       this._playBtn.title = '播放实时音频';
       this._playBtn.classList.remove('active');
     }
+  },
+
+  /**
+   * Start one silent buffer, synchronously, inside the gesture that called us.
+   *
+   * WebKit gates audio output on a source having actually started during a user
+   * gesture — `resume()` alone leaves the context reporting 'running' while
+   * everything scheduled afterwards plays silently. Chrome does not need this,
+   * which is exactly how this presented: sound in Chrome, none in Safari, same
+   * page and same stream.
+   *
+   * This renderer hits that gate squarely: _PREBUF_CHUNKS holds the first ~500ms
+   * back, so the first real source.start() lands well outside the click.
+   */
+  _unlockOutput() {
+    const ctx = this._audioCtx;
+    if (!ctx || this._unlocked) return;
+    try {
+      const source = ctx.createBufferSource();
+      source.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+      source.connect(ctx.destination);
+      source.start(0);
+      this._unlocked = true;
+    } catch { /* nothing to lose: playback is attempted regardless */ }
   },
 
   _flushPrebuf() {
