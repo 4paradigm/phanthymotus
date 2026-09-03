@@ -15,7 +15,7 @@ import { MappingRenderer }   from './renderers/mapping.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
-import { resolveDerivedTopics } from './topic-derive.js';
+import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
 const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
@@ -88,7 +88,19 @@ async function _fetchAndBuild() {
   const canvasTools = new Set(canvasCards.map(c => `${c.mcpId}:${c.toolName}`));
 
   // The layout is not a reliable record of derived topics — see topic-derive.js.
-  await resolveDerivedTopics(canvasCards, connections);
+  // multiInstance marks the tools whose topic is derived rather than declared,
+  // so those are re-asked even when the layout already has a topic for them: a
+  // card that has lost its inbound connection still carries the topic derived
+  // from it, and nothing else would ever correct it.
+  const isDerived = (card) => {
+    const mcp = mcps.find(m => m.id === card.mcpId);
+    const tool = (mcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === card.toolName);
+    return !!(typeof tool === 'object' && tool.multiInstance);
+  };
+  await resolveDerivedTopics(canvasCards, connections, { isDerived });
+  // A connection's fromTopic is read below as a topic to subscribe to, and it is
+  // just as stale as the card topic it was copied from — sync it before use.
+  syncConnectionTopics(canvasCards, connections);
 
   const topicSet = new Set();
   _topicMcpMap = {};  // reset

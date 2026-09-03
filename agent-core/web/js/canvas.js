@@ -1977,8 +1977,17 @@ function _revalidateDerivedTopics() {
     // persisted — so re-derive it whenever the card has an input to derive from.
     // Once per card per page load: _fetchTopicsFromDriver drops a repeat request
     // for the same input.
+    // `want` is '' both when nothing feeds this card and when its source has not
+    // resolved yet, and those want opposite treatment: the first should be asked
+    // now (the driver answers with its default output), the second must wait or
+    // it would adopt that default over the topic it is about to derive. Treating
+    // them alike is what this function was written to fix but did not: TTS lost
+    // its inbound connection, so want was '' with hasReal true, and the guard
+    // below skipped it — the card kept '/remote_control/message/tts' while the
+    // driver published on '/perception/tts', and the panel stayed empty.
+    const inputless = !_connections.some(c => c.toCardId === card.id);
     if (known === undefined) {
-      if (want || !hasReal) _fetchTopicsFromDriver(card, want);
+      if (want || inputless || !hasReal) _fetchTopicsFromDriver(card, want);
       continue;
     }
     if (known !== want) _fetchTopicsFromDriver(card, want);

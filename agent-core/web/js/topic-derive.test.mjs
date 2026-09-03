@@ -195,3 +195,99 @@ test('static tool may adopt a format-only payload when it has nothing yet', () =
   assert.equal(shouldAdoptLiveTopics(FORMAT_ONLY, [], false), true);
   assert.equal(shouldAdoptLiveTopics(FORMAT_ONLY, REAL, false), false);
 });
+
+// ── input-less cards must be re-asked ────────────────────────────────────────
+//
+// Straight from R1's saved layout: the TTS card was once fed by remote_message
+// and kept the topic derived then ('/remote_control/message/tts'). That
+// connection was later deleted, so the plugin restarted with no input topic and
+// publishes on '/perception/tts'. Nothing re-derived the card — it had a topic,
+// so it counted as resolved, and it had no input, so it counted as "waiting on
+// an upstream". The dashboard subscribed where nothing is published: the robot
+// spoke, the panel stayed empty, the play page was silent.
+
+import { hasInboundConnection } from './topic-derive.js';
+
+const R1_STALE_TTS = () => ({
+  id: 'card-tts', mcpId: 'mcp-perc', toolName: 'tts',
+  topicOut: [{ topic: '/remote_control/message/tts', format: 'audio/pcm-16k' }],
+});
+
+/** Stands in for the driver: `info` answers '/perception/tts' for an empty input. */
+function driverStub(calls) {
+  return async (_url, init) => {
+    const { input_topic: input, } = JSON.parse(init.body).arguments;
+    const tool = JSON.parse(init.body).tool;
+    calls.push(input);
+    // Mirrors the plugin: `${input}/${tool}` when fed, else its own default.
+    return { json: async () => ({ data: { topic_out: [{
+      topic: input ? `${input}/${tool}` : '/perception/tts', format: 'audio/pcm-16k',
+    }] } }) };
+  };
+}
+
+test('an input-less card with a stale derived topic gets corrected', async () => {
+  const card = R1_STALE_TTS();
+  const calls = [];
+  await resolveDerivedTopics([card], [], { fetchImpl: driverStub(calls), isDerived: () => true });
+  assert.deepEqual(calls, ['']);
+  assert.equal(card.topicOut[0].topic, '/perception/tts');
+});
+
+test('a card whose source has not resolved yet is not asked prematurely', async () => {
+  // Asking now would get the driver's default and overwrite it a moment later.
+  const src = { id: 'card-mic', mcpId: 'mcp-r1', toolName: 'mic', topicOut: [] };
+  const card = { id: 'card-asr', mcpId: 'mcp-perc', toolName: 'asr', topicOut: [] };
+  const conns = [{ fromCardId: 'card-mic', toCardId: 'card-asr', fromPortIdx: '0' }];
+  const calls = [];
+  await resolveDerivedTopics([src, card], conns,
+    { fetchImpl: driverStub(calls), isDerived: c => c.id === 'card-asr' });
+  assert.ok(!calls.includes(''), `asr must not be asked with an empty input, got ${JSON.stringify(calls)}`);
+});
+
+test('a connected card still derives from its source', async () => {
+  const src = { id: 'card-mic', mcpId: 'mcp-r1', toolName: 'mic',
+                topicOut: [{ topic: '/ubuntu/mic/audio', format: 'audio/pcm-16k' }] };
+  const card = { id: 'card-asr', mcpId: 'mcp-perc', toolName: 'asr', topicOut: [] };
+  const conns = [{ fromCardId: 'card-mic', toCardId: 'card-asr', fromPortIdx: '0' }];
+  await resolveDerivedTopics([src, card], conns,
+    { fetchImpl: driverStub([]), isDerived: c => c.id === 'card-asr' });
+  assert.equal(card.topicOut[0].topic, '/ubuntu/mic/audio/asr');
+});
+
+test('re-confirming an already-correct topic does not loop', async () => {
+  const card = { id: 'card-tts', mcpId: 'mcp-perc', toolName: 'tts',
+                 topicOut: [{ topic: '/perception/tts', format: 'audio/pcm-16k' }] };
+  const calls = [];
+  const changed = await resolveDerivedTopics([card], [],
+    { fetchImpl: driverStub(calls), isDerived: () => true });
+  assert.equal(calls.length, 1, 'asked exactly once');
+  assert.deepEqual(changed, [], 'nothing changed, so nothing reported as resolved');
+});
+
+test('hasInboundConnection distinguishes the two empty-input cases', () => {
+  const card = { id: 'a' };
+  assert.equal(hasInboundConnection(card, []), false);
+  assert.equal(hasInboundConnection(card, [{ toCardId: 'a', fromCardId: 'b' }]), true);
+});
+
+// ── connection fromTopic follows its source ──────────────────────────────────
+
+import { syncConnectionTopics } from './topic-derive.js';
+
+test('a connection stops advertising its source\'s old topic', () => {
+  const cards = [{ id: 'card-tts', topicOut: [{ topic: '/perception/tts' }] }];
+  const conns = [{ fromCardId: 'card-tts', toCardId: 'card-spk', fromPortIdx: '0',
+                   fromTopic: '/remote_control/message/tts' }];
+  assert.equal(syncConnectionTopics(cards, conns).length, 1);
+  assert.equal(conns[0].fromTopic, '/perception/tts');
+});
+
+test('an unresolved source leaves the persisted value alone', () => {
+  // It is the only evidence the last-resort pass has; blanking it loses it.
+  const cards = [{ id: 'card-tts', topicOut: [] }];
+  const conns = [{ fromCardId: 'card-tts', toCardId: 'card-spk', fromPortIdx: '0',
+                   fromTopic: '/remote_control/message/tts' }];
+  assert.deepEqual(syncConnectionTopics(cards, conns), []);
+  assert.equal(conns[0].fromTopic, '/remote_control/message/tts');
+});
