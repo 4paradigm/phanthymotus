@@ -224,27 +224,5 @@ class Nav2ContractTest(unittest.TestCase):
             second["topic_in"][0]["topic"], "/ubuntu/navigation/odom"
         )
 
-    def test_g1_test_container_script_has_no_canvas_auth_gate(self) -> None:
-        script = (
-            ACTUCORE_ROOT
-            / "plugins"
-            / "navigation"
-            / "deploy"
-            / "scripts"
-            / "owner-start-g1-test-containers.sh"
-        ).read_text(encoding="utf-8")
-        self.assertNotIn("CORE_ACCESS_TOKEN", script)
-        self.assertNotIn("/api/config/project-running", script)
-        self.assertNotIn("require_canvas_stopped", script)
-        self.assertIn('OWNER_LABEL="com.phanthymotus.test-owner"', script)
-        # ActuCore 只占一个 MCP 端口；15721 是 perception 的 WebSocket ASR，
-        # 卡片迁走后不该再出现在这里。
-        self.assertIn("require_port_free 15730", script)
-        self.assertNotIn("require_port_free 15720", script)
-        self.assertNotIn("require_port_free 15721", script)
-        self.assertNotIn("FAST_LIVO2_CONTAINER", script)
-        self.assertNotIn("NAV2_CONTAINER", script)
-
-
 if __name__ == "__main__":
     unittest.main()

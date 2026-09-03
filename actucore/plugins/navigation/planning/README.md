@@ -267,14 +267,8 @@ rviz2 -d actucore/plugins/navigation/runtime/g1_nav2/rviz/nav2.rviz
 ## 构建与部署
 
 Nav2 ROS 包随统一 ActuCore 镜像从源码构建，不存在独立 Nav2 service 或镜像。
-G1 临时验证从仓库根目录执行：
-
-```bash
-bash actucore/plugins/navigation/deploy/scripts/deploy-g1.sh
-```
-
-脚本只构建并启动一个 ActuCore 测试容器，不执行 Git 同步、Canvas action
-或机器人动作。正式 `actucore/deploy/service.yml` 同样只有一个 service。
+从仓库根目录执行 `./deploy/build_actucore.sh --mirror tuna` 生成日常镜像。
+正式 `actucore/deploy/service.yml` 只有一个 service；现场容器编排不在卡片源码中维护。
 
 Canvas 启动时 Nav2 只等待同容器 runtime 的 DDS 控制面，不等待 odom/cloud，避免
 与 FAST-LIVO2 的 `start_mapping` action 形成生命周期环形等待。真正执行

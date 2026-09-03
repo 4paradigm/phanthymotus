@@ -428,29 +428,5 @@ class FastLivo2ContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('if action == "stop_mapping"', mapping_backend)
 
-    def test_g1_deploy_entrypoint_stays_narrow(self) -> None:
-        deploy_script = (
-            ACTUCORE_ROOT
-            / "plugins"
-            / "navigation"
-            / "deploy"
-            / "scripts"
-            / "deploy-g1.sh"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn(
-            "./deploy/build_actucore.sh --mirror tuna", deploy_script
-        )
-        self.assertNotIn("--variant navigation", deploy_script)
-        self.assertNotIn("build-companion.sh", deploy_script)
-        self.assertNotIn("docker compose", deploy_script)
-        self.assertIn("STAGE=stop", deploy_script)
-        self.assertIn("STAGE=preflight", deploy_script)
-        self.assertIn("STAGE=start", deploy_script)
-        self.assertNotIn('${ACTUCORE_IMAGE:-', deploy_script)
-        self.assertNotIn("git pull", deploy_script)
-        self.assertNotIn("git reset", deploy_script)
-
-
 if __name__ == "__main__":
     unittest.main()

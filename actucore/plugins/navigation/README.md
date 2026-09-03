@@ -188,15 +188,9 @@ ROS 2 topic 不做“定时清理”：DDS `KEEP_LAST` 会自动淘汰旧样本�
 FAST-LIVO2 内部 LiDAR/IMU buffer span、adapter latest-only 丢弃数和 rosbag
 录制覆盖率；对应字段已经进入上述状态和故障摘要。
 
-真机每个阶段运行 300 秒，只读采集容器 CPU/内存、Jetson `tegrastats`、进程
-CPU 和完整 pipeline 状态：
-
-```bash
-DURATION_SEC=300 \
-  bash actucore/plugins/navigation/deploy/scripts/collect-navigation-diagnostics.sh
-```
-
-依次测量静止定位、同一路线导航，并在停卡后分别配置：两项均关闭、只开
+真机每个阶段运行 300 秒，由现场的只读诊断工具采集容器 CPU/内存、
+Jetson `tegrastats`、进程 CPU 和完整 pipeline 状态。依次测量静止定位、
+同一路线导航，并在停卡后分别配置：两项均关闭、只开
 `map_view_enabled`、只开 `fault_capture_enabled`、两项均开启。每阶段记录
 CPU 平均/P95、Driver LiDAR 发布率、mapper callback/处理率、最大帧间隔、
 adapter 丢弃和 odom discontinuity 次数。先用跨层计数确认丢帧发生在哪一层，
@@ -356,26 +350,9 @@ ActuCore 镜像的 C++ 并行编译数；默认值仍为 4。
 digest。它不是运行时 service，也不注册 Resource Center。日常构建成功后脚本输出
 `ACTUCORE_BUILD_DURATION_SEC=<秒数>`，用于比较依赖精简前后的真机构建耗时。
 
-G1 临时验收只创建一个容器。将构建输出的精确镜像名传入：
-
-```bash
-export ACTUCORE_IMAGE=local/phanthy-motus/actucore:<exact-tag>
-STAGE=preflight bash actucore/plugins/navigation/deploy/scripts/owner-start-g1-test-containers.sh
-STAGE=start bash actucore/plugins/navigation/deploy/scripts/owner-start-g1-test-containers.sh
-```
-
-在北京 G1 上从当前 PR 分支的仓库根目录一次完成默认构建和测试容器替换：
-
-```bash
-bash actucore/plugins/navigation/deploy/scripts/deploy-g1.sh
-```
-
-`deploy-g1.sh` 不实现另一套构建逻辑；它只调用仓库默认的
-`./deploy/build_actucore.sh --mirror tuna`，使用仓库锁定的默认基础镜像，再调用
-上述容器生命周期脚本。
-旧容器只有带 `com.phanthymotus.test-owner=navigation-card`，或迁移前已知值
-`com.phanthymotus.test-owner=nav2-card` 时才会被替换；其他 owner 仍会安全拒绝。
-脚本不发送导航目标或速度指令。
+临时验收脚本属于现场环境，不随卡片源码发布。日常镜像统一使用仓库默认的
+`./deploy/build_actucore.sh --mirror tuna` 构建；现场脚本只应负责环境预检和替换
+单个 ActuCore 容器，不得发送导航目标或速度指令。
 
 正式 `actucore/deploy/service.yml` 也只有 `actucore` 一个 service。地图和
 录制目录作为该容器的持久化 volume；不再定义 `fast_livo2` 或 `nav2` service。
