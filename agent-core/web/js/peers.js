@@ -170,20 +170,58 @@ function _renderPending(sessions) {
     </section>`;
 }
 
+/**
+ * Status of one paired peer, as three distinct facts rather than one dot.
+ *
+ * The row used to carry a single dot whose colour encoded the *role*, sitting
+ * right next to a dropdown that already said "Operator" — so it read as a status
+ * light, and an `operator` peer looked green whether it was running, idle or
+ * switched off. Three states are worth telling apart:
+ *
+ *   online + agent on   — can be given work
+ *   online + agent off  — reachable, answers tool calls and shares state, but
+ *                         /delegate returns 503 (智能控制 is off over there)
+ *   offline             — nothing has been heard from it
+ */
+function _peerStatus(p) {
+  if (!p.online) {
+    const age = p.contact_age_s == null ? '从未联系过'
+      : `最后联系 ${_describeAge(p.contact_age_s)}`;
+    return { state: 'offline', text: '离线', title: age };
+  }
+  if (p.agent_running === false) {
+    return { state: 'idle', text: '在线 · 智能控制未开',
+             title: '可查状态、可被调用工具，但接不了委派的任务' };
+  }
+  if (p.agent_running === true) {
+    return { state: 'online', text: '在线', title: '智能控制已开，可以协同' };
+  }
+  return { state: 'online', text: '在线', title: '对方未上报智能控制状态' };
+}
+
+function _describeAge(seconds) {
+  if (seconds < 60) return `${Math.round(seconds)} 秒前`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟前`;
+  return `${(seconds / 3600).toFixed(1)} 小时前`;
+}
+
 function _renderPaired(peers) {
   const rows = peers.length
-    ? peers.map((p) => `
+    ? peers.map((p) => {
+        const st = _peerStatus(p);
+        return `
         <div class="user-row" data-peer-id="${_escAttr(p.peer_id)}">
-          <span class="user-role-dot" data-role="${_escAttr(p.role)}" title="${_escAttr(p.role)}"></span>
+          <span class="peer-status-dot" data-state="${_escAttr(st.state)}" title="${_escAttr(st.title)}"></span>
           <span class="user-identity" title="${_escAttr(p.peer_id)}">
-            <span class="user-name">${_esc(p.display_name || p.peer_id.slice(0, 12))}</span>
-            <span class="user-id">${_esc(p.peer_id.slice(0, 12))}…</span>
+            <span class="user-name">${_esc(p.label || p.display_name || p.peer_id.slice(0, 12))}</span>
+            <span class="user-id" title="${_escAttr(st.title)}">${_esc(st.text)}</span>
           </span>
           <select class="user-role-select" data-peer-role>
             ${_ROLE_ORDER.map((r) => `<option value="${r}" ${r === p.role ? 'selected' : ''}>${r[0].toUpperCase()}${r.slice(1)}</option>`).join('')}
           </select>
           <button class="user-remove" data-peer-unpair title="解除配对">×</button>
-        </div>`).join('')
+        </div>`;
+      }).join('')
     : '<div class="channel-empty">还没有配对的机器人。在下方「发现到的机器人」里发起配对。</div>';
 
   return `
@@ -207,7 +245,11 @@ function _renderDiscovered(found) {
           </span>
           <button class="btn-primary btn-sm" data-peer-pair>配对</button>
         </div>`).join('')
-    : '<div class="channel-empty">附近没有发现其他机器人。确认对方也已开启多机协同、且在同一局域网。</div>';
+    : (found.length
+        // 只剩已配对的时候，说"没发现"会让人以为发现坏了 —— 图里就是这样：
+        // 唯一在附近的机器人正好已经配对，这一段却像在报故障。
+        ? `<div class="channel-empty">附近的 ${found.length} 台机器人都已配对。</div>`
+        : '<div class="channel-empty">附近没有发现其他机器人。确认对方也已开启多机协同、且在同一局域网。</div>');
 
   return `
     <section class="peer-section">

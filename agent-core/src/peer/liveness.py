@@ -20,6 +20,13 @@ Two independent signals, because each alone lies in a different direction:
 
 Online means *either* holds. Both are reported so a caller can say which, rather
 than reducing everything to one boolean the reader has to guess the meaning of.
+
+**Reachable is not the same as able to take work.** State sharing pushes whether
+or not the agent loop is running, so a peer with 智能控制 switched off is exactly
+as reachable as one that can accept a delegation — and `/api/peer/delegate` then
+answers 503, because delegation needs the subagent manager that only exists once
+the loop is up. `agent_running` carries the peer's own answer, so the caller can
+tell "cannot be reached" from "reached, but not accepting tasks".
 """
 
 import time
@@ -57,11 +64,18 @@ def liveness(peer: dict) -> dict:
     advert_age = (time.time() - advert.last_seen) if advert else None
     recently_seen = advert_age is not None and advert_age <= ADVERT_FRESH_S
 
+    # None rather than False when the peer has never told us: an older peer that
+    # does not send the field is not the same as one that says its loop is off.
+    from peer import dds_state
+    shared = dds_state.get_peer_topics().get(peer_id) or {}
+    agent_running = shared.get('agent_running')
+
     return {
         'online': bool(recently_heard or recently_seen),
         'contact_age_s': age,
         'advert_age_s': advert_age,
         'endpoints': endpoints,
+        'agent_running': agent_running if isinstance(agent_running, bool) else None,
     }
 
 

@@ -119,16 +119,60 @@ class TestNaming(unittest.TestCase):
         self.assertIn('Orin5', why)
 
 
+class TestAgentRunningIsSeparateFromReachable(unittest.TestCase):
+    """可达 ≠ 能接活。
+
+    这是真机上看到的：Orin6 的智能控制是关的，却在 Orin5 上显示在线 —— 因为状态
+    推送与控制开关无关，每 5s 照推。而 /api/peer/delegate 需要随主事件循环才建起来
+    的 subagent manager，所以那台机器会 503。只报 online 就等于让 agent 承诺一件
+    做不到的事。
+    """
+
+    def _live(self, shared):
+        with mock.patch('peer.registry.registry.get', return_value=_Advert(5)), \
+             mock.patch('peer.registry.registry.endpoints_for', return_value=['https://x']), \
+             mock.patch('peer.dds_state.get_peer_topics', return_value=shared):
+            return liveness.liveness(_peer('a' * 32, 'A', time.time() - 2))
+
+    def test_reports_the_peers_own_answer(self):
+        self.assertIs(self._live({'a' * 32: {'agent_running': False}})['agent_running'], False)
+        self.assertIs(self._live({'a' * 32: {'agent_running': True}})['agent_running'], True)
+
+    def test_never_told_is_unknown_not_off(self):
+        """旧版本 peer 不上报这个字段；把"没说"当成 off 会白白放弃一个可用的 peer。"""
+        self.assertIsNone(self._live({})['agent_running'])
+        self.assertIsNone(self._live({'a' * 32: {}})['agent_running'])
+
+    def test_an_unreachable_peer_is_still_offline_regardless(self):
+        with mock.patch('peer.registry.registry.get', return_value=None), \
+             mock.patch('peer.registry.registry.endpoints_for', return_value=[]), \
+             mock.patch('peer.dds_state.get_peer_topics', return_value={'a' * 32: {'agent_running': True}}):
+            self.assertFalse(liveness.liveness(_peer('a' * 32, 'A', time.time() - 9999))['online'])
+
+
 class TestPromptRendering(unittest.TestCase):
-    def _snapshot(self, peers, adverts=None):
+    def _snapshot(self, peers, adverts=None, shared=None):
         import prompt
         adverts = adverts or {}
         with mock.patch('peer.store.list_peers', return_value=peers), \
              mock.patch('peer.registry.registry.get', side_effect=lambda pid: adverts.get(pid)), \
              mock.patch('peer.registry.registry.endpoints_for', return_value=['https://x']), \
+             mock.patch('peer.dds_state.get_peer_topics', return_value=shared or {}), \
              mock.patch('task_store.active_tasks', return_value=[]), \
              mock.patch('collector.get_available_sources', return_value=[]):
             return prompt._env_dynamic()
+
+    def test_agent_off_is_marked_on_a_reachable_peer(self):
+        out = self._snapshot([_peer('a' * 32, 'Live', time.time() - 2)],
+                             shared={'a' * 32: {'agent_running': False}})
+        self.assertIn('online="yes"', out)
+        self.assertIn('agent="off"', out)
+
+    def test_unknown_agent_state_adds_no_attribute(self):
+        out = self._snapshot([_peer('a' * 32, 'Live', time.time() - 2)])
+        self.assertIn('online="yes"', out)
+        # 属性形式才算；hint 文案里本来就写着 agent=off 在解释这个属性的含义。
+        self.assertNotIn('agent="', out)
 
     def test_online_and_offline_are_both_shown_and_marked(self):
         """离线的不能省掉：agent 要能回答"有一台但联系不上"，而不是"没有"。"""

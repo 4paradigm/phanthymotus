@@ -54,6 +54,15 @@ def is_available() -> bool:
         return False
 
 
+def agent_running() -> bool:
+    """Whether the local agent loop is up (the dashboard's 智能控制 switch)."""
+    try:
+        import config
+        return bool((config.main.get('core') or {}).get('project_running', False))
+    except Exception:
+        return False
+
+
 def local_topics() -> list[str]:
     """The ROS topic names visible on this machine."""
     try:
@@ -63,9 +72,21 @@ def local_topics() -> list[str]:
         return []
 
 
-def record_peer_topics(peer_id: str, topics: list[str]) -> None:
-    """Store what a peer just told us it can see. Called by the inbox endpoint."""
-    _peer_topics[peer_id] = {'topics': list(topics), 'last_seen': time.time()}
+def record_peer_topics(peer_id: str, topics: list[str],
+                       agent_running: bool | None = None) -> None:
+    """Store what a peer just told us. Called by the inbox endpoint.
+
+    `agent_running` is the peer's own view of whether its agent loop is up. It
+    travels here rather than on a separate probe because this push already runs
+    every 5s, and because reachability alone is misleading: this push happens
+    whether or not the loop is running, so a peer with 智能控制 off looks exactly
+    as alive as one that can take work — right up to the 503 from /delegate.
+    """
+    _peer_topics[peer_id] = {
+        'topics': list(topics),
+        'last_seen': time.time(),
+        'agent_running': agent_running,
+    }
 
 
 def get_peer_topics() -> dict[str, dict]:
@@ -134,7 +155,8 @@ async def push_once() -> int:
     if not topics:
         return 0
 
-    payload = {'topics': topics, 'timestamp': time.time()}
+    payload = {'topics': topics, 'timestamp': time.time(),
+               'agent_running': agent_running()}
     delivered = 0
     for peer in store.list_peers():
         endpoints = registry.endpoints_for(peer['peer_id'])

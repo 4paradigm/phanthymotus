@@ -174,8 +174,30 @@ async def list_discovered(include_paired: bool = True):
 
 @router.get('/paired')
 async def list_paired():
-    """Peers we have paired with, and what they may do."""
-    return {'peers': store.list_peers()}
+    """Peers we have paired with, what they may do, and whether they can do it now.
+
+    Liveness is attached here rather than left to the UI: pairing is durable and
+    reachability is not, and the two were indistinguishable on screen — the only
+    dot in that row encodes the *role*, so an `operator` peer showed a green dot
+    whether it was running, idle or switched off.
+
+    `agent_running` is a third fact again: a peer with 智能控制 off keeps pushing
+    state and answering tool calls, but /delegate returns 503.
+    """
+    from peer import liveness as _liveness, naming as _naming
+    peers = store.list_peers()
+    labels = _naming.labels(peers)
+    out = []
+    for p in peers:
+        live = _liveness.liveness(p)
+        out.append({
+            **p,
+            'label': labels[p['peer_id']],
+            'online': live['online'],
+            'agent_running': live['agent_running'],
+            'contact_age_s': live['contact_age_s'],
+        })
+    return {'peers': out}
 
 
 class StartPairingReq(BaseModel):
@@ -504,8 +526,12 @@ async def inbox_state(req: Request):
     # 只保留字符串，并且设上限：对端是可以任意构造这个字段的，即便它已配对。
     clean = [t for t in topics if isinstance(t, str)][:2000]
 
+    running = payload.get('agent_running')
+    if not isinstance(running, bool):
+        running = None   # older peers do not send it; unknown ≠ off
+
     from peer import dds_state
-    dds_state.record_peer_topics(peer_id, clean)
+    dds_state.record_peer_topics(peer_id, clean, agent_running=running)
     store.touch(peer_id)
     return {'accepted': len(clean)}
 

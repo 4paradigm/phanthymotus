@@ -174,7 +174,16 @@ async def peer_list(
     for p in paired:
         live = _liveness.liveness(p)
         if live['online']:
-            state = 'online'
+            running = live.get('agent_running')
+            if running is False:
+                # Reachable but its agent loop is down: tools and state work,
+                # peer_delegate answers 503. Saying only "online" here is how an
+                # agent ends up promising work this peer cannot accept.
+                state = 'online, but its agent loop is off — cannot take delegated tasks'
+            elif running is True:
+                state = 'online, agent loop running'
+            else:
+                state = 'online (agent loop state unknown)'
         elif live['endpoints']:
             # An address is known but nothing has been heard: paired-and-switched-off
             # looks exactly like this, and it is not the same as never paired.

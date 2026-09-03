@@ -6415,6 +6415,23 @@ html, body {
 .user-role-dot[data-role="operator"] { background: var(--green); }
 .user-role-dot[data-role="viewer"]   { background: var(--text-dim); }
 .user-role-dot[data-role="blocked"]  { background: var(--red); }
+
+/* Paired-peer status. Deliberately a *different* class from .user-role-dot: that
+   one encodes the role and sits beside a dropdown that already names it, so it
+   was being read as a status light — an operator peer looked green whether it was
+   running or switched off. Three states, because "reachable" and "willing to take
+   work" are separate facts: 智能控制 off still answers tool calls and shares
+   state, but /delegate returns 503. */
+.peer-status-dot {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.peer-status-dot[data-state="online"]  { background: var(--green); }
+.peer-status-dot[data-state="idle"]    { background: var(--yellow); }
+.peer-status-dot[data-state="offline"] { background: var(--text-dim); }
 .user-platform-badge {
   flex: 0 0 auto;
   font-size: 0.68rem;
