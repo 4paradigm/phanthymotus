@@ -187,6 +187,23 @@ class TestDelegation(unittest.TestCase):
         self.assertIn('unknown peer', out)
         self.assertIn('Paired peers:', out)
 
+    def test_subagent_can_actually_reach_peer_delegate(self):
+        """subagent 必须真的拿得到 peer_delegate，否则 hop 传递是死代码。
+
+        真机上发现：Subagent.run() 已经在发布 hop 深度，但 subagent 继承的
+        系统工具走的是 _DESKTOP_TOOLS 白名单，peer_delegate 不在里面 ——
+        主 agent 有这个工具、subagent 没有。而链式委托恰恰发生在
+        「B 收到委托、其 subagent 再转给 C」，所以链路最长只能是一跳，
+        我为传递深度写的那套机制没有任何调用方。
+
+        断言白名单本身，而不是运行时状态：它是唯一决定可达性的地方。
+        """
+        import inspect
+        from subagent.agent import Subagent
+        src = inspect.getsource(Subagent._get_desktop_tool_schemas)
+        self.assertIn('peer_delegate', src,
+                      'subagents cannot reach peer_delegate; hop propagation is unreachable')
+
     def test_subagent_publishes_its_hop_depth(self):
         """subagent 运行期间必须设置 contextvar，否则链上深度会丢失。"""
         import inspect

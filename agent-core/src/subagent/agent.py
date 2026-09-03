@@ -144,7 +144,13 @@ class Subagent:
         from event.llm import _event_instance
         if not _event_instance:
             return []
-        _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'memory_recall'}
+        # peer_delegate is inherited deliberately: a chained delegation is
+        # precisely "B was asked to do something and hands part of it to C",
+        # and B's work happens inside a subagent. Without it here the hop
+        # counter that run() publishes would have no caller able to read it,
+        # and chains could only ever be one hop long.
+        _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+                          'WebFetch', 'WebSearch', 'memory_recall', 'peer_delegate'}
         return [
             info['schema']
             for name, info in _event_instance._sys_tools.items()
