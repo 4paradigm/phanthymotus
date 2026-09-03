@@ -62,7 +62,11 @@ Agent Core 会把消息里的 `goal_id` 作为私有任务 ID 传给 planner；�
 接收迟到的 accepted/rejected 回调，不会先发布伪终态再让晚到 goal 独立运行。
 
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
-`(0, 200] ms`。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
+`(0, 200] ms`。FAST-LIVO2 mapper 从实际进入其 callback 和处理循环的数据中，
+以 1 Hz 报告 LiDAR/IMU frame、源时间戳和实际扫描跨度；adapter 不再重复订阅
+原始高频 LiDAR/IMU，也不再复制整帧点云做旁路校验。adapter 只消费 mapper
+运行统计和 FAST-LIVO2 raw odom/cloud，负责 TF、坐标归一化与地图生成。状态会
+显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
 几何契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable` 或
 `raw_odom_discontinuity`，不会继续生成伪正常地图；几何跳变会在当前
 地图会话内锁存，需要重置或切换地图会话才能恢复。
@@ -71,17 +75,17 @@ LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一�
 `raw_odom_discontinuity` 后再采 5 秒，仅落盘一份 MCAP 到
 `/opt/phanthy-motus/data/fast_livo2/recordings/faults/`。`status.fault_capture`
 显示 `armed/post_trigger/saved/error`、触发原因、产物目录和
-`diagnostic_summary.json`；摘要会对齐 Driver 发布、FAST-LIVO2 callback/处理、
-adapter 接收/发布计数，因此旧录包中的低帧率不再被直接误判为雷达源降频。没有故障时
+`diagnostic_summary.json`；摘要会对齐 Driver 发布、FAST-LIVO2 实际
+callback/处理和 adapter 输出计数，因此旧录包中的低帧率不再被直接误判为
+雷达源降频。没有故障时
 停卡会丢弃空快照，不会将常态全频数据写入磁盘。录包进程不创建独立
 进程组，会随 FAST-LIVO2 runtime 的 stop/restart 一起回收，避免多个全频
 recorder 重复订阅传感器。FAST-LIVO2 输入使用 Best Effort：LiDAR 只保留
 最新 2 帧，IMU 保留 400 帧（按 200 Hz 约 2 秒）的积分历史。计算瞬时
 积压时丢弃旧点云，但不丢掉两帧 LiDAR 之间不可替代的 IMU 运动量；
 故障录包仍使用 Best Effort snapshot，不反压传感器链路。
-单个重复或乱序样本只会被丢弃，不会立即撤销已验证的传感器合同；
-输入 freshness 窗口内持续没有新的有效 LiDAR/IMU 时间对时，状态会把
-`point_time_invalid` 放入 `sensor_contract_issues` 诊断，但只要 FAST-LIVO2
+mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale` 放入
+`sensor_contract_issues`；已确认的静态 TF 不会因此丢失。只要 FAST-LIVO2
 自己的 odom/cloud 仍新鲜且 frame、TF 与 odom 连续性有效，就不会重复阻断输出。
 
 ## 公共输出
@@ -169,7 +173,8 @@ FAST-LIVO2 diagnostics 的 `latency_ms` / `latency_max_ms` 分别报告最近值
 
 `status.pipeline_diagnostics` 以 60 秒窗口关联三层已有证据：Driver 隐藏
 `_bridge_status`、FAST-LIVO2 mapper 1 Hz 运行统计和 adapter diagnostics。
-输出每层计数增量/频率、跨层比率和以下归因之一：
+输入丢帧只比较 Driver 发布与 mapper 实际 callback，adapter 仅代表 mapper
+输出后的坐标归一化阶段。输出每层计数增量/频率、跨层比率和以下归因之一：
 `driver_source_drop`、`dds_or_subscriber_drop`、
 `fast_livo_processing_backlog`、`scan_match_degraded`、
 `adapter_backlog`、`insufficient_evidence` 或 `healthy`。只有 Driver 自己的

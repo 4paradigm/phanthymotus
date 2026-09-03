@@ -45,11 +45,9 @@ def _mapper(cloud: int, imu: int, processed: int, **extra) -> dict:
     }
 
 
-def _adapter(cloud: int, imu: int, **extra) -> dict:
+def _adapter(cloud: int, **extra) -> dict:
     return {
         "pipeline_counters": {
-            "lidar_contract_received": cloud,
-            "imu_contract_received": imu,
             "raw_odom_received": cloud,
             "raw_cloud_received": cloud,
             "canonical_odom_published": cloud,
@@ -77,30 +75,31 @@ class PipelineDiagnosticsTest(unittest.TestCase):
             10.0,
             bridge=lambda scale: _bridge(100 * scale, 2000 * scale),
             mapper=lambda scale: _mapper(100 * scale, 2000 * scale, 100 * scale),
-            adapter=lambda scale: _adapter(100 * scale, 2000 * scale),
+            adapter=lambda scale: _adapter(100 * scale),
         )
 
         self.assertEqual(result["classification"], "healthy")
         self.assertEqual(result["ratios"]["processed_over_mapper_lidar"], 1.0)
+        self.assertNotIn("adapter_lidar_over_driver_cloud", result["ratios"])
 
     def test_pipeline_distinguishes_source_drop_dds_and_mapper_backlog(self) -> None:
         source = self._snapshot(
             10.0,
             bridge=lambda scale: _bridge(30 * scale, 2000 * scale),
             mapper=lambda scale: _mapper(30 * scale, 2000 * scale, 30 * scale),
-            adapter=lambda scale: _adapter(30 * scale, 2000 * scale),
+            adapter=lambda scale: _adapter(30 * scale),
         )
         dds = self._snapshot(
             10.0,
             bridge=lambda scale: _bridge(100 * scale, 2000 * scale),
             mapper=lambda scale: _mapper(80 * scale, 1800 * scale, 80 * scale),
-            adapter=lambda scale: _adapter(80 * scale, 1800 * scale),
+            adapter=lambda scale: _adapter(80 * scale),
         )
         backlog = self._snapshot(
             10.0,
             bridge=lambda scale: _bridge(100 * scale, 2000 * scale),
             mapper=lambda scale: _mapper(100 * scale, 2000 * scale, 50 * scale),
-            adapter=lambda scale: _adapter(100 * scale, 2000 * scale),
+            adapter=lambda scale: _adapter(100 * scale),
         )
 
         self.assertEqual(source["classification"], "driver_source_drop")
@@ -112,7 +111,7 @@ class PipelineDiagnosticsTest(unittest.TestCase):
         for now, count in ((0.0, 100), (5.0, 150), (6.0, 0), (16.0, 100)):
             diagnostic.observe("bridge", _bridge(count, count * 20), now)
             diagnostic.observe("mapper", _mapper(count, count * 20, count), now)
-            diagnostic.observe("adapter", _adapter(count, count * 20), now)
+            diagnostic.observe("adapter", _adapter(count), now)
 
         result = diagnostic.snapshot(algorithm_running=True, now_monotonic=16.0)
 
@@ -126,7 +125,7 @@ class PipelineDiagnosticsTest(unittest.TestCase):
         for now, count in ((0.0, 0), (10.0, 100)):
             diagnostic.observe("bridge", _bridge(count, count * 20), now)
             diagnostic.observe("mapper", _mapper(count, count * 20, count), now)
-            diagnostic.observe("adapter", _adapter(count, count * 20), now)
+            diagnostic.observe("adapter", _adapter(count), now)
 
         result = diagnostic.snapshot(algorithm_running=True, now_monotonic=80.1)
 

@@ -109,8 +109,6 @@ class PipelineDiagnostics:
             "adapter": {
                 name: _rate(samples["adapter"], name)
                 for name in (
-                    "lidar_contract_received",
-                    "imu_contract_received",
                     "raw_odom_received",
                     "raw_cloud_received",
                     "canonical_odom_published",
@@ -127,11 +125,9 @@ class PipelineDiagnostics:
         mapper_cloud = rates["mapper"]["lidar_callbacks"]["hz"]
         mapper_imu = rates["mapper"]["imu_callbacks"]["hz"]
         processed = rates["mapper"]["processed_lidar"]["hz"]
-        adapter_cloud = rates["adapter"]["lidar_contract_received"]["hz"]
         latest_mapper = samples["mapper"][-1][1] if samples["mapper"] else {}
         latest_adapter = samples["adapter"][-1][1] if samples["adapter"] else {}
         ratios = {
-            "adapter_lidar_over_driver_cloud": _ratio(adapter_cloud, bridge_cloud),
             "mapper_lidar_over_driver_cloud": _ratio(mapper_cloud, bridge_cloud),
             "mapper_imu_over_driver_imu": _ratio(mapper_imu, bridge_imu),
             "processed_over_mapper_lidar": _ratio(processed, mapper_cloud),
@@ -152,13 +148,12 @@ class PipelineDiagnostics:
         elif any(
             ratio is not None and ratio < 0.99
             for ratio in (
-                ratios["adapter_lidar_over_driver_cloud"],
                 ratios["mapper_lidar_over_driver_cloud"],
                 ratios["mapper_imu_over_driver_imu"],
             )
         ):
             classification = "dds_or_subscriber_drop"
-            evidence.append("downstream callback rate is below Driver publish rate")
+            evidence.append("FAST-LIVO2 callback rate is below Driver publish rate")
         elif (
             ratios["processed_over_mapper_lidar"] is not None
             and ratios["processed_over_mapper_lidar"] < 0.9

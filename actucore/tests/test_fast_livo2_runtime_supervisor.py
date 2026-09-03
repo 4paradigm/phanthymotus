@@ -405,8 +405,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._rejection_counts = {}
         adapter._last_lidar_source_stamp_ns = 1_000_000_000
         adapter._last_imu_source_stamp_ns = 1_350_000_000
-        adapter._last_sensor_pair_monotonic = time.monotonic() - 0.6
-        adapter._sensor_pair_max_age = 3.0
+        adapter._last_mapper_runtime_monotonic = time.monotonic() - 0.6
+        adapter._mapper_runtime_max_age = 3.0
         adapter._sensor_rejection_pub = _CapturePublisher()
         warnings = []
         infos = []
@@ -442,7 +442,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(evidence["source_stamp_ns"], 2_050_000_000)
         self.assertEqual(evidence["lidar_imu_skew_ms"], 350.0)
         self.assertEqual(evidence["lidar_imu_pair_result"], "skew_exceeded")
-        self.assertGreaterEqual(evidence["last_valid_pair_age_sec"], 0.5)
+        self.assertGreaterEqual(evidence["mapper_runtime_receive_age_sec"], 0.5)
 
         adapter._mark_valid("FAST-LIVO2 cloud")
         self.assertEqual(
@@ -546,16 +546,16 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
     def test_sensor_contract_accepts_arbitrary_shared_frame_and_static_tf(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
-        adapter._lidar_frame = "front_navigation_sensor"
-        adapter._imu_frame = "front_navigation_sensor"
-        adapter._last_lidar_source_stamp_ns = 1_000_000_000
-        adapter._last_imu_source_stamp_ns = 1_050_000_000
-        adapter._last_sensor_pair_monotonic = None
-        adapter._source_max_age = 0.5
-        adapter._sensor_pair_max_age = 3.0
-        adapter._point_time_ready = True
-        adapter._imu_time_ready = True
-        adapter._point_time_span_ms = 80.0
+        adapter._rejection_counts = {}
+        adapter._lidar_frame = None
+        adapter._imu_frame = None
+        adapter._last_lidar_source_stamp_ns = None
+        adapter._last_imu_source_stamp_ns = None
+        adapter._last_mapper_runtime_monotonic = None
+        adapter._mapper_runtime_max_age = 3.0
+        adapter._mapper_contract_ready = False
+        adapter._mapper_contract_issues = ()
+        adapter._point_time_span_ms = None
         adapter._base_to_sensor = None
         adapter._base_to_sensor_tf_ready = False
         adapter._sensor_frame = None
@@ -568,9 +568,25 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                 rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
             )
         )
+        adapter.get_logger = lambda: SimpleNamespace(
+            warning=lambda _message: None,
+            info=lambda _message: None,
+        )
 
-        adapter._refresh_sensor_contract()
-        adapter._refresh_sensor_contract()
+        runtime = SimpleNamespace(
+            data=json.dumps(
+                {
+                    "lidar_frame": "front_navigation_sensor",
+                    "imu_frame": "front_navigation_sensor",
+                    "last_lidar_source_stamp_sec": 1.0,
+                    "last_imu_source_stamp_sec": 1.05,
+                    "point_time_span_ms": 80.0,
+                    "input_contract_ready": True,
+                }
+            )
+        )
+        adapter._on_mapper_runtime(runtime)
+        adapter._on_mapper_runtime(runtime)
 
         self.assertTrue(adapter._sensor_contract_ready_locked())
         self.assertEqual(adapter._sensor_frame, "front_navigation_sensor")
@@ -582,19 +598,15 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             mock.ANY,
         )
 
-    def test_sensor_contract_tolerates_brief_pair_gap_but_rejects_three_seconds(self) -> None:
+    def test_mapper_runtime_staleness_is_diagnostic_only(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
-        adapter._rejection_counts = {}
         adapter._lidar_frame = "livox_frame"
         adapter._imu_frame = "livox_frame"
-        adapter._last_lidar_source_stamp_ns = 1_000_000_000
-        adapter._last_imu_source_stamp_ns = 1_050_000_000
-        adapter._last_sensor_pair_monotonic = None
-        adapter._source_max_age = 0.5
-        adapter._sensor_pair_max_age = 3.0
-        adapter._point_time_ready = True
-        adapter._imu_time_ready = True
+        adapter._last_mapper_runtime_monotonic = time.monotonic()
+        adapter._mapper_runtime_max_age = 3.0
+        adapter._mapper_contract_ready = True
+        adapter._mapper_contract_issues = ()
         adapter._point_time_span_ms = 100.0
         adapter._base_to_sensor = None
         adapter._base_to_sensor_tf_ready = False
@@ -608,45 +620,33 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
                 rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
             )
         )
-        adapter.get_logger = lambda: SimpleNamespace(
-            warning=lambda _message: None,
-            info=lambda _message: None,
-        )
-
         adapter._refresh_sensor_contract()
-        duplicate = SimpleNamespace(
-            header=SimpleNamespace(
-                frame_id="livox_frame",
-                stamp=SimpleNamespace(sec=1, nanosec=50_000_000),
-            )
-        )
-        adapter._on_imu_contract(duplicate)
 
         self.assertTrue(adapter._sensor_contract_ready_locked())
         self.assertEqual(adapter._readiness_blockers_locked(), [])
         self.assertIsNotNone(adapter._base_to_sensor)
 
-        adapter._last_sensor_pair_monotonic = time.monotonic() - 0.6
+        adapter._last_mapper_runtime_monotonic = time.monotonic() - 0.6
         self.assertTrue(adapter._sensor_contract_ready_locked())
         self.assertEqual(adapter._readiness_blockers_locked(), [])
 
-        adapter._last_sensor_pair_monotonic = time.monotonic() - 3.1
+        adapter._last_mapper_runtime_monotonic = time.monotonic() - 3.1
         self.assertFalse(adapter._sensor_contract_ready_locked())
         self.assertTrue(adapter._sensor_geometry_ready_locked())
         self.assertEqual(adapter._readiness_blockers_locked(), [])
         self.assertEqual(
             adapter._sensor_contract_issues_locked(),
-            ["point_time_invalid"],
+            ["mapper_runtime_stale"],
         )
         self.assertIsNotNone(adapter._base_to_sensor)
 
-    def test_stale_raw_sensor_pair_does_not_reject_fresh_fast_livo2_outputs(self) -> None:
+    def test_stale_mapper_runtime_does_not_reject_fresh_fast_livo2_outputs(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
         adapter._source_age = lambda _stamp: 0.0
         adapter._source_max_age = 0.5
         adapter._source_age_tolerance = 0.05
-        adapter._sensor_pair_max_age = 3.0
+        adapter._mapper_runtime_max_age = 3.0
         adapter._map_load_max_points = 200_000
         adapter._live_cloud_max_bytes = 64 * 1024 * 1024
         adapter._invalid_odom = 0
@@ -657,9 +657,9 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._sensor_frame = "sensor_frame"
         adapter._lidar_frame = "sensor_frame"
         adapter._imu_frame = "sensor_frame"
-        adapter._point_time_ready = True
-        adapter._imu_time_ready = True
-        adapter._last_sensor_pair_monotonic = time.monotonic() - 3.1
+        adapter._mapper_contract_ready = True
+        adapter._mapper_contract_issues = ()
+        adapter._last_mapper_runtime_monotonic = time.monotonic() - 3.1
         adapter._base_to_sensor_tf_ready = True
         adapter._base_to_sensor = Pose3(
             0.0,
@@ -726,13 +726,10 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._lock = threading.RLock()
         adapter._lidar_frame = "lidar_frame"
         adapter._imu_frame = "imu_frame"
-        adapter._last_lidar_source_stamp_ns = 1_000_000_000
-        adapter._last_imu_source_stamp_ns = 1_050_000_000
-        adapter._last_sensor_pair_monotonic = None
-        adapter._source_max_age = 0.5
-        adapter._sensor_pair_max_age = 3.0
-        adapter._point_time_ready = True
-        adapter._imu_time_ready = True
+        adapter._last_mapper_runtime_monotonic = time.monotonic()
+        adapter._mapper_runtime_max_age = 3.0
+        adapter._mapper_contract_ready = False
+        adapter._mapper_contract_issues = ("sensor_frame_mismatch",)
         adapter._point_time_span_ms = 50.0
         adapter._base_to_sensor = None
         adapter._base_to_sensor_tf_ready = False
@@ -747,6 +744,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._tf_buffer.lookup_transform.assert_not_called()
 
         adapter._imu_frame = "lidar_frame"
+        adapter._mapper_contract_ready = True
+        adapter._mapper_contract_issues = ()
         adapter._tf_buffer.lookup_transform.side_effect = (
             ADAPTER_MODULE.TransformException("no static transform")
         )
@@ -1039,7 +1038,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter = object.__new__(FastLivo2Adapter)
         adapter._source_age = lambda _stamp: 0.0
         adapter._source_max_age = 0.5
-        adapter._sensor_pair_max_age = 3.0
+        adapter._mapper_runtime_max_age = 3.0
         adapter._source_age_tolerance = 0.05
         adapter._map_load_max_points = 200_000
         adapter._live_cloud_max_bytes = 64 * 1024 * 1024
@@ -1061,9 +1060,9 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._sensor_frame = "sensor_frame"
         adapter._lidar_frame = "sensor_frame"
         adapter._imu_frame = "sensor_frame"
-        adapter._point_time_ready = True
-        adapter._imu_time_ready = True
-        adapter._last_sensor_pair_monotonic = time.monotonic()
+        adapter._mapper_contract_ready = True
+        adapter._mapper_contract_issues = ()
+        adapter._last_mapper_runtime_monotonic = time.monotonic()
         adapter._base_to_sensor_tf_ready = True
         adapter._base_to_sensor = Pose3(
             0.0,

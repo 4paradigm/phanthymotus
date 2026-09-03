@@ -33,7 +33,7 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from rclpy.time import Time
-from sensor_msgs.msg import Imu, PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
@@ -60,7 +60,6 @@ from .frame_adapter_core import (
     yaw_from_quaternion,
 )
 from .vectorized_cloud import (
-    absolute_point_time_span_ms,
     decode_xyz_array,
     map_view_with_pose,
     transform_xyz_array,
@@ -86,8 +85,10 @@ class FastLivo2Adapter(Node):
         super().__init__("g1_fast_livo2_adapter")
         self.declare_parameter("raw_odom_topic", "/ubuntu/navigation/fast_livo2/raw/odom")
         self.declare_parameter("raw_cloud_topic", "/ubuntu/navigation/fast_livo2/raw/cloud_registered")
-        self.declare_parameter("lidar_topic", "/ubuntu/navigation/lidar")
-        self.declare_parameter("imu_topic", "/ubuntu/navigation/imu")
+        self.declare_parameter(
+            "mapper_runtime_topic",
+            "/ubuntu/navigation/fast_livo2/mapper_runtime",
+        )
         self.declare_parameter("odom_topic", "/ubuntu/navigation/odom")
         self.declare_parameter("cloud_topic", "/ubuntu/navigation/cloud_registered")
         self.declare_parameter("obstacle_map_topic", "/ubuntu/navigation/obstacle_map")
@@ -103,7 +104,7 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("static_map_load_max_points", 200000)
         self.declare_parameter("live_cloud_max_bytes", 67108864)
         self.declare_parameter("source_max_age_sec", 0.5)
-        self.declare_parameter("sensor_pair_max_age_sec", 3.0)
+        self.declare_parameter("mapper_runtime_max_age_sec", 3.0)
         self.declare_parameter("source_age_tolerance_sec", 0.05)
         self.declare_parameter("map_voxel_size_m", 0.10)
         self.declare_parameter("static_angular_bin_deg", 1.0)
@@ -113,13 +114,13 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("obstacle_max_height_m", 0.30)
 
         self._source_max_age = float(self.get_parameter("source_max_age_sec").value)
-        self._sensor_pair_max_age = float(
-            self.get_parameter("sensor_pair_max_age_sec").value
+        self._mapper_runtime_max_age = float(
+            self.get_parameter("mapper_runtime_max_age_sec").value
         )
-        if not self._source_max_age <= self._sensor_pair_max_age <= 3.0:
+        if not self._source_max_age <= self._mapper_runtime_max_age <= 5.0:
             raise ValueError(
-                "sensor_pair_max_age_sec must be within "
-                "[source_max_age_sec, 3.0]"
+                "mapper_runtime_max_age_sec must be within "
+                "[source_max_age_sec, 5.0]"
             )
         self._source_age_tolerance = float(
             self.get_parameter("source_age_tolerance_sec").value
@@ -146,9 +147,9 @@ class FastLivo2Adapter(Node):
         self._imu_frame: str | None = None
         self._last_lidar_source_stamp_ns: int | None = None
         self._last_imu_source_stamp_ns: int | None = None
-        self._last_sensor_pair_monotonic: float | None = None
-        self._point_time_ready = False
-        self._imu_time_ready = False
+        self._last_mapper_runtime_monotonic: float | None = None
+        self._mapper_contract_ready = False
+        self._mapper_contract_issues: tuple[str, ...] = ()
         self._point_time_span_ms: float | None = None
         self._base_to_sensor_tf_ready = False
         self._sensor_tf_error: str | None = None
@@ -226,8 +227,6 @@ class FastLivo2Adapter(Node):
             self.get_parameter("map_view_enabled").value
         )
         self._pipeline_counters = {
-            "lidar_contract_received": 0,
-            "imu_contract_received": 0,
             "raw_odom_received": 0,
             "raw_cloud_received": 0,
             "canonical_odom_published": 0,
@@ -296,16 +295,9 @@ class FastLivo2Adapter(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.create_subscription(
-            PointCloud2,
-            str(self.get_parameter("lidar_topic").value),
-            self._on_lidar_contract,
-            latest_sensor_qos,
-            callback_group=self._callbacks,
-        )
-        self.create_subscription(
-            Imu,
-            str(self.get_parameter("imu_topic").value),
-            self._on_imu_contract,
+            String,
+            str(self.get_parameter("mapper_runtime_topic").value),
+            self._on_mapper_runtime,
             latest_sensor_qos,
             callback_group=self._callbacks,
         )
@@ -483,15 +475,16 @@ class FastLivo2Adapter(Node):
             counts[stream] = count
             lidar_stamp = getattr(self, "_last_lidar_source_stamp_ns", None)
             imu_stamp = getattr(self, "_last_imu_source_stamp_ns", None)
-            last_pair = getattr(self, "_last_sensor_pair_monotonic", None)
+            last_mapper_runtime = getattr(
+                self, "_last_mapper_runtime_monotonic", None
+            )
         if count == 1 or count % 100 == 0:
             bounded = str(detail).replace("\r", "\\r").replace("\n", "\\n")[:200]
             self.get_logger().warning(
                 f"rejecting {stream} count={count}: {bounded}"
             )
         if stream not in {
-            "navigation lidar contract",
-            "navigation imu contract",
+            "FAST-LIVO2 mapper runtime",
             "FAST-LIVO2 odom",
             "FAST-LIVO2 cloud",
         }:
@@ -529,13 +522,16 @@ class FastLivo2Adapter(Node):
                 None if pair_skew_ns is None else round(pair_skew_ns / 1_000_000, 3)
             ),
             "lidar_imu_pair_result": pair_result,
-            "sensor_pair_max_age_sec": getattr(
-                self, "_sensor_pair_max_age", None
+            "mapper_runtime_max_age_sec": getattr(
+                self, "_mapper_runtime_max_age", None
             ),
-            "last_valid_pair_age_sec": (
+            "mapper_runtime_receive_age_sec": (
                 None
-                if last_pair is None
-                else round(max(0.0, receive_monotonic_ns / 1e9 - last_pair), 6)
+                if last_mapper_runtime is None
+                else round(
+                    max(0.0, receive_monotonic_ns / 1e9 - last_mapper_runtime),
+                    6,
+                )
             ),
         }
         publisher = getattr(self, "_sensor_rejection_pub", None)
@@ -553,91 +549,81 @@ class FastLivo2Adapter(Node):
                 f"{stream} recovered after {rejected} rejected samples"
             )
 
-    def _on_lidar_contract(self, message: PointCloud2) -> None:
-        self._observe_pipeline_event("lidar_contract_received")
+    def _on_mapper_runtime(self, message: String) -> None:
         try:
-            frame = message.header.frame_id.strip()
-            if not frame:
-                raise InvalidFastLivo2Frame("lidar frame_id is empty")
-            source_stamp_ns = _stamp_ns(message.header.stamp)
-            with self._lock:
-                previous = self._last_lidar_source_stamp_ns
-            if previous is not None and source_stamp_ns <= previous:
-                raise InvalidFastLivo2Frame("lidar source stamp did not advance")
-            span_ms = absolute_point_time_span_ms(
-                fields=message.fields,
-                data=bytes(message.data),
-                point_step=int(message.point_step),
-                row_step=int(message.row_step),
-                width=int(message.width),
-                height=int(message.height),
-                is_bigendian=bool(message.is_bigendian),
-                header_stamp_ns=source_stamp_ns,
+            payload = json.loads(message.data)
+            if not isinstance(payload, dict):
+                raise InvalidFastLivo2Frame("mapper runtime must be an object")
+            lidar_frame = payload.get("lidar_frame")
+            imu_frame = payload.get("imu_frame")
+            if not isinstance(lidar_frame, str) or not isinstance(imu_frame, str):
+                raise InvalidFastLivo2Frame("mapper runtime frames are invalid")
+            lidar_frame = lidar_frame.strip()
+            imu_frame = imu_frame.strip()
+            point_time_span_ms = float(payload.get("point_time_span_ms", -1.0))
+            lidar_stamp_sec = float(
+                payload.get("last_lidar_source_stamp_sec", -1.0)
             )
+            imu_stamp_sec = float(
+                payload.get("last_imu_source_stamp_sec", -1.0)
+            )
+            mapper_ready = payload.get("input_contract_ready")
+            if not all(
+                math.isfinite(value)
+                for value in (
+                    point_time_span_ms,
+                    lidar_stamp_sec,
+                    imu_stamp_sec,
+                )
+            ) or not isinstance(mapper_ready, bool):
+                raise InvalidFastLivo2Frame("mapper runtime contract is invalid")
+            issues = []
+            if not lidar_frame or lidar_frame != imu_frame:
+                issues.append("sensor_frame_mismatch")
+            if not 0.0 < point_time_span_ms <= 200.0:
+                issues.append("point_time_invalid")
+            if mapper_ready != (not issues):
+                raise InvalidFastLivo2Frame("mapper runtime contract is inconsistent")
         except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
-            self._warn_rejected("navigation lidar contract", exc, message)
+            self._warn_rejected("FAST-LIVO2 mapper runtime", exc, message)
             return
-        self._mark_valid("navigation lidar contract")
+        self._mark_valid("FAST-LIVO2 mapper runtime")
+        now = time.monotonic()
         with self._lock:
-            if frame != self._lidar_frame:
+            if (
+                lidar_frame != self._lidar_frame
+                or imu_frame != self._imu_frame
+            ):
                 self._base_to_sensor = None
                 self._base_to_sensor_tf_ready = False
-            self._lidar_frame = frame
-            self._last_lidar_source_stamp_ns = source_stamp_ns
-            self._point_time_ready = True
-            self._point_time_span_ms = span_ms
-        self._refresh_sensor_contract()
-
-    def _on_imu_contract(self, message: Imu) -> None:
-        self._observe_pipeline_event("imu_contract_received")
-        try:
-            frame = message.header.frame_id.strip()
-            if not frame:
-                raise InvalidFastLivo2Frame("imu frame_id is empty")
-            source_stamp_ns = _stamp_ns(message.header.stamp)
-            if source_stamp_ns <= 0:
-                raise InvalidFastLivo2Frame("imu source stamp must be positive")
-            with self._lock:
-                previous = self._last_imu_source_stamp_ns
-            if previous is not None and source_stamp_ns <= previous:
-                raise InvalidFastLivo2Frame("imu source stamp did not advance")
-        except (InvalidFastLivo2Frame, TypeError, ValueError) as exc:
-            self._warn_rejected("navigation imu contract", exc, message)
-            return
-        self._mark_valid("navigation imu contract")
-        with self._lock:
-            if frame != self._imu_frame:
-                self._base_to_sensor = None
-                self._base_to_sensor_tf_ready = False
-            self._imu_frame = frame
-            self._last_imu_source_stamp_ns = source_stamp_ns
-            self._imu_time_ready = True
+            self._lidar_frame = lidar_frame or None
+            self._imu_frame = imu_frame or None
+            self._last_lidar_source_stamp_ns = (
+                int(lidar_stamp_sec * 1_000_000_000)
+                if lidar_stamp_sec > 0.0
+                else None
+            )
+            self._last_imu_source_stamp_ns = (
+                int(imu_stamp_sec * 1_000_000_000)
+                if imu_stamp_sec > 0.0
+                else None
+            )
+            self._last_mapper_runtime_monotonic = now
+            self._mapper_contract_ready = mapper_ready
+            self._mapper_contract_issues = tuple(issues)
+            self._point_time_span_ms = point_time_span_ms
         self._refresh_sensor_contract()
 
     def _refresh_sensor_contract(self) -> None:
-        now = time.monotonic()
         with self._lock:
             lidar_frame = self._lidar_frame
             imu_frame = self._imu_frame
-            lidar_stamp = self._last_lidar_source_stamp_ns
-            imu_stamp = self._last_imu_source_stamp_ns
-            if lidar_frame and imu_frame and lidar_frame != imu_frame:
+            if not lidar_frame or lidar_frame != imu_frame:
                 self._sensor_frame = None
                 self._base_to_sensor = None
                 self._base_to_sensor_tf_ready = False
-                self._last_sensor_pair_monotonic = None
-                return
-            if (
-                not lidar_frame
-                or not self._point_time_ready
-                or not self._imu_time_ready
-                or lidar_stamp is None
-                or imu_stamp is None
-                or abs(lidar_stamp - imu_stamp) > 200_000_000
-            ):
                 return
             sensor_frame = lidar_frame
-            self._last_sensor_pair_monotonic = now
             if (
                 self._sensor_frame == sensor_frame
                 and self._base_to_sensor_tf_ready
@@ -677,19 +663,18 @@ class FastLivo2Adapter(Node):
                 self._base_to_sensor_tf_ready = True
                 self._sensor_tf_error = None
 
-    def _sensor_pair_fresh_locked(self) -> bool:
+    def _mapper_runtime_fresh_locked(self) -> bool:
         return (
-            self._last_sensor_pair_monotonic is not None
-            and time.monotonic() - self._last_sensor_pair_monotonic
-            <= self._sensor_pair_max_age
+            self._last_mapper_runtime_monotonic is not None
+            and time.monotonic() - self._last_mapper_runtime_monotonic
+            <= self._mapper_runtime_max_age
         )
 
     def _sensor_contract_ready_locked(self) -> bool:
         return (
             self._sensor_frame is not None
-            and self._point_time_ready
-            and self._imu_time_ready
-            and self._sensor_pair_fresh_locked()
+            and self._mapper_contract_ready
+            and self._mapper_runtime_fresh_locked()
             and self._base_to_sensor_tf_ready
             and self._base_to_sensor is not None
         )
@@ -702,7 +687,10 @@ class FastLivo2Adapter(Node):
         )
 
     def _sensor_contract_issues_locked(self) -> list[str]:
-        return [] if self._sensor_pair_fresh_locked() else ["point_time_invalid"]
+        issues = list(self._mapper_contract_issues)
+        if not self._mapper_runtime_fresh_locked():
+            issues.append("mapper_runtime_stale")
+        return issues
 
     def _readiness_blockers_locked(self) -> list[str]:
         blockers = []
@@ -1871,7 +1859,7 @@ class FastLivo2Adapter(Node):
             "sensor_frame": state["sensor_frame"],
             "sensor_contract_ready": state["sensor_contract_ready"],
             "sensor_contract_issues": state["sensor_contract_issues"],
-            "sensor_pair_max_age_sec": self._sensor_pair_max_age,
+            "mapper_runtime_max_age_sec": self._mapper_runtime_max_age,
             "base_to_sensor_tf_ready": state["base_to_sensor_tf_ready"],
             "sensor_tf_error": state["sensor_tf_error"],
             "point_time_span_ms": state["point_time_span_ms"],

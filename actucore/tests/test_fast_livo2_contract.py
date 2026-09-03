@@ -130,7 +130,7 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=65a8d6a5a0854eabbc65a73da82f54222270028ae0cd44458e75696d44c80522",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=cc51080e2b36848927bfd416e64ada457d43abcd86428eec1ff113423a94c318",
             source_lock,
         )
         self.assertIn(
@@ -152,6 +152,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         )[1]
         self.assertNotIn("@@ -13,", runtime_cpp_patch)
         self.assertIn("publishRuntimeDiagnostics", runtime_patch_text)
+        self.assertIn("input_contract_ready", runtime_patch_text)
+        self.assertIn("self._on_mapper_runtime", adapter)
+        self.assertNotIn("self._on_lidar_contract", adapter)
+        self.assertNotIn("self._on_imu_contract", adapter)
         self.assertIn("+#include <stdexcept>", pcd_patch.read_text(encoding="utf-8"))
         self.assertIn("import numpy, rosbag2_py", dockerfile)
         self.assertIn("ros2 bag record --help | grep -F -- '--no-discovery'", dockerfile)
@@ -201,7 +205,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "65a8d6a5a0854eabbc65a73da82f54222270028ae0cd44458e75696d44c80522",
+            "cc51080e2b36848927bfd416e64ada457d43abcd86428eec1ff113423a94c318",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
