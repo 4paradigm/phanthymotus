@@ -34,6 +34,10 @@ from peer import identity
 SERVICE_TYPE = '_motus._tcp.local.'
 _MAX_TXT_VALUE = 255  # DNS-SD limit per key/value pair
 
+# Must stay comfortably below registry.STALE_AFTER_S (300s), or a peer that is
+# perfectly healthy ages out of the live view between refreshes.
+REFRESH_INTERVAL_S = 60
+
 
 def _txt_str(value) -> str:
     if isinstance(value, bytes):
@@ -90,6 +94,8 @@ class MdnsProvider(DiscoveryProvider):
         self._info = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._resolving: set = set()
+        self._seen_names: set = set()
+        self._refresh_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         # The *async* API is mandatory here, not a preference. The synchronous
@@ -113,9 +119,14 @@ class MdnsProvider(DiscoveryProvider):
             self._aiozc.zeroconf, SERVICE_TYPE, handlers=[self._on_change]
         )
         self._running = True
+        self._refresh_task = asyncio.ensure_future(self._refresh_loop())
 
     async def stop(self) -> None:
         self._running = False
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            self._refresh_task = None
+        self._seen_names.clear()
         aiozc, browser, info = self._aiozc, self._browser, self._info
         self._aiozc, self._browser, self._info = None, None, None
         if browser is not None:
@@ -201,11 +212,44 @@ class MdnsProvider(DiscoveryProvider):
         """
         from zeroconf import ServiceStateChange
         if state_change is ServiceStateChange.Removed:
+            # A peer that said goodbye should disappear now, not linger until the
+            # registry's staleness timeout.
+            self._seen_names.discard(name)
             return
+        self._seen_names.add(name)
         if name in self._resolving:
             return  # a resolve for this service is already in flight
         self._resolving.add(name)
         asyncio.ensure_future(self._resolve(service_type, name))
+
+    async def _refresh_loop(self) -> None:
+        """Re-resolve known services periodically to keep their adverts fresh.
+
+        Without this, discovery silently empties a few minutes after startup.
+        The registry drops adverts unseen for STALE_AFTER_S (300s), but zeroconf
+        only re-announces a stable service on its record TTL, which is far
+        longer — so a peer that is up, reachable and unchanged ages out and
+        never comes back. Every earlier two-machine test happened to run inside
+        that window, which is why it looked fine.
+
+        Re-resolving is a link-local multicast query; at this interval the cost
+        is negligible, and a peer that has genuinely gone still ages out because
+        the resolve fails and last_seen stops advancing.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(REFRESH_INTERVAL_S)
+                if not self._running:
+                    return
+                for name in list(self._seen_names):
+                    if name in self._resolving:
+                        continue
+                    self._resolving.add(name)
+                    await self._resolve(SERVICE_TYPE, name)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                print(f'[peer] mdns refresh failed: {type(e).__name__}: {e}')
 
     async def _resolve(self, service_type: str, name: str) -> None:
         from zeroconf.asyncio import AsyncServiceInfo

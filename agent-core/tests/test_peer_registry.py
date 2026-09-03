@@ -89,5 +89,41 @@ class TestRegistry(unittest.TestCase):
         self.assertEqual(len(discovered), 0)
 
 
+
+class TestDiscoveryFreshness(unittest.TestCase):
+    """发现列表会不会自己饿死。
+
+    真机上撞到的：两台机器互相都发现不到，但 provider 报 running=true。
+    registry 会清掉 STALE_AFTER_S(300s) 内没更新的 advert，而 mDNS 对一个稳定
+    服务的再通告周期远长于此（PTR 记录 TTL 默认数千秒）。于是**任何部署跑满
+    5 分钟后发现列表都会清空**，跟配置无关。
+
+    之前每次双机验证都在重启后 5 分钟内做完，所以从没暴露。
+    """
+
+    def test_refresh_interval_beats_staleness(self):
+        from peer.discovery.mdns import REFRESH_INTERVAL_S
+        from peer.registry import STALE_AFTER_S
+        self.assertLess(
+            REFRESH_INTERVAL_S, STALE_AFTER_S / 2,
+            'mDNS refresh must run well inside the staleness window, or healthy '
+            'peers age out of the live view and never return')
+
+    def test_removed_is_handled(self):
+        """收到 goodbye 要立刻忘掉，而不是等超时。"""
+        import inspect
+        from peer.discovery.mdns import MdnsProvider
+        src = inspect.getsource(MdnsProvider._on_change)
+        self.assertIn('_seen_names.discard', src,
+                      'Removed must drop the service, not just return')
+
+    def test_refresh_loop_stops_with_provider(self):
+        """刷新任务必须随 stop() 取消，否则热重启会留下孤儿任务。"""
+        import inspect
+        from peer.discovery.mdns import MdnsProvider
+        src = inspect.getsource(MdnsProvider.stop)
+        self.assertIn('_refresh_task', src)
+        self.assertIn('cancel', src)
+
 if __name__ == '__main__':
     unittest.main()
