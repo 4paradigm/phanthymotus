@@ -63,11 +63,21 @@ Hardware drivers are maintained in a separate repository: **[phanthymotus-driver
 
 ### Multi-Agent Peers
 
-> **Status: implemented; verified between two Orin test rigs, not yet on a fleet.** Discovery,
-> pairing, messaging, tool proxying, delegation and state sharing all run. What has *not* been
-> exercised is more than two peers, and anything across sites (the cloud roster provider is a
-> stub). Feishu bot-to-bot (`bot_to_bot_enabled` + `trusted_bots`, see
-> [Feishu channel setup](docs/feishu-channel-setup.md)) still exists as the internet-dependent path.
+> **Status: partly implemented.** Measured on two Orin test rigs, per granularity:
+>
+> | Piece | State |
+> |---|---|
+> | mDNS discovery, SAS pairing | works — both rigs paired, `operator` role |
+> | State sharing (signed HTTPS) | works — each side holds the other's topic list, refreshed every 5s |
+> | Tool proxy, **inbound** (serving a peer) | works — a signed `tools/list` returns exactly the tools bound on the receiver's canvas |
+> | Tool proxy, **outbound** (calling a peer's tools) | **not implemented** — nothing registers a peer as a synthetic MCP entry, so the local LLM cannot see or call them |
+> | Messaging (`lan` ChannelAdapter) | code exists, **not exercised** — no `lan` channel was configured on either rig |
+> | Task delegation (`peer_delegate`) | code and hop-count limit exist, **not exercised across machines** |
+> | Cloud roster discovery | stub |
+> | More than two peers | never tried |
+>
+> Feishu bot-to-bot (`bot_to_bot_enabled` + `trusted_bots`, see
+> [Feishu channel setup](docs/feishu-channel-setup.md)) remains the internet-dependent path.
 
 ![Peer mesh & security](docs/images/peer-mesh.png)
 
@@ -95,9 +105,12 @@ stays one record with several links, which is what makes fallback possible.
    unchanged: `InboundMessage`/`OutboundMessage`, ACL roles, rate limiting, `expect_reply` loop
    guard, and collector batching by trust level. Feishu and LAN are then two links with identical
    agent-side semantics, which gives "internet when available, LAN when not" for free.
-2. **Tools** — a peer registers as a synthetic MCP entry (`transport: 'peer'`), so its tools appear
-   as `mcp__peer:<id>__<tool>` and inherit the canvas binding gate, the ACP barrier (cross-machine
-   async waits work as-is), hooks, and per-tool config.
+2. **Tools** — the receiving half is built: `/api/peer/tools/list` and `/api/peer/tools/call`
+   authenticate the caller, then apply its role, its `tool_filter`, **and the receiver's own canvas
+   gate**, so a peer can only reach what a human wired locally. The sending half — registering a
+   peer as a synthetic MCP entry (`transport: 'peer'`) so its tools appear to the local LLM as
+   `mcp__peer:<id>__<tool>` — is **not implemented yet**; it needs a decision on whether peer tools
+   are exposed through the canvas (no UI for a peer card today) or exempted from it.
 3. **State** — topic lists and, later, pose/battery/task state, pushed over the same signed HTTPS
    link (`POST /api/peer/inbox/state`). This used to be DDS topics; DDS is now confined to the
    local host, and FastDDS transport isolation is *process-wide*, so a per-participant exemption

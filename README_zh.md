@@ -62,9 +62,20 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 
 ### 多机协同（Multi-Agent Peers）
 
-> **状态：已实现，在两台 Orin 测试机之间验证通过，尚未在多机队列上跑过。** 发现、配对、消息、工具代理、
-> 任务委派、状态共享都已运行。**没有**验证过的是超过两台 peer 的情形，以及跨地点（云端名册 provider 目前
-> 是桩）。飞书 bot 互通（`bot_to_bot_enabled` + `trusted_bots`，见[飞书渠道配置](docs/feishu-channel-setup.md)）
+> **状态：部分实现。** 在两台 Orin 测试机上逐项实测的结果：
+>
+> | 部分 | 状态 |
+> |---|---|
+> | mDNS 发现、SAS 配对 | 可用 —— 两台互相配对，角色 `operator` |
+> | 状态共享（签名 HTTPS） | 可用 —— 双向都拿到对端话题清单，5s 刷新 |
+> | 工具代理**入向**（服务对端） | 可用 —— 签名 `tools/list` 只返回接收方画布上绑定的工具 |
+> | 工具代理**出向**（调用对端工具） | **未实现** —— 没有任何地方把 peer 注册成合成 MCP 条目，本机 LLM 看不到也调不到 |
+> | 消息级（`lan` ChannelAdapter） | 代码在，**未验证** —— 两台都没有配置 `lan` 渠道 |
+> | 任务委派（`peer_delegate`） | 代码与 hop 限制都在，**未做跨机验证** |
+> | 云端名册发现 | 桩 |
+> | 超过两台 peer | 从未尝试 |
+>
+> 飞书 bot 互通（`bot_to_bot_enabled` + `trusted_bots`，见[飞书渠道配置](docs/feishu-channel-setup.md)）
 > 仍然作为依赖公网的那条路径存在。
 
 ![多机协同与安全](docs/images/peer-mesh.png)
@@ -90,8 +101,11 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 1. **消息级** —— 新增一个 `lan` `ChannelAdapter`，于是 peer 对话原样复用现有渠道栈：`InboundMessage`/
    `OutboundMessage`、ACL 角色、限频、`expect_reply` 防环、collector 按信任级别分批。飞书和局域网因此成为
    语义完全相同的两条链路，天然得到「有网走公网、断网走局域网」。
-2. **能力级** —— peer 注册为合成 MCP 条目（`transport: 'peer'`），其工具以 `mcp__peer:<id>__<tool>` 出现，
-   直接继承画布绑定闸门、ACP barrier（跨机异步等待原样可用）、hooks 与 per-tool 配置。
+2. **能力级** —— 接收侧已建成：`/api/peer/tools/list` 与 `/api/peer/tools/call` 先验签，再依次套用对端的
+   角色、`tool_filter`、**以及接收方自己的画布闸门**，所以 peer 只能碰到本机由人连过线的东西。发送侧
+   —— 把 peer 注册成合成 MCP 条目（`transport: 'peer'`），让它的工具以 `mcp__peer:<id>__<tool>` 出现在
+   本机 LLM 面前 —— **尚未实现**：它需要先定一件事，peer 工具是走画布暴露（目前没有 peer 卡片的 UI），
+   还是对画布闸门开一个例外。
 3. **状态级** —— 话题清单（以及后续的位姿、电量、任务状态）通过同一条签名 HTTPS 链路推送
    （`POST /api/peer/inbox/state`）。这里原本走 DDS topic；DDS 现已限制在本机，而 FastDDS 的传输隔离是
    **进程级**的，没法为 peer 流量单独开一个参与者的例外。改动顺带补上了一个真实缺陷：原来的 peer DDS 总线
