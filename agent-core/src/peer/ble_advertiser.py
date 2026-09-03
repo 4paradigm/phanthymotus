@@ -127,30 +127,17 @@ class MotusPeerService(Service):
 
 
 def _get_local_endpoints() -> list[str]:
-    """Get local HTTP endpoints for this peer.
+    """Reachable URL for this peer, for a BLE-discovered peer to dial.
 
-    Returns all non-loopback IP addresses on port 15678.
+    Reuses the same interface-selection trick as the mDNS provider rather than
+    enumerating every interface: `netifaces` is an unmaintained C extension that
+    routinely fails to build on ARM64, and a robot only needs to advertise the
+    address on its default route anyway. Listing every interface would also
+    advertise docker0/veth addresses that no peer can reach.
     """
-    import socket
-    import netifaces
+    from peer.discovery.mdns import MdnsProvider
 
-    endpoints = []
-    try:
-        for iface in netifaces.interfaces():
-            addrs = netifaces.ifaddresses(iface)
-            if netifaces.AF_INET in addrs:
-                for addr_info in addrs[netifaces.AF_INET]:
-                    ip = addr_info.get('addr')
-                    if ip and not ip.startswith('127.'):
-                        endpoints.append(f'https://{ip}:15678')
-    except Exception:
-        # Fallback: use hostname
-        try:
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
-            if ip and not ip.startswith('127.'):
-                endpoints.append(f'https://{ip}:15678')
-        except Exception:
-            pass
-
-    return endpoints
+    ip = MdnsProvider._primary_ip()
+    if not ip or ip.startswith('127.'):
+        return []
+    return [f'https://{ip}:15678']

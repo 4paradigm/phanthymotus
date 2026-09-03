@@ -18,18 +18,26 @@ This installs the base peer mesh with:
 
 ### Optional: BLE Advertising (Linux only)
 
-For full BLE bootstrap (advertising + scanning), install on Linux with BlueZ:
+BLE **scanning** works out of the box (`bleak` is a core dependency). BLE
+**advertising** (letting other robots discover *this* one) needs an extra
+package that is installed by hand:
 
 ```bash
-pip install -e ".[ble-advertise]"
+pip install bluez-peripheral
 ```
 
 Requires:
-- BlueZ >= 5.43
-- `bluez-peripheral` library
-- Root or CAP_NET_ADMIN for BLE operations
+- Linux with BlueZ >= 5.43
+- Root or `CAP_NET_ADMIN` for BLE operations
 
-On macOS/Windows or without BlueZ, BLE scanning still works but advertising is disabled.
+**Why not a `[ble-advertise]` extra?** `uv lock` resolves every declared extra
+when building the lockfile, so a Linux-only, pre-1.0 package would break the
+container build on every platform — including the ARM64 robots that will never
+advertise. `peer/ble_advertiser.py` imports it lazily and degrades to
+scan-only when it is absent, so a manual install is the honest trade.
+
+On macOS/Windows or without BlueZ, scanning still works; advertising is skipped
+with a log line.
 
 ---
 
