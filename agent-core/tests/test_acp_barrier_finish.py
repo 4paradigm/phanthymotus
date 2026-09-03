@@ -210,6 +210,33 @@ def test_missing_acp_callback_times_out_and_releases():
     assert not mcp_client._pending_actions
 
 
+def test_timeout_with_a_cancel_event_is_still_reported_as_timeout():
+    """Same silent timeout, but on the branch that takes a cancel_event.
+
+    `asyncio.wait()` — unlike `wait_for` — does not raise on timeout; it returns
+    with an empty `done`. The code fell through from there to the success path, so
+    a barrier that waited out its full timeout returned {"status": "completed"}
+    and `_acp_barrier_log` stayed silent.
+
+    This is the branch production always takes, in every interrupt mode:
+    `_run`/`_one_turn` create a fresh `cancel_event` per turn unconditionally
+    (llm.py:887), and `await_pending` branches on whether that argument is None,
+    not on whether it is set. The `wait_for` branch above — the one that does
+    raise — is only reachable from a direct call, so
+    test_missing_acp_callback_times_out_and_releases was passing on a path no
+    robot runs.
+    """
+    async def scenario():
+        _arm(timeout=0.1)
+        cancel = asyncio.Event()  # armed, but nothing ever sets it
+        return await asyncio.wait_for(_finish_barrier(cancel), timeout=2)
+
+    result = asyncio.run(scenario())
+    assert result['status'] == 'timeout'
+    assert result['actions'] == [SPEAK_ID]
+    assert not mcp_client._pending_actions
+
+
 def test_barrier_uses_the_longest_pending_timeout():
     """Two utterances in flight: the barrier must outlast the slower one."""
     async def scenario():

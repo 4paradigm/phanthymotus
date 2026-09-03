@@ -656,7 +656,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
             wait_task = asyncio.create_task(_wait_all())
             cancel_task = asyncio.create_task(cancel_event.wait())
             try:
-                done, pending = await asyncio.wait(
+                done, _unfinished = await asyncio.wait(
                     [wait_task, cancel_task],
                     timeout=effective_timeout,
                     return_when=asyncio.FIRST_COMPLETED,
@@ -677,7 +677,21 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                     _pending_timeouts.pop(aid, None)
                     _pending_tools.pop(aid, None)
                 return {"status": "cancelled"}
+            if wait_task not in done:
+                # Unlike wait_for, asyncio.wait() does not raise on timeout — it
+                # returns with an empty `done`. Falling through from here reported
+                # a silent timeout as {"status": "completed"}, so a barrier that
+                # waited out its full 120s looked identical to one that succeeded.
+                # That is precisely the case _acp_barrier_log was added to make
+                # attributable: an ACP completion callback that never arrives
+                # (self-signed cert rejected, AGENT_CORE_URL misconfigured).
+                # Converge on the TimeoutError path below, which already clears
+                # pending and reports "timeout".
+                raise asyncio.TimeoutError()
         else:
+            # Not reached from the agent loop: it creates a cancel_event for every
+            # turn (event/llm.py:887), so the branch above is the live one. Kept
+            # for direct callers.
             await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
 
         # 清理已完成的

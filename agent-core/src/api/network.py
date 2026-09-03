@@ -349,9 +349,79 @@ def _disconnect_wifi_sync():
     )
 
 
+_POLICY_TABLE_MIN = 200
+_POLICY_TABLE_MAX = 249
+
+
 def _policy_route_table_for(device: str) -> int:
-    """Deterministic private routing table number for a device (200-249)."""
-    return 200 + (zlib.crc32(device.encode()) % 50)
+    """Preferred private routing table number for a device (200-249).
+
+    Only a starting point — `_allocate_policy_table` may hand out a different one to
+    avoid a collision, or reuse whatever the connection already has.
+    """
+    return _POLICY_TABLE_MIN + (zlib.crc32(device.encode()) % 50)
+
+
+def _tables_of(ipv4: dict) -> set:
+    """Private-range table numbers an ipv4 setting refers to, via either its routing
+    rules or the `table` attribute of its routes."""
+    tables = set()
+    for entry in list(ipv4.get('routing-rules', [])) + list(ipv4.get('route-data', [])):
+        try:
+            table = int(entry.get('table', 0))
+        except (TypeError, ValueError):
+            continue
+        if _POLICY_TABLE_MIN <= table <= _POLICY_TABLE_MAX:
+            tables.add(table)
+    return tables
+
+
+def _allocate_policy_table(own_ipv4: dict, other_ipv4s: list, preferred: int) -> int:
+    """Pick the private table to use for one connection.
+
+    Reuse whatever this connection already refers to first. That keeps the number
+    stable across a WiFi card swap: the device name is MAC-derived, so a new card
+    renames the interface and `_policy_route_table_for` would hand out a different
+    number, stranding the routes and rule written for the old one — exactly what
+    happened on Bumi 2026-09-02 when a dead dongle was replaced (205 -> 218).
+
+    Otherwise take `preferred` if free, else the lowest free number in the range.
+    Deriving it from the device name alone collides: 50 slots and a crc32 means two
+    NICs on one host can land on the same table, and then their rules quietly share
+    one table and fight over it.
+    """
+    in_use = set()
+    for ipv4 in other_ipv4s:
+        in_use |= _tables_of(ipv4)
+
+    mine = _tables_of(own_ipv4)
+    reusable = sorted(mine - in_use)
+    if reusable:
+        return reusable[0]
+
+    if preferred not in in_use:
+        return preferred
+    for table in range(_POLICY_TABLE_MIN, _POLICY_TABLE_MAX + 1):
+        if table not in in_use:
+            return table
+    raise RuntimeError(
+        f'策略路由表号已用尽（{_POLICY_TABLE_MIN}-{_POLICY_TABLE_MAX}）')
+
+
+def _other_connection_ipv4s(bus, own_settings_path: str) -> list:
+    """ipv4 settings of every saved connection except `own_settings_path`."""
+    import dbus
+    settings_obj = bus.get_object(NM_IFACE, NM_SETTINGS_PATH)
+    settings_iface = dbus.Interface(settings_obj, NM_SETTINGS_IFACE)
+    results = []
+    for conn_path in settings_iface.ListConnections():
+        if str(conn_path) == own_settings_path:
+            continue
+        try:
+            results.append(_get_connection_settings(bus, str(conn_path)).get('ipv4', {}))
+        except Exception:
+            pass  # a connection we cannot read cannot be reasoned about; skip it
+    return results
 
 
 def _subnet_network(ip: str, prefix: int) -> str:
@@ -404,10 +474,16 @@ def _policy_route_data(table: int, network: str, prefix: int, gateway: str) -> l
     return entries
 
 
-def _without_policy_routes(route_data, table: int) -> list:
-    """`route_data` minus the entries we own, so a user's own static routes survive
-    both enabling and disabling."""
-    return [r for r in route_data if int(r.get('table', 0)) != table]
+def _without_policy_routes(route_data) -> list:
+    """`route_data` minus every entry we own, so a user's own static routes survive
+    both enabling and disabling.
+
+    Keyed on the whole private range rather than the one table currently in play:
+    a renumbering — a WiFi card swap renames the interface, so the old code derived
+    a different table — would otherwise strand the previous table's copies in the
+    profile forever, one stale pair per swap.
+    """
+    return [r for r in route_data if not _tables_of({'route-data': [r]})]
 
 
 def _set_policy_route_sync(device: str, enable: bool):
@@ -417,7 +493,10 @@ def _set_policy_route_sync(device: str, enable: bool):
     (asymmetric routing on multi-homed hosts).
 
     Implemented by *copying* the device's routes into a private table and pointing
-    a source-based `ip rule` at it, leaving the main table alone.
+    a source-based `ip rule` at it, leaving the main table alone. The table number
+    comes from `_allocate_policy_table`, which reuses whatever this connection already
+    refers to — the device name is MAC-derived, so deriving the number from it alone
+    renumbers on every card swap and strands the old copies.
 
     Do NOT reach for `ipv4.route-table` here, however natural it looks. It does not
     copy the connection's routes into the private table, it *relocates* them — the
@@ -456,12 +535,13 @@ def _set_policy_route_sync(device: str, enable: bool):
         raise RuntimeError(f'设备 "{device}" 当前未连接')
     settings_path = str(_get_prop(bus, active_conn_path, NM_ACTIVE_IFACE, 'Connection'))
 
-    table = _policy_route_table_for(device)
     conn_obj = bus.get_object(NM_IFACE, settings_path)
     conn_iface = dbus.Interface(conn_obj, NM_CONN_IFACE)
     settings = conn_iface.GetSettings()
     ipv4 = settings.setdefault('ipv4', dbus.Dictionary({}, signature='sv'))
-    kept_routes = _without_policy_routes(ipv4.get('route-data', []), table)
+    table = _allocate_policy_table(
+        ipv4, _other_connection_ipv4s(bus, settings_path), _policy_route_table_for(device))
+    kept_routes = _without_policy_routes(ipv4.get('route-data', []))
 
     if enable:
         ip4_path = str(_get_prop(bus, dev_path, NM_DEVICE_IFACE, 'Ip4Config'))
