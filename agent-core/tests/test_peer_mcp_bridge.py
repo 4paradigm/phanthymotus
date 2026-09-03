@@ -207,6 +207,54 @@ class TestCanvasGateExemption(unittest.TestCase):
         self.assertFalse(canvas_binding.is_peer_tool('mcp__mcp-1__peer'))
 
 
+class TestPeerToolsAreNotExpandedIntoTheToolList(unittest.TestCase):
+    """peer 工具**不能**进 LLM 的工具列表 —— 固定两个通用工具替代它。
+
+    展开过一版，量出来不成立：单个 schema 实测 613 字符（≈200 token），一台连线完整的
+    机器人绑 8–15 个工具，十台 peer 就是 ~100 个工具、每次请求多 ~20k token。而且在
+    上下文上限之前先坏两件事 —— 工具列表太长导致选错，以及工具列表位于缓存前缀里，
+    peer 上下线或重新广告都会把它改写、让缓存全部失效。
+
+    所以改成 peer_tools(peer) + peer_call(peer, tool, arguments_json)：都带 peer 参数，
+    无论多少台机器都只占两个 schema。
+    """
+
+    def _schemas(self, registry_patch):
+        import config
+        from event.llm import Event
+        with mock.patch.dict(mcp_client.registry, registry_patch, clear=True), \
+             mock.patch.object(config, 'main',
+                               {'canvas_layout': {'cards': [], 'execConnections': []}}):
+            return Event._get_bound_tool_schemas(Event.__new__(Event))
+
+    def test_a_peers_tools_are_not_appended(self):
+        mcp_id = 'peer:8bd2bf8fe8f8'
+        local = f'mcp__{mcp_id}__tts'
+        entry = {'transport': 'peer', 'online': True,
+                 'schemas': {local: {'name': local, 'description': '[Orin6] TTS'}}}
+        self.assertEqual(self._schemas({mcp_id: entry}), [])
+
+    def test_local_tools_still_require_a_canvas_connection(self):
+        entry = {'transport': 'http', 'online': True,
+                 'schemas': {'mcp__mcp-1__loco': {'name': 'mcp__mcp-1__loco'}}}
+        self.assertEqual(self._schemas({'mcp-1': entry}), [])
+
+    def test_the_pair_is_registered_as_system_tools(self):
+        src = (pathlib.Path(__file__).resolve().parents[1] / 'src/event/llm.py').read_text()
+        self.assertIn("('peer_tools', _peer_delegation.peer_tools)", src)
+        self.assertIn("('peer_call', _peer_delegation.peer_call)", src)
+
+    def test_the_cost_is_flat_in_fleet_size(self):
+        """无论几台 peer，追加的 schema 数都是 0 —— 这就是"永远两个工具"的含义。"""
+        many = {
+            f'peer:{i:012d}': {'transport': 'peer', 'online': True,
+                               'schemas': {f'mcp__peer:{i:012d}__t{j}': {'name': f't{j}'}
+                                           for j in range(15)}}
+            for i in range(30)
+        }
+        self.assertEqual(self._schemas(many), [])
+
+
 class TestDispatchRouting(unittest.TestCase):
     def test_call_tool_routes_peer_transport_to_the_bridge(self):
         src = (pathlib.Path(__file__).resolve().parents[1] / 'src/mcp_client.py').read_text()
@@ -216,3 +264,76 @@ class TestDispatchRouting(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestGenericPeerTools(unittest.IsolatedAsyncioTestCase):
+    """peer_tools / peer_call —— 固定两个工具覆盖任意规模的机群。"""
+
+    def setUp(self):
+        self.mcp_id = mcp_bridge.mcp_id_for(PEER_ID)
+        local = f'mcp__{self.mcp_id}__tts'
+        mcp_client.registry[self.mcp_id] = {
+            'name': 'Orin6 (peer)', 'transport': 'peer', 'online': True,
+            'tools': ['tts'],
+            'schemas': {local: {'name': local, 'description': '[Orin6] TTS — speak text',
+                                'parameters': {'type': 'object', 'properties': {
+                                    'action': {'type': 'string', 'enum': ['speak']},
+                                    'text': {'type': 'string'}}}}},
+            'remote_names': {local: REMOTE_TOOL},
+        }
+        self.addCleanup(mcp_client.registry.pop, self.mcp_id, None)
+
+    async def _tools(self, peer='Orin6'):
+        from peer import delegation
+        with mock.patch('peer.store.list_peers', return_value=[_peer()]):
+            return await delegation.peer_tools(peer)
+
+    async def _call(self, **kw):
+        from peer import delegation
+        seen = {}
+
+        async def _ct(full_name, args):
+            seen.update({'full_name': full_name, 'args': args})
+            return 'ok'
+        with mock.patch('peer.store.list_peers', return_value=[_peer()]), \
+             mock.patch('mcp_client.call_tool', side_effect=_ct):
+            out = await delegation.peer_call(**kw)
+        return out, seen
+
+    async def test_tools_lists_names_and_parameters(self):
+        out = await self._tools()
+        self.assertIn('tts', out)
+        self.assertIn('parameters', out)
+        self.assertIn('peer_call', out, '要告诉模型下一步用什么调它')
+
+    async def test_tools_rejects_an_unknown_peer_with_the_options(self):
+        out = await self._tools(peer='Nope')
+        self.assertIn('Error', out)
+        self.assertIn('Orin6', out)
+
+    async def test_call_goes_through_call_tool_not_around_it(self):
+        """走 call_tool 才能沿用同一套历史与 ACP 处理。"""
+        out, seen = await self._call(peer='Orin6', tool='tts',
+                                     arguments_json='{"action": "speak", "text": "hi"}')
+        self.assertEqual(out, 'ok')
+        self.assertEqual(seen['full_name'], f'mcp__{self.mcp_id}__tts')
+        self.assertEqual(seen['args'], {'action': 'speak', 'text': 'hi'})
+
+    async def test_call_explains_a_bad_json_payload(self):
+        out, seen = await self._call(peer='Orin6', tool='tts', arguments_json='action=speak')
+        self.assertIn('JSON', out)
+        self.assertEqual(seen, {}, '解析失败不该发出请求')
+
+    async def test_call_refuses_a_non_object_payload(self):
+        out, _ = await self._call(peer='Orin6', tool='tts', arguments_json='["speak"]')
+        self.assertIn('object', out)
+
+    async def test_call_says_so_when_the_peer_offers_nothing(self):
+        mcp_client.registry.pop(self.mcp_id, None)
+        out, seen = await self._call(peer='Orin6', tool='tts', arguments_json='{}')
+        self.assertIn('peer_tools', out)
+        self.assertEqual(seen, {})
+
+    async def test_default_arguments_are_an_empty_object(self):
+        out, seen = await self._call(peer='Orin6', tool='tts')
+        self.assertEqual(seen['args'], {})

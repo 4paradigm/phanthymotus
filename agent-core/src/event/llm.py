@@ -737,6 +737,8 @@ class Event:
             ('subagent_result', _sa_tools.subagent_result),
             ('peer_list', _peer_delegation.peer_list),
             ('peer_state', _peer_delegation.peer_state),
+            ('peer_tools', _peer_delegation.peer_tools),
+            ('peer_call', _peer_delegation.peer_call),
             ('peer_delegate', _peer_delegation.peer_delegate),
             # Desktop tools (Claude Code 风格)
             ('Bash', self._desktop_tools.Bash),
@@ -815,6 +817,16 @@ class Event:
                         if card_id:
                             self._bound_instance_ids[split_name] = card_id
 
+        # Peer tools are deliberately **not** added here. They reach the model
+        # through the `peer_tools` / `peer_call` pair instead (peer/delegation.py),
+        # which costs two schemas no matter how large the fleet gets.
+        #
+        # Expanding them was tried and does not scale: one schema measured 613
+        # chars (~200 tokens), a fully-wired robot binds 8–15 tools, so ten peers
+        # would add ~100 tools and ~20k tokens **per request**. Two things break
+        # before the context limit does — tool-choice accuracy across a list that
+        # long, and the prompt cache, since the tool list sits in the cached prefix
+        # and a peer going offline or re-advertising rewrites it.
         if not schemas:
             # 没有绑定任何工具时，仅使用系统工具（不暴露全部 MCP 工具）
             return []

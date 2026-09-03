@@ -271,3 +271,93 @@ async def peer_state(
         if topics:
             lines.append(f'    topics ({len(topics)}): ' + ', '.join(topics))
     return '\n'.join(lines)
+
+
+async def peer_tools(
+    peer: Annotated[str, 'Name or peer_id of the peer whose tools you want to see.'],
+) -> str:
+    """List the tools a paired peer will let this agent call, with their parameters.
+
+    Deliberately a lookup rather than schemas in this agent's tool list. Expanding
+    them was tried and does not scale: one schema measured ~200 tokens, a wired
+    robot binds 8–15 tools, so ten peers would add ~100 tools and ~20k tokens to
+    **every** request. Tool-choice accuracy and the prompt cache both suffer before
+    the context limit does — the tool list sits in the cached prefix, and a peer
+    going offline rewrites it.
+
+    So the cost of knowing what a fleet can do is one call, paid when it matters,
+    and `peer_tools` + `peer_call` stay two tools whatever the fleet size.
+    """
+    import json as _json
+    from peer import mcp_bridge as _bridge
+    from peer import naming as _naming
+    from peer import store as _store
+
+    peers = _store.list_peers()
+    found, why = _naming.resolve(peer, peers)
+    if found is None:
+        return f'Error: {why}'
+
+    import mcp_client as _mc
+    mcp_id = _bridge.mcp_id_for(found['peer_id'])
+    entry = _mc.registry.get(mcp_id)
+    if not entry:
+        return (f'{peer} is not offering any tools right now. It may be unreachable, or '
+                f'have nothing wired to its decision core — peer_list shows its state.')
+
+    label = _naming.labels(peers)[found['peer_id']]
+    lines = [f'{label} offers {len(entry.get("tools") or [])} tool(s). '
+             f'Call one with peer_call(peer="{label}", tool=..., arguments_json=...):']
+    for local, schema in (entry.get('schemas') or {}).items():
+        tool = local.split('__', 2)[-1]
+        desc = (schema.get('description') or '').strip()
+        params = schema.get('parameters') or {}
+        lines.append(f'- {tool}: {desc}')
+        if params.get('properties'):
+            lines.append(f'    parameters: {_json.dumps(params, ensure_ascii=False)}')
+    if not entry.get('online', True):
+        lines.append('(this peer is currently unreachable; the list is its last known one)')
+    return '\n'.join(lines)
+
+
+async def peer_call(
+    peer: Annotated[str, 'Name or peer_id of the peer to call. See peer_list.'],
+    tool: Annotated[str, 'Tool name as listed by peer_tools for that peer.'],
+    arguments_json: Annotated[str, 'Arguments as a JSON object string, e.g. {"action": "speak", "text": "hi"}.'] = '{}',
+) -> str:
+    """Call one tool on a paired peer and return its result.
+
+    The peer decides whether to allow it: its role for us, its `tool_filter`, and
+    whether the tool is wired to *its* decision core. A refusal comes back as the
+    far side's own message, which is the part that says which of those turned it
+    down.
+
+    Arguments travel as a JSON string because the tool-schema builder only maps
+    str/int/float/bool — an object parameter would raise at registration time.
+    """
+    import json as _json
+    import mcp_client as _mc
+    from peer import mcp_bridge as _bridge
+    from peer import naming as _naming
+    from peer import store as _store
+
+    peers = _store.list_peers()
+    found, why = _naming.resolve(peer, peers)
+    if found is None:
+        return f'Error: {why}'
+
+    try:
+        args = _json.loads(arguments_json or '{}')
+    except Exception as e:
+        return (f'Error: arguments_json must be a JSON object string, e.g. '
+                f'{{"action": "speak", "text": "hello"}} — {type(e).__name__}: {e}')
+    if not isinstance(args, dict):
+        return 'Error: arguments_json must decode to an object, not a list or scalar.'
+
+    mcp_id = _bridge.mcp_id_for(found['peer_id'])
+    if mcp_id not in _mc.registry:
+        return (f'{peer} is not offering tools right now — peer_tools shows what a peer '
+                f'offers, peer_list shows whether it is reachable.')
+    # Through call_tool rather than the bridge directly, so a peer tool takes the
+    # same dispatch path as any other: same history, same ACP handling.
+    return await _mc.call_tool(f'mcp__{mcp_id}__{tool}', args)
