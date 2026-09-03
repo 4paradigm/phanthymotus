@@ -1,7 +1,7 @@
 """
 peer/dds_state.py — ROS2 DDS state sharing (optional).
 
-Publishes local ROS topic list to `/motus/peer/{peer_id}/topics` and subscribes
+Publishes local ROS topic list to `/motus/peer/p{peer_id}/topics` and subscribes
 to other peers' topics. This is **state broadcast only** — no commands, because
 DDS has no authentication and anyone on ROS_DOMAIN_ID can write.
 
@@ -29,6 +29,21 @@ _thread: threading.Thread | None = None
 # owns the context; shutting down someone else's would tear the whole DDS bus
 # out from under the inspection API.
 _owns_rclpy = False
+
+
+def topic_for(peer_id: str) -> str:
+    """ROS topic carrying a peer's topic list.
+
+    The `p` prefix is load-bearing. ROS 2 requires every token of a topic name
+    to start with a letter or underscore, but a peer_id is a hex fingerprint —
+    10 of the 16 possible leading characters are digits, so roughly 62% of
+    peers would produce an invalid name and rclpy would raise
+    InvalidTopicNameException when creating the publisher.
+
+    Publisher and subscriber must both go through here; deriving the name
+    twice by hand is how the two ends silently stop matching.
+    """
+    return f'/motus/peer/p{peer_id}/topics'
 
 
 def is_available() -> bool:
@@ -103,7 +118,7 @@ def _run_loop():
     my_peer_id = identity.peer_id()
 
     # Publish our topic list every 5s
-    topic_name = f'/motus/peer/{my_peer_id}/topics'
+    topic_name = topic_for(my_peer_id)
     _publisher = _node.create_publisher(String, topic_name, 10)
 
     # Subscribe to all peers we know about (discovered via mDNS/static)
@@ -140,7 +155,7 @@ def _publish_our_topics():
 
 
 def _subscribe_to_peers():
-    """Subscribe to /motus/peer/{peer_id}/topics for all discovered peers."""
+    """Subscribe to each discovered peer's topic-list channel."""
     from peer.registry import registry
     from std_msgs.msg import String
 
@@ -149,7 +164,7 @@ def _subscribe_to_peers():
         peer_id = advert['peer_id']
         if peer_id in _subscribers:
             continue
-        topic_name = f'/motus/peer/{peer_id}/topics'
+        topic_name = topic_for(peer_id)
         try:
             sub = _node.create_subscription(
                 String, topic_name,

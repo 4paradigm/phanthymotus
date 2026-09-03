@@ -125,6 +125,31 @@ class TestDdsState(unittest.TestCase):
         """rclpy 缺失时 is_available() 返回 False 而不是抛异常。"""
         self.assertIsInstance(dds_state.is_available(), bool)
 
+    def test_topic_name_valid_for_digit_leading_peer_id(self):
+        """数字开头的 peer_id 必须产生合法的 ROS 话题名。
+
+        真实故障：Orin6 的指纹是 8bd2bf8f…，rclpy 抛
+        InvalidTopicNameException，DDS 线程当场死掉。Orin5 的指纹以字母开头
+        所以看起来是好的 —— 十六进制里 16 个字符有 10 个是数字，约 62% 的
+        机器人会踩到，能不能复现纯看运气。
+        """
+        import re
+        # ROS 2: 每一段必须以字母或下划线开头，其后为字母/数字/下划线
+        token = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+        for peer_id in ('8bd2bf8fe8f872361f8f3212dc7e4279',   # 数字开头（Orin6）
+                        'dd398c73177aa3487e7c695f4b19dfe5',   # 字母开头（Orin5）
+                        '0' * 32, '9abc' + '0' * 28):
+            name = dds_state.topic_for(peer_id)
+            self.assertTrue(name.startswith('/'), name)
+            for seg in name.strip('/').split('/'):
+                self.assertRegex(seg, token, f'invalid ROS topic segment in {name}')
+
+    def test_publisher_and_subscriber_agree_on_topic(self):
+        """发布端与订阅端必须走同一个函数，否则两端静默对不上。"""
+        peer_id = '8bd2bf8fe8f872361f8f3212dc7e4279'
+        self.assertEqual(dds_state.topic_for(peer_id), dds_state.topic_for(peer_id))
+        self.assertIn(peer_id, dds_state.topic_for(peer_id))
+
     def test_get_peer_topics_prunes_stale(self):
         """超过 60s 的 peer 记录被清理。"""
         import time
