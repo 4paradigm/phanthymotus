@@ -25,6 +25,10 @@ _subscribers: dict[str, object] = {}
 _peer_topics: dict[str, dict] = {}  # peer_id → {topics: [...], last_seen: float}
 _running = False
 _thread: threading.Thread | None = None
+# True only if this module called rclpy.init() itself. ros2_bridge.py normally
+# owns the context; shutting down someone else's would tear the whole DDS bus
+# out from under the inspection API.
+_owns_rclpy = False
 
 
 def is_available() -> bool:
@@ -81,7 +85,18 @@ def _run_loop():
 
     global _node, _publisher
 
-    rclpy.init()
+    # rclpy's context is process-global and may only be initialised once.
+    # ros2_bridge.py owns that lifecycle (it calls rclpy.init() at startup and
+    # rclpy.shutdown() on exit), so this thread must attach to the existing
+    # context rather than create one — calling init() again raises
+    # "Context.init() must only be called once" and kills this thread.
+    if not rclpy.ok():
+        # No bridge running (rclpy present but never initialised). Own it here,
+        # and remember that we did so cleanup knows whether it may shut down.
+        rclpy.init()
+        global _owns_rclpy
+        _owns_rclpy = True
+
     _node = Node('motus_peer_dds_state')
 
     from peer import identity
@@ -105,7 +120,11 @@ def _run_loop():
         rclpy.spin_once(_node, timeout_sec=1.0)
 
     _cleanup()
-    rclpy.shutdown()
+    # Only tear down the context if we created it. ros2_bridge.py's bus, the
+    # inspection API and every /ws/bus/{topic} subscriber share this context —
+    # shutting down one we merely borrowed would kill all of them.
+    if _owns_rclpy:
+        rclpy.shutdown()
 
 
 def _publish_our_topics():
