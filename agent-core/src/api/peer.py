@@ -33,7 +33,6 @@ from peer import delegation
 from channel.adapters import lan
 import mcp_client
 from subagent.protocol import SubagentSpec
-from subagent.manager import manager as subagent_manager
 
 
 router = fastapi.APIRouter(prefix='/api/peer', tags=['peer'])
@@ -415,6 +414,19 @@ async def delegate_task(req: Request):
 
     # Prepare augmented spec (increment hop, intersect filter)
     augmented_spec = delegation.prepare_delegated_spec(peer_id, spec)
+
+    # The manager is owned by the agent loop (event/llm.py) and only exists once
+    # that has initialised, so it is resolved per-request rather than imported at
+    # module load. Importing a manager singleton at import time is what broke
+    # startup before: subagent.manager exposes only the class.
+    import subagent
+    subagent_manager = subagent._manager_instance
+    if subagent_manager is None:
+        raise fastapi.HTTPException(
+            503,
+            'agent loop is not running — delegation needs the local subagent '
+            'manager, which starts with the main event loop'
+        )
 
     # Spawn and wait
     try:
