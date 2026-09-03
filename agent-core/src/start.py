@@ -388,6 +388,14 @@ async def lifespan(app):
     _ros2_loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, ros2_bridge.start, _ros2_loop)
 
+    # Confirm DDS isolation actually took effect. A missing or malformed profile
+    # makes FastDDS fall back to every interface silently — the robot keeps
+    # working and nothing looks wrong until another robot answers a command
+    # meant for this one. Checked after the bridge starts so real DDS sockets
+    # exist to inspect.
+    import dds_isolation
+    dds_isolation.check_and_report()
+
     # Pre-create audio publisher so DDS discovery completes before first use
     _ensure_audio_pub()
     _ensure_mic_pub()

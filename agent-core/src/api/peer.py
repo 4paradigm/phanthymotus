@@ -357,6 +357,17 @@ async def provider_status():
     return {'providers': registry.provider_status()}
 
 
+@router.get('/dds_isolation')
+async def dds_isolation_status():
+    """DDS 是否真的被隔离在本机。
+
+    值得单独暴露：隔离失效时没有任何外部症状——机器人照常工作，直到某天另一台
+    机器人替它回答了指令。运维需要一个能直接问的地方，而不是去翻启动日志。
+    """
+    import dds_isolation
+    return dds_isolation.check_and_report()
+
+
 @router.get('/dds_topology')
 async def dds_topology():
     """ROS2 topic lists from all peers (DDS state sharing).
