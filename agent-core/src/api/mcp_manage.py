@@ -761,6 +761,29 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             client_cfg = config.main.get('client', {})
             client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model, 'think_mode': think_mode}]
             config.main['client'] = client_cfg
+
+            # Mirror into services.llm as well. The dashboard has two places
+            # that configure the LLM — Settings (api/config.py) and this
+            # decision_core card — and only Settings used to write both keys.
+            # Configuring from the card therefore left services.llm empty, so
+            # the Settings page showed blank fields for a working setup, and
+            # saving that blank form wrote the emptiness back through to
+            # client.llm and killed the LLM. Keep the two entry points
+            # symmetric; services.llm is what the Settings form reads.
+            services_cfg = config.main.get('services', {})
+            existing_llm = services_cfg.get('llm', {}) or {}
+            services_cfg['llm'] = {
+                'url': llm_url,
+                'key': llm_key,
+                'model': llm_model,
+                # Preserve fields this card does not expose rather than
+                # dropping them; think_mode is set here, others are not.
+                'think_mode': think_mode,
+                **{k: v for k, v in existing_llm.items()
+                   if k not in ('url', 'key', 'model', 'think_mode')},
+            }
+            config.main['services'] = services_cfg
+
             # Reinitialize the LLM client with new config
             import client as client_mod
             client_mod.llm = client_mod.llm.__class__()
