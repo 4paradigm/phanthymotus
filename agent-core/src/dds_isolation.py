@@ -59,8 +59,12 @@ def ensure_profile() -> str:
                 return (f'⚠ {path} 是目录且无法删除（{e}）—— 这是 bind mount 在宿主机'
                         f'缺文件时自动创建的，隔离不会生效。请手工删除后重启相关容器')
             _write_profile(path)
-            return (f'{path} 原本是个目录（bind mount 自动创建），已替换为文件。'
-                    f'**其它容器需要重启**才能看到它')
+            return (
+                f'{path} 原本是个目录（宿主机缺文件时 bind mount 自动创建），已替换为文件。\n'
+                f'[dds] ⚠ 其它 DDS 容器现在会启动失败，报 '
+                f'"not a directory: Are you trying to mount a directory onto a file"'
+                f' —— 它们创建时把挂载类型固化成了目录，docker start 改不了。\n'
+                f'[dds] ⚠ 必须 **重建**（docker rm + run / compose up -d），仅 restart 无效。')
 
         if not os.path.exists(path):
             _write_profile(path)

@@ -12,6 +12,7 @@
  */
 
 import { showToast } from './toast.js';
+import { shouldAdoptLiveTopics } from './topic-derive.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -257,14 +258,38 @@ export function updateCanvasMcps(mcps) {
     const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
     const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
     if (typeof toolObj === 'object' && toolObj.multiInstance) {
-      // (skip topic update — fall through to configSchema check below)
-    } else {
-      if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  {
-        // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
-        if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
+      // Skipping the update wholesale was too broad. It exists to stop a tool's
+      // schema-level topic_out — which for a multiInstance tool is format-only
+      // by design — from clobbering the per-instance topic. But a *running*
+      // instance reports its real topic through the same field, and that value
+      // must win over whatever the card has cached.
+      //
+      // On R1 the TTS card held '/remote_control/message/tts', derived from its
+      // upstream when the card was wired. The plugin actually publishes on
+      // '/perception/tts' (it starts with no input topic, so it takes the
+      // default branch). The dashboard subscribed to the derived name, where
+      // nothing is ever published: the robot spoke, but there was no waveform
+      // and playback was silent.
+      //
+      // Only accept an entry that carries a real topic; a format-only payload
+      // still falls through untouched. Rule lives in topic-derive.js so it is
+      // testable and shared with the non-multiInstance branch below.
+      if (shouldAdoptLiveTopics(liveTopicOut, card.topicOut, true)) {
+        card.topicOut = liveTopicOut;
+        topicsChanged = true;
       }
-      if (liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
-        if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
+      if (shouldAdoptLiveTopics(liveTopicIn, card.topicIn, true)) {
+        card.topicIn = liveTopicIn;
+        topicsChanged = true;
+      }
+    } else {
+      if (shouldAdoptLiveTopics(liveTopicIn, card.topicIn, false)) {
+        card.topicIn = liveTopicIn;
+        topicsChanged = true;
+      }
+      if (shouldAdoptLiveTopics(liveTopicOut, card.topicOut, false)) {
+        card.topicOut = liveTopicOut;
+        topicsChanged = true;
       }
     }
     // Re-fetch driver-inferred topics for static (non-multiInstance) cards that still have no real topic path

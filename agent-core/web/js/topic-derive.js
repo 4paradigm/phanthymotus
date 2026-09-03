@@ -122,3 +122,29 @@ export async function resolveDerivedTopics(cards, connections, opts = {}) {
   }
   return resolved;
 }
+
+/**
+ * Should a live topic report replace what the card has cached?
+ *
+ * Split out of canvas.js so the rule can be tested, and because getting it
+ * wrong is silent: the card keeps a plausible-looking topic that nothing ever
+ * publishes on, so a stream simply stays empty.
+ *
+ * For a multiInstance tool the *schema* carries topic_out with a format and no
+ * topic, and that must never overwrite a resolved instance topic. A *running*
+ * instance reports its real topic through the same field, and that one has to
+ * win — including when it disagrees with a value derived earlier from the
+ * card's upstream.
+ *
+ * The R1 case: the TTS card had '/remote_control/message/tts', derived when it
+ * was wired. The plugin publishes on '/perception/tts' (it runs with no input
+ * topic and takes the default). The dashboard subscribed to the derived name,
+ * where nothing is published — the robot spoke, but no waveform, no playback.
+ */
+export function shouldAdoptLiveTopics(live, cached, multiInstance) {
+  if (!live?.length) return false;
+  if (JSON.stringify(live) === JSON.stringify(cached)) return false;
+  const liveHasReal = live.some(t => t.topic);
+  if (multiInstance) return liveHasReal;      // format-only payloads stay ignored
+  return liveHasReal || !cached?.some(t => t.topic);
+}

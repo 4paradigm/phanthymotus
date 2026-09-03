@@ -153,7 +153,11 @@ class TestDdsIsolation(unittest.TestCase):
             self.assertIn('缺失', msg)
 
     def test_ensure_profile_replaces_the_phantom_directory(self):
-        """目录会被就地换成文件，并提示其它容器需要重启。"""
+        """目录会被就地换成文件，并提示其它容器需要**重建**。
+
+        文案上"重启"是不够的：容器创建时把挂载类型固化成了目录，docker start
+        改不了它，只会一直报 "not a directory"。R1 上照着"重启"做了一轮才发现。
+        """
         with tempfile.TemporaryDirectory() as d:
             bundled = os.path.join(d, 'bundled.xml')
             target = os.path.join(d, 'dds-local.xml')
@@ -164,7 +168,7 @@ class TestDdsIsolation(unittest.TestCase):
                  mock.patch.dict(os.environ, {'FASTRTPS_DEFAULT_PROFILES_FILE': target}):
                 msg = dds_isolation.ensure_profile()
             self.assertTrue(os.path.isfile(target))
-            self.assertIn('重启', msg, '必须提示其它容器要重启才能看到文件')
+            self.assertIn('重建', msg, '必须说清是重建，restart 改不了已固化的挂载类型')
 
     def test_ensure_profile_updates_stale_content(self):
         """内容与镜像不一致时更新，一致则不动（避免每次启动都写盘）。"""
