@@ -58,7 +58,7 @@ def _detect_motus_targets(
             continue
         parts = Path(f).parts
         top = parts[0] if parts else ""
-        if top == "agent-core":
+        if top in {"agent-core", "memory-core"}:
             targets.add(BuildTarget.CORE)
         elif top == "perception":
             targets.add(BuildTarget.PERCEPTION)

@@ -543,6 +543,7 @@ async function _confirmLoad() {
     if (_alignVersions) msg += '\n相关容器已对齐到方案记录的版本。';
     if (needs.length) msg += `\n有 ${needs.length} 个脱敏字段需要补填，见「当前方案」。`;
     if (failed.length) msg += `\n以下技能安装失败：${failed.map(f => f.slug).join('、')}`;
+    if (json.data.warning) msg += `\n${json.data.warning}`;
     alert(msg);
   } catch (e) {
     confirmBtn.disabled = false;

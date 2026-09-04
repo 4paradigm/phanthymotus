@@ -82,7 +82,9 @@ def build_context(
         return _driver_context(driver_paths, changed_files)
 
     # phanthymotus: core, perception and actucore can all appear in one PR.
-    touches_core = any(f.startswith("agent-core/") for f in changed_files)
+    touches_core = any(
+        f.startswith(("agent-core/", "memory-core/")) for f in changed_files
+    )
     touches_perc = any(f.startswith("perception/") for f in changed_files)
     touches_actu = any(f.startswith("actucore/") for f in changed_files)
 
@@ -92,6 +94,8 @@ def build_context(
         label.append("agent-core")
         # No agent-core/README.md exists — these are the real references.
         docs += ["CONTRIBUTING.md", "README.md"]
+        if any(f.startswith("memory-core/") for f in changed_files):
+            docs.append("memory-core/README.md")
     if touches_perc:
         names.append("perception.md")
         label.append("perception")

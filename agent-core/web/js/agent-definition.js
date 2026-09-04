@@ -35,6 +35,9 @@ function show() {
         taIdentity.value = res.data.identity || '';
         taSystem.value = res.data.system || '';
         taMemory.value = res.data.memory || '';
+        if (res.data.memoryStatus?.warning) {
+          alert(res.data.memoryStatus.warning);
+        }
       }
     })
     .catch(err => console.error('[agent-def] load failed:', err));
@@ -58,11 +61,14 @@ async function save() {
       }),
     });
     const res = await resp.json();
-    if (res.code === 200) {
+    if (resp.ok && res.code === 200) {
       btnSave.textContent = '已保存';
+      if (res.warning || res.memoryStatus?.warning) {
+        alert(res.warning || res.memoryStatus.warning);
+      }
       setTimeout(() => { btnSave.textContent = '保存'; }, 1500);
     } else {
-      alert('保存失败: ' + (res.message || '未知错误'));
+      alert('保存失败: ' + (res.detail || res.message || `HTTP ${resp.status}`));
       btnSave.textContent = '保存';
     }
   } catch (err) {

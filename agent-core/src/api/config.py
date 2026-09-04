@@ -5,6 +5,7 @@ from typing import List
 import fastapi
 from pydantic import BaseModel
 
+import agent_memory
 import config
 import aiohttp
 import openai as openai_lib
@@ -939,14 +940,44 @@ class ResetRequest(BaseModel):
     skills: bool = False
 
 
+def _memory_defaults_dir():
+    import pathlib
+
+    installed = pathlib.Path('/opt/defaults/memory')
+    if installed.exists():
+        return installed
+    return pathlib.Path('./resource/memory/defaults')
+
+
 @router.post('/reset')
 async def reset_config(req: ResetRequest):
     import shutil
     import pathlib
     reset_items = []
+    memory_snapshot = None
 
-    defaults_dir = pathlib.Path('/opt/defaults/memory')
+    defaults_dir = _memory_defaults_dir()
     memory_dir = pathlib.Path('./resource/memory')
+
+    # Commit the durable memory replacement before changing any sibling reset
+    # targets.  A storage failure must not report a partially successful reset.
+    if req.memory:
+        src = defaults_dir / 'prompt_memory_init.md'
+        if not src.exists():
+            raise fastapi.HTTPException(status_code=500, detail='默认长期记忆文件不存在')
+        try:
+            memory_snapshot = await agent_memory.replace(
+                src.read_text(),
+                actor_key='system:reset',
+                reason='memory_reset',
+            )
+        except agent_memory.AgentMemoryCommitUncertainError as error:
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail='长期记忆重置结果无法确认，请检查存储状态',
+            ) from error
+        except agent_memory.AgentMemoryError as error:
+            raise fastapi.HTTPException(status_code=503, detail='长期记忆存储暂不可用') from error
 
     if req.chat_history:
         import chat_history
@@ -973,10 +1004,6 @@ async def reset_config(req: ResetRequest):
         reset_items.append('identity')
 
     if req.memory:
-        src = defaults_dir / 'prompt_memory_init.md'
-        dst = memory_dir / 'prompt_memory.md'
-        if src.exists():
-            shutil.copy2(src, dst)
         reset_items.append('memory')
 
     if req.skills:
@@ -1052,6 +1079,19 @@ async def reset_config(req: ResetRequest):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
 
-    return {'ok': True, 'reset': reset_items}
-
-
+    result = {'ok': True, 'reset': reset_items}
+    if memory_snapshot is not None:
+        warning = (
+            None
+            if memory_snapshot.fallback_ready
+            else agent_memory.COMPATIBILITY_WARNING
+        )
+        result['memoryStatus'] = {
+            'backend': memory_snapshot.backend,
+            'revision': memory_snapshot.revision,
+            'fallback_ready': memory_snapshot.fallback_ready,
+            'warning': warning,
+        }
+        if warning:
+            result['warning'] = warning
+    return result

@@ -149,7 +149,10 @@ All runtime configuration is managed through the Web UI and persisted to SQLite 
 ### Prompt / Memory System
 
 - **L1**: `resource/memory/prompt_system.md` (system rules, read-only)
-- **L1 Memory**: `resource/memory/prompt_memory.md` (LLM-editable long-term memory)
+- **L1 Memory**: `memory-core` stores the Agent-owned canonical prompt in
+  `resource/memory.db`; `resource/memory/prompt_memory.md` is its compatibility
+  mirror and the direct backend when `MEMORY_CORE_ENABLED=0`; a hidden state
+  file safely reconciles writes made in that mode when Memory Core is re-enabled
 - **L2**: Environment snapshot (devices, status, recent events) — built dynamically
 - **L3**: Conversation history (configurable limit)
 - **L4**: Trigger event

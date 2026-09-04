@@ -390,19 +390,23 @@ function _initResetModal() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (res.ok) {
-        overlay.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
-        if (restartServices) {
-          // Show restart waiting overlay
-          close();
-          _showRestartWaiting();
-        } else {
-          btnConfirm.textContent = '已完成';
-          setTimeout(() => { close(); btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 1000);
-        }
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok || payload.ok === false) {
+        throw new Error(payload.detail || payload.message || `HTTP ${res.status}`);
+      }
+      if (payload.warning) alert(payload.warning);
+      overlay.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
+      if (restartServices) {
+        // Show restart waiting overlay
+        close();
+        _showRestartWaiting();
+      } else {
+        btnConfirm.textContent = '已完成';
+        setTimeout(() => { close(); btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 1000);
       }
     } catch (e) {
       console.error('[reset] failed:', e);
+      alert('重置失败: ' + e.message);
       btnConfirm.textContent = '失败';
       setTimeout(() => { btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 2000);
     }

@@ -24,6 +24,7 @@ L4  当前触发       本轮触发该次推理的事件，用 XML 格式标注�
 import datetime
 import pathlib
 
+import agent_memory
 import config
 import event_bus
 
@@ -33,38 +34,47 @@ _TZ_CN = datetime.timezone(datetime.timedelta(hours=8))
 
 # ── L1 缓存 ──────────────────────────────────────────────────────────────────
 
-_l1_cache: dict = {'mtime': 0.0, 'content': ''}
+_l1_cache: dict = {'fingerprint': None, 'content': ''}
 
 
 def _system_definition() -> str:
-    """读取 L1 base prompt（含 system prompt + 身份定义 + 长期记忆），带 mtime 缓存。"""
+    """读取 L1 base prompt（含 system prompt + 身份定义 + 长期记忆）。"""
     system_path = pathlib.Path(config.main['event']['llm']['prompt_system'])
     identity_path = pathlib.Path('./resource/memory/identity.md')
-    memory_path = pathlib.Path(config.main['event']['llm']['prompt_memory'])
+    memory = agent_memory.snapshot()
 
-    # 检查文件修改时间
-    paths = [system_path, memory_path]
+    # Memory Core revision joins the file mtimes in the cache key.  A memory
+    # update therefore becomes visible on the next turn without making L1
+    # volatile inside an active turn.
+    paths = [system_path]
     if identity_path.exists():
         paths.append(identity_path)
-    max_mtime = max(p.stat().st_mtime for p in paths)
+    fingerprint = (
+        tuple((str(path), path.stat().st_mtime_ns) for path in paths),
+        memory.cache_key,
+    )
 
-    if max_mtime == _l1_cache['mtime']:
+    if fingerprint == _l1_cache['fingerprint']:
         return _l1_cache['content']
 
     # 重建
     system = system_path.read_text()
     identity = identity_path.read_text() if identity_path.exists() else ''
-    memory = memory_path.read_text()
 
     parts = [system]
     if identity.strip():
         parts.append("\n\n---以下是你的身份定义（不可修改）---\n\n" + identity)
-    parts.append("\n\n---以下是你的长期记忆，可通过记忆工具修改---\n\n" + memory)
+    parts.append("\n\n---以下是你的长期记忆，可通过记忆工具修改---\n\n" + memory.text)
 
     content = ''.join(parts)
-    _l1_cache['mtime'] = max_mtime
+    _l1_cache['fingerprint'] = fingerprint
     _l1_cache['content'] = content
     return content
+
+
+def capture_l1() -> str:
+    """Freeze the complete L1 definition for one decision-loop turn."""
+    return _system_definition()
 
 
 # ── L2 静态部分（设备/工具/技能）──────────────────────────────────────────────
@@ -247,7 +257,12 @@ def _trigger_message(event: dict) -> str:
 
 # ── 公共入口 ──────────────────────────────────────────────────────────────────
 
-def build_system(mcp_registry: dict, bound_tools: set | None = None) -> dict:
+def build_system(
+    mcp_registry: dict,
+    bound_tools: set | None = None,
+    *,
+    frozen_l1: str | None = None,
+) -> dict:
     """构建 system message（L1 + L2-static）。
 
     该消息在 turn 内应被冻结复用，不要每轮重建。
@@ -255,7 +270,9 @@ def build_system(mcp_registry: dict, bound_tools: set | None = None) -> dict:
     """
     return {
         'role': 'system',
-        'content': _system_definition() + '\n\n' + _env_static(mcp_registry, bound_tools),
+        'content': (frozen_l1 if frozen_l1 is not None else _system_definition())
+        + '\n\n'
+        + _env_static(mcp_registry, bound_tools),
     }
 
 
