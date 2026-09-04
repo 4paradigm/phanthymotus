@@ -60,6 +60,107 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 
 硬件驱动在独立仓库维护：**[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**。
 
+### 多机协同（Multi-Agent Peers）
+
+> **状态：部分实现。** 在两台 Orin 测试机上逐项实测的结果：
+>
+> | 部分 | 状态 |
+> |---|---|
+> | mDNS 发现、SAS 配对 | 可用 —— 两台互相配对，角色 `operator` |
+> | 状态共享（签名 HTTPS） | 可用 —— 双向都拿到对端话题清单，5s 刷新 |
+> | 工具代理**入向**（服务对端） | 可用 —— 签名 `tools/list` 只返回接收方画布上绑定的工具 |
+> | 工具代理**出向**（调用对端工具） | **未实现** —— 没有任何地方把 peer 注册成合成 MCP 条目，本机 LLM 看不到也调不到 |
+> | 消息级（`lan` ChannelAdapter） | 代码在，**未验证** —— 两台都没有配置 `lan` 渠道 |
+> | 任务委派（`peer_delegate`） | 代码与 hop 限制都在，**未做跨机验证** |
+> | 云端名册发现 | 桩 |
+> | 超过两台 peer | 从未尝试 |
+>
+> 飞书 bot 互通（`bot_to_bot_enabled` + `trusted_bots`，见[飞书渠道配置](docs/feishu-channel-setup.md)）
+> 仍然作为依赖公网的那条路径存在。
+
+![多机协同与安全](docs/images/peer-mesh.png)
+
+> 可编辑源文件：[`docs/peer-mesh.svg`](docs/peer-mesh.svg) —— 改完记得重新导出 PNG。
+
+机器人之间以**对等（peer）**方式协作：每一侧都跑自己的 Agent Core，各自保有自主权。发现、传输、信任是三个
+互相独立、可插拔的层，所以一个 peer 可以「mDNS 发现 + mTLS 通信」，也可以「云端名册发现 + 飞书通信」。
+
+**发现层** —— 所有 provider 产出同一种 `PeerAdvert`，主键是 `peer_id`（Ed25519 公钥指纹，**不是** IP，也不是
+平台账号）。因此同一个 peer 从多条路径被发现时，仍然是一条记录、多条链路 —— 这正是降级能成立的前提。
+
+| Provider | 依赖 | 用途 |
+|---|---|---|
+| mDNS / DNS-SD（`_motus._tcp.local`） | 同局域网 | 同场地，主力路径 |
+| ~~DDS presence（`/motus/presence`）~~ | —— | **不可用。** DDS 现已锁在本机（见下），任何基于 DDS 的东西都不跨机 |
+| 云端名册 | 公网 | 跨地点、跨网段 |
+| BLE 广播 | 无 | 仅用于完全离网时的**配对引导**，不承载数据面 |
+| 静态清单 | 无 | 兜底，永远保留 |
+
+**传输层 —— 四种协作粒度：**
+
+1. **消息级** —— 新增一个 `lan` `ChannelAdapter`，于是 peer 对话原样复用现有渠道栈：`InboundMessage`/
+   `OutboundMessage`、ACL 角色、限频、`expect_reply` 防环、collector 按信任级别分批。飞书和局域网因此成为
+   语义完全相同的两条链路，天然得到「有网走公网、断网走局域网」。
+2. **能力级** —— 接收侧已建成：`/api/peer/tools/list` 与 `/api/peer/tools/call` 先验签，再依次套用对端的
+   角色、`tool_filter`、**以及接收方自己的画布闸门**，所以 peer 只能碰到本机由人连过线的东西。发送侧
+   —— 把 peer 注册成合成 MCP 条目（`transport: 'peer'`），让它的工具以 `mcp__peer:<id>__<tool>` 出现在
+   本机 LLM 面前 —— **尚未实现**：它需要先定一件事，peer 工具是走画布暴露（目前没有 peer 卡片的 UI），
+   还是对画布闸门开一个例外。
+3. **状态级** —— 话题清单（以及后续的位姿、电量、任务状态）通过同一条签名 HTTPS 链路推送
+   （`POST /api/peer/inbox/state`）。这里原本走 DDS topic；DDS 现已限制在本机，而 FastDDS 的传输隔离是
+   一份**默认** profile 会套住进程内所有参与者，因此没法只靠配置为 peer 流量单独放开。（按参与者
+   分别指定 profile 是可行的 —— 在每个参与者创建前设好 `FASTRTPS_DEFAULT_PROFILES_FILE` 即可，
+   天轶驱动的 bridge 正是这样给它的两个 domain 分别选 profile 的 —— 但那要求掌握所有创建点，而
+   agent-core、perception、actucore 加十几个驱动做不到这一点。而且签名 HTTPS 本身就是更好的答案：
+   它有身份校验。）改动顺带补上了一个真实缺陷：原来的 peer DDS 总线
+   **没有任何鉴权**，同一个 `ROS_DOMAIN_ID` 上任何进程都能伪造另一台机器人的状态。现在仍然只承载状态，
+   绝不承载指令。
+4. **任务级** —— `peer_delegate` 把 `SubagentSpec` 发给 peer，由对方在本地 spawn 一个 subagent 并回传
+   `SubagentResult`。接收方会按 peer 自身角色对 `tool_filter` 二次裁剪 —— 发起方给的是请求上限，不是授权 ——
+   且 `hop_count > 2` 直接拒绝，避免委派链形成风暴。
+
+**信任层** —— 每个 Agent Core 首次启动生成 Ed25519 身份密钥；`ACCESS_TOKEN` 的职责收窄为「人类访问本机
+dashboard」，不再是跨机凭据。配对沿用蓝牙的做法：双方 dashboard 显示同一个 6 位短码（由双方公钥与 nonce
+派生），两边都由人确认。这样既能抗中间人、又不需要 CA，也是唯一在纯 BLE、完全无网时仍然成立的方案。链路
+随后跑在 pinned mTLS 上。peer 复用 `channel/acl.py` 的角色分级，默认 `viewer`（只读传感器）。
+
+**内部总线只留在本机。** 所有机器人一律 `ROS_DOMAIN_ID=42`，并加载同一份 loopback-only 的 FastDDS
+profile（`agent-core/deploy/dds-local.xml`，挂到 `/opt/phanthy-motus/dds-local.xml`），白名单只有
+`127.0.0.1`。在 `network_mode: host` 下同一台机器上所有容器共享同一个 loopback，因此本机总线照常工作、
+数据出不了这台机器。各机器人配置**完全相同** —— 没有需要人去分配的 domain 编号，这正是重点：
+`ROS_DOMAIN_ID` 可用范围很窄，而克隆出来的镜像之间根本无法协调。
+
+为什么这不是可选项：`/remote_control/message` —— 一条**指令** —— 当时正在到达办公网上的每一台机器人。
+在 Orin5 上敲的一条指令被 Orin6 一起执行了，两边日志里的时间戳完全一致。DDS 没有寻址、没有鉴权，同一个
+domain 上每个订阅者都会收到一切。
+
+两条运维后果：
+
+- **所有 DDS 容器都必须加载这份 profile。** 漏掉的那个容器会把**自己**和本机其余部分隔开，症状是
+  「机器人突然什么都听不见」。Agent Core 启动时会自检，并暴露 `GET /api/peer/dds_isolation`；判据是进程的
+  UDP socket 是否绑在 `127.0.0.1`，而不是文件在不在。
+- **文件缺失是静默失败。** 宿主机上没有 `/opt/phanthy-motus/dds-local.xml` 时，Docker 的 bind mount 会
+  自动建一个同名**目录**，FastDDS 读不到有效 profile 就回退到所有网卡 —— 隔离失效，日志里什么都没有。
+  Agent Core 会在文件缺失时从镜像里补齐；但已经把那个幽灵目录挂进去的容器必须**重建**而不是重启，
+  因为挂载类型在创建时就固化了。
+
+**peer 能碰到什么，分路径看。** 两条入向路径的保证不同，这个区别值得说准。
+
+*消息与委派* —— peer 的消息进 collector 时是**输入**而不是命令，由本机 LLM 决定怎么处理；委派的任务跑在
+subagent 里，其 tool_filter 会被接收方按该 peer 的角色重新裁剪。这两条路径上 peer 只能「请求」。
+
+*`POST /api/peer/tools/call`* —— 直接分发到设备：不过 LLM、不进 collector、不写历史（实测：接收方的
+agent loop 完全关着时，调用照样执行）。三道检查：
+
+1. **角色** —— `viewer` 只能碰只读的：任意层的 `sensor`/`resource`，加上整个感知层（它的 `processor`
+   工具是对数据做计算并发到话题上）。`operator` 还能碰会动的：`actuator`、整个 actucore 层（执行层 ——
+   `vla` 和导航虽然声明成 `processor`，但会驱动机器人）、以及 `controller`。未声明 type 的算会动。
+2. **`tool_filter`** —— 在角色允许的范围内再收窄。
+3. **本机画布** —— 该工具必须在**这台**机器上连线到 `decision_core`。
+
+所以 `operator` 的 peer **确实能**直接驱动本机执行器。这是既定策略而不是疏漏：授予 `operator` 就是那个
+授权动作，这也正是新配对的 peer 默认 `viewer`、以及每次这类调用都会在活动流里留痕的原因。
+
 ## Web Dashboard
 
 Dashboard（`http://<设备IP>:15678`）提供：
@@ -115,6 +216,8 @@ Dashboard（`http://<设备IP>:15678`）提供：
 | PR Review Agent（可选） | 25000 |
 
 硬件驱动端口请参见 [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)。
+
+多机协同**不新增端口** —— peer 之间走 Agent Core 已有的 15678，路径为 `/api/peer/*`。防火墙上无需额外放行。
 
 ## Resource Center（可选）
 

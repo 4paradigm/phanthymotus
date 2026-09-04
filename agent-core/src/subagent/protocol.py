@@ -35,6 +35,7 @@ class SubagentSpec:
     tool_deny: list[str] | None = None
     max_rounds: int = 10
     timeout_s: float = 300.0
+    hop_count: int = 0  # Incremented on each delegation, prevents infinite chains
     system_prompt_extra: str = ''
     context_seed: str = ''
     checkpoint_interval: int = 5

@@ -49,15 +49,16 @@
           <span>设置</span>
         </button>
         <div class="topbar-settings-dropdown hidden" id="topbar-settings-dropdown">
-          <button class="settings-dropdown-item" data-target="btn-network">网络</button>
-          <button class="settings-dropdown-item" data-target="btn-history">历史日志</button>
-          <button class="settings-dropdown-item" data-target="btn-agent-def">智能体定义</button>
-          <button class="settings-dropdown-item" data-target="btn-channels">渠道</button>
-          <button class="settings-dropdown-item" data-target="btn-deploy">部署</button>
-          <button class="settings-dropdown-item" data-target="btn-performance">性能</button>
-          <button class="settings-dropdown-item" data-target="btn-usage">用量</button>
+          <button class="settings-dropdown-item" data-target="btn-network"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.6 2.5 2.6 14 0 17M12 3.5c-2.6 2.5-2.6 14 0 17"/></svg></span>网络</button>
+          <button class="settings-dropdown-item" data-target="btn-history"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3.5 4.5V10H9"/><path d="M12 8v4.3l3 1.8"/></svg></span>历史日志</button>
+          <button class="settings-dropdown-item" data-target="btn-agent-def"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="4.5" width="15" height="15" rx="2.5"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2.8v1.7M15 2.8v1.7M9 19.5v1.7M15 19.5v1.7M2.8 9h1.7M2.8 15h1.7M19.5 9h1.7M19.5 15h1.7"/></svg></span>智能体定义</button>
+          <button class="settings-dropdown-item" data-target="btn-channels"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 4.5H4A1.5 1.5 0 0 0 2.5 6v8.5A1.5 1.5 0 0 0 4 16h3.5l4 3.5V16H20a1.5 1.5 0 0 0 1.5-1.5V6A1.5 1.5 0 0 0 20 4.5z"/></svg></span>渠道</button>
+          <button class="settings-dropdown-item" data-target="btn-peers"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 20.5v-1.6a3.6 3.6 0 0 0-3.6-3.6H6.1a3.6 3.6 0 0 0-3.6 3.6v1.6"/><circle cx="9" cy="7.5" r="3.6"/><path d="M21.5 20.5v-1.6a3.6 3.6 0 0 0-2.7-3.5"/><path d="M16.2 4.1a3.6 3.6 0 0 1 0 6.9"/></svg></span>多机协同</button>
+          <button class="settings-dropdown-item" data-target="btn-deploy"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3.5 7.5v9L12 21l8.5-4.5v-9L12 3z"/><path d="M3.5 7.5 12 12l8.5-4.5M12 12v9"/></svg></span>部署</button>
+          <button class="settings-dropdown-item" data-target="btn-performance"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg></span>性能</button>
+          <button class="settings-dropdown-item" data-target="btn-usage"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 20.5V10M12 20.5V3.5M19 20.5v-7"/></svg></span>用量</button>
           <div class="settings-dropdown-divider"></div>
-          <button class="settings-dropdown-item settings-dropdown-item--danger" data-target="btn-reset">重启与重置</button>
+          <button class="settings-dropdown-item settings-dropdown-item--danger" data-target="btn-reset"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 4.5V10H15"/></svg></span>重启与重置</button>
         </div>
       </div>
       <!-- 我的：Resource Center 账号 + 技能广场 / 解决方案市场 -->
@@ -73,6 +74,7 @@
       <button class="btn-ghost topbar-btn hidden" id="btn-skills">技能</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-solutions">解决方案</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-channels">渠道</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-peers">多机协同</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-reset">重置</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-performance">性能</button>
@@ -191,34 +193,47 @@
       </div>
       <div class="settings-list">
         <button class="settings-item" data-action="network">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.6 2.5 2.6 14 0 17M12 3.5c-2.6 2.5-2.6 14 0 17"/></svg></span>
           <span class="settings-item-label">网络</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item" data-action="history">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3.5 4.5V10H9"/><path d="M12 8v4.3l3 1.8"/></svg></span>
           <span class="settings-item-label">历史日志</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item" data-action="agent-def">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="4.5" width="15" height="15" rx="2.5"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2.8v1.7M15 2.8v1.7M9 19.5v1.7M15 19.5v1.7M2.8 9h1.7M2.8 15h1.7M19.5 9h1.7M19.5 15h1.7"/></svg></span>
           <span class="settings-item-label">智能体定义</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item" data-action="channels">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 4.5H4A1.5 1.5 0 0 0 2.5 6v8.5A1.5 1.5 0 0 0 4 16h3.5l4 3.5V16H20a1.5 1.5 0 0 0 1.5-1.5V6A1.5 1.5 0 0 0 20 4.5z"/></svg></span>
           <span class="settings-item-label">渠道</span>
           <span class="settings-item-arrow">›</span>
         </button>
+        <button class="settings-item" data-action="peers">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 20.5v-1.6a3.6 3.6 0 0 0-3.6-3.6H6.1a3.6 3.6 0 0 0-3.6 3.6v1.6"/><circle cx="9" cy="7.5" r="3.6"/><path d="M21.5 20.5v-1.6a3.6 3.6 0 0 0-2.7-3.5"/><path d="M16.2 4.1a3.6 3.6 0 0 1 0 6.9"/></svg></span>
+          <span class="settings-item-label">多机协同</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
         <button class="settings-item" data-action="deploy">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3.5 7.5v9L12 21l8.5-4.5v-9L12 3z"/><path d="M3.5 7.5 12 12l8.5-4.5M12 12v9"/></svg></span>
           <span class="settings-item-label">部署</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item" data-action="performance">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg></span>
           <span class="settings-item-label">性能</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item" data-action="usage">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 20.5V10M12 20.5V3.5M19 20.5v-7"/></svg></span>
           <span class="settings-item-label">用量</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item settings-item--danger" data-action="reset">
+          <span class="settings-item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 4.5V10H15"/></svg></span>
           <span class="settings-item-label">重启与重置</span>
           <span class="settings-item-arrow">›</span>
         </button>
@@ -713,6 +728,18 @@
           <button class="btn-primary btn-sm" id="channel-user-form-add">Add</button>
         </div>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="peer-overlay">
+  <div class="modal channel-modal">
+    <div class="modal-header">
+      <span class="modal-title">多机协同</span>
+      <button class="btn-icon" id="peer-close">✕</button>
+    </div>
+    <div class="modal-body channel-body" id="peer-body">
+      <div class="channel-empty">Loading...</div>
     </div>
   </div>
 </div>

@@ -22,10 +22,13 @@ perception:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
+    # DDS profile 只读挂载。必须与其它 DDS 容器加载同一份，
+    # 否则本容器会与本机其余部分失联。
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
   logging:
     driver: local
     options:

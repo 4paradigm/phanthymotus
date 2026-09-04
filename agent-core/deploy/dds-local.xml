@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  dds-local.xml — 把 ROS2 (FastDDS) 流量锁在本机。
+
+  为什么需要：DDS 没有「发给某台机器」的概念，同一 domain 内所有订阅者都收到。
+  两台机器人都用 ROS_DOMAIN_ID=42 时，在一台上发的指令另一台也会执行 —— 实测
+  两台收到的是同一条消息（ts 完全一致），各自跑了一轮 LLM 并各自播报。
+
+  为什么用网卡白名单而不是别的：
+    * 每台分配不同 ROS_DOMAIN_ID —— 可用范围窄（约 0-101），机器人一多必然冲突，
+      镜像克隆与多站点部署无法协调。
+    * ROS_LOCALHOST_ONLY=1 —— 实测本机也断，/perception/* 全部消失。
+    * FASTDDS_BUILTIN_TRANSPORTS=SHM —— 可行但进程级生效，且与任何需要跨机的
+      DDS 用途互斥。
+  白名单方案下所有机器人共用同一份配置、同一个 domain 42：内部流量物理上出不了
+  本机，各机器人互相看不见，因此不需要任何唯一编号，零协调。
+
+  容器均为 network_mode: host，共享同一个 loopback，所以本机各容器照常互通 ——
+  实测两个 loopback-only 参与者可正常收发。
+
+  作用范围：只影响 FastDDS。驱动连机器人本体走 CycloneDDS + 独立网卡
+  （如 R1 的 eth10 / 192.168.123.x），不受此文件影响 —— 已在 R1 实测：
+  加载本文件前后，本体 rt/lowstate 读取的包数与 IMU 数值完全一致。
+
+  ⚠️ 必须所有在 DDS 总线上的容器一起加载。只有部分容器加载时，未加载的那些
+  会与本机其余部分失联（实测：只改一个参与者时它就只剩 2 个话题）。
+
+  ⚠️ 本文件缺失或路径错时，FastDDS 会静默回退到默认传输 —— 隔离失效但一切
+  看起来正常。agent-core 启动时会自检并在日志中说明，见 src/dds_isolation.py。
+-->
+<dds xmlns="http://www.eprosima.com">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>lo_only</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>127.0.0.1</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="local_only" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>lo_only</transport_id>
+        </userTransports>
+        <!-- 关掉内建传输，否则默认的 UDPv4/SHM 仍会绑到所有网卡上，白名单等于没设 -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

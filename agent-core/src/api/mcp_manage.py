@@ -648,6 +648,22 @@ async def mcp_ping(mcp_id: str):
 @router.get('/{mcp_id}/tools')
 async def mcp_get_tools(mcp_id: str):
     """Return full tool list with inputSchema for the capability modal."""
+    # A paired peer's tools live only in mcp_client.registry (peer/mcp_bridge.py),
+    # never in the configured device list, so the lookup below would 404 on them.
+    if mcp_id.startswith('peer:'):
+        import mcp_client as _mc
+        entry = _mc.registry.get(mcp_id)
+        if not entry:
+            raise fastapi.HTTPException(status_code=404, detail='peer not offering tools')
+        return {'code': 200, 'data': {
+            'tools': [
+                {'name': name.split('__', 2)[-1],
+                 'description': schema.get('description', ''),
+                 'inputSchema': schema.get('parameters', {})}
+                for name, schema in (entry.get('schemas') or {}).items()
+            ],
+        }}
+
     mcps = _get_mcp_list()
     target = next((m for m in mcps if m.get('id') == mcp_id), None)
     if not target:
@@ -761,6 +777,29 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             client_cfg = config.main.get('client', {})
             client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model, 'think_mode': think_mode}]
             config.main['client'] = client_cfg
+
+            # Mirror into services.llm as well. The dashboard has two places
+            # that configure the LLM — Settings (api/config.py) and this
+            # decision_core card — and only Settings used to write both keys.
+            # Configuring from the card therefore left services.llm empty, so
+            # the Settings page showed blank fields for a working setup, and
+            # saving that blank form wrote the emptiness back through to
+            # client.llm and killed the LLM. Keep the two entry points
+            # symmetric; services.llm is what the Settings form reads.
+            services_cfg = config.main.get('services', {})
+            existing_llm = services_cfg.get('llm', {}) or {}
+            services_cfg['llm'] = {
+                'url': llm_url,
+                'key': llm_key,
+                'model': llm_model,
+                # Preserve fields this card does not expose rather than
+                # dropping them; think_mode is set here, others are not.
+                'think_mode': think_mode,
+                **{k: v for k, v in existing_llm.items()
+                   if k not in ('url', 'key', 'model', 'think_mode')},
+            }
+            config.main['services'] = services_cfg
+
             # Reinitialize the LLM client with new config
             import client as client_mod
             client_mod.llm = client_mod.llm.__class__()
@@ -802,6 +841,17 @@ async def _handle_agentcore_call(req: MCPCallRequest):
 @router.post('/{mcp_id}/call')
 async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
     """Call a tool on an MCP server and return the result."""
+    # A paired peer's tool is reached over its signed link, not local HTTP, and this
+    # handler builds JSON-RPC itself — so hand it to call_tool, which knows how to
+    # route `transport: 'peer'` (peer/mcp_bridge.py). Without this the dashboard has
+    # no way to exercise a peer tool at all.
+    if mcp_id.startswith('peer:'):
+        import mcp_client as _mc
+        if mcp_id not in _mc.registry:
+            raise fastapi.HTTPException(status_code=404, detail='peer not offering tools')
+        result = await _mc.call_tool(f'mcp__{mcp_id}__{req.tool}', dict(req.arguments))
+        return {'code': 200, 'data': {'result': result}}
+
     # ── Handle internal agentcore MCP (no HTTP transport) ──
     if mcp_id == 'agentcore':
         # remote_mic and remote_message — simple internal tools

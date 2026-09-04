@@ -61,6 +61,124 @@ The platform runs a single **sense → think → act** loop:
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
 
+### Multi-Agent Peers
+
+> **Status: partly implemented.** Measured on two Orin test rigs, per granularity:
+>
+> | Piece | State |
+> |---|---|
+> | mDNS discovery, SAS pairing | works — both rigs paired, `operator` role |
+> | State sharing (signed HTTPS) | works — each side holds the other's topic list, refreshed every 5s |
+> | Tool proxy, **inbound** (serving a peer) | works — a signed `tools/list` returns exactly the tools bound on the receiver's canvas |
+> | Tool proxy, **outbound** (calling a peer's tools) | **not implemented** — nothing registers a peer as a synthetic MCP entry, so the local LLM cannot see or call them |
+> | Messaging (`lan` ChannelAdapter) | code exists, **not exercised** — no `lan` channel was configured on either rig |
+> | Task delegation (`peer_delegate`) | code and hop-count limit exist, **not exercised across machines** |
+> | Cloud roster discovery | stub |
+> | More than two peers | never tried |
+>
+> Feishu bot-to-bot (`bot_to_bot_enabled` + `trusted_bots`, see
+> [Feishu channel setup](docs/feishu-channel-setup.md)) remains the internet-dependent path.
+
+![Peer mesh & security](docs/images/peer-mesh.png)
+
+> Editable source: [`docs/peer-mesh.svg`](docs/peer-mesh.svg) — re-export the PNG after changing it.
+
+Robots collaborate as **peers**: each side runs its own Agent Core and keeps its own autonomy.
+Discovery, transport and trust are three independent, pluggable layers, so a peer can be found
+over mDNS and talked to over mTLS, or found via a cloud roster and talked to over Feishu.
+
+**Discovery** — providers all emit the same `PeerAdvert`, keyed by `peer_id` (an Ed25519 public-key
+fingerprint, *not* an IP or platform account). One peer discovered over several paths therefore
+stays one record with several links, which is what makes fallback possible.
+
+| Provider | Needs | Used for |
+|---|---|---|
+| mDNS / DNS-SD (`_motus._tcp.local`) | Same LAN | Same site — the primary path |
+| ~~DDS presence (`/motus/presence`)~~ | — | **Not usable.** DDS is now pinned to loopback (see below), so nothing DDS-based crosses machines |
+| Cloud roster | Internet | Across sites and subnets |
+| BLE advert | Nothing | Fully offline **pairing bootstrap** only — not a data plane |
+| Static list | Nothing | Fallback, always kept |
+
+**Transport — four granularities of collaboration:**
+
+1. **Messages** — a `lan` `ChannelAdapter`, so peer conversations reuse the existing channel stack
+   unchanged: `InboundMessage`/`OutboundMessage`, ACL roles, rate limiting, `expect_reply` loop
+   guard, and collector batching by trust level. Feishu and LAN are then two links with identical
+   agent-side semantics, which gives "internet when available, LAN when not" for free.
+2. **Tools** — the receiving half is built: `/api/peer/tools/list` and `/api/peer/tools/call`
+   authenticate the caller, then apply its role, its `tool_filter`, **and the receiver's own canvas
+   gate**, so a peer can only reach what a human wired locally. The sending half — registering a
+   peer as a synthetic MCP entry (`transport: 'peer'`) so its tools appear to the local LLM as
+   `mcp__peer:<id>__<tool>` — is **not implemented yet**; it needs a decision on whether peer tools
+   are exposed through the canvas (no UI for a peer card today) or exempted from it.
+3. **State** — topic lists and, later, pose/battery/task state, pushed over the same signed HTTPS
+   link (`POST /api/peer/inbox/state`). This used to be DDS topics; DDS is now confined to the
+   local host, and a FastDDS *default* profile applies to every participant in the process, so the
+   loopback restriction cannot be lifted for peer traffic alone by configuration. (Per-participant
+   profiles are possible by setting `FASTRTPS_DEFAULT_PROFILES_FILE` around each participant's
+   creation — the Tianyi driver's bridge does exactly that for its two domains — but that requires
+   owning every creation site, which is not the case across agent-core, perception, actucore and a
+   dozen drivers. Signed HTTPS is also the better answer on its own terms: it authenticates.) The move fixed a real hole on the way: the DDS peer bus
+   had **no authentication**, so anything on the same `ROS_DOMAIN_ID` could forge another robot's
+   state. It still carries state only, never commands.
+4. **Tasks** — `peer_delegate` ships a `SubagentSpec` to a peer, which spawns a subagent locally and
+   returns a `SubagentResult`. The receiver re-clips `tool_filter` against the peer's own role — the
+   sender's list is a request, not a grant — and `hop_count > 2` is refused so delegation chains
+   cannot storm.
+
+**Trust** — every Agent Core generates an Ed25519 identity key on first boot; `ACCESS_TOKEN` narrows
+to "a human operating this dashboard" and is no longer the cross-machine credential. Pairing follows
+the Bluetooth model: both dashboards show the same 6-digit short code derived from both public keys
+plus nonces, and a human confirms on both sides. That resists a man-in-the-middle without needing a
+CA, and is the only scheme that also works over BLE with no network. Links then run over pinned
+mTLS. Peers reuse the `channel/acl.py` role ladder and default to `viewer` (read-only sensors).
+
+**The internal bus stays on one machine.** Every robot runs `ROS_DOMAIN_ID=42` and the same
+loopback-only FastDDS profile (`agent-core/deploy/dds-local.xml`, mounted at
+`/opt/phanthy-motus/dds-local.xml`), which whitelists `127.0.0.1`. Under `network_mode: host` all
+containers on a machine share one loopback, so the local bus works normally while nothing leaves
+the host. Configuration is identical everywhere — no per-robot domain numbers to hand out, which is
+the point: `ROS_DOMAIN_ID` has a narrow usable range and cloned images cannot coordinate.
+
+Why this is not optional: `/remote_control/message` — a *command* — was reaching every robot on the
+office LAN. One instruction typed on Orin5 was executed by Orin6 as well, with the identical
+timestamp in both logs. DDS has no addressing and no authentication; every subscriber on the domain
+receives everything.
+
+Two operational consequences:
+
+- **Every DDS container must load the profile.** A container that misses it isolates *itself* from
+  the rest of the machine — the symptom is a robot that suddenly hears nothing. Agent Core
+  self-checks at startup and exposes `GET /api/peer/dds_isolation`; the judgement is whether the
+  process's UDP sockets bind `127.0.0.1`, not whether the file exists.
+- **A missing file fails silently.** If the host lacks `/opt/phanthy-motus/dds-local.xml`, Docker's
+  bind mount creates a *directory* with that name, FastDDS ignores it and falls back to every
+  interface — isolation gone, nothing in the log. Agent Core writes the file from its image when it
+  is absent; containers that already mounted the phantom directory must be **recreated**, not
+  restarted, because the mount type is fixed at creation.
+
+**What a peer may reach, per path.** The two inbound paths carry different guarantees, and it is
+worth being exact about which.
+
+*Messages and delegation* — a peer's message enters the collector as **input**, not a command, and
+the local LLM decides what to do with it; a delegated task runs in a subagent whose tool filter the
+receiver re-clips against that peer's role. On these paths a peer only ever *requests*.
+
+*`POST /api/peer/tools/call`* — a direct dispatch to the device: no LLM, no collector, no history
+(measured: a call executed while the receiver's agent loop was switched off). Three checks gate it:
+
+1. **role** — `viewer` reaches read-only tools only: `sensor`/`resource` from any layer, plus the
+   whole perception layer, whose `processor` tools compute on data and publish to a topic.
+   `operator` also reaches tools that act: `actuator`, the whole actucore layer (the execution
+   layer — `vla` and navigation drive the robot despite declaring `processor`), and `controller`.
+   An undeclared type counts as acting.
+2. **`tool_filter`** — narrows further within the role.
+3. **the local canvas** — the tool must be wired to `decision_core` on *this* machine.
+
+So an `operator` peer **can** drive this robot's actuators directly. That is the policy, not an
+oversight: granting `operator` is what authorises it, which is why a newly paired peer defaults to
+`viewer`, and why every such call is announced on the activity stream.
+
 ### Memory & Long-Running Agent Architecture
 
 The Agent Core is designed for **continuous operation over days or months**. The architecture separates real-time interaction from background intelligence:
@@ -235,6 +353,9 @@ services:
 | PR Review Agent (optional) | 25000 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
+
+Peer-to-peer collaboration adds **no new port** — peers talk to each other over the Agent Core's
+existing 15678, under `/api/peer/*`. There is nothing extra to open on a firewall.
 
 ## Container Logs
 

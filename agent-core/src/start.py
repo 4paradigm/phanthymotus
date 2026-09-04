@@ -383,10 +383,27 @@ async def lifespan(app):
     import hostarch
     print(f'[startup] host facets: acc_arch={hostarch.acc_arch()} cpu_arch={hostarch.cpu_arch()}')
 
+    # Put the DDS profile in place *before* anything creates a participant —
+    # FastDDS reads it once, at first participant creation, so provisioning it
+    # after ros2_bridge.start() would have no effect until the next restart.
+    # This also self-heals hosts installed before the profile existed, and the
+    # bind-mount-created-a-directory case seen on R1.
+    import dds_isolation
+    _prov = dds_isolation.ensure_profile()
+    if _prov:
+        print(f'[dds] {_prov}')
+
     # 启动 ROS2 bridge（用于 DDS topic 订阅）
     import ros2_bridge
     _ros2_loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, ros2_bridge.start, _ros2_loop)
+
+    # Confirm the isolation actually took effect. A missing or malformed profile
+    # makes FastDDS fall back to every interface silently — the robot keeps
+    # working and nothing looks wrong until another robot answers a command
+    # meant for this one. Checked after the bridge starts so real DDS sockets
+    # exist to inspect.
+    dds_isolation.check_and_report()
 
     # Pre-create audio publisher so DDS discovery completes before first use
     _ensure_audio_pub()
@@ -419,6 +436,22 @@ async def lifespan(app):
     # 启动 Channel Manager（消息平台适配器）
     await channel_manager.start()
 
+    # peer discovery
+    from peer.registry import registry as peer_registry
+    await peer_registry.start()
+
+    # peer state sharing (topic lists over signed HTTPS; DDS is loopback-only)
+    from peer import dds_state
+    dds_state.start()
+
+    # peer tools, offered to the local LLM as synthetic MCP entries
+    from peer import mcp_bridge as peer_mcp_bridge
+    peer_mcp_bridge.start()
+
+    # peer BLE bootstrap (optional)
+    from peer import ble_bootstrap
+    ble_bootstrap.start()
+
     async with event.llm:
         # Auto-start project if configured, otherwise reset running state
         if config.main.get('core', {}).get('auto_start', False):
@@ -448,6 +481,14 @@ async def lifespan(app):
             for t in tasks:
                 t.cancel()
             await channel_manager.stop()
+            from peer.registry import registry as peer_registry
+            await peer_registry.stop()
+            from peer import dds_state
+            dds_state.stop()
+            from peer import mcp_bridge as peer_mcp_bridge
+            peer_mcp_bridge.stop()
+            from peer import ble_bootstrap
+            ble_bootstrap.stop()
             try:
                 await loop.run_in_executor(None, ros2_bridge.stop)
             except (asyncio.CancelledError, RuntimeError):
@@ -517,6 +558,13 @@ app_api.include_router(api.network.router)
 
 import api.channel
 app_api.include_router(api.channel.router)
+
+import api.peer
+# CRITICAL: api.peer.router MUST come after auth_middleware is installed and
+# before any catch-all. The /api/peer/inbox/* paths are exempt in auth.py so
+# peers can authenticate with Ed25519 signatures instead of ACCESS_TOKEN, but
+# that exemption only works if the middleware sees the request first.
+app_api.include_router(api.peer.router)
 
 import api.performance
 app_api.include_router(api.performance.router)

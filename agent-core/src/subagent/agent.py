@@ -144,7 +144,15 @@ class Subagent:
         from event.llm import _event_instance
         if not _event_instance:
             return []
-        _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'memory_recall'}
+        # peer_delegate is inherited deliberately: a chained delegation is
+        # precisely "B was asked to do something and hands part of it to C",
+        # and B's work happens inside a subagent. Without it here the hop
+        # counter that run() publishes would have no caller able to read it,
+        # and chains could only ever be one hop long.
+        _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+                          'WebFetch', 'WebSearch', 'memory_recall',
+                          'peer_list', 'peer_state', 'peer_tools', 'peer_call',
+                          'peer_delegate'}
         return [
             info['schema']
             for name, info in _event_instance._sys_tools.items()
@@ -205,6 +213,18 @@ class Subagent:
         self.updated_at = time.time()
         t0 = time.time()
         _trace_id = f'subagent:{self.id}'
+
+        # Publish this agent's peer-hop depth for the duration of the run, so a
+        # peer_delegate call made from inside it reports the real depth instead
+        # of 0. Without this the hop limit would only ever bound the first hop:
+        # every machine in a chain would believe it was the origin.
+        # ContextVars are per-task, so concurrent subagents at different depths
+        # do not interfere.
+        try:
+            from peer.delegation import current_hop_count
+            _hop_token = current_hop_count.set(getattr(self.spec, 'hop_count', 0))
+        except ImportError:
+            _hop_token = None
 
         tool_list = self._get_allowed_tools()
         finish_output: str | None = None
@@ -407,6 +427,9 @@ class Subagent:
             return self.result
 
         finally:
+            if _hop_token is not None:
+                from peer.delegation import current_hop_count
+                current_hop_count.reset(_hop_token)
             # Commit perf spans for this subagent run
             if _spans:
                 _spans.append({'span': 'subagent_total', 'component': 'subagent',

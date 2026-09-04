@@ -369,6 +369,13 @@ async def call_tool(full_name: str, args: dict) -> str:
     if info.get('transport') == 'internal':
         return await _dispatch_internal(mcp_id, tool_name, args)
 
+    # A paired peer's tools, reached over its signed link instead of local HTTP.
+    # Routed here so a remote tool travels the same path as any other: same
+    # schema plumbing, same history, same ACP handling. See peer/mcp_bridge.py.
+    if info.get('transport') == 'peer':
+        from peer import mcp_bridge
+        return await mcp_bridge.call(mcp_id, tool_name, args)
+
     url     = info['url']
     # Actuator/processor tools (e.g. load_map, navigate) may need longer than 30s
     meta = info.get('tool_meta', {}).get(full_name, {})

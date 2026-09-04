@@ -107,6 +107,16 @@ class ChannelAdapter(ABC):
     # 该平台支持发送的附件类别；send_message 遇到不支持的类别应抛异常而非静默丢弃
     SUPPORTED_FILE_KINDS: tuple[str, ...] = ()
 
+    # 该平台能不能做 Bot↔Bot（A2A）协作。
+    # 由 adapter 自己声明，而不是在 api/channel.py 里写死平台名 —— 否则每加一个
+    # 支持 A2A 的平台都要回去改校验分支，而漏改的表现是「配置存下来了但静默失效」。
+    SUPPORTS_BOT_TO_BOT: bool = False
+
+    # 对端 Bot 的信任是否来自 channel 配置里的 `trusted_bots`（open_id + chat_id）。
+    # 飞书是；局域网 peer 不是 —— 它的信任来自 `peers` 表里配对时钉住的公钥，
+    # 所以 lan channel 不该出现 trusted_bots 字段。
+    USES_TRUSTED_BOTS: bool = False
+
     def __init__(self, channel_id: str, platform: str, config: dict,
                  on_message: OnMessageCallback):
         self.channel_id = channel_id

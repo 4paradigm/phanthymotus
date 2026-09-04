@@ -64,6 +64,11 @@ function _summarize(event) {
     case 'mcp_call':     return `${p.tool}(${JSON.stringify(p.args || {})})`;
     case 'mcp_result':   return `← ${_truncate(JSON.stringify(p.result), 120)}`;
     case 'agent_thought': return p.text || '';
+    case 'peer_pair_request': return `${p.display_name || p.peer_id?.slice(0, 12) || 'peer'} 请求配对 · 验证码 ${p.code}`;
+    case 'peer_tool_call':   return `${p.peer || 'peer'} → ${p.tool}${p.action ? `(${p.action})` : ''}`;
+    case 'peer_tool_result': return p.ok
+      ? `${p.peer || 'peer'} ← ${p.tool} 完成${p.elapsed_ms != null ? ` ${p.elapsed_ms}ms` : ''}${p.action_id ? ` [${p.action_id}]` : ''}`
+      : `${p.peer || 'peer'} ← ${p.tool} 失败: ${_truncate(String(p.error || ''), 80)}`;
     case 'render':       return `renderer=${p.renderer}`;
     case 'status':       return p.online ? '⬤ online' : '○ offline';
     default:             return JSON.stringify(p).slice(0, 80);

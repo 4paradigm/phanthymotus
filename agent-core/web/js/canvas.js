@@ -11,6 +11,8 @@
  * Cards: pointer-capture drag within viewport (world coords)
  */
 
+import { showToast } from './toast.js';
+
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
@@ -64,15 +66,10 @@ async function _ensureEdit() {
   }
 }
 
+// Thin wrapper over the shared implementation so every existing call site
+// keeps working unchanged; the canvas still hosts its toast inside _canvasEl.
 function _showToast(msg) {
-  const old = document.getElementById('canvas-toast');
-  if (old) old.remove();
-  const toast = document.createElement('div');
-  toast.id = 'canvas-toast';
-  toast.textContent = msg;
-  toast.style.cssText = 'position:absolute;bottom:80px;left:50%;transform:translateX(-50%);width:fit-content;max-width:80%;background:rgba(28,25,23,.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:9999;pointer-events:none;opacity:0;animation:canvas-toast-in 2.5s ease forwards;';
-  _canvasEl.appendChild(toast);
-  setTimeout(() => toast.remove(), 2600);
+  showToast(msg, _canvasEl);
 }
 
 // Connection state
@@ -1955,8 +1952,17 @@ function _revalidateDerivedTopics() {
     // persisted — so re-derive it whenever the card has an input to derive from.
     // Once per card per page load: _fetchTopicsFromDriver drops a repeat request
     // for the same input.
+    // `want` is '' both when nothing feeds this card and when its source has not
+    // resolved yet, and those want opposite treatment: the first should be asked
+    // now (the driver answers with its default output), the second must wait or
+    // it would adopt that default over the topic it is about to derive. Treating
+    // them alike is what this function was written to fix but did not: TTS lost
+    // its inbound connection, so want was '' with hasReal true, and the guard
+    // below skipped it — the card kept '/remote_control/message/tts' while the
+    // driver published on '/perception/tts', and the panel stayed empty.
+    const inputless = !_connections.some(c => c.toCardId === card.id);
     if (known === undefined) {
-      if (want || !hasReal) _fetchTopicsFromDriver(card, want);
+      if (want || inputless || !hasReal) _fetchTopicsFromDriver(card, want);
       continue;
     }
     if (known !== want) _fetchTopicsFromDriver(card, want);

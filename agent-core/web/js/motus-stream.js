@@ -71,6 +71,16 @@ export function connectMotus(onStatusChange) {
 }
 
 function dispatch(event) {
+  // A pairing request needs to reach the operator even when the Peers panel is
+  // closed — requiring the panel to be open would defeat the point of human
+  // confirmation. Handled here rather than via a listener because no panel is
+  // guaranteed to have subscribed.
+  if (event?.type === 'peer_pair_request') {
+    import('./peers.js')
+      .then((m) => m.onPairRequest(event.payload || {}))
+      .catch(() => {});
+  }
+
   _listeners.forEach(({ mcpId, fn }) => {
     if (mcpId === null || mcpId === event.mcp_id) {
       fn(event);

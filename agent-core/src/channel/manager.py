@@ -141,8 +141,8 @@ def add_channel_config(channel_id: str, platform: str, cfg: dict,
         'id': channel_id,
         'platform': platform,
         'enabled': enabled,
-        'bot_to_bot_enabled': bot_to_bot_enabled if platform == 'feishu' else False,
-        'trusted_bots': normalize_trusted_bots(trusted_bots) if platform == 'feishu' else [],
+        'bot_to_bot_enabled': bot_to_bot_enabled if supports_bot_to_bot(platform) else False,
+        'trusted_bots': normalize_trusted_bots(trusted_bots) if uses_trusted_bots(platform) else [],
         'config': cfg,
         'status': 'disconnected',
         'updated_at': time.time(),
@@ -157,10 +157,12 @@ def update_channel_config(channel_id: str, **updates) -> dict | None:
     for ch in configs:
         if ch['id'] == channel_id:
             target_platform = updates.get('platform', ch['platform'])
-            if target_platform != 'feishu':
+            if not uses_trusted_bots(target_platform):
                 updates['trusted_bots'] = []
             elif 'trusted_bots' in updates:
                 updates['trusted_bots'] = normalize_trusted_bots(updates['trusted_bots'])
+            if not supports_bot_to_bot(target_platform):
+                updates['bot_to_bot_enabled'] = False
             for k, v in updates.items():
                 if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled', 'trusted_bots'):
                     ch[k] = v
@@ -187,6 +189,31 @@ _ADAPTER_CLASSES: dict[str, type] = {}
 def register_adapter(platform: str, cls: type):
     """注册平台适配器类。"""
     _ADAPTER_CLASSES[platform] = cls
+
+
+# 适配器 import 失败时（缺 SDK）的能力兜底。
+# 不能在类没注册时就返回 False —— 那样「装了飞书配置但 lark-oapi 掉了」会在下一次
+# 保存配置时把 bot_to_bot / trusted_bots 静默清空，SDK 修好后行为已经被改掉了。
+_BOT_TO_BOT_FALLBACK = frozenset({'feishu', 'lan'})
+_TRUSTED_BOTS_FALLBACK = frozenset({'feishu'})
+
+
+def supports_bot_to_bot(platform: str) -> bool:
+    cls = _ADAPTER_CLASSES.get(platform)
+    if cls is not None:
+        return bool(getattr(cls, 'SUPPORTS_BOT_TO_BOT', False))
+    return platform in _BOT_TO_BOT_FALLBACK
+
+
+def uses_trusted_bots(platform: str) -> bool:
+    """信任是否来自 channel 配置的 trusted_bots 列表。
+
+    lan peer 的信任在 `peers` 表（配对时钉住公钥），不在 channel 配置里。
+    """
+    cls = _ADAPTER_CLASSES.get(platform)
+    if cls is not None:
+        return bool(getattr(cls, 'USES_TRUSTED_BOTS', False))
+    return platform in _TRUSTED_BOTS_FALLBACK
 
 
 # ── Manager ──────────────────────────────────────────────────────────────────

@@ -106,6 +106,8 @@ class FeishuAdapter(ChannelAdapter):
     """Feishu/Lark adapter using SDK WebSocket long connection."""
 
     SUPPORTED_FILE_KINDS = (KIND_IMAGE, KIND_VIDEO, KIND_AUDIO, KIND_FILE)
+    SUPPORTS_BOT_TO_BOT = True
+    USES_TRUSTED_BOTS = True
 
     def __init__(self, channel_id: str, platform: str, config: dict,
                  on_message: OnMessageCallback):

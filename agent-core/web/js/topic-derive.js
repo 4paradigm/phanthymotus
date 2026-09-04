@@ -21,6 +21,21 @@ export function topicOfPort(card, portIdx) {
 }
 
 /**
+ * Does anything feed this card?
+ *
+ * The distinction that matters: `inputTopicOf` returns '' both for a card that
+ * nothing is connected to and for one whose source exists but has not resolved
+ * yet. Those need opposite handling — the first should be asked about right away
+ * (an input-less card publishes the driver's default), the second must be waited
+ * for. Conflating them is what let a stale topic survive: TTS lost its inbound
+ * connection, so it fell into the "waiting" case forever and was never re-asked,
+ * while the driver had long since fallen back to /perception/tts.
+ */
+export function hasInboundConnection(card, connections) {
+  return connections.some(c => c.toCardId === card.id);
+}
+
+/**
  * The topic feeding `card`, resolved through the graph.
  *
  * The source card's own topic wins, and if the source has no topic yet this
@@ -59,6 +74,10 @@ export function inputTopicOf(card, cards, connections, allowStale = false) {
  */
 export async function resolveDerivedTopics(cards, connections, opts = {}) {
   const doFetch = opts.fetchImpl || ((...a) => fetch(...a));
+  // Callers that can tell a derived (multiInstance) tool from a static one pass
+  // this. Default is "no card is derived", which keeps the conservative
+  // behaviour: only cards with no topic at all are asked about.
+  const isDerived = opts.isDerived || (() => false);
   const maxRounds = opts.maxRounds ?? 4;
   const resolved = [];
 
@@ -96,9 +115,20 @@ export async function resolveDerivedTopics(cards, connections, opts = {}) {
   for (let round = 0; round <= maxRounds; round++) {
     const allowStale = round === maxRounds;   // final pass only
     const pending = cards.filter((c) => {
-      if (!unresolved(c)) return false;
+      if (!c.mcpId || !c.toolName) return false;
+      // A *derived-topic* card with no input is asked even when it already
+      // holds a topic: that topic may have been derived from a connection since
+      // deleted, and nothing else would ever correct it. Its answer is the
+      // driver's default, which needs no upstream resolved first.
+      //
+      // Restricted to cards the caller marks as derived (multiInstance). A card
+      // with a static topic gets it from the MCP schema, and asking its driver
+      // instead would let an `info` answer overwrite the declared value.
+      const inputless = isDerived(c) && !hasInboundConnection(c, connections);
+      if (!unresolved(c) && !inputless) return false;
       const input = inputTopicOf(c, cards, connections, allowStale);
-      return input && !alreadyAsked(c, input);
+      if (!input && !inputless) return false;   // source exists but hasn't resolved yet
+      return !alreadyAsked(c, input);
     });
     if (!pending.length) break;
 
@@ -110,9 +140,13 @@ export async function resolveDerivedTopics(cards, connections, opts = {}) {
     pending.forEach((card, i) => {
       const out = answers[i];
       if (out?.some(t => t.topic)) {
-        card.topicOut = out;
-        resolved.push(card);
-        progressed = true;
+        // Only count it as progress when it actually differs — re-confirming an
+        // input-less card's existing topic must not keep the loop spinning.
+        if (JSON.stringify(out) !== JSON.stringify(card.topicOut)) {
+          card.topicOut = out;
+          resolved.push(card);
+          progressed = true;
+        }
       }
     });
     if (!progressed && !allowStale) {
@@ -121,4 +155,29 @@ export async function resolveDerivedTopics(cards, connections, opts = {}) {
     }
   }
   return resolved;
+}
+
+/**
+ * Rewrite each connection's `fromTopic` to what its source card actually publishes.
+ *
+ * `fromTopic` is written when the link is drawn and never revisited, so it holds
+ * whatever was known then. The monitor dashboard subscribes to it directly, so a
+ * leftover value becomes a panel watching a topic nothing publishes on — the same
+ * empty-panel symptom as a stale card topic, from the same cause one step along.
+ *
+ * Only rewrites when the source has a real topic: an unresolved source would
+ * otherwise blank out the one piece of evidence the last-resort pass relies on.
+ */
+export function syncConnectionTopics(cards, connections) {
+  const fixed = [];
+  for (const conn of connections) {
+    const src = cards.find(c => c.id === conn.fromCardId);
+    if (!src) continue;
+    const topic = topicOfPort(src, parseInt(conn.fromPortIdx, 10) || 0);
+    if (topic && topic !== conn.fromTopic) {
+      conn.fromTopic = topic;
+      fixed.push(conn);
+    }
+  }
+  return fixed;
 }

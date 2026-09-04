@@ -1,0 +1,143 @@
+"""
+peer/ble_advertiser.py — BLE GATT server for Linux (optional, uses bluez_peripheral).
+
+Exposes a GATT service with our peer identity for nearby robots to discover.
+This is Linux-specific and requires `bluez_peripheral` library + BlueZ >= 5.43.
+
+On platforms without BlueZ (macOS, Windows, non-BLE hardware), this silently
+does nothing — the scanning half in ble_bootstrap.py still works.
+"""
+
+import asyncio
+import json
+import os
+
+try:
+    from bluez_peripheral.gatt.service import Service
+    from bluez_peripheral.gatt.characteristic import characteristic, CharacteristicFlags
+    from bluez_peripheral.advert import Advertisement
+    from bluez_peripheral.agent import NoIoAgent
+    BLUEZ_PERIPHERAL_AVAILABLE = True
+except ImportError:
+    BLUEZ_PERIPHERAL_AVAILABLE = False
+    # Dummy base class for when bluez_peripheral is unavailable
+    class Service:
+        pass
+    def characteristic(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    class CharacteristicFlags:
+        READ = None
+
+from peer.ble_bootstrap import SERVICE_UUID, CHAR_PUBLIC_KEY, CHAR_ENDPOINTS
+
+
+_adapter = None
+_service = None
+_advertisement = None
+_running = False
+
+
+def is_available() -> bool:
+    """Check if bluez_peripheral is available."""
+    return BLUEZ_PERIPHERAL_AVAILABLE
+
+
+async def start_advertising():
+    """Start BLE advertising with GATT service."""
+    global _adapter, _service, _advertisement, _running
+
+    if not is_available():
+        print('[peer] BLE advertising disabled: bluez_peripheral unavailable')
+        return
+
+    if _running:
+        return
+
+    try:
+        from bluez_peripheral.util import get_message_bus
+        bus = await get_message_bus()
+
+        from peer import identity
+        my_peer_id = identity.peer_id()
+
+        # Create GATT service
+        service = MotusPeerService()
+        await service.register(bus)
+
+        # Create advertisement
+        adapter_name = os.environ.get('BLE_ADAPTER', 'hci0')
+        advertisement = Advertisement(
+            SERVICE_UUID,
+            'peripheral',
+            adapter_name,
+        )
+        await advertisement.register(bus)
+
+        _service = service
+        _advertisement = advertisement
+        _running = True
+        print(f'[peer] BLE advertising peer_id={my_peer_id[:12]} on {adapter_name}')
+
+    except Exception as e:
+        print(f'[peer] BLE advertising failed: {e}')
+        _running = False
+
+
+async def stop_advertising():
+    """Stop BLE advertising."""
+    global _running, _service, _advertisement
+
+    if not _running:
+        return
+
+    _running = False
+
+    try:
+        if _advertisement:
+            await _advertisement.unregister()
+        if _service:
+            await _service.unregister()
+    except Exception as e:
+        print(f'[peer] BLE stop error: {e}')
+
+    _advertisement = None
+    _service = None
+    print('[peer] BLE advertising stopped')
+
+
+class MotusPeerService(Service):
+    """GATT service exposing peer identity and endpoints."""
+
+    def __init__(self):
+        super().__init__(SERVICE_UUID, True)
+
+    @characteristic(CHAR_PUBLIC_KEY, CharacteristicFlags.READ)
+    def public_key(self, options):
+        """Return base64 Ed25519 public key."""
+        from peer import identity
+        return identity.public_key_b64().encode('utf-8')
+
+    @characteristic(CHAR_ENDPOINTS, CharacteristicFlags.READ)
+    def endpoints(self, options):
+        """Return JSON list of reachable URLs."""
+        endpoints = _get_local_endpoints()
+        return json.dumps(endpoints).encode('utf-8')
+
+
+def _get_local_endpoints() -> list[str]:
+    """Reachable URL for this peer, for a BLE-discovered peer to dial.
+
+    Reuses the same interface-selection trick as the mDNS provider rather than
+    enumerating every interface: `netifaces` is an unmaintained C extension that
+    routinely fails to build on ARM64, and a robot only needs to advertise the
+    address on its default route anyway. Listing every interface would also
+    advertise docker0/veth addresses that no peer can reach.
+    """
+    from peer.discovery.mdns import MdnsProvider
+
+    ip = MdnsProvider._primary_ip()
+    if not ip or ip.startswith('127.'):
+        return []
+    return [f'https://{ip}:15678']

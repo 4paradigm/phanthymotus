@@ -28,5 +28,11 @@ def _register_builtin_adapters():
     except ImportError as e:
         print(f'[channel] feishu adapter unavailable ({e})')
 
+    try:
+        from channel.adapters.lan import LanAdapter
+        register_adapter('lan', LanAdapter)
+    except ImportError as e:
+        print(f'[channel] lan adapter unavailable ({e})')
+
 
 _register_builtin_adapters()

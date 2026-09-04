@@ -77,6 +77,18 @@ _DB_DEFAULTS = {
         'auto_approve': True,
         'require_actuator_confirm': True,
     },
+    'peer_settings': {
+        'enabled': False,
+        # 广播给同网段的展示名。空则用 hostname。
+        'display_name': '',
+        # 本机对外可达的地址，供 peer 回连；空则由 mDNS 用网卡地址填。
+        'advertise_url': '',
+        'discovery': {'mdns': True, 'static': []},
+        # 新配对的 peer 默认角色。刻意不提供 auto_approve —— 配对必须有人确认。
+        'default_role': 'viewer',
+        # 签名的时间窗（秒）。离网机器人时钟可能漂移，必要时放宽。
+        'clock_skew_s': 120,
+    },
     'subagent': {
         'max_concurrent': 2,
         'max_total': 10,
@@ -185,6 +197,33 @@ def _get_conn() -> sqlite3.Connection:
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_conclusions_ts ON subagent_conclusions(created_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_conclusions_type ON subagent_conclusions(source_type)')
+    # ── 已配对的 peer（另一台 Agent Core）─────────────────────────────────────
+    # peer_id 是 Ed25519 公钥指纹，不是 IP，也不是平台账号 —— 同一个 peer 从
+    # mDNS / 云名册多条路径被发现时仍是同一行，这是链路降级能成立的前提。
+    # role / tool_filter 与 channel_users 共用 acl.py 的那套取值。
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS peers (
+            peer_id TEXT PRIMARY KEY,
+            display_name TEXT DEFAULT '',
+            public_key TEXT NOT NULL,
+            role TEXT DEFAULT 'viewer',
+            tool_filter TEXT DEFAULT '*',
+            endpoints TEXT DEFAULT '[]',
+            capabilities TEXT DEFAULT '[]',
+            paired_at REAL,
+            last_seen REAL,
+            -- When we last had evidence that the peer has *us* in its own table.
+            -- Pairing is per-direction, so confirming here proves nothing about the
+            -- other side: without this, a half-finished pairing looked complete on
+            -- the side that confirmed, and the failure only surfaced later as 403s.
+            mutual_at REAL
+        )
+    ''')
+    # Added after the table shipped; an existing database must not be discarded
+    # just because it predates the column.
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(peers)')}
+    if 'mutual_at' not in cols:
+        conn.execute('ALTER TABLE peers ADD COLUMN mutual_at REAL')
     conn.commit()
     return conn
 

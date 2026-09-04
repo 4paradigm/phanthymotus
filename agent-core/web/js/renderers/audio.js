@@ -36,6 +36,9 @@ export const AudioRenderer = {
   _nextStartTime: 0,
   _prebufCount:   0,
   _prebufQueue:   null,
+  // Looping silent source that keeps the output stream rendering — see
+  // _startKeepAlive. Held so _stopPlay can end it.
+  _keepAlive:     null,
   // Scheduled buffers, so ⏸ can actually stop them. Created per instance in
   // mount(): renderers are cloned with Object.assign, so a Set built here on
   // the prototype would be shared and pausing one card would cut another's audio.
@@ -162,11 +165,22 @@ export const AudioRenderer = {
     if (this._audioCtx.state === 'suspended') {
       this._audioCtx.resume();
     }
+    // Must happen inside the click handler — see _startKeepAlive.
+    this._startKeepAlive();
 
     this._playing = true;
     this._nextStartTime = 0;
     this._prebufCount = 0;
     this._prebufQueue = [];
+
+    // Silence has too many possible causes here (context state, scheduling
+    // lead, dropped frames, a gesture WebKit did not honour) and none of them
+    // are visible from the outside — the waveform keeps drawing either way.
+    console.debug('[audio] play start', {
+      state: this._audioCtx.state, sampleRate: this._audioCtx.sampleRate,
+      currentTime: this._audioCtx.currentTime,
+    });
+    this._loggedChunk = false;
 
     if (this._playBtn) {
       this._playBtn.textContent = '⏸';
@@ -177,6 +191,7 @@ export const AudioRenderer = {
 
   _stopPlay() {
     this._playing = false;
+    this._stopKeepAlive();
     this._prebufQueue = null;
     this._prebufCount = 0;
     // Stop the buffers already handed to the audio thread. Setting _playing
@@ -195,6 +210,39 @@ export const AudioRenderer = {
       this._playBtn.title = '播放实时音频';
       this._playBtn.classList.remove('active');
     }
+  },
+
+  /**
+   * Keep the output stream rendering for as long as playback is armed.
+   *
+   * WebKit's transient user activation expires a few seconds after the click,
+   * and an audio graph that has gone idle in the meantime comes back silent —
+   * the context still reports 'running' and buffers still schedule at sane
+   * times, so nothing looks wrong. Measured on R1: ▶ pressed, then the first
+   * chunk arrived at ctx time 7.872s, scheduled for 8.072s, and played to
+   * nobody. On the monitor page the same code was audible because speech was
+   * already flowing there, so the first chunk landed inside the window.
+   *
+   * A looping silent buffer costs one always-running source and removes the
+   * dependency on how soon after the click the audio happens to arrive.
+   */
+  _startKeepAlive() {
+    const ctx = this._audioCtx;
+    if (!ctx || this._keepAlive) return;
+    try {
+      const source = ctx.createBufferSource();
+      source.buffer = ctx.createBuffer(1, Math.max(1, Math.round(ctx.sampleRate)), ctx.sampleRate);
+      source.loop = true;
+      source.connect(ctx.destination);
+      source.start(0);
+      this._keepAlive = source;
+    } catch { /* best effort — playback is still attempted without it */ }
+  },
+
+  _stopKeepAlive() {
+    if (!this._keepAlive) return;
+    try { this._keepAlive.stop(); } catch { /* already ended */ }
+    this._keepAlive = null;
   },
 
   _flushPrebuf() {
@@ -269,6 +317,13 @@ export const AudioRenderer = {
       return;
     }
 
+    if (!this._loggedChunk) {
+      this._loggedChunk = true;
+      console.debug('[audio] first chunk scheduled', {
+        at: this._nextStartTime, now: ctx.currentTime,
+        state: ctx.state, samples: numSamples, bufRate: 16000, ctxRate: ctx.sampleRate,
+      });
+    }
     source.start(this._nextStartTime);
     this._nextStartTime += audioBuffer.duration;
     // Track it so _stopPlay can actually silence what is already queued.
