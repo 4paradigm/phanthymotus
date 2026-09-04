@@ -448,10 +448,6 @@ async def lifespan(app):
     from peer import mcp_bridge as peer_mcp_bridge
     peer_mcp_bridge.start()
 
-    # peer BLE bootstrap (optional)
-    from peer import ble_bootstrap
-    ble_bootstrap.start()
-
     async with event.llm:
         # Auto-start project if configured, otherwise reset running state
         if config.main.get('core', {}).get('auto_start', False):
@@ -487,8 +483,6 @@ async def lifespan(app):
             dds_state.stop()
             from peer import mcp_bridge as peer_mcp_bridge
             peer_mcp_bridge.stop()
-            from peer import ble_bootstrap
-            ble_bootstrap.stop()
             try:
                 await loop.run_in_executor(None, ros2_bridge.stop)
             except (asyncio.CancelledError, RuntimeError):

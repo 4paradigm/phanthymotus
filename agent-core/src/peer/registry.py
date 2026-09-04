@@ -146,14 +146,19 @@ class PeerRegistry:
             self._adverts.pop(pid, None)
 
     def provider_status(self) -> list[dict]:
-        return [
-            {
+        # A provider can be looping happily while every round fails — an rfkill'd
+        # BLE adapter is the standard example. `last_error` lets a provider say
+        # so itself, and a provider reporting one is not "running" for display
+        # purposes, or the badge would read green next to its own error text.
+        out = []
+        for p in self._providers:
+            error = self._provider_errors.get(p.name) or getattr(p, 'last_error', '')
+            out.append({
                 'name': p.name,
-                'running': p.is_running,
-                'error': self._provider_errors.get(p.name, ''),
-            }
-            for p in self._providers
-        ]
+                'running': p.is_running and not error,
+                'error': error,
+            })
+        return out
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -179,6 +184,9 @@ class PeerRegistry:
         if disc.get('static'):
             from peer.discovery.static import StaticProvider
             self._providers.append(StaticProvider(self.observe))
+        if disc.get('ble'):
+            from peer.discovery.ble import BleProvider
+            self._providers.append(BleProvider(self.observe))
 
         for provider in self._providers:
             try:

@@ -83,7 +83,9 @@ _DB_DEFAULTS = {
         'display_name': '',
         # 本机对外可达的地址，供 peer 回连；空则由 mDNS 用网卡地址填。
         'advertise_url': '',
-        'discovery': {'mdns': True, 'static': []},
+        # ble 默认关闭：它要主机侧先解 rfkill、开 bluetoothd，还要 dbus socket 挂进容器。
+        # 默认开启会让 provider 常态报错，而这类"红着也没人管"的告警很快就没人看了。
+        'discovery': {'mdns': True, 'static': [], 'ble': False},
         # 新配对的 peer 默认角色。刻意不提供 auto_approve —— 配对必须有人确认。
         'default_role': 'viewer',
         # 签名的时间窗（秒）。离网机器人时钟可能漂移，必要时放宽。
