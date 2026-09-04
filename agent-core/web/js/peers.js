@@ -112,6 +112,7 @@ function _render({ settings, identity, pending, paired, discovered, providers })
     _renderSettings(settings, identity, providers.providers || []),
     enabled ? _renderPending(sessions) : '',
     enabled ? _renderPaired(peers) : '',
+    enabled ? _renderStatic(settings) : '',
     enabled ? _renderDiscovered(found) : '',
   ].join('');
 
@@ -250,6 +251,46 @@ function _renderPaired(peers) {
     </section>`;
 }
 
+/**
+ * Hand-entered peer addresses.
+ *
+ * The escape hatch for what mDNS cannot do: it uses link-local multicast, so a
+ * peer one subnet away is invisible even when the two machines ping each other
+ * fine (measured between 10.100.121.0/24 and 10.100.128.0/19 in this building).
+ * Until now the only way to add one was editing SQLite by hand.
+ *
+ * An entry here is *discovery only* — it makes a peer appear in the list below;
+ * trust still comes from the 6-digit code confirmed on both screens.
+ */
+function _renderStatic(s) {
+  const entries = (s.discovery?.static || []).map((e) =>
+    (typeof e === 'string' ? { url: e } : e));
+  const rows = entries.length
+    ? entries.map((e, i) => `
+        <div class="user-row" data-static-index="${i}">
+          <span class="user-identity">
+            <span class="user-name">${_esc(e.display_name || e.url)}</span>
+            ${e.display_name ? `<span class="user-id">${_esc(e.url)}</span>` : ''}
+          </span>
+          <button class="user-remove" data-static-remove title="移除">×</button>
+        </div>`).join('')
+    : '<div class="channel-empty">还没有手动地址。同一子网内用不到这里，mDNS 会自动发现。</div>';
+
+  return `
+    <section class="peer-section">
+      <div class="channel-users-header">
+        <span class="channel-users-title">手动地址</span>
+        <span class="channel-users-hint">跨子网时用 —— mDNS 不跨路由器；填了仍需验证码配对</span>
+      </div>
+      ${rows}
+      <div class="peer-settings-row">
+        <input class="peer-input" id="peer-static-url"
+               placeholder="10.100.121.14 或 https://10.100.121.14:15678">
+        <button class="btn-primary btn-sm" data-static-add>添加</button>
+      </div>
+    </section>`;
+}
+
 function _renderDiscovered(found) {
   const unpaired = found.filter((p) => !p.paired);
   const rows = unpaired.length
@@ -291,6 +332,12 @@ async function _onClick(e) {
   const save = e.target.closest('[data-peer-save]');
   if (save) return _saveSettings();
 
+  if (e.target.closest('[data-static-add]')) return _addStatic();
+  const staticRow = e.target.closest('[data-static-index]');
+  if (staticRow && e.target.closest('[data-static-remove]')) {
+    return _removeStatic(Number(staticRow.dataset.staticIndex));
+  }
+
   const row = e.target.closest('[data-peer-id]');
   const peerId = row?.dataset.peerId;
 
@@ -304,6 +351,47 @@ async function _onChange(e) {
   if (e.target.id === 'peer-enabled' || e.target.id === 'peer-mdns') return _saveSettings();
   const sel = e.target.closest('[data-peer-role]');
   if (sel) return _setRole(sel);
+}
+
+
+async function _currentStatic() {
+  const s = await _get('/api/peer/settings');
+  return (s.discovery?.static || []).map((e) => (typeof e === 'string' ? { url: e } : e));
+}
+
+async function _putStatic(list, okText) {
+  try {
+    const res = await fetch('/api/peer/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ static: list }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.detail || '保存失败');
+    showToast(json.discovery_restarted ? okText : `已保存，但发现层重启失败：${json.error}`);
+  } catch (err) {
+    showToast(`失败：${err.message}`);
+  }
+  _refresh();
+}
+
+async function _addStatic() {
+  const input = document.getElementById('peer-static-url');
+  const url = (input?.value || '').trim();
+  if (!url) return showToast('先填一个地址');
+  const list = await _currentStatic();
+  // Normalisation and duplicate-checking happen server-side, so a bare host or a
+  // repeat is not an error here — it comes back cleaned in the next refresh.
+  list.push({ url });
+  if (input) input.value = '';
+  return _putStatic(list, '已添加，正在尝试发现');
+}
+
+async function _removeStatic(index) {
+  const list = await _currentStatic();
+  if (index < 0 || index >= list.length) return _refresh();
+  const [gone] = list.splice(index, 1);
+  return _putStatic(list, `已移除 ${gone.display_name || gone.url}`);
 }
 
 async function _saveSettings() {

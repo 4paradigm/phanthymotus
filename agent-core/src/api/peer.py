@@ -98,6 +98,52 @@ async def get_settings():
     }
 
 
+# Agent Core's port. A hand-typed address is much more often "10.100.121.14" than
+# a full URL, and defaulting saves the operator from a broken entry that only
+# shows up later as a peer that never appears.
+_DEFAULT_PEER_PORT = 15678
+
+
+def _normalize_static(entries: list) -> list[dict]:
+    """Clean up hand-entered peer addresses.
+
+    Accepts `host`, `host:port`, `https://host:port`, or `{url, display_name}`, and
+    normalises to `{'url': 'https://host:port', 'display_name': ...}`. Written when
+    this list became editable from the dashboard: it used to be stored verbatim, so
+    a missing scheme produced an advert nothing could ever reach and no error
+    anywhere — the peer simply never showed up.
+    """
+    from urllib.parse import urlparse
+
+    out, seen = [], set()
+    for entry in entries or []:
+        if isinstance(entry, str):
+            raw, name = entry.strip(), ''
+        elif isinstance(entry, dict):
+            raw = str(entry.get('url', '')).strip()
+            name = str(entry.get('display_name', '')).strip()
+        else:
+            raise fastapi.HTTPException(400, 'each static entry must be a string or an object')
+        if not raw:
+            continue
+
+        candidate = raw if '://' in raw else f'https://{raw}'
+        parsed = urlparse(candidate)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            raise fastapi.HTTPException(
+                400, f'"{raw}" is not an address — use host, host:port or https://host:port')
+        port = parsed.port or _DEFAULT_PEER_PORT
+        url = f'{parsed.scheme}://{parsed.hostname}:{port}'
+        if url in seen:
+            continue
+        seen.add(url)
+        item = {'url': url}
+        if name:
+            item['display_name'] = name
+        out.append(item)
+    return out
+
+
 class PeerSettingsReq(BaseModel):
     enabled: bool | None = None
     display_name: str | None = None
@@ -138,7 +184,7 @@ async def save_settings(req: PeerSettingsReq):
     if req.mdns is not None:
         disc['mdns'] = bool(req.mdns)
     if req.static is not None:
-        disc['static'] = req.static
+        disc['static'] = _normalize_static(req.static)
     s['discovery'] = disc
     config.main['peer_settings'] = s
 
