@@ -165,8 +165,11 @@ async def push_once() -> int:
     if not topics:
         return 0
 
+    import config
+    our_name = config.main.get('peer_settings', {}).get('display_name', '')
     payload = {'topics': topics, 'timestamp': time.time(),
-               'agent_running': agent_running()}
+               'agent_running': agent_running(),
+               'display_name': our_name}
     delivered = 0
     for peer in store.list_peers():
         endpoints = registry.endpoints_for(peer['peer_id'])
@@ -176,6 +179,10 @@ async def push_once() -> int:
         if resp is not None:
             delivered += 1
             push_errors.pop(peer['peer_id'], None)
+            # It accepted a signed request, so it has us in its own table — that is
+            # the other half of the pairing, and the only proof of it we ever get.
+            if not peer.get('mutual_at'):
+                store.mark_mutual(peer['peer_id'])
         else:
             push_errors[peer['peer_id']] = reason
     return delivered

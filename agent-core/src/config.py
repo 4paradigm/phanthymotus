@@ -211,9 +211,19 @@ def _get_conn() -> sqlite3.Connection:
             endpoints TEXT DEFAULT '[]',
             capabilities TEXT DEFAULT '[]',
             paired_at REAL,
-            last_seen REAL
+            last_seen REAL,
+            -- When we last had evidence that the peer has *us* in its own table.
+            -- Pairing is per-direction, so confirming here proves nothing about the
+            -- other side: without this, a half-finished pairing looked complete on
+            -- the side that confirmed, and the failure only surfaced later as 403s.
+            mutual_at REAL
         )
     ''')
+    # Added after the table shipped; an existing database must not be discarded
+    # just because it predates the column.
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(peers)')}
+    if 'mutual_at' not in cols:
+        conn.execute('ALTER TABLE peers ADD COLUMN mutual_at REAL')
     conn.commit()
     return conn
 

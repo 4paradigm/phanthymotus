@@ -33,11 +33,13 @@ def _row_to_dict(row) -> dict:
         'capabilities': json.loads(row[6]) if row[6] else [],
         'paired_at': row[7],
         'last_seen': row[8],
+        # None until the peer proves it has us too — see mark_mutual().
+        'mutual_at': row[9] if len(row) > 9 else None,
     }
 
 
 _COLS = ('peer_id, display_name, public_key, role, tool_filter, endpoints, '
-         'capabilities, paired_at, last_seen')
+         'capabilities, paired_at, last_seen, mutual_at')
 
 
 def get(peer_id: str) -> dict | None:
@@ -125,7 +127,39 @@ def touch(peer_id: str, endpoint: str = '') -> None:
                 conn.execute('UPDATE peers SET endpoints=? WHERE peer_id=?',
                              (json.dumps([endpoint]), peer_id))
                 print(f'[peer] learned endpoint for {peer_id[:12]}: {endpoint}')
-        conn.execute('UPDATE peers SET last_seen=? WHERE peer_id=?', (time.time(), peer_id))
+        # An authenticated inbound request is itself the evidence: a peer only
+        # talks to agents it has paired.
+        conn.execute('UPDATE peers SET last_seen=?, mutual_at=? WHERE peer_id=?',
+                     (time.time(), time.time(), peer_id))
+        conn.commit()
+
+
+def mark_mutual(peer_id: str) -> None:
+    """Record evidence that the peer has us in its own peers table.
+
+    Two things count, and both mean the far side accepted a signed exchange:
+    a state push of ours that it answered, and any authenticated request it sent
+    us (it only pushes to peers it has). Until one of those happens, "paired" here
+    is one-sided — the operator confirmed on this screen and nobody confirmed on
+    the other, which used to look exactly like a finished pairing.
+    """
+    with _conn() as conn:
+        conn.execute('UPDATE peers SET mutual_at=? WHERE peer_id=?', (time.time(), peer_id))
+        conn.commit()
+
+
+def update_display_name(peer_id: str, display_name: str) -> None:
+    """Update the stored display name for a paired peer.
+
+    Called when the peer pushes state with a new name — so a rename on one machine
+    syncs to all others within one push interval (5s), rather than staying stale
+    until the pairing is redone.
+    """
+    if not display_name or not isinstance(display_name, str):
+        return
+    with _conn() as conn:
+        conn.execute('UPDATE peers SET display_name=? WHERE peer_id=?',
+                     (display_name.strip()[:200], peer_id))
         conn.commit()
 
 

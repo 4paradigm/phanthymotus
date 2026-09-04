@@ -253,6 +253,14 @@ async def list_paired():
             # has us in no peers table — i.e. nobody approved the pairing over
             # there, which otherwise looks identical to a healthy pairing from here.
             'last_push_error': _state.push_errors.get(p['peer_id'], ''),
+            # False until the peer proves it has us as well. Confirming here writes
+            # only this side's record, so a pairing is genuinely half-done until
+            # then — and it used to render as finished.
+            'mutual': bool(p.get('mutual_at')),
+            # Timestamp for when mutual was last confirmed, or null. Used to tell
+            # "never confirmed" from "was mutual, now they unpaired us" — both cause
+            # 403s but need different UI text.
+            'mutual_at': p.get('mutual_at'),
         })
     return {'peers': out}
 
@@ -700,6 +708,13 @@ async def inbox_state(req: Request):
     from peer import dds_state
     dds_state.record_peer_topics(peer_id, clean, agent_running=running)
     store.touch(peer_id, _source_endpoint(req))
+
+    # Sync the display name: a rename on one machine should reach all others within
+    # one push interval (5s), not stay stale until the pairing is redone.
+    name = payload.get('display_name', '')
+    if name and isinstance(name, str):
+        store.update_display_name(peer_id, name)
+
     return {'accepted': len(clean)}
 
 

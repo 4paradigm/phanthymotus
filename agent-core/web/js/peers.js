@@ -207,9 +207,24 @@ function _peerStatus(p) {
   // push runs every 5s, so a 403 on it is the signal that nobody approved over
   // there. Shown as its own state because the fix is a human action on the other
   // screen, not something to wait out.
+  // Two kinds of 403, with different fixes:
+  // 1. One-sided pairing: we confirmed, they haven't yet → wait for them
+  // 2. They unpaired us: was mutual, now they deleted us → re-pair from scratch
   if ((p.last_push_error || '').includes('403')) {
-    return { state: 'idle', text: '对方尚未批准配对',
-             title: '本机已批准，但对端没有本机的配对记录 —— 请在对方设备上批准同一个验证码' };
+    const wasMutual = p.mutual_at != null;  // null/undefined = never mutual; 0 is a timestamp
+    return wasMutual
+      ? { state: 'idle', text: '对方已解除配对',
+          title: '对方删除了本机的配对记录 —— 需要重新配对' }
+      : { state: 'idle', text: '对方尚未批准配对',
+          title: '本机已批准，但对端没有本机的配对记录 —— 请在对方设备上批准同一个验证码' };
+  }
+  // No evidence yet that the far side has us. Shown as waiting rather than paired:
+  // confirming on this screen writes only this side's record, so until the peer
+  // accepts a signed request from us (or sends us one) the pairing is half-done —
+  // and it used to render exactly like a finished one.
+  if (!p.mutual) {
+    return { state: 'idle', text: '等待对方确认',
+             title: '本机已批准。对端也批准同一个验证码之后，这里会自动变为在线' };
   }
   if (!p.online) {
     const age = p.contact_age_s == null ? '从未联系过'
