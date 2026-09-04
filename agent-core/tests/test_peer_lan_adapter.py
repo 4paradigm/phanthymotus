@@ -23,6 +23,16 @@ from channel.adapters.lan import LanAdapter  # noqa: E402
 
 class TestLanAdapter(unittest.TestCase):
     def setUp(self):
+        # config.DB_PATH is a module-level constant read at import time, so the
+        # os.environ assignment above only wins if this file happens to import config
+        # first. Run under the full suite and it does not: store then reads whichever
+        # database an earlier test set up, and `test_health_check_no_peers` finds that
+        # test's peers instead of none. Patching the attribute is what actually
+        # isolates us — the same trap is noted in test_peer_mutual.py.
+        self._db = os.path.join(tempfile.mkdtemp(), 'peers.db')
+        self._patch = mock.patch.object(config, 'DB_PATH', self._db)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
         identity.reset_cache()
         identity.ensure_identity()
 
