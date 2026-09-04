@@ -294,14 +294,27 @@ function _renderStatic(s) {
 function _renderDiscovered(found) {
   const unpaired = found.filter((p) => !p.paired);
   const rows = unpaired.length
-    ? unpaired.map((p) => `
+    ? unpaired.map((p) => {
+        // A hand-entered address has no fingerprint yet — the static provider files
+        // it under `static:<url>`. Rendering that id as the name produced a row
+        // reading "static:https  static:https… · static", which says nothing about
+        // *which* machine it is. Show the address, and say the identity is still
+        // unknown rather than implying an id exists.
+        const provisional = p.peer_id.startsWith('static:');
+        const address = (p.endpoints || [])[0] || p.peer_id.replace(/^static:/, '');
+        const name = p.display_name || (provisional ? address : p.peer_id.slice(0, 12));
+        const meta = provisional
+          ? `指纹待配对确认 · ${_esc((p.sources || []).join(',') || 'static')}`
+          : `${_esc(p.peer_id.slice(0, 12))}… · ${_esc((p.sources || []).join(',') || '?')}`;
+        return `
         <div class="user-row" data-peer-id="${_escAttr(p.peer_id)}">
-          <span class="user-identity" title="${_escAttr(p.peer_id)}">
-            <span class="user-name">${_esc(p.display_name || p.peer_id.slice(0, 12))}</span>
-            <span class="user-id">${_esc(p.peer_id.slice(0, 12))}… · ${_esc((p.sources || []).join(',') || '?')}</span>
+          <span class="user-identity" title="${_escAttr(provisional ? address : p.peer_id)}">
+            <span class="user-name">${_esc(name)}</span>
+            <span class="user-id">${meta}</span>
           </span>
           <button class="btn-primary btn-sm" data-peer-pair>配对</button>
-        </div>`).join('')
+        </div>`;
+      }).join('')
     : (found.length
         // 只剩已配对的时候，说"没发现"会让人以为发现坏了 —— 图里就是这样：
         // 唯一在附近的机器人正好已经配对，这一段却像在报故障。
@@ -425,7 +438,11 @@ async function _startPairing(peerId) {
     });
     const json = await res.json();
     if (!res.ok) throw new Error(json.detail || '发起配对失败');
-    showToast(`验证码 ${json.code} — 请与对方设备核对后双方批准`);
+    // For a manual address the id we clicked was provisional; the response carries
+    // the fingerprint the peer just proved, and that is what the row below is keyed
+    // by from now on.
+    const who = json.display_name || `${(json.peer_id || '').slice(0, 12)}…`;
+    showToast(`验证码 ${json.code} — 对方是 ${who}，请与对方设备核对后双方批准`);
   } catch (err) {
     showToast(`发起配对失败：${err.message}`);
   }

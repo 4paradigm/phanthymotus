@@ -118,6 +118,15 @@ class PeerRegistry:
                 out.append(ep)
         return out
 
+    def forget(self, peer_id: str) -> None:
+        """Drop one advert.
+
+        Used when a provisional (`static:<url>`) advert is replaced by the real
+        fingerprint at pairing time: leaving both would show the same machine
+        twice, one of them un-pairable.
+        """
+        self._adverts.pop(peer_id, None)
+
     def prune(self) -> None:
         cutoff = time.time() - STALE_AFTER_S
         for pid in [p for p, a in self._adverts.items() if a.last_seen < cutoff]:

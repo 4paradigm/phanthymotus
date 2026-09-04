@@ -300,13 +300,35 @@ async def start_pairing(req: StartPairingReq):
         raise fastapi.HTTPException(502, 'peer public_key is not 32 bytes')
     remote_peer_id = identity.fingerprint(remote_pubkey_raw)
     if remote_peer_id != req.peer_id:
-        raise fastapi.HTTPException(
-            502, f'peer public_key fingerprint mismatch: advertised {req.peer_id}, '
-            f'key hashes to {remote_peer_id}'
-        )
+        # A hand-entered address carries a URL, not a fingerprint, so the static
+        # provider advertises a provisional id (`static:<url>`) and this is where
+        # the real one arrives. Refusing it made pairing over a manual address
+        # impossible — the very case mDNS cannot cover — while static.py's own
+        # docstring promised the swap happened here. It never did.
+        #
+        # A *non*-provisional mismatch stays fatal: that is a discovered peer whose
+        # key does not hash to the id it advertised, which is what the check exists
+        # to catch.
+        from peer.discovery.static import is_provisional
+        if not is_provisional(req.peer_id):
+            raise fastapi.HTTPException(
+                502, f'peer public_key fingerprint mismatch: advertised {req.peer_id}, '
+                f'key hashes to {remote_peer_id}'
+            )
+        # Re-file the advert under the identity it just proved, so everything after
+        # this (endpoints_for, the pending row, /pair/confirm) refers to the real
+        # peer rather than a URL-shaped placeholder.
+        from peer.discovery.base import PeerAdvert
+        registry.observe(PeerAdvert(
+            peer_id=remote_peer_id,
+            display_name=result.get('display_name', '') or advert.display_name,
+            endpoints=endpoints,
+            source=advert.source,
+        ))
+        registry.forget(req.peer_id)
 
     session = pairing.PairingSession(
-        peer_id=req.peer_id,
+        peer_id=remote_peer_id,
         peer_public_key=remote_pubkey_raw,
         display_name=result.get('display_name', advert.display_name),
         endpoints=endpoints,

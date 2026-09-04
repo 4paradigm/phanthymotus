@@ -11,6 +11,7 @@ provisional `peer_id` of `static:<url>`; the pairing flow replaces that with the
 real fingerprint once it has talked to the endpoint.
 """
 
+import asyncio
 import time
 
 import config
@@ -18,6 +19,15 @@ from peer.discovery.base import DiscoveryProvider, PeerAdvert
 
 
 PROVISIONAL_PREFIX = 'static:'
+
+# Re-emit on this interval. The registry drops any advert unseen for
+# STALE_AFTER_S (300s), and a configured address is not a sighting that can go
+# away — but emitting once at start() meant it aged out five minutes later and
+# only came back if discovery was restarted. Observed on a real machine: the
+# address was still listed in settings, the `static` provider badge was still
+# green, and "发现到的机器人" was empty. MdnsProvider already carries the same
+# loop for the same reason (see its _refresh_loop docstring).
+REFRESH_INTERVAL_S = 60
 
 
 def is_provisional(peer_id: str) -> bool:
@@ -28,12 +38,38 @@ def is_provisional(peer_id: str) -> bool:
 class StaticProvider(DiscoveryProvider):
     name = 'static'
 
+    _refresh_task = None
+
     async def start(self) -> None:
         self._running = True
-        self.refresh()
+        # Tolerated the same way the loop tolerates it: a bad first round should not
+        # prevent discovery from starting at all, since the next round recovers on
+        # its own. registry.start() raising here would take mDNS down with it.
+        try:
+            self.refresh()
+        except Exception as e:
+            print(f'[peer] static first refresh failed: {type(e).__name__}: {e}')
+        self._refresh_task = asyncio.ensure_future(self._refresh_loop())
 
     async def stop(self) -> None:
         self._running = False
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            self._refresh_task = None
+
+    async def _refresh_loop(self) -> None:
+        """Keep the configured addresses from ageing out of the registry."""
+        while self._running:
+            try:
+                await asyncio.sleep(REFRESH_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            if not self._running:
+                return
+            try:
+                self.refresh()
+            except Exception as e:      # 一轮失败不该让静态发现就此停摆
+                print(f'[peer] static refresh failed: {type(e).__name__}: {e}')
 
     def refresh(self) -> None:
         """Re-read the configured list and emit an advert per entry."""
