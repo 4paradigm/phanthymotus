@@ -33,6 +33,15 @@ import time
 
 # peer_id → {'topics': [...], 'last_seen': float}
 _peer_topics: dict[str, dict] = {}
+
+# peer_id → why the last state push failed, '' when it succeeded.
+#
+# Pairing is per-direction: each side writes its own record, so confirming on only
+# one machine leaves that machine believing it is paired while the other rejects
+# every signed request with 403. Nothing showed that — the paired list looked
+# complete. This push runs every 5s against every paired peer, so its failure
+# reason is the cheapest available answer to "did the other side ever approve?".
+push_errors: dict[str, str] = {}
 _task: asyncio.Task | None = None
 
 PUSH_INTERVAL_S = 5.0
@@ -124,6 +133,7 @@ def stop() -> None:
         _task.cancel()
         _task = None
     _peer_topics.clear()
+    push_errors.clear()
     print('[peer] state sharing stopped')
 
 
@@ -162,7 +172,10 @@ async def push_once() -> int:
         endpoints = registry.endpoints_for(peer['peer_id'])
         if not endpoints:
             continue
-        resp, _reason = await transport.post_json(endpoints, STATE_PATH, payload)
+        resp, reason = await transport.post_json(endpoints, STATE_PATH, payload)
         if resp is not None:
             delivered += 1
+            push_errors.pop(peer['peer_id'], None)
+        else:
+            push_errors[peer['peer_id']] = reason
     return delivered

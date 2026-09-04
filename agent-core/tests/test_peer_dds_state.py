@@ -126,6 +126,43 @@ class TestPush(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(rounds), 1, '第一轮失败后没有继续')
 
 
+class TestOneSidedPairingIsVisible(unittest.IsolatedAsyncioTestCase):
+    """单边配对必须看得出来。
+
+    配对是按方向各存一份记录的：只在一台机器上确认，那台就会把对方列为"已配对"，
+    而对端没有本机记录、会把每个签名请求 403 掉 —— 而这一侧的界面看起来完全正常。
+    状态推送每 5s 一轮，它的失败原因是回答"对方到底批准了没有"最便宜的信号。
+    """
+
+    def setUp(self):
+        dds_state.push_errors.clear()
+
+    async def _push(self, resp, reason):
+        async def _post(eps, path, payload, **kw):
+            return resp, reason
+        fake_bridge = mock.Mock(get_dds_topics=lambda: {'/x'})
+        with mock.patch.dict(sys.modules, {'ros2_bridge': fake_bridge}), \
+             mock.patch('peer.store.list_peers', return_value=[{'peer_id': 'p1'}]), \
+             mock.patch('peer.registry.registry.endpoints_for', return_value=['https://x']), \
+             mock.patch('peer.transport.post_json', side_effect=_post):
+            return await dds_state.push_once()
+
+    async def test_a_403_is_remembered(self):
+        await self._push(None, 'https://x → HTTP 403 {"detail":"not paired"}')
+        self.assertIn('403', dds_state.push_errors['p1'])
+
+    async def test_success_clears_a_previous_failure(self):
+        """对方批准之后，这个提示必须自己消失。"""
+        await self._push(None, 'HTTP 403 nope')
+        await self._push({'accepted': 1}, '')
+        self.assertNotIn('p1', dds_state.push_errors)
+
+    async def test_stop_clears_it(self):
+        await self._push(None, 'HTTP 403 nope')
+        dds_state.stop()
+        self.assertEqual(dds_state.push_errors, {})
+
+
 class TestPeerFacingPath(unittest.TestCase):
     def test_state_endpoint_is_exempt_from_access_token(self):
         """漏登记就是 401，而且日志看起来一切正常 —— 这个坑踩过一次。"""

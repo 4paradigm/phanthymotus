@@ -171,6 +171,54 @@ class TestStaticAdvertsStayFresh(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(calls), 2, '一轮异常把循环带走了')
 
 
+class TestPairingCarriesEndpointsBothWays(unittest.TestCase):
+    """跨子网配对必须让**双向**都有地址。
+
+    实测：天轶（10.100.128.0/19）配对 Orin5（10.100.121.0/24）之后，Orin5 存的
+    endpoints 是空的 —— 因为它从未通过 mDNS 发现过天轶（跨路由收不到），入向配对
+    也没记下来源。结果四分钟里 43 次状态推送只有单向到达，另一方向连地址都没有，
+    工具调用和委派也同样走不通，而界面只显示"离线"。
+    """
+
+    def _inbound(self, payload, client_host='10.100.129.72', known=()):
+        from unittest import mock
+        from api import peer as peer_api
+
+        req = mock.Mock()
+        req.client = mock.Mock(host=client_host)
+        with mock.patch.object(peer_api.registry, 'endpoints_for', return_value=list(known)):
+            return peer_api._inbound_endpoints(req, payload, 'p1')
+
+    def test_what_the_peer_tells_us_wins(self):
+        got = self._inbound({'endpoints': ['https://10.100.129.72:15678']})
+        self.assertEqual(got, ['https://10.100.129.72:15678'])
+
+    def test_discovery_is_merged_without_duplicates(self):
+        got = self._inbound({'endpoints': ['https://a:1']}, known=['https://a:1', 'https://b:2'])
+        self.assertEqual(got, ['https://a:1', 'https://b:2'])
+
+    def test_the_request_source_is_the_last_resort(self):
+        """代理或 NAT 会让它不准，但有个地址总比空列表强 —— 空列表就是原来的行为。"""
+        got = self._inbound({})
+        self.assertEqual(got, ['https://10.100.129.72:15678'])
+
+    def test_no_source_and_nothing_known_yields_empty(self):
+        self.assertEqual(self._inbound({}, client_host=''), [])
+
+    def test_the_initiator_advertises_its_own_address(self):
+        from unittest import mock
+        from api import peer as peer_api
+        with mock.patch('peer.discovery.mdns.MdnsProvider._primary_ip', return_value='10.0.0.7'):
+            self.assertEqual(peer_api._local_endpoints(), ['https://10.0.0.7:15678'])
+
+    def test_no_primary_ip_is_not_an_error(self):
+        from unittest import mock
+        from api import peer as peer_api
+        with mock.patch('peer.discovery.mdns.MdnsProvider._primary_ip',
+                        side_effect=OSError('no route')):
+            self.assertEqual(peer_api._local_endpoints(), [])
+
+
 if __name__ == '__main__':
     unittest.main()
 
@@ -229,6 +277,44 @@ class TestPairingAcceptsAProvisionalId(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(forgotten, ['static:https://10.100.121.14:15678'],
                          'provisional 那条没删，同一台机器会重复出现一次且配不上')
 
+    async def test_the_proven_fingerprint_is_written_back_to_config(self):
+        """否则 provider 每分钟都会把 provisional 那条重新播出来。
+
+        后果是同一台机器又以"未配对的手动地址"出现一次，registry.get(真 id) 查不到，
+        于是一条明明工作正常的链路显示成离线。
+        """
+        import base64
+        from unittest import mock
+
+        import config
+        from api import peer as peer_api
+        from peer.discovery.base import PeerAdvert
+
+        url = 'https://10.100.121.14:15678'
+        cfg = {'peer_settings': {'discovery': {'static': [{'url': url}]}}}
+        real = 'dd398c73177aa3487e7c695f4b19dfe5'
+        advert = PeerAdvert(peer_id=f'static:{url}', display_name='',
+                            endpoints=[url], source='static')
+
+        async def _post(eps, path, payload, **kw):
+            return {'nonce': 'n' * 22,
+                    'public_key': base64.b64encode(b'k' * 32).decode(),
+                    'display_name': 'Orin5'}, ''
+
+        with mock.patch.object(config, 'main', cfg), \
+             mock.patch.object(peer_api.registry, 'get', return_value=advert), \
+             mock.patch.object(peer_api.registry, 'endpoints_for', return_value=[url]), \
+             mock.patch.object(peer_api.registry, 'observe'), \
+             mock.patch.object(peer_api.registry, 'forget'), \
+             mock.patch.object(peer_api.registry, 'refresh_provider') as refreshed, \
+             mock.patch('peer.transport.post_json', side_effect=_post), \
+             mock.patch('peer.identity.fingerprint', return_value=real):
+            await peer_api.start_pairing(peer_api.StartPairingReq(peer_id=f'static:{url}'))
+
+        self.assertEqual(cfg['peer_settings']['discovery']['static'],
+                         [{'url': url, 'peer_id': real}])
+        refreshed.assert_called_once_with('static')
+
     async def test_a_real_mismatch_is_still_fatal(self):
         import base64
         key = base64.b64encode(b'k' * 32).decode()
@@ -238,3 +324,53 @@ class TestPairingAcceptsAProvisionalId(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exc.status_code, 502)
         self.assertIn('mismatch', exc.detail)
         self.assertEqual(observed, [], '不匹配时不该把它登记进 registry')
+
+
+class TestAnAddressIsLearnedFromInboundTraffic(unittest.TestCase):
+    """已有的单向配对要能自愈。
+
+    跨子网配对后接收方存的 endpoints 是空的（它从未发现过对方），于是反方向连地址都
+    没有。重新配对需要人在两台屏幕上再确认一次 —— 不该为此打断已经在用的链路。对方
+    每 5 秒推一次状态，那些请求都是验过签的，来源地址就是免费的答案。
+    """
+
+    def setUp(self):
+        import tempfile as _tmp
+        import config
+        from peer import store
+        # 独立的库，避免污染别的测试
+        self._db = os.path.join(_tmp.mkdtemp(), 'peers.db')
+        self._patch = __import__('unittest.mock', fromlist=['mock']).patch.dict(
+            os.environ, {'DB_PATH': self._db})
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        config._conn_cache = None if hasattr(config, '_conn_cache') else None
+        self.store = store
+
+    def _peer(self, endpoints):
+        from peer import identity
+        identity.reset_cache()
+        identity.ensure_identity()
+        return self.store.upsert('a' * 32, identity.public_key_b64(), 'Far',
+                                 role='viewer', endpoints=endpoints)
+
+    def test_an_empty_endpoint_list_is_filled_in(self):
+        self._peer([])
+        self.store.touch('a' * 32, 'https://10.100.129.72:15678')
+        self.assertEqual(self.store.get('a' * 32)['endpoints'],
+                         ['https://10.100.129.72:15678'])
+
+    def test_a_known_address_is_not_overwritten(self):
+        """配对时确认过的地址，比某一次请求的来源更可信（代理/NAT 会骗人）。"""
+        self._peer(['https://real:15678'])
+        self.store.touch('a' * 32, 'https://proxy:15678')
+        self.assertEqual(self.store.get('a' * 32)['endpoints'], ['https://real:15678'])
+
+    def test_touch_without_an_endpoint_still_updates_last_seen(self):
+        self._peer([])
+        before = self.store.get('a' * 32)['last_seen']
+        import time as _t
+        _t.sleep(0.01)
+        self.store.touch('a' * 32)
+        self.assertGreater(self.store.get('a' * 32)['last_seen'], before)
+        self.assertEqual(self.store.get('a' * 32)['endpoints'], [])

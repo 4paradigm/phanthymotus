@@ -230,6 +230,7 @@ async def list_paired():
     `agent_running` is a third fact again: a peer with 智能控制 off keeps pushing
     state and answering tool calls, but /delegate returns 503.
     """
+    from peer import dds_state as _state
     from peer import liveness as _liveness, naming as _naming
     from peer import mcp_bridge as _bridge
     peers = store.list_peers()
@@ -248,8 +249,92 @@ async def list_paired():
             # peer entries never appear there, and a bridge offering nothing looks
             # exactly like one that works.
             'tools_offered': _bridge.offered.get(p['peer_id'], []),
+            # Why our last state push to it failed. A 403 here means the other side
+            # has us in no peers table — i.e. nobody approved the pairing over
+            # there, which otherwise looks identical to a healthy pairing from here.
+            'last_push_error': _state.push_errors.get(p['peer_id'], ''),
         })
     return {'peers': out}
+
+
+def _adopt_static_peer_id(endpoints: list[str], peer_id: str) -> None:
+    """Write a proven fingerprint back onto the static entry it came from.
+
+    The static provider re-reads config every minute, so without this it keeps
+    re-emitting the provisional `static:<url>` advert: the same machine shows up
+    again as an unpaired "manual address" row, `registry.get(real_id)` finds
+    nothing, and the peer reads as offline on a link that is in fact working.
+    `StaticProvider` already honours a `peer_id` key on the entry — this is the
+    step that ever filled it in.
+    """
+    import config
+
+    s = dict(config.main.get('peer_settings', {}) or {})
+    disc = dict(s.get('discovery') or {})
+    entries = list(disc.get('static') or [])
+    changed = False
+    for i, entry in enumerate(entries):
+        url = entry if isinstance(entry, str) else (entry or {}).get('url', '')
+        if url not in endpoints:
+            continue
+        item = {'url': url} if isinstance(entry, str) else dict(entry)
+        if item.get('peer_id') == peer_id:
+            continue
+        item['peer_id'] = peer_id
+        entries[i] = item
+        changed = True
+    if not changed:
+        return
+    disc['static'] = entries
+    s['discovery'] = disc
+    config.main['peer_settings'] = s
+    registry.refresh_provider('static')
+
+
+def _source_endpoint(req: Request) -> str:
+    """The address an authenticated peer request arrived from.
+
+    A fallback for learning where a peer lives when nothing else knows — see
+    store.touch(). Not authoritative: behind a proxy or NAT this is the middlebox.
+    """
+    host = req.client.host if req.client else ''
+    return f'https://{host}:{_DEFAULT_PEER_PORT}' if host else ''
+
+
+def _local_endpoints() -> list[str]:
+    """How this agent can be reached, best guess first.
+
+    Sent in a pair request so the far side has an address even when it never
+    discovered us (mDNS does not cross subnets). Derived from the same primary-IP
+    logic mDNS advertises with, so the two agree.
+    """
+    try:
+        from peer.discovery.mdns import MdnsProvider
+        ip = MdnsProvider._primary_ip()
+    except Exception:
+        ip = ''
+    return [f'https://{ip}:{_DEFAULT_PEER_PORT}'] if ip else []
+
+
+def _inbound_endpoints(req: Request, payload: dict, peer_id: str) -> list[str]:
+    """Where to reach the peer that just asked us to pair.
+
+    Three sources, in order: what it told us, what discovery already knows, and
+    the address the request came from. The last one is a fallback rather than the
+    truth because a proxy or NAT would make it wrong — but having *something* beats
+    an empty list, which is what a cross-subnet pairing used to store.
+    """
+    given = [e for e in (payload.get('endpoints') or []) if isinstance(e, str) and e.strip()]
+    known = registry.endpoints_for(peer_id)
+    seen, out = set(), []
+    for ep in [*given, *known]:
+        ep = ep.strip()
+        if ep and ep not in seen:
+            seen.add(ep)
+            out.append(ep)
+    if not out and req.client and req.client.host:
+        out.append(f'https://{req.client.host}:{_DEFAULT_PEER_PORT}')
+    return out
 
 
 class StartPairingReq(BaseModel):
@@ -278,6 +363,13 @@ async def start_pairing(req: StartPairingReq):
         'nonce': local_nonce,
         'public_key': local_pubkey,
         'display_name': _local_display_name(),
+        # Our own reachable addresses. The receiver discovered us over mDNS or not
+        # at all — across subnets it is the latter, and it then stored no endpoints
+        # for us, so the reverse direction had no address to use: state pushes, tool
+        # calls and delegation could only ever go one way. Measured between Tianyi
+        # and Orin5: 43 pushes arrived one way in four minutes, zero came back, and
+        # the peer showed as offline on the side that could not reach.
+        'endpoints': _local_endpoints(),
     }
     result, err = await transport.post_json(
         endpoints, '/api/peer/inbox/pair_request', payload,
@@ -326,6 +418,7 @@ async def start_pairing(req: StartPairingReq):
             source=advert.source,
         ))
         registry.forget(req.peer_id)
+        _adopt_static_peer_id(endpoints, remote_peer_id)
 
     session = pairing.PairingSession(
         peer_id=remote_peer_id,
@@ -527,7 +620,7 @@ async def inbox_pair_request(req: Request):
         peer_id=peer_id,
         peer_public_key=remote_pubkey_raw,
         display_name=payload.get('display_name', '') or _peer_label(peer_id),
-        endpoints=registry.endpoints_for(peer_id),
+        endpoints=_inbound_endpoints(req, payload, peer_id),
         local_nonce=local_nonce,
         remote_nonce=remote_nonce,
         local_public_key=identity.public_key_raw(),
@@ -570,7 +663,7 @@ async def inbox_ping(req: Request):
     )
     if not peer_id:
         raise fastapi.HTTPException(403, f'signature verification failed: {reason}')
-    store.touch(peer_id)
+    store.touch(peer_id, _source_endpoint(req))
     return {'pong': True, 'timestamp': time.time()}
 
 
@@ -606,7 +699,7 @@ async def inbox_state(req: Request):
 
     from peer import dds_state
     dds_state.record_peer_topics(peer_id, clean, agent_running=running)
-    store.touch(peer_id)
+    store.touch(peer_id, _source_endpoint(req))
     return {'accepted': len(clean)}
 
 
@@ -753,7 +846,7 @@ async def call_tool(req: Request):
     await _emit('peer_tool_call', {})
     try:
         result = await mcp_client.call_tool(tool_name, arguments)
-        store.touch(peer_id)
+        store.touch(peer_id, _source_endpoint(req))
         await _emit('peer_tool_result', {
             'ok': True,
             'elapsed_ms': round((time.time() - started) * 1000),
@@ -871,7 +964,7 @@ async def delegate_task(req: Request):
     # Spawn and wait
     try:
         result = await subagent_manager.spawn_and_wait(augmented_spec, timeout=spec.timeout_s)
-        store.touch(peer_id)
+        store.touch(peer_id, _source_endpoint(req))
         return result.to_dict()
     except Exception as e:
         return {

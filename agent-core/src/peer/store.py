@@ -102,8 +102,29 @@ def update(peer_id: str, **fields) -> dict | None:
     return get(peer_id)
 
 
-def touch(peer_id: str) -> None:
+def touch(peer_id: str, endpoint: str = '') -> None:
+    """Mark a peer as heard from just now, and learn its address if we lack one.
+
+    The address matters because pairing is per-direction: the side that received
+    the pair request may never have discovered the other (mDNS does not cross
+    subnets), and it then stored no endpoints — so state pushes, tool calls and
+    delegation could only ever travel one way. Measured between two real machines:
+    43 pushes arrived in four minutes, none went back, and the peer read as
+    offline on the side that had no address.
+
+    Only filled in when empty. An address the peer advertised for itself, or one
+    confirmed at pairing time, is better evidence than the source of one request,
+    which a proxy or NAT would misreport.
+    """
     with _conn() as conn:
+        if endpoint:
+            row = conn.execute('SELECT endpoints FROM peers WHERE peer_id=?',
+                               (peer_id,)).fetchone()
+            existing = json.loads(row[0]) if row and row[0] else []
+            if not existing:
+                conn.execute('UPDATE peers SET endpoints=? WHERE peer_id=?',
+                             (json.dumps([endpoint]), peer_id))
+                print(f'[peer] learned endpoint for {peer_id[:12]}: {endpoint}')
         conn.execute('UPDATE peers SET last_seen=? WHERE peer_id=?', (time.time(), peer_id))
         conn.commit()
 

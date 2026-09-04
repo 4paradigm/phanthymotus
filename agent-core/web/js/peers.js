@@ -201,6 +201,16 @@ function _renderPending(sessions) {
  *   offline             — nothing has been heard from it
  */
 function _peerStatus(p) {
+  // Pairing is per-direction: each side writes its own record. Confirming on only
+  // one machine leaves *this* side listing the peer as paired while the other
+  // rejects every signed request — and the row looked perfectly healthy. The state
+  // push runs every 5s, so a 403 on it is the signal that nobody approved over
+  // there. Shown as its own state because the fix is a human action on the other
+  // screen, not something to wait out.
+  if ((p.last_push_error || '').includes('403')) {
+    return { state: 'idle', text: '对方尚未批准配对',
+             title: '本机已批准，但对端没有本机的配对记录 —— 请在对方设备上批准同一个验证码' };
+  }
   if (!p.online) {
     const age = p.contact_age_s == null ? '从未联系过'
       : `最后联系 ${_describeAge(p.contact_age_s)}`;

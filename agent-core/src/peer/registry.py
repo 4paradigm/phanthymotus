@@ -118,6 +118,19 @@ class PeerRegistry:
                 out.append(ep)
         return out
 
+    def refresh_provider(self, name: str) -> None:
+        """Ask one provider to re-read its source now.
+
+        Used after a static entry gains a proven peer_id: waiting out its refresh
+        interval would leave the provisional advert on screen for another minute.
+        """
+        for p in self._providers:
+            if p.name == name and hasattr(p, 'refresh'):
+                try:
+                    p.refresh()
+                except Exception as e:
+                    print(f'[peer] {name} refresh failed: {type(e).__name__}: {e}')
+
     def forget(self, peer_id: str) -> None:
         """Drop one advert.
 
