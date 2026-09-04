@@ -99,12 +99,28 @@ function _render({ settings, identity, pending, paired, discovered, providers })
   const peers = paired.peers || [];
   const found = discovered.peers || [];
 
+  // The panel repaints on a 5s poll, and this is a full innerHTML replacement, so
+  // anything half-typed in the name field was destroyed along with the element —
+  // the field looked uneditable because a keystroke survived at most five seconds.
+  // Carry the in-progress value, caret and focus across the repaint.
+  const nameEl = document.getElementById('peer-display-name');
+  const editing = nameEl && document.activeElement === nameEl;
+  const draft = nameEl ? nameEl.value : null;
+  const caret = editing ? [nameEl.selectionStart, nameEl.selectionEnd] : null;
+
   _body.innerHTML = [
     _renderSettings(settings, identity, providers.providers || []),
     enabled ? _renderPending(sessions) : '',
     enabled ? _renderPaired(peers) : '',
     enabled ? _renderDiscovered(found) : '',
   ].join('');
+
+  const fresh = document.getElementById('peer-display-name');
+  if (fresh && draft !== null && draft !== fresh.value) fresh.value = draft;
+  if (fresh && editing) {
+    fresh.focus();
+    if (caret) fresh.setSelectionRange(caret[0], caret[1]);
+  }
 }
 
 function _renderSettings(s, identity, providers) {
@@ -249,7 +265,15 @@ function _renderDiscovered(found) {
         // 只剩已配对的时候，说"没发现"会让人以为发现坏了 —— 图里就是这样：
         // 唯一在附近的机器人正好已经配对，这一段却像在报故障。
         ? `<div class="channel-empty">附近的 ${found.length} 台机器人都已配对。</div>`
-        : '<div class="channel-empty">附近没有发现其他机器人。确认对方也已开启多机协同、且在同一局域网。</div>');
+        // "同一局域网"这句话不够 —— 真实情况是天轶在 10.100.128.0/19、两台 Orin 在
+        // 10.100.121.0/24，同一栋楼、互相 ping 得通，但 mDNS 用链路本地多播
+        // （224.0.0.251，TTL=1），设计上不跨路由。读者会以为发现功能坏了，而它工作正常。
+        : `<div class="channel-empty">附近没有发现其他机器人。
+             <div class="peer-empty-hint">mDNS 只在<b>同一子网</b>内有效 —— 它走链路本地多播，
+             不跨路由器。对方在别的子网时这里就会是空的，即使两台互相 ping 得通。
+             那种情况需要用静态清单（<code>peer_settings.static.peers</code>）把地址写死，
+             再走同样的验证码配对。</div>
+           </div>`);
 
   return `
     <section class="peer-section">

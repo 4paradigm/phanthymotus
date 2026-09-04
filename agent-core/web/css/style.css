@@ -7718,7 +7718,38 @@ html, body {
   flex-wrap: wrap;
 }
 .peer-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
-.peer-input { flex: 1; min-width: 180px; padding: 6px 10px; border-radius: 6px; }
+/* Matches .channel-form-row inputs. Only flex/padding/radius were set before, so
+   border, background, colour and font fell back to the browser default — a heavy
+   dark box that read as a different design language from every other field. */
+.peer-input {
+  flex: 1;
+  min-width: 180px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input, var(--bg-body));
+  color: var(--text);
+  font-size: 0.85rem;
+}
+.peer-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.peer-input:disabled { opacity: .55; cursor: not-allowed; }
+.peer-empty-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: .8;
+  text-align: left;
+}
+.peer-empty-hint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: var(--bg-input, var(--bg-body));
+  border-radius: 4px;
+  padding: 1px 4px;
+}
 
 .peer-identity { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 .peer-identity-label { font-size: 12px; opacity: .7; }
