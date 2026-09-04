@@ -66,8 +66,11 @@ how perception's image reached several GB.
 
 `COPY actucore/deploy/ /deploy/` must stay: Agent Core extracts
 `/deploy/service.yml` from the image to merge the compose fragment, and dropping
-it silently degrades to the legacy `docker run` path. Perception's Jetson
-Dockerfile has exactly this bug — don't copy it.
+it silently degrades to the legacy `docker run` path — which does **not** carry
+the fragment's volumes, so the `dds-local.xml` mount disappears with it and the
+container is no longer isolated. Perception's Jetson Dockerfile shipped exactly
+this bug until `a916a02` ("include deployment service fragment", 2026-08-20); it
+has the `COPY` now, and R1's running container does have the profile mounted.
 
 ## Ports
 

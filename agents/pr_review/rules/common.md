@@ -124,6 +124,45 @@ child does not inherit the parent's `sys.stdout`. See
 `phanthymotus/README.md` § Container Logs and
 `phanthymotus-driver/README_dev.md` § Logging.
 
+## Every DDS container carries the loopback profile
+
+Applies to `agent-core`, `perception`, `actucore` and every driver — anything that
+reaches Agent Core over FastDDS. The compose fragment (or
+`agent-core/deploy/docker-compose.yml`) must have both:
+
+```yaml
+volumes:
+  - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+environment:
+  - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+```
+
+`ROS_DOMAIN_ID` is **42 everywhere**; there are no per-robot numbers to allocate.
+`FASTDDS_BUILTIN_TRANSPORTS` must be gone — it is a process-wide switch that cannot
+confine traffic to the local host, and the profile's `useBuiltinTransports=false`
+overrides it anyway, so leaving it in only misleads the next reader.
+
+This exists because `/remote_control/message` — a *command* topic — was reaching every
+robot on the office LAN: an instruction typed on one robot was executed by a second one,
+identical timestamp in both logs. DDS has no addressing and no authentication.
+
+Three things to flag, none of which look like what they are:
+
+1. **A missing mount does not merely leave the container unisolated — it cuts the
+   container off.** With `useBuiltinTransports=false` everywhere else it ends up on a
+   different transport from the rest of the machine and cannot reach Agent Core at all.
+   The symptom is a device that registers over HTTP and shows in the dashboard while none
+   of its topics carry data. If a PR describes that symptom, check the mount first.
+2. **A mistyped mount path fails silently.** Docker creates a *directory* of that name,
+   FastDDS falls back to every interface, nothing is logged. Compare the string exactly.
+3. **Dropping `COPY <component>/deploy/ /deploy/` from a Dockerfile removes the profile
+   too.** Without the fragment in the image, deployment degrades to the legacy
+   `docker run` path, which carries no volumes from it. See the actucore rules.
+
+For drivers, `phanthymotus-driver/scripts/check_service_yml.py` encodes this contract
+plus its two exemption tables; `read_file` it rather than re-deriving the rules. Full
+rationale: `CLAUDE.md` § "DDS is locked to the local host".
+
 ## Correctness, in priority order
 
 1. **Correctness** — bugs, races, unhandled errors, wrong logic. State the
