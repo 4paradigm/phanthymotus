@@ -7,6 +7,7 @@ import asyncio
 import pathlib
 import sys
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -89,18 +90,59 @@ class FeishuProxyTest(unittest.TestCase):
         self.assertTrue(seen)
         self.assertIs(seen[0]['trust_env'], True)
 
-    def test_websocket_sdk_proxy_patch_is_idempotent(self):
-        import lark_oapi.ws.client as ws_mod
+class SdkProxyPatchTest(unittest.TestCase):
+    """`_enable_sdk_env_proxy` is duck-typed — it only getattr/setattrs what it is
+    handed. The earlier version of these tests imported `lark_oapi.ws.client` to
+    get that object and then mocked the very attribute it came for, so the real
+    SDK bought nothing but the attribute's existence — while making the whole
+    file fail on any machine without the package installed. A stub carries the
+    same information and runs everywhere.
+    """
 
-        with mock.patch.object(
-            ws_mod, '_ws_connect_kwargs', return_value={'proxy': None, 'ping_interval': 30}
-        ):
-            feishu._enable_sdk_env_proxy(ws_mod)
-            patched = ws_mod._ws_connect_kwargs
-            feishu._enable_sdk_env_proxy(ws_mod)
+    @staticmethod
+    def _stub(**attrs):
+        return types.SimpleNamespace(**attrs)
 
-            self.assertIs(ws_mod._ws_connect_kwargs, patched)
-            self.assertEqual(patched(), {'ping_interval': 30})
+    def test_patch_strips_proxy_and_keeps_everything_else(self):
+        mod = self._stub(_ws_connect_kwargs=lambda: {'proxy': None, 'ping_interval': 30})
+        feishu._enable_sdk_env_proxy(mod)
+        self.assertEqual(mod._ws_connect_kwargs(), {'ping_interval': 30})
+
+    def test_patch_is_idempotent(self):
+        """Applied twice, the second call must be a no-op.
+
+        Not cosmetic: each application wraps the previous function, so a
+        re-import that patched again would nest a chain of closures whose depth
+        grows with the number of reconnects.
+        """
+        mod = self._stub(_ws_connect_kwargs=lambda: {'proxy': None, 'ping_interval': 30})
+        feishu._enable_sdk_env_proxy(mod)
+        patched = mod._ws_connect_kwargs
+        feishu._enable_sdk_env_proxy(mod)
+
+        self.assertIs(mod._ws_connect_kwargs, patched)
+        self.assertEqual(patched(), {'ping_interval': 30})
+
+    def test_module_without_the_hook_is_left_alone(self):
+        """An SDK version that renamed or dropped the function must not crash us —
+        Feishu still has to connect, it just will not honour the proxy env."""
+        mod = self._stub()
+        feishu._enable_sdk_env_proxy(mod)
+        self.assertFalse(hasattr(mod, '_ws_connect_kwargs'))
+
+    def test_real_sdk_still_exposes_the_hook(self):
+        """Canary for an upstream rename. Skips where the SDK is absent — this is
+        the only assertion here that genuinely needs it, and its failing means
+        lark_oapi changed, not that our patch is wrong."""
+        try:
+            import lark_oapi.ws.client as ws_mod
+        except ImportError as e:
+            self.skipTest(f'lark_oapi not installed ({e})')
+        self.assertTrue(
+            callable(getattr(ws_mod, '_ws_connect_kwargs', None)),
+            'lark_oapi.ws.client._ws_connect_kwargs is gone — _enable_sdk_env_proxy '
+            'now silently does nothing and Feishu will ignore HTTPS_PROXY',
+        )
 
 
 if __name__ == '__main__':

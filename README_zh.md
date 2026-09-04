@@ -93,7 +93,7 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 | mDNS / DNS-SD（`_motus._tcp.local`） | 同局域网 | 同场地，主力路径 |
 | ~~DDS presence（`/motus/presence`）~~ | —— | **不可用。** DDS 现已锁在本机（见下），任何基于 DDS 的东西都不跨机 |
 | 云端名册 | 公网 | 跨地点、跨网段 |
-| BLE 广播 | 无 | 仅用于完全离网时的**配对引导**，不承载数据面 |
+| BLE 广播 | 一块解开 rfkill 的蓝牙电台 | 没有共用 IP 网络时的**发现**手段。只带公钥，不承载数据面 —— 随后的配对握手仍然要求两台之间 IP 可达 |
 | 静态清单 | 无 | 兜底，永远保留 |
 
 **传输层 —— 四种协作粒度：**

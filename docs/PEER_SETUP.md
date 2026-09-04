@@ -50,32 +50,66 @@ Edit `~/.config/motus/config.json` or set via API:
 ```json
 {
   "peer_settings": {
+    "enabled": true,
     "discovery": {
-      "mdns": {
-        "enabled": true
-      },
-      "static": {
-        "enabled": true,
-        "peers": [
-          {
-            "peer_id": "abc123...",
-            "display_name": "Orin6",
-            "endpoints": ["https://192.168.1.100:15678"]
-          }
-        ]
-      },
-      "ble": {
-        "enabled": false
-      }
+      "mdns": true,
+      "ble": false,
+      "static": [
+        {
+          "url": "https://192.168.1.100:15678",
+          "display_name": "Orin6",
+          "peer_id": ""
+        }
+      ]
     }
   }
 }
 ```
 
 **Discovery Providers:**
-- `mdns`: Auto-discover peers on local network (recommended for LAN)
-- `static`: Manual peer list (for known IPs or cross-subnet)
-- `ble`: Bluetooth Low Energy bootstrap (for offline pairing)
+- `mdns` (bool): auto-discover peers on the local network. The primary path, on
+  by default. Link-local multicast — **does not cross routers**.
+- `static` (list): hand-entered addresses, for a peer one subnet away or a
+  network that filters multicast. `peer_id` is filled in automatically once
+  pairing proves the fingerprint.
+- `ble` (bool): Bluetooth LE. Off by default because it needs host-side setup
+  (below) that no amount of Python can do for you.
+
+All three can be changed from the dashboard's Peers panel and take effect
+without restarting the container.
+
+### BLE Prerequisites (host-side)
+
+BLE is the one provider whose failures are mostly not in this codebase. Before
+turning the toggle on:
+
+```bash
+# 1. The radio ships soft-blocked on Jetson — unblock it (bluetooth only;
+#    `rfkill unblock all` would also enable WiFi, which is not what you want on
+#    a robot wired to a fixed address).
+sudo rfkill unblock bluetooth
+
+# 2. BlueZ has to be running — bleak talks to it over D-Bus, not to the kernel.
+sudo systemctl enable --now bluetooth
+
+# 3. The adapter has to be up.
+sudo hciconfig hci0 up && hciconfig -a | head -3
+```
+
+In a container, `/var/run/dbus/system_bus_socket` must be mounted (agent-core's
+compose template already does this) — without it every scan raises a D-Bus
+error that mentions neither Bluetooth nor the missing mount.
+
+Set `BLE_ADAPTER` if the machine has more than one radio; otherwise the first
+one BlueZ reports is used.
+
+**What BLE does and does not buy you.** It removes the need for *discovery*
+infrastructure: two robots in the same room with no shared subnet still find
+each other and exchange public keys. It does **not** remove the need for
+*connectivity* — the SAS pairing handshake runs over HTTPS, so if the two have
+no IP path between them they will appear in each other's list and pairing will
+fail. Peers discovered with no reachable endpoint are shown without an address
+for exactly this reason.
 
 ---
 
@@ -91,9 +125,16 @@ python src/start.py
 The peer system starts automatically:
 ```
 [peer] generated identity a1b2c3d4e5f6...
-[peer] mDNS discovery started
-[peer] static discovery: 0 peers configured
-[peer] BLE bootstrap disabled: bleak unavailable
+[peer] discovery provider "mdns" started
+[peer] discovery provider "static" started
+```
+
+With `discovery.ble` on, two more lines appear — the second only when the
+peripheral half is installed:
+
+```
+[peer] ble advertising a1b2c3d4e5f6 on hci0
+[peer] discovery provider "ble" started
 ```
 
 ### 2. Discover Peers
@@ -387,20 +428,35 @@ curl -X POST http://localhost:15678/api/peer/f7e8d9c0... \
 
 ### BLE Not Working
 
-**Symptoms:** `[peer] BLE bootstrap disabled: bleak unavailable`
+The provider badge in the Peers panel carries the reason. The common ones:
 
-**Solutions:**
+| Badge text | Cause | Fix |
+|---|---|---|
+| `BLE discovery unavailable (missing bleak)` | Image predates the dependency | Rebuild the image — `bleak` is declared in `pyproject.toml` |
+| `scan only — bluez_peripheral not installed` | Not an error. This robot finds peers but cannot be found | `pip install bluez-peripheral` inside the container, on both machines |
+| `scan failed: BleakDBusError: ...` | Radio blocked, `bluetoothd` down, or no D-Bus socket in the container | See "BLE Prerequisites" above |
+| `advertising failed: RuntimeError: no BLE adapter present` | BlueZ sees no adapter | `hciconfig -a` on the host; check the USB dongle |
+
+A scan failure clears itself on the next successful round, so fixing the host
+side is enough — no settings save or restart needed. Rounds are 45 s apart.
+
+**Range matters more than you would expect.** Advertising packets are one-way
+broadcasts and survive a weak link; a GATT connection does not. Measured between
+the two Orin test rigs: the advert arrived reliably at −93…−99 dBm while every
+connection attempt timed out. If peers appear in the list and pairing never
+gets a key, check RSSI (shown on the row) before suspecting the code — under
+roughly −90 dBm, move the robots closer.
+
 ```bash
-# Install bleak
-pip install bleak
+# Is the radio actually usable, independent of Agent Core?
+rfkill list bluetooth
+hciconfig -a | head -3
+pgrep -a bluetoothd     # more reliable than systemctl on Jetson: some images
+                        # ship a Python systemctl shim that reports 'inactive'
+                        # for a bluetoothd that is demonstrably running
 
-# Check Bluetooth adapter
-hciconfig
-# or
-bluetoothctl show
-
-# For advertising (Linux only), install optional deps
-pip install -e ".[ble-advertise]"
+# Does the container see the bus?
+docker exec phanthy-motus-agent-core-1 ls -l /var/run/dbus/system_bus_socket
 ```
 
 ---
@@ -411,16 +467,15 @@ pip install -e ".[ble-advertise]"
 
 ```bash
 cd agent-core
-python tests/test_peer_identity_pairing.py
-python tests/test_peer_registry.py
-python tests/test_peer_transport.py
-python tests/test_peer_lan_adapter.py
-python tests/test_peer_tools.py
-python tests/test_peer_delegation.py
-python tests/test_peer_ble.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/ -q
 ```
 
-All 30 tests should pass.
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` is not optional: a globally-installed
+`fugue_test` plugin fails to import and aborts collection before any test runs,
+which makes the suite look broken when it is not.
+
+The BLE tests need no Bluetooth hardware — GATT reads are stubbed, so what runs
+is the provider's own logic.
 
 ### Enable Debug Logging
 

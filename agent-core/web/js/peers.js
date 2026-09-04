@@ -149,6 +149,10 @@ function _renderSettings(s, identity, providers) {
           <input type="checkbox" id="peer-mdns" ${s.discovery?.mdns ? 'checked' : ''} ${enabled ? '' : 'disabled'}>
           <span>局域网自动发现 (mDNS)</span>
         </label>
+        <label class="peer-toggle" title="蓝牙只用来交换公钥，不承载数据；配对握手仍走 HTTPS，两台之间必须还能通 IP。需要主机上 rfkill 解锁并运行 bluetoothd。">
+          <input type="checkbox" id="peer-ble" ${s.discovery?.ble ? 'checked' : ''} ${enabled ? '' : 'disabled'}>
+          <span>蓝牙发现 (BLE)</span>
+        </label>
       </div>
       <div class="peer-settings-row">
         <input class="peer-input" id="peer-display-name" placeholder="${_escAttr(s.resolved_display_name || '本机名称')}"
@@ -328,9 +332,12 @@ function _renderDiscovered(found) {
         const provisional = p.peer_id.startsWith('static:');
         const address = (p.endpoints || [])[0] || p.peer_id.replace(/^static:/, '');
         const name = p.display_name || (provisional ? address : p.peer_id.slice(0, 12));
+        // Signal strength is the only way to tell two identical robots in the
+        // same room apart before pairing — the fingerprints are both opaque.
+        const rssi = typeof p.rssi === 'number' ? ` · ${p.rssi}dBm` : '';
         const meta = provisional
           ? `指纹待配对确认 · ${_esc((p.sources || []).join(',') || 'static')}`
-          : `${_esc(p.peer_id.slice(0, 12))}… · ${_esc((p.sources || []).join(',') || '?')}`;
+          : `${_esc(p.peer_id.slice(0, 12))}… · ${_esc((p.sources || []).join(',') || '?')}${rssi}`;
         return `
         <div class="user-row" data-peer-id="${_escAttr(p.peer_id)}">
           <span class="user-identity" title="${_escAttr(provisional ? address : p.peer_id)}">
@@ -386,7 +393,8 @@ async function _onClick(e) {
 }
 
 async function _onChange(e) {
-  if (e.target.id === 'peer-enabled' || e.target.id === 'peer-mdns') return _saveSettings();
+  if (e.target.id === 'peer-enabled' || e.target.id === 'peer-mdns'
+      || e.target.id === 'peer-ble') return _saveSettings();
   const sel = e.target.closest('[data-peer-role]');
   if (sel) return _setRole(sel);
 }
@@ -435,12 +443,13 @@ async function _removeStatic(index) {
 async function _saveSettings() {
   const enabled = document.getElementById('peer-enabled')?.checked;
   const mdns = document.getElementById('peer-mdns')?.checked;
+  const ble = document.getElementById('peer-ble')?.checked;
   const displayName = document.getElementById('peer-display-name')?.value ?? '';
   try {
     const res = await fetch('/api/peer/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled, mdns, display_name: displayName }),
+      body: JSON.stringify({ enabled, mdns, ble, display_name: displayName }),
     });
     const json = await res.json();
     if (!res.ok) throw new Error(json.detail || '保存失败');

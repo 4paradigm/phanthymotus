@@ -92,6 +92,7 @@ async def get_settings():
         'discovery': {
             'mdns': bool(disc.get('mdns', True)),
             'static': disc.get('static') or [],
+            'ble': bool(disc.get('ble', False)),
         },
         'default_role': s.get('default_role', 'viewer'),
         'clock_skew_s': s.get('clock_skew_s', 120),
@@ -149,6 +150,7 @@ class PeerSettingsReq(BaseModel):
     display_name: str | None = None
     mdns: bool | None = None
     static: list | None = None
+    ble: bool | None = None
     default_role: str | None = None
     clock_skew_s: int | None = None
 
@@ -185,6 +187,8 @@ async def save_settings(req: PeerSettingsReq):
         disc['mdns'] = bool(req.mdns)
     if req.static is not None:
         disc['static'] = _normalize_static(req.static)
+    if req.ble is not None:
+        disc['ble'] = bool(req.ble)
     s['discovery'] = disc
     config.main['peer_settings'] = s
 

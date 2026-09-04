@@ -106,11 +106,11 @@ class TestApiImports(unittest.TestCase):
         import peer.tools           # noqa: F401
         import peer.delegation      # noqa: F401
         import peer.dds_state       # noqa: F401
-        import peer.ble_bootstrap   # noqa: F401
         import peer.ble_advertiser  # noqa: F401
         import peer.discovery.base    # noqa: F401
         import peer.discovery.static  # noqa: F401
         import peer.discovery.mdns    # noqa: F401
+        import peer.discovery.ble     # noqa: F401
         import channel.adapters.lan   # noqa: F401
 
     def test_delegate_without_agent_loop_returns_503(self):

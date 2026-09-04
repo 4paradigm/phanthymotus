@@ -96,7 +96,7 @@ stays one record with several links, which is what makes fallback possible.
 | mDNS / DNS-SD (`_motus._tcp.local`) | Same LAN | Same site — the primary path |
 | ~~DDS presence (`/motus/presence`)~~ | — | **Not usable.** DDS is now pinned to loopback (see below), so nothing DDS-based crosses machines |
 | Cloud roster | Internet | Across sites and subnets |
-| BLE advert | Nothing | Fully offline **pairing bootstrap** only — not a data plane |
+| BLE advert | A Bluetooth radio, unblocked | **Discovery** where there is no shared IP network. Carries the key, not a data plane — the pairing handshake that follows still needs IP reachability |
 | Static list | Nothing | Fallback, always kept |
 
 **Transport — four granularities of collaboration:**
