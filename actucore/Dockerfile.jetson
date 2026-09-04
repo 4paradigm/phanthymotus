@@ -1,8 +1,9 @@
 # ── Jetson ActuCore runtime ─────────────────────────────────────────
-# Expensive locked third-party navigation dependencies live in the digest-pinned
-# navigation base. This image only rebuilds repository-owned ROS packages and app code.
+# The digest-pinned navigation image is a build input only. Repository-owned ROS
+# packages are installed normally here, then only install spaces cross into runtime.
 ARG ACTUCORE_NAVIGATION_BASE_IMAGE
-FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE}
+ARG ACTUCORE_RUNTIME_BASE_IMAGE
+FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE} AS actucore_ros_builder
 ARG ACTUCORE_NAVIGATION_BASE_IMAGE
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -17,8 +18,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
     source /opt/fast_livo_ws/install/setup.bash && \
     cd /ros_ws && \
     MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
-      --packages-select fast_livo2 segmented_controller nav2 \
-      --symlink-install && \
+      --packages-select fast_livo2 segmented_controller nav2 && \
     source /ros_ws/install/setup.bash && \
     ros2 pkg prefix segmented_controller >/dev/null && \
     NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
@@ -26,11 +26,28 @@ RUN source /opt/ros/humble/install/setup.bash && \
     python3 -c "import numpy, rosbag2_py, yaml, em; import cv2; from fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; from fast_livo2.camera_depth_frame import decode as decode_depth, MAGIC as DEPTH_MAGIC; assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'" && \
     ros2 bag record --help | grep -F -- '--no-discovery' >/dev/null
 
+COPY actucore/plugins/ /tmp/actucore-plugins/
+RUN rm -rf /tmp/actucore-plugins/navigation/runtime
+
+# The navigation image is a build input only. Restart from the clean platform
+# parent and copy install spaces, leaving source, build and log trees behind.
+FROM ${ACTUCORE_RUNTIME_BASE_IMAGE} AS actucore_runtime
+ARG ACTUCORE_NAVIGATION_BASE_IMAGE
+ARG ACTUCORE_RUNTIME_BASE_IMAGE
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+COPY --from=actucore_ros_builder /opt/ros_deps_ws/install/ /opt/ros_deps_ws/install/
+COPY --from=actucore_ros_builder /opt/fast_livo_ws/install/ /opt/fast_livo_ws/install/
+COPY --from=actucore_ros_builder /opt/nav2_ws/install/ /opt/nav2_ws/install/
+COPY --from=actucore_ros_builder /opt/actucore-ros-package-lock.txt /opt/actucore-ros-package-lock.txt
+COPY --from=actucore_ros_builder /ros_ws/install/ /ros_ws/install/
+
 COPY actucore/plugins/navigation/runtime/navigation_lio.yaml /config/navigation_lio.yaml
 
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
-COPY actucore/plugins/    /work/plugins/
+COPY --from=actucore_ros_builder /tmp/actucore-plugins/ /work/plugins/
 COPY actucore/utils/      /work/utils/
 COPY actucore/config.yaml /work/config.yaml
 # Atomic-write stdout guard. The build context is the repo root, so this reuses
@@ -50,7 +67,18 @@ RUN find /ros_ws/install /opt/nav2_ws/install /opt/ros_deps_ws/install \
       >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
     echo /work \
       >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
-    cd / && python3 -c "import logsafe"
+    cd / && python3 -c "import logsafe" && \
+    source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    source /opt/nav2_ws/install/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    source /ros_ws/install/setup.bash && \
+    ros2 pkg prefix fast_livo2 >/dev/null && \
+    ros2 pkg prefix segmented_controller >/dev/null && \
+    ros2 pkg prefix nav2 >/dev/null && \
+    ! ldd /ros_ws/install/segmented_controller/lib/libsegmented_controller.so | grep -Fq 'not found' && \
+    test ! -e /ros_ws/src && test ! -e /ros_ws/build && test ! -e /ros_ws/log && \
+    test ! -e /work/plugins/navigation/runtime
 
 ENV LD_LIBRARY_PATH="/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/install/livox_ros_driver2/lib:/opt/fast_livo_ws/install/vikit_common/lib:/opt/fast_livo_ws/install/vikit_ros/lib:/opt/nav2_ws/install/lib:/opt/ros_deps_ws/install/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/fast_livo2:/ros_ws/install/segmented_controller:/ros_ws/install/nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
@@ -62,7 +90,8 @@ ENV RCUTILS_LOGGING_BUFFERED_STREAM=1
 LABEL org.opencontainers.image.title="Phanthy Motus ActuCore" \
       org.opencontainers.image.description="执行模型层 — navigation 卡片（FAST-LIVO2 + Nav2 + 语义航点）" \
       org.opencontainers.image.licenses="Apache-2.0 AND GPL-2.0-only AND GPL-3.0-only" \
-      org.opencontainers.image.base.name="${ACTUCORE_NAVIGATION_BASE_IMAGE}"
+      org.opencontainers.image.base.name="${ACTUCORE_RUNTIME_BASE_IMAGE}" \
+      org.opencontainers.image.navigation-build-base="${ACTUCORE_NAVIGATION_BASE_IMAGE}"
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \

@@ -524,12 +524,43 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("jetson-base:jp61-torch@sha256:", build_script)
         self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)
-        self.assertIn("FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE}", dockerfile)
+        self.assertIn(
+            "FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE} AS actucore_ros_builder",
+            dockerfile,
+        )
+        self.assertIn(
+            "FROM ${ACTUCORE_RUNTIME_BASE_IMAGE} AS actucore_runtime",
+            dockerfile,
+        )
         self.assertIn("ARG ACTUCORE_NAVIGATION_BASE_IMAGE\n", dockerfile)
+        self.assertIn("ARG ACTUCORE_RUNTIME_BASE_IMAGE\n", dockerfile)
+        self.assertNotIn("--symlink-install", dockerfile)
+        self.assertIn(
+            "COPY --from=actucore_ros_builder /ros_ws/install/ /ros_ws/install/",
+            dockerfile,
+        )
+        for workspace in ("ros_deps_ws", "fast_livo_ws", "nav2_ws"):
+            self.assertIn(
+                f"COPY --from=actucore_ros_builder /opt/{workspace}/install/",
+                dockerfile,
+            )
+        for directory in ("src", "build", "log"):
+            self.assertIn(f"test ! -e /ros_ws/{directory}", dockerfile)
+        self.assertIn(
+            "rm -rf /tmp/actucore-plugins/navigation/runtime", dockerfile
+        )
+        self.assertIn(
+            "test ! -e /work/plugins/navigation/runtime", dockerfile
+        )
+        self.assertNotIn("COPY actucore/plugins/    /work/plugins/", dockerfile)
         self.assertNotIn("actucore-navigation-base@sha256:", dockerfile)
         self.assertNotIn("missing-digest", dockerfile)
         self.assertIn("--base", build_script)
         self.assertIn("ACTUCORE_NAVIGATION_BASE_IMAGE override", build_script)
+        self.assertIn(
+            '"ACTUCORE_RUNTIME_BASE_IMAGE=${NAVIGATION_PARENT_IMAGE}"',
+            build_script,
+        )
         self.assertIn("JP${JP_VERSION} navigation base is not published", build_script)
         self.assertIn(
             "actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b",

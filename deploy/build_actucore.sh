@@ -4,8 +4,8 @@
 # 只有 Jetson 版：执行模型多数要 GPU（VLA / 抓取策略 / locomotion），
 # 没有 CPU 变体。navigation 卡片本身不用 GPU，但和它们共用这一个镜像。
 #
-# FAST-LIVO2 与 Nav2 只在 navigation base 中从锁定源码编译；日常镜像继承
-# digest-pinned base，只重编仓库自有 ROS 包和应用代码。
+# FAST-LIVO2 与 Nav2 只在 navigation base 中从锁定源码编译；日常镜像用
+# 它编译仓库自有 ROS 包，最终运行阶段回到同一个 digest-pinned 平台基线。
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
@@ -65,6 +65,10 @@ jetpack_vars "${JP_VERSION}" || exit 1
 
 # Dockerfile.jetson 基于 L4T base image —— 只有 arm64
 CPU_ARCH="arm64"
+case "${JP_VERSION}" in
+    5.11) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
+    6.1) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
+esac
 
 if ${BUILD_BASE}; then
     if ! ${IS_ARM64}; then
@@ -79,10 +83,6 @@ if ${BUILD_BASE}; then
     GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"
     source "${NAV_RUNTIME_DIR}/fast_livo2-source.lock"
     source "${NAV_RUNTIME_DIR}/nav2-source.lock"
-    case "${JP_VERSION}" in
-        5.11) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
-        6.1) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
-    esac
     BUILD_ARGS+=(
         "ACTUCORE_NAVIGATION_PARENT_IMAGE=${NAVIGATION_PARENT_IMAGE}"
         "GIT_MIRROR_PREFIX=${GIT_MIRROR_PREFIX}"
@@ -142,7 +142,10 @@ else
         echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE override must use an exact @sha256 digest" >&2
         exit 2
     fi
-    BUILD_ARGS+=("ACTUCORE_NAVIGATION_BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}")
+    BUILD_ARGS+=(
+        "ACTUCORE_NAVIGATION_BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}"
+        "ACTUCORE_RUNTIME_BASE_IMAGE=${NAVIGATION_PARENT_IMAGE}"
+    )
 fi
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${TAG}"

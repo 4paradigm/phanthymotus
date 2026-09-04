@@ -4,8 +4,8 @@
 #   /opt/ros/humble/install（dustynv/ros:humble-desktop-l4t 血统），
 #   外加 JetPack 的 CUDA torch。
 #
-# 只包含稳定、昂贵的第三方导航依赖。日常 ActuCore 镜像继承本镜像后，只编译
-# 仓库自有的三个 ROS 包并复制应用代码。
+# 只包含稳定、昂贵的第三方导航依赖。它是日常 ActuCore 的编译输入，
+# 最终服务镜像从干净平台基线重新开始，只复制编译好的 install space。
 #
 # 为什么 Nav2 是源码编译：base 是 Focal，而 ros-humble-* 的 Debian 包只有
 # Jammy 的，apt 装不到 navigation2。所以 Nav2 连同它在 base 之外缺的几个 ROS
@@ -518,8 +518,8 @@ RUN source /opt/ros/humble/install/setup.bash && \
     { git config --global --remove-section \
         "url.${GIT_MIRROR_PREFIX}https://github.com/" || true; }
 
-# The deployable base starts again from the digest-pinned parent. Only install
-# spaces cross this boundary; source, build and log trees stay in the builder.
+# The reusable build base starts again from the digest-pinned parent. Only
+# install spaces cross this boundary; source, build and log trees stay behind.
 FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_runtime
 ARG APT_MIRROR
 ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
@@ -544,8 +544,8 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
     done && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# These development packages remain because Dockerfile.jetson compiles the
-# three repository-owned ROS packages on top of this reusable build base.
+# This is intentionally a build-only input for Dockerfile.jetson, so it carries
+# the headers and compiler used for the three repository-owned ROS packages.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       build-essential \
@@ -586,8 +586,8 @@ RUN command -v colcon >/dev/null && \
     test ! -e /opt/fast_livo_ws/src && test ! -e /opt/fast_livo_ws/build && test ! -e /opt/fast_livo_ws/log && \
     test ! -e /opt/nav2_ws/src && test ! -e /opt/nav2_ws/build && test ! -e /opt/nav2_ws/log
 
-LABEL org.opencontainers.image.title="Phanthy Motus ActuCore Navigation Base" \
-      org.opencontainers.image.description="ActuCore navigation build base — locked FAST-LIVO2 and Nav2" \
+LABEL org.opencontainers.image.title="Phanthy Motus ActuCore Navigation Build Base" \
+      org.opencontainers.image.description="Build-only input with locked FAST-LIVO2 and Nav2 install spaces" \
       org.opencontainers.image.licenses="Apache-2.0 AND GPL-2.0-only AND GPL-3.0-only" \
       org.opencontainers.image.fast-livo2-revision="${FAST_LIVO2_COMMIT}" \
       org.opencontainers.image.fast-livo2-runtime-patch="${FAST_LIVO2_RUNTIME_PATCH_SHA256}" \
