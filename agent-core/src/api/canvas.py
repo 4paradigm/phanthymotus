@@ -277,6 +277,13 @@ async def get_layout():
 @router.post('/layout')
 async def save_layout(layout: CanvasLayout):
     """Persist the canvas layout. Only the current editor can save."""
+    from api.config import layout_lifecycle_lock
+
+    async with layout_lifecycle_lock:
+        return await _save_layout_locked(layout)
+
+
+async def _save_layout_locked(layout: CanvasLayout):
     global _editor_session, _editor_last_seen
     _check_editor_expired()
 
@@ -290,12 +297,62 @@ async def save_layout(layout: CanvasLayout):
 
     save_data = layout.dict()
     save_data.pop('session_id', None)
-    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = save_data
-    # A card that leaves the layout is unreachable afterwards — stop-project only
-    # walks the saved cards — so its plugin instance would keep running forever.
+    old_layout = config.main.get('canvas_layout', {}) or {}
+    old_cards = old_layout.get('cards', [])
+    was_running = config.main.get('core', {}).get('project_running', False)
+    topic_action_mgr = None
+    if was_running:
+        from topic_actions import build_routes, manager as topic_action_mgr
+        try:
+            build_routes(save_data)
+        except Exception as error:
+            return fastapi.responses.JSONResponse(
+                status_code=409,
+                content={
+                    'code': 409,
+                    'message': f'Topic-action routes are invalid: {error}',
+                },
+            )
+        core = config.main.get('core', {})
+        core['project_running'] = False
+        config.main['core'] = core
     from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, save_data.get('cards', []))
+    _, stop_failures = await stop_removed_cards(
+        old_cards, save_data.get('cards', []))
+    if stop_failures:
+        if topic_action_mgr is not None:
+            await topic_action_mgr.stop()
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={
+                'code': 409,
+                'message': (
+                    'Removed card stop was not confirmed; layout was not saved '
+                    'and the project was stopped fail-closed'
+                ),
+                'failures': stop_failures,
+            },
+        )
+    config.main['canvas_layout'] = save_data
+    if topic_action_mgr is not None:
+        try:
+            await topic_action_mgr.start(save_data)
+        except Exception as error:
+            await topic_action_mgr.stop()
+            notify_layout_changed(session_id or '')
+            return fastapi.responses.JSONResponse(
+                status_code=409,
+                content={
+                    'code': 409,
+                    'message': (
+                        f'Layout was saved but topic-action routes failed: {error}; '
+                        'the project was stopped fail-closed'
+                    ),
+                },
+            )
+        core = config.main.get('core', {})
+        core['project_running'] = True
+        config.main['core'] = core
     notify_layout_changed(session_id or '')
     return {'code': 200}
 

@@ -16,6 +16,7 @@ import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceCon
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
+import { selectPreviewTopic } from './topic-derive.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -710,7 +711,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     const fmtShort = fmt.split('/').pop() || '?';
     const colorCls = _fmtColorClass(fmt);
     const staticAttr = t.topic ? `data-static-topic="${_esc(t.topic)}"` : '';
-    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}" title="${_esc(fmt)}"><span class="canvas-port-label">${_esc(fmtShort)}</span></div>`;
+    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-port="${_esc(t.port || '')}" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}" title="${_esc(fmt)}"><span class="canvas-port-label">${_esc(fmtShort)}</span></div>`;
   }).join('');
 
   if (effectiveType === 'controller') {
@@ -848,7 +849,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     el.querySelector('.canvas-view-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      _openTopicDetailFor(el, mcpId, topicOut);
+      _openTopicDetailFor(el, mcpId, topicOut, toolTopicOut);
     });
 
     const sensorExecBtn = el.querySelector('.canvas-exec-btn');
@@ -1039,7 +1040,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (viewBtn) {
       viewBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        _openTopicDetailFor(el, mcpId, topicOut);
+        _openTopicDetailFor(el, mcpId, topicOut, toolTopicOut);
       });
     }
 
@@ -1911,12 +1912,14 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
  *    TTS card opened a panel that never showed a waveform, and why the server
  *    log filled with `ASGI callable returned without completing handshake`.
  */
-function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
+function _openTopicDetailFor(el, mcpId, cachedTopicOut, declaredTopicOut) {
   const livePorts = [...el.querySelectorAll('.canvas-port.out')]
-    .map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
+    .map(p => ({ port: p.dataset.port, topic: p.dataset.topic, format: p.dataset.format }));
   const liveMcp = _allMcps.find(m => m.id === mcpId);
-  const candidate = [...livePorts, ...(cachedTopicOut || []), ...(liveMcp?.topic_out || [])]
-    .find(t => t && t.topic);
+  const candidate = selectPreviewTopic(
+    [...livePorts, ...(cachedTopicOut || []), ...(liveMcp?.topic_out || [])],
+    declaredTopicOut,
+  );
   if (!candidate) {
     _showToast('该卡片还没有解析出输出 topic —— 先点「开始控制」把它启动起来');
     return;

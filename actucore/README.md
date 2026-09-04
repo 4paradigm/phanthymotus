@@ -9,7 +9,10 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前不带任何卡片** —— 这一版是骨架加全链路打通。`tools/list` 返回空数组，服务照样注册、探活、在 Dashboard 侧边栏「执行」分区里显示（count 0）。
+**当前卡片：`navigation`**，公开工具名 `ControlledSemanticSpatial` —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket），对外只发布 bounded `velocity_proposal`，物理执行仍归 Driver。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/navigation/README.md](plugins/navigation/README.md)。
+
+该卡片的公开契约可复用于不同机器人；当前 runtime adapter 使用兼容性
+`ubuntu` namespace，各本体由 Driver 提供符合契约的 topic、frame、标定和执行器。
 
 | | |
 |---|---|
@@ -24,15 +27,37 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 ## 构建与运行
 
-只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
+只有 Jetson 版 —— 执行模型多数要 GPU（VLA、抓取策略、locomotion），没有 CPU 变体。`navigation` 卡片本身不用 GPU，但和它们共用这一个镜像。
 
 ```bash
-./deploy/build_actucore.sh                    # JetPack 5.11（默认）
-./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1
-./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
+./deploy/build_actucore.sh                 # JetPack 5.11（默认）
+./deploy/build_actucore.sh --mirror tuna   # 指定 pip / apt 源
 ```
 
-镜像刻意做薄 —— 除了 MCP server 本身，只保留 base 镜像自带的 CUDA torch 和 ROS2 环境。加卡片时把该卡片的依赖放在它自己的 `RUN` 层，不要预装在基础层里。
+JetPack 5.11 默认继承仓库锁定的 `@sha256` 基础镜像，无需额外
+环境变量。JetPack 6.1 的 navigation base 尚未发布，当前不属于正式
+构建范围；该版本必须先构建、发布并在仓库中固定匹配的精确 digest，
+然后才能恢复支持。该基础镜像预编译了锁定版本的 FAST-LIVO2、Nav2
+和系统依赖，仅作为日常构建的 builder。仓库自有 ROS 包使用普通 install
+编译后，最终阶段从同一个干净、锁定 digest 的 Jetson 平台镜像重新开始，
+只复制第三方和自有 ROS install space 及应用代码。源码、build/log 目录和
+navigation base 中额外的编译层不会进入可部署镜像。临时验证另一个基线时
+可显式设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，覆盖值仍必须是精确的
+`@sha256` 引用。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
+重新构建并推送基础镜像：
+
+```bash
+GIT_MIRROR_PREFIX=https://ghfast.top/ \
+  ./deploy/build_actucore.sh --base --mirror tuna
+```
+
+在 8 GB 等小内存 ARM64 构建机上可设置 `BUILD_JOBS=2`；该值会同时传给
+navigation base 和日常 ActuCore 的 C++ 编译步骤。
+
+基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时仍把普通依赖
+放在 `Dockerfile.jetson`；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈
+才进入 `Dockerfile.navigation-base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
+再次走耗时且容易超时的 x86 QEMU 交叉编译。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 
@@ -78,6 +103,8 @@ TOOLS = [
             # "x-completion": {"actions": ["goto"], "timeout": 120},
             # 可选：系统 hook 绑定（打断等）
             # "x-hooks": {"on_interrupt_goto": {"action": "cancel"}},
+            # 可选：Canvas topic 输入转换为同工具 action
+            # "x-topic-actions": [{"port": "goal", "action": "goto", ...}],
         },
         "configSchema": {
             "type": "object",
@@ -110,9 +137,10 @@ TOOLS = [
        self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
        log.info("XPlugin loaded")
    ```
-4. 该卡片需要的依赖加到 `Dockerfile`（以及 `Dockerfile.jetson`，如果要跑 GPU）
+4. 该卡片需要的依赖加到 `Dockerfile.jetson` 自己的 `RUN` 层
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
-需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 vop 的注册块。
+需要 ROS 命名空间的卡片（topic 里要带机器人名）必须在注册块中校验类型和该
+runtime adapter 的支持范围；不要用 hostname 猜测机器人 namespace。
 
-完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/vop.py` —— 它是最干净的范例。
+本层最完整的范例是 `plugins/navigation/`：一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/vop.py`。

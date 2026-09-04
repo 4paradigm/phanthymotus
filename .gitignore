@@ -62,3 +62,8 @@ Thumbs.db
 
 # Docker
 .docker/
+
+# Local robot deployment and diagnostics helpers
+/actucore/plugins/navigation/deploy/scripts/collect-navigation-diagnostics.sh
+/actucore/plugins/navigation/deploy/scripts/deploy-g1.sh
+/actucore/plugins/navigation/deploy/scripts/owner-start-g1-test-containers.sh

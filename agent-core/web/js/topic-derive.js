@@ -20,6 +20,15 @@ export function topicOfPort(card, portIdx) {
   return list[portIdx]?.topic || list[0]?.topic || '';
 }
 
+/** Prefer the tool-declared preview output, otherwise the first resolved topic. */
+export function selectPreviewTopic(candidates, declaredTopicOut = []) {
+  const resolved = (candidates || []).filter(t => t?.topic);
+  const preferred = (declaredTopicOut || []).find(t => t.default_preview === true);
+  return (preferred && resolved.find(t =>
+    (preferred.port && t.port === preferred.port) || t.topic === preferred.topic
+  )) || resolved[0] || null;
+}
+
 /**
  * The topic feeding `card`, resolved through the graph.
  *

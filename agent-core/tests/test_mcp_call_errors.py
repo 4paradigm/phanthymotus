@@ -27,6 +27,7 @@ import mcp_client  # noqa: E402
 
 MCP_ID = 'mcp-1782801833'
 LOCO_MOVE = f'mcp__{MCP_ID}__loco__move'
+NAVIGATE = f'mcp__{MCP_ID}__navigation__navigate_to_pose'
 
 
 @pytest.fixture
@@ -131,3 +132,97 @@ def test_empty_result_without_an_error_still_stringifies(r1_registry, monkeypatc
     out = asyncio.run(mcp_client.call_tool(LOCO_MOVE, {}))
 
     assert out == '{}'
+
+
+def test_pending_barrier_is_scoped_to_one_tool(monkeypatch):
+    nav_event = asyncio.Event()
+    tts_event = asyncio.Event()
+    nav_event.set()
+    monkeypatch.setattr(
+        mcp_client,
+        '_pending_actions',
+        {'nav-action': nav_event, 'tts-action': tts_event},
+    )
+    monkeypatch.setattr(
+        mcp_client,
+        '_pending_tools',
+        {'nav-action': 'navigation', 'tts-action': 'tts'},
+    )
+    monkeypatch.setattr(
+        mcp_client,
+        '_pending_timeouts',
+        {'nav-action': 1, 'tts-action': 1},
+    )
+    monkeypatch.setattr(mcp_client, '_pending_results', mcp_client.OrderedDict())
+
+    result = asyncio.run(mcp_client.await_pending(tool_name='navigation'))
+
+    assert result == {'status': 'completed', 'actions': ['nav-action']}
+    assert 'tts-action' in mcp_client._pending_actions
+
+
+def test_completion_passthrough_actions_do_not_conflict(monkeypatch):
+    monkeypatch.setattr(mcp_client, '_pending_actions', {'nav-action': asyncio.Event()})
+    monkeypatch.setattr(mcp_client, '_pending_tools', {'nav-action': 'navigation'})
+    completion = {'passthrough_actions': ['pause_nav', 'resume_nav', 'stop_nav']}
+
+    assert not mcp_client.pending_conflicts('navigation', 'stop_nav', completion)
+    assert mcp_client.pending_conflicts('navigation', 'navigate_to_pose', completion)
+
+
+def test_completion_received_before_call_result_still_releases_pending(monkeypatch):
+    completion = {
+        'type': 'action_complete',
+        'action_id': 'nav-early',
+        'status': 'arrived',
+    }
+    reg = {
+        MCP_ID: {
+            'url': 'http://localhost:15730/mcp',
+            'tools': ['navigation'],
+            'split_map': {
+                NAVIGATE: {
+                    'tool': 'navigation',
+                    'action': 'navigate_to_pose',
+                }
+            },
+            'tool_meta': {
+                NAVIGATE: {
+                    'type': 'processor',
+                    'completion': {
+                        'actions': ['navigate_to_pose'],
+                        'timeout': 3600,
+                    },
+                }
+            },
+            'schemas': {},
+            'input_schemas': {},
+            'tool_groups': {},
+        }
+    }
+    monkeypatch.setattr(mcp_client, 'registry', reg)
+    monkeypatch.setattr(mcp_client, '_pending_actions', {})
+    monkeypatch.setattr(mcp_client, '_pending_tools', {})
+    monkeypatch.setattr(mcp_client, '_pending_timeouts', {})
+    monkeypatch.setattr(
+        mcp_client,
+        '_pending_results',
+        mcp_client.OrderedDict([('nav-early', completion)]),
+    )
+    _stub_jrpc(
+        monkeypatch,
+        {
+            'content': [
+                {
+                    'type': 'text',
+                    'text': '{"status":"navigating","action_id":"nav-early"}',
+                }
+            ]
+        },
+        [],
+    )
+
+    asyncio.run(mcp_client.call_tool(NAVIGATE, {}))
+
+    assert mcp_client._pending_actions['nav-early'].is_set()
+    assert mcp_client._pending_tools['nav-early'] == 'navigation'

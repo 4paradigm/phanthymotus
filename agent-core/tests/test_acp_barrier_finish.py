@@ -353,6 +353,23 @@ def test_mid_turn_mcp_barrier_ignores_steering():
     assert asyncio.run(scenario())['status'] == 'completed'
 
 
+def test_mid_turn_mcp_barrier_only_waits_for_its_tool():
+    async def scenario():
+        _arm('nav-action', tool='navigation')
+        _arm('tts-action', tool='tts')
+        _complete('nav-action')
+        return await asyncio.wait_for(
+            _acp_barrier(
+                'mcp__x__navigate', None, tool_name='navigation'
+            ),
+            timeout=1,
+        )
+
+    result = asyncio.run(scenario())
+    assert result['actions'] == ['nav-action']
+    assert 'tts-action' in mcp_client._pending_actions
+
+
 def test_abort_clears_every_pending_table():
     """A leftover in _pending_timeouts would inflate the next barrier's
     effective_timeout (mcp_client.py:610, max over all pending)."""

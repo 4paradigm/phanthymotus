@@ -1,20 +1,59 @@
 # ActuCore — 执行模型层配置
 #
 # 与 perception/config.yaml 同构：mcp_port + 每张卡片的开关与参数。
-# 当前不带任何卡片，plugins 为空。
+#
+# 卡片名要和 main.py 里 ActuCoreBundle 的注册块、以及插件的 PREFIX 对上。
 
 mcp_port: 15730
 
-plugins: {}
-  # 新增卡片后在这里打开它，例如：
-  #
-  # vla:
-  #   enabled: true
-  #   model_dir: /models/vla
-  #   namespace: ""       # 留空则用 hostname 自动推导
-  #
-  # nav:
-  #   enabled: true
-  #   map_dir: /models/maps
-  #
-  # 卡片名要和 main.py 里 ActuCoreBundle 的注册块、以及插件的 PREFIX 对上。
+plugins:
+  navigation:
+    enabled: true
+    namespace: ubuntu
+    mapping:
+      backend: ros_topic
+      request_timeout_sec: 130.0
+      discovery_timeout_sec: 5.0
+      input_max_age_ms: 500
+      lidar_qos_depth: 2
+      imu_qos_depth: 400
+      map_voxel_size_m: 0.10
+      obstacle_min_height_m: -0.30
+      obstacle_max_height_m: 0.30
+      collection_enabled: false
+      collection_directory: /opt/phanthy-motus/data/fast_livo2/recordings
+    planning:
+      backend: ros_topic
+      shadow_only: true
+      request_timeout_sec: 30.0
+      discovery_timeout_sec: 5.0
+      input_max_age_ms: 500
+      min_x_mps: 0.30
+      max_x_mps: 1.0
+      min_y_mps: 0.0
+      max_y_mps: 0.0
+      min_yaw_rps: 0.3
+      max_yaw_rps: 0.3
+      proposal_ttl_ms: 250
+    semantic:
+      camera_topic: "/ubuntu/camera/rgb_frame"
+      odometry_topic: "/ubuntu/navigation/odom"
+      fast_livo2_status_topic: "/ubuntu/navigation/fast_livo2/status"
+      goal_topic: "/ubuntu/navigation/goal_pose"
+      required_frame_id: "map"
+      required_child_frame_id: "base_link"
+      sensor_timeout_sec: 2.5
+      sensor_max_age_sec: 1.0
+      sensor_max_skew_sec: 0.35
+      sensor_sync_mode: "receive_time"
+      status_restart_gap_sec: 5.0
+      status_stale_after_sec: 3.5
+      subscriber_timeout_sec: 2.0
+      match_threshold: 0.55
+      navigation_speed: 0.30
+      auto_start_on_action: true
+      vlm:
+        base_url: "https://ark.cn-beijing.volces.com/api/v3"
+        api_key: ""
+        model: "doubao-seed-2-1-pro-260628"
+        timeout_sec: 18.0

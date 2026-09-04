@@ -1,0 +1,806 @@
+from __future__ import annotations
+
+import math
+import sys
+import unittest
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+PACKAGE_ROOT = (
+    Path(__file__).resolve().parents[1]
+    / "plugins"
+    / "navigation"
+    / "runtime"
+    / "nav2"
+)
+SEGMENTED_CONTROLLER_ROOT = PACKAGE_ROOT.parent / "segmented_controller"
+sys.path.insert(0, str(PACKAGE_ROOT))
+
+from nav2.costmap_validation import (  # noqa: E402
+    CostmapError,
+    CostmapSnapshot,
+    GoalCellRejected,
+    goal_cell_receipt,
+    validated_goal_cell_receipt,
+)
+from nav2.execution_protocol import (  # noqa: E402
+    MotionLimits,
+    ProtocolError,
+    Velocity,
+    VelocityProposal,
+    apply_motion_floor,
+    apply_motion_limits,
+    build_velocity_proposal,
+    limit_forward_velocity,
+    proposal_context_is_current,
+    proposal_context_is_publishable,
+)
+from nav2.readiness import (  # noqa: E402
+    control_odom_motion_blocker,
+    evaluate_readiness,
+    navigation_motion_blocker,
+)
+
+
+class Nav2CompanionCoreTest(unittest.TestCase):
+    def test_velocity_proposal_contract_and_terminal_zero(self) -> None:
+        payload = build_velocity_proposal(
+            nav_id="nav-001",
+            sequence=1,
+            ttl_ms=250,
+            navigation_status="navigating",
+            velocity=Velocity(x=1.0, y=0.0, yaw=2.0),
+            issued_at_unix_ms=1,
+        )
+        self.assertEqual(VelocityProposal.from_payload(payload).nav_id, "nav-001")
+
+        with self.assertRaises(ProtocolError):
+            build_velocity_proposal(
+                nav_id="nav-001",
+                sequence=2,
+                ttl_ms=250,
+                navigation_status="navigating",
+                velocity=Velocity(x=0.10, y=1.01, yaw=0.0),
+                issued_at_unix_ms=2,
+            )
+        payload["nav_status"] = "arrived"
+        with self.assertRaises(ProtocolError):
+            VelocityProposal.from_payload(payload)
+
+    def test_requested_speed_is_enforced_on_forward_proposals(self) -> None:
+        limited = limit_forward_velocity(
+            Velocity(x=0.50, y=0.0, yaw=0.2),
+            max_forward_mps=0.10,
+        )
+        self.assertEqual(limited, Velocity(x=0.10, y=0.0, yaw=0.2))
+        reverse = limit_forward_velocity(
+            Velocity(x=-1.0, y=0.0, yaw=0.0),
+            max_forward_mps=0.10,
+        )
+        self.assertEqual(reverse, Velocity.zero())
+
+    def test_motion_policy_is_axis_exclusive_without_amplification(self) -> None:
+        self.assertEqual(apply_motion_floor(Velocity.zero()), Velocity.zero())
+        self.assertEqual(
+            apply_motion_floor(Velocity(x=0.01, y=0.0, yaw=0.0)),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_floor(Velocity(x=0.0, y=0.0, yaw=-0.02)),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.19)),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_floor(Velocity(x=-0.05, y=0.0, yaw=0.20)),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_floor(Velocity(x=0.35, y=0.0, yaw=0.0)),
+            Velocity(x=0.35, y=0.0, yaw=0.0),
+        )
+        self.assertEqual(
+            apply_motion_floor(Velocity(x=0.50, y=0.0, yaw=-2.0)),
+            Velocity(x=0.0, y=0.0, yaw=-2.0),
+        )
+
+    def test_stale_async_proposal_context_is_rejected(self) -> None:
+        active = {"nav_id": "nav-1", "attempt": 2, "status": "navigating"}
+        self.assertTrue(
+            proposal_context_is_current(
+                active, nav_id="nav-1", attempt=2, status="navigating"
+            )
+        )
+        for nav_id, attempt, status in (
+            ("nav-old", 2, "navigating"),
+            ("nav-1", 1, "navigating"),
+            ("nav-1", 2, "arrived"),
+        ):
+            with self.subTest(nav_id=nav_id, attempt=attempt, status=status):
+                self.assertFalse(
+                    proposal_context_is_current(
+                        active, nav_id=nav_id, attempt=attempt, status=status
+                    )
+                )
+
+    def test_terminal_context_cannot_keep_periodic_proposals_alive(self) -> None:
+        navigating = {"nav_id": "nav-1", "attempt": 2, "status": "navigating"}
+        self.assertTrue(
+            proposal_context_is_publishable(
+                navigating, nav_id="nav-1", attempt=2, status="navigating"
+            )
+        )
+
+        for status in (
+            "arrived",
+            "cancelled",
+            "stopped",
+            "error",
+            "aborted",
+            "rejected",
+            "paused",
+        ):
+            with self.subTest(status=status):
+                active = {"nav_id": "nav-1", "attempt": 2, "status": status}
+                self.assertFalse(
+                    proposal_context_is_publishable(
+                        active, nav_id="nav-1", attempt=2, status=status
+                    )
+                )
+
+    def test_terminal_zero_precedes_status_and_stop_ack(self) -> None:
+        source = (
+            PACKAGE_ROOT / "nav2" / "planner_command_node.py"
+        ).read_text(encoding="utf-8")
+        on_result = source.split("    def _on_result", 1)[1].split(
+            "    def _pause", 1
+        )[0]
+        publish_state = source.split("    def _publish_state", 1)[1].split(
+            "    def _publish_heartbeat", 1
+        )[0]
+
+        self.assertLess(
+            on_result.index("self._publish_state()"),
+            on_result.index("self._state_changed.notify_all()"),
+        )
+        self.assertLess(
+            publish_state.index("self._publish_velocity_proposal("),
+            publish_state.index("self._emit(payload)"),
+        )
+
+    def test_card_motion_limits_apply_deadbands_caps_and_disable_lateral(self) -> None:
+        limits = MotionLimits(
+            min_x_mps=0.40,
+            max_x_mps=0.80,
+            min_y_mps=0.10,
+            max_y_mps=0.30,
+            min_yaw_rps=1.20,
+            max_yaw_rps=1.60,
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(x=0.05), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(x=0.90), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity(x=0.50),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(x=0.05),
+                limits=MotionLimits(min_x_mps=0.80, max_x_mps=1.0),
+                max_forward_mps=0.50,
+            ),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(x=-0.90), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(y=-0.02), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(y=0.8), limits=limits, max_forward_mps=0.50
+            ),
+            Velocity(y=0.30),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(y=0.20, yaw=-0.30),
+                limits=limits,
+                max_forward_mps=0.50,
+            ),
+            Velocity(y=0.20, yaw=0.0),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(y=0.20, yaw=-1.30),
+                limits=limits,
+                max_forward_mps=0.50,
+            ),
+            Velocity(y=0.0, yaw=-1.30),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(y=0.20),
+                limits=MotionLimits(max_y_mps=0.0),
+                max_forward_mps=0.50,
+            ),
+            Velocity.zero(),
+        )
+        self.assertEqual(
+            apply_motion_limits(
+                Velocity(yaw=-2.0),
+                limits=MotionLimits(min_yaw_rps=0.3, max_yaw_rps=0.3),
+                max_forward_mps=0.50,
+            ),
+            Velocity(yaw=-0.3),
+        )
+
+    def test_motion_limit_payload_is_complete_and_validated(self) -> None:
+        limits = MotionLimits.from_payload(
+            {
+                "min_x_mps": 0.4,
+                "max_x_mps": 0.8,
+                "min_y_mps": 0.1,
+                "max_y_mps": 0.3,
+                "min_yaw_rps": 1.2,
+                "max_yaw_rps": 1.8,
+            }
+        )
+        self.assertEqual(limits.max_y_mps, 0.3)
+        with self.assertRaises(ProtocolError):
+            MotionLimits.from_payload(
+                {
+                    **limits.as_dict(),
+                    "min_yaw_rps": 1.9,
+                    "max_yaw_rps": 1.8,
+                }
+            )
+
+    def test_fast_livo2_readiness_is_fail_closed(self) -> None:
+        ready = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            odom_received_at=9.8,
+            odom_source_age_sec=0.2,
+            odom_frame_ready=True,
+            obstacle_received_at=9.8,
+            obstacle_source_age_sec=0.2,
+            obstacle_frame_ready=True,
+            source_transform_ready=True,
+            source_stamp_skew_sec=0.05,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertTrue(ready["navigation_ready"])
+        self.assertIsNone(navigation_motion_blocker(ready))
+        self.assertIsNone(
+            control_odom_motion_blocker(
+                ready,
+                receive_max_age_sec=0.60,
+                source_max_age_sec=0.80,
+            )
+        )
+
+        scheduling_spike = dict(ready)
+        scheduling_spike["odom_status_age_sec"] = 0.316
+        scheduling_spike["odom_source_age_sec"] = 0.499
+        self.assertIsNone(
+            control_odom_motion_blocker(
+                scheduling_spike,
+                receive_max_age_sec=0.60,
+                source_max_age_sec=0.80,
+            )
+        )
+
+        control_stale = dict(ready)
+        control_stale["odom_status_age_sec"] = 0.61
+        self.assertEqual(
+            control_odom_motion_blocker(
+                control_stale,
+                receive_max_age_sec=0.60,
+                source_max_age_sec=0.80,
+            ),
+            "navigation_not_ready:control_odom_stale",
+        )
+
+        stale = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            odom_received_at=9.0,
+            odom_source_age_sec=1.0,
+            odom_frame_ready=False,
+            obstacle_received_at=None,
+            obstacle_source_age_sec=None,
+            obstacle_frame_ready=False,
+            source_transform_ready=False,
+            source_stamp_skew_sec=None,
+            lifecycle_states={"planner_server": 2},
+            action_server_ready=False,
+            global_to_base_ready=False,
+        )
+        self.assertFalse(stale["navigation_ready"])
+        self.assertIn("fast_livo2_odom_stale", stale["navigation_blockers"])
+        self.assertIn("registered_cloud_stale", stale["navigation_blockers"])
+        self.assertIn("map_to_base_unavailable", stale["navigation_blockers"])
+        self.assertIn("fast_livo2_odom_frame_invalid", stale["navigation_blockers"])
+        self.assertIn("registered_cloud_frame_invalid", stale["navigation_blockers"])
+        self.assertIn("fast_livo2_odom_stale", navigation_motion_blocker(stale))
+
+        skewed = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            odom_received_at=9.9,
+            odom_source_age_sec=0.1,
+            odom_frame_ready=True,
+            obstacle_received_at=9.9,
+            obstacle_source_age_sec=0.1,
+            obstacle_frame_ready=True,
+            source_transform_ready=True,
+            source_stamp_skew_sec=0.6,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertTrue(skewed["navigation_ready"])
+        self.assertEqual(skewed["fast_livo2_source_stamp_skew_sec"], 0.6)
+
+        unpaired = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            odom_received_at=9.9,
+            odom_source_age_sec=0.1,
+            odom_frame_ready=True,
+            obstacle_received_at=9.9,
+            obstacle_source_age_sec=0.1,
+            obstacle_frame_ready=True,
+            source_transform_ready=False,
+            source_stamp_skew_sec=0.01,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertIn(
+            "registered_cloud_transform_unavailable",
+            unpaired["navigation_blockers"],
+        )
+
+        boundary_jitter = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            source_max_age_sec=1.0,
+            odom_received_at=9.9,
+            odom_source_age_sec=0.71,
+            odom_frame_ready=True,
+            obstacle_received_at=9.9,
+            obstacle_source_age_sec=0.71,
+            obstacle_frame_ready=True,
+            source_transform_ready=True,
+            source_stamp_skew_sec=0.01,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertTrue(boundary_jitter["navigation_ready"])
+
+        too_old = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.5,
+            source_max_age_sec=1.0,
+            odom_received_at=9.9,
+            odom_source_age_sec=1.001,
+            odom_frame_ready=True,
+            obstacle_received_at=9.9,
+            obstacle_source_age_sec=1.001,
+            obstacle_frame_ready=True,
+            source_transform_ready=True,
+            source_stamp_skew_sec=0.01,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertIn("odom_source_stamp_stale", too_old["navigation_blockers"])
+        self.assertEqual(boundary_jitter["sensor_receive_max_age_sec"], 0.5)
+        self.assertEqual(boundary_jitter["sensor_source_max_age_sec"], 1.0)
+
+        scheduler_jitter = evaluate_readiness(
+            now_monotonic=10.0,
+            max_age_sec=0.8,
+            source_max_age_sec=1.0,
+            odom_received_at=9.37,
+            odom_source_age_sec=0.63,
+            odom_frame_ready=True,
+            obstacle_received_at=9.37,
+            obstacle_source_age_sec=0.63,
+            obstacle_frame_ready=True,
+            source_transform_ready=True,
+            source_stamp_skew_sec=0.01,
+            lifecycle_states={"planner_server": 3, "bt_navigator": 3},
+            action_server_ready=True,
+            global_to_base_ready=True,
+        )
+        self.assertTrue(scheduler_jitter["navigation_ready"])
+
+    def test_goal_cell_is_checked_before_nav2_action_dispatch(self) -> None:
+        snapshot = CostmapSnapshot.from_values(
+            frame_id="map",
+            stamp_ns=123,
+            resolution=0.5,
+            width=4,
+            height=3,
+            origin_x=-1.0,
+            origin_y=-0.5,
+            origin_yaw=0.0,
+            data=[
+                0,
+                0,
+                0,
+                0,
+                0,
+                20,
+                99,
+                100,
+                -1,
+                0,
+                0,
+                0,
+            ],
+            received_monotonic=10.0,
+        )
+
+        free = goal_cell_receipt(
+            snapshot,
+            x=-0.75,
+            y=-0.25,
+            expected_frame="map",
+            max_receive_age_sec=2.0,
+            now_monotonic=10.5,
+        )
+        self.assertEqual(free["cost"], 0)
+        self.assertFalse(free["collision"])
+
+        inscribed = goal_cell_receipt(
+            snapshot,
+            x=0.25,
+            y=0.25,
+            expected_frame="map",
+            max_receive_age_sec=2.0,
+            now_monotonic=10.5,
+        )
+        self.assertEqual(inscribed["cost"], 99)
+        self.assertTrue(inscribed["collision"])
+        with self.assertRaises(GoalCellRejected) as rejected:
+            validated_goal_cell_receipt(
+                snapshot,
+                x=0.25,
+                y=0.25,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+            )
+        self.assertEqual(rejected.exception.code, "goal_in_collision")
+
+        with self.assertRaises(GoalCellRejected) as rejected:
+            validated_goal_cell_receipt(
+                snapshot,
+                x=-0.75,
+                y=0.75,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+            )
+        self.assertEqual(rejected.exception.code, "goal_cost_unknown")
+
+        diagnostics = snapshot.diagnostics(now_monotonic=10.5)
+        self.assertEqual(diagnostics["inflated_cells"], 1)
+        self.assertEqual(diagnostics["inscribed_cells"], 1)
+        self.assertEqual(diagnostics["lethal_cells"], 1)
+        self.assertEqual(diagnostics["unknown_cells"], 1)
+        with self.assertRaisesRegex(CostmapError, "outside"):
+            goal_cell_receipt(
+                snapshot,
+                x=2.0,
+                y=0.0,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+            )
+        with self.assertRaises(GoalCellRejected) as rejected:
+            validated_goal_cell_receipt(
+                snapshot,
+                x=2.0,
+                y=0.0,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+            )
+        self.assertEqual(rejected.exception.code, "goal_outside_costmap")
+        with self.assertRaisesRegex(CostmapError, "receive age"):
+            goal_cell_receipt(
+                snapshot,
+                x=0.0,
+                y=0.0,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=12.1,
+            )
+        with self.assertRaisesRegex(CostmapError, "source age"):
+            goal_cell_receipt(
+                snapshot,
+                x=0.0,
+                y=0.0,
+                expected_frame="map",
+                max_receive_age_sec=2.0,
+                now_monotonic=10.5,
+                now_stamp_ns=snapshot.stamp_ns + 2_100_000_000,
+            )
+
+    def test_runtime_is_planner_controller_only(self) -> None:
+        setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
+        launch = (PACKAGE_ROOT / "launch" / "nav2.launch.py").read_text(
+            encoding="utf-8"
+        )
+        package = (PACKAGE_ROOT / "package.xml").read_text(encoding="utf-8")
+        dockerfile = (
+            Path(__file__).resolve().parents[1] / "Dockerfile.jetson"
+        ).read_text(encoding="utf-8")
+        service = (
+            Path(__file__).resolve().parents[1] / "deploy" / "service.yml"
+        ).read_text(encoding="utf-8")
+        segmented_cmake = (SEGMENTED_CONTROLLER_ROOT / "CMakeLists.txt").read_text(
+            encoding="utf-8"
+        )
+        segmented_plugin = (
+            SEGMENTED_CONTROLLER_ROOT / "segmented_controller.xml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "planner_command_bridge = nav2.planner_command_node:main", setup
+        )
+        for removed in (
+            "runtime_supervisor",
+            "canvas_pointcloud_bridge",
+            "canvas_map_view",
+            "loco_odom_bridge",
+        ):
+            self.assertNotIn(f'"{removed} =', setup)
+        self.assertIn('executable="planner_command_bridge"', launch)
+        self.assertIn("GroupAction(", launch)
+        self.assertIn("scoped=True", launch)
+        self.assertIn('default_value="/ubuntu/navigation/odom"', launch)
+        self.assertIn(
+            'default_value="/ubuntu/navigation/cloud_registered"', launch
+        )
+        self.assertNotIn("slam_toolbox", package)
+        self.assertNotIn("pointcloud_to_laserscan", package)
+        self.assertNotIn("slam_toolbox", dockerfile)
+        self.assertNotIn("pointcloud_to_laserscan", dockerfile)
+        self.assertNotIn("NAV2_MODE", service)
+        self.assertNotIn("container_name: embodied-perception-nav2", service)
+        self.assertIn("pluginlib_export_plugin_description_file", segmented_cmake)
+        self.assertIn("segmented_controller::SegmentedController", segmented_plugin)
+        self.assertIn(
+            "COPY actucore/plugins/navigation/runtime/segmented_controller/",
+            dockerfile,
+        )
+        self.assertIn(
+            "--packages-select fast_livo2 segmented_controller nav2",
+            dockerfile,
+        )
+        self.assertIn("ros2 pkg prefix segmented_controller", dockerfile)
+
+    def test_costmaps_combine_confirmed_static_map_and_live_clearing(self) -> None:
+        params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("amcl:", params)
+        self.assertNotIn("map_server:", params)
+        self.assertNotIn("data_type: LaserScan", params)
+        self.assertEqual(params.count("topic: /ubuntu/navigation/cloud_registered"), 2)
+        self.assertNotIn("topic: /ubuntu/navigation/obstacle_map", params)
+        self.assertEqual(params.count("map_topic: /ubuntu/navigation/static_map"), 1)
+        self.assertEqual(params.count("data_type: PointCloud2"), 2)
+        self.assertIn("min_obstacle_height: -3.0", params)
+        self.assertIn("max_obstacle_height: 3.0", params)
+        self.assertIn("adapter already applies the card-configured Z band", params)
+        self.assertIn("global_frame: map", params)
+        self.assertIn("rolling_window: true", params)
+        local = params.split("local_costmap:\n", 1)[1].split(
+            "\nglobal_costmap:", 1
+        )[0]
+        global_map = params.split("global_costmap:\n", 1)[1].split(
+            "\nplanner_server:", 1
+        )[0]
+        self.assertIn("sensor_frame: base_link", local)
+        self.assertIn("clearing: true", local)
+        self.assertIn("raytrace_max_range: 8.5", local)
+        self.assertIn("plugins: [static_layer, obstacle_layer, inflation_layer]", global_map)
+        self.assertIn("plugin: nav2_costmap_2d::StaticLayer", global_map)
+        self.assertIn("map_subscribe_transient_local: true", global_map)
+        self.assertIn("subscribe_to_updates: false", global_map)
+        self.assertIn("sensor_frame: base_link", global_map)
+        self.assertIn("clearing: true", global_map)
+        self.assertIn("marking: true", global_map)
+        self.assertIn("raytrace_max_range: 8.5", global_map)
+        self.assertNotIn("clearing: false", global_map)
+        self.assertIn("inflation_radius: 0.55", local)
+        self.assertIn("inflation_radius: 0.55", global_map)
+        footprint_radius = math.hypot(0.32, 0.28)
+        self.assertAlmostEqual(footprint_radius, 0.4252058, places=6)
+        self.assertGreater(0.55 - footprint_radius, 0.12)
+        self.assertLess(0.55 - footprint_radius, 0.13)
+
+    def test_controller_executes_stop_turn_drive_segments(self) -> None:
+        params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
+            encoding="utf-8"
+        )
+        source = (
+            SEGMENTED_CONTROLLER_ROOT / "src" / "segmented_controller.cpp"
+        ).read_text(encoding="utf-8")
+        follow_path = params.split("    FollowPath:\n", 1)[1].split(
+            "\n\nlocal_costmap:", 1
+        )[0]
+        for expected in (
+            "plugin: segmented_controller::SegmentedController",
+            "rotate_exit_rad: 0.15",
+            "rotate_reengage_rad: 0.35",
+            "approach_speed_mps: 0.30",
+            "cruise_speed_mps: 1.0",
+            "segment_tolerance_m: 0.18",
+            "stop_cycles_required: 2",
+            "status_topic: /ubuntu/navigation/nav2/segment_status",
+        ):
+            self.assertIn(expected, follow_path)
+        self.assertNotIn("RotationShimController", follow_path)
+        self.assertNotIn("DWBLocalPlanner", follow_path)
+        for phase in (
+            "STOP_CHECK",
+            "ROTATE",
+            "DRIVE",
+            "FINAL_ROTATE",
+            "ARRIVED",
+            "BLOCKED",
+        ):
+            self.assertIn(f"Phase::{phase}", source)
+        self.assertIn("command.twist.linear.x", source)
+        self.assertIn("command.twist.angular.z", source)
+        self.assertNotIn("command.twist.linear.y", source)
+        set_plan = source.split(
+            "void SegmentedController::setPlan", 1
+        )[1].split("geometry_msgs::msg::TwistStamped", 1)[0]
+        self.assertIn("preserve_final_approach", set_plan)
+        self.assertIn("after_stop_ == Phase::FINAL_ROTATE", set_plan)
+        self.assertIn("same_goal_endpoint", set_plan)
+        self.assertIn("phase_ != Phase::BLOCKED && has_segment_", set_plan)
+        self.assertIn('enterStopCheck(Phase::SELECT, "path_updated")', set_plan)
+        self.assertIn("nav2_costmap_2d::LETHAL_OBSTACLE", source)
+        self.assertNotIn("nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE", source)
+        self.assertNotIn("velocity_smoother:", params)
+
+    def test_speed_limit_and_behavior_tree_reach_planner_bridge(self) -> None:
+        command = (
+            PACKAGE_ROOT / "nav2" / "planner_command_node.py"
+        ).read_text(encoding="utf-8")
+        launch = (PACKAGE_ROOT / "launch" / "nav2.launch.py").read_text(
+            encoding="utf-8"
+        )
+        params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
+            encoding="utf-8"
+        )
+        tree = ET.parse(
+            PACKAGE_ROOT
+            / "behavior_trees"
+            / "navigate_to_pose_w_replanning_and_recovery.xml"
+        )
+        through_tree = ET.parse(
+            PACKAGE_ROOT
+            / "behavior_trees"
+            / "navigate_through_poses_w_replanning_and_recovery.xml"
+        )
+        self.assertIsNone(tree.find(".//BackUp"))
+        self.assertIsNone(through_tree.find(".//BackUp"))
+        self.assertIsNotNone(through_tree.find(".//ComputePathThroughPoses"))
+        self.assertIn(
+            "behavior_plugins: [spin, drive_on_heading, wait]",
+            params,
+        )
+        self.assertIn(
+            "default_nav_to_pose_bt_xml: "
+            "/ros_ws/install/nav2/share/nav2/behavior_trees/"
+            "navigate_to_pose_w_replanning_and_recovery.xml",
+            params,
+        )
+        self.assertIn(
+            "default_nav_through_poses_bt_xml: "
+            "/ros_ws/install/nav2/share/nav2/behavior_trees/"
+            "navigate_through_poses_w_replanning_and_recovery.xml",
+            params,
+        )
+        self.assertIn("bt_navigator_navigate_through_poses_rclcpp_node", params)
+        self.assertIn("from nav2_msgs.msg import SpeedLimit", command)
+        self.assertIn("self._publish_controller_speed_limit(speed_limit)", command)
+        self.assertIn("MotionLimits.from_payload", command)
+        self.assertIn("apply_motion_limits", command)
+        self.assertIn("control_odom_motion_blocker", command)
+        self.assertIn("self._on_segment_status", command)
+        self.assertIn('payload["execution"] = self._execution_status', command)
+        self.assertIn('"segment_status_topic": segment_status_topic', launch)
+        self.assertIn('"speed_limit_topic"', launch)
+        self.assertIn('"sensor_max_age_sec": 0.8', launch)
+        self.assertIn('"sensor_source_max_age_sec": 1.0', launch)
+        self.assertIn('"control_odom_max_age_sec": 0.60', launch)
+        self.assertIn('"control_odom_source_max_age_sec": 0.80', launch)
+        self.assertIn(
+            "odom_source_age = self._source_age(odom_source_stamp_ns)",
+            command,
+        )
+        self.assertIn(
+            "obstacle_source_age = self._source_age(obstacle_source_stamp_ns)",
+            command,
+        )
+        self.assertNotIn("_last_odom_source_age_sec", command)
+        self.assertNotIn("_last_obstacle_source_age_sec", command)
+        self.assertIn("xy_goal_tolerance: 0.20", params)
+        self.assertIn("yaw_goal_tolerance: 0.10", params)
+        self.assertIn("final_yaw_tolerance_rad: 0.10", params)
+        self.assertIn("controller_frequency: 20.0", params)
+        self.assertIn("bt_loop_duration: 50", params)
+        self.assertNotIn("smoothing_frequency:", params)
+        self.assertIn('self.declare_parameter("proposal_frequency_hz", 5.0)', command)
+        self.assertIn('"shadow_topic": cmd_vel_raw_topic', launch)
+        self.assertNotIn('endpoint.node_name == "velocity_smoother"', command)
+        lifecycle_defaults = command.split(
+            '"required_lifecycle_nodes",', 1
+        )[1].split(")\n", 1)[0]
+        self.assertNotIn("velocity_smoother", lifecycle_defaults)
+        self.assertIn("depth=1", command)
+        self.assertIn("proposal_context_is_publishable", command)
+        self.assertIn('payload.get("velocity_limits")', command)
+        self.assertIn("goal.pose.header.frame_id = self._global_frame", command)
+        send_goal = command.split("    def _send_active_goal", 1)[1].split(
+            "    def _publish_controller_speed_limit", 1
+        )[0]
+        self.assertLess(
+            send_goal.index("self._validate_goal_cell(target)"),
+            send_goal.index("self._action_client.wait_for_server"),
+        )
+        self.assertIn('"goal_costmap_max_age_sec": 2.0', launch)
+        self.assertNotIn("source_age_tolerance_sec", launch)
+        self.assertIn('self._active["goal_response_pending"] = True', send_goal)
+        timeout_branch = send_goal.split("if not accepted.wait", 1)[1]
+        self.assertNotIn('self._active["attempt"] += 1', timeout_branch)
+        self.assertNotIn('self._active["status"] = "error"', timeout_branch)
+        navigate_method = command.split(
+            "    def _navigate_to_pose", 1
+        )[1].split("    def _send_active_goal", 1)[0]
+        resume_method = command.split(
+            "    def _resume", 1
+        )[1].split("    def _stop", 1)[0]
+        for method in (navigate_method, resume_method):
+            self.assertIn("except CommandError as exc:", method)
+            self.assertIn("exc.outcome_known", method)
+        stop_method = command.split("    def _stop(self, nav_id)", 1)[1].split(
+            "    def _cancel_active", 1
+        )[0]
+        self.assertIn('active.get("goal_response_pending")', stop_method)
+        self.assertIn('"cancel_terminal_unconfirmed"', stop_method)
+
+
+if __name__ == "__main__":
+    unittest.main()

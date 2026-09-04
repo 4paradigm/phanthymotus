@@ -69,7 +69,7 @@ phanthymotus/
 │   └── plugins/       — ASR/TTS plugin implementations
 ├── actucore/          — Layer 2: ActuCore (execution models, MCP Server)
 │   ├── main.py        — MCP server entry point
-│   └── plugins/       — Execution model cards (none yet)
+│   └── plugins/       — Execution model cards, including ControlledSemanticSpatial navigation
 ├── deploy/            — Build & deployment scripts
 └── docker-compose.yml — Full stack orchestration
 ```
@@ -86,15 +86,16 @@ See the [architecture diagram](README.md#architecture) for how these layers conn
 |-------|-----------|-------------|
 | Layer 1 — Hardware Drivers | MCP HTTP Servers | Physical device interfaces ([phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)). A single driver exposes both the sensor side (video, audio, lidar, joints, battery, status) and the actuator side (motion, hand, head, waist, speaker, LED) |
 | Layer 2 — Perception Stack | ASR/TTS/VLM plugins | Raw streams → semantics, with local inference support (Jetson) |
-| Layer 2 — ActuCore | Execution models | The mirror of perception on the action side: VLA, navigation, grasp policies, locomotion, whole-body control. Lives in `actucore/`, structurally identical to the perception stack — each model attaches as a `processor` card. Ships no cards yet |
+| Layer 2 — ActuCore | Execution models | The mirror of perception on the action side: VLA, navigation, grasp policies, locomotion, whole-body control. Lives in `actucore/`, structurally identical to the perception stack — each model attaches as a `processor` card. Ships the robot-independent `ControlledSemanticSpatial` navigation contract; its bundled FAST-LIVO2/Nav2 runtime adapter and current hardware acceptance cover G1, while other bodies require compatible sensor/actuator adapters and their own acceptance |
 | Layer 3 — Agent Core | FastAPI + LLM Loop | Event-driven agent with DDS bridge and web dashboard |
 
 ### Communication
 
 - **Data Plane**: ROS2 DDS → `ros2_bridge.py` (daemon thread) → `inspection.py` fan-out → WebSocket `/ws/bus/{topic}`
 - **Control Plane**: MCP HTTP JSON-RPC 2.0 (Agent Core → hardware/perception)
+- **Canvas Topic Actions**: a processor may declare `inputSchema.x-topic-actions` to translate a connected `data/json` ROS topic into one validated MCP action while the project is running. Agent Core resolves the live source port, rejects schema/field violations, de-duplicates only confirmed deliveries, reconciles routes on live layout saves and Solution applies, and may pass the message ID through a declared private `id_argument` for tool-level idempotency. Layout saves, Solution applies and project start/stop share one lifecycle lock. A running edit gates dispatch before stopping removed cards, commits the layout before enabling replacement routes, and resumes only after activation succeeds. Unconfirmed or partially confirmed stops leave the previous layout intact and stop the project fail-closed instead of claiming a rollback
 - **Activity Stream**: WebSocket `/ws/motus` (real-time agent decision broadcast)
-- **Tool Types**: every MCP tool declares a `type` — `sensor`, `actuator`, `processor`, or `resource`. The type drives dispatch behaviour: consecutive `sensor` calls are batched in parallel, while `actuator` and `processor` calls pass through the ACP barrier and wait for pending actions to complete first (`_needs_barrier()` in `agent-core/src/event/llm.py`). Tools with no declared type default to barrier-guarded
+- **Tool Types**: every MCP tool declares a `type` — `sensor`, `actuator`, `processor`, or `resource`. The type drives dispatch behaviour: consecutive `sensor` calls are batched in parallel, while `actuator` and `processor` calls wait only for pending actions owned by the same MCP tool (`_needs_barrier()` in `agent-core/src/event/llm.py`). Long actions declare `inputSchema.x-completion`; necessary control actions can be listed in `passthrough_actions`. Tools with no declared type remain barrier-guarded when that tool owns pending work
 
 ### Core Flow
 

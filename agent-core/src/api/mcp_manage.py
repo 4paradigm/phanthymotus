@@ -17,7 +17,8 @@ router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
 
 
-async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
+async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None,
+                            topic_aux: list | None = None) -> None:
     """Register topics with the embedded inspection module (process-internal call).
 
     生产者（topic_out）与消费者（topic_in）分开登记：一个 topic 的数据格式由**发布方**
@@ -26,7 +27,11 @@ async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None 
     DDS 订阅也会用错消息类型。
     """
     from api.inspection import register_topic_internal
-    for producer, topics in ((True, topic_out or []), (False, topic_in or [])):
+    for producer, topics in (
+        (True, topic_out or []),
+        (True, topic_aux or []),
+        (False, topic_in or []),
+    ):
         for t in topics:
             topic = t.get('topic', '')
             fmt   = t.get('format', '')
@@ -97,6 +102,7 @@ async def _ping_mcp_http(url: str) -> dict:
     device_type = ''
     topic_out: list = []
     topic_in:  list = []
+    topic_aux: list = []
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         # Initialize
@@ -122,7 +128,11 @@ async def _ping_mcp_http(url: str) -> dict:
             async with session.post(url, json=tools_payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)
                 tools = [
-                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'multiInstance', 'inputSchema', 'configSchema', 'topic_out', 'topic_in')}
+                    {k: v for k, v in t.items() if k in (
+                        'name', 'description', 'type', 'multiInstance',
+                        'inputSchema', 'configSchema', 'topic_out', 'topic_in', 'topic_aux',
+                        'x-topic-actions', 'x-execution-control',
+                    )}
                     for t in data.get('result', {}).get('tools', [])
                 ]
         except Exception as e:
@@ -231,6 +241,9 @@ async def _ping_mcp_http(url: str) -> dict:
                 for tp in t.get('topic_in', []):
                     if tp.get('topic') and not any(e.get('topic') == tp['topic'] for e in topic_in):
                         topic_in.append(tp)
+                for tp in t.get('topic_aux', []):
+                    if tp.get('topic') and not any(e.get('topic') == tp['topic'] for e in topic_aux):
+                        topic_aux.append(tp)
 
         # List resources
         try:
@@ -242,7 +255,7 @@ async def _ping_mcp_http(url: str) -> dict:
             pass
 
     return {'tools': tools, 'resources': resources, 'server_name': server_name, 'device_type': device_type,
-            'topic_out': topic_out, 'topic_in': topic_in}
+            'topic_out': topic_out, 'topic_in': topic_in, 'topic_aux': topic_aux}
 
 
 def _guess_data_type(tools: list, resources: list, name: str) -> str:
@@ -493,6 +506,7 @@ async def _do_ping(mcp_id: str) -> dict:
     # Resolve empty topics from depends_on relationship
     topic_in  = [dict(t) for t in caps.get('topic_in',  [])]
     topic_out = [dict(t) for t in caps.get('topic_out', [])]
+    topic_aux = [dict(t) for t in caps.get('topic_aux', [])]
 
     upstream_out = []
     depends_on = target.get('depends_on', '')
@@ -610,6 +624,7 @@ async def _do_ping(mcp_id: str) -> dict:
         'tool_meta':   tool_meta_map,
         'split_map':   split_map,
         'tool_groups': tool_groups,
+        'tool_definitions': caps['tools'],
     }
 
     # Register system hooks from x-hooks declarations
@@ -620,7 +635,7 @@ async def _do_ping(mcp_id: str) -> dict:
             hooks.register(mcp_id, tool.get('name', ''), x_hooks)
 
     # Notify inspection module about all topics from this device
-    asyncio.create_task(_notify_inspector(mcp_id, topic_out, topic_in))
+    asyncio.create_task(_notify_inspector(mcp_id, topic_out, topic_in, topic_aux))
 
     # Auto-restore saved configs when device comes online (first ping or after offline)
     if not was_online:

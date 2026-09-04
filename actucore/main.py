@@ -7,25 +7,22 @@ ActuCore 把意图/目标变成运动指令。执行模型（VLA、导航、抓�
 whole-body control）以卡片（插件）的形式挂在这里，聚合成一个 MCP HTTP server
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-当前版本不带任何卡片 —— 这是骨架 + 全链路（注册、探活、部署）打通。
-新增卡片的完整步骤见 README.md。
+当前挂载的卡片：`navigation`（公开工具名 `ControlledSemanticSpatial`）——
+FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者作为子进程跑在本容器内，
+对外只发布 bounded velocity proposal。新增卡片的完整步骤见 README.md。
 
-MCP 工具命名规则：{plugin_prefix}_{tool_name}
-  例：vla_info, vla_start, nav_goto
+MCP 工具命名规则：{plugin_prefix}_{tool_name}；工具名等于 PREFIX 时不加前缀
+  例：vla_info、vla_start、ControlledSemanticSpatial
 
 MCP server 端口: config.mcp_port（默认 15730）
 """
 
 from __future__ import annotations
 
-# First, before anything can write to stdout: make every log line one atomic,
-# control-character-free write, so concurrent writers cannot tear a Docker log
-# record. Without this, actucore produced a log the daemon could not read back at
-# all — `docker logs` failed outright with "log message is too large
-# (1952739189 > 1000000)", i.e. the framing had come apart and a length prefix
-# was being read out of garbage. Same module perception installs; the Dockerfile
-# copies it out of perception/utils/ rather than keeping a fourth duplicate.
+# Install before any thread, ROS runtime, or HTTP handler can write a partial
+# Docker log record. The Dockerfile supplies perception's shared implementation.
 import logsafe
+
 logsafe.install()
 
 import json
@@ -33,6 +30,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -45,6 +43,9 @@ import yaml
 
 import rclpy
 import rclpy.executors
+from rclpy._rclpy_pybind11 import InvalidHandle
+
+from utils.security import redact_sensitive
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
@@ -120,12 +121,35 @@ class ActuCoreBundle:
         #            self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
         #            log.info("XPlugin loaded")
         #
-        # 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步，参照
-        # perception/main.py 里 vop 的写法：namespace 为空时用
-        # re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname()) 兜底。
+        # 需要 ROS 命名空间的卡片必须在自己的注册块里校验运行时支持范围。
         #
         # 卡片契约（PREFIX 不能含下划线、action.enum 必须含 "info" 等）见 README.md。
         # ──────────────────────────────────────────────────────────────────
+
+        navigation_cfg = plugins_cfg.get("navigation", {})
+        if not isinstance(navigation_cfg, dict):
+            raise ValueError("plugins.navigation must be an object")
+        if navigation_cfg.get("enabled", False):
+            namespace = navigation_cfg.get("namespace", "ubuntu")
+            if not isinstance(namespace, str):
+                raise ValueError("plugins.navigation.namespace must be a string")
+            namespace = namespace.strip().strip("/")
+            if namespace != "ubuntu":
+                raise ValueError(
+                    "built-in navigation runtime currently requires namespace=ubuntu"
+                )
+            from plugins.navigation import NavigationPlugin
+            plugin = NavigationPlugin(
+                navigation_cfg,
+                namespace,
+                executor,
+                completion_callback=sse_push,
+            )
+            self._plugins.append(plugin)
+            log.info(
+                "NavigationPlugin loaded (single-container runtime, namespace=%s)",
+                namespace,
+            )
 
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
@@ -145,6 +169,50 @@ class ActuCoreBundle:
             if p.PREFIX == prefix:
                 return p.dispatch(name, args)
         return None
+
+    def stop(self) -> bool:
+        """Best-effort release for every card that owns runtime resources.
+
+        执行模型卡片常常持有真实资源（导航卡片在容器内跑 FAST-LIVO2 / Nav2
+        子进程），进程退出时必须收回，否则重启会撞上残留的 ROS 节点。
+        """
+
+        all_confirmed = True
+        for plugin in reversed(self._plugins):
+            stop = getattr(plugin, "stop", None)
+            if callable(stop):
+                confirmed = False
+                for attempt in range(3):
+                    try:
+                        result = stop()
+                    except Exception:
+                        log.exception("failed to stop card %s", plugin.PREFIX)
+                        break
+                    confirmed = (
+                        isinstance(result, dict)
+                        and (
+                            result.get("terminal_confirmed") is True
+                            or (result.get("status") or result.get("state"))
+                            in {"idle", "stopped", "disabled"}
+                        )
+                    )
+                    if confirmed:
+                        break
+                    if not (
+                        isinstance(result, dict)
+                        and result.get("retryable") is True
+                        and (
+                            result.get("state") == "error"
+                            or result.get("status") == "error"
+                        )
+                    ):
+                        break
+                    if attempt < 2:
+                        time.sleep(0.25)
+                if not confirmed:
+                    all_confirmed = False
+                    log.error("card %s stop remained unconfirmed", plugin.PREFIX)
+        return all_confirmed
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -247,13 +315,21 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
+                        log.info(
+                            "[mcp] tools/call: %.200r(%s)",
+                            name,
+                            _brief(redact_sensitive(args)),
+                        )
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            safe_result = redact_sensitive(result)
+                            log.info(
+                                "[mcp] tools/call result: %s",
+                                json.dumps(safe_result)[:200],
+                            )
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
@@ -302,6 +378,19 @@ def _start_registration(mcp_port: int, name: str, category: str):
     threading.Thread(target=_run, daemon=True, name="register").start()
 
 
+def _spin_executor(executor) -> None:
+    """Keep the shared executor alive across concurrent ROS node teardown."""
+
+    while True:
+        try:
+            executor.spin()
+            return
+        except InvalidHandle:
+            if not rclpy.ok():
+                return
+            log.warning("ROS node was removed during spin; continuing executor")
+
+
 def main():
     global _bundle
 
@@ -320,10 +409,12 @@ def main():
     executor = rclpy.executors.MultiThreadedExecutor()
     _bundle  = ActuCoreBundle(cfg, executor)
 
-    def _spin():
-        executor.spin()
-
-    threading.Thread(target=_spin, daemon=True, name="actucore_spin").start()
+    threading.Thread(
+        target=_spin_executor,
+        args=(executor,),
+        daemon=True,
+        name="actucore_spin",
+    ).start()
 
     _start_registration(mcp_port, "ActuCore", "actucore")
 
@@ -340,6 +431,11 @@ def main():
     try:
         server.serve_forever()
     finally:
+        if not _bundle.stop():
+            log.critical(
+                "one or more card stops remained unconfirmed after retries; "
+                "forcing process shutdown so the container supervisor can recover"
+            )
         executor.shutdown()
         rclpy.shutdown()
 

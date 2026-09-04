@@ -21,6 +21,7 @@ mcp_client.py — MCP HTTP transport 客户端。
 """
 
 import asyncio
+from collections import OrderedDict
 import json
 import time
 import uuid
@@ -36,9 +37,10 @@ registry: dict[str, dict] = {}   # mcp_id → info
 
 # ── ACP: 异步动作完成协议 ──────────────────────────────────────────────────────
 _pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on completion)
-_pending_results: dict[str, dict] = {}            # action_id → completion payload
+_pending_results: OrderedDict[str, dict] = OrderedDict()  # includes early SSE results
 _pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
 _pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
+_MAX_EARLY_COMPLETIONS = 1024
 
 
 # ── 内部 JSON-RPC 助手 ─────────────────────────────────────────────────────────
@@ -124,6 +126,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
     split_map:  dict[str, dict] = {}  # split_schema_name → {tool, action}
     tool_groups: dict[str, list] = {} # original_tool_name → [split_schema_names]
     input_schemas: dict[str, dict] = {}  # schema_name → 原始 MCP inputSchema（用于参数校验）
+    tool_definitions: list[dict] = []    # 原始定义（含 x-topic-actions 等扩展）
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
@@ -137,6 +140,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
             # 2. tools/list
             result = await _jrpc(session, url, 'tools/list', {})
             for tool in result.get('tools', []):
+                tool_definitions.append(tool)
                 tool_schemas = _to_openai_schema(mcp_id, tool)
                 tools.append(tool['name'])
 
@@ -190,6 +194,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
         'split_map':     split_map,
         'tool_groups':   tool_groups,
         'input_schemas': input_schemas,
+        'tool_definitions': tool_definitions,
     }
 
     # 3. 后台订阅 SSE 事件流（非阻塞）
@@ -229,9 +234,14 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                         msg_type = msg.get('type') if isinstance(msg, dict) else None
                         if msg_type == 'action_complete':
                             action_id = msg.get('action_id') or payload.get('action_id')
-                            if action_id and action_id in _pending_actions:
+                            if action_id:
                                 _pending_results[action_id] = msg
-                                _pending_actions[action_id].set()
+                                _pending_results.move_to_end(action_id)
+                                pending = _pending_actions.get(action_id)
+                                if pending is not None:
+                                    pending.set()
+                                while len(_pending_results) > _MAX_EARLY_COMPLETIONS:
+                                    _pending_results.popitem(last=False)
 
                         await event_bus.enqueue(
                             source  = f'mcp:{mcp_id}',
@@ -300,6 +310,7 @@ def _register_internal_mcps():
             'input_schemas': input_schemas,
             'tool_groups': {},
             'split_map': {},
+            'tool_definitions': tools,
         }
 
 
@@ -520,6 +531,8 @@ async def call_tool(full_name: str, args: dict) -> str:
                 else:
                     dynamic_timeout = default_timeout
                 _pending_timeouts[action_id] = dynamic_timeout
+                if action_id in _pending_results:
+                    _pending_actions[action_id].set()
                 print(f'[acp] registered pending: {action_id} (tool={tool_name}, timeout={dynamic_timeout:.0f}s)')
         except (json.JSONDecodeError, IndexError):
             pass
@@ -618,8 +631,12 @@ async def cancel_and_reap(tasks) -> None:
 
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
                         tool_name: str | None = None) -> dict:
-    """等待 pending actions 完成。全局 barrier：等所有 pending。"""
-    aids = list(_pending_actions.keys())
+    """等待冲突工具的 pending actions；未给 tool_name 时保持全局等待。"""
+    aids = (
+        get_pending_for_tool(tool_name)
+        if tool_name is not None
+        else list(_pending_actions.keys())
+    )
     if not aids:
         return {"status": "no_pending"}
 
@@ -755,6 +772,14 @@ def get_pending_actions() -> list[str]:
 def get_pending_for_tool(tool_name: str) -> list[str]:
     """返回指定工具的 pending action_ids（barrier 资源冲突用）。"""
     return [aid for aid, tn in _pending_tools.items() if tn == tool_name and aid in _pending_actions]
+
+
+def pending_conflicts(
+    tool_name: str, action: str, completion_spec: dict | None
+) -> bool:
+    """Return whether this call conflicts with an unfinished call on the tool."""
+    passthrough = (completion_spec or {}).get('passthrough_actions', [])
+    return action not in passthrough and bool(get_pending_for_tool(tool_name))
 
 
 # ── Direct Tool Call (bypass barrier/ACP) ────────────────────────────────────

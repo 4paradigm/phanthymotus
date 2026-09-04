@@ -1,0 +1,16 @@
+{
+  "schema": "phanthy.navigation.velocity_proposal.v1",
+  "nav_id": "nav-example-1",
+  "sequence": 1,
+  "ttl_ms": 250,
+  "issued_at_unix_ms": 1785880000000,
+  "frame": "base_link",
+  "nav_status": "navigating",
+  "velocity": {
+    "x": 0.3,
+    "y": 0.0,
+    "yaw": 1.0
+  },
+  "shadow_only": true,
+  "physical_execution": false
+}
