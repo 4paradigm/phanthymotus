@@ -1103,7 +1103,12 @@ class Event:
         bound_tool_names = {s['name'] for s in bound_schemas}
 
         # ── 冻结 system message（turn 内复用，保证 prefix caching 命中）────
-        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+        frozen_l1 = prompt_mod.capture_l1()
+        frozen_system = prompt_mod.build_system(
+            mcp_client.registry,
+            bound_tool_names,
+            frozen_l1=frozen_l1,
+        )
 
         finish_tool = 'finish'
         llm_cfg = config.main.get('event', {}).get('llm', {})
@@ -1462,7 +1467,11 @@ class Event:
             # ── Rebuild frozen_system if skill state changed (activate/deactivate) ─
             skill_tools = {'activate_skill', 'deactivate_skill'}
             if any(c['function']['name'] in skill_tools for c in tool_calls):
-                frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+                frozen_system = prompt_mod.build_system(
+                    mcp_client.registry,
+                    bound_tool_names,
+                    frozen_l1=frozen_l1,
+                )
 
             # ── Steering: 检查是否有用户消息需要注入 ─────────────────────────
             steered = await collector.drain_steering()

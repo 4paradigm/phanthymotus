@@ -7,7 +7,7 @@ api/solutions.py — 解决方案（Solution）打包 / 发布 / 载入。
     skills          当前激活、且已在技能广场上架的技能
     prompt.identity resource/memory/identity.md
     prompt.system   resource/memory/prompt_system.md
-    prompt.memory   prompt_memory.md（LLM 可写的长期记忆）
+    prompt.memory   Memory Core 中的 Agent 长期记忆
     tasks           task_store 里的活跃任务（goal / check_cron / metadata）
 
 包体格式（formatVersion 1）：
@@ -53,6 +53,7 @@ from typing import Any, Optional
 import fastapi
 from pydantic import BaseModel
 
+import agent_memory
 import config
 
 router = fastapi.APIRouter(prefix='/solutions', tags=['solutions'])
@@ -301,13 +302,25 @@ def _canvas_devices() -> tuple[list, dict, list]:
 # ── 打包 ────────────────────────────────────────────────────────────────────
 
 def _prompt_paths() -> dict:
-    """prompt 三个文件的路径（与 api/agent_definition.py 保持同一来源）。"""
+    """Prompt paths, including the compatibility mirror for long-term memory."""
     import api.agent_definition as ad
     return {
         'identity': ad._IDENTITY_PATH,
         'system':   ad._SYSTEM_PATH,
         'memory':   ad._memory_path(),
     }
+
+
+def _prompt_content(key: str, path: pathlib.Path) -> str:
+    if key == 'memory':
+        return agent_memory.snapshot().text
+    return path.read_text()
+
+
+def _prompt_exists(key: str, path: pathlib.Path) -> bool:
+    if key == 'memory':
+        return bool(agent_memory.snapshot().text)
+    return path.exists()
 
 
 def _config_field_paths(ref_of: dict) -> list:
@@ -503,9 +516,9 @@ async def _build_payload(req: PackRequest, token: Optional[str]) -> dict:
             if key not in paths:
                 return {'ok': False, 'error': f'未知的 prompt 块: {key}'}
             path = paths[key]
-            if not path.exists():
+            if not _prompt_exists(key, path):
                 return {'ok': False, 'error': f'{path} 不存在，无法打包 prompt.{key}'}
-            prompt[key] = path.read_text()
+            prompt[key] = _prompt_content(key, path)
             includes.append(f'prompt.{key}')
         payload['prompt'] = prompt
 
@@ -683,7 +696,7 @@ def _overwrite_summary(includes: list) -> dict:
         if block in includes:
             path = paths[key]
             prompt_files.append({'block': block, 'path': str(path),
-                                 'exists': path.exists()})
+                                 'exists': _prompt_exists(key, path)})
     if prompt_files:
         summary['prompt'] = prompt_files
 
@@ -747,8 +760,8 @@ async def packable(request: fastapi.Request):
         },
         'prompt': [
             {'block': f'prompt.{key}', 'path': str(path),
-             'exists': path.exists(),
-             'chars': len(path.read_text()) if path.exists() else 0}
+             'exists': _prompt_exists(key, path),
+             'chars': len(_prompt_content(key, path)) if _prompt_exists(key, path) else 0}
             for key, path in paths.items()
         ],
         'tasks': [{'id': t.id, 'goal': t.goal, 'check_cron': t.check_cron}
@@ -976,6 +989,20 @@ async def apply(request: fastapi.Request, req: LoadRequest):
                     'error': '以下容器的版本还没对齐到方案记录的 tag，请先完成对齐',
                     'misaligned': misaligned}
 
+    # Apply prompts before every other solution side effect.  _apply_prompt
+    # stores long-term memory before the file-backed prompts, so validation or
+    # storage failures return without changing canvas, skills, or tasks.
+    try:
+        prompt_applied, prompt_warning = await _apply_prompt(
+            payload.get('prompt') or {}, includes
+        )
+    except agent_memory.AgentMemoryValidationError:
+        return {'code': 422, 'error': '方案中的长期记忆内容不能为空'}
+    except agent_memory.AgentMemoryCommitUncertainError:
+        return {'code': 503, 'error': '长期记忆写入结果无法确认，请检查存储状态'}
+    except agent_memory.AgentMemoryError:
+        return {'code': 503, 'error': '长期记忆存储暂不可用'}
+
     applied: dict = {}
 
     # 1) 画布 —— deviceRef 换回本机 mcpId
@@ -987,8 +1014,7 @@ async def apply(request: fastapi.Request, req: LoadRequest):
     if BLOCK_SKILLS in includes:
         applied['skills'] = await _apply_skills(payload.get('skills') or [], token)
 
-    # 3) Prompt
-    prompt_applied = _apply_prompt(payload.get('prompt') or {}, includes)
+    # 3) Prompt (already applied above; keep the response ordering stable)
     if prompt_applied:
         applied['prompt'] = prompt_applied
 
@@ -1015,7 +1041,10 @@ async def apply(request: fastapi.Request, req: LoadRequest):
     if solution.get('slug') and not req.payload:
         await _rc_request('POST', f'/api/solutions/{solution["slug"]}', None, {})
 
-    return {'code': 200, 'data': {'applied': applied, 'needsConfig': needs_config}}
+    data = {'applied': applied, 'needsConfig': needs_config}
+    if prompt_warning:
+        data['warning'] = prompt_warning
+    return {'code': 200, 'data': data}
 
 
 async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
@@ -1115,14 +1144,32 @@ async def _apply_skills(skills: list, token: Optional[str]) -> dict:
             'installed': installed_now, 'failed': failed}
 
 
-def _apply_prompt(prompt: dict, includes: list) -> list:
-    """写 prompt 文件，只写 includes 里声明过的那几项。"""
+async def _apply_prompt(prompt: dict, includes: list) -> tuple[list, str | None]:
+    """Apply selected prompts, routing long-term memory through its owner."""
     paths = _prompt_paths()
     written = []
+    warning = None
+
+    # Store memory first so a durable-write failure cannot leave the remaining
+    # prompt files looking like the whole solution was applied successfully.
+    memory_block = 'prompt.memory'
+    memory_content = prompt.get('memory')
+    if memory_block in includes and memory_content is not None:
+        snapshot = await agent_memory.replace(
+            memory_content,
+            actor_key='api:solutions',
+            reason='solution_apply',
+        )
+        written.append(memory_block)
+        if not snapshot.fallback_ready:
+            warning = agent_memory.COMPATIBILITY_WARNING
+
     for block in PROMPT_BLOCKS:
         if block not in includes:
             continue
         key = block.split('.', 1)[1]
+        if key == 'memory':
+            continue
         content = prompt.get(key)
         if content is None:
             continue
@@ -1130,7 +1177,7 @@ def _apply_prompt(prompt: dict, includes: list) -> list:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         written.append(block)
-    return written
+    return written, warning
 
 
 def _apply_tasks(tasks: list) -> dict:

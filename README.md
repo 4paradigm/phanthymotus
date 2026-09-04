@@ -139,6 +139,18 @@ Frontend tests: `node --test "agent-core/web/js/*.test.mjs"` (no dependencies).
 ### Agent Definition
 
 Define the agent's identity, system prompt, and long-term memory directly from the UI.
+Long-term memory is stored transactionally in Memory Core and mirrored to
+`prompt_memory.md` for rollback compatibility. Set `MEMORY_CORE_ENABLED=0` and
+restart Agent Core to use the compatibility file directly. On an installed
+system, persist the override in `/opt/phanthy-motus/.env` so image upgrades keep
+it. Writes made in that mode are journaled and reconciled when Memory Core is
+enabled again. This stage is scoped to the single Agent instance; per-user and
+shared memories require a later identity-aware integration. Stop all Agent Core
+replicas before toggling the backend or editing the compatibility file. Disabled
+mode does not open or migrate the Memory Core database; do not re-enable it
+while the UI reports an unconfirmed storage hand-off.
+Keep the compatibility path as a regular file; a file-level symbolic link puts
+memory into read-only degraded mode instead of replacing the link target.
 
 ![Agent Definition](docs/images/agent-definition.png)
 
@@ -338,4 +350,3 @@ its dashboard.
 ## License
 
 [Apache License 2.0](LICENSE)
-

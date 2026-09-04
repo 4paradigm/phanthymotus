@@ -11,11 +11,20 @@ dependencies = [
     "jsonschema>=4.0",
     "numpy>=1.24",
     "openai>=2.31.0",
+    "phanthy-memory-core",
     "pyyaml>=6.0.2",
     "lark-oapi>=1.4.0",
     "python-telegram-bot>=21.0",
     "slack-sdk>=3.27",
 ]
+
+[dependency-groups]
+test = [
+    "pytest>=8.0,<10",
+]
+
+[tool.uv.sources]
+phanthy-memory-core = { path = "../memory-core" }
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple/"

@@ -30,9 +30,16 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} uv
 
 WORKDIR /work
 
-COPY pyproject.toml /work/
+# Agent Core uses the sibling Memory Core as a local package.  The build
+# context is the repository root so the same ../memory-core source mapping
+# works locally and in the image.
+COPY memory-core/pyproject.toml memory-core/README.md memory-core/LICENSE /memory-core/
+COPY memory-core/src/ /memory-core/src/
+COPY agent-core/pyproject.toml agent-core/uv.lock /work/
 ENV UV_INDEX_URL=${PYPI_MIRROR}
-RUN uv lock && uv sync --no-dev --no-install-project
+RUN uv sync --locked --no-dev --no-install-project
+RUN /work/.venv/bin/python -c "import memory_core" && \
+    /work/.venv/bin/memory-core-selfcheck
 
 # Link system ROS2 packages into venv so sensor_msgs/rclpy are importable
 RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
@@ -40,14 +47,14 @@ RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/
     echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/usr/lib/python3/dist-packages" >> .venv/lib/python3.10/site-packages/system.pth
 
-COPY web/      /work/web/
-COPY src/      /work/src/
-COPY tools/    /work/tools/
-COPY resource/ /work/resource/
-COPY deploy/   /deploy/
+COPY agent-core/web/      /work/web/
+COPY agent-core/src/      /work/src/
+COPY agent-core/tools/    /work/tools/
+COPY agent-core/resource/ /work/resource/
+COPY agent-core/deploy/   /deploy/
 
 # Bake defaults to a path immune to volume mounts (for cold-start init)
-COPY resource/memory/defaults/ /opt/defaults/memory/
+COPY agent-core/resource/memory/defaults/ /opt/defaults/memory/
 
 ARG IMAGE_TAG=unknown
 ENV IMAGE_TAG=${IMAGE_TAG}

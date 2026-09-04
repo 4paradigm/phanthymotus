@@ -3,6 +3,7 @@ logsafe.install()
 
 import contextlib
 import asyncio
+import functools
 import json
 import logging
 import pathlib
@@ -16,6 +17,7 @@ import sys
 sys.modules['start'] = sys.modules[__name__]
 
 import config
+import agent_memory
 import auth
 import event
 import collector
@@ -26,13 +28,16 @@ import mcp_client
 from channel.manager import manager as channel_manager
 
 
-def _init_resource_files():
+def _memory_defaults_dir() -> pathlib.Path:
+    installed = pathlib.Path('/opt/defaults/memory')
+    if installed.exists():
+        return installed
+    return pathlib.Path('./resource/memory/defaults')
+
+
+def _init_resource_files() -> str | None:
     """如果目标 memory 文件不存在，从 defaults 拷贝（冷启动）。"""
-    # 镜像内固定路径（不会被 volume mount 遮盖）
-    defaults_dir = pathlib.Path('/opt/defaults/memory')
-    if not defaults_dir.exists():
-        # 本地开发 fallback
-        defaults_dir = pathlib.Path('./resource/memory/defaults')
+    defaults_dir = _memory_defaults_dir()
 
     memory_dir = pathlib.Path('./resource/memory')
     memory_dir.mkdir(parents=True, exist_ok=True)
@@ -45,12 +50,16 @@ def _init_resource_files():
                     shutil.copy(f, target)
                     print(f'[startup] copied default: {f.name}')
 
-    # prompt_memory.md 特殊处理：空则从 init 拷贝
-    mem = memory_dir / 'prompt_memory.md'
-    init = memory_dir / 'prompt_memory_init.md'
-    if init.exists() and (not mem.exists() or not mem.read_text().strip()):
-        mem.write_text(init.read_text())
-        print('[startup] initialized prompt_memory.md from init template')
+    # Read the immutable packaged template directly.  The compatibility copy
+    # above is published independently and another first-starting process may
+    # still be copying it into the shared volume.
+    init = defaults_dir / 'prompt_memory_init.md'
+    try:
+        init_text = init.read_text(encoding='utf-8')
+    except (OSError, UnicodeError) as error:
+        print(f'[startup] memory template unavailable: {type(error).__name__}')
+        return None
+    return init_text
 
 
 def _check_dds():
@@ -372,10 +381,24 @@ async def lifespan(app):
     auth.init()
 
     # 初始化资源文件（从 defaults 拷贝缺失文件）
-    _init_resource_files()
+    memory_seed = _init_resource_files()
+
+    loop = asyncio.get_running_loop()
+
+    # Bootstrap the durable prompt before the first Event turn.  The adapter
+    # degrades to the compatibility file on initialization failure, so memory
+    # storage must never prevent the robot control plane from starting.
+    memory_snapshot = await loop.run_in_executor(
+        None,
+        functools.partial(agent_memory.initialize, seed_text=memory_seed),
+    )
+    print(
+        f'[startup] memory backend={memory_snapshot.backend} '
+        f'revision={memory_snapshot.revision or "file"} '
+        f'fallback_ready={memory_snapshot.fallback_ready}'
+    )
 
     # 检查宿主是否有 ROS2 DDS 服务
-    loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check_dds)
 
     # 探测宿主架构（用于向 resource-center 过滤镜像目录）。只是预热 memo 并把值写进

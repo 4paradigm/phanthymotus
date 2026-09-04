@@ -64,6 +64,7 @@ Determined from `git diff --name-only origin/main...HEAD`.
 | Changed path | Target |
 |--------------|--------|
 | `agent-core/**` | `deploy/build_core.sh` |
+| `memory-core/**` | `deploy/build_core.sh` |
 | `perception/**` | `deploy/build_perception.sh --variant jetson` |
 | `README*`, `docs/**`, `CODEOWNERS` | none — review only |
 
