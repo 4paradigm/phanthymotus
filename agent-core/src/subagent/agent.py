@@ -501,17 +501,31 @@ class Subagent:
             return self.result
 
         except Exception as e:
+            # A cancellation that lands *inside* an await surfaces here as an
+            # exception rather than at the cooperative checkpoint at the top of the
+            # loop, so reporting every exception as FAILED loses the distinction and
+            # the reason with it. Measured on Tianyi: `spawn_sync timeout` cancelled
+            # three subagents mid-LLM-call and each was reported
+            # `✗ failed: TurnCancelled: Interrupted by user message during LLM call`
+            # — which names neither the real cause nor the fact that it was a
+            # deliberate cancel, and reads to the operator like a model error.
+            _cancelled = self._cancel_event.is_set()
+            _status = STATUS_CANCELLED if _cancelled else STATUS_FAILED
+            _error = (self._cancel_reason or 'cancelled') if _cancelled \
+                else f'{type(e).__name__}: {e}'
             self.result = SubagentResult(
                 agent_id=self.id,
-                status=STATUS_FAILED,
+                status=_status,
                 output='',
                 tool_calls_made=self._tool_calls_made,
-                        actions=self._action_report(),
+                actions=self._action_report(),
                 rounds_used=self.rounds_completed,
                 duration_s=time.time() - t0,
-                error=f'{type(e).__name__}: {e}',
+                error=_error,
             )
-            self.status = STATUS_FAILED
+            self.status = _status
+            print(f'[subagent:{self.id}] {_status} after '
+                  f'{self.rounds_completed} round(s): {_error}')
             return self.result
 
         finally:

@@ -466,6 +466,32 @@ class SubagentManager:
         elif result.error:
             notify_text += f'\n错误: {result.error[:100]}'
 
+        # A subagent that did not finish may still have *acted*, and the reader of this
+        # notification is an agent that can act again. Without saying what already
+        # happened, "failed: <goal>" reads as "nothing was done" and the obvious
+        # response is to redo it — physically.
+        #
+        # Measured on Tianyi: three delegated subagents were cancelled by
+        # `spawn_sync timeout` mid-run, each after it had already spoken its line and
+        # completed its gesture. Each surfaced as `✗ failed: <goal>` with no mention of
+        # that, and the main agent re-spoke the line and re-ran the arm motion. Every
+        # partially-finished task became a duplicate performance.
+        #
+        # `confirmed_actions()` is the same evidence the peer delegation response
+        # already carries (peer/delegation.py); it was simply never wired into the
+        # local notification.
+        if result.status != 'completed':
+            done = result.confirmed_actions()
+            substantive = result.substantive_tool_calls()
+            if done or substantive:
+                parts = []
+                if done:
+                    parts.append(f'{len(done)} 个动作已确认完成'
+                                 f'（{", ".join(a.get("action_id", "?") for a in done[:4])}）')
+                if substantive:
+                    parts.append(f'已调用: {", ".join(dict.fromkeys(substantive))[:120]}')
+                notify_text += (f'\n⚠ 已经做过的部分，不要重复执行: {"; ".join(parts)}')
+
         await event_bus.enqueue(
             source=f'subagent:{agent.id}',
             text=notify_text,
