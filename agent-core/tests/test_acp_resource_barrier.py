@@ -196,5 +196,62 @@ class TestAwaitPendingScoping(_PendingFixture):
         return time.monotonic() - t0
 
 
+class TestActionOutcomes(_PendingFixture):
+    """超时不能和成功长得一样。
+
+    超时路径清掉 pending 并让调用方照常往下走 —— 和成功完全同一条路。所以终态必须在
+    pending 消失之后仍然可查，否则"播完了"和"回调没来"在下游无法区分，这正是委派把一句
+    没播出去的台词报成已播的原因。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved_outcomes = dict(mcp_client._action_outcomes)
+        mcp_client._action_outcomes.clear()
+
+    def tearDown(self):
+        mcp_client._action_outcomes.clear()
+        mcp_client._action_outcomes.update(self._saved_outcomes)
+        super().tearDown()
+
+    def test_completed_is_recorded_after_pending_is_gone(self):
+        self._add('speak-1', frozenset({'mouth'}), done=True)
+        asyncio.run(mcp_client.await_pending(
+            want=frozenset({'mouth'}), scoped=True, timeout=1))
+        self.assertNotIn('speak-1', mcp_client._pending_actions)
+        self.assertEqual(mcp_client.action_outcome('speak-1')['status'], 'completed')
+
+    def test_timeout_is_distinguishable_from_completed(self):
+        self._add('speak-1', frozenset({'mouth'}), timeout=0.05)
+        out = asyncio.run(mcp_client.await_pending(
+            want=frozenset({'mouth'}), scoped=True))
+        self.assertEqual(out['status'], 'timeout')
+        self.assertEqual(mcp_client.action_outcome('speak-1')['status'], 'timeout')
+
+    def test_tool_name_is_kept(self):
+        """终态记录要在 _pending_tools 被清掉之前抓到 tool 名。"""
+        self._add('speak-1', frozenset({'mouth'}), tool='tts', done=True)
+        asyncio.run(mcp_client.await_pending(scoped=False, timeout=1))
+        self.assertEqual(mcp_client.action_outcome('speak-1')['tool'], 'tts')
+
+    def test_unknown_action_has_no_outcome(self):
+        self.assertIsNone(mcp_client.action_outcome('never-existed'))
+
+    def test_record_is_bounded(self):
+        """诊断尾巴，不是账本 —— 不能无上限增长。"""
+        cap = mcp_client._ACTION_OUTCOME_CAP
+        for i in range(cap + 25):
+            mcp_client._record_outcome(f'a-{i}', 'completed')
+        self.assertLessEqual(len(mcp_client._action_outcomes), cap)
+        self.assertIsNone(mcp_client.action_outcome('a-0'), 'oldest should be evicted')
+        self.assertIsNotNone(mcp_client.action_outcome(f'a-{cap + 24}'))
+
+    def test_forget_without_outcome_records_nothing(self):
+        """没有明确终态时不要猜 —— 记一个错的比不记更糟。"""
+        self._add('speak-1', frozenset({'mouth'}))
+        mcp_client._forget_pending(['speak-1'])
+        self.assertIsNone(mcp_client.action_outcome('speak-1'))
+
+
 if __name__ == '__main__':
     unittest.main()

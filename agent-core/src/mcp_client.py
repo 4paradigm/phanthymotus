@@ -21,6 +21,7 @@ mcp_client.py — MCP HTTP transport 客户端。
 """
 
 import asyncio
+import collections
 import json
 import time
 import uuid
@@ -97,19 +98,48 @@ def conflicting_pending(want: frozenset | None) -> list[str]:
     ]
 
 
-def _forget_pending(aids) -> None:
-    """Drop every per-action side table for `aids`.
+def _forget_pending(aids, outcome: str | None = None) -> None:
+    """Drop every per-action side table for `aids`, recording how each ended.
 
     One helper rather than the same four pops repeated at each exit: the pending
     bookkeeping is spread over five dicts now, and a cleanup path that forgets one
     of them leaks it for the lifetime of the process.
+
+    `outcome` ('completed' | 'timeout' | 'cancelled' | 'barge_in') is remembered in
+    `_action_outcomes` after the pending itself is gone. Without that the two
+    outcomes are indistinguishable a moment later: the timeout path clears pending
+    and lets the caller proceed exactly as success does, so an action whose
+    completion callback never arrived looks, downstream, like one that played. That
+    is what lets a delegation report a line as spoken when nothing was heard.
     """
     for aid in aids:
+        if outcome:
+            _record_outcome(aid, outcome)
         _pending_actions.pop(aid, None)
         _pending_results.pop(aid, None)
         _pending_timeouts.pop(aid, None)
         _pending_tools.pop(aid, None)
         _pending_resources.pop(aid, None)
+
+
+# Terminal state of recently finished actions, so a caller can still ask "did that
+# actually play?" after the pending is gone. Bounded — this is a diagnostic tail,
+# not a ledger, and an agent that never asks must not grow it without limit.
+_ACTION_OUTCOME_CAP = 512
+_action_outcomes: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+
+
+def _record_outcome(action_id: str, status: str) -> None:
+    entry = {'status': status, 'tool': _pending_tools.get(action_id, '')}
+    _action_outcomes.pop(action_id, None)
+    _action_outcomes[action_id] = entry
+    while len(_action_outcomes) > _ACTION_OUTCOME_CAP:
+        _action_outcomes.popitem(last=False)
+
+
+def action_outcome(action_id: str) -> dict | None:
+    """Terminal state of a finished action, or None if still pending / evicted."""
+    return _action_outcomes.get(action_id)
 
 
 # ── 内部 JSON-RPC 助手 ─────────────────────────────────────────────────────────
@@ -760,7 +790,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                 await cancel_and_reap([wait_task, cancel_task])
             if cancel_task in done:
                 # 用户打断：只清本次等待的那些，不连带抹掉不相干的 pending
-                _forget_pending(aids)
+                _forget_pending(aids, 'cancelled')
                 return {"status": "cancelled"}
             if wait_task not in done:
                 # Unlike wait_for, asyncio.wait() does not raise on timeout — it
@@ -780,11 +810,11 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
             await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
 
         # 清理已完成的
-        _forget_pending(aids)
+        _forget_pending(aids, 'completed')
         print(f'[acp] barrier cleared: {aids}')
         return {"status": "completed", "actions": aids}
     except asyncio.TimeoutError:
-        _forget_pending(aids)
+        _forget_pending(aids, 'timeout')
         print(f'[acp] barrier timeout: {aids}')
         return {"status": "timeout", "actions": aids}
 
@@ -830,13 +860,13 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
         results = {}
         for aid, _ in events:
             results[aid] = _pending_results.pop(aid, {"status": "completed"})
-        _forget_pending(aid for aid, _ in events)
+        _forget_pending((aid for aid, _ in events), 'completed')
         return {"status": "completed", "results": results}
     except asyncio.TimeoutError:
         completed = {aid: _pending_results.pop(aid, {}) for aid, ev in events if ev.is_set()}
         still_pending = [aid for aid, ev in events if not ev.is_set()]
         # 只清理已完成的；还在飞的留着，它们的 barrier 语义没变
-        _forget_pending(completed)
+        _forget_pending(completed, 'completed')
         return {"status": "timeout", "completed": completed, "pending": still_pending}
     except asyncio.CancelledError:
         return {"status": "cancelled", "pending": [aid for aid, _ in events]}

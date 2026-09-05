@@ -866,12 +866,35 @@ async def call_tool(req: Request):
     try:
         result = await mcp_client.call_tool(tool_name, arguments)
         store.touch(peer_id, _source_endpoint(req))
+
+        # ACP does not stop at the machine boundary.
+        #
+        # An async action returns as soon as the driver has *queued* it, so replying
+        # here handed the caller "done" while nothing had happened yet. Locally the
+        # barrier hides that; across a peer there was no barrier at all, which is why
+        # one robot told another to speak and then immediately spoke over it.
+        #
+        # So hold the response until this action actually finishes, and report the
+        # terminal state rather than the acknowledgement. The connection stays open
+        # for the action's duration — the same shape /delegate already has, and
+        # transport.post_json is cancellable now, so the caller can still abandon it.
+        action_id = _action_id_of(result)
+        action_status = 'sync'
+        if action_id:
+            sync_out = await mcp_client.sync([action_id], timeout=_ACTION_WAIT_S)
+            action_status = sync_out.get('status', 'unknown')
+            if action_status != 'completed':
+                print(f'[peer] {who} action {action_id} ended {action_status!r} '
+                      f'(tool={tool_name})')
+
         await _emit('peer_tool_result', {
             'ok': True,
             'elapsed_ms': round((time.time() - started) * 1000),
-            'action_id': _action_id_of(result),
+            'action_id': action_id,
+            'action_status': action_status,
         })
-        return {'result': result, 'error': None}
+        return {'result': result, 'error': None,
+                'action_id': action_id, 'action_status': action_status}
     except Exception as e:
         await _emit('peer_tool_result', {
             'ok': False, 'error': str(e),
@@ -879,6 +902,14 @@ async def call_tool(req: Request):
         })
         return {'result': None, 'error': str(e)}
 
+
+
+# How long a peer's tool call may hold this connection waiting for its action to
+# finish. Above the longest x-completion timeout a driver declares (g1 switch_mode
+# is 150s) so the driver's own limit is what expires first and we report *its*
+# verdict, rather than giving up early and leaving the caller unable to tell a slow
+# action from a lost one.
+_ACTION_WAIT_S = 180.0
 
 
 def _action_id_of(result) -> str:

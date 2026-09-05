@@ -59,6 +59,12 @@ class Subagent:
         # Tracking
         self._tool_calls_made: list[dict] = []
         self._progress_reports: list[str] = []
+        # ACP action_ids this run started, in order. A tool call that *begins* an
+        # asynchronous action is not evidence the action happened — the terminal
+        # state has to be looked up afterwards (mcp_client.action_outcome). This is
+        # what lets a delegator tell "spoke the line" from "queued it and the
+        # callback never came".
+        self._action_ids: list[str] = []
 
     @property
     def context(self) -> SubagentContext:
@@ -231,10 +237,15 @@ class Subagent:
         # ContextVars are per-task, so concurrent subagents at different depths
         # do not interfere.
         try:
-            from peer.delegation import current_hop_count
+            from peer.delegation import current_hop_count, current_cancel_event
             _hop_token = current_hop_count.set(getattr(self.spec, 'hop_count', 0))
+            # Same reasoning, for cancellation: a peer_delegate issued from inside
+            # this subagent must abort when *this* subagent is cancelled, not when
+            # some enclosing turn is.
+            _cancel_token = current_cancel_event.set(self._cancel_event)
         except ImportError:
             _hop_token = None
+            _cancel_token = None
 
         tool_list = self._get_allowed_tools()
         finish_output: str | None = None
@@ -250,6 +261,7 @@ class Subagent:
                         status=STATUS_CANCELLED,
                         output='',
                         tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
                         rounds_used=self.rounds_completed,
                         duration_s=time.time() - t0,
                         error=self._cancel_reason or 'cancelled',
@@ -375,6 +387,7 @@ class Subagent:
                         status=STATUS_COMPLETED,
                         output=finish_output,
                         tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
                         rounds_used=self.rounds_completed,
                         duration_s=time.time() - t0,
                     )
@@ -395,6 +408,7 @@ class Subagent:
                         status=STATUS_FAILED,
                         output='',
                         tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
                         rounds_used=self.rounds_completed,
                         duration_s=time.time() - t0,
                         error=fail_reason,
@@ -409,6 +423,7 @@ class Subagent:
                         status=STATUS_COMPLETED,
                         output=content or '(no output)',
                         tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
                         rounds_used=self.rounds_completed,
                         duration_s=time.time() - t0,
                     )
@@ -427,6 +442,7 @@ class Subagent:
                 status=STATUS_TIMEOUT,
                 output=content if content else '(max rounds reached)',
                 tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
                 rounds_used=self.rounds_completed,
                 duration_s=time.time() - t0,
                 error=f'Reached max_rounds={self.spec.max_rounds}',
@@ -440,6 +456,7 @@ class Subagent:
                 status=STATUS_CANCELLED,
                 output='',
                 tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
                 rounds_used=self.rounds_completed,
                 duration_s=time.time() - t0,
             )
@@ -452,6 +469,7 @@ class Subagent:
                 status=STATUS_FAILED,
                 output='',
                 tool_calls_made=self._tool_calls_made,
+                        actions=self._action_report(),
                 rounds_used=self.rounds_completed,
                 duration_s=time.time() - t0,
                 error=f'{type(e).__name__}: {e}',
@@ -463,6 +481,9 @@ class Subagent:
             if _hop_token is not None:
                 from peer.delegation import current_hop_count
                 current_hop_count.reset(_hop_token)
+            if _cancel_token is not None:
+                from peer.delegation import current_cancel_event
+                current_cancel_event.reset(_cancel_token)
             # Commit perf spans for this subagent run
             if _spans:
                 _spans.append({'span': 'subagent_total', 'component': 'subagent',
@@ -477,6 +498,43 @@ class Subagent:
                     )
                 except Exception:
                     pass
+
+    def _note_action_id(self, result) -> None:
+        """Record any ACP action_id this tool call started.
+
+        The id is in the tool's own reply, which `call_tool` returns as text (or as
+        a dict for a few tools), so parse rather than reach into mcp_client's
+        pending tables — those are process-global and shared with every other agent,
+        and picking "the newest pending" out of them would attribute another
+        subagent's action to this one under concurrency.
+        """
+        payload = result
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                return
+        if not isinstance(payload, dict):
+            return
+        action_id = payload.get('action_id')
+        if isinstance(action_id, str) and action_id and action_id not in self._action_ids:
+            self._action_ids.append(action_id)
+
+    def _action_report(self) -> list[dict]:
+        """Each action this run started, with the terminal state it reached.
+
+        `pending` means it never resolved before the run ended — which for a
+        delegated task means the caller must not treat it as done.
+        """
+        out = []
+        for aid in self._action_ids:
+            outcome = mcp_client.action_outcome(aid)
+            out.append({
+                'action_id': aid,
+                'status': (outcome or {}).get('status', 'pending'),
+                'tool': (outcome or {}).get('tool', ''),
+            })
+        return out
 
     async def _dispatch_tool(self, name: str, args: dict) -> str:
         """Dispatch a tool call and return result text."""
@@ -539,6 +597,7 @@ class Subagent:
                                        self._cancel_event,
                                        want=_bar_want, scoped=True)
                 result = await mcp_client.call_tool(name, args)
+                self._note_action_id(result)
                 if isinstance(result, dict):
                     return json.dumps(result, ensure_ascii=False)
                 return str(result)

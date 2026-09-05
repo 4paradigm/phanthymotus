@@ -83,6 +83,12 @@ class SubagentResult:
     rounds_used: int = 0
     duration_s: float = 0.0
     error: str | None = None
+    # ACP actions this run started and how each ended. Starting an async action is
+    # not evidence it happened: `speak` returns when the audio is *queued*, so a
+    # run that only ever queued and a run whose audio actually played produce
+    # identical prose. Entries are {action_id, status, tool}; status 'pending' means
+    # it never resolved before the run ended.
+    actions: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -91,6 +97,8 @@ class SubagentResult:
             'output': self.output,
             'tool_calls_made': self.tool_calls_made,
             'substantive_tool_calls': self.substantive_tool_calls(),
+            'actions': self.actions,
+            'confirmed_actions': self.confirmed_actions(),
             'rounds_used': self.rounds_used,
             'duration_s': self.duration_s,
             'error': self.error,
@@ -106,6 +114,25 @@ class SubagentResult:
             name for tc in self.tool_calls_made
             if (name := (tc.get('name') or '')) and name not in BOOKKEEPING_TOOLS
         ]
+
+    def confirmed_actions(self) -> list[dict]:
+        """Actions that reached a terminal 'completed' state.
+
+        Anything else — 'timeout', 'cancelled', 'barge_in', 'pending' — did not
+        demonstrably happen. A barrier timeout clears the pending and lets the
+        caller proceed exactly as success does, so this distinction is the only
+        thing standing between "the robot spoke" and "the robot was asked to".
+        """
+        return [a for a in self.actions if a.get('status') == 'completed']
+
+    def acted(self) -> bool:
+        """Whether this run did something observable.
+
+        True when it either completed an async action or called a non-bookkeeping
+        tool. A run that only called `subagent_finish` is False no matter how
+        confidently its output says otherwise.
+        """
+        return bool(self.confirmed_actions() or self.substantive_tool_calls())
 
     @classmethod
     def from_dict(cls, d: dict) -> SubagentResult:

@@ -303,7 +303,7 @@ async def _abort_pending_for_barge_in(interrupt_fallback=None) -> dict:
     fired = await hooks.fire('on_interrupt_all')
     if not fired and interrupt_fallback is not None:
         await interrupt_fallback()
-    mcp_client._forget_pending(actions)
+    mcp_client._forget_pending(actions, 'barge_in')
     return {"status": "barge_in", "actions": actions}
 
 
@@ -1007,6 +1007,11 @@ class Event:
             collector.set_cancel_event(cancel_ev)
             collector.set_turn_priority(1 if ev.get('_urgent') else 0)
             collector.set_busy(True)
+            # Publish this turn's cancel signal so tools that block for a long time
+            # can honour it. peer_delegate holds an HTTP connection for the remote
+            # task's whole duration, and the checks below only run between rounds.
+            from peer.delegation import current_cancel_event as _cancel_ctx
+            _cancel_token = _cancel_ctx.set(cancel_ev)
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev)
             except TurnCancelled:
@@ -1033,6 +1038,7 @@ class Event:
                 })
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
+                _cancel_ctx.reset(_cancel_token)
                 collector.set_cancel_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)

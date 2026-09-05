@@ -83,6 +83,49 @@ class TestSubstantiveToolCalls(unittest.TestCase):
         self.assertEqual(back.substantive_tool_calls(), ['mcp__mcp-1__tts'])
 
 
+class TestConfirmedActions(unittest.TestCase):
+    """启动一个异步动作不等于它发生了。
+
+    `speak` 在音频**入队**时就返回，所以"只排了队"和"真播完了"写出来的散文一模一样。
+    只有 'completed' 算数 —— 'timeout' 尤其不算，它清 pending 并照常放行。
+    """
+
+    def _with(self, *statuses) -> SubagentResult:
+        return SubagentResult(
+            agent_id='a1', status=STATUS_COMPLETED, output='说完了',
+            tool_calls_made=[{'name': 'mcp__m__tts', 'round': 0}],
+            actions=[{'action_id': f'speak-{i}', 'status': s, 'tool': 'tts'}
+                     for i, s in enumerate(statuses)],
+        )
+
+    def test_only_completed_counts(self):
+        r = self._with('completed', 'timeout', 'cancelled', 'pending', 'barge_in')
+        self.assertEqual([a['action_id'] for a in r.confirmed_actions()], ['speak-0'])
+
+    def test_acted_true_on_confirmed_action(self):
+        self.assertTrue(self._with('completed').acted())
+
+    def test_acted_true_on_substantive_tool_without_acp(self):
+        """不是每个工具都走 ACP。"""
+        r = SubagentResult(agent_id='a1', status=STATUS_COMPLETED, output='',
+                           tool_calls_made=[{'name': 'Read', 'round': 0}])
+        self.assertTrue(r.acted())
+
+    def test_acted_false_when_only_bookkeeping(self):
+        r = SubagentResult(agent_id='a1', status=STATUS_COMPLETED, output='已完成！',
+                           tool_calls_made=[{'name': 'subagent_finish', 'round': 0}])
+        self.assertFalse(r.acted(), '只调 subagent_finish 不算干活')
+
+    def test_to_dict_carries_both(self):
+        d = self._with('completed', 'timeout').to_dict()
+        self.assertEqual(len(d['actions']), 2)
+        self.assertEqual(len(d['confirmed_actions']), 1)
+
+    def test_from_dict_round_trips_actions(self):
+        back = SubagentResult.from_dict(self._with('completed').to_dict())
+        self.assertEqual(len(back.confirmed_actions()), 1)
+
+
 class TestCancelCarriesReason(unittest.TestCase):
     """取消一个 running subagent 原来完全静默 —— 日志在半路断掉，和挂死一模一样。
 

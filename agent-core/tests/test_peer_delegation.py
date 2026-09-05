@@ -149,7 +149,11 @@ class TestDelegation(unittest.TestCase):
             finally:
                 delegation.current_hop_count.reset(token)
 
-        self.assertEqual(out, 'ok')
+        self.assertIn('ok', out)
+        # 这个 fake 响应没带 actions / substantive_tool_calls（旧版 peer 的形状），
+        # 所以结果会附一句"无法确认对端是否真的动作了"。缺字段 ≠ 空字段：断言"什么都
+        # 没做"和直接相信散文一样错。
+        self.assertIn('unverified', out)
         self.assertEqual(sent.get('hop_count'), 2,
                          'peer_delegate sent the wrong depth; the chain limit cannot work')
 

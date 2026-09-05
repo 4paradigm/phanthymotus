@@ -218,13 +218,21 @@ def _ssl_context() -> ssl.SSLContext:
 
 async def post_json(endpoints: list[str], path: str, payload: dict,
                     *, timeout: float = 10.0,
-                    extra_headers: dict[str, str] | None = None) -> tuple[dict | None, str]:
+                    extra_headers: dict[str, str] | None = None,
+                    cancel_event: "asyncio.Event | None" = None) -> tuple[dict | None, str]:
     """POST a signed JSON body, trying each endpoint until one answers.
 
     Returns `(response_json, '')` or `(None, reason)`. Endpoints are tried in
     order because registry.endpoints_for() puts the freshest link first —
     walking the list is what makes "LAN died, cloud link still there" work with
     no extra logic at the call site.
+
+    `cancel_event` aborts the wait and returns `(None, 'cancelled')`. Delegation
+    holds this connection open for the remote task's whole duration — up to
+    `timeout_s + 10`, 130s by default — and the agent loop's own cancellation is
+    cooperative, checked only before an LLM call and after a tool dispatch, never
+    *during* one. So without this a person speaking while their robot waits on a
+    peer went unheard until the peer answered.
     """
     import aiohttp
 
@@ -234,6 +242,8 @@ async def post_json(endpoints: list[str], path: str, payload: dict,
     body = json.dumps(payload, ensure_ascii=False).encode()
     failures = []
     for base in endpoints:
+        if cancel_event is not None and cancel_event.is_set():
+            return None, 'cancelled'
         url = base.rstrip('/') + path
         headers = sign_headers('POST', path, body)
         if extra_headers:
@@ -243,7 +253,12 @@ async def post_json(endpoints: list[str], path: str, payload: dict,
             async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
                 async with session.post(url, data=body, headers=headers,
                                         ssl=_ssl_context()) as resp:
-                    text = await resp.text()
+                    if cancel_event is None:
+                        text = await resp.text()
+                    else:
+                        text, was_cancelled = await _read_or_cancel(resp, cancel_event)
+                        if was_cancelled:
+                            return None, 'cancelled'
                     if resp.status != 200:
                         failures.append(f'{base} → HTTP {resp.status} {text[:120]}')
                         continue
@@ -256,6 +271,32 @@ async def post_json(endpoints: list[str], path: str, payload: dict,
             failures.append(f'{base} → {type(e).__name__}: {e}')
             continue
     return None, '; '.join(failures) or 'unreachable'
+
+
+async def _read_or_cancel(resp, cancel_event: "asyncio.Event") -> tuple[str, bool]:
+    """Read the body, giving up as soon as `cancel_event` fires.
+
+    Returns `(text, was_cancelled)`. The reader task is cancelled and reaped on the
+    cancel path so it cannot outlive this call — an orphaned read on a closed
+    session is the "Task was destroyed but it is pending!" shape.
+    """
+    reader = asyncio.create_task(resp.text())
+    waiter = asyncio.create_task(cancel_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            [reader, waiter], return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (reader, waiter):
+            if not task.done():
+                task.cancel()
+        for task in (reader, waiter):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    if reader in done and not reader.cancelled():
+        return reader.result(), False
+    return '', True
 
 
 async def get_json(endpoints: list[str], path: str, *,
