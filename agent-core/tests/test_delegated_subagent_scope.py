@@ -83,6 +83,79 @@ class TestDelegatedSubagentToolScope(unittest.TestCase):
         self.assertEqual(self._names(hop_count=1), set())
 
 
+class TestDelegatedSubagentCannotUsePeerCall(unittest.TestCase):
+    """`peer_call` 是同一扇门的另一把钥匙。
+
+    上一版只从 subagent 手里拿走了 peer 的 **MCP** 工具，`peer_call` 这个**系统**工具还
+    留着 —— 模型直接从那儿走了过去。Orin6 被委派当捧哏后，它的 subagent 调
+    `peer_call(peer="Orin5", tool="tts", ...)`，再和自己的 tts 交替，把自己当成了两张嘴
+    的导演，而 Orin5 那句话还没说完。
+
+    `peer_delegate` 保留：链式委派是正当的，而且它走对端自己的 agent，带着 hop 计数和
+    角色重裁剪。
+    """
+
+    def _desktop_names(self, hop_count):
+        from unittest import mock
+        fake_tools = {
+            n: {'schema': {'name': n}}
+            for n in ('Bash', 'Read', 'memory_recall', 'peer_list', 'peer_state',
+                      'peer_tools', 'peer_call', 'peer_delegate')
+        }
+        fake_instance = type('E', (), {'_sys_tools': fake_tools})()
+        agent = Subagent(SubagentSpec(goal='说一句捧哏词', hop_count=hop_count),
+                         agent_id='desk01')
+        with mock.patch('event.llm._event_instance', fake_instance):
+            return {s['name'] for s in agent._get_desktop_tool_schemas()}
+
+    def test_delegated_subagent_loses_peer_call(self):
+        """回归：这一个漏掉，Orin6 的 subagent 就能驱动 Orin5 的嘴。"""
+        self.assertNotIn('peer_call', self._desktop_names(hop_count=1))
+
+    def test_delegated_subagent_keeps_peer_delegate(self):
+        """链式委派必须还能用，否则 hop 计数没有读者，链长永远是 1。"""
+        self.assertIn('peer_delegate', self._desktop_names(hop_count=1))
+
+    def test_delegated_subagent_keeps_read_only_peer_tools(self):
+        names = self._desktop_names(hop_count=1)
+        for n in ('peer_list', 'peer_state', 'peer_tools'):
+            self.assertIn(n, names)
+
+    def test_delegated_subagent_keeps_ordinary_tools(self):
+        names = self._desktop_names(hop_count=1)
+        for n in ('Bash', 'Read', 'memory_recall'):
+            self.assertIn(n, names)
+
+    def test_locally_spawned_subagent_keeps_peer_call(self):
+        """本机自己起的 subagent 是本机 agent 的延伸，行为不变。"""
+        self.assertIn('peer_call', self._desktop_names(hop_count=0))
+
+
+class TestSubagentBarriersHandoffSystemTools(unittest.TestCase):
+    """subagent 的系统工具分支原来完全没有 barrier。
+
+    Phase 1 只给 `mcp__` 那条分支加了 barrier，所以 subagent 调 `peer_call` 从不等自己
+    的音频 —— 主循环对同一个工具的 barrier，往下一层就被绕过了。
+    """
+
+    def test_dispatch_consults_the_barrier_for_system_tools(self):
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / 'src' / 'subagent' / 'agent.py').read_text()
+        desktop_branch = src.split('# Desktop tool call', 1)[1]
+        self.assertIn('_sys_tool_needs_barrier', desktop_branch,
+                      'subagent 的系统工具分支没有 barrier —— peer_call 会绕过它')
+        self.assertIn('_acp_barrier', desktop_branch)
+
+    def test_peer_call_is_a_barriered_system_tool(self):
+        from event.llm import _sys_tool_needs_barrier
+        self.assertTrue(_sys_tool_needs_barrier('peer_call'))
+
+    def test_read_only_peer_tools_do_not_barrier(self):
+        from event.llm import _sys_tool_needs_barrier
+        for n in ('peer_list', 'peer_state', 'peer_tools'):
+            self.assertFalse(_sys_tool_needs_barrier(n), n)
+
+
 class TestDelegatedCompletionDoesNotWakeLocalAgent(unittest.TestCase):
     """完成通知只在本机有决策需求时才发。
 

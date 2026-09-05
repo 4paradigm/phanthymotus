@@ -190,10 +190,26 @@ class Subagent:
                           'WebFetch', 'WebSearch', 'memory_recall',
                           'peer_list', 'peer_state', 'peer_tools', 'peer_call',
                           'peer_delegate'}
+        # `peer_call` is withheld from a delegated subagent, for the same reason the
+        # peer's MCP tools are (see _get_all_mcp_schemas): it drives another robot's
+        # hardware directly. Removing only the MCP route left this one open, and the
+        # model walked straight through it — asked to be the straight man, Orin6's
+        # delegated subagent called `peer_call(peer="Orin5", tool="tts", ...)` and
+        # then alternated that with its own tts, appointing itself director of both
+        # mouths while Orin5 was still mid-line.
+        #
+        # `peer_delegate` stays: a chained delegation is precisely "B was asked to do
+        # something and hands part of it to C", B's work happens inside a subagent,
+        # and it goes through C's own agent with the hop counter and role re-clipping
+        # intact. Without it here the hop counter run() publishes would have no
+        # caller able to read it and chains could only ever be one hop long.
+        allowed = set(_DESKTOP_TOOLS)
+        if getattr(self.spec, 'hop_count', 0) > 0:
+            allowed.discard('peer_call')
         return [
             info['schema']
             for name, info in _event_instance._sys_tools.items()
-            if name in _DESKTOP_TOOLS and name not in _DENIED_TOOLS
+            if name in allowed and name not in _DENIED_TOOLS
         ]
 
     def _build_subagent_sys_tools(self) -> list[dict]:
@@ -665,6 +681,19 @@ class Subagent:
         from event.llm import _event_instance
         if _event_instance and name in _event_instance._sys_tools:
             try:
+                # Hand-off tools need the ACP barrier here too. Phase 1 added it only
+                # to the `mcp__` branch above, so a subagent calling `peer_call` never
+                # waited for its own audio — the barrier the main loop applies to that
+                # exact tool was bypassed entirely by going one level down.
+                #
+                # Measured on Orin6, its delegated subagent alternating both mouths:
+                #   16:32:24.343  own pending speak-de3a6c33 (plays to 16:32:40)
+                #   16:32:27.296  peer_call(make Orin5 speak)   <- 2.9s in, no wait
+                # Same shape as the main-loop bug, one layer lower.
+                from event.llm import _acp_barrier, _sys_tool_needs_barrier
+                if _sys_tool_needs_barrier(name):
+                    await _acp_barrier(f'subagent:{self.id}/{name}',
+                                       self._cancel_event, scoped=False)
                 fn = _event_instance._sys_tools[name]['object']
                 result = await fn(**args)
                 if isinstance(result, list):
