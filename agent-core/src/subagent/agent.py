@@ -54,6 +54,7 @@ class Subagent:
         # Control signals
         self._cancel_event = asyncio.Event()
         self._pause_event = asyncio.Event()
+        self._cancel_reason: str = ''
 
         # Tracking
         self._tool_calls_made: list[dict] = []
@@ -82,8 +83,17 @@ class Subagent:
         except asyncio.QueueFull:
             pass  # drop if inbox full
 
-    def cancel(self) -> None:
-        """Signal cancellation."""
+    def cancel(self, reason: str = '') -> None:
+        """Signal cancellation.
+
+        `reason` is recorded and logged. Cancelling a running subagent used to be
+        entirely silent — neither this nor the branch in `run()` that acts on the
+        signal printed anything — so a cancelled agent's log ended mid-run with no
+        explanation, which reads identically to a hang.
+        """
+        self._cancel_reason = reason
+        print(f'[subagent:{self.id}] cancel signalled'
+              f'{f": {reason}" if reason else ""}')
         self._cancel_event.set()
 
     def pause(self) -> None:
@@ -242,8 +252,12 @@ class Subagent:
                         tool_calls_made=self._tool_calls_made,
                         rounds_used=self.rounds_completed,
                         duration_s=time.time() - t0,
+                        error=self._cancel_reason or 'cancelled',
                     )
                     self.status = STATUS_CANCELLED
+                    print(f'[subagent:{self.id}] cancelled at round {round_idx} '
+                          f'after {self.rounds_completed} round(s)'
+                          f'{f": {self._cancel_reason}" if self._cancel_reason else ""}')
                     return self.result
 
                 if self._pause_event.is_set():
@@ -316,6 +330,17 @@ class Subagent:
                         except json.JSONDecodeError:
                             fn_args = {}
 
+                        # Log every dispatch, mirroring the main loop's
+                        # `[decision]   tool_call:` line.
+                        #
+                        # Without this a subagent's tool use is invisible: the only
+                        # trace a dispatch left was mcp_client's `[acp] registered
+                        # pending`, which non-ACP tools never emit at all. So a
+                        # subagent that called nothing looked exactly like one that
+                        # worked, and diagnosing the four silent peer delegations on
+                        # Orin6 meant inferring absence from an unrelated log line.
+                        print(f'[subagent:{self.id}]   tool_call: {fn_name}({fn_args_str[:300]})')
+
                         # Dispatch
                         result_text = await self._dispatch_tool(fn_name, fn_args)
 
@@ -354,6 +379,14 @@ class Subagent:
                         duration_s=time.time() - t0,
                     )
                     self.status = STATUS_COMPLETED
+                    if not self.result.substantive_tool_calls():
+                        # Reported success having only called bookkeeping tools.
+                        # Loud on purpose: this is indistinguishable from real work
+                        # in the output text, and a delegator that trusts the text
+                        # will believe the task was carried out.
+                        print(f'[subagent:{self.id}] WARNING: completed with zero '
+                              f'substantive tool calls — reported success without '
+                              f'acting. goal={self.spec.goal[:80]!r}')
                     return self.result
 
                 if fail_reason is not None:

@@ -24,6 +24,18 @@ STATUS_CANCELLED = 'cancelled'
 TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_TIMEOUT, STATUS_CANCELLED}
 ACTIVE_STATUSES = {STATUS_PENDING, STATUS_RUNNING, STATUS_PAUSED, STATUS_SUSPENDED}
 
+# Tools that only talk *about* the task rather than carry it out. A subagent whose
+# entire run consists of these did nothing observable, yet still reports
+# STATUS_COMPLETED with whatever prose it chose to write.
+#
+# This is not hypothetical. Measured on Orin5+Orin6: of six inbound peer
+# delegations each asking the receiver to speak one line, four ran a single round,
+# called `subagent_finish` without ever touching tts, and returned "completed" —
+# and `peer_delegate` handed that self-report back to the delegator as success.
+# Both robots then announced a sixteen-line performance that never happened.
+# `substantive_tool_calls` is how a caller tells the two apart.
+BOOKKEEPING_TOOLS = frozenset({'subagent_finish', 'subagent_fail', 'subagent_report'})
+
 
 @dataclass
 class SubagentSpec:
@@ -78,10 +90,22 @@ class SubagentResult:
             'status': self.status,
             'output': self.output,
             'tool_calls_made': self.tool_calls_made,
+            'substantive_tool_calls': self.substantive_tool_calls(),
             'rounds_used': self.rounds_used,
             'duration_s': self.duration_s,
             'error': self.error,
         }
+
+    def substantive_tool_calls(self) -> list[str]:
+        """Names of tools this run called that actually did something.
+
+        Excludes BOOKKEEPING_TOOLS. An empty list on a `completed` result means the
+        subagent reported success without acting — see BOOKKEEPING_TOOLS.
+        """
+        return [
+            name for tc in self.tool_calls_made
+            if (name := (tc.get('name') or '')) and name not in BOOKKEEPING_TOOLS
+        ]
 
     @classmethod
     def from_dict(cls, d: dict) -> SubagentResult:

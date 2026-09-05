@@ -84,7 +84,7 @@ class SubagentManager:
         for agent_id, task in list(self._running.items()):
             agent = self._agents.get(agent_id)
             if agent:
-                agent.cancel()
+                agent.cancel('agent-core shutting down')
                 try:
                     await asyncio.wait_for(task, timeout=5.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -148,7 +148,7 @@ class SubagentManager:
             return True
 
         if agent.status == STATUS_RUNNING:
-            agent.cancel()
+            agent.cancel(reason or 'cancelled by request')
             # The running task will handle the rest
             return True
 
@@ -340,7 +340,7 @@ class SubagentManager:
             idle_time = time.time() - agent.updated_at
             if idle_time >= idle_timeout:
                 print(f'[subagent:{agent_id}] idle timeout: no progress for {idle_time:.0f}s')
-                agent.cancel()
+                agent.cancel(f'idle timeout ({idle_time:.0f}s without progress)')
                 return
 
     # ── Lifecycle Helpers ─────────────────────────────────────────────────────
