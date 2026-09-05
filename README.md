@@ -179,6 +179,43 @@ So an `operator` peer **can** drive this robot's actuators directly. That is the
 oversight: granting `operator` is what authorises it, which is why a newly paired peer defaults to
 `viewer`, and why every such call is announced on the activity stream.
 
+### ACP Barrier — what may run at the same time
+
+An actuator tool returns when the driver has *accepted* the action, not when the world
+has finished changing, so the agent loop needs a rule for what may start next. That
+rule is the **ACP barrier**, and it is scoped by **physical channel**.
+
+Drivers declare which channel each acting tool occupies via `x-resource` beside
+`x-completion` (spec: `phanthymotus-driver/README_dev.md` § *Physical Resources*).
+The barrier waits only for pending actions whose channel intersects the one the new
+call wants, so speaking no longer blocks driving while two `speak` calls still
+serialise. `finish` and the hand-off tools (`peer_call`, `peer_delegate`,
+`subagent_spawn*`, `subagent_message`) wait for **everything**, because ending a turn
+or handing work to another executor cannot know what will be touched.
+
+**Agent Core defines no channel names.** It only intersects the strings drivers
+declare, so `rotor`/`gimbal` or `thruster`/`ballast` work exactly as `mouth`/`base`
+does. Undeclared means "conflicts with everything", which is why an undeclared driver
+keeps its pre-barrier behaviour, and why a *partially* declared one is the case that
+behaves worst — see the driver README before declaring anything.
+
+Three properties are load-bearing and easy to break:
+
+- **Every dispatch path must consult the same table.** There are three — the main
+  loop, and the subagent's MCP and system-tool branches. Each was missed once, and
+  each miss reopened the whole bug through a different door. `_HANDOFF_SYSTEM_TOOLS`
+  is enumerated, not keyword-matched, and `tests/test_handoff_tools_partitioned.py`
+  fails if a new `peer_*`/`subagent_*` tool is left unclassified.
+- **The barrier expresses exclusion, not ordering.** "Announce before moving" is a
+  *sequencing* requirement, and nothing currently encodes it: with `mouth` and `base`
+  declared independent, the announcement and the motion overlap. Before this change
+  the global barrier made it serial by accident. Treat ordering as unsolved.
+- **A timeout clears pending and proceeds exactly like success.** So a terminal state
+  has to outlive its pending (`mcp_client.action_outcome`), and anything reporting
+  work upward must carry `SubagentResult.confirmed_actions()` rather than prose — an
+  agent that reads "failed" with no record of what already happened will redo it,
+  physically.
+
 ### Memory & Long-Running Agent Architecture
 
 The Agent Core is designed for **continuous operation over days or months**. The architecture separates real-time interaction from background intelligence:
