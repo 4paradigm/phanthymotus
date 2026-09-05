@@ -119,14 +119,67 @@ async def get_project_running():
 
 # ── Start / Stop Project (统一入口) ─────────────────────────────────────────────
 
+def order_cards_by_dependency(cards, connections):
+    """Start order: no card before the cards that feed it.
+
+    A card's input topic is only knowable once its source is running and has
+    answered `info` — a derived topic (ASR publishes `{input_topic}/asr`) exists
+    nowhere until then. So the order the cards are started in decides whether
+    the graph can be resolved at all.
+
+    The previous split — sources (no inbound connection) then processors (some
+    inbound connection) — is only a topological order for a graph two levels
+    deep. `mic → asr → decision_core` is three, and asr and decision_core both
+    landed in the second group, ordered by their position in the layout: the
+    card built first started first. On R1 decision_core had been on the canvas
+    for four days and asr was added that morning, so decision_core started
+    ahead of its own source, found no topic for it, and subscribed to nothing.
+    ASR heard the wake word and published; the agent loop was not listening.
+    Nothing failed and nothing was logged — the only visible symptom was that
+    speaking to the robot did nothing while typing to it worked.
+
+    Kahn's algorithm, levelled, so cards that do not depend on each other keep
+    their layout order and the two-level case still starts exactly as before.
+    Returns `(ordered, leftover)`; `leftover` is non-empty only for a cycle,
+    which has no valid order — the caller starts those last and says so.
+    """
+    ids = {c.get('id') for c in cards if c.get('id')}
+    # Self-loops and connections naming a card that is no longer on the canvas
+    # are ignored rather than treated as unsatisfiable: they would strand every
+    # card behind them, turning stale layout data into a total failure to start.
+    deps = {}
+    for conn in connections or []:
+        src, dst = conn.get('fromCardId'), conn.get('toCardId')
+        if src in ids and dst in ids and src != dst:
+            deps.setdefault(dst, set()).add(src)
+
+    ordered, started = [], set()
+    remaining = list(cards)
+    while remaining:
+        ready = [c for c in remaining
+                 if deps.get(c.get('id'), set()) <= started]
+        if not ready:
+            break
+        ordered.extend(ready)
+        started.update(c.get('id') for c in ready)
+        remaining = [c for c in remaining if c.get('id') not in started]
+    return ordered, remaining
+
+
 async def _do_start_project():
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
 
     Topic resolution strategy:
-      1. Start source cards first, then call info() to get their actual topic_out
-      2. Build a resolved_topics map: card_id → [topic_out entries]
-      3. When starting processor cards, look up source card's topic_out via connections
-      4. Fallback: use connection's persisted fromTopic if info() didn't return topic_out
+      1. Order the cards so every card starts after the cards feeding it
+         (order_cards_by_dependency)
+      2. Start each card, then call info() to get its actual topic_out, and
+         record it in resolved_topics: card_id → [topic_out entries]
+      3. A card's input_topic is read from its sources' resolved_topics, which
+         step 1 guarantees are already populated
+      4. Fallbacks, for a source that could not answer info(): the connection's
+         persisted fromTopic, then the source card's persisted topicOut
+      5. An inbound connection that resolves to no topic at all fails its card
+         rather than starting it deaf — see _resolve_input_topics
     """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
@@ -246,14 +299,16 @@ async def _do_start_project():
     if not cards:
         return
 
-    # 分类：sources (无入连接) 和 processors (有入连接)
-    cards_with_inbound = set()
-    for conn in connections:
-        cards_with_inbound.add(conn.get('toCardId'))
-
-    sources = [c for c in cards if c['id'] not in cards_with_inbound]
-    processors = [c for c in cards if c['id'] in cards_with_inbound]
-    all_ordered = sources + processors
+    ordered, cyclic = order_cards_by_dependency(cards, connections)
+    if cyclic:
+        # No order satisfies a cycle. Starting them last at least gives every
+        # acyclic card a resolved input; say which ones so a graph that quietly
+        # cannot resolve is not mistaken for the bug this ordering fixed.
+        print('[start-project] connection cycle involving '
+              f'{", ".join(c.get("toolName", "?") for c in cyclic)}'
+              ' — starting those last, input topics may not resolve')
+        ordered = ordered + cyclic
+    all_ordered = ordered
 
     # 广播启动开始
     await push_event({'type': 'project_start_begin', 'payload': {
@@ -358,38 +413,74 @@ async def _do_start_project():
             }})
             errors.append(tool_name)
 
-    def _resolve_input_topic(card_id: str) -> tuple[str, list]:
-        """Resolve input_topic(s) for a processor card from its inbound connections."""
-        in_conns = [c for c in connections if c.get('toCardId') == card_id]
-        topics = []
-        for conn in in_conns:
-            from_card_id = conn.get('fromCardId', '')
-            port_idx = int(conn.get('fromPortIdx', 0))
-            # Primary: use resolved topic_out from source card's info() response
-            if from_card_id in resolved_topics:
-                out_list = resolved_topics[from_card_id]
-                if port_idx < len(out_list) and out_list[port_idx].get('topic'):
-                    topics.append(out_list[port_idx]['topic'])
-                elif out_list and out_list[0].get('topic'):
-                    topics.append(out_list[0]['topic'])
-            # Fallback: use persisted fromTopic in connection data
-            elif conn.get('fromTopic'):
-                topics.append(conn['fromTopic'])
-            # Fallback 2: use source card's persisted topicOut
-            else:
-                from_card = next((c for c in cards if c.get('id') == from_card_id), None)
-                if from_card:
-                    card_topic_out = from_card.get('topicOut') or []
-                    if port_idx < len(card_topic_out) and card_topic_out[port_idx].get('topic'):
-                        topics.append(card_topic_out[port_idx]['topic'])
-                    elif card_topic_out and card_topic_out[0].get('topic'):
-                        topics.append(card_topic_out[0]['topic'])
-        topics = list(set(t for t in topics if t))
+    def _port_topic(out_list: list, port_idx: int) -> str:
+        """The topic a source publishes on `port_idx`, or its first one."""
+        if 0 <= port_idx < len(out_list) and out_list[port_idx].get('topic'):
+            return out_list[port_idx]['topic']
+        return (out_list[0].get('topic') or '') if out_list else ''
+
+    def _topic_of_connection(conn: dict) -> str:
+        """The topic carried by one connection, best answer first.
+
+        The three sources are tried in turn rather than chosen by which one
+        *exists*: the old code took the source card's presence in
+        resolved_topics as proof it had an answer, so a card that started and
+        reported topic_out without a topic on the wanted port consumed its turn
+        and blocked both fallbacks.
+        """
+        from_card_id = conn.get('fromCardId', '')
+        try:
+            port_idx = int(conn.get('fromPortIdx', 0) or 0)
+        except (TypeError, ValueError):
+            port_idx = 0
+        # Live info() answer from the source, which the start order guarantees
+        # has already run.
+        topic = _port_topic(resolved_topics.get(from_card_id) or [], port_idx)
+        # Persisted fallbacks, for a source that could not answer info(). Both
+        # are snapshots taken by the canvas page and can be stale or, for a
+        # derived topic never resolved in a browser, empty.
+        if not topic:
+            topic = conn.get('fromTopic') or ''
+        if not topic:
+            from_card = next((c for c in cards if c.get('id') == from_card_id), None)
+            topic = _port_topic((from_card or {}).get('topicOut') or [], port_idx)
+        return topic
+
+    def _resolve_input_topics(card_id: str) -> tuple[str, list, list]:
+        """Resolve input_topic(s) for a card from its inbound connections.
+
+        Returns `(input_topic, input_topics, unresolved)`. `unresolved` holds
+        the inbound connections that carry no topic — checked per connection,
+        not per card, because a card fed by several sources of which only some
+        resolve used to start with the rest silently missing. That is how
+        decision_core came up subscribed to `/remote_control/message` alone
+        while its ASR input was dropped, which looks from the outside like
+        multi-input never having worked.
+
+        Insertion order is kept: `list(set(...))` made the argument sent to the
+        driver differ between runs of an unchanged canvas.
+        """
+        topics, unresolved = [], []
+        for conn in [c for c in connections if c.get('toCardId') == card_id]:
+            topic = _topic_of_connection(conn)
+            if not topic:
+                unresolved.append(conn)
+            elif topic not in topics:
+                topics.append(topic)
         if len(topics) > 1:
-            return '', topics
+            return '', topics, unresolved
         elif len(topics) == 1:
-            return topics[0], []
-        return '', []
+            return topics[0], [], unresolved
+        return '', [], unresolved
+
+    def _unresolved_message(card: dict, unresolved: list) -> str:
+        """Name the upstream cards whose topic could not be found."""
+        names = []
+        for conn in unresolved:
+            src = next((c for c in cards if c.get('id') == conn.get('fromCardId')), None)
+            names.append((src or {}).get('toolName') or '?')
+        return (f'连线缺少 topic: {", ".join(names)} → '
+                f'{card.get("toolName", "?")}，请检查上游卡片是否能报出输出话题')
 
     # 先确保 channel adapters 已连接（被 Stop 过 / 上次启动失败的在此拉起）。
     # 必须在卡片启动之前：channel 卡片的自检要求 adapter 真的连通，
@@ -404,13 +495,25 @@ async def _do_start_project():
             except Exception as e:
                 print(f'[start-project] channel {ch_id} restart failed: {e}')
 
-    # Phase 1: start sources (no input_topic needed) and collect their topic_out
-    for card in sources:
-        await _start_and_resolve(card)
-
-    # Phase 2: start processors with resolved input_topic from sources
-    for card in processors:
-        input_topic, input_topics = _resolve_input_topic(card['id'])
+    # One pass in dependency order: a card's sources have already started and
+    # answered info(), so a card with no inbound connection resolves to no
+    # input_topic exactly as the old "sources first" phase gave it.
+    for card in all_ordered:
+        input_topic, input_topics, unresolved = _resolve_input_topics(card.get('id', ''))
+        if unresolved:
+            # Starting it anyway is what made this class of bug invisible: the
+            # card comes up subscribed to nothing and reports 已就绪. Fail it
+            # instead and let strict mode roll the project back, which is what
+            # the frontend did before this function took over the start.
+            message = _unresolved_message(card, unresolved)
+            tool_name = card.get('toolName', '')
+            print(f'[start-project] {tool_name}: {message}')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                'status': 'error', 'message': message,
+            }})
+            errors.append(tool_name)
+            continue
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
 
     # 有 card 失败 → 全部回滚，不标记 running
