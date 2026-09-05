@@ -772,7 +772,42 @@ async def list_tools(req: Request):
                    if not canvas_binding.is_peer_tool(s.get('name', ''))
                    and canvas_binding.is_bound(s.get('name', ''))]
     allowed = peer_tools.filter_schemas(peer_id, all_schemas)
-    return {'tools': allowed, 'count': len(allowed)}
+    return {'tools': allowed, 'count': len(allowed),
+            'acp_meta': _acp_meta_for(allowed)}
+
+
+def _acp_meta_for(schemas: list[dict]) -> dict:
+    """Per-tool ACP facts a caller needs, keyed by the tool's local name.
+
+    `tools` carries OpenAI function-calling schemas, whose `parameters` is not the
+    MCP `inputSchema` — so `x-completion` and `x-resource` are not in there, and the
+    bridge on the far side had no way to learn either. It filled `tool_meta` with
+    `{}`, which made every peer tool undeclared, and undeclared means "exclusive
+    against everything": calling one peer tool blocked all local actuation.
+
+    These two are safe to report where `type` was not (see mcp_bridge): the remote
+    is not guessing, it is repeating what its own driver declared.
+    """
+    out = {}
+    for schema in schemas:
+        name = schema.get('name', '')
+        if not name:
+            continue
+        mcp_id = name.split('__')[1] if name.startswith('mcp__') else ''
+        meta = (mcp_client.registry.get(mcp_id, {}).get('tool_meta', {}) or {}).get(name)
+        if not meta:
+            continue
+        resource = meta.get('resource')
+        entry = {}
+        if meta.get('completion'):
+            entry['completion'] = meta['completion']
+        if resource:
+            # frozenset is not JSON; sorted list keeps it stable across refreshes so
+            # a bridge diff does not churn.
+            entry['resource'] = sorted(resource)
+        if entry:
+            out[name] = entry
+    return out
 
 
 class ToolCallReq(BaseModel):

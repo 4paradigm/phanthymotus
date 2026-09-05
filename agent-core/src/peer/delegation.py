@@ -10,6 +10,7 @@ hop_count prevents infinite chains: A → B → C → D is capped at 2 hops.
 """
 
 import contextvars
+from uuid import uuid4
 from typing import Annotated
 
 from subagent.protocol import SubagentSpec, SubagentResult
@@ -28,6 +29,46 @@ _outbound_in_flight: dict[str, int] = {}
 def outbound_in_flight(peer_id: str) -> int:
     """How many of our delegations to `peer_id` are still awaiting a result."""
     return _outbound_in_flight.get(peer_id, 0)
+
+
+# Physical channel a delegation is assumed to occupy while it runs.
+#
+# The delegating agent's own loop is blocked inside the call, so it cannot speak
+# over the peer. Its *subagents* can, and they share the same room: two robots
+# talking at once is the collision this whole change exists to remove, and the local
+# barrier is the only thing positioned to prevent it.
+#
+# It is a policy default, not a measurement — the goal text is free-form, so what the
+# peer will actually do is unknowable at call time. The acoustic channel is chosen
+# because it is the one that collides audibly and the one the 相声 case exercised;
+# locomotion is deliberately left free, since two robots driving at once is not
+# inherently a conflict. Set to None to make a delegation exclusive against
+# everything local, which is safer and much more restrictive.
+DELEGATION_RESOURCE: frozenset | None = frozenset({'mouth'})
+
+
+def _hold_pending(hold_id: str, timeout: float) -> None:
+    """Register an ACP pending representing "a peer is doing something for us"."""
+    import asyncio
+    import mcp_client
+    mcp_client._pending_actions[hold_id] = asyncio.Event()
+    mcp_client._pending_tools[hold_id] = 'peer_delegate'
+    mcp_client._pending_timeouts[hold_id] = timeout
+    mcp_client._pending_resources[hold_id] = DELEGATION_RESOURCE
+
+
+def _release_pending(hold_id: str) -> None:
+    """Release the hold, waking anything waiting on the channel.
+
+    Sets the event before forgetting it: a local barrier may already be awaiting
+    this id, and dropping the tables from under it would leave that waiter hanging
+    until its own timeout instead of proceeding immediately.
+    """
+    import mcp_client
+    event = mcp_client._pending_actions.get(hold_id)
+    if event is not None:
+        event.set()
+    mcp_client._forget_pending([hold_id], 'completed')
 
 # How many peer hops the *currently executing* agent is already at.
 #
@@ -98,6 +139,12 @@ async def peer_delegate(
                 f'(limit {MAX_HOP_COUNT}). This task has been passed along too many times.')
 
     _outbound_in_flight[peer_id] = _outbound_in_flight.get(peer_id, 0) + 1
+    # Hold the shared channel for as long as the peer has the task, so a local
+    # subagent cannot start speaking into the same room. Registered directly rather
+    # than through call_tool because there is no MCP driver behind this — the
+    # "action" is a remote agent, and this process is the one that knows when it ends.
+    _hold_id = f'peer-delegate-{peer["peer_id"][:8]}-{uuid4().hex[:8]}'
+    _hold_pending(_hold_id, timeout_s + 10)
     try:
         result, err = await _transport.post_json(
             endpoints, '/api/peer/delegate',
@@ -106,6 +153,7 @@ async def peer_delegate(
             cancel_event=current_cancel_event.get(),
         )
     finally:
+        _release_pending(_hold_id)
         _remaining = _outbound_in_flight.get(peer_id, 1) - 1
         if _remaining > 0:
             _outbound_in_flight[peer_id] = _remaining

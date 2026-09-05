@@ -196,5 +196,107 @@ class TestReentrancyGuard(unittest.TestCase):
         self.assertIn('may', out)   # 对端可能仍在执行，不能断言它没做
 
 
+class TestDelegationHoldsTheChannel(unittest.TestCase):
+    """委派期间要占住共享通道。
+
+    委派方自己的循环卡在调用里，说不了话；但它的 **subagent** 能说，而且和对端在同一间
+    屋子里。两个机器人同时开口正是这次要消掉的碰撞，而本地 barrier 是唯一拦得住的地方。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        store.upsert('hold_peer', identity.public_key_b64(), 'HP', role='operator',
+                     endpoints=[ENDPOINT])
+
+    def setUp(self):
+        import mcp_client
+        self.mcp_client = mcp_client
+        for d in (mcp_client._pending_actions, mcp_client._pending_resources,
+                  mcp_client._pending_tools, mcp_client._pending_timeouts):
+            d.clear()
+
+    def tearDown(self):
+        delegation._outbound_in_flight.clear()
+
+    def _run(self, post):
+        with mock.patch('peer.transport.post_json', post), \
+             mock.patch('peer.registry.registry.endpoints_for', lambda p: [ENDPOINT]):
+            return asyncio.run(delegation.peer_delegate('hold_peer', 'say a line'))
+
+    def test_mouth_is_held_during_the_call(self):
+        seen = {}
+
+        async def _post(endpoints, path, payload, **kw):
+            seen['conflicts_mouth'] = self.mcp_client.conflicting_pending(
+                frozenset({'mouth'}))
+            seen['conflicts_base'] = self.mcp_client.conflicting_pending(
+                frozenset({'base'}))
+            return {'status': 'completed', 'output': 'ok',
+                    'actions': [], 'substantive_tool_calls': ['mcp__m__tts']}, ''
+
+        self._run(_post)
+        self.assertEqual(len(seen['conflicts_mouth']), 1,
+                         'a local subagent could have spoken over the peer')
+        self.assertEqual(seen['conflicts_base'], [],
+                         'driving is not in conflict with the peer speaking')
+
+    def test_hold_is_released_afterwards(self):
+        async def _post(endpoints, path, payload, **kw):
+            return {'status': 'completed', 'output': 'ok',
+                    'actions': [], 'substantive_tool_calls': ['x']}, ''
+        self._run(_post)
+        self.assertEqual(self.mcp_client.conflicting_pending(frozenset({'mouth'})), [])
+
+    def test_hold_is_released_when_the_link_dies(self):
+        """一次失败的委派不能把嘴永久锁住。"""
+        async def _post(endpoints, path, payload, **kw):
+            raise RuntimeError('link died')
+        with self.assertRaises(RuntimeError):
+            self._run(_post)
+        self.assertEqual(self.mcp_client.conflicting_pending(frozenset({'mouth'})), [])
+
+    def test_waiter_is_woken_not_left_to_time_out(self):
+        """释放时要先 set event 再清表，否则已在等的 barrier 会挂到自己超时。
+
+        整个流程必须在同一个事件循环里：waiter 是个 task，跨 asyncio.run 会被连带取消。
+        """
+        async def _scenario():
+            waiter_box = {}
+
+            async def _post(endpoints, path, payload, **kw):
+                self.assertEqual(len(self.mcp_client._pending_actions), 1)
+                # 一个已经在等这条 pending 的本地 barrier（比如 subagent 要说话）
+                waiter_box['t'] = asyncio.create_task(self.mcp_client.await_pending(
+                    want=frozenset({'mouth'}), scoped=True, timeout=30))
+                await asyncio.sleep(0)
+                self.assertFalse(waiter_box['t'].done(), 'barrier 应当在等')
+                return {'status': 'completed', 'output': 'ok',
+                        'actions': [], 'substantive_tool_calls': ['x']}, ''
+
+            with mock.patch('peer.transport.post_json', _post), \
+                 mock.patch('peer.registry.registry.endpoints_for',
+                            lambda p: [ENDPOINT]):
+                await delegation.peer_delegate('hold_peer', 'say a line')
+
+            # 委派返回后 event 已置位 —— barrier 应立刻收敛，而不是等自己的 130s
+            return await asyncio.wait_for(waiter_box['t'], timeout=2)
+
+        out = asyncio.run(_scenario())
+        self.assertEqual(out['status'], 'completed')
+
+    def test_hold_id_is_unique_per_call(self):
+        ids = []
+
+        async def _post(endpoints, path, payload, **kw):
+            ids.extend(self.mcp_client._pending_actions)
+            return {'status': 'completed', 'output': 'ok',
+                    'actions': [], 'substantive_tool_calls': ['x']}, ''
+
+        self._run(_post)
+        self._run(_post)
+        self.assertEqual(len(ids), 2)
+        self.assertNotEqual(ids[0], ids[1], '并发委派会互相清掉对方的 hold')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -119,6 +119,52 @@ class TestRefresh(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry['transport'], 'peer')
         self.assertTrue(entry['online'])
 
+    async def test_acp_meta_crosses_the_boundary(self):
+        """completion / resource 要跟着 tools/list 过来。
+
+        `tools` 是 OpenAI function-calling schema，它的 `parameters` 不是 MCP 的
+        `inputSchema`，所以 x-completion / x-resource 不在里面。以前 tool_meta 被填成
+        `{}`，于是每个 peer 工具都算"未声明"，而未声明 = 与一切互斥 —— 调一个 peer 工具
+        会挡住本机全部执行。
+        """
+        resp = {
+            'tools': [{'name': REMOTE_TOOL, 'description': 'tts',
+                       'parameters': {'type': 'object', 'properties': {}}}],
+            'acp_meta': {REMOTE_TOOL: {'completion': {'actions': ['speak'],
+                                                      'timeout': 60},
+                                       'resource': ['mouth']}},
+        }
+        await self._refresh(resp=resp)
+        entry = mcp_client.registry[mcp_bridge.mcp_id_for(PEER_ID)]
+        local = f'mcp__{mcp_bridge.mcp_id_for(PEER_ID)}__tts'
+        meta = entry['tool_meta'][local]
+        self.assertEqual(meta['resource'], frozenset({'mouth'}))
+        self.assertEqual(meta['completion']['actions'], ['speak'])
+        # 声明了资源之后，说话不该再挡住底盘
+        self.assertFalse(mcp_client.resources_conflict(
+            frozenset({'base'}), meta['resource']))
+
+    async def test_missing_acp_meta_stays_conservative(self):
+        """旧版 peer 不发这个字段 —— 必须退回"与一切互斥"，不能当成"不冲突"。"""
+        await self._refresh()   # 默认 fixture 不带 acp_meta
+        entry = mcp_client.registry[mcp_bridge.mcp_id_for(PEER_ID)]
+        local = f'mcp__{mcp_bridge.mcp_id_for(PEER_ID)}__tts'
+        self.assertIsNone(entry['tool_meta'][local]['resource'])
+        self.assertTrue(mcp_client.resources_conflict(
+            frozenset({'base'}), entry['tool_meta'][local]['resource']))
+
+    async def test_malformed_remote_resource_falls_back_to_conservative(self):
+        """对端可以发任意内容；打错的声明不能静默解锁并行执行。"""
+        resp = {
+            'tools': [{'name': REMOTE_TOOL, 'description': 'tts',
+                       'parameters': {'type': 'object', 'properties': {}}}],
+            'acp_meta': {REMOTE_TOOL: {'resource': {'mouth': True}}},
+        }
+        await self._refresh(resp=resp)
+        entry = mcp_client.registry[mcp_bridge.mcp_id_for(PEER_ID)]
+        local = f'mcp__{mcp_bridge.mcp_id_for(PEER_ID)}__tts'
+        self.assertIsNone(entry['tool_meta'][local]['resource'])
+
     async def test_description_says_which_robot(self):
         await self._refresh()
         entry = mcp_client.registry[mcp_bridge.mcp_id_for(PEER_ID)]

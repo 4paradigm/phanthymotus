@@ -56,6 +56,21 @@ def verify(token: str) -> bool:
     return bool(token) and token == _token
 
 
+_LOOPBACK_HOSTS = frozenset({'127.0.0.1', '::1', 'localhost', '::ffff:127.0.0.1'})
+
+
+def _from_loopback(request: Request) -> bool:
+    """Whether this request originated on this machine.
+
+    Driver and perception containers run with `network_mode: host` and post to
+    `https://localhost:15678` (see AGENT_CORE_URL), so the legitimate callers of the
+    driver-facing exemptions below are all loopback.
+    """
+    client = request.client
+    host = (client.host if client else '') or ''
+    return host in _LOOPBACK_HOSTS
+
+
 async def auth_middleware(request: Request, call_next):
     """FastAPI middleware: enforce token auth on /api/* and /ws/* paths."""
     if not _auth_enabled:
@@ -75,9 +90,25 @@ async def auth_middleware(request: Request, call_next):
     # MCP registration from driver containers
     if path == '/api/mcp' and request.method == 'POST':
         return await call_next(request)
-    # ACP completion callback from driver containers
+    # ACP completion callback from driver containers — loopback only.
+    #
+    # This was exempt with no origin check at all, on a server bound to 0.0.0.0.
+    # An action_id is the only thing needed to clear a barrier, and clearing one
+    # makes the agent proceed as though an action finished: anyone on the office LAN
+    # could tell a robot its speech had played, or that a navigation had arrived.
+    # A peer must use the signed /api/peer/inbox/acp_complete route instead, which
+    # verifies an Ed25519 signature and checks the action belongs to a call that
+    # peer actually made.
     if path == '/api/acp/complete' and request.method == 'POST':
-        return await call_next(request)
+        if _from_loopback(request):
+            return await call_next(request)
+        # Loud rather than silent: if some deployment really does run a driver off
+        # the host network, the symptom would otherwise be barriers timing out with
+        # no explanation, which is the exact failure mode this work exists to end.
+        _client = request.client
+        print(f'[auth] REJECTED /api/acp/complete from non-loopback '
+              f'{(_client.host if _client else "?")} — drivers must reach agent-core '
+              f'over localhost; peers must use /api/peer/inbox/acp_complete')
     # System hooks fire (internal/driver calls)
     if path == '/api/hooks/fire' and request.method == 'POST':
         return await call_next(request)
