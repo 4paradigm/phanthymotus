@@ -82,3 +82,42 @@ plugins:
       det_thresh: 0.1
       det_box_thresh: 0.1
     min_interval_ms: 0
+
+  obstacle:
+    enabled: true
+    provider: local
+    # Select the deployment domain explicitly; OBSTACLE_FIXED_SCENE overrides it.
+    scene_mode: fixed
+    fixed_scene: indoor
+    model_dir: /models/obstacle/zipdepth-int8
+    decision_threshold_m: 2.0
+    fallback_distance_m: 3.0
+    soft_timeout_s: 2.5
+    indoor:
+      roi: [0, 300, 213, 426]
+      roi_reference_size: [480, 640]
+      inverse_depth_percentile: 95.0
+      score_threshold: -0.06
+      # Convert the ZipDepth inverse-depth ROI statistic to a bounded distance.
+      inverse_depth_distance_scale: -27.0
+      inverse_depth_distance_bias_m: 3.7
+      classification_margin_m: 0.001
+      min_output_distance_m: 0.0
+      max_output_distance_m: 10.0
+      min_valid_pixels: 64
+    vehicle:
+      allowed_classes: [person, car, truck, bus, motorcycle, bicycle]
+      min_confidence: 0.25
+      percentile: 1.0
+      min_depth_m: 0.3
+      max_depth_m: 80.0
+      camera_to_bumper_offset_m: 1.0
+      allow_approximate_geometry: true
+      # Apply affine calibration after approximate bumper-offset geometry.
+      distance_calibration:
+        mode: affine
+        scale: 1.2
+        bias: -2.4
+        min_output_m: 0.0
+        max_output_m: 80.0
+      calibration: {}
