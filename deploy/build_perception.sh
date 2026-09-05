@@ -106,7 +106,7 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     fi
     if [[ ! "${SYNC_CONFIRM}" =~ ^[Nn] ]]; then
         echo "Registering image to resource-center (${RESOURCE_CENTER_URL})..."
-        # cards 与 plugins/{asr,tts,vop,ocr}.py 里各自的 TOOLS 声明手动保持一致（全部
+        # cards 与 plugins/{asr,tts,vop,ocr,soundevent}.py 里各自的 TOOLS 声明手动保持一致（全部
         # type: processor，且都常开，见 config.yaml 的 enabled 默认值）。新增插件时
         # 别忘了在这里补一行。
         HTTP_STATUS=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
@@ -126,7 +126,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                     {\"name\": \"asr\", \"type\": \"processor\"},
                     {\"name\": \"tts\", \"type\": \"processor\"},
                     {\"name\": \"vop\", \"type\": \"processor\"},
-                    {\"name\": \"ocr\", \"type\": \"processor\"}
+                    {\"name\": \"ocr\", \"type\": \"processor\"},
+                    {\"name\": \"soundevent\", \"type\": \"processor\"}
                 ]
             }")
 
