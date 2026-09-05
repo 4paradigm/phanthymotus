@@ -223,22 +223,33 @@ class TestDelegationHoldsTheChannel(unittest.TestCase):
              mock.patch('peer.registry.registry.endpoints_for', lambda p: [ENDPOINT]):
             return asyncio.run(delegation.peer_delegate('hold_peer', 'say a line'))
 
-    def test_mouth_is_held_during_the_call(self):
+    def test_the_hold_conflicts_with_every_channel(self):
+        """委派期间对**任何**本地通道都算冲突。
+
+        委派目标是自由文本，对端会动什么本机无从得知，所以只能按"与一切互斥"处理 ——
+        和未声明 `x-resource` 的 driver 工具同一条规则。
+
+        这条测试原来断言 `base` **不**冲突，因为当时 DELEGATION_RESOURCE 被硬编码成
+        `{'mouth'}`（理由是"说话才会听得出撞车"，而当时调的正好是个说话的场景）。那是把
+        场景拟合塞进了错误的层：通道名属于 driver，core 只负责比较，不该起名字。
+        """
         seen = {}
 
         async def _post(endpoints, path, payload, **kw):
-            seen['conflicts_mouth'] = self.mcp_client.conflicting_pending(
-                frozenset({'mouth'}))
-            seen['conflicts_base'] = self.mcp_client.conflicting_pending(
-                frozenset({'base'}))
+            for chan in ('mouth', 'base', 'arm_l', 'anything_at_all'):
+                seen[chan] = self.mcp_client.conflicting_pending(frozenset({chan}))
+            seen['undeclared'] = self.mcp_client.conflicting_pending(None)
             return {'status': 'completed', 'output': 'ok',
                     'actions': [], 'substantive_tool_calls': ['mcp__m__tts']}, ''
 
         self._run(_post)
-        self.assertEqual(len(seen['conflicts_mouth']), 1,
-                         'a local subagent could have spoken over the peer')
-        self.assertEqual(seen['conflicts_base'], [],
-                         'driving is not in conflict with the peer speaking')
+        for chan, hits in seen.items():
+            self.assertEqual(len(hits), 1,
+                             f'{chan}: 委派进行中，本地动作却没被挡住')
+
+    def test_the_hold_carries_no_channel_name(self):
+        """core 不该给物理通道起名字 —— 那是 driver 的事。"""
+        self.assertIsNone(delegation.DELEGATION_RESOURCE)
 
     def test_hold_is_released_afterwards(self):
         async def _post(endpoints, path, payload, **kw):

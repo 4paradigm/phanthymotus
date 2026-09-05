@@ -31,20 +31,23 @@ def outbound_in_flight(peer_id: str) -> int:
     return _outbound_in_flight.get(peer_id, 0)
 
 
-# Physical channel a delegation is assumed to occupy while it runs.
+# Physical channel a delegation occupies locally while it runs.
 #
-# The delegating agent's own loop is blocked inside the call, so it cannot speak
-# over the peer. Its *subagents* can, and they share the same room: two robots
-# talking at once is the collision this whole change exists to remove, and the local
-# barrier is the only thing positioned to prevent it.
+# `None`, meaning "assume it conflicts with everything", which is the same rule an
+# undeclared driver tool gets. The goal is free-form text, so what the peer will
+# actually do is genuinely unknowable at call time, and this module must not guess.
 #
-# It is a policy default, not a measurement — the goal text is free-form, so what the
-# peer will actually do is unknowable at call time. The acoustic channel is chosen
-# because it is the one that collides audibly and the one the 相声 case exercised;
-# locomotion is deliberately left free, since two robots driving at once is not
-# inherently a conflict. Set to None to make a delegation exclusive against
-# everything local, which is safer and much more restrictive.
-DELEGATION_RESOURCE: frozenset | None = frozenset({'mouth'})
+# An earlier version of this hardcoded `{'mouth'}` — picked because speech is what
+# collides audibly and because the routine being debugged happened to be a spoken
+# one. That was scenario-fitting in the wrong layer: agent-core has no business
+# naming a physical channel. Channel names belong to drivers (`x-resource`), which
+# describe hardware they actually own; the core only ever compares them.
+#
+# The cost is that a delegation blocks local actuation for its duration. The
+# delegating loop is blocked inside the call anyway, so this only constrains its
+# subagents, and constraining them is the conservative reading. Narrowing it needs
+# the *intent* from whoever called peer_delegate, not a default here.
+DELEGATION_RESOURCE: frozenset | None = None
 
 
 def _hold_pending(hold_id: str, timeout: float) -> None:

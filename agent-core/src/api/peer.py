@@ -916,7 +916,8 @@ async def call_tool(req: Request):
         action_id = _action_id_of(result)
         action_status = 'sync'
         if action_id:
-            sync_out = await mcp_client.sync([action_id], timeout=_ACTION_WAIT_S)
+            sync_out = await mcp_client.sync(
+                [action_id], timeout=_action_wait_budget(action_id))
             action_status = sync_out.get('status', 'unknown')
             if action_status != 'completed':
                 print(f'[peer] {who} action {action_id} ended {action_status!r} '
@@ -939,12 +940,26 @@ async def call_tool(req: Request):
 
 
 
-# How long a peer's tool call may hold this connection waiting for its action to
-# finish. Above the longest x-completion timeout a driver declares (g1 switch_mode
-# is 150s) so the driver's own limit is what expires first and we report *its*
-# verdict, rather than giving up early and leaving the caller unable to tell a slow
-# action from a lost one.
-_ACTION_WAIT_S = 180.0
+# Margin added to an action's *own* declared timeout when holding a peer's call open.
+#
+# The wait is derived per action from `x-completion.timeout` (which the driver set,
+# possibly scaled by text length) rather than from a global constant, so the driver's
+# limit is always what expires first and we report *its* verdict instead of giving up
+# early and leaving the caller unable to tell a slow action from a lost one.
+#
+# This used to be a flat 180s, justified as "above the longest timeout any driver
+# declares (g1 switch_mode is 150s)". That is a constant tuned to one robot's
+# firmware: correct until a driver declares 200s, and silently wrong after.
+_ACTION_WAIT_MARGIN_S = 15.0
+_ACTION_WAIT_FALLBACK_S = 120.0
+
+
+def _action_wait_budget(action_id: str) -> float:
+    """How long to wait for `action_id`, from its own declared timeout."""
+    declared = mcp_client._pending_timeouts.get(action_id)
+    if not isinstance(declared, (int, float)) or declared <= 0:
+        declared = _ACTION_WAIT_FALLBACK_S
+    return float(declared) + _ACTION_WAIT_MARGIN_S
 
 
 def _action_id_of(result) -> str:
