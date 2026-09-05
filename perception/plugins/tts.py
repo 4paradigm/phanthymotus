@@ -158,6 +158,10 @@ TOOLS = [
                 "actions": ["speak"],
                 "timeout": 60
             },
+            # The speaker is a single exclusive channel: two `speak` calls must
+            # serialise, but speaking while the base drives or an arm moves is fine
+            # and used to be blocked by the old global ACP barrier.
+            "x-resource": "mouth",
             "x-hooks": {
                 "on_interrupt_speak": {"action": "interrupt"},
             }

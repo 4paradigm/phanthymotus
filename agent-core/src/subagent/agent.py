@@ -518,6 +518,26 @@ class Subagent:
         # MCP tool call
         if name.startswith('mcp__'):
             try:
+                # ACP barrier, same judgement the main loop uses. Without it a
+                # subagent's `speak` returned at *enqueue* time, so the subagent
+                # reported "completed / 已排队播放" and `peer_delegate` returned
+                # before a single word had been played — which is why turn-taking
+                # between two robots never lined up.
+                #
+                # Scoped by physical resource, not global. This is load-bearing: a
+                # global barrier here would make one subagent's speech block every
+                # other subagent's every actuator call, on unrelated hardware,
+                # collapsing N concurrent agents into an effective 1. Concurrency
+                # only looked fine before because this path had no barrier at all.
+                #
+                # `self._cancel_event` so a cancelled subagent stops waiting rather
+                # than holding its slot for the full playback.
+                from event.llm import _acp_barrier, _needs_barrier
+                _bar_needed, _bar_want = _needs_barrier(name, args)
+                if _bar_needed:
+                    await _acp_barrier(f'subagent:{self.id}/{name}',
+                                       self._cancel_event,
+                                       want=_bar_want, scoped=True)
                 result = await mcp_client.call_tool(name, args)
                 if isinstance(result, dict):
                     return json.dumps(result, ensure_ascii=False)
