@@ -178,10 +178,55 @@ class TestPromptRendering(unittest.TestCase):
         """离线的不能省掉：agent 要能回答"有一台但联系不上"，而不是"没有"。"""
         out = self._snapshot([_peer('a' * 32, 'Live', time.time() - 2),
                               _peer('b' * 32, 'Dead', time.time() - 9999)])
-        self.assertIn('name="Live" role="operator" online="yes"', out)
+        self.assertIn('name="Live" we_allow_them="operator" online="yes"', out)
         self.assertIn('name="Dead"', out)
         self.assertIn('online="no"', out)
         self.assertIn('last_contact=', out)
+
+    def test_the_role_attribute_says_which_direction_it_constrains(self):
+        """裸 `role=` 会被读反。
+
+        实测：Tianyi 把 R1 设为 operator，R1 却宣称自己不能操作 Tianyi —— 因为 R1 那行
+        显示的是 `role="viewer"`（R1 授予 Tianyi 的角色），模型合理地把它当成了自己的权限。
+        操作者只好在 R1 上也设成 operator，而那对 R1 的出站访问毫无影响。
+        """
+        out = self._snapshot([_peer('a' * 32, 'Live', time.time() - 2)])
+        self.assertNotIn('role="', out, '裸 role= 没有方向，会被读成"我对它的权限"')
+        self.assertIn('we_allow_them="operator"', out)
+
+    def test_outbound_capability_is_shown_when_known(self):
+        """"我能对它做什么"必须来自对方实际开放的工具，而不是本机的授权记录。"""
+        from peer import mcp_bridge
+        saved = dict(mcp_bridge.offered)
+        mcp_bridge.offered.clear()
+        mcp_bridge.offered['a' * 32] = ['tts', 'loco']
+        try:
+            out = self._snapshot([_peer('a' * 32, 'Live', time.time() - 2)])
+        finally:
+            mcp_bridge.offered.clear()
+            mcp_bridge.offered.update(saved)
+        self.assertIn('they_allow_us="2 tool(s)"', out)
+
+    def test_never_refreshed_peer_shows_no_outbound_attribute(self):
+        """"还不知道"不能渲染成"没有" —— 那会让 agent 白白放弃一个可用的 peer。"""
+        from peer import mcp_bridge
+        saved = dict(mcp_bridge.offered)
+        mcp_bridge.offered.clear()
+        try:
+            out = self._snapshot([_peer('a' * 32, 'Live', time.time() - 2)])
+        finally:
+            mcp_bridge.offered.update(saved)
+        self.assertNotIn('they_allow_us=', out)
+
+    def test_hint_explains_the_two_directions(self):
+        """两个属性方向相反，hint 必须明说 —— 否则名字本身还是可能被读反。"""
+        out = self._snapshot([_peer('a' * 32, 'Live', time.time() - 2)])
+        # 从 <peers hint=" 之后再找结束的 ">，否则会先撞上 <status time="…"> 的那个
+        start = out.index('<peers hint="')
+        hint = out[start:out.index('">\n', start)]
+        self.assertIn('we_allow_them', hint)
+        self.assertIn('they_allow_us', hint)
+        self.assertIn('方向相反', hint)
 
     def test_no_peer_id_in_the_snapshot(self):
         """32 位十六进制是这一行里最贵的东西，而 peer_delegate 接受名字。"""
