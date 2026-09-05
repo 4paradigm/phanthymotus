@@ -44,6 +44,44 @@ def _get_config() -> dict:
     return {**defaults, **cfg}
 
 
+def notify_suppression_reason(spec, result, is_bg: bool) -> str | None:
+    """Why this subagent's completion should NOT wake the local main agent, or None.
+
+    A module-level predicate rather than inline conditions so it can be tested
+    without standing up the manager's history/DB bookkeeping.
+
+    Two cases, both "nobody here is waiting on an answer":
+
+    `bg` — a background monitor finishing normally. Long-standing behaviour.
+
+    `delegated` — an inbound peer delegation (hop_count > 0) finishing normally.
+    The work was the *peer's* request and its result already went back in the
+    /api/peer/delegate response; the local main agent never asked for it. Waking it
+    is not merely wasteful, it is harmful: the notification carries the subagent's
+    summary, the summary usually restates the line just spoken, and the main agent
+    says it again. Measured on Orin6, every round:
+
+        16:18:00.966  [subagent] tts("那你说得好的时候再来看。")
+        16:18:03.077  subagent_finish
+        16:18:05.736  [main]     tts("那你说得好的时候再来看。")   <- same line twice
+
+    All six straight-man lines were spoken twice. This used to be pure waste (the
+    woken turn emitted only `finish({})` — 12,760 prompt tokens for 4 output
+    tokens); once the tools actually worked, the waste became a behavioural defect.
+
+    Failures and timeouts always notify, for both cases: then the local operator
+    genuinely needs to know something was asked of this robot and did not happen.
+    """
+    if result is None or result.status != 'completed':
+        return None
+    if is_bg:
+        return 'bg'
+    if getattr(spec, 'hop_count', 0) > 0:
+        return (f'delegated task (hop={spec.hop_count}) done, result already returned '
+                f'to the requesting peer')
+    return None
+
+
 class SubagentManager:
     """Manages subagent lifecycle, scheduling, and communication."""
 
@@ -404,11 +442,16 @@ class SubagentManager:
             except Exception as e:
                 print(f'[subagent:{agent.id}] save conclusion to DB failed: {e}')
 
-        # BG subagent 正常完成 → 不触发 main agent
-        if is_bg and result.status == 'completed':
+        # 不需要本机决策的完成 → 只推前端，不唤醒 main agent
+        _skip = notify_suppression_reason(agent.spec, result, is_bg)
+        if _skip:
+            if _skip != 'bg':
+                print(f'[subagent:{agent.id}] not waking the local agent: {_skip}')
             await push_event({
                 'type': 'subagent_complete',
-                'payload': {'id': agent.id, 'status': 'completed', 'output': result.output[:100], 'rounds': result.rounds_used},
+                'payload': {'id': agent.id, 'status': result.status,
+                            'output': (result.output or '')[:100],
+                            'rounds': result.rounds_used},
             })
             return
 

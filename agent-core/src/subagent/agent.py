@@ -145,11 +145,32 @@ class Subagent:
         return tool_list
 
     def _get_all_mcp_schemas(self) -> list[dict]:
-        """Get all online MCP tool schemas (unfiltered by canvas binding for subagent)."""
-        # Subagents use all online tools from registry, filtered by spec
+        """Get all online MCP tool schemas (unfiltered by canvas binding for subagent).
+
+        A subagent working on a *peer's* behalf (hop_count > 0) does not get peer
+        tools. It was asked to do something **here**; reaching back out to another
+        robot's hardware is a trust inversion — the delegator's actuator moves
+        without the delegator's own agent deciding — and it produces nonsense.
+
+        Observed on Orin6: asked to be the straight man in a comedy routine, the
+        delegated subagent picked `mcp__peer:dd398c73177a__tts` — *Orin5's* mouth —
+        to deliver its line, so Orin5's speaker said "你好Orin5，我是Orin6". From the
+        room it sounds exactly like one robot repeating the other's words. Its own
+        `tts` and the peer's are two entries in the same flat list with near-identical
+        descriptions, so there was nothing to tell it apart by.
+
+        Chained delegation is unaffected: `peer_delegate` stays available (see
+        _get_desktop_tool_schemas) and carries the hop counter and role re-clipping,
+        so handing work onward still works — it just goes through the peer's own agent
+        instead of driving its hardware directly.
+        """
+        from peer import mcp_bridge
+        delegated = getattr(self.spec, 'hop_count', 0) > 0
         schemas = []
         for mcp_id, info in mcp_client.registry.items():
             if not info.get('online'):
+                continue
+            if delegated and mcp_bridge.is_peer_mcp(mcp_id):
                 continue
             for name, schema in info.get('schemas', {}).items():
                 schemas.append(schema)
