@@ -21,6 +21,8 @@ mcp_client.py — MCP HTTP transport 客户端。
 """
 
 import asyncio
+import collections
+import contextvars
 import json
 import time
 import uuid
@@ -39,6 +41,177 @@ _pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on 
 _pending_results: dict[str, dict] = {}            # action_id → completion payload
 _pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
 _pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
+_pending_resources: dict[str, frozenset | None] = {}  # action_id → 占用的物理通道
+_pending_owner: dict[str, str] = {}               # action_id → 发起它的 agent 上下文
+
+# ── 次序：谁发起的动作 ────────────────────────────────────────────────────────
+#
+# Resource exclusion answers "may these two run at once"; it cannot answer "must
+# this one finish first". Those are different questions and only the second one
+# knows about intent.
+#
+# "先说'我要起来了'再起身" is an *ordering* requirement. mouth and leg are different
+# channels, so exclusion permits the overlap — and before the barrier was scoped by
+# resource, the global barrier forbade it by accident. Neither is a real answer: the
+# same pair of tools must overlap when it is a gesture accompanying speech and must
+# not when it is a warning preceding motion. The tools are identical; only the intent
+# differs, and the intent lives in whoever emitted the calls.
+#
+# So ordering is enforced *within one agent's own sequence of calls* — the LLM emitted
+# them in an order and that order is the script — and NOT across independent agents,
+# which share no intent and whose unrelated actions must not block each other.
+# `PARALLEL_PARAM` lets the emitter opt a single call out of its own ordering.
+CONTEXT_MAIN = 'main'
+current_agent_context: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    'acp_current_agent_context', default=CONTEXT_MAIN
+)
+
+# Parameter the harness injects into every acting tool's schema. Not declared by
+# drivers: it is a property of *this call*, not of the hardware, so asking 14 drivers
+# to carry it would be putting caller intent in the wrong layer. Stripped before the
+# call leaves for the device.
+#
+# Default false, deliberately. A model does not reason about concurrency unless made
+# to; left to itself it writes calls as if they were sequential, because that is how
+# the text reads. So sequential is what it gets unless it says otherwise, and the
+# unsafe direction — a warning overlapping the motion it warns about — is the one that
+# requires an explicit request.
+PARALLEL_PARAM = 'concurrent'
+
+# ── ACP: 物理资源互斥 ─────────────────────────────────────────────────────────
+#
+# The barrier used to be global: any pending action blocked any acting tool. That
+# conflates two unrelated things — "I need X's result before Y" (causality) and "X
+# and Y both need the mouth" (exclusion) — and implements neither, arriving instead
+# at "everyone waits for everyone". Speaking blocked navigating; one subagent
+# speaking blocked every other subagent's every actuator call, on unrelated
+# hardware. With subagents newly honouring the barrier at all, that would have
+# collapsed N concurrent agents into an effective 1.
+#
+# What is genuinely mutually exclusive on a robot is a *physical channel* — one
+# mouth, one chassis, one left arm — not "all actuators". Drivers declare theirs as
+# `x-resource` next to `x-completion`; robotera/q5_bundle already splits base, arm,
+# leg and waist into separate tools, which the global barrier serialised for no
+# reason.
+#
+# Undeclared (`None`) means exclusive against everything. That is the conservative
+# reading and it is deliberate: every driver that has not declared keeps exactly its
+# old behaviour, so this can land without touching all fourteen of them at once.
+
+
+def parse_resources(raw) -> frozenset | None:
+    """Normalise a tool's `x-resource` into a set of channel names.
+
+    Accepts a bare string (`"mouth"`) or a list (`["base", "arm_l"]`). Returns None
+    for anything undeclared, empty or malformed — all of which mean "assume this
+    conflicts with everything" rather than "conflicts with nothing", because a
+    typo in a driver schema must not silently unlock parallel actuation.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        names = [raw]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        names = list(raw)
+    else:
+        return None
+    clean = {n.strip() for n in names if isinstance(n, str) and n.strip()}
+    return frozenset(clean) or None
+
+
+def resources_conflict(want: frozenset | None, held: frozenset | None) -> bool:
+    """Whether a call wanting `want` must wait for a pending action holding `held`."""
+    if want is None or held is None:
+        return True          # 任一侧未声明 → 保守当作互斥
+    return bool(want & held)
+
+
+def conflicting_pending(want: frozenset | None) -> list[str]:
+    """Pending action_ids whose resources clash with `want`, in registration order."""
+    return [
+        aid for aid in _pending_actions
+        if resources_conflict(want, _pending_resources.get(aid))
+    ]
+
+
+def pendings_to_wait_for(want: frozenset | None, *, owner: str,
+                         concurrent: bool) -> list[str]:
+    """Everything a call must wait for, in registration order.
+
+    Two independent reasons to wait, and they answer different questions:
+
+    * **resource conflict** — the hardware cannot do both. Always enforced; a caller
+      cannot opt out, because `concurrent=True` is a statement about intent, not a
+      claim that one chassis can drive two ways at once.
+    * **own ordering** — this agent already started something and has not asked for
+      overlap, so the order it emitted its calls in is honoured. Skipped for actions
+      started by a *different* context: independent agents share no script, and
+      making them wait on each other is what collapsed N subagents into one.
+    """
+    out = []
+    for aid in _pending_actions:
+        if resources_conflict(want, _pending_resources.get(aid)):
+            out.append(aid)
+        elif not concurrent and _pending_owner.get(aid, CONTEXT_MAIN) == owner:
+            out.append(aid)
+    return out
+
+
+def take_parallel_flag(args: dict) -> bool:
+    """Pop `concurrent` out of a call's arguments and return it.
+
+    Popped, not read: the parameter is injected by the harness and means nothing to
+    the device, so forwarding it would show up as an unexpected field in a driver's
+    schema validation.
+    """
+    if not isinstance(args, dict):
+        return False
+    return bool(args.pop(PARALLEL_PARAM, False))
+
+
+def _forget_pending(aids, outcome: str | None = None) -> None:
+    """Drop every per-action side table for `aids`, recording how each ended.
+
+    One helper rather than the same four pops repeated at each exit: the pending
+    bookkeeping is spread over five dicts now, and a cleanup path that forgets one
+    of them leaks it for the lifetime of the process.
+
+    `outcome` ('completed' | 'timeout' | 'cancelled' | 'barge_in') is remembered in
+    `_action_outcomes` after the pending itself is gone. Without that the two
+    outcomes are indistinguishable a moment later: the timeout path clears pending
+    and lets the caller proceed exactly as success does, so an action whose
+    completion callback never arrived looks, downstream, like one that played. That
+    is what lets a delegation report a line as spoken when nothing was heard.
+    """
+    for aid in aids:
+        if outcome:
+            _record_outcome(aid, outcome)
+        _pending_actions.pop(aid, None)
+        _pending_results.pop(aid, None)
+        _pending_timeouts.pop(aid, None)
+        _pending_tools.pop(aid, None)
+        _pending_resources.pop(aid, None)
+        _pending_owner.pop(aid, None)
+
+
+# Terminal state of recently finished actions, so a caller can still ask "did that
+# actually play?" after the pending is gone. Bounded — this is a diagnostic tail,
+# not a ledger, and an agent that never asks must not grow it without limit.
+_ACTION_OUTCOME_CAP = 512
+_action_outcomes: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+
+
+def _record_outcome(action_id: str, status: str) -> None:
+    entry = {'status': status, 'tool': _pending_tools.get(action_id, '')}
+    _action_outcomes.pop(action_id, None)
+    _action_outcomes[action_id] = entry
+    while len(_action_outcomes) > _ACTION_OUTCOME_CAP:
+        _action_outcomes.popitem(last=False)
+
+
+def action_outcome(action_id: str) -> dict | None:
+    """Terminal state of a finished action, or None if still pending / evicted."""
+    return _action_outcomes.get(action_id)
 
 
 # ── 内部 JSON-RPC 助手 ─────────────────────────────────────────────────────────
@@ -152,6 +325,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
                         'action_enum': action_enum,
                         'has_config_schema': bool(tool.get('configSchema')),
                         'completion': raw_input_schema.get('x-completion'),
+                        'resource': parse_resources(raw_input_schema.get('x-resource')),
                     }
                 else:
                     # 拆分：多个 sub-schemas
@@ -165,6 +339,8 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
                             'action_enum': None,
                             'has_config_schema': bool(tool.get('configSchema')),
                             'completion': (tool.get('inputSchema') or {}).get('x-completion'),
+                            'resource': parse_resources(
+                                (tool.get('inputSchema') or {}).get('x-resource')),
                         }
                         # 解析 action name（最后一段 __）
                         action_name = schema['name'].split('__')[-1]
@@ -519,6 +695,8 @@ async def call_tool(full_name: str, args: dict) -> str:
                 _pending_actions[action_id] = asyncio.Event()
                 # 记录该 pending 属于哪个工具（用于 barrier 资源冲突判断）
                 _pending_tools[action_id] = tool_name
+                _pending_resources[action_id] = meta.get('resource')
+                _pending_owner[action_id] = current_agent_context.get()
                 # 动态 timeout：有 text 参数时按字数算（合成+播放: 字数/3 + 10s余量），否则用 schema 默认值
                 text_arg = args.get('text', '')
                 default_timeout = completion_spec.get('timeout', 120)
@@ -527,7 +705,10 @@ async def call_tool(full_name: str, args: dict) -> str:
                 else:
                     dynamic_timeout = default_timeout
                 _pending_timeouts[action_id] = dynamic_timeout
-                print(f'[acp] registered pending: {action_id} (tool={tool_name}, timeout={dynamic_timeout:.0f}s)')
+                _res = _pending_resources.get(action_id)
+                _res_txt = ','.join(sorted(_res)) if _res else 'undeclared/exclusive'
+                print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
+                      f'timeout={dynamic_timeout:.0f}s, resource={_res_txt})')
         except (json.JSONDecodeError, IndexError):
             pass
 
@@ -561,8 +742,42 @@ def all_schemas() -> list[dict]:
                         'action': {**schema['parameters']['properties']['action'], 'enum': user_actions}
                     }
                 }}
-            schemas.append(schema)
+            schemas.append(with_parallel_param(schema, meta.get('type')))
     return schemas
+
+
+_PARALLEL_PARAM_DESC = (
+    '默认 false：这次调用会等你自己此前发起的动作先完成，也就是按你写出的先后顺序执行。'
+    '只有当这个动作**本来就该和上一个同时发生**时才设 true（例如讲解时配合的手势）。'
+    '安全播报之类"必须先说完再动"的场景不要设 true。'
+    '注意：占用同一个物理通道的动作永远串行，设 true 也不会并行。'
+)
+
+
+def with_parallel_param(schema: dict, tool_type: str | None) -> dict:
+    """Add the `concurrent` parameter to an acting tool's schema.
+
+    Injected by the harness rather than declared by drivers: whether a call should
+    overlap the previous one is a property of the *intent behind this call*, not of
+    the hardware. Asking every driver to carry it would put caller intent in the
+    device layer, and the flag would then be absent from any driver that forgot.
+
+    Only acting tools get it. `sensor`/`resource` tools are never barriered, so the
+    parameter would be noise in their schema and an invitation to set it meaninglessly.
+    """
+    if tool_type in ('sensor', 'resource'):
+        return schema
+    params = schema.get('parameters') or {}
+    props = params.get('properties') or {}
+    if PARALLEL_PARAM in props:
+        return schema                      # driver declared its own; do not shadow it
+    return {**schema, 'parameters': {
+        **params,
+        'properties': {**props, PARALLEL_PARAM: {
+            'type': 'boolean',
+            'description': _PARALLEL_PARAM_DESC,
+        }},
+    }}
 
 
 async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
@@ -624,9 +839,28 @@ async def cancel_and_reap(tasks) -> None:
 
 
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
-                        tool_name: str | None = None) -> dict:
-    """等待 pending actions 完成。全局 barrier：等所有 pending。"""
-    aids = list(_pending_actions.keys())
+                        tool_name: str | None = None,
+                        want: frozenset | None = None,
+                        scoped: bool = False,
+                        concurrent: bool = False,
+                        owner: str | None = None) -> dict:
+    """等待与 `want` 冲突的 pending actions 完成。
+
+    `scoped=False`（默认）保持全局语义：等所有 pending。`finish` 走这条 —— 结束 turn
+    前不该有任何动作还在飞，跟资源无关。
+
+    `scoped=True` 时只等资源冲突的那些（见 `resources_conflict`），且 `effective_timeout`
+    只对冲突项取 max —— 原来对全部 pending 取 max，一个长动作会把不相干的调用一起拖住。
+    清理也只清等到的那几个，不再连带把别人的 pending 抹掉。
+
+    `tool_name` 仅用于日志归因。
+    """
+    if scoped:
+        aids = pendings_to_wait_for(
+            want, owner=owner if owner is not None else current_agent_context.get(),
+            concurrent=concurrent)
+    else:
+        aids = list(_pending_actions.keys())
     if not aids:
         return {"status": "no_pending"}
 
@@ -634,9 +868,17 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
     if not events:
         return {"status": "no_pending"}
 
-    # 取所有 pending action 中最大的 timeout
+    # 只对实际要等的 action 取最大 timeout
     effective_timeout = max(_pending_timeouts.get(aid, timeout) for aid in aids)
-    print(f'[acp] barrier: waiting for {aids} (timeout={effective_timeout:.0f}s)')
+    _scope_txt = ''
+    if scoped:
+        _want_txt = ','.join(sorted(want)) if want else 'undeclared/exclusive'
+        _held = len(_pending_actions)
+        _mode = 'concurrent' if concurrent else 'sequential'
+        _scope_txt = (f' want={_want_txt}, {_mode}, '
+                      f'{len(aids)}/{_held} pending to wait for;')
+    print(f'[acp] barrier: waiting for {aids}'
+          f'{_scope_txt} (timeout={effective_timeout:.0f}s)')
 
     async def _wait_all():
         await asyncio.gather(*[ev.wait() for ev in events])
@@ -660,12 +902,8 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                 # "Task was destroyed but it is pending!" pair in the R1 logs.
                 await cancel_and_reap([wait_task, cancel_task])
             if cancel_task in done:
-                # 用户打断：清理所有 pending
-                for aid in aids:
-                    _pending_actions.pop(aid, None)
-                    _pending_results.pop(aid, None)
-                    _pending_timeouts.pop(aid, None)
-                    _pending_tools.pop(aid, None)
+                # 用户打断：只清本次等待的那些，不连带抹掉不相干的 pending
+                _forget_pending(aids, 'cancelled')
                 return {"status": "cancelled"}
             if wait_task not in done:
                 # Unlike wait_for, asyncio.wait() does not raise on timeout — it
@@ -685,19 +923,11 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
             await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
 
         # 清理已完成的
-        for aid in aids:
-            _pending_actions.pop(aid, None)
-            _pending_results.pop(aid, None)
-            _pending_timeouts.pop(aid, None)
-            _pending_tools.pop(aid, None)
+        _forget_pending(aids, 'completed')
         print(f'[acp] barrier cleared: {aids}')
         return {"status": "completed", "actions": aids}
     except asyncio.TimeoutError:
-        for aid in aids:
-            _pending_actions.pop(aid, None)
-            _pending_results.pop(aid, None)
-            _pending_timeouts.pop(aid, None)
-            _pending_tools.pop(aid, None)
+        _forget_pending(aids, 'timeout')
         print(f'[acp] barrier timeout: {aids}')
         return {"status": "timeout", "actions": aids}
 
@@ -737,18 +967,19 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
 
     try:
         await asyncio.wait_for(_wait_with_cancel(), timeout=timeout)
-        # 收集结果并清理
+        # 收集结果并清理。先取走 payload，再统一清副表 —— 这里原来只 pop 了
+        # _pending_results 和 _pending_actions，把 _pending_timeouts / _pending_tools
+        # 永久留在进程里；Phase 3 的 peer 回调正是走这条路，每次委派都会漏一份。
         results = {}
         for aid, _ in events:
             results[aid] = _pending_results.pop(aid, {"status": "completed"})
-            _pending_actions.pop(aid, None)
+        _forget_pending((aid for aid, _ in events), 'completed')
         return {"status": "completed", "results": results}
     except asyncio.TimeoutError:
         completed = {aid: _pending_results.pop(aid, {}) for aid, ev in events if ev.is_set()}
         still_pending = [aid for aid, ev in events if not ev.is_set()]
-        # 清理已完成的
-        for aid in completed:
-            _pending_actions.pop(aid, None)
+        # 只清理已完成的；还在飞的留着，它们的 barrier 语义没变
+        _forget_pending(completed, 'completed')
         return {"status": "timeout", "completed": completed, "pending": still_pending}
     except asyncio.CancelledError:
         return {"status": "cancelled", "pending": [aid for aid, _ in events]}
@@ -760,7 +991,15 @@ def get_pending_actions() -> list[str]:
 
 
 def get_pending_for_tool(tool_name: str) -> list[str]:
-    """返回指定工具的 pending action_ids（barrier 资源冲突用）。"""
+    """返回指定工具的 pending action_ids。
+
+    资源冲突判定现在用 `conflicting_pending(want)` —— 按物理通道，而不是按工具名。
+    工具名太粗也太细：两个 driver 的 `tts` 是两个名字但可能是同一间屋子的同一个声学
+    空间，而一个 `arm` 工具可能同时代表 arm_l 和 arm_r 两个独立通道。
+
+    留着这个函数只为按工具归因（日志/诊断）；它在此之前是零调用者，连同
+    `await_pending(tool_name=...)` 一起构成了一套搭好却从未接上的资源冲突骨架。
+    """
     return [aid for aid, tn in _pending_tools.items() if tn == tool_name and aid in _pending_actions]
 
 
@@ -778,6 +1017,15 @@ async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
     if not entry.get('online'):
         return {"error": f"device {mcp_id} offline"}
     url = entry['url']
+    if not url:
+        # A peer's synthetic entry (peer/mcp_bridge.py) carries no url — its tools
+        # reach the remote over the signed /api/peer/tools/call path, not by POSTing
+        # here. Falling through posted to the empty string, and aiohttp's failure
+        # for that surfaced as `call_tool_direct failed: ` with nothing after the
+        # colon, which is what the Orin5/Orin6 logs showed. Say what is wrong.
+        return {"error": f"device {mcp_id} has no url — not directly callable "
+                         f"(transport={entry.get('transport', '?')!r}); use the "
+                         f"transport's own call path"}
     payload = {
         "jsonrpc": "2.0",
         "id": int(time.time() * 1000) % 1_000_000,
@@ -810,6 +1058,4 @@ def cleanup_stale_actions(max_age_s: float = 300):
     # 简单实现：如果 action 超过 max_age 仍未完成，移除
     # 实际超时由 sync() 的 timeout 参数处理，这里作为安全网
     stale = [aid for aid, ev in _pending_actions.items() if ev.is_set()]
-    for aid in stale:
-        _pending_actions.pop(aid, None)
-        _pending_results.pop(aid, None)
+    _forget_pending(stale)

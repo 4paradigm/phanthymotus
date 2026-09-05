@@ -772,7 +772,42 @@ async def list_tools(req: Request):
                    if not canvas_binding.is_peer_tool(s.get('name', ''))
                    and canvas_binding.is_bound(s.get('name', ''))]
     allowed = peer_tools.filter_schemas(peer_id, all_schemas)
-    return {'tools': allowed, 'count': len(allowed)}
+    return {'tools': allowed, 'count': len(allowed),
+            'acp_meta': _acp_meta_for(allowed)}
+
+
+def _acp_meta_for(schemas: list[dict]) -> dict:
+    """Per-tool ACP facts a caller needs, keyed by the tool's local name.
+
+    `tools` carries OpenAI function-calling schemas, whose `parameters` is not the
+    MCP `inputSchema` — so `x-completion` and `x-resource` are not in there, and the
+    bridge on the far side had no way to learn either. It filled `tool_meta` with
+    `{}`, which made every peer tool undeclared, and undeclared means "exclusive
+    against everything": calling one peer tool blocked all local actuation.
+
+    These two are safe to report where `type` was not (see mcp_bridge): the remote
+    is not guessing, it is repeating what its own driver declared.
+    """
+    out = {}
+    for schema in schemas:
+        name = schema.get('name', '')
+        if not name:
+            continue
+        mcp_id = name.split('__')[1] if name.startswith('mcp__') else ''
+        meta = (mcp_client.registry.get(mcp_id, {}).get('tool_meta', {}) or {}).get(name)
+        if not meta:
+            continue
+        resource = meta.get('resource')
+        entry = {}
+        if meta.get('completion'):
+            entry['completion'] = meta['completion']
+        if resource:
+            # frozenset is not JSON; sorted list keeps it stable across refreshes so
+            # a bridge diff does not churn.
+            entry['resource'] = sorted(resource)
+        if entry:
+            out[name] = entry
+    return out
 
 
 class ToolCallReq(BaseModel):
@@ -866,12 +901,36 @@ async def call_tool(req: Request):
     try:
         result = await mcp_client.call_tool(tool_name, arguments)
         store.touch(peer_id, _source_endpoint(req))
+
+        # ACP does not stop at the machine boundary.
+        #
+        # An async action returns as soon as the driver has *queued* it, so replying
+        # here handed the caller "done" while nothing had happened yet. Locally the
+        # barrier hides that; across a peer there was no barrier at all, which is why
+        # one robot told another to speak and then immediately spoke over it.
+        #
+        # So hold the response until this action actually finishes, and report the
+        # terminal state rather than the acknowledgement. The connection stays open
+        # for the action's duration — the same shape /delegate already has, and
+        # transport.post_json is cancellable now, so the caller can still abandon it.
+        action_id = _action_id_of(result)
+        action_status = 'sync'
+        if action_id:
+            sync_out = await mcp_client.sync(
+                [action_id], timeout=_action_wait_budget(action_id))
+            action_status = sync_out.get('status', 'unknown')
+            if action_status != 'completed':
+                print(f'[peer] {who} action {action_id} ended {action_status!r} '
+                      f'(tool={tool_name})')
+
         await _emit('peer_tool_result', {
             'ok': True,
             'elapsed_ms': round((time.time() - started) * 1000),
-            'action_id': _action_id_of(result),
+            'action_id': action_id,
+            'action_status': action_status,
         })
-        return {'result': result, 'error': None}
+        return {'result': result, 'error': None,
+                'action_id': action_id, 'action_status': action_status}
     except Exception as e:
         await _emit('peer_tool_result', {
             'ok': False, 'error': str(e),
@@ -879,6 +938,28 @@ async def call_tool(req: Request):
         })
         return {'result': None, 'error': str(e)}
 
+
+
+# Margin added to an action's *own* declared timeout when holding a peer's call open.
+#
+# The wait is derived per action from `x-completion.timeout` (which the driver set,
+# possibly scaled by text length) rather than from a global constant, so the driver's
+# limit is always what expires first and we report *its* verdict instead of giving up
+# early and leaving the caller unable to tell a slow action from a lost one.
+#
+# This used to be a flat 180s, justified as "above the longest timeout any driver
+# declares (g1 switch_mode is 150s)". That is a constant tuned to one robot's
+# firmware: correct until a driver declares 200s, and silently wrong after.
+_ACTION_WAIT_MARGIN_S = 15.0
+_ACTION_WAIT_FALLBACK_S = 120.0
+
+
+def _action_wait_budget(action_id: str) -> float:
+    """How long to wait for `action_id`, from its own declared timeout."""
+    declared = mcp_client._pending_timeouts.get(action_id)
+    if not isinstance(declared, (int, float)) or declared <= 0:
+        declared = _ACTION_WAIT_FALLBACK_S
+    return float(declared) + _ACTION_WAIT_MARGIN_S
 
 
 def _action_id_of(result) -> str:

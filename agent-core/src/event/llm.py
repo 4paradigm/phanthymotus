@@ -216,7 +216,38 @@ _STEERING_POLL_S = 0.1
 # finish 结束 turn 前必须等 pending 动作完成，否则 speak → finish 会在音频播完前
 # 结束本轮 —— 讲解被截断。其余系统工具不挡：task_update 等应能在播放期间调用，
 # 否则每站都要多等一整段音频。
-_ACP_BARRIER_SYSTEM_TOOLS = frozenset({'finish'})
+#
+# 让**别人**去动手的系统工具同样必须挡，理由和 finish 一样但更隐蔽：交出去之后，对方第
+# 一件事往往就是占用同一个物理资源。这些工具不是 `mcp__` 前缀，所以 `_needs_barrier` 在
+# 第一行就返回 False —— 只有出现在这个集合里才会被拦。
+#
+# Orin5 实测，五轮相声每轮同一个形状：
+#
+#   16:00:20.863  registered pending: speak-406f7423   ← 自己开始说（实播 14.1s）
+#   16:00:23.579  peer_call(让 Orin6 说)               ← 2.7s 后就叫对端开口
+#   16:00:31.186  barrier: waiting ['speak-406f7423']   ← 直到自己下一句才拦
+#
+# 间隔 2.7 / 1.7 / 2.9 / 2.5 / 2.6 秒，自己那句要播 5–14 秒：两张嘴每轮都重叠。
+# 它对自己的嘴一直是守 barrier 的，只是从没把"让别人说"算成一次输出。
+#
+# 这里**穷举**而不是按名字猜：上一版只加了 peer_delegate 和 subagent_spawn，漏掉的
+# peer_call 恰好就是这次实测用的那扇门。`test_handoff_tools_are_partitioned` 会强制新增的
+# peer_* / subagent_* 工具二选一落到这里或下面的只读集合，免得再漏第三扇。
+_HANDOFF_SYSTEM_TOOLS = frozenset({
+    'peer_call',            # 直接调对端的工具 —— 对端立刻执行
+    'peer_delegate',        # 对端起 subagent 干活
+    'subagent_spawn',       # 本机起 subagent
+    'subagent_spawn_sync',
+    'subagent_message',     # 可能唤醒一个在等指令的 subagent 去动手
+})
+
+# 只读 / 纯管理，不会让任何人开始动作 —— 不挡，否则每次查状态都要等一整段音频。
+_READ_ONLY_HANDOFF_TOOLS = frozenset({
+    'peer_list', 'peer_state', 'peer_tools',
+    'subagent_status', 'subagent_result', 'subagent_cancel',
+})
+
+_ACP_BARRIER_SYSTEM_TOOLS = frozenset({'finish'}) | _HANDOFF_SYSTEM_TOOLS
 
 
 def _sys_tool_needs_barrier(name: str) -> bool:
@@ -224,8 +255,15 @@ def _sys_tool_needs_barrier(name: str) -> bool:
 
 
 async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
-                       interrupt_fallback=None) -> dict | None:
+                       interrupt_fallback=None,
+                       want: frozenset | None = None,
+                       scoped: bool = False,
+                       concurrent: bool = False) -> dict | None:
     """有 pending ACP 动作时等待其完成，并记录非正常结果。无 pending 则直接返回。
+
+    `scoped=True` 时只等与 `want`（本次调用要占用的物理资源）冲突的 pending；
+    `scoped=False` 等全部。系统工具走全局：`finish` 结束 turn 前不该有任何动作在飞，
+    `peer_delegate` / `subagent_spawn` 把活交给另一个执行者、无法预知对方会碰什么。
 
     `barge_in=True` 时，等待还会被新的用户消息唤醒。这条路只给 finish 用，因为
     只有 finish 的 barrier 会横跨整段播放：`cancel_event` 仅在 interrupt /
@@ -243,11 +281,15 @@ async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
         return None
 
     if not barge_in:
-        result = await mcp_client.await_pending(cancel_event, timeout=120)
+        result = await mcp_client.await_pending(cancel_event, timeout=120,
+                                               want=want, scoped=scoped,
+                                               concurrent=concurrent)
         _acp_barrier_log(name, result)
         return result
 
-    barrier = asyncio.create_task(mcp_client.await_pending(cancel_event, timeout=120))
+    barrier = asyncio.create_task(mcp_client.await_pending(cancel_event, timeout=120,
+                                                          want=want, scoped=scoped,
+                                                          concurrent=concurrent))
     steering = asyncio.create_task(_wait_for_steering())
     try:
         done, _ = await asyncio.wait(
@@ -283,11 +325,7 @@ async def _abort_pending_for_barge_in(interrupt_fallback=None) -> dict:
     fired = await hooks.fire('on_interrupt_all')
     if not fired and interrupt_fallback is not None:
         await interrupt_fallback()
-    for aid in actions:
-        mcp_client._pending_actions.pop(aid, None)
-        mcp_client._pending_results.pop(aid, None)
-        mcp_client._pending_timeouts.pop(aid, None)
-        mcp_client._pending_tools.pop(aid, None)
+    mcp_client._forget_pending(actions, 'barge_in')
     return {"status": "barge_in", "actions": actions}
 
 
@@ -339,6 +377,81 @@ def _viewer_channel_restricted(trigger_event: dict) -> bool:
 
 def _channel_tool_restricted(trigger_event: dict) -> bool:
     return _bot_channel_restricted(trigger_event) or _viewer_channel_restricted(trigger_event)
+
+
+def _needs_barrier(name: str, call_args: dict = None) -> tuple[bool, frozenset | None]:
+    """这个 MCP 工具调用要不要 barrier，以及它想占用哪些物理资源。
+
+    返回 `(needs, want)`。`needs=False` 时 `want` 无意义。`want=None` 表示工具没声明
+    `x-resource` —— 按保守解读当作与一切互斥，等于旧的全局行为。
+
+    actuator/processor 类型才挡；sensor/resource 放行。例外：在 on_interrupt_* hook
+    中注册的 tool+action 免 barrier（打断本身不能被 barrier 挡住）。
+
+    模块级函数，因为主循环和 subagent 都要用同一套判定 —— 它原来是 `_dispatch` 里的
+    嵌套函数，subagent 那条路（subagent/agent.py 的 MCP 分支）因此完全没有 barrier。
+    """
+    if not name.startswith('mcp__'):
+        return False, None
+    parts = name.split('__')
+    mcp_id = parts[1] if len(parts) > 1 else ''
+    # 从 split_map 获取原始 tool name + action
+    entry = mcp_client.registry.get(mcp_id)
+    if not entry:
+        return False, None
+    split_info = entry.get('split_map', {}).get(name, {})
+    if split_info:
+        # Split tool: action is encoded in schema name
+        tool_name = split_info.get('tool', '')
+        action_name = split_info.get('action', '')
+    else:
+        # Non-split tool: action comes from call args
+        tool_name = parts[-1] if len(parts) > 2 else ''
+        action_name = (call_args or {}).get('action', '')
+    # 在 interrupt hook 中注册的 → 免 barrier
+    import hooks
+    if hooks.is_interrupt_binding(mcp_id, tool_name, action_name):
+        return False, None
+    meta = entry.get('tool_meta', {}).get(name)
+    if not meta:
+        return True, None    # 无 meta 默认 barrier 且当全局独占（安全）
+    if meta.get('type') in ('sensor', 'resource'):
+        return False, None
+    return True, meta.get('resource')
+
+
+# Sources whose events are this machine talking to itself: a subagent finishing, an
+# ACP completion callback, a scheduled tick. None of them is somebody asking us to
+# stop. Vocabulary matches collector.py's `_PRIORITY_SOURCES`, which is what decides
+# who gets to wake the main loop at all — the two lists are meant to be read together.
+_SELF_ORIGINATED_SOURCE_KEYS = ('subagent', 'acp', 'scheduler')
+
+
+def _trigger_is_self_originated(trigger_event: dict) -> bool:
+    """True when every event in this turn's batch came from us, not from outside.
+
+    Used to decide whether starting a turn should abort whatever is currently
+    playing. The auto-interrupt below is documented as firing on a "new user turn",
+    but its only guard was `get_pending_actions() and not bot_restricted` — it never
+    looked at *who* triggered the turn. A subagent's own completion event arrives
+    URGENT the instant it finishes, so the main loop woke up and interrupted the TTS
+    that same subagent had just queued. On Orin6 that is most of why a robot asked to
+    speak stayed silent: `interrupted 1/2 active output(s)`, once per line.
+
+    Deliberately conservative in the other direction. This returns True only when we
+    can positively account for every source as self-originated; an empty or unknown
+    `sources` list falls through to interrupting, as before. Failing to interrupt when
+    a person actually speaks is the worse bug of the two, so an unenumerated barge-in
+    path keeps its old behaviour rather than silently losing it.
+    """
+    sources = (trigger_event.get('payload') or {}).get('sources')
+    if not isinstance(sources, list) or not sources:
+        return False
+    for src in sources:
+        low = str(src).lower()
+        if not any(key in low for key in _SELF_ORIGINATED_SOURCE_KEYS):
+            return False
+    return True
 
 
 def _bot_channel_reply_allowed(args: dict, source_message_ids: set[str]) -> bool:
@@ -839,6 +952,7 @@ class Event:
         """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled 时调用。
         优先使用 hook 系统；fallback 到硬编码查找。"""
         import hooks
+        from peer import mcp_bridge
         results = await hooks.fire('on_interrupt_all')
         if results:
             # Hook handled it — also clear pending ACP
@@ -867,6 +981,17 @@ class Event:
         tasks = []
         for mcp_id, info in mcp_client.registry.items():
             if not info.get('online'):
+                continue
+            # Skip peers. peer/mcp_bridge.py registers a synthetic entry per paired
+            # peer so its tools travel the normal mcp__ path, which means this loop
+            # over the whole registry was reaching across the network to silence
+            # *another robot's* mouth on every local barge-in. Observed on
+            # Orin5+Orin6: both machines logged
+            # `interrupt_active_outputs: peer:<id>:tts` at each other, and it only
+            # failed because a peer entry carries no url. Someone else's speech is
+            # not our output to abort — and a robot cutting off its partner
+            # mid-sentence is exactly the behaviour we are trying to fix here.
+            if mcp_bridge.is_peer_mcp(mcp_id):
                 continue
             tools = info.get('tools', [])
             for short_name, action in (('tts', 'interrupt'), ('loco', 'stop_move')):
@@ -904,6 +1029,11 @@ class Event:
             collector.set_cancel_event(cancel_ev)
             collector.set_turn_priority(1 if ev.get('_urgent') else 0)
             collector.set_busy(True)
+            # Publish this turn's cancel signal so tools that block for a long time
+            # can honour it. peer_delegate holds an HTTP connection for the remote
+            # task's whole duration, and the checks below only run between rounds.
+            from peer.delegation import current_cancel_event as _cancel_ctx
+            _cancel_token = _cancel_ctx.set(cancel_ev)
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev)
             except TurnCancelled:
@@ -930,6 +1060,7 @@ class Event:
                 })
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
+                _cancel_ctx.reset(_cancel_token)
                 collector.set_cancel_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)
@@ -1071,7 +1202,10 @@ class Event:
             asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
-        if mcp_client.get_pending_actions() and not bot_restricted:
+        # 自己触发的 turn（subagent 完成 / ACP 回调 / 定时器）不打断：那会掐掉
+        # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
+        if (mcp_client.get_pending_actions() and not bot_restricted
+                and not _trigger_is_self_originated(trigger_event)):
             _int_results = await hooks.fire('on_interrupt_all')
             if _int_results:
                 for aid in list(mcp_client._pending_actions.keys()):
@@ -1285,35 +1419,6 @@ class Event:
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []
 
-            def _needs_barrier(name: str, call_args: dict = None) -> bool:
-                """actuator/processor 类型的 MCP 工具需要 ACP barrier。
-                例外：在 on_interrupt_* hook 中注册的 tool+action 免 barrier。"""
-                if not name.startswith('mcp__'):
-                    return False
-                parts = name.split('__')
-                mcp_id = parts[1] if len(parts) > 1 else ''
-                # 从 split_map 获取原始 tool name + action
-                entry = mcp_client.registry.get(mcp_id)
-                if not entry:
-                    return False
-                split_info = entry.get('split_map', {}).get(name, {})
-                if split_info:
-                    # Split tool: action is encoded in schema name
-                    tool_name = split_info.get('tool', '')
-                    action_name = split_info.get('action', '')
-                else:
-                    # Non-split tool: action comes from call args
-                    tool_name = parts[-1] if len(parts) > 2 else ''
-                    action_name = (call_args or {}).get('action', '')
-                # 在 interrupt hook 中注册的 → 免 barrier
-                import hooks
-                if hooks.is_interrupt_binding(mcp_id, tool_name, action_name):
-                    return False
-                meta = entry.get('tool_meta', {}).get(name)
-                if not meta:
-                    return True  # 无 meta 默认 barrier（安全）
-                return meta.get('type') not in ('sensor', 'resource')
-
             async def _dispatch(call: dict) -> dict:
                 name   = call['function']['name']
                 args   = json.loads(call['function']['arguments'] or '{}')
@@ -1344,14 +1449,28 @@ class Event:
                     # ACP barrier: finish 之前等音频播完（见 _ACP_BARRIER_SYSTEM_TOOLS）。
                     # 等待期间用户开口要能立刻打断 —— 故 barge_in=True。
                     if _sys_tool_needs_barrier(name):
+                        # barge_in 只给 finish。它的 barrier 横跨整段播放且之后就结束
+                        # 本轮，steering 队列在本轮永远等不到 drain，所以必须能被新的
+                        # 用户消息唤醒（详见 _acp_barrier 的 docstring）。
+                        # peer_delegate / subagent_spawn 在 turn 中段，steering 的语义是
+                        # 注入当前 turn（:1414 之后就会 drain），走 mcp 工具那条路即可 ——
+                        # 用 barge_in=True 会掐掉自己的音频却照样把活派出去。
+                        _bargeable = (name == 'finish')
                         await _acp_barrier(
-                            name, cancel_event, barge_in=True,
-                            interrupt_fallback=self._interrupt_active_outputs)
+                            name, cancel_event, barge_in=_bargeable,
+                            interrupt_fallback=(self._interrupt_active_outputs
+                                                if _bargeable else None))
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
-                    # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
-                    if _needs_barrier(name, args):
-                        await _acp_barrier(name, cancel_event)
+                    # ACP barrier: 只等与本次调用资源冲突的 pending（见 _needs_barrier）
+                    # Pop `concurrent` before _needs_barrier looks at args and before
+                    # the call leaves for the device — it is harness-injected and the
+                    # driver's schema does not know it.
+                    _parallel = mcp_client.take_parallel_flag(args)
+                    _bar_needed, _bar_want = _needs_barrier(name, args)
+                    if _bar_needed:
+                        await _acp_barrier(name, cancel_event, want=_bar_want,
+                                           scoped=True, concurrent=_parallel)
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     # Inject instance_id from canvas binding (multiInstance tools need it)
@@ -1359,7 +1478,7 @@ class Event:
                         args['instance_id'] = self._bound_instance_ids[name]
                     result = await mcp_client.call_tool(name, args)
                     # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
-                    if not _needs_barrier(name, args) and mcp_client.get_pending_actions():
+                    if not _bar_needed and mcp_client.get_pending_actions():
                         import hooks as _hooks
                         parts = name.split('__')
                         _mcp_id = parts[1] if len(parts) > 1 else ''

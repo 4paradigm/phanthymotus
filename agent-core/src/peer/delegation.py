@@ -10,6 +10,7 @@ hop_count prevents infinite chains: A → B → C → D is capped at 2 hops.
 """
 
 import contextvars
+from uuid import uuid4
 from typing import Annotated
 
 from subagent.protocol import SubagentSpec, SubagentResult
@@ -17,6 +18,60 @@ from peer import store
 
 
 MAX_HOP_COUNT = 2
+
+# peer_id → how many delegations we currently have in flight *to* that peer.
+#
+# A count, not a set: two subagents may delegate to the same peer at once, and a
+# bare discard by whichever finished first would clear the other's marker too.
+_outbound_in_flight: dict[str, int] = {}
+
+
+def outbound_in_flight(peer_id: str) -> int:
+    """How many of our delegations to `peer_id` are still awaiting a result."""
+    return _outbound_in_flight.get(peer_id, 0)
+
+
+# Physical channel a delegation occupies locally while it runs.
+#
+# `None`, meaning "assume it conflicts with everything", which is the same rule an
+# undeclared driver tool gets. The goal is free-form text, so what the peer will
+# actually do is genuinely unknowable at call time, and this module must not guess.
+#
+# An earlier version of this hardcoded `{'mouth'}` — picked because speech is what
+# collides audibly and because the routine being debugged happened to be a spoken
+# one. That was scenario-fitting in the wrong layer: agent-core has no business
+# naming a physical channel. Channel names belong to drivers (`x-resource`), which
+# describe hardware they actually own; the core only ever compares them.
+#
+# The cost is that a delegation blocks local actuation for its duration. The
+# delegating loop is blocked inside the call anyway, so this only constrains its
+# subagents, and constraining them is the conservative reading. Narrowing it needs
+# the *intent* from whoever called peer_delegate, not a default here.
+DELEGATION_RESOURCE: frozenset | None = None
+
+
+def _hold_pending(hold_id: str, timeout: float) -> None:
+    """Register an ACP pending representing "a peer is doing something for us"."""
+    import asyncio
+    import mcp_client
+    mcp_client._pending_actions[hold_id] = asyncio.Event()
+    mcp_client._pending_tools[hold_id] = 'peer_delegate'
+    mcp_client._pending_timeouts[hold_id] = timeout
+    mcp_client._pending_resources[hold_id] = DELEGATION_RESOURCE
+
+
+def _release_pending(hold_id: str) -> None:
+    """Release the hold, waking anything waiting on the channel.
+
+    Sets the event before forgetting it: a local barrier may already be awaiting
+    this id, and dropping the tables from under it would leave that waiter hanging
+    until its own timeout instead of proceeding immediately.
+    """
+    import mcp_client
+    event = mcp_client._pending_actions.get(hold_id)
+    if event is not None:
+        event.set()
+    mcp_client._forget_pending([hold_id], 'completed')
 
 # How many peer hops the *currently executing* agent is already at.
 #
@@ -31,6 +86,19 @@ MAX_HOP_COUNT = 2
 # run; see subagent/agent.py.
 current_hop_count: contextvars.ContextVar[int] = contextvars.ContextVar(
     'peer_current_hop_count', default=0
+)
+
+# The cancel signal of whatever is currently executing — the agent loop's per-turn
+# event, or a subagent's own. Same reason as current_hop_count above: the dispatch
+# path passes no caller context, and system tools (unlike MCP tools, which get
+# `_cancel_event` injected into their args) receive only what the LLM supplied.
+#
+# Delegation needs it because it holds an HTTP connection open for the remote
+# task's whole duration, while the loop's cancellation is cooperative and checked
+# only before an LLM call and after a tool dispatch — never during one. A person
+# speaking mid-delegation was therefore unheard for up to `timeout_s + 10`.
+current_cancel_event: contextvars.ContextVar = contextvars.ContextVar(
+    'peer_current_cancel_event', default=None
 )
 
 
@@ -73,17 +141,83 @@ async def peer_delegate(
         return (f'Error: refusing to delegate — already {hop} peer hops deep '
                 f'(limit {MAX_HOP_COUNT}). This task has been passed along too many times.')
 
-    result, err = await _transport.post_json(
-        endpoints, '/api/peer/delegate',
-        {'goal': goal, 'timeout_s': timeout_s, 'max_rounds': max_rounds, 'hop_count': hop},
-        timeout=timeout_s + 10,
-    )
+    _outbound_in_flight[peer_id] = _outbound_in_flight.get(peer_id, 0) + 1
+    # Hold the shared channel for as long as the peer has the task, so a local
+    # subagent cannot start speaking into the same room. Registered directly rather
+    # than through call_tool because there is no MCP driver behind this — the
+    # "action" is a remote agent, and this process is the one that knows when it ends.
+    _hold_id = f'peer-delegate-{peer["peer_id"][:8]}-{uuid4().hex[:8]}'
+    _hold_pending(_hold_id, timeout_s + 10)
+    try:
+        result, err = await _transport.post_json(
+            endpoints, '/api/peer/delegate',
+            {'goal': goal, 'timeout_s': timeout_s, 'max_rounds': max_rounds, 'hop_count': hop},
+            timeout=timeout_s + 10,
+            cancel_event=current_cancel_event.get(),
+        )
+    finally:
+        _release_pending(_hold_id)
+        _remaining = _outbound_in_flight.get(peer_id, 1) - 1
+        if _remaining > 0:
+            _outbound_in_flight[peer_id] = _remaining
+        else:
+            _outbound_in_flight.pop(peer_id, None)
     if result is None:
+        if err == 'cancelled':
+            return (f'Delegation to "{peer["display_name"] or peer_id[:12]}" was '
+                    f'interrupted locally before a result came back. The peer may '
+                    f'still be carrying it out — do not assume it did nothing.')
         return f'Error: delegation to "{peer_id}" failed: {err}'
     if result.get('status') != 'completed':
         return (f'Peer "{peer["display_name"] or peer_id[:12]}" did not complete the task '
                 f'(status={result.get("status")}): {result.get("error") or "no detail"}')
-    return result.get('output') or '(peer returned an empty result)'
+    return _describe_outcome(peer, result)
+
+
+def _describe_outcome(peer: dict, result: dict) -> str:
+    """Render a completed delegation, stating what the peer actually did.
+
+    `output` is prose the remote model wrote about itself, and it cannot be trusted
+    as evidence. Measured on Orin5+Orin6: six delegations each asked the receiver to
+    speak one line; four ran a single round, never called tts, and returned
+    "已完成捧哏台词播报" — after which both robots announced a sixteen-line
+    performance nobody heard, and one saved it to long-term memory.
+
+    So the report leads with the machine-checkable part. `substantive_tool_calls`
+    excludes bookkeeping tools, and `actions` carries each ACP action's terminal
+    state — 'completed' is the only one that means it happened; 'timeout' in
+    particular clears the pending and lets everything proceed exactly like success.
+    """
+    who = peer.get('display_name') or peer['peer_id'][:12]
+    output = result.get('output') or '(peer returned an empty result)'
+
+    actions = result.get('actions')
+    actions = actions if isinstance(actions, list) else []
+    substantive = result.get('substantive_tool_calls')
+    # An older peer sends neither key. Absent ≠ empty: claiming it did nothing would
+    # be as wrong as trusting the prose, so say the check was unavailable.
+    if not isinstance(substantive, list) and not actions:
+        return (f'{output}\n\n[unverified: peer "{who}" predates action reporting, '
+                f'so whether it acted cannot be confirmed from this result]')
+
+    done = [a for a in actions if a.get('status') == 'completed']
+    unfinished = [a for a in actions if a.get('status') != 'completed']
+
+    if not done and not (substantive or []):
+        return (f'Peer "{who}" reported success but took no verifiable action — no '
+                f'completed action and no tool call beyond its own bookkeeping. '
+                f'Treat the task as NOT done; its own words were: {output}')
+
+    notes = []
+    if done:
+        notes.append(f'{len(done)} action(s) confirmed complete')
+    if unfinished:
+        detail = ', '.join(f'{a.get("action_id", "?")}={a.get("status", "?")}'
+                           for a in unfinished[:5])
+        notes.append(f'{len(unfinished)} did NOT confirm ({detail})')
+    if substantive:
+        notes.append(f'tools used: {", ".join(dict.fromkeys(substantive))}')
+    return f'{output}\n\n[peer "{who}": {"; ".join(notes)}]'
 
 
 def validate_delegation(peer_id: str, spec: SubagentSpec) -> tuple[bool, str]:
@@ -103,6 +237,27 @@ def validate_delegation(peer_id: str, spec: SubagentSpec) -> tuple[bool, str]:
     hop_count = getattr(spec, 'hop_count', 0)
     if hop_count > MAX_HOP_COUNT:
         return False, f'hop_count {hop_count} exceeds limit {MAX_HOP_COUNT}'
+
+    # Refuse an inbound delegation from a peer we are currently delegating *to*.
+    #
+    # hop_count alone does not stop this. A sends hop=0; B's subagent runs at hop=1
+    # and delegates back with hop=1; A accepts it (1 ≤ 2) and runs at hop=2; that
+    # subagent can delegate again at hop=2, which B also accepts. So A→B→A→B
+    # ping-pongs several rounds before the limit bites.
+    #
+    # It is not hypothetical. Orin5 asked Orin6 to speak a line; Orin6 turned around
+    # and delegated back to Orin5 twice asking for the script, and Orin5's inbound
+    # subagent ran seven rounds and timed out while the performance it was supposed
+    # to be part of went on without it.
+    #
+    # It also closes a cycle that becomes a real deadlock the moment an outbound
+    # delegation holds a resource for its duration: the inbound task would wait on
+    # the resource, held by the outbound call, waiting on the peer, waiting on the
+    # inbound task. Today the outbound call releases before it blocks, so this is
+    # about the ping-pong; keep the guard if that changes.
+    if outbound_in_flight(peer_id):
+        return False, ('reentrant: we are already waiting on a delegation to this '
+                       'peer — answer that one before asking us for something new')
 
     # Tool filter intersection: if the peer has a filter, the delegated spec's
     # filter must be a subset. For simplicity, we enforce that the peer's

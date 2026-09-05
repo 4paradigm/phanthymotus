@@ -579,6 +579,7 @@ async def _do_ping(mcp_id: str) -> dict:
                 'action_enum': action_enum,
                 'has_config_schema': bool(tool.get('configSchema')),
                 'completion': raw_input_schema.get('x-completion'),
+                'resource': mcp_client.parse_resources(raw_input_schema.get('x-resource')),
             }
         else:
             group = []
@@ -589,6 +590,8 @@ async def _do_ping(mcp_id: str) -> dict:
                     'action_enum': None,
                     'has_config_schema': bool(tool.get('configSchema')),
                     'completion': (tool.get('inputSchema') or {}).get('x-completion'),
+                    'resource': mcp_client.parse_resources(
+                        (tool.get('inputSchema') or {}).get('x-resource')),
                 }
                 action_name = schema['name'].split('__')[-1]
                 split_map[schema['name']] = {

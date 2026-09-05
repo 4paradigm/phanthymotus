@@ -135,6 +135,8 @@ async def refresh_one(peer: dict) -> int:
     label = peer.get('display_name') or peer_id[:ID_LEN]
     advertised = [s for s in (resp.get('tools') or []) if s.get('name')]
     aliases = _aliases([s['name'] for s in advertised])
+    acp_meta = resp.get('acp_meta')
+    acp_meta = acp_meta if isinstance(acp_meta, dict) else {}
 
     schemas, tools, tool_meta, remote_names = {}, [], {}, {}
     for schema in advertised:
@@ -150,7 +152,19 @@ async def refresh_one(peer: dict) -> int:
         # Type is not carried by tools/list, and guessing it locally is what
         # peer/tools.py already got burned by. Left empty: the remote decides what
         # it allows, and all_schemas() only uses type to trim processor actions.
-        tool_meta[local] = {}
+        #
+        # `completion` and `resource` are different in kind: the remote is not
+        # guessing them either, it is repeating what its own driver declared, so
+        # taking them at face value is safe. Without them every peer tool counted as
+        # undeclared, and undeclared means exclusive against everything — one peer
+        # tool call blocked all local actuation. A malformed `resource` from the far
+        # side falls back to None via parse_resources, i.e. to that same
+        # conservative reading, never to "conflicts with nothing".
+        remote_meta = acp_meta.get(remote) or {}
+        tool_meta[local] = {
+            'completion': remote_meta.get('completion'),
+            'resource': mcp_client.parse_resources(remote_meta.get('resource')),
+        }
 
     mcp_client.registry[mcp_id] = {
         'name': f'{label} (peer)',

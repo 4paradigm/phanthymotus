@@ -44,6 +44,44 @@ def _get_config() -> dict:
     return {**defaults, **cfg}
 
 
+def notify_suppression_reason(spec, result, is_bg: bool) -> str | None:
+    """Why this subagent's completion should NOT wake the local main agent, or None.
+
+    A module-level predicate rather than inline conditions so it can be tested
+    without standing up the manager's history/DB bookkeeping.
+
+    Two cases, both "nobody here is waiting on an answer":
+
+    `bg` — a background monitor finishing normally. Long-standing behaviour.
+
+    `delegated` — an inbound peer delegation (hop_count > 0) finishing normally.
+    The work was the *peer's* request and its result already went back in the
+    /api/peer/delegate response; the local main agent never asked for it. Waking it
+    is not merely wasteful, it is harmful: the notification carries the subagent's
+    summary, the summary usually restates the line just spoken, and the main agent
+    says it again. Measured on Orin6, every round:
+
+        16:18:00.966  [subagent] tts("那你说得好的时候再来看。")
+        16:18:03.077  subagent_finish
+        16:18:05.736  [main]     tts("那你说得好的时候再来看。")   <- same line twice
+
+    All six straight-man lines were spoken twice. This used to be pure waste (the
+    woken turn emitted only `finish({})` — 12,760 prompt tokens for 4 output
+    tokens); once the tools actually worked, the waste became a behavioural defect.
+
+    Failures and timeouts always notify, for both cases: then the local operator
+    genuinely needs to know something was asked of this robot and did not happen.
+    """
+    if result is None or result.status != 'completed':
+        return None
+    if is_bg:
+        return 'bg'
+    if getattr(spec, 'hop_count', 0) > 0:
+        return (f'delegated task (hop={spec.hop_count}) done, result already returned '
+                f'to the requesting peer')
+    return None
+
+
 class SubagentManager:
     """Manages subagent lifecycle, scheduling, and communication."""
 
@@ -84,7 +122,7 @@ class SubagentManager:
         for agent_id, task in list(self._running.items()):
             agent = self._agents.get(agent_id)
             if agent:
-                agent.cancel()
+                agent.cancel('agent-core shutting down')
                 try:
                     await asyncio.wait_for(task, timeout=5.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -148,7 +186,7 @@ class SubagentManager:
             return True
 
         if agent.status == STATUS_RUNNING:
-            agent.cancel()
+            agent.cancel(reason or 'cancelled by request')
             # The running task will handle the rest
             return True
 
@@ -340,7 +378,7 @@ class SubagentManager:
             idle_time = time.time() - agent.updated_at
             if idle_time >= idle_timeout:
                 print(f'[subagent:{agent_id}] idle timeout: no progress for {idle_time:.0f}s')
-                agent.cancel()
+                agent.cancel(f'idle timeout ({idle_time:.0f}s without progress)')
                 return
 
     # ── Lifecycle Helpers ─────────────────────────────────────────────────────
@@ -404,11 +442,16 @@ class SubagentManager:
             except Exception as e:
                 print(f'[subagent:{agent.id}] save conclusion to DB failed: {e}')
 
-        # BG subagent 正常完成 → 不触发 main agent
-        if is_bg and result.status == 'completed':
+        # 不需要本机决策的完成 → 只推前端，不唤醒 main agent
+        _skip = notify_suppression_reason(agent.spec, result, is_bg)
+        if _skip:
+            if _skip != 'bg':
+                print(f'[subagent:{agent.id}] not waking the local agent: {_skip}')
             await push_event({
                 'type': 'subagent_complete',
-                'payload': {'id': agent.id, 'status': 'completed', 'output': result.output[:100], 'rounds': result.rounds_used},
+                'payload': {'id': agent.id, 'status': result.status,
+                            'output': (result.output or '')[:100],
+                            'rounds': result.rounds_used},
             })
             return
 
@@ -422,6 +465,32 @@ class SubagentManager:
             notify_text += f'\n摘要: {result.output[:100]}'
         elif result.error:
             notify_text += f'\n错误: {result.error[:100]}'
+
+        # A subagent that did not finish may still have *acted*, and the reader of this
+        # notification is an agent that can act again. Without saying what already
+        # happened, "failed: <goal>" reads as "nothing was done" and the obvious
+        # response is to redo it — physically.
+        #
+        # Measured on Tianyi: three delegated subagents were cancelled by
+        # `spawn_sync timeout` mid-run, each after it had already spoken its line and
+        # completed its gesture. Each surfaced as `✗ failed: <goal>` with no mention of
+        # that, and the main agent re-spoke the line and re-ran the arm motion. Every
+        # partially-finished task became a duplicate performance.
+        #
+        # `confirmed_actions()` is the same evidence the peer delegation response
+        # already carries (peer/delegation.py); it was simply never wired into the
+        # local notification.
+        if result.status != 'completed':
+            done = result.confirmed_actions()
+            substantive = result.substantive_tool_calls()
+            if done or substantive:
+                parts = []
+                if done:
+                    parts.append(f'{len(done)} 个动作已确认完成'
+                                 f'（{", ".join(a.get("action_id", "?") for a in done[:4])}）')
+                if substantive:
+                    parts.append(f'已调用: {", ".join(dict.fromkeys(substantive))[:120]}')
+                notify_text += (f'\n⚠ 已经做过的部分，不要重复执行: {"; ".join(parts)}')
 
         await event_bus.enqueue(
             source=f'subagent:{agent.id}',

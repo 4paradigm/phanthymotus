@@ -179,6 +179,62 @@ So an `operator` peer **can** drive this robot's actuators directly. That is the
 oversight: granting `operator` is what authorises it, which is why a newly paired peer defaults to
 `viewer`, and why every such call is announced on the activity stream.
 
+### ACP Barrier — what may run at the same time
+
+An actuator tool returns when the driver has *accepted* the action, not when the world
+has finished changing, so the agent loop needs a rule for what may start next. That
+rule is the **ACP barrier**, and it is scoped by **physical channel**.
+
+Drivers declare which channel each acting tool occupies via `x-resource` beside
+`x-completion` (spec: `phanthymotus-driver/README_dev.md` § *Physical Resources*).
+The barrier waits only for pending actions whose channel intersects the one the new
+call wants, so speaking no longer blocks driving while two `speak` calls still
+serialise. `finish` and the hand-off tools (`peer_call`, `peer_delegate`,
+`subagent_spawn*`, `subagent_message`) wait for **everything**, because ending a turn
+or handing work to another executor cannot know what will be touched.
+
+**Agent Core defines no channel names.** It only intersects the strings drivers
+declare, so `rotor`/`gimbal` or `thruster`/`ballast` work exactly as `mouth`/`base`
+does. Undeclared means "conflicts with everything", which is why an undeclared driver
+keeps its pre-barrier behaviour, and why a *partially* declared one is the case that
+behaves worst — see the driver README before declaring anything.
+
+Three properties are load-bearing and easy to break:
+
+- **Every dispatch path must consult the same table.** There are three — the main
+  loop, and the subagent's MCP and system-tool branches. Each was missed once, and
+  each miss reopened the whole bug through a different door. `_HANDOFF_SYSTEM_TOOLS`
+  is enumerated, not keyword-matched, and `tests/test_handoff_tools_partitioned.py`
+  fails if a new `peer_*`/`subagent_*` tool is left unclassified.
+- **Exclusion and ordering are separate rules.** A call waits for two independent
+  reasons, and only the first can be overridden:
+
+  | reason | scope | can the caller opt out? |
+  |---|---|---|
+  | resource conflict | any agent | **no** — one chassis cannot drive two ways |
+  | own ordering | the same agent's own calls | yes, via `concurrent: true` |
+
+  Exclusion cannot answer "must this finish first". "Announce before moving" is a
+  *sequencing* requirement: `mouth` and `leg` are different channels, so exclusion
+  permits the overlap. The same pair must overlap when it is a gesture accompanying
+  speech and must not when it is a warning preceding motion — identical tools, and
+  only the intent differs. So ordering is enforced **within one agent's own sequence
+  of calls**, where the order it emitted them in is the script, and not across
+  independent agents, which share no script.
+
+  Agent Core injects a `concurrent` parameter into every acting tool's schema
+  (`mcp_client.with_parallel_param`) — drivers do not declare it, because whether a
+  call should overlap the previous one is a property of the intent, not the hardware.
+  It defaults to **false**: a model does not reason about concurrency unless made to,
+  and the unsafe direction — a warning overlapping the motion it warns about — is the
+  one that should require an explicit request. Ownership comes from
+  `mcp_client.current_agent_context`, which each subagent sets to its own id.
+- **A timeout clears pending and proceeds exactly like success.** So a terminal state
+  has to outlive its pending (`mcp_client.action_outcome`), and anything reporting
+  work upward must carry `SubagentResult.confirmed_actions()` rather than prose — an
+  agent that reads "failed" with no record of what already happened will redo it,
+  physically.
+
 ### Memory & Long-Running Agent Architecture
 
 The Agent Core is designed for **continuous operation over days or months**. The architecture separates real-time interaction from background intelligence:
