@@ -520,6 +520,41 @@ class Subagent:
         if isinstance(action_id, str) and action_id and action_id not in self._action_ids:
             self._action_ids.append(action_id)
 
+    async def _settle_own_actions(self) -> None:
+        """Wait for the actions this run started before declaring the run finished.
+
+        The main loop barriers `finish` for the same reason (_ACP_BARRIER_SYSTEM_TOOLS):
+        ending a turn while audio is still playing truncates it. `subagent_finish` is
+        the subagent's equivalent and was not barriered, which broke two things.
+
+        Measured on Orin6: a delegated subagent called tts, then `subagent_finish`
+        1.2s *before* the audio finished — so the delegation returned early and the
+        delegator could start its own line over the top, which is the whole bug this
+        change exists to remove.
+
+        Worse, it made the new action manifest lie. `/api/acp/complete` only sets the
+        pending's event; the terminal state is recorded when a barrier or `sync`
+        forgets it. Finishing first meant `action_outcome()` still returned None, so
+        `_action_report()` reported 'pending' and `peer_delegate` announced "did NOT
+        confirm" for a line that had in fact played. A verifier that cries wolf is
+        worse than none.
+
+        Waits only on ids this run started, so a concurrent subagent's audio on a
+        different channel is not waited for. Cancellation still cuts it short.
+        """
+        if not self._action_ids:
+            return
+        outstanding = [aid for aid in self._action_ids
+                       if aid in mcp_client._pending_actions]
+        if not outstanding:
+            return
+        result = await mcp_client.sync(outstanding, timeout=180,
+                                       cancel_event=self._cancel_event)
+        status = (result or {}).get('status')
+        if status != 'completed':
+            print(f'[subagent:{self.id}] actions did not all settle before finish: '
+                  f'{status} ({outstanding})')
+
     def _action_report(self) -> list[dict]:
         """Each action this run started, with the terminal state it reached.
 
@@ -540,6 +575,7 @@ class Subagent:
         """Dispatch a tool call and return result text."""
         # Subagent system tools
         if name == 'subagent_finish':
+            await self._settle_own_actions()
             return args.get('output', 'done')
         if name == 'subagent_fail':
             return args.get('reason', 'failed')

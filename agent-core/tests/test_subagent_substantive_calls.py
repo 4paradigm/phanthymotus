@@ -126,6 +126,93 @@ class TestConfirmedActions(unittest.TestCase):
         self.assertEqual(len(back.confirmed_actions()), 1)
 
 
+class TestSettleOwnActionsBeforeFinish(unittest.TestCase):
+    """subagent_finish 之前必须等自己启动的动作落地。
+
+    实测于 Orin6：一个被委派的 subagent 调了 tts，然后在音频播完**前 1.2 秒**就
+    subagent_finish —— 委派因此提前返回，委派方可以压着对端说话，正是这次要消掉的问题。
+
+    更糟的是它让新加的 action 清单说谎。`/api/acp/complete` 只置位 event，终态是被
+    barrier 或 sync 清理时才记下的；先 finish 就意味着 `action_outcome()` 还是 None，
+    于是清单报 'pending'、`peer_delegate` 宣布"did NOT confirm"—— 而那句话其实播了。
+    一个会误报的验证器比没有更糟。
+    """
+
+    def setUp(self):
+        import mcp_client
+        self.mcp_client = mcp_client
+        for d in (mcp_client._pending_actions, mcp_client._pending_results,
+                  mcp_client._pending_timeouts, mcp_client._pending_tools,
+                  mcp_client._pending_resources):
+            d.clear()
+        mcp_client._action_outcomes.clear()
+
+    def _agent(self):
+        a = Subagent(SubagentSpec(goal='说一句捧哏词'), agent_id='settle01')
+        a._action_ids = ['speak-x']
+        return a
+
+    def test_completed_action_is_reported_as_completed(self):
+        """回归：这条以前会报 'pending'。"""
+        async def _scenario():
+            agent = self._agent()
+            ev = asyncio.Event()
+            self.mcp_client._pending_actions['speak-x'] = ev
+            self.mcp_client._pending_tools['speak-x'] = 'tts'
+            self.mcp_client._pending_timeouts['speak-x'] = 30.0
+            self.mcp_client._pending_resources['speak-x'] = frozenset({'mouth'})
+            # 模拟 driver 的 /api/acp/complete 稍后到达
+            async def _late_complete():
+                await asyncio.sleep(0.05)
+                self.mcp_client._pending_results['speak-x'] = {'status': 'completed'}
+                ev.set()
+            asyncio.create_task(_late_complete())
+            await agent._dispatch_tool('subagent_finish', {'output': '说完了'})
+            return agent._action_report()
+
+        report = asyncio.run(_scenario())
+        self.assertEqual(report[0]['status'], 'completed',
+                         '动作已完成却被报成 pending —— 委派方会误判为没做')
+
+    def test_finish_does_not_return_before_the_action_settles(self):
+        async def _scenario():
+            agent = self._agent()
+            ev = asyncio.Event()
+            self.mcp_client._pending_actions['speak-x'] = ev
+            self.mcp_client._pending_timeouts['speak-x'] = 30.0
+            order = []
+
+            async def _late_complete():
+                await asyncio.sleep(0.05)
+                order.append('audio_done')
+                ev.set()
+
+            asyncio.create_task(_late_complete())
+            await agent._dispatch_tool('subagent_finish', {'output': 'x'})
+            order.append('finish_returned')
+            return order
+
+        self.assertEqual(asyncio.run(_scenario()),
+                         ['audio_done', 'finish_returned'])
+
+    def test_no_actions_returns_immediately(self):
+        agent = Subagent(SubagentSpec(goal='g'), agent_id='settle02')
+        out = asyncio.run(agent._dispatch_tool('subagent_finish', {'output': 'done'}))
+        self.assertEqual(out, 'done')
+
+    def test_cancelled_subagent_does_not_wait_forever(self):
+        """取消的 subagent 不该抱着 slot 等满整段播放。"""
+        async def _scenario():
+            agent = self._agent()
+            self.mcp_client._pending_actions['speak-x'] = asyncio.Event()
+            self.mcp_client._pending_timeouts['speak-x'] = 300.0
+            agent._cancel_event.set()
+            return await asyncio.wait_for(
+                agent._dispatch_tool('subagent_finish', {'output': 'x'}), timeout=3)
+
+        self.assertEqual(asyncio.run(_scenario()), 'x')
+
+
 class TestCancelCarriesReason(unittest.TestCase):
     """取消一个 running subagent 原来完全静默 —— 日志在半路断掉，和挂死一模一样。
 
