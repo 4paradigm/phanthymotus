@@ -22,6 +22,7 @@ mcp_client.py — MCP HTTP transport 客户端。
 
 import asyncio
 import collections
+import contextvars
 import json
 import time
 import uuid
@@ -41,6 +42,41 @@ _pending_results: dict[str, dict] = {}            # action_id → completion pay
 _pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
 _pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
 _pending_resources: dict[str, frozenset | None] = {}  # action_id → 占用的物理通道
+_pending_owner: dict[str, str] = {}               # action_id → 发起它的 agent 上下文
+
+# ── 次序：谁发起的动作 ────────────────────────────────────────────────────────
+#
+# Resource exclusion answers "may these two run at once"; it cannot answer "must
+# this one finish first". Those are different questions and only the second one
+# knows about intent.
+#
+# "先说'我要起来了'再起身" is an *ordering* requirement. mouth and leg are different
+# channels, so exclusion permits the overlap — and before the barrier was scoped by
+# resource, the global barrier forbade it by accident. Neither is a real answer: the
+# same pair of tools must overlap when it is a gesture accompanying speech and must
+# not when it is a warning preceding motion. The tools are identical; only the intent
+# differs, and the intent lives in whoever emitted the calls.
+#
+# So ordering is enforced *within one agent's own sequence of calls* — the LLM emitted
+# them in an order and that order is the script — and NOT across independent agents,
+# which share no intent and whose unrelated actions must not block each other.
+# `PARALLEL_PARAM` lets the emitter opt a single call out of its own ordering.
+CONTEXT_MAIN = 'main'
+current_agent_context: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    'acp_current_agent_context', default=CONTEXT_MAIN
+)
+
+# Parameter the harness injects into every acting tool's schema. Not declared by
+# drivers: it is a property of *this call*, not of the hardware, so asking 14 drivers
+# to carry it would be putting caller intent in the wrong layer. Stripped before the
+# call leaves for the device.
+#
+# Default false, deliberately. A model does not reason about concurrency unless made
+# to; left to itself it writes calls as if they were sequential, because that is how
+# the text reads. So sequential is what it gets unless it says otherwise, and the
+# unsafe direction — a warning overlapping the motion it warns about — is the one that
+# requires an explicit request.
+PARALLEL_PARAM = 'concurrent'
 
 # ── ACP: 物理资源互斥 ─────────────────────────────────────────────────────────
 #
@@ -98,6 +134,41 @@ def conflicting_pending(want: frozenset | None) -> list[str]:
     ]
 
 
+def pendings_to_wait_for(want: frozenset | None, *, owner: str,
+                         concurrent: bool) -> list[str]:
+    """Everything a call must wait for, in registration order.
+
+    Two independent reasons to wait, and they answer different questions:
+
+    * **resource conflict** — the hardware cannot do both. Always enforced; a caller
+      cannot opt out, because `concurrent=True` is a statement about intent, not a
+      claim that one chassis can drive two ways at once.
+    * **own ordering** — this agent already started something and has not asked for
+      overlap, so the order it emitted its calls in is honoured. Skipped for actions
+      started by a *different* context: independent agents share no script, and
+      making them wait on each other is what collapsed N subagents into one.
+    """
+    out = []
+    for aid in _pending_actions:
+        if resources_conflict(want, _pending_resources.get(aid)):
+            out.append(aid)
+        elif not concurrent and _pending_owner.get(aid, CONTEXT_MAIN) == owner:
+            out.append(aid)
+    return out
+
+
+def take_parallel_flag(args: dict) -> bool:
+    """Pop `concurrent` out of a call's arguments and return it.
+
+    Popped, not read: the parameter is injected by the harness and means nothing to
+    the device, so forwarding it would show up as an unexpected field in a driver's
+    schema validation.
+    """
+    if not isinstance(args, dict):
+        return False
+    return bool(args.pop(PARALLEL_PARAM, False))
+
+
 def _forget_pending(aids, outcome: str | None = None) -> None:
     """Drop every per-action side table for `aids`, recording how each ended.
 
@@ -120,6 +191,7 @@ def _forget_pending(aids, outcome: str | None = None) -> None:
         _pending_timeouts.pop(aid, None)
         _pending_tools.pop(aid, None)
         _pending_resources.pop(aid, None)
+        _pending_owner.pop(aid, None)
 
 
 # Terminal state of recently finished actions, so a caller can still ask "did that
@@ -624,6 +696,7 @@ async def call_tool(full_name: str, args: dict) -> str:
                 # 记录该 pending 属于哪个工具（用于 barrier 资源冲突判断）
                 _pending_tools[action_id] = tool_name
                 _pending_resources[action_id] = meta.get('resource')
+                _pending_owner[action_id] = current_agent_context.get()
                 # 动态 timeout：有 text 参数时按字数算（合成+播放: 字数/3 + 10s余量），否则用 schema 默认值
                 text_arg = args.get('text', '')
                 default_timeout = completion_spec.get('timeout', 120)
@@ -669,8 +742,42 @@ def all_schemas() -> list[dict]:
                         'action': {**schema['parameters']['properties']['action'], 'enum': user_actions}
                     }
                 }}
-            schemas.append(schema)
+            schemas.append(with_parallel_param(schema, meta.get('type')))
     return schemas
+
+
+_PARALLEL_PARAM_DESC = (
+    '默认 false：这次调用会等你自己此前发起的动作先完成，也就是按你写出的先后顺序执行。'
+    '只有当这个动作**本来就该和上一个同时发生**时才设 true（例如讲解时配合的手势）。'
+    '安全播报之类"必须先说完再动"的场景不要设 true。'
+    '注意：占用同一个物理通道的动作永远串行，设 true 也不会并行。'
+)
+
+
+def with_parallel_param(schema: dict, tool_type: str | None) -> dict:
+    """Add the `concurrent` parameter to an acting tool's schema.
+
+    Injected by the harness rather than declared by drivers: whether a call should
+    overlap the previous one is a property of the *intent behind this call*, not of
+    the hardware. Asking every driver to carry it would put caller intent in the
+    device layer, and the flag would then be absent from any driver that forgot.
+
+    Only acting tools get it. `sensor`/`resource` tools are never barriered, so the
+    parameter would be noise in their schema and an invitation to set it meaninglessly.
+    """
+    if tool_type in ('sensor', 'resource'):
+        return schema
+    params = schema.get('parameters') or {}
+    props = params.get('properties') or {}
+    if PARALLEL_PARAM in props:
+        return schema                      # driver declared its own; do not shadow it
+    return {**schema, 'parameters': {
+        **params,
+        'properties': {**props, PARALLEL_PARAM: {
+            'type': 'boolean',
+            'description': _PARALLEL_PARAM_DESC,
+        }},
+    }}
 
 
 async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
@@ -734,7 +841,9 @@ async def cancel_and_reap(tasks) -> None:
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
                         tool_name: str | None = None,
                         want: frozenset | None = None,
-                        scoped: bool = False) -> dict:
+                        scoped: bool = False,
+                        concurrent: bool = False,
+                        owner: str | None = None) -> dict:
     """等待与 `want` 冲突的 pending actions 完成。
 
     `scoped=False`（默认）保持全局语义：等所有 pending。`finish` 走这条 —— 结束 turn
@@ -747,7 +856,9 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
     `tool_name` 仅用于日志归因。
     """
     if scoped:
-        aids = conflicting_pending(want)
+        aids = pendings_to_wait_for(
+            want, owner=owner if owner is not None else current_agent_context.get(),
+            concurrent=concurrent)
     else:
         aids = list(_pending_actions.keys())
     if not aids:
@@ -763,7 +874,9 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
     if scoped:
         _want_txt = ','.join(sorted(want)) if want else 'undeclared/exclusive'
         _held = len(_pending_actions)
-        _scope_txt = f' want={_want_txt}, {len(aids)}/{_held} pending conflict;'
+        _mode = 'concurrent' if concurrent else 'sequential'
+        _scope_txt = (f' want={_want_txt}, {_mode}, '
+                      f'{len(aids)}/{_held} pending to wait for;')
     print(f'[acp] barrier: waiting for {aids}'
           f'{_scope_txt} (timeout={effective_timeout:.0f}s)')
 

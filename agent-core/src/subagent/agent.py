@@ -284,6 +284,12 @@ class Subagent:
             _hop_token = None
             _cancel_token = None
 
+        # Own the actions this run starts, so the ordering rule applies within this
+        # subagent's own sequence and not across agents. Without it every subagent
+        # would count as the main loop, and one subagent's speech would again make
+        # every other one wait — the collapse the resource scoping exists to avoid.
+        _ctx_token = mcp_client.current_agent_context.set(f'subagent:{self.id}')
+
         tool_list = self._get_allowed_tools()
         finish_output: str | None = None
         fail_reason: str | None = None
@@ -535,6 +541,7 @@ class Subagent:
             if _cancel_token is not None:
                 from peer.delegation import current_cancel_event
                 current_cancel_event.reset(_cancel_token)
+            mcp_client.current_agent_context.reset(_ctx_token)
             # Commit perf spans for this subagent run
             if _spans:
                 _spans.append({'span': 'subagent_total', 'component': 'subagent',
@@ -678,11 +685,13 @@ class Subagent:
                 # `self._cancel_event` so a cancelled subagent stops waiting rather
                 # than holding its slot for the full playback.
                 from event.llm import _acp_barrier, _needs_barrier
+                _parallel = mcp_client.take_parallel_flag(args)
                 _bar_needed, _bar_want = _needs_barrier(name, args)
                 if _bar_needed:
                     await _acp_barrier(f'subagent:{self.id}/{name}',
                                        self._cancel_event,
-                                       want=_bar_want, scoped=True)
+                                       want=_bar_want, scoped=True,
+                                       concurrent=_parallel)
                 result = await mcp_client.call_tool(name, args)
                 self._note_action_id(result)
                 if isinstance(result, dict):

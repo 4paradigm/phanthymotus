@@ -146,11 +146,12 @@ class TestForgetPending(_PendingFixture):
 
 
 class TestAwaitPendingScoping(_PendingFixture):
+    """资源互斥这一层。这些用例传 concurrent=True，把次序规则关掉，只看互斥。"""
     def test_scoped_ignores_non_conflicting(self):
         """底盘还在跑，但要说话 —— 不该等。"""
         self._add('nav-1', frozenset({'base'}), tool='loco', timeout=60.0)
         out = asyncio.run(mcp_client.await_pending(
-            want=frozenset({'mouth'}), scoped=True, timeout=1))
+            want=frozenset({'mouth'}), scoped=True, timeout=1, concurrent=True))
         self.assertEqual(out['status'], 'no_pending')
         # 不相干的 pending 必须原样留着
         self.assertIn('nav-1', mcp_client._pending_actions)
@@ -166,7 +167,7 @@ class TestAwaitPendingScoping(_PendingFixture):
         self._add('speak-1', frozenset({'mouth'}), done=True)
         self._add('nav-1', frozenset({'base'}), tool='loco')
         asyncio.run(mcp_client.await_pending(
-            want=frozenset({'mouth'}), scoped=True, timeout=1))
+            want=frozenset({'mouth'}), scoped=True, timeout=1, concurrent=True))
         self.assertNotIn('speak-1', mcp_client._pending_actions)
         self.assertIn('nav-1', mcp_client._pending_actions)
 
@@ -191,7 +192,8 @@ class TestAwaitPendingScoping(_PendingFixture):
     async def _timed_scoped_wait(self):
         import time
         t0 = time.monotonic()
-        out = await mcp_client.await_pending(want=frozenset({'mouth'}), scoped=True)
+        out = await mcp_client.await_pending(want=frozenset({'mouth'}), scoped=True,
+                                            concurrent=True)
         self.assertEqual(out['status'], 'timeout')
         return time.monotonic() - t0
 

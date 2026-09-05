@@ -206,10 +206,29 @@ Three properties are load-bearing and easy to break:
   each miss reopened the whole bug through a different door. `_HANDOFF_SYSTEM_TOOLS`
   is enumerated, not keyword-matched, and `tests/test_handoff_tools_partitioned.py`
   fails if a new `peer_*`/`subagent_*` tool is left unclassified.
-- **The barrier expresses exclusion, not ordering.** "Announce before moving" is a
-  *sequencing* requirement, and nothing currently encodes it: with `mouth` and `base`
-  declared independent, the announcement and the motion overlap. Before this change
-  the global barrier made it serial by accident. Treat ordering as unsolved.
+- **Exclusion and ordering are separate rules.** A call waits for two independent
+  reasons, and only the first can be overridden:
+
+  | reason | scope | can the caller opt out? |
+  |---|---|---|
+  | resource conflict | any agent | **no** — one chassis cannot drive two ways |
+  | own ordering | the same agent's own calls | yes, via `concurrent: true` |
+
+  Exclusion cannot answer "must this finish first". "Announce before moving" is a
+  *sequencing* requirement: `mouth` and `leg` are different channels, so exclusion
+  permits the overlap. The same pair must overlap when it is a gesture accompanying
+  speech and must not when it is a warning preceding motion — identical tools, and
+  only the intent differs. So ordering is enforced **within one agent's own sequence
+  of calls**, where the order it emitted them in is the script, and not across
+  independent agents, which share no script.
+
+  Agent Core injects a `concurrent` parameter into every acting tool's schema
+  (`mcp_client.with_parallel_param`) — drivers do not declare it, because whether a
+  call should overlap the previous one is a property of the intent, not the hardware.
+  It defaults to **false**: a model does not reason about concurrency unless made to,
+  and the unsafe direction — a warning overlapping the motion it warns about — is the
+  one that should require an explicit request. Ownership comes from
+  `mcp_client.current_agent_context`, which each subagent sets to its own id.
 - **A timeout clears pending and proceeds exactly like success.** So a terminal state
   has to outlive its pending (`mcp_client.action_outcome`), and anything reporting
   work upward must carry `SubagentResult.confirmed_actions()` rather than prose — an

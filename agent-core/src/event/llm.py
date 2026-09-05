@@ -257,7 +257,8 @@ def _sys_tool_needs_barrier(name: str) -> bool:
 async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
                        interrupt_fallback=None,
                        want: frozenset | None = None,
-                       scoped: bool = False) -> dict | None:
+                       scoped: bool = False,
+                       concurrent: bool = False) -> dict | None:
     """有 pending ACP 动作时等待其完成，并记录非正常结果。无 pending 则直接返回。
 
     `scoped=True` 时只等与 `want`（本次调用要占用的物理资源）冲突的 pending；
@@ -281,12 +282,14 @@ async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
 
     if not barge_in:
         result = await mcp_client.await_pending(cancel_event, timeout=120,
-                                               want=want, scoped=scoped)
+                                               want=want, scoped=scoped,
+                                               concurrent=concurrent)
         _acp_barrier_log(name, result)
         return result
 
     barrier = asyncio.create_task(mcp_client.await_pending(cancel_event, timeout=120,
-                                                          want=want, scoped=scoped))
+                                                          want=want, scoped=scoped,
+                                                          concurrent=concurrent))
     steering = asyncio.create_task(_wait_for_steering())
     try:
         done, _ = await asyncio.wait(
@@ -1460,9 +1463,14 @@ class Event:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 只等与本次调用资源冲突的 pending（见 _needs_barrier）
+                    # Pop `concurrent` before _needs_barrier looks at args and before
+                    # the call leaves for the device — it is harness-injected and the
+                    # driver's schema does not know it.
+                    _parallel = mcp_client.take_parallel_flag(args)
                     _bar_needed, _bar_want = _needs_barrier(name, args)
                     if _bar_needed:
-                        await _acp_barrier(name, cancel_event, want=_bar_want, scoped=True)
+                        await _acp_barrier(name, cancel_event, want=_bar_want,
+                                           scoped=True, concurrent=_parallel)
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     # Inject instance_id from canvas binding (multiInstance tools need it)
