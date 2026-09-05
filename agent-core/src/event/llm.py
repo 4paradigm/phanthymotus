@@ -217,18 +217,37 @@ _STEERING_POLL_S = 0.1
 # 结束本轮 —— 讲解被截断。其余系统工具不挡：task_update 等应能在播放期间调用，
 # 否则每站都要多等一整段音频。
 #
-# `peer_delegate` 和 `subagent_spawn` 也必须挡，理由和 finish 一样但更隐蔽：它们把活
-# 交给另一个执行者，而那个执行者的第一件事往往是占用同一个物理资源。Orin5 实测，五轮
-# 相声每轮都是同一个形状 ——
+# 让**别人**去动手的系统工具同样必须挡，理由和 finish 一样但更隐蔽：交出去之后，对方第
+# 一件事往往就是占用同一个物理资源。这些工具不是 `mcp__` 前缀，所以 `_needs_barrier` 在
+# 第一行就返回 False —— 只有出现在这个集合里才会被拦。
 #
-#   19:00:46.836  registered pending: speak-a9795bd8   ← 自己开始说
-#   19:00:48.337  peer_delegate("什么？")              ← 1.50s 后就叫对端开口
-#   19:00:50.26   acp/complete                          ← 自己这句才播完
+# Orin5 实测，五轮相声每轮同一个形状：
 #
-# 交出话语权的间隔是 1.50 / 1.83 / 1.93 / 1.61 / 1.75 秒，而自己那句实际播 3.4–7.6 秒：
-# 每一轮两张嘴都重叠好几秒。它对自己的嘴是守 barrier 的（下一句 tts 前会等），只是从没
-# 把"让别人说"算成一次输出。
-_ACP_BARRIER_SYSTEM_TOOLS = frozenset({'finish', 'peer_delegate', 'subagent_spawn'})
+#   16:00:20.863  registered pending: speak-406f7423   ← 自己开始说（实播 14.1s）
+#   16:00:23.579  peer_call(让 Orin6 说)               ← 2.7s 后就叫对端开口
+#   16:00:31.186  barrier: waiting ['speak-406f7423']   ← 直到自己下一句才拦
+#
+# 间隔 2.7 / 1.7 / 2.9 / 2.5 / 2.6 秒，自己那句要播 5–14 秒：两张嘴每轮都重叠。
+# 它对自己的嘴一直是守 barrier 的，只是从没把"让别人说"算成一次输出。
+#
+# 这里**穷举**而不是按名字猜：上一版只加了 peer_delegate 和 subagent_spawn，漏掉的
+# peer_call 恰好就是这次实测用的那扇门。`test_handoff_tools_are_partitioned` 会强制新增的
+# peer_* / subagent_* 工具二选一落到这里或下面的只读集合，免得再漏第三扇。
+_HANDOFF_SYSTEM_TOOLS = frozenset({
+    'peer_call',            # 直接调对端的工具 —— 对端立刻执行
+    'peer_delegate',        # 对端起 subagent 干活
+    'subagent_spawn',       # 本机起 subagent
+    'subagent_spawn_sync',
+    'subagent_message',     # 可能唤醒一个在等指令的 subagent 去动手
+})
+
+# 只读 / 纯管理，不会让任何人开始动作 —— 不挡，否则每次查状态都要等一整段音频。
+_READ_ONLY_HANDOFF_TOOLS = frozenset({
+    'peer_list', 'peer_state', 'peer_tools',
+    'subagent_status', 'subagent_result', 'subagent_cancel',
+})
+
+_ACP_BARRIER_SYSTEM_TOOLS = frozenset({'finish'}) | _HANDOFF_SYSTEM_TOOLS
 
 
 def _sys_tool_needs_barrier(name: str) -> bool:
