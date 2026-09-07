@@ -396,80 +396,28 @@ assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; \
 print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
     fi && rm -f /tmp/vits2-requirements.txt
 
-# ── Standalone onnxruntime (face recognition: SCRFD + ArcFace) ────────────────
-# **Placed here, last of the dependency layers, on purpose.** Everything above
-# is shared by ASR/TTS/VOP/OCR; this package is used by the face plugin alone.
-# A layer inserted higher up invalidates the Docker cache for every layer below
-# it, and several of those install *unpinned* (`ultralytics`, `phonemizer`), so
-# they silently re-resolve to whatever is newest — an earlier revision of this
-# change touched /etc/jetpack.env near the top of the file and moved ultralytics
-# 8.4.138 → 8.4.142 as a side effect, with nothing to do with face recognition.
-# Keep it below every shared layer and above only the COPY of application code,
-# which rebuilds on any source edit anyway. ORT_VERSION is resolved right here
-# rather than in /etc/jetpack.env for the same reason: that file is layer 2.
+# ── onnxruntime, CPU-only (used by the face recognition plugin alone) ────────
+# A second ONNX Runtime: sherpa-onnx bundles its own but exposes no way to run
+# our models on it. They coexist fine — measured on Orin6, both import orders
+# and both holding live sessions.
 #
-# This is a *second, independent* ONNX Runtime in the image. The first is the
-# one compiled into the sherpa-onnx wheel under sherpa_onnx/lib, which only ASR
-# and sherpa TTS can reach; there is no supported way to run our own models on
-# it. The OCR step above notes that onnxruntime was deliberately absent — that
-# was correct while rapidocr was used for post-processing only and OCR ran on
-# TensorRT. The face models are plain ONNX and must run on CPU and GPU hosts
-# alike, which rules out a TensorRT-only path (engines are not portable across
-# TensorRT majors, so it would mean a bundle per JetPack line for a 15 MB pair).
+# Deliberately the last dependency layer. A step inserted higher up invalidates
+# the cache for every layer below, and several of those install *unpinned*
+# (ultralytics, phonemizer), so they silently re-resolve to whatever is newest.
 #
-# **The two runtimes do coexist.** Measured on Orin6, five sequences each in
-# their own process: ORT alone; both imported; sherpa VAD session then an ORT
-# session; the same with RTLD_DEEPBIND; and ORT session then sherpa. All passed,
-# with both libraries mapped and neither interposing, because each extension
-# resolves against its own RPATH.
+# --no-deps: a resolved install also pulls protobuf, coloredlogs, humanfriendly
+# and flatbuffers, and protobuf was not in this image at all. None is needed for
+# inference (verified on Tianyi: session builds, run() returns all 9 outputs),
+# so this adds exactly one wheel and moves nothing else — numpy included, which
+# the torch/cv2/rapidocr stack is ABI-bound to.
 #
-# **One version for both JetPack lines.** 1.18.1 is what sherpa-onnx bundles on
-# jp6.1 (`libonnxruntime.so.1.18.1`), so on that line the two mapped runtimes
-# are ABI-identical. It also runs on jp5.11: its cp38 aarch64 wheel is
-# manylinux_2_28 and focal has glibc 2.31, verified on Orin5 (Ubuntu 20.04,
-# glibc 2.31, py 3.8) building a session and inferring. A per-line split was
-# tried first and dropped — nothing needed it, and one version is one thing to
-# reason about.
-#
-# **DO NOT bump to 1.19.x.** 1.19.2 enumerates the cores in
-# /sys/devices/system/cpu/present and pins a thread to each; on a Jetson where a
-# power mode has parked some cores (Tianyi in MODE_30W: present 0-11, online
-# 0-7) pthread_setaffinity_np returns EINVAL and a std::vector index then goes
-# out of range, abort()ing the whole perception process inside
-# InferenceSession() with no Python traceback. Measured on Tianyi: 1.19.2 aborts
-# under every SessionOptions combination including none at all, so no
-# configuration avoids it; 1.18.1, 1.17.3 and 1.16.3 each build a session and
-# return all 9 SCRFD outputs. Orin6 has present == online and never reproduces
-# it, so test a bump on a robot whose power mode parks cores.
-#
-# **`--no-deps`, deliberately.** A resolved install pulls protobuf, coloredlogs,
-# humanfriendly and flatbuffers in behind onnxruntime — and measured on the
-# jp6.1 image, protobuf was not previously present at all, so it would introduce
-# protobuf 7.36.1 into an image where rapidocr, TensorRT and ROS2 all live. None
-# of it is needed for inference: verified on Tianyi that with `--no-deps` and
-# none of those packages installed, InferenceSession builds and run() returns
-# all 9 outputs. numpy is therefore not reinstalled either — nothing is touched
-# but onnxruntime itself, which is the only safe way to add a runtime here given
-# the numpy C-ABI the torch/cv2/rapidocr stack is built against.
-#
-# CPU wheel: `device: auto` resolves to cpu on this image. A CUDA build for
-# Jetson is a separate per-JetPack wheel that must be hosted on COS the way
-# SHERPA_GPU_WHEEL is; when it lands, `auto` picks it up with no code change.
-ARG ORT_VERSION=1.18.1
-RUN . /etc/jetpack.env; \
-    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
-      "onnxruntime==${ORT_VERSION}" && \
-    python3 -c "import onnxruntime, sherpa_onnx; print('[build] ort-first import ok')" && \
-    python3 -c "import sherpa_onnx, onnxruntime; print('[build] sherpa-first import ok')" && \
-    python3 -c "import numpy, onnxruntime, sherpa_onnx, rapidocr, tensorrt, torch; \
-assert numpy.__version__ == '${NUMPY_VERSION}', \
-    'onnxruntime moved numpy to %s' % numpy.__version__; \
-assert not onnxruntime.__version__.startswith('1.19'), \
-    'onnxruntime 1.19.x abort()s on Jetsons with parked cores; see this step'; \
-print('[build] onnxruntime', onnxruntime.__version__, \
-      'providers:', onnxruntime.get_available_providers()); \
-print('[build] intact alongside it: sherpa-onnx', sherpa_onnx.__version__, \
-      '| tensorrt', tensorrt.__version__, '| numpy', numpy.__version__)"
+# 1.18.1 pinned, and **never 1.19.x**: 1.19.2 pins a thread to every core in
+# /sys/devices/system/cpu/present, so where a power mode has parked some (Tianyi
+# in MODE_30W: present 0-11, online 0-7) pthread_setaffinity_np returns EINVAL,
+# a vector index goes out of range, and all of perception abort()s inside
+# InferenceSession() with no traceback. 1.18.1 is also exactly what sherpa-onnx
+# bundles on jp6.1. Verified on Orin5 (py3.8, glibc 2.31) and Tianyi (py3.10).
+RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} onnxruntime==1.18.1
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
