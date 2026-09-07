@@ -80,12 +80,39 @@ _SEEN_FLUSH_INTERVAL_SECONDS = 300.0
 DEFAULT_MATCH_THRESHOLD = 0.35
 DEFAULT_SUBJECT_DOMINANCE = 1.6
 DEFAULT_MAX_FACES = 8
+DEFAULT_DETECT_FPS = 1.0
 DEFAULT_ENROLL_WINDOW_S = 3.0
 DEFAULT_ENROLL_WINDOW_MAX_FRAMES = 60
 DEFAULT_ENROLL_MAX_ANALYZED = 8
 DEFAULT_MAX_BATCH = 200
 DEFAULT_MAX_IMAGE_BYTES = 16 * 1024 * 1024
 DEFAULT_IMAGE_ROOTS = ("/models", "/tmp", "/work")
+
+
+def detect_interval(cfg: dict) -> float:
+    """Seconds to leave between detections, from `detect_fps`.
+
+    Expressed as a frequency because that is what an operator reasons about
+    ("look once a second"), and it stays meaningful when the camera's own rate
+    changes — a minimum interval in ms does not. Fractional values are the
+    point: 0.2 means once every five seconds.
+
+    `detect_fps: 0` means "every frame the camera delivers". `min_interval_ms`
+    is still honoured when `detect_fps` is absent, so a canvas saved by an
+    earlier build of this plugin keeps working (same courtesy
+    `normalize_device` extends to the pre-`device` ASR config).
+    """
+    if cfg.get("detect_fps") is None and cfg.get("min_interval_ms") is not None:
+        legacy = max(0.0, float(cfg["min_interval_ms"])) / 1000.0
+        log.info("[face] using legacy min_interval_ms=%s as %.3fs between "
+                 "detections; set detect_fps instead",
+                 cfg["min_interval_ms"], legacy)
+        return legacy
+    fps = float(cfg.get("detect_fps", DEFAULT_DETECT_FPS))
+    if fps <= 0:
+        return 0.0
+    return 1.0 / fps
+
 
 _IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
@@ -170,12 +197,13 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
+                "device":            {"type": "string", "enum": ["auto", "cpu", "gpu"], "default": "auto", "description": "推理设备。auto=有 GPU 用 GPU，没有则用 CPU"},
+                "detect_fps":        {"type": "number", "minimum": 0, "default": DEFAULT_DETECT_FPS, "description": "检测频率，每秒 x 次，支持小数（如 0.5 = 每 2 秒一次）；0=每帧都检测", "scope": "instance"},
                 "match_threshold":   {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格（越不容易认错人，但越容易认不出）"},
                 "min_face_px":       {"type": "integer", "minimum": 16, "default": DEFAULT_MIN_FACE_PX, "description": "最小人脸边长(px)，小于此值不做识别"},
                 "blur_min":          {"type": "number", "minimum": 0.0, "default": DEFAULT_BLUR_MIN, "description": "清晰度下限(拉普拉斯方差)，低于此值视为模糊人脸"},
                 "max_faces":         {"type": "integer", "minimum": 1, "default": DEFAULT_MAX_FACES, "description": "单帧最多处理的人脸数"},
                 "unknown_capacity":  {"type": "integer", "minimum": 0, "default": DEFAULT_UNKNOWN_CAPACITY, "description": "陌生人(unknown-N)数量上限，超出时淘汰最久未见的；已注册人员不受影响"},
-                "min_interval_ms":   {"type": "integer", "minimum": 0, "default": 200, "description": "帧处理最小间隔(ms)，限制算力占用，0=不限", "scope": "instance"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -675,7 +703,7 @@ class _FaceNode(Node):
         engine: _FaceEngine,
         cfg: dict,
         node_suffix: str = "",
-        min_interval: float = 0.0,
+        detect_interval_s: float = 1.0,
     ):
         node_name = f"face_{node_suffix}" if node_suffix else "face"
         super().__init__(node_name)
@@ -684,7 +712,8 @@ class _FaceNode(Node):
         self._output_topic = _face_output_topic(input_topic)
         self._engine = engine
         self._cfg = dict(cfg)
-        self._min_interval = max(0.0, float(min_interval))
+        # Seconds between detections; 0 = every frame. See detect_interval().
+        self._detect_interval = max(0.0, float(detect_interval_s))
         self.state = "idle"
 
         self._sub = None
@@ -849,8 +878,8 @@ class _FaceNode(Node):
             if time.monotonic() - self._last_flush_at >= _SEEN_FLUSH_INTERVAL_SECONDS:
                 self._flush_seen()
 
-            if self._min_interval > 0:
-                remaining = self._min_interval - (time.time() - started)
+            if self._detect_interval > 0:
+                remaining = self._detect_interval - (time.time() - started)
                 if remaining > 0:
                     stop_event.wait(remaining)
 
@@ -964,9 +993,7 @@ class _FaceNode(Node):
     def apply_config(self, cfg: dict) -> None:
         """Apply lightweight fields to a running node, as OCR's config does."""
         self._cfg = dict(cfg)
-        self._min_interval = max(
-            0.0, float(cfg.get("min_interval_ms", 0)) / 1000.0
-        )
+        self._detect_interval = detect_interval(cfg)
         self._window_seconds = float(
             cfg.get("enroll_window_s", DEFAULT_ENROLL_WINDOW_S)
         )
@@ -1110,7 +1137,7 @@ class FaceRecognitionPlugin:
             engine,
             cfg,
             node_suffix=node_key.replace("/", "_").replace("-", "_"),
-            min_interval=float(cfg.get("min_interval_ms", 0)) / 1000.0,
+            detect_interval_s=detect_interval(cfg),
         )
 
     def _dispose(self, node_key: str, node: _FaceNode) -> None:
@@ -1343,7 +1370,10 @@ class FaceRecognitionPlugin:
             self._dispose(node_key, node)
         return {"state": "idle"}
 
-    _INSTANCE_SCOPED = ("min_interval_ms",)
+    # Per-instance because one camera may want a different cadence from
+    # another; everything else (thresholds, the model, the database) is
+    # shared by every instance of the plugin.
+    _INSTANCE_SCOPED = ("detect_fps", "min_interval_ms")
 
     def _do_config(self, instance_id: str, args: dict) -> dict:
         cfg = {
@@ -1365,7 +1395,7 @@ class FaceRecognitionPlugin:
                 node = self._nodes.get(instance_id)
                 merged = self._merged_cfg(instance_id)
             if node is not None:
-                # min_interval_ms is applied in place; no reason to retire a
+                # detect_fps is applied in place; no reason to retire a
                 # live subscription for a frame-rate change.
                 node.apply_config(merged)
             return {"status": "configured", "instance_id": instance_id}

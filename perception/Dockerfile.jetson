@@ -43,10 +43,19 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 #   DLA_COMPILER_SO  COS key of the bundled libnvdla_compiler.so, or empty for a
 #                  line that does not need one (see the dla-fallback step).
 #   ORT_VERSION    standalone onnxruntime for the face plugin, pinned per line
-#                  because the wheel is tagged with the CPython ABI: jp5.11 is
-#                  cp38, for which onnxruntime stopped publishing wheels after
-#                  1.19, and jp6.1 is cp310. Unrelated to the ONNX Runtime
-#                  inside the sherpa-onnx wheel — see the onnxruntime step.
+#                  to the *same version sherpa-onnx bundles* on that line
+#                  (jp5.11 → 1.16.0, jp6.1 → libonnxruntime.so.1.18.1), so the
+#                  two ONNX Runtimes in the process are ABI-identical. Also the
+#                  ABI gate: jp5.11 is cp38, jp6.1 is cp310.
+#                  DO NOT bump to 1.19.x. 1.19.2 enumerates the cores in
+#                  /sys/devices/system/cpu/present and pins threads to them; on
+#                  a Jetson where some cores are *offline* (Tianyi in MODE_30W:
+#                  present 0-11, online 0-7) pthread_setaffinity_np returns
+#                  EINVAL and a std::vector index then goes out of range,
+#                  abort()ing the whole perception process during
+#                  InferenceSession(). Measured on Tianyi: 1.19.2 aborts with
+#                  every SessionOptions combination including none at all;
+#                  1.18.1, 1.17.3 and 1.16.3 all build a session and infer.
 #
 # It is also a record: `docker exec <c> cat /etc/jetpack.env` says what line an
 # image was built for, which is otherwise guesswork from the tag alone.
@@ -55,8 +64,8 @@ ARG SHERPA_GPU_WHEEL_61=jp61/sherpa_onnx-1.13.6+cuda-cp310-cp310-linux_aarch64.w
 ARG DLA_COMPILER_SO_61=jp61/libnvdla_compiler.so
 RUN case "${JP_VERSION}" in \
         511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}"; DLA=; ORT=1.16.3 ;; \
-        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; DLA="${DLA_COMPILER_SO_61}"; ORT=1.19.2 ;; \
-        *)   NUMPY=1.24.4; WHEEL=; DLA=; ORT=1.19.2 ;; \
+        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; DLA="${DLA_COMPILER_SO_61}"; ORT=1.18.1 ;; \
+        *)   NUMPY=1.24.4; WHEEL=; DLA=; ORT=1.18.1 ;; \
     esac; \
     printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\nDLA_COMPILER_SO=%s\nORT_VERSION=%s\n' \
         "${NUMPY}" "${WHEEL}" \
@@ -346,34 +355,51 @@ RUN . /etc/jetpack.env; \
 # hosts, which rules out a TensorRT-only path (engines are not portable across
 # TensorRT majors, so it would mean a bundle per JetPack line for a 15 MB pair).
 #
-# CPU wheel from PyPI. A CUDA-capable build for Jetson is a separate,
-# per-JetPack wheel that has to be hosted on COS the way SHERPA_GPU_WHEEL is;
-# until that exists `device: gpu` degrades to cpu with a warning
-# (utils/onnx_provider.ort_providers_for_device). The models are 2.5 MB and
-# 13 MB, so this is a throughput choice, not a correctness one.
+# **The two runtimes do coexist.** Measured on Orin6 in this image, five
+# sequences all passed, each in its own process: ORT alone; both imported;
+# sherpa VAD session then an ORT session; the same with RTLD_DEEPBIND; and ORT
+# session then sherpa. Both libraries stay mapped (`sherpa_onnx/lib/
+# libonnxruntime.so.1.18.1` and the wheel's own) without interposing on each
+# other, because each extension resolves against its own RPATH. So the symbol
+# clash this layer was originally written to guard against does not occur, and
+# the import asserts below are cheap insurance rather than the real risk.
 #
-# numpy is pinned on the same line for the reason the OCR step gives: several
-# packages in the base image are built against a specific numpy C-ABI, and an
-# unpinned install silently upgrades it.
+# The real risk was the ORT *version*, and it is why ORT_VERSION is pinned per
+# line rather than left to pip — see /etc/jetpack.env above for the offline-core
+# abort that 1.19.2 causes. Matching sherpa's bundled version also means the two
+# mapped runtimes are ABI-identical, so an accidental interposition would be
+# benign rather than a memory-layout mismatch.
 #
-# The assert is the point of this layer. Two ONNX Runtimes in one process could
-# clash at the symbol level — both ship a libonnxruntime, sherpa's resolved via
-# RPATH from its own extension — and a clash surfaces when the second one's
-# shared objects are dlopen'd, i.e. at import. So import in both orders: if
-# either direction is going to break, it breaks here, in the build, rather than
-# on a robot. Creating a session from each in one process needs model files that
-# do not exist at build time; that half is verified on hardware (an ASR
-# utterance and a face recognition both working in the same container).
+# CPU wheel from PyPI: `device: auto` therefore resolves to cpu on this image.
+# A CUDA-capable build for Jetson is a separate, per-JetPack wheel that has to
+# be hosted on COS the way SHERPA_GPU_WHEEL is; until that exists the models
+# (2.5 MB + 13 MB) run on cpu, which at the default 1 detection/second is a
+# throughput choice, not a correctness one.
+#
+# **`--no-deps`, deliberately.** A plain install pulls protobuf, coloredlogs,
+# humanfriendly and flatbuffers in behind onnxruntime — and measured on the
+# jp6.1 image, protobuf was not previously present at all, so a resolved
+# install introduces protobuf 7.36.1 into an image where OCR (rapidocr),
+# TensorRT and ROS2 all live. None of that is needed for inference: verified on
+# Tianyi that with `--no-deps` and no protobuf/coloredlogs/flatbuffers at all,
+# `InferenceSession` builds and `run()` returns all 9 SCRFD outputs. numpy is
+# therefore not reinstalled either — nothing is touched but onnxruntime itself,
+# which is the only way to add a runtime here without risking the numpy C-ABI
+# the torch/cv2/rapidocr stack is built against. The assert still checks numpy
+# did not move.
 RUN . /etc/jetpack.env; \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-      "numpy==${NUMPY_VERSION}" "onnxruntime==${ORT_VERSION}" && \
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} \
+      "onnxruntime==${ORT_VERSION}" && \
     python3 -c "import onnxruntime, sherpa_onnx; print('[build] ort-first import ok')" && \
     python3 -c "import sherpa_onnx, onnxruntime; print('[build] sherpa-first import ok')" && \
-    python3 -c "import numpy, onnxruntime, sherpa_onnx; \
+    python3 -c "import numpy, onnxruntime, sherpa_onnx, rapidocr, tensorrt, torch; \
 assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; \
+assert not onnxruntime.__version__.startswith('1.19'), \
+    'onnxruntime 1.19.x abort()s on Jetsons with offline cores; see jetpack.env'; \
 print('[build] onnxruntime', onnxruntime.__version__, \
       'providers:', onnxruntime.get_available_providers()); \
-print('[build] sherpa-onnx', sherpa_onnx.__version__, 'coexists; numpy', numpy.__version__)"
+print('[build] intact alongside it: sherpa-onnx', sherpa_onnx.__version__, \
+      '| tensorrt', tensorrt.__version__, '| numpy', numpy.__version__)"
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the

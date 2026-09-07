@@ -160,7 +160,7 @@ def _base_cfg(tmp_path, **overrides) -> dict:
         "max_faces": 8,
         "enroll_window_s": 3.0,
         "enroll_max_analyzed": 8,
-        "min_interval_ms": 0,
+        "detect_fps": 0,
         "unknown_capacity": 500,
         "max_batch": 200,
     }
@@ -355,7 +355,7 @@ def test_start_stop_churn_leaves_no_orphan_node(monkeypatch, tmp_path):
                 "action": "start", "input_topic": "/cam/rgb"})
             plugin.dispatch("face_recognition", {"action": "stop"})
             plugin.dispatch("face_recognition", {
-                "action": "config", "min_interval_ms": 10})
+                "action": "config", "detect_fps": 100})
         plugin.dispatch("face_recognition", {"action": "stop"})
         time.sleep(0.4)
 
@@ -882,10 +882,62 @@ def test_instance_config_rejects_shared_settings(plugin):
     assert _wait_until(lambda: plugin._nodes, timeout=5.0)
 
     ok = plugin.dispatch("face_recognition", {
-        "action": "config", "instance_id": "/cam", "min_interval_ms": 500})
+        "action": "config", "instance_id": "/cam", "detect_fps": 2})
     assert ok["status"] == "configured"
-    assert plugin._nodes["/cam"]._min_interval == pytest.approx(0.5)
+    assert plugin._nodes["/cam"]._detect_interval == pytest.approx(0.5)
 
     with pytest.raises(ValueError):
         plugin.dispatch("face_recognition", {
             "action": "config", "instance_id": "/cam", "match_threshold": 0.4})
+
+
+# ── detect_fps (检测频率) ──────────────────────────────────────────────────────
+
+def test_detect_fps_maps_to_an_interval_and_accepts_decimals():
+    assert face_plugin.detect_interval({}) == pytest.approx(1.0)        # default
+    assert face_plugin.detect_interval({"detect_fps": 2}) == pytest.approx(0.5)
+    assert face_plugin.detect_interval({"detect_fps": 0.5}) == pytest.approx(2.0)
+    assert face_plugin.detect_interval({"detect_fps": 0.2}) == pytest.approx(5.0)
+    assert face_plugin.detect_interval({"detect_fps": 10}) == pytest.approx(0.1)
+
+
+def test_detect_fps_zero_means_every_frame():
+    assert face_plugin.detect_interval({"detect_fps": 0}) == 0.0
+    assert face_plugin.detect_interval({"detect_fps": -3}) == 0.0
+
+
+def test_legacy_min_interval_ms_still_honoured():
+    """A canvas saved by the pre-detect_fps build must keep working."""
+    assert face_plugin.detect_interval({"min_interval_ms": 500}) == pytest.approx(0.5)
+    # detect_fps wins when both are present.
+    assert face_plugin.detect_interval(
+        {"detect_fps": 4, "min_interval_ms": 500}) == pytest.approx(0.25)
+
+
+def test_default_config_detects_once_per_second(monkeypatch, tmp_path):
+    """The shipped default, end to end through the node."""
+    probe = _EngineProbe(tmp_path)
+    monkeypatch.setattr(face_plugin, "_build_engine", probe)
+    cfg = _base_cfg(tmp_path)
+    cfg.pop("detect_fps")                     # fall back to the default
+    plugin = face_plugin.FaceRecognitionPlugin(cfg, _FakeExecutor())
+    try:
+        plugin.dispatch("face_recognition", {"action": "start", "input_topic": "/cam"})
+        assert _wait_until(lambda: plugin._nodes.get("/cam"), timeout=5.0)
+        assert plugin._nodes["/cam"]._detect_interval == pytest.approx(1.0)
+    finally:
+        plugin.dispatch("face_recognition", {"action": "stop"})
+
+
+def test_detect_fps_is_declared_on_the_card_as_a_decimal_number():
+    schema = face_plugin.TOOLS[0]["configSchema"]["properties"]["detect_fps"]
+    assert schema["type"] == "number"          # not integer — decimals required
+    assert schema["default"] == 1.0
+    assert schema["minimum"] == 0
+    assert schema.get("scope") == "instance"
+
+
+def test_device_is_declared_on_the_card_with_auto_default():
+    schema = face_plugin.TOOLS[0]["configSchema"]["properties"]["device"]
+    assert schema["default"] == "auto"
+    assert set(schema["enum"]) == {"auto", "cpu", "gpu"}

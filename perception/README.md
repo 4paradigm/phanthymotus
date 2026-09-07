@@ -704,11 +704,54 @@ needs them):
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that
-one; there is no supported way to run our own models on it). `device: cpu | gpu`
-selects providers through `utils/onnx_provider.ort_providers_for_device`. The image
-currently carries the **CPU wheel**, so `device: gpu` degrades to cpu with a warning
-— a per-JetPack `onnxruntime-gpu` wheel on COS is the follow-up, mirroring
-`SHERPA_GPU_WHEEL` in `Dockerfile.jetson`.
+one; there is no supported way to run our own models on it).
+
+`device: auto | cpu | gpu`, default **auto** — use the GPU when the installed
+onnxruntime offers a CUDA or TensorRT provider, else CPU. `auto` resolving to cpu
+is not warned about, because it is the expected outcome on this image: it ships
+the **CPU wheel**, so today `auto` always means cpu. An explicit `gpu` that cannot
+be honoured warns and degrades. A per-JetPack `onnxruntime-gpu` wheel on COS is
+the follow-up, mirroring `SHERPA_GPU_WHEEL` in `Dockerfile.jetson`; nothing else
+has to change when it lands, because `auto` will pick it up.
+
+#### The onnxruntime version is pinned, and 1.19.x must not be used
+
+`ORT_VERSION` in `/etc/jetpack.env` is pinned per JetPack line to **the same
+version sherpa-onnx bundles** there (jp5.11 → 1.16.x, jp6.1 → 1.18.1), so the two
+runtimes in the process are ABI-identical.
+
+**onnxruntime 1.19.2 abort()s the whole perception process** during
+`InferenceSession()` on a Jetson where some cores are parked. It enumerates
+`/sys/devices/system/cpu/present` and pins threads to every core in it; on Tianyi
+in MODE_30W (`present` 0-11, `online` 0-7) `pthread_setaffinity_np` returns EINVAL
+and a `std::vector` index then goes out of range:
+
+```
+pthread_setaffinity_np failed for thread: 31, index: 1, mask: {9, }, error code: 22
+stl_vector.h:1123 ... Assertion '__n < this->size()' failed.  Fatal Python error: Aborted
+```
+
+Measured on Tianyi: 1.19.2 aborts with **every** `SessionOptions` combination,
+including none at all, so no amount of configuration avoids it; 1.18.1, 1.17.3 and
+1.16.3 each build a session and return all 9 SCRFD outputs. The build asserts the
+installed version is not 1.19.x, and `warn_on_parked_cores()` logs the
+present/online mismatch at load time — an abort leaves no Python traceback, so the
+precondition has to be in the log *before* the session is created.
+
+Orin6 has `present == online`, so this never reproduces there. Judge it on a robot
+whose power mode parks cores.
+
+#### Its dependencies are deliberately not installed
+
+`pip install --no-deps`. A resolved install pulls in protobuf, coloredlogs,
+humanfriendly and flatbuffers — and measured on the jp6.1 image, **protobuf was
+not present at all** beforehand, so a plain install would introduce protobuf
+7.36.1 into an image where rapidocr, TensorRT and ROS2 all live. None of it is
+needed for inference: verified on Tianyi that with `--no-deps` and none of those
+packages present, `InferenceSession` builds and `run()` returns all 9 outputs. So
+this layer adds exactly one package and touches nothing else — numpy included,
+which matters because the torch/cv2/rapidocr stack is built against a specific
+numpy C-ABI.
 
 The `insightface` package is deliberately not a dependency: it wants onnx,
 scikit-image, scikit-learn and Cython to wrap ~200 lines of pre/post-processing.
@@ -768,6 +811,14 @@ Published payload (`{input_topic}/face`):
 A stranger who clears the quality gate is auto-enrolled and reported as
 `unknown-N`, with the **same id on every later sighting and after a restart** —
 which is what makes `register_current_stream` able to name them retroactively.
+
+Detection runs at **`detect_fps`** — 检测频率, detections per second, default
+**1.0**, fractional allowed (`0.5` = once every two seconds, `0` = every frame the
+camera delivers). It is per-instance, so two cameras can run at different
+cadences. Expressed as a frequency rather than a minimum interval because that is
+what an operator reasons about, and it stays meaningful when the camera's own rate
+changes. (`min_interval_ms`, the knob this replaced, is still honoured when
+`detect_fps` is absent, so a canvas saved by an earlier build keeps working.)
 
 A face that *fails* the gate is reported with `person_id: null`, `quality: "low"`
 and a `reason`, and is neither matched nor enrolled. Matching a blurred 30 px face

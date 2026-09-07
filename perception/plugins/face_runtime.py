@@ -33,7 +33,7 @@ import numpy as np
 
 from utils.cv2_compat import load_cv2
 from utils.model_downloader import ensure_face_model
-from utils.onnx_provider import normalize_device, ort_providers_for_device
+from utils.onnx_provider import ort_providers_for_device, warn_on_parked_cores
 
 log = logging.getLogger(__name__)
 
@@ -202,7 +202,7 @@ class FaceAnalyzer:
     def __init__(
         self,
         model_dir: str = DEFAULT_FACE_MODEL_DIR,
-        device: str = "cpu",
+        device: str = "auto",
         det_size: tuple[int, int] = DEFAULT_DET_SIZE,
         det_thresh: float = DEFAULT_DET_THRESH,
         nms_thresh: float = DEFAULT_NMS_THRESH,
@@ -212,7 +212,7 @@ class FaceAnalyzer:
         import onnxruntime as ort
 
         self._cv2 = load_cv2()
-        self._device = normalize_device(device)
+        self._requested_device = (device or "auto").strip().lower()
         self._det_thresh = float(det_thresh)
         self._nms_thresh = float(nms_thresh)
         width, height = (int(det_size[0]), int(det_size[1]))
@@ -225,7 +225,16 @@ class FaceAnalyzer:
         det_path = paths.get(DET_MODEL_FILE) or os.path.join(model_dir, DET_MODEL_FILE)
         rec_path = paths.get(REC_MODEL_FILE) or os.path.join(model_dir, REC_MODEL_FILE)
 
-        providers = ort_providers_for_device(self._device)
+        providers = ort_providers_for_device(self._requested_device)
+        # `device` resolves here, not in config: `auto` means "gpu when the
+        # installed wheel has one". Recorded so info/logs report what is
+        # actually running rather than what was asked for.
+        self._device = "gpu" if providers[0] != "CPUExecutionProvider" else "cpu"
+        # Session creation is where a parked-core Jetson abort()s under a bad
+        # ORT version, and an abort prints no Python traceback. Say the
+        # precondition first, so the last line before a silent death names it.
+        warn_on_parked_cores("face")
+
         options = ort.SessionOptions()
         options.intra_op_num_threads = max(1, int(num_threads))
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -248,8 +257,10 @@ class FaceAnalyzer:
             )
 
         log.info(
-            "[face] analyzer ready: device=%s providers=%s det=%s rec=%s size=%s",
-            self._device, self._det.get_providers(),
+            "[face] analyzer ready: onnxruntime=%s device=%s (requested %s) "
+            "providers=%s det=%s rec=%s size=%s",
+            ort.__version__, self._device, self._requested_device,
+            self._det.get_providers(),
             os.path.basename(det_path), os.path.basename(rec_path),
             self._det_size,
         )
@@ -261,6 +272,7 @@ class FaceAnalyzer:
 
     @property
     def device(self) -> str:
+        """The device actually in use — `auto` is already resolved."""
         return self._device
 
     @property
