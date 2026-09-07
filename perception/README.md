@@ -802,6 +802,93 @@ be pinned, and the robots have no reliable route to GitHub. To refresh, download
 and forces its own key shape), then re-download from COS and paste the *verified*
 `size`/`sha256` into `FACE_MODEL_FILES`.
 
+### The person record: `name` vs `profile`
+
+The split is about **what gets published**:
+
+| field | type | in the per-frame payload | what it is |
+|---|---|---|---|
+| `id` | str | yes | `p-N` (named) or `unknown-N` |
+| `name` | str | yes | 姓名, structured. A non-blank name is what makes an entry *named* |
+| `profile` | object | yes | 非结构化: gender, appearance, notes, tags - whatever the operator wants the agent to have in context |
+| `registered_at` | float | no | when the identity was created |
+| `last_seen_at` | float | no | most recent sighting |
+
+The timestamps are deliberately out of the payload: they change every frame (or
+never), and "when was this person around" is a question the **visit log** answers
+properly and a per-frame field cannot.
+
+A `profile` sent as a plain string is stored as `{"note": ...}` rather than
+rejected - an LLM will occasionally send prose where an object is expected.
+
+A database written by the pre-split build migrates on load: the old free-text
+`profile` becomes `name`, the old structured `meta` becomes `profile`, and
+`created_at` becomes `registered_at`. `persons.json` carries `version: 2`.
+
+### 访问记录表 - the visit log
+
+`visits.jsonl`, one line per **visit**, where a visit is a contiguous presence:
+
+```json
+{"person_id": "p-1", "name": "小王", "first_seen": 1788780000.0,
+ "last_seen": 1788783600.0, "sightings": 3417, "topic": "/cam/rgb"}
+```
+
+`list_visits` takes `person_id`, `since`, `until`, `limit`, `offset`. `since` and
+`until` accept epoch seconds **or** ISO-8601 (`2026-09-07T15:00`), because an
+operator asking "who was here at 3pm" thinks in wall-clock and an LLM will send a
+string. Filtering is by **overlap, not containment**: somebody present
+14:50-15:10 *was* there at 15:00, and a query for 15:00-15:05 has to say so.
+
+Three design points that are not obvious:
+
+**One row per visit, not per frame.** At the default 1 detection/second a
+per-frame log would be 86 400 writes a day per person onto eMMC, carrying no
+information a visit does not.
+
+**`visit_gap_s` is 10 minutes.** A visit closes only after the person has been
+unseen that long. A short gap would fragment one afternoon in the office into
+dozens of rows every time somebody turned their head.
+
+**Open visits are checkpointed, because that 10-minute gap is a data-loss
+window.** Somebody present all afternoon is a single visit held in memory for
+hours, and a robot that loses power would lose the whole record - not just the
+tail. So `visits-open.json` is rewritten at most every `visit_checkpoint_s`
+(60 s), bounding the loss to a minute of `last_seen`/`sightings`. On startup a
+checkpointed visit is **resumed** if its subject was seen recently, or closed and
+appended if they left while the process was down. The checkpoint is written
+*after* the append when a visit closes, so a crash in between replays a closed
+visit rather than dropping it - a duplicate is recoverable, a loss is not.
+Stopping an instance force-closes its open visits for the same reason.
+
+`list_visits` also returns visits still in progress, flagged `open: true`, so the
+10-minute close latency does not hide who is in the room right now.
+
+### Actions: register vs recognize
+
+Symmetric by suffix, and the two halves differ in more than direction:
+
+| | photo | stream | corpus |
+|---|---|---|---|
+| **register** (writes) | `register_by_photo` | `register_by_stream` | `register_by_corpus` |
+| **recognize** (read-only) | `recognize_by_photo` | `recognize_by_stream` | - |
+
+`recognize_*` is **read-only**: it neither auto-enrols the stranger it failed to
+match nor records a sighting. Asking "who is this" must not quietly change the
+answer. It also does **not** apply `subject_dominance`: that gate exists because
+enrolment has to resolve to exactly one person, whereas a query can just report
+everyone it sees. So a two-person photo is answered with two identities by
+`recognize_by_photo` and refused with `ambiguous_subject` by `register_by_photo` -
+same input, opposite handling, both correct.
+
+An unmatched face comes back as `person_id: null` with a `best_score`, which is
+the number an operator needs to decide whether `match_threshold` is too strict.
+
+`recognize_by_stream` scans the last **1 s** by default (not the 3 s enrolment
+window - the question is "who is in front of me now"), reports each person once at
+their best score across those frames, and falls back to reporting the clearest
+unidentified face so the answer is "someone I do not know" rather than "nobody".
+
 ### Identity database
 
 `plugins/face_db.py`, default `/models/face_db` — `/models` is the only host-mounted
@@ -828,15 +915,16 @@ later, because it may already be on the activity stream and in the agent's histo
 Published payload (`{input_topic}/face`):
 
 ```json
-{"ts": 1788777509.34, "topic": "/cam/rgb", "count": 1, "latency_ms": 28,
- "faces": [{"person_id": "p-1", "profile": "运营部小王", "known": true, "score": 0.61,
-            "bbox": [207, 186, 149, 206], "det_score": 0.811, "blur": 1484.2,
-            "min_side_px": 149, "quality": "ok"}]}
+{"ts": 1788777509.34, "count": 1, "latency_ms": 28,
+ "faces": [{"person_id": "p-1", "name": "小王", "profile": {"gender": "male"},
+            "known": true, "score": 0.61, "bbox": [207, 186, 149, 206],
+            "det_score": 0.811, "blur": 1484.2, "min_side_px": 149,
+            "quality": "ok"}]}
 ```
 
 A stranger who clears the quality gate is auto-enrolled and reported as
 `unknown-N`, with the **same id on every later sighting and after a restart** —
-which is what makes `register_current_stream` able to name them retroactively.
+which is what makes `register_by_stream` able to name them retroactively.
 
 Detection runs at **`detect_fps`** — 检测频率, detections per second, default
 **1.0**, fractional allowed (`0.5` = once every two seconds, `0` = every frame the
@@ -883,11 +971,11 @@ framed dead-on.
 
 | Action | Input |
 |--------|-------|
-| `register_user_photo` | `image_path` (confined to `image_roots`) or `image_b64`, plus `profile` and `meta` |
-| `register_current_stream` | `instance_id` + `profile`; analyses **every frame in the last `enroll_window_s`** (default 3 s, up to `enroll_max_analyzed` of them, newest first) |
-| `register_user_photos` | `package`: a directory, `.zip` or `.tar.gz`, by path or URL |
+| `register_by_photo` | `image_path` (confined to `image_roots`) or `image_b64`, plus `name` and `profile` |
+| `register_by_stream` | `instance_id` + `name`; analyses **every frame in the last `enroll_window_s`** (default 3 s, up to `enroll_max_analyzed` of them, newest first) |
+| `register_by_corpus` | `package`: a directory, `.zip` or `.tar.gz`, by path or URL |
 
-`register_current_stream` averages the agreeing frames rather than trusting one
+`register_by_stream` averages the agreeing frames rather than trusting one
 grab, and refuses with `ambiguous_subject` when fewer than half the usable frames
 agree with each other — two people taking turns being the dominant face would
 otherwise be enrolled as one identity matching neither.
@@ -902,7 +990,7 @@ attributable.
 Images plus an optional `manifest.json`, in either shape:
 
 ```json
-[{"file": "alice.jpg", "profile": "Alice from ops", "person": "alice", "meta": {"badge": "A7"}}]
+[{"file": "alice.jpg", "name": "Alice from ops", "person": "alice", "profile": {"badge": "A7"}}]
 {"alice.jpg": "Alice from ops"}
 ```
 
@@ -925,11 +1013,12 @@ the count rather than hanging the MCP client.
 
 ### Roster CRUD
 
-`list_persons` (`named` = all/named/unknown, `query` over id+profile+meta, `limit`,
-`offset`), `get_person`, `update_person` (`profile`, `meta`, `meta_delete[]`,
-`merge` — default merges, `merge: false` replaces), `forget` (or
-`named: "unknown"` to clear every anonymous entry). Setting a non-blank `profile`
-on an `unknown-N` names it in place, keeping the id. Reads never return embeddings.
+`list_persons` (`named` = all/named/unknown, `query` over id+name+profile,
+`limit`, `offset`), `get_person`, `update_person` (`name`, `profile`,
+`profile_delete[]`, `merge` — default merges, `merge: false` replaces), `forget`
+(or `named: "unknown"` to clear every anonymous entry), and `list_visits`.
+Setting a non-blank `name` on an `unknown-N` names it in place, keeping the id.
+Reads never return embeddings.
 
 `unknown_capacity` (default 500, editable on the card) bounds automatic enrolment
 only; lowering it evicts the excess immediately, oldest `last_seen_at` first, and
@@ -948,7 +1037,8 @@ pins that and that the two functions can never disagree.
 
 The pytest suite fakes the analyzer — a host-side suite must not need models or
 onnxruntime — and covers the lifecycle, all five reason codes, `unknown-N`
-stability and promotion, id retirement, capacity eviction, meta CRUD, batch
+stability and promotion, id retirement, capacity eviction, profile CRUD, the
+visit log (sessionisation, checkpoint recovery, overlap queries), batch
 per-item results and zip traversal (`tests/test_face_plugin.py`,
 `tests/test_face_db.py`).
 

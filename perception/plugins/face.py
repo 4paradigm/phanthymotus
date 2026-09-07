@@ -14,11 +14,12 @@ are each there because omitting them orphaned a live node in production.
 
 What this plugin adds over OCR:
 
-* **A 3-second rolling frame window** per instance. `register_current_stream`
+* **A 3-second rolling frame window** per instance. `register_by_stream`
   analyses every frame in it rather than one grab, so a blink, a turned head or
   one motion-blurred frame does not decide the enrolment.
 * **A persistent identity database** (`plugins/face_db.py`), shared by all
-  instances of the plugin, holding embeddings, profiles and free-form meta.
+  instances of the plugin, holding embeddings, names, free-form profiles and a
+  visit log.
 * **Structured failure reasons.** Enrolment fails for mundane physical reasons
   — nobody in frame, nobody sharp enough, too many candidates to guess a
   subject — and the caller (an LLM or an operator) can only react if it is told
@@ -56,8 +57,11 @@ from utils.ros_lifecycle import dispose_node
 
 from plugins.face_db import (
     DEFAULT_DB_DIR,
+    DEFAULT_VISIT_CHECKPOINT_S,
     DEFAULT_MAX_SAMPLES_PER_PERSON,
     DEFAULT_UNKNOWN_CAPACITY,
+    DEFAULT_VISIT_GAP_S,
+    DEFAULT_VISIT_LOG_MAX,
     FaceDB,
     is_unknown_id,
 )
@@ -140,9 +144,11 @@ TOOLS = [
                     "type": "string",
                     "enum": [
                         "start", "stop", "info", "config",
-                        "register_user_photo", "register_current_stream",
-                        "register_user_photos",
+                        "register_by_photo", "register_by_stream",
+                        "register_by_corpus",
+                        "recognize_by_photo", "recognize_by_stream",
                         "list_persons", "get_person", "update_person", "forget",
+                        "list_visits",
                     ],
                     "description": "Action to perform",
                 },
@@ -152,15 +158,17 @@ TOOLS = [
                 },
                 "image_path": {"type": "string", "description": "Path to a JPEG/PNG readable by this container"},
                 "image_b64":  {"type": "string", "description": "Base64-encoded JPEG/PNG bytes"},
-                "profile":    {"type": "string", "description": "Who this person is — free text shown alongside the id on every sighting"},
-                "meta":       {"type": "object", "description": "Free-form metadata object (department, tags, notes...)"},
-                "meta_delete": {"type": "array", "items": {"type": "string"}, "description": "Meta keys to remove"},
-                "merge":      {"type": "boolean", "description": "Merge meta into the existing object (default true) instead of replacing it"},
+                "name":       {"type": "string", "description": "姓名（结构化）。有 name 才算已注册；每次识别都会随 id 一起输出"},
+                "profile":    {"type": "object", "description": "非结构化画像对象：性别、外貌、备注、标签等，随 name 一起输出"},
+                "profile_delete": {"type": "array", "items": {"type": "string"}, "description": "要删除的 profile 键"},
+                "merge":      {"type": "boolean", "description": "profile 合并进已有对象（默认 true），false 为整体替换"},
+                "since":      {"type": "string", "description": "起始时间：epoch 秒或 ISO-8601（如 2026-09-07T15:00）"},
+                "until":      {"type": "string", "description": "结束时间：epoch 秒或 ISO-8601"},
                 "person_id":  {"type": "string", "description": "Existing person id (p-N or unknown-N)"},
                 "window_s":   {"type": "number", "description": "Seconds of recent stream to analyse (default 3.0, capped by enroll_window_s)"},
                 "package":    {"type": "string", "description": "Directory, .zip or .tar.gz path/URL holding photos plus an optional manifest.json"},
                 "named":      {"type": "string", "enum": ["all", "named", "unknown"], "description": "Filter the roster (default all); with action=forget, 'unknown' clears every anonymous entry"},
-                "query":      {"type": "string", "description": "Substring filter over id, profile and meta"},
+                "query":      {"type": "string", "description": "Substring filter over id, name and profile"},
                 "limit":      {"type": "integer", "description": "Page size (default 100)"},
                 "offset":     {"type": "integer", "description": "Page offset"},
             },
@@ -170,22 +178,31 @@ TOOLS = [
                 "stop":   {"params": [], "description": "Stop recognition"},
                 "info":   {"params": ["input_topic"], "description": "Report state, topics and database statistics"},
                 "config": {"params": [], "description": "Update configuration"},
-                "register_user_photo": {
-                    "params": ["image_path", "image_b64", "profile", "meta"],
+                "register_by_photo": {
+                    "params": ["image_path", "image_b64", "name", "profile"],
                     "description": "Register a person from one photo. Fails with a reason when there is no face, no clear face, or no obvious subject",
                 },
-                "register_current_stream": {
-                    "params": ["profile", "meta", "window_s"],
+                "register_by_stream": {
+                    "params": ["name", "profile", "window_s"],
                     "description": "Register the person currently in front of the camera, using the last few seconds of the live stream",
                 },
-                "register_user_photos": {
+                "register_by_corpus": {
                     "params": ["package"],
                     "description": "Register many people from a package of photos; returns a per-photo result saying which succeeded and why the others did not",
                 },
-                "list_persons":  {"params": ["named", "query", "limit", "offset"], "description": "List registered people with their profile and meta"},
+                "recognize_by_photo": {
+                    "params": ["image_path", "image_b64"],
+                    "description": "认出照片里的人 — 只读，不写库：返回每张人脸的 id/name/profile 与相似度，不会登记陌生人",
+                },
+                "recognize_by_stream": {
+                    "params": ["window_s"],
+                    "description": "认出摄像头前的人 — 只读，不写库：返回当前画面里每个人的 id/name/profile 与相似度",
+                },
+                "list_persons":  {"params": ["named", "query", "limit", "offset"], "description": "List registered people with their name and profile"},
                 "get_person":    {"params": ["person_id"], "description": "Read one person's full record"},
-                "update_person": {"params": ["person_id", "profile", "meta", "meta_delete", "merge"], "description": "Edit a person's profile or meta; setting a profile on an unknown-N id names that identity, keeping the id"},
+                "update_person": {"params": ["person_id", "name", "profile", "profile_delete", "merge"], "description": "Edit a person's name or profile; setting a name on an unknown-N id names that identity, keeping the id"},
                 "forget":        {"params": ["person_id", "named"], "description": "Delete a person (or every unknown entry). The id is retired and never reused"},
+                "list_visits":   {"params": ["person_id", "since", "until", "limit", "offset"], "description": "访问记录：查询某段时间内出现过的人。一次连续出现算一条记录，含首末时间与出现次数"},
             },
         },
         # Deliberately minimal, as in plugins/ocr.py: only what an operator
@@ -272,6 +289,11 @@ def _db_options(cfg: dict) -> dict:
         ),
         "max_samples_per_person": int(
             cfg.get("max_samples_per_person", DEFAULT_MAX_SAMPLES_PER_PERSON)
+        ),
+        "visit_gap_s": float(cfg.get("visit_gap_s", DEFAULT_VISIT_GAP_S)),
+        "visit_log_max": int(cfg.get("visit_log_max", DEFAULT_VISIT_LOG_MAX)),
+        "visit_checkpoint_s": float(
+            cfg.get("visit_checkpoint_s", DEFAULT_VISIT_CHECKPOINT_S)
         ),
     }
 
@@ -667,8 +689,13 @@ def _read_manifest(directory: str) -> dict[str, dict]:
     return entries
 
 
-def _sidecar_profile(image_path: str) -> tuple[str, dict]:
-    """Per-image fallback: `alice.json` then `alice.txt`, else the file stem."""
+def _sidecar_identity(image_path: str) -> tuple[str, dict]:
+    """Per-image fallback: `alice.json`, then `alice.txt`, else the file stem.
+
+    Returns `(name, profile)`. A sidecar may carry `name` and a `profile`
+    object; `profile` as a plain string is read as the name, which is the shape
+    a hand-written sidecar tends to have.
+    """
     stem, _ = os.path.splitext(image_path)
     json_path = f"{stem}.json"
     if os.path.isfile(json_path):
@@ -676,9 +703,11 @@ def _sidecar_profile(image_path: str) -> tuple[str, dict]:
             with open(json_path, encoding="utf-8") as handle:
                 data = json.load(handle)
             if isinstance(data, dict):
-                return str(data.get("profile") or ""), (
-                    data.get("meta") if isinstance(data.get("meta"), dict) else {}
-                )
+                name = data.get("name")
+                profile = data.get("profile")
+                if name is None and isinstance(profile, str):
+                    name, profile = profile, None
+                return str(name or ""), (profile if isinstance(profile, dict) else {})
             return str(data), {}
         except (OSError, ValueError):
             log.warning("[face] ignoring unreadable sidecar %s",
@@ -724,7 +753,7 @@ class _FaceNode(Node):
         self._frames.close()
         # Rolling enrolment window, kept beside LatestFrame rather than in place
         # of it: the worker still wants "newest frame, drop the rest", while
-        # register_current_stream wants the last few seconds. Bounded by age and
+        # register_by_stream wants the last few seconds. Bounded by age and
         # by count, so a fast camera cannot grow it without limit.
         self._window: deque[tuple[bytes, float]] = deque(
             maxlen=max(1, int(cfg.get(
@@ -805,7 +834,10 @@ class _FaceNode(Node):
                             len(self._worker_threads), self._input_topic)
             with self._window_lock:
                 self._window.clear()
-            self._flush_seen()
+            # force: an instance stopping means everyone currently in frame has
+            # left as far as this camera is concerned, so close their visits
+            # rather than losing them.
+            self._flush_seen(force_close=True)
             log.info("[face] stopped: %s", self._input_topic)
             return {"state": "idle"}
 
@@ -876,6 +908,15 @@ class _FaceNode(Node):
             self._pub.publish(msg)
             self._log_payload(payload)
 
+            # Closing a visit is in-memory bookkeeping plus one append, so it
+            # can run every cycle; only the persons.json rewrite is throttled.
+            try:
+                self._engine.db.close_stale_visits()
+                # Throttled inside the DB to visit_checkpoint_s, so calling it
+                # every cycle costs a lock and a timestamp compare.
+                self._engine.db.checkpoint_open_visits()
+            except Exception:  # noqa: BLE001
+                log.warning("[face] visit bookkeeping failed", exc_info=True)
             if time.monotonic() - self._last_flush_at >= _SEEN_FLUSH_INTERVAL_SECONDS:
                 self._flush_seen()
 
@@ -925,7 +966,7 @@ class _FaceNode(Node):
                     # cannot identify it" is the honest answer.
                     entry.update({
                         "person_id": None,
-                        "profile": "",
+                        "name": "",
                         "known": False,
                         "quality": "low",
                         "reason": REASON_LOW_QUALITY,
@@ -940,17 +981,17 @@ class _FaceNode(Node):
                 if person_id is None:
                     record = database.enroll_unknown(embedding)
                     person_id = record["id"]
-                    profile = record["profile"]
-                    known = False
                 else:
-                    database.touch(person_id, timestamp)
                     record = database.get_person(person_id)
-                    profile = record["profile"]
-                    known = record["named"]
+                # Sightings drive last_seen_at and the visit log; neither
+                # timestamp goes in the payload — "when was this person around"
+                # is a visit-log question (list_visits), not a per-frame field.
+                database.record_sighting(person_id, timestamp, self._input_topic)
                 entry.update({
                     "person_id": person_id,
-                    "profile": profile,
-                    "known": known,
+                    "name": record["name"],
+                    "profile": record["profile"],
+                    "known": record["named"],
                     "score": round(float(score), 4),
                     "quality": "ok",
                 })
@@ -983,10 +1024,11 @@ class _FaceNode(Node):
                       self._output_topic, payload["count"], occurrence,
                       ", recovered" if transition and occurrence == 1 else "")
 
-    def _flush_seen(self) -> None:
-        """Persist `last_seen_at` updates accumulated at frame rate."""
+    def _flush_seen(self, force_close: bool = False) -> None:
+        """Persist `last_seen_at` and close any visit whose subject has left."""
         self._last_flush_at = time.monotonic()
         try:
+            self._engine.db.close_stale_visits(force=force_close)
             self._engine.db.flush()
         except Exception:  # noqa: BLE001 - never kill the worker over this
             log.warning("[face] failed to persist sighting timestamps",
@@ -1171,12 +1213,16 @@ class FaceRecognitionPlugin:
             return self._do_stop(instance_id)
         if action == "config":
             return self._do_config(instance_id, args)
-        if action == "register_user_photo":
-            return self._do_register_photo(args)
-        if action == "register_current_stream":
-            return self._do_register_stream(instance_id, args)
-        if action == "register_user_photos":
-            return self._do_register_batch(args)
+        if action == "register_by_photo":
+            return self._do_register_by_photo(args)
+        if action == "register_by_stream":
+            return self._do_register_by_stream(instance_id, args)
+        if action == "register_by_corpus":
+            return self._do_register_by_corpus(args)
+        if action == "recognize_by_photo":
+            return self._do_recognize_by_photo(args)
+        if action == "recognize_by_stream":
+            return self._do_recognize_by_stream(instance_id, args)
         if action == "list_persons":
             return self._do_list_persons(args)
         if action == "get_person":
@@ -1185,6 +1231,8 @@ class FaceRecognitionPlugin:
             return self._do_update_person(args)
         if action == "forget":
             return self._do_forget(args)
+        if action == "list_visits":
+            return self._do_list_visits(args)
         return None
 
     _DESC = "Face recognition — identifies registered people in the camera feed"
@@ -1513,8 +1561,8 @@ class FaceRecognitionPlugin:
         self,
         engine: _FaceEngine,
         embeddings: list[np.ndarray],
-        profile: str,
-        meta: Any,
+        name: str,
+        profile: Any,
         person_id: str | None,
         gates: dict,
     ) -> dict:
@@ -1531,17 +1579,17 @@ class FaceRecognitionPlugin:
                 }
             was_unknown = not existing["named"]
             record = database.add_samples(person_id, embeddings)
-            if profile or meta is not None:
+            if name or profile is not None:
                 record = database.update_person(
-                    person_id, profile=profile or None, meta=meta
+                    person_id, name=name or None, profile=profile
                 )
             return {
                 "ok": True,
                 "person_id": person_id,
+                "name": record["name"],
                 "profile": record["profile"],
-                "meta": record["meta"],
                 "samples": record["samples"],
-                "promoted": was_unknown and bool(profile),
+                "promoted": was_unknown and bool(name),
             }
 
         # No id given: does this face already exist under some identity?
@@ -1552,33 +1600,33 @@ class FaceRecognitionPlugin:
             if is_unknown_id(matched) or not record["named"]:
                 # The face was already being tracked anonymously; naming it now
                 # keeps that id, so earlier sightings stay attributable.
-                record = database.update_person(matched, profile=profile, meta=meta)
+                record = database.update_person(matched, name=name, profile=profile)
                 promoted = True
-            elif meta is not None:
-                record = database.update_person(matched, meta=meta)
+            elif profile is not None:
+                record = database.update_person(matched, profile=profile)
             return {
                 "ok": True,
                 "person_id": matched,
+                "name": record["name"],
                 "profile": record["profile"],
-                "meta": record["meta"],
                 "samples": record["samples"],
                 "merged": True,
                 "promoted": promoted,
                 "score_to_existing": round(float(score), 4),
             }
 
-        record = database.add(profile, embeddings, named=True, meta=meta)
+        record = database.add(name, embeddings, named=True, profile=profile)
         return {
             "ok": True,
             "person_id": record["id"],
+            "name": record["name"],
             "profile": record["profile"],
-            "meta": record["meta"],
             "samples": record["samples"],
             "merged": False,
             "promoted": False,
         }
 
-    def _do_register_photo(self, args: dict) -> dict:
+    def _do_register_by_photo(self, args: dict) -> dict:
         engine = self._require_engine()
         cfg = dict(self._plugin_cfg)
         gates = _gates(cfg)
@@ -1597,42 +1645,21 @@ class FaceRecognitionPlugin:
         # `update_person`, and grouping several photos under one person is the
         # batch manifest's `person` key.
         result = self._commit_enrolment(
-            engine, [embedding], str(args.get("profile") or ""),
-            args.get("meta"), None, gates,
+            engine, [embedding], str(args.get("name") or ""),
+            args.get("profile"), None, gates,
         )
         if result.get("ok"):
             log.info("[face] registered %s from %s: %s", result["person_id"],
-                     escape_log_text(source), escape_log_text(result["profile"]))
+                     escape_log_text(source), escape_log_text(result["name"]))
         return {**result, "source": source}
 
-    def _do_register_stream(self, instance_id: str, args: dict) -> dict:
+    def _do_register_by_stream(self, instance_id: str, args: dict) -> dict:
         cfg = dict(self._plugin_cfg)
         gates = _gates(cfg)
 
-        with self._state_lock:
-            if instance_id:
-                node = self._nodes.get(instance_id)
-            elif len(self._nodes) == 1:
-                node = next(iter(self._nodes.values()))
-            else:
-                node = None
-                if len(self._nodes) > 1:
-                    return {
-                        "ok": False, "reason": REASON_BAD_INPUT,
-                        "detail": (
-                            f"{len(self._nodes)} instances are running; pass "
-                            "instance_id to say which camera to use"
-                        ),
-                        "instances": sorted(self._nodes),
-                    }
+        node, failure = self._pick_instance(instance_id)
         if node is None:
-            return {
-                "ok": False, "reason": REASON_NO_FRAMES,
-                "detail": (
-                    "no running instance to read from — start the card on a "
-                    "camera topic first"
-                ),
-            }
+            return failure
 
         window = min(
             float(args.get("window_s") or cfg.get(
@@ -1692,13 +1719,13 @@ class FaceRecognitionPlugin:
             }
 
         result = self._commit_enrolment(
-            engine, agreeing, str(args.get("profile") or ""),
-            args.get("meta"), None, gates,
+            engine, agreeing, str(args.get("name") or ""),
+            args.get("profile"), None, gates,
         )
         if result.get("ok"):
             log.info("[face] registered %s from the live stream (%d/%d frames): %s",
                      result["person_id"], len(agreeing), len(selected),
-                     escape_log_text(result["profile"]))
+                     escape_log_text(result["name"]))
         return {
             **result,
             "instance_id": instance_id or node._input_topic,
@@ -1707,7 +1734,7 @@ class FaceRecognitionPlugin:
             "window_s": round(window, 2),
         }
 
-    def _do_register_batch(self, args: dict) -> dict:
+    def _do_register_by_corpus(self, args: dict) -> dict:
         package = str(args.get("package") or "").strip()
         if not package:
             return {"ok": False, "reason": REASON_BAD_INPUT,
@@ -1756,11 +1783,17 @@ class FaceRecognitionPlugin:
                     os.path.basename(image_path)
                 ) or {}
                 if entry:
-                    profile = str(entry.get("profile") or "")
-                    meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else None
+                    # `name` is the structured label; a manifest that still puts
+                    # a plain string in `profile` is read as the name.
+                    raw_profile = entry.get("profile")
+                    name = entry.get("name")
+                    if name is None and isinstance(raw_profile, str):
+                        name, raw_profile = raw_profile, None
+                    name = str(name or "")
+                    profile = raw_profile if isinstance(raw_profile, dict) else None
                 else:
-                    profile, sidecar_meta = _sidecar_profile(image_path)
-                    meta = sidecar_meta or None
+                    name, sidecar_profile = _sidecar_identity(image_path)
+                    profile = sidecar_profile or None
                 group = str(entry.get("person") or entry.get("id") or "").strip()
                 person_id = groups.get(group) if group else None
 
@@ -1775,11 +1808,11 @@ class FaceRecognitionPlugin:
 
                 embedding, failure = self._analyze_subject(engine, data, gates)
                 if embedding is None:
-                    results.append({"file": relative, "profile": profile, **failure})
+                    results.append({"file": relative, "name": name, **failure})
                     continue
                 try:
                     outcome = self._commit_enrolment(
-                        engine, [embedding], profile, meta, person_id, gates
+                        engine, [embedding], name, profile, person_id, gates
                     )
                 except Exception as error:  # noqa: BLE001 - one bad photo must
                     # not abandon the rest of a 200-image batch half-registered
@@ -1804,6 +1837,179 @@ class FaceRecognitionPlugin:
             "registered": registered,
             "failed": failed,
             "results": results,
+        }
+
+    def _pick_instance(self, instance_id: str):
+        """Resolve which running instance a stream action should read from.
+
+        Returns `(node, None)` or `(None, failure)`. With exactly one instance
+        the id is optional — the common case is one camera — but with several
+        it is required rather than guessed, because reading the wrong camera
+        would silently answer about the wrong room.
+        """
+        with self._state_lock:
+            if instance_id:
+                node = self._nodes.get(instance_id)
+            elif len(self._nodes) == 1:
+                node = next(iter(self._nodes.values()))
+            else:
+                node = None
+                if len(self._nodes) > 1:
+                    return None, {
+                        "ok": False, "reason": REASON_BAD_INPUT,
+                        "detail": (
+                            f"{len(self._nodes)} instances are running; pass "
+                            "instance_id to say which camera to use"
+                        ),
+                        "instances": sorted(self._nodes),
+                    }
+        if node is None:
+            return None, {
+                "ok": False, "reason": REASON_NO_FRAMES,
+                "detail": (
+                    "no running instance to read from — start the card on a "
+                    "camera topic first"
+                ),
+            }
+        return node, None
+
+    # ── recognition on demand (read-only) ────────────────────────────────
+
+    def _identify(
+        self, engine: _FaceEngine, image_bytes: bytes, gates: dict
+    ) -> dict | list[dict]:
+        """Every face in one image, matched against the database.
+
+        **Read-only.** Unlike the continuous stream, this neither auto-enrols a
+        stranger as `unknown-N` nor records a sighting: "who is this" is a
+        question, and answering it should not mutate the roster or the visit
+        log. It also does not apply `subject_dominance` — that gate exists
+        because *enrolment* must resolve to exactly one person, whereas a query
+        can simply report everyone it sees.
+        """
+        image = engine.analyzer.decode_jpeg(image_bytes)
+        if image is None:
+            return {
+                "ok": False, "reason": REASON_BAD_INPUT,
+                "detail": "image could not be decoded as JPEG/PNG",
+            }
+        faces = engine.analyzer.detect(image, max_faces=gates["max_faces"])
+        results = []
+        for face in faces:
+            engine.analyzer.prepare(image, face)
+            entry = {
+                "bbox": face.bbox_xywh(),
+                "det_score": round(face.det_score, 4),
+                "blur": round(face.blur, 2),
+                "min_side_px": int(face.min_side),
+            }
+            if not (
+                face.det_score >= gates["det_thresh"]
+                and face.min_side >= gates["min_face_px"]
+                and face.blur >= gates["blur_min"]
+            ):
+                entry.update({
+                    "person_id": None, "name": "", "known": False,
+                    "quality": "low", "reason": REASON_LOW_QUALITY,
+                })
+                results.append(entry)
+                continue
+            embedding = engine.analyzer.embed(face.aligned)
+            person_id, score = engine.db.match(
+                embedding, gates["match_threshold"]
+            )
+            if person_id is None:
+                # `best_score` is what an operator needs to decide whether
+                # match_threshold is too strict, so report it rather than just
+                # saying no.
+                entry.update({
+                    "person_id": None, "name": "", "known": False,
+                    "quality": "ok", "best_score": round(float(score), 4),
+                })
+            else:
+                record = engine.db.get_person(person_id)
+                entry.update({
+                    "person_id": person_id,
+                    "name": record["name"],
+                    "profile": record["profile"],
+                    "known": record["named"],
+                    "score": round(float(score), 4),
+                    "quality": "ok",
+                })
+            results.append(entry)
+        return results
+
+    def _do_recognize_by_photo(self, args: dict) -> dict:
+        engine = self._require_engine()
+        cfg = dict(self._plugin_cfg)
+        gates = _gates(cfg)
+        try:
+            data, source = _load_image_bytes(args, cfg)
+        except _BadInput as error:
+            return error.as_result()
+        outcome = self._identify(engine, data, gates)
+        if isinstance(outcome, dict):
+            return {**outcome, "source": source}
+        return {
+            "ok": True,
+            "source": source,
+            "count": len(outcome),
+            "faces": outcome,
+        }
+
+    def _do_recognize_by_stream(self, instance_id: str, args: dict) -> dict:
+        cfg = dict(self._plugin_cfg)
+        gates = _gates(cfg)
+        node, failure = self._pick_instance(instance_id)
+        if node is None:
+            return failure
+
+        # Default 1 s, not the 3 s enrolment window: this answers "who is in
+        # front of me now". Several frames rather than one because a single
+        # blurred frame would otherwise report nobody; each person is reported
+        # once, at their best score across the window.
+        window = min(
+            float(args.get("window_s") or 1.0),
+            float(cfg.get("enroll_window_s", DEFAULT_ENROLL_WINDOW_S)),
+        )
+        frames = node.recent_frames(window)
+        if not frames:
+            return {
+                "ok": False, "reason": REASON_NO_FRAMES,
+                "detail": f"no frames received in the last {window:.1f}s",
+                "instance_id": instance_id or node._input_topic,
+            }
+        engine = self._require_engine()
+        budget = max(1, int(cfg.get("enroll_max_analyzed", DEFAULT_ENROLL_MAX_ANALYZED)))
+        selected = list(reversed(frames))[:budget]
+
+        best: dict[str, dict] = {}
+        unidentified: list[dict] = []
+        for image_bytes, _ts in selected:
+            outcome = self._identify(engine, image_bytes, gates)
+            if isinstance(outcome, dict):
+                continue                     # undecodable frame; try the next
+            for entry in outcome:
+                person_id = entry.get("person_id")
+                if person_id is None:
+                    unidentified.append(entry)
+                    continue
+                previous = best.get(person_id)
+                if previous is None or entry["score"] > previous["score"]:
+                    best[person_id] = entry
+
+        faces = sorted(best.values(), key=lambda e: e["score"], reverse=True)
+        if not faces and unidentified:
+            # Nobody recognised, but there were faces — report the best-looking
+            # one so the answer is "someone I do not know" rather than "nobody".
+            faces = [max(unidentified, key=lambda e: e.get("best_score", -2.0))]
+        return {
+            "ok": True,
+            "instance_id": instance_id or node._input_topic,
+            "count": len(faces),
+            "faces": faces,
+            "frames_examined": len(selected),
+            "window_s": round(window, 2),
         }
 
     # ── roster CRUD ───────────────────────────────────────────────────────
@@ -1839,9 +2045,9 @@ class FaceRecognitionPlugin:
         try:
             record = engine.db.update_person(
                 person_id,
+                name=args.get("name"),
                 profile=args.get("profile"),
-                meta=args.get("meta"),
-                meta_delete=args.get("meta_delete") or [],
+                profile_delete=args.get("profile_delete") or [],
                 merge=bool(args.get("merge", True)),
             )
         except KeyError:
@@ -1850,6 +2056,23 @@ class FaceRecognitionPlugin:
         except ValueError as error:
             return {"ok": False, "reason": REASON_BAD_INPUT, "detail": str(error)}
         return {"ok": True, "person": record}
+
+    def _do_list_visits(self, args: dict) -> dict:
+        """访问记录查询 — who was around, and when."""
+        engine = self._require_engine()
+        try:
+            return {
+                "ok": True,
+                **engine.db.list_visits(
+                    person_id=str(args.get("person_id") or ""),
+                    since=args.get("since"),
+                    until=args.get("until"),
+                    limit=int(args.get("limit") or 100),
+                    offset=int(args.get("offset") or 0),
+                ),
+            }
+        except ValueError as error:      # unparseable since/until
+            return {"ok": False, "reason": REASON_BAD_INPUT, "detail": str(error)}
 
     def _do_forget(self, args: dict) -> dict:
         engine = self._require_engine()

@@ -1,5 +1,5 @@
 """
-tests/test_face_db.py — FaceDB persistence, id allocation, capacity, meta CRUD.
+tests/test_face_db.py — FaceDB persistence, id allocation, capacity, profile CRUD.
 
 Pure host-side: no models, no ROS. Everything here is disk + numpy.
 Run: python -m pytest perception/tests -q
@@ -53,7 +53,7 @@ def _nudge(vector: np.ndarray, amount: float, seed: int = 99) -> np.ndarray:
 
 def test_add_and_match_roundtrip(tmp_path):
     db = FaceDB(db_dir=str(tmp_path))
-    record = db.add("Alice", [_vector(1)], meta={"team": "ops"})
+    record = db.add("Alice", [_vector(1)], profile={"team": "ops"})
     assert record["id"] == "p-1"
     assert record["named"] is True
     assert record["samples"] == 1
@@ -106,12 +106,12 @@ def test_rejects_wrong_dimension_and_zero_norm(tmp_path):
 
 def test_survives_reload(tmp_path):
     db = FaceDB(db_dir=str(tmp_path))
-    db.add("Alice", [_vector(1)], meta={"team": "ops"})
+    db.add("Alice", [_vector(1)], profile={"team": "ops"})
     db.enroll_unknown(_vector(5))
 
     reopened = FaceDB(db_dir=str(tmp_path))
     assert reopened.stats()["persons"] == 2
-    assert reopened.get_person("p-1")["meta"] == {"team": "ops"}
+    assert reopened.get_person("p-1")["profile"] == {"team": "ops"}
     matched, _ = reopened.match(_vector(5), 0.35)
     assert matched == "unknown-1"
 
@@ -206,50 +206,50 @@ def test_forget_missing_person_is_false(tmp_path):
 def test_promote_keeps_the_id(tmp_path):
     db = FaceDB(db_dir=str(tmp_path))
     unknown = db.enroll_unknown(_vector(1))["id"]
-    promoted = db.promote(unknown, "Carol", meta={"floor": 3})
+    promoted = db.promote(unknown, "Carol", profile={"floor": 3})
 
     assert promoted["id"] == unknown          # id preserved, deliberately
     assert promoted["named"] is True
-    assert promoted["profile"] == "Carol"
-    assert promoted["meta"] == {"floor": 3}
+    assert promoted["name"] == "Carol"
+    assert promoted["profile"] == {"floor": 3}
     stats = db.stats()
     assert (stats["named"], stats["unknown"]) == (1, 0)
 
 
-def test_setting_a_blank_profile_does_not_promote(tmp_path):
+def test_setting_a_blank_name_does_not_promote(tmp_path):
     db = FaceDB(db_dir=str(tmp_path))
     unknown = db.enroll_unknown(_vector(1))["id"]
-    record = db.update_person(unknown, profile="   ")
+    record = db.update_person(unknown, name="   ")
     assert record["named"] is False
 
 
-# ── meta CRUD ─────────────────────────────────────────────────────────────────
+# ── profile CRUD ─────────────────────────────────────────────────────────────────
 
-def test_meta_merge_replace_and_delete(tmp_path):
+def test_profile_merge_replace_and_delete(tmp_path):
     db = FaceDB(db_dir=str(tmp_path))
-    db.add("Alice", [_vector(1)], meta={"team": "ops", "floor": 3})
+    db.add("Alice", [_vector(1)], profile={"team": "ops", "floor": 3})
 
-    merged = db.update_person("p-1", meta={"floor": 4, "badge": "A7"})
-    assert merged["meta"] == {"team": "ops", "floor": 4, "badge": "A7"}
+    merged = db.update_person("p-1", profile={"floor": 4, "badge": "A7"})
+    assert merged["profile"] == {"team": "ops", "floor": 4, "badge": "A7"}
 
-    replaced = db.update_person("p-1", meta={"only": "this"}, merge=False)
-    assert replaced["meta"] == {"only": "this"}
+    replaced = db.update_person("p-1", profile={"only": "this"}, merge=False)
+    assert replaced["profile"] == {"only": "this"}
 
-    trimmed = db.update_person("p-1", meta={"keep": 1}, meta_delete=["only"])
-    assert trimmed["meta"] == {"keep": 1}
+    trimmed = db.update_person("p-1", profile={"keep": 1}, profile_delete=["only"])
+    assert trimmed["profile"] == {"keep": 1}
 
-    assert FaceDB(db_dir=str(tmp_path)).get_person("p-1")["meta"] == {"keep": 1}
+    assert FaceDB(db_dir=str(tmp_path)).get_person("p-1")["profile"] == {"keep": 1}
 
 
-def test_meta_must_be_a_json_object(tmp_path):
+def test_profile_must_be_a_json_object(tmp_path):
     db = FaceDB(db_dir=str(tmp_path))
     db.add("Alice", [_vector(1)])
     with pytest.raises(ValueError):
-        db.update_person("p-1", meta=["not", "an", "object"])
+        db.update_person("p-1", profile=["not", "an", "object"])
     with pytest.raises(ValueError):
-        db.update_person("p-1", meta={"bad": {1, 2}})     # a set is not JSON
+        db.update_person("p-1", profile={"bad": {1, 2}})     # a set is not JSON
     # The rejected write must not have changed anything.
-    assert db.get_person("p-1")["meta"] == {}
+    assert db.get_person("p-1")["profile"] == {}
 
 
 def test_update_and_get_missing_person_raise_keyerror(tmp_path):
@@ -257,7 +257,7 @@ def test_update_and_get_missing_person_raise_keyerror(tmp_path):
     with pytest.raises(KeyError):
         db.get_person("p-1")
     with pytest.raises(KeyError):
-        db.update_person("p-1", profile="x")
+        db.update_person("p-1", name="x")
     with pytest.raises(KeyError):
         db.add_samples("p-1", [_vector(1)])
 
@@ -289,7 +289,7 @@ def test_lowering_capacity_evicts_now_and_spares_named(tmp_path):
     stats = db.stats()
     assert stats["unknown"] == 2
     assert stats["named"] == 1                    # never a candidate
-    assert db.get_person("p-1")["profile"] == "Alice"
+    assert db.get_person("p-1")["name"] == "Alice"
 
 
 def test_zero_capacity_refuses_to_enrol_unknowns(tmp_path):
@@ -331,7 +331,7 @@ def test_samples_are_capped_keeping_the_newest(tmp_path):
 
 def test_list_persons_filters_and_pages(tmp_path):
     db = FaceDB(db_dir=str(tmp_path))
-    db.add("Alice from ops", [_vector(1)], meta={"badge": "A7"})
+    db.add("Alice from ops", [_vector(1)], profile={"badge": "A7"})
     db.add("Bob from sales", [_vector(2)])
     db.enroll_unknown(_vector(3))
 
@@ -339,7 +339,7 @@ def test_list_persons_filters_and_pages(tmp_path):
     assert db.list_persons(named="named")["total"] == 2
     assert db.list_persons(named="unknown")["total"] == 1
     assert db.list_persons(query="sales")["total"] == 1
-    assert db.list_persons(query="a7")["total"] == 1            # matches meta
+    assert db.list_persons(query="a7")["total"] == 1            # matches profile
     assert db.list_persons(query="unknown-")["total"] == 1      # matches id
 
     page = db.list_persons(limit=1, offset=1)
@@ -376,3 +376,237 @@ def test_concurrent_enrolment_keeps_every_person_and_row(tmp_path):
     assert reloaded.stats()["samples"] == 12
     for seed in range(12):
         assert reloaded.match(_vector(seed), 0.9)[0] is not None
+
+
+# ── visit log (访问记录表) ────────────────────────────────────────────────────
+
+def _seen(db, person_id, at, topic="/cam"):
+    db.record_sighting(person_id, at, topic)
+
+
+def test_a_continuous_presence_is_one_visit_not_one_per_frame(tmp_path):
+    """At 1 detection/second a per-frame log would be 86 400 rows a day."""
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=600.0)
+    db.add("Alice", [_vector(1)])
+    for offset in range(0, 300, 1):          # 5 minutes of sightings
+        _seen(db, "p-1", 1_000_000 + offset)
+
+    # Nothing written yet: the visit is still open.
+    assert not (tmp_path / "visits.jsonl").exists()
+    assert db.list_visits()["total"] == 1
+    open_visit = db.list_visits()["visits"][0]
+    assert open_visit["open"] is True
+    assert open_visit["sightings"] == 300
+
+    # Still open before the gap elapses, closed after. The last sighting is at
+    # +299, so the gap is measured from there.
+    last_seen = 1_000_000 + 299
+    assert db.close_stale_visits(now=last_seen + 599) == 0
+    assert db.close_stale_visits(now=last_seen + 601) == 1
+
+    lines = (tmp_path / "visits.jsonl").read_text().strip().split("\n")
+    assert len(lines) == 1, "one visit, not one row per sighting"
+    record = json.loads(lines[0])
+    assert record["person_id"] == "p-1"
+    assert record["first_seen"] == 1_000_000
+    assert record["last_seen"] == 1_000_000 + 299
+    assert record["sightings"] == 300
+
+
+def test_a_short_absence_does_not_split_the_visit(tmp_path):
+    """Someone turning their head must not fragment an afternoon."""
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=600.0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", 2_000_000)
+    db.close_stale_visits(now=2_000_000 + 120)     # 2 min gap: still the same visit
+    _seen(db, "p-1", 2_000_000 + 121)
+    db.close_stale_visits(now=2_000_000 + 800)     # now it has really been quiet
+
+    visits = db.list_visits()["visits"]
+    assert len(visits) == 1
+    assert visits[0]["sightings"] == 2
+
+
+def test_separate_visits_when_the_gap_is_exceeded(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=60.0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", 3_000_000)
+    db.close_stale_visits(now=3_000_000 + 100)
+    _seen(db, "p-1", 3_000_000 + 200)
+    db.close_stale_visits(now=3_000_000 + 400)
+    assert db.list_visits()["total"] == 2
+
+
+def test_list_visits_filters_by_overlap_not_containment(tmp_path):
+    """Someone there 14:50-15:10 was there at 15:00."""
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=60.0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", 1_000)
+    _seen(db, "p-1", 2_000)
+    db.close_stale_visits(force=True)
+
+    assert db.list_visits(since=1_500, until=1_600)["total"] == 1   # inside
+    assert db.list_visits(since=500, until=1_200)["total"] == 1     # overlaps start
+    assert db.list_visits(since=1_900, until=5_000)["total"] == 1   # overlaps end
+    assert db.list_visits(since=3_000)["total"] == 0                # after
+    assert db.list_visits(until=500)["total"] == 0                  # before
+
+
+def test_list_visits_accepts_iso_timestamps(tmp_path):
+    from datetime import datetime
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=60.0)
+    db.add("Alice", [_vector(1)])
+    when = datetime(2026, 9, 7, 15, 0, 0).timestamp()
+    _seen(db, "p-1", when)
+    db.close_stale_visits(force=True)
+
+    assert db.list_visits(since="2026-09-07T14:00", until="2026-09-07T16:00")["total"] == 1
+    assert db.list_visits(since="2026-09-07T16:00")["total"] == 0
+    with pytest.raises(ValueError):
+        db.list_visits(since="last tuesday")
+
+
+def test_list_visits_filters_by_person_and_resolves_the_current_name(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=60.0)
+    unknown = db.enroll_unknown(_vector(1))["id"]
+    db.add("Bob", [_vector(2)])
+    _seen(db, unknown, 10_000)
+    _seen(db, "p-1", 10_000)
+    db.close_stale_visits(force=True)
+
+    assert db.list_visits(person_id=unknown)["total"] == 1
+    assert db.list_visits()["total"] == 2
+
+    # The visit was logged while they were anonymous; naming them later must
+    # make the history readable rather than leaving a blank.
+    db.update_person(unknown, name="Late-named Carol")
+    entry = db.list_visits(person_id=unknown)["visits"][0]
+    assert entry["name"] == "Late-named Carol"
+
+
+def test_open_visits_are_checkpointed_against_power_loss(tmp_path):
+    """A 10-minute gap means an all-afternoon visit lives in RAM for hours."""
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=600.0, visit_checkpoint_s=0.0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", 4_000_000)
+    _seen(db, "p-1", 4_000_100)
+    assert db.checkpoint_open_visits() is True
+    assert (tmp_path / "visits-open.json").exists()
+
+    # Simulate a power cut: a brand-new FaceDB over the same directory.
+    recovered = FaceDB(db_dir=str(tmp_path), visit_gap_s=600.0)
+    visits = recovered.list_visits()["visits"]
+    assert len(visits) == 1
+    assert visits[0]["sightings"] == 2
+    assert visits[0]["first_seen"] == 4_000_000
+
+
+def test_a_stale_checkpointed_visit_is_closed_on_recovery(tmp_path):
+    """If the person left while we were down, the visit is completed, not resumed."""
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=1.0, visit_checkpoint_s=0.0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", 100.0)                # long in the past
+    db.checkpoint_open_visits(force=True)
+
+    recovered = FaceDB(db_dir=str(tmp_path), visit_gap_s=1.0)
+    assert recovered.stats()["open_visits"] == 0
+    lines = (tmp_path / "visits.jsonl").read_text().strip().split("\n")
+    assert len(lines) == 1
+    assert json.loads(lines[0])["recovered"] is True
+
+
+def test_a_fresh_checkpointed_visit_is_resumed_not_duplicated(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=600.0, visit_checkpoint_s=0.0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", _now_for_test := __import__("time").time())
+    db.checkpoint_open_visits(force=True)
+
+    recovered = FaceDB(db_dir=str(tmp_path), visit_gap_s=600.0)
+    assert recovered.stats()["open_visits"] == 1
+    _seen(recovered, "p-1", _now_for_test + 1)
+    recovered.close_stale_visits(force=True)
+    lines = (tmp_path / "visits.jsonl").read_text().strip().split("\n")
+    assert len(lines) == 1, "the resumed visit must not become a second record"
+    assert json.loads(lines[0])["sightings"] == 2
+
+
+def test_checkpoint_is_throttled_and_cleared_when_nothing_is_open(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=60.0, visit_checkpoint_s=3600.0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", 5_000_000)
+    assert db.checkpoint_open_visits() is True          # first one always writes
+    assert db.checkpoint_open_visits() is False         # throttled
+    db.close_stale_visits(force=True)
+    assert not (tmp_path / "visits-open.json").exists()
+
+
+def test_visit_log_is_trimmed_to_its_cap(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=1.0, visit_log_max=5)
+    db.add("Alice", [_vector(1)])
+    for index in range(12):
+        _seen(db, "p-1", 6_000_000 + index * 100)
+        db.close_stale_visits(now=6_000_000 + index * 100 + 50)
+    lines = (tmp_path / "visits.jsonl").read_text().strip().split("\n")
+    assert len(lines) == 5
+    # The newest are the ones kept.
+    assert json.loads(lines[-1])["first_seen"] == 6_000_000 + 11 * 100
+
+
+def test_a_torn_line_does_not_make_the_history_unreadable(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=1.0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", 7_000_000)
+    db.close_stale_visits(force=True)
+    with open(tmp_path / "visits.jsonl", "a") as handle:
+        handle.write('{"person_id": "p-1", "first_se\n')     # crash mid-append
+    assert db.list_visits()["total"] == 1
+
+
+def test_visit_log_disabled_by_a_zero_cap(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=1.0, visit_log_max=0)
+    db.add("Alice", [_vector(1)])
+    _seen(db, "p-1", 8_000_000)
+    db.close_stale_visits(force=True)
+    assert not (tmp_path / "visits.jsonl").exists()
+
+
+# ── record shape / migration ─────────────────────────────────────────────────
+
+def test_record_separates_name_from_free_form_profile(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path))
+    record = db.add("小王", [_vector(1)], profile={"gender": "male", "team": "ops"})
+    assert record["name"] == "小王"
+    assert record["profile"] == {"gender": "male", "team": "ops"}
+    assert "registered_at" in record and "last_seen_at" in record
+    assert "created_at" not in record and "meta" not in record
+
+
+def test_a_string_profile_is_kept_as_a_note(tmp_path):
+    """An LLM will occasionally send prose where an object is expected."""
+    db = FaceDB(db_dir=str(tmp_path))
+    record = db.add("小王", [_vector(1)], profile="爱穿蓝色外套")
+    assert record["profile"] == {"note": "爱穿蓝色外套"}
+
+
+def test_version_1_database_migrates_profile_to_name(tmp_path):
+    """The field split must not orphan a database written by the older build."""
+    db = FaceDB(db_dir=str(tmp_path))
+    db.add("ignored", [_vector(1)])
+    state = json.loads((tmp_path / "persons.json").read_text())
+    state["version"] = 1
+    state["persons"][0] = {
+        "id": "p-1",
+        "profile": "Alice from ops",          # v1: free text label
+        "meta": {"badge": "A7"},              # v1: structured bag
+        "named": True,
+        "created_at": 111.0,
+        "updated_at": 222.0,
+        "last_seen_at": 333.0,
+    }
+    (tmp_path / "persons.json").write_text(json.dumps(state))
+
+    migrated = FaceDB(db_dir=str(tmp_path)).get_person("p-1")
+    assert migrated["name"] == "Alice from ops"
+    assert migrated["profile"] == {"badge": "A7"}
+    assert migrated["registered_at"] == 111.0
+    assert migrated["last_seen_at"] == 333.0

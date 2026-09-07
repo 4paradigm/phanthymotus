@@ -122,13 +122,18 @@ class _FakeAnalyzer:
 class _SpecAnalyzer(_FakeAnalyzer):
     """The analyzer the tests use: identity travels in the aligned crop.
 
-    `prepare` stamps the face's identity into pixel [0,0,0] and `embed` reads it
+    `prepare` stamps the face's identity into cell [0,0,0] and `embed` reads it
     back, which is how a frame spec like `b"7:120:500"` ends up as a stable
     512-d vector for person 7 without any model.
+
+    int32, not uint8: a real aligned crop is uint8, but the plugin only ever
+    hands this array straight back to `embed`, and uint8 silently caps the
+    identity space at 255 — which cost a debugging round when a test used
+    identity 300 and got "Python integer 300 out of bounds for uint8".
     """
 
     def prepare(self, image, face):
-        aligned = np.zeros((112, 112, 3), dtype=np.uint8)
+        aligned = np.zeros((112, 112, 3), dtype=np.int32)
         aligned[0, 0, 0] = face.identity
         face.aligned = aligned
         return face
@@ -426,14 +431,14 @@ def test_unknown_face_gets_a_stable_id_across_frames(plugin):
     assert second["score"] > 0.9
 
 
-def test_a_registered_person_is_reported_with_their_profile(plugin):
+def test_a_registered_person_is_reported_with_their_name(plugin):
     engine = plugin._require_engine()
-    engine.db.add("运营部小王", [_unit(3)], meta={"team": "ops"})
+    engine.db.add("运营部小王", [_unit(3)], profile={"team": "ops"})
 
     _node, payloads = _run_one_frame(plugin, _FakeFrame.one(3))
     face = payloads[0]["faces"][0]
     assert face["person_id"] == "p-1"
-    assert face["profile"] == "运营部小王"
+    assert face["name"] == "运营部小王"
     assert face["known"] is True
 
 
@@ -464,7 +469,7 @@ def test_several_people_in_one_frame_are_all_reported(plugin):
     assert ids == {"unknown-1", "unknown-2"}      # ambiguity only blocks enrolment
 
 
-# ── register_user_photo ───────────────────────────────────────────────────────
+# ── register_by_photo ───────────────────────────────────────────────────────
 
 def _write_photo(tmp_path, name: str, frame: bytes) -> str:
     path = tmp_path / name
@@ -475,13 +480,13 @@ def _write_photo(tmp_path, name: str, frame: bytes) -> str:
 def test_register_from_a_photo_path(plugin, tmp_path):
     path = _write_photo(tmp_path, "alice.jpg", _FakeFrame.one(11))
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_path": path,
-        "profile": "Alice", "meta": {"team": "ops"},
+        "action": "register_by_photo", "image_path": path,
+        "name": "Alice", "profile": {"team": "ops"},
     })
     assert result["ok"] is True
     assert result["person_id"] == "p-1"
-    assert result["profile"] == "Alice"
-    assert result["meta"] == {"team": "ops"}
+    assert result["name"] == "Alice"
+    assert result["profile"] == {"team": "ops"}
 
     engine = plugin._require_engine()
     assert engine.db.match(_unit(11), 0.35)[0] == "p-1"
@@ -491,7 +496,7 @@ def test_register_from_base64(plugin):
     import base64
     encoded = base64.b64encode(_FakeFrame.one(12)).decode()
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_b64": encoded, "profile": "Bob"})
+        "action": "register_by_photo", "image_b64": encoded, "name": "Bob"})
     assert result["ok"] is True and result["person_id"] == "p-1"
 
 
@@ -506,7 +511,7 @@ def test_register_reports_each_failure_reason(plugin, tmp_path):
     for name, (frame, expected) in cases.items():
         path = _write_photo(tmp_path, f"{name}.jpg", frame)
         result = plugin.dispatch("face_recognition", {
-            "action": "register_user_photo", "image_path": path, "profile": name})
+            "action": "register_by_photo", "image_path": path, "profile": name})
         assert result["ok"] is False, name
         assert result["reason"] == expected, name
         assert result["detail"], name
@@ -515,25 +520,25 @@ def test_register_reports_each_failure_reason(plugin, tmp_path):
 
 def test_register_rejects_missing_and_out_of_root_paths(plugin, tmp_path):
     missing = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_path": str(tmp_path / "nope.jpg")})
+        "action": "register_by_photo", "image_path": str(tmp_path / "nope.jpg")})
     assert missing["reason"] == face_plugin.REASON_BAD_INPUT
 
     escaped = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_path": "/etc/hostname"})
+        "action": "register_by_photo", "image_path": "/etc/hostname"})
     assert escaped["reason"] == face_plugin.REASON_BAD_INPUT
     assert "must be under" in escaped["detail"]
 
     nothing = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "profile": "x"})
+        "action": "register_by_photo", "name": "x"})
     assert nothing["reason"] == face_plugin.REASON_BAD_INPUT
 
 
 def test_registering_a_known_face_merges_instead_of_duplicating(plugin, tmp_path):
     path = _write_photo(tmp_path, "a.jpg", _FakeFrame.one(20))
     first = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_path": path, "profile": "Alice"})
+        "action": "register_by_photo", "image_path": path, "name": "Alice"})
     second = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_path": path, "profile": "Alice"})
+        "action": "register_by_photo", "image_path": path, "name": "Alice"})
 
     assert second["person_id"] == first["person_id"]
     assert second["merged"] is True
@@ -549,15 +554,15 @@ def test_registering_a_tracked_stranger_promotes_their_unknown_id(plugin, tmp_pa
 
     path = _write_photo(tmp_path, "b.jpg", _FakeFrame.one(21))
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_path": path, "profile": "Dave"})
+        "action": "register_by_photo", "image_path": path, "name": "Dave"})
 
     assert result["person_id"] == unknown_id
     assert result["promoted"] is True
     record = plugin._require_engine().db.get_person(unknown_id)
-    assert record["named"] is True and record["profile"] == "Dave"
+    assert record["named"] is True and record["name"] == "Dave"
 
 
-# ── register_current_stream ───────────────────────────────────────────────────
+# ── register_by_stream ───────────────────────────────────────────────────
 
 def test_register_from_the_stream_uses_the_whole_window(plugin):
     node, _payloads = _run_one_frame(plugin, _FakeFrame.one(30))
@@ -565,7 +570,7 @@ def test_register_from_the_stream_uses_the_whole_window(plugin):
         node._image_cb(_FakeCompressedImage(_FakeFrame.one(30)))
 
     result = plugin.dispatch("face_recognition", {
-        "action": "register_current_stream", "profile": "Erin"})
+        "action": "register_by_stream", "name": "Erin"})
     assert result["ok"] is True
     assert result["frames_examined"] >= 2
     assert result["frames_used"] >= 2
@@ -574,7 +579,7 @@ def test_register_from_the_stream_uses_the_whole_window(plugin):
 
 def test_register_from_the_stream_without_an_instance(plugin):
     result = plugin.dispatch("face_recognition", {
-        "action": "register_current_stream", "profile": "Nobody"})
+        "action": "register_by_stream", "name": "Nobody"})
     assert result["ok"] is False
     assert result["reason"] == face_plugin.REASON_NO_FRAMES
 
@@ -587,7 +592,7 @@ def test_register_from_the_stream_reports_a_crowd(plugin):
             _FakeFrame.build((1, 120, 500.0), (2, 119, 500.0))))
 
     result = plugin.dispatch("face_recognition", {
-        "action": "register_current_stream", "profile": "Someone"})
+        "action": "register_by_stream", "name": "Someone"})
     assert result["ok"] is False
     assert result["reason"] == face_plugin.REASON_AMBIGUOUS
     assert result["frame_reasons"][face_plugin.REASON_AMBIGUOUS] >= 1
@@ -600,7 +605,7 @@ def test_register_from_the_stream_refuses_an_unstable_subject(plugin):
         node._image_cb(_FakeCompressedImage(_FakeFrame.one(identity)))
 
     result = plugin.dispatch("face_recognition", {
-        "action": "register_current_stream", "profile": "Whoever"})
+        "action": "register_by_stream", "name": "Whoever"})
     assert result["ok"] is False
     assert result["reason"] == face_plugin.REASON_AMBIGUOUS
     assert "stable subject" in result["detail"]
@@ -610,7 +615,7 @@ def test_register_stream_window_is_clamped_to_the_config(plugin):
     node, _ = _run_one_frame(plugin, _FakeFrame.one(45))
     node._image_cb(_FakeCompressedImage(_FakeFrame.one(45)))
     result = plugin.dispatch("face_recognition", {
-        "action": "register_current_stream", "profile": "Frank", "window_s": 999})
+        "action": "register_by_stream", "name": "Frank", "window_s": 999})
     assert result["window_s"] == pytest.approx(3.0)
 
 
@@ -621,7 +626,7 @@ def test_register_stream_needs_an_instance_id_when_several_run(plugin):
             "instance_id": f"i{index}"})
     assert _wait_until(lambda: len(plugin._nodes) == 2, timeout=5.0)
     result = plugin.dispatch("face_recognition", {
-        "action": "register_current_stream", "profile": "x"})
+        "action": "register_by_stream", "name": "x"})
     assert result["reason"] == face_plugin.REASON_BAD_INPUT
     assert "instance_id" in result["detail"]
 
@@ -642,7 +647,7 @@ def test_the_window_drops_frames_older_than_enroll_window_s(monkeypatch, tmp_pat
         plugin.dispatch("face_recognition", {"action": "stop"})
 
 
-# ── register_user_photos (batch) ──────────────────────────────────────────────
+# ── register_by_corpus (batch) ──────────────────────────────────────────────
 
 def _make_package(tmp_path, entries, manifest=None) -> str:
     directory = tmp_path / "pack"
@@ -672,7 +677,7 @@ def test_batch_reports_one_result_per_photo(plugin, tmp_path):
         },
     )
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photos", "package": package})
+        "action": "register_by_corpus", "package": package})
 
     assert result["ok"] is True
     assert result["total"] == 4
@@ -681,7 +686,7 @@ def test_batch_reports_one_result_per_photo(plugin, tmp_path):
 
     by_file = {item["file"]: item for item in result["results"]}
     assert by_file["alice.jpg"]["ok"] is True
-    assert by_file["alice.jpg"]["profile"] == "Alice from ops"
+    assert by_file["alice.jpg"]["name"] == "Alice from ops"
     assert by_file["bob.jpg"]["reason"] == face_plugin.REASON_LOW_QUALITY
     assert by_file["team.jpg"]["reason"] == face_plugin.REASON_AMBIGUOUS
     assert by_file["team.jpg"]["candidates"]
@@ -697,12 +702,12 @@ def test_batch_manifest_list_form_and_person_grouping(plugin, tmp_path):
         {"a1.jpg": _FakeFrame.one(70), "a2.jpg": _FakeFrame.one(71)},
         manifest=[
             {"file": "a1.jpg", "profile": "Grace", "person": "grace",
-             "meta": {"badge": "G1"}},
+             "profile": {"badge": "G1"}},
             {"file": "a2.jpg", "profile": "Grace", "person": "grace"},
         ],
     )
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photos", "package": package})
+        "action": "register_by_corpus", "package": package})
     assert result["registered"] == 2
     ids = {item["person_id"] for item in result["results"]}
     assert len(ids) == 1, "photos sharing a person key must become one identity"
@@ -710,7 +715,7 @@ def test_batch_manifest_list_form_and_person_grouping(plugin, tmp_path):
     engine = plugin._require_engine()
     person = engine.db.get_person(ids.pop())
     assert person["samples"] == 2
-    assert person["meta"] == {"badge": "G1"}
+    assert person["profile"] == {"badge": "G1"}
 
 
 def test_batch_falls_back_to_sidecars_then_the_filename(plugin, tmp_path):
@@ -718,17 +723,17 @@ def test_batch_falls_back_to_sidecars_then_the_filename(plugin, tmp_path):
     directory.mkdir()
     (directory / "heidi.jpg").write_bytes(_FakeFrame.one(80))
     (directory / "heidi.json").write_text(json.dumps(
-        {"profile": "Heidi from QA", "meta": {"floor": 2}}))
+        {"name": "Heidi from QA", "profile": {"floor": 2}}))
     (directory / "ivan.jpg").write_bytes(_FakeFrame.one(81))
     (directory / "ivan.txt").write_text("Ivan the intern\n")
     (directory / "judy.jpg").write_bytes(_FakeFrame.one(82))
 
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photos", "package": str(directory)})
-    profiles = {item["file"]: item["profile"] for item in result["results"]}
-    assert profiles["heidi.jpg"] == "Heidi from QA"
-    assert profiles["ivan.jpg"] == "Ivan the intern"
-    assert profiles["judy.jpg"] == "judy"          # filename stem
+        "action": "register_by_corpus", "package": str(directory)})
+    names = {item["file"]: item["name"] for item in result["results"]}
+    assert names["heidi.jpg"] == "Heidi from QA"
+    assert names["ivan.jpg"] == "Ivan the intern"
+    assert names["judy.jpg"] == "judy"          # filename stem
 
 
 def test_batch_accepts_a_zip_and_refuses_traversal(plugin, tmp_path):
@@ -740,7 +745,7 @@ def test_batch_accepts_a_zip_and_refuses_traversal(plugin, tmp_path):
         handle.writestr("manifest.json", json.dumps({"kate.jpg": "Kate"}))
 
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photos", "package": str(archive)})
+        "action": "register_by_corpus", "package": str(archive)})
     assert result["registered"] == 1
     assert [item["file"] for item in result["results"]] == ["kate.jpg"]
     assert not (tmp_path / "escape.jpg").exists()
@@ -750,7 +755,7 @@ def test_batch_rejects_an_empty_or_oversized_package(plugin, tmp_path, monkeypat
     empty = tmp_path / "empty-pack"
     empty.mkdir()
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photos", "package": str(empty)})
+        "action": "register_by_corpus", "package": str(empty)})
     assert result["reason"] == face_plugin.REASON_BAD_INPUT
     assert "no images" in result["detail"]
 
@@ -758,13 +763,13 @@ def test_batch_rejects_an_empty_or_oversized_package(plugin, tmp_path, monkeypat
     package = _make_package(
         tmp_path, {"a.jpg": _FakeFrame.one(1), "b.jpg": _FakeFrame.one(2)})
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photos", "package": package})
+        "action": "register_by_corpus", "package": package})
     assert result["reason"] == face_plugin.REASON_BAD_INPUT
     assert "max_batch" in result["detail"]
 
 
 def test_batch_requires_a_package(plugin):
-    result = plugin.dispatch("face_recognition", {"action": "register_user_photos"})
+    result = plugin.dispatch("face_recognition", {"action": "register_by_corpus"})
     assert result["reason"] == face_plugin.REASON_BAD_INPUT
 
 
@@ -773,8 +778,8 @@ def test_batch_requires_a_package(plugin):
 def test_roster_crud_through_dispatch(plugin, tmp_path):
     path = _write_photo(tmp_path, "l.jpg", _FakeFrame.one(100))
     created = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_path": path,
-        "profile": "Leo", "meta": {"team": "ops", "floor": 3}})
+        "action": "register_by_photo", "image_path": path,
+        "name": "Leo", "profile": {"team": "ops", "floor": 3}})
     person_id = created["person_id"]
 
     listed = plugin.dispatch("face_recognition", {"action": "list_persons"})
@@ -786,14 +791,14 @@ def test_roster_crud_through_dispatch(plugin, tmp_path):
 
     updated = plugin.dispatch("face_recognition", {
         "action": "update_person", "person_id": person_id,
-        "profile": "Leo (facilities)", "meta": {"floor": 4},
-        "meta_delete": ["team"]})
-    assert updated["person"]["profile"] == "Leo (facilities)"
-    assert updated["person"]["meta"] == {"floor": 4}
+        "name": "Leo (facilities)", "profile": {"floor": 4},
+        "profile_delete": ["team"]})
+    assert updated["person"]["name"] == "Leo (facilities)"
+    assert updated["person"]["profile"] == {"floor": 4}
 
     fetched = plugin.dispatch("face_recognition", {
         "action": "get_person", "person_id": person_id})
-    assert fetched["person"]["meta"] == {"floor": 4}
+    assert fetched["person"]["profile"] == {"floor": 4}
 
     forgotten = plugin.dispatch("face_recognition", {
         "action": "forget", "person_id": person_id})
@@ -830,7 +835,7 @@ def test_update_person_names_an_unknown_keeping_its_id(plugin):
     engine = plugin._require_engine()
     unknown_id = engine.db.enroll_unknown(_unit(120))["id"]
     result = plugin.dispatch("face_recognition", {
-        "action": "update_person", "person_id": unknown_id, "profile": "Nina"})
+        "action": "update_person", "person_id": unknown_id, "name": "Nina"})
     assert result["person"]["id"] == unknown_id
     assert result["person"]["named"] is True
 
@@ -958,8 +963,8 @@ def test_register_actions_take_no_person_id():
     """Which identity a photo belongs to is decided by matching, not by the
     caller — otherwise there are two ways to say it and they can disagree."""
     params = face_plugin.TOOLS[0]["inputSchema"]["x-action-params"]
-    assert "person_id" not in params["register_user_photo"]["params"]
-    assert "person_id" not in params["register_current_stream"]["params"]
+    assert "person_id" not in params["register_by_photo"]["params"]
+    assert "person_id" not in params["register_by_stream"]["params"]
     # It remains an input where it identifies an existing record.
     for action in ("get_person", "update_person", "forget"):
         assert "person_id" in params[action]["params"]
@@ -972,11 +977,11 @@ def test_register_ignores_a_person_id_argument(plugin, tmp_path):
     path = _write_photo(tmp_path, "x.jpg", _FakeFrame.one(201))
 
     result = plugin.dispatch("face_recognition", {
-        "action": "register_user_photo", "image_path": path,
-        "profile": "New person", "person_id": "p-1"})
+        "action": "register_by_photo", "image_path": path,
+        "name": "New person", "person_id": "p-1"})
     assert result["ok"] is True
     assert result["person_id"] == "p-2", "person_id must not force the identity"
-    assert engine.db.get_person("p-1")["profile"] == "Someone else"
+    assert engine.db.get_person("p-1")["name"] == "Someone else"
 
 
 def test_published_payload_carries_no_topic_field(plugin):
@@ -985,3 +990,207 @@ def test_published_payload_carries_no_topic_field(plugin):
     _node, payloads = _run_one_frame(plugin, _FakeFrame.one(210))
     assert "topic" not in payloads[0]
     assert set(payloads[0]) == {"ts", "count", "faces", "latency_ms"}
+
+
+# ── 访问记录表 through dispatch ────────────────────────────────────────────────
+
+def test_list_visits_action_is_on_the_card():
+    schema = face_plugin.TOOLS[0]["inputSchema"]
+    assert "list_visits" in schema["properties"]["action"]["enum"]
+    assert set(schema["x-action-params"]["list_visits"]["params"]) == {
+        "person_id", "since", "until", "limit", "offset",
+    }
+
+
+def test_recognition_records_visits_not_one_row_per_frame(plugin):
+    node, _ = _run_one_frame(plugin, _FakeFrame.one(300))
+    # One frame at a time: LatestFrame overwrites, so pushing several at once
+    # publishes fewer results than frames — deliberately, that is its job.
+    for expected in range(2, 5):
+        node._image_cb(_FakeCompressedImage(_FakeFrame.one(300)))
+        assert _wait_until(
+            lambda: len(node.publishers[0].messages) >= expected, timeout=5.0)
+
+    visits = plugin.dispatch("face_recognition", {"action": "list_visits"})
+    assert visits["ok"] is True
+    assert visits["total"] == 1, "one visit for one continuous presence"
+    entry = visits["visits"][0]
+    assert entry["open"] is True
+    assert entry["sightings"] >= 4
+    assert entry["topic"] == "/cam/rgb"
+
+
+def test_list_visits_rejects_an_unparseable_time(plugin):
+    plugin._require_engine()
+    result = plugin.dispatch("face_recognition", {
+        "action": "list_visits", "since": "next thursday"})
+    assert result["ok"] is False
+    assert result["reason"] == face_plugin.REASON_BAD_INPUT
+
+
+def test_stopping_an_instance_closes_the_open_visit(plugin):
+    """Otherwise a visit in progress is lost when the card is stopped."""
+    node, _ = _run_one_frame(plugin, _FakeFrame.one(310))
+    engine = plugin._require_engine()
+    assert engine.db.stats()["open_visits"] == 1
+
+    plugin.dispatch("face_recognition", {"action": "stop"})
+    assert engine.db.stats()["open_visits"] == 0
+    closed = engine.db.list_visits()
+    assert closed["total"] == 1
+    assert not closed["visits"][0].get("open")
+
+
+def test_payload_reports_name_and_profile_but_no_timestamps(plugin):
+    engine = plugin._require_engine()
+    engine.db.add("小王", [_unit(320)], profile={"gender": "male"})
+    _node, payloads = _run_one_frame(plugin, _FakeFrame.one(320))
+    face = payloads[0]["faces"][0]
+    assert face["name"] == "小王"
+    assert face["profile"] == {"gender": "male"}
+    # "when was this person around" is a list_visits question.
+    assert "registered_at" not in face and "last_seen_at" not in face
+
+
+# ── recognize_by_photo / recognize_by_stream (read-only) ─────────────────────
+
+def test_recognize_actions_are_on_the_card():
+    schema = face_plugin.TOOLS[0]["inputSchema"]
+    actions = set(schema["properties"]["action"]["enum"])
+    assert {"recognize_by_photo", "recognize_by_stream"} <= actions
+    assert actions == set(schema["x-action-params"])
+    params = schema["x-action-params"]
+    assert set(params["recognize_by_photo"]["params"]) == {"image_path", "image_b64"}
+    assert set(params["recognize_by_stream"]["params"]) == {"window_s"}
+    # register/recognize are symmetric by suffix.
+    assert {"register_by_photo", "register_by_stream", "register_by_corpus"} <= actions
+
+
+def test_recognize_by_photo_identifies_a_registered_person(plugin, tmp_path):
+    engine = plugin._require_engine()
+    engine.db.add("小王", [_unit(400)], profile={"gender": "male"})
+    path = _write_photo(tmp_path, "who.jpg", _FakeFrame.one(400))
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "recognize_by_photo", "image_path": path})
+    assert result["ok"] is True and result["count"] == 1
+    face = result["faces"][0]
+    assert face["person_id"] == "p-1"
+    assert face["name"] == "小王"
+    assert face["profile"] == {"gender": "male"}
+    assert face["score"] > 0.9
+
+
+def test_recognize_is_read_only(plugin, tmp_path):
+    """A query must not enrol the stranger it failed to recognise, nor log a
+    visit — otherwise asking "who is this" quietly changes the answer."""
+    engine = plugin._require_engine()
+    before = engine.db.stats()
+    path = _write_photo(tmp_path, "stranger.jpg", _FakeFrame.one(401))
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "recognize_by_photo", "image_path": path})
+    assert result["ok"] is True
+    face = result["faces"][0]
+    assert face["person_id"] is None
+    assert face["known"] is False
+    # The near-miss score is reported so match_threshold can be tuned.
+    assert "best_score" in face
+
+    after = engine.db.stats()
+    assert after["persons"] == before["persons"] == 0
+    assert after["open_visits"] == 0
+    assert engine.db.list_visits()["total"] == 0
+
+
+def test_recognize_reports_every_face_without_the_ambiguity_gate(plugin, tmp_path):
+    """subject_dominance exists for enrolment, which must pick one person; a
+    query can just report everyone."""
+    engine = plugin._require_engine()
+    engine.db.add("A", [_unit(410)])
+    engine.db.add("B", [_unit(411)])
+    path = _write_photo(tmp_path, "two.jpg",
+                        _FakeFrame.build((410, 120, 500.0), (411, 118, 500.0)))
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "recognize_by_photo", "image_path": path})
+    assert result["ok"] is True
+    assert result["count"] == 2
+    assert {f["name"] for f in result["faces"]} == {"A", "B"}
+
+    # The same photo is refused for registration, for the opposite reason.
+    refused = plugin.dispatch("face_recognition", {
+        "action": "register_by_photo", "image_path": path, "name": "C"})
+    assert refused["reason"] == face_plugin.REASON_AMBIGUOUS
+
+
+def test_recognize_by_photo_flags_a_low_quality_face(plugin, tmp_path):
+    path = _write_photo(tmp_path, "far.jpg", _FakeFrame.one(420, size=30, blur=4.0))
+    result = plugin.dispatch("face_recognition", {
+        "action": "recognize_by_photo", "image_path": path})
+    face = result["faces"][0]
+    assert face["quality"] == "low"
+    assert face["reason"] == face_plugin.REASON_LOW_QUALITY
+
+
+def test_recognize_by_photo_on_an_empty_frame(plugin, tmp_path):
+    path = _write_photo(tmp_path, "wall.jpg", b"")
+    result = plugin.dispatch("face_recognition", {
+        "action": "recognize_by_photo", "image_path": path})
+    assert result["ok"] is True and result["count"] == 0 and result["faces"] == []
+
+
+def test_recognize_by_photo_rejects_bad_input(plugin, tmp_path):
+    path = _write_photo(tmp_path, "corrupt.jpg", b"corrupt")
+    result = plugin.dispatch("face_recognition", {
+        "action": "recognize_by_photo", "image_path": path})
+    assert result["ok"] is False
+    assert result["reason"] == face_plugin.REASON_BAD_INPUT
+
+
+def test_recognize_by_stream_answers_who_is_there_now(plugin):
+    engine = plugin._require_engine()
+    engine.db.add("小李", [_unit(430)])
+    node, _ = _run_one_frame(plugin, _FakeFrame.one(430))
+    node._image_cb(_FakeCompressedImage(_FakeFrame.one(430)))
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "recognize_by_stream"})
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["faces"][0]["name"] == "小李"
+    assert result["window_s"] == pytest.approx(1.0)
+    assert result["frames_examined"] >= 1
+
+
+def test_recognize_by_stream_reports_each_person_once(plugin):
+    """Several frames of the same two people must not become four entries."""
+    engine = plugin._require_engine()
+    engine.db.add("A", [_unit(440)])
+    engine.db.add("B", [_unit(441)])
+    spec = _FakeFrame.build((440, 120, 500.0), (441, 118, 500.0))
+    node, _ = _run_one_frame(plugin, spec)
+    for _ in range(3):
+        node._image_cb(_FakeCompressedImage(spec))
+
+    result = plugin.dispatch("face_recognition", {"action": "recognize_by_stream"})
+    assert result["count"] == 2
+    assert {f["name"] for f in result["faces"]} == {"A", "B"}
+
+
+def test_recognize_by_stream_without_a_running_instance(plugin):
+    plugin._require_engine()
+    result = plugin.dispatch("face_recognition", {"action": "recognize_by_stream"})
+    assert result["ok"] is False
+    assert result["reason"] == face_plugin.REASON_NO_FRAMES
+
+
+def test_recognize_by_stream_needs_an_instance_id_when_several_run(plugin):
+    for index in (1, 2):
+        plugin.dispatch("face_recognition", {
+            "action": "start", "input_topic": f"/cam{index}",
+            "instance_id": f"i{index}"})
+    assert _wait_until(lambda: len(plugin._nodes) == 2, timeout=5.0)
+    result = plugin.dispatch("face_recognition", {"action": "recognize_by_stream"})
+    assert result["reason"] == face_plugin.REASON_BAD_INPUT
+    assert "instance_id" in result["detail"]

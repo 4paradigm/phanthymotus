@@ -127,6 +127,13 @@ plugins:
     # people are never evicted. Editable from the card.
     unknown_capacity: 500
     max_samples_per_person: 8
+    # 访问记录表 (visits.jsonl): 一次连续出现 = 一条记录，不是一帧一条。
+    # 离开超过 visit_gap_s 才封档落盘；10 分钟避免有人转个头就把一下午切成几十条。
+    visit_gap_s: 600.0
+    # 在场的人的 visit 会在内存里挂很久（10 分钟 gap + 一直出现），断电会整条丢，
+    # 所以每 visit_checkpoint_s 把未封档的 visit 落一次小文件，重启后续上。
+    visit_checkpoint_s: 60.0
+    visit_log_max: 20000
     max_batch: 200
     # Caller-supplied image/package paths are confined to these roots — the MCP
     # server has no authentication and runs as root in the container.
