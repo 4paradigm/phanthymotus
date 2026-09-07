@@ -34,6 +34,7 @@ import binascii
 import json
 import logging
 import os
+import re
 import tarfile
 import tempfile
 import threading
@@ -67,6 +68,8 @@ from plugins.face_db import (
 )
 from plugins.face_runtime import (
     DEFAULT_BLUR_MIN,
+    DEFAULT_MAX_IMAGE_PIXELS,
+    DEFAULT_MAX_IMAGE_SIDE,
     DEFAULT_DET_SIZE,
     DEFAULT_DET_THRESH,
     DEFAULT_FACE_MODEL_DIR,
@@ -89,7 +92,11 @@ DEFAULT_ENROLL_WINDOW_S = 3.0
 DEFAULT_ENROLL_WINDOW_MAX_FRAMES = 60
 DEFAULT_ENROLL_MAX_ANALYZED = 8
 DEFAULT_MAX_BATCH = 200
-DEFAULT_MAX_IMAGE_BYTES = 16 * 1024 * 1024
+# Only a transfer/memory guard now, not a policy limit: oversized *images* are
+# downscaled locally (see FaceAnalyzer.decode_image) rather than rejected, so
+# this only has to be larger than any real photo. 64 MB covers a 60 MP
+# uncompressed-ish PNG; the pixel cap is what actually protects memory.
+DEFAULT_MAX_IMAGE_BYTES = 64 * 1024 * 1024
 DEFAULT_IMAGE_ROOTS = ("/models", "/tmp", "/work")
 
 
@@ -118,7 +125,13 @@ def detect_interval(cfg: dict) -> float:
     return 1.0 / fps
 
 
-_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+# What the two decoders between them can read (cv2, then Pillow). Suffixes are
+# only used to *find* images in a corpus directory — the decode itself does not
+# care about the name, so this errs wide.
+_IMAGE_SUFFIXES = (
+    ".jpg", ".jpeg", ".jpe", ".png", ".bmp", ".webp", ".tif", ".tiff",
+    ".ppm", ".pgm", ".pbm", ".gif", ".ico", ".jfif",
+)
 
 _RESULT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
@@ -144,8 +157,8 @@ TOOLS = [
                     "type": "string",
                     "enum": [
                         "start", "stop", "info", "config",
-                        "register_by_photo", "register_by_stream",
-                        "register_by_corpus",
+                        "register_by_photo", "register_by_url",
+                        "register_by_stream", "register_by_corpus",
                         "recognize_by_photo", "recognize_by_stream",
                         "list_persons", "get_person", "update_person", "forget",
                         "list_visits",
@@ -156,19 +169,21 @@ TOOLS = [
                     "type": "string",
                     "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)",
                 },
-                "image_path": {"type": "string", "description": "Path to a JPEG/PNG readable by this container"},
-                "image_b64":  {"type": "string", "description": "Base64-encoded JPEG/PNG bytes"},
-                "name":       {"type": "string", "description": "姓名（结构化）。有 name 才算已注册；每次识别都会随 id 一起输出"},
-                "profile":    {"type": "object", "description": "非结构化画像对象：性别、外貌、备注、标签等，随 name 一起输出"},
-                "profile_delete": {"type": "array", "items": {"type": "string"}, "description": "要删除的 profile 键"},
+                "image_path": {"type": "string", "description": "容器内可读的图片路径，如 /tmp/alice.jpg。常见格式都支持（jpg/png/bmp/webp/tiff/gif...），过大的图会在本地缩放，不需要预先处理"},
+                "image_b64":  {"type": "string", "description": "Base64 编码的图片字节（不含 data: 前缀）"},
+                "url":        {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/alice.jpg。下载后本地解码缩放，格式限制同 image_path"},
+                "name":       {"type": "string", "description": "姓名（结构化），如 \"小王\"。有 name 才算已注册；每次识别都会随 id 一起输出"},
+                "profile":    {"type": "object", "description": "非结构化画像对象，如 {\"gender\":\"male\",\"team\":\"运营部\",\"note\":\"常穿蓝色外套\"}。键名自定，随 name 一起在每帧输出；传字符串会被存成 {\"note\":\"...\"}"},
+                "profile_delete": {"type": "array", "items": {"type": "string"}, "description": "要删除的 profile 键名列表，如 [\"team\",\"note\"]"},
                 "merge":      {"type": "boolean", "description": "profile 合并进已有对象（默认 true），false 为整体替换"},
-                "since":      {"type": "string", "description": "起始时间：epoch 秒或 ISO-8601（如 2026-09-07T15:00）"},
-                "until":      {"type": "string", "description": "结束时间：epoch 秒或 ISO-8601"},
-                "person_id":  {"type": "string", "description": "Existing person id (p-N or unknown-N)"},
-                "window_s":   {"type": "number", "description": "Seconds of recent stream to analyse (default 3.0, capped by enroll_window_s)"},
-                "package":    {"type": "string", "description": "Directory, .zip or .tar.gz path/URL holding photos plus an optional manifest.json"},
-                "named":      {"type": "string", "enum": ["all", "named", "unknown"], "description": "Filter the roster (default all); with action=forget, 'unknown' clears every anonymous entry"},
-                "query":      {"type": "string", "description": "Substring filter over id, name and profile"},
+                "since":      {"type": "string", "description": "起始时间，epoch 秒或 ISO-8601，如 \"2026-09-07T15:00\" 或 1788780000。按时间重叠筛选：15:00 前到、15:20 走的人，查 15:00-15:05 也会返回"},
+                "until":      {"type": "string", "description": "结束时间，格式同 since。留空表示至今"},
+                "person_id":  {"type": "string", "description": "已存在的人员 id，形如 p-3（已命名）或 unknown-7（陌生人）"},
+                "person_ids": {"type": "array", "items": {"type": "string"}, "description": "批量删除的 id 列表，如 [\"p-1\",\"p-2\",\"unknown-7\"]；也接受逗号或空格分隔的字符串 \"p-1, unknown-7\"。一次提交完成，不是逐个删。返回 forgotten(已删数量+id列表) 与 missing(不存在的 id)，部分成功是正常结果"},
+                "window_s":   {"type": "number", "description": "回看最近多少秒的画面。register_by_stream 默认 3.0，recognize_by_stream 默认 1.0，上限为 enroll_window_s"},
+                "package":    {"type": "string", "description": "图片包：目录 / .zip / .tar.gz 的路径或 URL。包内可放 manifest.json 指定每张图的 name 与 profile，如 [{\"file\":\"alice.jpg\",\"name\":\"Alice\",\"person\":\"alice\"}]；没有 manifest 则用同名 .json/.txt 侧文件，再退回文件名"},
+                "named":      {"type": "string", "enum": ["all", "named", "unknown"], "description": "过滤范围，默认 all。用于 action=forget 时，'unknown' 表示清空所有陌生人条目"},
+                "query":      {"type": "string", "description": "在 id、name、profile 上做子串匹配，如 \"运营部\""},
                 "limit":      {"type": "integer", "description": "Page size (default 100)"},
                 "offset":     {"type": "integer", "description": "Page offset"},
             },
@@ -182,6 +197,10 @@ TOOLS = [
                     "params": ["image_path", "image_b64", "name", "profile"],
                     "description": "Register a person from one photo. Fails with a reason when there is no face, no clear face, or no obvious subject",
                 },
+                "register_by_url": {
+                    "params": ["url", "name", "profile"],
+                    "description": "从图片 URL 注册一个人。过大或非常见格式的图片会在本地缩放/转码，而不是被拒绝",
+                },
                 "register_by_stream": {
                     "params": ["name", "profile", "window_s"],
                     "description": "Register the person currently in front of the camera, using the last few seconds of the live stream",
@@ -191,7 +210,7 @@ TOOLS = [
                     "description": "Register many people from a package of photos; returns a per-photo result saying which succeeded and why the others did not",
                 },
                 "recognize_by_photo": {
-                    "params": ["image_path", "image_b64"],
+                    "params": ["image_path", "image_b64", "url"],
                     "description": "认出照片里的人 — 只读，不写库：返回每张人脸的 id/name/profile 与相似度，不会登记陌生人",
                 },
                 "recognize_by_stream": {
@@ -201,7 +220,7 @@ TOOLS = [
                 "list_persons":  {"params": ["named", "query", "limit", "offset"], "description": "List registered people with their name and profile"},
                 "get_person":    {"params": ["person_id"], "description": "Read one person's full record"},
                 "update_person": {"params": ["person_id", "name", "profile", "profile_delete", "merge"], "description": "Edit a person's name or profile; setting a name on an unknown-N id names that identity, keeping the id"},
-                "forget":        {"params": ["person_id", "named"], "description": "Delete a person (or every unknown entry). The id is retired and never reused"},
+                "forget":        {"params": ["person_id", "person_ids", "named"], "description": "删除人员：单个 person_id、批量 person_ids，或 named='unknown' 清空所有陌生人。id 退役后永不复用"},
                 "list_visits":   {"params": ["person_id", "since", "until", "limit", "offset"], "description": "访问记录：查询某段时间内出现过的人。一次连续出现算一条记录，含首末时间与出现次数"},
             },
         },
@@ -295,6 +314,14 @@ def _db_options(cfg: dict) -> dict:
         "visit_checkpoint_s": float(
             cfg.get("visit_checkpoint_s", DEFAULT_VISIT_CHECKPOINT_S)
         ),
+    }
+
+
+def _decode_options(cfg: dict) -> dict:
+    """How incoming photos are normalised before detection."""
+    return {
+        "max_side": int(cfg.get("max_image_side", DEFAULT_MAX_IMAGE_SIDE)),
+        "max_pixels": int(cfg.get("max_image_pixels", DEFAULT_MAX_IMAGE_PIXELS)),
     }
 
 
@@ -490,12 +517,18 @@ def _worst_reason(failures: list[dict]) -> dict:
 # ── image sources ─────────────────────────────────────────────────────────────
 
 def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
-    """Read image bytes from `image_b64` or `image_path`.
+    """Read image bytes from `url`, `image_b64` or `image_path`.
 
-    No URL source: the dashboard has no file-upload widget, so a path (confined
-    to `image_roots`) and inline base64 are what a caller actually has. Adding a
-    URL fetch would also give an unauthenticated LAN caller a request-forging
-    primitive from inside the robot's network for no benefit.
+    The byte ceiling here is a transfer/memory guard, not a policy limit: an
+    image that is merely *large* is downscaled and converted locally by
+    `FaceAnalyzer.decode_image`, because "your photo is 24 MB" or "we only take
+    JPEG" is a limitation of ours rather than a property of their photo.
+
+    `url` is a distinct action (`register_by_url`) rather than a parameter
+    smuggled into the photo path, so the capability is visible on the card.
+    Note it does let a caller make this container issue an outbound request —
+    acceptable for a deliberate, named action, which is why it is not folded
+    into the generic input.
     """
     max_bytes = int(cfg.get("max_image_bytes", DEFAULT_MAX_IMAGE_BYTES))
 
@@ -507,15 +540,20 @@ def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
             raise _BadInput(f"image_b64 is not valid base64: {error}", "image_b64")
         if len(data) > max_bytes:
             raise _BadInput(
-                f"image is {len(data)} bytes, over the {max_bytes} limit", "image_b64"
+                f"image is {len(data)} bytes, over the {max_bytes} byte transfer "
+                "cap (raise max_image_bytes if this is a real photo)", "image_b64"
             )
         return data, "image_b64"
+
+    url = args.get("url") or args.get("image_url")
+    if url:
+        return _fetch_url(str(url), max_bytes), str(url)
 
     path = args.get("image_path")
     if path:
         return _read_local(str(path), cfg, max_bytes), str(path)
 
-    raise _BadInput("one of image_path or image_b64 is required")
+    raise _BadInput("one of url, image_path or image_b64 is required")
 
 
 def _image_roots(cfg: dict) -> tuple[str, ...]:
@@ -546,7 +584,8 @@ def _read_local(path: str, cfg: dict, max_bytes: int) -> bytes:
         size = os.path.getsize(resolved)
         if size > max_bytes:
             raise _BadInput(
-                f"file is {size} bytes, over the {max_bytes} limit", path
+                    f"file is {size} bytes, over the {max_bytes} byte transfer cap "
+                "(raise max_image_bytes if this is a real photo)", path
             )
         with open(resolved, "rb") as handle:
             return handle.read()
@@ -938,7 +977,9 @@ class _FaceNode(Node):
             analyzer = self._engine.analyzer
             database = self._engine.db
             gates = _gates(self._cfg)
-            image = analyzer.decode_jpeg(image_bytes)
+            image = analyzer.decode_image(
+                image_bytes, **_decode_options(self._cfg)
+            )
             if image is None:
                 payload["error"] = "undecodable frame"
                 return payload
@@ -1214,6 +1255,8 @@ class FaceRecognitionPlugin:
         if action == "config":
             return self._do_config(instance_id, args)
         if action == "register_by_photo":
+            return self._do_register_by_photo(args)
+        if action == "register_by_url":
             return self._do_register_by_photo(args)
         if action == "register_by_stream":
             return self._do_register_by_stream(instance_id, args)
@@ -1542,11 +1585,17 @@ class FaceRecognitionPlugin:
         self, engine: _FaceEngine, image_bytes: bytes, gates: dict
     ) -> tuple[np.ndarray | None, dict | None]:
         """One image → the subject's embedding, or the failure record."""
-        image = engine.analyzer.decode_jpeg(image_bytes)
+        image = engine.analyzer.decode_image(
+            image_bytes, **_decode_options(self._plugin_cfg)
+        )
         if image is None:
             return None, {
                 "ok": False, "reason": REASON_BAD_INPUT,
-                "detail": "image could not be decoded as JPEG/PNG",
+                "detail": (
+                    "image could not be decoded (cv2 and Pillow both refused it; "
+                    "HEIC/HEIF is the common format neither reads), or it exceeds "
+                    "max_image_pixels"
+                ),
             }
         shape = image.shape[:2]
         faces = engine.analyzer.detect(image, max_faces=gates["max_faces"])
@@ -1887,11 +1936,17 @@ class FaceRecognitionPlugin:
         because *enrolment* must resolve to exactly one person, whereas a query
         can simply report everyone it sees.
         """
-        image = engine.analyzer.decode_jpeg(image_bytes)
+        image = engine.analyzer.decode_image(
+            image_bytes, **_decode_options(self._plugin_cfg)
+        )
         if image is None:
             return {
                 "ok": False, "reason": REASON_BAD_INPUT,
-                "detail": "image could not be decoded as JPEG/PNG",
+                "detail": (
+                    "image could not be decoded (cv2 and Pillow both refused it; "
+                    "HEIC/HEIF is the common format neither reads), or it exceeds "
+                    "max_image_pixels"
+                ),
             }
         faces = engine.analyzer.detect(image, max_faces=gates["max_faces"])
         results = []
@@ -2075,19 +2130,51 @@ class FaceRecognitionPlugin:
             return {"ok": False, "reason": REASON_BAD_INPUT, "detail": str(error)}
 
     def _do_forget(self, args: dict) -> dict:
+        """Delete one person, a list of them, or every anonymous entry.
+
+        The list form is not just ergonomics: `forget_many` commits once, where
+        N single calls rewrote the whole database N times.
+        """
         engine = self._require_engine()
         scope = str(args.get("named") or "").strip().lower()
-        if scope == "unknown" and not args.get("person_id"):
+
+        raw_ids = args.get("person_ids")
+        if isinstance(raw_ids, str):
+            # An LLM (or a form field) will send "p-1, p-2" as one string.
+            raw_ids = [part for part in re.split(r"[,\s]+", raw_ids) if part]
+        ids = [str(pid).strip() for pid in (raw_ids or []) if str(pid).strip()]
+
+        single = str(args.get("person_id") or "").strip()
+        if single:
+            ids.append(single)
+
+        if scope == "unknown" and not ids:
             removed = engine.db.forget_unknowns()
             return {"ok": True, "forgotten": removed, "scope": "unknown"}
 
-        person_id = str(args.get("person_id") or "").strip()
-        if not person_id:
-            raise ValueError("person_id is required (or named='unknown')")
-        if engine.db.forget(person_id):
-            return {"ok": True, "forgotten": 1, "person_id": person_id}
-        return {"ok": False, "reason": REASON_BAD_INPUT,
-                "detail": f"no such person: {person_id!r}"}
+        if not ids:
+            raise ValueError(
+                "person_id, person_ids or named='unknown' is required"
+            )
+
+        outcome = engine.db.forget_many(ids)
+        forgotten, missing = outcome["forgotten"], outcome["missing"]
+        result = {
+            # Partially-successful is the normal case with a list, so `ok`
+            # reports "the request was processed", and the two lists say what
+            # actually happened to each id.
+            "ok": bool(forgotten) or not missing,
+            "forgotten": len(forgotten),
+            "person_ids": forgotten,
+        }
+        if missing:
+            result["missing"] = missing
+            result["detail"] = (
+                f"{len(missing)} id(s) did not exist: " + ", ".join(missing)
+            )
+            if not forgotten:
+                result["reason"] = REASON_BAD_INPUT
+        return result
 
 
 __all__ = [

@@ -615,48 +615,85 @@ class FaceDB:
         with self._lock:
             self._save_locked()
 
+    def _drop_locked(self, ids) -> list[str]:
+        """Remove these people and their embedding rows. Caller holds the lock.
+
+        Does **not** save: the caller decides when to commit, so a batch delete
+        is one rewrite rather than one per person. That matters more than it
+        sounds — every save writes a fresh `embeddings-<n>.npy` and rewrites
+        `persons.json`, so clearing 50 strangers one at a time meant 50 full
+        rewrites of the entire database onto eMMC.
+
+        Takes an *ordered* iterable and returns the removals in that order.
+        Iterating a set here instead made `forget_many`'s result order
+        hash-dependent, so a caller could not line its request up against the
+        response.
+
+        Also drops any visit in progress for those people, which would
+        otherwise be appended later under an id that no longer exists.
+        """
+        removed = [
+            pid for pid in dict.fromkeys(ids) if pid in self._persons
+        ]
+        if not removed:
+            return []
+        for pid in removed:
+            del self._persons[pid]
+            self._open_visits.pop(pid, None)
+        doomed = set(removed)
+        keep = [i for i, owner in enumerate(self._row_owners) if owner not in doomed]
+        if len(keep) != len(self._row_owners):
+            self._row_owners = [self._row_owners[i] for i in keep]
+            self._matrix = (
+                self._matrix[keep] if keep
+                else np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
+            )
+        return removed
+
     def forget(self, person_id: str) -> bool:
         """Delete one person, their samples and their embedding rows."""
         with self._lock:
-            if person_id not in self._persons:
+            if not self._drop_locked([person_id]):
                 return False
-            del self._persons[person_id]
-            keep = [
-                index for index, owner in enumerate(self._row_owners)
-                if owner != person_id
-            ]
-            if len(keep) != len(self._row_owners):
-                self._row_owners = [self._row_owners[i] for i in keep]
-                self._matrix = (
-                    self._matrix[keep] if keep
-                    else np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
-                )
             self._save_locked()
         log.info("[face_db] forgot %s", person_id)
         return True
 
+    def forget_many(self, person_ids) -> dict:
+        """Delete several people in one commit.
+
+        Returns `{"forgotten": [...], "missing": [...]}` rather than a count:
+        given a list of ids the caller needs to know *which* were not there, and
+        a partial result is the normal case — a stale id, a typo, or an entry
+        another operator already removed.
+        """
+        wanted = [str(pid) for pid in person_ids if str(pid).strip()]
+        unique = list(dict.fromkeys(wanted))          # de-dup, preserve order
+        with self._lock:
+            # `unique` is already ordered, so the response lines up with the
+            # request; passing a set here made the result order hash-dependent.
+            removed = self._drop_locked(unique)
+            if removed:
+                self._save_locked()
+        removed_set = set(removed)
+        missing = [pid for pid in unique if pid not in removed_set]
+        if removed:
+            log.info("[face_db] forgot %d person(s) in one commit", len(removed))
+        return {"forgotten": removed, "missing": missing}
+
     def forget_unknowns(self) -> int:
         """Delete every anonymous entry. Named people are untouched."""
         with self._lock:
+            # A list, not a set: roster order is insertion order, which keeps
+            # the return value deterministic.
             targets = [
-                person_id for person_id, person in self._persons.items()
+                pid for pid, person in self._persons.items()
                 if not person["named"]
             ]
-            for person_id in targets:
-                del self._persons[person_id]
-            if targets:
-                dropped = set(targets)
-                keep = [
-                    index for index, owner in enumerate(self._row_owners)
-                    if owner not in dropped
-                ]
-                self._row_owners = [self._row_owners[i] for i in keep]
-                self._matrix = (
-                    self._matrix[keep] if keep
-                    else np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
-                )
+            removed = self._drop_locked(targets)
+            if removed:
                 self._save_locked()
-        return len(targets)
+        return len(removed)
 
     # ── capacity ──────────────────────────────────────────────────────────
 

@@ -610,3 +610,82 @@ def test_version_1_database_migrates_profile_to_name(tmp_path):
     assert migrated["profile"] == {"badge": "A7"}
     assert migrated["registered_at"] == 111.0
     assert migrated["last_seen_at"] == 333.0
+
+
+# ── batch forget ─────────────────────────────────────────────────────────────
+
+def test_forget_many_commits_once_not_once_per_person(tmp_path):
+    """The reason batch exists: every save rewrites persons.json and writes a
+    fresh embeddings-<n>.npy, so N single deletes were N full rewrites of the
+    whole database onto eMMC."""
+    db = FaceDB(db_dir=str(tmp_path))
+    ids = [db.add(f"p{seed}", [_vector(seed)])["id"] for seed in range(6)]
+    before = json.loads((tmp_path / "persons.json").read_text())["generation"]
+
+    outcome = db.forget_many(ids[:4])
+
+    assert outcome["forgotten"] == ids[:4]
+    assert outcome["missing"] == []
+    state = json.loads((tmp_path / "persons.json").read_text())
+    assert state["generation"] == before + 1, "must be a single commit"
+    # Exactly one embeddings file, and it matches the surviving rows.
+    assert sorted(p.name for p in tmp_path.glob("embeddings-*.npy")) == [
+        state["embeddings_file"]
+    ]
+    assert len(state["rows"]) == 2
+    assert db.stats()["persons"] == 2
+
+
+def test_forget_many_reports_which_ids_were_missing(tmp_path):
+    """Partial success is the normal case when given a list of ids."""
+    db = FaceDB(db_dir=str(tmp_path))
+    db.add("Alice", [_vector(1)])
+    outcome = db.forget_many(["p-1", "p-404", "unknown-9"])
+    assert outcome["forgotten"] == ["p-1"]
+    assert outcome["missing"] == ["p-404", "unknown-9"]
+
+
+def test_forget_many_dedupes_and_tolerates_an_empty_list(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path))
+    db.add("Alice", [_vector(1)])
+    assert db.forget_many(["p-1", "p-1", "", "  "])["forgotten"] == ["p-1"]
+    assert db.forget_many([]) == {"forgotten": [], "missing": []}
+    assert db.forget_many(["p-1"])["missing"] == ["p-1"]      # already gone
+
+
+def test_forget_many_survives_a_reload_and_leaves_matching_intact(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path))
+    keep = db.add("Keeper", [_vector(100)])["id"]
+    db.forget_many([db.add(f"x{s}", [_vector(s)])["id"] for s in range(5)])
+
+    reopened = FaceDB(db_dir=str(tmp_path))
+    assert reopened.stats()["persons"] == 1
+    assert reopened.match(_vector(100), 0.9)[0] == keep
+    for seed in range(5):
+        assert reopened.match(_vector(seed), 0.9)[0] is None
+
+
+def test_forget_drops_the_open_visit_too(tmp_path):
+    """Otherwise the visit is appended later under an id that no longer exists."""
+    db = FaceDB(db_dir=str(tmp_path), visit_gap_s=600.0)
+    db.add("Alice", [_vector(1)])
+    db.record_sighting("p-1", 9_000_000, "/cam")
+    assert db.stats()["open_visits"] == 1
+
+    db.forget_many(["p-1"])
+    assert db.stats()["open_visits"] == 0
+    db.close_stale_visits(force=True)
+    assert db.list_visits()["total"] == 0
+
+
+def test_forget_unknowns_also_commits_once(tmp_path):
+    db = FaceDB(db_dir=str(tmp_path))
+    db.add("Alice", [_vector(900)])
+    for seed in range(5):
+        db.enroll_unknown(_vector(seed))
+    before = json.loads((tmp_path / "persons.json").read_text())["generation"]
+
+    assert db.forget_unknowns() == 5
+    state = json.loads((tmp_path / "persons.json").read_text())
+    assert state["generation"] == before + 1
+    assert db.stats()["named"] == 1

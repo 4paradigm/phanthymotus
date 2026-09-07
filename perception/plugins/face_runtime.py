@@ -47,6 +47,11 @@ DEFAULT_DET_THRESH = 0.5
 DEFAULT_NMS_THRESH = 0.4
 DEFAULT_MIN_FACE_PX = 64
 DEFAULT_BLUR_MIN = 60.0
+# Longest side an incoming photo is downscaled to before detection. 2048 keeps
+# a small distant face well above min_face_px while bounding the decoded array.
+DEFAULT_MAX_IMAGE_SIDE = 2048
+# Decompression-bomb guard, in pixels (~60 MP). A 24 MP phone photo passes.
+DEFAULT_MAX_IMAGE_PIXELS = 60_000_000
 
 EMBEDDING_DIM = 512
 _REC_INPUT_SIZE = 112
@@ -302,15 +307,97 @@ class FaceAnalyzer:
 
     # ── image helpers ─────────────────────────────────────────────────────
 
-    def decode_jpeg(self, data: bytes) -> np.ndarray | None:
-        """Decode JPEG/PNG bytes to a BGR array, or None if undecodable."""
-        buffer = np.frombuffer(data, dtype=np.uint8)
-        if buffer.size == 0:
+    def decode_image(
+        self,
+        data: bytes,
+        max_side: int = DEFAULT_MAX_IMAGE_SIDE,
+        max_pixels: int = DEFAULT_MAX_IMAGE_PIXELS,
+    ) -> np.ndarray | None:
+        """Decode arbitrary image bytes to a BGR array, downscaled if huge.
+
+        Converting and resizing **here** rather than rejecting at the API is
+        deliberate: an operator registering a face has whatever their phone or
+        camera produced, and "your photo is 24 MB" or "we only take JPEG" is a
+        limitation of ours, not a property of their photo.
+
+        Two decoders, because each covers formats the other does not: OpenCV
+        reads JPEG/PNG/BMP/WEBP/TIFF/PPM, and Pillow (already in the image)
+        adds GIF, ICO and some TIFF variants. Anything neither can read returns
+        None and the caller reports `bad_input`. HEIC/HEIF — what an iPhone
+        shoots by default — needs `pillow-heif`, which is not installed, so it
+        is the one common format still unsupported.
+
+        `max_side` exists for accuracy as much as memory: detection letterboxes
+        to `det_size` (640) anyway, so a 6000 px photo is downscaled by the
+        detector regardless. Doing it once here with INTER_AREA is both cheaper
+        and better than letting the letterbox do it — and it bounds the
+        intermediate array, which for a 60 MP image is 180 MB of uint8.
+
+        `max_pixels` is a decompression-bomb guard: a few hundred KB of PNG can
+        declare a 30000x30000 canvas, which would be 2.7 GB decoded and take the
+        whole perception process down with the OOM killer.
+        """
+        if not data:
             return None
-        image = self._cv2.imdecode(buffer, self._cv2.IMREAD_COLOR)
+        image = self._decode_with_cv2(data)
+        if image is None:
+            image = self._decode_with_pillow(data)
         if image is None or image.size == 0:
             return None
-        return image
+        if max_pixels and image.shape[0] * image.shape[1] > max_pixels:
+            log.warning("[face] refusing a %dx%d image (%.1f MP > %.1f MP cap)",
+                        image.shape[1], image.shape[0],
+                        image.shape[0] * image.shape[1] / 1e6, max_pixels / 1e6)
+            return None
+        return self._downscale(image, max_side)
+
+    def _decode_with_cv2(self, data: bytes) -> np.ndarray | None:
+        try:
+            buffer = np.frombuffer(data, dtype=np.uint8)
+            if buffer.size == 0:
+                return None
+            image = self._cv2.imdecode(buffer, self._cv2.IMREAD_COLOR)
+        except Exception:  # noqa: BLE001 - fall through to Pillow
+            return None
+        return image if image is not None and image.size else None
+
+    def _decode_with_pillow(self, data: bytes) -> np.ndarray | None:
+        """Fallback decoder, converting whatever it reads to 3-channel BGR."""
+        try:
+            import io
+
+            from PIL import Image
+
+            with Image.open(io.BytesIO(data)) as handle:
+                # convert() also flattens palettes, drops alpha and collapses
+                # 16-bit channels, so the result is always plain 8-bit RGB.
+                rgb = handle.convert("RGB")
+                array = np.asarray(rgb)
+        except Exception:  # noqa: BLE001 - genuinely undecodable
+            return None
+        if array.size == 0:
+            return None
+        return np.ascontiguousarray(array[:, :, ::-1])      # RGB -> BGR
+
+    def _downscale(self, image: np.ndarray, max_side: int) -> np.ndarray:
+        if not max_side:
+            return image
+        height, width = image.shape[:2]
+        longest = max(height, width)
+        if longest <= max_side:
+            return image
+        scale = max_side / float(longest)
+        resized = self._cv2.resize(
+            image,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=self._cv2.INTER_AREA,   # the right filter for shrinking
+        )
+        log.debug("[face] downscaled %dx%d -> %dx%d", width, height,
+                  resized.shape[1], resized.shape[0])
+        return resized
+
+    # Kept as an alias: the name predates supporting anything but JPEG.
+    decode_jpeg = decode_image
 
     # ── detection ─────────────────────────────────────────────────────────
 
@@ -451,6 +538,8 @@ class FaceAnalyzer:
 
 __all__ = [
     "DEFAULT_BLUR_MIN",
+    "DEFAULT_MAX_IMAGE_PIXELS",
+    "DEFAULT_MAX_IMAGE_SIDE",
     "DEFAULT_DET_SIZE",
     "DEFAULT_DET_THRESH",
     "DEFAULT_FACE_MODEL_DIR",

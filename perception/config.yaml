@@ -135,6 +135,15 @@ plugins:
     visit_checkpoint_s: 60.0
     visit_log_max: 20000
     max_batch: 200
+    # 过大/非常见格式的图片在本地缩放转码，而不是在接口处拒绝。
+    # 检测本身会把图 letterbox 到 det_size(640)，所以 2048 已远超需要，
+    # 在这里用 INTER_AREA 缩一次比让 letterbox 缩更快也更清晰。
+    max_image_side: 2048
+    # 解压炸弹护栏（像素数）：几百 KB 的 PNG 可以声明 30000x30000，
+    # 解出来 2.7 GB 会让 OOM killer 带走整个 perception 进程。
+    max_image_pixels: 60000000
+    # 仅为传输/内存护栏，不是策略限制 —— 超大图片会被本地缩放而非拒绝。
+    max_image_bytes: 67108864
     # Caller-supplied image/package paths are confined to these roots — the MCP
     # server has no authentication and runs as root in the container.
     image_roots: ["/models", "/tmp", "/work"]

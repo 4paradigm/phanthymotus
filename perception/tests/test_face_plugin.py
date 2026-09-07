@@ -72,6 +72,9 @@ class _FakeAnalyzer:
         self.embed_calls = 0
 
     # -- the surface plugins/face.py uses --
+    def decode_image(self, data: bytes, max_side: int = 0, max_pixels: int = 0):
+        return self.decode_jpeg(data)
+
     def decode_jpeg(self, data: bytes):
         self.seen.append(data)
         if data == b"corrupt":
@@ -1060,10 +1063,12 @@ def test_recognize_actions_are_on_the_card():
     assert {"recognize_by_photo", "recognize_by_stream"} <= actions
     assert actions == set(schema["x-action-params"])
     params = schema["x-action-params"]
-    assert set(params["recognize_by_photo"]["params"]) == {"image_path", "image_b64"}
+    assert set(params["recognize_by_photo"]["params"]) == {
+        "image_path", "image_b64", "url"}
     assert set(params["recognize_by_stream"]["params"]) == {"window_s"}
     # register/recognize are symmetric by suffix.
-    assert {"register_by_photo", "register_by_stream", "register_by_corpus"} <= actions
+    assert {"register_by_photo", "register_by_url",
+            "register_by_stream", "register_by_corpus"} <= actions
 
 
 def test_recognize_by_photo_identifies_a_registered_person(plugin, tmp_path):
@@ -1194,3 +1199,185 @@ def test_recognize_by_stream_needs_an_instance_id_when_several_run(plugin):
     result = plugin.dispatch("face_recognition", {"action": "recognize_by_stream"})
     assert result["reason"] == face_plugin.REASON_BAD_INPUT
     assert "instance_id" in result["detail"]
+
+
+# ── batch forget through dispatch ────────────────────────────────────────────
+
+def test_forget_accepts_a_list_of_ids(plugin):
+    engine = plugin._require_engine()
+    ids = [engine.db.add(f"p{s}", [_unit(500 + s)])["id"] for s in range(4)]
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "forget", "person_ids": ids[:3]})
+    assert result["ok"] is True
+    assert result["forgotten"] == 3
+    assert result["person_ids"] == ids[:3]
+    assert "missing" not in result
+    assert engine.db.stats()["persons"] == 1
+
+
+def test_forget_accepts_a_comma_separated_string(plugin):
+    """An LLM (or a text field) sends "p-1, p-2" rather than a JSON array."""
+    engine = plugin._require_engine()
+    engine.db.add("A", [_unit(510)])
+    engine.db.add("B", [_unit(511)])
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "forget", "person_ids": "p-1, p-2"})
+    assert result["forgotten"] == 2
+    assert engine.db.stats()["persons"] == 0
+
+
+def test_forget_reports_partial_success(plugin):
+    engine = plugin._require_engine()
+    engine.db.add("A", [_unit(520)])
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "forget", "person_ids": ["p-1", "p-404"]})
+    assert result["ok"] is True, 'something was deleted, so the call succeeded'
+    assert result["forgotten"] == 1
+    assert result["missing"] == ["p-404"]
+    assert "p-404" in result["detail"]
+
+
+def test_forget_with_only_unknown_ids_is_an_error(plugin):
+    plugin._require_engine()
+    result = plugin.dispatch("face_recognition", {
+        "action": "forget", "person_ids": ["p-404", "p-405"]})
+    assert result["ok"] is False
+    assert result["reason"] == face_plugin.REASON_BAD_INPUT
+    assert result["missing"] == ["p-404", "p-405"]
+
+
+def test_forget_still_takes_a_single_id_and_the_unknown_scope(plugin):
+    engine = plugin._require_engine()
+    engine.db.add("A", [_unit(530)])
+    engine.db.enroll_unknown(_unit(531))
+    engine.db.enroll_unknown(_unit(532))
+
+    single = plugin.dispatch("face_recognition", {
+        "action": "forget", "person_id": "p-1"})
+    assert single["forgotten"] == 1
+
+    scoped = plugin.dispatch("face_recognition", {
+        "action": "forget", "named": "unknown"})
+    assert scoped["forgotten"] == 2 and scoped["scope"] == "unknown"
+
+
+def test_forget_requires_something_to_delete(plugin):
+    plugin._require_engine()
+    with pytest.raises(ValueError):
+        plugin.dispatch("face_recognition", {"action": "forget"})
+
+
+def test_person_ids_is_declared_with_an_example_for_the_llm():
+    """The accepted shapes have to be readable off the schema alone."""
+    schema = face_plugin.TOOLS[0]["inputSchema"]
+    spec = schema["properties"]["person_ids"]
+    assert spec["type"] == "array"
+    assert 'p-1' in spec["description"]          # a concrete example
+    assert 'missing' in spec["description"]      # and the return shape
+    assert "person_ids" in schema["x-action-params"]["forget"]["params"]
+
+
+# ── register_by_url ──────────────────────────────────────────────────────────
+
+def test_register_by_url_fetches_and_registers(plugin, monkeypatch):
+    fetched = {}
+
+    def fake_fetch(url, max_bytes):
+        fetched['url'] = url
+        return _FakeFrame.one(600)
+
+    monkeypatch.setattr(face_plugin, '_fetch_url', fake_fetch)
+    result = plugin.dispatch("face_recognition", {
+        "action": "register_by_url",
+        "url": "https://example.com/alice.jpg", "name": "Alice"})
+
+    assert result["ok"] is True
+    assert result["name"] == "Alice"
+    assert fetched['url'] == "https://example.com/alice.jpg"
+    assert result["source"] == "https://example.com/alice.jpg"
+
+
+def test_register_by_url_surfaces_a_fetch_failure(plugin, monkeypatch):
+    def fake_fetch(url, max_bytes):
+        raise face_plugin._BadInput(f"cannot fetch {url!r}: timed out", url)
+
+    monkeypatch.setattr(face_plugin, '_fetch_url', fake_fetch)
+    result = plugin.dispatch("face_recognition", {
+        "action": "register_by_url", "url": "https://example.com/x.jpg"})
+    assert result["ok"] is False
+    assert result["reason"] == face_plugin.REASON_BAD_INPUT
+    assert "timed out" in result["detail"]
+
+
+def test_recognize_by_photo_also_accepts_a_url(plugin, monkeypatch):
+    engine = plugin._require_engine()
+    engine.db.add("Bob", [_unit(610)])
+    monkeypatch.setattr(face_plugin, '_fetch_url',
+                        lambda url, max_bytes: _FakeFrame.one(610))
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "recognize_by_photo", "url": "https://example.com/b.jpg"})
+    assert result["ok"] is True
+    assert result["faces"][0]["name"] == "Bob"
+
+
+def test_register_by_url_is_on_the_card_as_its_own_action():
+    """A URL fetch is a named capability, not a parameter smuggled into the
+    photo path — so it is visible on the card."""
+    schema = face_plugin.TOOLS[0]["inputSchema"]
+    assert "register_by_url" in schema["properties"]["action"]["enum"]
+    assert set(schema["x-action-params"]["register_by_url"]["params"]) == {
+        "url", "name", "profile"}
+
+
+# ── size / format handling is local, not a rejection ─────────────────────────
+
+def test_decode_options_come_from_config():
+    cfg = {"max_image_side": 1024, "max_image_pixels": 1_000_000}
+    assert face_plugin._decode_options(cfg) == {
+        "max_side": 1024, "max_pixels": 1_000_000}
+    defaults = face_plugin._decode_options({})
+    assert defaults["max_side"] == 2048 and defaults["max_pixels"] == 60_000_000
+
+
+def test_every_input_path_decodes_through_the_same_options(plugin, tmp_path):
+    """Resize/convert must apply to register and recognize alike, by photo,
+    url, corpus and stream — so they all have to reach decode_image with the
+    configured options rather than each path doing its own thing."""
+    engine = plugin._require_engine()
+    seen = []
+    original = engine.analyzer.decode_image
+
+    def spy(data, max_side=0, max_pixels=0):
+        seen.append((max_side, max_pixels))
+        return original(data, max_side, max_pixels)
+
+    engine.analyzer.decode_image = spy
+    plugin._plugin_cfg["max_image_side"] = 1234
+    plugin._plugin_cfg["max_image_pixels"] = 5_000_000
+
+    path = _write_photo(tmp_path, "a.jpg", _FakeFrame.one(700))
+    plugin.dispatch("face_recognition", {
+        "action": "register_by_photo", "image_path": path, "name": "A"})
+    plugin.dispatch("face_recognition", {
+        "action": "recognize_by_photo", "image_path": path})
+    package = _make_package(tmp_path, {"b.jpg": _FakeFrame.one(701)})
+    plugin.dispatch("face_recognition", {
+        "action": "register_by_corpus", "package": package})
+
+    assert len(seen) >= 3
+    assert all(opts == (1234, 5_000_000) for opts in seen), seen
+
+
+def test_the_byte_cap_is_a_transfer_guard_not_a_photo_limit():
+    """16 MB used to reject real phone photos; oversized images are now
+    downscaled locally instead."""
+    assert face_plugin.DEFAULT_MAX_IMAGE_BYTES == 64 * 1024 * 1024
+
+
+def test_corpus_finds_the_formats_both_decoders_read():
+    for suffix in (".jpg", ".png", ".webp", ".tif", ".tiff", ".gif", ".bmp"):
+        assert suffix in face_plugin._IMAGE_SUFFIXES
