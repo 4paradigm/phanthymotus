@@ -193,3 +193,65 @@ def pick_weights(model_dir: str, *candidates: str) -> str:
         if os.path.exists(path):
             return path
     return os.path.join(model_dir, candidates[-1]) if candidates else ""
+
+
+# ── standalone onnxruntime ────────────────────────────────────────────────────
+# Everything above concerns the ONNX Runtime *bundled inside the sherpa-onnx
+# wheel*, which is the only one ASR and sherpa TTS can see. The face plugin uses
+# the standalone `onnxruntime` package, a completely separate build with its own
+# provider list — `cuda_available()` says nothing about it, and using that here
+# would report gpu support the face sessions do not have (or miss support they
+# do). Hence a second, independent probe.
+
+@lru_cache(maxsize=1)
+def onnxruntime_providers() -> tuple[str, ...]:
+    """Execution providers the installed `onnxruntime` package offers.
+
+    Empty when the package is absent, so a caller can distinguish "no GPU" from
+    "no onnxruntime at all". Unlike `cuda_available()` this is a real query
+    rather than a file probe: `get_available_providers()` is a cheap C call that
+    does not create a session or touch the driver.
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return ()
+    try:
+        return tuple(ort.get_available_providers())
+    except Exception:  # noqa: BLE001 - a broken install must not crash startup
+        log.warning("[onnx_provider] onnxruntime is installed but would not "
+                    "report its providers", exc_info=True)
+        return ()
+
+
+def ort_providers_for_device(device: str) -> list[str]:
+    """Provider list for `InferenceSession(..., providers=...)`.
+
+    A *wrong device* degrades: `device: gpu` baked into a config.yaml on an
+    image carrying the CPU-only wheel still returns a working CPU provider
+    list, with the reason in the log — same policy as `provider_for_device`.
+
+    A *missing package* raises, because there is nothing to degrade to. The
+    plugin's background loader turns that into its `error` state and surfaces
+    the message in the dashboard, which is where someone is watching.
+
+    CPU is always appended as the fallback provider. ORT falls back per node
+    anyway, and naming it explicitly is what makes an unsupported op degrade
+    instead of failing session creation.
+    """
+    device = normalize_device(device)
+    available = onnxruntime_providers()
+    if not available:
+        raise ImportError(
+            "onnxruntime is not installed; the face recognition plugin needs it "
+            "(see the onnxruntime layer in perception/Dockerfile.jetson)"
+        )
+    if device == "gpu":
+        if "CUDAExecutionProvider" in available:
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if "TensorrtExecutionProvider" in available:
+            return ["TensorrtExecutionProvider", "CPUExecutionProvider"]
+        log.warning("[onnx_provider] device=gpu but the installed onnxruntime "
+                    "has no CUDA provider (available: %s) — falling back to cpu",
+                    ", ".join(available))
+    return ["CPUExecutionProvider"]

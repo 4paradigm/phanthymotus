@@ -605,6 +605,45 @@ def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str
     )
 
 
+# ── Face recognition (InsightFace buffalo_sc: SCRFD detector + ArcFace) ──
+# Plain ONNX, run by the standalone onnxruntime, so — unlike the OCR bundle —
+# there is nothing JetPack-specific about these files and no family selection:
+# one bundle serves both Jetson lines and any x86 dev host.
+#
+# Re-hosted on COS rather than fetched from the upstream GitHub release. The
+# release URL redirects to a signed, expiring `release-assets.githubusercontent`
+# URL, which cannot be pinned, and the robots have no reliable route to GitHub
+# anyway (see CLAUDE.md § "When a page or API won't load").
+FACE_MODEL_BASE = os.environ.get(
+    "FACE_MODEL_BASE_URL", f"{COS_BASE}/face/buffalo_sc"
+)
+# Pinned against the files re-hosted from the insightface v0.7 `buffalo_sc.zip`
+# release; the COS copies were re-downloaded and re-hashed after upload, so
+# these are the bytes a robot will actually receive.
+FACE_MODEL_FILES = {
+    # SCRFD-500M-BNKPS — detection + the 5 landmarks ArcFace alignment needs.
+    # 9 outputs: score/bbox/kps for strides 8, 16, 32 (verified against the
+    # decoder in plugins/face_runtime.py).
+    "det_500m.onnx": {
+        "size": 2524817,
+        "sha256": "5e4447f50245bbd7966bd6c0fa52938c61474a04ec7def48753668a9d8b4ea3a",
+    },
+    # ArcFace MobileFaceNet trained on Glint360K — 112x112 in, 512-d out.
+    "w600k_mbf.onnx": {
+        "size": 13616099,
+        "sha256": "9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f",
+    },
+}
+
+
+def ensure_face_model(model_dir: str) -> dict[str, str]:
+    """Ensure the face detection + recognition ONNX pair is present."""
+    model_dir = require_models_subpath(model_dir)
+    return ensure_verified_bundle(
+        "face", model_dir, FACE_MODEL_BASE, FACE_MODEL_FILES
+    )
+
+
 def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:
     """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
 

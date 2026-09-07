@@ -42,6 +42,11 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 #                  is correct on any base, present or future.
 #   DLA_COMPILER_SO  COS key of the bundled libnvdla_compiler.so, or empty for a
 #                  line that does not need one (see the dla-fallback step).
+#   ORT_VERSION    standalone onnxruntime for the face plugin, pinned per line
+#                  because the wheel is tagged with the CPython ABI: jp5.11 is
+#                  cp38, for which onnxruntime stopped publishing wheels after
+#                  1.19, and jp6.1 is cp310. Unrelated to the ONNX Runtime
+#                  inside the sherpa-onnx wheel — see the onnxruntime step.
 #
 # It is also a record: `docker exec <c> cat /etc/jetpack.env` says what line an
 # image was built for, which is otherwise guesswork from the tag alone.
@@ -49,14 +54,14 @@ ARG SHERPA_GPU_WHEEL_511=jp511/sherpa_onnx-1.13.6+cuda-cp38-cp38-linux_aarch64.w
 ARG SHERPA_GPU_WHEEL_61=jp61/sherpa_onnx-1.13.6+cuda-cp310-cp310-linux_aarch64.whl
 ARG DLA_COMPILER_SO_61=jp61/libnvdla_compiler.so
 RUN case "${JP_VERSION}" in \
-        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}"; DLA= ;; \
-        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; DLA="${DLA_COMPILER_SO_61}" ;; \
-        *)   NUMPY=1.24.4; WHEEL=; DLA= ;; \
+        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}"; DLA=; ORT=1.16.3 ;; \
+        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; DLA="${DLA_COMPILER_SO_61}"; ORT=1.19.2 ;; \
+        *)   NUMPY=1.24.4; WHEEL=; DLA=; ORT=1.19.2 ;; \
     esac; \
-    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\nDLA_COMPILER_SO=%s\n' \
+    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\nDLA_COMPILER_SO=%s\nORT_VERSION=%s\n' \
         "${NUMPY}" "${WHEEL}" \
         "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" \
-        "${DLA}" \
+        "${DLA}" "${ORT}" \
         > /etc/jetpack.env && \
     echo "[build] jp${JP_VERSION}:" && cat /etc/jetpack.env
 
@@ -330,6 +335,45 @@ RUN . /etc/jetpack.env; \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pyvips==3.1.0" && \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
     find "${RAPIDOCR_MODELS}" -type f -name '*.onnx' -delete
+
+# ── Standalone onnxruntime (face recognition: SCRFD + ArcFace) ────────────────
+# This is a *second, independent* ONNX Runtime in the image. The first is the
+# one compiled into the sherpa-onnx wheel under sherpa_onnx/lib, which only ASR
+# and sherpa TTS can reach; there is no supported way to run our own models on
+# it. The step above notes that onnxruntime was deliberately absent — that was
+# correct while rapidocr was used for post-processing only and OCR ran on
+# TensorRT. The face models are plain ONNX and must run on both CPU and GPU
+# hosts, which rules out a TensorRT-only path (engines are not portable across
+# TensorRT majors, so it would mean a bundle per JetPack line for a 15 MB pair).
+#
+# CPU wheel from PyPI. A CUDA-capable build for Jetson is a separate,
+# per-JetPack wheel that has to be hosted on COS the way SHERPA_GPU_WHEEL is;
+# until that exists `device: gpu` degrades to cpu with a warning
+# (utils/onnx_provider.ort_providers_for_device). The models are 2.5 MB and
+# 13 MB, so this is a throughput choice, not a correctness one.
+#
+# numpy is pinned on the same line for the reason the OCR step gives: several
+# packages in the base image are built against a specific numpy C-ABI, and an
+# unpinned install silently upgrades it.
+#
+# The assert is the point of this layer. Two ONNX Runtimes in one process could
+# clash at the symbol level — both ship a libonnxruntime, sherpa's resolved via
+# RPATH from its own extension — and a clash surfaces when the second one's
+# shared objects are dlopen'd, i.e. at import. So import in both orders: if
+# either direction is going to break, it breaks here, in the build, rather than
+# on a robot. Creating a session from each in one process needs model files that
+# do not exist at build time; that half is verified on hardware (an ASR
+# utterance and a face recognition both working in the same container).
+RUN . /etc/jetpack.env; \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+      "numpy==${NUMPY_VERSION}" "onnxruntime==${ORT_VERSION}" && \
+    python3 -c "import onnxruntime, sherpa_onnx; print('[build] ort-first import ok')" && \
+    python3 -c "import sherpa_onnx, onnxruntime; print('[build] sherpa-first import ok')" && \
+    python3 -c "import numpy, onnxruntime, sherpa_onnx; \
+assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; \
+print('[build] onnxruntime', onnxruntime.__version__, \
+      'providers:', onnxruntime.get_available_providers()); \
+print('[build] sherpa-onnx', sherpa_onnx.__version__, 'coexists; numpy', numpy.__version__)"
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
 # ldconfig shimmed for the same reason as the ffmpeg step above — this is the

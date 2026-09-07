@@ -82,3 +82,49 @@ plugins:
       det_thresh: 0.1
       det_box_thresh: 0.1
     min_interval_ms: 0
+
+  face_recognition:
+    enabled: true
+    # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
+    # Plain ONNX, so one bundle serves both JetPack lines and x86 dev hosts.
+    model_dir: /models/face/buffalo_sc
+    # The only host-mounted writable path in this container is /models (see
+    # perception/deploy/service.yml), so the identity database lives under it.
+    db_dir: /models/face_db
+    # cpu | gpu. gpu needs an onnxruntime build carrying the CUDA provider; the
+    # image currently ships the CPU wheel, so gpu degrades to cpu with a
+    # warning (utils/onnx_provider.ort_providers_for_device). The models are
+    # 2.5 MB + 13 MB, so cpu at a throttled frame rate is the design point.
+    device: cpu
+    num_threads: 2
+    warmup: true
+    det_size: [640, 640]
+    det_thresh: 0.5
+    # Cosine similarity between L2-normalised ArcFace embeddings. 0.35 is a
+    # starting point for w600k_mbf, NOT a measured value — raise it if the
+    # robot confuses people, lower it if it fails to recognise them, and record
+    # what you saw. Editable from the card.
+    match_threshold: 0.35
+    # Quality gate. A face below either bound is reported with person_id: null
+    # rather than matched or auto-enrolled: matching a blurred 30 px face is a
+    # coin flip, and enrolling one wastes an unknown-N slot forever.
+    min_face_px: 64
+    blur_min: 60.0          # variance of Laplacian on the aligned 112x112 crop
+    # Enrolment refuses to guess when two faces are comparably prominent.
+    # Prominence is area discounted 40% for being off-centre.
+    subject_dominance: 1.6
+    max_faces: 8
+    # register_current_stream analyses the last enroll_window_s of frames, up
+    # to enroll_max_analyzed of them (newest first), instead of a single grab.
+    enroll_window_s: 3.0
+    enroll_window_max_frames: 60
+    enroll_max_analyzed: 8
+    # Ceiling on auto-enrolled strangers; oldest sighting evicted first. Named
+    # people are never evicted. Editable from the card.
+    unknown_capacity: 500
+    max_samples_per_person: 8
+    max_batch: 200
+    # Caller-supplied image/package paths are confined to these roots — the MCP
+    # server has no authentication and runs as root in the container.
+    image_roots: ["/models", "/tmp", "/work"]
+    min_interval_ms: 200

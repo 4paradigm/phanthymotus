@@ -131,6 +131,37 @@ class PerceptionBundle:
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
 
+        if plugins_cfg.get("face_recognition", {}).get("enabled", False):
+            from plugins.face import FaceRecognitionPlugin
+            # Guarded like TTSPlugin: this plugin needs the standalone
+            # onnxruntime and a readable identity database, and neither belongs
+            # on the critical path of ASR/TTS/VOP/OCR. A failure here means the
+            # card does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    FaceRecognitionPlugin(plugins_cfg["face_recognition"], executor)
+                )
+                log.info("FaceRecognitionPlugin loaded")
+            except Exception:
+                log.error("FaceRecognitionPlugin failed to load; continuing without it",
+                          exc_info=True)
+
+    def _plugin_for(self, full_name: str):
+        """Resolve a tool name to (plugin, action) by longest matching PREFIX.
+
+        Matching the *longest* prefix, not the first underscore-separated
+        segment: a PREFIX may itself contain an underscore (`face_recognition`),
+        and splitting on the first `_` would look for a plugin called `face`,
+        find none, and report the tool as unknown.
+        """
+        for plugin in sorted(self._plugins, key=lambda p: -len(p.PREFIX)):
+            prefix = plugin.PREFIX
+            if full_name == prefix:
+                return plugin, prefix
+            if full_name.startswith(prefix + "_"):
+                return plugin, full_name[len(prefix) + 1:]
+        return None, ""
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -140,22 +171,20 @@ class PerceptionBundle:
         return tools
 
     def dispatch(self, full_name: str, args: dict) -> dict | None:
-        prefix, sep, tool_name = full_name.partition("_")
-        name = tool_name if sep else prefix
-        for p in self._plugins:
-            if p.PREFIX == prefix:
-                return p.dispatch(name, args)
-        return None
+        plugin, name = self._plugin_for(full_name)
+        if plugin is None:
+            return None
+        return plugin.dispatch(name, args)
 
     def owns(self, full_name: str) -> bool:
         """True when some loaded plugin claims this tool name.
 
         Lets the caller tell a genuinely unknown tool apart from a loaded
-        plugin returning None for an action it does not handle. Mirrors
-        `dispatch`'s prefix split so the two can never disagree.
+        plugin returning None for an action it does not handle. Goes through
+        the same resolver as `dispatch`, so the two cannot disagree.
         """
-        prefix, _, _ = full_name.partition("_")
-        return any(p.PREFIX == prefix for p in self._plugins)
+        plugin, _ = self._plugin_for(full_name)
+        return plugin is not None
 
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:

@@ -686,6 +686,204 @@ instance_id ever showed up in the log.
 
 ---
 
+## Face Recognition
+
+`plugins/face.py` — a `processor` card named **`face_recognition`**. Subscribes to an
+`image/jpeg` topic, publishes identities on `{input_topic}/face` as `data/json`, and
+enrols new people from a photo, the live stream, or a batch package.
+
+### Models
+
+InsightFace **buffalo_sc**, the smallest pack that still ships landmarks (alignment
+needs them):
+
+| File | Size | Role |
+|------|------|------|
+| `det_500m.onnx` | 2.5 MB | SCRFD-500M-BNKPS — detection + 5 keypoints |
+| `w600k_mbf.onnx` | 13 MB | ArcFace MobileFaceNet — 512-d embedding |
+
+Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
+Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that
+one; there is no supported way to run our own models on it). `device: cpu | gpu`
+selects providers through `utils/onnx_provider.ort_providers_for_device`. The image
+currently carries the **CPU wheel**, so `device: gpu` degrades to cpu with a warning
+— a per-JetPack `onnxruntime-gpu` wheel on COS is the follow-up, mirroring
+`SHERPA_GPU_WHEEL` in `Dockerfile.jetson`.
+
+The `insightface` package is deliberately not a dependency: it wants onnx,
+scikit-image, scikit-learn and Cython to wrap ~200 lines of pre/post-processing.
+Those 200 lines are in `plugins/face_runtime.py` instead — the SCRFD decode there
+(strides 8/16/32, 2 anchors per location, distance-coded boxes and keypoints) is a
+wire format, not a design choice, and was verified against the real model:
+`det_500m.onnx` has 9 outputs and `12800 = 80x80x2` rows for stride 8 at 640px.
+
+Alignment uses an explicit Umeyama similarity fit, **not**
+`cv2.estimateAffinePartial2D`: that runs RANSAC/LMEDS, and on exactly five
+correspondences a robust estimator can discard a point and return a different
+transform run to run, which would make one photo produce different embeddings.
+
+#### Re-hosting the models
+
+`FACE_MODEL_BASE` points at COS, not the upstream GitHub release: the release URL
+redirects to a signed, expiring `release-assets.githubusercontent` URL that cannot
+be pinned, and the robots have no reliable route to GitHub. To refresh, download
+`buffalo_sc.zip` from the insightface v0.7 release, upload the two `.onnx` files to
+`public/face/buffalo_sc/` with credentials from `resource-center/deploy/values.env`
+(`prisma/articles/upload-figs.js` cannot do it — it only accepts image extensions
+and forces its own key shape), then re-download from COS and paste the *verified*
+`size`/`sha256` into `FACE_MODEL_FILES`.
+
+### Identity database
+
+`plugins/face_db.py`, default `/models/face_db` — `/models` is the only host-mounted
+writable path this container has (`deploy/service.yml`).
+
+Two files, and **`persons.json` is the commit point**: it names the
+`embeddings-<n>.npy` it belongs to, is replaced last, and the superseded matrix is
+unlinked only after that succeeds. Writing `embeddings.npy` in place instead means
+two `os.replace` calls with a window where the row count and the owner list
+disagree — which silently misattributes every identity after the missing row.
+
+Matching is one `matrix @ embedding`: both sides are L2-normalised, so the dot
+product *is* the cosine and no `sklearn` is needed. Rows are per **sample**, and a
+person's score is their best sample — a mean-vector centroid would blur the pose
+variation that several enrolment photos exist to capture, and could push a real
+match below threshold when a second photo is added.
+
+Ids are `p-N` for named people and `unknown-N` for strangers, from monotonic
+counters that never decrease: a retired id must not resolve to a different person
+later, because it may already be on the activity stream and in the agent's history.
+
+### Recognising
+
+Published payload (`{input_topic}/face`):
+
+```json
+{"ts": 1788777509.34, "topic": "/cam/rgb", "count": 1, "latency_ms": 28,
+ "faces": [{"person_id": "p-1", "profile": "运营部小王", "known": true, "score": 0.61,
+            "bbox": [207, 186, 149, 206], "det_score": 0.811, "blur": 1484.2,
+            "min_side_px": 149, "quality": "ok"}]}
+```
+
+A stranger who clears the quality gate is auto-enrolled and reported as
+`unknown-N`, with the **same id on every later sighting and after a restart** —
+which is what makes `register_current_stream` able to name them retroactively.
+
+A face that *fails* the gate is reported with `person_id: null`, `quality: "low"`
+and a `reason`, and is neither matched nor enrolled. Matching a blurred 30 px face
+is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a
+smear that never matches anything again. Relax `min_face_px` / `blur_min` if you
+want identities at greater distance.
+
+`match_threshold` defaults to **0.35**. Measured separations on this model, same
+photo transformed: same face at half resolution **0.983**, same face +35
+brightness **0.979**, a different person **-0.108**. Real same-person /
+different-photo scores sit well below the first two, so **tune this against your own
+faces and record what you saw** — 0.35 is a starting point, not a measurement.
+
+### Registering, and why it fails
+
+Any channel can fail for mundane physical reasons, so all three return
+`{"ok": false, "reason": ..., "detail": ...}` rather than raising:
+
+| `reason` | Condition |
+|----------|-----------|
+| `no_face` | no detection anywhere in the input |
+| `low_quality` | best face fails `det_thresh` / `min_face_px` / `blur_min`; the detail names each gate with the measured value |
+| `ambiguous_subject` | ≥2 faces pass the gate and the primary is not `subject_dominance`x the runner-up; every candidate's bbox and score is returned |
+| `no_frames` | no running instance, or nothing in the window |
+| `bad_input` | undecodable image, unreachable URL, unreadable package, path outside `image_roots` |
+
+A real `low_quality` detail, from the group photo in the end-to-end check:
+
+```
+no clear face: face 53 px < 64 px (move closer); sharpness 41.4 < 60.0 (hold still)
+```
+
+Prominence is area discounted 40% for being off-centre — pure area picks the
+bystander standing nearer the lens edge, pure centrality picks a distant face
+framed dead-on.
+
+| Action | Input |
+|--------|-------|
+| `register_user_photo` | `image_path` (confined to `image_roots`) / `image_url` / `image_b64`, plus `profile`, `meta`, optional `person_id` |
+| `register_current_stream` | `instance_id` + `profile`; analyses **every frame in the last `enroll_window_s`** (default 3 s, up to `enroll_max_analyzed` of them, newest first) |
+| `register_user_photos` | `package`: a directory, `.zip` or `.tar.gz`, by path or URL |
+
+`register_current_stream` averages the agreeing frames rather than trusting one
+grab, and refuses with `ambiguous_subject` when fewer than half the usable frames
+agree with each other — two people taking turns being the dominant face would
+otherwise be enrolled as one identity matching neither.
+
+Enrolment never silently duplicates. A new face matching an existing **named**
+person is added as another sample (`merged: true`); matching an **`unknown-N`**
+promotes that entry **keeping its id** (`promoted: true`), so earlier sightings stay
+attributable.
+
+#### Batch package layout
+
+Images plus an optional `manifest.json`, in either shape:
+
+```json
+[{"file": "alice.jpg", "profile": "Alice from ops", "person": "alice", "meta": {"badge": "A7"}}]
+{"alice.jpg": "Alice from ops"}
+```
+
+Fallbacks in order: a sidecar `alice.json` / `alice.txt`, then the filename stem. A
+shared `person` key merges several photos into one identity. Archive members that
+are absolute, contain `..`, or are not regular files are skipped and logged.
+
+The result carries **one record per photo**, so a 40-person batch says exactly which
+people registered and why each of the rest did not:
+
+```json
+{"ok": true, "total": 40, "registered": 37, "failed": 3,
+ "results": [{"file": "alice.jpg", "ok": true, "person_id": "p-9"},
+             {"file": "bob.jpg", "ok": false, "reason": "low_quality", "detail": "..."},
+             {"file": "team.jpg", "ok": false, "reason": "ambiguous_subject", "candidates": [...]}]}
+```
+
+Synchronous, capped at `max_batch` (200); over the cap it returns `bad_input` naming
+the count rather than hanging the MCP client.
+
+### Roster CRUD
+
+`list_persons` (`named` = all/named/unknown, `query` over id+profile+meta, `limit`,
+`offset`), `get_person`, `update_person` (`profile`, `meta`, `meta_delete[]`,
+`merge` — default merges, `merge: false` replaces), `forget` (or
+`named: "unknown"` to clear every anonymous entry). Setting a non-blank `profile`
+on an `unknown-N` names it in place, keeping the id. Reads never return embeddings.
+
+`unknown_capacity` (default 500, editable on the card) bounds automatic enrolment
+only; lowering it evicts the excess immediately, oldest `last_seen_at` first, and
+reports how many went. Named people are never candidates.
+
+### Tool-name dispatch
+
+`face_recognition` is the first `PREFIX` containing an underscore.
+`PerceptionBundle.dispatch`/`owns` used to split on the first `_` and compare that
+to `PREFIX`, which made such a name undispatchable — it resolved to a plugin called
+`face`, matched nothing, and reported the tool as unknown. Both now go through
+`_plugin_for`, which matches the **longest** prefix; `tests/test_bundle_dispatch.py`
+pins that and that the two functions can never disagree.
+
+### Verifying
+
+The pytest suite fakes the analyzer — a host-side suite must not need models or
+onnxruntime — and covers the lifecycle, all five reason codes, `unknown-N`
+stability and promotion, id retirement, capacity eviction, meta CRUD, batch
+per-item results and zip traversal (`tests/test_face_plugin.py`,
+`tests/test_face_db.py`).
+
+What that cannot cover is the decode itself, so it was checked separately against
+the real models: a known similarity transform recovered to 4e-6, all 5 landmarks
+inside their bbox on real photos, and the identity separations quoted above. On
+hardware, confirm `info` goes `loading → ready`, that `{topic}/face` publishes,
+and — because two ONNX Runtimes share the process — that an ASR utterance is still
+transcribed and TTS still speaks with the card running.
+
+---
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |

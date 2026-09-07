@@ -121,6 +121,16 @@ def _install_fake_ros():
     rclpy = types.ModuleType("rclpy")
     node_mod = types.ModuleType("rclpy.node")
     node_mod.Node = _FakeNode
+    # main.py does `import rclpy.executors`, which needs rclpy to be a package
+    # with that submodule attached — a bare ModuleType is not, and the import
+    # fails with "'rclpy' is not a package".
+    executors_mod = types.ModuleType("rclpy.executors")
+    executors_mod.MultiThreadedExecutor = _FakeExecutor
+    executors_mod.SingleThreadedExecutor = _FakeExecutor
+    rclpy.executors = executors_mod
+    rclpy.node = node_mod
+    rclpy.init = lambda *args, **kwargs: None
+    rclpy.shutdown = lambda *args, **kwargs: None
     qos_mod = types.ModuleType("rclpy.qos")
 
     class QoSProfile:
@@ -145,6 +155,7 @@ def _install_fake_ros():
     audio_msgs_msg.AudioChunk = _FakeAudioChunk
     for name, module in {
         "rclpy": rclpy, "rclpy.node": node_mod, "rclpy.qos": qos_mod,
+        "rclpy.executors": executors_mod,
         "sensor_msgs": sensor_msgs, "sensor_msgs.msg": sensor_msgs_msg,
         "std_msgs": std_msgs, "std_msgs.msg": std_msgs_msg,
         "audio_msgs": audio_msgs, "audio_msgs.msg": audio_msgs_msg,

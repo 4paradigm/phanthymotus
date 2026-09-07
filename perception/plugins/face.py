@@ -1,0 +1,1842 @@
+#!/usr/bin/env python3
+"""
+plugins/face.py — FaceRecognitionPlugin: 人脸注册与持续识别。
+
+订阅 image/jpeg topic，持续识别画面中的人脸并发布身份到 ROS2 topic；
+已注册的人输出 id 与 profile，未注册的人输出稳定的 unknown-{id}。
+
+Lifecycle, locking and the start/stop/config state machine are copied from
+`plugins/ocr.py`, which is the reference implementation of the rules in
+`perception/README.md` § "Plugin Concurrency". The parts that look redundant
+(claiming a node key before leaving the lock, registering with the executor
+*before* `start()`, bumping a generation on a model-affecting config change)
+are each there because omitting them orphaned a live node in production.
+
+What this plugin adds over OCR:
+
+* **A 3-second rolling frame window** per instance. `register_current_stream`
+  analyses every frame in it rather than one grab, so a blink, a turned head or
+  one motion-blurred frame does not decide the enrolment.
+* **A persistent identity database** (`plugins/face_db.py`), shared by all
+  instances of the plugin, holding embeddings, profiles and free-form meta.
+* **Structured failure reasons.** Enrolment fails for mundane physical reasons
+  — nobody in frame, nobody sharp enough, too many candidates to guess a
+  subject — and the caller (an LLM or an operator) can only react if it is told
+  which. These return `{"ok": false, "reason": ...}` rather than raising, and
+  the batch path returns one such record per file.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import logging
+import os
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from collections import deque
+from typing import Any
+
+import numpy as np
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
+
+from utils.latest_frame import LatestFrame
+from utils.log_sampling import SampledLogGate, escape_log_text
+from utils.qos import CAMERA_QOS
+from utils.ros_lifecycle import dispose_node
+
+from plugins.face_db import (
+    DEFAULT_DB_DIR,
+    DEFAULT_MAX_SAMPLES_PER_PERSON,
+    DEFAULT_UNKNOWN_CAPACITY,
+    FaceDB,
+    is_unknown_id,
+)
+from plugins.face_runtime import (
+    DEFAULT_BLUR_MIN,
+    DEFAULT_DET_SIZE,
+    DEFAULT_DET_THRESH,
+    DEFAULT_FACE_MODEL_DIR,
+    DEFAULT_MIN_FACE_PX,
+    DEFAULT_NMS_THRESH,
+    DetectedFace,
+    FaceAnalyzer,
+)
+
+log = logging.getLogger(__name__)
+
+_ERROR_LOG_INTERVAL_SECONDS = 10.0
+_SEEN_FLUSH_INTERVAL_SECONDS = 300.0
+
+DEFAULT_MATCH_THRESHOLD = 0.35
+DEFAULT_SUBJECT_DOMINANCE = 1.6
+DEFAULT_MAX_FACES = 8
+DEFAULT_ENROLL_WINDOW_S = 3.0
+DEFAULT_ENROLL_WINDOW_MAX_FRAMES = 60
+DEFAULT_ENROLL_MAX_ANALYZED = 8
+DEFAULT_MAX_BATCH = 200
+DEFAULT_MAX_IMAGE_BYTES = 16 * 1024 * 1024
+DEFAULT_IMAGE_ROOTS = ("/models", "/tmp", "/work")
+
+_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+_RESULT_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+
+TOOLS = [
+    {
+        "name": "face_recognition",
+        "type": "processor",
+        "multiInstance": True,
+        "description": (
+            "Face recognition — identify people in a camera feed, and register "
+            "new people from a photo, the live stream, or a batch package"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "start", "stop", "info", "config",
+                        "register_user_photo", "register_current_stream",
+                        "register_user_photos",
+                        "list_persons", "get_person", "update_person", "forget",
+                    ],
+                    "description": "Action to perform",
+                },
+                "input_topic": {
+                    "type": "string",
+                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)",
+                },
+                "image_path": {"type": "string", "description": "Path to a JPEG/PNG readable by this container"},
+                "image_url":  {"type": "string", "description": "http(s) URL of a JPEG/PNG"},
+                "image_b64":  {"type": "string", "description": "Base64-encoded JPEG/PNG bytes"},
+                "profile":    {"type": "string", "description": "Who this person is — free text shown alongside the id on every sighting"},
+                "meta":       {"type": "object", "description": "Free-form metadata object (department, tags, notes...)"},
+                "meta_delete": {"type": "array", "items": {"type": "string"}, "description": "Meta keys to remove"},
+                "merge":      {"type": "boolean", "description": "Merge meta into the existing object (default true) instead of replacing it"},
+                "person_id":  {"type": "string", "description": "Existing person id — use an unknown-N id to give that identity a name"},
+                "window_s":   {"type": "number", "description": "Seconds of recent stream to analyse (default 3.0, capped by enroll_window_s)"},
+                "package":    {"type": "string", "description": "Directory, .zip or .tar.gz path/URL holding photos plus an optional manifest.json"},
+                "named":      {"type": "string", "enum": ["all", "named", "unknown"], "description": "Filter the roster (default all); with action=forget, 'unknown' clears every anonymous entry"},
+                "query":      {"type": "string", "description": "Substring filter over id, profile and meta"},
+                "limit":      {"type": "integer", "description": "Page size (default 100)"},
+                "offset":     {"type": "integer", "description": "Page offset"},
+            },
+            "required": ["action"],
+            "x-action-params": {
+                "start":  {"params": ["input_topic"], "description": "Start recognising faces on an image topic"},
+                "stop":   {"params": [], "description": "Stop recognition"},
+                "info":   {"params": ["input_topic"], "description": "Report state, topics and database statistics"},
+                "config": {"params": [], "description": "Update configuration"},
+                "register_user_photo": {
+                    "params": ["image_path", "image_url", "image_b64", "profile", "meta", "person_id"],
+                    "description": "Register a person from one photo. Fails with a reason when there is no face, no clear face, or no obvious subject",
+                },
+                "register_current_stream": {
+                    "params": ["profile", "meta", "person_id", "window_s"],
+                    "description": "Register the person currently in front of the camera, using the last few seconds of the live stream",
+                },
+                "register_user_photos": {
+                    "params": ["package"],
+                    "description": "Register many people from a package of photos; returns a per-photo result saying which succeeded and why the others did not",
+                },
+                "list_persons":  {"params": ["named", "query", "limit", "offset"], "description": "List registered people with their profile and meta"},
+                "get_person":    {"params": ["person_id"], "description": "Read one person's full record"},
+                "update_person": {"params": ["person_id", "profile", "meta", "meta_delete", "merge"], "description": "Edit a person's profile or meta; setting a profile on an unknown-N id names that identity, keeping the id"},
+                "forget":        {"params": ["person_id", "named"], "description": "Delete a person (or every unknown entry). The id is retired and never reused"},
+            },
+        },
+        # Deliberately minimal, as in plugins/ocr.py: only what an operator
+        # meaningfully decides. Expert knobs (model_dir, db_dir, device,
+        # det_size, det_thresh, nms_thresh, num_threads, enroll_window_s,
+        # max_batch, image_roots, ...) stay config.yaml-only — dispatch still
+        # honours them, they are just not advertised to the config UI.
+        "configSchema": {
+            "type": "object",
+            "properties": {
+                "match_threshold":   {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格（越不容易认错人，但越容易认不出）"},
+                "min_face_px":       {"type": "integer", "minimum": 16, "default": DEFAULT_MIN_FACE_PX, "description": "最小人脸边长(px)，小于此值不做识别"},
+                "blur_min":          {"type": "number", "minimum": 0.0, "default": DEFAULT_BLUR_MIN, "description": "清晰度下限(拉普拉斯方差)，低于此值视为模糊人脸"},
+                "max_faces":         {"type": "integer", "minimum": 1, "default": DEFAULT_MAX_FACES, "description": "单帧最多处理的人脸数"},
+                "unknown_capacity":  {"type": "integer", "minimum": 0, "default": DEFAULT_UNKNOWN_CAPACITY, "description": "陌生人(unknown-N)数量上限，超出时淘汰最久未见的；已注册人员不受影响"},
+                "min_interval_ms":   {"type": "integer", "minimum": 0, "default": 200, "description": "帧处理最小间隔(ms)，限制算力占用，0=不限", "scope": "instance"},
+            },
+        },
+        "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
+        "topic_out": [{"format": "data/json",  "desc": "recognised identities per frame"}],
+    }
+]
+
+
+# ── failure reasons ───────────────────────────────────────────────────────────
+
+REASON_NO_FACE = "no_face"
+REASON_LOW_QUALITY = "low_quality"
+REASON_AMBIGUOUS = "ambiguous_subject"
+REASON_NO_FRAMES = "no_frames"
+REASON_BAD_INPUT = "bad_input"
+
+# Which reason to report when frames in a window disagree. Ordered by what the
+# operator has to change: move people out of shot, then get closer / hold
+# still, then point the camera at somebody at all. Reporting "no clear face"
+# for a window that mostly contained a crowd sends them to fix the wrong thing.
+_REASON_PRECEDENCE = (REASON_AMBIGUOUS, REASON_LOW_QUALITY, REASON_NO_FACE)
+
+
+class _BadInput(Exception):
+    """An image or package could not be loaded. Carries the caller-facing detail."""
+
+    def __init__(self, detail: str, source: str = ""):
+        super().__init__(detail)
+        self.detail = detail
+        self.source = source
+
+    def as_result(self) -> dict:
+        result = {"ok": False, "reason": REASON_BAD_INPUT, "detail": self.detail}
+        if self.source:
+            result["source"] = self.source
+        return result
+
+
+def _face_output_topic(input_topic: str) -> str:
+    return f"{input_topic}/face"
+
+
+# ── configuration ─────────────────────────────────────────────────────────────
+
+def _analyzer_options(cfg: dict) -> dict:
+    det_size = cfg.get("det_size") or DEFAULT_DET_SIZE
+    if isinstance(det_size, (list, tuple)) and len(det_size) == 2:
+        det_size = (int(det_size[0]), int(det_size[1]))
+    else:
+        det_size = DEFAULT_DET_SIZE
+    return {
+        "model_dir": str(cfg.get("model_dir", DEFAULT_FACE_MODEL_DIR)),
+        "device": str(cfg.get("device", "cpu")),
+        "det_size": det_size,
+        "det_thresh": float(cfg.get("det_thresh", DEFAULT_DET_THRESH)),
+        "nms_thresh": float(cfg.get("nms_thresh", DEFAULT_NMS_THRESH)),
+        "num_threads": int(cfg.get("num_threads", 2)),
+        "warmup": bool(cfg.get("warmup", True)),
+    }
+
+
+def _db_options(cfg: dict) -> dict:
+    return {
+        "db_dir": str(cfg.get("db_dir", DEFAULT_DB_DIR)),
+        "unknown_capacity": int(
+            cfg.get("unknown_capacity", DEFAULT_UNKNOWN_CAPACITY)
+        ),
+        "max_samples_per_person": int(
+            cfg.get("max_samples_per_person", DEFAULT_MAX_SAMPLES_PER_PERSON)
+        ),
+    }
+
+
+def _gates(cfg: dict) -> dict:
+    """The quality/ambiguity thresholds, resolved once per call."""
+    return {
+        "det_thresh": float(cfg.get("det_thresh", DEFAULT_DET_THRESH)),
+        "min_face_px": float(cfg.get("min_face_px", DEFAULT_MIN_FACE_PX)),
+        "blur_min": float(cfg.get("blur_min", DEFAULT_BLUR_MIN)),
+        "dominance": float(cfg.get("subject_dominance", DEFAULT_SUBJECT_DOMINANCE)),
+        "match_threshold": float(cfg.get("match_threshold", DEFAULT_MATCH_THRESHOLD)),
+        "max_faces": int(cfg.get("max_faces", DEFAULT_MAX_FACES)),
+    }
+
+
+def _engine_signature(cfg: dict) -> tuple:
+    """What a config change must rebuild the engine for."""
+    options = _analyzer_options(cfg)
+    db_options = _db_options(cfg)
+    # unknown_capacity is applied in place (set_unknown_capacity), so it must
+    # not force a rebuild — changing it from the card would otherwise drop
+    # every running instance and reload both models.
+    db_options.pop("unknown_capacity", None)
+    return (
+        tuple(sorted((key, str(value)) for key, value in options.items())),
+        tuple(sorted((key, str(value)) for key, value in db_options.items())),
+    )
+
+
+class _FaceEngine:
+    """The analyzer and the identity database, loaded as one unit.
+
+    They are built together because both can fail slowly (a model download, a
+    corrupt database) and the plugin's single-flight loader has exactly one
+    slot; a half-loaded engine would let recognition start against a database
+    that never opened.
+    """
+
+    def __init__(self, analyzer: FaceAnalyzer, db: FaceDB):
+        self.analyzer = analyzer
+        self.db = db
+
+    def close(self) -> None:
+        try:
+            self.db.flush()
+        except Exception:  # noqa: BLE001 - closing must not raise
+            log.warning("[face] failed to flush the database on close",
+                        exc_info=True)
+        self.analyzer.close()
+
+
+def _build_engine(cfg: dict) -> _FaceEngine:
+    analyzer = FaceAnalyzer(**_analyzer_options(cfg))
+    db = FaceDB(**_db_options(cfg))
+    return _FaceEngine(analyzer, db)
+
+
+def _close_quietly(engine) -> None:
+    close = getattr(engine, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - best-effort release
+            log.warning("[face] engine close failed", exc_info=True)
+
+
+# ── subject selection (pure, unit-tested) ─────────────────────────────────────
+
+def _subject_weight(face: DetectedFace, shape: tuple[int, int]) -> float:
+    """Area, discounted for being off-centre.
+
+    Enrolment needs "the person being shown to the camera", which is bigger
+    *and* more central than a bystander. Pure area picks the bystander who
+    happens to stand closer to the lens edge; pure centrality picks a distant
+    face framed dead-on. The 40% centre discount is a deliberate compromise and
+    the number that `subject_dominance` is compared against.
+    """
+    height, width = shape[0], shape[1]
+    if width <= 0 or height <= 0:
+        return face.area
+    centre_x, centre_y = width / 2.0, height / 2.0
+    face_x = (face.bbox[0] + face.bbox[2]) / 2.0
+    face_y = (face.bbox[1] + face.bbox[3]) / 2.0
+    half_diagonal = (width ** 2 + height ** 2) ** 0.5 / 2.0
+    distance = ((face_x - centre_x) ** 2 + (face_y - centre_y) ** 2) ** 0.5
+    offness = min(1.0, distance / half_diagonal) if half_diagonal else 0.0
+    return face.area * (1.0 - 0.4 * offness)
+
+
+def _candidate_summary(face: DetectedFace, shape: tuple[int, int]) -> dict:
+    return {
+        "bbox": face.bbox_xywh(),
+        "det_score": round(face.det_score, 4),
+        "min_side_px": int(face.min_side),
+        "blur": round(face.blur, 2),
+        "weight": round(_subject_weight(face, shape), 1),
+    }
+
+
+def select_subject(
+    faces: list[DetectedFace], shape: tuple[int, int], gates: dict
+) -> tuple[DetectedFace | None, dict | None]:
+    """Pick the single person an enrolment is about.
+
+    Returns `(face, None)` on success or `(None, failure)` where `failure` is
+    the caller-facing record explaining which physical condition was not met.
+    """
+    if not faces:
+        return None, {
+            "ok": False,
+            "reason": REASON_NO_FACE,
+            "detail": "no face detected",
+            "faces": 0,
+        }
+
+    passing = [
+        face for face in faces
+        if face.det_score >= gates["det_thresh"]
+        and face.min_side >= gates["min_face_px"]
+        and face.blur >= gates["blur_min"]
+    ]
+    if not passing:
+        best = max(faces, key=lambda face: _subject_weight(face, shape))
+        reasons = []
+        if best.det_score < gates["det_thresh"]:
+            reasons.append(
+                f"detector score {best.det_score:.2f} < {gates['det_thresh']:.2f}"
+            )
+        if best.min_side < gates["min_face_px"]:
+            reasons.append(
+                f"face {int(best.min_side)} px < {int(gates['min_face_px'])} px "
+                "(move closer)"
+            )
+        if best.blur < gates["blur_min"]:
+            reasons.append(
+                f"sharpness {best.blur:.1f} < {gates['blur_min']:.1f} (hold still)"
+            )
+        return None, {
+            "ok": False,
+            "reason": REASON_LOW_QUALITY,
+            "detail": "no clear face: " + "; ".join(reasons),
+            "faces": len(faces),
+            "candidates": [_candidate_summary(face, shape) for face in faces[:5]],
+        }
+
+    passing.sort(key=lambda face: _subject_weight(face, shape), reverse=True)
+    if len(passing) >= 2:
+        primary = _subject_weight(passing[0], shape)
+        runner_up = _subject_weight(passing[1], shape)
+        ratio = primary / runner_up if runner_up > 0 else float("inf")
+        if ratio < gates["dominance"]:
+            return None, {
+                "ok": False,
+                "reason": REASON_AMBIGUOUS,
+                "detail": (
+                    f"{len(passing)} faces pass the quality gate; the largest is "
+                    f"only {ratio:.2f}x the runner-up (need "
+                    f"{gates['dominance']:.2f}x). Have one person face the camera, "
+                    "or register from a photo instead."
+                ),
+                "faces": len(passing),
+                "candidates": [
+                    _candidate_summary(face, shape) for face in passing[:5]
+                ],
+            }
+    return passing[0], None
+
+
+def _worst_reason(failures: list[dict]) -> dict:
+    """Pick the failure to report when several frames failed differently."""
+    for reason in _REASON_PRECEDENCE:
+        for failure in failures:
+            if failure.get("reason") == reason:
+                counts = {
+                    name: sum(1 for f in failures if f.get("reason") == name)
+                    for name in _REASON_PRECEDENCE
+                }
+                return {
+                    **failure,
+                    "frames_examined": len(failures),
+                    "frame_reasons": {
+                        name: count for name, count in counts.items() if count
+                    },
+                }
+    return {
+        "ok": False,
+        "reason": REASON_NO_FACE,
+        "detail": "no face detected",
+        "frames_examined": len(failures),
+    }
+
+
+# ── image sources ─────────────────────────────────────────────────────────────
+
+def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
+    """Fetch image bytes from whichever of the three sources was given."""
+    max_bytes = int(cfg.get("max_image_bytes", DEFAULT_MAX_IMAGE_BYTES))
+
+    encoded = args.get("image_b64")
+    if encoded:
+        try:
+            data = base64.b64decode(str(encoded), validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise _BadInput(f"image_b64 is not valid base64: {error}", "image_b64")
+        if len(data) > max_bytes:
+            raise _BadInput(
+                f"image is {len(data)} bytes, over the {max_bytes} limit", "image_b64"
+            )
+        return data, "image_b64"
+
+    url = args.get("image_url")
+    if url:
+        return _fetch_url(str(url), max_bytes), str(url)
+
+    path = args.get("image_path")
+    if path:
+        return _read_local(str(path), cfg, max_bytes), str(path)
+
+    raise _BadInput("one of image_path, image_url or image_b64 is required")
+
+
+def _image_roots(cfg: dict) -> tuple[str, ...]:
+    roots = cfg.get("image_roots") or DEFAULT_IMAGE_ROOTS
+    return tuple(os.path.realpath(str(root)) for root in roots)
+
+
+def _check_under_roots(path: str, cfg: dict) -> str:
+    """Confine caller-supplied paths to the configured roots.
+
+    The MCP server has no authentication and runs as root in the container, so
+    an unrestricted path would let any LAN caller probe the filesystem by
+    asking whether a file decodes as an image. Symlinks are resolved first —
+    a link inside a root pointing outside it would otherwise pass.
+    """
+    resolved = os.path.realpath(path)
+    roots = _image_roots(cfg)
+    if any(resolved == root or resolved.startswith(root + os.sep) for root in roots):
+        return resolved
+    raise _BadInput(
+        f"path must be under one of {', '.join(roots)}: got {path!r}", path
+    )
+
+
+def _read_local(path: str, cfg: dict, max_bytes: int) -> bytes:
+    resolved = _check_under_roots(path, cfg)
+    try:
+        size = os.path.getsize(resolved)
+        if size > max_bytes:
+            raise _BadInput(
+                f"file is {size} bytes, over the {max_bytes} limit", path
+            )
+        with open(resolved, "rb") as handle:
+            return handle.read()
+    except OSError as error:
+        raise _BadInput(f"cannot read {path!r}: {error}", path) from error
+
+
+def _fetch_url(url: str, max_bytes: int) -> bytes:
+    if not url.lower().startswith(("http://", "https://")):
+        raise _BadInput(f"only http(s) URLs are supported: {url!r}", url)
+    try:
+        with urllib.request.urlopen(url, timeout=20) as response:
+            data = response.read(max_bytes + 1)
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        raise _BadInput(f"cannot fetch {url!r}: {error}", url) from error
+    if len(data) > max_bytes:
+        raise _BadInput(f"download exceeds the {max_bytes} byte limit", url)
+    if not data:
+        raise _BadInput(f"{url!r} returned no data", url)
+    return data
+
+
+# ── package extraction ────────────────────────────────────────────────────────
+
+def _safe_member_name(name: str) -> str | None:
+    """Reject archive members that could escape the extraction directory.
+
+    Same policy as `model_downloader._check_bundle_relpath`: no absolute paths,
+    no `..`, no drive letters, and nothing that is not a plain relative path.
+    Returns the normalised name, or None if it must be skipped.
+    """
+    if not name or name.endswith("/"):
+        return None
+    normalised = os.path.normpath(name.replace("\\", "/"))
+    if (
+        os.path.isabs(normalised)
+        or normalised.startswith("..")
+        or os.sep + ".." + os.sep in os.sep + normalised + os.sep
+    ):
+        return None
+    return normalised
+
+
+def _extract_package(package: str, cfg: dict, destination: str) -> str:
+    """Materialise a package as a directory of files. Returns that directory."""
+    if package.lower().startswith(("http://", "https://")):
+        max_bytes = int(cfg.get("max_package_bytes", 512 * 1024 * 1024))
+        payload = _fetch_url(package, max_bytes)
+        archive = os.path.join(destination, "package.bin")
+        with open(archive, "wb") as handle:
+            handle.write(payload)
+        source = archive
+    else:
+        source = _check_under_roots(package, cfg)
+
+    if os.path.isdir(source):
+        return source
+
+    payload = os.path.join(destination, "payload")
+    os.makedirs(payload, exist_ok=True)
+    if zipfile.is_zipfile(source):
+        with zipfile.ZipFile(source) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                name = _safe_member_name(info.filename)
+                if name is None:
+                    log.warning("[face] skipping unsafe archive member %s",
+                                escape_log_text(info.filename))
+                    continue
+                target = os.path.join(payload, name)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with archive.open(info) as src, open(target, "wb") as dst:
+                    dst.write(src.read())
+        return payload
+
+    try:
+        with tarfile.open(source) as archive:
+            for member in archive.getmembers():
+                if not member.isfile():
+                    # Skips symlinks and devices as well as directories — a
+                    # symlink member is the classic tar escape.
+                    continue
+                name = _safe_member_name(member.name)
+                if name is None:
+                    log.warning("[face] skipping unsafe archive member %s",
+                                escape_log_text(member.name))
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                target = os.path.join(payload, name)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with extracted, open(target, "wb") as dst:
+                    dst.write(extracted.read())
+        return payload
+    except tarfile.TarError as error:
+        raise _BadInput(
+            f"{package!r} is neither a directory, a zip, nor a tar archive: {error}",
+            package,
+        ) from error
+
+
+def _read_manifest(directory: str) -> dict[str, dict]:
+    """Read `manifest.json`, accepting either supported shape.
+
+    A list of records (`[{"file": ..., "profile": ..., "person": ...}]`) or a
+    flat mapping of filename to profile text. Both appear in the wild because
+    the second is what somebody writes by hand.
+    """
+    path = os.path.join(directory, "manifest.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError) as error:
+        raise _BadInput(f"manifest.json is unreadable: {error}", path) from error
+
+    entries: dict[str, dict] = {}
+    if isinstance(raw, dict):
+        for filename, value in raw.items():
+            if isinstance(value, dict):
+                entries[str(filename)] = dict(value)
+            else:
+                entries[str(filename)] = {"profile": str(value)}
+    elif isinstance(raw, list):
+        for record in raw:
+            if not isinstance(record, dict):
+                continue
+            filename = record.get("file") or record.get("filename")
+            if not filename:
+                continue
+            entries[str(filename)] = {
+                key: value for key, value in record.items()
+                if key not in ("file", "filename")
+            }
+    else:
+        raise _BadInput("manifest.json must be an object or an array", path)
+    return entries
+
+
+def _sidecar_profile(image_path: str) -> tuple[str, dict]:
+    """Per-image fallback: `alice.json` then `alice.txt`, else the file stem."""
+    stem, _ = os.path.splitext(image_path)
+    json_path = f"{stem}.json"
+    if os.path.isfile(json_path):
+        try:
+            with open(json_path, encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                return str(data.get("profile") or ""), (
+                    data.get("meta") if isinstance(data.get("meta"), dict) else {}
+                )
+            return str(data), {}
+        except (OSError, ValueError):
+            log.warning("[face] ignoring unreadable sidecar %s",
+                        escape_log_text(json_path))
+    text_path = f"{stem}.txt"
+    if os.path.isfile(text_path):
+        try:
+            with open(text_path, encoding="utf-8") as handle:
+                return handle.read().strip(), {}
+        except OSError:
+            pass
+    return os.path.basename(stem), {}
+
+
+# ── ROS2 Node ─────────────────────────────────────────────────────────────────
+
+class _FaceNode(Node):
+    """订阅 image/jpeg topic，持续识别人脸身份并发布结果。"""
+
+    def __init__(
+        self,
+        input_topic: str,
+        engine: _FaceEngine,
+        cfg: dict,
+        node_suffix: str = "",
+        min_interval: float = 0.0,
+    ):
+        node_name = f"face_{node_suffix}" if node_suffix else "face"
+        super().__init__(node_name)
+
+        self._input_topic = input_topic
+        self._output_topic = _face_output_topic(input_topic)
+        self._engine = engine
+        self._cfg = dict(cfg)
+        self._min_interval = max(0.0, float(min_interval))
+        self.state = "idle"
+
+        self._sub = None
+        self._pub = self.create_publisher(String, self._output_topic, _RESULT_QOS)
+
+        self._frames: LatestFrame = LatestFrame()
+        self._frames.close()
+        # Rolling enrolment window, kept beside LatestFrame rather than in place
+        # of it: the worker still wants "newest frame, drop the rest", while
+        # register_current_stream wants the last few seconds. Bounded by age and
+        # by count, so a fast camera cannot grow it without limit.
+        self._window: deque[tuple[bytes, float]] = deque(
+            maxlen=max(1, int(cfg.get(
+                "enroll_window_max_frames", DEFAULT_ENROLL_WINDOW_MAX_FRAMES
+            )))
+        )
+        self._window_lock = threading.Lock()
+        self._window_seconds = float(
+            cfg.get("enroll_window_s", DEFAULT_ENROLL_WINDOW_S)
+        )
+
+        self._worker_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._stop_event.set()
+        self._generation = 0
+        self._worker_threads: list[threading.Thread] = []
+        self._node_lock = threading.RLock()
+        self._retired = False
+        self._log_gate = SampledLogGate(every=100)
+        self._last_error_log_at: float | None = None
+        self._last_flush_at = time.monotonic()
+        log.info("[face] node created: subscribing=%s, publishing=%s",
+                 self._input_topic, self._output_topic)
+
+    # ── lifecycle (mirrors _OCRNode) ──────────────────────────────────────
+
+    def start(self) -> dict:
+        with self._node_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> dict:
+        if self._retired:
+            return self._status_dict()
+        if self.state == "running":
+            return self._status_dict()
+        if not self._engine:
+            raise RuntimeError("face engine not configured")
+
+        self._generation += 1
+        generation = self._generation
+        stop_event = threading.Event()
+        frames: LatestFrame = LatestFrame()
+        self._stop_event = stop_event
+        self._frames = frames
+        if self._sub is None:
+            self._sub = self.create_subscription(
+                CompressedImage, self._input_topic, self._image_cb, CAMERA_QOS
+            )
+        self.state = "running"
+        self._worker_threads = [
+            thread for thread in self._worker_threads if thread.is_alive()
+        ]
+        self._worker_thread = threading.Thread(
+            target=self._worker,
+            args=(generation, stop_event, frames),
+            daemon=True,
+        )
+        self._worker_threads.append(self._worker_thread)
+        self._worker_thread.start()
+
+        log.info("[face] started: %s → %s", self._input_topic, self._output_topic)
+        return self._status_dict()
+
+    def stop(self) -> dict:
+        with self._node_lock:
+            self.state = "idle"
+            self._stop_event.set()
+            self._frames.close()
+            deadline = time.monotonic() + 3.0
+            for thread in self._worker_threads:
+                if thread.is_alive():
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            self._worker_threads = [
+                thread for thread in self._worker_threads if thread.is_alive()
+            ]
+            if self._worker_threads:
+                log.warning("[face] %d worker(s) still stopping after timeout: %s",
+                            len(self._worker_threads), self._input_topic)
+            with self._window_lock:
+                self._window.clear()
+            self._flush_seen()
+            log.info("[face] stopped: %s", self._input_topic)
+            return {"state": "idle"}
+
+    def retire(self) -> dict:
+        with self._node_lock:
+            self._retired = True
+            return self.stop()
+
+    @property
+    def worker_alive(self) -> bool:
+        return any(thread.is_alive() for thread in self._worker_threads)
+
+    # ── frame intake ──────────────────────────────────────────────────────
+
+    def _image_cb(self, msg: CompressedImage):
+        stop_event = self._stop_event
+        frames = self._frames
+        if self.state != "running" or stop_event.is_set():
+            return
+        data = bytes(msg.data)
+        now = time.time()
+        frames.push((data, now))
+        with self._window_lock:
+            self._window.append((data, now))
+            cutoff = now - self._window_seconds
+            while self._window and self._window[0][1] < cutoff:
+                self._window.popleft()
+
+    def recent_frames(self, window_s: float | None = None) -> list[tuple[bytes, float]]:
+        """Frames captured within the last `window_s` seconds, oldest first."""
+        limit = self._window_seconds if window_s is None else min(
+            float(window_s), self._window_seconds
+        )
+        cutoff = time.time() - max(0.0, limit)
+        with self._window_lock:
+            return [item for item in self._window if item[1] >= cutoff]
+
+    # ── recognition worker ────────────────────────────────────────────────
+
+    def _is_generation_active(
+        self, generation: int, stop_event: threading.Event
+    ) -> bool:
+        return (
+            self.state == "running"
+            and self._generation == generation
+            and self._stop_event is stop_event
+            and not stop_event.is_set()
+        )
+
+    def _worker(
+        self,
+        generation: int,
+        stop_event: threading.Event,
+        frames: LatestFrame,
+    ):
+        while not stop_event.is_set():
+            frame = frames.pop(timeout=1.0)
+            if frame is None:
+                continue
+            image_bytes, timestamp = frame
+
+            started = time.time()
+            payload = self._recognise_to_payload(image_bytes, timestamp)
+            if not self._is_generation_active(generation, stop_event):
+                continue
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False)
+            self._pub.publish(msg)
+            self._log_payload(payload)
+
+            if time.monotonic() - self._last_flush_at >= _SEEN_FLUSH_INTERVAL_SECONDS:
+                self._flush_seen()
+
+            if self._min_interval > 0:
+                remaining = self._min_interval - (time.time() - started)
+                if remaining > 0:
+                    stop_event.wait(remaining)
+
+    def _recognise_to_payload(self, image_bytes: bytes, timestamp: float) -> dict:
+        started = time.time()
+        payload: dict[str, Any] = {
+            "ts": timestamp,
+            "topic": self._input_topic,
+            "count": 0,
+            "faces": [],
+        }
+        try:
+            analyzer = self._engine.analyzer
+            database = self._engine.db
+            gates = _gates(self._cfg)
+            image = analyzer.decode_jpeg(image_bytes)
+            if image is None:
+                payload["error"] = "undecodable frame"
+                return payload
+            shape = image.shape[:2]
+            faces = analyzer.detect(image, max_faces=gates["max_faces"])
+            entries = []
+            for face in faces:
+                analyzer.prepare(image, face)
+                usable = (
+                    face.det_score >= gates["det_thresh"]
+                    and face.min_side >= gates["min_face_px"]
+                    and face.blur >= gates["blur_min"]
+                )
+                entry = {
+                    "bbox": face.bbox_xywh(),
+                    "det_score": round(face.det_score, 4),
+                    "blur": round(face.blur, 2),
+                    "min_side_px": int(face.min_side),
+                }
+                if not usable:
+                    # Reported, but neither matched nor enrolled. Matching a
+                    # blurred 30 px face is a coin flip, and auto-enrolling it
+                    # would spend an unknown-N slot on a smear that never
+                    # matches anything again. "There is a face here and I
+                    # cannot identify it" is the honest answer.
+                    entry.update({
+                        "person_id": None,
+                        "profile": "",
+                        "known": False,
+                        "quality": "low",
+                        "reason": REASON_LOW_QUALITY,
+                    })
+                    entries.append(entry)
+                    continue
+
+                embedding = analyzer.embed(face.aligned)
+                person_id, score = database.match(
+                    embedding, gates["match_threshold"]
+                )
+                if person_id is None:
+                    record = database.enroll_unknown(embedding)
+                    person_id = record["id"]
+                    profile = record["profile"]
+                    known = False
+                else:
+                    database.touch(person_id, timestamp)
+                    record = database.get_person(person_id)
+                    profile = record["profile"]
+                    known = record["named"]
+                entry.update({
+                    "person_id": person_id,
+                    "profile": profile,
+                    "known": known,
+                    "score": round(float(score), 4),
+                    "quality": "ok",
+                })
+                entries.append(entry)
+            payload["faces"] = entries
+            payload["count"] = len(entries)
+        except Exception as error:  # noqa: BLE001 - reported in the payload
+            payload["error"] = str(error)
+        payload["latency_ms"] = int((time.time() - started) * 1000)
+        return payload
+
+    def _log_payload(self, payload: dict) -> None:
+        """Transitions unthrottled, steady state sampled — as in plugins/ocr.py."""
+        outcome = "error" if "error" in payload else "ok"
+        should_log, transition, occurrence = self._log_gate.check(outcome)
+        if outcome == "error":
+            now = time.monotonic()
+            if transition or (
+                self._last_error_log_at is None
+                or now - self._last_error_log_at >= _ERROR_LOG_INTERVAL_SECONDS
+            ):
+                log.error("[face] recognition error (occurrence %d): %s",
+                          occurrence, escape_log_text(payload["error"]))
+                self._last_error_log_at = now
+            elif should_log:
+                log.debug("[face] recognition error (occurrence %d): %s",
+                          occurrence, escape_log_text(payload["error"]))
+        elif should_log:
+            log.debug("[face] published to %s: %d face(s) (frame %d%s)",
+                      self._output_topic, payload["count"], occurrence,
+                      ", recovered" if transition and occurrence == 1 else "")
+
+    def _flush_seen(self) -> None:
+        """Persist `last_seen_at` updates accumulated at frame rate."""
+        self._last_flush_at = time.monotonic()
+        try:
+            self._engine.db.flush()
+        except Exception:  # noqa: BLE001 - never kill the worker over this
+            log.warning("[face] failed to persist sighting timestamps",
+                        exc_info=True)
+
+    def apply_config(self, cfg: dict) -> None:
+        """Apply lightweight fields to a running node, as OCR's config does."""
+        self._cfg = dict(cfg)
+        self._min_interval = max(
+            0.0, float(cfg.get("min_interval_ms", 0)) / 1000.0
+        )
+        self._window_seconds = float(
+            cfg.get("enroll_window_s", DEFAULT_ENROLL_WINDOW_S)
+        )
+
+    def _status_dict(self) -> dict:
+        return {
+            "state": self.state,
+            "topic_in": [{"topic": self._input_topic, "format": "image/jpeg", "desc": "image input"}],
+            "topic_out": [{"topic": self._output_topic, "format": "data/json", "desc": "recognised identities"}],
+        }
+
+
+# ── Plugin ────────────────────────────────────────────────────────────────────
+
+class FaceRecognitionPlugin:
+    """Face recognition MCP plugin with a non-blocking start/stop/load machine.
+
+    The state machine, the single-flight loader and every locking rule are
+    `plugins/ocr.py`'s; see that docstring. The engine here is the analyzer plus
+    the identity database.
+    """
+
+    PREFIX = "face_recognition"
+
+    def __init__(self, plugin_cfg: dict, executor):
+        self._plugin_cfg = dict(plugin_cfg)
+        self._executor = executor
+
+        self._state_lock = threading.Lock()
+        self._nodes: dict[str, _FaceNode] = {}
+        self._instance_configs: dict[str, dict] = {}
+        self._pending_starts: dict[str, str] = {}
+        self._engine: _FaceEngine | None = None
+        self._engine_state = "idle"          # idle|loading|ready|error
+        self._load_error: str | None = None
+        self._load_generation = 0
+
+        log.info("[face] plugin init: device=%s, model_dir=%s, db_dir=%s",
+                 plugin_cfg.get("device", "cpu"),
+                 plugin_cfg.get("model_dir", DEFAULT_FACE_MODEL_DIR),
+                 plugin_cfg.get("db_dir", DEFAULT_DB_DIR))
+
+    def get_tools(self) -> list:
+        return TOOLS
+
+    # ── background loader (single-flight) ────────────────────────────────
+
+    def _spawn_loader_locked(self) -> None:
+        self._engine_state = "loading"
+        self._load_error = None
+        generation = self._load_generation
+        cfg = dict(self._plugin_cfg)
+        threading.Thread(
+            target=self._loader, args=(generation, cfg),
+            name="face-engine-loader", daemon=True,
+        ).start()
+
+    def _loader(self, generation: int, cfg: dict) -> None:
+        try:
+            engine = _build_engine(cfg)
+        except Exception as error:  # noqa: BLE001 - surfaced via state/info
+            log.exception("[face] engine load failed")
+            with self._state_lock:
+                if generation == self._load_generation:
+                    self._engine_state = "error"
+                    self._load_error = str(error)
+            return
+
+        with self._state_lock:
+            if generation != self._load_generation:
+                stale = engine
+            else:
+                self._engine = engine
+                self._engine_state = "ready"
+                stale = None
+        if stale is not None:
+            _close_quietly(stale)
+            return
+
+        while True:
+            with self._state_lock:
+                if generation != self._load_generation or not self._pending_starts:
+                    return
+                node_key, input_topic = next(iter(self._pending_starts.items()))
+            try:
+                node = self._create_node(node_key, input_topic, engine)
+            except Exception as error:  # noqa: BLE001 - keep serving others
+                log.error("[face] failed to build instance %r on %r: %s",
+                          node_key, input_topic, escape_log_text(error))
+                with self._state_lock:
+                    if self._pending_starts.get(node_key) == input_topic:
+                        del self._pending_starts[node_key]
+                continue
+            registered = False
+            with self._state_lock:
+                still_wanted = (
+                    generation == self._load_generation
+                    and self._pending_starts.get(node_key) == input_topic
+                )
+                if still_wanted:
+                    try:
+                        self._executor.add_node(node)
+                    except Exception as error:  # noqa: BLE001
+                        log.error("[face] failed to register instance %r: %s",
+                                  node_key, escape_log_text(error))
+                        del self._pending_starts[node_key]
+                    else:
+                        self._nodes[node_key] = node
+                        del self._pending_starts[node_key]
+                        registered = True
+            if not registered:
+                try:
+                    node.destroy_node()
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            try:
+                node.start()
+            except Exception as error:  # noqa: BLE001
+                log.error("[face] failed to start instance %r: %s",
+                          node_key, escape_log_text(error))
+                with self._state_lock:
+                    if self._nodes.get(node_key) is node:
+                        del self._nodes[node_key]
+                self._dispose(node_key, node)
+                continue
+            with self._state_lock:
+                still_ours = self._nodes.get(node_key) is node
+            if not still_ours:
+                node.stop()
+
+    def _merged_cfg(self, node_key: str) -> dict:
+        return {**self._plugin_cfg, **self._instance_configs.get(node_key, {})}
+
+    def _create_node(
+        self, node_key: str, input_topic: str, engine: _FaceEngine
+    ) -> _FaceNode:
+        cfg = self._merged_cfg(node_key)
+        return _FaceNode(
+            input_topic,
+            engine,
+            cfg,
+            node_suffix=node_key.replace("/", "_").replace("-", "_"),
+            min_interval=float(cfg.get("min_interval_ms", 0)) / 1000.0,
+        )
+
+    def _dispose(self, node_key: str, node: _FaceNode) -> None:
+        try:
+            node.retire()
+        finally:
+            dispose_node(self._executor, node, label=f"face/{node_key}")
+        log.info("[face] node disposed: %s", node_key)
+
+    def _instance_state_locked(self, node_key: str) -> str:
+        node = self._nodes.get(node_key)
+        if node is not None:
+            return node.state
+        if node_key in self._pending_starts:
+            return "error" if self._engine_state == "error" else "loading"
+        return "idle"
+
+    # ── MCP dispatch ──────────────────────────────────────────────────────
+
+    def dispatch(self, name: str, args: dict) -> dict | None:
+        action = args.get("action") if name == self.PREFIX else name
+        instance_id = args.get("instance_id", "")
+
+        if action == "info":
+            return self._do_info(instance_id, args.get("input_topic", ""))
+        if action == "start":
+            return self._do_start(instance_id, args)
+        if action == "stop":
+            return self._do_stop(instance_id)
+        if action == "config":
+            return self._do_config(instance_id, args)
+        if action == "register_user_photo":
+            return self._do_register_photo(args)
+        if action == "register_current_stream":
+            return self._do_register_stream(instance_id, args)
+        if action == "register_user_photos":
+            return self._do_register_batch(args)
+        if action == "list_persons":
+            return self._do_list_persons(args)
+        if action == "get_person":
+            return self._do_get_person(args)
+        if action == "update_person":
+            return self._do_update_person(args)
+        if action == "forget":
+            return self._do_forget(args)
+        return None
+
+    _DESC = "Face recognition — identifies registered people in the camera feed"
+
+    def _desc_locked(self, state: str) -> str:
+        if state == "loading":
+            return "Loading face detection and recognition models..."
+        if state == "error" and self._load_error:
+            return f"Model load failed: {self._load_error}"
+        return self._DESC
+
+    # ── info / start / stop / config ──────────────────────────────────────
+
+    def _do_info(self, instance_id: str, input_topic: str) -> dict:
+        base = {"name": "FaceRecognition", "manufacture": "Embodied",
+                "model": "scrfd+arcface"}
+        with self._state_lock:
+            engine = self._engine
+            if instance_id:
+                node = self._nodes.get(instance_id)
+                topic = (
+                    node._input_topic if node is not None
+                    else self._pending_starts.get(instance_id, input_topic)
+                )
+                out = _face_output_topic(topic) if topic else ""
+                state = self._instance_state_locked(instance_id)
+                result = {
+                    **base,
+                    "state": state,
+                    "desc": self._desc_locked(state),
+                    "topic_in": [{"topic": topic, "format": "image/jpeg", "desc": ""}] if topic else [],
+                    "topic_out": [{"topic": out, "format": "data/json", "desc": ""}] if out else [],
+                }
+                if state == "error" and self._load_error:
+                    result["error"] = self._load_error
+                return self._with_db_stats(result, engine)
+
+            keys = list(self._nodes) + [
+                key for key in self._pending_starts if key not in self._nodes
+            ]
+            instances = {key: {"state": self._instance_state_locked(key)} for key in keys}
+            topics_in, topics_out = [], []
+            for key in keys:
+                node = self._nodes.get(key)
+                topic = node._input_topic if node else self._pending_starts[key]
+                topics_in.append({"topic": topic, "format": "image/jpeg", "desc": ""})
+                topics_out.append({"topic": _face_output_topic(topic), "format": "data/json", "desc": ""})
+            states = {entry["state"] for entry in instances.values()}
+            if "loading" in states or self._engine_state == "loading":
+                state = "loading"
+            elif "running" in states:
+                state = "running"
+            elif "error" in states or self._engine_state == "error":
+                state = "error"
+            else:
+                state = "idle"
+            if not keys and input_topic:
+                topics_in = [{"topic": input_topic, "format": "image/jpeg", "desc": ""}]
+                topics_out = [{"topic": _face_output_topic(input_topic), "format": "data/json", "desc": ""}]
+            result = {
+                **base,
+                "state": state,
+                "desc": self._desc_locked(state),
+                "topic_in": topics_in,
+                "topic_out": topics_out,
+            }
+            if instances:
+                result["instances"] = instances
+            if self._load_error and state == "error":
+                result["error"] = self._load_error
+            return self._with_db_stats(result, engine)
+
+    def _with_db_stats(self, result: dict, engine: _FaceEngine | None) -> dict:
+        """Attach roster counts. Never fails info — it is the diagnostic path."""
+        if engine is None:
+            return result
+        try:
+            result["database"] = engine.db.stats()
+        except Exception:  # noqa: BLE001
+            log.warning("[face] could not read database stats", exc_info=True)
+        return result
+
+    def _do_start(self, instance_id: str, args: dict) -> dict:
+        input_topic = args.get("input_topic")
+        if not input_topic:
+            raise ValueError("input_topic is required for start action")
+        node_key = instance_id or input_topic
+
+        retired = None
+        with self._state_lock:
+            existing = self._nodes.get(node_key)
+            if existing is not None and existing._input_topic != input_topic:
+                retired = self._nodes.pop(node_key)
+        if retired is not None:
+            self._dispose(node_key, retired)
+
+        with self._state_lock:
+            existing = self._nodes.get(node_key)
+            if existing is not None:
+                start_node = existing            # idempotent re-start
+            else:
+                start_node = None
+                # Claim the key before leaving the lock so a concurrent stop
+                # always finds the instance in _pending_starts or _nodes, never
+                # in an invisible in-between state.
+                self._pending_starts[node_key] = input_topic
+                if self._engine_state != "ready":
+                    if self._engine_state in ("idle", "error"):
+                        self._spawn_loader_locked()
+                    return {
+                        "state": "loading",
+                        "input": input_topic,
+                        "output": _face_output_topic(input_topic),
+                    }
+            engine = self._engine
+            generation = self._load_generation
+
+        if start_node is not None:
+            return start_node.start()
+
+        node = self._create_node(node_key, input_topic, engine)
+        with self._state_lock:
+            claimed = self._pending_starts.get(node_key) == input_topic
+            current = self._nodes.get(node_key)
+            fresh = generation == self._load_generation
+            registered = False
+            if claimed and current is None and fresh:
+                try:
+                    self._executor.add_node(node)
+                except Exception as error:  # noqa: BLE001
+                    log.error("[face] failed to register instance %r: %s",
+                              node_key, escape_log_text(error))
+                    del self._pending_starts[node_key]
+                else:
+                    self._nodes[node_key] = node
+                    del self._pending_starts[node_key]
+                    registered = True
+            elif claimed and not fresh:
+                # A config change invalidated the engine mid-start; leave the
+                # claim so the loader it spawned brings this instance up.
+                pass
+            elif claimed:
+                del self._pending_starts[node_key]
+        if not registered:
+            try:
+                node.destroy_node()
+            except Exception:  # noqa: BLE001
+                pass
+            if current is not None:
+                return current.start()
+            if claimed and not fresh:
+                return {"state": "loading", "input": input_topic,
+                        "output": _face_output_topic(input_topic)}
+            return {"state": "idle", "input": input_topic,
+                    "output": _face_output_topic(input_topic)}
+        try:
+            result = node.start()
+        except Exception:
+            with self._state_lock:
+                if self._nodes.get(node_key) is node:
+                    del self._nodes[node_key]
+            self._dispose(node_key, node)
+            raise
+        with self._state_lock:
+            still_ours = self._nodes.get(node_key) is node
+        if not still_ours:
+            node.stop()
+            return {"state": "idle", "input": input_topic,
+                    "output": _face_output_topic(input_topic)}
+        return result
+
+    def _do_stop(self, instance_id: str) -> dict:
+        to_dispose: list[tuple[str, _FaceNode]] = []
+        with self._state_lock:
+            if instance_id:
+                self._pending_starts.pop(instance_id, None)
+                node = self._nodes.pop(instance_id, None)
+                if node is not None:
+                    to_dispose.append((instance_id, node))
+            else:
+                self._pending_starts.clear()
+                to_dispose.extend(self._nodes.items())
+                self._nodes = {}
+        for node_key, node in to_dispose:
+            self._dispose(node_key, node)
+        return {"state": "idle"}
+
+    _INSTANCE_SCOPED = ("min_interval_ms",)
+
+    def _do_config(self, instance_id: str, args: dict) -> dict:
+        cfg = {
+            key: value for key, value in args.items()
+            if key not in ("action", "instance_id")
+            and value is not None and value != ""
+        }
+
+        if instance_id:
+            shared = set(cfg) - set(self._INSTANCE_SCOPED)
+            if shared:
+                raise ValueError(
+                    "face recognition settings are shared: "
+                    + ", ".join(sorted(shared))
+                )
+            with self._state_lock:
+                previous = self._instance_configs.get(instance_id, {})
+                self._instance_configs[instance_id] = {**previous, **cfg}
+                node = self._nodes.get(instance_id)
+                merged = self._merged_cfg(instance_id)
+            if node is not None:
+                # min_interval_ms is applied in place; no reason to retire a
+                # live subscription for a frame-rate change.
+                node.apply_config(merged)
+            return {"status": "configured", "instance_id": instance_id}
+
+        evicted = 0
+        with self._state_lock:
+            updated = {**self._plugin_cfg, **cfg}
+            rebuild = _engine_signature(updated) != _engine_signature(self._plugin_cfg)
+            capacity_changed = (
+                int(updated.get("unknown_capacity", DEFAULT_UNKNOWN_CAPACITY))
+                != int(self._plugin_cfg.get("unknown_capacity", DEFAULT_UNKNOWN_CAPACITY))
+            )
+            self._plugin_cfg = updated
+            engine = self._engine
+            if not rebuild:
+                for node_key, node in self._nodes.items():
+                    node.apply_config({
+                        **updated, **self._instance_configs.get(node_key, {})
+                    })
+                nodes_live = self._engine is not None
+            else:
+                self._load_generation += 1
+                stale_engine = self._engine
+                self._engine = None
+                disposed = list(self._nodes.items())
+                self._nodes = {}
+                if self._pending_starts:
+                    self._spawn_loader_locked()
+                else:
+                    self._engine_state = "idle"
+                    self._load_error = None
+
+        if not rebuild:
+            if capacity_changed and engine is not None:
+                evicted = engine.db.set_unknown_capacity(
+                    int(self._plugin_cfg.get("unknown_capacity",
+                                             DEFAULT_UNKNOWN_CAPACITY))
+                )
+            result = {"status": "configured", "engine_loaded": nodes_live,
+                      "reused": nodes_live}
+            if capacity_changed:
+                result["unknown_evicted"] = evicted
+                result["unknown_capacity"] = int(
+                    self._plugin_cfg.get("unknown_capacity",
+                                         DEFAULT_UNKNOWN_CAPACITY)
+                )
+            return result
+
+        for node_key, node in disposed:
+            self._dispose(node_key, node)
+        if stale_engine is not None:
+            _close_quietly(stale_engine)
+        return {"status": "configured", "engine_loaded": False, "reused": False}
+
+    # ── engine access for the action paths ────────────────────────────────
+
+    def _require_engine(self) -> _FaceEngine:
+        """Return a ready engine, loading it on demand.
+
+        The registration and roster actions are useful without any instance
+        running — an operator enrols people from photos before pointing a
+        camera anywhere — so they trigger the same single-flight load a `start`
+        would, and wait for it rather than reporting `loading`. A tools/call
+        already has its own thread (ThreadingHTTPServer), so blocking here
+        blocks nothing else.
+        """
+        with self._state_lock:
+            if self._engine is not None:
+                return self._engine
+            if self._engine_state in ("idle", "error"):
+                self._spawn_loader_locked()
+            generation = self._load_generation
+
+        deadline = time.monotonic() + float(
+            self._plugin_cfg.get("load_timeout_s", 180.0)
+        )
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            with self._state_lock:
+                if generation != self._load_generation:
+                    generation = self._load_generation
+                    continue
+                if self._engine is not None:
+                    return self._engine
+                if self._engine_state == "error":
+                    raise RuntimeError(
+                        self._load_error or "face engine failed to load"
+                    )
+        raise RuntimeError("face engine is still loading; try again shortly")
+
+    # ── registration ──────────────────────────────────────────────────────
+
+    def _analyze_subject(
+        self, engine: _FaceEngine, image_bytes: bytes, gates: dict
+    ) -> tuple[np.ndarray | None, dict | None]:
+        """One image → the subject's embedding, or the failure record."""
+        image = engine.analyzer.decode_jpeg(image_bytes)
+        if image is None:
+            return None, {
+                "ok": False, "reason": REASON_BAD_INPUT,
+                "detail": "image could not be decoded as JPEG/PNG",
+            }
+        shape = image.shape[:2]
+        faces = engine.analyzer.detect(image, max_faces=gates["max_faces"])
+        for face in faces:
+            engine.analyzer.prepare(image, face)
+        subject, failure = select_subject(faces, shape, gates)
+        if subject is None:
+            return None, failure
+        return engine.analyzer.embed(subject.aligned), None
+
+    def _commit_enrolment(
+        self,
+        engine: _FaceEngine,
+        embeddings: list[np.ndarray],
+        profile: str,
+        meta: Any,
+        person_id: str | None,
+        gates: dict,
+    ) -> dict:
+        """Attach embeddings to the right identity, creating one if needed."""
+        database = engine.db
+
+        if person_id:
+            try:
+                existing = database.get_person(person_id)
+            except KeyError:
+                return {
+                    "ok": False, "reason": REASON_BAD_INPUT,
+                    "detail": f"no such person: {person_id!r}",
+                }
+            was_unknown = not existing["named"]
+            record = database.add_samples(person_id, embeddings)
+            if profile or meta is not None:
+                record = database.update_person(
+                    person_id, profile=profile or None, meta=meta
+                )
+            return {
+                "ok": True,
+                "person_id": person_id,
+                "profile": record["profile"],
+                "meta": record["meta"],
+                "samples": record["samples"],
+                "promoted": was_unknown and bool(profile),
+            }
+
+        # No id given: does this face already exist under some identity?
+        matched, score = database.match(embeddings[0], gates["match_threshold"])
+        if matched is not None:
+            record = database.add_samples(matched, embeddings)
+            promoted = False
+            if is_unknown_id(matched) or not record["named"]:
+                # The face was already being tracked anonymously; naming it now
+                # keeps that id, so earlier sightings stay attributable.
+                record = database.update_person(matched, profile=profile, meta=meta)
+                promoted = True
+            elif meta is not None:
+                record = database.update_person(matched, meta=meta)
+            return {
+                "ok": True,
+                "person_id": matched,
+                "profile": record["profile"],
+                "meta": record["meta"],
+                "samples": record["samples"],
+                "merged": True,
+                "promoted": promoted,
+                "score_to_existing": round(float(score), 4),
+            }
+
+        record = database.add(profile, embeddings, named=True, meta=meta)
+        return {
+            "ok": True,
+            "person_id": record["id"],
+            "profile": record["profile"],
+            "meta": record["meta"],
+            "samples": record["samples"],
+            "merged": False,
+            "promoted": False,
+        }
+
+    def _do_register_photo(self, args: dict) -> dict:
+        engine = self._require_engine()
+        cfg = dict(self._plugin_cfg)
+        gates = _gates(cfg)
+        try:
+            data, source = _load_image_bytes(args, cfg)
+        except _BadInput as error:
+            return error.as_result()
+
+        embedding, failure = self._analyze_subject(engine, data, gates)
+        if embedding is None:
+            return {**failure, "source": source}
+        result = self._commit_enrolment(
+            engine, [embedding], str(args.get("profile") or ""),
+            args.get("meta"), args.get("person_id") or None, gates,
+        )
+        if result.get("ok"):
+            log.info("[face] registered %s from %s: %s", result["person_id"],
+                     escape_log_text(source), escape_log_text(result["profile"]))
+        return {**result, "source": source}
+
+    def _do_register_stream(self, instance_id: str, args: dict) -> dict:
+        cfg = dict(self._plugin_cfg)
+        gates = _gates(cfg)
+
+        with self._state_lock:
+            if instance_id:
+                node = self._nodes.get(instance_id)
+            elif len(self._nodes) == 1:
+                node = next(iter(self._nodes.values()))
+            else:
+                node = None
+                if len(self._nodes) > 1:
+                    return {
+                        "ok": False, "reason": REASON_BAD_INPUT,
+                        "detail": (
+                            f"{len(self._nodes)} instances are running; pass "
+                            "instance_id to say which camera to use"
+                        ),
+                        "instances": sorted(self._nodes),
+                    }
+        if node is None:
+            return {
+                "ok": False, "reason": REASON_NO_FRAMES,
+                "detail": (
+                    "no running instance to read from — start the card on a "
+                    "camera topic first"
+                ),
+            }
+
+        window = min(
+            float(args.get("window_s") or cfg.get(
+                "enroll_window_s", DEFAULT_ENROLL_WINDOW_S)),
+            float(cfg.get("enroll_window_s", DEFAULT_ENROLL_WINDOW_S)),
+        )
+        frames = node.recent_frames(window)
+        if not frames:
+            return {
+                "ok": False, "reason": REASON_NO_FRAMES,
+                "detail": f"no frames received in the last {window:.1f}s",
+                "instance_id": instance_id or node._input_topic,
+            }
+
+        engine = self._require_engine()
+        # Analyse newest-first and cap the count: the window can hold 60 frames
+        # and running the full pair of models over all of them would take
+        # seconds for no extra accuracy.
+        budget = max(1, int(cfg.get("enroll_max_analyzed", DEFAULT_ENROLL_MAX_ANALYZED)))
+        selected = list(reversed(frames))[:budget]
+
+        embeddings: list[np.ndarray] = []
+        failures: list[dict] = []
+        for image_bytes, _ts in selected:
+            embedding, failure = self._analyze_subject(engine, image_bytes, gates)
+            if embedding is None:
+                failures.append(failure)
+            else:
+                embeddings.append(embedding)
+
+        if not embeddings:
+            return {
+                **_worst_reason(failures),
+                "instance_id": instance_id or node._input_topic,
+                "window_s": round(window, 2),
+            }
+
+        # Every accepted frame must show the *same* person. Two people taking
+        # turns being the dominant face would otherwise be enrolled as one
+        # identity whose embeddings match neither of them well.
+        anchor = embeddings[0]
+        agreeing = [
+            embedding for embedding in embeddings
+            if float(np.dot(anchor, embedding)) >= gates["match_threshold"]
+        ]
+        if len(agreeing) * 2 < len(embeddings):
+            return {
+                "ok": False,
+                "reason": REASON_AMBIGUOUS,
+                "detail": (
+                    f"the last {window:.1f}s did not show one stable subject "
+                    f"({len(agreeing)} of {len(embeddings)} usable frames agree). "
+                    "Have a single person hold still in front of the camera."
+                ),
+                "frames_examined": len(selected),
+                "instance_id": instance_id or node._input_topic,
+            }
+
+        result = self._commit_enrolment(
+            engine, agreeing, str(args.get("profile") or ""),
+            args.get("meta"), args.get("person_id") or None, gates,
+        )
+        if result.get("ok"):
+            log.info("[face] registered %s from the live stream (%d/%d frames): %s",
+                     result["person_id"], len(agreeing), len(selected),
+                     escape_log_text(result["profile"]))
+        return {
+            **result,
+            "instance_id": instance_id or node._input_topic,
+            "frames_used": len(agreeing),
+            "frames_examined": len(selected),
+            "window_s": round(window, 2),
+        }
+
+    def _do_register_batch(self, args: dict) -> dict:
+        package = str(args.get("package") or "").strip()
+        if not package:
+            return {"ok": False, "reason": REASON_BAD_INPUT,
+                    "detail": "package is required"}
+
+        engine = self._require_engine()
+        cfg = dict(self._plugin_cfg)
+        gates = _gates(cfg)
+        max_batch = int(cfg.get("max_batch", DEFAULT_MAX_BATCH))
+
+        with tempfile.TemporaryDirectory(prefix="face-batch-") as staging:
+            try:
+                directory = _extract_package(package, cfg, staging)
+                manifest = _read_manifest(directory)
+            except _BadInput as error:
+                return error.as_result()
+
+            images: list[str] = []
+            for root, _dirs, files in os.walk(directory):
+                for filename in sorted(files):
+                    if filename.lower().endswith(_IMAGE_SUFFIXES):
+                        images.append(os.path.join(root, filename))
+            images.sort()
+
+            if not images:
+                return {"ok": False, "reason": REASON_BAD_INPUT,
+                        "detail": "package contains no images", "source": package}
+            if len(images) > max_batch:
+                return {
+                    "ok": False, "reason": REASON_BAD_INPUT,
+                    "detail": (
+                        f"package has {len(images)} images, over the max_batch "
+                        f"limit of {max_batch}. Split it, or raise max_batch in "
+                        "config.yaml."
+                    ),
+                    "source": package,
+                }
+
+            results: list[dict] = []
+            # person key → the id its first successful photo created, so several
+            # photos of one person become several samples of one identity.
+            groups: dict[str, str] = {}
+            for image_path in images:
+                relative = os.path.relpath(image_path, directory)
+                entry = manifest.get(relative) or manifest.get(
+                    os.path.basename(image_path)
+                ) or {}
+                if entry:
+                    profile = str(entry.get("profile") or "")
+                    meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else None
+                else:
+                    profile, sidecar_meta = _sidecar_profile(image_path)
+                    meta = sidecar_meta or None
+                group = str(entry.get("person") or entry.get("id") or "").strip()
+                person_id = groups.get(group) if group else None
+
+                try:
+                    with open(image_path, "rb") as handle:
+                        data = handle.read()
+                except OSError as error:
+                    results.append({"file": relative, "ok": False,
+                                    "reason": REASON_BAD_INPUT,
+                                    "detail": f"cannot read: {error}"})
+                    continue
+
+                embedding, failure = self._analyze_subject(engine, data, gates)
+                if embedding is None:
+                    results.append({"file": relative, "profile": profile, **failure})
+                    continue
+                try:
+                    outcome = self._commit_enrolment(
+                        engine, [embedding], profile, meta, person_id, gates
+                    )
+                except Exception as error:  # noqa: BLE001 - one bad photo must
+                    # not abandon the rest of a 200-image batch half-registered
+                    log.error("[face] batch entry %s failed: %s",
+                              escape_log_text(relative), escape_log_text(error))
+                    results.append({"file": relative, "ok": False,
+                                    "reason": REASON_BAD_INPUT,
+                                    "detail": str(error)})
+                    continue
+                if outcome.get("ok") and group:
+                    groups.setdefault(group, outcome["person_id"])
+                results.append({"file": relative, **outcome})
+
+        registered = sum(1 for item in results if item.get("ok"))
+        failed = len(results) - registered
+        log.info("[face] batch %s: %d registered, %d failed",
+                 escape_log_text(package), registered, failed)
+        return {
+            "ok": True,
+            "source": package,
+            "total": len(results),
+            "registered": registered,
+            "failed": failed,
+            "results": results,
+        }
+
+    # ── roster CRUD ───────────────────────────────────────────────────────
+
+    def _do_list_persons(self, args: dict) -> dict:
+        engine = self._require_engine()
+        return {
+            "ok": True,
+            **engine.db.list_persons(
+                named=str(args.get("named") or "all"),
+                query=str(args.get("query") or ""),
+                limit=int(args.get("limit") or 100),
+                offset=int(args.get("offset") or 0),
+            ),
+        }
+
+    def _do_get_person(self, args: dict) -> dict:
+        person_id = str(args.get("person_id") or "").strip()
+        if not person_id:
+            raise ValueError("person_id is required")
+        engine = self._require_engine()
+        try:
+            return {"ok": True, "person": engine.db.get_person(person_id)}
+        except KeyError:
+            return {"ok": False, "reason": REASON_BAD_INPUT,
+                    "detail": f"no such person: {person_id!r}"}
+
+    def _do_update_person(self, args: dict) -> dict:
+        person_id = str(args.get("person_id") or "").strip()
+        if not person_id:
+            raise ValueError("person_id is required")
+        engine = self._require_engine()
+        try:
+            record = engine.db.update_person(
+                person_id,
+                profile=args.get("profile"),
+                meta=args.get("meta"),
+                meta_delete=args.get("meta_delete") or [],
+                merge=bool(args.get("merge", True)),
+            )
+        except KeyError:
+            return {"ok": False, "reason": REASON_BAD_INPUT,
+                    "detail": f"no such person: {person_id!r}"}
+        except ValueError as error:
+            return {"ok": False, "reason": REASON_BAD_INPUT, "detail": str(error)}
+        return {"ok": True, "person": record}
+
+    def _do_forget(self, args: dict) -> dict:
+        engine = self._require_engine()
+        scope = str(args.get("named") or "").strip().lower()
+        if scope == "unknown" and not args.get("person_id"):
+            removed = engine.db.forget_unknowns()
+            return {"ok": True, "forgotten": removed, "scope": "unknown"}
+
+        person_id = str(args.get("person_id") or "").strip()
+        if not person_id:
+            raise ValueError("person_id is required (or named='unknown')")
+        if engine.db.forget(person_id):
+            return {"ok": True, "forgotten": 1, "person_id": person_id}
+        return {"ok": False, "reason": REASON_BAD_INPUT,
+                "detail": f"no such person: {person_id!r}"}
+
+
+__all__ = [
+    "DEFAULT_MATCH_THRESHOLD",
+    "REASON_AMBIGUOUS",
+    "REASON_BAD_INPUT",
+    "REASON_LOW_QUALITY",
+    "REASON_NO_FACE",
+    "REASON_NO_FRAMES",
+    "FaceRecognitionPlugin",
+    "TOOLS",
+    "select_subject",
+]
