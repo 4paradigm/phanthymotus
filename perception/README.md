@@ -716,9 +716,16 @@ has to change when it lands, because `auto` will pick it up.
 
 #### The onnxruntime version is pinned, and 1.19.x must not be used
 
-`ORT_VERSION` in `/etc/jetpack.env` is pinned per JetPack line to **the same
-version sherpa-onnx bundles** there (jp5.11 → 1.16.x, jp6.1 → 1.18.1), so the two
-runtimes in the process are ABI-identical.
+**One version for both JetPack lines: 1.18.1.** That is what sherpa-onnx bundles on
+jp6.1 (`sherpa_onnx/lib/libonnxruntime.so.1.18.1`), so on that line the two mapped
+runtimes are ABI-identical. It runs on jp5.11 too — its cp38 aarch64 wheel is
+manylinux_2_28 and focal has glibc 2.31 — verified on Orin5 (Ubuntu 20.04, glibc
+2.31, Python 3.8) building a session and inferring. A per-line split was tried
+first and dropped: nothing required it, and one version is one thing to reason
+about.
+
+`ORT_VERSION` is an `ARG` on the onnxruntime step itself, **not** in
+`/etc/jetpack.env`, because that file is layer 2 — see § Where this layer sits.
 
 **onnxruntime 1.19.2 abort()s the whole perception process** during
 `InferenceSession()` on a Jetson where some cores are parked. It enumerates
@@ -740,6 +747,25 @@ precondition has to be in the log *before* the session is created.
 
 Orin6 has `present == online`, so this never reproduces there. Judge it on a robot
 whose power mode parks cores.
+
+#### Where this layer sits, and why that matters more than it looks
+
+The onnxruntime step is the **last of the dependency layers**, below everything
+ASR/TTS/VOP/OCR share and above only the `COPY` of application code.
+
+That placement is the whole safety story. A layer inserted higher up invalidates
+the Docker cache for every layer below it, and several of those install
+**unpinned** — `ultralytics` and `phonemizer` have no version constraint — so they
+silently re-resolve to whatever is newest on the next build. An earlier revision of
+this change put `ORT_VERSION` in `/etc/jetpack.env` near the top of the file, and
+that alone moved `ultralytics` 8.4.138 → 8.4.142 in the built image, with nothing
+to do with face recognition. Measured by diffing `pip freeze` between the old and
+new images.
+
+So the rule for this layer: it must stay below every shared layer, and anything it
+needs must be resolved *in* it. Against `main` the Dockerfile diff is a single
+additive hunk — 74 lines added, **0 removed** — so no shared layer's inputs change
+and no other algorithm's dependencies can drift because of it.
 
 #### Its dependencies are deliberately not installed
 
