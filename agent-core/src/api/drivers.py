@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import fcntl
 import os
+import shutil
 import threading
 import time
 from typing import Optional
@@ -273,6 +274,36 @@ def _deploy_sync(driver: dict) -> dict:
         return _deploy_sync_inner(driver)
 
 
+def _explain_pull_error(message: str) -> str:
+    """Turn a docker error into something an operator can act on.
+
+    Disk exhaustion is the case worth naming: it is common on a 57 GB Jetson
+    holding several ~18 GB perception images, and both the streamed pull error
+    and the misleading `No such image` that follows it are unactionable on
+    their own. The free-space figure comes from the host filesystem, which is
+    bind-mounted, so the number shown is the one that actually ran out.
+    """
+    text = str(message)
+    lowered = text.lower()
+    if 'no space left on device' in lowered or 'disk quota exceeded' in lowered:
+        hint = '磁盘空间不足'
+        try:
+            usage = shutil.disk_usage('/')
+            hint += (
+                f'（{usage.free // (1 << 20)} MiB 可用 / '
+                f'{usage.total // (1 << 30)} GiB 总计）'
+            )
+        except Exception:  # noqa: BLE001 - the hint is best-effort
+            pass
+        return (
+            f'{hint}。请清理旧镜像后重试：'
+            'docker image prune -a && docker builder prune -a'
+        )
+    if 'no such image' in lowered:
+        return f'{text}（本地没有该镜像，通常意味着上一步拉取实际失败）'
+    return text
+
+
 def _deploy_sync_inner(driver: dict) -> dict:
     """Deploy a driver/perception container via docker compose.
 
@@ -302,7 +333,23 @@ def _deploy_sync_inner(driver: dict) -> dict:
     _clear_deploy_log(driver['id'])
     _log_deploy(driver['id'], f'[pull] {target_image}')
     try:
+        pull_error = ''
         for line in client.api.pull(target_image, stream=True, decode=True):
+            # A streamed pull reports failure as a JSON line carrying `error`,
+            # and then ends *normally* — it does not raise. Without this check
+            # a failed pull looks like a successful one, execution falls
+            # through to containers.create() below, and the operator is shown
+            # `404 No such image` instead of the actual cause. That is exactly
+            # what a full disk produced: the real message was
+            # "mkdir /var/lib/containerd/...: no space left on device".
+            if line.get('error') or line.get('errorDetail'):
+                pull_error = (
+                    (line.get('errorDetail') or {}).get('message')
+                    or line.get('error')
+                    or 'unknown pull error'
+                )
+                _log_deploy(driver['id'], f'[pull] error: {pull_error}')
+                continue
             status = line.get('status', '')
             progress = line.get('progress', '')
             layer_id = line.get('id', '')
@@ -315,6 +362,11 @@ def _deploy_sync_inner(driver: dict) -> dict:
         _log_deploy(driver['id'], f'[pull] failed: {e}')
         return {'status': 'error', 'error': f'pull failed: {e}'}
 
+    if pull_error:
+        detail = _explain_pull_error(pull_error)
+        _log_deploy(driver['id'], f'[pull] failed: {detail}')
+        return {'status': 'error', 'error': f'镜像拉取失败: {detail}'}
+
     # Extract service.yml from image
     compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
     compose_file = os.path.join(compose_dir, 'docker-compose.yml')
@@ -322,7 +374,18 @@ def _deploy_sync_inner(driver: dict) -> dict:
     # Ensure compose dir exists (may be a host-mounted volume)
     os.makedirs(compose_dir, exist_ok=True)
 
-    container = client.containers.create(target_image)
+    try:
+        container = client.containers.create(target_image)
+    except Exception as e:
+        # Reached only if the image is absent despite the pull reporting
+        # success. Say so plainly rather than surfacing docker-py's raw
+        # "404 ... No such image", which reads like the registry lacks the tag.
+        detail = _explain_pull_error(str(e))
+        _log_deploy(driver['id'], f'[deploy] image unusable after pull: {detail}')
+        return {
+            'status': 'error',
+            'error': f'镜像拉取后仍不可用: {detail}',
+        }
     try:
         bits, _ = container.get_archive('/deploy/service.yml')
         tar_bytes = b''.join(bits)
