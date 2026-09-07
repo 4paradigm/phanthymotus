@@ -495,12 +495,48 @@ def test_register_from_a_photo_path(plugin, tmp_path):
     assert engine.db.match(_unit(11), 0.35)[0] == "p-1"
 
 
-def test_register_from_base64(plugin):
+def test_base64_input_is_refused_with_a_pointer_to_what_works(plugin):
+    """Removed because an LLM failed on it twice in production: a 43 800-char
+    string does not survive being carried through a model's context, and what
+    arrived was truncated. Refusing loudly beats decoding garbage."""
     import base64
     encoded = base64.b64encode(_FakeFrame.one(12)).decode()
     result = plugin.dispatch("face_recognition", {
         "action": "register_by_photo", "image_b64": encoded, "name": "Bob"})
-    assert result["ok"] is True and result["person_id"] == "p-1"
+    assert result["ok"] is False
+    assert result["reason"] == face_plugin.REASON_BAD_INPUT
+    assert "image_path" in result["detail"]
+    assert "register_by_url" in result["detail"]
+    assert plugin._require_engine().db.stats()["persons"] == 0
+
+
+def test_image_path_is_a_file_picker_field_pointing_at_the_shared_mount():
+    """`format: file` is what makes the canvas render a picker and upload via
+    agent-core's /api/file/upload — the same mechanism remote_image uses. The
+    upload has to land somewhere perception can read, hence uploadDir."""
+    spec = face_plugin.TOOLS[0]["inputSchema"]["properties"]["image_path"]
+    assert spec["format"] == "file"
+    assert spec["accept"] == "image/*"
+    assert spec["uploadDir"] == "/uploads"
+    assert "/uploads" in face_plugin.DEFAULT_IMAGE_ROOTS[0]
+
+
+def test_no_base64_anywhere_on_the_card():
+    schema = face_plugin.TOOLS[0]["inputSchema"]
+    assert "image_b64" not in schema["properties"]
+    for action, spec in schema["x-action-params"].items():
+        assert "image_b64" not in spec["params"], action
+
+
+def test_a_path_outside_the_roots_names_the_shared_mount(plugin):
+    """The first real failure was image_path=/work/daiwen.jpg — a real file in
+    agent-core, invisible here. The error has to say where to put it instead."""
+    result = plugin.dispatch("face_recognition", {
+        "action": "register_by_photo", "image_path": "/work/daiwen.jpg"})
+    assert result["ok"] is False
+    assert result["reason"] == face_plugin.REASON_BAD_INPUT
+    assert "/uploads" in result["detail"]
+    assert "register_by_url" in result["detail"]
 
 
 def test_register_reports_each_failure_reason(plugin, tmp_path):
@@ -1063,8 +1099,7 @@ def test_recognize_actions_are_on_the_card():
     assert {"recognize_by_photo", "recognize_by_stream"} <= actions
     assert actions == set(schema["x-action-params"])
     params = schema["x-action-params"]
-    assert set(params["recognize_by_photo"]["params"]) == {
-        "image_path", "image_b64", "url"}
+    assert set(params["recognize_by_photo"]["params"]) == {"image_path", "url"}
     assert set(params["recognize_by_stream"]["params"]) == {"window_s"}
     # register/recognize are symmetric by suffix.
     assert {"register_by_photo", "register_by_url",

@@ -10,6 +10,12 @@ services:
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
       - /opt/phanthy-motus/data:/work/resource
       - /opt/phanthy-motus:/opt/phanthy-motus
+      # Shared image drop-off, mounted at the same path by perception (see
+      # perception/deploy/service.yml). A `format: file` card field whose schema
+      # sets uploadDir:/uploads lands here, and so do files the LLM downloads
+      # for another container to read. Without it there is no path both
+      # containers can name — /tmp and /work are per-container.
+      - /opt/embodied/uploads:/uploads
     environment:
       - DB_PATH=/work/resource/data.db
       - COMPOSE_DIR=/opt/phanthy-motus

@@ -971,9 +971,45 @@ framed dead-on.
 
 | Action | Input |
 |--------|-------|
-| `register_by_photo` | `image_path` (confined to `image_roots`) or `image_b64`, plus `name` and `profile` |
+| `register_by_photo` | `image_path` — uploaded from the card, or written to `/uploads` (see below) — plus `name` and `profile` |
 | `register_by_stream` | `instance_id` + `name`; analyses **every frame in the last `enroll_window_s`** (default 3 s, up to `enroll_max_analyzed` of them, newest first) |
 | `register_by_corpus` | `package`: a directory, `.zip` or `.tar.gz`, by path or URL |
+
+#### Getting a photo *into* this container
+
+Not obvious, and it produced two real LLM failures before being fixed.
+
+perception and agent-core share **no filesystem** by default: agent-core mounts
+`/opt/phanthy-motus` and `/opt/phanthy-motus/data`, perception mounts `/dev` and
+`/opt/embodied/models`. The intersection is empty, and each container's `/tmp`
+and `/work` is its own. So an LLM that downloads a photo inside agent-core and
+passes `image_path: /work/daiwen.jpg` names a file that genuinely exists — just
+not here. That was the first failure.
+
+Its second attempt was `image_b64`, which failed too: the photo was 43 800
+base64 characters, and that does not survive being carried through a model's own
+context, so what arrived was truncated and the decoder correctly refused it.
+
+**base64 input has therefore been removed.** Both remaining channels pass a
+*reference* instead of the bytes:
+
+| channel | how the file gets here |
+|---|---|
+| `image_path` | written into **`/uploads`**, a host directory both containers mount at the same path (`perception/deploy/service.yml`, `agent-core/deploy/docker-compose.yml`) |
+| `register_by_url` | perception fetches it itself; nothing has to be moved |
+
+The card's `image_path` is declared `"format": "file"` with
+`"uploadDir": "/uploads"`, so the canvas renders a file picker that uploads
+through agent-core's `/api/file/upload` and fills the resulting path back in —
+the same mechanism agent-core's own `remote_image` card uses for `image_file`.
+`uploadDir` is new: that handler hardcoded agent-core's `/tmp/uploads`, which is
+right for a tool agent-core serves itself and invisible to a tool in any other
+container.
+
+Passing `image_b64` now returns a `bad_input` naming the two channels that work,
+and a path outside `image_roots` says to use `/uploads` or `register_by_url`
+rather than only "cannot read" — an LLM told just "not found" retries with
+another invisible path, which is what happened.
 
 `register_by_stream` averages the agreeing frames rather than trusting one
 grab, and refuses with `ambiguous_subject` when fewer than half the usable frames

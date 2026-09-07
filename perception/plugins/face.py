@@ -29,8 +29,6 @@ What this plugin adds over OCR:
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import logging
 import os
@@ -97,7 +95,10 @@ DEFAULT_MAX_BATCH = 200
 # this only has to be larger than any real photo. 64 MB covers a 60 MP
 # uncompressed-ish PNG; the pixel cap is what actually protects memory.
 DEFAULT_MAX_IMAGE_BYTES = 64 * 1024 * 1024
-DEFAULT_IMAGE_ROOTS = ("/models", "/tmp", "/work")
+# /uploads first: it is the only one of these that agent-core also mounts, so
+# it is the only path a caller outside this container can hand over. See
+# deploy/service.yml.
+DEFAULT_IMAGE_ROOTS = ("/uploads", "/models", "/tmp", "/work")
 
 
 def detect_interval(cfg: dict) -> float:
@@ -169,8 +170,14 @@ TOOLS = [
                     "type": "string",
                     "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)",
                 },
-                "image_path": {"type": "string", "description": "容器内可读的图片路径，如 /tmp/alice.jpg。常见格式都支持（jpg/png/bmp/webp/tiff/gif...），过大的图会在本地缩放，不需要预先处理"},
-                "image_b64":  {"type": "string", "description": "Base64 编码的图片字节（不含 data: 前缀）"},
+                # `format: file` makes the canvas render a file picker that
+                # uploads through agent-core's /api/file/upload and fills the
+                # resulting path back in — the same mechanism agent-core's own
+                # `remote_image` card uses for `image_file`. The upload lands in
+                # a directory both containers mount (see image_roots below), so
+                # the path this card receives is one perception can actually
+                # open.
+                "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadDir": "/uploads", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/alice.jpg）。常见格式都支持（jpg/png/bmp/webp/tiff/gif...），过大的图会本地缩放，不需要预处理"},
                 "url":        {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/alice.jpg。下载后本地解码缩放，格式限制同 image_path"},
                 "name":       {"type": "string", "description": "姓名（结构化），如 \"小王\"。有 name 才算已注册；每次识别都会随 id 一起输出"},
                 "profile":    {"type": "object", "description": "非结构化画像对象，如 {\"gender\":\"male\",\"team\":\"运营部\",\"note\":\"常穿蓝色外套\"}。键名自定，随 name 一起在每帧输出；传字符串会被存成 {\"note\":\"...\"}"},
@@ -194,7 +201,7 @@ TOOLS = [
                 "info":   {"params": ["input_topic"], "description": "Report state, topics and database statistics"},
                 "config": {"params": [], "description": "Update configuration"},
                 "register_by_photo": {
-                    "params": ["image_path", "image_b64", "name", "profile"],
+                    "params": ["image_path", "name", "profile"],
                     "description": "Register a person from one photo. Fails with a reason when there is no face, no clear face, or no obvious subject",
                 },
                 "register_by_url": {
@@ -210,7 +217,7 @@ TOOLS = [
                     "description": "Register many people from a package of photos; returns a per-photo result saying which succeeded and why the others did not",
                 },
                 "recognize_by_photo": {
-                    "params": ["image_path", "image_b64", "url"],
+                    "params": ["image_path", "url"],
                     "description": "认出照片里的人 — 只读，不写库：返回每张人脸的 id/name/profile 与相似度，不会登记陌生人",
                 },
                 "recognize_by_stream": {
@@ -517,33 +524,37 @@ def _worst_reason(failures: list[dict]) -> dict:
 # ── image sources ─────────────────────────────────────────────────────────────
 
 def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
-    """Read image bytes from `url`, `image_b64` or `image_path`.
+    """Read image bytes from `url` or `image_path`.
+
+    **Deliberately no base64 input.** It was there, and an LLM failed on it
+    twice in production: a 43 800-character string is not something a model can
+    carry through its own context reliably, and what arrived was truncated, so
+    the decoder correctly refused it. Both remaining channels move a *reference*
+    instead of the bytes.
 
     The byte ceiling here is a transfer/memory guard, not a policy limit: an
     image that is merely *large* is downscaled and converted locally by
     `FaceAnalyzer.decode_image`, because "your photo is 24 MB" or "we only take
     JPEG" is a limitation of ours rather than a property of their photo.
 
-    `url` is a distinct action (`register_by_url`) rather than a parameter
-    smuggled into the photo path, so the capability is visible on the card.
-    Note it does let a caller make this container issue an outbound request —
+    `url` is its own action (`register_by_url`) rather than a parameter
+    smuggled into the photo path, so the capability is visible on the card. Note
+    it does let a caller make this container issue an outbound request —
     acceptable for a deliberate, named action, which is why it is not folded
     into the generic input.
     """
     max_bytes = int(cfg.get("max_image_bytes", DEFAULT_MAX_IMAGE_BYTES))
 
-    encoded = args.get("image_b64")
-    if encoded:
-        try:
-            data = base64.b64decode(str(encoded), validate=True)
-        except (binascii.Error, ValueError) as error:
-            raise _BadInput(f"image_b64 is not valid base64: {error}", "image_b64")
-        if len(data) > max_bytes:
-            raise _BadInput(
-                f"image is {len(data)} bytes, over the {max_bytes} byte transfer "
-                "cap (raise max_image_bytes if this is a real photo)", "image_b64"
-            )
-        return data, "image_b64"
+    if args.get("image_b64"):
+        # Say what to do instead, rather than silently ignoring the argument:
+        # the model that reaches for base64 has the file in hand already.
+        raise _BadInput(
+            "image_b64 is no longer accepted — a long base64 string does not "
+            "survive being carried through an LLM's context. Use image_path "
+            "(upload from the card, or write the file into a directory both "
+            "agent-core and perception mount) or register_by_url instead.",
+            "image_b64",
+        )
 
     url = args.get("url") or args.get("image_url")
     if url:
@@ -553,7 +564,7 @@ def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
     if path:
         return _read_local(str(path), cfg, max_bytes), str(path)
 
-    raise _BadInput("one of url, image_path or image_b64 is required")
+    raise _BadInput("one of image_path or url is required")
 
 
 def _image_roots(cfg: dict) -> tuple[str, ...]:
@@ -573,14 +584,23 @@ def _check_under_roots(path: str, cfg: dict) -> str:
     roots = _image_roots(cfg)
     if any(resolved == root or resolved.startswith(root + os.sep) for root in roots):
         return resolved
+    # A caller that names a plausible-but-invisible path is almost always
+    # another container's filesystem — agent-core's /work and /tmp are its own,
+    # which is exactly how the first LLM attempt failed. Say where to put it.
     raise _BadInput(
-        f"path must be under one of {', '.join(roots)}: got {path!r}", path
+        f"path must be under one of {', '.join(roots)}: got {path!r}. "
+        "If you are writing the file from another container (e.g. agent-core), "
+        "write it to /uploads — that directory is mounted into both — or use "
+        "register_by_url.",
+        path,
     )
 
 
 def _read_local(path: str, cfg: dict, max_bytes: int) -> bytes:
     resolved = _check_under_roots(path, cfg)
     try:
+        if os.path.isdir(resolved):
+            raise _BadInput(f"{path!r} is a directory, not an image", path)
         size = os.path.getsize(resolved)
         if size > max_bytes:
             raise _BadInput(

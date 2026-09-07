@@ -146,7 +146,10 @@ plugins:
     max_image_bytes: 67108864
     # Caller-supplied image/package paths are confined to these roots — the MCP
     # server has no authentication and runs as root in the container.
-    image_roots: ["/models", "/tmp", "/work"]
+    # /uploads is the cross-container drop-off (see deploy/service.yml): the
+    # canvas file picker and the LLM both put images there, and it is the only
+    # one of these paths agent-core can also see.
+    image_roots: ["/uploads", "/models", "/tmp", "/work"]
     # 检测频率: how many detections per second. Fractional is the point —
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0
