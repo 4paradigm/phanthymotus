@@ -151,13 +151,12 @@ TOOLS = [
                     "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)",
                 },
                 "image_path": {"type": "string", "description": "Path to a JPEG/PNG readable by this container"},
-                "image_url":  {"type": "string", "description": "http(s) URL of a JPEG/PNG"},
                 "image_b64":  {"type": "string", "description": "Base64-encoded JPEG/PNG bytes"},
                 "profile":    {"type": "string", "description": "Who this person is — free text shown alongside the id on every sighting"},
                 "meta":       {"type": "object", "description": "Free-form metadata object (department, tags, notes...)"},
                 "meta_delete": {"type": "array", "items": {"type": "string"}, "description": "Meta keys to remove"},
                 "merge":      {"type": "boolean", "description": "Merge meta into the existing object (default true) instead of replacing it"},
-                "person_id":  {"type": "string", "description": "Existing person id — use an unknown-N id to give that identity a name"},
+                "person_id":  {"type": "string", "description": "Existing person id (p-N or unknown-N)"},
                 "window_s":   {"type": "number", "description": "Seconds of recent stream to analyse (default 3.0, capped by enroll_window_s)"},
                 "package":    {"type": "string", "description": "Directory, .zip or .tar.gz path/URL holding photos plus an optional manifest.json"},
                 "named":      {"type": "string", "enum": ["all", "named", "unknown"], "description": "Filter the roster (default all); with action=forget, 'unknown' clears every anonymous entry"},
@@ -172,11 +171,11 @@ TOOLS = [
                 "info":   {"params": ["input_topic"], "description": "Report state, topics and database statistics"},
                 "config": {"params": [], "description": "Update configuration"},
                 "register_user_photo": {
-                    "params": ["image_path", "image_url", "image_b64", "profile", "meta", "person_id"],
+                    "params": ["image_path", "image_b64", "profile", "meta"],
                     "description": "Register a person from one photo. Fails with a reason when there is no face, no clear face, or no obvious subject",
                 },
                 "register_current_stream": {
-                    "params": ["profile", "meta", "person_id", "window_s"],
+                    "params": ["profile", "meta", "window_s"],
                     "description": "Register the person currently in front of the camera, using the last few seconds of the live stream",
                 },
                 "register_user_photos": {
@@ -469,7 +468,13 @@ def _worst_reason(failures: list[dict]) -> dict:
 # ── image sources ─────────────────────────────────────────────────────────────
 
 def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
-    """Fetch image bytes from whichever of the three sources was given."""
+    """Read image bytes from `image_b64` or `image_path`.
+
+    No URL source: the dashboard has no file-upload widget, so a path (confined
+    to `image_roots`) and inline base64 are what a caller actually has. Adding a
+    URL fetch would also give an unauthenticated LAN caller a request-forging
+    primitive from inside the robot's network for no benefit.
+    """
     max_bytes = int(cfg.get("max_image_bytes", DEFAULT_MAX_IMAGE_BYTES))
 
     encoded = args.get("image_b64")
@@ -484,15 +489,11 @@ def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
             )
         return data, "image_b64"
 
-    url = args.get("image_url")
-    if url:
-        return _fetch_url(str(url), max_bytes), str(url)
-
     path = args.get("image_path")
     if path:
         return _read_local(str(path), cfg, max_bytes), str(path)
 
-    raise _BadInput("one of image_path, image_url or image_b64 is required")
+    raise _BadInput("one of image_path or image_b64 is required")
 
 
 def _image_roots(cfg: dict) -> tuple[str, ...]:
@@ -885,9 +886,10 @@ class _FaceNode(Node):
 
     def _recognise_to_payload(self, image_bytes: bytes, timestamp: float) -> dict:
         started = time.time()
+        # No `topic` field: a subscriber already knows which topic it read
+        # this from, and OCR's build_ocr_payload does not carry one either.
         payload: dict[str, Any] = {
             "ts": timestamp,
-            "topic": self._input_topic,
             "count": 0,
             "faces": [],
         }
@@ -1588,9 +1590,15 @@ class FaceRecognitionPlugin:
         embedding, failure = self._analyze_subject(engine, data, gates)
         if embedding is None:
             return {**failure, "source": source}
+        # No person_id input: which identity a photo belongs to is decided by
+        # matching, not by the caller. A face that matches an existing person
+        # becomes another sample of them; one that matches an unknown-N promotes
+        # that entry in place. Naming an identity after the fact is
+        # `update_person`, and grouping several photos under one person is the
+        # batch manifest's `person` key.
         result = self._commit_enrolment(
             engine, [embedding], str(args.get("profile") or ""),
-            args.get("meta"), args.get("person_id") or None, gates,
+            args.get("meta"), None, gates,
         )
         if result.get("ok"):
             log.info("[face] registered %s from %s: %s", result["person_id"],
@@ -1685,7 +1693,7 @@ class FaceRecognitionPlugin:
 
         result = self._commit_enrolment(
             engine, agreeing, str(args.get("profile") or ""),
-            args.get("meta"), args.get("person_id") or None, gates,
+            args.get("meta"), None, gates,
         )
         if result.get("ok"):
             log.info("[face] registered %s from the live stream (%d/%d frames): %s",

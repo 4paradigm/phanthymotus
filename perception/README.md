@@ -883,7 +883,7 @@ framed dead-on.
 
 | Action | Input |
 |--------|-------|
-| `register_user_photo` | `image_path` (confined to `image_roots`) / `image_url` / `image_b64`, plus `profile`, `meta`, optional `person_id` |
+| `register_user_photo` | `image_path` (confined to `image_roots`) or `image_b64`, plus `profile` and `meta` |
 | `register_current_stream` | `instance_id` + `profile`; analyses **every frame in the last `enroll_window_s`** (default 3 s, up to `enroll_max_analyzed` of them, newest first) |
 | `register_user_photos` | `package`: a directory, `.zip` or `.tar.gz`, by path or URL |
 

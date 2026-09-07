@@ -941,3 +941,47 @@ def test_device_is_declared_on_the_card_with_auto_default():
     schema = face_plugin.TOOLS[0]["configSchema"]["properties"]["device"]
     assert schema["default"] == "auto"
     assert set(schema["enum"]) == {"auto", "cpu", "gpu"}
+
+
+# ── card surface invariants ──────────────────────────────────────────────────
+
+def test_no_image_url_input():
+    """A URL fetch would give an unauthenticated LAN caller a request-forging
+    primitive inside the robot's network, for no benefit over path/base64."""
+    schema = face_plugin.TOOLS[0]["inputSchema"]
+    assert "image_url" not in schema["properties"]
+    for spec in schema["x-action-params"].values():
+        assert "image_url" not in spec["params"]
+
+
+def test_register_actions_take_no_person_id():
+    """Which identity a photo belongs to is decided by matching, not by the
+    caller — otherwise there are two ways to say it and they can disagree."""
+    params = face_plugin.TOOLS[0]["inputSchema"]["x-action-params"]
+    assert "person_id" not in params["register_user_photo"]["params"]
+    assert "person_id" not in params["register_current_stream"]["params"]
+    # It remains an input where it identifies an existing record.
+    for action in ("get_person", "update_person", "forget"):
+        assert "person_id" in params[action]["params"]
+
+
+def test_register_ignores_a_person_id_argument(plugin, tmp_path):
+    """Passing it anyway must not bypass matching."""
+    engine = plugin._require_engine()
+    engine.db.add("Someone else", [_unit(200)])
+    path = _write_photo(tmp_path, "x.jpg", _FakeFrame.one(201))
+
+    result = plugin.dispatch("face_recognition", {
+        "action": "register_user_photo", "image_path": path,
+        "profile": "New person", "person_id": "p-1"})
+    assert result["ok"] is True
+    assert result["person_id"] == "p-2", "person_id must not force the identity"
+    assert engine.db.get_person("p-1")["profile"] == "Someone else"
+
+
+def test_published_payload_carries_no_topic_field(plugin):
+    """A subscriber already knows the topic it read from, and OCR's payload
+    does not carry one either."""
+    _node, payloads = _run_one_frame(plugin, _FakeFrame.one(210))
+    assert "topic" not in payloads[0]
+    assert set(payloads[0]) == {"ts", "count", "faces", "latency_ms"}

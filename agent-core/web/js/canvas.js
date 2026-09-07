@@ -986,6 +986,13 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             if (!key || key === 'action') return;
             field.style.display = paramKeys.includes(key) ? '' : 'none';
           });
+          // Showing/hiding fields changes the card's height, which moves every
+          // port on it. _redrawConnections reads live getBoundingClientRect,
+          // so it is correct whenever it runs — it just was not running here,
+          // leaving connection lines anchored to where the ports used to be.
+          // Most visible on a tool whose actions differ a lot in parameter
+          // count (face_recognition: 4 params for list_persons, 0 for stop).
+          _redrawConnections();
         };
         actionSelect.addEventListener('change', async () => {
           if (!(await _ensureEdit())) {
