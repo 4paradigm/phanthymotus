@@ -486,6 +486,84 @@ def _get_tool_config(mcp_id: str, tool_name: str) -> dict | None:
     return config.main.get(f'tool_config:{mcp_id}:{tool_name}', None)
 
 
+async def _transfer_file_args(
+    mcp_id: str, url: str, input_schema: dict, args: dict
+) -> tuple[dict, str | None]:
+    """Send any `format: file` argument to the target service; rewrite the path.
+
+    Returns `(args, error)`. `error` is a message for the model when the file
+    cannot be handed over — it must not fall through to the tool, or the tool
+    reports "cannot read <path>" and the model retries with another path it
+    invented, which is the loop this exists to break.
+
+    Already-remote values are left alone: an operator who used the canvas picker
+    has a path in the *target's* namespace, and re-sending it would fail (it does
+    not exist here). The test is simply whether the file exists locally.
+    """
+    properties = (input_schema.get('properties') or {})
+    file_keys = [
+        key for key, spec in properties.items()
+        if isinstance(spec, dict) and spec.get('format') == 'file'
+    ]
+    if not file_keys:
+        return args, None
+
+    import os
+
+    updated = dict(args)
+    for key in file_keys:
+        local_path = updated.get(key)
+        if not local_path or not isinstance(local_path, str):
+            continue
+        if not os.path.isfile(local_path):
+            # Not a local file. Either it is already the target's path (the
+            # canvas picker's output, or a second call reusing an earlier
+            # result), or the model invented it. Let the tool answer — it knows
+            # its own filesystem, and its error names the upload mechanism.
+            continue
+        try:
+            remote_path = await _push_file(mcp_id, url, local_path)
+        except Exception as error:  # noqa: BLE001 - reported to the model
+            return updated, (
+                f'Error: could not send {local_path!r} to {mcp_id}: {error}. '
+                f'The service may be running an image without the /file/upload '
+                f'endpoint; check its version, or pass a URL if the tool takes one.'
+            )
+        print(f'[mcp] {key}: sent {local_path} → {mcp_id}:{remote_path}')
+        updated[key] = remote_path
+    return updated, None
+
+
+async def _push_file(mcp_id: str, url: str, local_path: str) -> str:
+    """Upload one local file to a service's /file/upload; return its path there.
+
+    Streams from disk rather than reading the file in: a photo can be tens of
+    megabytes and this process runs on a 7.4 GB robot alongside everything else.
+    """
+    import os
+
+    base = url.rsplit('/mcp', 1)[0] if url.endswith('/mcp') else url.rstrip('/')
+    endpoint = f'{base}/file/upload'
+
+    import auth
+    token = auth.get_token()
+    headers = {'X-Access-Token': token} if token else {}
+
+    form = aiohttp.FormData()
+    with open(local_path, 'rb') as handle:
+        form.add_field('file', handle, filename=os.path.basename(local_path))
+        timeout = aiohttp.ClientTimeout(total=180)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(endpoint, data=form, headers=headers) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f'HTTP {resp.status}: {text[:300]}')
+                payload = json.loads(text)
+    if not payload.get('ok') or not payload.get('path'):
+        raise RuntimeError(payload.get('error') or 'upload rejected')
+    return payload['path']
+
+
 async def call_tool(full_name: str, args: dict) -> str:
     """
     调用 MCP 工具。full_name 格式: 'mcp__<mcp_id>__<tool_name>'
@@ -567,8 +645,26 @@ async def call_tool(full_name: str, args: dict) -> str:
     if trace_id:
         args['_trace_id'] = trace_id  # _trace_id 保留给 driver（driver 需要）
 
-    # ── 参数校验：按工具声明的 inputSchema 验证 LLM 生成的参数 ──────────────
+    # ── 文件参数：本地路径 → 目标服务内的路径 ──────────────────────────────
+    # Runs before validation, because the value the LLM supplied is a path in
+    # *this* container and the tool needs one in its own.
+    #
+    # The browser has had this since `format: file` existed: the canvas renders a
+    # picker and uploads through /api/mcp/<id>/file/upload. The LLM had no
+    # equivalent, so it could only guess — and it guessed wrong twice in
+    # production, passing /work/dai_wenyuan_1.jpeg for a file it had just
+    # downloaded to /tmp. Nothing about that is specific to face recognition, so
+    # the transfer belongs here, at the one point every MCP call passes through,
+    # rather than in any one card: a future tool that declares `format: file`
+    # gets it without knowing this code exists.
     input_schema = info.get('input_schemas', {}).get(full_name)
+    if input_schema:
+        args, transfer_error = await _transfer_file_args(
+            mcp_id, url, input_schema, args)
+        if transfer_error:
+            return transfer_error
+
+    # ── 参数校验：按工具声明的 inputSchema 验证 LLM 生成的参数 ──────────────
     if input_schema:
         try:
             jsonschema.validate(instance=args, schema=input_schema)

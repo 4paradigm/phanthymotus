@@ -160,7 +160,8 @@ TOOLS = [
                         "start", "stop", "info", "config",
                         "register_by_photo", "register_by_url",
                         "register_by_stream", "register_by_corpus",
-                        "recognize_by_photo", "recognize_by_stream",
+                        "recognize_by_photo", "recognize_by_url",
+                        "recognize_by_stream",
                         "list_persons", "get_person", "update_person", "forget",
                         "list_visits",
                     ],
@@ -216,8 +217,12 @@ TOOLS = [
                     "description": "Register many people from a package of photos; returns a per-photo result saying which succeeded and why the others did not",
                 },
                 "recognize_by_photo": {
-                    "params": ["image_path", "url"],
+                    "params": ["image_path"],
                     "description": "认出照片里的人 — 只读，不写库：返回每张人脸的 id/name/profile 与相似度，不会登记陌生人",
+                },
+                "recognize_by_url": {
+                    "params": ["url"],
+                    "description": "认出图片 URL 里的人 — 只读，不写库。和 recognize_by_photo 相同，只是图片来自 http(s) 而非本地文件",
                 },
                 "recognize_by_stream": {
                     "params": ["window_s"],
@@ -1282,7 +1287,7 @@ class FaceRecognitionPlugin:
             return self._do_register_by_stream(instance_id, args)
         if action == "register_by_corpus":
             return self._do_register_by_corpus(args)
-        if action == "recognize_by_photo":
+        if action in ("recognize_by_photo", "recognize_by_url"):
             return self._do_recognize_by_photo(args)
         if action == "recognize_by_stream":
             return self._do_recognize_by_stream(instance_id, args)

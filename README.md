@@ -271,6 +271,108 @@ The Agent Core is designed for **continuous operation over days or months**. The
 - **Daily auto-summary** — a scheduled subagent generates daily reports covering user interactions, task completion, anomalies, performance review, and skill discovery opportunities.
 - **Prefix caching optimized** — stable system prompt (L1 + L2-static) is frozen per turn; dynamic status is minimal and placed in user messages to maximize LLM prefix cache hits.
 
+## File Arguments (`format: file`)
+
+A tool that needs a file — a photo to enrol a face, an audio clip to play —
+cannot simply be handed a path. The service that reads it usually runs in a
+**different container**, and containers share no filesystem here: agent-core
+mounts `/opt/phanthy-motus`, perception mounts `/opt/embodied/models`, and each
+one's `/tmp` and `/work` is its own. A path minted on one side is meaningless on
+the other.
+
+### Declaring one
+
+Mark the parameter in the tool's `inputSchema`:
+
+```python
+"image_path": {
+    "type": "string",
+    "format": "file",        # → the canvas renders a file picker
+    "accept": "image/*",     # → picker filter
+    "uploadTo": "mcp",       # → route the upload to *this* service
+    "description": "...",
+},
+```
+
+`uploadTo: "mcp"` is the important one. Omit it and the browser uploads into
+agent-core's own `/tmp/uploads`, which is correct only for a tool agent-core
+serves itself (`remote_image`, `remote_audio`) and invisible to anything else.
+
+### How the file actually moves
+
+```
+browser ──pick──▶ agent-core  POST /api/mcp/{mcp_id}/file/upload
+LLM ─────path──▶      │   address resolved from the MCP registry;
+                      │   body streamed on in 1 MiB chunks
+                      ▼
+                 the service  POST /file/upload
+                      │   writes it somewhere it can see
+                      ▼
+              ◀──reply── {"path": "/models/uploads/2026-09-08/alice.jpg"}
+                  that path becomes the tool argument, verbatim
+```
+
+The reply carries the path **in the receiving container's own namespace**, so
+there is one viewpoint and nothing to translate. No shared mount, and therefore
+no container recreation to enable it.
+
+The target's address comes from the MCP registry — every service reports `url`
+when it registers — so one route covers perception, actucore and every driver
+even though their ports all differ.
+
+### Two callers, one pipeline
+
+**Browser**: the canvas picker uploads and fills the returned path into the
+field. This has worked since `format: file` existed.
+
+**LLM**: it has no picker, so `mcp_client.call_tool` does it. Before validating
+arguments, any parameter declared `format: file` whose value is a file that
+exists **locally** is uploaded, and the argument is rewritten to the path the
+service returned. A value that is not a local file is passed through untouched —
+it is either already the target's path (the picker's output, or a second call
+reusing an earlier result) or something the model invented, and the tool's own
+error is the better answer.
+
+This lives in `call_tool`, the single point every MCP call passes through, **not
+in any card**. A tool added later gets the behaviour without knowing the code
+exists. It also survives `x-action-params` splitting, which rebuilds each
+action's properties from the parent schema (there is a test pinning that: drop
+`format` there and no split tool would ever be recognised).
+
+### Why not the alternatives
+
+**base64 in the argument.** Tried, and it failed in production: a 43 800
+character string does not survive being carried through an LLM's context, and
+what arrived was truncated.
+
+**A shared host mount.** Works, but needs every participating container
+recreated (Docker fixes mounts at creation), one host directory per pairing, and
+leaves the path ambiguous — `/uploads` here, something else there.
+
+**Letting the model guess.** This was the status quo, and the model guessed
+wrong twice: it downloaded a photo to `/tmp` and then passed
+`/work/dai_wenyuan_1.jpeg`. Told only "cannot read", it retried with another
+invisible path.
+
+### Receiving end
+
+`perception/utils/file_intake.py` implements `POST /file/upload` and is
+deliberately **stdlib-only**, because the drivers run a bare
+`ThreadingHTTPServer` rather than FastAPI and can adopt the identical endpoint in
+about five lines. Only perception has it today; the contract is fixed for the
+rest.
+
+Its behaviour, each point with a test:
+
+| | |
+|---|---|
+| size capped **while** writing | an oversized body is never fully committed or buffered |
+| `.part` then rename | a reader listing the directory never sees half a file |
+| filename → one component, CJK kept | users name files in Chinese; NFC-normalised so a macOS and a Linux upload of one name agree |
+| `subdir` refused, not sanitised | `../escape` became `.._escape` — a valid name, so the write succeeded somewhere unasked-for, silently |
+| pruned after `retention_days` (7) | uploads are a transfer buffer; enrolment keeps the *embedding*, never the photo |
+| `ACCESS_TOKEN` honoured when set | today perception is not given one, and the same port already serves `tools/call` — so this is reachability-gated, and the check is ready for when a token is wired in |
+
 ## Web Dashboard
 
 The dashboard at `http://<device-ip>:15678` provides:

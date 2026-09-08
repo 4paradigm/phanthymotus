@@ -1099,10 +1099,12 @@ def test_payload_reports_name_and_profile_but_no_timestamps(plugin):
 def test_recognize_actions_are_on_the_card():
     schema = face_plugin.TOOLS[0]["inputSchema"]
     actions = set(schema["properties"]["action"]["enum"])
-    assert {"recognize_by_photo", "recognize_by_stream"} <= actions
+    assert {"recognize_by_photo", "recognize_by_url",
+            "recognize_by_stream"} <= actions
     assert actions == set(schema["x-action-params"])
     params = schema["x-action-params"]
-    assert set(params["recognize_by_photo"]["params"]) == {"image_path", "url"}
+    assert set(params["recognize_by_photo"]["params"]) == {"image_path"}
+    assert set(params["recognize_by_url"]["params"]) == {"url"}
     assert set(params["recognize_by_stream"]["params"]) == {"window_s"}
     # register/recognize are symmetric by suffix.
     assert {"register_by_photo", "register_by_url",
@@ -1350,14 +1352,14 @@ def test_register_by_url_surfaces_a_fetch_failure(plugin, monkeypatch):
     assert "timed out" in result["detail"]
 
 
-def test_recognize_by_photo_also_accepts_a_url(plugin, monkeypatch):
+def test_recognize_by_url_is_its_own_action(plugin, monkeypatch):
     engine = plugin._require_engine()
     engine.db.add("Bob", [_unit(610)])
     monkeypatch.setattr(face_plugin, '_fetch_url',
                         lambda url, max_bytes: _FakeFrame.one(610))
 
     result = plugin.dispatch("face_recognition", {
-        "action": "recognize_by_photo", "url": "https://example.com/b.jpg"})
+        "action": "recognize_by_url", "url": "https://example.com/b.jpg"})
     assert result["ok"] is True
     assert result["faces"][0]["name"] == "Bob"
 
