@@ -535,6 +535,7 @@ async def _do_ping(mcp_id: str) -> dict:
     """Core ping logic — fetch capabilities, persist, notify inspector.
     Returns the same dict as the ping endpoint's data field.
     Raises HTTPException(404) if mcp_id not found."""
+    import mcp_client
     mcps = _get_mcp_list()
     target = next((m for m in mcps if m.get('id') == mcp_id), None)
     if not target:
@@ -731,6 +732,13 @@ async def _do_ping(mcp_id: str) -> dict:
     # Auto-restore saved configs when device comes online (first ping or after offline)
     if not was_online:
         asyncio.create_task(_restore_saved_configs(mcp_id, url, caps['tools']))
+
+    # Populate mcp_client.registry with schemas for file upload interception and validation
+    # Call _connect_one if registry lacks input_schemas (e.g. after container restart, or first ping)
+    needs_schemas = not mcp_client.registry.get(mcp_id, {}).get('input_schemas')
+    if needs_schemas:
+        server_name = caps.get('server_name', mcp_id)
+        asyncio.create_task(mcp_client._connect_one(mcp_id, server_name, url, render_hint))
 
     ws_path = ('/ws/bus' + topic_out[0].get('topic', '')) if topic_out else ''
     return {
