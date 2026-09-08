@@ -1565,7 +1565,10 @@ async function _startProject() {
 
   // Subscribe to startup progress events
   let modal = null;
-  let itemIndex = {};  // tool_name -> index in modal
+  let itemIndex = new Map();
+  // Tool names identify capabilities; instance IDs identify the actual cards.
+  // Empty instance IDs preserve old single-card event payloads.
+  const itemKey = item => JSON.stringify([item.mcp_id, item.tool, item.instance_id || '']);
   // Cards that accepted start but are still loading a model (perception TTS/OCR
   // fetch and warm one up). The backend settles them with a later ready/error
   // event, so the subscription has to outlive project_start_done — otherwise
@@ -1583,12 +1586,13 @@ async function _startProject() {
     const p = event.payload || {};
     if (event.type === 'project_start_begin') {
       const cards = p.cards || [];
-      const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
+      const items = cards.map(c => ({ card: { id: c.instance_id, toolName: c.tool, mcpId: c.mcp_id } }));
       modal = _showStartupModal(items);
-      cards.forEach((c, i) => { itemIndex[`${c.mcp_id}:${c.tool}`] = i; });
+      itemIndex = new Map(cards.map((c, i) => [itemKey(c), i]));
     } else if (event.type === 'project_start_item') {
-      const key = `${p.mcp_id}:${p.tool}`;
-      const idx = itemIndex[key];
+      const key = itemKey(p);
+      const idx = itemIndex.get(key);
+      if (idx === undefined) return;
       // Anything other than 'loading' is terminal for the wait: ready, error,
       // cancelled, or a status added later.
       if (p.status === 'loading') loading.add(key);
@@ -1758,6 +1762,7 @@ function _showStartupModal(items) {
   items.forEach(({ card }) => {
     const li = document.createElement('li');
     li.className = 'startup-modal-item';
+    li.title = card.id || '';
     li.innerHTML = `<span class="startup-dot"></span><span class="startup-name">${card.toolName}</span><span class="startup-status">等待启动</span>`;
     list.appendChild(li);
     dots.push(li.querySelector('.startup-dot'));

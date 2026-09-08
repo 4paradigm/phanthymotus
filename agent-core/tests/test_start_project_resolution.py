@@ -9,6 +9,7 @@ get it wrong and the fake cannot answer, exactly as on the robot.
 Run: cd agent-core && python3 -m pytest tests/test_start_project_resolution.py
 """
 import asyncio
+import json
 import os
 import pathlib
 import sys
@@ -239,3 +240,72 @@ def test_a_live_answer_beats_a_stale_persisted_one(driver):
     }
     assert _start(layout) is True
     assert driver.starts[CORE]['input_topic'] == '/ubuntu/mic/audio'
+
+
+@pytest.mark.parametrize('failure', [None, 'response', 'exception'])
+def test_same_name_camera_instances_have_independent_startup_events(driver, monkeypatch, failure):
+    ids = ['camera-rgb', 'camera-depth', 'camera-ir']
+    channels = dict(zip(ids, ['rgb', 'depth', 'infrared']))
+    started, registered = [], []
+
+    async def call(mcp_id, req):
+        cid = req.arguments['instance_id']
+        action = req.arguments['action']
+        if action == 'start':
+            started.append(cid)
+            if cid == ids[1]:
+                if failure == 'response':
+                    return {'code': 500, 'message': 'Camera failed'}
+                if failure == 'exception':
+                    raise RuntimeError('Camera disconnected')
+        channel = channels[cid]
+        payload = {'state': 'idle' if action == 'stop' else 'running',
+                   'topic_out': [{'topic': f'/robot/ext_camera/{cid}/{channel}',
+                                  'format': 'image/depth-zlib' if channel == 'depth' else 'image/jpeg'}]}
+        return {'code': 200, 'data': [{'type': 'text', 'text': json.dumps(payload)}]}
+
+    async def register(topic, fmt, mcp_id):
+        registered.append((topic, fmt))
+
+    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', call)
+    monkeypatch.setattr(sys.modules['api.inspection'], 'register_topic_internal', register)
+    assert _start({'cards': [_card(cid, 'ext_camera') for cid in ids], 'connections': []}) is (failure is None)
+    assert started == ids  # The real scheduler must call all three instances.
+    begin = next(e['payload'] for e in driver.events if e['type'] == 'project_start_begin')
+    assert [c.get('instance_id') for c in begin['cards']] == ids
+    progress = [e['payload'] for e in driver.events if e['type'] == 'project_start_item']
+    assert all(e.get('instance_id') in ids for e in progress)
+    for cid in ids:
+        states = [e['status'] for e in progress if e['instance_id'] == cid]
+        assert states == ['starting', 'error' if failure and cid == ids[1] else 'ready']
+    if failure is None:
+        assert registered == [(f'/robot/ext_camera/{cid}/{channels[cid]}',
+                               'image/depth-zlib' if channels[cid] == 'depth' else 'image/jpeg') for cid in ids]
+
+
+def test_late_loading_outcomes_keep_their_instance_identity(driver, monkeypatch):
+    ids = ['loading-a', 'loading-b', 'loading-c']
+    outcomes = dict(zip(ids, ['running', 'idle', 'error']))
+
+    async def call(mcp_id, req):
+        cid = req.arguments['instance_id']
+        state = 'loading' if req.arguments['action'] == 'start' else outcomes[cid]
+        return {'code': 200, 'data': {'state': state}}
+
+    async def no_delay(seconds):
+        pass
+
+    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', call)
+    monkeypatch.setattr(asyncio, 'sleep', no_delay)
+    config.main['canvas_layout'] = {'cards': [_card(cid, 'tts') for cid in ids], 'connections': []}
+
+    async def run():
+        assert await config_api._do_start_project() is True
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        await asyncio.gather(*pending)
+
+    asyncio.run(run())
+    events = [e['payload'] for e in driver.events if e['type'] == 'project_start_item']
+    assert all(e.get('instance_id') in ids for e in events)
+    for cid, terminal in zip(ids, ['ready', 'cancelled', 'error']):
+        assert [e['status'] for e in events if e['instance_id'] == cid] == ['starting', 'loading', terminal]
