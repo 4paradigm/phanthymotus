@@ -3,7 +3,8 @@
 plugins/face.py — FaceRecognitionPlugin: 人脸注册与持续识别。
 
 订阅 image/jpeg topic，持续识别画面中的人脸并发布身份到 ROS2 topic；
-已注册的人输出 id 与 profile，未注册的人输出稳定的 unknown-{id}。
+已注册的人输出 id、name 与 profile，未命名的人输出稳定的 id 但 name 为空。
+所有人的 id 都使用统一的 p-N 格式，通过 name 字段是否为空来区分已命名/未命名。
 
 Lifecycle, locking and the start/stop/config state machine are copied from
 `plugins/ocr.py`, which is the reference implementation of the rules in
@@ -185,8 +186,8 @@ TOOLS = [
                 "merge":      {"type": "boolean", "description": "profile 合并进已有对象（默认 true），false 为整体替换"},
                 "since":      {"type": "string", "description": "起始时间，epoch 秒或 ISO-8601，如 \"2026-09-07T15:00\" 或 1788780000。按时间重叠筛选：15:00 前到、15:20 走的人，查 15:00-15:05 也会返回"},
                 "until":      {"type": "string", "description": "结束时间，格式同 since。留空表示至今"},
-                "person_id":  {"type": "string", "description": "已存在的人员 id，形如 p-3（已命名）或 unknown-7（陌生人）"},
-                "person_ids": {"type": "array", "items": {"type": "string"}, "description": "批量删除的 id 列表，如 [\"p-1\",\"p-2\",\"unknown-7\"]；也接受逗号或空格分隔的字符串 \"p-1, unknown-7\"。一次提交完成，不是逐个删。返回 forgotten(已删数量+id列表) 与 missing(不存在的 id)，部分成功是正常结果"},
+                "person_id":  {"type": "string", "description": "已存在的人员 id，形如 p-3"},
+                "person_ids": {"type": "array", "items": {"type": "string"}, "description": "批量删除的 id 列表，如 [\"p-1\",\"p-2\",\"p-7\"]；也接受逗号或空格分隔的字符串 \"p-1, p-7\"。一次提交完成，不是逐个删。返回 forgotten(已删数量+id列表) 与 missing(不存在的 id)，部分成功是正常结果"},
                 "window_s":   {"type": "number", "description": "回看最近多少秒的画面。register_by_stream 默认 3.0，recognize_by_stream 默认 1.0，上限为 enroll_window_s"},
                 "package":    {"type": "string", "description": "图片包：目录 / .zip / .tar.gz 的路径或 URL。包内可放 manifest.json 指定每张图的 name 与 profile，如 [{\"file\":\"alice.jpg\",\"name\":\"Alice\",\"person\":\"alice\"}]；没有 manifest 则用同名 .json/.txt 侧文件，再退回文件名"},
                 "named":      {"type": "string", "enum": ["all", "named", "unknown"], "description": "过滤范围，默认 all。用于 action=forget 时，'unknown' 表示清空所有陌生人条目"},
@@ -230,8 +231,8 @@ TOOLS = [
                 },
                 "list_persons":  {"params": ["named", "query", "limit", "offset"], "description": "List registered people with their name and profile"},
                 "get_person":    {"params": ["person_id"], "description": "Read one person's full record"},
-                "update_person": {"params": ["person_id", "name", "profile", "profile_delete", "merge"], "description": "Edit a person's name or profile; setting a name on an unknown-N id names that identity, keeping the id"},
-                "forget":        {"params": ["person_id", "person_ids", "named"], "description": "删除人员：单个 person_id、批量 person_ids，或 named='unknown' 清空所有陌生人。id 退役后永不复用"},
+                "update_person": {"params": ["person_id", "name", "profile", "profile_delete", "merge"], "description": "Edit a person's name or profile; setting a name on an unnamed person (p-N with empty name) names that identity, keeping the id"},
+                "forget":        {"params": ["person_id", "person_ids", "named"], "description": "删除人员：单个 person_id、批量 person_ids，或 named='unknown' 清空所有未命名人员。id 退役后永不复用"},
                 "list_visits":   {"params": ["person_id", "since", "until", "limit", "offset"], "description": "访问记录：查询某段时间内出现过的人。一次连续出现算一条记录，含首末时间与出现次数"},
             },
         },
@@ -249,7 +250,7 @@ TOOLS = [
                 "min_face_px":       {"type": "integer", "minimum": 16, "default": DEFAULT_MIN_FACE_PX, "description": "最小人脸边长(px)，小于此值不做识别"},
                 "blur_min":          {"type": "number", "minimum": 0.0, "default": DEFAULT_BLUR_MIN, "description": "清晰度下限(拉普拉斯方差)，低于此值视为模糊人脸"},
                 "max_faces":         {"type": "integer", "minimum": 1, "default": DEFAULT_MAX_FACES, "description": "单帧最多处理的人脸数"},
-                "unknown_capacity":  {"type": "integer", "minimum": 0, "default": DEFAULT_UNKNOWN_CAPACITY, "description": "陌生人(unknown-N)数量上限，超出时淘汰最久未见的；已注册人员不受影响"},
+                "unknown_capacity":  {"type": "integer", "minimum": 0, "default": DEFAULT_UNKNOWN_CAPACITY, "description": "未命名人员(p-N 但 name 为空)数量上限，超出时淘汰最久未见的；已命名人员不受影响"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],

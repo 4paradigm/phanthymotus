@@ -113,7 +113,7 @@ def test_survives_reload(tmp_path):
     assert reopened.stats()["persons"] == 2
     assert reopened.get_person("p-1")["profile"] == {"team": "ops"}
     matched, _ = reopened.match(_vector(5), 0.35)
-    assert matched == "unknown-1"
+    assert matched == "p-2"  # All IDs now use p-N format
 
 
 def test_persons_json_is_the_commit_point(tmp_path):
@@ -174,25 +174,26 @@ def test_orphaned_rows_are_dropped_not_misattributed(tmp_path):
 def test_forgotten_id_is_never_reused(tmp_path):
     """A retired id must not resolve to a different person later.
 
-    An `unknown-3` may already have been published on the activity stream and
+    A `p-3` may already have been published on the activity stream and
     recorded in the agent's history; handing that id to somebody else would
     silently rewrite who those sightings were about.
     """
     db = FaceDB(db_dir=str(tmp_path))
     first = db.enroll_unknown(_vector(1))["id"]
-    assert first == "unknown-1"
+    assert first == "p-1"
     assert db.forget(first) is True
 
     second = db.enroll_unknown(_vector(2))["id"]
-    assert second == "unknown-2"
+    assert second == "p-2"
 
     reopened = FaceDB(db_dir=str(tmp_path))
     third = reopened.enroll_unknown(_vector(3))["id"]
-    assert third == "unknown-3"
+    assert third == "p-3"
 
 
 def test_forget_unknown_id_helper():
-    assert is_unknown_id("unknown-4")
+    # is_unknown_id is now deprecated, always returns False
+    assert not is_unknown_id("unknown-4")
     assert not is_unknown_id("p-4")
 
 
@@ -340,7 +341,7 @@ def test_list_persons_filters_and_pages(tmp_path):
     assert db.list_persons(named="unknown")["total"] == 1
     assert db.list_persons(query="sales")["total"] == 1
     assert db.list_persons(query="a7")["total"] == 1            # matches profile
-    assert db.list_persons(query="unknown-")["total"] == 1      # matches id
+    assert db.list_persons(query="p-3")["total"] == 1           # matches id (now p-3 instead of unknown-1)
 
     page = db.list_persons(limit=1, offset=1)
     assert len(page["persons"]) == 1 and page["total"] == 3
@@ -468,10 +469,10 @@ def test_list_visits_accepts_iso_timestamps(tmp_path):
 
 def test_list_visits_filters_by_person_and_resolves_the_current_name(tmp_path):
     db = FaceDB(db_dir=str(tmp_path), visit_gap_s=60.0)
-    unknown = db.enroll_unknown(_vector(1))["id"]
-    db.add("Bob", [_vector(2)])
-    _seen(db, unknown, 10_000)
-    _seen(db, "p-1", 10_000)
+    unknown = db.enroll_unknown(_vector(1))["id"]  # Will be p-1
+    db.add("Bob", [_vector(2)])  # Will be p-2
+    _seen(db, unknown, 10_000)  # p-1 visit
+    _seen(db, "p-2", 10_000)    # Bob's visit
     db.close_stale_visits(force=True)
 
     assert db.list_visits(person_id=unknown)["total"] == 1

@@ -2,10 +2,9 @@
 """
 plugins/face_db.py — 人脸身份持久化存储。
 
-Holds every enrolled identity (named people and auto-assigned `unknown-N`
-entries) plus their face embeddings, on disk under a `/models` subdirectory —
-the only host-mounted writable path the perception container has (see
-`perception/deploy/service.yml`).
+Holds every enrolled identity (both named and unnamed) plus their face embeddings,
+on disk under a `/models` subdirectory — the only host-mounted writable path the
+perception container has (see `perception/deploy/service.yml`).
 
 Three files, and **`persons.json` is the commit point**:
 
@@ -16,12 +15,14 @@ Three files, and **`persons.json` is the commit point**:
 
 A person record separates the structured fields from the free-form ones:
 
-    id              p-N (named) or unknown-N
+    id              p-N (all persons use the same ID format)
     name            str  — structured. A non-blank name is what makes an entry
                     "named"; publishing it is how the agent addresses someone.
+                    When blank, the person is recognized but not yet identified.
     profile         object — non-structured: gender, appearance, notes, tags.
                     Whatever the operator wants to carry, published alongside
                     the name so the agent has it in context on every sighting.
+    named           bool — whether this person has been given a name
     registered_at   when the identity was created
     last_seen_at    most recent sighting
 
@@ -100,8 +101,10 @@ _LOCK_FILE = ".face_db.lock"
 _EMBEDDINGS_PREFIX = "embeddings-"
 _EMBEDDINGS_SUFFIX = ".npy"
 
-UNKNOWN_PREFIX = "unknown-"
-NAMED_PREFIX = "p-"
+# All person IDs use the same format now: p-N
+# Whether a person is "named" is determined by the `named` field in their record,
+# not by the ID prefix. This keeps IDs stable when a person is recognized and named.
+PERSON_PREFIX = "p-"
 
 
 class FaceDBError(RuntimeError):
@@ -109,7 +112,9 @@ class FaceDBError(RuntimeError):
 
 
 def is_unknown_id(person_id: str) -> bool:
-    return str(person_id).startswith(UNKNOWN_PREFIX)
+    """Deprecated: all IDs are now p-N format. Check record['named'] instead."""
+    # Kept for backward compatibility during migration, always returns False
+    return False
 
 
 def _now() -> float:
@@ -207,7 +212,8 @@ class FaceDB:
         self._persons: dict[str, dict] = {}
         self._row_owners: list[str] = []
         self._matrix = np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
-        self._next_ids = {"named": 1, "unknown": 1}
+        # Single counter for all person IDs (p-N format)
+        self._next_ids = {"named": 1}
         self._generation = 0
 
         self._visit_gap = max(0.0, float(visit_gap_s))
@@ -314,9 +320,12 @@ class FaceDB:
         self._matrix = matrix if matrix.size else np.zeros(
             (0, EMBEDDING_DIM), dtype=np.float32
         )
+        # Migrate from old dual-counter format to single counter
+        # Take the max of both counters to ensure no ID collisions
+        old_named = max(1, int(next_ids.get("named", 1)))
+        old_unknown = max(1, int(next_ids.get("unknown", 1)))
         self._next_ids = {
-            "named": max(1, int(next_ids.get("named", 1))),
-            "unknown": max(1, int(next_ids.get("unknown", 1))),
+            "named": max(old_named, old_unknown),
         }
         self._generation = max(0, int(state.get("generation") or 0))
         log.info("[face_db] loaded %d person(s), %d sample(s) from %s",
@@ -394,13 +403,18 @@ class FaceDB:
         """Return a fresh id. Counters only ever increase, so an id retired by
         `forget()` is never handed to a different person later — a stale
         reference in a conversation history or a peer's notes must not resolve
-        to somebody else."""
-        key = "named" if named else "unknown"
-        prefix = NAMED_PREFIX if named else UNKNOWN_PREFIX
+        to somebody else.
+
+        All IDs use the same p-N format now, regardless of named status.
+        The `named` parameter still determines which counter to use for backward
+        compatibility, but both produce p-N formatted IDs.
+        """
+        # Use a single counter for all person IDs
+        key = "named"  # Always use the named counter
         while True:
             number = self._next_ids[key]
             self._next_ids[key] = number + 1
-            candidate = f"{prefix}{number}"
+            candidate = f"{PERSON_PREFIX}{number}"
             if candidate not in self._persons:
                 return candidate
 
