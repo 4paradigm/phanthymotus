@@ -1184,10 +1184,28 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                         except (json.JSONDecodeError, IndexError):
                             pass
 
+            # ── 文件参数转发：与 mcp_client.call_tool 相同的机制 ────────
+            # Canvas cards reach tools through this endpoint, not call_tool, so
+            # the LLM's file interceptor never ran. Duplicate the logic here so
+            # both paths get it. A future refactor can unify them; for now the
+            # duplication is cheaper than premature abstraction.
+            final_args = dict(req.arguments)
+            input_schema = None
+            tools_list = target.get('tools') or []
+            tool_obj = next((t for t in tools_list if isinstance(t, dict) and t.get('name') == req.tool), None)
+            if tool_obj:
+                input_schema = tool_obj.get('inputSchema')
+            if input_schema:
+                import mcp_client as _mc
+                final_args, transfer_error = await _mc._transfer_file_args(
+                    mcp_id, target['url'], input_schema, final_args)
+                if transfer_error:
+                    return {'code': 400, 'message': transfer_error, 'data': None}
+
             call_payload = {
                 'jsonrpc': '2.0', 'id': 3,
                 'method': 'tools/call',
-                'params': {'name': req.tool, 'arguments': req.arguments},
+                'params': {'name': req.tool, 'arguments': final_args},
             }
             async with session.post(url, json=call_payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)
