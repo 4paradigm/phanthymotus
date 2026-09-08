@@ -236,3 +236,105 @@ def test_loader_failure_retries_and_stop_disposes_node(plugin, monkeypatch):
     plugin.dispatch("obstacle", {"action": "stop"})
     assert node.destroyed and not plugin._executor.nodes
     assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("teardown", ["stop", "config", "rebind"])
+def test_late_start_cannot_revive_disposed_existing_node(plugin, monkeypatch, teardown):
+    _start(plugin)
+    _running(plugin)
+    node = plugin._nodes["a"]
+    original_start = node.start
+    entered, resume = threading.Event(), threading.Event()
+    outcome = {}
+
+    def delayed_start(adapter):
+        entered.set()
+        assert resume.wait(5)
+        return original_start(adapter)
+
+    monkeypatch.setattr(node, "start", delayed_start)
+    caller = threading.Thread(target=lambda: outcome.update(_start(plugin)))
+    caller.start()
+    try:
+        assert entered.wait(3)
+        if teardown == "config":
+            _config(plugin, "a", 1.5)
+        elif teardown == "rebind":
+            plugin.dispatch("obstacle", {
+                "action": "start", "instance_id": "a", "input_topic": "/cam/new",
+            })
+        else:
+            plugin.dispatch("obstacle", {"action": "stop", "instance_id": "a"})
+        assert node.destroyed
+        resume.set()
+        caller.join(timeout=3)
+        assert not caller.is_alive()
+        assert outcome["state"] == "idle"
+        assert node.state == "idle" and node._worker is None
+        if teardown != "rebind":
+            _start(plugin)
+        _running(plugin)
+        assert plugin._nodes["a"] is not node
+    finally:
+        resume.set()
+        caller.join(timeout=3)
+        node.stop()  # also cleans up a revived worker when testing old code
+
+
+@pytest.mark.parametrize("warm_adapter", [False, True])
+def test_stop_between_node_registration_and_first_start(plugin, monkeypatch, warm_adapter):
+    if warm_adapter:
+        _start(plugin)
+        _running(plugin)
+    entered, resume = threading.Event(), threading.Event()
+    original_start = obstacle_module._ObstacleNode.start
+    invalid_handle_calls = []
+    outcome = {}
+
+    def delayed_start(node, adapter):
+        entered.set()
+        assert resume.wait(5)
+        return original_start(node, adapter)
+
+    monkeypatch.setattr(obstacle_module._ObstacleNode, "start", delayed_start)
+    caller = threading.Thread(target=lambda: outcome.update(_start(plugin, "b")))
+    caller.start()
+    node = None
+    try:
+        assert entered.wait(3)
+        node = plugin._nodes["b"]
+        subscribe = node.create_subscription
+
+        def guarded_subscribe(*args, **kwargs):
+            if node.destroyed:
+                invalid_handle_calls.append(True)
+                raise RuntimeError("node handle is destroyed")
+            return subscribe(*args, **kwargs)
+
+        monkeypatch.setattr(node, "create_subscription", guarded_subscribe)
+        plugin.dispatch("obstacle", {"action": "stop", "instance_id": "b"})
+        assert node.destroyed
+        resume.set()
+        caller.join(timeout=3)
+        assert _wait_until(lambda: plugin._loader_thread is None)
+        assert not caller.is_alive() and not invalid_handle_calls
+        assert node.state == "idle" and node._worker is None
+        assert not node.subscriptions and "b" not in plugin._nodes
+        assert outcome["state"] == ("idle" if warm_adapter else "loading")
+    finally:
+        resume.set()
+        caller.join(timeout=3)
+        if node is not None:
+            node.stop()
+
+
+def test_plain_stop_can_restart_but_disposal_is_permanent(plugin):
+    _start(plugin)
+    _running(plugin)
+    node = plugin._nodes["a"]
+    adapter = plugin._adapter
+    node.stop()
+    assert node.start(adapter)["state"] == "running"
+    plugin.dispatch("obstacle", {"action": "stop"})
+    assert node.start(adapter)["state"] == "idle"
+    assert node.destroyed and node._worker is None

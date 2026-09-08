@@ -146,7 +146,8 @@ class _ObstacleNode(Node):
         self._frames.close()
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
-        self._lifecycle_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._retired = False
         self._detect_count = 0
         self._logged_first_frame = False
         self._log_gate = SampledLogGate(every=100)
@@ -154,6 +155,8 @@ class _ObstacleNode(Node):
 
     def start(self, adapter: LocalDistanceAdapter) -> dict:
         with self._lifecycle_lock:
+            if self._retired:
+                return {"state": "idle", "input": self._input_topic, "output": self._output_topic}
             if self.state == "running":
                 return {"state": "running", "input": self._input_topic, "output": self._output_topic}
             if self._worker is not None and self._worker.is_alive():
@@ -181,9 +184,7 @@ class _ObstacleNode(Node):
         return {"state": "running", "input": self._input_topic, "output": self._output_topic}
 
     def stop(self) -> dict:
-        # stop() only pauses the inference worker; the node itself stays
-        # registered until the plugin retires it (see ObstacleDistancePlugin.
-        # _dispose_node), so a later start on the same topic reuses it.
+        # A plain stop pauses the worker; permanent teardown uses retire().
         with self._lifecycle_lock:
             self.state = "idle"
             self._stop_event.set()
@@ -200,6 +201,14 @@ class _ObstacleNode(Node):
                 )
         log.info(f"[obstacle] stopped: {self._input_topic}")
         return {"state": "idle", "input": self._input_topic}
+
+    def retire(self) -> dict:
+        """Permanently stop this node before destroying its ROS handles."""
+        with self._lifecycle_lock:
+            # Match OCR: a delayed start must see retirement before touching
+            # subscriptions or creating another worker on this node.
+            self._retired = True
+            return self.stop()
 
     def _image_cb(self, msg: CompressedImage):
         if self.state != "running":
@@ -353,7 +362,7 @@ class ObstacleDistancePlugin:
     def _dispose(self, node_key: str, node: "_ObstacleNode") -> None:
         """Stop worker and fully destroy the node. Never called under lock."""
         try:
-            node.stop()
+            node.retire()
         finally:
             dispose_node(self._executor, node, label=f"obstacle/{node_key}")
         log.info(f"[obstacle] node disposed: {node_key}")
