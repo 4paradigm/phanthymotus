@@ -514,6 +514,12 @@ app_api.include_router(api.mcp_manage.router)
 import api.drivers
 app_api.include_router(api.drivers.router)
 
+import api.drivers_v2_endpoint
+app_api.include_router(api.drivers_v2_endpoint.router)
+
+import api.deploy_stream
+app_api.include_router(api.deploy_stream.router)
+
 import api.registry
 app_api.include_router(api.registry.router)
 
