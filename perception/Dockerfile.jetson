@@ -129,7 +129,7 @@ RUN cd /ros_ws && \
 # want it applied to everything.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --ignore-installed PyYAML && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    websockets webrtcvad
+    websockets webrtcvad "tflite-runtime==2.13.0"
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson).
