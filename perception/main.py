@@ -261,6 +261,32 @@ def make_handler():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
+
+            # File intake, before the body is read: an upload can be tens of
+            # megabytes and the JSON paths below slurp Content-Length into
+            # memory. utils/file_intake streams it to disk instead.
+            #
+            # This is how a photo reaches this container at all — see that
+            # module's docstring. agent-core proxies the browser's (or the LLM's)
+            # upload here and hands the returned path straight to a tool call;
+            # neither side needs a shared mount, because the path in the reply is
+            # this container's own.
+            if self.path == "/file/upload":
+                from utils.file_intake import access_token, handle_upload
+                cfg = _load_config()
+                intake = (cfg.get("file_intake") or {})
+                base_dir = str(intake.get("dir", "/models/uploads"))
+                body = self.rfile.read(length)
+                status, payload = handle_upload(
+                    self.headers, body, base_dir,
+                    token=access_token(),
+                    provided_token=self.headers.get("X-Access-Token"),
+                    max_bytes=int(intake.get("max_bytes", 64 * 1024 * 1024)),
+                    retention_days=int(intake.get("retention_days", 7)),
+                )
+                self._send(status, json.dumps(payload, ensure_ascii=False))
+                return
+
             raw = self.rfile.read(length)
 
             if self.path == "/vad/test":

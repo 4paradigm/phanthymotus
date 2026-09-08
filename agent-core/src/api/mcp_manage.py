@@ -343,6 +343,109 @@ async def mcp_list():
     return {'code': 200, 'data': items}
 
 
+def _file_intake_url(mcp_id: str) -> str:
+    """Resolve `mcp_id` to its `/file/upload` endpoint, or raise 4xx.
+
+    The address comes from the MCP registry, which every service populates when
+    it registers (`POST /api/mcp` carries `url`). That is what makes one route
+    cover perception, actucore and every driver despite their ports all
+    differing — the port was reported at registration, so nothing here needs a
+    per-layer table or a hardcoded number.
+    """
+    target = next((m for m in _get_mcp_list() if m.get('id') == mcp_id), None)
+    if not target:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail=f'unknown mcp: {mcp_id}')
+    if target.get('transport', 'http') != 'http':
+        # agentcore/channel are served in-process; they have no HTTP endpoint to
+        # proxy to, and a caller wanting to hand *them* a file should use
+        # /api/file/upload, which writes to this container directly.
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail=(f'{mcp_id} is an internal MCP with no HTTP endpoint; '
+                    'use /api/file/upload for agent-core-local files'))
+    url = (target.get('url') or '').strip()
+    if not url:
+        raise fastapi.HTTPException(status_code=503,
+                                    detail=f'{mcp_id} has no url registered yet')
+    # `http://localhost:15720/mcp` → `http://localhost:15720/file/upload`.
+    # rsplit on the trailing '/mcp' rather than urljoin: a registered url may
+    # carry a path prefix, and urljoin would discard it.
+    base = url.rsplit('/mcp', 1)[0] if url.endswith('/mcp') else url.rstrip('/')
+    return f'{base}/file/upload'
+
+
+@router.post('/{mcp_id}/file/upload')
+async def mcp_file_upload(
+    mcp_id: str,
+    file: fastapi.UploadFile = fastapi.File(),
+    subdir: str = fastapi.Form(''),
+):
+    """Proxy a file upload to the service that will read it.
+
+    The problem this solves: agent-core serves the browser, but the tool that
+    needs the file (a photo to enrol a face) runs in another container, and they
+    share no filesystem. A path produced here means nothing there — the first
+    face-enrolment attempt failed with an `image_path` that really existed, in
+    this container. base64 through the tool call failed too: 43 800 characters
+    does not survive being carried through an LLM's context.
+
+    So the bytes are streamed to the target service, which writes them somewhere
+    *it* can see and returns **its own** absolute path. The reply is handed
+    straight to a tool call. No shared mount, no container recreation, and only
+    one viewpoint on the path.
+
+    Streamed in 1 MiB chunks: a photo can be tens of megabytes, and buffering it
+    whole would put it in this process's memory on a 7.4 GB robot.
+    """
+    endpoint = _file_intake_url(mcp_id)
+    # The same value auth.py's middleware enforces, read from .env at startup —
+    # not a second copy from config, which could disagree.
+    import auth
+    token = auth.get_token()
+
+    form = aiohttp.FormData()
+    form.add_field('file', file.file,
+                   filename=file.filename or 'upload.bin',
+                   content_type=file.content_type or 'application/octet-stream')
+    if subdir:
+        form.add_field('subdir', subdir)
+
+    headers = {'X-Access-Token': token} if token else {}
+    # Generous: the transfer crosses only loopback, but a 60 MB photo onto eMMC
+    # under load is not instant, and a timeout here would look to the operator
+    # like the upload silently vanished.
+    timeout = aiohttp.ClientTimeout(total=180)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(endpoint, data=form, headers=headers) as resp:
+                text = await resp.text()
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    payload = {'ok': False, 'error': text[:500]}
+                if resp.status != 200 or not payload.get('ok'):
+                    return {'code': resp.status if resp.status != 200 else 502,
+                            'message': payload.get('error', 'upload failed'),
+                            'data': payload}
+                # `path` is absolute inside the *target* container. Returned
+                # verbatim; the canvas puts it in the tool argument unchanged.
+                return {'code': 200, 'message': '', 'data': payload}
+    except aiohttp.ClientError as error:
+        # Distinguish "the service is not listening" from "it rejected the file":
+        # the first is a deployment problem (an image without the endpoint), the
+        # second is the caller's.
+        return {'code': 502,
+                'message': (f'cannot reach {mcp_id} at {endpoint}: {error}. '
+                            'The target image may predate its /file/upload '
+                            'endpoint.'),
+                'data': None}
+    except asyncio.TimeoutError:
+        return {'code': 504,
+                'message': f'{mcp_id} did not finish receiving the file in time',
+                'data': None}
+
+
 @router.post('')
 async def mcp_add(req: MCPAddRequest):
     async with _mcp_write_lock:

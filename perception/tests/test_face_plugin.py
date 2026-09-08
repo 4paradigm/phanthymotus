@@ -505,20 +505,22 @@ def test_base64_input_is_refused_with_a_pointer_to_what_works(plugin):
         "action": "register_by_photo", "image_b64": encoded, "name": "Bob"})
     assert result["ok"] is False
     assert result["reason"] == face_plugin.REASON_BAD_INPUT
-    assert "image_path" in result["detail"]
+    assert "file/upload" in result["detail"]
     assert "register_by_url" in result["detail"]
     assert plugin._require_engine().db.stats()["persons"] == 0
 
 
-def test_image_path_is_a_file_picker_field_pointing_at_the_shared_mount():
-    """`format: file` is what makes the canvas render a picker and upload via
-    agent-core's /api/file/upload — the same mechanism remote_image uses. The
-    upload has to land somewhere perception can read, hence uploadDir."""
+def test_image_path_is_a_file_picker_routed_through_the_upload_proxy():
+    """`format: file` makes the canvas render a picker; `uploadTo: mcp` sends it
+    to /api/mcp/<id>/file/upload, which streams the bytes to *this* service and
+    returns a path this container can open. Without uploadTo the upload would
+    land in agent-core, which perception cannot see — the original bug."""
     spec = face_plugin.TOOLS[0]["inputSchema"]["properties"]["image_path"]
     assert spec["format"] == "file"
     assert spec["accept"] == "image/*"
-    assert spec["uploadDir"] == "/uploads"
-    assert "/uploads" in face_plugin.DEFAULT_IMAGE_ROOTS[0]
+    assert spec["uploadTo"] == "mcp"
+    # No shared mount is involved, so the roots stay as they were.
+    assert "/uploads" not in face_plugin.DEFAULT_IMAGE_ROOTS
 
 
 def test_no_base64_anywhere_on_the_card():
@@ -528,14 +530,15 @@ def test_no_base64_anywhere_on_the_card():
         assert "image_b64" not in spec["params"], action
 
 
-def test_a_path_outside_the_roots_names_the_shared_mount(plugin):
+def test_a_path_outside_the_roots_says_how_to_hand_the_file_over(plugin):
     """The first real failure was image_path=/work/daiwen.jpg — a real file in
-    agent-core, invisible here. The error has to say where to put it instead."""
+    agent-core, invisible here. Told only "cannot read", the LLM retried with
+    another invisible path, so the error has to name the mechanism that works."""
     result = plugin.dispatch("face_recognition", {
-        "action": "register_by_photo", "image_path": "/work/daiwen.jpg"})
+        "action": "register_by_photo", "image_path": "/etc/hostname"})
     assert result["ok"] is False
     assert result["reason"] == face_plugin.REASON_BAD_INPUT
-    assert "/uploads" in result["detail"]
+    assert "file/upload" in result["detail"]
     assert "register_by_url" in result["detail"]
 
 

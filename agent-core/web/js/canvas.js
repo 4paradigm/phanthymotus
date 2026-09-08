@@ -778,7 +778,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         } else if (def.format === 'file') {
           const accept = def.accept || '*/*';
           const uploadDir = def.uploadDir || '';
-          inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}>Choose File</button><span class="canvas-file-name"></span></div>`;
+          const uploadTo = def.uploadTo || '';
+          inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>Choose File</button><span class="canvas-file-name"></span></div>`;
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
           const desc = def.description || '';
@@ -869,31 +870,52 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const fileInput = document.createElement('input');
         fileInput.type = 'file';
         fileInput.accept = btn.dataset.accept || '*/*';
-        // Where the upload lands. Defaults to agent-core's own /tmp/uploads,
-        // which is right for a tool served by agent-core itself (remote_image,
-        // remote_audio). A tool in *another* container cannot see that path, so
-        // its schema declares `uploadDir` pointing at a directory both
-        // containers mount — see perception's face_recognition card.
+        // Two destinations, and which is correct depends on who reads the file.
+        //
+        //   uploadTo: 'mcp'  → POST /api/mcp/<id>/file/upload, which streams the
+        //     bytes to the service owning this tool. That service writes them
+        //     where it can see them and returns *its own* absolute path. This is
+        //     the only thing that works when the tool runs in another container:
+        //     agent-core and perception share no filesystem, so a path minted
+        //     here is meaningless there.
+        //   default → agent-core's own /tmp/uploads, right for a tool that
+        //     agent-core serves itself (remote_image, remote_audio).
+        const uploadTo = btn.dataset.uploadTo || '';
         const uploadDir = btn.dataset.uploadDir || '/tmp/uploads';
         fileInput.onchange = async () => {
           if (!fileInput.files[0]) return;
           btn.textContent = 'Uploading...';
           const form = new FormData();
           form.append('file', fileInput.files[0]);
-          form.append('path', uploadDir);
+          let endpoint = '/api/file/upload';
+          if (uploadTo === 'mcp') {
+            endpoint = `/api/mcp/${encodeURIComponent(mcpId)}/file/upload`;
+          } else {
+            form.append('path', uploadDir);
+          }
           try {
-            const res = await fetch('/api/file/upload', { method: 'POST', body: form });
+            const res = await fetch(endpoint, { method: 'POST', body: form });
             const data = await res.json();
             if (data.code === 200) {
-              hiddenInput.value = uploadDir.replace(/\/$/, '') + '/' + fileInput.files[0].name;
+              // The proxy replies with the receiving container's own path; the
+              // local endpoint does not, so derive it as before.
+              hiddenInput.value = uploadTo === 'mcp'
+                ? ((data.data && data.data.path) || '')
+                : uploadDir.replace(/\/$/, '') + '/' + fileInput.files[0].name;
               nameSpan.textContent = fileInput.files[0].name;
               btn.textContent = 'Re-select';
             } else {
+              // Surface the reason: the proxy distinguishes "the service is not
+              // listening" (an image predating the endpoint) from "it refused
+              // the file", and a bare "Failed" hides which.
               btn.textContent = 'Failed';
+              btn.title = data.message || '';
+              console.warn('[canvas] upload failed:', data.message || data);
               setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
             }
           } catch (err) {
             btn.textContent = 'Error';
+            btn.title = String(err);
             setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
           }
         };
@@ -925,7 +947,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       } else if (def.format === 'file') {
         const accept = def.accept || '*/*';
         const uploadDir = def.uploadDir || '';
-        inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}>选择文件</button><span class="canvas-file-name"></span></div>`;
+        const uploadTo = def.uploadTo || '';
+        inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>选择文件</button><span class="canvas-file-name"></span></div>`;
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
         const desc = def.description || '';

@@ -977,39 +977,74 @@ framed dead-on.
 
 #### Getting a photo *into* this container
 
-Not obvious, and it produced two real LLM failures before being fixed.
+Not obvious, and it produced two real failures before being fixed.
 
-perception and agent-core share **no filesystem** by default: agent-core mounts
+perception and agent-core share **no filesystem**: agent-core mounts
 `/opt/phanthy-motus` and `/opt/phanthy-motus/data`, perception mounts `/dev` and
 `/opt/embodied/models`. The intersection is empty, and each container's `/tmp`
 and `/work` is its own. So an LLM that downloads a photo inside agent-core and
 passes `image_path: /work/daiwen.jpg` names a file that genuinely exists — just
-not here. That was the first failure.
+not here. That was failure one. Its next attempt, `image_b64`, failed too: the
+photo was 43 800 base64 characters, which does not survive being carried through
+a model's own context, so what arrived was truncated.
 
-Its second attempt was `image_b64`, which failed too: the photo was 43 800
-base64 characters, and that does not survive being carried through a model's own
-context, so what arrived was truncated and the decoder correctly refused it.
+**base64 input has been removed**, and files now move through a proxy:
 
-**base64 input has therefore been removed.** Both remaining channels pass a
-*reference* instead of the bytes:
+```
+browser / LLM ──upload──▶ agent-core  POST /api/mcp/{mcp_id}/file/upload
+                              │  looks the target's address up in the MCP
+                              │  registry, streams the body on in 1 MiB chunks
+                              ▼
+                          perception  POST /file/upload
+                              │  writes to file_intake.dir (/models/uploads)
+                              ▼
+                     ◀──reply── {"path": "/models/uploads/2026-09-08/alice.jpg"}
+                          that path is used verbatim as image_path
+```
 
-| channel | how the file gets here |
-|---|---|
-| `image_path` | written into **`/uploads`**, a host directory both containers mount at the same path (`perception/deploy/service.yml`, `agent-core/deploy/docker-compose.yml`) |
-| `register_by_url` | perception fetches it itself; nothing has to be moved |
+The reply carries the path **in the receiving container's own namespace**, so
+there is one viewpoint and nothing to translate. No shared mount is involved,
+which also means no container has to be recreated to enable it.
 
-The card's `image_path` is declared `"format": "file"` with
-`"uploadDir": "/uploads"`, so the canvas renders a file picker that uploads
-through agent-core's `/api/file/upload` and fills the resulting path back in —
-the same mechanism agent-core's own `remote_image` card uses for `image_file`.
-`uploadDir` is new: that handler hardcoded agent-core's `/tmp/uploads`, which is
-right for a tool agent-core serves itself and invisible to a tool in any other
-container.
+The address comes from the MCP registry — every service reports `url` when it
+registers — so this one route covers perception, actucore and every driver even
+though their ports all differ. `utils/file_intake.py` is stdlib-only for the same
+reason: the drivers run a bare `ThreadingHTTPServer`, so they can adopt the
+identical endpoint in about five lines.
 
-Passing `image_b64` now returns a `bad_input` naming the two channels that work,
-and a path outside `image_roots` says to use `/uploads` or `register_by_url`
-rather than only "cannot read" — an LLM told just "not found" retries with
-another invisible path, which is what happened.
+On the card, `image_path` is declared `"format": "file"` with
+`"uploadTo": "mcp"`, which is what routes the canvas file picker through the
+proxy instead of agent-core's own `/api/file/upload`. Omitting `uploadTo` keeps
+the old behaviour, which is correct for a tool agent-core serves itself
+(`remote_image`, `remote_audio`).
+
+Details worth knowing about the receiving end:
+
+* **Size is capped while writing**, not after, so an oversized body is never
+  fully committed to disk or held in memory. Files land under a `.part` name and
+  are renamed, so a reader listing the directory never sees half a file.
+* **Filenames are reduced to one component** and keep CJK characters — the
+  people using this name their files in Chinese — after NFC normalisation, so a
+  macOS upload and a Linux one produce the same name rather than two files that
+  look identical.
+* **`subdir` is refused rather than sanitised** if it contains a separator.
+  Sanitising turned `../escape` into `.._escape`, a valid name, so the write
+  succeeded somewhere the caller did not ask for and nothing said so.
+* **Uploads are pruned after `retention_days`** (7). They are a transfer buffer,
+  not storage: enrolment keeps the *embedding* and never the photo, so without
+  this the directory grows forever on a 57 GB eMMC.
+* **Auth is by reachability, not a secret.** The endpoint honours `ACCESS_TOKEN`
+  if the service has one, but perception is not given one today (verified on
+  Tianyi) — and the port already serves `tools/call`, so anything that can reach
+  it can already drive the plugin.
+
+Verified on Tianyi: 200 KB of random binary round-trips byte-identically through
+the real endpoint with a Chinese filename, returning `/…/2026-09-08/戴文渊.jpg`.
+
+Passing `image_b64` now returns a `bad_input` naming the mechanism that works,
+and a path outside `image_roots` says to upload through the proxy or use
+`register_by_url` — an LLM told only "cannot read" retries with another
+invisible path, which is exactly what happened.
 
 `register_by_stream` averages the agreeing frames rather than trusting one
 grab, and refuses with `ambiguous_subject` when fewer than half the usable frames

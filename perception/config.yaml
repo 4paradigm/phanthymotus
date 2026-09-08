@@ -1,5 +1,16 @@
 mcp_port: 15720
 
+# 文件接收 (POST /file/upload)。agent-core 把浏览器/LLM 的上传代理到这里，
+# 本服务写到自己看得见的目录并把「本容器内的绝对路径」回给调用方 ——
+# 两个容器无需共享挂载。详见 utils/file_intake.py。
+file_intake:
+  # /models 是本容器唯一可写的宿主机挂载点。
+  dir: /models/uploads
+  max_bytes: 67108864
+  # 上传只是中转，不是存储：注册人脸留下的是 embedding，从不保留照片。
+  # 不清理会在 57 GB 的 eMMC 上一直涨。
+  retention_days: 7
+
 plugins:
   asr:
     enabled: true
@@ -146,10 +157,7 @@ plugins:
     max_image_bytes: 67108864
     # Caller-supplied image/package paths are confined to these roots — the MCP
     # server has no authentication and runs as root in the container.
-    # /uploads is the cross-container drop-off (see deploy/service.yml): the
-    # canvas file picker and the LLM both put images there, and it is the only
-    # one of these paths agent-core can also see.
-    image_roots: ["/uploads", "/models", "/tmp", "/work"]
+    image_roots: ["/models", "/tmp", "/work"]
     # 检测频率: how many detections per second. Fractional is the point —
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0

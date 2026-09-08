@@ -95,10 +95,10 @@ DEFAULT_MAX_BATCH = 200
 # this only has to be larger than any real photo. 64 MB covers a 60 MP
 # uncompressed-ish PNG; the pixel cap is what actually protects memory.
 DEFAULT_MAX_IMAGE_BYTES = 64 * 1024 * 1024
-# /uploads first: it is the only one of these that agent-core also mounts, so
-# it is the only path a caller outside this container can hand over. See
-# deploy/service.yml.
-DEFAULT_IMAGE_ROOTS = ("/uploads", "/models", "/tmp", "/work")
+# /models/uploads is where the file-intake endpoint writes (see
+# utils/file_intake.py and the `file_intake` block in config.yaml); /models is
+# already listed, which covers it.
+DEFAULT_IMAGE_ROOTS = ("/models", "/tmp", "/work")
 
 
 def detect_interval(cfg: dict) -> float:
@@ -170,14 +170,13 @@ TOOLS = [
                     "type": "string",
                     "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)",
                 },
-                # `format: file` makes the canvas render a file picker that
-                # uploads through agent-core's /api/file/upload and fills the
-                # resulting path back in — the same mechanism agent-core's own
-                # `remote_image` card uses for `image_file`. The upload lands in
-                # a directory both containers mount (see image_roots below), so
-                # the path this card receives is one perception can actually
-                # open.
-                "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadDir": "/uploads", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/alice.jpg）。常见格式都支持（jpg/png/bmp/webp/tiff/gif...），过大的图会本地缩放，不需要预处理"},
+                # `format: file` makes the canvas render a file picker;
+                # `uploadTo: mcp` sends it to POST /api/mcp/<id>/file/upload,
+                # which streams the bytes to *this* service and returns the path
+                # they landed on here. So the value this field receives is
+                # already a path perception can open — no shared mount, and no
+                # container recreation to make one appear.
+                "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/alice.jpg）。常见格式都支持（jpg/png/bmp/webp/tiff/gif...），过大的图会本地缩放，不需要预处理"},
                 "url":        {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/alice.jpg。下载后本地解码缩放，格式限制同 image_path"},
                 "name":       {"type": "string", "description": "姓名（结构化），如 \"小王\"。有 name 才算已注册；每次识别都会随 id 一起输出"},
                 "profile":    {"type": "object", "description": "非结构化画像对象，如 {\"gender\":\"male\",\"team\":\"运营部\",\"note\":\"常穿蓝色外套\"}。键名自定，随 name 一起在每帧输出；传字符串会被存成 {\"note\":\"...\"}"},
@@ -550,9 +549,9 @@ def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
         # the model that reaches for base64 has the file in hand already.
         raise _BadInput(
             "image_b64 is no longer accepted — a long base64 string does not "
-            "survive being carried through an LLM's context. Use image_path "
-            "(upload from the card, or write the file into a directory both "
-            "agent-core and perception mount) or register_by_url instead.",
+            "survive being carried through an LLM's context. Upload the file "
+            "through POST /api/mcp/<mcp_id>/file/upload and pass the path it "
+            "returns as image_path, or use register_by_url.",
             "image_b64",
         )
 
@@ -590,8 +589,9 @@ def _check_under_roots(path: str, cfg: dict) -> str:
     raise _BadInput(
         f"path must be under one of {', '.join(roots)}: got {path!r}. "
         "If you are writing the file from another container (e.g. agent-core), "
-        "write it to /uploads — that directory is mounted into both — or use "
-        "register_by_url.",
+        "If you are calling from another container, upload the file through "
+        "POST /api/mcp/<mcp_id>/file/upload — the reply carries a path this "
+        "container can open — or use register_by_url.",
         path,
     )
 

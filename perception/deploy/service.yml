@@ -22,15 +22,6 @@ perception:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
-    # Shared image drop-off, mounted at the same path by agent-core (see
-    # agent-core/deploy/docker-compose.yml). This is how a photo reaches this
-    # container: the canvas file picker uploads through agent-core's
-    # /api/file/upload, and the LLM writes downloads here — both land on the
-    # host directory, and perception reads the same path back. Without a shared
-    # mount there is *no* path both containers can name: agent-core's /tmp and
-    # /work are its own, and a base64 argument is not a workable substitute
-    # (a 40 000-character string does not survive an LLM's context).
-    - /opt/embodied/uploads:/uploads
     # DDS profile 只读挂载。必须与其它 DDS 容器加载同一份，
     # 否则本容器会与本机其余部分失联。
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
