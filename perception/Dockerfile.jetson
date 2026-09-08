@@ -431,7 +431,7 @@ RUN . /etc/jetpack.env && \
         61)  ORT_WHEEL="onnxruntime==1.18.0" ;; \
         *)   ORT_WHEEL="onnxruntime==1.18.1" ;; \
     esac && \
-    pip3 install --no-cache-dir --no-deps -i https://mirrors.tencentyun.com/pypi/simple/ "${ORT_WHEEL}"
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} "${ORT_WHEEL}"
 
 # ── JP6.1: Enable GPU using sherpa-onnx's bundled onnxruntime ────────────────
 # sherpa-onnx 1.13.6+cuda bundles onnxruntime 1.18.0 compiled against cuDNN 9,
