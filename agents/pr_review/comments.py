@@ -594,3 +594,63 @@ Commit: `{head_sha[:7]}`
 
 Push a fix and comment `/request_bot_review` again to retrigger.
 """
+
+
+def format_help_message() -> str:
+    """Help message explaining how to use the bot review command."""
+    return f"""{BOT_MARKER}
+## PR Review Agent — Usage
+
+### Basic Usage
+```
+/request_bot_review
+```
+Triggers a full build and review of the current PR head commit.
+
+### Options
+
+- **`help`** — Show this help message
+  ```
+  /request_bot_review help
+  ```
+
+- **`force`** — Re-review a commit that was already reviewed
+  ```
+  /request_bot_review force
+  ```
+
+- **`skip-build`** — Skip the build step, only run the review (requires cached build)
+  ```
+  /request_bot_review skip-build
+  ```
+
+- **`build-only`** — Only build, skip the review step
+  ```
+  /request_bot_review build-only
+  ```
+
+- **Target Selection** — Build specific components
+  ```
+  /request_bot_review core           # Build core only
+  /request_bot_review perception     # Build perception only
+  /request_bot_review unitree/g1     # Build specific driver
+  ```
+
+- **JetPack Variants** — Build perception for specific JetPack versions
+  ```
+  /request_bot_review jp511          # JetPack 5.11
+  /request_bot_review jp61           # JetPack 6.1
+  /request_bot_review jp511 jp61     # Both versions
+  ```
+
+### Combining Options
+```
+/request_bot_review force perception jp61
+/request_bot_review core unitree/g1
+```
+
+### Notes
+- Only one review runs at a time per commit. Repeat triggers on the same commit are skipped unless `force` is specified.
+- Build artifacts are cached, so `skip-build` works only after a successful build.
+- Reviews typically take 15-25 minutes depending on the PR size and build targets.
+"""

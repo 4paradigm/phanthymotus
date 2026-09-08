@@ -57,6 +57,17 @@ async def create_job_from_comment(
     if trigger is None:
         return None
 
+    # Handle help request
+    if trigger.get("help"):
+        logger.info(f"Help requested on {repo_full_name}#{pr_number}")
+        try:
+            await github_client.add_reaction(repo_full_name, comment_id, "eyes")
+            help_text = comments.format_help_message()
+            await github_client.post_comment(repo_full_name, pr_number, help_text)
+        except Exception as e:
+            logger.warning(f"Failed to post help message: {e}")
+        return None
+
     if repo_full_name not in config.repos:
         logger.warning(f"Ignoring trigger for unconfigured repo: {repo_full_name}")
         return None

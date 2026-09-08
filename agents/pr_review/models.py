@@ -311,6 +311,7 @@ def parse_trigger_command(comment_body: str) -> dict | None:
             "force": False,
             "force_targets": [],
             "perception_variants": [],
+            "help": False,
         }
         for arg in args:
             token = arg.strip().strip("`,")
@@ -322,6 +323,8 @@ def parse_trigger_command(comment_body: str) -> dict | None:
             elif lowered in ("force", "--force", "-f"):
                 # Re-review a commit that was already reviewed.
                 result["force"] = True
+            elif lowered in ("help", "-h", "--help"):
+                result["help"] = True
             elif lowered in ("core", "perception"):
                 result["force_targets"].append(lowered)
             elif JP_TOKEN_PATTERN.match(lowered):
