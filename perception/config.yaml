@@ -82,3 +82,18 @@ plugins:
       det_thresh: 0.1
       det_box_thresh: 0.1
     min_interval_ms: 0
+
+  obstacle:
+    enabled: true
+    provider: local
+    model_dir: /models/obstacle/dav2-small-metric
+    decision_threshold_m: 2.0
+    fallback_distance_m: 3.0
+    soft_timeout_s: 2.5
+    indoor:
+      roi: [0, 300, 213, 426]
+      roi_reference_size: [480, 640]
+      depth_percentile: 1.0
+      min_output_distance_m: 0.3
+      max_output_distance_m: 10.0
+      min_valid_pixels: 64
