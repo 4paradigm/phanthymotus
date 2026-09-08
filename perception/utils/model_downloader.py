@@ -594,6 +594,35 @@ OCR_MODEL_BUNDLES = {
 }
 
 
+# ── Indoor obstacle distance (DAv2-Small TensorRT engines) ─────────────
+OBSTACLE_MODEL_REVISION = "c01f28781812143550249725f1ce1ed4eac165a7"
+OBSTACLE_MODEL_BASE = os.environ.get(
+    "OBSTACLE_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    f"obstacle-indoor-dav2-small-trt/resolve/{OBSTACLE_MODEL_REVISION}",
+)
+OBSTACLE_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{OBSTACLE_MODEL_BASE}/jp61",
+        "files": {
+            "indoor-metric.engine": {
+                "size": 53636420,
+                "sha256": "2c9b5c2041c618cdaa2de13ac38396e729e3dcb21d9037a350c57f0973b40054",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": f"{OBSTACLE_MODEL_BASE}/jp511",
+        "files": {
+            "indoor-metric.engine": {
+                "size": 51526115,
+                "sha256": "7b0a0b47befca4e2df4480dfcf81a5854917e92e3efcb7148e0a3e3aa1bab4ed",
+            },
+        },
+    },
+}
+
+
 def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
     """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
     model_dir = require_models_subpath(model_dir)
@@ -742,3 +771,22 @@ def ensure_vits2_model(model_dir: str, family: str | None = None) -> str:
         entry,
     )
     return os.path.join(model_dir, "engines", key)
+
+
+def ensure_obstacle_models(
+    model_dir: str, bundle: str | None = None
+) -> dict[str, str]:
+    """Ensure the obstacle TensorRT engines matching the runtime TensorRT.
+
+    ``bundle`` (or the OBSTACLE_MODEL_BUNDLE environment variable) is an
+    explicit test override such as "jp61"/"jp511"; production deployments
+    leave it unset and follow the importable TensorRT version.
+    """
+    family = bundle or os.environ.get("OBSTACLE_MODEL_BUNDLE") or None
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(OBSTACLE_MODEL_BUNDLES, family)
+    entry = OBSTACLE_MODEL_BUNDLES[key]
+    log.info(f"[model_downloader] obstacle: using {key} bundle")
+    return ensure_verified_bundle(
+        f"obstacle/{key}", model_dir, entry["base_url"], entry["files"]
+    )
