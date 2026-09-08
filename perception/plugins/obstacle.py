@@ -339,6 +339,17 @@ class ObstacleDistancePlugin:
         merged.update(self._instance_configs.get(node_key, {}))
         return merged
 
+    def _cached_adapter_locked(self, node_key: str) -> LocalDistanceAdapter | None:
+        """Read a current adapter without building. Caller holds _state_lock."""
+        if self._adapter_state != "ready":
+            return None
+        if not self._instance_configs.get(node_key):
+            return self._adapter
+        cached = self._instance_adapters.get(node_key)
+        if cached is not None and cached[0] == self._effective_cfg_locked(node_key):
+            return cached[1]
+        return None
+
     def _dispose(self, node_key: str, node: "_ObstacleNode") -> None:
         """Stop worker and fully destroy the node. Never called under lock."""
         try:
@@ -487,7 +498,11 @@ class ObstacleDistancePlugin:
                     generation == self._load_generation
                     and self._pending_starts.get(node_key) == input_topic
                 )
-                still_wanted = entry_valid and node_key not in self._nodes
+                still_wanted = (
+                    entry_valid
+                    and node_key not in self._nodes
+                    and self._cached_adapter_locked(node_key) is node_adapter
+                )
                 if still_wanted:
                     try:
                         self._executor.add_node(node)
@@ -499,7 +514,7 @@ class ObstacleDistancePlugin:
                         self._nodes[node_key] = node
                         del self._pending_starts[node_key]
                         registered = True
-                elif entry_valid:
+                elif entry_valid and node_key in self._nodes:
                     # A concurrent start already owns a live node for this
                     # key; drop the entry so the loop can progress.
                     del self._pending_starts[node_key]
@@ -645,21 +660,14 @@ class ObstacleDistancePlugin:
         start_node = None
         with self._state_lock:
             existing = self._nodes.get(node_key)
-            instance_cfg = self._instance_configs.get(node_key)
-            cached = self._instance_adapters.get(node_key)
-            adapter_available = self._adapter_state == "ready" and (
-                not instance_cfg
-                or (cached is not None and cached[0] == self._effective_cfg_locked(node_key))
-            )
-            if existing is not None:
+            node_adapter = self._cached_adapter_locked(node_key)
+            if existing is not None and node_adapter is not None:
                 start_node = existing        # idempotent re-start
-                shared = self._adapter
-            elif adapter_available:
+            elif node_adapter is not None:
                 # Claim the key before leaving the lock: a concurrent stop
                 # must always find the instance in _pending_starts or
                 # _nodes, never in an invisible in-between state.
                 self._pending_starts[node_key] = input_topic
-                shared = self._adapter
                 generation = self._load_generation
             else:
                 # Cold start, error retry, or an instance whose per-instance
@@ -673,7 +681,6 @@ class ObstacleDistancePlugin:
                     "output": f"{input_topic}/obstacle",
                 }
 
-        node_adapter = self._adapter_for_key(node_key, shared)
         if start_node is not None:
             return start_node.start(node_adapter)
 
@@ -686,7 +693,10 @@ class ObstacleDistancePlugin:
         with self._state_lock:
             claimed = self._pending_starts.get(node_key) == input_topic
             current = self._nodes.get(node_key)
-            fresh = generation == self._load_generation
+            fresh = (
+                generation == self._load_generation
+                and self._cached_adapter_locked(node_key) is node_adapter
+            )
             registered = False
             if claimed and current is None and fresh:
                 try:
@@ -701,8 +711,8 @@ class ObstacleDistancePlugin:
                     registered = True
             elif claimed and not fresh:
                 # A config change invalidated the adapter mid-start; keep the
-                # claim so the loader brings this instance up on the new one.
-                pass
+                # claim and let the existing loader build the replacement.
+                self._spawn_loader_locked()
             elif claimed:
                 del self._pending_starts[node_key]
         if not registered:
