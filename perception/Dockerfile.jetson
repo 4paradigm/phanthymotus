@@ -396,7 +396,7 @@ assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; \
 print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
     fi && rm -f /tmp/vits2-requirements.txt
 
-# ── onnxruntime, CPU-only (used by the face recognition plugin alone) ────────
+# ── onnxruntime-gpu (used by the face recognition plugin alone) ──────────────
 # A second ONNX Runtime: sherpa-onnx bundles its own but exposes no way to run
 # our models on it. They coexist fine — measured on Orin6, both import orders
 # and both holding live sessions.
@@ -411,13 +411,23 @@ print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
 # so this adds exactly one wheel and moves nothing else — numpy included, which
 # the torch/cv2/rapidocr stack is ABI-bound to.
 #
-# 1.18.1 pinned, and **never 1.19.x**: 1.19.2 pins a thread to every core in
+# **never 1.19.x**: 1.19.2 pins a thread to every core in
 # /sys/devices/system/cpu/present, so where a power mode has parked some (Tianyi
 # in MODE_30W: present 0-11, online 0-7) pthread_setaffinity_np returns EINVAL,
 # a vector index goes out of range, and all of perception abort()s inside
-# InferenceSession() with no traceback. 1.18.1 is also exactly what sherpa-onnx
-# bundles on jp6.1. Verified on Orin5 (py3.8, glibc 2.31) and Tianyi (py3.10).
-RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} onnxruntime==1.18.1
+# InferenceSession() with no traceback.
+#
+# GPU variant: NVIDIA provides onnxruntime-gpu wheels for Jetson. Hosted on COS.
+# jp5.11 uses 1.17.0 (CUDA 11.4, Python 3.8), jp6.1 uses CPU-only 1.18.1 for now
+# (Python 3.10 GPU wheel to be added). The GPU wheel is ~37-50 MB vs ~5 MB for
+# CPU-only, but provides CUDAExecutionProvider and TensorrtExecutionProvider.
+RUN . /etc/jetpack.env && \
+    case "${JP_VERSION}" in \
+        511) ORT_WHEEL="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/onnxruntime/jp511/onnxruntime_gpu-1.17.0-cp38-cp38-linux_aarch64.whl" ;; \
+        61)  ORT_WHEEL="onnxruntime==1.18.1" ;; \
+        *)   ORT_WHEEL="onnxruntime==1.18.1" ;; \
+    esac && \
+    pip3 install --no-cache-dir --no-deps "${ORT_WHEEL}"
 
 # ── Thai TTS frontend deps ────────────────────────────────────────
 # Three pure-Python wheels, no compiled extensions and no build-time model fetch,
