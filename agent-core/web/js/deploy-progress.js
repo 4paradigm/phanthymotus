@@ -431,9 +431,8 @@ class DeployProgressUI {
 
         if (type === 'check') {
             this._addCheck(checkId, message, status);
-            // Also log checks
-            const statusIcon = status === 'pass' ? '✓' : status === 'fail' ? '✗' : '⚠';
-            this._addLog(`${statusIcon} ${message}`, status === 'fail' ? 'error' : 'success');
+            // Log checks (message already contains ✓/✗ from backend)
+            this._addLog(message, status === 'fail' ? 'error' : 'success');
         } else if (type === 'layer') {
             // Log layer completion
             this._addLog(`  ${layer_id}: ${status}`, 'info');
@@ -506,8 +505,10 @@ class DeployProgressUI {
         // Add log entry for significant progress updates
         if (stage === 'pull' && percent !== undefined) {
             // Throttle pull progress logs (only log every 10%)
-            const lastLoggedPercent = this._lastLoggedPercent || 0;
-            if (Math.floor(percent / 10) > Math.floor(lastLoggedPercent / 10)) {
+            const currentBucket = Math.floor(percent / 10);
+            const lastBucket = Math.floor(this._lastLoggedPercent / 10);
+
+            if (currentBucket > lastBucket) {
                 const progressMsg = `${message} - ${percent.toFixed(1)}%` + (speed ? ` (${speed})` : '');
                 this._addLog(progressMsg, 'info');
                 this._lastLoggedPercent = percent;
