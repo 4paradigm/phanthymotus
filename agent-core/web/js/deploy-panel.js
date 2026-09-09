@@ -257,9 +257,14 @@ function _renderMyServices() {
     const tags = _channelTags(item);
     const latestTag = tags.length > 0 ? tags[0].tag : null;
     const currentTag = s.running_image?.includes(':') ? s.running_image.split(':').pop() : null;
-    const hasUpdate = latestTag && currentTag && latestTag !== currentTag;
+    // 容器不在时 running_image 是空的（停止、部署失败、或被删掉），此时仍要拿
+    // last_deploy 里记的镜像来比对。否则 hasUpdate 静默变 false，版本行退回去显示
+    // 上次部署的 tag，看起来就像「装的这个已经是最新」——而它可能落后好几个版本。
+    const installedTag = currentTag
+      || (s.last_deploy?.image?.includes(':') ? s.last_deploy.image.split(':').pop() : null);
+    const hasUpdate = latestTag && installedTag && latestTag !== installedTag;
 
-    const entry = { item, id, s, latestTag, currentTag, hasUpdate };
+    const entry = { item, id, s, latestTag, currentTag, installedTag, hasUpdate };
 
     if ((s.running || item._cat === 'core') && hasUpdate) {
       updatable.push(entry);
@@ -358,7 +363,7 @@ function _svcGroupHTML(title, count, cls) {
     </div>`;
 }
 
-function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
+function _svcRowHTML({ item, id, s, latestTag, currentTag, installedTag, hasUpdate }) {
   const label = item._cat === 'driver' ? (item.model || item.image) : (item.name || item.image);
   const isRunning = s.running || item._cat === 'core';
   const statusDot = isRunning ? 'running' : s.status === 'error' ? 'error' : 'stopped';
@@ -385,7 +390,7 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
   }
   if (hasUpdate) {
     const latestImage = tags[0]?.imageRef || (imageBase + ':' + latestTag);
-    actions += `<button class="svc-btn svc-btn-upgrade" data-action="upgrade" data-driver-id="${id}" data-current-tag="${currentTag}" data-latest-tag="${latestTag}" data-latest-image="${latestImage}" data-label="${label}">升级</button>`;
+    actions += `<button class="svc-btn svc-btn-upgrade" data-action="upgrade" data-driver-id="${id}" data-current-tag="${installedTag || ''}" data-latest-tag="${latestTag}" data-latest-image="${latestImage}" data-label="${label}">升级</button>`;
   }
   if (item._cat === 'core') {
     // Core cannot stop itself — no stop button
@@ -405,9 +410,8 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
 
   // 孤儿服务没有 catalog 条目，停止时 running_image 也是空的 —— 退回到 manifest 里记录的
   // 镜像，否则用户看到的只有一个「—」，没法知道自己装的到底是哪个版本。
-  const versionText = currentTag
-    || (s.running_image?.split(':').pop())
-    || (item._orphan ? (s.image || s.last_deploy?.image || '').split(':').pop() : '')
+  const versionText = installedTag
+    || (item._orphan ? (s.image || '').split(':').pop() : '')
     || '—';
 
   return `

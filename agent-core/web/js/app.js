@@ -124,7 +124,9 @@ async function checkForUpdate() {
     const json = await res.json();
     if (json.code !== 200 || !json.data) return;
 
-    // Find services that have a newer image available vs what's running
+    // Find services that have a newer image available vs what's installed.
+    // 只在服务确实在跑时提示升级：容器没跑的场景（停止、部署失败）该走部署面板的
+    // 启动/重试流程，顶栏一个「升级」按钮解决不了它，只会盖住真实状态。
     const updatable = json.data.filter(d => {
       if (!d.running && d.category !== 'core') return false;  // core is always running if responding
       if (!d.image || !d.running_image) return false;
@@ -140,7 +142,12 @@ async function checkForUpdate() {
       latestTag:  _tagFromImage(d.image),
     }));
 
-    if (!updatable.length) return;
+    if (!updatable.length) {
+      // 没有可更新项时必须收起横幅：这个函数会被重复调用（升级完成后、渠道切换后），
+      // 早期版本直接 return，导致一条早已失效的「发现新版本」永久挂在顶栏。
+      document.getElementById('update-banner')?.classList.add('hidden');
+      return;
+    }
 
     // Sort by priority: core > perception > driver
     updatable.sort((a, b) => {
@@ -224,6 +231,10 @@ async function _deployServices(services) {
   setTimeout(() => {
     document.getElementById('update-banner').classList.add('hidden');
   }, 3000);
+  // deploy-v2 是后台任务，立刻返回时容器还没换版本，此刻复查会读到旧 running_image
+  // 又把横幅点亮。留一段时间让容器起来再校验——多服务升级里可能只有一部分成功，
+  // 剩下的仍需提示。
+  setTimeout(checkForUpdate, 30000);
 }
 
 async function _doUpdate(image, tag) {
