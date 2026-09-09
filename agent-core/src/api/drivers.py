@@ -586,9 +586,32 @@ async def _run_in_executor(fn, *args):
 
 # ── Registry sync helper ───────────────────────────────────────────────────
 
-def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
+# Which tag channels each update channel may resolve to. Must stay in sync with
+# _CHANNEL_TAGS in web/js/deploy-panel.js — the version list the user picks from
+# is built with the frontend's copy, and if this one disagrees the manifest ends
+# up pointing at a tag the panel never offers. That divergence is invisible until
+# it isn't: on preview, the unfiltered tags[0] is usually a ga build, so the
+# update banner (which reads manifest.image) advertises a version the deploy
+# panel simultaneously reports as already-latest.
+_CHANNEL_TAGS = {
+    'ga':      ('ga',),
+    'release': ('release', 'ga'),
+    'preview': ('preview',),
+}
+
+
+def _channel_tags(tags: list, channel: str) -> list:
+    """Filter catalog tags down to those visible on `channel`, order preserved."""
+    allowed = _CHANNEL_TAGS.get(channel, _CHANNEL_TAGS['ga'])
+    return [t for t in tags if t.get('channel') in allowed]
+
+
+def _upsert_from_catalog(manifest: list, catalog: dict, channel: str = '') -> tuple[int, int]:
     """Upsert drivers from registry catalog into manifest list (in-place).
     Returns (added, updated) counts.
+
+    `channel` is the active update channel; tags outside it are ignored when
+    resolving which image a driver should point at.
     """
     added = 0
     updated = 0
@@ -597,7 +620,7 @@ def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
     all_items = [item for c in CATEGORIES for item in catalog.get(c, [])]
 
     for item in all_items:
-        tags = item.get('tags', [])
+        tags = _channel_tags(item.get('tags', []), channel)
         if not tags:
             continue
 
@@ -730,7 +753,7 @@ async def drivers_sync():
     _registry_cache[cache_key(channel)] = {'data': catalog, 'ts': __import__('time').time()}
 
     manifest = _load_manifest()
-    added, updated = _upsert_from_catalog(manifest, catalog)
+    added, updated = _upsert_from_catalog(manifest, catalog, channel)
     _save_manifest(manifest)
     return {'code': 200, 'data': {'added': added, 'updated': updated}}
 

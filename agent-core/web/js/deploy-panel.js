@@ -84,7 +84,10 @@ async function _onChannelChange(e) {
       body: JSON.stringify({ channel }),
     });
     _currentChannel = channel;
-    await _loadCatalog(true);
+    // manifest.image 是按渠道解析出来的，换了渠道就得重新 sync；否则它仍指向上个
+    // 渠道的标签，顶栏（读 manifest.image）会继续报一个当前渠道里并不存在的版本。
+    try { await fetch('/api/drivers/sync', { method: 'POST' }); } catch { /* ignore */ }
+    await Promise.all([_loadCatalog(true), _loadStatuses()]);
     _render();
   } catch { /* ignore */ }
 }
