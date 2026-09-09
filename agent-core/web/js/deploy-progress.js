@@ -33,7 +33,7 @@ class DeployProgressMonitor {
     connect() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const token = localStorage.getItem('phanthy_access_token') || '';
-        const url = `${protocol}//${window.location.host}/ws/deploy/${this.driverId}?token=${token}`;
+        const url = `${protocol}//${window.location.host}/api/ws/deploy/${this.driverId}?token=${token}`;
 
         console.log('[DeployProgress] Connecting to:', url);
         this.ws = new WebSocket(url);
