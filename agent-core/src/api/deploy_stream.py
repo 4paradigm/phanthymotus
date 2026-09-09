@@ -30,15 +30,22 @@ router = fastapi.APIRouter(tags=['deploy'])
 # Per-driver deployment streams: {driver_id: set(queue)}
 _streams: dict[str, Set[asyncio.Queue]] = {}
 
+# Active deployments: {driver_id: {'status': 'deploying', 'image': '...', 'start_ts': ...}}
+_active_deployments: dict[str, dict] = {}
+
 
 class DeployProgress:
     """Context manager for deployment progress streaming."""
 
-    def __init__(self, driver_id: str):
+    def __init__(self, driver_id: str, image: str = ''):
         self.driver_id = driver_id
+        self.image = image
         self.start_ts = time.time()
 
     async def __aenter__(self):
+        # Mark deployment as active
+        mark_deployment_start(self.driver_id, self.image)
+
         await self._push({
             'type': 'start',
             'message': '开始部署…',
@@ -46,6 +53,9 @@ class DeployProgress:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Clear deployment state
+        mark_deployment_end(self.driver_id)
+
         if exc_type:
             await self.error('deploy', f'部署异常: {exc_val}')
         return False
@@ -160,3 +170,48 @@ async def deploy_ws(driver_id: str, websocket: fastapi.WebSocket):
             _streams[driver_id].discard(queue)
             if not _streams[driver_id]:
                 del _streams[driver_id]
+
+
+@router.get('/api/deploying')
+async def get_active_deployments():
+    """Get list of currently active deployments.
+
+    Returns:
+        {
+            'deployments': [
+                {
+                    'driver_id': 'perception',
+                    'status': 'deploying',
+                    'image': 'bj-warehouse.../perception:release...',
+                    'start_ts': 1234567890,
+                    'elapsed': 45.2
+                }
+            ]
+        }
+    """
+    now = time.time()
+    deployments = []
+    for driver_id, info in _active_deployments.items():
+        deployments.append({
+            'driver_id': driver_id,
+            'status': info.get('status', 'deploying'),
+            'image': info.get('image', ''),
+            'start_ts': info.get('start_ts', 0),
+            'elapsed': round(now - info.get('start_ts', now), 1),
+        })
+    return {'deployments': deployments}
+
+
+def mark_deployment_start(driver_id: str, image: str):
+    """Mark a deployment as started (called from drivers_async.py)."""
+    _active_deployments[driver_id] = {
+        'status': 'deploying',
+        'image': image,
+        'start_ts': time.time(),
+    }
+
+
+def mark_deployment_end(driver_id: str):
+    """Mark a deployment as finished (called from drivers_async.py)."""
+    if driver_id in _active_deployments:
+        del _active_deployments[driver_id]

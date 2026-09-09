@@ -42,7 +42,7 @@ async def _deploy_with_progress(driver: dict) -> dict:
     name = _container_name(driver_id, driver.get('container_name', ''))
     target_image = driver['image']
 
-    async with DeployProgress(driver_id) as progress:
+    async with DeployProgress(driver_id, target_image) as progress:
         # Check if already running with same image
         try:
             client = _docker()

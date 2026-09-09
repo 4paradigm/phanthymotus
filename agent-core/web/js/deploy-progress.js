@@ -546,5 +546,54 @@ class DeployProgressUI {
     }
 }
 
+// Auto-restore active deployments on page load
+async function restoreActiveDeployments() {
+    try {
+        const token = localStorage.getItem('phanthy_access_token') || '';
+        const response = await fetch('/api/deploying', {
+            headers: { 'Authorization': `Bearer ${token}` }
+        });
+
+        if (!response.ok) {
+            console.warn('[DeployProgress] Failed to fetch active deployments:', response.status);
+            return;
+        }
+
+        const data = await response.json();
+        const deployments = data.deployments || [];
+
+        console.log('[DeployProgress] Found active deployments:', deployments);
+
+        // Restore each active deployment
+        for (const deployment of deployments) {
+            const driverMap = {
+                'perception': 'Perception Stack',
+                'planning': 'Planning',
+                'control': 'Control',
+            };
+            const driverName = driverMap[deployment.driver_id] || deployment.driver_id;
+
+            console.log(`[DeployProgress] Restoring ${deployment.driver_id}...`);
+
+            // Create progress window
+            const progressWindow = new DeployProgressUI(deployment.driver_id, driverName);
+            progressWindow.show();
+
+            // Add a message indicating reconnection
+            const elapsed = Math.floor(deployment.elapsed || 0);
+            progressWindow._addLog(`重新连接到部署会话 (已运行 ${elapsed}s)`, 'info');
+        }
+    } catch (error) {
+        console.error('[DeployProgress] Error restoring deployments:', error);
+    }
+}
+
+// Run on page load
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', restoreActiveDeployments);
+} else {
+    restoreActiveDeployments();
+}
+
 // ES6 module exports
 export { DeployProgressMonitor, DeployProgressUI };
