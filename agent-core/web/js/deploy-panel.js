@@ -6,6 +6,8 @@
  *   Tab 2 「驱动市场」— 浏览和安装新驱动（flat grid + filter chips）
  */
 
+import { DeployProgressUI } from './deploy-progress.js';
+
 let _overlay  = null;
 let _polling  = null;
 
@@ -1002,9 +1004,16 @@ async function _executeDeploys(entries) {
         _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
       }
     } else {
-      _showDeployLogAny(driverId, '正在请求部署…');
+      // Try new deploy-v2 with progress, fallback to old API
+      const s = _statuses[driverId] || {};
+      const driverName = s.name || driverId;
+
+      // Show progress UI
+      const progressUI = new DeployProgressUI(driverId, driverName);
+      progressUI.show();
+
       try {
-        const res = await fetch(`/api/drivers/${driverId}/deploy`, {
+        const res = await fetch(`/api/drivers/${driverId}/deploy-v2`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ image }),
@@ -1012,12 +1021,14 @@ async function _executeDeploys(entries) {
         const json = await res.json();
         if (json.code !== 200) {
           _appendLogAny(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
+          progressUI.close();
         } else {
-          _appendLogAny(driverId, '镜像拉取中…');
-          _startLogPolling(driverId);
+          _appendLogAny(driverId, '部署中…（查看进度窗口）');
+          // Progress UI will auto-close on completion
         }
       } catch (e) {
         _appendLogAny(driverId, `✗ 网络错误: ${e.message}`, 'error');
+        progressUI.close();
       }
     }
   }

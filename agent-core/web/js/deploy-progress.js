@@ -417,7 +417,5 @@ class DeployProgressUI {
     }
 }
 
-// Export for use in other modules
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { DeployProgressMonitor, DeployProgressUI };
-}
+// ES6 module exports
+export { DeployProgressMonitor, DeployProgressUI };
