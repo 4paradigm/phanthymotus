@@ -172,7 +172,7 @@ async def deploy_ws(driver_id: str, websocket: fastapi.WebSocket):
                 del _streams[driver_id]
 
 
-@router.get('/api/deploying')
+@router.get('/deploying')
 async def get_active_deployments():
     """Get list of currently active deployments.
 

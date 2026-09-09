@@ -146,11 +146,11 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
     """Pull image and report progress via WebSocket."""
     loop = asyncio.get_event_loop()
 
-    def schedule_update(percent, speed_mbps, layer_count):
+    def schedule_update(percent, speed_mbps, status_msg):
         """Thread-safe progress update."""
         async def do_update():
             await progress.update(
-                'pull', f'拉取进度: {layer_count} 层',
+                'pull', f'拉取进度: {status_msg}',
                 percent=percent, speed=f'{speed_mbps:.1f} MB/s'
             )
         loop.call_soon_threadsafe(lambda: asyncio.create_task(do_update()))
@@ -203,10 +203,22 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
                     # Estimate speed (rough approximation)
                     elapsed = now - start_time
                     speed_mbps = (total_current / (1 << 20)) / max(0.1, elapsed)
-                    
+
+                    # Count layers by status
+                    downloading = sum(1 for l in layers.values() if l.get('status') == 'Downloading')
+                    extracting = sum(1 for l in layers.values() if l.get('status') == 'Extracting')
+
+                    # Build status message
+                    status_parts = []
+                    if downloading > 0:
+                        status_parts.append(f'{downloading} 层下载中')
+                    if extracting > 0:
+                        status_parts.append(f'{extracting} 层提取中')
+                    status_msg = ', '.join(status_parts) if status_parts else f'{len(layers)} 层'
+
                     # Push progress update to WebSocket (thread-safe)
-                    schedule_update(percent, speed_mbps, len(layers))
-                    
+                    schedule_update(percent, speed_mbps, status_msg)
+
                     # Also log it
                     _log_deploy(driver_id, f'[pull] {percent:.1f}% ({len(layers)} layers, {speed_mbps:.1f} MB/s)')
                 last_update = now
