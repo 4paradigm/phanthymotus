@@ -91,8 +91,9 @@ async def _deploy_with_progress(driver: dict) -> dict:
 
         # Pull image with progress tracking
         await progress.update('pull', f'开始拉取镜像 {target_image}…', percent=0)
-        _clear_deploy_log(driver_id)
+        # Pull image (this may take several minutes for large images)
         _log_deploy(driver_id, f'[pull] {target_image}')
+        await progress.update('pull', '正在拉取镜像，请稍候...', percent=10)
 
         pull_result = await _pull_image_with_progress(driver_id, target_image, progress)
 

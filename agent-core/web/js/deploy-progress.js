@@ -304,9 +304,9 @@ class DeployProgressUI {
                     font-weight: 500;
                 }
                 .deploy-progress-bar {
-                    height: 8px;
+                    height: 12px;
                     background: #333;
-                    border-radius: 4px;
+                    border-radius: 6px;
                     overflow: hidden;
                     margin-bottom: 10px;
                 }
