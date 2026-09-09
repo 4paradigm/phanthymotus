@@ -367,7 +367,7 @@ def make_handler():
                 if method == "initialize":
                     log.debug(f"[mcp] initialize request from client")
                     ok({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "perception-bundle", "version": "1.0.0"}})
+                        "serverInfo": {"name": os.environ.get("MCP_SERVER_NAME", "perception-bundle"), "version": "1.0.0"}})
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
                 elif method == "tools/call":
@@ -508,7 +508,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
     _ctx.verify_mode = _ssl.CERT_NONE
     payload = json.dumps({
         "name": name,
-        "url":  f"http://localhost:{mcp_port}/mcp",
+        "url": os.environ.get("MCP_ADVERTISE_URL", f"http://localhost:{mcp_port}/mcp"),
         "category": category,
     }).encode()
     def _run():
@@ -560,7 +560,7 @@ def main():
     # Start WebSocket ASR server in a separate thread
     threading.Thread(target=_start_ws_thread, args=(ws_port,), daemon=True, name="ws_asr").start()
 
-    _start_registration(mcp_port, "Perception Stack", "perception")
+    _start_registration(mcp_port, os.environ.get("MCP_SERVER_NAME", "Perception Stack"), "perception")
 
     server = ThreadingHTTPServer(("", mcp_port), make_handler())
     log.info(f"MCP server → http://0.0.0.0:{mcp_port}")

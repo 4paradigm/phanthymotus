@@ -1,0 +1,18 @@
+# CPU development/replay image, independent of the production Jetson image.
+ARG ROS_BASE_IMAGE=ros:humble
+FROM ${ROS_BASE_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip git libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
+COPY plugins/requirements.vop-depth.txt /tmp/requirements.vop-depth.txt
+RUN python3 -m pip install --no-cache-dir --index-url https://pypi.org/simple \
+    numpy==1.26.4 torch==2.2.2 torchvision==0.17.2 opencv-python==4.11.0.86 \
+    websockets==16.1.1 pytest==8.3.3 pytest-mock==3.14.0 \
+    -r /tmp/requirements.vop-depth.txt && \
+    python3 -m pip install --no-cache-dir --no-deps \
+    git+https://github.com/ultralytics/CLIP.git@a13192f8cb767260d7dfd98c843b0716593169e7 && \
+    python3 -m pip install --no-cache-dir --index-url https://pypi.org/simple ftfy==6.3.1 regex==2024.11.6
+COPY . /work/
+ENV YOLO_CONFIG_DIR=/work YOLO_MODEL_DIR=/models PYTHONUNBUFFERED=1
+ENV CONFIG_PATH=/work/vop-replay.yaml
+CMD ["bash", "-c", "source /opt/ros/humble/setup.bash && python3 main.py"]

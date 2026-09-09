@@ -9,22 +9,25 @@ Supports multi-instance (one instance per input topic).
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import math
 import logging
 import os
 import queue
 import threading
 import time
 import urllib.request
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
-import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+
+from plugins.vop_depth import DepthEstimator, extract_objects, render_preview, unavailable
+from utils.cv2_compat import load_cv2
 
 log = logging.getLogger(__name__)
 
@@ -84,18 +87,27 @@ TOOLS = [
                     "description": "Extra object classes to add on top of COCO-80 base (for set_classes action)"
                 },
             },
-            "required": ["action"]
+            "required": ["action"],
+            "x-action-params": {
+                "start": {"params": ["input_topic"], "description": "Start VOP on an image topic"},
+                "stop": {"params": [], "description": "Stop and release this instance"},
+                "info": {"params": ["input_topic"], "description": "Read state and output topics"},
+                "set_classes": {"params": ["classes"], "description": "Add open-vocabulary classes"},
+                "config": {"params": [], "description": "Configure this instance before starting"},
+            }
         },
         "configSchema": {
             "type": "object",
             "properties": {
-                "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "scope": "instance"},
-                "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "scope": "instance"},
+                "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "minimum": 0, "maximum": 1, "scope": "instance"},
+                "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "minimum": 1, "maximum": 60, "scope": "instance"},
+                "depth_enabled": {"type": "boolean", "default": False, "scope": "instance", "description": "物体轮廓内最近相对深度（未标定，不是米制避障距离）"},
                 "classes":    {"type": "array", "items": {"type": "string"}, "description": "Extra object classes to add on top of COCO-80 base", "scope": "instance"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
-        "topic_out": [{"format": "data/json",  "desc": "detected objects with positions"}],
+        "topic_out": [{"format": "data/json", "desc": "detected objects with positions and relative depth"},
+                      {"format": "image/jpeg", "desc": "VOP 图像、分割轮廓与最近相对深度"}],
     }
 ]
 
@@ -103,112 +115,197 @@ TOOLS = [
 # ── ROS2 Node (one per instance/topic) ────────────────────────────────────────
 
 class _VOPNode(Node):
-    """Per-topic YOLO inference node."""
+    """One cancellable worker per input; previews and JSON share a source frame."""
 
-    def __init__(self, input_topic: str, model, confidence: float, fps: float,
-                 extra_classes: list[str], node_suffix: str):
+    def __init__(self, input_topic, plugin, config, node_suffix):
         super().__init__(f"vop_{node_suffix}")
         self._input_topic = input_topic
         self._output_topic = f"{input_topic}/objects"
-        self._model = model
-        self._confidence = confidence
-        self._fps = fps
-        self._frame_interval = 1.0 / max(fps, 0.1)
-        self._extra_classes = extra_classes
-        self._classes = list(_COCO_80_CLASSES) + [c for c in extra_classes if c not in _COCO_80_CLASSES]
-
+        self._preview_topic = f"{input_topic}/objects/preview"
+        self._plugin = plugin
+        self._confidence = config["confidence"]
+        self._fps = config["fps"]
+        self._extra_classes = config["classes"]
+        self._depth_enabled = config["depth_enabled"]
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
-        self._sub: Optional[object] = None
-        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
-        self._stop_event = threading.Event()
-        self._worker: Optional[threading.Thread] = None
-        self._last_inference_time = 0.0
-        self._detect_count = 0
-
-    def start(self) -> dict:
-        if self._sub is not None:
-            return {"state": "running", "input": self._input_topic, "output": self._output_topic}
-        self._stop_event.clear()
-        self._sub = self.create_subscription(
-            CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
-        )
-        self._worker = threading.Thread(target=self._inference_worker, daemon=True,
-                                        name=f"vop_worker_{self._input_topic}")
-        self._worker.start()
-        log.info(f"[vop] started: {self._input_topic} → {self._output_topic}")
-        return {"state": "running", "input": self._input_topic, "output": self._output_topic}
-
-    def stop(self) -> dict:
-        if self._sub is not None:
-            self.destroy_subscription(self._sub)
-            self._sub = None
-        self._stop_event.set()
-        if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=3.0)
+        self._preview_pub = self.create_publisher(CompressedImage, self._preview_topic, _PUB_QOS)
+        self._sub = None
+        self._timer = None
         self._worker = None
-        log.info(f"[vop] stopped: {self._input_topic}")
-        return {"state": "idle", "input": self._input_topic}
+        self._frame_queue = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.RLock()
+        self._publish_lock = threading.RLock()
+        self._state = "idle"
+        self._error = None
+        self._last_received = self._last_result = self._last_admitted = 0.0
+        self._started = 0.0
+        self._last_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        self._last_header = None
+        self._source_received = 0.0
+        self._detect_count = 0
+        self._sequence = 0
 
-    def _image_cb(self, msg: CompressedImage):
+    def start(self):
+        with self._lifecycle_lock:
+            if self._worker and self._worker.is_alive():
+                if self._state == "stale" and not self._stop_event.is_set():
+                    self._state, self._error = "waiting", None
+                    self._started = time.monotonic()
+                    self._last_received = self._last_result = 0.0
+                return self.info()
+            if self._stop_event.is_set():
+                return {"state": "idle", "error": "Stopped instance; start again after stop completes"}
+            self._state = "waiting"
+            self._started = time.monotonic()
+            self._sub = self.create_subscription(CompressedImage, self._input_topic,
+                                                  self._image_cb, _LOW_LAT_QOS)
+            self._timer = self.create_timer(1.0, self._watchdog)
+            self._worker = threading.Thread(target=self._run, daemon=True,
+                                            name=f"vop_{self.get_name()}")
+            self._worker.start()
+            return self.info()
+
+    def stop(self):
+        # Cancellation precedes the lifecycle lock so a concurrent start cannot win.
+        with self._publish_lock:
+            if not self._stop_event.is_set():
+                try:
+                    self._publish_status("stopped")
+                except Exception:
+                    log.exception("[vop] stop preview failed; continuing resource cleanup")
+            self._stop_event.set()
+            self._state = "stopping"
+        with self._lifecycle_lock:
+            if self._sub is not None:
+                self.destroy_subscription(self._sub)
+                self._sub = None
+            if self._timer is not None:
+                self.destroy_timer(self._timer)
+                self._timer = None
+            if self._worker:
+                self._worker.join(timeout=3.0)
+            if self._worker and self._worker.is_alive():
+                return {"state": "stopping", "input": self._input_topic}
+            self._state = "idle"
+            return {"state": "idle", "input": self._input_topic}
+
+    def info(self):
         now = time.monotonic()
-        if now - self._last_inference_time < self._frame_interval:
+        state = self._state
+        error = self._error
+        if state in ("waiting", "loading") or (state == "processing" and not self._last_result):
+            state = "loading"
+        elif state == "processing":
+            state = "running"
+        elif state in ("stale", "stopping"):
+            error = error or ("No image input for 3 seconds" if state == "stale" else "Stop is still in progress")
+            state = "error"
+        return {"state": state, "phase": self._state, "error": error,
+                "input": self._input_topic, "output": self._output_topic,
+                "preview": self._preview_topic, "confidence": self._confidence,
+                "fps": self._fps, "extra_classes": self._extra_classes,
+                "depth_enabled": self._depth_enabled, "detect_count": self._detect_count,
+                "result_age_s": now - self._last_result if self._last_result else None}
+
+    def _image_cb(self, msg):
+        if self._stop_event.is_set():
             return
-        self._last_inference_time = now
-        # Drop old frame if queue full (no backpressure)
+        now = time.monotonic()
+        self._last_received = now
+        if now - self._last_admitted < 1.0 / self._fps:
+            return
+        self._last_admitted = now
+        item = (msg, now)
         try:
-            self._frame_queue.put_nowait(msg.data)
+            self._frame_queue.put_nowait(item)
         except queue.Full:
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._frame_queue.put_nowait(msg.data)
+                self._frame_queue.put_nowait(item)
             except queue.Full:
                 pass
 
-    def _inference_worker(self):
-        import cv2
+    def _watchdog(self):
+        with self._publish_lock:
+            if self._stop_event.is_set():
+                return
+            now = time.monotonic()
+            if now - (self._last_received or self._started) > 3.0:
+                self._state = "stale"
+                self._publish_status("stale: no input")
+            elif self._state == "error" or (not self._last_result and self._state in ("loading", "processing")):
+                self._publish_status(self._state)
+
+    def _publish_status(self, status):
+        self._publish([], None, self._last_frame, self._last_header, status)
+
+    def _publish(self, objects, masks, frame, header, status):
+        with self._publish_lock:
+            if self._stop_event.is_set():
+                return
+            stamp = None
+            if header is not None:
+                stamp = header.stamp.sec + header.stamp.nanosec / 1e9
+            self._sequence += 1
+            frame_age = time.monotonic() - self._source_received if self._source_received else None
+            preview = render_preview(frame, objects, masks, status=status,
+                                     depth_enabled=self._depth_enabled,
+                                     source_stamp=stamp, sequence=self._sequence, frame_age_s=frame_age)
+            data = {"timestamp": time.time(), "source_timestamp": stamp,
+                    "frame_id": header.frame_id if header else "",
+                    "sequence": self._sequence, "status": status, "error": self._error,
+                    "frame_age_s": frame_age,
+                    "objects": objects}
+            message = String()
+            message.data = json.dumps(data, ensure_ascii=False, allow_nan=False)
+            image = CompressedImage()
+            if header is not None:
+                image.header = copy.deepcopy(header)
+            image.format, image.data = "jpeg", preview
+            self._pub.publish(message)
+            self._preview_pub.publish(image)
+
+    def _run(self):
         while not self._stop_event.is_set():
             try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                msg, received = self._frame_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            if time.monotonic() - received > 3.0:
+                continue
             try:
-                frame = cv2.imdecode(
-                    np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
-                )
+                cv2 = load_cv2()
+                frame = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
-                    continue
-                results = self._model(frame, conf=self._confidence, verbose=False)
-                objects = self._extract_objects(results[0], frame.shape)
-                self._publish_objects(objects)
-            except Exception as e:
-                log.error(f"[vop] inference error: {e}", exc_info=True)
-
-    def _extract_objects(self, result, shape) -> list:
-        H, W = shape[:2]
-        half_w, half_h = W / 2.0, H / 2.0
-        objects = []
-        for box in result.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            x_norm = round((cx - half_w) / half_w, 3)
-            y_norm = round((cy - half_h) / half_h, 3)
-            cls_id = int(box.cls[0])
-            name = result.names[cls_id]
-            conf = round(float(box.conf[0]), 2)
-            objects.append({"name": name, "position": [x_norm, y_norm], "confidence": conf})
-        return objects
-
-    def _publish_objects(self, objects: list):
-        self._detect_count += 1
-        msg = String()
-        msg.data = json.dumps({
-            "timestamp": time.time(),
-            "objects": objects,
-        }, ensure_ascii=False)
-        self._pub.publish(msg)
+                    raise ValueError("Invalid JPEG input")
+                with self._publish_lock:
+                    self._last_frame, self._last_header = frame, copy.deepcopy(msg.header)
+                    self._source_received = received
+                    self._state = "loading" if self._plugin._model is None else "processing"
+                objects, masks, error = self._plugin._infer(frame, self._confidence,
+                                                          self._depth_enabled, self._stop_event)
+                with self._publish_lock:
+                    if self._stop_event.is_set():
+                        break
+                    self._error = error
+                    # Never republish a completed inference as live after input has disappeared.
+                    if time.monotonic() - self._last_received > 3.0:
+                        self._state = "stale"
+                        self._publish_status("stale: no input")
+                        continue
+                    self._state = "error" if error else "running"
+                    self._publish(objects, masks, frame, msg.header, "depth_unavailable" if error else "ok")
+                    self._detect_count += 1
+                    self._last_result = time.monotonic()
+            except Exception as exc:
+                log.exception("[vop] frame failed")
+                with self._publish_lock:
+                    self._error, self._state = str(exc), "error"
+                    self._publish_status("error")
 
 
 # ── Plugin class ──────────────────────────────────────────────────────────────
@@ -225,36 +322,59 @@ class VideoObjectPerceptionPlugin:
         self._base_classes = list(_COCO_80_CLASSES)
         self._extra_classes: list[str] = plugin_cfg.get("classes") or []
         self._model = None  # lazy load
-        self._model_loading = False
-        self._model_load_error = None
-        self._model_lock = threading.Lock()
+        self._model_lock = threading.RLock()
+        self._nodes_lock = threading.RLock()
+        self._depth_enabled = plugin_cfg.get("depth_enabled", False)
+        self._depth = None
+        self._device = "cpu"
         self._nodes: dict[str, _VOPNode] = {}
         self._instance_configs: dict[str, dict] = {}  # per-instance config overrides
 
     def _get_all_classes(self) -> list[str]:
         """Merge base COCO-80 + global extra + all instance extra classes."""
         all_extra = set(self._extra_classes)
-        for cfg in self._instance_configs.values():
+        with self._nodes_lock:
+            configs = list(self._instance_configs.values())
+        for cfg in configs:
             for c in cfg.get("classes") or []:
                 all_extra.add(c)
         return self._base_classes + [c for c in sorted(all_extra) if c not in self._base_classes]
 
     def _sync_model_classes(self):
-        """Re-sync model classes after config change."""
-        if self._model is None:
-            return
-        classes = self._get_all_classes()
-        # Move model to CPU for set_classes (CLIP tokenizer outputs CPU tensors)
-        # then move back to GPU for inference
-        try:
+        with self._model_lock:
+            if self._model is None:
+                return
+            classes = self._get_all_classes()
             self._model.model.cpu()
-            self._model.set_classes(classes)
-            if self._device and self._device != "cpu":
+            try:
+                self._model.set_classes(classes)
+            finally:
                 self._model.model.to(self._device)
-        except Exception as e:
-            log.warning(f"[vop] set_classes failed: {e}, trying without device move")
-            self._model.set_classes(classes)
-        log.info(f"[vop] model classes synced: {len(classes)} total (+{len(classes) - len(self._base_classes)} extra)")
+
+    def _infer(self, frame, confidence, depth_enabled, cancelled):
+        # ponytail: shared models serialize instances; use per-device workers if throughput requires it.
+        with self._model_lock:
+            if cancelled.is_set():
+                return [], None, None
+            self._ensure_model()
+            if cancelled.is_set():
+                return [], None, None
+            result = self._model(frame, conf=confidence, verbose=False, device=self._device)[0]
+            objects = extract_objects(result, frame.shape)
+            if not depth_enabled or not objects:
+                return objects, None, None
+            try:
+                if self._depth is None:
+                    directory = os.path.join(os.environ.get("YOLO_MODEL_DIR", "/models"), "vop-depth")
+                    self._depth = DepthEstimator(directory, self._device)
+                depths, masks = self._depth.estimate(frame, [obj["bbox_xyxy"] for obj in objects])
+                for obj, depth in zip(objects, depths):
+                    obj["obstacle_depth"] = depth
+                return objects, masks, None
+            except Exception as exc:
+                for obj in objects:
+                    obj["obstacle_depth"] = unavailable("error")
+                return objects, None, str(exc)
 
     def _ensure_model(self):
         if self._model is not None:
@@ -270,30 +390,7 @@ class VideoObjectPerceptionPlugin:
             os.makedirs(_model_dir, exist_ok=True)
             os.environ.setdefault("TORCH_HOME", _model_dir)
 
-            # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
-            # and patch missing imshow for headless environments
-            try:
-                import cv2
-                # Test if cv2 is functional
-                _ = cv2.IMREAD_COLOR
-            except (ImportError, AttributeError):
-                import importlib.util, sys as _sys
-                import glob as _glob
-                # Find the .so directly
-                _so_candidates = _glob.glob("/usr/lib/python*/dist-packages/cv2/python-*/cv2.cpython-*.so")
-                if _so_candidates:
-                    _spec = importlib.util.spec_from_file_location("cv2", _so_candidates[0])
-                    _mod = importlib.util.module_from_spec(_spec)
-                    _spec.loader.exec_module(_mod)
-                    _sys.modules["cv2"] = _mod
-                    import cv2
-                else:
-                    import cv2  # let it fail naturally
-
-            if not hasattr(cv2, 'imshow'):
-                cv2.imshow = lambda *a, **k: None
-                cv2.waitKey = lambda *a, **k: 0
-                cv2.destroyAllWindows = lambda *a, **k: None
+            load_cv2()
 
             from ultralytics import YOLO
             import torch
@@ -303,16 +400,17 @@ class VideoObjectPerceptionPlugin:
 
             model_path = self._resolve_model_path()
             log.info(f"[vop] loading model: {model_path} (device={self._device})")
-            self._model = YOLO(model_path)
+            model = YOLO(model_path)
 
             # Ensure CLIP weights are available locally before set_classes
             self._ensure_clip_weights()
 
             classes = self._get_all_classes()
             # set_classes on CPU (model loads on CPU by default), then move to GPU
-            self._model.set_classes(classes)
+            model.set_classes(classes)
             if self._device != "cpu":
-                self._model.model.to(self._device)
+                model.model.to(self._device)
+            self._model = model
             log.info(f"[vop] model loaded, {len(classes)} classes ({len(classes) - len(self._base_classes)} extra)")
 
     def _resolve_model_path(self) -> str:
@@ -363,172 +461,133 @@ class VideoObjectPerceptionPlugin:
         urllib.request.urlretrieve(url, target_path)
         log.info(f"[vop] CLIP download complete: {target_path}")
 
-    def _start_node(self, node_key: str, input_topic: str):
-        """Create and start a VOPNode for the given topic."""
-        icfg = self._instance_configs.get(node_key, {})
-        confidence = float(icfg.get("confidence", self._confidence))
-        fps = int(icfg.get("fps", self._fps))
-        extra_classes = icfg.get("classes") or list(self._extra_classes)
-        suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
-        node = _VOPNode(input_topic, self._model, confidence, fps,
-                        extra_classes, node_suffix=suffix)
-        self._executor.add_node(node)
-        self._nodes[node_key] = node
-        node.start()
-        log.info(f"[vop] node started (background): {input_topic}")
+    def _config_for(self, key):
+        return {"confidence": self._confidence, "fps": self._fps,
+                "classes": self._extra_classes, "depth_enabled": self._depth_enabled,
+                **self._instance_configs.get(key, {})}
 
-    def get_tools(self) -> list:
+    @staticmethod
+    def _validate_config(cfg):
+        if "depth_enabled" in cfg and type(cfg["depth_enabled"]) is not bool:
+            raise ValueError("depth_enabled must be boolean")
+        for key, low, high in (("confidence", 0, 1), ("fps", 1, 60)):
+            if key in cfg:
+                value = cfg[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+                    raise ValueError(f"{key} must be between {low} and {high}")
+                if key == "fps" and int(value) != value:
+                    raise ValueError("fps must be an integer")
+        if "classes" in cfg and (not isinstance(cfg["classes"], list) or
+                any(not isinstance(c, str) or not c.strip() or len(c) > 100 for c in cfg["classes"])):
+            raise ValueError("classes must be a list of nonempty strings (max 100 characters)")
+
+    def _stop_nodes(self, instance_id):
+        with self._nodes_lock:
+            selected = [(k, n) for k, n in self._nodes.items() if not instance_id or k == instance_id]
+        results = []
+        for key, node in selected:
+            result = node.stop()
+            results.append(result)
+            if result["state"] == "idle":
+                self._dispose_node(key, node)
+            else:
+                with self._nodes_lock:
+                    if not getattr(node, "_cleanup_started", False):
+                        node._cleanup_started = True
+                        threading.Thread(target=self._finish_stop, args=(key, node), daemon=True,
+                                         name=f"vop_cleanup_{node.get_name()}").start()
+        if any(r["state"] == "stopping" for r in results):
+            return {"state": "stopping"}
+        return {"state": "idle"}
+
+    def _finish_stop(self, key, node):
+        node._worker.join()
+        self._dispose_node(key, node)
+
+    def _dispose_node(self, key, node):
+        with self._nodes_lock:
+            if self._nodes.get(key) is not node:
+                return
+            self._executor.remove_node(node)
+            node.destroy_node()
+            node._state = "idle"
+            del self._nodes[key]
+            # The shared depth models can be released once the final instance is gone.
+            if not self._nodes and self._model_lock.acquire(blocking=False):
+                try:
+                    self._depth = None
+                finally:
+                    self._model_lock.release()
+
+    def get_tools(self):
         return TOOLS
 
-    def dispatch(self, name: str, args: dict) -> dict | None:
+    def dispatch(self, name, args):
         action = args.get("action", name)
         instance_id = args.get("instance_id", "")
-
+        input_topic = args.get("input_topic") or next(iter(args.get("input_topics") or []), "")
         if action == "info":
-            # Report loading/error state
-            if self._model_loading:
-                return {
-                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
-                    "state": "loading",
-                    "desc": "Loading YOLO model...",
-                }
-            if self._model_load_error:
-                return {
-                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
-                    "state": "error",
-                    "desc": f"Model load failed: {self._model_load_error}",
-                }
-            instances = {}
-            for key, node in self._nodes.items():
-                instances[key] = {
-                    "input": node._input_topic,
-                    "output": node._output_topic,
-                    "confidence": node._confidence,
-                    "fps": node._fps,
-                    "extra_classes": node._extra_classes,
-                    "detect_count": node._detect_count,
-                }
-            # Determine topic info: from running instance, args, or empty
-            input_topic = args.get("input_topic", "")
-            if not input_topic:
-                topics_list = args.get("input_topics") or []
-                if topics_list:
-                    input_topic = topics_list[0]
-            # If instance_id specified and running, use its topics
-            if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                input_topic = node._input_topic
-            # If no explicit topic but there are running instances, use first one
-            elif not input_topic and self._nodes:
-                first_node = next(iter(self._nodes.values()))
-                input_topic = first_node._input_topic
-            topics_in = [{"topic": input_topic, "format": "image/jpeg"}] if input_topic else []
-            topics_out = [{"topic": f"{input_topic}/objects", "format": "data/json"}] if input_topic else []
-            state = "running" if instances else "idle"
-            return {
-                "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
-                "state": state,
-                "base_classes_count": len(self._base_classes),
-                "total_classes": len(self._get_all_classes()),
-                "instances": instances,
-                "topic_in": topics_in,
-                "topic_out": topics_out,
-                "desc": "YOLOv8-World open-vocabulary object detection",
-            }
-
-        elif action == "start":
-            input_topic = args.get("input_topic")
-            if not input_topic:
-                topics_list = args.get("input_topics") or []
-                if topics_list:
-                    input_topic = topics_list[0]
-            if not input_topic:
-                raise ValueError("input_topic is required")
-            node_key = instance_id or input_topic
-            if node_key not in self._nodes:
-                if self._model is None:
-                    if self._model_loading:
-                        return {"state": "loading", "message": "Model is still loading, please wait..."}
-                    if self._model_load_error:
-                        return {"state": "error", "message": f"Model failed to load: {self._model_load_error}"}
-                    # Model not loaded yet — start loading in background
-                    def _bg_start():
-                        self._model_loading = True
-                        self._model_load_error = None
-                        try:
-                            self._ensure_model()
-                            self._model_loading = False
-                            self._start_node(node_key, input_topic)
-                        except Exception as e:
-                            self._model_loading = False
-                            self._model_load_error = str(e)
-                            log.error(f"[vop] model load failed: {e}", exc_info=True)
-                    threading.Thread(target=_bg_start, daemon=True, name="vop_model_load").start()
-                    return {"state": "loading", "input": input_topic, "output": f"{input_topic}/objects",
-                            "message": "Model loading in background, will start automatically"}
-                self._start_node(node_key, input_topic)
-            return self._nodes[node_key].start()
-
-        elif action == "stop":
-            if instance_id and instance_id in self._nodes:
-                node = self._nodes[instance_id]
-                result = node.stop()
-                self._executor.remove_node(node)
-                del self._nodes[instance_id]
-                return result
-            elif not instance_id and self._nodes:
-                results = []
-                for key in list(self._nodes.keys()):
-                    node = self._nodes[key]
-                    node.stop()
-                    self._executor.remove_node(node)
-                    del self._nodes[key]
-                    results.append(key)
-                return {"state": "idle", "stopped_instances": results}
-            return {"state": "idle"}
-
-        elif action == "set_classes":
-            classes = args.get("classes")
-            if not classes:
-                raise ValueError("classes list is required")
-            if instance_id:
-                # Per-instance extra classes
-                cfg = self._instance_configs.setdefault(instance_id, {})
-                cfg["classes"] = classes
-                # Update running node if exists
-                if instance_id in self._nodes:
-                    self._nodes[instance_id]._extra_classes = classes
-                    self._nodes[instance_id]._classes = list(_COCO_80_CLASSES) + [c for c in classes if c not in _COCO_80_CLASSES]
-            else:
-                # Global extra classes
-                self._extra_classes = classes
-            # Sync model classes in background to avoid blocking HTTP (GPU model move is slow)
-            threading.Thread(target=self._sync_model_classes, daemon=True, name="vop_sync_classes").start()
-            return {"base_classes": len(self._base_classes), "extra_classes": classes, "total": len(self._get_all_classes())}
-
-        elif action == "config":
-            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and v != ''}
-            if instance_id:
-                self._instance_configs[instance_id] = cfg
-                # If instance is running, restart with new config
-                if instance_id in self._nodes:
-                    node = self._nodes[instance_id]
-                    input_topic = node._input_topic
-                    node.stop()
-                    self._executor.remove_node(node)
-                    del self._nodes[instance_id]
-                    # Will be re-created on next start with new config
-                return {"status": "configured", "instance_id": instance_id, "config": cfg}
-            else:
-                # Update global defaults
-                if "confidence" in cfg:
-                    self._confidence = float(cfg["confidence"])
-                if "fps" in cfg:
-                    self._fps = int(cfg["fps"])
-                if "classes" in cfg:
-                    self._extra_classes = cfg["classes"]
-                    # Sync model classes in background to avoid blocking HTTP
-                    threading.Thread(target=self._sync_model_classes, daemon=True, name="vop_sync_classes").start()
-                return {"status": "configured", "config": cfg}
-
+            with self._nodes_lock:
+                instances = {key: node.info() for key, node in self._nodes.items()}
+                selected = instances.get(instance_id) if instance_id else next(iter(instances.values()), None)
+                if selected:
+                    input_topic = selected["input"]
+                state = selected["state"] if selected else "idle"
+                return {"name": "VideoObjectPerception", "manufacture": "Embodied",
+                        "model": self._model_name, "state": state,
+                        "phase": selected["phase"] if selected else "idle",
+                        "error": selected["error"] if selected else None,
+                        "base_classes_count": len(self._base_classes),
+                        "total_classes": len(self._get_all_classes()), "instances": instances,
+                        "topic_in": [{"topic": input_topic, "format": "image/jpeg"}] if input_topic else [],
+                        "topic_out": [
+                            {"topic": f"{input_topic}/objects", "format": "data/json", "desc": "物体识别与相对深度"},
+                            {"topic": f"{input_topic}/objects/preview", "format": "image/jpeg", "desc": "VOP 分割与最近点预览"},
+                        ] if input_topic else [],
+                        "desc": "Open-vocabulary objects; optional uncalibrated mask-min depth"}
+        if action == "start":
+            if not isinstance(input_topic, str) or not input_topic.startswith("/"):
+                raise ValueError("input_topic must be an absolute ROS image topic")
+            key = instance_id or input_topic
+            with self._nodes_lock:
+                node = self._nodes.get(key)
+                if node is None:
+                    if any(n._input_topic == input_topic for n in self._nodes.values()):
+                        raise ValueError("This input already has a VOP instance; stop it before rebinding")
+                    cfg = self._config_for(key)
+                    self._validate_config(cfg)
+                    suffix = hashlib.sha256(key.encode()).hexdigest()[:12]
+                    node = _VOPNode(input_topic, self, cfg, suffix)
+                    try:
+                        self._executor.add_node(node)
+                    except Exception:
+                        node.destroy_node()
+                        raise
+                    self._nodes[key] = node
+                elif node._input_topic != input_topic:
+                    raise ValueError("Stop the instance before changing its input")
+            return node.start()
+        if action == "stop":
+            return self._stop_nodes(instance_id)
+        if action in ("config", "set_classes"):
+            fields = ("confidence", "fps", "classes", "depth_enabled")
+            cfg = {k: args[k] for k in fields if k in args}
+            if action == "set_classes":
+                if "classes" not in cfg:
+                    raise ValueError("classes is required")
+                cfg = {"classes": cfg["classes"]}
+            self._validate_config(cfg)
+            if action == "config":
+                result = self._stop_nodes(instance_id)
+                if result["state"] == "stopping":
+                    return {"status": "error", "error": "Inference is stopping; retry config after stop completes"}
+            with self._nodes_lock:
+                if instance_id:
+                    self._instance_configs.setdefault(instance_id, {}).update(cfg)
+                else:
+                    for key, value in cfg.items():
+                        setattr(self, "_extra_classes" if key == "classes" else f"_{key}", value)
+            if "classes" in cfg:
+                self._sync_model_classes()
+            return {"status": "configured", "instance_id": instance_id, "config": cfg}
         return None

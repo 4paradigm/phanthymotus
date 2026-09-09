@@ -66,6 +66,7 @@ plugins:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
+    depth_enabled: false  # mask-min relative depth; uncalibrated, opt in per instance
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5

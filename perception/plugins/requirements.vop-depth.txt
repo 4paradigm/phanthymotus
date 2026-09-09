@@ -1,0 +1,5 @@
+# VOP depth API pins shared by replay and Jetson images.
+# Jetson installs with --no-deps to preserve NVIDIA CUDA wheels and system OpenCV.
+# Ultralytics code/models: AGPL-3.0 or Enterprise. SAM 2.1 upstream: Apache-2.0.
+ultralytics==8.4.144
+cloudpickle==3.1.2

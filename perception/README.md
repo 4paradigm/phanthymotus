@@ -2,6 +2,11 @@
 
 Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
 
+## VOP 物体最近点相对深度
+
+现有 vop 可选启用 SAM 2.1 掩码与 YOLO26-Depth，在监控面板显示原图、检测框、分割轮廓、最近点及相对深度。
+默认关闭；运行方式、数据契约和必须完成的人工验收见 [VOP 深度与监控验收](VOP_DEPTH.md)。
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

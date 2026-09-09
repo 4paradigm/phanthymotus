@@ -1,0 +1,10 @@
+# Development only. Production config keeps depth disabled.
+mcp_port: 15720
+ws_port: 15721
+plugins:
+  vop:
+    enabled: true
+    model: yolov8s-worldv2
+    confidence: 0.3
+    fps: 2
+    depth_enabled: true
