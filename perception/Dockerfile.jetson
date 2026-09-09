@@ -483,6 +483,15 @@ print('[build] Thai deps import ok: pythainlp %s, khanaa %s, wunsen %s' % \
 (pythainlp.__version__, m.version('khanaa'), m.version('wunsen')))"; \
     fi && rm -f /tmp/thai-requirements.txt
 
+# Keep the depth API version reproducible without replacing NVIDIA torch,
+# torchvision, NumPy or the system OpenCV. Late layer preserves the base cache.
+COPY perception/plugins/requirements.vop-depth.txt /tmp/vop-depth-requirements.txt
+RUN pip3 install --no-cache-dir --no-deps -i "${PYPI_MIRROR}" \
+      -r /tmp/vop-depth-requirements.txt \
+      "filelock>=3.16.1" "polars==0.20.31" "nvidia-ml-py>=12.0.0" "ultralytics-thop>=2.1.6" && \
+    python3 -c "import cloudpickle, cv2, filelock, polars, pynvml, thop, torch, torchvision, ultralytics; from ultralytics import YOLO, SAM; assert ultralytics.__version__ == '8.4.144'; assert torch.version.cuda, 'NVIDIA CUDA torch required'" && \
+    rm /tmp/vop-depth-requirements.txt
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
