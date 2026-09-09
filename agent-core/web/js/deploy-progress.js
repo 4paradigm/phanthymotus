@@ -32,9 +32,10 @@ class DeployProgressMonitor {
 
     connect() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const token = localStorage.getItem('access_token') || '';
+        const token = localStorage.getItem('phanthy_access_token') || '';
         const url = `${protocol}//${window.location.host}/ws/deploy/${this.driverId}?token=${token}`;
 
+        console.log('[DeployProgress] Connecting to:', url);
         this.ws = new WebSocket(url);
 
         this.ws.onopen = () => {
@@ -46,11 +47,12 @@ class DeployProgressMonitor {
         };
 
         this.ws.onmessage = (event) => {
+            console.log('[DeployProgress] Raw message:', event.data);
             try {
                 const data = JSON.parse(event.data);
                 this._handleMessage(data);
             } catch (e) {
-                console.error('[DeployProgress] Failed to parse message:', e);
+                console.error('[DeployProgress] Failed to parse message:', e, event.data);
             }
         };
 
