@@ -303,10 +303,19 @@ def run_preflight_checks(image: str, container_name: str) -> dict:
     size_info = estimate_image_size(image)
     required_gb = (size_info.get('size_gb') or 20.0) * 2.5  # 2.5x for pull + extract
 
+    # Extract registry from image URL
+    # image format: registry.com/namespace/repo:tag or namespace/repo:tag (defaults to docker.io)
+    registry = 'docker.io'
+    if '/' in image:
+        first_part = image.split('/')[0]
+        # If first part contains '.', it's likely a registry domain
+        if '.' in first_part or ':' in first_part:
+            registry = first_part.split(':')[0]  # Remove port if present
+
     checks = {
         'image_size': size_info,
         'disk': check_disk_space(required_gb),
-        'network': check_network(),
+        'network': check_network(registry=registry),
         'registry': check_registry_auth(image),
         'container': check_existing_container(container_name),
     }
