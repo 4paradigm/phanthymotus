@@ -178,11 +178,11 @@ class DeployProgressUI {
                 <div class="deploy-progress-body">
                     <div class="deploy-progress-checks"></div>
                     <div class="deploy-progress-main">
-                        <div class="deploy-progress-stage"></div>
+                        <div class="deploy-progress-stage">正在连接...</div>
                         <div class="deploy-progress-bar">
                             <div class="deploy-progress-bar-fill"></div>
                         </div>
-                        <div class="deploy-progress-details"></div>
+                        <div class="deploy-progress-details">等待部署开始</div>
                     </div>
                     <div class="deploy-progress-log"></div>
                 </div>
@@ -233,7 +233,7 @@ class DeployProgressUI {
                 .deploy-progress-header {
                     display: flex;
                     justify-content: space-between;
-                    align-items: center;
+                    align-items: flex-start;
                     margin-bottom: 20px;
                     padding-bottom: 10px;
                     border-bottom: 1px solid #333;
@@ -241,22 +241,23 @@ class DeployProgressUI {
                 .deploy-progress-header h3 {
                     margin: 0;
                     font-size: 18px;
-                    line-height: 1;
+                    line-height: 24px;
+                    flex: 1;
                 }
                 .deploy-progress-minimize {
                     background: none;
                     border: none;
                     color: #999;
-                    font-size: 24px;
-                    line-height: 1;
+                    font-size: 20px;
+                    line-height: 24px;
                     cursor: pointer;
-                    padding: 0;
-                    width: 24px;
+                    padding: 0 4px;
                     height: 24px;
-                    display: flex;
+                    display: inline-flex;
                     align-items: center;
                     justify-content: center;
                     flex-shrink: 0;
+                    margin-left: 12px;
                 }
                 .deploy-progress-minimize:hover {
                     color: #fff;
