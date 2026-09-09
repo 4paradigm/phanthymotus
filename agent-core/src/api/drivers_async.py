@@ -191,28 +191,15 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
                     percent = (total_current / total_size) * 100
                     # Estimate speed (rough approximation)
                     speed_mbps = total_current / (1 << 20) / max(1, now - last_update)
-                    return {
-                        'update': True,
-                        'percent': percent,
-                        'speed': f'{speed_mbps:.1f} MB/s',
-                        'layers': len(layers),
-                    }
+                    # Note: This used to return here, which broke the pull loop!
+                    # Now we just track it for logging
+                    _log_deploy(driver_id, f'[pull] {percent:.1f}% ({len(layers)} layers, {speed_mbps:.1f} MB/s)')
                 last_update = now
 
         return {'success': not pull_error, 'error': pull_error}
 
     try:
         result = await loop.run_in_executor(None, _pull)
-
-        # Process progress updates from the pull operation
-        if result.get('update'):
-            await progress.update(
-                'pull',
-                f'拉取进度: {result["layers"]} 层',
-                percent=result['percent'],
-                speed=result.get('speed'),
-            )
-
         return result
     except Exception as e:
         return {'success': False, 'error': str(e)}
