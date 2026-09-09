@@ -155,14 +155,14 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
             )
         loop.call_soon_threadsafe(lambda: asyncio.create_task(do_update()))
 
-    def schedule_layer_complete(layer_id, status):
-        """Thread-safe layer completion notification."""
+    def schedule_layer_update(layer_id, status, progress_str=''):
+        """Thread-safe layer status notification."""
         async def do_notify():
-            # Push layer completion to WebSocket for logging
             await progress._push({
                 'type': 'layer',
                 'layer_id': layer_id,
                 'status': status,
+                'progress': progress_str,
                 'message': f'{layer_id}: {status}',
             })
         loop.call_soon_threadsafe(lambda: asyncio.create_task(do_notify()))
@@ -175,6 +175,9 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
         layers = {}
         last_update = time.time()
         start_time = time.time()
+
+        # Track last logged status per layer to avoid spam
+        layer_last_status = {}
 
         for line in client.api.pull(image, stream=True, decode=True):
             # Check for errors
@@ -190,20 +193,27 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
             status = line.get('status', '')
             layer_id = line.get('id', '')
             progress_detail = line.get('progressDetail', {})
+            progress_str = line.get('progress', '')
 
-            # Notify when layer completes (check common completion statuses)
+            # Push layer status changes to WebSocket (for logging)
             if layer_id and status:
-                # These are the actual status strings from Docker API
-                complete_statuses = [
-                    'Pull complete',
-                    'Already exists',
-                    'Download complete',
-                    'Extracting',  # Also log extracting status
-                    'Verifying Checksum',
-                ]
-                # Only log significant status changes
-                if any(s in status for s in ['complete', 'exists', 'Extracting', 'Verifying']):
-                    schedule_layer_complete(layer_id, status)
+                last_status = layer_last_status.get(layer_id, '')
+
+                # Only push when status changes or is significant
+                is_significant = (
+                    status != last_status and (
+                        'complete' in status.lower() or
+                        'exists' in status.lower() or
+                        'extracting' in status.lower() or
+                        'verifying' in status.lower() or
+                        'waiting' in status.lower() or
+                        'pulling' in status.lower()
+                    )
+                )
+
+                if is_significant:
+                    schedule_layer_update(layer_id, status, progress_str)
+                    layer_last_status[layer_id] = status
 
             # Track layer progress
             if layer_id and progress_detail:

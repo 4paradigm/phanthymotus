@@ -434,8 +434,9 @@ class DeployProgressUI {
             // Log checks (message already contains ✓/✗ from backend)
             this._addLog(message, status === 'fail' ? 'error' : 'success');
         } else if (type === 'layer') {
-            // Log layer completion
-            this._addLog(`  ${layer_id}: ${status}`, 'info');
+            // Log layer completion with progress if available
+            const progressInfo = event.progress ? ` ${event.progress}` : '';
+            this._addLog(`  ${layer_id}: ${status}${progressInfo}`, 'info');
         } else if (type === 'progress') {
             this._updateProgress(stage, message, percent, speed);
         } else if (type === 'start') {
