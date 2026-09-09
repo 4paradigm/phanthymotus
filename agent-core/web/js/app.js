@@ -7,6 +7,7 @@ import { getToken, setToken, verifyToken } from './auth.js';
 import { initSidebar, renderSidebar } from './sidebar.js';
 import { initCanvas, updateCanvasMcps } from './canvas.js';
 import { initDeployPanel, showDeployConfirmModal } from './deploy-panel.js';
+import { DeployProgressUI } from './deploy-progress.js';
 import { connectMotus } from './motus-stream.js';
 import { initActivityLog }   from './activity-log.js';
 import { initDetailPanel }   from './detail-panel.js';
