@@ -191,8 +191,12 @@ async function _deployServices(services) {
     const prefix = services.length > 1 ? `[${i + 1}/${services.length}] ` : '';
     text.textContent = `${prefix}${svc.name} 正在升级…`;
 
+    // Show progress window
+    const progressUI = new DeployProgressUI(svc.id, svc.name);
+    progressUI.show();
+
     try {
-      const res = await fetch(`/api/drivers/${svc.id}/deploy`, {
+      const res = await fetch(`/api/drivers/${svc.id}/deploy-v2`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image: svc.image }),
@@ -201,11 +205,14 @@ async function _deployServices(services) {
       if (json.code !== 200) {
         text.textContent = `${svc.name} 升级失败：${json.message || '未知错误'}`;
         btn.disabled = false;
+        progressUI.close();
         return;
       }
+      // Progress UI will auto-close on completion
     } catch {
       text.textContent = `${svc.name} 请求失败，请检查网络`;
       btn.disabled = false;
+      progressUI.close();
       return;
     }
   }

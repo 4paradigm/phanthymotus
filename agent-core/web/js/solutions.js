@@ -464,20 +464,28 @@ function _versionCell(d) {
 async function _installDriver(driverId, btn) {
   btn.disabled = true;
   btn.textContent = '安装中…';
+
+  // Show progress window
+  const driverName = driverId; // Could be improved with actual name lookup
+  const progressUI = new DeployProgressUI(driverId, driverName);
+  progressUI.show();
+
   try {
-    const res = await fetch(`/api/drivers/${encodeURIComponent(driverId)}/deploy`, {
+    const res = await fetch(`/api/drivers/${encodeURIComponent(driverId)}/deploy-v2`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
     });
     const json = await res.json();
     if (json.code !== 200) {
       btn.disabled = false;
       btn.textContent = '重试安装';
+      progressUI.close();
       alert(`部署失败：${json.message || '未知错误'}`);
       return;
     }
   } catch (e) {
     btn.disabled = false;
     btn.textContent = '重试安装';
+    progressUI.close();
     alert(`部署失败：${e.message}`);
     return;
   }
