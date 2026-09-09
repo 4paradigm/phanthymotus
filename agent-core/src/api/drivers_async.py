@@ -191,9 +191,19 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
             layer_id = line.get('id', '')
             progress_detail = line.get('progressDetail', {})
 
-            # Notify when layer completes
-            if layer_id and status in ('Pull complete', 'Already exists', 'Download complete'):
-                schedule_layer_complete(layer_id, status)
+            # Notify when layer completes (check common completion statuses)
+            if layer_id and status:
+                # These are the actual status strings from Docker API
+                complete_statuses = [
+                    'Pull complete',
+                    'Already exists',
+                    'Download complete',
+                    'Extracting',  # Also log extracting status
+                    'Verifying Checksum',
+                ]
+                # Only log significant status changes
+                if any(s in status for s in ['complete', 'exists', 'Extracting', 'Verifying']):
+                    schedule_layer_complete(layer_id, status)
 
             # Track layer progress
             if layer_id and progress_detail:

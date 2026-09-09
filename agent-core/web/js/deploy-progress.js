@@ -160,6 +160,7 @@ class DeployProgressUI {
         this.driverName = driverName;
         this.monitor = new DeployProgressMonitor(driverId);
         this.container = null;
+        this._lastLoggedPercent = -10; // Initialize to -10 so first log happens at 0%
 
         this._createUI();
         this._attachCallbacks();
