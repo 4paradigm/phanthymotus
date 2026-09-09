@@ -72,6 +72,7 @@ class DeployProgressMonitor {
 
     _handleMessage(data) {
         const { type } = data;
+        console.log('[DeployProgress] Received message:', type, data);
 
         switch (type) {
             case 'connected':
@@ -295,9 +296,12 @@ class DeployProgressUI {
                 }
                 .deploy-progress-bar-fill {
                     height: 100%;
+                    background: #4caf50;
+                    background: -webkit-linear-gradient(left, #4caf50, #8bc34a);
                     background: linear-gradient(90deg, #4caf50, #8bc34a);
                     transition: width 0.3s ease;
                     width: 0%;
+                    min-width: 2px;
                 }
                 .deploy-progress-details {
                     font-size: 13px;
@@ -440,10 +444,12 @@ class DeployProgressUI {
     }
 
     _updateProgress(stage, message, percent, speed) {
+        console.log('[DeployProgress] Updating progress:', { stage, message, percent, speed });
         this._setStage(message);
 
         if (percent !== undefined) {
             const bar = this.container.querySelector('.deploy-progress-bar-fill');
+            console.log('[DeployProgress] Setting bar width to:', percent + '%');
             bar.style.width = `${percent}%`;
         }
 
