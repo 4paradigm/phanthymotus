@@ -95,8 +95,14 @@ async def _deploy_with_progress(driver: dict) -> dict:
         _log_deploy(driver_id, f'[pull] {target_image}')
 
         pull_result = await _pull_image_with_progress(driver_id, target_image, progress)
-        if not pull_result['success']:
-            detail = _explain_pull_error(pull_result['error'])
+
+        # Debug: check result type
+        if not isinstance(pull_result, dict):
+            await progress.error('pull', f'拉取镜像返回值类型错误: {type(pull_result).__name__} = {pull_result}')
+            return {'status': 'error', 'error': f'Internal error: unexpected result type {type(pull_result).__name__}'}
+
+        if not pull_result.get('success'):
+            detail = _explain_pull_error(pull_result.get('error', 'Unknown error'))
             _log_deploy(driver_id, f'[pull] failed: {detail}')
             await progress.error('pull', f'镜像拉取失败: {detail}')
             return {'status': 'error', 'error': f'镜像拉取失败: {detail}'}
@@ -106,14 +112,26 @@ async def _deploy_with_progress(driver: dict) -> dict:
         # Extract and merge service.yml
         await progress.update('compose', '准备容器配置…')
         compose_result = await _prepare_compose(driver, target_image, name, progress)
-        if not compose_result['success']:
-            return {'status': 'error', 'error': compose_result['error']}
+
+        # Debug: check result type
+        if not isinstance(compose_result, dict):
+            await progress.error('compose', f'准备配置返回值类型错误: {type(compose_result).__name__} = {compose_result}')
+            return {'status': 'error', 'error': f'Internal error: unexpected result type {type(compose_result).__name__}'}
+
+        if not compose_result.get('success'):
+            return {'status': 'error', 'error': compose_result.get('error', 'Unknown error')}
 
         # Start container
         await progress.update('start', '启动容器…')
         start_result = await _start_container(driver_id, compose_result, progress)
-        if not start_result['success']:
-            return {'status': 'error', 'error': start_result['error']}
+
+        # Debug: check result type
+        if not isinstance(start_result, dict):
+            await progress.error('start', f'启动容器返回值类型错误: {type(start_result).__name__} = {start_result}')
+            return {'status': 'error', 'error': f'Internal error: unexpected result type {type(start_result).__name__}'}
+
+        if not start_result.get('success'):
+            return {'status': 'error', 'error': start_result.get('error', 'Unknown error')}
 
         await progress.done(f'部署完成：{name}')
         return {
