@@ -6,11 +6,44 @@ Import and register this router in start.py alongside drivers.router.
 """
 
 import time
+import asyncio
 import fastapi
 
 from api.drivers import _load_manifest, _save_manifest, _deploy_sync, _run_in_executor, _log_deploy
 
 router = fastapi.APIRouter(prefix='/drivers', tags=['drivers'])
+
+# Track background deployment tasks
+_background_tasks = {}
+
+
+async def _deploy_background(driver_id: str, driver: dict):
+    """Run deployment in background and update manifest when done."""
+    try:
+        from api.drivers_async import _deploy_with_progress
+        result = await _deploy_with_progress(driver)
+
+        # Persist updated image and container_name into manifest
+        if not result.get('skipped'):
+            manifest = _load_manifest()
+            for d in manifest:
+                if d.get('id') == driver_id:
+                    d['image'] = driver['image']
+                    if result.get('container_name'):
+                        d['container_name'] = result['container_name']
+                    d['last_deploy'] = {
+                        'image':  driver['image'],
+                        'ts':     int(time.time()),
+                        'status': result.get('status', ''),
+                    }
+                    break
+            _save_manifest(manifest)
+    except Exception as e:
+        _log_deploy(driver_id, f'[error] background deploy failed: {e}')
+    finally:
+        # Remove from tracking
+        if driver_id in _background_tasks:
+            del _background_tasks[driver_id]
 
 
 @router.post('/{driver_id}/deploy-v2')
@@ -18,55 +51,58 @@ async def driver_deploy_v2(driver_id: str, body: dict = fastapi.Body(default={})
     """Enhanced deployment with progress streaming and preflight checks.
 
     Use WebSocket /ws/deploy/{driver_id} to receive real-time progress.
-    Falls back to legacy sync deployment if streaming fails.
+
+    This endpoint starts deployment in background and returns immediately.
+    The deployment continues even if the client disconnects.
     """
     manifest = _load_manifest()
     driver = next((d for d in manifest if d['id'] == driver_id), None)
     if not driver:
         raise fastapi.HTTPException(status_code=404, detail='Driver not found in manifest')
 
-    # Allow image override (same as regular deploy)
-    image_override = ''
-    if isinstance(body, dict):
-        if body.get('image'):
-            image_override = body['image']
-        elif body.get('registry_image') and body.get('tag'):
-            ri = body['registry_image']
-            tag = body['tag']
-            image_override = f'{ri}:{tag}'
-    if image_override:
-        driver = {**driver, 'image': image_override}
+    # Check if already deploying
+    if driver_id in _background_tasks:
+        return {
+            'code': 200,
+            'data': {
+                'status': 'deploying',
+                'message': 'Deployment already in progress',
+            }
+        }
 
-    # Use async deployment with progress
-    try:
-        from api.drivers_async import _deploy_with_progress
-        result = await _deploy_with_progress(driver)
-    except Exception as e:
-        _log_deploy(driver_id, f'[error] async deploy failed, falling back to sync: {e}')
-        # Fallback to sync deployment
-        try:
-            result = await _run_in_executor(_deploy_sync, driver)
-        except Exception as e2:
-            _log_deploy(driver_id, f'[error] {e2}')
-            return {'code': 500, 'message': str(e2)}
+    # Update image if provided
+    new_image = body.get('image')
+    if new_image:
+        driver['image'] = new_image
 
-    # Persist updated image and container_name into manifest
-    if not result.get('skipped'):
-        manifest = _load_manifest()
-        for d in manifest:
-            if d.get('id') == driver_id:
-                d['image'] = driver['image']
-                if result.get('container_name'):
-                    d['container_name'] = result['container_name']
-                d['last_deploy'] = {
-                    'image':  driver['image'],
-                    'ts':     int(time.time()),
-                    'status': result.get('status', ''),
-                }
-                break
-        _save_manifest(manifest)
+    _log_deploy(driver_id, f'[deploy-v2] starting background deployment: {driver["image"]}')
 
-    return {'code': 200, 'data': result}
+    # Start deployment in background (fire and forget)
+    task = asyncio.create_task(_deploy_background(driver_id, driver))
+    _background_tasks[driver_id] = task
+
+    # Return immediately - client connects to WebSocket for progress
+    return {
+        'code': 200,
+        'data': {
+            'status': 'started',
+            'message': 'Deployment started in background',
+            'driver_id': driver_id,
+        }
+    }
+
+
+@router.get('/{driver_id}/deploy-status')
+async def driver_deploy_status(driver_id: str):
+    """Check if a deployment is currently running for this driver."""
+    is_deploying = driver_id in _background_tasks
+    return {
+        'code': 200,
+        'data': {
+            'deploying': is_deploying,
+            'driver_id': driver_id,
+        }
+    }
 
 
 @router.get('/{driver_id}/preflight')
