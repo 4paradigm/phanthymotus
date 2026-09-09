@@ -155,6 +155,18 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
             )
         loop.call_soon_threadsafe(lambda: asyncio.create_task(do_update()))
 
+    def schedule_layer_complete(layer_id, status):
+        """Thread-safe layer completion notification."""
+        async def do_notify():
+            # Push layer completion to WebSocket for logging
+            await progress._push({
+                'type': 'layer',
+                'layer_id': layer_id,
+                'status': status,
+                'message': f'{layer_id}: {status}',
+            })
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(do_notify()))
+
     def _pull():
         client = _docker()
         pull_error = ''
@@ -178,6 +190,10 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
             status = line.get('status', '')
             layer_id = line.get('id', '')
             progress_detail = line.get('progressDetail', {})
+
+            # Notify when layer completes
+            if layer_id and status in ('Pull complete', 'Already exists', 'Download complete'):
+                schedule_layer_complete(layer_id, status)
 
             # Track layer progress
             if layer_id and progress_detail:

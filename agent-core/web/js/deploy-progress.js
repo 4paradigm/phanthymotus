@@ -426,14 +426,22 @@ class DeployProgressUI {
     }
 
     _handleProgress(event) {
-        const { type, stage, message, percent, speed, status, checkId } = event;
+        const { type, stage, message, percent, speed, status, checkId, layer_id } = event;
 
         if (type === 'check') {
             this._addCheck(checkId, message, status);
+            // Also log checks
+            const statusIcon = status === 'pass' ? '✓' : status === 'fail' ? '✗' : '⚠';
+            this._addLog(`${statusIcon} ${message}`, status === 'fail' ? 'error' : 'success');
+        } else if (type === 'layer') {
+            // Log layer completion
+            this._addLog(`  ${layer_id}: ${status}`, 'info');
         } else if (type === 'progress') {
             this._updateProgress(stage, message, percent, speed);
         } else if (type === 'start') {
             this._addLog(message, 'info');
+        } else if (type === 'done') {
+            this._addLog(message || '部署完成', 'success');
         }
     }
 
@@ -493,6 +501,20 @@ class DeployProgressUI {
             parts.push(speed);
         }
         details.textContent = parts.join(' · ');
+
+        // Add log entry for significant progress updates
+        if (stage === 'pull' && percent !== undefined) {
+            // Throttle pull progress logs (only log every 10%)
+            const lastLoggedPercent = this._lastLoggedPercent || 0;
+            if (Math.floor(percent / 10) > Math.floor(lastLoggedPercent / 10)) {
+                const progressMsg = `${message} - ${percent.toFixed(1)}%` + (speed ? ` (${speed})` : '');
+                this._addLog(progressMsg, 'info');
+                this._lastLoggedPercent = percent;
+            }
+        } else if (stage !== 'pull') {
+            // Log all non-pull progress updates
+            this._addLog(message, 'info');
+        }
 
         // Update minimized indicator
         const minimizedProgress = this.minimizedIndicator.querySelector('.deploy-progress-minimized-progress');
