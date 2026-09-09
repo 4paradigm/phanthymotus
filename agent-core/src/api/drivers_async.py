@@ -146,6 +146,15 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
     """Pull image and report progress via WebSocket."""
     loop = asyncio.get_event_loop()
 
+    def schedule_update(percent, speed_mbps, layer_count):
+        """Thread-safe progress update."""
+        async def do_update():
+            await progress.update(
+                'pull', f'拉取进度: {layer_count} 层',
+                percent=percent, speed=f'{speed_mbps:.1f} MB/s'
+            )
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(do_update()))
+
     def _pull():
         client = _docker()
         pull_error = ''
@@ -153,6 +162,7 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
         # Track progress by layer
         layers = {}
         last_update = time.time()
+        start_time = time.time()
 
         for line in client.api.pull(image, stream=True, decode=True):
             # Check for errors
@@ -191,9 +201,13 @@ async def _pull_image_with_progress(driver_id: str, image: str, progress: Deploy
                 if total_size > 0:
                     percent = (total_current / total_size) * 100
                     # Estimate speed (rough approximation)
-                    speed_mbps = total_current / (1 << 20) / max(1, now - last_update)
-                    # Note: This used to return here, which broke the pull loop!
-                    # Now we just track it for logging
+                    elapsed = now - start_time
+                    speed_mbps = (total_current / (1 << 20)) / max(0.1, elapsed)
+                    
+                    # Push progress update to WebSocket (thread-safe)
+                    schedule_update(percent, speed_mbps, len(layers))
+                    
+                    # Also log it
                     _log_deploy(driver_id, f'[pull] {percent:.1f}% ({len(layers)} layers, {speed_mbps:.1f} MB/s)')
                 last_update = now
 
