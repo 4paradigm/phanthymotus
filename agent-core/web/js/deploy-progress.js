@@ -173,7 +173,10 @@ class DeployProgressUI {
             <div class="deploy-progress-content">
                 <div class="deploy-progress-header">
                     <h3>部署进度：${this.driverName}</h3>
-                    <button class="deploy-progress-minimize" title="最小化">−</button>
+                    <div class="deploy-progress-header-actions">
+                        <button class="deploy-progress-minimize" title="最小化">−</button>
+                        <button class="deploy-progress-close" title="关闭">×</button>
+                    </div>
                 </div>
                 <div class="deploy-progress-body">
                     <div class="deploy-progress-checks"></div>
@@ -244,7 +247,13 @@ class DeployProgressUI {
                     line-height: 24px;
                     flex: 1;
                 }
-                .deploy-progress-minimize {
+                .deploy-progress-header-actions {
+                    display: flex;
+                    gap: 4px;
+                    align-items: center;
+                }
+                .deploy-progress-minimize,
+                .deploy-progress-close {
                     background: none;
                     border: none;
                     color: #999;
@@ -257,12 +266,16 @@ class DeployProgressUI {
                     align-items: center;
                     justify-content: center;
                     flex-shrink: 0;
-                    margin-left: 12px;
+                    margin-left: 0;
                 }
-                .deploy-progress-minimize:hover {
+                .deploy-progress-minimize:hover,
+                .deploy-progress-close:hover {
                     color: #fff;
                     background: rgba(255,255,255,0.1);
                     border-radius: 4px;
+                }
+                .deploy-progress-close {
+                    font-size: 24px;
                 }
                 .deploy-progress-checks {
                     margin-bottom: 15px;
@@ -387,6 +400,11 @@ class DeployProgressUI {
             this.minimize();
         };
 
+        // Close button
+        this.container.querySelector('.deploy-progress-close').onclick = () => {
+            this.close();
+        };
+
         // Click minimized indicator to restore
         this.minimizedIndicator.onclick = () => {
             this.restore();
@@ -426,6 +444,16 @@ class DeployProgressUI {
             this._addLog(`建议: ${suggestion}`, 'info');
         }
         this._setStage('部署失败', 'error');
+
+        // Update minimized indicator
+        const minimizedProgress = this.minimizedIndicator.querySelector('.deploy-progress-minimized-progress');
+        if (minimizedProgress) {
+            minimizedProgress.textContent = '部署失败';
+            minimizedProgress.style.color = '#f44336';
+        }
+
+        // Auto-close after 15 seconds
+        setTimeout(() => this.close(), 15000);
     }
 
     _handleDone(event) {
