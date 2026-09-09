@@ -170,7 +170,7 @@ class DeployProgressUI {
             <div class="deploy-progress-content">
                 <div class="deploy-progress-header">
                     <h3>部署进度：${this.driverName}</h3>
-                    <button class="deploy-progress-close" title="最小化">_</button>
+                    <button class="deploy-progress-minimize" title="最小化">−</button>
                 </div>
                 <div class="deploy-progress-body">
                     <div class="deploy-progress-checks"></div>
@@ -185,6 +185,20 @@ class DeployProgressUI {
                 </div>
             </div>
         `;
+
+        // Create minimized indicator (hidden by default)
+        this.minimizedIndicator = document.createElement('div');
+        this.minimizedIndicator.className = 'deploy-progress-minimized hidden';
+        this.minimizedIndicator.innerHTML = `
+            <div class="deploy-progress-minimized-content">
+                <div class="deploy-progress-minimized-title">
+                    <span class="deploy-progress-minimized-spinner">⟳</span>
+                    <span>部署中：${this.driverName}</span>
+                </div>
+                <div class="deploy-progress-minimized-progress"></div>
+            </div>
+        `;
+        document.body.appendChild(this.minimizedIndicator);
 
         // Add styles if not already present
         if (!document.getElementById('deploy-progress-styles')) {
@@ -224,17 +238,27 @@ class DeployProgressUI {
                 .deploy-progress-header h3 {
                     margin: 0;
                     font-size: 18px;
+                    line-height: 1;
                 }
-                .deploy-progress-close {
+                .deploy-progress-minimize {
                     background: none;
                     border: none;
                     color: #999;
-                    font-size: 20px;
+                    font-size: 24px;
+                    line-height: 1;
                     cursor: pointer;
-                    padding: 0 10px;
+                    padding: 0;
+                    width: 24px;
+                    height: 24px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    flex-shrink: 0;
                 }
-                .deploy-progress-close:hover {
+                .deploy-progress-minimize:hover {
                     color: #fff;
+                    background: rgba(255,255,255,0.1);
+                    border-radius: 4px;
                 }
                 .deploy-progress-checks {
                     margin-bottom: 15px;
@@ -299,15 +323,66 @@ class DeployProgressUI {
                 .deploy-progress-log-entry.success {
                     color: #4caf50;
                 }
+
+                /* Minimized indicator */
+                .deploy-progress-minimized {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    background: #1e1e1e;
+                    border: 1px solid #333;
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    min-width: 280px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                    cursor: pointer;
+                    z-index: 9999;
+                    transition: transform 0.2s, box-shadow 0.2s;
+                }
+                .deploy-progress-minimized:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 6px 16px rgba(0,0,0,0.4);
+                }
+                .deploy-progress-minimized.hidden {
+                    display: none;
+                }
+                .deploy-progress-minimized-content {
+                    color: #e0e0e0;
+                }
+                .deploy-progress-minimized-title {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    font-size: 14px;
+                    font-weight: 500;
+                    margin-bottom: 8px;
+                }
+                .deploy-progress-minimized-spinner {
+                    animation: spin 1s linear infinite;
+                    font-size: 16px;
+                }
+                @keyframes spin {
+                    from { transform: rotate(0deg); }
+                    to { transform: rotate(360deg); }
+                }
+                .deploy-progress-minimized-progress {
+                    font-size: 12px;
+                    color: #999;
+                }
             `;
             document.head.appendChild(style);
         }
 
         document.body.appendChild(this.container);
 
-        // Close button
-        this.container.querySelector('.deploy-progress-close').onclick = () => {
+        // Minimize button
+        this.container.querySelector('.deploy-progress-minimize').onclick = () => {
             this.minimize();
+        };
+
+        // Click minimized indicator to restore
+        this.minimizedIndicator.onclick = () => {
+            this.restore();
         };
     }
 
@@ -381,6 +456,13 @@ class DeployProgressUI {
             parts.push(speed);
         }
         details.textContent = parts.join(' · ');
+
+        // Update minimized indicator
+        const minimizedProgress = this.minimizedIndicator.querySelector('.deploy-progress-minimized-progress');
+        if (minimizedProgress) {
+            const progressText = percent !== undefined ? `${percent.toFixed(1)}%` : message || '进行中...';
+            minimizedProgress.textContent = progressText;
+        }
     }
 
     _setStage(message, status) {
@@ -401,18 +483,28 @@ class DeployProgressUI {
 
     show() {
         this.container.style.display = 'flex';
+        this.minimizedIndicator.classList.add('hidden');
         this.monitor.connect();
     }
 
     minimize() {
         this.container.style.display = 'none';
+        this.minimizedIndicator.classList.remove('hidden');
         // Keep monitor connected
+    }
+
+    restore() {
+        this.container.style.display = 'flex';
+        this.minimizedIndicator.classList.add('hidden');
     }
 
     close() {
         this.monitor.disconnect();
         if (this.container && this.container.parentNode) {
             this.container.parentNode.removeChild(this.container);
+        }
+        if (this.minimizedIndicator && this.minimizedIndicator.parentNode) {
+            this.minimizedIndicator.parentNode.removeChild(this.minimizedIndicator);
         }
     }
 }
