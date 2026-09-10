@@ -379,6 +379,22 @@ def _channel_tool_restricted(trigger_event: dict) -> bool:
     return _bot_channel_restricted(trigger_event) or _viewer_channel_restricted(trigger_event)
 
 
+def _round_already_notified(tool_calls: list) -> bool:
+    """True if this round's tool_calls already include a bare-tts speak call —
+    the LLM remembered to reply itself, so auto-notify should not double-say it."""
+    for call in tool_calls:
+        name = call.get('function', {}).get('name', '')
+        if name.split('__')[-1] != 'tts':
+            continue
+        try:
+            args = json.loads(call['function'].get('arguments') or '{}')
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        if args.get('action') == 'speak':
+            return True
+    return False
+
+
 def _needs_barrier(name: str, call_args: dict = None) -> tuple[bool, frozenset | None]:
     """这个 MCP 工具调用要不要 barrier，以及它想占用哪些物理资源。
 
@@ -833,6 +849,7 @@ class Event:
             ('update_memory', event.memory.update),
             ('activate_skill', event.skills.activate_skill),
             ('deactivate_skill', event.skills.deactivate_skill),
+            ('set_auto_notify', event.skills.set_auto_notify),
             ('task_create', event.task.task_create),
             ('task_update', event.task.task_update),
             ('task_done', event.task.task_done),
@@ -1406,6 +1423,17 @@ class Event:
             text = response.get('content') or ''
             if text:
                 await push_event({'type': 'agent_thought', 'payload': {'text': text}})
+                if not tool_restricted and not _round_already_notified(response.get('tool_calls') or []):
+                    # event.skills (attribute) is rebound to a Tools() instance by
+                    # event/__init__.py, shadowing the submodule — get_notify_override
+                    # is a module-level function, so it must come from sys.modules.
+                    import sys as _sys
+                    override = _sys.modules['event.skills'].get_notify_override()
+                    auto_notify = override if override is not None else \
+                        config.main.get('event', {}).get('llm', {}).get('auto_notify', True)
+                    if auto_notify:
+                        import hooks
+                        await hooks.fire('on_notify', {'text': text})
 
             # ── 用量广播 ──────────────────────────────────────────────────
             _usage = response.get('_usage')

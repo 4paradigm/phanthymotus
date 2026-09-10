@@ -879,6 +879,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
             'trigger_interval_ms': trigger_interval_ms,
             'vision_input': bool(llm_cfg.get('vision_input', False)),
+            'auto_notify': bool(llm_cfg.get('auto_notify', True)),
         }}
 
     elif action == 'config':
@@ -931,6 +932,14 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             event_cfg = config.main.get('event', {})
             llm_cfg = event_cfg.get('llm', {})
             llm_cfg['vision_input'] = bool(vision_input)
+            event_cfg['llm'] = llm_cfg
+            config.main['event'] = event_cfg
+        # 自动播报开关
+        auto_notify = req.arguments.get('auto_notify')
+        if auto_notify is not None:
+            event_cfg = config.main.get('event', {})
+            llm_cfg = event_cfg.get('llm', {})
+            llm_cfg['auto_notify'] = bool(auto_notify)
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
         # Save search config to desktop_tools.search

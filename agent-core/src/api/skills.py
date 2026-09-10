@@ -92,6 +92,7 @@ async def install_from_rc(slug: str, rc_token: str | None = None) -> dict:
         'version': skill_data.get('version', '1.0.0'),
         'requiredTools': skill_data.get('requiredTools', []),
         'configSchema': skill_data.get('configSchema'),
+        'narrationDefault': skill_data.get('narrationDefault'),
         'author': (skill_data.get('author') or {}).get('name', ''),
         'installedAt': datetime.datetime.now().isoformat(),
         'active': True,
@@ -123,6 +124,7 @@ async def list_skills():
             'requiredTools': s.get('requiredTools', []),
             'active': s.get('active', False),
             'installedAt': s.get('installedAt', ''),
+            'narrationDefault': s.get('narrationDefault'),
         })
     return {'code': 200, 'data': result}
 
@@ -201,7 +203,7 @@ async def update_skill(body: dict = fastapi.Body(...)):
 
     # 允许更新的字段
     editable = ('name', 'oneLiner', 'description', 'instruction', 'category',
-                'icon', 'requiredTools', 'configSchema', 'version')
+                'icon', 'requiredTools', 'configSchema', 'version', 'narrationDefault')
     for key in editable:
         if key in body:
             skill[key] = body[key]
@@ -243,6 +245,7 @@ async def publish_skill(body: dict = fastapi.Body(...)):
         'version': version,
         'requiredTools': skill.get('requiredTools', []),
         'configSchema': skill.get('configSchema'),
+        'narrationDefault': skill.get('narrationDefault'),
     }
 
     headers = {'Content-Type': 'application/json'}

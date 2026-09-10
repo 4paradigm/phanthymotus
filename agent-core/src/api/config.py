@@ -1087,8 +1087,12 @@ async def reset_config(req: ResetRequest):
         for skill in skills_cfg.get('installed', []):
             skill['active'] = False
         config.main['skills'] = skills_cfg
-        import event.skills
-        event.skills._runtime_activated.clear()
+        # event.skills (attribute) is rebound to a Tools() instance by
+        # event/__init__.py, shadowing the submodule where _runtime_activated
+        # actually lives — must go through sys.modules, not `import event.skills`.
+        import sys
+        import event.skills  # ensure it's imported/registered in sys.modules
+        sys.modules['event.skills']._runtime_activated.clear()
         reset_items.append('skills')
 
     if req.restart_services:

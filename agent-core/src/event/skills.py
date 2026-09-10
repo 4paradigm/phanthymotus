@@ -5,7 +5,7 @@ event/skills.py — 技能系统（混合模式）。
   1. DB `active` 字段 — UI 控制技能对 LLM 的可见性（出现在 <skills> 列表中）
   2. 内存 `_runtime_activated` — LLM 调用 activate_skill 后才注入完整 instruction
 
-提供 activate_skill / deactivate_skill 系统工具。
+提供 activate_skill / deactivate_skill / set_auto_notify 系统工具。
 """
 
 import typing
@@ -17,6 +17,27 @@ import config
 
 # LLM 按需激活的 slugs（内存态，重启清空）
 _runtime_activated: set[str] = set()
+
+# 自动播报运行时覆盖（内存态，重启清空）。None = 跟随全局配置 event.llm.auto_notify。
+# 由 set_auto_notify 工具手动设置，或在技能激活/停用时按其 narrationDefault 重新计算——
+# 两者写的是同一个变量，谁最后写就以谁为准。
+_notify_override: bool | None = None
+
+
+def get_notify_override() -> bool | None:
+    return _notify_override
+
+
+def _recompute_notify_override():
+    """技能激活状态变化后，按当前激活技能里第一个声明了 narrationDefault 的技能
+    重新计算运行时覆盖；没有技能声明时恢复为 None（跟随全局配置）。"""
+    global _notify_override
+    for s in get_active_skills():
+        v = s.get('narrationDefault')
+        if v is not None:
+            _notify_override = bool(v)
+            return
+    _notify_override = None
 
 
 def installed_skills() -> list[dict]:
@@ -73,6 +94,7 @@ class Tools:
         if not skill:
             return f'技能 "{slug}" 不可用。可用技能: {", ".join(s["slug"] for s in avail)}'
         _runtime_activated.add(slug)
+        _recompute_notify_override()
         return f'已激活技能「{skill["name"]}」。完整指令已注入，请立即根据指令执行任务，不要 finish。'
 
     async def deactivate_skill(self,
@@ -82,4 +104,14 @@ class Tools:
         if slug not in _runtime_activated:
             return f'技能 "{slug}" 未处于激活状态。'
         _runtime_activated.discard(slug)
+        _recompute_notify_override()
         return f'已停用技能「{slug}」，其指令已从上下文移除。'
+
+    async def set_auto_notify(self,
+        enabled: typing.Annotated[bool, '是否开启自动播报——把你写的 content 自动通过语音/灯效等已注册输出广播给用户'],
+    ):
+        """临时开启/关闭自动播报。默认开启；进入不希望每步都被听到/看到的场景
+        （下棋、表演、需要沉浸感的角色扮演）前调用 false，结束后调用 true 恢复。"""
+        global _notify_override
+        _notify_override = bool(enabled)
+        return f'自动播报已{"开启" if enabled else "关闭"}。'
