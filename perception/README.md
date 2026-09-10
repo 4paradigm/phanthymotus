@@ -614,23 +614,17 @@ that was true of two CUDA *contexts* and not of two sessions.
 jp5.11 needs `japanese_worker_device: cpu` set explicitly, and the error says so if it
 is not. Two independent reasons, either one disqualifying:
 
-- its ONNX Runtime is **1.15.1** and executes this graph's duration path incorrectly —
-  8 runs gave 6.05 s against the CPU's 8.35 s, and the 10-token probe returned
-  16800–24000 samples against 47400. **This is not about memory**: with an empty box and
-  the guard disabled the session builds, does not crash, and still comes out 27–51%
-  short;
+- **its CUDA renders this graph wrongly** — confirmed by ear, and the cause is not
+  known. Ruled out: the two-runtime collision, the model file, TF32, the ONNX Runtime
+  version, and the CUDA provider binary. The full record, so nobody repeats those five
+  experiments, is **[docs/jp511-cuda-kokoro.md](docs/jp511-cuda-kokoro.md)**;
 - and separately, the box rarely has room.
 
 Worth being precise about what was *not* broken, because "GPU works on jp5.11" is also
 true: sherpa's own engines and face both run on the GPU there and always have.
-`KokoroDirect` — the standalone session this code builds — is the only thing affected,
-it exists only for Japanese, and it was pinned to the CPU from the day it was written,
-so this path had never been exercised on that line until now.
-
-The fix, if anyone wants it, is a newer ONNX Runtime for jp5.11 — the same work as the
-1.18.1 build for jp6.1, against CUDA 11.4 and cp38. Not guaranteed: recent versions drop
-cp38. The encouraging sign is that sherpa bundles **1.16.0** on that line, so something
-newer than 1.15.1 does build there.
+`KokoroDirect` is the only thing affected, it exists only for Japanese, and it was
+pinned to the CPU from the day it was written, so this path had never been exercised on
+that line until now.
 **The residual risk is stated rather than hidden**: the thresholds are heuristics, and
 there is a window where CUDA would be attempted on jp5.11 — the duration gate catches it
 if the build survives, and does not if the box OOMs first. `japanese_worker_device: cpu`

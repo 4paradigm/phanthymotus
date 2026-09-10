@@ -101,10 +101,16 @@ IDLE_TIMEOUT_S = 0.0
 #     jp6.1   cpu 8.35s stdev 0.000   cuda 8.35s stdev 0.000
 #     jp5.11  cpu 8.35s stdev 0.000   cuda 6.05s stdev 0.053   <- 27.5% short
 #
-# jp5.11's ONNX Runtime is 1.15.1 and its CUDA execution of the duration path is simply
-# wrong; 27% short is audibly rushed speech. Gating on the version number would be the
-# wrong fix — it would not catch the next line with the same defect — so gate on the
-# measurement instead. The probe already runs as warmup, so this costs nothing.
+# **Confirmed by ear**: jp5.11's CUDA renders this graph as garbled speech, while
+# jp6.1's matches its own CPU exactly. The cause is unknown, and five candidates have
+# been ruled out by measurement — the two-runtime collision, the model file, TF32, the
+# ONNX Runtime version, and the CUDA provider binary. The record is in
+# perception/docs/jp511-cuda-kokoro.md.
+#
+# Which is why the gate is a **measurement** and not a version check. A version check
+# would have been wrong twice: written against 1.15.1 it lets the official 1.16.0
+# through, and 1.16.0 produces the same garbled audio. The probe already runs as
+# warmup, so it costs nothing.
 PROBE_TEXT = "konnichiwa"
 PROBE_SAMPLES = 47400
 # Wide enough that a legitimately different build is not rejected, far tighter than the
@@ -276,10 +282,11 @@ class KokoroWorkerProxy:
 
         - **not enough memory.** A CUDA session needs ~967 MB beside an existing
           context and ~1585 MB bringing its own. Asking anyway OOM-killed a jp5.11 rig.
-        - **wrong durations.** jp5.11's ONNX Runtime 1.15.1 executes this graph's
-          duration path incorrectly: 8 runs gave 6.05 s against the CPU's 8.35 s, and
-          the 10-token probe returned 16800-24000 samples against 47400. 27-51% short
-          is audibly rushed speech, and it has nothing to do with memory.
+        - **wrong durations.** On jp5.11 the CUDA path does not agree with its own
+          CPU: the long sentence came back 22% short and the *short* one 54% long, and
+          three renders of one input gave 1.4 s, 1.9 s and 2.95 s. Confirmed by ear as
+          garbled. Not a version problem — NVIDIA's official 1.16.0 behaves the same as
+          the 1.15.1 that ships — and nothing to do with memory.
         """
         from plugins.kokoro_direct import KokoroDirect
 
