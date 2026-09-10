@@ -201,8 +201,12 @@ def test_kokoro_defaults_to_gpu_and_the_others_to_cpu(monkeypatch):
         LANGUAGES = tts.KokoroTTSAdapter.LANGUAGES
         DEFAULT_LANGUAGE = tts.KokoroTTSAdapter.DEFAULT_LANGUAGE
 
-        def __init__(self, model_dir, speaker_id, speed, device, language=None):
-            seen.update(model_dir=model_dir, device=device, language=language)
+        # **kwargs so a new adapter option does not break this test: it is asserting
+        # the device default, not the constructor's full signature.
+        def __init__(self, model_dir, speaker_id, speed, device, language=None,
+                     **kwargs):
+            seen.update(model_dir=model_dir, device=device, language=language,
+                        **kwargs)
 
     monkeypatch.setattr(tts, "KokoroTTSAdapter", _Recorder)
     monkeypatch.setattr(tts, "MatchaTTSAdapter",
@@ -233,7 +237,8 @@ def test_config_yaml_and_dashboard_language_keys_are_both_accepted(monkeypatch):
     class _Recorder:
         DEFAULT_LANGUAGE = tts.KokoroTTSAdapter.DEFAULT_LANGUAGE
 
-        def __init__(self, model_dir, speaker_id, speed, device, language=None):
+        def __init__(self, model_dir, speaker_id, speed, device, language=None,
+                     **kwargs):
             seen["language"] = language
 
     monkeypatch.setattr(tts, "KokoroTTSAdapter", _Recorder)

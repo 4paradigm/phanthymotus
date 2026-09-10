@@ -725,7 +725,8 @@ class KokoroTTSAdapter(TTSAdapter):
     }
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 device: str = "gpu", language: str = DEFAULT_LANGUAGE):
+                 device: str = "gpu", language: str = DEFAULT_LANGUAGE,
+                 japanese_worker: bool = True, japanese_worker_device: str = "gpu"):
         import os
         from utils.model_downloader import ensure_kokoro_model
         from utils.onnx_provider import normalize_device, pick_weights, provider_for_device
@@ -812,6 +813,8 @@ class KokoroTTSAdapter(TTSAdapter):
         self._model_dir = model_dir
         self._weights_name = os.path.basename(model_path)
         self._provider = provider
+        self._japanese_worker = bool(japanese_worker)
+        self._japanese_worker_device = japanese_worker_device
 
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
@@ -991,22 +994,55 @@ class KokoroTTSAdapter(TTSAdapter):
         return self._ja_frontend
 
     def _direct(self):
-        """The phoneme-driven ONNX runtime, built on first Japanese utterance.
+        """The phoneme-driven runtime, built on the first Japanese utterance.
 
-        A second session on the same weights, so it is lazy and only Japanese pays
-        for it. Everything else keeps using sherpa, which is correct for those
-        languages and better tested.
+        A second session on the same weights, so it is lazy and only Japanese pays for
+        it. Everything else keeps using sherpa, which is correct for those languages
+        and better tested. A card configured for any of the other eight languages
+        never builds this at all.
 
-        It is deliberately given no device: `KokoroDirect` is CPU-only by
-        construction, because a second *CUDA* session on this graph collides with
-        sherpa's inside the shared CUDA provider library. That is not a tuning
-        choice — see the reasoning and the measurements in `kokoro_direct.py`.
+        **It runs in a separate process.** A CUDA session on this graph cannot coexist
+        with sherpa's in one process — the two ONNX Runtimes share a single provider
+        bridge holding one `ProviderHost` pointer, so the second session built runs
+        against the wrong runtime's objects; on jp5.11 that is a SIGSEGV that kills all
+        of perception. `plugins/kokoro_worker.py` has the full mechanism and the
+        measurements. The boundary also buys the GPU: RTF 0.063 against 0.525
+        in-process on CPU, for ~372 MB.
+
+        Falling back to the in-process CPU session is deliberate and safe — that is
+        exactly what shipped before the worker existed.
         """
         if self._direct_runtime is None:
+            if self._japanese_worker:
+                try:
+                    from plugins.kokoro_worker import KokoroWorkerProxy
+                    self._direct_runtime = KokoroWorkerProxy(
+                        self._model_dir, self._weights_name,
+                        device=self._japanese_worker_device)
+                    return self._direct_runtime
+                except Exception as exc:                          # noqa: BLE001
+                    log.warning("[tts] kokoro worker unavailable (%s); Japanese uses "
+                                "the in-process CPU session", exc)
             from plugins.kokoro_direct import KokoroDirect
             self._direct_runtime = KokoroDirect(
                 self._model_dir, self._weights_name)
         return self._direct_runtime
+
+    def close(self) -> None:
+        """Release the Japanese worker, if there is one.
+
+        Called when the card stops or the engine is switched. Without it a card that
+        spoke Japanese once holds the session for the adapter's whole life — true of
+        the in-process runtime too, and a leak this fixes for the worker case, because
+        a process exit is the only thing that returns a CUDA context.
+        """
+        runtime, self._direct_runtime = self._direct_runtime, None
+        closer = getattr(runtime, "close", None)
+        if closer is not None:
+            try:
+                closer()
+            except Exception as exc:                              # noqa: BLE001
+                log.warning("[tts] closing the kokoro worker failed: %s", exc)
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
@@ -1201,6 +1237,12 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
             # same way the facade takes `tts_engine` or `engine`.
             language=(cfg.get('tts_language') or cfg.get('language')
                       or KokoroTTSAdapter.DEFAULT_LANGUAGE),
+            # Japanese runs in its own process — the only way a CUDA session on this
+            # graph can coexist with sherpa's. Not exposed in configSchema: it is a
+            # correctness constraint, not an operator preference. config.yaml can
+            # turn it off to fall back to the in-process CPU session.
+            japanese_worker=bool(cfg.get('japanese_worker', True)),
+            japanese_worker_device=str(cfg.get('japanese_worker_device') or 'gpu'),
         )
     return MatchaTTSAdapter(model_dir, speaker_id, speed, device)
 
@@ -2339,3 +2381,13 @@ def _dispose_impl(impl) -> None:
         impl.dispatch("tts", {"action": "stop"})
     except Exception:
         log.error("[tts] failed to stop the outgoing engine", exc_info=True)
+    # Kokoro's Japanese path may own a worker process. Dropping the impl does not
+    # reap it — a child is not garbage — and on `device: gpu` it is holding a CUDA
+    # context the incoming engine is about to want.
+    adapter = getattr(impl, "_adapter", None)
+    closer = getattr(adapter, "close", None)
+    if closer is not None:
+        try:
+            closer()
+        except Exception:
+            log.error("[tts] failed to close the outgoing adapter", exc_info=True)

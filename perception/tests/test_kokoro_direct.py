@@ -158,24 +158,47 @@ def test_the_japanese_table_encodes_with_no_unknowns():
 
 def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
                                                                   monkeypatch):
-    """A CUDA session here collides with sherpa's; the collision is not order-fixable.
+    """CUDA here is safe only in a process with no other ONNX Runtime in it.
 
-    Two ONNX Runtime builds share one `libonnxruntime_providers_cuda.so` on jp6.1,
-    and whichever of them builds the *second* CUDA session on this graph dies with
-    "Could not find OrtValue with name '/Squeeze_2_output_0'". Measured both ways
-    round on Orin 6.
+    Two runtimes share one provider bridge holding a single `ProviderHost` pointer, so
+    whichever builds the *second* CUDA session on this graph dies with "Could not find
+    OrtValue with name '/Squeeze_2_output_0'" — an exception on jp6.1, a SIGSEGV that
+    kills all of perception on jp5.11. Measured both ways round on both rigs.
 
-    This shipped once. The code requested CUDA while a stale docstring asserted the
-    request was inert because the wheel was CPU-only — true until the Dockerfile
-    started installing the GPU wheel, and untested either way. So assert the two
-    things that keep it from coming back: the providers list, and the absence of any
-    argument that could reintroduce a device.
+    This shipped once, because the code requested CUDA while a stale docstring asserted
+    the request was inert. `provider` exists again now that `plugins/kokoro_worker.py`
+    provides a process with nothing else in it — so the invariant has moved rather than
+    disappeared, and this asserts where it moved to:
+
+      - the **default** is still CPU, so anything constructing this without thinking
+        gets the safe thing;
+      - the only caller that passes `provider=` is the worker child.
+
+    A CPU-only session loads no CUDA provider at all, so it never touches the bridge —
+    which is why `japanese_worker: false` and `japanese_worker_device: cpu` are both
+    safe configurations rather than merely slower ones.
     """
+    import ast
     import inspect
+    from pathlib import Path
 
     signature = inspect.signature(kd.KokoroDirect.__init__)
-    assert "provider" not in signature.parameters, (
-        "KokoroDirect must expose no device argument — see its docstring for why")
+    assert signature.parameters["provider"].default == "cpu", (
+        "the default must stay CPU: a caller that does not think about it is in "
+        "perception's process, where CUDA here corrupts sherpa's sessions")
+
+    perception_root = Path(__file__).resolve().parents[1]
+    passing = set()
+    for path in (perception_root / "plugins").rglob("*.py"):
+        tree = ast.parse(path.read_text("utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "KokoroDirect"
+                    and any(kw.arg == "provider" for kw in node.keywords)):
+                passing.add(path.name)
+    assert passing <= {"kokoro_worker.py"}, (
+        f"only the worker child may ask for a device; also seen in {sorted(passing)}")
 
     (tmp_path / "tokens.txt").write_text("a 1\n", encoding="utf-8")
     (tmp_path / "voices.bin").write_bytes(

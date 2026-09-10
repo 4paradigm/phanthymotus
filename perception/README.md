@@ -410,35 +410,107 @@ thing to do here — current misaki targets a newer Kokoro with a larger vocabul
 A test asserts every phoneme the table can emit exists in `tokens.txt`. The absence of
 that assertion is what let the original 12-drop bug ship.
 
-**This session is CPU-only by construction, and that is not a tuning decision.** On
-jp6.1 the standalone onnxruntime (1.18.0) and sherpa's bundled one (1.18.1) share a
-single `libonnxruntime_providers_cuda.so` — the Dockerfile copies sherpa's into
-`onnxruntime/capi/` to get the face plugin onto the GPU, and the soname collides so the
-first `dlopen` wins. Separate graphs coexist fine, but a *second* CUDA session on the
-**Kokoro** graph fails in whichever runtime did not load the provider, symmetrically:
+**This session runs in a process of its own, and that is not a tuning decision.** Two
+ONNX Runtimes live in the perception process — sherpa's bundled one and the standalone
+`onnxruntime` wheel that also serves face recognition — and they cannot both hold a CUDA
+session on the Kokoro graph. The reason is in the dynamic linker, not in either library:
+
+`libonnxruntime_providers_shared.so` is an 8 KB library exporting exactly
+`Provider_GetHost` and `Provider_SetHost` — a process-global slot holding **one** pointer
+to **one** runtime's `ProviderHost`. It carries a SONAME, and `ld.so` deduplicates a
+`dlopen` by matching the requested *basename* against already-loaded objects, so the
+second runtime's copy is never mapped: both get the first one. Each runtime writes its own
+host into that slot as it loads a provider, **last writer wins**, and the next session
+built runs against the other runtime's framework objects:
 
 | order | result |
 |---|---|
-| sherpa's CUDA session first | the standalone one fails, error names `/home/tian/Yxh/…` |
-| the standalone one first | **sherpa** fails, error names `/home/yifanl/…` |
+| sherpa's CUDA session first | the standalone one fails, error names sherpa's build path |
+| the standalone one first | **sherpa** fails, error names the standalone build's path |
 
 both with `Error mapping output names: Could not find OrtValue with name
-'/Squeeze_2_output_0'`. Order does not save it; staying off CUDA does. `KokoroDirect`
-therefore takes **no device argument**, so it cannot be asked.
+'/Squeeze_2_output_0'`. Verified by watching `Provider_GetHost()` change value with only
+ever one bridge mapped. **On jp5.11 the same collision is a SIGSEGV that kills the whole
+perception process**, taking ASR, VOP, OCR and face with it — worse than jp6.1, and it had
+never been exercised there because only Japanese reaches this path.
 
-The cost is confined to Japanese, and it is affordable. Measured on Orin 6, one process,
-Japanese synthesized first so its CPU session is live throughout:
+Order does not save it, and neither does anything short of a process boundary. Four
+narrower fixes were tried and measured: a version-matched 1.18.1 build (still collides),
+renaming the bridge's SONAME (`ld.so` matches the *other* object's SONAME, so changing
+ours does nothing), renaming its symbols (the second file is then never mapped at all),
+and finally renaming both the bridge and the CUDA provider *files* — which does work, but
+only by forking ONNX Runtime's ABI and maintaining a build per JetPack line.
+
+So `plugins/kokoro_worker.py` spawns a child that is the only ONNX Runtime in its address
+space. `spawn`, never `fork`: `fork` copies already-`dlopen`ed libraries, so a forked child
+would inherit sherpa's runtime and the isolation would be worthless.
+
+**What that buys, measured on Orin 6** — one 9.3 s utterance, 121 tokens:
+
+| | first call | steady state |
+|---|---|---|
+| in-process, cpu (the previous shape) | RTF 0.555 | RTF 0.525 |
+| **worker, cuda** | RTF 0.861 (8.03 s, cold kernels) | **RTF 0.063** |
+
+**What it costs**, whole-box `MemAvailable`, measured end to end through the real adapter
+on Orin 6:
+
+| | while resident | after `close()` |
+|---|---|---|
+| in-process cpu session (the previous shape) | 820 MB | **never returned** |
+| worker holding a cuda session | 1585 MB | ~330 MB residual (1191 MB reclaimed) |
+
+So it is more expensive *while speaking Japanese* and cheaper once it is done, which the
+in-process version could never be. A spawned child's own baseline is only 32–40 MB, so the
+extra interpreter is not the expensive part; the CUDA context is. An earlier note here
+quoted "+372 MB net" from a differently-sequenced measurement — the table above is the one
+taken through the adapter and is the one to trust.
+
+The process boundary itself is free enough to ignore. Only a phoneme string goes in and
+the float32 waveform comes out; the parent still does the resample, the 3200-byte framing,
+the pacing and the DDS publish, so it is **one round trip per utterance, not per frame**.
+Measured with a real 0.89 MB payload (9.3 s at 24 kHz): **2.7 ms mean, 335 MB/s** — 0.45%
+of the 590 ms the GPU synthesis itself takes.
+
+Three consequences worth knowing before turning it on:
+
+- **Nothing is spent unless the card's language is `ja`.** `_direct()` is reached only from
+  `_synthesize_japanese`, which is behind `if self._language == "ja"`. A card configured
+  for any of the other eight languages never spawns the child. A card configured *as* `ja`
+  pays at card start, because the construction-time warmup goes through the same branch.
+- **The first CUDA call costs 8.03 s**, so the child is warmed during startup and kept
+  alive. A per-utterance child would be far worse than the CPU path it replaces.
+- **It is reaped after two minutes idle**, which also fixes a leak the in-process version
+  had: `_direct_runtime` was assigned once and never released, so a card that spoke
+  Japanese once kept the session for the adapter's whole life even after switching back to
+  English. Reaping on idle rather than on the language switch is deliberate — the cold path
+  is ~15 s measured end to end and an alternating tour would otherwise pay it on every
+  switch. Card stop and engine switch close it immediately.
+
+Verified through the real adapter on Orin 6: no worker exists until Japanese is used;
+`en-us`/`zh` keep RTF ~0.11 with the worker resident; Japanese alternates with them at
+RTF 0.067–0.069; `kill -9` on the child recovers (it **restarts** the worker, paying the
+cold path again — the CPU fallback is unit-tested but was not reached on device, so treat
+it as unproven there); `close()` reclaims 1191 MB and a later Japanese utterance rebuilds.
+
+Both CPU configurations remain safe, and are safe for the same reason: a CPU-only session
+loads no CUDA provider, so it never touches the bridge. `japanese_worker_device: cpu` keeps
+the process boundary at RTF 0.525; `japanese_worker: false` goes back to the in-process CPU
+session entirely. That fallback also happens automatically if the child cannot start or
+dies — Japanese losing 8× is acceptable, Japanese breaking is not.
+
+The other eight languages are unaffected either way. Measured in one process with the
+Japanese session live throughout:
 
 | language | runtime | RTF |
 |---|---|---|
 | en-us / en-gb | sherpa, cuda | 0.31 / 0.21 |
 | zh | sherpa, cuda | 0.14 |
 | es / fr / it / pt-br / hi | sherpa, cuda | 0.10 – 0.11 |
-| **ja** | **direct ONNX, cpu** | **0.54** |
+| **ja** | **worker, cuda** | **0.063** |
 
-Real time with margin, and the other eight languages keep the GPU. Threads are the only
-lever left for Japanese and they matter — `intra_op_num_threads` defaults to one per
-core (RTF 0.52); the ORT default of 2 gives 1.17, i.e. slower than real time.
+On the CPU path, threads are the only lever and they matter — `intra_op_num_threads`
+defaults to one per core (RTF 0.52); the ORT default of 2 gives 1.17, slower than real time.
 
 **Pitch accent is not implemented and cannot be with this model.** The pinned misaki has
 no accent code at all (it arrived in 2025-04, alongside the larger vocabulary above),
