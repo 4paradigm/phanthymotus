@@ -62,6 +62,29 @@ plugins:
     speed: 1.0
     warmup: true
     max_chunk_tokens: 256
+    # kokoro-multi only. Japanese does not go through sherpa — it drives the ONNX
+    # graph directly with misaki phonemes — and that second session must live in its
+    # own process. Two ONNX Runtimes in one process share a single provider bridge
+    # holding one ProviderHost pointer, so whichever builds a CUDA session second
+    # runs against the other's objects: an exception on jp6.1, and on jp5.11 a
+    # SIGSEGV that kills all of perception. plugins/kokoro_worker.py has the detail.
+    #
+    # Measured on Orin 6 through the real adapter, one 9.3 s utterance: RTF 0.069 in
+    # the worker on gpu against 0.525 in-process on cpu, and ~15 s for the first
+    # utterance (spawn + the 8 s first CUDA call, which is why the child is kept
+    # alive). Memory, whole-box: 1585 MB while resident, of which 1191 MB comes back
+    # when the card stops — against 820 MB that the in-process session never returned.
+    # The IPC itself is 2.7 ms per utterance, 0.45% of synthesis.
+    #
+    # Nothing is spent unless the card's language is `ja`, and the worker is reaped
+    # after two minutes idle.
+    #
+    # Set false to fall back to the in-process CPU session — still real time, and
+    # what shipped before the worker existed. `japanese_worker_device: cpu` keeps the
+    # process boundary but not the GPU; both are safe, because a CPU-only session
+    # never loads the CUDA provider and so never touches the shared bridge.
+    japanese_worker: true
+    japanese_worker_device: gpu
     # matcha-zh-en / mms-th / kokoro-multi only — vits2-zh-en runs on TensorRT and
     # ignores this. Matcha is fp32, so both devices load the same weights and only
     # the provider changes; gpu measured ~4.3x faster at num_threads=2.
