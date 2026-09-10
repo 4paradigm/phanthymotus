@@ -2326,7 +2326,9 @@ class TTSPlugin:
         if requested:
             engine = self._select_engine(requested)
             with self._lock:
-                switching = engine != self._impl_engine or self._impl is None
+                already_building = self._building == engine
+                switching = not already_building and (
+                    engine != self._impl_engine or self._impl is None)
                 if switching:
                     outgoing, self._impl = self._impl, None
                     self._impl_engine = ""
@@ -2342,6 +2344,18 @@ class TTSPlugin:
                     _dispose_impl(outgoing)
                 self._build_async(engine)
                 log.info("[tts] switching engine to %s", engine)
+            if switching or already_building:
+                if already_building:
+                    # A config for the engine already being built — e.g. a
+                    # dashboard resend after seeing "loading" — must not start
+                    # a second build. Two _build_async() runs for the same
+                    # engine race on self._building/_impl_engine, and whichever
+                    # finishes last wins; if resends keep arriving faster than a
+                    # cold CUDA build the card never settles and just reloads
+                    # the model over and over. Ride the in-flight build instead.
+                    log.info("[tts] config for %s while already building; "
+                              "waiting on the in-flight build instead of "
+                              "starting another", engine)
                 # Wait for it, up to a bound. Only part of a build is open-ended
                 # (downloading a model); constructing the session afterwards took
                 # ~2 s on cpu and ~5 s on gpu, and answering `loading` for that is
