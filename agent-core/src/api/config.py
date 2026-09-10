@@ -166,7 +166,34 @@ def order_cards_by_dependency(cards, connections):
     return ordered, remaining
 
 
+_start_project_lock = False
+
+
 async def _do_start_project():
+    """Serializes concurrent callers behind a flag.
+
+    The frontend's start button used to accept a second click while the first
+    start was still in flight (it only flips to "running" after the fetch
+    resolves), and api_start_project() had no guard either — two overlapping
+    calls each pushed their own project_start_begin/item/done sequence on
+    /ws/motus. Both browser-side listeners are registered with mcp_id=null
+    (they match every event, not just their own run's), so each one reacted to
+    *both* streams: extra modals, item updates applied against the wrong
+    modal's index, and whichever run errored first called offMotusEvent() on
+    both listeners, silently orphaning the other run's still-loading cards.
+    """
+    global _start_project_lock
+    if _start_project_lock:
+        print('[start-project] already in progress, ignoring concurrent call')
+        return None
+    _start_project_lock = True
+    try:
+        return await _do_start_project_impl()
+    finally:
+        _start_project_lock = False
+
+
+async def _do_start_project_impl():
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
 
     Topic resolution strategy:
@@ -602,6 +629,11 @@ async def _do_stop_project():
 
 @router.post('/start-project')
 async def api_start_project():
+    if _start_project_lock:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'ok': False, 'detail': '启动已在进行中，请稍候'}
+        )
     success = await _do_start_project()
     if success is False:
         return fastapi.responses.JSONResponse(

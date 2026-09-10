@@ -1061,6 +1061,13 @@ html, body {
   animation: btn-pulse 3s ease-in-out infinite;
 }
 
+.canvas-main-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  animation: none;
+  transform: none;
+}
+
 /* Error flash on start failure */
 @keyframes btn-error-shake {
   0%, 100% { transform: translateX(0); }

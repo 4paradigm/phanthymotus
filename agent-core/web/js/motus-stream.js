@@ -20,6 +20,31 @@ export function onMotusEvent(mcpId, fn) {
   _listeners.push({ mcpId, fn });
 }
 
+// Resolves true once the socket is actually open, or false after `timeoutMs`.
+// push_event() on the backend is fire-and-forget to whatever clients are
+// registered *right now* — an event fired while this tab's socket is still
+// reconnecting (page just loaded, brief network blip, backend restart) is
+// gone forever, no buffering. Callers that are about to trigger a
+// server-pushed event they need to see (e.g. the start-project modal) should
+// await this first so they don't silently miss it.
+export function whenMotusConnected(timeoutMs = 8000) {
+  if (_lastStatus === 'connected') return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      _statusCbs = _statusCbs.filter((cb) => cb !== onStatus);
+      resolve(false);
+    }, timeoutMs);
+    function onStatus(state) {
+      if (state === 'connected') {
+        clearTimeout(timer);
+        _statusCbs = _statusCbs.filter((cb) => cb !== onStatus);
+        resolve(true);
+      }
+    }
+    _statusCbs.push(onStatus);
+  });
+}
+
 export function offMotusEvent(fn) {
   _listeners = _listeners.filter(l => l.fn !== fn);
 }

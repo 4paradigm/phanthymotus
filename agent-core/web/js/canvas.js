@@ -471,7 +471,15 @@ function _setupControlButtons() {
   });
 
   document.getElementById('canvas-project-toggle')?.addEventListener('click', () => {
-    _projectRunning ? _stopProject() : _startProject();
+    if (_projectRunning) { _stopProject(); return; }
+    // _projectRunning only flips true once the start fetch resolves, so a
+    // second click during that async window used to fire a second concurrent
+    // /api/config/start-project — two overlapping event streams that stomped
+    // each other's modal state.
+    const btn = document.getElementById('canvas-project-toggle');
+    if (btn?.disabled) return;
+    if (btn) btn.disabled = true;
+    _startProject().finally(() => { if (btn) btn.disabled = false; });
   });
   _syncProjectBtn();
 
@@ -1605,7 +1613,17 @@ async function _startProject() {
   await _saveLayout();
 
   // Import motus for event subscription
-  const { onMotusEvent, offMotusEvent } = await import('./motus-stream.js');
+  const { onMotusEvent, offMotusEvent, whenMotusConnected } = await import('./motus-stream.js');
+
+  // project_start_begin is a fire-and-forget WS push with no server-side
+  // buffering — if this tab's /ws/motus socket is still reconnecting (page
+  // just loaded, brief network blip) the event that would open the modal is
+  // simply lost. Wait for it (briefly) so the listener below is actually
+  // live before the backend starts pushing.
+  const wsReady = await whenMotusConnected(8000);
+  if (!wsReady) {
+    _logActivity('warn', '启动进度推送连接未就绪，启动弹窗可能不会显示');
+  }
 
   // Subscribe to startup progress events
   let modal = null;
