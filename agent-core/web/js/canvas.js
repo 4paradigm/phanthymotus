@@ -1702,6 +1702,12 @@ async function _startProject() {
       offMotusEvent(_onEvent);
       if (modal) {
         _showStartupError(modal);
+      } else if (res.status === 409) {
+        // A prior start is still settling (e.g. a card mid-warmup) — no
+        // project_start_begin ever arrived, so no modal exists to show the
+        // error in. Without this the click just looks like it did nothing;
+        // the activity log entry above is easy to miss.
+        _showToast(data.detail || '启动已在进行中，请稍候');
       }
     }
   } catch (e) {
@@ -1970,7 +1976,33 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
  *    TTS card opened a panel that never showed a waveform, and why the server
  *    log filled with `ASGI callable returned without completing handshake`.
  */
-function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
+async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
+  // Ask the driver directly first, the same way the info modal does. Every
+  // other source here (out-port dataset, the closure captured at render time,
+  // the static MCP definition) is _revalidateDerivedTopics' cache, and it has
+  // shown a stranded topic from a card's PREVIOUS wiring before a revalidation
+  // pass has run to correct it — this button must not wait on that.
+  const card = _cards.find(c => c.el === el);
+  if (card) {
+    try {
+      const resp = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tool: card.toolName,
+          arguments: { action: 'info', instance_id: card.id, input_topic: _inputTopicFor(card) },
+        }),
+      });
+      const parsed = _parseMcpCallResult(await resp.json());
+      const liveTopic = parsed?.topic_out?.find(t => t && t.topic);
+      if (liveTopic) {
+        showTopicDetail(liveTopic.topic, liveTopic.format || '');
+        return;
+      }
+    } catch (e) {
+      console.warn('[canvas] live topic fetch failed, falling back to cache:', e);
+    }
+  }
   const livePorts = [...el.querySelectorAll('.canvas-port.out')]
     .map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
   const liveMcp = _allMcps.find(m => m.id === mcpId);
@@ -2022,9 +2054,20 @@ function _revalidateDerivedTopics() {
     // its inbound connection, so want was '' with hasReal true, and the guard
     // below skipped it — the card kept '/remote_control/message/tts' while the
     // driver published on '/perception/tts', and the panel stayed empty.
-    const inputless = !_connections.some(c => c.toCardId === card.id);
     if (known === undefined) {
-      if (want || inputless || !hasReal) _fetchTopicsFromDriver(card, want);
+      // Nothing has verified this card's topics in this page's lifetime, and
+      // the saved layout is not evidence. `want` is '' both when nothing
+      // feeds this card (ask now, the driver answers with its default) and
+      // when a connected source has not resolved its topic yet (also fine —
+      // _fetchTopicsFromDriver stamps topicOutFrom with this `want`, and
+      // _resolveAllTopics re-runs this on every resolve, so a later pass
+      // re-derives once the source's topic is known). Gating on `want ||
+      // inputless || !hasReal` skipped exactly the case a connected-but-
+      // stale card lands in: hasReal true (old wiring's cached topic) and
+      // want '' (new source not resolved yet) — that combination hit
+      // neither condition, so a rewired TTS card kept its previous
+      // connection's topic (e.g. an ext_mic/asr chain) forever.
+      _fetchTopicsFromDriver(card, want);
       continue;
     }
     if (known !== want) _fetchTopicsFromDriver(card, want);

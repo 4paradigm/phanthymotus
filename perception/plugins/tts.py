@@ -38,6 +38,12 @@ PCM_FRAME_S = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s of audio per frame
 # resamples 24000 -> 16000 internally (utils/resample.py) so that the topic stays
 # audio/pcm-16k and nothing downstream has to learn a second rate.
 KOKORO_SAMPLE_RATE = 24000
+# How long a Japanese adapter stays on the in-process CPU fallback before
+# _direct() gives the shared GPU worker another attempt. Not "every call" — a
+# worker that is genuinely down would then pay the ~60s RUN_TIMEOUT_S probe on
+# every single utterance; not "never" either, which is what shipped before and
+# pinned a card to CPU for its whole life over one transient failure.
+KOKORO_WORKER_RETRY_S = 60.0
 
 # Frames held back before pacing starts, then published in one burst, so the
 # consumer begins with a real cushion. 5 frames = 500ms, matching the
@@ -810,6 +816,11 @@ class KokoroTTSAdapter(TTSAdapter):
         # Japanese does not go through sherpa at all — see _synthesize_japanese —
         # so the direct runtime needs to know which weights and provider to reuse.
         self._direct_runtime = None
+        # Set when _direct_runtime is the in-process CPU fallback rather than the
+        # worker proxy, so _direct() knows to give the worker another chance later
+        # instead of being stuck on CPU for the adapter's whole life — see _direct().
+        self._direct_fallback = False
+        self._direct_retry_at = 0.0
         self._model_dir = model_dir
         self._weights_name = os.path.basename(model_path)
         self._provider = provider
@@ -1011,27 +1022,50 @@ class KokoroTTSAdapter(TTSAdapter):
 
         Falling back to the in-process CPU session is deliberate and safe — that is
         exactly what shipped before the worker existed.
+
+        The fallback used to be permanent: once the worker's construction raised
+        anything other than `DeviceUnavailable`, `_direct_runtime` was set to a
+        plain `KokoroDirect` and the `is None` check above never fired again for
+        this adapter's whole life — a single transient failure (the shared worker
+        busy rebuilding after a restart, a one-off timeout) pinned the card to CPU
+        until the card or engine was restarted, even though the worker had long
+        since recovered. `_direct_fallback`/`_direct_retry_at` give it another
+        attempt every `KOKORO_WORKER_RETRY_S`, instead of never.
         """
+        now = time.monotonic()
+        if self._direct_runtime is not None:
+            if not self._direct_fallback or now < self._direct_retry_at:
+                return self._direct_runtime
+
+        if self._japanese_worker:
+            from plugins.kokoro_worker import DeviceUnavailable, KokoroWorkerProxy
+            try:
+                self._direct_runtime = KokoroWorkerProxy(
+                    self._model_dir, self._weights_name,
+                    device=self._japanese_worker_device)
+                self._direct_fallback = False
+                return self._direct_runtime
+            except DeviceUnavailable:
+                # The configured device cannot do the job. Substituting the CPU
+                # here would hide it behind a card that still says `gpu` — the
+                # state that made Japanese "mysteriously slow" and took a
+                # measurement to explain. Let it surface. Deliberately not
+                # retried like the branch below: this is a standing condition
+                # (not enough memory, a wrong-duration CUDA build), not a
+                # transient one, so retrying it would just repeat the same cost
+                # every KOKORO_WORKER_RETRY_S for no chance of a different answer.
+                raise
+            except Exception as exc:                          # noqa: BLE001
+                log.warning("[tts] kokoro worker unavailable (%s); Japanese uses "
+                            "the in-process CPU session, retrying the worker in "
+                            "%.0fs", exc, KOKORO_WORKER_RETRY_S)
+                self._direct_retry_at = now + KOKORO_WORKER_RETRY_S
+
         if self._direct_runtime is None:
-            if self._japanese_worker:
-                from plugins.kokoro_worker import DeviceUnavailable, KokoroWorkerProxy
-                try:
-                    self._direct_runtime = KokoroWorkerProxy(
-                        self._model_dir, self._weights_name,
-                        device=self._japanese_worker_device)
-                    return self._direct_runtime
-                except DeviceUnavailable:
-                    # The configured device cannot do the job. Substituting the CPU
-                    # here would hide it behind a card that still says `gpu` — the
-                    # state that made Japanese "mysteriously slow" and took a
-                    # measurement to explain. Let it surface.
-                    raise
-                except Exception as exc:                          # noqa: BLE001
-                    log.warning("[tts] kokoro worker unavailable (%s); Japanese uses "
-                                "the in-process CPU session", exc)
             from plugins.kokoro_direct import KokoroDirect
             self._direct_runtime = KokoroDirect(
                 self._model_dir, self._weights_name)
+            self._direct_fallback = True
         return self._direct_runtime
 
     def close(self) -> None:
@@ -2326,7 +2360,9 @@ class TTSPlugin:
         if requested:
             engine = self._select_engine(requested)
             with self._lock:
-                switching = engine != self._impl_engine or self._impl is None
+                already_building = self._building == engine
+                switching = not already_building and (
+                    engine != self._impl_engine or self._impl is None)
                 if switching:
                     outgoing, self._impl = self._impl, None
                     self._impl_engine = ""
@@ -2342,6 +2378,18 @@ class TTSPlugin:
                     _dispose_impl(outgoing)
                 self._build_async(engine)
                 log.info("[tts] switching engine to %s", engine)
+            if switching or already_building:
+                if already_building:
+                    # A config for the engine already being built — e.g. a
+                    # dashboard resend after seeing "loading" — must not start
+                    # a second build. Two _build_async() runs for the same
+                    # engine race on self._building/_impl_engine, and whichever
+                    # finishes last wins; if resends keep arriving faster than a
+                    # cold CUDA build the card never settles and just reloads
+                    # the model over and over. Ride the in-flight build instead.
+                    log.info("[tts] config for %s while already building; "
+                              "waiting on the in-flight build instead of "
+                              "starting another", engine)
                 # Wait for it, up to a bound. Only part of a build is open-ended
                 # (downloading a model); constructing the session afterwards took
                 # ~2 s on cpu and ~5 s on gpu, and answering `loading` for that is

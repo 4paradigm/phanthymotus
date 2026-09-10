@@ -547,8 +547,16 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
                 if level:
                     opts.graph_optimization_level = getattr(
                         ort.GraphOptimizationLevel, level)
+                # Positionally aligned with `providers`, e.g.
+                # [{"cudnn_conv_algo_search": "HEURISTIC"}, {}] — see
+                # kokoro_direct.py for why Kokoro's Japanese session needs this.
+                provider_options = options.get("provider_options")
                 started = time.monotonic()
-                sess = ort.InferenceSession(model_path, opts, providers=providers)
+                if provider_options:
+                    sess = ort.InferenceSession(model_path, opts, providers=providers,
+                                                provider_options=provider_options)
+                else:
+                    sess = ort.InferenceSession(model_path, opts, providers=providers)
                 post = None
                 if postprocess:
                     module = importlib.import_module(postprocess["module"])
