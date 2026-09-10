@@ -44,6 +44,15 @@ KOKORO_SAMPLE_RATE = 24000
 # every single utterance; not "never" either, which is what shipped before and
 # pinned a card to CPU for its whole life over one transient failure.
 KOKORO_WORKER_RETRY_S = 60.0
+# Forces KokoroDirect.synthesize_stream() to split every Japanese utterance
+# into chunks of at most this many tokens, well under the style table's 510
+# ceiling — see _synthesize_japanese. Tuned starting point: on Orin5 CPU,
+# ~400 tokens measured ~60ms/token, so 50 targets first sound in a few
+# seconds rather than tens of seconds; smaller means more ONNX calls (each
+# with its own fixed overhead) and one more potential seam per split, larger
+# means more silence before the first frame. Has no effect on GPU, where a
+# whole utterance is fast enough that this rarely mattered in the first place.
+KOKORO_JA_CHUNK_TOKENS = 250
 
 # Frames held back before pacing starts, then published in one burst, so the
 # consumer begins with a real cushion. 5 frames = 500ms, matching the
@@ -1154,17 +1163,49 @@ class KokoroTTSAdapter(TTSAdapter):
                         "normalisation", text)
             return
 
+        # Chunk-by-chunk, not synthesize()+concatenate. On CPU, also forced to
+        # small chunks rather than the style table's 510-token ceiling: the
+        # ceiling is a correctness limit, not a latency target, and most
+        # utterances never reach it — measured on Orin5 (CPU-only, jp5.11's CUDA
+        # computes this graph's durations wrongly), a single ~400-token sentence
+        # is one `_run` call and sat in 25s of silence before the first frame,
+        # because there was nothing to split. KOKORO_JA_CHUNK_TOKENS forces a
+        # split regardless of length, so chunk 1 (a few seconds of compute) can
+        # start playing while chunk 2 is still being computed.
+        #
+        # GPU does not get this: after fixing the CUDA EP's cudnn_conv_algo_search
+        # default (see kokoro_direct.py), the SAME long sentence measured 3.18s
+        # to first frame on GPU with no chunking at all — RTF is fast enough there
+        # that forcing small chunks would only buy back a couple of seconds while
+        # paying the leading/trailing-silence cost of every extra chunk boundary
+        # (measured: chunking one utterance into ~9 pieces added ~7.5s of audible
+        # mid-utterance pauses). The device actually in use, not the one asked
+        # for, decides this — a session that fell back to the in-process CPU path
+        # after a worker failure is exactly the case this exists for.
+        produced_any = False
         with self._lock:
-            samples = self._direct().synthesize(
-                phonemes, speaker_id=self._sid, speed=self._speed)
+            runtime = self._direct()
+            # The session actually resident, not the device once asked for: a
+            # KokoroWorkerProxy configured for gpu that has silently fallen back
+            # to its in-process CPU session (worker failure, mid-retry-window)
+            # must not be judged "gpu" just because that is what device_used
+            # still says — it would skip exactly the chunking this exists for.
+            providers = getattr(runtime, "providers", None) or []
+            using_gpu = any("CUDA" in p or "Tensorrt" in p for p in providers)
+            chunk_limit = None if using_gpu else KOKORO_JA_CHUNK_TOKENS
+            for samples in runtime.synthesize_stream(
+                    phonemes, speaker_id=self._sid, speed=self._speed,
+                    max_chunk_tokens=chunk_limit):
+                if samples.size == 0:
+                    continue
+                produced_any = True
+                pcm = downsample_24k_to_16k(samples)
+                for i in range(0, len(pcm), CHUNK_BYTES):
+                    yield pcm[i:i + CHUNK_BYTES]
 
-        if samples.size == 0:
+        if not produced_any:
             log.warning("[tts] kokoro_direct produced no audio for %r (%r)",
                         text, phonemes)
-            return
-        pcm = downsample_24k_to_16k(samples)
-        for i in range(0, len(pcm), CHUNK_BYTES):
-            yield pcm[i:i + CHUNK_BYTES]
 
     def set_speed(self, speed: float) -> None:
         # Applied per generate() call, so nothing reloads — same as the other two.

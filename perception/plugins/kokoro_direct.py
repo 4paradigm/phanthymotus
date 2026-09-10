@@ -138,6 +138,15 @@ class KokoroDirect:
                  os.path.basename(model_path), len(self._token_to_id),
                  self._n_speakers, actual)
 
+    @property
+    def providers(self) -> list:
+        """What the session actually got, e.g. `['CPUExecutionProvider']` after a
+        `gpu` request was silently declined — mirrors `KokoroWorkerProxy.providers`
+        so a caller can treat the two interchangeably (see tts.py's chunk-size
+        decision, which needs to know CPU vs GPU is actually resident, not just
+        which one was originally asked for)."""
+        return list(self._session.get_providers())
+
     def close(self) -> None:
         """Release the session.
 
@@ -184,20 +193,56 @@ class KokoroDirect:
         longer than 510 tokens is synthesized in chunks and concatenated, because
         sherpa's equivalent calls SHERPA_ONNX_EXIT(-1) at that boundary and losing a
         long sentence is worse than a seam in it.
+
+        Callers that can consume audio as it is produced should use
+        `synthesize_stream` instead — this just drains it and concatenates, which is
+        exactly the "wait for the whole utterance" cost that made a long sentence on
+        CPU (RTF ~0.52) sit in silence for as long as it took to compute all of it.
+        """
+        pieces = list(self.synthesize_stream(phonemes, speaker_id, speed))
+        if not pieces:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+
+    def synthesize_stream(self, phonemes: str, speaker_id: int = 0, speed: float = 1.0,
+                          max_chunk_tokens: int | None = None):
+        """Like `synthesize`, but yields each chunk's audio as it is computed.
+
+        Kokoro is not autoregressive, so a single chunk's `_run` cannot itself be
+        streamed — one ONNX call computes that chunk's whole waveform in one shot.
+        The win here is for an utterance `chunk_ids` splits into more than one
+        chunk: the caller can start playing chunk 1 while this generator is still
+        computing chunk 2, instead of waiting for every chunk and the final
+        `np.concatenate` before anything is audible.
+
+        `max_chunk_tokens` defaults to the style table's own ceiling (510), which
+        is a correctness limit, not a latency target — most utterances are well
+        under it and so never actually split, which is why on CPU (RTF ~0.5-1 for
+        a single chunk, since there is no GPU-fast path to hide it behind) a
+        ~400-token sentence measured ~25s of silence before the first frame: one
+        `_run` call, computed in full before this generator could yield anything.
+        A caller chasing time-to-first-sound over CPU can pass a smaller value —
+        `style` is looked up by each chunk's own token count
+        (`self._styles[speaker_id, len(ids)]`), so a chunk of any size is a
+        correct, independent unit; there is no bound below which a smaller value
+        is *wrong*, only smaller ONNX calls with proportionally more per-call
+        fixed overhead and one more potential seam per split.
         """
         ids, unknown = self.encode(phonemes)
         if unknown:
             log.warning("[tts] kokoro_direct: %d phoneme(s) not in the vocabulary "
                         "and skipped: %s", len(unknown), "".join(sorted(set(unknown))))
         if not ids:
-            return np.zeros(0, dtype=np.float32)
+            return
         if not 0 <= speaker_id < self._n_speakers:
             raise ValueError(
                 f"speaker_id must be 0..{self._n_speakers - 1}, got {speaker_id}")
 
-        pieces = [self._run(chunk, speaker_id, speed)
-                  for chunk in chunk_ids(ids, STYLE_LENGTHS - 1, self._break_ids)]
-        return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+        limit = STYLE_LENGTHS - 1
+        if max_chunk_tokens is not None:
+            limit = max(1, min(limit, int(max_chunk_tokens)))
+        for chunk in chunk_ids(ids, limit, self._break_ids):
+            yield self._run(chunk, speaker_id, speed)
 
     def _run(self, ids, speaker_id: int, speed: float):
         # A leading and trailing 0, and the style row is chosen by the *inner* count —
