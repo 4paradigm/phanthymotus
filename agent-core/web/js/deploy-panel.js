@@ -92,17 +92,17 @@ async function _onChannelChange(e) {
   } catch { /* ignore */ }
 }
 
-// Versions visible per channel. Release also shows ga (a stable fallback);
-// preview is deliberately NOT inclusive of release/ga — mixing in the far
-// more sparsely-published stable tags just buries the preview builds you're
-// there to see. Anything not in this map's active list is hidden, not merely
-// re-labelled — resource-center's own channel param already narrows what it
-// returns, this is the client's independent guarantee that the version list
-// never shows a build outside the selected channel.
+// Versions visible per channel, most-stable last: each channel shows its own
+// tags plus every more-stable channel's tags (preview -> +release -> +ga), so
+// picking a less-stable channel never hides a build you could already see on
+// a more-stable one. Anything not in this map's active list is hidden, not
+// merely re-labelled — resource-center's own channel param already narrows
+// what it returns, this is the client's independent guarantee that the
+// version list never shows a build outside the selected channel's reach.
 const _CHANNEL_TAGS = {
   ga:      ['ga'],
   release: ['release', 'ga'],
-  preview: ['preview'],
+  preview: ['preview', 'release', 'ga'],
 };
 
 function _channelTags(item) {

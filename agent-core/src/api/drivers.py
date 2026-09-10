@@ -589,14 +589,14 @@ async def _run_in_executor(fn, *args):
 # Which tag channels each update channel may resolve to. Must stay in sync with
 # _CHANNEL_TAGS in web/js/deploy-panel.js — the version list the user picks from
 # is built with the frontend's copy, and if this one disagrees the manifest ends
-# up pointing at a tag the panel never offers. That divergence is invisible until
-# it isn't: on preview, the unfiltered tags[0] is usually a ga build, so the
-# update banner (which reads manifest.image) advertises a version the deploy
-# panel simultaneously reports as already-latest.
+# up pointing at a tag the panel never offers. Each channel includes its own
+# tags plus every more-stable channel's tags (preview -> +release -> +ga), so
+# switching to a less-stable channel never hides a build already visible on a
+# more-stable one.
 _CHANNEL_TAGS = {
     'ga':      ('ga',),
     'release': ('release', 'ga'),
-    'preview': ('preview',),
+    'preview': ('preview', 'release', 'ga'),
 }
 
 
