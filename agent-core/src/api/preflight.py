@@ -17,11 +17,17 @@ from typing import Optional
 import docker as docker_sdk
 
 
-def check_disk_space(required_gb: float = 20.0) -> dict:
+def check_disk_space(required_gb: float = 20.0, min_gb: float = 1.0) -> dict:
     """Check if sufficient disk space is available.
 
+    Only blocks deployment (status='fail') when free space drops below the
+    absolute floor `min_gb`. Falling short of the recommended `required_gb`
+    (e.g. 2.5x image size) is a non-blocking warning, since that figure is a
+    comfort margin for pull+extract, not a hard requirement.
+
     Args:
-        required_gb: Minimum free space required in GB
+        required_gb: Recommended free space in GB (comfort margin)
+        min_gb: Absolute minimum free space in GB below which deploy is blocked
 
     Returns:
         {
@@ -44,7 +50,7 @@ def check_disk_space(required_gb: float = 20.0) -> dict:
                 'total_gb': round(total_gb, 1),
                 'message': f'磁盘空间充足：{free_gb:.1f} GB 可用',
             }
-        elif free_gb >= required_gb * 0.6:
+        elif free_gb >= min_gb:
             return {
                 'status': 'warning',
                 'free_gb': round(free_gb, 1),
@@ -57,7 +63,7 @@ def check_disk_space(required_gb: float = 20.0) -> dict:
                 'status': 'fail',
                 'free_gb': round(free_gb, 1),
                 'total_gb': round(total_gb, 1),
-                'message': f'磁盘空间不足：仅 {free_gb:.1f} GB 可用（需要 {required_gb:.0f} GB）',
+                'message': f'磁盘空间不足：仅 {free_gb:.1f} GB 可用（需要至少 {min_gb:.0f} GB）',
                 'suggestion': '必须清理磁盘空间：docker image prune -a && docker builder prune -a',
             }
     except Exception as e:

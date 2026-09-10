@@ -166,6 +166,17 @@ class DeployProgressUI {
         this._attachCallbacks();
     }
 
+    static _getMinimizedStack() {
+        let stack = document.getElementById('deploy-progress-minimized-stack');
+        if (!stack) {
+            stack = document.createElement('div');
+            stack.id = 'deploy-progress-minimized-stack';
+            stack.className = 'deploy-progress-minimized-stack';
+            document.body.appendChild(stack);
+        }
+        return stack;
+    }
+
     _createUI() {
         // Create modal overlay
         this.container = document.createElement('div');
@@ -205,7 +216,7 @@ class DeployProgressUI {
                 <div class="deploy-progress-minimized-progress"></div>
             </div>
         `;
-        document.body.appendChild(this.minimizedIndicator);
+        DeployProgressUI._getMinimizedStack().appendChild(this.minimizedIndicator);
 
         // Add styles if not already present
         if (!document.getElementById('deploy-progress-styles')) {
@@ -345,11 +356,18 @@ class DeployProgressUI {
                     color: #4caf50;
                 }
 
-                /* Minimized indicator */
-                .deploy-progress-minimized {
+                /* Minimized indicator stack — holds one indicator per active deployment
+                   so multiple concurrent deploys don't render on top of each other */
+                .deploy-progress-minimized-stack {
                     position: fixed;
                     bottom: 20px;
                     right: 20px;
+                    display: flex;
+                    flex-direction: column-reverse;
+                    gap: 12px;
+                    z-index: 9999;
+                }
+                .deploy-progress-minimized {
                     background: #1e1e1e;
                     border: 1px solid #333;
                     border-radius: 8px;
@@ -357,7 +375,6 @@ class DeployProgressUI {
                     min-width: 280px;
                     box-shadow: 0 4px 12px rgba(0,0,0,0.3);
                     cursor: pointer;
-                    z-index: 9999;
                     transition: transform 0.2s, box-shadow 0.2s;
                 }
                 .deploy-progress-minimized:hover {
