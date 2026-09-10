@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from plugins import scrfd_decode
 from utils.cv2_compat import load_cv2
 from utils.model_downloader import ensure_face_model
 from utils.onnx_provider import ort_providers_for_device, warn_on_parked_cores
@@ -89,9 +90,12 @@ _REC_INPUT_SIZE = 112
 
 # SCRFD wire format for a 3-level, 2-anchor, keypoint-carrying model. Upstream
 # derives these from the output count; det_500m always has 9 outputs.
-_FEAT_STRIDES = (8, 16, 32)
-_NUM_ANCHORS = 2
-_NUM_KPS = 5
+# Single source of truth is plugins/scrfd_decode.py, which the worker child imports
+# too — two copies of "this detector has three strides" is exactly the kind of drift
+# that produces an opaque reshape error.
+_FEAT_STRIDES = scrfd_decode.FEAT_STRIDES
+_NUM_ANCHORS = scrfd_decode.NUM_ANCHORS
+_NUM_KPS = scrfd_decode.NUM_KPS
 
 # ArcFace's canonical 112x112 landmark template. Aligning every face onto these
 # five points is what makes two embeddings comparable at all.
@@ -188,42 +192,12 @@ def _umeyama_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return transform[:dim].astype(np.float32)
 
 
-def _distance2bbox(centers: np.ndarray, distances: np.ndarray) -> np.ndarray:
-    x1 = centers[:, 0] - distances[:, 0]
-    y1 = centers[:, 1] - distances[:, 1]
-    x2 = centers[:, 0] + distances[:, 2]
-    y2 = centers[:, 1] + distances[:, 3]
-    return np.stack([x1, y1, x2, y2], axis=-1)
-
-
-def _distance2kps(centers: np.ndarray, distances: np.ndarray) -> np.ndarray:
-    points = []
-    for index in range(0, distances.shape[1], 2):
-        points.append(centers[:, 0] + distances[:, index])
-        points.append(centers[:, 1] + distances[:, index + 1])
-    return np.stack(points, axis=-1)
-
-
-def _nms(boxes: np.ndarray, scores: np.ndarray, thresh: float) -> list[int]:
-    """Plain greedy IoU suppression — no cv2.dnn, no torchvision."""
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    areas = np.maximum(0.0, x2 - x1 + 1) * np.maximum(0.0, y2 - y1 + 1)
-    order = scores.argsort()[::-1]
-    keep: list[int] = []
-    while order.size > 0:
-        current = int(order[0])
-        keep.append(current)
-        if order.size == 1:
-            break
-        rest = order[1:]
-        xx1 = np.maximum(x1[current], x1[rest])
-        yy1 = np.maximum(y1[current], y1[rest])
-        xx2 = np.minimum(x2[current], x2[rest])
-        yy2 = np.minimum(y2[current], y2[rest])
-        inter = np.maximum(0.0, xx2 - xx1 + 1) * np.maximum(0.0, yy2 - yy1 + 1)
-        iou = inter / (areas[current] + areas[rest] - inter)
-        order = rest[iou <= thresh]
-    return keep
+# The decode moved to plugins/scrfd_decode.py so the worker child can import the same
+# implementation instead of a copy. Re-exported under the old private names: everything
+# below reads them, and a rename would be churn for its own sake.
+_distance2bbox = scrfd_decode.distance2bbox
+_distance2kps = scrfd_decode.distance2kps
+_nms = scrfd_decode.nms
 
 
 class FaceAnalyzer:
@@ -282,8 +256,21 @@ class FaceAnalyzer:
         # read-only for /models; let ORT keep its optimised graph in memory.
         options.log_severity_level = 3
 
-        self._det = ort.InferenceSession(det_path, options, providers=providers)
-        self._rec = ort.InferenceSession(rec_path, options, providers=providers)
+        # Both sessions go into plugins/ort_worker.py's child process, because the
+        # standalone ONNX Runtime and sherpa-onnx's bundled one corrupt each other's
+        # sessions through a shared provider bridge whenever both are in one process —
+        # an exception on jp6.1, a SIGSEGV that kills all of perception on jp5.11, and
+        # with face's session built first, sherpa's Kokoro engine cannot be constructed
+        # at all. That module's docstring has the mechanism and the measurements.
+        #
+        # `_open_session` keeps this to one branch rather than two code paths: the
+        # proxy answers get_inputs/get_outputs/get_providers from the load reply, so
+        # everything below is unchanged either way.
+        self._session_keys = []
+        self._det = self._open_session("face.det", det_path, providers, options,
+                                       num_threads)
+        self._rec = self._open_session("face.rec", rec_path, providers, options,
+                                       num_threads)
         self._det_input = self._det.get_inputs()[0].name
         self._rec_input = self._rec.get_inputs()[0].name
         self._det_outputs = [output.name for output in self._det.get_outputs()]
@@ -307,6 +294,44 @@ class FaceAnalyzer:
 
         if warmup:
             self._warmup()
+
+    def _open_session(self, key: str, model_path: str, providers, options,
+                      num_threads: int):
+        """One session, in the ORT worker child unless it has been turned off.
+
+        Falls back to an in-process session if the child cannot be reached, and says so
+        loudly: that is the configuration where sherpa's runtime and this one collide,
+        so it is degraded rather than equivalent. Face itself survives the collision —
+        its graph has none of the fused squeeze outputs Kokoro's has — so the fallback
+        keeps face working and puts the *Kokoro engine* at risk instead. That is the
+        lesser harm, and worth a warning either way.
+        """
+        from plugins import ort_worker
+
+        if ort_worker.worker_enabled():
+            try:
+                # Only the detector gets a post-processor: its head is 0.96 MiB of
+                # candidates before thresholding and a few hundred bytes after. The
+                # recogniser already returns a 2 kB embedding, so there is nothing to
+                # reduce and nothing to couple.
+                postprocess = ({"module": "plugins.scrfd_decode", "func": "decode"}
+                               if key == "face.det" else None)
+                session = ort_worker.get_worker().load(
+                    key, model_path, providers,
+                    {"intra_op_num_threads": max(1, int(num_threads)),
+                     "graph_optimization_level": "ORT_ENABLE_ALL",
+                     "log_severity_level": 3},
+                    postprocess=postprocess,
+                )
+                self._session_keys.append(key)
+                return session
+            except Exception as exc:                              # noqa: BLE001
+                log.warning(
+                    "[face] the ORT worker could not load %s (%s); falling back to an "
+                    "in-process session. sherpa-onnx and this runtime then share one "
+                    "provider bridge, which breaks whichever builds a CUDA session "
+                    "second — see plugins/ort_worker.py", key, exc)
+        return ort.InferenceSession(model_path, options, providers=providers)
 
     # ── properties ────────────────────────────────────────────────────────
 
@@ -463,40 +488,23 @@ class FaceAnalyzer:
         blob = (blob - 127.5) / 128.0
         blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
 
-        outputs = self._det.run(self._det_outputs, {self._det_input: blob})
-        levels = len(_FEAT_STRIDES)
+        if self._session_keys:
+            # The session is in the worker; decode there, so the 16 800 candidates
+            # never cross. `post_kwargs` carry what changes per frame.
+            boxes, keypoints, scores = self._det.run(
+                self._det_outputs, {self._det_input: blob},
+                post_kwargs={"input_h": input_h, "input_w": input_w, "scale": scale,
+                             "det_thresh": self._det_thresh,
+                             "nms_thresh": self._nms_thresh})
+        else:
+            outputs = self._det.run(self._det_outputs, {self._det_input: blob})
+            boxes, keypoints, scores = scrfd_decode.decode(
+                outputs, input_h, input_w, scale,
+                self._det_thresh, self._nms_thresh)
 
-        boxes_all: list[np.ndarray] = []
-        kps_all: list[np.ndarray] = []
-        scores_all: list[np.ndarray] = []
-        for index, stride in enumerate(_FEAT_STRIDES):
-            scores = outputs[index].reshape(-1)
-            bbox_preds = outputs[index + levels].reshape(-1, 4) * stride
-            kps_preds = outputs[index + levels * 2].reshape(-1, _NUM_KPS * 2) * stride
-
-            grid_h, grid_w = input_h // stride, input_w // stride
-            centers = np.stack(
-                np.mgrid[:grid_h, :grid_w][::-1], axis=-1
-            ).astype(np.float32).reshape(-1, 2) * stride
-            if _NUM_ANCHORS > 1:
-                centers = np.stack([centers] * _NUM_ANCHORS, axis=1).reshape(-1, 2)
-
-            positive = np.where(scores >= self._det_thresh)[0]
-            if positive.size == 0:
-                continue
-            boxes_all.append(_distance2bbox(centers, bbox_preds)[positive])
-            kps_all.append(
-                _distance2kps(centers, kps_preds)[positive].reshape(-1, _NUM_KPS, 2)
-            )
-            scores_all.append(scores[positive])
-
-        if not scores_all:
+        if scores.size == 0:
             return []
-
-        boxes = np.concatenate(boxes_all) / scale
-        keypoints = np.concatenate(kps_all) / scale
-        scores = np.concatenate(scores_all)
-        keep = _nms(boxes, scores, self._nms_thresh)
+        keep = range(len(scores))
 
         faces = [
             DetectedFace(
@@ -566,7 +574,22 @@ class FaceAnalyzer:
         return faces
 
     def close(self) -> None:
-        """Drop the sessions. Called via `_close_quietly` on config changes."""
+        """Drop the sessions. Called via `_close_quietly` on config changes.
+
+        Dropping the reference is enough for an in-process session, but not for one
+        living in the ORT worker: a child does not notice its parent's garbage
+        collector, so the session would stay resident — 13 MB of weights and its share
+        of the GPU pool — for the life of the process. Unload it explicitly, and keep
+        the child alive for whatever else it holds.
+        """
+        for key in getattr(self, "_session_keys", ()):
+            try:
+                from plugins import ort_worker
+                ort_worker.get_worker().unload(key)
+            except Exception as exc:                              # noqa: BLE001
+                log.warning("[face] could not unload %s from the ORT worker: %s",
+                            key, exc)
+        self._session_keys = []
         self._det = None
         self._rec = None
 

@@ -166,40 +166,29 @@ def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
     kills all of perception on jp5.11. Measured both ways round on both rigs.
 
     This shipped once, because the code requested CUDA while a stale docstring asserted
-    the request was inert. `provider` exists again now that `plugins/kokoro_worker.py`
-    provides a process with nothing else in it — so the invariant has moved rather than
-    disappeared, and this asserts where it moved to:
+    the request was inert. Both arguments exist again now that
+    `plugins/ort_worker.py` provides a process with nothing else in it — so the
+    invariant moved rather than disappeared, and this asserts where it moved to:
 
-      - the **default** is still CPU, so anything constructing this without thinking
+      - `provider` defaults to **cpu**, so anything constructing this without thinking
         gets the safe thing;
-      - the only caller that passes `provider=` is the worker child.
+      - `in_process` defaults to **False**, so the session goes to the worker child.
+        `in_process=True` puts it next to sherpa's runtime, which is the configuration
+        that collides, and the callers only use it as an explicitly-degraded fallback.
 
     A CPU-only session loads no CUDA provider at all, so it never touches the bridge —
-    which is why `japanese_worker: false` and `japanese_worker_device: cpu` are both
-    safe configurations rather than merely slower ones.
+    which is why the in-process fallback paths are safe despite being in the colliding
+    process, as long as they stay on cpu.
     """
-    import ast
     import inspect
-    from pathlib import Path
 
     signature = inspect.signature(kd.KokoroDirect.__init__)
     assert signature.parameters["provider"].default == "cpu", (
-        "the default must stay CPU: a caller that does not think about it is in "
-        "perception's process, where CUDA here corrupts sherpa's sessions")
-
-    perception_root = Path(__file__).resolve().parents[1]
-    passing = set()
-    for path in (perception_root / "plugins").rglob("*.py"):
-        tree = ast.parse(path.read_text("utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "KokoroDirect"
-                    and any(kw.arg == "provider" for kw in node.keywords)):
-                passing.add(path.name)
-    assert passing <= {"kokoro_worker.py"}, (
-        f"only the worker child may ask for a device; also seen in {sorted(passing)}")
-
+        "the default must stay CPU: a caller that does not think about it may be in "
+        "perception's own process, where CUDA here corrupts sherpa's sessions")
+    assert signature.parameters["in_process"].default is False, (
+        "the default must be the worker child. in_process=True puts this session next "
+        "to sherpa's runtime, which is the configuration that collides")
     (tmp_path / "tokens.txt").write_text("a 1\n", encoding="utf-8")
     (tmp_path / "voices.bin").write_bytes(
         b"\0" * (kd.STYLE_LENGTHS * kd.STYLE_DIM * 4))
@@ -218,5 +207,8 @@ def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
         "o", (), {"intra_op_num_threads": 0})(), "InferenceSession": _Session})
     monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
 
-    kd.KokoroDirect(str(tmp_path), "model.onnx")
+    # in_process=True on purpose: this is the path the fake onnxruntime above can be
+    # seen from, and it is the path whose provider list matters — the worker child
+    # gets its providers as a plain list argument, asserted in test_ort_worker.py.
+    kd.KokoroDirect(str(tmp_path), "model.onnx", in_process=True)
     assert seen["providers"] == ["CPUExecutionProvider"], seen

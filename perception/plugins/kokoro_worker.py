@@ -25,6 +25,15 @@ Renaming the bridge and the CUDA provider in a private ORT build does fix it —
 but it forks ONNX Runtime's ABI and needs a second build per JetPack line. A process
 boundary gets the same result with none of that, and buys the GPU as well.
 
+**This module no longer owns a process.** It owns the *policy* for Japanese — which
+device is safe, whether the duration came out right, and when to give the memory back —
+while `plugins/ort_worker.py` owns the one child that holds every standalone-ORT session
+in this process, face's included. Two children would mean two CUDA contexts; the point of
+moving out of the parent was to keep the count where it already was, not to raise it.
+
+So encoding, the style-table lookup and chunking all run in the parent, as they always
+did, and only `session.run()` crosses: tokens and a 1 kB style row in, the waveform out.
+
 Measured on Orin 6, one 9.3 s Japanese utterance, 121 tokens:
 
     in-process, cpu (what this replaces)   RTF 0.525
@@ -122,17 +131,14 @@ def _mem_available_mb() -> int:
 
 
 class KokoroWorkerProxy:
-    """`KokoroDirect`'s surface, executed in a spawned child.
+    """`KokoroDirect`'s surface, with its ONNX session in the shared ORT worker.
 
-    Only `synthesize` is forwarded — the phoneme string goes in (~121 characters) and
-    float32 samples come back (~91 KB). Resampling, framing, pacing and EOF all stay in
-    the parent, so the boundary sits where the data is smallest and `plugins/tts.py`
-    does not change.
+    Constructed by `plugins/tts.py:_direct()`; its interface is deliberately unchanged
+    from when this class owned a child process, so nothing in tts.py had to move.
 
-    Falls back to an in-process CPU `KokoroDirect` if the child cannot be started or
-    dies. That fallback is exactly what shipped before this module existed, so a worker
-    failure costs speed and nothing else — Japanese must not break because a subprocess
-    did.
+    Falls back to an in-process CPU `KokoroDirect` if the worker cannot serve it. That
+    fallback is what shipped before any of this existed, so a worker failure costs speed
+    and nothing else — Japanese must not break because a subprocess did.
     """
 
     def __init__(self, model_dir: str, weights: str, device: str = "gpu",
@@ -144,25 +150,17 @@ class KokoroWorkerProxy:
         self._idle_timeout_s = float(idle_timeout_s)
 
         self._lock = threading.RLock()
-        self._ctx = None
-        self._proc = None
-        self._cmd_q = None
-        self._res_q = None
+        self._direct = None
+        self._device_used = device
         self._last_used = time.monotonic()
         self._closed = False
         self._fallback = None
         self._fallback_warned = False
 
-        # Filled by the child's handshake; the properties need them before any call.
-        self._n_speakers = 0
-        self._sample_rate = 0
-        self._providers = []
-        self._device_used = device
-
-        self._start()
+        self._build()
 
         self._reaper = threading.Thread(target=self._reap_loop, daemon=True,
-                                        name="kokoro-worker-reaper")
+                                        name="kokoro-session-reaper")
         self._reaper.start()
         atexit.register(self.close)
 
@@ -170,276 +168,155 @@ class KokoroWorkerProxy:
 
     @property
     def num_speakers(self) -> int:
-        if self._n_speakers:
-            return self._n_speakers
-        return self._use_fallback().num_speakers
+        with self._lock:
+            return (self._direct or self._use_fallback()).num_speakers
 
     @property
     def sample_rate(self) -> int:
-        if self._sample_rate:
-            return self._sample_rate
-        return self._use_fallback().sample_rate
+        with self._lock:
+            return (self._direct or self._use_fallback()).sample_rate
 
     @property
     def providers(self) -> list:
-        """What the child actually got. `['CPUExecutionProvider']` means the GPU was
-        asked for and refused — worth seeing in `info` rather than assuming."""
-        return list(self._providers)
+        """What the session actually got. `['CPUExecutionProvider']` after asking for
+        gpu means a guard declined it — worth seeing in `info` rather than assuming."""
+        with self._lock:
+            if self._direct is None:
+                return []
+            return list(self._direct._session.get_providers())
 
-    # ── lifecycle ────────────────────────────────────────────────────────────
+    @property
+    def device_used(self) -> str:
+        return self._device_used
 
-    def _start(self) -> None:
-        """Spawn the child and wait for it to report a warmed session.
+    # ── build, with both guards ──────────────────────────────────────────────
 
-        `spawn`, never the platform default: on Linux that is `fork`, which copies the
-        address space including already-dlopened libraries. A forked child would
-        inherit sherpa's ONNX Runtime and the isolation this module exists for would be
-        worthless.
+    def _build(self) -> None:
+        """Load the session in the shared worker, on a device that is actually safe.
+
+        Two guards, and the order matters. The duration check runs *after* the session
+        is built, so it cannot prevent the allocation that builds it from taking the box
+        down — the headroom check has to come first.
         """
-        import multiprocessing as mp
+        from plugins.kokoro_direct import KokoroDirect
 
         device = self._device
         if device in ("cuda", "gpu"):
             headroom = _mem_available_mb()
             if 0 <= headroom < CUDA_HEADROOM_MB:
-                log.warning("[tts] kokoro worker: %d MB available, under the %d MB a "
-                            "CUDA child needs — using cpu (RTF ~0.52 rather than "
-                            "~0.07). Asking anyway OOM-killed a jp5.11 rig.",
+                log.warning("[tts] kokoro: %d MB available, under the %d MB a CUDA "
+                            "session needs — using cpu (RTF ~0.52 rather than ~0.07). "
+                            "Asking anyway OOM-killed a jp5.11 rig.",
                             headroom, CUDA_HEADROOM_MB)
                 device = "cpu"
 
-        self._ctx = mp.get_context("spawn")
-        self._cmd_q = self._ctx.Queue()
-        self._res_q = self._ctx.Queue()
-        self._proc = self._ctx.Process(
-            target=_kokoro_worker,
-            args=(self._model_dir, self._weights, device, self._num_threads,
-                  self._cmd_q, self._res_q, log.getEffectiveLevel()),
-            daemon=False,
-            name="kokoro_ja_worker",
-        )
         started = time.monotonic()
-        self._proc.start()
+        for candidate, why in ((device, "requested"), ("cpu", "fallback")):
+            if why == "fallback" and candidate == device:
+                break                       # already tried it, and it failed the check
+            direct = KokoroDirect(self._model_dir, self._weights,
+                                  num_threads=self._num_threads, provider=candidate,
+                                  session_key="tts.kokoro.ja")
+            # The warmup was always needed — the first CUDA call costs 8.03 s of lazy
+            # kernel loading against 0.59 s warm — so checking its output length is
+            # free. A wrong length means this device computes the duration path
+            # incorrectly, and a fast wrong answer is worse than a slow right one.
+            n = len(direct.synthesize(PROBE_TEXT, speaker_id=0, speed=1.0))
+            off = abs(n - PROBE_SAMPLES) / PROBE_SAMPLES
+            if off <= PROBE_TOLERANCE:
+                self._direct = direct
+                self._device_used = candidate
+                log.info("[tts] kokoro session ready in %.1fs on %s%s: providers=%s",
+                         time.monotonic() - started, candidate,
+                         "" if candidate == self._device
+                         else f" (asked for {self._device})",
+                         direct._session.get_providers())
+                return
+            log.error("[tts] %s produced %d samples for the probe, expected ~%d "
+                      "(%.0f%% off) — this device computes the duration path wrongly; "
+                      "not using it", candidate, n, PROBE_SAMPLES, off * 100)
+            direct.close()
+        raise RuntimeError(
+            f"neither {self._device} nor cpu produced a plausible probe duration; the "
+            f"model or the phoneme table does not match this code")
 
-        try:
-            kind, payload = self._res_q.get(timeout=START_TIMEOUT_S)
-        except queue.Empty:
-            self._terminate()
-            raise RuntimeError(
-                f"Kokoro worker did not report ready within {START_TIMEOUT_S:.0f}s")
-        if kind != "ready":
-            self._terminate()
-            raise RuntimeError(f"Kokoro worker failed to start: {payload}")
-
-        self._n_speakers = int(payload["num_speakers"])
-        self._sample_rate = int(payload["sample_rate"])
-        self._providers = list(payload["providers"])
-        self._device_used = payload.get("device_used", self._device)
-        log.info("[tts] kokoro worker ready in %.1fs: pid=%s device=%s%s providers=%s, "
-                 "%d speakers, warmup %.2fs",
-                 time.monotonic() - started, self._proc.pid, self._device_used,
-                 "" if self._device_used == self._device
-                 else f" (asked for {self._device})",
-                 self._providers, self._n_speakers, payload["warmup_s"])
-
-    def _alive(self) -> bool:
-        return self._proc is not None and self._proc.is_alive()
-
-    def _terminate(self) -> None:
-        proc, self._proc = self._proc, None
-        self._cmd_q = self._res_q = None
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.join(timeout=5)
-            if proc.is_alive():
-                proc.kill()
-                proc.join(timeout=5)
-        except Exception:                                        # noqa: BLE001
-            pass
+    # ── lifecycle ────────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Kill the child and release its CUDA context.
+        """Unload the session, giving its weights and GPU pool back.
 
-        A process exit is the only thing that returns a CUDA context at all — an
-        in-process session never does. Called on card stop, engine switch, idle
-        expiry and at exit; safe to call more than once.
+        Unloads rather than killing the child: face's sessions live in the same process
+        and must survive Japanese being done with. Called on card stop, engine switch,
+        idle expiry and at exit; safe to call more than once.
         """
         with self._lock:
-            if self._closed and self._proc is None:
-                return
             self._closed = True
-            if self._proc is not None:
-                log.info("[tts] kokoro worker closing (pid=%s)", self._proc.pid)
-            self._terminate()
+            direct, self._direct = self._direct, None
             self._fallback = None
+        if direct is not None:
+            try:
+                direct.close()
+            except Exception as exc:                              # noqa: BLE001
+                log.warning("[tts] unloading the kokoro session failed: %s", exc)
 
     def _reap_loop(self) -> None:
         """Give the memory back when Japanese stops being used.
 
-        Not on `set_language`, deliberately: the cold path is ~10.5 s and a tour that
-        alternates languages would pay it on every switch. Idle time is the signal that
-        actually means "done with Japanese".
+        Not on `set_language`, deliberately: the cold path is ~15 s measured end to end
+        and a tour that alternates languages would pay it on every switch. Idle time is
+        the signal that actually means "done with Japanese".
         """
         while True:
             time.sleep(5.0)
+            direct = None
             with self._lock:
                 if self._closed:
                     return
                 idle = time.monotonic() - self._last_used
-                if self._alive() and idle > self._idle_timeout_s:
-                    log.info("[tts] kokoro worker idle %.0fs, reaping (pid=%s)",
-                             idle, self._proc.pid)
-                    self._terminate()
+                if self._direct is not None and idle > self._idle_timeout_s:
+                    log.info("[tts] kokoro session idle %.0fs, unloading", idle)
+                    direct, self._direct = self._direct, None
+            # Unload outside the lock: it is a round trip to the child, and holding the
+            # lock across it would stall an utterance that arrived meanwhile.
+            if direct is not None:
+                try:
+                    direct.close()
+                except Exception as exc:                          # noqa: BLE001
+                    log.warning("[tts] idle unload failed: %s", exc)
 
-    # ── the one forwarded call ───────────────────────────────────────────────
+    # ── the one call ─────────────────────────────────────────────────────────
 
     def synthesize(self, phonemes: str, speaker_id: int = 0, speed: float = 1.0):
         with self._lock:
             self._last_used = time.monotonic()
             if self._closed:
                 return self._use_fallback().synthesize(phonemes, speaker_id, speed)
-            if not self._alive():
+            if self._direct is None:
                 try:
-                    self._start()
+                    self._build()
                 except Exception as exc:                          # noqa: BLE001
-                    log.warning("[tts] kokoro worker could not be restarted (%s); "
+                    log.warning("[tts] kokoro session could not be rebuilt (%s); "
                                 "Japanese falls back to the in-process CPU session",
                                 exc)
                     return self._use_fallback().synthesize(phonemes, speaker_id, speed)
-
-            req_id = uuid.uuid4().hex[:8]
             try:
-                self._cmd_q.put(("synthesize", req_id, phonemes, speaker_id, speed))
-                kind, payload = self._recv(req_id)
+                return self._direct.synthesize(phonemes, speaker_id=speaker_id,
+                                               speed=speed)
             except Exception as exc:                              # noqa: BLE001
-                log.warning("[tts] kokoro worker call failed (%s); falling back to "
-                            "the in-process CPU session", exc)
-                self._terminate()
+                log.warning("[tts] kokoro synthesis in the worker failed (%s); "
+                            "falling back to the in-process CPU session", exc)
+                self._direct = None
                 return self._use_fallback().synthesize(phonemes, speaker_id, speed)
 
-            if kind == "error":
-                # The child is fine, the request was not — surface it rather than
-                # silently re-synthesizing somewhere else and hiding a real bug.
-                raise RuntimeError(f"kokoro worker: {payload}")
-            return payload
-
-    def _recv(self, want_id: str):
-        """Read until this request's answer, tolerating a late reply to an earlier one.
-
-        Calls are serialised by `self._lock`, so out-of-order traffic means a previous
-        call timed out and its result arrived afterwards. Dropping it is right; blocking
-        on it would deadlock the next utterance.
-        """
-        deadline = time.monotonic() + CALL_TIMEOUT_S
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"no reply within {CALL_TIMEOUT_S:.0f}s (child alive="
-                    f"{self._alive()})")
-            kind, req_id, payload = self._res_q.get(timeout=remaining)
-            if req_id == want_id:
-                return kind, payload
-            log.debug("[tts] kokoro worker: dropping stale reply %s", req_id)
-
     def _use_fallback(self):
-        """The in-process CPU session — what shipped before this module existed."""
+        """The in-process CPU session — what shipped before any of this existed."""
         if self._fallback is None:
             from plugins.kokoro_direct import KokoroDirect
             self._fallback = KokoroDirect(self._model_dir, self._weights,
-                                          num_threads=self._num_threads)
+                                          num_threads=self._num_threads,
+                                          in_process=True)
         if not self._fallback_warned:
             self._fallback_warned = True
             log.warning("[tts] Japanese is using the in-process CPU session "
-                        "(RTF ~0.52 against ~0.06 on the worker)")
+                        "(RTF ~0.52 against ~0.07 in the worker)")
         return self._fallback
-
-
-def _build_checked(KokoroDirect, model_dir, weights, device, num_threads, wlog):
-    """Build on `device`, warm it up, and check the warmup's duration is right.
-
-    The warmup was always needed — the first CUDA call costs 8.03 s of lazy kernel
-    loading against 0.59 s warm — so measuring its output length is free. If the length
-    is wrong the device is executing the duration path incorrectly (jp5.11's ORT 1.15.1
-    returns 35-44% of it), and CPU is the only honest answer: 27% short is audibly
-    rushed speech, and a fast wrong answer is worse than a slow right one.
-
-    Returns `(runtime, device_actually_used)`.
-    """
-    for candidate, why in ((device, "requested"), ("cpu", "fallback")):
-        if why == "fallback" and candidate == device:
-            break                       # already tried, and it failed the check
-        direct = KokoroDirect(model_dir, weights, num_threads=num_threads,
-                              provider=candidate)
-        n = len(direct.synthesize(PROBE_TEXT, speaker_id=0, speed=1.0))
-        off = abs(n - PROBE_SAMPLES) / PROBE_SAMPLES
-        if off <= PROBE_TOLERANCE:
-            if why == "fallback":
-                wlog.warning("running on cpu after %r failed the duration check", device)
-            return direct, candidate
-        wlog.error("%s produced %d samples for the probe, expected ~%d (%.0f%% off) — "
-                   "this device computes the duration path wrongly; not using it",
-                   candidate, n, PROBE_SAMPLES, off * 100)
-        del direct
-    raise RuntimeError(
-        f"neither {device} nor cpu produced a plausible probe duration; the model or "
-        f"the phoneme table does not match this code")
-
-
-def _kokoro_worker(model_dir: str, weights: str, device: str, num_threads: int,
-                   cmd_q, res_q, log_level: int) -> None:
-    """Child entry point. Owns one `KokoroDirect` and nothing else.
-
-    Deliberately imports neither `rclpy` nor `sherpa_onnx`: this process exists to be
-    the only ONNX Runtime in its address space, and the parent keeps the ROS node, the
-    publisher and the pacing.
-    """
-    # A spawned child gets a fresh interpreter and does not inherit the parent's
-    # sys.stdout, so the atomic writer has to be reinstalled — without it a subprocess
-    # writing on the parent's fd 1 tears Docker log records.
-    try:
-        from utils import logsafe
-        logsafe.install(check_fd=False)
-    except Exception:                                             # noqa: BLE001
-        pass
-
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
-        datefmt='%H:%M:%S')
-    wlog = logging.getLogger("tts.kokoro_worker")
-
-    try:
-        from plugins.kokoro_direct import KokoroDirect
-        started = time.monotonic()
-        direct, device_used = _build_checked(KokoroDirect, model_dir, weights, device,
-                                             num_threads, wlog)
-        res_q.put(("ready", {
-            "num_speakers": direct.num_speakers,
-            "sample_rate": direct.sample_rate,
-            "providers": list(direct._session.get_providers()),
-            "device_used": device_used,
-            "warmup_s": round(time.monotonic() - started, 2),
-        }))
-    except Exception as exc:                                      # noqa: BLE001
-        res_q.put(("failed", f"{type(exc).__name__}: {exc}"))
-        return
-
-    while True:
-        try:
-            command = cmd_q.get()
-        except (EOFError, OSError):
-            return
-        if command is None or command[0] == "stop":
-            return
-        if command[0] != "synthesize":
-            wlog.warning("unknown command %r", command[0])
-            continue
-        _, req_id, phonemes, speaker_id, speed = command
-        try:
-            samples = direct.synthesize(phonemes, speaker_id=speaker_id, speed=speed)
-            res_q.put(("ok", req_id, np.asarray(samples, dtype=np.float32)))
-        except Exception as exc:                                  # noqa: BLE001
-            res_q.put(("error", req_id, f"{type(exc).__name__}: {exc}"))
