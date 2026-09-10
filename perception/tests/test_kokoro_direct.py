@@ -197,8 +197,9 @@ def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
     seen = {}
 
     class _Session:
-        def __init__(self, path, opts, providers):
+        def __init__(self, path, opts, providers, provider_options=None):
             seen["providers"] = providers
+            seen["provider_options"] = provider_options
 
         def get_providers(self):
             return seen["providers"]
@@ -212,3 +213,6 @@ def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
     # gets its providers as a plain list argument, asserted in test_ort_worker.py.
     kd.KokoroDirect(str(tmp_path), "model.onnx", in_process=True)
     assert seen["providers"] == ["CPUExecutionProvider"], seen
+    assert seen["provider_options"] == [{}], (
+        "cudnn_conv_algo_search is a CUDA-only option; a CPU-only session must not "
+        "carry it")

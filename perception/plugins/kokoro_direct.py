@@ -90,6 +90,18 @@ class KokoroDirect:
 
         providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
                      if provider in ("cuda", "gpu") else ["CPUExecutionProvider"])
+        # onnxruntime's CUDA EP defaults cudnn_conv_algo_search to EXHAUSTIVE, which
+        # re-benchmarks convolution kernels on every *distinct* input shape — and
+        # this graph's shape is the token count, which is different per sentence.
+        # Measured: a repeated sentence (same shape already benchmarked) answers in
+        # well under a second; a genuinely new one pays several extra seconds on top
+        # of the ~0.07 RTF this graph otherwise runs at. HEURISTIC picks an algorithm
+        # from cuDNN's own heuristics instead of benchmarking every candidate, which
+        # costs a little peak throughput but not a multi-second stall per new shape.
+        # No effect on CPUExecutionProvider, which is why it is CUDA-only below.
+        provider_options = [{"cudnn_conv_algo_search": "HEURISTIC"}
+                             if p == "CUDAExecutionProvider" else {}
+                             for p in providers]
         # 0 lets ORT pick one thread per core, which measured fastest; an explicit
         # value is honoured so a busy robot can be told to use fewer.
         threads = int(num_threads or 0)
@@ -99,12 +111,14 @@ class KokoroDirect:
             opts = ort.SessionOptions()
             opts.intra_op_num_threads = threads
             self._session = ort.InferenceSession(model_path, opts,
-                                                 providers=providers)
+                                                 providers=providers,
+                                                 provider_options=provider_options)
         else:
             from plugins import ort_worker
             self._session = ort_worker.get_worker().load(
                 session_key, model_path, providers,
-                {"intra_op_num_threads": threads})
+                {"intra_op_num_threads": threads,
+                 "provider_options": provider_options})
             self._session_key = session_key
         actual = self._session.get_providers()
 
