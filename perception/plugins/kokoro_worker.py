@@ -413,8 +413,14 @@ class KokoroWorkerProxy:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
 
-    def synthesize_stream(self, phonemes: str, speaker_id: int = 0, speed: float = 1.0):
+    def synthesize_stream(self, phonemes: str, speaker_id: int = 0, speed: float = 1.0,
+                          max_chunk_tokens: int | None = None):
         """Like `synthesize`, but yields each chunk as `KokoroDirect` computes it.
+
+        `max_chunk_tokens` is passed straight through to `KokoroDirect` — see its
+        docstring. Applies equally to the worker and the in-process fallback, so
+        switching devices mid-utterance (the failure path below) does not change
+        how finely the rest of the utterance is chunked.
 
         Falls back to the in-process CPU session on the same conditions
         `synthesize` used to, but only up to the first chunk: once a chunk from
@@ -428,7 +434,7 @@ class KokoroWorkerProxy:
             self._last_used = time.monotonic()
             if self._closed:
                 yield from self._use_fallback().synthesize_stream(
-                    phonemes, speaker_id, speed)
+                    phonemes, speaker_id, speed, max_chunk_tokens)
                 return
             if self._direct is None:
                 try:
@@ -442,12 +448,13 @@ class KokoroWorkerProxy:
                                 "Japanese falls back to the in-process CPU session",
                                 exc)
                     yield from self._use_fallback().synthesize_stream(
-                        phonemes, speaker_id, speed)
+                        phonemes, speaker_id, speed, max_chunk_tokens)
                     return
             started = False
             try:
                 for chunk in self._direct.synthesize_stream(
-                        phonemes, speaker_id=speaker_id, speed=speed):
+                        phonemes, speaker_id=speaker_id, speed=speed,
+                        max_chunk_tokens=max_chunk_tokens):
                     started = True
                     yield chunk
             except Exception as exc:                              # noqa: BLE001
@@ -457,7 +464,7 @@ class KokoroWorkerProxy:
                             "falling back to the in-process CPU session", exc)
                 self._direct = None
                 yield from self._use_fallback().synthesize_stream(
-                    phonemes, speaker_id, speed)
+                    phonemes, speaker_id, speed, max_chunk_tokens)
 
     def _use_fallback(self):
         """The in-process CPU session — what shipped before any of this existed."""

@@ -52,7 +52,7 @@ KOKORO_WORKER_RETRY_S = 60.0
 # with its own fixed overhead) and one more potential seam per split, larger
 # means more silence before the first frame. Has no effect on GPU, where a
 # whole utterance is fast enough that this rarely mattered in the first place.
-KOKORO_JA_CHUNK_TOKENS = 50
+KOKORO_JA_CHUNK_TOKENS = 250
 
 # Frames held back before pacing starts, then published in one burst, so the
 # consumer begins with a real cushion. 5 frames = 500ms, matching the

@@ -55,7 +55,8 @@ class _FakeDirect:
         return np.zeros(self.lengths.get(self.provider, kw.PROBE_SAMPLES),
                         dtype=np.float32)
 
-    def synthesize_stream(self, phonemes, speaker_id=0, speed=1.0):
+    def synthesize_stream(self, phonemes, speaker_id=0, speed=1.0,
+                          max_chunk_tokens=None):
         yield self.synthesize(phonemes, speaker_id, speed)
 
     def close(self):
