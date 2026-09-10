@@ -1447,3 +1447,63 @@ def test_the_byte_cap_is_a_transfer_guard_not_a_photo_limit():
 def test_corpus_finds_the_formats_both_decoders_read():
     for suffix in (".jpg", ".png", ".webp", ".tif", ".tiff", ".gif", ".bmp"):
         assert suffix in face_plugin._IMAGE_SUFFIXES
+
+
+# ── the wiring nothing else checks ────────────────────────────────────────────
+
+def test_analyzer_options_are_all_accepted_by_the_proxy():
+    """`_analyzer_options` builds the kwargs; the proxy has to accept every one.
+
+    This shipped broken: adding `model` to the options without adding it to
+    `FaceServiceProxy.__init__` gave `TypeError: __init__() got an unexpected keyword
+    argument 'model'` at card start, on a robot. Nothing caught it, because every test
+    either replaces `_build_engine` wholesale or fakes the analyzer with a signature
+    that swallows anything — so the one place the real kwargs meet the real signature
+    was never exercised.
+
+    Checked by signature rather than by calling it, because constructing the real proxy
+    spawns a child and loads two models.
+    """
+    import inspect
+
+    from plugins.face_proxy import FaceServiceProxy
+
+    produced = set(face_plugin._analyzer_options({}))
+    produced |= {"max_image_side", "max_image_pixels"}      # added by _build_engine
+    accepted = set(inspect.signature(FaceServiceProxy.__init__).parameters) - {"self"}
+    assert produced <= accepted, (
+        f"_build_engine would pass {sorted(produced - accepted)}, which "
+        f"FaceServiceProxy.__init__ does not take")
+
+
+def test_the_proxy_forwards_everything_it_takes_to_the_service():
+    """And the service has to accept what the proxy sends, for the same reason.
+
+    One hop further along the same chain: proxy -> ort_worker.service ->
+    plugins.face_service.build -> FaceService.__init__ -> FaceAnalyzer. A parameter
+    that stops halfway is a card that will not start.
+    """
+    import inspect
+
+    from plugins.face_proxy import FaceServiceProxy
+    from plugins.face_service import FaceService
+
+    proxy_takes = set(inspect.signature(FaceServiceProxy.__init__).parameters) - {"self"}
+    service_takes = set(inspect.signature(FaceService.__init__).parameters) - {"self"}
+    # `device` is resolved to `providers` in the proxy and does not travel as-is.
+    forwarded = proxy_takes - {"device"}
+    assert forwarded <= service_takes, (
+        f"the proxy would forward {sorted(forwarded - service_takes)}, which "
+        f"FaceService.__init__ does not take")
+
+
+def test_the_service_passes_the_model_on_to_the_analyzer():
+    """The last hop. `model` selects the weights; silently dropping it would run
+    buffalo_sc while the card said something else."""
+    import inspect
+
+    from plugins.face_runtime import FaceAnalyzer
+    from plugins.face_service import FaceService
+
+    assert "model" in inspect.signature(FaceService.__init__).parameters
+    assert "model" in inspect.signature(FaceAnalyzer.__init__).parameters

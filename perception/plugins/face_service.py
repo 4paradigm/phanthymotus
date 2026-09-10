@@ -65,7 +65,8 @@ class FaceService:
     def __init__(self, model_dir: str, providers, num_threads: int = 2,
                  det_size=(640, 640), det_thresh: float = 0.5,
                  nms_thresh: float = 0.4, max_image_side: int = 2048,
-                 max_image_pixels: float = 60e6, warmup: bool = True):
+                 max_image_pixels: float = 60e6, warmup: bool = True,
+                 model: str = "buffalo_sc"):
         from plugins.face_runtime import FaceAnalyzer
 
         # The decode limits are per-call on decode_image, not analyzer state, so they
@@ -78,9 +79,9 @@ class FaceService:
         # created in it is exactly what the design wants. The flag exists so the same
         # class refuses to create one in the perception process by accident.
         self._analyzer = FaceAnalyzer(
-            model_dir=model_dir, providers=providers, num_threads=num_threads,
-            det_size=det_size, det_thresh=det_thresh, nms_thresh=nms_thresh,
-            warmup=warmup, in_process=True,
+            model_dir=model_dir, model=model, providers=providers,
+            num_threads=num_threads, det_size=det_size, det_thresh=det_thresh,
+            nms_thresh=nms_thresh, warmup=warmup, in_process=True,
         )
         log.info("face service ready: device=%s providers=%s",
                  self._analyzer.device, self._analyzer.providers)

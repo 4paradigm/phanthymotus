@@ -24,7 +24,7 @@ import logging
 
 import numpy as np
 
-from plugins.face_runtime import DetectedFace
+from plugins.face_runtime import DEFAULT_FACE_MODEL, DetectedFace
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +43,8 @@ class FaceServiceProxy:
     def __init__(self, model_dir: str, device: str = "auto", num_threads: int = 2,
                  det_size=(640, 640), det_thresh: float = 0.5,
                  nms_thresh: float = 0.4, max_image_side: int = 2048,
-                 max_image_pixels: float = 60e6, warmup: bool = True):
+                 max_image_pixels: float = 60e6, warmup: bool = True,
+                 model: str = DEFAULT_FACE_MODEL):
         from plugins import ort_worker
         from utils.onnx_provider import ort_providers_for_device, warn_on_parked_cores
 
@@ -60,8 +61,9 @@ class FaceServiceProxy:
         self._worker = ort_worker.get_worker()
         described = self._worker.service(
             SERVICE_KEY, "plugins.face_service", "build",
-            model_dir=model_dir, providers=providers, num_threads=num_threads,
-            det_size=tuple(det_size), det_thresh=det_thresh, nms_thresh=nms_thresh,
+            model_dir=model_dir, model=model, providers=providers,
+            num_threads=num_threads, det_size=tuple(det_size),
+            det_thresh=det_thresh, nms_thresh=nms_thresh,
             max_image_side=max_image_side, max_image_pixels=max_image_pixels,
             warmup=warmup,
         ).describe()

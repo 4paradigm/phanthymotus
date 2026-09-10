@@ -252,7 +252,12 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "model":             {"type": "string", "enum": sorted(FACE_MODELS), "default": DEFAULT_FACE_MODEL, "description": "识别模型。切换模型会重新加载并使已存样本失效——不同网络的 embedding 不可比较，已注册人员需重新录入"},
+                # The description enumerates what each value actually is: `buffalo_sc`
+                # is InsightFace's *pack* name, not a network name, and an operator
+                # reading the card has no way to know it means SCRFD-500M + ArcFace
+                # MobileFaceNet. Generated from the registry so a second entry
+                # documents itself.
+                "model":             {"type": "string", "enum": sorted(FACE_MODELS), "default": DEFAULT_FACE_MODEL, "description": "识别模型：" + "；".join(f"{name} = {spec['description']}" for name, spec in sorted(FACE_MODELS.items())) + "。切换模型会重新加载，并使已存样本失效——不同网络的 embedding 不可比较，已注册人员需重新录入"},
                 "device":            {"type": "string", "enum": ["auto", "cpu", "gpu"], "default": "auto", "description": "推理设备。auto=有 GPU 用 GPU，没有则用 CPU"},
                 "detect_fps":        {"type": "number", "minimum": 0, "default": DEFAULT_DETECT_FPS, "description": "检测频率，每秒 x 次，支持小数（如 0.5 = 每 2 秒一次）；0=每帧都检测", "scope": "instance"},
                 "match_threshold":   {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格（越不容易认错人，但越容易认不出）"},

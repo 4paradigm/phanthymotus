@@ -96,7 +96,9 @@ FACE_MODELS = {
         "det": "det_500m.onnx",
         "rec": "w600k_mbf.onnx",
         "bundle": "face",
-        "description": "SCRFD-500M + ArcFace MobileFaceNet, 512-d",
+        # `buffalo_sc` is InsightFace's pack name and covers two networks; spelling
+        # them out is what makes the card's dropdown readable.
+        "description": "InsightFace buffalo_sc（SCRFD-500M 检测 + ArcFace MobileFaceNet，512 维）",
     },
 }
 DEFAULT_FACE_MODEL = "buffalo_sc"
