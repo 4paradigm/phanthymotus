@@ -492,6 +492,35 @@ Verified through the real adapter on Orin 6: no worker exists until Japanese is 
 RTF 0.067–0.070; `kill -9` on the child recovers; `close()` reclaims ~1.2 GB and a later
 Japanese utterance rebuilds.
 
+#### Known hazard, pre-existing: face on gpu before Kokoro on gpu
+
+The worker moves Japanese out of the perception process, but **face and sherpa are still
+both in it**, and they are the same colliding pair. Face survives the collision — its
+graph has none of the fused squeeze outputs Kokoro's has — but Kokoro does not survive
+being built second:
+
+| order (one process, both on `device: gpu`) | result |
+|---|---|
+| Kokoro's sherpa session, then face | both fine — face 5.6–6.7 ms, Japanese RTF 0.071 |
+| **face, then Kokoro's sherpa session** | **`OfflineTts` construction fails**: `Could not find OrtValue with name '/Squeeze_2_output_0'` |
+
+Reproduced on the stock image with none of the worker's files mounted, so it is not the
+worker's doing and the worker cannot fix it. It is **Kokoro-specific**: `matcha-zh-en`
+builds fine in the failing order.
+
+Why production has not hit it: `main.py` constructs the TTS plugin at `:112-117` and face
+at `:140-147`, and the TTS adapter builds its session during construction (the warmup),
+while face's engine loads lazily on card start. So the default order is the safe one.
+
+**What does hit it:** switching the TTS engine to `kokoro-multi`, or stopping and
+restarting the TTS card, while face is already running on gpu. The engine build fails and
+the card goes `state: error`. Workarounds today are to start the TTS card before face's,
+or to run face on `device: cpu`. The real fix is the same shape as the worker — face's
+session in its own process — which is a separate change with its own memory cost.
+
+Verified together on Orin 6, in the working order: worker on gpu at RTF 0.066–0.077, face
+on gpu at 5.63–6.32 ms, `en-us`/`zh` at RTF 0.083–0.107, interleaved over several rounds.
+
 #### jp5.11 cannot use the GPU here, for two independent reasons
 
 Both were measured on Orin 5, and both had to be guarded, because they fail at different
