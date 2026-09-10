@@ -359,7 +359,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -628,6 +628,63 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
         return text.strip()
 
 
+class SherpaOnnxNemoCtcAdapter(ASRAdapter):
+    """Offline NeMo FastConformer CTC (English-only Parakeet).
+
+    Uses sherpa_onnx.OfflineRecognizer.from_nemo_ctc, which has been in the
+    pinned sherpa-onnx 1.13.6 all along — no new runtime is involved.
+
+    The point of this adapter is noise robustness, not another language option.
+    The only other English-specific entry in the registry (zipformer-en) is
+    trained on LibriSpeech's 960 h of clean read speech, which is the wrong
+    distribution for a robot whose microphone always carries cooling-fan noise.
+    Parakeet's training set is ~1.7 M h of diverse audio with non-speech
+    material deliberately mixed in, and it emits punctuation and capitalisation.
+
+    English-only by construction: `language` is accepted for interface
+    compatibility and ignored, exactly as every other adapter here does.
+    """
+
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import pick_weights, provider_for_device
+
+        import sherpa_onnx
+        # cpu-only entry today, but keep the same device-ordered preference the
+        # other offline adapters use so a hand-assembled gpu directory works.
+        names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
+            if device == "gpu" else \
+            ("model.int8.onnx", "model.onnx")
+        model_path = pick_weights(model_dir, *names)
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+        provider = provider_for_device(device, (model_path,))
+
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+            model=model_path,
+            tokens=tokens_path,
+            num_threads=num_threads,
+            provider=provider,
+            sample_rate=SAMPLE_RATE,
+            feature_dim=80,
+            decoding_method="greedy_search",
+        )
+        log.info(f"[asr] sherpa-onnx nemo-ctc adapter loaded: model={model_path}, "
+                 f"device={device}, provider={provider}")
+
+    def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        import io as _io, wave as _wave
+        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
+            pcm = wf.readframes(wf.getnframes())
+        n = len(pcm) // 2
+        samples = struct.unpack(f'<{n}h', pcm)
+        float_samples = [s / 32768.0 for s in samples]
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, float_samples)
+        self._recognizer.decode_streams([stream])
+        text = stream.result.text
+        return text.strip()
+
+
 class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
@@ -695,6 +752,19 @@ ASR_MODELS = {
             # No gpu entry: not measured.
             "cpu": {"download": "asr_en", "dtype": "int8",
                     "dir": "/models/sherpa-onnx/asr-en"},
+        },
+    },
+    "parakeet-en": {
+        "label": "Parakeet CTC 110M (en only, offline, noise-robust)",
+        "adapter": SherpaOnnxNemoCtcAdapter,
+        "devices": {
+            # No gpu entry: never benchmarked on either Jetson line, and the
+            # rule in perception/README.md is that a gpu pair is admitted only
+            # after it has been measured *and* its transcripts read. It was
+            # chosen to be viable on the CPU in the first place — the int8
+            # archive is 104 MB, the smallest offline English option here.
+            "cpu": {"download": "asr_parakeet_en", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/parakeet-en"},
         },
     },
     "sensevoice-small": {

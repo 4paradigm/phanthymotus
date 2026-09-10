@@ -905,6 +905,23 @@ just a different provider string.
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
 | `paraformer-offline` | int8 | — not offered | unmeasured |
 | `zipformer-en` | int8 | — not offered | unmeasured |
+| `parakeet-en` | int8, 104 MB | — not offered | unmeasured |
+
+**Pick `parakeet-en` over `zipformer-en` for English.** Both are English-only, but
+they are trained on very different audio. `zipformer-en` is LibriSpeech — 960 h of
+clean read audiobook speech — which is the wrong distribution for a robot whose
+microphone always carries cooling-fan noise. Parakeet's NeMo FastConformer CTC 110M
+is trained on ~1.7 M h of diverse audio with non-speech material deliberately mixed
+in to suppress hallucination, and it emits punctuation and capitalisation, which
+`zipformer-en` does not. It is also the smallest offline English archive here
+(104 MB int8) and needs no new runtime: `OfflineRecognizer.from_nemo_ctc` has been
+in the pinned sherpa-onnx 1.13.6 all along.
+
+Measured on Orin 6 (jp6.1) inside the perception image, cpu provider,
+`num_threads=2`: RTF 0.039 on the bundle's 7.4 s sample and 0.054 on its 1.0 s
+sample — roughly 25x realtime, with punctuation and capitalisation in the
+transcript. No gpu pair is offered because none has been benchmarked; that is the
+admission rule below, and CPU was the point of picking this model anyway.
 
 ⚠️ **`sensevoice-small` on gpu drops some utterances entirely** — fp16 under the
 CUDA provider returns an empty transcript for certain inputs, silently and

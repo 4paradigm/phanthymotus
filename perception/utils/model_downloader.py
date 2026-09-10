@@ -55,6 +55,10 @@ MODELS = {
         "url": f"{COS_BASE}/sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2",
         "check_file": "tokens.txt",
     },
+    "asr_parakeet_en": {
+        "url": f"{COS_BASE}/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8.tar.bz2",
+        "check_file": "tokens.txt",
+    },
     "asr_x_asr": {
         "url": f"{COS_BASE}/x-asr-zh-en-punct-int8-robot.zip",
         "check_file": "tokens.txt",
