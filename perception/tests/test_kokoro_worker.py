@@ -245,3 +245,91 @@ def test_idle_reaping_releases_the_child(monkeypatch):
     _one_pass()
     assert stop.is_set()
     assert ctx.proc.terminated, "an idle worker must give its CUDA context back"
+
+
+# ── the duration gate ─────────────────────────────────────────────────────────
+
+class _FakeDirect:
+    """A KokoroDirect stand-in whose probe length is scripted per provider."""
+
+    lengths = {}
+
+    def __init__(self, model_dir, weights, num_threads=0, provider="cpu"):
+        self.provider = provider
+        self._session = type("s", (), {"get_providers": lambda self: [provider]})()
+
+    num_speakers, sample_rate = 54, 24000
+
+    def synthesize(self, phonemes, speaker_id=0, speed=1.0):
+        return np.zeros(self.lengths[self.provider], dtype=np.float32)
+
+
+def test_a_device_that_gets_durations_wrong_is_rejected_for_cpu(monkeypatch):
+    """jp5.11's CUDA returns 35-44% of the probe's length; 27% short is rushed speech.
+
+    Gating on the ORT version would not catch the next line with the same defect, so the
+    gate is the measurement. The probe already runs as warmup, so it is free.
+    """
+    logged = []
+    _FakeDirect.lengths = {"gpu": 21000, "cpu": kw.PROBE_SAMPLES}
+    runtime, used = kw._build_checked(
+        _FakeDirect, "/models/x", "model.onnx", "gpu", 0,
+        type("l", (), {"warning": lambda *a: logged.append(a),
+                       "error": lambda *a: logged.append(a)})())
+    assert used == "cpu", "a device failing the duration check must not be used"
+    assert any("duration" in str(a) for a in logged), logged
+
+
+def test_a_correct_device_is_kept(monkeypatch):
+    _FakeDirect.lengths = {"gpu": kw.PROBE_SAMPLES, "cpu": kw.PROBE_SAMPLES}
+    _runtime, used = kw._build_checked(
+        _FakeDirect, "/models/x", "model.onnx", "gpu", 0,
+        type("l", (), {"warning": lambda *a: None, "error": lambda *a: None})())
+    assert used == "gpu"
+
+
+def test_small_deviation_is_tolerated():
+    """A different-but-valid build must not be rejected over a few samples."""
+    _FakeDirect.lengths = {"gpu": int(kw.PROBE_SAMPLES * 1.03), "cpu": kw.PROBE_SAMPLES}
+    _runtime, used = kw._build_checked(
+        _FakeDirect, "/models/x", "model.onnx", "gpu", 0,
+        type("l", (), {"warning": lambda *a: None, "error": lambda *a: None})())
+    assert used == "gpu"
+
+
+def test_cpu_failing_the_check_too_is_an_error_not_a_silent_pass():
+    """Then the model or the phoneme table does not match this code — say so."""
+    _FakeDirect.lengths = {"gpu": 100, "cpu": 100}
+    with pytest.raises(RuntimeError, match="plausible probe duration"):
+        kw._build_checked(
+            _FakeDirect, "/models/x", "model.onnx", "gpu", 0,
+            type("l", (), {"warning": lambda *a: None, "error": lambda *a: None})())
+
+
+# ── the headroom guard, which must run BEFORE the duration gate ───────────────
+
+def test_cuda_is_declined_when_the_box_has_no_headroom(monkeypatch):
+    """The duration check cannot save a box that OOMs while building the session.
+
+    Measured on jp5.11: 5237 MB available, sherpa's own Kokoro GPU adapter takes 3.2 GB,
+    and the CUDA child's allocation then killed the process — before the probe ran.
+    Two independent guards, and this one has to be first because it is the one that can
+    take the process down.
+    """
+    monkeypatch.setattr(kw, "_mem_available_mb", lambda: 2048)
+    _proxy_, ctx = _proxy(monkeypatch, [READY], device="gpu")
+    assert ctx.process_kwargs["args"][2] == "cpu", (
+        "a CUDA child must not be spawned with less headroom than it needs")
+
+
+def test_cuda_is_used_when_there_is_room(monkeypatch):
+    monkeypatch.setattr(kw, "_mem_available_mb", lambda: 4096)
+    _proxy_, ctx = _proxy(monkeypatch, [READY], device="gpu")
+    assert ctx.process_kwargs["args"][2] == "gpu"
+
+
+def test_an_unreadable_meminfo_does_not_block_the_gpu(monkeypatch):
+    """-1 means "could not tell", which must not be read as "no memory"."""
+    monkeypatch.setattr(kw, "_mem_available_mb", lambda: -1)
+    _proxy_, ctx = _proxy(monkeypatch, [READY], device="gpu")
+    assert ctx.process_kwargs["args"][2] == "gpu"

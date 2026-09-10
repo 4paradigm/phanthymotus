@@ -65,6 +65,61 @@ CALL_TIMEOUT_S = 30.0
 # memory back. Card stop and engine switch close it immediately regardless.
 IDLE_TIMEOUT_S = 120.0
 
+# The warmup probe doubles as a correctness gate on the chosen device, because one
+# JetPack line executes this graph wrong on CUDA.
+#
+# The graph is stochastic — 4 RandomNormalLike and 7 RandomUniformLike nodes — so the
+# *waveform* differs run to run and between providers by design, and "cpu output must
+# equal cuda output" is not a valid check. The **duration** is not stochastic: measured
+# 8 runs per provider, CPU gives one distinct length with stdev exactly 0, and gives the
+# same length on both JetPack lines. That makes duration a portable reference.
+#
+#   probe "konnichiwa", 10 tokens, speaker 0, speed 1.0:
+#     jp6.1   cpu  47400, 47400, 47400      cuda 47400, 47400, 47400   <- correct
+#     jp5.11  cpu  47400, 47400, 47400      cuda 16800, 21000, 21000   <- 35-44%
+#
+#   the full sentence, 8 runs each:
+#     jp6.1   cpu 8.35s stdev 0.000   cuda 8.35s stdev 0.000
+#     jp5.11  cpu 8.35s stdev 0.000   cuda 6.05s stdev 0.053   <- 27.5% short
+#
+# jp5.11's ONNX Runtime is 1.15.1 and its CUDA execution of the duration path is simply
+# wrong; 27% short is audibly rushed speech. Gating on the version number would be the
+# wrong fix — it would not catch the next line with the same defect — so gate on the
+# measurement instead. The probe already runs as warmup, so this costs nothing.
+PROBE_TEXT = "konnichiwa"
+PROBE_SAMPLES = 47400
+# Wide enough that a legitimately different build is not rejected, far tighter than the
+# 56% error it has to catch.
+PROBE_TOLERANCE = 0.10
+
+# Two guards are needed, and the order matters: the duration check above runs *after* the
+# session is built, so it cannot prevent the allocation that builds it from taking the
+# box down. Measured on jp5.11, asking for a CUDA child:
+#
+#   5237 MB available -> sherpa's own Kokoro GPU adapter takes 3.2 GB -> 2048 MB left
+#   -> the CUDA child's allocation -> whole-box OOM, SIGKILL, before the probe ran
+#
+# (`dmesg`: "Out of memory: Killed process ... (python3) anon-rss:2420028kB".) The same
+# adapter costs ~950 MB on jp6.1, where a CUDA child fits in the 1585 MB it needs. So the
+# headroom figure is the child's measured cost plus a margin, checked before spawning.
+#
+# On jp5.11 this lands on cpu, which is also where the duration check would have put it.
+# Two independent reasons, one outcome — and the memory one has to be first because it is
+# the one that can kill the process.
+CUDA_HEADROOM_MB = 2500
+
+
+def _mem_available_mb() -> int:
+    """Whole-box MemAvailable. -1 if unreadable, which must not block the GPU."""
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
 
 class KokoroWorkerProxy:
     """`KokoroDirect`'s surface, executed in a spawned child.
@@ -102,6 +157,7 @@ class KokoroWorkerProxy:
         self._n_speakers = 0
         self._sample_rate = 0
         self._providers = []
+        self._device_used = device
 
         self._start()
 
@@ -142,12 +198,22 @@ class KokoroWorkerProxy:
         """
         import multiprocessing as mp
 
+        device = self._device
+        if device in ("cuda", "gpu"):
+            headroom = _mem_available_mb()
+            if 0 <= headroom < CUDA_HEADROOM_MB:
+                log.warning("[tts] kokoro worker: %d MB available, under the %d MB a "
+                            "CUDA child needs — using cpu (RTF ~0.52 rather than "
+                            "~0.07). Asking anyway OOM-killed a jp5.11 rig.",
+                            headroom, CUDA_HEADROOM_MB)
+                device = "cpu"
+
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._res_q = self._ctx.Queue()
         self._proc = self._ctx.Process(
             target=_kokoro_worker,
-            args=(self._model_dir, self._weights, self._device, self._num_threads,
+            args=(self._model_dir, self._weights, device, self._num_threads,
                   self._cmd_q, self._res_q, log.getEffectiveLevel()),
             daemon=False,
             name="kokoro_ja_worker",
@@ -168,9 +234,12 @@ class KokoroWorkerProxy:
         self._n_speakers = int(payload["num_speakers"])
         self._sample_rate = int(payload["sample_rate"])
         self._providers = list(payload["providers"])
-        log.info("[tts] kokoro worker ready in %.1fs: pid=%s device=%s providers=%s, "
+        self._device_used = payload.get("device_used", self._device)
+        log.info("[tts] kokoro worker ready in %.1fs: pid=%s device=%s%s providers=%s, "
                  "%d speakers, warmup %.2fs",
-                 time.monotonic() - started, self._proc.pid, self._device,
+                 time.monotonic() - started, self._proc.pid, self._device_used,
+                 "" if self._device_used == self._device
+                 else f" (asked for {self._device})",
                  self._providers, self._n_speakers, payload["warmup_s"])
 
     def _alive(self) -> bool:
@@ -288,6 +357,37 @@ class KokoroWorkerProxy:
         return self._fallback
 
 
+def _build_checked(KokoroDirect, model_dir, weights, device, num_threads, wlog):
+    """Build on `device`, warm it up, and check the warmup's duration is right.
+
+    The warmup was always needed — the first CUDA call costs 8.03 s of lazy kernel
+    loading against 0.59 s warm — so measuring its output length is free. If the length
+    is wrong the device is executing the duration path incorrectly (jp5.11's ORT 1.15.1
+    returns 35-44% of it), and CPU is the only honest answer: 27% short is audibly
+    rushed speech, and a fast wrong answer is worse than a slow right one.
+
+    Returns `(runtime, device_actually_used)`.
+    """
+    for candidate, why in ((device, "requested"), ("cpu", "fallback")):
+        if why == "fallback" and candidate == device:
+            break                       # already tried, and it failed the check
+        direct = KokoroDirect(model_dir, weights, num_threads=num_threads,
+                              provider=candidate)
+        n = len(direct.synthesize(PROBE_TEXT, speaker_id=0, speed=1.0))
+        off = abs(n - PROBE_SAMPLES) / PROBE_SAMPLES
+        if off <= PROBE_TOLERANCE:
+            if why == "fallback":
+                wlog.warning("running on cpu after %r failed the duration check", device)
+            return direct, candidate
+        wlog.error("%s produced %d samples for the probe, expected ~%d (%.0f%% off) — "
+                   "this device computes the duration path wrongly; not using it",
+                   candidate, n, PROBE_SAMPLES, off * 100)
+        del direct
+    raise RuntimeError(
+        f"neither {device} nor cpu produced a plausible probe duration; the model or "
+        f"the phoneme table does not match this code")
+
+
 def _kokoro_worker(model_dir: str, weights: str, device: str, num_threads: int,
                    cmd_q, res_q, log_level: int) -> None:
     """Child entry point. Owns one `KokoroDirect` and nothing else.
@@ -314,15 +414,13 @@ def _kokoro_worker(model_dir: str, weights: str, device: str, num_threads: int,
     try:
         from plugins.kokoro_direct import KokoroDirect
         started = time.monotonic()
-        direct = KokoroDirect(model_dir, weights, num_threads=num_threads,
-                              provider=device)
-        # Pay for lazy CUDA kernel loading and the memory pool here rather than on the
-        # first real utterance: measured at 8.03 s against 0.59 s warm.
-        direct.synthesize("konnichiwa", speaker_id=0, speed=1.0)
+        direct, device_used = _build_checked(KokoroDirect, model_dir, weights, device,
+                                             num_threads, wlog)
         res_q.put(("ready", {
             "num_speakers": direct.num_speakers,
             "sample_rate": direct.sample_rate,
             "providers": list(direct._session.get_providers()),
+            "device_used": device_used,
             "warmup_s": round(time.monotonic() - started, 2),
         }))
     except Exception as exc:                                      # noqa: BLE001

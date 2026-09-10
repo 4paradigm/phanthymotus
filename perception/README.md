@@ -489,9 +489,42 @@ Three consequences worth knowing before turning it on:
 
 Verified through the real adapter on Orin 6: no worker exists until Japanese is used;
 `en-us`/`zh` keep RTF ~0.11 with the worker resident; Japanese alternates with them at
-RTF 0.067–0.069; `kill -9` on the child recovers (it **restarts** the worker, paying the
-cold path again — the CPU fallback is unit-tested but was not reached on device, so treat
-it as unproven there); `close()` reclaims 1191 MB and a later Japanese utterance rebuilds.
+RTF 0.067–0.070; `kill -9` on the child recovers; `close()` reclaims ~1.2 GB and a later
+Japanese utterance rebuilds.
+
+#### jp5.11 cannot use the GPU here, for two independent reasons
+
+Both were measured on Orin 5, and both had to be guarded, because they fail at different
+moments.
+
+**1. The CUDA path computes durations wrongly.** The graph *is* stochastic — 4
+`RandomNormalLike` and 7 `RandomUniformLike` nodes — so the waveform differs run to run
+and between providers **by design**, and "cpu output must equal cuda output" is not a
+valid check. The **duration** is not stochastic, and that is where the defect shows:
+
+| | cpu | cuda |
+|---|---|---|
+| jp6.1, 8 runs | 8.35 s, stdev 0.000, 1 distinct length | 8.35 s, stdev 0.000, 1 distinct length |
+| **jp5.11**, 8 runs | 8.35 s, stdev 0.000, 1 distinct length | **6.05 s**, stdev 0.053, 3 distinct lengths |
+
+27.5% short is audibly rushed speech. The probe used for warmup gates this: 10 tokens
+give exactly 47400 samples on CPU **on both lines**, jp6.1's CUDA matches exactly, and
+jp5.11's CUDA returns 16800–21000. Gating on the ORT version number would be the wrong
+fix — it would not catch the next line with the same defect — so the gate is the
+measurement, and it is free because the probe already ran.
+
+**2. A CUDA child does not fit.** sherpa's own Kokoro GPU adapter takes **3.2 GB** on
+jp5.11 against ~950 MB on jp6.1, so a CUDA child's allocation OOM-killed the rig —
+`dmesg`: `Out of memory: Killed process … (python3) anon-rss:2420028kB` — **before the
+probe could run**. So the duration gate alone is not enough; a headroom check has to come
+first, because it is the one that can take the process down.
+
+With both guards, `japanese_worker_device: gpu` is safe to leave set: jp6.1 uses the GPU,
+jp5.11 declines it and lands on CPU at RTF 0.50, and both run to completion. **The
+residual risk is stated rather than hidden**: the headroom figure is a heuristic, and on
+jp5.11 there is a window (roughly 2.5–3.2 GB available) where CUDA would be attempted —
+the duration gate catches it if the build survives, and does not if the box OOMs first.
+Set `japanese_worker_device: cpu` on that line to remove the window entirely.
 
 Both CPU configurations remain safe, and are safe for the same reason: a CPU-only session
 loads no CUDA provider, so it never touches the bridge. `japanese_worker_device: cpu` keeps
