@@ -1014,12 +1014,18 @@ class KokoroTTSAdapter(TTSAdapter):
         """
         if self._direct_runtime is None:
             if self._japanese_worker:
+                from plugins.kokoro_worker import DeviceUnavailable, KokoroWorkerProxy
                 try:
-                    from plugins.kokoro_worker import KokoroWorkerProxy
                     self._direct_runtime = KokoroWorkerProxy(
                         self._model_dir, self._weights_name,
                         device=self._japanese_worker_device)
                     return self._direct_runtime
+                except DeviceUnavailable:
+                    # The configured device cannot do the job. Substituting the CPU
+                    # here would hide it behind a card that still says `gpu` — the
+                    # state that made Japanese "mysteriously slow" and took a
+                    # measurement to explain. Let it surface.
+                    raise
                 except Exception as exc:                          # noqa: BLE001
                     log.warning("[tts] kokoro worker unavailable (%s); Japanese uses "
                                 "the in-process CPU session", exc)

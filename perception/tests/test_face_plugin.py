@@ -62,7 +62,19 @@ class _FakeFrame:
 
 
 class _FakeAnalyzer:
-    """Detects whatever the frame bytes say, and embeds by identity number."""
+    """Stands in for `FaceServiceProxy`: one call, results already embedded.
+
+    The plugin no longer calls decode/detect/prepare/embed — that pipeline runs in the
+    ORT worker child (`plugins/face_service.py`), because a standalone ONNX Runtime
+    session cannot share a process with sherpa-onnx's. So the fake implements the same
+    one method the real proxy does, and applies the quality gate itself, which is where
+    the gate now lives.
+
+    Identity used to travel through the aligned crop so that `embed` could read it back.
+    With one call there is nothing to smuggle it through, so it is read straight from
+    the frame spec — simpler, and it removes the int32-vs-uint8 trap that cost a
+    debugging round when a test used identity 300.
+    """
 
     def __init__(self, delay: float = 0.0, frame_shape=(480, 640)):
         self.delay = delay
@@ -70,30 +82,33 @@ class _FakeAnalyzer:
         self.frame_shape = frame_shape
         self.seen: list[bytes] = []
         self.embed_calls = 0
+        self.calls: list[dict] = []
 
-    # -- the surface plugins/face.py uses --
-    def decode_image(self, data: bytes, max_side: int = 0, max_pixels: int = 0):
-        return self.decode_jpeg(data)
+    device = "cpu"
+    providers = ["CPUExecutionProvider"]
 
-    def decode_jpeg(self, data: bytes):
-        self.seen.append(data)
-        if data == b"corrupt":
-            return None
-        image = np.zeros((*self.frame_shape, 3), dtype=np.uint8)
-        image[0, 0, 0] = 1                      # keep .size truthy
-        self._spec = data.decode()
-        return image
-
-    def detect(self, image, max_faces: int = 0):
+    def recognise(self, image_bytes: bytes, max_faces: int = 0,
+                  det_thresh: float = 0.5, min_face_px: int = 64,
+                  blur_min: float = 60.0, want_aligned: bool = False,
+                  embed_all: bool = False):
+        self.seen.append(image_bytes)
+        self.calls.append({"max_faces": max_faces, "det_thresh": det_thresh,
+                           "min_face_px": min_face_px, "blur_min": blur_min,
+                           "want_aligned": want_aligned, "embed_all": embed_all})
         if self.delay:
             time.sleep(self.delay)
-        if not self._spec:
-            return []
-        faces = []
+        if image_bytes == b"corrupt":
+            return None, []
+
+        spec = image_bytes.decode()
         height, width = self.frame_shape
-        segments = self._spec.split("|")
-        # Lay the boxes out left to right; the first one is centred, so it wins
-        # the centre-weighted dominance comparison when sizes are equal.
+        if not spec:
+            return (height, width), []
+
+        faces = []
+        segments = spec.split("|")
+        # Lay the boxes out left to right; the first one is centred, so it wins the
+        # centre-weighted dominance comparison when sizes are equal.
         for index, segment in enumerate(segments):
             identity, size, blur = segment.split(":")
             side = int(size)
@@ -108,42 +123,31 @@ class _FakeAnalyzer:
             )
             face.identity = int(identity)
             faces.append(face)
+
         faces.sort(key=lambda f: f.area, reverse=True)
-        return faces[:max_faces] if max_faces else faces
+        if max_faces:
+            faces = faces[:max_faces]
 
-    def prepare(self, image, face):
-        face.aligned = np.zeros((112, 112, 3), dtype=np.uint8)
-        return face
-
-    def embed(self, aligned):
-        raise AssertionError("subclasses carry the identity; use _SpecAnalyzer")
+        # The gate, where the real service applies it: an unusable face gets no
+        # embedding, and `embedding is None` is how the plugin reads that verdict.
+        for face in faces:
+            usable = (face.det_score >= det_thresh
+                      and face.min_side >= min_face_px
+                      and face.blur >= blur_min)
+            if usable or embed_all:
+                self.embed_calls += 1
+                face.embedding = _unit(face.identity)
+            if want_aligned:
+                face.aligned = np.zeros((112, 112, 3), dtype=np.uint8)
+        return (height, width), faces
 
     def close(self):
         self.closed = True
 
 
-class _SpecAnalyzer(_FakeAnalyzer):
-    """The analyzer the tests use: identity travels in the aligned crop.
-
-    `prepare` stamps the face's identity into cell [0,0,0] and `embed` reads it
-    back, which is how a frame spec like `b"7:120:500"` ends up as a stable
-    512-d vector for person 7 without any model.
-
-    int32, not uint8: a real aligned crop is uint8, but the plugin only ever
-    hands this array straight back to `embed`, and uint8 silently caps the
-    identity space at 255 — which cost a debugging round when a test used
-    identity 300 and got "Python integer 300 out of bounds for uint8".
-    """
-
-    def prepare(self, image, face):
-        aligned = np.zeros((112, 112, 3), dtype=np.int32)
-        aligned[0, 0, 0] = face.identity
-        face.aligned = aligned
-        return face
-
-    def embed(self, aligned):
-        self.embed_calls += 1
-        return _unit(int(aligned[0, 0, 0]))
+# Kept as an alias: the identity-through-the-crop trick it existed for is gone, but
+# several tests name it and the indirection is free.
+_SpecAnalyzer = _FakeAnalyzer
 
 
 @pytest.fixture(autouse=True)
@@ -241,12 +245,11 @@ def test_tool_shape_matches_the_card_contract():
 # ── subject selection / failure reasons ───────────────────────────────────────
 
 def _faces(*specs):
-    analyzer = _SpecAnalyzer()
-    analyzer.decode_jpeg(_FakeFrame.build(*specs))
-    faces = analyzer.detect(None)
-    for face in faces:
-        analyzer.prepare(None, face)
-    return faces, (480, 640)
+    # embed_all, because `select_subject` is what these tests exercise and it has to see
+    # every candidate — including ones the per-frame gate would skip.
+    analyzer = _FakeAnalyzer()
+    shape, faces = analyzer.recognise(_FakeFrame.build(*specs), embed_all=True)
+    return faces, shape
 
 
 def test_no_face_reason():
@@ -1383,21 +1386,18 @@ def test_decode_options_come_from_config():
     assert defaults["max_side"] == 2048 and defaults["max_pixels"] == 60_000_000
 
 
-def test_every_input_path_decodes_through_the_same_options(plugin, tmp_path):
-    """Resize/convert must apply to register and recognize alike, by photo,
-    url, corpus and stream — so they all have to reach decode_image with the
-    configured options rather than each path doing its own thing."""
+def test_every_input_path_goes_through_the_one_recognise_call(plugin, tmp_path):
+    """Resize/convert must apply to register and recognize alike, by photo, url,
+    corpus and stream.
+
+    This used to spy on `decode_image` and assert every path passed the same options.
+    It cannot any more, and that is the improvement: decoding happens in the ORT worker
+    child, which is built **once** with the configured limits
+    (`plugins/face_proxy.py`), so no path can pass its own. What is left to check is
+    that every path reaches the single call rather than growing its own pipeline.
+    """
     engine = plugin._require_engine()
-    seen = []
-    original = engine.analyzer.decode_image
-
-    def spy(data, max_side=0, max_pixels=0):
-        seen.append((max_side, max_pixels))
-        return original(data, max_side, max_pixels)
-
-    engine.analyzer.decode_image = spy
-    plugin._plugin_cfg["max_image_side"] = 1234
-    plugin._plugin_cfg["max_image_pixels"] = 5_000_000
+    before = len(engine.analyzer.calls)
 
     path = _write_photo(tmp_path, "a.jpg", _FakeFrame.one(700))
     plugin.dispatch("face_recognition", {
@@ -1408,8 +1408,34 @@ def test_every_input_path_decodes_through_the_same_options(plugin, tmp_path):
     plugin.dispatch("face_recognition", {
         "action": "register_by_corpus", "package": package})
 
-    assert len(seen) >= 3
-    assert all(opts == (1234, 5_000_000) for opts in seen), seen
+    calls = engine.analyzer.calls[before:]
+    assert len(calls) >= 3, calls
+    # Registration needs an embedding for whichever face select_subject picks, even a
+    # marginal one; the continuous path must not pay for that.
+    assert any(c["embed_all"] for c in calls), calls
+    assert not all(c["embed_all"] for c in calls), calls
+
+
+def test_the_decode_limits_reach_the_service(monkeypatch, tmp_path):
+    """The limits are constructor state on the proxy now, so assert they get there.
+
+    max_side bounds the letterbox downscale and max_pixels is the decompression-bomb
+    guard; a path that silently defaulted them would be a real hole.
+    """
+    seen = {}
+
+    class _Probe(_FakeAnalyzer):
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            super().__init__()
+
+    monkeypatch.setattr(face_plugin, "FaceServiceProxy", _Probe)
+    face_plugin._build_engine({"model_dir": str(tmp_path),
+                               "db_dir": str(tmp_path / "db"),
+                               "max_image_side": 1234,
+                               "max_image_pixels": 5_000_000})
+    assert seen["max_image_side"] == 1234
+    assert seen["max_image_pixels"] == 5_000_000
 
 
 def test_the_byte_cap_is_a_transfer_guard_not_a_photo_limit():
@@ -1421,3 +1447,63 @@ def test_the_byte_cap_is_a_transfer_guard_not_a_photo_limit():
 def test_corpus_finds_the_formats_both_decoders_read():
     for suffix in (".jpg", ".png", ".webp", ".tif", ".tiff", ".gif", ".bmp"):
         assert suffix in face_plugin._IMAGE_SUFFIXES
+
+
+# ── the wiring nothing else checks ────────────────────────────────────────────
+
+def test_analyzer_options_are_all_accepted_by_the_proxy():
+    """`_analyzer_options` builds the kwargs; the proxy has to accept every one.
+
+    This shipped broken: adding `model` to the options without adding it to
+    `FaceServiceProxy.__init__` gave `TypeError: __init__() got an unexpected keyword
+    argument 'model'` at card start, on a robot. Nothing caught it, because every test
+    either replaces `_build_engine` wholesale or fakes the analyzer with a signature
+    that swallows anything — so the one place the real kwargs meet the real signature
+    was never exercised.
+
+    Checked by signature rather than by calling it, because constructing the real proxy
+    spawns a child and loads two models.
+    """
+    import inspect
+
+    from plugins.face_proxy import FaceServiceProxy
+
+    produced = set(face_plugin._analyzer_options({}))
+    produced |= {"max_image_side", "max_image_pixels"}      # added by _build_engine
+    accepted = set(inspect.signature(FaceServiceProxy.__init__).parameters) - {"self"}
+    assert produced <= accepted, (
+        f"_build_engine would pass {sorted(produced - accepted)}, which "
+        f"FaceServiceProxy.__init__ does not take")
+
+
+def test_the_proxy_forwards_everything_it_takes_to_the_service():
+    """And the service has to accept what the proxy sends, for the same reason.
+
+    One hop further along the same chain: proxy -> ort_worker.service ->
+    plugins.face_service.build -> FaceService.__init__ -> FaceAnalyzer. A parameter
+    that stops halfway is a card that will not start.
+    """
+    import inspect
+
+    from plugins.face_proxy import FaceServiceProxy
+    from plugins.face_service import FaceService
+
+    proxy_takes = set(inspect.signature(FaceServiceProxy.__init__).parameters) - {"self"}
+    service_takes = set(inspect.signature(FaceService.__init__).parameters) - {"self"}
+    # `device` is resolved to `providers` in the proxy and does not travel as-is.
+    forwarded = proxy_takes - {"device"}
+    assert forwarded <= service_takes, (
+        f"the proxy would forward {sorted(forwarded - service_takes)}, which "
+        f"FaceService.__init__ does not take")
+
+
+def test_the_service_passes_the_model_on_to_the_analyzer():
+    """The last hop. `model` selects the weights; silently dropping it would run
+    buffalo_sc while the card said something else."""
+    import inspect
+
+    from plugins.face_runtime import FaceAnalyzer
+    from plugins.face_service import FaceService
+
+    assert "model" in inspect.signature(FaceService.__init__).parameters
+    assert "model" in inspect.signature(FaceAnalyzer.__init__).parameters

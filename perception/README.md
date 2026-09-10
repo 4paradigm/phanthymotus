@@ -492,36 +492,65 @@ Verified through the real adapter on Orin 6: no worker exists until Japanese is 
 RTF 0.067–0.070; `kill -9` on the child recovers; `close()` reclaims ~1.2 GB and a later
 Japanese utterance rebuilds.
 
-#### Known hazard, pre-existing: face on gpu before Kokoro on gpu
+#### Fixed: every standalone-ORT session lives in one child process
 
-The worker moves Japanese out of the perception process, but **face and sherpa are still
-both in it**, and they are the same colliding pair. Face survives the collision — its
-graph has none of the fused squeeze outputs Kokoro's has — but Kokoro does not survive
-being built second:
+The hazard this section used to describe — face on gpu before Kokoro on gpu, which
+could not build the TTS engine at all — is gone, and so is the whole class it belonged
+to. `plugins/ort_worker.py` spawns **one** child that owns every standalone-ONNX-Runtime
+session, so the perception process holds only sherpa's runtime and the two can no longer
+reach each other.
 
-| order (one process, both on `device: gpu`) | result |
-|---|---|
-| Kokoro's sherpa session, then face | both fine — face 5.6–6.7 ms, Japanese RTF 0.071 |
-| **face, then Kokoro's sherpa session** | **`OfflineTts` construction fails**: `Could not find OrtValue with name '/Squeeze_2_output_0'` |
+Not one process per card: one per **runtime**, which is the boundary the bug has. CUDA
+contexts therefore do not increase — the parent used to hold sherpa's *and* the
+standalone one's; now it holds sherpa's and the child holds the standalone one.
 
-Reproduced on the stock image with none of the worker's files mounted, so it is not the
-worker's doing and the worker cannot fix it. It is **Kokoro-specific**: `matcha-zh-en`
-builds fine in the failing order.
+`spawn`, never `fork`. `fork` copies the address space including already-`dlopen`ed
+libraries, so a forked child would inherit sherpa's runtime and the isolation would be
+worthless. A test asserts it, because that one word is the entire guarantee.
 
-Why production has not hit it: `main.py` constructs the TTS plugin at `:112-117` and face
-at `:140-147`, and the TTS adapter builds its session during construction (the warmup),
-while face's engine loads lazily on card start. So the default order is the safe one.
+**Where the boundary is, and why not further in.** The first attempt split at
+`InferenceSession.run` and left decoding, letterboxing, alignment and the quality gate
+in the parent. It worked and it was the wrong cut:
 
-**What does hit it:** switching the TTS engine to `kokoro-multi`, or stopping and
-restarting the TTS card, while face is already running on gpu. The engine build fails and
-the card goes `state: error`. Workarounds today are to start the TTS card before face's,
-or to run face on `device: cpu`. The real fix is the same shape as the worker — face's
-session in its own process — which is a separate change with its own memory cost.
+| | in-process | split at `run()` | **whole pipeline in the child** |
+|---|---|---|---|
+| a frame, jp6.1 | ~46 ms | ~78 ms | **48.1 ms** |
+| a frame, jp5.11 | — | — | **26.4 ms** |
 
-Verified together on Orin 6, in the working order: worker on gpu at RTF 0.066–0.077, face
-on gpu at 5.63–6.32 ms, `en-us`/`zh` at RTF 0.083–0.107, interleaved over several rounds.
+because the parent was sending a 2.93 MiB normalised blob and getting **0.96 MiB of
+pre-threshold candidates** back — SCRFD returns 16 800 of them and a frame keeps nought
+to eight — then a 147 kB crop per face for a 2 kB embedding. What the parent actually
+holds is the `CompressedImage` JPEG, ~232 kB, and what it wants is a few boxes and a
+512-float vector each. So the frame crosses **once, compressed**, and
+`plugins/face_service.py` runs decode → detect → decode-head → align → sharpness →
+**the quality gate** → embed inside the child. The gate has to come along: it sits
+between alignment and embedding and decides which faces are worth embedding at all.
 
-#### jp5.11 cannot use the GPU here, for two independent reasons
+What stays in the parent: the FaceDB (`matrix @ embedding` on a 2 kB vector, its lock,
+its files), subject selection, the payload, ROS publishing, the enrolment window. None
+of it touches ONNX.
+
+`FaceAnalyzer` now **refuses to be constructed outside the child** rather than
+documenting that it should not be. A test also walks the plugin tree for
+`ort.InferenceSession` calls and fails on any outside the three files allowed to have
+one, because a new caller adding one would reintroduce a SIGSEGV silently.
+
+**Verified on both lines**, in the order that fails on main: face's sessions up first,
+then sherpa's Kokoro engine builds; Japanese and face share one child and interleave;
+dropping one service leaves the other running.
+
+**Two things that are not settled**, recorded rather than smoothed over:
+
+- **A dropped session does not return memory to the OS.** Measured: unloading Kokoro
+  from the child moved `MemAvailable` by **+0 MB**. The CUDA pool is returned on process
+  exit, not on session destruction, so unloading frees space *inside* the child for
+  reuse and stops the headroom guard mis-reading the box — it does not give memory back.
+  An earlier version of this section claimed it did.
+- **The face path has only been exercised on frames with no faces in them.** The
+  embedding, the aligned-crop return and the registration paths have unit coverage and
+  no on-device run.
+
+#### jp5.11 runs Japanese on the CPU, for two independent reasons
 
 Both were measured on Orin 5, and both had to be guarded, because they fail at different
 moments.
@@ -548,12 +577,58 @@ jp5.11 against ~950 MB on jp6.1, so a CUDA child's allocation OOM-killed the rig
 probe could run**. So the duration gate alone is not enough; a headroom check has to come
 first, because it is the one that can take the process down.
 
-With both guards, `japanese_worker_device: gpu` is safe to leave set: jp6.1 uses the GPU,
-jp5.11 declines it and lands on CPU at RTF 0.50, and both run to completion. **The
-residual risk is stated rather than hidden**: the headroom figure is a heuristic, and on
-jp5.11 there is a window (roughly 2.5–3.2 GB available) where CUDA would be attempted —
-the duration gate catches it if the build survives, and does not if the box OOMs first.
-Set `japanese_worker_device: cpu` on that line to remove the window entirely.
+**No silent substitution.** An earlier revision quietly used the CPU when the GPU was
+unavailable, and that produced the worst state available: a card configured for `gpu`,
+running at RTF 0.52 instead of 0.07, with the reason in a log line nobody reads. It
+took a measurement to explain why Japanese "felt slow". The card now goes
+`state: error` and the message names **which** of the two problems it hit, because they
+have different fixes:
+
+| | what it means | what to do |
+|---|---|---|
+| *not enough memory …* | the GPU is fine, the box is full | free memory, or set `japanese_worker_device: cpu` |
+| *… computes the duration path wrongly* | the GPU works and gets the wrong answer | set `japanese_worker_device: cpu`; freeing memory will not help |
+
+The second verdict is **recorded on the machine**, keyed by the ONNX Runtime version,
+because the attempt is not free: one rejected CUDA session took Orin 5's MemAvailable
+from 5754 MB to 1935 MB and **kept it** — unloading does not return it. A crash restarts
+perception, so an in-memory verdict would be lost and the next start would pay again.
+That is how face's later GPU load tipped that box into the OOM killer. Delete
+`.cuda-duration-verdict` in the model directory to force a re-evaluation.
+
+The headroom figure depends on **who else is in the child**, because the first CUDA
+session there pays for the context and the rest do not:
+
+| | measured | threshold |
+|---|---|---|
+| Kokoro alone, bringing its own context | 1585 MB | 2500 MB |
+| Kokoro beside the face service | **967 MB** | 1400 MB |
+
+A single conservative number refused the second case on the first case's evidence: with
+2158 MB free on an otherwise idle jp6.1 box, a 967 MB allocation was declined. With the
+guard asking `ort_worker.has_cuda_session()` first, face and Japanese now **both run on
+the GPU in the same child** on jp6.1 — Japanese at RTF 0.089 while face recognises at
+29.7–37.8 ms. An earlier version of this section said a 7.4 GB box could not fit both;
+that was true of two CUDA *contexts* and not of two sessions.
+
+jp5.11 needs `japanese_worker_device: cpu` set explicitly, and the error says so if it
+is not. Two independent reasons, either one disqualifying:
+
+- **its CUDA renders this graph wrongly** — confirmed by ear, and the cause is not
+  known. Ruled out: the two-runtime collision, the model file, TF32, the ONNX Runtime
+  version, and the CUDA provider binary. The full record, so nobody repeats those five
+  experiments, is **[docs/jp511-cuda-kokoro.md](docs/jp511-cuda-kokoro.md)**;
+- and separately, the box rarely has room.
+
+Worth being precise about what was *not* broken, because "GPU works on jp5.11" is also
+true: sherpa's own engines and face both run on the GPU there and always have.
+`KokoroDirect` is the only thing affected, it exists only for Japanese, and it was
+pinned to the CPU from the day it was written, so this path had never been exercised on
+that line until now.
+**The residual risk is stated rather than hidden**: the thresholds are heuristics, and
+there is a window where CUDA would be attempted on jp5.11 — the duration gate catches it
+if the build survives, and does not if the box OOMs first. `japanese_worker_device: cpu`
+removes the window on that line.
 
 Both CPU configurations remain safe, and are safe for the same reason: a CPU-only session
 loads no CUDA provider, so it never touches the bridge. `japanese_worker_device: cpu` keeps

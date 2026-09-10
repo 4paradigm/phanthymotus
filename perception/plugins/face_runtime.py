@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from plugins import scrfd_decode
 from utils.cv2_compat import load_cv2
 from utils.model_downloader import ensure_face_model
 from utils.onnx_provider import ort_providers_for_device, warn_on_parked_cores
@@ -70,6 +71,38 @@ log = logging.getLogger(__name__)
 
 DEFAULT_FACE_MODEL_DIR = "/models/face/buffalo_sc"
 
+# Which model pair to run. One entry today; the point of the registry is that adding a
+# second is a table row rather than a hunt through the file for hardcoded names, and
+# that the card can offer the choice.
+#
+# What a new entry has to supply: the detector must emit **nine** outputs — score, bbox
+# and five keypoints per stride — because ArcFace alignment needs the landmarks and
+# `plugins/scrfd_decode.py` decodes exactly that shape. A detector without keypoints
+# cannot be used here at all, which is asserted at load time rather than discovered as
+# bad embeddings. The recogniser must take 112x112 and return 512 dimensions, since the
+# stored samples and every existing FaceDB row are that.
+#
+# Changing the model invalidates the database: embeddings from different networks are
+# not comparable, and matching across them would silently confuse identities. The
+# plugin's engine signature includes the model, so a change reloads — but the samples
+# already stored do **not** get re-embedded, which is why this is a deploy-time choice
+# rather than something to flip on a running robot with a populated roster.
+FACE_MODELS = {
+    # insightface v0.7 buffalo_sc: SCRFD-500M-BNKPS + ArcFace MobileFaceNet
+    # (Glint360K). 2.5 MB + 13 MB, which is what makes cpu at one detection per
+    # second the design point.
+    "buffalo_sc": {
+        "dir": "/models/face/buffalo_sc",
+        "det": "det_500m.onnx",
+        "rec": "w600k_mbf.onnx",
+        "bundle": "face",
+        # `buffalo_sc` is InsightFace's pack name and covers two networks; spelling
+        # them out is what makes the card's dropdown readable.
+        "description": "InsightFace buffalo_sc（SCRFD-500M 检测 + ArcFace MobileFaceNet，512 维）",
+    },
+}
+DEFAULT_FACE_MODEL = "buffalo_sc"
+
 DET_MODEL_FILE = "det_500m.onnx"
 REC_MODEL_FILE = "w600k_mbf.onnx"
 
@@ -89,9 +122,12 @@ _REC_INPUT_SIZE = 112
 
 # SCRFD wire format for a 3-level, 2-anchor, keypoint-carrying model. Upstream
 # derives these from the output count; det_500m always has 9 outputs.
-_FEAT_STRIDES = (8, 16, 32)
-_NUM_ANCHORS = 2
-_NUM_KPS = 5
+# Single source of truth is plugins/scrfd_decode.py, which the worker child imports
+# too — two copies of "this detector has three strides" is exactly the kind of drift
+# that produces an opaque reshape error.
+_FEAT_STRIDES = scrfd_decode.FEAT_STRIDES
+_NUM_ANCHORS = scrfd_decode.NUM_ANCHORS
+_NUM_KPS = scrfd_decode.NUM_KPS
 
 # ArcFace's canonical 112x112 landmark template. Aligning every face onto these
 # five points is what makes two embeddings comparable at all.
@@ -188,42 +224,12 @@ def _umeyama_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return transform[:dim].astype(np.float32)
 
 
-def _distance2bbox(centers: np.ndarray, distances: np.ndarray) -> np.ndarray:
-    x1 = centers[:, 0] - distances[:, 0]
-    y1 = centers[:, 1] - distances[:, 1]
-    x2 = centers[:, 0] + distances[:, 2]
-    y2 = centers[:, 1] + distances[:, 3]
-    return np.stack([x1, y1, x2, y2], axis=-1)
-
-
-def _distance2kps(centers: np.ndarray, distances: np.ndarray) -> np.ndarray:
-    points = []
-    for index in range(0, distances.shape[1], 2):
-        points.append(centers[:, 0] + distances[:, index])
-        points.append(centers[:, 1] + distances[:, index + 1])
-    return np.stack(points, axis=-1)
-
-
-def _nms(boxes: np.ndarray, scores: np.ndarray, thresh: float) -> list[int]:
-    """Plain greedy IoU suppression — no cv2.dnn, no torchvision."""
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    areas = np.maximum(0.0, x2 - x1 + 1) * np.maximum(0.0, y2 - y1 + 1)
-    order = scores.argsort()[::-1]
-    keep: list[int] = []
-    while order.size > 0:
-        current = int(order[0])
-        keep.append(current)
-        if order.size == 1:
-            break
-        rest = order[1:]
-        xx1 = np.maximum(x1[current], x1[rest])
-        yy1 = np.maximum(y1[current], y1[rest])
-        xx2 = np.minimum(x2[current], x2[rest])
-        yy2 = np.minimum(y2[current], y2[rest])
-        inter = np.maximum(0.0, xx2 - xx1 + 1) * np.maximum(0.0, yy2 - yy1 + 1)
-        iou = inter / (areas[current] + areas[rest] - inter)
-        order = rest[iou <= thresh]
-    return keep
+# The decode moved to plugins/scrfd_decode.py so the worker child can import the same
+# implementation instead of a copy. Re-exported under the old private names: everything
+# below reads them, and a rename would be churn for its own sake.
+_distance2bbox = scrfd_decode.distance2bbox
+_distance2kps = scrfd_decode.distance2kps
+_nms = scrfd_decode.nms
 
 
 class FaceAnalyzer:
@@ -239,11 +245,14 @@ class FaceAnalyzer:
         self,
         model_dir: str = DEFAULT_FACE_MODEL_DIR,
         device: str = "auto",
+        model: str = DEFAULT_FACE_MODEL,
         det_size: tuple[int, int] = DEFAULT_DET_SIZE,
         det_thresh: float = DEFAULT_DET_THRESH,
         nms_thresh: float = DEFAULT_NMS_THRESH,
         num_threads: int = 2,
         warmup: bool = True,
+        providers=None,
+        in_process: bool = False,
     ):
         if ort is None:
             raise RuntimeError(
@@ -261,14 +270,36 @@ class FaceAnalyzer:
         # the reshape below would fail with an opaque numpy error.
         self._det_size = (width - width % 32 or 32, height - height % 32 or 32)
 
-        paths = ensure_face_model(model_dir)
-        det_path = paths.get(DET_MODEL_FILE) or os.path.join(model_dir, DET_MODEL_FILE)
-        rec_path = paths.get(REC_MODEL_FILE) or os.path.join(model_dir, REC_MODEL_FILE)
+        spec = FACE_MODELS.get(model)
+        if spec is None:
+            raise ValueError(
+                f"unknown face model {model!r}; this build has "
+                f"{sorted(FACE_MODELS)}. Adding one is a row in FACE_MODELS, but read "
+                "the note there first: the detector must emit nine outputs and the "
+                "recogniser must be 112x112 -> 512-d, and switching models invalidates "
+                "the stored embeddings."
+            )
+        self._model = model
+        det_name, rec_name = spec["det"], spec["rec"]
+        # An explicitly configured model_dir wins, so an operator can point at a local
+        # copy; otherwise the registry's own directory is used.
+        if model_dir == DEFAULT_FACE_MODEL_DIR:
+            model_dir = spec["dir"]
 
-        providers = ort_providers_for_device(self._requested_device)
-        # `device` resolves here, not in config: `auto` means "gpu when the
-        # installed wheel has one". Recorded so info/logs report what is
-        # actually running rather than what was asked for.
+        paths = ensure_face_model(model_dir, bundle=spec.get("bundle", "face"))
+        det_path = paths.get(det_name) or os.path.join(model_dir, det_name)
+        rec_path = paths.get(rec_name) or os.path.join(model_dir, rec_name)
+
+        # Providers are resolved by whoever built this — the parent, before it decides
+        # whether there is room — and passed in. Resolving them here would mean asking
+        # the standalone onnxruntime what it offers, in a process that may be the
+        # perception one, which is a question with a side effect: it maps the provider
+        # bridge. Falls back to resolving locally when nobody passed any, which is the
+        # in-child default path.
+        if providers is None:
+            providers = ort_providers_for_device(self._requested_device)
+        providers = list(providers)
+        # `device` reports what is actually running rather than what was asked for.
         self._device = "gpu" if providers[0] != "CPUExecutionProvider" else "cpu"
         # Session creation is where a parked-core Jetson abort()s under a bad
         # ORT version, and an abort prints no Python traceback. Say the
@@ -282,6 +313,22 @@ class FaceAnalyzer:
         # read-only for /models; let ORT keep its optimised graph in memory.
         options.log_severity_level = 3
 
+        # Created here, and "here" decides everything: this class runs either inside
+        # plugins/ort_worker.py's child — where it is the only ONNX Runtime and a
+        # session is exactly right — or in the perception process, where sherpa's
+        # runtime is already loaded and a CUDA session corrupts it. Callers in the
+        # perception process must go through plugins/face_proxy.py; `in_process` is the
+        # switch, and it defaults to False so nothing gets it by accident.
+        if not in_process:
+            raise RuntimeError(
+                "FaceAnalyzer creates an ONNX Runtime session, which must not happen "
+                "in the perception process: sherpa-onnx's runtime is already there and "
+                "the two corrupt each other (an exception on jp6.1, a SIGSEGV that "
+                "kills all of perception on jp5.11). Use plugins/face_proxy."
+                "FaceServiceProxy, which runs this in the ORT worker child. "
+                "See plugins/ort_worker.py."
+            )
+
         self._det = ort.InferenceSession(det_path, options, providers=providers)
         self._rec = ort.InferenceSession(rec_path, options, providers=providers)
         self._det_input = self._det.get_inputs()[0].name
@@ -290,16 +337,16 @@ class FaceAnalyzer:
 
         if len(self._det_outputs) != len(_FEAT_STRIDES) * 3:
             raise RuntimeError(
-                f"{DET_MODEL_FILE} has {len(self._det_outputs)} outputs; this "
+                f"{det_name} has {len(self._det_outputs)} outputs; this "
                 f"decoder expects {len(_FEAT_STRIDES) * 3} (3 strides x "
                 "score/bbox/kps). A detector without keypoints cannot be "
                 "aligned for recognition."
             )
 
         log.info(
-            "[face] analyzer ready: onnxruntime=%s device=%s (requested %s) "
-            "providers=%s det=%s rec=%s size=%s",
-            ort.__version__, self._device, self._requested_device,
+            "[face] analyzer ready: onnxruntime=%s model=%s device=%s "
+            "(requested %s) providers=%s det=%s rec=%s size=%s",
+            ort.__version__, model, self._device, self._requested_device,
             self._det.get_providers(),
             os.path.basename(det_path), os.path.basename(rec_path),
             self._det_size,
@@ -464,39 +511,11 @@ class FaceAnalyzer:
         blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
 
         outputs = self._det.run(self._det_outputs, {self._det_input: blob})
-        levels = len(_FEAT_STRIDES)
-
-        boxes_all: list[np.ndarray] = []
-        kps_all: list[np.ndarray] = []
-        scores_all: list[np.ndarray] = []
-        for index, stride in enumerate(_FEAT_STRIDES):
-            scores = outputs[index].reshape(-1)
-            bbox_preds = outputs[index + levels].reshape(-1, 4) * stride
-            kps_preds = outputs[index + levels * 2].reshape(-1, _NUM_KPS * 2) * stride
-
-            grid_h, grid_w = input_h // stride, input_w // stride
-            centers = np.stack(
-                np.mgrid[:grid_h, :grid_w][::-1], axis=-1
-            ).astype(np.float32).reshape(-1, 2) * stride
-            if _NUM_ANCHORS > 1:
-                centers = np.stack([centers] * _NUM_ANCHORS, axis=1).reshape(-1, 2)
-
-            positive = np.where(scores >= self._det_thresh)[0]
-            if positive.size == 0:
-                continue
-            boxes_all.append(_distance2bbox(centers, bbox_preds)[positive])
-            kps_all.append(
-                _distance2kps(centers, kps_preds)[positive].reshape(-1, _NUM_KPS, 2)
-            )
-            scores_all.append(scores[positive])
-
-        if not scores_all:
+        boxes, keypoints, scores = scrfd_decode.decode(
+            outputs, input_h, input_w, scale, self._det_thresh, self._nms_thresh)
+        if scores.size == 0:
             return []
-
-        boxes = np.concatenate(boxes_all) / scale
-        keypoints = np.concatenate(kps_all) / scale
-        scores = np.concatenate(scores_all)
-        keep = _nms(boxes, scores, self._nms_thresh)
+        keep = range(len(scores))
 
         faces = [
             DetectedFace(
@@ -566,10 +585,13 @@ class FaceAnalyzer:
         return faces
 
     def close(self) -> None:
-        """Drop the sessions. Called via `_close_quietly` on config changes."""
+        """Drop the sessions.
+
+        Inside the worker child this is all that is needed: the child's own exit, or
+        `ort_worker`'s `drop`, is what actually returns the CUDA context.
+        """
         self._det = None
         self._rec = None
-
 
 __all__ = [
     "DEFAULT_BLUR_MIN",
