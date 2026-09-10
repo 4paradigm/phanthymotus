@@ -67,30 +67,36 @@ def _reset():
     yield
 
 
-def _proxy(monkeypatch, device="gpu", headroom=8192, idle=1e9):
+def _proxy(monkeypatch, device="gpu", headroom=8192, idle=1e9, model_dir=None):
     """A proxy whose sessions are fakes, with the reaper thread neutered."""
     import plugins.kokoro_direct as kd
     monkeypatch.setattr(kd, "KokoroDirect", _FakeDirect)
     monkeypatch.setattr(kw, "_mem_available_mb", lambda: headroom)
     monkeypatch.setattr(kw.KokoroWorkerProxy, "_reap_loop", lambda self: None)
-    return kw.KokoroWorkerProxy("/models/kokoro-multi/gpu", "model.onnx",
+    return kw.KokoroWorkerProxy(model_dir or "/models/kokoro-multi/gpu", "model.onnx",
                                 device=device, idle_timeout_s=idle)
 
 
 # ── which device ──────────────────────────────────────────────────────────────
 
-def test_a_device_that_gets_durations_wrong_is_rejected_for_cpu(monkeypatch):
-    """jp5.11's CUDA returns 35-44% of the probe's length. 27% short is rushed speech.
+def test_a_device_that_gets_durations_wrong_raises_rather_than_substituting(
+        monkeypatch, tmp_path):
+    """No silent substitution: the card must say the GPU is unusable, not quietly
+    become a CPU card that still reads `gpu`.
 
-    Gating on the ORT version number would be the wrong fix — it would not catch the
-    next line with the same defect — so the gate is the measurement, and it is free
-    because the probe already runs to warm the session.
+    That state is what made Japanese "mysteriously slow" and took a measurement to
+    explain. The message has to distinguish this from the memory case — here the GPU is
+    present and has room, and computes the duration path wrongly (jp5.11's ORT 1.15.1
+    returns 27-51% short, which is audibly rushed speech).
     """
-    _FakeDirect.lengths = {"gpu": 21000, "cpu": kw.PROBE_SAMPLES}
-    proxy = _proxy(monkeypatch, device="gpu")
-    assert proxy.device_used == "cpu"
-    assert [p for p, _ in _FakeDirect.built] == ["gpu", "cpu"]
-    assert "gpu" in _FakeDirect.closed, "the rejected session must be unloaded"
+    _FakeDirect.lengths = {"gpu": 21000}
+    with pytest.raises(kw.DeviceUnavailable) as excinfo:
+        _proxy(monkeypatch, device="gpu", model_dir=str(tmp_path))
+    message = str(excinfo.value)
+    assert "duration" in message
+    assert "Not a memory problem" in message, message
+    assert "japanese_worker_device: cpu" in message, "the message must be actionable"
+    assert "gpu" in _FakeDirect.closed, "the rejected session must be released"
 
 
 def test_a_correct_device_is_kept(monkeypatch):
@@ -106,26 +112,25 @@ def test_a_few_samples_of_deviation_are_tolerated(monkeypatch):
     assert _proxy(monkeypatch, device="gpu").device_used == "gpu"
 
 
-def test_cpu_failing_the_check_too_is_an_error_not_a_silent_pass(monkeypatch):
-    """Then the model or the phoneme table does not match this code — say so."""
-    _FakeDirect.lengths = {"gpu": 100, "cpu": 100}
-    with pytest.raises(RuntimeError, match="plausible probe duration"):
-        _proxy(monkeypatch, device="gpu")
+def test_cpu_failing_the_check_too_is_an_error(monkeypatch, tmp_path):
+    """Then the model or the phoneme table does not match this code — say that, and do
+    not blame the device."""
+    _FakeDirect.lengths = {"cpu": 100}
+    with pytest.raises(kw.DeviceUnavailable, match="does not match this code"):
+        _proxy(monkeypatch, device="cpu", model_dir=str(tmp_path))
 
 
 # ── whether there is room ─────────────────────────────────────────────────────
 
-def test_cuda_is_declined_when_the_box_has_no_headroom(monkeypatch):
-    """The duration check cannot save a box that OOMs while building the session.
-
-    Measured on jp5.11: 5237 MB available, sherpa's own Kokoro GPU adapter takes 3.2 GB,
-    and the CUDA allocation then killed the process — before the probe ran. So this
-    guard has to be first; it is the one that can take the process down.
-    """
-    proxy = _proxy(monkeypatch, device="gpu", headroom=2048)
-    assert proxy.device_used == "cpu"
-    assert [p for p, _ in _FakeDirect.built] == ["cpu"], (
-        "with no headroom it must not even try CUDA")
+def test_no_headroom_raises_and_says_it_is_a_memory_problem(monkeypatch, tmp_path):
+    """The operator has to be able to tell this apart from the durations case: here the
+    GPU works and the box is full, and freeing memory would fix it."""
+    with pytest.raises(kw.DeviceUnavailable) as excinfo:
+        _proxy(monkeypatch, device="gpu", headroom=2048, model_dir=str(tmp_path))
+    message = str(excinfo.value)
+    assert "memory" in message
+    assert "the GPU itself is fine" in message.lower() or "not a model problem" in message
+    assert not _FakeDirect.built, "with no headroom it must not build anything at all"
 
 
 def test_cuda_is_used_when_there_is_room(monkeypatch):
@@ -219,9 +224,8 @@ def test_without_a_shared_context_the_higher_figure_applies(monkeypatch):
     from plugins import ort_worker
     monkeypatch.setattr(ort_worker, "get_worker",
                         lambda: type("w", (), {"has_cuda_session": lambda self: False})())
-    proxy = _proxy(monkeypatch, device="gpu", headroom=1800)
-    assert proxy.device_used == "cpu", (
-        "a fresh context needs the 1585 MB it was measured at, plus margin")
+    with pytest.raises(kw.DeviceUnavailable, match="2500 MB needed"):
+        _proxy(monkeypatch, device="gpu", headroom=1800)
 
 
 def test_asking_the_worker_failing_is_treated_as_no_context(monkeypatch):
@@ -232,4 +236,63 @@ def test_asking_the_worker_failing_is_treated_as_no_context(monkeypatch):
         raise RuntimeError("worker unreachable")
 
     monkeypatch.setattr(ort_worker, "get_worker", _boom)
-    assert _proxy(monkeypatch, device="gpu", headroom=1800).device_used == "cpu"
+    with pytest.raises(kw.DeviceUnavailable, match="2500 MB needed"):
+        _proxy(monkeypatch, device="gpu", headroom=1800)
+
+
+# ── the attempt is not free, so it happens once per machine ───────────────────
+
+def test_a_rejected_cuda_is_remembered_across_restarts(monkeypatch, tmp_path):
+    """Trying CUDA costs memory that unloading does not return, so try it once.
+
+    Measured on Orin 5: one rejected attempt took MemAvailable from 5754 to 1935 MB and
+    kept it. A crash restarts perception, so an in-memory verdict would be lost and the
+    next start would pay again — which is how face's later GPU load tipped that box into
+    the OOM killer.
+    """
+    _FakeDirect.lengths = {"gpu": 21000}
+    with pytest.raises(kw.DeviceUnavailable, match="duration"):
+        _proxy(monkeypatch, device="gpu", model_dir=str(tmp_path))
+    assert (tmp_path / ".cuda-duration-verdict").exists()
+
+    # A restarted process must not build anything before refusing.
+    _FakeDirect.built = []
+    with pytest.raises(kw.DeviceUnavailable, match="recorded in"):
+        _proxy(monkeypatch, device="gpu", model_dir=str(tmp_path))
+    assert not _FakeDirect.built, (
+        "a machine that has already answered this must not pay for the answer again")
+
+
+def test_the_verdict_is_keyed_on_the_runtime_version(monkeypatch, tmp_path):
+    """The defect is in the ONNX Runtime build, so a different one gets re-evaluated."""
+    (tmp_path / ".cuda-duration-verdict").write_text("1.15.1", encoding="utf-8")
+    assert kw._cuda_known_bad(str(tmp_path), "1.15.1") is True
+    assert kw._cuda_known_bad(str(tmp_path), "1.18.1") is False
+
+
+def test_a_missing_verdict_file_is_not_a_verdict(tmp_path):
+    assert kw._cuda_known_bad(str(tmp_path), "1.18.1") is False
+
+
+def test_an_unwritable_model_dir_does_not_break_the_build(monkeypatch, tmp_path):
+    """A read-only /models must cost the memory of a retry, not a crash."""
+    def _boom(*a, **k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("builtins.open", _boom)
+    kw._remember_cuda_is_bad(str(tmp_path), "1.18.1")     # must not raise
+
+
+# ── idle unloading is off, and the reaper honours that ────────────────────────
+
+def test_idle_unloading_is_off_by_default():
+    """It never returned memory — measured at +0 MB — and cost a 5-7 s rebuild."""
+    assert kw.IDLE_TIMEOUT_S == 0
+
+
+def test_the_reaper_exits_immediately_when_disabled(monkeypatch):
+    proxy = _proxy(monkeypatch, idle=0.0)
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    proxy._reap_loop()                    # returns rather than looping
+    assert slept == [], "a disabled reaper must not even poll"

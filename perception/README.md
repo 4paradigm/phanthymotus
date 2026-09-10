@@ -577,6 +577,25 @@ jp5.11 against ~950 MB on jp6.1, so a CUDA child's allocation OOM-killed the rig
 probe could run**. So the duration gate alone is not enough; a headroom check has to come
 first, because it is the one that can take the process down.
 
+**No silent substitution.** An earlier revision quietly used the CPU when the GPU was
+unavailable, and that produced the worst state available: a card configured for `gpu`,
+running at RTF 0.52 instead of 0.07, with the reason in a log line nobody reads. It
+took a measurement to explain why Japanese "felt slow". The card now goes
+`state: error` and the message names **which** of the two problems it hit, because they
+have different fixes:
+
+| | what it means | what to do |
+|---|---|---|
+| *not enough memory …* | the GPU is fine, the box is full | free memory, or set `japanese_worker_device: cpu` |
+| *… computes the duration path wrongly* | the GPU works and gets the wrong answer | set `japanese_worker_device: cpu`; freeing memory will not help |
+
+The second verdict is **recorded on the machine**, keyed by the ONNX Runtime version,
+because the attempt is not free: one rejected CUDA session took Orin 5's MemAvailable
+from 5754 MB to 1935 MB and **kept it** — unloading does not return it. A crash restarts
+perception, so an in-memory verdict would be lost and the next start would pay again.
+That is how face's later GPU load tipped that box into the OOM killer. Delete
+`.cuda-duration-verdict` in the model directory to force a re-evaluation.
+
 The headroom figure depends on **who else is in the child**, because the first CUDA
 session there pays for the context and the rest do not:
 
@@ -592,8 +611,26 @@ the GPU in the same child** on jp6.1 — Japanese at RTF 0.089 while face recogn
 29.7–37.8 ms. An earlier version of this section said a 7.4 GB box could not fit both;
 that was true of two CUDA *contexts* and not of two sessions.
 
-jp5.11 still lands on CPU, and correctly: 785 MB free is under even the shared figure,
-and its CUDA gets the durations wrong anyway. Two independent reasons, one outcome.
+jp5.11 needs `japanese_worker_device: cpu` set explicitly, and the error says so if it
+is not. Two independent reasons, either one disqualifying:
+
+- its ONNX Runtime is **1.15.1** and executes this graph's duration path incorrectly —
+  8 runs gave 6.05 s against the CPU's 8.35 s, and the 10-token probe returned
+  16800–24000 samples against 47400. **This is not about memory**: with an empty box and
+  the guard disabled the session builds, does not crash, and still comes out 27–51%
+  short;
+- and separately, the box rarely has room.
+
+Worth being precise about what was *not* broken, because "GPU works on jp5.11" is also
+true: sherpa's own engines and face both run on the GPU there and always have.
+`KokoroDirect` — the standalone session this code builds — is the only thing affected,
+it exists only for Japanese, and it was pinned to the CPU from the day it was written,
+so this path had never been exercised on that line until now.
+
+The fix, if anyone wants it, is a newer ONNX Runtime for jp5.11 — the same work as the
+1.18.1 build for jp6.1, against CUDA 11.4 and cp38. Not guaranteed: recent versions drop
+cp38. The encouraging sign is that sherpa bundles **1.16.0** on that line, so something
+newer than 1.15.1 does build there.
 **The residual risk is stated rather than hidden**: the thresholds are heuristics, and
 there is a window where CUDA would be attempted on jp5.11 — the duration gate catches it
 if the build survives, and does not if the box OOMs first. `japanese_worker_device: cpu`

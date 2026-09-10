@@ -69,10 +69,20 @@ log = logging.getLogger(__name__)
 START_TIMEOUT_S = 45.0
 # One utterance is 0.59 s warm. This is a "the child is wedged" bound, not a budget.
 CALL_TIMEOUT_S = 30.0
-# Long enough that a bilingual tour switching languages does not pay the ~10.5 s cold
-# path repeatedly; short enough that a card that has finished with Japanese gives the
-# memory back. Card stop and engine switch close it immediately regardless.
-IDLE_TIMEOUT_S = 120.0
+# Idle unloading is **off**, and that is a correction rather than a default.
+#
+# It was added to "give the memory back when Japanese stops being used", and then
+# measured: unloading moved whole-box MemAvailable by **+0 MB**. The CUDA pool is
+# returned on process exit, not on session destruction, so the only thing it achieved
+# was making the next utterance pay the cold path again — observed on Orin 6 as
+# "kokoro session ready in 7.4s" after a 120 s gap, which is what a tour with pauses in
+# it feels as the TTS being slow.
+#
+# Card stop and engine switch still release it: those are the points where the answer
+# to "is this needed again" is actually known.
+#
+# Set a positive number to re-enable it, but know what it does and does not buy.
+IDLE_TIMEOUT_S = 0.0
 
 # The warmup probe doubles as a correctness gate on the chosen device, because one
 # JetPack line executes this graph wrong on CUDA.
@@ -124,6 +134,45 @@ CUDA_HEADROOM_FRESH_MB = 2500
 CUDA_HEADROOM_SHARED_MB = 1400
 
 
+def _cuda_verdict_path(model_dir: str) -> str:
+    """Where this machine records that CUDA failed the duration check.
+
+    Persistent, not in-memory, because the process that learns it may not be the one
+    that needs it: a crash restarts perception and an in-memory verdict is lost, so the
+    next start tries CUDA again — which is exactly what happened on Orin 5, where the
+    retry contributed to a whole-box OOM.
+
+    Keyed by the ONNX Runtime version, because the defect is in that build. A new
+    runtime gets a fresh evaluation rather than inheriting a verdict about a different
+    one.
+    """
+    return os.path.join(model_dir, ".cuda-duration-verdict")
+
+
+def _cuda_known_bad(model_dir: str, ort_version: str) -> bool:
+    try:
+        with open(_cuda_verdict_path(model_dir), encoding="utf-8") as handle:
+            return handle.read().strip() == ort_version
+    except OSError:
+        return False
+
+
+def _remember_cuda_is_bad(model_dir: str, ort_version: str) -> None:
+    """Record the verdict so the attempt is made once per machine, not once per start.
+
+    The attempt is not free, which is why this exists. A CUDA session that then gets
+    rejected still leaves its pool behind — measured at ~967 MB that `unload` does not
+    return — so retrying it on every start is a permanent cost for a known answer, and
+    on a full box it is what tips the machine into the OOM killer.
+    """
+    try:
+        with open(_cuda_verdict_path(model_dir), "w", encoding="utf-8") as handle:
+            handle.write(ort_version)
+    except OSError as exc:
+        log.warning("[tts] could not record the CUDA verdict (%s); it will be "
+                    "re-evaluated on the next start", exc)
+
+
 def _mem_available_mb() -> int:
     """Whole-box MemAvailable. -1 if unreadable, which must not block the GPU."""
     try:
@@ -134,6 +183,22 @@ def _mem_available_mb() -> int:
     except OSError:
         pass
     return -1
+
+
+class DeviceUnavailable(RuntimeError):
+    """The configured device cannot be used, and substituting one silently is worse.
+
+    Distinct from every other failure on purpose. A worker that dies, a queue that
+    times out, a child that will not spawn — those are infrastructure, and falling back
+    to an in-process CPU session keeps Japanese working at a cost of speed, which is
+    the right trade. **This** is the operator having asked for a device that will not
+    do the job, and quietly giving them a different one produces the worst state there
+    is: a card configured for gpu, running at RTF 0.52, with the reason in a log line
+    nobody reads.
+
+    So this one propagates: the card goes `state: error` carrying the message, and the
+    operator decides.
+    """
 
 
 class KokoroWorkerProxy:
@@ -198,63 +263,94 @@ class KokoroWorkerProxy:
     # ── build, with both guards ──────────────────────────────────────────────
 
     def _build(self) -> None:
-        """Load the session in the shared worker, on a device that is actually safe.
+        """Load the session on the device asked for, or fail saying why.
 
-        Two guards, and the order matters. The duration check runs *after* the session
-        is built, so it cannot prevent the allocation that builds it from taking the box
-        down — the headroom check has to come first.
+        **No silent substitution.** An earlier version quietly used the CPU when the
+        GPU was unavailable, which produced the worst possible state: a card configured
+        for `gpu`, running at RTF 0.52 instead of 0.07, with the reason in a log line
+        nobody reads. The card now goes `state: error` and names which of the two
+        problems it hit, so the operator can set `japanese_worker_device: cpu` knowing
+        what they are accepting.
+
+        The two are independent and either one alone is disqualifying:
+
+        - **not enough memory.** A CUDA session needs ~967 MB beside an existing
+          context and ~1585 MB bringing its own. Asking anyway OOM-killed a jp5.11 rig.
+        - **wrong durations.** jp5.11's ONNX Runtime 1.15.1 executes this graph's
+          duration path incorrectly: 8 runs gave 6.05 s against the CPU's 8.35 s, and
+          the 10-token probe returned 16800-24000 samples against 47400. 27-51% short
+          is audibly rushed speech, and it has nothing to do with memory.
         """
         from plugins.kokoro_direct import KokoroDirect
 
-        device = self._device
-        if device in ("cuda", "gpu"):
+        want_cuda = self._device in ("cuda", "gpu")
+        ort_version = "unknown"
+        try:
+            import onnxruntime as _ort
+            ort_version = _ort.__version__
+        except Exception:                                         # noqa: BLE001
+            pass
+
+        if want_cuda:
+            # Known-bad first: the attempt is not free. A CUDA session that then gets
+            # rejected still leaves its pool behind — measured at 3.8 GB on Orin 5 that
+            # unloading does not return — so a machine that has already answered this
+            # question must not pay again on every restart.
+            if _cuda_known_bad(self._model_dir, ort_version):
+                raise DeviceUnavailable(
+                    f"this machine's onnxruntime {ort_version} computes Kokoro's "
+                    f"duration path wrongly on CUDA — measured once and recorded in "
+                    f"{_cuda_verdict_path(self._model_dir)}. Japanese would be 27-51% "
+                    f"too short, which is audibly rushed speech. Not a memory problem. "
+                    f"Set japanese_worker_device: cpu (RTF ~0.52, still real time)."
+                )
+
             from plugins import ort_worker
             shared = False
             try:
                 shared = ort_worker.get_worker().has_cuda_session()
             except Exception as exc:                              # noqa: BLE001
-                log.debug("[tts] could not ask the worker about CUDA (%s); "
-                          "assuming a context has to be paid for", exc)
+                log.debug("[tts] could not ask the worker about CUDA (%s); assuming a "
+                          "context has to be paid for", exc)
             needed = CUDA_HEADROOM_SHARED_MB if shared else CUDA_HEADROOM_FRESH_MB
             headroom = _mem_available_mb()
             if 0 <= headroom < needed:
-                log.warning("[tts] kokoro: %d MB available, under the %d MB a CUDA "
-                            "session needs%s — using cpu (RTF ~0.52 rather than "
-                            "~0.07). Asking anyway OOM-killed a jp5.11 rig.",
-                            headroom, needed,
-                            " beside the existing context" if shared
-                            else " including a context of its own")
-                device = "cpu"
+                raise DeviceUnavailable(
+                    f"not enough memory for a CUDA session: {headroom} MB available, "
+                    f"{needed} MB needed{' beside the existing context' if shared else ' including a context of its own'}. "
+                    f"This is a **memory** problem, not a model problem — the GPU "
+                    f"itself is fine. Free memory on the box, or set "
+                    f"japanese_worker_device: cpu (RTF ~0.52, still real time). "
+                    f"Asking anyway OOM-killed a jp5.11 rig mid-utterance."
+                )
 
         started = time.monotonic()
-        for candidate, why in ((device, "requested"), ("cpu", "fallback")):
-            if why == "fallback" and candidate == device:
-                break                       # already tried it, and it failed the check
-            direct = KokoroDirect(self._model_dir, self._weights,
-                                  num_threads=self._num_threads, provider=candidate,
-                                  session_key="tts.kokoro.ja")
-            # The warmup was always needed — the first CUDA call costs 8.03 s of lazy
-            # kernel loading against 0.59 s warm — so checking its output length is
-            # free. A wrong length means this device computes the duration path
-            # incorrectly, and a fast wrong answer is worse than a slow right one.
-            n = len(direct.synthesize(PROBE_TEXT, speaker_id=0, speed=1.0))
-            off = abs(n - PROBE_SAMPLES) / PROBE_SAMPLES
-            if off <= PROBE_TOLERANCE:
-                self._direct = direct
-                self._device_used = candidate
-                log.info("[tts] kokoro session ready in %.1fs on %s%s: providers=%s",
-                         time.monotonic() - started, candidate,
-                         "" if candidate == self._device
-                         else f" (asked for {self._device})",
-                         direct._session.get_providers())
-                return
-            log.error("[tts] %s produced %d samples for the probe, expected ~%d "
-                      "(%.0f%% off) — this device computes the duration path wrongly; "
-                      "not using it", candidate, n, PROBE_SAMPLES, off * 100)
+        direct = KokoroDirect(self._model_dir, self._weights,
+                              num_threads=self._num_threads, provider=self._device,
+                              session_key="tts.kokoro.ja")
+        # The warmup was always needed — the first CUDA call costs 8 s of lazy kernel
+        # loading against 0.6 s warm — so checking its output length is free.
+        n = len(direct.synthesize(PROBE_TEXT, speaker_id=0, speed=1.0))
+        off = abs(n - PROBE_SAMPLES) / PROBE_SAMPLES
+        if off > PROBE_TOLERANCE:
             direct.close()
-        raise RuntimeError(
-            f"neither {self._device} nor cpu produced a plausible probe duration; the "
-            f"model or the phoneme table does not match this code")
+            if want_cuda:
+                _remember_cuda_is_bad(self._model_dir, ort_version)
+            raise DeviceUnavailable(
+                f"{self._device} produced {n} samples for the probe, expected "
+                f"~{PROBE_SAMPLES} ({off * 100:.0f}% off): this device computes "
+                f"Kokoro's duration path wrongly, which comes out as audibly rushed "
+                f"speech. Not a memory problem. "
+                + ("Set japanese_worker_device: cpu (RTF ~0.52, still real time)."
+                   if want_cuda else
+                   "The model or the phoneme table does not match this code.")
+            )
+
+        self._direct = direct
+        self._device_used = self._device
+        log.info("[tts] kokoro session ready in %.1fs on %s: providers=%s",
+                 time.monotonic() - started, self._device,
+                 direct._session.get_providers())
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -282,6 +378,8 @@ class KokoroWorkerProxy:
         and a tour that alternates languages would pay it on every switch. Idle time is
         the signal that actually means "done with Japanese".
         """
+        if self._idle_timeout_s <= 0:
+            return                      # off; see IDLE_TIMEOUT_S for why that is default
         while True:
             time.sleep(5.0)
             direct = None
@@ -310,6 +408,10 @@ class KokoroWorkerProxy:
             if self._direct is None:
                 try:
                     self._build()
+                except DeviceUnavailable:
+                    # Not ours to paper over — the operator asked for a device that
+                    # cannot do the job, and the card should say so.
+                    raise
                 except Exception as exc:                          # noqa: BLE001
                     log.warning("[tts] kokoro session could not be rebuilt (%s); "
                                 "Japanese falls back to the in-process CPU session",
