@@ -1702,6 +1702,12 @@ async function _startProject() {
       offMotusEvent(_onEvent);
       if (modal) {
         _showStartupError(modal);
+      } else if (res.status === 409) {
+        // A prior start is still settling (e.g. a card mid-warmup) — no
+        // project_start_begin ever arrived, so no modal exists to show the
+        // error in. Without this the click just looks like it did nothing;
+        // the activity log entry above is easy to miss.
+        _showToast(data.detail || '启动已在进行中，请稍候');
       }
     }
   } catch (e) {
