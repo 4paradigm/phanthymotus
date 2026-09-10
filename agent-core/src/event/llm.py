@@ -1424,7 +1424,11 @@ class Event:
             if text:
                 await push_event({'type': 'agent_thought', 'payload': {'text': text}})
                 if not tool_restricted and not _round_already_notified(response.get('tool_calls') or []):
-                    override = event.skills.get_notify_override()
+                    # event.skills (attribute) is rebound to a Tools() instance by
+                    # event/__init__.py, shadowing the submodule — get_notify_override
+                    # is a module-level function, so it must come from sys.modules.
+                    import sys as _sys
+                    override = _sys.modules['event.skills'].get_notify_override()
                     auto_notify = override if override is not None else \
                         config.main.get('event', {}).get('llm', {}).get('auto_notify', True)
                     if auto_notify:
