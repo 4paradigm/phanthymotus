@@ -101,21 +101,27 @@ PROBE_SAMPLES = 47400
 # 56% error it has to catch.
 PROBE_TOLERANCE = 0.10
 
-# Two guards are needed, and the order matters: the duration check above runs *after* the
-# session is built, so it cannot prevent the allocation that builds it from taking the
-# box down. Measured on jp5.11, asking for a CUDA child:
+# Two guards are needed, and the order matters: the duration check above runs *after*
+# the session is built, so it cannot prevent the allocation that builds it from taking
+# the box down. Measured on jp5.11, asking for a CUDA session with no headroom check:
 #
 #   5237 MB available -> sherpa's own Kokoro GPU adapter takes 3.2 GB -> 2048 MB left
-#   -> the CUDA child's allocation -> whole-box OOM, SIGKILL, before the probe ran
+#   -> the CUDA allocation -> whole-box OOM, SIGKILL, before the probe ran
 #
-# (`dmesg`: "Out of memory: Killed process ... (python3) anon-rss:2420028kB".) The same
-# adapter costs ~950 MB on jp6.1, where a CUDA child fits in the 1585 MB it needs. So the
-# headroom figure is the child's measured cost plus a margin, checked before spawning.
+# (`dmesg`: "Out of memory: Killed process ... (python3) anon-rss:2420028kB".)
 #
-# On jp5.11 this lands on cpu, which is also where the duration check would have put it.
-# Two independent reasons, one outcome — and the memory one has to be first because it is
-# the one that can kill the process.
-CUDA_HEADROOM_MB = 2500
+# The figure depends on whether the ORT worker already holds a CUDA session, because
+# the first one in that process pays for the context and the rest do not. Measured on
+# Orin 6:
+#
+#   Kokoro alone in the child, bringing its own context       1585 MB
+#   Kokoro beside the face service, context already there      967 MB
+#
+# A single conservative number would refuse the second case on the first case's
+# evidence — which it did: with 2158 MB free on an otherwise idle box, a 967 MB
+# allocation was declined because the threshold was 2500.
+CUDA_HEADROOM_FRESH_MB = 2500
+CUDA_HEADROOM_SHARED_MB = 1400
 
 
 def _mem_available_mb() -> int:
@@ -202,12 +208,22 @@ class KokoroWorkerProxy:
 
         device = self._device
         if device in ("cuda", "gpu"):
+            from plugins import ort_worker
+            shared = False
+            try:
+                shared = ort_worker.get_worker().has_cuda_session()
+            except Exception as exc:                              # noqa: BLE001
+                log.debug("[tts] could not ask the worker about CUDA (%s); "
+                          "assuming a context has to be paid for", exc)
+            needed = CUDA_HEADROOM_SHARED_MB if shared else CUDA_HEADROOM_FRESH_MB
             headroom = _mem_available_mb()
-            if 0 <= headroom < CUDA_HEADROOM_MB:
+            if 0 <= headroom < needed:
                 log.warning("[tts] kokoro: %d MB available, under the %d MB a CUDA "
-                            "session needs — using cpu (RTF ~0.52 rather than ~0.07). "
-                            "Asking anyway OOM-killed a jp5.11 rig.",
-                            headroom, CUDA_HEADROOM_MB)
+                            "session needs%s — using cpu (RTF ~0.52 rather than "
+                            "~0.07). Asking anyway OOM-killed a jp5.11 rig.",
+                            headroom, needed,
+                            " beside the existing context" if shared
+                            else " including a context of its own")
                 device = "cpu"
 
         started = time.monotonic()

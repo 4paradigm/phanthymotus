@@ -129,6 +129,9 @@ class OrtWorker:
         # without every caller having to notice it died.
         self._loaded = {}
         self._meta = {}
+        # key -> (module, func, kwargs), rebuilt on a restart for the same reason
+        # sessions are: a caller holding a proxy should not have to notice.
+        self._services = {}
         self._closed = False
         atexit.register(self.close)
 
@@ -183,6 +186,15 @@ class OrtWorker:
                 log.info("[ort] reloaded %s after the worker restarted", key)
             except Exception as exc:                              # noqa: BLE001
                 log.warning("[ort] could not reload %s: %s", key, exc)
+        stale_services, self._services = dict(self._services), {}
+        for key, (module, func, kwargs) in stale_services.items():
+            try:
+                self._request(("service", key, module, func, kwargs),
+                              timeout=LOAD_TIMEOUT_S)
+                self._services[key] = (module, func, kwargs)
+                log.info("[ort] rebuilt service %s after the worker restarted", key)
+            except Exception as exc:                              # noqa: BLE001
+                log.warning("[ort] could not rebuild service %s: %s", key, exc)
 
     def _terminate(self) -> None:
         proc, self._proc = self._proc, None
@@ -213,6 +225,32 @@ class OrtWorker:
                 log.info("[ort] worker closing (pid=%s)", self._proc.pid)
             self._terminate()
             self._loaded = {}
+            self._services = {}
+
+    def has_cuda_session(self) -> bool:
+        """Whether the child already holds a CUDA session — and so a CUDA context.
+
+        A caller deciding whether it can afford one needs this, because the first CUDA
+        session in the child pays for the context and the rest do not. Measured on
+        Orin 6: the face service on cuda cost 764 MB, and Kokoro's graph beside it cost
+        **967 MB** including its first inference — against 1585 MB when Kokoro was
+        alone in the child and had to bring a context with it.
+        """
+        with self._lock:
+            for _path, providers, _options in self._loaded.values():
+                if any("CUDA" in p or "Tensorrt" in p for p in providers):
+                    return True
+            # Services resolve their own providers inside the child, so ask them.
+            for key in list(self._services):
+                try:
+                    described = self._request(("call", key, "describe", {}),
+                                              timeout=30) or {}
+                except Exception:                                 # noqa: BLE001
+                    continue
+                if any("CUDA" in p or "Tensorrt" in p
+                       for p in (described.get("providers") or ())):
+                    return True
+        return False
 
     @property
     def alive(self) -> bool:
@@ -229,16 +267,12 @@ class OrtWorker:
         picklable; the child rebuilds it.
 
         `postprocess` is `{"module": ..., "func": ...}`, imported by the child and
-        applied to the raw outputs before they are sent back. It exists because a
-        detector head is enormous before thresholding and tiny after — SCRFD returns
-        16 800 candidates of which a frame keeps nought to eight — so shipping the raw
-        arrays across means throwing 99.95% of them away on the far side, measured at
-        +27 ms per detection.
-
-        Passing a module path rather than a callable keeps this class ignorant of what
-        it is hosting: a closure could not be pickled to a spawned child anyway, and a
-        name means the child imports the *same* implementation the in-process path uses
-        rather than a copy of it.
+        applied to the raw outputs before they are sent back. Kokoro does not use it —
+        its reply is the waveform, which is the thing the caller wanted — and neither
+        does face any more, because hosting the whole pipeline (see `service`) beats
+        shrinking one reply. Kept because a name, not a closure, is the only way to
+        hand code to a spawned child, and the next caller that needs it will need it
+        this way.
         """
         with self._lock:
             self._closed = False
@@ -270,6 +304,51 @@ class OrtWorker:
                 self._request(("unload", key), timeout=30)
             except Exception as exc:                              # noqa: BLE001
                 log.warning("[ort] unload %s failed: %s", key, exc)
+
+    # ── services: a whole pipeline in the child, not just a session ──────────
+
+    def service(self, key: str, module: str, func: str, **kwargs):
+        """Build an object in the child by name and return a handle to call it.
+
+        This exists because splitting at `InferenceSession.run` puts the *largest*
+        payload on the wire. Face measured +27 ms per detection that way: a 2.93 MiB
+        normalised blob out, 0.96 MiB of pre-threshold candidates back, then a crop per
+        face. Hosting the pipeline instead means the frame crosses once as the
+        50-300 kB JPEG the parent already holds, and a few kB of results come back.
+
+        `module`/`func` rather than a callable, for the same reason `postprocess` takes
+        a name: a spawned child cannot be handed a closure, and a name means it imports
+        the same implementation rather than a copy. This class still knows nothing about
+        what it is hosting.
+        """
+        with self._lock:
+            self._closed = False
+            self._ensure_started()
+            reply = self._request(("service", key, module, func, kwargs),
+                                  timeout=LOAD_TIMEOUT_S)
+            self._services[key] = (module, func, kwargs)
+            return ServiceProxy(self, key, reply)
+
+    def call(self, key: str, method: str, kwargs=None, timeout=None):
+        with self._lock:
+            if self._closed:
+                raise OrtWorkerError("the ORT worker is closed")
+            if not self.alive:
+                log.warning("[ort] worker died; restarting and rebuilding its services")
+                self._ensure_started()
+            return self._request(("call", key, method, dict(kwargs or {})),
+                                 timeout=timeout or RUN_TIMEOUT_S)
+
+    def drop(self, key: str) -> None:
+        """Release one service, keeping the child and everything else it holds."""
+        with self._lock:
+            self._services.pop(key, None)
+            if not self.alive:
+                return
+            try:
+                self._request(("drop", key), timeout=30)
+            except Exception as exc:                              # noqa: BLE001
+                log.warning("[ort] drop %s failed: %s", key, exc)
 
     def run(self, key: str, output_names, feeds, post_kwargs=None):
         """Run the session. With a postprocessor registered, the reply is its return
@@ -348,6 +427,34 @@ class OrtSessionProxy:
         self._worker.unload(self._key)
 
 
+class ServiceProxy:
+    """A handle on an object living in the worker child.
+
+    Deliberately thin: `describe()` answers from the build-time reply and everything
+    else is one round trip. The parent-side wrapper that gives it a friendly shape is
+    `plugins/face_proxy.py` — keeping that out of here is what stops this module
+    accumulating knowledge of its tenants.
+    """
+
+    def __init__(self, worker: "OrtWorker", key: str, described: dict):
+        self._worker = worker
+        self._key = key
+        self._described = dict(described or {})
+
+    @property
+    def key(self) -> str:
+        return self._key
+
+    def describe(self) -> dict:
+        return dict(self._described)
+
+    def call(self, method: str, timeout=None, **kwargs):
+        return self._worker.call(self._key, method, kwargs, timeout=timeout)
+
+    def drop(self) -> None:
+        self._worker.drop(self._key)
+
+
 # ── the single instance ───────────────────────────────────────────────────────
 
 _worker = None
@@ -413,6 +520,7 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
                          "providers": ort.get_available_providers()}))
 
     sessions = {}
+    services = {}
 
     def _meta(entries):
         return [{"name": e.name, "shape": list(e.shape), "type": e.type}
@@ -456,6 +564,38 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
                     "inputs": _meta(sess.get_inputs()),
                     "outputs": _meta(sess.get_outputs()),
                 }))
+
+            elif verb == "service":
+                _, _, key, module_name, func_name, kwargs = command
+                module = importlib.import_module(module_name)
+                started = time.monotonic()
+                obj = getattr(module, func_name)(**kwargs)
+                services[key] = obj
+                describe = getattr(obj, "describe", None)
+                wlog.info("built service %s from %s.%s in %.2fs",
+                          key, module_name, func_name, time.monotonic() - started)
+                res_q.put((req_id, "ok", describe() if describe else {}))
+
+            elif verb == "call":
+                _, _, key, method, kwargs = command
+                obj = services.get(key)
+                if obj is None:
+                    res_q.put((req_id, "error",
+                               f"service {key!r} is not built in the worker"))
+                    continue
+                res_q.put((req_id, "ok", getattr(obj, method)(**kwargs)))
+
+            elif verb == "drop":
+                _, _, key = command
+                obj = services.pop(key, None)
+                closer = getattr(obj, "close", None)
+                if closer is not None:
+                    try:
+                        closer()
+                    except Exception as exc:                      # noqa: BLE001
+                        wlog.warning("closing service %s failed: %s", key, exc)
+                wlog.info("dropped service %s", key)
+                res_q.put((req_id, "ok", None))
 
             elif verb == "unload":
                 _, _, key = command

@@ -194,3 +194,42 @@ def test_a_failing_call_falls_back_rather_than_propagating(monkeypatch):
     out = proxy.synthesize("konnichiwa")
     assert out.size == kw.PROBE_SAMPLES
     assert ("cpu", True) in _FakeDirect.built
+
+
+# ── the headroom figure depends on who else is in the child ───────────────────
+
+def test_a_shared_cuda_context_lowers_what_japanese_must_find(monkeypatch):
+    """The first CUDA session in the worker pays for the context; the rest do not.
+
+    Measured on Orin 6: Kokoro alone in the child cost 1585 MB, and Kokoro beside the
+    face service cost 967 MB. One conservative threshold refused the second case on the
+    first case's evidence — with 2158 MB free on an otherwise idle box, a 967 MB
+    allocation was declined because the number was 2500.
+    """
+    from plugins import ort_worker
+    monkeypatch.setattr(ort_worker, "get_worker",
+                        lambda: type("w", (), {"has_cuda_session": lambda self: True})())
+    # Between the two thresholds: too little for a fresh context, ample beside one.
+    proxy = _proxy(monkeypatch, device="gpu", headroom=1800)
+    assert proxy.device_used == "gpu", (
+        "with a context already in the child, 1800 MB is more than the 967 MB measured")
+
+
+def test_without_a_shared_context_the_higher_figure_applies(monkeypatch):
+    from plugins import ort_worker
+    monkeypatch.setattr(ort_worker, "get_worker",
+                        lambda: type("w", (), {"has_cuda_session": lambda self: False})())
+    proxy = _proxy(monkeypatch, device="gpu", headroom=1800)
+    assert proxy.device_used == "cpu", (
+        "a fresh context needs the 1585 MB it was measured at, plus margin")
+
+
+def test_asking_the_worker_failing_is_treated_as_no_context(monkeypatch):
+    """Erring towards the larger figure: guessing wrong the other way OOMs the box."""
+    from plugins import ort_worker
+
+    def _boom():
+        raise RuntimeError("worker unreachable")
+
+    monkeypatch.setattr(ort_worker, "get_worker", _boom)
+    assert _proxy(monkeypatch, device="gpu", headroom=1800).device_used == "cpu"

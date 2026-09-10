@@ -65,7 +65,10 @@ from plugins.face_db import (
     FaceDB,
     is_unknown_id,
 )
+from plugins.face_proxy import FaceServiceProxy
 from plugins.face_runtime import (
+    DEFAULT_FACE_MODEL,
+    FACE_MODELS,
     DEFAULT_BLUR_MIN,
     DEFAULT_MAX_IMAGE_PIXELS,
     DEFAULT_MAX_IMAGE_SIDE,
@@ -237,13 +240,19 @@ TOOLS = [
             },
         },
         # Deliberately minimal, as in plugins/ocr.py: only what an operator
-        # meaningfully decides. Expert knobs (model_dir, db_dir, device,
+        # meaningfully decides. `model` is advertised even though there is one entry
+        # today: the enum is generated from FACE_MODELS, so a second entry appears on
+        # the card without touching this file, and an operator who sees the field knows
+        # the choice exists. `model_dir` stays hidden — it points at a local copy of
+        # whatever `model` selected, which is a deployment detail.
+        # Expert knobs (model_dir, db_dir, device,
         # det_size, det_thresh, nms_thresh, num_threads, enroll_window_s,
         # max_batch, image_roots, ...) stay config.yaml-only — dispatch still
         # honours them, they are just not advertised to the config UI.
         "configSchema": {
             "type": "object",
             "properties": {
+                "model":             {"type": "string", "enum": sorted(FACE_MODELS), "default": DEFAULT_FACE_MODEL, "description": "识别模型。切换模型会重新加载并使已存样本失效——不同网络的 embedding 不可比较，已注册人员需重新录入"},
                 "device":            {"type": "string", "enum": ["auto", "cpu", "gpu"], "default": "auto", "description": "推理设备。auto=有 GPU 用 GPU，没有则用 CPU"},
                 "detect_fps":        {"type": "number", "minimum": 0, "default": DEFAULT_DETECT_FPS, "description": "检测频率，每秒 x 次，支持小数（如 0.5 = 每 2 秒一次）；0=每帧都检测", "scope": "instance"},
                 "match_threshold":   {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格（越不容易认错人，但越容易认不出）"},
@@ -303,6 +312,7 @@ def _analyzer_options(cfg: dict) -> dict:
         det_size = DEFAULT_DET_SIZE
     return {
         "model_dir": str(cfg.get("model_dir", DEFAULT_FACE_MODEL_DIR)),
+        "model": str(cfg.get("model", DEFAULT_FACE_MODEL)),
         "device": str(cfg.get("device", "cpu")),
         "det_size": det_size,
         "det_thresh": float(cfg.get("det_thresh", DEFAULT_DET_THRESH)),
@@ -386,7 +396,25 @@ class _FaceEngine:
 
 
 def _build_engine(cfg: dict) -> _FaceEngine:
-    analyzer = FaceAnalyzer(**_analyzer_options(cfg))
+    """The analyzer runs in the ORT worker child; the database stays here.
+
+    A `FaceAnalyzer` in this process would create a standalone ONNX Runtime session
+    next to sherpa-onnx's, and the two corrupt each other — an exception on jp6.1, a
+    SIGSEGV that kills all of perception on jp5.11, and with face's session built first
+    the Kokoro TTS engine cannot be constructed at all. `FaceAnalyzer` now refuses to
+    be built outside the child, so this is not a convention to remember.
+
+    The database is the opposite: `matrix @ embedding` on a 2 kB vector, mutated from
+    MCP threads as well as this worker, and it owns files on disk. It has nothing to do
+    with ONNX and stays where its lock is.
+    """
+    decode = _decode_options(cfg)
+    analyzer = FaceServiceProxy(
+        **_analyzer_options(cfg),
+        # _decode_options names these for decode_image's own signature; the service
+        # holds them for the life of the child instead of taking them per call.
+        max_image_side=decode["max_side"], max_image_pixels=decode["max_pixels"],
+    )
     db = FaceDB(**_db_options(cfg))
     return _FaceEngine(analyzer, db)
 
@@ -1003,22 +1031,25 @@ class _FaceNode(Node):
             analyzer = self._engine.analyzer
             database = self._engine.db
             gates = _gates(self._cfg)
-            image = analyzer.decode_image(
-                image_bytes, **_decode_options(self._cfg)
+            # One round trip, carrying the JPEG as received. Decoding, detection,
+            # alignment, the quality gate and embedding all happen in the ORT worker
+            # child — see plugins/face_service.py for why the boundary is there and
+            # not at the session.
+            shape, faces = analyzer.recognise(
+                image_bytes,
+                max_faces=gates["max_faces"],
+                det_thresh=gates["det_thresh"],
+                min_face_px=gates["min_face_px"],
+                blur_min=gates["blur_min"],
             )
-            if image is None:
+            if shape is None:
                 payload["error"] = "undecodable frame"
                 return payload
-            shape = image.shape[:2]
-            faces = analyzer.detect(image, max_faces=gates["max_faces"])
             entries = []
             for face in faces:
-                analyzer.prepare(image, face)
-                usable = (
-                    face.det_score >= gates["det_thresh"]
-                    and face.min_side >= gates["min_face_px"]
-                    and face.blur >= gates["blur_min"]
-                )
+                # The gate ran in the child; an unusable face is exactly one it did not
+                # think was worth embedding.
+                usable = face.embedding is not None
                 entry = {
                     "bbox": face.bbox_xywh(),
                     "det_score": round(face.det_score, 4),
@@ -1041,7 +1072,7 @@ class _FaceNode(Node):
                     entries.append(entry)
                     continue
 
-                embedding = analyzer.embed(face.aligned)
+                embedding = face.embedding
                 person_id, score = database.match(
                     embedding, gates["match_threshold"]
                 )
@@ -1611,10 +1642,20 @@ class FaceRecognitionPlugin:
         self, engine: _FaceEngine, image_bytes: bytes, gates: dict
     ) -> tuple[np.ndarray | None, dict | None]:
         """One image → the subject's embedding, or the failure record."""
-        image = engine.analyzer.decode_image(
-            image_bytes, **_decode_options(self._plugin_cfg)
+        # embed_all here, unlike the recognition path: `select_subject` picks the
+        # subject *after* seeing every candidate's geometry, so the embedding has to
+        # exist for whichever one it chooses — including a marginal face that the
+        # per-frame gate would have skipped. Registration is a deliberate act with a
+        # human waiting, so paying for a few extra embeddings is the right trade.
+        shape, faces = engine.analyzer.recognise(
+            image_bytes,
+            max_faces=gates["max_faces"],
+            det_thresh=gates["det_thresh"],
+            min_face_px=gates["min_face_px"],
+            blur_min=gates["blur_min"],
+            embed_all=True,
         )
-        if image is None:
+        if shape is None:
             return None, {
                 "ok": False, "reason": REASON_BAD_INPUT,
                 "detail": (
@@ -1623,14 +1664,10 @@ class FaceRecognitionPlugin:
                     "max_image_pixels"
                 ),
             }
-        shape = image.shape[:2]
-        faces = engine.analyzer.detect(image, max_faces=gates["max_faces"])
-        for face in faces:
-            engine.analyzer.prepare(image, face)
         subject, failure = select_subject(faces, shape, gates)
         if subject is None:
             return None, failure
-        return engine.analyzer.embed(subject.aligned), None
+        return subject.embedding, None
 
     def _commit_enrolment(
         self,
@@ -1962,10 +1999,14 @@ class FaceRecognitionPlugin:
         because *enrolment* must resolve to exactly one person, whereas a query
         can simply report everyone it sees.
         """
-        image = engine.analyzer.decode_image(
-            image_bytes, **_decode_options(self._plugin_cfg)
+        shape, faces = engine.analyzer.recognise(
+            image_bytes,
+            max_faces=gates["max_faces"],
+            det_thresh=gates["det_thresh"],
+            min_face_px=gates["min_face_px"],
+            blur_min=gates["blur_min"],
         )
-        if image is None:
+        if shape is None:
             return {
                 "ok": False, "reason": REASON_BAD_INPUT,
                 "detail": (
@@ -1974,28 +2015,23 @@ class FaceRecognitionPlugin:
                     "max_image_pixels"
                 ),
             }
-        faces = engine.analyzer.detect(image, max_faces=gates["max_faces"])
         results = []
         for face in faces:
-            engine.analyzer.prepare(image, face)
             entry = {
                 "bbox": face.bbox_xywh(),
                 "det_score": round(face.det_score, 4),
                 "blur": round(face.blur, 2),
                 "min_side_px": int(face.min_side),
             }
-            if not (
-                face.det_score >= gates["det_thresh"]
-                and face.min_side >= gates["min_face_px"]
-                and face.blur >= gates["blur_min"]
-            ):
+            # The gate ran in the child; no embedding means it was not worth one.
+            if face.embedding is None:
                 entry.update({
                     "person_id": None, "name": "", "known": False,
                     "quality": "low", "reason": REASON_LOW_QUALITY,
                 })
                 results.append(entry)
                 continue
-            embedding = engine.analyzer.embed(face.aligned)
+            embedding = face.embedding
             person_id, score = engine.db.match(
                 embedding, gates["match_threshold"]
             )

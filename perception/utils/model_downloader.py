@@ -636,12 +636,27 @@ FACE_MODEL_FILES = {
 }
 
 
-def ensure_face_model(model_dir: str) -> dict[str, str]:
-    """Ensure the face detection + recognition ONNX pair is present."""
+FACE_MODEL_BUNDLES = {
+    "face": (FACE_MODEL_BASE, FACE_MODEL_FILES),
+}
+
+
+def ensure_face_model(model_dir: str, bundle: str = "face") -> dict[str, str]:
+    """Ensure a face detection + recognition ONNX pair is present.
+
+    `bundle` selects which pinned set to fetch, so a second model added to
+    `plugins/face_runtime.FACE_MODELS` brings its own sizes and hashes rather than
+    reusing these. One entry today; the parameter exists so adding the second does not
+    have to touch the call site.
+    """
+    spec = FACE_MODEL_BUNDLES.get(bundle)
+    if spec is None:
+        raise ValueError(
+            f"unknown face model bundle {bundle!r}; this build has "
+            f"{sorted(FACE_MODEL_BUNDLES)}")
+    base, files = spec
     model_dir = require_models_subpath(model_dir)
-    return ensure_verified_bundle(
-        "face", model_dir, FACE_MODEL_BASE, FACE_MODEL_FILES
-    )
+    return ensure_verified_bundle(bundle, model_dir, base, files)
 
 
 def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:

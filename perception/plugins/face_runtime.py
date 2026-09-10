@@ -71,6 +71,36 @@ log = logging.getLogger(__name__)
 
 DEFAULT_FACE_MODEL_DIR = "/models/face/buffalo_sc"
 
+# Which model pair to run. One entry today; the point of the registry is that adding a
+# second is a table row rather than a hunt through the file for hardcoded names, and
+# that the card can offer the choice.
+#
+# What a new entry has to supply: the detector must emit **nine** outputs — score, bbox
+# and five keypoints per stride — because ArcFace alignment needs the landmarks and
+# `plugins/scrfd_decode.py` decodes exactly that shape. A detector without keypoints
+# cannot be used here at all, which is asserted at load time rather than discovered as
+# bad embeddings. The recogniser must take 112x112 and return 512 dimensions, since the
+# stored samples and every existing FaceDB row are that.
+#
+# Changing the model invalidates the database: embeddings from different networks are
+# not comparable, and matching across them would silently confuse identities. The
+# plugin's engine signature includes the model, so a change reloads — but the samples
+# already stored do **not** get re-embedded, which is why this is a deploy-time choice
+# rather than something to flip on a running robot with a populated roster.
+FACE_MODELS = {
+    # insightface v0.7 buffalo_sc: SCRFD-500M-BNKPS + ArcFace MobileFaceNet
+    # (Glint360K). 2.5 MB + 13 MB, which is what makes cpu at one detection per
+    # second the design point.
+    "buffalo_sc": {
+        "dir": "/models/face/buffalo_sc",
+        "det": "det_500m.onnx",
+        "rec": "w600k_mbf.onnx",
+        "bundle": "face",
+        "description": "SCRFD-500M + ArcFace MobileFaceNet, 512-d",
+    },
+}
+DEFAULT_FACE_MODEL = "buffalo_sc"
+
 DET_MODEL_FILE = "det_500m.onnx"
 REC_MODEL_FILE = "w600k_mbf.onnx"
 
@@ -213,11 +243,14 @@ class FaceAnalyzer:
         self,
         model_dir: str = DEFAULT_FACE_MODEL_DIR,
         device: str = "auto",
+        model: str = DEFAULT_FACE_MODEL,
         det_size: tuple[int, int] = DEFAULT_DET_SIZE,
         det_thresh: float = DEFAULT_DET_THRESH,
         nms_thresh: float = DEFAULT_NMS_THRESH,
         num_threads: int = 2,
         warmup: bool = True,
+        providers=None,
+        in_process: bool = False,
     ):
         if ort is None:
             raise RuntimeError(
@@ -235,14 +268,36 @@ class FaceAnalyzer:
         # the reshape below would fail with an opaque numpy error.
         self._det_size = (width - width % 32 or 32, height - height % 32 or 32)
 
-        paths = ensure_face_model(model_dir)
-        det_path = paths.get(DET_MODEL_FILE) or os.path.join(model_dir, DET_MODEL_FILE)
-        rec_path = paths.get(REC_MODEL_FILE) or os.path.join(model_dir, REC_MODEL_FILE)
+        spec = FACE_MODELS.get(model)
+        if spec is None:
+            raise ValueError(
+                f"unknown face model {model!r}; this build has "
+                f"{sorted(FACE_MODELS)}. Adding one is a row in FACE_MODELS, but read "
+                "the note there first: the detector must emit nine outputs and the "
+                "recogniser must be 112x112 -> 512-d, and switching models invalidates "
+                "the stored embeddings."
+            )
+        self._model = model
+        det_name, rec_name = spec["det"], spec["rec"]
+        # An explicitly configured model_dir wins, so an operator can point at a local
+        # copy; otherwise the registry's own directory is used.
+        if model_dir == DEFAULT_FACE_MODEL_DIR:
+            model_dir = spec["dir"]
 
-        providers = ort_providers_for_device(self._requested_device)
-        # `device` resolves here, not in config: `auto` means "gpu when the
-        # installed wheel has one". Recorded so info/logs report what is
-        # actually running rather than what was asked for.
+        paths = ensure_face_model(model_dir, bundle=spec.get("bundle", "face"))
+        det_path = paths.get(det_name) or os.path.join(model_dir, det_name)
+        rec_path = paths.get(rec_name) or os.path.join(model_dir, rec_name)
+
+        # Providers are resolved by whoever built this — the parent, before it decides
+        # whether there is room — and passed in. Resolving them here would mean asking
+        # the standalone onnxruntime what it offers, in a process that may be the
+        # perception one, which is a question with a side effect: it maps the provider
+        # bridge. Falls back to resolving locally when nobody passed any, which is the
+        # in-child default path.
+        if providers is None:
+            providers = ort_providers_for_device(self._requested_device)
+        providers = list(providers)
+        # `device` reports what is actually running rather than what was asked for.
         self._device = "gpu" if providers[0] != "CPUExecutionProvider" else "cpu"
         # Session creation is where a parked-core Jetson abort()s under a bad
         # ORT version, and an abort prints no Python traceback. Say the
@@ -256,37 +311,40 @@ class FaceAnalyzer:
         # read-only for /models; let ORT keep its optimised graph in memory.
         options.log_severity_level = 3
 
-        # Both sessions go into plugins/ort_worker.py's child process, because the
-        # standalone ONNX Runtime and sherpa-onnx's bundled one corrupt each other's
-        # sessions through a shared provider bridge whenever both are in one process —
-        # an exception on jp6.1, a SIGSEGV that kills all of perception on jp5.11, and
-        # with face's session built first, sherpa's Kokoro engine cannot be constructed
-        # at all. That module's docstring has the mechanism and the measurements.
-        #
-        # `_open_session` keeps this to one branch rather than two code paths: the
-        # proxy answers get_inputs/get_outputs/get_providers from the load reply, so
-        # everything below is unchanged either way.
-        self._session_keys = []
-        self._det = self._open_session("face.det", det_path, providers, options,
-                                       num_threads)
-        self._rec = self._open_session("face.rec", rec_path, providers, options,
-                                       num_threads)
+        # Created here, and "here" decides everything: this class runs either inside
+        # plugins/ort_worker.py's child — where it is the only ONNX Runtime and a
+        # session is exactly right — or in the perception process, where sherpa's
+        # runtime is already loaded and a CUDA session corrupts it. Callers in the
+        # perception process must go through plugins/face_proxy.py; `in_process` is the
+        # switch, and it defaults to False so nothing gets it by accident.
+        if not in_process:
+            raise RuntimeError(
+                "FaceAnalyzer creates an ONNX Runtime session, which must not happen "
+                "in the perception process: sherpa-onnx's runtime is already there and "
+                "the two corrupt each other (an exception on jp6.1, a SIGSEGV that "
+                "kills all of perception on jp5.11). Use plugins/face_proxy."
+                "FaceServiceProxy, which runs this in the ORT worker child. "
+                "See plugins/ort_worker.py."
+            )
+
+        self._det = ort.InferenceSession(det_path, options, providers=providers)
+        self._rec = ort.InferenceSession(rec_path, options, providers=providers)
         self._det_input = self._det.get_inputs()[0].name
         self._rec_input = self._rec.get_inputs()[0].name
         self._det_outputs = [output.name for output in self._det.get_outputs()]
 
         if len(self._det_outputs) != len(_FEAT_STRIDES) * 3:
             raise RuntimeError(
-                f"{DET_MODEL_FILE} has {len(self._det_outputs)} outputs; this "
+                f"{det_name} has {len(self._det_outputs)} outputs; this "
                 f"decoder expects {len(_FEAT_STRIDES) * 3} (3 strides x "
                 "score/bbox/kps). A detector without keypoints cannot be "
                 "aligned for recognition."
             )
 
         log.info(
-            "[face] analyzer ready: onnxruntime=%s device=%s (requested %s) "
-            "providers=%s det=%s rec=%s size=%s",
-            ort.__version__, self._device, self._requested_device,
+            "[face] analyzer ready: onnxruntime=%s model=%s device=%s "
+            "(requested %s) providers=%s det=%s rec=%s size=%s",
+            ort.__version__, model, self._device, self._requested_device,
             self._det.get_providers(),
             os.path.basename(det_path), os.path.basename(rec_path),
             self._det_size,
@@ -294,44 +352,6 @@ class FaceAnalyzer:
 
         if warmup:
             self._warmup()
-
-    def _open_session(self, key: str, model_path: str, providers, options,
-                      num_threads: int):
-        """One session, in the ORT worker child unless it has been turned off.
-
-        Falls back to an in-process session if the child cannot be reached, and says so
-        loudly: that is the configuration where sherpa's runtime and this one collide,
-        so it is degraded rather than equivalent. Face itself survives the collision —
-        its graph has none of the fused squeeze outputs Kokoro's has — so the fallback
-        keeps face working and puts the *Kokoro engine* at risk instead. That is the
-        lesser harm, and worth a warning either way.
-        """
-        from plugins import ort_worker
-
-        if ort_worker.worker_enabled():
-            try:
-                # Only the detector gets a post-processor: its head is 0.96 MiB of
-                # candidates before thresholding and a few hundred bytes after. The
-                # recogniser already returns a 2 kB embedding, so there is nothing to
-                # reduce and nothing to couple.
-                postprocess = ({"module": "plugins.scrfd_decode", "func": "decode"}
-                               if key == "face.det" else None)
-                session = ort_worker.get_worker().load(
-                    key, model_path, providers,
-                    {"intra_op_num_threads": max(1, int(num_threads)),
-                     "graph_optimization_level": "ORT_ENABLE_ALL",
-                     "log_severity_level": 3},
-                    postprocess=postprocess,
-                )
-                self._session_keys.append(key)
-                return session
-            except Exception as exc:                              # noqa: BLE001
-                log.warning(
-                    "[face] the ORT worker could not load %s (%s); falling back to an "
-                    "in-process session. sherpa-onnx and this runtime then share one "
-                    "provider bridge, which breaks whichever builds a CUDA session "
-                    "second — see plugins/ort_worker.py", key, exc)
-        return ort.InferenceSession(model_path, options, providers=providers)
 
     # ── properties ────────────────────────────────────────────────────────
 
@@ -488,20 +508,9 @@ class FaceAnalyzer:
         blob = (blob - 127.5) / 128.0
         blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
 
-        if self._session_keys:
-            # The session is in the worker; decode there, so the 16 800 candidates
-            # never cross. `post_kwargs` carry what changes per frame.
-            boxes, keypoints, scores = self._det.run(
-                self._det_outputs, {self._det_input: blob},
-                post_kwargs={"input_h": input_h, "input_w": input_w, "scale": scale,
-                             "det_thresh": self._det_thresh,
-                             "nms_thresh": self._nms_thresh})
-        else:
-            outputs = self._det.run(self._det_outputs, {self._det_input: blob})
-            boxes, keypoints, scores = scrfd_decode.decode(
-                outputs, input_h, input_w, scale,
-                self._det_thresh, self._nms_thresh)
-
+        outputs = self._det.run(self._det_outputs, {self._det_input: blob})
+        boxes, keypoints, scores = scrfd_decode.decode(
+            outputs, input_h, input_w, scale, self._det_thresh, self._nms_thresh)
         if scores.size == 0:
             return []
         keep = range(len(scores))
@@ -574,25 +583,13 @@ class FaceAnalyzer:
         return faces
 
     def close(self) -> None:
-        """Drop the sessions. Called via `_close_quietly` on config changes.
+        """Drop the sessions.
 
-        Dropping the reference is enough for an in-process session, but not for one
-        living in the ORT worker: a child does not notice its parent's garbage
-        collector, so the session would stay resident — 13 MB of weights and its share
-        of the GPU pool — for the life of the process. Unload it explicitly, and keep
-        the child alive for whatever else it holds.
+        Inside the worker child this is all that is needed: the child's own exit, or
+        `ort_worker`'s `drop`, is what actually returns the CUDA context.
         """
-        for key in getattr(self, "_session_keys", ()):
-            try:
-                from plugins import ort_worker
-                ort_worker.get_worker().unload(key)
-            except Exception as exc:                              # noqa: BLE001
-                log.warning("[face] could not unload %s from the ORT worker: %s",
-                            key, exc)
-        self._session_keys = []
         self._det = None
         self._rec = None
-
 
 __all__ = [
     "DEFAULT_BLUR_MIN",

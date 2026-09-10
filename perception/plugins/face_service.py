@@ -68,13 +68,18 @@ class FaceService:
                  max_image_pixels: float = 60e6, warmup: bool = True):
         from plugins.face_runtime import FaceAnalyzer
 
+        # The decode limits are per-call on decode_image, not analyzer state, so they
+        # are held here and passed through. They are not cosmetic: max_side bounds the
+        # letterbox downscale and max_pixels is the decompression-bomb guard.
+        self._max_side = int(max_image_side)
+        self._max_pixels = int(max_image_pixels)
+
         # in_process=True is correct *here*: this is the isolated process, so a session
-        # created in it is exactly what the design wants. The flag exists so that the
-        # same class does not create one in the perception process by accident.
+        # created in it is exactly what the design wants. The flag exists so the same
+        # class refuses to create one in the perception process by accident.
         self._analyzer = FaceAnalyzer(
             model_dir=model_dir, providers=providers, num_threads=num_threads,
             det_size=det_size, det_thresh=det_thresh, nms_thresh=nms_thresh,
-            max_image_side=max_image_side, max_image_pixels=max_image_pixels,
             warmup=warmup, in_process=True,
         )
         log.info("face service ready: device=%s providers=%s",
@@ -106,7 +111,9 @@ class FaceService:
         `embed_all` overrides the gate for the identify/register paths that want an
         embedding even for a marginal face.
         """
-        image = self._analyzer.decode_image(image_bytes)
+        image = self._analyzer.decode_image(
+            image_bytes, max_side=self._max_side,
+            max_pixels=self._max_pixels)
         if image is None:
             return {"width": 0, "height": 0, "faces": [], "decoded": False}
 
