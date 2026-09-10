@@ -177,6 +177,7 @@ TOOLS = [
             "x-resource": "mouth",
             "x-hooks": {
                 "on_interrupt_speak": {"action": "interrupt"},
+                "on_notify": {"action": "speak"},
             }
         },
         "configSchema": {
