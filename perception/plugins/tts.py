@@ -1154,17 +1154,28 @@ class KokoroTTSAdapter(TTSAdapter):
                         "normalisation", text)
             return
 
+        # Chunk-by-chunk, not synthesize()+concatenate: an utterance past the
+        # 510-token style-table limit is split into several ONNX calls
+        # (kokoro_direct.chunk_ids), and waiting for every one of them before
+        # yielding anything meant a long sentence sat in silence for as long as
+        # it took to compute all of it — ~0.5s of that is the model's own RTF at
+        # 1x realtime on CPU, so a 26s utterance measured 25s of dead air before
+        # the first frame. Streaming lets chunk 1 start playing while chunk 2 is
+        # still being computed, same as sherpa's per-segment pipelining above.
+        produced_any = False
         with self._lock:
-            samples = self._direct().synthesize(
-                phonemes, speaker_id=self._sid, speed=self._speed)
+            for samples in self._direct().synthesize_stream(
+                    phonemes, speaker_id=self._sid, speed=self._speed):
+                if samples.size == 0:
+                    continue
+                produced_any = True
+                pcm = downsample_24k_to_16k(samples)
+                for i in range(0, len(pcm), CHUNK_BYTES):
+                    yield pcm[i:i + CHUNK_BYTES]
 
-        if samples.size == 0:
+        if not produced_any:
             log.warning("[tts] kokoro_direct produced no audio for %r (%r)",
                         text, phonemes)
-            return
-        pcm = downsample_24k_to_16k(samples)
-        for i in range(0, len(pcm), CHUNK_BYTES):
-            yield pcm[i:i + CHUNK_BYTES]
 
     def set_speed(self, speed: float) -> None:
         # Applied per generate() call, so nothing reloads — same as the other two.

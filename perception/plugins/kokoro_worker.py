@@ -408,10 +408,28 @@ class KokoroWorkerProxy:
     # ── the one call ─────────────────────────────────────────────────────────
 
     def synthesize(self, phonemes: str, speaker_id: int = 0, speed: float = 1.0):
+        pieces = list(self.synthesize_stream(phonemes, speaker_id, speed))
+        if not pieces:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+
+    def synthesize_stream(self, phonemes: str, speaker_id: int = 0, speed: float = 1.0):
+        """Like `synthesize`, but yields each chunk as `KokoroDirect` computes it.
+
+        Falls back to the in-process CPU session on the same conditions
+        `synthesize` used to, but only up to the first chunk: once a chunk from
+        the worker has already reached the caller, restarting on the fallback
+        would either replay it (an audible repeat) or skip it (a dropped chunk).
+        A failure after that point is left to surface like any other
+        mid-utterance synthesis failure — the caller already plays whatever
+        arrived before the error.
+        """
         with self._lock:
             self._last_used = time.monotonic()
             if self._closed:
-                return self._use_fallback().synthesize(phonemes, speaker_id, speed)
+                yield from self._use_fallback().synthesize_stream(
+                    phonemes, speaker_id, speed)
+                return
             if self._direct is None:
                 try:
                     self._build()
@@ -423,15 +441,23 @@ class KokoroWorkerProxy:
                     log.warning("[tts] kokoro session could not be rebuilt (%s); "
                                 "Japanese falls back to the in-process CPU session",
                                 exc)
-                    return self._use_fallback().synthesize(phonemes, speaker_id, speed)
+                    yield from self._use_fallback().synthesize_stream(
+                        phonemes, speaker_id, speed)
+                    return
+            started = False
             try:
-                return self._direct.synthesize(phonemes, speaker_id=speaker_id,
-                                               speed=speed)
+                for chunk in self._direct.synthesize_stream(
+                        phonemes, speaker_id=speaker_id, speed=speed):
+                    started = True
+                    yield chunk
             except Exception as exc:                              # noqa: BLE001
+                if started:
+                    raise
                 log.warning("[tts] kokoro synthesis in the worker failed (%s); "
                             "falling back to the in-process CPU session", exc)
                 self._direct = None
-                return self._use_fallback().synthesize(phonemes, speaker_id, speed)
+                yield from self._use_fallback().synthesize_stream(
+                    phonemes, speaker_id, speed)
 
     def _use_fallback(self):
         """The in-process CPU session — what shipped before any of this existed."""

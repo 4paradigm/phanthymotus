@@ -184,20 +184,39 @@ class KokoroDirect:
         longer than 510 tokens is synthesized in chunks and concatenated, because
         sherpa's equivalent calls SHERPA_ONNX_EXIT(-1) at that boundary and losing a
         long sentence is worse than a seam in it.
+
+        Callers that can consume audio as it is produced should use
+        `synthesize_stream` instead — this just drains it and concatenates, which is
+        exactly the "wait for the whole utterance" cost that made a long sentence on
+        CPU (RTF ~0.52) sit in silence for as long as it took to compute all of it.
+        """
+        pieces = list(self.synthesize_stream(phonemes, speaker_id, speed))
+        if not pieces:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+
+    def synthesize_stream(self, phonemes: str, speaker_id: int = 0, speed: float = 1.0):
+        """Like `synthesize`, but yields each chunk's audio as it is computed.
+
+        Kokoro is not autoregressive, so a single chunk's `_run` cannot itself be
+        streamed — one ONNX call computes that chunk's whole waveform in one shot.
+        The win here is for an utterance that `chunk_ids` splits into more than one
+        chunk (over 510 tokens): the caller can start playing chunk 1 while this
+        generator is still computing chunk 2, instead of waiting for every chunk and
+        the final `np.concatenate` before anything is audible.
         """
         ids, unknown = self.encode(phonemes)
         if unknown:
             log.warning("[tts] kokoro_direct: %d phoneme(s) not in the vocabulary "
                         "and skipped: %s", len(unknown), "".join(sorted(set(unknown))))
         if not ids:
-            return np.zeros(0, dtype=np.float32)
+            return
         if not 0 <= speaker_id < self._n_speakers:
             raise ValueError(
                 f"speaker_id must be 0..{self._n_speakers - 1}, got {speaker_id}")
 
-        pieces = [self._run(chunk, speaker_id, speed)
-                  for chunk in chunk_ids(ids, STYLE_LENGTHS - 1, self._break_ids)]
-        return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+        for chunk in chunk_ids(ids, STYLE_LENGTHS - 1, self._break_ids):
+            yield self._run(chunk, speaker_id, speed)
 
     def _run(self, ids, speaker_id: int, speed: float):
         # A leading and trailing 0, and the style row is chosen by the *inner* count —
