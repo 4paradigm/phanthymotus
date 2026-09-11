@@ -30,7 +30,6 @@ os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
 import mcp_client  # noqa: E402
 import collector  # noqa: E402
 from event.llm import (  # noqa: E402
-    _abort_pending_for_barge_in,
     _acp_barrier,
     _acp_barrier_log,
     _sys_tool_needs_barrier,
@@ -106,11 +105,12 @@ def test_other_system_tools_are_not_gated(name):
 
 # ── the barrier itself ───────────────────────────────────────────────────────
 #
-# finish's real call site passes barge_in=True, so these exercise that path.
+# finish's real call site is now just `_acp_barrier(name, cancel_event)` — the
+# barrier takes no barge-in options at all. Only an explicit interrupt
+# (cancel_event) cuts a wait short; see _acp_barrier's docstring.
 
-def _finish_barrier(cancel_event=None, interrupt_fallback=None):
-    return _acp_barrier('finish', cancel_event, barge_in=True,
-                        interrupt_fallback=interrupt_fallback)
+def _finish_barrier(cancel_event=None):
+    return _acp_barrier('finish', cancel_event)
 
 
 def test_no_pending_does_not_block():
@@ -141,8 +141,12 @@ def test_finish_waits_until_playback_completes():
     assert not mcp_client._pending_actions, 'pending table must be cleared'
 
 
-def test_barge_in_cancels_the_wait():
-    """"别说了" must still cut through — the wait honours cancel_event."""
+def test_explicit_interrupt_cancels_the_wait():
+    """"别说了" must still cut through — the wait honours cancel_event.
+
+    This is the *only* way to stop playback now. cancel_event is set by the
+    interrupt/followup collector modes and by the interrupt tool; nothing else.
+    """
     async def scenario():
         _arm()
         cancel = asyncio.Event()
@@ -159,29 +163,22 @@ def test_barge_in_cancels_the_wait():
     assert not mcp_client._pending_actions
 
 
-def test_barge_in_leaves_no_task_pending():
-    """The barge-in path must reap the tasks it cancels, not just request it.
+def test_interrupt_leaves_no_task_pending():
+    """The wait must reap whatever it abandons, not merely request cancellation.
 
-    `Task.cancel()` only schedules the CancelledError. `_acp_barrier` cancels its
-    `await_pending` task the moment a steering message wins the race, and
-    `await_pending` had no cleanup of its own for that case — so CancelledError
-    propagated straight out of it and left its two inner tasks orphaned. Every
-    barge-in on R1 logged:
-
-        Task was destroyed but it is pending!
-        task: <Task pending ... coro=<Event.wait() ...>>
-        task: <Task pending ... coro=<await_pending.<locals>._wait_all() ...>>
-
-    Note this needs the *steering* path, not `cancel_event`: with cancel_event set
-    `await_pending` returns 'cancelled' under its own control and cleans up on the
-    way out.
+    `Task.cancel()` only schedules the CancelledError. This used to be a race
+    between the barrier and a steering watcher, and cancelling the loser orphaned
+    `await_pending`'s two inner tasks on every barge-in — R1 logged
+    `Task was destroyed but it is pending!` each time. The steering watcher is
+    gone; this keeps the leak assertion on the surviving abort path.
     """
     async def scenario():
         _arm(timeout=30.0)
-        barrier = asyncio.create_task(_finish_barrier())
+        cancel = asyncio.Event()
+        barrier = asyncio.create_task(_finish_barrier(cancel))
 
         await asyncio.sleep(0.05)
-        collector._steering_queue.put_nowait({'source': 'asr', 'text': '别说了'})
+        cancel.set()
         result = await asyncio.wait_for(barrier, timeout=2)
         # all_tasks() is the set of *unfinished* tasks, so anything left here
         # besides this coroutine is a task the barrier abandoned mid-cancel.
@@ -189,7 +186,7 @@ def test_barge_in_leaves_no_task_pending():
         return result, sorted(t.get_coro().__qualname__ for t in leaked)
 
     result, leaked = asyncio.run(scenario())
-    assert result['status'] == 'barge_in'
+    assert result['status'] == 'cancelled'
     assert leaked == [], f'barrier abandoned cancelled tasks: {leaked}'
 
 
@@ -256,89 +253,126 @@ def test_barrier_uses_the_longest_pending_timeout():
     assert asyncio.run(scenario())['status'] == 'completed'
 
 
-# ── barge-in during the finish barrier ───────────────────────────────────────
+# ── steering must NOT cut playback short ─────────────────────────────────────
 #
-# The default interrupt_mode is "steer" (collector.py:44), which parks a user
-# message in _steering_queue and does NOT set cancel_event. finish's `break`
-# (llm.py:1367) is ahead of the steering drain (llm.py:1377), so nothing in the
-# turn will ever consume it. Without this wake-up the barrier makes the user wait
-# out the whole narration — the very thing the barrier was added to protect.
+# There used to be a barge-in here: the finish barrier raced `await_pending`
+# against a watcher on `_steering_queue`, so any queued P>0 event aborted the
+# audio. Two measurements on Orin5 killed it.
+#
+#   17:01:48  registered pending: speak-42c1c65c (tts, 171s)   # 英伟达汇报
+#   17:02:29  barrier barge_in before finish                   # 41s in, cut
+#   17:02:29  received [URGENT] source=subagent:7ff3018a       # a *subagent* finishing
+#
+# Filtering to human sources only moved the problem: typing the next question in
+# the web console then cut the previous briefing off mid-sentence. On this path
+# "sent a message" and "asked it to stop" are indistinguishable — and the
+# architecture already has an explicit entry point for the latter.
+#
+# So: messages queue. `set_busy(False)` → `_flush_all_pending()` turns them into
+# the next turn's trigger when the turn ends normally. Nothing is dropped; the
+# user waits out the current utterance.
 
-def test_steering_message_releases_the_barrier():
+def test_steering_message_does_not_release_the_barrier():
+    """The regression: a queued message must not abort playback."""
     async def scenario():
         _arm(timeout=30.0)
         barrier = asyncio.create_task(_finish_barrier())
 
         await asyncio.sleep(0.05)
-        assert not barrier.done()
+        collector._steering_queue.put_nowait({'source': 'asr', 'text': '再帮我查个别的'})
+        await asyncio.sleep(0.3)
+        assert not barrier.done(), 'a new message cut the audio short'
 
-        collector._steering_queue.put_nowait({'source': 'asr', 'text': '别说了'})
-        return await asyncio.wait_for(barrier, timeout=2)
+        _complete()
+        return await asyncio.wait_for(barrier, timeout=1)
 
     result = asyncio.run(scenario())
-    assert result['status'] == 'barge_in'
+    assert result['status'] == 'completed'
     assert result['actions'] == [SPEAK_ID]
-    assert not mcp_client._pending_actions, 'barge-in must clear pending too'
+
+
+def test_subagent_notification_does_not_release_the_barrier():
+    """The Orin5 case: a background task finishing cut off the previous report."""
+    async def scenario():
+        _arm(timeout=30.0)
+        barrier = asyncio.create_task(_finish_barrier())
+
+        await asyncio.sleep(0.05)
+        collector._steering_queue.put_nowait(
+            {'source': 'subagent:7ff3018a', 'text': '子代理 [7ff3018a] ✓ completed'})
+        await asyncio.sleep(0.3)
+        assert not barrier.done(), 'a subagent finishing cut the audio short'
+
+        _complete()
+        return await asyncio.wait_for(barrier, timeout=1)
+
+    assert asyncio.run(scenario())['status'] == 'completed'
 
 
 def test_steering_message_is_left_in_the_queue():
-    """The barrier only peeks. _flush_all_pending() turns it into the next
-    turn's trigger — draining it here would drop the user's message on the floor."""
+    """The barrier never touches the queue. `_flush_all_pending()` turns the
+    message into the next turn's trigger — draining it here would drop it."""
     async def scenario():
         _arm(timeout=30.0)
         barrier = asyncio.create_task(_finish_barrier())
         await asyncio.sleep(0.05)
-        collector._steering_queue.put_nowait({'source': 'asr', 'text': '别说了'})
-        await asyncio.wait_for(barrier, timeout=2)
+        collector._steering_queue.put_nowait({'source': 'asr', 'text': 'hi'})
+        _complete()
+        await asyncio.wait_for(barrier, timeout=1)
 
     asyncio.run(scenario())
     assert collector._steering_queue.qsize() == 1
 
 
-def test_barge_in_falls_back_when_no_hook_is_bound():
-    """No on_interrupt_all binding → the hardcoded tts/loco lookup must still run,
-    otherwise barge-in clears pending but leaves the audio playing."""
-    called = []
-
-    async def _fallback():
-        called.append(True)
-
-    async def scenario():
-        _arm(timeout=30.0)
-        barrier = asyncio.create_task(_finish_barrier(interrupt_fallback=_fallback))
-        await asyncio.sleep(0.05)
-        collector._steering_queue.put_nowait({'source': 'asr', 'text': '停'})
-        return await asyncio.wait_for(barrier, timeout=2)
-
-    assert asyncio.run(scenario())['status'] == 'barge_in'
-    assert called == [True]
-
-
-def test_deferred_priority_events_also_release_the_barrier():
-    """`_priority_pending` holds bot-channel and queue-full events — same story."""
+def test_deferred_priority_events_do_not_release_the_barrier():
+    """`_priority_pending` holds bot-channel and queue-full events — same rule."""
     async def scenario():
         _arm(timeout=30.0)
         barrier = asyncio.create_task(_finish_barrier())
         await asyncio.sleep(0.05)
         collector._priority_pending.append({'source': 'channel', 'text': 'hi'})
-        return await asyncio.wait_for(barrier, timeout=2)
+        await asyncio.sleep(0.3)
+        assert not barrier.done()
+        _complete()
+        return await asyncio.wait_for(barrier, timeout=1)
 
-    assert asyncio.run(scenario())['status'] == 'barge_in'
+    assert asyncio.run(scenario())['status'] == 'completed'
 
 
-def test_pre_existing_steering_short_circuits_immediately():
-    """A message that landed before finish must not wait a poll interval either."""
+def test_pre_existing_steering_does_not_short_circuit():
+    """A message that landed before finish must not abort the audio either."""
     async def scenario():
         _arm(timeout=30.0)
         collector._steering_queue.put_nowait({'source': 'asr', 'text': '停'})
-        return await asyncio.wait_for(_finish_barrier(), timeout=1)
+        barrier = asyncio.create_task(_finish_barrier())
+        await asyncio.sleep(0.3)
+        assert not barrier.done()
+        _complete()
+        return await asyncio.wait_for(barrier, timeout=1)
 
-    assert asyncio.run(scenario())['status'] == 'barge_in'
+    assert asyncio.run(scenario())['status'] == 'completed'
+
+
+def test_interrupt_still_wins_over_a_queued_message():
+    """Queued messages wait; an explicit interrupt does not."""
+    async def scenario():
+        _arm(timeout=30.0)
+        cancel = asyncio.Event()
+        barrier = asyncio.create_task(_finish_barrier(cancel))
+        await asyncio.sleep(0.05)
+        collector._steering_queue.put_nowait({'source': 'asr', 'text': 'hi'})
+        await asyncio.sleep(0.2)
+        assert not barrier.done()
+
+        cancel.set()
+        return await asyncio.wait_for(barrier, timeout=1)
+
+    assert asyncio.run(scenario())['status'] == 'cancelled'
 
 
 def test_mid_turn_mcp_barrier_ignores_steering():
-    """barge_in defaults to False: mid-turn steering is injected into the current
-    turn (llm.py:1377), not treated as an abort signal. Only finish opts in."""
+    """Unchanged: mid-turn steering is injected into the current turn
+    (llm.py's drain after the tool batch), never treated as an abort signal."""
     async def scenario():
         _arm(timeout=30.0)
         barrier = asyncio.create_task(_acp_barrier('mcp__x__navigate', None))
@@ -351,21 +385,6 @@ def test_mid_turn_mcp_barrier_ignores_steering():
         return await asyncio.wait_for(barrier, timeout=1)
 
     assert asyncio.run(scenario())['status'] == 'completed'
-
-
-def test_abort_clears_every_pending_table():
-    """A leftover in _pending_timeouts would inflate the next barrier's
-    effective_timeout (mcp_client.py:610, max over all pending)."""
-    async def scenario():
-        _arm('speak-a', timeout=30.0)
-        _arm('speak-b', timeout=40.0)
-        return await _abort_pending_for_barge_in()
-
-    result = asyncio.run(scenario())
-    assert sorted(result['actions']) == ['speak-a', 'speak-b']
-    for d in (mcp_client._pending_actions, mcp_client._pending_results,
-              mcp_client._pending_timeouts, mcp_client._pending_tools):
-        assert not d
 
 
 # ── attribution ──────────────────────────────────────────────────────────────

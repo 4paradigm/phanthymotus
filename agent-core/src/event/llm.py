@@ -263,8 +263,7 @@ def _sys_tool_needs_barrier(name: str) -> bool:
     return name in _ACP_BARRIER_SYSTEM_TOOLS
 
 
-async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
-                       interrupt_fallback=None,
+async def _acp_barrier(name: str, cancel_event, *,
                        want: frozenset | None = None,
                        scoped: bool = False,
                        concurrent: bool = False,
@@ -275,80 +274,31 @@ async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
     `scoped=False` 等全部。系统工具走全局：`finish` 结束 turn 前不该有任何动作在飞，
     `peer_delegate` / `subagent_spawn` 把活交给另一个执行者、无法预知对方会碰什么。
 
-    `barge_in=True` 时，等待还会被新的用户消息唤醒。这条路只给 finish 用，因为
-    只有 finish 的 barrier 会横跨整段播放：`cancel_event` 仅在 interrupt /
-    followup 模式下置位（collector.py 的 `_interrupt_mode` 分支），默认的 steer
-    模式把 busy 期间的用户消息塞进 steering_queue 就完事、不动 cancel_event，而
-    finish 检测在 steering drain（`:1377`）之前就 break 了 —— 队列里的消息在本轮
-    永远等不到消费，用户要一直等到讲解播完。唤醒后中止播放并放行，turn 正常结束，
-    消息由 `_flush_all_pending()` 转成下一轮的触发事件；这正是加 barrier 之前的打
-    断行为，只是不再依赖 "finish 提前返回" 这个副作用。
+    **只有显式 interrupt 能中止播放。** 这个 barrier 不会因为"来了新消息"就掐掉正在
+    播的音频：打断走 `cancel_event`（collector 的 interrupt / followup 模式置位，或
+    interrupt 工具），其余一律排队。steer 模式（默认）下 busy 期间的消息进 steering
+    队列，turn 播完正常结束时 `set_busy(False)` → `_flush_all_pending()` 把它转成下一
+    轮的触发事件 —— 用户多等一段播放，但不会丢。
 
-    turn 中段的 mcp 工具 barrier 不走 `barge_in` 这条：那里 steering 的语义是注入
-    当前 turn，不是中止 turn。但它们仍然可以传 `reconsider_event` ——比 `cancel_event`
-    窄得多的信号，只放弃"这次调用还没发出去、还在排队"的这一次等待，不影响正在
-    排的东西本身，也不结束 turn（见 `mcp_client.await_pending` 的 docstring）。
+    finish 的 barrier 以前额外被 steering 队列唤醒（barge_in），本意是"用户开口就停"。
+    实际上队列里什么都算数：Orin5 上一个后台 subagent 跑完的完成通知掐掉了主 agent
+    正在播的上一份汇报；改成只认人发的消息之后，用户在网页里打下一个问题同样会把上
+    一份汇报冲掉 —— 因为在这条路上"发消息"和"要求停止"根本无法区分。既然架构里已经
+    有 interrupt 这个显式入口，隐式打断整条去掉。
+
+    `reconsider_event` 不受影响：它比 `cancel_event` 窄得多，只放弃"这次调用还没发出
+    去、还在排队"的这一次等待，不动正在排的东西，也不结束 turn、不掐音频
+    （见 `mcp_client.await_pending` 的 docstring）。
     """
     if not mcp_client.get_pending_actions():
         return None
 
-    if not barge_in:
-        result = await mcp_client.await_pending(cancel_event, timeout=120,
-                                               want=want, scoped=scoped,
-                                               concurrent=concurrent,
-                                               reconsider_event=reconsider_event)
-        _acp_barrier_log(name, result)
-        return result
-
-    barrier = asyncio.create_task(mcp_client.await_pending(cancel_event, timeout=120,
-                                                          want=want, scoped=scoped,
-                                                          concurrent=concurrent))
-    steering = asyncio.create_task(_wait_for_steering())
-    try:
-        done, _ = await asyncio.wait(
-            [barrier, steering], return_when=asyncio.FIRST_COMPLETED)
-        if barrier in done:
-            result = barrier.result()
-        else:
-            result = await _abort_pending_for_barge_in(interrupt_fallback)
-    finally:
-        # Reap, don't just request: cancel() alone leaves these pending until the
-        # loop resumes them, and dropping the reference here is what orphaned
-        # await_pending's inner tasks on every barge-in.
-        await mcp_client.cancel_and_reap((barrier, steering))
+    result = await mcp_client.await_pending(cancel_event, timeout=120,
+                                           want=want, scoped=scoped,
+                                           concurrent=concurrent,
+                                           reconsider_event=reconsider_event)
     _acp_barrier_log(name, result)
     return result
-
-
-async def _wait_for_steering(poll_s: float = _STEERING_POLL_S) -> None:
-    """轮询到队列里出现**人**发的消息为止。asyncio.Queue 没有 "非破坏性等待"，
-    而 drain_steering() 会把消息取走 —— 取走了本轮 finish 之后就没人再放回去。
-
-    判据是 `has_barge_in_steering()` 而不是 `has_steering()`：这个 wakeup 的唯一后果
-    是 `_abort_pending_for_barge_in()` 掐掉正在播的音频，而机器自己发的通知没有掐掉
-    人类汇报的资格。用 has_steering() 时，一个后台 subagent 跑完就会打断主 agent 正在
-    播的上一份汇报（Orin5 实测，见 has_barge_in_steering 的 docstring）。
-
-    被过滤掉的通知不会丢：它留在队列里，turn 正常播完结束后由 `_flush_all_pending()`
-    转成下一轮的触发事件 —— 也就是"说完这句再报"，本来就是想要的顺序。
-    """
-    while not collector.has_barge_in_steering():
-        await asyncio.sleep(poll_s)
-
-
-async def _abort_pending_for_barge_in(interrupt_fallback=None) -> dict:
-    """用户在播放期间说话：停掉正在进行的输出，清 pending，放 finish 过去。
-
-    `interrupt_fallback` 是没有 on_interrupt_all 绑定时的兜底（硬编码找 tts/loco），
-    与 run_forever 的 TurnCancelled 路径共用同一套逻辑。
-    """
-    import hooks
-    actions = mcp_client.get_pending_actions()
-    fired = await hooks.fire('on_interrupt_all')
-    if not fired and interrupt_fallback is not None:
-        await interrupt_fallback()
-    mcp_client._forget_pending(actions, 'barge_in')
-    return {"status": "barge_in", "actions": actions}
 
 
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
@@ -1553,19 +1503,10 @@ class Event:
                     )
                 elif name in self._sys_tools:
                     # ACP barrier: finish 之前等音频播完（见 _ACP_BARRIER_SYSTEM_TOOLS）。
-                    # 等待期间用户开口要能立刻打断 —— 故 barge_in=True。
+                    # 只有显式 interrupt（cancel_event）能中止这段等待，新消息一律排队
+                    # 到下一轮 —— 详见 _acp_barrier 的 docstring。
                     if _sys_tool_needs_barrier(name):
-                        # barge_in 只给 finish。它的 barrier 横跨整段播放且之后就结束
-                        # 本轮，steering 队列在本轮永远等不到 drain，所以必须能被新的
-                        # 用户消息唤醒（详见 _acp_barrier 的 docstring）。
-                        # peer_delegate / subagent_spawn 在 turn 中段，steering 的语义是
-                        # 注入当前 turn（:1414 之后就会 drain），走 mcp 工具那条路即可 ——
-                        # 用 barge_in=True 会掐掉自己的音频却照样把活派出去。
-                        _bargeable = (name == 'finish')
-                        await _acp_barrier(
-                            name, cancel_event, barge_in=_bargeable,
-                            interrupt_fallback=(self._interrupt_active_outputs
-                                                if _bargeable else None))
+                        await _acp_barrier(name, cancel_event)
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 只等与本次调用资源冲突的 pending（见 _needs_barrier）
