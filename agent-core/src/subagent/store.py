@@ -19,6 +19,19 @@ from .protocol import (
 )
 
 
+def _placeholders(values) -> str:
+    """`?, ?, ?` sized to `values`.
+
+    Both status sets used to be spelled out as four literal `?` — which silently
+    encoded "there are exactly four statuses" into two SQL strings. Adding
+    STATUS_PARTIAL to TERMINAL_STATUSES made `cleanup_old` raise
+    `ProgrammingError: statement uses 5, and there are 6 supplied` on **startup**,
+    inside the lifespan hook: Agent Core refused to boot at all, and the traceback
+    named sqlite bindings rather than the status constant that had changed.
+    """
+    return ', '.join('?' * len(values))
+
+
 def _get_conn() -> sqlite3.Connection:
     db_path = pathlib.Path(config.DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,11 +102,12 @@ class SubagentStore:
 
     def load_active(self) -> list[dict]:
         """Load all non-terminal subagents for restore on startup."""
+        statuses = tuple(ACTIVE_STATUSES)
         with _get_conn() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                'SELECT * FROM subagents WHERE status IN (?, ?, ?, ?)',
-                tuple(ACTIVE_STATUSES),
+                f'SELECT * FROM subagents WHERE status IN ({_placeholders(statuses)})',
+                statuses,
             ).fetchall()
         results = []
         for row in rows:
@@ -118,10 +132,12 @@ class SubagentStore:
     def cleanup_old(self, max_age_hours: int = 24) -> int:
         """Remove completed/failed subagents older than max_age."""
         cutoff = time.time() - max_age_hours * 3600
+        statuses = tuple(TERMINAL_STATUSES)
         with _get_conn() as conn:
             cursor = conn.execute(
-                'DELETE FROM subagents WHERE status IN (?, ?, ?, ?) AND updated_at < ?',
-                (*TERMINAL_STATUSES, cutoff),
+                f'DELETE FROM subagents WHERE status IN ({_placeholders(statuses)}) '
+                'AND updated_at < ?',
+                (*statuses, cutoff),
             )
             conn.commit()
             return cursor.rowcount

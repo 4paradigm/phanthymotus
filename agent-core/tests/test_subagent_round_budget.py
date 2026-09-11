@@ -255,6 +255,36 @@ class TestStaleConfigRowIsMigrated(unittest.TestCase):
         self.assertEqual(sa['default_timeout_s'], 450)
 
 
+class TestStoreQueriesMatchTheStatusSets(unittest.TestCase):
+    """加一个状态常量不该让 Agent Core 起不来。
+
+    store.py 里两条 SQL 把"状态正好有四个"写死成了四个字面 `?`。给 TERMINAL_STATUSES
+    加上 STATUS_PARTIAL 之后，`cleanup_old` 在 **启动时**（lifespan 里 manager.start()）
+    抛 `ProgrammingError: statement uses 5, and there are 6 supplied`，Agent Core 直接
+    起不来 —— Orin5 上实测连撞三次重启。而且 traceback 指的是 sqlite 绑定数，不是那个
+    变了的状态常量。
+
+    这两条查询现在按集合大小生成占位符，这里钉住的就是"再加状态也不会炸"。
+    """
+
+    def setUp(self):
+        from subagent.store import SubagentStore
+        self.store = SubagentStore()
+
+    def test_cleanup_old_runs_with_the_current_terminal_set(self):
+        from subagent.protocol import TERMINAL_STATUSES
+        self.assertGreater(len(TERMINAL_STATUSES), 4, 'partial 没进终态集合')
+        self.store.cleanup_old(24)  # 炸就是回归
+
+    def test_load_active_runs_with_the_current_active_set(self):
+        self.assertIsInstance(self.store.load_active(), list)
+
+    def test_placeholders_track_the_set_size(self):
+        from subagent.store import _placeholders
+        self.assertEqual(_placeholders(('a', 'b', 'c')), '?, ?, ?')
+        self.assertEqual(_placeholders(('a',)), '?')
+
+
 class TestSpawnSyncSurfacesPartialOutput(unittest.TestCase):
     """`error or output` 把停下来的原因摆在答案前面，然后把答案整个丢了。"""
 
