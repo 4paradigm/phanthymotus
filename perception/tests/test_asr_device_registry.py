@@ -129,7 +129,7 @@ def test_device_schema_default_is_cpu():
 
 def test_asr_models_supporting():
     assert "sensevoice-small" in asr.asr_models_supporting("gpu")
-    assert "paraformer-zh-en" in asr.asr_models_supporting("gpu")
+    assert "parakeet-en" in asr.asr_models_supporting("gpu")
     # Measured 0.80x on CUDA — deliberately absent.
     assert "x-asr-zh-en" not in asr.asr_models_supporting("gpu")
     assert asr.asr_models_supporting("cpu") == sorted(asr.ASR_MODELS)
@@ -149,7 +149,7 @@ def test_model_dir_from_another_entry_is_ignored():
     """config.yaml ships a model_dir for one bundle; reusing it for a different
     model or device would download the wrong weights into it."""
     spec = asr.ASR_MODELS["sensevoice-small"]["devices"]["gpu"]
-    other = asr.ASR_MODELS["paraformer-zh-en"]["devices"]["cpu"]["dir"]
+    other = asr.ASR_MODELS["parakeet-en"]["devices"]["cpu"]["dir"]
     assert asr._model_dir_for({"model_dir": other}, spec) == spec["dir"]
 
 
@@ -220,6 +220,57 @@ def _plugin_with(monkeypatch, model, device):
     return plugin, loads
 
 
+# ── removed models ───────────────────────────────────────────────────────────
+#
+# paraformer-zh-en, paraformer-offline and zipformer-en were dropped for
+# accuracy. A card's `asr_model` lives in agent-core's config DB on each robot,
+# so the upgrade cannot rewrite it — without an alias, every deployment that had
+# picked one comes up `state: error` after the next restart.
+
+
+def test_every_removed_model_resolves_to_one_that_exists():
+    assert asr.REMOVED_ASR_MODELS, "the alias map must not be emptied"
+    for gone, replacement in asr.REMOVED_ASR_MODELS.items():
+        assert gone not in asr.ASR_MODELS, f"{gone} is still registered"
+        assert replacement in asr.ASR_MODELS, f"{gone} -> missing {replacement}"
+        assert asr.resolve_asr_model(gone) == replacement
+
+
+def test_a_live_model_name_passes_through_untouched():
+    for name in asr.ASR_MODELS:
+        assert asr.resolve_asr_model(name) == name
+
+
+def test_the_schema_enum_offers_exactly_the_registered_models():
+    enum = asr.TOOLS[0]["configSchema"]["properties"]["asr_model"]["enum"]
+    assert sorted(enum) == sorted(asr.ASR_MODELS)
+    # A removed name in the dropdown would let an operator re-pick it.
+    assert not set(enum) & set(asr.REMOVED_ASR_MODELS)
+
+
+def test_config_migrates_a_card_still_holding_a_removed_model(monkeypatch):
+    """The failure this guards: `state: error` on every upgraded robot."""
+    plugin, loads = _plugin_with(monkeypatch, "sensevoice-small", "cpu")
+
+    result = plugin.dispatch("asr", {"action": "config",
+                                     "asr_model": "zipformer-en"})
+
+    assert result["status"] != "error", result
+    assert plugin._asr_model == "parakeet-en"
+    assert loads == ["parakeet-en"]
+
+
+def test_an_unknown_model_is_still_an_error(monkeypatch):
+    """Resolving removed names must not turn every typo into a silent default."""
+    plugin, loads = _plugin_with(monkeypatch, "sensevoice-small", "cpu")
+
+    result = plugin.dispatch("asr", {"action": "config",
+                                     "asr_model": "whisper-large"})
+
+    assert result["status"] == "error"
+    assert loads == []
+
+
 def test_config_degrades_a_carried_over_device_instead_of_rejecting(monkeypatch):
     """Switching to a cpu-only model must not fail on a stale `device: gpu`.
 
@@ -228,17 +279,18 @@ def test_config_degrades_a_carried_over_device_instead_of_rejecting(monkeypatch)
     card running the previous model while the operator believed they had
     switched — seen on Orin5, where a parakeet-en request was rejected and the
     transcripts that followed were sensevoice-small's. (parakeet-en has gpu
-    weights now, so the cpu-only model under test here is zipformer-en.)
+    weights now, so the cpu-only model under test here is x-asr-zh-en — the
+    only one left after the paraformers and zipformer-en were dropped.)
     """
     plugin, loads = _plugin_with(monkeypatch, "sensevoice-small", "gpu")
 
     result = plugin.dispatch("asr", {"action": "config",
-                                     "asr_model": "zipformer-en", "device": "gpu"})
+                                     "asr_model": "x-asr-zh-en", "device": "gpu"})
 
     assert result["status"] != "error", result
     assert result["device"] == "cpu"
-    assert plugin._asr_model == "zipformer-en"
-    assert loads == ["zipformer-en"]
+    assert plugin._asr_model == "x-asr-zh-en"
+    assert loads == ["x-asr-zh-en"]
 
 
 def test_config_still_rejects_an_explicit_unsupported_device(monkeypatch):
@@ -247,10 +299,10 @@ def test_config_still_rejects_an_explicit_unsupported_device(monkeypatch):
     Degrading this one silently is how a "GPU is not faster" bug report gets
     written against a model that never ran on the GPU at all.
     """
-    plugin, loads = _plugin_with(monkeypatch, "zipformer-en", "cpu")
+    plugin, loads = _plugin_with(monkeypatch, "x-asr-zh-en", "cpu")
 
     result = plugin.dispatch("asr", {"action": "config",
-                                     "asr_model": "zipformer-en", "device": "gpu"})
+                                     "asr_model": "x-asr-zh-en", "device": "gpu"})
 
     assert result["status"] == "error"
     assert "gpu" in result["message"]

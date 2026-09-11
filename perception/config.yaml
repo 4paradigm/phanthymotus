@@ -17,13 +17,12 @@ plugins:
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
-    asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | parakeet-en | sensevoice-small
+    asr_model: sensevoice-small   # x-asr-zh-en | parakeet-en | sensevoice-small
     # cpu | gpu — which weights get loaded is per (model, device) in
     # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
     # jp5.11 only) and is only offered for models where it was benchmarked and
-    # the transcripts were read: sensevoice-small (fp16), paraformer-zh-en
-    # (fp32) and parakeet-en (fp32). Everything else is cpu-only — int8 weights
-    # are slower on CUDA, not
+    # the transcripts were read: sensevoice-small (fp16) and parakeet-en
+    # (fp32). x-asr-zh-en is cpu-only — its int8 weights are slower on CUDA, not
     # faster, because ONNX Runtime's CUDA provider has no int8 kernels.
     #
     # gpu is ~3.4x faster per utterance (58 ms vs 195 ms p50 on 1-4 s of speech)

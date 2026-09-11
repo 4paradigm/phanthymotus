@@ -79,7 +79,7 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 `tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
 `config.yaml`) selects the voice. Engines are named **`<model>-<languages>`** —
-the same shape `asr_model` uses (`x-asr-zh-en`, `paraformer-zh-en`, `zipformer-en`),
+the same shape `asr_model` uses (`x-asr-zh-en`, `parakeet-en`, `sensevoice-small`),
 because the dashboard renders the raw enum string, so these two dropdowns sit side
 by side in front of the same operator. Language codes, not country codes: `zh`, not
 `cn`. Naming an engine after its *runtime* was the previous mistake — `matcha-zh-en`
@@ -901,19 +901,29 @@ just a different provider string.
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
 | `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance ⚠️ |
-| `paraformer-zh-en` (streaming) | int8, 226 MB | **fp32, 825 MB** | **1.77x** |
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
-| `paraformer-offline` | int8 | — not offered | unmeasured |
-| `zipformer-en` | int8 | — not offered | unmeasured |
 | `parakeet-en` | int8, 104 MB | **fp32, 437 MB** | **4.9x** long / **2.0x** short |
 
-**Pick `parakeet-en` over `zipformer-en` for English.** Both are English-only, but
-they are trained on very different audio. `zipformer-en` is LibriSpeech — 960 h of
+### Removed models
+
+`paraformer-zh-en`, `paraformer-offline` and `zipformer-en` were dropped from the
+registry for accuracy. The two bilingual paraformers were worse than
+`sensevoice-small` on the same audio; `zipformer-en` is LibriSpeech — 960 h of
 clean read audiobook speech — which is the wrong distribution for a robot whose
-microphone always carries cooling-fan noise. Parakeet's NeMo FastConformer CTC 110M
-is trained on ~1.7 M h of diverse audio with non-speech material deliberately mixed
-in to suppress hallucination, and it emits punctuation and capitalisation, which
-`zipformer-en` does not. It is also the smallest offline English archive here
+microphone always carries cooling-fan noise.
+
+`REMOVED_ASR_MODELS` in `plugins/asr.py` maps each of them onto a replacement
+(the paraformers → `sensevoice-small`, `zipformer-en` → `parakeet-en`) and logs a
+warning. That map is not politeness: a card's `asr_model` lives in agent-core's
+config DB **on each robot**, so an upgrade cannot rewrite it. A removed name that
+resolves to nothing makes `config` return an error and the card comes up
+`state: error` after the next restart, on every deployment that had picked one.
+Do not delete an entry from that map when you remove a model — add one.
+
+**`parakeet-en` is the English model.** NeMo FastConformer CTC 110M, trained on
+~1.7 M h of diverse audio with non-speech material deliberately mixed in to
+suppress hallucination, and it emits punctuation and capitalisation, which
+`zipformer-en` did not. It is also the smallest offline English archive here
 (104 MB int8) and needs no new runtime: `OfflineRecognizer.from_nemo_ctc` has been
 in the pinned sherpa-onnx 1.13.6 all along.
 
@@ -1139,8 +1149,9 @@ That rule exists because of one result. Streaming paraformer fp16 on CUDA:
 The same fp16 file on CPU transcribed correctly, so the conversion was fine and the
 CUDA+fp16+streaming *combination* is not. Session creation, speed, and
 self-consistency were all green. Only reading the text caught it. (fp16 is also
-slower than fp32 for that model, so there was nothing to gain by debugging it —
-`paraformer-zh-en`'s gpu entry is fp32.)
+slower than fp32 for that model, so there was nothing to gain by debugging it.
+That model has since been removed from the registry for accuracy; the finding is
+kept because it is the reason every gpu entry has to be listened to, not timed.)
 
 Checklist:
 

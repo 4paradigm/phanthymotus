@@ -52,20 +52,8 @@ def _progress_hook(name: str, progress_cb=None):
     return hook
 
 MODELS = {
-    "asr": {
-        "url": f"{COS_BASE}/sherpa-onnx-streaming-paraformer-bilingual-zh-en.zip",
-        "check_file": "tokens.txt",
-    },
-    "asr_en": {
-        "url": f"{COS_BASE}/sherpa-onnx-streaming-zipformer-en-2023-06-26.zip",
-        "check_file": "tokens.txt",
-    },
     "asr_sensevoice": {
         "url": f"{COS_BASE}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.zip",
-        "check_file": "tokens.txt",
-    },
-    "asr_paraformer_offline": {
-        "url": f"{COS_BASE}/sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2",
         "check_file": "tokens.txt",
     },
     "asr_parakeet_en": {
@@ -522,27 +510,6 @@ SHERPA_GPU_MODEL_BASE = os.environ.get(
     "SHERPA_GPU_MODEL_BASE_URL", f"{COS_BASE}/sherpa-onnx-gpu"
 )
 SHERPA_GPU_BUNDLES = {
-    # Streaming paraformer, fp32. fp16 exists but is NOT used here: on CUDA it
-    # emits nothing but </s> (correct on CPU, so the conversion is fine and the
-    # CUDA+fp16+streaming combination is not), and it is slower than fp32 anyway
-    # (2077 ms vs 1859 ms).
-    "asr_gpu": {
-        "base_url": f"{SHERPA_GPU_MODEL_BASE}/streaming-paraformer-bilingual-zh-en-fp32",
-        "files": {
-            "encoder.onnx": {
-                "size": 636348877,
-                "sha256": "832c8e8d3f758f4ab0fcfc011eec91154ecd129b7305564a7b461b20064ebcc6",
-            },
-            "decoder.onnx": {
-                "size": 228464044,
-                "sha256": "e178f5a7dd4efbf5905a797807006d773b12116eb39fed3d16758e68f9f50921",
-            },
-            "tokens.txt": {
-                "size": 75756,
-                "sha256": "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6",
-            },
-        },
-    },
     # Offline NeMo Parakeet CTC 110M, fp32. The int8 archive this model's cpu
     # entry uses is deliberately NOT reused here: ONNX Runtime's CUDA provider
     # has no int8 kernels and falls back per node. No fp16 variant is published

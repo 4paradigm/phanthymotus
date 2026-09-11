@@ -2074,7 +2074,7 @@ class SherpaOnnxTTSPlugin:
 
 DEFAULT_TTS_ENGINE = "vits2-zh-en"
 # `<model>-<languages>`, the shape `asr_model` in plugins/asr.py already uses
-# (x-asr-zh-en, paraformer-zh-en, zipformer-en). Two reasons to match it rather
+# (x-asr-zh-en, parakeet-en, sensevoice-small). Two reasons to match it rather
 # than invent a second convention: the dashboard renders the raw enum string, so
 # this is what an operator reads in the dropdown right next to the ASR one; and
 # naming an engine after its runtime said nothing about what you would hear —
