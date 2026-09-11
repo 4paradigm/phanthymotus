@@ -988,7 +988,7 @@ class DelegateReq(BaseModel):
     model: str | None = None
     tool_filter: list[str] | None = None
     tool_deny: list[str] | None = None
-    max_rounds: int = 10
+    max_rounds: int = 20
     timeout_s: float = 300.0
     # How many peers this task has already been handed through. The receiver
     # increments it and refuses past delegation.MAX_HOP_COUNT.
@@ -1033,7 +1033,7 @@ async def delegate_task(req: Request):
         model=payload.get('model'),
         tool_filter=payload.get('tool_filter'),
         tool_deny=payload.get('tool_deny'),
-        max_rounds=payload.get('max_rounds', 10),
+        max_rounds=payload.get('max_rounds', 20),
         timeout_s=payload.get('timeout_s', 300.0),
         hop_count=hop_count,
     )

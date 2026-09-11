@@ -106,7 +106,7 @@ async def peer_delegate(
     peer_id: Annotated[str, 'Paired peer to hand the task to — the name shown in the peers list, or its peer_id.'],
     goal: Annotated[str, 'What the remote agent should accomplish, stated as a complete instruction.'],
     timeout_s: Annotated[float, 'Seconds to wait for the result before giving up.'] = 120.0,
-    max_rounds: Annotated[int, 'Maximum reasoning rounds the remote agent may use.'] = 10,
+    max_rounds: Annotated[int, 'Maximum reasoning rounds the remote agent may use.'] = 20,
 ) -> str:
     """Ask a paired peer to carry out a task and wait for its result.
 

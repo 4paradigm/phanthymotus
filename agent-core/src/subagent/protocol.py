@@ -20,8 +20,13 @@ STATUS_COMPLETED = 'completed'
 STATUS_FAILED = 'failed'
 STATUS_TIMEOUT = 'timeout'
 STATUS_CANCELLED = 'cancelled'
+# Ran out of rounds but wrote up what it had. Distinct from STATUS_TIMEOUT, which
+# says only "it stopped" — a caller cannot tell from that whether `output` is a
+# real answer or a placeholder, and the honest answer used to be the placeholder.
+STATUS_PARTIAL = 'partial'
 
-TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_TIMEOUT, STATUS_CANCELLED}
+TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_TIMEOUT,
+                     STATUS_CANCELLED, STATUS_PARTIAL}
 ACTIVE_STATUSES = {STATUS_PENDING, STATUS_RUNNING, STATUS_PAUSED, STATUS_SUSPENDED}
 
 # Tools that only talk *about* the task rather than carry it out. A subagent whose
@@ -45,8 +50,17 @@ class SubagentSpec:
     model: str | None = None
     tool_filter: list[str] | None = None
     tool_deny: list[str] | None = None
-    max_rounds: int = 10
-    timeout_s: float = 300.0
+    # 0 = use `subagent.default_max_rounds` from config, filled in by
+    # SubagentManager.spawn(). A hardcoded default here is how that config key
+    # came to be read by nothing: every caller got 10 and the configured value
+    # (50) was dead. Specs built outside the manager (peer delegation restoring
+    # from a dict) are clamped in Subagent.__init__ instead.
+    max_rounds: int = 0
+    # 负数 = use `subagent.default_timeout_s` from config, same dead-config story as
+    # max_rounds above. The sentinel cannot be 0: `manager._schedule` reads `> 0`, so
+    # 0 already means "no watchdog at all". This is an *idle* timeout — cancels after
+    # that long with no progress, not an absolute cap on the run.
+    timeout_s: float = -1.0
     hop_count: int = 0  # Incremented on each delegation, prevents infinite chains
     system_prompt_extra: str = ''
     context_seed: str = ''

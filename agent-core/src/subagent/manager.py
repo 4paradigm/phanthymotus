@@ -33,11 +33,11 @@ def _get_config() -> dict:
         'max_concurrent': 5,
         'max_concurrent_bg': 1,
         'max_total': 10,
-        'default_max_rounds': 10,
-        'default_timeout_s': 300,
+        'default_max_rounds': 50,
+        'default_timeout_s': 600,
         'preemption_enabled': True,
         'checkpoint_interval': 5,
-        'compress_threshold_chars': 20000,
+        'compress_threshold_chars': 40000,
         'cleanup_age_hours': 24,
     }
     cfg = config.main.get('subagent', {})
@@ -140,6 +140,13 @@ class SubagentManager:
         """Create and queue a subagent. Returns agent_id."""
         if len(self._agents) >= self._cfg['max_total']:
             raise RuntimeError(f'Maximum subagent count ({self._cfg["max_total"]}) reached')
+
+        # Resolve the "use the configured default" sentinels here, the one funnel
+        # every spawn passes through (spawn_and_wait delegates to this).
+        if spec.max_rounds <= 0:
+            spec.max_rounds = int(self._cfg['default_max_rounds'])
+        if spec.timeout_s < 0:
+            spec.timeout_s = float(self._cfg['default_timeout_s'])
 
         agent = Subagent(
             spec=spec,
@@ -456,7 +463,8 @@ class SubagentManager:
             return
 
         # 非 bg 或 fail/timeout → 触发 main agent（精简通知）
-        status_emoji = {'completed': '✓', 'failed': '✗', 'timeout': '⏱', 'cancelled': '⊘'}
+        status_emoji = {'completed': '✓', 'failed': '✗', 'timeout': '⏱',
+                        'cancelled': '⊘', 'partial': '◐'}
         emoji = status_emoji.get(result.status, '?')
 
         # 精简通知：goal 摘要 + output 前 100 字符

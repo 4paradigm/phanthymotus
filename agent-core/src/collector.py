@@ -194,11 +194,15 @@ async def drain_steering() -> list[dict]:
 
 
 def has_steering() -> bool:
-    """steering_queue 里有没有待处理的用户消息 —— 只看，不取走。
+    """steering_queue 里有没有待处理的消息 —— 只看，不取走。
 
-    ACP barrier 用它做 barge-in 检测：steer 模式（默认）下 busy 时的用户消息
-    只入队、不 set cancel_event，barrier 光靠 cancel_event 醒不过来。
-    drain_steering() 会把消息取走，barrier 里不能用。
+    steer 模式（默认）下 busy 时的 P>0 事件只入队、不 set cancel_event，所以主循环
+    要靠这个函数知道"该回头看看了"。drain_steering() 会把消息取走，这里不能用。
+
+    注意这**不是**打断信号。打断只走显式 interrupt（interrupt / followup 模式下的
+    `_cancel_event`，或 interrupt 工具）；队列里有消息不等于有人要求机器人闭嘴。
+    曾经有过一个基于本函数的隐式打断（finish barrier 的 barge_in），见
+    `event/llm.py::_acp_barrier` 的 docstring —— 那条路已经拆掉。
     """
     return not _steering_queue.empty() or bool(_priority_pending)
 
