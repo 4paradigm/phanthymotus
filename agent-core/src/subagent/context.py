@@ -52,7 +52,7 @@ class SubagentContext:
     # compression fired nearly every round.
     _KEEP_RECENT_TURNS = 4
 
-    def __init__(self, spec: SubagentSpec, compress_threshold: int = 60000):
+    def __init__(self, spec: SubagentSpec, compress_threshold: int = 40000):
         self._spec = spec
         self._compress_threshold = compress_threshold
         self._system_prompt = self._build_system(spec)

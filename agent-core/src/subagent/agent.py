@@ -26,10 +26,11 @@ from .protocol import (
 from .context import SubagentContext
 
 
-# Used only when a spec reaches here without the manager having resolved
-# `subagent.default_max_rounds` (max_rounds=0) — a spec rebuilt from a dict, say.
-# Never the configured default; that lives in config and manager._get_config().
+# Used only when a spec reaches here without the manager having resolved the
+# config sentinels (max_rounds=0 / timeout_s<0) — a spec rebuilt from a dict, say.
+# Never the configured defaults; those live in config and manager._get_config().
 _FALLBACK_MAX_ROUNDS = 50
+_FALLBACK_TIMEOUT_S = 600.0
 
 
 # Tools that subagents are NEVER allowed to use (enforced at code level)
@@ -45,12 +46,14 @@ class Subagent:
     """An isolated agent instance with its own LLM loop and context."""
 
     def __init__(self, spec: SubagentSpec, agent_id: str | None = None,
-                 compress_threshold: int = 60000):
+                 compress_threshold: int = 40000):
         self.id = agent_id or uuid4().hex[:8]
         # Resolve before building the context: the system prompt states the round
         # budget, and `range(0)` would otherwise exit the loop before round 0.
         if spec.max_rounds <= 0:
             spec.max_rounds = _FALLBACK_MAX_ROUNDS
+        if spec.timeout_s < 0:
+            spec.timeout_s = _FALLBACK_TIMEOUT_S
         self.spec = spec
         self.status: str = 'pending'
         self.created_at: float = time.time()

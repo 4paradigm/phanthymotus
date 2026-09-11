@@ -94,11 +94,35 @@ class TestMaxRoundsSentinel(unittest.TestCase):
     def test_manager_resolves_from_config(self):
         from subagent.manager import SubagentManager
         mgr = SubagentManager(llm_client=None)
-        mgr._cfg = {**mgr._cfg, 'default_max_rounds': 42}
+        mgr._cfg = {**mgr._cfg, 'default_max_rounds': 42, 'default_timeout_s': 777}
         spec = SubagentSpec(goal='研究 NVDA')
         asyncio.run(mgr.spawn(spec))
         self.assertEqual(spec.max_rounds, 42,
                          'subagent.default_max_rounds 又变成死配置了')
+        self.assertEqual(spec.timeout_s, 777,
+                         'subagent.default_timeout_s 又变成死配置了')
+
+
+class TestIdleTimeoutSentinel(unittest.TestCase):
+    """`default_timeout_s` 和 max_rounds 一样也是死配置：生效的是 SubagentSpec 的 300.0。
+
+    哨兵只能用负数 —— `manager._schedule` 判的是 `timeout_s > 0`，0 已经表示"不装看门狗"。
+    """
+
+    def test_negative_is_the_sentinel(self):
+        spec = SubagentSpec(goal='g')
+        self.assertLess(spec.timeout_s, 0)
+        agent = Subagent(spec, agent_id='idle1')
+        self.assertEqual(agent.spec.timeout_s, 600.0)
+
+    def test_zero_still_means_no_watchdog(self):
+        """别把"不要超时"也当成哨兵吃掉。"""
+        agent = Subagent(SubagentSpec(goal='g', timeout_s=0), agent_id='idle2')
+        self.assertEqual(agent.spec.timeout_s, 0)
+
+    def test_explicit_value_is_respected(self):
+        agent = Subagent(SubagentSpec(goal='g', timeout_s=45), agent_id='idle3')
+        self.assertEqual(agent.spec.timeout_s, 45)
 
 
 class TestWrapUpOnExhaustion(unittest.TestCase):
@@ -187,13 +211,13 @@ class TestStaleConfigRowIsMigrated(unittest.TestCase):
     """已部署机器上的旧默认值不会自己更新。
 
     `_seed_defaults` 是 `INSERT OR IGNORE`，整行粒度 —— 'subagent' 行一旦存在，改
-    `_DB_DEFAULTS` 对它没有任何影响。Orin5 上就是 20000（实测读出来的），光改代码默认值
+    `_DB_DEFAULTS` 对它没有任何影响。Orin5 上实测读出来是 20000 / 300，光改代码默认值
     等于这次的压缩修复在现网一台都吃不到。
 
     config 在 import 时就跑迁移且只跑一次，所以起子进程验。
     """
 
-    def _migrated_value(self, stored: int) -> int:
+    def _migrated(self, threshold: int, timeout_s: int) -> dict:
         import json
         import subprocess
         import sqlite3
@@ -202,26 +226,33 @@ class TestStaleConfigRowIsMigrated(unittest.TestCase):
         conn.execute('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         conn.execute('INSERT INTO config VALUES (?,?)', (
             'subagent', json.dumps({'max_concurrent': 2, 'default_max_rounds': 50,
-                                    'compress_threshold_chars': stored})))
+                                    'compress_threshold_chars': threshold,
+                                    'default_timeout_s': timeout_s})))
         conn.commit()
         conn.close()
         src = str(pathlib.Path(__file__).resolve().parents[1] / 'src')
         out = subprocess.run(
             [sys.executable, '-c',
-             'import sys, json, config; '
-             'print("VALUE", config.main["subagent"]["compress_threshold_chars"])'],
+             'import json, config; print("VALUE", json.dumps(config.main["subagent"]))'],
             cwd=src, env={**os.environ, 'DB_PATH': db, 'PYTHONPATH': src},
             capture_output=True, text=True, timeout=60)
         line = [l for l in out.stdout.splitlines() if l.startswith('VALUE')]
         self.assertTrue(line, f'子进程没跑起来: {out.stdout}\n{out.stderr}')
-        return int(line[0].split()[1])
+        return json.loads(line[0][len('VALUE '):])
 
-    def test_stale_default_is_bumped(self):
-        self.assertEqual(self._migrated_value(20000), 60000)
+    def test_stale_defaults_are_bumped(self):
+        sa = self._migrated(20000, 300)
+        self.assertEqual(sa['compress_threshold_chars'], 40000)
+        self.assertEqual(sa['default_timeout_s'], 600)
 
-    def test_hand_tuned_value_is_left_alone(self):
-        """只认旧默认值这一个数；有人调过就不要覆盖。"""
-        self.assertEqual(self._migrated_value(35000), 35000)
+    def test_unrelated_keys_survive(self):
+        self.assertEqual(self._migrated(20000, 300)['default_max_rounds'], 50)
+
+    def test_hand_tuned_values_are_left_alone(self):
+        """只认旧默认值这两个数；有人调过就不要覆盖。"""
+        sa = self._migrated(35000, 450)
+        self.assertEqual(sa['compress_threshold_chars'], 35000)
+        self.assertEqual(sa['default_timeout_s'], 450)
 
 
 class TestSpawnSyncSurfacesPartialOutput(unittest.TestCase):

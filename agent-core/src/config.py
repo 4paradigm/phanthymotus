@@ -95,10 +95,10 @@ _DB_DEFAULTS = {
         'max_concurrent': 2,
         'max_total': 10,
         'default_max_rounds': 50,
-        'default_timeout_s': 300,
+        'default_timeout_s': 600,
         'preemption_enabled': True,
         'checkpoint_interval': 5,
-        'compress_threshold_chars': 60000,
+        'compress_threshold_chars': 40000,
         'cleanup_age_hours': 24,
         'bg_route_enabled': True,
         'bg_model': None,  # None = use main model; or specify e.g. 'qwen-turbo'
@@ -271,23 +271,34 @@ def _migrate():
                 conn.commit()
                 print(f'[config] deduped {len(mcp_list) - len(deduped)} duplicate MCP entries')
 
-        # subagent 压缩阈值 20000 → 60000。
+        # subagent 的两个旧默认值：压缩阈值 20000 → 40000，空转超时 300 → 600。
         #
         # _seed_defaults 用的是 INSERT OR IGNORE，整行粒度：已部署机器上的 'subagent'
-        # 行早就存在，新默认值永远进不去。Orin5 实测就是这样 —— 一次 WebSearch 的结果
-        # 就超过 20000 字符，压缩几乎每轮触发、只留最近两轮，子代理因此忘掉自己刚查到的
-        # 东西并反复重查（同一个问题搜了 round 2、6、9）。
+        # 行早就存在，新默认值永远进不去。Orin5 实测读出来就是 20000/300。
         #
-        # 只改还停在旧默认值上的行；有人手工调过就不动。
+        # 20000 的代价：一次 WebSearch 的结果就超过它，压缩几乎每轮触发、只留最近两轮，
+        # 子代理因此忘掉自己刚查到的东西并反复重查（同一个问题搜了 round 2、6、9）。
+        # 300 的代价：轮次预算放到 50 之后，先撞上的会是这个空转超时，而超时是 cancel，
+        # cancel 不会走收尾调用 —— 又变回什么都拿不回来。
+        #
+        # 只改还停在旧默认值上的键；有人手工调过就不动。
+        _stale_subagent_defaults = {
+            'compress_threshold_chars': (20000, 40000),
+            'default_timeout_s': (300, 600),
+        }
         row_sa = conn.execute("SELECT value FROM config WHERE key='subagent'").fetchone()
         if row_sa:
             sa = json.loads(row_sa[0])
-            if sa.get('compress_threshold_chars') == 20000:
-                sa['compress_threshold_chars'] = 60000
+            changed = []
+            for key, (old, new) in _stale_subagent_defaults.items():
+                if sa.get(key) == old:
+                    sa[key] = new
+                    changed.append(f'{key} {old} -> {new}')
+            if changed:
                 conn.execute("UPDATE config SET value=? WHERE key='subagent'",
                              (json.dumps(sa),))
                 conn.commit()
-                print('[config] subagent.compress_threshold_chars 20000 -> 60000')
+                print(f'[config] subagent: {", ".join(changed)}')
 
 _migrate()
 

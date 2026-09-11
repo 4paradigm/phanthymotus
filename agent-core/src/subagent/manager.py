@@ -34,10 +34,10 @@ def _get_config() -> dict:
         'max_concurrent_bg': 1,
         'max_total': 10,
         'default_max_rounds': 50,
-        'default_timeout_s': 300,
+        'default_timeout_s': 600,
         'preemption_enabled': True,
         'checkpoint_interval': 5,
-        'compress_threshold_chars': 60000,
+        'compress_threshold_chars': 40000,
         'cleanup_age_hours': 24,
     }
     cfg = config.main.get('subagent', {})
@@ -141,10 +141,12 @@ class SubagentManager:
         if len(self._agents) >= self._cfg['max_total']:
             raise RuntimeError(f'Maximum subagent count ({self._cfg["max_total"]}) reached')
 
-        # Resolve the "use the configured default" sentinel here, the one funnel
+        # Resolve the "use the configured default" sentinels here, the one funnel
         # every spawn passes through (spawn_and_wait delegates to this).
         if spec.max_rounds <= 0:
             spec.max_rounds = int(self._cfg['default_max_rounds'])
+        if spec.timeout_s < 0:
+            spec.timeout_s = float(self._cfg['default_timeout_s'])
 
         agent = Subagent(
             spec=spec,

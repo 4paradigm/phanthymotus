@@ -56,7 +56,11 @@ class SubagentSpec:
     # (50) was dead. Specs built outside the manager (peer delegation restoring
     # from a dict) are clamped in Subagent.__init__ instead.
     max_rounds: int = 0
-    timeout_s: float = 300.0
+    # 负数 = use `subagent.default_timeout_s` from config, same dead-config story as
+    # max_rounds above. The sentinel cannot be 0: `manager._schedule` reads `> 0`, so
+    # 0 already means "no watchdog at all". This is an *idle* timeout — cancels after
+    # that long with no progress, not an absolute cap on the run.
+    timeout_s: float = -1.0
     hop_count: int = 0  # Incremented on each delegation, prevents infinite chains
     system_prompt_extra: str = ''
     context_seed: str = ''
