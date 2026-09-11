@@ -73,18 +73,6 @@ MODELS = {
         "check_file": "vocos-16khz-univ.onnx",
         "single_file": True,
     },
-    "kws": {
-        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
-        "check_file": "tokens.txt",
-    },
-    "kws_zh": {
-        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.zip",
-        "check_file": "tokens.txt",
-    },
-    "kws_en": {
-        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.zip",
-        "check_file": "tokens.txt",
-    },
     "vad": {
         "url": f"{COS_BASE}/silero_vad.onnx",
         "check_file": "silero_vad.onnx",

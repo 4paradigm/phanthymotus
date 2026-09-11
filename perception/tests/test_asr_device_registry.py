@@ -451,3 +451,66 @@ class _FakeNode:
         self.state = "running"
         self._log.append(self.topic)
         return {"state": "running"}
+
+
+# ── removed trigger modes ────────────────────────────────────────────────────
+#
+# `kws` ran a second sherpa KeywordSpotter on the raw audio. It was removed in
+# favour of `asr_kws`, which gates on the transcript. This one degrades worse
+# than a removed model name if left unmapped: an unrecognised trigger_mode
+# falls through to `vad`, which is always listening — a wake-word-gated robot
+# would silently start answering every utterance in the room.
+
+
+def test_kws_migrates_to_asr_kws():
+    assert "kws" not in asr.TRIGGER_MODES
+    assert asr.REMOVED_TRIGGER_MODES["kws"] == "asr_kws"
+    assert asr.resolve_trigger_mode("kws", {}) == "asr_kws"
+
+
+def test_live_trigger_modes_pass_through():
+    for mode in asr.TRIGGER_MODES:
+        assert asr.resolve_trigger_mode(mode, {}) == mode
+
+
+def test_the_schema_enum_matches_the_live_trigger_modes():
+    enum = asr.TOOLS[0]["configSchema"]["properties"]["trigger_mode"]["enum"]
+    assert sorted(enum) == sorted(asr.TRIGGER_MODES)
+    assert asr.DEFAULT_TRIGGER_MODE in enum
+    assert not set(enum) & set(asr.REMOVED_TRIGGER_MODES)
+
+
+def test_migrating_carries_the_wake_word_over_from_kws_keywords():
+    """Without this the migrated card has no keyword, and asr_kws degrades to
+    always-on vad — the exact silent failure this mapping exists to prevent."""
+    cfg = {"keywords": ["x iǎo f àn x iǎo f àn @小范小范"]}
+
+    assert asr.resolve_trigger_mode("kws", cfg) == "asr_kws"
+    assert cfg["asr_kws_keyword"] == "小范小范"
+
+
+def test_an_underscored_english_wake_word_becomes_speakable_text():
+    cfg = {"keywords": ["▁FA N C Y ▁RO B O T @FANCY_ROBOT"]}
+
+    asr.resolve_trigger_mode("kws", cfg)
+
+    # '_' is a filename convention, not something anyone says.
+    assert cfg["asr_kws_keyword"] == "FANCY ROBOT"
+
+
+def test_an_explicit_asr_kws_keyword_is_not_overwritten():
+    cfg = {"asr_kws_keyword": "hello robot",
+           "keywords": ["x iǎo f àn x iǎo f àn @小范小范"]}
+
+    assert asr.resolve_trigger_mode("kws", cfg) == "asr_kws"
+    assert cfg["asr_kws_keyword"] == "hello robot"
+
+
+def test_a_token_only_keyword_yields_no_wake_word_rather_than_a_guess():
+    """The token side is a spotter lexicon, not text — stripping its spaces
+    would produce a wake word nobody can pronounce. Better to have none and
+    log, which resolve_trigger_mode does at error level."""
+    cfg = {"keywords": ["x iǎo f àn x iǎo f àn"]}
+
+    assert asr.resolve_trigger_mode("kws", cfg) == "asr_kws"
+    assert "asr_kws_keyword" not in cfg

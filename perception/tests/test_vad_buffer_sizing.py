@@ -95,3 +95,27 @@ def test_pcm_history_outlives_the_longest_possible_segment():
         silence_samples=0,
     )
     assert len(got) == pre_roll * 2
+
+
+def test_vad_worker_is_called_with_the_arguments_it_declares():
+    """`_vad_worker` runs in a spawned process, so a stale positional argument
+    is not a TypeError at import — it is a child that dies on start, with the
+    parent reporting only that no audio ever arrived. Removing the `kws_cfg`
+    parameter is exactly the kind of change that leaves one behind.
+    """
+    import inspect
+    import re
+
+    from plugins import asr
+
+    params = inspect.signature(asr._vad_worker).parameters
+    call = re.search(
+        r"target=_vad_worker,\s*args=\((.*?)\),\s*\n\s*daemon=True",
+        inspect.getsource(asr), re.S,
+    )
+    assert call, "could not find the Process(target=_vad_worker, ...) call site"
+    args = [a.strip() for a in call.group(1).replace("\n", " ").split(",") if a.strip()]
+    assert len(args) == len(params), (
+        f"_vad_worker takes {len(params)} arguments {list(params)} but is called "
+        f"with {len(args)}: {args}"
+    )

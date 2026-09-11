@@ -1347,7 +1347,27 @@ place it is again the *only* remaining cause, and the log line
 
 ## asr_kws and espeak
 
-`trigger_mode: asr_kws` transcribes every utterance and gates on a phoneme-level
+`trigger_mode` has two values: `vad` (transcribe and forward everything) and
+`asr_kws` (forward only what follows a wake word). `asr_kws` is the default.
+
+There used to be a third, `kws`, which ran a second sherpa `KeywordSpotter` on
+the raw audio with its own zipformer bundle and its own `waiting_wake` state in
+the VAD worker. It is gone: that is an extra model, an extra download and an
+extra state machine to do a job `asr_kws` already does on a transcript the ASR
+produces anyway.
+
+`REMOVED_TRIGGER_MODES` in `plugins/asr.py` migrates `kws` → `asr_kws` at load.
+Unlike a removed *model* name, leaving this unmapped would not surface as a card
+error — an unrecognised `trigger_mode` falls through to `vad`, so a robot that
+was wake-word gated would silently start answering every utterance in the room.
+The migration also carries the wake word across, taking the display form after
+`@` in the old `keywords` spec (`"x iǎo f àn x iǎo f àn @小范小范"` → `小范小范`),
+because `asr_kws` with no keyword degrades to `vad` — the same silent failure by
+another route. A keyword with no `@` part yields nothing and logs at error
+level: the token side is a spotter lexicon, and de-spacing it would invent a
+wake word nobody can pronounce.
+
+`asr_kws` transcribes every utterance and gates on a phoneme-level
 fuzzy match against the wake word, so it needs IPA for both. That path had two
 faults that together cost **5.2 s per utterance** and quietly degraded wake-word
 accuracy.

@@ -403,9 +403,9 @@ TOOLS = [
                                                  "never gives back — check headroom before enabling",
                                   "default": "cpu", "scope": "shared",
                                   "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small"]}},
-                "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
-                "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
-                "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
+                # `kws` (a second sherpa KeywordSpotter on the raw audio) was
+                # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
+                "trigger_mode":  {"type": "string", "enum": ["vad", "asr_kws"], "description": "Trigger mode (vad = always listen, asr_kws = ASR + phoneme matching)", "default": "asr_kws", "scope": "shared"},
                 "asr_kws_keyword": {"type": "string", "description": "唤醒词文本（如'范式小狗'、'hello robot'）", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
@@ -678,6 +678,73 @@ def resolve_asr_model(name: str) -> str:
     return replacement
 
 
+# Trigger modes. `vad` = transcribe everything; `asr_kws` = transcribe
+# everything and gate on the *transcript* matching a wake word phonetically.
+TRIGGER_MODES = ("vad", "asr_kws")
+DEFAULT_TRIGGER_MODE = "asr_kws"
+
+# `kws` ran a second sherpa KeywordSpotter on the raw audio, with its own
+# zipformer bundle and its own `waiting_wake` state in the VAD worker. Removed:
+# it was a whole extra model and gate to maintain for the same job `asr_kws`
+# already does on text that has to be transcribed anyway.
+#
+# Same reasoning as REMOVED_ASR_MODELS — the value lives in each robot's own
+# config DB and no upgrade can rewrite it. But this one degrades worse than a
+# card error if left unmapped: an unrecognised `trigger_mode` falls through to
+# `vad`, which is **always listening**. A robot that was wake-word gated would
+# silently start responding to every utterance in the room. So it maps to
+# `asr_kws`, and the wake word comes across with it.
+REMOVED_TRIGGER_MODES = {"kws": "asr_kws"}
+
+
+def _wake_word_from_kws_keywords(kws_cfg: dict) -> str:
+    """Recover a plain-text wake word from a `kws`-mode keyword spec.
+
+    KWS keywords are written as tokens plus an optional display form —
+    ``"x iǎo f àn x iǎo f àn @小范小范"`` or
+    ``"▁FA N C Y ▁RO B O T @FANCY_ROBOT"``. Only the part after ``@`` is real
+    text; the tokens are for the spotter's lexicon and mean nothing to a
+    phonemizer. Without a usable one, return '' and let the caller warn —
+    guessing by stripping spaces out of the token side would produce a wake
+    word nobody can say.
+    """
+    for raw in (kws_cfg.get('keywords') or []):
+        _, sep, display = str(raw).partition('@')
+        if sep and display.strip():
+            return display.strip().replace('_', ' ')
+    return ''
+
+
+def resolve_trigger_mode(mode: str, kws_cfg: dict = None) -> str:
+    """Map a removed trigger mode onto its replacement; pass others through.
+
+    When `kws` becomes `asr_kws` and no `asr_kws_keyword` is configured, the
+    old KWS wake word is carried over in place — otherwise asr_kws would find
+    no keyword and fall back to `vad`, i.e. always-on.
+    """
+    replacement = REMOVED_TRIGGER_MODES.get(mode)
+    if replacement is None:
+        return mode
+    if kws_cfg is not None and not kws_cfg.get('asr_kws_keyword'):
+        carried = _wake_word_from_kws_keywords(kws_cfg)
+        if carried:
+            kws_cfg['asr_kws_keyword'] = carried
+            log.warning(
+                f"[asr] trigger_mode '{mode}' was removed; using '{replacement}' "
+                f"with the wake word carried over from kws_keywords: '{carried}'"
+            )
+            return replacement
+        log.error(
+            f"[asr] trigger_mode '{mode}' was removed and no wake word could be "
+            f"recovered from kws_keywords ({kws_cfg.get('keywords')!r}). "
+            f"'{replacement}' with no keyword falls back to always-on VAD — set "
+            f"asr_kws_keyword on this card."
+        )
+        return replacement
+    log.warning(f"[asr] trigger_mode '{mode}' was removed; using '{replacement}'")
+    return replacement
+
+
 def asr_models_supporting(device: str) -> list[str]:
     """Model names whose registry entry has weights for this device."""
     return sorted(name for name, info in ASR_MODELS.items()
@@ -808,14 +875,17 @@ def _warmup_adapter(adapter: ASRAdapter, model_name: str, device: str) -> None:
 def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 stop_evt: multiprocessing.Event,
                 backend: str, threshold: float, silence_ms: int,
-                kws_cfg: dict = None,
                 save_vad_segments: bool = False, max_saved_segments: int = 1000,
                 pre_roll_ms: int = 500, log_level: int = logging.INFO):
-    """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
+    """Runs in a child process — sherpa-onnx ONNX VAD.
 
-    Pipeline: Audio → VAD → (KWS gate) → utterance output
-    - If kws_cfg is provided and enabled, only output utterances after keyword detected
-    - Otherwise (kws disabled), output all utterances (backward compat)
+    Pipeline: Audio → VAD → utterance output. Every completed utterance is
+    emitted; wake-word gating is `asr_kws`, which lives downstream in
+    `_worker_inner` and works on the *transcript*, not on the audio.
+
+    There used to be a second gate here: a sherpa KeywordSpotter running on the
+    raw audio (`trigger_mode: kws`), with its own model and its own
+    `waiting_wake` state. It has been removed — see REMOVED_TRIGGER_MODES.
     """
     # A spawned child gets a fresh interpreter and does not inherit the parent's
     # sys.stdout object, so the atomic writer has to be reinstalled here.
@@ -874,101 +944,16 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         f"silence_ms={silence_ms}, pre_roll_ms={pre_roll_ms})"
     )
 
-    # ── Initialize KWS (optional) ──
-    kws_spotter = None
-    kws_stream = None
-    kws_enabled = (kws_cfg.get('trigger_mode', 'kws') == 'kws') if kws_cfg else False
-    if kws_enabled:
-        # Select KWS model based on kws_model config
-        kws_model_variant = kws_cfg.get('kws_model', 'zh')
-        if kws_model_variant == 'zh':
-            kws_model_dir = '/models/sherpa-onnx/kws_zh'
-            ensure_model("kws_zh", kws_model_dir)
-        elif kws_model_variant == 'en':
-            kws_model_dir = '/models/sherpa-onnx/kws_en'
-            ensure_model("kws_en", kws_model_dir)
-        else:  # zh-en
-            kws_model_dir = kws_cfg.get('model_dir', '/models/sherpa-onnx/kws')
-            ensure_model("kws", kws_model_dir)
-        keywords = kws_cfg.get('keywords', [])
-        if keywords:
-            import glob as _glob
-            # Find model files (prefer int8 + chunk-8)
-            def _find(prefix, prefer_int8=True):
-                pattern = os.path.join(kws_model_dir, f"{prefix}-*.onnx")
-                files = _glob.glob(pattern)
-                if not files:
-                    return ""
-                chunk8 = [f for f in files if "chunk-8" in f]
-                cands = chunk8 if chunk8 else files
-                if prefer_int8:
-                    int8f = [f for f in cands if "int8" in f]
-                    if int8f: return int8f[0]
-                else:
-                    fp32f = [f for f in cands if "int8" not in f]
-                    if fp32f: return fp32f[0]
-                return cands[0]
-
-            encoder = _find("encoder", prefer_int8=True)
-            decoder = _find("decoder", prefer_int8=False)
-            joiner = _find("joiner", prefer_int8=True)
-            tokens = os.path.join(kws_model_dir, "tokens.txt")
-
-            if encoder and decoder and joiner and os.path.exists(tokens):
-                # Write keywords file
-                kws_keywords_file = os.path.join(kws_model_dir, "keywords.txt")
-                with open(kws_keywords_file, 'w', encoding='utf-8') as f:
-                    for kw in keywords:
-                        f.write(f"{kw}\n")
-
-                kws_spotter = sherpa_onnx.KeywordSpotter(
-                    tokens=tokens,
-                    encoder=encoder,
-                    decoder=decoder,
-                    joiner=joiner,
-                    keywords_file=kws_keywords_file,
-                    num_threads=1,
-                    # KWS is pinned to CPU. Its zipformer bundle ships int8 only,
-                    # and int8 on CUDA measured slower than CPU on every model
-                    # tried — so there is nothing to gain and the `device` setting
-                    # deliberately does not reach here. See utils/onnx_provider.py.
-                    provider="cpu",
-                    keywords_score=1.5,
-                    keywords_threshold=0.1,
-                )
-                kws_stream = kws_spotter.create_stream()
-                _log.info(f"[vad-worker] KWS initialized, keywords={keywords}")
-            else:
-                _log.warning(f"[vad-worker] KWS model files not found in {kws_model_dir}, disabling KWS")
-                kws_enabled = False
-        else:
-            _log.info("[vad-worker] KWS enabled but no keywords configured, disabling")
-            kws_enabled = False
-
-    # ── State machine ──
-    # States: 'waiting_wake' (KWS mode) or 'listening' (direct mode / post-wake)
-    state = 'waiting_wake' if kws_enabled else 'listening'
-    _kws_triggered = False
     speech_buf = b''
     start_ts = None
     end_ts = None
-    kws_cooldown_until = 0.0
     _was_speaking = False  # Track speech onset for hook notification
 
-    _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
+    _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx)")
     audio_count = 0
 
     # VAD segment saving
     _VAD_SEG_DIR = '/models/vad_segments'
-
-    def _save_segment(float_samples_list):
-        """Save float samples as WAV."""
-        try:
-            seg_pcm = struct.pack(f'<{len(float_samples_list)}h',
-                                  *[int(max(-32768, min(32767, s * 32768))) for s in float_samples_list])
-            _write_segment(seg_pcm)
-        except Exception:
-            pass
 
     def _save_segment_pcm(pcm_bytes):
         """Save raw PCM bytes as WAV."""
@@ -1053,98 +1038,55 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         pcm_history.append(pcm[:n * 2])
         vad.accept_waveform(float_samples)
 
-        if state == 'waiting_wake':
-            # Feed KWS with AGC-normalized audio for better detection at distance
-            if kws_spotter:
-                kws_stream.accept_waveform(SAMPLE_RATE, float_samples)
-                while kws_spotter.is_ready(kws_stream):
-                    kws_spotter.decode_stream(kws_stream)
-                result = kws_spotter.get_result(kws_stream)
-                kw = result.keyword if hasattr(result, 'keyword') else str(result)
-                if kw and kw.strip():
-                    now = time.time()
-                    if now >= kws_cooldown_until:
-                        kws_cooldown_until = now + 2.0
-                        _log.info(f"[vad-worker] WAKE WORD detected: {kw.strip()}")
-                        # Transition to listening — start recording immediately
-                        state = 'listening'
-                        _kws_triggered = True
-                        speech_buf = pcm  # include current frame (user may already be speaking)
-                        start_ts = ts
-                        end_ts = ts
-                        # Reset KWS stream for next wake
-                        kws_stream = kws_spotter.create_stream()
-            # Drain any completed VAD segments (discard in wake-wait mode)
-            while not vad.empty():
-                seg = vad.front
+        # Detect speech onset → notify main thread for on_hearing hook
+        _is_speaking = vad.is_speech_detected()
+        if _is_speaking and not _was_speaking:
+            result_q.put(("speech_start", ts, ts))
+        _was_speaking = _is_speaking
+
+        # Collect completed VAD segments.
+        # The VAD only reports a segment after min_silence_duration of
+        # trailing silence has elapsed, and that silence is not part of
+        # seg.samples — so the current chunk timestamp sits one silence
+        # window past the real end of speech. Rewind it, the same way
+        # PcmHistory.pre_roll() rewinds by silence_samples to locate the
+        # segment start in the sample domain.
+        seg_end_ts = ts - silence_samples / SAMPLE_RATE
+        while not vad.empty():
+            seg = vad.front
+            seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
+                                   *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+            # `is None`, not falsy: a legitimate start_ts of 0.0 would
+            # otherwise be re-stamped.
+            if start_ts is None:
+                pre_pcm = pcm_history.pre_roll(
+                    getattr(seg, 'start', None),
+                    len(seg.samples),
+                    pre_roll_samples,
+                    silence_samples,
+                )
+                start_ts = seg_end_ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
+                speech_buf = pre_pcm + seg_pcm
+            else:
+                pre_pcm = b''
+                speech_buf += seg_pcm
+            end_ts = seg_end_ts
+            vad.pop()
+
+            # Output the segment as an utterance
+            if len(speech_buf) > SAMPLE_RATE:  # >500ms
+                _log.info(
+                    f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
+                    f"pre_roll_bytes={len(pre_pcm)}"
+                )
                 if save_vad_segments:
-                    _save_segment(seg.samples)
-                vad.pop()
-
-        elif state == 'listening':
-            # Detect speech onset → notify main thread for on_hearing hook
-            _is_speaking = vad.is_speech_detected()
-            if _is_speaking and not _was_speaking:
-                result_q.put(("speech_start", ts, ts, False))
-            _was_speaking = _is_speaking
-
-            # Collect completed VAD segments.
-            # The VAD only reports a segment after min_silence_duration of
-            # trailing silence has elapsed, and that silence is not part of
-            # seg.samples — so the current chunk timestamp sits one silence
-            # window past the real end of speech. Rewind it, the same way
-            # PcmHistory.pre_roll() rewinds by silence_samples to locate the
-            # segment start in the sample domain.
-            seg_end_ts = ts - silence_samples / SAMPLE_RATE
-            while not vad.empty():
-                seg = vad.front
-                seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
-                                       *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
-                # `is None`, not falsy: a legitimate start_ts of 0.0 would
-                # otherwise be re-stamped.
-                if start_ts is None:
-                    pre_pcm = pcm_history.pre_roll(
-                        getattr(seg, 'start', None),
-                        len(seg.samples),
-                        pre_roll_samples,
-                        silence_samples,
-                    )
-                    start_ts = seg_end_ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
-                    speech_buf = pre_pcm + seg_pcm
-                else:
-                    pre_pcm = b''
-                    speech_buf += seg_pcm
-                end_ts = seg_end_ts
-                vad.pop()
-
-                # Output the segment as an utterance
-                if len(speech_buf) > SAMPLE_RATE:  # >500ms
-                    _log.info(
-                        f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
-                        f"pre_roll_bytes={len(pre_pcm)}"
-                    )
-                    if save_vad_segments:
-                        _save_segment_pcm(speech_buf)
-                    result_q.put((speech_buf,
-                                  seg_end_ts if start_ts is None else start_ts,
-                                  seg_end_ts if end_ts is None else end_ts,
-                                  _kws_triggered))
-                    _kws_triggered = False
-                    speech_buf = b''
-                    start_ts = None
-                    end_ts = None
-                    # Return to waiting for wake word (if KWS enabled)
-                    if kws_enabled:
-                        state = 'waiting_wake'
-                        # Stop draining here. Without the break, segments still
-                        # queued in the VAD keep being treated as an active
-                        # listening session and can emit a second utterance in
-                        # this same pass, after the wake gate has already closed.
-                        # `state` is only re-read on the next outer iteration, so
-                        # the gate would be bypassed for however many segments
-                        # the VAD had queued. The remainder belongs to
-                        # waiting_wake, which drains it next round.
-                        break
+                    _save_segment_pcm(speech_buf)
+                result_q.put((speech_buf,
+                              seg_end_ts if start_ts is None else start_ts,
+                              seg_end_ts if end_ts is None else end_ts))
+                speech_buf = b''
+                start_ts = None
+                end_ts = None
 
     _log.info("[vad-worker] process exiting")
 
@@ -1234,7 +1176,7 @@ class _ASRNode(Node):
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                  self._kws_cfg, self._save_vad_segments, self._max_saved_segments,
+                  self._save_vad_segments, self._max_saved_segments,
                   self._vad_pre_roll_ms, log.getEffectiveLevel()),
             daemon=True, name="vad_worker",
         )
@@ -1412,7 +1354,8 @@ class _ASRNode(Node):
     def _worker_inner(self):
         # Pre-compute keyword IPA if in asr_kws mode
         _kws_triggered = False  # track whether current utterance was KWS-triggered
-        trigger_mode = self._kws_cfg.get('trigger_mode', 'kws')
+        trigger_mode = resolve_trigger_mode(
+            self._kws_cfg.get('trigger_mode', DEFAULT_TRIGGER_MODE), self._kws_cfg)
         keyword_ipa = None
         asr_kws_threshold = float(self._kws_cfg.get('asr_kws_threshold', 0.3))
         if trigger_mode == 'asr_kws':
@@ -1449,11 +1392,7 @@ class _ASRNode(Node):
                     except Exception as _he:
                         log.debug(f"[asr] fire on_hearing failed: {_he}")
                     continue
-                if len(item) == 4:
-                    utterance, start_ts, end_ts, _kws_from_vad = item
-                else:
-                    utterance, start_ts, end_ts = item[:3]
-                    _kws_from_vad = False
+                utterance, start_ts, end_ts = item[:3]
             except Exception:
                 continue
             try:
@@ -1494,7 +1433,7 @@ class _ASRNode(Node):
                         continue
                     text = remaining
 
-                _kws_was_triggered = _kws_triggered or _kws_from_vad
+                _kws_was_triggered = _kws_triggered
                 _kws_triggered = False
                 self._kws_triggered = False
                 result = {"text": text, "audio_start_ts": start_ts,
@@ -1555,7 +1494,11 @@ class ASRPlugin:
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
+        # Still called `kws` in config.yaml for continuity — it now carries only
+        # the asr_kws settings (trigger_mode / asr_kws_keyword / threshold).
         self._kws_cfg      = plugin_cfg.get('kws', {})
+        self._kws_cfg['trigger_mode'] = resolve_trigger_mode(
+            self._kws_cfg.get('trigger_mode', DEFAULT_TRIGGER_MODE), self._kws_cfg)
         # On by default: the saved segments are the only way to audit what the VAD
         # actually handed the recogniser when a transcription looks wrong. Bounded
         # by _max_saved_segments — see _enforce_retention(), which unlike the
@@ -1574,7 +1517,7 @@ class ASRPlugin:
         log.info(f"[asr] plugin init: model={self._asr_model}, device={self._device}, "
                  f"vad={self._vad_backend}, threshold={self._vad_threshold}, "
                  f"silence_ms={self._vad_silence_ms}, pre_roll_ms={self._vad_pre_roll_ms}, "
-                 f"kws_enabled={self._kws_cfg.get('enabled', False)}")
+                 f"trigger_mode={self._kws_cfg['trigger_mode']}")
 
     def get_tools(self) -> list:
         return TOOLS
@@ -1857,12 +1800,14 @@ class ASRPlugin:
                 self._vad_threshold = float(cfg['vad_threshold'])
             if 'vad_silence_ms' in cfg:
                 self._vad_silence_ms = int(cfg['vad_silence_ms'])
-            if 'trigger_mode' in cfg:
-                self._kws_cfg['trigger_mode'] = cfg['trigger_mode']
-            if 'kws_model' in cfg:
-                self._kws_cfg['kws_model'] = cfg['kws_model']
+            # kws_keywords is still read — not to run a KeywordSpotter, but so a
+            # card submitting the old pair (trigger_mode: kws + kws_keywords)
+            # has its wake word available for resolve_trigger_mode to carry over.
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
+            if 'trigger_mode' in cfg:
+                self._kws_cfg['trigger_mode'] = resolve_trigger_mode(
+                    cfg['trigger_mode'], self._kws_cfg)
             if 'asr_kws_keyword' in cfg:
                 self._kws_cfg['asr_kws_keyword'] = cfg['asr_kws_keyword']
             if 'asr_kws_threshold' in cfg:
