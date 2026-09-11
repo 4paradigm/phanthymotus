@@ -155,15 +155,45 @@ class DeployProgressMonitor {
  * Creates a modal overlay with progress information.
  */
 class DeployProgressUI {
-    constructor(driverId, driverName) {
+    /**
+     * @param {object} [options]
+     * @param {boolean} [options.monitor=true]  Open the per-driver deploy
+     *   WebSocket. Pass false to drive the window by hand with pushProgress()
+     *   / pushDone() / pushError() — agent-core upgrades go through
+     *   /api/system/update, which reports a step string over polling and has
+     *   no deploy channel to connect to. Without this the window opened a
+     *   socket that could never receive anything.
+     */
+    constructor(driverId, driverName, options = {}) {
         this.driverId = driverId;
         this.driverName = driverName;
-        this.monitor = new DeployProgressMonitor(driverId);
+        this.monitor = options.monitor === false
+            ? null : new DeployProgressMonitor(driverId);
         this.container = null;
         this._lastLoggedPercent = -10; // Initialize to -10 so first log happens at 0%
 
         this._createUI();
-        this._attachCallbacks();
+        if (this.monitor) this._attachCallbacks();
+    }
+
+    // ── Manual drive (no WebSocket) ──────────────────────────────────────
+    // Same three events the monitor delivers, so both transports end up in
+    // exactly one set of rendering code.
+
+    pushProgress(message, percent, stage = 'update') {
+        this._handleProgress({ type: 'progress', stage, message, percent });
+    }
+
+    pushLog(message, level = 'info') {
+        this._addLog(message, level);
+    }
+
+    pushDone(event) {
+        this._handleDone(event || {});
+    }
+
+    pushError(event) {
+        this._handleError(typeof event === 'string' ? { message: event } : event);
     }
 
     static _getMinimizedStack() {
@@ -295,7 +325,10 @@ class DeployProgressUI {
 
     _handleDone(event) {
         const { message, elapsed } = event;
-        this._addLog(`${message} (耗时 ${elapsed}s)`, 'success');
+        // Only the deploy WebSocket carries `elapsed`; the core upgrade poll has
+        // no equivalent. Unguarded this printed a literal "(耗时 undefineds)".
+        const took = Number.isFinite(elapsed) ? ` (耗时 ${elapsed}s)` : '';
+        this._addLog(`${message}${took}`, 'success');
         this._setStage('部署完成', 'success');
         this._updateProgress('done', '', 100);
 
@@ -379,7 +412,7 @@ class DeployProgressUI {
     show() {
         this.container.style.display = 'flex';
         this.minimizedIndicator.classList.add('hidden');
-        this.monitor.connect();
+        if (this.monitor) this.monitor.connect();
     }
 
     minimize() {
@@ -394,7 +427,7 @@ class DeployProgressUI {
     }
 
     close() {
-        this.monitor.disconnect();
+        if (this.monitor) this.monitor.disconnect();
         if (this.container && this.container.parentNode) {
             this.container.parentNode.removeChild(this.container);
         }
