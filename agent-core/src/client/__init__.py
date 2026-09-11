@@ -39,6 +39,7 @@ async def call(
     message_list: list[dict],
     tool_list: list[dict],
     cancel_event=None,
+    reconsider_event=None,
     model_override: str | None = None,
     trace_id: str = '',
     caller_info: dict | None = None,
@@ -51,7 +52,9 @@ async def call(
     Args:
         message_list: Messages for the LLM
         tool_list: Available tools
-        cancel_event: Optional asyncio.Event to cancel the call
+        cancel_event: Optional asyncio.Event to cancel the call (ends the whole turn)
+        reconsider_event: Optional asyncio.Event — narrower than cancel_event, aborts
+            just this request (raises RoundReconsider) without ending the turn
         model_override: Optional model name override
         trace_id: Optional trace ID for usage attribution
         caller_info: Optional caller metadata {'agent_type': 'main_agent'|'subagent'}
@@ -80,6 +83,7 @@ async def call(
         message_list=message_list,
         tool_list=tool_list,
         cancel_event=cancel_event,
+        reconsider_event=reconsider_event,
         model_override=model_override,
     )
 

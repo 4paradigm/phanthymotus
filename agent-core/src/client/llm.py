@@ -135,6 +135,7 @@ class Client():
         message_list: list[dict],
         tool_list: list[dict],
         cancel_event: 'asyncio.Event | None' = None,
+        reconsider_event: 'asyncio.Event | None' = None,
         model_override: 'str | None' = None,
     ) -> dict:
 
@@ -206,6 +207,7 @@ class Client():
                         'completion_tokens': usage.completion_tokens,
                         'total_tokens': usage.total_tokens,
                         'cached_tokens': cached_tokens,
+                        'elapsed_s': round(elapsed, 2),
                     }
                 return msg
             except Exception as e:
@@ -253,12 +255,16 @@ class Client():
                 for _, c, cfg in alive
             ]
 
-            # 如果有 cancel_event，加入哨兵 task 实现用户消息抢占
+            # 如果有 cancel_event / reconsider_event，加入哨兵 task 实现用户消息抢占
             cancel_task = None
+            reconsider_task = None
             wait_tasks = list(task_list)
             if cancel_event:
                 cancel_task = asyncio.create_task(cancel_event.wait())
                 wait_tasks.append(cancel_task)
+            if reconsider_event:
+                reconsider_task = asyncio.create_task(reconsider_event.wait())
+                wait_tasks.append(reconsider_task)
 
             done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
@@ -270,6 +276,13 @@ class Client():
                     t.cancel()
                 from event.llm import TurnCancelled
                 raise TurnCancelled("Interrupted by user message during LLM call")
+
+            # reconsider 先完成 → 这次请求作废，但 turn 不结束，调用方原地重问
+            if reconsider_task and reconsider_task in done:
+                for t in task_list:
+                    t.cancel()
+                from event.llm import RoundReconsider
+                raise RoundReconsider("Higher-priority input arrived during LLM call")
 
             # 检查是否有成功的
             for t in done:

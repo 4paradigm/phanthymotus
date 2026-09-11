@@ -48,7 +48,7 @@ function _append(event) {
   `;
   log.appendChild(row);
 
-  while (log.children.length > 500) log.removeChild(log.firstChild);
+  while (log.children.length > 1000) log.removeChild(log.firstChild);
 
   if (atBottom) log.scrollTop = log.scrollHeight;
 }
@@ -67,7 +67,8 @@ function _summarize(event) {
       ? `${p.peer || 'peer'} ← ${p.tool} 完成${p.elapsed_ms != null ? ` ${p.elapsed_ms}ms` : ''}${p.action_id ? ` [${p.action_id}]` : ''}`
       : `${p.peer || 'peer'} ← ${p.tool} 失败: ${_trunc(String(p.error || ''), 80)}`;
     case 'render':         return `renderer=${p.renderer}`;
-    case 'llm_usage':      return `tokens: in=${p.prompt_tokens} out=${p.completion_tokens} cached=${p.cached_tokens}`;
+    case 'llm_usage':      return `tokens: in=${p.prompt_tokens} out=${p.completion_tokens} cached=${p.cached_tokens}`
+                              + (p.elapsed_s != null ? ` · ${p.elapsed_s}s` : '');
     case 'turn_end':
       if (p.usage) return `✓ ${p.rounds}轮 ${p.duration_s}s | tokens: in=${p.usage.prompt_tokens} out=${p.usage.completion_tokens} cached=${p.usage.cached_tokens}`;
       return '✓ turn complete';
