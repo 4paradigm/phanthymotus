@@ -993,6 +993,15 @@ async function _executeDeploys(entries) {
     const isCoreDriver = (_catalog.core || []).some(item => _driverIdForItem(item, 'core') === driverId);
 
     if (isCoreDriver) {
+      // Same progress window as a driver deploy. It cannot use the deploy
+      // WebSocket — agent-core upgrades go through /api/system/update, which
+      // publishes a step string that _startCoreUpdatePolling reads — so the
+      // window is constructed without a monitor and driven by that poll.
+      const coreName = (_statuses[driverId] || {}).name || driverId;
+      const progressUI = new DeployProgressUI(driverId, coreName, { monitor: false });
+      progressUI.show();
+      progressUI.pushProgress('正在启动升级…', 5);
+
       _showDeployLog(driverId, '正在启动升级…');
       try {
         const res = await fetch('/api/system/update', {
@@ -1002,13 +1011,16 @@ async function _executeDeploys(entries) {
         });
         const json = await res.json();
         if (json.code !== 200) {
-          _appendLog(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
+          const msg = json.message || '未知错误';
+          _appendLog(driverId, `✗ 错误: ${msg}`, 'error');
+          progressUI.pushError({ message: msg });
         } else {
           _appendLog(driverId, '升级任务已启动，拉取镜像中…');
-          _startCoreUpdatePolling(driverId);
+          _startCoreUpdatePolling(driverId, image, progressUI);
         }
       } catch (e) {
         _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
+        progressUI.pushError({ message: `网络错误: ${e.message}` });
       }
     } else {
       // Try new deploy-v2 with progress, fallback to old API
@@ -1206,10 +1218,20 @@ function _stopLogPolling(driverId) {
 
 // ── Core update polling ───────────────────────────────────────────────────
 
-function _startCoreUpdatePolling(driverId) {
+function _startCoreUpdatePolling(driverId, targetImage, progressUI) {
   if (_logPolls[driverId]) clearInterval(_logPolls[driverId]);
 
+  const targetTag = (targetImage || '').split(':').pop();
   let attempts = 0;
+  let lastStep = '';
+  let stepsSeen = 0;
+  // True once the API has gone away at least once. agent-core restarts itself
+  // as the last act of the upgrade, so a dropped connection here is the
+  // expected path to success, not a failure.
+  let sawRestart = false;
+
+  const finish = (fn) => { _stopLogPolling(driverId); if (progressUI) fn(); };
+
   _logPolls[driverId] = setInterval(async () => {
     attempts++;
     try {
@@ -1218,9 +1240,30 @@ function _startCoreUpdatePolling(driverId) {
       const data = json.data || {};
 
       if (data.error) {
-        _stopLogPolling(driverId);
         _appendLog(driverId, `✗ 升级失败：${data.error}`, 'error');
-      } else if (data.step) {
+        finish(() => progressUI.pushError({ message: data.error }));
+        return;
+      }
+
+      if (sawRestart) {
+        // We are talking to a process that came back. Confirm it is the new
+        // image rather than the old one having merely survived a blip —
+        // reporting success on reconnect alone would call a failed upgrade
+        // that rolled back a success.
+        await _loadStatuses();
+        const running = (_statuses[driverId] || {}).running_image || '';
+        const tag = running.includes(':') ? running.split(':').pop() : '';
+        if (tag && targetTag && tag === targetTag) {
+          _appendLog(driverId, `✓ 已升级到 ${tag}`, 'success');
+          finish(() => progressUI.pushDone({ message: `升级完成：${tag}` }));
+          _render();
+          return;
+        }
+      }
+
+      if (data.step && data.step !== lastStep) {
+        lastStep = data.step;
+        stepsSeen++;
         const el = document.getElementById(`log-${driverId}`);
         if (el) {
           el.querySelectorAll('.log-output').forEach(e => e.remove());
@@ -1229,14 +1272,26 @@ function _startCoreUpdatePolling(driverId) {
           pre.textContent = data.step;
           el.appendChild(pre);
         }
+        // /api/system/update reports a step string and no percentage — there is
+        // nothing to compute one from. The bar advances per distinct step so it
+        // reflects progress through the sequence rather than bytes, capped
+        // below 100 so only a confirmed restart completes it.
+        if (progressUI) progressUI.pushProgress(data.step, Math.min(85, 15 * stepsSeen));
       }
 
       if (attempts > 90) {
-        _stopLogPolling(driverId);
         _appendLog(driverId, '✗ 升级超时', 'error');
+        finish(() => progressUI.pushError({
+          message: '升级超时',
+          suggestion: '容器可能仍在切换中，刷新页面查看当前版本。',
+        }));
       }
     } catch {
-      // 服务重启中，连接断开是正常的
+      // 服务重启中，连接断开是正常的 —— 这正是升级成功的必经之路。
+      if (!sawRestart) {
+        sawRestart = true;
+        if (progressUI) progressUI.pushProgress('服务重启中，等待重新连接…', 90);
+      }
     }
   }, 2000);
 }
