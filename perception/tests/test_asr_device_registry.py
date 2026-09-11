@@ -23,6 +23,7 @@ sherpa_onnx is stubbed out because importing plugins.asr pulls it in transitivel
 from __future__ import annotations
 
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -255,3 +256,146 @@ def test_config_still_rejects_an_explicit_unsupported_device(monkeypatch):
     assert "gpu" in result["message"]
     assert plugin._device == "cpu"
     assert loads == []
+
+
+def test_a_device_change_mid_load_supersedes_the_load_in_flight(monkeypatch):
+    """A switch made while a model is downloading must not be dropped.
+
+    Seen on Orin5: `config {parakeet-en}` started the cpu download, the operator
+    then picked gpu, and the second request updated `_device` but never reloaded
+    — the in-flight load was simply ignored. The card came up on the int8 cpu
+    weights while both the plugin and the dashboard reported gpu.
+    """
+    import threading
+
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **k: object())
+    plugin = asr.ASRPlugin({"asr_model": "sensevoice-small", "device": "cpu"},
+                           executor=None)
+
+    started, release, built = threading.Event(), threading.Event(), []
+
+    def _fake_build(cfg, on_status=None):
+        built.append((cfg["asr_model"], cfg["device"]))
+        if len(built) == 1:
+            started.set()
+            assert release.wait(5), "test deadlock"
+        return object()
+
+    monkeypatch.setattr(asr, "_build_asr_adapter", _fake_build)
+
+    first = plugin.dispatch("asr", {"action": "config", "asr_model": "parakeet-en"})
+    assert first["status"] == "loading" and first["device"] == "cpu"
+    assert started.wait(5)
+
+    second = plugin.dispatch("asr", {"action": "config",
+                                     "asr_model": "parakeet-en", "device": "gpu"})
+    assert second["status"] == "loading" and second["device"] == "gpu"
+
+    release.set()
+    deadline = time.monotonic() + 5
+    while plugin._loading and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert not plugin._loading
+    assert built == [("parakeet-en", "cpu"), ("parakeet-en", "gpu")]
+    assert plugin._plugin_cfg["device"] == "gpu"
+    assert plugin._load_error is None
+
+
+def test_config_reports_loading_while_a_load_is_still_running(monkeypatch):
+    """A no-op config mid-download must not answer "configured".
+
+    That answer ended the dashboard's progress text and left it on a bare
+    spinner for the rest of the download.
+    """
+    plugin, _ = _plugin_with(monkeypatch, "parakeet-en", "cpu")
+    plugin._loading = True
+    plugin._load_status = "正在下载模型 'parakeet-en' … 30% (30/100 MB)"
+
+    result = plugin.dispatch("asr", {"action": "config", "asr_model": "parakeet-en"})
+
+    assert result["status"] == "loading"
+    assert result["message"] == plugin._load_status
+
+
+def test_start_returns_loading_instead_of_blocking_for_a_download(monkeypatch):
+    """`start` waits only a grace period, then hands back to the info poller.
+
+    Blocking for the whole download pinned an MCP worker thread and kept the
+    dashboard from ever polling `info`, which is where the phase text lives.
+    """
+    plugin, _ = _plugin_with(monkeypatch, "parakeet-en", "cpu")
+    monkeypatch.setattr(asr, "MODEL_LOAD_GRACE_S", 0.05)
+    plugin._loading = True
+    plugin._load_status = "正在下载模型 'parakeet-en' … 30% (30/100 MB)"
+
+    began = time.monotonic()
+    result = plugin.dispatch("asr", {"action": "start", "instance_id": "card-1",
+                                     "input_topic": "/mic"})
+
+    assert result["state"] == "loading"
+    assert result["message"] == plugin._load_status
+    assert time.monotonic() - began < 1
+
+
+def test_a_start_deferred_behind_a_load_runs_when_the_model_is_ready(monkeypatch):
+    """Handing `start` back as `loading` must not silently drop it.
+
+    The caller polls `info` after that and treats anything other than `loading`
+    as the final answer — so a plugin that came back idle instead of running
+    would be read as a cancelled card, and the ASR node would never exist.
+    """
+    import threading
+
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **k: object())
+    plugin = asr.ASRPlugin({"asr_model": "sensevoice-small", "device": "cpu"},
+                           executor=types.SimpleNamespace(add_node=lambda node: None))
+    monkeypatch.setattr(asr, "MODEL_LOAD_GRACE_S", 0.05)
+
+    release = threading.Event()
+    monkeypatch.setattr(asr, "_build_asr_adapter",
+                        lambda cfg, on_status=None: (release.wait(5), object())[1])
+
+    plugin._load_model_async("parakeet-en")
+    result = plugin.dispatch("asr", {"action": "start", "instance_id": "card-1",
+                                     "input_topic": "/mic"})
+    assert result["state"] == "loading"
+    assert "card-1" in plugin._pending_starts
+    # The window between "model ready" and "node running" must not read as idle.
+    plugin._loading = False
+    assert plugin.dispatch("asr", {"action": "info"})["state"] == "loading"
+    plugin._loading = True
+
+    starts = []
+    monkeypatch.setattr(asr, "_ASRNode", lambda *a, **k: _FakeNode(starts, *a, **k))
+    release.set()
+
+    deadline = time.monotonic() + 5
+    while not starts and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert starts == ["/mic"], "the deferred start never ran"
+    assert plugin._pending_starts == {}
+
+
+def test_stop_drops_a_start_deferred_behind_a_load(monkeypatch):
+    """Otherwise it fires minutes after the operator stopped the card."""
+    plugin, _ = _plugin_with(monkeypatch, "parakeet-en", "cpu")
+    plugin._pending_starts["card-1"] = {"action": "start", "instance_id": "card-1"}
+
+    plugin.dispatch("asr", {"action": "stop", "instance_id": "card-1"})
+
+    assert plugin._pending_starts == {}
+
+
+class _FakeNode:
+    """Stands in for _ASRNode: records the topic it was started on."""
+
+    def __init__(self, log, *args, **kwargs):
+        self._log = log
+        self.topic = args[0] if args else kwargs.get("input_topic", "")
+        self.state = "idle"
+
+    def start(self):
+        self.state = "running"
+        self._log.append(self.topic)
+        return {"state": "running"}

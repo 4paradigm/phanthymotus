@@ -40,9 +40,12 @@ AUDIO_FORMAT       = "audio/pcm-16k"
 _AUDIO_FORMAT_ALIASES = frozenset({AUDIO_FORMAT, "pcm_16k_16bit_mono"})
 MIN_CHUNK_BYTES    = 1024  # 512 samples — one Silero VAD window
 
-# Upper bound on how long `start` waits for a background model load. Prevents a
-# stalled download from pinning an MCP worker thread indefinitely.
-MODEL_LOAD_TIMEOUT_S = 300
+# How long `start` waits for a background model load before returning
+# `state: loading` and letting the caller poll `info` instead. Long enough for a
+# model already on disk (a warm load is ~0.1-2 s), far too short for a download —
+# which is the point: the dashboard only shows download progress once `start`
+# has returned.
+MODEL_LOAD_GRACE_S = 3.0
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1674,6 +1677,14 @@ class ASRPlugin:
         self._plugin_cfg   = plugin_cfg
         self._loading      = False
         self._load_error   = None
+        # The (model, device) the loader thread should end up on. Written under
+        # _nodes_lock by every config request; a request that lands mid-load
+        # supersedes the one in flight rather than being dropped.
+        self._load_target  = (self._asr_model, self._device)
+        # start requests that arrived while a model was loading, by node key.
+        # `start` answers those with `state: loading` rather than blocking for
+        # the whole download, so the loader thread has to run them afterwards.
+        self._pending_starts: dict[str, dict] = {}
         # What the current load is actually doing, for `info`/`start`/`config` to
         # report. One string, set from the loader thread and read from MCP worker
         # threads — a plain attribute assignment is atomic enough for that and
@@ -1745,29 +1756,72 @@ class ASRPlugin:
         node._max_saved_segments = self._max_saved_segments
 
     def _load_model_async(self, model_name: str):
-        """Download and load ASR model in a background thread."""
+        """Download and load ASR model in a background thread.
+
+        The latest request wins. An in-flight load used to be a reason to drop
+        the new one, which lost every switch made while a model was downloading:
+        on Orin5 a `config {parakeet-en}` started the cpu download, the operator
+        then picked gpu, and that second request updated `_device` but never
+        reloaded — so the card came up on the cpu weights while both the plugin
+        and the dashboard reported gpu. Instead the loader re-reads the target
+        after each attempt and goes round again if it changed.
+        """
         import threading
         def _do_load():
-            try:
-                log.info(f"[asr] downloading/loading model '{model_name}'...")
-                self._plugin_cfg['asr_model'] = model_name
-                adapter = _build_asr_adapter(
-                    self._plugin_cfg,
-                    on_status=lambda text: setattr(self, "_load_status", text))
-                self._adapter = adapter
-                self._loading = False
-                self._load_error = None
-                self._load_status = ""
-                log.info(f"[asr] model '{model_name}' ready")
-            except Exception as e:
-                log.error(f"[asr] failed to load model '{model_name}': {e}", exc_info=True)
-                self._loading = False
-                self._load_error = str(e)
-                self._load_status = ""
+            while True:
+                with self._nodes_lock:
+                    model, device = self._load_target
+                try:
+                    log.info(f"[asr] downloading/loading model '{model}' ({device})...")
+                    adapter = _build_asr_adapter(
+                        {**self._plugin_cfg, 'asr_model': model, 'device': device},
+                        on_status=lambda text: setattr(self, "_load_status", text))
+                    error = None
+                except Exception as e:
+                    log.error(f"[asr] failed to load model '{model}': {e}", exc_info=True)
+                    adapter, error = None, str(e)
+                with self._nodes_lock:
+                    if self._load_target != (model, device):
+                        # Superseded while we were loading — drop this result,
+                        # including its error, and load what was asked for last.
+                        log.info("[asr] load of '%s' (%s) superseded by '%s' (%s)",
+                                 model, device, *self._load_target)
+                        continue
+                    if adapter is not None:
+                        self._adapter = adapter
+                        self._plugin_cfg['asr_model'] = model
+                        self._plugin_cfg['device'] = device
+                        log.info(f"[asr] model '{model}' ready")
+                    self._load_error = error
+                    self._load_status = ""
+                    self._loading = False
+                    # Left in place, not popped: `info` reports a pending start
+                    # as still loading, and the poller watching this card reads
+                    # `idle` as "cancelled". Each is dropped once it has run.
+                    deferred = list(self._pending_starts.items())
+                break
+            # Starts that arrived while the model was loading. `start` answered
+            # them with `state: loading` instead of blocking, so running them is
+            # now this thread's job — the caller only polls `info` and would
+            # read a plugin that never started as a cancelled one.
+            for key, start_args in deferred:
+                try:
+                    if error is None:
+                        log.info("[asr] running the start deferred behind the load "
+                                 "of '%s'", model)
+                        self.dispatch("asr", start_args)
+                except Exception as e:
+                    log.error(f"[asr] deferred start failed: {e}", exc_info=True)
+                finally:
+                    with self._nodes_lock:
+                        if self._pending_starts.get(key) is start_args:
+                            del self._pending_starts[key]
 
         with self._nodes_lock:
+            self._load_target = (model_name, self._device)
             if self._loading:
-                log.warning(f"[asr] a model load is already in flight, ignoring '{model_name}'")
+                log.info("[asr] load in flight; queueing '%s' (%s) as the new target",
+                         model_name, self._device)
                 return
             self._loading = True
             self._load_error = None
@@ -1779,8 +1833,11 @@ class ASRPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
-            # Report loading/error state at plugin level
-            if self._loading:
+            # Report loading/error state at plugin level. A start that is still
+            # queued behind the load counts as loading too: the caller polling
+            # this reads anything else as final, and `idle` in that window would
+            # be reported as a cancelled card moments before the node comes up.
+            if self._loading or self._pending_starts:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "loading",
@@ -1838,18 +1895,28 @@ class ASRPlugin:
 
         elif action == "start":
             if self._loading:
-                # Bounded wait. The unbounded `while self._loading: sleep(0.5)`
-                # this replaces pinned an MCP worker thread for as long as the
-                # download took — and forever if the loader thread died without
-                # raising Exception, since nothing else clears _loading.
-                deadline = time.monotonic() + MODEL_LOAD_TIMEOUT_S
+                # Short grace wait, then hand back. A warm model is ready within
+                # a second or two, and waiting for it keeps `start` synchronous
+                # the way callers expect. A cold one takes minutes — blocking for
+                # that pinned an MCP worker thread and, worse, left the operator
+                # staring at a bare spinner: `state: loading` is what makes the
+                # dashboard poll `info` and relay the download/load phase text,
+                # and it could not do that while this call had not returned.
+                #
+                # Handing back means this start has to be remembered, not
+                # dropped: the caller polls `info` and takes anything that is no
+                # longer `loading` as the final answer, so a plugin that came
+                # back idle would be read as "start cancelled".
+                deadline = time.monotonic() + MODEL_LOAD_GRACE_S
                 while self._loading:
                     if time.monotonic() > deadline:
+                        with self._nodes_lock:
+                            self._pending_starts[instance_id or
+                                                 args.get("input_topic", "")] = dict(args)
                         return {"state": "loading", "asr_model": self._asr_model,
                                 "message": (self._load_status or
-                                            f"模型 '{self._asr_model}' 仍在加载") +
-                                           f"（已等待 {MODEL_LOAD_TIMEOUT_S}s，稍后重试）"}
-                    time.sleep(0.5)
+                                            f"模型 '{self._asr_model}' 仍在加载")}
+                    time.sleep(0.1)
             if self._load_error:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
             if not self._adapter:
@@ -1899,11 +1966,15 @@ class ASRPlugin:
 
         elif action == "stop":
             with self._nodes_lock:
+                # A start deferred behind a model load has to be dropped here
+                # too, or it fires minutes after the operator stopped the card.
                 if instance_id:
                     keys = [instance_id] if instance_id in self._nodes else []
+                    self._pending_starts.pop(instance_id, None)
                 else:
                     # Stop all instances (backward compat / project stop)
                     keys = list(self._nodes.keys())
+                    self._pending_starts.clear()
                 nodes = [(k, self._nodes.pop(k)) for k in keys]
             # request_stop() before disposing: it is non-blocking and unblocks an
             # in-flight start() so _dispose_node does not sit behind it.
@@ -2015,6 +2086,14 @@ class ASRPlugin:
             for key, node in was_running:
                 self._sync_cfg(node)
                 node.start()
+            if self._loading:
+                # Nothing about the model changed, but one is still coming down
+                # the wire. Reporting "configured" here ended the dashboard's
+                # progress text mid-download and left it on a bare spinner.
+                return {"status": "loading", "asr_model": self._asr_model,
+                        "device": self._device,
+                        "message": self._load_status or
+                                   f"正在加载模型 '{self._asr_model}' ({self._device})"}
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None
