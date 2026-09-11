@@ -323,7 +323,7 @@ def select_bundle_family(bundles: dict, family: str | None = None) -> str:
 
 
 def ensure_verified_bundle(
-    name: str, model_dir: str, base_url: str, files: dict
+    name: str, model_dir: str, base_url: str, files: dict, progress_cb=None
 ) -> dict[str, str]:
     """Ensure a size/SHA256-pinned bundle is present and valid in model_dir.
 
@@ -350,7 +350,8 @@ def ensure_verified_bundle(
             if _bundle_matches(model_dir, files):
                 log.info(f"[model_downloader] {name}: verified by another instance")
                 return paths
-            _download_verified_bundle(name, base_url, model_dir, files)
+            _download_verified_bundle(name, base_url, model_dir, files,
+                                      progress_cb=progress_cb)
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -415,15 +416,23 @@ def _verify_pinned_file(path: str, metadata: dict) -> None:
 
 
 def _fetch_pinned_file(
-    name: str, url: str, destination: str, metadata: dict, label: str = ""
+    name: str, url: str, destination: str, metadata: dict, label: str = "",
+    progress_cb=None, done_bytes: int = 0, total_bytes: int = 0,
 ) -> None:
     """Download one URL to destination, verifying its pinned size and SHA256.
 
     Retries three times with a short backoff, leaving no partial file behind:
     a truncated download fails _verify_pinned_file, which is caught here, so a
     flaky link costs a retry rather than a corrupt model.
+
+    `progress_cb(pct, mb_done, mb_total)` matches _progress_hook's contract so a
+    caller can pass the same callback on either path. `done_bytes`/`total_bytes`
+    place this file inside a larger bundle, so a two-file bundle reports one
+    monotonic 0-100% instead of restarting at 0 for the second file. The pinned
+    size is the denominator — no reliance on Content-Length.
     """
     label = label or os.path.basename(destination)
+    total_bytes = total_bytes or int(metadata.get("size") or 0)
     last_error = None
     for attempt in range(1, 4):
         try:
@@ -431,12 +440,28 @@ def _fetch_pinned_file(
                 f"[model_downloader] {name}: downloading {label} "
                 f"(attempt {attempt}/3)"
             )
+            fetched = 0
+            last_pct = 0
             with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     output.write(chunk)
+                    fetched += len(chunk)
+                    if progress_cb is not None and total_bytes > 0:
+                        pct = min(int((done_bytes + fetched) * 100 / total_bytes), 100)
+                        # Same 10%-step schedule as the archive path, so this
+                        # costs nothing extra and reads the same in the UI.
+                        if pct >= last_pct + 10:
+                            last_pct = pct
+                            try:
+                                progress_cb(pct,
+                                            (done_bytes + fetched) / (1024 * 1024),
+                                            total_bytes / (1024 * 1024))
+                            except Exception as error:  # pragma: no cover
+                                log.debug(f"[model_downloader] {name}: "
+                                          f"progress_cb failed: {error}")
                 output.flush()
                 os.fsync(output.fileno())
             _verify_pinned_file(destination, metadata)
@@ -454,10 +479,17 @@ def _fetch_pinned_file(
 
 
 def _download_verified_bundle(
-    name: str, base_url: str, model_dir: str, files: dict
+    name: str, base_url: str, model_dir: str, files: dict, progress_cb=None
 ) -> None:
-    """Download and verify a multi-file model before replacing its destination."""
+    """Download and verify a multi-file model before replacing its destination.
+
+    Progress is reported across the *bundle*, not per file: every size is pinned
+    up front, so a 437 MB model plus a 10 KB tokens.txt reads as one monotonic
+    0-100% rather than jumping back to 0% for the second file.
+    """
     os.makedirs(model_dir, exist_ok=True)
+    total_bytes = sum(int(m.get("size") or 0) for m in files.values())
+    done_bytes = 0
     staging_prefix = f".{name.replace('/', '_')}-"
     with tempfile.TemporaryDirectory(prefix=staging_prefix, dir=model_dir) as staging:
         for filename, metadata in files.items():
@@ -467,7 +499,10 @@ def _download_verified_bundle(
             )
             destination = os.path.join(staging, filename)
             os.makedirs(os.path.dirname(destination), exist_ok=True)
-            _fetch_pinned_file(name, url, destination, metadata, label=filename)
+            _fetch_pinned_file(name, url, destination, metadata, label=filename,
+                               progress_cb=progress_cb, done_bytes=done_bytes,
+                               total_bytes=total_bytes)
+            done_bytes += int(metadata.get("size") or 0)
 
         for filename in files:
             final = os.path.join(model_dir, filename)
@@ -534,8 +569,14 @@ SHERPA_GPU_BUNDLES = {
 }
 
 
-def ensure_gpu_model(name: str, model_dir: str) -> dict[str, str]:
-    """Ensure a `device: gpu` weight bundle is present and SHA256-verified."""
+def ensure_gpu_model(name: str, model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Ensure a `device: gpu` weight bundle is present and SHA256-verified.
+
+    Takes the same `progress_cb(pct, mb_done, mb_total)` as ensure_model. These
+    are the largest downloads in the stack — parakeet's fp32 weights are 437 MB
+    and took 81 s on an Orin — and without a callback the card sat on a static
+    "fetching" line for that whole time, which is indistinguishable from hung.
+    """
     bundle = SHERPA_GPU_BUNDLES.get(name)
     if bundle is None:
         raise KeyError(
@@ -543,7 +584,7 @@ def ensure_gpu_model(name: str, model_dir: str) -> dict[str, str]:
             f"available: {sorted(SHERPA_GPU_BUNDLES)}"
         )
     return ensure_verified_bundle(name, model_dir, bundle["base_url"],
-                                  bundle["files"])
+                                  bundle["files"], progress_cb=progress_cb)
 
 
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──

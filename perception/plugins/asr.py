@@ -344,10 +344,31 @@ def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
     phonemization pass, which used to redo the work with a *different* segmentation
     (it skipped punctuation where _text_to_ipa splits on it) and therefore could not
     have agreed with the index it was given.
+
+    The offset is exact for the phoneme, but a phoneme boundary is not always a
+    *word* boundary: espeak does not distribute phonemes evenly over letters, so
+    a word the ASR spelled oddly can end one character early. Observed on
+    hardware \u2014 "Little fanscy show me around the exhibition hall" matched the
+    9-phoneme wake word and cut inside `fanscy`, sending the LLM
+    "**y** show me around the exhibition hall". So after cutting, finish the
+    Latin word we landed inside.
+
+    Latin only, and deliberately: CJK is written without spaces, so advancing to
+    the next boundary there would swallow the entire command
+    (\u300c\u5c0f\u8303\u5c0f\u8303\u4f60\u597d\u300d \u2192 nothing left). `isascii() and isalnum()` is the test that
+    separates the two \u2014 a Chinese character is alnum but not ASCII.
     """
     if end_pos <= 0 or not char_ends:
         return ''
     cut = char_ends[min(end_pos, len(char_ends)) - 1]
+
+    def _mid_latin_word(i: int) -> bool:
+        return (0 < i < len(text)
+                and text[i].isascii() and text[i].isalnum()
+                and text[i - 1].isascii() and text[i - 1].isalnum())
+
+    while _mid_latin_word(cut):
+        cut += 1
     return text[cut:].lstrip('\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a,.!?;: ')
 
 
@@ -813,18 +834,22 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
 
     model_dir = _model_dir_for(cfg, spec)
     _status(f"正在获取模型 '{model_name}' ({device}) …")
+    # Same callback on both paths. The gpu bundles are the largest downloads in
+    # the stack — parakeet's fp32 weights are 437 MB and took 81 s on an Orin —
+    # and until this was threaded through, the gpu branch showed the static
+    # "正在获取模型" line above for that entire time, which an operator reads as
+    # hung. (Note this only fires while bytes are moving: an already-verified
+    # bundle returns in ~2 s and the caller never sees a percentage.)
+    _on_progress = lambda pct, mb_done, mb_total: _status(
+        f"正在下载模型 '{model_name}' … {pct}% "
+        f"({mb_done:.0f}/{mb_total:.0f} MB)")
     if device == "gpu":
         # Size/SHA256-pinned: these are the largest downloads in the stack.
         from utils.model_downloader import ensure_gpu_model
-        ensure_gpu_model(spec["download"], model_dir)
+        ensure_gpu_model(spec["download"], model_dir, progress_cb=_on_progress)
     else:
         from utils.model_downloader import ensure_model
-        ensure_model(
-            spec["download"], model_dir,
-            progress_cb=lambda pct, mb_done, mb_total: _status(
-                f"正在下载模型 '{model_name}' … {pct}% "
-                f"({mb_done:.0f}/{mb_total:.0f} MB)"),
-        )
+        ensure_model(spec["download"], model_dir, progress_cb=_on_progress)
 
     num_threads = int(cfg.get('num_threads', 2))
     _status(f"正在加载模型 '{model_name}' 到内存 …")

@@ -269,3 +269,48 @@ def test_positions_are_opt_in(monkeypatch):
     _fake_cmn_phonemizer(monkeypatch)
     out = asr._text_to_ipa("小范小范")
     assert isinstance(out, list) and out and isinstance(out[0], str)
+
+
+# ── the cut must land on a word boundary, not just a phoneme boundary ────────
+#
+# Observed on Orin6 with the wake word "little fancy" (9 phonemes). The ASR
+# rendered it "Little fanscy", which phonemizes to the same 9 phonemes and
+# matched — but espeak's char offset for the last one fell one character short
+# of the end of "fanscy", so the command handed to the LLM was
+# "y show me around the exhibition hall".
+
+
+def test_a_cut_inside_a_latin_word_finishes_that_word():
+    text = "Little fanscy show me around the exhibition hall"
+    # char_ends[8] lands inside "fanscy" — one char short of its end (13).
+    char_ends = [1, 2, 4, 6, 8, 9, 10, 11, 12]
+
+    got = asr._text_after_phoneme(text, char_ends, 9)
+
+    assert got == "show me around the exhibition hall"
+    assert not got.startswith("y ")
+
+
+def test_an_exact_word_boundary_cut_is_left_alone():
+    text = "Little fancy show me around"
+    char_ends = [1, 2, 4, 6, 8, 9, 10, 11, 13]   # 13 == end of "fancy"
+
+    assert asr._text_after_phoneme(text, char_ends, 9) == "show me around"
+
+
+def test_cjk_is_never_advanced_to_the_next_boundary(monkeypatch):
+    """Chinese is written without spaces, so 'finish the word' would swallow the
+    whole command. The rule is Latin-only for exactly this reason."""
+    _fake_cmn_phonemizer(monkeypatch)
+    text = "小范小范你好"
+    _, char_ends = asr._text_to_ipa(text, with_positions=True)
+
+    assert asr._text_after_phoneme(text, char_ends, 12) == "你好"
+
+
+def test_a_cut_at_the_very_end_of_the_text_stays_empty():
+    text = "Little fanscy"
+    char_ends = [1, 2, 4, 6, 8, 9, 10, 11, 12]
+
+    # Advancing must stop at len(text) rather than run off the end.
+    assert asr._text_after_phoneme(text, char_ends, 9) == ""

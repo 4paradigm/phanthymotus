@@ -756,3 +756,93 @@ def test_ensure_model_handles_dot_slash_tar_layout(tmp_path, monkeypatch):
     assert (model_dir / "tokens.txt").read_text() == "tokens"
     assert (model_dir / "test_wavs" / "0.wav").read_bytes() == b"wav"
     assert not (model_dir / "model").exists()
+
+
+# ── gpu bundle download progress ─────────────────────────────────────────────
+#
+# The gpu weight bundles are the largest downloads in the stack — parakeet's
+# fp32 model.onnx is 437 MB and took 81 s on an Orin. Until progress_cb was
+# threaded through, only the *archive* path (device: cpu) reported percentages;
+# the bundle path reported nothing, so the card sat on a static "fetching" line
+# for 81 s, which an operator cannot tell apart from hung.
+
+
+def test_ensure_verified_bundle_reports_download_progress(tmp_path, monkeypatch):
+    # One 4 MB file so the 1 MB read loop crosses several 10% steps.
+    payloads = {"model.onnx": b"m" * (4 << 20), "tokens.txt": b"a\nb\n"}
+    manifest = _manifest(payloads)
+    _serve(monkeypatch, payloads, [])
+    seen: list[tuple] = []
+
+    model_downloader.ensure_verified_bundle(
+        "asr_gpu", str(tmp_path / "m"), "https://example/x", manifest,
+        progress_cb=lambda pct, done, total: seen.append((pct, done, total)),
+    )
+
+    assert seen, "no progress was reported for a multi-megabyte bundle"
+    pcts = [p for p, _, _ in seen]
+    assert pcts == sorted(pcts), f"progress went backwards: {pcts}"
+    assert max(pcts) <= 100
+
+
+def test_bundle_progress_spans_the_whole_bundle_not_each_file(tmp_path, monkeypatch):
+    """Per-file percentages would drop back to 0% when the second file starts.
+    parakeet's bundle is a 437 MB model plus a 10 KB tokens.txt, so that would
+    read as 100% → 0% → 100% right at the end of a 81 s wait."""
+    payloads = {"model.onnx": b"m" * (4 << 20), "tokens.txt": b"a\nb\n"}
+    manifest = _manifest(payloads)
+    _serve(monkeypatch, payloads, [])
+    totals: set = set()
+
+    model_downloader.ensure_verified_bundle(
+        "asr_gpu", str(tmp_path / "m"), "https://example/x", manifest,
+        progress_cb=lambda pct, done, total: totals.add(round(total, 3)),
+    )
+
+    # One denominator for the whole bundle, and it is the sum of the pinned
+    # sizes — not either file's own size.
+    assert len(totals) == 1, f"denominator changed mid-bundle: {totals}"
+    expected = sum(m["size"] for m in manifest.values()) / (1024 * 1024)
+    assert abs(totals.pop() - expected) < 0.001
+
+
+def test_a_cached_bundle_reports_no_progress_and_no_download(tmp_path, monkeypatch):
+    """An already-verified bundle returns in ~2 s; emitting 0-100% for it would
+    show a phantom download on every card start."""
+    payloads = {"model.onnx": b"m" * (2 << 20), "tokens.txt": b"a\nb\n"}
+    manifest = _manifest(payloads)
+    model_dir = tmp_path / "m"
+    model_dir.mkdir()
+    for name, data in payloads.items():
+        (model_dir / name).write_bytes(data)
+    calls: list[str] = []
+    _serve(monkeypatch, payloads, calls)
+    seen: list = []
+
+    model_downloader.ensure_verified_bundle(
+        "asr_gpu", str(model_dir), "https://example/x", manifest,
+        progress_cb=lambda *a: seen.append(a),
+    )
+
+    assert calls == [], "re-downloaded a bundle that was already verified"
+    assert seen == []
+
+
+def test_ensure_gpu_model_forwards_the_callback(monkeypatch):
+    """The plugin calls ensure_gpu_model, not ensure_verified_bundle — a
+    callback dropped at that seam is invisible until someone watches a 437 MB
+    download with no percentage."""
+    forwarded = {}
+    monkeypatch.setitem(
+        model_downloader.SHERPA_GPU_BUNDLES, "probe_gpu",
+        {"base_url": "https://example/x", "files": {}},
+    )
+    monkeypatch.setattr(
+        model_downloader, "ensure_verified_bundle",
+        lambda *a, **kw: forwarded.update(kw) or {},
+    )
+
+    sentinel = object()
+    model_downloader.ensure_gpu_model("probe_gpu", "/tmp/x", progress_cb=sentinel)
+
+    assert forwarded.get("progress_cb") is sentinel
