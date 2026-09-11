@@ -7798,3 +7798,183 @@ html, body {
   .peer-pending-actions { margin-left: 0; width: 100%; }
   .peer-sas { font-size: 26px; }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   DEPLOY PROGRESS MODAL
+   ──────────────────────────────────────────────────────────────────────────
+   These rules used to live inside deploy-progress.js as a hardcoded dark
+   palette (#1e1e1e card, #0a0a0a log, #4caf50 bar) injected at runtime — the
+   only component in the dashboard that did not use the tokens above, so it
+   rendered as a black terminal window in the middle of a warm parchment UI.
+   Keep it here: a colour literal in this block is a bug, not a shortcut.
+══════════════════════════════════════════════════════════════════════════ */
+.deploy-progress-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.6);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+.deploy-progress-content {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 18px 22px 20px;
+  min-width: 500px;
+  max-width: 700px;
+  max-height: 80vh;
+  overflow: auto;
+  color: var(--text);
+  font-family: var(--font-ui);
+}
+.deploy-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.deploy-progress-header h3 {
+  margin: 0;
+  flex: 1;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 24px;
+  letter-spacing: -.01em;
+}
+.deploy-progress-header-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.deploy-progress-minimize,
+.deploy-progress-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 20px;
+  line-height: 24px;
+  cursor: pointer;
+  padding: 0 4px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.deploy-progress-minimize:hover,
+.deploy-progress-close:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+  border-radius: var(--radius-xs);
+}
+.deploy-progress-close { font-size: 24px; }
+
+.deploy-progress-checks { margin-bottom: 15px; }
+.deploy-progress-check {
+  padding: 8px;
+  margin: 4px 0;
+  border-radius: var(--radius-xs);
+  font-size: 13px;
+}
+.deploy-progress-check.pass    { background: var(--green-bg);  color: var(--green); }
+.deploy-progress-check.warning { background: var(--yellow-bg); color: var(--yellow); }
+.deploy-progress-check.fail    { background: var(--red-bg);    color: var(--red); }
+
+.deploy-progress-stage {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+.deploy-progress-stage:empty { display: none; }
+.deploy-progress-stage.success { color: var(--green); }
+.deploy-progress-stage.error   { color: var(--red); }
+
+.deploy-progress-bar {
+  height: 10px;
+  background: var(--bg-input);
+  border-radius: 5px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.deploy-progress-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width .3s ease;
+  width: 0%;
+  min-width: 2px;
+}
+.deploy-progress-details {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 15px;
+}
+.deploy-progress-log {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.deploy-progress-log-entry {
+  margin: 2px 0;
+  color: var(--text-muted);
+}
+.deploy-progress-log-entry.success { color: var(--green); }
+.deploy-progress-log-entry.error   { color: var(--red); }
+
+/* Minimized indicator stack — one indicator per active deployment, so several
+   concurrent deploys don't render on top of each other */
+.deploy-progress-minimized-stack {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 12px;
+  z-index: 9999;
+}
+.deploy-progress-minimized {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: 12px 16px;
+  min-width: 280px;
+  cursor: pointer;
+  transition: transform .2s, box-shadow .2s;
+}
+.deploy-progress-minimized:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+.deploy-progress-minimized.hidden { display: none; }
+.deploy-progress-minimized-content { color: var(--text); }
+.deploy-progress-minimized-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.deploy-progress-minimized-spinner {
+  animation: spin 1s linear infinite;
+  font-size: 16px;
+  color: var(--accent);
+}
+.deploy-progress-minimized-progress {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.deploy-progress-minimized-progress.error { color: var(--red); }
