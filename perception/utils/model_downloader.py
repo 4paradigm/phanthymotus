@@ -543,6 +543,24 @@ SHERPA_GPU_BUNDLES = {
             },
         },
     },
+    # Offline NeMo Parakeet CTC 110M, fp32. The int8 archive this model's cpu
+    # entry uses is deliberately NOT reused here: ONNX Runtime's CUDA provider
+    # has no int8 kernels and falls back per node. No fp16 variant is published
+    # upstream, so fp32 is the only gpu option and there is nothing to compare
+    # it against — which, given what fp16 did to sensevoice on CUDA, is fine.
+    "asr_parakeet_en_gpu": {
+        "base_url": f"{SHERPA_GPU_MODEL_BASE}/nemo-parakeet-tdt-ctc-110m-en-fp32",
+        "files": {
+            "model.onnx": {
+                "size": 458161021,
+                "sha256": "936806cf3dd0db5aba53f8c7410bb5632d7a8ad6b2c51009f5e4fc0890ec76bf",
+            },
+            "tokens.txt": {
+                "size": 9953,
+                "sha256": "450e56bd2f036fe5b6aa821865838cc5aa9d8b0106134ce9a9ba0664abe6cd10",
+            },
+        },
+    },
     # Offline SenseVoice, fp16 — faster than fp32 on CUDA (344 ms vs 416 ms), half
     # the size, and transcript-identical to fp32 on both providers.
     "asr_sensevoice_gpu": {

@@ -905,7 +905,7 @@ just a different provider string.
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
 | `paraformer-offline` | int8 | — not offered | unmeasured |
 | `zipformer-en` | int8 | — not offered | unmeasured |
-| `parakeet-en` | int8, 104 MB | — not offered | unmeasured |
+| `parakeet-en` | int8, 104 MB | **fp32, 437 MB** | **4.9x** long / **2.0x** short |
 
 **Pick `parakeet-en` over `zipformer-en` for English.** Both are English-only, but
 they are trained on very different audio. `zipformer-en` is LibriSpeech — 960 h of
@@ -920,9 +920,21 @@ in the pinned sherpa-onnx 1.13.6 all along.
 Measured inside the perception image on both JetPack lines, cpu provider,
 `num_threads=2` — RTF 0.039/0.054 on Orin 6 (jp6.1) and 0.040/0.055 on Orin 5
 (jp5.11) for the bundle's 7.4 s and 1.0 s samples. Roughly 25x realtime on either
-line, with punctuation and capitalisation in the transcript. No gpu pair is
-offered because none has been benchmarked; that is the admission rule below, and
-CPU was the point of picking this model anyway.
+line, with punctuation and capitalisation in the transcript. CPU was the point of
+picking this model, and cpu remains the sensible default for it.
+
+A gpu pair is offered as well, and it went through the admission rule below on
+both lines: 6 runs each, first discarded as warmup, against the int8 cpu entry.
+The 7.43 s clip takes 56/57 ms on cuda against 275/271 ms on cpu (~4.9x); the
+0.99 s clip takes 26/29 ms against 52/51 ms (~2.0x). The short clip wins less
+because fixed per-call overhead dominates, and short is the shape most robot
+utterances have — budget for ~2x, not ~5x. Transcripts were read, not just timed:
+all six configurations returned byte-identical text, stable across repeats, with
+none of the silent empty-transcript failure sensevoice fp16 shows on CUDA. The
+weights are fp32 because no fp16 variant is published upstream and int8 on CUDA
+is slower, not faster. Cold start on cuda is ~2.1 s on jp5.11 (466 ms on jp6.1)
+against ~290 ms on cpu, absorbed by the load-time warmup. The ~2 GB of RAM a CUDA
+context costs applies here as much as anywhere — see below.
 
 ⚠️ **`sensevoice-small` on gpu drops some utterances entirely** — fp16 under the
 CUDA provider returns an empty transcript for certain inputs, silently and

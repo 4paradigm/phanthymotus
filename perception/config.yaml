@@ -21,8 +21,9 @@ plugins:
     # cpu | gpu — which weights get loaded is per (model, device) in
     # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
     # jp5.11 only) and is only offered for models where it was benchmarked and
-    # the transcripts were read: sensevoice-small (fp16) and paraformer-zh-en
-    # (fp32). Everything else is cpu-only — int8 weights are slower on CUDA, not
+    # the transcripts were read: sensevoice-small (fp16), paraformer-zh-en
+    # (fp32) and parakeet-en (fp32). Everything else is cpu-only — int8 weights
+    # are slower on CUDA, not
     # faster, because ONNX Runtime's CUDA provider has no int8 kernels.
     #
     # gpu is ~3.4x faster per utterance (58 ms vs 195 ms p50 on 1-4 s of speech)

@@ -376,7 +376,7 @@ TOOLS = [
                                                  "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
                                                  "never gives back — check headroom before enabling",
                                   "default": "cpu", "scope": "shared",
-                                  "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small"]}},
+                                  "x-show-when": {"asr_model": ["parakeet-en", "paraformer-zh-en", "sensevoice-small"]}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -763,13 +763,28 @@ ASR_MODELS = {
         "label": "Parakeet CTC 110M (en only, offline, noise-robust)",
         "adapter": SherpaOnnxNemoCtcAdapter,
         "devices": {
-            # No gpu entry: never benchmarked on either Jetson line, and the
-            # rule in perception/README.md is that a gpu pair is admitted only
-            # after it has been measured *and* its transcripts read. It was
-            # chosen to be viable on the CPU in the first place — the int8
-            # archive is 104 MB, the smallest offline English option here.
             "cpu": {"download": "asr_parakeet_en", "dtype": "int8",
                     "dir": "/models/sherpa-onnx/parakeet-en"},
+            # fp32, measured on BOTH lines — Orin5 (jp5.11) and Orin6 (jp6.1) —
+            # against the int8 cpu entry, 6 runs each, first discarded as warmup:
+            #
+            #   7.43 s clip:  56/57 ms cuda vs 275/271 ms cpu   → ~4.9x
+            #   0.99 s clip:  26/29 ms cuda vs  52/ 51 ms cpu   → ~2.0x
+            #
+            # The short clip wins less because fixed per-call overhead dominates,
+            # which is the shape most robot utterances have — budget for ~2x, not
+            # ~5x. Transcripts were read, not just timed: all six configurations
+            # (fp32/cuda, fp32/cpu, int8/cpu on each line) returned byte-identical
+            # text, stable across repeats. That check is not ceremony — sensevoice
+            # fp16 on CUDA is fast, self-consistent, and silently returns an empty
+            # transcript for some inputs. This model shows no such failure.
+            #
+            # Cold start on CUDA is ~2.1 s on jp5.11 (466 ms on jp6.1) against
+            # ~290 ms on cpu; _warmup_adapter already absorbs that at load time.
+            # The ~2 GB of RAM a CUDA context costs, ~1.4 GB of it unreturnable,
+            # applies here as much as to any gpu entry — see README.
+            "gpu": {"download": "asr_parakeet_en_gpu", "dtype": "fp32",
+                    "dir": "/models/sherpa-onnx/parakeet-en-gpu"},
         },
     },
     "sensevoice-small": {

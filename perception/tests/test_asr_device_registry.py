@@ -226,17 +226,18 @@ def test_config_degrades_a_carried_over_device_instead_of_rejecting(monkeypatch)
     but the form still submits the last selected value. Rejecting that left the
     card running the previous model while the operator believed they had
     switched — seen on Orin5, where a parakeet-en request was rejected and the
-    transcripts that followed were sensevoice-small's.
+    transcripts that followed were sensevoice-small's. (parakeet-en has gpu
+    weights now, so the cpu-only model under test here is zipformer-en.)
     """
     plugin, loads = _plugin_with(monkeypatch, "sensevoice-small", "gpu")
 
     result = plugin.dispatch("asr", {"action": "config",
-                                     "asr_model": "parakeet-en", "device": "gpu"})
+                                     "asr_model": "zipformer-en", "device": "gpu"})
 
     assert result["status"] != "error", result
     assert result["device"] == "cpu"
-    assert plugin._asr_model == "parakeet-en"
-    assert loads == ["parakeet-en"]
+    assert plugin._asr_model == "zipformer-en"
+    assert loads == ["zipformer-en"]
 
 
 def test_config_still_rejects_an_explicit_unsupported_device(monkeypatch):
@@ -245,10 +246,10 @@ def test_config_still_rejects_an_explicit_unsupported_device(monkeypatch):
     Degrading this one silently is how a "GPU is not faster" bug report gets
     written against a model that never ran on the GPU at all.
     """
-    plugin, loads = _plugin_with(monkeypatch, "parakeet-en", "cpu")
+    plugin, loads = _plugin_with(monkeypatch, "zipformer-en", "cpu")
 
     result = plugin.dispatch("asr", {"action": "config",
-                                     "asr_model": "parakeet-en", "device": "gpu"})
+                                     "asr_model": "zipformer-en", "device": "gpu"})
 
     assert result["status"] == "error"
     assert "gpu" in result["message"]
