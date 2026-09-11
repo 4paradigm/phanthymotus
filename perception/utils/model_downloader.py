@@ -25,8 +25,16 @@ log = logging.getLogger(__name__)
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
 
 
-def _progress_hook(name: str):
-    """Create a reporthook for urlretrieve that logs download progress."""
+def _progress_hook(name: str, progress_cb=None):
+    """Create a reporthook for urlretrieve that logs download progress.
+
+    `progress_cb(pct, mb_done, mb_total)` is for callers that surface progress in
+    a UI rather than only in the log — the dashboard shows one status string per
+    plugin, and "downloading 60%" is a very different thing to wait for than
+    "loading". Called on the same 10%-step schedule as the log line, so it costs
+    nothing extra; exceptions from it are swallowed because a status update
+    failing must never abort a download that is otherwise fine.
+    """
     last_pct = [0]
     def hook(block_num, block_size, total_size):
         if total_size > 0:
@@ -36,23 +44,20 @@ def _progress_hook(name: str):
                 mb_done = block_num * block_size / (1024 * 1024)
                 mb_total = total_size / (1024 * 1024)
                 log.info(f"[model_downloader] {name}: {pct}% ({mb_done:.1f}/{mb_total:.1f} MB)")
+                if progress_cb is not None:
+                    try:
+                        progress_cb(pct, mb_done, mb_total)
+                    except Exception as error:  # pragma: no cover - defensive
+                        log.debug(f"[model_downloader] {name}: progress_cb failed: {error}")
     return hook
 
 MODELS = {
-    "asr": {
-        "url": f"{COS_BASE}/sherpa-onnx-streaming-paraformer-bilingual-zh-en.zip",
-        "check_file": "tokens.txt",
-    },
-    "asr_en": {
-        "url": f"{COS_BASE}/sherpa-onnx-streaming-zipformer-en-2023-06-26.zip",
-        "check_file": "tokens.txt",
-    },
     "asr_sensevoice": {
         "url": f"{COS_BASE}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.zip",
         "check_file": "tokens.txt",
     },
-    "asr_paraformer_offline": {
-        "url": f"{COS_BASE}/sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2",
+    "asr_parakeet_en": {
+        "url": f"{COS_BASE}/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8.tar.bz2",
         "check_file": "tokens.txt",
     },
     "asr_x_asr": {
@@ -68,18 +73,6 @@ MODELS = {
         "check_file": "vocos-16khz-univ.onnx",
         "single_file": True,
     },
-    "kws": {
-        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
-        "check_file": "tokens.txt",
-    },
-    "kws_zh": {
-        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.zip",
-        "check_file": "tokens.txt",
-    },
-    "kws_en": {
-        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.zip",
-        "check_file": "tokens.txt",
-    },
     "vad": {
         "url": f"{COS_BASE}/silero_vad.onnx",
         "check_file": "silero_vad.onnx",
@@ -93,7 +86,7 @@ MODELS = {
 }
 
 
-def ensure_model(name: str, model_dir: str) -> None:
+def ensure_model(name: str, model_dir: str, progress_cb=None) -> None:
     """Ensure model files exist in model_dir. Download from COS if missing.
 
     Serialized per (model_dir, name) with a file lock, and every download lands
@@ -122,13 +115,14 @@ def ensure_model(name: str, model_dir: str) -> None:
             if os.path.exists(check_path):
                 log.info(f"[model_downloader] {name}: fetched by another instance")
                 return
-            _download_model(name, info, model_dir, check_path)
+            _download_model(name, info, model_dir, check_path, progress_cb)
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _download_model(name: str, info: dict, model_dir: str, check_path: str) -> None:
+def _download_model(name: str, info: dict, model_dir: str, check_path: str,
+                    progress_cb=None) -> None:
     """Fetch one legacy model into model_dir. Caller holds the per-model lock."""
     url = info["url"]
     log.info(f"[model_downloader] {name}: downloading from {url} ...")
@@ -140,7 +134,7 @@ def _download_model(name: str, info: dict, model_dir: str, check_path: str) -> N
                                          delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+            urlretrieve(url, tmp_path, reporthook=_progress_hook(name, progress_cb))
             os.chmod(tmp_path, 0o644)
             os.replace(tmp_path, check_path)
             log.info(f"[model_downloader] {name}: done.")
@@ -159,7 +153,7 @@ def _download_model(name: str, info: dict, model_dir: str, check_path: str) -> N
         tmp_path = tmp.name
 
     try:
-        urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+        urlretrieve(url, tmp_path, reporthook=_progress_hook(name, progress_cb))
         log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
 
         # Extract beside the destination, then move the files in, so a partly
@@ -216,6 +210,15 @@ def _extract_tar(tar_path: str, model_dir: str) -> None:
         if not members:
             raise RuntimeError(f"Empty archive: {tar_path}")
 
+        # Drop the leading "./" GNU tar writes for archives built with `tar -c .`
+        # BEFORE computing the prefix. Otherwise every member shares a "." first
+        # component, _common_prefix_from_names strips just "./", and the archive's
+        # real top-level directory survives — so check_file ends up one level
+        # below where the caller looks and the download is reported as corrupt.
+        # (sherpa-onnx publishes both layouts; the NeMo Parakeet asset is "./".)
+        for m in members:
+            m.name = _strip_dot_slash(m.name)
+
         names = [m.name for m in members if not m.isdir()]
         prefix = _common_prefix_from_names(names)
         for m in members:
@@ -227,6 +230,13 @@ def _extract_tar(tar_path: str, model_dir: str) -> None:
                 continue
             m.name = m.name.lstrip("/")
             tf.extract(m, model_dir)
+
+
+def _strip_dot_slash(name: str) -> str:
+    """Remove leading "./" components from an archive member name."""
+    while name.startswith("./"):
+        name = name[2:]
+    return name
 
 
 def _common_prefix_from_names(names: list[str]) -> str:
@@ -313,7 +323,7 @@ def select_bundle_family(bundles: dict, family: str | None = None) -> str:
 
 
 def ensure_verified_bundle(
-    name: str, model_dir: str, base_url: str, files: dict
+    name: str, model_dir: str, base_url: str, files: dict, progress_cb=None
 ) -> dict[str, str]:
     """Ensure a size/SHA256-pinned bundle is present and valid in model_dir.
 
@@ -340,7 +350,8 @@ def ensure_verified_bundle(
             if _bundle_matches(model_dir, files):
                 log.info(f"[model_downloader] {name}: verified by another instance")
                 return paths
-            _download_verified_bundle(name, base_url, model_dir, files)
+            _download_verified_bundle(name, base_url, model_dir, files,
+                                      progress_cb=progress_cb)
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -405,15 +416,23 @@ def _verify_pinned_file(path: str, metadata: dict) -> None:
 
 
 def _fetch_pinned_file(
-    name: str, url: str, destination: str, metadata: dict, label: str = ""
+    name: str, url: str, destination: str, metadata: dict, label: str = "",
+    progress_cb=None, done_bytes: int = 0, total_bytes: int = 0,
 ) -> None:
     """Download one URL to destination, verifying its pinned size and SHA256.
 
     Retries three times with a short backoff, leaving no partial file behind:
     a truncated download fails _verify_pinned_file, which is caught here, so a
     flaky link costs a retry rather than a corrupt model.
+
+    `progress_cb(pct, mb_done, mb_total)` matches _progress_hook's contract so a
+    caller can pass the same callback on either path. `done_bytes`/`total_bytes`
+    place this file inside a larger bundle, so a two-file bundle reports one
+    monotonic 0-100% instead of restarting at 0 for the second file. The pinned
+    size is the denominator — no reliance on Content-Length.
     """
     label = label or os.path.basename(destination)
+    total_bytes = total_bytes or int(metadata.get("size") or 0)
     last_error = None
     for attempt in range(1, 4):
         try:
@@ -421,12 +440,28 @@ def _fetch_pinned_file(
                 f"[model_downloader] {name}: downloading {label} "
                 f"(attempt {attempt}/3)"
             )
+            fetched = 0
+            last_pct = 0
             with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
                     output.write(chunk)
+                    fetched += len(chunk)
+                    if progress_cb is not None and total_bytes > 0:
+                        pct = min(int((done_bytes + fetched) * 100 / total_bytes), 100)
+                        # Same 10%-step schedule as the archive path, so this
+                        # costs nothing extra and reads the same in the UI.
+                        if pct >= last_pct + 10:
+                            last_pct = pct
+                            try:
+                                progress_cb(pct,
+                                            (done_bytes + fetched) / (1024 * 1024),
+                                            total_bytes / (1024 * 1024))
+                            except Exception as error:  # pragma: no cover
+                                log.debug(f"[model_downloader] {name}: "
+                                          f"progress_cb failed: {error}")
                 output.flush()
                 os.fsync(output.fileno())
             _verify_pinned_file(destination, metadata)
@@ -444,10 +479,17 @@ def _fetch_pinned_file(
 
 
 def _download_verified_bundle(
-    name: str, base_url: str, model_dir: str, files: dict
+    name: str, base_url: str, model_dir: str, files: dict, progress_cb=None
 ) -> None:
-    """Download and verify a multi-file model before replacing its destination."""
+    """Download and verify a multi-file model before replacing its destination.
+
+    Progress is reported across the *bundle*, not per file: every size is pinned
+    up front, so a 437 MB model plus a 10 KB tokens.txt reads as one monotonic
+    0-100% rather than jumping back to 0% for the second file.
+    """
     os.makedirs(model_dir, exist_ok=True)
+    total_bytes = sum(int(m.get("size") or 0) for m in files.values())
+    done_bytes = 0
     staging_prefix = f".{name.replace('/', '_')}-"
     with tempfile.TemporaryDirectory(prefix=staging_prefix, dir=model_dir) as staging:
         for filename, metadata in files.items():
@@ -457,7 +499,10 @@ def _download_verified_bundle(
             )
             destination = os.path.join(staging, filename)
             os.makedirs(os.path.dirname(destination), exist_ok=True)
-            _fetch_pinned_file(name, url, destination, metadata, label=filename)
+            _fetch_pinned_file(name, url, destination, metadata, label=filename,
+                               progress_cb=progress_cb, done_bytes=done_bytes,
+                               total_bytes=total_bytes)
+            done_bytes += int(metadata.get("size") or 0)
 
         for filename in files:
             final = os.path.join(model_dir, filename)
@@ -488,24 +533,21 @@ SHERPA_GPU_MODEL_BASE = os.environ.get(
     "SHERPA_GPU_MODEL_BASE_URL", f"{COS_BASE}/sherpa-onnx-gpu"
 )
 SHERPA_GPU_BUNDLES = {
-    # Streaming paraformer, fp32. fp16 exists but is NOT used here: on CUDA it
-    # emits nothing but </s> (correct on CPU, so the conversion is fine and the
-    # CUDA+fp16+streaming combination is not), and it is slower than fp32 anyway
-    # (2077 ms vs 1859 ms).
-    "asr_gpu": {
-        "base_url": f"{SHERPA_GPU_MODEL_BASE}/streaming-paraformer-bilingual-zh-en-fp32",
+    # Offline NeMo Parakeet CTC 110M, fp32. The int8 archive this model's cpu
+    # entry uses is deliberately NOT reused here: ONNX Runtime's CUDA provider
+    # has no int8 kernels and falls back per node. No fp16 variant is published
+    # upstream, so fp32 is the only gpu option and there is nothing to compare
+    # it against — which, given what fp16 did to sensevoice on CUDA, is fine.
+    "asr_parakeet_en_gpu": {
+        "base_url": f"{SHERPA_GPU_MODEL_BASE}/nemo-parakeet-tdt-ctc-110m-en-fp32",
         "files": {
-            "encoder.onnx": {
-                "size": 636348877,
-                "sha256": "832c8e8d3f758f4ab0fcfc011eec91154ecd129b7305564a7b461b20064ebcc6",
-            },
-            "decoder.onnx": {
-                "size": 228464044,
-                "sha256": "e178f5a7dd4efbf5905a797807006d773b12116eb39fed3d16758e68f9f50921",
+            "model.onnx": {
+                "size": 458161021,
+                "sha256": "936806cf3dd0db5aba53f8c7410bb5632d7a8ad6b2c51009f5e4fc0890ec76bf",
             },
             "tokens.txt": {
-                "size": 75756,
-                "sha256": "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6",
+                "size": 9953,
+                "sha256": "450e56bd2f036fe5b6aa821865838cc5aa9d8b0106134ce9a9ba0664abe6cd10",
             },
         },
     },
@@ -527,8 +569,14 @@ SHERPA_GPU_BUNDLES = {
 }
 
 
-def ensure_gpu_model(name: str, model_dir: str) -> dict[str, str]:
-    """Ensure a `device: gpu` weight bundle is present and SHA256-verified."""
+def ensure_gpu_model(name: str, model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Ensure a `device: gpu` weight bundle is present and SHA256-verified.
+
+    Takes the same `progress_cb(pct, mb_done, mb_total)` as ensure_model. These
+    are the largest downloads in the stack — parakeet's fp32 weights are 437 MB
+    and took 81 s on an Orin — and without a callback the card sat on a static
+    "fetching" line for that whole time, which is indistinguishable from hung.
+    """
     bundle = SHERPA_GPU_BUNDLES.get(name)
     if bundle is None:
         raise KeyError(
@@ -536,7 +584,7 @@ def ensure_gpu_model(name: str, model_dir: str) -> dict[str, str]:
             f"available: {sorted(SHERPA_GPU_BUNDLES)}"
         )
     return ensure_verified_bundle(name, model_dir, bundle["base_url"],
-                                  bundle["files"])
+                                  bundle["files"], progress_cb=progress_cb)
 
 
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──

@@ -79,7 +79,7 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 `tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
 `config.yaml`) selects the voice. Engines are named **`<model>-<languages>`** —
-the same shape `asr_model` uses (`x-asr-zh-en`, `paraformer-zh-en`, `zipformer-en`),
+the same shape `asr_model` uses (`x-asr-zh-en`, `parakeet-en`, `sensevoice-small`),
 because the dashboard renders the raw enum string, so these two dropdowns sit side
 by side in front of the same operator. Language codes, not country codes: `zh`, not
 `cn`. Naming an engine after its *runtime* was the previous mistake — `matcha-zh-en`
@@ -901,10 +901,50 @@ just a different provider string.
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
 | `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance ⚠️ |
-| `paraformer-zh-en` (streaming) | int8, 226 MB | **fp32, 825 MB** | **1.77x** |
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
-| `paraformer-offline` | int8 | — not offered | unmeasured |
-| `zipformer-en` | int8 | — not offered | unmeasured |
+| `parakeet-en` | int8, 104 MB | **fp32, 437 MB** | **4.9x** long / **2.0x** short |
+
+### Removed models
+
+`paraformer-zh-en`, `paraformer-offline` and `zipformer-en` were dropped from the
+registry for accuracy. The two bilingual paraformers were worse than
+`sensevoice-small` on the same audio; `zipformer-en` is LibriSpeech — 960 h of
+clean read audiobook speech — which is the wrong distribution for a robot whose
+microphone always carries cooling-fan noise.
+
+`REMOVED_ASR_MODELS` in `plugins/asr.py` maps each of them onto a replacement
+(the paraformers → `sensevoice-small`, `zipformer-en` → `parakeet-en`) and logs a
+warning. That map is not politeness: a card's `asr_model` lives in agent-core's
+config DB **on each robot**, so an upgrade cannot rewrite it. A removed name that
+resolves to nothing makes `config` return an error and the card comes up
+`state: error` after the next restart, on every deployment that had picked one.
+Do not delete an entry from that map when you remove a model — add one.
+
+**`parakeet-en` is the English model.** NeMo FastConformer CTC 110M, trained on
+~1.7 M h of diverse audio with non-speech material deliberately mixed in to
+suppress hallucination, and it emits punctuation and capitalisation, which
+`zipformer-en` did not. It is also the smallest offline English archive here
+(104 MB int8) and needs no new runtime: `OfflineRecognizer.from_nemo_ctc` has been
+in the pinned sherpa-onnx 1.13.6 all along.
+
+Measured inside the perception image on both JetPack lines, cpu provider,
+`num_threads=2` — RTF 0.039/0.054 on Orin 6 (jp6.1) and 0.040/0.055 on Orin 5
+(jp5.11) for the bundle's 7.4 s and 1.0 s samples. Roughly 25x realtime on either
+line, with punctuation and capitalisation in the transcript. CPU was the point of
+picking this model, and cpu remains the sensible default for it.
+
+A gpu pair is offered as well, and it went through the admission rule below on
+both lines: 6 runs each, first discarded as warmup, against the int8 cpu entry.
+The 7.43 s clip takes 56/57 ms on cuda against 275/271 ms on cpu (~4.9x); the
+0.99 s clip takes 26/29 ms against 52/51 ms (~2.0x). The short clip wins less
+because fixed per-call overhead dominates, and short is the shape most robot
+utterances have — budget for ~2x, not ~5x. Transcripts were read, not just timed:
+all six configurations returned byte-identical text, stable across repeats, with
+none of the silent empty-transcript failure sensevoice fp16 shows on CUDA. The
+weights are fp32 because no fp16 variant is published upstream and int8 on CUDA
+is slower, not faster. Cold start on cuda is ~2.1 s on jp5.11 (466 ms on jp6.1)
+against ~290 ms on cpu, absorbed by the load-time warmup. The ~2 GB of RAM a CUDA
+context costs applies here as much as anywhere — see below.
 
 ⚠️ **`sensevoice-small` on gpu drops some utterances entirely** — fp16 under the
 CUDA provider returns an empty transcript for certain inputs, silently and
@@ -1109,8 +1149,9 @@ That rule exists because of one result. Streaming paraformer fp16 on CUDA:
 The same fp16 file on CPU transcribed correctly, so the conversion was fine and the
 CUDA+fp16+streaming *combination* is not. Session creation, speed, and
 self-consistency were all green. Only reading the text caught it. (fp16 is also
-slower than fp32 for that model, so there was nothing to gain by debugging it —
-`paraformer-zh-en`'s gpu entry is fp32.)
+slower than fp32 for that model, so there was nothing to gain by debugging it.
+That model has since been removed from the registry for accuracy; the finding is
+kept because it is the reason every gpu entry has to be listened to, not timed.)
 
 Checklist:
 
@@ -1306,7 +1347,27 @@ place it is again the *only* remaining cause, and the log line
 
 ## asr_kws and espeak
 
-`trigger_mode: asr_kws` transcribes every utterance and gates on a phoneme-level
+`trigger_mode` has two values: `vad` (transcribe and forward everything) and
+`asr_kws` (forward only what follows a wake word). `asr_kws` is the default.
+
+There used to be a third, `kws`, which ran a second sherpa `KeywordSpotter` on
+the raw audio with its own zipformer bundle and its own `waiting_wake` state in
+the VAD worker. It is gone: that is an extra model, an extra download and an
+extra state machine to do a job `asr_kws` already does on a transcript the ASR
+produces anyway.
+
+`REMOVED_TRIGGER_MODES` in `plugins/asr.py` migrates `kws` → `asr_kws` at load.
+Unlike a removed *model* name, leaving this unmapped would not surface as a card
+error — an unrecognised `trigger_mode` falls through to `vad`, so a robot that
+was wake-word gated would silently start answering every utterance in the room.
+The migration also carries the wake word across, taking the display form after
+`@` in the old `keywords` spec (`"x iǎo f àn x iǎo f àn @小范小范"` → `小范小范`),
+because `asr_kws` with no keyword degrades to `vad` — the same silent failure by
+another route. A keyword with no `@` part yields nothing and logs at error
+level: the token side is a spotter lexicon, and de-spacing it would invent a
+wake word nobody can pronounce.
+
+`asr_kws` transcribes every utterance and gates on a phoneme-level
 fuzzy match against the wake word, so it needs IPA for both. That path had two
 faults that together cost **5.2 s per utterance** and quietly degraded wake-word
 accuracy.

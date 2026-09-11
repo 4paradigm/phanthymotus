@@ -40,9 +40,32 @@ AUDIO_FORMAT       = "audio/pcm-16k"
 _AUDIO_FORMAT_ALIASES = frozenset({AUDIO_FORMAT, "pcm_16k_16bit_mono"})
 MIN_CHUNK_BYTES    = 1024  # 512 samples — one Silero VAD window
 
-# Upper bound on how long `start` waits for a background model load. Prevents a
-# stalled download from pinning an MCP worker thread indefinitely.
-MODEL_LOAD_TIMEOUT_S = 300
+# How long `start` waits for a background model load before returning
+# `state: loading` and letting the caller poll `info` instead. Long enough for a
+# model already on disk (a warm load is ~0.1-2 s), far too short for a download —
+# which is the point: the dashboard only shows download progress once `start`
+# has returned.
+MODEL_LOAD_GRACE_S = 3.0
+
+# Longest utterance sherpa's VAD will hold open before it force-cuts, and the
+# capacity of the circular buffer it holds that utterance in.
+#
+# The buffer MUST be strictly larger than the max speech duration, and by more
+# than one window. sherpa checks the force-cut condition as
+# `buffer_.Size() > max_utterance_length_` at the top of AcceptWaveform, but
+# CircularBuffer::Push resizes (and logs `Overflow! ... Increase capacity to:`)
+# as soon as `n + size > capacity`. With both set to the same number, Size() can
+# never exceed max_utterance_length_ without Push having already overflowed —
+# the escape hatch is structurally unreachable, and every long utterance pays
+# the overflow first.
+#
+# That was the bug: both were 30. Counting out loud for 30 s produced the
+# overflow warning, a doubling of the buffer to 60 s that sherpa never gives
+# back, a 33.4 s segment instead of a 30 s one, and — because the force-cut
+# also switches the model to threshold 0.90 / min_silence 0.1 s until the
+# buffer drains — a spurious 1.1 s fragment cut immediately after it.
+VAD_MAX_SPEECH_S = 30
+VAD_BUFFER_S     = 35
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -321,10 +344,31 @@ def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
     phonemization pass, which used to redo the work with a *different* segmentation
     (it skipped punctuation where _text_to_ipa splits on it) and therefore could not
     have agreed with the index it was given.
+
+    The offset is exact for the phoneme, but a phoneme boundary is not always a
+    *word* boundary: espeak does not distribute phonemes evenly over letters, so
+    a word the ASR spelled oddly can end one character early. Observed on
+    hardware \u2014 "Little fanscy show me around the exhibition hall" matched the
+    9-phoneme wake word and cut inside `fanscy`, sending the LLM
+    "**y** show me around the exhibition hall". So after cutting, finish the
+    Latin word we landed inside.
+
+    Latin only, and deliberately: CJK is written without spaces, so advancing to
+    the next boundary there would swallow the entire command
+    (\u300c\u5c0f\u8303\u5c0f\u8303\u4f60\u597d\u300d \u2192 nothing left). `isascii() and isalnum()` is the test that
+    separates the two \u2014 a Chinese character is alnum but not ASCII.
     """
     if end_pos <= 0 or not char_ends:
         return ''
     cut = char_ends[min(end_pos, len(char_ends)) - 1]
+
+    def _mid_latin_word(i: int) -> bool:
+        return (0 < i < len(text)
+                and text[i].isascii() and text[i].isalnum()
+                and text[i - 1].isascii() and text[i - 1].isalnum())
+
+    while _mid_latin_word(cut):
+        cut += 1
     return text[cut:].lstrip('\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a,.!?;: ')
 
 
@@ -359,23 +403,31 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                # The two paraformers and zipformer-en were dropped for accuracy;
+                # REMOVED_ASR_MODELS maps a card still holding one onto its
+                # replacement rather than letting it fail to resolve.
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
                 # rejected. Keep the list in sync with ASR_MODELS — the unit test
                 # test_asr_device_registry.py asserts they match.
+                #
+                # Hiding the field does not clear it: the form still submits the
+                # value selected for the previous model. `config` therefore
+                # degrades a carried-over device to cpu instead of rejecting it,
+                # and only rejects a device the request actually changed.
                 "device":        {"type": "string", "enum": ["cpu", "gpu"],
                                   "description": "Inference device. gpu loads non-quantised weights "
                                                  "(~2.5x faster per utterance) but costs ~2 GB RAM "
                                                  "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
                                                  "never gives back — check headroom before enabling",
                                   "default": "cpu", "scope": "shared",
-                                  "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small"]}},
-                "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
-                "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
-                "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
-                "asr_kws_keyword": {"type": "string", "description": "唤醒词文本（如'范式小狗'、'hello robot'）", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
+                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small"]}},
+                # `kws` (a second sherpa KeywordSpotter on the raw audio) was
+                # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
+                "trigger_mode":  {"type": "string", "enum": ["vad", "asr_kws"], "description": "Trigger mode (vad = always listen, asr_kws = ASR + phoneme matching)", "default": "asr_kws", "scope": "shared"},
+                "asr_kws_keyword": {"type": "string", "description": "唤醒词文本（如'小范小范'、'little fancy'）", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
@@ -407,131 +459,6 @@ def _pcm16_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
 class ASRAdapter(ABC):
     @abstractmethod
     def transcribe(self, wav_bytes: bytes, language: str) -> str: ...
-
-
-class SherpaOnnxASRAdapter(ASRAdapter):
-    """On-device streaming ASR using sherpa-onnx paraformer (no network required)."""
-
-    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
-        from utils.onnx_provider import pick_weights, provider_for_device
-
-        import sherpa_onnx
-        # Streaming paraformer uses encoder + decoder (not a single model file).
-        # Candidate order flips with the device: a gpu bundle holds fp32 weights,
-        # a cpu bundle holds int8. See utils/onnx_provider.py for why.
-        enc = ("encoder.onnx", "encoder.int8.onnx") if device == "gpu" else \
-              ("encoder.int8.onnx", "encoder.onnx")
-        dec = ("decoder.onnx", "decoder.int8.onnx") if device == "gpu" else \
-              ("decoder.int8.onnx", "decoder.onnx")
-        encoder_path = pick_weights(model_dir, *enc)
-        decoder_path = pick_weights(model_dir, *dec)
-        tokens_path = os.path.join(model_dir, "tokens.txt")
-        provider = provider_for_device(device, (encoder_path, decoder_path))
-
-        self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
-            encoder=encoder_path,
-            decoder=decoder_path,
-            tokens=tokens_path,
-            num_threads=num_threads,
-            provider=provider,
-            sample_rate=SAMPLE_RATE,
-            decoding_method="greedy_search",
-        )
-        log.info(f"[asr] sherpa-onnx paraformer adapter loaded: encoder={encoder_path}, "
-                 f"device={device}, provider={provider}")
-
-    def transcribe(self, wav_bytes: bytes, language: str) -> str:
-        import io as _io, wave as _wave
-        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
-            pcm = wf.readframes(wf.getnframes())
-        n = len(pcm) // 2
-        samples = struct.unpack(f'<{n}h', pcm)
-        float_samples = [s / 32768.0 for s in samples]
-        # Pad 500ms silence at the end to avoid last-token truncation
-        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
-
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, float_samples)
-        stream.input_finished()
-        while self._recognizer.is_ready(stream):
-            self._recognizer.decode_streams([stream])
-        result = self._recognizer.get_result(stream)
-        # result may be a string directly or an object with .text
-        text = result.text if hasattr(result, 'text') else str(result)
-        return text.strip()
-
-
-class SherpaOnnxZipformerAdapter(ASRAdapter):
-    """On-device streaming ASR using sherpa-onnx zipformer transducer (English)."""
-
-    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
-        from utils.onnx_provider import provider_for_device
-
-        import sherpa_onnx
-        import glob as _glob
-
-        # Find encoder/decoder/joiner (prefer chunk-16; dtype follows the device —
-        # int8 for cpu, non-int8 for gpu, see utils/onnx_provider.py)
-        prefer_int8 = device != "gpu"
-
-        def _find(prefix, prefer_int8=True):
-            pattern = os.path.join(model_dir, f"{prefix}-*.onnx")
-            files = _glob.glob(pattern)
-            if not files:
-                return ""
-            chunk16 = [f for f in files if "chunk-16" in f]
-            cands = chunk16 if chunk16 else files
-            if prefer_int8:
-                int8f = [f for f in cands if "int8" in f]
-                if int8f:
-                    return int8f[0]
-            else:
-                fp32f = [f for f in cands if "int8" not in f]
-                if fp32f:
-                    return fp32f[0]
-            return cands[0]
-
-        encoder_path = _find("encoder", prefer_int8=prefer_int8)
-        # The decoder is tiny, so the fp32 copy is preferred on both devices.
-        decoder_path = _find("decoder", prefer_int8=False)
-        joiner_path = _find("joiner", prefer_int8=prefer_int8)
-        tokens_path = os.path.join(model_dir, "tokens.txt")
-
-        if not all([encoder_path, decoder_path, joiner_path]):
-            raise RuntimeError(f"[asr] zipformer model files not found in {model_dir}")
-
-        provider = provider_for_device(
-            device, (encoder_path, decoder_path, joiner_path))
-        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-            encoder=encoder_path,
-            decoder=decoder_path,
-            joiner=joiner_path,
-            tokens=tokens_path,
-            num_threads=num_threads,
-            provider=provider,
-            sample_rate=SAMPLE_RATE,
-            decoding_method="greedy_search",
-        )
-        log.info(f"[asr] sherpa-onnx zipformer adapter loaded: encoder={encoder_path}, "
-                 f"device={device}, provider={provider}")
-
-    def transcribe(self, wav_bytes: bytes, language: str) -> str:
-        import io as _io, wave as _wave
-        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
-            pcm = wf.readframes(wf.getnframes())
-        n = len(pcm) // 2
-        samples = struct.unpack(f'<{n}h', pcm)
-        float_samples = [s / 32768.0 for s in samples]
-        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
-
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, float_samples)
-        stream.input_finished()
-        while self._recognizer.is_ready(stream):
-            self._recognizer.decode_streams([stream])
-        result = self._recognizer.get_result(stream)
-        text = result.text if hasattr(result, 'text') else str(result)
-        return text.strip()
 
 
 class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
@@ -584,17 +511,29 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         return text.strip()
 
 
-class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
-    """Offline non-streaming Paraformer (zh+en, small).
+class SherpaOnnxNemoCtcAdapter(ASRAdapter):
+    """Offline NeMo FastConformer CTC (English-only Parakeet).
 
-    Better accuracy than streaming version — no tail truncation.
-    Uses sherpa_onnx.OfflineRecognizer.from_paraformer.
+    Uses sherpa_onnx.OfflineRecognizer.from_nemo_ctc, which has been in the
+    pinned sherpa-onnx 1.13.6 all along — no new runtime is involved.
+
+    The point of this adapter is noise robustness, not another language option.
+    It replaces zipformer-en, which was trained on LibriSpeech's 960 h of clean
+    read speech — the wrong distribution for a robot whose microphone always
+    carries cooling-fan noise, and why that entry is gone.
+    Parakeet's training set is ~1.7 M h of diverse audio with non-speech
+    material deliberately mixed in, and it emits punctuation and capitalisation.
+
+    English-only by construction: `language` is accepted for interface
+    compatibility and ignored, exactly as every other adapter here does.
     """
 
     def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
         from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
+        # cpu-only entry today, but keep the same device-ordered preference the
+        # other offline adapters use so a hand-assembled gpu directory works.
         names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
             if device == "gpu" else \
             ("model.int8.onnx", "model.onnx")
@@ -602,16 +541,17 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
         tokens_path = os.path.join(model_dir, "tokens.txt")
         provider = provider_for_device(device, (model_path,))
 
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
-            paraformer=model_path,
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+            model=model_path,
             tokens=tokens_path,
             num_threads=num_threads,
             provider=provider,
             sample_rate=SAMPLE_RATE,
+            feature_dim=80,
             decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx offline paraformer adapter loaded: "
-                 f"model={model_path}, device={device}, provider={provider}")
+        log.info(f"[asr] sherpa-onnx nemo-ctc adapter loaded: model={model_path}, "
+                 f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -667,34 +607,32 @@ ASR_MODELS = {
                     "dir": "/models/sherpa-onnx/x-asr-zh-en"},
         },
     },
-    "paraformer-zh-en": {
-        "label": "Paraformer Bilingual (zh+en, streaming)",
-        "adapter": SherpaOnnxASRAdapter,
+    "parakeet-en": {
+        "label": "Parakeet CTC 110M (en only, offline, noise-robust)",
+        "adapter": SherpaOnnxNemoCtcAdapter,
         "devices": {
-            "cpu": {"download": "asr", "dtype": "int8",
-                    "dir": "/models/sherpa-onnx/asr"},
-            # fp32, not fp16: fp16 on CUDA emits only `</s>` for this model, and
-            # is slower than fp32 anyway (2077 ms vs 1859 ms).
-            "gpu": {"download": "asr_gpu", "dtype": "fp32",
-                    "dir": "/models/sherpa-onnx/asr-gpu"},
-        },
-    },
-    "paraformer-offline": {
-        "label": "Paraformer Offline (zh+en, small)",
-        "adapter": SherpaOnnxOfflineParaformerAdapter,
-        "devices": {
-            # No gpu entry: no non-quantised variant has been built or measured.
-            "cpu": {"download": "asr_paraformer_offline", "dtype": "int8",
-                    "dir": "/models/sherpa-onnx/asr-paraformer-offline"},
-        },
-    },
-    "zipformer-en": {
-        "label": "Zipformer English (streaming)",
-        "adapter": SherpaOnnxZipformerAdapter,
-        "devices": {
-            # No gpu entry: not measured.
-            "cpu": {"download": "asr_en", "dtype": "int8",
-                    "dir": "/models/sherpa-onnx/asr-en"},
+            "cpu": {"download": "asr_parakeet_en", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/parakeet-en"},
+            # fp32, measured on BOTH lines — Orin5 (jp5.11) and Orin6 (jp6.1) —
+            # against the int8 cpu entry, 6 runs each, first discarded as warmup:
+            #
+            #   7.43 s clip:  56/57 ms cuda vs 275/271 ms cpu   → ~4.9x
+            #   0.99 s clip:  26/29 ms cuda vs  52/ 51 ms cpu   → ~2.0x
+            #
+            # The short clip wins less because fixed per-call overhead dominates,
+            # which is the shape most robot utterances have — budget for ~2x, not
+            # ~5x. Transcripts were read, not just timed: all six configurations
+            # (fp32/cuda, fp32/cpu, int8/cpu on each line) returned byte-identical
+            # text, stable across repeats. That check is not ceremony — sensevoice
+            # fp16 on CUDA is fast, self-consistent, and silently returns an empty
+            # transcript for some inputs. This model shows no such failure.
+            #
+            # Cold start on CUDA is ~2.1 s on jp5.11 (466 ms on jp6.1) against
+            # ~290 ms on cpu; _warmup_adapter already absorbs that at load time.
+            # The ~2 GB of RAM a CUDA context costs, ~1.4 GB of it unreturnable,
+            # applies here as much as to any gpu entry — see README.
+            "gpu": {"download": "asr_parakeet_en_gpu", "dtype": "fp32",
+                    "dir": "/models/sherpa-onnx/parakeet-en-gpu"},
         },
     },
     "sensevoice-small": {
@@ -727,6 +665,106 @@ ASR_MODELS = {
 
 DEFAULT_ASR_MODEL = "sensevoice-small"
 
+# Models that used to be in the registry, and what a card configured for one
+# now gets instead.
+#
+# paraformer-zh-en / paraformer-offline / zipformer-en were dropped for
+# accuracy, not for size or speed. The two bilingual paraformers are strictly
+# worse than sensevoice-small on the same audio, and zipformer-en is
+# LibriSpeech — 960 h of clean read speech, the wrong distribution for a
+# microphone that always carries cooling-fan noise, which is exactly what
+# parakeet-en was added for.
+#
+# This map is not optional politeness. A card's `asr_model` lives in
+# agent-core's config DB on each robot, so an upgrade cannot rewrite it; a
+# removed name that resolves to nothing makes `config` return an error and the
+# card comes up `state: error` after the next restart, on every deployment that
+# had picked one. Resolve instead, and say so in the log.
+REMOVED_ASR_MODELS = {
+    "paraformer-zh-en":   "sensevoice-small",
+    "paraformer-offline": "sensevoice-small",
+    "zipformer-en":       "parakeet-en",
+}
+
+
+def resolve_asr_model(name: str) -> str:
+    """Map a removed model name onto its replacement; pass others through."""
+    replacement = REMOVED_ASR_MODELS.get(name)
+    if replacement is None:
+        return name
+    log.warning(
+        f"[asr] '{name}' was removed from the model registry (accuracy); "
+        f"using '{replacement}' instead. Update the card to silence this."
+    )
+    return replacement
+
+
+# Trigger modes. `vad` = transcribe everything; `asr_kws` = transcribe
+# everything and gate on the *transcript* matching a wake word phonetically.
+TRIGGER_MODES = ("vad", "asr_kws")
+DEFAULT_TRIGGER_MODE = "asr_kws"
+
+# `kws` ran a second sherpa KeywordSpotter on the raw audio, with its own
+# zipformer bundle and its own `waiting_wake` state in the VAD worker. Removed:
+# it was a whole extra model and gate to maintain for the same job `asr_kws`
+# already does on text that has to be transcribed anyway.
+#
+# Same reasoning as REMOVED_ASR_MODELS — the value lives in each robot's own
+# config DB and no upgrade can rewrite it. But this one degrades worse than a
+# card error if left unmapped: an unrecognised `trigger_mode` falls through to
+# `vad`, which is **always listening**. A robot that was wake-word gated would
+# silently start responding to every utterance in the room. So it maps to
+# `asr_kws`, and the wake word comes across with it.
+REMOVED_TRIGGER_MODES = {"kws": "asr_kws"}
+
+
+def _wake_word_from_kws_keywords(kws_cfg: dict) -> str:
+    """Recover a plain-text wake word from a `kws`-mode keyword spec.
+
+    KWS keywords are written as tokens plus an optional display form —
+    ``"x iǎo f àn x iǎo f àn @小范小范"`` or
+    ``"▁FA N C Y ▁RO B O T @FANCY_ROBOT"``. Only the part after ``@`` is real
+    text; the tokens are for the spotter's lexicon and mean nothing to a
+    phonemizer. Without a usable one, return '' and let the caller warn —
+    guessing by stripping spaces out of the token side would produce a wake
+    word nobody can say.
+    """
+    for raw in (kws_cfg.get('keywords') or []):
+        _, sep, display = str(raw).partition('@')
+        if sep and display.strip():
+            return display.strip().replace('_', ' ')
+    return ''
+
+
+def resolve_trigger_mode(mode: str, kws_cfg: dict = None) -> str:
+    """Map a removed trigger mode onto its replacement; pass others through.
+
+    When `kws` becomes `asr_kws` and no `asr_kws_keyword` is configured, the
+    old KWS wake word is carried over in place — otherwise asr_kws would find
+    no keyword and fall back to `vad`, i.e. always-on.
+    """
+    replacement = REMOVED_TRIGGER_MODES.get(mode)
+    if replacement is None:
+        return mode
+    if kws_cfg is not None and not kws_cfg.get('asr_kws_keyword'):
+        carried = _wake_word_from_kws_keywords(kws_cfg)
+        if carried:
+            kws_cfg['asr_kws_keyword'] = carried
+            log.warning(
+                f"[asr] trigger_mode '{mode}' was removed; using '{replacement}' "
+                f"with the wake word carried over from kws_keywords: '{carried}'"
+            )
+            return replacement
+        log.error(
+            f"[asr] trigger_mode '{mode}' was removed and no wake word could be "
+            f"recovered from kws_keywords ({kws_cfg.get('keywords')!r}). "
+            f"'{replacement}' with no keyword falls back to always-on VAD — set "
+            f"asr_kws_keyword on this card."
+        )
+        return replacement
+    log.warning(f"[asr] trigger_mode '{mode}' was removed; using '{replacement}'")
+    return replacement
+
 
 def asr_models_supporting(device: str) -> list[str]:
     """Model names whose registry entry has weights for this device."""
@@ -753,10 +791,27 @@ def _model_dir_for(cfg: dict, spec: dict) -> str:
     return requested
 
 
-def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
+def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
+    """Build the configured adapter, optionally reporting progress.
+
+    `on_status(text)` is called as the build moves between its two genuinely
+    different waits — fetching ~100-800 MB of weights over the network, and
+    loading them into memory (plus a warmup inference). Collapsing both into one
+    "loading" made the dashboard say "Downloading model..." for the whole build,
+    including the part where nothing was downloading, and it never said how far
+    along the download was. Callers that don't care pass nothing.
+    """
     from utils.onnx_provider import normalize_device
 
-    model_name = cfg.get('asr_model', DEFAULT_ASR_MODEL)
+    def _status(text: str) -> None:
+        if on_status is None:
+            return
+        try:
+            on_status(text)
+        except Exception as error:  # pragma: no cover - defensive
+            log.debug(f"[asr] status callback failed: {error}")
+
+    model_name = resolve_asr_model(cfg.get('asr_model', DEFAULT_ASR_MODEL))
     model_info = ASR_MODELS.get(model_name)
     if not model_info:
         log.warning(f"[asr] unknown model '{model_name}', falling back to "
@@ -778,17 +833,29 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
     spec = model_info["devices"][device]
 
     model_dir = _model_dir_for(cfg, spec)
+    _status(f"正在获取模型 '{model_name}' ({device}) …")
+    # Same callback on both paths. The gpu bundles are the largest downloads in
+    # the stack — parakeet's fp32 weights are 437 MB and took 81 s on an Orin —
+    # and until this was threaded through, the gpu branch showed the static
+    # "正在获取模型" line above for that entire time, which an operator reads as
+    # hung. (Note this only fires while bytes are moving: an already-verified
+    # bundle returns in ~2 s and the caller never sees a percentage.)
+    _on_progress = lambda pct, mb_done, mb_total: _status(
+        f"正在下载模型 '{model_name}' … {pct}% "
+        f"({mb_done:.0f}/{mb_total:.0f} MB)")
     if device == "gpu":
         # Size/SHA256-pinned: these are the largest downloads in the stack.
         from utils.model_downloader import ensure_gpu_model
-        ensure_gpu_model(spec["download"], model_dir)
+        ensure_gpu_model(spec["download"], model_dir, progress_cb=_on_progress)
     else:
         from utils.model_downloader import ensure_model
-        ensure_model(spec["download"], model_dir)
+        ensure_model(spec["download"], model_dir, progress_cb=_on_progress)
 
     num_threads = int(cfg.get('num_threads', 2))
+    _status(f"正在加载模型 '{model_name}' 到内存 …")
     adapter = model_info["adapter"](model_dir, device, num_threads)
     if cfg.get('warmup', True):
+        _status(f"正在预热模型 '{model_name}' …")
         _warmup_adapter(adapter, model_name, device)
     return adapter
 
@@ -833,14 +900,17 @@ def _warmup_adapter(adapter: ASRAdapter, model_name: str, device: str) -> None:
 def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 stop_evt: multiprocessing.Event,
                 backend: str, threshold: float, silence_ms: int,
-                kws_cfg: dict = None,
                 save_vad_segments: bool = False, max_saved_segments: int = 1000,
                 pre_roll_ms: int = 500, log_level: int = logging.INFO):
-    """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
+    """Runs in a child process — sherpa-onnx ONNX VAD.
 
-    Pipeline: Audio → VAD → (KWS gate) → utterance output
-    - If kws_cfg is provided and enabled, only output utterances after keyword detected
-    - Otherwise (kws disabled), output all utterances (backward compat)
+    Pipeline: Audio → VAD → utterance output. Every completed utterance is
+    emitted; wake-word gating is `asr_kws`, which lives downstream in
+    `_worker_inner` and works on the *transcript*, not on the audio.
+
+    There used to be a second gate here: a sherpa KeywordSpotter running on the
+    raw audio (`trigger_mode: kws`), with its own model and its own
+    `waiting_wake` state. It has been removed — see REMOVED_TRIGGER_MODES.
     """
     # A spawned child gets a fresh interpreter and does not inherit the parent's
     # sys.stdout object, so the atomic writer has to be reinstalled here.
@@ -874,7 +944,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             min_silence_duration=silence_ms / 1000.0,
             min_speech_duration=0.1,
             window_size=512,
-            max_speech_duration=30,
+            max_speech_duration=VAD_MAX_SPEECH_S,
         ),
         sample_rate=SAMPLE_RATE,
         num_threads=1,
@@ -887,110 +957,28 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # sherpa TTS engine follow `device`.
         provider="cpu",
     )
-    vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
+    vad = sherpa_onnx.VoiceActivityDetector(
+        vad_config, buffer_size_in_seconds=VAD_BUFFER_S)
     pre_roll_samples = max(0, int(SAMPLE_RATE * pre_roll_ms / 1000))
     silence_samples = max(0, int(SAMPLE_RATE * silence_ms / 1000))
-    pcm_history = PcmHistory(SAMPLE_RATE * 31)
+    # One second past the longest segment the VAD can hand us, so pre_roll()
+    # can still address the samples just before a maximum-length segment.
+    pcm_history = PcmHistory(SAMPLE_RATE * (VAD_BUFFER_S + 1))
     _log.info(
         f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, "
         f"silence_ms={silence_ms}, pre_roll_ms={pre_roll_ms})"
     )
 
-    # ── Initialize KWS (optional) ──
-    kws_spotter = None
-    kws_stream = None
-    kws_enabled = (kws_cfg.get('trigger_mode', 'kws') == 'kws') if kws_cfg else False
-    if kws_enabled:
-        # Select KWS model based on kws_model config
-        kws_model_variant = kws_cfg.get('kws_model', 'zh')
-        if kws_model_variant == 'zh':
-            kws_model_dir = '/models/sherpa-onnx/kws_zh'
-            ensure_model("kws_zh", kws_model_dir)
-        elif kws_model_variant == 'en':
-            kws_model_dir = '/models/sherpa-onnx/kws_en'
-            ensure_model("kws_en", kws_model_dir)
-        else:  # zh-en
-            kws_model_dir = kws_cfg.get('model_dir', '/models/sherpa-onnx/kws')
-            ensure_model("kws", kws_model_dir)
-        keywords = kws_cfg.get('keywords', [])
-        if keywords:
-            import glob as _glob
-            # Find model files (prefer int8 + chunk-8)
-            def _find(prefix, prefer_int8=True):
-                pattern = os.path.join(kws_model_dir, f"{prefix}-*.onnx")
-                files = _glob.glob(pattern)
-                if not files:
-                    return ""
-                chunk8 = [f for f in files if "chunk-8" in f]
-                cands = chunk8 if chunk8 else files
-                if prefer_int8:
-                    int8f = [f for f in cands if "int8" in f]
-                    if int8f: return int8f[0]
-                else:
-                    fp32f = [f for f in cands if "int8" not in f]
-                    if fp32f: return fp32f[0]
-                return cands[0]
-
-            encoder = _find("encoder", prefer_int8=True)
-            decoder = _find("decoder", prefer_int8=False)
-            joiner = _find("joiner", prefer_int8=True)
-            tokens = os.path.join(kws_model_dir, "tokens.txt")
-
-            if encoder and decoder and joiner and os.path.exists(tokens):
-                # Write keywords file
-                kws_keywords_file = os.path.join(kws_model_dir, "keywords.txt")
-                with open(kws_keywords_file, 'w', encoding='utf-8') as f:
-                    for kw in keywords:
-                        f.write(f"{kw}\n")
-
-                kws_spotter = sherpa_onnx.KeywordSpotter(
-                    tokens=tokens,
-                    encoder=encoder,
-                    decoder=decoder,
-                    joiner=joiner,
-                    keywords_file=kws_keywords_file,
-                    num_threads=1,
-                    # KWS is pinned to CPU. Its zipformer bundle ships int8 only,
-                    # and int8 on CUDA measured slower than CPU on every model
-                    # tried — so there is nothing to gain and the `device` setting
-                    # deliberately does not reach here. See utils/onnx_provider.py.
-                    provider="cpu",
-                    keywords_score=1.5,
-                    keywords_threshold=0.1,
-                )
-                kws_stream = kws_spotter.create_stream()
-                _log.info(f"[vad-worker] KWS initialized, keywords={keywords}")
-            else:
-                _log.warning(f"[vad-worker] KWS model files not found in {kws_model_dir}, disabling KWS")
-                kws_enabled = False
-        else:
-            _log.info("[vad-worker] KWS enabled but no keywords configured, disabling")
-            kws_enabled = False
-
-    # ── State machine ──
-    # States: 'waiting_wake' (KWS mode) or 'listening' (direct mode / post-wake)
-    state = 'waiting_wake' if kws_enabled else 'listening'
-    _kws_triggered = False
     speech_buf = b''
     start_ts = None
     end_ts = None
-    kws_cooldown_until = 0.0
     _was_speaking = False  # Track speech onset for hook notification
 
-    _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
+    _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx)")
     audio_count = 0
 
     # VAD segment saving
     _VAD_SEG_DIR = '/models/vad_segments'
-
-    def _save_segment(float_samples_list):
-        """Save float samples as WAV."""
-        try:
-            seg_pcm = struct.pack(f'<{len(float_samples_list)}h',
-                                  *[int(max(-32768, min(32767, s * 32768))) for s in float_samples_list])
-            _write_segment(seg_pcm)
-        except Exception:
-            pass
 
     def _save_segment_pcm(pcm_bytes):
         """Save raw PCM bytes as WAV."""
@@ -1075,98 +1063,55 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         pcm_history.append(pcm[:n * 2])
         vad.accept_waveform(float_samples)
 
-        if state == 'waiting_wake':
-            # Feed KWS with AGC-normalized audio for better detection at distance
-            if kws_spotter:
-                kws_stream.accept_waveform(SAMPLE_RATE, float_samples)
-                while kws_spotter.is_ready(kws_stream):
-                    kws_spotter.decode_stream(kws_stream)
-                result = kws_spotter.get_result(kws_stream)
-                kw = result.keyword if hasattr(result, 'keyword') else str(result)
-                if kw and kw.strip():
-                    now = time.time()
-                    if now >= kws_cooldown_until:
-                        kws_cooldown_until = now + 2.0
-                        _log.info(f"[vad-worker] WAKE WORD detected: {kw.strip()}")
-                        # Transition to listening — start recording immediately
-                        state = 'listening'
-                        _kws_triggered = True
-                        speech_buf = pcm  # include current frame (user may already be speaking)
-                        start_ts = ts
-                        end_ts = ts
-                        # Reset KWS stream for next wake
-                        kws_stream = kws_spotter.create_stream()
-            # Drain any completed VAD segments (discard in wake-wait mode)
-            while not vad.empty():
-                seg = vad.front
+        # Detect speech onset → notify main thread for on_hearing hook
+        _is_speaking = vad.is_speech_detected()
+        if _is_speaking and not _was_speaking:
+            result_q.put(("speech_start", ts, ts))
+        _was_speaking = _is_speaking
+
+        # Collect completed VAD segments.
+        # The VAD only reports a segment after min_silence_duration of
+        # trailing silence has elapsed, and that silence is not part of
+        # seg.samples — so the current chunk timestamp sits one silence
+        # window past the real end of speech. Rewind it, the same way
+        # PcmHistory.pre_roll() rewinds by silence_samples to locate the
+        # segment start in the sample domain.
+        seg_end_ts = ts - silence_samples / SAMPLE_RATE
+        while not vad.empty():
+            seg = vad.front
+            seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
+                                   *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+            # `is None`, not falsy: a legitimate start_ts of 0.0 would
+            # otherwise be re-stamped.
+            if start_ts is None:
+                pre_pcm = pcm_history.pre_roll(
+                    getattr(seg, 'start', None),
+                    len(seg.samples),
+                    pre_roll_samples,
+                    silence_samples,
+                )
+                start_ts = seg_end_ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
+                speech_buf = pre_pcm + seg_pcm
+            else:
+                pre_pcm = b''
+                speech_buf += seg_pcm
+            end_ts = seg_end_ts
+            vad.pop()
+
+            # Output the segment as an utterance
+            if len(speech_buf) > SAMPLE_RATE:  # >500ms
+                _log.info(
+                    f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
+                    f"pre_roll_bytes={len(pre_pcm)}"
+                )
                 if save_vad_segments:
-                    _save_segment(seg.samples)
-                vad.pop()
-
-        elif state == 'listening':
-            # Detect speech onset → notify main thread for on_hearing hook
-            _is_speaking = vad.is_speech_detected()
-            if _is_speaking and not _was_speaking:
-                result_q.put(("speech_start", ts, ts, False))
-            _was_speaking = _is_speaking
-
-            # Collect completed VAD segments.
-            # The VAD only reports a segment after min_silence_duration of
-            # trailing silence has elapsed, and that silence is not part of
-            # seg.samples — so the current chunk timestamp sits one silence
-            # window past the real end of speech. Rewind it, the same way
-            # PcmHistory.pre_roll() rewinds by silence_samples to locate the
-            # segment start in the sample domain.
-            seg_end_ts = ts - silence_samples / SAMPLE_RATE
-            while not vad.empty():
-                seg = vad.front
-                seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
-                                       *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
-                # `is None`, not falsy: a legitimate start_ts of 0.0 would
-                # otherwise be re-stamped.
-                if start_ts is None:
-                    pre_pcm = pcm_history.pre_roll(
-                        getattr(seg, 'start', None),
-                        len(seg.samples),
-                        pre_roll_samples,
-                        silence_samples,
-                    )
-                    start_ts = seg_end_ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
-                    speech_buf = pre_pcm + seg_pcm
-                else:
-                    pre_pcm = b''
-                    speech_buf += seg_pcm
-                end_ts = seg_end_ts
-                vad.pop()
-
-                # Output the segment as an utterance
-                if len(speech_buf) > SAMPLE_RATE:  # >500ms
-                    _log.info(
-                        f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
-                        f"pre_roll_bytes={len(pre_pcm)}"
-                    )
-                    if save_vad_segments:
-                        _save_segment_pcm(speech_buf)
-                    result_q.put((speech_buf,
-                                  seg_end_ts if start_ts is None else start_ts,
-                                  seg_end_ts if end_ts is None else end_ts,
-                                  _kws_triggered))
-                    _kws_triggered = False
-                    speech_buf = b''
-                    start_ts = None
-                    end_ts = None
-                    # Return to waiting for wake word (if KWS enabled)
-                    if kws_enabled:
-                        state = 'waiting_wake'
-                        # Stop draining here. Without the break, segments still
-                        # queued in the VAD keep being treated as an active
-                        # listening session and can emit a second utterance in
-                        # this same pass, after the wake gate has already closed.
-                        # `state` is only re-read on the next outer iteration, so
-                        # the gate would be bypassed for however many segments
-                        # the VAD had queued. The remainder belongs to
-                        # waiting_wake, which drains it next round.
-                        break
+                    _save_segment_pcm(speech_buf)
+                result_q.put((speech_buf,
+                              seg_end_ts if start_ts is None else start_ts,
+                              seg_end_ts if end_ts is None else end_ts))
+                speech_buf = b''
+                start_ts = None
+                end_ts = None
 
     _log.info("[vad-worker] process exiting")
 
@@ -1256,7 +1201,7 @@ class _ASRNode(Node):
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                  self._kws_cfg, self._save_vad_segments, self._max_saved_segments,
+                  self._save_vad_segments, self._max_saved_segments,
                   self._vad_pre_roll_ms, log.getEffectiveLevel()),
             daemon=True, name="vad_worker",
         )
@@ -1434,7 +1379,8 @@ class _ASRNode(Node):
     def _worker_inner(self):
         # Pre-compute keyword IPA if in asr_kws mode
         _kws_triggered = False  # track whether current utterance was KWS-triggered
-        trigger_mode = self._kws_cfg.get('trigger_mode', 'kws')
+        trigger_mode = resolve_trigger_mode(
+            self._kws_cfg.get('trigger_mode', DEFAULT_TRIGGER_MODE), self._kws_cfg)
         keyword_ipa = None
         asr_kws_threshold = float(self._kws_cfg.get('asr_kws_threshold', 0.3))
         if trigger_mode == 'asr_kws':
@@ -1471,11 +1417,7 @@ class _ASRNode(Node):
                     except Exception as _he:
                         log.debug(f"[asr] fire on_hearing failed: {_he}")
                     continue
-                if len(item) == 4:
-                    utterance, start_ts, end_ts, _kws_from_vad = item
-                else:
-                    utterance, start_ts, end_ts = item[:3]
-                    _kws_from_vad = False
+                utterance, start_ts, end_ts = item[:3]
             except Exception:
                 continue
             try:
@@ -1516,7 +1458,7 @@ class _ASRNode(Node):
                         continue
                     text = remaining
 
-                _kws_was_triggered = _kws_triggered or _kws_from_vad
+                _kws_was_triggered = _kws_triggered
                 _kws_triggered = False
                 self._kws_triggered = False
                 result = {"text": text, "audio_start_ts": start_ts,
@@ -1559,12 +1501,29 @@ class ASRPlugin:
         self._plugin_cfg   = plugin_cfg
         self._loading      = False
         self._load_error   = None
+        # The (model, device) the loader thread should end up on. Written under
+        # _nodes_lock by every config request; a request that lands mid-load
+        # supersedes the one in flight rather than being dropped.
+        self._load_target  = (self._asr_model, self._device)
+        # start requests that arrived while a model was loading, by node key.
+        # `start` answers those with `state: loading` rather than blocking for
+        # the whole download, so the loader thread has to run them afterwards.
+        self._pending_starts: dict[str, dict] = {}
+        # What the current load is actually doing, for `info`/`start`/`config` to
+        # report. One string, set from the loader thread and read from MCP worker
+        # threads — a plain attribute assignment is atomic enough for that and
+        # needs no lock.
+        self._load_status  = ""
         self._adapter      = _build_asr_adapter(plugin_cfg)
         vad_cfg            = plugin_cfg.get('vad', {})
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
+        # Still called `kws` in config.yaml for continuity — it now carries only
+        # the asr_kws settings (trigger_mode / asr_kws_keyword / threshold).
         self._kws_cfg      = plugin_cfg.get('kws', {})
+        self._kws_cfg['trigger_mode'] = resolve_trigger_mode(
+            self._kws_cfg.get('trigger_mode', DEFAULT_TRIGGER_MODE), self._kws_cfg)
         # On by default: the saved segments are the only way to audit what the VAD
         # actually handed the recogniser when a transcription looks wrong. Bounded
         # by _max_saved_segments — see _enforce_retention(), which unlike the
@@ -1583,7 +1542,7 @@ class ASRPlugin:
         log.info(f"[asr] plugin init: model={self._asr_model}, device={self._device}, "
                  f"vad={self._vad_backend}, threshold={self._vad_threshold}, "
                  f"silence_ms={self._vad_silence_ms}, pre_roll_ms={self._vad_pre_roll_ms}, "
-                 f"kws_enabled={self._kws_cfg.get('enabled', False)}")
+                 f"trigger_mode={self._kws_cfg['trigger_mode']}")
 
     def get_tools(self) -> list:
         return TOOLS
@@ -1625,28 +1584,76 @@ class ASRPlugin:
         node._max_saved_segments = self._max_saved_segments
 
     def _load_model_async(self, model_name: str):
-        """Download and load ASR model in a background thread."""
+        """Download and load ASR model in a background thread.
+
+        The latest request wins. An in-flight load used to be a reason to drop
+        the new one, which lost every switch made while a model was downloading:
+        on Orin5 a `config {parakeet-en}` started the cpu download, the operator
+        then picked gpu, and that second request updated `_device` but never
+        reloaded — so the card came up on the cpu weights while both the plugin
+        and the dashboard reported gpu. Instead the loader re-reads the target
+        after each attempt and goes round again if it changed.
+        """
         import threading
         def _do_load():
-            try:
-                log.info(f"[asr] downloading/loading model '{model_name}'...")
-                self._plugin_cfg['asr_model'] = model_name
-                adapter = _build_asr_adapter(self._plugin_cfg)
-                self._adapter = adapter
-                self._loading = False
-                self._load_error = None
-                log.info(f"[asr] model '{model_name}' ready")
-            except Exception as e:
-                log.error(f"[asr] failed to load model '{model_name}': {e}", exc_info=True)
-                self._loading = False
-                self._load_error = str(e)
+            while True:
+                with self._nodes_lock:
+                    model, device = self._load_target
+                try:
+                    log.info(f"[asr] downloading/loading model '{model}' ({device})...")
+                    adapter = _build_asr_adapter(
+                        {**self._plugin_cfg, 'asr_model': model, 'device': device},
+                        on_status=lambda text: setattr(self, "_load_status", text))
+                    error = None
+                except Exception as e:
+                    log.error(f"[asr] failed to load model '{model}': {e}", exc_info=True)
+                    adapter, error = None, str(e)
+                with self._nodes_lock:
+                    if self._load_target != (model, device):
+                        # Superseded while we were loading — drop this result,
+                        # including its error, and load what was asked for last.
+                        log.info("[asr] load of '%s' (%s) superseded by '%s' (%s)",
+                                 model, device, *self._load_target)
+                        continue
+                    if adapter is not None:
+                        self._adapter = adapter
+                        self._plugin_cfg['asr_model'] = model
+                        self._plugin_cfg['device'] = device
+                        log.info(f"[asr] model '{model}' ready")
+                    self._load_error = error
+                    self._load_status = ""
+                    self._loading = False
+                    # Left in place, not popped: `info` reports a pending start
+                    # as still loading, and the poller watching this card reads
+                    # `idle` as "cancelled". Each is dropped once it has run.
+                    deferred = list(self._pending_starts.items())
+                break
+            # Starts that arrived while the model was loading. `start` answered
+            # them with `state: loading` instead of blocking, so running them is
+            # now this thread's job — the caller only polls `info` and would
+            # read a plugin that never started as a cancelled one.
+            for key, start_args in deferred:
+                try:
+                    if error is None:
+                        log.info("[asr] running the start deferred behind the load "
+                                 "of '%s'", model)
+                        self.dispatch("asr", start_args)
+                except Exception as e:
+                    log.error(f"[asr] deferred start failed: {e}", exc_info=True)
+                finally:
+                    with self._nodes_lock:
+                        if self._pending_starts.get(key) is start_args:
+                            del self._pending_starts[key]
 
         with self._nodes_lock:
+            self._load_target = (model_name, self._device)
             if self._loading:
-                log.warning(f"[asr] a model load is already in flight, ignoring '{model_name}'")
+                log.info("[asr] load in flight; queueing '%s' (%s) as the new target",
+                         model_name, self._device)
                 return
             self._loading = True
             self._load_error = None
+            self._load_status = f"正在准备模型 '{model_name}' …"
         threading.Thread(target=_do_load, daemon=True, name="asr_model_loader").start()
 
     def dispatch(self, name: str, args: dict) -> dict | None:
@@ -1654,12 +1661,15 @@ class ASRPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
-            # Report loading/error state at plugin level
-            if self._loading:
+            # Report loading/error state at plugin level. A start that is still
+            # queued behind the load counts as loading too: the caller polling
+            # this reads anything else as final, and `idle` in that window would
+            # be reported as a cancelled card moments before the node comes up.
+            if self._loading or self._pending_starts:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "loading",
-                    "desc": f"Downloading model '{self._asr_model}'...",
+                    "desc": self._load_status or f"正在加载模型 '{self._asr_model}' …",
                 }
             if self._load_error:
                 return {
@@ -1713,17 +1723,28 @@ class ASRPlugin:
 
         elif action == "start":
             if self._loading:
-                # Bounded wait. The unbounded `while self._loading: sleep(0.5)`
-                # this replaces pinned an MCP worker thread for as long as the
-                # download took — and forever if the loader thread died without
-                # raising Exception, since nothing else clears _loading.
-                deadline = time.monotonic() + MODEL_LOAD_TIMEOUT_S
+                # Short grace wait, then hand back. A warm model is ready within
+                # a second or two, and waiting for it keeps `start` synchronous
+                # the way callers expect. A cold one takes minutes — blocking for
+                # that pinned an MCP worker thread and, worse, left the operator
+                # staring at a bare spinner: `state: loading` is what makes the
+                # dashboard poll `info` and relay the download/load phase text,
+                # and it could not do that while this call had not returned.
+                #
+                # Handing back means this start has to be remembered, not
+                # dropped: the caller polls `info` and takes anything that is no
+                # longer `loading` as the final answer, so a plugin that came
+                # back idle would be read as "start cancelled".
+                deadline = time.monotonic() + MODEL_LOAD_GRACE_S
                 while self._loading:
                     if time.monotonic() > deadline:
+                        with self._nodes_lock:
+                            self._pending_starts[instance_id or
+                                                 args.get("input_topic", "")] = dict(args)
                         return {"state": "loading", "asr_model": self._asr_model,
-                                "message": f"model '{self._asr_model}' still loading after "
-                                           f"{MODEL_LOAD_TIMEOUT_S}s, retry later"}
-                    time.sleep(0.5)
+                                "message": (self._load_status or
+                                            f"模型 '{self._asr_model}' 仍在加载")}
+                    time.sleep(0.1)
             if self._load_error:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
             if not self._adapter:
@@ -1773,11 +1794,15 @@ class ASRPlugin:
 
         elif action == "stop":
             with self._nodes_lock:
+                # A start deferred behind a model load has to be dropped here
+                # too, or it fires minutes after the operator stopped the card.
                 if instance_id:
                     keys = [instance_id] if instance_id in self._nodes else []
+                    self._pending_starts.pop(instance_id, None)
                 else:
                     # Stop all instances (backward compat / project stop)
                     keys = list(self._nodes.keys())
+                    self._pending_starts.clear()
                 nodes = [(k, self._nodes.pop(k)) for k in keys]
             # request_stop() before disposing: it is non-blocking and unblocks an
             # in-flight start() so _dispose_node does not sit behind it.
@@ -1800,12 +1825,14 @@ class ASRPlugin:
                 self._vad_threshold = float(cfg['vad_threshold'])
             if 'vad_silence_ms' in cfg:
                 self._vad_silence_ms = int(cfg['vad_silence_ms'])
-            if 'trigger_mode' in cfg:
-                self._kws_cfg['trigger_mode'] = cfg['trigger_mode']
-            if 'kws_model' in cfg:
-                self._kws_cfg['kws_model'] = cfg['kws_model']
+            # kws_keywords is still read — not to run a KeywordSpotter, but so a
+            # card submitting the old pair (trigger_mode: kws + kws_keywords)
+            # has its wake word available for resolve_trigger_mode to carry over.
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
+            if 'trigger_mode' in cfg:
+                self._kws_cfg['trigger_mode'] = resolve_trigger_mode(
+                    cfg['trigger_mode'], self._kws_cfg)
             if 'asr_kws_keyword' in cfg:
                 self._kws_cfg['asr_kws_keyword'] = cfg['asr_kws_keyword']
             if 'asr_kws_threshold' in cfg:
@@ -1821,7 +1848,9 @@ class ASRPlugin:
             # because a request can change both at once, and whether a device is
             # allowed depends on the model.
             from utils.onnx_provider import normalize_device
-            new_model = cfg.get('asr_model', self._asr_model)
+            # Resolve before validating, so a card still holding a removed name
+            # reconfigures onto the replacement instead of erroring out.
+            new_model = resolve_asr_model(cfg.get('asr_model', self._asr_model))
             new_device = (normalize_device(cfg['device']) if 'device' in cfg
                           else self._device)
             if new_model not in ASR_MODELS:
@@ -1829,17 +1858,39 @@ class ASRPlugin:
                         "message": f"Unknown asr_model '{new_model}'; "
                                    f"available: {', '.join(sorted(ASR_MODELS))}"}
             if new_device not in ASR_MODELS[new_model]["devices"]:
-                # Reject rather than silently degrade: someone is looking at the
-                # result of this call, and a request for gpu that quietly runs on
-                # cpu is how a "GPU is not faster" bug report gets written.
-                supported = asr_models_supporting(new_device)
-                return {"status": "error",
-                        "asr_model": self._asr_model, "device": self._device,
-                        "message": (
-                            f"Model '{new_model}' has no '{new_device}' weights — it "
-                            f"was either measured slower there or never verified. "
-                            f"Models with {new_device} support: "
-                            f"{', '.join(supported) or '(none)'}")}
+                # Two different situations reach here, and only one of them is a
+                # user error.
+                #
+                # The device field is hidden by `x-show-when` for models with no
+                # gpu weights, but the form still submits whatever was selected
+                # last — so switching from a gpu-capable model to a cpu-only one
+                # carries a stale `device: gpu` that nobody asked for. Rejecting
+                # that is worse than useless: the dashboard issues `start`
+                # regardless of the config result, so the card came up on the
+                # OLD model while the operator believed they had switched.
+                # Observed on Orin5: a parakeet-en request was rejected for
+                # `device: gpu`, and the transcripts that followed were
+                # sensevoice-small's.
+                #
+                # So: a device the caller did not touch degrades to cpu, loudly.
+                # A device the caller explicitly asked for is still rejected —
+                # a request for gpu that quietly runs on cpu is how a "GPU is not
+                # faster" bug report gets written.
+                device_requested = ('device' in cfg
+                                    and normalize_device(cfg['device']) != self._device)
+                if device_requested:
+                    supported = asr_models_supporting(new_device)
+                    return {"status": "error",
+                            "asr_model": self._asr_model, "device": self._device,
+                            "message": (
+                                f"Model '{new_model}' has no '{new_device}' weights — it "
+                                f"was either measured slower there or never verified. "
+                                f"Models with {new_device} support: "
+                                f"{', '.join(supported) or '(none)'}")}
+                log.warning("[asr] model '%s' has no '%s' weights and the request did "
+                            "not ask to change device — carrying over the previous "
+                            "value would fail, so using cpu.", new_model, new_device)
+                new_device = "cpu"
 
             if (new_model, new_device) != (self._asr_model, self._device):
                 # Stop all running nodes first
@@ -1855,8 +1906,8 @@ class ASRPlugin:
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "device": self._device,
-                        "message": f"Switching to model '{self._asr_model}' on "
-                                   f"{self._device}, downloading..."}
+                        "message": self._load_status or
+                                   f"正在切换到模型 '{self._asr_model}' ({self._device})"}
             # Hot-reload: stop running nodes, apply new config, restart automatically
             with self._nodes_lock:
                 was_running = [(key, node) for key, node in self._nodes.items()
@@ -1867,6 +1918,14 @@ class ASRPlugin:
             for key, node in was_running:
                 self._sync_cfg(node)
                 node.start()
+            if self._loading:
+                # Nothing about the model changed, but one is still coming down
+                # the wire. Reporting "configured" here ended the dashboard's
+                # progress text mid-download and left it on a bare spinner.
+                return {"status": "loading", "asr_model": self._asr_model,
+                        "device": self._device,
+                        "message": self._load_status or
+                                   f"正在加载模型 '{self._asr_model}' ({self._device})"}
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None
@@ -1963,7 +2022,7 @@ def _vad_segment_sync(audio_bytes: bytes, model: str = 'silero',
                     min_silence_duration=0.1,
                     min_speech_duration=0.1,
                     window_size=CHUNK_SAMPLES,
-                    max_speech_duration=30,
+                    max_speech_duration=VAD_MAX_SPEECH_S,
                 ),
                 sample_rate=SAMPLE_RATE,
                 num_threads=1,
@@ -1971,7 +2030,7 @@ def _vad_segment_sync(audio_bytes: bytes, model: str = 'silero',
                 # per-window inference is too small to amortise a CUDA session.
                 provider="cpu",
             ),
-            buffer_size_in_seconds=30,
+            buffer_size_in_seconds=VAD_BUFFER_S,
         )
 
         def is_speech(chunk):

@@ -218,198 +218,9 @@ class DeployProgressUI {
         `;
         DeployProgressUI._getMinimizedStack().appendChild(this.minimizedIndicator);
 
-        // Add styles if not already present
-        if (!document.getElementById('deploy-progress-styles')) {
-            const style = document.createElement('style');
-            style.id = 'deploy-progress-styles';
-            style.textContent = `
-                .deploy-progress-modal {
-                    position: fixed;
-                    top: 0;
-                    left: 0;
-                    right: 0;
-                    bottom: 0;
-                    background: rgba(0, 0, 0, 0.5);
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    z-index: 10000;
-                }
-                .deploy-progress-content {
-                    background: #1e1e1e;
-                    border-radius: 8px;
-                    padding: 20px;
-                    min-width: 500px;
-                    max-width: 700px;
-                    max-height: 80vh;
-                    overflow: auto;
-                    color: #e0e0e0;
-                }
-                .deploy-progress-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: flex-start;
-                    margin-bottom: 20px;
-                    padding-bottom: 10px;
-                    border-bottom: 1px solid #333;
-                }
-                .deploy-progress-header h3 {
-                    margin: 0;
-                    font-size: 18px;
-                    line-height: 24px;
-                    flex: 1;
-                }
-                .deploy-progress-header-actions {
-                    display: flex;
-                    gap: 4px;
-                    align-items: center;
-                }
-                .deploy-progress-minimize,
-                .deploy-progress-close {
-                    background: none;
-                    border: none;
-                    color: #999;
-                    font-size: 20px;
-                    line-height: 24px;
-                    cursor: pointer;
-                    padding: 0 4px;
-                    height: 24px;
-                    display: inline-flex;
-                    align-items: center;
-                    justify-content: center;
-                    flex-shrink: 0;
-                    margin-left: 0;
-                }
-                .deploy-progress-minimize:hover,
-                .deploy-progress-close:hover {
-                    color: #fff;
-                    background: rgba(255,255,255,0.1);
-                    border-radius: 4px;
-                }
-                .deploy-progress-close {
-                    font-size: 24px;
-                }
-                .deploy-progress-checks {
-                    margin-bottom: 15px;
-                }
-                .deploy-progress-check {
-                    padding: 8px;
-                    margin: 4px 0;
-                    border-radius: 4px;
-                    font-size: 14px;
-                }
-                .deploy-progress-check.pass {
-                    background: rgba(76, 175, 80, 0.2);
-                    color: #4caf50;
-                }
-                .deploy-progress-check.warning {
-                    background: rgba(255, 152, 0, 0.2);
-                    color: #ff9800;
-                }
-                .deploy-progress-check.fail {
-                    background: rgba(244, 67, 54, 0.2);
-                    color: #f44336;
-                }
-                .deploy-progress-stage {
-                    font-size: 16px;
-                    margin-bottom: 10px;
-                    font-weight: 500;
-                }
-                .deploy-progress-bar {
-                    height: 12px;
-                    background: #333;
-                    border-radius: 6px;
-                    overflow: hidden;
-                    margin-bottom: 10px;
-                }
-                .deploy-progress-bar-fill {
-                    height: 100%;
-                    background: #4caf50;
-                    background: -webkit-linear-gradient(left, #4caf50, #8bc34a);
-                    background: linear-gradient(90deg, #4caf50, #8bc34a);
-                    transition: width 0.3s ease;
-                    width: 0%;
-                    min-width: 2px;
-                }
-                .deploy-progress-details {
-                    font-size: 13px;
-                    color: #999;
-                    margin-bottom: 15px;
-                }
-                .deploy-progress-log {
-                    background: #0a0a0a;
-                    border-radius: 4px;
-                    padding: 10px;
-                    max-height: 200px;
-                    overflow-y: auto;
-                    font-family: monospace;
-                    font-size: 12px;
-                }
-                .deploy-progress-log-entry {
-                    margin: 2px 0;
-                    color: #999;
-                }
-                .deploy-progress-log-entry.error {
-                    color: #f44336;
-                }
-                .deploy-progress-log-entry.success {
-                    color: #4caf50;
-                }
-
-                /* Minimized indicator stack — holds one indicator per active deployment
-                   so multiple concurrent deploys don't render on top of each other */
-                .deploy-progress-minimized-stack {
-                    position: fixed;
-                    bottom: 20px;
-                    right: 20px;
-                    display: flex;
-                    flex-direction: column-reverse;
-                    gap: 12px;
-                    z-index: 9999;
-                }
-                .deploy-progress-minimized {
-                    background: #1e1e1e;
-                    border: 1px solid #333;
-                    border-radius: 8px;
-                    padding: 12px 16px;
-                    min-width: 280px;
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-                    cursor: pointer;
-                    transition: transform 0.2s, box-shadow 0.2s;
-                }
-                .deploy-progress-minimized:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 6px 16px rgba(0,0,0,0.4);
-                }
-                .deploy-progress-minimized.hidden {
-                    display: none;
-                }
-                .deploy-progress-minimized-content {
-                    color: #e0e0e0;
-                }
-                .deploy-progress-minimized-title {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    font-size: 14px;
-                    font-weight: 500;
-                    margin-bottom: 8px;
-                }
-                .deploy-progress-minimized-spinner {
-                    animation: spin 1s linear infinite;
-                    font-size: 16px;
-                }
-                @keyframes spin {
-                    from { transform: rotate(0deg); }
-                    to { transform: rotate(360deg); }
-                }
-                .deploy-progress-minimized-progress {
-                    font-size: 12px;
-                    color: #999;
-                }
-            `;
-            document.head.appendChild(style);
-        }
+        // Styles live in css/style.css (§ DEPLOY PROGRESS MODAL). They used to be
+        // injected from here as a hardcoded dark palette, which is why this modal
+        // rendered as a black terminal window inside a light parchment UI.
 
         document.body.appendChild(this.container);
 
@@ -475,7 +286,7 @@ class DeployProgressUI {
         const minimizedProgress = this.minimizedIndicator.querySelector('.deploy-progress-minimized-progress');
         if (minimizedProgress) {
             minimizedProgress.textContent = '部署失败';
-            minimizedProgress.style.color = '#f44336';
+            minimizedProgress.classList.add('error');
         }
 
         // Auto-close after 15 seconds
@@ -502,7 +313,10 @@ class DeployProgressUI {
 
     _updateProgress(stage, message, percent, speed) {
         console.log('[DeployProgress] Updating progress:', { stage, message, percent, speed });
-        this._setStage(message);
+        // An empty message is not a stage — `_handleDone` calls this with '' just
+        // to push the bar to 100%, and overwriting the stage with it wiped the
+        // 部署完成 line the operator had just been shown.
+        if (message) this._setStage(message);
 
         if (percent !== undefined) {
             const bar = this.container.querySelector('.deploy-progress-bar-fill');
@@ -531,8 +345,10 @@ class DeployProgressUI {
                 this._addLog(progressMsg, 'info');
                 this._lastLoggedPercent = percent;
             }
-        } else if (stage !== 'pull') {
-            // Log all non-pull progress updates
+        } else if (stage !== 'pull' && message) {
+            // Log all non-pull progress updates. Guarded on `message` for the
+            // same reason as the stage above: the bar-to-100% call carries none,
+            // and logging it left a bare timestamp as the last line of the log.
             this._addLog(message, 'info');
         }
 
@@ -547,8 +363,8 @@ class DeployProgressUI {
     _setStage(message, status) {
         const stageEl = this.container.querySelector('.deploy-progress-stage');
         stageEl.textContent = message;
-        stageEl.style.color = status === 'error' ? '#f44336' :
-                              status === 'success' ? '#4caf50' : '#e0e0e0';
+        // Class, not an inline colour: the theme owns green/red.
+        stageEl.className = `deploy-progress-stage ${status || ''}`.trim();
     }
 
     _addLog(message, level = 'info') {

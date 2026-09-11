@@ -17,12 +17,12 @@ plugins:
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
-    asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | sensevoice-small
+    asr_model: sensevoice-small   # x-asr-zh-en | parakeet-en | sensevoice-small
     # cpu | gpu — which weights get loaded is per (model, device) in
     # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
     # jp5.11 only) and is only offered for models where it was benchmarked and
-    # the transcripts were read: sensevoice-small (fp16) and paraformer-zh-en
-    # (fp32). Everything else is cpu-only — int8 weights are slower on CUDA, not
+    # the transcripts were read: sensevoice-small (fp16) and parakeet-en
+    # (fp32). x-asr-zh-en is cpu-only — its int8 weights are slower on CUDA, not
     # faster, because ONNX Runtime's CUDA provider has no int8 kernels.
     #
     # gpu is ~3.4x faster per utterance (58 ms vs 195 ms p50 on 1-4 s of speech)
@@ -42,11 +42,26 @@ plugins:
       threshold: 0.5
       silence_ms: 400
       pre_roll_ms: 500
+    # Wake-word gating. Still called `kws` for continuity with existing
+    # deployments, but there is no longer a keyword-spotting *model*: the old
+    # `trigger_mode: kws` ran a second sherpa KeywordSpotter on the raw audio
+    # and has been removed. `asr_kws` gates on the transcript instead, which
+    # the ASR produces anyway.
     kws:
-      enabled: true
-      model_dir: /models/sherpa-onnx/kws
-      keywords:
-        - "x iǎo f àn x iǎo f àn @小范小范"
+      # vad = transcribe and forward everything (always listening)
+      # asr_kws = forward only utterances whose transcript starts with the wake
+      #           word, phonetically matched; the command is what follows it
+      #
+      # A card still set to `kws` is migrated to `asr_kws` at load, carrying its
+      # wake word over from `keywords` — see REMOVED_TRIGGER_MODES in
+      # plugins/asr.py. Note an unset wake word makes asr_kws degrade to vad,
+      # i.e. always on.
+      trigger_mode: asr_kws
+      asr_kws_keyword: "小范小范"
+      # Normalised phoneme edit distance, 0-1. Lower is stricter. Measured on a
+      # 10-phoneme wake word, 0.3 permits at most 3 full-cost edits, which in
+      # practice means the ASR has to render the wake word almost exactly.
+      asr_kws_threshold: 0.3
 
   tts:
     enabled: true
