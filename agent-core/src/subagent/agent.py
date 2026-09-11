@@ -21,8 +21,15 @@ from .protocol import (
     SubagentSpec, SubagentResult, SubagentStatus,
     STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED,
     STATUS_TIMEOUT, STATUS_CANCELLED, STATUS_PAUSED, STATUS_SUSPENDED,
+    STATUS_PARTIAL,
 )
 from .context import SubagentContext
+
+
+# Used only when a spec reaches here without the manager having resolved
+# `subagent.default_max_rounds` (max_rounds=0) — a spec rebuilt from a dict, say.
+# Never the configured default; that lives in config and manager._get_config().
+_FALLBACK_MAX_ROUNDS = 50
 
 
 # Tools that subagents are NEVER allowed to use (enforced at code level)
@@ -38,8 +45,12 @@ class Subagent:
     """An isolated agent instance with its own LLM loop and context."""
 
     def __init__(self, spec: SubagentSpec, agent_id: str | None = None,
-                 compress_threshold: int = 20000):
+                 compress_threshold: int = 60000):
         self.id = agent_id or uuid4().hex[:8]
+        # Resolve before building the context: the system prompt states the round
+        # budget, and `range(0)` would otherwise exit the loop before round 0.
+        if spec.max_rounds <= 0:
+            spec.max_rounds = _FALLBACK_MAX_ROUNDS
         self.spec = spec
         self.status: str = 'pending'
         self.created_at: float = time.time()
@@ -479,18 +490,19 @@ class Subagent:
 
                 # Checkpoint check (done by manager externally)
 
-            # Max rounds reached
+            # Max rounds reached — write up what we have before returning.
+            wrap_up = await self._wrap_up(content)
             self.result = SubagentResult(
                 agent_id=self.id,
-                status=STATUS_TIMEOUT,
-                output=content if content else '(max rounds reached)',
+                status=STATUS_PARTIAL,
+                output=wrap_up,
                 tool_calls_made=self._tool_calls_made,
-                        actions=self._action_report(),
+                actions=self._action_report(),
                 rounds_used=self.rounds_completed,
                 duration_s=time.time() - t0,
                 error=f'Reached max_rounds={self.spec.max_rounds}',
             )
-            self.status = STATUS_TIMEOUT
+            self.status = STATUS_PARTIAL
             return self.result
 
         except asyncio.CancelledError:
@@ -628,6 +640,57 @@ class Subagent:
                 'tool': (outcome or {}).get('tool', ''),
             })
         return out
+
+    async def _wrap_up(self, last_content: str) -> str:
+        """One final toolless LLM call: turn the run's findings into an answer.
+
+        A subagent that runs out of rounds is almost always mid-tool-call, so
+        `last_content` is empty and the caller used to receive the literal string
+        '(max rounds reached)'. Measured on Orin5: a research run made 22 WebSearch
+        calls and one WebFetch over its 10 rounds, then handed the main agent that
+        placeholder — every finding discarded at the finish line.
+
+        Tools are withheld on purpose. The budget is spent; offering tools here
+        just invites another search whose result nothing would read.
+
+        Falls back to `last_content`, then to the placeholder, so this can only
+        add information — a failing LLM call leaves the old behaviour intact.
+        """
+        placeholder = last_content or '(max rounds reached)'
+        if not self._tool_calls_made:
+            # Nothing was gathered; there is nothing to write up.
+            return placeholder
+
+        try:
+            messages = self._context.build_messages()
+            messages.append({
+                'role': 'user',
+                'content': (
+                    f'[系统] 你已用完 {self.spec.max_rounds} 轮预算，不能再调用任何工具。\n'
+                    '现在直接输出最终结果：把已经查到的信息整理成对任务目标的回答，'
+                    '保留具体数字、来源和结论。如果有没查到的部分，在末尾用一两句说明缺口，'
+                    '不要因此放弃已有内容。'
+                ),
+            })
+            import client as _client
+            response = await _client.call(
+                message_list=messages,
+                tool_list=[],
+                cancel_event=self._cancel_event,
+                model_override=self.spec.model,
+                trace_id=f'subagent:{self.id}:wrap_up',
+                caller_info={'agent_type': 'subagent'},
+            )
+            text = (response.get('content') or '').strip()
+            if text:
+                print(f'[subagent:{self.id}] wrap-up produced {len(text)} chars '
+                      f'after {self.rounds_completed} round(s)')
+                return text
+            print(f'[subagent:{self.id}] wrap-up returned empty content')
+        except Exception as e:
+            print(f'[subagent:{self.id}] wrap-up failed: {e}')
+
+        return placeholder
 
     async def _dispatch_tool(self, name: str, args: dict) -> str:
         """Dispatch a tool call and return result text."""

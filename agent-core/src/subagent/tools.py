@@ -62,7 +62,7 @@ class SubagentTools:
         priority: Annotated[int, "优先级: 0=紧急 1=高 2=普通 3=低, -1=自动继承"] = -1,
         tools: Annotated[str, "工具过滤: '*'=全部, 逗号分隔的 fnmatch 模式"] = '*',
         model: Annotated[str, "LLM模型覆盖,为空则用默认模型"] = '',
-        max_rounds: Annotated[int, "最大推理轮数"] = 10,
+        max_rounds: Annotated[int, "最大推理轮数，0=用系统配置的默认值"] = 0,
         context: Annotated[str, "传递给子代理的初始上下文信息"] = '',
     ) -> str:
         """创建子代理异步执行任务。返回 agent_id 用于后续查询。适合不需要立即结果的后台任务。"""
@@ -99,7 +99,7 @@ class SubagentTools:
         priority: Annotated[int, "优先级: 0=紧急 1=高 2=普通 3=低"] = 0,
         tools: Annotated[str, "工具过滤: '*'=全部, 逗号分隔的 fnmatch 模式"] = '*',
         model: Annotated[str, "LLM模型覆盖,为空则用默认模型"] = '',
-        max_rounds: Annotated[int, "最大推理轮数"] = 10,
+        max_rounds: Annotated[int, "最大推理轮数，0=用系统配置的默认值"] = 0,
         context: Annotated[str, "传递给子代理的初始上下文信息"] = '',
         timeout: Annotated[int, "等待超时秒数"] = 120,
     ) -> str:
@@ -124,8 +124,13 @@ class SubagentTools:
         result = await self._mgr.spawn_and_wait(spec, timeout=float(timeout))
         if result.status == 'completed':
             return f'[子代理完成] {result.output}'
-        else:
-            return f'[子代理{result.status}] {result.error or result.output or "(无输出)"}'
+        # Output first, error second: a run that stopped early can still have written
+        # up real findings (status 'partial'), and `error or output` put the reason it
+        # stopped in front of the answer and dropped the answer entirely.
+        if result.output:
+            suffix = f'\n（{result.error}）' if result.error else ''
+            return f'[子代理{result.status}] {result.output}{suffix}'
+        return f'[子代理{result.status}] {result.error or "(无输出)"}'
 
     async def subagent_status(
         self,

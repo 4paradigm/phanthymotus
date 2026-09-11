@@ -45,7 +45,14 @@ _BASE_PROMPT = """\
 class SubagentContext:
     """Manages isolated context for a single subagent."""
 
-    def __init__(self, spec: SubagentSpec, compress_threshold: int = 20000):
+    # How many recent turns survive a compression pass verbatim. At 2 a research
+    # subagent forgot its own last-but-one search: on Orin5 it re-ran "support and
+    # resistance" in rounds 2, 6 and 9 and "analyst price target" in rounds 0, 1, 5
+    # and 8, because a single WebSearch turn can exceed the threshold on its own and
+    # compression fired nearly every round.
+    _KEEP_RECENT_TURNS = 4
+
+    def __init__(self, spec: SubagentSpec, compress_threshold: int = 60000):
         self._spec = spec
         self._compress_threshold = compress_threshold
         self._system_prompt = self._build_system(spec)
@@ -134,12 +141,13 @@ class SubagentContext:
         return total > self._compress_threshold
 
     async def compress(self, llm_client=None, model_override: str | None = None) -> None:
-        """Compress old turns into a summary, keeping recent 2 turns."""
-        if len(self._turns) <= 2:
+        """Compress old turns into a summary, keeping the most recent turns verbatim."""
+        keep = self._KEEP_RECENT_TURNS
+        if len(self._turns) <= keep:
             return
 
-        old_turns = self._turns[:-2]
-        self._turns = self._turns[-2:]
+        old_turns = self._turns[:-keep]
+        self._turns = self._turns[-keep:]
 
         # Build text representation of old turns
         text_parts = []
@@ -148,7 +156,10 @@ class SubagentContext:
                 role = msg.get('role', 'unknown')
                 content = msg.get('content', '')
                 if content:
-                    text_parts.append(f'[{role}] {content[:500]}')
+                    # Tool results are the findings; an assistant's prose about them
+                    # can be re-derived, so give the tool output the bigger window.
+                    cap = 1500 if role == 'tool' else 500
+                    text_parts.append(f'[{role}] {content[:cap]}')
                 tool_calls = msg.get('tool_calls', [])
                 if tool_calls:
                     for tc in tool_calls:
@@ -157,10 +168,22 @@ class SubagentContext:
 
         old_text = '\n'.join(text_parts)
 
-        # Ask LLM to compress
+        # Ask LLM to compress.
+        #
+        # "简洁" alone makes this a prose summary, and a prose summary of a search
+        # round is "查询了英伟达股价相关信息" — which reads as *done* while carrying
+        # none of the answer, so the subagent searches the same thing again. What has
+        # to survive is the facts themselves: numbers, names, URLs, and which queries
+        # are already spent.
         compress_messages = [
-            {'role': 'system', 'content': '将以下对话历史压缩为简洁的摘要，保留关键信息（工具调用结果、决策、发现）。用中文输出。'},
-            {'role': 'user', 'content': old_text[:8000]},  # cap input
+            {'role': 'system', 'content': (
+                '将以下对话历史压缩为摘要，供同一个 agent 继续执行任务时阅读。要求：\n'
+                '1. 逐条保留已查到的事实：具体数字、日期、名称、结论、来源 URL。宁可长也不要丢数据。\n'
+                '2. 列出已经调用过的工具和查询内容，标明哪些已经有答案、哪些没查到，避免重复检索。\n'
+                '3. 不要写"已了解/已分析"这类空话，只写内容本身。\n'
+                '用中文输出。'
+            )},
+            {'role': 'user', 'content': old_text[:16000]},  # cap input
         ]
 
         try:
@@ -180,10 +203,10 @@ class SubagentContext:
                     role = msg.get('role', '')
                     content = msg.get('content', '')
                     if role == 'tool' and content:
-                        fallback_parts.append(content[:200])
+                        fallback_parts.append(content[:500])
                     elif role == 'assistant' and content:
                         fallback_parts.append(content[:100])
-            fallback = '\n'.join(fallback_parts)[:3000]
+            fallback = '\n'.join(fallback_parts)[:6000]
             if self._summary:
                 self._summary = f'{self._summary}\n\n[简要回顾] {fallback}'
             else:

@@ -98,7 +98,7 @@ _DB_DEFAULTS = {
         'default_timeout_s': 300,
         'preemption_enabled': True,
         'checkpoint_interval': 5,
-        'compress_threshold_chars': 20000,
+        'compress_threshold_chars': 60000,
         'cleanup_age_hours': 24,
         'bg_route_enabled': True,
         'bg_model': None,  # None = use main model; or specify e.g. 'qwen-turbo'
@@ -270,6 +270,24 @@ def _migrate():
                 conn.execute("UPDATE config SET value=? WHERE key='services'", (json.dumps(svc),))
                 conn.commit()
                 print(f'[config] deduped {len(mcp_list) - len(deduped)} duplicate MCP entries')
+
+        # subagent 压缩阈值 20000 → 60000。
+        #
+        # _seed_defaults 用的是 INSERT OR IGNORE，整行粒度：已部署机器上的 'subagent'
+        # 行早就存在，新默认值永远进不去。Orin5 实测就是这样 —— 一次 WebSearch 的结果
+        # 就超过 20000 字符，压缩几乎每轮触发、只留最近两轮，子代理因此忘掉自己刚查到的
+        # 东西并反复重查（同一个问题搜了 round 2、6、9）。
+        #
+        # 只改还停在旧默认值上的行；有人手工调过就不动。
+        row_sa = conn.execute("SELECT value FROM config WHERE key='subagent'").fetchone()
+        if row_sa:
+            sa = json.loads(row_sa[0])
+            if sa.get('compress_threshold_chars') == 20000:
+                sa['compress_threshold_chars'] = 60000
+                conn.execute("UPDATE config SET value=? WHERE key='subagent'",
+                             (json.dumps(sa),))
+                conn.commit()
+                print('[config] subagent.compress_threshold_chars 20000 -> 60000')
 
 _migrate()
 
