@@ -917,11 +917,12 @@ in to suppress hallucination, and it emits punctuation and capitalisation, which
 (104 MB int8) and needs no new runtime: `OfflineRecognizer.from_nemo_ctc` has been
 in the pinned sherpa-onnx 1.13.6 all along.
 
-Measured on Orin 6 (jp6.1) inside the perception image, cpu provider,
-`num_threads=2`: RTF 0.039 on the bundle's 7.4 s sample and 0.054 on its 1.0 s
-sample — roughly 25x realtime, with punctuation and capitalisation in the
-transcript. No gpu pair is offered because none has been benchmarked; that is the
-admission rule below, and CPU was the point of picking this model anyway.
+Measured inside the perception image on both JetPack lines, cpu provider,
+`num_threads=2` — RTF 0.039/0.054 on Orin 6 (jp6.1) and 0.040/0.055 on Orin 5
+(jp5.11) for the bundle's 7.4 s and 1.0 s samples. Roughly 25x realtime on either
+line, with punctuation and capitalisation in the transcript. No gpu pair is
+offered because none has been benchmarked; that is the admission rule below, and
+CPU was the point of picking this model anyway.
 
 ⚠️ **`sensevoice-small` on gpu drops some utterances entirely** — fp16 under the
 CUDA provider returns an empty transcript for certain inputs, silently and
