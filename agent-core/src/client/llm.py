@@ -206,6 +206,7 @@ class Client():
                         'completion_tokens': usage.completion_tokens,
                         'total_tokens': usage.total_tokens,
                         'cached_tokens': cached_tokens,
+                        'elapsed_s': round(elapsed, 2),
                     }
                 return msg
             except Exception as e:
