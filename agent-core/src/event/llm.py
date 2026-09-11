@@ -321,9 +321,18 @@ async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
 
 
 async def _wait_for_steering(poll_s: float = _STEERING_POLL_S) -> None:
-    """轮询到 steering_queue 非空为止。asyncio.Queue 没有 "非破坏性等待"，
-    而 drain_steering() 会把消息取走 —— 取走了本轮 finish 之后就没人再放回去。"""
-    while not collector.has_steering():
+    """轮询到队列里出现**人**发的消息为止。asyncio.Queue 没有 "非破坏性等待"，
+    而 drain_steering() 会把消息取走 —— 取走了本轮 finish 之后就没人再放回去。
+
+    判据是 `has_barge_in_steering()` 而不是 `has_steering()`：这个 wakeup 的唯一后果
+    是 `_abort_pending_for_barge_in()` 掐掉正在播的音频，而机器自己发的通知没有掐掉
+    人类汇报的资格。用 has_steering() 时，一个后台 subagent 跑完就会打断主 agent 正在
+    播的上一份汇报（Orin5 实测，见 has_barge_in_steering 的 docstring）。
+
+    被过滤掉的通知不会丢：它留在队列里，turn 正常播完结束后由 `_flush_all_pending()`
+    转成下一轮的触发事件 —— 也就是"说完这句再报"，本来就是想要的顺序。
+    """
+    while not collector.has_barge_in_steering():
         await asyncio.sleep(poll_s)
 
 

@@ -196,11 +196,43 @@ async def drain_steering() -> list[dict]:
 def has_steering() -> bool:
     """steering_queue 里有没有待处理的用户消息 —— 只看，不取走。
 
-    ACP barrier 用它做 barge-in 检测：steer 模式（默认）下 busy 时的用户消息
-    只入队、不 set cancel_event，barrier 光靠 cancel_event 醒不过来。
-    drain_steering() 会把消息取走，barrier 里不能用。
+    steer 模式（默认）下 busy 时的 P>0 事件只入队、不 set cancel_event，所以主循环
+    要靠这个函数知道"该回头看看了"。drain_steering() 会把消息取走，这里不能用。
+
+    **打断播放请用 `has_barge_in_steering()`**：这个函数对所有 P>0 事件都为真，
+    包括机器自己发的通知。
     """
     return not _steering_queue.empty() or bool(_priority_pending)
+
+
+# 机器自己产生的 P>0 通知。它们该进 steering 队列（主循环要尽快看到），但**不该**
+# 被当成"有人要抢话筒"而掐掉正在播的音频。
+_MACHINE_SOURCE_PREFIXES = ('subagent:', 'scheduler:', 'acp', 'peer:', 'bg_monitor')
+
+
+def _is_machine_notification(ev: dict) -> bool:
+    return (ev.get('source') or '').lower().startswith(_MACHINE_SOURCE_PREFIXES)
+
+
+def has_barge_in_steering() -> bool:
+    """队列里有没有**人**在要话筒 —— 只看，不取走。
+
+    finish 的 ACP barrier 用它决定要不要中止正在播放的音频。中止播放只有在有人
+    开口/打字时才说得通；机器自己的通知没有这个资格。
+
+    Orin5 实测（17:01:48 起）：主 agent 正在播一份 171s 的英伟达调研汇报，41 秒后
+    第二个 subagent（坝上自驾游）跑完，`manager._finalize` 把完成通知
+    (source=`subagent:7ff3018a`) 塞进 steering 队列 —— finish barrier 立刻醒来、
+    `_abort_pending_for_barge_in` 掐掉音频。用户没有做任何打断，英伟达那段汇报被
+    自己派出去的后台任务冲掉了，而且冲它的通知本身还要再播一遍。
+
+    过滤用的是"机器源"黑名单而不是"人类源"白名单：判错方向要往"人还能打断"那边错。
+    新接一个人类渠道忘了登记，最坏是它照常能打断（原行为）；反过来则是有人喊停而
+    机器人继续念，那是不能接受的。
+    """
+    if any(not _is_machine_notification(ev) for ev in list(_steering_queue._queue)):
+        return True
+    return any(not _is_machine_notification(ev) for ev in _priority_pending)
 
 
 def defer_priority(events: list[dict]) -> None:
