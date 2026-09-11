@@ -3,7 +3,8 @@ collector.py — 双队列事件收集器。
 
 架构：
   - P>0 事件（ASR/message/channel）→ 立即送 main agent，或 busy 时按模式处理：
-    - steer: 推入 steering_queue，agent loop 在 tool batch 间消费
+    - steer: 推入 steering_queue，agent loop 在 tool batch 间消费；同时置位
+      reconsider_event，叫醒可能正卡住的 LLM 请求/barrier 等待（不结束 turn）
     - interrupt: 触发 cancel_event，中止当前 turn
     - followup: 暂存 _priority_pending，等 turn 结束后 drain
   - P=0 事件（sensor/scheduler 等）→ 独立节奏送 bg subagent，main agent 永远不看到
@@ -34,6 +35,10 @@ _BG_THROTTLE_INTERVAL = 1.0
 # ── 共享状态 ──────────────────────────────────────────────────────────────────
 _busy: bool = False
 _cancel_event: asyncio.Event | None = None
+# 比 _cancel_event 窄：steer 模式下高优先级事件到达时置位，只打断"正在飞的 LLM
+# 请求"或"还没发出去、卡在排队里的 tool_call"，不像 _cancel_event 那样让整个 turn
+# 作废（见 event/llm.py 的 RoundReconsider）。
+_reconsider_event: asyncio.Event | None = None
 _current_turn_priority: int = 0
 _source_ring: dict[str, deque] = {}  # per-source ring buffer（所有事件）
 
@@ -145,6 +150,12 @@ def set_cancel_event(ev: asyncio.Event | None):
     """由 agent loop 调用：注册/清除当前 turn 的取消信号。"""
     global _cancel_event
     _cancel_event = ev
+
+
+def set_reconsider_event(ev: asyncio.Event | None):
+    """由 agent loop 调用：注册/清除当前 turn 的 reconsider 信号（见类型定义处注释）。"""
+    global _reconsider_event
+    _reconsider_event = ev
 
 
 def set_turn_priority(priority: int):
@@ -663,6 +674,12 @@ async def _drain_loop():
                     except asyncio.QueueFull:
                         # queue 满时退化为 followup
                         _priority_pending.append(ev)
+                    # 除了排队，还叫醒当前可能卡住的 LLM 请求/barrier 等待——不结束
+                    # turn（那是 _cancel_event 的事），只是让主循环别等到自然结束才
+                    # 看到这条消息。消息内容本身已经在 steering_queue 里了，这里只
+                    # 是个"该回头看看了"的信号。
+                    if _reconsider_event:
+                        _reconsider_event.set()
                 elif _interrupt_mode == 'interrupt':
                     # Interrupt: 缓存事件并触发 cancel
                     _priority_pending.append(ev)

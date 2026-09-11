@@ -1,8 +1,10 @@
 """
-System Hooks — bypass-LLM immediate actions triggered by system events.
+System Hooks — bypass-LLM actions triggered by system events.
 
-Hooks are registered by drivers via `x-hooks` in MCP tool schemas.
-When fired, they execute tool calls directly (no LLM, no barrier, no ACP).
+Hooks are registered by drivers via `x-hooks` in MCP tool schemas. When fired,
+they execute tool calls directly, without going back to the LLM (see `fire`'s
+`barrier_aware` param for whether they also bypass the barrier/ACP — true
+interrupts should, narration-style hooks like on_notify should not).
 """
 
 from __future__ import annotations
@@ -101,13 +103,23 @@ def get_status() -> dict:
 
 # ── Executor ─────────────────────────────────────────────────────────────────
 
-async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: str | None = None) -> list[dict]:
-    """Fire a hook: execute all bound tool calls immediately, bypassing LLM and barrier.
+async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: str | None = None,
+               barrier_aware: bool = False) -> list[dict]:
+    """Fire a hook: execute all bound tool calls, bypassing the LLM.
 
     Args:
         hook_id: Hook identifier (e.g. "on_interrupt_all")
         extra_params: Additional params merged into each tool call
         exclude_mcp_id: Skip bindings from this mcp_id (avoid double-fire)
+        barrier_aware: False (default) bypasses the barrier too — correct for
+            true interrupts (on_interrupt_*, e-stop), which must preempt
+            immediately no matter what else is in flight. True routes through
+            `mcp_client.call_tool_hook`'s barrier-aware path instead: skip a
+            binding if its resource is already busy, and register whatever it
+            starts as an ACP pending so normal tool calls wait for it too.
+            Use this for hooks that narrate/inform rather than interrupt
+            (on_notify) — otherwise they either talk over something already
+            playing, or get talked over by the very next tool call themselves.
 
     Returns:
         List of results from each binding execution.
@@ -127,7 +139,7 @@ async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: s
         args = {**binding.params, **(extra_params or {})}
         if binding.action:
             args['action'] = binding.action
-        tasks.append(_fire_one(mcp_client, binding, args))
+        tasks.append(_fire_one(mcp_client, binding, args, barrier_aware=barrier_aware))
 
     # Execute all bindings in parallel
     outcomes = await asyncio.gather(*tasks, return_exceptions=True)
@@ -150,6 +162,8 @@ async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: s
     return results
 
 
-async def _fire_one(mcp_client, binding: HookBinding, args: dict) -> Any:
+async def _fire_one(mcp_client, binding: HookBinding, args: dict, barrier_aware: bool = False) -> Any:
     """Execute a single hook binding via direct tool call."""
+    if barrier_aware:
+        return await mcp_client.call_tool_hook(binding.mcp_id, binding.tool, args, barrier_aware=True)
     return await mcp_client.call_tool_direct(binding.mcp_id, binding.tool, args)

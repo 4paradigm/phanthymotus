@@ -38,6 +38,15 @@ class TurnCancelled(Exception):
     pass
 
 
+class RoundReconsider(Exception):
+    """`reconsider_event` 打断了一次还在飞的 LLM 请求时抛出。
+
+    跟 `TurnCancelled` 不同：不结束这个 turn，`turn_messages` 也不清空——调用方
+    （`_one_turn` 的主循环）捕获后原地把新到的 steering drain 进上下文，直接发起
+    新一轮请求，不把这次失败的请求记进历史。"""
+    pass
+
+
 # ── 系统工具注册（静态，仅 finish / memory）──────────────────────────────────
 
 def _build_system_tools(named_functions: list[tuple[str, callable]]) -> dict:
@@ -258,7 +267,8 @@ async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
                        interrupt_fallback=None,
                        want: frozenset | None = None,
                        scoped: bool = False,
-                       concurrent: bool = False) -> dict | None:
+                       concurrent: bool = False,
+                       reconsider_event=None) -> dict | None:
     """有 pending ACP 动作时等待其完成，并记录非正常结果。无 pending 则直接返回。
 
     `scoped=True` 时只等与 `want`（本次调用要占用的物理资源）冲突的 pending；
@@ -274,8 +284,10 @@ async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
     消息由 `_flush_all_pending()` 转成下一轮的触发事件；这正是加 barrier 之前的打
     断行为，只是不再依赖 "finish 提前返回" 这个副作用。
 
-    turn 中段的 mcp 工具 barrier 不走这条：那里 steering 的语义是注入当前 turn
-    （`:1377` 之后就会 drain），不是中止动作。
+    turn 中段的 mcp 工具 barrier 不走 `barge_in` 这条：那里 steering 的语义是注入
+    当前 turn，不是中止 turn。但它们仍然可以传 `reconsider_event` ——比 `cancel_event`
+    窄得多的信号，只放弃"这次调用还没发出去、还在排队"的这一次等待，不影响正在
+    排的东西本身，也不结束 turn（见 `mcp_client.await_pending` 的 docstring）。
     """
     if not mcp_client.get_pending_actions():
         return None
@@ -283,7 +295,8 @@ async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
     if not barge_in:
         result = await mcp_client.await_pending(cancel_event, timeout=120,
                                                want=want, scoped=scoped,
-                                               concurrent=concurrent)
+                                               concurrent=concurrent,
+                                               reconsider_event=reconsider_event)
         _acp_barrier_log(name, result)
         return result
 
@@ -380,17 +393,30 @@ def _channel_tool_restricted(trigger_event: dict) -> bool:
 
 
 def _round_already_notified(tool_calls: list) -> bool:
-    """True if this round's tool_calls already include a bare-tts speak call —
-    the LLM remembered to reply itself, so auto-notify should not double-say it."""
+    """True if this round's tool_calls already exercised whatever action
+    on_notify would also fire — the LLM replied itself, so auto-notify should
+    not double-say it.
+
+    Must resolve through `mcp_client.resolve_tool_binding` rather than parsing
+    the tool_call name directly: a device using x-action-params (e.g. a `tts`
+    tool split into `tts__speak`/`tts__interrupt`/...) never has a literal
+    `action` argument or a name ending in the base tool name, so a name-suffix
+    or args["action"] check silently never matches for it — every round then
+    looks "not yet notified" even when the LLM just spoke, and on_notify fires
+    a second, redundant call on top of the LLM's own.
+    """
     for call in tool_calls:
         name = call.get('function', {}).get('name', '')
-        if name.split('__')[-1] != 'tts':
-            continue
         try:
             args = json.loads(call['function'].get('arguments') or '{}')
         except (json.JSONDecodeError, TypeError):
             args = {}
-        if args.get('action') == 'speak':
+        resolved = mcp_client.resolve_tool_binding(name, args)
+        if not resolved:
+            continue
+        mcp_id, tool_name, action = resolved
+        import hooks
+        if hooks.get_hook_for_binding(mcp_id, tool_name, action) == 'on_notify':
             return True
     return False
 
@@ -1044,6 +1070,11 @@ class Event:
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
             collector.set_cancel_event(cancel_ev)
+            # 更窄的信号：高优先级 steering 到达时，打断"正在飞的 LLM 请求"或者
+            # "还没发出去、卡在排队里的 tool_call"，但不结束这个 turn（跟 cancel_ev
+            # 的区别见 event/llm.py 的 RoundReconsider 和 mcp_client.await_pending）。
+            reconsider_ev = asyncio.Event()
+            collector.set_reconsider_event(reconsider_ev)
             collector.set_turn_priority(1 if ev.get('_urgent') else 0)
             collector.set_busy(True)
             # Publish this turn's cancel signal so tools that block for a long time
@@ -1052,7 +1083,7 @@ class Event:
             from peer.delegation import current_cancel_event as _cancel_ctx
             _cancel_token = _cancel_ctx.set(cancel_ev)
             try:
-                await self._one_turn(ev, cancel_event=cancel_ev)
+                await self._one_turn(ev, cancel_event=cancel_ev, reconsider_event=reconsider_ev)
             except TurnCancelled:
                 print(f'[decision] turn cancelled by user message')
                 self._current_turn.append({
@@ -1079,6 +1110,7 @@ class Event:
             finally:
                 _cancel_ctx.reset(_cancel_token)
                 collector.set_cancel_event(None)
+                collector.set_reconsider_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)
                 if not ev.get('_bot_channel_event'):
@@ -1177,7 +1209,8 @@ class Event:
         self._turns = recent_turns
         print(f'[decision] compressed: kept {len(recent_turns)} recent turns, summary={len(summary)} chars')
 
-    async def _one_turn(self, trigger_event: dict, cancel_event: asyncio.Event | None = None):
+    async def _one_turn(self, trigger_event: dict, cancel_event: asyncio.Event | None = None,
+                        reconsider_event: asyncio.Event | None = None):
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
@@ -1352,6 +1385,17 @@ class Event:
             # 取消检查点：在耗时的 LLM 调用前检查是否被用户消息中断
             if cancel_event and cancel_event.is_set():
                 raise TurnCancelled("Interrupted before LLM call")
+            if reconsider_event is not None and reconsider_event.is_set():
+                # 已经有高优先级 steering 在等——不用真的发一次请求再被打断，
+                # 直接原地重新构建（走下面 except RoundReconsider 同一条处理）。
+                reconsider_event.clear()
+                _steered_pre = await collector.drain_steering()
+                if _steered_pre:
+                    for sev in _steered_pre:
+                        turn_messages.append({'role': 'user', 'content':
+                            f'[system notification source={sev.get("source", "")}]\n{sev.get("text", "")}'})
+                    print(f'[decision] reconsider pending before request, steered {len(_steered_pre)} message(s)')
+                continue
 
             _round_t0 = _time.perf_counter()
             _round_start_ts = time.time()
@@ -1360,11 +1404,27 @@ class Event:
                     message_list = messages,
                     tool_list    = all_tool_list,
                     cancel_event = cancel_event,
+                    reconsider_event = reconsider_event,
                     trace_id     = _trace_id,
                     caller_info  = {'agent_type': 'main_agent'},
                 )
             except TurnCancelled:
                 raise
+            except RoundReconsider:
+                # 高优先级 steering 在这次请求还没返回时就到了：这次请求整个作废，
+                # 不记进 turn_messages（本来就还没 append），不结束 turn——把新消息
+                # drain 进去，原地重新发起请求。跟 finish 的 barge_in 是两回事：那
+                # 条会中止播放、结束整轮；这里只是换一次更知情的推理，turn 接着走。
+                reconsider_event.clear()
+                _steered_inflight = await collector.drain_steering()
+                if _steered_inflight:
+                    for sev in _steered_inflight:
+                        turn_messages.append({'role': 'user', 'content':
+                            f'[system notification source={sev.get("source", "")}]\n{sev.get("text", "")}'})
+                    print(f'[decision] llm call reconsidered, steered {len(_steered_inflight)} message(s) into retry')
+                round_idx += 1
+                total_rounds += 1
+                continue
             except Exception as e:
                 from client.llm import LLMErrorKind, _classify_error
                 kind, _ = _classify_error(e)
@@ -1433,7 +1493,11 @@ class Event:
                         config.main.get('event', {}).get('llm', {}).get('auto_notify', True)
                     if auto_notify:
                         import hooks
-                        await hooks.fire('on_notify', {'text': text})
+                        # barrier_aware: on_notify narrates, it doesn't interrupt — it must
+                        # not talk over whatever's already playing, and once it does speak,
+                        # the next LLM-issued tool call must wait for it like any other
+                        # ACP-tracked action would (see hooks.fire's docstring).
+                        await hooks.fire('on_notify', {'text': text}, barrier_aware=True)
 
             # ── 用量广播 ──────────────────────────────────────────────────
             _usage = response.get('_usage')
@@ -1450,6 +1514,11 @@ class Event:
             async def _dispatch(call: dict) -> dict:
                 name   = call['function']['name']
                 args   = json.loads(call['function']['arguments'] or '{}')
+                # Set only by the mcp__ branch below, when a barrier wait was cut short
+                # by reconsider_event rather than genuinely completing. Lets the caller
+                # tell "interrupted before it ever reached the device, still had made
+                # no progress" apart from every other outcome.
+                _reconsidered = False
 
                 # 性能追踪：记录工具时间
                 _t_before = time.time()
@@ -1496,36 +1565,50 @@ class Event:
                     # driver's schema does not know it.
                     _parallel = mcp_client.take_parallel_flag(args)
                     _bar_needed, _bar_want = _needs_barrier(name, args)
+                    _barrier_result = None
                     if _bar_needed:
-                        await _acp_barrier(name, cancel_event, want=_bar_want,
-                                           scoped=True, concurrent=_parallel)
-                    args['_trace_id'] = _trace_id
-                    args['_cancel_event'] = cancel_event
-                    # Inject instance_id from canvas binding (multiInstance tools need it)
-                    if name in self._bound_instance_ids and 'instance_id' not in args:
-                        args['instance_id'] = self._bound_instance_ids[name]
-                    result = await mcp_client.call_tool(name, args)
-                    # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
-                    if not _bar_needed and mcp_client.get_pending_actions():
-                        import hooks as _hooks
-                        parts = name.split('__')
-                        _mcp_id = parts[1] if len(parts) > 1 else ''
-                        _entry = mcp_client.registry.get(_mcp_id, {})
-                        _split = _entry.get('split_map', {}).get(name, {})
-                        _tool = _split.get('tool', parts[-1] if len(parts) > 2 else '')
-                        _act = _split.get('action', args.get('action', ''))
-                        if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
-                            for aid in list(mcp_client._pending_actions.keys()):
-                                mcp_client._pending_results[aid] = {
-                                    "status": "cancelled",
-                                    "reason": "interrupted by user instruction",
-                                }
-                                mcp_client._pending_actions[aid].set()
-                            # Fire hook to notify ALL registered parties (e.g. perception TTS)
-                            _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
-                            if _hook_id:
-                                asyncio.create_task(_hooks.fire(_hook_id, exclude_mcp_id=_mcp_id))
-                            print(f'[acp] interrupt: cancelled pending + fired {_hook_id} (source: {_tool}.{_act})')
+                        _barrier_result = await _acp_barrier(name, cancel_event, want=_bar_want,
+                                           scoped=True, concurrent=_parallel,
+                                           reconsider_event=reconsider_event)
+                    if _barrier_result is not None and _barrier_result.get('status') not in ('completed', 'no_pending'):
+                        # Barrier wait ended without ever reaching the device — do NOT
+                        # dispatch it anyway (this used to be silently ignored: a
+                        # cancelled/reconsidering wait still fell through to
+                        # call_tool below). Whatever it was waiting on is untouched,
+                        # still legitimately in flight; the caller decides whether to
+                        # void this whole round (reconsidering, nothing dispatched
+                        # yet) or just record it as not-dispatched.
+                        result = {"status": "not_dispatched",
+                                  "reason": f"barrier wait interrupted before dispatch (status={_barrier_result.get('status')})"}
+                        _reconsidered = (_barrier_result.get('status') == 'reconsidering')
+                    else:
+                        args['_trace_id'] = _trace_id
+                        args['_cancel_event'] = cancel_event
+                        # Inject instance_id from canvas binding (multiInstance tools need it)
+                        if name in self._bound_instance_ids and 'instance_id' not in args:
+                            args['instance_id'] = self._bound_instance_ids[name]
+                        result = await mcp_client.call_tool(name, args)
+                        # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
+                        if not _bar_needed and mcp_client.get_pending_actions():
+                            import hooks as _hooks
+                            parts = name.split('__')
+                            _mcp_id = parts[1] if len(parts) > 1 else ''
+                            _entry = mcp_client.registry.get(_mcp_id, {})
+                            _split = _entry.get('split_map', {}).get(name, {})
+                            _tool = _split.get('tool', parts[-1] if len(parts) > 2 else '')
+                            _act = _split.get('action', args.get('action', ''))
+                            if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
+                                for aid in list(mcp_client._pending_actions.keys()):
+                                    mcp_client._pending_results[aid] = {
+                                        "status": "cancelled",
+                                        "reason": "interrupted by user instruction",
+                                    }
+                                    mcp_client._pending_actions[aid].set()
+                                # Fire hook to notify ALL registered parties (e.g. perception TTS)
+                                _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
+                                if _hook_id:
+                                    asyncio.create_task(_hooks.fire(_hook_id, exclude_mcp_id=_mcp_id))
+                                print(f'[acp] interrupt: cancelled pending + fired {_hook_id} (source: {_tool}.{_act})')
                 else:
                     result = f'未知工具: {name}'
 
@@ -1547,7 +1630,7 @@ class Event:
                     'payload': {'tool': name, 'result': result if isinstance(result, str) else '[multimodal]'},
                 })
 
-                return {'id': call['id'], 'result': result}
+                return {'id': call['id'], 'result': result, '_reconsidered': _reconsidered}
 
             # 顺序执行工具调用（尊重 LLM 输出顺序），连续 sensor 工具批量并行
             def _is_sensor(name: str) -> bool:
@@ -1562,6 +1645,7 @@ class Event:
 
             results = []
             _batch = []
+            _round_voided = False
             for c in tool_calls:
                 if _is_sensor(c['function']['name']):
                     _batch.append(c)
@@ -1569,9 +1653,40 @@ class Event:
                     if _batch:
                         results.extend(await asyncio.gather(*[_dispatch(b) for b in _batch]))
                         _batch = []
-                    results.append(await _dispatch(c))
-            if _batch:
+                    r = await _dispatch(c)
+                    if r.get('_reconsidered') and not results:
+                        # Nothing in this round has actually reached the device yet
+                        # (this is the first non-sensor call, and it never got past
+                        # its own barrier wait) — safe to treat the whole round as
+                        # if it never happened, same as reconsider firing while the
+                        # LLM call itself was still in flight. If something earlier
+                        # in this round *had* already dispatched, voiding here would
+                        # erase the model's only memory of a real, already-running
+                        # action — so that case falls through and keeps this result
+                        # as a plain "not dispatched" entry instead (see below).
+                        _round_voided = True
+                        break
+                    results.append(r)
+            if _batch and not _round_voided:
                 results.extend(await asyncio.gather(*[_dispatch(b) for b in _batch]))
+
+            if _round_voided:
+                # Discard this round entirely: same treatment as a reconsidered
+                # in-flight LLM call (RoundReconsider below) — pop the response we
+                # appended before dispatch, don't record any tool result, drain the
+                # steering that triggered this, and retry with fresh context.
+                turn_messages.pop()
+                _steered_void = await collector.drain_steering()
+                if _steered_void:
+                    for sev in _steered_void:
+                        turn_messages.append({'role': 'user', 'content':
+                            f'[system notification source={sev.get("source", "")}]\n{sev.get("text", "")}'})
+                    print(f'[decision] round voided by reconsider, steered {len(_steered_void)} message(s) into retry')
+                if reconsider_event is not None:
+                    reconsider_event.clear()
+                round_idx += 1
+                total_rounds += 1
+                continue
 
             # ── 把工具结果加入本轮消息 ────────────────────────────────────
             if results:
