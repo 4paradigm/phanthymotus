@@ -1295,5 +1295,3 @@ function _startCoreUpdatePolling(driverId, targetImage, progressUI) {
     }
   }, 2000);
 }
-
-}
