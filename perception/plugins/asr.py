@@ -47,6 +47,26 @@ MIN_CHUNK_BYTES    = 1024  # 512 samples — one Silero VAD window
 # has returned.
 MODEL_LOAD_GRACE_S = 3.0
 
+# Longest utterance sherpa's VAD will hold open before it force-cuts, and the
+# capacity of the circular buffer it holds that utterance in.
+#
+# The buffer MUST be strictly larger than the max speech duration, and by more
+# than one window. sherpa checks the force-cut condition as
+# `buffer_.Size() > max_utterance_length_` at the top of AcceptWaveform, but
+# CircularBuffer::Push resizes (and logs `Overflow! ... Increase capacity to:`)
+# as soon as `n + size > capacity`. With both set to the same number, Size() can
+# never exceed max_utterance_length_ without Push having already overflowed —
+# the escape hatch is structurally unreachable, and every long utterance pays
+# the overflow first.
+#
+# That was the bug: both were 30. Counting out loud for 30 s produced the
+# overflow warning, a doubling of the buffer to 60 s that sherpa never gives
+# back, a 33.4 s segment instead of a 30 s one, and — because the force-cut
+# also switches the model to threshold 0.90 / min_silence 0.1 s until the
+# buffer drains — a spurious 1.1 s fragment cut immediately after it.
+VAD_MAX_SPEECH_S = 30
+VAD_BUFFER_S     = 35
+
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -362,7 +382,10 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                # The two paraformers and zipformer-en were dropped for accuracy;
+                # REMOVED_ASR_MODELS maps a card still holding one onto its
+                # replacement rather than letting it fail to resolve.
+                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -379,7 +402,7 @@ TOOLS = [
                                                  "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
                                                  "never gives back — check headroom before enabling",
                                   "default": "cpu", "scope": "shared",
-                                  "x-show-when": {"asr_model": ["parakeet-en", "paraformer-zh-en", "sensevoice-small"]}},
+                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small"]}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -415,131 +438,6 @@ def _pcm16_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
 class ASRAdapter(ABC):
     @abstractmethod
     def transcribe(self, wav_bytes: bytes, language: str) -> str: ...
-
-
-class SherpaOnnxASRAdapter(ASRAdapter):
-    """On-device streaming ASR using sherpa-onnx paraformer (no network required)."""
-
-    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
-        from utils.onnx_provider import pick_weights, provider_for_device
-
-        import sherpa_onnx
-        # Streaming paraformer uses encoder + decoder (not a single model file).
-        # Candidate order flips with the device: a gpu bundle holds fp32 weights,
-        # a cpu bundle holds int8. See utils/onnx_provider.py for why.
-        enc = ("encoder.onnx", "encoder.int8.onnx") if device == "gpu" else \
-              ("encoder.int8.onnx", "encoder.onnx")
-        dec = ("decoder.onnx", "decoder.int8.onnx") if device == "gpu" else \
-              ("decoder.int8.onnx", "decoder.onnx")
-        encoder_path = pick_weights(model_dir, *enc)
-        decoder_path = pick_weights(model_dir, *dec)
-        tokens_path = os.path.join(model_dir, "tokens.txt")
-        provider = provider_for_device(device, (encoder_path, decoder_path))
-
-        self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
-            encoder=encoder_path,
-            decoder=decoder_path,
-            tokens=tokens_path,
-            num_threads=num_threads,
-            provider=provider,
-            sample_rate=SAMPLE_RATE,
-            decoding_method="greedy_search",
-        )
-        log.info(f"[asr] sherpa-onnx paraformer adapter loaded: encoder={encoder_path}, "
-                 f"device={device}, provider={provider}")
-
-    def transcribe(self, wav_bytes: bytes, language: str) -> str:
-        import io as _io, wave as _wave
-        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
-            pcm = wf.readframes(wf.getnframes())
-        n = len(pcm) // 2
-        samples = struct.unpack(f'<{n}h', pcm)
-        float_samples = [s / 32768.0 for s in samples]
-        # Pad 500ms silence at the end to avoid last-token truncation
-        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
-
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, float_samples)
-        stream.input_finished()
-        while self._recognizer.is_ready(stream):
-            self._recognizer.decode_streams([stream])
-        result = self._recognizer.get_result(stream)
-        # result may be a string directly or an object with .text
-        text = result.text if hasattr(result, 'text') else str(result)
-        return text.strip()
-
-
-class SherpaOnnxZipformerAdapter(ASRAdapter):
-    """On-device streaming ASR using sherpa-onnx zipformer transducer (English)."""
-
-    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
-        from utils.onnx_provider import provider_for_device
-
-        import sherpa_onnx
-        import glob as _glob
-
-        # Find encoder/decoder/joiner (prefer chunk-16; dtype follows the device —
-        # int8 for cpu, non-int8 for gpu, see utils/onnx_provider.py)
-        prefer_int8 = device != "gpu"
-
-        def _find(prefix, prefer_int8=True):
-            pattern = os.path.join(model_dir, f"{prefix}-*.onnx")
-            files = _glob.glob(pattern)
-            if not files:
-                return ""
-            chunk16 = [f for f in files if "chunk-16" in f]
-            cands = chunk16 if chunk16 else files
-            if prefer_int8:
-                int8f = [f for f in cands if "int8" in f]
-                if int8f:
-                    return int8f[0]
-            else:
-                fp32f = [f for f in cands if "int8" not in f]
-                if fp32f:
-                    return fp32f[0]
-            return cands[0]
-
-        encoder_path = _find("encoder", prefer_int8=prefer_int8)
-        # The decoder is tiny, so the fp32 copy is preferred on both devices.
-        decoder_path = _find("decoder", prefer_int8=False)
-        joiner_path = _find("joiner", prefer_int8=prefer_int8)
-        tokens_path = os.path.join(model_dir, "tokens.txt")
-
-        if not all([encoder_path, decoder_path, joiner_path]):
-            raise RuntimeError(f"[asr] zipformer model files not found in {model_dir}")
-
-        provider = provider_for_device(
-            device, (encoder_path, decoder_path, joiner_path))
-        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-            encoder=encoder_path,
-            decoder=decoder_path,
-            joiner=joiner_path,
-            tokens=tokens_path,
-            num_threads=num_threads,
-            provider=provider,
-            sample_rate=SAMPLE_RATE,
-            decoding_method="greedy_search",
-        )
-        log.info(f"[asr] sherpa-onnx zipformer adapter loaded: encoder={encoder_path}, "
-                 f"device={device}, provider={provider}")
-
-    def transcribe(self, wav_bytes: bytes, language: str) -> str:
-        import io as _io, wave as _wave
-        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
-            pcm = wf.readframes(wf.getnframes())
-        n = len(pcm) // 2
-        samples = struct.unpack(f'<{n}h', pcm)
-        float_samples = [s / 32768.0 for s in samples]
-        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
-
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, float_samples)
-        stream.input_finished()
-        while self._recognizer.is_ready(stream):
-            self._recognizer.decode_streams([stream])
-        result = self._recognizer.get_result(stream)
-        text = result.text if hasattr(result, 'text') else str(result)
-        return text.strip()
 
 
 class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
@@ -592,50 +490,6 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         return text.strip()
 
 
-class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
-    """Offline non-streaming Paraformer (zh+en, small).
-
-    Better accuracy than streaming version — no tail truncation.
-    Uses sherpa_onnx.OfflineRecognizer.from_paraformer.
-    """
-
-    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
-        from utils.onnx_provider import pick_weights, provider_for_device
-
-        import sherpa_onnx
-        names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
-            if device == "gpu" else \
-            ("model.int8.onnx", "model.onnx")
-        model_path = pick_weights(model_dir, *names)
-        tokens_path = os.path.join(model_dir, "tokens.txt")
-        provider = provider_for_device(device, (model_path,))
-
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
-            paraformer=model_path,
-            tokens=tokens_path,
-            num_threads=num_threads,
-            provider=provider,
-            sample_rate=SAMPLE_RATE,
-            decoding_method="greedy_search",
-        )
-        log.info(f"[asr] sherpa-onnx offline paraformer adapter loaded: "
-                 f"model={model_path}, device={device}, provider={provider}")
-
-    def transcribe(self, wav_bytes: bytes, language: str) -> str:
-        import io as _io, wave as _wave
-        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
-            pcm = wf.readframes(wf.getnframes())
-        n = len(pcm) // 2
-        samples = struct.unpack(f'<{n}h', pcm)
-        float_samples = [s / 32768.0 for s in samples]
-
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, float_samples)
-        self._recognizer.decode_streams([stream])
-        text = stream.result.text
-        return text.strip()
-
-
 class SherpaOnnxNemoCtcAdapter(ASRAdapter):
     """Offline NeMo FastConformer CTC (English-only Parakeet).
 
@@ -643,9 +497,9 @@ class SherpaOnnxNemoCtcAdapter(ASRAdapter):
     pinned sherpa-onnx 1.13.6 all along — no new runtime is involved.
 
     The point of this adapter is noise robustness, not another language option.
-    The only other English-specific entry in the registry (zipformer-en) is
-    trained on LibriSpeech's 960 h of clean read speech, which is the wrong
-    distribution for a robot whose microphone always carries cooling-fan noise.
+    It replaces zipformer-en, which was trained on LibriSpeech's 960 h of clean
+    read speech — the wrong distribution for a robot whose microphone always
+    carries cooling-fan noise, and why that entry is gone.
     Parakeet's training set is ~1.7 M h of diverse audio with non-speech
     material deliberately mixed in, and it emits punctuation and capitalisation.
 
@@ -732,36 +586,6 @@ ASR_MODELS = {
                     "dir": "/models/sherpa-onnx/x-asr-zh-en"},
         },
     },
-    "paraformer-zh-en": {
-        "label": "Paraformer Bilingual (zh+en, streaming)",
-        "adapter": SherpaOnnxASRAdapter,
-        "devices": {
-            "cpu": {"download": "asr", "dtype": "int8",
-                    "dir": "/models/sherpa-onnx/asr"},
-            # fp32, not fp16: fp16 on CUDA emits only `</s>` for this model, and
-            # is slower than fp32 anyway (2077 ms vs 1859 ms).
-            "gpu": {"download": "asr_gpu", "dtype": "fp32",
-                    "dir": "/models/sherpa-onnx/asr-gpu"},
-        },
-    },
-    "paraformer-offline": {
-        "label": "Paraformer Offline (zh+en, small)",
-        "adapter": SherpaOnnxOfflineParaformerAdapter,
-        "devices": {
-            # No gpu entry: no non-quantised variant has been built or measured.
-            "cpu": {"download": "asr_paraformer_offline", "dtype": "int8",
-                    "dir": "/models/sherpa-onnx/asr-paraformer-offline"},
-        },
-    },
-    "zipformer-en": {
-        "label": "Zipformer English (streaming)",
-        "adapter": SherpaOnnxZipformerAdapter,
-        "devices": {
-            # No gpu entry: not measured.
-            "cpu": {"download": "asr_en", "dtype": "int8",
-                    "dir": "/models/sherpa-onnx/asr-en"},
-        },
-    },
     "parakeet-en": {
         "label": "Parakeet CTC 110M (en only, offline, noise-robust)",
         "adapter": SherpaOnnxNemoCtcAdapter,
@@ -820,6 +644,39 @@ ASR_MODELS = {
 
 DEFAULT_ASR_MODEL = "sensevoice-small"
 
+# Models that used to be in the registry, and what a card configured for one
+# now gets instead.
+#
+# paraformer-zh-en / paraformer-offline / zipformer-en were dropped for
+# accuracy, not for size or speed. The two bilingual paraformers are strictly
+# worse than sensevoice-small on the same audio, and zipformer-en is
+# LibriSpeech — 960 h of clean read speech, the wrong distribution for a
+# microphone that always carries cooling-fan noise, which is exactly what
+# parakeet-en was added for.
+#
+# This map is not optional politeness. A card's `asr_model` lives in
+# agent-core's config DB on each robot, so an upgrade cannot rewrite it; a
+# removed name that resolves to nothing makes `config` return an error and the
+# card comes up `state: error` after the next restart, on every deployment that
+# had picked one. Resolve instead, and say so in the log.
+REMOVED_ASR_MODELS = {
+    "paraformer-zh-en":   "sensevoice-small",
+    "paraformer-offline": "sensevoice-small",
+    "zipformer-en":       "parakeet-en",
+}
+
+
+def resolve_asr_model(name: str) -> str:
+    """Map a removed model name onto its replacement; pass others through."""
+    replacement = REMOVED_ASR_MODELS.get(name)
+    if replacement is None:
+        return name
+    log.warning(
+        f"[asr] '{name}' was removed from the model registry (accuracy); "
+        f"using '{replacement}' instead. Update the card to silence this."
+    )
+    return replacement
+
 
 def asr_models_supporting(device: str) -> list[str]:
     """Model names whose registry entry has weights for this device."""
@@ -866,7 +723,7 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
         except Exception as error:  # pragma: no cover - defensive
             log.debug(f"[asr] status callback failed: {error}")
 
-    model_name = cfg.get('asr_model', DEFAULT_ASR_MODEL)
+    model_name = resolve_asr_model(cfg.get('asr_model', DEFAULT_ASR_MODEL))
     model_info = ASR_MODELS.get(model_name)
     if not model_info:
         log.warning(f"[asr] unknown model '{model_name}', falling back to "
@@ -992,7 +849,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             min_silence_duration=silence_ms / 1000.0,
             min_speech_duration=0.1,
             window_size=512,
-            max_speech_duration=30,
+            max_speech_duration=VAD_MAX_SPEECH_S,
         ),
         sample_rate=SAMPLE_RATE,
         num_threads=1,
@@ -1005,10 +862,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # sherpa TTS engine follow `device`.
         provider="cpu",
     )
-    vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
+    vad = sherpa_onnx.VoiceActivityDetector(
+        vad_config, buffer_size_in_seconds=VAD_BUFFER_S)
     pre_roll_samples = max(0, int(SAMPLE_RATE * pre_roll_ms / 1000))
     silence_samples = max(0, int(SAMPLE_RATE * silence_ms / 1000))
-    pcm_history = PcmHistory(SAMPLE_RATE * 31)
+    # One second past the longest segment the VAD can hand us, so pre_roll()
+    # can still address the samples just before a maximum-length segment.
+    pcm_history = PcmHistory(SAMPLE_RATE * (VAD_BUFFER_S + 1))
     _log.info(
         f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, "
         f"silence_ms={silence_ms}, pre_roll_ms={pre_roll_ms})"
@@ -2018,7 +1878,9 @@ class ASRPlugin:
             # because a request can change both at once, and whether a device is
             # allowed depends on the model.
             from utils.onnx_provider import normalize_device
-            new_model = cfg.get('asr_model', self._asr_model)
+            # Resolve before validating, so a card still holding a removed name
+            # reconfigures onto the replacement instead of erroring out.
+            new_model = resolve_asr_model(cfg.get('asr_model', self._asr_model))
             new_device = (normalize_device(cfg['device']) if 'device' in cfg
                           else self._device)
             if new_model not in ASR_MODELS:
@@ -2190,7 +2052,7 @@ def _vad_segment_sync(audio_bytes: bytes, model: str = 'silero',
                     min_silence_duration=0.1,
                     min_speech_duration=0.1,
                     window_size=CHUNK_SAMPLES,
-                    max_speech_duration=30,
+                    max_speech_duration=VAD_MAX_SPEECH_S,
                 ),
                 sample_rate=SAMPLE_RATE,
                 num_threads=1,
@@ -2198,7 +2060,7 @@ def _vad_segment_sync(audio_bytes: bytes, model: str = 'silero',
                 # per-window inference is too small to amortise a CUDA session.
                 provider="cpu",
             ),
-            buffer_size_in_seconds=30,
+            buffer_size_in_seconds=VAD_BUFFER_S,
         )
 
         def is_speech(chunk):
