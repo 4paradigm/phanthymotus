@@ -208,3 +208,49 @@ def test_warmup_failure_does_not_propagate():
             raise RuntimeError("no session")
 
     asr._warmup_adapter(_Broken(), "sensevoice-small", "gpu")  # must not raise
+
+
+def _plugin_with(monkeypatch, model, device):
+    """An ASRPlugin whose model load is stubbed out, for dispatch-level tests."""
+    monkeypatch.setattr(asr, "_build_asr_adapter", lambda *a, **k: object())
+    plugin = asr.ASRPlugin({"asr_model": model, "device": device}, executor=None)
+    loads = []
+    monkeypatch.setattr(plugin, "_load_model_async", lambda name: loads.append(name))
+    return plugin, loads
+
+
+def test_config_degrades_a_carried_over_device_instead_of_rejecting(monkeypatch):
+    """Switching to a cpu-only model must not fail on a stale `device: gpu`.
+
+    The device field is hidden by `x-show-when` for models with no gpu weights,
+    but the form still submits the last selected value. Rejecting that left the
+    card running the previous model while the operator believed they had
+    switched — seen on Orin5, where a parakeet-en request was rejected and the
+    transcripts that followed were sensevoice-small's.
+    """
+    plugin, loads = _plugin_with(monkeypatch, "sensevoice-small", "gpu")
+
+    result = plugin.dispatch("asr", {"action": "config",
+                                     "asr_model": "parakeet-en", "device": "gpu"})
+
+    assert result["status"] != "error", result
+    assert result["device"] == "cpu"
+    assert plugin._asr_model == "parakeet-en"
+    assert loads == ["parakeet-en"]
+
+
+def test_config_still_rejects_an_explicit_unsupported_device(monkeypatch):
+    """Asking for gpu on a cpu-only model is a real error and stays one.
+
+    Degrading this one silently is how a "GPU is not faster" bug report gets
+    written against a model that never ran on the GPU at all.
+    """
+    plugin, loads = _plugin_with(monkeypatch, "parakeet-en", "cpu")
+
+    result = plugin.dispatch("asr", {"action": "config",
+                                     "asr_model": "parakeet-en", "device": "gpu"})
+
+    assert result["status"] == "error"
+    assert "gpu" in result["message"]
+    assert plugin._device == "cpu"
+    assert loads == []

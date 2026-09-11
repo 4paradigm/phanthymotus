@@ -716,3 +716,43 @@ def test_ensure_model_archive_is_published_atomically(tmp_path, monkeypatch):
     seen_midway.clear()
     model_downloader.ensure_model("asr", str(model_dir))
     assert seen_midway == []
+
+
+def test_ensure_model_handles_dot_slash_tar_layout(tmp_path, monkeypatch):
+    """`tar -c .` archives must land flat, same as `tar -c model/`.
+
+    GNU tar prefixes every member with "./" when the archive is built from the
+    current directory. That gives all members a shared "." first component, so a
+    naive common-prefix strip removes only "./" and leaves the real top-level
+    directory — check_file then sits one level too deep and the download is
+    rejected as corrupt. Real archive that does this: the sherpa-onnx NeMo
+    Parakeet asset behind MODELS["asr_parakeet_en"].
+    """
+    import tarfile
+    from utils import model_downloader
+
+    model_dir = tmp_path / "parakeet"
+    archive = tmp_path / "src.tar.bz2"
+    payload = tmp_path / "build"
+    (payload / "test_wavs").mkdir(parents=True)
+    (payload / "tokens.txt").write_text("tokens")
+    (payload / "test_wavs" / "0.wav").write_bytes(b"wav")
+    with tarfile.open(archive, "w:bz2") as handle:
+        handle.add(payload / "tokens.txt", arcname="./model/tokens.txt")
+        handle.add(payload / "test_wavs" / "0.wav", arcname="./model/test_wavs/0.wav")
+
+    def fake_urlretrieve(url, dest, reporthook=None):
+        with open(archive, "rb") as src, open(dest, "wb") as out:
+            out.write(src.read())
+
+    monkeypatch.setattr(model_downloader, "urlretrieve", fake_urlretrieve)
+    monkeypatch.setitem(
+        model_downloader.MODELS, "asr_parakeet_en",
+        {"url": "https://example.invalid/p.tar.bz2", "check_file": "tokens.txt"},
+    )
+
+    model_downloader.ensure_model("asr_parakeet_en", str(model_dir))
+
+    assert (model_dir / "tokens.txt").read_text() == "tokens"
+    assert (model_dir / "test_wavs" / "0.wav").read_bytes() == b"wav"
+    assert not (model_dir / "model").exists()

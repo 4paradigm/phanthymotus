@@ -365,6 +365,11 @@ TOOLS = [
                 # field for the rest rather than offering a choice that would be
                 # rejected. Keep the list in sync with ASR_MODELS — the unit test
                 # test_asr_device_registry.py asserts they match.
+                #
+                # Hiding the field does not clear it: the form still submits the
+                # value selected for the previous model. `config` therefore
+                # degrades a carried-over device to cpu instead of rejecting it,
+                # and only rejects a device the request actually changed.
                 "device":        {"type": "string", "enum": ["cpu", "gpu"],
                                   "description": "Inference device. gpu loads non-quantised weights "
                                                  "(~2.5x faster per utterance) but costs ~2 GB RAM "
@@ -823,8 +828,25 @@ def _model_dir_for(cfg: dict, spec: dict) -> str:
     return requested
 
 
-def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
+def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
+    """Build the configured adapter, optionally reporting progress.
+
+    `on_status(text)` is called as the build moves between its two genuinely
+    different waits — fetching ~100-800 MB of weights over the network, and
+    loading them into memory (plus a warmup inference). Collapsing both into one
+    "loading" made the dashboard say "Downloading model..." for the whole build,
+    including the part where nothing was downloading, and it never said how far
+    along the download was. Callers that don't care pass nothing.
+    """
     from utils.onnx_provider import normalize_device
+
+    def _status(text: str) -> None:
+        if on_status is None:
+            return
+        try:
+            on_status(text)
+        except Exception as error:  # pragma: no cover - defensive
+            log.debug(f"[asr] status callback failed: {error}")
 
     model_name = cfg.get('asr_model', DEFAULT_ASR_MODEL)
     model_info = ASR_MODELS.get(model_name)
@@ -848,17 +870,25 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
     spec = model_info["devices"][device]
 
     model_dir = _model_dir_for(cfg, spec)
+    _status(f"正在获取模型 '{model_name}' ({device}) …")
     if device == "gpu":
         # Size/SHA256-pinned: these are the largest downloads in the stack.
         from utils.model_downloader import ensure_gpu_model
         ensure_gpu_model(spec["download"], model_dir)
     else:
         from utils.model_downloader import ensure_model
-        ensure_model(spec["download"], model_dir)
+        ensure_model(
+            spec["download"], model_dir,
+            progress_cb=lambda pct, mb_done, mb_total: _status(
+                f"正在下载模型 '{model_name}' … {pct}% "
+                f"({mb_done:.0f}/{mb_total:.0f} MB)"),
+        )
 
     num_threads = int(cfg.get('num_threads', 2))
+    _status(f"正在加载模型 '{model_name}' 到内存 …")
     adapter = model_info["adapter"](model_dir, device, num_threads)
     if cfg.get('warmup', True):
+        _status(f"正在预热模型 '{model_name}' …")
         _warmup_adapter(adapter, model_name, device)
     return adapter
 
@@ -1629,6 +1659,11 @@ class ASRPlugin:
         self._plugin_cfg   = plugin_cfg
         self._loading      = False
         self._load_error   = None
+        # What the current load is actually doing, for `info`/`start`/`config` to
+        # report. One string, set from the loader thread and read from MCP worker
+        # threads — a plain attribute assignment is atomic enough for that and
+        # needs no lock.
+        self._load_status  = ""
         self._adapter      = _build_asr_adapter(plugin_cfg)
         vad_cfg            = plugin_cfg.get('vad', {})
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
@@ -1701,15 +1736,19 @@ class ASRPlugin:
             try:
                 log.info(f"[asr] downloading/loading model '{model_name}'...")
                 self._plugin_cfg['asr_model'] = model_name
-                adapter = _build_asr_adapter(self._plugin_cfg)
+                adapter = _build_asr_adapter(
+                    self._plugin_cfg,
+                    on_status=lambda text: setattr(self, "_load_status", text))
                 self._adapter = adapter
                 self._loading = False
                 self._load_error = None
+                self._load_status = ""
                 log.info(f"[asr] model '{model_name}' ready")
             except Exception as e:
                 log.error(f"[asr] failed to load model '{model_name}': {e}", exc_info=True)
                 self._loading = False
                 self._load_error = str(e)
+                self._load_status = ""
 
         with self._nodes_lock:
             if self._loading:
@@ -1717,6 +1756,7 @@ class ASRPlugin:
                 return
             self._loading = True
             self._load_error = None
+            self._load_status = f"正在准备模型 '{model_name}' …"
         threading.Thread(target=_do_load, daemon=True, name="asr_model_loader").start()
 
     def dispatch(self, name: str, args: dict) -> dict | None:
@@ -1729,7 +1769,7 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "loading",
-                    "desc": f"Downloading model '{self._asr_model}'...",
+                    "desc": self._load_status or f"正在加载模型 '{self._asr_model}' …",
                 }
             if self._load_error:
                 return {
@@ -1791,8 +1831,9 @@ class ASRPlugin:
                 while self._loading:
                     if time.monotonic() > deadline:
                         return {"state": "loading", "asr_model": self._asr_model,
-                                "message": f"model '{self._asr_model}' still loading after "
-                                           f"{MODEL_LOAD_TIMEOUT_S}s, retry later"}
+                                "message": (self._load_status or
+                                            f"模型 '{self._asr_model}' 仍在加载") +
+                                           f"（已等待 {MODEL_LOAD_TIMEOUT_S}s，稍后重试）"}
                     time.sleep(0.5)
             if self._load_error:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
@@ -1899,17 +1940,39 @@ class ASRPlugin:
                         "message": f"Unknown asr_model '{new_model}'; "
                                    f"available: {', '.join(sorted(ASR_MODELS))}"}
             if new_device not in ASR_MODELS[new_model]["devices"]:
-                # Reject rather than silently degrade: someone is looking at the
-                # result of this call, and a request for gpu that quietly runs on
-                # cpu is how a "GPU is not faster" bug report gets written.
-                supported = asr_models_supporting(new_device)
-                return {"status": "error",
-                        "asr_model": self._asr_model, "device": self._device,
-                        "message": (
-                            f"Model '{new_model}' has no '{new_device}' weights — it "
-                            f"was either measured slower there or never verified. "
-                            f"Models with {new_device} support: "
-                            f"{', '.join(supported) or '(none)'}")}
+                # Two different situations reach here, and only one of them is a
+                # user error.
+                #
+                # The device field is hidden by `x-show-when` for models with no
+                # gpu weights, but the form still submits whatever was selected
+                # last — so switching from a gpu-capable model to a cpu-only one
+                # carries a stale `device: gpu` that nobody asked for. Rejecting
+                # that is worse than useless: the dashboard issues `start`
+                # regardless of the config result, so the card came up on the
+                # OLD model while the operator believed they had switched.
+                # Observed on Orin5: a parakeet-en request was rejected for
+                # `device: gpu`, and the transcripts that followed were
+                # sensevoice-small's.
+                #
+                # So: a device the caller did not touch degrades to cpu, loudly.
+                # A device the caller explicitly asked for is still rejected —
+                # a request for gpu that quietly runs on cpu is how a "GPU is not
+                # faster" bug report gets written.
+                device_requested = ('device' in cfg
+                                    and normalize_device(cfg['device']) != self._device)
+                if device_requested:
+                    supported = asr_models_supporting(new_device)
+                    return {"status": "error",
+                            "asr_model": self._asr_model, "device": self._device,
+                            "message": (
+                                f"Model '{new_model}' has no '{new_device}' weights — it "
+                                f"was either measured slower there or never verified. "
+                                f"Models with {new_device} support: "
+                                f"{', '.join(supported) or '(none)'}")}
+                log.warning("[asr] model '%s' has no '%s' weights and the request did "
+                            "not ask to change device — carrying over the previous "
+                            "value would fail, so using cpu.", new_model, new_device)
+                new_device = "cpu"
 
             if (new_model, new_device) != (self._asr_model, self._device):
                 # Stop all running nodes first
@@ -1925,8 +1988,8 @@ class ASRPlugin:
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "device": self._device,
-                        "message": f"Switching to model '{self._asr_model}' on "
-                                   f"{self._device}, downloading..."}
+                        "message": self._load_status or
+                                   f"正在切换到模型 '{self._asr_model}' ({self._device})"}
             # Hot-reload: stop running nodes, apply new config, restart automatically
             with self._nodes_lock:
                 was_running = [(key, node) for key, node in self._nodes.items()

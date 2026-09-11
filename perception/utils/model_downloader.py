@@ -25,8 +25,16 @@ log = logging.getLogger(__name__)
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
 
 
-def _progress_hook(name: str):
-    """Create a reporthook for urlretrieve that logs download progress."""
+def _progress_hook(name: str, progress_cb=None):
+    """Create a reporthook for urlretrieve that logs download progress.
+
+    `progress_cb(pct, mb_done, mb_total)` is for callers that surface progress in
+    a UI rather than only in the log — the dashboard shows one status string per
+    plugin, and "downloading 60%" is a very different thing to wait for than
+    "loading". Called on the same 10%-step schedule as the log line, so it costs
+    nothing extra; exceptions from it are swallowed because a status update
+    failing must never abort a download that is otherwise fine.
+    """
     last_pct = [0]
     def hook(block_num, block_size, total_size):
         if total_size > 0:
@@ -36,6 +44,11 @@ def _progress_hook(name: str):
                 mb_done = block_num * block_size / (1024 * 1024)
                 mb_total = total_size / (1024 * 1024)
                 log.info(f"[model_downloader] {name}: {pct}% ({mb_done:.1f}/{mb_total:.1f} MB)")
+                if progress_cb is not None:
+                    try:
+                        progress_cb(pct, mb_done, mb_total)
+                    except Exception as error:  # pragma: no cover - defensive
+                        log.debug(f"[model_downloader] {name}: progress_cb failed: {error}")
     return hook
 
 MODELS = {
@@ -97,7 +110,7 @@ MODELS = {
 }
 
 
-def ensure_model(name: str, model_dir: str) -> None:
+def ensure_model(name: str, model_dir: str, progress_cb=None) -> None:
     """Ensure model files exist in model_dir. Download from COS if missing.
 
     Serialized per (model_dir, name) with a file lock, and every download lands
@@ -126,13 +139,14 @@ def ensure_model(name: str, model_dir: str) -> None:
             if os.path.exists(check_path):
                 log.info(f"[model_downloader] {name}: fetched by another instance")
                 return
-            _download_model(name, info, model_dir, check_path)
+            _download_model(name, info, model_dir, check_path, progress_cb)
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _download_model(name: str, info: dict, model_dir: str, check_path: str) -> None:
+def _download_model(name: str, info: dict, model_dir: str, check_path: str,
+                    progress_cb=None) -> None:
     """Fetch one legacy model into model_dir. Caller holds the per-model lock."""
     url = info["url"]
     log.info(f"[model_downloader] {name}: downloading from {url} ...")
@@ -144,7 +158,7 @@ def _download_model(name: str, info: dict, model_dir: str, check_path: str) -> N
                                          delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+            urlretrieve(url, tmp_path, reporthook=_progress_hook(name, progress_cb))
             os.chmod(tmp_path, 0o644)
             os.replace(tmp_path, check_path)
             log.info(f"[model_downloader] {name}: done.")
@@ -163,7 +177,7 @@ def _download_model(name: str, info: dict, model_dir: str, check_path: str) -> N
         tmp_path = tmp.name
 
     try:
-        urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+        urlretrieve(url, tmp_path, reporthook=_progress_hook(name, progress_cb))
         log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
 
         # Extract beside the destination, then move the files in, so a partly
@@ -220,6 +234,15 @@ def _extract_tar(tar_path: str, model_dir: str) -> None:
         if not members:
             raise RuntimeError(f"Empty archive: {tar_path}")
 
+        # Drop the leading "./" GNU tar writes for archives built with `tar -c .`
+        # BEFORE computing the prefix. Otherwise every member shares a "." first
+        # component, _common_prefix_from_names strips just "./", and the archive's
+        # real top-level directory survives — so check_file ends up one level
+        # below where the caller looks and the download is reported as corrupt.
+        # (sherpa-onnx publishes both layouts; the NeMo Parakeet asset is "./".)
+        for m in members:
+            m.name = _strip_dot_slash(m.name)
+
         names = [m.name for m in members if not m.isdir()]
         prefix = _common_prefix_from_names(names)
         for m in members:
@@ -231,6 +254,13 @@ def _extract_tar(tar_path: str, model_dir: str) -> None:
                 continue
             m.name = m.name.lstrip("/")
             tf.extract(m, model_dir)
+
+
+def _strip_dot_slash(name: str) -> str:
+    """Remove leading "./" components from an archive member name."""
+    while name.startswith("./"):
+        name = name[2:]
+    return name
 
 
 def _common_prefix_from_names(names: list[str]) -> str:

@@ -278,6 +278,7 @@ async def _do_start_project_impl():
         node existed, so only now can the card report the real ones.
         """
         deadline = time.time() + LOADING_TIMEOUT_S
+        last_message = ''
         while time.time() < deadline:
             await _asyncio.sleep(LOADING_POLL_S)
             try:
@@ -290,6 +291,18 @@ async def _do_start_project_impl():
                 continue
             state, message = _tool_state(info)
             if state == 'loading' or state is None:
+                # Relay the tool's own phase text as it changes. The card sits
+                # here for minutes on a cold model, and "模型加载中" for the whole
+                # of it tells the operator nothing about whether it is pulling
+                # 100 MB over the network or warming up — which are very
+                # different things to wait for. Only on change: the poll is
+                # every LOADING_POLL_S and identical events would just churn.
+                if message and message != last_message:
+                    last_message = message
+                    await push_event({'type': 'project_start_item', 'payload': {
+                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'loading',
+                        'message': message,
+                    }})
                 continue
             if state == 'idle':
                 # The start was cancelled or the project stopped while the model
