@@ -177,6 +177,50 @@ class TestAcpBarrierReconsider:
         assert ACTION_ID in mcp_client._pending_actions, \
             'the action being waited on is still running — must not be forgotten'
 
+    def test_finish_barrier_honours_reconsider_without_cutting_audio(self):
+        """The system-tool barrier takes reconsider_event too, and the audio survives.
+
+        Orin5, 17:32: the finish barrier took neither reconsider_event nor a look at
+        its own return value, so a message sent early in a 48s briefing sat in the
+        queue for 33.6s (event ts=17:32:19, received 17:32:52.597) — finish's break
+        is ahead of the steering drain, so nothing in the turn could consume it.
+
+        The two assertions below are the whole point of "播边想": the wait ends
+        (so the loop can think) *and* the speak is still pending (so it keeps playing).
+        """
+        async def scenario():
+            _arm('speak-67462a1e', tool='tts', resource=frozenset({'mouth'}))
+            reconsider = asyncio.Event()
+            barrier = asyncio.create_task(
+                _acp_barrier('finish', cancel_event=None, reconsider_event=reconsider))
+            await asyncio.sleep(0.05)
+            assert not barrier.done(), 'finish barrier must actually be waiting here'
+            reconsider.set()
+            return await asyncio.wait_for(barrier, timeout=1)
+
+        result = asyncio.run(scenario())
+        assert result['status'] == 'reconsidering'
+        assert 'speak-67462a1e' in mcp_client._pending_actions, \
+            'the briefing is still playing — reconsider must not forget it'
+
+    def test_interrupt_still_beats_a_new_message_on_the_finish_barrier(self):
+        """cancel_event and reconsider_event armed together: interrupt wins.
+
+        "有 interrupt 就无视 barrier 直接执行" — and unlike reconsider, it *does*
+        forget the pending, because the whole turn is being thrown away.
+        """
+        async def scenario():
+            _arm('speak-67462a1e', tool='tts')
+            cancel, reconsider = asyncio.Event(), asyncio.Event()
+            barrier = asyncio.create_task(
+                _acp_barrier('finish', cancel_event=cancel, reconsider_event=reconsider))
+            await asyncio.sleep(0.05)
+            cancel.set()
+            return await asyncio.wait_for(barrier, timeout=1)
+
+        assert asyncio.run(scenario())['status'] == 'cancelled'
+        assert 'speak-67462a1e' not in mcp_client._pending_actions
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

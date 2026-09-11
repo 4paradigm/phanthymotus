@@ -263,6 +263,22 @@ def _sys_tool_needs_barrier(name: str) -> bool:
     return name in _ACP_BARRIER_SYSTEM_TOOLS
 
 
+def _turn_ends_on_finish(tool_calls: list, finish_tool: str, finish_deferred: bool) -> bool:
+    """`finish` 出现在 tool_calls 里，是否意味着本轮 turn 该结束。
+
+    不等价 —— 出现不代表执行了。新消息在 finish 的 ACP barrier 期间到达时这次 finish
+    被作废（`_dispatch` 的 sys-tool 分支），turn 必须接着走，否则就退回"播报多长、延迟
+    多长"：Orin5 实测一条消息在队列里躺了 33.6 秒，正好是播报的剩余时长。
+
+    做成模块级谓词而不是内联条件，是为了能在不搭起整个 `_one_turn`（prompt 构建、
+    client、mcp registry、DB）的情况下测到它 —— 与 `subagent/manager.py` 的
+    `notify_suppression_reason` 同样的理由。
+    """
+    if finish_deferred:
+        return False
+    return finish_tool in [c['function']['name'] for c in tool_calls]
+
+
 async def _acp_barrier(name: str, cancel_event, *,
                        want: frozenset | None = None,
                        scoped: bool = False,
@@ -276,19 +292,19 @@ async def _acp_barrier(name: str, cancel_event, *,
 
     **只有显式 interrupt 能中止播放。** 这个 barrier 不会因为"来了新消息"就掐掉正在
     播的音频：打断走 `cancel_event`（collector 的 interrupt / followup 模式置位，或
-    interrupt 工具），其余一律排队。steer 模式（默认）下 busy 期间的消息进 steering
-    队列，turn 播完正常结束时 `set_busy(False)` → `_flush_all_pending()` 把它转成下一
-    轮的触发事件 —— 用户多等一段播放，但不会丢。
+    interrupt 工具）。
 
     finish 的 barrier 以前额外被 steering 队列唤醒（barge_in），本意是"用户开口就停"。
     实际上队列里什么都算数：Orin5 上一个后台 subagent 跑完的完成通知掐掉了主 agent
     正在播的上一份汇报；改成只认人发的消息之后，用户在网页里打下一个问题同样会把上
     一份汇报冲掉 —— 因为在这条路上"发消息"和"要求停止"根本无法区分。既然架构里已经
-    有 interrupt 这个显式入口，隐式打断整条去掉。
+    有 interrupt 这个显式入口，隐式打断整条去掉了。
 
-    `reconsider_event` 不受影响：它比 `cancel_event` 窄得多，只放弃"这次调用还没发出
-    去、还在排队"的这一次等待，不动正在排的东西，也不结束 turn、不掐音频
-    （见 `mcp_client.await_pending` 的 docstring）。
+    新消息走的是 `reconsider_event`，语义完全不同、**不掐音频**：它只放弃"这次调用还
+    没发出去、还在排队"的这一次等待，返回 `{"status": "reconsidering"}` 而**不**
+    `_forget_pending`（见 `mcp_client.await_pending`），正在播的东西原样继续。调用方
+    据此作废这次调用、把新消息 drain 进当前 turn 重新推理 —— 即"播边想"。finish 走这条
+    时还要额外阻止 turn 结束，见 `_dispatch` 的 sys-tool 分支与 finish 检测处。
     """
     if not mcp_client.get_pending_actions():
         return None
@@ -1471,9 +1487,10 @@ class Event:
             tool_calls = response.get('tool_calls') or []
 
             async def _dispatch(call: dict) -> dict:
+                nonlocal _finish_deferred
                 name   = call['function']['name']
                 args   = json.loads(call['function']['arguments'] or '{}')
-                # Set only by the mcp__ branch below, when a barrier wait was cut short
+                # Set by either barrier branch below, when a barrier wait was cut short
                 # by reconsider_event rather than genuinely completing. Lets the caller
                 # tell "interrupted before it ever reached the device, still had made
                 # no progress" apart from every other outcome.
@@ -1503,11 +1520,39 @@ class Event:
                     )
                 elif name in self._sys_tools:
                     # ACP barrier: finish 之前等音频播完（见 _ACP_BARRIER_SYSTEM_TOOLS）。
-                    # 只有显式 interrupt（cancel_event）能中止这段等待，新消息一律排队
-                    # 到下一轮 —— 详见 _acp_barrier 的 docstring。
+                    # 和下面的 mcp__ 分支同形：等待被 reconsider_event 截断时**不派发**
+                    # 这次调用，由调用方决定作废整轮还是记成"没派出去"。
+                    #
+                    # 这条以前不传 reconsider_event 也不看返回值，于是播报期间的新消息
+                    # 谁都看不到：finish 的 break 在 steering drain 前面，turn 里没有任何
+                    # 东西会消费队列。Orin5 实测，一条消息在队列里躺了 33.6 秒 —— 正好是
+                    # 播报的剩余时长（事件自带 ts=17:32:19，received 在 17:32:52.597）。
+                    _barrier_result = None
                     if _sys_tool_needs_barrier(name):
-                        await _acp_barrier(name, cancel_event)
-                    result = await self._sys_tools[name]['object'](**args)
+                        _barrier_result = await _acp_barrier(
+                            name, cancel_event, reconsider_event=reconsider_event)
+                    if (_barrier_result is not None
+                            and _barrier_result.get('status') not in ('completed', 'no_pending')):
+                        _reconsidered = (_barrier_result.get('status') == 'reconsidering')
+                        if name == finish_tool and _reconsidered:
+                            # 关键：barrier 没放行不代表 turn 该结束。把这次 finish 作废，
+                            # 音频继续播（reconsidering 刻意不 _forget_pending），循环回到
+                            # steering drain 带着新消息再想一遍 —— 也就是"播边想"。
+                            _finish_deferred = True
+                            result = {
+                                "status": "not_dispatched",
+                                "reason": "新消息到达，本次 finish 已取消，turn 继续。"
+                                          "当前语音仍在正常播放、不会被打断，你新说的话会排在它后面。"
+                                          "请结合新消息继续处理，不要重复已经说过的内容。",
+                            }
+                        else:
+                            result = {
+                                "status": "not_dispatched",
+                                "reason": f"barrier wait interrupted before dispatch "
+                                          f"(status={_barrier_result.get('status')})",
+                            }
+                    else:
+                        result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 只等与本次调用资源冲突的 pending（见 _needs_barrier）
                     # Pop `concurrent` before _needs_barrier looks at args and before
@@ -1596,6 +1641,10 @@ class Event:
             results = []
             _batch = []
             _round_voided = False
+            # Reset per round, before any _dispatch runs. Set by the sys-tool branch
+            # when finish's barrier was cut short by a new message: the finish never
+            # executed, so the finish detection below must not end the turn.
+            _finish_deferred = False
             for c in tool_calls:
                 if _is_sensor(c['function']['name']):
                     _batch.append(c)
@@ -1684,8 +1733,19 @@ class Event:
                     break
 
             # ── finish 检测 ───────────────────────────────────────────────
-            if finish_tool in [c['function']['name'] for c in tool_calls]:
+            #
+            # 出现在 tool_calls 里不等于执行了。新消息在 finish 的 ACP barrier 期间到达时
+            # 这次 finish 被作废（见 _dispatch 的 sys-tool 分支），turn 必须接着走 —— 否则
+            # 就退回"播报多长、延迟多长"。
+            #
+            # 这里单独判而不是靠 _round_voided：后者只在本轮还没有任何工具派出去时才成立，
+            # 而 `tts(...) + finish()` 同轮是常见形状（Orin5 日志里就有），那时 results 非空、
+            # 不 void，会一路落到这个 break 上。
+            if _turn_ends_on_finish(tool_calls, finish_tool, _finish_deferred):
                 break
+            if _finish_deferred:
+                print('[decision] finish deferred: new message arrived during playback, '
+                      'turn continues (audio keeps playing)')
 
             # ── Rebuild frozen_system if skill state changed (activate/deactivate) ─
             skill_tools = {'activate_skill', 'deactivate_skill'}
@@ -1715,6 +1775,14 @@ class Event:
                         'sources': [s.get('source', '') for s in steered],
                     }})
                     print(f'[decision] steered {len(steered)} user message(s) into current turn')
+
+            # 消息已经进 turn_messages 了，这次 reconsider 的目的达成 —— 不清的话下一次
+            # client.call 会立刻抛 RoundReconsider 再 drain 一次空队列，白烧一次请求。
+            # 放在 drain 之后而不是作废 finish 的当场，是为了尽量少丢"clear 与 drain 之间
+            # 新到的消息"；真撞上也只是多一次 reconsider 重试，那条路本来就能吃下。
+            # （_round_voided 那条路有自己的 clear，见上面。）
+            if _finish_deferred and reconsider_event is not None:
+                reconsider_event.clear()
 
             # ── 取消检查点：工具执行完毕后，下一轮 LLM 调用前 ────────────────
             if cancel_event and cancel_event.is_set():
