@@ -1149,6 +1149,87 @@ async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
         return {"error": f"call_tool_direct failed: {e}"}
 
 
+def resolve_tool_binding(name: str, args: dict) -> tuple[str, str, str | None] | None:
+    """Resolve an LLM-facing tool_call name back to (mcp_id, tool_name, action).
+
+    A device's real action can reach the LLM two ways: unsplit (tool name is
+    `mcp__{id}__{tool}`, action is an `args["action"]` value) or split via
+    x-action-params (tool name is `mcp__{id}__{tool}__{action}`, no `action`
+    arg). Callers that need to compare an LLM tool_call against an x-hooks
+    binding — which is always declared against the raw device tool+action —
+    must go through this instead of guessing from the name string, or they
+    silently stop matching for whichever convention they didn't hardcode.
+    Returns None if `name` isn't a currently-registered tool of any device.
+    """
+    for mcp_id, info in registry.items():
+        split = info.get('split_map', {}).get(name)
+        if split:
+            return mcp_id, split['tool'], split['action']
+        prefix = f'mcp__{mcp_id}__'
+        if name in info.get('schemas', {}) and name.startswith(prefix):
+            return mcp_id, name[len(prefix):], args.get('action')
+    return None
+
+
+async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
+                          barrier_aware: bool = False) -> dict:
+    """Like `call_tool_direct`, with an opt-in barrier-aware mode for hooks that
+    must not behave like an interrupt.
+
+    True interrupt hooks (on_interrupt_*, e-stop) are supposed to bypass
+    everything immediately — that's the correct semantics for "stop now no
+    matter what". `on_notify` (narrate LLM content so the user isn't left in
+    silence during a long tool-calling turn) is not that: firing it should not
+    cut off whatever the robot is already saying or doing, and once it does
+    speak, the next barrier-respecting tool call shouldn't cut *it* off either.
+    `barrier_aware=True` gets both: skip the call if the tool's declared
+    x-resource is already held by a pending ACP action, and — if the call
+    returns an action_id under a completion spec — register it as pending the
+    same way `call_tool`'s normal ACP dispatch does, so it participates in the
+    barrier like any LLM-issued call would.
+    """
+    entry = registry.get(mcp_id)
+    if not entry:
+        return {"error": f"device {mcp_id} not registered"}
+
+    meta = {}
+    if barrier_aware:
+        action = args.get('action')
+        candidates = [f'mcp__{mcp_id}__{tool_name}__{action}'] if action else []
+        candidates.append(f'mcp__{mcp_id}__{tool_name}')
+        tool_meta = entry.get('tool_meta', {})
+        for candidate in candidates:
+            if candidate in tool_meta:
+                meta = tool_meta[candidate]
+                break
+        resource = meta.get('resource')
+        if resource and conflicting_pending(resource):
+            return {"skipped": "resource busy"}
+
+    result = await call_tool_direct(mcp_id, tool_name, args)
+
+    if barrier_aware and isinstance(result, dict):
+        completion_spec = meta.get('completion')
+        action = args.get('action')
+        if completion_spec and _should_await_completion(completion_spec, action):
+            action_id = result.get('action_id')
+            if action_id:
+                resource = meta.get('resource')
+                _pending_actions[action_id] = asyncio.Event()
+                _pending_tools[action_id] = tool_name
+                _pending_resources[action_id] = resource
+                _pending_owner[action_id] = current_agent_context.get()
+                text_arg = args.get('text', '')
+                default_timeout = completion_spec.get('timeout', 120)
+                dynamic_timeout = len(text_arg) / 3 + 10 if text_arg else default_timeout
+                _pending_timeouts[action_id] = dynamic_timeout
+                _res_txt = ','.join(sorted(resource)) if resource else 'undeclared/exclusive'
+                print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
+                      f'timeout={dynamic_timeout:.0f}s, resource={_res_txt}) [via hook]')
+
+    return result
+
+
 def cleanup_stale_actions(max_age_s: float = 300):
     """清理超时的 pending actions（防泄漏，由定时器调用）。"""
     # 简单实现：如果 action 超过 max_age 仍未完成，移除

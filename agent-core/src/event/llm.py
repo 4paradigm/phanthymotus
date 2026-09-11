@@ -380,17 +380,30 @@ def _channel_tool_restricted(trigger_event: dict) -> bool:
 
 
 def _round_already_notified(tool_calls: list) -> bool:
-    """True if this round's tool_calls already include a bare-tts speak call —
-    the LLM remembered to reply itself, so auto-notify should not double-say it."""
+    """True if this round's tool_calls already exercised whatever action
+    on_notify would also fire — the LLM replied itself, so auto-notify should
+    not double-say it.
+
+    Must resolve through `mcp_client.resolve_tool_binding` rather than parsing
+    the tool_call name directly: a device using x-action-params (e.g. a `tts`
+    tool split into `tts__speak`/`tts__interrupt`/...) never has a literal
+    `action` argument or a name ending in the base tool name, so a name-suffix
+    or args["action"] check silently never matches for it — every round then
+    looks "not yet notified" even when the LLM just spoke, and on_notify fires
+    a second, redundant call on top of the LLM's own.
+    """
     for call in tool_calls:
         name = call.get('function', {}).get('name', '')
-        if name.split('__')[-1] != 'tts':
-            continue
         try:
             args = json.loads(call['function'].get('arguments') or '{}')
         except (json.JSONDecodeError, TypeError):
             args = {}
-        if args.get('action') == 'speak':
+        resolved = mcp_client.resolve_tool_binding(name, args)
+        if not resolved:
+            continue
+        mcp_id, tool_name, action = resolved
+        import hooks
+        if hooks.get_hook_for_binding(mcp_id, tool_name, action) == 'on_notify':
             return True
     return False
 
@@ -1433,7 +1446,11 @@ class Event:
                         config.main.get('event', {}).get('llm', {}).get('auto_notify', True)
                     if auto_notify:
                         import hooks
-                        await hooks.fire('on_notify', {'text': text})
+                        # barrier_aware: on_notify narrates, it doesn't interrupt — it must
+                        # not talk over whatever's already playing, and once it does speak,
+                        # the next LLM-issued tool call must wait for it like any other
+                        # ACP-tracked action would (see hooks.fire's docstring).
+                        await hooks.fire('on_notify', {'text': text}, barrier_aware=True)
 
             # ── 用量广播 ──────────────────────────────────────────────────
             _usage = response.get('_usage')
