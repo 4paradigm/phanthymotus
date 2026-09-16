@@ -69,12 +69,48 @@ test("an empty persisted fromTopic does not stop the downstream card", async () 
   assert.equal(cards[2].topicOut[0].topic, '/remote_control/mic/asr/tts');
 });
 
-test('a card already carrying a topic is not re-asked', async () => {
+test('a static card already carrying a topic is not re-asked', async () => {
+  // Default isDerived is "nothing is derived", so this pins the static case:
+  // a topic that came from the MCP schema must not be second-guessed.
   const log = [];
   const cards = clone([MIC, ASR, TTS]);
   cards[1].topicOut = [{ topic: '/remote_control/mic/asr', format: 'data/json' }];
   await resolveDerivedTopics(cards, clone(CONNS), { fetchImpl: driver(log) });
   assert.deepEqual(log.map(c => c.tool), ['tts']);
+});
+
+test('a connected derived card is re-asked even when it has a topic', async () => {
+  // The saved layout is a snapshot, not evidence. Before this, a derived card
+  // that had both a topic and an inbound connection was skipped, so a driver
+  // renaming its output never reached the dashboard: visual_depth moved from
+  // `{input}/depth` to `{input}/visual_depth` and the panels kept subscribing
+  // to a topic nothing published on, showing nothing and explaining nothing.
+  const log = [];
+  const cards = clone([MIC, ASR]);
+  cards[1].topicOut = [{ topic: '/remote_control/mic/old_name', format: 'data/json' }];
+  await resolveDerivedTopics(cards, [clone(CONNS[0])], {
+    fetchImpl: driver(log), isDerived: (c) => c.toolName === 'asr',
+  });
+  assert.deepEqual(log.map(c => c.tool), ['asr'], 'the renamed card must be re-asked');
+  assert.equal(cards[1].topicOut[0].topic, '/remote_control/mic/asr',
+               'and the driver answer must replace the stale name');
+});
+
+test('a derived card waits for an unresolved input before being asked', async () => {
+  // Re-asking must not mean asking too early: a card whose source has no topic
+  // yet would otherwise be asked with an empty input and adopt the driver's
+  // default over the name it is about to derive.
+  const log = [];
+  const src = { id: 'card-src', mcpId: 'mcp-1', toolName: 'mic', topicOut: [] };
+  const asr = { id: 'card-asr', mcpId: 'mcp-2', toolName: 'asr',
+                topicOut: [{ topic: '/stale/asr', format: 'data/json' }] };
+  const conns = [{ fromCardId: 'card-src', fromPortIdx: '0',
+                   toCardId: 'card-asr', toPortIdx: '0', fromTopic: '' }];
+  await resolveDerivedTopics([src, asr], conns, {
+    fetchImpl: driver(log), isDerived: () => true, maxRounds: 0,
+  });
+  assert.ok(!log.some(c => c.tool === 'asr' && !c.input),
+            'must not be asked with an empty input while its source is unresolved');
 });
 
 test('a disconnected card is not asked — there is nothing to derive from', async () => {

@@ -5,8 +5,11 @@ plugins/visual_depth.py — VideoDepthPerceptionPlugin: monocular depth from a p
 Subscribes to image/jpeg topics, runs a prebuilt YOLO26-depth TensorRT engine,
 and publishes two things per frame:
 
-    {input}/depth          image/depth-zlib   for the dashboard's depth renderer
-    {input}/depth_summary  data/json          for the agent
+    {input}/visual_depth          image/depth-zlib   for the dashboard's renderer
+    {input}/visual_depth_summary  data/json          for the agent
+
+Named after the tool, not after what they carry — see output_topics_for for why
+`{input}/depth` could not stay.
 
 Most robots in this fleet carry only an RGB camera — the RealSense on the
 Realman RM75 is the exception — so this gives the rest a depth map without new
@@ -71,15 +74,35 @@ DEPTH_HEIGHT = 480
 
 # Where a topic-less instance publishes. There is no input topic to derive an
 # output from, so it is fixed — same idea as vop's DEFAULT_OUTPUT_TOPIC.
-DEFAULT_DEPTH_TOPIC = "/perception/visual_depth/depth"
-DEFAULT_SUMMARY_TOPIC = "/perception/visual_depth/depth_summary"
+DEFAULT_DEPTH_TOPIC = "/perception/visual_depth"
+DEFAULT_SUMMARY_TOPIC = "/perception/visual_depth_summary"
 _DEFAULT_INSTANCE = "_default"
 
 
 def output_topics_for(input_topic: Optional[str]) -> tuple[str, str]:
-    """The one place the two output topics are derived from the input."""
+    """The one place the two output topics are derived from the input.
+
+    Named after this tool, which is the convention everything else derived
+    follows — `{input}/asr`, `{input}/tts`. These two were named after what they
+    carry instead (`/depth`, `/depth_summary`), and on a robot whose camera
+    already publishes its own depth map that produced a straight collision:
+    visual_depth fed by `/nvidia_desktop/camera/head` derived
+    `/nvidia_desktop/camera/head/depth`, which is exactly where the Tianyi
+    driver's own `camera_depth` sensor publishes.
+
+    Nothing detected it. The two producers simply took turns re-registering the
+    topic under their own formats — `image/depth-zlib` against `image/depth-z16`
+    — and every flip tore down and rebuilt the dashboard's subscription against
+    a message type the other one was not using. 303 rebuilds later the panel had
+    never received a frame, while both producers were publishing perfectly well.
+    It read as visual_depth being stuck on its first frame.
+
+    `_summary` is a sibling rather than a child (`…/visual_depth_summary`, not
+    `…/visual_depth/summary`) so that neither topic is a path prefix of the
+    other, which keeps prefix-matching anywhere downstream from confusing them.
+    """
     if input_topic:
-        return f"{input_topic}/depth", f"{input_topic}/depth_summary"
+        return f"{input_topic}/visual_depth", f"{input_topic}/visual_depth_summary"
     return DEFAULT_DEPTH_TOPIC, DEFAULT_SUMMARY_TOPIC
 
 _LOW_LAT_QOS = QoSProfile(

@@ -188,16 +188,34 @@ export async function resolveDerivedTopics(cards, connections, opts = {}) {
     const allowStale = round === maxRounds;   // final pass only
     const pending = cards.filter((c) => {
       if (!c.mcpId || !c.toolName) return false;
-      // A *derived-topic* card with no input is asked even when it already
-      // holds a topic: that topic may have been derived from a connection since
-      // deleted, and nothing else would ever correct it. Its answer is the
-      // driver's default, which needs no upstream resolved first.
+      // Every *derived-topic* card is asked once, whether or not it already
+      // holds a topic. A topic in the saved layout is not evidence — it is a
+      // snapshot of what some browser derived at some point, and this file
+      // exists because that snapshot cannot be trusted.
+      //
+      // This used to be narrower: only a derived card with *no inbound
+      // connection* was re-asked, on the grounds that its topic may have
+      // outlived a deleted link. A connected one that already had a topic was
+      // skipped, so nothing here could ever notice the driver renaming its
+      // output. When perception's visual_depth stopped deriving `{input}/depth`
+      // and started deriving `{input}/visual_depth`, the dashboard went on
+      // subscribing to the old name and showed empty panels with nothing to say
+      // why. The canvas page does re-ask on every load and had the new names in
+      // its ports, but a viewer is deliberately barred from persisting them
+      // (canvas.js _saveLayout requires the edit lock), so the layout the
+      // monitor reads stayed wrong indefinitely.
+      //
+      // The cost is one `info` per derived card per run, which is a read.
+      // `asked` keeps it to once, and an answer is only taken when it is
+      // non-empty and actually different, so a driver that cannot infer cannot
+      // blank out a good topic.
       //
       // Restricted to cards the caller marks as derived (multiInstance). A card
       // with a static topic gets it from the MCP schema, and asking its driver
       // instead would let an `info` answer overwrite the declared value.
-      const inputless = isDerived(c) && !hasInboundConnection(c, connections);
-      if (!unresolved(c) && !inputless) return false;
+      const derived = isDerived(c);
+      const inputless = derived && !hasInboundConnection(c, connections);
+      if (!unresolved(c) && !derived) return false;
       const input = inputTopicsOf(c, cards, connections, allowStale);
       // Empty means either nothing feeds this card, or some source has not
       // resolved yet — only the first is answerable now.

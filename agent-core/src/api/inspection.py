@@ -37,6 +37,10 @@ _topic_queues: dict[str, list] = {}
 # Active primary subscriptions (topic paths with live DDS sub)
 _active_primary_subs: set[str] = set()
 
+# Collisions already reported, so a rejected producer that keeps re-registering
+# on every heartbeat says so once rather than every few seconds.
+_logged_topic_collisions: set[tuple] = set()
+
 # Last frame cache per topic (for initial snapshot push on new WS connect)
 _last_frame: dict[str, bytes] = {}
 
@@ -137,6 +141,35 @@ async def register_topic_internal(topic: str, fmt: str, mcp_id: str,
     if not topic:
         return
     existing = _topic_registry.get(topic)
+    # Two *producers* claiming one topic under different formats. The
+    # consumer rule below cannot catch this — both sides are publishers, and
+    # each was simply overwriting the other.
+    #
+    # Nothing rate-limited that. On Tianyi the driver's own `camera_depth`
+    # published `/nvidia_desktop/camera/head/depth` as image/depth-z16 while
+    # perception's visual_depth derived the same name for its image/depth-zlib
+    # output, and the two took turns re-registering it. Every flip tore the
+    # subscription down and rebuilt it against a message type the other
+    # producer was not sending, so rclpy refused it as an incompatible type on
+    # an existing topic name. 303 rebuilds later the dashboard had still never
+    # received a frame — while both producers were publishing perfectly well.
+    # It presented as one of them being stuck on its first frame.
+    #
+    # First claim wins. A collision is a naming bug that has to be fixed at the
+    # source, and until it is, a panel that works for one of the two beats a
+    # panel that works for neither.
+    if existing and producer and \
+            existing.get('mcp_id') != mcp_id and existing.get('format') != fmt:
+        key = (topic, existing.get('mcp_id'), mcp_id, fmt)
+        if key not in _logged_topic_collisions:
+            _logged_topic_collisions.add(key)
+            print(f'[inspection] TOPIC COLLISION on {topic}: kept '
+                  f'{existing.get("format")!r} from {existing.get("mcp_id")}, '
+                  f'refused {fmt!r} from {mcp_id}. Two producers are publishing '
+                  f'to one topic under different formats — one of them needs '
+                  f'renaming, and until then the other one is unreadable.')
+        _ensure_primary_sub(topic, existing.get('format', ''), asyncio.get_event_loop())
+        return
     if existing and not producer:
         if existing.get('format') != fmt:
             print(f'[inspection] ignored consumer format {fmt!r} for {topic} '

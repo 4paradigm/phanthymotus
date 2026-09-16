@@ -2279,8 +2279,8 @@ other bundles in that file state.
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
 | Output (vop) | `{input_topic}/objects` | `data/json` |
-| Output (visual_depth map) | `{input_topic}/depth` | `image/depth-zlib` |
-| Output (visual_depth summary) | `{input_topic}/depth_summary` | `data/json` |
+| Output (visual_depth map) | `{input_topic}/visual_depth` | `image/depth-zlib` |
+| Output (visual_depth summary) | `{input_topic}/visual_depth_summary` | `data/json` |
 
 The depth map is **640x480 uint16 millimetres, zlib level 1**, published as a
 `CompressedImage` with `format="16UC1; compressedDepth zlib"`. The size is not

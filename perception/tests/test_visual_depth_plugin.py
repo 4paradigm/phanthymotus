@@ -154,8 +154,8 @@ def test_both_topics_are_published_for_one_frame():
     node = executor.nodes[0]
     _feed(node)
 
-    depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
-    summary_pub = next(p for p in node.publishers if p.topic.endswith("/depth_summary"))
+    depth_pub = next(p for p in node.publishers if p.topic.endswith("/visual_depth"))
+    summary_pub = next(p for p in node.publishers if p.topic.endswith("/visual_depth_summary"))
     assert _wait_until(lambda: depth_pub.messages and summary_pub.messages)
 
     values = np.frombuffer(zlib.decompress(depth_pub.messages[0]), dtype="<u2")
@@ -170,7 +170,7 @@ def test_model_output_is_resampled_to_the_renderer_size():
     node = executor.nodes[0]
     _feed(node)
 
-    depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
+    depth_pub = next(p for p in node.publishers if p.topic.endswith("/visual_depth"))
     assert _wait_until(lambda: bool(depth_pub.messages))
     values = np.frombuffer(zlib.decompress(depth_pub.messages[0]), dtype="<u2")
     assert values.size == W * H
@@ -184,7 +184,7 @@ def test_depth_scale_is_applied():
     node = executor.nodes[0]
     _feed(node)
 
-    depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
+    depth_pub = next(p for p in node.publishers if p.topic.endswith("/visual_depth"))
     assert _wait_until(lambda: bool(depth_pub.messages))
     values = np.frombuffer(zlib.decompress(depth_pub.messages[0]), dtype="<u2")
     assert values[0] == 2000          # 1.0 * 2.0 m → 2000 mm
@@ -274,7 +274,7 @@ def test_a_frame_that_fails_to_decode_is_skipped_not_fatal():
     time.sleep(0.01)          # clear the 1 ms rate-limit window between frames
     _feed(node, b"640x480")
 
-    depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
+    depth_pub = next(p for p in node.publishers if p.topic.endswith("/visual_depth"))
     assert _wait_until(lambda: bool(depth_pub.messages))
 
 
@@ -468,7 +468,7 @@ def test_calibration_reaches_the_published_depth_map():
     plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
     _feed(node)
-    depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
+    depth_pub = next(p for p in node.publishers if p.topic.endswith("/visual_depth"))
     assert _wait_until(lambda: bool(depth_pub.messages))
     values = np.frombuffer(zlib.decompress(depth_pub.messages[0]), dtype="<u2")
     assert values[0] == 3000          # 1.5 m * e^ln2 → 3.0 m → 3000 mm
@@ -591,7 +591,7 @@ def test_calibrate_uses_the_live_frame_of_a_running_instance():
     plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
     _feed(node)
-    depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
+    depth_pub = next(p for p in node.publishers if p.topic.endswith("/visual_depth"))
     assert _wait_until(lambda: bool(depth_pub.messages))
 
     result = plugin.dispatch("visual_depth", {"action": "calibrate", "distance_m": 2.0})
