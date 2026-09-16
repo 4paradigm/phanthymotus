@@ -126,8 +126,13 @@ def _ocr_output_topic(input_topic: str) -> str:
 
 
 def _adapter_options(cfg: dict) -> dict:
+    backend = cfg.get("backend", "tensorrt")
+    if backend not in ("tensorrt", "onnx-cpu"):
+        raise ValueError(f"unsupported OCR backend: {backend}")
     return {
-        "model_dir": str(cfg.get("model_dir", DEFAULT_OCR_MODEL_DIR)),
+        "backend": backend,
+        "model_dir": str(cfg.get("model_dir", "/models/ocr/ppocrv6-small-onnx"
+                                 if backend == "onnx-cpu" else DEFAULT_OCR_MODEL_DIR)),
         "device_id": int(cfg.get("device_id", 0)),
         "use_angle_cls": bool(cfg.get("use_angle_cls", True)),
         "max_side_len": int(cfg.get("max_side_len", DEFAULT_MAX_SIDE_LEN)),
@@ -158,8 +163,11 @@ def _build_ocr_adapter(cfg: dict) -> RapidOCRAdapter:
     if provider != 'rapidocr':
         raise ValueError(f"unsupported OCR provider: {provider}")
     options = _adapter_options(cfg)
-    from utils.model_downloader import ensure_ocr_model
-    ensure_ocr_model(options["model_dir"])
+    from utils.model_downloader import ensure_ocr_model, ensure_ocr_onnx_model
+    if options["backend"] == "onnx-cpu":
+        ensure_ocr_onnx_model(options["model_dir"], options["use_angle_cls"])
+    else:
+        ensure_ocr_model(options["model_dir"])
     return RapidOCRAdapter(**options)
 
 

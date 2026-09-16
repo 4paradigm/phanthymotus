@@ -170,6 +170,8 @@ plugins:
   ocr:
     enabled: true
     provider: rapidocr
+    # Explicit x86 opt-in: backend: onnx-cpu and a separate
+    # model_dir: /models/ocr/ppocrv6-small-onnx. Default remains TensorRT.
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
     language: zh
