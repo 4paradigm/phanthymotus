@@ -15,9 +15,13 @@ _log = logging.getLogger(__name__)
 
 TENSORRT_MODEL_FILES = ("det.engine", "rec.engine", "keys.txt")
 TENSORRT_CLASSIFIER_MODEL_FILE = "cls.engine"
+ONNX_MODEL_FILES = ("det/inference.onnx", "rec/inference.onnx", "keys.txt")
+ONNX_CLASSIFIER_MODEL_FILE = "cls/ch_ppocr_mobile_v2.0_cls_mobile.onnx"
 MAX_RECOGNITION_WIDTH = 2048
 _OCR_MEAN = (127.5, 127.5, 127.5)
 _OCR_NORMAL = (1 / 127.5, 1 / 127.5, 1 / 127.5)
+_ONNX_DET_MEAN = tuple(x * 255 for x in (0.485, 0.456, 0.406))
+_ONNX_DET_NORMAL = tuple(1 / (x * 255) for x in (0.229, 0.224, 0.225))
 DEFAULT_MAX_SIDE_LEN = 1600
 DEFAULT_REC_MIN_SCORE = 0.9
 DEFAULT_DET_THRESH = 0.3
@@ -402,7 +406,72 @@ class _TensorRTModelSession:
             pass
 
 
-class _TensorRTPipeline:
+class _OnnxCPUModelSession:
+    """FP32 CPU session with the same image contract as the TensorRT session."""
+
+    def __init__(self, model_path: Path, *, device_id: int, mean, normal):
+        import numpy as np
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(
+            str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        inputs = self._session.get_inputs()
+        if len(inputs) != 1 or len(self._session.get_outputs()) != 1:
+            raise ValueError("OCR ONNX model must have one input and one output")
+        spec = inputs[0]
+        if spec.type != "tensor(float)" or len(spec.shape) != 4:
+            raise ValueError("OCR ONNX input must be FP32 NCHW")
+        self._name, self._shape = spec.name, spec.shape
+        self._mean = np.asarray(mean, dtype=np.float32).reshape(1, 3, 1, 1)
+        self._normal = np.asarray(normal, dtype=np.float32).reshape(1, 3, 1, 1)
+        default = ((1, 3, 640, 640) if model_path.parent.name == "det"
+                   else (1, 3, 48, 192 if model_path.parent.name == "cls" else 320))
+        self.optimization_shape = tuple(
+            actual if isinstance(actual, int) and actual > 0 else fallback
+            for actual, fallback in zip(self._shape, default)
+        )
+        self._validate_shape(self.optimization_shape)
+
+    def _validate_shape(self, shape):
+        if len(shape) != 4 or shape[0] != 1 or shape[1] != 3 or min(shape) <= 0:
+            raise ValueError(f"invalid OCR ONNX NCHW shape: {shape}")
+        if any(isinstance(fixed, int) and fixed > 0 and fixed != value
+               for fixed, value in zip(self._shape, shape)):
+            raise ValueError(f"OCR ONNX shape {shape} does not match {self._shape}")
+
+    def fit_input_image_shape(self, height, width):
+        self._validate_shape((1, 3, height, width))
+        return height, width
+
+    def max_batch_size(self, height, width):
+        self._validate_shape((1, 3, height, width))
+        # ponytail: one crop per CPU call bounds memory; batch only if measured useful.
+        return 1
+
+    def run_uint8(self, image, shape):
+        return self.run_uint8_batch(image[None], shape)
+
+    def run_uint8_batch(self, images, shape):
+        import numpy as np
+
+        self._validate_shape(shape)
+        if images.shape != (shape[0], shape[2], shape[3], shape[1]):
+            raise ValueError(f"OCR ONNX image/shape mismatch: {images.shape} vs {shape}")
+        if self._session is None:
+            raise RuntimeError("OCR ONNX session is closed")
+        value = images.transpose(0, 3, 1, 2).astype(np.float32)
+        value = np.ascontiguousarray((value - self._mean) * self._normal)
+        return self._session.run(None, {self._name: value})[0]
+
+    def close(self):
+        self._session = None
+
+
+class _OCRPipeline:
     @staticmethod
     def _multiple_of_32(value: float) -> int:
         return max(32, int(round(value / 32)) * 32)
@@ -551,20 +620,29 @@ class _TensorRTPipeline:
         empty_result_retry: EmptyResultRetryConfig | None = None,
         use_angle_cls: bool = False,
         cls_thresh: float = DEFAULT_CLS_THRESH,
+        backend: str = "tensorrt",
     ):
         from rapidocr.ch_ppocr_det.utils import DBPostProcess
         from rapidocr.ch_ppocr_rec.utils import CTCLabelDecode
         from rapidocr.utils.process_img import get_rotate_crop_image
 
-        self._det = _TensorRTModelSession(
-            root / "det.engine",
+        session = _OnnxCPUModelSession if backend == "onnx-cpu" else _TensorRTModelSession
+        files = ONNX_MODEL_FILES if backend == "onnx-cpu" else TENSORRT_MODEL_FILES
+        classifier_file = (ONNX_CLASSIFIER_MODEL_FILE if backend == "onnx-cpu"
+                           else TENSORRT_CLASSIFIER_MODEL_FILE)
+        # The official FP32 detector export uses ImageNet normalization;
+        # deployed TensorRT engines keep their existing [-1, 1] contract.
+        det_mean = _ONNX_DET_MEAN if backend == "onnx-cpu" else _OCR_MEAN
+        det_normal = _ONNX_DET_NORMAL if backend == "onnx-cpu" else _OCR_NORMAL
+        self._det = session(
+            root / files[0],
             device_id=device_id,
-            mean=_OCR_MEAN,
-            normal=_OCR_NORMAL,
+            mean=det_mean,
+            normal=det_normal,
         )
         try:
-            self._rec = _TensorRTModelSession(
-                root / "rec.engine",
+            self._rec = session(
+                root / files[1],
                 device_id=device_id,
                 mean=_OCR_MEAN,
                 normal=_OCR_NORMAL,
@@ -575,8 +653,8 @@ class _TensorRTPipeline:
         self._cls = None
         if use_angle_cls:
             try:
-                self._cls = _TensorRTModelSession(
-                    root / TENSORRT_CLASSIFIER_MODEL_FILE,
+                self._cls = session(
+                    root / classifier_file,
                     device_id=device_id,
                     mean=_OCR_MEAN,
                     normal=_OCR_NORMAL,
@@ -892,7 +970,10 @@ class RapidOCRAdapter:
         det_unclip_ratio: float = DEFAULT_DET_UNCLIP_RATIO,
         crop_refinement: dict | None = None,
         empty_result_retry: dict | None = None,
+        backend: str = "tensorrt",
     ):
+        if backend not in ("tensorrt", "onnx-cpu"):
+            raise ValueError(f"unsupported OCR backend: {backend}")
         root = Path(model_dir)
         self._max_side_len = max_side_len
         self._request_lock = threading.Lock()
@@ -903,16 +984,18 @@ class RapidOCRAdapter:
         empty_result_retry_config = EmptyResultRetryConfig.from_mapping(
             empty_result_retry
         )
-        required_files = TENSORRT_MODEL_FILES + (
-            (TENSORRT_CLASSIFIER_MODEL_FILE,) if use_angle_cls else ()
-        )
+        required_files = (ONNX_MODEL_FILES if backend == "onnx-cpu" else TENSORRT_MODEL_FILES)
+        if use_angle_cls:
+            required_files += (ONNX_CLASSIFIER_MODEL_FILE if backend == "onnx-cpu"
+                               else TENSORRT_CLASSIFIER_MODEL_FILE,)
         missing = [name for name in required_files if not (root / name).is_file()]
         if missing:
             raise FileNotFoundError(
-                f"OCR TensorRT model files missing: {', '.join(missing)}"
+                f"OCR {backend} model files missing: {', '.join(missing)}"
             )
-        pipeline = _TensorRTPipeline(
+        pipeline = _OCRPipeline(
             root,
+            backend=backend,
             device_id=device_id,
             crop_refinement=crop_refinement_config,
             empty_result_retry=empty_result_retry_config,

@@ -6,6 +6,50 @@ vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## OCR on x86 CPU
+
+OCR keeps TensorRT as its default. For a CPU deployment, explicitly set these
+shared YAML settings (not per-instance canvas settings):
+
+```yaml
+plugins:
+  ocr:
+    enabled: true
+    provider: rapidocr
+    backend: onnx-cpu
+    model_dir: /models/ocr/ppocrv6-small-onnx
+    use_angle_cls: true
+    min_interval_ms: 1000
+```
+
+Replace the existing OCR `model_dir` as well as the backend. CPU mode uses
+ONNX Runtime's `CPUExecutionProvider`, two intra-op threads and one crop per
+inference call. It does not silently fall back from TensorRT. The output schema,
+camera subscription and photo/URL actions are unchanged. Sampling at 1 Hz is a
+starting configuration, not a latency guarantee.
+
+The runtime needs `onnxruntime`, `rapidocr==3.9.1`, OpenCV, NumPy and pyvips
+with libvips. The Jetson Dockerfile is unchanged; an x86 image must include
+these dependencies. No model weights are baked into this change. Models are
+downloaded into `/models` using the existing size/SHA-256 verification and
+file-lock mechanism:
+
+- Official [PaddlePaddle PP-OCRv6 small detector](https://www.modelscope.cn/models/PaddlePaddle/PP-OCRv6_small_det_onnx)
+  and recognizer (FP32), pinned revisions and hashes in `utils/model_downloader.py`.
+- PP-OCRv4 mobile orientation classifier from RapidAI/RapidOCR `v3.9.0`.
+- The same pinned PP-OCRv6 character dictionary as the TensorRT bundle.
+
+The upstream model families are Apache-2.0. CPU detection follows the official
+ONNX ImageNet normalization; existing TensorRT normalization is unchanged.
+Run a real inference check inside the target image:
+
+```bash
+PYTHONPATH=/work python3 /work/tools/verify_ocr_cpu.py
+```
+
+This checks generated text, a blank image and malformed input. It does not
+replace camera/ROS/WebUI acceptance or a Jetson hardware regression test.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

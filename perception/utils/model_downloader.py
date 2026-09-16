@@ -642,6 +642,38 @@ OCR_MODEL_BUNDLES = {
 }
 
 
+# Official PP-OCRv6 FP32 exports; pinned independently of JetPack engines.
+OCR_ONNX_BUNDLES = {
+    "det": {
+        "base_url": "https://www.modelscope.cn/models/PaddlePaddle/PP-OCRv6_small_det_onnx/resolve/956a0b620a4017cc04056c692be1703b0025d028",
+        "files": {"inference.onnx": {"size": 9880512, "sha256": "d73e0058b7a8086bbd57f3d10b8bcd4ff95363f67e06e2762b5e814fe9c9410e"}},
+    },
+    "rec": {
+        "base_url": "https://www.modelscope.cn/models/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/296d43bc0ebced0fd9c605174aa5962e49810ab6",
+        "files": {"inference.onnx": {"size": 21159378, "sha256": "5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634"}},
+    },
+    "cls": {
+        "base_url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.0/onnx/PP-OCRv4/cls",
+        "files": {"ch_ppocr_mobile_v2.0_cls_mobile.onnx": {"size": 585532, "sha256": "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c"}},
+    },
+}
+
+
+def ensure_ocr_onnx_model(model_dir: str, use_angle_cls: bool = True) -> None:
+    model_dir = require_models_subpath(model_dir)
+    for component in ("det", "rec", "cls") if use_angle_cls else ("det", "rec"):
+        bundle = OCR_ONNX_BUNDLES[component]
+        ensure_verified_bundle(
+            f"ocr/onnx/{component}", os.path.join(model_dir, component),
+            bundle["base_url"], bundle["files"],
+        )
+    ensure_verified_bundle(
+        "ocr/onnx/keys", model_dir,
+        f"{OCR_MODEL_BASE}/tensorrt-jp6-trt10.4-orin-batch8-cls8",
+        {"keys.txt": _OCR_KEYS},
+    )
+
+
 def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
     """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
     model_dir = require_models_subpath(model_dir)
