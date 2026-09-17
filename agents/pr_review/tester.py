@@ -85,6 +85,16 @@ SUITES: dict[str, dict] = {
             "LD_PRELOAD": "/usr/lib/aarch64-linux-gnu/libgomp.so.1",
         },
     },
+    "actucore": {
+        "workdir": "actucore",
+        "target": BuildTarget.ACTUCORE,
+        "python": "python3",
+        # Same image family as perception — same two reasons for both vars.
+        "env": {
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "LD_PRELOAD": "/usr/lib/aarch64-linux-gnu/libgomp.so.1",
+        },
+    },
 }
 
 # pytest's exit codes, which say things the junit XML cannot.

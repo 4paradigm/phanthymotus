@@ -26,6 +26,8 @@ let _status   = null;   // overlay that says why nothing is on screen
 let _staleTimer = null;
 let _frames   = 0;
 let _textLike = false;  // 文本/活动流；其余都是画布
+let _retryTimer = null;
+let _session  = 0;      // 换话题时自增，用来丢弃在途的重连
 
 // How long without a frame before the panel stops implying the stream is live.
 // A <canvas> keeps its last painted pixels forever, so a stalled stream is
@@ -33,6 +35,16 @@ let _textLike = false;  // 文本/活动流；其余都是画布
 const STALE_MS = 10000;
 
 // 连接中／等待数据这类提示始终居中：那时面板上本来就没有内容可遮。
+// 断线后多久重连一次。
+//
+// 服务端在话题还没注册时会发一条 error 然后**关掉**连接
+// （api/inspection.py 的 bus_ws）。没有重连的话，面板就永久停在"这个 topic
+// 没有发出任何数据"上 —— 哪怕几秒后卡片启动了、话题注册了、数据开始流，它也
+// 不会知道，只有关掉重开才会重新连上。
+//
+// 而"先打开面板、再启动卡片"恰恰是最自然的操作顺序。
+const RETRY_MS = 3000;
+
 const _CENTERED = 'position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);' +
   'text-align:center;font-size:13px;padding:0 16px;pointer-events:none;z-index:2';
 
@@ -109,6 +121,17 @@ export function showTopicDetail(topicPath, format) {
     _setStatus('这张卡片还没有解析出输出 topic — 先启动它', 'warn');
     return;
   }
+  _connect(topicPath, hint, _session);
+}
+
+/**
+ * 连一次 /ws/bus，断了就再连 —— 只要面板还停在同一个话题上。
+ *
+ * `session` 是打开这个面板时的代次。换了话题或关了面板，_cleanup 会把代次推进，
+ * 在途的重连醒来发现自己过期就安静退出，不会往下一个话题的面板上写东西。
+ */
+function _connect(topicPath, hint, session) {
+  if (session !== _session) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsHost = location.host;
   const wsUrl = `${proto}://${wsHost}/ws/bus${topicPath}`;
@@ -147,12 +170,22 @@ export function showTopicDetail(topicPath, format) {
   _ws.onclose = () => {
     console.debug('[detail-panel] WS closed:', topicPath);
     clearTimeout(_staleTimer);
-    if (_frames === 0) _setStatus('连接已断开，这个 topic 没有发出任何数据', 'warn');
+    if (_frames === 0) {
+      _setStatus(`还没有数据 — ${Math.round(RETRY_MS / 1000)} 秒后重试`, 'dim');
+    }
+    _scheduleRetry(topicPath, hint, session);
   };
   _ws.onerror = (e) => {
     console.warn('[detail-panel] WS error:', topicPath, e);
-    if (_frames === 0) _setStatus('连接失败', 'warn');
+    // onerror 之后总会跟一个 onclose，重连交给它，这里只管说话。
+    if (_frames === 0) _setStatus('连接失败，正在重试…', 'warn');
   };
+}
+
+function _scheduleRetry(topicPath, hint, session) {
+  clearTimeout(_retryTimer);
+  if (session !== _session) return;
+  _retryTimer = setTimeout(() => _connect(topicPath, hint, session), RETRY_MS);
 }
 
 export async function showNodeDetail(mcp) {
@@ -210,6 +243,11 @@ function _closePanel() {
 }
 
 function _cleanup() {
+  // 先推进代次：在途的重连醒来会发现自己过期而退出。清 timer 之外还要这一步，
+  // 因为 _connect 可能已经在跑、timer 已经烧掉了。
+  _session += 1;
+  clearTimeout(_retryTimer);
+  _retryTimer = null;
   clearTimeout(_staleTimer);
   _staleTimer = null;
   _frames = 0;

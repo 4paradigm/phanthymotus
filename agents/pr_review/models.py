@@ -86,6 +86,11 @@ class BuildTarget(str, Enum):
 SUPPORTED_JP_VERSIONS = ("5.11", "6.1")
 DEFAULT_JP_VERSION = "5.11"
 
+# The targets a JetPack version means something for — `worker._build_plan`
+# expands exactly these over the requested versions. Core and drivers have no
+# variant, so a version token next to them is noise.
+JP_VARIANT_TARGETS = frozenset({"perception", "actucore"})
+
 
 # Statuses from which a job will never advance. Plain strings, because the
 # store hands back rows where status is a string, not an enum member.
@@ -332,7 +337,24 @@ TRIGGER = "/request_bot_review"
 # A JetPack version token: `jetson-5.11`, `jetson-jp6.1`, `jp5.11`, or the bare
 # version. Only perception has variants, so no target prefix is required — and a
 # version on its own is taken as a request to build perception.
-JP_TOKEN_PATTERN = re.compile(r"^(?:jetson-)?(?:jp)?(\d+\.\d+)$", re.IGNORECASE)
+#
+# The dot is optional, because the help message advertises `jp511` / `jp61` and
+# that is what people type. Requiring it meant `/request_bot_review force
+# perception jp61` — the help's own combining example — parsed to no variant at
+# all and silently built the 5.11 default.
+JP_TOKEN_PATTERN = re.compile(r"^(?:jetson-)?(?:jp)?(\d+(?:\.\d+)?)$", re.IGNORECASE)
+
+# Dotless spellings, resolved against the supported set rather than by splitting
+# digits: `511` is 5.11 only because 5.11 is a version we have, and guessing
+# between 5.11 and 51.1 from the string alone is not something to invent.
+JP_VERSION_BY_DIGITS = {v.replace(".", ""): v for v in SUPPORTED_JP_VERSIONS}
+
+
+def normalize_jp_version(raw: str) -> str | None:
+    """Map a parsed JetPack token to a supported version, or None if unknown."""
+    if raw in SUPPORTED_JP_VERSIONS:
+        return raw
+    return JP_VERSION_BY_DIGITS.get(raw.replace(".", ""))
 
 
 def parse_trigger_command(comment_body: str) -> dict | None:
@@ -382,8 +404,10 @@ def parse_trigger_command(comment_body: str) -> dict | None:
                 # force list and silently did nothing.
                 result["force_targets"].append(lowered)
             elif JP_TOKEN_PATTERN.match(lowered):
-                version = JP_TOKEN_PATTERN.match(lowered).group(1)
-                if version not in SUPPORTED_JP_VERSIONS:
+                version = normalize_jp_version(
+                    JP_TOKEN_PATTERN.match(lowered).group(1)
+                )
+                if version is None:
                     # Dropped rather than passed through: the build script exits
                     # 1 on an unknown version, which would fail the whole job.
                     # The build-in-progress comment lists what will actually be
@@ -395,13 +419,26 @@ def parse_trigger_command(comment_body: str) -> dict | None:
                     continue
                 if version not in result["perception_variants"]:
                     result["perception_variants"].append(version)
-                # Asking for a version is asking for perception: the token means
-                # nothing for any other target.
-                if "perception" not in result["force_targets"]:
-                    result["force_targets"].append("perception")
             elif "/" in token:
                 # A driver path such as unitree/g1
                 result["force_targets"].append(token)
+            else:
+                # Never drop a token in silence. The whole point of this bug was
+                # that an unrecognised argument left no trace anywhere: the job
+                # ran, succeeded, and built something the requester did not ask
+                # for.
+                logger.warning(
+                    f"Ignoring unrecognised {TRIGGER} argument {token!r}"
+                )
+
+        # A version on its own means perception — but only when nothing else
+        # that has JetPack variants was named. Applied inside the loop it also
+        # fired for `actucore jp6.1`, which then built perception too: an
+        # unasked-for image, and for jp6.1 an expensive one.
+        if result["perception_variants"] and not (
+            set(result["force_targets"]) & JP_VARIANT_TARGETS
+        ):
+            result["force_targets"].append("perception")
         return result
 
     return None
