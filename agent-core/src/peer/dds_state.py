@@ -170,12 +170,19 @@ async def push_once() -> int:
     payload = {'topics': topics, 'timestamp': time.time(),
                'agent_running': agent_running(),
                'display_name': our_name}
+    from peer import backoff
+
     delivered = 0
     for peer in store.list_peers():
         endpoints = registry.endpoints_for(peer['peer_id'])
         if not endpoints:
             continue
+        # 被对端明确拒绝过的，按退避跳过。`push_errors` 里那条原因保持不变，所以
+        # 面板上仍然看得见「为什么」，只是不再每 5s 重问一遍。
+        if backoff.should_skip(peer['peer_id']):
+            continue
         resp, reason = await transport.post_json(endpoints, STATE_PATH, payload)
+        backoff.note_result(peer['peer_id'], resp is not None, reason)
         if resp is not None:
             delivered += 1
             push_errors.pop(peer['peer_id'], None)

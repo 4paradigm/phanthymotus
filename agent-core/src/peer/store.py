@@ -79,6 +79,10 @@ def upsert(peer_id: str, public_key_b64: str, display_name: str = '',
              json.dumps(endpoints or []), json.dumps(capabilities or []), now, now)
         )
         conn.commit()
+    # (重新)配对是「情况变了」的那一刻，所以别让上一轮的退避再拖十几分钟才恢复。
+    # 单向配对修好之后，人在界面上点完就该立刻看到对方上线。
+    from peer import backoff
+    backoff.reset(peer_id)
     return get(peer_id)
 
 
