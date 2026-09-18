@@ -88,7 +88,23 @@ RUN find /ros_ws/install /opt/nav2_ws/install /opt/ros_deps_ws/install \
     ros2 pkg prefix fast_livo2 >/dev/null && \
     ros2 pkg prefix segmented_controller >/dev/null && \
     ros2 pkg prefix nav2 >/dev/null && \
-    ! ldd /ros_ws/install/segmented_controller/lib/libsegmented_controller.so | grep -Fq 'not found' && \
+    for binary in \
+      /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
+      /opt/nav2_ws/install/lib/nav2_controller/controller_server \
+      /opt/nav2_ws/install/lib/nav2_planner/planner_server \
+      /opt/nav2_ws/install/lib/nav2_smoother/smoother_server \
+      /opt/nav2_ws/install/lib/nav2_behaviors/behavior_server \
+      /opt/nav2_ws/install/lib/nav2_bt_navigator/bt_navigator \
+      /opt/nav2_ws/install/lib/nav2_waypoint_follower/waypoint_follower \
+      /opt/nav2_ws/install/lib/nav2_lifecycle_manager/lifecycle_manager \
+      /ros_ws/install/segmented_controller/lib/libsegmented_controller.so; do \
+      dependencies="$(ldd "${binary}")" || exit 1; \
+      printf '%s\n' "${binary}" "${dependencies}"; \
+      if grep -Fq 'not found' <<< "${dependencies}"; then exit 1; fi; \
+    done && \
+    NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
+      python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
+    cd /work && python3 -c "import main; import numpy, rosbag2_py, yaml, em, cv2; from fast_livo2.camera_rgb_frame import decode; from fast_livo2.camera_depth_frame import decode" && \
     test ! -e /ros_ws/src && test ! -e /ros_ws/build && test ! -e /ros_ws/log && \
     test ! -e /work/plugins/navigation/runtime
 

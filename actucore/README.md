@@ -126,6 +126,10 @@ GIT_MIRROR_PREFIX=https://ghfast.top/ \
   ./deploy/build_actucore.sh --base --mirror tuna
 ```
 
+最终镜像阶段会检查 FAST-LIVO2 与 Nav2 原生节点的动态链接、加载配置中的全部
+BT 插件，并导入 ActuCore 主入口；JP6.1 同样检查主入口导入。缺失共享库或 Python
+模块会使构建失败，不能用 builder 阶段或挂载源码后的测试代替最终镜像检查。
+
 在 8 GB 等小内存 ARM64 构建机上可设置 `BUILD_JOBS=2`；该值会同时传给
 navigation base 和日常 ActuCore 的 C++ 编译步骤。
 

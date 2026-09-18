@@ -57,3 +57,33 @@ def test_platform_build_selection(tmp_path, args, extra, dockerfile):
         assert not any(arg.startswith('ACTUCORE_RUNTIME_BASE_IMAGE=') for arg in call)
     elif dockerfile == 'Dockerfile.jetson':
         assert any(arg.startswith('ACTUCORE_NAVIGATION_BASE_IMAGE=') and '@sha256:' in arg for arg in call)
+
+
+@pytest.mark.parametrize('name', ['Dockerfile.jetson', 'Dockerfile.vla'])
+def test_final_image_contains_entry_point_dependencies(name):
+    final = (ROOT / 'actucore' / name).read_text().rsplit('\nFROM ', 1)[1]
+    copies = [line.split() for line in final.splitlines() if line.startswith('COPY ')]
+    for source, destination in [('actucore/main.py', '/work/main.py'),
+                                ('actucore/utils/', '/work/utils/')]:
+        assert ['COPY', source, destination] in copies
+    assert 'python3 -c "import main' in final
+
+
+@pytest.mark.parametrize('output,status,success', [
+    ('libpcl_common.so.1.10 => /usr/lib/libpcl_common.so.1.10', 0, True),
+    ('libpcl_common.so.1.10 => not found', 0, False),
+    ('not a dynamic executable', 1, False),
+])
+def test_final_native_check_fails_closed(tmp_path, output, status, success):
+    final = (ROOT / 'actucore/Dockerfile.jetson').read_text().rsplit('\nFROM ', 1)[1]
+    check = 'for binary in ' + final.split('for binary in ', 1)[1].split('done &&', 1)[0] + 'done'
+    assert 'fastlivo_mapping' in check and 'controller_server' in check
+    assert 'libsegmented_controller.so' in check
+    assert 'ctypes.CDLL' in final
+    fake = tmp_path / 'ldd'
+    fake.write_text(f'#!{sys.executable}\nimport sys\nprint({output!r})\nsys.exit({status})\n')
+    fake.chmod(0o755)
+    result = subprocess.run(['bash', '-o', 'pipefail', '-c', check],
+                            env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
+                            capture_output=True, text=True, timeout=5)
+    assert (result.returncode == 0) is success, result.stdout + result.stderr

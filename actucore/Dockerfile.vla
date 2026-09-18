@@ -1,37 +1,23 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# VLA-only runtime retained for JP6.1; the base comes in as BASE_IMAGE (see
-# below). The application layers are byte-identical on both — what differs is
-# only what the base already carries.
+# VLA-only runtime retained for JP6.1. JP5.11 navigation uses Dockerfile.jetson.
 #
 # Build context: repo root (phanthymotus/) so we can access both
 # actucore/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
-#   ./deploy/build_actucore.sh --mirror tuna                  # jp5.11 (default)
 #   ./deploy/build_actucore.sh --jp-version 6.1 --mirror tuna
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-# Defaults match deploy/build_actucore.sh, which matches build_perception.sh.
+# Defaults match the JP6.1 path in deploy/build_actucore.sh.
 # The script always passes both explicitly; these only apply to a bare
 # `docker build`, and having them disagree with the script would mean the same
 # command producing a different image depending on how it was invoked.
-ARG JP_VERSION=511
-# One Dockerfile, two bases. Everything above and below this line is identical
-# on both JetPack lines — only what the base carries differs, and the card sorts
-# itself out at runtime:
-#
-#   jp5.11  jetson-base            remote providers only. Thin. (default)
-#   jp6.1   jetson-base-actucore   CUDA torch 2.9 + lerobot → local *and* remote
-#                                  providers. ~18.6 GB.
-#
-# That split is forced, not chosen. JetPack 5.11 is CUDA 11.4 and lerobot needs
-# torch >= 2.2.1, and no torch >= 2.2 supports CUDA 11.4 (PyTorch's own matrix
-# floors at 11.8) — so local inference cannot exist there whatever we build.
-# The `smolvla` provider refuses at start on that line with that reason; `mock`
-# and `vla_cloud` are unaffected. See deploy/prepare_actucore_base.sh.
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
+ARG JP_VERSION=61
+# CUDA torch and lerobot support local and remote providers on this platform.
+# See deploy/prepare_actucore_base.sh for the separate inference base.
+ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base-actucore:jp61-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
 
@@ -65,6 +51,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
+COPY actucore/utils/      /work/utils/
 COPY actucore/config.yaml /work/config.yaml
 # JP6.1 has no published navigation base; never advertise an unusable card.
 RUN python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))" && \
@@ -101,6 +88,11 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42
+
+# Import the shipped entry point without starting ROS, HTTP or any card.
+RUN . /opt/ros/humble/install/setup.bash && \
+    . /ros_ws/install/setup.bash && \
+    python3 -c "import main"
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
