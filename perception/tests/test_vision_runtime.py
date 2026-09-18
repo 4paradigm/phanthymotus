@@ -298,3 +298,53 @@ def test_an_empty_detection_output_decodes_to_no_boxes():
         np.zeros((1, 0, 6), dtype=np.float32), meta, conf=0.25)
     assert boxes.shape == (0, 4)
     assert scores.size == 0 and classes.size == 0
+
+
+class _StretchEngine:
+    input_shape = (1, 3, 384, 512)
+    input_dtype = np.dtype(np.float32)
+    output_names = ["depth"]
+
+    def __init__(self, *args, **kwargs):
+        self.seen = None
+
+    def infer(self, image):
+        self.seen = image
+        return [np.ones((1, 1, 384, 512), dtype=np.float32)]
+
+    def close(self):
+        pass
+
+
+def test_stretch_uses_the_full_canvas_and_rgb_unit_range(monkeypatch):
+    from utils import tensorrt_runtime
+    monkeypatch.setattr(tensorrt_runtime, "TensorRTEngine", _StretchEngine)
+    session = VisionEngineSession("fake.engine", resize_mode="stretch")
+    frame = np.full((360, 640, 3), (255, 0, 0), dtype=np.uint8)
+    outputs, meta = session.infer(frame)
+    assert meta is None
+    assert session._engine.seen.shape == (1, 3, 384, 512)
+    assert np.all(session._engine.seen[0, 2] == 1)
+    assert np.all(session._engine.seen[0, :2] == 0)
+    assert decode_depth(outputs, meta).shape == (384, 512)
+
+
+def test_stretch_is_opt_in_and_letterbox_remains_the_default(monkeypatch):
+    from utils import tensorrt_runtime
+    monkeypatch.setattr(tensorrt_runtime, "TensorRTEngine", _StretchEngine)
+    _, meta = VisionEngineSession("fake.engine").infer(np.zeros((360, 640, 3), dtype=np.uint8))
+    assert meta is not None and meta.pad_y > 0
+
+
+def test_invalid_resize_mode_does_not_load_an_engine(monkeypatch):
+    from utils import tensorrt_runtime
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid resize mode loaded an engine")
+    monkeypatch.setattr(tensorrt_runtime, "TensorRTEngine", forbidden)
+    with pytest.raises(ValueError, match="resize"):
+        VisionEngineSession("fake.engine", resize_mode="invalid")
+
+
+def test_depth_decode_without_padding_keeps_every_pixel():
+    depth = np.arange(384 * 512, dtype=np.float32).reshape(1, 1, 384, 512)
+    np.testing.assert_array_equal(decode_depth([depth], None), depth[0, 0])

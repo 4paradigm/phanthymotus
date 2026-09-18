@@ -2378,6 +2378,60 @@ other bundles in that file state.
 
 ---
 
+## Indoor obstacle distance (`obstacle`)
+
+This optional tool is disabled by default (`plugins.obstacle.enabled: false`).
+Enabling it registers the MCP tool without downloading a model or initializing
+TensorRT. Neither `info` nor `config` downloads or initializes a model. A valid `start` downloads the
+pinned engine for the current JetPack family if missing; `info` exposes loading
+progress under the `obstacle-yolo26s` name. The engine initializes on first inference.
+
+The tool supports `start`, `stop`, `info` and `config`, with one instance per input
+topic (or explicit `instance_id`). `start` requires `input_topic` or the first
+entry in `input_topics`. It consumes JPEG bytes in `sensor_msgs/CompressedImage`
+and publishes a `std_msgs/String` containing JSON on `{input_topic}/obstacle`,
+advertised as `data/json`, with RELIABLE / KEEP_LAST(10) / VOLATILE QoS.
+It does not publish a depth image or visual_depth regional summaries.
+
+Example successful payload (distances in metres):
+
+```json
+{
+  "pred_distance": 1.5,
+  "distance_m": 1.5,
+  "near_obstacle": true,
+  "scene": "indoor",
+  "status": "ok",
+  "error_code": null,
+  "fallback": false,
+  "approximate_geometry": false,
+  "latency_ms": 20.0
+}
+```
+
+- `pred_distance` and `distance_m` are aliases for the same estimate. The default
+  reducer takes P1 over valid positive finite depth in the configured ROI,
+  scaled from its reference image size, and clamps the result to the configured
+  output range. This is a monocular estimate, not a calibrated range sensor.
+- `near_obstacle` is the strict comparison `distance_m < decision_threshold_m`.
+  The default threshold is 2.0 m; a value exactly at the threshold is not near.
+- `latency_ms` covers local image-to-distance processing, not ROS transport.
+  The indoor backend reports `scene: "indoor"` and `approximate_geometry: false`.
+- Image/depth/inference failures and soft-deadline overruns retain the same JSON
+  shape, but set `status: "error"`, `fallback: true`, and a non-null `error_code`:
+  `invalid_image`, `invalid_depth`, `no_valid_depth`, `model_error`, or `timeout`.
+  Both distance fields then contain `fallback_distance_m` (default 3.0 m).
+  Consumers must inspect `status`/`fallback` before treating this as a measurement
+  or clear space; `near_obstacle` is still computed from that fallback distance.
+- `soft_timeout_s` (default 2.5 s) is a post-checked processing deadline, not GPU
+  preemption. A running inference is allowed to finish before its resources are
+  released. Download failures are surfaced through `info` as loading errors,
+  rather than being published as successful measurements.
+
+`stop` cancels a pending start or disposes the running instance. Model adapters
+may remain cached for a subsequent start; model-affecting configuration changes
+invalidate that cache. No ASR or driver audio interface changes are involved.
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |
@@ -2387,6 +2441,7 @@ other bundles in that file state.
 | Output (vop) | `{input_topic}/objects` | `data/json` |
 | Output (visual_depth map) | `{input_topic}/visual_depth` | `image/depth-zlib` |
 | Output (visual_depth summary) | `{input_topic}/visual_depth_summary` | `data/json` |
+| Output (obstacle distance) | `{input_topic}/obstacle` | `data/json` |
 
 The depth map is **640x480 uint16 millimetres, zlib level 1**, published as a
 `CompressedImage` with `format="16UC1; compressedDepth zlib"`. The size is not

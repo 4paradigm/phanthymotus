@@ -462,7 +462,7 @@ class ObstacleDistancePlugin:
                 if generation == self._load_generation:
                     self._load_status = text
 
-        progress_cb, _ = fetch_status(on_status, "yolo26s-depth")
+        progress_cb, _ = fetch_status(on_status, "obstacle-yolo26s")
         with self._state_lock:
             adapter = self._adapter if generation == self._load_generation else None
         if adapter is None:
