@@ -45,9 +45,55 @@ class ResolvedImage:
     platform: str  # "os/arch[/variant]"
     size: int
 
+    @property
+    def image_ref(self) -> str:
+        return f"{self.family}@{self.digest}"
+
 
 class RegistryError(Exception):
     pass
+
+
+def _extract_host(family: str) -> str:
+    """Extract the registry host from a registry repository reference."""
+    return family.split("/", 1)[0]
+
+
+def _host_matches_configured(host: str, configured_registry: str) -> bool:
+    """Check if the given host matches the configured REGISTRY authority (hostname:port).
+
+    Full canonical authority comparison:
+    - Both hostname and port must match exactly.
+    - Hostname is lowercased for canonical comparison.
+    - No port in configured means port 443 default; a target with explicit port never matches.
+    - No port in target means port 443 default; configured with port never matches target without.
+    """
+    if not configured_registry or not host:
+        return False
+
+    def _canonical(authority: str) -> tuple[str, str]:
+        """Return (hostname_lower, port_or_empty)."""
+        if authority.endswith("]:443"):
+            return authority[:-1].lower(), "443"  # [ipv6]:443
+        idx = authority.rfind(":")
+        if idx == -1:
+            return authority.lower(), ""
+        hostname = authority[:idx]
+        port = authority[idx + 1 :]
+        # Don't treat ipv6 without brackets as host:port
+        if hostname.count(":") > 0:
+            return authority.lower(), ""
+        return hostname.lower(), port
+
+    host_hostname, host_port = _canonical(host)
+    cfg_hostname, cfg_port = _canonical(configured_registry)
+
+    if host_hostname != cfg_hostname:
+        return False
+    # Port must match: empty means default 443, which only matches if cfg also has no port
+    if host_port != cfg_port:
+        return False
+    return True
 
 
 def parse_reference(ref: str) -> tuple[str, str]:
@@ -56,25 +102,43 @@ def parse_reference(ref: str) -> tuple[str, str]:
     - Digest references (``@sha256:...``) are rejected up front — the agent
       only accepts tags to pin to a digest itself.
     - ``latest`` and empty tags are rejected.
+    - Authority (host:port) is separated from repository path before tag parsing
+      so that a port colon does not collide with the tag colon.
     """
     if not isinstance(ref, str) or not ref:
         raise RegistryError("empty image reference")
     if "@" in ref:
         raise RegistryError("digest references are not accepted as input")
-    repo = ref
+
+    # ── Separate authority (host[:port]) from repository path ─────────────
+    parts = ref.split("/", 1)
+    authority = parts[0]
+    # Validate authority contains only legal host/port characters
+    if not re.fullmatch(r"[a-zA-Z0-9._-]+(?::[0-9]+)?", authority):
+        raise RegistryError(f"invalid authority {authority!r}")
+
+    if len(parts) == 1:
+        raise RegistryError(f"malformed reference {ref!r}")
+    rest = parts[1]  # repository path possibly ending with :tag
+
+    # ── Split tag from repository path (only on last colon not in path) ──
     tag = "latest"
-    if ":" in ref:
-        before, after = ref.rsplit(":", 1)
+    if ":" in rest:
+        before, after = rest.rsplit(":", 1)
         if "/" in after or not before:
             raise RegistryError(f"malformed reference {ref!r}")
-        repo, tag = before, after
+        repo_path, tag = before, after
+    else:
+        repo_path = rest
+
+    family = authority + "/" + repo_path
     if tag in ("", "latest"):
         raise RegistryError("latest/empty tag is not allowed")
     if not TAG_RE.fullmatch(tag):
         raise RegistryError(f"invalid tag {tag!r}")
-    if not REPO_RE.fullmatch(repo):
-        raise RegistryError(f"invalid repository {repo!r}")
-    return repo, tag
+    if not REPO_RE.fullmatch(repo_path):
+        raise RegistryError(f"invalid repository {repo_path!r}")
+    return family, tag
 
 
 class RegistryClient:
@@ -89,6 +153,7 @@ class RegistryClient:
                 pool=config.connect_timeout,
             ),
             follow_redirects=False,
+            trust_env=False,
         )
 
     async def resolve(
@@ -105,6 +170,13 @@ class RegistryClient:
         must match the repository portion of ``ref``.
         """
         allowed_prefixes = allowed_prefixes or []
+        # Reject foreign registry before making any HTTP requests
+        family_candidate = ref.split("/", 1)[0]
+        if not _host_matches_configured(family_candidate, self.config.registry):
+            raise RegistryError(
+                f"target authority {family_candidate!r} does not match "
+                f"configured registry {self.config.registry!r}"
+            )
         if "@" in ref:
             family, _, digest = ref.rpartition("@")
             if not family or not digest:
@@ -426,10 +498,31 @@ class RegistryClient:
         return "https", host, path
 
     def _auth_headers(self, family: str) -> dict[str, str]:
+        """Return Basic Authorization only when the target host matches configured REGISTRY.
+
+        Defense-in-depth: never send credentials to a host that isn't the
+        administratively configured REGISTRY.
+        """
+        target_host = _extract_host(family)
+        if not self.config.registry:
+            # No registry configured — anonymous by default
+            return {}
+        if not _host_matches_configured(target_host, self.config.registry):
+            raise RegistryError(
+                f"target authority {target_host!r} does not match "
+                f"configured registry {self.config.registry!r}"
+            )
         user = os.getenv("REGISTRY_USER", "")
         password = os.getenv("REGISTRY_PASSWORD", "")
-        if not user:
+        if not user and not password:
+            # Anonymous: both empty is OK (no auth headers needed)
             return {}
+        if not user or not password:
+            # Fail closed: both user and password must be set together
+            raise RegistryError(
+                "both REGISTRY_USER and REGISTRY_PASSWORD must be set together, "
+                "or both unset for anonymous access"
+            )
         token = base64.b64encode(f"{user}:{password}".encode()).decode()
         return {"Authorization": f"Basic {token}"}
 
@@ -450,13 +543,21 @@ class RegistryClient:
         if not _verify_bearer_realm(realm):
             raise RegistryError("registry Bearer realm is not a verified HTTPS URL")
         realm_host = up.urlparse(realm).hostname or ""
-        # The realm host must always be the manifest registry host or an
+        realm_port_val = up.urlparse(realm).port
+        realm_authority = (
+            f"{realm_host}:{realm_port_val}" if realm_host and realm_port_val else realm_host
+        )
+        # The realm authority must always be the manifest registry authority or an
         # explicitly allowlisted host — including for the anonymous Bearer flow.
         # This prevents a malicious registry challenge from steering the agent
         # into contacting an arbitrary host (SSRF) even when no credentials are
         # sent.
+        # target_authority is the manifest registry host (already validated vs
+        # configured REGISTRY above).  Build it WITHOUT appending realm_port,
+        # because `host` is already the complete authority (e.g. "registry:5000").
+        target_authority = host
         if not _realm_host_allowed(
-            realm_host, host, self.config.registry_auth_host_allowlist
+            realm_authority, target_authority, self.config.registry_auth_host_allowlist
         ):
             raise RegistryError(
                 f"registry Bearer realm host {realm_host!r} is not the "
@@ -465,7 +566,7 @@ class RegistryClient:
         user = os.getenv("REGISTRY_USER", "")
         password = os.getenv("REGISTRY_PASSWORD", "")
         headers = {}
-        if user:
+        if user and password:
             auth = base64.b64encode(f"{user}:{password}".encode()).decode()
             headers["Authorization"] = f"Basic {auth}"
         url = (
@@ -719,9 +820,42 @@ def _checked_manifest_digest(resp, content, body: bytes) -> None:
             "registry manifest body does not match its digest"
         )
 
+def _canonical_https_authority(authority: str) -> str:
+    """Canonicalize an HTTPS authority for Bearer realm comparison.
+
+    Returns a lowercase ``hostname:effective_port`` string so that
+    ``registry.example`` and ``registry.example:443`` compare equal,
+    while custom ports match only exactly.
+    """
+    if not authority:
+        return ""
+    # Handle IPv6 [addr]:port
+    if authority.startswith("["):
+        bracket_end = authority.rfind("]")
+        if bracket_end == -1:
+            return authority.lower()
+        hostname = authority[: bracket_end + 1]
+        port_part = authority[bracket_end + 1 :]
+        port = port_part.lstrip(":") or "443"
+        return f"{hostname.lower()}:{port}"
+    idx = authority.rfind(":")
+    if idx == -1:
+        # No port — HTTPS default is 443
+        return f"{authority.lower()}:443"
+    hostname = authority[:idx]
+    port = authority[idx + 1 :]
+    # Don't treat ipv6 without brackets as host:port
+    if hostname.count(":") > 0:
+        return authority.lower()
+    if not port:
+        return f"{hostname.lower()}:443"
+    return f"{hostname.lower()}:{port}"
+
+
 def _realm_host_allowed(realm_host: str, registry_host: str, allowlist: list[str]) -> bool:
-    """True only when the Bearer realm host equals the manifest registry host or
-    is in the explicit REGISTRY_AUTH_HOST_ALLOWLIST."""
-    if realm_host == registry_host:
+    """True only when the Bearer realm authority equals the manifest registry
+    authority (canonicalized for HTTPS) or is in the explicit
+    REGISTRY_AUTH_HOST_ALLOWLIST."""
+    if _canonical_https_authority(realm_host) == _canonical_https_authority(registry_host):
         return True
     return realm_host in (allowlist or [])

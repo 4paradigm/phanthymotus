@@ -8,6 +8,7 @@ No obsolete lifecycle states, no build_index, no dpl_x.
 from __future__ import annotations
 
 import datetime as _dt
+import urllib.parse
 from zoneinfo import ZoneInfo
 
 from .models import BuildInfo
@@ -62,6 +63,18 @@ def _escape(text: str) -> str:
     return (text or "").replace("`", "").replace("\r", " ").replace("\n", " ")[:500]
 
 
+def build_evidence_download_url(
+    public_base_url: str,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+) -> str:
+    query = urllib.parse.urlencode({"repo": repo, "pr": pr_number, "head": head_sha})
+    return f"{public_base_url.rstrip('/')}/evidence/download?{query}"
+
+
+
+
 def _build_table(builds: list[BuildInfo]) -> str:
     """Render the build results table for deploy-ready comment."""
     lines = [
@@ -84,12 +97,14 @@ def _cos_evidence_block(
     object_key: str = "",
     sha256: str = "",
     size: int = 0,
-
+    download_url: str = "",
 ) -> list[str]:
     """Render the COS evidence block. Returns empty list if no evidence."""
     if not object_key:
         return []
     lines = [""]
+    if download_url:
+        lines.append(f"[Download COS evidence]({_escape(download_url)})")
     text = f"COS: `{_escape(object_key)}`"
     if sha256:
         text += f" · `@sha256:{_escape(sha256[:12])}`"
@@ -210,7 +225,7 @@ def deploy_requested(
         "",
     ] + comp_lines + [
         "",
-        "### Compatible machines",
+        "### Full-coverage machines",
         "",
     ]
     for mg in machine_groups:
@@ -240,6 +255,7 @@ def failed_comment(
     cos_object_key: str = "",
     cos_bundle_sha256: str = "",
     cos_bundle_size: int = 0,
+    cos_download_url: str = "",
 
 ) -> str:
     lines = [
@@ -254,7 +270,7 @@ def failed_comment(
     ]
     if error:
         lines.append(f"**Error:** {_escape(error)}")
-    lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size))
+    lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
     lines.append(last_checked_line())
     return "\n".join(lines)
 
@@ -293,6 +309,7 @@ def succeeded_comment(
     cos_object_key: str = "",
     cos_bundle_sha256: str = "",
     cos_bundle_size: int = 0,
+    cos_download_url: str = "",
 
 ) -> str:
     lines = [
@@ -305,7 +322,7 @@ def succeeded_comment(
         "",
         "Testing passed. The deployment is accepted.",
     ]
-    lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size))
+    lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
     lines.append(last_checked_line())
     return "\n".join(lines)
 
@@ -378,6 +395,86 @@ def approve_deploy_occupied_comment(
         f"`/approve_deploy machine={machine_alias}`",
         "",
         "Re-read `running_image` on the next NEW approve.",
+        "Controller does not perform stop/remove/cleanup.",
+        "",
+        last_checked_line(),
+    ])
+    return "\n".join(lines)
+
+
+def approve_deploy_revoked_comment(
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    machine_alias: str,
+) -> str:
+    lines = [
+        BOT_MARKER,
+        lifecycle_marker(repo, pr_number),
+        "### Deploy Approval \u2014 Lifecycle",
+        "",
+        "**Status:** `deploy-requested`",
+        f"**Bound HEAD:** `{_short(head_sha)}`",
+        "",
+        "The approval command changed, was removed, or could not be revalidated "
+        "before deployment.",
+        "ZERO deployment was performed.",
+        "",
+        "Machine Owner must send a NEW:",
+        "",
+        f"`/approve_deploy machine={machine_alias}`",
+        "",
+        last_checked_line(),
+    ]
+    return "\n".join(lines)
+
+
+def approve_deploy_no_coverage_comment(
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    machine_alias: str,
+    components: list[dict],
+    all_component_ids: set,
+    covered_ids: set,
+    full_coverage_machines: list[dict],
+) -> str:
+    lines = [
+        BOT_MARKER,
+        lifecycle_marker(repo, pr_number),
+        "### Deploy Approval — Lifecycle",
+        "",
+        "**Status:** `deploy-requested`",
+        f"**Bound HEAD:** `{_short(head_sha)}`",
+        "",
+        f"Selected machine `{_escape(machine_alias)}` does not cover all required components.",
+        "ZERO deployment was performed.",
+        "",
+        "### Components to deploy",
+        "",
+    ]
+    for c in components:
+        target = _escape(str(c.get("target", "")))
+        cid = c.get("component_id", "")
+        covered = cid in covered_ids
+        prefix = "- " if covered else "- (not covered) "
+        lines.append(f"{prefix} {target} ({cid})")
+    lines.extend([
+        "",
+        "### Full-coverage compatible machines",
+        "",
+    ])
+    if full_coverage_machines:
+        for m in full_coverage_machines:
+            lines.append(f"- `{_escape(m['alias'])}`")
+    else:
+        lines.append("No single configured machine covers all required components.")
+        lines.append("Machine policy must be updated by the operator.")
+    lines.extend([
+        "",
+        "**Next action — Machine Owner**",
+        "",
+        "`/approve_deploy machine=<full-coverage-alias>`",
         "",
         last_checked_line(),
     ])

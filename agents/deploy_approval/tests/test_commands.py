@@ -146,3 +146,83 @@ class TestCommandStartsLine:
         assert command_starts_line_any("/deploy_help")
         assert not command_starts_line_any("")
         assert not command_starts_line_any("not a command")
+
+
+class TestIterTopLevelCommandLines:
+    def test_normal_command(self):
+        from ..commands import _iter_top_level_command_lines
+        lines = _iter_top_level_command_lines("/request_deploy")
+        assert lines == ["/request_deploy"]
+
+    def test_backtick_fence(self):
+        from ..commands import _iter_top_level_command_lines
+        text = '```python\n/request_deploy\n```\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_tilde_fence(self):
+        from ..commands import _iter_top_level_command_lines
+        text = '~~~\n/request_deploy\n~~~\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_mixed_fence_regression(self):
+        from ..commands import _iter_top_level_command_lines
+        # Backtick fence opened, then tilde fence appears — tilde must NOT close backtick
+        text = '```\n/request_deploy\n~~~\n/request_deploy\n```\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_multiline_html_comment(self):
+        from ..commands import _iter_top_level_command_lines
+        text = '<!--\n/request_deploy\n-->\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_single_line_html_comment_with_command(self):
+        from ..commands import _iter_top_level_command_lines
+        text = '<!-- /request_deploy -->\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_indented_fence_cannot_execute_approve(self):
+        from ..commands import _iter_top_level_command_lines
+        # Indented fence (3 spaces) — fence detected but command inside is NOT column-0
+        text = '   ```text\n/approve_deploy machine=test\n```\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_indented_html_comment_cannot_execute_approve(self):
+        from ..commands import _iter_top_level_command_lines
+        # Indented HTML comment (3 spaces) — command inside must not be yielded
+        text = '   <!--\n/approve_deploy machine=test\n-->\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_fence_with_trailing_text_does_not_close_and_execute(self):
+        from ..commands import _iter_top_level_command_lines
+        # Closing fence with trailing text (not space/tab/EOL) should NOT close fence
+        text = '```\n/approve_deploy machine=test\n```not-a-close\n/request_deploy\n```\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_html_comment_nested_opener_does_not_toggle(self):
+        from ..commands import _iter_top_level_command_lines
+        # Nested <!-- inside an open HTML comment must NOT toggle state back to False
+        text = '<!--\n/request_deploy\n<!-- nested comment -->\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == []  # Both commands hidden — '<!-- ... -->' has close>open, doesn't close multiline
+
+    def test_html_comment_nested_opener_stays_inside_comment(self):
+        from ..commands import _iter_top_level_command_lines
+        # Multiple nested <!-- should all be treated as content
+        text = '<!-- start\n<!-- middle\n<!-- deep\n-->\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == ["/request_deploy"]
+
+    def test_html_comment_nested_opener_keeps_command_hidden(self):
+        from ..commands import _iter_top_level_command_lines
+        # Command after nested <!-- that doesn't close should remain hidden
+        text = '<!--\n<!-- no close yet\n/request_deploy'
+        lines = _iter_top_level_command_lines(text)
+        assert lines == []

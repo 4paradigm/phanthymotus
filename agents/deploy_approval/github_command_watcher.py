@@ -124,19 +124,28 @@ class GitHubCommandWatcher:
         # Filter new comments, sort ascending
         new_comments = [
             c for c in comments
-            if isinstance(c.get("id"), int) and c["id"] > cursor
+            if isinstance(c.get("id"), int) and not isinstance(c.get("id"), bool) and c["id"] > cursor
         ]
         new_comments.sort(key=lambda c: c["id"])
 
         for c in new_comments:
-            body = c.get("body", "")
-            if not isinstance(body, str) or not body.strip():
-                continue
-
             comment_id = c["id"]
 
-            # Skip bot's own lifecycle comments
-            if self.proxy.is_bot_comment(c):
+            # Skip bot's own lifecycle comments — fresh-read body to avoid stale-body TOCTOU
+            try:
+                fresh_comment_obj = await self.proxy.get_comment(repo, comment_id)
+            except Exception as e:
+                logger.warning(
+                    "watcher fresh-read comment %s#%s #%s: %s — skip this cycle",
+                    repo, pr_number, comment_id, e,
+                )
+                return
+
+            if fresh_comment_obj is None:
+                # Comment was deleted between list and get — skip this cycle
+                return
+
+            if self.proxy.is_bot_comment(fresh_comment_obj):
                 # Use cursor-only persistence to preserve lifecycle markdown
                 if state.get("head_sha"):
                     state = await self.proxy.persist_cursor(
@@ -144,7 +153,24 @@ class GitHubCommandWatcher:
                     ) or state
                 continue
 
-            if not commands_mod.command_starts_line_any(body):
+            # Validate fresh comment ID matches candidate
+            fresh_id = fresh_comment_obj.get("id")
+            if not isinstance(fresh_id, int) or isinstance(fresh_id, bool) or fresh_id != comment_id:
+                logger.warning(
+                    "watcher fresh comment id %s (type=%s) != candidate %s — skip this cycle",
+                    fresh_id, type(fresh_id).__name__, comment_id,
+                )
+                return
+
+            fresh_body = fresh_comment_obj.get("body", "")
+            if not isinstance(fresh_body, str) or not fresh_body.strip():
+                if state.get("head_sha"):
+                    state = await self.proxy.persist_cursor(
+                        repo, pr_number, comment_id,
+                    ) or state
+                continue
+
+            if not commands_mod.command_starts_line_any(fresh_body):
                 # Non-command comment — use cursor-only persistence
                 if state.get("head_sha"):
                     state = await self.proxy.persist_cursor(
@@ -152,7 +178,7 @@ class GitHubCommandWatcher:
                     ) or state
                 continue
 
-            cmd = commands_mod.parse_command(body)
+            cmd = commands_mod.parse_command(fresh_body)
             if not cmd.is_command:
                 if state.get("head_sha"):
                     state = await self.proxy.persist_cursor(

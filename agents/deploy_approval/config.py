@@ -3,13 +3,18 @@
 Deploy Approval does not define a new runtime env namespace. It reuses the
 existing upstream GitHub/poll/webhook/registry keys and fixed read-only files
 for machine ownership and COS secrets.
+
+Review Agent HTTP API is NOT a Deploy Approval dependency.
+Deploy Approval reads Review Agent output from GitHub PR comments.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import os
 import ipaddress
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,7 +28,11 @@ DEFAULT_GITHUB_REPOS = (
     "4paradigm/phanthymotus-driver",
 )
 
-SUPPORTED_GITHUB_REPOS = frozenset(DEFAULT_GITHUB_REPOS)
+FORK_TEST_GITHUB_REPOS = (
+    "Haohao-end/phanthymotus",
+)
+
+SUPPORTED_GITHUB_REPOS = frozenset(DEFAULT_GITHUB_REPOS + FORK_TEST_GITHUB_REPOS)
 
 
 @dataclass
@@ -31,7 +40,6 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 25001
 
-    github_token: str = ""
     github_api_url: str = "https://api.github.com"
     github_webhook_secret: str = ""
     webhook_enabled: bool = False
@@ -40,12 +48,17 @@ class Config:
     github_repos: list[str] = field(
         default_factory=lambda: list(DEFAULT_GITHUB_REPOS)
     )
+    deploy_approval_public_base_url: str = ""
+    github_oauth_client_id: str = ""
+    github_oauth_client_secret: str = field(default="", repr=False)
+    fork_test_mode: bool = False
     github_comment_max_pages: int = 20
     github_comment_max_comments: int = 500
     github_comment_max_bytes: int = 4 * 1024 * 1024
 
-    review_agent_base_url: str = "http://host.docker.internal:25000"
-    review_agent_api_token: str = ""
+    # Review comment trust configuration
+    review_comment_author_id: str = ""
+    review_comment_author_login: str = ""
 
     # Machine owners configuration
     machine_owners_file: str = "/run/deploy-approval/machines.yaml"
@@ -58,17 +71,15 @@ class Config:
     connect_timeout: float = 10.0
     read_timeout: float = 30.0
     total_timeout: float = 60.0
-    health_poll_interval_seconds: float = 5.0
-    health_timeout_seconds: float = 300.0
 
     # COS evidence storage
     cos_region: str = ""
     cos_bucket: str = ""
     cos_secret_id: str = ""
     cos_secret_key: str = ""
-    cos_session_token: str = ""
-    cos_prefix: str = "deploy-approval"
-    cos_signed_url_ttl_seconds: int = 604800
+
+    # Registry trust anchor — the ONLY allowed registry host for image resolution.
+    registry: str = ""
 
     registry_auth_host_allowlist: list[str] = field(default_factory=list)
 
@@ -170,7 +181,7 @@ def _load_secrets_config(path: str) -> dict:
         cos = {}
     if not isinstance(cos, dict):
         raise ValueError("secrets.yaml cos section must be a mapping")
-    result = {"cos": {}}
+    result = {"cos": {}, "github_oauth": {}, "review_comment_trust": {}}
 
     def _coerce_string(key: str, *, required: bool = False, allow_empty: bool = True) -> str:
         if key not in cos:
@@ -184,23 +195,36 @@ def _load_secrets_config(path: str) -> dict:
             raise ValueError(f"secrets.yaml cos.{key} must be a non-empty string")
         return value
 
-    for key in ("region", "bucket", "secret_id", "secret_key", "session_token"):
+    for key in ("region", "bucket", "secret_id", "secret_key"):
         result["cos"][key] = _coerce_string(key)
-    result["cos"]["prefix"] = _coerce_string("prefix", allow_empty=False) or "deploy-approval"
-    ttl = cos.get("signed_url_ttl_seconds", 604800)
-    if isinstance(ttl, bool) or not isinstance(ttl, int):
-        raise ValueError("secrets.yaml cos.signed_url_ttl_seconds must be an integer")
-    if ttl < 1 or ttl > 604800:
-        raise ValueError("secrets.yaml cos.signed_url_ttl_seconds must be 1..604800")
-    result["cos"]["signed_url_ttl_seconds"] = ttl
+    oauth = data.get("github_oauth", {})
+    if not isinstance(oauth, dict):
+        raise ValueError("secrets.yaml github_oauth section must be a mapping")
+    for key in ("client_id", "client_secret"):
+        value = oauth.get(key, "")
+        if not isinstance(value, str):
+            raise ValueError(f"secrets.yaml github_oauth.{key} must be a string")
+        result["github_oauth"][key] = value
+    # Review comment trust config
+    rct = data.get("review_comment_trust", {})
+    if rct is None:
+        rct = {}
+    if not isinstance(rct, dict):
+        raise ValueError("secrets.yaml review_comment_trust section must be a mapping")
+    for key in ("author_id", "author_login"):
+        value = rct.get(key, "")
+        if not isinstance(value, str):
+            raise ValueError(f"secrets.yaml review_comment_trust.{key} must be a string")
+        result["review_comment_trust"][key] = value
     return result
 
 
 def load_config() -> Config:
     secrets = _load_secrets_config("/run/deploy-approval/secrets.yaml")
     cos = secrets.get("cos", {})
+    github_oauth = secrets.get("github_oauth", {})
+    review_trust = secrets.get("review_comment_trust", {})
     cfg = Config(
-        github_token=os.getenv("GITHUB_TOKEN", ""),
         github_api_url="https://api.github.com",
         github_webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
         webhook_enabled=_env_bool("WEBHOOK_ENABLED", False),
@@ -210,8 +234,12 @@ def load_config() -> Config:
             DEFAULT_GITHUB_REPOS if os.getenv("GITHUB_REPOS") is None
             else _env_str_list("GITHUB_REPOS")
         ),
-        review_agent_base_url="http://host.docker.internal:25000",
-        review_agent_api_token="",
+        fork_test_mode=_env_bool("DEPLOY_APPROVAL_FORK_TEST_MODE", False),
+        deploy_approval_public_base_url=os.getenv("DEPLOY_APPROVAL_PUBLIC_BASE_URL", "").strip(),
+        github_oauth_client_id=github_oauth.get("client_id", ""),
+        github_oauth_client_secret=github_oauth.get("client_secret", ""),
+        review_comment_author_id=review_trust.get("author_id", ""),
+        review_comment_author_login=review_trust.get("author_login", ""),
         machine_owners_file="/run/deploy-approval/machines.yaml",
         secrets_file="/run/deploy-approval/secrets.yaml",
         allow_private_http=False,
@@ -219,15 +247,11 @@ def load_config() -> Config:
         connect_timeout=10.0,
         read_timeout=30.0,
         total_timeout=60.0,
-        health_poll_interval_seconds=5.0,
-        health_timeout_seconds=300.0,
         cos_region=cos.get("region", ""),
         cos_bucket=cos.get("bucket", ""),
         cos_secret_id=cos.get("secret_id", ""),
         cos_secret_key=cos.get("secret_key", ""),
-        cos_session_token=cos.get("session_token", ""),
-        cos_prefix=cos.get("prefix", "deploy-approval"),
-        cos_signed_url_ttl_seconds=cos.get("signed_url_ttl_seconds", 604800),
+        registry=os.getenv("REGISTRY", "").strip(),
         registry_auth_host_allowlist=[],
     )
     validate_config(cfg)
@@ -235,8 +259,22 @@ def load_config() -> Config:
 
 
 def validate_config(cfg: Config) -> None:
-    if not cfg.github_token:
-        raise ValueError("GITHUB_TOKEN is required")
+    if not isinstance(cfg.deploy_approval_public_base_url, str):
+        raise ValueError("DEPLOY_APPROVAL_PUBLIC_BASE_URL must be a string")
+    parsed_public_url = urllib.parse.urlsplit(cfg.deploy_approval_public_base_url)
+    if (
+        not cfg.deploy_approval_public_base_url
+        or parsed_public_url.scheme != "https"
+        or not parsed_public_url.netloc
+        or parsed_public_url.username is not None
+        or parsed_public_url.password is not None
+        or parsed_public_url.query
+        or parsed_public_url.fragment
+    ):
+        raise ValueError("DEPLOY_APPROVAL_PUBLIC_BASE_URL must be an absolute HTTPS URL without query or fragment")
+    cfg.deploy_approval_public_base_url = cfg.deploy_approval_public_base_url.rstrip("/")
+    if not cfg.github_oauth_client_id.strip() or not cfg.github_oauth_client_secret.strip():
+        raise ValueError("secrets.yaml github_oauth client_id and client_secret are required")
     if not isinstance(cfg.github_repos, list):
         raise ValueError("GITHUB_REPOS must be a list")
     if not cfg.github_repos:
@@ -248,11 +286,27 @@ def validate_config(cfg: Config) -> None:
     for r in cfg.github_repos:
         if not isinstance(r, str):
             raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
-    required_repos = set(DEFAULT_GITHUB_REPOS)
-    if len(cfg.github_repos) != len(DEFAULT_GITHUB_REPOS) or set(cfg.github_repos) != required_repos:
+    # Mutually exclusive mode validation
+    _modes_active = int(cfg.fork_test_mode)
+    if _modes_active > 1:
+        raise ValueError(
+            "DEPLOY_APPROVAL_FORK_TEST_MODE "
+            "Deploy Approval fork test mode is the only test mode"
+        )
+
+    required_repos = (
+        set(FORK_TEST_GITHUB_REPOS)
+        if cfg.fork_test_mode
+        else set(DEFAULT_GITHUB_REPOS)
+    )
+    if cfg.fork_test_mode:
+        expected_repos = FORK_TEST_GITHUB_REPOS
+    else:
+        expected_repos = DEFAULT_GITHUB_REPOS
+    if len(cfg.github_repos) != len(expected_repos) or set(cfg.github_repos) != required_repos:
         raise ValueError(
             "GITHUB_REPOS must contain exactly: "
-            + ", ".join(DEFAULT_GITHUB_REPOS)
+            + ", ".join(expected_repos)
         )
     if cfg.webhook_enabled and not cfg.github_webhook_secret:
         raise ValueError(
@@ -283,17 +337,50 @@ def validate_config(cfg: Config) -> None:
         if not isinstance(r, str):
             raise ValueError(f"HTTP_ALLOWED_CIDRS member must be a string, got {r!r}")
     for name in (
-        "host", "review_agent_base_url", "machine_owners_file", "secrets_file",
-        "github_api_url", "review_agent_api_token",
+        "host", "machine_owners_file", "secrets_file",
+        "github_api_url",
         "cos_region", "cos_bucket", "cos_secret_id", "cos_secret_key",
-        "cos_session_token", "cos_prefix",
+        "review_comment_author_id", "review_comment_author_login",
     ):
         val = getattr(cfg, name)
         if not isinstance(val, str):
             raise ValueError(f"{name} must be a string")
     if not isinstance(cfg.registry_auth_host_allowlist, list):
         raise ValueError("REGISTRY_AUTH_HOST_ALLOWLIST must be a list")
-    if cfg.cos_signed_url_ttl_seconds <= 0 or cfg.cos_signed_url_ttl_seconds > 604800:
+    # Registry trust anchor validation
+    registry = cfg.registry
+    if not registry:
+        raise ValueError("REGISTRY is required — production Deploy Approval must configure REGISTRY")
+    # Must not contain scheme
+    if registry.startswith("https://") or registry.startswith("http://"):
+        raise ValueError(f"REGISTRY must not include scheme, got {registry!r}")
+    # Must not contain whitespace
+    if any(c.isspace() for c in registry):
+        raise ValueError(f"REGISTRY must not contain whitespace, got {registry!r}")
+    # Must not contain userinfo
+    if "@" in registry:
+        raise ValueError(f"REGISTRY must not contain userinfo, got {registry!r}")
+    # Must not contain path
+    if "/" in registry:
+        raise ValueError(f"REGISTRY must not contain path, got {registry!r}")
+    # Must not contain query or fragment
+    if "?" in registry or "#" in registry:
+        raise ValueError(f"REGISTRY must not contain query/fragment, got {registry!r}")
+    # Must have a valid host part (before any port)
+    host_part = registry.split(":")[0]
+    if not host_part:
+        raise ValueError(f"REGISTRY host must not be empty, got {registry!r}")
+    # Review comment trust: author_id is required
+    if not cfg.review_comment_author_id.strip():
         raise ValueError(
-            f"COS_SIGNED_URL_TTL_SECONDS must be 1..604800, got {cfg.cos_signed_url_ttl_seconds}"
+            "secrets.yaml review_comment_trust.author_id is required"
+        )
+    # Validate author_id is a positive integer
+    try:
+        aid = int(cfg.review_comment_author_id)
+        if aid <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValueError(
+            "secrets.yaml review_comment_trust.author_id must be a positive integer"
         )

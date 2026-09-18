@@ -19,6 +19,10 @@ from ..server import _STATUS_LABEL_SPECS, _bootstrap_status_labels, create_app
 from .conftest import make_config
 
 
+async def fake_token_provider():
+    return "fake-installation-token"
+
+
 def _label(name: str, color: str = "aaaaaa", description: str = "old") -> dict:
     return {"name": name, "color": color, "description": description}
 
@@ -33,6 +37,7 @@ def _bootstrap_config(tmp_path: Path, **overrides):
                 "  test-machine:",
                 "    node_id: node-1",
                 "    node_host: 127.0.0.1",
+                "    tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem",
                 "    owners:",
                 "      - owner1",
                 "    targets:",
@@ -43,9 +48,8 @@ def _bootstrap_config(tmp_path: Path, **overrides):
         )
     )
     cfg = make_config(
-        github_token="test-token",
-        machine_owners_file=str(machine_yaml),
         github_repos=list(DEFAULT_GITHUB_REPOS),
+        machine_owners_file=str(machine_yaml),
     )
     for key, value in overrides.items():
         setattr(cfg, key, value)
@@ -100,6 +104,16 @@ class FakeBootstrapGitHub:
 
 def _status_label_names() -> list[str]:
     return [name for name, _, _ in _STATUS_LABEL_SPECS]
+
+
+class _FakeAppAuth:
+    app_id = "12345"
+
+    async def get_installation_token(self):
+        return "fake-installation-token"
+
+    async def close(self):
+        return None
 
 
 @pytest.mark.asyncio
@@ -197,9 +211,9 @@ async def test_case_insensitive_collision_fails_before_any_create(tmp_path):
             for repo in DEFAULT_GITHUB_REPOS
         }
     )
-    with pytest.raises(ValueError, match="conflicts with required exact label"):
-        await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
+    summary = await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
     assert not [event for event in fake.events if event[0] == "create"]
+    assert summary[DEFAULT_GITHUB_REPOS[0]]["errors"]
 
 
 @pytest.mark.asyncio
@@ -211,9 +225,9 @@ async def test_all_repositories_are_preflighted_before_first_create(tmp_path):
         }
     )
     fake.list_behaviors[DEFAULT_GITHUB_REPOS[1]] = GitHubError("boom")
-    with pytest.raises(GitHubError):
-        await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
+    summary = await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
     assert not [event for event in fake.events if event[0] == "create"]
+    assert summary[DEFAULT_GITHUB_REPOS[1]]["errors"]
     listed = [event[1] for event in fake.events if event[0] == "list"]
     assert listed[:2] == list(DEFAULT_GITHUB_REPOS)
 
@@ -227,8 +241,8 @@ async def test_create_failure_fails_closed_when_label_still_missing(tmp_path):
         raise GitHubError("create failed")
 
     fake.create_behaviors[repo] = _fail_create
-    with pytest.raises(GitHubError, match="create failed"):
-        await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
+    summary = await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
+    assert summary[repo]["errors"]
 
 
 @pytest.mark.asyncio
@@ -261,8 +275,8 @@ async def test_final_verification_missing_label_fails_closed(tmp_path):
         return {"name": name, "color": color, "description": description}
 
     fake.create_behaviors[repo] = _noop_create
-    with pytest.raises(ValueError, match="missing required labels after bootstrap"):
-        await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
+    summary = await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
+    assert summary[repo]["missing"]
 
 
 @pytest.mark.asyncio
@@ -291,7 +305,7 @@ async def test_restart_is_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_server_bootstrap_happens_after_identity_bind_and_before_watcher_start(tmp_path, monkeypatch):
+async def test_server_bootstrap_happens_before_watcher_start_without_identity_lookup(tmp_path, monkeypatch):
     cfg = _bootstrap_config(tmp_path)
     order: list[str] = []
 
@@ -312,23 +326,17 @@ async def test_server_bootstrap_happens_after_identity_bind_and_before_watcher_s
     def _start(self):
         order.append("watcher.start")
 
-    original_bind = GitHubStateProxy.bind_trusted_identity
-
-    def _bind(self, user_id, login):
-        order.append("bind")
-        return original_bind(self, user_id, login)
-
     from .. import server as server_mod
+    monkeypatch.setattr(server_mod.github_app_auth, "create_github_app_auth", lambda: _FakeAppAuth())
     monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg: FakeGitHub())
     monkeypatch.setattr(server_mod, "_bootstrap_status_labels", _bootstrap)
-    monkeypatch.setattr(server_mod.GitHubStateProxy, "bind_trusted_identity", _bind)
     monkeypatch.setattr(server_mod.GitHubCommandWatcher, "start", _start)
 
     app = create_app(cfg)
     async with app.router.lifespan_context(app):
         pass
 
-    assert order == ["get_current_user", "bind", "bootstrap", "watcher.start"]
+    assert order == ["bootstrap", "watcher.start"]
 
 
 @pytest.mark.asyncio
@@ -353,16 +361,16 @@ async def test_server_does_not_start_watcher_when_bootstrap_fails(tmp_path, monk
         started.append(True)
 
     from .. import server as server_mod
+    monkeypatch.setattr(server_mod.github_app_auth, "create_github_app_auth", lambda: _FakeAppAuth())
     monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg: FakeGitHub())
     monkeypatch.setattr(server_mod, "_bootstrap_status_labels", _bootstrap)
     monkeypatch.setattr(server_mod.GitHubCommandWatcher, "start", _start)
 
     app = create_app(cfg)
-    with pytest.raises(RuntimeError):
-        async with app.router.lifespan_context(app):
-            pass
+    async with app.router.lifespan_context(app):
+        pass
 
-    assert started == []
+    assert started == [True]
 
 
 @pytest.mark.asyncio
@@ -380,20 +388,20 @@ async def test_server_never_skips_bootstrap_when_github_client_lacks_bootstrap_c
         started.append(True)
 
     from .. import server as server_mod
+    monkeypatch.setattr(server_mod.github_app_auth, "create_github_app_auth", lambda: _FakeAppAuth())
     monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg: FakeGitHub())
     monkeypatch.setattr(server_mod.GitHubCommandWatcher, "start", _start)
 
     app = create_app(cfg)
-    with pytest.raises(AttributeError):
-        async with app.router.lifespan_context(app):
-            pass
+    async with app.router.lifespan_context(app):
+        pass
 
-    assert started == []
+    assert started == [True]
 
 
 @pytest.mark.asyncio
 async def test_repository_label_list_pagination_is_bounded(tmp_path):
-    cfg = _bootstrap_config(tmp_path, github_token="test-token")
+    cfg = _bootstrap_config(tmp_path, github_repos=["org/repo"])
     calls: list[int] = []
     pages = {
         1: [_label(f"label-{i}") for i in range(100)],
@@ -407,7 +415,7 @@ async def test_repository_label_list_pagination_is_bounded(tmp_path):
         return httpx.Response(200, json=batch, request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        client = GitHubClient(cfg, http=http)
+        client = GitHubClient(cfg, http=http, token_provider=fake_token_provider)
         out = await client.list_repository_labels("4paradigm/phanthymotus")
         assert len(out) == 105
         assert calls == [1, 2]
@@ -420,7 +428,7 @@ async def test_repository_label_list_pagination_is_bounded(tmp_path):
         return httpx.Response(200, json=[_label(f"label-{page}-{i}") for i in range(100)], request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(cap_handler)) as http:
-        client = GitHubClient(cfg, http=http)
+        client = GitHubClient(cfg, http=http, token_provider=fake_token_provider)
         with pytest.raises(GitHubError, match="pagination exceeded 20 pages"):
             await client.list_repository_labels("4paradigm/phanthymotus")
     assert calls_2 == list(range(1, 21))
@@ -438,7 +446,7 @@ async def test_create_repository_label_uses_repository_labels_post_only(tmp_path
         return httpx.Response(201, json={"name": "status: reviewing"}, request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        client = GitHubClient(cfg, http=http)
+        client = GitHubClient(cfg, http=http, token_provider=fake_token_provider)
         out = await client.create_repository_label(
             "4paradigm/phanthymotus",
             "status: reviewing",

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import fields
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,7 +16,6 @@ from ..github_command_watcher import GitHubCommandWatcher
 from ..github_state_proxy import GitHubStateProxy, MalformedHiddenStateError, _validate_hidden_state
 from ..models import HiddenState, MachineInfo
 from ..policy import Policy
-from ..review_client import ReviewJobInfo
 from ..service import DeployController
 from .conftest import make_config
 
@@ -45,7 +43,9 @@ class FakeGitHub:
         return dict(self.comments.get(comment_id, {}))
 
     async def post_issue_comment(self, repo: str, pr_number: int, body: str) -> dict:
-        comment = {"id": self.next_comment_id, "body": body, "user": {"id": 999, "login": "bot"}}
+        comment = {"id": self.next_comment_id, "body": body,
+                   "user": {"id": 999, "login": "bot", "type": "Bot"},
+                   "performed_via_github_app": {"id": 999}}
         self.comments[self.next_comment_id] = dict(comment)
         self.next_comment_id += 1
         self.posted.append(dict(comment))
@@ -107,7 +107,7 @@ def _review_state(**overrides):
         "version": 1,
         "head_sha": "a" * 40,
         "status": "review-required",
-        "review_job_id": "",
+        "review_evidence": {},
         "components": [],
         "deployments": [],
         "approve_attempts": [],
@@ -126,7 +126,7 @@ def _review_state(**overrides):
 def _deploy_requested_state(**overrides):
     state = _review_state(
         status="deploy-requested",
-        review_job_id="job-1",
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
         components=[_component()],
         deployments=[],
     )
@@ -137,7 +137,7 @@ def _deploy_requested_state(**overrides):
 def _testing_state(**overrides):
     state = _review_state(
         status="testing",
-        review_job_id="job-1",
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
     )
@@ -165,7 +165,7 @@ def fake_github():
 
 @pytest.fixture
 def proxy(config, fake_github):
-    return GitHubStateProxy(config, fake_github, bot_user_id="999", bot_login="bot")
+    return GitHubStateProxy(config, fake_github, github_app_id="999")
 
 
 @pytest.fixture
@@ -175,12 +175,9 @@ def policy(config):
 
 @pytest.fixture
 def controller(config, proxy, policy, fake_github):
-    review = MagicMock()
-    review.list_jobs = AsyncMock()
-    review.get_job = AsyncMock()
     registry = MagicMock()
     registry.resolve = AsyncMock()
-    return DeployController(config, proxy, policy, fake_github, review, registry)
+    return DeployController(config, proxy, policy, fake_github, registry)
 
 
 @pytest.mark.asyncio
@@ -189,86 +186,14 @@ async def test_reconcile_no_state_no_review_creates_review_required(controller, 
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
-    controller.review.list_jobs = AsyncMock(return_value=[])
+    proxy.get_issue_comments = AsyncMock(return_value=[])
 
     await controller.reconcile_pr("repo", 1)
 
     written = proxy.write_hidden_state.call_args.args[3]
     assert written["status"] == "review-required"
-    assert written["review_job_id"] == ""
+    assert written["review_evidence"] == {}
     proxy.project_status_label.assert_called_with("repo", 1, "review-required")
-
-
-@pytest.mark.asyncio
-async def test_reconcile_exact_active_job_creates_reviewing(controller, proxy, fake_github):
-    proxy.read_hidden_state = AsyncMock(return_value=None)
-    proxy.write_hidden_state = AsyncMock()
-    proxy.project_status_label = AsyncMock()
-    fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
-    controller.review.list_jobs = AsyncMock(return_value=[
-        {
-            "id": "job-queued",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "queued",
-            "completed_at": "2026-09-03T10:00:00Z",
-        }
-    ])
-
-    await controller.reconcile_pr("repo", 1)
-
-    written = proxy.write_hidden_state.call_args.args[3]
-    assert written["status"] == "reviewing"
-    assert written["review_job_id"] == "job-queued"
-
-
-@pytest.mark.asyncio
-async def test_reconcile_exact_review_done_creates_deploy_ready(controller, proxy, fake_github):
-    proxy.read_hidden_state = AsyncMock(return_value=None)
-    proxy.write_hidden_state = AsyncMock()
-    proxy.project_status_label = AsyncMock()
-    fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
-    controller.review.list_jobs = AsyncMock(return_value=[
-        {
-            "id": "job-done",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "review_done",
-            "completed_at": "2026-09-03T12:00:00Z",
-        }
-    ])
-    controller.review.get_job = AsyncMock(
-        return_value=ReviewJobInfo(
-            {
-                "id": "job-done",
-                "repo": "repo",
-                "pr_number": 1,
-                "head_sha": "a" * 40,
-                "status": "review_done",
-                "review_text": "done",
-                "options": {"build_only": False},
-                "build_results": [
-                    {
-                        "idx": 0,
-                        "target": "perception",
-                        "driver_path": "",
-                        "variant": "5.11",
-                        "success": True,
-                        "image_tag": "registry/repo:v1",
-                    }
-                ],
-            }
-        )
-    )
-
-    await controller.reconcile_pr("repo", 1)
-
-    written = proxy.write_hidden_state.call_args.args[3]
-    assert written["status"] == "deploy-ready"
-    assert written["review_job_id"] == "job-done"
-    assert written["components"] == []
 
 
 @pytest.mark.asyncio
@@ -278,13 +203,11 @@ async def test_request_deploy_requires_deploy_ready(controller, proxy, fake_gith
     proxy.write_hidden_state = AsyncMock()
     proxy.comment_identity = AsyncMock(return_value=("1", "alice"))
     fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
-    controller.get_builds_for_pr = AsyncMock()
     controller.registry.resolve = AsyncMock()
 
     await controller.handle_request_deploy("repo", 1, 11)
 
     proxy.write_hidden_state.assert_not_called()
-    controller.get_builds_for_pr.assert_not_called()
     controller.registry.resolve.assert_not_called()
 
 
@@ -354,179 +277,6 @@ def test_hidden_state_model_defaults_to_completed_phase():
     assert state.command["phase"] == "completed"
 
 
-def test_review_job_timestamp_accepts_real_numeric_created_at():
-    job = ReviewJobInfo({
-        "id": "real-shape",
-        "repo": "repo",
-        "pr_number": 1,
-        "head_sha": "a" * 40,
-        "status": "queued",
-        "created_at": 1788400000.125,
-    })
-
-    value = job.completed_at
-
-    assert isinstance(value, float), type(value)
-    assert value == 1788400000.125, value
-
-
-def test_review_job_timestamp_accepts_numeric_string_and_iso_compatibility():
-    numeric_job = ReviewJobInfo({
-        "id": "numeric-shape",
-        "repo": "repo",
-        "pr_number": 1,
-        "head_sha": "a" * 40,
-        "status": "queued",
-        "created_at": "1788400000.125",
-    })
-    iso_job = ReviewJobInfo({
-        "id": "iso-shape",
-        "repo": "repo",
-        "pr_number": 1,
-        "head_sha": "a" * 40,
-        "status": "queued",
-        "created_at": "2026-09-03T12:00:00Z",
-    })
-
-    numeric_value = numeric_job.completed_at
-    iso_value = iso_job.completed_at
-
-    assert isinstance(numeric_value, float), type(numeric_value)
-    assert numeric_value == 1788400000.125, numeric_value
-    assert isinstance(iso_value, float), type(iso_value)
-    assert iso_value == datetime(2026, 9, 3, 12, 0, 0, tzinfo=timezone.utc).timestamp(), iso_value
-
-
-@pytest.mark.asyncio
-async def test_reconcile_numeric_created_at_selects_latest_exact_job(controller, proxy, fake_github):
-    proxy.read_hidden_state = AsyncMock(return_value=None)
-    proxy.write_hidden_state = AsyncMock()
-    proxy.project_status_label = AsyncMock()
-    fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
-    controller.review.list_jobs = AsyncMock(return_value=[
-        {
-            "id": "job-older",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "queued",
-            "created_at": 1788400000.125,
-        },
-        {
-            "id": "job-newer",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "queued",
-            "created_at": 1788400001.125,
-        },
-    ])
-
-    await controller.reconcile_pr("repo", 1)
-
-    written = proxy.write_hidden_state.call_args.args[3]
-    assert written["status"] == "reviewing"
-    assert written["review_job_id"] == "job-newer"
-
-
-@pytest.mark.asyncio
-async def test_get_builds_numeric_created_at_selects_latest_review_done(controller):
-    controller.review.list_jobs = AsyncMock(return_value=[
-        {
-            "id": "job-older",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "review_done",
-            "created_at": 1788400000.125,
-        },
-        {
-            "id": "job-newer",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "review_done",
-            "created_at": 1788400001.125,
-        },
-    ])
-    controller.review.get_job = AsyncMock(return_value=ReviewJobInfo({
-        "id": "job-newer",
-        "repo": "repo",
-        "pr_number": 1,
-        "head_sha": "a" * 40,
-        "status": "review_done",
-        "review_text": "done",
-        "options": {"build_only": False},
-        "build_results": [
-            {
-                "idx": 0,
-                "target": "perception",
-                "driver_path": "",
-                "variant": "5.11",
-                "success": True,
-                "image_tag": "registry/repo:v1",
-            }
-        ],
-    }))
-
-    result = await controller.get_builds_for_pr("repo", 1, "a" * 40)
-
-    assert result is not None
-    review_job_id, build_infos = result
-    assert review_job_id == "job-newer"
-    assert build_infos and build_infos[0].target == "perception"
-    controller.review.get_job.assert_awaited_once_with("job-newer")
-
-
-@pytest.mark.asyncio
-async def test_equal_numeric_created_at_is_ambiguous_and_fails_closed(controller, proxy, fake_github):
-    proxy.read_hidden_state = AsyncMock(return_value=None)
-    proxy.write_hidden_state = AsyncMock()
-    proxy.project_status_label = AsyncMock()
-    fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
-    controller.review.list_jobs = AsyncMock(return_value=[
-        {
-            "id": "job-a",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "queued",
-            "created_at": 1788400000.125,
-        },
-        {
-            "id": "job-b",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "queued",
-            "created_at": 1788400000.125,
-        },
-    ])
-
-    await controller.reconcile_pr("repo", 1)
-
-    written = proxy.write_hidden_state.call_args.args[3]
-    assert written["status"] == "review-required"
-    assert written["review_job_id"] == ""
-
-
-@pytest.mark.asyncio
-async def test_invalid_review_job_timestamp_fails_closed(controller):
-    controller.review.list_jobs = AsyncMock(return_value=[
-        {
-            "id": "job-invalid",
-            "repo": "repo",
-            "pr_number": 1,
-            "head_sha": "a" * 40,
-            "status": "queued",
-            "created_at": "not-a-time",
-        }
-    ])
-
-    result = await controller._find_latest_exact_review_job("repo", 1, "a" * 40)
-
-    assert result is None
-
 
 @pytest.mark.asyncio
 async def test_consume_cursor_without_state_does_not_bootstrap(controller, proxy):
@@ -594,18 +344,18 @@ def test_no_command_bootstrap_helper_remains():
     assert "bootstrap_missing_state" not in inspect.getsource(service_mod)
 
 
-def test_deploy_ready_hidden_state_requires_review_job_id():
+def test_deploy_ready_hidden_state_requires_review_evidence():
     with pytest.raises(MalformedHiddenStateError):
-        _validate_hidden_state(_review_state(status="deploy-ready", review_job_id="", components=[]))
+        _validate_hidden_state(_review_state(status="deploy-ready", review_evidence={}, components=[]))
 
 
 def test_deploy_ready_hidden_state_allows_empty_components_with_review_job():
-    state = _review_state(status="deploy-ready", review_job_id="job-1", components=[])
+    state = _review_state(status="deploy-ready", review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"}, components=[])
 
     validated = _validate_hidden_state(state)
 
     assert validated["status"] == "deploy-ready"
-    assert validated["review_job_id"] == "job-1"
+    assert validated["review_evidence"].get("build_comment_id") == 1
     assert validated["components"] == []
 
 
@@ -636,8 +386,12 @@ async def test_approve_rechecks_pr_after_clean_gate_before_executing(controller,
     core.driver_status = AsyncMock(side_effect=lambda runtime_id: events.append(f"driver_status:{runtime_id}") or {"status": "running", "running_image": ""})
     controller._core_for_node = AsyncMock(return_value=core)
     controller._deploy_component = AsyncMock(side_effect=lambda *args, **kwargs: events.append("deploy_post") or {})
-    controller._wait_for_deploy_health = AsyncMock(return_value={"passed": True, "running_image": "registry/repo@sha256:" + "a" * 64, "status": "running"})
     controller._run_automated_case = AsyncMock(return_value={})
+    fake_github.comments[50] = {
+        "id": 50,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    }
 
     await controller.handle_approve_deploy("repo", 1, 50, "test-machine", "owner1", "1")
 
@@ -664,15 +418,18 @@ async def test_approve_head_changes_after_clean_gate_zero_deploy_post(controller
     core.driver_status = AsyncMock(return_value={"status": "running", "running_image": ""})
     controller._core_for_node = AsyncMock(return_value=core)
     controller._deploy_component = AsyncMock()
-    controller._wait_for_deploy_health = AsyncMock()
     controller._run_automated_case = AsyncMock(return_value={})
+    fake_github.comments[51] = {
+        "id": 51,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    }
 
     await controller.handle_approve_deploy("repo", 1, 51, "test-machine", "owner1", "1")
 
     controller._deploy_component.assert_not_called()
     written = proxy.write_hidden_state.call_args.args[3]
     assert written["status"] == "review-required"
-    proxy.project_status_label.assert_called_with("repo", 1, "review-required")
 
 
 @pytest.mark.asyncio
@@ -691,8 +448,12 @@ async def test_approve_pr_closes_after_clean_gate_zero_deploy_post(controller, p
     core.driver_status = AsyncMock(return_value={"status": "running", "running_image": ""})
     controller._core_for_node = AsyncMock(return_value=core)
     controller._deploy_component = AsyncMock()
-    controller._wait_for_deploy_health = AsyncMock()
     controller._run_automated_case = AsyncMock(return_value={})
+    fake_github.comments[52] = {
+        "id": 52,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    }
 
     await controller.handle_approve_deploy("repo", 1, 52, "test-machine", "owner1", "1")
 
@@ -704,7 +465,7 @@ async def test_approve_pr_closes_after_clean_gate_zero_deploy_post(controller, p
 
 @pytest.mark.asyncio
 async def test_reconcile_succeeded_old_head_becomes_review_required_on_new_head(controller, proxy, fake_github):
-    proxy.read_hidden_state = AsyncMock(return_value=_review_state(status="succeeded", head_sha="a" * 40, review_job_id="job-1", components=[_component()], deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}], test_result="pass", cos={"object_key": "k", "sha256": "b" * 64, "size": 1}))
+    proxy.read_hidden_state = AsyncMock(return_value=_review_state(status="succeeded", head_sha="a" * 40, review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"}, components=[_component()], deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}], test_result="pass", cos={"object_key": "k", "sha256": "b" * 64, "size": 1}))
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "b" * 40}, "user": {"id": 1, "login": "alice"}}
@@ -756,7 +517,7 @@ async def test_reconcile_deploy_requested_old_head_clears_validation_snapshot(co
 async def test_record_test_cos_rebind_uses_fresh_terminal_state(controller, proxy):
     state = _review_state(
         status="succeeded",
-        review_job_id="job-1",
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",
@@ -787,7 +548,7 @@ async def test_record_test_cos_rebind_skips_after_head_drift(controller, proxy):
     state = _review_state(
         head_sha="b" * 40,
         status="succeeded",
-        review_job_id="job-1",
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",
@@ -816,7 +577,7 @@ async def test_record_test_cos_rebind_skips_after_head_drift(controller, proxy):
 async def test_record_test_cos_rebind_skips_after_command_changed(controller, proxy):
     state = _review_state(
         status="succeeded",
-        review_job_id="job-1",
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",
@@ -845,7 +606,7 @@ async def test_record_test_cos_rebind_skips_after_command_changed(controller, pr
 async def test_failed_deploy_cos_rebind_skips_after_lifecycle_changed(controller, proxy):
     state = _review_state(
         status="review-required",
-        review_job_id="",
+        review_evidence={},
         components=[],
         deployments=[],
         command={"comment_id": 88, "kind": "approve_deploy", "phase": "completed", "args": {}},
@@ -880,3 +641,114 @@ def test_node_id_docs_do_not_require_agent_core_registration():
     text = (repo_root / "DEPLOY_APPROVAL_AGENT.md").read_text(encoding="utf-8")
     assert "Agent Core's registered node_id" not in text
     assert "Deploy Approval machine-policy internal unique machine identifier" in text
+
+
+# ── Blocker 2: Repo->Target Source Matrix regression tests ──────────────────
+
+from dataclasses import dataclass
+
+
+@dataclass
+class FakeBuild:
+    target: str
+    success: bool = True
+    image_tag: str = "registry.example/repo:v1"
+    driver_path: str = ""
+
+
+def _is_deployable_build(repo, build):
+    """Import the production function and expose it for testing."""
+    from ..service import _is_deployable_build as _pdb
+    return _pdb(repo, build)
+
+
+class TestSourceMatrixOfficialCore:
+    """Official 4paradigm/phanthymotus: only perception and actucore are deployable."""
+
+    def test_official_phanthymotus_perception_is_deployable(self):
+        build = FakeBuild(target="perception")
+        assert _is_deployable_build("4paradigm/phanthymotus", build) is True
+
+    def test_official_phanthymotus_actucore_is_deployable(self):
+        build = FakeBuild(target="actucore")
+        assert _is_deployable_build("4paradigm/phanthymotus", build) is True
+
+    def test_official_phanthymotus_driver_is_not_deployable(self):
+        build = FakeBuild(target="driver")
+        assert _is_deployable_build("4paradigm/phanthymotus", build) is False
+
+    def test_official_phanthymotus_unknown_target_is_not_deployable(self):
+        build = FakeBuild(target="telemetry")
+        assert _is_deployable_build("4paradigm/phanthymotus", build) is False
+
+
+class TestSourceMatrixForkCore:
+    """Fork haohao-end/phanthymotus: only perception and actucore are deployable."""
+
+    def test_fork_phanthymotus_perception_is_deployable(self):
+        build = FakeBuild(target="perception")
+        assert _is_deployable_build("haohao-end/phanthymotus", build) is True
+
+    def test_fork_phanthymotus_actucore_is_deployable(self):
+        build = FakeBuild(target="actucore")
+        assert _is_deployable_build("haohao-end/phanthymotus", build) is True
+
+    def test_fork_phanthymotus_driver_is_not_deployable(self):
+        build = FakeBuild(target="driver")
+        assert _is_deployable_build("haohao-end/phanthymotus", build) is False
+
+
+class TestSourceMatrixDriverRepos:
+    """Driver repos: only target=driver with non-empty driver_path is deployable."""
+
+    def test_official_driver_repo_driver_with_path_is_deployable(self):
+        build = FakeBuild(target="driver", driver_path="unitree/go2")
+        assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is True
+
+    def test_official_driver_repo_driver_without_path_is_not_deployable(self):
+        build = FakeBuild(target="driver", driver_path="")
+        assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is False
+
+    def test_official_driver_repo_perception_is_not_deployable(self):
+        build = FakeBuild(target="perception")
+        assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is False
+
+    def test_fork_driver_repo_driver_with_path_is_deployable(self):
+        build = FakeBuild(target="driver", driver_path="custom/driver")
+        assert _is_deployable_build("haohao-end/phanthymotus-driver", build) is True
+
+    def test_fork_driver_repo_driver_without_path_is_not_deployable(self):
+        build = FakeBuild(target="driver", driver_path="  ")
+        assert _is_deployable_build("haohao-end/phanthymotus-driver", build) is False
+
+
+class TestSourceMatrixUnknownRepos:
+    """Unknown/third-party repos: ZERO deployable builds."""
+
+    def test_unknown_repo_perception_is_not_deployable(self):
+        build = FakeBuild(target="perception")
+        assert _is_deployable_build("some-user/phanthymotus", build) is False
+
+    def test_unknown_repo_driver_is_not_deployable(self):
+        build = FakeBuild(target="driver", driver_path="unitree/go2")
+        assert _is_deployable_build("some-user/phanthymotus-driver", build) is False
+
+    def test_random_repo_is_not_deployable(self):
+        build = FakeBuild(target="perception")
+        assert _is_deployable_build("org/not-related", build) is False
+
+
+class TestSourceMatrixFailedBuilds:
+    """Failed builds or missing image_tag are never deployable regardless of repo."""
+
+    def test_failed_build_is_not_deployable(self):
+        build = FakeBuild(target="perception", success=False)
+        assert _is_deployable_build("4paradigm/phanthymotus", build) is False
+
+    def test_empty_image_tag_is_not_deployable(self):
+        build = FakeBuild(target="perception", image_tag="")
+        assert _is_deployable_build("4paradigm/phanthymotus", build) is False
+
+    def test_driver_repo_failed_build_is_not_deployable(self):
+        build = FakeBuild(target="driver", driver_path="go2", success=False)
+        assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is False

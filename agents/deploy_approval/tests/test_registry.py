@@ -420,22 +420,22 @@ def test_resolve_tag_rejects_cross_origin_bearer_with_credentials():
         return httpx.Response(404, json={}, request=request)
 
     import os
-    os.environ["ARGUSER"] = "u"
-    os.environ["ARGPASS"] = "p"
+    os.environ["REGISTRY_USER"] = "u"
+    os.environ["REGISTRY_PASSWORD"] = "p"
     try:
         client = RegistryClient(_reg_cfg(), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
         with pytest.raises(RegistryError):
             _resolve(client, "registry.example/repo/app:v1", ["registry.example/repo"])
         assert state["creds_sent"] is False
     finally:
-        os.environ.pop("ARGUSER", None)
-        os.environ.pop("ARGPASS", None)
+        os.environ.pop("REGISTRY_USER", None)
+        os.environ.pop("REGISTRY_PASSWORD", None)
 
 
 def test_resolve_tag_allows_allowlisted_cross_origin_realm():
     import os
-    os.environ["ARGUSER"] = "u"
-    os.environ["ARGPASS"] = "p"
+    os.environ["REGISTRY_USER"] = "u"
+    os.environ["REGISTRY_PASSWORD"] = "p"
     state = {"used_bearer": False}
     try:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -464,8 +464,71 @@ def test_resolve_tag_allows_allowlisted_cross_origin_realm():
         assert res.digest == _DMAN
         assert state["used_bearer"] is True
     finally:
-        os.environ.pop("ARGUSER", None)
-        os.environ.pop("ARGPASS", None)
+        os.environ.pop("REGISTRY_USER", None)
+        os.environ.pop("REGISTRY_PASSWORD", None)
+
+
+def test_resolve_tag_rejects_foreign_registry_with_zero_http_requests():
+    # A foreign registry must be rejected before any HTTP request is made.
+    http_call_count = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        http_call_count["count"] += 1
+        return httpx.Response(404, json={}, request=request)
+
+    client = RegistryClient(
+        _reg_cfg(registry="registry.example"),
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(RegistryError, match="target authority"):
+        _resolve(client, "other.example/repo/app:v1", ["other.example/repo"])
+    assert http_call_count["count"] == 0
+
+
+def test_resolve_tag_port_mismatch_rejected():
+    # configured=registry.example:5000 should NOT match target=registry.example
+    state = {"calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["calls"] += 1
+        return httpx.Response(404, json={}, request=request)
+
+    import os
+    os.environ["REGISTRY_USER"] = "u"
+    os.environ["REGISTRY_PASSWORD"] = "p"
+    try:
+        client = RegistryClient(
+            _reg_cfg(registry="registry.example:5000"),
+            http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(RegistryError, match="target authority"):
+            _resolve(client, "registry.example/repo/app:v1", ["registry.example/repo"])
+        assert state["calls"] == 0
+    finally:
+        os.environ.pop("REGISTRY_USER", None)
+        os.environ.pop("REGISTRY_PASSWORD", None)
+
+
+def test_resolve_tag_only_registry_user_raises_error():
+    import os
+    os.environ["REGISTRY_USER"] = "u"
+    try:
+        client = RegistryClient(_reg_cfg(registry="registry.example"), http=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404))))
+        with pytest.raises(RegistryError, match="both REGISTRY_USER and REGISTRY_PASSWORD"):
+            _resolve(client, "registry.example/repo/app:v1", ["registry.example/repo"])
+    finally:
+        os.environ.pop("REGISTRY_USER", None)
+
+
+def test_resolve_tag_only_registry_password_raises_error():
+    import os
+    os.environ["REGISTRY_PASSWORD"] = "p"
+    try:
+        client = RegistryClient(_reg_cfg(registry="registry.example"), http=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404))))
+        with pytest.raises(RegistryError, match="both REGISTRY_USER and REGISTRY_PASSWORD"):
+            _resolve(client, "registry.example/repo/app:v1", ["registry.example/repo"])
+    finally:
+        os.environ.pop("REGISTRY_PASSWORD", None)
 
 
 def test_resolve_tag_index_rejects_desc_mismatched_response():
@@ -605,3 +668,336 @@ def test_verify_digest_rejects_wrong_family_and_index_digest():
         _vdigest(client, "registry.example/other/x@" + _DMAN, ["registry.example/repo"])
     with pytest.raises(RegistryError):
         _vdigest(client, "registry.example/repo/x@" + index_digest, ["registry.example/repo"])
+
+
+# ── Problem 2: registry host:port parsing ──────────────────────────────────
+
+def test_parse_reference_with_port():
+    family, tag = parse_reference("registry.example:5000/repo/app:v1")
+    assert family == "registry.example:5000/repo/app"
+    assert tag == "v1"
+
+
+def test_parse_reference_with_port_no_tag():
+    # No tag suffix -> defaults to "latest" which raises RegistryError
+    with pytest.raises(RegistryError, match="latest/empty tag"):
+        parse_reference("registry.example:5000/repo/app")
+
+
+def test_parse_reference_without_port():
+    family, tag = parse_reference("registry.example/repo/app:v1")
+    assert family == "registry.example/repo/app"
+    assert tag == "v1"
+
+
+# ── Problem 3: bearer realm authority port ─────────────────────────────────
+
+import os
+
+
+def test_resolve_tag_bearer_realm_port_uses_manifest_host():
+    # Bearer realm has port 443 but manifest host is registry.example (no port).
+    # target_authority must be built from manifest host, not realm port.
+    state = {"calls": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["calls"].append(request.url.host)
+        if request.url.host == "registry.example" and request.url.path == "/token":
+            return httpx.Response(200, json={"token": "tok"}, request=request)
+        if request.url.path.endswith("/manifests/v1"):
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer "):
+                return httpx.Response(
+                    200,
+                    headers={"Docker-Content-Digest": _DMAN},
+                    content=_manifest_body(_DCFG),
+                    request=request,
+                )
+            return httpx.Response(
+                401,
+                headers={"Www-Authenticate": 'Bearer realm="https://registry.example:443/token",service="svc"'},
+                request=request,
+            )
+        if request.url.path.endswith("/blobs/" + _DCFG):
+            return httpx.Response(200, content=_blob_bytes, request=request)
+        return httpx.Response(404, json={}, request=request)
+
+    client = RegistryClient(_reg_cfg(registry="registry.example", registry_auth_host_allowlist=["registry.example"]), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    res = _resolve(client, "registry.example/repo/app:v1", ["registry.example/repo"])
+    assert res.digest == _DMAN
+    # The bearer token request should go to manifest host, not realm port
+    assert "registry.example" in state["calls"]
+
+
+# ── Problem 4: comment ID bool rejection ──────────────────────────────────
+
+from ..commands import parse_command as _pc
+
+
+def test_parse_command_rejects_bool_like_ids():
+    # Sanity: command parsing doesn't accept numeric-looking IDs as commands
+    cmd = _pc("123")
+    assert not cmd.is_command
+
+
+# ── Bearer realm custom-port authority & HTTPS canonicalization ──────────────
+
+import os
+
+
+def test_resolve_bearer_custom_port_success():
+    # A. REGISTRY=registry.example:5000, Bearer realm: registry.example:5000/token
+    # Must successfully obtain token. Verify token request port is 5000.
+    state = {"token_url": ""}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            state["token_url"] = str(request.url)
+            return httpx.Response(200, json={"token": "tok5000"}, request=request)
+        if request.url.path.endswith("/manifests/v1"):
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer "):
+                return httpx.Response(
+                    200,
+                    headers={"Docker-Content-Digest": _DMAN},
+                    content=_manifest_body(_DCFG),
+                    request=request,
+                )
+            return httpx.Response(
+                401,
+                headers={"Www-Authenticate": 'Bearer realm="https://registry.example:5000/token",service="svc"'},
+                request=request,
+            )
+        if request.url.path.endswith("/blobs/" + _DCFG):
+            return httpx.Response(200, content=_blob_bytes, request=request)
+        return httpx.Response(404, json={}, request=request)
+
+    os.environ["REGISTRY_USER"] = "u"
+    os.environ["REGISTRY_PASSWORD"] = "p"
+    try:
+        client = RegistryClient(
+            _reg_cfg(registry="registry.example:5000"),
+            http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        res = _resolve(client, "registry.example:5000/repo/app:v1", ["registry.example:5000/repo"])
+        assert res.digest == _DMAN
+        assert ":5000" in state["token_url"], f"expected token port 5000, got: {state['token_url']}"
+    finally:
+        os.environ.pop("REGISTRY_USER", None)
+        os.environ.pop("REGISTRY_PASSWORD", None)
+
+
+def test_resolve_bearer_wrong_port_rejected_zero_token_calls():
+    # B. manifest authority: registry.example:5000, Bearer realm: registry.example:5001/token
+    # Must raise RegistryError. TOKEN_HTTPS_CALLS == 0.
+    http_call_count = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        http_call_count["count"] += 1
+        if request.url.path == "/token":
+            return httpx.Response(200, json={"token": "tok"}, request=request)
+        if request.url.path.endswith("/manifests/v1"):
+            return httpx.Response(
+                401,
+                headers={"Www-Authenticate": 'Bearer realm="https://registry.example:5001/token",service="svc"'},
+                request=request,
+            )
+        return httpx.Response(404, json={}, request=request)
+
+    os.environ["REGISTRY_USER"] = "u"
+    os.environ["REGISTRY_PASSWORD"] = "p"
+    try:
+        client = RegistryClient(
+            _reg_cfg(registry="registry.example:5000"),
+            http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(RegistryError, match="realm host"):
+            _resolve(client, "registry.example:5000/repo/app:v1", ["registry.example:5000/repo"])
+        # The only HTTP call is the initial manifest GET (which returns 401);
+        # the Bearer token endpoint at port 5001 must NEVER be called.
+        assert http_call_count["count"] == 1
+    finally:
+        os.environ.pop("REGISTRY_USER", None)
+        os.environ.pop("REGISTRY_PASSWORD", None)
+
+
+def test_resolve_bearer_https_443_canonical_accepts():
+    # C. manifest authority: registry.example (no port), Bearer realm: registry.example:443/token
+    # Must be treated as the same HTTPS authority and succeed.
+    state = {"used_bearer": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "registry.example" and request.url.path == "/token":
+            return httpx.Response(200, json={"token": "tok443"}, request=request)
+        if request.url.path.endswith("/manifests/v1"):
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer "):
+                state["used_bearer"] = True
+                return httpx.Response(
+                    200,
+                    headers={"Docker-Content-Digest": _DMAN},
+                    content=_manifest_body(_DCFG),
+                    request=request,
+                )
+            return httpx.Response(
+                401,
+                headers={"Www-Authenticate": 'Bearer realm="https://registry.example:443/token",service="svc"'},
+                request=request,
+            )
+        if request.url.path.endswith("/blobs/" + _DCFG):
+            return httpx.Response(200, content=_blob_bytes, request=request)
+        return httpx.Response(404, json={}, request=request)
+
+    client = RegistryClient(
+        _reg_cfg(registry="registry.example"),
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    res = _resolve(client, "registry.example/repo/app:v1", ["registry.example/repo"])
+    assert res.digest == _DMAN
+    assert state["used_bearer"] is True
+
+
+def test_resolve_bearer_foreign_realm_rejected_zero_token_calls():
+    # D. manifest authority: registry.example, Bearer realm: evil.example/token
+    # Must fail closed. TOKEN_HTTPS_CALLS == 0 (no token request to evil.example).
+    http_call_count = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        http_call_count["count"] += 1
+        if request.url.host == "evil.example":
+            return httpx.Response(200, json={"token": "tok_evil"}, request=request)
+        if request.url.path.endswith("/manifests/v1"):
+            return httpx.Response(
+                401,
+                headers={"Www-Authenticate": 'Bearer realm="https://evil.example/token",service="svc"'},
+                request=request,
+            )
+        return httpx.Response(404, json={}, request=request)
+
+    os.environ["REGISTRY_USER"] = "u"
+    os.environ["REGISTRY_PASSWORD"] = "p"
+    try:
+        client = RegistryClient(
+            _reg_cfg(registry="registry.example"),
+            http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(RegistryError, match="realm host"):
+            _resolve(client, "registry.example/repo/app:v1", ["registry.example/repo"])
+        # Only the initial manifest GET; token endpoint never called.
+        assert http_call_count["count"] == 1
+    finally:
+        os.environ.pop("REGISTRY_USER", None)
+        os.environ.pop("REGISTRY_PASSWORD", None)
+
+
+def test_resolve_bearer_wrong_port_rejects_before_credential_request():
+    # E. With fake REGISTRY_USER/REGISTRY_PASSWORD, wrong-port realm must still
+    # be rejected before any credential network request.
+    http_call_count = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        http_call_count["count"] += 1
+        if request.url.path == "/token":
+            return httpx.Response(200, json={"token": "tok"}, request=request)
+        if request.url.path.endswith("/manifests/v1"):
+            return httpx.Response(
+                401,
+                headers={"Www-Authenticate": 'Bearer realm="https://registry.example:9999/token",service="svc"'},
+                request=request,
+            )
+        return httpx.Response(404, json={}, request=request)
+
+    os.environ["REGISTRY_USER"] = "fake_user"
+    os.environ["REGISTRY_PASSWORD"] = "fake_pass"
+    try:
+        client = RegistryClient(
+            _reg_cfg(registry="registry.example:5000"),
+            http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(RegistryError, match="realm host"):
+            _resolve(client, "registry.example:5000/repo/app:v1", ["registry.example:5000/repo"])
+        # Only the initial manifest GET (401); token fetch at port 9999 never happens.
+        assert http_call_count["count"] == 1
+    finally:
+        os.environ.pop("REGISTRY_USER", None)
+        os.environ.pop("REGISTRY_PASSWORD", None)
+
+
+# ── Blocker 1: ResolvedImage.image_ref property regression tests ────────────
+
+from ..registry_client import ResolvedImage
+
+
+def test_image_ref_property_exact_format():
+    """Blocker 1A: ResolvedImage(...).image_ref must equal '{family}@{digest}'."""
+    family = "registry.example/namespace/repo"
+    digest = "sha256:" + "ab" * 32
+    resolved = ResolvedImage(family=family, tag="v1", digest=digest, platform="linux/arm64", size=1024)
+    assert resolved.image_ref == f"{family}@{digest}"
+
+
+def test_image_ref_property_unchanged_by_other_fields():
+    """Blocker 1A: image_ref is determined solely by family + digest."""
+    resolved = ResolvedImage(
+        family="registry.example/repo",
+        tag="v1",
+        digest="sha256:" + "cd" * 32,
+        platform="linux/amd64",
+        size=2048,
+    )
+    assert resolved.image_ref == "registry.example/repo@sha256:" + "cd" * 32
+    # Changing tag/platform/size does not affect image_ref
+    resolved.tag = "v2"
+    resolved.platform = "linux/arm64"
+    resolved.size = 4096
+    assert resolved.image_ref == "registry.example/repo@sha256:" + "cd" * 32
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_ref_uses_real_resolved_image_type():
+    """Blocker 1B: DeployController._resolve_image_ref() must work with real ResolvedImage type.
+
+    Not just SimpleNamespace. This proves the contract between registry.resolve()
+    and service._resolve_image_ref() is implemented against the real ResolvedImage
+    dataclass interface.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from .conftest import make_config
+    from ..policy import Policy
+    from ..models import MachineInfo
+    from ..service import DeployController
+
+    config = make_config(registry="registry.example")
+    proxy = MagicMock()
+    policy = Policy(config)
+    policy.machines = {}
+    github = MagicMock()
+    review = MagicMock()
+    registry = MagicMock()
+
+    controller = DeployController(config, proxy, policy, github, registry)
+
+    real_resolved = ResolvedImage(
+        family="registry.example/repo",
+        tag="v1",
+        digest="sha256:" + "ef" * 32,
+        platform="linux/arm64",
+        size=512,
+    )
+    assert isinstance(real_resolved, ResolvedImage)
+
+    registry.resolve = AsyncMock(return_value=real_resolved)
+
+    from ..models import BuildInfo
+    build = BuildInfo(
+        idx=0, target="perception", variant="5.11",
+        success=True, image_tag="registry.example/repo:v1",
+        driver_path="", deployable=True,
+    )
+
+    result = await controller._resolve_image_ref("4paradigm/phanthymotus", 1, "a" * 40, build)
+
+    assert result is not None
+    image_ref, platform = result
+    assert image_ref == "registry.example/repo@sha256:" + "ef" * 32
+    assert platform == "linux/arm64"

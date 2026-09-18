@@ -52,14 +52,14 @@ def build_client(
         "follow_redirects": False,
         "limits": httpx.Limits(max_connections=50),
     }
-    if verify_tls and ca_file:
+    if not verify_tls:
+        raise SecurityError("TLS verification must not be disabled")
+    if ca_file:
         kwargs["verify"] = ca_file
-    elif verify_tls:
+    else:
         # Never disable TLS verification. Plaintext HTTP is gated separately by
         # require_http_policy; HTTPS always uses the system CA store.
         kwargs["verify"] = True
-    else:
-        kwargs["verify"] = False
     return httpx.AsyncClient(**kwargs)
 
 
@@ -79,19 +79,13 @@ def is_allowed_private_host(host: str, allowed_cidrs: list[str]) -> bool:
     )
 
 
-# The single, fixed standard topology for the Review Agent inside Docker:
-# ``http://host.docker.internal:25000`` (Linux ``host-gateway``). Only this exact
-# host+port is granted a minimal HTTP exception for the Review Agent client;
-# nothing else (GitHub / Registry / Agent Core / arbitrary hosts) may use it.
-REVIEW_AGENT_FIXED_HOST = "host.docker.internal"
-REVIEW_AGENT_FIXED_PORT = 25000
 
 
 AGENT_CORE_NODE_PORT = 15678
 
 
 def require_http_policy(
-    url: str, config: Config, *, allow_private: bool, review_agent: bool = False,
+    url: str, config: Config, *, allow_private: bool,
     agent_core_node: str = "",
 ) -> None:
     """Fail-closed transport policy for an outbound URL.
@@ -101,9 +95,6 @@ def require_http_policy(
     - HTTP to loopback (127.0.0.1 / ::1) is always allowed so a collocated
       Review Agent or local registry is reachable even when ALLOW_PRIVATE_HTTP
       is off — but only the literal loopback hosts, never hostnames.
-    - The fixed ``http://host.docker.internal:25000`` Review Agent topology is
-      allowed only when ``review_agent=True`` (a single, exact, container-native
-      exception). No other host/port may use it.
     - Other private HTTP requires ``allow_private`` and a literal IP inside
       an allowed private CIDR (no DNS-based private guessing).
     """
@@ -114,20 +105,6 @@ def require_http_policy(
         return
     host = parsed.hostname or ""
     if host in ("127.0.0.1", "::1"):
-        return
-    if (
-        review_agent
-        and host == REVIEW_AGENT_FIXED_HOST
-        and (parsed.port or 80) == REVIEW_AGENT_FIXED_PORT
-    ):
-        return
-    # Trusted Agent Core nodes: HTTP to the exact literal node_host configured
-    # for the selected machine, on the fixed Agent Core port 15678.
-    if (
-        agent_core_node
-        and host == agent_core_node
-        and (parsed.port or 80) == AGENT_CORE_NODE_PORT
-    ):
         return
     if not allow_private:
         raise SecurityError("HTTP not permitted (HTTPS required by policy)")

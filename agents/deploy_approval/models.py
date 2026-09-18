@@ -81,6 +81,7 @@ class MachineInfo:
     node_id: str
     owners: list[str]  # GitHub logins (case-insensitive)
     node_host: str = ""
+    tls_peer_cert_file: str = ""
     targets: list[str] | None = None  # allowed targets (None = all)
     platforms: list[str] | None = None  # allowed platforms (None = all)
     variants: list[str] | None = None  # allowed variants (None = all)
@@ -106,7 +107,7 @@ class HiddenState:
     version: int = 1
     head_sha: str = ""
     status: str = "review-required"
-    review_job_id: str = ""
+    review_evidence: dict = field(default_factory=dict)
     components: list[dict] = field(default_factory=list)
     deployments: list[dict] = field(default_factory=list)
     case_results: dict[str, str] = field(default_factory=dict)
@@ -125,7 +126,7 @@ class HiddenState:
             "version": self.version,
             "head_sha": self.head_sha,
             "status": self.status,
-            "review_job_id": self.review_job_id,
+            "review_evidence": dict(self.review_evidence),
             "components": self.components,
             "deployments": self.deployments,
             "case_results": dict(self.case_results),

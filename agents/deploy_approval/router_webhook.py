@@ -71,7 +71,9 @@ async def webhook(request: Request):
         not isinstance(repo, str)
         or not repo
         or not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
         or not isinstance(comment_id, int)
+        or isinstance(comment_id, bool)
         or pr_number <= 0
         or comment_id <= 0
     ):

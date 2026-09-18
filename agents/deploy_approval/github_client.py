@@ -50,8 +50,9 @@ class GitHubError(Exception):
 
 
 class GitHubClient:
-    def __init__(self, config: Config, http: httpx.AsyncClient | None = None):
+    def __init__(self, config: Config, http: httpx.AsyncClient | None = None, token_provider: callable = None):
         self.config = config
+        self._token_provider = token_provider
         self.http = http or httpx.AsyncClient(
             timeout=httpx.Timeout(
                 config.total_timeout,
@@ -60,15 +61,28 @@ class GitHubClient:
                 pool=config.connect_timeout,
             ),
             follow_redirects=False,
+            trust_env=False,
         )
 
-    def _headers(self):
-        if not self.config.github_token:
-            raise GitHubError("GITHUB_TOKEN is not configured")
-        return {
-            "Authorization": "Bearer " + self.config.github_token,
-            "Accept": "application/vnd.github+json",
-        }
+    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Unified async per-request GitHub API call with fresh installation token.
+
+        Each request obtains a fresh token from ``self._token_provider()``.
+        No long-lived Authorization header is mutated on the client.
+        """
+        if self._token_provider is not None:
+            token = await self._token_provider()
+        else:
+            raise GitHubError("No token provider configured for GitHubClient")
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers["Authorization"] = "Bearer " + token
+        headers.setdefault("Accept", "application/vnd.github+json")
+        headers.setdefault("X-GitHub-Api-Version", "2026-03-10")
+        url = self.api(path.lstrip("/"))
+        require_http_policy(url, self.config, allow_private=self.config.allow_private_http)
+        return await stream_request(
+            self.http, method, url, self.config.max_response_bytes,
+            headers=headers, **kwargs)
 
     def api(self, path: str) -> str:
         return self.config.github_api_url.rstrip("/") + "/" + path.lstrip("/")
@@ -89,12 +103,7 @@ class GitHubClient:
 
     async def get_pr(self, repo: str, pr_number: int) -> dict:
         path = f"/repos/{repo}/pulls/{pr_number}"
-        require_http_policy(
-            self.api(path), self.config, allow_private=self.config.allow_private_http
-        )
-        resp = await stream_request(
-            self.http, "GET", self.api(path), self.config.max_response_bytes,
-            headers=self._headers(), timeout=self.config.total_timeout)
+        resp = await self._request("GET", path, timeout=self.config.total_timeout)
         try:
             require_2xx(resp.status_code, "github get PR")
         except SecurityError as e:
@@ -125,9 +134,8 @@ class GitHubClient:
                     f"github comment pagination exceeded {max_pages} pages "
                     f"for {repo}#{pr_number}"
                 )
-            resp = await stream_request(
-                self.http, "GET", url, self.config.max_response_bytes,
-                headers=self._headers(),
+            resp = await self._request(
+                "GET", url,
                 params={"per_page": 100, "page": page}, timeout=self.config.total_timeout)
             try:
                 require_2xx(resp.status_code, "github list comments")
@@ -164,9 +172,8 @@ class GitHubClient:
                 url, self.config,
                 allow_private=self.config.allow_private_http
             )
-            resp = await stream_request(
-                self.http, "GET", url, self.config.max_response_bytes,
-                headers=self._headers(),
+            resp = await self._request(
+                "GET", url,
                 params={
                     "state": "open",
                     "sort": "updated",
@@ -209,13 +216,8 @@ class GitHubClient:
         return sorted(seen.values(), key=_sort_key, reverse=True)
 
     async def get_comment(self, repo: str, comment_id: int) -> dict:
-        url = self.api(f"/repos/{repo}/issues/comments/{comment_id}")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        resp = await stream_request(
-            self.http, "GET", url, self.config.max_response_bytes,
-            headers=self._headers(), timeout=self.config.total_timeout)
+        path = f"/repos/{repo}/issues/comments/{comment_id}"
+        resp = await self._request("GET", path, timeout=self.config.total_timeout)
         try:
             require_2xx(resp.status_code, "github get comment")
         except SecurityError as e:
@@ -225,13 +227,8 @@ class GitHubClient:
     async def post_issue_comment(
         self, repo: str, pr_number: int, body: str
     ) -> dict:
-        url = self.api(f"/repos/{repo}/issues/{pr_number}/comments")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        resp = await stream_request(
-            self.http, "POST", url, self.config.max_response_bytes,
-            headers=self._headers(), json={"body": body}, timeout=self.config.total_timeout)
+        path = f"/repos/{repo}/issues/{pr_number}/comments"
+        resp = await self._request("POST", path, json={"body": body}, timeout=self.config.total_timeout)
         try:
             require_2xx(resp.status_code, "github post comment")
         except SecurityError as e:
@@ -239,14 +236,8 @@ class GitHubClient:
         return await self._read_json(resp)
 
     async def update_comment(self, repo: str, comment_id: int, body: str):
-        url = self.api(f"/repos/{repo}/issues/comments/{comment_id}")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        headers = {**self._headers(), "Accept": "application/vnd.github+json"}
-        resp = await stream_request(
-            self.http, "PATCH", url, self.config.max_response_bytes,
-            headers=headers, json={"body": body}, timeout=self.config.total_timeout)
+        path = f"/repos/{repo}/issues/comments/{comment_id}"
+        resp = await self._request("PATCH", path, json={"body": body}, timeout=self.config.total_timeout)
         try:
             require_2xx(resp.status_code, "github update comment")
         except SecurityError as e:
@@ -287,9 +278,7 @@ class GitHubClient:
         require_http_policy(
             url, self.config, allow_private=self.config.allow_private_http
         )
-        resp = await stream_request(
-            self.http, "GET", url, self.config.max_response_bytes,
-            headers=self._headers(), timeout=self.config.total_timeout)
+        resp = await self._request("GET", url, timeout=self.config.total_timeout)
         try:
             require_2xx(resp.status_code, "github get file contents")
         except SecurityError as e:
@@ -319,9 +308,9 @@ class GitHubClient:
         require_http_policy(
             url, self.config, allow_private=self.config.allow_private_http
         )
-        resp = await stream_request(
-            self.http, "GET", url, self.config.max_response_bytes,
-            headers=self._headers(), timeout=self.config.total_timeout)
+        resp = await self._request(
+            "GET", f"/repos/{repo}/issues/{issue_number}/labels",
+            timeout=self.config.total_timeout)
         try:
             require_2xx(resp.status_code, "github get labels")
         except SecurityError as e:
@@ -329,41 +318,13 @@ class GitHubClient:
         data = await self._read_json_list(resp)
         return [l.get("name", "") for l in data if isinstance(l, dict) and l.get("name")]
 
-    async def set_issue_labels(self, repo: str, issue_number: int,
-                                labels: list[str]) -> None:
-        """Replace all labels on an issue/PR.
-
-        Preserves non-status:* labels by only managing status:* labels.
-        Caller should pass the full desired label set.
-        """
-        if not labels:
-            labels = []
-        url = self.api(f"/repos/{repo}/issues/{issue_number}/labels")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        headers = {**self._headers(), "Accept": "application/vnd.github+json"}
-        resp = await stream_request(
-            self.http, "PUT", url, self.config.max_response_bytes,
-            headers=headers, json={"labels": labels},
-            timeout=self.config.total_timeout)
-        try:
-            require_2xx(resp.status_code, "github set labels")
-        except SecurityError as e:
-            raise GitHubError(str(e)) from e
 
     async def add_issue_label(self, repo: str, issue_number: int,
                                label: str) -> None:
         """Add a single label to an issue/PR."""
-        url = self.api(f"/repos/{repo}/issues/{issue_number}/labels")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        headers = {**self._headers(), "Accept": "application/vnd.github+json"}
-        resp = await stream_request(
-            self.http, "POST", url, self.config.max_response_bytes,
-            headers=headers, json={"labels": [label]},
-            timeout=self.config.total_timeout)
+        path = f"/repos/{repo}/issues/{issue_number}/labels"
+        resp = await self._request("POST", path, json={"labels": [label]},
+                                    timeout=self.config.total_timeout)
         try:
             require_2xx(resp.status_code, "github add label")
         except SecurityError as e:
@@ -372,14 +333,8 @@ class GitHubClient:
     async def remove_issue_label(self, repo: str, issue_number: int,
                                   label: str) -> None:
         """Remove a single label from an issue/PR."""
-        url = self.api(f"/repos/{repo}/issues/{issue_number}/labels/{label}")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        headers = {**self._headers(), "Accept": "application/vnd.github+json"}
-        resp = await stream_request(
-            self.http, "DELETE", url, self.config.max_response_bytes,
-            headers=headers, timeout=self.config.total_timeout)
+        path = f"/repos/{repo}/issues/{issue_number}/labels/{label}"
+        resp = await self._request("DELETE", path, timeout=self.config.total_timeout)
         # 404 is ok (label already doesn't exist)
         if resp.status_code not in (200, 204, 404):
             try:
@@ -396,6 +351,28 @@ class GitHubClient:
     async def pr_head_sha(self, repo: str, pr_number: int) -> str:
         pr = await self.get_pr(repo, pr_number)
         return str((pr.get("head") or {}).get("sha") or "")
+
+
+    async def resolve_commit_sha(self, repo: str, ref: str) -> str:
+        """GET /repos/{repo}/commits/{ref} -> return full 40-hex SHA.
+
+        Raises GitHubError on 404/422/malformed response.
+        """
+        if not ref or not str(ref).strip():
+            raise GitHubError("resolve_commit_sha: ref is empty")
+        resp = await self._request("GET", self.api(f"repos/{repo}/commits/{ref}"))
+        data = await self._read_json(resp)
+        sha = data.get("sha")
+        if not isinstance(sha, str) or len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha.lower()):
+            raise GitHubError(f"resolve_commit_sha: invalid sha {sha!r}")
+        return sha.lower()
+
+
+    async def _get_token(self) -> str:
+        """Get current installation token from the token provider."""
+        if self._token_provider is not None:
+            return await self._token_provider()
+        raise GitHubError("No token provider configured for GitHubClient")
     async def pr_state(self, repo: str, pr_number: int) -> PrSnapshot | None:
         """Strict, fail-closed snapshot of a PR for candidate creation.
 
@@ -461,15 +438,10 @@ class GitHubClient:
         (write/maintain/admin pass; read/triage/none fail). Any API error, 404,
         non-2xx, or schema/type failure fails closed (returns an empty string).
         """
-        url = self.api(f"/repos/{repo}/collaborators/{username}")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
+        path = f"/repos/{repo}/collaborators/{username}"
         resp = None
         try:
-            resp = await stream_request(
-                self.http, "GET", url, self.config.max_response_bytes,
-                headers=self._headers(), timeout=self.config.total_timeout)
+            resp = await self._request("GET", path, timeout=self.config.total_timeout)
         except httpx.HTTPError as e:
             logger.warning("collaborator permission check failed: %s", e)
             return ""
@@ -504,16 +476,9 @@ class GitHubClient:
         org, _, slug = team.partition("/")
         if not org or not slug:
             return False
-        url = self.api(
-            f"/orgs/{org}/teams/{slug}/memberships/{username}"
-        )
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
+        path = f"/orgs/{org}/teams/{slug}/memberships/{username}"
         try:
-            resp = await stream_request(
-                self.http, "GET", url, self.config.max_response_bytes,
-                headers=self._headers(), timeout=self.config.total_timeout,
+            resp = await self._request("GET", path, timeout=self.config.total_timeout,
             )
         except (httpx.HTTPError, SecurityError) as e:
             logger.warning("team membership check failed for %s: %s", team, e)
@@ -534,14 +499,7 @@ class GitHubClient:
         GET /user. Returns a dict with ``id`` (int) and ``login`` (str).
         Raises GitHubError on failure.
         """
-        url = self.api("/user")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        resp = await stream_request(
-            self.http, "GET", url, self.config.max_response_bytes,
-            headers=self._headers(), timeout=self.config.total_timeout,
-        )
+        resp = await self._request("GET", "/user", timeout=self.config.total_timeout,)
         try:
             require_2xx(resp.status_code, "github current user")
         except SecurityError as e:
@@ -550,16 +508,12 @@ class GitHubClient:
 
     async def list_repository_labels(self, repo: str) -> list[dict]:
         """List all labels in a repository with bounded pagination."""
-        url = self.api(f"/repos/{repo}/labels")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
+        url = f"/repos/{repo}/labels"
         labels: list[dict] = []
         max_pages = 20
         for page in range(1, max_pages + 1):
-            resp = await stream_request(
-                self.http, "GET", url, self.config.max_response_bytes,
-                headers=self._headers(),
+            resp = await self._request(
+                "GET", url,
                 params={"per_page": 100, "page": page},
                 timeout=self.config.total_timeout,
             )
@@ -582,16 +536,10 @@ class GitHubClient:
         self, repo: str, name: str, color: str, description: str,
     ) -> dict:
         """Create a repository label using the authenticated GitHub token."""
-        url = self.api(f"/repos/{repo}/labels")
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        resp = await stream_request(
-            self.http, "POST", url, self.config.max_response_bytes,
-            headers=self._headers(),
+        path = f"/repos/{repo}/labels"
+        resp = await self._request("POST", path,
             json={"name": name, "color": color, "description": description},
-            timeout=self.config.total_timeout,
-        )
+            timeout=self.config.total_timeout,)
         try:
             require_2xx(resp.status_code, "github create repository label")
         except SecurityError as e:

@@ -36,7 +36,10 @@ from .github_client import GitHubClient, GitHubError
 from .github_state_proxy import GitHubStateProxy, _validate_hidden_state
 from .models import BuildInfo, new_id, utc_now
 from .policy import Policy, PolicyError
-from .review_client import ReviewAgentClient, ReviewJobInfo
+from .review_comment_parser import (
+    extract_review_evidence,
+    ReviewCommentEvidence,
+)
 from .registry_client import RegistryClient, parse_reference
 
 logger = logging.getLogger(__name__)
@@ -158,7 +161,6 @@ class DeployController:
         proxy: GitHubStateProxy,
         policy: Policy,
         github: GitHubClient,
-        review: ReviewAgentClient,
         registry: object = None,
         agent_core_factory: object = None,
     ):
@@ -166,7 +168,6 @@ class DeployController:
         self.proxy = proxy
         self.policy = policy
         self.github = github
-        self.review = review
         self.registry = registry
         self._agent_core_factory = agent_core_factory
         self._core_clients: dict[str, AgentCoreClient] = {}
@@ -236,7 +237,7 @@ class DeployController:
         *,
         head_sha: str,
         status: str,
-        review_job_id: str = "",
+        review_evidence: dict | None = None,
         components: list[dict] | None = None,
         deployments: list[dict] | None = None,
     ) -> dict:
@@ -244,7 +245,7 @@ class DeployController:
             "version": 1,
             "head_sha": head_sha,
             "status": status,
-            "review_job_id": review_job_id,
+            "review_evidence": dict(review_evidence or {}),
             "components": list(components or []),
             "deployments": list(deployments or []),
             "case_results": {},
@@ -281,11 +282,11 @@ class DeployController:
         *,
         head_sha: str,
         status: str,
-        review_job_id: str = "",
+        review_evidence: dict | None = None,
     ) -> None:
         state["head_sha"] = head_sha
         state["status"] = status
-        state["review_job_id"] = review_job_id
+        state["review_evidence"] = dict(review_evidence or {})
         state["components"] = []
         state["deployments"] = []
         state["approve_attempts"] = []
@@ -300,37 +301,6 @@ class DeployController:
             "phase": "completed",
             "args": {},
         }
-
-    def _build_infos_from_review_job(self, job: ReviewJobInfo) -> list[BuildInfo]:
-        build_infos: list[BuildInfo] = []
-        for idx, b in enumerate(job.builds or []):
-            target = str(getattr(b, "target", "") or "")
-            driver_path = str(getattr(b, "driver_path", "") or "")
-            variant = _normalize_variant(str(getattr(b, "variant", "") or ""))
-            success = bool(getattr(b, "success", False))
-            image_tag = str(getattr(b, "image_tag", "") or "")
-
-            if target.upper() == "CORE":
-                continue
-
-            build_infos.append(
-                BuildInfo(
-                    idx=idx,
-                    target=target,
-                    driver_path=driver_path,
-                    variant=variant,
-                    success=success,
-                    image_tag=image_tag,
-                    deployable=_is_deployable_build(
-                        type("_build", (), {
-                            "target": target,
-                            "success": success,
-                            "image_tag": image_tag,
-                        })()
-                    ),
-                )
-            )
-        return build_infos
 
     @staticmethod
     def _canonical_component_snapshot(components: list[dict]) -> list[dict]:
@@ -436,64 +406,6 @@ class DeployController:
             })
         return snapshot
 
-    async def _find_latest_exact_review_job(
-        self, repo: str, pr_number: int, head_sha: str,
-    ) -> ReviewJobInfo | None:
-        page_size = 100
-        max_pages = 10
-        candidate: ReviewJobInfo | None = None
-        candidate_ts: float | None = None
-        seen_candidates = 0
-        offset = 0
-        pages_fetched = 0
-        while pages_fetched < max_pages:
-            page = await self.review.list_jobs(
-                repo=repo,
-                limit=page_size,
-                offset=offset,
-            )
-            if not page:
-                break
-            pages_fetched += 1
-            for raw_job in page:
-                job = self._coerce_review_job(raw_job)
-                if job is None:
-                    continue
-                if job.repo != repo:
-                    continue
-                if int(job.pr_number or 0) != int(pr_number):
-                    continue
-                if job.head_sha != head_sha:
-                    continue
-                ts = job.completed_at
-                if ts is None:
-                    continue
-                if candidate_ts is None or ts > candidate_ts:
-                    candidate = job
-                    candidate_ts = ts
-                    seen_candidates = 1
-                elif ts == candidate_ts:
-                    seen_candidates += 1
-            if len(page) < page_size:
-                break
-            offset += page_size
-        else:
-            logger.error(
-                "latest exact review job scan truncated for %s#%s head=%s",
-                repo, pr_number, head_sha,
-            )
-            return None
-
-        if candidate is None or seen_candidates != 1:
-            if seen_candidates > 1:
-                logger.error(
-                    "ambiguous exact review jobs for %s#%s head=%s: "
-                    "latest timestamp %r matched %d jobs",
-                    repo, pr_number, head_sha, candidate_ts, seen_candidates,
-                )
-            return None
-        return candidate
-
     async def _rebind_terminal_cos_if_current(
         self,
         repo: str,
@@ -552,16 +464,6 @@ class DeployController:
                 if isinstance(cid, str) and cid:
                     deployed_component_ids.add(cid)
         return deployed_component_ids
-
-    def _coerce_review_job(self, job: object) -> ReviewJobInfo | None:
-        if isinstance(job, ReviewJobInfo):
-            return job
-        if isinstance(job, dict):
-            try:
-                return ReviewJobInfo(job)
-            except Exception:
-                return None
-        return None
 
     def _resolve_component_runtime(
         self,
@@ -691,23 +593,51 @@ class DeployController:
                 )
                 return True
 
-            # Get builds for this PR HEAD
-            result = await self.get_builds_for_pr(repo, pr_number, pr_head)
-            if result is None:
+            # Get build evidence from PR comments
+            try:
+                comments = await self.github.get_issue_comments(repo, pr_number)
+                if not isinstance(comments, list):
+                    comments = []
+                evidence = extract_review_evidence(
+                    comments,
+                    self.config.review_comment_author_id,
+                    self.config.review_comment_author_login,
+                )
+            except Exception as e:
+                logger.warning(
+                    "request_deploy comment evidence %s#%s: %s",
+                    repo, pr_number, e,
+                )
+                evidence = None
+
+            if evidence is None:
                 await self._post_error(
                     repo, pr_number,
-                    "No completed review builds found for this HEAD. "
+                    "No completed review evidence found for this HEAD. "
                     "Wait for Review Agent to complete.",
                 )
                 return True
 
-            review_job_id, builds = result
-            if state.get("review_job_id", "") and state.get("review_job_id") != review_job_id:
-                await self._post_error(
-                    repo, pr_number,
-                    "Review lifecycle is stale. Refresh before requesting deploy.",
+            # Convert evidence builds to BuildInfo
+            builds = []
+            for eb in evidence.builds:
+                bi = BuildInfo(
+                    idx=0,
+                    target=eb.target,
+                    driver_path=eb.driver_path,
+                    variant=eb.variant,
+                    success=eb.success,
+                    image_tag=eb.image_tag,
+                    deployable=_is_deployable_build(
+                        type("_build", (), {
+                            "target": eb.target,
+                            "success": eb.success,
+                            "image_tag": eb.image_tag,
+                        })()
+                    ),
                 )
-                return True
+                builds.append(bi)
+
             components = await self._build_component_snapshot(
                 repo, pr_number, pr_head, builds,
             )
@@ -724,6 +654,28 @@ class DeployController:
                 )
                 return True
 
+            # Resolve evidence commit prefix to full SHA
+            resolved_head = await self._resolve_review_evidence_for_head(
+                repo, pr_head, evidence,
+            )
+            if resolved_head is None:
+                await self._post_error(
+                    repo, pr_number,
+                    "Review evidence commit could not be resolved to the current PR HEAD.",
+                )
+                return True
+
+            # Build review_evidence snapshot with resolved full SHA
+            review_evidence_data = {
+                "build_comment_id": evidence.build_comment_id,
+                "build_comment_updated_at": evidence.build_comment_updated_at,
+                "commit_prefix": evidence.commit_prefix,
+                "resolved_head_sha": resolved_head,
+                "test_comment_id": evidence.test_comment_id,
+                "code_review_comment_id": evidence.code_review_comment_id,
+                "review_author_id": evidence.review_author_id,
+            }
+
             # Determine compatible machine groups
             machine_groups = self._get_machine_groups_for_components(components)
 
@@ -731,7 +683,7 @@ class DeployController:
             state = self._init_hidden_state(
                 head_sha=pr_head,
                 status="deploy-requested",
-                review_job_id=review_job_id,
+                review_evidence=review_evidence_data,
                 components=components,
             )
             state["command"] = {
@@ -1327,144 +1279,6 @@ class DeployController:
 
     # ── Build helpers ──
 
-    async def get_builds_for_pr(
-        self, repo: str, pr_number: int, head_sha: str,
-    ) -> tuple[str, list[BuildInfo]] | None:
-        """Query Review Agent for builds matching the given HEAD.
-
-        Uses bounded two-step verification:
-        1. Bounded pagination scan via list_jobs with status=review_done, repo filter.
-        2. GET /api/jobs/{job_id} detail to verify review_complete().
-
-        Each paginated page is filtered locally by exact repo, PR, full HEAD.
-        After finding the unique latest candidate, the full job detail is fetched
-        and verified with review_complete() (options.build_only is False,
-        review_text non-empty, status=review_done).
-
-        Returns (review_job_id, list of BuildInfo) or None.
-        """
-        try:
-            # Stage 1: bounded pagination scan
-            page_size = 100
-            max_pages = 10
-            candidate_job_id: str | None = None
-            candidate_ts: float | None = None
-            seen_candidates = 0
-            offset = 0
-            pages_fetched = 0
-            while pages_fetched < max_pages:
-                page = await self.review.list_jobs(
-                    repo=repo, status="review_done",
-                    limit=page_size, offset=offset,
-                )
-                if not page:
-                    break
-                pages_fetched += 1
-                for raw_job in page:
-                    job = self._coerce_review_job(raw_job)
-                    if job is None:
-                        continue
-                    if job.repo != repo:
-                        continue
-                    if int(job.pr_number or 0) != int(pr_number):
-                        continue
-                    if job.head_sha != head_sha:
-                        continue
-                    if job.status != "review_done":
-                        continue
-                    ts = job.completed_at
-                    if ts is None:
-                        continue
-                    if candidate_ts is None or ts > candidate_ts:
-                        candidate_job_id = job.job_id
-                        candidate_ts = ts
-                        seen_candidates = 1
-                    elif ts == candidate_ts:
-                        seen_candidates += 1
-                if len(page) < page_size:
-                    break
-                offset += page_size
-            else:
-                # max_pages reached while last page was still full — scan truncated
-                logger.error(
-                    "get_builds_for_pr %s#%s head=%s: pagination scan truncated at %d pages, last page full, fail closed",
-                    repo, pr_number, head_sha, max_pages,
-                )
-                return None
-
-            if not candidate_job_id or seen_candidates == 0:
-                return None
-            if seen_candidates > 1:
-                logger.error(
-                    "ambiguous exact-head review_done jobs for %s#%s head=%s: "
-                    "latest timestamp %r matched %d jobs",
-                    repo, pr_number, head_sha, candidate_ts, seen_candidates,
-                )
-                return None
-
-            # Stage 2: fetch full job detail and verify review_complete()
-            detail = await self.review.get_job(candidate_job_id)
-            if detail is None:
-                return None
-            if detail.repo != repo:
-                return None
-            if int(detail.pr_number or 0) != int(pr_number):
-                return None
-            if detail.head_sha != head_sha:
-                return None
-            if detail.status != "review_done":
-                return None
-            if not detail.review_complete():
-                logger.warning(
-                    "get_builds_for_pr %s#%s head=%s job=%s: review_complete() is False (build_only=%s, review_text empty=%s)",
-                    repo, pr_number, head_sha, candidate_job_id,
-                    detail.build_only,
-                    not bool(detail.review_text),
-                )
-                return None
-
-            review_job_id = detail.job_id
-            if not review_job_id:
-                return None
-            builds = detail.builds or []
-
-            # Build BuildInfo list
-            build_infos = []
-            for idx, b in enumerate(builds):
-                target = str(getattr(b, "target", "") or "")
-                driver_path = str(getattr(b, "driver_path", "") or "")
-                variant = _normalize_variant(str(getattr(b, "variant", "") or ""))
-                success = bool(getattr(b, "success", False))
-                image_tag = str(getattr(b, "image_tag", "") or "")
-
-                # Exclude CORE
-                if target.upper() == "CORE":
-                    continue
-
-                build_info = BuildInfo(
-                    idx=idx,
-                    target=target,
-                    driver_path=driver_path,
-                    variant=variant,
-                    success=success,
-                    image_tag=image_tag,
-                    deployable=_is_deployable_build(
-                        type("_build", (), {
-                            "target": target,
-                            "success": success,
-                            "image_tag": image_tag,
-                        })()
-                    ),
-                )
-                build_infos.append(build_info)
-
-            return (review_job_id, build_infos)
-
-        except Exception as e:
-            logger.warning(
-                "get_builds_for_pr %s#%s: %s", repo, pr_number, e,
-            )
-            return None
 
     async def _resolve_image_ref(
         self, repo: str, pr_number: int, head_sha: str,
@@ -1934,7 +1748,7 @@ class DeployController:
         old_head = state.get("head_sha", "")
         state["status"] = "review-required"
         state["head_sha"] = new_head
-        state["review_job_id"] = ""
+        state["review_evidence"] = {}
         state["components"] = []
         state["deployments"] = []
         state["approve_attempts"] = []
@@ -1968,7 +1782,7 @@ class DeployController:
     ) -> None:
         """Invalidate the current validation snapshot and return to review-required."""
         state["status"] = "review-required"
-        state["review_job_id"] = ""
+        state["review_evidence"] = {}
         state["components"] = []
         state["deployments"] = []
         state["approve_attempts"] = []
@@ -2039,7 +1853,7 @@ class DeployController:
                     state,
                     head_sha=current_head,
                     status="review-required",
-                    review_job_id="",
+                    review_evidence={},
                 )
                 state["command"] = {
                     "comment_id": int(state.get("last_processed_comment_id", 0) or 0),
@@ -2083,51 +1897,64 @@ class DeployController:
         if not current_head:
             return
 
-        latest_job = await self._find_latest_exact_review_job(repo, pr_number, current_head)
-        if latest_job is None:
-            desired_status = "review-required"
-            review_job_id = ""
-            build_infos: list[BuildInfo] = []
-        elif latest_job.status in _REVIEW_ACTIVE_STATUSES:
-            desired_status = "reviewing"
-            review_job_id = latest_job.job_id
-            build_infos = []
-        elif latest_job.status == "review_done":
-            try:
-                detail = await self.review.get_job(latest_job.job_id)
-                if (
-                    detail is None
-                    or detail.repo != repo
-                    or int(detail.pr_number or 0) != int(pr_number)
-                    or detail.head_sha != current_head
-                    or detail.status != "review_done"
-                    or not detail.review_complete()
-                ):
-                    desired_status = "review-required"
-                    review_job_id = ""
-                    build_infos = []
-                else:
-                    desired_status = "deploy-ready"
-                    review_job_id = detail.job_id
-                    build_infos = self._build_infos_from_review_job(detail)
-            except Exception as e:
-                logger.warning(
-                    "reconcile review_done job verification %s#%s head=%s: %s",
-                    repo, pr_number, current_head, e,
-                )
+        # Fetch PR comments and extract review evidence from GitHub comments
+        try:
+            comments = await self.github.get_issue_comments(repo, pr_number)
+            if not isinstance(comments, list):
+                comments = []
+            evidence = extract_review_evidence(
+                comments,
+                self.config.review_comment_author_id,
+                self.config.review_comment_author_login,
+            )
+            if evidence is None:
                 desired_status = "review-required"
-                review_job_id = ""
+                review_evidence_data: dict = {}
+                build_infos: list[BuildInfo] = []
+            else:
+                # Convert evidence builds to BuildInfo
                 build_infos = []
-        else:
+                for eb in evidence.builds:
+                    bi = BuildInfo(
+                        idx=0,
+                        target=eb.target,
+                        driver_path=eb.driver_path,
+                        variant=eb.variant,
+                        success=eb.success,
+                        image_tag=eb.image_tag,
+                        deployable=_is_deployable_build(
+                            type("_build", (), {
+                                "target": eb.target,
+                                "success": eb.success,
+                                "image_tag": eb.image_tag,
+                            })()
+                        ),
+                    )
+                    build_infos.append(bi)
+                desired_status = "deploy-ready"
+                review_evidence_data = {
+                    "build_comment_id": evidence.build_comment_id,
+                    "build_comment_updated_at": evidence.build_comment_updated_at,
+                    "commit_prefix": evidence.commit_prefix,
+                    "resolved_head_sha": evidence.resolved_head_sha,
+                    "test_comment_id": evidence.test_comment_id,
+                    "code_review_comment_id": evidence.code_review_comment_id,
+                    "review_author_id": evidence.review_author_id,
+                }
+        except Exception as e:
+            logger.warning(
+                "reconcile comment evidence %s#%s head=%s: %s",
+                repo, pr_number, current_head, e,
+            )
             desired_status = "review-required"
-            review_job_id = ""
+            review_evidence_data: dict = {}
             build_infos = []
 
         if state is None:
             state = self._init_hidden_state(
                 head_sha=current_head,
                 status=desired_status,
-                review_job_id=review_job_id,
+                review_evidence=review_evidence_data,
                 components=[],
                 deployments=[],
             )
@@ -2141,7 +1968,7 @@ class DeployController:
         else:
             state["head_sha"] = current_head
             state["status"] = desired_status
-            state["review_job_id"] = review_job_id
+            state["review_evidence"] = review_evidence_data
             state["components"] = []
             state["deployments"] = []
             state["approve_attempts"] = []
@@ -2228,7 +2055,7 @@ class DeployController:
 
         if not current_head or current_head != state.get("head_sha", ""):
             state["status"] = "review-required"
-            state["review_job_id"] = ""
+            state["review_evidence"] = {}
             state["components"] = []
             state["deployments"] = []
             state["approve_attempts"] = []
@@ -2251,10 +2078,26 @@ class DeployController:
             await self.proxy.project_status_label(repo, pr_number, "review-required")
             return "review-required"
 
-        lookup = await self.get_builds_for_pr(repo, pr_number, current_head)
-        if lookup is None:
+        # Get build evidence from PR comments
+        try:
+            comments = await self.github.get_issue_comments(repo, pr_number)
+            if not isinstance(comments, list):
+                comments = []
+            evidence = extract_review_evidence(
+                comments,
+                self.config.review_comment_author_id,
+                self.config.review_comment_author_login,
+            )
+        except Exception as e:
+            logger.warning(
+                "refresh_uncertain comment evidence %s#%s: %s",
+                repo, pr_number, e,
+            )
+            evidence = None
+
+        if evidence is None:
             state["status"] = "review-required"
-            state["review_job_id"] = ""
+            state["review_evidence"] = {}
             state["components"] = []
             state["deployments"] = []
             state["approve_attempts"] = []
@@ -2277,14 +2120,42 @@ class DeployController:
             await self.proxy.project_status_label(repo, pr_number, "review-required")
             return "review-required"
 
-        review_job_id, builds = lookup
+        # Convert evidence builds to BuildInfo
+        builds = []
+        for eb in evidence.builds:
+            bi = BuildInfo(
+                idx=0,
+                target=eb.target,
+                driver_path=eb.driver_path,
+                variant=eb.variant,
+                success=eb.success,
+                image_tag=eb.image_tag,
+                deployable=_is_deployable_build(
+                    type("_build", (), {
+                        "target": eb.target,
+                        "success": eb.success,
+                        "image_tag": eb.image_tag,
+                    })()
+                ),
+            )
+            builds.append(bi)
+
+        review_evidence_data = {
+            "build_comment_id": evidence.build_comment_id,
+            "build_comment_updated_at": evidence.build_comment_updated_at,
+            "commit_prefix": evidence.commit_prefix,
+            "resolved_head_sha": evidence.resolved_head_sha,
+            "test_comment_id": evidence.test_comment_id,
+            "code_review_comment_id": evidence.code_review_comment_id,
+            "review_author_id": evidence.review_author_id,
+        }
         fresh_components = await self._build_component_snapshot(
             repo, pr_number, current_head, builds,
         )
         if fresh_components is None:
             logger.warning(
-                "uncertain recovery snapshot rebuild unavailable %s#%s head=%s job=%s",
-                repo, pr_number, current_head, review_job_id,
+                "uncertain recovery snapshot rebuild unavailable %s#%s head=%s",
+                repo, pr_number, current_head,
             )
             state["command"] = {
                 "comment_id": comment_id,
@@ -2306,14 +2177,14 @@ class DeployController:
             await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
             return "uncertain"
 
-        old_review_job_id = str(state.get("review_job_id", "") or "")
+        old_review_evidence = state.get("review_evidence", {})
         old_components = self._canonical_component_snapshot(state.get("components", []))
         fresh_canonical = self._canonical_component_snapshot(fresh_components)
         same_snapshot = (
-            old_review_job_id == review_job_id and old_components == fresh_canonical
+            old_review_evidence == review_evidence_data and old_components == fresh_canonical
         )
         updated_state = dict(state)
-        updated_state["review_job_id"] = review_job_id
+        updated_state["review_evidence"] = review_evidence_data
         updated_state["status"] = "deploy-requested"
         updated_state["command"] = {
             "comment_id": comment_id,
@@ -2344,8 +2215,8 @@ class DeployController:
             )
             if preserved_components is None:
                 logger.warning(
-                    "uncertain recovery runtime binding unavailable %s#%s head=%s job=%s",
-                    repo, pr_number, current_head, review_job_id,
+                    "uncertain recovery runtime binding unavailable %s#%s head=%s",
+                    repo, pr_number, current_head,
                 )
                 state["command"] = {
                     "comment_id": comment_id,
@@ -2396,7 +2267,42 @@ class DeployController:
         await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
         return "deploy-requested"
 
-    # ── Hidden state validation ──
+    async def _resolve_review_evidence_for_head(
+        self, repo: str, fresh_head: str, evidence: "ReviewCommentEvidence",
+    ) -> str | None:
+        """Resolve evidence.commit_prefix to full SHA and verify == fresh_head.
+
+        Returns resolved 40-hex SHA on success, or None on any failure.
+        """
+        from .review_comment_parser import ReviewCommentEvidence
+        if not isinstance(evidence, ReviewCommentEvidence):
+            return None
+        commit_prefix = evidence.commit_prefix
+        if not isinstance(commit_prefix, str) or not re.fullmatch(r"[0-9a-f]{7,40}", commit_prefix):
+            logger.warning(
+                "resolve evidence commit_prefix invalid: %r", commit_prefix
+            )
+            return None
+        try:
+            resolved = await self.github.resolve_commit_sha(repo, commit_prefix)
+        except Exception as e:
+            logger.warning(
+                "resolve_commit_sha %s %s: %s", repo, commit_prefix, e
+            )
+            return None
+        if not isinstance(resolved, str) or not re.fullmatch(r"[0-9a-f]{40}", resolved):
+            logger.warning(
+                "resolve_commit_sha returned malformed sha: %r", resolved
+            )
+            return None
+        if resolved != fresh_head:
+            logger.warning(
+                "resolved sha %s != fresh_head %s", resolved, fresh_head
+            )
+            return None
+        return resolved
+
+        # ── Hidden state validation ──
 
     def _validate_hidden_state(self, state: dict) -> None:
         """Validate hidden state before persisting."""

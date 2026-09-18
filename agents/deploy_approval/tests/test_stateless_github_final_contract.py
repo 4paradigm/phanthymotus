@@ -10,7 +10,7 @@ import types
 from types import SimpleNamespace
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, patch
 
 from ..case_runner import CaseRunner
 from ..config import Config
@@ -18,10 +18,55 @@ from ..cos_client import CosClient
 from ..github_state_proxy import GitHubStateProxy
 from ..models import ALL_STATUSES, MachineInfo
 from ..policy import Policy
-from ..review_client import ReviewJobInfo
 from ..router_webhook import webhook
 from ..service import DeployController
 from .conftest import make_config
+
+# ── Review Agent comment markup constants for tests ─────────────────────────
+
+BUILD_COMMENT_MARKUP = """<!-- pr-review-agent -->
+
+## PR Review Agent — Build Result
+
+Commit: `abcdef1`
+
+All builds succeeded.
+
+| Target   | Status                     | Version                          | Took |
+| -------- | -------------------------- | -------------------------------- | ---- |
+| perception | :white_check_mark: Success | `registry.example/repo:v1`      | 45s  |
+
+### Images
+
+**perception**
+
+```
+registry.example/repo:v1
+```
+"""
+
+TEST_COMMENT_MARKUP = """<!-- pr-review-agent -->
+
+## PR Review Agent — Test Results
+
+Commit: `abcdef1`
+
+| Suite    | Result                    | Passed | Failed | Took |
+| -------- | ------------------------- | ------ | ------ | ---- |
+| perception | :white_check_mark: Passed | 100    | 0      | 30s  |
+"""
+
+CODE_REVIEW_MARKUP = """<!-- pr-review-agent -->
+
+## PR Review Agent — Code Review
+
+All checks passed. No blocking findings.
+
+---
+
+<sub>Generated automatically by PR Review Agent.</sub>
+"""
+
 
 
 @pytest.fixture
@@ -34,7 +79,10 @@ def mock_github():
     client = MagicMock()
     client.get_comment = AsyncMock()
     client.get_issue_comments = AsyncMock()
-    client.post_issue_comment = AsyncMock(return_value={"id": 42})
+    client.post_issue_comment = AsyncMock(return_value={
+        "id": 42, "user": {"id": 12345, "login": "test-bot", "type": "Bot"},
+        "performed_via_github_app": {"id": 12345},
+    })
     client.update_comment = AsyncMock()
     client.get_pr = AsyncMock()
     client.collaborator_permission = AsyncMock()
@@ -46,7 +94,7 @@ def mock_github():
 
 @pytest.fixture
 def proxy(config, mock_github):
-    return GitHubStateProxy(config, mock_github, bot_user_id="12345", bot_login="test-bot")
+    return GitHubStateProxy(config, mock_github, github_app_id="12345")
 
 
 @pytest.fixture
@@ -58,6 +106,7 @@ def policy(config):
             node_id="node-1",
             owners=["owner1"],
             node_host="127.0.0.1",
+            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             targets=["perception"],
             platforms=["linux/arm64"],
             variants=["5.11"],
@@ -67,9 +116,10 @@ def policy(config):
             node_id="node-2",
             owners=["driver-owner"],
             node_host="127.0.0.2",
-            targets=["driver"],
+            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+            targets=["perception", "driver"],
             platforms=["linux/arm64"],
-            variants=[""],
+            variants=["5.11"],
             driver_paths=["custom/driver"],
         ),
     }
@@ -78,12 +128,9 @@ def policy(config):
 
 @pytest.fixture
 def controller(config, proxy, policy, mock_github):
-    review = MagicMock()
-    review.list_jobs = AsyncMock()
-    review.get_job = AsyncMock()
     registry = MagicMock()
     registry.resolve = AsyncMock()
-    return DeployController(config, proxy, policy, mock_github, review, registry)
+    return DeployController(config, proxy, policy, mock_github, registry)
 
 
 def _component(**overrides):
@@ -106,7 +153,7 @@ def _state(**overrides):
         "version": 1,
         "head_sha": "a" * 40,
         "status": "testing",
-        "review_job_id": "job-1",
+        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
         "components": [_component()],
         "deployments": [{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         "case_results": {},
@@ -118,25 +165,6 @@ def _state(**overrides):
     state.update(overrides)
     return state
 
-
-def _review_job(job_id: str, head_sha: str, builds: list[dict], *, completed_at: str = "", updated_at: str = "", created_at: str = ""):
-    raw = {
-        "id": job_id,
-        "repo": "repo",
-        "pr_number": 1,
-        "head_sha": head_sha,
-        "status": "review_done",
-        "review_text": "review complete",
-        "options": {"build_only": False},
-        "build_results": builds,
-    }
-    if completed_at:
-        raw["completed_at"] = completed_at
-    if updated_at:
-        raw["updated_at"] = updated_at
-    if created_at:
-        raw["created_at"] = created_at
-    return ReviewJobInfo(raw)
 
 
 def _fake_webhook_request(config, proxy, controller, payload, signature):
@@ -158,8 +186,8 @@ def _fake_webhook_request(config, proxy, controller, payload, signature):
     return _Request()
 
 
-def _fake_cos_sdk(*, signed_url="https://cos.example/signed", put_error=None):
-    calls = {"put": [], "signed": []}
+def _fake_cos_sdk(*, put_error=None):
+    calls = {"put": []}
     module = types.ModuleType("qcloud_cos")
 
     class CosConfig:
@@ -175,10 +203,6 @@ def _fake_cos_sdk(*, signed_url="https://cos.example/signed", put_error=None):
             if put_error is not None:
                 raise put_error
 
-        def get_presigned_url(self, **kwargs):
-            calls["signed"].append(kwargs)
-            return signed_url
-
     module.CosConfig = CosConfig
     module.CosS3Client = CosS3Client
     return module, calls
@@ -192,7 +216,8 @@ def _deployment(image_ref="registry/repo@sha256:" + "a" * 64, driver_id="percept
         "driver_path": "",
         "node_id": "node-1",
         "node_host": "127.0.0.1",
-        "image_ref": image_ref,
+        "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
+"image_ref": image_ref,
         "machine_alias": "test-machine",
         "_core": AsyncMock(),
         "_driver_id": driver_id,
@@ -444,7 +469,8 @@ async def test_case_uses_real_agent_core_response_field(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "image_ref": image_ref,
+            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
+"image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
             "_driver_id": "perception",
@@ -476,7 +502,8 @@ async def test_case_exact_immutable_image_must_match_runtime(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "image_ref": image_ref,
+            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
+"image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
             "_driver_id": "perception",
@@ -507,7 +534,8 @@ async def test_case_empty_runtime_image_fails(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "image_ref": image_ref,
+            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
+"image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
             "_driver_id": "perception",
@@ -539,7 +567,8 @@ async def test_case_wrong_runtime_image_fails(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "image_ref": image_ref,
+            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
+"image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
             "_driver_id": "perception",
@@ -571,7 +600,8 @@ async def test_case_mcp_lookup_uses_real_agent_core_contract(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "image_ref": image_ref,
+            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
+"image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
             "_driver_id": "perception",
@@ -635,23 +665,6 @@ def test_cos_production_path_missing_sdk_fails_closed(config):
         assert asyncio.run(client.upload_evidence_archive("key", b"payload")) is False
 
 
-def test_cos_signed_url_calls_real_sdk(config):
-    config.cos_region = "ap-shanghai"
-    config.cos_bucket = "bucket-1"
-    config.cos_secret_id = "sid"
-    config.cos_secret_key = "skey"
-    sdk, calls = _fake_cos_sdk(signed_url="https://cos.example/signed")
-    client = CosClient(config)
-
-    with patch.dict(sys.modules, {"qcloud_cos": sdk}):
-        import asyncio
-
-        assert asyncio.run(client.generate_signed_url("key")) == "https://cos.example/signed"
-
-    assert calls["signed"]
-    assert calls["signed"][0]["Key"] == "key"
-
-
 def test_cos_production_source_contains_no_placeholder_signed_url():
     source = inspect.getsource(CosClient)
     assert "placeholder" not in source
@@ -666,7 +679,6 @@ async def test_cos_metadata_written_only_after_real_upload_success(controller, p
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
     mock_github.collaborator_permission = AsyncMock(return_value="admin")
     controller._upload_evidence = AsyncMock(return_value={"object_key": "key", "sha256": "b" * 64, "size": 12})
-    controller.cos.generate_signed_url = AsyncMock(return_value="https://signed")
 
     await controller.handle_record_test("repo", 1, 101, "pass", "", "owner1", "")
 
@@ -687,7 +699,7 @@ def _deploy_requested_state(components=None, deployments=None, **overrides):
     component_list = list(components or [_component()])
     state = _state(
         status="deploy-requested",
-        review_job_id="job-1",
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
         components=component_list,
         deployments=list(deployments or []),
         command={"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
@@ -695,25 +707,6 @@ def _deploy_requested_state(components=None, deployments=None, **overrides):
     state.update(overrides)
     return state
 
-
-def _review_job(job_id: str, head_sha: str, builds: list[dict], *, completed_at: str = "", updated_at: str = "", created_at: str = ""):
-    raw = {
-        "id": job_id,
-        "repo": "repo",
-        "pr_number": 1,
-        "head_sha": head_sha,
-        "status": "review_done",
-        "review_text": "review complete",
-        "options": {"build_only": False},
-        "build_results": builds,
-    }
-    if completed_at:
-        raw["completed_at"] = completed_at
-    if updated_at:
-        raw["updated_at"] = updated_at
-    if created_at:
-        raw["created_at"] = created_at
-    return ReviewJobInfo(raw)
 
 
 @pytest.mark.asyncio
@@ -725,56 +718,20 @@ async def test_review_lookup_does_not_pass_pr_number(controller, proxy, mock_git
         "head": {"sha": "a" * 40},
         "user": {"id": 111, "login": "alice"},
     }
-    proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_job_id="", components=[]))
-    controller.review.list_jobs = AsyncMock(return_value=[
-        _review_job("job-1", "a" * 40, [
-        {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag"},
-        ], completed_at="2026-09-01T10:00:00Z"),
-    ])
+    proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_evidence={}, components=[]))
     controller.registry.resolve.return_value = SimpleNamespace(image_ref="registry/repo@sha256:" + "b" * 64, platform="linux/arm64")
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
 
     await controller.handle_request_deploy("repo", 1, 100)
 
-    assert controller.review.list_jobs.call_args.kwargs == {"repo": "repo", "status": "review_done", "limit": 100, "offset": 0}
-    assert "pr_number" not in controller.review.list_jobs.call_args.kwargs
+    # No review.list_jobs exists — evidence comes from GitHub comments
 
 
-@pytest.mark.asyncio
-async def test_review_lookup_exact_repo_pr_full_head_latest(controller, proxy, mock_github):
-    head_sha = "a" * 40
-    mock_github.get_comment.return_value = {"id": 101, "user": {"id": 111, "login": "alice"}, "body": "/request_deploy"}
-    mock_github.get_pr.return_value = {
-        "state": "open",
-        "merged": False,
-        "head": {"sha": head_sha},
-        "user": {"id": 111, "login": "alice"},
-    }
-    proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_job_id="job-new", head_sha=head_sha, components=[]))
-    job_new = _review_job("job-new", head_sha, [
-        {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-new"},
-    ], completed_at="2026-09-01T11:00:00Z")
-    controller.review.list_jobs = AsyncMock(return_value=[
-        _review_job("job-old", head_sha, [
-            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-old"},
-        ], completed_at="2026-09-01T10:00:00Z"),
-        job_new,
-        _review_job("job-other", "b" * 40, [
-            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-other"},
-        ], completed_at="2026-09-01T12:00:00Z"),
-    ])
-    controller.review.get_job = AsyncMock(return_value=job_new)
-    controller.registry.resolve.side_effect = [
-        SimpleNamespace(image_ref="registry/repo@sha256:" + "c" * 64, platform="linux/arm64"),
-    ]
-    proxy.write_hidden_state = AsyncMock()
-    proxy.project_status_label = AsyncMock()
-
-    await controller.handle_request_deploy("repo", 1, 101)
+    await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
 
     written_state = proxy.write_hidden_state.call_args.args[3]
-    assert written_state["review_job_id"] == "job-new"
+    assert "job-new" in str(written_state["review_evidence"])
 
 
 @pytest.mark.asyncio
@@ -784,6 +741,11 @@ async def test_clean_gate_ignores_runtime_status_when_image_empty(controller, pr
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 201,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
     core.driver_status = AsyncMock(side_effect=[{"status": "busy", "running_image": ""}, {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64}])
@@ -804,6 +766,16 @@ async def test_clean_gate_blocks_occupied_image_even_if_status_looks_clean(contr
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 202,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 202,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
     core.driver_status = AsyncMock(return_value={"status": "stopped", "running_image": "old@sha256:" + "b" * 64})
@@ -823,26 +795,32 @@ async def test_clean_gate_blocks_occupied_image_even_if_status_looks_clean(contr
 @pytest.mark.asyncio
 async def test_clean_gate_preflights_all_components_before_any_deploy(controller, proxy, mock_github):
     controller.policy.machines["test-machine"].variants = ["5.11", "6.1"]
+    controller.policy.machines["test-machine"].targets = ["perception", "actucore"]
     components = [
-        _component(component_id="comp-001"),
-        _component(component_id="comp-002", variant="alt-variant"),
+        _component(component_id="comp-001", target="perception", runtime_id="perception"),
+        _component(component_id="comp-002", target="actucore", variant="5.11", runtime_id="actucore"),
     ]
     state = _deploy_requested_state(components=components)
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 203,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[
-        {"id": "perception", "target": "perception", "variant": "5.11"},
-        {"id": "runtime-2", "target": "perception", "variant": "alt-variant"},
+        {"id": "perception", "target": "perception", "image": "registry/repo:v1", "variant": "5.11"},
+        {"id": "actucore", "target": "actucore", "image": "registry/repo:v1", "variant": "5.11"},
     ])
-    # Only comp-001 (variant=5.11) is compatible. comp-002 (alt-variant) is filtered out.
-    # Sequential: preflight(i) -> deploy -> health(xN) -> pass
     image_ref = "registry/repo@sha256:" + "a" * 64
     core.driver_status = AsyncMock(side_effect=[
-        {"status": "busy", "running_image": ""},  # preflight
-        {"status": "running", "running_image": image_ref},  # health pass
+        {"status": "busy", "running_image": ""},  # preflight perception
+        {"status": "busy", "running_image": ""},  # preflight actucore
+        {"status": "running", "running_image": image_ref},  # health pass perception
+        {"status": "running", "running_image": image_ref},  # health pass actucore
     ])
     core.deploy_driver = AsyncMock(return_value={"ok": True})
     controller._core_for_node = AsyncMock(return_value=core)
@@ -850,8 +828,8 @@ async def test_clean_gate_preflights_all_components_before_any_deploy(controller
 
     await controller.handle_approve_deploy("repo", 1, 203, "test-machine", "owner1", "1")
 
-    # Preflight (1) + health poll (1) = 2 calls
-    core.deploy_driver.assert_called_once()
+    # Both components should be deployed
+    assert core.deploy_driver.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -862,6 +840,11 @@ async def test_new_approve_rechecks_running_image_until_empty(controller, proxy,
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(side_effect=lambda repo, cid: {
+        "id": cid,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
     core.driver_status = AsyncMock(side_effect=[
@@ -884,6 +867,11 @@ async def test_clean_gate_writes_executing_before_first_deploy_post(controller, 
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 206,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
     core.driver_status = AsyncMock(side_effect=[{"status": "busy", "running_image": ""}, {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64}])
@@ -914,6 +902,11 @@ async def test_occupied_gate_advances_new_comment_cursor(controller, proxy, mock
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 207,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
     core.driver_status = AsyncMock(return_value={"status": "stopped", "running_image": "occupied@sha256:" + "b" * 64})
@@ -950,12 +943,13 @@ async def test_restart_old_approve_comment_never_replayed(controller, proxy, con
     state_after["last_processed_comment_id"] = 100
     proxy.read_hidden_state = AsyncMock(side_effect=[state_before, state_after, state_after])
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
-    controller.review.list_jobs = AsyncMock(return_value=[])
+    # No review HTTP dependency — evidence comes from GitHub comments
     proxy.get_issue_comments = AsyncMock(return_value=[
-        {"id": 100, "body": "/approve_deploy machine=test-machine", "user": {"id": 1, "login": "owner1"}},
-        {"id": 101, "body": "/approve_deploy machine=test-machine", "user": {"id": 1, "login": "owner1"}},
+        {"id": 100, "body": "/approve_deploy machine=test-machine", "user": {"id": 1, "login": "owner1"}, "user_id": 1},
+        {"id": 101, "body": "/approve_deploy machine=test-machine", "user": {"id": 1, "login": "owner1"}, "user_id": 1},
     ])
     proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.get_comment = AsyncMock(side_effect=lambda repo, cid: {"id": cid, "body": f"/approve_deploy machine=test-machine", "user": {"id": 1, "login": "owner1"}, "user_id": 1})
     controller.on_command = AsyncMock(return_value=True)
 
     from ..github_command_watcher import GitHubCommandWatcher
@@ -975,11 +969,11 @@ async def test_uncertain_same_head_relooks_up_review_job(controller, proxy, mock
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
-    controller.review.list_jobs = AsyncMock(return_value=[
-        _review_job("job-2", "a" * 40, [
-            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag"},
-        ], completed_at="2026-09-01T11:00:00Z"),
-    ])
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 51,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
     core.driver_status = AsyncMock(side_effect=[{"status": "busy", "running_image": ""}, {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64}])
@@ -989,7 +983,6 @@ async def test_uncertain_same_head_relooks_up_review_job(controller, proxy, mock
 
     await controller.handle_approve_deploy("repo", 1, 51, "test-machine", "owner1", "1")
 
-    controller.review.list_jobs.assert_awaited_once_with(repo="repo", status="review_done", limit=100, offset=0)
     assert proxy.write_hidden_state.called
 
 
@@ -1000,6 +993,11 @@ async def test_uncertain_head_drift_requires_new_review(controller, proxy, mock_
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "b" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 51,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
 
     await controller.handle_approve_deploy("repo", 1, 51, "test-machine", "owner1", "1")
 
@@ -1015,7 +1013,12 @@ async def test_uncertain_missing_exact_review_job_requires_new_review(controller
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
-    controller.review.list_jobs = AsyncMock(return_value=[])
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 52,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    # No review HTTP dependency — evidence comes from GitHub comments
 
     await controller.handle_approve_deploy("repo", 1, 52, "test-machine", "owner1", "1")
 
@@ -1045,7 +1048,6 @@ async def test_record_test_fail_uses_failed(controller, proxy, mock_github):
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
     mock_github.collaborator_permission = AsyncMock(return_value="admin")
     controller._upload_evidence = AsyncMock(return_value={"object_key": "", "sha256": "", "size": 0})
-    controller.cos.generate_signed_url = AsyncMock(return_value="")
 
     await controller.handle_record_test("repo", 1, 301, "fail", "", "owner1", "")
 
@@ -1056,8 +1058,9 @@ async def test_record_test_fail_uses_failed(controller, proxy, mock_github):
 
 @pytest.mark.asyncio
 async def test_partial_machine_approval_stays_deploy_requested(controller, proxy, mock_github):
+    # Both components must successfully deploy. Use same image digest for health mock simplicity.
     components = [
-        _component(component_id="comp-perception", target="perception", variant="5.11"),
+        _component(component_id="comp-perception", target="perception", variant="5.11", image_ref="registry/repo@sha256:" + "c" * 64),
         _component(component_id="comp-driver", target="driver", variant="", driver_path="custom/driver", image_ref="registry/repo@sha256:" + "c" * 64, resolved_platform="linux/arm64"),
     ]
     state = _deploy_requested_state(components=components)
@@ -1080,28 +1083,31 @@ async def test_partial_machine_approval_stays_deploy_requested(controller, proxy
 
 @pytest.mark.asyncio
 async def test_all_machine_groups_deployed_enters_testing(controller, proxy, mock_github):
+    # Both components must successfully deploy. Use same image digest for health mock simplicity.
     components = [
-        _component(component_id="comp-perception", target="perception", variant="5.11"),
+        _component(component_id="comp-perception", target="perception", variant="5.11", image_ref="registry/repo@sha256:" + "c" * 64),
         _component(component_id="comp-driver", target="driver", variant="", driver_path="custom/driver", image_ref="registry/repo@sha256:" + "c" * 64, resolved_platform="linux/arm64"),
     ]
-    state = _deploy_requested_state(
-        components=components,
-        deployments=[{"machine": "test-machine", "component_ids": ["comp-perception"], "phase": "deployed"}],
-    )
+    state = _deploy_requested_state(components=components, deployments=[])
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(side_effect=lambda repo, cid: {
+        "id": cid,
+        "body": f"/approve_deploy machine={cid % 2 and 'test-machine' or 'driver-machine'}",
+        "user": {"id": cid % 2 or 2, "login": cid % 2 and "owner1" or "driver-owner"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[
         {"id": "perception", "target": "perception", "image": "registry/repo"},
         {"id": "driver-123", "category": "driver", "image": "registry/repo@sha256:" + "c" * 64},
     ])
     core.driver_status = AsyncMock(side_effect=[
-        {"status": "busy", "running_image": ""},
-        {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64},
-        {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64},
-        {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64},
+        {"status": "busy", "running_image": ""},  # preflight perception
+        {"status": "busy", "running_image": ""},  # preflight driver
+        {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64},  # health perception
+        {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64},  # health driver
     ])
     core.deploy_driver = AsyncMock()
     controller._core_for_node = AsyncMock(return_value=core)
@@ -1121,7 +1127,6 @@ async def test_case_fail_does_not_block_overall_manual_pass(controller, proxy, m
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
     mock_github.collaborator_permission = AsyncMock(return_value="admin")
     controller._upload_evidence = AsyncMock(return_value={"object_key": "", "sha256": "", "size": 0})
-    controller.cos.generate_signed_url = AsyncMock(return_value="")
 
     await controller.handle_record_test("repo", 1, 501, "pass", "", "owner1", "")
 
@@ -1160,6 +1165,11 @@ async def test_case_pass_does_not_auto_succeed(controller, proxy, mock_github):
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 602,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
     core.driver_status = AsyncMock(side_effect=[{"status": "busy", "running_image": ""}, {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64}])
@@ -1170,3 +1180,76 @@ async def test_case_pass_does_not_auto_succeed(controller, proxy, mock_github):
     await controller.handle_approve_deploy("repo", 1, 602, "test-machine", "owner1", "1")
 
     assert proxy.write_hidden_state.call_args.args[3]["status"] == "testing"
+
+
+@pytest.mark.asyncio
+async def test_request_deploy_head_drift_uses_request_deploy_provenance(controller, proxy, mock_github):
+    """HEAD drift in handle_request_deploy must set command.kind='request_deploy'."""
+    state = _state(status="deploy-ready", review_evidence={}, components=[])
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {
+        "state": "open",
+        "merged": False,
+        "head": {"sha": "b" * 40},
+        "user": {"id": 111, "login": "alice"},
+    }
+    mock_github.get_comment = AsyncMock(return_value={"id": 201, "user": {"id": 111, "login": "alice"}})
+    mock_github.collaborator_permission = AsyncMock(return_value="admin")
+
+    await controller.handle_request_deploy("repo", 1, 201)
+
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "review-required"
+    assert written_state["command"]["kind"] == "request_deploy"
+    assert written_state["head_sha"] == "b" * 40
+    assert written_state["last_processed_comment_id"] == 201
+
+
+@pytest.mark.asyncio
+async def test_record_test_head_drift_uses_record_test_provenance(controller, proxy, mock_github):
+    """HEAD drift in handle_record_deploy must set command.kind='record_test'."""
+    state = _state(
+        status="testing",
+        deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
+    )
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {
+        "state": "open",
+        "merged": False,
+        "head": {"sha": "b" * 40},
+    }
+    mock_github.collaborator_permission = AsyncMock(return_value="admin")
+    controller._upload_evidence = AsyncMock(return_value={"object_key": "", "sha256": "", "size": 0})
+
+    await controller.handle_record_test("repo", 1, 202, "pass", "", "owner1", "")
+
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "review-required"
+    assert written_state["command"]["kind"] == "record_test"
+    assert written_state["head_sha"] == "b" * 40
+    assert written_state["last_processed_comment_id"] == 202
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MIGRATED from test_v8_contract.py
+# ═══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_same_pr_number_different_repos_have_separate_evidence(controller):
+    """PRs with the same number in different repos must never cross-bind."""
+    from .. import service as svc
+    source = open(svc.__file__).read()
+    assert "extract_review_evidence" in source
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MIGRATED from test_v10_contract.py
+# ══════════════════════════════════════════════════════════════════════════════

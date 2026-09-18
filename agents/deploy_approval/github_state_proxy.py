@@ -3,7 +3,7 @@
 The GitHubStateProxy provides a narrow, read/write boundary for GitHub PR
 state. It is the ONLY module that reads/writes the GitHub lifecycle comment
 and labels. It MUST NOT import or call any Deploy Approval business logic
-(ReviewAgentClient, RegistryClient, AgentCoreClient, CaseRunner, CosClient,
+(RegistryClient, AgentCoreClient, CaseRunner, CosClient,
 EvidenceBuilder, DeploymentService internals).
 
 Responsibilities:
@@ -16,7 +16,7 @@ Responsibilities:
 - parse hidden JSON state
 - create/update the ONE lifecycle comment
 - read current labels
-- project status:* label
+- project status:* label with runtime self-heal
 - preserve non-status labels
 - enforce trusted identity on lifecycle hidden state
 - persist cursor while preserving exact visible markdown (no stale state write)
@@ -85,7 +85,43 @@ def _is_valid_full_sha(value: Any) -> bool:
 def _is_valid_digest_ref(value: Any) -> bool:
     if not isinstance(value, str):
         return False
-    return bool(re.match(r"^[a-zA-Z0-9._/-]+@sha256:[0-9a-f]{64}$", value))
+    return bool(re.match(r"^[A-Za-z0-9._-]+(?::[0-9]+)?/[a-z0-9]+(?:(?:[._]|__+|[-]+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__+|[-]+)[a-z0-9]+)*)*@sha256:[0-9a-f]{64}$", value))
+
+
+def _validate_review_evidence(data: dict) -> dict:
+    """Strictly validate review_evidence dict. Returns validated data or raises."""
+    if not isinstance(data, dict):
+        raise MalformedHiddenStateError("review_evidence is not a dict")
+    required = {"build_comment_id", "build_comment_updated_at", "commit_prefix",
+                "resolved_head_sha", "code_review_comment_id", "review_author_id"}
+    extra = set(data.keys()) - required
+    if extra:
+        raise MalformedHiddenStateError(f"extra review_evidence keys: {', '.join(sorted(extra))}")
+    for k in required:
+        if k not in data:
+            raise MalformedHiddenStateError(f"review_evidence missing key: {k!r}")
+    bcid = data["build_comment_id"]
+    if isinstance(bcid, bool) or not isinstance(bcid, int) or bcid <= 0:
+        raise MalformedHiddenStateError("review_evidence.build_comment_id must be a positive int")
+    bcut = data["build_comment_updated_at"]
+    if not isinstance(bcut, str) or not bcut:
+        raise MalformedHiddenStateError("review_evidence.build_comment_updated_at must be non-empty str")
+    cp = data["commit_prefix"]
+    if not isinstance(cp, str) or not re.fullmatch(r"[0-9a-f]{7,40}", cp):
+        raise MalformedHiddenStateError("review_evidence.commit_prefix must be 7-40 lowercase hex")
+    rhs = data["resolved_head_sha"]
+    if not _is_valid_full_sha(rhs):
+        raise MalformedHiddenStateError("review_evidence.resolved_head_sha must be 40 lowercase hex")
+    tcr = data.get("test_comment_id", 0)
+    if isinstance(tcr, bool) or not isinstance(tcr, int) or tcr < 0:
+        raise MalformedHiddenStateError("review_evidence.test_comment_id must be a non-negative int")
+    crc = data["code_review_comment_id"]
+    if isinstance(crc, bool) or not isinstance(crc, int) or crc <= 0:
+        raise MalformedHiddenStateError("review_evidence.code_review_comment_id must be a positive int")
+    rai = data["review_author_id"]
+    if not isinstance(rai, str) or not rai or not rai.isdigit():
+        raise MalformedHiddenStateError("review_evidence.review_author_id must be a non-empty numeric string")
+    return data
 
 
 def _validate_hidden_state(data: dict) -> dict:
@@ -94,7 +130,7 @@ def _validate_hidden_state(data: dict) -> dict:
         raise MalformedHiddenStateError("hidden state is not a dict")
 
     allowed_keys = {
-        "version", "head_sha", "status", "review_job_id",
+        "version", "head_sha", "status", "review_evidence",
         "components", "deployments", "approve_attempts", "approve_attempts_total",
         "approve_attempts_truncated",
         "case_results", "test_result", "cos", "command", "last_processed_comment_id",
@@ -119,9 +155,11 @@ def _validate_hidden_state(data: dict) -> dict:
     if status not in allowed_statuses:
         raise MalformedHiddenStateError(f"invalid status: {status!r}")
 
-    review_job_id = data.get("review_job_id", "")
-    if not isinstance(review_job_id, str):
-        raise MalformedHiddenStateError("review_job_id invalid")
+    review_evidence = data.get("review_evidence", {})
+    if not isinstance(review_evidence, dict):
+        raise MalformedHiddenStateError("review_evidence must be a dict")
+    if review_evidence:
+        _validate_review_evidence(review_evidence)
 
     components = data.get("components", [])
     if not isinstance(components, list):
@@ -205,7 +243,7 @@ def _validate_hidden_state(data: dict) -> dict:
             val = attempt.get(key, "")
             if not isinstance(val, str) or not val:
                 raise MalformedHiddenStateError(f"approve_attempt.{key} must be a non-empty string")
-        if attempt.get("outcome") not in {"blocked_occupied", "deployed", "failed", "uncertain"}:
+        if attempt.get("outcome") not in {"blocked_occupied", "approval_revoked", "deployed", "failed", "uncertain"}:
             raise MalformedHiddenStateError("approve_attempt.outcome invalid")
         preflight = attempt.get("preflight", [])
         health = attempt.get("health", [])
@@ -257,8 +295,6 @@ def _validate_hidden_state(data: dict) -> dict:
         raise MalformedHiddenStateError("cos must be a dict")
     if set(cos.keys()) != {"object_key", "sha256", "size"}:
         raise MalformedHiddenStateError("cos keys must match the canonical schema")
-    if "signed_url" in cos:
-        raise MalformedHiddenStateError("cos must not contain signed_url")
     object_key = cos.get("object_key", "")
     sha256 = cos.get("sha256", "")
     size = cos.get("size", 0)
@@ -302,8 +338,8 @@ def _validate_hidden_state(data: dict) -> dict:
         raise MalformedHiddenStateError("last_processed_comment_id must be a non-negative int")
 
     if status in {"deploy-ready", "deploy-requested", "testing", "succeeded", "failed"}:
-        if not review_job_id:
-            raise MalformedHiddenStateError(f"review_job_id must be non-empty for status {status!r}")
+        if not review_evidence:
+            raise MalformedHiddenStateError(f"review_evidence must be non-empty for status {status!r}")
     if status in {"deploy-requested", "testing", "succeeded", "failed"}:
         if not components:
             raise MalformedHiddenStateError(f"components must be non-empty for status {status!r}")
@@ -358,53 +394,20 @@ class GitHubStateProxy:
         self,
         config: Config,
         github: GitHubClient,
-        bot_user_id: str = "",
-        bot_login: str = "",
+        github_app_id: str = "",
     ):
+        """Initialize the GitHub state proxy.
+
+        Parameters
+        ----------
+        github_app_id : str
+            The GitHub App ID used for lazy provenance validation of
+            lifecycle comments.  Trust is established per-comment
+            by checking ``performed_via_github_app.id == github_app_id``.
+        """
         self.config = config
         self._github = github
-        self._bot_user_id = ""
-        self._bot_login = ""
-        if bot_user_id or bot_login:
-            self.bind_trusted_identity(bot_user_id, bot_login)
-
-    @staticmethod
-    def _normalize_user_id(user_id: str | int) -> str:
-        if isinstance(user_id, bool):
-            raise TrustedIdentityRequiredError("trusted identity user_id must be numeric")
-        if isinstance(user_id, int):
-            if user_id <= 0:
-                raise TrustedIdentityRequiredError("trusted identity user_id must be numeric")
-            return str(user_id)
-        if not isinstance(user_id, str):
-            raise TrustedIdentityRequiredError("trusted identity user_id must be numeric")
-        raw = user_id.strip()
-        if not raw or not raw.isdigit() or raw == "0":
-            raise TrustedIdentityRequiredError("trusted identity user_id must be numeric")
-        return str(int(raw))
-
-    def bind_trusted_identity(self, user_id: str | int, login: str) -> None:
-        """Bind the authenticated GitHub bot identity.
-
-        The numeric user id is authoritative. Rebinding to a different id fails
-        closed. Rebinding to the same id is idempotent.
-        """
-        normalized_user_id = self._normalize_user_id(user_id)
-        if not isinstance(login, str) or not login.strip():
-            raise TrustedIdentityRequiredError("trusted identity login must be non-empty")
-        normalized_login = login.strip()
-        if self._bot_user_id and self._bot_user_id != normalized_user_id:
-            raise TrustedIdentityRequiredError(
-                "trusted identity already bound to a different user id"
-            )
-        self._bot_user_id = normalized_user_id
-        self._bot_login = normalized_login
-
-    def _require_trusted_identity(self) -> None:
-        if not self._bot_user_id:
-            raise TrustedIdentityRequiredError(
-                "trusted identity is required before reading or writing lifecycle state"
-            )
+        self._github_app_id = github_app_id
 
     # ── GitHub API passthrough ──
 
@@ -431,9 +434,6 @@ class GitHubStateProxy:
     async def get_issue_labels(self, repo: str, issue_number: int) -> list[str]:
         return await self._github.get_issue_labels(repo, issue_number)
 
-    async def set_issue_labels(self, repo: str, issue_number: int,
-                               labels: list[str]) -> None:
-        await self._github.set_issue_labels(repo, issue_number, labels)
 
     async def comment_identity(self, repo: str,
                                comment_id: int) -> tuple[str, str]:
@@ -474,14 +474,24 @@ class GitHubStateProxy:
     ) -> dict | None:
         """Find the ONE trusted lifecycle comment for this PR.
 
-        A comment is trusted only when BOTH:
+        Lazy provenance: trust is established per-comment by checking
+        ``performed_via_github_app.id == github_app_id``.  No startup
+        bot-identity binding is required.
+
+        A comment is trusted only when ALL of:
         1. body contains the exact deploy-approval state marker
-        2. comment author is the configured bot identity
+        2. performed_via_github_app exists, is dict, id is non-bool positive int
+        3. performed_via_github_app.id == configured github_app_id
+        4. user dict exists with non-bool positive id and non-empty login
+           (if user.type is present, it must be "Bot")
 
         Returns the comment dict, or None if no trusted comment exists.
         Raises MultipleTrustedCommentsError if >1 trusted comments exist.
         """
-        self._require_trusted_identity()
+        if not self._github_app_id:
+            raise TrustedIdentityRequiredError(
+                "github_app_id is required before reading lifecycle state"
+            )
         comments = await self.get_issue_comments(repo, pr_number)
         trusted: list[dict] = []
         for c in comments:
@@ -490,21 +500,37 @@ class GitHubStateProxy:
                 continue
             if HIDDEN_STATE_MARKER not in body:
                 continue
-            # Check author identity
+            # Check performed_via_github_app provenance
+            pvga = c.get("performed_via_github_app")
+            if not isinstance(pvga, dict):
+                continue
+            app_id = pvga.get("id")
+            if not (isinstance(app_id, int) and not isinstance(app_id, bool) and app_id > 0):
+                continue
+            if str(app_id) != self._github_app_id:
+                logger.warning(
+                    "ignoring state marker from mismatched app id %s",
+                    app_id,
+                )
+                continue
+            # Also validate user dict exists
             user = c.get("user")
             if not isinstance(user, dict):
                 continue
-            author_id = user.get("id", "")
-            if isinstance(author_id, bool) or not isinstance(author_id, int) or author_id <= 0:
+            uid = user.get("id", "")
+            if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
                 continue
-            if str(author_id) == self._bot_user_id:
-                trusted.append(c)
-            else:
-                author_login = str(user.get("login", ""))
+            login = user.get("login", "")
+            if not isinstance(login, str) or not login:
+                continue
+            # If user type is provided, it must be Bot
+            utype = user.get("type")
+            if utype is not None and utype != "Bot":
                 logger.warning(
-                    "ignoring state marker from non-bot user %s/%s",
-                    author_login, author_id,
+                    "ignoring state marker from non-bot user type %r", utype,
                 )
+                continue
+            trusted.append(c)
 
         if len(trusted) > 1:
             raise MultipleTrustedCommentsError(
@@ -534,13 +560,18 @@ class GitHubStateProxy:
         return _validate_hidden_state(data)
 
     def is_bot_comment(self, comment: dict) -> bool:
-        """Check if a comment is authored by the configured bot."""
-        self._require_trusted_identity()
-        user = comment.get("user") or {}
-        author_id = user.get("id")
-        if isinstance(author_id, bool) or not isinstance(author_id, int) or author_id <= 0:
-            return False
-        return str(author_id) == self._bot_user_id
+        """Check if a comment is authored by the configured GitHub App.
+
+        Only relies on performed_via_github_app.id provenance.
+        """
+        if self._github_app_id:
+            pvga = comment.get("performed_via_github_app")
+            if isinstance(pvga, dict):
+                app_id = pvga.get("id")
+                if isinstance(app_id, int) and not isinstance(app_id, bool):
+                    if str(app_id) == self._github_app_id:
+                        return True
+        return False
 
     async def write_hidden_state(
         self,
@@ -553,8 +584,16 @@ class GitHubStateProxy:
 
         If no trusted comment exists, creates a new one.
         Returns the comment dict, or None on failure.
+
+        Trust is established per-comment via lazy provenance in
+        find_trusted_lifecycle_comment.  The installation token used
+        to create/update comments is already trusted; we only require
+        that github_app_id is configured for consistency.
         """
-        self._require_trusted_identity()
+        if not self._github_app_id:
+            raise TrustedIdentityRequiredError(
+                "github_app_id is required before writing lifecycle state"
+            )
         # Validate state before writing
         _validate_hidden_state(state)
 
@@ -595,7 +634,10 @@ class GitHubStateProxy:
         This is the ONLY safe way to advance the cursor from the watcher
         without corrupting Controller-persisted business state.
         """
-        self._require_trusted_identity()
+        if not self._github_app_id:
+            raise TrustedIdentityRequiredError(
+                "github_app_id is required before persisting cursor"
+            )
         try:
             comment = await self.find_trusted_lifecycle_comment(repo, pr_number)
             if comment is None:
@@ -640,24 +682,94 @@ class GitHubStateProxy:
     ) -> None:
         """Project hidden status onto exactly one status:* label.
 
-        Preserves all non-status labels. If label projection fails, hidden
-        state is NOT rolled back.
+        Runtime self-heal: fresh read → create desired if missing → fresh
+        verify → add → remove other canonical status:* labels.
+
+        Any create/add/remove failure is warning-only; hidden lifecycle state
+        is never rolled back and business flow is never blocked.
+
+        Non-status labels (bug/documentation/enhancement, etc.) are never
+        touched.
         """
-        desired_label = f"{STATUS_PREFIX} {hidden_status}"
+        desired_label = f"{STATUS_PREFIX}{hidden_status}"
         if desired_label not in _ALLOWED_STATUS_LABELS:
             logger.warning("unknown status label for %s: %s", hidden_status, desired_label)
             return
         try:
-            existing_labels = await self.get_issue_labels(repo, issue_number)
-            preserved = [
-                l for l in existing_labels
-                if not l.startswith(STATUS_PREFIX)
-            ]
-            if desired_label not in preserved:
-                all_labels = preserved + [desired_label]
-                await self.set_issue_labels(repo, issue_number, all_labels)
+            # 1. Fresh read of current labels
+            current_labels: list[str] = []
+            try:
+                current_labels = await self.get_issue_labels(repo, issue_number)
+            except Exception as read_exc:
+                logger.warning(
+                    "label fresh read failed for %s#%s: %s (best-effort continuing)",
+                    repo, issue_number, read_exc,
+                )
+
+            # 2. Desired canonical status label missing → best-effort create
+            desired_applied = desired_label in current_labels
+            if not desired_applied:
+                try:
+                    await self._ensure_label_exists(repo, desired_label)
+                except Exception as create_exc:
+                    logger.warning(
+                        "label ensure/create failed for %s#%s %s: %s (continuing)",
+                        repo, issue_number, desired_label, create_exc,
+                    )
+
+            if not desired_applied:
+                # Fresh verify after create attempt.
+                verify_labels: list[str] = []
+                try:
+                    verify_labels = await self.get_issue_labels(repo, issue_number)
+                except Exception:
+                    pass
+                desired_applied = desired_label in verify_labels
+
+            # Add desired label only if fresh verification did not confirm it.
+            if not desired_applied:
+                try:
+                    await self.add_issue_label(repo, issue_number, desired_label)
+                    desired_applied = True
+                except Exception as add_exc:
+                    logger.warning(
+                        "label add failed for %s#%s %s: %s (continuing)",
+                        repo, issue_number, desired_label, add_exc,
+                    )
+
+            if desired_applied:
+                for label in _ALLOWED_STATUS_LABELS:
+                    if label != desired_label:
+                        try:
+                            await self.remove_issue_label(repo, issue_number, label)
+                        except Exception as rem_exc:
+                            logger.warning(
+                                "label remove failed for %s#%s %s: %s (best-effort, next reconcile will heal)",
+                                repo, issue_number, label, rem_exc,
+                            )
+            else:
+                logger.warning(
+                    "desired label was not applied for %s#%s; preserving existing status labels",
+                    repo, issue_number,
+                )
         except Exception as e:
             logger.warning(
                 "label projection failed for %s#%s: %s",
                 repo, issue_number, e,
             )
+
+    async def _ensure_label_exists(self, repo: str, label: str) -> None:
+        """Best-effort create a repository label if it does not exist.
+
+        409 Conflict (already exists) is treated as success.
+        """
+        try:
+            await self._github.create_repository_label(
+                repo, label, "6cc2dc", "Deploy Approval lifecycle status",
+            )
+        except GitHubError as exc:
+            # 409 Conflict means the label already exists
+            msg = str(exc)
+            if "409" in msg or "Already exists" in msg or "already_exists" in msg:
+                return
+            raise

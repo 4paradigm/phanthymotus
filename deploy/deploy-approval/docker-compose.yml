@@ -5,6 +5,7 @@ services:
       dockerfile: agents/deploy_approval/Dockerfile
     image: phanthy-motus/deploy-approval:local
     container_name: deploy-approval
+    user: "${DEPLOY_APPROVAL_RUNTIME_UID:-65532}:${DEPLOY_APPROVAL_RUNTIME_GID:-65532}"
     # ── Single-replica / single-writer topology ───────────────────────
     # Deploy Approval is restart-safe stateless, but intentionally
     # single-replica / single-writer. Exactly one GitHubCommandWatcher serially
@@ -14,8 +15,12 @@ services:
     # unsafe-side-effect model.
     restart: unless-stopped
     environment:
-      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      GITHUB_APP_ID: "${GITHUB_APP_ID}"
+      GITHUB_INSTALLATION_ID: "${GITHUB_INSTALLATION_ID}"
+      GITHUB_APP_PRIVATE_KEY_FILE: "${GITHUB_APP_PRIVATE_KEY_FILE}"
+      DEPLOY_APPROVAL_PUBLIC_BASE_URL: "${DEPLOY_APPROVAL_PUBLIC_BASE_URL}"
       GITHUB_REPOS: "${GITHUB_REPOS:-4paradigm/phanthymotus,4paradigm/phanthymotus-driver}"
+      DEPLOY_APPROVAL_FORK_TEST_MODE: "${DEPLOY_APPROVAL_FORK_TEST_MODE:-false}"
       POLL_ENABLED: "${POLL_ENABLED:-true}"
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-30}"
       WEBHOOK_ENABLED: "${WEBHOOK_ENABLED:-false}"
@@ -23,12 +28,12 @@ services:
       REGISTRY: "${REGISTRY:-}"
       REGISTRY_USER: "${REGISTRY_USER:-}"
       REGISTRY_PASSWORD: "${REGISTRY_PASSWORD:-}"
-      ACCESS_TOKEN: "${ACCESS_TOKEN}"
     extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./machines.yaml:/run/deploy-approval/machines.yaml:ro
       - ./secrets.yaml:/run/deploy-approval/secrets.yaml:ro
+      - ./certs:/run/deploy-approval/certs:ro
+      - "${GITHUB_APP_PRIVATE_KEY_FILE}:${GITHUB_APP_PRIVATE_KEY_FILE}:ro"
     ports:
       - "25001:25001"
     read_only: true

@@ -5,8 +5,6 @@
 #   ./deploy.sh up|rebuild|start|stop|restart|down|status|logs
 #
 # Fixed inputs:
-#   review env: ../pr-review/.env
-#   agent core env: /opt/phanthy-motus/.env
 #   machine policy: ./machines.yaml
 #   COS secrets: ./secrets.yaml
 #
@@ -18,13 +16,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/deploy.sh"
 cd "$SCRIPT_DIR"
 COMPOSE="docker compose"
-REVIEW_ENV="../pr-review/.env"
-AGENT_CORE_ENV="/opt/phanthy-motus/.env"
 MACHINES_FILE="./machines.yaml"
 SECRETS_FILE="./secrets.yaml"
+CERTS_DIR="./certs"
 TMP_ENV=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+require_runtime_user() {
+    RUNTIME_UID="$(id -u)"
+    RUNTIME_GID="$(id -g)"
+    [ "$RUNTIME_UID" -gt 0 ] || die "deploy.sh runtime user must be non-root"
+    [ "$RUNTIME_GID" -gt 0 ] || die "deploy.sh runtime group must be non-root"
+    export RUNTIME_UID RUNTIME_GID
+}
 
 dotenv_parse() {
     local file="$1"
@@ -81,18 +86,123 @@ require_env_value() {
     printf '%s\n' "$value"
 }
 
-require_review_env() {
-    [ -f "$REVIEW_ENV" ] && [ ! -L "$REVIEW_ENV" ] || die "Review Agent .env must be a regular file: $REVIEW_ENV"
-    [ -r "$REVIEW_ENV" ] || die "Review Agent .env not readable: $REVIEW_ENV"
-    dotenv_parse "$REVIEW_ENV" >/dev/null
-    require_env_value "$REVIEW_ENV" GITHUB_TOKEN "GITHUB_TOKEN" >/dev/null
+require_github_app_inputs() {
+    [ -n "${GITHUB_APP_ID:-}" ] || die "GITHUB_APP_ID is required"
+    [ -n "${GITHUB_INSTALLATION_ID:-}" ] || die "GITHUB_INSTALLATION_ID is required"
+    case "$GITHUB_APP_ID" in ''|*[!0-9]*) die "GITHUB_APP_ID must be positive decimal";; esac
+    case "$GITHUB_INSTALLATION_ID" in ''|*[!0-9]*) die "GITHUB_INSTALLATION_ID must be positive decimal";; esac
+    [ "$GITHUB_APP_ID" -gt 0 ] || die "GITHUB_APP_ID must be positive decimal"
+    [ "$GITHUB_INSTALLATION_ID" -gt 0 ] || die "GITHUB_INSTALLATION_ID must be positive decimal"
+    [ -n "${GITHUB_APP_PRIVATE_KEY_FILE:-}" ] || die "GITHUB_APP_PRIVATE_KEY_FILE is required"
+    python3 - "$GITHUB_APP_PRIVATE_KEY_FILE" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_absolute():
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE must be an absolute path")
+try:
+    info = path.lstat()
+except OSError:
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE does not exist")
+if stat.S_ISLNK(info.st_mode):
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE must not be a symlink")
+if not stat.S_ISREG(info.st_mode):
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE must be a regular file")
+if info.st_uid != os.getuid():
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE must be owned by invoking user")
+if os.getuid() == 0:
+    raise SystemExit("deploy.sh must run as a non-root user")
+if stat.S_IMODE(info.st_mode) & 0o077:
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE must not grant group/world access")
+if not os.access(path, os.R_OK):
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE is not readable")
+try:
+    text = path.read_text(encoding="ascii")
+except (OSError, UnicodeDecodeError):
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE must be PEM text")
+if "PRIVATE KEY" not in text or "-----BEGIN" not in text:
+    raise SystemExit("GITHUB_APP_PRIVATE_KEY_FILE must contain a PEM private key")
+print("GITHUB_APP_PRIVATE_KEY_OK")
+PY
 }
 
-require_core_env() {
-    [ -f "$AGENT_CORE_ENV" ] && [ ! -L "$AGENT_CORE_ENV" ] || die "Agent Core .env must be a regular file: $AGENT_CORE_ENV"
-    [ -r "$AGENT_CORE_ENV" ] || die "Agent Core .env not readable: $AGENT_CORE_ENV"
-    dotenv_parse "$AGENT_CORE_ENV" >/dev/null
-    require_env_value "$AGENT_CORE_ENV" ACCESS_TOKEN "ACCESS_TOKEN" >/dev/null
+require_public_base_url() {
+    [ -n "${DEPLOY_APPROVAL_PUBLIC_BASE_URL:-}" ] || die "DEPLOY_APPROVAL_PUBLIC_BASE_URL is required"
+    python3 - "$DEPLOY_APPROVAL_PUBLIC_BASE_URL" <<'PY'
+import sys
+import urllib.parse
+value = sys.argv[1]
+parsed = urllib.parse.urlsplit(value)
+if (parsed.scheme != "https" or not parsed.netloc or parsed.username is not None
+        or parsed.password is not None or parsed.query or parsed.fragment):
+    raise SystemExit("DEPLOY_APPROVAL_PUBLIC_BASE_URL must be an absolute HTTPS URL without query or fragment")
+print("DEPLOY_APPROVAL_PUBLIC_BASE_URL_OK")
+PY
+}
+
+
+
+require_private_local_inputs() {
+    python3 - "$MACHINES_FILE" "$SECRETS_FILE" "$CERTS_DIR" <<'PY'
+import os
+import stat
+import ssl
+import sys
+from pathlib import Path
+
+machines_file = Path(sys.argv[1])
+secrets_file = Path(sys.argv[2])
+certs_dir = Path(sys.argv[3])
+expected_uid = os.getuid()
+
+
+def _check_owned_private(path: Path, *, label: str, directory: bool) -> None:
+    try:
+        st = path.lstat()
+    except OSError:
+        raise SystemExit(f"{label} is missing")
+    if stat.S_ISLNK(st.st_mode):
+        raise SystemExit(f"{label} must not be a symlink")
+    if directory:
+        if not stat.S_ISDIR(st.st_mode):
+            raise SystemExit(f"{label} must be a directory")
+        if not (st.st_mode & stat.S_IXUSR):
+            raise SystemExit(f"{label} must be searchable by owner")
+    elif not stat.S_ISREG(st.st_mode):
+        raise SystemExit(f"{label} must be a regular file")
+    if st.st_uid != expected_uid:
+        raise SystemExit(f"{label} must be owned by the invoking user")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        raise SystemExit(f"{label} must not grant group/world permissions")
+
+
+_check_owned_private(machines_file, label="machines.yaml", directory=False)
+_check_owned_private(secrets_file, label="secrets.yaml", directory=False)
+_check_owned_private(certs_dir, label="certs directory", directory=True)
+
+for cert in sorted(certs_dir.iterdir()):
+    if not cert.name.endswith(".pem"):
+        continue
+    if cert.parent != certs_dir:
+        raise SystemExit(f"TLS peer cert {cert.name} must be a direct child of certs directory")
+    _check_owned_private(cert, label=f"TLS peer cert {cert.name}", directory=False)
+    try:
+        pem = cert.read_text(encoding="ascii")
+    except OSError:
+        raise SystemExit(f"TLS peer cert {cert.name} is not readable")
+    except UnicodeDecodeError:
+        raise SystemExit(f"TLS peer cert {cert.name} must be PEM text")
+    if pem.count("-----BEGIN CERTIFICATE-----") != 1 or pem.count("-----END CERTIFICATE-----") != 1:
+        raise SystemExit(f"TLS peer cert {cert.name} must contain exactly one PEM certificate")
+    try:
+        ssl.PEM_cert_to_DER_cert(pem)
+    except ValueError:
+        raise SystemExit(f"TLS peer cert {cert.name} is not a valid PEM certificate")
+print("LOCAL_INPUT_PERMISSIONS_OK")
+PY
 }
 
 require_machine_policy() {
@@ -100,6 +210,7 @@ require_machine_policy() {
     [ -r "$MACHINES_FILE" ] || die "Machine policy file not readable: $MACHINES_FILE"
     python3 - "$MACHINES_FILE" <<'PY'
 import sys, yaml
+from pathlib import Path
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh)
@@ -126,7 +237,63 @@ for alias, machine in machines.items():
     for owner in owners:
         if not isinstance(owner, str) or not owner.strip():
             raise SystemExit(f"machine {alias!r} has an invalid owner entry")
+    cert_file = machine.get("tls_peer_cert_file")
+    if not isinstance(cert_file, str) or not cert_file.strip():
+        raise SystemExit(f"machine {alias!r} must define tls_peer_cert_file")
+    cert_val = cert_file.strip()
+    if not cert_val.endswith(".pem"):
+        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must end with .pem")
+    cert_path = Path(cert_val)
+    cert_root = Path("/run/deploy-approval/certs")
+    if not cert_path.is_absolute():
+        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must be absolute")
+    if ".." in cert_path.parts:
+        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must not contain '..'")
+    if cert_path.parent != cert_root:
+        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must be a direct child of {cert_root}")
 print("MACHINE_POLICY_OK")
+PY
+    python3 - "$MACHINES_FILE" "$CERTS_DIR" <<'PY'
+import ssl
+import sys
+import yaml
+from pathlib import Path
+
+machines_file = Path(sys.argv[1])
+local_certs_dir = Path(sys.argv[2])
+with machines_file.open("r", encoding="utf-8") as fh:
+    data = yaml.safe_load(fh)
+machines = data.get("machines", {})
+cert_root = Path("/run/deploy-approval/certs")
+for alias, machine in machines.items():
+    cert_file_raw = str(machine.get("tls_peer_cert_file", "")).strip()
+    if not cert_file_raw.endswith(".pem"):
+        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must end with .pem")
+    logical = Path(cert_file_raw)
+    if logical.parent != cert_root:
+        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must be a direct child of {cert_root}")
+    local = local_certs_dir / logical.name
+    try:
+        stat = local.lstat()
+    except OSError:
+        raise SystemExit(f"machine {alias!r} TLS peer cert is missing")
+    if local.is_symlink():
+        raise SystemExit(f"machine {alias!r} TLS peer cert must not be a symlink")
+    if not local.is_file():
+        raise SystemExit(f"machine {alias!r} TLS peer cert must be a regular file")
+    try:
+        pem = local.read_text(encoding="ascii")
+    except OSError:
+        raise SystemExit(f"machine {alias!r} TLS peer cert is not readable")
+    except UnicodeDecodeError:
+        raise SystemExit(f"machine {alias!r} TLS peer cert must be PEM text")
+    if pem.count("-----BEGIN CERTIFICATE-----") != 1 or pem.count("-----END CERTIFICATE-----") != 1:
+        raise SystemExit(f"machine {alias!r} TLS peer cert must contain exactly one PEM certificate")
+    try:
+        ssl.PEM_cert_to_DER_cert(pem)
+    except ValueError:
+        raise SystemExit(f"machine {alias!r} TLS peer cert is not a valid PEM certificate")
+print("MACHINE_TLS_CERTS_OK")
 PY
 }
 
@@ -147,25 +314,34 @@ if cos is None:
     cos = {}
 if not isinstance(cos, dict):
     raise SystemExit("cos section must be a mapping")
-for key in ("region", "bucket", "secret_id", "secret_key", "session_token"):
+for key in ("region", "bucket", "secret_id", "secret_key"):
     value = cos.get(key, "")
     if value is not None and not isinstance(value, str):
         raise SystemExit(f"cos.{key} must be a string")
-prefix = cos.get("prefix", "deploy-approval")
-if not isinstance(prefix, str) or not prefix.strip():
-    raise SystemExit("cos.prefix must be a non-empty string")
-ttl = cos.get("signed_url_ttl_seconds", 604800)
-if isinstance(ttl, bool) or not isinstance(ttl, int):
-    raise SystemExit("cos.signed_url_ttl_seconds must be an integer")
-if ttl < 1 or ttl > 604800:
-    raise SystemExit("cos.signed_url_ttl_seconds must be 1..604800")
+tokens = data.get("agent_core_tokens")
+if not isinstance(tokens, dict) or not tokens:
+    raise SystemExit("agent_core_tokens must be a non-empty mapping")
+for alias, token in tokens.items():
+    if not isinstance(alias, str) or not alias.strip():
+        raise SystemExit("agent_core_tokens keys must be non-empty strings")
+    if not isinstance(token, str) or not token.strip():
+        raise SystemExit(f"agent_core_tokens[{alias!r}] must be a non-empty string")
+oauth = data.get("github_oauth")
+if not isinstance(oauth, dict):
+    raise SystemExit("github_oauth must be a mapping")
+for key in ("client_id", "client_secret"):
+    value = oauth.get(key, "")
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"github_oauth.{key} must be a non-empty string")
 print("SECRETS_OK")
 PY
 }
 
 require_runtime_inputs() {
-    require_review_env
-    require_core_env
+    require_runtime_user
+    require_github_app_inputs
+    require_public_base_url
+    require_private_local_inputs
     require_machine_policy
     require_secrets
 }
@@ -174,15 +350,14 @@ build_env_file() {
     local tmp
     tmp="$(mktemp)"
     chmod 600 "$tmp"
-    {
-        printf 'GITHUB_TOKEN=%s\n' "$(require_env_value "$REVIEW_ENV" GITHUB_TOKEN GITHUB_TOKEN)"
-        printf 'ACCESS_TOKEN=%s\n' "$(require_env_value "$AGENT_CORE_ENV" ACCESS_TOKEN ACCESS_TOKEN)"
+    {        printf 'DEPLOY_APPROVAL_RUNTIME_UID=%s\n' "$RUNTIME_UID"
+        printf 'DEPLOY_APPROVAL_RUNTIME_GID=%s\n' "$RUNTIME_GID"
+        fork_mode="${DEPLOY_APPROVAL_FORK_TEST_MODE:-false}"
+        printf 'DEPLOY_APPROVAL_FORK_TEST_MODE=%s\n' "$fork_mode"
         for key in GITHUB_REPOS POLL_ENABLED POLL_INTERVAL_SECONDS WEBHOOK_ENABLED GITHUB_WEBHOOK_SECRET REGISTRY REGISTRY_USER REGISTRY_PASSWORD; do
-            if dotenv_has_key "$REVIEW_ENV" "$key"; then
-                value="$(dotenv_value "$REVIEW_ENV" "$key")"
-                if [ -n "$value" ]; then
-                    printf '%s=%s\n' "$key" "$value"
-                fi
+            value="${!key:-}"
+            if [ -n "$value" ]; then
+                printf '%s=%s\n' "$key" "$value"
             fi
         done
     } > "$tmp"
@@ -207,8 +382,18 @@ cmd_rebuild() {
 }
 
 cmd_stop() { $COMPOSE stop; }
-cmd_start() { $COMPOSE start; }
-cmd_restart() { $COMPOSE restart; }
+cmd_start() {
+    require_runtime_inputs
+    TMP_ENV="$(build_env_file)"
+    trap 'rm -f "$TMP_ENV"' EXIT
+    $COMPOSE --env-file "$TMP_ENV" up -d --no-build
+}
+cmd_restart() {
+    require_runtime_inputs
+    TMP_ENV="$(build_env_file)"
+    trap 'rm -f "$TMP_ENV"' EXIT
+    $COMPOSE --env-file "$TMP_ENV" up -d --no-build --force-recreate
+}
 cmd_down() { $COMPOSE down; }
 
 cmd_status() {

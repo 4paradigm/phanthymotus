@@ -2,7 +2,65 @@
 
 本文是 Deploy Approval 的中文主文档，描述当前冻结的 stateless 合同。
 
-Deploy Controller 只负责部署审批与状态编排，**代码不修改**；代码构建与 Review 仍由 Review Agent 负责。当前只支持 `4paradigm/phanthymotus` 和 `4paradigm/phanthymotus-driver`，未知仓库必须 fail closed。
+Deploy Controller 只负责部署审批与状态编排，**代码不修改**；代码构建与 Review 仍由 Review Agent 负责。生产模式只支持 `4paradigm/phanthymotus` 和 `4paradigm/phanthymotus-driver`；显式设置 `DEPLOY_APPROVAL_FORK_TEST_MODE=true` 时只支持 fork E2E 测试 repo：`Haohao-end/phanthymotus`当前不测试 driver fork。缺失、重复、official/fork 混用、第三方仓库或模式不匹配均必须 fail closed。
+
+## Review Agent 集成
+
+Deploy Approval **不调用** Review Agent HTTP API（`/api/status`、`PR Conversation comments`、`PR Conversation comments/{id}`）。
+Deploy Approval **不需要**：
+- Review Agent 主机 / IP / 端口
+- Review Agent `GITHUB_TOKEN`
+- Review Agent SSH / Dashboard
+- `host.docker.internal` 网络连通性
+
+Deploy Approval 仅通过 **GitHub PR 对话评论** 读取 Review Agent 输出。
+
+### 评论协议
+
+Review Agent 使用固定标记 `<!-- pr-review-agent -->` 写入评论，包含三个部分：
+
+1. **Build Result** — `## PR Review Agent — Build Result`
+   - 包含提交短 SHA、目标构建表和镜像引用。
+2. **Test Results** — `## PR Review Agent — Test Results`（可选）
+   - 包含测试套件通过/失败计数。
+3. **Code Review** — `## PR Review Agent — Code Review`
+   - 包含审查文本。
+
+Deploy Approval 通过 `review_comment_parser.py` 解析这些评论并提取
+`ReviewCommentEvidence`，包含 build_comment_id、builds、test/code review 来源。
+
+### 可信评论作者
+
+Deploy Approval 验证 Review Agent 评论来自 `secrets.yaml` 中配置的可信作者：
+
+```yaml
+review_comment_trust:
+  author_id: "<review-agent-github-user-id>"
+  author_login: "<review-agent-github-login>"
+```
+
+- `author_id` **必填**，必须是正整数。
+- `author_login` 可选，但如果配置必须与 `comment.user.login` 匹配。
+- `performed_via_github_app` 可能为 `null`（Review Agent 使用用户 PAT）。
+- 来自其他作者的评论将被**拒绝（fail closed）**。
+
+### 生产 Review Agent 单例不变量
+
+**对于生产仓库（`4paradigm/phanthymotus`、`4paradigm/phanthymotus-driver`）：**
+
+同一时刻最多只能存在一个权威的 Review Agent poller/producer。
+
+原因：
+- Review Agent poller watermark / processed comment IDs 是实例本地状态。
+- 两台 Review Agent 服务器看到同一条 `/request_bot_review` 会产生重复的 job/comment/build。
+- 不存在跨实例分布式去重。
+
+**测试 Review Agent** 必须使用：
+- `GITHUB_REPOS=Haohao-end/phanthymotus`
+- 配合 `DEPLOY_APPROVAL_FORK_TEST_MODE=true`
+- 绝不允许监听生产仓库。
+
+`AUTHORITATIVE_REVIEW_AGENT_COUNT_FOR_PRODUCTION_REPOS=1` 是上线人工门禁。
 
 ## 三层模型
 
@@ -42,12 +100,12 @@ merge 后正式 release / production deployment 属于 main/release workflow，�
 
 Source matrix:
 
-- Review Agent API: job / build / target / `review_image_tag` source facts
-- Registry: only immutable verification / resolution of that exact `review_image_tag`
+- GitHub PR comments: Review Agent output (build / test / code review evidence)
+- Registry: only immutable verification / resolution of the exact `review_image_tag` from comments
 - Agent Core: runtime identity / current `running_image` / MCP evidence
 - GitHub hidden JSON: restart-safe persistence snapshot
 
-`phanthymotus` 只部署 `perception` / `actucore`，`CORE` 不作为可部署组件；`phanthymotus-driver` 以 `driver_path` 作为机器策略身份，但 runtime id 必须通过 Agent Core 的精确 image repository 匹配得到，不能直接从 `driver_path` 拼接或模糊推导。Deploy Controller 通过配置的 `node_host` 连接到已存在的 Agent Core API，不做 Agent Core registration。Registry 只作为 `/request_deploy` 内部的 exact Review Agent image 解析与 immutable verification 实现细节，不作为独立 actor 或独立控制面。
+`phanthymotus` 只部署 `perception` / `actucore`，`CORE` 不作为可部署组件；`phanthymotus-driver` 以 `driver_path` 作为机器策略身份，但 runtime id 必须通过 Agent Core 的精确 image repository 匹配得到，不能直接从 `driver_path` 拼接或模糊推导。Deploy Controller 通过本地管理员维护的 `machines.yaml` 中配置的 literal IPv4 `node_host` 连接到已存在的 Agent Core API，不做 Agent Core registration。Agent Core endpoint 固定为 `https://<node_host>:15678`，HTTP redirect 禁用。每台机器必须配置 `/run/deploy-approval/certs/` 下独享的 `tls_peer_cert_file`，作为管理员预置的 exact peer leaf certificate pin。Deploy Approval 不做 TOFU，不从 Robot 首次抓取证书，不允许 `verify=False`，也不允许 PR/comment 指定目标 IP 或证书路径。Registry 只作为 `/request_deploy` 内部的 exact Review Agent image 解析与 immutable verification 实现细节，不作为独立 actor 或独立控制面。
 
 fresh Review Agent build_results + fresh Registry immutable resolution
 ↓
@@ -69,6 +127,46 @@ command.phase=uncertain
 status=deploy-requested
 ZERO later POST
 NEW approve only
+
+## Full-Coverage Machine Gate
+
+/approve_deploy 必须首先通过 full-coverage gate：
+
+1. 计算 ALL bound component_ids
+2. 计算 selected machine 实际能覆盖的 component_ids
+3. 只有 machine_compatible_component_ids >= all_component_ids 才允许继续
+4. 如果 coverage 不足：ZERO deploy POST，status 保持 deploy-requested，comment 列出 full-coverage machines
+
+full-coverage gate 确保不再存在 partial machine-group 部署、不再跨机器轮询、不再等待剩余 component。
+
+full-coverage gate 必须在 CLEAN gate 之前执行。
+
+CLEAN 通过后：FULL-COVERAGE -> running_image-only CLEAN -> fresh exact approval comment -> final fresh PR/full HEAD -> persist command.phase=executing to GitHub FIRST -> deploy ALL components -> durable status: testing -> fixed Case (advisory only) -> Machine Owner /record_test -> succeeded | failed.
+
+不再检查 "所有 machine group 是否全部部署完毕"，因为 selected machine 已要求覆盖全部 components。
+
+**无 post-deploy health gate：** 每次 Agent Core deploy POST 返回正常即视为该组件部署成功，不额外调用 `driver_status` 轮询 `running_image` 来判定生命周期成功。终态证据上传前，对已部署 runtime 做一次性的 `driver_status` 日志快照；失败只写固定 marker，不改变已写入 GitHub 的终态。
+
+## Agent Authentication
+
+## GitHub Installation Model
+
+`GITHUB_INSTALLATION_ID` identifies a GitHub App installation on an
+account/organization; it is **not** inherently one ID per repository.
+A single installation can be configured for multiple selected repositories.
+
+Current production auth intentionally uses one installation ID.
+Current runtime validation target is `4paradigm/phanthymotus`.
+`4paradigm/phanthymotus-driver` runtime authorization is **DEFERRED**.
+
+When driver is enabled, prefer adding driver to the same installation's
+selected repository set. Only introduce repo-to-installation routing
+if GitHub later proves there are distinct installations.
+
+
+
+- **Deploy Approval** uses GitHub App (`GITHUB_APP_ID`, `GITHUB_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_FILE`).
+- **Review Agent** uses a user-provided `GITHUB_TOKEN`. This is strictly separate from Deploy Approval's GitHub App credentials.
 
 ## Actor
 
@@ -175,17 +273,15 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 - 只能由 PR Author 发起
 - 先 fresh GET PR
 - 再 fresh full HEAD
-- 再调用 Review Agent 的 `list_jobs(repo=repo, status="review_done")`
-- Deploy Controller 在本地做 exact 过滤：
-  - exact repo
-  - exact PR number
-  - exact full 40-char HEAD SHA
-  - exact `status == review_done`
-- 选择 latest exact `review_done` Job
-- 绑定 `review_job_id`
+- 再 fresh GET PR 评论
+- 通过 `review_comment_parser.extract_review_evidence()` 解析评论
+- 验证评论作者为可信作者
+- 验证 comment 中的 commit prefix resolve 到 fresh full HEAD
+- 选择 latest unambiguous 同 HEAD review evidence
+- 绑定 `review_evidence`（build_comment_id、test_comment_id、code_review_comment_id）
 - 只取该 Job 中所有 successful deployable components
 - CORE 排除
-- `review_image_tag` 必须直接来自 Review Agent API 的 `build_results[].image_tag`
+- `review_image_tag` 必须直接来自 Review Agent Build Result 评论的 Images section
 - mutable image tag 只允许通过现有 Registry client 一次性解析成 immutable `repository@sha256:...`
 - 保存 `resolved_platform`
 - hidden JSON 持久化 validation snapshot
@@ -217,6 +313,15 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 - `status: review-required`
 - 下一步给 Developer：`/request_bot_review`
 
+### Full-Coverage Machine Gate
+
+一条 `/approve_deploy` 命令只选择一台 machine。这台 machine 必须覆盖 ALL bound components。
+
+- coverage 不完整 → ZERO deploy POST，status 保持 `deploy-requested`，提示用户选择 full-coverage machine
+- 不存在跨 machine partial success
+- 不存在"先部署一部分，再换另一台机器继续部署"的流程
+- 成功覆盖并部署全部 components 后直接进入 `testing`
+
 ### CLEAN GATE
 
 CLEAN GATE 只读取 `running_image`，不判断机器状态。禁止把下面这些值用于 pre-deploy gate：
@@ -230,7 +335,7 @@ CLEAN GATE 只读取 `running_image`，不判断机器状态。禁止把下面�
 - node availability state
 - machine readiness state
 
-如果同一台 machine group 的所有 selected remaining components 都满足：
+如果 selected machine 上的 ALL bound components 都满足：
 
 ```text
 running_image == ""
@@ -259,10 +364,10 @@ running_image != ""
 
 ### 同一 machine 的多组件预检
 
-同一 machine approval 下的多个 selected remaining components 必须先全部 preflight：
+本次 approval 的 ALL bound components 必须在 ANY deploy POST 前全部 preflight：
 
 ```text
-ALL selected remaining components preflight
+ALL bound components preflight
 BEFORE
 ANY deploy POST
 ```
@@ -273,34 +378,63 @@ ANY deploy POST
 
 只有全部 `running_image == ""` 时，才执行：
 
-1. fresh GitHub hidden state
-2. persist `command.phase = executing`
-3. 然后才允许第一个 Agent Core deploy POST
+1. fresh exact approval comment revalidation
+2. final fresh PR/full HEAD
+3. persist `command.phase = executing` to GitHub FIRST
+4. 然后才允许第一个 Agent Core deploy POST
 
 严格顺序：
 
 ```text
 CLEAN GATE PASS
     ↓
+fresh exact approval comment revalidation (comment valid, id exact, actor exact, body parses, alias exact)
+    ↓
+any failure -> approve_attempt.outcome=approval_revoked, status=deploy-requested, command.phase=completed, ZERO POST
+    ↓
+final fresh PR/full HEAD (drift -> review-required, ZERO POST)
+    ↓
 GitHub hidden state command.phase=executing persisted
     ↓
 POST existing Agent Core deploy
 ```
 
-### partial machine groups
+### fresh exact approval comment revalidation
 
-同一 machine approval 只部署该 machine 当前兼容且尚未部署的 components。不同 machine 需要分别 NEW `/approve_deploy`。如果只完成了一部分 machine group，`status` 仍保持 `deploy-requested`；只有所有 required components 成功部署后才进入 `testing`。
+任何检查失败：
+
+- comment object valid
+- comment id exact
+- actor id exact
+- body parses as approve_deploy
+- machine alias exact
+
+则：
+
+- `approve_attempt.outcome=approval_revoked`
+- `status=deploy-requested`
+- `command.phase=completed`
+- cursor advances to current comment
+- ZERO deploy POST
+- Machine Owner must send a NEW `/approve_deploy`
+
+`approval_revoked` 不是 top-level status，不增加新的 lifecycle state。
 
 ## Case：advisory only
 
-固定 case 只在所有 required components 都部署完之后运行，而且只作为 advisory evidence：
+固定 case 只在所有 required components 都部署完之后、且 durable testing state 已写入 GitHub 之后运行，而且只作为 advisory evidence：
 
 - 不得在所有 required components deploy 完成前运行
+- 不得在 durable testing hidden state 写入前运行
+- 不得在 testing label projection 前运行
 - Case PASS 不得自动把状态改成 `succeeded`
 - Case FAIL 不得阻止 Machine Owner 最终 `/record_test result=pass`
+- Case FAIL 不得将 `testing` 改为 `failed`
+- Case exception/timeout/unavailable 不得回退 `testing` 状态
 - Case 必须使用实际 Agent Core binding / actual runtime id
 - 不允许 placeholder PASS
 - 不允许 shell / subprocess / SSH / user-supplied executable
+- advisory case_results 持久化前必须 fresh-read hidden state 并校验 same HEAD + status=testing + same command
 
 ### 需要存在的真实行为测试
 
@@ -335,10 +469,13 @@ POST existing Agent Core deploy
 - `result=pass` -> `status: succeeded`
 - `result=fail` -> `status: failed`
 
-COS 默认归档只包含两个文件：
+COS 默认归档只包含一个文件：
 
-- `manifest.json`
-- `evidence.log`
+- `evidence.log.gz`
+
+COS object key 固定为：
+
+`phanthymotus_pr/<repo-dir>/<YYYY-MM>/<YYYY-MM-DD>/pr-<N>/evidence-<FULL_HEAD_SHA>.log.gz`
 
 COS hidden state 只保存：
 
@@ -346,7 +483,25 @@ COS hidden state 只保存：
 - `sha256`
 - `size`
 
-GitHub lifecycle hidden JSON、visible lifecycle comment 和 `/deploy_status` comment 均不得持久化 signed URL。GitHub 中只持久化 `object_key`、`sha256`、`size`。
+GitHub 中只持久化 `object_key`、`sha256`、`size`。
+
+终态 lifecycle comment 在 COS 上传成功后显示稳定的 Deploy Approval 下载链接：
+
+```text
+GitHub PR comment
+    ↓ [Download COS evidence]
+Deploy Approval /evidence/download?repo=...&pr=...&head=<FULL_HEAD_SHA>
+    ↓ GitHub App user OAuth + signed state + PKCE
+fresh PR / hidden state authorization
+    ↓ private COS HEAD + bounded GET
+exact size + SHA-256 verification
+    ↓
+attachment: evidence-<FULL_HEAD_SHA>.log.gz
+```
+
+下载 URL 只包含 `repo`、`pr`、`head`，不包含 object key、bucket、COS credential 或任何 presigned URL。OAuth callback 是外部 GitHub App 配置的：`<DEPLOY_APPROVAL_PUBLIC_BASE_URL>/evidence/oauth/callback`。
+GitHub App callback wildcard matching 应当 **DISABLED**，除非有明确需求。
+部署的 `redirect_uri` 必须与注册的回调 URL 完全一致。下载前必须重新验证 PR HEAD、terminal hidden state、PR author / deployed machine owner / collaborator authorization，并验证 compressed size、SHA-256 和 10 MiB 上限。COS runtime identity 需要 `cos:PutObject`、`cos:HeadObject`、`cos:GetObject`，范围为 `phanthymotus_pr/*`。
 
 ## restart / uncertain
 
@@ -386,19 +541,19 @@ fetch/filter comments
 
 旧 `command.comment_id` 必须被消费，旧 comment 永远不能 automatic dispatch。
 
-### uncertain 后必须重新 Review Job lookup
+### uncertain 后必须重新 Review Evidence 验证
 
 `executing -> uncertain` 之后，下一次 NEW `/approve_deploy` 需要：
 
 1. fresh GET PR
 2. fresh current full HEAD
-3. `list_jobs(repo=repo, status="review_done")`
-4. Controller 本地 exact 过滤 repo + PR number + current full HEAD
+3. fresh PR comments → `extract_review_evidence()`
+4. Controller 本地 exact 过滤：可信作者 + commit prefix resolve + HEAD 绑定
 
 如果：
 
 - HEAD drift
-- 或者 exact `review_done` Job 缺失
+- 或者 review evidence 缺失/不匹配
 
 则：
 
@@ -407,7 +562,7 @@ fetch/filter comments
 - 下一步给 Developer：`/request_bot_review`
 - ZERO replay
 
-如果 same HEAD + exact Review Job FOUND：
+如果 same HEAD + review evidence FOUND：
 
 - refresh validation snapshot
 - `status: deploy-requested`
@@ -430,6 +585,20 @@ fetch/filter comments
 - `/deploy_status`
 - `/deploy_help [topic]`
 
+## Required GitHub App Permissions
+
+Minimum repository permissions:
+
+- **Pull requests: write** — used for PR reads and PR conversation comments /
+  status-label operations.
+- **Metadata: read** — needed for collaborator permission lookup.
+
+Do **not** request Administration, Actions, or Contents permission
+solely because an unused helper exists.
+
+If a future production path begins reading repository contents through
+the Contents API, that must be reviewed as a separate permission change.
+
 ## 结论
 
 Deploy Approval 的最终收口原则是：
@@ -441,3 +610,11 @@ Deploy Approval 的最终收口原则是：
 - CLEAN GATE 只看 `running_image`
 - uncertain 后不自动 replay
 - Case 只做 advisory
+
+## 私钥操作合同
+
+- 私钥绝不允许以明文形式出现在源码或文档中。
+- 运行时通过 `GITHUB_APP_PRIVATE_KEY_FILE` 指定密钥文件路径。
+- `deploy.sh` 强制校验本地私钥的属主/权限。
+- 如果私钥已暴露，必须在运行时验证前轮换密钥。
+- 绝不允许打印私钥内容。

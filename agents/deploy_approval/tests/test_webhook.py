@@ -43,3 +43,27 @@ def test_wrong_algorithm_rejected():
 def test_empty_sig_rejected():
     assert verify_signature(b"body", "", b"secret") is False
     assert verify_signature(b"body", None, b"secret") is False
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MIGRATED from test_v8_contract.py
+# ═══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_unknown_repository_fails_closed(config, proxy, controller):
+    config.webhook_enabled = True
+    config.github_webhook_secret = "secret"
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "evil/repo"},
+        "issue": {"number": 1, "pull_request": {}},
+        "comment": {"id": 99},
+    }
+    request = _fake_request(config, proxy, controller, payload)
+
+    with patch("agents.deploy_approval.router_webhook._verify_signature_impl", return_value=True):
+        with pytest.raises(Exception) as exc:
+            await webhook(request)
+
+    assert getattr(exc.value, "status_code", None) == 404

@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import ssl
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import httpx
 
-from ..agent_core_client import AgentCoreClient, AgentCoreError
-from ..config import Config, validate_config
-from .conftest import make_config
+from ..agent_core_client import AgentCoreClient, AgentCoreDeployOutcomeUncertain, AgentCoreError
+from ..config import Config, DEFAULT_GITHUB_REPOS, FORK_TEST_GITHUB_REPOS, validate_config
+from ..models import MachineInfo
+from ..policy import Policy
+from ..service import DeployController, DeployControllerError
+from .conftest import TEST_CERT_PEM, make_config
 
 
 class _Transport(httpx.AsyncBaseTransport):
@@ -28,6 +34,10 @@ class _Transport(httpx.AsyncBaseTransport):
         )
 
 
+async def fake_token_provider():
+    return "fake-installation-token"
+
+
 class _TransportFromScenarios(httpx.AsyncBaseTransport):
     """Routes each request path to a canned transport so one client can serve
     multiple Agent Core endpoints."""
@@ -43,9 +53,22 @@ class _TransportFromScenarios(httpx.AsyncBaseTransport):
 
 
 def _client():
-    cfg = make_config(allow_private_http=False)
-    cfg.ca_file = ""
-    return cfg
+    return make_config(allow_private_http=False)
+
+
+def _agent_core_client(
+    transport: httpx.AsyncBaseTransport,
+    *,
+    base_url: str = "https://192.0.2.1:15678",
+    node_host: str = "192.0.2.1",
+) -> AgentCoreClient:
+    return AgentCoreClient(
+        _client(),
+        base_url=base_url,
+        node_host=node_host,
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+        http=httpx.AsyncClient(transport=transport),
+    )
 
 
 def _open_pr(number: int, updated_at: str, *, marker: str = "") -> dict:
@@ -56,25 +79,33 @@ def _open_pr(number: int, updated_at: str, *, marker: str = "") -> dict:
 
 
 @pytest.mark.parametrize(
-    "github_repos, should_pass, expected_error",
+    "github_repos, fork_test_mode, should_pass, expected_error",
     [
-        ([], False, "GITHUB_REPOS is required"),
-        (["4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver", "some/other-repo"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"], True, ""),
-        (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], True, ""),
+        ([], False, False, "GITHUB_REPOS is required"),
+        (["4paradigm/phanthymotus"], False, False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus-driver"], False, False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus-driver"], False, False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], False, False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver", "some/other-repo"], False, False, "GITHUB_REPOS must contain exactly"),
+        (list(FORK_TEST_GITHUB_REPOS), False, False, "GITHUB_REPOS must contain exactly"),
+        (list(DEFAULT_GITHUB_REPOS), True, False, "GITHUB_REPOS must contain exactly"),
+        ([DEFAULT_GITHUB_REPOS[0], "some/fork-repo"], True, False, "GITHUB_REPOS must contain exactly"),
+        (list(DEFAULT_GITHUB_REPOS), False, True, ""),
+        (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], False, True, ""),
+        (list(FORK_TEST_GITHUB_REPOS), True, True, ""),
     ],
 )
-def test_validate_config_requires_exact_supported_repo_set(github_repos, should_pass, expected_error):
+def test_validate_config_requires_exact_supported_repo_set(github_repos, fork_test_mode, should_pass, expected_error):
     cfg = Config(
-        github_token="tok",
         github_repos=github_repos,
+        fork_test_mode=fork_test_mode,
         poll_enabled=True,
         github_webhook_secret="secret",
+        deploy_approval_public_base_url="https://deploy.example",
+        github_oauth_client_id="test-client",
+        github_oauth_client_secret="test-secret",
+        registry="ccr.ccs.tencentyun.com",
     )
     if should_pass:
         validate_config(cfg)
@@ -83,13 +114,231 @@ def test_validate_config_requires_exact_supported_repo_set(github_repos, should_
             validate_config(cfg)
 
 
+def test_agent_core_endpoint_policy_requires_https_exact_ipv4():
+    cfg = _client()
+    cert = "/run/deploy-approval/certs/test-agent-core.pem"
+    ok = AgentCoreClient(
+        cfg,
+        base_url="https://10.0.0.1:15678",
+        node_host="10.0.0.1",
+        tls_peer_cert_file=cert,
+        http=httpx.AsyncClient(transport=_Transport({"valid": True, "auth_required": True})),
+    )
+    assert ok.base_url == "https://10.0.0.1:15678"
+
+    bad_cases = [
+        ("http://10.0.0.1:15678", "10.0.0.1", "scheme"),
+        ("https://10.0.0.2:15678", "10.0.0.1", "hostname"),
+        ("https://robot.local:15678", "10.0.0.1", "hostname"),
+        ("https://10.0.0.1:15679", "10.0.0.1", "port"),
+        ("https://user:pass@10.0.0.1:15678", "10.0.0.1", "userinfo"),
+        ("https://10.0.0.1:15678/api", "10.0.0.1", "path"),
+        ("https://10.0.0.1:15678?x=1", "10.0.0.1", "query"),
+        ("https://10.0.0.1:15678#x", "10.0.0.1", "fragment"),
+        ("https://10.0.0.1:15678", "robot.local", "literal IP"),
+    ]
+    for base_url, node_host, message in bad_cases:
+        with pytest.raises(AgentCoreError, match=message):
+            AgentCoreClient(
+                cfg,
+                base_url=base_url,
+                node_host=node_host,
+                tls_peer_cert_file=cert,
+                http=httpx.AsyncClient(transport=_Transport({"valid": True, "auth_required": True})),
+            )
+
+
+def test_agent_core_constructor_requires_node_host():
+    cfg = _client()
+    with pytest.raises(TypeError):
+        AgentCoreClient(
+            cfg,
+            base_url="https://192.0.2.1:15678",
+            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+            http=httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}})),
+        )
+    with pytest.raises(AgentCoreError, match="node_host is required"):
+        AgentCoreClient(
+            cfg,
+            base_url="https://192.0.2.1:15678",
+            node_host="",
+            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+            http=httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}})),
+        )
+
+
+def test_agent_core_constructor_has_no_ca_file_parameter():
+    sig = inspect.signature(AgentCoreClient.__init__)
+    assert "ca_file" not in sig.parameters
+    with pytest.raises(TypeError):
+        AgentCoreClient(
+            _client(),
+            base_url="https://192.0.2.1:15678",
+            node_host="192.0.2.1",
+            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+            ca_file="/run/deploy-approval/certs/test-agent-core.pem",
+            http=httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}})),
+        )
+
+
+def test_agent_core_pinned_certificate_context_constructed():
+    client = AgentCoreClient(
+        _client(),
+        base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+    )
+    assert client.http._transport._pool._ssl_context.verify_mode == ssl.CERT_REQUIRED
+    assert client.http._transport._pool._ssl_context.check_hostname is False
+    assert client.http._transport._pool._ssl_context.minimum_version >= ssl.TLSVersion.TLSv1_2
+
+
+def test_agent_core_self_created_client_disables_proxy_env(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://bad proxy")
+    client = AgentCoreClient(
+        _client(),
+        base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+    )
+    assert client.http.trust_env is False
+
+
+@pytest.mark.parametrize(
+    "cert_file,match",
+    [
+        ("", "required"),
+        ("cert.pem", "under /run/deploy-approval/certs"),
+        ("/run/deploy-approval/certs/../peer.pem", "must not contain"),
+        ("/tmp/peer.pem", "under /run/deploy-approval/certs"),
+        ("/etc/ssl/certs/ca-certificates.crt", "under /run/deploy-approval/certs"),
+    ],
+)
+def test_agent_core_tls_peer_cert_logical_path_required(cert_file, match):
+    with pytest.raises(AgentCoreError, match=match):
+        AgentCoreClient(
+            _client(),
+            base_url="https://192.0.2.1:15678",
+            node_host="192.0.2.1",
+            tls_peer_cert_file=cert_file,
+            http=httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}})),
+        )
+
+
+def test_agent_core_aclose_owns_only_self_created_http():
+    owned = AgentCoreClient(
+        _client(),
+        base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+    )
+    asyncio.run(owned.aclose())
+    asyncio.run(owned.aclose())
+    assert owned.http.is_closed
+
+    external = httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}}))
+    injected = AgentCoreClient(
+        _client(),
+        base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+        http=external,
+    )
+    asyncio.run(injected.aclose())
+    assert external.is_closed is False
+    asyncio.run(external.aclose())
+
+
+class _FakeCore:
+    def __init__(self, verify_side_effect=None, close_side_effect=None):
+        self.verify = AsyncMock(side_effect=verify_side_effect)
+        self.aclose = AsyncMock(side_effect=close_side_effect)
+
+
+def _controller_for_core_tests(core_factory=None) -> DeployController:
+    config = make_config()
+    policy = Policy(config)
+    policy.machines = {
+        "m1": MachineInfo(
+            alias="m1",
+            node_id="node-1",
+            owners=["owner"],
+            node_host="192.0.2.1",
+            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+            targets=["driver"],
+            platforms=["linux/arm64"],
+            driver_paths=["vendor/driver"],
+        )
+    }
+    return DeployController(
+        config,
+        MagicMock(),
+        policy,
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        agent_core_factory=core_factory,
+    )
+
+
+def test_resolve_core_verify_agent_core_error_closes_new_client(monkeypatch):
+    import agents.deploy_approval.service as service_mod
+
+    core = _FakeCore(verify_side_effect=AgentCoreError("bad token"))
+    monkeypatch.setattr(service_mod, "AgentCoreClient", lambda *args, **kwargs: core)
+    controller = _controller_for_core_tests()
+    with pytest.raises(DeployControllerError, match="unreachable"):
+        asyncio.run(controller._resolve_core_client("node-1"))
+    core.aclose.assert_awaited_once()
+
+
+def test_resolve_core_unexpected_verify_error_closes_new_client(monkeypatch):
+    import agents.deploy_approval.service as service_mod
+
+    core = _FakeCore(verify_side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(service_mod, "AgentCoreClient", lambda *args, **kwargs: core)
+    controller = _controller_for_core_tests()
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(controller._resolve_core_client("node-1"))
+    core.aclose.assert_awaited_once()
+
+
+def test_verified_core_is_cached_and_reused(monkeypatch):
+    import agents.deploy_approval.service as service_mod
+
+    core = _FakeCore()
+    created = []
+
+    def _factory(*args, **kwargs):
+        created.append((args, kwargs))
+        return core
+
+    monkeypatch.setattr(service_mod, "AgentCoreClient", _factory)
+    controller = _controller_for_core_tests()
+    first = asyncio.run(controller._core_for_node("node-1"))
+    second = asyncio.run(controller._core_for_node("node-1"))
+    assert first is core
+    assert second is core
+    assert len(created) == 1
+    core.verify.assert_awaited_once()
+
+
+def test_controller_aclose_logs_and_continues(caplog):
+    controller = _controller_for_core_tests()
+    bad = _FakeCore(close_side_effect=RuntimeError("close failed"))
+    good = _FakeCore()
+    controller._core_clients = {"bad": bad, "good": good}
+    asyncio.run(controller.aclose())
+    bad.aclose.assert_awaited_once()
+    good.aclose.assert_awaited_once()
+    assert controller._core_clients == {}
+    assert "failed to close Agent Core client" in caplog.text
+
+
 def test_agent_core_accepts_code_200():
     cfg = _client()
     tr = _Transport({"code": 200, "data": {"running_image": "registry/repo@sha256:" + "a" * 64}})
-    c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
-    )
+    c = _agent_core_client(tr)
     out = asyncio.run(c.driver_status("driver"))
     assert out == {"running_image": "registry/repo@sha256:" + "a" * 64}
 
@@ -98,8 +347,9 @@ def test_agent_core_rejects_missing_running_image():
     cfg = _client()
     tr = _Transport({"code": 200, "data": {"status": "running"}})
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.driver_status("driver"))
@@ -109,8 +359,9 @@ def test_agent_core_rejects_missing_data_envelope():
     cfg = _client()
     tr = _Transport({"message": "boom", "data": None})
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.driver_status("driver"))
@@ -120,8 +371,9 @@ def test_agent_core_rejects_non_200_code():
     cfg = _client()
     tr = _Transport({"code": 500, "message": "boom", "data": None})
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.driver_status("driver"))
@@ -133,8 +385,9 @@ def test_agent_core_auth_verify_accepts_raw_shape():
     cfg = _client()
     tr = _Transport({"valid": True, "auth_required": True})
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     out = asyncio.run(c.verify())
     assert out.get("valid") is True
@@ -154,8 +407,9 @@ def test_agent_core_auth_disabled_fails_closed():
         cfg = _client()
         tr = _Transport(payload)
         c = AgentCoreClient(
-            cfg, base_url="https://example.invalid:15678",
-            ca_file="", http=httpx.AsyncClient(transport=tr),
+            cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
         )
         with pytest.raises(AgentCoreError):
             asyncio.run(c.verify())
@@ -165,8 +419,9 @@ def test_agent_core_rejects_http_401():
     cfg = _client()
     tr = _Transport({"detail": "nope"}, status=401)
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.verify())
@@ -216,8 +471,9 @@ def test_agent_core_oversize_response_fails_closed():
     cfg.max_response_bytes = 64
     tr = _ChunkedTransport(b'{"code": 200, "data": "' + b"x" * 512 + b'"}')
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.driver_status("driver"))
@@ -228,7 +484,6 @@ def test_github_list_open_prs_reads_past_500_and_ignores_age():
     from urllib.parse import parse_qs, urlparse
 
     cfg = make_config(allow_private_http=False)
-    cfg.github_token = "gh-token"
     cfg.github_api_url = "https://api.github.com"
 
     old_ts = "2010-01-01T00:00:00Z"
@@ -259,7 +514,7 @@ def test_github_list_open_prs_reads_past_500_and_ignores_age():
             page = requested_pages[-1]
             return httpx.Response(200, json=page_batches.get(page, []), request=request)
 
-    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()))
+    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()), token_provider=fake_token_provider)
     prs = asyncio.run(gh.list_open_prs("org/repo"))
 
     assert len(prs) == 601
@@ -276,7 +531,6 @@ def test_github_list_open_prs_never_requests_closed():
     from urllib.parse import parse_qs, urlparse
 
     cfg = make_config(allow_private_http=False)
-    cfg.github_token = "gh-token"
     cfg.github_api_url = "https://api.github.com"
 
     requested_states: list[str] = []
@@ -292,7 +546,7 @@ def test_github_list_open_prs_never_requests_closed():
             batch = [_open_pr(i, "2026-09-03T12:00:00Z") for i in range(1, 101)] if page == 1 else []
             return httpx.Response(200, json=batch, request=request)
 
-    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()))
+    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()), token_provider=fake_token_provider)
     prs = asyncio.run(gh.list_open_prs("org/repo"))
 
     assert len(prs) == 100
@@ -305,7 +559,6 @@ def test_github_list_open_prs_deduplicates_page_overlap():
     from urllib.parse import parse_qs, urlparse
 
     cfg = make_config(allow_private_http=False)
-    cfg.github_token = "gh-token"
     cfg.github_api_url = "https://api.github.com"
 
     requested_pages: list[int] = []
@@ -326,7 +579,7 @@ def test_github_list_open_prs_deduplicates_page_overlap():
                 batch = []
             return httpx.Response(200, json=batch, request=request)
 
-    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()))
+    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()), token_provider=fake_token_provider)
     prs = asyncio.run(gh.list_open_prs("org/repo"))
 
     assert requested_pages == [1, 2]
@@ -354,8 +607,9 @@ def test_real_agent_core_list_envelopes_accept_list_data():
         for payload, kind, expect in cases:
             tr = _Transport(payload)
             c = AgentCoreClient(
-                cfg, base_url="https://example.invalid:15678",
-                ca_file="", http=httpx.AsyncClient(transport=tr),
+                cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
             )
             if kind == "list_drivers":
                 got = await c.list_drivers()
@@ -409,8 +663,9 @@ def test_real_agent_core_registry_catalog_facets_contract():
             ],
         })
         c = AgentCoreClient(
-            cfg, base_url="https://example.invalid:15678",
-            ca_file="", http=httpx.AsyncClient(
+            cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(
                 transport=_TransportFromScenarios({
                     "/api/registry/catalog": catalog_tr,
                     "/api/drivers": drivers_tr,
@@ -450,8 +705,9 @@ def test_registry_catalog_rejects_legacy_nested_facets_shape():
         },
     })
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.registry_catalog())
@@ -467,8 +723,9 @@ def test_registry_catalog_rejects_missing_top_level_facets():
         "filter": {"applied": True},
     })
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.registry_catalog())
@@ -485,8 +742,9 @@ def test_registry_catalog_rejects_non_dict_top_level_filter():
         "filter": "applied",
     })
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.registry_catalog())
@@ -502,8 +760,9 @@ def test_registry_catalog_rejects_missing_filter_fail_closed():
         "facets": {"cpu_arch": "arm64", "acc_arch": "jetson-jp5"},
     })
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.registry_catalog())
@@ -520,8 +779,9 @@ def test_registry_catalog_rejects_empty_cpu_or_acc_arch():
             "filter": {"applied": True},
         })
         c = AgentCoreClient(
-            cfg, base_url="https://example.invalid:15678",
-            ca_file="", http=httpx.AsyncClient(transport=tr),
+            cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
         )
         with pytest.raises(AgentCoreError):
             asyncio.run(c.registry_catalog())
@@ -533,8 +793,9 @@ def test_list_drivers_rejects_object_data_fail_closed():
     cfg = _client()
     tr = _Transport({"code": 200, "data": {"id": "perception"}})
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.list_drivers())
@@ -548,10 +809,11 @@ def test_deploy_driver_requires_immutable_digest_form():
                 "registry.example/repo/perception",
                 "registry.example/repo/perception@sha256:abc",
                 "registry.example/repo/perception@sha256:" + "z" * 64):
-        tr = _Transport({"code": 200, "data": {}})
+        tr = _Transport({"code": 200, "data": {"status": "starting"}})
         c = AgentCoreClient(
-            cfg, base_url="https://example.invalid:15678",
-            ca_file="", http=httpx.AsyncClient(transport=tr),
+            cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
         )
         with pytest.raises(AgentCoreError):
             asyncio.run(c.deploy_driver("drv", bad))
@@ -562,13 +824,14 @@ def test_deploy_driver_requires_immutable_digest_form():
 
         async def handle_async_request(self, request):
             self.body = request.content
-            return httpx.Response(200, json={"code": 200, "data": {}},
+            return httpx.Response(200, json={"code": 200, "data": {"status": "starting"}},
                                   request=request)
 
     tr = Capture()
     c = AgentCoreClient(
-        cfg, base_url="https://example.invalid:15678",
-        ca_file="", http=httpx.AsyncClient(transport=tr),
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
     )
     good = "registry.example/repo/perception@sha256:" + "a" * 64
     asyncio.run(c.deploy_driver("drv", good))
@@ -588,48 +851,310 @@ def test_mcp_health_rejects_non_object_tools_without_coercion():
             "data": {"online": True, "tools": raw_tools},
         })
         c = AgentCoreClient(
-            cfg, base_url="https://example.invalid:15678",
-            ca_file="", http=httpx.AsyncClient(transport=tr),
+            cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1",
+        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
         )
         with pytest.raises(AgentCoreError):
             asyncio.run(c.mcp_ping("mcp1"))
 
 
-# ── ReviewJobInfo: options.build_only missing must fail closed ────────────
+# ── GitHubClient.resolve_commit_sha regression tests ────────────────────────
 
-def test_build_only_missing_fails_closed():
-    """options={} (or a missing ``build_only`` key) must make review_complete()
-    False — never treated as ``build_only=False``. Only an explicit JSON
-    boolean False may pass the deploy gate; missing/null/string/number/True
-    all fail closed."""
-    from ..review_client import ReviewJobInfo
+def test_resolve_commit_sha_returns_exact_40_hex():
+    """resolve_commit_sha must return exact 40-char lowercase hex."""
+    from ..github_client import GitHubClient
+    import httpx
 
-    base = {
-        "id": "job1", "repo": "r", "pr_number": 1,
-        "head_sha": "h" * 40, "build_ref_sha": "b" * 40,
-        "status": "review_done", "review_text": "Review performed.",
-        "build_results": [],
-    }
-    # missing options entirely / options={} / missing build_only key
-    for raw in (
-        {k: v for k, v in base.items() if k != "options"},
-        {**base, "options": {}},
-        # a full-detail job whose options dict lacks build_only
-        {**base, "options": {"review_text": "x"}},
-        # explicit non-boolean values are equally fail-closed (missing,
-        # null, string, number, True all fail; only explicit False passes)
-        {**base, "options": {"build_only": None}},
-        {**base, "options": {"build_only": "false"}},
-        {**base, "options": {"build_only": 0}},
-        {**base, "options": {"build_only": True}},
-    ):
-        info = ReviewJobInfo(raw)
-        if raw.get("options") == {"build_only": True}:
-            assert info.build_only is True, raw  # explicit True is still not deployable
-        else:
-            assert info.build_only is None, raw
-        assert info.review_complete() is False, raw
-    # the explicit JSON boolean False is the ONLY passing form
-    info = ReviewJobInfo({**base, "options": {"build_only": False}})
-    assert info.build_only is False
-    assert info.review_complete() is True
+    payload = {"sha": "a" * 40}
+
+    class Tr(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return httpx.Response(200, json=payload, request=request)
+
+    async def _token():
+        return "fake"
+
+    cfg = make_config()
+    client = GitHubClient(cfg, token_provider=_token, http=httpx.AsyncClient(transport=Tr()))
+    result = asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
+    assert result == "a" * 40
+
+
+def test_resolve_commit_sha_rejects_non_40hex():
+    """Non-40-character or non-hex SHA responses must be rejected."""
+    from ..github_client import GitHubClient
+    import httpx
+
+    for bad in ("abc", "a" * 39, "a" * 41, "ZZZZ" * 10):
+        payload = {"sha": bad}
+
+        class Tr(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(200, json=payload, request=request)
+
+        async def _token():
+            return "fake"
+
+        cfg = make_config()
+        client = GitHubClient(cfg, token_provider=_token, http=httpx.AsyncClient(transport=Tr()))
+        try:
+            result = asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
+            assert False, f"should have failed for sha={bad}"
+        except Exception:
+            pass
+
+
+def test_resolve_commit_sha_rejects_missing_sha_key():
+    """Response without 'sha' key must be rejected."""
+    from ..github_client import GitHubClient
+    import httpx
+
+    payload = {"other": "value"}
+
+    class Tr(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return httpx.Response(200, json=payload, request=request)
+
+    async def _token():
+        return "fake"
+
+    cfg = make_config()
+    client = GitHubClient(cfg, token_provider=_token, http=httpx.AsyncClient(transport=Tr()))
+    try:
+        result = asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
+        assert False, "should have failed"
+    except Exception:
+        pass
+
+
+def test_resolve_commit_sha_rejects_non_2xx():
+    """Non-2xx responses must propagate errors."""
+    from ..github_client import GitHubClient
+    import httpx
+
+    class Tr(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return httpx.Response(404, json={"message": "not found"}, request=request)
+
+    async def _token():
+        return "fake"
+
+    cfg = make_config()
+    client = GitHubClient(cfg, token_provider=_token, http=httpx.AsyncClient(transport=Tr()))
+    try:
+        result = asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
+        assert False, "should have failed"
+    except Exception:
+        pass
+
+
+
+import pytest
+
+
+class TestValidateApiPathSegment:
+    """Blocker 3: _validate_api_path_segment rejects malicious values."""
+
+    def _make_client(self, transport):
+        return AgentCoreClient(
+            make_config(allow_private_http=True),
+            base_url="https://10.0.0.1:15678",
+            node_host="10.0.0.1",
+            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+            http=httpx.AsyncClient(transport=transport),
+        )
+
+    def _ok_transport(self):
+        return _Transport({"code": 200, "data": {}})
+
+    def _status_transport(self):
+        return _Transport(
+            {"code": 200, "data": {"status": "running", "running_image": "img@sha256:" + "a" * 64}},
+        )
+
+    def _mcp_transport(self):
+        return _Transport({"code": 200, "data": {"online": True, "tools": []}})
+
+    def test_agent_core_runtime_id_allows_embedded_dot_but_rejects_dot_segments(self):
+        """Real Agent Core runtime id allows embedded dots; exact . / .. rejected."""
+        image = "registry/repo@sha256:" + "a" * 64
+        c = self._make_client(_Transport({"code": 200, "data": {"status": "starting"}}))
+
+        result = asyncio.run(c.deploy_driver("x-humanoid-tianyi2.0", image))
+        assert result["data"]["status"] == "starting"
+
+        for bad in (".", ".."):
+            with pytest.raises(AgentCoreError):
+                asyncio.run(c.deploy_driver(bad, image))
+
+    def test_deploy_driver_rejects_slash_in_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="must not contain '/'"):
+            asyncio.run(c.deploy_driver("drv/evil", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_backslash_in_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="must not contain"):
+            asyncio.run(c.deploy_driver("drv\\evil", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_question_mark_in_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="must not contain '?'"):
+            asyncio.run(c.deploy_driver("drv?x=1", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_hash_in_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="must not contain '#'"):
+            asyncio.run(c.deploy_driver("drv#section", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_percent_in_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="must not contain '%'"):
+            asyncio.run(c.deploy_driver("drv%20evil", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_whitespace_in_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="must not contain"):
+            asyncio.run(c.deploy_driver("drv evil", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_control_characters_in_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="must not contain control characters"):
+            asyncio.run(c.deploy_driver("drv\x00evil", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_non_string_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="requires a non-empty driver id"):
+            asyncio.run(c.deploy_driver(123, "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_empty_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="requires a non-empty driver id"):
+            asyncio.run(c.deploy_driver("", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_driver_rejects_stripped_empty_driver_id(self):
+        c = self._make_client(self._ok_transport())
+        with pytest.raises(AgentCoreError, match="must be non-empty"):
+            asyncio.run(c.deploy_driver("  ", "registry/repo@sha256:" + "a" * 64))
+
+    def test_deploy_post_explicit_error_code_is_confirmed_failure(self):
+        class Transport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(200, json={
+                    "code": 500,
+                    "data": {"status": "failed"},
+                    "message": "deployment failed",
+                }, request=request)
+
+        c = self._make_client(Transport())
+        with pytest.raises(AgentCoreError, match="deployment failed") as excinfo:
+            asyncio.run(c.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
+        assert isinstance(excinfo.value, AgentCoreError)
+        assert not isinstance(excinfo.value, AgentCoreDeployOutcomeUncertain)
+
+    def test_deploy_post_data_status_error_is_confirmed_failure(self):
+        class Transport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(200, json={
+                    "code": 0,
+                    "data": {"status": "error", "error": "image pull failed"},
+                    "message": "error",
+                }, request=request)
+
+        c = self._make_client(Transport())
+        with pytest.raises(AgentCoreError, match="image pull failed") as excinfo:
+            asyncio.run(c.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
+        assert isinstance(excinfo.value, AgentCoreError)
+        assert not isinstance(excinfo.value, AgentCoreDeployOutcomeUncertain)
+
+    def test_deploy_post_skipped_response_is_confirmed_failure(self):
+        class Transport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(200, json={
+                    "code": 0,
+                    "data": {"status": "ok", "skipped": True},
+                    "message": "skipped",
+                }, request=request)
+
+        c = self._make_client(Transport())
+        with pytest.raises(AgentCoreError, match="skipped") as excinfo:
+            asyncio.run(c.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
+        assert isinstance(excinfo.value, AgentCoreError)
+        assert not isinstance(excinfo.value, AgentCoreDeployOutcomeUncertain)
+
+    def test_deploy_post_transport_timeout_is_uncertain(self):
+        # Scenario 1: httpx.ReadTimeout (transport-layer error)
+        class ReadTimeoutTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                raise httpx.ReadTimeout("timed out", request=request)
+
+        c = self._make_client(ReadTimeoutTransport())
+        with pytest.raises(AgentCoreDeployOutcomeUncertain, match="timed out"):
+            asyncio.run(c.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
+
+        # Scenario 2: REAL stream_request total wall-clock timeout
+        # A slow transport that sleeps past the total_timeout provokes SecurityError
+        # from asyncio.wait_for, which must be classified as UNCERTAIN once the
+        # unsafe POST has already begun.
+        class SlowTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                await asyncio.sleep(10)
+                raise httpx.ReadTimeout("too late", request=request)
+
+        slow_cfg = make_config(allow_private_http=True, total_timeout=0.01)
+        c2 = AgentCoreClient(
+            slow_cfg,
+            base_url="https://10.0.0.1:15678",
+            node_host="10.0.0.1",
+            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+            http=httpx.AsyncClient(transport=SlowTransport()),
+        )
+        with pytest.raises(AgentCoreDeployOutcomeUncertain) as excinfo:
+            asyncio.run(c2.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
+        assert "total timeout" in str(excinfo.value).lower() or "timeout" in str(excinfo.value).lower()
+
+
+    def test_driver_status_rejects_slash_in_driver_id(self):
+        c = self._make_client(self._status_transport())
+        with pytest.raises(AgentCoreError, match="must not contain"):
+            asyncio.run(c.driver_status("evil/../../system"))
+
+    def test_mcp_ping_rejects_question_mark_in_mcp_id(self):
+        c = self._make_client(self._mcp_transport())
+        with pytest.raises(AgentCoreError, match="must not contain '?'"):
+            asyncio.run(c.mcp_ping("mcp?x=1"))
+
+
+# ── FIX 2: GitHub self-created client trust_env regression ──────────────────
+
+def test_github_self_created_client_disables_proxy_env(monkeypatch):
+    """GitHubClient self-created AsyncClient must not inherit proxy env."""
+    monkeypatch.setenv("HTTP_PROXY", "http://evil-proxy:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://evil-proxy:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://evil-proxy:8080")
+    from ..github_client import GitHubClient
+    from ..config import Config
+    cfg = Config(github_repos=["org/repo"], poll_enabled=True)
+    client = GitHubClient(cfg)
+    try:
+        assert client.http.trust_env is False
+    finally:
+        asyncio.run(client.http.aclose())
+
+
+# ── FIX 3: Registry self-created client trust_env regression ────────────────
+
+def test_registry_self_created_client_disables_proxy_env(monkeypatch):
+    """RegistryClient self-created AsyncClient must not inherit proxy env."""
+    monkeypatch.setenv("HTTP_PROXY", "http://evil-proxy:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://evil-proxy:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://evil-proxy:8080")
+    from ..registry_client import RegistryClient
+    from ..config import Config
+    cfg = Config(github_repos=["org/repo"], poll_enabled=True, registry="localhost:5000")
+    client = RegistryClient(cfg)
+    try:
+        assert client.http.trust_env is False
+    finally:
+        asyncio.run(client.http.aclose())
