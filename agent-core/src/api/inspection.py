@@ -122,16 +122,18 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
     if topic in _active_primary_subs:
         return  # already subscribed
 
-    _active_primary_subs.add(topic)  # mark immediately to prevent race
     queue_depth = 20 if fmt.startswith('audio/') or topic == '/perception/perf_spans' else 1
-    ros2_bridge.subscribe(
+    if not ros2_bridge.subscribe(
         key,
         topic,
         fmt,
         loop,
         _push_factory(topic),
         queue_depth=queue_depth,
-    )
+    ):
+        return  # a later registration/WS connection must be able to retry
+    # No await between the check and subscribe: only mark a confirmed DDS sub.
+    _active_primary_subs.add(topic)
     print(f'[inspection] started primary sub: {topic}')
 
 

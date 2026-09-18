@@ -60,3 +60,10 @@ ActuCore 401 项容器测试通过。报告新增 APT 签名、Core 无关源改
 新增确定性回归在修复前复现成功/写入失败两条路径均提前可见 complete，修复后通过。
 本地后处理专项 9 passed / 1 skipped / 2 subtests；ActuCore 全量 400 passed /
 2 skipped / 68 subtests。README 同步终态持久化契约，无接口变更、无真机操作。
+
+第四轮 `9ca0422`：三个镜像构建成功，Core 987 / ActuCore 402 项容器测试通过。
+代码审查发现 inspection 在 ROS 订阅失败前已设置活跃标记，导致注册/页面重试
+永久跳过。改为 subscribe 成功后再设置标记；失败返回和异常都可在后续注册重试。
+新增经真实注册入口的两条回归，修复前均失败、修复后通过；相邻 ROS/topic 冲突
+检查共 17 项通过。它恢复既有订阅语义，不改变公开接口、消息类型或部署步骤，
+README 与 CONTRIBUTING 的数据流说明仍适用，无需新增用户操作。
