@@ -1551,11 +1551,12 @@ class CollectionPostprocessManager:
                 )
                 final_state = str(manifest.get("state", "complete"))
                 with self._lock:
-                    self._retry_counts.pop(session, None)
-                    self._status.update(
+                    status = dict(self._status)
+                    status.update(
                         state=final_state,
                         stage="complete",
                         percent=100.0,
+                        paused_reason=None,
                         processed_images=int(manifest.get("processed_images", 0)),
                         total_images=int(manifest.get("total_images", 0)),
                         generated_lidar_frames=int(
@@ -1568,8 +1569,13 @@ class CollectionPostprocessManager:
                             "invalid_frames_present" if final_state == "degraded" else None
                         ),
                     )
-                    status = dict(self._status)
+                # Completion is observable only after its journal is committed.
+                # Keep disk I/O outside the state lock; a failed write must enter
+                # the error/retry path without briefly reporting success.
                 self._persist_status(session, status)
+                with self._lock:
+                    self._retry_counts.pop(session, None)
+                    self._status = status
             except Exception as exc:
                 with self._lock:
                     self._known.discard(session)

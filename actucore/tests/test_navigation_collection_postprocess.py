@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -651,6 +652,39 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             )
             self.assertEqual(journal["state"], "complete")
             self.assertEqual(journal["processed_images"], 1)
+
+    def test_completion_is_visible_only_after_journal_write(self) -> None:
+        class FakeProcessor:
+            def process_session(self, session, progress, wait_if_paused):
+                progress("processing", 1, 1, None)
+                return {"state": "complete", "processed_images": 1, "total_images": 1}
+
+        for fail_write in (False, True):
+            with self.subTest(fail_write=fail_write), tempfile.TemporaryDirectory() as temporary:
+                observed = []
+
+                class ObservedManager(CollectionPostprocessManager):
+                    def _persist_status(self, session, status):
+                        if status["state"] == "complete":
+                            observed.append(self.snapshot()["postprocess"]["state"])
+                            if fail_write:
+                                raise OSError("journal write failed")
+                        super()._persist_status(session, status)
+
+                session = Path(temporary) / "session-a"
+                session.mkdir()
+                manager = ObservedManager(temporary, processor_factory=FakeProcessor)
+                # Keep a failed write's scheduled retry inside this test's lifetime.
+                with patch("plugins.navigation.mapping.collection_postprocess.threading.Timer"):
+                    self.assertTrue(manager.enqueue(session))
+                    manager._jobs.join()
+                self.assertEqual(observed, ["processing"])
+                expected = "error" if fail_write else "complete"
+                self.assertEqual(manager.snapshot()["postprocess"]["state"], expected)
+                journal = json.loads((session / "postprocess.json").read_text())
+                self.assertEqual(journal["state"], expected)
+                if fail_write:
+                    self.assertIn("journal write failed", journal["failure_reason"])
 
     def test_failed_postprocess_session_is_retried_once(self) -> None:
         class FlakyProcessor:

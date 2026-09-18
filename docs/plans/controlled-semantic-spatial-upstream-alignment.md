@@ -53,3 +53,10 @@ ActuCore 401 项容器测试通过。报告新增 APT 签名、Core 无关源改
 - 目标路由测试直接使用真实导航声明，覆盖有效、重复、非法 goal ID 及私有 `_control_nav_id`。
 - 按 registry digest 测量平台/构建基线/最终镜像；证据见同目录 `controlled-semantic-spatial-image-size-evidence.md`。README 说明 JP6.1 是原有构建路径迁出，不新增其 pip/audio_msgs 依赖。无需改接口或部署步骤。
 - 本轮本地复验：Core 同前述命令 987 passed / 1 deselected / 8 subtests；数量减少 1 对应退出范围的镜像源专用测试。`test_topic_actions.py` 11 passed，`actucore/tests/test_build_actucore.py` 11 passed；`git diff --check` 通过。镜像由下一轮 BOT 重建确认。
+
+第三轮 `f676038`：三个镜像构建成功，Core 容器测试 987 项通过；ActuCore
+400 passed / 1 failed，暴露后处理完成状态早于日志写入的竞态。
+修复为先原子写入终态日志，再发布内存终态并清理重试次数；磁盘 I/O 不占状态锁。
+新增确定性回归在修复前复现成功/写入失败两条路径均提前可见 complete，修复后通过。
+本地后处理专项 9 passed / 1 skipped / 2 subtests；ActuCore 全量 400 passed /
+2 skipped / 68 subtests。README 同步终态持久化契约，无接口变更、无真机操作。
