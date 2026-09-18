@@ -292,6 +292,11 @@ def _start_registration(mcp_port: int, name: str, category: str):
     }).encode()
     def _run():
         import time as _t
+        # Log transitions, not ticks. A 30s heartbeat that says "ok" every time
+        # is 92 of this container's 115 log lines — it crowds out the plugin
+        # errors that are the only reason to read this log at all. What an
+        # operator needs is the edges: it came up, or it stopped answering.
+        healthy = None
         while True:
             try:
                 req = _urllib.Request(
@@ -299,10 +304,16 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with _urllib.urlopen(req, timeout=3, context=_ctx):
-                    log.info(f"[register] heartbeat ok → {agent_core_url}")
+                    if healthy is not True:
+                        log.info(f"[register] heartbeat ok → {agent_core_url}"
+                                 + ("" if healthy is None else " (recovered)"))
+                        healthy = True
                 _t.sleep(30)
             except Exception as e:
+                # Every failure is logged: a flapping link is a real symptom and
+                # collapsing it would hide how often it drops.
                 log.warning(f"[register] failed: {e}, retrying in 5s")
+                healthy = False
                 _t.sleep(5)
     threading.Thread(target=_run, daemon=True, name="register").start()
 
