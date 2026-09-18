@@ -328,7 +328,8 @@ def main():
     def _spin():
         executor.spin()
 
-    threading.Thread(target=_spin, daemon=True, name="actucore_spin").start()
+    spin_thread = threading.Thread(target=_spin, daemon=True, name="actucore_spin")
+    spin_thread.start()
 
     _start_registration(mcp_port, "ActuCore", "actucore")
 
@@ -345,7 +346,18 @@ def main():
     try:
         server.serve_forever()
     finally:
+        # 关机顺序是有讲究的：spin 线程还停在 `executor.spin()` 里面（rclpy 的 C++
+        # 代码里）时，解释器一旦开始 finalize，就会 `terminate called without an
+        # active exception` → `Fatal Python error: Aborted`，容器退出码 134。
+        # 天轶上每次 SIGTERM 都会这样，日志里累计 13 次。
+        #
+        # `executor.shutdown()` 会让 `spin()` 返回，所以在 `rclpy.shutdown()` 之前
+        # 把线程 join 掉 —— 让 C++ 那边在解释器还活着的时候退干净。超时是兜底：
+        # 关不干净也不能把关机卡死，daemon 线程本来就会被强制收走。
         executor.shutdown()
+        spin_thread.join(timeout=5.0)
+        if spin_thread.is_alive():
+            log.warning("spin thread did not stop within 5s; shutting down anyway")
         rclpy.shutdown()
 
 
