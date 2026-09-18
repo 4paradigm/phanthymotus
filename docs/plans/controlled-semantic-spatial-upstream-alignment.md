@@ -75,3 +75,12 @@ README 与 CONTRIBUTING 的数据流说明仍适用，无需新增用户操作�
 Bundle，检查公开工具恰为 vla、导航配置关闭、导航不可导入。保留共享配置生成
 平台变体，避免复制整套模型配置。README 同步打包契约；JP6.1 colcon/audio_msgs
 原有层和压缩/解压体积区别已有说明，不再扩展无关构建优化。
+
+第六轮 `154f8db`：三个镜像构建成功，Core 989 / ActuCore 402 项容器测试通过。
+补齐 Core 监控对 sensor-envelope 的 UInt8MultiArray 类型映射，沿用二进制透传，
+回归覆盖 bytes、list 和 ROS 常用 array 数据容器。ActuCore 的语义/采集消费者
+原本直接订阅 DDS，此缺口不等于业务消费者无法接收；不新增转发依赖。
+语义 navigate 返回展开 planner_result，保留 nav_id/action_id；完成回调使用
+同一 nav_id，已有语义调用及 planner 终态测试覆盖，不按错误推断改写任务身份。
+构建基线重复意见沿用固定 digest 与实际层增量证据。此轮只扩展 Core 内部格式
+识别，消息契约和用户操作不变，现有 README/接口说明无需变更；未部署或真机验收。

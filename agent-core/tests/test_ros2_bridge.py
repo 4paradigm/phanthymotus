@@ -38,6 +38,23 @@ def _header(frame_id="map", sec=12, nanosec=34):
 
 
 class Ros2BridgeNavigationEncodingTest(unittest.TestCase):
+    def test_sensor_envelope_resolves_and_preserves_binary_payload(self) -> None:
+        from array import array
+
+        messages = ModuleType("std_msgs.msg")
+        envelope_type = type("UInt8MultiArray", (), {})
+        messages.UInt8MultiArray = envelope_type
+        fmt = "application/vnd.phanthy.sensor-envelope.v1"
+        with patch.dict(sys.modules, {"std_msgs.msg": messages}):
+            self.assertIs(ros2_bridge._resolve_msg_type(fmt), envelope_type)
+        payload = b'PSE1\x00\xff\x80{"schema":"camera_rgb_frame"}\x00\xff\xd8'
+        for data in (payload, list(payload), array("B", payload)):
+            with self.subTest(storage=type(data).__name__):
+                self.assertEqual(
+                    ros2_bridge._encode_message(SimpleNamespace(data=data), fmt),
+                    payload,
+                )
+
     def test_pointcloud_is_encoded_for_the_existing_renderer(self) -> None:
         fields = [
             SimpleNamespace(name=name, offset=offset, datatype=7, count=1)

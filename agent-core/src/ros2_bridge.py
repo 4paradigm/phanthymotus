@@ -477,7 +477,7 @@ def _resolve_msg_type(fmt: str):
         except ImportError:
             pass
         return None
-    if fmt == 'sensor/mapping':
+    if fmt in ('sensor/mapping', 'application/vnd.phanthy.sensor-envelope.v1'):
         try:
             from std_msgs.msg import UInt8MultiArray
             return UInt8MultiArray
