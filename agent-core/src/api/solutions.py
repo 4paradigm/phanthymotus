@@ -1020,6 +1020,13 @@ async def apply(request: fastapi.Request, req: LoadRequest):
 
 async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     """写画布布局与卡片配置。"""
+    from api.config import layout_lifecycle_lock
+
+    async with layout_lifecycle_lock:
+        return await _apply_canvas_locked(canvas, mapping)
+
+
+async def _apply_canvas_locked(canvas: dict, mapping: dict) -> dict:
     from api.canvas import (apply_tool_config, delete_all_tool_configs,
                             notify_layout_changed, tool_config_key)
 
@@ -1051,18 +1058,45 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
             c['toMcpId'] = target['mcpId']
         exec_connections.append(c)
 
-    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = {
+    old_layout = config.main.get('canvas_layout', {}) or {}
+    old_cards = old_layout.get('cards', [])
+    new_layout = {
         'cards':           cards,
         'connections':     connections,
         'execConnections': exec_connections,
         'transform':       canvas.get('transform') or {},
     }
+    was_running = config.main.get('core', {}).get('project_running', False)
+    topic_action_mgr = None
+    if was_running:
+        from topic_actions import build_routes, manager as topic_action_mgr
+        try:
+            build_routes(new_layout)
+        except Exception as error:
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail=f'Topic-action routes are invalid: {error}',
+            ) from error
+        core = config.main.get('core', {})
+        core['project_running'] = False
+        config.main['core'] = core
     # 方案里的卡片是整套替换的，被换掉的那些卡片的实例不会再有人来停它
     from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, cards)
-    # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
-    notify_layout_changed()
+    _, stop_failures = await stop_removed_cards(old_cards, cards)
+    if stop_failures:
+        if topic_action_mgr is not None:
+            await topic_action_mgr.stop()
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail={
+                'message': (
+                    'Removed card stop was not confirmed; solution was not applied '
+                    'and the project was stopped fail-closed'
+                ),
+                'failures': stop_failures,
+            },
+        )
+    config.main['canvas_layout'] = new_layout
 
     # 卡片配置：先清空旧的，再写包体里的
     removed = delete_all_tool_configs()
@@ -1081,6 +1115,26 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
         config.main[tool_config_key(mcp_id, tool_name, instance_id)] = value
         apply_tool_config(mcp_id, tool_name, value, instance_id)
         written += 1
+
+    if topic_action_mgr is not None:
+        try:
+            await topic_action_mgr.start(new_layout)
+        except Exception as error:
+            await topic_action_mgr.stop()
+            notify_layout_changed()
+            raise fastapi.HTTPException(
+                status_code=409,
+                detail=(
+                    f'Solution canvas was saved but topic-action routes failed: '
+                    f'{error}; the project was stopped fail-closed'
+                ),
+            ) from error
+        core = config.main.get('core', {})
+        core['project_running'] = True
+        config.main['core'] = core
+
+    # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
+    notify_layout_changed()
 
     return {'cards': len(cards),
             'connections': len(connections) + len(exec_connections),

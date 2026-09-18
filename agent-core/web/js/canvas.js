@@ -21,7 +21,7 @@ import { getToken } from './auth.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
 // same way, and with api/config.py's _start_and_resolve so the canvas and the
 // start agree about what a card consumes.
-import { inputArgs, inputKey } from './topic-derive.js';
+import { inputArgs, inputKey, selectPreviewTopic } from './topic-derive.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -854,7 +854,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     const fmt = t.format || '';
     const colorCls = _fmtColorClass(fmt);
     const staticAttr = t.topic ? `data-static-topic="${_esc(t.topic)}"` : '';
-    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}"></div>`;
+    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-port="${_esc(t.port || '')}" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}"></div>`;
   }).join('');
 
   if (effectiveType === 'controller') {
@@ -995,7 +995,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     el.querySelector('.canvas-view-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      _openTopicDetailFor(el, mcpId, topicOut);
+      _openTopicDetailFor(el, mcpId, topicOut, toolTopicOut);
     });
 
     const sensorExecBtn = el.querySelector('.canvas-exec-btn');
@@ -1221,7 +1221,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (viewBtn) {
       viewBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        _openTopicDetailFor(el, mcpId, topicOut);
+        _openTopicDetailFor(el, mcpId, topicOut, toolTopicOut);
       });
     }
 
@@ -2276,7 +2276,7 @@ async function _fetchTopicsFromDriver(card, inputTopics) {
  *    TTS card opened a panel that never showed a waveform, and why the server
  *    log filled with `ASGI callable returned without completing handshake`.
  */
-async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
+async function _openTopicDetailFor(el, mcpId, cachedTopicOut, declaredTopicOut) {
   // Ask the driver directly first, the same way the info modal does. Every
   // other source here (out-port dataset, the closure captured at render time,
   // the static MCP definition) is _revalidateDerivedTopics' cache, and it has
@@ -2295,7 +2295,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
         }),
       });
       const parsed = _parseMcpCallResult(await resp.json());
-      const liveTopic = parsed?.topic_out?.find(t => t && t.topic);
+      const liveTopic = selectPreviewTopic(parsed?.topic_out || [], declaredTopicOut);
       if (liveTopic) {
         showTopicDetail(liveTopic.topic, liveTopic.format || '');
         return;
@@ -2305,10 +2305,12 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
     }
   }
   const livePorts = [...el.querySelectorAll('.canvas-port.out')]
-    .map(p => ({ topic: p.dataset.topic, format: p.dataset.format }));
+    .map(p => ({ port: p.dataset.port, topic: p.dataset.topic, format: p.dataset.format }));
   const liveMcp = _allMcps.find(m => m.id === mcpId);
-  const candidate = [...livePorts, ...(cachedTopicOut || []), ...(liveMcp?.topic_out || [])]
-    .find(t => t && t.topic);
+  const candidate = selectPreviewTopic(
+    [...livePorts, ...(cachedTopicOut || []), ...(liveMcp?.topic_out || [])],
+    declaredTopicOut,
+  );
   if (!candidate) {
     _showToast('该卡片还没有解析出输出 topic —— 先点「开始控制」把它启动起来');
     return;

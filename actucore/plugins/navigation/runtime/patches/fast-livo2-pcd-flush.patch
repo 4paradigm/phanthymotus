@@ -1,0 +1,135 @@
+--- a/include/LIVMapper.h
++++ b/include/LIVMapper.h
+@@ -21,6 +21,7 @@
+ #include <tf2_ros/transform_broadcaster.h>
+ #include <geometry_msgs/msg/transform_stamped.hpp>
+ #include <nav_msgs/msg/path.hpp>
++#include <rcl_interfaces/msg/set_parameters_result.hpp>
+ #include <vikit/camera_loader.h>
+
+ class LIVMapper
+@@ -37,8 +38,8 @@
+   void stateEstimationAndMapping();
+   void handleVIO();
+   void handleLIO();
+-  void savePCD();
++  bool savePCD();
+   void processImu();
+   void publishRuntimeDiagnostics();
+
+   bool sync_packages(LidarMeasureGroup &meas);
+@@ -182,6 +183,7 @@
+   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mavros_pose_publisher;
+   rclcpp::TimerBase::SharedPtr imu_prop_timer;
+   rclcpp::Node::SharedPtr node;
++  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr pcd_flush_callback;
+
+   int frame_num = 0;
+   double aver_time_consu = 0;
+--- a/src/LIVMapper.cpp
++++ b/src/LIVMapper.cpp
+@@ -121,6 +121,26 @@
+   pcl_wait_pub.reset(new PointCloudXYZI());
+   pcl_wait_save.reset(new PointCloudXYZRGB());
+   pcl_wait_save_intensity.reset(new PointCloudXYZI());
++  pcd_flush_callback = this->node->add_on_set_parameters_callback(
++    [this](const std::vector<rclcpp::Parameter> &parameters)
++    {
++      rcl_interfaces::msg::SetParametersResult result;
++      result.successful = true;
++      for (const auto &parameter : parameters)
++      {
++        if (parameter.get_name() != "pcd_save.flush_sequence")
++        {
++          continue;
++        }
++        if (!pcd_save_en || !savePCD())
++        {
++          result.successful = false;
++          result.reason = "raw PCD flush failed";
++          return result;
++        }
++      }
++      return result;
++    });
+   voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
+   vio_manager.reset(new VIOManager());
+   root_dir = ROOT_DIR;
+@@ -193,6 +213,7 @@
+   try_declare.template operator()<int>("pcd_save.interval", -1);
+   try_declare.template operator()<bool>("pcd_save.pcd_save_en", false);
+   try_declare.template operator()<int>("pcd_save.type", 0);
++  try_declare.template operator()<int64_t>("pcd_save.flush_sequence", 0);
+   try_declare.template operator()<bool>("image_save.img_save_en", false);
+   try_declare.template operator()<int>("image_save.interval", 1);
+   try_declare.template operator()<bool>("pcd_save.colmap_output_en", false);
+@@ -732,10 +753,18 @@
+             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
+ }
+
+-void LIVMapper::savePCD()
++bool LIVMapper::savePCD()
+ {
+-  if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0))
++  if (!pcd_save_en)
+   {
++    return false;
++  }
++  if (pcl_wait_save->points.empty() && pcl_wait_save_intensity->points.empty())
++  {
++    return true;
++  }
++  if (pcd_save_en)
++  {
+     const std::string raw_points_name = pcd_save_interval < 0 ? "all_raw_points.pcd" : "tail_raw_points.pcd";
+     std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/" + raw_points_name;
+     std::string downsampled_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
+@@ -753,11 +782,19 @@
+       voxel_filter.setLeafSize(filter_size_pcd, filter_size_pcd, filter_size_pcd);
+       voxel_filter.filter(*downsampled_cloud);
+
+-      pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save); // Save the raw point cloud data
++      if (pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save) != 0)
++      {
++        RCLCPP_ERROR(this->node->get_logger(), "PCD finalization failed: %s", raw_points_dir.c_str());
++        return false;
++      }
+       std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir
+                 << " with point count: " << pcl_wait_save->points.size() << RESET << std::endl;
+
+-      pcd_writer.writeBinary(downsampled_points_dir, *downsampled_cloud); // Save the downsampled point cloud data
++      if (pcd_writer.writeBinary(downsampled_points_dir, *downsampled_cloud) != 0)
++      {
++        RCLCPP_ERROR(this->node->get_logger(), "PCD downsample finalization failed: %s", downsampled_points_dir.c_str());
++        return false;
++      }
+       std::cout << GREEN << "Downsampled point cloud data saved to: " << downsampled_points_dir
+                 << " with point count after filtering: " << downsampled_cloud->points.size() << RESET << std::endl;
+
+@@ -784,12 +821,13 @@
+       if (!writeIntensityPCDBinary(raw_points_dir, *pcl_wait_save_intensity, written_points))
+       {
+         RCLCPP_ERROR(this->node->get_logger(), "PCD finalization failed: %s", raw_points_dir.c_str());
+-        return;
++        return false;
+       }
+       RCLCPP_WARN(this->node->get_logger(), "PCD finalization completed: path=%s points=%zu",
+         raw_points_dir.c_str(), written_points);
+     }
+   }
++  return true;
+ }
+
+ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
+@@ -904,7 +942,10 @@
+       std::chrono::steady_clock::now() - processing_started).count();
+     max_processing_ms = std::max(max_processing_ms, last_processing_ms);
+   }
+-  savePCD();
++  if (!savePCD())
++  {
++    RCLCPP_ERROR(this->node->get_logger(), "PCD finalization failed during shutdown");
++  }
+ }
+
+ void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)

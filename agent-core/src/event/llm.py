@@ -600,6 +600,8 @@ def _needs_barrier(name: str, call_args: dict = None) -> tuple[bool, frozenset |
         return True, None    # 无 meta 默认 barrier 且当全局独占（安全）
     if meta.get('type') in ('sensor', 'resource'):
         return False, None
+    if action_name in (meta.get('completion') or {}).get('passthrough_actions', []):
+        return False, None
     return True, meta.get('resource')
 
 

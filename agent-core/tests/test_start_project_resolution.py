@@ -399,3 +399,22 @@ def test_a_live_answer_beats_a_stale_persisted_one(driver):
     }
     assert _start(layout) is True
     assert driver.starts[CORE]['input_topic'] == '/ubuntu/mic/audio'
+
+
+def test_port_bindings_survive_dependency_order_and_use_live_topics(driver, monkeypatch):
+    import mcp_client
+    nav = _card('nav', 'ControlledSemanticSpatial')
+    nav['topicIn'] = [{'port': 'lidar'}, {'port': 'imu'}]
+    monkeypatch.setattr(mcp_client, 'registry', {'mcp-perception': {
+        'tool_definitions': [{'name': 'ControlledSemanticSpatial',
+            'inputSchema': {'properties': {'input_bindings': {'type': 'array'}}}}]}})
+    second = _conn(RM, 'nav', '/stale/imu')
+    second['toPortIdx'] = '1'
+    layout = {'cards': [nav, _card(MIC, 'mic'), _card(RM, 'remote_message')],
+              'connections': [_conn(MIC, 'nav', '/stale/lidar'), second]}
+    assert _start(layout) is True
+    assert driver.starts['nav']['input_bindings'] == [
+        {'port': 'lidar', 'topic': '/ubuntu/mic/audio'},
+        {'port': 'imu', 'topic': '/remote_control/message'},
+    ]
+    assert 'input_topics' not in driver.starts['nav']

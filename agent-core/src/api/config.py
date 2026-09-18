@@ -1,3 +1,5 @@
+import asyncio
+import json
 import time
 from urllib.parse import urlparse
 from typing import List
@@ -10,6 +12,84 @@ import aiohttp
 import openai as openai_lib
 
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
+# ponytail: one project exists per Core process; split the lock only if that changes.
+layout_lifecycle_lock = asyncio.Lock()
+
+
+def _mcp_payload(result) -> dict:
+    """Unwrap an MCP call result without hiding a direct plugin response."""
+    if not isinstance(result, dict):
+        return {}
+    if 'code' not in result:
+        return result
+    if result.get('code') != 200:
+        return {}
+    payload = result.get('data')
+    if isinstance(payload, list) and payload:
+        payload = payload[0].get('text', '{}') if isinstance(payload[0], dict) else {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _stop_confirmed(payload: dict) -> bool:
+    return (
+        payload.get('terminal_confirmed') is True
+        or (payload.get('status') or payload.get('state'))
+        in {'idle', 'stopped', 'disabled'}
+    )
+
+
+def _tool_accepts_input_bindings(mcp_id: str, tool_name: str) -> bool:
+    """Use port-aware wiring only when the target tool declares it."""
+    import mcp_client
+
+    tools = mcp_client.registry.get(mcp_id, {}).get('tool_definitions', [])
+    for tool in tools:
+        if tool.get('name') == tool_name:
+            properties = (tool.get('inputSchema') or {}).get('properties') or {}
+            return 'input_bindings' in properties
+    return False
+
+
+def _resolve_processor_inputs(card, connections, cards, resolved_topics):
+    """Resolve inbound topics while preserving each destination port."""
+    cards_by_id = {item.get('id'): item for item in cards if item.get('id')}
+    target_inputs = card.get('topicIn') or []
+    bindings = []
+    topics = []
+    for conn in connections:
+        if conn.get('toCardId') != card.get('id'):
+            continue
+        try:
+            source_index = int(conn.get('fromPortIdx', 0))
+            target_index = int(conn.get('toPortIdx', 0))
+        except (TypeError, ValueError):
+            continue
+        source = cards_by_id.get(conn.get('fromCardId'), {})
+        outputs = resolved_topics.get(source.get('id')) or source.get('topicOut') or []
+        topic = ''
+        if 0 <= source_index < len(outputs):
+            topic = str(outputs[source_index].get('topic') or '').strip()
+        if not topic:
+            topic = str(conn.get('fromTopic') or '').strip()
+        if not topic:
+            continue
+        topics.append(topic)
+        if 0 <= target_index < len(target_inputs):
+            port = str(target_inputs[target_index].get('port') or '').strip()
+            if port:
+                bindings.append({'port': port, 'topic': topic})
+
+    unique_topics = list(dict.fromkeys(topics))
+    if len(unique_topics) > 1:
+        return '', unique_topics, bindings
+    if unique_topics:
+        return unique_topics[0], [], bindings
+    return '', [], bindings
 
 
 # ── Models ──────────────────────────────────────────────────────────────────
@@ -169,7 +249,7 @@ def order_cards_by_dependency(cards, connections):
 _start_project_lock = False
 
 
-async def _do_start_project():
+async def _do_start_project(*, _lock_held: bool = False):
     """Serializes concurrent callers behind a flag.
 
     The frontend's start button used to accept a second click while the first
@@ -188,7 +268,10 @@ async def _do_start_project():
         return None
     _start_project_lock = True
     try:
-        return await _do_start_project_impl()
+        if _lock_held:
+            return await _do_start_project_impl()
+        async with layout_lifecycle_lock:
+            return await _do_start_project_impl()
     finally:
         _start_project_lock = False
 
@@ -360,6 +443,9 @@ async def _do_start_project_impl():
         topic_out = data.get('topic_out') or []
         if topic_out:
             resolved_topics[card_id] = topic_out
+            card = next((item for item in cards if item.get('id') == card_id), None)
+            if card is not None:
+                card['topicOut'] = topic_out
             from api.inspection import register_topic_internal
             for tp in topic_out:
                 if tp.get('topic') and tp.get('format'):
@@ -513,7 +599,7 @@ async def _do_start_project_impl():
             return {}
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
-                                 control_interface: dict = None):
+                                 control_interface: dict = None, input_bindings: list = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -528,7 +614,10 @@ async def _do_start_project_impl():
         args = {'action': 'start', 'instance_id': card_id}
         info_args: dict = {}
         wanted: list = []
-        if input_topics and len(input_topics) > 1:
+        if input_bindings and _tool_accepts_input_bindings(mcp_id, tool_name):
+            args['input_bindings'] = input_bindings
+            info_args['input_bindings'] = input_bindings
+        elif input_topics and len(input_topics) > 1:
             wanted = list(input_topics)
             args['input_topics'] = input_topics
             info_args['input_topics'] = input_topics
@@ -856,17 +945,32 @@ async def _do_start_project_impl():
             errors.append(tool_name)
             continue
 
+        _, _, input_bindings = _resolve_processor_inputs(
+            card, connections, cards, resolved_topics
+        )
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
-                                 control_interface=descriptor)
+                                 control_interface=descriptor, input_bindings=input_bindings)
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
         print(f'[start-project] {len(errors)} cards failed ({", ".join(errors)}), rolling back')
         await push_event({'type': 'project_start_done', 'payload': {'has_error': True, 'errors': errors}})
-        await _do_stop_project()
+        await _do_stop_project(_lock_held=True)
         return False
 
-    # 全部成功 → 标记 running
+    # 路由先在不可派发状态下安装；全部成功后再开放 project_running 门。
+    try:
+        from topic_actions import manager as topic_action_mgr
+        await topic_action_mgr.start(layout)
+    except Exception as e:
+        print(f'[start-project] topic-actions failed: {e}')
+        errors.append('topic-actions')
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True, 'errors': errors,
+        }})
+        await _do_stop_project(_lock_held=True)
+        return False
+
     core = config.main.get('core', {})
     core['project_running'] = True
     config.main['core'] = core
@@ -878,8 +982,8 @@ async def _do_start_project_impl():
     return True
 
 
-async def _stop_cards(cards) -> int:
-    """Send `stop` to each card's instance. Returns how many calls were made.
+async def _stop_cards(cards) -> tuple[int, list[dict]]:
+    """Stop every card and return confirmed stops plus unconfirmed failures.
 
     `stop` is idempotent — a plugin that is already idle returns
     `{"state": "idle"}` — so this is safe to call on cards that were never
@@ -888,6 +992,7 @@ async def _stop_cards(cards) -> int:
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
 
     stopped = 0
+    failures = []
     for card in cards:
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -895,15 +1000,29 @@ async def _stop_cards(cards) -> int:
         if not mcp_id or not tool_name:
             continue
         try:
-            req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
-            await mcp_call_tool(mcp_id, req)
+            req = MCPCallRequest(
+                tool=tool_name,
+                arguments={'action': 'stop', 'instance_id': card_id},
+            )
+            result = await mcp_call_tool(mcp_id, req)
+            payload = _mcp_payload(result)
+            if result.get('code', 200) != 200 or not _stop_confirmed(payload):
+                raise RuntimeError(
+                    payload.get('error')
+                    or result.get('message')
+                    or 'stop was not confirmed'
+                )
             stopped += 1
-        except Exception:
-            pass
-    return stopped
+        except Exception as error:
+            failures.append({
+                'card_id': card_id,
+                'tool': tool_name,
+                'error': str(error)[:200],
+            })
+    return stopped, failures
 
 
-async def stop_removed_cards(old_cards, new_cards) -> int:
+async def stop_removed_cards(old_cards, new_cards) -> tuple[int, list[dict]]:
     """Stop instances belonging to cards that just left the layout.
 
     `_do_stop_project` stops what the *saved layout* lists, so a card removed
@@ -922,25 +1041,39 @@ async def stop_removed_cards(old_cards, new_cards) -> int:
     live = {c.get('id', '') for c in (new_cards or []) if c.get('id')}
     removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
     if not removed:
-        return 0
-    count = await _stop_cards(removed)
+        return 0, []
+    count, failures = await _stop_cards(removed)
     print(f'[layout] stopped {count} instance(s) for removed card(s): '
           f'{", ".join(c.get("id", "") for c in removed)}')
-    return count
+    if failures:
+        print(f'[layout] {len(failures)} removed card stop(s) unconfirmed: {failures}')
+    return count, failures
 
 
-async def _do_stop_project():
+async def _do_stop_project(*, _lock_held: bool = False):
     """停止所有 canvas cards。"""
+    if not _lock_held:
+        async with layout_lifecycle_lock:
+            return await _do_stop_project(_lock_held=True)
+
     from api.motus_stream import push_event
 
-    layout = config.main.get('canvas_layout', {})
-    await _stop_cards(layout.get('cards', []))
-
+    # 先关运行态和 topic actions，避免停卡过程再接收新动作。
     core = config.main.get('core', {})
     core['project_running'] = False
     config.main['core'] = core
+    from topic_actions import manager as topic_action_mgr
+    await topic_action_mgr.stop()
+
+    layout = config.main.get('canvas_layout', {})
+    stopped, failures = await _stop_cards(layout.get('cards', []))
+    if failures:
+        print(f'[stop-project] pending: {failures}')
+        return {'ok': False, 'stopped': stopped, 'failures': failures}
+
     await push_event({'type': 'project_state', 'payload': {'running': False}})
     print('[stop-project] done')
+    return {'ok': True, 'stopped': stopped, 'failures': []}
 
 
 @router.post('/start-project')
@@ -961,8 +1094,10 @@ async def api_start_project():
 
 @router.post('/stop-project')
 async def api_stop_project():
-    await _do_stop_project()
-    return {'ok': True}
+    result = await _do_stop_project()
+    if not result['ok']:
+        return fastapi.responses.JSONResponse(status_code=409, content=result)
+    return result
 
 
 
@@ -1508,5 +1643,3 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
-
-
