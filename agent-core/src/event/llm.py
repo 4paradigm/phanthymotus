@@ -57,6 +57,57 @@ def _decoded_json(value):
     return parsed if isinstance(parsed, (dict, list)) else value
 
 
+def _tool_content(result):
+    """一个 tool role 消息的 `content`，保证是服务端收得下的形状。
+
+    OpenAI 的 schema 里 tool 消息的 content 只能是字符串（或多模态 content part
+    数组）。而 `_dispatch` 的返回值并不都是字符串：barrier 被打断时它返回
+    `{"status": "not_dispatched", "reason": ...}` 这样的 dict，之前原样塞进
+    content，请求就被上游以 400 拒掉。
+
+    这不是偶发抖动，而是确定性的、并且会粘住：这条坏消息一旦进了 turn_messages，
+    本轮后面每一次请求都带着它，于是整轮持续 400 直到 turn 结束。天轶上 24356 次
+    历史请求里，带 dict content 的有 35 次，**没有一次拿到过回复**；日志里只有
+    `UPSTREAM_PASSTHROUGH: The model service rejected this request.`，网关把上游
+    的具体字段名吞掉了，所以从错误信息本身看不出是哪条消息的问题。
+
+    子代理那条路径（`subagent/agent.py::_dispatch_tool`）一直是 json.dumps 收口的，
+    这里补上同样的收口，而不是去逐个改 `_dispatch` 的返回值 —— 收口放在唯一的出口
+    上，以后任何新的非字符串返回值都不会再把整轮打掉。
+    """
+    if isinstance(result, str):
+        return result
+    # 多模态 content part 数组（图片等）是 schema 允许的另一种形状，原样放行。
+    if isinstance(result, list):
+        return result
+    if result is None:
+        return ''
+    if isinstance(result, (dict, int, float, bool)):
+        try:
+            return json.dumps(result, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+    return str(result)
+
+
+def _sanitise_turn(turn: list) -> list:
+    """把一轮历史消息里不合法的 tool content 收干净。
+
+    修复之前写进 `chat_messages` 的 dict content 还躺在每台已部署机器的 data.db
+    里，而 `__aenter__` 的重启续跑会把最近 10 轮原样读回 `_turns` —— 也就是把同一个
+    400 一起续跑回来，升级并不能自愈。这里在读回来的那一侧再过一遍。
+    """
+    if not isinstance(turn, list):
+        return turn
+    out = []
+    for msg in turn:
+        if (isinstance(msg, dict) and msg.get('role') == 'tool'
+                and not isinstance(msg.get('content'), (str, list, type(None)))):
+            msg = {**msg, 'content': _tool_content(msg.get('content'))}
+        out.append(msg)
+    return out
+
+
 # ── Turn 取消异常 ────────────────────────────────────────────────────────────────
 
 class TurnCancelled(Exception):
@@ -1268,6 +1319,15 @@ def get_recent_context_rich(max_turns: int = 20, max_chars: int = 6000) -> str:
             content = msg.get('content', '')
             if not content:
                 continue
+            if not isinstance(content, str):
+                # `content[:800]` 上一个 dict 会抛 `unhashable type: 'slice'`，而这个
+                # 函数是从 `_bg_trigger_loop` 里调的 —— 那个 while True 没有任何
+                # try/except，异常直接把 task 打死，后台传感器监控就此静默停摆，
+                # 日志里只留一行 "Task exception was never retrieved"。天轶上实测
+                # 一次这样死了 40 分钟，直到容器重启才恢复。
+                content = _tool_content(content)
+                if not isinstance(content, str):
+                    continue
             # 跳过 <status 开头的环境快照（噪音大）
             if role == 'user' and content.startswith('<status'):
                 continue
@@ -1367,7 +1427,9 @@ class Event:
         import chat_history
         last = chat_history.get_last_session_turns(limit=10)
         if last:
-            self._turns = last['turns']
+            # 落盘的历史可能是修复之前写的：那时 tool 消息的 content 会是 dict，
+            # 读回来就等于把同一个 400 一起续跑回来。所以在 restore 这一侧也过一遍。
+            self._turns = [_sanitise_turn(t) for t in last['turns']]
             self._session_id = last['session_id']
             print(f'[startup] resumed session {last["session_id"][:8]}... ({len(last["turns"])} turns)')
         else:
@@ -2452,7 +2514,7 @@ class Event:
                     {
                         'role':         'tool',
                         'tool_call_id': r['id'],
-                        'content':      r['result'],
+                        'content':      _tool_content(r['result']),
                     }
                     for r in results
                 ]
