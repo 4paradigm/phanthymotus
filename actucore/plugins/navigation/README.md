@@ -295,8 +295,8 @@ behavior/bt_navigator/waypoint_follower + navfn、costmap 三层，
 smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们已被当前
 链路取代，或会把 ompl、ceres、xtensor、Qt5 等无用依赖拖进镜像。
 
-镜像里**没有** torch / CLIP / YOLO / ASR 依赖 —— 卡片自身只用标准库 + ROS
-消息包，语义航点是 HTTP 调远端 VLM。那些模型依赖属于 perception。G1 实测的
+导航卡片不额外引入 torch / CLIP / YOLO / ASR；平台基线及同镜像的 VLA 卡片
+有各自的模型依赖。语义航点通过 HTTP 调远端 VLM。以下为历史 G1 实测：
 上游 ActuCore 镜像为 `13,786,589,503` bytes，首次加入导航栈的镜像为
 `14,665,479,002` bytes，增加 `878,889,499` bytes（约 `0.82 GiB` / `6.38%`）。
 该数据由上海 G1 上的 `docker image inspect --format '{{.Size}}'` 实测；增加的是
@@ -307,7 +307,9 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 体积。基础镜像使用 builder/runtime 双阶段；最终阶段只复制三个 ROS install-space
 和包锁，不保留 `/opt/ros_deps_ws`、`/opt/fast_livo_ws`、`/opt/nav2_ws` 的源码、
 build 与 log 目录。上述 `0.82 GiB` 是清理前的历史测量，新的最终体积必须在原生
-ARM64 完整构建后重新记录。
+ARM64 完整构建后重新记录。2026-09-18 当前镜像的 registry 压缩层测量见
+[镜像体积证据](../../../docs/plans/controlled-semantic-spatial-image-size-evidence.md)，
+该口径不能与上述历史解压后大小相减。
 该固定 base 同时提供 `colcon` / `empy` 和 PyYAML；日常镜像构建会实际执行
 `colcon build` 并显式导入 `em` / `yaml`，避免把基础镜像的偶然环境冒充成依赖
 契约，并从最终安装的 `nav2_params.yaml` 逐个动态加载全部 BT 插件库，缺库或

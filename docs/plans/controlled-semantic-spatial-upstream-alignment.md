@@ -44,3 +44,12 @@ https://github.com/4paradigm/phanthymotus/pull/141#issuecomment-5724471763 指�
 - JP6.1 确认漏打包 `utils.security`：补齐目录复制、主入口导入检查和两个镜像的打包契约测试；Dockerfile 默认参数也与 JP6.1 构建入口一致。
 - JP5.11 最终镜像只验证 segmented_controller，FAST-LIVO2/Nav2 的检查原在 builder：补齐最终阶段所有运行节点的 ldd、BT 插件 dlopen 与 Python 入口检查。先用真实构建确认平台镜像的库闭包，若缺库再按具体缺失补运行依赖，避免无证据安装开发包。
 - Shell 检查在临时目录用替身 ldd 验证正常、缺库及命令失败三条路径；原生库检查仍以 BOT 实际构建为准。相关构建说明同步，不改 Driver 或真机部署步骤。
+
+第二轮 `d6d72a5`：三个镜像均构建成功，最终镜像加载检查通过；Core 988、
+ActuCore 401 项容器测试通过。报告新增 APT 签名、Core 无关源改写与体积证据意见。
+
+- 删除 JP6.1 没有 APT 消费者的两层源改写，不再引入 trusted=yes。
+- Core 恢复上游 APT 行为，仅保留导航 ROS 消息导入检查；删除随源改写引入的专用测试，因该行为已退出 PR 范围。
+- 目标路由测试直接使用真实导航声明，覆盖有效、重复、非法 goal ID 及私有 `_control_nav_id`。
+- 按 registry digest 测量平台/构建基线/最终镜像；证据见同目录 `controlled-semantic-spatial-image-size-evidence.md`。README 说明 JP6.1 是原有构建路径迁出，不新增其 pip/audio_msgs 依赖。无需改接口或部署步骤。
+- 本轮本地复验：Core 同前述命令 987 passed / 1 deselected / 8 subtests；数量减少 1 对应退出范围的镜像源专用测试。`test_topic_actions.py` 11 passed，`actucore/tests/test_build_actucore.py` 11 passed；`git diff --check` 通过。镜像由下一轮 BOT 重建确认。

@@ -9,7 +9,6 @@
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
-ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 # Defaults match the JP6.1 path in deploy/build_actucore.sh.
 # The script always passes both explicitly; these only apply to a bare
 # `docker build`, and having them disagree with the script would mean the same
@@ -19,18 +18,9 @@ ARG JP_VERSION=61
 # See deploy/prepare_actucore_base.sh for the separate inference base.
 ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base-actucore:jp61-torch
 FROM ${BASE_IMAGE}
-ARG PYPI_MIRROR APT_MIRROR
+ARG PYPI_MIRROR
 
-# ── APT mirror (conditional) ─────────────────────────────────────
-RUN if [ -n "${APT_MIRROR}" ]; then \
-        sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
-    fi
-
-# ── Switch ROS2 to TUNA mirror + skip expired key (if sources exist) ──
-RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
-        sed -i 's|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g' /etc/apt/sources.list.d/*.list && \
-        sed -i 's|deb \[|deb [trusted=yes |g; s|deb http|deb [trusted=yes] http|g' /etc/apt/sources.list.d/ros2*.list; \
-    fi
+# No APT consumer: keep the signed sources inherited from the platform base.
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"

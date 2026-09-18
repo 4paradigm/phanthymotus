@@ -112,6 +112,10 @@ JetPack 5.11 默认继承仓库锁定的 `@sha256` 基础镜像，无需额外
 环境变量，提供 navigation 与 VLA mock / vla_cloud。JetPack 6.1 保留上游
 `jetson-base-actucore` 的 torch / lerobot 本地推理，通过 `Dockerfile.vla` 构建；
 该镜像禁用 navigation（对应基座尚未发布），不接受 navigation base 覆盖。
+`Dockerfile.vla` 保留上游 `bdeec4e` 原 `Dockerfile.jetson` 的 JP6.1 路径：
+colcon/empy 和 audio_msgs 的构建步骤是原有层，不是导航新增依赖。独立文件让
+JP6.1 继续使用 torch/lerobot 平台基线，避免进入 JP5.11 的导航多阶段构建。
+该文件没有 APT 消费者，因此不修改继承的 APT 源或签名校验。
 5.11 的导航基础镜像预编译了锁定版本的 FAST-LIVO2、Nav2
 和系统依赖，仅作为日常构建的 builder。仓库自有 ROS 包使用普通 install
 编译后，最终阶段从同一个干净、锁定 digest 的 Jetson 平台镜像重新开始，
@@ -137,6 +141,9 @@ navigation base 和日常 ActuCore 的 C++ 编译步骤。
 放在 `Dockerfile.jetson`；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈
 才进入 `Dockerfile.navigation-base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
 再次走耗时且容易超时的 x86 QEMU 交叉编译。
+
+当前镜像与固定导航基线的按 digest 体积测量、依赖增量及测量口径见
+[导航镜像体积证据](../docs/plans/controlled-semantic-spatial-image-size-evidence.md)。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 

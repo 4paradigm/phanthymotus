@@ -258,6 +258,16 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls[-1], "/ubuntu/navigation/goal_pose")
 
     async def test_valid_goal_dispatches_once_and_stop_unsubscribes(self) -> None:
+        from plugins.navigation.contract import navigation_tool_definition
+
+        tool = navigation_tool_definition("ubuntu")
+        mcp_client.registry["perception"] = {"tool_definitions": [tool]}
+        layout = _layout()
+        layout["cards"][1]["toolName"] = tool["name"]
+        layout["connections"][0]["toPortIdx"] = str(next(
+            index for index, port in enumerate(tool["topic_in"])
+            if port["port"] == "goal_pose"
+        ))
         callbacks = {}
         dispatched = []
 
@@ -282,7 +292,7 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         ) as unsubscribe, patch.dict(sys.modules, {"api.mcp_manage": fake_api}), patch(
             "builtins.print"
         ) as log:
-            await self.manager.start(_layout())
+            await self.manager.start(layout)
             callback = next(iter(callbacks.values()))
             payload = {
                 "schema": "phanthy.navigation.goal.v1",
@@ -294,13 +304,14 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
             }
             await callback(json.dumps(payload).encode(), "data/json")
             await callback(json.dumps(payload).encode(), "data/json")
+            await callback(json.dumps({**payload, "goal_id": ""}).encode(), "data/json")
 
             self.assertEqual(
                 dispatched,
                 [
                     (
                         "perception",
-                        "nav2",
+                        "ControlledSemanticSpatial",
                         {
                             "action": "navigate_to_pose",
                             "instance_id": "nav2-card",
@@ -314,9 +325,10 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
                 ],
             )
             stats = next(iter(self.manager.snapshot().values()))
-            self.assertEqual(stats["received"], 2)
+            self.assertEqual(stats["received"], 3)
             self.assertEqual(stats["dispatched"], 1)
             self.assertEqual(stats["duplicates"], 1)
+            self.assertEqual(stats["invalid"], 1)
             self.assertNotIn(
                 "goal-001", "\n".join(call.args[0] for call in log.call_args_list)
             )

@@ -1,11 +1,9 @@
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
-ARG PYPI_MIRROR APT_MIRROR
+ARG PYPI_MIRROR
 
 # Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault).
-# The pinned ROS base may carry a site-local Ubuntu mirror. Rewrite it in this
-# same layer because ffmpeg/python/dbus/curl below are concrete APT consumers.
 # --retry survives the transient TLS drops this network path has hit more than
 # once (curl exit 56 / HTTP2 stream errors) — retrying the whole RUN restarts
 # the ffmpeg apt install too, which is the expensive part.
@@ -14,21 +12,7 @@ ARG PYPI_MIRROR APT_MIRROR
 # offender. The compose plugin is proxied through ghfast.top (same GitHub
 # mirror already used in perception/Dockerfile.jetson).
 ARG DOCKER_CLI_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/docker-27.5.1-aarch64.tgz
-RUN if [ -n "${APT_MIRROR}" ]; then \
-        for source in \
-          /etc/apt/sources.list \
-          /etc/apt/sources.list.d/*.list \
-          /etc/apt/sources.list.d/*.sources; do \
-            [ -f "${source}" ] || continue; \
-            sed -E -i \
-              "s|https?://archive\.ubuntu\.com|https://${APT_MIRROR}|g; \
-               s|https?://security\.ubuntu\.com|https://${APT_MIRROR}|g; \
-               s|https?://ports\.ubuntu\.com|https://${APT_MIRROR}|g; \
-               s|https?://mirrors\.tencentyun\.com|https://${APT_MIRROR}|g" \
-              "${source}"; \
-        done; \
-    fi && \
-    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip python3-dbus ffmpeg curl && \
     curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --retry-max-time 60 \
