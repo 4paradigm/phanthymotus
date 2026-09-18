@@ -912,6 +912,36 @@ if __name__ == '__main__':
     logging.getLogger('uvicorn.error').addFilter(_SSLCloseFilter())
     logging.getLogger('asyncio').addFilter(_SSLCloseFilter())
 
+    # Drop the dashboard's own polling from the access log.
+    #
+    # An open dashboard re-asks these four every second or two, and on a robot
+    # that has been up for an hour they are half of every line in
+    # `docker logs`. That is not a cosmetic complaint: chasing the LLM 400s on
+    # Tianyi meant reading around 15209 peer 403s and several hundred of these
+    # to find eight lines that mattered.
+    #
+    # **Only successful polls of known paths are dropped.** Anything 4xx/5xx
+    # stays, every other path stays, and every non-access logger is untouched —
+    # a filter that hid a failing request would cost more than the noise does.
+    _QUIET_POLLS = (
+        'GET /api/mcp ',
+        'GET /api/topics/status ',
+        'GET /api/canvas/edit-status',
+        'GET /api/deploying ',
+        'GET /api/auth/verify ',
+        'POST /api/mcp ',            # driver/perception registration heartbeat
+        'POST /api/hooks/fire ',
+    )
+
+    class _AccessPollFilter(logging.Filter):
+        def filter(self, record):
+            msg = record.getMessage()
+            if '" 2' not in msg and '" 3' not in msg:
+                return True          # not a 2xx/3xx — always keep
+            return not any(p in msg for p in _QUIET_POLLS)
+
+    logging.getLogger('uvicorn.access').addFilter(_AccessPollFilter())
+
     cert_file, key_file = _ensure_ssl_certs()
     uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None,
                 ssl_certfile=cert_file, ssl_keyfile=key_file,

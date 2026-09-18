@@ -465,6 +465,11 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
 # 这些 404 占了那台机器驱动日志的 98.5%（310262 / 315088 行）。
 _sse_tasks: dict[str, asyncio.Task] = {}
 
+# mcp_id → the sse url we already reported as absent, so "this server has no SSE
+# endpoint" is said once per device rather than once per reconnect. Keyed by url
+# too: a device that moves to a new port deserves to be reported again.
+_sse_absent: dict[str, str] = {}
+
 
 def _start_sse(mcp_id: str, url: str) -> None:
     """(重)启动一个设备的 SSE 订阅，先取消上一个。"""
@@ -503,8 +508,17 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                     if resp.status == 404:
                         missing += 1
                         if missing >= 2:
-                            print(f'[mcp] {mcp_id}: no SSE endpoint at {sse_url} '
-                                  f'(404) — not subscribing')
+                            # Once per device, not once per reconnect. This line
+                            # was the second-biggest source of noise in
+                            # agent-core's own log (206 lines in 1642) because
+                            # `_connect_one` re-ran every 30s — the churn is
+                            # fixed separately, but "this server has no SSE" is
+                            # a standing fact either way and does not improve by
+                            # being repeated.
+                            if _sse_absent.get(mcp_id) != sse_url:
+                                _sse_absent[mcp_id] = sse_url
+                                print(f'[mcp] {mcp_id}: no SSE endpoint at {sse_url} '
+                                      f'(404) — not subscribing')
                             return
                         await asyncio.sleep(delay)
                         continue
