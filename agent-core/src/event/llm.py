@@ -90,6 +90,24 @@ def _tool_content(result):
     return str(result)
 
 
+def _sanitise_turn(turn: list) -> list:
+    """把一轮历史消息里不合法的 tool content 收干净。
+
+    修复之前写进 `chat_messages` 的 dict content 还躺在每台已部署机器的 data.db
+    里，而 `__aenter__` 的重启续跑会把最近 10 轮原样读回 `_turns` —— 也就是把同一个
+    400 一起续跑回来，升级并不能自愈。这里在读回来的那一侧再过一遍。
+    """
+    if not isinstance(turn, list):
+        return turn
+    out = []
+    for msg in turn:
+        if (isinstance(msg, dict) and msg.get('role') == 'tool'
+                and not isinstance(msg.get('content'), (str, list, type(None)))):
+            msg = {**msg, 'content': _tool_content(msg.get('content'))}
+        out.append(msg)
+    return out
+
+
 # ── Turn 取消异常 ────────────────────────────────────────────────────────────────
 
 class TurnCancelled(Exception):
@@ -1301,6 +1319,15 @@ def get_recent_context_rich(max_turns: int = 20, max_chars: int = 6000) -> str:
             content = msg.get('content', '')
             if not content:
                 continue
+            if not isinstance(content, str):
+                # `content[:800]` 上一个 dict 会抛 `unhashable type: 'slice'`，而这个
+                # 函数是从 `_bg_trigger_loop` 里调的 —— 那个 while True 没有任何
+                # try/except，异常直接把 task 打死，后台传感器监控就此静默停摆，
+                # 日志里只留一行 "Task exception was never retrieved"。天轶上实测
+                # 一次这样死了 40 分钟，直到容器重启才恢复。
+                content = _tool_content(content)
+                if not isinstance(content, str):
+                    continue
             # 跳过 <status 开头的环境快照（噪音大）
             if role == 'user' and content.startswith('<status'):
                 continue
@@ -1400,7 +1427,9 @@ class Event:
         import chat_history
         last = chat_history.get_last_session_turns(limit=10)
         if last:
-            self._turns = last['turns']
+            # 落盘的历史可能是修复之前写的：那时 tool 消息的 content 会是 dict，
+            # 读回来就等于把同一个 400 一起续跑回来。所以在 restore 这一侧也过一遍。
+            self._turns = [_sanitise_turn(t) for t in last['turns']]
             self._session_id = last['session_id']
             print(f'[startup] resumed session {last["session_id"][:8]}... ({len(last["turns"])} turns)')
         else:
