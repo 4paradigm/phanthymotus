@@ -707,7 +707,25 @@ async def _do_ping(mcp_id: str) -> dict:
             if tool_name:
                 tool_groups[tool_name] = group
 
-    mcp_client.registry[mcp_id] = {
+    # Merge, never replace. This dict is what the heartbeat knows; anything it
+    # does not know about belongs to `mcp_client._connect_one` and must survive.
+    #
+    # Replacing it dropped `input_schemas` on every heartbeat, and twelve lines
+    # below, `needs_schemas` tests for exactly that key and re-runs
+    # `_connect_one` when it is missing. So every device rebuilt its whole
+    # connection — initialize, tools/list, SSE subscription — once per heartbeat,
+    # for as long as it was registered. The value `_connect_one` wrote never
+    # survived to the next tick.
+    #
+    # That self-sustaining loop is what made the leaked SSE task in #234 grow
+    # linearly: 120 heartbeats an hour, each leaking one immortal polling loop,
+    # each backing off to a 60s poll — +2 req/s per hour, which is the slope
+    # measured on Tianyi. Fixing the leak stopped the growth; this stops the
+    # churn that drove it, and lets an SSE stream actually stay open.
+    #
+    # This is the second key to go missing from this literal — `tool_meta` was
+    # the first. Merging retires the whole class rather than the instance.
+    mcp_client.registry.setdefault(mcp_id, {}).update({
         'name':        target.get('name', mcp_id),
         'url':         url,
         'online':      True,
@@ -717,7 +735,7 @@ async def _do_ping(mcp_id: str) -> dict:
         'tool_meta':   tool_meta_map,
         'split_map':   split_map,
         'tool_groups': tool_groups,
-    }
+    })
 
     # Register system hooks from x-hooks declarations
     import hooks
