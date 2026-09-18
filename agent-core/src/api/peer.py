@@ -497,6 +497,9 @@ async def confirm_pairing(req: ConfirmPairingReq):
     )
     pairing.pop(req.peer_id)
     print(f'[peer] paired with {req.peer_id[:12]} ({peer["display_name"]}) as {default_role}')
+    store.record_audit(req.peer_id, store.EVENT_PAIRED,
+                       display_name=peer['display_name'], actor='local',
+                       detail=f'role={default_role}')
     return {'peer': peer, 'already_paired': False, 'code_verified': True}
 
 
@@ -538,9 +541,17 @@ async def update_peer(peer_id: str, req: UpdatePeerReq):
     fields = {k: v for k, v in req.model_dump().items() if v is not None}
     if not fields:
         raise fastapi.HTTPException(400, 'no fields to update')
+    before = store.get(peer_id) or {}
     peer = store.update(peer_id, **fields)
     if peer is None:
         raise fastapi.HTTPException(404, 'peer not found')
+    # Role is the one field that changes what a peer may do to this robot —
+    # `operator` reaches actuators with no LLM and no human in the loop. Worth a
+    # durable record of who granted it and when.
+    if 'role' in fields and fields['role'] != before.get('role'):
+        store.record_audit(peer_id, store.EVENT_ROLE_CHANGED,
+                           display_name=peer.get('display_name', ''), actor='local',
+                           detail=f'{before.get("role", "?")} → {fields["role"]}')
     return {'peer': peer}
 
 
@@ -590,8 +601,24 @@ async def unpair(peer_id: str):
         print(f'[peer] unpaired {label} ({peer_id[:12]}) — could NOT tell the peer '
               f'({notify_error[:160]}); its record of us stays until someone clears it')
 
+    store.record_audit(peer_id, store.EVENT_UNPAIRED_LOCAL,
+                       display_name=label, actor='local',
+                       detail='peer notified' if notified
+                              else f'peer NOT notified: {notify_error}')
     await _notify_unpair(peer_id, label, 'unpaired_local', actor='local')
     return {'deleted': True, 'notified': notified, 'notify_error': notify_error}
+
+
+@router.get('/audit')
+async def peer_audit(limit: int = 50, peer_id: str = ''):
+    """Durable history of pairing changes — who paired, who unpaired, when.
+
+    The `peers` table only answers "what is true now". When a row is deleted the
+    relationship leaves no trace at all, which is how "who unpaired Tianyi from
+    Orin5 on the 11th" became unanswerable: container logs had rotated, the
+    activity stream lives in memory, and the table was simply empty.
+    """
+    return {'events': store.list_audit(limit=limit, peer_id=peer_id)}
 
 
 @router.get('/providers')
@@ -812,6 +839,10 @@ async def inbox_unpair(req: Request):
     from peer import backoff
     backoff.reset(peer_id)
 
+    if removed:
+        store.record_audit(peer_id, store.EVENT_UNPAIRED_BY_PEER,
+                           display_name=label, actor=peer_id,
+                           detail='the peer told us it removed us')
     await _notify_unpair(peer_id, label, 'unpaired_by_peer', actor=peer_id)
     return {'removed': removed}
 
