@@ -243,6 +243,26 @@ def _get_conn() -> sqlite3.Connection:
     cols = {r[1] for r in conn.execute('PRAGMA table_info(peers)')}
     if 'mutual_at' not in cols:
         conn.execute('ALTER TABLE peers ADD COLUMN mutual_at REAL')
+    # ── peer 关系变更的审计轨迹 ───────────────────────────────────────────────
+    # `peers` 只记录「现在是什么」。删掉一行之后，那段关系就不再有任何痕迹 ——
+    # 有人在天轶上解除了和 Orin5 的配对，一周后想查是谁、什么时候干的，
+    # `docker logs` 早已轮换过去，活动流是内存里的，数据库里只剩一张空表。
+    # 这张表存的是「发生过什么」，所以它只增不改。
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS peer_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            peer_id TEXT NOT NULL,
+            display_name TEXT DEFAULT '',
+            -- paired | unpaired_local | unpaired_by_peer | role_changed
+            event TEXT NOT NULL,
+            -- 'local'（这台机器上的操作员）或对方的 peer_id
+            actor TEXT DEFAULT '',
+            detail TEXT DEFAULT ''
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_peer_audit_ts ON peer_audit(ts)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_peer_audit_peer ON peer_audit(peer_id)')
     conn.commit()
     return conn
 
