@@ -450,7 +450,38 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
 
     # 3. 后台订阅 SSE 事件流（非阻塞）
     if online:
-        asyncio.create_task(_subscribe_sse(mcp_id, url))
+        _start_sse(mcp_id, url)
+
+
+# mcp_id → 该设备当前的 SSE 订阅 task。
+#
+# 必须有人记着它：`_connect_one` 不止在启动时跑一次，`api/mcp_manage.py` 的心跳
+# 分支在 registry 缺 input_schemas 时也会再调一次。原来每调一次就 create_task 一个
+# 新的订阅循环，而旧的谁也不认识、永远不退出，于是每次心跳泄漏一个 task。
+#
+# 天轶实测：驱动日志里 `GET /mcp/sse → 404` 的速率逐小时递增 39k → 52k → 60k →
+# 67k → 74k 每小时（约 20 req/s），agent-core 一重启立刻归零再重新爬。心跳 30s 一次
+# ⇒ 每小时多 120 个 task，每个退避到 60s 上限 ⇒ 每小时多约 2 req/s，和实测吻合。
+# 这些 404 占了那台机器驱动日志的 98.5%（310262 / 315088 行）。
+_sse_tasks: dict[str, asyncio.Task] = {}
+
+
+def _start_sse(mcp_id: str, url: str) -> None:
+    """(重)启动一个设备的 SSE 订阅，先取消上一个。"""
+    old = _sse_tasks.pop(mcp_id, None)
+    if old is not None and not old.done():
+        old.cancel()
+    _sse_tasks[mcp_id] = asyncio.create_task(
+        _subscribe_sse(mcp_id, url), name=f'sse:{mcp_id}')
+
+
+def stop_sse(mcp_id: str | None = None) -> None:
+    """取消 SSE 订阅：给 mcp_id 就取消那一个，不给就全部。"""
+    ids = [mcp_id] if mcp_id else list(_sse_tasks)
+    for i in ids:
+        task = _sse_tasks.pop(i, None)
+        if task is not None and not task.done():
+            task.cancel()
 
 
 async def _subscribe_sse(mcp_id: str, url: str) -> None:
@@ -458,16 +489,31 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
     sse_url   = url.rstrip('/') + '/sse'
     delay     = 2.0
     timeout   = aiohttp.ClientTimeout(total=None, sock_read=60)
+    # 404 = 这个 server 根本没有 SSE 端点。15 个驱动里只有 4 个实现了 `/mcp/sse`，
+    # 所以这是常态而不是故障，重试多少次都不会变成 200。连着两次就收工，等下一次
+    # `_connect_one`（重连、重新注册）再决定要不要重新订阅。
+    #
+    # 5xx 之类不在此列：那是「现在不行」，退避重试是对的。
+    missing = 0
 
     while True:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(sse_url) as resp:
+                    if resp.status == 404:
+                        missing += 1
+                        if missing >= 2:
+                            print(f'[mcp] {mcp_id}: no SSE endpoint at {sse_url} '
+                                  f'(404) — not subscribing')
+                            return
+                        await asyncio.sleep(delay)
+                        continue
                     if resp.status >= 400:
                         await asyncio.sleep(delay)
                         delay = min(delay * 2, 60)
                         continue
                     delay = 2.0
+                    missing = 0
                     async for line in resp.content:
                         line = line.decode().strip()
                         if not line.startswith('data:'):
