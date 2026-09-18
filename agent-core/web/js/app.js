@@ -7,6 +7,7 @@ import { getToken, setToken, verifyToken } from './auth.js';
 import { initSidebar, renderSidebar } from './sidebar.js';
 import { initCanvas, updateCanvasMcps } from './canvas.js';
 import { initDeployPanel, showDeployConfirmModal } from './deploy-panel.js';
+import { startDeploy } from './deploy-progress.js';
 import { connectMotus } from './motus-stream.js';
 import { initActivityLog }   from './activity-log.js';
 import { initDetailPanel }   from './detail-panel.js';
@@ -17,6 +18,7 @@ import { initAccount }       from './account.js';
 import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
 import { initChannels }      from './channels.js';
+import { initPeers }         from './peers.js';
 import { initMobile }        from './mobile.js';
 import { initPerformance }   from './performance.js';
 import { initUsage }         from './usage.js';
@@ -49,6 +51,7 @@ async function main() {
   initHistory();
   initNetwork();
   initChannels();
+  initPeers();
   initPerformance();
   initUsage();
 
@@ -122,7 +125,9 @@ async function checkForUpdate() {
     const json = await res.json();
     if (json.code !== 200 || !json.data) return;
 
-    // Find services that have a newer image available vs what's running
+    // Find services that have a newer image available vs what's installed.
+    // 只在服务确实在跑时提示升级：容器没跑的场景（停止、部署失败）该走部署面板的
+    // 启动/重试流程，顶栏一个「升级」按钮解决不了它，只会盖住真实状态。
     const updatable = json.data.filter(d => {
       if (!d.running && d.category !== 'core') return false;  // core is always running if responding
       if (!d.image || !d.running_image) return false;
@@ -138,7 +143,12 @@ async function checkForUpdate() {
       latestTag:  _tagFromImage(d.image),
     }));
 
-    if (!updatable.length) return;
+    if (!updatable.length) {
+      // 没有可更新项时必须收起横幅：这个函数会被重复调用（升级完成后、渠道切换后），
+      // 早期版本直接 return，导致一条早已失效的「发现新版本」永久挂在顶栏。
+      document.getElementById('update-banner')?.classList.add('hidden');
+      return;
+    }
 
     // Sort by priority: core > perception > driver
     updatable.sort((a, b) => {
@@ -166,20 +176,27 @@ function showUpdateBanner(updatable) {
 }
 
 async function confirmAndUpdate(updatable) {
+  // Core still gets the confirm modal — it restarts the whole page — but from
+  // there on it deploys like anything else. It used to skip the progress window
+  // entirely and report through this one line of banner text, which is why the
+  // same 「更新」 button looked like two different features depending on what
+  // happened to be out of date.
   const coreItem = updatable.find(u => u.category === 'core');
   if (coreItem) {
-    // Core requires confirm modal since it restarts the whole page
-    const items = updatable.map(u => ({
-      label: u.name, currentTag: u.currentTag, newTag: u.latestTag,
-    }));
-    showDeployConfirmModal(items, () => _doUpdate(coreItem.image, coreItem.latestTag));
+    // Core goes alone: it replaces this process and reloads the page, so
+    // anything queued behind it would be posted into a restarting container.
+    // The banner re-detects the rest after the reload.
+    const rest = updatable.length - 1;
+    showDeployConfirmModal(
+      [{ label: coreItem.name, currentTag: coreItem.currentTag, newTag: coreItem.latestTag }],
+      () => _deployServices([coreItem], rest),
+    );
   } else {
-    // Non-core services: deploy directly, show progress in banner
     _deployServices(updatable);
   }
 }
 
-async function _deployServices(services) {
+async function _deployServices(services, deferred = 0) {
   const btn  = document.getElementById('btn-update');
   const text = document.getElementById('update-banner-text');
   btn.disabled = true;
@@ -189,23 +206,28 @@ async function _deployServices(services) {
     const prefix = services.length > 1 ? `[${i + 1}/${services.length}] ` : '';
     text.textContent = `${prefix}${svc.name} 正在升级…`;
 
-    try {
-      const res = await fetch(`/api/drivers/${svc.id}/deploy`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: svc.image }),
-      });
-      const json = await res.json();
-      if (json.code !== 200) {
-        text.textContent = `${svc.name} 升级失败：${json.message || '未知错误'}`;
-        btn.disabled = false;
-        return;
-      }
-    } catch {
-      text.textContent = `${svc.name} 请求失败，请检查网络`;
+    const { ok } = await startDeploy({
+      driverId:   svc.id,
+      driverName: svc.name,
+      image:      svc.image,
+      kind:       svc.category === 'core' ? 'core' : 'driver',
+    });
+    if (!ok) {
+      // The window holds the error and its suggestion; the banner only says
+      // which service stopped the run.
+      text.textContent = `${svc.name} 升级失败（见进度窗口）`;
       btn.disabled = false;
       return;
     }
+  }
+
+  const isCore = services.some(s => s.category === 'core');
+  if (isCore) {
+    // core 的成败要等容器换完才知道 —— 进度窗口会自己确认新 tag 并刷新页面。
+    text.textContent = deferred
+      ? `Agent Core 升级中…，刷新后继续升级其余 ${deferred} 个服务`
+      : 'Agent Core 升级中…，完成后页面会自动刷新';
+    return;
   }
 
   // All done
@@ -215,83 +237,10 @@ async function _deployServices(services) {
   setTimeout(() => {
     document.getElementById('update-banner').classList.add('hidden');
   }, 3000);
-}
-
-async function _doUpdate(image, tag) {
-  const btn  = document.getElementById('btn-update');
-  const text = document.getElementById('update-banner-text');
-  btn.disabled = true;
-  text.textContent = '正在启动升级…';
-
-  try {
-    const res  = await fetch('/api/system/update', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image }),
-    });
-    const json = await res.json();
-    if (json.code !== 200) {
-      text.textContent = `升级失败：${json.message || '未知错误'}`;
-      btn.disabled = false;
-      return;
-    }
-  } catch {
-    text.textContent = '请求失败，请检查网络';
-    btn.disabled = false;
-    return;
-  }
-
-  const poll = setInterval(async () => {
-    try {
-      const r = await fetch('/api/system/update-status');
-      const j = await r.json();
-      const d = j.data || {};
-      if (d.error) {
-        clearInterval(poll);
-        text.textContent = `升级失败：${d.error}`;
-        btn.disabled = false;
-      } else if (d.step) {
-        text.textContent = d.step;
-      }
-    } catch {
-      clearInterval(poll);
-      _startReconnectLoop(tag);
-    }
-  }, 1500);
-}
-
-function _startReconnectLoop(expectedTag) {
-  const text = document.getElementById('update-banner-text');
-  let elapsed = 0;
-  let attempts = 0;
-  text.textContent = `容器切换中（0s），请稍后…`;
-
-  const timer = setInterval(() => {
-    elapsed += 10;
-    text.textContent = `容器切换中（${elapsed}s），请稍后…`;
-  }, 10000);
-
-  const reconnect = setInterval(async () => {
-    attempts++;
-    try {
-      const res  = await fetch('/api/system/update-check');
-      const json = await res.json();
-      if (json.code === 200) {
-        clearInterval(timer);
-        clearInterval(reconnect);
-        const newTag = json.data?.current_tag || expectedTag;
-        text.textContent = `升级成功，版本：${newTag}`;
-        setTimeout(() => location.reload(), 1500);
-      }
-    } catch {
-      // Server might be down OR SSL cert changed after restart — force reload after 60s
-      if (attempts >= 6) {
-        clearInterval(timer);
-        clearInterval(reconnect);
-        location.reload();
-      }
-    }
-  }, 10000);
+  // deploy-v2 是后台任务，立刻返回时容器还没换版本，此刻复查会读到旧 running_image
+  // 又把横幅点亮。留一段时间让容器起来再校验——多服务升级里可能只有一部分成功，
+  // 剩下的仍需提示。
+  setTimeout(checkForUpdate, 30000);
 }
 
 async function _pingNewMcps(mcps) {

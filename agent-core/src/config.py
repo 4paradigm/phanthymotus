@@ -66,6 +66,12 @@ _DB_DEFAULTS = {
             'source_ring_size': 50,             # per-source ring buffer 大小（供 raw_input_info 查询）
             'interrupt_mode': 'steer',          # 打断模式: steer | interrupt | followup
             'barge_in_threshold_ms': 500,       # 语音 barge-in 阈值（ms），低于此值视为 backchannel
+            # 主动播报：距上次面向用户的输出多久没动静就自动生成并播报一句进展汇报。
+            # 0 = 关闭。播放期间不计时（正在说话时根本没有计时器）。
+            'auto_narration': True,             # 长时间不出声时由系统代为播报进展的总开关
+            'narration_silence_seconds': 15,
+            'narration_context_chars': 6000,    # 喂给汇报调用的上下文预算（取 turn 尾部）
+            'narration_timeout_s': 20,          # 汇报调用硬超时，超时视为本次放弃
         },
         'subscribe_topics': [],  # DDS topics core subscribes to directly (e.g. ["/robot/mic/audio/asr_event"])
     },
@@ -77,14 +83,28 @@ _DB_DEFAULTS = {
         'auto_approve': True,
         'require_actuator_confirm': True,
     },
+    'peer_settings': {
+        'enabled': False,
+        # 广播给同网段的展示名。空则用 hostname。
+        'display_name': '',
+        # 本机对外可达的地址，供 peer 回连；空则由 mDNS 用网卡地址填。
+        'advertise_url': '',
+        # ble 默认关闭：它要主机侧先解 rfkill、开 bluetoothd，还要 dbus socket 挂进容器。
+        # 默认开启会让 provider 常态报错，而这类"红着也没人管"的告警很快就没人看了。
+        'discovery': {'mdns': True, 'static': [], 'ble': False},
+        # 新配对的 peer 默认角色。刻意不提供 auto_approve —— 配对必须有人确认。
+        'default_role': 'viewer',
+        # 签名的时间窗（秒）。离网机器人时钟可能漂移，必要时放宽。
+        'clock_skew_s': 120,
+    },
     'subagent': {
         'max_concurrent': 2,
         'max_total': 10,
         'default_max_rounds': 50,
-        'default_timeout_s': 300,
+        'default_timeout_s': 600,
         'preemption_enabled': True,
         'checkpoint_interval': 5,
-        'compress_threshold_chars': 20000,
+        'compress_threshold_chars': 40000,
         'cleanup_age_hours': 24,
         'bg_route_enabled': True,
         'bg_model': None,  # None = use main model; or specify e.g. 'qwen-turbo'
@@ -124,16 +144,27 @@ def _get_conn() -> sqlite3.Connection:
     conn.execute(
         'CREATE TABLE IF NOT EXISTS chat_sessions '
         '(id TEXT PRIMARY KEY, started_at REAL NOT NULL, ended_at REAL, '
-        'summary TEXT DEFAULT \'\', turn_count INTEGER DEFAULT 0)'
+        'summary TEXT DEFAULT \'\', turn_count INTEGER DEFAULT 0, '
+        'kind TEXT DEFAULT \'main\')'
     )
     conn.execute(
         'CREATE TABLE IF NOT EXISTS chat_messages '
         '(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, '
-        'turn_index INTEGER NOT NULL, messages TEXT NOT NULL, created_at REAL NOT NULL)'
+        'turn_index INTEGER NOT NULL, messages TEXT NOT NULL, created_at REAL NOT NULL, '
+        'updated_at REAL)'
     )
     conn.execute(
         'CREATE INDEX IF NOT EXISTS idx_cm_session ON chat_messages(session_id, turn_index)'
     )
+    # Columns added after the tables shipped; existing DBs need them backfilled.
+    for table, column, ddl in (
+        ('chat_sessions', 'kind', 'kind TEXT DEFAULT \'main\''),
+        ('chat_messages', 'updated_at', 'updated_at REAL'),
+    ):
+        try:
+            conn.execute(f'ALTER TABLE {table} ADD COLUMN {ddl}')
+        except sqlite3.OperationalError:
+            pass  # already present
     conn.execute('''
         CREATE TABLE IF NOT EXISTS channel_users (
             platform TEXT NOT NULL,
@@ -185,6 +216,33 @@ def _get_conn() -> sqlite3.Connection:
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_conclusions_ts ON subagent_conclusions(created_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_conclusions_type ON subagent_conclusions(source_type)')
+    # ── 已配对的 peer（另一台 Agent Core）─────────────────────────────────────
+    # peer_id 是 Ed25519 公钥指纹，不是 IP，也不是平台账号 —— 同一个 peer 从
+    # mDNS / 云名册多条路径被发现时仍是同一行，这是链路降级能成立的前提。
+    # role / tool_filter 与 channel_users 共用 acl.py 的那套取值。
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS peers (
+            peer_id TEXT PRIMARY KEY,
+            display_name TEXT DEFAULT '',
+            public_key TEXT NOT NULL,
+            role TEXT DEFAULT 'viewer',
+            tool_filter TEXT DEFAULT '*',
+            endpoints TEXT DEFAULT '[]',
+            capabilities TEXT DEFAULT '[]',
+            paired_at REAL,
+            last_seen REAL,
+            -- When we last had evidence that the peer has *us* in its own table.
+            -- Pairing is per-direction, so confirming here proves nothing about the
+            -- other side: without this, a half-finished pairing looked complete on
+            -- the side that confirmed, and the failure only surfaced later as 403s.
+            mutual_at REAL
+        )
+    ''')
+    # Added after the table shipped; an existing database must not be discarded
+    # just because it predates the column.
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(peers)')}
+    if 'mutual_at' not in cols:
+        conn.execute('ALTER TABLE peers ADD COLUMN mutual_at REAL')
     conn.commit()
     return conn
 
@@ -229,6 +287,92 @@ def _migrate():
                 conn.execute("UPDATE config SET value=? WHERE key='services'", (json.dumps(svc),))
                 conn.commit()
                 print(f'[config] deduped {len(mcp_list) - len(deduped)} duplicate MCP entries')
+
+        # subagent 的两个旧默认值：压缩阈值 20000 → 40000，空转超时 300 → 600。
+        #
+        # _seed_defaults 用的是 INSERT OR IGNORE，整行粒度：已部署机器上的 'subagent'
+        # 行早就存在，新默认值永远进不去。Orin5 实测读出来就是 20000/300。
+        #
+        # 20000 的代价：一次 WebSearch 的结果就超过它，压缩几乎每轮触发、只留最近两轮，
+        # 子代理因此忘掉自己刚查到的东西并反复重查（同一个问题搜了 round 2、6、9）。
+        # 300 的代价：轮次预算放到 50 之后，先撞上的会是这个空转超时，而超时是 cancel，
+        # cancel 不会走收尾调用 —— 又变回什么都拿不回来。
+        #
+        # 只改还停在旧默认值上的键；有人手工调过就不动。
+        _stale_subagent_defaults = {
+            'compress_threshold_chars': (20000, 40000),
+            'default_timeout_s': (300, 600),
+        }
+        row_sa = conn.execute("SELECT value FROM config WHERE key='subagent'").fetchone()
+        if row_sa:
+            sa = json.loads(row_sa[0])
+            changed = []
+            for key, (old, new) in _stale_subagent_defaults.items():
+                if sa.get(key) == old:
+                    sa[key] = new
+                    changed.append(f'{key} {old} -> {new}')
+            if changed:
+                conn.execute("UPDATE config SET value=? WHERE key='subagent'",
+                             (json.dumps(sa),))
+                conn.commit()
+                print(f'[config] subagent: {", ".join(changed)}')
+
+        # event.llm 新增的主动播报键。同上面那段：_seed_defaults 是整行粒度的
+        # INSERT OR IGNORE，已部署机器上的 'event' 行早就存在，新默认值永远进不去 ——
+        # 结果会是阈值读成 0，功能静默不生效。只补缺失的键，手工调过的值不动。
+        _narration_defaults = {
+            'auto_narration': True,
+            'narration_silence_seconds': 15,
+            'narration_context_chars': 6000,
+            'narration_timeout_s': 20,
+        }
+        # 已删除的键。轮数维度取消后（纯时间触发，定时器全局负责），这个键没有任何读者，
+        # 留在库里只会让人对着设置页猜"它还管不管用"。和上面的补种合并成一次
+        # read-modify-write —— 拆成两段就要对同一行读写两次，中间还多一个失败窗口。
+        # auto_notify 换名成 auto_narration，**不继承旧值**。
+        #
+        # 旧键的含义是"把模型写的 content 自动念出来"。有人（比如 Tianyi）因为那功能念的是
+        # 内部推理而把它关掉了 —— 一个完全合理的决定。现在 content 自动播报已经废除，同一个
+        # 键被重新定义成"框架进度播报的总开关"，于是那个旧决定会静默地把一个它从没评价过的
+        # 新功能也关死，而设置页上看不出任何异常（Tianyi 就是人工打开才恢复的）。
+        #
+        # 语义变了就换键：新键按默认值 True 生效，旧键删掉。这是替操作员重新做决定，但
+        # 他当初拒绝的那个东西已经不存在了，让一个作废的决定继续生效更糟。
+        _narration_removed = ('narration_silence_rounds', 'auto_notify')
+
+        # 改过的默认值：沉默阈值 25 → 15 秒。25 是几小时前由上面这段自己种进去的，不是
+        # 谁选的，所以停在 25 的机器要跟着改；手工调过（比如 90）的不动。同 subagent 那段
+        # 的做法，(旧默认, 新默认)。
+        _stale_narration_defaults = {
+            'narration_silence_seconds': (25, 15),
+        }
+
+        row_ev = conn.execute("SELECT value FROM config WHERE key='event'").fetchone()
+        if row_ev:
+            ev = json.loads(row_ev[0])
+            llm_cfg = ev.setdefault('llm', {})
+            added = [k for k in _narration_defaults if k not in llm_cfg]
+            for k in added:
+                llm_cfg[k] = _narration_defaults[k]
+            dropped = [k for k in _narration_removed if k in llm_cfg]
+            for k in dropped:
+                llm_cfg.pop(k, None)
+            retuned = []
+            for k, (old_v, new_v) in _stale_narration_defaults.items():
+                if llm_cfg.get(k) == old_v:
+                    llm_cfg[k] = new_v
+                    retuned.append(f'{k} {old_v} -> {new_v}')
+            if added or dropped or retuned:
+                conn.execute("UPDATE config SET value=? WHERE key='event'", (json.dumps(ev),))
+                conn.commit()
+                _msg = []
+                if added:
+                    _msg.append(f'seeded {", ".join(added)}')
+                if dropped:
+                    _msg.append(f'dropped {", ".join(dropped)}')
+                if retuned:
+                    _msg.append(f'retuned {", ".join(retuned)}')
+                print(f'[config] event.llm: {"; ".join(_msg)}')
 
 _migrate()
 

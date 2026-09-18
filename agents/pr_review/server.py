@@ -16,6 +16,7 @@ from .poller import Poller
 from .router_api import router as api_router
 from .router_webhook import router as webhook_router
 from .store import JobStore
+from .tester import sweep_leaked_containers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -106,6 +107,9 @@ async def lifespan(app: FastAPI):
     workspace_mgr = GitWorkspaceManager(config.data_dir, config.repos)
     await workspace_mgr.ensure_clones()
     await workspace_mgr.cleanup_stale_worktrees()
+    # Same reason, one layer out: killing a `docker run` kills the client, and
+    # `--rm` never fires for the container it leaves holding memory.
+    await sweep_leaked_containers()
     app.state.workspace_mgr = workspace_mgr
 
     job_queue = JobQueue(

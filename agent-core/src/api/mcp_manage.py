@@ -356,6 +356,109 @@ async def mcp_list():
     return {'code': 200, 'data': items}
 
 
+def _file_intake_url(mcp_id: str) -> str:
+    """Resolve `mcp_id` to its `/file/upload` endpoint, or raise 4xx.
+
+    The address comes from the MCP registry, which every service populates when
+    it registers (`POST /api/mcp` carries `url`). That is what makes one route
+    cover perception, actucore and every driver despite their ports all
+    differing — the port was reported at registration, so nothing here needs a
+    per-layer table or a hardcoded number.
+    """
+    target = next((m for m in _get_mcp_list() if m.get('id') == mcp_id), None)
+    if not target:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail=f'unknown mcp: {mcp_id}')
+    if target.get('transport', 'http') != 'http':
+        # agentcore/channel are served in-process; they have no HTTP endpoint to
+        # proxy to, and a caller wanting to hand *them* a file should use
+        # /api/file/upload, which writes to this container directly.
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail=(f'{mcp_id} is an internal MCP with no HTTP endpoint; '
+                    'use /api/file/upload for agent-core-local files'))
+    url = (target.get('url') or '').strip()
+    if not url:
+        raise fastapi.HTTPException(status_code=503,
+                                    detail=f'{mcp_id} has no url registered yet')
+    # `http://localhost:15720/mcp` → `http://localhost:15720/file/upload`.
+    # rsplit on the trailing '/mcp' rather than urljoin: a registered url may
+    # carry a path prefix, and urljoin would discard it.
+    base = url.rsplit('/mcp', 1)[0] if url.endswith('/mcp') else url.rstrip('/')
+    return f'{base}/file/upload'
+
+
+@router.post('/{mcp_id}/file/upload')
+async def mcp_file_upload(
+    mcp_id: str,
+    file: fastapi.UploadFile = fastapi.File(),
+    subdir: str = fastapi.Form(''),
+):
+    """Proxy a file upload to the service that will read it.
+
+    The problem this solves: agent-core serves the browser, but the tool that
+    needs the file (a photo to enrol a face) runs in another container, and they
+    share no filesystem. A path produced here means nothing there — the first
+    face-enrolment attempt failed with an `image_path` that really existed, in
+    this container. base64 through the tool call failed too: 43 800 characters
+    does not survive being carried through an LLM's context.
+
+    So the bytes are streamed to the target service, which writes them somewhere
+    *it* can see and returns **its own** absolute path. The reply is handed
+    straight to a tool call. No shared mount, no container recreation, and only
+    one viewpoint on the path.
+
+    Streamed in 1 MiB chunks: a photo can be tens of megabytes, and buffering it
+    whole would put it in this process's memory on a 7.4 GB robot.
+    """
+    endpoint = _file_intake_url(mcp_id)
+    # The same value auth.py's middleware enforces, read from .env at startup —
+    # not a second copy from config, which could disagree.
+    import auth
+    token = auth.get_token()
+
+    form = aiohttp.FormData()
+    form.add_field('file', file.file,
+                   filename=file.filename or 'upload.bin',
+                   content_type=file.content_type or 'application/octet-stream')
+    if subdir:
+        form.add_field('subdir', subdir)
+
+    headers = {'X-Access-Token': token} if token else {}
+    # Generous: the transfer crosses only loopback, but a 60 MB photo onto eMMC
+    # under load is not instant, and a timeout here would look to the operator
+    # like the upload silently vanished.
+    timeout = aiohttp.ClientTimeout(total=180)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(endpoint, data=form, headers=headers) as resp:
+                text = await resp.text()
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    payload = {'ok': False, 'error': text[:500]}
+                if resp.status != 200 or not payload.get('ok'):
+                    return {'code': resp.status if resp.status != 200 else 502,
+                            'message': payload.get('error', 'upload failed'),
+                            'data': payload}
+                # `path` is absolute inside the *target* container. Returned
+                # verbatim; the canvas puts it in the tool argument unchanged.
+                return {'code': 200, 'message': '', 'data': payload}
+    except aiohttp.ClientError as error:
+        # Distinguish "the service is not listening" from "it rejected the file":
+        # the first is a deployment problem (an image without the endpoint), the
+        # second is the caller's.
+        return {'code': 502,
+                'message': (f'cannot reach {mcp_id} at {endpoint}: {error}. '
+                            'The target image may predate its /file/upload '
+                            'endpoint.'),
+                'data': None}
+    except asyncio.TimeoutError:
+        return {'code': 504,
+                'message': f'{mcp_id} did not finish receiving the file in time',
+                'data': None}
+
+
 @router.post('')
 async def mcp_add(req: MCPAddRequest):
     async with _mcp_write_lock:
@@ -445,6 +548,7 @@ async def _do_ping(mcp_id: str) -> dict:
     """Core ping logic — fetch capabilities, persist, notify inspector.
     Returns the same dict as the ping endpoint's data field.
     Raises HTTPException(404) if mcp_id not found."""
+    import mcp_client
     mcps = _get_mcp_list()
     target = next((m for m in mcps if m.get('id') == mcp_id), None)
     if not target:
@@ -593,6 +697,7 @@ async def _do_ping(mcp_id: str) -> dict:
                 'action_enum': action_enum,
                 'has_config_schema': bool(tool.get('configSchema')),
                 'completion': raw_input_schema.get('x-completion'),
+                'resource': mcp_client.parse_resources(raw_input_schema.get('x-resource')),
             }
         else:
             group = []
@@ -603,6 +708,8 @@ async def _do_ping(mcp_id: str) -> dict:
                     'action_enum': None,
                     'has_config_schema': bool(tool.get('configSchema')),
                     'completion': (tool.get('inputSchema') or {}).get('x-completion'),
+                    'resource': mcp_client.parse_resources(
+                        (tool.get('inputSchema') or {}).get('x-resource')),
                 }
                 action_name = schema['name'].split('__')[-1]
                 split_map[schema['name']] = {
@@ -641,6 +748,13 @@ async def _do_ping(mcp_id: str) -> dict:
     if not was_online:
         asyncio.create_task(_restore_saved_configs(mcp_id, url, caps['tools']))
 
+    # Populate mcp_client.registry with schemas for file upload interception and validation
+    # Call _connect_one if registry lacks input_schemas (e.g. after container restart, or first ping)
+    needs_schemas = not mcp_client.registry.get(mcp_id, {}).get('input_schemas')
+    if needs_schemas:
+        server_name = caps.get('server_name', mcp_id)
+        asyncio.create_task(mcp_client._connect_one(mcp_id, server_name, url, render_hint))
+
     ws_path = ('/ws/bus' + topic_out[0].get('topic', '')) if topic_out else ''
     return {
         'online':      True,
@@ -663,6 +777,22 @@ async def mcp_ping(mcp_id: str):
 @router.get('/{mcp_id}/tools')
 async def mcp_get_tools(mcp_id: str):
     """Return full tool list with inputSchema for the capability modal."""
+    # A paired peer's tools live only in mcp_client.registry (peer/mcp_bridge.py),
+    # never in the configured device list, so the lookup below would 404 on them.
+    if mcp_id.startswith('peer:'):
+        import mcp_client as _mc
+        entry = _mc.registry.get(mcp_id)
+        if not entry:
+            raise fastapi.HTTPException(status_code=404, detail='peer not offering tools')
+        return {'code': 200, 'data': {
+            'tools': [
+                {'name': name.split('__', 2)[-1],
+                 'description': schema.get('description', ''),
+                 'inputSchema': schema.get('parameters', {})}
+                for name, schema in (entry.get('schemas') or {}).items()
+            ],
+        }}
+
     mcps = _get_mcp_list()
     target = next((m for m in mcps if m.get('id') == mcp_id), None)
     if not target:
@@ -758,12 +888,21 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         llm_cfg = event_cfg.get('llm', {})
         trigger_interval_ms = llm_cfg.get('trigger_interval_ms', 1000)
         topic_in_list = [{'topic': t, 'format': 'data/json'} for t in sub_topics] if sub_topics else [{'topic': '', 'format': 'data/json'}]
+        # 延迟 import：event.llm 拉起整个 agent loop，模块顶层导入会成环。
+        from event.llm import _narration_thresholds
         return {'code': 200, 'data': {
             'description': '决策核心 — 接收多路 DDS 输入，LLM 推理后执行动作',
             'topic_in': topic_in_list,
             'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
             'trigger_interval_ms': trigger_interval_ms,
             'vision_input': bool(llm_cfg.get('vision_input', False)),
+            'auto_narration': bool(llm_cfg.get('auto_narration', True)),
+            'narration_silence_seconds': int(llm_cfg.get('narration_silence_seconds', 15)),
+            # 运行时生效值（set_progress_report 的口头调整会盖住上面两个配置值，重启清空）。
+            # 前端 schema 不认这个键、会忽略它 —— 它的用途是让「卡片写 4 轮、机器人实际
+            # 按 10 轮跑」这件事在接口和日志里可见，而不是停留在某个进程的内存里。
+            'narration_effective': dict(zip(('rounds', 'seconds'),
+                                            _narration_thresholds())),
         }}
 
     elif action == 'config':
@@ -776,6 +915,29 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             client_cfg = config.main.get('client', {})
             client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model, 'think_mode': think_mode}]
             config.main['client'] = client_cfg
+
+            # Mirror into services.llm as well. The dashboard has two places
+            # that configure the LLM — Settings (api/config.py) and this
+            # decision_core card — and only Settings used to write both keys.
+            # Configuring from the card therefore left services.llm empty, so
+            # the Settings page showed blank fields for a working setup, and
+            # saving that blank form wrote the emptiness back through to
+            # client.llm and killed the LLM. Keep the two entry points
+            # symmetric; services.llm is what the Settings form reads.
+            services_cfg = config.main.get('services', {})
+            existing_llm = services_cfg.get('llm', {}) or {}
+            services_cfg['llm'] = {
+                'url': llm_url,
+                'key': llm_key,
+                'model': llm_model,
+                # Preserve fields this card does not expose rather than
+                # dropping them; think_mode is set here, others are not.
+                'think_mode': think_mode,
+                **{k: v for k, v in existing_llm.items()
+                   if k not in ('url', 'key', 'model', 'think_mode')},
+            }
+            config.main['services'] = services_cfg
+
             # Reinitialize the LLM client with new config
             import client as client_mod
             client_mod.llm = client_mod.llm.__class__()
@@ -795,6 +957,23 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             llm_cfg['vision_input'] = bool(vision_input)
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
+        # 自动播报开关
+        auto_narration = req.arguments.get('auto_narration')
+        if auto_narration is not None:
+            event_cfg = config.main.get('event', {})
+            llm_cfg = event_cfg.get('llm', {})
+            llm_cfg['auto_narration'] = bool(auto_narration)
+            event_cfg['llm'] = llm_cfg
+            config.main['event'] = event_cfg
+        # 主动播报阈值（轮数 / 秒数，先到者触发；0 = 关闭该维度）
+        for _k in ('narration_silence_seconds',):
+            _v = req.arguments.get(_k)
+            if _v is not None:
+                event_cfg = config.main.get('event', {})
+                llm_cfg = event_cfg.get('llm', {})
+                llm_cfg[_k] = max(0, int(_v))
+                event_cfg['llm'] = llm_cfg
+                config.main['event'] = event_cfg
         # Save search config to desktop_tools.search
         search_type = req.arguments.get('search_type')
         if search_type is not None:
@@ -817,6 +996,17 @@ async def _handle_agentcore_call(req: MCPCallRequest):
 @router.post('/{mcp_id}/call')
 async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
     """Call a tool on an MCP server and return the result."""
+    # A paired peer's tool is reached over its signed link, not local HTTP, and this
+    # handler builds JSON-RPC itself — so hand it to call_tool, which knows how to
+    # route `transport: 'peer'` (peer/mcp_bridge.py). Without this the dashboard has
+    # no way to exercise a peer tool at all.
+    if mcp_id.startswith('peer:'):
+        import mcp_client as _mc
+        if mcp_id not in _mc.registry:
+            raise fastapi.HTTPException(status_code=404, detail='peer not offering tools')
+        result = await _mc.call_tool(f'mcp__{mcp_id}__{req.tool}', dict(req.arguments))
+        return {'code': 200, 'data': {'result': result}}
+
     # ── Handle internal agentcore MCP (no HTTP transport) ──
     if mcp_id == 'agentcore':
         # remote_mic and remote_message — simple internal tools
@@ -1043,10 +1233,28 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                         except (json.JSONDecodeError, IndexError):
                             pass
 
+            # ── 文件参数转发：与 mcp_client.call_tool 相同的机制 ────────
+            # Canvas cards reach tools through this endpoint, not call_tool, so
+            # the LLM's file interceptor never ran. Duplicate the logic here so
+            # both paths get it. A future refactor can unify them; for now the
+            # duplication is cheaper than premature abstraction.
+            final_args = dict(req.arguments)
+            input_schema = None
+            tools_list = target.get('tools') or []
+            tool_obj = next((t for t in tools_list if isinstance(t, dict) and t.get('name') == req.tool), None)
+            if tool_obj:
+                input_schema = tool_obj.get('inputSchema')
+            if input_schema:
+                import mcp_client as _mc
+                final_args, transfer_error = await _mc._transfer_file_args(
+                    mcp_id, target['url'], input_schema, final_args)
+                if transfer_error:
+                    return {'code': 400, 'message': transfer_error, 'data': None}
+
             call_payload = {
                 'jsonrpc': '2.0', 'id': 3,
                 'method': 'tools/call',
-                'params': {'name': req.tool, 'arguments': req.arguments},
+                'params': {'name': req.tool, 'arguments': final_args},
             }
             async with session.post(url, json=call_payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)

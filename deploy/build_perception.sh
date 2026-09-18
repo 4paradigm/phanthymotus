@@ -106,9 +106,10 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     fi
     if [[ ! "${SYNC_CONFIRM}" =~ ^[Nn] ]]; then
         echo "Registering image to resource-center (${RESOURCE_CENTER_URL})..."
-        # cards 与 plugins/{asr,tts,vop,ocr}.py 里各自的 TOOLS 声明手动保持一致（全部
-        # type: processor，且都常开，见 config.yaml 的 enabled 默认值）。新增插件时
-        # 别忘了在这里补一行。
+        # cards 与 perception/plugins/*.py 里各自的 TOOLS 声明手动保持一致 —— name 用
+        # 插件的 PREFIX（resource-center 会把这个字符串原样显示在镜像详情页上），type
+        # 用 TOOLS[0]["type"]，当前列出的插件均为 processor。列进来的都是 config.yaml 里
+        # enabled 默认为 true 的插件。新增插件时别忘了在这里补一行。
         HTTP_STATUS=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
             -X POST "${RESOURCE_CENTER_URL}/api/admin/register" \
             -H "Content-Type: application/json" \
@@ -121,12 +122,15 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"acc_arch\": \"${ACC_ARCH}\",
                 \"cpu_arch\": \"${CPU_ARCH}\",
                 \"name\": \"Perception Stack\",
-                \"description\": \"语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测\",
+                \"description\": \"感知套件 — 语音：ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测；视觉：物体检测 + 单目深度 + OCR 文字识别 + 人脸识别。视觉与本地语音模型跑 TensorRT\",
                 \"cards\": [
                     {\"name\": \"asr\", \"type\": \"processor\"},
                     {\"name\": \"tts\", \"type\": \"processor\"},
                     {\"name\": \"vop\", \"type\": \"processor\"},
-                    {\"name\": \"ocr\", \"type\": \"processor\"}
+                    {\"name\": \"visual_depth\", \"type\": \"processor\"},
+                    {\"name\": \"ocr\", \"type\": \"processor\"},
+                    {\"name\": \"face_recognition\", \"type\": \"processor\"},
+                    {\"name\": \"soundevent\", \"type\": \"processor\"}
                 ]
             }")
 

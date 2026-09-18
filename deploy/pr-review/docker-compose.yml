@@ -50,6 +50,14 @@ services:
 
     environment:
       - PYTHONUNBUFFERED=1
+      # The same expression as the volume above, deliberately repeated rather
+      # than left to .env. The mount has a default, so it works whether or not
+      # DATA_HOST_DIR is set — but the *variable* only reaches the container
+      # through env_file, so an unset .env gave a working mount and a container
+      # that did not know its host path, and the test stage refused to run with
+      # "DATA_HOST_DIR is not set". Deriving both from one expression means the
+      # mount and the variable cannot disagree.
+      - DATA_HOST_DIR=${DATA_HOST_DIR:-/opt/phanthy-motus/pr-review}
 
     # On stop, in-flight jobs are told on their PR that the agent restarted, so
     # a build killed mid-flight does not leave a "Building..." comment that

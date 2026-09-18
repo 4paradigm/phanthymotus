@@ -16,8 +16,15 @@ def get_sessions(limit: int = 50, offset: int = 0):
 
 @router.get('/sessions/{session_id}')
 def get_session(session_id: str):
-    messages = chat_history.get_session_messages(session_id)
-    return {'session_id': session_id, 'messages': messages}
+    turns = chat_history.get_session_turns(session_id)
+    return {
+        'session_id': session_id,
+        'messages': [t['messages'] for t in turns],
+        'turn_times': [
+            {'started_at': t['started_at'], 'updated_at': t['updated_at']}
+            for t in turns
+        ],
+    }
 
 
 @router.delete('/sessions/{session_id}')

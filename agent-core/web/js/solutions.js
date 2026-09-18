@@ -14,6 +14,7 @@ import { openInstanceConfigModal, openToolConfigModal } from './sidebar.js';
 import { reloadFromServer } from './canvas.js';
 import { isRcLoggedIn, rcHeaders, rcFetch, showAccount, refreshAccount } from './account.js';
 import { sessionId } from './session.js';
+import { startDeploy } from './deploy-progress.js';
 
 // 与 resource-center/lib/solution.ts 的 INDUSTRIES 保持一致
 const INDUSTRIES = [
@@ -464,21 +465,13 @@ function _versionCell(d) {
 async function _installDriver(driverId, btn) {
   btn.disabled = true;
   btn.textContent = '安装中…';
-  try {
-    const res = await fetch(`/api/drivers/${encodeURIComponent(driverId)}/deploy`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-    });
-    const json = await res.json();
-    if (json.code !== 200) {
-      btn.disabled = false;
-      btn.textContent = '重试安装';
-      alert(`部署失败：${json.message || '未知错误'}`);
-      return;
-    }
-  } catch (e) {
+
+  // 同一个进度窗口。失败信息留在窗口里（含建议），不再额外弹 alert —— 那条 alert
+  // 之前还会把窗口关掉，等于把唯一能看到失败原因的地方关了。
+  const { ok } = await startDeploy({ driverId, driverName: driverId });
+  if (!ok) {
     btn.disabled = false;
     btn.textContent = '重试安装';
-    alert(`部署失败：${e.message}`);
     return;
   }
 

@@ -11,8 +11,9 @@ import { ImageRenderer }    from './renderers/image.js';
 import { CameraRenderer }   from './renderers/camera.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
+import { ControlRenderer }  from './renderers/control.js';
 
-const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 
 const PREVIEW_CAPACITY = 100;  // sliding window frame count per topic
 

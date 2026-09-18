@@ -1,0 +1,24 @@
+# Japanese TTS frontend — plugins/ja_text_norm.py
+#
+# Kanji have to leave the text before it reaches sherpa-onnx: its Kokoro frontend
+# routes everything in [一-鿿] to lexicon-zh.txt with no language check, so Japanese
+# kanji are otherwise pronounced in Mandarin. Measured on Orin 6: 今日私何 produces
+# 30682 samples under ja, en-us, es and fr alike — the language setting has no
+# effect on kanji at all.
+#
+# janome, and not the two obvious alternatives:
+#
+#   pykakasi        same job, but GPL-3.0-or-later.
+#   fugashi/cutlet  declare requires_python >= 3.9, so they cannot run on jp5.11's
+#                   cp38 at all.
+#
+# janome is Apache-2.0, ships as `py3-none-any` with its own IPADIC dictionary (no
+# MeCab, no compiler, no build-time model fetch), and was verified to import and
+# convert on cp38/jp5.11 and cp310/jp6.1 before being chosen.
+#
+# Pinned, like every other frontend dep here: the readings this produces are the
+# audio, so a silent dictionary change between versions would alter how the robot
+# pronounces things with nothing in the diff to show it. The Dockerfile's import
+# check runs a real conversion and asserts no kanji survive, which catches the
+# cp38-installs-then-fails-at-import trap requirements.thai.txt documents.
+janome==0.5.0

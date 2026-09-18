@@ -1,17 +1,28 @@
 mcp_port: 15720
 
+# 文件接收 (POST /file/upload)。agent-core 把浏览器/LLM 的上传代理到这里，
+# 本服务写到自己看得见的目录并把「本容器内的绝对路径」回给调用方 ——
+# 两个容器无需共享挂载。详见 utils/file_intake.py。
+file_intake:
+  # /models 是本容器唯一可写的宿主机挂载点。
+  dir: /models/uploads
+  max_bytes: 67108864
+  # 上传只是中转，不是存储：注册人脸留下的是 embedding，从不保留照片。
+  # 不清理会在 57 GB 的 eMMC 上一直涨。
+  retention_days: 7
+
 plugins:
   asr:
     enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
-    asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | sensevoice-small
+    asr_model: sensevoice-small   # x-asr-zh-en | parakeet-en | sensevoice-small
     # cpu | gpu — which weights get loaded is per (model, device) in
     # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
     # jp5.11 only) and is only offered for models where it was benchmarked and
-    # the transcripts were read: sensevoice-small (fp16) and paraformer-zh-en
-    # (fp32). Everything else is cpu-only — int8 weights are slower on CUDA, not
+    # the transcripts were read: sensevoice-small (fp16) and parakeet-en
+    # (fp32). x-asr-zh-en is cpu-only — its int8 weights are slower on CUDA, not
     # faster, because ONNX Runtime's CUDA provider has no int8 kernels.
     #
     # gpu is ~3.4x faster per utterance (58 ms vs 195 ms p50 on 1-4 s of speech)
@@ -31,33 +42,130 @@ plugins:
       threshold: 0.5
       silence_ms: 400
       pre_roll_ms: 500
+    # Wake-word gating. Still called `kws` for continuity with existing
+    # deployments, but there is no longer a keyword-spotting *model*: the old
+    # `trigger_mode: kws` ran a second sherpa KeywordSpotter on the raw audio
+    # and has been removed. `asr_kws` gates on the transcript instead, which
+    # the ASR produces anyway.
     kws:
-      enabled: true
-      model_dir: /models/sherpa-onnx/kws
-      keywords:
-        - "x iǎo f àn x iǎo f àn @小范小范"
+      # vad = transcribe and forward everything (always listening)
+      # asr_kws = forward only utterances whose transcript starts with the wake
+      #           word, phonetically matched; the command is what follows it
+      #
+      # A card still set to `kws` is migrated to `asr_kws` at load, carrying its
+      # wake word over from `keywords` — see REMOVED_TRIGGER_MODES in
+      # plugins/asr.py. Note an unset wake word makes asr_kws degrade to vad,
+      # i.e. always on.
+      trigger_mode: asr_kws
+      asr_kws_keyword: "小范小范"
+      # Normalised phoneme edit distance, 0-1. Lower is stricter. Measured on a
+      # 10-phoneme wake word, 0.3 permits at most 3 full-cost edits, which in
+      # practice means the ASR has to render the wake word almost exactly.
+      asr_kws_threshold: 0.3
 
   tts:
     enabled: true
-    engine: vits2_trt
+    engine: vits2-zh-en
     backend: trt
     model_dir: /models/vits2
+    # vits2-zh-en and mms-th support 0 only. For kokoro-multi this is an index
+    # *within* the selected language — 0 is that language's first voice — so the
+    # voice moves with `language` and cannot end up mismatched with it. The global
+    # ids are not guessable (Japanese starts at 37, Spanish is 28, 29 and 53), which
+    # is why they are not what this field takes.
     speaker_id: 0
     speed: 1.0
     warmup: true
     max_chunk_tokens: 256
-    # sherpa_onnx engine only — vits2_trt runs on TensorRT and ignores this.
-    # Matcha is fp32, so both devices load the same weights and only the provider
-    # changes; gpu measured ~4.3x faster at num_threads=2.
+    # kokoro-multi only. Japanese does not go through sherpa — it drives the ONNX
+    # graph directly with misaki phonemes — and that second session must live in its
+    # own process. Two ONNX Runtimes in one process share a single provider bridge
+    # holding one ProviderHost pointer, so whichever builds a CUDA session second
+    # runs against the other's objects: an exception on jp6.1, and on jp5.11 a
+    # SIGSEGV that kills all of perception. plugins/kokoro_worker.py has the detail.
+    #
+    # Measured on Orin 6 through the real adapter, one 9.3 s utterance: RTF 0.069 in
+    # the worker on gpu against 0.525 in-process on cpu, and ~15 s for the first
+    # utterance (spawn + the 8 s first CUDA call, which is why the child is kept
+    # alive). Memory, whole-box: 1585 MB while resident, of which 1191 MB comes back
+    # when the card stops — against 820 MB that the in-process session never returned.
+    # The IPC itself is 2.7 ms per utterance, 0.45% of synthesis.
+    #
+    # Nothing is spent unless the card's language is `ja`, and the worker is reaped
+    # after two minutes idle.
+    #
+    # Set false to fall back to the in-process CPU session — still real time, and
+    # what shipped before the worker existed. `japanese_worker_device: cpu` keeps the
+    # process boundary but not the GPU; both are safe, because a CPU-only session
+    # never loads the CUDA provider and so never touches the shared bridge.
+    japanese_worker: true
+    japanese_worker_device: gpu
+    # matcha-zh-en / mms-th / kokoro-multi only — vits2-zh-en runs on TensorRT and
+    # ignores this. Matcha is fp32, so both devices load the same weights and only
+    # the provider changes; gpu measured ~4.3x faster at num_threads=2.
+    #
+    # Left unset for kokoro-multi on purpose: it is the one engine whose two
+    # devices load *different weight files* (fp32 on gpu, int8 on cpu, because the
+    # CUDA provider falls back per node on quantised ops), so it carries its own
+    # default in ENGINE_DEVICE_DEFAULTS — gpu. An explicit `cpu` here would apply
+    # to every engine and quietly override that.
     device: cpu
+    # kokoro-multi only: pronunciation language. One of en-us, en-gb, zh, ja, es,
+    # fr, it, pt-br, hi — every language Kokoro v1.0 has voices for. Read per
+    # generate() call, so changing it costs nothing.
+    #
+    # It selects the espeak voice for the NON-Chinese runs of the text; Chinese is
+    # phonemised from lexicon-zh.txt on every setting, so mixed zh/en code-switches
+    # on its own and `zh` deliberately maps to an English voice (that only affects
+    # how embedded Latin is read).
+    #
+    # `speaker_id` is an index relative to this, so the voice follows the language
+    # and the two cannot end up disagreeing.
+    #
+    # Only en-us / en-gb / zh have been listened to — sherpa-onnx documents English
+    # and Chinese as this model's supported pair, so the rest are best-effort.
+    language: en-us
 
   vop:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
-    model: "yolov8s-worldv2"
+    # Runs a prebuilt TensorRT engine. `yolov8s-worldv2` still resolves here for
+    # cards saved before the switch, but the engine it loads is this one.
+    model: "yoloe-26s-seg"
     confidence: 0.3
-    classes: []         # empty = default broad set
     fps: 5
+    # NOTE: there is no `classes` key any more. The engine's open-vocabulary
+    # class list is frozen when the engine is exported, so it cannot be changed
+    # from here or at runtime; setting it makes the plugin refuse the config
+    # rather than silently ignore it. To change what vop can detect, edit
+    # tools/export_vision_engines.py, rebuild, and republish the bundle.
+
+  # Was `vdp:` for one release; main.py still reads that spelling from a
+  # config.yaml already on a machine, and the tool answers to `vdp_*` too.
+  visual_depth:
+    # Monocular depth. On by default, so the card is there to wire up without
+    # editing a file on the robot first.
+    #
+    # It is a second resident engine next to vop/OCR/ASR/TTS, and on the 8 GB
+    # Orins memory — not GPU time — is the binding constraint. The engine is
+    # loaded lazily on the first `start`, so an enabled-but-unwired card costs
+    # nothing; the cost appears once something actually subscribes. On a tight
+    # machine that does not consume depth, set this to false.
+    enabled: true
+    namespace: ""       # auto-detect from hostname if empty
+    fps: 2
+    # Output is METRES. ultralytics bakes its metric fit into the exported
+    # engine (Depth.forward applies cal_a/cal_b before the export branch), and
+    # the released yolo26n-depth weights ship with that fit done — verified on
+    # Orin5 against the reference .pt on the same photos.
+    #
+    # These two are a *site* refit on top of it, for when the generic fit is
+    # off for a particular camera: metres_out = metres_in**cal_a * exp(cal_b).
+    # Same parameterisation ultralytics' model.calibrate() produces, so a fit
+    # from there pastes in unchanged. 1.0 / 0.0 = trust the engine.
+    cal_a: 1.0
+    cal_b: 0.0
+    max_depth_m: 20.0
 
   ocr:
     enabled: true
@@ -82,3 +190,73 @@ plugins:
       det_thresh: 0.1
       det_box_thresh: 0.1
     min_interval_ms: 0
+
+  soundevent:
+    enabled: true
+  face_recognition:
+    enabled: true
+    # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
+    # Plain ONNX, so one bundle serves both JetPack lines and x86 dev hosts.
+    model_dir: /models/face/buffalo_sc
+    # The only host-mounted writable path in this container is /models (see
+    # perception/deploy/service.yml), so the identity database lives under it.
+    db_dir: /models/face_db
+    # auto | cpu | gpu. auto (the default) uses the GPU when the installed
+    # onnxruntime offers a CUDA/TensorRT provider and falls back to cpu when it
+    # does not — which is the case on this image today, because it ships the CPU
+    # wheel (a CUDA build for Jetson is a per-JetPack wheel that must be hosted
+    # on COS, like SHERPA_GPU_WHEEL). An explicit `gpu` that cannot be honoured
+    # warns and degrades; `auto` does not warn, since cpu is the expected
+    # outcome there. The models are 2.5 MB + 13 MB, so cpu at 1 detection/second
+    # is the design point.
+    device: auto
+    num_threads: 2
+    warmup: true
+    det_size: [640, 640]
+    det_thresh: 0.5
+    # Cosine similarity between L2-normalised ArcFace embeddings. 0.35 is a
+    # starting point for w600k_mbf, NOT a measured value — raise it if the
+    # robot confuses people, lower it if it fails to recognise them, and record
+    # what you saw. Editable from the card.
+    match_threshold: 0.35
+    # Quality gate. A face below either bound is reported with person_id: null
+    # rather than matched or auto-enrolled: matching a blurred 30 px face is a
+    # coin flip, and enrolling one wastes an unknown-N slot forever.
+    min_face_px: 64
+    blur_min: 60.0          # variance of Laplacian on the aligned 112x112 crop
+    # Enrolment refuses to guess when two faces are comparably prominent.
+    # Prominence is area discounted 40% for being off-centre.
+    subject_dominance: 1.6
+    max_faces: 8
+    # register_current_stream analyses the last enroll_window_s of frames, up
+    # to enroll_max_analyzed of them (newest first), instead of a single grab.
+    enroll_window_s: 3.0
+    enroll_window_max_frames: 60
+    enroll_max_analyzed: 8
+    # Ceiling on auto-enrolled strangers; oldest sighting evicted first. Named
+    # people are never evicted. Editable from the card.
+    unknown_capacity: 500
+    max_samples_per_person: 8
+    # 访问记录表 (visits.jsonl): 一次连续出现 = 一条记录，不是一帧一条。
+    # 离开超过 visit_gap_s 才封档落盘；10 分钟避免有人转个头就把一下午切成几十条。
+    visit_gap_s: 600.0
+    # 在场的人的 visit 会在内存里挂很久（10 分钟 gap + 一直出现），断电会整条丢，
+    # 所以每 visit_checkpoint_s 把未封档的 visit 落一次小文件，重启后续上。
+    visit_checkpoint_s: 60.0
+    visit_log_max: 20000
+    max_batch: 200
+    # 过大/非常见格式的图片在本地缩放转码，而不是在接口处拒绝。
+    # 检测本身会把图 letterbox 到 det_size(640)，所以 2048 已远超需要，
+    # 在这里用 INTER_AREA 缩一次比让 letterbox 缩更快也更清晰。
+    max_image_side: 2048
+    # 解压炸弹护栏（像素数）：几百 KB 的 PNG 可以声明 30000x30000，
+    # 解出来 2.7 GB 会让 OOM killer 带走整个 perception 进程。
+    max_image_pixels: 60000000
+    # 仅为传输/内存护栏，不是策略限制 —— 超大图片会被本地缩放而非拒绝。
+    max_image_bytes: 67108864
+    # Caller-supplied image/package paths are confined to these roots — the MCP
+    # server has no authentication and runs as root in the container.
+    image_roots: ["/models", "/tmp", "/work"]
+    # 检测频率: how many detections per second. Fractional is the point —
+    # 0.5 means once every two seconds; 0 means every frame the camera sends.
+    detect_fps: 1.0

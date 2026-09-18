@@ -25,6 +25,9 @@ from vision_stubs import (  # noqa: F401
 
 import plugins.vits2_tts_trt.plugin as vits2  # noqa: E402
 from plugins.vits2_tts_trt.adapter import Vits2TensorRTAdapter  # noqa: E402
+# The engine list is owned by plugins/tts.py and imported by this package rather
+# than restated, so assert against the source of truth instead of a copy.
+import plugins.tts as tts  # noqa: E402
 
 
 class _FakeAdapter(Vits2TensorRTAdapter):
@@ -450,7 +453,7 @@ def test_tool_is_the_standard_tts_tool_with_an_engine_selector():
     config = tools[0]["configSchema"]["properties"]
     # The engine has to be visible in the device panel, or switching it means
     # rebuilding the image (see PR #112 review).
-    assert config["tts_engine"]["enum"] == ["vits2_trt", "sherpa_onnx"]
+    assert config["tts_engine"]["enum"] == list(tts.TTS_ENGINES)
     assert vits2.TTSPlugin.PREFIX == "tts"
 
 

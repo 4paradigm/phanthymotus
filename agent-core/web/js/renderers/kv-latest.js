@@ -2,6 +2,8 @@
  * kv-latest.js — "最新模式" renderer for JSON topics.
  * Shows each top-level key as a cell with live-updating value.
  */
+import { decodeNestedJson } from './json-util.js';
+
 export const KvLatestRenderer = {
   name: 'kv-latest',
   canRender: (hint) => hint && (hint.startsWith('text/') || hint === 'data/json'),
@@ -23,7 +25,10 @@ export const KvLatestRenderer = {
       const json = JSON.parse(str);
       if (json.type === 'ping' || json.type === 'meta') return;
 
-      const flat = _flatten(json);
+      // Same second-layer decode the log view does: a field holding a JSON
+      // string becomes the object it encodes, so its fields get their own
+      // cells instead of one cell full of escaped source text.
+      const flat = _flatten(decodeNestedJson(json));
       for (const [key, value] of Object.entries(flat)) {
         this._updateCell(key, value);
       }

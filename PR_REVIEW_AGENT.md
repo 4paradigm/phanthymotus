@@ -44,13 +44,25 @@ logic, so they can run simultaneously without double-triggering.
 | `/request_bot_review perception` | Force `perception` (JetPack 5.11, the default) |
 | `/request_bot_review perception jetson-6.1` | Force `perception` on JetPack 6.1 |
 | `/request_bot_review perception jetson-5.11 jetson-6.1` | Both JetPack versions — two builds, two images |
+| `/request_bot_review actucore jp61` | Force `actucore` on JetPack 6.1 |
 | `/request_bot_review unitree/g1` | Force a specific driver |
 
-A JetPack token implies the `perception` target, so `/request_bot_review
-jetson-6.1` is enough. `jetson-6.1`, `jetson-jp6.1`, `jp6.1` and `6.1` are all
-accepted; an unsupported version is ignored with a warning rather than passed
-to the build script, which would exit 1 on it. The "Building..." comment lists
-the builds that will actually run, versions included.
+`jetson-6.1`, `jetson-jp6.1`, `jp6.1`, `jp61` and `6.1` are all accepted
+spellings of one version. The dotless ones matter: they are what the `help`
+message advertises, and they were rejected until they weren't — the token fell
+through the parser unrecognised, the job then built the 5.11 default, and it
+did so *successfully*, so nothing on the PR or in the log said the requested
+version had been dropped. Any argument the parser does not recognise is now
+logged.
+
+A JetPack token on its own implies `perception`, so `/request_bot_review
+jetson-6.1` is enough. Next to `actucore` it applies to actucore alone — both
+targets have JetPack variants, and the implication used to fire regardless,
+making `actucore jp61` build an unrequested perception jp6.1 image as well.
+
+An unsupported version is ignored with a warning rather than passed to the
+build script, which would exit 1 on it. The "Building..." comment lists the
+builds that will actually run, versions included.
 
 The trigger must start a line, and it must be in the PR's **main conversation**
 box. Line-level review comments are a different GitHub event and are not seen.

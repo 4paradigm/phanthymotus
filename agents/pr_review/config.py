@@ -90,6 +90,45 @@ class Config:
 
     # Paths
     data_dir: str = "/data/repos"
+    # The host path `data_dir` is bind-mounted from, needed only to run tests.
+    #
+    # Builds never needed it: `docker build` sends its context over the socket,
+    # so the *client's* view of a path is what counts. `docker run -v` is the
+    # opposite — the **daemon** resolves it, and a container path handed to it
+    # names nothing on the host, so Docker silently creates an empty directory
+    # and mounts that. Every test would then fail on "file not found" and be
+    # reported on the PR as the author's doing. tester.py refuses to run rather
+    # than guess when this is unset and we are demonstrably in a container.
+    data_host_dir: str = ""
+
+    # Tests — run inside the images built from the PR. See tester.py.
+    tests_enabled: bool = True
+    # actucore was missing here while its 117 tests sat in the repo: an
+    # actucore PR got a build and a review, and a test section that did not
+    # mention it at all.
+    test_components: tuple[str, ...] = ("agent-core", "perception", "actucore")
+    # Deliberately far above what a suite costs, because these bound a wedged
+    # container, not a slow one. Measured on the perception suite (787 tests):
+    # 34s native on Orin 6, 61s under qemu on the x86 build host — emulation is
+    # ~1.8x, not the order of magnitude it is easy to assume, so there is no
+    # reason to exclude an arm64 image from an x86 host.
+    test_timeout_seconds: int = 3600
+    # Generous because the first run on a host pulls a multi-GB arm64 image
+    # before pytest prints anything at all.
+    test_idle_timeout_seconds: int = 900
+    test_pytest_spec: str = "pytest==8.3.4 pytest-asyncio"
+    # NOT the Tencent mirror the rest of this repo defaults to: it only
+    # resolves inside the Tencent VPC, and on the Orins every test run would
+    # end as `error` on a DNS failure. Measured from a perception container on
+    # Orin 6: mirrors.tencentyun.com does not resolve, pypi.org does. The
+    # images also bake PIP_INDEX_URL=jetson.webredirect.org, which resolves
+    # nowhere we run, so passing `-i` explicitly is required, not optional.
+    # A VPC host should set TEST_PYPI_INDEX to the mirror for speed; tester.py
+    # falls back to pypi.org if the configured index fails.
+    test_pypi_index: str = "https://pypi.org/simple/"
+    test_memory_limit: str = "8g"
+    test_max_reported_failures: int = 5
+    test_context_max_chars: int = 3000
 
     # Server
     host: str = "0.0.0.0"
@@ -126,6 +165,13 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _load_repo_names() -> tuple[str, ...] | None:
@@ -190,6 +236,20 @@ def load_config() -> Config:
         retry_backoff_seconds=_env_int("RETRY_BACKOFF_SECONDS", 60),
         job_history_days=_env_int("JOB_HISTORY_DAYS", 30),
         data_dir=os.environ.get("DATA_DIR", "/data/repos"),
+        data_host_dir=os.environ.get("DATA_HOST_DIR", ""),
+        tests_enabled=_env_bool("TESTS_ENABLED", True),
+        test_components=_env_csv(
+            "TEST_COMPONENTS", ("agent-core", "perception", "actucore")
+        ),
+        test_timeout_seconds=_env_int("TEST_TIMEOUT_SECONDS", 3600),
+        test_idle_timeout_seconds=_env_int("TEST_IDLE_TIMEOUT_SECONDS", 900),
+        test_pytest_spec=os.environ.get(
+            "TEST_PYTEST_SPEC", "pytest==8.3.4 pytest-asyncio"
+        ),
+        test_pypi_index=os.environ.get("TEST_PYPI_INDEX", "https://pypi.org/simple/"),
+        test_memory_limit=os.environ.get("TEST_MEMORY_LIMIT", "8g"),
+        test_max_reported_failures=_env_int("TEST_MAX_REPORTED_FAILURES", 5),
+        test_context_max_chars=_env_int("TEST_CONTEXT_MAX_CHARS", 3000),
         host=os.environ.get("HOST", "0.0.0.0"),
         port=_env_int("PORT", 25000),
         resource_center_url=os.environ.get("RESOURCE_CENTER_URL", ""),

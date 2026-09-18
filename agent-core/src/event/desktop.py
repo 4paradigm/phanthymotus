@@ -28,6 +28,21 @@ _IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 _IMAGE_INLINE_MAX = 1_500_000   # 1.5 MB
 _IMAGE_MAX_EDGE = 1280          # 缩放后最长边
 
+# WebFetch(save_to=...) 落盘上限。与 channel/media.py:LIMITS 的平台附件上限同量级——
+# 下载一个发不出去的文件没有意义。注意这**不是** WebFetch 转 markdown 那条路径的 512KB raw cap：
+# 那条路的内容要进 context，这条不进。
+_DOWNLOAD_MAX = 20 * 1024 * 1024
+
+# WebSearch 每种搜索类型的 (默认条数, 上限)。上限是对 router.phanthy.com 实测出来的：
+# web 给 50 就回 50，image 给 30 回 23（够了），video 给 20 也只回 10。
+# 默认值压得比上限低得多——一次 WebSearch 的结果单独就能撑爆历史压缩阈值
+# （见 config.py 的 compress 阈值注释与 subagent/context.py 的实测记录）。
+_SEARCH_LIMITS = {
+    'web':   (10, 50),
+    'image': (8, 30),
+    'video': (5, 10),
+}
+
 _BASH_BLOCKED = [
     'rm -rf /', 'rm -rf /*', 'mkfs', 'reboot', 'shutdown', 'poweroff',
     'dd if=', 'dd of=/dev',
@@ -68,6 +83,108 @@ def _truncate(text: str, max_bytes: int = _MAX_OUTPUT) -> str:
     encoded = text.encode('utf-8', errors='replace')[:max_bytes]
     truncated = encoded.decode('utf-8', errors='ignore')
     return truncated + f'\n\n... [output truncated at {max_bytes} bytes]'
+
+
+# ── WebSearch 结果格式化 ─────────────────────────────────────────────────────────
+#
+# 搜索后端对三种 search_type 返回**三种不同形状**的结果，只有 web 那种是
+# {title,url,content,website,date}。image 的图在 `image.url`（`content` 恒为空串），
+# video 的元信息在 `video.*`（`video.url` 恒为空，能播的是落地页 `url`），网页结果的配图在
+# `web_extensions.images[]`。按一种形状去读三种结果，就等于把图片搜索的图整个丢掉。
+
+
+def _fmt_meta(r: dict) -> str:
+    """website | date，两者都可能缺。"""
+    parts = [r.get(k, '') for k in ('website', 'date')]
+    return ' | '.join(p for p in parts if p)
+
+
+def _fmt_duration(seconds) -> str:
+    """'164' → '2:44'。后端给的是字符串秒数，也可能是空串。"""
+    try:
+        s = int(float(seconds))
+    except (TypeError, ValueError):
+        return ''
+    if s <= 0:
+        return ''
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f'{h}:{m:02d}:{sec:02d}' if h else f'{m}:{sec:02d}'
+
+
+def _fmt_wh(d: dict) -> str:
+    w, h = d.get('width', ''), d.get('height', '')
+    return f'{w}x{h}' if w and h else ''
+
+
+def _fmt_web_result(r: dict) -> list[str]:
+    lines = [f'### {r.get("title", "Untitled")}']
+    if r.get('url'):
+        lines.append(f'URL: {r["url"]}')
+    meta = _fmt_meta(r)
+    if meta:
+        lines.append(f'Source: {meta}')
+    try:
+        if float(r.get('authority_score') or 0) >= 0.8:
+            lines.append('Authority: high')
+    except (TypeError, ValueError):
+        pass
+    if r.get('content'):
+        lines.append(r['content'][:500])
+    # 网页自带的配图——要发图给用户时这些往往比 image 搜索更贴题。
+    images = (r.get('web_extensions') or {}).get('images') or []
+    for img in images[:3]:
+        if img.get('url'):
+            wh = _fmt_wh(img)
+            lines.append(f'- Figure: {img["url"]}' + (f' ({wh})' if wh else ''))
+    return lines
+
+
+def _fmt_image_result(r: dict) -> list[str]:
+    lines = [f'### {r.get("title", "Untitled")}']
+    img = r.get('image') or {}
+    if img.get('url'):
+        wh = _fmt_wh(img)
+        lines.append(f'Image: {img["url"]}' + (f' ({wh})' if wh else ''))
+    if r.get('url'):
+        lines.append(f'Page: {r["url"]}')
+    meta = _fmt_meta(r)
+    if meta:
+        lines.append(f'Source: {meta}')
+    # content 对图片结果恒为空，不打印空行。
+    if r.get('content'):
+        lines.append(r['content'][:200])
+    return lines
+
+
+def _fmt_video_result(r: dict) -> list[str]:
+    lines = [f'### {r.get("title", "Untitled")}']
+    vid = r.get('video') or {}
+    # video.url 实测恒为空——可播地址是上一级的落地页 url。
+    watch = vid.get('url') or r.get('url', '')
+    if watch:
+        lines.append(f'Watch: {watch}')
+    if vid.get('hover_pic'):
+        lines.append(f'Cover: {vid["hover_pic"]}')
+    dur = _fmt_duration(vid.get('duration'))
+    wh = _fmt_wh(vid)
+    facts = [x for x in (f'Duration: {dur}' if dur else '', f'Resolution: {wh}' if wh else '') if x]
+    if facts:
+        lines.append(' | '.join(facts))
+    meta = _fmt_meta(r)
+    if meta:
+        lines.append(f'Source: {meta}')
+    # 视频结果的 content 往往是整段字幕/文案，比网页摘要长得多，单独截短。
+    if r.get('content'):
+        lines.append(r['content'][:300])
+    return lines
+
+
+_RESULT_FORMATTERS = {
+    'web': _fmt_web_result,
+    'image': _fmt_image_result,
+    'video': _fmt_video_result,
+}
 
 
 def vision_input_enabled() -> bool:
@@ -525,14 +642,22 @@ class DesktopTools:
         url: typing.Annotated[str, 'URL to fetch'],
         prompt: typing.Annotated[str, 'What information to extract from the page (optional)'] = '',
         timeout: typing.Annotated[int, 'Timeout in seconds (default 30)'] = 30,
+        save_to: typing.Annotated[str, "Save the raw bytes to this local path instead of extracting text. Use it to download an image or video URL returned by WebSearch. Must be under /work or /tmp; the extension is filled in from the response if omitted."] = '',
     ) -> str:
-        """Fetch URL content. HTML is automatically converted to Markdown for readability. Optionally specify a prompt to describe what information you want to extract."""
+        """Fetch URL content. HTML is automatically converted to Markdown for readability. Optionally specify a prompt to describe what information you want to extract.
+
+        Pass save_to to download instead: the raw bytes go to that local path and the tool returns the
+        saved path, size and type. This is how a remote image/video from WebSearch becomes something you
+        can send with the channel reply tool's files parameter or look at with Read()."""
         timeout = max(5, min(timeout, 60))
 
         try:
             import aiohttp
         except ImportError:
             return 'Error: aiohttp not installed. Run: pip install aiohttp'
+
+        if save_to:
+            return await self._download(url, save_to, timeout)
 
         try:
             import html2text
@@ -577,16 +702,89 @@ class DesktopTools:
 
         return result
 
+    async def _download(self, url: str, save_to: str, timeout: int) -> str:
+        """WebFetch(save_to=...) 的下载分支：把响应体原样写到本地白名单目录。
+
+        独立成一个方法，是因为它和取文本那条路几乎没有共同点：不解码、不转 markdown、
+        不进 context，大小上限也不同（那条路的 512KB 是"别撑爆上下文"，这条是"别撑爆磁盘"）。
+        """
+        import mimetypes
+
+        import aiohttp
+
+        p = _resolve_path(save_to)
+        err = _check_path_allowed(p)
+        if err:
+            return f'Error: {err}'
+        if p.is_dir():
+            return f'Error: {p} is a directory'
+
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return f'Error: cannot create {p.parent}: {e}'
+
+        written = 0
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout),
+                                       headers={'User-Agent': 'Mozilla/5.0 (compatible; AgentBot/1.0)'},
+                                       ssl=False) as resp:
+                    if resp.status >= 400:
+                        return f'Error: HTTP {resp.status} {resp.reason}'
+                    content_type = (resp.headers.get('content-type', '') or '').split(';')[0].strip()
+
+                    # 没有扩展名时按 Content-Type 补一个：channel/media.py::infer_kind 先看扩展名，
+                    # 一个没后缀的 JPEG 会被当成普通文件发出去（走文件接口而不是图片接口）。
+                    if not p.suffix and content_type:
+                        ext = mimetypes.guess_extension(content_type)
+                        if ext == '.jpe':      # mimetypes 对 image/jpeg 的第一个答案，平台不认
+                            ext = '.jpg'
+                        if ext:
+                            p = p.with_suffix(ext)
+
+                    # 流式写盘：超限即中止，不把 20MB+ 先攒进内存。
+                    with open(p, 'wb') as fh:
+                        async for chunk in resp.content.iter_chunked(65536):
+                            written += len(chunk)
+                            if written > _DOWNLOAD_MAX:
+                                fh.close()
+                                p.unlink(missing_ok=True)
+                                return (f'Error: response exceeds the {_DOWNLOAD_MAX // 1024 // 1024}MB '
+                                        f'download limit. Nothing was saved.')
+                            fh.write(chunk)
+        except asyncio.TimeoutError:
+            p.unlink(missing_ok=True)
+            return f'Error: request timed out after {timeout}s'
+        except Exception as e:
+            p.unlink(missing_ok=True)
+            return f'Error downloading URL: {e}'
+
+        if written == 0:
+            p.unlink(missing_ok=True)
+            return f'Error: {url} returned an empty body. Nothing was saved.'
+
+        desc = f'Saved {written} bytes to {p}'
+        if content_type:
+            desc += f' ({content_type})'
+        return desc
+
     # ── 9. WebSearch ─────────────────────────────────────────────────────────
 
     @log.function_(call=True)
     async def WebSearch(self,
         query: typing.Annotated[str, 'Search query keywords'],
-        search_type: typing.Annotated[str, 'Type of search: web, image, or video (default web)'] = 'web',
-        top_k: typing.Annotated[int, 'Maximum number of results (default 10)'] = 10,
+        search_type: typing.Annotated[str, "Type of search: 'web' (pages), 'image' (pictures), or 'video' (clips). Default 'web'."] = 'web',
+        top_k: typing.Annotated[int, 'Maximum number of results. 0 = per-type default (web 10, image 8, video 5). Caps: web 50, image 30, video 10.'] = 0,
         time_range: typing.Annotated[str, 'Time filter: day/week/month/year, empty for no limit'] = '',
     ) -> str:
-        """Search the web for current information. Returns structured results with titles, URLs, and content summaries. Use for finding news, documentation, research, or any information that may have changed recently."""
+        """Search the web for current information. Use for news, documentation, research, or anything that may have changed recently.
+
+        search_type='image' returns picture URLs ("Image: https://..."), search_type='video' returns watch
+        links, cover images and durations, and web results may list article figures ("Figure: https://...").
+        Those are remote URLs — to show one to the user or look at it yourself, first download it with
+        WebFetch(url, save_to='/tmp/pic.jpg'), then send it via the channel reply tool's files parameter
+        (it only accepts local paths) or inspect it with Read(path)."""
         import json as _json
 
         # Load search config (prefer desktop_tools.search, fallback to tool_config)
@@ -608,9 +806,12 @@ class DesktopTools:
             base_url = base_url + '/v1'
 
         # Build request payload
+        if search_type not in _SEARCH_LIMITS:
+            search_type = 'web'
+        default_k, max_k = _SEARCH_LIMITS[search_type]
         search_params = {
-            'search_type': search_type if search_type in ('web', 'image', 'video') else 'web',
-            'top_k': max(1, min(top_k, 20)),
+            'search_type': search_type,
+            'top_k': default_k if top_k <= 0 else min(top_k, max_k),
         }
         if time_range and time_range in ('day', 'week', 'month', 'year'):
             search_params['time_range'] = time_range
@@ -667,28 +868,14 @@ class DesktopTools:
         if not results:
             return f'No results found for "{query}"'
 
-        # Format results for LLM consumption
-        lines = [f'Search results for "{query}" ({len(results)} results):']
+        # Format results for LLM consumption. Each result carries its own `type`; dispatch on it
+        # rather than on the requested search_type, so a mixed response still renders correctly.
+        label = {'web': 'Web', 'image': 'Image', 'video': 'Video'}[search_type]
+        lines = [f'{label} search results for "{query}" ({len(results)} results):']
         lines.append('')
         for r in results:
-            title = r.get('title', 'Untitled')
-            url = r.get('url', '')
-            content = r.get('content', '')
-            website = r.get('website', '')
-            date = r.get('date', '')
-
-            lines.append(f'### {title}')
-            if url:
-                lines.append(f'URL: {url}')
-            meta_parts = []
-            if website:
-                meta_parts.append(website)
-            if date:
-                meta_parts.append(date)
-            if meta_parts:
-                lines.append(f'Source: {" | ".join(meta_parts)}')
-            if content:
-                lines.append(content[:500])
+            fmt = _RESULT_FORMATTERS.get(r.get('type') or search_type, _fmt_web_result)
+            lines.extend(fmt(r))
             lines.append('')
 
         return _truncate('\n'.join(lines))

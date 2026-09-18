@@ -103,6 +103,125 @@ must match the URDF `<joint name="...">` **exactly**. A mismatch does not error 
 the dashboard silently draws a humanoid stick figure whatever the real morphology
 is.
 
+## `deploy/service.yml` — DDS isolation
+
+**You cannot run it** (your tools are read-only), but `scripts/check_service_yml.py` at
+the driver repo root encodes this contract exactly, including both exemption tables. When
+a PR touches a `deploy/service.yml`, `read_file` that script first: it is shorter than
+this section and it is the thing that will be true after future edits. Then check the
+fragment against it with `read_file`/`file_diff`. If the PR adds a driver that the script
+would fail, say so and name the failing item — and mention the script by path, because
+whoever fixes it can run it locally.
+
+Two lines are mandatory in every driver's fragment:
+
+```yaml
+volumes:
+  - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+environment:
+  - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+```
+
+Why this is worth blocking a PR over: `/remote_control/message` — a *command* topic —
+was reaching every robot on the office LAN, and an instruction typed on one robot was
+executed by a second one, identical timestamp in both logs. DDS has no addressing and
+no authentication. The profile pins FastDDS to `127.0.0.1`; because containers run
+`network_mode: host` they share one loopback, so the local bus works and nothing
+crosses the machine.
+
+**The failure mode is not what you would guess.** A container missing these lines is
+not merely unisolated — with `useBuiltinTransports=false` everywhere else it lands on a
+different transport from the rest of the machine and **cannot reach Agent Core at all**.
+The symptom is a device that registers over HTTP and appears in the dashboard while
+none of its topics ever carry data, which sends the author looking at their plugin code.
+If a PR reports exactly that symptom, check the mount before reviewing anything else.
+
+Also flag:
+
+- **`FASTDDS_BUILTIN_TRANSPORTS` still present.** It contradicts the profile's
+  `useBuiltinTransports=false`. The XML wins, so the variable changes nothing and only
+  misleads the next reader. (Note it may also be baked into an image's `ENV`, where
+  compose cannot remove it — that is not the PR's fault, but the fragment should not
+  add it.)
+- **Agent Core's domain is not 42.** It is 42 on every robot; there is nothing to
+  allocate, and per-robot numbers were tried and rejected (narrow usable range, cloned
+  images cannot coordinate). A dual-context driver may spell the body's domain
+  `<PREFIX>_ROS_DOMAIN_ID` — only the Agent Core side must be 42.
+- **A mistyped mount path.** Docker silently creates a *directory* of that name,
+  FastDDS falls back to every interface, and nothing is logged. Isolation is off while
+  everything looks fine. This is why the checker compares the mount string exactly.
+
+Two exceptions, and they are not the same kind of exception:
+
+- `x-humanoid/tianyi2.0` **must not** set the environment variable. It holds two
+  FastDDS contexts in one process and selects a profile per context around each
+  `rclpy.init()`; a process-wide default would put the body link on loopback and cut
+  it. The mount is still required. Setting the variable here is a defect, not a pass.
+- `engineai/t800` runs on CycloneDDS (`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` forced in
+  its `CMD`), which a FastDDS profile cannot touch, so its domain-42 traffic **is still
+  on the LAN**. This is a known open gap, not a covered case; the checker reports it as
+  `GAP` and does not fail. Do not ask a PR to "fix" it by adding the FastDDS lines —
+  they would do nothing. Closing it needs a CycloneDDS-level config for the core
+  context, and no T800 hardware has been available to try it.
+
+A driver that reaches Agent Core over FastDDS and appears in neither list has no
+exemption. If a PR adds a third such driver, the right outcome is a new entry in the
+checker's table (`IN_CODE_PROFILE` or `KNOWN_GAPS`) with the reason — not a silent pass.
+
+`ipc` and `pid` are **not** part of this contract; see the section at the end.
+
+## Continuous control (`motus.control/1`) — servo cards
+
+Applies to any PR touching `common/control/`, a `servo.py`, or anything that
+subscribes to a `control/*` topic. Authoritative: `README_dev.md` §"Continuous
+Control (`motus.control/1`)"; architecture and the requirements coming next in
+`phanthymotus/docs/vla-integration.md`.
+
+This is the path an execution model drives the robot through — tens of commands a
+second, no human in the loop per command. **A review miss here moves a real arm.**
+Existing implementations to compare against: `realman/rm75_6f_v/servo.py` (single
+7-DOF arm), `x-humanoid/tianyi2.0/servo.py` (dual arm + hands, uses `groups`).
+
+Block on these:
+
+- **The check chain re-implemented in the card.** Freshness, source arbitration,
+  step clamping, hard limits, watchdog and escalation belong to
+  `common/control.ControlSink`, which is ROS-free, takes an injected clock, and is
+  tested without a robot. A card that does its own bounds check has a second,
+  untested copy of the safety properties. What legitimately belongs in the card:
+  unit conversion at the SDK boundary, the vendor's motion gate, and which call
+  stops the machine.
+- **`force_torque` missing from the descriptor.** It is required *even as `null`* —
+  `parse_descriptor` rejects a descriptor that omits it. Watch for a PR that
+  "fixes" that rejection by defaulting it to a value: omitting it is how a robot
+  ends up assumed to have a protection it does not have, and inventing one is
+  worse.
+- **A descriptor hand-written apart from the feedback path.** The state the driver
+  publishes and the commands it accepts must come from the same
+  `build_descriptor()`. Two hand-maintained tables will eventually disagree about
+  what the machine can do, and nothing will report it.
+- **Unit conversion anywhere but the boundary.** rm75's descriptor is radians and
+  its SDK takes degrees; the conversion sits immediately before the SDK call. A
+  conversion scattered across a file is how half a trajectory ends up in the wrong
+  unit.
+- **The motion gate skipped because commands are frequent.** The vendor's
+  motion-enable / human confirmation is checked once at `start` — that is the point
+  where a person is present. Streaming does not earn an exemption.
+- **Generous `ttl_ms` / `watchdog_ms` / `max_obs_age_ms`.** A generous ttl removes
+  the protection *while still appearing to provide it*: the robot then resumes from
+  a pause on a command computed from an old picture. These are measurements, not
+  preferences — ask what the PR measured.
+- **`obs_stamp_ms` set from anything but the sensor's capture time.** The whole
+  point of the second timestamp is catching a freshly-generated command computed
+  from an 800 ms old picture. Filling it from "when the driver read the value"
+  looks right in every test that does not involve latency.
+- **Pause treated as a safe state.** When commands stop the robot holds, and
+  resumes *without warning* the moment a valid one lands. A PR that calls a held
+  robot safe, or that removes the resume announcement, is wrong about the hardware.
+
+Tests for a new check go in `tests/test_control_sink.py` — it is ROS-free with an
+injected clock, so there is no excuse for an untested safety rule in a bundle.
+
 ## Comparing against an existing driver
 
 Pick the closest existing driver and check the new one against it. Good models:
@@ -122,8 +241,17 @@ which is spec-canonical for IDs and ports but is 3,400 lines in one file.
 ## Do not flag these — the docs and the code disagree, and the code wins
 
 - `README_dev.md` says `deploy/service.yml` must not set `network_mode`, `ipc` or
-  `pid` because Agent Core injects them. **Every existing driver sets them.**
-  Do not raise this against a new driver that follows the existing files.
+  `pid` because Agent Core injects them. **Every existing driver sets them, and
+  they are right to.** Injection happens only in `_deploy_legacy` — the
+  `docker run` fallback for an image that ships *no* `service.yml`
+  (`agent-core/src/api/drivers.py`). On the normal path the fragment is merged
+  **verbatim**: `_deploy_sync` overrides only `image` and fills a missing
+  `logging` block, nothing else. So a driver with a `service.yml` must declare
+  its own `network_mode: host`, which the DDS profile depends on — containers
+  share a loopback only under host networking.
+  `ipc`/`pid` genuinely vary (a drone does not need `pid: host`) and the profile
+  disables shared memory anyway, so do not require them either way. Do not raise
+  any of this against a driver that follows the existing files.
 - The doc writes paths as `drivers/<provider>/<model>/`. There is no `drivers/`
   prefix in the real layout.
 - The doc's directory diagram omits `deploy/` and `resource/`, which real drivers

@@ -1,6 +1,18 @@
 actucore:
   image: __IMAGE__
   container_name: embodied-actucore
+  # Without this the container gets no GPU, whatever `privileged` and
+  # `/dev:/dev` suggest: the L4T base ships zero-length placeholders for the
+  # driver libraries and only the nvidia runtime bind-mounts the host's real
+  # ones over them. `torch.cuda.is_available()` is then False and a local VLA
+  # provider falls back to CPU — which it *says*, in one warning line, and then
+  # runs a 450M-parameter policy on an Orin's CPU cores at a rate no arm can
+  # use. Measured on Tianyi before this line existed.
+  #
+  # perception/deploy/service.yml carries the same flag and the longer version
+  # of this note, including why a libnvdla_compiler.so error is not evidence
+  # that the flag is missing.
+  runtime: nvidia
   network_mode: host
   ipc: host
   pid: host
@@ -11,11 +23,13 @@ actucore:
     # navigation 卡片：FAST-LIVO2 的点云地图与采集数据要活过容器重建
     - /opt/phanthy-motus/data/fast_livo2/maps:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
     - /opt/phanthy-motus/data/fast_livo2/recordings:/opt/phanthy-motus/data/fast_livo2/recordings:rw
+    # DDS profile 只读挂载。必须与其它 DDS 容器加载同一份，
+    # 否则本容器会与本机其余部分失联。
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    # DEFAULT 同时启用 SHM 和 UDPv4；同机 Driver / ActuCore 优先走 SHM，并保留 UDP fallback
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
   logging:
     driver: local
     options:

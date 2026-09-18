@@ -326,7 +326,21 @@ class TensorRTEngine:
             self._engine = self._runtime.deserialize_cuda_engine(serialized)
             del serialized
             if self._engine is None:
-                raise TensorRTError(f"failed to deserialize TensorRT engine: {self.path}")
+                # Overwhelmingly this is a version mismatch: an engine plan is
+                # tied to the exact TensorRT that built it, and the reason it
+                # does not match is almost never visible from here — the
+                # detail sits in TensorRT's own log line, which lands in the
+                # container log well above this traceback and is easy to miss.
+                # Say the runtime version so the two numbers can be compared
+                # without going looking.
+                raise TensorRTError(
+                    f"failed to deserialize TensorRT engine: {self.path}. "
+                    f"This runtime is TensorRT {tensorrt_version()}; an engine "
+                    f"plan only loads on the version that built it, so a "
+                    f"bundle built elsewhere must be rebuilt against this one "
+                    f"(see the preceding [TRT] [E] line for the version it "
+                    f"expects)."
+                )
             self._context = self._engine.create_execution_context()
             if self._context is None:
                 raise TensorRTError(f"failed to create TensorRT context: {self.path}")

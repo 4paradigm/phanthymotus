@@ -14,9 +14,13 @@ services:
       - DB_PATH=/work/resource/data.db
       - COMPOSE_DIR=/opt/phanthy-motus
       - CONTAINER_NAME=phanthy-motus-agent-core-1
+      # 所有机器人共用 domain 42：内部 DDS 被 dds-local.xml 锁在 loopback，
+      # 各机器人互相看不见，因此不需要按机分配唯一编号。
       - ROS_DOMAIN_ID=42
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-      - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+      # 取代 FASTDDS_BUILTIN_TRANSPORTS：后者是进程级开关，无法只限制本机；
+      # 且与 profile 里的 useBuiltinTransports=false 冲突。
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     logging:
       driver: local
       options:

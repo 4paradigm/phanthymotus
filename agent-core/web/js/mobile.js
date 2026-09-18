@@ -29,26 +29,20 @@ export function initMobile() {
     sidebarFab.addEventListener('click', _toggleSidebar);
   }
 
-  // Log fab → toggle activity drawer
-  const logFab = document.getElementById('mobile-log-fab');
-  if (logFab) {
-    logFab.addEventListener('click', _toggleLogDrawer);
+  // Every affordance that opens or closes the log goes through one function, so
+  // the two presentations cannot disagree about the current state.
+  for (const id of ['mobile-log-fab', 'monitor-log-btn']) {
+    document.getElementById(id)?.addEventListener('click', toggleLog);
   }
 
-  // Monitor inline log button → same action
-  const monitorLogBtn = document.getElementById('monitor-log-btn');
-  if (monitorLogBtn) {
-    monitorLogBtn.addEventListener('click', _toggleLogDrawer);
-  }
-
-  // Activity strip collapse button → close drawer on mobile
+  // The ▼ inside the header. It sits inside #activity-toggle, which also
+  // listens, so it has to stop the event rather than let both fire and cancel
+  // each other out.
   const collapseBtn = document.getElementById('activity-collapse-btn');
   if (collapseBtn) {
     collapseBtn.addEventListener('click', (e) => {
-      if (!_isMobile) return;
       e.stopPropagation();
-      _closeLogDrawer();
-      if (_overlay) _overlay.classList.remove('active');
+      toggleLog();
     });
   }
 
@@ -231,9 +225,42 @@ function _toggleLogDrawer() {
   }
 }
 
+/**
+ * Open or close the activity log, whichever way this viewport presents it.
+ *
+ * The log has two presentations — a collapsible bottom bar above 768px, a
+ * right-hand drawer at or below it — and each had its own idea of how to close
+ * it. Below 768px the strip is parked off-screen with `translateX(100%)` and the
+ * `collapsed` class is deliberately neutralised, so the bar's own header toggle
+ * was both invisible and inert: measured on a 768x1024 tablet, the header sat at
+ * x=769 with nothing hit-testable there, yet clicking it still wrote
+ * `activity-collapsed: 1`. That flag then travelled to the next desktop session
+ * as a bar that was already shut.
+ *
+ * One entry point for every affordance, so which one the user reaches for stops
+ * mattering.
+ */
+export function toggleLog() {
+  const strip = document.getElementById('activity-strip');
+  if (!strip) return false;
+  if (_isMobile) {
+    _toggleLogDrawer();
+    return strip.classList.contains('mobile-log-open');
+  }
+  const collapsed = !strip.classList.contains('collapsed');
+  strip.classList.toggle('collapsed', collapsed);
+  // Only meaningful for the bottom bar; writing it from drawer mode is what let
+  // a hidden state cross between the two.
+  localStorage.setItem('activity-collapsed', collapsed ? '1' : '0');
+  return !collapsed;
+}
+
 function _closeLogDrawer() {
   const strip = document.getElementById('activity-strip');
   if (strip) strip.classList.remove('mobile-log-open');
+  // The dimming overlay is what makes the rest of the page unclickable, so it
+  // has to go with the drawer. Closing on a breakpoint change left it behind.
+  if (_overlay) _overlay.classList.remove('active');
 }
 
 // ── Detail Panel ─────────────────────────────────────────────────────────────

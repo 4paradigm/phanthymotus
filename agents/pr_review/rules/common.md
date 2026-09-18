@@ -124,6 +124,65 @@ child does not inherit the parent's `sys.stdout`. See
 `phanthymotus/README.md` § Container Logs and
 `phanthymotus-driver/README_dev.md` § Logging.
 
+## Every DDS container carries the loopback profile
+
+Applies to `agent-core`, `perception`, `actucore` and every driver — anything that
+reaches Agent Core over FastDDS. The compose fragment (or
+`agent-core/deploy/docker-compose.yml`) must have both:
+
+```yaml
+volumes:
+  - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+environment:
+  - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+```
+
+`ROS_DOMAIN_ID` is **42 everywhere**; there are no per-robot numbers to allocate.
+`FASTDDS_BUILTIN_TRANSPORTS` must be gone — it is a process-wide switch that cannot
+confine traffic to the local host, and the profile's `useBuiltinTransports=false`
+overrides it anyway, so leaving it in only misleads the next reader.
+
+This exists because `/remote_control/message` — a *command* topic — was reaching every
+robot on the office LAN: an instruction typed on one robot was executed by a second one,
+identical timestamp in both logs. DDS has no addressing and no authentication.
+
+Three things to flag, none of which look like what they are:
+
+1. **A missing mount does not merely leave the container unisolated — it cuts the
+   container off.** With `useBuiltinTransports=false` everywhere else it ends up on a
+   different transport from the rest of the machine and cannot reach Agent Core at all.
+   The symptom is a device that registers over HTTP and shows in the dashboard while none
+   of its topics carry data. If a PR describes that symptom, check the mount first.
+2. **A mistyped mount path fails silently.** Docker creates a *directory* of that name,
+   FastDDS falls back to every interface, nothing is logged. Compare the string exactly.
+3. **Dropping `COPY <component>/deploy/ /deploy/` from a Dockerfile removes the profile
+   too.** Without the fragment in the image, deployment degrades to the legacy
+   `docker run` path, which carries no volumes from it. See the actucore rules.
+
+For drivers, `phanthymotus-driver/scripts/check_service_yml.py` encodes this contract
+plus its two exemption tables; `read_file` it rather than re-deriving the rules. Full
+rationale: `CLAUDE.md` § "DDS is locked to the local host".
+
+## Tests
+
+`agent-core/tests` and `perception/tests` are run inside the images built from
+this PR, and the results are given to you above. They are advisory, not a gate —
+the review is posted either way.
+
+- A **failing** test is a finding: read the test and the code it covers, and say
+  which of the two is wrong. "Tests fail" on its own is not a review.
+- A **passing** suite is not coverage. For a change to behaviour, say whether a
+  test should have been added or changed, and name the file it belongs in
+  (`agent-core/tests/test_<area>.py`, `perception/tests/test_<area>.py`). Both
+  suites are `unittest`-style and locate their code relative to `__file__`, so a
+  new test needs no fixtures, no ROS and no network — `perception/tests/
+  conftest.py` already stubs rclpy through `vision_stubs`.
+- **Do not ask for tests that need hardware, a model download, or a GPU.**
+  Neither suite has any, deliberately, and asking for them produces work the
+  author has to push back on every time.
+- A suite reported as "could not be run" is an agent-side problem. Say nothing
+  about it; it is not a fact about this PR.
+
 ## Correctness, in priority order
 
 1. **Correctness** — bugs, races, unhandled errors, wrong logic. State the

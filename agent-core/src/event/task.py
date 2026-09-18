@@ -40,14 +40,38 @@ def _unregister_check(task_id: str) -> None:
 
 
 class Tools:
+    # task_create 原来还有一个 check_cron 参数，已删。
+    #
+    # 注意：下面这些 docstring 会**原样送进模型的 prompt**（_build_system_tools 拿
+    # fn.__doc__ 当 tool description），所以设计理由只能写在这种注释里 —— 写进 docstring
+    # 等于把刚拿掉的东西又塞回模型眼前。这条是写测试时才发现的：解释性 docstring 里带着
+    # "*/2 * * * *"，测试直接判它还在 prompt 里。
+    #
+    # 为什么删：整份 prompt 里没有任何一句话让模型去建定时检查，唯一的驱动就是那个参数
+    # 描述本身 —— 它给了现成的 "*/2 * * * *" 可抄，又把"留空"写成"则不自动检查"（听起来
+    # 像放弃了什么）。Tianyi 实测模型基本每次都设，于是每 2 分钟被叫醒一次去
+    # subagent_status + task_update，一次两轮、每轮三万多 token，一小时 12 次。
+    #
+    # 它想解决的三件事现在都有人管：子代理干完会自己推 URGENT 通知
+    # （subagent/manager.py 的 _notify_completion，实测 160ms 内到）；卡死有
+    # _timeout_watchdog 兜；用户那边的进度由框架按沉默时长自动播报（event/llm.py）。
+    # 而写进去的 progress 只被环境快照读回来给模型自己看 —— 花两轮 LLM 调用写一句自己
+    # 刚说过的话。
+    #
+    # 能力本身保留，只是不再由模型来建：设置页改任务（api/tasks.py）和方案包声明的任务
+    # （api/solutions.py）仍然可以带 cron，那些是人明确要的；_register_check 也留着，
+    # 重启时要靠它把那些检查恢复回来（event/llm.py 的启动恢复段）。
     @log.function_(call=True)
     async def task_create(self,
         goal: typing.Annotated[str, '任务目标描述（如"走到B点"）'],
-        check_cron: typing.Annotated[str, '定时检查 cron 表达式（如 "*/2 * * * *" 每2分钟），留空则不自动检查'] = '',
     ):
-        """创建一个长时间任务并开始追踪。适用于预计超过30秒的动作（导航、巡逻、等待等）。"""
-        task = task_store.create(goal=goal, check_cron=check_cron)
-        _register_check(task)
+        """创建一个长时间任务并开始追踪。适用于预计超过30秒的动作（导航、巡逻、等待等）。
+
+        纯追踪：任务会出现在你的环境快照里提醒你还有事没完，完成或失败时用 task_done /
+        task_fail 收尾。不会定期叫醒你查进度 —— 子代理干完会自动通知你，进度也会自动
+        播报给用户。
+        """
+        task = task_store.create(goal=goal)
         return f'任务已创建：[{task.id}] {task.goal}'
 
     @log.function_(call=True)

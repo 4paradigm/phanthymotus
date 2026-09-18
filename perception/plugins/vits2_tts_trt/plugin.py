@@ -883,7 +883,10 @@ class TTSPlugin:
             "name": self.NAME,
             "manufacture": "Embodied",
             "model": self._model_name,
-            "engine": "vits2_trt",
+            # No "engine" key. Which engine is live is the facade's to report
+            # (plugins/tts.py) — it is the only thing that knows. A hardcoded
+            # "vits2_trt" here outlived the rename to <model>-<languages> and was
+            # what the dashboard displayed, a value not in the configSchema enum.
             "desc": self.DESC,
         }
         base.update(extra)

@@ -22,20 +22,33 @@ _TOOL_CONFIG_PREFIX = 'tool_config:'
 
 # ── Editor Lock State (in-memory, resets on restart) ─────────────────────────
 #
-# The lock's lifetime is tied to the holder's /ws/motus connection, not to a
-# browser unload handler: beforeunload/pagehide never fire on a killed process,
-# a reclaimed mobile tab or a crashed page, and sendBeacon may be dropped — so a
-# closed tab used to hold the canvas hostage until the TTL expired. api/motus_stream
-# reports connect/disconnect here; a disconnect releases the lock after a short
-# grace period, and a *live* connection means the lock never times out (an editor
-# staring at the canvas without touching it is not idle).
+# The lock expires on *idleness*: 60s without a real user action frees it, even
+# if the holder's tab is still open. An earlier version keyed the lifetime off the
+# holder's /ws/motus connection instead and never timed out a live one, which meant
+# a tab left open on the canvas held it hostage indefinitely — the bug this replaces.
+# Idleness is measured from real actions only (claim, layout write, /keep-edit,
+# which the frontend fires from actual pointer/key/wheel input); a poll must never
+# renew it or an open tab renews forever, which is how the old TTL was defeated.
+#
+# WS liveness is still tracked, but now only to release *faster* than the TTL when
+# a tab goes away: api/motus_stream reports connect/disconnect here and a disconnect
+# releases after a short grace period. It can no longer keep a lock alive. That
+# matters because beforeunload/pagehide never fire on a killed process, a reclaimed
+# mobile tab or a crashed page, and sendBeacon may be dropped.
 
 _editor_session: Optional[str] = None   # session_id of current editor
-_editor_last_seen: float = 0.0          # monotonic timestamp of last activity
-_EDITOR_TIMEOUT = 60.0                  # TTL fallback for sessions with no live WS
+_editor_last_seen: float = 0.0          # monotonic timestamp of last real action
+_EDITOR_TIMEOUT = 60.0                  # idle seconds before the lock auto-releases
 
 _live_sessions: dict[str, int] = {}     # session_id → open /ws/motus count
 _DISCONNECT_GRACE = 8.0                 # seconds to tolerate a WS reconnect flap
+
+_SWEEP_INTERVAL = 10.0                  # background expiry check cadence
+
+# Why the lock was last freed. Mirrored into /edit-status so a client that missed
+# the canvas_editor push (WS down — the very case the poll exists for) can still
+# tell "you idled out" from "someone released it".
+_last_release_reason = ''
 
 _layout_rev = 0                         # bumped on every canvas_layout write
 
@@ -58,6 +71,9 @@ def _broadcast(event: dict) -> None:
 
 def _broadcast_editor(reason: str) -> None:
     """Tell every client who holds the lock now (None = free)."""
+    global _last_release_reason
+    if _editor_session is None:
+        _last_release_reason = reason
     _broadcast({'type': 'canvas_editor',
                 'payload': {'editor': _editor_session, 'reason': reason}})
 
@@ -75,18 +91,42 @@ def notify_layout_changed(session_id: str = '') -> None:
 
 
 def _check_editor_expired():
-    """Release the lock if its holder is gone.
+    """Release the lock if its holder has been idle past the TTL.
 
-    A session with a live /ws/motus never expires; the TTL only covers holders we
-    have no connection for (WS never established, or an old client).
+    Deliberately does *not* consult _live_sessions: an open tab is not an active
+    editor, and letting a live WS veto expiry is exactly what made the lock
+    un-releasable. Only real actions push _editor_last_seen forward.
     """
     global _editor_session, _editor_last_seen
-    if not _editor_session or _live_sessions.get(_editor_session):
+    if not _editor_session:
         return
     if (time.monotonic() - _editor_last_seen) > _EDITOR_TIMEOUT:
         _editor_session = None
         _editor_last_seen = 0.0
-        _broadcast_editor('timeout')
+        _broadcast_editor('idle')
+
+
+async def _editor_sweeper() -> None:
+    """Expire idle locks even when nothing is polling.
+
+    _check_editor_expired is otherwise lazy, and the frontend's status poll lives
+    in a setInterval that browsers throttle hard once the tab is backgrounded — so
+    the one tab that most needs its lock reaped is the least likely to ask.
+    """
+    while True:
+        await asyncio.sleep(_SWEEP_INTERVAL)
+        try:
+            _check_editor_expired()
+        except Exception:
+            pass                        # a sweep failure must not kill the loop
+
+
+def start_editor_sweeper() -> None:
+    """Launch the sweeper; called from start.py's lifespan."""
+    try:
+        asyncio.create_task(_editor_sweeper())
+    except RuntimeError:
+        pass                            # no loop (tests, import-time) — lazy checks still apply
 
 
 def session_connected(session_id: str) -> None:
@@ -250,18 +290,34 @@ async def release_edit(request: fastapi.Request):
     return {'code': 200}
 
 
-@router.get('/edit-status')
-async def edit_status(session_id: str = ''):
-    """Check who is currently editing.
+@router.post('/keep-edit')
+async def keep_edit(body: dict = fastapi.Body(...)):
+    """Renew the idle TTL. Sent by the frontend on real user input, throttled.
 
-    Passing your own session_id also refreshes the TTL — the frontend's 10s poll
-    thus acts as a heartbeat while the /ws/motus connection is down.
+    This is the only heartbeat — /edit-status deliberately does not renew, because
+    it is polled unconditionally and would keep any open tab's lock alive forever.
     """
     global _editor_last_seen
     _check_editor_expired()
-    if session_id and session_id == _editor_session:
-        _editor_last_seen = time.monotonic()
+
+    session_id = body.get('session_id', '')
+    if not session_id or _editor_session != session_id:
+        # Already expired or taken — a ping cannot resurrect it, the client has to
+        # re-claim. Returning the real holder lets it fix its local state in place.
+        return fastapi.responses.JSONResponse(
+            status_code=409, content={'code': 409, 'message': 'Not the current editor',
+                                      'editor': _editor_session})
+
+    _editor_last_seen = time.monotonic()
     return {'code': 200, 'editor': _editor_session}
+
+
+@router.get('/edit-status')
+async def edit_status(session_id: str = ''):
+    """Check who is currently editing. Pure query — does not renew the TTL."""
+    _check_editor_expired()
+    return {'code': 200, 'editor': _editor_session,
+            'reason': '' if _editor_session else _last_release_reason}
 
 
 # ── Layout Endpoints ─────────────────────────────────────────────────────────

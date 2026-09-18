@@ -202,3 +202,175 @@ def test_pick_weights_falls_back_to_last_candidate(tmp_path):
 
 def test_pick_weights_with_no_candidates(tmp_path):
     assert onnx_provider.pick_weights(str(tmp_path)) == ""
+
+
+# ── standalone onnxruntime ───────────────────────────────────────────────────
+# A separate build from the one inside the sherpa-onnx wheel, so it needs its
+# own probe and its own tests — cuda_available() must not influence these.
+
+def _install_fake_ort(monkeypatch, providers):
+    """Install a fake `onnxruntime`, or remove it when providers is None."""
+    onnx_provider.onnxruntime_providers.cache_clear()
+    if providers is None:
+        monkeypatch.setitem(sys.modules, "onnxruntime", None)
+        return
+    module = types.ModuleType("onnxruntime")
+    module.get_available_providers = lambda: list(providers)
+    monkeypatch.setitem(sys.modules, "onnxruntime", module)
+
+
+def test_ort_providers_empty_when_not_installed(monkeypatch):
+    _install_fake_ort(monkeypatch, None)
+    assert onnx_provider.onnxruntime_providers() == ()
+
+
+def test_ort_missing_package_raises_rather_than_degrading(monkeypatch):
+    """There is nothing to degrade to; the plugin turns this into error state."""
+    _install_fake_ort(monkeypatch, None)
+    with pytest.raises(ImportError, match="onnxruntime is not installed"):
+        onnx_provider.ort_providers_for_device("cpu")
+
+
+def test_ort_cpu_device(monkeypatch):
+    _install_fake_ort(monkeypatch, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    assert onnx_provider.ort_providers_for_device("cpu") == ["CPUExecutionProvider"]
+
+
+def test_ort_gpu_uses_cuda_with_a_cpu_fallback(monkeypatch):
+    _install_fake_ort(monkeypatch, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    assert onnx_provider.ort_providers_for_device("gpu") == [
+        "CUDAExecutionProvider", "CPUExecutionProvider",
+    ]
+
+
+def test_ort_gpu_degrades_to_cpu_on_the_cpu_only_wheel(monkeypatch, caplog):
+    """The shipped image carries the CPU wheel; device: gpu must still work."""
+    _install_fake_ort(monkeypatch, ["CPUExecutionProvider"])
+    with caplog.at_level("WARNING"):
+        assert onnx_provider.ort_providers_for_device("gpu") == ["CPUExecutionProvider"]
+    assert any("no GPU provider" in record.getMessage() for record in caplog.records)
+
+
+# ── device: auto ─────────────────────────────────────────────────────────────
+
+def test_auto_prefers_the_gpu_when_there_is_one(monkeypatch):
+    _install_fake_ort(monkeypatch, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    assert onnx_provider.ort_providers_for_device("auto") == [
+        "CUDAExecutionProvider", "CPUExecutionProvider",
+    ]
+
+
+def test_auto_falls_back_to_cpu_silently(monkeypatch, caplog):
+    """cpu is the expected outcome on a CPU-wheel image, not a misconfiguration,
+    so auto must not cry wolf on every robot."""
+    _install_fake_ort(monkeypatch, ["CPUExecutionProvider"])
+    with caplog.at_level("WARNING"):
+        assert onnx_provider.ort_providers_for_device("auto") == ["CPUExecutionProvider"]
+    assert not caplog.records
+
+
+def test_auto_is_the_default_for_an_empty_device(monkeypatch):
+    _install_fake_ort(monkeypatch, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    for value in ("", None, "  "):
+        assert onnx_provider.ort_providers_for_device(value)[0] == "CUDAExecutionProvider"
+
+
+def test_auto_takes_tensorrt_when_cuda_is_absent(monkeypatch):
+    _install_fake_ort(monkeypatch,
+                      ["TensorrtExecutionProvider", "CPUExecutionProvider"])
+    assert onnx_provider.ort_providers_for_device("auto")[0] == "TensorrtExecutionProvider"
+
+
+def test_explicit_cpu_never_takes_the_gpu(monkeypatch):
+    _install_fake_ort(monkeypatch, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    assert onnx_provider.ort_providers_for_device("cpu") == ["CPUExecutionProvider"]
+
+
+def test_unknown_ort_device_warns_and_uses_cpu(monkeypatch, caplog):
+    _install_fake_ort(monkeypatch, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    with caplog.at_level("WARNING"):
+        assert onnx_provider.ort_providers_for_device("tpu") == ["CPUExecutionProvider"]
+    assert any("unknown device" in r.getMessage() for r in caplog.records)
+
+
+# ── parked cores (the onnxruntime 1.19.x abort) ──────────────────────────────
+
+def test_cpu_topology_parses_sysfs_ranges(monkeypatch, tmp_path):
+    (tmp_path / "present").write_text("0-11\n")
+    (tmp_path / "online").write_text("0-7\n")
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):
+        name = str(path)
+        if name.startswith("/sys/devices/system/cpu/"):
+            return real_open(tmp_path / name.rsplit("/", 1)[-1], *args, **kwargs)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert onnx_provider.cpu_topology() == (12, 8)
+
+
+def test_cpu_topology_parses_comma_lists(monkeypatch, tmp_path):
+    (tmp_path / "present").write_text("0-3,8-11\n")
+    (tmp_path / "online").write_text("0-3,8\n")
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):
+        name = str(path)
+        if name.startswith("/sys/devices/system/cpu/"):
+            return real_open(tmp_path / name.rsplit("/", 1)[-1], *args, **kwargs)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert onnx_provider.cpu_topology() == (8, 5)
+
+
+def test_cpu_topology_is_zero_when_sysfs_is_absent(monkeypatch):
+    def fake_open(path, *args, **kwargs):
+        raise OSError("no sysfs")
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert onnx_provider.cpu_topology() == (0, 0)
+
+
+def test_warn_on_parked_cores_only_fires_when_they_differ(monkeypatch, caplog):
+    """Tianyi in MODE_30W: present 0-11, online 0-7 — the precondition for the
+    1.19.x abort, which leaves no Python traceback to diagnose."""
+    monkeypatch.setattr(onnx_provider, "cpu_topology", lambda: (12, 8))
+    with caplog.at_level("WARNING"):
+        onnx_provider.warn_on_parked_cores("face")
+    assert any("12 CPUs present but only 8 online" in r.getMessage()
+               for r in caplog.records)
+
+    caplog.clear()
+    monkeypatch.setattr(onnx_provider, "cpu_topology", lambda: (6, 6))
+    with caplog.at_level("WARNING"):
+        onnx_provider.warn_on_parked_cores("face")
+    assert not caplog.records
+
+
+def test_ort_gpu_accepts_tensorrt_when_cuda_is_absent(monkeypatch):
+    _install_fake_ort(monkeypatch,
+                      ["TensorrtExecutionProvider", "CPUExecutionProvider"])
+    assert onnx_provider.ort_providers_for_device("gpu") == [
+        "TensorrtExecutionProvider", "CPUExecutionProvider",
+    ]
+
+
+def test_ort_probe_survives_a_broken_install(monkeypatch):
+    onnx_provider.onnxruntime_providers.cache_clear()
+    module = types.ModuleType("onnxruntime")
+
+    def explode():
+        raise RuntimeError("libonnxruntime.so: undefined symbol")
+
+    module.get_available_providers = explode
+    monkeypatch.setitem(sys.modules, "onnxruntime", module)
+    assert onnx_provider.onnxruntime_providers() == ()
+
+
+def test_ort_probe_is_independent_of_the_sherpa_wheel(monkeypatch, tmp_path):
+    """cuda_available() describes sherpa's runtime, not this one."""
+    _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
+    _install_fake_ort(monkeypatch, ["CPUExecutionProvider"])
+    assert onnx_provider.cuda_available() is True
+    assert onnx_provider.ort_providers_for_device("gpu") == ["CPUExecutionProvider"]

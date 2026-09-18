@@ -86,6 +86,11 @@ class BuildTarget(str, Enum):
 SUPPORTED_JP_VERSIONS = ("5.11", "6.1")
 DEFAULT_JP_VERSION = "5.11"
 
+# The targets a JetPack version means something for — `worker._build_plan`
+# expands exactly these over the requested versions. Core and drivers have no
+# variant, so a version token next to them is noise.
+JP_VARIANT_TARGETS = frozenset({"perception", "actucore"})
+
 
 # Statuses from which a job will never advance. Plain strings, because the
 # store hands back rows where status is a string, not an enum member.
@@ -123,6 +128,7 @@ class Stage(str, Enum):
     WORKTREE = "preparing worktree"
     DETECTING = "detecting changes"
     BUILDING = "building"
+    TESTING = "running tests"
     RULE_CHECKS = "running rule checks"
     LLM_REVIEW = "generating review"
     POSTING = "posting results"
@@ -162,6 +168,51 @@ class BuildResult:
 
     def label(self) -> str:
         return build_label(self.target, self.driver_path, self.variant)
+
+
+@dataclass
+class TestResult:
+    """One test suite run inside the image built from this PR.
+
+    `status` is five-valued rather than a `success: bool` because the outcomes
+    are acted on differently and collapsing them misattributes blame:
+
+        None       still running (placeholder row, same trick as BuildResult)
+        "passed"   pytest exited 0
+        "failed"   tests ran and some failed — the PR's problem
+        "error"    pytest never produced a usable result: the image could not
+                   be pulled, pytest could not be installed, collection blew
+                   up. The agent's problem, and reporting it as "failed" would
+                   put an infrastructure outage on the author's PR
+        "skipped"  not run at all, `skip_reason` says why (usually: this PR
+                   built no image for that component)
+    """
+
+    component: str  # "agent-core" | "perception"
+    status: str | None
+    # Which image it ran in. Recorded so the comment can say *what* was tested:
+    # a green suite means nothing without the ref it ran against.
+    image_tag: str = ""
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    total: int = 0
+    # "tests/test_x.py::TestY::test_z", from the junit XML. The counts say how
+    # bad it is; these say where to look.
+    failing_ids: list[str] = field(default_factory=list)
+    # Assertion output for the first few failures, for the reviewer's context.
+    failure_text: str = ""
+    log_tail: str = ""
+    log_path: str = ""
+    duration_seconds: float | None = None
+    # Same contract as BuildResult: "idle" | "cap" | "". A killed suite is not
+    # a failing suite.
+    timeout_kind: str = ""
+    skip_reason: str = ""
+
+    def label(self) -> str:
+        return f"{self.component} tests"
 
 
 def build_label(
@@ -205,6 +256,7 @@ class ReviewJob:
     # Options parsed from the command
     skip_build: bool = False
     build_only: bool = False
+    skip_tests: bool = False
     force_targets: list[str] = field(default_factory=list)  # e.g. ["core"]
     # JetPack versions to build perception for, in the order requested. Empty
     # means the default; two entries mean two images from one job.
@@ -221,6 +273,7 @@ class ReviewJob:
     attempt: int = 0
     attempt_errors: list[str] = field(default_factory=list)
     build_results: list[BuildResult] = field(default_factory=list)
+    test_results: list[TestResult] = field(default_factory=list)
     review_text: str = ""
     # Rule-check findings as plain dicts, so they survive persistence and can
     # be rendered by the dashboard rather than only formatted into a comment.
@@ -284,15 +337,32 @@ TRIGGER = "/request_bot_review"
 # A JetPack version token: `jetson-5.11`, `jetson-jp6.1`, `jp5.11`, or the bare
 # version. Only perception has variants, so no target prefix is required — and a
 # version on its own is taken as a request to build perception.
-JP_TOKEN_PATTERN = re.compile(r"^(?:jetson-)?(?:jp)?(\d+\.\d+)$", re.IGNORECASE)
+#
+# The dot is optional, because the help message advertises `jp511` / `jp61` and
+# that is what people type. Requiring it meant `/request_bot_review force
+# perception jp61` — the help's own combining example — parsed to no variant at
+# all and silently built the 5.11 default.
+JP_TOKEN_PATTERN = re.compile(r"^(?:jetson-)?(?:jp)?(\d+(?:\.\d+)?)$", re.IGNORECASE)
+
+# Dotless spellings, resolved against the supported set rather than by splitting
+# digits: `511` is 5.11 only because 5.11 is a version we have, and guessing
+# between 5.11 and 51.1 from the string alone is not something to invent.
+JP_VERSION_BY_DIGITS = {v.replace(".", ""): v for v in SUPPORTED_JP_VERSIONS}
+
+
+def normalize_jp_version(raw: str) -> str | None:
+    """Map a parsed JetPack token to a supported version, or None if unknown."""
+    if raw in SUPPORTED_JP_VERSIONS:
+        return raw
+    return JP_VERSION_BY_DIGITS.get(raw.replace(".", ""))
 
 
 def parse_trigger_command(comment_body: str) -> dict | None:
     """Parse a `/request_bot_review` command out of a comment body.
 
-    Returns {"skip_build", "build_only", "force", "force_targets",
-    "perception_variants"}, or None when the comment does not contain the
-    trigger.
+    Returns {"skip_build", "build_only", "skip_tests", "force", "force_targets",
+    "perception_variants", "help"}, or None when the comment does not contain
+    the trigger.
     """
     if not comment_body:
         return None
@@ -308,9 +378,11 @@ def parse_trigger_command(comment_body: str) -> dict | None:
         result = {
             "skip_build": False,
             "build_only": False,
+            "skip_tests": False,
             "force": False,
             "force_targets": [],
             "perception_variants": [],
+            "help": False,
         }
         for arg in args:
             token = arg.strip().strip("`,")
@@ -319,14 +391,23 @@ def parse_trigger_command(comment_body: str) -> dict | None:
                 result["skip_build"] = True
             elif lowered == "build-only":
                 result["build_only"] = True
+            elif lowered == "skip-tests":
+                result["skip_tests"] = True
             elif lowered in ("force", "--force", "-f"):
                 # Re-review a commit that was already reviewed.
                 result["force"] = True
-            elif lowered in ("core", "perception"):
+            elif lowered in ("help", "-h", "--help"):
+                result["help"] = True
+            elif lowered in ("core", "perception", "actucore"):
+                # actucore was accepted by worker._parse_forced_targets but not
+                # here, so `/request_bot_review actucore` parsed to an empty
+                # force list and silently did nothing.
                 result["force_targets"].append(lowered)
             elif JP_TOKEN_PATTERN.match(lowered):
-                version = JP_TOKEN_PATTERN.match(lowered).group(1)
-                if version not in SUPPORTED_JP_VERSIONS:
+                version = normalize_jp_version(
+                    JP_TOKEN_PATTERN.match(lowered).group(1)
+                )
+                if version is None:
                     # Dropped rather than passed through: the build script exits
                     # 1 on an unknown version, which would fail the whole job.
                     # The build-in-progress comment lists what will actually be
@@ -338,13 +419,26 @@ def parse_trigger_command(comment_body: str) -> dict | None:
                     continue
                 if version not in result["perception_variants"]:
                     result["perception_variants"].append(version)
-                # Asking for a version is asking for perception: the token means
-                # nothing for any other target.
-                if "perception" not in result["force_targets"]:
-                    result["force_targets"].append("perception")
             elif "/" in token:
                 # A driver path such as unitree/g1
                 result["force_targets"].append(token)
+            else:
+                # Never drop a token in silence. The whole point of this bug was
+                # that an unrecognised argument left no trace anywhere: the job
+                # ran, succeeded, and built something the requester did not ask
+                # for.
+                logger.warning(
+                    f"Ignoring unrecognised {TRIGGER} argument {token!r}"
+                )
+
+        # A version on its own means perception — but only when nothing else
+        # that has JetPack variants was named. Applied inside the loop it also
+        # fired for `actucore jp6.1`, which then built perception too: an
+        # unasked-for image, and for jp6.1 an expensive one.
+        if result["perception_variants"] and not (
+            set(result["force_targets"]) & JP_VARIANT_TARGETS
+        ):
+            result["force_targets"].append("perception")
         return result
 
     return None

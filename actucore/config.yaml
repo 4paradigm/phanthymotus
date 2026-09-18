@@ -57,3 +57,161 @@ plugins:
         api_key: ""
         model: "doubao-seed-2-1-pro-260628"
         timeout_sec: 18.0
+  vla:
+    # enabled 只决定这张卡片**出不出现**在工具列表和侧边栏里，不决定它动不动。
+    # 关闭后只隐藏 VLA；navigation 的启用状态独立配置。
+    #
+    # 真正的门槛都在别处：
+    #   1. 必须在画布上把它的输出连到一张驱动命令卡片（control/* 端口），
+    #      否则 start 拿不到下游动作空间，直接拒绝；
+    #   2. 协商不通过（动作维度、频率对不上）同样拒绝启动；
+    #   3. 每一条指令还要过驱动侧 ControlSink 的检查链。
+    # 容器重启也不会让它自己跑起来（bundle 的 start() 是空的）。
+    enabled: true
+    # provider 由 plugins/vla/providers/ 目录发现，不写死在这里。
+    # 本地一个模型一个（按模型名），远端统一一个。
+    #   mock       正弦轨迹，无模型、无网络、无 GPU —— 验证通路用
+    #   smolvla    LeRobot SmolVLA，本机推理（只有 jp6.1 的镜像有）
+    #   vla_cloud  任何跑在别处的模型，只配 endpoint + key + model
+    provider: mock
+    topic: /actucore/vla/cmd
+    # 留空则取 min(模型 control_hz, 下游 expected_hz)，再被下游 max_hz 夹住。
+    rate_hz: null
+    # 指令流的优先级。遥控器一类应当高于策略，驱动侧 ControlSink 据此仲裁。
+    priority: 50
+    # ACP 物理通道，决定这张卡片和谁互斥。只是**协商之前**的占位：
+    # start 之后以下游 descriptor 的 groups 为准（天轶是 arm_l/arm_r/hand_l/hand_r），
+    # agent-core 在心跳时会重新读 schema，拿到真实的那一组。
+    resource: arm
+
+    # ── provider: mock ───────────────────────────────────────────────────
+    # 正弦幅度是各关节半行程的比例，默认很小。
+    amplitude: 0.05
+    period_s: 8.0
+    chunk_size: 10
+
+    # ── provider: vla_cloud（远端）────────────────────────────────────────
+    # 和 agent-core 配 LLM 是同一个形状：地址 + key + 模型名，没有别的。
+    # 注意它说的是我们自己的 motus.vla/1 协议，不是 openpi 的 WebSocket 或
+    # LeRobot 的 gRPC —— 翻译在服务端（phanthymotus-cloud）做，机器人这侧
+    # 不背每种服务器一个适配器。
+    #
+    # 这三项只在 provider = vla_cloud 时显示（schema 里的 x-show-when）：
+    # 本机 provider 旁边填着一个 endpoint，看起来像配好了，实际被忽略。
+    endpoint: ""
+    api_key: ""
+    # 服务端认得的模型名，自由填写 —— 这些名字住在服务端，不是我们能枚举的。
+    # 和下面本机的 model_name 是**两个字段**，因为表单把 enum 渲染成 <select>：
+    # 一个字段同时承载两者的话，选了 vla_cloud 就只能从本机 checkpoint 里挑，
+    # 反而填不了服务端的名字。
+    cloud_model_name: ""
+    # 每次请求的超时——是"放弃的时刻"，不是预期延迟。
+    # 回包迟到不是安全问题：驱动会丢掉观测年龄超过 descriptor 里 max_obs_age_ms
+    # 的指令（当前 300ms），而它的 watchdog 早已让机械臂保持住了。超时设得过大
+    # 只是让"端点已经死了"这件事更晚被发现，所以没必要远高于那个年龄上限。
+    timeout_ms: 500
+
+    # ── 选哪个 checkpoint ────────────────────────────────────────────────
+    # 本机 provider 从下面 models: 里挑（远端的是上面的 cloud_model_name）。
+    # 开源发布的沿用上游原名；为某台机器人微调过的用带机器人名的名字，
+    # 因为"它适配的动作空间"正是操作员必须搞对的东西。
+    #
+    # 说明写在这里而不是 schema 的 description 里：表单的标签是
+    # `title || description || key` 且没有单独的提示位，写在那里会把字段名顶掉。
+    model_name: smolvla_base
+
+    models:
+      # 上游原版：SO-100/SO-101 的 6 维，驱动不了天轶（26 维），协商会拒绝。
+      # 留在这里是因为它是唯一公开可得、能验证整条本机推理链路的 checkpoint。
+      smolvla_base:
+        model_dir: /models/vla/smolvla_base
+        weights:
+          # 两条源，机器自己挑。下载器按**最大的那个文件**做一次 Range 探测，
+          # 快的先用，失败则顺延。多源之所以安全，是因为每个文件都 pin 了
+          # size+sha256 —— 校验与来源无关，所以换源不降低任何保证。
+          base_url:
+            - https://www.modelscope.cn/api/v1/models/lerobot/smolvla_base/repo?Revision=master&FilePath={file}
+            - https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/vla/smolvla_base
+          files:
+            config.json:
+              size: 2299
+              sha256: "650584b56c104720f7a3c91d1ec6bec9e8de8ac11e60c92ba2fa82d93eda147d"
+            model.safetensors:
+              size: 906712520
+              sha256: "7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb"
+            policy_preprocessor.json:
+              size: 1872
+              sha256: "7683d648280a72f0d51e869fb8dd1596beed90b7f84849330cf1bc26634a4bd6"
+            policy_postprocessor.json:
+              size: 660
+              sha256: "2b78bb742065288df2ec63b0ee35f97a1f6950171cf2272f7e34b1fe3873b17b"
+            policy_preprocessor_step_5_normalizer_processor.safetensors:
+              size: 640
+              sha256: "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
+            policy_postprocessor_step_0_unnormalizer_processor.safetensors:
+              size: 640
+              sha256: "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
+        # smolvla_base 的 config.json 期望 observation.images.camera1/2/3 和
+        # observation.state（各 6 维）。缺哪个就报哪个，不会拿黑图去推理。
+        feature_map: {}
+        #   main:  observation.images.camera1
+        #   wrist: observation.images.camera2
+        #   state: observation.state
+
+      # 微调版按同样的形状加在这里，各自一份 weights 清单：
+      # smolvla_tianyi:
+      #   model_dir: /models/vla/smolvla_tianyi
+      #   weights: {base_url: [...], files: {...}}
+      #   feature_map: {main: observation.images.camera1, state: observation.state}
+
+    # ── provider: smolvla（本机）──────────────────────────────────────────
+    # 需要镜像带 lerobot，即 jp6.1 的 jetson-base-actucore。jp5.11 上会在
+    # start 时明确拒绝并说明原因（CUDA 11.4 撑不住 torch >= 2.2.1）。
+    device: cuda
+    vlm_weights:
+      base_url:
+        - https://www.modelscope.cn/api/v1/models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct/repo?Revision=master&FilePath={file}
+        - https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/vla/smolvlm2_500m
+      files:
+        added_tokens.json:
+          size: 4739
+          sha256: "74135b8664b56088c0006f1c8e848d79a8eba003411f72ebf1dc2ee96227be3a"
+        chat_template.json:
+          size: 430
+          sha256: "b585e3598909a5687f9f9d738d35223724dedef256b9b274e1cbfb32b13c74bf"
+        config.json:
+          size: 3767
+          sha256: "ea6bc1237e96247f6258de3e202e2e62b93d6f386dc47e7b36b5588bf3a15e17"
+        generation_config.json:
+          size: 136
+          sha256: "34835060c9f0f74d1acb456cc72ca32746d3843d9eb5f578f9cbffac1d2eb840"
+        merges.txt:
+          size: 466391
+          sha256: "0b54e8aa4e53d5383e2e4bc635a56b43f9647f7b13832d5d9ecd8f82dac4f510"
+        model.safetensors:
+          size: 2029990624
+          sha256: "b9bfd456c9472c0acd5719d6e514c4b859891af205ee1a736552fd3497b8b0c3"
+        preprocessor_config.json:
+          size: 599
+          sha256: "149e315d9410368e5491455bb06e0f763426e9e56cca731c13b24404a29b6374"
+        processor_config.json:
+          size: 67
+          sha256: "f3ad45028447b3562b4752be0d5916d6806c1ef589091a469608dcf0faa1737c"
+        special_tokens_map.json:
+          size: 868
+          sha256: "2dfea2a426162316ff1567c82bc6d36d9690cd9f90455f075c77daca78b45c60"
+        tokenizer.json:
+          size: 3548256
+          sha256: "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a"
+        tokenizer_config.json:
+          size: 28626
+          sha256: "dd9ce2ab89a3dd881bd9378f1a79b943a064b9275a7e1706d5b7b47b68977913"
+        vocab.json:
+          size: 800662
+          sha256: "82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79"
+
+  # nav:
+  #   enabled: true
+  #   map_dir: /models/maps
+  #
+  # 卡片名要和 main.py 里 ActuCoreBundle 的注册块、以及插件的 PREFIX 对上。

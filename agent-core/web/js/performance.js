@@ -32,6 +32,9 @@ function _guessComponent(span) {
 
 let _refreshTimer = null;
 let _currentRange = '24h';
+// 内容没变就不重画，否则每 3 秒一次的自动刷新会把展开的行和滚动位置抖一遍。
+let _summarySig = '';
+let _waterfallSig = '';
 
 export function initPerformance() {
   const overlay = document.getElementById('performance-overlay');
@@ -55,10 +58,15 @@ export function initPerformance() {
 function _open() {
   document.getElementById('performance-overlay')?.classList.remove('hidden');
   _load();
+  // 打开期间持续刷新。以前 _refreshTimer 声明了却从来没被赋值，面板停在打开那一刻，
+  // 正在跑的 turn 要关掉重开才看得到。
+  if (_refreshTimer) clearInterval(_refreshTimer);
+  _refreshTimer = setInterval(_load, 3000);
 }
 
 function _close() {
   document.getElementById('performance-overlay')?.classList.add('hidden');
+  _summarySig = _waterfallSig = '';
   if (_refreshTimer) { clearInterval(_refreshTimer); _refreshTimer = null; }
 }
 
@@ -99,8 +107,12 @@ function _renderSummary(agg) {
 
   if (!agg || agg.count === 0) {
     el.innerHTML = '<div class="perf-empty">暂无数据</div>';
+    _summarySig = '';
     return;
   }
+  const sig = JSON.stringify(agg);
+  if (sig === _summarySig) return;
+  _summarySig = sig;
 
   const bySpan = agg.by_span || {};
   const spanNames = Object.keys(bySpan);
@@ -168,12 +180,18 @@ function _renderWaterfall(turns) {
 
   if (!turns.length) {
     el.innerHTML = '<div class="perf-empty">暂无记录</div>';
+    _waterfallSig = '';
     return;
   }
+  const sig = JSON.stringify(turns);
+  if (sig === _waterfallSig) return;
+  _waterfallSig = sig;
 
   const rows = turns.map((t, idx) => {
     const spans = (t.spans || []).filter(s => s.span !== 'turn_total');
-    const timeStr = new Date(t.created_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const timeStr = new Date(t.created_at * 1000).toLocaleTimeString('zh-CN', {
+      timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
     const text = (t.trigger_text || '').replace(/<[^>]*>/g, '').replace(/\{[^}]*\}/g, '').trim().slice(0, 25);
     const totalMs = t.total_duration_ms || 0;
 

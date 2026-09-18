@@ -7,6 +7,35 @@
 import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 
+/**
+ * 分区图标。
+ *
+ * 原来这四层用的是 ◆ ◈ ❋ 这类几何字符 —— 它们的形状、粗细、基线全由字体决定，
+ * 和顶栏那套 24×24、stroke 1.8、round cap 的图标不是一回事，挤在 10px 标签旁边
+ * 尤其显得廉价。这里改成同一族的描边图标，各自画的是这一层真正在做的事：
+ *
+ *   agentcore  芯片 —— 做决定的那颗核
+ *   perception 眼睛 —— 这一层负责"接收"
+ *   actucore   闪电 —— 这一层负责"动"
+ *   driver     插头 —— 通往某台具体硬件的那根线
+ *
+ * driver 的颜色继续表示在线状态（原来由圆点承担），所以侧栏收起成窄条时，一眼
+ * 既看得出这是台设备，也看得出它活着没有。
+ */
+const _ICON_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+
+const ICONS = {
+  agentcore: `<svg ${_ICON_ATTRS}><rect x="7.5" y="7.5" width="9" height="9" rx="1.8"/>` +
+    `<path d="M9.8 3.2v4.3M14.2 3.2v4.3M9.8 16.5v4.3M14.2 16.5v4.3` +
+    `M3.2 9.8h4.3M3.2 14.2h4.3M16.5 9.8h4.3M16.5 14.2h4.3"/></svg>`,
+  perception: `<svg ${_ICON_ATTRS}><path d="M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12z"/>` +
+    `<circle cx="12" cy="12" r="2.6"/></svg>`,
+  actucore: `<svg ${_ICON_ATTRS}><path d="M13.2 2.5 5 13.8h5.6L9.8 21.5 18 10.2h-5.6l.8-7.7z"/></svg>`,
+  driver: `<svg ${_ICON_ATTRS}><path d="M9 2.8v5.4M15 2.8v5.4"/>` +
+    `<path d="M5.6 8.2h12.8v3.2a6.4 6.4 0 0 1-12.8 0V8.2z"/><path d="M12 17.8v3.4"/></svg>`,
+};
+
 let _scroll = null;
 let _empty  = null;
 let _backdrop = null;
@@ -30,8 +59,43 @@ export function initSidebar() {
     searchInput.addEventListener('input', () => _onSearchInput(searchInput.value));
   }
 
+  _initCollapse();
+
   // Load saved tool configs
   _loadToolConfigs();
+}
+
+/**
+ * Collapse the sidebar to a rail.
+ *
+ * 280px is a third of a tablet in portrait, and most of the time the canvas is
+ * what you are looking at. Shut, the panel keeps a rail of the section status
+ * dots rather than disappearing: the toggle stays in the same place whichever
+ * state it is in, and which devices are up is still readable.
+ *
+ * Below 768px the sidebar is a drawer that the fab already opens and closes, so
+ * this control is hidden there and the flag is left alone — it belongs to the
+ * wide layout and should survive a trip through a narrow one.
+ */
+function _initCollapse() {
+  const sidebar = document.getElementById('sidebar');
+  const btn = document.getElementById('sidebar-collapse-btn');
+  if (!sidebar || !btn) return;
+
+  const apply = (on) => {
+    sidebar.classList.toggle('collapsed', on);
+    btn.setAttribute('aria-expanded', on ? 'false' : 'true');
+    btn.title = on ? '展开侧栏' : '收起侧栏';
+    btn.setAttribute('aria-label', btn.title);
+  };
+
+  apply(localStorage.getItem('sidebar-collapsed') === '1');
+
+  btn.addEventListener('click', () => {
+    const on = !sidebar.classList.contains('collapsed');
+    apply(on);
+    localStorage.setItem('sidebar-collapsed', on ? '1' : '0');
+  });
 }
 
 async function _loadToolConfigs() {
@@ -83,14 +147,14 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   // Perception section
   if (perceptions.length) {
     _scroll.appendChild(_buildMergedSection(perceptions, {
-      cls: 'sidebar-section-perception', icon: '◈', label: '感知',
+      cls: 'sidebar-section-perception', icon: ICONS.perception, label: '感知',
     }));
   }
 
   // ActuCore section
   if (actucores.length) {
     _scroll.appendChild(_buildMergedSection(actucores, {
-      cls: 'sidebar-section-actucore', icon: '❋', iconCls: 'actucore', label: '执行',
+      cls: 'sidebar-section-actucore', icon: ICONS.actucore, iconCls: 'actucore', label: '执行',
     }));
   }
 
@@ -116,7 +180,7 @@ function _buildSection(mcp) {
   const header = document.createElement('div');
   header.className = 'sidebar-section-header';
   header.innerHTML = `
-    <span class="sidebar-section-dot ${_esc(statusCls)}"></span>
+    <span class="sidebar-section-icon driver ${_esc(statusCls)}">${ICONS.driver}</span>
     <span class="sidebar-section-name">${_esc(name)}</span>
     <span class="sidebar-section-count">${(mcp.tools || []).length}</span>
   `;
@@ -157,7 +221,7 @@ function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
     }
   }
   header.innerHTML = `
-    <span class="sidebar-section-icon ${_esc(iconCls)}">${_esc(icon)}</span>
+    <span class="sidebar-section-icon ${_esc(iconCls)}">${icon}</span>
     <span class="sidebar-section-name">${_esc(label)}</span>
     <span class="sidebar-section-count">${allTools.length}</span>
   `;
@@ -194,7 +258,7 @@ function _buildControllerSection(controllers) {
   header.className = 'sidebar-section-header';
   const totalTools = controllers.reduce((s, m) => s + (m.tools || []).length, 0);
   header.innerHTML = `
-    <span class="sidebar-section-icon controller">◆</span>
+    <span class="sidebar-section-icon controller">${ICONS.agentcore}</span>
     <span class="sidebar-section-name">AgentCore</span>
     <span class="sidebar-section-count">${totalTools}</span>
   `;
@@ -859,7 +923,7 @@ function _hideDetail() {
  * Open a config modal for a specific canvas card instance.
  * Only shows fields with scope === "instance".
  */
-export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
+export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema, description) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
@@ -872,6 +936,19 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
   titleEl.textContent = `Instance Config: ${toolName}`;
   bodyEl.innerHTML = '';
+
+  // The fields below state what can be *changed*; nothing else in this dialog
+  // states what the tool is or what it is fixed to. That gap is invisible for a
+  // tool whose settings are the whole story, and misleading for one whose
+  // capability is baked in at build time — vop runs a TensorRT engine with a
+  // frozen class list, so "confidence and fps" is the complete set of knobs and
+  // the dialog read as though the tool had simply lost its configuration.
+  if (description) {
+    const note = document.createElement('p');
+    note.className = 'tool-config-desc';
+    note.textContent = description;
+    bodyEl.appendChild(note);
+  }
 
   const props = (configSchema && configSchema.properties) || {};
   const required = (configSchema && configSchema.required) || [];
@@ -1027,7 +1104,12 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   }
 
   if (!hasFields) {
-    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">No instance config fields</p>';
+    // Appended, not assigned: replacing innerHTML here would wipe the
+    // description above, which is exactly the case where it matters most.
+    const empty = document.createElement('p');
+    empty.style.color = 'var(--text-secondary)';
+    empty.textContent = 'No instance config fields';
+    bodyEl.appendChild(empty);
   }
 
   const close = () => { overlay.classList.add('hidden'); };

@@ -39,6 +39,15 @@ async def status(request: Request):
             "build_idle_timeout_seconds": config.build_idle_timeout_seconds,
             "max_attempts": config.max_attempts,
             "job_history_days": config.job_history_days,
+            "tests_enabled": config.tests_enabled,
+            "test_components": list(config.test_components),
+            "test_timeout_seconds": config.test_timeout_seconds,
+            "test_idle_timeout_seconds": config.test_idle_timeout_seconds,
+            # Surfaced because an unset value is the one configuration mistake
+            # that stops tests from running at all, and it is invisible
+            # otherwise: the agent refuses rather than mounting a phantom
+            # directory, and the refusal only appears in a job's log.
+            "data_host_dir_set": bool(config.data_host_dir),
             "mirror": config.mirror,
             "webhook_enabled": config.webhook_enabled,
             "llm_configured": bool(config.llm_base_url and config.llm_api_key),

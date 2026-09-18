@@ -69,6 +69,16 @@ COPY deploy/   /deploy/
 # Bake defaults to a path immune to volume mounts (for cold-start init)
 COPY resource/memory/defaults/ /opt/defaults/memory/
 
+# `file` —— 模型拿它判断下载下来的东西到底是不是图片。Tianyi 实测：LLM 下了两张人物
+# 照片后连着两次 `file /tmp/x.png` 都撞上 `/bin/sh: 1: file: not found`，白烧两轮才改用
+# 别的办法。装一个 100KB 的包比让它每次现场摸索便宜。
+#
+# **单独一层、放在文件末尾**，不并进上面那个 apt RUN：并进去会让它之后的 uv sync（依赖
+# 安装，这个镜像最贵的一层）整个失效重建。同 perception 那边记下的教训。
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated file && \
+    rm -rf /var/lib/apt/lists/*
+
 ARG IMAGE_TAG=unknown
 ENV IMAGE_TAG=${IMAGE_TAG}
 RUN echo "${IMAGE_TAG}" > /work/VERSION

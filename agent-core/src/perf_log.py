@@ -49,15 +49,11 @@ def commit_spans(trace_id: str, spans: list[dict], source: str = '', trigger_tex
     ).fetchone()
 
     if not existing:
-        # 计算 total_duration
-        starts = [s['start_ts'] for s in spans if s.get('start_ts') and s['start_ts'] > 1e9]
-        ends = [s['end_ts'] for s in spans if s.get('end_ts') and s['end_ts'] > 1e9]
-        total_ms = int((max(ends) - min(starts)) * 1000) if starts and ends else None
-        # 新建 perf_turns 记录
+        # 新建 perf_turns 记录（total_duration_ms 在写完 spans 后统一算）
         conn.execute(
             '''INSERT INTO perf_turns (turn_id, created_at, source, trigger_text, total_duration_ms)
                VALUES (?, ?, ?, ?, ?)''',
-            (trace_id, now, source, trigger_text[:200], total_ms),
+            (trace_id, now, source, trigger_text[:200], None),
         )
 
     # 写 perf_spans
@@ -81,6 +77,16 @@ def commit_spans(trace_id: str, spans: list[dict], source: str = '', trigger_tex
                 now,
             ),
         )
+
+    # 总时长从库里所有 span 重算 —— turn 跑到一半就会提交一批 spans（让性能面板能看到
+    # 正在跑的 turn），后到的那批不能让已经写下的总时长停在第一批的值上。
+    conn.execute(
+        '''UPDATE perf_turns SET total_duration_ms = (
+               SELECT CAST((MAX(end_ts) - MIN(start_ts)) * 1000 AS INTEGER)
+               FROM perf_spans WHERE trace_id = ? AND start_ts > 1e9 AND end_ts > 1e9
+           ) WHERE turn_id = ?''',
+        (trace_id, trace_id),
+    )
 
     conn.commit()
     conn.close()

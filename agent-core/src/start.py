@@ -125,6 +125,8 @@ def _register_core_mcp(silent=False):
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
                         'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
+                        'auto_narration': {'type': 'boolean', 'description': '自动播报：模型长时间不出声时，由系统自动生成一句进展汇报并通过已注册的语音/灯效等输出播报给用户', 'default': True},
+                        'narration_silence_seconds': {'type': 'integer', 'description': '主动播报：距上次对用户说话多少秒后自动汇报一次进展（0 = 关闭）', 'default': 15, 'x-show-when': {'auto_narration': 'true'}},
                         'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
                         'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
                         'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
@@ -383,10 +385,27 @@ async def lifespan(app):
     import hostarch
     print(f'[startup] host facets: acc_arch={hostarch.acc_arch()} cpu_arch={hostarch.cpu_arch()}')
 
+    # Put the DDS profile in place *before* anything creates a participant —
+    # FastDDS reads it once, at first participant creation, so provisioning it
+    # after ros2_bridge.start() would have no effect until the next restart.
+    # This also self-heals hosts installed before the profile existed, and the
+    # bind-mount-created-a-directory case seen on R1.
+    import dds_isolation
+    _prov = dds_isolation.ensure_profile()
+    if _prov:
+        print(f'[dds] {_prov}')
+
     # 启动 ROS2 bridge（用于 DDS topic 订阅）
     import ros2_bridge
     _ros2_loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, ros2_bridge.start, _ros2_loop)
+
+    # Confirm the isolation actually took effect. A missing or malformed profile
+    # makes FastDDS fall back to every interface silently — the robot keeps
+    # working and nothing looks wrong until another robot answers a command
+    # meant for this one. Checked after the bridge starts so real DDS sockets
+    # exist to inspect.
+    dds_isolation.check_and_report()
 
     # Pre-create audio publisher so DDS discovery completes before first use
     _ensure_audio_pub()
@@ -405,6 +424,10 @@ async def lifespan(app):
     # 定期刷新 agent-core 自身注册（30s）
     asyncio.create_task(_heartbeat_core_mcp())
 
+    # 画布编辑锁：闲置 60s 自动释放（惰性检查兜不住被浏览器节流的后台标签页）
+    from api import canvas as canvas_api
+    canvas_api.start_editor_sweeper()
+
     # 启动 DDS topic 订阅（依据 config event.subscribe_topics）
     topics = config.main.get('event', {}).get('subscribe_topics', [])
     topic_subscriber.start(topics, asyncio.get_event_loop())
@@ -418,6 +441,18 @@ async def lifespan(app):
 
     # 启动 Channel Manager（消息平台适配器）
     await channel_manager.start()
+
+    # peer discovery
+    from peer.registry import registry as peer_registry
+    await peer_registry.start()
+
+    # peer state sharing (topic lists over signed HTTPS; DDS is loopback-only)
+    from peer import dds_state
+    dds_state.start()
+
+    # peer tools, offered to the local LLM as synthetic MCP entries
+    from peer import mcp_bridge as peer_mcp_bridge
+    peer_mcp_bridge.start()
 
     async with event.llm:
         # Auto-start project if configured, otherwise reset running state
@@ -448,6 +483,12 @@ async def lifespan(app):
             for t in tasks:
                 t.cancel()
             await channel_manager.stop()
+            from peer.registry import registry as peer_registry
+            await peer_registry.stop()
+            from peer import dds_state
+            dds_state.stop()
+            from peer import mcp_bridge as peer_mcp_bridge
+            peer_mcp_bridge.stop()
             try:
                 await loop.run_in_executor(None, ros2_bridge.stop)
             except (asyncio.CancelledError, RuntimeError):
@@ -478,6 +519,12 @@ app_api.include_router(api.mcp_manage.router)
 
 import api.drivers
 app_api.include_router(api.drivers.router)
+
+import api.drivers_v2_endpoint
+app_api.include_router(api.drivers_v2_endpoint.router)
+
+import api.deploy_stream
+app_api.include_router(api.deploy_stream.router)
 
 import api.registry
 app_api.include_router(api.registry.router)
@@ -518,6 +565,13 @@ app_api.include_router(api.network.router)
 import api.channel
 app_api.include_router(api.channel.router)
 
+import api.peer
+# CRITICAL: api.peer.router MUST come after auth_middleware is installed and
+# before any catch-all. The /api/peer/inbox/* paths are exempt in auth.py so
+# peers can authenticate with Ed25519 signatures instead of ACCESS_TOKEN, but
+# that exemption only works if the middleware sees the request first.
+app_api.include_router(api.peer.router)
+
 import api.performance
 app_api.include_router(api.performance.router)
 
@@ -557,9 +611,7 @@ async def acp_complete(request: fastapi.Request):
         return {'ok': False, 'error': 'action_id required'}
 
     # 通道1: 解锁 sync() 等待
-    if action_id in mcp_client._pending_actions:
-        mcp_client._pending_results[action_id] = body
-        mcp_client._pending_actions[action_id].set()
+    mcp_client.mark_action_complete(action_id, body)
 
     # 通道2: 进 event_bus → steering 注入 LLM
     import event_bus

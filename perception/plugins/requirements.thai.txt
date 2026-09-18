@@ -1,0 +1,52 @@
+# Thai TTS text-frontend runtime (plugins/thai_frontend.py).
+#
+# All three are pure-Python wheels with no compiled extensions and no model
+# downloads at import — pythainlp's newmm dictionary ships inside its wheel, so
+# the container never reaches the network for it. Nothing here needs numpy, so
+# unlike the VITS2 frontend set there is no C-ABI pin to preserve.
+#
+# **pythainlp is pinned per Python version, and 5.0.4 for cp38 is not a guess.**
+# The two JetPack lines are not the same interpreter: jp61 is cp310, jp511 is
+# cp38. 5.3.x declares `requires_python >=3.9`, so pip skips it on cp38 — but
+# every 5.0.5-and-newer release *also* fails to import there regardless of what
+# its metadata claims, because `pythainlp/corpus/common.py` annotates a
+# module-level variable `_THAI_DICT: dict[str, list] = {}` and PEP 585 builtin
+# generics are evaluated at runtime:
+#
+#   TypeError: 'type' object is not subscriptable
+#
+# Verified by installing and importing each candidate inside the real jp5.11
+# perception image (Python 3.8.10) — 5.2.0, 5.1.2, 5.1.0 and 5.0.5 all raise it;
+# 5.0.4 imports and its bahttext / num_to_thaiword / normalize / remove_zw /
+# word_tokenize all work. 4.1.0 has no installable wheel. Reading the changelog is
+# not enough here: the metadata says 5.2.0 supports 3.7+, and it does not.
+#
+# 5.0.4 has no `expand_maiyamok`, and its `maiyamok` takes a token list where
+# 5.3.7's takes a string. plugins/thai_frontend.py therefore expands ๆ itself
+# rather than branching on the version.
+pythainlp==5.0.4; python_version < "3.9"
+pythainlp==5.3.7; python_version >= "3.9"
+# Same version the VITS2 frontend set pins, restated so installing this one
+# second cannot move it.
+importlib_resources==5.12.0; python_version < "3.9"
+# Thai transliteration of foreign words. wunsen composes Chinese pinyin into Thai
+# script; khanaa spells a Thai syllable from onset/vowel/coda and is what the
+# Latin fallback uses. Both MIT, both ~20-30 KB.
+#
+# wunsen does NOT handle English — it covers Japanese, Korean, Mandarin and
+# Vietnamese only. The Latin path is khanaa plus the rule table in
+# plugins/thai_frontend.py, not wunsen.
+#
+# **khanaa is pinned per Python version for the same reason pythainlp is.** 0.1.x
+# annotates `def find_same_sound_consonant(...) -> list[str]` at module level, so
+# importing it on cp38 raises `TypeError: 'type' object is not subscriptable` —
+# again in spite of `requires_python >=3.7`. 0.0.6 is the newest that imports
+# there. Its API is the older `SpellWord().spell_out(...)` rather than
+# `Kham(...).form`, and _load_khanaa in thai_frontend.py adapts between them;
+# verified on cp38 that both produce the same output for the same inputs
+# (สต+เอะ+ก+tone 3 -> เสต๊ก, บ+อู -> บู), so cp38 is not a degraded line here.
+# 0.0.6 also satisfies wunsen's own `khanaa>=0.0.6`, and wunsen was verified
+# working against it on cp38.
+wunsen==0.0.3
+khanaa==0.0.6; python_version < "3.9"
+khanaa==0.1.1; python_version >= "3.9"

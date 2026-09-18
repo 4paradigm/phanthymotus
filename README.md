@@ -61,6 +61,180 @@ The platform runs a single **sense → think → act** loop:
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
 
+### Multi-Agent Peers
+
+> **Status: partly implemented.** Measured on two Orin test rigs, per granularity:
+>
+> | Piece | State |
+> |---|---|
+> | mDNS discovery, SAS pairing | works — both rigs paired, `operator` role |
+> | State sharing (signed HTTPS) | works — each side holds the other's topic list, refreshed every 5s |
+> | Tool proxy, **inbound** (serving a peer) | works — a signed `tools/list` returns exactly the tools bound on the receiver's canvas |
+> | Tool proxy, **outbound** (calling a peer's tools) | **not implemented** — nothing registers a peer as a synthetic MCP entry, so the local LLM cannot see or call them |
+> | Messaging (`lan` ChannelAdapter) | code exists, **not exercised** — no `lan` channel was configured on either rig |
+> | Task delegation (`peer_delegate`) | code and hop-count limit exist, **not exercised across machines** |
+> | Cloud roster discovery | stub |
+> | More than two peers | never tried |
+>
+> Feishu bot-to-bot (`bot_to_bot_enabled` + `trusted_bots`, see
+> [Feishu channel setup](docs/feishu-channel-setup.md)) remains the internet-dependent path.
+
+![Peer mesh & security](docs/images/peer-mesh.png)
+
+> Editable source: [`docs/peer-mesh.svg`](docs/peer-mesh.svg) — re-export the PNG after changing it.
+
+Robots collaborate as **peers**: each side runs its own Agent Core and keeps its own autonomy.
+Discovery, transport and trust are three independent, pluggable layers, so a peer can be found
+over mDNS and talked to over mTLS, or found via a cloud roster and talked to over Feishu.
+
+**Discovery** — providers all emit the same `PeerAdvert`, keyed by `peer_id` (an Ed25519 public-key
+fingerprint, *not* an IP or platform account). One peer discovered over several paths therefore
+stays one record with several links, which is what makes fallback possible.
+
+| Provider | Needs | Used for |
+|---|---|---|
+| mDNS / DNS-SD (`_motus._tcp.local`) | Same LAN | Same site — the primary path |
+| ~~DDS presence (`/motus/presence`)~~ | — | **Not usable.** DDS is now pinned to loopback (see below), so nothing DDS-based crosses machines |
+| Cloud roster | Internet | Across sites and subnets |
+| BLE advert | A Bluetooth radio, unblocked | **Discovery** where there is no shared IP network. Carries the key, not a data plane — the pairing handshake that follows still needs IP reachability |
+| Static list | Nothing | Fallback, always kept |
+
+**Transport — four granularities of collaboration:**
+
+1. **Messages** — a `lan` `ChannelAdapter`, so peer conversations reuse the existing channel stack
+   unchanged: `InboundMessage`/`OutboundMessage`, ACL roles, rate limiting, `expect_reply` loop
+   guard, and collector batching by trust level. Feishu and LAN are then two links with identical
+   agent-side semantics, which gives "internet when available, LAN when not" for free.
+2. **Tools** — the receiving half is built: `/api/peer/tools/list` and `/api/peer/tools/call`
+   authenticate the caller, then apply its role, its `tool_filter`, **and the receiver's own canvas
+   gate**, so a peer can only reach what a human wired locally. The sending half — registering a
+   peer as a synthetic MCP entry (`transport: 'peer'`) so its tools appear to the local LLM as
+   `mcp__peer:<id>__<tool>` — is **not implemented yet**; it needs a decision on whether peer tools
+   are exposed through the canvas (no UI for a peer card today) or exempted from it.
+3. **State** — topic lists and, later, pose/battery/task state, pushed over the same signed HTTPS
+   link (`POST /api/peer/inbox/state`). This used to be DDS topics; DDS is now confined to the
+   local host, and a FastDDS *default* profile applies to every participant in the process, so the
+   loopback restriction cannot be lifted for peer traffic alone by configuration. (Per-participant
+   profiles are possible by setting `FASTRTPS_DEFAULT_PROFILES_FILE` around each participant's
+   creation — the Tianyi driver's bridge does exactly that for its two domains — but that requires
+   owning every creation site, which is not the case across agent-core, perception, actucore and a
+   dozen drivers. Signed HTTPS is also the better answer on its own terms: it authenticates.) The move fixed a real hole on the way: the DDS peer bus
+   had **no authentication**, so anything on the same `ROS_DOMAIN_ID` could forge another robot's
+   state. It still carries state only, never commands.
+4. **Tasks** — `peer_delegate` ships a `SubagentSpec` to a peer, which spawns a subagent locally and
+   returns a `SubagentResult`. The receiver re-clips `tool_filter` against the peer's own role — the
+   sender's list is a request, not a grant — and `hop_count > 2` is refused so delegation chains
+   cannot storm.
+
+**Trust** — every Agent Core generates an Ed25519 identity key on first boot; `ACCESS_TOKEN` narrows
+to "a human operating this dashboard" and is no longer the cross-machine credential. Pairing follows
+the Bluetooth model: both dashboards show the same 6-digit short code derived from both public keys
+plus nonces, and a human confirms on both sides. That resists a man-in-the-middle without needing a
+CA, and is the only scheme that also works over BLE with no network. Links then run over pinned
+mTLS. Peers reuse the `channel/acl.py` role ladder and default to `viewer` (read-only sensors).
+
+**The internal bus stays on one machine.** Every robot runs `ROS_DOMAIN_ID=42` and the same
+loopback-only FastDDS profile (`agent-core/deploy/dds-local.xml`, mounted at
+`/opt/phanthy-motus/dds-local.xml`), which whitelists `127.0.0.1`. Under `network_mode: host` all
+containers on a machine share one loopback, so the local bus works normally while nothing leaves
+the host. Configuration is identical everywhere — no per-robot domain numbers to hand out, which is
+the point: `ROS_DOMAIN_ID` has a narrow usable range and cloned images cannot coordinate.
+
+Why this is not optional: `/remote_control/message` — a *command* — was reaching every robot on the
+office LAN. One instruction typed on Orin5 was executed by Orin6 as well, with the identical
+timestamp in both logs. DDS has no addressing and no authentication; every subscriber on the domain
+receives everything.
+
+Two operational consequences:
+
+- **Every DDS container must load the profile.** A container that misses it isolates *itself* from
+  the rest of the machine — the symptom is a robot that suddenly hears nothing. Agent Core
+  self-checks at startup and exposes `GET /api/peer/dds_isolation`; the judgement is whether the
+  process's UDP sockets bind `127.0.0.1`, not whether the file exists.
+- **A missing file fails silently.** If the host lacks `/opt/phanthy-motus/dds-local.xml`, Docker's
+  bind mount creates a *directory* with that name, FastDDS ignores it and falls back to every
+  interface — isolation gone, nothing in the log. Agent Core writes the file from its image when it
+  is absent; containers that already mounted the phantom directory must be **recreated**, not
+  restarted, because the mount type is fixed at creation.
+
+**What a peer may reach, per path.** The two inbound paths carry different guarantees, and it is
+worth being exact about which.
+
+*Messages and delegation* — a peer's message enters the collector as **input**, not a command, and
+the local LLM decides what to do with it; a delegated task runs in a subagent whose tool filter the
+receiver re-clips against that peer's role. On these paths a peer only ever *requests*.
+
+*`POST /api/peer/tools/call`* — a direct dispatch to the device: no LLM, no collector, no history
+(measured: a call executed while the receiver's agent loop was switched off). Three checks gate it:
+
+1. **role** — `viewer` reaches read-only tools only: `sensor`/`resource` from any layer, plus the
+   whole perception layer, whose `processor` tools compute on data and publish to a topic.
+   `operator` also reaches tools that act: `actuator`, the whole actucore layer (the execution
+   layer — `vla` and navigation drive the robot despite declaring `processor`), and `controller`.
+   An undeclared type counts as acting.
+2. **`tool_filter`** — narrows further within the role.
+3. **the local canvas** — the tool must be wired to `decision_core` on *this* machine.
+
+So an `operator` peer **can** drive this robot's actuators directly. That is the policy, not an
+oversight: granting `operator` is what authorises it, which is why a newly paired peer defaults to
+`viewer`, and why every such call is announced on the activity stream.
+
+### ACP Barrier — what may run at the same time
+
+An actuator tool returns when the driver has *accepted* the action, not when the world
+has finished changing, so the agent loop needs a rule for what may start next. That
+rule is the **ACP barrier**, and it is scoped by **physical channel**.
+
+Drivers declare which channel each acting tool occupies via `x-resource` beside
+`x-completion` (spec: `phanthymotus-driver/README_dev.md` § *Physical Resources*).
+The barrier waits only for pending actions whose channel intersects the one the new
+call wants, so speaking no longer blocks driving while two `speak` calls still
+serialise. `finish` and the hand-off tools (`peer_call`, `peer_delegate`,
+`subagent_spawn*`, `subagent_message`) wait for **everything**, because ending a turn
+or handing work to another executor cannot know what will be touched.
+
+**Agent Core defines no channel names.** It only intersects the strings drivers
+declare, so `rotor`/`gimbal` or `thruster`/`ballast` work exactly as `mouth`/`base`
+does. Undeclared means "conflicts with everything", which is why an undeclared driver
+keeps its pre-barrier behaviour, and why a *partially* declared one is the case that
+behaves worst — see the driver README before declaring anything.
+
+Three properties are load-bearing and easy to break:
+
+- **Every dispatch path must consult the same table.** There are three — the main
+  loop, and the subagent's MCP and system-tool branches. Each was missed once, and
+  each miss reopened the whole bug through a different door. `_HANDOFF_SYSTEM_TOOLS`
+  is enumerated, not keyword-matched, and `tests/test_handoff_tools_partitioned.py`
+  fails if a new `peer_*`/`subagent_*` tool is left unclassified.
+- **Exclusion and ordering are separate rules.** A call waits for two independent
+  reasons, and only the first can be overridden:
+
+  | reason | scope | can the caller opt out? |
+  |---|---|---|
+  | resource conflict | any agent | **no** — one chassis cannot drive two ways |
+  | own ordering | the same agent's own calls | yes, via `concurrent: true` |
+
+  Exclusion cannot answer "must this finish first". "Announce before moving" is a
+  *sequencing* requirement: `mouth` and `leg` are different channels, so exclusion
+  permits the overlap. The same pair must overlap when it is a gesture accompanying
+  speech and must not when it is a warning preceding motion — identical tools, and
+  only the intent differs. So ordering is enforced **within one agent's own sequence
+  of calls**, where the order it emitted them in is the script, and not across
+  independent agents, which share no script.
+
+  Agent Core injects a `concurrent` parameter into every acting tool's schema
+  (`mcp_client.with_parallel_param`) — drivers do not declare it, because whether a
+  call should overlap the previous one is a property of the intent, not the hardware.
+  It defaults to **false**: a model does not reason about concurrency unless made to,
+  and the unsafe direction — a warning overlapping the motion it warns about — is the
+  one that should require an explicit request. Ownership comes from
+  `mcp_client.current_agent_context`, which each subagent sets to its own id.
+- **A timeout clears pending and proceeds exactly like success.** So a terminal state
+  has to outlive its pending (`mcp_client.action_outcome`), and anything reporting
+  work upward must carry `SubagentResult.confirmed_actions()` rather than prose — an
+  agent that reads "failed" with no record of what already happened will redo it,
+  physically.
+
 ### Memory & Long-Running Agent Architecture
 
 The Agent Core is designed for **continuous operation over days or months**. The architecture separates real-time interaction from background intelligence:
@@ -96,6 +270,108 @@ The Agent Core is designed for **continuous operation over days or months**. The
 - **Urgent interrupts only** — background subagents only interrupt the main agent for safety-critical alerts (battery critical, hardware faults). Routine reports go to the database silently.
 - **Daily auto-summary** — a scheduled subagent generates daily reports covering user interactions, task completion, anomalies, performance review, and skill discovery opportunities.
 - **Prefix caching optimized** — stable system prompt (L1 + L2-static) is frozen per turn; dynamic status is minimal and placed in user messages to maximize LLM prefix cache hits.
+
+## File Arguments (`format: file`)
+
+A tool that needs a file — a photo to enrol a face, an audio clip to play —
+cannot simply be handed a path. The service that reads it usually runs in a
+**different container**, and containers share no filesystem here: agent-core
+mounts `/opt/phanthy-motus`, perception mounts `/opt/embodied/models`, and each
+one's `/tmp` and `/work` is its own. A path minted on one side is meaningless on
+the other.
+
+### Declaring one
+
+Mark the parameter in the tool's `inputSchema`:
+
+```python
+"image_path": {
+    "type": "string",
+    "format": "file",        # → the canvas renders a file picker
+    "accept": "image/*",     # → picker filter
+    "uploadTo": "mcp",       # → route the upload to *this* service
+    "description": "...",
+},
+```
+
+`uploadTo: "mcp"` is the important one. Omit it and the browser uploads into
+agent-core's own `/tmp/uploads`, which is correct only for a tool agent-core
+serves itself (`remote_image`, `remote_audio`) and invisible to anything else.
+
+### How the file actually moves
+
+```
+browser ──pick──▶ agent-core  POST /api/mcp/{mcp_id}/file/upload
+LLM ─────path──▶      │   address resolved from the MCP registry;
+                      │   body streamed on in 1 MiB chunks
+                      ▼
+                 the service  POST /file/upload
+                      │   writes it somewhere it can see
+                      ▼
+              ◀──reply── {"path": "/models/uploads/2026-09-08/alice.jpg"}
+                  that path becomes the tool argument, verbatim
+```
+
+The reply carries the path **in the receiving container's own namespace**, so
+there is one viewpoint and nothing to translate. No shared mount, and therefore
+no container recreation to enable it.
+
+The target's address comes from the MCP registry — every service reports `url`
+when it registers — so one route covers perception, actucore and every driver
+even though their ports all differ.
+
+### Two callers, one pipeline
+
+**Browser**: the canvas picker uploads and fills the returned path into the
+field. This has worked since `format: file` existed.
+
+**LLM**: it has no picker, so `mcp_client.call_tool` does it. Before validating
+arguments, any parameter declared `format: file` whose value is a file that
+exists **locally** is uploaded, and the argument is rewritten to the path the
+service returned. A value that is not a local file is passed through untouched —
+it is either already the target's path (the picker's output, or a second call
+reusing an earlier result) or something the model invented, and the tool's own
+error is the better answer.
+
+This lives in `call_tool`, the single point every MCP call passes through, **not
+in any card**. A tool added later gets the behaviour without knowing the code
+exists. It also survives `x-action-params` splitting, which rebuilds each
+action's properties from the parent schema (there is a test pinning that: drop
+`format` there and no split tool would ever be recognised).
+
+### Why not the alternatives
+
+**base64 in the argument.** Tried, and it failed in production: a 43 800
+character string does not survive being carried through an LLM's context, and
+what arrived was truncated.
+
+**A shared host mount.** Works, but needs every participating container
+recreated (Docker fixes mounts at creation), one host directory per pairing, and
+leaves the path ambiguous — `/uploads` here, something else there.
+
+**Letting the model guess.** This was the status quo, and the model guessed
+wrong twice: it downloaded a photo to `/tmp` and then passed
+`/work/dai_wenyuan_1.jpeg`. Told only "cannot read", it retried with another
+invisible path.
+
+### Receiving end
+
+`perception/utils/file_intake.py` implements `POST /file/upload` and is
+deliberately **stdlib-only**, because the drivers run a bare
+`ThreadingHTTPServer` rather than FastAPI and can adopt the identical endpoint in
+about five lines. Only perception has it today; the contract is fixed for the
+rest.
+
+Its behaviour, each point with a test:
+
+| | |
+|---|---|
+| size capped **while** writing | an oversized body is never fully committed or buffered |
+| `.part` then rename | a reader listing the directory never sees half a file |
+| filename → one component, CJK kept | users name files in Chinese; NFC-normalised so a macOS and a Linux upload of one name agree |
+| `subdir` refused, not sanitised | `../escape` became `.._escape` — a valid name, so the write succeeded somewhere unasked-for, silently |
+| pruned after `retention_days` (7) | uploads are a transfer buffer; enrolment keeps the *embedding*, never the photo |
+| `ACCESS_TOKEN` honoured when set | today perception is not given one, and the same port already serves `tools/call` — so this is reachability-gated, and the check is ready for when a token is wired in |
 
 ## Web Dashboard
 
@@ -239,6 +515,9 @@ services:
 | PR Review Agent (optional) | 25000 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
+
+Peer-to-peer collaboration adds **no new port** — peers talk to each other over the Agent Core's
+existing 15678, under `/api/peer/*`. There is nothing extra to open on a firewall.
 
 ## Container Logs
 

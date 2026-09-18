@@ -20,9 +20,26 @@ STATUS_COMPLETED = 'completed'
 STATUS_FAILED = 'failed'
 STATUS_TIMEOUT = 'timeout'
 STATUS_CANCELLED = 'cancelled'
+# Ran out of rounds but wrote up what it had. Distinct from STATUS_TIMEOUT, which
+# says only "it stopped" — a caller cannot tell from that whether `output` is a
+# real answer or a placeholder, and the honest answer used to be the placeholder.
+STATUS_PARTIAL = 'partial'
 
-TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_TIMEOUT, STATUS_CANCELLED}
+TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_TIMEOUT,
+                     STATUS_CANCELLED, STATUS_PARTIAL}
 ACTIVE_STATUSES = {STATUS_PENDING, STATUS_RUNNING, STATUS_PAUSED, STATUS_SUSPENDED}
+
+# Tools that only talk *about* the task rather than carry it out. A subagent whose
+# entire run consists of these did nothing observable, yet still reports
+# STATUS_COMPLETED with whatever prose it chose to write.
+#
+# This is not hypothetical. Measured on Orin5+Orin6: of six inbound peer
+# delegations each asking the receiver to speak one line, four ran a single round,
+# called `subagent_finish` without ever touching tts, and returned "completed" —
+# and `peer_delegate` handed that self-report back to the delegator as success.
+# Both robots then announced a sixteen-line performance that never happened.
+# `substantive_tool_calls` is how a caller tells the two apart.
+BOOKKEEPING_TOOLS = frozenset({'subagent_finish', 'subagent_fail', 'subagent_report'})
 
 
 @dataclass
@@ -33,8 +50,18 @@ class SubagentSpec:
     model: str | None = None
     tool_filter: list[str] | None = None
     tool_deny: list[str] | None = None
-    max_rounds: int = 10
-    timeout_s: float = 300.0
+    # 0 = use `subagent.default_max_rounds` from config, filled in by
+    # SubagentManager.spawn(). A hardcoded default here is how that config key
+    # came to be read by nothing: every caller got 10 and the configured value
+    # (50) was dead. Specs built outside the manager (peer delegation restoring
+    # from a dict) are clamped in Subagent.__init__ instead.
+    max_rounds: int = 0
+    # 负数 = use `subagent.default_timeout_s` from config, same dead-config story as
+    # max_rounds above. The sentinel cannot be 0: `manager._schedule` reads `> 0`, so
+    # 0 already means "no watchdog at all". This is an *idle* timeout — cancels after
+    # that long with no progress, not an absolute cap on the run.
+    timeout_s: float = -1.0
+    hop_count: int = 0  # Incremented on each delegation, prevents infinite chains
     system_prompt_extra: str = ''
     context_seed: str = ''
     checkpoint_interval: int = 5
@@ -70,6 +97,12 @@ class SubagentResult:
     rounds_used: int = 0
     duration_s: float = 0.0
     error: str | None = None
+    # ACP actions this run started and how each ended. Starting an async action is
+    # not evidence it happened: `speak` returns when the audio is *queued*, so a
+    # run that only ever queued and a run whose audio actually played produce
+    # identical prose. Entries are {action_id, status, tool}; status 'pending' means
+    # it never resolved before the run ended.
+    actions: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -77,10 +110,43 @@ class SubagentResult:
             'status': self.status,
             'output': self.output,
             'tool_calls_made': self.tool_calls_made,
+            'substantive_tool_calls': self.substantive_tool_calls(),
+            'actions': self.actions,
+            'confirmed_actions': self.confirmed_actions(),
             'rounds_used': self.rounds_used,
             'duration_s': self.duration_s,
             'error': self.error,
         }
+
+    def substantive_tool_calls(self) -> list[str]:
+        """Names of tools this run called that actually did something.
+
+        Excludes BOOKKEEPING_TOOLS. An empty list on a `completed` result means the
+        subagent reported success without acting — see BOOKKEEPING_TOOLS.
+        """
+        return [
+            name for tc in self.tool_calls_made
+            if (name := (tc.get('name') or '')) and name not in BOOKKEEPING_TOOLS
+        ]
+
+    def confirmed_actions(self) -> list[dict]:
+        """Actions that reached a terminal 'completed' state.
+
+        Anything else — 'timeout', 'cancelled', 'barge_in', 'pending' — did not
+        demonstrably happen. A barrier timeout clears the pending and lets the
+        caller proceed exactly as success does, so this distinction is the only
+        thing standing between "the robot spoke" and "the robot was asked to".
+        """
+        return [a for a in self.actions if a.get('status') == 'completed']
+
+    def acted(self) -> bool:
+        """Whether this run did something observable.
+
+        True when it either completed an async action or called a non-bookkeeping
+        tool. A run that only called `subagent_finish` is False no matter how
+        confidently its output says otherwise.
+        """
+        return bool(self.confirmed_actions() or self.substantive_tool_calls())
 
     @classmethod
     def from_dict(cls, d: dict) -> SubagentResult:

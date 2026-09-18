@@ -156,6 +156,13 @@ export function renderConfig(el, c) {
       <dd>${c.llm_configured
         ? `<span class="pill ok">on</span> ${esc(c.llm_model)}`
         : '<span class="pill cancelled">not configured</span>'}</dd>
+      <dt title="Suites are run inside the images this job builds. Failures are reported but do not block the review.">Tests</dt>
+      <dd>${c.tests_enabled
+        ? `<span class="pill ok">on</span> ${(c.test_components || []).map((t) => esc(t)).join(', ')}`
+        : '<span class="pill cancelled">disabled</span>'}
+        ${c.tests_enabled && c.data_host_dir_set === false
+          ? '<br><span class="pill fail">DATA_HOST_DIR unset</span> tests cannot mount the worktree'
+          : ''}</dd>
     </dl>`;
 }
 
@@ -180,7 +187,7 @@ export function renderHistory(el, jobs) {
     <table class="tbl">
       <thead><tr>
         <th>PR</th><th>Repo</th><th>Commit</th><th>Status</th>
-        <th>Builds</th><th>By</th><th>Via</th>
+        <th>Builds</th><th>Tests</th><th>By</th><th>Via</th>
         <th class="num">Elapsed</th><th class="num">When</th>
       </tr></thead>
       <tbody>
@@ -196,6 +203,7 @@ export function renderHistory(el, jobs) {
               ${j.attempt > 1 ? `<span class="pill">try ${esc(j.attempt)}</span>` : ''}
             </td>
             <td>${_buildSummary(j.build_results)}</td>
+            <td>${_testSummary(j.test_results)}</td>
             ${byCell(j)}
             <td>${esc(j.source)}</td>
             <td class="num">${esc(fmtDuration(j.elapsed))}</td>
@@ -228,6 +236,32 @@ function buildLabel(b) {
   return 'failed';
 }
 
+function testPill(t) {
+  if (t.status === null || t.status === undefined) return 'running';
+  if (t.status === 'passed') return 'ok';
+  if (t.status === 'skipped') return '';
+  return 'fail';
+}
+
+function testLabel(t) {
+  if (t.status === null || t.status === undefined) return 'testing';
+  if (t.status === 'passed') return 'passed';
+  if (t.status === 'skipped') return 'not run';
+  // Same distinction as builds: killed is not failed, and `error` means the
+  // agent never got a verdict — neither is a statement about the PR.
+  if (t.timeout_kind === 'idle') return 'stalled';
+  if (t.timeout_kind === 'cap') return 'timed out';
+  if (t.status === 'error') return 'error';
+  return `${t.failed + t.errors} failed`;
+}
+
+function _testSummary(results) {
+  if (!results || !results.length) return '<span style="color:var(--text-dim)">—</span>';
+  return results.map((t) =>
+    `<span class="pill ${testPill(t)}">${esc(t.component)}</span>`
+  ).join(' ');
+}
+
 function _buildSummary(results) {
   if (!results || !results.length) return '<span style="color:var(--text-dim)">—</span>';
   return results.map((b) =>
@@ -250,6 +284,7 @@ export function renderDetail(el, job) {
   el.innerHTML = [
     _detailMeta(job),
     _detailBuilds(job),
+    _detailTests(job),
     _detailPRContext(job),
     _detailReviewProcess(job),
     _detailReview(job),
@@ -352,6 +387,64 @@ function _detailBuilds(j) {
           <tbody>${rows}</tbody>
         </table>
       </div>
+      ${logs}
+    </div>`;
+}
+
+function _detailTests(j) {
+  const results = j.test_results || [];
+  // Returns nothing rather than an empty-state card, so every job from before
+  // this feature renders exactly as it did.
+  if (!results.length) return '';
+
+  const rows = results.map((t) => `
+    <tr>
+      <td>${esc(t.component)}</td>
+      <td><span class="pill ${testPill(t)}">${esc(testLabel(t))}</span></td>
+      <td class="num">${esc(t.passed)}</td>
+      <td class="num">${esc(t.failed + t.errors)}</td>
+      <td class="num">${esc(t.skipped)}</td>
+      <td>${esc(fmtDuration(t.duration_seconds))}</td>
+    </tr>
+    ${t.skip_reason ? `<tr><td colspan="6" style="color:var(--text-dim)">${esc(t.skip_reason)}</td></tr>` : ''}`
+  ).join('');
+
+  const failing = results
+    .filter((t) => (t.failing_ids || []).length)
+    .map((t) => `
+      <div class="finding">
+        <span class="pill sev-error">${esc(t.component)}</span>
+        <div>${t.failing_ids.slice(0, 50).map((id) => `<div class="mono">${esc(id)}</div>`).join('')}
+        ${t.failing_ids.length > 50 ? `<div style="color:var(--text-dim)">… and ${t.failing_ids.length - 50} more</div>` : ''}</div>
+      </div>`).join('');
+
+  // Only suites that actually ran have a log. app.js finds these panes the
+  // same way it finds the build ones — it queries .log-pane[data-job]
+  // generically, so nothing there needs to know about tests.
+  const logs = results.filter((t) => t.has_log).map((t) => `
+    <div class="log-wrap" data-log-block="${esc(t.idx)}">
+      <div class="log-toolbar">
+        <strong>${esc(t.component)} tests</strong>
+        <span class="log-toolbar-spacer"></span>
+        <span class="log-tail-state" data-log-state="${esc(t.idx)}"></span>
+        <button class="btn-ghost btn-sm" data-log-bottom="${esc(t.idx)}">Jump to end</button>
+      </div>
+      <pre class="log-pane" data-job="${esc(j.id)}" data-idx="${esc(t.idx)}"></pre>
+    </div>`).join('');
+
+  return `
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Tests</h2></div>
+      <div class="card-body no-pad">
+        <table class="tbl">
+          <thead><tr>
+            <th>Suite</th><th>Status</th><th class="num">Passed</th>
+            <th class="num">Failed</th><th class="num">Skipped</th><th>Took</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      ${failing}
       ${logs}
     </div>`;
 }

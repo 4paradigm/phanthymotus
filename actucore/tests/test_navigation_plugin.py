@@ -343,15 +343,12 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("requires namespace=ubuntu", main)
         self.assertNotIn("socket.gethostname()", main)
 
-    def test_navigation_runtime_uses_default_fastdds_transport(self):
-        manifests = (
-            ACTUCORE_ROOT / "Dockerfile.jetson",
-            ACTUCORE_ROOT / "deploy" / "service.yml",
-        )
-        for manifest in manifests:
-            content = manifest.read_text(encoding="utf-8")
-            self.assertIn("FASTDDS_BUILTIN_TRANSPORTS=DEFAULT", content)
-            self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS=UDPv4", content)
+    def test_navigation_runtime_uses_host_dds_isolation(self):
+        service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text()
+        self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
+        self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
+        for manifest in (ACTUCORE_ROOT / "Dockerfile.jetson", ACTUCORE_ROOT / "deploy" / "service.yml"):
+            self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS=", manifest.read_text())
 
         for source_lock in (
             "nav2-source.lock",
@@ -642,12 +639,10 @@ class NavigationContractTest(unittest.TestCase):
         ):
             self.assertNotIn(removed, build_script)
         self.assertIn("ACTUCORE_BUILD_DURATION_SEC=", build_script)
-        self.assertIn(
-            r'\"cards\": [{\"name\": \"ControlledSemanticSpatial\", '
-            r'\"type\": \"processor\"}]',
-            build_script,
-        )
-        self.assertIn("内置 ControlledSemanticSpatial 导航 processor 卡片", build_script)
+        self.assertIn('"name":"ControlledSemanticSpatial"', build_script)
+        self.assertIn('"name":"vla"', build_script)
+        self.assertIn('CARDS_JSON', build_script)
+
 
 class NavigationPluginTest(unittest.TestCase):
     def make_plugin(self, *, runtime=None, mapping=None, planning=None, semantic=None):

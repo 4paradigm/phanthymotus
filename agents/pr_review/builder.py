@@ -201,7 +201,7 @@ async def _build_with_script(
         env.update(env_overrides)
 
     started = time.monotonic()
-    success, timeout_kind = await _run_build(
+    success, timeout_kind, _returncode = await _run_build(
         ["bash", str(script), *args],
         cwd=str(cwd),
         env=env,
@@ -228,7 +228,7 @@ async def _build_with_script(
 # ── Process execution ─────────────────────────────────────────────────────────
 
 
-async def _run_build(
+async def run_logged(
     cmd: list[str],
     cwd: str,
     env: dict[str, str],
@@ -236,12 +236,23 @@ async def _run_build(
     idle_timeout: int,
     log_path: Path,
     label: str,
-) -> tuple[bool, str]:
-    """Run a build, streaming its output to `log_path`.
+    what: str = "Build",
+    append: bool = False,
+) -> tuple[bool, str, int | None]:
+    """Run a child process, streaming its output to `log_path`.
 
-    Returns `(success, timeout_kind)`, where `timeout_kind` is `""` for a build
-    that ended on its own, `"idle"` for one killed for going quiet, and `"cap"`
-    for one killed by the absolute bound.
+    Builds are the original caller; `tester.py` reuses it to drive `docker run`.
+    `what` is a capitalised noun ("Build", "Test run") used only in the log
+    lines. Everything below is the same discipline either way, and it exists
+    because each piece of it was a separate incident; do not reimplement it in
+    a second module.
+
+    Returns `(success, timeout_kind, returncode)`, where `timeout_kind` is `""`
+    for a run that ended on its own, `"idle"` for one killed for going quiet,
+    and `"cap"` for one killed by the absolute bound. `returncode` is `None`
+    for a killed run; builds ignore it, but pytest's exit code distinguishes
+    "tests failed" (1) from "could not collect" (3/4) and "collected nothing"
+    (5), which are very different things to report on a PR.
 
     Two bounds, because "too slow" and "stuck" are different failures:
 
@@ -261,7 +272,7 @@ async def _run_build(
     outside — without the explicit kill, `docker build` would keep running
     orphaned, holding the build cache and CPU for the retry to contend with.
     """
-    logger.info(f"Building {label}: {' '.join(cmd[:3])}... (cwd={cwd})")
+    logger.info(f"{what} starting — {label}: {' '.join(cmd[:3])}... (cwd={cwd})")
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # start_new_session puts the child in its own process group so the whole
@@ -282,7 +293,11 @@ async def _run_build(
 
     # buffering=0 so a reader tailing this file sees output as it is produced
     # rather than one block per flush.
-    log_file = open(log_path, "wb", buffering=0)
+    #
+    # `append` is for callers that put several steps in one log — the test
+    # stage pulls the image and then runs pytest, and truncating between them
+    # would throw away the pull output that explains a slow start.
+    log_file = open(log_path, "ab" if append else "wb", buffering=0)
 
     started = time.monotonic()
     last_output = started
@@ -328,7 +343,7 @@ async def _run_build(
                     kind = "idle"
                     note = (
                         f"no output for {idle_timeout}s "
-                        f"({elapsed:,}s into the build)"
+                        f"({elapsed:,}s into the run)"
                     )
                 else:
                     kind = "cap"
@@ -336,9 +351,9 @@ async def _run_build(
                         f"absolute cap of {timeout}s reached; "
                         f"last output {quiet_for}s ago"
                     )
-                log_file.write(f"\n[agent] Build killed: {note}\n".encode())
-                logger.error(f"Build killed ({kind}): {label} — {note}")
-                return False, kind
+                log_file.write(f"\n[agent] {what} killed: {note}\n".encode())
+                logger.error(f"{what} killed ({kind}): {label} — {note}")
+                return False, kind, None
             try:
                 # Shielded so a timeout or outer cancellation does not kill the
                 # task mid-write; it is drained explicitly below so the partial
@@ -354,8 +369,8 @@ async def _run_build(
     except asyncio.CancelledError:
         await _terminate(proc)
         await _drain(task)
-        log_file.write(b"\n[agent] Build cancelled (agent stopping)\n")
-        logger.warning(f"Build cancelled, subprocess killed: {label}")
+        log_file.write(f"\n[agent] {what} cancelled (agent stopping)\n".encode())
+        logger.warning(f"{what} cancelled, subprocess killed: {label}")
         raise
     finally:
         # Closed after the task is drained, so the partial log is flushed even
@@ -365,10 +380,15 @@ async def _run_build(
     success = returncode == 0
     took = time.monotonic() - started
     if success:
-        logger.info(f"Build succeeded in {took:.0f}s: {label}")
+        logger.info(f"{what} succeeded in {took:.0f}s: {label}")
     else:
-        logger.error(f"Build failed (rc={returncode}) after {took:.0f}s: {label}")
-    return success, ""
+        logger.error(f"{what} failed (rc={returncode}) after {took:.0f}s: {label}")
+    return success, "", returncode
+
+
+# The build path still calls it by its old name. Keeping the alias means this
+# extraction changes no builder behaviour and no builder call sites.
+_run_build = run_logged
 
 
 async def _drain(task: asyncio.Task):

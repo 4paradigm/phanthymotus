@@ -71,6 +71,12 @@ class _FakeNode:
         self.subscriptions.append(subscription)
         return subscription
 
+    def destroy_subscription(self, subscription):
+        # Plugins drop the subscription on stop() and recreate it on the next
+        # start(); the tests assert on what is left registered here.
+        if subscription in self.subscriptions:
+            self.subscriptions.remove(subscription)
+
     def destroy_node(self):
         self.destroyed = True
 
@@ -103,7 +109,10 @@ class _FakeString:
 
 
 class _FakeCompressedImage:
-    def __init__(self, data: bytes, fmt="jpeg"):
+    # Defaults so a plugin that *publishes* one can construct it the way ROS
+    # does — `CompressedImage()` then assign — as well as tests that build an
+    # incoming frame in one call.
+    def __init__(self, data: bytes = b"", fmt="jpeg"):
         self.data = data
         self.format = fmt
 
@@ -121,6 +130,16 @@ def _install_fake_ros():
     rclpy = types.ModuleType("rclpy")
     node_mod = types.ModuleType("rclpy.node")
     node_mod.Node = _FakeNode
+    # main.py does `import rclpy.executors`, which needs rclpy to be a package
+    # with that submodule attached — a bare ModuleType is not, and the import
+    # fails with "'rclpy' is not a package".
+    executors_mod = types.ModuleType("rclpy.executors")
+    executors_mod.MultiThreadedExecutor = _FakeExecutor
+    executors_mod.SingleThreadedExecutor = _FakeExecutor
+    rclpy.executors = executors_mod
+    rclpy.node = node_mod
+    rclpy.init = lambda *args, **kwargs: None
+    rclpy.shutdown = lambda *args, **kwargs: None
     qos_mod = types.ModuleType("rclpy.qos")
 
     class QoSProfile:
@@ -145,6 +164,7 @@ def _install_fake_ros():
     audio_msgs_msg.AudioChunk = _FakeAudioChunk
     for name, module in {
         "rclpy": rclpy, "rclpy.node": node_mod, "rclpy.qos": qos_mod,
+        "rclpy.executors": executors_mod,
         "sensor_msgs": sensor_msgs, "sensor_msgs.msg": sensor_msgs_msg,
         "std_msgs": std_msgs, "std_msgs.msg": std_msgs_msg,
         "audio_msgs": audio_msgs, "audio_msgs.msg": audio_msgs_msg,
@@ -152,7 +172,54 @@ def _install_fake_ros():
         sys.modules[name] = module
 
 
+def _install_fake_cv2():
+    """Minimal cv2 for host-side tests.
+
+    The vision plugins do `import cv2` inside their worker threads, so without
+    this every worker dies on its first frame and the failure surfaces only as
+    a PytestUnhandledThreadExceptionWarning — easy to scroll past while
+    believing the pipeline was exercised. Only the handful of calls those
+    workers make are implemented; anything else raises rather than quietly
+    returning something plausible.
+
+    Skipped when the real cv2 is importable, so a machine that has it tests
+    against the real thing.
+    """
+    try:
+        import cv2  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import numpy as _np
+
+    cv2 = types.ModuleType("cv2")
+    cv2.IMREAD_COLOR = 1
+    cv2.INTER_NEAREST = 0
+    cv2.INTER_LINEAR = 1
+
+    def imdecode(buf, flags):
+        # Tests hand in a raw "WxH" marker rather than a real JPEG; anything
+        # unparseable decodes to None, which is what a corrupt frame does.
+        try:
+            width, height = (int(v) for v in bytes(buf).decode().split("x"))
+        except Exception:
+            return None
+        return _np.zeros((height, width, 3), dtype=_np.uint8)
+
+    def resize(src, dsize, interpolation=0):
+        width, height = dsize
+        rows = (_np.arange(height) * src.shape[0] // height).clip(0, src.shape[0] - 1)
+        cols = (_np.arange(width) * src.shape[1] // width).clip(0, src.shape[1] - 1)
+        return src[rows][:, cols]
+
+    cv2.imdecode = imdecode
+    cv2.resize = resize
+    sys.modules["cv2"] = cv2
+
+
 _install_fake_ros()
+_install_fake_cv2()
 
 
 def _wait_until(predicate, timeout=3.0):

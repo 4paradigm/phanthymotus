@@ -134,7 +134,7 @@ def test_empty_result_without_an_error_still_stringifies(r1_registry, monkeypatc
     assert out == '{}'
 
 
-def test_pending_barrier_is_scoped_to_one_tool(monkeypatch):
+def test_pending_barrier_uses_upstream_resource_scope(monkeypatch):
     nav_event = asyncio.Event()
     tts_event = asyncio.Event()
     nav_event.set()
@@ -155,19 +155,27 @@ def test_pending_barrier_is_scoped_to_one_tool(monkeypatch):
     )
     monkeypatch.setattr(mcp_client, '_pending_results', mcp_client.OrderedDict())
 
-    result = asyncio.run(mcp_client.await_pending(tool_name='navigation'))
+    monkeypatch.setattr(mcp_client, '_pending_resources', {
+        'nav-action': frozenset({'base'}), 'tts-action': frozenset({'mouth'})})
+    monkeypatch.setattr(mcp_client, '_pending_owner', {'tts-action': 'other-agent'})
+    result = asyncio.run(mcp_client.await_pending(
+        want=frozenset({'base'}), scoped=True, concurrent=True))
 
     assert result == {'status': 'completed', 'actions': ['nav-action']}
     assert 'tts-action' in mcp_client._pending_actions
 
 
-def test_completion_passthrough_actions_do_not_conflict(monkeypatch):
-    monkeypatch.setattr(mcp_client, '_pending_actions', {'nav-action': asyncio.Event()})
-    monkeypatch.setattr(mcp_client, '_pending_tools', {'nav-action': 'navigation'})
-    completion = {'passthrough_actions': ['pause_nav', 'resume_nav', 'stop_nav']}
-
-    assert not mcp_client.pending_conflicts('navigation', 'stop_nav', completion)
-    assert mcp_client.pending_conflicts('navigation', 'navigate_to_pose', completion)
+@pytest.mark.parametrize('action', ['pause_nav', 'resume_nav', 'stop_nav', 'wait_navigation_done'])
+def test_completion_passthrough_actions_do_not_conflict(monkeypatch, action):
+    from event.llm import _needs_barrier
+    completion = {'passthrough_actions': ['pause_nav', 'resume_nav', 'stop_nav', 'wait_navigation_done']}
+    monkeypatch.setattr(mcp_client, 'registry', {MCP_ID: {
+        'tool_meta': {NAVIGATE: {'type': 'processor', 'completion': completion}},
+        'split_map': {NAVIGATE: {'tool': 'navigation', 'action': action}},
+    }})
+    assert _needs_barrier(NAVIGATE) == (False, None)
+    mcp_client.registry[MCP_ID]['split_map'][NAVIGATE]['action'] = 'navigate_to_pose'
+    assert _needs_barrier(NAVIGATE) == (True, None)
 
 
 def test_completion_received_before_call_result_still_releases_pending(monkeypatch):
@@ -226,3 +234,20 @@ def test_completion_received_before_call_result_still_releases_pending(monkeypat
 
     assert mcp_client._pending_actions['nav-early'].is_set()
     assert mcp_client._pending_tools['nav-early'] == 'navigation'
+
+
+def test_early_completion_cache_keeps_pending_results_and_notifies_after_registration(monkeypatch):
+    monkeypatch.setattr(mcp_client, '_pending_actions', {'active': asyncio.Event()})
+    monkeypatch.setattr(mcp_client, '_pending_results', mcp_client.OrderedDict(active={'status': 'done'}))
+    monkeypatch.setattr(mcp_client, '_pending_resources', {'early-2': frozenset({'base'})})
+    monkeypatch.setattr(mcp_client, '_MAX_EARLY_COMPLETIONS', 2)
+    settled = []
+    monkeypatch.setattr(mcp_client, '_settle_listeners', [lambda aid, resource: settled.append((aid, resource))])
+    for i in range(3):
+        assert mcp_client.mark_action_complete(f'early-{i}', {'status': 'arrived'}) is False
+    assert list(mcp_client._pending_results) == ['active', 'early-1', 'early-2']
+    assert settled == []
+    event = mcp_client._pending_actions['early-2'] = asyncio.Event()
+    assert mcp_client.mark_action_complete('early-2', mcp_client._pending_results['early-2'])
+    assert event.is_set()
+    assert settled == [('early-2', frozenset({'base'}))]

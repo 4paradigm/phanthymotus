@@ -48,9 +48,13 @@ class _BuilderProbe:
         self.delay = delay
         self.calls = 0
         self.built = []
+        self.on_status = None
         self.lock = threading.Lock()
 
-    def __call__(self, cfg):
+    def __call__(self, cfg, on_status=None):
+        # Mirrors _build_ocr_adapter: the plugin passes a status sink so the
+        # bundle download's progress reaches the card.
+        self.on_status = on_status
         with self.lock:
             self.calls += 1
         if self.delay:
@@ -337,7 +341,7 @@ def test_ocr_add_node_failure_leaks_nothing(monkeypatch):
 def test_ocr_load_failure_reports_error_and_retries(monkeypatch):
     calls = {"n": 0}
 
-    def flaky_builder(cfg):
+    def flaky_builder(cfg, on_status=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("download failed")
@@ -486,3 +490,105 @@ def test_ocr_start_on_retired_node_is_inert(ocr):
     assert result["state"] == "idle"
     assert len(node.subscriptions) == subscriptions_before
     assert not node.worker_alive
+
+
+# ── one-shot recognition ─────────────────────────────────────────────────────
+
+def _photo_plugin(monkeypatch, tmp_path):
+    """OCR plugin whose image roots are tmp_path and whose adapter is stubbed."""
+    cfg = {"provider": "rapidocr",
+           "image_roots": [str(tmp_path)],
+           "max_image_bytes": 1 << 20}
+    return _make_plugin(monkeypatch, cfg=cfg)
+
+
+def test_recognize_by_photo_loads_the_adapter_on_demand(monkeypatch, tmp_path):
+    """A photo question is useful with no camera running, so it waits for the
+    single-flight load rather than reporting `loading` and making callers poll."""
+    plugin, executor, builder = _photo_plugin(monkeypatch, tmp_path)
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"hello-world")
+
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": str(photo)})
+    assert result["ok"] is True
+    assert result["source"] == str(photo)
+    # The stubbed adapter echoes the bytes back as the recognised text, so this
+    # also proves the image reached it intact.
+    assert result["items"][0]["text"] == "hello-world"
+    assert executor.nodes == []          # nothing was started
+    assert builder.calls == 1
+
+
+def test_recognize_reuses_the_adapter_a_running_instance_already_built(monkeypatch, tmp_path):
+    """One adapter, not a second set of TensorRT engines on the same GPU."""
+    plugin, executor, builder = _photo_plugin(monkeypatch, tmp_path)
+    _start_and_wait(plugin, executor, "/cam/a")
+    assert builder.calls == 1
+
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"abc")
+    assert plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                   "image_path": str(photo)})["ok"] is True
+    assert builder.calls == 1
+    plugin.dispatch("ocr", {"action": "stop"})
+
+
+def test_recognize_by_photo_refuses_a_path_outside_the_roots(monkeypatch, tmp_path):
+    plugin, _, _ = _photo_plugin(monkeypatch, tmp_path)
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": "/etc/passwd"})
+    assert result["ok"] is False
+    assert result["reason"] == "bad_input"
+    assert "recognize_by_url" in result["detail"]
+
+
+def test_recognize_by_url_shares_the_photo_path(monkeypatch, tmp_path):
+    import plugins.image_input as image_input
+    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: b"from-url")
+    plugin, _, _ = _photo_plugin(monkeypatch, tmp_path)
+    result = plugin.dispatch("ocr", {"action": "recognize_by_url",
+                                     "url": "https://example.com/doc.jpg"})
+    assert result["ok"] is True
+    assert result["source"] == "https://example.com/doc.jpg"
+    assert result["items"][0]["text"] == "from-url"
+
+
+def test_recognize_surfaces_an_adapter_load_failure(monkeypatch, tmp_path):
+    def explode(cfg, on_status=None):
+        raise RuntimeError("no engines")
+
+    cfg = {"provider": "rapidocr", "image_roots": [str(tmp_path)]}
+    plugin, _, _ = _make_plugin(monkeypatch, builder=explode, cfg=cfg)
+    photo = tmp_path / "doc.jpg"
+    photo.write_bytes(b"x")
+    result = plugin.dispatch("ocr", {"action": "recognize_by_photo",
+                                     "image_path": str(photo)})
+    assert result["ok"] is False
+    assert result["reason"] == "adapter_unavailable"
+    assert "no engines" in result["detail"]
+
+
+def test_the_new_ocr_actions_are_advertised(monkeypatch, tmp_path):
+    schema = ocr_plugin.TOOLS[0]["inputSchema"]
+    assert {"recognize_by_photo", "recognize_by_url"} <= set(
+        schema["properties"]["action"]["enum"])
+    assert schema["x-action-params"]["recognize_by_photo"]["params"] == ["image_path"]
+    assert schema["properties"]["image_path"]["uploadTo"] == "mcp"
+
+
+def test_start_without_a_topic_comes_up_on_demand(ocr):
+    """A card with no camera still starts, as tts's does.
+
+    It loads the adapter and owns a publisher; it just has nothing to subscribe
+    to. Before this it raised, so a photo-only card could never show `running`.
+    """
+    plugin, executor, _ = ocr
+    plugin.dispatch("ocr", {"action": "start"})
+    assert _wait_until(lambda: len(executor.nodes) == 1
+                       and executor.nodes[0].state == "running")
+    node = executor.nodes[0]
+    assert node._input_topic == ""
+    assert node._output_topic == ocr_plugin.DEFAULT_OUTPUT_TOPIC
+    assert node.subscriptions == []          # nothing to subscribe to
+    assert set(plugin._nodes) == {"_default"}

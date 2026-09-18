@@ -9,6 +9,7 @@
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
+#   ./build_actucore.sh --jp-version 6.1         # VLA-only，保留上游本地推理
 #   ./build_actucore.sh --mirror tuna
 #   ./build_actucore.sh --base --mirror tuna     # 依赖变化时才构建 navigation base
 #   BUILD_JOBS=2 ./build_actucore.sh --base --mirror tuna  # 小内存 ARM64 主机
@@ -36,6 +37,8 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+
 
 RESOURCE_CENTER_URL="${RESOURCE_CENTER_URL:-https://motus.phanthy.com}"
 
@@ -70,7 +73,20 @@ case "${JP_VERSION}" in
     6.1) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
 esac
 
-if ${BUILD_BASE}; then
+CARDS_JSON='[{"name":"ControlledSemanticSpatial","type":"processor"},{"name":"vla","type":"processor"}]'
+if ! ${BUILD_BASE} && [ "${JP_VERSION}" = "6.1" ]; then
+    if [ -n "${ACTUCORE_NAVIGATION_BASE_IMAGE:-}" ]; then
+        echo "ERROR=JP6.1 navigation runtime is not supported; build VLA without a navigation override" >&2
+        exit 2
+    fi
+    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.vla"
+    IMAGE_NAME="actucore"
+    TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
+    BASE_IMAGE="${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}/${BASE_NAMESPACE:-phanthy-motus}/jetson-base-actucore:jp${JP_ARG}-torch"
+    BUILD_ARGS+=("JP_VERSION=${JP_ARG}" "BASE_IMAGE=${BASE_IMAGE}")
+    CARDS_JSON='[{"name":"vla","type":"processor"}]'
+    echo "[info] JP6.1: VLA providers enabled; navigation is unavailable on this image."
+elif ${BUILD_BASE}; then
     if ! ${IS_ARM64}; then
         echo "ERROR=build the navigation base on native ARM64, not through QEMU" >&2
         exit 2
@@ -209,8 +225,8 @@ if ! ${BUILD_BASE} && ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; 
                 \"cpu_arch\": \"${CPU_ARCH}\",
                 \"name\": \"ActuCore\",
                 \"port\": 15730,
-                \"description\": \"执行模型层，内置 ControlledSemanticSpatial 导航 processor 卡片\",
-                \"cards\": [{\"name\": \"ControlledSemanticSpatial\", \"type\": \"processor\"}]
+                \"description\": \"执行模型层（导航支持 JP5.11；VLA 按 JetPack 提供模型后端）\",
+                \"cards\": ${CARDS_JSON}
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then

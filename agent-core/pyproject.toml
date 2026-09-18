@@ -15,7 +15,17 @@ dependencies = [
     "lark-oapi>=1.4.0",
     "python-telegram-bot>=21.0",
     "slack-sdk>=3.27",
+    "zeroconf>=0.136.0",
+    "bleak>=0.21.0",
 ]
+
+# BLE *advertising* (peripheral mode) is deliberately NOT declared here.
+# `uv lock` resolves every declared extra, so a Linux-only, pre-1.0 package
+# would break the image build for everyone — including the ARM64 robots that
+# will never advertise over BLE. peer/ble_advertiser.py imports it lazily and
+# degrades to scan-only when absent; install it by hand on hosts that need it:
+#     pip install bluez-peripheral
+# See docs/PEER_SETUP.md § "Optional: BLE Advertising".
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple/"

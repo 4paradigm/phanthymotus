@@ -1,4 +1,6 @@
 /** text.js — Renders streaming text output */
+import { decodeNestedJson, plainValue, escapeHtml } from './json-util.js';
+
 export const TextRenderer = {
   name: 'text',
   canRender: (hint) => hint && (hint.startsWith('text/') || hint === 'data/json'),
@@ -81,26 +83,28 @@ export const TextRenderer = {
   unmount() { this._el?.remove(); this._el = null; this._textEl = null; },
 };
 
+/** How much of one value is shown inline; the rest is on the tooltip. */
+const VALUE_MAX = 200;
+
 function _formatJson(obj) {
-  // Compact single-line for small objects, otherwise pretty-print
-  const keys = Object.keys(obj);
-  if (keys.length <= 6) {
-    return keys.map(k => {
-      const v = obj[k];
-      const val = Array.isArray(v)
-        ? `[${v.map(n => typeof n === 'number' ? n.toFixed(3) : JSON.stringify(n)).join(', ')}]`
-        : JSON.stringify(v);
-      return `<b>${k}</b>: ${val}`;
-    }).join('  ');
-  }
-  // For larger objects, use compact key: value format (one per line)
-  return keys.map(k => {
-    const v = obj[k];
-    const val = Array.isArray(v)
-      ? `[${v.map(n => typeof n === 'number' ? n.toFixed(3) : JSON.stringify(n)).join(', ')}]`
-      : JSON.stringify(v);
-    return `<b>${k}</b>: ${val}`;
-  }).join('\n');
+  // Decode first: a field carrying a JSON *string* was previously rendered
+  // through JSON.stringify, which showed it as source text — escaped quotes and
+  // \uXXXX sequences instead of the object and the words it encodes.
+  const decoded = decodeNestedJson(obj);
+  const keys = Object.keys(decoded);
+  const rows = keys.map(k => {
+    const full = plainValue(decoded[k]);
+    // These cards are one grid column wide. A single unbroken value used to wrap
+    // into a ribbon of a few characters per line, which is not readable at any
+    // length — clip it and keep the whole thing reachable on hover.
+    const shown = full.length > VALUE_MAX ? `${full.slice(0, VALUE_MAX)}…` : full;
+    // escapeHtml because this is assigned through innerHTML and every part of it
+    // is publisher-controlled: a payload containing markup used to be parsed as
+    // markup.
+    return `<b>${escapeHtml(k)}</b>: <span title="${escapeHtml(full)}">${escapeHtml(shown)}</span>`;
+  });
+  // One line each once there are enough keys that a single run would be soup.
+  return rows.join(keys.length <= 6 ? '  ' : '\n');
 }
 
 /** Returns true if obj is {key: Array<object>} style state data suitable for table rendering */

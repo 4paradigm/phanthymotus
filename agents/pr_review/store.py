@@ -25,7 +25,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .models import BuildResult, ReviewJob
+from .models import BuildResult, ReviewJob, TestResult
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,7 @@ class JobStore:
             ("merged_at", "ALTER TABLE jobs ADD COLUMN merged_at TEXT"),
             ("perception_variants",
              "ALTER TABLE jobs ADD COLUMN perception_variants TEXT"),
+            ("skip_tests", "ALTER TABLE jobs ADD COLUMN skip_tests INTEGER"),
         ):
             if column not in existing:
                 conn.execute(ddl)
@@ -166,9 +167,9 @@ class JobStore:
                   review_rounds, review_stopped_reason, review_tool_calls,
                   pr_title, pr_body, pr_context,
                   pr_author, build_ref_sha, merge_commit_sha, merged_at,
-                  perception_variants
+                  perception_variants, skip_tests
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                          ?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job.id,
@@ -208,6 +209,7 @@ class JobStore:
                     job.merge_commit_sha,
                     job.merged_at,
                     json.dumps(job.perception_variants),
+                    int(job.skip_tests),
                 ),
             )
             conn.commit()
@@ -315,6 +317,50 @@ class JobStore:
         finally:
             conn.close()
 
+    async def save_test_result(self, job_id: str, idx: int, result: TestResult):
+        try:
+            await asyncio.to_thread(self._save_test_result_sync, job_id, idx, result)
+        except Exception as e:
+            logger.warning(f"Failed to persist test result {job_id}[{idx}]: {e}")
+
+    def _save_test_result_sync(self, job_id: str, idx: int, result: TestResult):
+        conn = self._connect()
+        try:
+            # INSERT OR REPLACE for the same reason as build results: the
+            # worker writes a status=NULL placeholder before the run starts so
+            # the dashboard has a pane to tail, then overwrites it.
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO test_results (
+                  job_id, idx, component, status, image_tag,
+                  passed, failed, skipped, errors, total,
+                  failing_ids, log_path, duration_seconds, timeout_kind,
+                  skip_reason, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    job_id,
+                    idx,
+                    result.component,
+                    result.status,
+                    result.image_tag,
+                    result.passed,
+                    result.failed,
+                    result.skipped,
+                    result.errors,
+                    result.total,
+                    json.dumps(result.failing_ids),
+                    result.log_path,
+                    result.duration_seconds,
+                    result.timeout_kind,
+                    result.skip_reason,
+                    time.time(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     # ── Reads ─────────────────────────────────────────────────────────────────
 
     async def list_jobs(
@@ -378,6 +424,27 @@ class JobStore:
                     })
                 for j in jobs:
                     j["build_results"] = by_job.get(j["id"], [])
+
+                tr = conn.execute(
+                    f"""SELECT job_id, idx, component, status,
+                               passed, failed, errors, skipped
+                        FROM test_results WHERE job_id IN ({marks})
+                        ORDER BY job_id, idx""",
+                    ids,
+                ).fetchall()
+                tests_by_job: dict[str, list[dict]] = {}
+                for row in tr:
+                    tests_by_job.setdefault(row["job_id"], []).append({
+                        "idx": row["idx"],
+                        "component": row["component"],
+                        "status": row["status"],
+                        "passed": row["passed"] or 0,
+                        "failed": row["failed"] or 0,
+                        "errors": row["errors"] or 0,
+                        "skipped": row["skipped"] or 0,
+                    })
+                for j in jobs:
+                    j["test_results"] = tests_by_job.get(j["id"], [])
             return jobs, total
         finally:
             conn.close()
@@ -447,6 +514,30 @@ class JobStore:
                 }
                 for r in br
             ]
+            tr = conn.execute(
+                """SELECT * FROM test_results
+                   WHERE job_id = ? ORDER BY idx""",
+                (job_id,),
+            ).fetchall()
+            job["test_results"] = [
+                {
+                    "idx": r["idx"],
+                    "component": r["component"],
+                    "status": r["status"],
+                    "image_tag": _col(r, "image_tag", ""),
+                    "passed": r["passed"] or 0,
+                    "failed": r["failed"] or 0,
+                    "skipped": r["skipped"] or 0,
+                    "errors": r["errors"] or 0,
+                    "total": r["total"] or 0,
+                    "failing_ids": _load_json(r["failing_ids"], []),
+                    "has_log": bool(r["log_path"]) and Path(r["log_path"]).exists(),
+                    "duration_seconds": r["duration_seconds"],
+                    "timeout_kind": _col(r, "timeout_kind", ""),
+                    "skip_reason": _col(r, "skip_reason", ""),
+                }
+                for r in tr
+            ]
             return job
         finally:
             conn.close()
@@ -497,6 +588,17 @@ class JobStore:
                 "SELECT log_path FROM build_results WHERE job_id = ? AND idx = ?",
                 (job_id, idx),
             ).fetchone()
+            if row is None:
+                # Test logs live in the same directory under their own indices
+                # (tester.TEST_IDX_BASE and up). Asked explicitly rather than
+                # left to the glob below: relying on "the primary lookup misses
+                # and the fallback happens to find it" makes the fallback
+                # load-bearing for a whole class of log.
+                row = conn.execute(
+                    "SELECT log_path FROM test_results "
+                    "WHERE job_id = ? AND idx = ?",
+                    (job_id, idx),
+                ).fetchone()
         finally:
             conn.close()
 
@@ -644,6 +746,7 @@ class JobStore:
                 return 0
             marks = ",".join("?" * len(stale))
             conn.execute(f"DELETE FROM build_results WHERE job_id IN ({marks})", stale)
+            conn.execute(f"DELETE FROM test_results WHERE job_id IN ({marks})", stale)
             conn.execute(f"DELETE FROM jobs WHERE id IN ({marks})", stale)
             conn.commit()
         finally:
@@ -686,6 +789,7 @@ class JobStore:
             "finished_at": row["finished_at"],
             "elapsed": _elapsed(row["started_at"], row["finished_at"]),
             "build_results": [],
+            "test_results": [],
         }
 
     @classmethod
@@ -696,6 +800,7 @@ class JobStore:
             "options": {
                 "skip_build": bool(row["skip_build"]),
                 "build_only": bool(row["build_only"]),
+                "skip_tests": bool(_col(row, "skip_tests", 0)),
                 "force_targets": _load_json(row["force_targets"], []),
                 "perception_variants": _load_json(
                     _col(row, "perception_variants", ""), []
@@ -771,6 +876,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   attempt INTEGER DEFAULT 0,
   skip_build INTEGER DEFAULT 0,
   build_only INTEGER DEFAULT 0,
+  skip_tests INTEGER DEFAULT 0,
   force_targets TEXT,
   perception_variants TEXT,
   review_text TEXT,
@@ -814,4 +920,30 @@ CREATE TABLE IF NOT EXISTS build_results (
   UNIQUE(job_id, idx)
 );
 CREATE INDEX IF NOT EXISTS idx_br_job ON build_results(job_id);
+
+-- Its own table rather than a reuse of build_results: the shapes genuinely
+-- differ (a five-valued status against a tri-state success, four counts, a
+-- list of failing ids), and sharing the table would make the dashboard render
+-- test rows through buildPill/targetLabel as though they were builds.
+CREATE TABLE IF NOT EXISTS test_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL,
+  idx INTEGER NOT NULL,
+  component TEXT,
+  status TEXT,             -- NULL while running; see models.TestResult
+  image_tag TEXT,
+  passed INTEGER,
+  failed INTEGER,
+  skipped INTEGER,
+  errors INTEGER,
+  total INTEGER,
+  failing_ids TEXT,        -- json
+  log_path TEXT,
+  duration_seconds REAL,
+  timeout_kind TEXT,
+  skip_reason TEXT,
+  created_at REAL NOT NULL,
+  UNIQUE(job_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_tr_job ON test_results(job_id);
 """

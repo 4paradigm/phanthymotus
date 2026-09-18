@@ -5,7 +5,7 @@ Lives in its own module so both `trigger` (acknowledgment) and `worker`
 """
 
 from .builder import split_image_ref
-from .models import BuildResult
+from .models import BuildResult, TestResult
 from .reviewer import Finding
 
 # Marker prefixed to every bot comment, so bot comments are identifiable.
@@ -21,6 +21,9 @@ COMMENT_BUDGET = 60000
 # many-failure jobs (a driver PR touching a dozen drivers) link to the dashboard
 # instead of padding the comment with a dozen unreadable snippets.
 MIN_USEFUL_LOG_CHARS = 1500
+# A failing suite can name hundreds of tests; past the first few the list stops
+# being a pointer and starts being the log.
+MAX_LISTED_FAILING_TESTS = 20
 
 MODE_LABELS = {
     (False, False): "Build + Review",
@@ -36,13 +39,19 @@ def format_ack(
     skip_build: bool,
     build_only: bool,
     source: str,
+    skip_tests: bool = False,
 ) -> str:
     """Immediate acknowledgment posted when a job is accepted.
 
     This same comment is edited in place to show build progress and results,
     so a PR gets one comment that tracks progress rather than one per stage.
     """
+    # Appended rather than folded into MODE_LABELS: that table exists to name
+    # four modes, and a third key dimension would make it eight rows to say one
+    # extra word.
     mode = MODE_LABELS.get((skip_build, build_only), "Build + Review")
+    if skip_tests:
+        mode += " · tests skipped"
     source_label = "polling" if source == "poll" else "webhook"
 
     return f"""{BOT_MARKER}
@@ -81,12 +90,25 @@ def format_building(
 | Status | Building... |
 
 Builds usually take 5–20 minutes, and longer when something compiles from source.
-This comment will be updated when done.
+This comment will be updated when done, and the test suites run after that — as
+their own comment, so the build result stays put once you have it.
 """
 
 
-def format_build_result(head_sha: str, results: list[BuildResult]) -> str:
-    """Final build state — success or failure, with logs for failures."""
+def format_build_result(
+    head_sha: str,
+    results: list[BuildResult],
+    tests_pending: list[str] | None = None,
+) -> str:
+    """Final build state — success or failure, with logs for failures.
+
+    `tests_pending` names the suites that will run next, so the reader knows a
+    second comment is coming. The results themselves go in that separate
+    comment (`format_test_result`) rather than being folded back in here: this
+    body is what somebody is reading while they pull an image and deploy it,
+    and rewriting it minutes later would move the refs and the deploy
+    instructions out from under them.
+    """
     rows = []
     for r in results:
         name = r.label()
@@ -166,6 +188,14 @@ Commit: `{head_sha[:7]}`
             f"dashboard.\n"
         )
 
+    if tests_pending:
+        listed = ", ".join(f"`{n}`" for n in tests_pending)
+        body += (
+            f"\n### Tests\n\nRunning {listed} inside the image(s) above — the "
+            f"results will arrive as a **separate comment**, so nothing here "
+            f"changes. They do not block the review.\n"
+        )
+
     # Logs last, and sharing whatever the rest of the comment left over: the
     # author reads the log to fix the build, so it gets the space, but the table
     # and image refs above it must survive intact. Splitting the remainder
@@ -193,6 +223,117 @@ Commit: `{head_sha[:7]}`
     return body
 
 
+def format_test_result(head_sha: str, tests: list[TestResult]) -> str:
+    """Test results, as their own comment.
+
+    Separate from the build comment on purpose. That one is what somebody is
+    reading while they pull an image and deploy it, and the suites finish
+    minutes after it is posted — rewriting it then would move the image refs
+    and the deploy commands out from under them. It is also simpler: the logs
+    here get the whole comment budget instead of competing with a failed
+    build's.
+
+    Returns "" when nothing actually ran: a PR that built no images has nothing
+    to say about tests, and a table of "not run" rows on every `skip-build` job
+    is noise that trains people to ignore it. Those rows are still persisted
+    and shown on the dashboard.
+    """
+    ran = [t for t in tests if t.status not in (None, "skipped")]
+    if not ran:
+        return ""
+
+    rows = []
+    for t in tests:
+        took = _fmt_took(t.duration_seconds)
+        if t.status == "passed":
+            verdict = ":white_check_mark: Passed"
+        elif t.status == "failed":
+            verdict = f":x: {t.failed + t.errors} failed"
+        elif t.status == "skipped":
+            verdict = ":heavy_minus_sign: Not run"
+        elif t.timeout_kind:
+            verdict = ":hourglass: Killed"
+        else:
+            verdict = ":warning: Could not run"
+        rows.append(
+            f"| {t.component} | {verdict} | {t.passed} | {t.failed} | {took} |"
+        )
+
+    images = sorted({t.image_tag for t in ran if t.image_tag})
+    ran_in = (
+        "\n".join(f"- `{ref}`" for ref in images)
+        if images else "- (image reference unavailable)"
+    )
+
+    body = f"""{BOT_MARKER}
+## PR Review Agent — Test Results
+
+Commit: `{head_sha[:7]}`
+
+| Suite | Result | Passed | Failed | Took |
+|-------|--------|--------|--------|------|
+{chr(10).join(rows)}
+
+Run inside the image(s) built from this commit, so these are this PR's code on
+the Python it actually ships:
+
+{ran_in}
+"""
+
+    # Said explicitly, because a red X next to a review that got posted anyway
+    # reads as a bug in the agent rather than a deliberate policy.
+    if any(t.status == "failed" for t in tests):
+        body += (
+            "\n> Test failures do not block the review — the review is posted "
+            "either way, and was generated with these failures as context.\n"
+        )
+
+    # An `error` is ours, not the PR's, and saying so stops the author hunting
+    # for a bug they did not write.
+    for t in tests:
+        if t.status == "error":
+            body += (
+                f"\n> :warning: `{t.component}` could not be run: "
+                f"{t.skip_reason or 'no verdict'}. This is an agent-side "
+                f"problem, not a finding about this PR.\n"
+            )
+        elif t.status == "skipped":
+            body += f"\n> `{t.component}` not run — {t.skip_reason}\n"
+
+    failing = [(t, t.failing_ids) for t in tests if t.failing_ids]
+    if failing:
+        body += "\n<details>\n<summary>Failing tests</summary>\n\n"
+        for t, ids in failing:
+            body += f"**{t.component}**\n\n"
+            for test_id in ids[:MAX_LISTED_FAILING_TESTS]:
+                body += f"- `{test_id}`\n"
+            if len(ids) > MAX_LISTED_FAILING_TESTS:
+                body += f"- … and {len(ids) - MAX_LISTED_FAILING_TESTS} more\n"
+            body += "\n"
+        body += "</details>\n"
+
+    # Logs get the whole budget here — no failed build to share it with, which
+    # is the other reason this is its own comment.
+    bad = [t for t in tests if t.status in ("failed", "error") and t.log_tail]
+    if bad:
+        share = (COMMENT_BUDGET - len(body)) // len(bad)
+        if share >= MIN_USEFUL_LOG_CHARS:
+            for t in bad:
+                body += _log_details(t.label(), t.log_tail, share, "run")
+        else:
+            names = ", ".join(f"`{t.label()}`" for t in bad)
+            body += (
+                f"\n> Logs omitted — too long to include here. Open the "
+                f"dashboard for the full output of: {names}.\n"
+            )
+
+    body += (
+        "\n---\n<sub>Tests run automatically after each build. "
+        "`/request_bot_review skip-tests` to skip them.</sub>\n"
+    )
+    return body
+
+
 def _fmt_took(seconds: float | None) -> str:
     """A build's wall clock, for the result table. "—" while still building.
 
@@ -212,8 +353,8 @@ def _fmt_took(seconds: float | None) -> str:
     return f"{h}h {m:02d}m"
 
 
-def _log_details(name: str, log_tail: str, budget: int) -> str:
-    """One collapsed build log, trimmed only if it cannot fit.
+def _log_details(name: str, log_tail: str, budget: int, kind: str = "build") -> str:
+    """One collapsed log, trimmed only if it cannot fit.
 
     The whole tail goes in when there is room. Sending the author to the
     dashboard for the actual error is friction at the moment they are most
@@ -266,7 +407,7 @@ def _log_details(name: str, log_tail: str, budget: int) -> str:
     # npm or docker step echoing a README would otherwise close the block early
     # and spill the rest of the log into the comment as markup.
     return f"""
-<details><summary>{name} build log ({note})</summary>
+<details><summary>{name} {kind} log ({note})</summary>
 
 ````
 {text}
@@ -356,6 +497,10 @@ def format_review(findings: list[Finding], review_text: str, job=None) -> str:
     if job is not None:
         body += _format_large_files(job)
         body += _format_infra(job)
+        # One line, no logs. This comment is often read on its own — it is a
+        # separate comment from the build one — and a reviewer should not have
+        # to scroll up to learn a suite was red.
+        body += _format_test_summary(getattr(job, "test_results", None) or [])
 
     if findings:
         body += "\n### Rule Checks\n\n"
@@ -371,6 +516,28 @@ def format_review(findings: list[Finding], review_text: str, job=None) -> str:
         body += _format_review_budget(job)
 
     body += "\n---\n<sub>Generated automatically by PR Review Agent.</sub>\n"
+    return body
+
+
+def _format_test_summary(tests: list[TestResult]) -> str:
+    """One line per suite for the review comment. Logs stay in the build one."""
+    ran = [t for t in tests if t.status not in (None, "skipped")]
+    if not ran:
+        return ""
+    body = "\n### Tests\n\n"
+    for t in tests:
+        if t.status == "skipped":
+            body += f"- {t.component} — not run ({t.skip_reason})\n"
+        elif t.status == "error":
+            body += f"- {t.component} — could not be run ({t.skip_reason})\n"
+        elif t.status == "failed":
+            body += (
+                f"- {t.component} — {t.passed} passed, "
+                f"**{t.failed + t.errors} failed** "
+                f"(details in the test results comment above)\n"
+            )
+        elif t.status == "passed":
+            body += f"- {t.component} — {t.passed} passed\n"
     return body
 
 
@@ -593,4 +760,75 @@ Commit: `{head_sha[:7]}`
 ```
 
 Push a fix and comment `/request_bot_review` again to retrigger.
+"""
+
+
+def format_help_message() -> str:
+    """Help message explaining how to use the bot review command."""
+    return f"""{BOT_MARKER}
+## PR Review Agent — Usage
+
+### Basic Usage
+```
+/request_bot_review
+```
+Triggers a full build and review of the current PR head commit.
+
+### Options
+
+- **`help`** — Show this help message
+  ```
+  /request_bot_review help
+  ```
+
+- **`force`** — Re-review a commit that was already reviewed
+  ```
+  /request_bot_review force
+  ```
+
+- **`skip-build`** — Skip the build step, only run the review (requires cached build)
+  ```
+  /request_bot_review skip-build
+  ```
+
+- **`build-only`** — Only build, skip the review step
+  ```
+  /request_bot_review build-only
+  ```
+
+- **`skip-tests`** — Skip running `agent-core/tests` / `perception/tests` /
+  `actucore/tests` in the images this job builds. They run by default, do not
+  block the review, and are fed to the reviewer as context.
+  ```
+  /request_bot_review skip-tests
+  ```
+
+- **Target Selection** — Build specific components
+  ```
+  /request_bot_review core           # Build core only
+  /request_bot_review perception     # Build perception only
+  /request_bot_review actucore       # Build actucore only
+  /request_bot_review unitree/g1     # Build specific driver
+  ```
+
+- **JetPack Variants** — Build perception or actucore for specific JetPack
+  versions. A version on its own means perception; next to `actucore` it
+  applies to actucore alone.
+  ```
+  /request_bot_review jp511            # perception, JetPack 5.11
+  /request_bot_review jp61             # perception, JetPack 6.1
+  /request_bot_review jp511 jp61       # Both versions
+  /request_bot_review actucore jp61    # actucore only, JetPack 6.1
+  ```
+
+### Combining Options
+```
+/request_bot_review force perception jp61
+/request_bot_review core unitree/g1
+```
+
+### Notes
+- Only one review runs at a time per commit. Repeat triggers on the same commit are skipped unless `force` is specified.
+- Build artifacts are cached, so `skip-build` works only after a successful build.
+- Reviews typically take 15-25 minutes depending on the PR size and build targets.
 """

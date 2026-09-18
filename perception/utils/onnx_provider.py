@@ -193,3 +193,132 @@ def pick_weights(model_dir: str, *candidates: str) -> str:
         if os.path.exists(path):
             return path
     return os.path.join(model_dir, candidates[-1]) if candidates else ""
+
+
+# ── standalone onnxruntime ────────────────────────────────────────────────────
+# Everything above concerns the ONNX Runtime *bundled inside the sherpa-onnx
+# wheel*, which is the only one ASR and sherpa TTS can see. The face plugin uses
+# the standalone `onnxruntime` package, a completely separate build with its own
+# provider list — `cuda_available()` says nothing about it, and using that here
+# would report gpu support the face sessions do not have (or miss support they
+# do). Hence a second, independent probe.
+
+@lru_cache(maxsize=1)
+def onnxruntime_providers() -> tuple[str, ...]:
+    """Execution providers the installed `onnxruntime` package offers.
+
+    Empty when the package is absent, so a caller can distinguish "no GPU" from
+    "no onnxruntime at all". Unlike `cuda_available()` this is a real query
+    rather than a file probe: `get_available_providers()` is a cheap C call that
+    does not create a session or touch the driver.
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return ()
+    try:
+        return tuple(ort.get_available_providers())
+    except Exception:  # noqa: BLE001 - a broken install must not crash startup
+        log.warning("[onnx_provider] onnxruntime is installed but would not "
+                    "report its providers", exc_info=True)
+        return ()
+
+
+def ort_providers_for_device(device: str) -> list[str]:
+    """Provider list for `InferenceSession(..., providers=...)`.
+
+    `auto` (the default for the face plugin) means **use the GPU when there is
+    one**: CUDA if the installed wheel offers it, else TensorRT, else CPU. It
+    never warns, because resolving to cpu is the expected outcome on a
+    CPU-wheel image rather than a misconfiguration.
+
+    An explicit `gpu` that cannot be honoured *does* warn but still degrades —
+    same policy as `provider_for_device`: a `device: gpu` baked into a
+    config.yaml on an image carrying the CPU-only wheel should still boot a
+    working recogniser, with the reason in the log.
+
+    A *missing package* raises, because there is nothing to degrade to. The
+    plugin's background loader turns that into its `error` state and surfaces
+    the message in the dashboard, which is where someone is watching.
+
+    CPU is always appended as the fallback provider. ORT falls back per node
+    anyway, and naming it explicitly is what makes an unsupported op degrade
+    instead of failing session creation.
+    """
+    # Strip before defaulting: a config field left blank (or whitespace, which
+    # is what a cleared form control sends) means "unset", i.e. auto — not an
+    # unknown device to warn about. Same treatment normalize_device gives "".
+    requested = (device or "").strip().lower() or "auto"
+    available = onnxruntime_providers()
+    if not available:
+        raise ImportError(
+            "onnxruntime is not installed; the face recognition plugin needs it "
+            "(see the onnxruntime layer in perception/Dockerfile.jetson)"
+        )
+
+    if requested in ("auto", "gpu", "cuda", "nvidia"):
+        for provider in ("CUDAExecutionProvider", "TensorrtExecutionProvider"):
+            if provider in available:
+                return [provider, "CPUExecutionProvider"]
+        if requested != "auto":
+            log.warning("[onnx_provider] device=%r but the installed onnxruntime "
+                        "has no GPU provider (available: %s) — falling back to cpu",
+                        device, ", ".join(available))
+    elif requested != "cpu":
+        log.warning("[onnx_provider] unknown device %r, using cpu", device)
+    return ["CPUExecutionProvider"]
+
+
+def cpu_topology() -> tuple[int, int]:
+    """(present, online) CPU counts from sysfs; (0, 0) when unreadable.
+
+    Used only to warn. ONNX Runtime 1.19.x reads the *present* list, pins
+    threads to every core in it, and indexes a vector sized by the *online*
+    count — so on a Jetson where a power mode has parked some cores
+    (Tianyi in MODE_30W: present 0-11, online 0-7) `pthread_setaffinity_np`
+    returns EINVAL and the process abort()s inside `InferenceSession()`, taking
+    all of perception with it. The pinned versions do not do this, but a future
+    bump could reintroduce it, and the abort leaves no Python traceback anyone
+    can act on — so say the precondition out loud at load time.
+    """
+    def _count(path: str) -> int:
+        try:
+            with open(path) as handle:
+                spec = handle.read().strip()
+        except OSError:
+            return 0
+        total = 0
+        for chunk in spec.split(","):
+            if not chunk:
+                continue
+            if "-" in chunk:
+                low, _, high = chunk.partition("-")
+                total += int(high) - int(low) + 1
+            else:
+                total += 1
+        return total
+
+    return (_count("/sys/devices/system/cpu/present"),
+            _count("/sys/devices/system/cpu/online"))
+
+
+def warn_on_parked_cores(label: str = "onnx_provider") -> None:
+    """Log a warning when some CPUs are present but offline. See cpu_topology."""
+    present, online = cpu_topology()
+    if present and online and present != online:
+        log.warning(
+            "[%s] %d CPUs present but only %d online — this is the condition "
+            "under which onnxruntime 1.19.x abort()s during session creation "
+            "(pthread_setaffinity_np EINVAL on a parked core). Installed "
+            "onnxruntime is %s.",
+            label, present, online,
+            _installed_ort_version() or "not installed",
+        )
+
+
+def _installed_ort_version() -> str:
+    try:
+        import onnxruntime
+        return str(onnxruntime.__version__)
+    except Exception:  # noqa: BLE001
+        return ""

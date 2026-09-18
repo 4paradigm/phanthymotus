@@ -11,12 +11,17 @@
  * Cards: pointer-capture drag within viewport (world coords)
  */
 
+import { showToast } from './toast.js';
+
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
-import { selectPreviewTopic } from './topic-derive.js';
+// Shared with the monitor dashboard so both sides shape the `info` call the
+// same way, and with api/config.py's _start_and_resolve so the canvas and the
+// start agree about what a card consumes.
+import { inputArgs, inputKey, selectPreviewTopic } from './topic-derive.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -31,6 +36,11 @@ let _allMcps    = [];
 // also sent on the /ws/motus connection — the backend releases this session's
 // lock shortly after that socket drops, so closing/killing the tab frees the
 // canvas without depending on an unload handler firing.
+//
+// The lock also expires after 60s of *idleness*, tab open or not. Holding it
+// therefore means proving activity: _pingEdit below renews it from real user
+// input. Nothing else may renew — a poll that renewed would make an open tab
+// immortal, which is the bug this replaces.
 const _sessionId = sessionId();
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
@@ -65,27 +75,105 @@ async function _ensureEdit() {
   }
 }
 
+// Thin wrapper over the shared implementation so every existing call site
+// keeps working unchanged; the canvas still hosts its toast inside _canvasEl.
 function _showToast(msg) {
-  const old = document.getElementById('canvas-toast');
-  if (old) old.remove();
-  const toast = document.createElement('div');
-  toast.id = 'canvas-toast';
-  toast.textContent = msg;
-  toast.style.cssText = 'position:absolute;bottom:80px;left:50%;transform:translateX(-50%);width:fit-content;max-width:80%;background:rgba(28,25,23,.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:9999;pointer-events:none;opacity:0;animation:canvas-toast-in 2.5s ease forwards;';
-  _canvasEl.appendChild(toast);
-  setTimeout(() => toast.remove(), 2600);
+  showToast(msg, _canvasEl);
 }
 
 // Connection state
-let _connections = [];  // [{id, fromCardId, fromPort, toCardId, toPort, format}]
+let _connections = [];  // [{id, fromCardId, fromPortIdx, toCardId, toPortIdx, format, fromTopic}]
 let _execConnections = []; // [{id, fromCardId, toCardId, toToolName, toMcpId}]
 let _draggingConn = null; // {fromCardId, fromPortEl, format, topic, tempPath, type?}
 
-// Project run state
+// Live connector DOM, keyed by connection id. Connectors are updated in place
+// rather than torn down and rebuilt on every redraw: a redraw runs on every
+// pointermove of a card drag, and recreating the paths there dropped the
+// :hover that was keeping the × button open and re-bound every listener 60x a
+// second.
+const _connEls = new Map();  // connId -> {hit, line, btn}
+
+// Card being dragged right now (null when idle). The MCP poll must not swap
+// card elements out from under an active pointer capture — see updateCanvasMcps.
+let _draggingCardId = null;
+let _mcpsPendingRefresh = false;
+
+// Project run state.
+//
+// `_projectRunning` starts false, which is a guess, not knowledge — the real
+// answer only arrives when /api/config/project-running resolves. The canvas
+// meanwhile renders and becomes clickable: measured on Orin 5, cards and their
+// × buttons are on screen at t=318ms and this is still false until t=470ms.
+// Every edit guard reads it, so for that window all of them were open on a
+// running project, and the operation went through in silence — a card delete
+// claimed the edit lock, stopped the plugin instance, and saved the layout.
+// The window has no upper bound: it is however long that request takes, and it
+// is longest exactly when the machine is busy starting the project.
+//
+// `_projectStateKnown` closes it by separating "stopped" from "not yet known"
+// and refusing edits for both.
 let _projectRunning = false;
+let _projectStateKnown = false;
 
 export function isProjectRunning() { return _projectRunning; }
-export function redrawCanvas() { _redrawConnections(); }
+
+/** Why editing is refused right now, or '' when it is allowed. */
+function _editLockReason() {
+  if (!_projectStateKnown) return '正在确认运行状态，请稍候重试';
+  if (_projectRunning) return '请停止智能控制后修改';
+  return '';
+}
+
+/**
+ * Refuse an edit if the project is running — or if we cannot yet tell.
+ *
+ * Returns true when the caller must stop. Says so with a toast: these refusals
+ * used to go only to _logActivity, which appends a line to the activity strip
+ * at the bottom of the page, interleaved with the mcp_call/mcp_result traffic.
+ * Clicking × on a card therefore looked like nothing happened at all. Every
+ * other user-facing refusal in this file already uses a toast; these three
+ * (delete card, draw connection, delete connection) were the exceptions.
+ */
+function _refuseEdit() {
+  const reason = _editLockReason();
+  if (!reason) return false;
+  _showToast(reason);
+  _logActivity('warn', reason);
+  return true;
+}
+
+/** Same question without the toast, for paths that show their own rejection. */
+function _editsLocked() { return _editLockReason() !== ''; }
+
+/**
+ * Ask the backend for the run state, retrying until it answers.
+ *
+ * Editing is refused while the answer is unknown, so giving up would leave the
+ * canvas read-only until the next reload. Backs off to 5s and keeps trying;
+ * a WebSocket `project_state` event resolves it too, whichever lands first.
+ */
+function _syncProjectState(delay = 500) {
+  return fetch('/api/config/project-running')
+    .then(r => r.json())
+    .then(d => { _applyProjectState(d.running); return true; })
+    .catch(() => {
+      if (!_projectStateKnown) {
+        setTimeout(() => _syncProjectState(Math.min(delay * 2, 5000)), delay);
+      }
+      return false;
+    });
+}
+
+/** Record what the backend says about the run state, and unblock editing. */
+function _applyProjectState(running) {
+  _projectRunning = !!running;
+  _projectStateKnown = true;
+  _syncProjectBtn();
+  document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+    btn.classList.toggle('locked', !_projectRunning);
+  });
+}
+export function redrawCanvas() { _scheduleRedraw(); }
 export function ensureEdit() { return _ensureEdit(); }
 export function isEditor() { return _isEditor; }
 
@@ -102,7 +190,7 @@ export function reloadFromServer() { return _reloadLayout(); }
  * Returns true if added, false if rejected.
  */
 export async function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
-  if (_projectRunning) return false;
+  if (_refuseEdit()) return false;
   if (!(await _ensureEdit())) return false;
   if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
   if (!multiInstance) {
@@ -129,6 +217,53 @@ const ZOOM_MIN  = 0.25;
 const ZOOM_MAX  = 2.5;
 const ZOOM_STEP = 0.1;
 
+// ── Per-client viewport persistence ───────────────────────────────────────────
+//
+// Where you are looking is a property of *this* viewer, not of the shared
+// document. It used to be written only inside _saveLayout, which returns early
+// unless this session holds the editor lock — and the lock has to be claimed
+// explicitly, so for an ordinary viewer the transform was never stored anywhere
+// and every refresh snapped back to wherever the last editor had left it.
+// localStorage also keeps one person's panning from yanking everyone else's view
+// on their next load, which sharing it through the layout did.
+const VIEWPORT_KEY = 'canvas-viewport-v1';
+
+let _viewportTimer = null;
+/** Remember this browser's zoom/pan. Debounced — a pinch fires continuously. */
+function _saveViewport() {
+  clearTimeout(_viewportTimer);
+  _viewportTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(VIEWPORT_KEY, JSON.stringify({ zoom: _zoom, tx: _tx, ty: _ty }));
+    } catch { /* private mode or quota — a remembered view is a nicety, never a blocker */ }
+  }, 300);
+}
+
+/**
+ * This browser's last transform, or null if it has none.
+ *
+ * Validated rather than trusted: a NaN or an out-of-range zoom coming back out
+ * of storage would render the canvas blank or microscopic, and — being
+ * persisted — it would do so on every subsequent load with no way back short of
+ * clearing site data.
+ */
+function _loadViewport() {
+  let raw = null;
+  try { raw = localStorage.getItem(VIEWPORT_KEY); } catch { return null; }
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    if (!Number.isFinite(v?.zoom) || !Number.isFinite(v?.tx) || !Number.isFinite(v?.ty)) return null;
+    return { zoom: Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, v.zoom)), tx: v.tx, ty: v.ty };
+  } catch { return null; }
+}
+
+/** Called after any zoom or pan the user drove. */
+function _viewportChanged() {
+  _saveViewport();
+  _debouncedSave();  // keeps the server copy current when this session is the editor
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 export async function initCanvas(initialMcps) {
@@ -145,6 +280,8 @@ export async function initCanvas(initialMcps) {
   _setupDropZone();
   _setupControlButtons();
   _setupPortDrag();
+  _setupPortTooltip();
+  _syncGeometryObservers();
 
   // Load persisted layout
   try {
@@ -164,7 +301,7 @@ export async function initCanvas(initialMcps) {
       c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId)
     );
     _resolveAllTopics();
-    _redrawConnections();
+    _scheduleRedraw();
 
     // Cards whose topic_out is derived resolve inside _resolveAllTopics now
     // (_revalidateDerivedTopics). The bespoke recovery that used to live here
@@ -172,17 +309,29 @@ export async function initCanvas(initialMcps) {
     // connection, which missed both a stale non-empty topic and a leaf card like
     // TTS.
 
-    // Restore viewport transform if saved
-    if (layoutJson.data?.transform) {
-      _zoom = layoutJson.data.transform.zoom ?? 1;
-      _tx   = layoutJson.data.transform.tx   ?? 0;
-      _ty   = layoutJson.data.transform.ty   ?? 0;
+    // Restore the viewport. This browser's own last position wins over the one
+    // in the shared layout, which is only ever whatever the last editor left;
+    // the layout copy is the fallback for a browser that has none of its own.
+    const savedView  = _loadViewport();
+    const serverView = layoutJson.data?.transform;
+    if (savedView) {
+      ({ zoom: _zoom, tx: _tx, ty: _ty } = savedView);
+      _applyTransform();
+    } else if (serverView) {
+      _zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, serverView.zoom ?? 1));
+      _tx   = serverView.tx ?? 0;
+      _ty   = serverView.ty ?? 0;
       _applyTransform();
     }
 
-    // On mobile, auto-fit cards to viewport instead of using saved desktop transform
-    if (window.innerWidth <= 768 && _cards.length > 0) {
+    // First visit on a phone: a transform set on a desktop frames nothing
+    // useful at this width, so fit the cards instead — and remember the result,
+    // so the next load restores rather than re-fits. Only when this browser has
+    // no view of its own: re-fitting unconditionally, as this did before,
+    // discarded the pinch-zoom the user had just set on every single refresh.
+    if (window.innerWidth <= 768 && _cards.length > 0 && !savedView) {
       _fitToViewport();
+      _saveViewport();
     }
 
     // Initialize editor lock state from layout response
@@ -193,29 +342,22 @@ export async function initCanvas(initialMcps) {
   // Show editor status bar
   _updateEditorUI();
 
-  // Restore project running state from backend
-  try {
-    const runRes = await fetch('/api/config/project-running');
-    const runData = await runRes.json();
-    if (runData.running) {
-      _projectRunning = true;
-      _syncProjectBtn();
-      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
-    }
-  } catch { /* ignore */ }
+  // Restore project running state from backend. Editing stays refused until
+  // this answers, so a failure must not leave the canvas locked for good —
+  // retry until it does. The old version swallowed the error and left
+  // `_projectRunning` at its false default, which read as "stopped" and opened
+  // every guard on a robot that was in fact running.
+  _syncProjectState();
 
   // Cross-tab sync: listen for project_state / editor-lock / layout events via WebSocket
   const { onMotusEvent } = await import('./motus-stream.js');
   onMotusEvent(null, (event) => {
     if (event.type === 'project_state') {
-      const running = event.payload?.running;
-      if (running !== _projectRunning) {
-        _projectRunning = running;
-        _syncProjectBtn();
-        document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-          btn.classList.toggle('locked', !_projectRunning);
-        });
-      }
+      const running = !!event.payload?.running;
+      // Applied even when it matches what we hold: this is also the first
+      // authoritative answer some page loads get, and it is what marks the
+      // state known.
+      if (running !== _projectRunning || !_projectStateKnown) _applyProjectState(running);
     } else if (event.type === 'canvas_editor') {
       _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
     } else if (event.type === 'canvas_layout') {
@@ -228,15 +370,7 @@ export async function initCanvas(initialMcps) {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       _checkEditStatus();
-      fetch('/api/config/project-running').then(r => r.json()).then(d => {
-        if (d.running !== _projectRunning) {
-          _projectRunning = d.running;
-          _syncProjectBtn();
-          document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-            btn.classList.toggle('locked', !_projectRunning);
-          });
-        }
-      }).catch(() => {});
+      _syncProjectState();
     }
   });
 
@@ -245,6 +379,13 @@ export async function initCanvas(initialMcps) {
 
 export function updateCanvasMcps(mcps) {
   _allMcps = mcps || [];
+  // This runs on a 10s poll and can replace card elements wholesale. Doing that
+  // mid-drag detaches the element that holds the pointer capture: the drag
+  // handler keeps writing style.left/top to the orphan and keeps advancing
+  // cardData.x/y (which is what gets saved), while the card on screen snaps
+  // back to where the rebuild put it. Saved position and rendered position then
+  // disagree permanently, which reads as "the connections drifted".
+  if (_draggingCardId) { _mcpsPendingRefresh = true; return; }
   let topicsChanged = false;
   for (const card of _cards) {
     const mcp = _allMcps.find(m => m.id === card.mcpId);
@@ -276,7 +417,7 @@ export function updateCanvasMcps(mcps) {
     // Only fetch once (not on every poll) — mark card to avoid repeated calls
     if (!card.topicOut?.some(t => t.topic) && liveTopicOut?.length && !toolObj?.multiInstance && !card._topicFetched) {
       card._topicFetched = true;
-      _fetchTopicsFromDriver(card, '');
+      _fetchTopicsFromDriver(card, []);
     }
 
     // Also trigger rebuild if instance-config button presence doesn't match live configSchema
@@ -296,8 +437,9 @@ export function updateCanvasMcps(mcps) {
       card.el = newEl;
       _makeDraggable(newEl, card);
     }
+    _syncGeometryObservers();
     _resolveAllTopics();
-    _redrawConnections();
+    _scheduleRedraw();
     _debouncedSave();
   }
 }
@@ -371,7 +513,7 @@ function _setupZoomPan() {
     e.preventDefault();
     const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP;
     _zoomAt(e.clientX, e.clientY, delta);
-    _debouncedSave();
+    _viewportChanged();
   }, { passive: false });
 
   // ── Pinch-to-zoom (mobile two-finger gesture) ──
@@ -405,7 +547,7 @@ function _setupZoomPan() {
   _canvasEl.addEventListener('touchend', (e) => {
     if (e.touches.length < 2) {
       _pinching = false;
-      _debouncedSave();
+      _viewportChanged();
     }
   });
 
@@ -442,7 +584,7 @@ function _setupZoomPan() {
     if (!_panning) return;
     _panning = false;
     _canvasEl.style.cursor = '';
-    _debouncedSave();
+    _viewportChanged();
   });
 
   _canvasEl.addEventListener('pointercancel', () => {
@@ -452,30 +594,34 @@ function _setupZoomPan() {
 }
 
 function _setupControlButtons() {
-  const rect = _canvasEl?.getBoundingClientRect() ?? { left: 0, top: 0, width: 800, height: 600 };
-  const cx = (rect.width  || 800) / 2;
-  const cy = (rect.height || 600) / 2;
-
   document.getElementById('canvas-zoom-in')?.addEventListener('click', () => {
     const r = _canvasEl.getBoundingClientRect();
     _zoomAt(r.left + r.width / 2, r.top + r.height / 2, ZOOM_STEP);
-    _debouncedSave();
+    _viewportChanged();
   });
 
   document.getElementById('canvas-zoom-out')?.addEventListener('click', () => {
     const r = _canvasEl.getBoundingClientRect();
     _zoomAt(r.left + r.width / 2, r.top + r.height / 2, -ZOOM_STEP);
-    _debouncedSave();
+    _viewportChanged();
   });
 
   document.getElementById('canvas-zoom-reset')?.addEventListener('click', () => {
     _zoom = 1; _tx = 0; _ty = 0;
     _applyTransform();
-    _debouncedSave();
+    _viewportChanged();
   });
 
   document.getElementById('canvas-project-toggle')?.addEventListener('click', () => {
-    _projectRunning ? _stopProject() : _startProject();
+    if (_projectRunning) { _stopProject(); return; }
+    // _projectRunning only flips true once the start fetch resolves, so a
+    // second click during that async window used to fire a second concurrent
+    // /api/config/start-project — two overlapping event streams that stomped
+    // each other's modal state.
+    const btn = document.getElementById('canvas-project-toggle');
+    if (btn?.disabled) return;
+    if (btn) btn.disabled = true;
+    _startProject().finally(() => { if (btn) btn.disabled = false; });
   });
   _syncProjectBtn();
 
@@ -502,8 +648,8 @@ function _setupDropZone() {
     e.preventDefault();
     _canvasEl.classList.remove('drag-over');
 
-    if (_projectRunning) {
-      _showDropReject(e, '请停止智能控制后修改');
+    if (_editsLocked()) {
+      _showDropReject(e, _editLockReason());
       return;
     }
 
@@ -613,6 +759,7 @@ function _addCard(data, save = true) {
   const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData };
   _cards.push(cardData);
   _makeDraggable(el, cardData);
+  _syncGeometryObservers();
 
   // Call info(instance_id) to get driver-inferred topics for static tools.
   // For multiInstance processors, topics depend on the connected input_topic — skip here.
@@ -621,7 +768,7 @@ function _addCard(data, save = true) {
   const _toolObj2 = (_mcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
   const _isMultiInstanceSensor = _toolObj2?.multiInstance && _toolObj2?.type === 'sensor';
   if ((!_toolObj2?.multiInstance || _isMultiInstanceSensor) && (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length)) {
-    _fetchTopicsFromDriver(cardData, '');
+    _fetchTopicsFromDriver(cardData, []);
   }
 
   _syncEmptyState();
@@ -630,10 +777,7 @@ function _addCard(data, save = true) {
 }
 
 async function _removeCard(id) {
-  if (_projectRunning) {
-    _logActivity('warn', '请停止智能控制后修改');
-    return;
-  }
+  if (_refuseEdit()) return;
   if (!(await _ensureEdit())) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
@@ -657,7 +801,8 @@ async function _removeCard(id) {
   // Clean up executor connections
   _execConnections = _execConnections.filter(c => c.fromCardId !== id && c.toCardId !== id);
   _resolveAllTopics();
-  _redrawConnections();
+  _syncGeometryObservers();
+  _scheduleRedraw();
   _syncEmptyState();
   // Cancel any pending debounced save, then save immediately with updated state
   clearTimeout(_saveTimer);
@@ -701,17 +846,15 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   // Build port HTML
   const inPortsHtml = topicIn.map((t, i) => {
     const fmt = t.format || '';
-    const fmtShort = fmt.split('/').pop() || '?';
     const colorCls = _fmtColorClass(fmt);
-    return `<div class="canvas-port in ${colorCls}" data-dir="in" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" data-idx="${i}" title="${_esc(fmt)}"><span class="canvas-port-label">${_esc(fmtShort)}</span></div>`;
+    return `<div class="canvas-port in ${colorCls}" data-dir="in" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" data-idx="${i}"></div>`;
   }).join('');
 
   const outPortsHtml = topicOut.map((t, i) => {
     const fmt = t.format || '';
-    const fmtShort = fmt.split('/').pop() || '?';
     const colorCls = _fmtColorClass(fmt);
     const staticAttr = t.topic ? `data-static-topic="${_esc(t.topic)}"` : '';
-    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-port="${_esc(t.port || '')}" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}" title="${_esc(fmt)}"><span class="canvas-port-label">${_esc(fmtShort)}</span></div>`;
+    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-port="${_esc(t.port || '')}" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}"></div>`;
   }).join('');
 
   if (effectiveType === 'controller') {
@@ -729,7 +872,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       </div>
       <div class="canvas-port-col left">${inPortsHtml}</div>
       <div class="canvas-port-col right">${outPortsHtml}</div>
-      <div class="canvas-port-col bottom"><div class="canvas-port executor" data-dir="executor" data-format="executor" title="连接执行器"><span class="canvas-port-label">执行器</span></div></div>
+      <div class="canvas-port-col bottom"><div class="canvas-port executor" data-dir="executor" data-format="executor" data-tip="连接执行器"></div></div>
     `;
 
     el.querySelector('.canvas-card-close').addEventListener('click', (e) => {
@@ -781,7 +924,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
         } else if (def.format === 'file') {
           const accept = def.accept || '*/*';
-          inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}">Choose File</button><span class="canvas-file-name"></span></div>`;
+          const uploadDir = def.uploadDir || '';
+          const uploadTo = def.uploadTo || '';
+          inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>Choose File</button><span class="canvas-file-name"></span></div>`;
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
           const desc = def.description || '';
@@ -843,7 +988,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const liveMcp2 = _allMcps.find(m => m.id === mcpId);
         const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
         const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
-        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema,
+          typeof liveToolObj2 === 'object' ? liveToolObj2.description : undefined);
       });
     }
 
@@ -872,25 +1018,52 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const fileInput = document.createElement('input');
         fileInput.type = 'file';
         fileInput.accept = btn.dataset.accept || '*/*';
+        // Two destinations, and which is correct depends on who reads the file.
+        //
+        //   uploadTo: 'mcp'  → POST /api/mcp/<id>/file/upload, which streams the
+        //     bytes to the service owning this tool. That service writes them
+        //     where it can see them and returns *its own* absolute path. This is
+        //     the only thing that works when the tool runs in another container:
+        //     agent-core and perception share no filesystem, so a path minted
+        //     here is meaningless there.
+        //   default → agent-core's own /tmp/uploads, right for a tool that
+        //     agent-core serves itself (remote_image, remote_audio).
+        const uploadTo = btn.dataset.uploadTo || '';
+        const uploadDir = btn.dataset.uploadDir || '/tmp/uploads';
         fileInput.onchange = async () => {
           if (!fileInput.files[0]) return;
           btn.textContent = 'Uploading...';
           const form = new FormData();
           form.append('file', fileInput.files[0]);
-          form.append('path', '/tmp/uploads');
+          let endpoint = '/api/file/upload';
+          if (uploadTo === 'mcp') {
+            endpoint = `/api/mcp/${encodeURIComponent(mcpId)}/file/upload`;
+          } else {
+            form.append('path', uploadDir);
+          }
           try {
-            const res = await fetch('/api/file/upload', { method: 'POST', body: form });
+            const res = await fetch(endpoint, { method: 'POST', body: form });
             const data = await res.json();
             if (data.code === 200) {
-              hiddenInput.value = '/tmp/uploads/' + fileInput.files[0].name;
+              // The proxy replies with the receiving container's own path; the
+              // local endpoint does not, so derive it as before.
+              hiddenInput.value = uploadTo === 'mcp'
+                ? ((data.data && data.data.path) || '')
+                : uploadDir.replace(/\/$/, '') + '/' + fileInput.files[0].name;
               nameSpan.textContent = fileInput.files[0].name;
               btn.textContent = 'Re-select';
             } else {
+              // Surface the reason: the proxy distinguishes "the service is not
+              // listening" (an image predating the endpoint) from "it refused
+              // the file", and a bare "Failed" hides which.
               btn.textContent = 'Failed';
+              btn.title = data.message || '';
+              console.warn('[canvas] upload failed:', data.message || data);
               setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
             }
           } catch (err) {
             btn.textContent = 'Error';
+            btn.title = String(err);
             setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
           }
         };
@@ -921,7 +1094,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
       } else if (def.format === 'file') {
         const accept = def.accept || '*/*';
-        inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}">选择文件</button><span class="canvas-file-name"></span></div>`;
+        const uploadDir = def.uploadDir || '';
+        const uploadTo = def.uploadTo || '';
+        inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>选择文件</button><span class="canvas-file-name"></span></div>`;
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
         const desc = def.description || '';
@@ -936,7 +1111,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     // Controller gets an additional bottom executor port
     const executorPortHtml = effectiveType === 'controller'
-      ? `<div class="canvas-port-col bottom"><div class="canvas-port executor" data-dir="executor" data-format="executor" title="连接执行器"><span class="canvas-port-label">执行器</span></div></div>`
+      ? `<div class="canvas-port-col bottom"><div class="canvas-port executor" data-dir="executor" data-format="executor" data-tip="连接执行器"></div></div>`
       : '';
 
     // Determine if there are any usable fields/actions left
@@ -990,6 +1165,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             if (!key || key === 'action') return;
             field.style.display = paramKeys.includes(key) ? '' : 'none';
           });
+          // Showing/hiding fields changes the card's height, which moves every
+          // port on it. The card ResizeObserver (_syncGeometryObservers) now
+          // covers this, but ask explicitly too so the behaviour does not
+          // depend on ResizeObserver being available.
+          _scheduleRedraw();
         };
         actionSelect.addEventListener('change', async () => {
           if (!(await _ensureEdit())) {
@@ -1023,7 +1203,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const liveMcp2 = _allMcps.find(m => m.id === mcpId);
         const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
         const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
-        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema,
+          typeof liveToolObj2 === 'object' ? liveToolObj2.description : undefined);
       });
     }
 
@@ -1058,17 +1239,23 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const fileInput = document.createElement('input');
         fileInput.type = 'file';
         fileInput.accept = btn.dataset.accept || '*/*';
+        // Where the upload lands. Defaults to agent-core's own /tmp/uploads,
+        // which is right for a tool served by agent-core itself (remote_image,
+        // remote_audio). A tool in *another* container cannot see that path, so
+        // its schema declares `uploadDir` pointing at a directory both
+        // containers mount — see perception's face_recognition card.
+        const uploadDir = btn.dataset.uploadDir || '/tmp/uploads';
         fileInput.onchange = async () => {
           if (!fileInput.files[0]) return;
           btn.textContent = 'Uploading...';
           const form = new FormData();
           form.append('file', fileInput.files[0]);
-          form.append('path', '/tmp/uploads');
+          form.append('path', uploadDir);
           try {
             const res = await fetch('/api/file/upload', { method: 'POST', body: form });
             const data = await res.json();
             if (data.code === 200) {
-              hiddenInput.value = '/tmp/uploads/' + fileInput.files[0].name;
+              hiddenInput.value = uploadDir.replace(/\/$/, '') + '/' + fileInput.files[0].name;
               nameSpan.textContent = fileInput.files[0].name;
               btn.textContent = 'Re-select';
             } else {
@@ -1093,6 +1280,67 @@ function _fmtColorClass(fmt) {
   if (fmt.startsWith('data/json') || fmt.startsWith('text')) return 'fmt-json';
   if (fmt.startsWith('image') || fmt.startsWith('video')) return 'fmt-visual';
   return 'fmt-default';
+}
+
+// ── Port hover tooltip ────────────────────────────────────────────────────────
+// Replaces the native `title`, whose ~1s delay made it useless for telling apart
+// several same-format ports on one card. Text is read from the DOM at hover time
+// rather than baked in at render: most topics are resolved later (by
+// _resolveAllTopics, by connection propagation, or by an async `info` call), so a
+// stored copy would go stale.
+
+let _portTip = null;
+
+function _ensurePortTip() {
+  if (_portTip) return _portTip;
+  _portTip = document.createElement('div');
+  _portTip.className = 'canvas-port-tip';
+  _portTip.innerHTML = '<span class="canvas-port-tip-fmt"></span><span class="canvas-port-tip-topic"></span>';
+  document.body.appendChild(_portTip);
+  return _portTip;
+}
+
+function _hidePortTip() {
+  if (_portTip) _portTip.classList.remove('visible');
+}
+
+function _showPortTip(port) {
+  const tip = _ensurePortTip();
+  const fmt = port.dataset.tip || port.dataset.format || '?';
+  // An out-port with no topic yet is unresolved, not topic-less — say so rather
+  // than showing the format alone, which is what made the ports ambiguous.
+  const topic = port.dataset.tip ? '' : (port.dataset.topic || (port.dataset.dir === 'out' ? '(未解析)' : ''));
+
+  tip.querySelector('.canvas-port-tip-fmt').textContent = fmt;
+  const topicEl = tip.querySelector('.canvas-port-tip-topic');
+  topicEl.textContent = topic;
+  topicEl.style.display = topic ? '' : 'none';
+  tip.classList.toggle('unresolved', topic === '(未解析)');
+  tip.classList.add('visible');
+
+  // Ports live inside the zoom/pan viewport, so anchor off the on-screen rect and
+  // position fixed — the tooltip then stays a constant size at any zoom level.
+  const r = port.getBoundingClientRect();
+  const tw = tip.offsetWidth;
+  const th = tip.offsetHeight;
+  const below = r.top < th + 12;
+  let left = r.left + r.width / 2 - tw / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+  tip.style.left = `${Math.round(left)}px`;
+  tip.style.top = `${Math.round(below ? r.bottom + 8 : r.top - th - 8)}px`;
+  tip.classList.toggle('below', below);
+}
+
+function _setupPortTooltip() {
+  // mouseover fires for every element, so the non-port case doubles as mouseout.
+  document.addEventListener('mouseover', (e) => {
+    const port = e.target.closest?.('.canvas-port');
+    if (port && !_draggingConn) _showPortTip(port);
+    else _hidePortTip();
+  });
+  // Dragging a connection or panning/zooming moves the port out from under it.
+  document.addEventListener('pointerdown', _hidePortTip);
+  document.addEventListener('wheel', _hidePortTip, { passive: true });
 }
 
 // ── Config overlay helpers ─────────────────────────────────────────────────
@@ -1187,7 +1435,7 @@ function _setupPortDrag() {
             toToolName: toCardData?.toolName || '',
             toMcpId: toCardData?.mcpId || '',
           });
-          _redrawConnections();
+          _scheduleRedraw();
           _logActivity('executor', `绑定执行器: ${toCardData?.toolName || toCardId}`);
           _saveLayout();
         }
@@ -1218,15 +1466,23 @@ function _setupPortDrag() {
         });
 
         _resolveAllTopics();
-        _redrawConnections();
+        _scheduleRedraw();
         _saveLayout();
 
         const toCardData = _cards.find(c => c.id === toCard.dataset.cardId);
         if (toCardData && _projectRunning) {
-          // Use resolved topic from the destination's in-port
+          // Restart on the card's *whole* input set, not just the link that was
+          // just drawn. Perception rebuilds a node whose input_topic differs
+          // from the one it holds (plugins/tts.py), so naming only the new topic
+          // silently unbound whatever the card was already consuming — drawing a
+          // second line into a TTS card killed the first one.
+          const topics = _inputTopicsFor(toCardData);
           const resolvedInPort = toCard.querySelector(`.canvas-port.in[data-idx="${inPort.dataset.idx}"]`);
-          const resolvedTopic = resolvedInPort?.dataset.topic || _draggingConn.topic;
-          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic, instance_id: toCardData.id });
+          const args = topics.length
+            ? inputArgs(topics)
+            : { input_topic: resolvedInPort?.dataset.topic || _draggingConn.topic };
+          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start',
+                         { ...args, instance_id: toCardData.id });
         }
         // The destination's output topic is derived from this new input;
         // _resolveAllTopics above already scheduled that refetch, and doing it
@@ -1246,10 +1502,7 @@ function _setupPortDrag() {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;
-    if (_projectRunning) {
-      _logActivity('warn', '请停止智能控制后修改');
-      return;
-    }
+    if (_refuseEdit()) return;
     if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
@@ -1301,159 +1554,248 @@ function _setupPortDrag() {
   });
 }
 
+/**
+ * True when the canvas subtree is actually laid out.
+ *
+ * Both monitor mode (`#app.monitor-active .canvas-area`) and the mobile
+ * settings/account panels (`#app.settings-active .canvas-area`) hide the canvas
+ * with `display:none`. getBoundingClientRect() inside a display:none subtree
+ * returns all zeros, so a redraw that lands there writes every path as a
+ * zero-length segment at the world origin — and because the redraw is purely
+ * event-driven, nothing recomputes it when the canvas comes back. That is one
+ * of the ways connectors "disappear". The 10s MCP poll and async topic fetches
+ * make it easy to hit.
+ */
+function _canvasVisible() {
+  return !!_viewport && _viewport.offsetParent !== null;
+}
+
+// ── Redraw scheduling ─────────────────────────────────────────────────────────
+
+let _redrawRaf = null;
+
+/**
+ * Coalesce redraws to one per frame. Card drag, the resize observer and the
+ * MCP poll can all ask for a redraw within the same frame; each redraw measures
+ * every port, so doing it once is both cheaper and visually identical.
+ */
+function _scheduleRedraw() {
+  if (_redrawRaf !== null) return;
+  _redrawRaf = requestAnimationFrame(() => {
+    _redrawRaf = null;
+    _redrawConnections();
+  });
+}
+
+/**
+ * Watches everything whose geometry the connector endpoints depend on.
+ *
+ * Ports are vertically centred in a full-height column (`.canvas-port-col`,
+ * `justify-content:center`), so *any* change in a card's height moves every
+ * port on it. Card height changes in a lot of places that have no reason to
+ * know about connectors — appending an execution result, a longer driver name
+ * wrapping onto a second line, a web font swapping in, a config field being
+ * revealed. Each of those used to leave the lines anchored where the ports
+ * used to be; observing the cards fixes the whole class at once instead of
+ * chasing each call site.
+ *
+ * `_canvasEl` is observed too: it covers window resizes, and its box going
+ * 0 -> non-zero is the signal that the canvas became visible again, which is
+ * what flushes the redraw deferred by _canvasVisible().
+ */
+let _geomObs = null;
+
+function _syncGeometryObservers() {
+  if (typeof ResizeObserver === 'undefined') return;
+  if (!_geomObs) _geomObs = new ResizeObserver(() => _scheduleRedraw());
+  // Cheap to rebuild wholesale (a handful of cards) and avoids leaking
+  // observations of card elements that have been replaced or removed.
+  _geomObs.disconnect();
+  if (_canvasEl) _geomObs.observe(_canvasEl);
+  for (const card of _cards) if (card.el) _geomObs.observe(card.el);
+}
+
+// ── Connector drawing ─────────────────────────────────────────────────────────
+
+/**
+ * Resolve a saved connection endpoint to a live port element.
+ *
+ * `data-idx` is just the position of the topic in the card's topicIn/topicOut
+ * array, and updateCanvasMcps rebuilds a card whenever the driver reports a
+ * different topic list — which renumbers the ports. A connection saved against
+ * the old numbering then resolves to nothing. Falling back to a unique
+ * format match recovers the common case; anything else is reported rather than
+ * silently skipped, because the connection stays in _connections and is still
+ * persisted, so it can reappear later and looks like a flickering line.
+ */
+function _findPort(cardEl, dir, idx, format) {
+  const ports = Array.from(cardEl.querySelectorAll(`.canvas-port.${dir}`));
+  const byIdx = ports.find(p => p.dataset.idx === String(idx));
+  if (byIdx) return byIdx;
+  if (format) {
+    const byFmt = ports.filter(p => p.dataset.format === format);
+    if (byFmt.length === 1) return byFmt[0];
+  }
+  return null;
+}
+
+// Connection ids already reported as undrawable. Kept out of the connection
+// objects themselves because _saveLayout serializes those verbatim.
+const _unresolvedWarned = new Set();
+
+function _warnUnresolved(conn, reason) {
+  if (_unresolvedWarned.has(conn.id)) return;  // redraw runs per frame during a drag
+  _unresolvedWarned.add(conn.id);
+  _logActivity('warn', `连线无法绘制（${reason}），请重新连接: ${conn.id}`);
+}
+
+const _ARROW_BY_FMT = {
+  'fmt-audio':  'conn-arrow-audio',
+  'fmt-json':   'conn-arrow-json',
+  'fmt-visual': 'conn-arrow-visual',
+};
+
+/**
+ * Get the DOM for a connection, creating it (and binding its listeners) once.
+ * `onDelete` is invoked by both the × button and the right-click handler.
+ */
+function _connectorEls(conn, onDelete) {
+  let entry = _connEls.get(conn.id);
+  if (entry) return entry;
+
+  const hit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  hit.classList.add('connector-hit');
+
+  const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  line.classList.add('connector-line');
+
+  const btn = document.createElement('button');
+  btn.className = 'conn-delete-btn';
+  btn.textContent = '×';
+  btn.dataset.connId = conn.id;
+
+  const showBtn = () => btn.classList.add('visible');
+  const hideBtn = () => { if (!btn.matches(':hover')) btn.classList.remove('visible'); };
+  hit.addEventListener('mouseenter', showBtn);
+  hit.addEventListener('mouseleave', hideBtn);
+  line.addEventListener('mouseenter', showBtn);
+  line.addEventListener('mouseleave', hideBtn);
+  btn.addEventListener('mouseleave', () => btn.classList.remove('visible'));
+  btn.addEventListener('click', (e) => { e.stopPropagation(); onDelete(); });
+  line.addEventListener('contextmenu', (e) => { e.preventDefault(); onDelete(); });
+
+  _connSvg.appendChild(hit);
+  _connSvg.appendChild(line);
+  _viewport.appendChild(btn);
+
+  entry = { hit, line, btn };
+  _connEls.set(conn.id, entry);
+  return entry;
+}
+
+function _dropConnector(id) {
+  const entry = _connEls.get(id);
+  if (!entry) return;
+  entry.hit.remove();
+  entry.line.remove();
+  entry.btn.remove();
+  _connEls.delete(id);
+}
+
+function _removeTopicConnection(connId) {
+  const conn = _connections.find(c => c.id === connId);
+  if (!conn) return;
+  _connections = _connections.filter(c => c.id !== connId);
+  _resolveAllTopics();
+  _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
+  _scheduleRedraw();
+  _saveLayout();
+}
+
 function _redrawConnections() {
-  if (!_connSvg) return;
-  _connSvg.querySelectorAll('.connector-line, .connector-hit').forEach(l => l.remove());
-  _viewport.querySelectorAll('.conn-delete-btn').forEach(b => b.remove());
-  // Force synchronous layout flush so compositor layer is invalidated immediately
-  void _connSvg.getBoundingClientRect();
+  if (!_connSvg || !_viewport) return;
+  // Deferred rather than drawn wrong — see _canvasVisible. The observer on
+  // _canvasEl re-schedules this once the canvas has a box again.
+  if (!_canvasVisible()) return;
+
+  const alive = new Set();
+  const vpRect = _viewport.getBoundingClientRect();
+  const toWorldX = v => (v - vpRect.left) / _zoom;
+  const toWorldY = v => (v - vpRect.top) / _zoom;
 
   for (const conn of _connections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
     const toCard = _cards.find(c => c.id === conn.toCardId);
     if (!fromCard || !toCard) continue;
 
-    const fromPort = fromCard.el.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
-    const toPort = toCard.el.querySelector(`.canvas-port.in[data-idx="${conn.toPortIdx}"]`);
-    if (!fromPort || !toPort) continue;
+    const fromPort = _findPort(fromCard.el, 'out', conn.fromPortIdx, conn.format);
+    const toPort = _findPort(toCard.el, 'in', conn.toPortIdx, conn.format);
+    if (!fromPort || !toPort) { _warnUnresolved(conn, '端口已变更'); continue; }
+    _unresolvedWarned.delete(conn.id);
 
-    const vpRect = _viewport.getBoundingClientRect();
     const fromRect = fromPort.getBoundingClientRect();
     const toRect = toPort.getBoundingClientRect();
 
-    const x1 = (fromRect.left + fromRect.width / 2 - vpRect.left) / _zoom;
-    const y1 = (fromRect.top + fromRect.height / 2 - vpRect.top) / _zoom;
-    const x2 = (toRect.left + toRect.width / 2 - vpRect.left) / _zoom;
-    const y2 = (toRect.top + toRect.height / 2 - vpRect.top) / _zoom;
+    const x1 = toWorldX(fromRect.left + fromRect.width / 2);
+    const y1 = toWorldY(fromRect.top + fromRect.height / 2);
+    const x2 = toWorldX(toRect.left + toRect.width / 2);
+    const y2 = toWorldY(toRect.top + toRect.height / 2);
     const cx = Math.max(Math.abs(x2 - x1) * 0.5, 60);
+    const d = `M${x1},${y1} C${x1+cx},${y1} ${x2-cx},${y2} ${x2},${y2}`;
 
-    // Invisible wide hit-area path (easier to hover/click)
-    const hitLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    hitLine.classList.add('connector-hit');
-    hitLine.setAttribute('d', `M${x1},${y1} C${x1+cx},${y1} ${x2-cx},${y2} ${x2},${y2}`);
-
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const { hit, line, btn } = _connectorEls(conn, () => {
+      if (_refuseEdit()) return;
+      _ensureEdit().then(ok => { if (ok) _removeTopicConnection(conn.id); });
+    });
+    hit.setAttribute('d', d);
+    line.setAttribute('d', d);
     const fmtCls = _fmtColorClass(conn.format);
-    line.classList.add('connector-line', fmtCls);
-    line.setAttribute('d', `M${x1},${y1} C${x1+cx},${y1} ${x2-cx},${y2} ${x2},${y2}`);
-    const arrowId = fmtCls === 'fmt-audio' ? 'conn-arrow-audio'
-                  : fmtCls === 'fmt-json'  ? 'conn-arrow-json'
-                  : fmtCls === 'fmt-visual' ? 'conn-arrow-visual'
-                  : 'conn-arrow';
-    line.setAttribute('marker-end', `url(#${arrowId})`);
-
-    // Delete button at midpoint
-    const mx = (x1 + x2) / 2;
-    const my = (y1 + y2) / 2;
-    const delBtn = document.createElement('button');
-    delBtn.className = 'conn-delete-btn';
-    delBtn.textContent = '×';
-    delBtn.style.left = mx + 'px';
-    delBtn.style.top  = my + 'px';
-    delBtn.dataset.connId = conn.id;
-    _viewport.appendChild(delBtn);
-
-    const showBtn = () => delBtn.classList.add('visible');
-    const hideBtn = () => { if (!delBtn.matches(':hover')) delBtn.classList.remove('visible'); };
-
-    hitLine.addEventListener('mouseenter', showBtn);
-    hitLine.addEventListener('mouseleave', hideBtn);
-    line.addEventListener('mouseenter', showBtn);
-    line.addEventListener('mouseleave', hideBtn);
-    delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
-    delBtn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      if (_projectRunning) {
-        _logActivity('warn', '请停止智能控制后修改');
-        return;
-      }
-      if (!(await _ensureEdit())) return;
-      _connections = _connections.filter(c => c.id !== conn.id);
-      _resolveAllTopics();
-      _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
-      _redrawConnections();
-      _saveLayout();
-    });
-
-    line.addEventListener('contextmenu', (e) => {
-      e.preventDefault();
-      if (_projectRunning) {
-        _logActivity('warn', '请停止智能控制后修改');
-        return;
-      }
-      _connections = _connections.filter(c => c.id !== conn.id);
-      _resolveAllTopics();
-      _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
-      _redrawConnections();
-      _saveLayout();
-    });
-
-    _connSvg.appendChild(hitLine);
-    _connSvg.appendChild(line);
+    line.setAttribute('class', `connector-line ${fmtCls}`);
+    line.setAttribute('marker-end', `url(#${_ARROW_BY_FMT[fmtCls] || 'conn-arrow'})`);
+    btn.style.left = (x1 + x2) / 2 + 'px';
+    btn.style.top  = (y1 + y2) / 2 + 'px';
+    alive.add(conn.id);
   }
 
-  // ── Draw executor connections (vertical, dashed emerald) ──
+  // ── Executor connections (vertical, dashed emerald) ──
   for (const conn of _execConnections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
     const toCard = _cards.find(c => c.id === conn.toCardId);
     if (!fromCard || !toCard) continue;
 
     const execPort = fromCard.el.querySelector('.canvas-port.executor');
-    if (!execPort) continue;
+    if (!execPort) { _warnUnresolved(conn, '执行器端口已消失'); continue; }
+    _unresolvedWarned.delete(conn.id);
 
-    const vpRect = _viewport.getBoundingClientRect();
     const fromRect = execPort.getBoundingClientRect();
     // Target: top center of the destination card
     const toCardRect = toCard.el.getBoundingClientRect();
 
-    const x1 = (fromRect.left + fromRect.width / 2 - vpRect.left) / _zoom;
-    const y1 = (fromRect.top + fromRect.height / 2 - vpRect.top) / _zoom;
-    const x2 = (toCardRect.left + toCardRect.width / 2 - vpRect.left) / _zoom;
-    const y2 = (toCardRect.top - vpRect.top) / _zoom;
+    const x1 = toWorldX(fromRect.left + fromRect.width / 2);
+    const y1 = toWorldY(fromRect.top + fromRect.height / 2);
+    const x2 = toWorldX(toCardRect.left + toCardRect.width / 2);
+    const y2 = toWorldY(toCardRect.top);
     const cy = Math.max(Math.abs(y2 - y1) * 0.5, 60);
+    const d = `M${x1},${y1} C${x1},${y1+cy} ${x2},${y2-cy} ${x2},${y2}`;
 
-    const pathD = `M${x1},${y1} C${x1},${y1+cy} ${x2},${y2-cy} ${x2},${y2}`;
-
-    const hitLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    hitLine.classList.add('connector-hit');
-    hitLine.setAttribute('d', pathD);
-
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    line.classList.add('connector-line', 'executor-conn');
-    line.setAttribute('d', pathD);
-    line.setAttribute('marker-end', 'url(#exec-arrow)');
-
-    const mx = (x1 + x2) / 2;
-    const my = (y1 + y2) / 2;
-    const delBtn = document.createElement('button');
-    delBtn.className = 'conn-delete-btn';
-    delBtn.textContent = '×';
-    delBtn.style.left = mx + 'px';
-    delBtn.style.top  = my + 'px';
-    delBtn.dataset.connId = conn.id;
-    _viewport.appendChild(delBtn);
-
-    const showBtn = () => delBtn.classList.add('visible');
-    const hideBtn = () => { if (!delBtn.matches(':hover')) delBtn.classList.remove('visible'); };
-
-    hitLine.addEventListener('mouseenter', showBtn);
-    hitLine.addEventListener('mouseleave', hideBtn);
-    line.addEventListener('mouseenter', showBtn);
-    line.addEventListener('mouseleave', hideBtn);
-    delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
-
-    const removeExec = async () => {
+    const { hit, line, btn } = _connectorEls(conn, async () => {
       if (!(await _ensureEdit())) return;
       _execConnections = _execConnections.filter(c => c.id !== conn.id);
       _logActivity('executor', `解绑执行器: ${conn.toToolName || conn.toCardId}`);
-      _redrawConnections();
+      _scheduleRedraw();
       _saveLayout();
-    };
-    delBtn.addEventListener('click', (e) => { e.stopPropagation(); removeExec(); });
-    line.addEventListener('contextmenu', (e) => { e.preventDefault(); removeExec(); });
+    });
+    hit.setAttribute('d', d);
+    line.setAttribute('d', d);
+    line.setAttribute('class', 'connector-line executor-conn');
+    line.setAttribute('marker-end', 'url(#exec-arrow)');
+    btn.style.left = (x1 + x2) / 2 + 'px';
+    btn.style.top  = (y1 + y2) / 2 + 'px';
+    alive.add(conn.id);
+  }
 
-    _connSvg.appendChild(hitLine);
-    _connSvg.appendChild(line);
+  for (const id of Array.from(_connEls.keys())) {
+    if (!alive.has(id)) _dropConnector(id);
   }
 }
 
@@ -1565,7 +1907,17 @@ async function _startProject() {
   await _saveLayout();
 
   // Import motus for event subscription
-  const { onMotusEvent, offMotusEvent } = await import('./motus-stream.js');
+  const { onMotusEvent, offMotusEvent, whenMotusConnected } = await import('./motus-stream.js');
+
+  // project_start_begin is a fire-and-forget WS push with no server-side
+  // buffering — if this tab's /ws/motus socket is still reconnecting (page
+  // just loaded, brief network blip) the event that would open the modal is
+  // simply lost. Wait for it (briefly) so the listener below is actually
+  // live before the backend starts pushing.
+  const wsReady = await whenMotusConnected(8000);
+  if (!wsReady) {
+    _logActivity('warn', '启动进度推送连接未就绪，启动弹窗可能不会显示');
+  }
 
   // Subscribe to startup progress events
   let modal = null;
@@ -1634,9 +1986,7 @@ async function _startProject() {
   try {
     const res = await fetch('/api/config/start-project', { method: 'POST' });
     if (res.ok) {
-      _projectRunning = true;
-      _syncProjectBtn();
-      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+      _applyProjectState(true);
       _logActivity('project', '智能控制已开启');
     } else {
       const data = await res.json().catch(() => ({}));
@@ -1644,6 +1994,12 @@ async function _startProject() {
       offMotusEvent(_onEvent);
       if (modal) {
         _showStartupError(modal);
+      } else if (res.status === 409) {
+        // A prior start is still settling (e.g. a card mid-warmup) — no
+        // project_start_begin ever arrived, so no modal exists to show the
+        // error in. Without this the click just looks like it did nothing;
+        // the activity log entry above is easy to miss.
+        _showToast(data.detail || '启动已在进行中，请稍候');
       }
     }
   } catch (e) {
@@ -1654,9 +2010,7 @@ async function _startProject() {
 }
 
 function _stopProject() {
-  _projectRunning = false;
-  _syncProjectBtn();
-  document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.add('locked'));
+  _applyProjectState(false);
   // Auto-stop mic stream
   for (const card of _cards) {
     if (card.toolName === 'remote_mic' && isMicActive()) {
@@ -1836,19 +2190,29 @@ function _parseMcpCallResult(json) {
 }
 
 /**
- * Ask the driver to infer topics for a card given an optional input topic.
+ * Ask the driver to infer topics for a card given the topics feeding it.
  * Used for multiInstance sensors (_addCard) and processors (after wiring).
  * Updates card.topicOut and DOM out-ports if driver returns non-empty topics.
+ *
+ * Takes the whole set, not one topic: a card can be fed by several connections
+ * (decision_core normally is), and asking about one of them produced an answer
+ * that depended on which link happened to be first in `_connections` — a
+ * different answer after the same links were redrawn in another order, and a
+ * different answer from the one api/config.py derives at start.
  */
-async function _fetchTopicsFromDriver(card, inputTopic) {
-  const want = inputTopic || '';
+async function _fetchTopicsFromDriver(card, inputTopics) {
+  const topics = Array.isArray(inputTopics) ? inputTopics
+                : (inputTopics ? [inputTopics] : []);
+  const want = inputKey(topics);
   if (card._topicFetchFor === want) return;   // identical request already in flight
   card._topicFetchFor = want;
   try {
     const resp = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool: card.toolName, arguments: { action: 'info', instance_id: card.id, input_topic: inputTopic } }),
+      body: JSON.stringify({ tool: card.toolName,
+                             arguments: { action: 'info', instance_id: card.id,
+                                          ...inputArgs(topics) } }),
     });
     const data = await resp.json();
     const parsed = _parseMcpCallResult(data);
@@ -1865,7 +2229,7 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
       // one has to be re-walked — otherwise a chain (mic → asr → tts) only ever
       // resolves its first hop.
       _resolveAllTopics();
-      _redrawConnections();
+      _scheduleRedraw();
       _debouncedSave();
     } else if (card.topicOut?.some(t => t.topic)) {
       // The driver cannot infer an output for this input, so whatever we are
@@ -1873,7 +2237,7 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
       // what stops a deleted connection's topic from outliving the connection.
       card.topicOut = [];
       _resolveAllTopics();
-      _redrawConnections();
+      _scheduleRedraw();
       _debouncedSave();
     }
   } catch (e) {
@@ -1912,7 +2276,34 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
  *    TTS card opened a panel that never showed a waveform, and why the server
  *    log filled with `ASGI callable returned without completing handshake`.
  */
-function _openTopicDetailFor(el, mcpId, cachedTopicOut, declaredTopicOut) {
+async function _openTopicDetailFor(el, mcpId, cachedTopicOut, declaredTopicOut) {
+  // Ask the driver directly first, the same way the info modal does. Every
+  // other source here (out-port dataset, the closure captured at render time,
+  // the static MCP definition) is _revalidateDerivedTopics' cache, and it has
+  // shown a stranded topic from a card's PREVIOUS wiring before a revalidation
+  // pass has run to correct it — this button must not wait on that.
+  const card = _cards.find(c => c.el === el);
+  if (card) {
+    try {
+      const resp = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tool: card.toolName,
+          arguments: { action: 'info', instance_id: card.id,
+                       ...inputArgs(_inputTopicsFor(card)) },
+        }),
+      });
+      const parsed = _parseMcpCallResult(await resp.json());
+      const liveTopic = selectPreviewTopic(parsed?.topic_out || [], declaredTopicOut);
+      if (liveTopic) {
+        showTopicDetail(liveTopic.topic, liveTopic.format || '');
+        return;
+      }
+    } catch (e) {
+      console.warn('[canvas] live topic fetch failed, falling back to cache:', e);
+    }
+  }
   const livePorts = [...el.querySelectorAll('.canvas-port.out')]
     .map(p => ({ port: p.dataset.port, topic: p.dataset.topic, format: p.dataset.format }));
   const liveMcp = _allMcps.find(m => m.id === mcpId);
@@ -1927,10 +2318,30 @@ function _openTopicDetailFor(el, mcpId, cachedTopicOut, declaredTopicOut) {
   showTopicDetail(candidate.topic, candidate.format || '');
 }
 
-function _inputTopicFor(card) {
-  const inConn = _connections.find(c => c.toCardId === card.id);
-  if (!inConn) return '';
-  const inPort = card.el.querySelector(`.canvas-port.in[data-idx="${inConn.toPortIdx}"]`);  return inPort?.dataset.topic || '';
+/**
+ * Every topic feeding `card`, in the order the connections were drawn.
+ *
+ * Read from each *source's* out-port, not from this card's in-port. An in-port
+ * dataset holds one string, and several connections routinely land on one port
+ * — decision_core declares a single `data/json` input and is normally fed by
+ * three — so _resolveAllTopics' last writer won and the rest were invisible
+ * here. This used to take `_connections.find(...)`, one arbitrary link, which
+ * made a card's derived topic depend on the order the links were drawn in and
+ * disagree with what api/config.py resolves at start.
+ *
+ * [] if any source is unresolved: same "wait, don't guess" rule as elsewhere,
+ * since deriving from half the inputs yields an answer that must be redone.
+ */
+function _inputTopicsFor(card) {
+  const topics = [];
+  for (const conn of _connections.filter(c => c.toCardId === card.id)) {
+    const src = _cards.find(c => c.id === conn.fromCardId);
+    const outPort = src?.el?.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
+    const topic = outPort?.dataset.topic || '';
+    if (!topic) return [];
+    if (!topics.includes(topic)) topics.push(topic);
+  }
+  return topics;
 }
 
 /**
@@ -1950,7 +2361,8 @@ function _inputTopicFor(card) {
  */
 function _revalidateDerivedTopics() {
   for (const card of _cards) {
-    const want = _inputTopicFor(card);
+    const want = _inputTopicsFor(card);
+    const wantKey = inputKey(want);
     const known = card.topicOutFrom;
     const hasReal = card.topicOut?.some(t => t.topic);
     // Nothing verified this card's topics in this page's lifetime. The saved
@@ -1958,11 +2370,31 @@ function _revalidateDerivedTopics() {
     // persisted — so re-derive it whenever the card has an input to derive from.
     // Once per card per page load: _fetchTopicsFromDriver drops a repeat request
     // for the same input.
+    // `want` is '' both when nothing feeds this card and when its source has not
+    // resolved yet, and those want opposite treatment: the first should be asked
+    // now (the driver answers with its default output), the second must wait or
+    // it would adopt that default over the topic it is about to derive. Treating
+    // them alike is what this function was written to fix but did not: TTS lost
+    // its inbound connection, so want was '' with hasReal true, and the guard
+    // below skipped it — the card kept '/remote_control/message/tts' while the
+    // driver published on '/perception/tts', and the panel stayed empty.
     if (known === undefined) {
-      if (want || !hasReal) _fetchTopicsFromDriver(card, want);
+      // Nothing has verified this card's topics in this page's lifetime, and
+      // the saved layout is not evidence. `want` is '' both when nothing
+      // feeds this card (ask now, the driver answers with its default) and
+      // when a connected source has not resolved its topic yet (also fine —
+      // _fetchTopicsFromDriver stamps topicOutFrom with this `want`, and
+      // _resolveAllTopics re-runs this on every resolve, so a later pass
+      // re-derives once the source's topic is known). Gating on `want ||
+      // inputless || !hasReal` skipped exactly the case a connected-but-
+      // stale card lands in: hasReal true (old wiring's cached topic) and
+      // want '' (new source not resolved yet) — that combination hit
+      // neither condition, so a rewired TTS card kept its previous
+      // connection's topic (e.g. an ext_mic/asr chain) forever.
+      _fetchTopicsFromDriver(card, want);
       continue;
     }
-    if (known !== want) _fetchTopicsFromDriver(card, want);
+    if (known !== wantKey) _fetchTopicsFromDriver(card, want);
   }
 }
 
@@ -2052,11 +2484,10 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     const json = await res.json();
 
     if (json.code === 200) {
-      const resultText = typeof json.data === 'string'
-        ? json.data
-        : JSON.stringify(json.data, null, 2);
+      const resultText = _formatCallResult(json.data);
       _showResult(el, resultText, false);
-      _logActivity('mcp_result', `${toolName} → ${resultText}`);
+      // The panel can afford a 144-entry list; one log line cannot.
+      _logActivity('mcp_result', `${toolName} → ${_truncate(resultText, 400)}`);
     } else {
       const errText = json.message || '执行失败';
       _showResult(el, errText, true);
@@ -2071,6 +2502,50 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
   }
 }
 
+function _truncate(text, limit) {
+  return text.length <= limit ? text : `${text.slice(0, limit)}… (${text.length} chars)`;
+}
+
+/**
+ * Render an MCP call result as something a human can read.
+ *
+ * `data` arrives as the MCP content envelope — `[{type:"text", text:"..."}]` —
+ * whose single text part is itself usually a JSON *string*. Stringifying the
+ * envelope therefore showed the wrapper plus an escaped payload: `\"ok\": true`
+ * and every non-ASCII character as `\uXXXX`, so a Chinese OCR result was
+ * unreadable in the one place it matters.
+ *
+ * Unwrap, then parse if it parses. JSON.stringify does not escape non-ASCII, so
+ * pretty-printing the parsed object is also what makes the text legible again.
+ * Anything that is not JSON is shown as the plain string it is, which is still
+ * better than the envelope around it.
+ */
+function _formatCallResult(data) {
+  let payload = data;
+
+  if (Array.isArray(payload)) {
+    const parts = payload
+      .map(part => (typeof part === 'string' ? part : part?.text))
+      .filter(part => typeof part === 'string');
+    // Several parts is rare but legal; keep them all rather than silently
+    // showing only the first.
+    if (parts.length) payload = parts.join('\n');
+  }
+
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim();
+    // Only attempt a parse on something that could be JSON — otherwise a bare
+    // number or the word "true" would be reformatted into something the
+    // service never said.
+    if (/^[[{]/.test(trimmed)) {
+      try { return JSON.stringify(JSON.parse(trimmed), null, 2); } catch { /* not JSON */ }
+    }
+    return payload;
+  }
+
+  return payload === undefined ? '' : JSON.stringify(payload, null, 2);
+}
+
 function _showResult(el, text, isError) {
   const existing = el.querySelector('.canvas-result');
   if (existing) existing.remove();
@@ -2079,8 +2554,29 @@ function _showResult(el, text, isError) {
   const pre = document.createElement('pre');
   pre.className = 'canvas-result-pre' + (isError ? ' error' : '');
   pre.textContent = text;
+  // Focusable so Ctrl/Cmd+A can be scoped to this box. A <pre> is not focusable
+  // by default, so select-all fell through to the document and selected the
+  // whole canvas — every card's text — instead of the result the user was
+  // trying to copy.
+  pre.tabIndex = 0;
+  pre.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+      event.preventDefault();
+      event.stopPropagation();
+      _selectElementText(pre);
+    }
+  });
   wrapper.appendChild(pre);
   el.appendChild(wrapper);
+}
+
+function _selectElementText(node) {
+  const selection = window.getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  selection.removeAllRanges();
+  selection.addRange(range);
 }
 
 function _flashStartError(msg) {
@@ -2130,12 +2626,13 @@ function _makeDraggable(el, cardData) {
     if (e.target.closest('.canvas-card-close')) return;
     if (e.target.closest('.canvas-card-info-btn')) return;
     if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
-    if (_projectRunning) return;
+    if (_editsLocked()) return;
     if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
 
     isDragging   = true;
+    _draggingCardId = cardData.id;
     startClientX = e.clientX;
     startClientY = e.clientY;
     startWorldX  = cardData.x;
@@ -2157,15 +2654,28 @@ function _makeDraggable(el, cardData) {
 
     el.style.left = cardData.x + 'px';
     el.style.top  = cardData.y + 'px';
-    _redrawConnections();
+    _scheduleRedraw();
   });
 
-  header.addEventListener('pointerup', () => {
+  const endDrag = (save) => {
     if (!isDragging) return;
     isDragging = false;
+    _draggingCardId = null;
     el.classList.remove('dragging');
-    _debouncedSave();
-  });
+    if (save) _debouncedSave();
+    // Card rebuilds were held off for the duration of the drag; catch up now.
+    if (_mcpsPendingRefresh) {
+      _mcpsPendingRefresh = false;
+      updateCanvasMcps(_allMcps);
+    }
+  };
+
+  header.addEventListener('pointerup', () => endDrag(true));
+  // Without this a lost capture (alt-tab, touch interruption, the element being
+  // replaced) would leave _draggingCardId set forever, which silently freezes
+  // every card rebuild from then on.
+  header.addEventListener('pointercancel', () => endDrag(true));
+  header.addEventListener('lostpointercapture', () => endDrag(true));
 }
 
 // ── Layout persistence ────────────────────────────────────────────────────────
@@ -2279,14 +2789,17 @@ function _applyEditorState(editor, reason) {
   _isEditor = editor === _sessionId;
   _updateEditorUI();
 
-  if (!editor) {
-    if (!wasEditor) {
-      // Canvas just went free — pick up whatever the last editor left behind.
-      _scheduleReload(reason === 'release');
-      if (reason === 'release') _showToast('画布编辑权已释放，可点击「编辑」接管');
-    }
-  } else if (wasEditor && !_isEditor) {
-    _showToast('编辑权已被释放，画布转为只读');
+  if (wasEditor && !_isEditor) {
+    // We just lost it. The idle timer needs its own wording: "已被释放" reads as
+    // someone else having done it and leaves the user with no idea why the canvas
+    // went read-only under them.
+    _showToast(reason === 'idle'
+      ? '超过 1 分钟无操作，编辑权已自动释放，点击「编辑」可重新获取'
+      : '编辑权已被释放，画布转为只读');
+  } else if (!editor && !wasEditor) {
+    // Canvas just went free — pick up whatever the last editor left behind.
+    _scheduleReload(reason === 'release');
+    if (reason === 'release') _showToast('画布编辑权已释放，可点击「编辑」接管');
   }
 }
 
@@ -2314,9 +2827,57 @@ async function _checkEditStatus() {
     const data = await resp.json();
     const editor = data.editor || null;
     if (editor === _currentEditor) return;   // no change — don't re-render or reload
-    _applyEditorState(editor, '');
+    // The server echoes why it was freed, so a client whose WS is down (the case
+    // this poll exists for) still gets the right explanation.
+    _applyEditorState(editor, data.reason || '');
   } catch { /* silent */ }
 }
+
+// ── Activity heartbeat ───────────────────────────────────────────────────────
+// Renews the 60s idle TTL from real input only. Bound on document in the capture
+// phase so it also covers the sidebar and the tool-config modals — someone filling
+// in a config form for two minutes is editing, and must not be timed out.
+//
+// 15s is well under the TTL so a dropped ping costs nothing. Panning and zooming
+// renew twice over: they also hit the debounced layout save, which the server
+// counts as activity too.
+//
+// Throttling is trailing-edge, not drop-on-the-floor. Discarding a throttled ping
+// would measure the 60s from the last *ping* instead of the last *action*: act at
+// t=0 and again at t=14, and the lock would die at t=60 — 46s after you last
+// touched it. The trailing timer guarantees a renewal lands within 15s of any
+// action, so every action really does buy a full minute.
+const _KEEP_ALIVE_MS = 15000;
+let _lastPingAt = 0;
+let _pingTimer = null;
+
+function _pingEdit() {
+  if (!_isEditor) return;
+  const wait = _KEEP_ALIVE_MS - (Date.now() - _lastPingAt);
+  if (wait <= 0) { _sendPing(); return; }
+  if (!_pingTimer) {
+    _pingTimer = setTimeout(() => { _pingTimer = null; _sendPing(); }, wait);
+  }
+}
+
+async function _sendPing() {
+  if (!_isEditor) return;
+  _lastPingAt = Date.now();
+  try {
+    const resp = await fetch('/api/canvas/keep-edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _sessionId }),
+    });
+    if (resp.status === 409) {
+      // Already expired or reassigned — adopt the truth instead of acting editor.
+      const data = await resp.json().catch(() => ({}));
+      _applyEditorState(data.editor || null, data.editor ? '' : 'idle');
+    }
+  } catch { /* silent — the poll will reconcile */ }
+}
+
+['pointerdown', 'keydown', 'wheel'].forEach(ev =>
+  document.addEventListener(ev, _pingEdit, { capture: true, passive: true }));
 
 async function _reloadLayout() {
   try {
@@ -2334,7 +2895,7 @@ async function _reloadLayout() {
     _connections = (layoutJson.data?.connections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
     _execConnections = (layoutJson.data?.execConnections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
     _resolveAllTopics();
-    _redrawConnections();
+    _scheduleRedraw();
     _syncEmptyState();
     // Update editor info
     _currentEditor = layoutJson.editor || null;
@@ -2364,5 +2925,6 @@ window.addEventListener('beforeunload', _releaseBeacon);
 // re-read the real state instead of trusting the stale in-memory flag.
 window.addEventListener('pageshow', (e) => { if (e.persisted) _checkEditStatus(); });
 
-// Periodically check edit status (piggyback on existing polling interval)
+// Periodically re-read the lock state. Purely a read: it must not renew the idle
+// TTL (the server no longer lets it), or an open tab would never time out.
 setInterval(_checkEditStatus, 10000);

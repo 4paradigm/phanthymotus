@@ -2,8 +2,17 @@
 """
 perception/main.py — Perception Stack bundle 统一入口。
 
-读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin（以及未来的 VLM、SLAM 等），
-聚合成一个 MCP HTTP server 对外暴露。
+读取 config.yaml，按插件配置加载各感知插件，聚合成一个 MCP HTTP server 对外暴露：
+
+  asr              语音识别（VAD + 唤醒词 + 多后端 ASR）
+  tts              语音合成（VITS2 / Matcha / Kokoro，本地 TensorRT 或 ONNX）
+  vop              物体检测（YOLOE-26 + TensorRT）
+  visual_depth     单目深度（YOLO26-depth + TensorRT）
+  ocr              文字识别（RapidOCR + TensorRT）
+  face_recognition 人脸识别与建库（InsightFace buffalo_sc）
+
+每个插件自带一个 `enabled` 开关，加载失败的插件不会拖垮其余插件 —— 它的卡片
+不出现在 dashboard 上，这一点是看得见的。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
   例：asr_info, asr_start, asr_stop, tts_info, tts_start, tts_speak
@@ -26,6 +35,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -126,10 +136,77 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        # `vdp:` is the pre-rename spelling of this section; a config.yaml a
+        # machine already has on disk still uses it.
+        depth_cfg = plugins_cfg.get("visual_depth") or plugins_cfg.get("vdp") or {}
+        if depth_cfg.get("enabled", False):
+            import re, socket
+            namespace = depth_cfg.get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.visual_depth import VideoDepthPerceptionPlugin
+            # Guarded like TTSPlugin and FaceRecognitionPlugin: this one needs a
+            # TensorRT engine bundle for the running JetPack line, and a machine
+            # that cannot fetch it must still get ASR/TTS/VOP/OCR. The card
+            # simply does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    VideoDepthPerceptionPlugin(depth_cfg, namespace, executor)
+                )
+                log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
+                          exc_info=True)
+
         if plugins_cfg.get("ocr", {}).get("enabled", False):
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
+
+        if plugins_cfg.get("soundevent", {}).get("enabled", False):
+            from plugins.soundevent import SoundEventPlugin
+            self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
+            log.info("SoundEventPlugin loaded")
+        if plugins_cfg.get("face_recognition", {}).get("enabled", False):
+            from plugins.face import FaceRecognitionPlugin
+            # Guarded like TTSPlugin: this plugin needs the standalone
+            # onnxruntime and a readable identity database, and neither belongs
+            # on the critical path of ASR/TTS/VOP/OCR. A failure here means the
+            # card does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    FaceRecognitionPlugin(plugins_cfg["face_recognition"], executor)
+                )
+                log.info("FaceRecognitionPlugin loaded")
+            except Exception:
+                log.error("FaceRecognitionPlugin failed to load; continuing without it",
+                          exc_info=True)
+
+    def _plugin_for(self, full_name: str):
+        """Resolve a tool name to (plugin, action) by longest matching prefix.
+
+        Matching the *longest* prefix, not the first underscore-separated
+        segment: a prefix may itself contain an underscore (`face_recognition`),
+        and splitting on the first `_` would look for a plugin called `face`,
+        find none, and report the tool as unknown.
+
+        A plugin may also declare `ALIASES` — prefixes it answers to but does
+        not advertise. That is what keeps a card saved under an old tool name
+        working after a rename: `get_all_tools` publishes only PREFIX, so the
+        dashboard shows the new name, while an existing canvas card still
+        dispatches instead of going `state: error` on the next restart.
+        """
+        candidates = [(plugin.PREFIX, 0, plugin) for plugin in self._plugins]
+        candidates += [(alias, 1, plugin) for plugin in self._plugins
+                       for alias in getattr(plugin, "ALIASES", ())]
+        # Longest prefix first, and a real prefix ahead of an alias of the same
+        # length: whoever actually owns a name outranks whoever used to.
+        for prefix, _is_alias, plugin in sorted(candidates, key=lambda c: (-len(c[0]), c[1])):
+            if full_name == prefix:
+                return plugin, plugin.PREFIX
+            if full_name.startswith(prefix + "_"):
+                return plugin, full_name[len(prefix) + 1:]
+        return None, ""
 
     def get_all_tools(self) -> list:
         tools = []
@@ -140,22 +217,20 @@ class PerceptionBundle:
         return tools
 
     def dispatch(self, full_name: str, args: dict) -> dict | None:
-        prefix, sep, tool_name = full_name.partition("_")
-        name = tool_name if sep else prefix
-        for p in self._plugins:
-            if p.PREFIX == prefix:
-                return p.dispatch(name, args)
-        return None
+        plugin, name = self._plugin_for(full_name)
+        if plugin is None:
+            return None
+        return plugin.dispatch(name, args)
 
     def owns(self, full_name: str) -> bool:
         """True when some loaded plugin claims this tool name.
 
         Lets the caller tell a genuinely unknown tool apart from a loaded
-        plugin returning None for an action it does not handle. Mirrors
-        `dispatch`'s prefix split so the two can never disagree.
+        plugin returning None for an action it does not handle. Goes through
+        the same resolver as `dispatch`, so the two cannot disagree.
         """
-        prefix, _, _ = full_name.partition("_")
-        return any(p.PREFIX == prefix for p in self._plugins)
+        plugin, _ = self._plugin_for(full_name)
+        return plugin is not None
 
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:
@@ -232,6 +307,32 @@ def make_handler():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
+
+            # File intake, before the body is read: an upload can be tens of
+            # megabytes and the JSON paths below slurp Content-Length into
+            # memory. utils/file_intake streams it to disk instead.
+            #
+            # This is how a photo reaches this container at all — see that
+            # module's docstring. agent-core proxies the browser's (or the LLM's)
+            # upload here and hands the returned path straight to a tool call;
+            # neither side needs a shared mount, because the path in the reply is
+            # this container's own.
+            if self.path == "/file/upload":
+                from utils.file_intake import access_token, handle_upload
+                cfg = _load_config()
+                intake = (cfg.get("file_intake") or {})
+                base_dir = str(intake.get("dir", "/models/uploads"))
+                body = self.rfile.read(length)
+                status, payload = handle_upload(
+                    self.headers, body, base_dir,
+                    token=access_token(),
+                    provided_token=self.headers.get("X-Access-Token"),
+                    max_bytes=int(intake.get("max_bytes", 64 * 1024 * 1024)),
+                    retention_days=int(intake.get("retention_days", 7)),
+                )
+                self._send(status, json.dumps(payload, ensure_ascii=False))
+                return
+
             raw = self.rfile.read(length)
 
             if self.path == "/vad/test":
@@ -498,7 +599,36 @@ def main():
     _bundle  = PerceptionBundle(cfg, executor)
 
     def _spin():
-        executor.spin()
+        """Spin the executor, surviving a single entity's teardown race.
+
+        `executor.spin()` used to run bare. Anything it raised killed this
+        daemon thread outright, and with it every subscription in the process —
+        ASR, OCR, vop, the lot — while the MCP HTTP server kept answering, so
+        the service looked healthy and simply stopped perceiving. The one
+        observed trigger was rclpy's
+
+            InvalidHandle: cannot use Destroyable because destruction was
+            requested
+
+        raised from `_take_subscription` when a node's handle is destroyed
+        while the executor still holds it in its wait list. That is a bug in
+        whoever tore the node down (fixed in vop/visual_depth: leave the executor
+        before destroying anything), but one plugin's teardown must not be
+        able to silence the whole stack.
+
+        So: log it and resume. The offending entity is already gone, so the
+        next spin proceeds without it. The delay is a brake against a tight
+        loop if some error turns out to be permanent — better a slow log than
+        a pegged core.
+        """
+        while True:
+            try:
+                executor.spin()
+                return                      # clean shutdown
+            except Exception:
+                log.exception("[spin] executor raised; resuming in 1s — "
+                              "ROS callbacks were interrupted")
+                time.sleep(1.0)
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 

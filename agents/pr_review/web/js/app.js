@@ -219,6 +219,12 @@ async function loadDetail(id) {
     (job.build_results || []).forEach((b) => {
       logCursors.set(String(b.idx), { offset: 0, done: false });
     });
+    // Test logs share the same tailing loop but live at their own indices
+    // (tester.TEST_IDX_BASE and up). Without seeding them here their panes
+    // would re-read from offset 0 on every poll.
+    (job.test_results || []).forEach((t) => {
+      logCursors.set(String(t.idx), { offset: 0, done: false });
+    });
 
     if (traceState.jobId !== id) {
       traceState.jobId = id;

@@ -13,6 +13,79 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 该卡片的公开契约可复用于不同机器人；当前 runtime adapter 使用兼容性
 `ubuntu` namespace，各本体由 Driver 提供符合契约的 topic、frame、标定和执行器。
+**另一张卡片：`vla`，默认开启。** `enabled` 只决定这张卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
+
+## `vla` 卡片
+
+一张卡片 + 可插拔 provider，**不是每个模型一张卡**。两条轴刻意保持正交，因为换模型和换机器人是两件无关的事：
+
+- **provider（换模型）** —— 从 `plugins/vla/providers/` **扫目录发现**，卡片里没有枚举。加一个后端就是加一个文件：暴露 `PROVIDER`，实现 `capabilities` / `infer` / `health` / `close` 四个方法，`configSchema` 的 enum 在运行时生成。
+- **embodiment（换机器人）** —— 完全不配置。卡片驱动的是**画布上连到它输出口的那张驱动命令卡片**，和 `canvas_binding.py` 决定 agent 能够到哪些 MCP 是同一套逻辑。agent-core 在启动时向那张卡片要 action space，作为 `control_interface` 传进 `start`。没有 `embodiment: "g1_dex1"` 这种字符串可以写错，也不会把 URDF 误当成动作接口。
+
+启动时**协商一次**：provider 的 `capabilities()` 和下游 descriptor 对账（动作维度、频率），对不上直接拒绝启动并说明是哪两个数字对不上——而不是启动后在 30 Hz 上一条条失败，那时候操作员看到的是一台停住的机器人和没有原因。
+
+Provider 的组织方式是**非对称的**，而且是刻意的：
+
+| provider | 说明 |
+|---|---|
+| `mock` | 正弦轨迹，无模型、无网络、无 GPU、无 torch。默认值 |
+| `smolvla` | LeRobot SmolVLA，本机推理。**只有 JetPack 6.1 的镜像有**，见下 |
+| `vla_cloud` | 任何跑在别处的模型。只配 `{endpoint, api_key, model}` |
+
+**本地一个模型一个文件，按模型名命名** —— 和 `perception/plugins/` 一样（`asr.py`、`tts.py`、`vop.py` 各自管自己的权重、下载和加载）。一个笼统的 `local` 会变成一个按模型族分支的 switch，SmolVLA 的动作 padding、π0 的 JAX 栈、UnifoLM 的 flash-attn 构建全堆在它后面。共用的部分（发现、四方法契约、与机械臂的协商）在卡片和 `providers/__init__.py` 里。
+
+**远端只有一个文件。** 模型跑在别处时，它自己的那些麻烦就不是机器人的事了：回来的是一个 action chunk，唯一变化的是地址。配置形状和 agent-core 配 LLM 完全一样——这个项目里 `config.main['client']['llm']` 就是一组 `{url, key, model}`，旁边没有一行 serving 代码。
+
+### 选哪个 checkpoint
+
+`provider` 选"哪个模型族、跑在哪"，`model_name` 选"具体哪一份权重"：
+
+```yaml
+provider: smolvla
+model_name: smolvla_base     # 本机 provider 从 models: 里挑
+models:
+  smolvla_base:              # 上游原版，6 维（SO-100/SO-101）
+    model_dir: /models/vla/smolvla_base
+    weights: {base_url: [...], files: {...}}
+    feature_map: {...}
+  smolvla_tianyi:            # 为某台机器人微调过的，另起一份
+    ...
+```
+
+公开发布的 checkpoint 沿用**上游原名**；为某台机器人微调过的用**带机器人名的名字**（`smolvla_tianyi`、`smolvla_q5`）——因为"它适配的动作空间"正是操作员必须搞对的东西，而名字是唯一会被读到的地方。
+
+选了一个没注册过的名字会**直接拒绝并列出已暂存的**，不会退回默认值：悄悄加载另一份 checkpoint 会得到一个能跑、会动、但是错的策略，正是整条协商链路存在的理由。
+
+表单里 `endpoint` / `api_key` / `timeout_ms` **只在 `provider: vla_cloud` 时出现**（`x-show-when`）。本机 provider 旁边填着一个 endpoint 看起来像配好了，实际被忽略，没有任何东西会说明这件事。
+
+需要说清楚的一个后果：`vla_cloud` 说的是**我们自己的 `motus.vla/1`**，不是 openpi 的 msgpack-over-WebSocket，也不是 LeRobot 的 gRPC。指向一个原始的上游服务器不会work——翻译属于服务端（`phanthymotus-cloud`），那里本来就住着吞吐和扩缩容的问题。这和 OpenAI 生态的分工是同一个：spec 是文档，vLLM 和 SGLang 各自实现，客户端不背每种服务器一个适配器。
+
+`smolvla` 的三条规矩都在 `providers/smolvla.py` 里：**懒 import**（torch/lerobot 在用到它们的函数里才 import，所以没装 lerobot 的镜像照常启动、照常提供 `mock` 和 `vla_cloud`）、**懒下载**（COS + size/sha256 pin，复用 perception 的 `model_downloader`，不重写）、**懒加载且不占调用线程**（`__init__` 只读 checkpoint 的 config —— 便宜，且足够回答 `capabilities()` 让卡片先完成协商 —— 权重在后台线程加载，期间 `health()` 为 False，卡片报 `loading` 而不是 ready）。
+
+有一件事它替你做不了，而且值得把话说准：**限制来自 checkpoint，不是架构。**
+
+SmolVLA 的天花板是 `max_action_dim: 32` —— 训练时把动作补到 32 过投影层，推理时按 `action_feature.shape[0]` 裁回数据集的维度。维度在微调时**从 LeRobot 数据集自动推断**，投影层跟着 resize，不用手改配置（只有 DoF > 32 才要动架构）。天轶的 26 维落在 32 以内，所以这个模型族对天轶是可行的目标。
+
+不行的是**这个 checkpoint**：`smolvla_base` 在 SO-100/SO-101 上预训练，它的动作头只学过六个槽，归一化统计量也是那条臂的。指到 26 维上它会**吐出数字而不是报错**——那比拒绝更糟，也正是协商比对的是 checkpoint 的宽度而不是网络宽度的原因。
+
+路径是**在天轶数据上微调**，不是改配置。动手前值得知道：LeRobot 的 issue 区里有微调 loss 收敛、曲线正常、评测成功率却是 0% 的案例，原因是 state/action 布局和录制时对不上。
+
+`mock` 的用途不是演示，是**在接任何模型之前验证整条通路**——画布连线、协商、消息构造、驱动侧检查链、watchdog、拔网线。它按各关节半行程的比例构造，因此**在结构上就出不了限位**，默认幅度很小。
+
+安全上这张卡片自己只做很少的事：
+
+- **不自启动。** bundle 生命周期的 `start()` 故意什么都不做，策略不能因为容器重启就继续跑。
+- **不声明 `x-completion`。** 策略跑到被停为止，没有"完成"；声明了会让一个 ACP pending 挂住整张卡片的生命周期，把其它所有 actuator 堵在 barrier 后面。
+- **`x-resource` + 两个 interrupt hook** 都指向 `stop`。
+- 推理失败时**发布空**而不是重发上一条：接收端的 watchdog 会让机械臂停住，而重发会让它继续按一个已经不在跑的策略动。
+
+真正保证安全的东西在驱动侧 —— `common/control.ControlSink` 逐条检查、静默即 hold、受力即停。这个分工是刻意的：actucore 这个进程可能崩溃、被 OOM kill、或者丢掉网络，这三种情况都不能是"机器人靠它停下来"。
+
+协议见 `phanthymotus-driver/README_dev.md` §「Continuous Control」，设计见 `docs/vla-integration.md`。
+
+```bash
+cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
+```
 
 | | |
 |---|---|
@@ -32,12 +105,14 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 ```bash
 ./deploy/build_actucore.sh                 # JetPack 5.11（默认）
 ./deploy/build_actucore.sh --mirror tuna   # 指定 pip / apt 源
+./deploy/build_actucore.sh --jp-version 6.1 # 上游 VLA 本地推理，不含 navigation
 ```
 
 JetPack 5.11 默认继承仓库锁定的 `@sha256` 基础镜像，无需额外
-环境变量。JetPack 6.1 的 navigation base 尚未发布，当前不属于正式
-构建范围；该版本必须先构建、发布并在仓库中固定匹配的精确 digest，
-然后才能恢复支持。该基础镜像预编译了锁定版本的 FAST-LIVO2、Nav2
+环境变量，提供 navigation 与 VLA mock / vla_cloud。JetPack 6.1 保留上游
+`jetson-base-actucore` 的 torch / lerobot 本地推理，通过 `Dockerfile.vla` 构建；
+该镜像禁用 navigation（对应基座尚未发布），不接受 navigation base 覆盖。
+5.11 的导航基础镜像预编译了锁定版本的 FAST-LIVO2、Nav2
 和系统依赖，仅作为日常构建的 builder。仓库自有 ROS 包使用普通 install
 编译后，最终阶段从同一个干净、锁定 digest 的 Jetson 平台镜像重新开始，
 只复制第三方和自有 ROS install space 及应用代码。源码、build/log 目录和
@@ -120,7 +195,7 @@ TOOLS = [
 ]
 ```
 
-**`type` 的含义** —— 它决定 Agent Core 怎么调度这个工具：`sensor` 连续调用会被批量并行；`actuator` 和 `processor` 要过 ACP barrier，dispatch 前会等所有 pending 动作完成；`resource` 是静态资源（如 URDF）。没声明 `type` 的工具默认按需要 barrier 处理（安全侧）。判定逻辑在 `agent-core/src/event/llm.py` 的 `_needs_barrier()`。
+**`type` 的含义** —— 它决定 Agent Core 怎么调度这个工具：`sensor` 连续调用会被批量并行；`actuator` 和 `processor` 要过 ACP barrier，按上游 `x-resource` 和调用者顺序等待冲突动作；未声明资源时保守互斥；`resource` 是静态资源（如 URDF）。没声明 `type` 的工具默认按需要 barrier 处理（安全侧）。判定逻辑在 `agent-core/src/event/llm.py` 的 `_needs_barrier()`。
 
 **`configSchema` 的 `scope`** —— `shared` 是整个卡片共享一份配置，`instance` 是每张画布卡片一份。
 

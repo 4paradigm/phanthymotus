@@ -31,6 +31,45 @@ Known failure modes to check for:
 - `utils/model_downloader.py` — the model manifest. **Models belong here, fetched
   from COS at runtime, not committed.** Eleven models are already listed; a new
   one should be added to this manifest in the same shape.
+- `utils/model_progress.py` — the one place the download status line is worded.
+
+## Model downloads
+
+Authoritative: `perception/README.md` §"Model downloads: the two rules". If a PR
+touches a download path — a new model, a new `ensure_*`, a plugin that fetches
+weights, a changed manifest — check it against both rules and say which one it
+misses.
+
+**Rule 1 — pinned, and free to choose a source.** Every file carries `size` +
+`sha256`, verified before acceptance. Flag: a new model added without pins; a
+`check_file`-exists test used as verification (a truncated 780 MB transfer passes
+it and then fails at session creation, undiagnosably); a hand-rolled loop over
+sources instead of passing `base_url` as a list to `ensure_verified_bundle`, which
+probes them and uses the fastest.
+
+**Rule 2 — it must say how far along it is.** A download with no progress is
+indistinguishable from a hang: one status line, and a cold fetch runs from seconds
+to minutes. Flag any of these:
+
+- an `ensure_*` call that omits `progress_cb` where the caller has a status
+  channel — the parameter existing and not being passed is the usual shape of
+  this bug, and it reads as wired when it is not;
+- a new `ensure_*` front door that does not *accept* `progress_cb` (and `stage_cb`
+  too, if it unpacks an archive) and forward it;
+- the status line formatted by hand instead of via `utils/model_progress.fetch_status` —
+  seven plugins render this and the wording must not drift;
+- an archive path with no `stage_cb`: a percentage lies at the end of an archive
+  download, and `100% (515/515 MB)` frozen while a tarball unpacks reads as a hang;
+- **a callback wired to a status field nothing can read.** This is the one worth
+  spending a round on, because the code looks complete: check the plugin's
+  `info`/`state` can actually be answered *while the download is in flight*. Two
+  real cases — TTS's `_loading` flag had no writer, so its "downloading" reply was
+  unreachable code; the VLA card answered `idle` through a multi-gigabyte fetch
+  because `_running` is only set afterwards.
+
+Where a download genuinely cannot report progress (it runs in a child process
+whose protocol is request/reply), the fix is to move the fetch, not to skip the
+rule — see how face prefetches in the parent.
 
 Perception ships `deploy/service.yml`, so it deploys the same way drivers do:
 Agent Core extracts the fragment from the image and merges it into the host

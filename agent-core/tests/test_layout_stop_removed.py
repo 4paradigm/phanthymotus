@@ -20,6 +20,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -208,6 +209,7 @@ def test_saving_a_running_layout_reconciles_topic_actions(monkeypatch):
         'canvas_layout': {'cards': []},
     })
     monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
     monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
     monkeypatch.setattr(canvas_api, 'notify_layout_changed', lambda _session: None)
 
@@ -248,6 +250,7 @@ def test_route_activation_failure_keeps_saved_layout_but_stops_project(
         'canvas_layout': {'cards': []},
     })
     monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
     monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
     monkeypatch.setattr(canvas_api, 'notify_layout_changed', lambda _session: None)
 
@@ -274,6 +277,7 @@ def test_layout_is_not_saved_when_removed_card_stop_is_unconfirmed(
         'canvas_layout': original,
     })
     monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
     monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
 
     result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
@@ -297,6 +301,7 @@ def test_route_failure_does_not_stop_a_removed_card(monkeypatch, calls):
         'canvas_layout': original,
     })
     monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
     monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
 
     result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
@@ -334,6 +339,7 @@ def test_partial_stop_failure_stops_routes_and_project_fail_closed(
         'canvas_layout': original,
     })
     monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
+    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
     monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
 
     result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(

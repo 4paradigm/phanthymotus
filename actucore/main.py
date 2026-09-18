@@ -9,7 +9,8 @@ whole-body control）以卡片（插件）的形式挂在这里，聚合成一�
 
 当前挂载的卡片：`navigation`（公开工具名 `ControlledSemanticSpatial`）——
 FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者作为子进程跑在本容器内，
-对外只发布 bounded velocity proposal。新增卡片的完整步骤见 README.md。
+对外只发布 bounded velocity proposal；同时注册上游 `vla` 卡片。
+新增卡片的完整步骤见 README.md。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}；工具名等于 PREFIX 时不加前缀
   例：vla_info、vla_start、ControlledSemanticSpatial
@@ -150,6 +151,10 @@ class ActuCoreBundle:
                 "NavigationPlugin loaded (single-container runtime, namespace=%s)",
                 namespace,
             )
+        if plugins_cfg.get("vla", {}).get("enabled", False):
+            from plugins.vla import VLAPlugin
+            self._plugins.append(VLAPlugin(plugins_cfg["vla"], executor))
+            log.info("VLAPlugin loaded")
 
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")

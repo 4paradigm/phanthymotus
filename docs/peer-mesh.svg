@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PhanthyMotus peer mesh & security diagram — editable source.
+
+  Rendered from the Resource Center homepage component
+  (components/PeerMeshDiagram.tsx), a hand-laid-out 1200x784 SVG.
+
+  Deliberately a separate figure from architecture.svg: that one is the
+  vertical single-robot stack, this one is the horizontal peer relationship
+  plus the orthogonal trust axis.
+
+  README.md / README_zh.md embed docs/images/peer-mesh.png for consistency
+  with the architecture diagram. After editing this file, re-export that
+  PNG (2x, white background).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="784" viewBox="0 0 1200 784" role="img" aria-label="PhanthyMotus peer mesh and security: four discovery providers converging on a peer registry; four collaboration links between two agent cores, every one signed and restricted to paired peers, with the state link marked state-only; and a trust pipeline of identity, short-code pairing, pinned mTLS and role authorization, ending in the actuator double gate that prevents a peer from driving a motor directly">
+<defs>
+<marker id="head-peer" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M 0 0 L 10 5 L 0 10 z" fill="#3F7A80">
+</path>
+</marker>
+<marker id="head-trust" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M 0 0 L 10 5 L 0 10 z" fill="#9C4B3F">
+</path>
+</marker>
+</defs>
+<text x="96" y="120" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.08em">DISCOVERY</text>
+<text x="96" y="386" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.08em">TRANSPORT</text>
+<text x="96" y="658" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.08em">TRUST</text>
+<g>
+<rect x="108" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
+</rect>
+<text x="122" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">mDNS</text>
+<text x="122" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">same LAN · primary</text>
+<g>
+<rect x="122" y="90" width="116" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
+</rect>
+<text x="180" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">_motus._tcp.local</text>
+</g>
+</g>
+<g>
+<rect x="397" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
+</rect>
+<text x="411" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">CLOUD ROSTER</text>
+<text x="411" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">across sites</text>
+<g>
+<rect x="411" y="90" width="116" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
+</rect>
+<text x="469" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Feishu · registry</text>
+</g>
+</g>
+<g>
+<rect x="686" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
+</rect>
+<text x="700" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">BLE ADVERT</text>
+<text x="700" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">fully offline</text>
+<g>
+<rect x="700" y="90" width="116" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
+</rect>
+<text x="758" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">pairing bootstrap</text>
+</g>
+</g>
+<g>
+<rect x="976" y="40" width="200" height="78" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
+</rect>
+<text x="990" y="64" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">STATIC LIST</text>
+<text x="990" y="78" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">fallback</text>
+<g>
+<rect x="990" y="90" width="86" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#3F7A80" stroke-opacity="0.45">
+</rect>
+<text x="1033" y="103.5" fill="#2F5F63" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">hand-entered</text>
+</g>
+</g>
+<g>
+<path d="M 208 118 L 474 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
+</path>
+</g>
+<g>
+<path d="M 497 118 L 586 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
+</path>
+</g>
+<g>
+<path d="M 786 118 L 698 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
+</path>
+</g>
+<g>
+<path d="M 1076 118 L 810 150" fill="none" stroke="#3F7A80" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-peer)">
+</path>
+</g>
+<text x="342" y="144" fill="#78716C" text-anchor="end" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">PeerAdvert</text>
+<g>
+<rect x="362" y="150" width="560" height="58" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
+</rect>
+<text x="376" y="174" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">PEER REGISTRY</text>
+<text x="376" y="188" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">peer_id = Ed25519 fingerprint — one peer found via many paths stays one record</text>
+</g>
+<g>
+<rect x="108" y="282" width="250" height="200" rx="10" fill="#EEF4F1" stroke="#5C7A6A" stroke-width="2">
+</rect>
+<text x="122" y="306" fill="#425A4B" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">AGENT CORE · A</text>
+<text x="122" y="320" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">port 15678</text>
+<g>
+<rect x="122" y="332" width="68" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="156" y="345.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Collector</text>
+</g>
+<g>
+<rect x="196" y="332" width="74" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="233" y="345.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Agent Loop</text>
+</g>
+<g>
+<rect x="122" y="357" width="80" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="162" y="370.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Canvas Gate</text>
+</g>
+<g>
+<rect x="208" y="357" width="68" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="242" y="370.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Subagents</text>
+</g>
+</g>
+<g>
+<rect x="926" y="282" width="250" height="200" rx="10" fill="#EEF4F1" stroke="#5C7A6A" stroke-width="2">
+</rect>
+<text x="940" y="306" fill="#425A4B" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">AGENT CORE · B</text>
+<text x="940" y="320" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">port 15678</text>
+<g>
+<rect x="940" y="332" width="68" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="974" y="345.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Collector</text>
+</g>
+<g>
+<rect x="1014" y="332" width="74" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="1051" y="345.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Agent Loop</text>
+</g>
+<g>
+<rect x="940" y="357" width="80" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="980" y="370.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Canvas Gate</text>
+</g>
+<g>
+<rect x="1026" y="357" width="68" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#5C7A6A" stroke-opacity="0.45">
+</rect>
+<text x="1060" y="370.5" fill="#425A4B" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Subagents</text>
+</g>
+</g>
+<g>
+<path d="M 368 322 L 916 322" fill="none" stroke="#3F7A80" stroke-width="2" stroke-opacity="1" marker-start="url(#head-peer)" marker-end="url(#head-peer)">
+</path>
+<text x="642" y="314" fill="#78716C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.02em">lan A2A · ChannelAdapter</text>
+<text x="642" y="338" fill="#A8A29E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9.5">InboundMessage / OutboundMessage · reuses ACL, rate limit, loop guard</text>
+</g>
+<g>
+<path d="M 368 366 L 916 366" fill="none" stroke="#3F7A80" stroke-width="2" stroke-opacity="1" marker-start="url(#head-peer)" marker-end="url(#head-peer)">
+</path>
+<text x="642" y="358" fill="#78716C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.02em">peer MCP · tool proxy</text>
+<text x="642" y="382" fill="#A8A29E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9.5">mcp__peer:&lt;id&gt;__&lt;tool&gt; · canvas gate + ACP barrier apply unchanged</text>
+</g>
+<g>
+<path d="M 368 410 L 916 410" fill="none" stroke="#3F7A80" stroke-width="2" stroke-opacity="1" marker-start="url(#head-peer)" marker-end="url(#head-peer)">
+</path>
+<text x="642" y="402" fill="#78716C" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.02em">peer_delegate · task handoff</text>
+<text x="642" y="426" fill="#A8A29E" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9.5">SubagentSpec → / SubagentResult ← · hop_count ≤ 2</text>
+</g>
+<g>
+<path d="M 368 454 L 916 454" fill="none" stroke="#3F7A80" stroke-width="1.5" stroke-opacity="0.75" marker-start="url(#head-peer)" marker-end="url(#head-peer)">
+</path>
+<text x="642" y="446" fill="#3F7A80" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" letter-spacing="0.02em">peer state · signed HTTPS</text>
+<text x="642" y="470" fill="#9C4B3F" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9.5">POST /api/peer/inbox/state · state only — never commands</text>
+</g>
+<g>
+<rect x="108" y="556" width="252" height="74" rx="10" fill="#FBEDEA" stroke="#9C4B3F" stroke-width="2">
+</rect>
+<text x="122" y="580" fill="#7A3830" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">IDENTITY</text>
+<text x="122" y="594" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">Ed25519 keypair</text>
+<g>
+<rect x="122" y="606" width="140" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#9C4B3F" stroke-opacity="0.45">
+</rect>
+<text x="192" y="619.5" fill="#7A3830" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">peer_id = fingerprint</text>
+</g>
+</g>
+<g>
+<rect x="380" y="556" width="252" height="74" rx="10" fill="#FBEDEA" stroke="#9C4B3F" stroke-width="2">
+</rect>
+<text x="394" y="580" fill="#7A3830" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">PAIRING</text>
+<text x="394" y="594" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">6-digit SAS code</text>
+<g>
+<rect x="394" y="606" width="122" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#9C4B3F" stroke-opacity="0.45">
+</rect>
+<text x="455" y="619.5" fill="#7A3830" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">both sides confirm</text>
+</g>
+</g>
+<g>
+<rect x="652" y="556" width="252" height="74" rx="10" fill="#FBEDEA" stroke="#9C4B3F" stroke-width="2">
+</rect>
+<text x="666" y="580" fill="#7A3830" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">TRANSPORT</text>
+<text x="666" y="594" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">pinned mTLS</text>
+<g>
+<rect x="666" y="606" width="98" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#9C4B3F" stroke-opacity="0.45">
+</rect>
+<text x="715" y="619.5" fill="#7A3830" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">replay-guarded</text>
+</g>
+</g>
+<g>
+<rect x="924" y="556" width="252" height="74" rx="10" fill="#FBEDEA" stroke="#9C4B3F" stroke-width="2">
+</rect>
+<text x="938" y="580" fill="#7A3830" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">AUTHORIZATION</text>
+<text x="938" y="594" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">peers table role</text>
+<g>
+<rect x="938" y="606" width="104" height="19" rx="4" fill="rgba(255,255,255,0.7)" stroke="#9C4B3F" stroke-opacity="0.45">
+</rect>
+<text x="990" y="619.5" fill="#7A3830" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">default: viewer</text>
+</g>
+</g>
+<g>
+<path d="M 360 593 L 380 593" fill="none" stroke="#9C4B3F" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-trust)">
+</path>
+</g>
+<g>
+<path d="M 632 593 L 652 593" fill="none" stroke="#9C4B3F" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-trust)">
+</path>
+</g>
+<g>
+<path d="M 904 593 L 924 593" fill="none" stroke="#9C4B3F" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-trust)">
+</path>
+</g>
+<g>
+<rect x="108" y="656" width="180" height="52" rx="10" fill="#EAF3F3" stroke="#3F7A80" stroke-width="2">
+</rect>
+<text x="122" y="680" fill="#2F5F63" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">PEER REQUEST</text>
+<text x="122" y="694" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">operator role</text>
+</g>
+<g>
+<rect x="316" y="656" width="160" height="52" rx="10" fill="#FBEDEA" stroke="#9C4B3F" stroke-width="2">
+</rect>
+<text x="330" y="680" fill="#7A3830" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">COLLECTOR</text>
+<text x="330" y="694" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">input, not command</text>
+</g>
+<g>
+<rect x="504" y="656" width="170" height="52" rx="10" fill="#FBEDEA" stroke="#9C4B3F" stroke-width="2">
+</rect>
+<text x="518" y="680" fill="#7A3830" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">LLM DECISION</text>
+<text x="518" y="694" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">local agent decides</text>
+</g>
+<g>
+<rect x="702" y="656" width="180" height="52" rx="10" fill="#FBEDEA" stroke="#9C4B3F" stroke-width="2">
+</rect>
+<text x="716" y="680" fill="#7A3830" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">CANVAS GATE</text>
+<text x="716" y="694" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">bound on canvas?</text>
+</g>
+<g>
+<rect x="910" y="656" width="266" height="52" rx="10" fill="#FDF0E8" stroke="#C4673A" stroke-width="2">
+</rect>
+<text x="924" y="680" fill="#A0502C" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" letter-spacing="0.06em">ACTUATOR</text>
+<text x="924" y="694" fill="#A8A29E" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10">+ human confirm if required</text>
+</g>
+<g>
+<path d="M 288 682 L 316 682" fill="none" stroke="#9C4B3F" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-trust)">
+</path>
+</g>
+<g>
+<path d="M 476 682 L 504 682" fill="none" stroke="#9C4B3F" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-trust)">
+</path>
+</g>
+<g>
+<path d="M 674 682 L 702 682" fill="none" stroke="#9C4B3F" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-trust)">
+</path>
+</g>
+<g>
+<path d="M 882 682 L 910 682" fill="none" stroke="#9C4B3F" stroke-width="2" stroke-linejoin="round" marker-end="url(#head-trust)">
+</path>
+</g>
+<path d="M 198 708
+              C 198 748, 1043 748, 1043 708" fill="none" stroke="#9C4B3F" stroke-width="2" stroke-dasharray="5 5" stroke-opacity="0.55">
+</path>
+<circle cx="620.5" cy="742" r="13" fill="#FFFFFF" stroke="#9C4B3F" stroke-width="2">
+</circle>
+<path d="M 615.5 737 L 625.5 747
+              M 625.5 737 L 615.5 747" stroke="#9C4B3F" stroke-width="2.5" stroke-linecap="round">
+</path>
+<text x="646.5" y="746" fill="#9C4B3F" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5" font-weight="600">a peer can never drive a motor directly</text>
+</svg>

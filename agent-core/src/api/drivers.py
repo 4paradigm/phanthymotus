@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import fcntl
 import os
+import shutil
 import threading
 import time
 from typing import Optional
@@ -273,6 +274,36 @@ def _deploy_sync(driver: dict) -> dict:
         return _deploy_sync_inner(driver)
 
 
+def _explain_pull_error(message: str) -> str:
+    """Turn a docker error into something an operator can act on.
+
+    Disk exhaustion is the case worth naming: it is common on a 57 GB Jetson
+    holding several ~18 GB perception images, and both the streamed pull error
+    and the misleading `No such image` that follows it are unactionable on
+    their own. The free-space figure comes from the host filesystem, which is
+    bind-mounted, so the number shown is the one that actually ran out.
+    """
+    text = str(message)
+    lowered = text.lower()
+    if 'no space left on device' in lowered or 'disk quota exceeded' in lowered:
+        hint = '磁盘空间不足'
+        try:
+            usage = shutil.disk_usage('/')
+            hint += (
+                f'（{usage.free // (1 << 20)} MiB 可用 / '
+                f'{usage.total // (1 << 30)} GiB 总计）'
+            )
+        except Exception:  # noqa: BLE001 - the hint is best-effort
+            pass
+        return (
+            f'{hint}。请清理旧镜像后重试：'
+            'docker image prune -a && docker builder prune -a'
+        )
+    if 'no such image' in lowered:
+        return f'{text}（本地没有该镜像，通常意味着上一步拉取实际失败）'
+    return text
+
+
 def _deploy_sync_inner(driver: dict) -> dict:
     """Deploy a driver/perception container via docker compose.
 
@@ -302,7 +333,23 @@ def _deploy_sync_inner(driver: dict) -> dict:
     _clear_deploy_log(driver['id'])
     _log_deploy(driver['id'], f'[pull] {target_image}')
     try:
+        pull_error = ''
         for line in client.api.pull(target_image, stream=True, decode=True):
+            # A streamed pull reports failure as a JSON line carrying `error`,
+            # and then ends *normally* — it does not raise. Without this check
+            # a failed pull looks like a successful one, execution falls
+            # through to containers.create() below, and the operator is shown
+            # `404 No such image` instead of the actual cause. That is exactly
+            # what a full disk produced: the real message was
+            # "mkdir /var/lib/containerd/...: no space left on device".
+            if line.get('error') or line.get('errorDetail'):
+                pull_error = (
+                    (line.get('errorDetail') or {}).get('message')
+                    or line.get('error')
+                    or 'unknown pull error'
+                )
+                _log_deploy(driver['id'], f'[pull] error: {pull_error}')
+                continue
             status = line.get('status', '')
             progress = line.get('progress', '')
             layer_id = line.get('id', '')
@@ -315,6 +362,11 @@ def _deploy_sync_inner(driver: dict) -> dict:
         _log_deploy(driver['id'], f'[pull] failed: {e}')
         return {'status': 'error', 'error': f'pull failed: {e}'}
 
+    if pull_error:
+        detail = _explain_pull_error(pull_error)
+        _log_deploy(driver['id'], f'[pull] failed: {detail}')
+        return {'status': 'error', 'error': f'镜像拉取失败: {detail}'}
+
     # Extract service.yml from image
     compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
     compose_file = os.path.join(compose_dir, 'docker-compose.yml')
@@ -322,7 +374,18 @@ def _deploy_sync_inner(driver: dict) -> dict:
     # Ensure compose dir exists (may be a host-mounted volume)
     os.makedirs(compose_dir, exist_ok=True)
 
-    container = client.containers.create(target_image)
+    try:
+        container = client.containers.create(target_image)
+    except Exception as e:
+        # Reached only if the image is absent despite the pull reporting
+        # success. Say so plainly rather than surfacing docker-py's raw
+        # "404 ... No such image", which reads like the registry lacks the tag.
+        detail = _explain_pull_error(str(e))
+        _log_deploy(driver['id'], f'[deploy] image unusable after pull: {detail}')
+        return {
+            'status': 'error',
+            'error': f'镜像拉取后仍不可用: {detail}',
+        }
     try:
         bits, _ = container.get_archive('/deploy/service.yml')
         tar_bytes = b''.join(bits)
@@ -523,9 +586,32 @@ async def _run_in_executor(fn, *args):
 
 # ── Registry sync helper ───────────────────────────────────────────────────
 
-def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
+# Which tag channels each update channel may resolve to. Must stay in sync with
+# _CHANNEL_TAGS in web/js/deploy-panel.js — the version list the user picks from
+# is built with the frontend's copy, and if this one disagrees the manifest ends
+# up pointing at a tag the panel never offers. Each channel includes its own
+# tags plus every more-stable channel's tags (preview -> +release -> +ga), so
+# switching to a less-stable channel never hides a build already visible on a
+# more-stable one.
+_CHANNEL_TAGS = {
+    'ga':      ('ga',),
+    'release': ('release', 'ga'),
+    'preview': ('preview', 'release', 'ga'),
+}
+
+
+def _channel_tags(tags: list, channel: str) -> list:
+    """Filter catalog tags down to those visible on `channel`, order preserved."""
+    allowed = _CHANNEL_TAGS.get(channel, _CHANNEL_TAGS['ga'])
+    return [t for t in tags if t.get('channel') in allowed]
+
+
+def _upsert_from_catalog(manifest: list, catalog: dict, channel: str = '') -> tuple[int, int]:
     """Upsert drivers from registry catalog into manifest list (in-place).
     Returns (added, updated) counts.
+
+    `channel` is the active update channel; tags outside it are ignored when
+    resolving which image a driver should point at.
     """
     added = 0
     updated = 0
@@ -534,7 +620,7 @@ def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
     all_items = [item for c in CATEGORIES for item in catalog.get(c, [])]
 
     for item in all_items:
-        tags = item.get('tags', [])
+        tags = _channel_tags(item.get('tags', []), channel)
         if not tags:
             continue
 
@@ -667,7 +753,7 @@ async def drivers_sync():
     _registry_cache[cache_key(channel)] = {'data': catalog, 'ts': __import__('time').time()}
 
     manifest = _load_manifest()
-    added, updated = _upsert_from_catalog(manifest, catalog)
+    added, updated = _upsert_from_catalog(manifest, catalog, channel)
     _save_manifest(manifest)
     return {'code': 200, 'data': {'added': added, 'updated': updated}}
 

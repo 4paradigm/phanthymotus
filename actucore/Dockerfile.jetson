@@ -54,6 +54,18 @@ COPY actucore/config.yaml /work/config.yaml
 # perception's copy instead of adding a fourth one to keep in sync — see the
 # DUPLICATION note in perception/utils/logsafe.py.
 COPY perception/utils/logsafe.py /work/logsafe.py
+# COS downloader with size/SHA256 pinning, for cards that fetch weights at
+# runtime (plugins/vla's smolvla provider). Same reasoning as logsafe above:
+# reuse perception's copy rather than keeping a second one in sync. It carries
+# the parts that are easy to get wrong — a check file that must not appear
+# until the model behind it is complete, a lock so concurrent starts fetch one
+# copy, archives staged before they are merged.
+COPY perception/utils/model_downloader.py /work/model_downloader.py
+# The status-line helper that turns that downloader's callbacks into the one
+# string a card shows. Same reuse rule again — and it must travel with the
+# downloader: smolvla imports both, so shipping one without the other fails at
+# card start, on a robot, with an ImportError nothing here would have caught.
+COPY perception/utils/model_progress.py /work/model_progress.py
 # Agent Core reads /deploy/service.yml out of the image to merge the compose
 # fragment — dropping this COPY silently falls back to the legacy docker-run path.
 COPY actucore/deploy/     /deploy/
@@ -84,7 +96,6 @@ ENV LD_LIBRARY_PATH="/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/i
 ENV AMENT_PREFIX_PATH="/ros_ws/install/fast_livo2:/ros_ws/install/segmented_controller:/ros_ws/install/nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 ENV RCUTILS_LOGGING_BUFFERED_STREAM=1
 
 LABEL org.opencontainers.image.title="Phanthy Motus ActuCore" \
