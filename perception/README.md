@@ -2380,8 +2380,8 @@ other bundles in that file state.
 
 ## Indoor obstacle distance (`obstacle`)
 
-This optional tool is disabled by default (`plugins.obstacle.enabled: false`).
-Enabling it registers the MCP tool without downloading a model or initializing
+This tool is enabled by default (`plugins.obstacle.enabled: true`).
+Registration exposes the MCP tool without downloading a model or initializing
 TensorRT. Neither `info` nor `config` downloads or initializes a model. A valid `start` downloads the
 pinned engine for the current JetPack family if missing; `info` exposes loading
 progress under the `obstacle-yolo26s` name. The engine initializes on first inference.

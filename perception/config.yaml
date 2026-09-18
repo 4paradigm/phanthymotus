@@ -64,7 +64,7 @@ plugins:
       asr_kws_threshold: 0.3
 
   obstacle:
-    enabled: false
+    enabled: true
     provider: local
     model_dir: /models/obstacle/yolo26s-metric
     decision_threshold_m: 2.0
