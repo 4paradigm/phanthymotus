@@ -40,12 +40,12 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
-COPY actucore/plugins/    /work/plugins/
+COPY actucore/plugins/__init__.py /work/plugins/__init__.py
+COPY actucore/plugins/vla/ /work/plugins/vla/
 COPY actucore/utils/      /work/utils/
 COPY actucore/config.yaml /work/config.yaml
 # JP6.1 has no published navigation base; never advertise an unusable card.
-RUN python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))" && \
-    rm -rf /work/plugins/navigation
+RUN python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"
 # Atomic-write stdout guard. The build context is the repo root, so this reuses
 # perception's copy instead of adding a fourth one to keep in sync — see the
 # DUPLICATION note in perception/utils/logsafe.py.
@@ -79,10 +79,11 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42
 
-# Import the shipped entry point without starting ROS, HTTP or any card.
+# Inspect the shipped bundle's public inventory without starting ROS, HTTP,
+# providers or any card. JP6.1 must neither import nor advertise navigation.
 RUN . /opt/ros/humble/install/setup.bash && \
     . /ros_ws/install/setup.bash && \
-    python3 -c "import main"
+    python3 -c "import main, importlib.util; cfg=main._load_config(); assert cfg['plugins']['navigation']['enabled'] is False; assert importlib.util.find_spec('plugins.navigation') is None; bundle=main.ActuCoreBundle(cfg, None); assert {t['name'] for t in bundle.get_all_tools()} == {'vla'}; print('JP61_VLA_ONLY_INVENTORY=PASS')"
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \

@@ -116,6 +116,9 @@ JetPack 5.11 默认继承仓库锁定的 `@sha256` 基础镜像，无需额外
 colcon/empy 和 audio_msgs 的构建步骤是原有层，不是导航新增依赖。独立文件让
 JP6.1 继续使用 torch/lerobot 平台基线，避免进入 JP5.11 的导航多阶段构建。
 该文件没有 APT 消费者，因此不修改继承的 APT 源或签名校验。
+JP6.1 只复制 VLA 插件，构建产物从共用配置生成 navigation-disabled 变体；
+最终镜像直接构造未启动的 Bundle，断言其公开工具仅为 `vla`、navigation 配置
+关闭且插件不可导入。构建检查不启动 ROS、HTTP、模型推理或卡片。
 5.11 的导航基础镜像预编译了锁定版本的 FAST-LIVO2、Nav2
 和系统依赖，仅作为日常构建的 builder。仓库自有 ROS 包使用普通 install
 编译后，最终阶段从同一个干净、锁定 digest 的 Jetson 平台镜像重新开始，
