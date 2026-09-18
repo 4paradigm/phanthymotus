@@ -57,6 +57,39 @@ def _decoded_json(value):
     return parsed if isinstance(parsed, (dict, list)) else value
 
 
+def _tool_content(result):
+    """一个 tool role 消息的 `content`，保证是服务端收得下的形状。
+
+    OpenAI 的 schema 里 tool 消息的 content 只能是字符串（或多模态 content part
+    数组）。而 `_dispatch` 的返回值并不都是字符串：barrier 被打断时它返回
+    `{"status": "not_dispatched", "reason": ...}` 这样的 dict，之前原样塞进
+    content，请求就被上游以 400 拒掉。
+
+    这不是偶发抖动，而是确定性的、并且会粘住：这条坏消息一旦进了 turn_messages，
+    本轮后面每一次请求都带着它，于是整轮持续 400 直到 turn 结束。天轶上 24356 次
+    历史请求里，带 dict content 的有 35 次，**没有一次拿到过回复**；日志里只有
+    `UPSTREAM_PASSTHROUGH: The model service rejected this request.`，网关把上游
+    的具体字段名吞掉了，所以从错误信息本身看不出是哪条消息的问题。
+
+    子代理那条路径（`subagent/agent.py::_dispatch_tool`）一直是 json.dumps 收口的，
+    这里补上同样的收口，而不是去逐个改 `_dispatch` 的返回值 —— 收口放在唯一的出口
+    上，以后任何新的非字符串返回值都不会再把整轮打掉。
+    """
+    if isinstance(result, str):
+        return result
+    # 多模态 content part 数组（图片等）是 schema 允许的另一种形状，原样放行。
+    if isinstance(result, list):
+        return result
+    if result is None:
+        return ''
+    if isinstance(result, (dict, int, float, bool)):
+        try:
+            return json.dumps(result, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+    return str(result)
+
+
 # ── Turn 取消异常 ────────────────────────────────────────────────────────────────
 
 class TurnCancelled(Exception):
@@ -2452,7 +2485,7 @@ class Event:
                     {
                         'role':         'tool',
                         'tool_call_id': r['id'],
-                        'content':      r['result'],
+                        'content':      _tool_content(r['result']),
                     }
                     for r in results
                 ]
