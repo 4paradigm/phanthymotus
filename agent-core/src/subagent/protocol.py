@@ -65,6 +65,21 @@ class SubagentSpec:
     system_prompt_extra: str = ''
     context_seed: str = ''
     checkpoint_interval: int = 5
+    # What finishing this run is supposed to *produce*. Two kinds exist and the
+    # difference is not cosmetic:
+    #
+    #   'action' — the run is meant to change something in the world. Ending it
+    #              with nothing but bookkeeping calls means it reported success
+    #              without acting, which is exactly the failure BOOKKEEPING_TOOLS
+    #              exists to catch. Default, because a task that does nothing
+    #              should have to declare that about itself.
+    #   'report' — the deliverable *is* the judgement. The background monitor
+    #              (`collector._route_to_bg_subagent`) reads sensor data, decides
+    #              whether it matters and answers with `subagent_report`. Doing
+    #              its job correctly means calling only bookkeeping tools, so the
+    #              "did nothing" check reads it backwards: 85 warnings on Tianyi
+    #              in one log, every one of them a monitor working as designed.
+    deliverable: str = 'action'
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -79,6 +94,10 @@ class SubagentSpec:
             'system_prompt_extra': self.system_prompt_extra,
             'context_seed': self.context_seed,
             'checkpoint_interval': self.checkpoint_interval,
+            # Listed explicitly: this dict enumerates fields rather than walking
+            # the dataclass, so a new field is silently dropped across a
+            # checkpoint or a peer delegation unless it is added here too.
+            'deliverable': self.deliverable,
             'metadata': self.metadata,
         }
 

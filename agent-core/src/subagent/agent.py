@@ -478,11 +478,20 @@ class Subagent:
                         duration_s=time.time() - t0,
                     )
                     self.status = STATUS_COMPLETED
-                    if not self.result.substantive_tool_calls():
+                    if (not self.result.substantive_tool_calls()
+                            and getattr(self.spec, 'deliverable', 'action') != 'report'):
                         # Reported success having only called bookkeeping tools.
                         # Loud on purpose: this is indistinguishable from real work
                         # in the output text, and a delegator that trusts the text
                         # will believe the task was carried out.
+                        #
+                        # Skipped for `deliverable='report'` runs, where the
+                        # judgement *is* the deliverable — the background monitor
+                        # answers with `subagent_report` and nothing else, so for
+                        # it "only bookkeeping tools" is success, not a red flag.
+                        # It fired 85 times in one Tianyi log, every one a monitor
+                        # working exactly as designed, which is how a warning stops
+                        # being read at all.
                         print(f'[subagent:{self.id}] WARNING: completed with zero '
                               f'substantive tool calls — reported success without '
                               f'acting. goal={self.spec.goal[:80]!r}')

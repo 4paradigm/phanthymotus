@@ -579,6 +579,10 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
             max_rounds=10,
             timeout_s=3600,
             context_seed=message,
+            # 这个 agent 的交付物就是判断本身 —— 它被 tool_deny 挡掉了所有会动的
+            # 工具（上一行），能做的只有 subagent_report / subagent_finish。所以
+            # 「只调用了记账类工具」对它是正常完成，不是「报告成功却没干活」。
+            deliverable='report',
         )
         await _manager_instance.spawn(spec)
 
