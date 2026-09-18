@@ -560,8 +560,16 @@ async function _unpair(peerId, row) {
   const name = row?.querySelector('.user-name')?.textContent || peerId.slice(0, 12);
   if (!confirm(`解除与「${name}」的配对？\n\n对方将无法再请求任何工具，重新协作需要再走一次验证码配对。`)) return;
   try {
-    await fetch(`/api/peer/paired/${encodeURIComponent(peerId)}`, { method: 'DELETE' });
-    showToast('已解除配对');
+    const res = await fetch(`/api/peer/paired/${encodeURIComponent(peerId)}`, { method: 'DELETE' });
+    const body = await res.json().catch(() => ({}));
+    // Say plainly when the peer could not be told. Silence here is what left
+    // Tianyi and Orin5 disagreeing for seven days: this side looked finished,
+    // and the other side kept pushing into a 403 with nobody watching.
+    if (body.notified === false) {
+      showToast(`已解除配对，但没能通知到「${name}」（可能离线）—— 它那边的记录需要手动清理`);
+    } else {
+      showToast('已解除配对，对方已同步');
+    }
   } catch (err) {
     showToast(`解除失败：${err.message}`);
   }

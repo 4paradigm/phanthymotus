@@ -546,10 +546,52 @@ async def update_peer(peer_id: str, req: UpdatePeerReq):
 
 @router.delete('/paired/{peer_id}')
 async def unpair(peer_id: str):
-    """Remove a peer. The dashboard shows this as "unpair"."""
-    if not store.delete(peer_id):
+    """Remove a peer. The dashboard shows this as "unpair".
+
+    Tells the peer first, then deletes. Both halves of that matter:
+
+    * **Tells it at all.** Unpairing used to be one-sided and silent. The far
+      side went on believing it was paired and pushing state every 5s into a
+      403, and the two tables stayed inconsistent until a human noticed. Tianyi
+      and Orin5 sat like that for seven days.
+    * **First.** The endpoints to reach the peer come from
+      `registry.endpoints_for()`, which reads the row we are about to delete.
+
+    Best-effort, with a short timeout: a peer that is switched off cannot be
+    told, and the operator's click must still take effect. The response says
+    which happened so the dashboard can be honest about it rather than implying
+    both sides are now clean.
+    """
+    peer = store.get(peer_id)
+    if peer is None:
         raise fastapi.HTTPException(404, 'peer not found')
-    return {'deleted': True}
+    label = peer.get('display_name') or peer_id[:12]
+
+    endpoints = registry.endpoints_for(peer_id)
+    notified, notify_error = False, ''
+    if endpoints:
+        resp, reason = await transport.post_json(
+            endpoints, '/api/peer/inbox/unpair', {}, timeout=5.0)
+        notified = resp is not None
+        notify_error = '' if notified else reason
+    else:
+        notify_error = 'no_known_endpoint'
+
+    if not store.delete(peer_id):
+        # Vanished between the read and here — concurrent unpair, nothing to do.
+        raise fastapi.HTTPException(404, 'peer not found')
+
+    from peer import backoff
+    backoff.reset(peer_id)
+
+    if notified:
+        print(f'[peer] unpaired {label} ({peer_id[:12]}) — the peer was told')
+    else:
+        print(f'[peer] unpaired {label} ({peer_id[:12]}) — could NOT tell the peer '
+              f'({notify_error[:160]}); its record of us stays until someone clears it')
+
+    await _notify_unpair(peer_id, label, 'unpaired_local', actor='local')
+    return {'deleted': True, 'notified': notified, 'notify_error': notify_error}
 
 
 @router.get('/providers')
@@ -739,6 +781,59 @@ async def inbox_message(req: Request):
 
     accepted, err = await lan.deliver(peer_id, payload)
     return {'accepted': accepted, 'reason': err if not accepted else ''}
+
+
+@router.post('/inbox/unpair')
+async def inbox_unpair(req: Request):
+    """A peer telling us it has removed us, so we remove it too.
+
+    Pairing is per-direction and unpairing used to be silent: the side that was
+    deleted kept believing it was paired and kept pushing state every 5s, getting
+    403 `unknown_peer` every time. On Tianyi that ran for seven days and 15209
+    rejected requests, and the only way anyone found out was reading the peers
+    table by hand.
+
+    **A peer can only remove itself.** `peer_id` comes from the verified
+    signature, never from the body, so this endpoint cannot be used to unpair a
+    third party — it only lets a peer say the one thing it is entitled to say.
+    """
+    body = await req.body()
+    peer_id, reason = transport.verify_signed_request(
+        req.method, req.url.path, req.headers, body, require_paired=True
+    )
+    if not peer_id:
+        raise fastapi.HTTPException(403, f'signature verification failed: {reason}')
+
+    peer = store.get(peer_id) or {}
+    label = peer.get('display_name') or peer_id[:12]
+    removed = store.delete(peer_id)
+    print(f'[peer] {label} ({peer_id[:12]}) unpaired us — removed from our table')
+
+    from peer import backoff
+    backoff.reset(peer_id)
+
+    await _notify_unpair(peer_id, label, 'unpaired_by_peer', actor=peer_id)
+    return {'removed': removed}
+
+
+async def _notify_unpair(peer_id: str, label: str, event: str, *, actor: str) -> None:
+    """Put an unpairing on the activity stream. Never raises.
+
+    The operator standing next to the robot is the person who needs to know a
+    collaboration just ended; a line in a container log is not that, and this
+    investigation showed why — by the time anyone asked who unpaired Tianyi on
+    the 11th, `docker logs` had long since rotated past it.
+    """
+    try:
+        from api.motus_stream import push_event
+        await push_event({
+            'type': 'peer_unpaired',
+            'mcp_id': f'peer:{peer_id[:12]}',
+            'payload': {'peer_id': peer_id, 'peer': label,
+                        'event': event, 'actor': actor},
+        })
+    except Exception as e:
+        print(f'[peer] unpair notification failed: {type(e).__name__}: {e}')
 
 
 # ── tool proxy (peer-facing, Ed25519 signature) ──────────────────────────────
