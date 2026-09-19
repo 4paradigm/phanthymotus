@@ -761,3 +761,60 @@ def test_the_model_can_reach_execute():
     assert set(schema["x-action-params"]) == {"execute", "pause", "interrupt", "resume"}
     assert schema["x-action-params"]["execute"]["params"] == ["task"]
     assert {"start", "stop"} <= set(schema["properties"]["action"]["enum"])
+
+
+# ── the refusal has to say *which* model and *which* card ────────────────────
+#
+# `模型输出 6 维动作，下游只接受 26 维` names what disagrees but not who. A robot
+# runs several cards, and this exact message appeared twice on Tianyi with no way
+# to tell which checkpoint was wired to which arm without opening the canvas.
+
+def test_a_mismatch_names_the_model_and_the_downstream_card():
+    class Wide:
+        def capabilities(self):
+            return {"action_dim": 32, "control_hz": 30, "model": "smolvla/ckpt-9000"}
+        def infer(self, obs=None, inference_delay=0): return [[0.0] * 32]
+        def health(self): return True
+        def close(self): pass
+
+    card = make_card(provider="wide")
+    import plugins.vla.plugin as plugin_mod
+    original = plugin_mod.discover
+    plugin_mod.discover = lambda: {"wide": lambda d, c, on_status=None: Wide()}
+    plugin_mod.discover.errors = {}
+    try:
+        result = card.dispatch("start", {"action": "start",
+                                         "control_interface": DESCRIPTOR})
+    finally:
+        plugin_mod.discover = original
+
+    assert result["state"] == "error"
+    msg = result["message"]
+    # the disagreement itself, unchanged
+    assert "32" in msg and "7" in msg
+    # who the model is
+    assert "smolvla/ckpt-9000" in msg
+    assert "wide" in msg
+    # which card it was pointed at — mode, joint count, and the first joint name,
+    # which is what actually separates two arms on one robot
+    assert "joint_position" in msg
+    assert "joint1" in msg
+
+
+def test_the_model_label_falls_back_to_the_provider_name():
+    """A provider that does not name itself still has to be identifiable."""
+    from plugins.vla.plugin import _model_label
+    assert _model_label("smolvla", {}) == "smolvla"
+    assert _model_label("smolvla", {"model": "ckpt-9000"}) == "smolvla:ckpt-9000"
+    # No stutter when the checkpoint path already carries the family name —
+    # "smolvla:smolvla/ckpt-9000" reads like a bug in the error message itself.
+    assert _model_label("smolvla", {"model": "smolvla/ckpt-9000"}) == "smolvla/ckpt-9000"
+
+
+def test_the_downstream_label_survives_a_sparse_descriptor():
+    """Never let the diagnostic be the thing that raises."""
+    from plugins.vla.plugin import _downstream_label
+    assert _downstream_label({}) == "?/? 关节"
+    assert "joint_position" in _downstream_label({"mode": "joint_position", "dof": 26})
+    assert "left_shoulder" in _downstream_label(
+        {"mode": "joint_position", "dof": 26, "joint_names": ["left_shoulder_pitch"]})

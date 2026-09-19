@@ -46,6 +46,41 @@ FORMATS = {"joint_position": "control/joint",
            "eef_pose": "control/waypoint"}
 
 
+def _model_label(provider_name: str, capabilities: dict) -> str:
+    """Which model, in the words an operator can act on.
+
+    `capabilities['model']` is whatever the provider chose to call itself — a
+    checkpoint path for the real ones, `mock-sine@4s` for the mock. Falls back to
+    the provider name, which is at least the thing named in the card's config.
+    """
+    model = str((capabilities or {}).get("model") or "")
+    if not model:
+        return str(provider_name)
+    # A checkpoint path usually already begins with the model family, and
+    # `smolvla:smolvla/ckpt-9000` reads like a bug in the error message.
+    if model.startswith(str(provider_name)):
+        return model
+    return f"{provider_name}:{model}"
+
+
+def _downstream_label(descriptor: dict) -> str:
+    """Which card, in the words an operator can act on.
+
+    The descriptor carries no card id, so identity has to come from what it
+    describes: the control mode, the joint count, and the first joint's name.
+    That last one is what actually distinguishes two arms on the same robot —
+    "26 关节" is ambiguous where "从 left_shoulder_pitch 起" is not.
+    """
+    descriptor = descriptor or {}
+    mode = descriptor.get("mode") or "?"
+    dof = descriptor.get("dof")
+    names = descriptor.get("joint_names") or []
+    label = f"{mode}/{dof if dof is not None else '?'} 关节"
+    if names:
+        label += f"（从 {names[0]} 起）"
+    return label
+
+
 class Observation:
     """一帧观测。字段名就是 provider 协议里的那几个。
 
@@ -345,7 +380,16 @@ class VLAPlugin:
             self._close(provider)
             # Refused rather than started and left to fail per command: at
             # 30 Hz the second outcome is a stopped robot with no reason given.
-            return self._error("模型与下游动作空间不匹配：" + "；".join(problems))
+            #
+            # Named, because "模型输出 6 维动作，下游只接受 26 维" tells an operator
+            # what disagrees but not *who* — and a robot runs several cards. On
+            # Tianyi this exact message appeared twice with no way to tell which
+            # checkpoint was wired to which arm without opening the canvas.
+            return self._error(
+                f"模型与下游动作空间不匹配 —— "
+                f"模型 {_model_label(provider_name, capabilities)}，"
+                f"下游 {_downstream_label(descriptor)}："
+                + "；".join(problems))
 
         mode = descriptor.get("mode")
         if mode not in FORMATS:
