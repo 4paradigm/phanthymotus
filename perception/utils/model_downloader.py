@@ -1283,3 +1283,37 @@ def ensure_depth_model(model_dir: str, family: str | None = None,
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
+
+
+# Indoor distance models are independent of the visual_depth model bundle.
+_OBSTACLE_MODEL_BASE = (
+    "https://modelscope.cn/api/v1/models/Flame4pd/obstacle-indoor-yolo26s-trt/repo"
+    "?Revision=dd09f801bf732586b09ba9c1aa15f944d465c535&FilePath="
+)
+OBSTACLE_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": _OBSTACLE_MODEL_BASE + "jp61/{file}",
+        "files": {
+            "indoor-metric.engine": {
+                "size": 30838180,
+                "sha256": "6b8afab1f7f4633ce9d100211e3f39622c0478f34cff39589f4e3222601dde26",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": _OBSTACLE_MODEL_BASE + "jp511/{file}",
+        "files": {
+            "indoor-metric.engine": {
+                "size": 27019922,
+                "sha256": "4cb00f5bd4d2609c8a91eb0a9b8759484699eb7075a6c806ecafa5bd590a4029",
+            },
+        },
+    },
+}
+
+
+def ensure_obstacle_models(model_dir: str, family: str | None = None,
+                           progress_cb=None) -> dict[str, str]:
+    """Fetch the pinned indoor distance engine for the running TensorRT family."""
+    return _ensure_vision_bundle("obstacle", OBSTACLE_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)

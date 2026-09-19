@@ -168,6 +168,11 @@ class PerceptionBundle:
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
 
+        if plugins_cfg.get("obstacle", {}).get("enabled", False):
+            from plugins.obstacle import ObstacleDistancePlugin
+            self._plugins.append(ObstacleDistancePlugin(plugins_cfg["obstacle"], executor))
+            log.info("ObstacleDistancePlugin loaded")
+
         if plugins_cfg.get("soundevent", {}).get("enabled", False):
             from plugins.soundevent import SoundEventPlugin
             self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
