@@ -1530,9 +1530,13 @@ class Event:
         Orin6 实测（2026-09-19）：actucore 的 `vla` 卡绑着 `on_interrupt_all`，卡片
         没在跑时返回 `{"state":"idle","message":"卡片未在运行"}` —— 什么都没做，却
         让 `results` 非空。它是那台机器上**唯一**的绑定，而 actucore 跑在每一台机器人
-        上。所以用户插话时：hook 触发 → vla 空转 → 兜底跳过 → 语音不停、导航不停，
-        日志里还写着「interrupted via on_interrupt_all hook (1 binding(s))」。
-        perception 真正的 `tts` 只绑在 `on_interrupt_speak` 上，插话根本不触发它。
+        上。直接探未修复的这个函数，它打印
+        「interrupted via on_interrupt_all hook (1 binding(s))」，而实际只叫了 vla，
+        `tts` 和 `loco` 一次都没被调用。
+
+        受影响的是**运动**。语音未必：ASR 的 barge-in 另有一条 `on_interrupt_speak`
+        会停住 TTS（Orin6 上实测确实停了），所以按打断来源不同，语音可能侥幸得救。
+        而底盘/导航只有这一条路，兜底被跳过就真的不停。
 
         去重按 `(mcp_id, tool)`：hook 已经成功叫停过的那张卡不再叫第二次。叫停本身
         是幂等的，所以重复调用无害，但日志会变得难读。
