@@ -576,6 +576,9 @@ app_api.include_router(api.peer.router)
 import api.performance
 app_api.include_router(api.performance.router)
 
+import api.benchmark
+app_api.include_router(api.benchmark.router)
+
 app = fastapi.FastAPI(lifespan=lifespan)
 app.middleware('http')(auth.auth_middleware)
 app.mount('/api', app_api)

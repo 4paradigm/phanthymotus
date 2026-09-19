@@ -8589,3 +8589,46 @@ html, body {
   color: var(--text-muted);
 }
 .deploy-progress-minimized-progress.error { color: var(--red); }
+
+/* ── Benchmark panel ──────────────────────────────────────────────────────── */
+/* n 和被测配置与分数同列：一个不带样本量的分数会被当成结论，而它只是分布里的
+   一个样本；不带模型与镜像 tag 的两行分数之间没有可比性。 */
+
+.benchmark-modal { width: min(920px, 94vw); max-height: 86vh; }
+.benchmark-body { display: flex; flex-direction: column; gap: 18px; overflow: auto; }
+.bm-section { display: flex; flex-direction: column; gap: 8px; }
+.bm-heading { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.bm-empty { padding: 14px; color: var(--text-secondary); font-size: 13px; }
+
+.bm-repeats-label { font-size: 12px; color: var(--text-secondary); display: flex;
+                    align-items: center; gap: 4px; }
+.bm-repeats { width: 52px; padding: 3px 6px; border-radius: 6px;
+              border: 1px solid var(--border); background: var(--bg-elevated);
+              color: var(--text-primary); }
+
+#bm-scenarios { display: flex; flex-direction: column; gap: 4px; }
+.bm-scenario { display: flex; align-items: center; gap: 10px; padding: 7px 10px;
+               border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
+.bm-scenario-name { font-size: 13px; }
+.bm-scenario-meta { margin-left: auto; font-size: 12px; color: var(--text-secondary); }
+
+.bm-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.bm-table th { text-align: left; font-weight: 500; color: var(--text-secondary);
+               padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.bm-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.bm-failures, .bm-config { color: var(--text-secondary); }
+
+.bm-progress-head { display: flex; align-items: center; gap: 12px; font-size: 13px;
+                    padding-bottom: 6px; }
+.bm-state { padding: 2px 8px; border-radius: 999px; font-size: 11px;
+            background: var(--bg-elevated); }
+.bm-state--running { color: var(--blue); }
+.bm-state--done { color: var(--green); }
+
+.bm-score { font-variant-numeric: tabular-nums; font-weight: 600; }
+.bm-score--none { color: var(--text-secondary); font-weight: 400; }
+.bm-n { margin-left: 6px; font-size: 11px; color: var(--text-secondary); }
+
+.bm-outcome--ok { color: var(--green); }
+.bm-outcome--stalled, .bm-outcome--timeout, .bm-outcome--error { color: var(--red); }
+.bm-outcome--pending { color: var(--text-secondary); }

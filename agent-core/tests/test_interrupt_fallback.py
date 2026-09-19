@@ -156,7 +156,7 @@ def test_a_failed_call_is_not_counted_as_interrupted(monkeypatch, capsys,
     _register(tools=['tts', 'loco'])
     _run()
     out = capsys.readouterr().out
-    assert 'interrupted 0/2 active output(s)' in out
+    assert '0/2 via fallback' in out
     assert 'device offline' in out
 
 
@@ -171,14 +171,14 @@ def test_an_exception_is_reported_and_not_counted(monkeypatch, capsys,
     _register(tools=['tts', 'loco'])
     _run()
     out = capsys.readouterr().out
-    assert 'interrupted 1/2 active output(s)' in out
+    assert '1/2 via fallback' in out
     assert 'boom' in out
 
 
 def test_success_is_counted(direct_calls, capsys, forbid_call_tool):
     _register(tools=['tts', 'loco'])
     _run()
-    assert 'interrupted 2/2 active output(s)' in capsys.readouterr().out
+    assert '2/2 via fallback' in capsys.readouterr().out
 
 
 def test_no_interruptible_tool_says_so(direct_calls, capsys, forbid_call_tool):
@@ -186,27 +186,45 @@ def test_no_interruptible_tool_says_so(direct_calls, capsys, forbid_call_tool):
     _register(tools=['mic', 'camera'])
     _run()
     out = capsys.readouterr().out
-    assert 'no tts/loco tool registered' in out
+    assert 'nothing to interrupt' in out
     assert direct_calls == []
 
 
-# ── the hook path still wins ─────────────────────────────────────────────────
+# ── hook 与兜底一起跑，按卡片去重 ────────────────────────────────────────────
+#
+# 这里原本断言「注册了 hook，兜底就完全不跑」。意图是对的（别对同一张卡重复叫停），
+# 实现太宽：它连 hook 从未碰过的卡也一起跳过了。而 hooks.fire 对每一个执行过的绑定
+# 都追加结果，**包括什么都没做的** —— actucore 的 vla 卡没在跑时返回
+# `{"state":"idle","message":"卡片未在运行"}`，于是一张卡的绑定替全机队关掉了兜底。
+# Orin6 实测（2026-09-19）确认：插话时语音不停、导航不停。
+#
+# 现在两条都跑，按 (mcp_id, tool) 去重 —— 原来的意图保留，过宽的部分去掉。
 
-def test_a_registered_hook_short_circuits_the_fallback(monkeypatch, direct_calls):
+
+def _fire_stub(*bindings):
+    """hooks.fire 的真实返回形状：每个绑定一条 dict。"""
     async def _fire(hook_id, *a, **kw):
-        return ['binding-1']
+        return [{'hook': hook_id, 'mcp_id': m, 'tool': t, 'result': {}} for m, t in bindings]
+    return _fire
 
-    monkeypatch.setattr(hooks, 'fire', _fire)
+
+def test_a_card_the_hook_stopped_is_not_told_twice(monkeypatch, direct_calls):
+    monkeypatch.setattr(hooks, 'fire', _fire_stub(('mcp-1', 'tts'), ('mcp-1', 'loco')))
     _register(tools=['tts', 'loco'])
     _run()
-    assert direct_calls == [], 'the hook handled it; the fallback must not also fire'
+    assert direct_calls == [], 'the hook already stopped both cards'
+
+
+def test_a_card_the_hook_never_touched_is_still_stopped(monkeypatch, direct_calls):
+    """缺陷本体：绑定存在 ≠ 这张卡被停住了。"""
+    monkeypatch.setattr(hooks, 'fire', _fire_stub(('mcp-other', 'vla')))
+    _register(tools=['tts', 'loco'])
+    _run()
+    assert {(c[0], c[1]) for c in direct_calls} == {('mcp-1', 'tts'), ('mcp-1', 'loco')}
 
 
 def test_the_hook_path_clears_pending_acp(monkeypatch):
-    async def _fire(hook_id, *a, **kw):
-        return ['binding-1']
-
-    monkeypatch.setattr(hooks, 'fire', _fire)
+    monkeypatch.setattr(hooks, 'fire', _fire_stub(('mcp-1', 'tts')))
 
     async def scenario():
         ev = asyncio.Event()

@@ -1516,22 +1516,49 @@ class Event:
 
     # ── 打断：中止正在进行的输出 ─────────────────────────────────────────────
 
-    async def _interrupt_active_outputs(self):
-        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled 时调用。
-        优先使用 hook 系统；fallback 到硬编码查找。"""
+    async def _interrupt_active_outputs(self, reason: str = ''):
+        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled / 新用户 turn 时调用。
+
+        **hook 与硬编码兜底都跑，不是二选一。** 这两条路覆盖的是**不相交**的两组
+        卡片：hook 覆盖「自己声明了 `on_interrupt_all` 绑定」的卡，兜底覆盖「叫
+        `tts`/`loco` 但没声明绑定」的卡。当成二选一，另一组就永远碰不到。
+
+        以前是 `if results: return`，而 `hooks.fire` 对**每一个执行过的绑定**都追加
+        一条结果，**包括抛异常的和什么都没做的**。于是「存在绑定」被当成了「打断已
+        处理」，一张卡的绑定替全机队关掉了兜底。
+
+        Orin6 实测（2026-09-19）：actucore 的 `vla` 卡绑着 `on_interrupt_all`，卡片
+        没在跑时返回 `{"state":"idle","message":"卡片未在运行"}` —— 什么都没做，却
+        让 `results` 非空。它是那台机器上**唯一**的绑定，而 actucore 跑在每一台机器人
+        上。直接探未修复的这个函数，它打印
+        「interrupted via on_interrupt_all hook (1 binding(s))」，而实际只叫了 vla，
+        `tts` 和 `loco` 一次都没被调用。
+
+        受影响的是**运动**。语音未必：ASR 的 barge-in 另有一条 `on_interrupt_speak`
+        会停住 TTS（Orin6 上实测确实停了），所以按打断来源不同，语音可能侥幸得救。
+        而底盘/导航只有这一条路，兜底被跳过就真的不停。
+
+        去重按 `(mcp_id, tool)`：hook 已经成功叫停过的那张卡不再叫第二次。叫停本身
+        是幂等的，所以重复调用无害，但日志会变得难读。
+        """
         import hooks
         from peer import mcp_bridge
-        results = await hooks.fire('on_interrupt_all')
-        if results:
-            # Hook handled it — also clear pending ACP
-            for aid in list(mcp_client._pending_actions.keys()):
-                mcp_client._pending_actions[aid].set()
-            _stop_countdown()   # 打断 = 用户在说话，不是沉默的起点
-            print(f'[decision] interrupted via on_interrupt_all hook ({len(results)} binding(s))')
-            return
 
-        # Fallback: hardcoded lookup (no hook registered)
-        #
+        try:
+            hook_results = await hooks.fire('on_interrupt_all')
+        except Exception as exc:
+            # 打断路径是最不该抛异常的地方：它跑在 TurnCancelled 处理里，抛出去就
+            # 连兜底一起丢了 —— 而兜底恰恰是这时候唯一还能停住机器人的东西。
+            print(f'[decision] on_interrupt_all hook raised: {exc}')
+            hook_results = []
+        # 只有**成功**的绑定才算覆盖到：抛异常的那张卡并没有被叫停，若它恰好也叫
+        # tts/loco，兜底该再试一次。非 dict 的条目当成「不知道覆盖了谁」，宁可让
+        # 兜底多叫一次（叫停是幂等的），也不要漏。
+        covered = {(r.get('mcp_id'), r.get('tool')) for r in hook_results
+                   if isinstance(r, dict) and 'error' not in r}
+        hook_failures = [r for r in hook_results if isinstance(r, dict) and 'error' in r]
+        tasks = []
+
         # registry[mcp_id]['tools'] holds *bare* plugin names ('tts', 'loco') --
         # mcp_client._connect_one does `tools.append(tool['name'])`. This used to
         # hand those straight to call_tool(), which parses its argument as a full
@@ -1547,7 +1574,6 @@ class Event:
         # Deliberately not interrupting switch_mode: aborting a posture change
         # partway is how a controlled descent becomes a fall, so a running
         # stand-up/lie-down is left to finish.
-        tasks = []
         for mcp_id, info in mcp_client.registry.items():
             if not info.get('online'):
                 continue
@@ -1564,26 +1590,40 @@ class Event:
                 continue
             tools = info.get('tools', [])
             for short_name, action in (('tts', 'interrupt'), ('loco', 'stop_move')):
-                if short_name in tools:
+                if short_name in tools and (mcp_id, short_name) not in covered:
                     tasks.append((f'{mcp_id}:{short_name}',
                                   mcp_client.call_tool_direct(mcp_id, short_name,
                                                               {'action': action})))
-        if not tasks:
-            print('[decision] interrupt_active_outputs: no tts/loco tool registered')
-            return
 
-        labels = [label for label, _ in tasks]
-        results = await asyncio.gather(*[coro for _, coro in tasks],
-                                       return_exceptions=True)
         ok = 0
-        for label, r in zip(labels, results):
-            if isinstance(r, Exception):
-                print(f'[decision] interrupt_active_outputs: {label} raised: {r}')
-            elif isinstance(r, dict) and r.get('error'):
-                print(f'[decision] interrupt_active_outputs: {label} failed: {r["error"]}')
-            else:
-                ok += 1
-        print(f'[decision] interrupted {ok}/{len(tasks)} active output(s) (fallback)')
+        if tasks:
+            labels = [label for label, _ in tasks]
+            results = await asyncio.gather(*[coro for _, coro in tasks],
+                                           return_exceptions=True)
+            for label, r in zip(labels, results):
+                if isinstance(r, Exception):
+                    print(f'[decision] interrupt_active_outputs: {label} raised: {r}')
+                elif isinstance(r, dict) and r.get('error'):
+                    print(f'[decision] interrupt_active_outputs: {label} failed: {r["error"]}')
+                else:
+                    ok += 1
+
+        # Unconditionally, on both paths. Previously this ran only when a hook was
+        # bound, so a robot with no binding kept its pending ACP actions blocked —
+        # the barrier never released — and the silence countdown kept running
+        # through a barge-in.
+        for aid in list(mcp_client._pending_actions.keys()):
+            if reason:
+                mcp_client._pending_results[aid] = {'status': 'cancelled', 'reason': reason}
+            mcp_client._pending_actions[aid].set()
+        _stop_countdown()   # 打断 = 用户在说话，不是沉默的起点
+
+        if not hook_results and not tasks:
+            print('[decision] interrupt_active_outputs: nothing to interrupt '
+                  '(no on_interrupt_all binding, no tts/loco tool)')
+            return
+        print(f'[decision] interrupted: {len(covered)} via hook, {ok}/{len(tasks)} via fallback'
+              + (f', {len(hook_failures)} hook binding(s) failed' if hook_failures else ''))
 
 
     # ── 主循环 ───────────────────────────────────────────────────────────────
@@ -2010,19 +2050,12 @@ class Event:
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
         if (mcp_client.get_pending_actions() and not bot_restricted
                 and not _trigger_is_self_originated(trigger_event)):
-            _int_results = await hooks.fire('on_interrupt_all')
-            if _int_results:
-                for aid in list(mcp_client._pending_actions.keys()):
-                    mcp_client._pending_results[aid] = {
-                        "status": "cancelled",
-                        "reason": "auto-interrupted by new user message",
-                    }
-                    mcp_client._pending_actions[aid].set()
-                _stop_countdown()   # 打断 = 用户在说话，不是沉默的起点
-                print(f'[decision] auto-interrupt: {len(_int_results)} hook(s) fired, pending cleared')
-            else:
-                # Fallback: 没有 hook 注册时用硬编码查找
-                await self._interrupt_active_outputs()
+            # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
+            # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
+            # hook 被触发两遍；而有绑定时兜底被整个跳过。两个问题同源：把 hook 和
+            # 兜底当成了二选一，它们覆盖的其实是不相交的两组卡片。
+            await self._interrupt_active_outputs(
+                reason='auto-interrupted by new user message')
 
         # Subagent status in log
         if self._subagent_mgr:

@@ -21,6 +21,7 @@ import { initChannels }      from './channels.js';
 import { initPeers }         from './peers.js';
 import { initMobile }        from './mobile.js';
 import { initPerformance }   from './performance.js';
+import { initBenchmark }     from './benchmark.js';
 import { initUsage }         from './usage.js';
 import './agent-definition.js';
 
@@ -53,6 +54,7 @@ async function main() {
   initChannels();
   initPeers();
   initPerformance();
+  initBenchmark();
   initUsage();
 
   // Settings dropdown (web topbar)

@@ -56,6 +56,7 @@
           <button class="settings-dropdown-item" data-target="btn-peers"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 20.5v-1.6a3.6 3.6 0 0 0-3.6-3.6H6.1a3.6 3.6 0 0 0-3.6 3.6v1.6"/><circle cx="9" cy="7.5" r="3.6"/><path d="M21.5 20.5v-1.6a3.6 3.6 0 0 0-2.7-3.5"/><path d="M16.2 4.1a3.6 3.6 0 0 1 0 6.9"/></svg></span>多机协同</button>
           <button class="settings-dropdown-item" data-target="btn-deploy"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3.5 7.5v9L12 21l8.5-4.5v-9L12 3z"/><path d="M3.5 7.5 12 12l8.5-4.5M12 12v9"/></svg></span>部署</button>
           <button class="settings-dropdown-item" data-target="btn-performance"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg></span>性能</button>
+          <button class="settings-dropdown-item hidden" data-target="btn-benchmark"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5h16"/><rect x="5" y="11" width="3.5" height="8.5" rx="1"/><rect x="10.2" y="6" width="3.5" height="13.5" rx="1"/><rect x="15.4" y="13.5" width="3.5" height="6" rx="1"/></svg></span>基准测试</button>
           <button class="settings-dropdown-item" data-target="btn-usage"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 20.5V10M12 20.5V3.5M19 20.5v-7"/></svg></span>用量</button>
           <div class="settings-dropdown-divider"></div>
           <button class="settings-dropdown-item settings-dropdown-item--danger" data-target="btn-reset"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 4.5V10H15"/></svg></span>重启与重置</button>
@@ -78,6 +79,7 @@
       <button class="btn-ghost topbar-btn hidden" id="btn-reset">重置</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-performance">性能</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-benchmark">基准测试</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-usage">用量</button>
     </div>
     <button class="mobile-hamburger" id="mobile-hamburger" aria-label="菜单">⋮</button>
@@ -653,6 +655,40 @@
     <div class="modal-body performance-body">
       <div id="perf-summary-cards"></div>
       <div id="perf-waterfall"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Benchmark Modal -->
+<div class="modal-overlay hidden" id="benchmark-overlay">
+  <div class="modal benchmark-modal">
+    <div class="modal-header">
+      <span class="modal-title">基准测试</span>
+      <div style="display:flex;gap:6px;align-items:center">
+        <label class="bm-repeats-label">重复
+          <input type="number" id="bm-repeats" class="bm-repeats" value="1" min="1" max="20">
+          次</label>
+        <button class="btn-primary btn-sm" id="bm-run">开始</button>
+        <button class="btn-ghost btn-sm" id="bm-abort">中止</button>
+        <button class="btn-ghost btn-sm" id="bm-refresh">刷新</button>
+        <button class="btn-icon" id="benchmark-close">&#10005;</button>
+      </div>
+    </div>
+    <div class="modal-body benchmark-body">
+      <section class="bm-section">
+        <h4 class="bm-heading">可跑的场景</h4>
+        <div id="bm-scenarios"></div>
+      </section>
+      <section class="bm-section">
+        <h4 class="bm-heading">本次进度</h4>
+        <div id="bm-progress"></div>
+      </section>
+      <section class="bm-section">
+        <h4 class="bm-heading">历史</h4>
+        <!-- n 与被测配置和分数同列显示：一个不带样本量、不带模型与镜像的分数
+             没有可比性，也会被当成结论。 -->
+        <div id="bm-runs"></div>
+      </section>
     </div>
   </div>
 </div>
