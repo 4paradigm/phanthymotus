@@ -64,6 +64,27 @@ class RestartPolicyTests(unittest.TestCase):
                 self.assertNotIn('unless-stopped', stripped,
                                  f'{f.relative_to(REPO)}: {line}')
 
+    def test_the_console_deploy_path_also_uses_always(self):
+        """机器人上大多数容器其实是控制台建的，不是 compose 建的。
+
+        `api/drivers.py` 直接调 docker SDK 创建容器，所以它那处硬编码的策略才是
+        真正决定「重启后回不回来」的那一个 —— 只改 compose 片段会留下这条更常用的
+        路径不动。
+        """
+        src = (REPO / 'agent-core' / 'src' / 'api' / 'drivers.py').read_text(encoding='utf-8')
+        code = '\n'.join(ln for ln in src.splitlines() if not ln.lstrip().startswith('#'))
+        self.assertIn("restart_policy={'Name': 'always'}", code)
+        self.assertNotIn("'unless-stopped'", code)
+
+    def test_install_sh_inherits_rather_than_hardcodes(self):
+        """install.sh 从镜像里取 compose，所以它没有自己的一份策略要维护。
+
+        这条断言的是那个契约本身：Dockerfile 必须把 deploy/ 放进镜像，
+        否则 install.sh 的 `docker cp .../deploy/docker-compose.yml` 会取到别的东西。
+        """
+        dockerfile = (REPO / 'agent-core' / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertIn('COPY deploy/', dockerfile)
+
     def test_the_reason_is_written_down(self):
         """没有理由的话，下一个人会觉得 unless-stopped 更稳妥而改回去。"""
         for f in FRAGMENTS:
