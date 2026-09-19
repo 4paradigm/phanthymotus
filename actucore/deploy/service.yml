@@ -32,4 +32,10 @@ actucore:
     options:
       max-size: "10m"
       max-file: "3"
-  restart: unless-stopped
+  # always, not unless-stopped: after a host reboot the robot must come back
+  # on its own. G1 came up from a reboot with every container still exited —
+  # somebody had to SSH in and start them, and until they did the robot was
+  # simply gone, with nothing to distinguish that from a broken deployment.
+  # The cost is that a container stopped by hand also returns after a reboot;
+  # here that is the lesser surprise.
+  restart: always
