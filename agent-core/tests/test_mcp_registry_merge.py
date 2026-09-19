@@ -77,12 +77,12 @@ class TestTheHeartbeatMerges(unittest.TestCase):
         self.assertIn('input_schemas', mcp_client.registry['dev-1'])
         mcp_client.registry.pop('dev-1', None)
 
-    def test_needs_schemas_becomes_false_after_connect_one_has_run(self):
+    def test_the_reconnect_loop_can_terminate(self):
         """循环能停下来 —— 这正是原来做不到的那一点。"""
-        mcp_client.registry['dev-2'] = {'input_schemas': {'x': {}}}
+        mcp_client.registry['dev-2'] = {'connected': True}
         mcp_client.registry.setdefault('dev-2', {}).update({'online': True, 'tools': []})
-        needs = not mcp_client.registry.get('dev-2', {}).get('input_schemas')
-        self.assertFalse(needs, '心跳之后仍判定「缺 schema」就会无限重连')
+        self.assertTrue(mcp_client.registry['dev-2']['connected'],
+                        '心跳之后仍判定「没连过」就会无限重连')
         mcp_client.registry.pop('dev-2', None)
 
     def test_the_heartbeat_still_updates_what_it_does_know(self):
@@ -111,10 +111,58 @@ class TestTheTwoWritersAgree(unittest.TestCase):
         self.assertEqual(heartbeat - connect, set(),
                          f'心跳独有的键：{heartbeat - connect}')
 
-    def test_input_schemas_is_the_key_only_connect_one_writes(self):
+    def test_the_heartbeat_now_maintains_input_schemas_itself(self):
+        """合并挡住了「被抹掉」，但没有解决「不再刷新」。
+
+        合并之后 `needs_schemas` 恒为假，`_connect_one` 不再重跑，于是驱动改了某个工具的
+        inputSchema 时，参数校验会一直用旧的那份，直到 agent-core 重启 —— 之前那个每 30 秒
+        的 churn 恰好在充当刷新。所以心跳必须自己算出这个键，而不只是保住它。
+        """
+        heartbeat = max(_keys_of_registry_literal(MANAGE), key=len)
+        self.assertIn('input_schemas', heartbeat)
+
+    def test_connected_is_what_only_connect_one_writes(self):
+        """触发全量连接的判据是「连过没有」，不是「缺哪个键」。
+
+        旧判据（`input_schemas` 缺失）只在心跳先抹掉它时才成立。心跳现在会填它，
+        那个判据就会在第一次 ping 时即为假 —— 而 `_connect_one` 是**唯一**启动 SSE
+        订阅的地方，只靠心跳注册的设备将永远拿不到订阅。
+        """
         heartbeat = max(_keys_of_registry_literal(MANAGE), key=len)
         connect = max(_keys_of_registry_literal(CLIENT), key=len)
-        self.assertIn('input_schemas', connect - heartbeat)
+        self.assertEqual(connect - heartbeat, {'connected'})
+        src = MANAGE.read_text(encoding='utf-8')
+        self.assertIn("get('connected')", src)
+        # 只看可执行代码：旧判据的名字还留在解释历史的注释里，那是有意的。
+        code = '\n'.join(ln for ln in src.splitlines()
+                         if not ln.lstrip().startswith('#'))
+        self.assertNotIn('needs_schemas =', code)
+
+
+class TestConnectTriggerSurvivesAHeartbeatOnlyDevice(unittest.TestCase):
+    """只靠心跳注册的设备也必须拿到一次全量连接。
+
+    这是把判据从「缺 input_schemas」换成「没连过」的理由：心跳在检查之前就把
+    registry 更新好了，所以任何「某个键在不在」的判据都会在第一次 ping 时即为假。
+    """
+
+    def _would_connect(self, entry):
+        # 与 api/mcp_manage.py 中的判据保持一致
+        return not (entry or {}).get('connected')
+
+    def test_a_brand_new_device_triggers_a_connect(self):
+        self.assertTrue(self._would_connect({}))
+
+    def test_a_device_the_heartbeat_just_filled_still_triggers_one(self):
+        """回归本身：心跳写了 input_schemas，不能因此就算「连过了」。"""
+        self.assertTrue(self._would_connect({'input_schemas': {'x': {}}, 'online': True}))
+
+    def test_a_connected_device_does_not_reconnect_every_heartbeat(self):
+        self.assertFalse(self._would_connect({'connected': True, 'input_schemas': {'x': {}}}))
+
+    def test_a_failed_connect_is_retried(self):
+        """`connected` 取的是 online —— 没真正够到设备就不算连过。"""
+        self.assertTrue(self._would_connect({'connected': False}))
 
 
 if __name__ == '__main__':

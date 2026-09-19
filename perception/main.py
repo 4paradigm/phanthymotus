@@ -62,6 +62,11 @@ for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
 # side was already capped, the argument side was not.
 _LOG_ARG_CHARS = 500
 
+# How often the register thread says it is still alive when nothing has changed.
+# The heartbeat itself stays at 30s; this only governs how often that fact
+# reaches the log, so "quiet" cannot mean both "healthy" and "thread died".
+REGISTER_ALIVE_INTERVAL_S = 1800.0
+
 
 def _brief(obj) -> str:
     """One-line, length-capped repr for logging an MCP payload."""
@@ -559,10 +564,16 @@ def _start_registration(mcp_port: int, name: str, category: str):
     }).encode()
     def _run():
         import time as _t
-        # Log transitions, not ticks — same reasoning as actucore's copy. Here it
-        # is 92 lines out of 242, on the container whose log is the first place
-        # anyone looks when ASR or TTS misbehaves.
+        # Log transitions plus a slow keepalive — same reasoning as actucore's
+        # copy. Here it is 92 lines out of 242, on the container whose log is the
+        # first place anyone looks when ASR or TTS misbehaves.
+        #
+        # The slow line exists because edges alone made "healthy" and "the
+        # register thread died" look identical: every "ok" used to double as
+        # proof of life, and dropping it entirely traded one blind spot for
+        # another.
         healthy = None
+        last_alive = 0.0
         while True:
             try:
                 req = _urllib.Request(
@@ -570,10 +581,15 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with _urllib.urlopen(req, timeout=3, context=_ctx):
+                    now = _t.monotonic()
                     if healthy is not True:
                         log.info(f"[register] heartbeat ok → {agent_core_url}"
                                  + ("" if healthy is None else " (recovered)"))
                         healthy = True
+                        last_alive = now
+                    elif now - last_alive >= REGISTER_ALIVE_INTERVAL_S:
+                        last_alive = now
+                        log.info(f"[register] still registered → {agent_core_url}")
                 _t.sleep(30)
             except Exception as e:
                 # Every failure is logged: a flapping link is a real symptom.

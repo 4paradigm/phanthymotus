@@ -446,6 +446,13 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
         'split_map':     split_map,
         'tool_groups':   tool_groups,
         'input_schemas': input_schemas,
+        # "A full connect has happened for this device." The heartbeat in
+        # api/mcp_manage.py reads this to decide whether to call us, because it
+        # is the *connect* that matters, not any one key it leaves behind —
+        # notably the SSE subscription started just below, which nothing else
+        # sets up. Only set when the connect actually reached the device:
+        # a failed attempt must be retried on the next heartbeat.
+        'connected':     online,
     }
 
     # 3. 后台订阅 SSE 事件流（非阻塞）
