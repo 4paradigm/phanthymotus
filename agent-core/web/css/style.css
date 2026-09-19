@@ -8590,45 +8590,188 @@ html, body {
 }
 .deploy-progress-minimized-progress.error { color: var(--red); }
 
-/* ── Benchmark panel ──────────────────────────────────────────────────────── */
-/* n 和被测配置与分数同列：一个不带样本量的分数会被当成结论，而它只是分布里的
-   一个样本；不带模型与镜像 tag 的两行分数之间没有可比性。 */
+/* ── 基准测试面板 ─────────────────────────────────────────────────────────── */
+/*
+   这个面板只回答一个问题：**分数动没动，为什么。**
+   它继承房子的配色与字体 —— 它是嵌在仪表盘里的一块，不是另一个 app。设计判断花在
+   结构上：
+   - 左右分栏。「挑要跑什么」是一次性动作，收进窄栏；「读跑出了什么」是反复做的事，
+     占主区。三个一样大的方块堆叠会让两者显得一样重要。
+   - 历史里分数画在**共享的 0-100 轴**上，标准差是须线，样本量印在刻度旁，模型与
+     镜像 tag 作为这一行的身份。一个不带样本量、不带被测配置的分数是噪音；把它们拆成
+     四个能各读各的列，等于邀请人只看那个数字。
+   - 每个 case 一条五段维度条。失败时「断在哪一维」是下一步动作的依据，不该再点一层。
+*/
 
-.benchmark-modal { width: min(920px, 94vw); max-height: 86vh; }
-.benchmark-body { display: flex; flex-direction: column; gap: 18px; overflow: auto; }
-.bm-section { display: flex; flex-direction: column; gap: 8px; }
-.bm-heading { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
-.bm-empty { padding: 14px; color: var(--text-secondary); font-size: 13px; }
+.benchmark-modal { width: min(1040px, 94vw); height: min(760px, 88vh); }
+.benchmark-modal .modal-body { flex: 1; min-height: 0; }
 
-.bm-repeats-label { font-size: 12px; color: var(--text-secondary); display: flex;
-                    align-items: center; gap: 4px; }
-.bm-repeats { width: 52px; padding: 3px 6px; border-radius: 6px;
-              border: 1px solid var(--border); background: var(--bg-elevated);
-              color: var(--text-primary); }
+.benchmark-modal .modal-header { gap: 12px; }
+.bm-header-meta {
+  margin-left: auto; display: flex; gap: 14px; align-items: baseline;
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bm-header-meta b { font-weight: 500; color: var(--text-muted); }
 
-#bm-scenarios { display: flex; flex-direction: column; gap: 4px; }
-.bm-scenario { display: flex; align-items: center; gap: 10px; padding: 7px 10px;
-               border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
-.bm-scenario-name { font-size: 13px; }
-.bm-scenario-meta { margin-left: auto; font-size: 12px; color: var(--text-secondary); }
+.benchmark-body { display: grid; grid-template-columns: 236px 1fr; padding: 0; overflow: hidden; }
 
-.bm-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.bm-table th { text-align: left; font-weight: 500; color: var(--text-secondary);
-               padding: 6px 8px; border-bottom: 1px solid var(--border); }
-.bm-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
-.bm-failures, .bm-config { color: var(--text-secondary); }
+.bm-h {
+  margin: 0; font-size: 12px; font-weight: 600; color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
 
-.bm-progress-head { display: flex; align-items: center; gap: 12px; font-size: 13px;
-                    padding-bottom: 6px; }
-.bm-state { padding: 2px 8px; border-radius: 999px; font-size: 11px;
-            background: var(--bg-elevated); }
-.bm-state--running { color: var(--blue); }
+/* ── 左栏：挑 ─────────────────────────────────────────────────────────────── */
+
+.bm-pick {
+  border-right: 1px solid var(--border); display: flex; flex-direction: column;
+  min-height: 0; background: var(--bg);
+}
+.bm-pick-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 14px 16px 8px;
+}
+.bm-scenarios { flex: 1; min-height: 0; overflow-y: auto; padding: 0 10px 10px; }
+
+.bm-scenario {
+  display: block; padding: 9px 10px; border-radius: var(--radius-sm); cursor: pointer;
+}
+.bm-scenario:hover { background: var(--bg-hover); }
+.bm-scenario input { float: left; margin: 3px 9px 0 0; accent-color: var(--accent); }
+.bm-scenario-name { display: block; font-size: 13px; line-height: 1.35; }
+.bm-scenario-meta {
+  display: block; margin-left: 22px; font-size: 11px; color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+.bm-launch { border-top: 1px solid var(--border); padding: 12px 16px 14px; }
+.bm-repeats-row {
+  display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-muted);
+}
+.bm-repeats-row input {
+  width: 54px; padding: 4px 7px; border: 1px solid var(--border-med);
+  border-radius: var(--radius-xs); background: var(--bg-card); color: var(--text);
+  font-family: var(--font-mono); font-size: 13px; text-align: center;
+}
+/* n=1 是一次抛硬币，不是结论。这行字在重复次数是 1 的时候才出现。 */
+.bm-note { margin: 7px 0 0; font-size: 11px; line-height: 1.45; color: var(--yellow); }
+.bm-run { width: 100%; margin-top: 12px; }
+.bm-abort { display: block; width: 100%; margin-top: 8px; text-align: center; }
+
+.bm-linkbtn {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font: inherit; font-size: 11px; color: var(--text-dim);
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.bm-linkbtn:hover { color: var(--accent); }
+
+/* ── 右栏：读 ─────────────────────────────────────────────────────────────── */
+
+.bm-read { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.bm-block { padding: 14px 18px; border-bottom: 1px solid var(--border); min-height: 0; }
+.bm-block--grow { flex: 1; display: flex; flex-direction: column; border-bottom: none; }
+.bm-block > .bm-h { margin-bottom: 10px; }
+.bm-block--grow > div { flex: 1; min-height: 0; overflow-y: auto; }
+
+.bm-empty {
+  padding: 18px 2px; font-size: 12.5px; line-height: 1.6; color: var(--text-muted);
+}
+.bm-empty code {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--text);
+  background: var(--bg-input); padding: 1px 5px; border-radius: var(--radius-xs);
+}
+
+/* ── 分数刻度：共享 0-100 轴 ───────────────────────────────────────────────── */
+
+.bm-run-row {
+  /* 身份列不吃满：中间留一条大空沟会让「哪一次」和「多少分」读成两件事，
+     而这个设计的全部意图正是让它们分不开。 */
+  display: grid; grid-template-columns: minmax(0, 320px) minmax(220px, 1fr); gap: 20px;
+  align-items: center; padding: 9px 2px; border-bottom: 1px solid var(--border);
+}
+.bm-run-row:last-child { border-bottom: none; }
+.bm-run-id { min-width: 0; }
+.bm-run-when { font-size: 12.5px; }
+.bm-run-config {
+  display: block; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 轴线在下、数字在上：先前两者同高，刻度正好从数字中间穿过去。 */
+.bm-axis { position: relative; height: 30px; margin: 0 24px 0 8px; }
+/* 轴本身很轻。要被看见的是刻度的位置，不是轴。 */
+.bm-axis::before {
+  content: ''; position: absolute; left: 0; right: 0; top: 21px; height: 1px;
+  background: var(--border-med);
+}
+.bm-axis-mark {
+  position: absolute; top: 17px; width: 1px; height: 6px; background: var(--border-med);
+}
+/* 不确定度是背景信息，刻度才是主角：须线做成一条细线，不做成色块。 */
+.bm-whisker {
+  position: absolute; top: 21px; height: 1px;
+  background: var(--accent); opacity: 0.35;
+}
+.bm-tick {
+  position: absolute; top: 15px; width: 3px; height: 13px; border-radius: 2px;
+  background: var(--accent); transform: translateX(-1.5px);
+}
+.bm-tick--none { background: var(--text-dim); }
+.bm-score {
+  position: absolute; top: 0; transform: translateX(-50%);
+  font-family: var(--font-mono); font-size: 12.5px; font-weight: 600;
+  font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap;
+}
+/* 右半边的分数向左展开、左半边向右展开 —— 数字永远朝轴心里侧，不会被切掉。 */
+.bm-score--start { transform: translateX(-2px); }
+.bm-score--end   { transform: translateX(calc(-100% + 2px)); }
+/* 样本量永远贴着分数走，不另起一列。 */
+.bm-n { font-weight: 400; font-size: 10.5px; color: var(--text-muted); margin-left: 3px; }
+
+/* ── 进行中 ───────────────────────────────────────────────────────────────── */
+
+.bm-progress-head {
+  display: flex; align-items: baseline; gap: 12px; font-size: 12.5px;
+  color: var(--text-muted); margin-bottom: 9px;
+}
+.bm-progress-head b {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-weight: 600; color: var(--text);
+}
+.bm-state { color: var(--text-dim); }
+.bm-state--running { color: var(--accent); }
 .bm-state--done { color: var(--green); }
 
-.bm-score { font-variant-numeric: tabular-nums; font-weight: 600; }
-.bm-score--none { color: var(--text-secondary); font-weight: 400; }
-.bm-n { margin-left: 6px; font-size: 11px; color: var(--text-secondary); }
+.bm-case {
+  display: grid; grid-template-columns: 1fr 74px 56px; gap: 12px;
+  align-items: center; padding: 6px 2px; font-size: 12.5px;
+  border-bottom: 1px solid var(--border);
+}
+.bm-case:last-child { border-bottom: none; }
+.bm-case-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bm-case-name i { font-style: normal; color: var(--text-dim); font-family: var(--font-mono); }
+.bm-case-score {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right;
+}
+.bm-case-outcome { font-size: 11.5px; }
+.bm-case-outcome--ok { color: var(--green); }
+.bm-case-outcome--pending { color: var(--text-dim); }
+.bm-case-outcome--stalled,
+.bm-case-outcome--timeout,
+.bm-case-outcome--error { color: var(--red); }
 
-.bm-outcome--ok { color: var(--green); }
-.bm-outcome--stalled, .bm-outcome--timeout, .bm-outcome--error { color: var(--red); }
-.bm-outcome--pending { color: var(--text-secondary); }
+/* 五段维度条：失败时「断在哪一维」是下一步动作的依据。 */
+.bm-dims { display: flex; gap: 2px; margin-top: 3px; }
+.bm-dim { height: 3px; flex: 1; border-radius: 1px; background: var(--border); }
+.bm-dim--ok { background: var(--green); }
+.bm-dim--bad { background: var(--red); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .bm-tick, .bm-whisker { transition: left 160ms ease, width 160ms ease; }
+}
+
+@media (max-width: 860px) {
+  .benchmark-body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .bm-pick { border-right: none; border-bottom: 1px solid var(--border); max-height: 40%; }
+  .bm-run-row { grid-template-columns: 1fr; gap: 4px; }
+}

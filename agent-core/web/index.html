@@ -664,30 +664,43 @@
   <div class="modal benchmark-modal">
     <div class="modal-header">
       <span class="modal-title">基准测试</span>
-      <div style="display:flex;gap:6px;align-items:center">
-        <label class="bm-repeats-label">重复
-          <input type="number" id="bm-repeats" class="bm-repeats" value="1" min="1" max="20">
-          次</label>
-        <button class="btn-primary btn-sm" id="bm-run">开始</button>
-        <button class="btn-ghost btn-sm" id="bm-abort">中止</button>
-        <button class="btn-ghost btn-sm" id="bm-refresh">刷新</button>
-        <button class="btn-icon" id="benchmark-close">&#10005;</button>
-      </div>
+      <div class="bm-header-meta" id="bm-env"></div>
+      <button class="btn-icon" id="benchmark-close">&#10005;</button>
     </div>
+
     <div class="modal-body benchmark-body">
-      <section class="bm-section">
-        <h4 class="bm-heading">可跑的场景</h4>
-        <div id="bm-scenarios"></div>
-      </section>
-      <section class="bm-section">
-        <h4 class="bm-heading">本次进度</h4>
-        <div id="bm-progress"></div>
-      </section>
-      <section class="bm-section">
-        <h4 class="bm-heading">历史</h4>
-        <!-- n 与被测配置和分数同列显示：一个不带样本量、不带模型与镜像的分数
-             没有可比性，也会被当成结论。 -->
-        <div id="bm-runs"></div>
+      <!-- 左栏：要跑什么。挑是一次性动作，所以收在窄栏里。 -->
+      <aside class="bm-pick">
+        <div class="bm-pick-head">
+          <h4 class="bm-h">场景</h4>
+          <button class="bm-linkbtn" id="bm-refresh">重新扫描</button>
+        </div>
+        <div id="bm-scenarios" class="bm-scenarios"></div>
+
+        <div class="bm-launch">
+          <label class="bm-repeats-row" for="bm-repeats">
+            <span>重复</span>
+            <input type="number" id="bm-repeats" value="3" min="1" max="20">
+            <span>次</span>
+          </label>
+          <p class="bm-note" id="bm-repeats-note"></p>
+          <button class="btn-primary bm-run" id="bm-run">开始</button>
+          <button class="bm-linkbtn bm-abort" id="bm-abort">中止当前批次</button>
+        </div>
+      </aside>
+
+      <!-- 右栏：跑出了什么。这是反复读的地方。 -->
+      <section class="bm-read">
+        <div class="bm-block">
+          <h4 class="bm-h">进行中</h4>
+          <div id="bm-progress"></div>
+        </div>
+        <div class="bm-block bm-block--grow">
+          <h4 class="bm-h">历史</h4>
+          <!-- 分数画在共享的 0-100 轴上，样本量与被测配置贴着它 ——
+               「动没动」靠形状回答，而不是让人在四个列之间心算。 -->
+          <div id="bm-runs"></div>
+        </div>
       </section>
     </div>
   </div>
