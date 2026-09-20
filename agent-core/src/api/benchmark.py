@@ -3,11 +3,14 @@
 面板只在**检测到仿真器**（一个同时提供 `sim_scenario` 与 `sim_report` 的 MCP）时
 才有内容 —— 出厂的机器人不该看到一个 Benchmark 标签。
 
-## 这一层不评分
+## 驱动产出事实，这一层做裁判
 
-评分在仿真器里（`assertions.py`），因为裁判必须和被测系统不相交：一条坏掉的 ACP
-路径如果由 agent-core 自己判，会悄悄把自己判成绿的。这里只做三件事：把批次发过去、
-把结果收回来、把**被测配置**一起记下来。
+判定在 `benchmark_case.py`，不在仿真器里。裁判和被测系统必须不相交 —— 而裁判原先
+住在仿真器驱动里，那正是被测系统的一部分。仿真器只负责产出事实（事件流、ACP 记录），
+断言是 `(用例, 事件, ACP记录) → 判定` 的纯函数，搬上来之后顺带也能判真机跑出来的
+同形状事件流。
+
+除此之外这里做三件事：把批次发过去、把结果收回来、把**被测配置**一起记下来。
 
 ## 为什么不按名字找仿真器
 
@@ -72,6 +75,63 @@ async def _call(mcp_id: str, tool: str, args: dict) -> dict:
 
 
 # ── 可用性 ────────────────────────────────────────────────────────────────────
+
+async def case_readiness(needs: dict) -> dict:
+    """用例声明的依赖，在本机逐条对一遍。
+
+    这是把用例做成**方案包体的一段**、而不是一张卡片，换来的那件事：卡片住在驱动
+    里，驱动没装的时候卡片本身就不存在，于是「你缺这个驱动」这句话没有地方可说 ——
+    用户只会看到画布上少了点什么。依赖写在包体里，载入之前就能逐层报出来：先说缺
+    哪个驱动，驱动在了再说缺哪张地图。
+
+    两层顺序是有意的：没装驱动就不去问地图。那一问会走 MCP 超时，把一个「没装」
+    的清楚结论拖成一个「超时」的含糊结论。
+    """
+    drivers = [str(d) for d in (needs.get('drivers') or [])]
+    assets = [str(a) for a in (needs.get('assets') or [])]
+
+    online = {str(e.get('server_name') or ''): mid
+              for mid, e in mcp_client.registry.items() if e.get('online')}
+    missing_drivers = [d for d in drivers if d not in online]
+
+    ready = {'drivers': drivers, 'assets': assets,
+             'missing_drivers': missing_drivers, 'missing_assets': [],
+             'assets_checked': False}
+    if missing_drivers or not assets:
+        ready['ok'] = not missing_drivers
+        return ready
+
+    mcp_id = find_simulator()
+    if mcp_id is None:
+        ready['ok'] = not missing_drivers
+        return ready
+    result = await _call(mcp_id, SCENARIO_TOOL, {'action': 'list_maps'})
+    if 'error' in result:
+        # 问不到不等于缺 —— 报成缺失会让一个临时故障看起来像装错了东西。
+        ready['ok'] = True
+        ready['assets_error'] = result['error']
+        return ready
+    have = {str(m.get('name') or m) for m in (result.get('maps') or [])}
+    ready['assets_checked'] = True
+    ready['missing_assets'] = [a for a in assets if a not in have]
+    ready['ok'] = not ready['missing_assets']
+    return ready
+
+
+@router.get('/case')
+async def current_case():
+    """当前已载入方案里的用例（没有则 `case: null`）。"""
+    from api.solutions import loaded_case
+    payload = loaded_case()
+    if not payload:
+        return {'case': None}
+    import benchmark_case
+    return {'case': payload,
+            'problems': benchmark_case.validate({'test': payload}),
+            'readiness': await case_readiness(
+                benchmark_case.requires({'test': payload}))}
+
+
 
 @router.get('/available')
 async def available():

@@ -10,10 +10,11 @@ than correctness:
 * **n travels with the score.** An LLM is stochastic, so one run is one sample.
   A number shown without its sample size reads as a conclusion.
 
-And one about layering: agent-core does not score. The simulator judges, because
-the judge and the system under test have to be disjoint — otherwise a broken ACP
-path quietly marks itself green. This layer only dispatches, collects and
-records.
+And one about layering: the simulator produces facts, agent-core judges them
+(`benchmark_case.py`). The judge and the system under test have to be disjoint,
+and the judge used to live in the simulator driver — which is part of the system
+under test. This layer dispatches, collects, records, and reports what a case
+still needs before it can run.
 
 Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_benchmark_api.py -q
 """
@@ -318,3 +319,56 @@ def test_the_environment_block_names_the_model_under_test(simulator):
 
     assert set(result['environment']) >= {'tier', 'llm_model', 'llm_provider',
                                           'host', 'image_tags', 'git_shas'}
+
+
+# ── 用例依赖：分层报错 ────────────────────────────────────────────────────────
+
+def test_a_missing_driver_is_reported_before_assets_are_asked_about(simulator, monkeypatch):
+    """驱动没装就不去问地图。
+
+    那一问会走 MCP 超时，把「没装 simulator 驱动」这个清楚的结论，拖成一个
+    「超时」的含糊结论 —— 而分层报错的全部意义就是让第一层先说话。
+    """
+    monkeypatch.delitem(mcp_client.registry, 'mcp-sim')
+
+    ready = asyncio.run(benchmark.case_readiness(
+        {'drivers': ['simulator-generic'], 'assets': ['bj-2f']}))
+
+    assert ready['ok'] is False
+    assert ready['missing_drivers'] == ['simulator-generic']
+    assert ready['assets_checked'] is False
+    assert simulator['calls'] == []
+
+
+def test_a_missing_map_is_reported_once_the_driver_is_there(simulator):
+    simulator['replies'][('sim_scenario', 'list_maps')] = {'maps': [{'name': 'lab'}]}
+    mcp_client.registry['mcp-sim']['server_name'] = 'simulator-generic'
+
+    ready = asyncio.run(benchmark.case_readiness(
+        {'drivers': ['simulator-generic'], 'assets': ['bj-2f']}))
+
+    assert ready['missing_drivers'] == []
+    assert ready['missing_assets'] == ['bj-2f']
+    assert ready['ok'] is False
+
+
+def test_a_case_whose_dependencies_are_all_present_is_runnable(simulator):
+    simulator['replies'][('sim_scenario', 'list_maps')] = {'maps': [{'name': 'bj-2f'}]}
+    mcp_client.registry['mcp-sim']['server_name'] = 'simulator-generic'
+
+    ready = asyncio.run(benchmark.case_readiness(
+        {'drivers': ['simulator-generic'], 'assets': ['bj-2f']}))
+
+    assert ready['ok'] is True and ready['missing_assets'] == []
+
+
+def test_an_unreachable_simulator_is_not_reported_as_a_missing_asset(simulator):
+    """问不到 ≠ 缺。报成缺失，一次临时故障就会看起来像装错了东西。"""
+    simulator['replies'][('sim_scenario', 'list_maps')] = {'error': 'timeout'}
+    mcp_client.registry['mcp-sim']['server_name'] = 'simulator-generic'
+
+    ready = asyncio.run(benchmark.case_readiness(
+        {'drivers': ['simulator-generic'], 'assets': ['bj-2f']}))
+
+    assert ready['ok'] is True
+    assert ready['missing_assets'] == [] and ready['assets_error'] == 'timeout'
