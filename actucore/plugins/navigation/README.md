@@ -40,6 +40,14 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 - 分段执行的转向和直行预检只在 footprint 命中 Nav2
   `LETHAL_OBSTACLE` 时拒绝；膨胀安全带仅用于代价与规划，不冒充实体碰撞。
 
+## Action 响应与超时
+
+Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在多线程 executor
+中提前消费目标、取消或结果响应。用户回调与 Future 等待不持该锁。
+`shadow_velocity_stale` 仍表示速度候选超过有效期，继续输出零速；不能仅凭此
+判断 topic 断线。若同时出现 `Ignoring unexpected goal response`、目标已经结束但
+桥接状态仍为 `starting`，应检查 action 响应是否丢失。修复不会补回旧进程已丢失的响应。
+
 ## 外部输入
 
 | port | topic | 必需 |

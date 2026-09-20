@@ -20,7 +20,6 @@ from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import SpeedLimit
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Odometry
-from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
@@ -37,6 +36,7 @@ from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
+from .action_client import RaceSafeActionClient
 from .execution_protocol import (
     MotionLimits,
     ProtocolError,
@@ -312,7 +312,7 @@ class PlannerCommandNode(Node):
             costmap_qos,
             callback_group=self._callbacks,
         )
-        self._action_client = ActionClient(
+        self._action_client = RaceSafeActionClient(
             self,
             NavigateToPose,
             self._action_name,
