@@ -45,6 +45,10 @@ REPORT_TOOL = 'sim_report'
 # 轮询事实的间隔。事实是驱动侧累积的，问快了只是白问。
 _POLL_SECONDS = 2.0
 
+# 跑动期间世界的持有者。`sim_scenario` 的 `load`/`reset` 是 LLM 可调用的 action ——
+# 没有这把锁，被测的 agent 能重置正在测它的那次测量。
+OWNER = 'benchmark'
+
 
 # ── 安全闸 ────────────────────────────────────────────────────────────────────
 
@@ -121,6 +125,9 @@ class CaseRun:
             self.state = 'error'
             self.error = str(exc)
         finally:
+            # 把世界还给画布。不还，下一个人连 reset 都调不动，而错误信息会指向一次
+            # 早就结束的跑动。
+            await self._call(SCENARIO_TOOL, {'action': 'abort', 'owner': OWNER})
             await self._finish()
 
     async def _one(self, index: int) -> dict:
@@ -130,7 +137,7 @@ class CaseRun:
         reset = await self._call(SCENARIO_TOOL, {
             'action': 'reset', 'map': (run.get('world') or {}).get('map', ''),
             'spawn': (run.get('world') or {}).get('spawn') or {},
-            'seed': self.seed + index})
+            'seed': self.seed + index, 'owner': OWNER})
         if 'error' in reset:
             return self._case_row(index, started, {}, error=reset['error'])
 
@@ -140,7 +147,7 @@ class CaseRun:
         facts = await self._watch(run, started)
         results = benchmark_case.evaluate({'test': self.case},
                                           facts.get('events') or [],
-                                          facts.get('acp_posts') or [])
+                                          facts.get('acp_posts') or [], facts=facts)
         score = benchmark_case.score({'test': self.case}, results)
         return self._case_row(index, started, {'facts': facts, 'results': results,
                                                'score': score})

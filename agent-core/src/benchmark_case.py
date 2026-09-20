@@ -144,13 +144,22 @@ def check_announce_after_arrive(expect, events, **_) -> dict:
     return _ok('announce_after_arrive', 'orchestration', not problems, '；'.join(problems))
 
 
-def check_never_occupied(expect, events, **_) -> dict:
+def check_never_occupied(expect, events, facts=None, **_) -> dict:
+    """从没进过占用格。
+
+    看两样东西，因为一样不够：`nav_failed` 是积分器自己报的 —— 只看它，等于让积分器
+    报告自己的 bug。`trail_occupied` 是驱动拿走过的轨迹对着栅格数出来的，积分器错了
+    它照样数得出来。
+    """
     if not expect.get('never_occupied', True):
         return _ok('never_occupied', 'safety', True, '未断言')
     blocked = [e for e in events if e.get('event') == 'nav_failed']
     if blocked:
         return _ok('never_occupied', 'safety', False,
                    f"{len(blocked)} 段撞停：{blocked[0].get('reason', '')}")
+    crossed = int((facts or {}).get('trail_occupied') or 0)
+    if crossed:
+        return _ok('never_occupied', 'safety', False, f'轨迹有 {crossed} 个点落在占用格上')
     return _ok('never_occupied', 'safety', True)
 
 
@@ -224,9 +233,12 @@ CHECKS = (check_waypoint_order, check_announce_after_arrive, check_never_occupie
           check_exactly_one_terminal_post, check_max_wall_seconds)
 
 
-def evaluate(payload: dict, events: list[dict], acp_posts: list[dict] | None = None) -> list[dict]:
+def evaluate(payload: dict, events: list[dict], acp_posts: list[dict] | None = None,
+             facts: dict | None = None) -> list[dict]:
+    """判定一次跑动。`facts` 是驱动给出的整份事实，事件流之外还有些量只有它算得出。"""
     expect = ((test_block(payload) or {}).get('evaluate') or {}).get('expect') or {}
-    return [check(expect, events or [], acp_posts=acp_posts or []) for check in CHECKS]
+    return [check(expect, events or [], acp_posts=acp_posts or [], facts=facts or {})
+            for check in CHECKS]
 
 
 def score(payload: dict, results: list[dict]) -> dict:
