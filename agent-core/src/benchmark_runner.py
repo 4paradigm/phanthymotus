@@ -149,7 +149,8 @@ class CaseRun:
             return self._case_row(index, started, {}, error=reset['error'])
 
         self.state = 'running'
-        await self._say(run.get('prompt', ''))
+        # 开场那句是**指令**，不是插话 —— 记错了，复盘的人会以为一开始就有人打断。
+        await self._say(run.get('prompt', ''), label='指令')
 
         facts = await self._watch(run, started)
         results = benchmark_case.evaluate({'test': self.case},
@@ -159,7 +160,7 @@ class CaseRun:
         return self._case_row(index, started, {'facts': facts, 'results': results,
                                                'score': score})
 
-    async def _say(self, text: str) -> None:
+    async def _say(self, text: str, label: str = '插话') -> None:
         """把一句话当作用户说的送进去 —— 用例的保真度就在这里。
 
         同时在世界的事件日志里留一条。判定用不着它（打断看的是 ACP 上报与
@@ -172,7 +173,7 @@ class CaseRun:
         await event_bus.enqueue(source='message', text=str(text),
                                 payload={'benchmark': True})
         try:
-            await self._call(SCENARIO_TOOL, {'action': 'note', 'text': f'[用例插话] {text}'})
+            await self._call(SCENARIO_TOOL, {'action': 'note', 'text': f'[用例{label}] {text}'})
         except Exception:
             pass      # 记账失败不该让一次跑动停下来
 

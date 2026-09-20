@@ -238,8 +238,8 @@ def test_every_spoken_line_also_lands_in_the_world_log(simulator, said):
     notes = [args.get('text') for tool, args in simulator
              if tool == 'sim_scenario' and args.get('action') == 'note']
 
-    assert any('先等一下' in (n or '') for n in notes)
-    assert all(n.startswith('[用例插话]') for n in notes)
+    assert notes[0].startswith('[用例指令]'), '开场那句是指令，不是插话'
+    assert any(n.startswith('[用例插话]') and '先等一下' in n for n in notes)
 
 
 def test_a_failed_note_does_not_stop_the_run(simulator, said, monkeypatch):
