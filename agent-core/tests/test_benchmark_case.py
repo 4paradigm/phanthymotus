@@ -59,6 +59,33 @@ def test_total_task_duration_has_no_default_target():
     assert with_target['concurrency.total_seconds']['max'] == 300
 
 
+def test_speaking_on_the_way_is_not_penalised_by_default():
+    """**两个维度的默认目标不能互相打架。**
+
+    Orin6 上一跑就现原形：机器人在路上说了一句「正在带您前往一号展区，请跟我走」。
+    同一次跑动里 `ux` 因为它少了一段空白，而 `world_timing` 曾因为它扣分 ——
+    奖一次罚一次，等于没有意见。
+
+    这个指标分不清「到达前宣布已到达」（该罚）和「路上说点什么」（该奖），而区分
+    它们是内容问题，是裁判的活。所以它是可看的指标，不是默认目标。
+    """
+    assert 'world_timing.spoke_before_arrival' not in bc.DEFAULT_TARGETS
+
+    seen_it = seen(**{'world_timing.spoke_before_arrival': 3})
+    items = bc.check_targets(seen_it, bc.targets(case()))
+
+    assert not any(i['id'] == 'world_timing.spoke_before_arrival' for i in items)
+
+
+def test_leaving_mid_sentence_is_still_penalised():
+    """「讲完再走」没有这种两义性：话说一半就走，任何维度都不想要。"""
+    items = bc.check_targets(seen(**{'world_timing.left_while_speaking': 1}),
+                             bc.targets(case()))
+
+    left = next(i for i in items if i['id'] == 'world_timing.left_while_speaking')
+    assert left['ok'] is False
+
+
 def test_a_case_can_move_a_default_target_without_replacing_the_rest():
     spec = bc.targets(case(targets={'ux.blank_avg_s': 15}))
 
