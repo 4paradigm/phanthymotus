@@ -25,6 +25,7 @@ import pathlib
 import sys
 import tempfile
 
+import fastapi
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
@@ -372,3 +373,54 @@ def test_an_unreachable_simulator_is_not_reported_as_a_missing_asset(simulator):
 
     assert ready['ok'] is True
     assert ready['missing_assets'] == [] and ready['assets_error'] == 'timeout'
+
+
+# ── 覆盖前先存画布 ────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def canvas_and_registry(monkeypatch):
+    from api import solutions
+    monkeypatch.setattr(solutions, '_layout', lambda: {
+        'cards': [{'id': 'c1', 'mcpId': 'mcp-sim', 'toolName': 'nav', 'x': 0, 'y': 0}],
+        'connections': [], 'execConnections': []})
+    monkeypatch.setattr(solutions, '_mcp_list', lambda: [
+        {'id': 'mcp-sim', 'name': 'simulator', 'server_name': 'simulator-generic',
+         'url': 'http://localhost:15711/mcp'}])
+    import config
+    yield
+    config.main[benchmark.SNAPSHOT_KEY] = None
+
+
+def test_the_canvas_is_packed_before_a_case_overwrites_it(canvas_and_registry):
+    """载入用例会覆盖画布，而用户自己搭的那套东西没有别的地方存着 —— 它就在画布上。"""
+    result = asyncio.run(benchmark.snapshot(_request()))
+
+    assert result['saved'] is True and result['cards'] == 1
+    assert result['payload']['canvas']['cards'][0]['toolName'] == 'nav'
+
+
+def test_the_snapshot_is_reported_but_never_restored_on_its_own(canvas_and_registry):
+    """跑完自动把画布换回去，会在用户正看着结果的时候把画布抽走。还原是用户的决定。"""
+    asyncio.run(benchmark.snapshot(_request()))
+
+    info = asyncio.run(benchmark.snapshot_info())
+
+    assert info['saved'] is True and info['cards'] == 1
+    assert info['savedAt'] > 0
+
+
+def test_restoring_without_a_snapshot_says_so_rather_than_doing_nothing():
+    import config
+    config.main[benchmark.SNAPSHOT_KEY] = None
+
+    with pytest.raises(fastapi.HTTPException) as caught:
+        asyncio.run(benchmark.snapshot_restore(_request()))
+
+    assert caught.value.status_code == 404
+
+
+def _request():
+    class _Req:
+        headers: dict = {}
+        cookies: dict = {}
+    return _Req()

@@ -10,7 +10,9 @@
 断言是 `(用例, 事件, ACP记录) → 判定` 的纯函数，搬上来之后顺带也能判真机跑出来的
 同形状事件流。
 
-除此之外这里做三件事：把批次发过去、把结果收回来、把**被测配置**一起记下来。
+除此之外这里做的事：跑用例（`benchmark_runner`）、把结果连同**被测配置**记下来，
+以及在用例覆盖画布之前把画布存成一个解决方案包 —— 用户自己搭的那套东西没有别的地方
+存着，它就在画布上。
 
 ## 为什么不按名字找仿真器
 
@@ -20,6 +22,7 @@
 
 import os
 import platform
+import time
 
 import fastapi
 from fastapi import APIRouter, Query
@@ -132,7 +135,6 @@ async def current_case():
                 benchmark_case.requires({'test': payload}))}
 
 
-
 @router.get('/available')
 async def available():
     """面板据此决定要不要出现。"""
@@ -151,12 +153,74 @@ async def scenarios():
             **({'error': result['error']} if 'error' in result else {})}
 
 
+# ── 载入用例前：先把现在的画布存下来 ──────────────────────────────────────────
+
+SNAPSHOT_KEY = 'benchmark_canvas_snapshot'
+
+
+@router.post('/snapshot')
+async def snapshot(request: fastapi.Request):
+    """把当前画布打包成一个解决方案，存在本机并回给前端下载。
+
+    载入用例会覆盖画布。用户自己搭的那套东西没有别的地方存着 —— 它就在画布上。所以
+    在覆盖之前先打成一个包：一份留在机器上，一份用户可以下载，和用例一样是一个能在
+    本地与市场上流通的文件。
+
+    用 `solutions` 的打包路径，不另写一套：`deviceRef` 映射、`x-sensitive` 脱敏、
+    版本记录都在那边，复制一遍就会漏掉脱敏。
+    """
+    import config
+    from api.solutions import PackInclude, PackRequest, _build_payload, _get_rc_token
+
+    built = await _build_payload(PackRequest(include=PackInclude()),
+                                 _get_rc_token(request))
+    if not built.get('ok'):
+        raise fastapi.HTTPException(status_code=422, detail=built.get('error', '打包失败'))
+
+    payload = built['payload']
+    config.main[SNAPSHOT_KEY] = {
+        'savedAt': int(time.time()),
+        'cards': len(((payload.get('canvas') or {}).get('cards')) or []),
+        'payload': payload,
+    }
+    return {'saved': True, 'cards': config.main[SNAPSHOT_KEY]['cards'],
+            'payload': payload, 'includes': built['includes']}
+
+
+@router.get('/snapshot')
+async def snapshot_info():
+    """存过的快照。**只报告，不自动还原** —— 跑完自动把画布换回去，会在用户正看着
+    结果的时候把画布抽走；还原是用户的决定。"""
+    import config
+    stored = config.main.get(SNAPSHOT_KEY) or {}
+    if not stored:
+        return {'saved': False}
+    return {'saved': True, 'savedAt': stored.get('savedAt'),
+            'cards': stored.get('cards', 0)}
+
+
+@router.post('/snapshot/restore')
+async def snapshot_restore(request: fastapi.Request):
+    """把画布换回快照。只在用户点的时候发生。"""
+    import config
+    from api.solutions import LoadRequest, apply as apply_solution
+
+    stored = config.main.get(SNAPSHOT_KEY) or {}
+    if not stored.get('payload'):
+        raise fastapi.HTTPException(status_code=404, detail='本机没有存过画布快照')
+    result = await apply_solution(request, LoadRequest(
+        payload=stored['payload'], includes=['canvas'], confirm=True))
+    if result.get('code') != 200:
+        raise fastapi.HTTPException(status_code=result.get('code', 500),
+                                    detail=result.get('error', '还原失败'))
+    return {'restored': True, 'cards': stored.get('cards', 0)}
+
+
 # ── 跑当前载入的用例 ──────────────────────────────────────────────────────────
 
 class CaseRunRequest(BaseModel):
     repeats: int = 1
     seed: int = 0
-    confirm_unsafe: bool = False        # 明知画布上有真设备仍要跑（不提供绕过）
 
 
 @router.post('/case/run')

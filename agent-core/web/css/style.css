@@ -8665,6 +8665,41 @@ html, body {
 }
 .bm-linkbtn:hover { color: var(--accent); }
 
+/* ── 用例：载入前的那一次覆盖 ─────────────────────────────────────────────── */
+
+.bm-case-block { padding: 0 16px 12px; border-bottom: 1px solid var(--border); }
+.bm-case-block .bm-empty { padding: 10px 0 4px; }
+.bm-case-loaded { padding: 4px 0 2px; }
+.bm-case-title { font-size: 13px; line-height: 1.35; color: var(--text); }
+/* 用例的初始指令就是用户会说的那句话，所以让它读起来像一句话，不像一个字段。 */
+.bm-case-prompt {
+  margin: 4px 0 8px; font-size: 12px; line-height: 1.5; color: var(--text-muted);
+}
+.bm-case-ok { font-size: 11.5px; color: var(--green); }
+/* 缺什么按层列出来：每一条的下一步动作都不一样。 */
+.bm-blockers { margin: 2px 0 8px; padding: 0; list-style: none; }
+.bm-blockers li {
+  font-size: 11.5px; line-height: 1.6; color: var(--yellow);
+  padding-left: 12px; text-indent: -12px;
+}
+.bm-blockers li::before { content: "· "; }
+.bm-blockers b { color: var(--text); font-family: var(--font-mono); font-weight: 500; }
+/* 覆盖是默认不做的事，所以勾选框是显式的一步，不是一句脚注。 */
+.bm-confirm {
+  display: flex; align-items: center; gap: 7px; margin: 9px 0 0;
+  font-size: 12px; color: var(--text-muted); cursor: pointer;
+}
+.bm-confirm input { accent-color: var(--accent); }
+.bm-case-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.bm-case-actions .btn-primary { flex: 1; }
+.bm-case-actions .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+/* 跑完只提示还原，不自动做 —— 自动会在用户正看着结果的时候把画布抽走。 */
+.bm-restore {
+  margin-top: 10px; padding: 9px 11px; border: 1px dashed var(--border-med);
+  border-radius: var(--radius-xs); font-size: 11.5px; color: var(--text-muted);
+}
+.bm-restore .bm-linkbtn { margin-left: 6px; }
+
 /* ── 右栏：读 ─────────────────────────────────────────────────────────────── */
 
 .bm-read { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }

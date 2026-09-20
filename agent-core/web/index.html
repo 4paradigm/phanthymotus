@@ -671,6 +671,15 @@
     <div class="modal-body benchmark-body">
       <!-- 左栏：要跑什么。挑是一次性动作，所以收在窄栏里。 -->
       <aside class="bm-pick">
+        <!-- 用例：一个带 test 段的解决方案。它自带画布，所以载入会覆盖现在这张 ——
+             覆盖之前先给用户一条退路，勾选是明确的，不做默认。 -->
+        <div class="bm-pick-head">
+          <h4 class="bm-h">用例</h4>
+          <label class="bm-linkbtn" for="bm-case-file">打开用例文件</label>
+        </div>
+        <input type="file" id="bm-case-file" accept="application/json,.json" hidden>
+        <div id="bm-case" class="bm-case-block"></div>
+
         <div class="bm-pick-head">
           <h4 class="bm-h">场景</h4>
           <button class="bm-linkbtn" id="bm-refresh">重新扫描</button>
