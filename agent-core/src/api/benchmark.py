@@ -151,6 +151,82 @@ async def scenarios():
             **({'error': result['error']} if 'error' in result else {})}
 
 
+# ── 跑当前载入的用例 ──────────────────────────────────────────────────────────
+
+class CaseRunRequest(BaseModel):
+    repeats: int = 1
+    seed: int = 0
+    confirm_unsafe: bool = False        # 明知画布上有真设备仍要跑（不提供绕过）
+
+
+@router.post('/case/run')
+async def run_case(request: CaseRunRequest):
+    """跑当前方案带的用例。
+
+    四道门，顺序是有意的：有没有用例 → 用例本身合不合法 → 依赖齐不齐 → 画布上有没有
+    真设备。每一道都给出不同的下一步动作，合成一个布尔就全丢了。
+    """
+    import benchmark_case
+    import benchmark_runner
+    from api.solutions import loaded_case
+
+    if benchmark_runner.is_busy():
+        raise fastapi.HTTPException(status_code=409, detail='已经有一次基准测试在跑')
+
+    case = loaded_case()
+    if not case:
+        raise fastapi.HTTPException(
+            status_code=409, detail='当前方案里没有 test 段，先载入一个测试用例')
+
+    problems = benchmark_case.validate({'test': case})
+    if problems:
+        raise fastapi.HTTPException(status_code=422, detail='；'.join(problems))
+
+    mcp_id = find_simulator()
+    readiness = await case_readiness(benchmark_case.requires({'test': case}))
+    if mcp_id is None or not readiness.get('ok'):
+        raise fastapi.HTTPException(status_code=409, detail={
+            'error': '用例的依赖还不齐', 'readiness': readiness})
+
+    # 安全闸：注入的文本和真实指令无法区分，画布上任何一张会动的真卡片都会真的动。
+    unsafe = benchmark_runner.unsafe_cards(mcp_id)
+    if unsafe:
+        raise fastapi.HTTPException(status_code=409, detail={
+            'error': '画布上有会动的真实设备，基准测试会让它们真的动起来',
+            'unsafe': unsafe})
+
+    environment = _environment()
+    repeats = max(1, int(request.repeats))
+    run_id = benchmark_store.create_run(
+        case.get('name', '') or 'case', n_repeats=repeats,
+        tier=environment['tier'], llm_model=environment['llm_model'],
+        llm_provider=environment['llm_provider'], host=environment['host'],
+        image_tags=environment['image_tags'], git_shas=environment['git_shas'])
+
+    run = benchmark_runner.CaseRun(case, mcp_id, repeats, int(request.seed),
+                                   run_id, environment)
+    benchmark_runner.set_current(run)
+    run.start()
+    return {'run_id': run_id, 'repeats': repeats, 'mcp_id': mcp_id}
+
+
+@router.get('/case/progress')
+async def case_progress():
+    import benchmark_runner
+    run = benchmark_runner.current()
+    return run.snapshot() if run else {'state': 'idle'}
+
+
+@router.post('/case/abort')
+async def case_abort():
+    import benchmark_runner
+    run = benchmark_runner.current()
+    if not run:
+        return {'state': 'idle'}
+    run.abort()
+    return {'state': 'aborting', 'run_id': run.run_id}
+
+
 # ── 起一批 ────────────────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
