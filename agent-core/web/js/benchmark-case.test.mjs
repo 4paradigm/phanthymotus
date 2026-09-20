@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 
 import { blockerRows, cardKey, hardwareNotice, plannedUtterances,
          runRefusal } from './benchmark.js';
-import { parseList, weightNote, normalizeInjection } from './benchmark-editor.js';
+import { normalizeInjection } from './benchmark-editor.js';
 
 test('依赖齐了就没有任何一条拦路的', () => {
   assert.deepEqual(blockerRows([], { ok: true, missing_drivers: [], missing_assets: [] }), []);
@@ -148,54 +148,26 @@ test('结构化的理由不会退化成 [object Object]', () => {
 
 // ── 编辑器：几个必须自己算对的地方 ───────────────────────────────────────────
 
-test('站序逗号分隔和换行分隔都认', () => {
-  // 只认一种，另一种会安静地变成**一个**名字很长的站点 —— 跑起来一站都对不上，
-  // 看着却像是 agent 走错了路。
-  assert.deepEqual(parseList('P3, P4, P5'), ['P3', 'P4', 'P5']);
-  assert.deepEqual(parseList('P3\nP4\nP5'), ['P3', 'P4', 'P5']);
-  assert.deepEqual(parseList('入口，一号展区'), ['入口', '一号展区']);
-});
-
-test('站序里的空白与空行不会变成站点', () => {
-  assert.deepEqual(parseList('  P3 ,, \n  P4  \n\n'), ['P3', 'P4']);
-});
-
-test('空的站序是空列表，不是一个空字符串站点', () => {
-  assert.deepEqual(parseList(''), []);
-  assert.deepEqual(parseList(null), []);
-});
-
-test('权重合计正好 100 时不啰嗦', () => {
-  assert.equal(weightNote({ orchestration: 30, interruption: 25, long_horizon: 25,
-                            safety: 15, latency: 5 }), '');
-});
-
-test('权重合计不是 100 只提示，不当成错误', () => {
-  // 评分是按比例算的，105 照样能跑 —— 拦下来只会挡住人改权重。
-  const note = weightNote({ orchestration: 40, interruption: 25, long_horizon: 25,
-                            safety: 15, latency: 5 });
-
-  assert.match(note, /110/);
-  assert.match(note, /不影响跑/);
-});
-
-test('权重全是 0 要说出来', () => {
-  assert.match(weightNote({}), /总分算不出来/);
-});
-
 test('一条插话只留一个触发方式', () => {
-  // 两个都填，跑的时候按 after_arrival 走，而写的人以为按秒走。
-  const byArrival = normalizeInjection({
-    mode: 'arrive', after_arrival: 'P5', at: '90', delay: '6', text: '先等一下' });
+  // 两个都填，跑的时候按 after_action 走，而写的人以为按秒走。
+  const byAction = normalizeInjection({
+    mode: 'action', after_action: '3', at: '90', delay: '6', text: '先等一下' });
   const bySecond = normalizeInjection({
-    mode: 'at', after_arrival: 'P5', at: '90', delay: '0', text: '先等一下' });
+    mode: 'at', after_action: '3', at: '90', delay: '0', text: '先等一下' });
 
-  assert.deepEqual(byArrival, { text: '先等一下', delay: 6, after_arrival: 'P5' });
+  assert.deepEqual(byAction, { text: '先等一下', delay: 6, after_action: 3 });
   assert.deepEqual(bySecond, { text: '先等一下', delay: 0, at: 90 });
 });
 
+test('第 0 个动作不存在，按第 1 个算', () => {
+  // 「第 0 个动作完成后」永远不会触发 —— 而它看起来像是「一开始就发」。
+  const row = normalizeInjection({ mode: 'action', after_action: '0', text: '喂' });
+
+  assert.equal(row.after_action, 1);
+});
+
 test('插话的延时空着按 0 算，不是 NaN', () => {
-  const row = normalizeInjection({ mode: 'arrive', after_arrival: 'P5', delay: '', text: '喂' });
+  const row = normalizeInjection({ mode: 'action', after_action: '1', delay: '', text: '喂' });
 
   assert.equal(row.delay, 0);
 });
