@@ -27,14 +27,9 @@
  * 会话没了就说没了，不编。
  */
 
-// 断言名是给代码看的。「没过：waypoint_order」要人自己翻译，而这一行正是打开这个
-// 弹窗的第一眼。
-const CHECKS = {
-  waypoint_order: '站序不对', announce_after_arrive: '到达后没讲解',
-  never_occupied: '进了占用格', interrupted_leg: '被打断那段上报不实',
-  resume_correctness: '绕行后没回到原来那站',
-  exactly_one_terminal_post: 'ACP 重复上报', max_wall_seconds: '超时',
-};
+// 没过的那几条现在本来就是人话 —— 要么是用户写的要求，要么是默认目标的标签
+// （「到达之前不开讲」「平均懵逼时长不超过 10 秒」）。原先这里有一张把
+// `waypoint_order` 翻译成「站序不对」的表，那是断言名还是代码标识符时的事。
 
 // 一次运行里最值钱的线索往往是「这里什么都没发生」—— 机器人卡住、LLM 空转、
 // barrier 等超时，长得都一样：一段静默。
@@ -156,7 +151,7 @@ function _render(data) {
     </div>
     ${(data.cases || []).map((c) => (c.assertions || []).length
       ? `<div class="bm-tl-fail">没过：${(c.assertions || [])
-          .map((a) => _esc(CHECKS[a] || a)).join('、')}</div>`
+          .map((a) => _esc(a)).join('、')}</div>`
       : '').join('')}`;
 
   const agent = data.agent || [];
@@ -211,10 +206,17 @@ function _agentCell(row) {
 function _worldCell(e) {
   const label = KINDS[e.kind] || e.kind;
   const known = KINDS[e.kind] !== undefined;
-  const detail = e.label || e.text || '';
+  // 真机上没有 label（驱动的 ACP result 不带它），目标只在派发参数里 —— 退到参数，
+  // 否则「出发」就是一行没有目的地的字。
+  const detail = e.label || e.text || _args(e.args);
   return `<span class="bm-tl-kind${known ? '' : ' bm-tl-kind--minor'}">${_esc(label)}</span>` +
     `<span class="bm-clip bm-tl-detail">${_esc(detail)}${
       e.status ? ` <i>${_esc(e.status)}</i>` : ''}</span>`;
+}
+
+function _args(args) {
+  const entries = Object.entries(args || {});
+  return entries.length ? entries.map(([k, v]) => `${k}=${v}`).join(' ') : '';
 }
 
 function _esc(value) {
