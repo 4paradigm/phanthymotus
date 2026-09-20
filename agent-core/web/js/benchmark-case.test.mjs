@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { blockerRows, cardKey, hardwareNotice, plannedUtterances,
+import { blockerRows, cardKey, compareNote, hardwareNotice, plannedUtterances,
          runRefusal } from './benchmark.js';
 import { normalizeInjection } from './benchmark-editor.js';
 
@@ -298,4 +298,42 @@ test('调用自带的时刻优先于所属轮次的时刻', () => {
     [{ turn: 0, at: 5, says: [], calls: [{ name: 'speak', at: 30, args: '{}' }] }], []);
 
   assert.deepEqual(rows.map((r) => r.at), [5, 30]);
+});
+
+
+// ── 两次运行之间 ──────────────────────────────────────────────────────────────
+//
+// 这一组守的是纪律：说不出显著差异的时候要说「测不出」，而不是把两个均值之差当结论。
+
+test('不显著时不给方向', () => {
+  const note = compareNote({ available: true, significant: false,
+                             median_delta: 2.4, paired: 5 }, '导览');
+
+  assert.match(note, /测不出显著差异/);
+  assert.doesNotMatch(note, /更好|更差/);
+});
+
+test('不显著时也不着色', () => {
+  // 一个绿色的「测不出显著差异」仍然会被读成「变好了」—— 颜色比字先被看见。
+  const note = compareNote({ available: true, significant: false,
+                             median_delta: 2.4, paired: 5 });
+
+  assert.match(note, /bm-cmp-none/);
+  assert.doesNotMatch(note, /bm-cmp--up|bm-cmp--down/);
+});
+
+test('显著变好才说更好，并且带上样本量', () => {
+  const note = compareNote({ available: true, significant: true,
+                             median_delta: 12.5, paired: 6 }, '导览');
+
+  assert.match(note, /更好/);
+  assert.match(note, /n=6/);
+  assert.match(note, /bm-cmp--up/);
+});
+
+test('样本不够时把理由说出来，不是静默省略', () => {
+  const note = compareNote({ available: false, reason: '配对样本只有 1 条，无法判断显著性' });
+
+  assert.match(note, /只有 1 条/);
+  assert.doesNotMatch(note, /更好|更差/);
 });

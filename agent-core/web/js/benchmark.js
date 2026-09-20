@@ -672,11 +672,48 @@ async function _loadRuns() {
   el.querySelectorAll('[data-run]').forEach((row) => {
     row.addEventListener('click', () => openTimeline(row.dataset.run));
   });
+  _compareLatest(runs);
+}
+
+/** 最近两次同一个用例之间，分数的差异站不站得住。
+ *
+ * 只在**检验过得去**的时候说「更好/更差」。两个均值不同不等于有差别 —— LLM 是随机的，
+ * 一次运行的分数是分布里的一个样本。这块面板原先只有 mean ± stdev，照着它说「涨了」
+ * 是没有依据的。
+ */
+async function _compareLatest(runs) {
+  const el = document.getElementById('bm-compare');
+  if (!el) return;
+  const pair = runs.filter((r) => r.suite === runs[0]?.suite).slice(0, 2);
+  if (pair.length < 2) { el.classList.add('hidden'); return; }
+  let result;
+  try {
+    result = await api(`/api/benchmark/runs/${pair[0].id}/compare/${pair[1].id}`);
+  } catch { el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  el.innerHTML = compareNote(result, pair[0].suite);
+}
+
+/** 这句话说什么。不显著时**不给方向** —— 那正是这条检验存在的理由。 */
+export function compareNote(result, suite = '') {
+  const name = suite ? `「${_esc(suite)}」` : '';
+  if (!result?.available) {
+    return `<span class="bm-cmp-none">${name}最近两次还比不出来：${
+      _esc(result?.reason || '样本不够')}</span>`;
+  }
+  if (!result.significant) {
+    return `<span class="bm-cmp-none">${name}最近两次<b>测不出显著差异</b>（中位差 ${
+      result.median_delta?.toFixed?.(1) ?? '—'}，n=${result.paired}）</span>`;
+  }
+  const better = result.median_delta > 0;
+  return `<span class="bm-cmp ${better ? 'bm-cmp--up' : 'bm-cmp--down'}">${name}最近一次<b>${
+    better ? '更好' : '更差'}</b>　中位差 ${result.median_delta.toFixed(1)}　n=${result.paired}</span>`;
 }
 
 const _DIMS = {
-  orchestration: '编排', interruption: '打断', long_horizon: '长程',
-  latency: '时效', safety: '安全',
+  world_timing: '物理世界时序性', concurrency: '同步执行效率',
+  llm_latency: 'LLM 延时', cache_hit: 'cache 命中',
+  answer_quality: '回答效果', ux: '用户体验', physical_safety: '安全',
 };
 const _CHECK_DIM = {
   waypoint_order: '编排', announce_after_arrive: '编排', exactly_one_terminal_post: '编排',

@@ -545,6 +545,16 @@ async def runs(limit: int = Query(50, ge=1, le=500)):
     return {'runs': benchmark_store.list_runs(limit=limit)}
 
 
+@router.get('/runs/{run_id}/compare/{baseline_id}')
+async def compare(run_id: str, baseline_id: str):
+    """这次比上次，分数的差异站不站得住。
+
+    面板据此决定**要不要**给涨跌结论。两个均值不同不等于有差别 —— LLM 是随机的，
+    一次运行的分数是分布里的一个样本。「测不出显著差异」是一个结论，不是缺省值。
+    """
+    return benchmark_store.compare_runs(baseline_id, run_id)
+
+
 @router.get('/runs/{run_id}')
 async def run_detail(run_id: str):
     stored = benchmark_store.get_run(run_id)

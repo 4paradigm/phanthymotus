@@ -8759,6 +8759,12 @@ html, body {
 }
 .bm-confirm input { accent-color: var(--accent); }
 /* 常驻提示条：这张画布上有会动的真设备。挑用例之前就说，不等按了运行才拦。 */
+.bm-compare { margin-bottom: 9px; font-size: 11px; line-height: 1.6; }
+.bm-compare b { font-weight: 600; }
+/* 不显著就不着色 —— 一个绿色的「测不出显著差异」仍然会被读成「变好了」。 */
+.bm-cmp-none { color: var(--text-muted); }
+.bm-cmp--up { color: var(--green, #2E7D32); }
+.bm-cmp--down { color: var(--red); }
 .bm-hw-notice {
   margin: 0 18px; padding: 7px 11px;
   border-left: 2px solid var(--red); background: var(--red-bg);

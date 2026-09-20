@@ -302,3 +302,61 @@ def delete_case(case_id: str) -> bool:
     cursor = conn.execute('DELETE FROM case_library WHERE id=?', (case_id,))
     conn.commit()
     return cursor.rowcount > 0
+
+
+# ── 两次运行之间，分数真的动了吗 ──────────────────────────────────────────────
+#
+# 原先这里只有 mean ± stdev，而面板照着它说「涨了」是没有依据的：LLM 是随机的，
+# 一次运行的分数是分布里的一个样本，两个样本均值不同不等于有差别。
+#
+# `tools/llm_bench` 已经把这件事做对过一次，它的 README 记着当初为什么必须这么做：
+# 「显著性用统计检验，不靠重复测量……任一条不过，报告就判『测不出显著差异』，
+# 不排名、不给推荐。」这里照搬，不重写。
+
+def _stats():
+    """`llm_bench.stats`，拿不到就返回 None。
+
+    它在 `tools/` 下，不是 `src/` 的一部分。**必须走包命名空间** —— 扁平的
+    `import config` 会被 `src/config.py` 顶掉（`tests/test_llm_bench.py` 开头记着
+    这个坑）。拿不到就老实说算不了，而不是退回自己手搓一个检验。
+    """
+    import pathlib
+    import sys
+    tools = str(pathlib.Path(__file__).resolve().parents[1] / 'tools')
+    if tools not in sys.path:
+        sys.path.append(tools)
+    try:
+        from llm_bench import stats
+        return stats
+    except Exception:
+        return None
+
+
+def compare_runs(baseline_id: str, current_id: str) -> dict:
+    """两次跑同一个用例，分数的差异站不站得住。
+
+    **按重复序号配对**，因为第 i 次重复两边用的是同一个 seed（`seed + index`）——
+    seed 存在的理由就是让两次运行之间有东西可以配对。样本不足（n<3）时返回
+    `available: False` 并说明原因，而不是给一个看起来很确定的结论。
+    """
+    stats = _stats()
+    if stats is None:
+        return {'available': False, 'reason': '取不到 llm_bench.stats，算不了显著性'}
+
+    def scores(run_id):
+        run = get_run(run_id) or {}
+        return {c.get('repeat_idx'): c.get('score') for c in (run.get('cases') or [])
+                if c.get('score') is not None}
+
+    before, after = scores(baseline_id), scores(current_id)
+    shared = sorted(set(before) & set(after))
+    deltas = [float(after[i]) - float(before[i]) for i in shared]
+    result = stats.significance(deltas)
+    result['paired'] = len(shared)
+    if not result.get('available'):
+        return result
+    # 「测不出显著差异」是一个结论，不是缺省值 —— 面板据此**不**给涨跌箭头。
+    result['verdict'] = ('更好' if result['significant'] and result['median_delta'] > 0
+                         else '更差' if result['significant']
+                         else '测不出显著差异')
+    return result
