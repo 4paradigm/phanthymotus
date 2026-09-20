@@ -268,7 +268,7 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
-            if self.path.split("?")[0] == "/sse":
+            if self.path.split("?")[0] == "/mcp/sse":
                 # SSE streaming endpoint for ACP completion events
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")

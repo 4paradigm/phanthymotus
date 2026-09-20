@@ -90,7 +90,7 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 | | |
 |---|---|
 | MCP HTTP | `http://<host>:15730/mcp` |
-| SSE（ACP 完成事件） | `http://<host>:15730/sse` |
+| SSE（ACP 完成事件） | `http://<host>:15730/mcp/sse` |
 | 容器 | `embodied-actucore` |
 | 镜像 | `<registry>/<namespace>/actucore:<tag>` |
 | 注册类别 | `actucore` |
