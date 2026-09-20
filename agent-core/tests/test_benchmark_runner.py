@@ -53,6 +53,22 @@ def canvas():
 
 @pytest.fixture
 def registry(monkeypatch):
+    # 层（category）记在注册表那一份里，不在运行时 map —— 真机上就是这么分的。
+    monkeypatch.setitem(config.main, 'services', {'mcp': [
+        {'id': 'mcp-sim', 'server_name': 'simulator-generic', 'category': 'driver'},
+        {'id': 'mcp-real', 'server_name': 'x-humanoid-tianyi', 'category': 'driver'},
+        {'id': 'mcp-perc', 'server_name': 'perception-bundle', 'category': 'perception'},
+        {'id': 'agentcore', 'server_name': 'AgentCore', 'category': 'controller',
+         'transport': 'internal'},
+    ]})
+    monkeypatch.setitem(mcp_client.registry, 'mcp-perc', {
+        'online': True, 'name': 'Perception Stack',
+        'tool_meta': {'mcp__mcp-perc__tts': {'type': 'actuator'}},
+    })
+    monkeypatch.setitem(mcp_client.registry, 'agentcore', {
+        'online': True, 'name': 'AgentCore',
+        'tool_meta': {'mcp__agentcore__decision_core': {'type': 'controller'}},
+    })
     monkeypatch.setitem(mcp_client.registry, 'mcp-sim', {
         'online': True, 'name': 'simulator', 'server_name': 'simulator-generic',
         'category': 'driver',
@@ -98,6 +114,24 @@ def test_a_real_robots_sensor_does_not_block_the_run(canvas, registry):
 
 def test_the_simulators_own_actuators_are_fine(canvas, registry):
     canvas(card('mcp-sim', 'loco'))
+
+    assert benchmark_runner.unsafe_cards('mcp-sim') == []
+
+
+def test_agent_cores_own_pseudo_devices_never_block_a_run(canvas, registry):
+    """Orin6 上抓到的：`decision_core` 被判成「会动的真实设备」，于是任何用例都跑不了。
+
+    它按定义在每张画布上 —— 它就是被测的那个系统，不是一台会走起来的机器。这条闸
+    要是把它算进去，就只剩一个永远亮着的红灯。"""
+    canvas(card('agentcore', 'decision_core'), card('agentcore', 'remote_message'))
+
+    assert benchmark_runner.unsafe_cards('mcp-sim') == []
+
+
+def test_a_perception_tool_does_not_block_a_run(canvas, registry):
+    """同一次跑动里抓到的第二条：perception 的 `tts` 申报 actuator，但它不驱动任何
+    东西 —— 层比类型更有发言权，而层原先读的是一个从来没人写过的字段。"""
+    canvas(card('mcp-perc', 'tts'))
 
     assert benchmark_runner.unsafe_cards('mcp-sim') == []
 

@@ -61,11 +61,18 @@ def unsafe_cards(simulator_mcp_id: str) -> list[dict]:
     from peer.tools import is_read_only
 
     layout = config.main.get('canvas_layout') or {}
+    internal = {m.get('id') for m in (config.main.get('services', {}).get('mcp') or [])
+                if m.get('transport') == 'internal'}
     unsafe = []
     for card in layout.get('cards') or []:
         mcp_id = card.get('mcpId', '')
         tool = card.get('toolName', '')
         if not mcp_id or not tool or mcp_id == simulator_mcp_id:
+            continue
+        # agent-core 自己的伪设备（`decision_core`、`remote_message`、channel）不是
+        # 会动的东西 —— 它们是被测的那个系统。`decision_core` 按定义在每张画布上，
+        # 把它算进来，任何用例都跑不了，这条闸就只剩一个永远亮着的红灯。
+        if mcp_id in internal:
             continue
         if is_read_only(f'mcp__{mcp_id}__{tool}'):
             continue
