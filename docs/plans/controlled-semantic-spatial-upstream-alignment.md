@@ -126,3 +126,8 @@ _pending_started 计时。复核自动合并的 Solution test 段与运行中写
 其他用例遗留的全局 services 配置。为模拟驱动 fixture 隔离 services/core 配置后，
 Core 1245 passed / 1 deselected / 11 subtests；Web 78 passed。未改运行逻辑
 掩盖失败。旧 head 0221694 的 BOT 因上游冲突终止，须以新 head 重新申请。
+
+87682b8 三镜像构建成功、ActuCore 容器 437 项通过；Core 容器 12 项失败均在
+上游新增 interrupt_all_fallback 测试的 patch 目标解析阶段，Python 3.10 将
+event.llm 解析为包导出的 Event 实例而非同名模块。改为 import_module 后
+patch.object 明确目标，保留全部断言，不修改运行代码；由后续容器复验确认。
