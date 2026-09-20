@@ -511,6 +511,18 @@ async def run_timeline(run_id: str):
     }
 
 
+def _trigger_of(triggers: list) -> str:
+    """这一轮是被什么唤醒的。
+
+    优先挑**人说的那句话**：`<status …>` 是每轮都会附上的环境快照，几百字，拿它当
+    「触发」既占满一屏又什么都没说。只有状态快照时才退回去，压成一行。
+    """
+    spoken = [t for t in triggers if not t.lstrip().startswith('<status')]
+    if spoken:
+        return spoken[0][:200]
+    return '（状态刷新）' if triggers else ''
+
+
 def _agent_track(session_id: str, started, ended) -> list:
     """这次跑动期间 agent 说了什么、调了什么。
 
@@ -544,12 +556,12 @@ def _agent_track(session_id: str, started, ended) -> list:
             continue          # 整轮都结束在跑动之前
         if window_to is not None and at and at > window_to:
             continue          # 整轮都开始在跑动之后
-        says, calls, trigger = [], [], ''
+        says, calls, triggers = [], [], []
         for message in turn.get('messages') or []:
             role = message.get('role')
             content = message.get('content')
-            if role == 'user' and isinstance(content, str) and not trigger:
-                trigger = content[:200]
+            if role == 'user' and isinstance(content, str) and content.strip():
+                triggers.append(content.strip())
             elif role == 'assistant':
                 if isinstance(content, str) and content.strip():
                     says.append(content.strip())
@@ -564,14 +576,24 @@ def _agent_track(session_id: str, started, ended) -> list:
         # `created_at` 留在几天前，内容却是刚刚写的。真机上因此排出了「第 11 轮
         # +-277189.7s」这种时间。最后写入的时刻才是这轮真正发生的时刻。
         written = turn.get('updated_at') or at
+        offset = round(written - float(started), 1) if (started and written) else None
+        # 落在本轮跑动窗口之外的时间**不显示**。
+        #
+        # 一轮可能在跑动之前起头、在跑动之后还在被追写（真机上见过一轮 `updated_at`
+        # 在跑动结束 26 分钟之后）。那种情况下两个时间戳都不在窗口里，排出来的
+        # 「+1980s」放在一次 7 分钟的跑动里，是个看起来精确的假数。宁可不给数。
+        duration = (float(ended) - float(started)) if (started and ended) else None
+        outside = (offset is not None and duration is not None
+                   and not (-5 <= offset <= duration + 5))
         # 轮号从**这次跑动**数起，不用会话里的序号 —— 打开的是一次跑动的现场，
         # 第一轮却写着「第 11 轮」，读的人会以为前面漏了十轮。会话里的序号留在
         # `sessionTurn`，要和历史面板对照时还用得上。
         track.append({
             'turn': len(track),
             'sessionTurn': index,
-            'at': round(written - float(started), 1) if (started and written) else None,
-            'trigger': trigger, 'says': says, 'calls': calls,
+            'at': None if outside else offset,
+            'timing': 'outside' if outside else 'exact',
+            'trigger': _trigger_of(triggers), 'says': says, 'calls': calls,
         })
     return track
 

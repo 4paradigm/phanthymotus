@@ -8947,6 +8947,8 @@ html, body {
 /* 会话里的轮号只在和这次跑动的轮号不同时出现 —— 要和历史面板对照时用得上，
    平时不该占视线。 */
 .bm-tl-session { margin-left: 8px; color: var(--text-dim); opacity: .75; }
+/* 一轮跨出了跑动窗口就不给秒数 —— 一个看起来精确的假数比没有数更糟。 */
+.bm-tl-nowhen { color: var(--yellow); font-style: normal; opacity: .8; }
 /* 触发这一轮的那句话是人说的 —— 排成一句话，不排成一个字段。 */
 .bm-tl-trigger { margin: 3px 0; font-size: 12px; line-height: 1.5; color: var(--text); }
 .bm-tl-says { margin: 3px 0; font-size: 12px; line-height: 1.55; color: var(--text-muted); }

@@ -564,3 +564,65 @@ def test_turns_are_numbered_from_the_start_of_this_run(monkeypatch):
 
     assert agent[0]['turn'] == 0
     assert agent[0]['sessionTurn'] == 10
+
+
+def test_a_time_outside_the_run_window_is_not_shown(monkeypatch):
+    """真机上排出过「+1980s」——一次 7 分钟的跑动里，33 分钟处的一轮。
+
+    一轮可能在跑动之前起头、在跑动之后还在被追写，两个时间戳都不在窗口里。那种情况
+    宁可不给数，也不给一个看起来精确的假数。
+    """
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=?, ended_at=? WHERE id=?',
+                 ('s1', stored['started_at'] + 420, run_id))
+    conn.commit()
+
+    import chat_history
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': stored['started_at'] - 100,
+        'updated_at': stored['started_at'] + 1980,      # 跑动结束 26 分钟之后还在追写
+        'messages': [{'role': 'assistant', 'content': '地图可用了'}]}])
+
+    turn = asyncio.run(benchmark.run_timeline(run_id))['agent'][0]
+
+    assert turn['at'] is None
+    assert turn['timing'] == 'outside'
+    assert turn['says'] == ['地图可用了']       # 内容照常给，只是不编时间
+
+
+def test_the_trigger_prefers_what_a_person_said(monkeypatch):
+    """`<status …>` 是每轮都附的环境快照，几百字。拿它当「触发」既占满一屏，
+    又什么都没说。"""
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?', ('s1', run_id))
+    conn.commit()
+
+    import chat_history
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': stored['started_at'], 'updated_at': stored['started_at'] + 3,
+        'messages': [
+            {'role': 'user', 'content': '<status time="2026-09-20"> <active_tasks>…'},
+            {'role': 'user', 'content': '先等一下，我想先看看那边那个算力工厂'},
+        ]}])
+
+    assert asyncio.run(benchmark.run_timeline(run_id))['agent'][0]['trigger'] \
+        == '先等一下，我想先看看那边那个算力工厂'
+
+
+def test_a_turn_woken_only_by_a_status_refresh_says_so(monkeypatch):
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?', ('s1', run_id))
+    conn.commit()
+
+    import chat_history
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': stored['started_at'], 'updated_at': stored['started_at'] + 3,
+        'messages': [{'role': 'user', 'content': '<status time="2026-09-20">…</status>'}]}])
+
+    assert asyncio.run(benchmark.run_timeline(run_id))['agent'][0]['trigger'] == '（状态刷新）'

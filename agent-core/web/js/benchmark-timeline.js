@@ -120,7 +120,8 @@ function _turn(t) {
       <span class="bm-tl-args">${_esc(c.args)}</span></div>`).join('');
   return `
     <div class="bm-tl-turn">
-      <div class="bm-tl-when">${t.at == null ? '' : `+${t.at}s`}　第 ${t.turn + 1} 轮${
+      <div class="bm-tl-when">${t.at == null
+        ? '<i class="bm-tl-nowhen">时间落在本轮之外</i>　' : `+${t.at}s　`}第 ${t.turn + 1} 轮${
         t.sessionTurn != null && t.sessionTurn !== t.turn
           ? `<span class="bm-tl-session">会话内第 ${t.sessionTurn + 1} 轮</span>` : ''}</div>
       ${t.trigger ? `<div class="bm-tl-trigger">“${_esc(t.trigger)}”</div>` : ''}
