@@ -809,13 +809,17 @@ _NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任
 - 口语，会被直接念出来。不要 markdown、编号、括号注释、工具名、文件路径。
 - 一两句话，把事情说清楚就停。**不要为了短而把名字、地点砍掉或缩写** —— 说完整的
   名字比省几个字重要。
-- **不要说时长。** 你拿不到"这件事做了多久"这个数，过程记录里也没有。说"已经进行了
-  多少秒/分钟"一定是编的。
+- **时长只能用下面「当前等待」里给出的数，一个字都不要自己算。** 过程记录里那些
+  时间戳不是拿来做减法的 —— 真机上照着它们算，算出过"大约等了 25 秒"这种数。
+  「当前等待」里没有的，就别提时长。
 - 用用户的语言。
 - 只说过程记录里**真实发生过**的事，没查到的别编。
 {last}
 如果过程记录里确实还没有任何具体进展（比如刚开始、还没拿到任何结果），
 只输出 SKIP 三个字母 —— 这种时候沉默比说一句空话好。
+
+当前等待（这是唯一可靠的时长来源）：
+{waiting}
 
 过程记录：
 {context}
@@ -928,6 +932,12 @@ def _stop_countdown() -> None:
     _silence_countdown = None
 
 
+# 沉默是从哪一刻开始的。播报要说「已经等了多久」，这是唯一说得准的那个数 ——
+# 播报那次 LLM 调用看不到当前时刻，让它自己从历史时间戳里凑，凑出来的就是天轶上
+# 那句「大约等了 25 秒」。
+_silence_since: float | None = None
+
+
 def _start_countdown() -> None:
     """开始计时；**已在计时则不动**（不把正在跑的 deadline 往后推）。"""
     global _silence_countdown
@@ -943,7 +953,8 @@ def _restart_countdown() -> None:
 
 
 def _spawn_countdown() -> None:
-    global _silence_countdown
+    global _silence_countdown, _silence_since
+    _silence_since = time.time()      # 用户从这一刻起没再听到任何东西
     _, seconds_thr = _narration_thresholds()
     if seconds_thr <= 0:
         _silence_countdown = None
@@ -1098,8 +1109,30 @@ def _build_narration_messages(*, frozen_system: dict, context: str,
     last = (f'- 不要重复你上次已经播报过的：「{last_report_text}」' if last_report_text else '')
     return [
         frozen_system,
-        {'role': 'user', 'content': _NARRATION_PROMPT.format(last=last, context=context)},
+        {'role': 'user', 'content': _NARRATION_PROMPT.format(
+            last=last, context=context, waiting=_waiting_facts())},
     ]
+
+
+def _waiting_facts() -> str:
+    """这一刻等了多久、在等什么 —— 由框架算好交给模型。
+
+    模型没有别的办法拿到这个数：播报那次调用里既没有当前时刻，也没有 pending 列表，
+    过程记录里只有几条历史时间戳。让它自己减，就减出了「大约等了 25 秒」。
+    """
+    lines = []
+    if _silence_since is not None:
+        lines.append(f'- 距你上次开口：{int(time.time() - _silence_since)} 秒')
+    try:
+        import mcp_client
+        for wait in mcp_client.pending_waits()[:3]:
+            tool = wait['tool'] or '某个动作'
+            lines.append(f'- 正在等 {tool} 完成：已等 {wait["seconds"]} 秒')
+    except Exception:
+        pass
+    if not lines:
+        return '（这一刻没有在等任何东西，也就没有"等了多久"可说）'
+    return '\n'.join(lines)
 
 
 # ── Tiered Retention helpers ──────────────────────────────────────────────────
