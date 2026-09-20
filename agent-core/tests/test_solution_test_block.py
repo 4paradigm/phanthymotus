@@ -43,9 +43,12 @@ def payload(test=TEST_BLOCK):
 
 @pytest.fixture
 def simulator(monkeypatch):
+    # 名字写进注册表，在线写进运行时 map —— 真机上就是这么分的两份。往 registry
+    # 条目里塞 server_name 会把「名字该从哪儿查」这个 bug 遮住（Orin6 上抓到过）。
+    monkeypatch.setitem(config.main, 'services', {'mcp': [
+        {'id': 'mcp-sim', 'name': '仿真器', 'server_name': 'simulator-generic'}]})
     monkeypatch.setitem(mcp_client.registry, 'mcp-sim', {
         'url': 'http://localhost:15711/mcp', 'online': True,
-        'server_name': 'simulator-generic',
         'tools': ['nav', 'tts', 'sim_scenario', 'sim_report'],
     })
     maps = {'maps': [{'name': 'bj-2f'}]}
