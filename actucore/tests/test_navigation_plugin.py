@@ -238,10 +238,7 @@ class NavigationContractTest(unittest.TestCase):
             [item["port"] for item in tool["topic_out"]],
             [
                 "map_view",
-                "status",
-                "collection_status",
-                "velocity_proposal",
-                "costmap",
+                "motion_sequence",
             ],
         )
         auxiliary = {item["port"]: item for item in tool["topic_aux"]}
@@ -272,6 +269,23 @@ class NavigationContractTest(unittest.TestCase):
         ):
             self.assertIn(action, actions)
         self.assertNotIn("x-execution-control", tool)
+
+    def test_motion_sequence_keeps_driver_wire_contract(self):
+        from plugins.navigation.planning.contract import nav2_tool_definition
+
+        for namespace in ("ubuntu", "robot"):
+            with self.subTest(namespace=namespace):
+                tool = navigation_tool_definition(namespace)
+                motion = tool["topic_out"][1]
+                proposal = next(
+                    item for item in nav2_tool_definition(namespace)["topic_out"]
+                    if item["port"] == "velocity_proposal"
+                )
+                self.assertEqual(motion, {**proposal, "port": "motion_sequence"})
+                self.assertEqual(
+                    motion["topic"], f"/{namespace}/navigation/nav2/velocity_proposal"
+                )
+                self.assertEqual(motion["schema"], "phanthy.navigation.velocity_proposal.v1")
 
     def test_unified_action_schema_only_exposes_supported_fields(self):
         tool = navigation_tool_definition("ubuntu")

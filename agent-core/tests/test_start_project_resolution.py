@@ -421,3 +421,33 @@ def test_port_bindings_survive_dependency_order_and_use_live_topics(driver, monk
         {'port': 'imu', 'topic': '/remote_control/message'},
     ]
     assert 'input_topics' not in driver.starts['nav']
+
+
+@pytest.mark.parametrize('live', [False, True])
+def test_navigation_selects_standard_outputs_of_consolidated_sensor_cards(live):
+    """Select the wired output, even when legacy outputs occupy slot zero."""
+    nav = _card('nav', 'ControlledSemanticSpatial')
+    ports = ['lidar', 'imu', 'rgb', 'depth_frame']
+    nav['topicIn'] = [{'port': port} for port in ports]
+    sources = [
+        ('lidar_cloud', ['/legacy/lidar', '/ubuntu/navigation/lidar'], 1),
+        ('lidar_imu', ['/ubuntu/navigation/imu'], 0),
+        ('camera_rgb', ['/legacy/jpeg', '/ubuntu/camera/rgb_frame'], 1),
+        ('camera_depth', ['/legacy/depth', '/ubuntu/camera/depth_frame'], 1),
+    ]
+    cards, connections, resolved, expected = [nav], [], {}, []
+    for target_idx, (name, topics, source_idx) in enumerate(sources):
+        outputs = [{'topic': topic} for topic in topics]
+        cards.append(_card(name, name, outputs if not live else [{'topic': '/stale'}]))
+        if live:
+            resolved[name] = outputs
+        connection = _conn(name, 'nav', '/stale/fallback')
+        connection.update(fromPortIdx=str(source_idx), toPortIdx=str(target_idx))
+        connections.append(connection)
+        expected.append({'port': ports[target_idx], 'topic': topics[source_idx]})
+    single, topics, bindings = config_api._resolve_processor_inputs(
+        nav, connections, cards, resolved,
+    )
+    assert single == ''
+    assert bindings == expected
+    assert topics == [item['topic'] for item in expected]

@@ -7,7 +7,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -35,6 +36,7 @@ from fast_livo2.camera_rgb_frame import (  # noqa: E402
 )
 from plugins.navigation.mapping.collection_postprocess import (  # noqa: E402
     CollectionPreviewWorker,
+    RosCollectionController,
     CollectionPostprocessManager,
     LiveCollectionSynchronizer,
     OfflineAnnotationProcessor,
@@ -721,6 +723,53 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
 
             self.assertEqual(manager.snapshot()["postprocess"]["state"], "complete")
             self.assertEqual(FlakyProcessor.calls, 2)
+
+
+class CollectionControllerTrafficTest(unittest.TestCase):
+    def test_only_diagnostics_are_published_and_export_still_receives_status(self):
+        node = Mock()
+        executor = Mock()
+        manager = Mock()
+        manager.snapshot.return_value = {"postprocess": {"state": "complete"}}
+        manager.enqueue_receipt.return_value = True
+        modules = {
+            "rclpy.node": SimpleNamespace(Node=Mock(return_value=node)),
+            "rclpy.qos": SimpleNamespace(
+                DurabilityPolicy=SimpleNamespace(TRANSIENT_LOCAL=1),
+                HistoryPolicy=SimpleNamespace(KEEP_LAST=1),
+                ReliabilityPolicy=SimpleNamespace(RELIABLE=1),
+                QoSProfile=Mock(),
+            ),
+            "std_msgs.msg": SimpleNamespace(String=SimpleNamespace),
+        }
+        with patch.dict(sys.modules, modules), patch(
+            "plugins.navigation.mapping.collection_postprocess.CollectionPostprocessManager",
+            return_value=manager,
+        ), patch(
+            "plugins.navigation.mapping.collection_postprocess.CollectionPreviewWorker",
+            side_effect=AssertionError("preview worker must not start"),
+        ):
+            controller = RosCollectionController("unused", "robot", executor)
+            self.assertEqual(node.create_publisher.call_count, 1)
+            self.assertEqual(node.create_publisher.call_args.args[1],
+                             "/robot/navigation/fast_livo2/collection_status_json")
+            self.assertEqual(node.create_subscription.call_count, 1)
+            self.assertEqual(node.create_subscription.call_args.args[1],
+                             "/robot/navigation/fast_livo2/collection_status_raw")
+            executor.add_node.assert_called_once_with(node)
+            raw = {"session_id": "recording-1", "state": "recording"}
+            controller._on_raw(SimpleNamespace(data=json.dumps(raw)))
+            manager.update_raw_status.assert_called_once_with(raw)
+            controller._on_raw(SimpleNamespace(data="invalid json"))
+            self.assertEqual(manager.update_raw_status.call_count, 1)
+            controller.set_runtime_active(False)
+            manager.set_runtime_active.assert_called_once_with(False)
+            receipt = {"session_id": "recording-1"}
+            self.assertTrue(controller.enqueue_receipt(receipt))
+            manager.enqueue_receipt.assert_called_once_with(receipt)
+            controller._publish()
+            message = node.create_publisher.return_value.publish.call_args.args[0]
+            self.assertEqual(json.loads(message.data), manager.snapshot.return_value)
 
 
 if __name__ == "__main__":

@@ -111,7 +111,8 @@ _MANIFEST = {
                 "header.stamp_ns / timing.source_stamp_ns in the PSE1 envelope"
             ),
             "desc": (
-                "Driver RGB JPEG with source time, calibration and LiDAR-to-camera "
+                "Connect the RGB PSE1 output of Driver camera_rgb, not its plain JPEG output. "
+                "Requires source time, calibration and LiDAR-to-camera "
                 "extrinsics; shared by semantic navigation and data collection"
             ),
         },

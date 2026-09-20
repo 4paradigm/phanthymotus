@@ -81,7 +81,6 @@ cloud、静态累计和 Nav2 输入全部 fail-closed。
 | `obstacle_map`      | `/ubuntu/navigation/obstacle_map`                 | `map`              | 累计静态障碍的兼容诊断投影                |
 | `map_view`          | `/ubuntu/navigation/fast_livo2/map_view`          | `map`              | Canvas 累计静态点、最新实时点和机器人位置            |
 | `status`            | `/ubuntu/navigation/fast_livo2/status`            | JSON               | 算法进程、输入 freshness、frame 和产物状态 |
-| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_preview` | JPEG               | 最新同步 RGB、采集帧号和 LiDAR 障碍物距离标注     |
 
 adapter 先按 `0.10 m` 体素把同一帧命中去重；导航高度带和有效距离内的体素
 首次出现即写入累计静态图，不等待多帧确认、不跟踪动态分量，也不通过后续
@@ -357,20 +356,10 @@ cloud，二者仍各自按 `0.5 s` source age 拒绝过期输出。
 `.partial`；Canvas 正常停止、rosbag2 完成 flush 且 receipt 写入后才原子改为
 最终目录。异常退出会保留 `.partial`，不会冒充完整数据。
 
-Canvas 公共 `/ubuntu/navigation/fast_livo2/collection_preview` 输出图像；它与旧的
-`collection_status` String topic 使用不同名称，避免 ROS topic 在版本升级后
-同名异型。该图像端口不再输出日志式 JSON，而是输出最新一帧已对齐的 RGB 预览：
-顶部显示采集帧号，图中按现有离线
-算法投影 LiDAR 可见最近点，并在对应像素标出障碍物距离。预览只消费采样器已经
-生成的 1 Hz 录制快照，后台采用 latest-only 队列，不会提高录制频率或阻塞
-FAST-LIVO2/Nav2 回调。RGB 会在有界队列中等待随后到达的 Depth、LiDAR、IMU
-和 Odom；任一路新数据都可完成匹配，因此合法快照不依赖 ROS 回调到达顺序。
-
-停止智能控制并完成 MCAP 原子收口后，同一 `collection_status` 图像端口自动
-切换为本体离线导出进度卡；显示 session、阶段、已处理/总帧数、百分比、
-RGB/JSON、Depth PNG、LiDAR PCD 产物数以及暂停或失败原因。`complete`、
-`degraded`、`error` 终态采用 transient-local 保留，下一次采集产生新预览后
-再被替换，不需要额外动作或新的 Canvas 连接点。
+已停止发布 `/ubuntu/navigation/fast_livo2/collection_preview`。数采控制器不再
+创建 JPEG publisher、五路预览订阅或后台预览渲染线程，也不再生成导出进度图片。
+录制采样与 MCAP 写入由 runtime supervisor 继续负责；停止后 receipt 仍交给
+离线导出管理器处理，导出结果和失败原因通过 `info` 与内部 JSON 诊断读取。
 
 完整机器诊断继续保留在卡片原有
 `/ubuntu/navigation/fast_livo2/status` 的 `collection` 字段，并额外发布到内部
@@ -451,11 +440,13 @@ MCAP/ROS 工具再手工解包：
 
 ## 统一卡片连线与构建
 
-Canvas 把 Driver `navigation_lidar`、`navigation_imu` 和 PSE1 相机 `rgb` 接到公开
+Canvas 把 Driver `lidar_cloud` 的标准 PointCloud2、`lidar_imu` 和
+`camera_rgb` 的 RGB PSE1 输出接到公开
 `ControlledSemanticSpatial` 卡片；语义导航和数采共用这一路 RGB，启用完整数采时再连接可选的
-`depth_frame`。`livo_odom`、registered cloud、obstacle map 都在同一容器内
-交给 planning/semantic 模块。`collection_status` 是唯一新增的只读公共诊断
-输出，用于直接查看数采是否正常及失败原因。
+`camera_depth` 的 Depth PSE1 输出到 `depth_frame`。原机身 `imu` 不能替代 `lidar_imu`。
+`livo_odom`、registered cloud、obstacle map 都在同一容器内
+交给 planning/semantic 模块。数采预览已停发，机器诊断仍由内部 topic 提供，
+统一卡片仅公开 `map_view` 与 `motion_sequence` 两个输出。
 
 本模块随统一镜像构建，版本和许可证见
 [`../runtime/FAST_LIVO2_THIRD_PARTY.md`](../runtime/FAST_LIVO2_THIRD_PARTY.md)。

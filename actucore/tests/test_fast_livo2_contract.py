@@ -59,7 +59,6 @@ class FastLivo2ContractTest(unittest.TestCase):
                 "static_map",
                 "map_view",
                 "status",
-                "collection_status",
             },
         )
         self.assertEqual(outputs["livo_odom"]["frame_id"], "map -> base_link")
@@ -76,19 +75,6 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(outputs["static_map"]["frame_id"], "map")
         self.assertEqual(outputs["map_view"]["schema"], "phanthy.navigation.map_view.v1")
-        self.assertEqual(
-            outputs["collection_status"]["topic"],
-            "/ubuntu/navigation/fast_livo2/collection_preview",
-        )
-        self.assertEqual(outputs["collection_status"]["format"], "image/jpeg")
-        self.assertEqual(
-            outputs["collection_status"]["ros_type"],
-            "sensor_msgs/msg/CompressedImage",
-        )
-        self.assertEqual(
-            outputs["collection_status"]["schema"],
-            "phanthy.navigation.collection_preview.v1",
-        )
         config = tool["configSchema"]["properties"]
         self.assertEqual(config["obstacle_min_height_m"]["default"], -0.30)
         self.assertEqual(config["obstacle_max_height_m"]["default"], 0.30)

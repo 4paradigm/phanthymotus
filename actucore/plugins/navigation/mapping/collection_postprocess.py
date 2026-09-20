@@ -1623,24 +1623,15 @@ class DisabledCollectionController:
 
 
 class RosCollectionController:
-    """Publish a human-readable Canvas preview and retain machine diagnostics."""
+    """Retain collection export and machine diagnostics without preview traffic."""
 
     def __init__(self, root_directory: str, namespace: str, executor):
-        from fast_livo2.camera_depth_frame import decode as decode_depth_frame
-        from fast_livo2.camera_rgb_frame import decode as decode_rgb_frame
-        from fast_livo2.vectorized_cloud import decode_xyz_array
-        from nav_msgs.msg import Odometry
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-        from sensor_msgs.msg import CompressedImage, Imu, PointCloud2
-        from std_msgs.msg import String, UInt8MultiArray
+        from std_msgs.msg import String
 
         root = f"/{namespace.strip('/')}"
         self._String = String
-        self._CompressedImage = CompressedImage
-        self._decode_depth_frame = decode_depth_frame
-        self._decode_rgb_frame = decode_rgb_frame
-        self._decode_xyz_array = decode_xyz_array
         self._node = Node("navigation_collection_status")
         status_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -1648,28 +1639,7 @@ class RosCollectionController:
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        preview_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        record_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
         self._manager = CollectionPostprocessManager(root_directory)
-        self._synchronizer = LiveCollectionSynchronizer()
-        self._preview_worker = CollectionPreviewWorker()
-        self._last_preview_serial = -1
-        self._last_progress_signature: str | None = None
-        self._preview_publisher = self._node.create_publisher(
-            CompressedImage,
-            f"{root}/navigation/fast_livo2/collection_preview",
-            preview_qos,
-        )
         self._diagnostics_publisher = self._node.create_publisher(
             String,
             f"{root}/navigation/fast_livo2/collection_status_json",
@@ -1681,28 +1651,6 @@ class RosCollectionController:
             self._on_raw,
             status_qos,
         )
-        record_topics = {
-            "lidar": (f"{root}/navigation/collection/lidar", PointCloud2),
-            "imu": (f"{root}/navigation/collection/imu", Imu),
-            "rgb_frame": (
-                f"{root}/navigation/collection/camera/rgb",
-                UInt8MultiArray,
-            ),
-            "depth_frame": (
-                f"{root}/navigation/collection/camera/depth",
-                UInt8MultiArray,
-            ),
-            "odom": (f"{root}/navigation/collection/odom", Odometry),
-        }
-        self._record_subscriptions = [
-            self._node.create_subscription(
-                message_type,
-                topic,
-                lambda message, source=kind: self._on_record(source, message),
-                record_qos,
-            )
-            for kind, (topic, message_type) in record_topics.items()
-        ]
         self._timer = self._node.create_timer(1.0, self._publish)
         executor.add_node(self._node)
 
@@ -1712,145 +1660,13 @@ class RosCollectionController:
         except (TypeError, ValueError):
             return
         self._manager.update_raw_status(value)
-        session_id = value.get("session_id")
-        if isinstance(session_id, str) and session_id:
-            previous = self._synchronizer.session_id
-            self._synchronizer.update_session(session_id)
-            if previous != session_id:
-                self._preview_worker.reset()
-
-    @staticmethod
-    def _header_stamp_ns(message) -> int:
-        stamp = message.header.stamp
-        value = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
-        if value <= 0:
-            raise PostprocessError("collection_preview_source_stamp_missing")
-        return value
-
-    def _normalize_record(self, kind: str, message) -> dict:
-        if kind == "rgb_frame":
-            metadata, jpeg = self._decode_rgb_frame(bytes(message.data))
-            return {
-                "kind": kind,
-                "stamp_ns": int(metadata["source_stamp_ns"]),
-                "metadata": metadata,
-                "jpeg": jpeg,
-            }
-        if kind == "depth_frame":
-            metadata, depth = self._decode_depth_frame(bytes(message.data))
-            return {
-                "kind": kind,
-                "stamp_ns": int(metadata["source_stamp_ns"]),
-                "frame_id": str(metadata["frame_id"]),
-                "metadata": metadata,
-                "depth": depth,
-            }
-        stamp_ns = self._header_stamp_ns(message)
-        if kind == "lidar":
-            return {
-                "kind": kind,
-                "stamp_ns": stamp_ns,
-                "frame_id": str(message.header.frame_id),
-                "points": self._decode_xyz_array(
-                    fields=message.fields,
-                    data=bytes(message.data),
-                    point_step=int(message.point_step),
-                    row_step=int(message.row_step),
-                    width=int(message.width),
-                    height=int(message.height),
-                    is_bigendian=bool(message.is_bigendian),
-                    max_points=200_000,
-                    max_data_bytes=64 * 1024 * 1024,
-                ),
-            }
-        if kind == "imu":
-            return {
-                "kind": kind,
-                "stamp_ns": stamp_ns,
-                "gravity": np.asarray(
-                    (
-                        message.linear_acceleration.x,
-                        message.linear_acceleration.y,
-                        message.linear_acceleration.z,
-                    ),
-                    dtype=np.float64,
-                ),
-            }
-        pose = message.pose.pose
-        transform = np.eye(4, dtype=np.float64)
-        transform[:3, :3] = _quaternion_matrix(
-            pose.orientation.x,
-            pose.orientation.y,
-            pose.orientation.z,
-            pose.orientation.w,
-        )
-        transform[:3, 3] = (
-            pose.position.x,
-            pose.position.y,
-            pose.position.z,
-        )
-        return {
-            "kind": kind,
-            "stamp_ns": stamp_ns,
-            "t_map_base": transform,
-        }
-
-    def _on_record(self, kind: str, message) -> None:
-        try:
-            record = self._normalize_record(kind, message)
-            ready = self._synchronizer.observe(record)
-        except Exception as exc:
-            self._preview_worker.record_failure(exc)
-            return
-        if ready is not None:
-            frame_number, bundle = ready
-            self._preview_worker.submit(frame_number, bundle)
 
     def _publish(self) -> None:
-        preview = self._preview_worker.snapshot()
-        diagnostics = {
-            **self._manager.snapshot(),
-            "preview": {
-                key: value for key, value in preview.items() if key != "jpeg"
-            },
-        }
-        diagnostics_message = self._String()
-        diagnostics_message.data = json.dumps(
-            diagnostics, ensure_ascii=False, separators=(",", ":")
+        message = self._String()
+        message.data = json.dumps(
+            self.snapshot(), ensure_ascii=False, separators=(",", ":")
         )
-        self._diagnostics_publisher.publish(diagnostics_message)
-        if collection_public_mode(diagnostics) == "progress":
-            progress = diagnostics["postprocess"]
-            signature = json.dumps(
-                progress, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
-            if signature == self._last_progress_signature:
-                return
-            try:
-                payload = render_collection_progress(progress)
-            except Exception as exc:
-                self._preview_worker.record_failure(exc)
-                return
-            self._last_progress_signature = signature
-            self._publish_jpeg(payload, "collection_export_progress")
-            return
-        self._last_progress_signature = None
-        serial = int(preview["serial"])
-        if serial == self._last_preview_serial:
-            return
-        self._last_preview_serial = serial
-        payload = preview.get("jpeg")
-        if not payload:
-            return
-        self._publish_jpeg(payload, "camera_color_optical_frame")
-
-    def _publish_jpeg(self, payload: bytes, frame_id: str) -> None:
-        message = self._CompressedImage()
-        message.header.stamp = self._node.get_clock().now().to_msg()
-        message.header.frame_id = frame_id
-        message.format = "jpeg"
-        message.data = bytes(payload)
-        self._preview_publisher.publish(message)
+        self._diagnostics_publisher.publish(message)
 
     def set_runtime_active(self, active: bool) -> None:
         self._manager.set_runtime_active(active)
@@ -1862,13 +1678,7 @@ class RosCollectionController:
         self._manager.update_root(root_directory)
 
     def snapshot(self) -> dict:
-        preview = self._preview_worker.snapshot()
-        return {
-            **self._manager.snapshot(),
-            "preview": {
-                key: value for key, value in preview.items() if key != "jpeg"
-            },
-        }
+        return self._manager.snapshot()
 
 
 def build_collection_controller(root_directory: str, namespace: str, executor):

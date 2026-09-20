@@ -24,10 +24,7 @@ NAVIGATION_PUBLIC_ACTIONS = NAVIGATION_LIFECYCLE_ACTIONS + NAVIGATION_ACTIONS
 CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME = "ControlledSemanticSpatial"
 NAVIGATION_PUBLIC_OUTPUT_PORTS = (
     "map_view",
-    "status",
-    "collection_status",
-    "velocity_proposal",
-    "costmap",
+    "motion_sequence",
 )
 
 
@@ -170,7 +167,8 @@ def navigation_tool_definition(namespace: str) -> dict:
                     "header.stamp_ns / timing.source_stamp_ns in the PSE1 envelope"
                 ),
                 "desc": (
-                    "Driver Z16 depth with scale, calibration, RGB alignment metadata, "
+                    "Connect the Depth PSE1 output of Driver camera_depth. "
+                    "Requires Z16 depth with scale, calibration, RGB alignment metadata, "
                     "and source time; required when collection_enabled=true"
                 ),
             },
@@ -186,6 +184,11 @@ def navigation_tool_definition(namespace: str) -> dict:
         str(item.get("port", "")): item
         for item in [*mapping["topic_out"], *planning["topic_out"]]
         if item.get("port")
+    }
+    # Public card name; retain the existing Driver wire contract.
+    component_outputs["motion_sequence"] = {
+        **component_outputs["velocity_proposal"],
+        "port": "motion_sequence",
     }
     outputs = [
         deepcopy(component_outputs[port]) for port in NAVIGATION_PUBLIC_OUTPUT_PORTS

@@ -223,7 +223,7 @@ shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互
 ## 统一卡片连线
 
 odom、registered cloud 和 static map 由 `NavigationPlugin` 固定为同容器
-内部 topic，不需要 Canvas 连线。Canvas 只需把公开 `velocity_proposal`
+内部 topic，不需要 Canvas 连线。Canvas 只需把公开 `motion_sequence`
 输出接到 Driver `loco.velocity_proposal`；可选 `goal_pose` 仍可作为外部输入。
 
 地图和实时位姿从统一卡片的 `map_view` 查看；`livo_odom` 只作为同容器内部
@@ -235,11 +235,8 @@ odom、registered cloud 和 static map 由 `NavigationPlugin` 固定为同容器
 FAST-LIVO2 三维点云的正上方平面投影，与 Nav2 的二维规划坐标直接对齐，
 不是新增的 occupancy grid。
 
-统一卡片的 costmap“查看数据流”打开二维导航视图：底图是规划器
-实际使用的 `/global_costmap/costmap`，红色是占据障碍，橙色是膨胀代价，
-绿色是当前 `/plan`，绿色箭头是 `map -> base_link` 位姿，橙色圆点是目标。
-该视图用来直接判断“目标在代价地图外”、“起点或终点落在膨胀区”和
-“障碍将可通行区切断”等无有效路径原因。
+统一卡片不再公开 costmap 输出端口。规划器仍使用
+`/global_costmap/costmap`，需要排障时可通过下述 RViz 流程检查。
 
 Canvas 的 odom/path/costmap 监控依赖 Agent Core 按原生 ROS 2 类型订阅
 `nav_msgs/msg/Odometry`、`nav_msgs/msg/Path` 和 `nav_msgs/msg/OccupancyGrid`；不得在同名 topic 上创建

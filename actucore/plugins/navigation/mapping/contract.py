@@ -210,7 +210,10 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "Driver-provided REP-103 sensor_frame",
                 "units": "x/y/z=m; timestamp=absolute ns",
                 "max_age_ms": 500,
-                "desc": "Rigid navigation cloud prepared by the Driver sensor adapter",
+                "desc": (
+                    "Connect the standard PointCloud2 output of Driver lidar_cloud; "
+                    "requires per-point timestamps in the navigation sensor frame"
+                ),
             },
             {
                 "port": "imu",
@@ -223,7 +226,10 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "same Driver-provided REP-103 sensor_frame as lidar",
                 "units": "linear_acceleration=m/s^2; angular_velocity=rad/s",
                 "max_age_ms": 500,
-                "desc": "Navigation IMU aligned with the LiDAR stream",
+                "desc": (
+                    "Connect Driver lidar_imu, aligned with the LiDAR stream; "
+                    "the body imu card is not a substitute"
+                ),
             },
         ],
         "topic_out": [
@@ -311,20 +317,6 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "schema": "phanthy.navigation.fast_livo2_status.v1",
                 "rate_hz": 1,
                 "desc": "Lifecycle, source freshness, frame validation and artifact status",
-            },
-            {
-                "port": "collection_status",
-                "topic": f"{root}/navigation/fast_livo2/collection_preview",
-                "format": "image/jpeg",
-                "ros_type": "sensor_msgs/msg/CompressedImage",
-                "qos": "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
-                "schema": "phanthy.navigation.collection_preview.v1",
-                "rate_hz": 1,
-                "desc": (
-                    "Latest synchronized RGB sample with its frame number and "
-                    "LiDAR nearest-visible-point distance markers while recording; "
-                    "switches to export progress after the card stops"
-                ),
             },
         ],
         "inputSchema": {

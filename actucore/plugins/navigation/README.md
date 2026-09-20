@@ -18,16 +18,15 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
                             ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
                                       |
-                                      `─ velocity_proposal -> Driver loco
+                                      `─ motion_sequence -> Driver loco
 ```
 
 - `NavigationPlugin` 是唯一 MCP/Canvas 生命周期所有者。
 - FAST-LIVO2 和 Nav2 ROS launch 由 `NavigationRuntime` 作为同容器子进程组
   启停；运行时不调用 Docker，也不需要 Docker socket。
 - odom、registered cloud 和 obstacle map 是卡片内部 ROS 边；
-  `collection_status` 作为只读公共图像输出，供 Canvas 查看最新同步 RGB、
-  当前采集帧号和 LiDAR 障碍物距离标注；停止后同一端口切换为离线导出
-  进度与失败原因。机器诊断保留在内部 JSON topic。
+  状态与 costmap 保留为内部 ROS topic，分别承担命令回执和导航目标校验。
+  数采预览 `collection_preview` 已停发，预览订阅和渲染也已移除；录制与离线导出保留。
 - VLN 命中地点后直接调用同卡片 planner；无论是 Canvas 还是 VLN 入口，
   planner 都为每个新任务生成独立
   `nav_id`。到达或手动停止时先发布一次终态零速 proposal，再确认
@@ -50,6 +49,24 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 | `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航，`collection_enabled=true` 时必需 |
 | `depth_frame` | `/ubuntu/camera/depth_frame` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE1` 封装中的深度尺度、标定与源时间戳 |
 | `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由 Agent Core `x-topic-actions` 转换为 `navigate_to_pose`，不生成独立监控卡片 |
+
+Driver 卡片合并后的连线：
+
+| Driver 卡片 | 选择的输出能力 | 本卡片输入 |
+| --- | --- | --- |
+| `lidar_cloud` | 带逐点时间戳的标准 `sensor_msgs/msg/PointCloud2` | `lidar` |
+| `lidar_imu` | 与 LiDAR 同时钟、同传感器坐标系的 `sensor_msgs/msg/Imu` | `imu` |
+| `camera_rgb` | RGB PSE1 自描述帧，`phanthy.sensor.camera_rgb_frame.v1` | `rgb` |
+| `camera_depth` | Depth PSE1 自描述帧，`phanthy.sensor.camera_depth_frame.v1` | `depth_frame` |
+
+原机身 `imu` 保持原用途，不能代替 `lidar_imu`。相机卡片原有 JPEG/深度输出
+不能代替 PSE1 输入。按输出的 topic、ROS 类型与 schema 选端口，不假定它是第一个输出。
+消费端不依赖来源卡片名称；实际 topic 由画布所选输出端口传入 runtime。
+本次以保留上述既有 topic/schema 为适配基线，新 Driver 的实际 `tools/list` 尚待联调核验。
+
+升级旧画布时，先停止智能控制，移除 `navigation_lidar`、`navigation_imu`、
+`camera_rgb_frame`、`camera_depth_frame` 四张旧卡片，添加或刷新上表卡片，
+重新连接对应输出并保存，再启动。不要只改卡片显示名称或沿用旧输出索引。
 
 这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
 `lidar` 和 `imu`。`goal_pose` 是可选的外部 topic action，不是启动时内部连线。
@@ -93,18 +110,21 @@ mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale
 
 ## 公共输出
 
+卡片只保留以下两个输出，顺序固定。`motion_sequence` 是公开端口名，
+其 ROS topic、消息 schema、5 Hz 频率和 TTL 保持原有 Driver 契约；
+它仍发送有界速度提案，不是新的批量轨迹协议。升级已有画布时，先停止智能控制，
+刷新卡片定义，再把原第 4 个输出的连线重接到第 2 个 `motion_sequence`，
+连接 Driver `loco.velocity_proposal`；删除已移除输出的旧连线后再启动。
+
 | port | topic | 用途 |
 | --- | --- | --- |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
-| `status` | `/ubuntu/navigation/fast_livo2/status` | 定位、建图和运行状态 |
-| `collection_status` | `/ubuntu/navigation/fast_livo2/collection_preview` | 采集中显示 RGB/帧号/距离，停止后显示导出进度 |
-| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | 连接 Driver `loco` 执行器 |
-| `costmap` | `/global_costmap/costmap` | 实时全局代价地图 |
+| `motion_sequence` | `/ubuntu/navigation/nav2/velocity_proposal` | 连接 Driver `loco` 执行器 |
 
 `livo_odom`、registered cloud、confirmed static map 和 obstacle map 仍只由
 同容器内的定位、规划和语义逻辑消费，不生成 Canvas 右侧连线端口。
-`/plan` 和 `/ubuntu/navigation/odom` 注册为隐藏辅助流，只供 `map_view` 与
-`costmap` 叠加路径和位姿，不生成独立监控卡片。详细
+`/plan` 和 `/ubuntu/navigation/odom` 注册为隐藏辅助流，只供 `map_view`
+叠加路径和位姿，不生成独立监控卡片。详细
 frame、QoS、freshness、数采和速度约束见内部实现说明：
 
 - [mapping/README.md](mapping/README.md)
