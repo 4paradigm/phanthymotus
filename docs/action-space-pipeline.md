@@ -1,6 +1,8 @@
 # 动作空间管线：从模型输出到电机
 
-> 状态：三步计划的第 1 步已开 PR，第 2、3 步未开始。
+> 状态：三步全部实现，等评审。第 1 步已合（driver #311）；第 2 步 cloud MR !17；
+> 第 3 步 driver PR（`feat/eef-pose-action-space`）+ phanthymotus PR
+> （`feat/eef-pose-negotiate`）。**没有一行在真机上跑过。**
 > 最后更新 2026-09-21。
 
 这份文档记的是一件事：**模型吐出来的那串数字，和机器人关节之间，差着什么。**
@@ -20,7 +22,29 @@
 | `openvla-bridge` | 末端 **delta** 位姿 + 夹爪 | 7 | **要** |
 | `unifolm-vla-g1` | `EE_R6_G1` 双臂**绝对**末端位姿 + 腰 | 23 | **要** |
 
-`EE_R6_G1` 的布局是 `2 × [末端 xyz(3) + R6 旋转(6) + 夹爪(1)] + 腰 rpy(3) = 23`。
+**`EE_R6_G1` 的布局不是 `2 × [xyz(3) + R6(6) + 夹爪(1)] + 腰 rpy(3)`。** 这句话
+（连同这份文档此前写的那一版、`descriptor.py` 的注释、`negotiate.py` 的注释、
+CLAUDE.md，全都一样）抄自上游 `ActionEncoding` 枚举的注释，而上游**自己的数据
+管线**排的是另一个东西：
+
+| 下标 | 内容 |
+|---|---|
+| 0..2   | 左末端 xyz |
+| 3..8   | 左末端 R6（旋转矩阵的**前两列**，列优先） |
+| 9..11  | 右末端 xyz |
+| 12..17 | 右末端 R6 |
+| 18     | **右**夹爪（0..4.5，Dex1 行程，不是归一化闭合度） |
+| 19     | **左**夹爪 |
+| 20..22 | 腰，`action.body[3:6]` |
+
+两种排法都是 23 维，所以维度校验、协商、消息校验全都通过。差别有两处：夹爪不按臂
+交错（按注释读，第 9 维会把右末端 xyz 的第一个数当成左夹爪），而且两个夹爪**右在
+前**（就算发现了第一点，照直觉接是两只手互换）。
+
+三条独立证据：上游源码（`convert_lerobot_to_hdf5.py:77` +
+`rlds_dataset.py:26-57`）、checkpoint 的 `dataset_statistics.json`（18/19 维范围
+[0.019, 4.5]，其余 21 维全在 ±1 内）、以及右末端 y 全负 / 左末端 y 全正。出处记在
+`phanthymotus-cloud/runtimes/common/normalize.py` 的模块文档里。
 
 **这两件事是独立的，而从前的协商只比了其中一件。** 一个 23 维的末端位姿模型连到
 一张 23 维 `joint_position` 卡片上，两个数字完全吻合，协商通过，然后位姿被当成关节角
@@ -35,7 +59,11 @@
 | cloud | `motus.vla/1` 的 capabilities 加 `control_mode`；四个模型声明填好 | MR !16 已合 |
 | phanthymotus | `negotiate.check()` 比动作空间，**缺声明也拒** | PR #248 已合 |
 | driver | G1 `servo` 卡（`rt/arm_sdk`，16 维关节空间） | PR #309 已合，**默认关闭** |
-| driver | `Group.mode` —— 动作空间按段声明 | PR #311 **待合** |
+| driver | `Group.mode` —— 动作空间按段声明 | PR #311 **已合** |
+| driver | `eef_pose` 的布局定死为 7 维 + 单位四元数校验 + slerp 角度钳位 | 待评审 |
+| cloud | 四个 runtime 的规范化层 + `native_mode`/分段/`eef_state` | MR !17 待评审 |
+| driver | `servo_eef` 卡片：CLIK + 残差拒绝 + 末端位姿上报 | 待评审 |
+| phanthymotus | 协商逐段比，机器人把末端位姿报给增量模型 | 待评审 |
 
 线上：`unifolm-vla-g1` 在 kai 上 `ready 1/1` + `enabled`，NodePort 30108。
 **它跑的镜像早于 `control_mode` 那个提交**，所以 `/capabilities` 里还没有这个字段——
@@ -51,7 +79,7 @@
 这个切法把两件事按**知识归属**分开了：模型的古怪输出是模型的知识，归云端；
 怎么落到这台机器人的关节是机器人的知识，归边端。
 
-### 第 1 步 —— 扩 mode 词汇表（driver PR #311，待合）
+### 第 1 步 —— 扩 mode 词汇表（driver PR #311，**已合**）
 
 `descriptor.mode` 从前是整份描述符一个，表达不了混合向量。现在 `Group` 可以带自己的
 `mode`，不写就继承顶层。向后兼容是结构性的：现存 descriptor 没有按段 mode，继承顶层，
@@ -60,7 +88,7 @@
 **这一步没有往 MODES 里加任何新 mode，是有意的。** `eef_r6_g1` 那种模型私有布局不进
 协议词汇表——它该在云端被规范化。PR 里有一条测试就是拿它去试并要求被拒。
 
-### 第 2 步 —— 云端规范化（未开始，cloud 仓库）
+### 第 2 步 —— 云端规范化（**已实现**，cloud MR !17）
 
 每个 runtime 把自己那个模型的怪癖抹平成标准空间：
 
@@ -74,15 +102,22 @@ WMA       已经是标准
 
 要做的：
 
-- 定下标准的绝对末端位姿布局（旋转用什么表示——建议四元数，别用 R6 或 rpy；
-  它们长得都像一串浮点数，接反了不报错）。
-- `control_mode` 报**规范化后**的空间，另加一个 `native_mode` 说原生是什么。
-  **这个字段不是装饰**：没有它，「中间有个转换、它可能失败」对机器人完全不可见。
-- **openvla 的 delta 转绝对需要当前末端位姿。** 要么云端按 `session_id` 自己累积
-  （有状态，丢一帧永久偏移），要么机器人在请求里带上（更稳，小的协议增量）。
-  **倾向后者**，但没定。
+定下来的（都已实现）：
 
-### 第 3 步 —— 边端 `servo_eef` + IK（未开始，driver 仓库）
+- **标准布局：每个末端 7 维 `[x, y, z, qx, qy, qz, qw]`，米 + 单位四元数 xyzw。**
+  选四元数不是因为紧凑，是因为它是三种表示里唯一**自带校验**的：单位范数。
+  机器人侧 `sink._check_contract` 查它，于是「把 rpy 或 R6 当四元数发下来」变成
+  一次响亮的 REJECT。
+- **夹爪单独一维，不进位姿段**，且**不归一化**（见上表：0..4.5 是 Dex1 的行程）。
+  换算到 0..1 需要知道这只夹爪的完整行程，那是机器人的知识不是模型的。
+- `control_mode` 报**规范化后**的空间，`native_mode` 说原生是什么。一个
+  `control_mode` 字符串说不清混合向量，所以还加了 `control_groups`，和
+  `descriptor.groups` 同构。
+- **openvla 的 delta 基准由机器人在请求里带**（`eef_state` + `needs_eef_state`），
+  不在云端按 session 累积 —— 后者丢一帧就永久偏移，pod 重启或换副本基准就没了。
+  服务端在需要而没带时返回 **400**（是调用方发错了，不是模型不舒服）。
+
+### 第 3 步 —— 边端 `servo_eef` + IK（**已实现**，driver 待评审）
 
 一张新卡片，收标准的绝对末端位姿，解 IK，往 `rt/arm_sdk` 发关节角。
 
@@ -97,18 +132,24 @@ WMA       已经是标准
 
 ### IK 放边端可行，余量极大
 
-阻尼最小二乘，纯 pinocchio，用本仓库的 `unitree/g1/resource/g1_model.urdf`，
-锁掉腿和腰只留 14 个臂关节，warm start：
+阻尼最小二乘，纯 pinocchio 4.1.0，用本仓库的 `unitree/g1/resource/g1_model.urdf`。
+下面这组是**实现之后**用真正的 `common/control/kinematics.py` 重跑的：
 
 ```
-稳态    中位 0.239 ms   p95 0.259 ms   max 0.313 ms
-迭代    中位 3 次        残差中位 6.5e-07
-未收敛  0/280
-30 Hz 预算 33.3 ms —— 占 0.8%
+双臂各解一次（= 一个 30 Hz 周期的真实成本）
+    中位 0.473 ms   p95 0.515 ms   max 1.575 ms   迭代中位 2   未收敛 0/600
+    30 Hz 预算 33.3 ms —— p95 占 1.55%
+
+姿态跟踪（单臂，绕 z 连续转）
+    中位 0.243 ms   p95 0.263 ms   迭代中位 2   未收敛 0/200
 ```
 
-复现：Orin 6 上 `/tmp/iklib`（约 200 MB，`pip install --target`，没动系统包），
-脚本 `/tmp/ikbench2.py`。
+**姿态那一组是新的** —— 此前「只测了平移，旋转没测」是本文档第五节列的缺口之一，
+而旋转正是 IK 变难的地方。现在它和平移同一个量级，那条缺口可以划掉了。
+
+复现：Orin 6 上 `/tmp/iklib`（约 200 MB，`pip install --target`，没动系统包，
+用 `site.addsitedir` 激活而不是 `sys.path.insert` —— cmeel 的 `.pth` 要 site 处理
+才生效），脚本 `/tmp/ikbench_eef.py`。
 
 ### 宇树的 `g1_arm_ik.py` 用 pip 装的 pinocchio 跑不起来
 
@@ -160,12 +201,26 @@ if self._chunk_index >= len(self._chunk):     # 只有块**用完了**才去取�
 
 ## 五、明确没做的
 
-- **VLA 那 23 维仍然驱动不了 G1。** 这正是第 2、3 步要解决的。
+- **一行都没在真机上跑过。** 三步的代码都有单元测试（cloud 292、driver 888、
+  actucore 170），规范化层还在 kai 的真 GPU 上对着 `unifolm-vla-g1` 验过一次真实
+  输出，但**没有任何一条指令进过 G1 的电机**。
+- **`servo_eef` 卡同样一次真机都没跑过**，默认关闭。多两处没有依据的地方：腰的
+  roll/pitch 能不能经 `rt/arm_sdk` 写（限位已卡死在 ±0.02 rad），以及夹爪的单位
+  —— 同一对物理夹爪，`servo.py`（接 WMA）声明 0..1，`servo_eef`（接 VLA）按统计量
+  是 0..4.5，**只有一个能是对的**。
+- **腰那三维的轴序还没坐实。** 它是 `action.body[3:6]` 的切片，而 `body` 的定义
+  不在上游仓库里（观测侧取的还是 `body[12:15]`，不同的切片）。规范化对它原样透传。
+- **openvla 的旋转增量按基座标系合成**（`R_new = R_delta · R_current`）。bridge 的
+  delta 是世界系的，这是标准约定，但没有真机数据验证过；小角度下差别很小，大角度
+  下是完全不同的轨迹，两种都不报错。
+- **部署没做。** kai 上跑的四个 runtime 仍是旧镜像（`/capabilities` 里连
+  `control_mode` 都没有）。要生效得打一个 release tag 再构建 —— 那是一次显式的
+  发布动作。
 - **`servo` 卡一次真机都没跑过。** 两处待确认做成了启动时显式拒绝：
   `rt/arm_sdk` 要不要算 CRC（`send_crc` 默认 True）、Dex1 的消息类型（import 不到就
   拒绝启动）。真机验证按官方文档：**先把 G1 悬挂起来，进锁定站立**。
-- **CLIK 基准只动了平移，姿态是固定的。** 旋转跟踪是 IK 变难的地方，没测。
-  也没测奇异位形附近、没有自碰撞检查、腰那 3 维没算进来。
+- **奇异位形附近没测，也没有自碰撞检查**（这个求解器根本不检查）。姿态跟踪已经
+  补测了，见上。
 - **`pi05` 的速度→位置积分。** 它输出 `joint_velocity`，而 `servo` 卡只收
   `joint_position`。和 IK 无关的另一个缺口，规模小得多。
 - **router 的载荷敏感问题。** 同一个请求只改图像大小：6 KB → 0.5 s，232 KB → 2.5-5.5 s，
@@ -176,6 +231,19 @@ if self._chunk_index >= len(self._chunk):     # 只有块**用完了**才去取�
 ## 六、这条路上踩过的坑
 
 留着是因为它们都**不报错**，而且下一个人大概率会以同样的方式踩。
+
+- **上游的枚举注释和上游自己的数据管线对不上。** `ActionEncoding.EE_R6_G1` 旁边
+  写着 `2 x [EEF XYZ(3) + R6(6) + Gripper(1)] + Waist rpy(3)`，而
+  `convert_lerobot_to_hdf5.py` 拼的是 `[left_ee, right_ee, right_gripper,
+  left_gripper, body[3:6]]`。两种都是 23 维。这份文档、descriptor 的注释、
+  negotiate 的注释、CLAUDE.md 全都抄了那句注释。**定布局要读产出数据的那段代码，
+  不是读描述它的那句话。**
+- **单元测试证明不了单位。** 夹爪的限位按「归一化闭合度」写成 0..1，手写的测试
+  全绿 —— 它测的是我自己写下的那个数。拿 kai 上的真模型跑一次，那两维是
+  2.67..4.47。**一个自洽的假设和一次观测，代价差在一整条跑不起来的管线上。**
+- **cmeel 装的 pinocchio 用 `sys.path.insert` 加载不了。** 它靠 `cmeel.pth`，而
+  `.pth` 只在 `site` 处理目录时才执行。`sys.path.insert` 之后 `import pinocchio`
+  仍然 ModuleNotFoundError，看起来像没装。用 `site.addsitedir()`。
 
 - **靠扫 import 定依赖会漏掉字符串引用的类。** `rich` 是写在 logging 配置字典里的
   `"class": "rich.logging.RichHandler"`，整个仓库没有一条 `import rich`。漏了它之后
