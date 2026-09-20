@@ -270,7 +270,7 @@ class NavigationContractTest(unittest.TestCase):
             self.assertIn(action, actions)
         self.assertNotIn("x-execution-control", tool)
 
-    def test_motion_sequence_keeps_driver_wire_contract(self):
+    def test_motion_sequence_uses_consistent_public_and_runtime_contract(self):
         from plugins.navigation.planning.contract import nav2_tool_definition
 
         for namespace in ("ubuntu", "robot"):
@@ -279,13 +279,13 @@ class NavigationContractTest(unittest.TestCase):
                 motion = tool["topic_out"][1]
                 proposal = next(
                     item for item in nav2_tool_definition(namespace)["topic_out"]
-                    if item["port"] == "velocity_proposal"
+                    if item["port"] == "motion_sequence"
                 )
-                self.assertEqual(motion, {**proposal, "port": "motion_sequence"})
+                self.assertEqual(motion, proposal)
                 self.assertEqual(
-                    motion["topic"], f"/{namespace}/navigation/nav2/velocity_proposal"
+                    motion["topic"], f"/{namespace}/navigation/motion_sequence"
                 )
-                self.assertEqual(motion["schema"], "phanthy.navigation.velocity_proposal.v1")
+                self.assertEqual(motion["schema"], "phanthy.navigation.motion_sequence.v1")
 
     def test_unified_action_schema_only_exposes_supported_fields(self):
         tool = navigation_tool_definition("ubuntu")
@@ -1318,7 +1318,7 @@ class NavigationRuntimeTest(unittest.TestCase):
         self.assertIn("odom_topic:=/robot/navigation/odom", fast_command)
         self.assertIn("odom_topic:=/robot/navigation/odom", nav2_command)
         self.assertIn(
-            "velocity_proposal_topic:=/robot/navigation/nav2/velocity_proposal",
+            "motion_sequence_topic:=/robot/navigation/motion_sequence",
             nav2_command,
         )
         with mock.patch("plugins.navigation.runtime.os.killpg") as killpg:

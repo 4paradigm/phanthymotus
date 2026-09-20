@@ -1,4 +1,4 @@
-"""Structured, bounded velocity proposals emitted by the Nav2 runtime.
+"""Structured, bounded motion sequences emitted by the Nav2 runtime.
 
 This module has no ROS or robot SDK dependency.  It only defines the public
 proposal envelope used by Nav2; trusted ownership, execution and stop
@@ -14,8 +14,8 @@ import time
 
 
 SCHEMA_VERSION = 1
-VELOCITY_PROPOSAL_SCHEMA = "phanthy.navigation.velocity_proposal.v1"
-VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
+MOTION_SEQUENCE_SCHEMA = "phanthy.navigation.motion_sequence.v1"
+MOTION_SEQUENCE_TOPIC = "/ubuntu/navigation/motion_sequence"
 MIN_EFFECTIVE_LINEAR_MPS = 0.30
 MIN_EFFECTIVE_YAW_RADPS = 1.00
 TURN_ONLY_YAW_THRESHOLD_RADPS = 0.20
@@ -319,7 +319,7 @@ def _finite_number(value, field: str) -> float:
 
 
 @dataclass(frozen=True)
-class VelocityProposal:
+class MotionSequence:
     nav_id: str
     sequence: int
     ttl_ms: int
@@ -335,12 +335,12 @@ class VelocityProposal:
         *,
         limits: VelocityLimits = DEFAULT_VELOCITY_LIMITS,
         max_ttl_ms: int = 250,
-    ) -> "VelocityProposal":
+    ) -> "MotionSequence":
         if not isinstance(payload, dict):
             raise ProtocolError("invalid_payload", "proposal must be a JSON object")
-        if payload.get("schema") != VELOCITY_PROPOSAL_SCHEMA:
+        if payload.get("schema") != MOTION_SEQUENCE_SCHEMA:
             raise ProtocolError(
-                "schema_mismatch", f"schema must be {VELOCITY_PROPOSAL_SCHEMA}"
+                "schema_mismatch", f"schema must be {MOTION_SEQUENCE_SCHEMA}"
             )
         if payload.get("frame") != "base_link":
             raise ProtocolError("frame_mismatch", "frame must be base_link")
@@ -405,7 +405,7 @@ class VelocityProposal:
 
     def as_payload(self) -> dict:
         payload = {
-            "schema": VELOCITY_PROPOSAL_SCHEMA,
+            "schema": MOTION_SEQUENCE_SCHEMA,
             "nav_id": self.nav_id,
             "sequence": self.sequence,
             "ttl_ms": self.ttl_ms,
@@ -421,7 +421,7 @@ class VelocityProposal:
         return payload
 
 
-def build_velocity_proposal(
+def build_motion_sequence(
     *,
     nav_id: str,
     sequence: int,
@@ -433,7 +433,7 @@ def build_velocity_proposal(
 ) -> dict:
     """Build and self-validate one proposal before ROS publication."""
 
-    proposal = VelocityProposal(
+    proposal = MotionSequence(
         nav_id=nav_id,
         sequence=sequence,
         ttl_ms=ttl_ms,
@@ -443,7 +443,7 @@ def build_velocity_proposal(
         reason=reason,
     )
     payload = proposal.as_payload()
-    VelocityProposal.from_payload(payload)
+    MotionSequence.from_payload(payload)
     return payload
 
 
@@ -456,14 +456,14 @@ __all__ = [
     "TURN_ONLY_YAW_THRESHOLD_RADPS",
     "ProtocolError",
     "SCHEMA_VERSION",
-    "VELOCITY_PROPOSAL_SCHEMA",
-    "VELOCITY_PROPOSAL_TOPIC",
+    "MOTION_SEQUENCE_SCHEMA",
+    "MOTION_SEQUENCE_TOPIC",
     "Velocity",
     "VelocityLimits",
-    "VelocityProposal",
+    "MotionSequence",
     "apply_motion_floor",
     "apply_motion_limits",
-    "build_velocity_proposal",
+    "build_motion_sequence",
     "limit_forward_velocity",
     "proposal_context_is_current",
     "proposal_context_is_publishable",

@@ -22,7 +22,7 @@ FAST-LIVO2 internal module
       Nav2 internal module
               |-- planner + rolling costmaps + controller
               |-- /plan                                  nav_msgs/Path
-              `-- /ubuntu/navigation/nav2/velocity_proposal
+              `-- /ubuntu/navigation/motion_sequence
                                       |
                                       v
                               Driver loco actuator
@@ -58,7 +58,7 @@ registered cloud。Nav2 readiness 直接检查该 cloud 时间点的
 快路径执行；它们使用独立 latest-only 后台任务和锁，因此不会周期性把
 registered cloud 的接收 age 推过 500 ms。BT 和分段控制器均为 20 Hz，
 可以用最新位姿在每个控制周期检查过点、转向和障碍；非零
-`velocity_proposal` 仍仅以 5 Hz 刷新，停车零速不等待下一个 5 Hz 周期。
+`motion_sequence` 仍仅以 5 Hz 刷新，停车零速不等待下一个 5 Hz 周期。
 
 `goal_pose` 最小样例：
 
@@ -85,7 +85,7 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 
 | port | topic | type / QoS | 语义 |
 | --- | --- | --- | --- |
-| `velocity_proposal` | `/ubuntu/navigation/nav2/velocity_proposal` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.velocity_proposal.v1`，非零动作最多 5 Hz，零速立即发布，只保留最新值，`base_link`，TTL 最大 250 ms |
+| `motion_sequence` | `/ubuntu/navigation/motion_sequence` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.motion_sequence.v1`，非零动作最多 5 Hz，零速立即发布，只保留最新值，`base_link`，TTL 最大 250 ms |
 | `plan` | `/plan` | `nav_msgs/msg/Path`; `RELIABLE + KEEP_LAST(1)` | Nav2 原生 `map` 全局路径，Canvas 显示起点、终点、路径长度和折线 |
 | `costmap` | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | Nav2 实时二维全局代价地图，作为卡片默认预览，叠加路径、位姿、终点和膨胀障碍 |
 
@@ -224,7 +224,7 @@ shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互
 
 odom、registered cloud 和 static map 由 `NavigationPlugin` 固定为同容器
 内部 topic，不需要 Canvas 连线。Canvas 只需把公开 `motion_sequence`
-输出接到 Driver `loco.velocity_proposal`；可选 `goal_pose` 仍可作为外部输入。
+输出接到 Driver `loco.motion_sequence`；可选 `goal_pose` 仍可作为外部输入。
 
 地图和实时位姿从统一卡片的 `map_view` 查看；`livo_odom` 只作为同容器内部
 定位/规划数据，不再生成 Canvas 公共端口。Agent Core 的地图 renderer 会额外

@@ -70,10 +70,10 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertFalse(inputs["goal_pose"]["required"])
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
-        self.assertEqual(set(outputs), {"velocity_proposal", "plan", "costmap"})
-        self.assertEqual(tool["topic_out"][0]["port"], "velocity_proposal")
-        proposal = outputs["velocity_proposal"]
-        self.assertEqual(proposal["schema"], "phanthy.navigation.velocity_proposal.v1")
+        self.assertEqual(set(outputs), {"motion_sequence", "plan", "costmap"})
+        self.assertEqual(tool["topic_out"][0]["port"], "motion_sequence")
+        proposal = outputs["motion_sequence"]
+        self.assertEqual(proposal["schema"], "phanthy.navigation.motion_sequence.v1")
         self.assertEqual(proposal["max_age_ms"], 250)
         self.assertEqual(proposal["rate_hz"], 5)
         self.assertEqual(
@@ -129,8 +129,15 @@ class Nav2ContractTest(unittest.TestCase):
             (
                 runtime_dir
                 / "protocol"
-                / "velocity-proposal-v1.schema.json"
+                / "motion-sequence-v1.schema.json"
             ).read_text(encoding="utf-8")
+        )
+        self.assertIn('default_value="/ubuntu/navigation/motion_sequence"', launch)
+        self.assertIn('"motion_sequence_topic": motion_sequence_topic', launch)
+        self.assertIn('self.get_parameter("motion_sequence_topic")', planner_bridge)
+        self.assertEqual(
+            proposal_schema["properties"]["schema"]["const"],
+            "phanthy.navigation.motion_sequence.v1",
         )
         self.assertIn('default_value="/ubuntu/navigation/odom"', launch)
         self.assertIn('default_value="/ubuntu/navigation/cloud_registered"', launch)

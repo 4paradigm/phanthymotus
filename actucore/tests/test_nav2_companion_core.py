@@ -28,10 +28,10 @@ from nav2.execution_protocol import (  # noqa: E402
     MotionLimits,
     ProtocolError,
     Velocity,
-    VelocityProposal,
+    MotionSequence,
     apply_motion_floor,
     apply_motion_limits,
-    build_velocity_proposal,
+    build_motion_sequence,
     limit_forward_velocity,
     proposal_context_is_current,
     proposal_context_is_publishable,
@@ -44,8 +44,8 @@ from nav2.readiness import (  # noqa: E402
 
 
 class Nav2CompanionCoreTest(unittest.TestCase):
-    def test_velocity_proposal_contract_and_terminal_zero(self) -> None:
-        payload = build_velocity_proposal(
+    def test_motion_sequence_contract_and_terminal_zero(self) -> None:
+        payload = build_motion_sequence(
             nav_id="nav-001",
             sequence=1,
             ttl_ms=250,
@@ -53,10 +53,13 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             velocity=Velocity(x=1.0, y=0.0, yaw=2.0),
             issued_at_unix_ms=1,
         )
-        self.assertEqual(VelocityProposal.from_payload(payload).nav_id, "nav-001")
+        self.assertEqual(MotionSequence.from_payload(payload).nav_id, "nav-001")
+        self.assertEqual(payload["schema"], "phanthy.navigation.motion_sequence.v1")
+        with self.assertRaises(ProtocolError):
+            MotionSequence.from_payload({**payload, "schema": "unknown.schema.v1"})
 
         with self.assertRaises(ProtocolError):
-            build_velocity_proposal(
+            build_motion_sequence(
                 nav_id="nav-001",
                 sequence=2,
                 ttl_ms=250,
@@ -66,7 +69,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             )
         payload["nav_status"] = "arrived"
         with self.assertRaises(ProtocolError):
-            VelocityProposal.from_payload(payload)
+            MotionSequence.from_payload(payload)
 
     def test_requested_speed_is_enforced_on_forward_proposals(self) -> None:
         limited = limit_forward_velocity(
@@ -167,7 +170,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             on_result.index("self._state_changed.notify_all()"),
         )
         self.assertLess(
-            publish_state.index("self._publish_velocity_proposal("),
+            publish_state.index("self._publish_motion_sequence("),
             publish_state.index("self._emit(payload)"),
         )
 

@@ -1,5 +1,5 @@
 {
-  "schema": "phanthy.navigation.velocity_proposal.v1",
+  "schema": "phanthy.navigation.motion_sequence.v1",
   "nav_id": "nav-example-1",
   "sequence": 1,
   "ttl_ms": 250,

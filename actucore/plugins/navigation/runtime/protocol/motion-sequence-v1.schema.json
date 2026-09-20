@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Phanthy Navigation Velocity Proposal v1",
+  "title": "Phanthy Navigation Motion Sequence v1",
   "type": "object",
   "required": [
     "schema",
@@ -15,7 +15,7 @@
     "physical_execution"
   ],
   "properties": {
-    "schema": {"const": "phanthy.navigation.velocity_proposal.v1"},
+    "schema": {"const": "phanthy.navigation.motion_sequence.v1"},
     "nav_id": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"

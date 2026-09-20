@@ -125,7 +125,7 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "type": "number",
             "const": 5.0,
             "default": 5.0,
-            "description": "Latest-only velocity proposal cadence",
+            "description": "Latest-only motion sequence cadence",
         },
     },
     "additionalProperties": False,
@@ -208,7 +208,7 @@ def nav2_tool_definition(namespace: str) -> dict:
             "directly accumulated static occupancy plus live clearing "
             "obstacles. This "
             "ActuCore card only emits "
-            "bounded velocity proposals with a fresh task ID; the Driver loco "
+            "bounded motion sequences with a fresh task ID; the Driver loco "
             "actuator owns any physical execution and task adoption."
         ),
         "topic_in": [
@@ -282,12 +282,12 @@ def nav2_tool_definition(namespace: str) -> dict:
         ],
         "topic_out": [
             {
-                "port": "velocity_proposal",
-                "topic": f"{root}/navigation/nav2/velocity_proposal",
+                "port": "motion_sequence",
+                "topic": f"{root}/navigation/motion_sequence",
                 "format": "data/json",
                 "ros_type": "std_msgs/msg/String",
                 "qos": "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
-                "schema": "phanthy.navigation.velocity_proposal.v1",
+                "schema": "phanthy.navigation.motion_sequence.v1",
                 "rate_hz": 5,
                 "timestamp": "issued_at_unix_ms; TTL uses Driver receive monotonic time",
                 "frame_id": "base_link",

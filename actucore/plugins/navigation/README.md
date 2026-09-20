@@ -32,7 +32,7 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
   `nav_id`。到达或手动停止时先发布一次终态零速 proposal，再确认
   终态并允许下一个任务；已结束任务不会继续以 5 Hz 刷新，终态结果
   本身仍可查询和幂等重放。
-- Nav2 仍只发布 `phanthy.navigation.velocity_proposal.v1`，Driver 继续负责
+- Nav2 仍只发布 `phanthy.navigation.motion_sequence.v1`，Driver 继续负责
   物理执行、TTL、急停、二次限幅和停车确认。
 - Nav2 保留 NavFn、rolling costmap 和重规划，局部执行改为分段
   `停稳 -> 原地转向 -> 直行 -> 停稳复查`。控制和位姿检查为
@@ -111,15 +111,16 @@ mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale
 ## 公共输出
 
 卡片只保留以下两个输出，顺序固定。`motion_sequence` 是公开端口名，
-其 ROS topic、消息 schema、5 Hz 频率和 TTL 保持原有 Driver 契约；
+其 ROS topic 与消息 schema 同步使用 `motion_sequence`；5 Hz 频率和 TTL 不变；
 它仍发送有界速度提案，不是新的批量轨迹协议。升级已有画布时，先停止智能控制，
 刷新卡片定义，再把原第 4 个输出的连线重接到第 2 个 `motion_sequence`，
-连接 Driver `loco.velocity_proposal`；删除已移除输出的旧连线后再启动。
+连接同步升级后的 Driver `loco.motion_sequence`；删除已移除输出的旧连线后再启动。
+旧 Driver 不接受新的 schema，因此必须两端同步升级，不能单独部署本版 ActuCore。
 
 | port | topic | 用途 |
 | --- | --- | --- |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
-| `motion_sequence` | `/ubuntu/navigation/nav2/velocity_proposal` | 连接 Driver `loco` 执行器 |
+| `motion_sequence` | `/ubuntu/navigation/motion_sequence` | 连接 Driver `loco` 执行器 |
 
 `livo_odom`、registered cloud、confirmed static map 和 obstacle map 仍只由
 同容器内的定位、规划和语义逻辑消费，不生成 Canvas 右侧连线端口。
@@ -258,7 +259,7 @@ ACP barrier 沿用上游的物理资源与调用顺序规则；本卡片尚未�
 
 Canvas 手动执行 `navigate_to_pose` 时，Agent Core 只透明转发 MCP
 请求。planner 接受目标后生成新 `nav_id`，并在整个任务的
-velocity proposal 中保持该 ID。Nav2 上报匹配的终态后，卡片释放
+motion sequence 中保持该 ID。Nav2 上报匹配的终态后，卡片释放
 活动任务；下一次点击因此会获得另一个 ID，无需重启
 Canvas、Core 或 Driver。Driver 在空闲订阅状态接纳首条新鲜、合法、
 非零且非终态 proposal 的 `nav_id`，活动任务期间拒绝 ID 切换，并在

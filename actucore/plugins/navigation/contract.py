@@ -185,11 +185,6 @@ def navigation_tool_definition(namespace: str) -> dict:
         for item in [*mapping["topic_out"], *planning["topic_out"]]
         if item.get("port")
     }
-    # Public card name; retain the existing Driver wire contract.
-    component_outputs["motion_sequence"] = {
-        **component_outputs["velocity_proposal"],
-        "port": "motion_sequence",
-    }
     outputs = [
         deepcopy(component_outputs[port]) for port in NAVIGATION_PUBLIC_OUTPUT_PORTS
     ]

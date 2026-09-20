@@ -24,7 +24,7 @@ def generate_launch_description() -> LaunchDescription:
     odom_topic = LaunchConfiguration("odom_topic")
     obstacle_cloud_topic = LaunchConfiguration("obstacle_cloud_topic")
     cmd_vel_raw_topic = LaunchConfiguration("cmd_vel_raw_topic")
-    velocity_proposal_topic = LaunchConfiguration("velocity_proposal_topic")
+    motion_sequence_topic = LaunchConfiguration("motion_sequence_topic")
     command_topic = LaunchConfiguration("command_topic")
     status_topic = LaunchConfiguration("status_topic")
     segment_status_topic = LaunchConfiguration("segment_status_topic")
@@ -50,8 +50,8 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/ubuntu/navigation/nav2/cmd_vel_raw",
             ),
             DeclareLaunchArgument(
-                "velocity_proposal_topic",
-                default_value="/ubuntu/navigation/nav2/velocity_proposal",
+                "motion_sequence_topic",
+                default_value="/ubuntu/navigation/motion_sequence",
             ),
             DeclareLaunchArgument(
                 "command_topic",
@@ -105,7 +105,7 @@ def generate_launch_description() -> LaunchDescription:
                         # unobserved motion model and delays crossing the
                         # actuator's effective velocity deadbands.
                         "shadow_topic": cmd_vel_raw_topic,
-                        "proposal_topic": velocity_proposal_topic,
+                        "motion_sequence_topic": motion_sequence_topic,
                         "controller_speed_limit_topic": speed_limit_topic,
                         "speed_limit_timeout": 3.0,
                         "behavior_tree_path": os.path.join(

@@ -166,7 +166,7 @@ class NavigationRuntime:
             "odom_topic": f"{navigation}/odom",
             "obstacle_cloud_topic": f"{navigation}/cloud_registered",
             "cmd_vel_raw_topic": f"{nav2}/cmd_vel_raw",
-            "velocity_proposal_topic": f"{nav2}/velocity_proposal",
+            "motion_sequence_topic": f"{navigation}/motion_sequence",
             "command_topic": f"{nav2}/command",
             "status_topic": f"{nav2}/status",
             "segment_status_topic": f"{nav2}/segment_status",

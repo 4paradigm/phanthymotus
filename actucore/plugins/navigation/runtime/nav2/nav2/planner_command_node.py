@@ -42,7 +42,7 @@ from .execution_protocol import (
     ProtocolError,
     Velocity,
     apply_motion_limits,
-    build_velocity_proposal,
+    build_motion_sequence,
     proposal_context_is_publishable,
 )
 from .costmap_validation import (
@@ -93,7 +93,7 @@ class PlannerCommandNode(Node):
             "shadow_topic", "/ubuntu/navigation/nav2/cmd_vel_shadow"
         )
         self.declare_parameter(
-            "proposal_topic", "/ubuntu/navigation/nav2/velocity_proposal"
+            "motion_sequence_topic", "/ubuntu/navigation/motion_sequence"
         )
         self.declare_parameter(
             "controller_speed_limit_topic", "/ubuntu/navigation/nav2/speed_limit"
@@ -134,7 +134,7 @@ class PlannerCommandNode(Node):
         )
         self._action_name = str(self.get_parameter("action_name").value)
         self._shadow_topic = str(self.get_parameter("shadow_topic").value)
-        self._proposal_topic = str(self.get_parameter("proposal_topic").value)
+        self._motion_sequence_topic = str(self.get_parameter("motion_sequence_topic").value)
         self._controller_speed_limit_topic = str(
             self.get_parameter("controller_speed_limit_topic").value
         )
@@ -259,7 +259,7 @@ class PlannerCommandNode(Node):
             String, self._status_topic, status_qos
         )
         self._proposal_pub = self.create_publisher(
-            String, self._proposal_topic, latest_command_qos
+            String, self._motion_sequence_topic, latest_command_qos
         )
         self._speed_limit_pub = self.create_publisher(
             SpeedLimit, self._controller_speed_limit_topic, command_qos
@@ -338,7 +338,7 @@ class PlannerCommandNode(Node):
         )
         self._proposal_timer = self.create_timer(
             1.0 / self._proposal_frequency_hz,
-            self._publish_latest_velocity_proposal,
+            self._publish_latest_motion_sequence,
             callback_group=self._callbacks,
         )
 
@@ -598,7 +598,7 @@ class PlannerCommandNode(Node):
                     or self._last_published_proposal.get("reason") != reason
                 )
             if publish_safety_zero:
-                self._publish_velocity_proposal(
+                self._publish_motion_sequence(
                     nav_id=nav_id,
                     navigation_status=status,
                     velocity=velocity,
@@ -618,7 +618,7 @@ class PlannerCommandNode(Node):
                     self._active["status"] = "error"
                     self._active["error_code"] = "unsafe_shadow_velocity"
                     self._active["error"] = f"{exc.code}: {exc}"
-                    self._publish_velocity_proposal(
+                    self._publish_motion_sequence(
                         nav_id=nav_id,
                         navigation_status="error",
                         velocity=Velocity.zero(),
@@ -1162,7 +1162,7 @@ class PlannerCommandNode(Node):
                 "raw shadow output has foreign subscribers: " + ",".join(names),
             )
 
-    def _publish_velocity_proposal(
+    def _publish_motion_sequence(
         self,
         *,
         nav_id: str,
@@ -1174,7 +1174,7 @@ class PlannerCommandNode(Node):
             self._proposal_sequence += 1
             sequence = self._proposal_sequence
         wire_status = "planning" if navigation_status == "starting" else navigation_status
-        payload = build_velocity_proposal(
+        payload = build_motion_sequence(
             nav_id=nav_id,
             sequence=sequence,
             ttl_ms=self._proposal_ttl_ms,
@@ -1193,7 +1193,7 @@ class PlannerCommandNode(Node):
                 "reason": reason,
             }
 
-    def _publish_latest_velocity_proposal(self) -> None:
+    def _publish_latest_motion_sequence(self) -> None:
         """Publish only the newest Nav2 sample at the configured execution cadence."""
         with self._lock:
             candidate = (
@@ -1244,7 +1244,7 @@ class PlannerCommandNode(Node):
                 status=status,
             ):
                 return
-        self._publish_velocity_proposal(
+        self._publish_motion_sequence(
             nav_id=str(nav_id),
             navigation_status=str(status),
             velocity=velocity,
@@ -1315,7 +1315,7 @@ class PlannerCommandNode(Node):
         payload["global_costmap"] = self._global_costmap_diagnostics()
         if stop_proposal is not None:
             nav_id, status = stop_proposal
-            self._publish_velocity_proposal(
+            self._publish_motion_sequence(
                 nav_id=nav_id,
                 navigation_status=status,
                 velocity=Velocity.zero(),
@@ -1340,7 +1340,7 @@ class PlannerCommandNode(Node):
                 "localization_backend": "fast_livo2",
                 "global_frame": self._global_frame,
                 "n5_protocol_ready": True,
-                "velocity_proposal_topic": self._proposal_topic,
+                "motion_sequence_topic": self._motion_sequence_topic,
                 "proposal_ttl_ms": self._proposal_ttl_ms,
                 "proposal_frequency_hz": self._proposal_frequency_hz,
                 "proposal_subscribers": self._proposal_pub.get_subscription_count(),

@@ -5,8 +5,8 @@
 根据雨强反馈，ControlledSemanticSpatial 仅保留原第 1、4 个输出。
 公开输出依次为 `map_view`、`motion_sequence`，移除 `status`、
 `collection_status`、`costmap`。修改统一卡片契约；停发纯展示的 collection_preview，不删除内部必需 ROS 流或数采功能。
-`motion_sequence` 沿用原 velocity proposal 的 ROS topic、schema、QoS、频率和 TTL，
-保持当前 Driver 消费兼容，不转换为新的轨迹协议。
+`motion_sequence` 的端口、ROS topic、schema、launch 参数与实现命名全部统一；
+QoS、频率、TTL、消息字段及停车语义不变。Driver 由同事同步修改，不兼容旧 schema。
 
 ## 实施与兼容
 
@@ -41,6 +41,7 @@
 
 ## 本轮提交与北京部署
 
-用户已授权提交和部署，目标北京 G1。先范围化提交并推送 PR #141，触发 BOT 构建及复审。
+此前端口收敛版本已提交并部署北京 G1。用户最新要求本地与现场验收通过后再申请 BOT review；
+本次完整协议改名先本地验证，待同事的 Driver 配套后才可部署。
 部署前只读核验设备身份、当前镜像、Driver 接口、画布占用和任务状态；通过后部署已构建镜像。
 部署结果与本地测试、BOT 审查和现场运动验收分别记录。
