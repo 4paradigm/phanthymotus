@@ -124,6 +124,42 @@ def summary(payload: dict) -> dict:
     }
 
 
+def unmeasurable(payload: dict) -> list[str]:
+    """用例断言了一些**这张画布产生不出事实**的东西。
+
+    判定读的是驱动给出的事实流。讲解顺序靠的是仿真器世界里的 `speak_start` /
+    `speak_end` —— 只有仿真器自己的 `tts` 卡会写进去。画布上绑的要是**别家**的
+    tts（真机上的感知栈就是一例），机器人每站都讲了，事实流里却一句都没有，
+    `announce_after_arrive` 恒为失败，而分数把这笔算在 agent 头上。
+
+    Orin6 上就是这样：日志里讲解与导航严格交替、barrier 两个方向都挡对了，
+    播报记录却是空的。
+
+    「测不到」和「测了没过」是两件事，而事件流本身分不出来 —— 从里面看，
+    「没讲」和「讲了但没记下来」完全一样。所以只能在跑之前按配置说：这条断言在这
+    张画布上没有意义。
+    """
+    block = test_block(payload) or {}
+    expect = (block.get('evaluate') or {}).get('expect') or {}
+    if not expect.get('announce_after_arrive'):
+        return []
+
+    drivers = set(requires(payload).get('drivers') or [])
+    if not drivers:
+        return []
+    refs = {d.get('ref') for d in (payload.get('devices') or [])
+            if d.get('serverName') in drivers or d.get('name') in drivers}
+    speaks = [c for c in ((payload.get('canvas') or {}).get('cards') or [])
+              if c.get('toolName') in ('tts', 'speaker')]
+    if not speaks:
+        return ['用例断言了「到达后讲解」，但画布上没有任何 tts/speaker 卡片 —— '
+                '讲解不会进入事实流，这条断言会恒为失败']
+    if not any(c.get('deviceRef') in refs for c in speaks):
+        return ['用例断言了「到达后讲解」，但画布上的 tts 不属于用例声明的驱动 —— '
+                '它说的话不进事实流，这条断言会恒为失败（改用仿真器自己的 tts 卡）']
+    return []
+
+
 def requires(payload: dict) -> dict:
     block = test_block(payload) or {}
     needs = block.get('requires') or {}

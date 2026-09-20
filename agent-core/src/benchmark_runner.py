@@ -160,11 +160,21 @@ class CaseRun:
                                                'score': score})
 
     async def _say(self, text: str) -> None:
-        """把一句话当作用户说的送进去 —— 用例的保真度就在这里。"""
+        """把一句话当作用户说的送进去 —— 用例的保真度就在这里。
+
+        同时在世界的事件日志里留一条。判定用不着它（打断看的是 ACP 上报与
+        `nav_cancelled`），但**人**要看：`sim_report` 是事后复盘一次跑动的地方，
+        而一条「机器人好好走着突然掉头」的记录里，如果没有那句插话，读的人无从知道
+        为什么。说话经由 collector，不经由仿真器，所以不补这一笔它就不在场。
+        """
         if not str(text).strip():
             return
         await event_bus.enqueue(source='message', text=str(text),
                                 payload={'benchmark': True})
+        try:
+            await self._call(SCENARIO_TOOL, {'action': 'note', 'text': f'[用例插话] {text}'})
+        except Exception:
+            pass      # 记账失败不该让一次跑动停下来
 
     async def _watch(self, run: dict, started: float) -> dict:
         """边轮询事实边按触发条件追加插话，直到用例结束或超时。"""

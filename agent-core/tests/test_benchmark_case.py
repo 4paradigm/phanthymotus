@@ -206,3 +206,49 @@ def test_evaluate_reads_expect_out_of_the_case_payload():
 
     assert 'waypoint_order' in names
     assert len(names) == len(bc.CHECKS)
+
+
+# ── 测不到的断言 ──────────────────────────────────────────────────────────────
+
+def canvas_case(tts_ref='d0'):
+    """一个断言了讲解的用例，tts 卡挂在 `tts_ref` 指的那台设备上。"""
+    payload = case()
+    payload['test']['evaluate']['expect']['announce_after_arrive'] = True
+    payload['devices'] = [
+        {'ref': 'd0', 'serverName': 'simulator-generic'},
+        {'ref': 'd1', 'serverName': 'perception-bundle'},
+    ]
+    payload['canvas'] = {'cards': [
+        {'id': 'c1', 'deviceRef': 'd0', 'toolName': 'controlled_spatial'},
+        {'id': 'c2', 'deviceRef': tts_ref, 'toolName': 'tts'},
+    ]}
+    return payload
+
+
+def test_a_tts_from_another_device_makes_the_announcement_check_meaningless():
+    """Orin6 上抓到的：画布绑的是感知栈的 tts，机器人每站都讲了，仿真器的事实流里
+    却一句都没有 —— 断言恒为失败，而分数把这笔算在 agent 头上。"""
+    problems = bc.unmeasurable(canvas_case(tts_ref='d1'))
+
+    assert len(problems) == 1
+    assert '不进事实流' in problems[0]
+
+
+def test_the_simulators_own_tts_is_fine():
+    assert bc.unmeasurable(canvas_case(tts_ref='d0')) == []
+
+
+def test_no_speech_card_at_all_is_reported_too():
+    payload = canvas_case()
+    payload['canvas']['cards'] = [c for c in payload['canvas']['cards']
+                                  if c['toolName'] != 'tts']
+
+    assert any('没有任何 tts' in p for p in bc.unmeasurable(payload))
+
+
+def test_a_case_that_does_not_assert_announcements_is_not_nagged():
+    """没断言讲解的用例，画布上有没有 tts 都不关它的事。"""
+    payload = canvas_case(tts_ref='d1')
+    payload['test']['evaluate']['expect']['announce_after_arrive'] = False
+
+    assert bc.unmeasurable(payload) == []

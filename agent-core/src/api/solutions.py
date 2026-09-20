@@ -915,7 +915,7 @@ async def _test_preflight(payload: dict) -> Optional[dict]:
     if not block:
         return None
 
-    problems = benchmark_case.validate(payload)
+    problems = benchmark_case.validate(payload) + benchmark_case.unmeasurable(payload)
     from api.benchmark import case_readiness
     readiness = await case_readiness(benchmark_case.requires(payload))
     return {

@@ -229,6 +229,34 @@ def test_the_injection_is_sent_even_when_the_world_finished_first(simulator, sai
     assert texts == ['带我转一下展区并给我介绍下', '先等一下']
 
 
+def test_every_spoken_line_also_lands_in_the_world_log(simulator, said):
+    """判定用不着它，**人**要看：`sim_report` 是事后复盘的地方，而一条「机器人好好
+    走着突然掉头」的记录里没有那句插话，读的人无从知道为什么。说话经由 collector，
+    不经由仿真器，所以不补这一笔它就不在场。"""
+    run_once()
+
+    notes = [args.get('text') for tool, args in simulator
+             if tool == 'sim_scenario' and args.get('action') == 'note']
+
+    assert any('先等一下' in (n or '') for n in notes)
+    assert all(n.startswith('[用例插话]') for n in notes)
+
+
+def test_a_failed_note_does_not_stop_the_run(simulator, said, monkeypatch):
+    """记账失败不该让一次跑动停下来。"""
+    async def flaky(mcp_id, tool, args):
+        if tool == 'sim_scenario' and args.get('action') == 'note':
+            raise RuntimeError('仿真器忙')
+        return await _ok(mcp_id, tool, args)
+
+    _ok = mcp_client.call_tool_direct
+    monkeypatch.setattr(mcp_client, 'call_tool_direct', flaky)
+
+    run = run_once()
+
+    assert run.state == 'done'
+
+
 def test_the_world_is_reset_from_the_case_not_from_the_driver(simulator, said):
     """地图和出生点来自用例。驱动里存一份、用例里存一份，迟早会对不上。"""
     run_once()
