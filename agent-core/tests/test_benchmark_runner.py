@@ -15,6 +15,7 @@ import pathlib
 import sys
 import tempfile
 
+import fastapi
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
@@ -288,3 +289,53 @@ def run_once(repeats=1, seed=0):
     benchmark_runner.set_current(run)
     asyncio.run(run._drive())
     return run
+
+
+# ── 「开始智能控制」这道闸 ────────────────────────────────────────────────────
+
+def test_the_background_route_is_closed_until_control_starts():
+    """天轶上抓到的：容器一起来，还没点「开始智能控制」，后台 subagent 就每秒在刷。
+
+    `project_running` 此前**不控制任何东西** —— `start.py` 只拿它清上次的残留，
+    而 collector 与 run_forever 都是无条件起跑的。于是已有的 DDS 订阅和 MCP SSE
+    一直在灌，一天 3668 个 turn，没人点过「开始」。
+    """
+    import collector
+    config.main['core'] = {**(config.main.get('core') or {}), 'project_running': False}
+
+    assert collector.project_running() is False
+
+    config.main['core'] = {**(config.main.get('core') or {}), 'project_running': True}
+
+    assert collector.project_running() is True
+
+
+def test_running_a_case_before_control_starts_is_refused():
+    """没开控制就跑，初始指令送进去没人处理，最后记一个 0 分 —— 那是基准测试在撒谎。"""
+    import collector
+    from api import benchmark as bm
+    config.main['core'] = {**(config.main.get('core') or {}), 'project_running': False}
+    try:
+        with pytest.raises(fastapi.HTTPException) as caught:
+            asyncio.run(bm.run_case(bm.CaseRunRequest(repeats=1)))
+        assert caught.value.status_code == 409
+    finally:
+        config.main['core'] = {**(config.main.get('core') or {}), 'project_running': True}
+
+
+def test_the_gate_announces_itself(capsys):
+    """静默丢弃和坏掉的机器人从外面看一模一样 ——「为什么不理我」是排查时最贵的
+    那类问题。进入和离开丢弃状态各说一次，并报出这期间扔了多少条。"""
+    import collector
+    collector._gated_since, collector._gated_count = None, 0
+
+    collector._note_gated('dds:/camera/objects')
+    collector._note_gated('dds:/camera/objects')
+    first = capsys.readouterr().out
+
+    collector._note_ungated()
+    second = capsys.readouterr().out
+
+    assert '智能控制未启动' in first and first.count('智能控制未启动') == 1  # 只说一次
+    assert 'dds:/camera/objects' in first
+    assert '丢弃 2 条' in second

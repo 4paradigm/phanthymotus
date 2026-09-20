@@ -401,6 +401,13 @@ async def run_case(request: CaseRunRequest):
         raise fastapi.HTTPException(
             status_code=409, detail='当前方案里没有 test 段，先载入一个测试用例')
 
+    # 智能控制没开，事件进不了 collector（`collector.project_running` 那道闸），
+    # 初始指令送进去也不会有人处理 —— 跑完会记一个 0 分，而那是基准测试在撒谎。
+    import collector
+    if not collector.project_running():
+        raise fastapi.HTTPException(
+            status_code=409, detail='还没「开始智能控制」——现在跑，指令送进去没人处理，只会记一个 0 分')
+
     problems = benchmark_case.validate({'test': case})
     if problems:
         raise fastapi.HTTPException(status_code=422, detail='；'.join(problems))
