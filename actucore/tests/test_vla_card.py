@@ -48,6 +48,7 @@ DESCRIPTOR = {
 }
 
 
+
 def make_card(**cfg):
     base = {"provider": "mock", "amplitude": 0.1, "period_s": 4.0, "chunk_size": 5}
     base.update(cfg)
@@ -114,7 +115,7 @@ def test_matching_capabilities_pass():
 
 def test_action_dim_mismatch_names_both_numbers():
     """"shape mismatch" sends somebody to read code; this sends them to a wire."""
-    problems = negotiate.check({"action_dim": 32}, DESCRIPTOR)
+    problems = negotiate.check(_caps(action_dim=32), DESCRIPTOR)
     assert problems
     assert "32" in problems[0] and "7" in problems[0]
 
@@ -126,13 +127,13 @@ def test_a_downstream_that_is_not_a_control_card_is_caught_first():
 
 
 def test_a_model_faster_than_the_hardware_is_refused():
-    problems = negotiate.check({"action_dim": 7, "control_hz": 500}, DESCRIPTOR)
+    problems = negotiate.check(_caps(control_hz=500), DESCRIPTOR)
     assert any("500" in p for p in problems)
 
 
 def test_every_problem_is_reported_at_once():
     """An operator fixing a canvas should see the whole disagreement."""
-    problems = negotiate.check({"action_dim": 32, "control_hz": 500}, DESCRIPTOR)
+    problems = negotiate.check(_caps(action_dim=32, control_hz=500), DESCRIPTOR)
     assert len(problems) == 2
 
 
@@ -204,7 +205,7 @@ def test_chunk_indices_walk_the_chunk_then_refill():
 
 def test_an_empty_chunk_raises_rather_than_publishing_nothing_silently():
     class Empty:
-        def capabilities(self): return {"action_dim": 7}
+        def capabilities(self): return _caps()
         def infer(self, obs=None, inference_delay=0): return []
         def health(self): return True
         def close(self): return None
@@ -770,7 +771,19 @@ class _Graph:
 
 
 def _caps(**over):
-    base = {"n_cameras": 0, "needs_state": False}
+    """一份能通过协商的 capabilities。
+
+    `control_mode` 在这里，是因为 `negotiate.check()` **缺它就拒** —— 维度相同不代表
+    动作空间相同（一个 23 维的末端位姿模型和一张 23 维的关节卡片，数字完全吻合），
+    而猜错的代价是机械臂走到错误的地方。不测动作空间的用例用这个构造器拿到一份合法
+    的，才不会被那条检查抢先触发。
+
+    **文件里曾经有两个同名的 `_caps`**，后定义的把前面那个遮蔽掉了，于是「补了字段
+    却还是失败」。只留这一个。
+    """
+    base = {"control_mode": "joint_position", "action_dim": 7,
+            "chunk_size": 10, "control_hz": 30,
+            "n_cameras": 0, "needs_state": False}
     base.update(over)
     return base
 
@@ -997,7 +1010,7 @@ def test_the_downstream_label_survives_a_sparse_descriptor():
 
 def test_a_descriptor_whose_groups_are_not_objects_is_refused_at_start():
     from plugins.vla import negotiate
-    caps = {"action_dim": 7, "chunk_size": 10, "control_hz": 30}
+    caps = _caps(chunk_size=10)
     problems = negotiate.check(caps, {**DESCRIPTOR, "groups": ["arm_l", "arm_r"]})
     assert problems and "groups" in problems[0]
     # names the offending indices, so a 26-dof descriptor does not have to be
@@ -1049,3 +1062,61 @@ def test_one_cards_broken_schema_does_not_empty_the_bundle():
     bundle = object.__new__(main.ActuCoreBundle)
     bundle._plugins = [Broken(), Fine()]
     assert [t["name"] for t in bundle.get_all_tools()] == ["fine"]
+
+
+# ── 动作空间：维度相同不代表空间相同 ─────────────────────────────────────────
+
+
+def test_a_model_in_a_different_action_space_is_refused():
+    """这条检查补上之前，这一组输入是**协商通过**的。
+
+    UnifoLM-VLA 的 G1 checkpoint 输出 23 维 EE_R6_G1（2 × [xyz(3) + R6(6) + 夹爪(1)]
+    + 腰 rpy(3)），而天轶那类机器人的命令卡片是 23 维 joint_position。两个 23 完全
+    吻合，`dof` 和 `control_hz` 都挑不出毛病，于是位姿被当成关节角发下去。
+    """
+    problems = negotiate.check(
+        _caps(control_mode="eef_r6_g1", action_dim=7),
+        DESCRIPTOR,                                   # mode=joint_position, dof=7
+    )
+    assert problems
+    assert any("eef_r6_g1" in p and "joint_position" in p for p in problems)
+
+
+def test_a_model_that_declares_nothing_is_refused():
+    """「不确定就拒绝，不要猜」—— 猜错的代价不是报错，是机械臂走到错误的地方。"""
+    caps = _caps()
+    caps.pop("control_mode")
+    problems = negotiate.check(caps, DESCRIPTOR)
+    assert problems
+    # 报错要说清楚去哪儿设，两侧各一处。
+    assert any("CONTROL_MODE" in p and "control_mode" in p for p in problems)
+
+
+def test_a_matching_action_space_passes():
+    assert negotiate.check(_caps(control_mode="joint_position"), DESCRIPTOR) == []
+
+
+def test_the_action_space_check_does_not_mask_the_others():
+    """空间不对、维度也不对时，两条都要报出来。
+
+    `check()` 收集全部理由而不是撞上第一条就返回 —— 在画布上改接线的人应该一次看到
+    全部分歧，而不是修好一个再发现下一个。
+    """
+    problems = negotiate.check(
+        _caps(control_mode="joint_velocity", action_dim=32), DESCRIPTOR
+    )
+    assert len(problems) == 2
+    assert any("joint_velocity" in p for p in problems)
+    assert any("32" in p and "7" in p for p in problems)
+
+
+def test_the_local_providers_declare_their_action_space():
+    """mock 和 smolvla 都发绝对关节角。
+
+    不声明的话，它们自己会被上面那条检查拦下 —— 这个用例钉的是「新增 provider 时
+    别忘了这个字段」，而不是某个具体的值。
+    """
+    from plugins.vla.providers import mock as mock_provider
+
+    provider = mock_provider.PROVIDER(DESCRIPTOR, {})
+    assert provider.capabilities()["control_mode"] in ("joint_position",)

@@ -120,6 +120,10 @@ class MockProvider:
     def capabilities(self) -> dict:
         return {
             "model": f"mock-sine@{self._period_s:g}s",
+            # 正弦轨迹走的是绝对关节角 —— 它照着下游 descriptor 的 limits 生成，
+            # 那组 limits 就是关节限位。声明它不是形式：negotiate 现在会拒绝一个
+            # 不声明动作空间的模型，因为维度相同不代表空间相同。
+            "control_mode": "joint_position",
             "action_dim": self._dof,
             "chunk_size": self._chunk,
             "control_hz": self._hz,

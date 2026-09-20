@@ -35,6 +35,37 @@ def check(capabilities: dict, descriptor: dict) -> list:
         )
         return problems              # nothing else is meaningful without this
 
+    # ── 动作空间必须对上，而维度相同**不代表**空间相同 ──────────────────────
+    #
+    # 这是这个函数里最后补上的一条检查，补它的理由值得写下来：在它之前，比的只有
+    # `dof` 和 `control_hz`。于是一个 23 维的**末端位姿**模型（UnifoLM-VLA 的
+    # EE_R6_G1：2 × [xyz(3) + R6(6) + 夹爪(1)] + 腰 rpy(3)）连到一张 23 维的
+    # `joint_position` 卡片上，两个数字完全吻合，协商通过，然后把位姿当关节角发下去。
+    #
+    # 它不是个别现象。已经在用的模型里至少三种空间：
+    #
+    #     SmolVLA / mock           joint_position
+    #     π0.5 (DROID)             joint_velocity      ← 归一化关节速度
+    #     OpenVLA (bridge)         末端 delta 位姿 + 夹爪
+    #     UnifoLM-VLA (G1)         EE_R6_G1，motus.control/1 的 MODES 里**没有**这个
+    #
+    # **没声明也要拒。** 「不确定就拒绝，不要猜」在这里格外重要：猜错的代价不是报错，
+    # 是机械臂走到错误的地方。所以缺字段时报错里直接写出该去哪儿设。
+    declared = str(capabilities.get("control_mode") or "").strip()
+    mode = str(descriptor.get("mode") or "").strip()
+    if not declared:
+        problems.append(
+            "模型没有声明自己的动作空间（capabilities 里缺 control_mode）—— "
+            f"下游是 {mode or '未知'}，而维度对得上并不代表空间对得上。"
+            "远端模型在 phanthymotus-cloud 的模型声明里设 CONTROL_MODE，"
+            "本机 provider 在 capabilities() 里返回 control_mode"
+        )
+    elif mode and declared != mode:
+        problems.append(
+            f"模型输出 {declared!r} 空间的动作，下游接受 {mode!r} —— "
+            "两者维度可能相同，但含义不同，发下去就是让机械臂走到错误的地方"
+        )
+
     action_dim = capabilities.get("action_dim")
     dof = descriptor.get("dof")
     if action_dim is not None and dof is not None and int(action_dim) != int(dof):
