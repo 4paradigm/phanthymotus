@@ -422,13 +422,23 @@ def speech_probe(server_name: str, tool: str) -> dict:
 
     入参是**驱动名**不是 `mcp_id`：包体里的卡片带 `deviceRef`，`mcpId` 是 None。
     """
-    info = mcp_client.registry.get(local_mcp_id(server_name)) or {}
+    mcp_id = local_mcp_id(server_name)
+    info = mcp_client.registry.get(mcp_id) or {}
     # `tool_meta` 的键是**全名** `mcp__<id>__<tool>`（`tool_meta[schema['name']]`，
     # 而 `schema['name']` 由 `_to_openai_schema` 产出全名）。按裸名取永远是空 dict ——
     # 于是每一张画布都会被报成「没有任何申报了嘴的卡片」，包括完全正确的那些。
     # 第一版就是这么写的，单元测试喂的是假 probe，所以一路绿到真机上。
-    meta = (info.get('tool_meta') or {}).get(
-        f'mcp__{local_mcp_id(server_name)}__{tool}') or {}
+    # 一个工具在注册表里可能是**一份 schema，也可能是好几份**：带 action 枚举的工具
+    # 会被 `_connect_one` 按 action 拆开，键变成 `mcp__<id>__<tool>__<action>`，
+    # `mcp__<id>__<tool>` 这个键根本不存在。卡片记的是**工具**名，所以两种形状都要认。
+    #
+    # 拆出来的几份申报是同一份（`resource`/`completion` 都从父工具的 inputSchema 抄
+    # 下来），取到哪一份都一样。Orin6 上的仿真器 `tts` 就是拆开的那种 —— 前两跳全对，
+    # 就卡在这里，表现和「没申报」一模一样。
+    metas = info.get('tool_meta') or {}
+    exact = f'mcp__{mcp_id}__{tool}'
+    meta = metas.get(exact) or next(
+        (m for name, m in metas.items() if name.startswith(f'{exact}__')), {})
     resource = meta.get('resource') or frozenset()
     return {'mouth': bool(set(resource) & benchmark_facts.SPEECH_CHANNELS),
             'completion': bool(meta.get('completion'))}

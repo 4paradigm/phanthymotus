@@ -261,6 +261,42 @@ def test_the_probe_is_asked_by_driver_name_because_a_payload_has_no_mcp_id(monke
     assert benchmark.speech_probe('mcp-perc', 'tts')['mouth'] is False
 
 
+def test_a_tool_split_by_action_is_still_found(monkeypatch):
+    """带 action 枚举的工具会被 `_connect_one` 拆开，键变成
+    `mcp__<id>__<tool>__<action>`，`mcp__<id>__<tool>` 这个键根本不存在。
+
+    卡片记的是**工具**名。只认精确键的话，一个拆开的 tts 表现得和「没申报嘴」
+    一模一样 —— Orin6 上的仿真器 tts 就是这种，前两跳全对，卡在这里。
+    """
+    monkeypatch.setitem(config.main, 'services', {'mcp': [
+        {'id': 'mcp-sim2', 'server_name': 'simulator-generic-device-bundle'}]})
+    monkeypatch.setitem(mcp_client.registry, 'mcp-sim2', {
+        'online': True, 'tools': ['tts'],
+        'tool_meta': {
+            'mcp__mcp-sim2__tts__speak': {'resource': frozenset({'mouth'}),
+                                          'completion': {'timeout': 60}},
+            'mcp__mcp-sim2__tts__stop': {'resource': frozenset({'mouth'}),
+                                         'completion': {'timeout': 60}},
+        },
+    })
+
+    assert benchmark.speech_probe('simulator-generic-device-bundle', 'tts') == {
+        'mouth': True, 'completion': True}
+
+
+def test_a_prefix_collision_does_not_count_as_the_same_tool(monkeypatch):
+    """`tts_backup` 不是 `tts` 拆出来的 —— 拆分用的是 `__`，前缀匹配必须带上它。"""
+    monkeypatch.setitem(config.main, 'services', {'mcp': [
+        {'id': 'mcp-x', 'server_name': 'some-bundle'}]})
+    monkeypatch.setitem(mcp_client.registry, 'mcp-x', {
+        'online': True, 'tools': ['tts_backup'],
+        'tool_meta': {'mcp__mcp-x__tts_backup': {'resource': frozenset({'mouth'}),
+                                                 'completion': {'timeout': 60}}},
+    })
+
+    assert benchmark.speech_probe('some-bundle', 'tts')['mouth'] is False
+
+
 def test_a_tool_that_declares_no_channel_is_not_a_mouth(monkeypatch):
     """R1 的 `speaker` 就是这样：它是真的喇叭，但没申报通道，所以讲解事实不靠它 ——
     靠画布上那张申报了 mouth 的 `tts`。"""

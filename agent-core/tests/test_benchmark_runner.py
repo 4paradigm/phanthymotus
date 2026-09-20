@@ -147,6 +147,37 @@ def test_an_undeclared_type_counts_as_acting(canvas, registry):
     assert len(benchmark_runner.unsafe_cards('mcp-sim')) == 1
 
 
+def test_a_split_sensor_is_not_listed_as_something_that_moves(canvas, registry,
+                                                              monkeypatch):
+    """带 action 枚举的工具会被按 action 拆开，`tool_meta` 里只有
+    `mcp__<id>__mic__start` 这样的键，`mcp__<id>__mic` 根本不存在。
+
+    画布卡片记的是**工具**名，所以拼出来的名字查不到申报 → `tool_type` 返回 '' →
+    「没申报就算会动」→ 麦克风进了「会动的设备」清单。方向上安全，但一份把麦克风算
+    进去的清单，人就不会认真读了 —— 而这份清单的全部作用就是让人认真读一遍。
+    """
+    monkeypatch.setitem(mcp_client.registry, 'mcp-real', {
+        'online': True, 'name': '天轶', 'server_name': 'x-humanoid-tianyi',
+        'category': 'driver',
+        'tool_meta': {'mcp__mcp-real__mic__start': {'type': 'sensor'},
+                      'mcp__mcp-real__mic__stop': {'type': 'sensor'},
+                      'mcp__mcp-real__loco__walk': {'type': 'actuator'}},
+    })
+    canvas(card('mcp-real', 'mic'), card('mcp-real', 'loco'))
+
+    assert [u['tool'] for u in benchmark_runner.unsafe_cards(None)] == ['loco']
+
+
+def test_a_tool_with_no_declaration_anywhere_still_counts_as_acting(canvas, registry,
+                                                                    monkeypatch):
+    """兜底不能松：查不到就是查不到，按会动处理。"""
+    monkeypatch.setitem(mcp_client.registry, 'mcp-real', {
+        'online': True, 'name': '天轶', 'category': 'driver', 'tool_meta': {}})
+    canvas(card('mcp-real', 'mystery'))
+
+    assert [u['tool'] for u in benchmark_runner.unsafe_cards(None)] == ['mystery']
+
+
 def test_without_a_simulator_every_actuator_needs_confirming(canvas, registry):
     """真机上没有仿真器可以代劳，所以画布上会动的东西**全部**要进确认清单。
 

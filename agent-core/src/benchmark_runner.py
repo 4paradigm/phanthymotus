@@ -85,6 +85,26 @@ def unsafe_cards(simulator_mcp_id: str | None = None) -> list[dict]:
     """
     from peer.tools import is_read_only
 
+    def schema_name(mcp_id: str, tool: str) -> str:
+        """画布上的工具名 → 注册表里真实存在的那个 schema 名。
+
+        带 action 枚举的工具会被 `_connect_one` 按 action 拆开，`tool_meta` 的键变成
+        `mcp__<id>__<tool>__<action>`，`mcp__<id>__<tool>` 不存在。而画布卡片记的是
+        **工具**名，于是拼出来的名字查不到申报 —— `tool_type` 返回 ''，按「没申报就算
+        会动」处理，麦克风就这么进了「会动的设备」清单。
+
+        拆出来的几份 type 相同（都从父工具抄下来），取哪一份都一样。查不到就返回精确
+        名：没申报仍然按会动处理，这条兜底不能松。
+
+        只在这里解，不动 `peer/tools.py` —— 那是信任边界，而它拿到的名字来自
+        `all_schemas()`，本来就是拆分后的名字，精确命中，不需要这一层。
+        """
+        exact = f'mcp__{mcp_id}__{tool}'
+        metas = (mcp_client.registry.get(mcp_id) or {}).get('tool_meta') or {}
+        if exact in metas:
+            return exact
+        return next((n for n in metas if n.startswith(f'{exact}__')), exact)
+
     layout = config.main.get('canvas_layout') or {}
     internal = {m.get('id') for m in (config.main.get('services', {}).get('mcp') or [])
                 if m.get('transport') == 'internal'}
@@ -99,7 +119,7 @@ def unsafe_cards(simulator_mcp_id: str | None = None) -> list[dict]:
         # 把它算进来，任何用例都跑不了，这条闸就只剩一个永远亮着的红灯。
         if mcp_id in internal:
             continue
-        if is_read_only(f'mcp__{mcp_id}__{tool}'):
+        if is_read_only(schema_name(mcp_id, tool)):
             continue
         entry = mcp_client.registry.get(mcp_id) or {}
         unsafe.append({'mcpId': mcp_id, 'tool': tool,
