@@ -260,17 +260,43 @@ class VLAPlugin:
                                    "scope": "shared",
                                    "x-show-when": {"provider": staged_providers},
                                    **({"enum": local_models} if local_models else {})},
-                    "cloud_model_name": {"type": "string", "scope": "shared",
-                                         "x-show-when": {"provider": remote_providers}},
+                    # Which dataset's statistics un-normalise the action.
+                    #
+                    # Only a **pretrained base** needs this, and only because its
+                    # statistics are grouped per dataset (`smolvla_base` carries
+                    # so100 / so100-blue / so100-red) while the pipeline looks up
+                    # plain `action`. A miss is not an error in LeRobot — the step
+                    # passes the tensor through — so leaving it unset used to mean
+                    # the card emitted the policy's normalised space, ≈ ±1, into a
+                    # descriptor that reads degrees. The provider now refuses to
+                    # load instead, and this field is where the answer goes.
+                    #
+                    # Free text rather than `enum`: the groups live inside the
+                    # checkpoint and are only known once it is read, and an empty
+                    # <select> would be worse than a box you can type into. The
+                    # provider validates it and lists the real groups when it is
+                    # wrong.
+                    #
+                    # A checkpoint fine-tuned on one robot keys its statistics
+                    # `action` and needs nothing here.
+                    "unnorm_key": {"type": "string", "scope": "shared",
+                                   "x-show-when": {"provider": staged_providers}},
                     # Only vla_cloud has anywhere to send a request. Hiding
                     # these for a local provider is not cosmetic: a filled-in
                     # endpoint beside `provider: smolvla` reads as configured
                     # and is ignored, which is the kind of thing an operator
                     # spends an afternoon on.
+                    #
+                    # 顺序就是表单里的顺序（sidebar.js 遍历 Object.entries），并且是
+                    # **填写的顺序**：先有服务器，才有它认得的 key，才谈得上问它有哪些
+                    # 模型名。`cloud_model_name` 一度排在最前，于是表单第一个问的是一个
+                    # 只有服务器知道答案的名字。
                     "endpoint": {"type": "string", "scope": "shared",
                                  "x-show-when": {"provider": remote_providers}},
                     "api_key": {"type": "string", "scope": "shared",
                                 "x-show-when": {"provider": remote_providers}},
+                    "cloud_model_name": {"type": "string", "scope": "shared",
+                                         "x-show-when": {"provider": remote_providers}},
                     "timeout_ms": {"type": "number", "default": 500,
                                    "scope": "shared",
                                    "x-show-when": {"provider": remote_providers}},

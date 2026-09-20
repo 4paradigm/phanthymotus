@@ -789,3 +789,101 @@ def test_every_provider_factory_takes_a_status_sink():
                if "on_status" not in inspect.signature(module.PROVIDER).parameters]
 
     assert not missing, f"these factories cannot be handed a status sink: {missing}"
+
+
+# ── normalisation statistics ────────────────────────────────────────────────
+#
+# `_select_stats` is the whole decision, and it is a dict transform, so it is
+# tested here rather than behind a GPU. What it guards against is the most
+# expensive kind of bug this provider can have: not a crash, but a policy that
+# runs, negotiates, validates, and drives the arm with numbers off by two
+# orders of magnitude.
+
+# Shaped exactly as observed on Tianyi's `smolvla_base`: one entry per dataset,
+# each holding that dataset's mean/std. Not `…action.mean` as a flat key — the
+# statistics are nested under the feature name, which is why the pipeline's
+# lookup of plain `action` misses rather than raising.
+GROUPED = {
+    "so100.buffer.action": {"mean": [1.6, 119.9], "std": [26.4, 52.4]},
+    "so100-red.buffer.action": {"mean": [2.4, 124.9], "std": [14.3, 42.8]},
+}
+
+
+def test_a_finetuned_checkpoints_stats_are_left_alone():
+    """Keyed `action` already — nothing to choose, and choosing would be wrong."""
+    plain = {"action": {"mean": [0.0], "std": [1.0]}}
+    assert SmolVLAProvider._select_stats(plain, "") is None
+    assert SmolVLAProvider._select_stats(plain, "so100") is None
+
+
+def test_a_step_without_stats_is_skipped():
+    assert SmolVLAProvider._select_stats(None, "so100") is None
+    assert SmolVLAProvider._select_stats({}, "so100") is None
+
+
+def test_grouped_stats_without_a_key_are_refused():
+    """The refusal is the point: an identity un-normaliser is silent.
+
+    LeRobot treats a missing `action` entry as "nothing to do" rather than as
+    an error, so the alternative to raising here is a policy that emits its own
+    normalised space (≈ ±1) into a descriptor that reads degrees.
+    """
+    with pytest.raises(ValueError) as caught:
+        SmolVLAProvider._select_stats(GROUPED, "")
+    message = str(caught.value)
+    # The operator has to be told what to pick from, not just that it failed.
+    assert "so100" in message and "so100-red" in message
+    assert "identity" in message
+
+
+def test_an_unknown_key_is_refused_and_lists_the_real_ones():
+    with pytest.raises(ValueError) as caught:
+        SmolVLAProvider._select_stats(GROUPED, "so100-blue")
+    assert "so100-blue" in str(caught.value) and "so100-red" in str(caught.value)
+
+
+def test_the_chosen_group_is_rekeyed_the_way_the_pipeline_looks_it_up():
+    """`so100.buffer.action` → `action`, and the other datasets are dropped."""
+    chosen = SmolVLAProvider._select_stats(GROUPED, "so100")
+    assert chosen == {"action": {"mean": [1.6, 119.9], "std": [26.4, 52.4]}}
+
+
+def test_the_key_comes_from_the_model_entry_before_the_card(tmp_path, checkpoint):
+    """Per-checkpoint, because which dataset fits is a property of the weights."""
+    models = {"smolvla_base": {"model_dir": str(checkpoint), "unnorm_key": "so100-red"}}
+    provider = make_provider(tmp_path, model_name="smolvla_base", models=models,
+                             unnorm_key="so100")
+    assert provider._unnorm_key == "so100-red"
+
+
+def test_applying_the_stats_rebuilds_the_tensor_cache(monkeypatch, checkpoint):
+    """Assigning `step.stats` alone changes nothing — `__call__` reads the cache.
+
+    This is the half of the fix with no symptom if it is missed: the selection
+    looks applied, the log line prints, and the un-normalisation is still an
+    identity because `NormalizerProcessorStep.__call__` only ever consults
+    `_tensor_stats`, built once in `__post_init__`.
+    """
+    module = types.ModuleType("lerobot.processor.normalize_processor")
+    module.to_tensor = lambda stats, device=None, dtype=None: ("tensors", tuple(sorted(stats)))
+    monkeypatch.setitem(sys.modules, "lerobot.processor.normalize_processor", module)
+
+    class Step:
+        def __init__(self, stats):
+            self.stats, self.device, self.dtype = stats, "cpu", None
+            self._tensor_stats = ("stale", ())
+
+    class Pipeline:
+        def __init__(self, steps):
+            self.steps = steps
+
+    grouped = Step(dict(GROUPED))
+    plain = Step({"action": {"mean": [0.0], "std": [1.0]}})
+    provider = make_provider(checkpoint, unnorm_key="so100")
+    provider._apply_norm_stats(Pipeline([grouped, plain]))
+
+    assert grouped.stats == {"action": {"mean": [1.6, 119.9], "std": [26.4, 52.4]}}
+    assert grouped._tensor_stats == ("tensors", ("action",))
+    # The already-correct step must be left exactly as it was.
+    assert plain.stats == {"action": {"mean": [0.0], "std": [1.0]}}
+    assert plain._tensor_stats == ("stale", ())

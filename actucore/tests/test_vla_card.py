@@ -383,6 +383,42 @@ def test_remote_only_fields_are_hidden_for_a_local_provider():
         assert props[field]["x-show-when"] == {"provider": ["vla_cloud"]}, field
 
 
+def test_the_cloud_fields_are_ordered_the_way_they_are_filled_in():
+    """表单顺序就是 schema 顺序（sidebar.js 遍历 Object.entries）。
+
+    先有服务器，才有它认得的 key，才谈得上问它有哪些模型名。`cloud_model_name` 一度
+    排在最前，于是表单第一个问的是一个只有服务器知道答案的名字 —— 一个纯排序问题，
+    但它是操作员第一眼看到的东西。
+    """
+    keys = list(_properties())
+    order = [keys.index(f) for f in ("endpoint", "api_key", "cloud_model_name")]
+    assert order == sorted(order), f"云端三项的顺序不对：{keys}"
+
+
+def test_unnorm_key_is_settable_from_the_form():
+    """修了 provider 却没修配置表面，等于把卡片变成一个填不了的错误。
+
+    The provider refuses to load a checkpoint whose normalisation statistics are
+    grouped per dataset unless one is chosen — that refusal is the fix for a card
+    that used to emit its policy's normalised space (≈ ±1) into a descriptor that
+    reads degrees. But the form renders exactly this schema, so without a field
+    here an operator is told to set something they have nowhere to set.
+
+    Free text, not `enum`: the groups live inside the checkpoint and are only
+    known once it is read. An empty <select> would be worse than a box.
+    """
+    props = _properties()
+    assert "unnorm_key" in props, "表单里没有 unnorm_key，provider 的拒绝就无解了"
+    assert props["unnorm_key"]["type"] == "string"
+    assert "enum" not in props["unnorm_key"]
+
+
+def test_unnorm_key_is_hidden_for_the_cloud_provider():
+    """云端那侧由服务端自己选，机器人这边填了也不会被用上。"""
+    condition = _properties()["unnorm_key"]["x-show-when"]["provider"]
+    assert "vla_cloud" not in condition
+
+
 def test_every_show_when_value_is_a_string_or_a_list_of_them():
     """A boolean here renders the field permanently hidden, silently.
 
