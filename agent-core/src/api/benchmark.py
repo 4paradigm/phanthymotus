@@ -564,8 +564,12 @@ def _agent_track(session_id: str, started, ended) -> list:
         # `created_at` 留在几天前，内容却是刚刚写的。真机上因此排出了「第 11 轮
         # +-277189.7s」这种时间。最后写入的时刻才是这轮真正发生的时刻。
         written = turn.get('updated_at') or at
+        # 轮号从**这次跑动**数起，不用会话里的序号 —— 打开的是一次跑动的现场，
+        # 第一轮却写着「第 11 轮」，读的人会以为前面漏了十轮。会话里的序号留在
+        # `sessionTurn`，要和历史面板对照时还用得上。
         track.append({
-            'turn': index,
+            'turn': len(track),
+            'sessionTurn': index,
             'at': round(written - float(started), 1) if (started and written) else None,
             'trigger': trigger, 'says': says, 'calls': calls,
         })

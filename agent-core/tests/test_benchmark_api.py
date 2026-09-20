@@ -540,3 +540,27 @@ def test_a_turns_time_comes_from_when_it_was_written(monkeypatch):
     agent = asyncio.run(benchmark.run_timeline(run_id))['agent']
 
     assert agent[0]['at'] == 12.0
+
+
+def test_turns_are_numbered_from_the_start_of_this_run(monkeypatch):
+    """打开的是一次跑动的现场，第一轮却写着「第 11 轮」，读的人会以为前面漏了十轮。
+    会话里的序号留在 `sessionTurn`，要和历史面板对照时还用得上。"""
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?', ('s1', run_id))
+    conn.commit()
+
+    import chat_history
+    old = {'started_at': stored['started_at'] - 9000,
+           'updated_at': stored['started_at'] - 8000, 'messages': []}
+    mine = {'started_at': stored['started_at'] + 5,
+            'updated_at': stored['started_at'] + 9, 'messages': [
+                {'role': 'assistant', 'content': '开始'}]}
+    monkeypatch.setattr(chat_history, 'get_session_turns',
+                        lambda sid: [old, old, old, old, old, old, old, old, old, old, mine])
+
+    agent = asyncio.run(benchmark.run_timeline(run_id))['agent']
+
+    assert agent[0]['turn'] == 0
+    assert agent[0]['sessionTurn'] == 10
