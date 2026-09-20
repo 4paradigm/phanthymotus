@@ -88,11 +88,16 @@ class Observation:
     同样的字段名往 motus.vla/1 的 payload 里塞，两边都不该依赖这里的类型。
     """
 
-    __slots__ = ("images", "state", "prompt", "t_capture_ms")
+    __slots__ = ("images", "state", "eef_state", "prompt", "t_capture_ms")
 
-    def __init__(self, images=None, state=None, prompt="", t_capture_ms=0):
+    def __init__(self, images=None, state=None, prompt="", t_capture_ms=0,
+                 eef_state=None):
         self.images = images or {}
         self.state = state
+        # 机器人当前的末端位姿，标准布局。和 `state` 是两件事：`state` 的宽度和
+        # 含义由 checkpoint 决定，这个由协议定义，只服务于把模型的末端**增量**
+        # 转成绝对位姿。见 motus.vla/1 的 `eef_state`。
+        self.eef_state = eef_state
         self.prompt = prompt
         self.t_capture_ms = int(t_capture_ms or 0)
 
@@ -136,6 +141,7 @@ class VLAPlugin:
         self._images: dict = {}
         self._image_ms: dict = {}
         self._proprio = None
+        self._eef = None
         self._state_ms = 0
         self._binding = None
         self._rate_hz = 30.0
@@ -641,6 +647,11 @@ class VLAPlugin:
             missing.append(f"相机 {len(bound['images'])}/{n_cameras} 路")
         if needs_state and not bound["state"]:
             missing.append("本体状态")
+        # 增量模型（末端 delta）要机器人报出自己当前的末端位姿。它和本体状态走
+        # **同一路话题**，所以这里检查的是同一个绑定 —— 载荷里有没有 `eef` 字段
+        # 要等第一帧到了才知道，那是 `observation()` 的事。
+        if capabilities.get("needs_eef_state") and not bound["state"]:
+            missing.append("末端位姿（模型输出的是末端增量，需要基准位姿）")
         if missing:
             return None, ("模型需要的观测没有连上：" + "、".join(missing)
                           + "。请在画布上把相机卡片、以及驱动命令卡片的状态输出"
@@ -682,8 +693,14 @@ class VLAPlugin:
         values = payload.get("values")
         if not isinstance(values, list):
             return
+        # `eef` 是同一条载荷里的可选字段，不是另一路话题。`_bind_inputs` 按 **ROS
+        # 消息类型**分派角色，两路 `String` 它分不开 —— 单开一路会变成一个按连线
+        # 顺序赌运气的绑定。发布方见 phanthymotus-driver 的
+        # `unitree/g1/servo_eef.py::_publish_state`。
+        eef = payload.get("eef")
         with self._obs_lock:
             self._proprio = [float(v) for v in values]
+            self._eef = [float(v) for v in eef] if isinstance(eef, list) else None
             self._state_ms = int(payload.get("stamp_ms") or 0) or int(time.time() * 1000)
 
     @staticmethod
@@ -705,6 +722,7 @@ class VLAPlugin:
             images = dict(self._images)
             image_ms = dict(self._image_ms)
             state = list(self._proprio) if self._proprio is not None else None
+            eef_state = list(self._eef) if self._eef is not None else None
             state_ms = self._state_ms
 
         capabilities = self._capabilities or {}
@@ -712,11 +730,17 @@ class VLAPlugin:
             return None
         if capabilities.get("needs_state") and state is None:
             return None
+        # 和 `needs_state` 同样的处理：模型要而观测里没有，就不发这一拍。凑一个
+        # 单位位姿上去，手臂会飞到原点附近一个看起来挺合理的地方，而上游每一道
+        # 检查都满意。
+        if capabilities.get("needs_eef_state") and eef_state is None:
+            return None
 
         stamps = [ms for ms in image_ms.values() if ms]
         if state_ms:
             stamps.append(state_ms)
-        return Observation(images=images, state=state, prompt=self._task,
+        return Observation(images=images, state=state, eef_state=eef_state,
+                           prompt=self._task,
                            t_capture_ms=min(stamps) if stamps else 0)
 
     def _close_node(self):

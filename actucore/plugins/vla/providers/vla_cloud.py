@@ -114,6 +114,15 @@ class VLACloudProvider:
         state = getattr(observation, "state", None)
         if state is not None:
             payload["state"] = [float(v) for v in state]
+        # 末端位姿基准。只有输出增量的模型要它（`needs_eef_state`），而那类模型
+        # 的 `needs_state` 往往是 False —— OpenVLA 训练时就不吃本体感受，却恰恰是
+        # 唯一需要这个字段的。所以两者各发各的，不能合并成一个。
+        #
+        # 没有就**整个字段省略**，不发空列表：服务端把 None 和 [] 分开看，后者是
+        # 「机器人报了，但它是空的」，那是个错误而不是缺省。
+        eef_state = getattr(observation, "eef_state", None)
+        if eef_state:
+            payload["eef_state"] = [float(v) for v in eef_state]
         if self._model:
             payload["model"] = self._model
 
