@@ -1,0 +1,738 @@
+{
+ "state": "running",
+ "scenario": "exhibition_tour",
+ "scenario_name": "展厅导览 · 基础巡游",
+ "elapsed": 600.0,
+ "events": [
+  {
+   "t": 0.0,
+   "event": "scenario_load",
+   "scenario": "exhibition_tour",
+   "name": "展厅导览 · 基础巡游"
+  },
+  {
+   "t": 0.0,
+   "event": "scenario_start",
+   "scenario": "exhibition_tour"
+  },
+  {
+   "t": 0.05,
+   "event": "nav_start",
+   "action_id": "sim-nav-f2160016611d",
+   "kind": "navigate_to",
+   "label": "入口",
+   "target": {
+    "x": 1.5,
+    "y": 0.0,
+    "yaw": 0.0
+   },
+   "state": 1,
+   "result": 0,
+   "status": "running",
+   "reason": "",
+   "progress": {
+    "dist_done": 0.0,
+    "dist_total": 1.5,
+    "fraction": 0.0,
+    "leg": 0,
+    "legs": 1
+   }
+  },
+  {
+   "t": 3.65,
+   "event": "arrive",
+   "action_id": "sim-nav-f2160016611d",
+   "kind": "navigate_to",
+   "label": "入口",
+   "target": {
+    "x": 1.5,
+    "y": 0.0,
+    "yaw": 0.0
+   },
+   "state": 4,
+   "result": 0,
+   "status": "completed",
+   "reason": "",
+   "progress": {
+    "dist_done": 1.5,
+    "dist_total": 1.5,
+    "fraction": 1.0,
+    "leg": 1,
+    "legs": 1
+   },
+   "elapsed": 3.6,
+   "pose": {
+    "x": 1.3962,
+    "y": 0.0,
+    "yaw": 0.0
+   }
+  },
+  {
+   "t": 3.7,
+   "event": "speak_start",
+   "action_id": "sim-tts-6066f061b892",
+   "text": "入口到了。展厅入口与迎宾区",
+   "duration": 2.6
+  },
+  {
+   "t": 6.35,
+   "event": "speak_end",
+   "outcome": "completed",
+   "action_id": "sim-tts-6066f061b892",
+   "text": "入口到了。展厅入口与迎宾区",
+   "duration": 2.6,
+   "started_at": 3.699999999999995,
+   "ended_at": 6.349999999999985,
+   "status": "completed"
+  },
+  {
+   "t": 7.0,
+   "event": "nav_start",
+   "action_id": "sim-nav-d7fa407fc4a8",
+   "kind": "navigate_to",
+   "label": "一号展区",
+   "target": {
+    "x": 6.0,
+    "y": 3.0,
+    "yaw": 1.57
+   },
+   "state": 1,
+   "result": 0,
+   "status": "running",
+   "reason": "",
+   "progress": {
+    "dist_done": 0.0,
+    "dist_total": 5.448,
+    "fraction": 0.0,
+    "leg": 0,
+    "legs": 1
+   }
+  },
+  {
+   "t": 21.3,
+   "event": "arrive",
+   "action_id": "sim-nav-d7fa407fc4a8",
+   "kind": "navigate_to",
+   "label": "一号展区",
+   "target": {
+    "x": 6.0,
+    "y": 3.0,
+    "yaw": 1.57
+   },
+   "state": 4,
+   "result": 0,
+   "status": "completed",
+   "reason": "",
+   "progress": {
+    "dist_done": 5.448,
+    "dist_total": 5.448,
+    "fraction": 1.0,
+    "leg": 1,
+    "legs": 1
+   },
+   "elapsed": 14.3,
+   "pose": {
+    "x": 5.9588,
+    "y": 2.9752,
+    "yaw": 1.5131
+   }
+  },
+  {
+   "t": 21.35,
+   "event": "speak_start",
+   "action_id": "sim-tts-626dae3145db",
+   "text": "一号展区到了。早期产品与发展历程",
+   "duration": 3.2
+  },
+  {
+   "t": 24.55,
+   "event": "speak_end",
+   "outcome": "completed",
+   "action_id": "sim-tts-626dae3145db",
+   "text": "一号展区到了。早期产品与发展历程",
+   "duration": 3.2,
+   "started_at": 21.35000000000017,
+   "ended_at": 24.550000000000214,
+   "status": "completed"
+  },
+  {
+   "t": 25.15,
+   "event": "nav_start",
+   "action_id": "sim-nav-00d2a2a02f9f",
+   "kind": "navigate_to",
+   "label": "二号展区",
+   "target": {
+    "x": 12.0,
+    "y": 3.0,
+    "yaw": 1.57
+   },
+   "state": 1,
+   "result": 0,
+   "status": "running",
+   "reason": "",
+   "progress": {
+    "dist_done": 0.0,
+    "dist_total": 6.041,
+    "fraction": 0.0,
+    "leg": 0,
+    "legs": 1
+   }
+  },
+  {
+   "t": 29.3,
+   "event": "injection",
+   "text": "先别走了，带我去一下洗手间",
+   "injection_kind": "user_message",
+   "scheduled": 29.3
+  },
+  {
+   "t": 29.3,
+   "event": "nav_cancelled",
+   "action_id": "sim-nav-00d2a2a02f9f",
+   "kind": "navigate_to",
+   "label": "二号展区",
+   "target": {
+    "x": 12.0,
+    "y": 3.0,
+    "yaw": 1.57
+   },
+   "state": 4,
+   "result": -1,
+   "status": "cancelled",
+   "reason": "interrupted by user instruction",
+   "progress": {
+    "dist_done": 0.649,
+    "dist_total": 6.041,
+    "fraction": 0.107,
+    "leg": 0,
+    "legs": 1
+   },
+   "elapsed": 4.15,
+   "pose": {
+    "x": 6.6075,
+    "y": 3.0026,
+    "yaw": 0.0057
+   }
+  },
+  {
+   "t": 29.9,
+   "event": "nav_start",
+   "action_id": "sim-nav-9004dbd3a615",
+   "kind": "navigate_to",
+   "label": "洗手间",
+   "target": {
+    "x": 8.0,
+    "y": -3.0,
+    "yaw": -1.57
+   },
+   "state": 1,
+   "result": 0,
+   "status": "running",
+   "reason": "",
+   "progress": {
+    "dist_done": 0.0,
+    "dist_total": 6.117,
+    "fraction": 0.0,
+    "leg": 0,
+    "legs": 1
+   }
+  },
+  {
+   "t": 45.4,
+   "event": "arrive",
+   "action_id": "sim-nav-9004dbd3a615",
+   "kind": "navigate_to",
+   "label": "洗手间",
+   "target": {
+    "x": 8.0,
+    "y": -3.0,
+    "yaw": -1.57
+   },
+   "state": 4,
+   "result": 0,
+   "status": "completed",
+   "reason": "",
+   "progress": {
+    "dist_done": 6.117,
+    "dist_total": 6.117,
+    "fraction": 1.0,
+    "leg": 1,
+    "legs": 1
+   },
+   "elapsed": 15.5,
+   "pose": {
+    "x": 7.9898,
+    "y": -2.9531,
+    "yaw": -1.5139
+   }
+  },
+  {
+   "t": 45.45,
+   "event": "speak_start",
+   "action_id": "sim-tts-dbb98319d1b1",
+   "text": "洗手间到了。无障碍洗手间",
+   "duration": 2.4
+  },
+  {
+   "t": 47.9,
+   "event": "speak_end",
+   "outcome": "completed",
+   "action_id": "sim-tts-dbb98319d1b1",
+   "text": "洗手间到了。无障碍洗手间",
+   "duration": 2.4,
+   "started_at": 45.449999999999555,
+   "ended_at": 47.899999999999416,
+   "status": "completed"
+  },
+  {
+   "t": 48.55,
+   "event": "nav_start",
+   "action_id": "sim-nav-427ee3fecb27",
+   "kind": "navigate_to",
+   "label": "二号展区",
+   "target": {
+    "x": 12.0,
+    "y": 3.0,
+    "yaw": 1.57
+   },
+   "state": 1,
+   "result": 0,
+   "status": "running",
+   "reason": "",
+   "progress": {
+    "dist_done": 0.0,
+    "dist_total": 7.178,
+    "fraction": 0.0,
+    "leg": 0,
+    "legs": 1
+   }
+  },
+  {
+   "t": 68.85,
+   "event": "arrive",
+   "action_id": "sim-nav-427ee3fecb27",
+   "kind": "navigate_to",
+   "label": "二号展区",
+   "target": {
+    "x": 12.0,
+    "y": 3.0,
+    "yaw": 1.57
+   },
+   "state": 4,
+   "result": 0,
+   "status": "completed",
+   "reason": "",
+   "progress": {
+    "dist_done": 7.178,
+    "dist_total": 7.178,
+    "fraction": 1.0,
+    "leg": 1,
+    "legs": 1
+   },
+   "elapsed": 20.3,
+   "pose": {
+    "x": 11.9714,
+    "y": 2.9615,
+    "yaw": 1.5138
+   }
+  },
+  {
+   "t": 68.9,
+   "event": "speak_start",
+   "action_id": "sim-tts-6b863b009ef8",
+   "text": "二号展区到了。核心技术与专利墙",
+   "duration": 3.0
+  },
+  {
+   "t": 71.95,
+   "event": "speak_end",
+   "outcome": "completed",
+   "action_id": "sim-tts-6b863b009ef8",
+   "text": "二号展区到了。核心技术与专利墙",
+   "duration": 3.0,
+   "started_at": 68.89999999999823,
+   "ended_at": 71.94999999999806,
+   "status": "completed"
+  },
+  {
+   "t": 72.6,
+   "event": "nav_start",
+   "action_id": "sim-nav-5670f7804074",
+   "kind": "navigate_to",
+   "label": "三号展区",
+   "target": {
+    "x": 15.0,
+    "y": -4.0,
+    "yaw": 3.14
+   },
+   "state": 1,
+   "result": 0,
+   "status": "running",
+   "reason": "",
+   "progress": {
+    "dist_done": 0.0,
+    "dist_total": 7.592,
+    "fraction": 0.0,
+    "leg": 0,
+    "legs": 1
+   }
+  },
+  {
+   "t": 96.35,
+   "event": "arrive",
+   "action_id": "sim-nav-5670f7804074",
+   "kind": "navigate_to",
+   "label": "三号展区",
+   "target": {
+    "x": 15.0,
+    "y": -4.0,
+    "yaw": 3.14
+   },
+   "state": 4,
+   "result": 0,
+   "status": "completed",
+   "reason": "",
+   "progress": {
+    "dist_done": 7.592,
+    "dist_total": 7.592,
+    "fraction": 1.0,
+    "leg": 1,
+    "legs": 1
+   },
+   "elapsed": 23.75,
+   "pose": {
+    "x": 14.9793,
+    "y": -3.9571,
+    "yaw": -3.0847
+   }
+  },
+  {
+   "t": 96.4,
+   "event": "speak_start",
+   "action_id": "sim-tts-7c042ae29882",
+   "text": "三号展区到了。应用场景与合作伙伴",
+   "duration": 3.2
+  },
+  {
+   "t": 99.65,
+   "event": "speak_end",
+   "outcome": "completed",
+   "action_id": "sim-tts-7c042ae29882",
+   "text": "三号展区到了。应用场景与合作伙伴",
+   "duration": 3.2,
+   "started_at": 96.39999999999667,
+   "ended_at": 99.64999999999648,
+   "status": "completed"
+  }
+ ],
+ "transcript": [
+  {
+   "text": "入口到了。展厅入口与迎宾区",
+   "started_at": 3.7,
+   "ended_at": 6.35,
+   "status": "completed"
+  },
+  {
+   "text": "一号展区到了。早期产品与发展历程",
+   "started_at": 21.35,
+   "ended_at": 24.55,
+   "status": "completed"
+  },
+  {
+   "text": "洗手间到了。无障碍洗手间",
+   "started_at": 45.45,
+   "ended_at": 47.9,
+   "status": "completed"
+  },
+  {
+   "text": "二号展区到了。核心技术与专利墙",
+   "started_at": 68.9,
+   "ended_at": 71.95,
+   "status": "completed"
+  },
+  {
+   "text": "三号展区到了。应用场景与合作伙伴",
+   "started_at": 96.4,
+   "ended_at": 99.65,
+   "status": "completed"
+  }
+ ],
+ "waypoints": [
+  "入口",
+  "一号展区",
+  "洗手间",
+  "二号展区",
+  "三号展区"
+ ],
+ "acp_posts": [
+  {
+   "action_id": "sim-nav-f2160016611d",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-nav-f2160016611d",
+    "kind": "navigate_to",
+    "label": "入口",
+    "target": {
+     "x": 1.5,
+     "y": 0.0,
+     "yaw": 0.0
+    },
+    "state": 4,
+    "result": 0,
+    "status": "completed",
+    "reason": "",
+    "progress": {
+     "dist_done": 1.5,
+     "dist_total": 1.5,
+     "fraction": 1.0,
+     "leg": 1,
+     "legs": 1
+    },
+    "elapsed": 3.6,
+    "pose": {
+     "x": 1.3962,
+     "y": 0.0,
+     "yaw": 0.0
+    }
+   },
+   "tool": "controlled_spatial",
+   "ts": 1789870181.432128
+  },
+  {
+   "action_id": "sim-tts-6066f061b892",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-tts-6066f061b892",
+    "text": "入口到了。展厅入口与迎宾区",
+    "duration": 2.6,
+    "started_at": 3.699999999999995,
+    "ended_at": 6.349999999999985,
+    "status": "completed"
+   },
+   "tool": "tts",
+   "ts": 1789870181.432729
+  },
+  {
+   "action_id": "sim-nav-d7fa407fc4a8",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-nav-d7fa407fc4a8",
+    "kind": "navigate_to",
+    "label": "一号展区",
+    "target": {
+     "x": 6.0,
+     "y": 3.0,
+     "yaw": 1.57
+    },
+    "state": 4,
+    "result": 0,
+    "status": "completed",
+    "reason": "",
+    "progress": {
+     "dist_done": 5.448,
+     "dist_total": 5.448,
+     "fraction": 1.0,
+     "leg": 1,
+     "legs": 1
+    },
+    "elapsed": 14.3,
+    "pose": {
+     "x": 5.9588,
+     "y": 2.9752,
+     "yaw": 1.5131
+    }
+   },
+   "tool": "controlled_spatial",
+   "ts": 1789870181.459414
+  },
+  {
+   "action_id": "sim-tts-626dae3145db",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-tts-626dae3145db",
+    "text": "一号展区到了。早期产品与发展历程",
+    "duration": 3.2,
+    "started_at": 21.35000000000017,
+    "ended_at": 24.550000000000214,
+    "status": "completed"
+   },
+   "tool": "tts",
+   "ts": 1789870181.460138
+  },
+  {
+   "action_id": "sim-nav-00d2a2a02f9f",
+   "status": "cancelled",
+   "result": {
+    "action_id": "sim-nav-00d2a2a02f9f",
+    "kind": "navigate_to",
+    "label": "二号展区",
+    "target": {
+     "x": 12.0,
+     "y": 3.0,
+     "yaw": 1.57
+    },
+    "state": 4,
+    "result": -1,
+    "status": "cancelled",
+    "reason": "interrupted by user instruction",
+    "progress": {
+     "dist_done": 0.649,
+     "dist_total": 6.041,
+     "fraction": 0.107,
+     "leg": 0,
+     "legs": 1
+    },
+    "elapsed": 4.15,
+    "pose": {
+     "x": 6.6075,
+     "y": 3.0026,
+     "yaw": 0.0057
+    }
+   },
+   "tool": "controlled_spatial",
+   "ts": 1789870181.4828491
+  },
+  {
+   "action_id": "sim-nav-9004dbd3a615",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-nav-9004dbd3a615",
+    "kind": "navigate_to",
+    "label": "洗手间",
+    "target": {
+     "x": 8.0,
+     "y": -3.0,
+     "yaw": -1.57
+    },
+    "state": 4,
+    "result": 0,
+    "status": "completed",
+    "reason": "",
+    "progress": {
+     "dist_done": 6.117,
+     "dist_total": 6.117,
+     "fraction": 1.0,
+     "leg": 1,
+     "legs": 1
+    },
+    "elapsed": 15.5,
+    "pose": {
+     "x": 7.9898,
+     "y": -2.9531,
+     "yaw": -1.5139
+    }
+   },
+   "tool": "controlled_spatial",
+   "ts": 1789870181.518336
+  },
+  {
+   "action_id": "sim-tts-dbb98319d1b1",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-tts-dbb98319d1b1",
+    "text": "洗手间到了。无障碍洗手间",
+    "duration": 2.4,
+    "started_at": 45.449999999999555,
+    "ended_at": 47.899999999999416,
+    "status": "completed"
+   },
+   "tool": "tts",
+   "ts": 1789870181.518995
+  },
+  {
+   "action_id": "sim-nav-427ee3fecb27",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-nav-427ee3fecb27",
+    "kind": "navigate_to",
+    "label": "二号展区",
+    "target": {
+     "x": 12.0,
+     "y": 3.0,
+     "yaw": 1.57
+    },
+    "state": 4,
+    "result": 0,
+    "status": "completed",
+    "reason": "",
+    "progress": {
+     "dist_done": 7.178,
+     "dist_total": 7.178,
+     "fraction": 1.0,
+     "leg": 1,
+     "legs": 1
+    },
+    "elapsed": 20.3,
+    "pose": {
+     "x": 11.9714,
+     "y": 2.9615,
+     "yaw": 1.5138
+    }
+   },
+   "tool": "controlled_spatial",
+   "ts": 1789870181.5667589
+  },
+  {
+   "action_id": "sim-tts-6b863b009ef8",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-tts-6b863b009ef8",
+    "text": "二号展区到了。核心技术与专利墙",
+    "duration": 3.0,
+    "started_at": 68.89999999999823,
+    "ended_at": 71.94999999999806,
+    "status": "completed"
+   },
+   "tool": "tts",
+   "ts": 1789870181.56761
+  },
+  {
+   "action_id": "sim-nav-5670f7804074",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-nav-5670f7804074",
+    "kind": "navigate_to",
+    "label": "三号展区",
+    "target": {
+     "x": 15.0,
+     "y": -4.0,
+     "yaw": 3.14
+    },
+    "state": 4,
+    "result": 0,
+    "status": "completed",
+    "reason": "",
+    "progress": {
+     "dist_done": 7.592,
+     "dist_total": 7.592,
+     "fraction": 1.0,
+     "leg": 1,
+     "legs": 1
+    },
+    "elapsed": 23.75,
+    "pose": {
+     "x": 14.9793,
+     "y": -3.9571,
+     "yaw": -3.0847
+    }
+   },
+   "tool": "controlled_spatial",
+   "ts": 1789870181.626949
+  },
+  {
+   "action_id": "sim-tts-7c042ae29882",
+   "status": "completed",
+   "result": {
+    "action_id": "sim-tts-7c042ae29882",
+    "text": "三号展区到了。应用场景与合作伙伴",
+    "duration": 3.2,
+    "started_at": 96.39999999999667,
+    "ended_at": 99.64999999999648,
+    "status": "completed"
+   },
+   "tool": "tts",
+   "ts": 1789870181.6279092
+  }
+ ],
+ "trail_occupied": 0
+}

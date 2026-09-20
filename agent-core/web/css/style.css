@@ -8589,3 +8589,399 @@ html, body {
   color: var(--text-muted);
 }
 .deploy-progress-minimized-progress.error { color: var(--red); }
+
+/* ── 基准测试面板 ─────────────────────────────────────────────────────────── */
+/*
+   这个面板只回答一个问题：**分数动没动，为什么。**
+   它继承房子的配色与字体 —— 它是嵌在仪表盘里的一块，不是另一个 app。设计判断花在
+   结构上：
+   - 左右分栏。「挑要跑什么」是一次性动作，收进窄栏；「读跑出了什么」是反复做的事，
+     占主区。三个一样大的方块堆叠会让两者显得一样重要。
+   - 历史里分数画在**共享的 0-100 轴**上，标准差是须线，样本量印在刻度旁，模型与
+     镜像 tag 作为这一行的身份。一个不带样本量、不带被测配置的分数是噪音；把它们拆成
+     四个能各读各的列，等于邀请人只看那个数字。
+   - 每个 case 一条五段维度条。失败时「断在哪一维」是下一步动作的依据，不该再点一层。
+*/
+
+.benchmark-modal { width: min(1040px, 94vw); height: min(760px, 88vh); }
+.benchmark-modal .modal-body { flex: 1; min-height: 0; }
+
+.benchmark-modal .modal-header { gap: 12px; }
+.bm-header-meta {
+  margin-left: auto; display: flex; gap: 14px; align-items: baseline;
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bm-header-meta b { font-weight: 500; color: var(--text-muted); }
+
+/* 左栏装的是主体内容（用例卡），不是一列勾选框 —— 236px 是给勾选框留的宽度，
+   用例名在那个宽度里要断成两行，站数和「已在画布上」会断得更碎。 */
+.benchmark-body { display: grid; grid-template-columns: 330px 1fr; padding: 0; overflow: hidden; }
+
+.bm-h {
+  margin: 0; font-size: 12px; font-weight: 600; color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
+
+/* ── 左栏：挑 ─────────────────────────────────────────────────────────────── */
+
+.bm-pick {
+  border-right: 1px solid var(--border); display: flex; flex-direction: column;
+  min-height: 0; background: var(--bg);
+}
+.bm-pick-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 14px 16px 8px;
+}
+.bm-scenarios { flex: 1; min-height: 0; overflow-y: auto; padding: 0 10px 10px; }
+
+.bm-scenario {
+  display: block; padding: 9px 10px; border-radius: var(--radius-sm); cursor: pointer;
+}
+.bm-scenario:hover { background: var(--bg-hover); }
+.bm-scenario input { float: left; margin: 3px 9px 0 0; accent-color: var(--accent); }
+.bm-scenario-name { display: block; font-size: 13px; line-height: 1.35; }
+.bm-scenario-meta {
+  display: block; margin-left: 22px; font-size: 11px; color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+.bm-launch { border-top: 1px solid var(--border); padding: 12px 16px 14px; }
+.bm-repeats-row {
+  display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-muted);
+}
+.bm-repeats-row input {
+  width: 54px; padding: 4px 7px; border: 1px solid var(--border-med);
+  border-radius: var(--radius-xs); background: var(--bg-card); color: var(--text);
+  font-family: var(--font-mono); font-size: 13px; text-align: center;
+}
+/* n=1 是一次抛硬币，不是结论。这行字在重复次数是 1 的时候才出现。 */
+.bm-note { margin: 7px 0 0; font-size: 11px; line-height: 1.45; color: var(--yellow); }
+.bm-run { width: 100%; margin-top: 12px; }
+.bm-abort { display: block; width: 100%; margin-top: 8px; text-align: center; }
+
+.bm-linkbtn {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font: inherit; font-size: 11px; color: var(--text-dim);
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.bm-linkbtn:hover { color: var(--accent); }
+
+/* ── 用例库 ───────────────────────────────────────────────────────────────── */
+
+.bm-lib-tabs {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px 8px; border-bottom: 1px solid var(--border);
+}
+.bm-lib-spacer { flex: 1; }
+.bm-lib-tab {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font: inherit; font-size: 13px; color: var(--text-dim);
+}
+.bm-lib-tab.active { color: var(--text); font-weight: 500; }
+.bm-lib-panel { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 16px 4px; }
+
+/* 一张用例卡就是一次「跑什么」的完整决定：叫什么、上次多少分、说的哪句话、
+   还差什么。分开摆的话，要人自己在两处之间对起来。 */
+.bm-card {
+  padding: 10px 0 11px; border-bottom: 1px solid var(--border);
+}
+.bm-card--loaded { border-left: 2px solid var(--accent); padding-left: 9px; }
+.bm-card-head { display: flex; align-items: baseline; gap: 10px; }
+.bm-card-name {
+  flex: 1; min-width: 0; font-size: 13px; line-height: 1.35; color: var(--text);
+}
+.bm-card-score {
+  font-family: var(--font-mono); font-size: 12.5px; color: var(--text);
+  white-space: nowrap;
+}
+.bm-card-score--none { font-size: 11px; color: var(--text-dim); }
+/* 初始指令是用户会说的那句话 —— 让它读起来像一句话，不像一个字段。 */
+.bm-card-prompt {
+  margin: 3px 0 6px; font-size: 12px; line-height: 1.5; color: var(--text-muted);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.bm-card-foot { display: flex; align-items: center; gap: 10px; }
+.bm-card-meta {
+  flex: 1; min-width: 0; font-size: 11px; color: var(--text-dim);
+  font-family: var(--font-mono); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 「已在画布上」排在 meta 最前面，不排在最后：这一行会省略号截断，排在后面的那条
+   信息会被吃掉，而「这张就是画布上那张」正是扫列表时最需要看见的一条。 */
+.bm-card-flag {
+  margin-right: 7px; color: var(--accent); font-style: normal; white-space: nowrap;
+}
+.bm-card-flag::after { content: ' ·'; color: var(--text-dim); }
+.bm-card-actions { display: flex; align-items: center; gap: 10px; }
+.bm-cardrun {
+  padding: 2px 11px; border: 1px solid var(--border-med); border-radius: var(--radius-xs);
+  background: var(--bg-card); color: var(--text); font: inherit; font-size: 12px;
+  cursor: pointer;
+}
+.bm-cardrun:hover { border-color: var(--accent); color: var(--accent); }
+
+.bm-blocked, .bm-overwrite { padding: 4px 2px 8px; }
+.bm-blocked b { color: var(--text); }
+
+/* ── 用例：载入前的那一次覆盖 ─────────────────────────────────────────────── */
+
+.bm-case-block { padding: 0 16px 12px; border-bottom: 1px solid var(--border); }
+.bm-case-block .bm-empty { padding: 10px 0 4px; }
+.bm-case-loaded { padding: 4px 0 2px; }
+.bm-case-title { font-size: 13px; line-height: 1.35; color: var(--text); }
+/* 用例的初始指令就是用户会说的那句话，所以让它读起来像一句话，不像一个字段。 */
+.bm-case-prompt {
+  margin: 4px 0 8px; font-size: 12px; line-height: 1.5; color: var(--text-muted);
+}
+.bm-case-ok { font-size: 11.5px; color: var(--green); }
+/* 缺什么按层列出来：每一条的下一步动作都不一样。 */
+.bm-blockers { margin: 2px 0 8px; padding: 0; list-style: none; }
+.bm-blockers li {
+  font-size: 11.5px; line-height: 1.6; color: var(--yellow);
+  padding-left: 12px; text-indent: -12px;
+}
+.bm-blockers li::before { content: "· "; }
+.bm-blockers b { color: var(--text); font-family: var(--font-mono); font-weight: 500; }
+/* 覆盖是默认不做的事，所以勾选框是显式的一步，不是一句脚注。 */
+.bm-confirm {
+  display: flex; align-items: center; gap: 7px; margin: 9px 0 0;
+  font-size: 12px; color: var(--text-muted); cursor: pointer;
+}
+.bm-confirm input { accent-color: var(--accent); }
+.bm-case-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.bm-case-actions .btn-primary { flex: 1; }
+.bm-case-actions .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+/* 跑完只提示还原，不自动做 —— 自动会在用户正看着结果的时候把画布抽走。 */
+.bm-restore {
+  margin-top: 10px; padding: 9px 11px; border: 1px dashed var(--border-med);
+  border-radius: var(--radius-xs); font-size: 11.5px; color: var(--text-muted);
+}
+.bm-restore .bm-linkbtn { margin-left: 6px; }
+
+/* ── 右栏：读 ─────────────────────────────────────────────────────────────── */
+
+.bm-read { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.bm-block { padding: 14px 18px; border-bottom: 1px solid var(--border); min-height: 0; }
+.bm-block--grow { flex: 1; display: flex; flex-direction: column; border-bottom: none; }
+.bm-block > .bm-h { margin-bottom: 10px; }
+.bm-block--grow > div { flex: 1; min-height: 0; overflow-y: auto; }
+
+.bm-empty {
+  padding: 18px 2px; font-size: 12.5px; line-height: 1.6; color: var(--text-muted);
+}
+.bm-empty code {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--text);
+  background: var(--bg-input); padding: 1px 5px; border-radius: var(--radius-xs);
+}
+
+/* ── 分数刻度：共享 0-100 轴 ───────────────────────────────────────────────── */
+
+.bm-run-row {
+  /* 身份列不吃满：中间留一条大空沟会让「哪一次」和「多少分」读成两件事，
+     而这个设计的全部意图正是让它们分不开。 */
+  display: grid; grid-template-columns: minmax(0, 320px) minmax(220px, 1fr); gap: 20px;
+  align-items: center; padding: 9px 2px; border-bottom: 1px solid var(--border);
+}
+.bm-run-row:last-child { border-bottom: none; }
+.bm-run-id { min-width: 0; }
+.bm-run-when { font-size: 12.5px; }
+.bm-run-config {
+  display: block; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 轴线在下、数字在上：先前两者同高，刻度正好从数字中间穿过去。 */
+.bm-axis { position: relative; height: 30px; margin: 0 24px 0 8px; }
+/* 轴本身很轻。要被看见的是刻度的位置，不是轴。 */
+.bm-axis::before {
+  content: ''; position: absolute; left: 0; right: 0; top: 21px; height: 1px;
+  background: var(--border-med);
+}
+.bm-axis-mark {
+  position: absolute; top: 17px; width: 1px; height: 6px; background: var(--border-med);
+}
+/* 不确定度是背景信息，刻度才是主角：须线做成一条细线，不做成色块。 */
+.bm-whisker {
+  position: absolute; top: 21px; height: 1px;
+  background: var(--accent); opacity: 0.35;
+}
+.bm-tick {
+  position: absolute; top: 15px; width: 3px; height: 13px; border-radius: 2px;
+  background: var(--accent); transform: translateX(-1.5px);
+}
+.bm-tick--none { background: var(--text-dim); }
+.bm-score {
+  position: absolute; top: 0; transform: translateX(-50%);
+  font-family: var(--font-mono); font-size: 12.5px; font-weight: 600;
+  font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap;
+}
+/* 右半边的分数向左展开、左半边向右展开 —— 数字永远朝轴心里侧，不会被切掉。 */
+.bm-score--start { transform: translateX(-2px); }
+.bm-score--end   { transform: translateX(calc(-100% + 2px)); }
+/* 样本量永远贴着分数走，不另起一列。 */
+.bm-n { font-weight: 400; font-size: 10.5px; color: var(--text-muted); margin-left: 3px; }
+
+/* ── 进行中 ───────────────────────────────────────────────────────────────── */
+
+.bm-progress-head {
+  display: flex; align-items: baseline; gap: 12px; font-size: 12.5px;
+  color: var(--text-muted); margin-bottom: 9px;
+}
+.bm-progress-head b {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-weight: 600; color: var(--text);
+}
+.bm-state { color: var(--text-dim); }
+.bm-state--running { color: var(--accent); }
+.bm-state--done { color: var(--green); }
+
+.bm-case {
+  display: grid; grid-template-columns: 1fr 74px 56px; gap: 12px;
+  align-items: center; padding: 6px 2px; font-size: 12.5px;
+  border-bottom: 1px solid var(--border);
+}
+.bm-case:last-child { border-bottom: none; }
+.bm-case-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bm-case-name i { font-style: normal; color: var(--text-dim); font-family: var(--font-mono); }
+.bm-case-score {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right;
+}
+.bm-case-outcome { font-size: 11.5px; }
+.bm-case-outcome--ok { color: var(--green); }
+.bm-case-outcome--pending { color: var(--text-dim); }
+.bm-case-outcome--stalled,
+.bm-case-outcome--timeout,
+.bm-case-outcome--error { color: var(--red); }
+
+/* 五段维度条：失败时「断在哪一维」是下一步动作的依据。 */
+.bm-dims { display: flex; gap: 2px; margin-top: 3px; }
+.bm-dim { height: 3px; flex: 1; border-radius: 1px; background: var(--border); }
+.bm-dim--ok { background: var(--green); }
+.bm-dim--bad { background: var(--red); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .bm-tick, .bm-whisker { transition: left 160ms ease, width 160ms ease; }
+}
+
+@media (max-width: 860px) {
+  .benchmark-body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .bm-pick { border-right: none; border-bottom: 1px solid var(--border); max-height: 40%; }
+  .bm-run-row { grid-template-columns: 1fr; gap: 4px; }
+}
+
+
+/* ── 用例编辑器 ───────────────────────────────────────────────────────────── */
+/* 改的几乎全是自然语言，所以这里像一张写字的表单，不像一个配置面板。 */
+
+.bm-editor-modal { width: min(680px, 92vw); max-height: 86vh; display: flex;
+                   flex-direction: column; }
+.bm-editor-body { padding: 16px 20px; overflow-y: auto; }
+.bm-ed-row { margin-bottom: 16px; }
+.bm-ed-label {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 5px;
+  font-size: 12px; color: var(--text-muted);
+}
+.bm-ed-input {
+  width: 100%; padding: 6px 9px; border: 1px solid var(--border-med);
+  border-radius: var(--radius-xs); background: var(--bg-input); color: var(--text);
+  font: inherit; font-size: 13px;
+}
+.bm-ed-input:focus { outline: none; border-color: var(--accent); }
+/* 初始指令与插话是人说的话，给它们正文的行距，不是输入框的行距。 */
+.bm-ed-prose { line-height: 1.6; resize: vertical; }
+.bm-ed-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bm-ed-inline + .bm-ed-inline { margin-top: 7px; }
+.bm-ed-sm { width: 138px; }
+.bm-ed-xs { width: 84px; text-align: center; font-family: var(--font-mono); }
+.bm-ed-hint {
+  margin: 4px 0 0; font-size: 11px; line-height: 1.5; color: var(--text-dim);
+}
+.bm-ed-checks { display: flex; gap: 20px; font-size: 12.5px; color: var(--text-muted); }
+.bm-ed-checks input, .bm-ed-injection input[type="radio"] { accent-color: var(--accent); }
+/* 标签写在框外，不靠 placeholder —— placeholder 在填了值之后就消失了，
+   填完的表单会变成一排没有名字的数字。 */
+.bm-ed-weight { display: flex; align-items: center; gap: 6px;
+                font-size: 11.5px; color: var(--text-dim); white-space: nowrap; }
+.bm-ed-unit { font-size: 11.5px; color: var(--text-dim); }
+.bm-ed-injection {
+  padding: 9px 11px; margin-bottom: 8px; border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+}
+.bm-ed-injection label { font-size: 12px; color: var(--text-muted); }
+.bm-ed-injection textarea { margin-top: 7px; }
+/* 校验结果常驻在保存按钮旁边：编辑分几次做完，存一半不该被拒，
+   但「还差什么」要随时看得见，而不是等点「跑」才说。 */
+.bm-editor-foot {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 20px; border-top: 1px solid var(--border);
+}
+.bm-editor-problems { flex: 1; min-width: 0; max-height: 64px; overflow-y: auto; }
+.bm-editor-problems .bm-blockers { margin: 0; }
+
+
+/* ── 运行详情 ───────────────────────────────────────────────────────────── */
+/* 一条共享时间轴，两条泳道。先前是左右两栏各自排版 —— 时刻本来就是对的，但同一秒
+   在两边的高度不同，读的人得拿眼睛找数字，等于没对齐。 */
+
+.bm-timeline-modal { width: min(1120px, 95vw); max-height: 88vh;
+                     display: flex; flex-direction: column; }
+.bm-timeline-body { padding: 14px 20px 18px; overflow-y: auto; }
+.bm-tl-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+.bm-tl-score { font-family: var(--font-mono); font-size: 22px; color: var(--text); }
+.bm-tl-meta { font-size: 11.5px; color: var(--text-dim); font-family: var(--font-mono); }
+.bm-tl-fail { margin-bottom: 8px; font-size: 12px; color: var(--yellow); }
+
+/* 时间列在正中间：两侧都贴着它，同一秒必然同一行。 */
+.bm-tl-r {
+  display: grid; grid-template-columns: 1fr 64px 1fr; gap: 10px;
+  align-items: baseline; padding: 2px 0;
+}
+.bm-tl-r--headrow {
+  padding: 8px 0 6px; border-bottom: 1px solid var(--border); margin-bottom: 4px;
+  font-size: 11px; font-weight: 600; color: var(--text-muted);
+}
+.bm-tl-t {
+  text-align: center; font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--text-dim); white-space: nowrap;
+}
+/* agent 一侧靠右、世界一侧靠左，两边都朝中间那条时间轴收 —— 视线不用横跨整屏。 */
+.bm-tl-left { text-align: right; min-width: 0; }
+.bm-tl-right { min-width: 0; }
+
+.bm-tl-turnhead { font-size: 12px; color: var(--text); }
+.bm-tl-session { margin-left: 8px; color: var(--text-dim); font-style: normal; opacity: .75; }
+/* 触发这一轮的那句话是人（或系统）说的 —— 排成一句话，不排成一个字段。 */
+.bm-tl-trigger { display: block; font-size: 12px; line-height: 1.5; color: var(--text); }
+.bm-tl-says { display: block; font-size: 12px; line-height: 1.55; color: var(--text-muted); }
+.bm-tl-callname {
+  font-family: var(--font-mono); font-size: 11px; color: var(--accent);
+  font-weight: 500; margin-right: 6px;
+}
+.bm-tl-args { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+.bm-tl-kind { font-size: 11.5px; color: var(--text); margin-right: 8px; }
+.bm-tl-kind--minor { color: var(--text-dim); opacity: .55; }
+.bm-tl-detail { font-size: 11.5px; color: var(--text-muted); }
+.bm-tl-detail i { color: var(--text-dim); font-style: normal; }
+
+/* 省略号里常常正是要看的东西（完整讲解词、整串参数）。默认一行，点开看全文 ——
+   不用跳去翻 docker logs。 */
+.bm-clip {
+  display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; vertical-align: bottom; cursor: pointer;
+}
+.bm-clip--open { white-space: pre-wrap; word-break: break-word; overflow: visible; }
+.bm-clip:hover { text-decoration: underline dotted var(--border-med); }
+
+/* 每一段静默都画出来：排查时要看的就是时间去哪儿了。短停顿是节奏，安静地记一笔；
+   长静默是事故，得看得见。 */
+.bm-tl-r--quiet .bm-tl-t { color: var(--text-dim); font-size: 10px; }
+.bm-tl-r--loud .bm-tl-t { color: var(--yellow); font-size: 11px; }
+
+.bm-run-row { cursor: pointer; }
+.bm-run-row:hover { background: var(--bg-hover, rgba(0,0,0,.03)); }
+
+@media (max-width: 760px) {
+  .bm-tl-r { grid-template-columns: 1fr 52px 1fr; gap: 6px; }
+}

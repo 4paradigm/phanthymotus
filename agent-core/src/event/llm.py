@@ -778,10 +778,15 @@ _NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任
 
 只输出那一句话。不要调用任何工具，不要写别的内容。
 
-必须落到**具体的事实**上，按这个顺序（没有的就跳过，不要硬凑）：
-1. 已经做完了什么 —— 查了什么、看到了什么、去了哪
-2. 其中值得说的发现 —— 具体的数字、名称、结论
-3. 接下来要做什么
+这句话每 15 秒左右才有一次，它的作用是**承上启下**：让还在等的人知道事情在往前走、
+下一步是什么。所以重心放在**当前和接下来**，已经做完的事只作铺垫，一句带过。
+
+按这个顺序（没有的就跳过，不要硬凑）：
+1. 正在做什么 / 接下来要做什么 —— 这是重点
+2. 支撑它的那件已完成的事，以及其中值得说的发现（具体的数字、名称、结论）
+
+不要把已完成的事说成"刚刚完成"的样子 —— 它可能是十几秒前的事了，听起来会像机器人
+在原地复述。
 
 下面的"过程记录"只包含**上次汇报之后新发生的事**，所以直接讲这些新东西就行，
 不用再把之前说过的重复一遍、也不用做总结。
@@ -795,28 +800,54 @@ _NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任
 结尾也不要凑话。"马上整理成报告""很快就好""稍后告诉你"这类收尾没有任何信息量，
 说完最后一件具体的事就停住。
 
-正面例子：
-- "财报和机构评级都查到了，营收同比涨了一倍，还差估值那部分"
-- "客厅和厨房都找过了没有，接下来去卧室"
-- "第一家店关门了，正在查附近还有哪几家"
+正面例子（都落在"接下来"上，已完成的部分只是铺垫）：
+- "营收和机构评级查到了，正在算估值这一块"
+- "客厅和厨房都没有，接着去卧室找"
+- "第一家店关门了，正在看附近还有哪几家开着"
 
 其他要求：
 - 口语，会被直接念出来。不要 markdown、编号、括号注释、工具名、文件路径。
-- 不超过 40 个字。宁可只说一件具体的事，也不要三件都含糊带过。
+- 一两句话，把事情说清楚就停。**不要为了短而把名字、地点砍掉或缩写** —— 说完整的
+  名字比省几个字重要。
+- **时长只能用下面「当前等待」里给出的数，一个字都不要自己算。** 过程记录里那些
+  时间戳不是拿来做减法的 —— 真机上照着它们算，算出过"大约等了 25 秒"这种数。
+  「当前等待」里没有的，就别提时长。
 - 用用户的语言。
 - 只说过程记录里**真实发生过**的事，没查到的别编。
 {last}
 如果过程记录里确实还没有任何具体进展（比如刚开始、还没拿到任何结果），
 只输出 SKIP 三个字母 —— 这种时候沉默比说一句空话好。
 
+当前等待（这是唯一可靠的时长来源）：
+{waiting}
+
 过程记录：
 {context}
 """
 
-# 播出去之前的硬上限。prompt 里的"不超过 40 个字"是承重的 —— 这段话会注册成一个 ACP
-# pending，超时按 len(text)/3 + 10 算，下一个需要 barrier 的工具调用（含 finish）都得
-# 等它播完。模型经常无视长度约束，所以代码侧也要截。
-_NARRATION_MAX_CHARS = 120
+# 播出去之前的上限。这段话会注册成一个 ACP pending，超时按 len(text)/3 + 10 算，下一个
+# 需要 barrier 的工具调用（含 finish）都得等它播完 —— 所以不能无限长。
+#
+# 但**从中间砍是错的**：真机上把人名、展位名砍成半截播了出去，听的人只会以为机器人
+# 出故障了。宁可多播几个字，也不要播一个断掉的词。所以放宽上限，并且只在句读处收尾。
+_NARRATION_MAX_CHARS = 200
+_SENTENCE_ENDS = '。！？!?；;…'
+
+
+def _trim_narration(text: str, limit: int = _NARRATION_MAX_CHARS) -> str:
+    """超长时在**句读处**收尾，不从字中间砍。
+
+    截到一半的名字比长一点的句子糟得多：用户听到的是「我们到了算力工」然后戛然而止。
+    找不到句读就整句退回上一个逗号；再找不到，才认了硬截 —— 但那时至少已经尽力。
+    """
+    text = (text or '').strip()
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    cut = max((window.rfind(ch) for ch in _SENTENCE_ENDS), default=-1)
+    if cut < limit // 3:                       # 句读太靠前，整句都没了，退而求其次
+        cut = max((window.rfind(ch) for ch in '，,、 '), default=-1)
+    return window[:cut + 1].strip() if cut > 0 else window
 
 # 「一台机器上没有任何 on_notify 绑定」只值得说一次，但必须说 —— 见 _report_progress。
 _warned_no_notify = False
@@ -901,6 +932,12 @@ def _stop_countdown() -> None:
     _silence_countdown = None
 
 
+# 沉默是从哪一刻开始的。播报要说「已经等了多久」，这是唯一说得准的那个数 ——
+# 播报那次 LLM 调用看不到当前时刻，让它自己从历史时间戳里凑，凑出来的就是天轶上
+# 那句「大约等了 25 秒」。
+_silence_since: float | None = None
+
+
 def _start_countdown() -> None:
     """开始计时；**已在计时则不动**（不把正在跑的 deadline 往后推）。"""
     global _silence_countdown
@@ -916,7 +953,8 @@ def _restart_countdown() -> None:
 
 
 def _spawn_countdown() -> None:
-    global _silence_countdown
+    global _silence_countdown, _silence_since
+    _silence_since = time.time()      # 用户从这一刻起没再听到任何东西
     _, seconds_thr = _narration_thresholds()
     if seconds_thr <= 0:
         _silence_countdown = None
@@ -1071,8 +1109,30 @@ def _build_narration_messages(*, frozen_system: dict, context: str,
     last = (f'- 不要重复你上次已经播报过的：「{last_report_text}」' if last_report_text else '')
     return [
         frozen_system,
-        {'role': 'user', 'content': _NARRATION_PROMPT.format(last=last, context=context)},
+        {'role': 'user', 'content': _NARRATION_PROMPT.format(
+            last=last, context=context, waiting=_waiting_facts())},
     ]
+
+
+def _waiting_facts() -> str:
+    """这一刻等了多久、在等什么 —— 由框架算好交给模型。
+
+    模型没有别的办法拿到这个数：播报那次调用里既没有当前时刻，也没有 pending 列表，
+    过程记录里只有几条历史时间戳。让它自己减，就减出了「大约等了 25 秒」。
+    """
+    lines = []
+    if _silence_since is not None:
+        lines.append(f'- 距你上次开口：{int(time.time() - _silence_since)} 秒')
+    try:
+        import mcp_client
+        for wait in mcp_client.pending_waits()[:3]:
+            tool = wait['tool'] or '某个动作'
+            lines.append(f'- 正在等 {tool} 完成：已等 {wait["seconds"]} 秒')
+    except Exception:
+        pass
+    if not lines:
+        return '（这一刻没有在等任何东西，也就没有"等了多久"可说）'
+    return '\n'.join(lines)
 
 
 # ── Tiered Retention helpers ──────────────────────────────────────────────────
@@ -1516,22 +1576,49 @@ class Event:
 
     # ── 打断：中止正在进行的输出 ─────────────────────────────────────────────
 
-    async def _interrupt_active_outputs(self):
-        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled 时调用。
-        优先使用 hook 系统；fallback 到硬编码查找。"""
+    async def _interrupt_active_outputs(self, reason: str = ''):
+        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled / 新用户 turn 时调用。
+
+        **hook 与硬编码兜底都跑，不是二选一。** 这两条路覆盖的是**不相交**的两组
+        卡片：hook 覆盖「自己声明了 `on_interrupt_all` 绑定」的卡，兜底覆盖「叫
+        `tts`/`loco` 但没声明绑定」的卡。当成二选一，另一组就永远碰不到。
+
+        以前是 `if results: return`，而 `hooks.fire` 对**每一个执行过的绑定**都追加
+        一条结果，**包括抛异常的和什么都没做的**。于是「存在绑定」被当成了「打断已
+        处理」，一张卡的绑定替全机队关掉了兜底。
+
+        Orin6 实测（2026-09-19）：actucore 的 `vla` 卡绑着 `on_interrupt_all`，卡片
+        没在跑时返回 `{"state":"idle","message":"卡片未在运行"}` —— 什么都没做，却
+        让 `results` 非空。它是那台机器上**唯一**的绑定，而 actucore 跑在每一台机器人
+        上。直接探未修复的这个函数，它打印
+        「interrupted via on_interrupt_all hook (1 binding(s))」，而实际只叫了 vla，
+        `tts` 和 `loco` 一次都没被调用。
+
+        受影响的是**运动**。语音未必：ASR 的 barge-in 另有一条 `on_interrupt_speak`
+        会停住 TTS（Orin6 上实测确实停了），所以按打断来源不同，语音可能侥幸得救。
+        而底盘/导航只有这一条路，兜底被跳过就真的不停。
+
+        去重按 `(mcp_id, tool)`：hook 已经成功叫停过的那张卡不再叫第二次。叫停本身
+        是幂等的，所以重复调用无害，但日志会变得难读。
+        """
         import hooks
         from peer import mcp_bridge
-        results = await hooks.fire('on_interrupt_all')
-        if results:
-            # Hook handled it — also clear pending ACP
-            for aid in list(mcp_client._pending_actions.keys()):
-                mcp_client._pending_actions[aid].set()
-            _stop_countdown()   # 打断 = 用户在说话，不是沉默的起点
-            print(f'[decision] interrupted via on_interrupt_all hook ({len(results)} binding(s))')
-            return
 
-        # Fallback: hardcoded lookup (no hook registered)
-        #
+        try:
+            hook_results = await hooks.fire('on_interrupt_all')
+        except Exception as exc:
+            # 打断路径是最不该抛异常的地方：它跑在 TurnCancelled 处理里，抛出去就
+            # 连兜底一起丢了 —— 而兜底恰恰是这时候唯一还能停住机器人的东西。
+            print(f'[decision] on_interrupt_all hook raised: {exc}')
+            hook_results = []
+        # 只有**成功**的绑定才算覆盖到：抛异常的那张卡并没有被叫停，若它恰好也叫
+        # tts/loco，兜底该再试一次。非 dict 的条目当成「不知道覆盖了谁」，宁可让
+        # 兜底多叫一次（叫停是幂等的），也不要漏。
+        covered = {(r.get('mcp_id'), r.get('tool')) for r in hook_results
+                   if isinstance(r, dict) and 'error' not in r}
+        hook_failures = [r for r in hook_results if isinstance(r, dict) and 'error' in r]
+        tasks = []
+
         # registry[mcp_id]['tools'] holds *bare* plugin names ('tts', 'loco') --
         # mcp_client._connect_one does `tools.append(tool['name'])`. This used to
         # hand those straight to call_tool(), which parses its argument as a full
@@ -1547,7 +1634,6 @@ class Event:
         # Deliberately not interrupting switch_mode: aborting a posture change
         # partway is how a controlled descent becomes a fall, so a running
         # stand-up/lie-down is left to finish.
-        tasks = []
         for mcp_id, info in mcp_client.registry.items():
             if not info.get('online'):
                 continue
@@ -1564,26 +1650,40 @@ class Event:
                 continue
             tools = info.get('tools', [])
             for short_name, action in (('tts', 'interrupt'), ('loco', 'stop_move')):
-                if short_name in tools:
+                if short_name in tools and (mcp_id, short_name) not in covered:
                     tasks.append((f'{mcp_id}:{short_name}',
                                   mcp_client.call_tool_direct(mcp_id, short_name,
                                                               {'action': action})))
-        if not tasks:
-            print('[decision] interrupt_active_outputs: no tts/loco tool registered')
-            return
 
-        labels = [label for label, _ in tasks]
-        results = await asyncio.gather(*[coro for _, coro in tasks],
-                                       return_exceptions=True)
         ok = 0
-        for label, r in zip(labels, results):
-            if isinstance(r, Exception):
-                print(f'[decision] interrupt_active_outputs: {label} raised: {r}')
-            elif isinstance(r, dict) and r.get('error'):
-                print(f'[decision] interrupt_active_outputs: {label} failed: {r["error"]}')
-            else:
-                ok += 1
-        print(f'[decision] interrupted {ok}/{len(tasks)} active output(s) (fallback)')
+        if tasks:
+            labels = [label for label, _ in tasks]
+            results = await asyncio.gather(*[coro for _, coro in tasks],
+                                           return_exceptions=True)
+            for label, r in zip(labels, results):
+                if isinstance(r, Exception):
+                    print(f'[decision] interrupt_active_outputs: {label} raised: {r}')
+                elif isinstance(r, dict) and r.get('error'):
+                    print(f'[decision] interrupt_active_outputs: {label} failed: {r["error"]}')
+                else:
+                    ok += 1
+
+        # Unconditionally, on both paths. Previously this ran only when a hook was
+        # bound, so a robot with no binding kept its pending ACP actions blocked —
+        # the barrier never released — and the silence countdown kept running
+        # through a barge-in.
+        for aid in list(mcp_client._pending_actions.keys()):
+            if reason:
+                mcp_client._pending_results[aid] = {'status': 'cancelled', 'reason': reason}
+            mcp_client._pending_actions[aid].set()
+        _stop_countdown()   # 打断 = 用户在说话，不是沉默的起点
+
+        if not hook_results and not tasks:
+            print('[decision] interrupt_active_outputs: nothing to interrupt '
+                  '(no on_interrupt_all binding, no tts/loco tool)')
+            return
+        print(f'[decision] interrupted: {len(covered)} via hook, {ok}/{len(tasks)} via fallback'
+              + (f', {len(hook_failures)} hook binding(s) failed' if hook_failures else ''))
 
 
     # ── 主循环 ───────────────────────────────────────────────────────────────
@@ -1886,8 +1986,7 @@ class Event:
             print(f'[decision] narration: same as last, skipped → "{report}"')
             _restart_countdown()
             return
-        if len(report) > _NARRATION_MAX_CHARS:
-            report = report[:_NARRATION_MAX_CHARS]
+        report = _trim_narration(report)
 
         results = await hooks.fire('on_notify', {'text': report}, barrier_aware=True)
         if not _notify_fire_spoke(results):
@@ -2010,19 +2109,12 @@ class Event:
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
         if (mcp_client.get_pending_actions() and not bot_restricted
                 and not _trigger_is_self_originated(trigger_event)):
-            _int_results = await hooks.fire('on_interrupt_all')
-            if _int_results:
-                for aid in list(mcp_client._pending_actions.keys()):
-                    mcp_client._pending_results[aid] = {
-                        "status": "cancelled",
-                        "reason": "auto-interrupted by new user message",
-                    }
-                    mcp_client._pending_actions[aid].set()
-                _stop_countdown()   # 打断 = 用户在说话，不是沉默的起点
-                print(f'[decision] auto-interrupt: {len(_int_results)} hook(s) fired, pending cleared')
-            else:
-                # Fallback: 没有 hook 注册时用硬编码查找
-                await self._interrupt_active_outputs()
+            # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
+            # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
+            # hook 被触发两遍；而有绑定时兜底被整个跳过。两个问题同源：把 hook 和
+            # 兜底当成了二选一，它们覆盖的其实是不相交的两组卡片。
+            await self._interrupt_active_outputs(
+                reason='auto-interrupted by new user message')
 
         # Subagent status in log
         if self._subagent_mgr:

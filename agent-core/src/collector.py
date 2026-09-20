@@ -461,7 +461,9 @@ def _format_priority_batch(events: list[dict]) -> str:
     """格式化 P>0 事件为 XML（精简 perf 字段后的文本）。"""
     parts = []
     for ev in events:
-        ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        # 和 <status time=...> 必须是同一套钟 —— 见 prompt.format_ts 的注释。
+        import prompt
+        ts = prompt.format_ts(ev['ts'])
         channel = _infer_channel(ev)
         source = ev.get('source', '')
         text = _slim_event_text(ev.get('text', ''))
@@ -501,7 +503,8 @@ def _format_bg_batch(events: list[dict]) -> str:
 
     parts = []
     for source, evs in groups.items():
-        ts = datetime.datetime.fromtimestamp(evs[-1]['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        import prompt
+        ts = prompt.format_ts(evs[-1]['ts'])
         last_text = evs[-1].get('text', '')
         if len(evs) == 1:
             parts.append(f'<source name="{source}" ts="{ts}">\n{last_text}\n</source>')
@@ -616,12 +619,60 @@ def _infer_channel(ev: dict) -> str:
 
 # ── 主循环 ────────────────────────────────────────────────────────────────────
 
+_gated_since: float | None = None
+_gated_count: int = 0
+
+
+def _note_gated(source: str) -> None:
+    global _gated_since, _gated_count
+    _gated_count += 1
+    if _gated_since is None:
+        _gated_since = time.time()
+        print(f'[collector] 智能控制未启动，事件不处理（首条来自 {source}）')
+
+
+def _note_ungated() -> None:
+    global _gated_since, _gated_count
+    if _gated_since is None:
+        return
+    print(f'[collector] 智能控制已启动，恢复处理事件'
+          f'（停用期间丢弃 {_gated_count} 条，历时 {int(time.time() - _gated_since)}s）')
+    _gated_since, _gated_count = None, 0
+
+
+def project_running() -> bool:
+    """「开始智能控制」按下了没有。
+
+    这个标志此前**不控制任何东西** —— `start.py` 里只在不自动启动时把上次的残留清成
+    False，然后 `collector.start()` 和 `run_forever()` 照样无条件起跑。于是容器一起来，
+    已有的 DDS 订阅与 MCP SSE 就开始往 event_bus 灌，P=0 的那些进 bg buffer，每秒一批、
+    每批 spawn 一个后台 subagent —— 没人点过「开始」，机器人对着一台冰箱持续烧 token。
+    天轶上一天 3668 个 turn 就是这么来的。
+    """
+    return bool((config.main.get('core') or {}).get('project_running', False))
+
+
 async def _drain_loop():
     """持续从 event_bus 消费事件，按 priority 分流到两个管道。"""
     ring_size = config.main.get('event', {}).get('llm', {}).get('source_ring_size', 50)
     while True:
         ev = await event_bus.dequeue()
         source = ev.get('source', 'unknown')
+
+        # 没启动就什么都不该跑。
+        #
+        # 这里**丢弃**而不是攒着：不取的话 event_bus 会一直涨，点下「开始」的瞬间几
+        # 小时的传感器数据会一次性砸进来。所以照常取、直接扔，并把 bg buffer 也清掉
+        # —— 停着的这段时间里的读数，启动时再看已经没有意义了。
+        #
+        # 丢弃必须**出声**。一个不响应的机器人和一个坏掉的机器人从外面看一模一样，
+        # 而「为什么不理我」是排查时最贵的那类问题。所以进入和离开丢弃状态各说一次，
+        # 并顺带报一下这期间扔了多少条。
+        if not project_running():
+            _note_gated(source)
+            _bg_buffer.clear()
+            continue
+        _note_ungated()
 
         _extract_perf_timestamps(ev)
         priority = _extract_priority(ev)
@@ -729,6 +780,9 @@ async def _bg_trigger_loop():
     while True:
         interval = config.main.get('event', {}).get('llm', {}).get('trigger_interval_ms', 1000) / 1000.0
         await asyncio.sleep(interval)
+        if not project_running():
+            _bg_buffer.clear()
+            continue
         if not _bg_buffer:
             continue
         batch = list(_bg_buffer)

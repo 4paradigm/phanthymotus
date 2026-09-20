@@ -56,6 +56,7 @@
           <button class="settings-dropdown-item" data-target="btn-peers"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 20.5v-1.6a3.6 3.6 0 0 0-3.6-3.6H6.1a3.6 3.6 0 0 0-3.6 3.6v1.6"/><circle cx="9" cy="7.5" r="3.6"/><path d="M21.5 20.5v-1.6a3.6 3.6 0 0 0-2.7-3.5"/><path d="M16.2 4.1a3.6 3.6 0 0 1 0 6.9"/></svg></span>多机协同</button>
           <button class="settings-dropdown-item" data-target="btn-deploy"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3.5 7.5v9L12 21l8.5-4.5v-9L12 3z"/><path d="M3.5 7.5 12 12l8.5-4.5M12 12v9"/></svg></span>部署</button>
           <button class="settings-dropdown-item" data-target="btn-performance"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 7 4-14 3 7h4"/></svg></span>性能</button>
+          <button class="settings-dropdown-item hidden" data-target="btn-benchmark"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5h16"/><rect x="5" y="11" width="3.5" height="8.5" rx="1"/><rect x="10.2" y="6" width="3.5" height="13.5" rx="1"/><rect x="15.4" y="13.5" width="3.5" height="6" rx="1"/></svg></span>基准测试</button>
           <button class="settings-dropdown-item" data-target="btn-usage"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 20.5V10M12 20.5V3.5M19 20.5v-7"/></svg></span>用量</button>
           <div class="settings-dropdown-divider"></div>
           <button class="settings-dropdown-item settings-dropdown-item--danger" data-target="btn-reset"><span class="settings-dropdown-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 4.5V10H15"/></svg></span>重启与重置</button>
@@ -78,6 +79,7 @@
       <button class="btn-ghost topbar-btn hidden" id="btn-reset">重置</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-performance">性能</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-benchmark">基准测试</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-usage">用量</button>
     </div>
     <button class="mobile-hamburger" id="mobile-hamburger" aria-label="菜单">⋮</button>
@@ -653,6 +655,90 @@
     <div class="modal-body performance-body">
       <div id="perf-summary-cards"></div>
       <div id="perf-waterfall"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Benchmark Modal -->
+<div class="modal-overlay hidden" id="benchmark-overlay">
+  <div class="modal benchmark-modal">
+    <div class="modal-header">
+      <span class="modal-title">基准测试</span>
+      <div class="bm-header-meta" id="bm-env"></div>
+      <button class="btn-icon" id="benchmark-close">&#10005;</button>
+    </div>
+
+    <div class="modal-body benchmark-body">
+      <!-- 左栏：用例库。主体是「看现有的方案」——「打开文件」是导入路径，
+           所以它是标签旁边的一个小链接，不是入口。 -->
+      <aside class="bm-pick">
+        <div class="bm-lib-tabs">
+          <button class="bm-lib-tab active" data-lib="local">本机</button>
+          <button class="bm-lib-tab" data-lib="market">市场</button>
+          <span class="bm-lib-spacer"></span>
+          <button class="bm-linkbtn" id="bm-case-new">新建</button>
+          <label class="bm-linkbtn" for="bm-case-file">导入</label>
+        </div>
+        <input type="file" id="bm-case-file" accept="application/json,.json" hidden>
+
+        <div id="bm-lib-local" class="bm-lib-panel"></div>
+        <div id="bm-lib-market" class="bm-lib-panel hidden"></div>
+
+        <div class="bm-launch">
+          <label class="bm-repeats-row" for="bm-repeats">
+            <span>重复</span>
+            <input type="number" id="bm-repeats" value="3" min="1" max="20">
+            <span>次</span>
+          </label>
+          <p class="bm-note" id="bm-repeats-note"></p>
+          <button class="bm-linkbtn bm-abort" id="bm-abort">停止当前运行</button>
+        </div>
+      </aside>
+
+      <!-- 右栏：跑出了什么。这是反复读的地方。 -->
+      <section class="bm-read">
+        <div class="bm-block">
+          <h4 class="bm-h">进行中</h4>
+          <div id="bm-progress"></div>
+        </div>
+        <div class="bm-block bm-block--grow">
+          <h4 class="bm-h">历史</h4>
+          <!-- 分数画在共享的 0-100 轴上，样本量与被测配置贴着它 ——
+               「动没动」靠形状回答，而不是让人在四个列之间心算。 -->
+          <div id="bm-runs"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<!-- 一次运行的详情：说了什么、想了什么、调了什么、世界怎么回应。
+     分数只回答「好不好」，这里回答「哪儿坏了」。 -->
+<div class="modal-overlay hidden" id="bm-timeline-overlay">
+  <div class="modal bm-timeline-modal">
+    <div class="modal-header">
+      <span class="modal-title">运行详情</span>
+      <button class="btn-icon" id="bm-timeline-close">&#10005;</button>
+    </div>
+    <div class="modal-body bm-timeline-body" id="bm-timeline-body"></div>
+  </div>
+</div>
+
+<!-- 用例编辑器。写的几乎全是自然语言：初始指令是用户会说的那句话，插话是他会插的
+     那句话。只有触发条件是结构化的。地图是一个声明（一个字符串），**不是**从仿真器
+     拉的下拉框 —— 判定层本来就要能判真机器人跑出来的事件流，一个必须先有仿真器地图
+     才能编辑的用例会把那条路堵死。 -->
+<div class="modal-overlay hidden" id="bm-editor-overlay">
+  <div class="modal bm-editor-modal">
+    <div class="modal-header">
+      <span class="modal-title">编辑用例</span>
+      <button class="btn-icon" id="bm-editor-close">&#10005;</button>
+    </div>
+    <div class="modal-body bm-editor-body" id="bm-editor-body"></div>
+    <div class="modal-footer bm-editor-foot">
+      <div class="bm-editor-problems" id="bm-editor-problems"></div>
+      <button class="bm-linkbtn" id="bm-editor-canvas">用当前画布更新这个用例</button>
+      <button class="btn-primary" id="bm-editor-save">保存</button>
     </div>
   </div>
 </div>

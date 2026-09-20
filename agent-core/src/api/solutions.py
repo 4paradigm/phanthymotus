@@ -58,6 +58,7 @@ import config
 router = fastapi.APIRouter(prefix='/solutions', tags=['solutions'])
 
 FORMAT_VERSION = 1
+BLOCK_TEST = 'test'
 
 # 可打包的块名。canvas 必选，其余由用户勾选。
 BLOCK_CANVAS = 'canvas'
@@ -423,6 +424,10 @@ class PackInclude(BaseModel):
     skills: list[str] = []              # 要打包的技能 slug
     prompt: list[str] = []              # identity | system | memory
     tasks:  bool = False
+    # 带 test 段的方案就是一个基准测试用例：解决方案 + 执行方案 + 评估方案。
+    # 不另起类型、不另开分发路径 —— 市场、脱敏、deviceRef 跨机映射、preflight 的
+    # 分层报错全部沿用这里已有的那一套。见 src/benchmark_case.py。
+    test:   Optional[dict] = None
 
 
 class PackRequest(BaseModel):
@@ -472,6 +477,15 @@ async def _build_payload(req: PackRequest, token: Optional[str]) -> dict:
 
     canvas_block, redacted = _pack_canvas(ref_of, set(req.extra_redact))
     payload['canvas'] = canvas_block
+
+    if req.include.test:
+        import benchmark_case
+        problems = benchmark_case.validate({'test': req.include.test})
+        if problems:
+            # 与其打出一个跑起来什么都不发生、最后记 0 分的用例，不如在这里拒绝。
+            return {'ok': False, 'error': '这个 test 段不能作为测试用例', 'detail': problems}
+        payload['test'] = req.include.test
+        includes.append(BLOCK_TEST)
 
     # 技能：必须是当前激活的，且已在技能广场上架
     if req.include.skills:
@@ -703,6 +717,12 @@ async def get_current():
     return {'code': 200, 'data': config.main.get(_CURRENT_KEY, None)}
 
 
+def loaded_case() -> Optional[dict]:
+    """当前方案带的 test 段，没有则 None。基准测试面板据此知道「现在能跑哪个用例」。"""
+    current = config.main.get(_CURRENT_KEY) or {}
+    return current.get(BLOCK_TEST) or None
+
+
 @router.delete('/current')
 async def clear_current():
     """清除"当前方案"标记。只动标记，不回滚任何实际配置。"""
@@ -879,7 +899,33 @@ async def preflight(request: fastapi.Request, req: LoadRequest):
         'selfVersion': _core_version(),
         'overwrite': _overwrite_summary(includes),
         'canvasEditor': _canvas_editor_conflict(req.session_id),
+        'test': await _test_preflight(payload),
     }}
+
+
+async def _test_preflight(payload: dict) -> Optional[dict]:
+    """带 test 段的方案是一个基准测试用例，这里先把它的依赖对一遍。
+
+    分层的报错就落在这里：`devices` 说的是画布上的卡片要哪些驱动，`test` 说的是
+    这个用例**另外**要什么（仿真器、地图）。两者分开报，用户才知道是方案装不上，
+    还是方案装得上但跑不了这个用例。
+    """
+    import benchmark_case
+    block = benchmark_case.test_block(payload)
+    if not block:
+        return None
+
+    problems = benchmark_case.validate(payload) + benchmark_case.unmeasurable(payload)
+    from api.benchmark import case_readiness
+    readiness = await case_readiness(benchmark_case.requires(payload))
+    return {
+        'isCase':    True,
+        'prompt':    (block.get('run') or {}).get('prompt', ''),
+        'injections': len((block.get('run') or {}).get('injections') or []),
+        'problems':  problems,
+        'readiness': readiness,
+        'canRun':    not problems and readiness.get('ok', False),
+    }
 
 
 def _canvas_editor_conflict(session_id: str) -> Optional[str]:
@@ -1009,6 +1055,9 @@ async def apply(request: fastapi.Request, req: LoadRequest):
         'appliedAt':   int(time.time()),
         'versionAligned': bool(req.align_versions),
         'devices':     payload.get('devices') or [],
+        # 用例随方案一起落地：画布、技能、prompt 已经按包体铺好，用例说的是「拿这套
+        # 配置跑什么、怎么判」，分开存就会出现两边对不上的组合。
+        'test':        payload.get(BLOCK_TEST) if BLOCK_TEST in includes else None,
     }
 
     # 记一次载入量（失败无所谓，别影响载入结果）

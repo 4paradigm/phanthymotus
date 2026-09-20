@@ -38,6 +38,12 @@ registry: dict[str, dict] = {}   # mcp_id → info
 
 # ── ACP: 异步动作完成协议 ──────────────────────────────────────────────────────
 _pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on completion)
+# action_id → 注册时刻。加它只为一件事：主动播报要说「已经等了多久」。
+#
+# 先前没有任何地方记这个，而播报的 prompt 里也没有「现在几点」—— 模型只能拿过程
+# 记录里几条历史时间戳凑，凑出来的「大约等了 25 秒」必然是错的。数要么给对的，
+# 要么不给，不能让它自己算。
+_pending_started: dict[str, float] = {}
 _pending_results: dict[str, dict] = {}            # action_id → completion payload
 _pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
 _pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
@@ -938,6 +944,7 @@ async def call_tool(full_name: str, args: dict) -> str:
                 # 记录该 pending 属于哪个工具（用于 barrier 资源冲突判断）
                 _pending_tools[action_id] = tool_name
                 _pending_resources[action_id] = meta.get('resource')
+                _pending_started[action_id] = time.time()
                 _pending_owner[action_id] = current_agent_context.get()
                 # 动态 timeout：有 text 参数时按字数算（合成+播放: 字数/3 + 10s余量），否则用 schema 默认值
                 text_arg = args.get('text', '')
@@ -1279,6 +1286,29 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
         return {"status": "cancelled", "pending": [aid for aid, _ in events]}
 
 
+def pending_waits() -> list[dict]:
+    """现在还在等的动作，各等了多久。
+
+    给主动播报用：「已经等了多久」这个数必须由框架给出。播报那次 LLM 调用既看不到
+    当前时刻，也没有 pending 列表 —— 让它自己从历史时间戳里凑，凑出来的就是天轶上
+    那句「大约等了 25 秒」。
+    """
+    now = time.time()
+    out = []
+    for action_id, ev in _pending_actions.items():
+        if ev.is_set():
+            continue
+        started = _pending_started.get(action_id)
+        if not started:
+            continue
+        out.append({
+            'tool': _pending_tools.get(action_id, ''),
+            'seconds': int(now - started),
+            'timeout': int(_pending_timeouts.get(action_id, 0)),
+        })
+    return sorted(out, key=lambda w: -w['seconds'])
+
+
 def get_pending_actions() -> list[str]:
     """返回当前所有 pending action_ids（供 prompt 展示）。"""
     return list(_pending_actions.keys())
@@ -1416,6 +1446,7 @@ async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
             if action_id:
                 resource = meta.get('resource')
                 _pending_actions[action_id] = asyncio.Event()
+                _pending_started[action_id] = time.time()
                 _pending_tools[action_id] = tool_name
                 _pending_resources[action_id] = resource
                 _pending_owner[action_id] = current_agent_context.get()
