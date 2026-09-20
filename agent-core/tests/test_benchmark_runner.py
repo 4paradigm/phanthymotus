@@ -4,7 +4,10 @@
 
 * **被测的 agent 不能重置测量。** 跑动由 agent-core 驱动，不是 LLM 可调用的一张卡片。
 * **初始指令走用户消息那条路。** 用例问的就是「用户说了这句话之后会发生什么」。
-* **画布上有会动的真设备就拒绝跑。** 注入的文本和真实指令无法区分。
+* **画布上会动的真设备，开跑前必须经人确认。** 注入的文本和真实指令无法区分，
+  所以这些设备会真的动起来。从前这里是「一律拒绝」，那在真机上等于永远不能跑 ——
+  真机上每一张执行器卡都不属于仿真器。现在由现场的人决定，而**确认必须对得上服务端
+  此刻看到的那一组设备**。
 
 Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_benchmark_runner.py -q
 """
@@ -142,6 +145,105 @@ def test_an_undeclared_type_counts_as_acting(canvas, registry):
     canvas(card('mcp-real', 'whatever'))
 
     assert len(benchmark_runner.unsafe_cards('mcp-sim')) == 1
+
+
+def test_a_split_sensor_is_not_listed_as_something_that_moves(canvas, registry,
+                                                              monkeypatch):
+    """带 action 枚举的工具会被按 action 拆开，`tool_meta` 里只有
+    `mcp__<id>__mic__start` 这样的键，`mcp__<id>__mic` 根本不存在。
+
+    画布卡片记的是**工具**名，所以拼出来的名字查不到申报 → `tool_type` 返回 '' →
+    「没申报就算会动」→ 麦克风进了「会动的设备」清单。方向上安全，但一份把麦克风算
+    进去的清单，人就不会认真读了 —— 而这份清单的全部作用就是让人认真读一遍。
+    """
+    monkeypatch.setitem(mcp_client.registry, 'mcp-real', {
+        'online': True, 'name': '天轶', 'server_name': 'x-humanoid-tianyi',
+        'category': 'driver',
+        'tool_meta': {'mcp__mcp-real__mic__start': {'type': 'sensor'},
+                      'mcp__mcp-real__mic__stop': {'type': 'sensor'},
+                      'mcp__mcp-real__loco__walk': {'type': 'actuator'}},
+    })
+    canvas(card('mcp-real', 'mic'), card('mcp-real', 'loco'))
+
+    assert [u['tool'] for u in benchmark_runner.unsafe_cards(None)] == ['loco']
+
+
+def test_a_tool_with_no_declaration_anywhere_still_counts_as_acting(canvas, registry,
+                                                                    monkeypatch):
+    """兜底不能松：查不到就是查不到，按会动处理。"""
+    monkeypatch.setitem(mcp_client.registry, 'mcp-real', {
+        'online': True, 'name': '天轶', 'category': 'driver', 'tool_meta': {}})
+    canvas(card('mcp-real', 'mystery'))
+
+    assert [u['tool'] for u in benchmark_runner.unsafe_cards(None)] == ['mystery']
+
+
+def test_without_a_simulator_every_actuator_needs_confirming(canvas, registry):
+    """真机上没有仿真器可以代劳，所以画布上会动的东西**全部**要进确认清单。
+
+    这也正是从前那条「非空就拒绝」在真机上的样子：清单永远非空，于是永远拒绝。
+    """
+    canvas(card('mcp-real', 'controlled_spatial'), card('mcp-real', 'whatever'),
+           card('mcp-real', 'camera_head'), card('agentcore', 'decision_core'))
+
+    moving = benchmark_runner.unsafe_cards(None)
+
+    assert sorted(u['tool'] for u in moving) == ['controlled_spatial', 'whatever']
+
+
+# ── 开跑前的确认 ──────────────────────────────────────────────────────────────
+#
+# 这一组盯的是端点，不是分类。分类改对了而端点放行，等于一台真机器人在没人确认的
+# 情况下走起来。
+
+from api import benchmark as bm_api  # noqa: E402
+
+MOVING = [{'mcpId': 'mcp-real', 'tool': 'controlled_spatial', 'device': '天轶'}]
+
+
+def test_no_confirmation_means_no_run():
+    with pytest.raises(fastapi.HTTPException) as caught:
+        bm_api._check_confirmation(MOVING, None)
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail['needs_confirmation'] is True
+    assert caught.value.detail['moving_cards'] == MOVING
+
+
+def test_a_confirmation_that_matches_lets_the_run_start():
+    bm_api._check_confirmation(MOVING, ['mcp-real:controlled_spatial'])
+
+
+def test_a_confirmation_for_a_different_set_is_refused():
+    """画布在「弹窗弹出」和「点开始运行」之间是可以改的。
+
+    人看着仿真器的 tts 按了确认，另一个标签页把卡片换成真机底盘 —— 那个勾就为一组
+    他从没看见过的设备背了书。所以服务端重算，客户端送来的只用来核对。
+    """
+    with pytest.raises(fastapi.HTTPException) as caught:
+        bm_api._check_confirmation(MOVING, ['mcp-sim:tts'])
+
+    assert caught.value.status_code == 409
+    assert '变了' in caught.value.detail['error']
+
+
+def test_a_partial_confirmation_is_refused():
+    """确认了一台、实际会动两台 —— 这不是「确认过了」。"""
+    two = MOVING + [{'mcpId': 'mcp-real', 'tool': 'loco', 'device': '天轶'}]
+
+    with pytest.raises(fastapi.HTTPException):
+        bm_api._check_confirmation(two, ['mcp-real:controlled_spatial'])
+
+
+def test_an_empty_confirmation_list_does_not_authorise_real_devices():
+    """空列表是「我什么都没确认」，不是「确认了空集」。"""
+    with pytest.raises(fastapi.HTTPException):
+        bm_api._check_confirmation(MOVING, [])
+
+
+def test_nothing_moves_so_nothing_is_asked():
+    """仿真器在场时清单为空，不该弹窗 —— 行为和从前一字不差。"""
+    bm_api._check_confirmation([], None)
 
 
 # ── 触发时刻 ──────────────────────────────────────────────────────────────────

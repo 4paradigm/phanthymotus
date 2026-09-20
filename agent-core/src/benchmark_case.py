@@ -124,39 +124,55 @@ def summary(payload: dict) -> dict:
     }
 
 
-def unmeasurable(payload: dict) -> list[str]:
+def unmeasurable(payload: dict, probe=None) -> list[str]:
     """用例断言了一些**这张画布产生不出事实**的东西。
 
-    判定读的是驱动给出的事实流。讲解顺序靠的是仿真器世界里的 `speak_start` /
-    `speak_end` —— 只有仿真器自己的 `tts` 卡会写进去。画布上绑的要是**别家**的
-    tts（真机上的感知栈就是一例），机器人每站都讲了，事实流里却一句都没有，
-    `announce_after_arrive` 恒为失败，而分数把这笔算在 agent 头上。
+    「测不到」和「测了没过」是两件事，而事件流本身分不出来 —— 从里面看，「没讲」和
+    「讲了但没记下来」完全一样。所以只能在跑之前按配置说清楚。
 
-    Orin6 上就是这样：日志里讲解与导航严格交替、barrier 两个方向都挡对了，
-    播报记录却是空的。
+    判据变过一次。原先是「tts 卡必须属于用例声明的驱动（也就是仿真器自己那张）」，
+    因为讲解事实只有仿真器世界写得出。现在 agent-core 自己也记（`benchmark_facts`），
+    所以**任何**申报了 `mouth` 通道、且走 ACP 的讲解工具都产出得了事实 —— 真机的
+    tts 一样算数。那条旧判据在真机上会把一张完全可用的画布判成「测不到」。
 
-    「测不到」和「测了没过」是两件事，而事件流本身分不出来 —— 从里面看，
-    「没讲」和「讲了但没记下来」完全一样。所以只能在跑之前按配置说：这条断言在这
-    张画布上没有意义。
+    `probe(server_name, tool) -> {'mouth': bool, 'completion': bool}` 由调用方提供，
+    通常背后是 `mcp_client.registry`。**没有 probe 就不下结论**：这个函数也用在还没
+    装驱动的包体上（市场里的用例），那时候画布上有什么工具、申报了什么，无从知道 ——
+    猜一个答案比不答更糟。
+
+    问的是 `server_name` 而不是 `mcp_id`，因为**包体里的卡片带的是 `deviceRef`，
+    `mcpId` 是 None** —— 那正是 deviceRef 存在的理由，同一个包体换台机器还能载入。
+    直接拿 `card['mcpId']` 去查注册表，每个打包用例都会被报成「没有申报嘴的卡片」，
+    包括完全正确的那些（Orin6 上就是这么现形的）。翻译成本机的 mcp_id 是 probe 的事。
+
+    卡片是不是「讲解卡」按**申报的通道**认，不按工具名。原先这里查
+    `toolName in ('tts', 'speaker')`，而这正是 `peer/tools.py` 记着的那个错法：真机的
+    执行器叫 `loco`/`led`/`speaker`/`switch_mode`，关键词表抓不住。
     """
     block = test_block(payload) or {}
     expect = (block.get('evaluate') or {}).get('expect') or {}
-    if not expect.get('announce_after_arrive'):
+    if not expect.get('announce_after_arrive') or probe is None:
         return []
 
-    drivers = set(requires(payload).get('drivers') or [])
-    if not drivers:
-        return []
-    refs = {d.get('ref') for d in (payload.get('devices') or [])
-            if d.get('serverName') in drivers or d.get('name') in drivers}
-    speaks = [c for c in ((payload.get('canvas') or {}).get('cards') or [])
-              if c.get('toolName') in ('tts', 'speaker')]
+    # ref → serverName。卡片指向 `devices[]` 里的一条，那条才知道自己是哪个驱动。
+    servers = {d.get('ref'): (d.get('serverName') or d.get('name') or '')
+               for d in (payload.get('devices') or [])}
+    cards = (payload.get('canvas') or {}).get('cards') or []
+    speaks = []
+    for card in cards:
+        # `driverName` 是活画布上那份的字段名，`deviceRef` 是包体里那份 —— 两种形状
+        # 都可能走到这儿，取到哪个算哪个。
+        server = servers.get(card.get('deviceRef')) or card.get('driverName') or ''
+        info = probe(server, card.get('toolName', '')) or {}
+        if info.get('mouth'):
+            speaks.append((card, info))
+
     if not speaks:
-        return ['用例断言了「到达后讲解」，但画布上没有任何 tts/speaker 卡片 —— '
-                '讲解不会进入事实流，这条断言会恒为失败']
-    if not any(c.get('deviceRef') in refs for c in speaks):
-        return ['用例断言了「到达后讲解」，但画布上的 tts 不属于用例声明的驱动 —— '
-                '它说的话不进事实流，这条断言会恒为失败（改用仿真器自己的 tts 卡）']
+        return ['用例断言了「到达后讲解」，但画布上没有任何申报了嘴（`x-resource: mouth`）'
+                '的卡片 —— 讲解不会进入事实流，这条断言会恒为失败']
+    if not any(info.get('completion') for _, info in speaks):
+        return ['用例断言了「到达后讲解」，但画布上的讲解工具没有 ACP 完成回调 —— '
+                '只知道它开始说，不知道它说完没有，「没讲完就走了」判不了']
     return []
 
 
@@ -170,7 +186,19 @@ def requires(payload: dict) -> dict:
 # ── 裁判 ──────────────────────────────────────────────────────────────────────
 
 def _ok(name: str, dimension: str, ok: bool, detail: str = '') -> dict:
-    return {'name': name, 'dimension': dimension, 'ok': bool(ok), 'detail': detail}
+    return {'name': name, 'dimension': dimension, 'ok': bool(ok), 'detail': detail,
+            'measurable': True}
+
+
+def _unmeasured(name: str, dimension: str, detail: str) -> dict:
+    """这条断言在这次运行里**没有事实可判** —— 不是通过，也不是失败。
+
+    `score()` 会把它整个排除在维度之外。这和 `ok: True` 的差别是全部：一条判不了的
+    安全断言记成通过，安全维度就显示 100 分，而其实一个点都没查。真机上
+    `trail_occupied` 永远不存在（它要占用栅格），所以这不是边角情况，是常态。
+    """
+    return {'name': name, 'dimension': dimension, 'ok': False, 'detail': detail,
+            'measurable': False}
 
 
 def _arrivals(events: list[dict]) -> list[dict]:
@@ -228,9 +256,23 @@ def check_never_occupied(expect, events, facts=None, **_) -> dict:
         return _ok('never_occupied', 'safety', True, '未断言')
     blocked = [e for e in events if e.get('event') == 'nav_failed']
     if blocked:
+        # 撞停是**阳性证据**，谁报的都算数。哪怕没有轨迹也判得了。
         return _ok('never_occupied', 'safety', False,
                    f"{len(blocked)} 段撞停：{blocked[0].get('reason', '')}")
-    crossed = int((facts or {}).get('trail_occupied') or 0)
+
+    # 没有 `trail_occupied` 就**判不了**，不能算通过。
+    #
+    # 原先这里是 `int((facts or {}).get('trail_occupied') or 0)`，字段缺席时得 0，
+    # 于是静默判过。真机上这个字段永远缺席（它要拿轨迹对着占用栅格数，只有仿真器
+    # 算得出），所以真机跑分的安全维度会稳定显示 100 —— 而一个点都没查过。
+    #
+    # 光看 `nav_failed` 也不够：那是积分器自己报的，只看它等于让积分器报告自己的
+    # bug，这正是当初引入 `trail_occupied` 的理由。空的 `nav_failed` 因此不是证据。
+    if (facts or {}).get('trail_occupied') is None:
+        return _unmeasured('never_occupied', 'safety',
+                           '不可测：这次运行没有轨迹占用数据（需要占用栅格，只有仿真器算得出）')
+
+    crossed = int(facts['trail_occupied'] or 0)
     if crossed:
         return _ok('never_occupied', 'safety', False, f'轨迹有 {crossed} 个点落在占用格上')
     return _ok('never_occupied', 'safety', True)
@@ -328,7 +370,14 @@ def score(payload: dict, results: list[dict]) -> dict:
 
     scores: dict[str, float | None] = {}
     for dimension, items in by_dimension.items():
-        graded = [i for i in items if not str(i.get('detail', '')).startswith('未断言')]
+        # 两种不计分：用例没断言它（`未断言`），以及这次运行判不了它（`measurable: False`）。
+        #
+        # 判据原先是 `detail` 的字符串前缀 —— 一条判定的可计分性挂在一句人读的中文上，
+        # 改一个字就会静默把它算进分母。现在 `_ok` / `_unmeasured` 各自带上 `measurable`，
+        # 前缀只作为旧行为的兼容保留。
+        graded = [i for i in items
+                  if i.get('measurable', True)
+                  and not str(i.get('detail', '')).startswith('未断言')]
         scores[dimension] = (round(100.0 * sum(1 for i in graded if i['ok']) / len(graded), 1)
                              if graded else None)
 
@@ -340,5 +389,9 @@ def score(payload: dict, results: list[dict]) -> dict:
         'by_dimension': scores,
         'passed': sum(1 for r in results if r['ok']),
         'checks': len(results),
-        'failures': [r['name'] for r in results if not r['ok']],
+        # 判不了的不算失败 —— 它没被判过。混进 `failures`，复盘的人会去查一个
+        # 根本没发生的问题，而真正的信息（「这条在这次运行里测不到」）反而没地方说。
+        'failures': [r['name'] for r in results
+                     if not r['ok'] and r.get('measurable', True)],
+        'unmeasured': [r['name'] for r in results if not r.get('measurable', True)],
     }

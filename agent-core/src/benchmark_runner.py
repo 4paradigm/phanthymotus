@@ -3,8 +3,8 @@
 ## 为什么在这里，不在卡片里
 
 跑一个用例要做的事，一半在 agent-core 这一侧：把初始指令当作**用户消息**送进
-collector、在合适的时刻追加插话、按用例的权重算分、把分数连同被测配置落盘。仿真器
-只管世界 —— 重置、推进、产出事实。
+collector、在合适的时刻追加插话、按用例的权重算分、把分数连同被测配置落盘。世界那一半
+交给 `SimulatorWorld` 或 `RealWorld` —— 重置、记账、产出事实。
 
 原先这些都在 `sim_scenario` 这张卡片上，于是有两个后果，都不是小事：
 
@@ -21,10 +21,14 @@ collector、在合适的时刻追加插话、按用例的权重算分、把分�
 
 ## 一条安全闸，以及它管不到的地方
 
-注入的文本和真实指令无法区分。所以开始运行之前检查画布：**只要有一张会动的卡片不属于
-仿真器，就拒绝。**否则一句「带我转一下展区」会让真机器人走起来 —— 没有人确认过，
-也没有人在旁边。分类用 `peer.tools.is_read_only`，它按驱动申报的 type 和 layer 判，
-不猜名字（猜名字漏掉过 `loco`/`led`/`speaker`/`switch_mode`）。
+注入的文本和真实指令无法区分。所以开始运行之前检查画布，列出会动、又不由仿真器代劳的
+卡片 —— 一句「带我转一下展区」会让真机器人真的走起来。分类用 `peer.tools.is_read_only`，
+它按驱动申报的 type 和 layer 判，不猜名字（猜名字漏掉过 `loco`/`led`/`speaker`/`switch_mode`）。
+
+这条闸原先是「非空就拒绝」，而那在真机上等于**永远拒绝** —— 真机上每一张执行器卡都不
+属于仿真器，于是一个面向解决方案的基准测试在真实机器人上一步也跑不了。现在这份清单交给
+现场的人确认（`api/benchmark._check_confirmation`），**确认必须对得上服务端此刻重算的
+那一组**：画布在弹窗与开跑之间是可以改的，拿上一次的勾为一组新设备背书是不行的。
 
 **但画布并不能封死 agent 够得到什么。** 画布决定的是 LLM 被**告知**哪些工具
 （`llm.py::_get_bound_tool_schemas` 从 execConnections 收集），而 `_dispatch` 直接把
@@ -46,6 +50,7 @@ import time
 from typing import Optional
 
 import benchmark_case
+import benchmark_facts
 import benchmark_store
 import config
 import event_bus
@@ -64,13 +69,41 @@ OWNER = 'benchmark'
 
 # ── 安全闸 ────────────────────────────────────────────────────────────────────
 
-def unsafe_cards(simulator_mcp_id: str) -> list[dict]:
-    """画布上不属于仿真器、且会动的卡片。
+def unsafe_cards(simulator_mcp_id: str | None = None) -> list[dict]:
+    """画布上会动、且不由仿真器代劳的卡片 —— 也就是**这次运行会真的动起来的东西**。
 
-    非空就不能跑：用例的 prompt 会经由主 agent 变成真实的工具调用，而注入的文本
-    和一句真实指令在 collector 眼里完全一样。
+    语义变了一次，值得写下来：原先是「非空就拒绝」。那条规则在仿真器在场时是对的，
+    放到真机上却等于**永远拒绝** —— 真机上每一张执行器卡都不属于仿真器，于是一个
+    面向解决方案的基准测试在真实机器人上一步也跑不了。
+
+    现在它回答的是「要请人确认什么」。拒绝与否是调用方的事：仿真器在场时这个列表为空，
+    行为和从前一字不差；真机上非空，`/case/run` 据此要求一次明确的人工确认。
+
+    拦的东西没有变松：用例的 prompt 经主 agent 变成真实的工具调用，而注入的文本和
+    一句真实指令在 collector 眼里完全一样。变的只是由谁决定 —— 从代码写死，改成现场
+    那个人。
     """
     from peer.tools import is_read_only
+
+    def schema_name(mcp_id: str, tool: str) -> str:
+        """画布上的工具名 → 注册表里真实存在的那个 schema 名。
+
+        带 action 枚举的工具会被 `_connect_one` 按 action 拆开，`tool_meta` 的键变成
+        `mcp__<id>__<tool>__<action>`，`mcp__<id>__<tool>` 不存在。而画布卡片记的是
+        **工具**名，于是拼出来的名字查不到申报 —— `tool_type` 返回 ''，按「没申报就算
+        会动」处理，麦克风就这么进了「会动的设备」清单。
+
+        拆出来的几份 type 相同（都从父工具抄下来），取哪一份都一样。查不到就返回精确
+        名：没申报仍然按会动处理，这条兜底不能松。
+
+        只在这里解，不动 `peer/tools.py` —— 那是信任边界，而它拿到的名字来自
+        `all_schemas()`，本来就是拆分后的名字，精确命中，不需要这一层。
+        """
+        exact = f'mcp__{mcp_id}__{tool}'
+        metas = (mcp_client.registry.get(mcp_id) or {}).get('tool_meta') or {}
+        if exact in metas:
+            return exact
+        return next((n for n in metas if n.startswith(f'{exact}__')), exact)
 
     layout = config.main.get('canvas_layout') or {}
     internal = {m.get('id') for m in (config.main.get('services', {}).get('mcp') or [])
@@ -86,7 +119,7 @@ def unsafe_cards(simulator_mcp_id: str) -> list[dict]:
         # 把它算进来，任何用例都跑不了，这条闸就只剩一个永远亮着的红灯。
         if mcp_id in internal:
             continue
-        if is_read_only(f'mcp__{mcp_id}__{tool}'):
+        if is_read_only(schema_name(mcp_id, tool)):
             continue
         entry = mcp_client.registry.get(mcp_id) or {}
         unsafe.append({'mcpId': mcp_id, 'tool': tool,
@@ -94,15 +127,86 @@ def unsafe_cards(simulator_mcp_id: str) -> list[dict]:
     return unsafe
 
 
+# ── 世界 ──────────────────────────────────────────────────────────────────────
+#
+# 用例测的是**解决方案**，而一个解决方案既能跑在仿真器上也能跑在真机器人上。区别只有
+# 两件事：世界能不能被重置，以及事实从哪来。抽成两个实现，`CaseRun` 就不必知道自己
+# 跑在哪一侧 —— 它原先整个是仿真器形状的（`sim_scenario` / `sim_report` 硬写在五处），
+# 于是真机上连一步都走不了。
+
+
+class SimulatorWorld:
+    """仿真器持有的世界：可重置、可记账，事实由 `sim_report` 给出（含轨迹）。"""
+
+    kind = 'simulator'
+    resettable = True
+
+    def __init__(self, mcp_id: str):
+        self.mcp_id = mcp_id
+
+    async def _call(self, tool: str, args: dict) -> dict:
+        result = await mcp_client.call_tool_direct(self.mcp_id, tool, args)
+        return result if isinstance(result, dict) else {'error': str(result)}
+
+    async def reset(self, run: dict, seed: int) -> dict:
+        world = run.get('world') or {}
+        return await self._call(SCENARIO_TOOL, {
+            'action': 'reset', 'map': world.get('map', ''),
+            'spawn': world.get('spawn') or {}, 'seed': seed, 'owner': OWNER})
+
+    async def release(self) -> None:
+        await self._call(SCENARIO_TOOL, {'action': 'abort', 'owner': OWNER})
+
+    async def note(self, text: str) -> None:
+        await self._call(SCENARIO_TOOL, {'action': 'note', 'text': text})
+
+    async def facts(self) -> dict:
+        return await self._call(REPORT_TOOL, {'what': 'report'})
+
+
+class RealWorld:
+    """真实机器人所在的世界：重置不了，事实由 agent-core 自己记。
+
+    `reset` 是**显式的空操作**，不是悄悄跳过：物理世界没有出生点可以回到，机器人就停
+    在上一次运行结束的地方。这件事要进复盘 —— 否则第二次重复的起点和第一次不同，而
+    记录里看不出任何差别，只会显示两次分数不一样。
+    """
+
+    kind = 'real'
+    resettable = False
+
+    def __init__(self, waypoints: list[str] | None = None):
+        self.waypoints = waypoints or []
+        self._recorder = None
+
+    async def reset(self, run: dict, seed: int) -> dict:
+        self._recorder = benchmark_facts.start(self.waypoints)
+        return {'reset': False,
+                'note': '真机不重置世界：机器人停在上一次运行结束的位置'}
+
+    async def release(self) -> None:
+        benchmark_facts.stop()
+
+    async def note(self, text: str) -> None:
+        return                      # 没有世界日志可记；插话已经在事实流里有 speak 事件
+
+    async def facts(self) -> dict:
+        recorder = self._recorder or benchmark_facts.current()
+        return recorder.facts() if recorder else {'events': [], 'acp_posts': []}
+
+
 # ── 一次运行 ──────────────────────────────────────────────────────────────────
 
 class CaseRun:
     """一个用例的 N 次重复。同一时刻只允许有一个。"""
 
-    def __init__(self, case: dict, mcp_id: str, repeats: int, seed: int,
-                 run_id: str, environment: dict):
+    def __init__(self, case: dict, mcp_id: str | None, repeats: int, seed: int,
+                 run_id: str, environment: dict, world=None):
         self.case = case
         self.mcp_id = mcp_id
+        # `mcp_id` 为空就是真机：没有仿真器持有世界。
+        self.world = world or (SimulatorWorld(mcp_id) if mcp_id
+                               else RealWorld(_expected_waypoints(case)))
         self.repeats = max(1, int(repeats))
         self.seed = int(seed)
         self.run_id = run_id
@@ -114,15 +218,11 @@ class CaseRun:
         self._abort = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
-    # -- 与仿真器说话 ---------------------------------------------------------
-
-    async def _call(self, tool: str, args: dict) -> dict:
-        result = await mcp_client.call_tool_direct(self.mcp_id, tool, args)
-        return result if isinstance(result, dict) else {'error': str(result)}
+    # -- 与世界说话 -----------------------------------------------------------
 
     async def _facts(self) -> dict:
-        """驱动产出的事实：事件流 + ACP 记录。判定不看驱动自己的 assertions。"""
-        return await self._call(REPORT_TOOL, {'what': 'report'})
+        """这次运行的事实：事件流 + ACP 记录。判定不看驱动自己的 assertions。"""
+        return await self.world.facts()
 
     # -- 执行 -----------------------------------------------------------------
 
@@ -145,18 +245,16 @@ class CaseRun:
             self.error = str(exc)
         finally:
             # 把世界还给画布。不还，下一个人连 reset 都调不动，而错误信息会指向一次
-            # 早就结束的运行。
-            await self._call(SCENARIO_TOOL, {'action': 'abort', 'owner': OWNER})
+            # 早就结束的运行。真机这一侧还给的是事实记录器 —— 不停的话，运行结束后
+            # 机器人继续做的事会漏进这次运行的事实里。
+            await self.world.release()
             await self._finish()
 
     async def _one(self, index: int) -> dict:
         run = self.case.get('run') or {}
         started = time.time()
 
-        reset = await self._call(SCENARIO_TOOL, {
-            'action': 'reset', 'map': (run.get('world') or {}).get('map', ''),
-            'spawn': (run.get('world') or {}).get('spawn') or {},
-            'seed': self.seed + index, 'owner': OWNER})
+        reset = await self.world.reset(run, self.seed + index)
         if 'error' in reset:
             return self._case_row(index, started, {}, error=reset['error'])
 
@@ -185,7 +283,7 @@ class CaseRun:
         await event_bus.enqueue(source='message', text=str(text),
                                 payload={'benchmark': True})
         try:
-            await self._call(SCENARIO_TOOL, {'action': 'note', 'text': f'[用例{label}] {text}'})
+            await self.world.note(f'[用例{label}] {text}')
         except Exception:
             pass      # 记账失败不该让一次运行停下来
 
@@ -232,8 +330,11 @@ class CaseRun:
         score = payload.get('score') or {}
         results = payload.get('results') or []
         elapsed = time.time() - started
+        # 判不了的不算失败（`measurable: False`）—— 否则真机上每次运行都会因为
+        # 「没有轨迹占用数据」被标成 failed，而那不是 agent 做错了什么。
         failures = [r['name'] for r in results
-                    if not r['ok'] and r.get('detail') != '未断言']
+                    if not r['ok'] and r.get('measurable', True)
+                    and r.get('detail') != '未断言']
         name = self.case.get('name', '') or 'case'
         outcome = 'error' if error else ('ok' if not failures else 'failed')
         # `scenario` 和 `outcome` 也放进返回的行里：面板拿同一份数据渲染进度，
@@ -293,6 +394,28 @@ class CaseRun:
 
 
 # ── 触发与收尾判定 ────────────────────────────────────────────────────────────
+
+def _expected_waypoints(case: dict) -> list[str]:
+    """用例点名要去的那些站。
+
+    真机的事实记录器靠这份名单认出一次派发的目标是哪一站 —— 它在参数值里找它们，
+    因为参数**名**各家不同（见 `benchmark_facts` 的模块文档）。用例没点名站序的话，
+    名单为空，导航事实就没有 label，而那些断言本来也没被断言。
+    """
+    expect = (case.get('evaluate') or {}).get('expect') or {}
+    names = list(expect.get('waypoint_order') or [])
+    for key in ('resume_target',):
+        if expect.get(key):
+            names.append(expect[key])
+    leg = expect.get('interrupted_leg') or {}
+    if leg.get('target'):
+        names.append(leg['target'])
+    seen: list[str] = []
+    for name in names:
+        if str(name) and str(name) not in seen:
+            seen.append(str(name))
+    return seen
+
 
 def _trigger_due(injection: dict, events: list, elapsed: float) -> Optional[float]:
     """这条插话该在第几秒（运行开始起算）发出；条件还没满足就返回 None。

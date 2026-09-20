@@ -32,6 +32,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'benchmark-test.db'))
 
 import benchmark_store  # noqa: E402
+import config  # noqa: E402
 import mcp_client  # noqa: E402
 from api import benchmark  # noqa: E402
 
@@ -221,13 +222,111 @@ def test_an_offline_simulator_is_not_offered(monkeypatch):
     assert benchmark.find_simulator() is None
 
 
-def test_available_is_what_hides_the_panel_on_a_shipped_robot(monkeypatch):
+# ── 申报探针 ──────────────────────────────────────────────────────────────────
+#
+# 这一组对着**真实形状的注册表**跑。`unmeasurable` 那边喂的是假 probe，所以探针自己
+# 怎么查注册表，那边一条都盖不到 —— 第一版按裸名查 `tool_meta`，假 probe 一路绿，
+# 到 R1 上才发现每张画布都被报成「没有任何申报了嘴的卡片」。
+
+def registry_with(monkeypatch, server_name, mcp_id, tool, **meta):
+    """两张表都要造，因为查一个工具真的要走两跳：
+
+    `server_name → mcp_id` 住在 `config.main['services']['mcp']`（包体说的是驱动名，
+    因为它要能换机器），`mcp_id → tool_meta` 住在运行时注册表，键是**全名**。
+    """
+    services = dict(config.main.get('services') or {})
+    services['mcp'] = [{'id': mcp_id, 'server_name': server_name, 'name': server_name}]
+    monkeypatch.setitem(config.main, 'services', services)
+    monkeypatch.setitem(mcp_client.registry, mcp_id, {
+        'online': True, 'tools': [tool],
+        'tool_meta': {f'mcp__{mcp_id}__{tool}': meta},
+    })
+
+
+def test_the_probe_reads_a_tools_declared_mouth_and_acp(monkeypatch):
+    registry_with(monkeypatch, 'perception-bundle', 'mcp-perc', 'tts',
+                  resource=frozenset({'mouth'}), completion={'timeout': 120})
+
+    assert benchmark.speech_probe('perception-bundle', 'tts') == {'mouth': True,
+                                                                  'completion': True}
+
+
+def test_the_probe_is_asked_by_driver_name_because_a_payload_has_no_mcp_id(monkeypatch):
+    """包体里的卡片带 `deviceRef`，`mcpId` 是 None。拿 `mcp_id` 当入参，每个打包用例
+    都会被报成「没有申报嘴的卡片」—— Orin6 上就是这么现形的。"""
+    registry_with(monkeypatch, 'perception-bundle', 'mcp-perc', 'tts',
+                  resource=frozenset({'mouth'}), completion={'timeout': 120})
+
+    # 本机的 mcp_id 当驱动名传进去，应该什么都查不到。
+    assert benchmark.speech_probe('mcp-perc', 'tts')['mouth'] is False
+
+
+def test_a_tool_split_by_action_is_still_found(monkeypatch):
+    """带 action 枚举的工具会被 `_connect_one` 拆开，键变成
+    `mcp__<id>__<tool>__<action>`，`mcp__<id>__<tool>` 这个键根本不存在。
+
+    卡片记的是**工具**名。只认精确键的话，一个拆开的 tts 表现得和「没申报嘴」
+    一模一样 —— Orin6 上的仿真器 tts 就是这种，前两跳全对，卡在这里。
+    """
+    monkeypatch.setitem(config.main, 'services', {'mcp': [
+        {'id': 'mcp-sim2', 'server_name': 'simulator-generic-device-bundle'}]})
+    monkeypatch.setitem(mcp_client.registry, 'mcp-sim2', {
+        'online': True, 'tools': ['tts'],
+        'tool_meta': {
+            'mcp__mcp-sim2__tts__speak': {'resource': frozenset({'mouth'}),
+                                          'completion': {'timeout': 60}},
+            'mcp__mcp-sim2__tts__stop': {'resource': frozenset({'mouth'}),
+                                         'completion': {'timeout': 60}},
+        },
+    })
+
+    assert benchmark.speech_probe('simulator-generic-device-bundle', 'tts') == {
+        'mouth': True, 'completion': True}
+
+
+def test_a_prefix_collision_does_not_count_as_the_same_tool(monkeypatch):
+    """`tts_backup` 不是 `tts` 拆出来的 —— 拆分用的是 `__`，前缀匹配必须带上它。"""
+    monkeypatch.setitem(config.main, 'services', {'mcp': [
+        {'id': 'mcp-x', 'server_name': 'some-bundle'}]})
+    monkeypatch.setitem(mcp_client.registry, 'mcp-x', {
+        'online': True, 'tools': ['tts_backup'],
+        'tool_meta': {'mcp__mcp-x__tts_backup': {'resource': frozenset({'mouth'}),
+                                                 'completion': {'timeout': 60}}},
+    })
+
+    assert benchmark.speech_probe('some-bundle', 'tts')['mouth'] is False
+
+
+def test_a_tool_that_declares_no_channel_is_not_a_mouth(monkeypatch):
+    """R1 的 `speaker` 就是这样：它是真的喇叭，但没申报通道，所以讲解事实不靠它 ——
+    靠画布上那张申报了 mouth 的 `tts`。"""
+    registry_with(monkeypatch, 'r1-device-bundle', 'mcp-r1', 'speaker',
+                  resource=None, completion=None)
+
+    assert benchmark.speech_probe('r1-device-bundle', 'speaker') == {'mouth': False,
+                                                                     'completion': False}
+
+
+def test_an_unknown_device_probes_false_rather_than_raising(monkeypatch):
+    monkeypatch.setattr(mcp_client, 'registry', {})
+
+    assert benchmark.speech_probe('nope', 'tts') == {'mouth': False, 'completion': False}
+
+
+def test_the_panel_is_available_on_a_robot_with_no_simulator(monkeypatch):
+    """R1 上抓到的：装了最新 agent-core，设置里却没有基准测试这一项，而且没有任何
+    迹象说明为什么没有。
+
+    入口原先挂在「有没有仿真器」上。但基准测试测的是**解决方案** —— 裁判一直是纯函数，
+    事实流现在真机上也有（`benchmark_facts`），仿真器在不在场只决定世界能不能重置，
+    以及有没有轨迹占用这类只有它算得出的量。两件都不是「入口该不该存在」。
+    """
     monkeypatch.setattr(mcp_client, 'registry', {})
 
     result = asyncio.run(benchmark.available())
 
-    assert result['available'] is False
-    assert result['mcp_id'] is None
+    assert result['available'] is True
+    assert result['simulator'] is None      # 前端据此决定要不要走确认
 
 
 # ── 被测配置 ────────────────────────────────────────────────────────────────

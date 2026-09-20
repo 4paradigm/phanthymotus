@@ -8758,6 +8758,23 @@ html, body {
   font-size: 12px; color: var(--text-muted); cursor: pointer;
 }
 .bm-confirm input { accent-color: var(--accent); }
+/* 常驻提示条：这张画布上有会动的真设备。挑用例之前就说，不等按了运行才拦。 */
+.bm-hw-notice {
+  margin: 0 18px; padding: 7px 11px;
+  border-left: 2px solid var(--red); background: var(--red-bg);
+  font-size: 11px; line-height: 1.5; color: var(--red);
+}
+/* 真机确认。比覆盖画布重一档：那个只是丢掉几张卡，这个会让一台真机器人动起来，
+   所以整块有红色左边框，两组信息（会动什么、会说什么）分开列。 */
+.bm-hardware { border-left: 2px solid var(--red, #e5484d); padding-left: 10px; }
+.bm-hardware .bm-note { color: var(--red, #e5484d); }
+.bm-hw-group { margin-top: 9px; }
+.bm-hw-title {
+  display: block; margin-bottom: 3px;
+  font-size: 11px; color: var(--text-muted);
+}
+.bm-hw-group .bm-blockers { margin: 0; }
+.bm-dim { color: var(--text-muted); font-style: italic; }
 .bm-case-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
 .bm-case-actions .btn-primary { flex: 1; }
 .bm-case-actions .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
