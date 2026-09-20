@@ -414,7 +414,9 @@ def observations(facts: dict, spans: list[dict], usage: dict, window: tuple,
     return {
         'world_timing': world_timing(facts),
         'concurrency': concurrency(facts, spans, window),
-        'llm_latency': llm_latency(spans, rounds_ok=(usage or {}).get('calls')),
+        # `call_count` 是**推出来的成功轮数**：`perf_spans` 不记一轮成没成功，而
+        # `token_usage` 成功一次记一行。这一点在 `llm_latency` 的文档里写着，别读成实测。
+        'llm_latency': llm_latency(spans, rounds_ok=(usage or {}).get('call_count')),
         'cache_hit': cache_hit(usage),
         'answer_quality': {},          # 没有可算指标 —— 这一条只能由裁判判
         'ux': ux(facts, marks),

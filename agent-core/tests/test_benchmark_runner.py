@@ -28,16 +28,17 @@ import benchmark_runner  # noqa: E402
 import benchmark_store  # noqa: E402
 import config  # noqa: E402
 import event_bus  # noqa: E402
+import benchmark_judge  # noqa: E402
 import mcp_client  # noqa: E402
 
 CASE = {
     'name': 'bj-2f-tour',
     'requires': {'drivers': ['simulator-generic'], 'assets': ['bj-2f']},
     'run': {'prompt': '带我转一下展区并给我介绍下',
-            'world': {'map': 'bj-2f', 'spawn': {'x': 5.98, 'y': 8.77, 'yaw': 0.55}},
-            'injections': [{'after_arrival': 'P3', 'delay': 0.05, 'text': '先等一下'}]},
-    'evaluate': {'expect': {'waypoint_order': ['P3', 'P4'], 'max_wall_seconds': 30},
-                 'weights': {'orchestration': 100}},
+            'injections': [{'after_action': 1, 'delay': 0.05, 'text': '先等一下'}],
+            'budget_seconds': 30, 'idle_seconds': 0.01},
+    'requirements': [{'id': 'r0', 'text': '按顺序走完每一站', 'weight': 30,
+                      'dimension': 'world_timing'}],
 }
 
 
@@ -270,14 +271,23 @@ def test_the_delay_is_counted_from_seeing_the_arrival_not_from_its_timestamp():
         {'after_arrival': 'P5', 'delay': 6.0}, sped_up, 30.0) == 36.0
 
 
-def test_a_run_is_finished_once_every_expected_waypoint_was_reached():
-    expect = {'waypoint_order': ['P3', 'P4']}
-    partial = {'events': [{'event': 'arrive', 'label': 'P3'}]}
-    complete = {'events': [{'event': 'arrive', 'label': 'P3'},
-                           {'event': 'arrive', 'label': 'P4'}]}
+def test_an_injection_can_fire_after_the_nth_action_whatever_that_action_was():
+    """`after_action` 是 `after_arrival` 的通用化 —— 「到达某一站」是展区导览的说法，
+    「第 N 个动作做完」在任何用例里都成立，判据也一样在事实流里。"""
+    two_done = [{'event': 'arrive', 't': 5.0}, {'event': 'speak_end', 't': 9.0}]
 
-    assert benchmark_runner._finished(partial, expect) is False
-    assert benchmark_runner._finished(complete, expect) is True
+    assert benchmark_runner._trigger_due({'after_action': 3, 'delay': 1.0},
+                                         two_done, 20.0) is None
+    assert benchmark_runner._trigger_due({'after_action': 2, 'delay': 1.0},
+                                         two_done, 20.0) == 21.0
+
+
+def test_the_old_after_arrival_trigger_still_works():
+    """旧用例还在用它。编辑器不再提供，但读到了要认。"""
+    arrived = [{'event': 'arrive', 'label': 'P5', 't': 300.0}]
+
+    assert benchmark_runner._trigger_due(
+        {'after_arrival': 'P5', 'delay': 6.0}, arrived, 30.0) == 36.0
 
 
 # ── 一次完整跑动 ──────────────────────────────────────────────────────────────
@@ -302,6 +312,27 @@ def simulator(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def judge(monkeypatch):
+    """裁判打桩。
+
+    `_one` 现在跑完会调 LLM 裁判 —— 不打桩的话，每一条跑动测试都会发真实请求，在没有
+    网络的机器上表现为「运行失败」，而失败原因和被测的东西毫无关系。
+
+    确定性那一半（默认目标对着指标判）照常真跑，本来就不该打桩 —— 那一半不花钱、
+    不联网，正是「模糊判定要少」换来的好处。
+    """
+    calls = []
+
+    async def fake(case, observations, facts, agent_track, model=None):
+        calls.append({'observations': observations, 'facts': facts,
+                      'agent_track': agent_track})
+        return {'items': [], 'model': 'fake-judge', 'error': ''}
+
+    monkeypatch.setattr(benchmark_judge, 'judge', fake)
+    return calls
+
+
 @pytest.fixture
 def said(monkeypatch):
     messages = []
@@ -318,7 +349,7 @@ def test_the_prompt_enters_as_a_user_message(simulator, said):
     会返回 200 然后只进后台批 —— 看起来像发了但没反应。"""
     run = run_once()
 
-    assert run.state == 'done'
+    assert run.state == 'done', run.error
     assert said[0]['source'] == 'message'
     assert said[0]['text'] == '带我转一下展区并给我介绍下'
 
@@ -357,15 +388,64 @@ def test_a_failed_note_does_not_stop_the_run(simulator, said, monkeypatch):
 
     run = run_once()
 
-    assert run.state == 'done'
+    assert run.state == 'done', run.error
 
 
-def test_the_world_is_reset_from_the_case_not_from_the_driver(simulator, said):
-    """地图和出生点来自用例。驱动里存一份、用例里存一份，迟早会对不上。"""
+def test_a_case_that_names_no_map_leaves_the_world_where_it_is(simulator, said):
+    """用例不再声明地图和出生点 —— **跑在当前世界上**，和「跑在当前画布上」是同一件事。
+
+    仿真器仍然被 reset（世界要回到一个干净的起点），但 `map` 是空的，也就是「保持你
+    现在这张图」。`world` 还写在包体里的旧用例照旧生效，只是编辑器不再提供这一项。
+    """
     run_once()
 
-    action, args = simulator[0][1]['action'], simulator[0][1]
-    assert action == 'reset'
+    args = simulator[0][1]
+    assert args['action'] == 'reset' and args['owner'] == benchmark_runner.OWNER
+    assert args['map'] == '' and args['spawn'] == {}
+
+
+def test_the_run_ends_when_the_world_goes_quiet(simulator, said):
+    """收尾条件换过一版：原先是「所有期望站点都到过了」—— 那要求用例先声明一串站名，
+    也就是把展区导览的词汇焊进了收尾逻辑。现在只剩预算耗尽和安静下来两条。"""
+    run = run_once()
+
+    assert run.state == 'done'
+    assert run.cases[0]['elapsed'] < 30       # 远没跑满预算
+
+
+def test_a_run_is_not_declared_over_while_an_action_is_still_pending(simulator, said,
+                                                                     monkeypatch):
+    """没有新事实常常只是因为机器人正走在半路上 —— 一段两分钟的导航期间事实流就是
+    不动的。光看「没有新事实」会在半路上把运行判结束，然后给一个「什么都没做完」的分。
+    """
+    monkeypatch.setattr(mcp_client, 'get_pending_actions', lambda: ['a1'])
+    monkeypatch.setitem(CASE['run'], 'budget_seconds', 0.3)
+
+    run = run_once()
+
+    monkeypatch.setitem(CASE['run'], 'budget_seconds', 30)
+    # 安静了，但有动作没完 —— 只能等到预算耗尽。
+    assert run.cases[0]['elapsed'] >= 0.3
+
+
+def test_the_run_records_when_the_user_spoke_and_when_it_interrupted(simulator, said):
+    """UX 那几个指标要知道这两个时刻，而事实流里没有 —— 它记的是机器人做了什么，
+    不是用户什么时候说的话。"""
+    run = run_once()
+
+    marks = run._marks
+    # 从「用户说完」起算，不从运行开始起算 —— 否则世界重置那几秒会被算进用户的等待。
+    assert marks['prompt_at'] >= marks['started']
+    assert len(marks['injections_at']) == 1
+    assert marks['injections_at'][0] >= marks['prompt_at']
+
+
+def test_a_legacy_case_that_still_carries_a_map_is_honoured(simulator, said):
+    legacy = {**CASE, 'run': {**CASE['run'], 'world': {'map': 'bj-2f',
+                                                       'spawn': {'x': 5.98}}}}
+    run_once(case=legacy)
+
+    args = simulator[0][1]
     assert args['map'] == 'bj-2f' and args['spawn']['x'] == 5.98
 
 
@@ -385,9 +465,9 @@ def test_repeats_each_get_their_own_seed(simulator, said):
         or len({c['score']['total'] for c in run.cases}) == 1
 
 
-def run_once(repeats=1, seed=0):
+def run_once(repeats=1, seed=0, case=None):
     run_id = benchmark_store.create_run('bj-2f-tour', n_repeats=repeats)
-    run = benchmark_runner.CaseRun(CASE, 'mcp-sim', repeats, seed, run_id, {})
+    run = benchmark_runner.CaseRun(case or CASE, 'mcp-sim', repeats, seed, run_id, {})
     benchmark_runner.set_current(run)
     asyncio.run(run._drive())
     return run
