@@ -221,6 +221,42 @@ def test_an_offline_simulator_is_not_offered(monkeypatch):
     assert benchmark.find_simulator() is None
 
 
+# ── 申报探针 ──────────────────────────────────────────────────────────────────
+#
+# 这一组对着**真实形状的注册表**跑。`unmeasurable` 那边喂的是假 probe，所以探针自己
+# 怎么查注册表，那边一条都盖不到 —— 第一版按裸名查 `tool_meta`，假 probe 一路绿，
+# 到 R1 上才发现每张画布都被报成「没有任何申报了嘴的卡片」。
+
+def registry_with(monkeypatch, mcp_id, tool, **meta):
+    """`tool_meta` 的键是全名 `mcp__<id>__<tool>` —— 这正是要钉住的那件事。"""
+    monkeypatch.setitem(mcp_client.registry, mcp_id, {
+        'online': True, 'tools': [tool],
+        'tool_meta': {f'mcp__{mcp_id}__{tool}': meta},
+    })
+
+
+def test_the_probe_reads_a_tools_declared_mouth_and_acp(monkeypatch):
+    registry_with(monkeypatch, 'mcp-perc', 'tts',
+                  resource=frozenset({'mouth'}), completion={'timeout': 120})
+
+    assert benchmark.speech_probe('mcp-perc', 'tts') == {'mouth': True, 'completion': True}
+
+
+def test_a_tool_that_declares_no_channel_is_not_a_mouth(monkeypatch):
+    """R1 的 `speaker` 就是这样：它是真的喇叭，但没申报通道，所以讲解事实不靠它 ——
+    靠画布上那张申报了 mouth 的 `tts`。"""
+    registry_with(monkeypatch, 'mcp-r1', 'speaker', resource=None, completion=None)
+
+    assert benchmark.speech_probe('mcp-r1', 'speaker') == {'mouth': False,
+                                                           'completion': False}
+
+
+def test_an_unknown_device_probes_false_rather_than_raising(monkeypatch):
+    monkeypatch.setattr(mcp_client, 'registry', {})
+
+    assert benchmark.speech_probe('nope', 'tts') == {'mouth': False, 'completion': False}
+
+
 def test_the_panel_is_available_on_a_robot_with_no_simulator(monkeypatch):
     """R1 上抓到的：装了最新 agent-core，设置里却没有基准测试这一项，而且没有任何
     迹象说明为什么没有。

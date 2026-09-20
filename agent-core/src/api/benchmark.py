@@ -188,7 +188,11 @@ async def available():
     `simulator` 照样返回，前端拿它提示当前是哪一侧、要不要走确认。
     """
     mcp_id = find_simulator()
+    import benchmark_runner
     return {'available': True, 'mcp_id': mcp_id, 'simulator': mcp_id,
+            # 这次运行会让什么动起来 —— **在点「运行」之前**就说。原先这份清单只在
+            # 被拒绝的 409 里出现，于是面板在人做决定之前一个字都没提。
+            'moving_cards': benchmark_runner.unsafe_cards(mcp_id),
             'environment': _environment()}
 
 
@@ -405,7 +409,11 @@ def speech_probe(mcp_id: str, tool: str) -> dict:
     （`case_readiness` 先跑，两层顺序是有意的）。
     """
     info = mcp_client.registry.get(mcp_id) or {}
-    meta = (info.get('tool_meta') or {}).get(tool) or {}
+    # `tool_meta` 的键是**全名** `mcp__<id>__<tool>`（`tool_meta[schema['name']]`，
+    # 而 `schema['name']` 由 `_to_openai_schema` 产出全名）。按裸名取永远是空 dict ——
+    # 于是每一张画布都会被报成「没有任何申报了嘴的卡片」，包括完全正确的那些。
+    # 第一版就是这么写的，单元测试喂的是假 probe，所以一路绿到真机上。
+    meta = (info.get('tool_meta') or {}).get(f'mcp__{mcp_id}__{tool}') or {}
     resource = meta.get('resource') or frozenset()
     return {'mouth': bool(set(resource) & benchmark_facts.SPEECH_CHANNELS),
             'completion': bool(meta.get('completion'))}

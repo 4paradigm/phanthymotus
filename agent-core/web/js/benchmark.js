@@ -75,6 +75,7 @@ async function _detect() {
       el.classList.toggle('hidden', !info.available);
     });
     _simulator = info.simulator ?? info.mcp_id ?? null;
+    _renderHardwareNotice(info.moving_cards || []);
     // 被测配置常驻标题栏：分数属于某一次具体的模型与镜像，不该藏在某一行里。
     const env = info.environment || {};
     const meta = document.getElementById('bm-env');
@@ -401,6 +402,21 @@ async function _runCase(repeats, confirmMovingCards = null) {
     if (moving) { _confirmHardware(moving, repeats); return; }
     showToast(runRefusal(e));
   }
+}
+
+/** 面板顶上那句常驻提示：这张画布一跑起来，什么会真的动。 */
+export function hardwareNotice(movingCards = []) {
+  if (!movingCards.length) return '';
+  const names = movingCards.map((m) => `${m.device || m.mcpId} 的 ${m.tool}`).join('、');
+  return `这张画布上有会动的真实设备（${names}）。运行用例会让它们真的动起来，开跑前要确认。`;
+}
+
+function _renderHardwareNotice(movingCards) {
+  const el = document.getElementById('bm-hw-notice');
+  if (!el) return;
+  const text = hardwareNotice(movingCards);
+  el.textContent = text;
+  el.classList.toggle('hidden', !text);
 }
 
 /** 一张卡片在确认清单里的身份。必须和服务端的 `card_key` 一字不差。 */

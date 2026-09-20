@@ -12,7 +12,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { blockerRows, cardKey, plannedUtterances, runRefusal } from './benchmark.js';
+import { blockerRows, cardKey, hardwareNotice, plannedUtterances,
+         runRefusal } from './benchmark.js';
 import { parseList, weightNote, normalizeInjection } from './benchmark-editor.js';
 
 test('依赖齐了就没有任何一条拦路的', () => {
@@ -84,6 +85,19 @@ test('多张真卡片都点出来，不是只说第一张', () => {
 //
 // 确认弹窗要说清楚两件事：**哪些东西会动**，以及**会对它们说什么**。少了后者，人只
 // 知道机器人要动，不知道它要被支使去做什么 —— 那个勾就没有意义。
+
+test('画布上有真设备时，挑用例之前就提示', () => {
+  // 原先这份清单只在被拒绝的 409 里出现 —— 人做决定之前面板一个字都没提。
+  const notice = hardwareNotice([{ device: '天轶', tool: 'loco' },
+                                 { mcpId: 'mcp-x', tool: 'speaker' }]);
+
+  assert.match(notice, /天轶 的 loco/);
+  assert.match(notice, /mcp-x 的 speaker/);   // 没有设备名就退回 mcpId
+});
+
+test('纯仿真的画布不挂这条提示', () => {
+  assert.equal(hardwareNotice([]), '');
+});
 
 test('确认清单里的身份用 mcpId，不用设备名', () => {
   // 设备名改个昵称就变，`mcpId` 不会。服务端拿这个串比对，两边必须一字不差。

@@ -668,6 +668,10 @@
       <button class="btn-icon" id="benchmark-close">&#10005;</button>
     </div>
 
+    <!-- 画布上有真设备时的常驻提示。放在这里而不是只放在确认弹窗里：人该在挑用例
+         之前就知道这台机器会真的动，而不是按了「运行」才被拦一次。 -->
+    <div class="bm-hw-notice hidden" id="bm-hw-notice"></div>
+
     <div class="modal-body benchmark-body">
       <!-- 左栏：用例库。主体是「看现有的方案」——「打开文件」是导入路径，
            所以它是标签旁边的一个小链接，不是入口。 -->
