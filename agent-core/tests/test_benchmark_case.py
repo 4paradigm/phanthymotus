@@ -243,19 +243,34 @@ def test_evaluate_reads_expect_out_of_the_case_payload():
 # ── 测不到的断言 ──────────────────────────────────────────────────────────────
 
 def canvas_case(speech_tool='tts'):
-    """一个断言了讲解的用例，画布上挂着 `speech_tool` 那张卡。"""
+    """一个断言了讲解的用例，画布上挂着 `speech_tool` 那张卡。
+
+    **卡片带的是 `deviceRef`，`mcpId` 是 None** —— 这是打包过的解决方案在真机上的
+    真实形状（Orin6 上取下来的），也正是 deviceRef 存在的理由：同一个包体换台机器
+    还能载入。用 `mcpId` 造夹具会把整类 bug 测没了。
+    """
     payload = case()
     payload['test']['evaluate']['expect']['announce_after_arrive'] = True
+    payload['devices'] = [{'ref': 'd2', 'serverName': 'r1-device-bundle',
+                           'name': 'Unitree R1'}]
     payload['canvas'] = {'cards': [
-        {'id': 'c1', 'mcpId': 'mcp-real', 'toolName': 'controlled_spatial'},
-        {'id': 'c2', 'mcpId': 'mcp-real', 'toolName': speech_tool},
+        {'id': 'c1', 'deviceRef': 'd2', 'mcpId': None, 'toolName': 'controlled_spatial'},
+        {'id': 'c2', 'deviceRef': 'd2', 'mcpId': None, 'toolName': speech_tool},
     ]}
     return payload
 
 
-def probe(mouth=(), completion=()):
-    """假的申报表。真的那份背后是 `mcp_client.registry`（`api.benchmark.speech_probe`）。"""
-    return lambda mcp_id, tool: {'mouth': tool in mouth, 'completion': tool in completion}
+def probe(mouth=(), completion=(), server='r1-device-bundle'):
+    """假的申报表。真的那份背后是 `mcp_client.registry`（`api.benchmark.speech_probe`）。
+
+    第一个入参是**驱动名**，不是 `mcp_id` —— 认错驱动的也要答 False，否则这组测试
+    盖不住「解错了 deviceRef」这一类。
+    """
+    def ask(server_name, tool):
+        if server_name != server:
+            return {'mouth': False, 'completion': False}
+        return {'mouth': tool in mouth, 'completion': tool in completion}
+    return ask
 
 
 def test_a_real_robots_tts_is_measurable_now():
@@ -292,6 +307,23 @@ def test_a_speech_tool_without_acp_cannot_time_the_announcement():
 
     assert len(problems) == 1
     assert 'ACP' in problems[0]
+
+
+def test_the_card_is_resolved_through_deviceRef_not_mcpId():
+    """打包的用例里 `mcpId` 是 None —— 卡片指向 `devices[]` 里的一条，那条才知道
+    自己是哪个驱动。
+
+    Orin6 上现的形：拿 `card['mcpId']` 去查注册表，每个打包用例都被报成「没有申报嘴
+    的卡片」，包括完全正确的那些。这条断言要是只用 `mcpId` 造夹具，就永远抓不到。
+    """
+    seen = []
+
+    def watching(server_name, tool):
+        seen.append(server_name)
+        return {'mouth': tool == 'tts', 'completion': tool == 'tts'}
+
+    assert bc.unmeasurable(canvas_case(), probe=watching) == []
+    assert set(seen) == {'r1-device-bundle'}       # 不是 None，也不是 ''
 
 
 def test_without_a_probe_no_verdict_is_reached():

@@ -32,6 +32,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'benchmark-test.db'))
 
 import benchmark_store  # noqa: E402
+import config  # noqa: E402
 import mcp_client  # noqa: E402
 from api import benchmark  # noqa: E402
 
@@ -227,8 +228,15 @@ def test_an_offline_simulator_is_not_offered(monkeypatch):
 # 怎么查注册表，那边一条都盖不到 —— 第一版按裸名查 `tool_meta`，假 probe 一路绿，
 # 到 R1 上才发现每张画布都被报成「没有任何申报了嘴的卡片」。
 
-def registry_with(monkeypatch, mcp_id, tool, **meta):
-    """`tool_meta` 的键是全名 `mcp__<id>__<tool>` —— 这正是要钉住的那件事。"""
+def registry_with(monkeypatch, server_name, mcp_id, tool, **meta):
+    """两张表都要造，因为查一个工具真的要走两跳：
+
+    `server_name → mcp_id` 住在 `config.main['services']['mcp']`（包体说的是驱动名，
+    因为它要能换机器），`mcp_id → tool_meta` 住在运行时注册表，键是**全名**。
+    """
+    services = dict(config.main.get('services') or {})
+    services['mcp'] = [{'id': mcp_id, 'server_name': server_name, 'name': server_name}]
+    monkeypatch.setitem(config.main, 'services', services)
     monkeypatch.setitem(mcp_client.registry, mcp_id, {
         'online': True, 'tools': [tool],
         'tool_meta': {f'mcp__{mcp_id}__{tool}': meta},
@@ -236,19 +244,31 @@ def registry_with(monkeypatch, mcp_id, tool, **meta):
 
 
 def test_the_probe_reads_a_tools_declared_mouth_and_acp(monkeypatch):
-    registry_with(monkeypatch, 'mcp-perc', 'tts',
+    registry_with(monkeypatch, 'perception-bundle', 'mcp-perc', 'tts',
                   resource=frozenset({'mouth'}), completion={'timeout': 120})
 
-    assert benchmark.speech_probe('mcp-perc', 'tts') == {'mouth': True, 'completion': True}
+    assert benchmark.speech_probe('perception-bundle', 'tts') == {'mouth': True,
+                                                                  'completion': True}
+
+
+def test_the_probe_is_asked_by_driver_name_because_a_payload_has_no_mcp_id(monkeypatch):
+    """包体里的卡片带 `deviceRef`，`mcpId` 是 None。拿 `mcp_id` 当入参，每个打包用例
+    都会被报成「没有申报嘴的卡片」—— Orin6 上就是这么现形的。"""
+    registry_with(monkeypatch, 'perception-bundle', 'mcp-perc', 'tts',
+                  resource=frozenset({'mouth'}), completion={'timeout': 120})
+
+    # 本机的 mcp_id 当驱动名传进去，应该什么都查不到。
+    assert benchmark.speech_probe('mcp-perc', 'tts')['mouth'] is False
 
 
 def test_a_tool_that_declares_no_channel_is_not_a_mouth(monkeypatch):
     """R1 的 `speaker` 就是这样：它是真的喇叭，但没申报通道，所以讲解事实不靠它 ——
     靠画布上那张申报了 mouth 的 `tts`。"""
-    registry_with(monkeypatch, 'mcp-r1', 'speaker', resource=None, completion=None)
+    registry_with(monkeypatch, 'r1-device-bundle', 'mcp-r1', 'speaker',
+                  resource=None, completion=None)
 
-    assert benchmark.speech_probe('mcp-r1', 'speaker') == {'mouth': False,
-                                                           'completion': False}
+    assert benchmark.speech_probe('r1-device-bundle', 'speaker') == {'mouth': False,
+                                                                     'completion': False}
 
 
 def test_an_unknown_device_probes_false_rather_than_raising(monkeypatch):

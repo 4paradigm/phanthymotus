@@ -135,10 +135,15 @@ def unmeasurable(payload: dict, probe=None) -> list[str]:
     所以**任何**申报了 `mouth` 通道、且走 ACP 的讲解工具都产出得了事实 —— 真机的
     tts 一样算数。那条旧判据在真机上会把一张完全可用的画布判成「测不到」。
 
-    `probe(mcp_id, tool) -> {'mouth': bool, 'completion': bool}` 由调用方提供，通常
-    背后是 `mcp_client.registry`。**没有 probe 就不下结论**：这个函数也用在还没装驱动
-    的包体上（市场里的用例），那时候画布上有什么工具、申报了什么，无从知道 —— 猜一个
-    答案比不答更糟。
+    `probe(server_name, tool) -> {'mouth': bool, 'completion': bool}` 由调用方提供，
+    通常背后是 `mcp_client.registry`。**没有 probe 就不下结论**：这个函数也用在还没
+    装驱动的包体上（市场里的用例），那时候画布上有什么工具、申报了什么，无从知道 ——
+    猜一个答案比不答更糟。
+
+    问的是 `server_name` 而不是 `mcp_id`，因为**包体里的卡片带的是 `deviceRef`，
+    `mcpId` 是 None** —— 那正是 deviceRef 存在的理由，同一个包体换台机器还能载入。
+    直接拿 `card['mcpId']` 去查注册表，每个打包用例都会被报成「没有申报嘴的卡片」，
+    包括完全正确的那些（Orin6 上就是这么现形的）。翻译成本机的 mcp_id 是 probe 的事。
 
     卡片是不是「讲解卡」按**申报的通道**认，不按工具名。原先这里查
     `toolName in ('tts', 'speaker')`，而这正是 `peer/tools.py` 记着的那个错法：真机的
@@ -149,10 +154,16 @@ def unmeasurable(payload: dict, probe=None) -> list[str]:
     if not expect.get('announce_after_arrive') or probe is None:
         return []
 
+    # ref → serverName。卡片指向 `devices[]` 里的一条，那条才知道自己是哪个驱动。
+    servers = {d.get('ref'): (d.get('serverName') or d.get('name') or '')
+               for d in (payload.get('devices') or [])}
     cards = (payload.get('canvas') or {}).get('cards') or []
     speaks = []
     for card in cards:
-        info = probe(card.get('mcpId', ''), card.get('toolName', '')) or {}
+        # `driverName` 是活画布上那份的字段名，`deviceRef` 是包体里那份 —— 两种形状
+        # 都可能走到这儿，取到哪个算哪个。
+        server = servers.get(card.get('deviceRef')) or card.get('driverName') or ''
+        info = probe(server, card.get('toolName', '')) or {}
         if info.get('mouth'):
             speaks.append((card, info))
 
