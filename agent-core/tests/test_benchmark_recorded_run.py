@@ -100,8 +100,8 @@ def test_blank_time_is_computed_from_the_real_speak_gaps(facts):
     """播报顺序在两台 Orin 上没有别的验证办法 —— 它们都没有真喇叭。"""
     seen = measure(facts)['ux']
 
-    assert seen['blank_count'] > 0
-    assert seen['blank_max_s'] >= seen['blank_avg_s']
+    assert seen['silence_count'] > 0
+    assert seen['silence_max_s'] >= seen['silence_avg_s']
 
 
 def test_cross_clock_metrics_stay_refused_on_a_simulated_run(facts):
@@ -163,9 +163,9 @@ def test_losing_the_trail_data_turns_safety_unmeasurable_not_perfect(facts):
 def test_this_tour_never_speaks_while_it_moves(facts):
     """这趟录下来的跑动**从不边走边说** —— 只在站点停下来讲。
 
-    这条是量出来的，不是设计出来的：把全部播报事件删掉，懵逼时长一秒都不变，说明走
+    这条是量出来的，不是设计出来的：把全部播报事件删掉，静默思考时间一秒都不变，说明走
     路的那些秒本来就一句话没有。一个用户全程被晾了 81 秒的导览，分站看每一站都「到了
-    就讲」，挑不出毛病 —— 这正是「懵逼时长」这个指标存在的理由：它问的是别的问题。
+    就讲」，挑不出毛病 —— 这正是「静默思考时间」这个指标存在的理由：它问的是别的问题。
 
     真要改善，得让机器人在路上说话（而不是讲得更久），而这条断言会在那一天变红，
     提醒改的人回来把它改成新的事实。
@@ -174,5 +174,5 @@ def test_this_tour_never_speaks_while_it_moves(facts):
     quiet['events'] = [e for e in quiet['events']
                        if not str(e.get('event', '')).startswith('speak')]
 
-    assert measure(quiet)['ux']['blank_total_s'] == measure(facts)['ux']['blank_total_s']
-    assert measure(facts)['ux']['blank_total_s'] > 60     # 一共晾了一分多钟
+    assert measure(quiet)['ux']['silence_total_s'] == measure(facts)['ux']['silence_total_s']
+    assert measure(facts)['ux']['silence_total_s'] > 60     # 一共晾了一分多钟

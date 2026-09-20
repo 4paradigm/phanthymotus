@@ -74,9 +74,15 @@ export function scorecard(c) {
 
 /** 一条判定：结论、它是算出来的还是判出来的、以及理由。 */
 export function scoreItem(i) {
-  const mark = i.measurable === false ? '—' : (i.ok ? '✓' : '✗');
-  const cls = i.measurable === false ? 'none' : (i.ok ? 'ok' : 'bad');
-  const from = i.kind === 'target' ? '算出来的' : '裁判判的';
+  const done = i.measurable !== false;
+  const ratio = i.kind === 'ratio';
+  const mark = !done ? '—' : (ratio ? `${Math.round((i.credit ?? 0) * 100)}` : (i.ok ? '✓' : '✗'));
+  const cls = !done ? 'none' : (ratio ? 'ratio' : (i.ok ? 'ok' : 'bad'));
+  // **标签要说实际发生了什么，不是它属于哪一类。** 原先按 kind 打，于是一条没算成的
+  // 目标也写着「算出来的」—— 而它旁边正写着「判不了」的理由，两句直接打架。
+  const from = !done ? '没算成'
+    : ratio ? '按比例计分'
+    : i.kind === 'target' ? '算出来的' : '裁判判的';
   return `<div class="bm-sc-item bm-sc-item--${cls}">
     <span class="bm-sc-mark">${mark}</span>
     <span class="bm-sc-text">${_esc(i.text || '')}
@@ -124,6 +130,8 @@ export function initTimeline() {
   // 省略号里的东西常常正是要看的（完整的讲解词、整串参数）。点一下展开，
   // 不用跳去翻 docker logs。
   document.getElementById('bm-timeline-body')?.addEventListener('click', (event) => {
+    const tab = event.target.closest('.bm-tl-tab');
+    if (tab) return _switchPane(tab.dataset.pane);
     const clip = event.target.closest('.bm-clip');
     if (clip) clip.classList.toggle('bm-clip--open');
   });
@@ -146,6 +154,13 @@ export async function openTimeline(runId) {
     return;
   }
   body.innerHTML = _render(data);
+}
+
+function _switchPane(which) {
+  document.querySelectorAll('.bm-tl-tab').forEach((t) => t.classList.toggle(
+    'active', t.dataset.pane === which));
+  document.querySelectorAll('.bm-tl-pane').forEach((p) => p.classList.toggle(
+    'hidden', p.dataset.pane !== which));
 }
 
 function close() {
@@ -219,25 +234,37 @@ function _render(data) {
       <span class="bm-tl-score">${run.score_total ?? '—'}</span>
       <span class="bm-tl-meta">${_esc(run.suite || '')}　${_esc(run.llm_model || '')}
         ${_esc(Object.values(run.image_tags || {}).filter(Boolean).join(' '))}</span>
-    </div>
-    ${(data.cases || []).map(scorecard).join('')}`;
+    </div>`;
 
+  // **打分细节和日志是两回事，分两个 tab。**
+  //
+  // 「这次多少分、为什么」和「它一步步做了什么」是两种查法：前者按原则读，后者按时间
+  // 读。叠在一条纵向流里，读任何一个都要滚过另一个 —— 而日志动辄几十行，打分细节就被
+  // 推到看不见的地方。默认停在打分，因为那是打开这个弹窗的第一个问题。
+  const cards = (data.cases || []).map(scorecard).join('');
   const agent = data.agent || [];
   const world = data.world || [];
-  if (!agent.length && !world.length) {
-    return head + `<div class="bm-empty">这次运行没有留下记录。<br>
-      记录在运行结束时才落盘，更早的运行（或清过的会话）没有这一份。</div>`;
-  }
 
-  const rows = withQuiet(merge(agent, world));
+  const log = (!agent.length && !world.length)
+    ? `<div class="bm-empty">这次运行没有留下记录。<br>
+        记录在运行结束时才落盘，更早的运行（或清过的会话）没有这一份。</div>`
+    : `${agent.length ? '' : '<div class="bm-tl-fail">这次运行的对话记录已经没有了。</div>'}
+       <div class="bm-tl-r bm-tl-r--headrow">
+         <span class="bm-tl-left">Agent 请求做什么</span>
+         <span class="bm-tl-t"></span>
+         <span class="bm-tl-right">世界真的做了什么</span>
+       </div>
+       <div class="bm-tl-flow">${withQuiet(merge(agent, world)).map(_row).join('')}</div>`;
+
   return `${head}
-    ${agent.length ? '' : '<div class="bm-tl-fail">这次运行的对话记录已经没有了。</div>'}
-    <div class="bm-tl-r bm-tl-r--headrow">
-      <span class="bm-tl-left">Agent 请求做什么</span>
-      <span class="bm-tl-t"></span>
-      <span class="bm-tl-right">世界真的做了什么</span>
+    <div class="bm-tl-tabs">
+      <button class="bm-tl-tab active" data-pane="score">打分细节</button>
+      <button class="bm-tl-tab" data-pane="log">运行日志</button>
     </div>
-    <div class="bm-tl-flow">${rows.map(_row).join('')}</div>`;
+    <div class="bm-tl-pane" data-pane="score">${cards ||
+      '<div class="bm-empty">这次运行没有留下判定明细。<br>' +
+      '更早的运行只存了没过的项目名，理由和指标是后来才开始落盘的。</div>'}</div>
+    <div class="bm-tl-pane hidden" data-pane="log">${log}</div>`;
 }
 
 function _row(row) {

@@ -8761,6 +8761,16 @@ html, body {
 /* 常驻提示条：这张画布上有会动的真设备。挑用例之前就说，不等按了运行才拦。 */
 /* 「判不了」和「没过」要看得出区别 —— 一个是 agent 做错了，一个是这次测不到。 */
 .bm-dim-none { color: var(--text-muted); font-style: italic; }
+/* 打分细节 / 运行日志：两种查法，分两个 tab。叠成一条纵向流的话，日志动辄几十行，
+   打分细节就被推到看不见的地方。 */
+.bm-tl-tabs { display: flex; gap: 2px; margin: 10px 0 0; border-bottom: 1px solid var(--border); }
+.bm-tl-tab {
+  padding: 6px 13px; border: none; background: none; cursor: pointer;
+  font-size: 12px; color: var(--text-muted); border-bottom: 2px solid transparent;
+}
+.bm-tl-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.bm-tl-pane { padding-top: 10px; }
+
 /* 「分数为什么是这个」。每条原则一块，块里是一项一项的判定。 */
 .bm-sc { margin: 10px 0 14px; }
 .bm-sc-dim { margin-bottom: 10px; padding-left: 9px; border-left: 2px solid var(--border); }
@@ -8780,6 +8790,8 @@ html, body {
 .bm-sc-item--ok .bm-sc-mark { color: var(--green, #2E7D32); }
 .bm-sc-item--bad .bm-sc-mark { color: var(--red); }
 .bm-sc-item--none .bm-sc-mark { color: var(--text-muted); }
+/* 比例型的那一项显示的是分数本身，不是对勾 —— 88% 不是「通过」，它就是 88 分。 */
+.bm-sc-item--ratio .bm-sc-mark { font-family: var(--font-mono); color: var(--text); }
 /* 「算出来的」和「裁判判的」要分得清：一个不会抖，一个会。 */
 .bm-sc-from { margin-left: 6px; font-size: 10px; font-style: normal; color: var(--text-muted); }
 .bm-sc-why, .bm-sc-steps { grid-column: 2; color: var(--text-muted); }
@@ -8824,7 +8836,10 @@ html, body {
 .bm-block { padding: 14px 18px; border-bottom: 1px solid var(--border); min-height: 0; }
 .bm-block--grow { flex: 1; display: flex; flex-direction: column; border-bottom: none; }
 .bm-block > .bm-h { margin-bottom: 10px; }
-.bm-block--grow > div { flex: 1; min-height: 0; overflow-y: auto; }
+/* **只让列表增长。** 原先是 `> div`，对所有直接子元素生效 —— 加了「最近两次比较」
+   那一行之后，它和列表平分了高度，于是列表被压到底部，上面空出一大片。 */
+.bm-block--grow > div:not(.bm-compare) { flex: 1; min-height: 0; overflow-y: auto; }
+.bm-block--grow > .bm-compare { flex: none; }
 
 .bm-empty {
   padding: 18px 2px; font-size: 12.5px; line-height: 1.6; color: var(--text-muted);

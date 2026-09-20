@@ -405,3 +405,24 @@ test('老记录没有 results 时退回原来那行，不是空白', () => {
   assert.match(html, /没过/);
   assert.match(html, /站序不对/);
 });
+
+
+test('没算成的那一项不许写「算出来的」', () => {
+  // 标签原先按类别打，于是一条没算成的目标也写着「算出来的」——
+  // 而它旁边正写着「判不了」的理由，两句直接打架。
+  const html = scoreItem({ kind: 'target', ok: false, measurable: false,
+                           text: '首次响应不超过 8 秒', detail: '仿真时钟…' });
+
+  assert.match(html, /没算成/);
+  assert.doesNotMatch(html, /算出来的/);
+});
+
+test('比例型显示分数本身，不是对勾', () => {
+  // 88% 不是「通过」，它就是 88 分。
+  const html = scoreItem({ kind: 'ratio', ok: true, credit: 0.884,
+                           text: 'cache 命中率', detail: '88.4%' });
+
+  assert.match(html, />88</);
+  assert.match(html, /按比例计分/);
+  assert.doesNotMatch(html, /✓/);
+});

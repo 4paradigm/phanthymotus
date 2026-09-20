@@ -1,7 +1,7 @@
 """一次运行算出来的那些确切数字。
 
 指标是整套评分的地基：原则分对着它判，裁判拿着它做判断。地基上有一个数算错了，
-上面每一层都会跟着错，而且错得很像模像样 —— 一个算错的「懵逼时长 3.2s」不会报错，
+上面每一层都会跟着错，而且错得很像模像样 —— 一个算错的「静默思考时间 3.2s」不会报错，
 只会让人以为体验很好。
 
 所以这一组测的是**算得对不对**，不是「函数能跑」。
@@ -190,8 +190,8 @@ def test_blank_time_is_measured_only_while_the_robot_is_busy():
     result = bm.ux(facts(events), {'started': 0})
 
     # 0→10 和 12→30 两段空白，18 秒那段是最长的。
-    assert result['blank_max_s'] == 18.0
-    assert result['blank_count'] == 2
+    assert result['silence_max_s'] == 18.0
+    assert result['silence_count'] == 2
 
 
 def test_the_average_is_judged_and_the_max_is_still_reported():
@@ -202,8 +202,8 @@ def test_the_average_is_judged_and_the_max_is_still_reported():
 
     result = bm.ux(facts(events), {'started': 0})
 
-    assert result['blank_max_s'] == 59.0
-    assert result['blank_avg_s'] < result['blank_max_s']
+    assert result['silence_max_s'] == 59.0
+    assert result['silence_avg_s'] < result['silence_max_s']
 
 
 def test_first_response_is_measured_from_when_the_user_finished_speaking():
@@ -236,7 +236,7 @@ def test_cross_clock_metrics_are_refused_when_the_world_is_simulated():
     assert isinstance(result['interrupt_response_s'], U)
     assert '仿真时钟' in result['first_response_s'].why
     # 单钟内部的指标不受影响 —— 它的单位是那个世界的秒，但相减是有意义的。
-    assert result['blank_max_s'] == 18.0
+    assert result['silence_max_s'] == 18.0
 
 
 # ── 安全 ──────────────────────────────────────────────────────────────────────

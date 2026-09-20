@@ -87,17 +87,43 @@ def test_leaving_mid_sentence_is_still_penalised():
 
 
 def test_a_case_can_move_a_default_target_without_replacing_the_rest():
-    spec = bc.targets(case(targets={'ux.blank_avg_s': 15}))
+    spec = bc.targets(case(targets={'ux.silence_avg_s': 15}))
 
-    assert spec['ux.blank_avg_s']['max'] == 15
+    assert spec['ux.silence_avg_s']['max'] == 15
     assert spec['llm_latency.median_s']['max'] == 10       # 其余不受影响
 
 
 def test_overriding_a_lower_bound_target_keeps_it_a_lower_bound():
-    """cache 命中是越高越好。覆盖它的时候当成上限，等于把「至少三成」改成「至多三成」。"""
-    spec = bc.targets(case(targets={'cache_hit.ratio': 0.5}))
+    """越高越好的指标，覆盖时当成上限就把「至少」改成了「至多」。"""
+    spec = bc.targets(case(targets={'ux.some_rate': 0.5}))
 
-    assert spec['cache_hit.ratio'] == {'min': 0.5, 'label': 'cache 命中不低于三成'}
+    assert spec['ux.some_rate']['max'] == 0.5      # 默认里没有的，按上限
+
+
+def test_cache_hit_scores_by_its_rate_not_by_a_pass_mark():
+    """**命中率本身就是分数。**
+
+    原先是 `min: 0.3` 的通过/不通过：31% 过、94% 也过，两次都记 100 分，而它们差着
+    三倍。cache 命中是个连续量，压成布尔等于把这条原则能提供的信息全扔了，只留下
+    「有没有烂到三成以下」。
+    """
+    items = bc.check_targets(seen(**{'cache_hit.ratio': 0.884}), bc.targets(case()))
+    hit = next(i for i in items if i['id'] == 'cache_hit.ratio')
+
+    assert hit['kind'] == 'ratio'
+    assert hit['credit'] == 0.884
+    assert '88.4%' in hit['detail']
+    # 88% 不是「失败」，它就是 88 分 —— 所以不该出现在 failures 里。
+    assert hit['ok'] is True
+    assert bc.score(case(), [hit])['by_dimension']['cache_hit'] == 88.4
+
+
+def test_a_poor_cache_rate_scores_low_without_being_called_a_failure():
+    items = bc.check_targets(seen(**{'cache_hit.ratio': 0.05}), bc.targets(case()))
+    hit = next(i for i in items if i['id'] == 'cache_hit.ratio')
+
+    assert bc.score(case(), [hit])['by_dimension']['cache_hit'] == 5.0
+    assert bc.score(case(), [hit])['failures'] == []
 
 
 # ── 结构 ──────────────────────────────────────────────────────────────────────
@@ -221,8 +247,12 @@ def test_an_unmeasurable_metric_is_not_a_failure_and_carries_its_reason():
     assert '轨迹占用数据' in safety['detail']
 
 
-def test_a_lower_bound_target_is_compared_the_other_way_round():
-    items = bc.check_targets(seen(**{'cache_hit.ratio': 0.31}), bc.targets(case()))
+def test_a_case_can_turn_a_metric_into_a_lower_bound():
+    """写一个数是改阈值，写一个 dict 是整条换掉 —— 后者是把一条目标从上限改成下限、
+    或者改成比例型的唯一办法。"""
+    payload = case(targets={'cache_hit.ratio': {'min': 0.5, 'ratio': False,
+                                                'label': 'cache 至少五成'}})
+    items = bc.check_targets(seen(**{'cache_hit.ratio': 0.62}), bc.targets(payload))
 
     cache = next(i for i in items if i['id'] == 'cache_hit.ratio')
     assert cache['ok'] is True and '≥' in cache['detail']

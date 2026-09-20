@@ -2,7 +2,7 @@
 
 ## 为什么指标在前，判定在后
 
-「用户体验好不好」对大模型是个氛围词，判出来的分不可信也不可比。「懵逼时长 23.4 秒」
+「用户体验好不好」对大模型是个氛围词，判出来的分不可信也不可比。「最长静默思考时间 23.4 秒」
 不是 —— 它是个数，两次运行之间能比，也能画趋势。
 
 > **指标优先，模糊判定最少化。** 每条原则先有可计算的指标，LLM 只在指标之上做判断。
@@ -33,17 +33,26 @@ import statistics
 # 指标算不出来时的统一形状。`None` 会被下游当成 0 或者当成"没有"，两种误读都出现过，
 # 所以缺失是一个显式的对象，而且**必带理由** —— 「判不了」和「判了没过」是两件事，
 # 说不出为什么判不了的话，读的人只能当它是后者。
-class Unmeasurable:
-    __slots__ = ('why',)
+class Unmeasurable(dict):
+    """**是个 dict**，所以 `json.dumps` 直接认得它。
+
+    原先是个普通对象，于是整块指标一落盘就被 `benchmark_store._dumps` 的
+    `except TypeError: return '{}'` 静默吞掉 —— 一个「判不了」的理由，让七条原则的
+    指标全都没存下来，而且不报错。Orin6 上现的形：判定项落了 12 条，指标块是空的。
+
+    做成 dict 子类而不是在序列化那头特判，是因为那头不该认识这个类型；而理由本身
+    是这里最值钱的东西，得跟着数据走，不能只活在内存里。
+    """
 
     def __init__(self, why: str):
-        self.why = why
+        super().__init__(unmeasurable=why)
+
+    @property
+    def why(self) -> str:
+        return str(self['unmeasurable'])
 
     def __repr__(self) -> str:
         return f'Unmeasurable({self.why!r})'
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, Unmeasurable) and other.why == self.why
 
 
 def _pct(values: list[float], p: float) -> float:
@@ -280,11 +289,12 @@ def cache_hit(usage: dict) -> dict:
 def ux(facts: dict, marks: dict) -> dict:
     """用户那一侧感觉到的几个数。
 
-    **懵逼时长判平均、报最长。** 只判最长会被一次离群值支配；只报平均会把一段 60 秒的
-    空白稀释掉，而那一段正是用户真正会抱怨的。两个都出，判定用平均。
+    **静默思考时间**：机器人在忙却一声不吭的那些段落。定义里「在忙」是要紧的 ——
+    站着不动不说话是正常的，正走着却一路不吭声才难受。
 
-    「懵逼」的定义是**机器人在忙却一声不吭**，不是单纯的静默：站着不动不说话是正常的，
-    正走着却一路不吭声才难受。
+    最长、平均、总计三个都出。判定用**最长**：用户抱怨的是那一段特别长的沉默，而平均
+    会把它稀释掉（一段 60 秒的空白混进十次 5 秒里就看不见了）。平均和总计仍然报出来，
+    它们回答的是别的问题 —— 「一共被晾了多久」平均和最长都答不了。
     """
     events = facts.get('events') or []
     speaks = _spans_of(events, 'speak_start', ('speak_end',))
@@ -292,12 +302,12 @@ def ux(facts: dict, marks: dict) -> dict:
 
     blanks = _blank_intervals(speaks, navs)
     out: dict = {
-        'blank_avg_s': round(sum(blanks) / len(blanks), 2) if blanks else 0.0,
-        'blank_max_s': round(max(blanks), 2) if blanks else 0.0,
+        'silence_avg_s': round(sum(blanks) / len(blanks), 2) if blanks else 0.0,
+        'silence_max_s': round(max(blanks), 2) if blanks else 0.0,
         # 一共被晾了多久。平均和最长都答不了这个问题：十次 5 秒和一次 50 秒平均值不同、
         # 最长值也不同，但用户被晾的总时间一样长。
-        'blank_total_s': round(sum(blanks), 2),
-        'blank_count': len(blanks),
+        'silence_total_s': round(sum(blanks), 2),
+        'silence_count': len(blanks),
     }
 
     # 跨钟的两个：只有事实流本身就是墙钟时才算。见模块文档。

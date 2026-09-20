@@ -79,8 +79,15 @@ DEFAULT_TARGETS = {
     'world_timing.acp_contradictions':   {'max': 0, 'label': 'ACP 上报与事实一致'},
     'concurrency.idle_ratio':            {'max': 0.20, 'label': '空档不超过两成'},
     'llm_latency.median_s':              {'max': 10, 'label': '每轮推理中位不超过 10 秒'},
-    'cache_hit.ratio':                   {'min': 0.30, 'label': 'cache 命中不低于三成'},
-    'ux.blank_avg_s':                    {'max': 10, 'label': '平均懵逼时长不超过 10 秒'},
+    # **比例型：命中率本身就是分数**，不是一条及格线。
+    #
+    # 原先是 `min: 0.3` 的通过/不通过：31% 过、94% 也过，两次都记 100 分，而它们
+    # 差着三倍。cache 命中是个连续量，把它压成一个布尔，等于把这条原则能提供的
+    # 全部信息扔掉，只留下「有没有烂到 30% 以下」。
+    'cache_hit.ratio':                   {'ratio': True, 'label': 'cache 命中率'},
+    # 判**最长**那一段，不判平均：用户抱怨的就是那一段特别长的沉默，而平均会把它
+    # 稀释掉（一段 60 秒混进十次 5 秒里就看不见了）。平均和总计照样报出来。
+    'ux.silence_max_s':                  {'max': 20, 'label': '最长静默思考时间不超过 20 秒'},
     'ux.first_response_s':               {'max': 8,  'label': '首次响应不超过 8 秒'},
     'ux.interrupt_response_s':           {'max': 3,  'label': '打断后 3 秒内有反应'},
     # 一条，不是两条 —— 见 `benchmark_metrics.physical_safety` 里 `incidents` 的注释：
@@ -156,9 +163,12 @@ def targets(payload: dict) -> dict:
     """默认目标，叠上用例自己的覆盖。"""
     merged = {key: dict(spec) for key, spec in DEFAULT_TARGETS.items()}
     for key, value in ((test_block(payload) or {}).get('targets') or {}).items():
+        # 写一个数就是改阈值，写一个 dict 就是整条换掉 —— 后者是唯一能把一条目标
+        # 从上限改成下限、或者改成比例型的办法。默认按上限，因为绝大多数指标越小越好。
+        if isinstance(value, dict):
+            merged[key] = {'label': key, **merged.get(key, {}), **value}
+            continue
         if key not in merged:
-            # 用例给一个默认里没有的指标定目标是允许的（比如总任务完成时长），
-            # 但得说清是上限还是下限 —— 默认按上限，因为绝大多数指标是越小越好。
             merged[key] = {'max': value, 'label': key}
             continue
         bound = 'min' if 'min' in merged[key] else 'max'
@@ -316,6 +326,15 @@ def check_targets(observations: dict, spec: dict) -> list[dict]:
                           'text': label, 'weight': float(target.get('weight', 10)),
                           'ok': False, 'measurable': False, 'detail': value.why})
             continue
+        if target.get('ratio'):
+            # 比例型：这个数（0–1）**就是**得分，没有及格线。`ok` 对它没有意义，
+            # 所以恒为 True —— 一个 88% 的 cache 命中不是「失败」，它就是 88 分。
+            credit = max(0.0, min(1.0, float(value)))
+            items.append({'id': path, 'kind': 'ratio', 'dimension': dimension,
+                          'text': label, 'weight': float(target.get('weight', 10)),
+                          'ok': True, 'credit': credit, 'measurable': True,
+                          'detail': f'{round(credit * 100, 1)}%'})
+            continue
         if 'max' in target:
             ok = float(value) <= float(target['max'])
             detail = f'{value}（目标 ≤{target["max"]}）'
@@ -329,6 +348,13 @@ def check_targets(observations: dict, spec: dict) -> list[dict]:
 
 
 # ── 分数 ──────────────────────────────────────────────────────────────────────
+
+def _credit(item: dict) -> float:
+    """这一项拿到多少分（0–1）。没写 `credit` 就是老的通过/不通过。"""
+    if 'credit' in item:
+        return max(0.0, min(1.0, float(item['credit'])))
+    return 1.0 if item.get('ok') else 0.0
+
 
 def score(payload: dict, items: list[dict]) -> dict:
     """按原则分组算分，再按原则权重合成总分。
@@ -348,9 +374,11 @@ def score(payload: dict, items: list[dict]) -> dict:
     for dimension, group in by_dimension.items():
         graded = [i for i in group if i.get('measurable', True)]
         total = sum(float(i.get('weight', 0)) for i in graded)
-        scores[dimension] = (round(100.0 * sum(float(i.get('weight', 0))
-                                               for i in graded if i['ok']) / total, 1)
-                             if total > 0 else None)
+        # `credit` 是 0–1 的部分得分，默认由 `ok` 决定（通过给满、没过给零）。
+        # 比例型的项（cache 命中率）直接带着自己的比例走 —— 88% 就是 88 分，
+        # 而不是「过了」或者「没过」。
+        earned = sum(float(i.get('weight', 0)) * _credit(i) for i in graded)
+        scores[dimension] = round(100.0 * earned / total, 1) if total > 0 else None
 
     numerator = sum(weights.get(name, 1.0) * value
                     for name, value in scores.items() if value is not None)

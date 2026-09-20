@@ -104,9 +104,16 @@ def _get_conn():
 
 
 def _dumps(value) -> str:
+    """序列化，序列化不了就**说出来**。
+
+    原先这里是静默返回 `'{}'`。于是指标块里一个不可序列化的值，让整块数据消失得无声
+    无息 —— 读出来是「这次没有指标」，而实际是「存的时候出错了」。两者在界面上长得
+    一模一样，而修法完全不同。
+    """
     try:
         return json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        print(f'[benchmark] 存不下这段数据，已丢弃：{type(exc).__name__}: {exc}')
         return '{}'
 
 
