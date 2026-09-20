@@ -37,6 +37,10 @@ ARG ACTUCORE_RUNTIME_BASE_IMAGE
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# Python dependencies are owned by the digest-pinned platform parent, not by
+# the navigation builder. Verify them in the clean stage before copying anything.
+RUN python3 -c "import yaml, requests; print('PLATFORM_PYTHON_DEPS=PASS PyYAML=' + yaml.__version__ + ' requests=' + requests.__version__)"
+
 COPY --from=actucore_ros_builder /opt/ros_deps_ws/install/ /opt/ros_deps_ws/install/
 COPY --from=actucore_ros_builder /opt/fast_livo_ws/install/ /opt/fast_livo_ws/install/
 COPY --from=actucore_ros_builder /opt/nav2_ws/install/ /opt/nav2_ws/install/

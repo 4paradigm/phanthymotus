@@ -15,7 +15,7 @@ from unittest import mock
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
-from plugins.navigation.contract import navigation_tool_definition  # noqa: E402
+from plugins.navigation.contract import NAVIGATION_ACTIONS, navigation_tool_definition  # noqa: E402
 from plugins.navigation.mapping.backend import RosTopicFastLivo2Backend  # noqa: E402
 from plugins.navigation.mapping.core import FastLivo2BackendError  # noqa: E402
 from plugins.navigation.mapping.plugin import FastLivo2Plugin  # noqa: E402
@@ -669,6 +669,20 @@ class NavigationPluginTest(unittest.TestCase):
             planning_plugin=planning or FakeComponent("planning"),
             semantic_plugin=semantic or FakeComponent("semantic"),
         )
+
+    def test_all_operational_actions_reject_idle_before_component_dispatch(self):
+        runtime = FakeRuntime()
+        components = [FakeComponent(name) for name in ("mapping", "planning", "semantic")]
+        plugin = self.make_plugin(runtime=runtime, mapping=components[0],
+                                  planning=components[1], semantic=components[2])
+        before = [list(component.calls) for component in components]
+        for action in set(NAVIGATION_ACTIONS) - {"info", "config", "start", "stop"}:
+            with self.subTest(action=action):
+                result = plugin.dispatch("ControlledSemanticSpatial", {"action": action})
+                self.assertEqual(result["error_code"], "canvas_not_started")
+                self.assertEqual([component.calls for component in components], before)
+                self.assertFalse(runtime.started)
+                self.assertIsNone(runtime.start_kwargs)
 
     def test_only_ControlledSemanticSpatial_is_a_public_dispatch_name(self):
         plugin = self.make_plugin()

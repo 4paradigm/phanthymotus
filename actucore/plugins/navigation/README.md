@@ -40,6 +40,15 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 - 分段执行的转向和直行预检只在 footprint 命中 Nav2
   `LETHAL_OBSTACLE` 时拒绝；膨胀安全带仅用于代价与规划，不冒充实体碰撞。
 
+`topic_aux` 中的 `plan` 与 `livo_odom` 供 Core inspection 订阅，用于地图路径/位姿叠加；
+它们不属于 Canvas 连线输出。Canvas 从顶层 `topic_out` 选择输出端口，不读取
+`topic_aux` 或 `info.mapping/planning/semantic` 内的诊断元数据。不要为精简公开端口
+删除内部诊断订阅，否则地图叠加会失去数据。
+
+JP5.11 的 PyYAML 与 requests 由固定 digest 的平台父镜像提供，分别为 5.3.1 与
+2.22.0；最终 Docker stage 在复制 ROS 安装空间前验证二者可导入。导航 builder
+不承担这些 Python 包的运行时供应。变更平台 digest 时必须重新通过该检查。
+
 ## Action 响应与超时
 
 Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在多线程 executor

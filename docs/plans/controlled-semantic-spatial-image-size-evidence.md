@@ -43,3 +43,18 @@ Accept 同时包含 Docker v2 manifest、OCI manifest 与 OCI index；若返回 
 选 `platform.os=linux`、`architecture=arm64` 的子 manifest，再对 `layers[].size` 求和。
 对层 digest/size 前缀作比较得到共享父层与实际新增传输量。未下载整个镜像，也未
 将压缩体积标成磁盘占用；部署空间规划仍需目标机器的解压后大小与 Docker 共享层情况。
+
+## 2026-09-20 当前评审镜像复测
+
+BOT 为 PR head `28884ce` 构建的 JP5.11 镜像 `release.260920.edc2365-jetson-jp5.11`：
+
+- 固定平台父镜像压缩层合计：6,497,999,697 bytes。
+- 当前最终镜像压缩层合计：6,513,361,900 bytes。
+- 增量：15,362,203 bytes（14.65 MiB）；共享前 47 层。
+- 测量命令：`docker buildx imagetools inspect --raw <ref>`，对 manifest 的 layers[].size 求和；
+  此次两个 ref 均直接返回 image manifest，不需要解析 index。
+- 这是实际运行层增量，不声称镜像零增长；构建 source/build/log 不复制到最终阶段，JP6.1 继续不含导航。
+
+依赖实查：在固定 JP5.11 父镜像以 `--network none --entrypoint python3` 导入
+`yaml, requests`，返回 PyYAML 5.3.1、requests 2.22.0。补充最终 stage 的显式检查，
+防止未来基础镜像变更静默丢失依赖，不为已存在的依赖重复添加安装层。
