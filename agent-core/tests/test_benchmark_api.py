@@ -724,8 +724,11 @@ def test_without_spans_the_time_is_marked_as_only_the_write_moment(monkeypatch):
     assert turn['at'] == 14.5 and turn['timing'] == 'written'
 
 
-def test_a_call_whose_name_has_no_span_gets_no_time(monkeypatch):
-    """与其配错一个时刻，不如说不知道。"""
+def test_a_turn_whose_tool_sequence_differs_is_not_matched(monkeypatch):
+    """配对按**调用名序列**：序列对不上，就不是同一轮，整轮都不给精确时间。
+
+    与其把别人那一轮的时刻贴上来，不如退回「写完时」并在界面上标出来。
+    """
     run_id, started = _run_with_session()
 
     import chat_history
@@ -741,7 +744,34 @@ def test_a_call_whose_name_has_no_span_gets_no_time(monkeypatch):
         'spans': [{'span': 'turn_total', 'start_ts': started + 1},
                   {'span': 'tool:tts', 'start_ts': started + 3}]}])
 
-    calls = asyncio.run(benchmark.run_timeline(run_id))['agent'][0]['calls']
+    turn = asyncio.run(benchmark.run_timeline(run_id))['agent'][0]
 
-    assert calls[0]['at'] == 3.0
-    assert 'at' not in calls[1]
+    assert turn['timing'] == 'written'
+    assert all('at' not in c for c in turn['calls'])
+
+
+def test_matching_is_not_by_trigger_text(monkeypatch):
+    """两边存的根本不是同一个串：perf 存原始的 `<event source=…>`，会话存 `<status …>`。
+
+    真机上一比就知道 —— 而配不上的后果是整列悄悄退回「写完时」，看起来只是少了点
+    精度，不像出错。所以配对靠调用名序列，不靠 trigger 文本。
+    """
+    run_id, started = _run_with_session()
+
+    import chat_history
+    import perf_log
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': started, 'updated_at': started + 20, 'messages': [
+            {'role': 'user', 'content': '<status time="2026-09-20 13:50:54">…'},
+            {'role': 'assistant', 'content': '', 'tool_calls': [
+                {'function': {'name': 'mcp__m__tts', 'arguments': '{}'}}]}]}])
+    monkeypatch.setattr(perf_log, 'turns_between', lambda a, b: [{
+        'turn_id': 't1',
+        'trigger_text': '<event source="acp:sim-tts-bb312a896304" channel="sensor">',
+        'spans': [{'span': 'turn_total', 'start_ts': started + 2},
+                  {'span': 'tool:tts', 'start_ts': started + 4}]}])
+
+    turn = asyncio.run(benchmark.run_timeline(run_id))['agent'][0]
+
+    assert turn['timing'] == 'exact' and turn['at'] == 2.0
+    assert turn['calls'][0]['at'] == 4.0

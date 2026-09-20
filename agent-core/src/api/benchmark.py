@@ -513,24 +513,44 @@ async def run_timeline(run_id: str):
     }
 
 
-def _spans_by_trigger(started, ended) -> dict:
+def _perf_turns(started, ended) -> list:
     """这段时间里每一轮的**真实**起止与逐次工具调用时刻。
 
     会话历史只记「这一轮是什么时候被写完的」，而一轮里的动作发生在那之前 —— 左栏
     于是整体比右栏晚一整轮的时长，两条轨道看着就是对不上（真机上左栏 +14.5s 的那次
     讲解，右栏在 +8.7s 就开讲了）。`perf_spans` 里有每次调用的真实起止，拿它对齐。
-
-    按 `trigger_text` 前缀配对，不按顺序配对：一次运行期间可能有别的来源插进来，
-    按顺序配会整体错位一格，而那种错位比没有时间更难发现。
     """
     if not started:
-        return {}
+        return []
     try:
         import perf_log
-        turns = perf_log.turns_between(float(started) - 10, float(ended or started) + 600)
+        return perf_log.turns_between(float(started) - 10, float(ended or started) + 600)
     except Exception:
-        return {}
-    return {str(t.get('trigger_text') or '')[:60]: t for t in turns if t.get('trigger_text')}
+        return []
+
+
+def _tool_names(entry: dict) -> list:
+    return [str(s['span'])[5:] for s in (entry.get('spans') or [])
+            if str(s.get('span', '')).startswith('tool:')]
+
+
+def _match_perf(perf: list, calls: list) -> dict | None:
+    """按**工具调用名的序列**配对，并消耗掉配上的那一条。
+
+    不按 `trigger_text` 配：两边存的根本不是同一个串 —— perf 存原始的
+    `<event source=…>`，会话存的是 `<status …>` 或格式化之后的通知。真机上一比就知道，
+    而配不上的后果是整列悄悄退回「写完时」，看起来只是少了点精度，不像出错。
+
+    也不按顺序配：一次运行期间可能有别的来源插进来，整列错位一格比没有时间更难发现。
+    调用名序列是两边都有、且由同一次执行决定的东西。
+    """
+    names = [c['name'] for c in calls]
+    if not names:
+        return None
+    for index, entry in enumerate(perf):
+        if _tool_names(entry) == names:
+            return perf.pop(index)
+    return None
 
 
 def _timing_from_spans(entry: dict, started: float) -> dict:
@@ -592,7 +612,7 @@ def _agent_track(session_id: str, started, ended) -> list:
     except Exception:
         return []
 
-    by_trigger = _spans_by_trigger(started, ended)
+    perf = _perf_turns(started, ended)
     window_from = float(started) - 5 if started else None
     window_to = float(ended) + 5 if ended else None
 
@@ -631,8 +651,8 @@ def _agent_track(session_id: str, started, ended) -> list:
         # `created_at` 留在几天前，内容却是刚刚写的。真机上因此排出了「第 11 轮
         # +-277189.7s」这种时间。最后写入的时刻才是这轮真正发生的时刻。
         # 时间优先用 spans 里的真实起止 —— 会话历史只有「写完」那一刻。
-        spans_entry = by_trigger.get((triggers[0] if triggers else '')[:60])
-        timed = _timing_from_spans(spans_entry, float(started)) if (spans_entry and started) else {}
+        spans_entry = _match_perf(perf, calls) if started else None
+        timed = _timing_from_spans(spans_entry, float(started)) if spans_entry else {}
         written = turn.get('updated_at') or at
         offset = timed.get('at') if timed.get('at') is not None else (
             round(written - float(started), 1) if (started and written) else None)
