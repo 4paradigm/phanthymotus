@@ -1096,6 +1096,120 @@ def test_a_matching_action_space_passes():
     assert negotiate.check(_caps(control_mode="joint_position"), DESCRIPTOR) == []
 
 
+# ── 混合向量：顶层一个 mode 说不清的那些 ─────────────────────────────────────
+
+# 规范化之后的 G1 动作空间：两个末端位姿、两个归一化夹爪、三个腰关节角。
+MIXED_GROUPS = [
+    {"name": "eef_l", "offset": 0, "count": 7, "mode": "eef_pose"},
+    {"name": "gripper_l", "offset": 7, "count": 1, "mode": "joint_position"},
+    {"name": "eef_r", "offset": 8, "count": 7, "mode": "eef_pose"},
+    {"name": "gripper_r", "offset": 15, "count": 1, "mode": "joint_position"},
+    {"name": "waist", "offset": 16, "count": 3, "mode": "joint_position"},
+]
+
+
+def _mixed_descriptor(groups=None):
+    return {
+        "control_interface": "motus.control/1",
+        "mode": "eef_pose",
+        "dof": 19,
+        "joint_names": [f"a{i}" for i in range(19)],
+        "units": {"length": "m", "angle": "rad"},
+        "limits": {"lower": [-2.0] * 19, "upper": [2.0] * 19},
+        "rate": {"max_hz": 100, "expected_hz": 30, "watchdog_ms": 200},
+        "force_torque": None,
+        "groups": [dict(g) for g in (groups or MIXED_GROUPS)],
+    }
+
+
+def test_a_mixed_vector_that_agrees_segment_by_segment_passes():
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _mixed_descriptor(),
+    )
+    assert problems == []
+
+
+def test_segments_that_line_up_differently_are_refused():
+    """总维度相同、顶层 mode 相同，而分段错位 —— 每一段都把邻段的数字当成自己的。
+
+    这是顶层那条检查看不见的分歧：两边都报 19 维的 `eef_pose`，一边第 7 维是夹爪、
+    另一边第 7 维还是位姿的一部分。发下去不报错。
+    """
+    shifted = [
+        {"name": "eef_l", "offset": 0, "count": 8, "mode": "eef_pose"},
+        {"name": "gripper_l", "offset": 8, "count": 1, "mode": "joint_position"},
+        {"name": "eef_r", "offset": 9, "count": 7, "mode": "eef_pose"},
+        {"name": "gripper_r", "offset": 16, "count": 1, "mode": "joint_position"},
+        {"name": "waist", "offset": 17, "count": 2, "mode": "joint_position"},
+    ]
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=shifted),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("位置对不上" in p for p in problems)
+
+
+def test_a_segment_in_the_wrong_space_is_refused():
+    """腰那三个是关节角。一个把它们也当成笛卡尔量的模型，维度全对。"""
+    wrong = [dict(g) for g in MIXED_GROUPS]
+    wrong[-1] = {**wrong[-1], "mode": "eef_pose"}
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=wrong),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("waist" in p for p in problems)
+
+
+def test_different_numbers_of_segments_are_refused_rather_than_zipped():
+    """段数不同就无从逐段核对。按最短的那个 zip 过去会静默漏掉尾巴。"""
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[{"name": "all", "offset": 0, "count": 19,
+                               "mode": "eef_pose"}]),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("分成" in p for p in problems)
+
+
+def test_a_driver_group_without_a_mode_inherits_the_top_level_one():
+    """和 `motus.control/1` 驱动侧同一条规矩 —— 不写就是「和整体一样」。
+
+    今天每一个已有的驱动都不写段 mode，所以这条不成立的话，它们全都会在协商时被
+    判成和模型分歧。
+    """
+    inheriting = [
+        {"name": "a", "offset": 0, "count": 10},         # 不写 → eef_pose
+        {"name": "b", "offset": 10, "count": 9, "mode": "eef_pose"},
+    ]
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[{"name": "a", "offset": 0, "count": 10,
+                               "mode": "eef_pose"},
+                              {"name": "b", "offset": 10, "count": 9,
+                               "mode": "eef_pose"}]),
+        _mixed_descriptor(inheriting),
+    )
+    assert problems == []
+
+
+def test_a_single_space_model_is_not_forced_to_declare_segments():
+    """一边有段一边没有不算分歧 —— 今天每个模型都是单一空间，没有段是常态。"""
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19),
+        _mixed_descriptor(),
+    ) == []
+    # 而顶层 mode 真的不同时，仍然由上面那条检查抓住 —— 不是因为没有段就放行。
+    assert negotiate.check(
+        _caps(control_mode="joint_position", action_dim=19),
+        _mixed_descriptor(),
+    )
+
+
 def test_the_action_space_check_does_not_mask_the_others():
     """空间不对、维度也不对时，两条都要报出来。
 

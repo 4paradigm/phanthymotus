@@ -65,6 +65,7 @@ def check(capabilities: dict, descriptor: dict) -> list:
             f"模型输出 {declared!r} 空间的动作，下游接受 {mode!r} —— "
             "两者维度可能相同，但含义不同，发下去就是让机械臂走到错误的地方"
         )
+    problems.extend(_group_problems(capabilities, descriptor))
 
     action_dim = capabilities.get("action_dim")
     dof = descriptor.get("dof")
@@ -108,6 +109,71 @@ def check(capabilities: dict, descriptor: dict) -> list:
                 )
 
     return problems
+
+
+def _group_problems(capabilities: dict, descriptor: dict) -> list:
+    """逐段比动作空间，当两边都按段声明的时候。
+
+    顶层那一条 `control_mode` vs `descriptor.mode` 比的是整条向量，而规范化之后的
+    向量是**混的**：G1 的 19 维是两个末端位姿、两个归一化夹爪、三个腰关节角。这种
+    向量上「顶层 mode 相同」几乎什么都没保证 —— 两边都报 `eef_pose`，而一边的第
+    8 维是夹爪、另一边是腰，维度和顶层 mode 全都吻合，指令照发。
+
+    **只有两边都声明了段才逐段比。** 一边有一边没有不算错：今天每个模型都是单一
+    空间，没有段是常态，那时候顶层那条检查已经是完整的。这里要抓的是**都声明了却
+    对不上**，那是真的分歧。
+    """
+    model_groups = capabilities.get("control_groups")
+    driver_groups = descriptor.get("groups")
+    if not isinstance(model_groups, (list, tuple)) or not model_groups:
+        return []
+    if not isinstance(driver_groups, (list, tuple)) or not driver_groups:
+        return []
+
+    default_mode = str(descriptor.get("mode") or "").strip()
+    problems = []
+    if len(model_groups) != len(driver_groups):
+        problems.append(
+            f"模型把动作分成 {len(model_groups)} 段，下游卡片分成 "
+            f"{len(driver_groups)} 段 —— 分段不同就无从逐段核对，"
+            f"模型侧：{_shape(model_groups, '')}；"
+            f"下游：{_shape(driver_groups, default_mode)}"
+        )
+        return problems
+
+    for i, (mine, theirs) in enumerate(zip(model_groups, driver_groups)):
+        if not isinstance(mine, dict) or not isinstance(theirs, dict):
+            continue                    # 形状问题由下面那条 groups 检查报
+        # 段的 mode 留空表示继承顶层，和 `motus.control/1` 的驱动侧同一条规矩。
+        mine_mode = str(mine.get("mode") or "").strip()
+        theirs_mode = str(theirs.get("mode") or "").strip() or default_mode
+        if mine_mode and theirs_mode and mine_mode != theirs_mode:
+            problems.append(
+                f"第 {i} 段（模型叫 {mine.get('name')!r}，下游叫 "
+                f"{theirs.get('name')!r}）：模型输出 {mine_mode!r}，"
+                f"下游接受 {theirs_mode!r}"
+            )
+        if mine.get("offset") != theirs.get("offset") or \
+                mine.get("count") != theirs.get("count"):
+            problems.append(
+                f"第 {i} 段的位置对不上：模型 "
+                f"[{mine.get('offset')}, +{mine.get('count')})，下游 "
+                f"[{theirs.get('offset')}, +{theirs.get('count')}) —— "
+                "总维度相同而分段错位，是最难从症状看出来的一种：每一段都把邻段的"
+                "数字当成自己的"
+            )
+    return problems
+
+
+def _shape(groups, default_mode: str) -> str:
+    parts = []
+    for group in groups:
+        if not isinstance(group, dict):
+            parts.append("?")
+            continue
+        mode = str(group.get("mode") or "").strip() or default_mode or "?"
+        parts.append(f"{group.get('name')}×{group.get('count')}({mode})")
+    return " + ".join(parts)
 
 
 def effective_rate(capabilities: dict, descriptor: dict, requested_hz=None) -> float:
