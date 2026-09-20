@@ -51,10 +51,13 @@ from typing import Optional
 
 import benchmark_case
 import benchmark_facts
+import benchmark_judge
+import benchmark_metrics
 import benchmark_store
 import config
 import event_bus
 import mcp_client
+import perf_log
 
 SCENARIO_TOOL = 'sim_scenario'
 REPORT_TOOL = 'sim_report'
@@ -206,7 +209,7 @@ class CaseRun:
         self.mcp_id = mcp_id
         # `mcp_id` 为空就是真机：没有仿真器持有世界。
         self.world = world or (SimulatorWorld(mcp_id) if mcp_id
-                               else RealWorld(_expected_waypoints(case)))
+                               else RealWorld())
         self.repeats = max(1, int(repeats))
         self.seed = int(seed)
         self.run_id = run_id
@@ -253,6 +256,9 @@ class CaseRun:
     async def _one(self, index: int) -> dict:
         run = self.case.get('run') or {}
         started = time.time()
+        # UX 那几个指标要知道「用户是什么时候说完的」「插话是什么时候发出去的」。
+        # 只有这里知道 —— 事实流里没有这两个时刻，它记的是机器人做了什么。
+        self._marks = {'started': started, 'prompt_at': None, 'injections_at': []}
 
         reset = await self.world.reset(run, self.seed + index)
         if 'error' in reset:
@@ -261,14 +267,36 @@ class CaseRun:
         self.state = 'running'
         # 开场那句是**指令**，不是插话 —— 记错了，复盘的人会以为一开始就有人打断。
         await self._say(run.get('prompt', ''), label='指令')
+        # 「用户说完」的时刻。首次响应时延从这里起算 —— 从 `started` 起算的话，
+        # 会把世界重置那几秒也算进用户的等待里。
+        self._marks['prompt_at'] = time.time()
 
         facts = await self._watch(run, started)
-        results = benchmark_case.evaluate({'test': self.case},
-                                          facts.get('events') or [],
-                                          facts.get('acp_posts') or [], facts=facts)
-        score = benchmark_case.score({'test': self.case}, results)
-        return self._case_row(index, started, {'facts': facts, 'results': results,
-                                               'score': score})
+        payload = {'test': self.case}
+        window = (started, time.time())
+        seen = benchmark_metrics.observations(
+            facts, perf_log.spans_between(*window), _usage_between(*window),
+            window, self._marks)
+
+        # 确定性那一半先判完 —— 它不花钱、不会抖，而且裁判要拿着这些数去判剩下那半。
+        items = benchmark_case.check_targets(seen, benchmark_case.targets(payload))
+        verdict = await benchmark_judge.judge(payload, seen, facts,
+                                              self._agent_track_now(window))
+        items += verdict['items']
+
+        score = benchmark_case.score(payload, items)
+        return self._case_row(index, started,
+                              {'facts': facts, 'results': items, 'score': score,
+                               'observations': seen, 'judge': verdict},
+                              error=verdict['error'])
+
+    def _agent_track_now(self, window: tuple) -> list:
+        try:
+            from api.benchmark import _agent_track
+            stored = benchmark_store.get_run(self.run_id) or {}
+            return _agent_track(stored.get('session_id', ''), window[0], window[1])
+        except Exception:
+            return []
 
     async def _say(self, text: str, label: str = '插话') -> None:
         """把一句话当作用户说的送进去 —— 用例的保真度就在这里。
@@ -288,17 +316,33 @@ class CaseRun:
             pass      # 记账失败不该让一次运行停下来
 
     async def _watch(self, run: dict, started: float) -> dict:
-        """边轮询事实边按触发条件追加插话，直到用例结束或超时。"""
-        expect = (self.case.get('evaluate') or {}).get('expect') or {}
-        budget = float(expect.get('max_wall_seconds') or 900)
+        """边轮询事实边按触发条件追加插话，直到安静下来或者预算耗尽。
+
+        **怎么算结束，这一版换了。** 原先是「所有期望站点都到过了」—— 那要求用例先声明
+        一串站名，也就是把展区导览的词汇焊进了收尾逻辑。现在只剩两条通用的：
+
+        * **预算耗尽**（`run.budget_seconds`）
+        * **安静下来**：`idle_seconds` 内没有新事实，**而且**没有 pending 的 ACP 动作
+
+        后半句不能少。没有新事实常常只是因为机器人正走在半路上 —— 一段两分钟的导航
+        期间事实流就是不动的。光看「没有新事实」会在半路上把运行判结束，然后给一个
+        「什么都没做完」的分数。
+        """
+        budget = float(run.get('budget_seconds') or 900)
+        quiet_for = float(run.get('idle_seconds') or 60)
         pending = [dict(i) for i in (run.get('injections') or [])]
         armed: dict[int, float] = {}
         facts: dict = {}
+        last_change = time.time()
+        last_size = -1
 
         while not self._abort.is_set() and time.time() - started < budget:
             facts = await self._facts()
             events = facts.get('events') or []
             elapsed = time.time() - started
+
+            if len(events) != last_size:
+                last_size, last_change = len(events), time.time()
 
             for index, injection in enumerate(pending):
                 if injection.get('done'):
@@ -310,14 +354,16 @@ class CaseRun:
                     armed[index] = due
                 if elapsed >= armed[index]:
                     await self._say(injection.get('text', ''))
+                    self._marks['injections_at'].append(time.time())
                     injection['done'] = True
 
             # 已经触发、还没发出去的插话必须发完再收尾。世界跑得比 LLM 快的时候
-            # （加速倍率、或者一段很短的路），站点会先到齐 —— 就这么收尾的话，打断
-            # 根本没发生过，而打断那几条断言会记在 agent 头上。
+            # （加速倍率、或者一段很短的路），事情会先做完 —— 就这么收尾的话，打断
+            # 根本没发生过，而那条要求会记在 agent 头上。
             outstanding = any(index in armed and not injection.get('done')
                               for index, injection in enumerate(pending))
-            if _finished(facts, expect) and not outstanding:
+            if (not outstanding and time.time() - last_change >= quiet_for
+                    and not mcp_client.get_pending_actions()):
                 break
             await asyncio.sleep(_POLL_SECONDS)
 
@@ -330,11 +376,10 @@ class CaseRun:
         score = payload.get('score') or {}
         results = payload.get('results') or []
         elapsed = time.time() - started
-        # 判不了的不算失败（`measurable: False`）—— 否则真机上每次运行都会因为
-        # 「没有轨迹占用数据」被标成 failed，而那不是 agent 做错了什么。
-        failures = [r['name'] for r in results
-                    if not r['ok'] and r.get('measurable', True)
-                    and r.get('detail') != '未断言']
+        # 直接用 `score()` 算好的那一份，不在这里重算一遍 —— 「判不了的不算失败」
+        # 这条规则有两份实现的话，改一处就会悄悄分叉，而分叉的表现是某些运行被标成
+        # failed 却列不出任何失败项。
+        failures = list(score.get('failures') or [])
         name = self.case.get('name', '') or 'case'
         outcome = 'error' if error else ('ok' if not failures else 'failed')
         # `scenario` 和 `outcome` 也放进返回的行里：面板拿同一份数据渲染进度，
@@ -349,7 +394,8 @@ class CaseRun:
             self.run_id, scenario=name, repeat_idx=index, seed=self.seed + index,
             ok=bool(not error and not failures), outcome=outcome,
             score=score.get('total'), elapsed_ms=int(elapsed * 1000),
-            assertions=failures, facts=payload.get('facts') or {})
+            assertions=failures, facts=payload.get('facts') or {},
+            results=results, observations=payload.get('observations') or {})
         return row
 
     async def _finish(self) -> None:
@@ -395,28 +441,6 @@ class CaseRun:
 
 # ── 触发与收尾判定 ────────────────────────────────────────────────────────────
 
-def _expected_waypoints(case: dict) -> list[str]:
-    """用例点名要去的那些站。
-
-    真机的事实记录器靠这份名单认出一次派发的目标是哪一站 —— 它在参数值里找它们，
-    因为参数**名**各家不同（见 `benchmark_facts` 的模块文档）。用例没点名站序的话，
-    名单为空，导航事实就没有 label，而那些断言本来也没被断言。
-    """
-    expect = (case.get('evaluate') or {}).get('expect') or {}
-    names = list(expect.get('waypoint_order') or [])
-    for key in ('resume_target',):
-        if expect.get(key):
-            names.append(expect[key])
-    leg = expect.get('interrupted_leg') or {}
-    if leg.get('target'):
-        names.append(leg['target'])
-    seen: list[str] = []
-    for name in names:
-        if str(name) and str(name) not in seen:
-            seen.append(str(name))
-    return seen
-
-
 def _trigger_due(injection: dict, events: list, elapsed: float) -> Optional[float]:
     """这条插话该在第几秒（运行开始起算）发出；条件还没满足就返回 None。
 
@@ -428,7 +452,17 @@ def _trigger_due(injection: dict, events: list, elapsed: float) -> Optional[floa
       是驱动的时钟，加速倍率下和墙钟不是一回事；两个时钟相减出来的秒数没有意义。
     """
     delay = float(injection.get('delay') or 0)
-    label = injection.get('after_arrival')
+
+    # 通用触发：第 N 个异步动作完成之后。这是 `after_arrival` 的推广 —— 「到达某一站」
+    # 是展区导览的说法，而「第 N 个动作做完」在任何用例里都成立，判据也一样在事实流里。
+    nth = injection.get('after_action')
+    if nth is not None:
+        done = sum(1 for e in events
+                   if e.get('event') in ('arrive', 'speak_end', 'nav_cancelled',
+                                         'nav_failed'))
+        return elapsed + delay if done >= int(nth) else None
+
+    label = injection.get('after_arrival')      # 旧用例还在用，继续认
     if label:
         seen = any(e.get('event') == 'arrive' and e.get('label') == label for e in events)
         return elapsed + delay if seen else None
@@ -436,14 +470,12 @@ def _trigger_due(injection: dict, events: list, elapsed: float) -> Optional[floa
     return None if at is None else float(at) + delay
 
 
-def _finished(facts: dict, expect: dict) -> bool:
-    """所有期望到达的站点都到过了就算运行结束，不必等满预算。"""
-    order = expect.get('waypoint_order') or []
-    if not order:
-        return False
-    arrived = [e.get('label') for e in (facts.get('events') or [])
-               if e.get('event') == 'arrive']
-    return all(label in arrived for label in order)
+def _usage_between(start: float, end: float) -> dict:
+    """这段时间里的 token 用量。cache 命中率就是从这儿来的。"""
+    try:
+        return perf_log.query_usage_summary(start, end)
+    except Exception:
+        return {}
 
 
 def _stdev(values: list) -> Optional[float]:

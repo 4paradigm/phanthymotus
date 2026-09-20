@@ -1,7 +1,11 @@
 """api/benchmark.py — 用例库、跑一个用例、看分数、看历史。
 
-面板只在**检测到仿真器**（一个同时提供 `sim_scenario` 与 `sim_report` 的 MCP）时
-才有内容 —— 出厂的机器人不该看到一个 Benchmark 标签。
+面板**恒在**。它测的是解决方案，不是仿真 —— 仿真器在不在场只决定两件事：世界能不能
+被重置，以及有没有轨迹占用这类只有它算得出的量。
+
+**「运行」跑的永远是当前画布。** 用例贡献的是初始指令、插话和评判标准；把它自带的画布
+搬进来是另一个动作（`/cases/{id}/apply`），覆盖确认挂在那里。两件事原先绑在一起，于是
+一个自带空画布的新用例，点一下「运行」就把用户手上的画布清空了。
 
 ## 主体是用例库，不是「打开一个文件」
 
@@ -13,12 +17,17 @@
 一个测试用例 —— 被测的 agent 能调到它，裁判也就住进了被测系统内部。场景现在描述的是
 **世界**，不是一个可勾选的测试单位。
 
-## 驱动产出事实，这一层做裁判
+## 指标优先，模糊判定最少化
 
-判定在 `benchmark_case.py`，不在仿真器里。裁判和被测系统必须不相交 —— 而裁判原先
-住在仿真器驱动里，那正是被测系统的一部分。仿真器只负责产出事实（事件流、ACP 记录），
-断言是 `(用例, 事件, ACP记录) → 判定` 的纯函数，搬上来之后顺带也能判真机跑出来的
-同形状事件流。
+判定分两半，都不在仿真器里（裁判和被测系统必须不相交）：
+
+* **算出来的**：`benchmark_metrics` 先把数算出来，`benchmark_case.check_targets` 拿数
+  对默认目标做**确定性**判定，完全不经 LLM。
+* **判出来的**：`benchmark_judge` 只判真的没有可算指标的那几样 —— 回答效果、参考流程的
+  偏离是否合理、用例写的人话要求（而且判的时候手里拿着全部指标）。
+
+「用户体验好不好」对大模型是个氛围词，判出来的分不可信也不可比；「懵逼时长 23.4 秒超没
+超 15 秒」它判得可靠。
 
 除此之外这里做的事：跑用例（`benchmark_runner`）、把结果连同**被测配置**记下来，
 以及在用例覆盖画布之前把画布存成一个解决方案包 —— 用户自己搭的那套东西没有别的地方
@@ -38,7 +47,6 @@ import fastapi
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
-import benchmark_facts
 import benchmark_store
 import config
 import mcp_client
@@ -209,16 +217,33 @@ class CaseWrite(BaseModel):
     origin: str = ''
 
 
+def _read_case(case_id: str) -> dict | None:
+    """库里的一条，**读出来就已经是新格式**。
+
+    迁移放在读的路径上，不只放在跑的路径上：旧格式的用例在列表里会显示「0 条要求」，
+    而用户看到的是「我的要求没了」，不是「格式换了」。存回去的时候自然就是新格式。
+    """
+    import benchmark_case
+    record = benchmark_store.get_case(case_id)
+    if record is None:
+        return None
+    return {**record, 'payload': benchmark_case.migrate(record['payload'])}
+
+
 def _case_view(record: dict, loaded: dict | None) -> dict:
     """列表里一张卡需要知道的一切，含「跑不了的理由」和上一次的分数。"""
     import benchmark_case
-    payload = record['payload']
+    payload = benchmark_case.migrate(record['payload'])
     block = benchmark_case.summary(payload)
     recent = benchmark_store.trend(suite=record['name'], limit=1)
     return {
-        'id': record['id'], 'name': record['name'], 'origin': record['origin'],
+        'id': record['id'], 'origin': record['origin'],
         'updated_at': record['updated_at'],
         **block,
+        # **`name` 放在 `**block` 之后**：库里存的那个名字是用户自己起的，而 `summary`
+        # 回的是 `test.name`，后者常常是空的（从文件或市场收进来的用例就没有）。
+        # 展开顺序反过来的话，那些用例在列表里是一行没有标题的卡片。
+        'name': record['name'] or block.get('name', ''),
         'problems': benchmark_case.validate(payload),
         'isLoaded': bool(loaded and loaded == benchmark_case.test_block(payload)),
         'last': recent[0] if recent else None,
@@ -251,7 +276,7 @@ async def market_cases(search: str = '', limit: int = Query(30, ge=1, le=50)):
 
 @router.get('/cases/{case_id}')
 async def get_case(case_id: str):
-    record = benchmark_store.get_case(case_id)
+    record = _read_case(case_id)
     if record is None:
         raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
     return record
@@ -316,11 +341,23 @@ async def preflight_case(request: fastapi.Request, case_id: str, session_id: str
 
 @router.post('/cases/{case_id}/apply')
 async def apply_case(request: fastapi.Request, case_id: str, session_id: str = ''):
-    """把这个用例载入成当前方案（会覆盖画布）。"""
+    """把这个用例**自带的画布**载入成当前方案。
+
+    这是唯一会覆盖画布的入口，所以「画布会被覆盖」的确认属于这里 —— 跑用例不会走到
+    这条路。原先两件事是绑在一起的：想跑就得先载入，于是一个自带空画布的新用例，
+    点一下「跑」就把现场的画布清空了。
+
+    用例没有画布就拒绝，而不是载入一张空的。「没有可载入的东西」和「载入一张空画布」
+    是两件完全不同的事，后者会毁掉用户手上的工作。
+    """
     from api.solutions import LoadRequest, apply as apply_solution
     record = benchmark_store.get_case(case_id)
     if record is None:
         raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
+    if not ((record['payload'].get('canvas') or {}).get('cards') or []):
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='这个用例没有自带画布，没有可载入的东西 —— 直接在当前画布上跑就行')
     result = await apply_solution(request, LoadRequest(
         payload=record['payload'], includes=['canvas', 'test'],
         confirm=True, session_id=session_id))
@@ -396,52 +433,16 @@ async def snapshot_restore(request: fastapi.Request):
 class CaseRunRequest(BaseModel):
     repeats: int = 1
     seed: int = 0
+    # 要跑哪个用例。**空 = 跑当前方案自带的那个。**
+    #
+    # 这个字段是这一轮修的那个 bug 的解药：原先想跑库里的用例，只能先「载入」它，而
+    # 载入会把它自带的画布刷进来 —— 新建的用例画布是空的，于是点一下「跑」，当前画布
+    # 就没了。跑从来不该改画布：**跑的永远是当前画布**，用例提供的只是指令、插话和
+    # 评判标准。要把用例自带的画布搬进来，那是「载入」这个单独的动作。
+    case_id: str = ''
     # 真机确认。`moving_cards` 是前端弹窗里那个人**看到并同意**的那一组设备，
     # 形如 `["mcp-123:loco", ...]`。服务端会重算一遍再比对 —— 见 `_check_confirmation`。
     confirm_moving_cards: list[str] | None = None
-
-
-def local_mcp_id(server_name: str) -> str:
-    """包体里的驱动名 → 本机的 `mcp_id`。
-
-    和 `_driver_online` 同一份查法：名字住在注册表（`config.main['services']['mcp']`），
-    运行时那份不存 `server_name`。两张表各答一半，这是既有的事实。
-    """
-    entry = next((m for m in (config.main.get('services', {}).get('mcp') or [])
-                  if m.get('server_name') == server_name or m.get('name') == server_name),
-                 None)
-    return (entry or {}).get('id') or ''
-
-
-def speech_probe(server_name: str, tool: str) -> dict:
-    """这个驱动的这个工具申报了什么 —— 给 `benchmark_case.unmeasurable` 用。
-
-    读注册表里驱动自己申报的 `x-resource` 与 `x-completion`，不猜名字。驱动没上线时
-    两项都是 False，于是预检会说「画布上没有讲解卡」，而那时本来就该先说缺驱动
-    （`case_readiness` 先跑，两层顺序是有意的）。
-
-    入参是**驱动名**不是 `mcp_id`：包体里的卡片带 `deviceRef`，`mcpId` 是 None。
-    """
-    mcp_id = local_mcp_id(server_name)
-    info = mcp_client.registry.get(mcp_id) or {}
-    # `tool_meta` 的键是**全名** `mcp__<id>__<tool>`（`tool_meta[schema['name']]`，
-    # 而 `schema['name']` 由 `_to_openai_schema` 产出全名）。按裸名取永远是空 dict ——
-    # 于是每一张画布都会被报成「没有任何申报了嘴的卡片」，包括完全正确的那些。
-    # 第一版就是这么写的，单元测试喂的是假 probe，所以一路绿到真机上。
-    # 一个工具在注册表里可能是**一份 schema，也可能是好几份**：带 action 枚举的工具
-    # 会被 `_connect_one` 按 action 拆开，键变成 `mcp__<id>__<tool>__<action>`，
-    # `mcp__<id>__<tool>` 这个键根本不存在。卡片记的是**工具**名，所以两种形状都要认。
-    #
-    # 拆出来的几份申报是同一份（`resource`/`completion` 都从父工具的 inputSchema 抄
-    # 下来），取到哪一份都一样。Orin6 上的仿真器 `tts` 就是拆开的那种 —— 前两跳全对，
-    # 就卡在这里，表现和「没申报」一模一样。
-    metas = info.get('tool_meta') or {}
-    exact = f'mcp__{mcp_id}__{tool}'
-    meta = metas.get(exact) or next(
-        (m for name, m in metas.items() if name.startswith(f'{exact}__')), {})
-    resource = meta.get('resource') or frozenset()
-    return {'mouth': bool(set(resource) & benchmark_facts.SPEECH_CHANNELS),
-            'completion': bool(meta.get('completion'))}
 
 
 def card_key(card: dict) -> str:
@@ -471,6 +472,37 @@ def _check_confirmation(moving: list[dict], confirmed: list[str] | None) -> None
             'needs_confirmation': True, 'moving_cards': moving})
 
 
+def _case_to_run(case_id: str) -> dict | None:
+    """要跑的那个 `test` 段 —— **不碰画布**。
+
+    指名了就从本机用例库取，没指名就用当前方案自带的。两条路都只读 `test` 段：画布是
+    现场那一张，用例只贡献指令、插话和评判标准。
+    """
+    import benchmark_case
+    from api.solutions import loaded_case
+
+    if not case_id:
+        return loaded_case()
+    record = _read_case(case_id)
+    if record is None:
+        raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
+    return benchmark_case.test_block(record['payload'])
+
+
+def _run_name(case_id: str, case: dict) -> str:
+    """这次运行在历史里叫什么。
+
+    **不能退回 `'case'`。** 那不只是难看：`compare_runs` 按这个名字分组去配对，于是
+    所有没名字的用例会被归成一堆**互相比分** —— 一个「这次比上次好了」的结论，比的
+    其实是两个不同的用例。
+
+    库里存的那个名字是用户自己起的，优先用它；`test.name` 是编辑器写进去的第二份，
+    从文件或市场收进来的用例往往没有。
+    """
+    record = benchmark_store.get_case(case_id) if case_id else None
+    return (record or {}).get('name') or case.get('name', '') or '未命名用例'
+
+
 @router.post('/case/run')
 async def run_case(request: CaseRunRequest):
     """跑当前方案带的用例。
@@ -485,10 +517,10 @@ async def run_case(request: CaseRunRequest):
     if benchmark_runner.is_busy():
         raise fastapi.HTTPException(status_code=409, detail='已经有一次基准测试在跑')
 
-    case = loaded_case()
+    case = _case_to_run(request.case_id)
     if not case:
         raise fastapi.HTTPException(
-            status_code=409, detail='当前方案里没有 test 段，先载入一个测试用例')
+            status_code=409, detail='没有可跑的用例：在左边挑一个，或者给当前方案加一段 test')
 
     # 智能控制没开，事件进不了 collector（`collector.project_running` 那道闸），
     # 初始指令送进去也不会有人处理 —— 跑完会记一个 0 分，而那是基准测试在撒谎。
@@ -516,7 +548,7 @@ async def run_case(request: CaseRunRequest):
     environment = _environment()
     repeats = max(1, int(request.repeats))
     run_id = benchmark_store.create_run(
-        case.get('name', '') or 'case', n_repeats=repeats,
+        _run_name(request.case_id, case), n_repeats=repeats,
         tier=environment['tier'], llm_model=environment['llm_model'],
         llm_provider=environment['llm_provider'], host=environment['host'],
         image_tags=environment['image_tags'], git_shas=environment['git_shas'],
@@ -551,6 +583,16 @@ async def case_abort():
 @router.get('/runs')
 async def runs(limit: int = Query(50, ge=1, le=500)):
     return {'runs': benchmark_store.list_runs(limit=limit)}
+
+
+@router.get('/runs/{run_id}/compare/{baseline_id}')
+async def compare(run_id: str, baseline_id: str):
+    """这次比上次，分数的差异站不站得住。
+
+    面板据此决定**要不要**给涨跌结论。两个均值不同不等于有差别 —— LLM 是随机的，
+    一次运行的分数是分布里的一个样本。「测不出显著差异」是一个结论，不是缺省值。
+    """
+    return benchmark_store.compare_runs(baseline_id, run_id)
 
 
 @router.get('/runs/{run_id}')
@@ -589,14 +631,21 @@ async def run_timeline(run_id: str):
         'label': e.get('label', ''),
         'text': e.get('text', ''),
         'status': e.get('status', ''),
+        # 真机上没有 label（驱动的 ACP result 不带），目标只在派发参数里。
+        # 不带上它，时间线里的「出发」就是一行没有目的地的字。
+        'args': e.get('args') or {},
     } for e in events]
 
     return {
         'run': {k: stored.get(k) for k in
                 ('id', 'suite', 'status', 'started_at', 'ended_at', 'n_repeats',
                  'llm_model', 'image_tags', 'score_total', 'score_stdev')},
+        # `results` / `observations` 是「分数为什么是这个」的全部答案：每一项的判定
+        # 与理由、裁判对参考流程的逐步比对、七条原则算出来的那些数。不带上它们，
+        # 这个弹窗只能回答「好不好」，回答不了「哪儿坏了」——而后者才是打开它的理由。
         'cases': [{k: c.get(k) for k in
-                   ('repeat_idx', 'seed', 'outcome', 'score', 'assertions')}
+                   ('repeat_idx', 'seed', 'outcome', 'score', 'assertions',
+                    'results', 'observations')}
                   for c in cases],
         'world': world,
         'transcript': facts.get('transcript') or [],

@@ -27,14 +27,119 @@
  * 会话没了就说没了，不编。
  */
 
-// 断言名是给代码看的。「没过：waypoint_order」要人自己翻译，而这一行正是打开这个
-// 弹窗的第一眼。
-const CHECKS = {
-  waypoint_order: '站序不对', announce_after_arrive: '到达后没讲解',
-  never_occupied: '进了占用格', interrupted_leg: '被打断那段上报不实',
-  resume_correctness: '绕行后没回到原来那站',
-  exactly_one_terminal_post: 'ACP 重复上报', max_wall_seconds: '超时',
+// 没过的那几条现在本来就是人话 —— 要么是用户写的要求，要么是默认目标的标签
+// （「到达之前不开讲」「平均懵逼时长不超过 10 秒」）。原先这里有一张把
+// `waypoint_order` 翻译成「站序不对」的表，那是断言名还是代码标识符时的事。
+
+const DIMS = {
+  world_timing: '物理世界时序性', concurrency: '同步执行效率',
+  llm_latency: 'LLM 延时', cache_hit: 'cache 命中',
+  answer_quality: '回答效果', ux: '用户体验', physical_safety: '安全',
 };
+
+// 指标的名字与单位。原先直接把 `spoke_before_arrival 1 left_while_speaking 0` 这种
+// 原始键名摆在用户面前 —— 那是给代码看的，读的人得先在心里翻译一遍。
+const METRICS = {
+  spoke_before_arrival: ['到达前开讲', '次'], left_while_speaking: ['讲完前就走', '次'],
+  acp_contradictions: ['ACP 与事实矛盾', '条'], nav_legs: ['导航段数', '段'],
+  speak_turns: ['讲解次数', '次'],
+  total_seconds: ['总时长', '秒'], llm_seconds: ['推理耗时', '秒'],
+  tool_seconds: ['工具耗时', '秒'], tool_parallelism: ['工具并行度', ''],
+  idle_seconds: ['空档', '秒'], idle_ratio: ['空档占比', ''],
+  serialised_cross_channel: ['本可并行却串行', '次'],
+  rounds: ['轮数', ''], rounds_ok: ['成功轮数', ''], median_s: ['中位', '秒'],
+  p95_s: ['P95', '秒'], max_s: ['最慢', '秒'],
+  prompt_tokens: ['prompt', ''], cached_tokens: ['命中', ''], ratio: ['命中率', ''],
+  silence_avg_s: ['平均静默', '秒'], silence_max_s: ['最长静默', '秒'],
+  silence_total_s: ['静默总计', '秒'], silence_count: ['静默段数', '段'],
+  first_response_s: ['首次响应', '秒'], interrupt_response_s: ['打断后响应', '秒'],
+  incidents: ['事故', '次'], nav_failed: ['撞停', '次'],
+  trail_occupied: ['压占用格', '点'], first_reason: ['原因', ''],
+};
+
+/** 「分数为什么是这个」—— 每条原则一张表：结论、项目、来源、权重、数值或理由。
+ *
+ * 排成表是因为这一屏是用来**扫**的：七条原则十几项，混在一行行散文里，眼睛找不到
+ * 「哪一条没过、差多少」。列固定之后，同一列上下对齐，扫一眼就知道。
+ */
+export function scorecard(c) {
+  const items = c.results || [];
+  if (!items.length) return (c.assertions || []).length
+    ? `<div class="bm-tl-fail">没过：${(c.assertions || []).map(_esc).join('、')}</div>` : '';
+
+  const byDim = {};
+  items.forEach((i) => (byDim[i.dimension || 'answer_quality'] ||= []).push(i));
+  const seen = c.observations || {};
+
+  return `<div class="bm-sc">${Object.keys(DIMS).filter((k) => byDim[k] || seen[k])
+    .map((k) => {
+      const group = byDim[k] || [];
+      const graded = group.filter((i) => i.measurable !== false);
+      const score = graded.length
+        ? Math.round(100 * graded.reduce((a, i) => a + (i.weight || 0) * credit(i), 0)
+            / (graded.reduce((a, i) => a + (i.weight || 0), 0) || 1))
+        : null;
+      return `<section class="bm-sc-dim">
+        <header class="bm-sc-head">
+          <b>${_esc(DIMS[k])}</b>
+          <span class="bm-sc-num${score == null ? ' bm-sc-num--none' : ''}">${
+            score == null ? '判不了' : score}</span>
+        </header>
+        ${metricTable(seen[k])}
+        ${group.length ? `<table class="bm-sc-t"><tbody>${
+          group.map(scoreItem).join('')}</tbody></table>` : ''}
+      </section>`;
+    }).join('')}</div>`;
+}
+
+/** 这一项拿到多少分（0–1）。和后端 `benchmark_case._credit` 同一套规则。 */
+export function credit(i) {
+  if (i.credit != null) return Math.max(0, Math.min(1, Number(i.credit)));
+  return i.ok ? 1 : 0;
+}
+
+/** 那条原则算出来的几个数，横排成一行小格。判分会抖，这些不会。 */
+export function metricTable(block) {
+  const cells = Object.entries(block || {})
+    .filter(([, v]) => typeof v === 'number' || (typeof v === 'string' && v !== ''))
+    .map(([k, v]) => {
+      const [label, unit] = METRICS[k] || [k, ''];
+      const shown = typeof v === 'number' ? Math.round(v * 100) / 100 : v;
+      return `<span class="bm-sc-m"><i>${_esc(label)}</i>${_esc(shown)}${
+        unit ? `<u>${unit}</u>` : ''}</span>`;
+    });
+  return cells.length ? `<div class="bm-sc-ms">${cells.join('')}</div>` : '';
+}
+
+/** 一行：结论、项目、来源、权重、数值或理由。理由和逐步比对各占一整行。 */
+export function scoreItem(i) {
+  const done = i.measurable !== false;
+  const ratio = i.kind === 'ratio';
+  const mark = !done ? '—' : (ratio ? `${Math.round(credit(i) * 100)}` : (i.ok ? '✓' : '✗'));
+  const cls = !done ? 'none' : (ratio ? 'ratio' : (i.ok ? 'ok' : 'bad'));
+  // **来源说的是实际发生了什么，不是它属于哪一类。** 原先按 kind 打，于是一条没算成
+  // 的目标也写着「算出来的」—— 而它旁边正写着「判不了」的理由，两句直接打架。
+  const from = !done ? '没算成'
+    : ratio ? '按比例计分'
+    : i.kind === 'target' ? '算出来的' : '裁判判的';
+
+  const extra = [
+    i.detail ? `<div class="bm-clip bm-sc-why">${_esc(i.detail)}</div>` : '',
+    (i.steps || []).length ? `<div class="bm-sc-steps">${(i.steps || []).map((s) => `
+      <div class="bm-sc-step${s.match ? '' : ' bm-sc-step--off'}">
+        <span>${s.match ? '符合' : '偏离'}</span>
+        <span>${_esc(s.step || '')}</span>
+        <span class="bm-clip">${_esc(s.note || '')}</span>
+      </div>`).join('')}</div>` : '',
+  ].filter(Boolean).join('');
+
+  return `<tr class="bm-sc-item bm-sc-item--${cls}">
+      <td class="bm-sc-mark">${mark}</td>
+      <td class="bm-sc-text">${_esc(i.text || '')}</td>
+      <td class="bm-sc-from">${from}</td>
+      <td class="bm-sc-w">${i.weight ?? ''}</td>
+    </tr>${extra ? `<tr class="bm-sc-extra"><td></td><td colspan="3">${extra}</td></tr>` : ''}`;
+}
 
 // 一次运行里最值钱的线索往往是「这里什么都没发生」—— 机器人卡住、LLM 空转、
 // barrier 等超时，长得都一样：一段静默。
@@ -58,6 +163,8 @@ export function initTimeline() {
   // 省略号里的东西常常正是要看的（完整的讲解词、整串参数）。点一下展开，
   // 不用跳去翻 docker logs。
   document.getElementById('bm-timeline-body')?.addEventListener('click', (event) => {
+    const tab = event.target.closest('.bm-tl-tab');
+    if (tab) return _switchPane(tab.dataset.pane);
     const clip = event.target.closest('.bm-clip');
     if (clip) clip.classList.toggle('bm-clip--open');
   });
@@ -80,6 +187,13 @@ export async function openTimeline(runId) {
     return;
   }
   body.innerHTML = _render(data);
+}
+
+function _switchPane(which) {
+  document.querySelectorAll('.bm-tl-tab').forEach((t) => t.classList.toggle(
+    'active', t.dataset.pane === which));
+  document.querySelectorAll('.bm-tl-pane').forEach((p) => p.classList.toggle(
+    'hidden', p.dataset.pane !== which));
 }
 
 function close() {
@@ -153,28 +267,37 @@ function _render(data) {
       <span class="bm-tl-score">${run.score_total ?? '—'}</span>
       <span class="bm-tl-meta">${_esc(run.suite || '')}　${_esc(run.llm_model || '')}
         ${_esc(Object.values(run.image_tags || {}).filter(Boolean).join(' '))}</span>
-    </div>
-    ${(data.cases || []).map((c) => (c.assertions || []).length
-      ? `<div class="bm-tl-fail">没过：${(c.assertions || [])
-          .map((a) => _esc(CHECKS[a] || a)).join('、')}</div>`
-      : '').join('')}`;
+    </div>`;
 
+  // **打分细节和日志是两回事，分两个 tab。**
+  //
+  // 「这次多少分、为什么」和「它一步步做了什么」是两种查法：前者按原则读，后者按时间
+  // 读。叠在一条纵向流里，读任何一个都要滚过另一个 —— 而日志动辄几十行，打分细节就被
+  // 推到看不见的地方。默认停在打分，因为那是打开这个弹窗的第一个问题。
+  const cards = (data.cases || []).map(scorecard).join('');
   const agent = data.agent || [];
   const world = data.world || [];
-  if (!agent.length && !world.length) {
-    return head + `<div class="bm-empty">这次运行没有留下记录。<br>
-      记录在运行结束时才落盘，更早的运行（或清过的会话）没有这一份。</div>`;
-  }
 
-  const rows = withQuiet(merge(agent, world));
+  const log = (!agent.length && !world.length)
+    ? `<div class="bm-empty">这次运行没有留下记录。<br>
+        记录在运行结束时才落盘，更早的运行（或清过的会话）没有这一份。</div>`
+    : `${agent.length ? '' : '<div class="bm-tl-fail">这次运行的对话记录已经没有了。</div>'}
+       <div class="bm-tl-r bm-tl-r--headrow">
+         <span class="bm-tl-left">Agent 请求做什么</span>
+         <span class="bm-tl-t"></span>
+         <span class="bm-tl-right">世界真的做了什么</span>
+       </div>
+       <div class="bm-tl-flow">${withQuiet(merge(agent, world)).map(_row).join('')}</div>`;
+
   return `${head}
-    ${agent.length ? '' : '<div class="bm-tl-fail">这次运行的对话记录已经没有了。</div>'}
-    <div class="bm-tl-r bm-tl-r--headrow">
-      <span class="bm-tl-left">Agent 请求做什么</span>
-      <span class="bm-tl-t"></span>
-      <span class="bm-tl-right">世界真的做了什么</span>
+    <div class="bm-tl-tabs">
+      <button class="bm-tl-tab active" data-pane="score">打分细节</button>
+      <button class="bm-tl-tab" data-pane="log">运行日志</button>
     </div>
-    <div class="bm-tl-flow">${rows.map(_row).join('')}</div>`;
+    <div class="bm-tl-pane" data-pane="score">${cards ||
+      '<div class="bm-empty">这次运行没有留下判定明细。<br>' +
+      '更早的运行只存了没过的项目名，理由和指标是后来才开始落盘的。</div>'}</div>
+    <div class="bm-tl-pane hidden" data-pane="log">${log}</div>`;
 }
 
 function _row(row) {
@@ -211,10 +334,17 @@ function _agentCell(row) {
 function _worldCell(e) {
   const label = KINDS[e.kind] || e.kind;
   const known = KINDS[e.kind] !== undefined;
-  const detail = e.label || e.text || '';
+  // 真机上没有 label（驱动的 ACP result 不带它），目标只在派发参数里 —— 退到参数，
+  // 否则「出发」就是一行没有目的地的字。
+  const detail = e.label || e.text || _args(e.args);
   return `<span class="bm-tl-kind${known ? '' : ' bm-tl-kind--minor'}">${_esc(label)}</span>` +
     `<span class="bm-clip bm-tl-detail">${_esc(detail)}${
       e.status ? ` <i>${_esc(e.status)}</i>` : ''}</span>`;
+}
+
+function _args(args) {
+  const entries = Object.entries(args || {});
+  return entries.length ? entries.map(([k, v]) => `${k}=${v}`).join(' ') : '';
 }
 
 function _esc(value) {

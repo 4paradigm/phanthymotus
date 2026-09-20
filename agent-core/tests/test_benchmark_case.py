@@ -1,10 +1,8 @@
-"""用例的结构校验与裁判。
+"""用例的结构，以及分数怎么来。
 
-裁判搬到 agent-core，是为了让它和被测系统真的不相交：原先 `assertions.py` 住在
-仿真器驱动里 —— 裁判住在被测系统内部。它本来就是纯函数
-`(用例, 事件, ACP记录) → 判定`，没有驱动依赖，所以搬过来之后变成**驱动产出事实、
-agent-core 做裁判**。顺带它也推广了：将来跑在真机器人上的用例，只要吐出同样形状的
-事件流，这同一套断言直接可用。
+判定本身不在这里了 —— 确定性那一半在 `test_benchmark_metrics.py`（指标算得对不对），
+模糊那一半在 `test_benchmark_judge.py`（裁判的输入输出）。这个文件管的是中间那层：
+用例声明了什么、默认目标怎么叠、一堆判决怎么变成分数。
 
 Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_benchmark_case.py -q
 """
@@ -14,329 +12,339 @@ import pathlib
 import sys
 import tempfile
 
-import pytest
-
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'case-test.db'))
 
 import benchmark_case as bc  # noqa: E402
+import benchmark_metrics as bm  # noqa: E402
 
 
-def case(**evaluate):
-    return {'formatVersion': 1, 'canvas': {}, 'test': {
-        'requires': {'drivers': ['simulator-generic'], 'assets': ['bj-2f']},
-        'run': {'prompt': '带我转一下展区并给我介绍下',
-                'injections': [{'after_arrival': 'P5', 'delay': 6.0, 'text': '先等一下'}]},
-        'evaluate': {'expect': {'waypoint_order': ['P3', 'P4']}, 'weights': {}, **evaluate},
-    }}
+def case(**over):
+    block = {
+        'requires': {'drivers': ['simulator-generic'], 'assets': []},
+        'run': {'prompt': '带我转一下展区', 'injections': []},
+        'requirements': [{'text': '到了再讲', 'weight': 25, 'dimension': 'world_timing'}],
+    }
+    block.update(over)
+    return {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [], 'test': block}
 
 
-def arrive(t, label):
-    return {'t': t, 'event': 'arrive', 'label': label}
+def item(dimension, ok, weight=10, measurable=True, text='x'):
+    return {'id': text, 'text': text, 'dimension': dimension, 'ok': ok,
+            'weight': weight, 'measurable': measurable}
 
 
-def nav_start(t, label=''):
-    return {'t': t, 'event': 'nav_start', 'label': label}
+# ── 七条原则 ──────────────────────────────────────────────────────────────────
+
+def test_no_dimension_key_collides_with_the_old_set():
+    """旧的是 orchestration / interruption / long_horizon / **latency** / **safety**。
+
+    新的里面也有「延时」和「安全」，但含义不同 —— 旧 `latency` 是「整趟跑完没超预算」，
+    新 `llm_latency` 是「每轮推理多快」。沿用同一个键，趋势图会把两种度量悄悄画进同一
+    条线。同名不同义在这个仓库已经坑过三次，这条是第五次的预防。
+    """
+    old = {'orchestration', 'interruption', 'long_horizon', 'latency', 'safety'}
+
+    assert not (set(bc.DIMENSIONS) & old)
+    assert set(bc.DIMENSION_LABELS) == set(bc.DIMENSIONS)
+
+
+def test_total_task_duration_has_no_default_target():
+    """三站的导览和十站的导览没有可比的标准。给一个拍脑袋的默认值，等于让每个长用例都
+    无故扣分。它永远报出来、永远可看趋势，只在用例自己给了数时才参与判定。"""
+    assert 'concurrency.total_seconds' not in bc.DEFAULT_TARGETS
+
+    with_target = bc.targets(case(targets={'concurrency.total_seconds': 300}))
+
+    assert with_target['concurrency.total_seconds']['max'] == 300
+
+
+def test_speaking_on_the_way_is_not_penalised_by_default():
+    """**两个维度的默认目标不能互相打架。**
+
+    Orin6 上一跑就现原形：机器人在路上说了一句「正在带您前往一号展区，请跟我走」。
+    同一次跑动里 `ux` 因为它少了一段空白，而 `world_timing` 曾因为它扣分 ——
+    奖一次罚一次，等于没有意见。
+
+    这个指标分不清「到达前宣布已到达」（该罚）和「路上说点什么」（该奖），而区分
+    它们是内容问题，是裁判的活。所以它是可看的指标，不是默认目标。
+    """
+    assert 'world_timing.spoke_before_arrival' not in bc.DEFAULT_TARGETS
+
+    seen_it = seen(**{'world_timing.spoke_before_arrival': 3})
+    items = bc.check_targets(seen_it, bc.targets(case()))
+
+    assert not any(i['id'] == 'world_timing.spoke_before_arrival' for i in items)
+
+
+def test_leaving_mid_sentence_is_still_penalised():
+    """「讲完再走」没有这种两义性：话说一半就走，任何维度都不想要。"""
+    items = bc.check_targets(seen(**{'world_timing.left_while_speaking': 1}),
+                             bc.targets(case()))
+
+    left = next(i for i in items if i['id'] == 'world_timing.left_while_speaking')
+    assert left['ok'] is False
+
+
+def test_a_case_can_move_a_default_target_without_replacing_the_rest():
+    spec = bc.targets(case(targets={'ux.silence_avg_s': 15}))
+
+    assert spec['ux.silence_avg_s']['max'] == 15
+    assert spec['llm_latency.median_s']['max'] == 10       # 其余不受影响
+
+
+def test_overriding_a_lower_bound_target_keeps_it_a_lower_bound():
+    """越高越好的指标，覆盖时当成上限就把「至少」改成了「至多」。"""
+    spec = bc.targets(case(targets={'ux.some_rate': 0.5}))
+
+    assert spec['ux.some_rate']['max'] == 0.5      # 默认里没有的，按上限
+
+
+def test_cache_hit_scores_by_its_rate_not_by_a_pass_mark():
+    """**命中率本身就是分数。**
+
+    原先是 `min: 0.3` 的通过/不通过：31% 过、94% 也过，两次都记 100 分，而它们差着
+    三倍。cache 命中是个连续量，压成布尔等于把这条原则能提供的信息全扔了，只留下
+    「有没有烂到三成以下」。
+    """
+    items = bc.check_targets(seen(**{'cache_hit.ratio': 0.884}), bc.targets(case()))
+    hit = next(i for i in items if i['id'] == 'cache_hit.ratio')
+
+    assert hit['kind'] == 'ratio'
+    assert hit['credit'] == 0.884
+    assert '88.4%' in hit['detail']
+    # 88% 不是「失败」，它就是 88 分 —— 所以不该出现在 failures 里。
+    assert hit['ok'] is True
+    assert bc.score(case(), [hit])['by_dimension']['cache_hit'] == 88.4
+
+
+def test_a_poor_cache_rate_scores_low_without_being_called_a_failure():
+    items = bc.check_targets(seen(**{'cache_hit.ratio': 0.05}), bc.targets(case()))
+    hit = next(i for i in items if i['id'] == 'cache_hit.ratio')
+
+    assert bc.score(case(), [hit])['by_dimension']['cache_hit'] == 5.0
+    assert bc.score(case(), [hit])['failures'] == []
 
 
 # ── 结构 ──────────────────────────────────────────────────────────────────────
 
 def test_a_solution_without_a_test_block_is_not_a_case():
     assert bc.is_case({'formatVersion': 1, 'canvas': {}}) is False
-    assert bc.validate({'formatVersion': 1})[0].startswith('这个解决方案没有 test 段')
 
 
 def test_a_well_formed_case_validates():
-    assert bc.is_case(case()) is True
     assert bc.validate(case()) == []
 
 
 def test_an_empty_prompt_is_refused():
-    """没有初始指令，机器人不会动，最后会记一个 0 分 —— 那是基准测试在撒谎。"""
-    broken = case()
-    broken['test']['run']['prompt'] = '   '
+    """空指令跑出来的 0 分是基准测试在撒谎。"""
+    payload = case(run={'prompt': '   ', 'injections': []})
 
-    assert any('prompt 为空' in p for p in bc.validate(broken))
+    assert any('prompt 为空' in p for p in bc.validate(payload))
 
 
 def test_an_injection_that_can_never_fire_is_refused():
-    broken = case()
-    broken['test']['run']['injections'] = [{'text': '喂'}]
+    payload = case(run={'prompt': '走', 'injections': [{'text': '等一下'}]})
 
-    assert any('永远不会触发' in p for p in bc.validate(broken))
-
-
-def test_a_case_with_no_assertions_is_refused():
-    """没有断言的用例只会产生一个无意义的满分。"""
-    broken = case()
-    broken['test']['evaluate']['expect'] = {}
-
-    assert any('没有断言' in p for p in bc.validate(broken))
+    assert any('永远不会触发' in p for p in bc.validate(payload))
 
 
-def test_unknown_weight_dimensions_are_refused():
-    broken = case()
-    broken['test']['evaluate']['weights'] = {'orchestration': 30, 'vibes': 70}
+def test_a_requirement_hung_on_an_unknown_principle_is_refused():
+    payload = case(requirements=[{'text': '随便', 'dimension': '编排'}])
 
-    assert any('未知维度' in p and 'vibes' in p for p in bc.validate(broken))
+    assert any('未知原则' in p for p in bc.validate(payload))
+
+
+def test_a_new_case_is_unrunnable_and_carries_no_canvas():
+    """新用例故意是不合法的（没有初始指令），也**故意不带画布**。
+
+    跑用例跑的是当前画布；自带画布只是可选的参考。新用例带一张空画布，「跑」就会把它
+    刷进去 —— 那正是这一轮要修的那个 bug。
+    """
+    blank = {'test': bc.blank()}
+
+    assert any('prompt 为空' in p for p in bc.validate(blank))
+    assert 'canvas' not in bc.blank()
 
 
 def test_requires_is_what_preflight_reads():
-    """用例声明依赖，preflight 才能分层报错 —— 这正是卡片做不到的那件事：
-    驱动没装时卡片本身不存在，连「你缺这个驱动」都没地方说。"""
-    needs = bc.requires(case())
-
-    assert needs['drivers'] == ['simulator-generic']
-    assert needs['assets'] == ['bj-2f']
+    assert bc.requires(case())['drivers'] == ['simulator-generic']
 
 
-# ── 裁判 ──────────────────────────────────────────────────────────────────────
+# ── 参考流程 ──────────────────────────────────────────────────────────────────
 
-def test_waypoint_order_compares_arrivals_in_order():
-    good = bc.check_waypoint_order({'waypoint_order': ['P3', 'P4']},
-                                   [arrive(1, 'P3'), arrive(2, 'P4')])
-    bad = bc.check_waypoint_order({'waypoint_order': ['P3', 'P4']},
-                                  [arrive(1, 'P4'), arrive(2, 'P3')])
+def test_a_procedure_becomes_one_requirement_under_world_timing():
+    """一等的输入框，普通的计分方式。
 
-    assert good['ok'] is True
-    assert bad['ok'] is False and 'P3' in bad['detail']
+    它不是新维度 —— 维度是固定的质量轴，而一条流程是这个用例的内容；「有没有按流程走」
+    本来就是 `world_timing` 在问的事。
+    """
+    payload = case(procedure='1. 打开地图\n2. 导航', requirements=[])
 
+    reqs = bc.requirements(payload)
 
-def test_announcing_before_arriving_fails():
-    events = [nav_start(0, 'P3'), arrive(5, 'P3'), nav_start(6, 'P4'), arrive(9, 'P4'),
-              {'t': 9.5, 'event': 'speak_start'}, {'t': 11, 'event': 'speak_end',
-                                                   'status': 'completed'}]
-
-    result = bc.check_announce_after_arrive({'announce_after_arrive': True}, events)
-
-    assert result['ok'] is False
-    assert 'P3' in result['detail'] and '没讲' in result['detail']
+    assert len(reqs) == 1
+    assert reqs[0]['dimension'] == 'world_timing'
+    assert reqs[0]['weight'] == bc.PROCEDURE_WEIGHT
+    assert '打开地图' in reqs[0]['procedure']
 
 
-def test_leaving_before_the_announcement_finishes_fails():
-    events = [nav_start(0, 'P3'), arrive(5, 'P3'), {'t': 5.2, 'event': 'speak_start'},
-              nav_start(6, 'P4'), {'t': 9, 'event': 'speak_end', 'status': 'completed'}]
+def test_a_procedures_weight_and_home_can_both_be_changed():
+    payload = case(procedure='1. 打开地图',
+                   requirements=[{'id': bc.PROCEDURE_ID, 'weight': 60,
+                                  'dimension': 'answer_quality'}])
 
-    result = bc.check_announce_after_arrive({'announce_after_arrive': True}, events)
+    reqs = bc.requirements(payload)
 
-    assert result['ok'] is False and '没讲完就走' in result['detail']
-
-
-def test_an_abandoned_leg_reported_completed_is_caught():
-    """基准测试要抓的谎：被放弃的一段报 completed，等于告诉模型它到过一个没去过的地方。"""
-    posts = [{'action_id': 'a1', 'status': 'completed',
-              'result': {'label': 'P6', 'progress': {'fraction': 0.4}}}]
-
-    result = bc.check_interrupted_leg(
-        {'interrupted_leg': {'target': 'P6', 'acp_status': 'cancelled'}}, [], acp_posts=posts)
-
-    assert result['ok'] is False and 'completed' in result['detail']
+    assert len(reqs) == 1 and reqs[0]['weight'] == 60
+    assert reqs[0]['dimension'] == 'answer_quality'
 
 
-def test_a_full_progress_cancel_is_not_an_interruption():
-    posts = [{'action_id': 'a1', 'status': 'cancelled',
-              'result': {'label': 'P6', 'progress': {'fraction': 1.0}}}]
-
-    result = bc.check_interrupted_leg(
-        {'interrupted_leg': {'target': 'P6', 'min_progress': 0.02}}, [], acp_posts=posts)
-
-    assert result['ok'] is False
+def test_no_procedure_means_no_extra_requirement():
+    assert len(bc.requirements(case(procedure='   '))) == 1   # 只有用例自己写的那条
 
 
-def test_resuming_at_the_wrong_waypoint_is_caught():
-    """长程任务里模型最常犯的错，任何单步断言都看不见。"""
-    events = [{'t': 5, 'event': 'nav_cancelled', 'label': 'P6'}, nav_start(8, 'P7')]
+def test_a_requirement_with_no_principle_lands_in_answer_quality():
+    """没指定就归到「回答效果」—— 那是唯一没有可算指标、本来就靠裁判的一条。"""
+    payload = case(requirements=[{'text': '讲得要有意思'}])
 
-    result = bc.check_resume_correctness({'resume_target': 'P6'}, events)
-
-    assert result['ok'] is False and 'P7' in result['detail']
+    assert bc.requirements(payload)[0]['dimension'] == 'answer_quality'
 
 
-def test_duplicate_terminal_posts_are_caught():
-    """重复上报在 agent-core 侧是静默的，除了这里没有地方会发现。"""
-    posts = [{'action_id': 'a1'}, {'action_id': 'a1'}, {'action_id': 'a2'}]
+# ── 目标：确定性判定 ──────────────────────────────────────────────────────────
 
-    assert bc.check_exactly_one_terminal_post({}, [], acp_posts=posts)['ok'] is False
-
-
-def test_checks_that_were_not_asserted_say_so():
-    for check in (bc.check_waypoint_order, bc.check_interrupted_leg,
-                  bc.check_resume_correctness, bc.check_max_wall_seconds):
-        assert check({}, [], acp_posts=[])['detail'] == '未断言'
+def seen(**over):
+    base = bm.observations({'events': [], 'acp_posts': [], 'source': 'agent-core'},
+                           [], {}, (0, 100))
+    for path, value in over.items():
+        group, key = path.split('.', 1)
+        base[group][key] = value
+    return base
 
 
-# ── 评分 ──────────────────────────────────────────────────────────────────────
+def test_a_metric_inside_its_target_passes_without_any_llm():
+    items = bc.check_targets(seen(**{'llm_latency.median_s': 4.0}),
+                             bc.targets(case()))
 
-def test_weights_come_from_the_case_not_from_code():
-    payload = case()
-    results = bc.evaluate(payload, [arrive(1, 'P3')], acp_posts=[])
-    payload['test']['evaluate']['weights'] = {'orchestration': 1}
-    only_orchestration = bc.score(payload, results)['total']
-    payload['test']['evaluate']['weights'] = {'safety': 1}
-    only_safety = bc.score(payload, results)['total']
+    latency = next(i for i in items if i['id'] == 'llm_latency.median_s')
+    assert latency['ok'] is True and latency['kind'] == 'target'
 
-    assert only_orchestration != only_safety
+
+def test_a_metric_outside_its_target_fails_and_says_both_numbers():
+    items = bc.check_targets(seen(**{'llm_latency.median_s': 23.4}),
+                             bc.targets(case()))
+
+    latency = next(i for i in items if i['id'] == 'llm_latency.median_s')
+    assert latency['ok'] is False
+    assert '23.4' in latency['detail'] and '10' in latency['detail']
+
+
+def test_an_unmeasurable_metric_is_not_a_failure_and_carries_its_reason():
+    items = bc.check_targets(seen(), bc.targets(case()))
+
+    safety = next(i for i in items if i['id'] == 'physical_safety.incidents')
+    assert safety['measurable'] is False
+    assert '轨迹占用数据' in safety['detail']
+
+
+def test_a_case_can_turn_a_metric_into_a_lower_bound():
+    """写一个数是改阈值，写一个 dict 是整条换掉 —— 后者是把一条目标从上限改成下限、
+    或者改成比例型的唯一办法。"""
+    payload = case(targets={'cache_hit.ratio': {'min': 0.5, 'ratio': False,
+                                                'label': 'cache 至少五成'}})
+    items = bc.check_targets(seen(**{'cache_hit.ratio': 0.62}), bc.targets(payload))
+
+    cache = next(i for i in items if i['id'] == 'cache_hit.ratio')
+    assert cache['ok'] is True and '≥' in cache['detail']
+
+
+# ── 分数 ──────────────────────────────────────────────────────────────────────
+
+def test_a_dimension_scores_by_the_weight_of_what_passed():
+    items = [item('world_timing', True, weight=30), item('world_timing', False, weight=10)]
+
+    result = bc.score(case(), items)
+
+    assert result['by_dimension']['world_timing'] == 75.0
 
 
 def test_an_unmeasured_dimension_scores_none_not_zero():
-    """「没测」和「测了没过」是两件事；平均在一起，基准测试就开始撒谎。"""
-    payload = case()
-    result = bc.score(payload, bc.evaluate(payload, [], acp_posts=[]))
+    """「没测到」和「测了没过」是两件事。平均在一起，基准测试就开始撒谎了。"""
+    items = [item('physical_safety', False, measurable=False)]
 
-    assert result['by_dimension']['long_horizon'] is None
-    assert result['by_dimension']['latency'] is None
+    result = bc.score(case(), items)
 
-
-def test_a_perfect_run_scores_one_hundred():
-    payload = case()
-    payload['test']['evaluate']['expect'] = {'waypoint_order': ['P3'], 'never_occupied': True}
-    events = [nav_start(0, 'P3'), arrive(3, 'P3')]
-
-    result = bc.score(payload, bc.evaluate(payload, events, acp_posts=[]))
-
-    assert result['total'] == 100.0
-    assert result['failures'] == []
+    assert result['by_dimension']['physical_safety'] is None
+    assert result['failures'] == [] and result['unmeasured'] == ['x']
 
 
-def test_safety_without_trail_data_is_unmeasured_not_a_free_pass():
-    """没有轨迹占用数据时，安全维度必须是 `None`，**不是 100**。
+def test_dimension_weights_come_from_the_case_not_from_code():
+    """权重是会被争论、会被调整的东西，改权重不该是改代码。"""
+    payload = case(dimension_weights={'world_timing': 9, 'ux': 1})
+    items = [item('world_timing', True), item('ux', False)]
 
-    这条守的是一个真实存在过的缺陷：判定读 `int(facts.get('trail_occupied') or 0)`，
-    字段缺席得 0，于是静默判过。真机上这个字段永远缺席（它要拿轨迹对着占用栅格数），
-    所以每一次真机跑分都会报告一个从没查过的满分安全维度。
-
-    空的 `nav_failed` 不能顶替：那是积分器自己报的，只看它等于让积分器报告自己的 bug。
-    """
-    payload = case()
-    payload['test']['evaluate']['expect'] = {'waypoint_order': ['P3'], 'never_occupied': True}
-    events = [nav_start(0, 'P3'), arrive(3, 'P3')]
-
-    result = bc.score(payload, bc.evaluate(payload, events, acp_posts=[], facts={}))
-
-    assert result['by_dimension']['safety'] is None
-    assert result['unmeasured'] == ['never_occupied']
-    assert result['failures'] == []        # 判不了不等于没通过
+    assert bc.score(payload, items)['total'] == 90.0
 
 
-def test_a_crash_is_still_caught_without_trail_data():
-    """撞停是阳性证据，谁报的都算数 —— 没有轨迹也判得了，不能一起划进「不可测」。"""
-    payload = case()
-    payload['test']['evaluate']['expect'] = {'never_occupied': True}
-    events = [nav_start(0, 'P3'), {'event': 'nav_failed', 't': 2, 'reason': '前方占用'}]
+def test_an_unmeasured_dimension_drops_out_of_the_denominator():
+    payload = case(dimension_weights={'world_timing': 1, 'physical_safety': 99})
+    items = [item('world_timing', True), item('physical_safety', False, measurable=False)]
 
-    result = bc.score(payload, bc.evaluate(payload, events, acp_posts=[], facts={}))
-
-    assert result['by_dimension']['safety'] == 0.0
-    assert result['failures'] == ['never_occupied']
+    assert bc.score(payload, items)['total'] == 100.0
 
 
-def test_evaluate_reads_expect_out_of_the_case_payload():
-    payload = case()
-    payload['test']['evaluate']['expect'] = {'waypoint_order': ['P3', 'P4']}
+def test_a_case_with_nothing_measurable_scores_none_rather_than_zero():
+    result = bc.score(case(), [item('ux', False, measurable=False)])
 
-    names = [r['name'] for r in bc.evaluate(payload, [arrive(1, 'P3')], acp_posts=[])]
-
-    assert 'waypoint_order' in names
-    assert len(names) == len(bc.CHECKS)
+    assert result['total'] is None
 
 
-# ── 测不到的断言 ──────────────────────────────────────────────────────────────
+# ── 旧格式 ────────────────────────────────────────────────────────────────────
 
-def canvas_case(speech_tool='tts'):
-    """一个断言了讲解的用例，画布上挂着 `speech_tool` 那张卡。
-
-    **卡片带的是 `deviceRef`，`mcpId` 是 None** —— 这是打包过的解决方案在真机上的
-    真实形状（Orin6 上取下来的），也正是 deviceRef 存在的理由：同一个包体换台机器
-    还能载入。用 `mcpId` 造夹具会把整类 bug 测没了。
-    """
-    payload = case()
-    payload['test']['evaluate']['expect']['announce_after_arrive'] = True
-    payload['devices'] = [{'ref': 'd2', 'serverName': 'r1-device-bundle',
-                           'name': 'Unitree R1'}]
-    payload['canvas'] = {'cards': [
-        {'id': 'c1', 'deviceRef': 'd2', 'mcpId': None, 'toolName': 'controlled_spatial'},
-        {'id': 'c2', 'deviceRef': 'd2', 'mcpId': None, 'toolName': speech_tool},
-    ]}
-    return payload
+def legacy():
+    return {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [], 'test': {
+        'requires': {'drivers': ['simulator-generic'], 'assets': []},
+        'run': {'prompt': '带我转一下展厅'},
+        'evaluate': {
+            'expect': {'waypoint_order': ['入口', '一号展区'],
+                       'announce_after_arrive': True,
+                       'resume_target': '二号展区',
+                       'interrupted_leg': {'target': '二号展区'},
+                       'max_wall_seconds': 600},
+            'weights': {'orchestration': 30}}}}
 
 
-def probe(mouth=(), completion=(), server='r1-device-bundle'):
-    """假的申报表。真的那份背后是 `mcp_client.registry`（`api.benchmark.speech_probe`）。
+def test_an_old_case_reads_back_as_prose_requirements():
+    """不转的话，已经存在的用例打开就是空的 —— 用户看到的是「我的要求没了」，
+    而不是「格式换了」。"""
+    reqs = bc.requirements(bc.migrate(legacy()))
+    texts = [r['text'] for r in reqs]
 
-    第一个入参是**驱动名**，不是 `mcp_id` —— 认错驱动的也要答 False，否则这组测试
-    盖不住「解错了 deviceRef」这一类。
-    """
-    def ask(server_name, tool):
-        if server_name != server:
-            return {'mouth': False, 'completion': False}
-        return {'mouth': tool in mouth, 'completion': tool in completion}
-    return ask
+    assert any('依次到达每一站' in t and '入口' in t for t in texts)
+    assert any('到了再讲' in t or '讲完再走' in t for t in texts)
+    assert all(r['dimension'] in bc.DIMENSIONS for r in reqs)
 
 
-def test_a_real_robots_tts_is_measurable_now():
-    """判据变了：任何申报了嘴、且走 ACP 的讲解工具都产出得了事实。
+def test_migrating_drops_the_old_evaluate_block():
+    migrated = bc.migrate(legacy())
 
-    原先要求 tts 必须属于用例声明的驱动（也就是仿真器自己那张），因为只有仿真器世界
-    写得出 speak 事件。agent-core 自己记了之后那条判据在真机上会把一张完全可用的画布
-    判成「测不到」。
-    """
-    assert bc.unmeasurable(canvas_case(),
-                           probe=probe(mouth=('tts',), completion=('tts',))) == []
+    assert 'evaluate' not in migrated['test']
+    assert bc.validate(migrated) == []
 
 
-def test_a_speech_tool_is_recognised_by_its_declared_channel_not_its_name():
-    """`speaker_raise` 这种名字，关键词表抓不住 —— `peer/tools.py` 就是这么栽的。"""
-    payload = canvas_case(speech_tool='speaker_raise')
-
-    assert bc.unmeasurable(payload, probe=probe(mouth=('speaker_raise',),
-                                                completion=('speaker_raise',))) == []
+def test_the_old_wall_clock_budget_becomes_the_run_budget():
+    assert bc.migrate(legacy())['test']['run']['budget_seconds'] == 600
 
 
-def test_no_card_declares_a_mouth_so_the_announcement_check_is_meaningless():
-    """Orin6 上抓到的：机器人每站都讲了，事实流里却一句都没有 —— 断言恒为失败，
-    而分数把这笔算在 agent 头上。"""
-    problems = bc.unmeasurable(canvas_case(), probe=probe())
+def test_never_occupied_does_not_become_a_requirement():
+    """它在新结构里是**目标**，默认目标已经覆盖了。再转一遍会变成同一件事判两次。"""
+    payload = legacy()
+    payload['test']['evaluate']['expect']['never_occupied'] = True
 
-    assert len(problems) == 1
-    assert '没有任何申报了嘴' in problems[0]
+    texts = [r['text'] for r in bc.requirements(bc.migrate(payload))]
 
-
-def test_a_speech_tool_without_acp_cannot_time_the_announcement():
-    """只知道它开始说，不知道它说完没有 —— 「没讲完就走了」判不了。"""
-    problems = bc.unmeasurable(canvas_case(), probe=probe(mouth=('tts',)))
-
-    assert len(problems) == 1
-    assert 'ACP' in problems[0]
+    assert not any('占用' in t for t in texts)
 
 
-def test_the_card_is_resolved_through_deviceRef_not_mcpId():
-    """打包的用例里 `mcpId` 是 None —— 卡片指向 `devices[]` 里的一条，那条才知道
-    自己是哪个驱动。
-
-    Orin6 上现的形：拿 `card['mcpId']` 去查注册表，每个打包用例都被报成「没有申报嘴
-    的卡片」，包括完全正确的那些。这条断言要是只用 `mcpId` 造夹具，就永远抓不到。
-    """
-    seen = []
-
-    def watching(server_name, tool):
-        seen.append(server_name)
-        return {'mouth': tool == 'tts', 'completion': tool == 'tts'}
-
-    assert bc.unmeasurable(canvas_case(), probe=watching) == []
-    assert set(seen) == {'r1-device-bundle'}       # 不是 None，也不是 ''
-
-
-def test_without_a_probe_no_verdict_is_reached():
-    """市场里的用例在本机还没装驱动，画布上的工具申报了什么无从知道。
-
-    猜一个答案比不答更糟：一条假的「测不到」会让人去改一张其实没问题的画布。
-    """
-    assert bc.unmeasurable(canvas_case()) == []
-
-
-def test_a_case_that_does_not_assert_announcements_is_not_nagged():
-    """没断言讲解的用例，画布上有没有 tts 都不关它的事。"""
-    payload = canvas_case()
-    payload['test']['evaluate']['expect']['announce_after_arrive'] = False
-
-    assert bc.unmeasurable(payload, probe=probe()) == []
+def test_a_new_format_case_passes_through_migrate_untouched():
+    assert bc.migrate(case()) == case()

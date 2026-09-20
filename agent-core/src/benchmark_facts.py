@@ -32,19 +32,18 @@ agent-core 自己把它派发出去的异步动作记成同样形状的事实。
 没申报 `x-resource` 的工具不产出事实。这是**有意让它缺**而不是猜一个：一条猜错的事实
 会让裁判判错，而缺一条事实至少还能在预检里说出来。
 
-## 站名：唯一真正难的一处
+## 目标去了哪里：记参数，不猜含义
 
-真机的 ACP result **不带站名**。天轶完成导航时回的是 `{pose, elapsed_s,
-action_id_chassis}`，仿真器回的才是 `{label, ...}`。目标名只存在于**派发参数**里，而参数名
+真机的 ACP result **不带目标名**。天轶完成导航时回的是 `{pose, elapsed_s,
+action_id_chassis}`，仿真器回的才是 `{label, ...}`。目标只存在于**派发参数**里，而参数名
 各家不同：天轶是 `tag_name`，仿真器是 `label`，下一家会是别的。
 
-挑一个参数名来读，等于把某一家驱动的 schema 焊进判定层。所以反过来：
+挑一个参数名来读，等于把某一家驱动的 schema 焊进事实层。所以**原样记下参数里的字符串
+值**，不解释它们是什么。要求是人话，判它的是裁判 —— 「有没有按我说的顺序去那几个地方」
+是它读着参数就能回答的问题，而这里少做一层猜测，就少一处会猜错的地方。
 
-> 一段路的 label = 这次派发的参数里，**值**等于用例 `waypoint_order` 中某一项的那个字符串。
-
-与驱动无关，不需要知道任何 schema。降级也是诚实的：模型若按坐标导航而不是按站名，
-就没有 label，`waypoint_order` 判失败 —— 而那是**正确**的判定，因为用例要的就是按名字
-去那些站。
+早先这里是拿参数值去匹配用例声明的 `waypoint_order`。那个列表随结构化断言一起没了，
+而它本来也是展区导览的词汇：不是每个用例都有「站」。
 """
 
 from __future__ import annotations
@@ -79,7 +78,7 @@ class Recorder:
     """
 
     def __init__(self, waypoints: list[str] | None = None):
-        # 已知的站名。派发参数里的值匹配到其中之一，就是这一段的目标。
+        # 保留这个入参只为兼容调用方；目标不再靠它解析，见模块文档。
         self.waypoints = [str(w) for w in (waypoints or [])]
         self._lock = threading.RLock()
         self._started = time.time()
@@ -102,10 +101,12 @@ class Recorder:
         if kind is None:
             return
         label = self.label_of(args)
+        target = _string_args(args)
         with self._lock:
-            self._inflight[action_id] = {'kind': kind, 'tool': tool, 'label': label}
+            self._inflight[action_id] = {'kind': kind, 'tool': tool, 'label': label,
+                                         'args': target}
             self._append(f'{_PREFIX[kind]}_start', tool=tool, label=label,
-                         action_id=action_id)
+                         action_id=action_id, args=target)
 
     def on_settled(self, action_id: str, _resource=None) -> None:
         with self._lock:
@@ -159,10 +160,10 @@ class Recorder:
     # ── 内部 ──────────────────────────────────────────────────────────────────
 
     def label_of(self, args: dict) -> str:
-        """派发参数里能对上某个已知站名的那个值。对不上就是空串。
+        """调用方给了已知名单时，派发参数里对得上的那个值；否则空串。
 
-        按**值**找而不是按参数名找 —— 见模块文档。遍历顺序按参数名排序，好让同一份
-        参数每次得到同一个答案（两个参数都对上时不该看字典顺序的脸色）。
+        按**值**找而不是按参数名找，因为参数名各家不同。现在没有名单可给了（`waypoints`
+        随 `waypoint_order` 一起没了），所以这个方法通常返回空串 —— 目标看 `args`。
         """
         for key in sorted(args or {}):
             value = args[key]
@@ -251,3 +252,21 @@ def _wire() -> None:
     mcp_client.on_action_settled(
         lambda aid, res=None: _current and _current.on_settled(aid, res))
     _wired = True
+
+
+def _string_args(args: dict, limit: int = 6) -> dict | None:
+    """派发参数里的字符串值 —— 原样记下，不解释。
+
+    只留字符串：坐标、超时、重试次数这些数字对「它去了哪儿」没有帮助，却会把事实流
+    撑大。条数设上限，因为有些驱动的参数表很长，而事实流是要整份喂给裁判的。
+    """
+    out = {}
+    for key in sorted(args or {}):
+        value = args[key]
+        if isinstance(value, str) and value.strip():
+            out[key] = value[:80]
+        if len(out) >= limit:
+            break
+    # 一个都没有就返回 None，不是 `{}`。`_append` 丢掉 None，而一个空 dict 会留在事件
+    # 里 —— 读的人会以为「记了，是空的」，而实际是「这次调用里没有字符串参数」。
+    return out or None
