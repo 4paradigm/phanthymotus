@@ -516,3 +516,27 @@ def test_a_turn_that_ended_before_the_run_is_still_excluded(monkeypatch):
         'messages': [{'role': 'user', 'content': '上一场'}]}])
 
     assert asyncio.run(benchmark.run_timeline(run_id))['agent'] == []
+
+
+def test_a_turns_time_comes_from_when_it_was_written(monkeypatch):
+    """真机上排出过「第 11 轮 +-277189.7s」—— 三天前的时间戳。
+
+    一轮的行是会被**覆盖**的：agent-core 重启后 `_turns` 从上一个会话重新载入，轮号
+    从小往大重排，`save_turn` 撞上旧行就走 UPDATE —— `created_at` 停在几天前，内容
+    却是刚写的。最后写入的时刻才是这轮真正发生的时刻。
+    """
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?', ('s1', run_id))
+    conn.commit()
+
+    import chat_history
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': stored['started_at'] - 277189,        # 被覆盖的旧行
+        'updated_at': stored['started_at'] + 12,            # 真正写入的时刻
+        'messages': [{'role': 'assistant', 'content': '地图已加载。'}]}])
+
+    agent = asyncio.run(benchmark.run_timeline(run_id))['agent']
+
+    assert agent[0]['at'] == 12.0

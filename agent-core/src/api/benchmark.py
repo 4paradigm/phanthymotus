@@ -557,9 +557,16 @@ def _agent_track(session_id: str, started, ended) -> list:
                     fn = (call.get('function') or {})
                     calls.append({'name': str(fn.get('name', '')).split('__')[-1],
                                   'args': str(fn.get('arguments', ''))[:200]})
+        # 时间取 `updated_at`，不取 `created_at`。
+        #
+        # 一轮的行是会被**覆盖**的：agent-core 重启后 `_turns` 从上一个会话重新载入，
+        # 轮号从小往大重排，于是 `save_turn` 撞上几天前那一轮的行走了 UPDATE ——
+        # `created_at` 留在几天前，内容却是刚刚写的。真机上因此排出了「第 11 轮
+        # +-277189.7s」这种时间。最后写入的时刻才是这轮真正发生的时刻。
+        written = turn.get('updated_at') or at
         track.append({
             'turn': index,
-            'at': round(at - float(started), 1) if (started and at) else None,
+            'at': round(written - float(started), 1) if (started and written) else None,
             'trigger': trigger, 'says': says, 'calls': calls,
         })
     return track
