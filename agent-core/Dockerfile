@@ -72,13 +72,19 @@ COPY resource/memory/defaults/ /opt/defaults/memory/
 # 搜索路径 —— 缓存里没有它，链接器会退回去扫目录，`file` 照常能起来。末尾那句
 # `file --version` 就是当场证明这一点，而不是等模型在真机上撞（这个包本来就是那么
 # 加进来的）。
-RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
-    ln -s /bin/true /usr/sbin/ldconfig && \
+# `.real` 这个名字**已经被占了**：基础镜像里 /usr/sbin/ldconfig 是个 387 字节的包装
+# 脚本，真二进制在 /usr/sbin/ldconfig.real（/sbin 是 /usr/sbin 的符号链接，所以
+# /sbin/ldconfig.real 是同一个文件）。往那个名字上 mv 会**直接覆盖掉真二进制**，
+# 容器里从此再也跑不了 ldconfig —— 第一版就是这么干的，而当时加的 `file --version`
+# 照样通过，因为它验的不是被破坏的那一处。所以用一个不可能撞名的临时名字，
+# 并且在同一层里把 ldconfig 自己也验一遍。
+RUN cp -a /usr/sbin/ldconfig /tmp/ldconfig.masked-orig && \
+    ln -sf /bin/true /usr/sbin/ldconfig && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated file && \
     rm -rf /var/lib/apt/lists/* && \
-    rm /usr/sbin/ldconfig && mv /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
-    file --version
+    mv /tmp/ldconfig.masked-orig /usr/sbin/ldconfig && \
+    file --version && ldconfig --version
 
 ARG IMAGE_TAG=unknown
 ENV IMAGE_TAG=${IMAGE_TAG}
