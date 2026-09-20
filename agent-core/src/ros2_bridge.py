@@ -79,6 +79,24 @@ def _spin_loop() -> None:
         try:
             _executor.spin_once(timeout_sec=0.05)
         except Exception as e:
+            # 上下文没了就收工，不要接着敲。
+            #
+            # `rcl_shutdown()` 不一定是 `stop()` 调的 —— 别的组件（插件 teardown、
+            # 关机路径里的另一个模块）也会让 context 失效，而那时 `_running` 还是
+            # True。原来这里只是 sleep(0.1) 再试，于是变成每秒 10 次打印同一行
+            # `failed to create timer: the given context is not valid`，而 context
+            # 是不会自己变回有效的。天轶实测：每次关机刷 100 行左右，日志里累计 876 行。
+            #
+            # 判据用 `rclpy.ok()` 而不是匹配错误文本：文本是 rcl 的实现细节，会随
+            # 版本变；`ok()` 问的正是「这个 context 还能用吗」。
+            try:
+                context_dead = not rclpy.ok()
+            except Exception:
+                context_dead = True
+            if context_dead:
+                print('[ros2_bridge] rcl context is gone — spin loop exiting',
+                      file=sys.stderr, flush=True)
+                return
             print(f'[ros2_bridge] spin error: {e}', file=sys.stderr, flush=True)
             import time as _t
             _t.sleep(0.1)  # avoid tight loop on persistent errors

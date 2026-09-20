@@ -684,6 +684,16 @@ async def _do_ping(mcp_id: str) -> dict:
     tool_meta_map = {}
     split_map = {}
     tool_groups = {}
+    # The raw MCP inputSchema per tool, used by mcp_client for argument
+    # validation and for spotting `format: file` arguments to upload.
+    #
+    # The heartbeat has to compute this, not just preserve it. Merging alone
+    # (the previous commit) stopped it being *erased*, but then nothing ever
+    # refreshed it either: `needs_schemas` is false forever after the first
+    # `_connect_one`, so a driver that changes a tool's inputSchema would be
+    # validated against the old one until agent-core restarted. The churn this
+    # repo just removed had been accidentally serving as that refresh.
+    input_schemas = {}
     for tool in caps['tools']:
         tool_schemas = mcp_client._to_openai_schema(mcp_id, tool)
 
@@ -691,6 +701,7 @@ async def _do_ping(mcp_id: str) -> dict:
             schema = tool_schemas[0]
             schemas[schema['name']] = schema
             raw_input_schema = tool.get('inputSchema') or {}
+            input_schemas[schema['name']] = raw_input_schema
             action_enum = raw_input_schema.get('properties', {}).get('action', {}).get('enum')
             tool_meta_map[schema['name']] = {
                 'type': tool.get('type'),
@@ -703,6 +714,10 @@ async def _do_ping(mcp_id: str) -> dict:
             group = []
             for schema in tool_schemas:
                 schemas[schema['name']] = schema
+                # Split tools validate against the sub-schema's own parameters,
+                # matching what `_connect_one` stores for the same shape.
+                input_schemas[schema['name']] = schema.get(
+                    'parameters', {'type': 'object', 'properties': {}})
                 tool_meta_map[schema['name']] = {
                     'type': tool.get('type'),
                     'action_enum': None,
@@ -721,7 +736,25 @@ async def _do_ping(mcp_id: str) -> dict:
             if tool_name:
                 tool_groups[tool_name] = group
 
-    mcp_client.registry[mcp_id] = {
+    # Merge, never replace. This dict is what the heartbeat knows; anything it
+    # does not know about belongs to `mcp_client._connect_one` and must survive.
+    #
+    # Replacing it dropped `input_schemas` on every heartbeat, and twelve lines
+    # below, `needs_schemas` tests for exactly that key and re-runs
+    # `_connect_one` when it is missing. So every device rebuilt its whole
+    # connection — initialize, tools/list, SSE subscription — once per heartbeat,
+    # for as long as it was registered. The value `_connect_one` wrote never
+    # survived to the next tick.
+    #
+    # That self-sustaining loop is what made the leaked SSE task in #234 grow
+    # linearly: 120 heartbeats an hour, each leaking one immortal polling loop,
+    # each backing off to a 60s poll — +2 req/s per hour, which is the slope
+    # measured on Tianyi. Fixing the leak stopped the growth; this stops the
+    # churn that drove it, and lets an SSE stream actually stay open.
+    #
+    # This is the second key to go missing from this literal — `tool_meta` was
+    # the first. Merging retires the whole class rather than the instance.
+    mcp_client.registry.setdefault(mcp_id, {}).update({
         'name':        target.get('name', mcp_id),
         'url':         url,
         'online':      True,
@@ -732,7 +765,8 @@ async def _do_ping(mcp_id: str) -> dict:
         'split_map':   split_map,
         'tool_groups': tool_groups,
         'tool_definitions': caps['tools'],
-    }
+        'input_schemas': input_schemas,
+    })
 
     # Register system hooks from x-hooks declarations
     import hooks
@@ -748,10 +782,17 @@ async def _do_ping(mcp_id: str) -> dict:
     if not was_online:
         asyncio.create_task(_restore_saved_configs(mcp_id, url, caps['tools']))
 
-    # Populate mcp_client.registry with schemas for file upload interception and validation
-    # Call _connect_one if registry lacks input_schemas (e.g. after container restart, or first ping)
-    needs_schemas = not mcp_client.registry.get(mcp_id, {}).get('input_schemas')
-    if needs_schemas:
+    # Do a full connect the first time we see this device.
+    #
+    # The trigger is "have we ever connected", not "is `input_schemas` missing".
+    # That older test worked only because the heartbeat erased the key it then
+    # tested for — and now that the heartbeat fills it in a dozen lines above,
+    # the test would be false on the very first ping and `_connect_one` would
+    # never run at all. That matters beyond schemas: **`_connect_one` is the
+    # only thing that starts the SSE subscription**, so a device that registers
+    # by heartbeat alone would silently never get one, and its ACP completion
+    # events would have nowhere to arrive.
+    if not mcp_client.registry.get(mcp_id, {}).get('connected'):
         server_name = caps.get('server_name', mcp_id)
         asyncio.create_task(mcp_client._connect_one(mcp_id, server_name, url, render_hint))
 

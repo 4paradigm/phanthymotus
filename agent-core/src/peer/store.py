@@ -79,6 +79,10 @@ def upsert(peer_id: str, public_key_b64: str, display_name: str = '',
              json.dumps(endpoints or []), json.dumps(capabilities or []), now, now)
         )
         conn.commit()
+    # (重新)配对是「情况变了」的那一刻，所以别让上一轮的退避再拖十几分钟才恢复。
+    # 单向配对修好之后，人在界面上点完就该立刻看到对方上线。
+    from peer import backoff
+    backoff.reset(peer_id)
     return get(peer_id)
 
 
@@ -168,6 +172,62 @@ def delete(peer_id: str) -> bool:
         cur = conn.execute('DELETE FROM peers WHERE peer_id=?', (peer_id,))
         conn.commit()
         return cur.rowcount > 0
+
+
+# ── 审计 ──────────────────────────────────────────────────────────────────────
+
+# 保留多少条。配对关系的变更是罕见事件 —— 几百条就能覆盖一台机器整个生命周期，
+# 而无上限的表迟早会变成另一个需要有人去清的东西。
+AUDIT_MAX_ROWS = 500
+
+EVENT_PAIRED = 'paired'
+EVENT_UNPAIRED_LOCAL = 'unpaired_local'
+EVENT_UNPAIRED_BY_PEER = 'unpaired_by_peer'
+EVENT_ROLE_CHANGED = 'role_changed'
+
+
+def record_audit(peer_id: str, event: str, *, display_name: str = '',
+                 actor: str = '', detail: str = '') -> None:
+    """记一条 peer 关系变更。只增不改，失败不抛。
+
+    `peers` 表回答「现在是什么」，删掉一行之后那段关系就不再有任何痕迹。这张表
+    回答「发生过什么」—— 写它的直接理由是：有人在天轶上解除了和 Orin5 的配对，
+    一周后要查是谁、什么时候，`docker logs` 已经轮换过去，活动流只在内存里，
+    数据库里只剩一张空表，于是这个问题根本没有答案。
+
+    审计写失败绝不能让配对/解除本身失败：一条查不到的记录，远好过一次做不成的操作。
+    """
+    try:
+        with _conn() as conn:
+            conn.execute(
+                'INSERT INTO peer_audit (ts, peer_id, display_name, event, actor, detail) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (time.time(), peer_id, display_name or '', event, actor or '',
+                 str(detail or '')[:500]))
+            # 按 id 裁剪而不是按时间：id 是单调的，而 ts 来自 wall clock，机器上
+            # 时钟跳变过（G1 上的容器启动时间是 1970），按 ts 排序会留错行。
+            conn.execute(
+                'DELETE FROM peer_audit WHERE id <= '
+                '(SELECT MAX(id) FROM peer_audit) - ?', (AUDIT_MAX_ROWS,))
+            conn.commit()
+    except Exception as e:
+        print(f'[peer] audit write failed ({type(e).__name__}: {e}) — ignored')
+
+
+def list_audit(limit: int = 50, peer_id: str = '') -> list[dict]:
+    """最近的关系变更，最新在前。"""
+    limit = max(1, min(int(limit or 50), AUDIT_MAX_ROWS))
+    sql = ('SELECT ts, peer_id, display_name, event, actor, detail FROM peer_audit')
+    args: list = []
+    if peer_id:
+        sql += ' WHERE peer_id=?'
+        args.append(peer_id)
+    sql += ' ORDER BY id DESC LIMIT ?'
+    args.append(limit)
+    with _conn() as conn:
+        rows = conn.execute(sql, tuple(args)).fetchall()
+    return [{'ts': r[0], 'peer_id': r[1], 'display_name': r[2],
+             'event': r[3], 'actor': r[4], 'detail': r[5]} for r in rows]
 
 
 def public_key_bytes(peer_id: str) -> bytes | None:

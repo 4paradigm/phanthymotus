@@ -84,3 +84,21 @@ Bundle，检查公开工具恰为 vla、导航配置关闭、导航不可导入�
 同一 nav_id，已有语义调用及 planner 终态测试覆盖，不按错误推断改写任务身份。
 构建基线重复意见沿用固定 digest 与实际层增量证据。此轮只扩展 Core 内部格式
 识别，消息契约和用户操作不变，现有 README/接口说明无需变更；未部署或真机验收。
+
+## 2026-09-20 上游冲突处理
+
+从已验收代码 14578fd 合并 upstream/main 7be9332，更新现有 PR #141。
+冲突范围为 ActuCore main 的退出清理、Core mcp_manage 注册刷新和 mcp_client SSE 管理；
+保留导航 topic-actions、完成协议与宿主清理，同时保留上游 schema 隔离、心跳刷新、
+SSE task 去重和 spin join。检查自动合并的 ROS 桥及资源仲裁。
+执行 Core、ActuCore、Web 现有测试及合并边界验证，再提交并推送当前 PR 分支。
+不修改两项明确暂缓问题，不部署、不驱动机器人；上海验收仅覆盖原 14578fd。
+README 与操作说明按实际契约复核；本轮不改变公开接口和部署方式。
+
+验证结果：Core 1095 passed / 1 deselected / 11 subtests（临时 DB，沿用已确认的
+test_progress_stream 排除项，该文件本轮无改动）；ActuCore 435 passed / 2 skipped /
+70 subtests；Web 45 passed。新增真实心跳入口保留导航定义且不重复连接的测试、
+main 退出顺序正常/未确认停止两条测试。上游 schema 隔离测试复用现有 ROS 替身，
+避免漏掉 InvalidHandle 导入并隔离全局模块。git diff --check 通过。
+本轮未构建镜像、未部署、未进行更新后真机验收；README、CONTRIBUTING 与既有
+导航接口/操作说明不受本次内部生命周期合并影响，无需修改。

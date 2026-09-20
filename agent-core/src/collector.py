@@ -579,6 +579,10 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
             max_rounds=10,
             timeout_s=3600,
             context_seed=message,
+            # 这个 agent 的交付物就是判断本身 —— 它被 tool_deny 挡掉了所有会动的
+            # 工具（上一行），能做的只有 subagent_report / subagent_finish。所以
+            # 「只调用了记账类工具」对它是正常完成，不是「报告成功却没干活」。
+            deliverable='report',
         )
         await _manager_instance.spawn(spec)
 
@@ -732,7 +736,18 @@ async def _bg_trigger_loop():
         # 只在 buffer 含有实质性传感器数据时才路由到 bg subagent
         if not _bg_buffer_has_substance(batch):
             continue
-        await _route_to_bg_subagent(batch)
+        try:
+            await _route_to_bg_subagent(batch)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # 一个坏批次不能把整个后台监控打死。这个 task 是 ensure_future 出来的、
+            # 没有人 await，所以异常逃出 while True 之后只会在日志里留一行
+            # "Task exception was never retrieved"，而传感器路由就此永久停摆 ——
+            # 从外面看和"最近没有传感器事件"一模一样。天轶上 `get_recent_context_rich`
+            # 的 TypeError 就是这样让后台静默了 40 分钟，直到容器重启。
+            print(f'[collector] bg routing failed, skipping this batch '
+                  f'({type(e).__name__}: {e})')
 
 
 def start():

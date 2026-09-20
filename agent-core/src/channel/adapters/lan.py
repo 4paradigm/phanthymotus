@@ -131,11 +131,17 @@ class LanAdapter(ChannelAdapter):
         return 'degraded' if self._last_error else 'connected'
 
     async def ping(self, peer_id: str) -> tuple[bool, str]:
+        from peer import backoff
         from peer.registry import registry
+        # 探活是后台轮询，和 dds_state 的状态推送一样受退避约束 —— 一个已经明确
+        # 拒绝我们的 peer，再探多少次也还是 403。真正要发消息时不走这条路。
+        if backoff.should_skip(peer_id):
+            return False, 'peer rejected us recently; backing off'
         endpoints = registry.endpoints_for(peer_id)
         result, err = await transport.post_json(
             endpoints, INBOX_PING_PATH, {'channel_id': self.channel_id}, timeout=5.0
         )
+        backoff.note_result(peer_id, result is not None, err)
         if result is None:
             return False, err
         store.touch(peer_id)

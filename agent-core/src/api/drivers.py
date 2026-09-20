@@ -488,7 +488,22 @@ def _deploy_sync_legacy(driver: dict) -> dict:
         name=name,
         hostname=ros_hostname,
         remove=False,
-        restart_policy={'Name': 'unless-stopped'},
+        # `always`, not `unless-stopped`. This is the path most containers on a
+        # robot are actually created by — the console deploys them here, not
+        # from a compose file — so it decides whether the robot comes back after
+        # a reboot.
+        #
+        # G1 came up from one with every container still exited. Somebody had to
+        # SSH in and start them, and until they did the robot was simply gone,
+        # with nothing to distinguish that from a broken deployment.
+        # `unless-stopped` will not start a container that was already stopped
+        # when the daemon went down, which is exactly the state a reboot leaves
+        # them in.
+        #
+        # The cost is that a container stopped by hand also returns after a
+        # reboot. On these machines that is the lesser surprise: "should be
+        # running and isn't" is both more likely and more expensive.
+        restart_policy={'Name': 'always'},
     )
 
     # Second consumer of the `-jetson` tag suffix, alongside hostarch.py /

@@ -56,6 +56,10 @@ log = logging.getLogger(__name__)
 # than through the library so that capabilities are available before torch is
 # imported at all.
 CONFIG_FILE = "config.json"
+# The preprocessor pipeline LeRobot writes beside the weights. It carries a
+# *second*, independent reference to the backbone — the tokenizer's — and
+# staging the weights does not fix it. See `_write_resolved_config`.
+PREPROCESSOR_FILE = "policy_preprocessor.json"
 
 
 class SmolVLAProvider:
@@ -77,7 +81,9 @@ class SmolVLAProvider:
         feature_map    {our observation name: the policy's input key}, e.g.
                        {"main": "observation.images.top", "state":
                        "observation.state"}
-        chunk_size     override the checkpoint's action horizon
+
+    Note there is no `chunk_size` key here: the action horizon comes from the
+    checkpoint and nothing else. See `_chunk_size`.
     """
 
     def __init__(self, descriptor: dict, config: dict | None = None,
@@ -97,14 +103,22 @@ class SmolVLAProvider:
         self._feature_map = dict(entry.get("feature_map")
                                  or config.get("feature_map") or {})
         self._weights = entry.get("weights") or config.get("weights") or {}
+        # Which dataset's statistics un-normalise the action. Only needed by a
+        # checkpoint whose statistics are grouped per dataset — see
+        # `_select_stats`, which refuses to load rather than guess.
+        self._unnorm_key = str(entry.get("unnorm_key")
+                               or config.get("unnorm_key") or "").strip()
         self._vlm_dir = config.get("vlm_dir") or "/models/vla/smolvlm2_500m"
         self._vlm_weights = config.get("vlm_weights") or {}
-        self._chunk_override = config.get("chunk_size")
         # Set by _ensure_backbone when the checkpoint has to be presented with a
         # local backbone path; None means load straight from model_dir.
         self._resolve_dir = None
 
         self._policy = None
+        # The checkpoint's own pipelines. Not optional decoration: the policy
+        # cannot be called without them (see `infer`).
+        self._preprocessor = None
+        self._postprocessor = None
         self._error = ""
         # Where the card's status line comes from while weights are moving.
         # These are the largest downloads anywhere in the system — a SmolVLA
@@ -151,12 +165,28 @@ class SmolVLAProvider:
         }
 
     def infer(self, observation=None, inference_delay: int = 0) -> list:
+        """One chunk, in the arm's units.
+
+        The two pipeline calls are not optional plumbing, and leaving them out
+        fails in two different ways — one loud, one silent, which is the
+        dangerous one:
+
+          `preprocessor` normalizes the observation **and tokenizes the task
+          string**. SmolVLA reads `observation.language.tokens`, not `task`, so
+          without this the call raises `KeyError` on every inference.
+
+          `postprocessor` unnormalizes the action. Without it the chunk is in
+          the policy's normalized space while everything downstream — the
+          descriptor, the limits, the arm — reads radians. Negotiation passes,
+          the message validates, and the numbers are simply wrong.
+        """
         policy = self._policy
-        if policy is None:
+        preprocessor, postprocessor = self._preprocessor, self._postprocessor
+        if policy is None or preprocessor is None or postprocessor is None:
             raise RuntimeError(self._error or "weights are still loading")
 
-        batch = self._batch(observation)
-        chunk = self._predict(policy, batch)
+        batch = preprocessor(self._batch(observation))
+        chunk = self._predict(policy, batch, postprocessor)
         return [[float(v) for v in step] for step in chunk]
 
     def health(self) -> bool:
@@ -166,6 +196,7 @@ class SmolVLAProvider:
         with self._lock:
             self._closed = True
             policy, self._policy = self._policy, None
+            self._preprocessor = self._postprocessor = None
         if policy is None:
             return
         del policy
@@ -285,38 +316,93 @@ class SmolVLAProvider:
         """
         config = self._read_config()
         backbone = config.get("vlm_model_name") or ""
-        if not backbone or os.path.isdir(backbone):
-            return                                  # already local, or none named
+        if backbone and os.path.isdir(backbone):
+            # Already a local path, so there is nothing to stage — but do not
+            # return here. The preprocessor names the backbone a *second* time
+            # and that copy is the one that actually broke the robot.
+            self._vlm_dir = backbone
+        elif backbone:
+            manifest = self._vlm_weights
+            base_url, files = manifest.get("base_url"), manifest.get("files")
+            if os.path.exists(os.path.join(self._vlm_dir, CONFIG_FILE)):
+                pass
+            elif base_url and files:
+                from model_downloader import ensure_verified_bundle
+                from model_progress import fetch_status
 
-        manifest = self._vlm_weights
-        base_url, files = manifest.get("base_url"), manifest.get("files")
-        if os.path.exists(os.path.join(self._vlm_dir, CONFIG_FILE)):
-            pass
-        elif base_url and files:
-            from model_downloader import ensure_verified_bundle
-            from model_progress import fetch_status
+                # Named after the backbone, not the checkpoint: the two are
+                # separate downloads and one shared label would read as a
+                # restart at 0%.
+                progress_cb, _ = fetch_status(self._on_status,
+                                              backbone.split("/")[-1])
+                ensure_verified_bundle("vla-smolvla-backbone", self._vlm_dir,
+                                       base_url, files, progress_cb=progress_cb)
+            else:
+                raise FileNotFoundError(
+                    f"this checkpoint needs the {backbone!r} backbone, which "
+                    f"LeRobot would fetch from HuggingFace at load time — "
+                    f"unreachable from a robot. Stage it on COS the way the "
+                    f"policy weights are staged and configure `vlm_weights`, "
+                    f"or put it at {self._vlm_dir}."
+                )
 
-            # Named after the backbone, not the checkpoint: the two are separate
-            # downloads and one shared label would read as a restart at 0%.
-            progress_cb, _ = fetch_status(self._on_status, backbone.split("/")[-1])
-            ensure_verified_bundle("vla-smolvla-backbone", self._vlm_dir,
-                                   base_url, files, progress_cb=progress_cb)
-        else:
-            raise FileNotFoundError(
-                f"this checkpoint needs the {backbone!r} backbone, which LeRobot "
-                f"would fetch from HuggingFace at load time — unreachable from a "
-                f"robot. Stage it on COS the way the policy weights are staged "
-                f"and configure `vlm_weights`, or put it at {self._vlm_dir}."
-            )
-        self._resolve_dir = self._write_resolved_config(config)
+        if self._names_remote(config):
+            self._resolve_dir = self._write_resolved_config(config)
+
+    def _names_remote(self, config: dict) -> bool:
+        """Does anything in this checkpoint still name a hub id?
+
+        Two places do, independently, and staging the weights fixes neither on
+        its own — which is why this asks about both rather than inferring one
+        from the other.
+        """
+        backbone = config.get("vlm_model_name") or ""
+        if backbone and not os.path.isdir(backbone):
+            return True
+        tokenizer = self._preprocessor_tokenizer()
+        return bool(tokenizer and not os.path.isdir(tokenizer))
+
+    def _preprocessor_tokenizer(self) -> str:
+        """Whatever the preprocessor pipeline will try to load a tokenizer from."""
+        for step in (self._read_preprocessor().get("steps") or []):
+            if step.get("registry_name") == "tokenizer_processor":
+                return str((step.get("config") or {}).get("tokenizer_name") or "")
+        return ""
+
+    def _read_preprocessor(self) -> dict:
+        """The staged preprocessor pipeline, or {} — absent is a valid layout."""
+        path = os.path.join(self._model_dir, PREPROCESSOR_FILE)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:               # noqa: BLE001
+            return {}
 
     def _write_resolved_config(self, config: dict) -> str:
-        """A load-time view of the checkpoint whose backbone path is local.
+        """A load-time view of the checkpoint with every hub id made local.
+
+        **Two files name the backbone, not one.** `config.json` names it for the
+        policy, and `policy_preprocessor.json` names it again for the tokenizer
+        step. Rewriting only the first gets the weights to load and then fails
+        the moment the pipeline is built:
+
+            ValueError: Failed to instantiate processor step
+            'tokenizer_processor' ... We couldn't connect to
+            'https://huggingface.co'
+
+        which reads like a weights problem and is not one. Both are rewritten
+        here for the same reason and in the same place, so neither can be fixed
+        without the other.
 
         Hard links rather than copies for the weights: a second 900 MB file on a
-        57 GB eMMC for the sake of one edited JSON field is not a trade worth
+        57 GB eMMC for the sake of two edited JSON fields is not a trade worth
         making. Falls back to a copy across filesystems.
         """
+        preprocessor = self._read_preprocessor()
+        # Everything rewritten below must be excluded from the linking pass, or
+        # the link wins and the edit is never written.
+        rewritten = {CONFIG_FILE} | ({PREPROCESSOR_FILE} if preprocessor else set())
+
         resolved = os.path.join(self._model_dir, ".resolved")
         os.makedirs(resolved, exist_ok=True)
         for name in os.listdir(self._model_dir):
@@ -324,16 +410,48 @@ class SmolVLAProvider:
                 continue
             source = os.path.join(self._model_dir, name)
             target = os.path.join(resolved, name)
-            if name == CONFIG_FILE or os.path.exists(target):
+            if name in rewritten or os.path.exists(target):
+                continue
+            if os.path.isdir(source):
+                # A checkpoint is a flat directory of files, but nothing stops
+                # one from carrying a subdirectory, and neither os.link nor
+                # shutil.copy2 takes one — the load would die on IsADirectoryError
+                # while the weights beside it were perfectly fine.
                 continue
             try:
                 os.link(source, target)
             except OSError:
                 import shutil
                 shutil.copy2(source, target)
-        with open(os.path.join(resolved, CONFIG_FILE), "w", encoding="utf-8") as handle:
-            json.dump({**config, "vlm_model_name": self._vlm_dir}, handle)
+
+        self._write_sidecar(resolved, CONFIG_FILE,
+                            {**config, "vlm_model_name": self._vlm_dir})
+
+        if preprocessor:
+            for step in preprocessor.get("steps") or []:
+                if step.get("registry_name") != "tokenizer_processor":
+                    continue
+                step.setdefault("config", {})["tokenizer_name"] = self._vlm_dir
+            self._write_sidecar(resolved, PREPROCESSOR_FILE, preprocessor)
         return resolved
+
+    @staticmethod
+    def _write_sidecar(resolved: str, name: str, document: dict):
+        """Write one rewritten file, replacing rather than opening any link.
+
+        **Unlinking first is the whole point.** An earlier version of this file
+        rewrote only `config.json`, so every other file — the preprocessor
+        included — is already a *hard link* to the pinned original in every
+        checkpoint staged before this change. `open(..., "w")` on a hard link
+        truncates the shared inode, which would destroy the very file whose
+        SHA256 proves the download is intact, and it would do so on the first
+        load after an upgrade.
+        """
+        path = os.path.join(resolved, name)
+        if os.path.exists(path):
+            os.unlink(path)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
 
     def _read_config(self) -> dict:
         path = os.path.join(self._model_dir, CONFIG_FILE)
@@ -350,7 +468,7 @@ class SmolVLAProvider:
     def _load(self):
         """Background weight load. Failures are recorded, never raised here."""
         try:
-            policy = self._build_policy()
+            policy, preprocessor, postprocessor = self._build_policy()
         except Exception as error:      # noqa: BLE001 — reported via health()
             self._error = f"{type(error).__name__}: {error}"
             log.warning("smolvla provider failed to load: %s", self._error)
@@ -359,23 +477,123 @@ class SmolVLAProvider:
             if self._closed:            # stopped while we were loading
                 return
             self._policy = policy
+            self._preprocessor = preprocessor
+            self._postprocessor = postprocessor
         log.info("smolvla provider ready: %s on %s",
                  self._config.get("type"), self._device)
 
     def _build_policy(self):
-        """Construct the LeRobot policy. The one version-sensitive call here.
+        """Construct the LeRobot policy and the two pipelines that feed it.
 
-        Kept to a couple of lines on purpose: everything else in this file works
+        Kept to a few lines on purpose: everything else in this file works
         against plain dicts and is tested without torch, so when LeRobot's API
         moves this is the only thing to fix.
+
+        `device_processor` is overridden rather than rewritten into the staged
+        JSON, because the checkpoint hardcodes `cuda` and the device is decided
+        at load time — `_resolved_device` falls back to cpu when there is no
+        GPU, and a staged file would contradict it.
         """
-        from lerobot.policies.factory import make_policy_config  # noqa: F401
+        from lerobot.policies.factory import make_pre_post_processors
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
-        policy = SmolVLAPolicy.from_pretrained(self._resolve_dir or self._model_dir)
-        policy.to(self._resolved_device())
+        source = self._resolve_dir or self._model_dir
+        device = self._resolved_device()
+        policy = SmolVLAPolicy.from_pretrained(source)
+        policy.to(device)
         policy.eval()
-        return policy
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy.config, pretrained_path=source,
+            preprocessor_overrides={"device_processor": {"device": device}})
+        self._apply_norm_stats(preprocessor, postprocessor)
+        return policy, preprocessor, postprocessor
+
+    def _apply_norm_stats(self, *pipelines) -> None:
+        """Point the normalizer steps at one dataset's statistics.
+
+        A no-op for a checkpoint whose statistics are already keyed `action`.
+        Split from `_select_stats` because only these four lines touch LeRobot:
+        the decision is a dict transform and is tested without the library.
+
+        The tensor cache is the part that is easy to miss. `NormalizerProcessorStep`
+        converts `stats` into `_tensor_stats` in `__post_init__`, and `__call__`
+        reads **only** the latter — so assigning `step.stats` alone changes
+        nothing at all, silently, and the un-normalisation stays an identity.
+        """
+        from lerobot.processor.normalize_processor import to_tensor
+
+        for pipeline in pipelines:
+            for step in getattr(pipeline, "steps", []):
+                chosen = self._select_stats(getattr(step, "stats", None), self._unnorm_key)
+                if chosen is None:
+                    continue
+                step.stats = chosen
+                step._tensor_stats = to_tensor(      # noqa: SLF001
+                    chosen, device=step.device, dtype=step.dtype)
+                log.info("smolvla norm stats: using %r → keys %s",
+                         self._unnorm_key, sorted(chosen))
+
+    @staticmethod
+    def _select_stats(stats: dict | None, unnorm_key: str) -> dict | None:
+        """One dataset's statistics, keyed the way the pipeline looks them up.
+
+        Returns None when there is nothing to do — no stats, or already keyed
+        `action`, which is what a checkpoint fine-tuned on one robot looks like.
+
+        ── Why this has to exist ────────────────────────────────────────────
+        `smolvla_base` is a **multi-dataset pretrained base**. Its statistics
+        are grouped by the dataset they came from:
+
+            so100.buffer.action / so100-blue.buffer.action / so100-red.buffer.action
+
+        and the pipeline looks up plain `action`. A miss is not an error in
+        LeRobot: the step simply passes the tensor through. So the policy's
+        normalised output — roughly ±1 — is handed to the descriptor, the
+        limits and the arm, all of which read degrees. Negotiation passes, the
+        message validates, the numbers are wrong by two orders of magnitude,
+        and nothing is logged.
+
+        Measured on Tianyi 2026-09-20, before this fix: the card's output was
+        |max| ≈ 0.9 while `so100`'s own statistics are mean ∈ [-27, 120],
+        std ∈ [19, 59]. Commanding an arm whose joints span tens of degrees to
+        a target near zero is not "a smaller motion" — it drives it to a limit.
+
+        ── Why refusing is the right failure ────────────────────────────────
+        There is no safe default. Picking the wrong group yields well-formed
+        actions of the wrong magnitude, which is exactly the failure this whole
+        negotiation path exists to prevent, so an unset key refuses to load and
+        the card reports the error instead of driving anything.
+
+        This is the same decision OpenVLA calls `unnorm_key`, and the cloud
+        runtime (`phanthymotus-cloud`, runtimes/smolvla) makes it under that
+        same name. The two were compared on the same checkpoint and the same
+        inputs: with the key applied, their sampled action distributions agree
+        to 0.35 of the sampling spread. Without it, one of them is in a
+        different space entirely.
+        """
+        import re
+
+        if not stats or "action" in stats:
+            return None
+        groups = sorted({key.split(".")[0] for key in stats})
+        if not unnorm_key:
+            raise ValueError(
+                f"this checkpoint's normalisation statistics are grouped per "
+                f"dataset ({', '.join(groups)}) and none is named `action`: it is "
+                f"a pretrained base, not a model that can drive an arm as-is. Set "
+                f"`unnorm_key` to one of them, or register a checkpoint fine-tuned "
+                f"on your own data. Left unset, un-normalisation silently becomes "
+                f"an identity: the actions are well-formed and off by two orders "
+                f"of magnitude."
+            )
+        if unnorm_key not in groups:
+            raise ValueError(
+                f"unnorm_key={unnorm_key!r} is not in this checkpoint. "
+                f"Available: {', '.join(groups)}"
+            )
+        prefix = re.compile(rf"^{re.escape(unnorm_key)}\.(?:buffer\.)?")
+        return {prefix.sub("", key): value
+                for key, value in stats.items() if key.startswith(unnorm_key + ".")}
 
     def _resolved_device(self) -> str:
         if self._device != "cuda":
@@ -433,12 +651,16 @@ class SmolVLAProvider:
         return batch
 
     @staticmethod
-    def _predict(policy, batch) -> list:
+    def _predict(policy, batch, postprocessor) -> list:
         """One chunk out of the policy. The second version-sensitive call.
 
         `predict_action_chunk` is what LeRobot's async and RTC paths use;
         `select_action` is the single-step fallback for a policy that has no
         chunk method, wrapped so the caller always sees a chunk.
+
+        The postprocessor runs before the tensor leaves the GPU, and before the
+        shape is normalized: it is part of producing the action, not a
+        formatting step applied to one.
         """
         import torch
 
@@ -448,6 +670,7 @@ class SmolVLAProvider:
             else:
                 chunk = policy.select_action(batch)
 
+        chunk = postprocessor(chunk)
         chunk = chunk.detach().to("cpu")
         # (B, T, D) → (T, D); (T, D) stays; (D,) becomes one step.
         if chunk.ndim == 3:
@@ -475,8 +698,14 @@ class SmolVLAProvider:
         return None
 
     def _chunk_size(self):
-        if self._chunk_override:
-            return int(self._chunk_override)
+        """The checkpoint's action horizon, and only ever the checkpoint's.
+
+        Deliberately not overridable from config. `chunk_size` is also the
+        *mock* provider's tuning knob — config.yaml sets it to 10 for the sine
+        generator — and the config dict handed to a provider is flat and shared
+        by all of them. Reading it here let the mock's knob silently replace the
+        real horizon: smolvla_base returns chunks of 50 and advertised 10.
+        """
         for key in ("n_action_steps", "chunk_size", "horizon"):
             value = self._config.get(key)
             if isinstance(value, int) and value > 0:

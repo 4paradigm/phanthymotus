@@ -9,6 +9,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 
 # Fix Python "dual module" bug: start.py runs as __main__, but other modules
 # `import start` which creates a SEPARATE module instance with its own globals.
@@ -911,6 +912,76 @@ if __name__ == '__main__':
 
     logging.getLogger('uvicorn.error').addFilter(_SSLCloseFilter())
     logging.getLogger('asyncio').addFilter(_SSLCloseFilter())
+
+    # Drop the dashboard's own polling from the access log.
+    #
+    # An open dashboard re-asks these four every second or two, and on a robot
+    # that has been up for an hour they are half of every line in
+    # `docker logs`. That is not a cosmetic complaint: chasing the LLM 400s on
+    # Tianyi meant reading around 15209 peer 403s and several hundred of these
+    # to find eight lines that mattered.
+    #
+    # **Only successful polls of known paths are dropped.** Anything 4xx/5xx
+    # stays, every other path stays, and every non-access logger is untouched —
+    # a filter that hid a failing request would cost more than the noise does.
+    _QUIET_POLLS = (
+        'GET /api/mcp ',
+        'GET /api/topics/status ',
+        'GET /api/canvas/edit-status',
+        'GET /api/deploying ',
+        'GET /api/auth/verify ',
+        'POST /api/mcp ',            # driver/perception registration heartbeat
+        'POST /api/hooks/fire ',
+    )
+
+    # How often to report what was suppressed, and from where.
+    _SUPPRESSED_REPORT_S = 600.0
+
+    class _AccessPollFilter(logging.Filter):
+        """Drop successful polls, but never drop the *fact* that they happened.
+
+        Suppressing them outright would have cost this project a real find: the
+        leaked SSE subscription in #234 was spotted only because the driver
+        logged every request, and the giveaway was the shape of the volume —
+        39k, 53k, 60k, 67k, 74k per hour, climbing. Filter that away and a
+        runaway client becomes invisible, which is a worse failure than the
+        noise it removes.
+
+        So the lines go and the count stays. Every ten minutes it prints how
+        many were suppressed and the three busiest paths; a number that keeps
+        growing is the same signal the raw lines carried, at 1/1000th the size.
+        """
+
+        def __init__(self):
+            super().__init__()
+            self._counts: dict[str, int] = {}
+            self._last_report = time.monotonic()
+
+        def _maybe_report(self):
+            now = time.monotonic()
+            if now - self._last_report < _SUPPRESSED_REPORT_S or not self._counts:
+                return
+            window = now - self._last_report
+            self._last_report = now
+            total = sum(self._counts.values())
+            top = sorted(self._counts.items(), key=lambda kv: -kv[1])[:3]
+            self._counts = {}
+            detail = ', '.join(f'{p.strip()}×{n}' for p, n in top)
+            print(f'[access] suppressed {total} successful polls in '
+                  f'{window / 60:.0f} min ({total / window:.1f}/s): {detail}')
+
+        def filter(self, record):
+            msg = record.getMessage()
+            if '" 2' not in msg and '" 3' not in msg:
+                return True          # not a 2xx/3xx — always keep
+            hit = next((p for p in _QUIET_POLLS if p in msg), None)
+            if hit is None:
+                return True
+            self._counts[hit] = self._counts.get(hit, 0) + 1
+            self._maybe_report()
+            return False
+
+    logging.getLogger('uvicorn.access').addFilter(_AccessPollFilter())
 
     cert_file, key_file = _ensure_ssl_certs()
     uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None,

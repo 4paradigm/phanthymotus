@@ -125,7 +125,17 @@ async def refresh_one(peer: dict) -> int:
             entry['online'] = False
         return 0
 
+    from peer import backoff
+    # 同 dds_state / lan.ping：被明确拒绝过就先不问。保持已注册的工具不动 —— 「现在
+    # 问不到」不等于「它什么都不提供」，这和下面 endpoints 为空时的处理是同一个理由。
+    if backoff.should_skip(peer_id):
+        entry = mcp_client.registry.get(mcp_id)
+        if entry:
+            entry['online'] = False
+        return 0
+
     resp, reason = await transport.get_json(endpoints, '/api/peer/tools/list', timeout=8)
+    backoff.note_result(peer_id, resp is not None, reason)
     if resp is None:
         entry = mcp_client.registry.get(mcp_id)
         if entry:

@@ -26,6 +26,7 @@ Run: cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/tes
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import types
@@ -123,8 +124,18 @@ def test_rtc_is_not_claimed(checkpoint):
     assert make_provider(checkpoint).capabilities()["supports_rtc"] is False
 
 
-def test_chunk_size_can_be_overridden(checkpoint):
-    assert make_provider(checkpoint, chunk_size=8).capabilities()["chunk_size"] == 8
+def test_the_mocks_chunk_size_does_not_leak_into_this_provider(checkpoint):
+    """`chunk_size` belongs to the mock, and the config dict is shared.
+
+    config.yaml sets `chunk_size: 10` under the *mock* provider's section, but
+    every provider is handed the same flat dict. This provider used to read the
+    key as an override, so the sine generator's tuning knob silently replaced
+    the checkpoint's real horizon — smolvla_base returns chunks of 50 and
+    advertised 10, which is the number an operator sizes a rate against.
+    """
+    provider = make_provider(checkpoint, chunk_size=10)
+
+    assert provider.capabilities()["chunk_size"] == 50   # the checkpoint's own
 
 
 def test_a_checkpoint_without_an_action_feature_reports_no_dimension(checkpoint):
@@ -257,6 +268,12 @@ class _FakeTensor:
         return _FakeTensor([self.value])
 
 
+def _identity(chunk):
+    """A postprocessor that changes nothing — for the shape tests, which are
+    about shape. The one test that cares about unnormalizing passes its own."""
+    return chunk
+
+
 def _depth(value):
     depth = 0
     while isinstance(value, list):
@@ -354,14 +371,209 @@ def test_every_chunk_shape_becomes_a_list_of_steps(returned, expected, fake_torc
     policy = types.SimpleNamespace(
         predict_action_chunk=lambda batch: _FakeTensor(returned))
 
-    assert SmolVLAProvider._predict(policy, {}) == expected
+    assert SmolVLAProvider._predict(policy, {}, _identity) == expected
 
 
 def test_a_policy_without_a_chunk_method_falls_back_to_single_step(fake_torch):
     policy = types.SimpleNamespace(
         select_action=lambda batch: _FakeTensor([0.5, 0.6]))
 
-    assert SmolVLAProvider._predict(policy, {}) == [[0.5, 0.6]]
+    assert SmolVLAProvider._predict(policy, {}, _identity) == [[0.5, 0.6]]
+
+
+def test_the_chunk_is_unnormalized_before_it_is_read(fake_torch):
+    """The postprocessor is part of producing the action, not formatting it.
+
+    Skipping it leaves the chunk in the policy's normalized space while the
+    descriptor, the limits and the arm all read radians — a failure that
+    negotiates fine, validates fine, and moves the arm to the wrong place.
+    """
+    policy = types.SimpleNamespace(
+        predict_action_chunk=lambda batch: _FakeTensor([[1.0, 2.0]]))
+    unnormalize = lambda chunk: _FakeTensor([[v * 10 for v in chunk.value[0]]])
+
+    assert SmolVLAProvider._predict(policy, {}, unnormalize) == [[10.0, 20.0]]
+
+
+# ── the two places a checkpoint names its backbone ───────────────────────────
+
+HUB_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+
+
+@pytest.fixture
+def staged_backbone(tmp_path_factory):
+    """A local copy of the VLM, as model_downloader would leave it.
+
+    Its own temp root, not a child of the checkpoint: on a robot the two are
+    siblings under /models/vla, and nesting it would have the resolve pass walk
+    into it.
+    """
+    backbone = tmp_path_factory.mktemp("backbone") / "smolvlm2_500m"
+    backbone.mkdir()
+    (backbone / "config.json").write_text("{}")
+    (backbone / "tokenizer.json").write_text("{}")
+    return backbone
+
+
+def _write_checkpoint(checkpoint, *, vlm_model_name, tokenizer_name):
+    (checkpoint / "config.json").write_text(json.dumps(
+        {**CHECKPOINT_CONFIG, "vlm_model_name": vlm_model_name}))
+    (checkpoint / "policy_preprocessor.json").write_text(json.dumps({
+        "name": "policy_preprocessor",
+        "steps": [
+            {"registry_name": "to_batch_processor", "config": {}},
+            {"registry_name": "tokenizer_processor",
+             "config": {"task_key": "task", "tokenizer_name": tokenizer_name}},
+        ],
+    }))
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+
+
+def _staged_tokenizer(resolve_dir):
+    written = json.loads(
+        (pathlib.Path(resolve_dir) / "policy_preprocessor.json").read_text())
+    step = next(s for s in written["steps"]
+                if s["registry_name"] == "tokenizer_processor")
+    return step["config"]["tokenizer_name"]
+
+
+def test_the_tokenizer_is_redirected_at_the_local_backbone(checkpoint,
+                                                           staged_backbone):
+    """The bug that made local inference impossible on a robot.
+
+    Rewriting only `config.json` gets the *weights* to load and then fails when
+    the preprocessor pipeline is built, because the tokenizer step names the hub
+    id separately. On a robot that is an OSError against huggingface.co, raised
+    after everything looked correctly staged.
+    """
+    _write_checkpoint(checkpoint, vlm_model_name=HUB_ID, tokenizer_name=HUB_ID)
+
+    provider = make_provider(checkpoint, vlm_dir=str(staged_backbone))
+    resolved = pathlib.Path(provider._resolve_dir)
+
+    assert _staged_tokenizer(resolved) == str(staged_backbone)
+    assert json.loads((resolved / "config.json").read_text())[
+        "vlm_model_name"] == str(staged_backbone)
+
+
+def test_a_local_policy_config_does_not_excuse_a_remote_tokenizer(checkpoint,
+                                                                  staged_backbone):
+    """`vlm_model_name` already being a path used to mean "nothing to do".
+
+    It does not: the tokenizer is named independently and can still be a hub id,
+    so the early return skipped the rewrite that was actually needed.
+    """
+    _write_checkpoint(checkpoint, vlm_model_name=str(staged_backbone),
+                      tokenizer_name=HUB_ID)
+
+    provider = make_provider(checkpoint, vlm_dir="/nowhere")
+
+    assert _staged_tokenizer(provider._resolve_dir) == str(staged_backbone)
+
+
+def test_a_fully_local_checkpoint_is_loaded_where_it_lies(checkpoint,
+                                                          staged_backbone):
+    """Nothing remote is named, so there is nothing to stage a copy of."""
+    _write_checkpoint(checkpoint, vlm_model_name=str(staged_backbone),
+                      tokenizer_name=str(staged_backbone))
+
+    assert make_provider(checkpoint, vlm_dir=str(staged_backbone))._resolve_dir is None
+
+
+def test_the_rewrite_leaves_the_pinned_originals_alone(checkpoint,
+                                                       staged_backbone):
+    """The originals are verified by SHA256; editing one invalidates the manifest
+    that proves the weights are the weights. The edit goes to the sidecar."""
+    _write_checkpoint(checkpoint, vlm_model_name=HUB_ID, tokenizer_name=HUB_ID)
+
+    resolved = pathlib.Path(
+        make_provider(checkpoint, vlm_dir=str(staged_backbone))._resolve_dir)
+    original = json.loads((checkpoint / "policy_preprocessor.json").read_text())
+
+    assert next(s for s in original["steps"]
+                if s["registry_name"] == "tokenizer_processor"
+                )["config"]["tokenizer_name"] == HUB_ID
+    assert (resolved / "model.safetensors").exists()    # weights still linked
+
+
+def test_upgrading_over_an_old_sidecar_does_not_truncate_the_pinned_original(
+        checkpoint, staged_backbone):
+    """Every checkpoint staged before this change has the preprocessor in
+    `.resolved` as a *hard link* to the original, because the old code rewrote
+    only config.json and linked everything else. Opening that path for writing
+    truncates the shared inode — destroying the file whose SHA256 proves the
+    download is intact, on the first load after an upgrade.
+    """
+    _write_checkpoint(checkpoint, vlm_model_name=HUB_ID, tokenizer_name=HUB_ID)
+    stale = checkpoint / ".resolved"
+    stale.mkdir()
+    os.link(checkpoint / "policy_preprocessor.json",
+            stale / "policy_preprocessor.json")          # what the old code left
+
+    provider = make_provider(checkpoint, vlm_dir=str(staged_backbone))
+
+    original = json.loads((checkpoint / "policy_preprocessor.json").read_text())
+    assert next(s for s in original["steps"]
+                if s["registry_name"] == "tokenizer_processor"
+                )["config"]["tokenizer_name"] == HUB_ID
+    assert _staged_tokenizer(provider._resolve_dir) == str(staged_backbone)
+
+
+def test_a_subdirectory_in_the_checkpoint_does_not_break_the_rewrite(
+        checkpoint, staged_backbone):
+    """Neither os.link nor shutil.copy2 takes a directory, and the exception
+    would surface as a failed *load* with the weights sitting there intact."""
+    _write_checkpoint(checkpoint, vlm_model_name=HUB_ID, tokenizer_name=HUB_ID)
+    (checkpoint / "extra").mkdir()
+
+    resolved = pathlib.Path(
+        make_provider(checkpoint, vlm_dir=str(staged_backbone))._resolve_dir)
+
+    assert (resolved / "model.safetensors").exists()
+    assert not (resolved / "extra").exists()
+
+
+# ── the pipelines the policy cannot be called without ────────────────────────
+
+def test_infer_refuses_until_the_pipelines_are_built(checkpoint):
+    """Weights in but pipelines missing is still not ready.
+
+    Guarding on the policy alone would let a half-loaded provider through, and
+    the failure lands as a KeyError deep inside LeRobot instead of here.
+    """
+    provider = make_provider(checkpoint)
+    provider._policy = object()
+
+    with pytest.raises(RuntimeError):
+        provider.infer(_observation(state=[0.0] * 6))
+
+
+def test_infer_tokenizes_the_task_through_the_checkpoints_own_pipeline(
+        checkpoint, fake_torch):
+    """SmolVLA reads `observation.language.tokens`, not `task`.
+
+    The card only ever had the string. Handing the raw batch to the policy is
+    what raised `KeyError: 'observation.language.tokens'` on every inference.
+    """
+    provider = make_provider(
+        checkpoint, feature_map={"main": "observation.images.top",
+                                 "state": "observation.state"})
+    seen = {}
+
+    def preprocessor(batch):
+        seen.update(batch)
+        return {"observation.language.tokens": "tokenized"}
+
+    provider._policy = types.SimpleNamespace(
+        predict_action_chunk=lambda batch: _FakeTensor([[0.1, 0.2]]))
+    provider._preprocessor = preprocessor
+    provider._postprocessor = _identity
+
+    chunk = provider.infer(_observation(images={"main": [[1]]},
+                                        state=[0.0] * 6, prompt="pick it up"))
+
+    assert seen["task"] == "pick it up"          # the pipeline's input...
+    assert chunk == [[0.1, 0.2]]                 # ...and the policy saw its output
 
 
 # ── the real published checkpoint ────────────────────────────────────────────
@@ -577,3 +789,101 @@ def test_every_provider_factory_takes_a_status_sink():
                if "on_status" not in inspect.signature(module.PROVIDER).parameters]
 
     assert not missing, f"these factories cannot be handed a status sink: {missing}"
+
+
+# ── normalisation statistics ────────────────────────────────────────────────
+#
+# `_select_stats` is the whole decision, and it is a dict transform, so it is
+# tested here rather than behind a GPU. What it guards against is the most
+# expensive kind of bug this provider can have: not a crash, but a policy that
+# runs, negotiates, validates, and drives the arm with numbers off by two
+# orders of magnitude.
+
+# Shaped exactly as observed on Tianyi's `smolvla_base`: one entry per dataset,
+# each holding that dataset's mean/std. Not `…action.mean` as a flat key — the
+# statistics are nested under the feature name, which is why the pipeline's
+# lookup of plain `action` misses rather than raising.
+GROUPED = {
+    "so100.buffer.action": {"mean": [1.6, 119.9], "std": [26.4, 52.4]},
+    "so100-red.buffer.action": {"mean": [2.4, 124.9], "std": [14.3, 42.8]},
+}
+
+
+def test_a_finetuned_checkpoints_stats_are_left_alone():
+    """Keyed `action` already — nothing to choose, and choosing would be wrong."""
+    plain = {"action": {"mean": [0.0], "std": [1.0]}}
+    assert SmolVLAProvider._select_stats(plain, "") is None
+    assert SmolVLAProvider._select_stats(plain, "so100") is None
+
+
+def test_a_step_without_stats_is_skipped():
+    assert SmolVLAProvider._select_stats(None, "so100") is None
+    assert SmolVLAProvider._select_stats({}, "so100") is None
+
+
+def test_grouped_stats_without_a_key_are_refused():
+    """The refusal is the point: an identity un-normaliser is silent.
+
+    LeRobot treats a missing `action` entry as "nothing to do" rather than as
+    an error, so the alternative to raising here is a policy that emits its own
+    normalised space (≈ ±1) into a descriptor that reads degrees.
+    """
+    with pytest.raises(ValueError) as caught:
+        SmolVLAProvider._select_stats(GROUPED, "")
+    message = str(caught.value)
+    # The operator has to be told what to pick from, not just that it failed.
+    assert "so100" in message and "so100-red" in message
+    assert "identity" in message
+
+
+def test_an_unknown_key_is_refused_and_lists_the_real_ones():
+    with pytest.raises(ValueError) as caught:
+        SmolVLAProvider._select_stats(GROUPED, "so100-blue")
+    assert "so100-blue" in str(caught.value) and "so100-red" in str(caught.value)
+
+
+def test_the_chosen_group_is_rekeyed_the_way_the_pipeline_looks_it_up():
+    """`so100.buffer.action` → `action`, and the other datasets are dropped."""
+    chosen = SmolVLAProvider._select_stats(GROUPED, "so100")
+    assert chosen == {"action": {"mean": [1.6, 119.9], "std": [26.4, 52.4]}}
+
+
+def test_the_key_comes_from_the_model_entry_before_the_card(tmp_path, checkpoint):
+    """Per-checkpoint, because which dataset fits is a property of the weights."""
+    models = {"smolvla_base": {"model_dir": str(checkpoint), "unnorm_key": "so100-red"}}
+    provider = make_provider(tmp_path, model_name="smolvla_base", models=models,
+                             unnorm_key="so100")
+    assert provider._unnorm_key == "so100-red"
+
+
+def test_applying_the_stats_rebuilds_the_tensor_cache(monkeypatch, checkpoint):
+    """Assigning `step.stats` alone changes nothing — `__call__` reads the cache.
+
+    This is the half of the fix with no symptom if it is missed: the selection
+    looks applied, the log line prints, and the un-normalisation is still an
+    identity because `NormalizerProcessorStep.__call__` only ever consults
+    `_tensor_stats`, built once in `__post_init__`.
+    """
+    module = types.ModuleType("lerobot.processor.normalize_processor")
+    module.to_tensor = lambda stats, device=None, dtype=None: ("tensors", tuple(sorted(stats)))
+    monkeypatch.setitem(sys.modules, "lerobot.processor.normalize_processor", module)
+
+    class Step:
+        def __init__(self, stats):
+            self.stats, self.device, self.dtype = stats, "cpu", None
+            self._tensor_stats = ("stale", ())
+
+    class Pipeline:
+        def __init__(self, steps):
+            self.steps = steps
+
+    grouped = Step(dict(GROUPED))
+    plain = Step({"action": {"mean": [0.0], "std": [1.0]}})
+    provider = make_provider(checkpoint, unnorm_key="so100")
+    provider._apply_norm_stats(Pipeline([grouped, plain]))
+
+    assert grouped.stats == {"action": {"mean": [1.6, 119.9], "std": [26.4, 52.4]}}
+    assert grouped._tensor_stats == ("tensors", ("action",))
+    # The already-correct step must be left exactly as it was.
+    assert plain.stats == {"action": {"mean": [0.0], "std": [1.0]}}
+    assert plain._tensor_stats == ("stale", ())

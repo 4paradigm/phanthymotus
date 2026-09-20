@@ -365,6 +365,133 @@ def test_the_mock_does_not_claim_to_read_anything():
     assert MOCK(DESCRIPTOR).capabilities()["n_cameras"] == 0
 
 
+# ── the mock on an arm whose range is not symmetric ──────────────────────────
+#
+# DESCRIPTOR above is [-2, 2] on every joint, which is the one shape that hides
+# the bug these cover: with a symmetric range the midpoint *is* the rest pose,
+# so centring on either gives the same numbers. Real arms are not symmetric.
+# The numbers below are Tianyi's, read off its servo card.
+
+ASYMMETRIC = {
+    "control_interface": "motus.control/1",
+    "mode": "joint_position",
+    "dof": 4,
+    "units": {"angle": "rad", "normalized": "0-1"},
+    "limits": {
+        #        shoulder_roll   elbow_pitch   finger  finger
+        "lower": [-0.2617993878, -2.6179938780, 0.0,   0.0],
+        "upper": [2.6179938780, 0.2617993878, 1.0,   1.0],
+    },
+    "groups": [
+        {"name": "arm_l", "offset": 0, "count": 2, "unit": "rad", "resource": "arm_l"},
+        {"name": "hand_l", "offset": 2, "count": 2, "unit": "normalized",
+         "resource": "hand_l"},
+    ],
+    "rate": {"max_hz": 50, "expected_hz": 30, "watchdog_ms": 200},
+}
+
+
+def test_the_first_command_is_the_rest_pose_not_the_middle_of_the_range():
+    """The bug as it was reported: "手臂抬得太高".
+
+    Centring on the midpoint made the *first* command — before the wave had
+    moved at all — ask for shoulder_roll +1.178 rad (+67.5°) and the fingers
+    half closed. The driver then ramped there at max_delta_per_step, which is
+    what an observer saw as the arms lifting. No value of `amplitude` fixed it,
+    because the offending number was the centre.
+    """
+    first = MOCK(ASYMMETRIC, {"chunk_size": 1}).infer()[0]
+    assert first == [0.0, 0.0, 0.0, 0.0]
+    midpoints = [(lo + hi) / 2 for lo, hi in zip(ASYMMETRIC["limits"]["lower"],
+                                                 ASYMMETRIC["limits"]["upper"])]
+    assert midpoints[0] > 1.1      # the pose it used to start from
+    assert first[0] != pytest.approx(midpoints[0])
+
+
+def test_the_signal_returns_to_rest_every_cycle():
+    """`(1-cos)/2`, not a sine: it leaves rest at zero velocity and comes back.
+
+    A signal that ends a cycle somewhere other than where it started drifts,
+    and a drifting test signal on a real arm is how a limit gets reached.
+    """
+    hz, period = 30.0, 4.0
+    provider = MOCK(ASYMMETRIC, {"chunk_size": int(hz * period) + 1,
+                                 "period_s": period, "control_hz": hz})
+    chunk = provider.infer()
+    assert chunk[0] == [0.0] * 4
+    assert chunk[-1] == pytest.approx([0.0] * 4, abs=1e-9)
+    assert max(step[0] for step in chunk) > 0      # it did move in between
+
+
+def test_a_joint_resting_on_its_own_bound_still_moves_and_moves_inward():
+    """A finger rests at 0.0, which is one end of its travel.
+
+    A symmetric sine around that point would have to leave the range to move at
+    all, so it would either clip to a constant or violate the limit.
+    """
+    chunk = MOCK(ASYMMETRIC, {"chunk_size": 40, "period_s": 1.0,
+                              "control_hz": 30}).infer()
+    finger = [step[2] for step in chunk]
+    assert max(finger) > 0.1
+    assert min(finger) >= 0.0
+
+
+def test_the_signal_stays_inside_an_asymmetric_range_at_full_amplitude():
+    lower, upper = ASYMMETRIC["limits"]["lower"], ASYMMETRIC["limits"]["upper"]
+    provider = MOCK(ASYMMETRIC, {"amplitude": 1.0, "chunk_size": 64,
+                                 "period_s": 1.0, "control_hz": 30})
+    for _ in range(20):
+        for values in provider.infer():
+            for v, lo, hi in zip(values, lower, upper):
+                assert lo <= v <= hi
+
+
+def test_a_gripper_gets_a_visible_default_while_an_arm_stays_small():
+    """The other half of the report: "没有驱动手指".
+
+    The fingers *were* being driven — 5% of a 0-1 grip, around a half-closed
+    centre. Both halves of that are invisible. The fraction is keyed on the
+    group's unit so this default holds on any robot whose descriptor says
+    `normalized`, not just the one it was reported on.
+    """
+    chunk = MOCK(ASYMMETRIC, {"chunk_size": 60, "period_s": 2.0,
+                              "control_hz": 30}).infer()
+    grip = max(step[2] for step in chunk)
+    shoulder = max(step[0] for step in chunk)
+    assert grip == pytest.approx(0.5, abs=1e-6)          # half the grip: visible
+    assert shoulder == pytest.approx(0.05 * 2.618, rel=1e-3)   # 7.5°, still small
+
+
+def test_amplitude_can_be_set_per_group_and_a_name_beats_a_unit():
+    amplitude = {"default": 0.02, "normalized": 0.5, "hand_l": 0.1}
+    chunk = MOCK(ASYMMETRIC, {"amplitude": amplitude, "chunk_size": 60,
+                              "period_s": 2.0, "control_hz": 30}).infer()
+    assert max(step[2] for step in chunk) == pytest.approx(0.1, abs=1e-6)
+    assert max(step[0] for step in chunk) == pytest.approx(0.02 * 2.618, rel=1e-3)
+
+
+def test_a_scalar_amplitude_still_applies_to_every_joint():
+    """An operator who writes one number has overridden the per-unit default."""
+    chunk = MOCK(ASYMMETRIC, {"amplitude": 0.25, "chunk_size": 60,
+                              "period_s": 2.0, "control_hz": 30}).infer()
+    assert max(step[2] for step in chunk) == pytest.approx(0.25, abs=1e-6)
+
+
+def test_an_out_of_range_amplitude_is_refused():
+    for bad in (0, 1.5, -0.1):
+        with pytest.raises(ValueError):
+            MOCK(ASYMMETRIC, {"amplitude": bad})
+    with pytest.raises(ValueError):
+        MOCK(ASYMMETRIC, {"amplitude": {"default": 0.05, "normalized": 2.0}})
+
+
+def test_a_malformed_group_does_not_stop_the_test_signal():
+    """The mock is what people reach for *when* a descriptor looks wrong."""
+    odd = {**ASYMMETRIC, "groups": ["arm_l", {"name": "hand_l"}, None]}
+    chunk = MOCK(odd, {"chunk_size": 10}).infer()
+    assert len(chunk[0]) == 4
+
+
 # ── the config form an operator actually sees ────────────────────────────────
 
 def _properties(**cfg):
@@ -381,6 +508,42 @@ def test_remote_only_fields_are_hidden_for_a_local_provider():
 
     for field in ("endpoint", "api_key", "timeout_ms"):
         assert props[field]["x-show-when"] == {"provider": ["vla_cloud"]}, field
+
+
+def test_the_cloud_fields_are_ordered_the_way_they_are_filled_in():
+    """表单顺序就是 schema 顺序（sidebar.js 遍历 Object.entries）。
+
+    先有服务器，才有它认得的 key，才谈得上问它有哪些模型名。`cloud_model_name` 一度
+    排在最前，于是表单第一个问的是一个只有服务器知道答案的名字 —— 一个纯排序问题，
+    但它是操作员第一眼看到的东西。
+    """
+    keys = list(_properties())
+    order = [keys.index(f) for f in ("endpoint", "api_key", "cloud_model_name")]
+    assert order == sorted(order), f"云端三项的顺序不对：{keys}"
+
+
+def test_unnorm_key_is_settable_from_the_form():
+    """修了 provider 却没修配置表面，等于把卡片变成一个填不了的错误。
+
+    The provider refuses to load a checkpoint whose normalisation statistics are
+    grouped per dataset unless one is chosen — that refusal is the fix for a card
+    that used to emit its policy's normalised space (≈ ±1) into a descriptor that
+    reads degrees. But the form renders exactly this schema, so without a field
+    here an operator is told to set something they have nowhere to set.
+
+    Free text, not `enum`: the groups live inside the checkpoint and are only
+    known once it is read. An empty <select> would be worse than a box.
+    """
+    props = _properties()
+    assert "unnorm_key" in props, "表单里没有 unnorm_key，provider 的拒绝就无解了"
+    assert props["unnorm_key"]["type"] == "string"
+    assert "enum" not in props["unnorm_key"]
+
+
+def test_unnorm_key_is_hidden_for_the_cloud_provider():
+    """云端那侧由服务端自己选，机器人这边填了也不会被用上。"""
+    condition = _properties()["unnorm_key"]["x-show-when"]["provider"]
+    assert "vla_cloud" not in condition
 
 
 def test_every_show_when_value_is_a_string_or_a_list_of_them():
@@ -761,3 +924,127 @@ def test_the_model_can_reach_execute():
     assert set(schema["x-action-params"]) == {"execute", "pause", "interrupt", "resume"}
     assert schema["x-action-params"]["execute"]["params"] == ["task"]
     assert {"start", "stop"} <= set(schema["properties"]["action"]["enum"])
+
+
+# ── the refusal has to say *which* model and *which* card ────────────────────
+#
+# `模型输出 6 维动作，下游只接受 26 维` names what disagrees but not who. A robot
+# runs several cards, and this exact message appeared twice on Tianyi with no way
+# to tell which checkpoint was wired to which arm without opening the canvas.
+
+def test_a_mismatch_names_the_model_and_the_downstream_card():
+    class Wide:
+        def capabilities(self):
+            return {"action_dim": 32, "control_hz": 30, "model": "smolvla/ckpt-9000"}
+        def infer(self, obs=None, inference_delay=0): return [[0.0] * 32]
+        def health(self): return True
+        def close(self): pass
+
+    card = make_card(provider="wide")
+    import plugins.vla.plugin as plugin_mod
+    original = plugin_mod.discover
+    plugin_mod.discover = lambda: {"wide": lambda d, c, on_status=None: Wide()}
+    plugin_mod.discover.errors = {}
+    try:
+        result = card.dispatch("start", {"action": "start",
+                                         "control_interface": DESCRIPTOR})
+    finally:
+        plugin_mod.discover = original
+
+    assert result["state"] == "error"
+    msg = result["message"]
+    # the disagreement itself, unchanged
+    assert "32" in msg and "7" in msg
+    # who the model is
+    assert "smolvla/ckpt-9000" in msg
+    assert "wide" in msg
+    # which card it was pointed at — mode, joint count, and the first joint name,
+    # which is what actually separates two arms on one robot
+    assert "joint_position" in msg
+    assert "joint1" in msg
+
+
+def test_the_model_label_falls_back_to_the_provider_name():
+    """A provider that does not name itself still has to be identifiable."""
+    from plugins.vla.plugin import _model_label
+    assert _model_label("smolvla", {}) == "smolvla"
+    assert _model_label("smolvla", {"model": "ckpt-9000"}) == "smolvla:ckpt-9000"
+    # No stutter when the checkpoint path already carries the family name —
+    # "smolvla:smolvla/ckpt-9000" reads like a bug in the error message itself.
+    assert _model_label("smolvla", {"model": "smolvla/ckpt-9000"}) == "smolvla/ckpt-9000"
+
+
+def test_the_downstream_label_survives_a_sparse_descriptor():
+    """Never let the diagnostic be the thing that raises."""
+    from plugins.vla.plugin import _downstream_label
+    assert _downstream_label({}) == "?/? 关节"
+    assert "joint_position" in _downstream_label({"mode": "joint_position", "dof": 26})
+    assert "left_shoulder" in _downstream_label(
+        {"mode": "joint_position", "dof": 26, "joint_names": ["left_shoulder_pitch"]})
+
+
+# ── a bad descriptor must not take the tool list with it ─────────────────────
+#
+# All three of these are one incident. A descriptor was accepted at `start` with
+# `groups: ["arm_l"]` — strings where the spec says objects. Nothing failed then.
+# `_resources()` runs on every *schema* fetch, a different code path, and there
+# it raised; `tools/list` returns the whole bundle, so agent-core got an RPC
+# error and served the cards it already knew with no ports at all. `stop` did
+# not help — the descriptor is not cleared — so only a container restart did.
+#
+# Fixed in three places because each of them alone leaves the failure possible:
+# refuse it at the door, survive it if it gets in, and contain it to one card.
+
+def test_a_descriptor_whose_groups_are_not_objects_is_refused_at_start():
+    from plugins.vla import negotiate
+    caps = {"action_dim": 7, "chunk_size": 10, "control_hz": 30}
+    problems = negotiate.check(caps, {**DESCRIPTOR, "groups": ["arm_l", "arm_r"]})
+    assert problems and "groups" in problems[0]
+    # names the offending indices, so a 26-dof descriptor does not have to be
+    # eyeballed to find which entry is wrong
+    assert "0, 1" in problems[0]
+
+    assert negotiate.check(caps, {**DESCRIPTOR, "groups": "arm_l"})
+    # absent and well-formed are both fine
+    assert not negotiate.check(caps, DESCRIPTOR)
+    assert not negotiate.check(
+        caps, {**DESCRIPTOR,
+               "groups": [{"name": "arm_l", "offset": 0, "count": 7,
+                           "resource": "arm_l"}]})
+
+
+def test_resources_skips_a_group_it_cannot_read_instead_of_raising():
+    """This runs on every schema fetch; raising here empties the whole bundle."""
+    card = make_card(resource="arm")
+    card._descriptor = {"groups": ["arm_l", None,
+                                   {"name": "hand_l", "resource": "hand_l"}]}
+    assert card._resources() == ["hand_l"]
+
+    card._descriptor = {"groups": ["arm_l"]}
+    assert card._resources() == ["arm"]      # falls back to the configured value
+
+
+def test_one_cards_broken_schema_does_not_empty_the_bundle():
+    # `main` imports rclpy at module scope and the rest of this suite runs on a
+    # laptop without ROS. Stubbed rather than skipped: the thing under test is
+    # ten lines of pure Python, and a test that only runs on a robot is a test
+    # that runs after the mistake has already shipped.
+    from .test_actucore_executor import _load_main_module
+
+    main = _load_main_module()
+
+    class Fine:
+        PREFIX = "fine"
+
+        def get_tools(self):
+            return [{"name": "fine"}]
+
+    class Broken:
+        PREFIX = "broken"
+
+        def get_tools(self):
+            raise AttributeError("'str' object has no attribute 'get'")
+
+    bundle = object.__new__(main.ActuCoreBundle)
+    bundle._plugins = [Broken(), Fine()]
+    assert [t["name"] for t in bundle.get_all_tools()] == ["fine"]

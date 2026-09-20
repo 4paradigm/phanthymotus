@@ -61,6 +61,11 @@ for _quiet in ('urllib3', 'httpcore', 'httpx'):
 # already capped, the argument side was not.
 _LOG_ARG_CHARS = 500
 
+# How often the register thread says it is still alive when nothing has changed.
+# The heartbeat itself stays at 30s; this only governs how often that fact
+# reaches the log, so "quiet" cannot mean both "healthy" and "thread died".
+REGISTER_ALIVE_INTERVAL_S = 1800.0
+
 
 def _brief(obj) -> str:
     """One-line, length-capped repr for logging an MCP payload."""
@@ -160,9 +165,28 @@ class ActuCoreBundle:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 
     def get_all_tools(self) -> list:
+        """Every card's schema. One broken card must not take the rest with it.
+
+        `tools/list` is not a call against one card — it is how agent-core learns
+        that any card exists at all, and what its ports are. So an exception
+        raised while building one card's schema used to empty the whole bundle:
+        agent-core got an RPC error, kept the cards it already knew, and showed
+        them with no input and no output ports. That reads as a canvas problem,
+        and the traceback is in *this* process's log, which is not where anyone
+        looks first. Seen on Tianyi.
+
+        Nothing here can repair the broken card, and pretending otherwise would
+        be worse — so it is dropped, loudly, and the others are served.
+        """
         tools = []
         for p in self._plugins:
-            for t in p.get_tools():
+            try:
+                built = list(p.get_tools())
+            except Exception:      # noqa: BLE001 — one card's schema, not the bundle's
+                log.exception("card %s failed to build its schema; serving the rest "
+                              "without it", getattr(p, "PREFIX", p))
+                continue
+            for t in built:
                 full_name = t['name'] if t['name'] == p.PREFIX else f"{p.PREFIX}_{t['name']}"
                 tools.append({**t, "name": full_name})
         return tools
@@ -368,6 +392,18 @@ def _start_registration(mcp_port: int, name: str, category: str):
     }).encode()
     def _run():
         import time as _t
+        # Log transitions, plus a slow keepalive. A 30s heartbeat that says "ok"
+        # every time is 92 of this container's 115 log lines — it crowds out the
+        # plugin errors that are the only reason to read this log at all.
+        #
+        # But edges alone are not enough either, and that was a real loss when
+        # this first shipped: every "ok" line used to double as proof the thread
+        # was alive, so a wedged register thread showed up as the log going
+        # quiet. With edges only, quiet *is* the healthy state, and "fine" and
+        # "dead" look identical. The slow line keeps that signal at 1/60th the
+        # cost — two lines an hour instead of 120.
+        healthy = None
+        last_alive = 0.0
         while True:
             try:
                 req = _urllib.Request(
@@ -375,10 +411,21 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with _urllib.urlopen(req, timeout=3, context=_ctx):
-                    log.info(f"[register] heartbeat ok → {agent_core_url}")
+                    now = _t.monotonic()
+                    if healthy is not True:
+                        log.info(f"[register] heartbeat ok → {agent_core_url}"
+                                 + ("" if healthy is None else " (recovered)"))
+                        healthy = True
+                        last_alive = now
+                    elif now - last_alive >= REGISTER_ALIVE_INTERVAL_S:
+                        last_alive = now
+                        log.info(f"[register] still registered → {agent_core_url}")
                 _t.sleep(30)
             except Exception as e:
+                # Every failure is logged: a flapping link is a real symptom and
+                # collapsing it would hide how often it drops.
                 log.warning(f"[register] failed: {e}, retrying in 5s")
+                healthy = False
                 _t.sleep(5)
     threading.Thread(target=_run, daemon=True, name="register").start()
 
@@ -414,12 +461,13 @@ def main():
     executor = rclpy.executors.MultiThreadedExecutor()
     _bundle  = ActuCoreBundle(cfg, executor)
 
-    threading.Thread(
+    spin_thread = threading.Thread(
         target=_spin_executor,
         args=(executor,),
         daemon=True,
         name="actucore_spin",
-    ).start()
+    )
+    spin_thread.start()
 
     _start_registration(mcp_port, "ActuCore", "actucore")
 
@@ -441,7 +489,18 @@ def main():
                 "one or more card stops remained unconfirmed after retries; "
                 "forcing process shutdown so the container supervisor can recover"
             )
+        # 关机顺序是有讲究的：spin 线程还停在 `executor.spin()` 里面（rclpy 的 C++
+        # 代码里）时，解释器一旦开始 finalize，就会 `terminate called without an
+        # active exception` → `Fatal Python error: Aborted`，容器退出码 134。
+        # 天轶上每次 SIGTERM 都会这样，日志里累计 13 次。
+        #
+        # `executor.shutdown()` 会让 `spin()` 返回，所以在 `rclpy.shutdown()` 之前
+        # 把线程 join 掉 —— 让 C++ 那边在解释器还活着的时候退干净。超时是兜底：
+        # 关不干净也不能把关机卡死，daemon 线程本来就会被强制收走。
         executor.shutdown()
+        spin_thread.join(timeout=5.0)
+        if spin_thread.is_alive():
+            log.warning("spin thread did not stop within 5s; shutting down anyway")
         rclpy.shutdown()
 
 

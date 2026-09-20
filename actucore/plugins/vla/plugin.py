@@ -46,6 +46,41 @@ FORMATS = {"joint_position": "control/joint",
            "eef_pose": "control/waypoint"}
 
 
+def _model_label(provider_name: str, capabilities: dict) -> str:
+    """Which model, in the words an operator can act on.
+
+    `capabilities['model']` is whatever the provider chose to call itself — a
+    checkpoint path for the real ones, `mock-sine@4s` for the mock. Falls back to
+    the provider name, which is at least the thing named in the card's config.
+    """
+    model = str((capabilities or {}).get("model") or "")
+    if not model:
+        return str(provider_name)
+    # A checkpoint path usually already begins with the model family, and
+    # `smolvla:smolvla/ckpt-9000` reads like a bug in the error message.
+    if model.startswith(str(provider_name)):
+        return model
+    return f"{provider_name}:{model}"
+
+
+def _downstream_label(descriptor: dict) -> str:
+    """Which card, in the words an operator can act on.
+
+    The descriptor carries no card id, so identity has to come from what it
+    describes: the control mode, the joint count, and the first joint's name.
+    That last one is what actually distinguishes two arms on the same robot —
+    "26 关节" is ambiguous where "从 left_shoulder_pitch 起" is not.
+    """
+    descriptor = descriptor or {}
+    mode = descriptor.get("mode") or "?"
+    dof = descriptor.get("dof")
+    names = descriptor.get("joint_names") or []
+    label = f"{mode}/{dof if dof is not None else '?'} 关节"
+    if names:
+        label += f"（从 {names[0]} 起）"
+    return label
+
+
 class Observation:
     """一帧观测。字段名就是 provider 协议里的那几个。
 
@@ -225,17 +260,43 @@ class VLAPlugin:
                                    "scope": "shared",
                                    "x-show-when": {"provider": staged_providers},
                                    **({"enum": local_models} if local_models else {})},
-                    "cloud_model_name": {"type": "string", "scope": "shared",
-                                         "x-show-when": {"provider": remote_providers}},
+                    # Which dataset's statistics un-normalise the action.
+                    #
+                    # Only a **pretrained base** needs this, and only because its
+                    # statistics are grouped per dataset (`smolvla_base` carries
+                    # so100 / so100-blue / so100-red) while the pipeline looks up
+                    # plain `action`. A miss is not an error in LeRobot — the step
+                    # passes the tensor through — so leaving it unset used to mean
+                    # the card emitted the policy's normalised space, ≈ ±1, into a
+                    # descriptor that reads degrees. The provider now refuses to
+                    # load instead, and this field is where the answer goes.
+                    #
+                    # Free text rather than `enum`: the groups live inside the
+                    # checkpoint and are only known once it is read, and an empty
+                    # <select> would be worse than a box you can type into. The
+                    # provider validates it and lists the real groups when it is
+                    # wrong.
+                    #
+                    # A checkpoint fine-tuned on one robot keys its statistics
+                    # `action` and needs nothing here.
+                    "unnorm_key": {"type": "string", "scope": "shared",
+                                   "x-show-when": {"provider": staged_providers}},
                     # Only vla_cloud has anywhere to send a request. Hiding
                     # these for a local provider is not cosmetic: a filled-in
                     # endpoint beside `provider: smolvla` reads as configured
                     # and is ignored, which is the kind of thing an operator
                     # spends an afternoon on.
+                    #
+                    # 顺序就是表单里的顺序（sidebar.js 遍历 Object.entries），并且是
+                    # **填写的顺序**：先有服务器，才有它认得的 key，才谈得上问它有哪些
+                    # 模型名。`cloud_model_name` 一度排在最前，于是表单第一个问的是一个
+                    # 只有服务器知道答案的名字。
                     "endpoint": {"type": "string", "scope": "shared",
                                  "x-show-when": {"provider": remote_providers}},
                     "api_key": {"type": "string", "scope": "shared",
                                 "x-show-when": {"provider": remote_providers}},
+                    "cloud_model_name": {"type": "string", "scope": "shared",
+                                         "x-show-when": {"provider": remote_providers}},
                     "timeout_ms": {"type": "number", "default": 500,
                                    "scope": "shared",
                                    "x-show-when": {"provider": remote_providers}},
@@ -345,7 +406,16 @@ class VLAPlugin:
             self._close(provider)
             # Refused rather than started and left to fail per command: at
             # 30 Hz the second outcome is a stopped robot with no reason given.
-            return self._error("模型与下游动作空间不匹配：" + "；".join(problems))
+            #
+            # Named, because "模型输出 6 维动作，下游只接受 26 维" tells an operator
+            # what disagrees but not *who* — and a robot runs several cards. On
+            # Tianyi this exact message appeared twice with no way to tell which
+            # checkpoint was wired to which arm without opening the canvas.
+            return self._error(
+                f"模型与下游动作空间不匹配 —— "
+                f"模型 {_model_label(provider_name, capabilities)}，"
+                f"下游 {_downstream_label(descriptor)}："
+                + "；".join(problems))
 
         mode = descriptor.get("mode")
         if mode not in FORMATS:
@@ -512,6 +582,12 @@ class VLAPlugin:
                 "rate_hz": self._rate_hz,
                 "ttl_ms": self._ttl_ms,
                 "published": self._published,
+                # What `resume` will do. `pause` and `interrupt` both leave the
+                # card reporting `state: paused` — the only thing that tells
+                # them apart afterwards is whether the plan survived, and
+                # without this number nothing exposes that. A halted card
+                # showing 0 here will re-infer; one showing 9 will replay.
+                "chunk_pending": max(0, len(self._chunk) - self._chunk_index),
                 "capabilities": dict(self._capabilities),
                 "control_interface": dict(self._descriptor),
                 "error": self._last_error,
@@ -805,11 +881,23 @@ class VLAPlugin:
         re-reads the schema on heartbeat (`api/mcp_manage.py` extracts
         `x-resource` there as well as at registration), so the negotiated set
         replaces it shortly after the card starts.
+
+        `negotiate.check` refuses a descriptor whose `groups` are not objects, so
+        in normal operation every entry here is a dict. The isinstance guard is
+        for the one path that bypasses negotiation: this runs on *every* schema
+        fetch, including fetches that happen after a descriptor was stored by
+        some future caller that did not go through `_start`. Raising here does
+        not fail this card — it fails `tools/list` for the whole bundle, leaving
+        agent-core with no schema for anything and a canvas of cards with no
+        ports. A resource that cannot be read is worth skipping; it is not worth
+        that.
         """
         groups = self._descriptor.get("groups") or []
         negotiated = []
         for group in groups:
-            resource = (group or {}).get("resource")
+            if not isinstance(group, dict):
+                continue
+            resource = group.get("resource")
             if resource and resource not in negotiated:
                 negotiated.append(resource)
         if negotiated:
