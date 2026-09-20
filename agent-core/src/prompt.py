@@ -34,6 +34,26 @@ _PEERS_SHOWN = 6
 _TZ_CN = datetime.timezone(datetime.timedelta(hours=8))
 
 
+def format_ts(epoch: float | None = None, sep: str = 'T') -> str:
+    """把时刻格式化成送进 prompt 的样子 —— **唯一**的一处。
+
+    先前有两套：`<status time=...>` 走 `now(_TZ_CN)`（北京时间），而 collector 里的
+    `<event ts=...>` 走裸 `fromtimestamp()`，取的是容器时区 —— 线上容器是
+    `TZ=Etc/UTC`。于是同一秒在同一段 prompt 里写成两个相差 8 小时的数：
+
+        <status time="2026-09-20 18:28:39">
+        <event  ... ts="2026-09-20T10:28:39">
+
+    模型被问「这件事进行了多久」时就拿这两个相减，播报里那句「已经等了四分钟」
+    「大约等了一分半」就是这么来的 —— 它不是编的，是照着两套钟算的。
+
+    所以时间戳只能有一个出口。谁要往 prompt 里写时刻，都从这里拿。
+    """
+    when = datetime.datetime.now(_TZ_CN) if epoch is None else \
+        datetime.datetime.fromtimestamp(epoch, tz=_TZ_CN)
+    return when.strftime(f'%Y-%m-%d{sep}%H:%M:%S')
+
+
 # ── L1 缓存 ──────────────────────────────────────────────────────────────────
 
 _l1_cache: dict = {'mtime': 0.0, 'content': ''}
@@ -186,7 +206,7 @@ def _env_dynamic() -> str:
     每次调用都重新生成，但作为 user message 放在历史之后，
     不影响 system message 的缓存命中。
     """
-    now = datetime.datetime.now(_TZ_CN).strftime('%Y-%m-%d %H:%M:%S')
+    now = format_ts(sep=' ')
 
     # 活跃任务
     import task_store
@@ -195,15 +215,30 @@ def _env_dynamic() -> str:
     tasks_section = ''
     if active:
         task_lines = []
+        def _span(seconds: float) -> str:
+            if seconds < 60:
+                return f'{int(seconds)}s'
+            if seconds < 3600:
+                return f'{int(seconds / 60)}min'
+            return f'{seconds / 3600:.1f}h'
+
+        now = _time.time()
         for t in active:
-            elapsed = _time.time() - t.created_at
-            if elapsed < 60:
-                elapsed_str = f'{int(elapsed)}s'
-            elif elapsed < 3600:
-                elapsed_str = f'{int(elapsed / 60)}min'
-            else:
-                elapsed_str = f'{elapsed / 3600:.1f}h'
-            task_lines.append(f'  <task id="{t.id}" status="{t.status}" elapsed="{elapsed_str}">{t.goal}{" — " + t.progress if t.progress else ""}</task>')
+            # `age` 而不是 `elapsed`。
+            #
+            # 这个数是**任务被创建至今**，不是"当前这件事做了多久"。任务常常建一次、
+            # 反复复用、迟迟不 task_done —— 天轶上见过一个导览任务挂着 1.6h，而机器人
+            # 刚开始走第一段。叫 elapsed，模型就照着念成"已经进行了一个半小时"。
+            #
+            # 同时给出距上次进展多久：那才是"这件事最近一次动是什么时候"，也是唯一
+            # 适合用来判断"是不是卡住了"的数。
+            age = _span(now - t.created_at)
+            last = getattr(t, 'updated_at', None) or t.created_at
+            since = _span(now - last)
+            task_lines.append(
+                f'  <task id="{t.id}" status="{t.status}" age="{age}" '
+                f'last_progress="{since}前">{t.goal}'
+                f'{" — " + t.progress if t.progress else ""}</task>')
         tasks_section = f'<active_tasks>\n' + '\n'.join(task_lines) + '\n</active_tasks>\n'
 
     # 不再显示 active_subagents — bg subagent 结论通过 memory_recall 按需检索，
@@ -350,7 +385,7 @@ def _trigger_message(event: dict) -> str:
     """
     if event.get('source') == 'collector':
         return event['text']
-    ts = datetime.datetime.fromtimestamp(event['ts'], tz=_TZ_CN).strftime('%Y-%m-%dT%H:%M:%S')
+    ts = format_ts(event['ts'])
     src = event['source']
     txt = event['text']
     return f'<event source="{src}" ts="{ts}">\n{txt}\n</event>'

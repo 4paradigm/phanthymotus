@@ -116,3 +116,13 @@ Canvas 布局保存和 Solution 画布应用，返回 409 并保持运行、卡�
 11 subtests（临时 DB，排除此前已确认的 test_progress_stream）；Web 46 passed，
 包括真实保存处理函数收到 409 后提示并恢复布局。未运行浏览器端到端或真机测试。
 CONTRIBUTING 已更新为停止后编辑契约；README 和导航输入/输出接口不变。
+
+复审排队期间上游又合入 b60a2a9（Benchmark 面板），PR 再次冲突。继续合并，
+唯一冲突为 ACP 注册状态声明：同时保留导航早到终态 OrderedDict 与上游
+_pending_started 计时。复核自动合并的 Solution test 段与运行中写入保护，
+重新执行 Core/Web 测试；最终复审须指向本次合并后的 head。
+
+合并后 Core 全量首次 7 项启动解析失败，独立运行该文件 18 项通过；测试依赖
+其他用例遗留的全局 services 配置。为模拟驱动 fixture 隔离 services/core 配置后，
+Core 1245 passed / 1 deselected / 11 subtests；Web 78 passed。未改运行逻辑
+掩盖失败。旧 head 0221694 的 BOT 因上游冲突终止，须以新 head 重新申请。

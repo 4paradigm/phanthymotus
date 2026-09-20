@@ -30,7 +30,11 @@ import mcp_client  # noqa: E402
 from peer import tools as peer_tools  # noqa: E402
 
 
-# 真实机器上取到的形状：驱动的 loco/speaker 是 actuator，感知的 tts 是 processor。
+# 驱动的 loco/speaker 是 actuator，感知的 tts 是 processor。
+#
+# 注意 `category` 在这里被放进了 registry 条目 —— **真机上不是这样的**：层记在
+# `config.main['services']['mcp']`（`/api/mcp` 返回的那份），运行时这张表从来没有
+# 这个键。下面 `_RealShape` 用真机的形状再跑一遍同样的判定。
 _REGISTRY = {
     'mcp-drv': {
         'category': 'driver',
@@ -196,6 +200,51 @@ class TestNotificationScope(_Registry):
         """判据只有一处 —— 端点和授权逻辑漂移了，通知范围就会悄悄变。"""
         src = (pathlib.Path(__file__).resolve().parents[1] / 'src/api/peer.py').read_text()
         self.assertIn('peer_tools.is_read_only(tool_name)', src)
+
+
+class _RealShape(unittest.TestCase):
+    """真机上的数据形状：层在注册表那一份里，运行时 map 里没有。
+
+    Orin6 上抓到的：`tool_category()` 只问运行时 map 要 `category`，而那个键从来
+    没人往里写过，于是它对每个设备都返回 `''`，层规则整条失效 —— 最要紧的一条是
+    **actucore 的 `vla` 只剩下它自己声明的 `processor`，于是 viewer 通过了只读检查**，
+    而那正是这个模块的 docstring 说层规则存在的理由。
+    """
+
+    def setUp(self):
+        import config
+        runtime = {mcp_id: {k: v for k, v in entry.items() if k != 'category'}
+                   for mcp_id, entry in _REGISTRY.items()}
+        self._patch = mock.patch.dict(mcp_client.registry, runtime, clear=True)
+        self._patch.start()
+        self._services = config.main.get('services')
+        config.main['services'] = {'mcp': [
+            {'id': 'mcp-drv', 'category': 'driver'},
+            {'id': 'mcp-perc', 'category': 'perception'},
+            {'id': 'mcp-actu', 'category': 'actucore'},
+        ]}
+
+    def tearDown(self):
+        import config
+        self._patch.stop()
+        config.main['services'] = self._services
+
+    def test_the_layer_is_found_even_though_the_runtime_map_lacks_it(self):
+        self.assertEqual(peer_tools.tool_category('mcp__mcp-actu__vla'), 'actucore')
+        self.assertEqual(peer_tools.tool_category('mcp__mcp-perc__tts'), 'perception')
+
+    def test_a_viewer_still_cannot_reach_the_execution_layer(self):
+        with mock.patch('peer.store.get', return_value=_peer(role='viewer')):
+            ok, why = peer_tools.check_tool_permission('p1', 'mcp__mcp-actu__vla')
+
+        self.assertFalse(ok, 'viewer 通过了 vla 的检查 —— 层规则又失效了')
+        self.assertIn('actucore', why)
+
+    def test_perception_stays_reachable_by_a_viewer(self):
+        with mock.patch('peer.store.get', return_value=_peer(role='viewer')):
+            ok, _ = peer_tools.check_tool_permission('p1', 'mcp__mcp-perc__tts')
+
+        self.assertTrue(ok)
 
 
 if __name__ == '__main__':

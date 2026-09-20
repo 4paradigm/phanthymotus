@@ -82,6 +82,9 @@ def driver(monkeypatch):
     input the card was started with, which is the whole point: an ASR that was
     never started, or started without an input, has no output topic to report.
     """
+    # These fake drivers have no persisted tool schemas. Isolate their config
+    # from other suites (notably Solution tests restoring services to None).
+    monkeypatch.setattr(config, 'main', {'services': {'mcp': []}, 'core': {}})
     starts, started_input = {}, {}
 
     async def _call(mcp_id, req):

@@ -123,6 +123,28 @@ def query_latest(n: int = 20) -> list:
     return result
 
 
+def turns_between(start: float, end: float) -> list:
+    """一个时间窗内的 turn 及其 spans，按时间正序。
+
+    给基准测试的「运行详情」用：spans 里有每次工具调用的**真实起止时刻**，
+    而会话历史只有一轮被写完的时刻。两者相差一整轮的时长 —— 左右两栏于是对不上。
+    """
+    conn = _get_conn()
+    conn.row_factory = sqlite3.Row
+    turns = conn.execute(
+        'SELECT * FROM perf_turns WHERE created_at BETWEEN ? AND ? ORDER BY created_at',
+        (float(start), float(end))).fetchall()
+    result = []
+    for t in turns:
+        td = dict(t)
+        td['spans'] = [dict(s) for s in conn.execute(
+            'SELECT span, component, start_ts, end_ts, duration_ms FROM perf_spans '
+            'WHERE trace_id=? ORDER BY start_ts', (td['turn_id'],)).fetchall()]
+        result.append(td)
+    conn.close()
+    return result
+
+
 def query_spans(trace_id: str) -> list:
     """返回单个 turn 的全部 spans。"""
     conn = _get_conn()

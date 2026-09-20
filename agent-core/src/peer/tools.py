@@ -86,8 +86,39 @@ def tool_type(full_name: str) -> str:
 
 
 def tool_category(full_name: str) -> str:
-    """Which layer offers this tool: 'perception', 'actucore', 'driver', or ''."""
-    return str(_mcp_info(full_name).get('category') or '')
+    """Which layer offers this tool: 'perception', 'actucore', 'driver', or ''.
+
+    The layer is recorded when a device registers, in `config.main['services']['mcp']`
+    — the list `/api/mcp` returns. It is **not** in `mcp_client.registry`, which
+    holds runtime state (online, tools, schemas) and has never carried a
+    `category` key: grep the tree and the only writers of that key are the
+    services list and `start.py`'s own pseudo-devices.
+
+    Reading it from the runtime map therefore returned `''` for every real
+    device, which silently disabled both halves of the layer rule:
+
+    * `ACTING_CATEGORIES` never fired, so **actucore's tools were judged by their
+      declared type alone** — and `vla` declares `processor`, so a `viewer` peer
+      passed the read-only check for a tool that drives the robot. That is the
+      exact failure this module's docstring says the layer rule exists to prevent.
+    * `READ_ONLY_CATEGORIES` never fired, so perception tools declaring an
+      actuator type (`tts`) were treated as acting. Harmless by comparison — it
+      fails closed — but it is why a viewer could not reach the perception layer
+      the README promises it.
+
+    Surfaced on Orin6 by the benchmark panel's safety gate, which uses the same
+    classifier and flagged the perception bundle's `tts` as a device that moves.
+    """
+    info = _mcp_info(full_name)
+    if info.get('category'):
+        return str(info['category'])
+    parts = full_name.split('__', 2)
+    if len(parts) != 3:
+        return ''
+    import config
+    entry = next((m for m in (config.main.get('services', {}).get('mcp') or [])
+                  if m.get('id') == parts[1]), None)
+    return str((entry or {}).get('category') or '')
 
 
 def is_read_only(full_name: str) -> bool:
