@@ -82,6 +82,19 @@ def _environment() -> dict:
     }
 
 
+def _current_session() -> str:
+    """主 agent 当前的会话 id。
+
+    跑动结束之后要回看「它当时怎么想的、调了什么」，而那份记录在 `chat_history` 里
+    按会话存。不在开跑时记下来，事后就只能靠时间去猜是哪一段对话。
+    """
+    try:
+        import event
+        return str(getattr(event.llm, '_session_id', '') or '')
+    except Exception:
+        return ''
+
+
 async def _call(mcp_id: str, tool: str, args: dict) -> dict:
     result = await mcp_client.call_tool_direct(mcp_id, tool, args)
     return result if isinstance(result, dict) else {'error': str(result)}
@@ -411,7 +424,8 @@ async def run_case(request: CaseRunRequest):
         case.get('name', '') or 'case', n_repeats=repeats,
         tier=environment['tier'], llm_model=environment['llm_model'],
         llm_provider=environment['llm_provider'], host=environment['host'],
-        image_tags=environment['image_tags'], git_shas=environment['git_shas'])
+        image_tags=environment['image_tags'], git_shas=environment['git_shas'],
+        session_id=_current_session())
 
     run = benchmark_runner.CaseRun(case, mcp_id, repeats, int(request.seed),
                                    run_id, environment)
@@ -450,6 +464,94 @@ async def run_detail(run_id: str):
     if stored is None:
         raise fastapi.HTTPException(status_code=404, detail='unknown run')
     return stored
+
+
+@router.get('/runs/{run_id}/timeline')
+async def run_timeline(run_id: str):
+    """一次跑动里到底发生了什么 —— 说了什么、想了什么、调了什么、世界怎么回应。
+
+    分数只回答「好不好」，回答不了「哪儿坏了」。而这次跑动的现场**留不住**：仿真器
+    的世界下一次跑动一开始就被重置，会话历史会被压缩。所以事实在写入时就存进了
+    `benchmark_case.facts`，会话 id 存进了 `benchmark_run.session_id`。
+
+    两条轨道**不强行合成一条**。agent 那侧的时间是墙钟，世界那侧是仿真时钟，两个钟
+    相减没有意义 —— 各自归一到「从本轮开始起算的秒数」并排放，比编一个共同时间轴
+    诚实。对齐基准两边都是跑动开始：世界的第一条事件是 `scenario_load`（reset 那一刻），
+    agent 的第一轮是被那句初始指令唤醒的。
+    """
+    stored = benchmark_store.get_run(run_id)
+    if stored is None:
+        raise fastapi.HTTPException(status_code=404, detail='unknown run')
+
+    cases = stored.get('cases') or []
+    facts = next((c.get('facts') for c in cases if c.get('facts')), {}) or {}
+    events = facts.get('events') or []
+    base = events[0].get('t', 0) if events else 0
+
+    world = [{
+        'at': round(float(e.get('t', 0)) - base, 1),
+        'kind': e.get('event', ''),
+        'label': e.get('label', ''),
+        'text': e.get('text', ''),
+        'status': e.get('status', ''),
+    } for e in events]
+
+    return {
+        'run': {k: stored.get(k) for k in
+                ('id', 'suite', 'status', 'started_at', 'ended_at', 'n_repeats',
+                 'llm_model', 'image_tags', 'score_total', 'score_stdev')},
+        'cases': [{k: c.get(k) for k in
+                   ('repeat_idx', 'seed', 'outcome', 'score', 'assertions')}
+                  for c in cases],
+        'world': world,
+        'transcript': facts.get('transcript') or [],
+        'acp': facts.get('acp_posts') or [],
+        'agent': _agent_track(stored.get('session_id', ''),
+                              stored.get('started_at'), stored.get('ended_at')),
+    }
+
+
+def _agent_track(session_id: str, started, ended) -> list:
+    """这次跑动期间 agent 说了什么、调了什么。
+
+    按**轮**取，不按消息取：一轮就是「被什么唤醒 → 想了什么 → 调了哪些工具」，而
+    那正好是排查时要看的粒度。会话被清过或压缩掉就只能返回空 —— 与其编一段出来，
+    不如让前端说「这次跑动的对话记录已经没有了」。
+    """
+    if not session_id:
+        return []
+    try:
+        import chat_history
+        turns = chat_history.get_session_turns(session_id)
+    except Exception:
+        return []
+
+    track = []
+    for index, turn in enumerate(turns):
+        at = turn.get('started_at') or 0
+        if started and at and at < float(started) - 5:
+            continue          # 跑动开始之前的轮次，不是这次的事
+        if ended and at and at > float(ended) + 5:
+            continue
+        says, calls, trigger = [], [], ''
+        for message in turn.get('messages') or []:
+            role = message.get('role')
+            content = message.get('content')
+            if role == 'user' and isinstance(content, str) and not trigger:
+                trigger = content[:200]
+            elif role == 'assistant':
+                if isinstance(content, str) and content.strip():
+                    says.append(content.strip())
+                for call in message.get('tool_calls') or []:
+                    fn = (call.get('function') or {})
+                    calls.append({'name': str(fn.get('name', '')).split('__')[-1],
+                                  'args': str(fn.get('arguments', ''))[:200]})
+        track.append({
+            'turn': index,
+            'at': round(at - float(started), 1) if (started and at) else None,
+            'trigger': trigger, 'says': says, 'calls': calls,
+        })
+    return track
 
 
 @router.delete('/runs/{run_id}')

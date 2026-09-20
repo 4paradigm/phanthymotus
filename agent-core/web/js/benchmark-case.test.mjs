@@ -144,3 +144,30 @@ test('插话的延时空着按 0 算，不是 NaN', () => {
 
   assert.equal(row.delay, 0);
 });
+
+// ── 跑动现场：静默是线索 ─────────────────────────────────────────────────────
+
+import { withQuiet } from './benchmark-timeline.js';
+
+test('两条事件之间的长静默单独占一行', () => {
+  // 卡住、LLM 空转、barrier 等超时，在事件流里长得都一样：什么都没发生。
+  // 相邻两行挨着排，这段静默就看不见了 —— 而它通常就是答案。
+  const rows = withQuiet([{ at: 0, kind: 'arrive' }, { at: 300, kind: 'scenario_stop' }], 25);
+
+  assert.equal(rows.length, 3);
+  assert.equal(rows[1].quiet, 300);
+});
+
+test('挨得近的事件之间不插静默行', () => {
+  const rows = withQuiet([{ at: 0, kind: 'arrive' }, { at: 4, kind: 'speak_start' }], 25);
+
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every((r) => !r.quiet));
+});
+
+test('第一条事件前面不算静默', () => {
+  // 归一之后第一条就是 0 —— 拿它和「不存在的上一条」比，会凭空多出一行。
+  const rows = withQuiet([{ at: 40, kind: 'arrive' }], 25);
+
+  assert.equal(rows.length, 1);
+});

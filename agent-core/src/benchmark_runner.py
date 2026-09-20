@@ -220,19 +220,23 @@ class CaseRun:
         score = payload.get('score') or {}
         results = payload.get('results') or []
         elapsed = time.time() - started
+        failures = [r['name'] for r in results
+                    if not r['ok'] and r.get('detail') != '未断言']
+        name = self.case.get('name', '') or 'case'
+        outcome = 'error' if error else ('ok' if not failures else 'failed')
+        # `scenario` 和 `outcome` 也放进返回的行里：面板拿同一份数据渲染进度，
+        # 少了它们那一行就显示成「#1 ·」和「undefined」。
         row = {
             'repeat': index, 'seed': self.seed + index, 'elapsed': elapsed,
+            'scenario': name, 'outcome': outcome,
             'score': score, 'error': error,
-            'failures': [r['name'] for r in results if not r['ok'] and r.get('detail') != '未断言'],
-            'results': results,
+            'failures': failures, 'results': results,
         }
         benchmark_store.add_case(
-            self.run_id, scenario=self.case.get('name', '') or 'case',
-            repeat_idx=index, seed=self.seed + index,
-            ok=bool(not error and not row['failures']),
-            outcome='error' if error else ('ok' if not row['failures'] else 'failed'),
+            self.run_id, scenario=name, repeat_idx=index, seed=self.seed + index,
+            ok=bool(not error and not failures), outcome=outcome,
             score=score.get('total'), elapsed_ms=int(elapsed * 1000),
-            assertions=row['failures'])
+            assertions=failures, facts=payload.get('facts') or {})
         return row
 
     async def _finish(self) -> None:

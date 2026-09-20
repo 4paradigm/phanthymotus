@@ -372,3 +372,106 @@ def _request():
         headers: dict = {}
         cookies: dict = {}
     return _Req()
+
+
+# ── 跑完之后回看现场 ──────────────────────────────────────────────────────────
+
+FACTS = {
+    'events': [
+        {'t': 1000.0, 'event': 'scenario_load'},
+        {'t': 1020.0, 'event': 'nav_start', 'label': 'P3'},
+        {'t': 1035.5, 'event': 'arrive', 'label': 'P3'},
+        {'t': 1037.0, 'event': 'speak_start', 'text': 'P3 到了'},
+        {'t': 1041.0, 'event': 'speak_end', 'text': 'P3 到了', 'status': 'completed'},
+    ],
+    'transcript': [{'text': 'P3 到了', 'status': 'completed'}],
+    'acp_posts': [{'action_id': 'a1', 'status': 'completed'}],
+}
+
+
+def test_the_facts_survive_the_run_they_came_from():
+    """仿真器的世界下一次跑动一开始就被重置 —— 不在写入时存一份，跑完就再也没法
+    回答「分数为什么是这个」。"""
+    run_id = benchmark_store.create_run('导览', n_repeats=1)
+    benchmark_store.add_case(run_id, scenario='导览', repeat_idx=0, facts=FACTS)
+
+    timeline = asyncio.run(benchmark.run_timeline(run_id))
+
+    assert [w['kind'] for w in timeline['world']][:3] == [
+        'scenario_load', 'nav_start', 'arrive']
+    assert timeline['transcript'][0]['status'] == 'completed'
+
+
+def test_world_times_are_relative_to_the_start_of_the_run():
+    """世界那侧是仿真时钟，agent 那侧是墙钟 —— 两个钟相减没有意义，所以各自归一到
+    「从本轮开始起算的秒数」，而不是编一个共同时间轴。"""
+    run_id = benchmark_store.create_run('导览')
+    benchmark_store.add_case(run_id, scenario='导览', facts=FACTS)
+
+    world = asyncio.run(benchmark.run_timeline(run_id))['world']
+
+    assert world[0]['at'] == 0.0
+    assert world[2]['at'] == 35.5
+
+
+def test_the_agent_track_is_grouped_by_turn(monkeypatch):
+    """按轮取，不按消息取：一轮就是「被什么唤醒 → 想了什么 → 调了哪些工具」，
+    排查时要看的正好是这个粒度。"""
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?', ('s1', run_id))
+    conn.commit()
+
+    import chat_history
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': stored['started_at'] + 2, 'updated_at': 0,
+        'messages': [
+            {'role': 'user', 'content': '带我转一下展区'},
+            {'role': 'assistant', 'content': '好的，先去 P3。',
+             'tool_calls': [{'function': {'name': 'mcp__m1__controlled_spatial',
+                                          'arguments': '{"action":"navigate_to_tag"}'}}]},
+        ]}])
+
+    agent = asyncio.run(benchmark.run_timeline(run_id))['agent']
+
+    assert agent[0]['trigger'] == '带我转一下展区'
+    assert agent[0]['says'] == ['好的，先去 P3。']
+    assert agent[0]['calls'][0]['name'] == 'controlled_spatial'
+    assert agent[0]['at'] == 2.0
+
+
+def test_turns_from_before_the_run_are_not_claimed_as_its_own(monkeypatch):
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?', ('s1', run_id))
+    conn.commit()
+
+    import chat_history
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [
+        {'started_at': stored['started_at'] - 600, 'messages': [
+            {'role': 'user', 'content': '上一场对话'}]},
+        {'started_at': stored['started_at'] + 1, 'messages': [
+            {'role': 'user', 'content': '这一场'}]},
+    ])
+
+    agent = asyncio.run(benchmark.run_timeline(run_id))['agent']
+
+    assert [t['trigger'] for t in agent] == ['这一场']
+
+
+def test_a_cleared_history_is_an_empty_track_not_an_error(monkeypatch):
+    """会话被清过或压缩掉就返回空 —— 与其编一段出来，不如让前端说记录已经没有了。"""
+    run_id = benchmark_store.create_run('导览')
+
+    timeline = asyncio.run(benchmark.run_timeline(run_id))
+
+    assert timeline['agent'] == []
+
+
+def test_an_unknown_run_is_a_404():
+    with pytest.raises(fastapi.HTTPException) as caught:
+        asyncio.run(benchmark.run_timeline('nope'))
+
+    assert caught.value.status_code == 404

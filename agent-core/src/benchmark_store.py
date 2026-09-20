@@ -77,10 +77,23 @@ _SCHEMA = (
 )
 
 
+# 加列用 ALTER，不能靠 CREATE TABLE IF NOT EXISTS —— 表已经存在的机器上，新字段
+# 不会自己长出来。重复执行会报 duplicate column，吞掉即可。
+_ADDITIONS = (
+    'ALTER TABLE benchmark_case ADD COLUMN facts TEXT',
+    'ALTER TABLE benchmark_run ADD COLUMN session_id TEXT',
+)
+
+
 def _get_conn():
     conn = config._get_conn()
     for statement in _SCHEMA:
         conn.execute(statement)
+    for statement in _ADDITIONS:
+        try:
+            conn.execute(statement)
+        except Exception:
+            pass        # 已经有这一列
     return conn
 
 
@@ -100,15 +113,17 @@ def _loads(raw, fallback):
 
 def create_run(suite: str, *, tier: str = 'fidelity', n_repeats: int = 1,
                llm_model: str = '', llm_provider: str = '', host: str = '',
-               image_tags: dict | None = None, git_shas: dict | None = None) -> str:
+               image_tags: dict | None = None, git_shas: dict | None = None,
+               session_id: str = '') -> str:
     run_id = f'bm-{int(time.time())}-{uuid.uuid4().hex[:6]}'
     conn = _get_conn()
     conn.execute(
         'INSERT INTO benchmark_run (id, suite, tier, status, started_at, n_repeats, '
-        'llm_model, llm_provider, host, image_tags, git_shas) '
-        'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        'llm_model, llm_provider, host, image_tags, git_shas, session_id) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
         (run_id, suite, tier, 'running', time.time(), max(1, int(n_repeats)),
-         llm_model, llm_provider, host, _dumps(image_tags or {}), _dumps(git_shas or {})))
+         llm_model, llm_provider, host, _dumps(image_tags or {}), _dumps(git_shas or {}),
+         session_id))
     conn.commit()
     return run_id
 
@@ -116,13 +131,20 @@ def create_run(suite: str, *, tier: str = 'fidelity', n_repeats: int = 1,
 def add_case(run_id: str, *, scenario: str, repeat_idx: int = 0, seed: int = 0,
              ok: bool = False, outcome: str = '', score: float | None = None,
              elapsed_ms: int | None = None, assertions: list | None = None,
-             artifacts_ref: str = '') -> None:
+             artifacts_ref: str = '', facts: dict | None = None) -> None:
+    """记一次 repeat 的结果。
+
+    `facts` 是驱动那一侧的完整事实（事件流、播报记录、ACP 上报）。存下来，是因为
+    仿真器的世界**下一次跑动一开始就被重置**了 —— 不在这里留一份，一次跑动结束之后
+    就再也没法回看它到底发生了什么，而「分数为什么是这个」恰恰只能从那里回答。
+    """
     conn = _get_conn()
     conn.execute(
         'INSERT INTO benchmark_case (run_id, scenario, repeat_idx, seed, ok, outcome, '
-        'score, elapsed_ms, assertions, artifacts_ref) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        'score, elapsed_ms, assertions, artifacts_ref, facts) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
         (run_id, scenario, int(repeat_idx), int(seed), 1 if ok else 0, outcome,
-         score, elapsed_ms, _dumps(assertions or []), artifacts_ref))
+         score, elapsed_ms, _dumps(assertions or []), artifacts_ref,
+         _dumps(facts or {})))
     conn.commit()
 
 
@@ -149,12 +171,13 @@ def _run_row(row) -> dict:
         'image_tags': _loads(row[10], {}), 'git_shas': _loads(row[11], {}),
         'score_total': row[12], 'score_stdev': row[13],
         'scores_by_dim': _loads(row[14], {}), 'detail': row[15],
+        'session_id': row[16] if len(row) > 16 else '',
     }
 
 
 _RUN_COLUMNS = ('id, suite, tier, status, started_at, ended_at, n_repeats, llm_model, '
                 'llm_provider, host, image_tags, git_shas, score_total, score_stdev, '
-                'scores_by_dim, detail')
+                'scores_by_dim, detail, session_id')
 
 
 def list_runs(limit: int = 50) -> list[dict]:
@@ -175,10 +198,11 @@ def get_run(run_id: str) -> dict | None:
     run['cases'] = [
         {'scenario': c[0], 'repeat_idx': c[1], 'seed': c[2], 'ok': bool(c[3]),
          'outcome': c[4], 'score': c[5], 'elapsed_ms': c[6],
-         'assertions': _loads(c[7], []), 'artifacts_ref': c[8]}
+         'assertions': _loads(c[7], []), 'artifacts_ref': c[8],
+         'facts': _loads(c[9], {})}
         for c in conn.execute(
             'SELECT scenario, repeat_idx, seed, ok, outcome, score, elapsed_ms, '
-            'assertions, artifacts_ref FROM benchmark_case WHERE run_id=? ORDER BY id',
+            'assertions, artifacts_ref, facts FROM benchmark_case WHERE run_id=? ORDER BY id',
             (run_id,)).fetchall()
     ]
     return run

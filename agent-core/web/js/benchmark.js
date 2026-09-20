@@ -24,6 +24,7 @@
 
 import { showToast } from './toast.js';
 import { initEditor, openEditor } from './benchmark-editor.js';
+import { initTimeline, openTimeline } from './benchmark-timeline.js';
 
 // `auth.js` patches window.fetch to attach the Bearer token, so plain fetch is
 // already authenticated — there is no shared api() helper in this codebase.
@@ -48,6 +49,7 @@ let _runId = null;
 
 export function initBenchmark() {
   initEditor(_loadLibrary);
+  initTimeline();
   document.getElementById('bm-case-file')?.addEventListener('change', _pickCaseFile);
   document.getElementById('bm-case-new')?.addEventListener('click', _newCase);
   document.querySelectorAll('.bm-lib-tab').forEach((tab) => {
@@ -519,7 +521,7 @@ async function _loadRuns() {
     const config = [r.llm_model, Object.values(r.image_tags || {}).filter(Boolean).join(' ')]
       .filter(Boolean).join('  ');
     return `
-    <div class="bm-run-row">
+    <div class="bm-run-row" data-run="${_esc(r.id)}" title="点开看这次跑动的现场">
       <div class="bm-run-id">
         <div class="bm-run-when">${_time(r.started_at)}　${_esc(r.suite)}</div>
         <span class="bm-run-config">${_esc(config) || '未记录配置'}</span>
@@ -536,6 +538,10 @@ async function _loadRuns() {
       </div>
     </div>`;
   }).join('');
+
+  el.querySelectorAll('[data-run]').forEach((row) => {
+    row.addEventListener('click', () => openTimeline(row.dataset.run));
+  });
 }
 
 const _DIMS = {

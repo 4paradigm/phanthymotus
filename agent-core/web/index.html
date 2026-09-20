@@ -712,6 +712,18 @@
   </div>
 </div>
 
+<!-- 一次跑动的现场：说了什么、想了什么、调了什么、世界怎么回应。
+     分数只回答「好不好」，这里回答「哪儿坏了」。 -->
+<div class="modal-overlay hidden" id="bm-timeline-overlay">
+  <div class="modal bm-timeline-modal">
+    <div class="modal-header">
+      <span class="modal-title">跑动现场</span>
+      <button class="btn-icon" id="bm-timeline-close">&#10005;</button>
+    </div>
+    <div class="modal-body bm-timeline-body" id="bm-timeline-body"></div>
+  </div>
+</div>
+
 <!-- 用例编辑器。写的几乎全是自然语言：初始指令是用户会说的那句话，插话是他会插的
      那句话。只有触发条件是结构化的。地图是一个声明（一个字符串），**不是**从仿真器
      拉的下拉框 —— 判定层本来就要能判真机器人跑出来的事件流，一个必须先有仿真器地图
