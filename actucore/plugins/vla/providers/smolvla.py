@@ -149,6 +149,14 @@ class SmolVLAProvider:
             # `smolvla` is true of every one of them and tells an operator
             # reading `info()` nothing about which weights are loaded.
             "model": self._model or self._config.get("type") or "smolvla",
+            # SmolVLA 的动作是绝对关节角，反归一化之后就是弧度。声明它不是形式：
+            # negotiate 现在会拒绝一个不声明动作空间的模型，因为维度相同不代表空间
+            # 相同（一个 23 维的末端位姿模型和一张 23 维的关节卡片，数字完全吻合）。
+            #
+            # 写成常量而不是从 checkpoint 读，是因为 LeRobot 的 config 里没有这个
+            # 概念 —— 它由**微调数据集**决定，而不是由架构决定。将来出现一个用速度
+            # 或末端位姿微调的 SmolVLA，这里必须跟着改，而那时 negotiate 会先拦住它。
+            "control_mode": "joint_position",
             "action_dim": self._action_dim(),
             "chunk_size": self._chunk_size(),
             "control_hz": float(self._config.get("fps") or 30.0),

@@ -24,9 +24,15 @@ Two shapes live here, and the asymmetry is deliberate:
 A provider implements four methods:
 
     capabilities() -> dict
-        {model, action_dim, chunk_size, control_hz, needs_state, n_cameras,
-         image_size, supports_rtc}. Read once at start and reconciled against
-        the downstream driver's action space before anything moves.
+        {model, control_mode, action_dim, chunk_size, control_hz, needs_state,
+         n_cameras, image_size, supports_rtc}. Read once at start and reconciled
+        against the downstream driver's action space before anything moves.
+
+        `control_mode` 是 `motus.control/1` 的 MODES 之一（`joint_position`、
+        `joint_velocity`、`eef_pose`…），说的是 `infer()` 返回的那些数字**是什么**。
+        它和 `action_dim` 是两件事，而这正是它存在的理由：一个 23 维的末端位姿模型
+        和一张 23 维的关节卡片，维度完全吻合，把位姿当关节角发下去就是让机械臂走到
+        错误的地方。`negotiate.check()` 现在缺它就拒。
 
     infer(observation, inference_delay=0) -> list[list[float]]
         An action chunk, shape (T, action_dim), already in engineering units.
