@@ -640,8 +640,12 @@ async def run_timeline(run_id: str):
         'run': {k: stored.get(k) for k in
                 ('id', 'suite', 'status', 'started_at', 'ended_at', 'n_repeats',
                  'llm_model', 'image_tags', 'score_total', 'score_stdev')},
+        # `results` / `observations` 是「分数为什么是这个」的全部答案：每一项的判定
+        # 与理由、裁判对参考流程的逐步比对、七条原则算出来的那些数。不带上它们，
+        # 这个弹窗只能回答「好不好」，回答不了「哪儿坏了」——而后者才是打开它的理由。
         'cases': [{k: c.get(k) for k in
-                   ('repeat_idx', 'seed', 'outcome', 'score', 'assertions')}
+                   ('repeat_idx', 'seed', 'outcome', 'score', 'assertions',
+                    'results', 'observations')}
                   for c in cases],
         'world': world,
         'transcript': facts.get('transcript') or [],

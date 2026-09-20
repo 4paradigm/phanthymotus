@@ -31,6 +31,77 @@
 // （「到达之前不开讲」「平均懵逼时长不超过 10 秒」）。原先这里有一张把
 // `waypoint_order` 翻译成「站序不对」的表，那是断言名还是代码标识符时的事。
 
+const DIMS = {
+  world_timing: '物理世界时序性', concurrency: '同步执行效率',
+  llm_latency: 'LLM 延时', cache_hit: 'cache 命中',
+  answer_quality: '回答效果', ux: '用户体验', physical_safety: '安全',
+};
+
+/** 「分数为什么是这个」—— 每一项的判定、理由，以及算出来的那些数。
+ *
+ * 这一段原先不存在：跑完只留下失败项的名字，理由、裁判的逐步比对、七条原则的指标
+ * 全都只活在内存里。于是这个弹窗能回答「好不好」，回答不了「哪儿坏了」，而后者才是
+ * 打开它的理由。
+ */
+export function scorecard(c) {
+  const items = c.results || [];
+  if (!items.length) return (c.assertions || []).length
+    ? `<div class="bm-tl-fail">没过：${(c.assertions || []).map(_esc).join('、')}</div>` : '';
+
+  const byDim = {};
+  items.forEach((i) => (byDim[i.dimension || 'answer_quality'] ||= []).push(i));
+  const seen = c.observations || {};
+
+  return `<div class="bm-sc">${Object.keys(DIMS).filter((k) => byDim[k] || seen[k])
+    .map((k) => {
+      const group = byDim[k] || [];
+      const graded = group.filter((i) => i.measurable !== false);
+      const score = graded.length
+        ? Math.round(100 * graded.filter((i) => i.ok).reduce((a, i) => a + (i.weight || 0), 0)
+            / (graded.reduce((a, i) => a + (i.weight || 0), 0) || 1))
+        : null;
+      return `<div class="bm-sc-dim">
+        <div class="bm-sc-head">
+          <b>${_esc(DIMS[k])}</b>
+          <span class="bm-sc-num${score == null ? ' bm-sc-num--none' : ''}">${
+            score == null ? '判不了' : score}</span>
+          <span class="bm-sc-metrics">${_esc(metricLine(seen[k]))}</span>
+        </div>
+        ${group.map(scoreItem).join('')}
+      </div>`;
+    }).join('')}</div>`;
+}
+
+/** 一条判定：结论、它是算出来的还是判出来的、以及理由。 */
+export function scoreItem(i) {
+  const mark = i.measurable === false ? '—' : (i.ok ? '✓' : '✗');
+  const cls = i.measurable === false ? 'none' : (i.ok ? 'ok' : 'bad');
+  const from = i.kind === 'target' ? '算出来的' : '裁判判的';
+  return `<div class="bm-sc-item bm-sc-item--${cls}">
+    <span class="bm-sc-mark">${mark}</span>
+    <span class="bm-sc-text">${_esc(i.text || '')}
+      <i class="bm-sc-from">${from}${i.weight ? ` · 权重 ${i.weight}` : ''}</i></span>
+    ${i.detail ? `<span class="bm-clip bm-sc-why">${_esc(i.detail)}</span>` : ''}
+    ${(i.steps || []).length ? `<div class="bm-sc-steps">${(i.steps || []).map((s) => `
+      <div class="bm-sc-step${s.match ? '' : ' bm-sc-step--off'}">
+        <span>${s.match ? '符合' : '偏离'}</span>
+        <span>${_esc(s.step || '')}</span>
+        <span class="bm-clip">${_esc(s.note || '')}</span>
+      </div>`).join('')}</div>` : ''}
+  </div>`;
+}
+
+/** 那条原则算出来的几个数。判分会抖，这些不会 —— 所以它们要一直在。 */
+export function metricLine(block) {
+  if (!block || typeof block !== 'object') return '';
+  return Object.entries(block)
+    .filter(([, v]) => typeof v === 'number' || typeof v === 'string')
+    .filter(([, v]) => v !== '')
+    .slice(0, 5)
+    .map(([k, v]) => `${k} ${typeof v === 'number' ? Math.round(v * 100) / 100 : v}`)
+    .join('　');
+}
+
 // 一次运行里最值钱的线索往往是「这里什么都没发生」—— 机器人卡住、LLM 空转、
 // barrier 等超时，长得都一样：一段静默。
 //
@@ -149,10 +220,7 @@ function _render(data) {
       <span class="bm-tl-meta">${_esc(run.suite || '')}　${_esc(run.llm_model || '')}
         ${_esc(Object.values(run.image_tags || {}).filter(Boolean).join(' '))}</span>
     </div>
-    ${(data.cases || []).map((c) => (c.assertions || []).length
-      ? `<div class="bm-tl-fail">没过：${(c.assertions || [])
-          .map((a) => _esc(a)).join('、')}</div>`
-      : '').join('')}`;
+    ${(data.cases || []).map(scorecard).join('')}`;
 
   const agent = data.agent || [];
   const world = data.world || [];

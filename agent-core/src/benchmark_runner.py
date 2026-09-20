@@ -394,7 +394,8 @@ class CaseRun:
             self.run_id, scenario=name, repeat_idx=index, seed=self.seed + index,
             ok=bool(not error and not failures), outcome=outcome,
             score=score.get('total'), elapsed_ms=int(elapsed * 1000),
-            assertions=failures, facts=payload.get('facts') or {})
+            assertions=failures, facts=payload.get('facts') or {},
+            results=results, observations=payload.get('observations') or {})
         return row
 
     async def _finish(self) -> None:

@@ -81,6 +81,11 @@ _SCHEMA = (
 # 不会自己长出来。重复执行会报 duplicate column，吞掉即可。
 _ADDITIONS = (
     'ALTER TABLE benchmark_case ADD COLUMN facts TEXT',
+    # 判定的**理由**和七条原则的**指标**。原先只存失败项的文本（`assertions`），
+    # 于是跑完之后「分数为什么是这个」答不了 —— 而那恰恰是打开这个面板的第一个问题。
+    # 裁判的逐步比对尤其：它是排查时最有用的那一份，却只活在内存里。
+    'ALTER TABLE benchmark_case ADD COLUMN results TEXT',
+    'ALTER TABLE benchmark_case ADD COLUMN observations TEXT',
     'ALTER TABLE benchmark_run ADD COLUMN session_id TEXT',
     'ALTER TABLE benchmark_run ADD COLUMN agent_track TEXT',
 )
@@ -132,20 +137,26 @@ def create_run(suite: str, *, tier: str = 'fidelity', n_repeats: int = 1,
 def add_case(run_id: str, *, scenario: str, repeat_idx: int = 0, seed: int = 0,
              ok: bool = False, outcome: str = '', score: float | None = None,
              elapsed_ms: int | None = None, assertions: list | None = None,
-             artifacts_ref: str = '', facts: dict | None = None) -> None:
+             artifacts_ref: str = '', facts: dict | None = None,
+             results: list | None = None, observations: dict | None = None) -> None:
     """记一次 repeat 的结果。
 
     `facts` 是驱动那一侧的完整事实（事件流、播报记录、ACP 上报）。存下来，是因为
     仿真器的世界**下一次运行一开始就被重置**了 —— 不在这里留一份，一次运行结束之后
     就再也没法回看它到底发生了什么，而「分数为什么是这个」恰恰只能从那里回答。
+
+    `results` 是每一项的判定与**理由**，`observations` 是七条原则的指标块。同样是
+    「不存就没了」：它们原先只活在内存里的 `CaseRun`，跑完那个对象就被下一次运行顶掉。
+    裁判对参考流程的逐步比对尤其 —— 那是排查时最有用的一份，而它一次都没落过盘。
     """
     conn = _get_conn()
     conn.execute(
         'INSERT INTO benchmark_case (run_id, scenario, repeat_idx, seed, ok, outcome, '
-        'score, elapsed_ms, assertions, artifacts_ref, facts) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        'score, elapsed_ms, assertions, artifacts_ref, facts, results, observations) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
         (run_id, scenario, int(repeat_idx), int(seed), 1 if ok else 0, outcome,
          score, elapsed_ms, _dumps(assertions or []), artifacts_ref,
-         _dumps(facts or {})))
+         _dumps(facts or {}), _dumps(results or []), _dumps(observations or {})))
     conn.commit()
 
 
@@ -223,10 +234,12 @@ def get_run(run_id: str) -> dict | None:
         {'scenario': c[0], 'repeat_idx': c[1], 'seed': c[2], 'ok': bool(c[3]),
          'outcome': c[4], 'score': c[5], 'elapsed_ms': c[6],
          'assertions': _loads(c[7], []), 'artifacts_ref': c[8],
-         'facts': _loads(c[9], {})}
+         'facts': _loads(c[9], {}), 'results': _loads(c[10], []),
+         'observations': _loads(c[11], {})}
         for c in conn.execute(
             'SELECT scenario, repeat_idx, seed, ok, outcome, score, elapsed_ms, '
-            'assertions, artifacts_ref, facts FROM benchmark_case WHERE run_id=? ORDER BY id',
+            'assertions, artifacts_ref, facts, results, observations '
+            'FROM benchmark_case WHERE run_id=? ORDER BY id',
             (run_id,)).fetchall()
     ]
     return run

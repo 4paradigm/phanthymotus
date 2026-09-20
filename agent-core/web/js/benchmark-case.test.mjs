@@ -174,7 +174,7 @@ test('插话的延时空着按 0 算，不是 NaN', () => {
 
 // ── 跑动现场：静默是线索 ─────────────────────────────────────────────────────
 
-import { withQuiet, merge } from './benchmark-timeline.js';
+import { withQuiet, merge, scorecard, scoreItem, metricLine } from './benchmark-timeline.js';
 
 test('每一段静默都画出来，不只是最长的那段', () => {
   // 排查时要看的是「时间去哪儿了」。每行左边虽然有 +Xs，但那要人自己做减法 ——
@@ -336,4 +336,72 @@ test('样本不够时把理由说出来，不是静默省略', () => {
 
   assert.match(note, /只有 1 条/);
   assert.doesNotMatch(note, /更好|更差/);
+});
+
+
+// ── 分数为什么是这个 ──────────────────────────────────────────────────────────
+//
+// 这一段原先不存在：跑完只留下失败项的名字，理由、裁判的逐步比对、七条原则的指标
+// 全都只活在内存里。于是详情弹窗能回答「好不好」，回答不了「哪儿坏了」。
+
+test('每一项都说清楚是算出来的还是判出来的', () => {
+  // 一个不会抖，一个会 —— 读的人该知道自己在看哪一种。
+  const target = scoreItem({ kind: 'target', ok: true, text: '空档不超过两成',
+                             detail: '0.12（目标 ≤0.2）', weight: 10 });
+  const judged = scoreItem({ kind: 'requirement', ok: true, text: '到了再讲',
+                             detail: 'arrive 在先', weight: 25 });
+
+  assert.match(target, /算出来的/);
+  assert.match(judged, /裁判判的/);
+});
+
+test('判不了既不是通过也不是失败', () => {
+  const html = scoreItem({ kind: 'target', ok: false, measurable: false,
+                           text: '打断后 3 秒内有反应', detail: '仿真时钟…' });
+
+  assert.match(html, /bm-sc-item--none/);
+  assert.doesNotMatch(html, /bm-sc-item--bad/);
+});
+
+test('参考流程逐步展开，偏离的那步标出来', () => {
+  const html = scoreItem({ kind: 'requirement', ok: true, text: '按参考流程执行',
+    steps: [{ step: '1. 打开地图', match: true, note: 'at=7.9 list_tags' },
+            { step: '2. 导航过去', match: false, note: '直接走了' }] });
+
+  assert.match(html, /1\. 打开地图/);
+  assert.match(html, /bm-sc-step--off/);
+  assert.match(html, /直接走了/);
+});
+
+test('一条要求都没判不了的原则，分数写「判不了」而不是 0', () => {
+  // 一个 0 会被当成「测了，没过」。
+  const html = scorecard({ results: [
+    { dimension: 'physical_safety', ok: false, measurable: false,
+      text: '全程没有撞停', detail: '没有轨迹数据' }] });
+
+  assert.match(html, /判不了/);
+  assert.doesNotMatch(html, /bm-sc-num">0</);
+});
+
+test('原则分按权重算，和后端一致', () => {
+  const html = scorecard({ results: [
+    { dimension: 'world_timing', ok: true, weight: 30, text: 'a' },
+    { dimension: 'world_timing', ok: false, weight: 10, text: 'b' }] });
+
+  assert.match(html, />75</);
+});
+
+test('指标一直显示，不管那条原则判没判得了', () => {
+  // 判分会抖，「中位 8.4s」不会 —— 所以它要一直在。
+  const line = metricLine({ median_s: 8.4231, rounds: 12, note: '' });
+
+  assert.match(line, /median_s 8.42/);
+  assert.match(line, /rounds 12/);
+});
+
+test('老记录没有 results 时退回原来那行，不是空白', () => {
+  const html = scorecard({ assertions: ['站序不对'] });
+
+  assert.match(html, /没过/);
+  assert.match(html, /站序不对/);
 });

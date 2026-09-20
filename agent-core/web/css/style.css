@@ -8761,6 +8761,31 @@ html, body {
 /* 常驻提示条：这张画布上有会动的真设备。挑用例之前就说，不等按了运行才拦。 */
 /* 「判不了」和「没过」要看得出区别 —— 一个是 agent 做错了，一个是这次测不到。 */
 .bm-dim-none { color: var(--text-muted); font-style: italic; }
+/* 「分数为什么是这个」。每条原则一块，块里是一项一项的判定。 */
+.bm-sc { margin: 10px 0 14px; }
+.bm-sc-dim { margin-bottom: 10px; padding-left: 9px; border-left: 2px solid var(--border); }
+.bm-sc-head { display: flex; align-items: baseline; gap: 9px; font-size: 12px; }
+.bm-sc-num { font-family: var(--font-mono); font-weight: 600; }
+/* 「判不了」不着色也不加粗 —— 一个醒目的「判不了」会被当成一个分数。 */
+.bm-sc-num--none { font-weight: 400; color: var(--text-muted); }
+.bm-sc-metrics {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-mono); font-size: 10px; color: var(--text-muted);
+}
+.bm-sc-item {
+  display: grid; grid-template-columns: 14px 1fr; gap: 2px 6px;
+  margin-top: 5px; font-size: 11px; line-height: 1.5;
+}
+.bm-sc-mark { font-weight: 600; }
+.bm-sc-item--ok .bm-sc-mark { color: var(--green, #2E7D32); }
+.bm-sc-item--bad .bm-sc-mark { color: var(--red); }
+.bm-sc-item--none .bm-sc-mark { color: var(--text-muted); }
+/* 「算出来的」和「裁判判的」要分得清：一个不会抖，一个会。 */
+.bm-sc-from { margin-left: 6px; font-size: 10px; font-style: normal; color: var(--text-muted); }
+.bm-sc-why, .bm-sc-steps { grid-column: 2; color: var(--text-muted); }
+.bm-sc-step { display: flex; gap: 7px; margin-top: 2px; font-size: 10px; }
+.bm-sc-step > span:first-child { flex: none; color: var(--green, #2E7D32); }
+.bm-sc-step--off > span:first-child { color: var(--red); }
 .bm-compare { margin-bottom: 9px; font-size: 11px; line-height: 1.6; }
 .bm-compare b { font-weight: 600; }
 /* 不显著就不着色 —— 一个绿色的「测不出显著差异」仍然会被读成「变好了」。 */
