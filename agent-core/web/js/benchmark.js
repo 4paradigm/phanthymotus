@@ -1,12 +1,15 @@
 /**
- * benchmark.js — 浏览场景、勾选批次、起跑、看分数、看本机历史。
+ * benchmark.js — 用例库、起跑、看分数、看本机历史。
+ *
+ * 主体是**看现有的方案**：本机一份可编辑的用例库，加上市场里带 `test` 段的方案。
+ * 打开一个用例文件是导入路径，不是入口 —— 它在标签旁边，是个小链接。
  *
  * 这块只回答一个问题：**分数动没动，为什么。** 所以历史里的分数不是表格里的数字，
  * 而是共享 0-100 轴上的一个刻度：标准差是须线，样本量印在刻度旁，模型与镜像 tag
  * 作为这一行的身份。「动没动」由形状回答，不用在四个列之间心算。
  *
  * 这一块是「单次跑的过程可视化」之外的另一个需求：已有的面板（画布、活动流、
- * performance、history）能看一趟跑得怎么样，但看不了「有哪些场景能跑、跑哪些、
+ * performance、history）能看一趟跑得怎么样，但看不了「有哪些用例、跑哪个、
  * 每次多少分、分数趋势」。
  *
  * 两条在 UI 上必须守住的规矩：
@@ -20,6 +23,7 @@
  */
 
 import { showToast } from './toast.js';
+import { initEditor, openEditor } from './benchmark-editor.js';
 
 // `auth.js` patches window.fetch to attach the Bearer token, so plain fetch is
 // already authenticated — there is no shared api() helper in this codebase.
@@ -41,16 +45,17 @@ async function api(path, opts) {
 
 let _pollTimer = null;
 let _runId = null;
-let _mode = 'suite';         // 'case' 的进度在另一个端点上
-let _scenarios = [];
 
 export function initBenchmark() {
+  initEditor(_loadLibrary);
   document.getElementById('bm-case-file')?.addEventListener('change', _pickCaseFile);
+  document.getElementById('bm-case-new')?.addEventListener('click', _newCase);
+  document.querySelectorAll('.bm-lib-tab').forEach((tab) => {
+    tab.addEventListener('click', () => _switchTab(tab.dataset.lib));
+  });
   document.getElementById('benchmark-close')?.addEventListener('click', _close);
   document.getElementById('btn-benchmark')?.addEventListener('click', _open);
-  document.getElementById('bm-run')?.addEventListener('click', _run);
   document.getElementById('bm-abort')?.addEventListener('click', _abort);
-  document.getElementById('bm-refresh')?.addEventListener('click', _load);
   document.getElementById('bm-repeats')?.addEventListener('input', _repeatsNote);
   _repeatsNote();
   _detect();
@@ -96,43 +101,147 @@ function _close() {
 }
 
 async function _load() {
-  await Promise.all([_loadCase(), _loadScenarios(), _loadRuns()]);
+  await Promise.all([_loadLibrary(), _loadRuns()]);
   await _poll();
 }
 
-// ── 用例 ─────────────────────────────────────────────────────────────────────
+// ── 用例库 ───────────────────────────────────────────────────────────────────
 //
-// 用例是一个带 `test` 段的解决方案，所以它自带画布 —— 载入会覆盖用户现在这张。
-// 这一段的三件事全都围绕那一次覆盖：先给退路（存成文件），再要明确的勾选，最后
-// 把「为什么还跑不了」按层说清楚，而不是给一个灰掉的按钮。
+// 主体是**看现有的方案**：本机一份可编辑的库，加上市场里带 `test` 段的方案。
+// 「导入文件」还在，但它是导入路径，不是入口。
+//
+// 用例自带画布，所以跑一个还没载入的用例会覆盖当前这张 —— 那条路照旧：先给退路
+// （把当前画布存下来），再要明确的勾选。
 
-let _pending = null;      // 已读入但还没载入的用例包体
+let _cases = [];
+let _tab = 'local';
 
-async function _loadCase() {
-  try {
-    const data = await api('/api/benchmark/case');
-    _renderCase(data.case ? { loaded: data } : null);
-  } catch { _renderCase(null); }
-}
-
-function _renderCase(view) {
-  const el = document.getElementById('bm-case');
+async function _loadLibrary() {
+  if (_tab === 'market') return _loadMarketCases();
+  const el = document.getElementById('bm-lib-local');
   if (!el) return;
+  try {
+    _cases = (await api('/api/benchmark/cases')).cases || [];
+  } catch { _cases = []; }
 
-  if (_pending) { el.innerHTML = _pendingHtml(); _bindPending(); return; }
-  if (!view?.loaded?.case) {
-    el.innerHTML = `<div class="bm-empty">还没有载入用例。<br>
-      用例是一个带 <code>test</code> 段的解决方案，打开一个用例文件就能跑。</div>`;
+  if (!_cases.length) {
+    // 空状态是行动邀请，不是句号。
+    el.innerHTML = `<div class="bm-empty">本机还没有用例。<br>
+      从「市场」收一个，或者「新建」一个从头写。</div>`;
     return;
   }
+  el.innerHTML = _cases.map(_caseCard).join('');
+  _bindCaseCards(el);
+}
 
-  const { case: block, problems = [], readiness = {} } = view.loaded;
-  el.innerHTML = `
-    <div class="bm-case-loaded">
-      <div class="bm-case-title">${_esc(block.name || '当前用例')}</div>
-      <div class="bm-case-prompt">“${_esc((block.run || {}).prompt || '')}”</div>
-      ${_blockers(problems, readiness)}
+function _caseCard(c) {
+  // 地图名不进这一行 —— 扫列表时它不影响选哪个用例，而它一挤，站数和插话数就被
+  // 省略号吃掉了。地图在编辑器里看。
+  const bits = [
+    c.waypoints ? `${c.waypoints} 站` : '',
+    c.injections ? `${c.injections} 处插话` : '',
+  ].filter(Boolean).join(' · ');
+  // 分数贴着用例本身 ——「这个用例现在多少分」是打开面板的第一个问题，
+  // 让它只活在右栏历史里，等于要人自己把两边对起来。
+  const last = c.last
+    ? `<span class="bm-card-score">${c.last.score_total ?? '—'}${
+        c.last.score_stdev != null ? ` ±${c.last.score_stdev}` : ''
+      }<span class="bm-n">n=${c.last.n_repeats}</span></span>`
+    : '<span class="bm-card-score bm-card-score--none">还没跑过</span>';
+  return `
+    <div class="bm-card${c.isLoaded ? ' bm-card--loaded' : ''}" data-id="${_esc(c.id)}">
+      <div class="bm-card-head">
+        <span class="bm-card-name">${_esc(c.name)}</span>
+        ${last}
+      </div>
+      <div class="bm-card-prompt">“${_esc(c.prompt || '还没写初始指令')}”</div>
+      <div class="bm-card-foot">
+        <span class="bm-card-meta">${
+          c.isLoaded ? '<i class="bm-card-flag">已在画布上</i>' : ''}${_esc(bits)}</span>
+        <span class="bm-card-actions">
+          <button class="bm-linkbtn" data-edit="${_esc(c.id)}">编辑</button>
+          <button class="bm-linkbtn" data-del="${_esc(c.id)}">删除</button>
+          <button class="bm-cardrun" data-run="${_esc(c.id)}">跑</button>
+        </span>
+      </div>
+      ${(c.problems || []).length ? `<ul class="bm-blockers">${
+        c.problems.map((p) => `<li>${_esc(p)}</li>`).join('')}</ul>` : ''}
     </div>`;
+}
+
+function _bindCaseCards(el) {
+  el.querySelectorAll('[data-edit]').forEach((b) => b.addEventListener(
+    'click', () => openEditor(b.dataset.edit)));
+  el.querySelectorAll('[data-run]').forEach((b) => b.addEventListener(
+    'click', () => _startCase(b.dataset.run)));
+  el.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+    const card = _cases.find((c) => c.id === b.dataset.del);
+    if (!window.confirm(`删掉用例「${card?.name || ''}」？跑过的分数会留在历史里。`)) return;
+    await api(`/api/benchmark/cases/${b.dataset.del}`, { method: 'DELETE' });
+    await _loadLibrary();
+  }));
+}
+
+async function _loadMarketCases() {
+  const el = document.getElementById('bm-lib-market');
+  if (!el) return;
+  el.innerHTML = '<div class="bm-empty">加载中…</div>';
+  let data;
+  try {
+    data = await api('/api/benchmark/cases/market');
+  } catch (e) {
+    el.innerHTML = `<div class="bm-empty">连不上方案市场：${_esc(e.message || e)}</div>`;
+    return;
+  }
+  const items = data.cases || [];
+  if (!items.length) {
+    el.innerHTML = data.error
+      ? `<div class="bm-empty">连不上方案市场：${_esc(data.error)}</div>`
+      : '<div class="bm-empty">市场上还没有带测试用例的方案。</div>';
+    return;
+  }
+  el.innerHTML = items.map((s) => `
+    <div class="bm-card">
+      <div class="bm-card-head">
+        <span class="bm-card-name">${_esc(s.name)}</span>
+        <span class="bm-card-meta">v${_esc(s.version || '')} ↓${s.downloads || 0}</span>
+      </div>
+      <div class="bm-card-prompt">${_esc(s.oneLiner || '')}</div>
+      <div class="bm-card-foot">
+        <span class="bm-card-meta">${(s.requiredDrivers || [])
+          .map((d) => _esc(d.name || d.serverName || '')).join('、')}</span>
+        <button class="bm-cardrun" data-grab="${_esc(s.slug)}">收进本机</button>
+      </div>
+    </div>`).join('');
+  el.querySelectorAll('[data-grab]').forEach((b) => b.addEventListener(
+    'click', () => _grabFromMarket(b.dataset.grab)));
+}
+
+async function _grabFromMarket(slug) {
+  try {
+    // 市场列表不带包体（几十 KB），要收进本机得单取一次详情。
+    const detail = await api(`/api/solutions/market/${slug}`);
+    const solution = detail.data || {};
+    await api('/api/benchmark/cases', {
+      method: 'POST',
+      body: JSON.stringify({ payload: solution.payload, name: solution.name,
+                             origin: `market:${slug}` }),
+    });
+    _switchTab('local');
+    showToast(`已收进本机：${solution.name || slug}`);
+  } catch (e) {
+    showToast(`收不进来：${e.message || e}`);
+  }
+}
+
+function _switchTab(which) {
+  _tab = which;
+  document.querySelectorAll('.bm-lib-tab').forEach((t) => {
+    t.classList.toggle('active', t.dataset.lib === which);
+  });
+  document.getElementById('bm-lib-local')?.classList.toggle('hidden', which !== 'local');
+  document.getElementById('bm-lib-market')?.classList.toggle('hidden', which !== 'market');
+  _loadLibrary();
 }
 
 /**
@@ -153,69 +262,73 @@ export function blockerRows(problems = [], readiness = {}) {
   return rows;
 }
 
-function _blockers(problems, readiness) {
-  const rows = blockerRows(problems, readiness);
-  if (!rows.length) return '<div class="bm-case-ok">依赖齐了，可以跑。</div>';
-  return `<ul class="bm-blockers">${rows.map((r) => `<li>${r}</li>`).join('')}</ul>`;
+// ── 跑一个用例：没载入就先过覆盖确认 ─────────────────────────────────────────
+
+async function _startCase(caseId) {
+  const card = _cases.find((c) => c.id === caseId);
+  const repeats = Math.max(1, parseInt(document.getElementById('bm-repeats')?.value || '1', 10));
+
+  let pre;
+  try {
+    pre = (await api(`/api/benchmark/cases/${caseId}/preflight`, {
+      method: 'POST', body: JSON.stringify({}),
+    })).data;
+  } catch (e) {
+    showToast(`检查失败：${e.message || e}`); return;
+  }
+
+  const rows = blockerRows(pre?.test?.problems || [], pre?.test?.readiness || {});
+  (pre?.devices?.missing || []).forEach((d) => rows.unshift(
+    `缺驱动 <b>${_esc(d.serverName || d.name || '')}</b>　先装上并启动它`));
+  if (rows.length) { _showBlockers(card?.name || '这个用例', rows); return; }
+
+  if (card?.isLoaded) { await _runCase(repeats); return; }
+  _confirmOverwrite(caseId, card, pre, repeats);
 }
 
-function _pendingHtml() {
-  const test = _pending.payload.test || {};
-  const cards = ((_pending.payload.canvas || {}).cards || []).length;
-  const missing = _pending.preflight?.devices?.missing || [];
-  const overwrite = _pending.preflight?.overwrite?.canvas || {};
-  return `
-    <div class="bm-case-loaded">
-      <div class="bm-case-title">${_esc(_pending.name)}</div>
-      <div class="bm-case-prompt">“${_esc((test.run || {}).prompt || '')}”</div>
-      ${missing.length ? `<ul class="bm-blockers">${missing.map((d) => `
-        <li>缺驱动 <b>${_esc(d.serverName || d.name || '')}</b>　先装上并启动它</li>`).join('')}</ul>`
-        : `<p class="bm-note">这个用例自带 ${cards} 张卡片，载入会替换掉画布上现在的
-             ${overwrite.cards ?? 0} 张。</p>`}
+function _showBlockers(name, rows) {
+  const el = document.getElementById('bm-progress');
+  if (!el) return;
+  el.innerHTML = `<div class="bm-blocked">
+    <b>${_esc(name)}</b> 还跑不了：
+    <ul class="bm-blockers">${rows.map((r) => `<li>${r}</li>`).join('')}</ul>
+  </div>`;
+}
+
+function _confirmOverwrite(caseId, card, pre, repeats) {
+  const el = document.getElementById('bm-progress');
+  if (!el) return;
+  const mine = pre?.overwrite?.canvas?.cards ?? 0;
+  el.innerHTML = `
+    <div class="bm-overwrite">
+      <p class="bm-note">跑「${_esc(card?.name || '')}」要先把它自带的画布载入进来，
+        会替换掉画布上现在的 ${mine} 张卡片。</p>
       <button class="bm-linkbtn" id="bm-save-canvas">先把当前画布存成解决方案</button>
       <label class="bm-confirm"><input type="checkbox" id="bm-confirm-overwrite">
         我知道会覆盖当前画布</label>
       <div class="bm-case-actions">
-        <button class="btn-primary" id="bm-case-apply" disabled>载入用例</button>
+        <button class="btn-primary" id="bm-case-apply" disabled>载入并开跑</button>
         <button class="bm-linkbtn" id="bm-case-cancel">取消</button>
       </div>
     </div>`;
-}
-
-function _bindPending() {
   const confirm = document.getElementById('bm-confirm-overwrite');
   const apply = document.getElementById('bm-case-apply');
   // 覆盖是默认不做的事：勾了才亮。
   confirm?.addEventListener('change', () => { apply.disabled = !confirm.checked; });
-  document.getElementById('bm-save-canvas')?.addEventListener('click', _saveCanvas);
-  document.getElementById('bm-case-apply')?.addEventListener('click', _applyCase);
-  document.getElementById('bm-case-cancel')?.addEventListener('click', () => {
-    _pending = null; _loadCase();
+  document.getElementById('bm-save-canvas')?.addEventListener('click', saveCanvasSnapshot);
+  document.getElementById('bm-case-cancel')?.addEventListener('click', () => { _poll(); });
+  apply?.addEventListener('click', async () => {
+    try {
+      await api(`/api/benchmark/cases/${caseId}/apply`, {
+        method: 'POST', body: JSON.stringify({}),
+      });
+    } catch (e) { showToast(`载入失败：${e.message || e}`); return; }
+    await _loadLibrary();
+    await _runCase(repeats);
   });
 }
 
-async function _pickCaseFile(event) {
-  const file = event.target.files?.[0];
-  event.target.value = '';
-  if (!file) return;
-  let payload;
-  try {
-    payload = JSON.parse(await file.text());
-  } catch { showToast('这个文件不是解决方案包体'); return; }
-  if (!payload.test) { showToast('这个解决方案没有 test 段，不是一个测试用例'); return; }
-
-  try {
-    const result = await api('/api/solutions/preflight', {
-      method: 'POST', body: JSON.stringify({ payload, includes: ['canvas', 'test'] }),
-    });
-    _pending = { name: file.name.replace(/\.json$/i, ''), payload, preflight: result.data };
-    _renderCase(null);
-  } catch (e) {
-    showToast(`读不了这个用例：${e.message || e}`);
-  }
-}
-
-async function _saveCanvas() {
+export async function saveCanvasSnapshot() {
   try {
     const result = await api('/api/benchmark/snapshot', { method: 'POST' });
     // 存两份：一份留在机器上（还原用），一份下载（能在别处载入）。
@@ -232,76 +345,37 @@ async function _saveCanvas() {
   }
 }
 
-async function _applyCase() {
+async function _pickCaseFile(event) {
+  const file = event.target.files?.[0];
+  event.target.value = '';
+  if (!file) return;
+  let payload;
   try {
-    await api('/api/solutions/apply', {
+    payload = JSON.parse(await file.text());
+  } catch { showToast('这个文件不是解决方案包体'); return; }
+
+  try {
+    await api('/api/benchmark/cases', {
       method: 'POST',
-      body: JSON.stringify({ payload: _pending.payload, includes: ['canvas', 'test'],
-                             confirm: true }),
+      body: JSON.stringify({ payload, name: file.name.replace(/\.json$/i, ''),
+                             origin: 'file' }),
     });
-    _pending = null;
-    await _loadCase();
-    showToast('用例已载入，画布已换成它自带的那张');
+    _switchTab('local');
+    showToast('已导入本机用例库');
   } catch (e) {
-    showToast(`载入失败：${e.message || e}`);
+    showToast(`导入失败：${e.message || e}`);
   }
 }
 
-// ── 场景 ─────────────────────────────────────────────────────────────────────
-
-async function _loadScenarios() {
-  const el = document.getElementById('bm-scenarios');
-  if (!el) return;
+async function _newCase() {
   try {
-    const data = await api('/api/benchmark/scenarios');
-    _scenarios = data.scenarios || [];
-  } catch {
-    _scenarios = [];
-  }
-  if (!_scenarios.length) {
-    // 空状态是行动邀请，不是句号：说清楚去哪儿放，人就知道下一步做什么。
-    el.innerHTML = `<div class="bm-empty">还没有场景。<br>
-      把一个 yaml 放进 <code>/opt/phanthy-motus/data/sim/scenarios</code>，
-      再点「重新扫描」。</div>`;
-    return;
-  }
-  el.innerHTML = _scenarios.map((s) => {
-    const stops = (s.waypoints || []).length;
-    const bits = [stops ? `${stops} 站` : '点位随地图', (s.injections || []).length ? '含打断' : ''];
-    return `
-    <label class="bm-scenario">
-      <input type="checkbox" value="${_esc(s.slug)}" checked>
-      <span class="bm-scenario-name">${_esc(s.name || s.slug)}</span>
-      <span class="bm-scenario-meta">${bits.filter(Boolean).join('　')}</span>
-    </label>`;
-  }).join('');
-}
-
-function _selected() {
-  return Array.from(document.querySelectorAll('#bm-scenarios input:checked'))
-    .map((el) => el.value);
-}
-
-// ── 起一批 ───────────────────────────────────────────────────────────────────
-
-async function _run() {
-  const repeats = Math.max(1, parseInt(document.getElementById('bm-repeats')?.value || '1', 10));
-  // 载入了用例就跑用例 —— 它自带画布、指令和判定，比勾几个场景说得更全。
-  if (document.querySelector('.bm-case-ok')) { await _runCase(repeats); return; }
-
-  const scenarios = _selected();
-  if (!scenarios.length) { showToast('先选至少一个场景'); return; }
-  try {
-    const result = await api('/api/benchmark/run', {
-      method: 'POST',
-      body: JSON.stringify({ scenarios, repeats, seed: 0 }),
+    const created = await api('/api/benchmark/cases', {
+      method: 'POST', body: JSON.stringify({ name: '新用例', origin: 'blank' }),
     });
-    _runId = result.run_id;
-    _mode = 'suite';
-    showToast(`已开始：${scenarios.length} 个场景 × ${repeats} 次`);
-    _startPolling();
+    await _loadLibrary();
+    openEditor(created.id);
   } catch (e) {
-    showToast(`起批失败：${e.message || e}`);
+    showToast(`新建失败：${e.message || e}`);
   }
 }
 
@@ -311,7 +385,6 @@ async function _runCase(repeats) {
       method: 'POST', body: JSON.stringify({ repeats, seed: 0 }),
     });
     _runId = result.run_id;
-    _mode = 'case';
     showToast(`用例已开始 × ${repeats} 次`);
     _startPolling();
   } catch (e) {
@@ -334,9 +407,8 @@ export function runRefusal(error) {
 
 async function _abort() {
   try {
-    await api('/api/benchmark/abort', { method: 'POST' });
-    await _collect();
-    showToast('已中止，已完成的结果保留');
+    await api('/api/benchmark/case/abort', { method: 'POST' });
+    showToast('已中止，已跑完的那几次留在历史里');
   } catch (e) {
     showToast(`中止失败：${e.message || e}`);
   }
@@ -344,9 +416,7 @@ async function _abort() {
 
 function _startPolling() {
   _stopPolling();
-  // The suite runs on the driver, so progress is a poll rather than a stream.
-  // sim_report is a `resource`, which is what makes it answerable while a
-  // navigation is pending.
+  // 跑动在后台的 asyncio task 上推进，所以进度是轮询而不是推流。
   _pollTimer = setInterval(_poll, 3000);
 }
 
@@ -359,13 +429,12 @@ async function _poll() {
   if (!el) return;
   let data;
   try {
-    data = await api(_mode === 'case' ? '/api/benchmark/case/progress'
-                                      : '/api/benchmark/progress');
+    data = await api('/api/benchmark/case/progress');
   } catch { return; }
 
   if (!data || data.error || !data.cases || !data.cases.length) {
     // 空闲时不报「0 / 0 个 case」——那是噪音，不是信息。
-    el.innerHTML = '<div class="bm-empty">没有正在进行的批次。</div>';
+    el.innerHTML = '<div class="bm-empty">没有正在进行的跑动。</div>';
     return;
   }
   const done = data.cases.filter((c) => c.outcome !== 'pending').length;
@@ -400,8 +469,9 @@ async function _poll() {
 
   if (['done', 'aborted', 'error'].includes(data.state)) {
     _stopPolling();
-    if (_mode === 'case') { _runId = null; await _loadRuns(); await _offerRestore(); }
-    else await _collect();
+    _runId = null;
+    await Promise.all([_loadRuns(), _loadLibrary()]);
+    await _offerRestore();
   }
 }
 
@@ -424,15 +494,6 @@ async function _offerRestore() {
       } catch (e) { showToast(`还原失败：${e.message || e}`); }
     });
   } catch { /* 没存过快照就没有这一步 */ }
-}
-
-async function _collect() {
-  if (!_runId) return;
-  try {
-    await api(`/api/benchmark/runs/${_runId}/collect`, { method: 'POST' });
-    _runId = null;
-    await _loadRuns();
-  } catch { /* the run stays 'running' and can be collected on the next open */ }
 }
 
 // ── 历史 ─────────────────────────────────────────────────────────────────────
