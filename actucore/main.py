@@ -141,9 +141,28 @@ class ActuCoreBundle:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 
     def get_all_tools(self) -> list:
+        """Every card's schema. One broken card must not take the rest with it.
+
+        `tools/list` is not a call against one card — it is how agent-core learns
+        that any card exists at all, and what its ports are. So an exception
+        raised while building one card's schema used to empty the whole bundle:
+        agent-core got an RPC error, kept the cards it already knew, and showed
+        them with no input and no output ports. That reads as a canvas problem,
+        and the traceback is in *this* process's log, which is not where anyone
+        looks first. Seen on Tianyi.
+
+        Nothing here can repair the broken card, and pretending otherwise would
+        be worse — so it is dropped, loudly, and the others are served.
+        """
         tools = []
         for p in self._plugins:
-            for t in p.get_tools():
+            try:
+                built = list(p.get_tools())
+            except Exception:      # noqa: BLE001 — one card's schema, not the bundle's
+                log.exception("card %s failed to build its schema; serving the rest "
+                              "without it", getattr(p, "PREFIX", p))
+                continue
+            for t in built:
                 full_name = t['name'] if t['name'] == p.PREFIX else f"{p.PREFIX}_{t['name']}"
                 tools.append({**t, "name": full_name})
         return tools

@@ -52,6 +52,30 @@ def check(capabilities: dict, descriptor: dict) -> list:
     if chunk is not None and int(chunk) < 1:
         problems.append(f"chunk_size 为 {chunk}，至少要 1")
 
+    # `groups` is read long after start — the card reports it as `x-resource` on
+    # every schema fetch, which is a *different* code path from the one that
+    # stored it. So a malformed value costs nothing here and everything there:
+    # it is accepted at start, survives `stop` (the descriptor is not cleared),
+    # and from then on every `tools/list` raises. agent-core then has no schema
+    # for any card in the bundle, and the canvas shows cards with no ports —
+    # a symptom that points at the canvas, with the traceback in actucore's log.
+    #
+    # Only the shape is checked. Whether the groups tile the vector is the
+    # driver's own invariant and it already enforces it (`common/control/
+    # descriptor.py::_parse_groups`); re-deriving it here would be a second
+    # opinion that can disagree.
+    groups = descriptor.get("groups")
+    if groups is not None:
+        if not isinstance(groups, (list, tuple)):
+            problems.append(f"descriptor.groups 应当是列表，收到 {type(groups).__name__}")
+        else:
+            bad = [i for i, entry in enumerate(groups) if not isinstance(entry, dict)]
+            if bad:
+                problems.append(
+                    f"descriptor.groups 的第 {', '.join(map(str, bad))} 项不是对象 —— "
+                    f"每一项应形如 {{name, offset, count, resource}}"
+                )
+
     return problems
 
 

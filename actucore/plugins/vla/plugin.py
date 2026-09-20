@@ -881,11 +881,23 @@ class VLAPlugin:
         re-reads the schema on heartbeat (`api/mcp_manage.py` extracts
         `x-resource` there as well as at registration), so the negotiated set
         replaces it shortly after the card starts.
+
+        `negotiate.check` refuses a descriptor whose `groups` are not objects, so
+        in normal operation every entry here is a dict. The isinstance guard is
+        for the one path that bypasses negotiation: this runs on *every* schema
+        fetch, including fetches that happen after a descriptor was stored by
+        some future caller that did not go through `_start`. Raising here does
+        not fail this card — it fails `tools/list` for the whole bundle, leaving
+        agent-core with no schema for anything and a canvas of cards with no
+        ports. A resource that cannot be read is worth skipping; it is not worth
+        that.
         """
         groups = self._descriptor.get("groups") or []
         negotiated = []
         for group in groups:
-            resource = (group or {}).get("resource")
+            if not isinstance(group, dict):
+                continue
+            resource = group.get("resource")
             if resource and resource not in negotiated:
                 negotiated.append(resource)
         if negotiated:

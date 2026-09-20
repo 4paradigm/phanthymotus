@@ -11,16 +11,42 @@ weights and no torch, which makes it the regression harness for everything
 above: change ControlSink, change the negotiation, bump the schema version, and
 this is what re-proves the path on a laptop.
 
-Two deliberate properties:
+Three deliberate properties:
 
 - **It is bounded by construction.** The trajectory is a fraction of the
-  *declared* half-span around the midpoint of each joint's range, so it cannot
-  leave the limits even before the driver's own checks. A test signal that can
-  reach a joint limit is a test signal that will, at three in the morning.
+  distance from its rest pose to the *declared* limit, so it cannot leave the
+  limits even before the driver's own checks. A test signal that can reach a
+  joint limit is a test signal that will, at three in the morning.
+
+- **It starts and ends at rest, and never jumps.** The wave is `(1-cos)/2`, so
+  it leaves the rest pose at zero velocity and returns to it every cycle.
 
 - **The amplitude default is small and the frequency is slow.** First run of
   anything on a real arm is at reduced speed with a person watching; a default
   that assumes otherwise is a default that gets used.
+
+── Why "rest pose" and not the midpoint of the range ─────────────────────────
+
+It used to centre the sine on the midpoint of each joint's declared range, on
+the reasoning that the midpoint is the point furthest from both limits. That is
+true and it is not the point. A joint's range is not symmetric about its rest
+position, so the midpoint is a *pose*, and on a real robot it was not a pose
+anyone had asked for. Measured on Tianyi (26 dof):
+
+    left_shoulder_roll   [-0.262, 2.618] rad   midpoint  +1.178 rad = +67.5°
+    left_elbow_pitch     [-2.618, 0.262] rad   midpoint  -1.178 rad
+    hand_* (12 fingers)  [0, 1] normalized     midpoint   0.5  (half closed)
+
+So the very first command — before the sine had moved at all — asked for both
+arms raised 67° to the side with the hands half closed, and the driver ramped
+there at `max_delta_per_step` over about a second. What looked like "the mock's
+amplitude is too large" was the *centre*, and no amount of reducing `amplitude`
+would have fixed it.
+
+The rest pose is zero, clamped into the range: every rotary joint on these arms
+straddles zero (arms hanging), and a normalized 0-1 finger reads 0 as open. So
+zero is both the natural home and, for the fingers, one end of travel — which
+is why the wave is unipolar rather than a sine: it can start *on* a bound.
 """
 
 from __future__ import annotations
@@ -36,17 +62,29 @@ class MockProvider:
             phanthymotus-driver/README_dev.md § "Continuous Control"). The mock
             adapts to it rather than declaring its own, which is what makes it
             usable against any arm without configuration.
-        amplitude: fraction of each joint's half-range, 0-1.
+        amplitude: fraction of the travel available from rest, 0-1. Either one
+            number for every joint, or a dict keyed by group name — because the
+            same fraction does not read the same on every group. On Tianyi 5%
+            of an arm joint's reach is 7.5° and plainly visible, while 5% of a
+            0-1 finger is 0.05 and looks like the hand is not being driven at
+            all. A group the dict does not mention falls back to `default`.
         period_s: seconds per full cycle.
         chunk_size: how many future steps to emit per inference, so the chunk
             path is exercised rather than only the single-step one.
     """
 
-    def __init__(self, descriptor: dict, *, amplitude: float = 0.05,
+    DEFAULT_AMPLITUDE = 0.05
+
+    # A normalized 0-1 axis is a gripper, not a joint: 5% of a grip is a twitch
+    # nobody can see, and "the hand is not being driven" is exactly how it was
+    # reported. Half of the grip is unmistakable and still returns to open every
+    # cycle. Keyed on the unit rather than on Tianyi's group names so it is the
+    # default on any robot whose descriptor says `normalized`.
+    DEFAULT_AMPLITUDE_BY_UNIT = {"normalized": 0.5}
+
+    def __init__(self, descriptor: dict, *, amplitude=DEFAULT_AMPLITUDE,
                  period_s: float = 8.0, chunk_size: int = 10,
                  control_hz: float = 30.0):
-        if not 0 < amplitude <= 1:
-            raise ValueError("amplitude must be in (0, 1]")
         if period_s <= 0 or control_hz <= 0 or chunk_size < 1:
             raise ValueError("period_s, control_hz and chunk_size must be positive")
 
@@ -59,11 +97,23 @@ class MockProvider:
         if len(self._lower) != self._dof or len(self._upper) != self._dof:
             raise ValueError("descriptor limits do not match its dof")
 
-        self._amplitude = amplitude
+        self._amplitude = _per_joint_amplitude(
+            amplitude, (descriptor or {}).get("groups"), self._dof)
         self._period_s = period_s
         self._chunk = chunk_size
         self._hz = control_hz
         self._phase = 0.0
+
+        # Precomputed rather than derived per sample: this runs at control rate,
+        # and the two numbers depend only on the descriptor.
+        self._rest, self._reach = [], []
+        for lo, hi in zip(self._lower, self._upper):
+            rest = min(max(0.0, lo), hi)
+            # Toward whichever side has more room, so a joint that rests on one
+            # of its bounds still moves, and moves inward.
+            up, down = hi - rest, rest - lo
+            self._rest.append(rest)
+            self._reach.append(up if up >= down else -down)
 
     # ── provider protocol ────────────────────────────────────────────────────
 
@@ -106,13 +156,53 @@ class MockProvider:
     # ── the signal ───────────────────────────────────────────────────────────
 
     def _sample(self, t: float) -> list:
-        wave = math.sin(2 * math.pi * t / self._period_s)
-        out = []
-        for lo, hi in zip(self._lower, self._upper):
-            mid = (lo + hi) / 2.0
-            half = (hi - lo) / 2.0
-            out.append(mid + wave * half * self._amplitude)
-        return out
+        # Unipolar: 0 at rest, 1 at the far end of the swing, back to 0. A plain
+        # sine would need a centre with room on both sides, which a finger
+        # resting at 0.0 does not have.
+        wave = (1.0 - math.cos(2 * math.pi * t / self._period_s)) / 2.0
+        return [rest + wave * reach * amp
+                for rest, reach, amp in zip(self._rest, self._reach, self._amplitude)]
+
+
+def _per_joint_amplitude(amplitude, groups, dof: int) -> list:
+    """One fraction per joint, from a number or a dict.
+
+    A dict key is either a **group name** (`hand_l`) or a group's **unit**
+    (`normalized`), with `default` for the rest; a name beats a unit. Units are
+    in the keys because that is what makes a default portable — group names are
+    invented per robot, whereas `rad` and `normalized` come from the descriptor
+    spec and mean the same thing on every arm.
+
+    A group whose `offset`/`count` do not describe a real slice is skipped
+    rather than raised on: this is a test signal, and refusing to start because
+    one group in a descriptor is odd would take away the tool people reach for
+    *when* a descriptor is odd.
+    """
+    def _fraction(value, where: str) -> float:
+        value = float(value)
+        if not 0 < value <= 1:
+            raise ValueError(f"amplitude{where} must be in (0, 1], got {value}")
+        return value
+
+    if not isinstance(amplitude, dict):
+        return [_fraction(amplitude, "")] * dof
+
+    default = _fraction(amplitude.get("default", MockProvider.DEFAULT_AMPLITUDE),
+                        "['default']")
+    out = [default] * dof
+    for group in groups or []:
+        if not isinstance(group, dict):
+            continue
+        offset, count = group.get("offset"), group.get("count")
+        if not isinstance(offset, int) or not isinstance(count, int):
+            continue
+        for key in (group.get("name"), group.get("unit")):
+            if key in amplitude and key != "default":
+                value = _fraction(amplitude[key], f"[{key!r}]")
+                for i in range(offset, min(offset + count, dof)):
+                    out[i] = value
+                break
+    return out
 
 
 def PROVIDER(descriptor: dict, config: dict | None = None,
@@ -125,9 +215,17 @@ def PROVIDER(descriptor: dict, config: dict | None = None,
     """
     del on_status
     config = config or {}
+    # The default is the dict, not the scalar: a bare 0.05 would mean the same
+    # invisible twitch on a gripper that got this reported in the first place.
+    # An operator who writes a scalar has overridden that on purpose.
+    amplitude = config.get("amplitude")
+    if amplitude is None:
+        amplitude = {"default": MockProvider.DEFAULT_AMPLITUDE,
+                     **MockProvider.DEFAULT_AMPLITUDE_BY_UNIT}
     return MockProvider(
         descriptor,
-        amplitude=float(config.get("amplitude", 0.05)),
+        # Not coerced with float(): a dict here is the per-group form.
+        amplitude=amplitude if isinstance(amplitude, dict) else float(amplitude),
         period_s=float(config.get("period_s", 8.0)),
         chunk_size=int(config.get("chunk_size", 10)),
         control_hz=float(config.get("control_hz", 30.0)),
