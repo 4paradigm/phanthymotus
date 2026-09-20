@@ -2709,6 +2709,10 @@ async function _saveLayout() {
       _isEditor = false;
       _updateEditorUI();
       await _reloadLayout();
+    } else if (resp.status === 409) {
+      const data = await resp.json();
+      _showToast(data.message || '画布保存被拒绝，请刷新后重试');
+      await _reloadLayout();
     }
   } catch { /* silent */ }
 }

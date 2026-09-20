@@ -355,60 +355,27 @@ async def _save_layout_locked(layout: CanvasLayout):
     save_data.pop('session_id', None)
     old_layout = config.main.get('canvas_layout', {}) or {}
     old_cards = old_layout.get('cards', [])
-    was_running = config.main.get('core', {}).get('project_running', False)
-    topic_action_mgr = None
-    if was_running:
-        from topic_actions import build_routes, manager as topic_action_mgr
-        try:
-            build_routes(save_data)
-        except Exception as error:
-            return fastapi.responses.JSONResponse(
-                status_code=409,
-                content={
-                    'code': 409,
-                    'message': f'Topic-action routes are invalid: {error}',
-                },
-            )
-        core = config.main.get('core', {})
-        core['project_running'] = False
-        config.main['core'] = core
+    if config.main.get('core', {}).get('project_running', False):
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'code': 409, 'message': '请先停止智能控制后修改画布'},
+        )
     from api.config import stop_removed_cards
     _, stop_failures = await stop_removed_cards(
         old_cards, save_data.get('cards', []))
     if stop_failures:
-        if topic_action_mgr is not None:
-            await topic_action_mgr.stop()
         return fastapi.responses.JSONResponse(
             status_code=409,
             content={
                 'code': 409,
                 'message': (
                     'Removed card stop was not confirmed; layout was not saved '
-                    'and the project was stopped fail-closed'
+                    'and the project remains stopped'
                 ),
                 'failures': stop_failures,
             },
         )
     config.main['canvas_layout'] = save_data
-    if topic_action_mgr is not None:
-        try:
-            await topic_action_mgr.start(save_data)
-        except Exception as error:
-            await topic_action_mgr.stop()
-            notify_layout_changed(session_id or '')
-            return fastapi.responses.JSONResponse(
-                status_code=409,
-                content={
-                    'code': 409,
-                    'message': (
-                        f'Layout was saved but topic-action routes failed: {error}; '
-                        'the project was stopped fail-closed'
-                    ),
-                },
-            )
-        core = config.main.get('core', {})
-        core['project_running'] = True
-        config.main['core'] = core
     notify_layout_changed(session_id or '')
     return {'code': 200}
 

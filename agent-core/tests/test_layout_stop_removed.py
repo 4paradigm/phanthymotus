@@ -191,77 +191,115 @@ def test_port_aware_wiring_requires_an_explicit_tool_contract(monkeypatch):
     assert not config_api._tool_accepts_input_bindings('actucore', 'legacy_tool')
 
 
-def test_saving_a_running_layout_reconciles_topic_actions(monkeypatch):
-    started = []
-
-    class _TopicActions:
-        async def start(self, layout):
-            assert config_api.config.main['core']['project_running'] is False
-            assert config_api.config.main['canvas_layout'] == layout
-            started.append(layout)
-
-    topic_actions = type(sys)('topic_actions')
-    topic_actions.build_routes = lambda _layout: []
-    topic_actions.manager = _TopicActions()
-    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
-    monkeypatch.setattr(config_api.config, 'main', {
-        'core': {'project_running': True},
-        'canvas_layout': {'cards': []},
-    })
+@pytest.fixture
+def layout_state(monkeypatch):
+    from unittest.mock import Mock, AsyncMock
+    original = {'cards': [TTS_OLD, ASR], 'connections': []}
+    state = {'core': {'project_running': True}, 'canvas_layout': original,
+             'preserved_config': {'value': 1}}
+    monkeypatch.setattr(config_api.config, 'main', state)
     monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
     monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
     monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
-    monkeypatch.setattr(canvas_api, 'notify_layout_changed', lambda _session: None)
+    monkeypatch.setattr(canvas_api, 'notify_layout_changed', Mock())
+    monkeypatch.setattr(canvas_api, 'delete_all_tool_configs', Mock(return_value=0))
+    monkeypatch.setattr(canvas_api, 'apply_tool_config', Mock())
+    routes = type(sys)('topic_actions')
+    routes.build_routes = Mock()
+    routes.manager = type('Manager', (), {'start': AsyncMock(), 'stop': AsyncMock()})()
+    monkeypatch.setitem(sys.modules, 'topic_actions', routes)
+    return state, routes
 
+
+@pytest.mark.parametrize('remove', [False, True])
+def test_running_layout_write_is_rejected_without_side_effects(layout_state, calls, remove):
+    import copy
+    state, routes = layout_state
+    before = copy.deepcopy(state)
     result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
-        cards=[TTS_NEW],
-        connections=[],
+        cards=[] if remove else state['canvas_layout']['cards'],
+        connections=[{'fromCardId': ASR['id'], 'toCardId': TTS_OLD['id'],
+                      'fromPortIdx': 0, 'toPortIdx': 0}],
         session_id='editor-1',
     )))
-
-    assert result == {'code': 200}
-    assert started == [{
-        'cards': [TTS_NEW],
-        'connections': [],
-        'execConnections': [],
-        'transform': {},
-    }]
-    assert config_api.config.main['core']['project_running'] is True
+    assert result.status_code == 409
+    assert state == before
+    assert calls == []
+    routes.build_routes.assert_not_called()
+    routes.manager.start.assert_not_called()
+    routes.manager.stop.assert_not_called()
+    canvas_api.notify_layout_changed.assert_not_called()
 
 
-def test_route_activation_failure_keeps_saved_layout_but_stops_project(
-    monkeypatch
-):
-    stopped = []
+@pytest.mark.parametrize('running', [False, True])
+def test_solution_replacement_requires_stopped_project(layout_state, calls, running):
+    import copy
+    state, routes = layout_state
+    state['core']['project_running'] = running
+    before = copy.deepcopy(state)
+    payload = {'cards': [{'id': TTS_OLD['id'], 'deviceRef': 'device', 'toolName': 'tts'}],
+               'connections': [], 'toolConfigs': {'device:tts': {'voice': 'new'}}}
+    if running:
+        with pytest.raises(solutions_api.fastapi.HTTPException) as error:
+            asyncio.run(solutions_api._apply_canvas(payload, {'device': 'mcp-1'}))
+        assert error.value.status_code == 409
+        assert state == before
+        assert calls == []
+        canvas_api.delete_all_tool_configs.assert_not_called()
+        canvas_api.apply_tool_config.assert_not_called()
+        canvas_api.notify_layout_changed.assert_not_called()
+    else:
+        result = asyncio.run(solutions_api._apply_canvas(payload, {'device': 'mcp-1'}))
+        assert result['toolConfigsWritten'] == 1
+        canvas_api.apply_tool_config.assert_called_once()
+        assert len(calls) == 1  # removed ASR, retained TTS
+    routes.manager.start.assert_not_called()
+    routes.manager.stop.assert_not_called()
+    assert state['core']['project_running'] is running
 
-    class _TopicActions:
-        async def start(self, _layout):
-            raise RuntimeError('DDS subscription failed')
 
-        async def stop(self):
-            stopped.append(True)
-
-    topic_actions = type(sys)('topic_actions')
-    topic_actions.build_routes = lambda _layout: []
-    topic_actions.manager = _TopicActions()
-    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
-    monkeypatch.setattr(config_api.config, 'main', {
-        'core': {'project_running': True},
-        'canvas_layout': {'cards': []},
-    })
-    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
-    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
-    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
-    monkeypatch.setattr(canvas_api, 'notify_layout_changed', lambda _session: None)
-
+def test_stopped_layout_can_be_saved(layout_state, calls):
+    state, routes = layout_state
+    state['core']['project_running'] = False
     result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
         cards=[TTS_NEW], connections=[], session_id='editor-1'
     )))
+    assert result == {'code': 200}
+    assert state['canvas_layout']['cards'] == [TTS_NEW]
+    assert len(calls) == 2
+    assert state['core']['project_running'] is False
+    routes.manager.start.assert_not_called()
 
-    assert result.status_code == 409
-    assert config_api.config.main['canvas_layout']['cards'] == [TTS_NEW]
-    assert config_api.config.main['core']['project_running'] is False
-    assert stopped == [True]
+
+@pytest.mark.parametrize('solution', [False, True])
+def test_running_state_is_checked_after_waiting_for_lifecycle_lock(
+    monkeypatch, layout_state, calls, solution
+):
+    state, _ = layout_state
+    state['core']['project_running'] = False
+
+    async def run():
+        lock = asyncio.Lock()
+        monkeypatch.setattr(config_api, 'layout_lifecycle_lock', lock)
+        async with lock:
+            operation = (solutions_api._apply_canvas({'cards': []}, {}) if solution
+                         else canvas_api.save_layout(canvas_api.CanvasLayout(
+                             cards=[], session_id='editor-1')))
+            task = asyncio.create_task(operation)
+            await asyncio.sleep(0)
+            assert not task.done()
+            state['core']['project_running'] = True
+        if solution:
+            with pytest.raises(solutions_api.fastapi.HTTPException) as error:
+                await task
+            assert error.value.status_code == 409
+        else:
+            assert (await task).status_code == 409
+
+    asyncio.run(run())
+    assert calls == []
+    assert state['canvas_layout']['cards'] == [TTS_OLD, ASR]
+    assert state['core']['project_running'] is True
 
 
 def test_layout_is_not_saved_when_removed_card_stop_is_unconfirmed(
@@ -285,130 +323,6 @@ def test_layout_is_not_saved_when_removed_card_stop_is_unconfirmed(
     )))
 
     assert result.status_code == 409
-    assert config_api.config.main['canvas_layout'] == original
-
-
-def test_route_failure_does_not_stop_a_removed_card(monkeypatch, calls):
-    topic_actions = type(sys)('topic_actions')
-    topic_actions.build_routes = lambda _layout: (_ for _ in ()).throw(
-        RuntimeError('invalid route')
-    )
-    topic_actions.manager = object()
-    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
-    original = {'cards': [TTS_OLD], 'connections': []}
-    monkeypatch.setattr(config_api.config, 'main', {
-        'core': {'project_running': True},
-        'canvas_layout': original,
-    })
-    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
-    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
-    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
-
-    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
-        cards=[], connections=[], session_id='editor-1'
-    )))
-
-    assert result.status_code == 409
-    assert calls == []
-    assert config_api.config.main['canvas_layout'] == original
-
-
-def test_partial_stop_failure_stops_routes_and_project_fail_closed(
-    monkeypatch, calls
-):
-    async def _pending(_mcp_id, req):
-        calls.append((_mcp_id, req.tool, dict(req.arguments)))
-        if req.arguments['instance_id'] == TTS_OLD['id']:
-            return {'state': 'error', 'error': 'stop pending'}
-        return {'state': 'idle'}
-
-    stopped = []
-
-    class _TopicActions:
-        async def stop(self):
-            stopped.append(True)
-
-    topic_actions = type(sys)('topic_actions')
-    topic_actions.build_routes = lambda _layout: []
-    topic_actions.manager = _TopicActions()
-    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
-    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _pending)
-    original = {'cards': [TTS_OLD, ASR], 'connections': []}
-    monkeypatch.setattr(config_api.config, 'main', {
-        'core': {'project_running': True},
-        'canvas_layout': original,
-    })
-    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
-    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
-    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
-
-    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
-        cards=[], connections=[], session_id='editor-1'
-    )))
-
-    assert result.status_code == 409
-    assert stopped == [True]
-    assert {call[2]['instance_id'] for call in calls} == {TTS_OLD['id'], ASR['id']}
-    assert config_api.config.main['core']['project_running'] is False
-    assert config_api.config.main['canvas_layout'] == original
-
-
-def test_applying_a_solution_reconciles_running_topic_actions(monkeypatch):
-    started = []
-
-    class _TopicActions:
-        async def start(self, layout):
-            assert config_api.config.main['core']['project_running'] is False
-            assert config_api.config.main['canvas_layout'] == layout
-            started.append(layout)
-
-    topic_actions = type(sys)('topic_actions')
-    topic_actions.build_routes = lambda _layout: []
-    topic_actions.manager = _TopicActions()
-    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
-    monkeypatch.setattr(config_api.config, 'main', {
-        'core': {'project_running': True},
-        'canvas_layout': {'cards': []},
-    })
-    monkeypatch.setattr(canvas_api, 'notify_layout_changed', lambda *_: None)
-
-    result = asyncio.run(solutions_api._apply_canvas(
-        {
-            'cards': [{
-                'id': 'nav-card',
-                'deviceRef': 'navigation-device',
-                'toolName': 'ControlledSemanticSpatial',
-            }],
-            'connections': [],
-        },
-        {'navigation-device': 'actucore'},
-    ))
-
-    assert result['cards'] == 1
-    assert started == [config_api.config.main['canvas_layout']]
-
-
-def test_solution_route_failure_does_not_stop_a_removed_card(monkeypatch, calls):
-    topic_actions = type(sys)('topic_actions')
-    topic_actions.build_routes = lambda _layout: (_ for _ in ()).throw(
-        RuntimeError('invalid route')
-    )
-    topic_actions.manager = object()
-    monkeypatch.setitem(sys.modules, 'topic_actions', topic_actions)
-    original = {'cards': [TTS_OLD], 'connections': []}
-    monkeypatch.setattr(config_api.config, 'main', {
-        'core': {'project_running': True},
-        'canvas_layout': original,
-    })
-
-    with pytest.raises(solutions_api.fastapi.HTTPException) as error:
-        asyncio.run(solutions_api._apply_canvas(
-            {'cards': [], 'connections': []},
-            {},
-        ))
-
-    assert error.value.status_code == 409
-    assert calls == []
     assert config_api.config.main['canvas_layout'] == original
 
 
