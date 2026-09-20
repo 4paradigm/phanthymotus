@@ -506,8 +506,10 @@ async def run_timeline(run_id: str):
         'world': world,
         'transcript': facts.get('transcript') or [],
         'acp': facts.get('acp_posts') or [],
-        'agent': _agent_track(stored.get('session_id', ''),
-                              stored.get('started_at'), stored.get('ended_at')),
+        # 定格的那一份优先：会话里的轮次跑完之后还会被接着改写，现读一次，同一条
+        # 记录过几分钟就换了个样子。老记录没有定格，只能现读。
+        'agent': stored.get('agent_track') or _agent_track(
+            stored.get('session_id', ''), stored.get('started_at'), stored.get('ended_at')),
     }
 
 

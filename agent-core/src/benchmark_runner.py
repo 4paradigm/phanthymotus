@@ -268,7 +268,23 @@ class CaseRun:
             status={'done': 'done', 'aborted': 'aborted'}.get(self.state, 'error'),
             score_total=mean, score_stdev=stdev,
             scores_by_dim={k: round(sum(v) / len(v), 1) for k, v in by_dimension.items()},
-            detail=self.error or f'n={len(self.cases)} scored={len(scored)}')
+            detail=self.error or f'n={len(self.cases)} scored={len(scored)}',
+            agent_track=self._freeze_agent_track())
+
+    def _freeze_agent_track(self) -> list:
+        """把 agent 这一侧也定格。
+
+        会话里的轮次是活的：跑动结束后 agent 接着工作，同一批行继续被改写。不定格，
+        同一条记录过几分钟再打开就换了个样子 —— 真机上先显示 +32.8s，后来变成
+        「时间落在本轮之外」，而那次跑动一个字都没变。
+        """
+        try:
+            from api.benchmark import _agent_track
+            stored = benchmark_store.get_run(self.run_id) or {}
+            return _agent_track(stored.get('session_id', ''),
+                                stored.get('started_at'), time.time())
+        except Exception:
+            return []
 
     def snapshot(self) -> dict:
         return {'state': self.state, 'run_id': self.run_id,

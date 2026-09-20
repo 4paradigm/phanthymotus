@@ -396,6 +396,16 @@ async def lifespan(app):
     if _prov:
         print(f'[dds] {_prov}')
 
+    # 上次关机时还在跑的基准测试：那个 asyncio task 已经随进程一起没了，记录却还
+    # 标着「进行中」——面板每次打开都会报一次并不存在的跑动。
+    try:
+        import benchmark_store
+        _stale = benchmark_store.mark_stale_runs()
+        if _stale:
+            print(f'[benchmark] {_stale} 次跑动因重启中断')
+    except Exception as _exc:
+        print(f'[benchmark] 清理中断跑动失败: {_exc}')
+
     # 启动 ROS2 bridge（用于 DDS topic 订阅）
     import ros2_bridge
     _ros2_loop = asyncio.get_running_loop()

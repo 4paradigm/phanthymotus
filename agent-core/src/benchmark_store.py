@@ -82,6 +82,7 @@ _SCHEMA = (
 _ADDITIONS = (
     'ALTER TABLE benchmark_case ADD COLUMN facts TEXT',
     'ALTER TABLE benchmark_run ADD COLUMN session_id TEXT',
+    'ALTER TABLE benchmark_run ADD COLUMN agent_track TEXT',
 )
 
 
@@ -150,14 +151,36 @@ def add_case(run_id: str, *, scenario: str, repeat_idx: int = 0, seed: int = 0,
 
 def finish_run(run_id: str, *, status: str = 'done', score_total: float | None = None,
                score_stdev: float | None = None, scores_by_dim: dict | None = None,
-               detail: str = '') -> None:
+               detail: str = '', agent_track: list | None = None) -> None:
+    """收尾一次跑动。
+
+    `agent_track` 在这里定格。会话里的轮次是**活的** —— 跑动结束之后 agent 继续工作，
+    同一批行还会被接着改写，`updated_at` 一路往后走。等到有人回头看这次跑动，读到的
+    就不是它当时的样子了：真机上先是排出了正确的 +32.8s，几分钟后同一条记录变成了
+    「时间落在本轮之外」。驱动那侧的事实早就是这么存的，agent 这侧同理。
+    """
     conn = _get_conn()
     conn.execute(
         'UPDATE benchmark_run SET status=?, ended_at=?, score_total=?, score_stdev=?, '
-        'scores_by_dim=?, detail=? WHERE id=?',
+        'scores_by_dim=?, detail=?, agent_track=? WHERE id=?',
         (status, time.time(), score_total, score_stdev,
-         _dumps(scores_by_dim or {}), detail, run_id))
+         _dumps(scores_by_dim or {}), detail, _dumps(agent_track or []), run_id))
     conn.commit()
+
+
+def mark_stale_runs() -> int:
+    """启动时把还标着 `running` 的跑动记为中断。
+
+    agent-core 重启会带走那个在跑的 asyncio task，而记录留在原地 —— 于是它永远停在
+    「进行中」，面板每次打开都报一次并不存在的跑动。
+    """
+    conn = _get_conn()
+    cursor = conn.execute(
+        "UPDATE benchmark_run SET status='interrupted', ended_at=?, "
+        "detail='agent-core 重启，跑动被中断' WHERE status='running'",
+        (time.time(),))
+    conn.commit()
+    return cursor.rowcount
 
 
 def _run_row(row) -> dict:
@@ -172,12 +195,13 @@ def _run_row(row) -> dict:
         'score_total': row[12], 'score_stdev': row[13],
         'scores_by_dim': _loads(row[14], {}), 'detail': row[15],
         'session_id': row[16] if len(row) > 16 else '',
+        'agent_track': _loads(row[17], []) if len(row) > 17 else [],
     }
 
 
 _RUN_COLUMNS = ('id, suite, tier, status, started_at, ended_at, n_repeats, llm_model, '
                 'llm_provider, host, image_tags, git_shas, score_total, score_stdev, '
-                'scores_by_dim, detail, session_id')
+                'scores_by_dim, detail, session_id, agent_track')
 
 
 def list_runs(limit: int = 50) -> list[dict]:

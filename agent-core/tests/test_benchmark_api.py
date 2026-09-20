@@ -626,3 +626,48 @@ def test_a_turn_woken_only_by_a_status_refresh_says_so(monkeypatch):
         'messages': [{'role': 'user', 'content': '<status time="2026-09-20">…</status>'}]}])
 
     assert asyncio.run(benchmark.run_timeline(run_id))['agent'][0]['trigger'] == '（状态刷新）'
+
+
+def test_the_agent_track_is_frozen_when_the_run_ends(monkeypatch):
+    """会话里的轮次是**活的**：跑完之后 agent 接着工作，同一批行继续被改写。
+
+    真机上同一条记录先显示 +32.8s，几分钟后变成「时间落在本轮之外」—— 那次跑动
+    一个字都没变，变的是它读的那份数据。
+    """
+    run_id = benchmark_store.create_run('导览')
+    benchmark_store.finish_run(run_id, score_total=80.0, agent_track=[
+        {'turn': 0, 'at': 32.8, 'timing': 'exact', 'trigger': '带我转一下',
+         'says': ['好的'], 'calls': []}])
+
+    import chat_history
+    # 之后会话被改写成另一个样子 —— 定格的那份不该受影响
+    monkeypatch.setattr(chat_history, 'get_session_turns',
+                        lambda sid: [{'started_at': 0, 'updated_at': 0, 'messages': []}])
+
+    agent = asyncio.run(benchmark.run_timeline(run_id))['agent']
+
+    assert agent[0]['at'] == 32.8
+    assert agent[0]['says'] == ['好的']
+
+
+def test_a_run_left_running_by_a_restart_is_marked_interrupted():
+    """重启带走了那个在跑的 task，记录却留在原地 —— 不清理，面板每次打开都会报
+    一次并不存在的跑动。"""
+    run_id = benchmark_store.create_run('导览')
+    assert benchmark_store.get_run(run_id)['status'] == 'running'
+
+    benchmark_store.mark_stale_runs()
+
+    stored = benchmark_store.get_run(run_id)
+    assert stored['status'] == 'interrupted'
+    assert stored['ended_at'] is not None
+
+
+def test_marking_stale_runs_leaves_finished_ones_alone():
+    done = benchmark_store.create_run('导览')
+    benchmark_store.finish_run(done, score_total=90.0)
+
+    benchmark_store.mark_stale_runs()
+
+    assert benchmark_store.get_run(done)['status'] == 'done'
+    assert benchmark_store.get_run(done)['score_total'] == 90.0
