@@ -218,6 +218,36 @@ def test_running_a_case_that_is_gone_is_a_404():
     assert caught.value.status_code == 404
 
 
+def test_an_old_format_case_shows_its_requirements_in_the_list():
+    """**列表也要迁移，不只是跑的时候。**
+
+    Orin6 上现的形：库里那个旧格式用例，卡片上写着「0 条要求」。用户看到的是
+    「我的要求没了」，不是「格式换了」—— 而迁移其实是有的，只是没走到这条路上。
+    """
+    legacy = {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [], 'test': {
+        'run': {'prompt': '带我转一下展厅'},
+        'evaluate': {'expect': {'waypoint_order': ['入口', '一号展区'],
+                                'announce_after_arrive': True}}}}
+    benchmark_store.save_case(legacy, name='旧的')
+
+    card = next(c for c in asyncio.run(benchmark.list_cases())['cases']
+                if c['name'] == '旧的')
+
+    assert card['requirements'] == 2
+
+
+def test_the_name_in_the_library_wins_over_the_one_inside_the_test_block():
+    """库里存的名字是用户自己起的；`test.name` 常常是空的（从文件或市场收进来的用例
+    就没有）。展开顺序反过来，那些用例在列表里是一行没有标题的卡片。"""
+    nameless = {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [],
+                'test': {'run': {'prompt': '走'}}}
+    benchmark_store.save_case(nameless, name='我起的名字')
+
+    names = [c['name'] for c in asyncio.run(benchmark.list_cases())['cases']]
+
+    assert '我起的名字' in names and '' not in names
+
+
 def test_an_old_format_case_is_migrated_on_its_way_to_the_runner():
     """Orin6 上那个用例是旧格式。不转的话，跑起来一条要求都没有 —— 而且不报错。"""
     legacy = {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [], 'test': {

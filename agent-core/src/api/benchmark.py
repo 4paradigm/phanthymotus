@@ -217,16 +217,33 @@ class CaseWrite(BaseModel):
     origin: str = ''
 
 
+def _read_case(case_id: str) -> dict | None:
+    """库里的一条，**读出来就已经是新格式**。
+
+    迁移放在读的路径上，不只放在跑的路径上：旧格式的用例在列表里会显示「0 条要求」，
+    而用户看到的是「我的要求没了」，不是「格式换了」。存回去的时候自然就是新格式。
+    """
+    import benchmark_case
+    record = benchmark_store.get_case(case_id)
+    if record is None:
+        return None
+    return {**record, 'payload': benchmark_case.migrate(record['payload'])}
+
+
 def _case_view(record: dict, loaded: dict | None) -> dict:
     """列表里一张卡需要知道的一切，含「跑不了的理由」和上一次的分数。"""
     import benchmark_case
-    payload = record['payload']
+    payload = benchmark_case.migrate(record['payload'])
     block = benchmark_case.summary(payload)
     recent = benchmark_store.trend(suite=record['name'], limit=1)
     return {
-        'id': record['id'], 'name': record['name'], 'origin': record['origin'],
+        'id': record['id'], 'origin': record['origin'],
         'updated_at': record['updated_at'],
         **block,
+        # **`name` 放在 `**block` 之后**：库里存的那个名字是用户自己起的，而 `summary`
+        # 回的是 `test.name`，后者常常是空的（从文件或市场收进来的用例就没有）。
+        # 展开顺序反过来的话，那些用例在列表里是一行没有标题的卡片。
+        'name': record['name'] or block.get('name', ''),
         'problems': benchmark_case.validate(payload),
         'isLoaded': bool(loaded and loaded == benchmark_case.test_block(payload)),
         'last': recent[0] if recent else None,
@@ -259,7 +276,7 @@ async def market_cases(search: str = '', limit: int = Query(30, ge=1, le=50)):
 
 @router.get('/cases/{case_id}')
 async def get_case(case_id: str):
-    record = benchmark_store.get_case(case_id)
+    record = _read_case(case_id)
     if record is None:
         raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
     return record
@@ -466,10 +483,10 @@ def _case_to_run(case_id: str) -> dict | None:
 
     if not case_id:
         return loaded_case()
-    record = benchmark_store.get_case(case_id)
+    record = _read_case(case_id)
     if record is None:
         raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
-    return benchmark_case.test_block(benchmark_case.migrate(record['payload']))
+    return benchmark_case.test_block(record['payload'])
 
 
 @router.post('/case/run')
