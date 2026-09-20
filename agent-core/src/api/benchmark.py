@@ -534,6 +534,11 @@ def _tool_names(entry: dict) -> list:
             if str(s.get('span', '')).startswith('tool:')]
 
 
+def _is_subsequence(needle: list, haystack: list) -> bool:
+    iterator = iter(haystack)
+    return all(name in iterator for name in needle)
+
+
 def _match_perf(perf: list, calls: list) -> dict | None:
     """按**工具调用名的序列**配对，并消耗掉配上的那一条。
 
@@ -542,13 +547,24 @@ def _match_perf(perf: list, calls: list) -> dict | None:
     而配不上的后果是整列悄悄退回「写完时」，看起来只是少了点精度，不像出错。
 
     也不按顺序配：一次运行期间可能有别的来源插进来，整列错位一格比没有时间更难发现。
-    调用名序列是两边都有、且由同一次执行决定的东西。
+
+    **是子序列，不是相等。** perf 记的是每一次派发，会话记的只是 LLM 自己发起的调用 ——
+    `on_notify` 钩子自动播报的那次 speak 有 span，却不在会话的 tool_calls 里。真机上
+    八轮里六轮因此配不上：
+
+        会话  ['navigate_to_tag', 'speak', 'task_update']
+        perf  ['navigate_to_tag', 'speak', 'speak', 'task_update']
+
+    先找完全相等的（最可靠），再退到按顺序包含。
     """
     names = [c['name'] for c in calls]
     if not names:
         return None
     for index, entry in enumerate(perf):
         if _tool_names(entry) == names:
+            return perf.pop(index)
+    for index, entry in enumerate(perf):
+        if _is_subsequence(names, _tool_names(entry)):
             return perf.pop(index)
     return None
 

@@ -724,11 +724,41 @@ def test_without_spans_the_time_is_marked_as_only_the_write_moment(monkeypatch):
     assert turn['at'] == 14.5 and turn['timing'] == 'written'
 
 
-def test_a_turn_whose_tool_sequence_differs_is_not_matched(monkeypatch):
-    """配对按**调用名序列**：序列对不上，就不是同一轮，整轮都不给精确时间。
+def test_hook_fired_calls_do_not_break_the_match(monkeypatch):
+    """perf 记每一次派发，会话只记 LLM 自己发起的调用 —— `on_notify` 钩子自动播报
+    的那次 speak 有 span，却不在会话的 tool_calls 里。
 
-    与其把别人那一轮的时刻贴上来，不如退回「写完时」并在界面上标出来。
+    真机上八轮里六轮因此配不上：
+        会话  ['navigate_to_tag', 'speak', 'task_update']
+        perf  ['navigate_to_tag', 'speak', 'speak', 'task_update']
+    所以是子序列，不是相等。
     """
+    run_id, started = _run_with_session()
+
+    import chat_history
+    import perf_log
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': started, 'updated_at': started + 30, 'messages': [
+            {'role': 'assistant', 'content': '', 'tool_calls': [
+                {'function': {'name': 'mcp__m__controlled_spatial', 'arguments': '{}'}},
+                {'function': {'name': 'mcp__m__tts', 'arguments': '{}'}},
+                {'function': {'name': 'task_update', 'arguments': '{}'}}]}]}])
+    monkeypatch.setattr(perf_log, 'turns_between', lambda a, b: [{
+        'turn_id': 't1', 'trigger_text': 'x', 'spans': [
+            {'span': 'turn_total', 'start_ts': started + 1},
+            {'span': 'tool:controlled_spatial', 'start_ts': started + 2},
+            {'span': 'tool:tts', 'start_ts': started + 5},
+            {'span': 'tool:tts', 'start_ts': started + 9},     # 钩子播报，不在会话里
+            {'span': 'tool:task_update', 'start_ts': started + 11}]}])
+
+    turn = asyncio.run(benchmark.run_timeline(run_id))['agent'][0]
+
+    assert turn['timing'] == 'exact'
+    assert [c.get('at') for c in turn['calls']] == [2.0, 5.0, 11.0]
+
+
+def test_a_turn_whose_calls_are_not_in_the_span_list_is_not_matched(monkeypatch):
+    """多出来的可以忽略，缺掉的不行：会话里有、perf 里没有，就不是同一轮。"""
     run_id, started = _run_with_session()
 
     import chat_history
