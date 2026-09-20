@@ -58,6 +58,7 @@ import config
 router = fastapi.APIRouter(prefix='/solutions', tags=['solutions'])
 
 FORMAT_VERSION = 1
+BLOCK_TEST = 'test'
 
 # 可打包的块名。canvas 必选，其余由用户勾选。
 BLOCK_CANVAS = 'canvas'
@@ -423,6 +424,10 @@ class PackInclude(BaseModel):
     skills: list[str] = []              # 要打包的技能 slug
     prompt: list[str] = []              # identity | system | memory
     tasks:  bool = False
+    # 带 test 段的方案就是一个基准测试用例：解决方案 + 执行方案 + 评估方案。
+    # 不另起类型、不另开分发路径 —— 市场、脱敏、deviceRef 跨机映射、preflight 的
+    # 分层报错全部沿用这里已有的那一套。见 src/benchmark_case.py。
+    test:   Optional[dict] = None
 
 
 class PackRequest(BaseModel):
@@ -472,6 +477,15 @@ async def _build_payload(req: PackRequest, token: Optional[str]) -> dict:
 
     canvas_block, redacted = _pack_canvas(ref_of, set(req.extra_redact))
     payload['canvas'] = canvas_block
+
+    if req.include.test:
+        import benchmark_case
+        problems = benchmark_case.validate({'test': req.include.test})
+        if problems:
+            # 与其打出一个跑起来什么都不发生、最后记 0 分的用例，不如在这里拒绝。
+            return {'ok': False, 'error': '这个 test 段不能作为测试用例', 'detail': problems}
+        payload['test'] = req.include.test
+        includes.append(BLOCK_TEST)
 
     # 技能：必须是当前激活的，且已在技能广场上架
     if req.include.skills:
