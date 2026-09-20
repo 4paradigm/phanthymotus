@@ -489,6 +489,20 @@ def _case_to_run(case_id: str) -> dict | None:
     return benchmark_case.test_block(record['payload'])
 
 
+def _run_name(case_id: str, case: dict) -> str:
+    """这次运行在历史里叫什么。
+
+    **不能退回 `'case'`。** 那不只是难看：`compare_runs` 按这个名字分组去配对，于是
+    所有没名字的用例会被归成一堆**互相比分** —— 一个「这次比上次好了」的结论，比的
+    其实是两个不同的用例。
+
+    库里存的那个名字是用户自己起的，优先用它；`test.name` 是编辑器写进去的第二份，
+    从文件或市场收进来的用例往往没有。
+    """
+    record = benchmark_store.get_case(case_id) if case_id else None
+    return (record or {}).get('name') or case.get('name', '') or '未命名用例'
+
+
 @router.post('/case/run')
 async def run_case(request: CaseRunRequest):
     """跑当前方案带的用例。
@@ -534,7 +548,7 @@ async def run_case(request: CaseRunRequest):
     environment = _environment()
     repeats = max(1, int(request.repeats))
     run_id = benchmark_store.create_run(
-        case.get('name', '') or 'case', n_repeats=repeats,
+        _run_name(request.case_id, case), n_repeats=repeats,
         tier=environment['tier'], llm_model=environment['llm_model'],
         llm_provider=environment['llm_provider'], host=environment['host'],
         image_tags=environment['image_tags'], git_shas=environment['git_shas'],

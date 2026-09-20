@@ -261,6 +261,23 @@ def test_an_old_format_case_is_migrated_on_its_way_to_the_runner():
     assert any('入口' in r['text'] for r in benchmark_case.requirements({'test': got}))
 
 
+def test_a_run_is_named_after_the_case_so_history_can_tell_them_apart():
+    """**不能退回一个通用名字。**
+
+    `compare_runs` 按名字分组去配对，于是所有叫 `case` 的运行会被归成一堆互相比分 ——
+    一个「这次比上次好了」的结论，比的其实是两个不同的用例。
+    """
+    nameless = {'formatVersion': 1, 'canvas': {}, 'devices': [],
+                'test': {'run': {'prompt': '走'}}}
+    case_id = benchmark_store.save_case(nameless, name='我的用例')
+
+    assert benchmark._run_name(case_id, {'run': {}}) == '我的用例'
+
+
+def test_a_run_with_no_name_anywhere_still_gets_something_readable():
+    assert benchmark._run_name('', {}) == '未命名用例'
+
+
 # ── 载入画布：唯一会覆盖的动作 ────────────────────────────────────────────────
 
 def test_loading_a_case_with_no_canvas_is_refused_rather_than_wiping_it():
