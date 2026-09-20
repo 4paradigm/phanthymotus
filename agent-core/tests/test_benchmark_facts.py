@@ -138,29 +138,32 @@ def test_the_real_actuator_names_are_classified_by_channel(recorder):
 
 # ── 站名靠值匹配 ──────────────────────────────────────────────────────────────
 
-def test_the_label_is_found_by_value_not_by_parameter_name(recorder):
-    """各家参数名不同：天轶 `tag_name`、仿真器 `label`。挑一个名字读，等于把某一家的
-    schema 焊进判定层。"""
-    register('a1', 'controlled_spatial', {'label': '入口'}, BASE)
+def test_the_dispatch_arguments_are_recorded_verbatim(recorder):
+    """各家参数名不同：天轶 `tag_name`、仿真器 `label`、下一家会是别的。挑一个名字读，
+    等于把某一家的 schema 焊进事实层 —— 所以原样记下，不解释。
+
+    要求是人话，判它的是裁判：「有没有按我说的顺序去那几个地方」是它读着参数就能回答
+    的问题，而这里少做一层猜测，就少一处会猜错的地方。
+    """
+    register('a1', 'controlled_spatial', {'tag_name': '一号展区', 'speed': 0.5}, BASE)
     register('a2', 'nav', {'poi': '二号展区'}, BASE)
 
-    labels = [e.get('label') for e in recorder.facts()['events']]
-    assert labels == ['入口', '二号展区']
+    args = [e.get('args') for e in recorder.facts()['events']]
+    assert args == [{'tag_name': '一号展区'}, {'poi': '二号展区'}]
 
 
-def test_navigating_by_coordinates_yields_no_label(recorder):
-    """按坐标导航就没有站名，于是 `waypoint_order` 判失败 —— 而那是**正确**的判定，
-    因为用例要的就是按名字去那些站。这里不该伪造一个。"""
-    register('a1', 'controlled_spatial', {'x': 5.98, 'y': 8.77}, BASE)
-    complete('a1')
+def test_numbers_are_left_out_of_the_recorded_arguments(recorder):
+    """坐标、超时、重试次数对「它去了哪儿」没有帮助，却会把事实流撑大 ——
+    而事实流是要整份喂给裁判的。"""
+    register('a1', 'controlled_spatial', {'x': 5.98, 'y': 8.77, 'retries': 3}, BASE)
 
-    assert all('label' not in e for e in recorder.facts()['events'])
+    assert recorder.facts()['events'][0].get('args') is None
 
 
-def test_an_unrelated_string_argument_is_not_mistaken_for_a_waypoint(recorder):
-    register('a1', 'controlled_spatial', {'strategy': 'delivery', 'mode': 'free'}, BASE)
+def test_a_very_wide_parameter_table_is_capped(recorder):
+    register('a1', 'nav', {f'k{i}': f'v{i}' for i in range(20)}, BASE)
 
-    assert recorder.facts()['events'][0].get('label') is None
+    assert len(recorder.facts()['events'][0]['args']) == 6
 
 
 # ── ACP 上报 ──────────────────────────────────────────────────────────────────

@@ -209,7 +209,7 @@ class CaseRun:
         self.mcp_id = mcp_id
         # `mcp_id` 为空就是真机：没有仿真器持有世界。
         self.world = world or (SimulatorWorld(mcp_id) if mcp_id
-                               else RealWorld(_expected_waypoints(case)))
+                               else RealWorld())
         self.repeats = max(1, int(repeats))
         self.seed = int(seed)
         self.run_id = run_id
@@ -439,28 +439,6 @@ class CaseRun:
 
 
 # ── 触发与收尾判定 ────────────────────────────────────────────────────────────
-
-def _expected_waypoints(case: dict) -> list[str]:
-    """用例点名要去的那些站。
-
-    真机的事实记录器靠这份名单认出一次派发的目标是哪一站 —— 它在参数值里找它们，
-    因为参数**名**各家不同（见 `benchmark_facts` 的模块文档）。用例没点名站序的话，
-    名单为空，导航事实就没有 label，而那些断言本来也没被断言。
-    """
-    expect = (case.get('evaluate') or {}).get('expect') or {}
-    names = list(expect.get('waypoint_order') or [])
-    for key in ('resume_target',):
-        if expect.get(key):
-            names.append(expect[key])
-    leg = expect.get('interrupted_leg') or {}
-    if leg.get('target'):
-        names.append(leg['target'])
-    seen: list[str] = []
-    for name in names:
-        if str(name) and str(name) not in seen:
-            seen.append(str(name))
-    return seen
-
 
 def _trigger_due(injection: dict, events: list, elapsed: float) -> Optional[float]:
     """这条插话该在第几秒（运行开始起算）发出；条件还没满足就返回 None。
