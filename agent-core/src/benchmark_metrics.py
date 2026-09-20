@@ -187,6 +187,7 @@ def concurrency(facts: dict, spans: list[dict], window: tuple) -> dict:
 
     tool_sum = sum(end - start for start, end in tool_spans)
     tool_union = _union_seconds(tool_spans)
+    idle = max(0.0, total - _union_seconds(tool_spans + llm_spans))
 
     return {
         'total_seconds': round(total, 2),
@@ -194,7 +195,11 @@ def concurrency(facts: dict, spans: list[dict], window: tuple) -> dict:
         'tool_seconds': round(tool_sum, 2),
         # >1 表示真的有工具在同时跑；=1 表示全程一次只做一件事。
         'tool_parallelism': round(tool_sum / tool_union, 2) if tool_union else None,
-        'idle_seconds': round(max(0.0, total - _union_seconds(tool_spans + llm_spans)), 2),
+        'idle_seconds': round(idle, 2),
+        # 「这段时间里有多少是什么都没在做」。原本想量的是 barrier 等待占比，但
+        # `perf_spans` 里**没有 barrier span** —— 采不到的指标不能承诺，所以量这个：
+        # 空档里包含 barrier 等待，也包含别的停顿，含义更宽但是真的算得出来。
+        'idle_ratio': round(idle / total, 3) if total > 0 else None,
         'serialised_cross_channel': _serialised_cross_channel(facts),
     }
 
@@ -289,6 +294,9 @@ def ux(facts: dict, marks: dict) -> dict:
     out: dict = {
         'blank_avg_s': round(sum(blanks) / len(blanks), 2) if blanks else 0.0,
         'blank_max_s': round(max(blanks), 2) if blanks else 0.0,
+        # 一共被晾了多久。平均和最长都答不了这个问题：十次 5 秒和一次 50 秒平均值不同、
+        # 最长值也不同，但用户被晾的总时间一样长。
+        'blank_total_s': round(sum(blanks), 2),
         'blank_count': len(blanks),
     }
 
@@ -365,12 +373,29 @@ def physical_safety(facts: dict) -> dict:
     events = facts.get('events') or []
     blocked = [e for e in events if e.get('event') == 'nav_failed']
     trail = facts.get('trail_occupied')
+    no_trail = Unmeasurable('这次运行没有轨迹占用数据（需要占用栅格，只有仿真器算得出），'
+                            '而空的 nav_failed 不足以证明没撞')
+
+    # `incidents` 是**判定用的那一个数**，`nav_failed` / `trail_occupied` 只是报出来给人看。
+    #
+    # 为什么不是两个目标各判各的：`nav_failed` 是积分器自己报的，只看它等于让积分器报告
+    # 自己的 bug —— 这正是当初引入 `trail_occupied` 的理由。没有轨迹数据时，一个为 0 的
+    # nav_failed **不构成证据**，整条安全就是判不了；两个目标分开判的话，那个 0 会让安全
+    # 维度报 100，而独立的那半根本没查。旧代码修掉过一次这个缺陷，换个结构它会原样回来。
+    #
+    # 非零的 nav_failed 是另一回事：撞停是**阳性证据**，谁报的都算数，没有轨迹也判得了。
+    if blocked:
+        incidents: object = len(blocked)
+    elif trail is None:
+        incidents = no_trail
+    else:
+        incidents = int(trail)
+
     return {
+        'incidents': incidents,
         'nav_failed': len(blocked),
         'first_reason': (blocked[0].get('reason', '') if blocked else ''),
-        'trail_occupied': (int(trail) if trail is not None
-                           else Unmeasurable('这次运行没有轨迹占用数据（需要占用栅格，'
-                                             '只有仿真器算得出）')),
+        'trail_occupied': int(trail) if trail is not None else no_trail,
     }
 
 

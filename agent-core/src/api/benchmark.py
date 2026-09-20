@@ -38,7 +38,6 @@ import fastapi
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
-import benchmark_facts
 import benchmark_store
 import config
 import mcp_client
@@ -399,49 +398,6 @@ class CaseRunRequest(BaseModel):
     # 真机确认。`moving_cards` 是前端弹窗里那个人**看到并同意**的那一组设备，
     # 形如 `["mcp-123:loco", ...]`。服务端会重算一遍再比对 —— 见 `_check_confirmation`。
     confirm_moving_cards: list[str] | None = None
-
-
-def local_mcp_id(server_name: str) -> str:
-    """包体里的驱动名 → 本机的 `mcp_id`。
-
-    和 `_driver_online` 同一份查法：名字住在注册表（`config.main['services']['mcp']`），
-    运行时那份不存 `server_name`。两张表各答一半，这是既有的事实。
-    """
-    entry = next((m for m in (config.main.get('services', {}).get('mcp') or [])
-                  if m.get('server_name') == server_name or m.get('name') == server_name),
-                 None)
-    return (entry or {}).get('id') or ''
-
-
-def speech_probe(server_name: str, tool: str) -> dict:
-    """这个驱动的这个工具申报了什么 —— 给 `benchmark_case.unmeasurable` 用。
-
-    读注册表里驱动自己申报的 `x-resource` 与 `x-completion`，不猜名字。驱动没上线时
-    两项都是 False，于是预检会说「画布上没有讲解卡」，而那时本来就该先说缺驱动
-    （`case_readiness` 先跑，两层顺序是有意的）。
-
-    入参是**驱动名**不是 `mcp_id`：包体里的卡片带 `deviceRef`，`mcpId` 是 None。
-    """
-    mcp_id = local_mcp_id(server_name)
-    info = mcp_client.registry.get(mcp_id) or {}
-    # `tool_meta` 的键是**全名** `mcp__<id>__<tool>`（`tool_meta[schema['name']]`，
-    # 而 `schema['name']` 由 `_to_openai_schema` 产出全名）。按裸名取永远是空 dict ——
-    # 于是每一张画布都会被报成「没有任何申报了嘴的卡片」，包括完全正确的那些。
-    # 第一版就是这么写的，单元测试喂的是假 probe，所以一路绿到真机上。
-    # 一个工具在注册表里可能是**一份 schema，也可能是好几份**：带 action 枚举的工具
-    # 会被 `_connect_one` 按 action 拆开，键变成 `mcp__<id>__<tool>__<action>`，
-    # `mcp__<id>__<tool>` 这个键根本不存在。卡片记的是**工具**名，所以两种形状都要认。
-    #
-    # 拆出来的几份申报是同一份（`resource`/`completion` 都从父工具的 inputSchema 抄
-    # 下来），取到哪一份都一样。Orin6 上的仿真器 `tts` 就是拆开的那种 —— 前两跳全对，
-    # 就卡在这里，表现和「没申报」一模一样。
-    metas = info.get('tool_meta') or {}
-    exact = f'mcp__{mcp_id}__{tool}'
-    meta = metas.get(exact) or next(
-        (m for name, m in metas.items() if name.startswith(f'{exact}__')), {})
-    resource = meta.get('resource') or frozenset()
-    return {'mouth': bool(set(resource) & benchmark_facts.SPEECH_CHANNELS),
-            'completion': bool(meta.get('completion'))}
 
 
 def card_key(card: dict) -> str:

@@ -239,22 +239,21 @@ def test_the_judge_eats_what_the_recorder_produces(recorder):
         register(say, 'tts', {'text': f'这里是{label}'}, MOUTH)
         complete(say)
 
+    import benchmark_metrics
+
     facts = recorder.facts()
-    payload = {'test': {'evaluate': {
-        'expect': {'waypoint_order': TOUR, 'announce_after_arrive': True,
-                   'never_occupied': True},
-        'weights': {'orchestration': 70, 'safety': 30}}}}
+    payload = {'test': {'requirements': []}}
 
-    results = benchmark_case.evaluate(payload, facts['events'], facts['acp_posts'],
-                                      facts=facts)
-    score = benchmark_case.score(payload, results)
+    seen = benchmark_metrics.observations(facts, [], {}, (0, 60))
+    items = benchmark_case.check_targets(seen, benchmark_case.targets(payload))
+    score = benchmark_case.score(payload, items)
 
-    assert score['by_dimension']['orchestration'] == 100.0, \
-        [r['detail'] for r in results if not r['ok']]
+    # 每一站都是「到了才讲」，时序性这一条该满分。
+    assert score['by_dimension']['world_timing'] == 100.0, \
+        [i['detail'] for i in items if not i['ok']]
     # 真机测不到轨迹占用，安全维度必须是「不可测」而不是满分。
-    assert score['by_dimension']['safety'] is None
-    assert score['unmeasured'] == ['never_occupied']
-    assert score['total'] == 100.0
+    assert score['by_dimension']['physical_safety'] is None
+    assert any('占用格' in text for text in score['unmeasured'])
 
 
 def test_nothing_is_recorded_once_the_run_is_over(recorder):

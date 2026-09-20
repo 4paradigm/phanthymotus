@@ -27,10 +27,9 @@ TEST_BLOCK = {
     'name': '北京2F展厅 · 完整导览',
     'requires': {'drivers': ['simulator-generic'], 'assets': ['bj-2f']},
     'run': {'prompt': '带我转一下展区并给我介绍下',
-            'world': {'map': 'bj-2f'},
-            'injections': [{'after_arrival': 'P5', 'delay': 6.0, 'text': '先等一下'}]},
-    'evaluate': {'expect': {'waypoint_order': ['P3', 'P4']},
-                 'weights': {'orchestration': 100}},
+            'injections': [{'after_action': 2, 'delay': 6.0, 'text': '先等一下'}]},
+    'requirements': [{'text': '按我说的顺序依次到达每一站', 'weight': 30,
+                      'dimension': 'world_timing'}],
 }
 
 
@@ -113,7 +112,7 @@ def test_the_list_carries_what_a_card_needs_without_unpacking_the_payload():
     card = asyncio.run(benchmark.list_cases())['cases'][0]
 
     assert card['prompt'] == '带我转一下展区并给我介绍下'
-    assert card['injections'] == 1 and card['waypoints'] == 2
+    assert card['injections'] == 1 and card['requirements'] == 1
     assert card['problems'] == []
 
 
@@ -191,7 +190,7 @@ def test_summary_is_where_the_payload_shape_is_known():
     view = benchmark_case.summary(payload(cards=4))
 
     assert view['name'] == '北京2F展厅 · 完整导览'
-    assert view['map'] == 'bj-2f' and view['cards'] == 4
+    assert view['requirements'] == 1 and view['cards'] == 4
 
 
 def test_summary_of_a_solution_that_is_not_a_case_is_empty_not_a_crash():

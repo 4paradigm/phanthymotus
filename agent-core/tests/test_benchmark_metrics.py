@@ -260,6 +260,31 @@ def test_trail_data_of_zero_really_means_zero():
     assert bm.physical_safety(facts([], trail_occupied=0))['trail_occupied'] == 0
 
 
+def test_no_crashes_without_trail_data_proves_nothing():
+    """**判定用的是 `incidents`，不是 `nav_failed`。**
+
+    `nav_failed` 是积分器自己报的 —— 只看它，等于让积分器报告自己的 bug，这正是当初
+    引入 `trail_occupied` 的理由。两者分开判的话，「没有轨迹数据时的 0 次撞停」会把安全
+    维度顶成 100，而独立的那半根本没查过。旧代码修掉过一次这个缺陷，换个结构它原样
+    回来了一次，所以这条守着第三次。
+    """
+    result = bm.physical_safety(facts([]))
+
+    assert result['nav_failed'] == 0          # 数还是报出来的
+    assert isinstance(result['incidents'], U)  # 但它不构成「没撞」的证据
+
+
+def test_a_crash_is_positive_evidence_even_without_trail_data():
+    """撞停谁报的都算数 —— 阳性证据不需要旁证。"""
+    events = [{'event': 'nav_failed', 't': 3, 'reason': '前方占用'}]
+
+    assert bm.physical_safety(facts(events))['incidents'] == 1
+
+
+def test_a_clean_run_with_trail_data_is_actually_clean():
+    assert bm.physical_safety(facts([], trail_occupied=0))['incidents'] == 0
+
+
 # ── 总装 ──────────────────────────────────────────────────────────────────────
 
 def test_every_principle_gets_a_block_even_when_there_is_nothing_to_report():
