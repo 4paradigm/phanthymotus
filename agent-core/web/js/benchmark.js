@@ -417,6 +417,7 @@ async function _abort() {
 }
 
 function _startPolling() {
+  if (_pollTimer) return;      // 已经在轮询了，别把自己重置掉
   _stopPolling();
   // 跑动在后台的 asyncio task 上推进，所以进度是轮询而不是推流。
   _pollTimer = setInterval(_poll, 3000);
@@ -424,6 +425,24 @@ function _startPolling() {
 
 function _stopPolling() {
   if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+}
+
+/**
+ * 进度该显示什么。
+ *
+ * 跑着但一次 repeat 都还没跑完，是长程用例的常态 —— 第一趟导览就是好几分钟。只按
+ * 「有没有已完成的 case」判断，这段时间里刷新一下页面，面板会说「没有正在进行的
+ * 跑动」，而机器人正在走。真机上就是这么露出来的。
+ */
+export function progressView(data) {
+  const live = ['starting', 'running'].includes(data?.state);
+  const cases = data?.cases || [];
+  return {
+    live,
+    show: !!data && !data.error && (live || cases.length > 0),
+    done: cases.filter((c) => c.outcome !== 'pending').length,
+    total: data?.repeats ?? cases.length,
+  };
 }
 
 async function _poll() {
@@ -434,20 +453,24 @@ async function _poll() {
     data = await api('/api/benchmark/case/progress');
   } catch { return; }
 
-  if (!data || data.error || !data.cases || !data.cases.length) {
+  const view = progressView(data);
+  if (view.live) _startPolling();
+
+  if (!view.show) {
     // 空闲时不报「0 / 0 个 case」——那是噪音，不是信息。
     el.innerHTML = '<div class="bm-empty">没有正在进行的跑动。</div>';
     return;
   }
-  const done = data.cases.filter((c) => c.outcome !== 'pending').length;
+  const cases = data.cases || [];
+  const done = view.done;
   el.innerHTML = `
     <div class="bm-progress-head">
       <span class="bm-state bm-state--${_esc(data.state)}">${_stateLabel(data.state)}</span>
-      <span><b>${done}</b> / ${data.cases.length} 个 case</span>
+      <span><b>${done}</b> / ${view.total} 次</span>
       ${data.mean != null ? `<span>均分 <b>${data.mean}</b>${
         data.stdev != null ? ` ±${data.stdev}` : ''}<span class="bm-n">n=${data.n}</span></span>` : ''}
     </div>
-    ${data.cases.map((c) => {
+    ${cases.map((c) => {
       const score = c.score || {};
       const dims = score.by_dimension || {};
       const order = ['orchestration', 'interruption', 'long_horizon', 'latency', 'safety'];

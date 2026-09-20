@@ -171,3 +171,39 @@ test('第一条事件前面不算静默', () => {
 
   assert.equal(rows.length, 1);
 });
+
+// ── 进度：跑着就说跑着 ───────────────────────────────────────────────────────
+
+import { progressView } from './benchmark.js';
+
+test('一次 repeat 都还没跑完，也要显示它在跑', () => {
+  // 长程用例的常态：第一趟导览要好几分钟。这段时间刷新页面，面板不能说
+  // 「没有正在进行的跑动」——机器人正在走。真机上就是这么露出来的。
+  const view = progressView({ state: 'running', repeats: 3, cases: [] });
+
+  assert.equal(view.live, true);
+  assert.equal(view.show, true);
+  assert.equal(view.total, 3);
+});
+
+test('空闲且没有结果时才说没有跑动', () => {
+  assert.equal(progressView({ state: 'idle' }).show, false);
+  assert.equal(progressView(null).show, false);
+});
+
+test('跑完了还留在面板上，不立刻清空', () => {
+  const view = progressView({ state: 'done', repeats: 2, cases: [
+    { outcome: 'ok' }, { outcome: 'failed' }] });
+
+  assert.equal(view.live, false);
+  assert.equal(view.show, true);
+  assert.equal(view.done, 2);
+});
+
+test('排队中的 repeat 不算已完成', () => {
+  const view = progressView({ state: 'running', repeats: 3, cases: [
+    { outcome: 'ok' }, { outcome: 'pending' }] });
+
+  assert.equal(view.done, 1);
+  assert.equal(view.total, 3);
+});
