@@ -113,6 +113,18 @@ def test_a_tool_that_declares_nothing_produces_no_facts(recorder):
     assert recorder.facts()['events'] == []
 
 
+def test_a_bare_string_channel_still_classifies(recorder):
+    """驱动写的就是 `"x-resource": "mouth"`（一个字符串，不是列表）。
+
+    注册表里存的是归一化过的 frozenset，但真让一个裸串走到这儿，`set("mouth")` 会
+    变成一堆单字母，于是一条讲解事实都不产出 —— 方向安全，但**无声**。
+    """
+    register('s1', 'tts', {'text': '你好'}, 'mouth')
+    complete('s1')
+
+    assert names(recorder.facts()) == ['speak_start', 'speak_end']
+
+
 def test_the_real_actuator_names_are_classified_by_channel(recorder):
     """`loco` 这个名字里没有 move / nav / goto，任何关键词表都抓不住它。
 

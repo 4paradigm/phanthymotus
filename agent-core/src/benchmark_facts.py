@@ -178,10 +178,16 @@ class Recorder:
 
 
 def _kind(resource) -> str | None:
-    """申报的通道属于哪一类。没申报就是 None —— 不猜。"""
+    """申报的通道属于哪一类。没申报就是 None —— 不猜。
+
+    裸字符串要单独挡一下。注册表里存的是 `parse_resources` 归一化过的 frozenset，
+    但 `set("mouth")` 是 `{'m','o','u','t','h'}` —— 匹配不上任何通道，于是一条讲解
+    事实都不产出。方向上是安全的，问题在于**无声**：事实流里「没讲」和「讲了但没
+    记下来」完全一样，而这正是已经踩过一次的那种坑。
+    """
     if not resource:
         return None
-    channels = set(resource)
+    channels = {resource} if isinstance(resource, str) else set(resource)
     if channels & NAV_CHANNELS:
         return 'nav'
     if channels & SPEECH_CHANNELS:
