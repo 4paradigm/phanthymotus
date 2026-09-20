@@ -580,7 +580,9 @@ async function _poll() {
     ${cases.map((c) => {
       const score = c.score || {};
       const dims = score.by_dimension || {};
-      const order = ['orchestration', 'interruption', 'long_horizon', 'latency', 'safety'];
+      // 七条原则，顺序固定 —— 格子的位置本身就是信息，顺序一变，两次运行的条形图
+      // 就没法并排看了。和 `benchmark_case.DIMENSIONS` 同一份顺序。
+      const order = Object.keys(_DIMS);
       const bar = order.map((k) => {
         const v = dims[k];
         const cls = v == null ? '' : (v >= 100 ? ' bm-dim--ok' : ' bm-dim--bad');
@@ -591,7 +593,11 @@ async function _poll() {
       <div class="bm-case">
         <div class="bm-case-name">
           ${_esc(c.scenario)} <i>#${c.repeat + 1}</i>
-          ${(c.failures || []).length ? `<i>· ${(c.failures || []).map(_dimOrName).join('、')}</i>` : ''}
+          ${(c.failures || []).length ? `<i title="${_esc((c.failures || []).join('\n'))}">· 没过 ${
+            (c.failures || []).length} 条</i>` : ''}${
+            (score.unmeasured || []).length ? `<i class="bm-dim-none"
+              title="${_esc((score.unmeasured || []).join('\n'))}">· ${
+              (score.unmeasured || []).length} 条判不了</i>` : ''}
           <div class="bm-dims">${bar}</div>
         </div>
         <div class="bm-case-score">${score.total ?? '—'}</div>
@@ -715,16 +721,10 @@ const _DIMS = {
   llm_latency: 'LLM 延时', cache_hit: 'cache 命中',
   answer_quality: '回答效果', ux: '用户体验', physical_safety: '安全',
 };
-const _CHECK_DIM = {
-  waypoint_order: '编排', announce_after_arrive: '编排', exactly_one_terminal_post: '编排',
-  interrupted_leg: '打断', resume_correctness: '长程',
-  max_wall_seconds: '时效', never_occupied: '安全',
-};
 const _OUTCOMES = { ok: '通过', stalled: '卡住', timeout: '超时', error: '出错', pending: '排队中' };
 const _STATES = { idle: '空闲', loading: '准备中', running: '进行中', done: '已完成' };
 
 function _dimLabel(k) { return _DIMS[k] || k; }
-function _dimOrName(name) { return _CHECK_DIM[name] || name; }
 function _outcome(o) { return _OUTCOMES[o] || o; }
 function _stateLabel(s) { return _STATES[s] || s; }
 
