@@ -232,8 +232,11 @@ class CaseRun:
         score = payload.get('score') or {}
         results = payload.get('results') or []
         elapsed = time.time() - started
+        # 判不了的不算失败（`measurable: False`）—— 否则真机上每次运行都会因为
+        # 「没有轨迹占用数据」被标成 failed，而那不是 agent 做错了什么。
         failures = [r['name'] for r in results
-                    if not r['ok'] and r.get('detail') != '未断言']
+                    if not r['ok'] and r.get('measurable', True)
+                    and r.get('detail') != '未断言']
         name = self.case.get('name', '') or 'case'
         outcome = 'error' if error else ('ok' if not failures else 'failed')
         # `scenario` 和 `outcome` 也放进返回的行里：面板拿同一份数据渲染进度，

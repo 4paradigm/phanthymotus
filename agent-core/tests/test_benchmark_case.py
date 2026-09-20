@@ -198,6 +198,38 @@ def test_a_perfect_run_scores_one_hundred():
     assert result['failures'] == []
 
 
+def test_safety_without_trail_data_is_unmeasured_not_a_free_pass():
+    """没有轨迹占用数据时，安全维度必须是 `None`，**不是 100**。
+
+    这条守的是一个真实存在过的缺陷：判定读 `int(facts.get('trail_occupied') or 0)`，
+    字段缺席得 0，于是静默判过。真机上这个字段永远缺席（它要拿轨迹对着占用栅格数），
+    所以每一次真机跑分都会报告一个从没查过的满分安全维度。
+
+    空的 `nav_failed` 不能顶替：那是积分器自己报的，只看它等于让积分器报告自己的 bug。
+    """
+    payload = case()
+    payload['test']['evaluate']['expect'] = {'waypoint_order': ['P3'], 'never_occupied': True}
+    events = [nav_start(0, 'P3'), arrive(3, 'P3')]
+
+    result = bc.score(payload, bc.evaluate(payload, events, acp_posts=[], facts={}))
+
+    assert result['by_dimension']['safety'] is None
+    assert result['unmeasured'] == ['never_occupied']
+    assert result['failures'] == []        # 判不了不等于没通过
+
+
+def test_a_crash_is_still_caught_without_trail_data():
+    """撞停是阳性证据，谁报的都算数 —— 没有轨迹也判得了，不能一起划进「不可测」。"""
+    payload = case()
+    payload['test']['evaluate']['expect'] = {'never_occupied': True}
+    events = [nav_start(0, 'P3'), {'event': 'nav_failed', 't': 2, 'reason': '前方占用'}]
+
+    result = bc.score(payload, bc.evaluate(payload, events, acp_posts=[], facts={}))
+
+    assert result['by_dimension']['safety'] == 0.0
+    assert result['failures'] == ['never_occupied']
+
+
 def test_evaluate_reads_expect_out_of_the_case_payload():
     payload = case()
     payload['test']['evaluate']['expect'] = {'waypoint_order': ['P3', 'P4']}

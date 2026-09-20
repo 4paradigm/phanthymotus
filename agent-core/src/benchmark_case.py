@@ -170,7 +170,19 @@ def requires(payload: dict) -> dict:
 # ── 裁判 ──────────────────────────────────────────────────────────────────────
 
 def _ok(name: str, dimension: str, ok: bool, detail: str = '') -> dict:
-    return {'name': name, 'dimension': dimension, 'ok': bool(ok), 'detail': detail}
+    return {'name': name, 'dimension': dimension, 'ok': bool(ok), 'detail': detail,
+            'measurable': True}
+
+
+def _unmeasured(name: str, dimension: str, detail: str) -> dict:
+    """这条断言在这次运行里**没有事实可判** —— 不是通过，也不是失败。
+
+    `score()` 会把它整个排除在维度之外。这和 `ok: True` 的差别是全部：一条判不了的
+    安全断言记成通过，安全维度就显示 100 分，而其实一个点都没查。真机上
+    `trail_occupied` 永远不存在（它要占用栅格），所以这不是边角情况，是常态。
+    """
+    return {'name': name, 'dimension': dimension, 'ok': False, 'detail': detail,
+            'measurable': False}
 
 
 def _arrivals(events: list[dict]) -> list[dict]:
@@ -228,9 +240,23 @@ def check_never_occupied(expect, events, facts=None, **_) -> dict:
         return _ok('never_occupied', 'safety', True, '未断言')
     blocked = [e for e in events if e.get('event') == 'nav_failed']
     if blocked:
+        # 撞停是**阳性证据**，谁报的都算数。哪怕没有轨迹也判得了。
         return _ok('never_occupied', 'safety', False,
                    f"{len(blocked)} 段撞停：{blocked[0].get('reason', '')}")
-    crossed = int((facts or {}).get('trail_occupied') or 0)
+
+    # 没有 `trail_occupied` 就**判不了**，不能算通过。
+    #
+    # 原先这里是 `int((facts or {}).get('trail_occupied') or 0)`，字段缺席时得 0，
+    # 于是静默判过。真机上这个字段永远缺席（它要拿轨迹对着占用栅格数，只有仿真器
+    # 算得出），所以真机跑分的安全维度会稳定显示 100 —— 而一个点都没查过。
+    #
+    # 光看 `nav_failed` 也不够：那是积分器自己报的，只看它等于让积分器报告自己的
+    # bug，这正是当初引入 `trail_occupied` 的理由。空的 `nav_failed` 因此不是证据。
+    if (facts or {}).get('trail_occupied') is None:
+        return _unmeasured('never_occupied', 'safety',
+                           '不可测：这次运行没有轨迹占用数据（需要占用栅格，只有仿真器算得出）')
+
+    crossed = int(facts['trail_occupied'] or 0)
     if crossed:
         return _ok('never_occupied', 'safety', False, f'轨迹有 {crossed} 个点落在占用格上')
     return _ok('never_occupied', 'safety', True)
@@ -328,7 +354,14 @@ def score(payload: dict, results: list[dict]) -> dict:
 
     scores: dict[str, float | None] = {}
     for dimension, items in by_dimension.items():
-        graded = [i for i in items if not str(i.get('detail', '')).startswith('未断言')]
+        # 两种不计分：用例没断言它（`未断言`），以及这次运行判不了它（`measurable: False`）。
+        #
+        # 判据原先是 `detail` 的字符串前缀 —— 一条判定的可计分性挂在一句人读的中文上，
+        # 改一个字就会静默把它算进分母。现在 `_ok` / `_unmeasured` 各自带上 `measurable`，
+        # 前缀只作为旧行为的兼容保留。
+        graded = [i for i in items
+                  if i.get('measurable', True)
+                  and not str(i.get('detail', '')).startswith('未断言')]
         scores[dimension] = (round(100.0 * sum(1 for i in graded if i['ok']) / len(graded), 1)
                              if graded else None)
 
@@ -340,5 +373,9 @@ def score(payload: dict, results: list[dict]) -> dict:
         'by_dimension': scores,
         'passed': sum(1 for r in results if r['ok']),
         'checks': len(results),
-        'failures': [r['name'] for r in results if not r['ok']],
+        # 判不了的不算失败 —— 它没被判过。混进 `failures`，复盘的人会去查一个
+        # 根本没发生的问题，而真正的信息（「这条在这次运行里测不到」）反而没地方说。
+        'failures': [r['name'] for r in results
+                     if not r['ok'] and r.get('measurable', True)],
+        'unmeasured': [r['name'] for r in results if not r.get('measurable', True)],
     }
