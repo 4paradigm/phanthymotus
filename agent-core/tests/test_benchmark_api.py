@@ -475,3 +475,44 @@ def test_an_unknown_run_is_a_404():
         asyncio.run(benchmark.run_timeline('nope'))
 
     assert caught.value.status_code == 404
+
+
+def test_a_turn_that_began_before_the_run_but_grew_during_it_counts(monkeypatch):
+    """Orin6 上抓到的：agent 那一栏整个是空的，而会话明明活跃在跑动窗口里。
+
+    一轮是被反复重写的 —— `save_turn` 在 turn_index 已存在时走 UPDATE，`created_at`
+    不变、`updated_at` 往后走。跑动期间写进去的内容，可能挂在一个**早就起了头**的
+    轮次上。只看起始时刻，这一轮会被整个丢掉。
+    """
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=?, ended_at=? WHERE id=?',
+                 ('s1', stored['started_at'] + 400, run_id))
+    conn.commit()
+
+    import chat_history
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': stored['started_at'] - 4000,          # 跑动开始前就起了头
+        'updated_at': stored['started_at'] + 100,           # 但内容写在跑动期间
+        'messages': [{'role': 'user', 'content': '带我转一下展区'}]}])
+
+    agent = asyncio.run(benchmark.run_timeline(run_id))['agent']
+
+    assert [t['trigger'] for t in agent] == ['带我转一下展区']
+
+
+def test_a_turn_that_ended_before_the_run_is_still_excluded(monkeypatch):
+    run_id = benchmark_store.create_run('导览')
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?', ('s1', run_id))
+    conn.commit()
+
+    import chat_history
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': stored['started_at'] - 4000,
+        'updated_at': stored['started_at'] - 3000,          # 整轮都结束在跑动之前
+        'messages': [{'role': 'user', 'content': '上一场'}]}])
+
+    assert asyncio.run(benchmark.run_timeline(run_id))['agent'] == []

@@ -526,13 +526,24 @@ def _agent_track(session_id: str, started, ended) -> list:
     except Exception:
         return []
 
+    window_from = float(started) - 5 if started else None
+    window_to = float(ended) + 5 if ended else None
+
     track = []
     for index, turn in enumerate(turns):
         at = turn.get('started_at') or 0
-        if started and at and at < float(started) - 5:
-            continue          # 跑动开始之前的轮次，不是这次的事
-        if ended and at and at > float(ended) + 5:
-            continue
+        # 按**区间相交**判断，不按开始时刻。
+        #
+        # 一轮是被反复重写的：`save_turn` 在 turn_index 已存在时走 UPDATE，`created_at`
+        # 保持不变、`updated_at` 往后走。所以一轮可能在跑动**开始之前**就起了头，而
+        # 它的内容是在跑动**期间**写进去的。只看起始时刻，这一轮会被整个丢掉 ——
+        # Orin6 上就是如此：会话明明活跃在跑动窗口里（`ended_at` 落在窗口内），
+        # 而每一轮的 `started_at` 都在窗口之前，于是 agent 那一栏是空的。
+        until = turn.get('updated_at') or at
+        if window_from is not None and until and until < window_from:
+            continue          # 整轮都结束在跑动之前
+        if window_to is not None and at and at > window_to:
+            continue          # 整轮都开始在跑动之后
         says, calls, trigger = [], [], ''
         for message in turn.get('messages') or []:
             role = message.get('role')
