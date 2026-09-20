@@ -77,14 +77,23 @@ COPY resource/memory/defaults/ /opt/defaults/memory/
 # /sbin/ldconfig.real 是同一个文件）。往那个名字上 mv 会**直接覆盖掉真二进制**，
 # 容器里从此再也跑不了 ldconfig —— 第一版就是这么干的，而当时加的 `file --version`
 # 照样通过，因为它验的不是被破坏的那一处。所以用一个不可能撞名的临时名字，
-# 并且在同一层里把 ldconfig 自己也验一遍。
+# 并且在同一层里把 ldconfig 那两个文件也验一遍。
+#
+# **验它还在，但不执行它。** 第二版这里写的是 `ldconfig --version`，而在 qemu 下执行
+# ldconfig 恰恰就是这一整层要绕开的那个随机段错误（实测基线 2/5 失败）。于是那句检查
+# 本身开始随机崩掉构建 —— 一个用「跑一次」来证明「没坏」的检查，放在一个「跑一次就
+# 可能崩」的环境里。改成看文件在不在、是不是原来那个 ELF：`cp -a` 保留大小与 inode
+# 之外的一切，覆盖掉真二进制的那种坏法（第一版）在这里一眼就能看出来。
 RUN cp -a /usr/sbin/ldconfig /tmp/ldconfig.masked-orig && \
     ln -sf /bin/true /usr/sbin/ldconfig && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated file && \
     rm -rf /var/lib/apt/lists/* && \
     mv /tmp/ldconfig.masked-orig /usr/sbin/ldconfig && \
-    file --version && ldconfig --version
+    file --version && \
+    test -x /usr/sbin/ldconfig.real && \
+    file /usr/sbin/ldconfig.real | grep -q ELF && \
+    test "$(stat -c %s /usr/sbin/ldconfig.real)" -gt 100000
 
 ARG IMAGE_TAG=unknown
 ENV IMAGE_TAG=${IMAGE_TAG}
