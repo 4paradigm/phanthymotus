@@ -260,6 +260,27 @@ class VLAPlugin:
                                    "scope": "shared",
                                    "x-show-when": {"provider": staged_providers},
                                    **({"enum": local_models} if local_models else {})},
+                    # Which dataset's statistics un-normalise the action.
+                    #
+                    # Only a **pretrained base** needs this, and only because its
+                    # statistics are grouped per dataset (`smolvla_base` carries
+                    # so100 / so100-blue / so100-red) while the pipeline looks up
+                    # plain `action`. A miss is not an error in LeRobot — the step
+                    # passes the tensor through — so leaving it unset used to mean
+                    # the card emitted the policy's normalised space, ≈ ±1, into a
+                    # descriptor that reads degrees. The provider now refuses to
+                    # load instead, and this field is where the answer goes.
+                    #
+                    # Free text rather than `enum`: the groups live inside the
+                    # checkpoint and are only known once it is read, and an empty
+                    # <select> would be worse than a box you can type into. The
+                    # provider validates it and lists the real groups when it is
+                    # wrong.
+                    #
+                    # A checkpoint fine-tuned on one robot keys its statistics
+                    # `action` and needs nothing here.
+                    "unnorm_key": {"type": "string", "scope": "shared",
+                                   "x-show-when": {"provider": staged_providers}},
                     "cloud_model_name": {"type": "string", "scope": "shared",
                                          "x-show-when": {"provider": remote_providers}},
                     # Only vla_cloud has anywhere to send a request. Hiding
