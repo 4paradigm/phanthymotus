@@ -60,6 +60,18 @@ _SCHEMA = (
         artifacts_ref TEXT DEFAULT ''
     )
     ''',
+    # 本机用例库。表名**不是** benchmark_case —— 那个名字已经被「一次跑动里的一个
+    # repeat」占了。同名不同义在这一轮已经坑过三次（kind / result / state），不再
+    # 来第四次：这里存的是「要跑什么」，上面那张存的是「跑出了什么」。
+    '''
+    CREATE TABLE IF NOT EXISTS case_library (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        origin     TEXT DEFAULT '',
+        updated_at REAL NOT NULL,
+        payload    TEXT NOT NULL
+    )
+    ''',
     'CREATE INDEX IF NOT EXISTS idx_benchmark_run_started ON benchmark_run(started_at)',
     'CREATE INDEX IF NOT EXISTS idx_benchmark_case_run ON benchmark_case(run_id)',
 )
@@ -194,3 +206,51 @@ def trend(suite: str = '', limit: int = 30) -> list[dict]:
         'n_repeats': run['n_repeats'], 'llm_model': run['llm_model'],
         'image_tags': run['image_tags'], 'tier': run['tier'],
     } for run in runs[:limit]][::-1]
+
+
+# ── 本机用例库 ────────────────────────────────────────────────────────────────
+#
+# 存的是**整个解决方案包体**，不是只有 `test` 段。用例是解决方案 + 执行方案 +
+# 评估方案；只存后两段，载入时就拿不出画布，「用例自带画布」这条也就不成立了。
+
+def save_case(payload: dict, *, name: str = '', origin: str = '',
+              case_id: str = '') -> str:
+    """新建或覆盖一条用例。返回它的 id。"""
+    case_id = case_id or f'case-{int(time.time())}-{uuid.uuid4().hex[:6]}'
+    conn = _get_conn()
+    conn.execute(
+        'INSERT INTO case_library (id, name, origin, updated_at, payload) '
+        'VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET '
+        'name=excluded.name, origin=excluded.origin, updated_at=excluded.updated_at, '
+        'payload=excluded.payload',
+        (case_id, name or '未命名用例', origin, time.time(), _dumps(payload)))
+    conn.commit()
+    return case_id
+
+
+def _case_row(row) -> dict:
+    return {'id': row[0], 'name': row[1], 'origin': row[2],
+            'updated_at': row[3], 'payload': _loads(row[4], {})}
+
+
+def get_case(case_id: str) -> dict | None:
+    row = _get_conn().execute(
+        'SELECT id, name, origin, updated_at, payload FROM case_library WHERE id=?',
+        (case_id,)).fetchone()
+    return _case_row(row) if row else None
+
+
+def list_cases(limit: int = 100) -> list[dict]:
+    rows = _get_conn().execute(
+        'SELECT id, name, origin, updated_at, payload FROM case_library '
+        'ORDER BY updated_at DESC LIMIT ?', (limit,)).fetchall()
+    return [_case_row(row) for row in rows]
+
+
+def delete_case(case_id: str) -> bool:
+    """删用例。**不动 benchmark_run** —— 跑过的分数是已经发生的事实，用例被删掉
+    不会让它没发生过，而历史里那一行仍然带着当时的模型与镜像 tag。"""
+    conn = _get_conn()
+    cursor = conn.execute('DELETE FROM case_library WHERE id=?', (case_id,))
+    conn.commit()
+    return cursor.rowcount > 0

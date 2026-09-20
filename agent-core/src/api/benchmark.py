@@ -1,7 +1,17 @@
-"""api/benchmark.py — 浏览场景、起一批、看分数、看历史。
+"""api/benchmark.py — 用例库、跑一个用例、看分数、看历史。
 
 面板只在**检测到仿真器**（一个同时提供 `sim_scenario` 与 `sim_report` 的 MCP）时
 才有内容 —— 出厂的机器人不该看到一个 Benchmark 标签。
+
+## 主体是用例库，不是「打开一个文件」
+
+进入一个用例的路径是**看现有的方案**：本机一份可编辑的用例库，加上市场里带 `test`
+段的方案。文件导入还在，但它是导入路径，不是主体。
+
+原先这里还有一套「勾几个场景跑一批」的端点（`/scenarios`、`/run`、`/progress`、
+`/runs/{id}/collect`），已经删掉：那套的执行与评分都在仿真器卡片上，而卡片不该拥有
+一个测试用例 —— 被测的 agent 能调到它，裁判也就住进了被测系统内部。场景现在描述的是
+**世界**，不是一个可勾选的测试单位。
 
 ## 驱动产出事实，这一层做裁判
 
@@ -143,14 +153,138 @@ async def available():
             'environment': _environment()}
 
 
-@router.get('/scenarios')
-async def scenarios():
-    mcp_id = find_simulator()
-    if mcp_id is None:
-        return {'scenarios': [], 'error': 'no simulator registered'}
-    result = await _call(mcp_id, REPORT_TOOL, {'what': 'list'})
-    return {'mcp_id': mcp_id, 'scenarios': result.get('scenarios', []),
-            **({'error': result['error']} if 'error' in result else {})}
+# ── 本机用例库 ────────────────────────────────────────────────────────────────
+#
+# 面板的主体是**看现有的方案**，不是「打开一个文件」—— 文件是导入路径。所以本机存
+# 一份可编辑的用例库，市场那栏列出带 `test` 段的方案，收进来就能改。改一个权重不该
+# 去走一遍发布审核。
+
+
+class CaseWrite(BaseModel):
+    payload: dict = {}
+    name: str = ''
+    origin: str = ''
+
+
+def _case_view(record: dict, loaded: dict | None) -> dict:
+    """列表里一张卡需要知道的一切，含「跑不了的理由」和上一次的分数。"""
+    import benchmark_case
+    payload = record['payload']
+    block = benchmark_case.summary(payload)
+    recent = benchmark_store.trend(suite=record['name'], limit=1)
+    return {
+        'id': record['id'], 'name': record['name'], 'origin': record['origin'],
+        'updated_at': record['updated_at'],
+        **block,
+        'problems': benchmark_case.validate(payload),
+        'isLoaded': bool(loaded and loaded == benchmark_case.test_block(payload)),
+        'last': recent[0] if recent else None,
+    }
+
+
+@router.get('/cases')
+async def list_cases():
+    from api.solutions import loaded_case
+    loaded = loaded_case()
+    return {'cases': [_case_view(record, loaded)
+                      for record in benchmark_store.list_cases()]}
+
+
+@router.get('/cases/market')
+async def market_cases(search: str = '', limit: int = Query(30, ge=1, le=50)):
+    """市场上**带 test 段的**方案。
+
+    过滤在这一层做，靠 `includes` 里有没有 `test` —— 市场列表不返回包体（几十 KB，
+    列表页用不着），但 `includes` 是它返回的字段之一，正好够用。
+    """
+    from api.solutions import market as solutions_market
+
+    result = await solutions_market(search=search, industry='all', limit=limit)
+    if result.get('code') != 200:
+        return {'cases': [], 'error': result.get('error', '连不上方案市场')}
+    items = [s for s in (result.get('data') or []) if 'test' in (s.get('includes') or [])]
+    return {'cases': items}
+
+
+@router.get('/cases/{case_id}')
+async def get_case(case_id: str):
+    record = benchmark_store.get_case(case_id)
+    if record is None:
+        raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
+    return record
+
+
+@router.post('/cases')
+async def create_case(req: CaseWrite):
+    """新建 / 从文件或市场导入。
+
+    这里**不拒绝**不合法的用例：刚建出来的空用例本来就是不合法的（没有初始指令），
+    拒绝它就没法新建了。问题随列表一起报出来，跑的时候才真正拦。
+    """
+    import benchmark_case
+    payload = req.payload or {'formatVersion': 1, 'canvas': {}, 'devices': [],
+                              'test': benchmark_case.blank()}
+    if not benchmark_case.is_case(payload):
+        raise fastapi.HTTPException(status_code=422, detail='这个解决方案没有 test 段，不是用例')
+    case_id = benchmark_store.save_case(
+        payload, name=req.name or benchmark_case.summary(payload)['name'],
+        origin=req.origin)
+    return benchmark_store.get_case(case_id)
+
+
+@router.put('/cases/{case_id}')
+async def update_case(case_id: str, req: CaseWrite):
+    """保存编辑。
+
+    保存**可以**存下一个还不能跑的用例 —— 编辑是分几次做完的，存一半不该被拒。
+    但理由要一起回去，编辑器当场显示，而不是等到点「跑」才说。
+    """
+    import benchmark_case
+    if benchmark_store.get_case(case_id) is None:
+        raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
+    if not benchmark_case.is_case(req.payload):
+        raise fastapi.HTTPException(status_code=422, detail='这个包体没有 test 段，不是用例')
+
+    benchmark_store.save_case(req.payload, name=req.name, origin=req.origin,
+                              case_id=case_id)
+    record = benchmark_store.get_case(case_id)
+    return {**record, 'problems': benchmark_case.validate(req.payload)}
+
+
+@router.delete('/cases/{case_id}')
+async def delete_case(case_id: str):
+    return {'deleted': benchmark_store.delete_case(case_id)}
+
+
+@router.post('/cases/{case_id}/preflight')
+async def preflight_case(request: fastapi.Request, case_id: str, session_id: str = ''):
+    """载入前检查：缺哪些驱动、会覆盖掉什么、用例本身还差什么。
+
+    转给 `solutions.preflight`，不另写一套 —— 覆盖清单、`deviceRef` 映射、
+    `test.readiness` 的分层报错都在那边，复制一份就会漏掉其中一项。
+    """
+    from api.solutions import LoadRequest, preflight
+    record = benchmark_store.get_case(case_id)
+    if record is None:
+        raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
+    return await preflight(request, LoadRequest(
+        payload=record['payload'], includes=['canvas', 'test'], session_id=session_id))
+
+
+@router.post('/cases/{case_id}/apply')
+async def apply_case(request: fastapi.Request, case_id: str, session_id: str = ''):
+    """把这个用例载入成当前方案（会覆盖画布）。"""
+    from api.solutions import LoadRequest, apply as apply_solution
+    record = benchmark_store.get_case(case_id)
+    if record is None:
+        raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
+    result = await apply_solution(request, LoadRequest(
+        payload=record['payload'], includes=['canvas', 'test'],
+        confirm=True, session_id=session_id))
+    if result.get('code') != 200:
+        raise fastapi.HTTPException(status_code=result.get('code', 500),
+                                    detail=result.get('error', '载入失败'))
+    return {'applied': True, 'case': record['name']}
 
 
 # ── 载入用例前：先把现在的画布存下来 ──────────────────────────────────────────
@@ -289,96 +423,6 @@ async def case_abort():
         return {'state': 'idle'}
     run.abort()
     return {'state': 'aborting', 'run_id': run.run_id}
-
-
-# ── 起一批 ────────────────────────────────────────────────────────────────────
-
-class RunRequest(BaseModel):
-    scenarios: list[str] = []
-    repeats: int = 1
-    seed: int = 0
-
-
-@router.post('/run')
-async def run(request: RunRequest):
-    mcp_id = find_simulator()
-    if mcp_id is None:
-        raise fastapi.HTTPException(status_code=409, detail='no simulator registered')
-
-    result = await _call(mcp_id, SCENARIO_TOOL, {
-        'action': 'run_suite', 'scenarios': request.scenarios,
-        'repeats': max(1, int(request.repeats)), 'seed': int(request.seed),
-    })
-    if 'error' in result:
-        raise fastapi.HTTPException(status_code=400, detail=result['error'])
-
-    environment = _environment()
-    suite = ','.join(result.get('scenarios') or request.scenarios) or 'all'
-    run_id = benchmark_store.create_run(
-        suite, n_repeats=max(1, int(request.repeats)),
-        tier=environment['tier'], llm_model=environment['llm_model'],
-        llm_provider=environment['llm_provider'], host=environment['host'],
-        image_tags=environment['image_tags'], git_shas=environment['git_shas'])
-    return {'run_id': run_id, 'mcp_id': mcp_id, 'suite': suite,
-            'repeats': max(1, int(request.repeats)), 'started': result}
-
-
-@router.post('/abort')
-async def abort():
-    mcp_id = find_simulator()
-    if mcp_id is None:
-        raise fastapi.HTTPException(status_code=409, detail='no simulator registered')
-    return await _call(mcp_id, SCENARIO_TOOL, {'action': 'abort_suite'})
-
-
-@router.get('/progress')
-async def progress():
-    """跑着的时候轮询。
-
-    `sim_report` 是 `resource` 类型，`_needs_barrier` 豁免这一类 —— 所以一段 90 秒
-    导航 pending 期间也查得到进度。写成 actuator 就查不了。
-    """
-    mcp_id = find_simulator()
-    if mcp_id is None:
-        return {'state': 'idle', 'error': 'no simulator registered'}
-    return await _call(mcp_id, REPORT_TOOL, {'what': 'suite'})
-
-
-@router.post('/runs/{run_id}/collect')
-async def collect(run_id: str):
-    """把仿真器给出的判定落盘。分数由仿真器算，这里只记录。"""
-    stored = benchmark_store.get_run(run_id)
-    if stored is None:
-        raise fastapi.HTTPException(status_code=404, detail='unknown run')
-    mcp_id = find_simulator()
-    if mcp_id is None:
-        raise fastapi.HTTPException(status_code=409, detail='no simulator registered')
-
-    summary = await _call(mcp_id, REPORT_TOOL, {'what': 'suite'})
-    if 'error' in summary:
-        raise fastapi.HTTPException(status_code=400, detail=summary['error'])
-
-    for case in summary.get('cases') or []:
-        score = (case.get('score') or {}).get('total')
-        elapsed = case.get('elapsed')
-        benchmark_store.add_case(
-            run_id, scenario=case.get('scenario', ''),
-            repeat_idx=int(case.get('repeat', 0)), seed=int(case.get('seed', 0)),
-            ok=case.get('outcome') == 'ok', outcome=case.get('outcome', ''),
-            score=score, elapsed_ms=int(elapsed * 1000) if elapsed else None,
-            assertions=case.get('failures') or [])
-
-    by_dimension = {}
-    for scenario in (summary.get('scenarios') or {}).values():
-        for name, value in (scenario.get('by_dimension') or {}).items():
-            by_dimension.setdefault(name, []).append(value)
-    benchmark_store.finish_run(
-        run_id,
-        status='done' if summary.get('state') == 'done' else 'partial',
-        score_total=summary.get('mean'), score_stdev=summary.get('stdev'),
-        scores_by_dim={name: round(sum(v) / len(v), 1) for name, v in by_dimension.items()},
-        detail=f"n={summary.get('n')} scored={summary.get('scored')}")
-    return benchmark_store.get_run(run_id)
 
 
 # ── 历史 ──────────────────────────────────────────────────────────────────────

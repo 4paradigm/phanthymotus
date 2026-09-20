@@ -87,6 +87,43 @@ def validate(payload: dict) -> list[str]:
     return problems
 
 
+def blank() -> dict:
+    """新建用例的骨架。
+
+    **故意是不合法的** —— `run.prompt` 是空的，`validate` 会立刻指出来。一个新用例
+    一建出来就「合法」，等于说它已经能跑，而它什么都还没写。空指令跑出来的 0 分是
+    基准测试在撒谎，所以宁可从第一秒就红着。
+    """
+    return {
+        'requires': {'drivers': [], 'assets': []},
+        'run': {'prompt': '', 'world': {}, 'injections': []},
+        'evaluate': {
+            'expect': {'announce_after_arrive': True, 'never_occupied': True},
+            'weights': {'orchestration': 30, 'interruption': 25, 'long_horizon': 25,
+                        'safety': 15, 'latency': 5},
+        },
+    }
+
+
+def summary(payload: dict) -> dict:
+    """列表要显示的那几项。
+
+    列表不该自己去解包体的内部结构 —— `test.run.injections` 这种路径散到前端之后，
+    改一次结构要追着它跑。
+    """
+    block = test_block(payload) or {}
+    run = block.get('run') or {}
+    expect = (block.get('evaluate') or {}).get('expect') or {}
+    return {
+        'name': block.get('name', '') or payload.get('name', ''),
+        'prompt': str(run.get('prompt', '')),
+        'injections': len(run.get('injections') or []),
+        'waypoints': len(expect.get('waypoint_order') or []),
+        'map': str((run.get('world') or {}).get('map', '')),
+        'cards': len(((payload.get('canvas') or {}).get('cards')) or []),
+    }
+
+
 def requires(payload: dict) -> dict:
     block = test_block(payload) or {}
     needs = block.get('requires') or {}
