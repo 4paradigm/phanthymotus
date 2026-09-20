@@ -461,7 +461,9 @@ def _format_priority_batch(events: list[dict]) -> str:
     """格式化 P>0 事件为 XML（精简 perf 字段后的文本）。"""
     parts = []
     for ev in events:
-        ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        # 和 <status time=...> 必须是同一套钟 —— 见 prompt.format_ts 的注释。
+        import prompt
+        ts = prompt.format_ts(ev['ts'])
         channel = _infer_channel(ev)
         source = ev.get('source', '')
         text = _slim_event_text(ev.get('text', ''))
@@ -501,7 +503,8 @@ def _format_bg_batch(events: list[dict]) -> str:
 
     parts = []
     for source, evs in groups.items():
-        ts = datetime.datetime.fromtimestamp(evs[-1]['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        import prompt
+        ts = prompt.format_ts(evs[-1]['ts'])
         last_text = evs[-1].get('text', '')
         if len(evs) == 1:
             parts.append(f'<source name="{source}" ts="{ts}">\n{last_text}\n</source>')

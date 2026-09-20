@@ -778,10 +778,15 @@ _NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任
 
 只输出那一句话。不要调用任何工具，不要写别的内容。
 
-必须落到**具体的事实**上，按这个顺序（没有的就跳过，不要硬凑）：
-1. 已经做完了什么 —— 查了什么、看到了什么、去了哪
-2. 其中值得说的发现 —— 具体的数字、名称、结论
-3. 接下来要做什么
+这句话每 15 秒左右才有一次，它的作用是**承上启下**：让还在等的人知道事情在往前走、
+下一步是什么。所以重心放在**当前和接下来**，已经做完的事只作铺垫，一句带过。
+
+按这个顺序（没有的就跳过，不要硬凑）：
+1. 正在做什么 / 接下来要做什么 —— 这是重点
+2. 支撑它的那件已完成的事，以及其中值得说的发现（具体的数字、名称、结论）
+
+不要把已完成的事说成"刚刚完成"的样子 —— 它可能是十几秒前的事了，听起来会像机器人
+在原地复述。
 
 下面的"过程记录"只包含**上次汇报之后新发生的事**，所以直接讲这些新东西就行，
 不用再把之前说过的重复一遍、也不用做总结。
@@ -795,14 +800,17 @@ _NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任
 结尾也不要凑话。"马上整理成报告""很快就好""稍后告诉你"这类收尾没有任何信息量，
 说完最后一件具体的事就停住。
 
-正面例子：
-- "财报和机构评级都查到了，营收同比涨了一倍，还差估值那部分"
-- "客厅和厨房都找过了没有，接下来去卧室"
-- "第一家店关门了，正在查附近还有哪几家"
+正面例子（都落在"接下来"上，已完成的部分只是铺垫）：
+- "营收和机构评级查到了，正在算估值这一块"
+- "客厅和厨房都没有，接着去卧室找"
+- "第一家店关门了，正在看附近还有哪几家开着"
 
 其他要求：
 - 口语，会被直接念出来。不要 markdown、编号、括号注释、工具名、文件路径。
-- 不超过 40 个字。宁可只说一件具体的事，也不要三件都含糊带过。
+- 一两句话，把事情说清楚就停。**不要为了短而把名字、地点砍掉或缩写** —— 说完整的
+  名字比省几个字重要。
+- **不要说时长。** 你拿不到"这件事做了多久"这个数，过程记录里也没有。说"已经进行了
+  多少秒/分钟"一定是编的。
 - 用用户的语言。
 - 只说过程记录里**真实发生过**的事，没查到的别编。
 {last}
@@ -813,10 +821,29 @@ _NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任
 {context}
 """
 
-# 播出去之前的硬上限。prompt 里的"不超过 40 个字"是承重的 —— 这段话会注册成一个 ACP
-# pending，超时按 len(text)/3 + 10 算，下一个需要 barrier 的工具调用（含 finish）都得
-# 等它播完。模型经常无视长度约束，所以代码侧也要截。
-_NARRATION_MAX_CHARS = 120
+# 播出去之前的上限。这段话会注册成一个 ACP pending，超时按 len(text)/3 + 10 算，下一个
+# 需要 barrier 的工具调用（含 finish）都得等它播完 —— 所以不能无限长。
+#
+# 但**从中间砍是错的**：真机上把人名、展位名砍成半截播了出去，听的人只会以为机器人
+# 出故障了。宁可多播几个字，也不要播一个断掉的词。所以放宽上限，并且只在句读处收尾。
+_NARRATION_MAX_CHARS = 200
+_SENTENCE_ENDS = '。！？!?；;…'
+
+
+def _trim_narration(text: str, limit: int = _NARRATION_MAX_CHARS) -> str:
+    """超长时在**句读处**收尾，不从字中间砍。
+
+    截到一半的名字比长一点的句子糟得多：用户听到的是「我们到了算力工」然后戛然而止。
+    找不到句读就整句退回上一个逗号；再找不到，才认了硬截 —— 但那时至少已经尽力。
+    """
+    text = (text or '').strip()
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    cut = max((window.rfind(ch) for ch in _SENTENCE_ENDS), default=-1)
+    if cut < limit // 3:                       # 句读太靠前，整句都没了，退而求其次
+        cut = max((window.rfind(ch) for ch in '，,、 '), default=-1)
+    return window[:cut + 1].strip() if cut > 0 else window
 
 # 「一台机器上没有任何 on_notify 绑定」只值得说一次，但必须说 —— 见 _report_progress。
 _warned_no_notify = False
@@ -1926,8 +1953,7 @@ class Event:
             print(f'[decision] narration: same as last, skipped → "{report}"')
             _restart_countdown()
             return
-        if len(report) > _NARRATION_MAX_CHARS:
-            report = report[:_NARRATION_MAX_CHARS]
+        report = _trim_narration(report)
 
         results = await hooks.fire('on_notify', {'text': report}, barrier_aware=True)
         if not _notify_fire_spoke(results):
