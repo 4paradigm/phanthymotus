@@ -39,6 +39,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 import benchmark_store
+import config
 import mcp_client
 
 router = APIRouter(prefix='/benchmark', tags=['benchmark'])
@@ -66,7 +67,6 @@ def _environment() -> dict:
     """
     llm = {}
     try:
-        import config
         clients = (config.main.get('client') or {}).get('llm') or []
         if clients:
             llm = clients[0] or {}
@@ -89,6 +89,23 @@ async def _call(mcp_id: str, tool: str, args: dict) -> dict:
 
 # ── 可用性 ────────────────────────────────────────────────────────────────────
 
+def _driver_online(declared: str) -> bool:
+    """本机有没有这个驱动，而且它在线。
+
+    名字住在**注册表**（`config.main['services']['mcp']`，就是 `/api/mcp` 返回的那份），
+    在线与否住在 `mcp_client.registry`。两份数据，各答一半。
+
+    这里原先只问后者要 `server_name` —— 而运行时那份根本不存这个字段，于是每个名字
+    都比不上，任何用例都报「缺驱动」，包括驱动就在旁边跑着、`available` 同时还答
+    `true` 的时候。Orin6 上一跑就现原形。
+    """
+    entry = next((m for m in (config.main.get('services', {}).get('mcp') or [])
+                  if m.get('server_name') == declared or m.get('name') == declared), None)
+    if entry is None:
+        return False
+    return bool((mcp_client.registry.get(entry.get('id')) or {}).get('online'))
+
+
 async def case_readiness(needs: dict) -> dict:
     """用例声明的依赖，在本机逐条对一遍。
 
@@ -102,10 +119,7 @@ async def case_readiness(needs: dict) -> dict:
     """
     drivers = [str(d) for d in (needs.get('drivers') or [])]
     assets = [str(a) for a in (needs.get('assets') or [])]
-
-    online = {str(e.get('server_name') or ''): mid
-              for mid, e in mcp_client.registry.items() if e.get('online')}
-    missing_drivers = [d for d in drivers if d not in online]
+    missing_drivers = [d for d in drivers if not _driver_online(d)]
 
     ready = {'drivers': drivers, 'assets': assets,
              'missing_drivers': missing_drivers, 'missing_assets': [],
@@ -303,7 +317,6 @@ async def snapshot(request: fastapi.Request):
     用 `solutions` 的打包路径，不另写一套：`deviceRef` 映射、`x-sensitive` 脱敏、
     版本记录都在那边，复制一遍就会漏掉脱敏。
     """
-    import config
     from api.solutions import PackInclude, PackRequest, _build_payload, _get_rc_token
 
     built = await _build_payload(PackRequest(include=PackInclude()),
@@ -336,7 +349,6 @@ async def snapshot_info():
 @router.post('/snapshot/restore')
 async def snapshot_restore(request: fastapi.Request):
     """把画布换回快照。只在用户点的时候发生。"""
-    import config
     from api.solutions import LoadRequest, apply as apply_solution
 
     stored = config.main.get(SNAPSHOT_KEY) or {}

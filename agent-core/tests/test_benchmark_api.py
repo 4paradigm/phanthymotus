@@ -45,6 +45,18 @@ def clean_runs():
         benchmark_store.delete_run(run['id'])
 
 
+def _register(server_name, mcp_id='mcp-sim', name='仿真器'):
+    """把驱动写进注册表（`/api/mcp` 读的那一份）。
+
+    刻意**不**往 `mcp_client.registry` 里塞 `server_name` —— 真机上那份就没有这个
+    字段，而测试里塞了它，就正好把「名字该从哪儿查」这个 bug 遮住。
+    """
+    import config
+    services = dict(config.main.get('services') or {})
+    services['mcp'] = [{'id': mcp_id, 'name': name, 'server_name': server_name}]
+    config.main['services'] = services
+
+
 @pytest.fixture
 def simulator(monkeypatch):
     """A registry entry that looks like the simulator bundle, plus a fake driver."""
@@ -229,6 +241,37 @@ def test_the_environment_block_names_the_model_under_test(simulator):
 
 # ── 用例依赖：分层报错 ────────────────────────────────────────────────────────
 
+def test_a_driver_that_is_installed_and_online_is_not_reported_missing(simulator, monkeypatch):
+    """在 Orin6 上抓到的：每个用例都报「缺驱动」，而驱动就在旁边跑着。
+
+    名字住在注册表（`config.main['services']['mcp']`），在线与否住在
+    `mcp_client.registry`，两份数据各答一半。原先只问运行时那份要 `server_name`，
+    而它根本不存这个字段 —— 于是每个名字都比不上，全判成缺。这个 fixture 特意让
+    registry 条目**没有** `server_name`，和真机上一模一样。
+    """
+    import config
+    monkeypatch.setitem(config.main, 'services', {'mcp': [
+        {'id': 'mcp-sim', 'name': '仿真器', 'server_name': 'simulator-generic-device-bundle'}]})
+
+    ready = asyncio.run(benchmark.case_readiness({'drivers': ['simulator-generic-device-bundle']}))
+
+    assert ready['missing_drivers'] == []
+    assert ready['ok'] is True
+
+
+def test_a_registered_but_offline_driver_still_counts_as_missing(simulator, monkeypatch):
+    """装了但没起来，和没装一样跑不了 —— 要报出来。"""
+    import config
+    monkeypatch.setitem(config.main, 'services', {'mcp': [
+        {'id': 'mcp-sim', 'name': '仿真器', 'server_name': 'simulator-generic'}]})
+    monkeypatch.setitem(mcp_client.registry, 'mcp-sim',
+                        {**mcp_client.registry['mcp-sim'], 'online': False})
+
+    ready = asyncio.run(benchmark.case_readiness({'drivers': ['simulator-generic']}))
+
+    assert ready['missing_drivers'] == ['simulator-generic']
+
+
 def test_a_missing_driver_is_reported_before_assets_are_asked_about(simulator, monkeypatch):
     """驱动没装就不去问地图。
 
@@ -248,7 +291,7 @@ def test_a_missing_driver_is_reported_before_assets_are_asked_about(simulator, m
 
 def test_a_missing_map_is_reported_once_the_driver_is_there(simulator):
     simulator['replies'][('sim_scenario', 'list_maps')] = {'maps': [{'name': 'lab'}]}
-    mcp_client.registry['mcp-sim']['server_name'] = 'simulator-generic'
+    _register('simulator-generic')
 
     ready = asyncio.run(benchmark.case_readiness(
         {'drivers': ['simulator-generic'], 'assets': ['bj-2f']}))
@@ -260,7 +303,7 @@ def test_a_missing_map_is_reported_once_the_driver_is_there(simulator):
 
 def test_a_case_whose_dependencies_are_all_present_is_runnable(simulator):
     simulator['replies'][('sim_scenario', 'list_maps')] = {'maps': [{'name': 'bj-2f'}]}
-    mcp_client.registry['mcp-sim']['server_name'] = 'simulator-generic'
+    _register('simulator-generic')
 
     ready = asyncio.run(benchmark.case_readiness(
         {'drivers': ['simulator-generic'], 'assets': ['bj-2f']}))
@@ -271,7 +314,7 @@ def test_a_case_whose_dependencies_are_all_present_is_runnable(simulator):
 def test_an_unreachable_simulator_is_not_reported_as_a_missing_asset(simulator):
     """问不到 ≠ 缺。报成缺失，一次临时故障就会看起来像装错了东西。"""
     simulator['replies'][('sim_scenario', 'list_maps')] = {'error': 'timeout'}
-    mcp_client.registry['mcp-sim']['server_name'] = 'simulator-generic'
+    _register('simulator-generic')
 
     ready = asyncio.run(benchmark.case_readiness(
         {'drivers': ['simulator-generic'], 'assets': ['bj-2f']}))
