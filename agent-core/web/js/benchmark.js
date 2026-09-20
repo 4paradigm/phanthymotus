@@ -46,6 +46,8 @@ async function api(path, opts) {
 
 let _pollTimer = null;
 let _runId = null;
+// 仿真器的 mcp_id，没有就是 null —— 也就是这次运行会驱动真实设备。
+let _simulator = null;
 
 export function initBenchmark() {
   initEditor(_loadLibrary);
@@ -66,11 +68,13 @@ export function initBenchmark() {
 async function _detect() {
   try {
     const info = await api('/api/benchmark/available');
-    // Absent simulator, the entry stays hidden rather than showing a tab that
-    // can only ever say "nothing here".
+    // 入口原先挂在「有没有仿真器」上，没装就整个消失 —— R1 上就是这样，一台装了最新
+    // agent-core 的机器人设置里没有这一项，也没有任何迹象说明为什么。基准测试测的是
+    // **解决方案**，真机上照样跑，所以入口恒在；仿真器在不在场只决定要不要走确认。
     document.querySelectorAll('[data-target="btn-benchmark"]').forEach((el) => {
       el.classList.toggle('hidden', !info.available);
     });
+    _simulator = info.simulator ?? info.mcp_id ?? null;
     // 被测配置常驻标题栏：分数属于某一次具体的模型与镜像，不该藏在某一行里。
     const env = info.environment || {};
     const meta = document.getElementById('bm-env');
@@ -381,27 +385,90 @@ async function _newCase() {
   }
 }
 
-async function _runCase(repeats) {
+async function _runCase(repeats, confirmMovingCards = null) {
   try {
     const result = await api('/api/benchmark/case/run', {
-      method: 'POST', body: JSON.stringify({ repeats, seed: 0 }),
+      method: 'POST',
+      body: JSON.stringify({ repeats, seed: 0,
+                             confirm_moving_cards: confirmMovingCards }),
     });
     _runId = result.run_id;
     showToast(`用例开始运行 × ${repeats} 次`);
     _startPolling();
   } catch (e) {
+    // 服务端说「这次会驱动真实设备」—— 那不是错误，是要请现场的人拍板。
+    const moving = e?.detail?.needs_confirmation ? (e.detail.moving_cards || []) : null;
+    if (moving) { _confirmHardware(moving, repeats); return; }
     showToast(runRefusal(e));
   }
+}
+
+/** 一张卡片在确认清单里的身份。必须和服务端的 `card_key` 一字不差。 */
+export function cardKey(card) {
+  return `${card.mcpId || ''}:${card.tool || ''}`;
+}
+
+/** 这次运行会发出的每一句话 —— 开场指令，以及每一条插话。 */
+export function plannedUtterances(testBlock) {
+  const run = testBlock?.run || {};
+  const lines = [];
+  if (run.prompt) lines.push({ label: '开场', text: run.prompt });
+  (run.injections || []).forEach((injection) => {
+    const when = injection.after_arrival
+      ? `到达 ${injection.after_arrival} 后 ${injection.delay || 0} 秒`
+      : `第 ${injection.at ?? '?'} 秒`;
+    lines.push({ label: `插话 · ${when}`, text: injection.text || '' });
+  });
+  return lines;
+}
+
+async function _confirmHardware(moving, repeats) {
+  const el = document.getElementById('bm-progress');
+  if (!el) return;
+  // 指令从**服务端当前载入的那个用例**读，不从列表卡片读 —— 会跑的是前者。
+  // 两者不一致的时候（刚改过、还没载入），照着列表念给人听就是念错了。
+  let lines = [];
+  try {
+    lines = plannedUtterances((await api('/api/benchmark/case')).case);
+  } catch { /* 读不到就明说，见下面那条占位 */ }
+  el.innerHTML = `
+    <div class="bm-overwrite bm-hardware">
+      <p class="bm-note"><b>这次运行会驱动真实设备。</b>用例的指令经由主 agent 变成
+        真实的工具调用 —— 和有人亲口说出来没有区别。</p>
+      <div class="bm-hw-group"><span class="bm-hw-title">会动的卡片</span>
+        <ul class="bm-blockers">${moving.map((m) =>
+          `<li>${_esc(m.device || m.mcpId)} · <b>${_esc(m.tool)}</b></li>`).join('')}</ul>
+      </div>
+      <div class="bm-hw-group"><span class="bm-hw-title">将发出的指令</span>
+        <ul class="bm-blockers">${lines.map((l) =>
+          `<li>[${_esc(l.label)}] ${_esc(l.text)}</li>`).join('') ||
+          '<li class="bm-dim">读不到用例内容 —— 不知道会发出什么，先别跑</li>'}</ul>
+      </div>
+      <label class="bm-confirm"><input type="checkbox" id="bm-confirm-hardware">
+        我确认现场有人，周围安全</label>
+      <div class="bm-case-actions">
+        <button class="btn-primary" id="bm-hw-go" disabled>开始运行</button>
+        <button class="bm-linkbtn" id="bm-hw-cancel">取消</button>
+      </div>
+    </div>`;
+  const confirm = document.getElementById('bm-confirm-hardware');
+  const go = document.getElementById('bm-hw-go');
+  // 默认不做的事：勾了才亮。和覆盖画布同一个形态。
+  confirm?.addEventListener('change', () => { go.disabled = !confirm.checked; });
+  document.getElementById('bm-hw-cancel')?.addEventListener('click', () => { _poll(); });
+  go?.addEventListener('click', () => _runCase(repeats, moving.map(cardKey)));
 }
 
 /** 拒绝跑的理由要说成人话，尤其是安全那条 —— 它不是故障，是它该拦下来。 */
 export function runRefusal(error) {
   const detail = error?.detail || error?.message || error;
   if (typeof detail === 'string') return `无法运行：${detail}`;
+  // 画布在「弹窗弹出」和「点开始运行」之间被改了。重新算一遍再请人看一次，
+  // 而不是拿上一次的勾去为一组新设备背书。
+  if (detail?.needs_confirmation) return '画布变了，请重新确认会动的设备。';
   if (detail?.unsafe?.length) {
     const names = detail.unsafe.map((u) => `${u.device} 的 ${u.tool}`).join('、');
-    return `画布上有真设备会跟着动（${names}）。用例的指令和真指令分不出来 —— ` +
-           `先把它们从画布上拿掉。`;
+    return `画布上有真设备会跟着动（${names}）。`;
   }
   if (detail?.readiness) return '用例的依赖还不齐，看上面那几条。';
   return `无法运行：${JSON.stringify(detail)}`;

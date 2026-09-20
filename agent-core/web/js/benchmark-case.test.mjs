@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { blockerRows, runRefusal } from './benchmark.js';
+import { blockerRows, cardKey, plannedUtterances, runRefusal } from './benchmark.js';
 import { parseList, weightNote, normalizeInjection } from './benchmark-editor.js';
 
 test('依赖齐了就没有任何一条拦路的', () => {
@@ -69,7 +69,6 @@ test('画布上有真设备时，说清楚是哪台的哪张卡', () => {
 
   assert.match(message, /天轶/);
   assert.match(message, /controlled_spatial/);
-  assert.match(message, /分不出来/);
 });
 
 test('多张真卡片都点出来，不是只说第一张', () => {
@@ -79,6 +78,48 @@ test('多张真卡片都点出来，不是只说第一张', () => {
 
   assert.match(message, /天轶 的 loco/);
   assert.match(message, /Go2 的 switch_mode/);
+});
+
+// ── 真机确认 ──────────────────────────────────────────────────────────────────
+//
+// 确认弹窗要说清楚两件事：**哪些东西会动**，以及**会对它们说什么**。少了后者，人只
+// 知道机器人要动，不知道它要被支使去做什么 —— 那个勾就没有意义。
+
+test('确认清单里的身份用 mcpId，不用设备名', () => {
+  // 设备名改个昵称就变，`mcpId` 不会。服务端拿这个串比对，两边必须一字不差。
+  assert.equal(cardKey({ mcpId: 'mcp-real', tool: 'loco', device: '天轶' }),
+               'mcp-real:loco');
+});
+
+test('开场指令和每一条插话都念出来', () => {
+  const lines = plannedUtterances({ run: {
+    prompt: '带我转一下展区',
+    injections: [{ after_arrival: 'P5', delay: 6, text: '先等一下' },
+                 { at: 30, text: '走吧' }],
+  } });
+
+  assert.deepEqual(lines.map((l) => l.text), ['带我转一下展区', '先等一下', '走吧']);
+  assert.match(lines[1].label, /到达 P5 后 6 秒/);
+  assert.match(lines[2].label, /第 30 秒/);
+});
+
+test('没有插话的用例只念开场那一句', () => {
+  const lines = plannedUtterances({ run: { prompt: '过来' } });
+
+  assert.deepEqual(lines.map((l) => l.text), ['过来']);
+});
+
+test('读不到用例就给空清单，不编一句出来', () => {
+  // 弹窗据此显示「读不到用例内容 —— 不知道会发出什么，先别跑」。编一句比不说更糟。
+  assert.deepEqual(plannedUtterances(undefined), []);
+  assert.deepEqual(plannedUtterances({}), []);
+});
+
+test('画布在确认之后变了，说的是重新确认而不是报错', () => {
+  const message = runRefusal({ detail: { needs_confirmation: true, moving_cards: [] } });
+
+  assert.match(message, /重新确认/);
+  assert.doesNotMatch(message, /\[object Object\]/);
 });
 
 test('纯文本的拒绝理由原样说出来', () => {

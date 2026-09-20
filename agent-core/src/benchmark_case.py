@@ -124,39 +124,44 @@ def summary(payload: dict) -> dict:
     }
 
 
-def unmeasurable(payload: dict) -> list[str]:
+def unmeasurable(payload: dict, probe=None) -> list[str]:
     """用例断言了一些**这张画布产生不出事实**的东西。
 
-    判定读的是驱动给出的事实流。讲解顺序靠的是仿真器世界里的 `speak_start` /
-    `speak_end` —— 只有仿真器自己的 `tts` 卡会写进去。画布上绑的要是**别家**的
-    tts（真机上的感知栈就是一例），机器人每站都讲了，事实流里却一句都没有，
-    `announce_after_arrive` 恒为失败，而分数把这笔算在 agent 头上。
+    「测不到」和「测了没过」是两件事，而事件流本身分不出来 —— 从里面看，「没讲」和
+    「讲了但没记下来」完全一样。所以只能在跑之前按配置说清楚。
 
-    Orin6 上就是这样：日志里讲解与导航严格交替、barrier 两个方向都挡对了，
-    播报记录却是空的。
+    判据变过一次。原先是「tts 卡必须属于用例声明的驱动（也就是仿真器自己那张）」，
+    因为讲解事实只有仿真器世界写得出。现在 agent-core 自己也记（`benchmark_facts`），
+    所以**任何**申报了 `mouth` 通道、且走 ACP 的讲解工具都产出得了事实 —— 真机的
+    tts 一样算数。那条旧判据在真机上会把一张完全可用的画布判成「测不到」。
 
-    「测不到」和「测了没过」是两件事，而事件流本身分不出来 —— 从里面看，
-    「没讲」和「讲了但没记下来」完全一样。所以只能在跑之前按配置说：这条断言在这
-    张画布上没有意义。
+    `probe(mcp_id, tool) -> {'mouth': bool, 'completion': bool}` 由调用方提供，通常
+    背后是 `mcp_client.registry`。**没有 probe 就不下结论**：这个函数也用在还没装驱动
+    的包体上（市场里的用例），那时候画布上有什么工具、申报了什么，无从知道 —— 猜一个
+    答案比不答更糟。
+
+    卡片是不是「讲解卡」按**申报的通道**认，不按工具名。原先这里查
+    `toolName in ('tts', 'speaker')`，而这正是 `peer/tools.py` 记着的那个错法：真机的
+    执行器叫 `loco`/`led`/`speaker`/`switch_mode`，关键词表抓不住。
     """
     block = test_block(payload) or {}
     expect = (block.get('evaluate') or {}).get('expect') or {}
-    if not expect.get('announce_after_arrive'):
+    if not expect.get('announce_after_arrive') or probe is None:
         return []
 
-    drivers = set(requires(payload).get('drivers') or [])
-    if not drivers:
-        return []
-    refs = {d.get('ref') for d in (payload.get('devices') or [])
-            if d.get('serverName') in drivers or d.get('name') in drivers}
-    speaks = [c for c in ((payload.get('canvas') or {}).get('cards') or [])
-              if c.get('toolName') in ('tts', 'speaker')]
+    cards = (payload.get('canvas') or {}).get('cards') or []
+    speaks = []
+    for card in cards:
+        info = probe(card.get('mcpId', ''), card.get('toolName', '')) or {}
+        if info.get('mouth'):
+            speaks.append((card, info))
+
     if not speaks:
-        return ['用例断言了「到达后讲解」，但画布上没有任何 tts/speaker 卡片 —— '
-                '讲解不会进入事实流，这条断言会恒为失败']
-    if not any(c.get('deviceRef') in refs for c in speaks):
-        return ['用例断言了「到达后讲解」，但画布上的 tts 不属于用例声明的驱动 —— '
-                '它说的话不进事实流，这条断言会恒为失败（改用仿真器自己的 tts 卡）']
+        return ['用例断言了「到达后讲解」，但画布上没有任何申报了嘴（`x-resource: mouth`）'
+                '的卡片 —— 讲解不会进入事实流，这条断言会恒为失败']
+    if not any(info.get('completion') for _, info in speaks):
+        return ['用例断言了「到达后讲解」，但画布上的讲解工具没有 ACP 完成回调 —— '
+                '只知道它开始说，不知道它说完没有，「没讲完就走了」判不了']
     return []
 
 

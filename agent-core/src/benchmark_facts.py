@@ -88,6 +88,12 @@ class Recorder:
         # action_id → 派发时记下的东西。结算时查不到 mcp_client 那几张表了
         # （`_forget_pending` 先拆表再通知），所以自己留一份。
         self._inflight: dict[str, dict] = {}
+        # 已结算的那些，留着不删。ACP 上报和结算通知谁先到**不保证** ——
+        # `/acp/complete` 里两句的先后可以改，而 `mark_action_complete` 还有 SSE 那条
+        # 调用路径根本不经过那个端点。只要摘掉就认不出这条上报属于哪一段路，
+        # `result.label` 补不上，`interrupted_leg` 在真机上就没有可比的东西。
+        # 一次运行里的动作数以百计，留着不占什么。
+        self._settled: dict[str, dict] = {}
 
     # ── 订阅点 ────────────────────────────────────────────────────────────────
 
@@ -104,6 +110,8 @@ class Recorder:
     def on_settled(self, action_id: str, _resource=None) -> None:
         with self._lock:
             entry = self._inflight.pop(action_id, None)
+            if entry is not None:
+                self._settled[action_id] = entry
         if entry is None:
             return
         status = _status_of(action_id)
@@ -126,7 +134,8 @@ class Recorder:
         """
         action_id = str(body.get('action_id') or '')
         with self._lock:
-            entry = self._inflight.get(action_id) or {}
+            entry = (self._inflight.get(action_id)
+                     or self._settled.get(action_id) or {})
         post = dict(body)
         label = entry.get('label')
         if label and isinstance(post.get('result'), dict) and 'label' not in post['result']:

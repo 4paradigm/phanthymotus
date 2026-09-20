@@ -38,6 +38,7 @@ import fastapi
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
+import benchmark_facts
 import benchmark_store
 import config
 import mcp_client
@@ -174,9 +175,20 @@ async def current_case():
 
 @router.get('/available')
 async def available():
-    """面板据此决定要不要出现。"""
+    """面板据此决定要不要出现 —— 现在恒为可用。
+
+    从前这里是 `mcp_id is not None`：没装仿真器，入口整个消失。R1 上就是这样，一台
+    部署了最新 agent-core 的机器人，设置里没有基准测试这一项，而且没有任何迹象说明
+    为什么没有。
+
+    但基准测试测的是**解决方案**，不是仿真。裁判从一开始就是纯函数，现在事实流在真机
+    上也有了（`benchmark_facts`），所以仿真器在不在场只决定两件事：世界能不能重置，
+    以及有没有轨迹占用这类只有它算得出的量。两件都不是「入口该不该存在」。
+
+    `simulator` 照样返回，前端拿它提示当前是哪一侧、要不要走确认。
+    """
     mcp_id = find_simulator()
-    return {'available': mcp_id is not None, 'mcp_id': mcp_id,
+    return {'available': True, 'mcp_id': mcp_id, 'simulator': mcp_id,
             'environment': _environment()}
 
 
@@ -380,6 +392,50 @@ async def snapshot_restore(request: fastapi.Request):
 class CaseRunRequest(BaseModel):
     repeats: int = 1
     seed: int = 0
+    # 真机确认。`moving_cards` 是前端弹窗里那个人**看到并同意**的那一组设备，
+    # 形如 `["mcp-123:loco", ...]`。服务端会重算一遍再比对 —— 见 `_check_confirmation`。
+    confirm_moving_cards: list[str] | None = None
+
+
+def speech_probe(mcp_id: str, tool: str) -> dict:
+    """这张卡片的工具申报了什么 —— 给 `benchmark_case.unmeasurable` 用。
+
+    读注册表里驱动自己申报的 `x-resource` 与 `x-completion`，不猜名字。驱动没上线时
+    两项都是 False，于是预检会说「画布上没有讲解卡」，而那时本来就该先说缺驱动
+    （`case_readiness` 先跑，两层顺序是有意的）。
+    """
+    info = mcp_client.registry.get(mcp_id) or {}
+    meta = (info.get('tool_meta') or {}).get(tool) or {}
+    resource = meta.get('resource') or frozenset()
+    return {'mouth': bool(set(resource) & benchmark_facts.SPEECH_CHANNELS),
+            'completion': bool(meta.get('completion'))}
+
+
+def card_key(card: dict) -> str:
+    """一张会动的卡片在确认清单里的身份。设备名会变（改个昵称就变），`mcpId` 不会。"""
+    return f"{card.get('mcpId', '')}:{card.get('tool', '')}"
+
+
+def _check_confirmation(moving: list[dict], confirmed: list[str] | None) -> None:
+    """真机上开跑前，确认必须对得上**服务端此刻看到的**那一组设备。
+
+    比对而不是只看一个布尔位，是因为画布在「弹窗弹出」和「点开始运行」之间是可以改的：
+    人看着「仿真器的 tts」按了确认，另一个标签页把卡片换成了真机的底盘，那个勾就为
+    一组他从没看见过的设备背了书。所以清单由服务端重算，客户端送来的那份只用来核对。
+
+    仿真器在场时 `moving` 为空，这里什么都不做 —— 行为和从前一字不差。
+    """
+    if not moving:
+        return
+    wanted = sorted(card_key(card) for card in moving)
+    if confirmed is None:
+        raise fastapi.HTTPException(status_code=409, detail={
+            'error': '这次运行会驱动真实设备，需要现场确认',
+            'needs_confirmation': True, 'moving_cards': moving})
+    if sorted(str(entry) for entry in confirmed) != wanted:
+        raise fastapi.HTTPException(status_code=409, detail={
+            'error': '画布在确认之后变了，请重新确认',
+            'needs_confirmation': True, 'moving_cards': moving})
 
 
 @router.post('/case/run')
@@ -412,18 +468,17 @@ async def run_case(request: CaseRunRequest):
     if problems:
         raise fastapi.HTTPException(status_code=422, detail='；'.join(problems))
 
+    # 仿真器不在场不是错误 —— 用例测的是解决方案，真机上照样能跑。
     mcp_id = find_simulator()
     readiness = await case_readiness(benchmark_case.requires({'test': case}))
-    if mcp_id is None or not readiness.get('ok'):
+    if not readiness.get('ok'):
         raise fastapi.HTTPException(status_code=409, detail={
             'error': '用例的依赖还不齐', 'readiness': readiness})
 
     # 安全闸：注入的文本和真实指令无法区分，画布上任何一张会动的真卡片都会真的动。
-    unsafe = benchmark_runner.unsafe_cards(mcp_id)
-    if unsafe:
-        raise fastapi.HTTPException(status_code=409, detail={
-            'error': '画布上有会动的真实设备，基准测试会让它们真的动起来',
-            'unsafe': unsafe})
+    # 仿真器在场时这组为空（它替所有会动的东西挡着），真机上非空，要人确认。
+    _check_confirmation(benchmark_runner.unsafe_cards(mcp_id),
+                        request.confirm_moving_cards)
 
     environment = _environment()
     repeats = max(1, int(request.repeats))

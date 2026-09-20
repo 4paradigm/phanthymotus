@@ -242,45 +242,69 @@ def test_evaluate_reads_expect_out_of_the_case_payload():
 
 # ── 测不到的断言 ──────────────────────────────────────────────────────────────
 
-def canvas_case(tts_ref='d0'):
-    """一个断言了讲解的用例，tts 卡挂在 `tts_ref` 指的那台设备上。"""
+def canvas_case(speech_tool='tts'):
+    """一个断言了讲解的用例，画布上挂着 `speech_tool` 那张卡。"""
     payload = case()
     payload['test']['evaluate']['expect']['announce_after_arrive'] = True
-    payload['devices'] = [
-        {'ref': 'd0', 'serverName': 'simulator-generic'},
-        {'ref': 'd1', 'serverName': 'perception-bundle'},
-    ]
     payload['canvas'] = {'cards': [
-        {'id': 'c1', 'deviceRef': 'd0', 'toolName': 'controlled_spatial'},
-        {'id': 'c2', 'deviceRef': tts_ref, 'toolName': 'tts'},
+        {'id': 'c1', 'mcpId': 'mcp-real', 'toolName': 'controlled_spatial'},
+        {'id': 'c2', 'mcpId': 'mcp-real', 'toolName': speech_tool},
     ]}
     return payload
 
 
-def test_a_tts_from_another_device_makes_the_announcement_check_meaningless():
-    """Orin6 上抓到的：画布绑的是感知栈的 tts，机器人每站都讲了，仿真器的事实流里
-    却一句都没有 —— 断言恒为失败，而分数把这笔算在 agent 头上。"""
-    problems = bc.unmeasurable(canvas_case(tts_ref='d1'))
+def probe(mouth=(), completion=()):
+    """假的申报表。真的那份背后是 `mcp_client.registry`（`api.benchmark.speech_probe`）。"""
+    return lambda mcp_id, tool: {'mouth': tool in mouth, 'completion': tool in completion}
+
+
+def test_a_real_robots_tts_is_measurable_now():
+    """判据变了：任何申报了嘴、且走 ACP 的讲解工具都产出得了事实。
+
+    原先要求 tts 必须属于用例声明的驱动（也就是仿真器自己那张），因为只有仿真器世界
+    写得出 speak 事件。agent-core 自己记了之后那条判据在真机上会把一张完全可用的画布
+    判成「测不到」。
+    """
+    assert bc.unmeasurable(canvas_case(),
+                           probe=probe(mouth=('tts',), completion=('tts',))) == []
+
+
+def test_a_speech_tool_is_recognised_by_its_declared_channel_not_its_name():
+    """`speaker_raise` 这种名字，关键词表抓不住 —— `peer/tools.py` 就是这么栽的。"""
+    payload = canvas_case(speech_tool='speaker_raise')
+
+    assert bc.unmeasurable(payload, probe=probe(mouth=('speaker_raise',),
+                                                completion=('speaker_raise',))) == []
+
+
+def test_no_card_declares_a_mouth_so_the_announcement_check_is_meaningless():
+    """Orin6 上抓到的：机器人每站都讲了，事实流里却一句都没有 —— 断言恒为失败，
+    而分数把这笔算在 agent 头上。"""
+    problems = bc.unmeasurable(canvas_case(), probe=probe())
 
     assert len(problems) == 1
-    assert '不进事实流' in problems[0]
+    assert '没有任何申报了嘴' in problems[0]
 
 
-def test_the_simulators_own_tts_is_fine():
-    assert bc.unmeasurable(canvas_case(tts_ref='d0')) == []
+def test_a_speech_tool_without_acp_cannot_time_the_announcement():
+    """只知道它开始说，不知道它说完没有 —— 「没讲完就走了」判不了。"""
+    problems = bc.unmeasurable(canvas_case(), probe=probe(mouth=('tts',)))
+
+    assert len(problems) == 1
+    assert 'ACP' in problems[0]
 
 
-def test_no_speech_card_at_all_is_reported_too():
-    payload = canvas_case()
-    payload['canvas']['cards'] = [c for c in payload['canvas']['cards']
-                                  if c['toolName'] != 'tts']
+def test_without_a_probe_no_verdict_is_reached():
+    """市场里的用例在本机还没装驱动，画布上的工具申报了什么无从知道。
 
-    assert any('没有任何 tts' in p for p in bc.unmeasurable(payload))
+    猜一个答案比不答更糟：一条假的「测不到」会让人去改一张其实没问题的画布。
+    """
+    assert bc.unmeasurable(canvas_case()) == []
 
 
 def test_a_case_that_does_not_assert_announcements_is_not_nagged():
     """没断言讲解的用例，画布上有没有 tts 都不关它的事。"""
-    payload = canvas_case(tts_ref='d1')
+    payload = canvas_case()
     payload['test']['evaluate']['expect']['announce_after_arrive'] = False
 
-    assert bc.unmeasurable(payload) == []
+    assert bc.unmeasurable(payload, probe=probe()) == []

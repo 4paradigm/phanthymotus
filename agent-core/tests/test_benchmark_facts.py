@@ -168,6 +168,22 @@ def test_acp_posts_are_kept_whole_and_gain_the_label_we_worked_out(recorder):
     assert post['result']['pose'] == [1.0, 2.0]       # 原样，不重组
 
 
+def test_a_post_that_arrives_after_the_settle_still_finds_its_leg(recorder):
+    """上报和结算谁先到**不保证**。
+
+    `/acp/complete` 里两句的先后可以改，而 `mark_action_complete` 还有 SSE 那条调用
+    路径根本不经过那个端点。结算时就把这个 action 摘掉的话，晚到的上报认不出属于
+    哪一段路，`result.label` 补不上，`interrupted_leg` 在真机上没有可比的东西。
+    """
+    register('a1', 'controlled_spatial', {'tag_name': '二号展区'}, BASE)
+    complete('a1', status='cancelled')
+
+    benchmark_facts.note_acp_post({'action_id': 'a1', 'status': 'cancelled',
+                                   'result': {'progress': {'fraction': 0.4}}})
+
+    assert recorder.facts()['acp_posts'][0]['result']['label'] == '二号展区'
+
+
 def test_a_result_that_already_has_a_label_is_left_alone(recorder):
     """仿真器自己给了 label 就用它的 —— 它看得见世界，比我们从参数里认的可信。"""
     register('a1', 'controlled_spatial', {'tag_name': '入口'}, BASE)

@@ -221,13 +221,20 @@ def test_an_offline_simulator_is_not_offered(monkeypatch):
     assert benchmark.find_simulator() is None
 
 
-def test_available_is_what_hides_the_panel_on_a_shipped_robot(monkeypatch):
+def test_the_panel_is_available_on_a_robot_with_no_simulator(monkeypatch):
+    """R1 上抓到的：装了最新 agent-core，设置里却没有基准测试这一项，而且没有任何
+    迹象说明为什么没有。
+
+    入口原先挂在「有没有仿真器」上。但基准测试测的是**解决方案** —— 裁判一直是纯函数，
+    事实流现在真机上也有（`benchmark_facts`），仿真器在不在场只决定世界能不能重置，
+    以及有没有轨迹占用这类只有它算得出的量。两件都不是「入口该不该存在」。
+    """
     monkeypatch.setattr(mcp_client, 'registry', {})
 
     result = asyncio.run(benchmark.available())
 
-    assert result['available'] is False
-    assert result['mcp_id'] is None
+    assert result['available'] is True
+    assert result['simulator'] is None      # 前端据此决定要不要走确认
 
 
 # ── 被测配置 ────────────────────────────────────────────────────────────────
