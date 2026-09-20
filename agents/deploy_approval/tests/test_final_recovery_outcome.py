@@ -259,7 +259,24 @@ async def test_request_deploy_uses_canonical_component_snapshot_helper():
         build_comment_updated_at="2026-09-03T10:00:00Z",
         builds=[ReviewBuild(target="perception", driver_path="", variant="5.11", success=True, version="release.260918.abcdef1", image_tag="ccr.ccs.tencentyun.com/repo:v1")],
     )
-    builds = [BuildInfo(0, "perception", "", "5.11", True, "registry.example/repo:v1", True)]
+    builds = [BuildInfo(0, "perception", "", "5.11", True, "repo:v1", True)]
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {
+            "id": 5001,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abcdef1\n\n| target | status | version | took |\n| perception | :white_check_mark: | 5.11 | 10s |\n\n### Images\n\n**perception**\n```\nregistry.example/repo:v1\n```\n",
+            "created_at": "2026-09-03T09:00:00Z",
+            "updated_at": "2026-09-03T10:00:00Z",
+        },
+        {
+            "id": 5002,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nLGTM\n",
+            "created_at": "2026-09-03T11:00:00Z",
+            "updated_at": "2026-09-03T11:00:00Z",
+        },
+    ])
     controller._build_component_snapshot = AsyncMock(
         return_value=[
             {
@@ -304,6 +321,7 @@ async def test_request_deploy_uses_canonical_component_snapshot_helper():
     proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
+    github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
 
     await controller.handle_request_deploy("repo", 1, 101)
 
@@ -331,13 +349,29 @@ async def test_uncertain_recovery_rebuilds_fresh_component_snapshot():
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
         builds=[ReviewBuild(target="perception", driver_path="test", variant="default", success=True, image_tag="registry.example/repo:v2", version="v2")],
         review_author_id="7950763",
     )
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {
+            "id": 1001,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| target | status | version | took |\n| perception | :white_check_mark: | v2 | 10s |\n\n### Images\n\n**perception**\n```\nregistry.example/repo:v2\n```\n",
+            "created_at": "2026-09-18T03:50:00Z",
+            "updated_at": "2026-09-18T03:55:54Z",
+        },
+        {
+            "id": 1003,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": ("<!-- pr-review-agent -->\n## PR Review Agent " + emdash + " Code Review\n\nLooks good.\n").replace("\\n", "\n"),
+            "created_at": "2026-09-18T03:56:00Z",
+            "updated_at": "2026-09-18T03:56:00Z",
+        },
+    ])
     with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
         controller._build_component_snapshot = AsyncMock(
         return_value=[_component(component_id="comp-new", image_ref="registry.example/repo@sha256:" + "d" * 64)]
@@ -349,7 +383,7 @@ async def test_uncertain_recovery_rebuilds_fresh_component_snapshot():
 
     assert result == "deploy-requested"
     written_state = proxy.write_hidden_state.call_args.args[3]
-    assert "job-new" in str(written_state["review_evidence"])
+    assert written_state["review_evidence"]["build_comment_id"] == 1001
     assert written_state["components"][0]["component_id"] == "comp-new"
 
 
@@ -369,13 +403,29 @@ async def test_uncertain_recovery_new_job_never_keeps_old_components():
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
         builds=[ReviewBuild(target="perception", driver_path="test", variant="default", success=True, image_tag="registry.example/repo:v2", version="v2")],
         review_author_id="7950763",
     )
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {
+            "id": 1001,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| target | status | version | took |\n| perception | :white_check_mark: | v2 | 10s |\n\n### Images\n\n**perception**\n```\nregistry.example/repo:v2\n```\n",
+            "created_at": "2026-09-18T03:50:00Z",
+            "updated_at": "2026-09-18T03:55:54Z",
+        },
+        {
+            "id": 1003,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": ("<!-- pr-review-agent -->\n## PR Review Agent " + emdash + " Code Review\n\nLooks good.\n").replace("\\n", "\n"),
+            "created_at": "2026-09-18T03:56:00Z",
+            "updated_at": "2026-09-18T03:56:00Z",
+        },
+    ])
     with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
         controller._build_component_snapshot = AsyncMock(return_value=[_component(component_id="comp-new")])
         proxy.write_hidden_state = AsyncMock()
@@ -404,13 +454,29 @@ async def test_uncertain_recovery_snapshot_change_resets_deployments():
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
         builds=[ReviewBuild(target="perception", driver_path="test", variant="default", success=True, image_tag="registry.example/repo:v2", version="v2")],
         review_author_id="7950763",
     )
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {
+            "id": 1001,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| target | status | version | took |\n| perception | :white_check_mark: | v2 | 10s |\n\n### Images\n\n**perception**\n```\nregistry.example/repo:v2\n```\n",
+            "created_at": "2026-09-18T03:50:00Z",
+            "updated_at": "2026-09-18T03:55:54Z",
+        },
+        {
+            "id": 1003,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": ("<!-- pr-review-agent -->\n## PR Review Agent " + emdash + " Code Review\n\nLooks good.\n").replace("\\n", "\n"),
+            "created_at": "2026-09-18T03:56:00Z",
+            "updated_at": "2026-09-18T03:56:00Z",
+        },
+    ])
     with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
         controller._build_component_snapshot = AsyncMock(
             return_value=[_component(component_id="comp-new", review_image_tag="registry.example/repo:v2")]
@@ -439,7 +505,7 @@ async def test_uncertain_recovery_snapshot_change_resets_deployments():
 async def test_uncertain_recovery_same_snapshot_preserves_known_successful_deployments():
     controller, proxy, policy, github, registry, config = _controller()
     state = _state(
-        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        review_evidence={"build_comment_id": 1001, "build_comment_updated_at": "2026-09-18T03:55:54Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 1002, "code_review_comment_id": 1003, "review_author_id": "7950763"},
         components=[
             _component(component_id="comp-1", runtime_id="perception"),
             _component(component_id="comp-2", runtime_id="actucore", target="actucore"),
@@ -453,12 +519,28 @@ async def test_uncertain_recovery_same_snapshot_preserves_known_successful_deplo
         _fresh_component(component_id="comp-2", target="actucore"),
     ]
     github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {
+            "id": 1001,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": ("<!-- pr-review-agent -->\n## PR Review Agent " + emdash + " Build Result\n\nCommit: abc1234\n\n| target | status | version | took |\n| perception | :white_check_mark: | v1 | 10s |\n| actucore | :white_check_mark: | v1 | 10s |\n\n### Images\n\n**perception**\n```\nregistry.example/repo:v1\n```\n\n**actucore**\n```\nregistry.example/repo:v1\n```\n").replace("\\n", "\n"),
+            "created_at": "2026-09-18T03:50:00Z",
+            "updated_at": "2026-09-18T03:55:54Z",
+        },
+        {
+            "id": 1003,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": ("<!-- pr-review-agent -->\n## PR Review Agent " + emdash + " Code Review\n\nLooks good.\n").replace("\\n", "\n"),
+            "created_at": "2026-09-18T03:56:00Z",
+            "updated_at": "2026-09-18T03:56:00Z",
+        },
+    ])
     from agents.deploy_approval.review_comment_parser import ReviewCommentEvidence, ReviewBuild
     fake_evidence = ReviewCommentEvidence(
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
@@ -483,7 +565,7 @@ async def test_uncertain_recovery_same_snapshot_preserves_known_successful_deplo
 async def test_uncertain_recovery_clears_runtime_id_for_ambiguous_component():
     controller, proxy, policy, github, registry, config = _controller()
     state = _state(
-        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        review_evidence={"build_comment_id": 1001, "build_comment_updated_at": "2026-09-18T03:55:54Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 1002, "code_review_comment_id": 1003, "review_author_id": "7950763"},
         components=[
             _component(component_id="comp-1", runtime_id="perception"),
             _component(component_id="comp-2", target="actucore", runtime_id="actucore"),
@@ -493,12 +575,28 @@ async def test_uncertain_recovery_clears_runtime_id_for_ambiguous_component():
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
     github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {
+            "id": 1001,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": ("<!-- pr-review-agent -->\n## PR Review Agent " + emdash + " Build Result\n\nCommit: abc1234\n\n| target | status | version | took |\n| perception | :white_check_mark: | v1 | 10s |\n| actucore | :white_check_mark: | v1 | 10s |\n\n### Images\n\n**perception**\n```\nregistry.example/repo:v1\n```\n\n**actucore**\n```\nregistry.example/repo:v1\n```\n").replace("\\n", "\n"),
+            "created_at": "2026-09-18T03:50:00Z",
+            "updated_at": "2026-09-18T03:55:54Z",
+        },
+        {
+            "id": 1003,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": ("<!-- pr-review-agent -->\n## PR Review Agent " + emdash + " Code Review\n\nLooks good.\n").replace("\\n", "\n"),
+            "created_at": "2026-09-18T03:56:00Z",
+            "updated_at": "2026-09-18T03:56:00Z",
+        },
+    ])
     from agents.deploy_approval.review_comment_parser import ReviewCommentEvidence, ReviewBuild
     fake_evidence = ReviewCommentEvidence(
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
@@ -539,13 +637,29 @@ async def test_uncertain_recovery_registry_failure_stays_uncertain():
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
         builds=[ReviewBuild(target="perception", driver_path="test", variant="default", success=True, image_tag="registry.example/repo:v2", version="v2")],
         review_author_id="7950763",
     )
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {
+            "id": 1001,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| target | status | version | took |\n| perception | :white_check_mark: | v2 | 10s |\n\n### Images\n\n**perception**\n```\nregistry.example/repo:v2\n```\n",
+            "created_at": "2026-09-18T03:50:00Z",
+            "updated_at": "2026-09-18T03:55:54Z",
+        },
+        {
+            "id": 1003,
+            "user": {"id": "7950763", "login": "review-agent-bot"},
+            "body": ("<!-- pr-review-agent -->\n## PR Review Agent " + emdash + " Code Review\n\nLooks good.\n").replace("\\n", "\n"),
+            "created_at": "2026-09-18T03:56:00Z",
+            "updated_at": "2026-09-18T03:56:00Z",
+        },
+    ])
     with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
         controller._build_component_snapshot = AsyncMock(return_value=None)
         proxy.write_hidden_state = AsyncMock()
@@ -999,11 +1113,7 @@ def test_poll_disabled_webhook_enabled_fails_config():
             Config(
                 github_repos=[
                     "4paradigm/phanthymotus",
-                    "4paradigm/phanthymotus-driver",
                 ],
-                deploy_approval_public_base_url="https://deploy.example",
-                github_oauth_client_id="test-client",
-                github_oauth_client_secret="test-secret",
                 poll_enabled=False,
                 webhook_enabled=True,
                 github_webhook_secret="secret",
@@ -1182,7 +1292,6 @@ async def test_uncertain_same_snapshot_real_snapshot_helper_preserves_deployed_r
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
@@ -1259,7 +1368,6 @@ async def test_uncertain_same_snapshot_missing_old_deployed_runtime_binding_stay
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
@@ -1326,7 +1434,6 @@ async def test_uncertain_changed_snapshot_ignores_missing_old_runtime_binding_an
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
         commit_prefix="abc1234",
-        resolved_head_sha="a" * 40,
         test_comment_id=1002,
         code_review_comment_id=1003,
         code_review_text="Looks good.",
@@ -1348,7 +1455,7 @@ async def test_uncertain_changed_snapshot_ignores_missing_old_runtime_binding_an
 
     assert result == "deploy-requested"
     written_state = proxy.write_hidden_state.call_args.args[3]
-    assert "job-new" in str(written_state["review_evidence"])
+    assert written_state["review_evidence"]["build_comment_id"] == 1001
     assert written_state["status"] == "deploy-requested"
     assert written_state["command"]["phase"] == "completed"
     assert all("runtime_id" not in component for component in written_state["components"])

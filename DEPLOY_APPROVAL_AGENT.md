@@ -51,15 +51,15 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **GitHub hidden lifecycle JSON is the ONLY authoritative persistent Deploy Approval business-state store.** Fresh facts come from Review Agent / Registry / Agent Core and are copied into hidden state to make the snapshot restart-safe.
 - **Restart-safe, single-replica / single-writer:** Deploy Approval is intentionally restart-safe stateless, but only one `GitHubCommandWatcher` serially processes mutating commands. Multiple concurrent Deploy Controller replicas are unsupported because the current hidden-state protocol has no CAS/distributed lock, and replicas >1 would violate the at-most-once unsafe-side-effect model.
 - **Polling:** PR comments are polled using `POLL_INTERVAL_SECONDS` from the upstream environment. Default: 30 seconds. No webhook required.
-- **Open-PR watcher enumeration:** `GitHubCommandWatcher` enumerates all open PRs in both supported repositories. Enumeration uses `state=open`, `sort=updated`, `direction=desc`, `per_page=100` and continues paging until the batch is empty or shorter than 100. There is no age/lookback cutoff, no 500-PR truncation, and page overlap is deduplicated by PR number. Closed/merged PRs are not enumerated by Deploy Approval.
+- **Open-PR watcher enumeration:** `GitHubCommandWatcher` enumerates all open PRs in configured `GITHUB_REPOS`. Enumeration uses `state=open`, `sort=updated`, `direction=desc`, `per_page=100` and continues paging until the batch is empty or shorter than 100. There is no age/lookback cutoff, no 500-PR truncation, and page overlap is deduplicated by PR number. Closed/merged PRs are not enumerated by Deploy Approval.
 - **POLL_ENABLED must be true.** Webhook is supplementary only.
 - **Hidden state JSON:** The lifecycle comment carries a `<!-- deploy-approval-state:v1\n{...}\n-->` marker with validated JSON state.
 - **Trusted identity:** The lifecycle comment author must match the configured GitHub App identity. Deploy Approval uses lazy GitHub App provenance (`performed_via_github_app.id` == configured `GITHUB_APP_ID`) validated at comment patch time. No startup bot-identity lookup. No `/apps/{slug}/bot` calls.
 - **Top-level status labels:** only `review-required`, `reviewing`, `deploy-ready`, `deploy-requested`, `testing`, `succeeded`, `failed`.
 - **Status labels:** `status:*` labels are best-effort UI projection only. Label bootstrap/list/create failures are logged as warnings and never block startup or business operations. Label failure does not affect any gate or lifecycle transition.
 - **Review Agent authentication:** Review Agent uses a user-provided `GITHUB_TOKEN`, not the GitHub App. This is strictly separate from Deploy Approval's GitHub App credentials.
-- **Supported repos:** production must configure exactly `4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver`. `DEPLOY_APPROVAL_FORK_TEST_MODE=true` allows only the explicit fork test repo `Haohao-end/phanthymotus`. Missing, duplicate, mixed, or third-party repos fail closed.
-- **review_done lookup:** `/request_deploy` binds the latest exact `review_done` Job for repo + PR + full HEAD; Review Agent API does not receive a `pr_number` kwarg.
+- **Supported repos:** production capability supports main + driver; default/current rollout may configure main only; `GITHUB_REPOS` must be a non-empty duplicate-free subset of supported repos. Current installation may authorize only `main` initially. When driver is added to the same installation's selected repositories later, the same `GITHUB_INSTALLATION_ID` continues; only `GITHUB_REPOS` is extended. Deploy Approval source code does not change.
+- **Evidence source:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation. Trusted Review Agent GitHub comments provide Build Result, Test Results, and Code Review. Build/Test commit short SHA resolves via GitHub to full SHA for exact equality with fresh PR HEAD. Image tag comes from the selected Build Result comment Images section (full mutable ref, not basename). Registry resolves to immutable digest. No Review Agent HTTP API.
 - **Full-coverage machine list:** `deploy_requested` lifecycle comment shows only machines that can cover ALL bound components. If no machine can cover all components, status stays deploy-requested and the operator must update machine policy.
 - **Source matrix:** GitHub PR comments are the source of Review Agent Build/Test/Code Review evidence and image:tag candidate facts; Registry only verifies/resolves that exact Review Agent image tag; Agent Core only supplies runtime identity, current `running_image`, and MCP evidence; GitHub persists the deployment snapshot.
 - **Deployability:** `phanthymotus` deploys `perception` and `actucore`, not `CORE`; `phanthymotus-driver` deploys exact driver paths.
@@ -73,19 +73,14 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **Final unsafe order:** Full-Coverage -> running_image-only CLEAN -> fresh exact approval comment -> final fresh PR/full HEAD -> persist command.phase=executing to GitHub FIRST -> Agent Core deploy POST.
 - **approval_revoked:** final fresh approval comment revalidation checks: comment object valid, comment id exact, actor id exact, body parses as approve_deploy, machine alias exact. If any check fails (comment deleted, changed, malformed, actor mismatch, machine alias mismatch, or cannot be revalidated): `approve_attempt.outcome=approval_revoked`, `status=deploy-requested`, `command.phase=completed`, cursor advances to current comment, ZERO deploy POST. Machine Owner must send a NEW `/approve_deploy`. `approval_revoked` is not a top-level status and does not introduce a new lifecycle state.
 - **Success goes directly to testing:** Full-coverage approval + clean pass + successful deploy = status: testing directly. No intermediate machine-group progress check.
-- **review_done → deploy-ready only:** No automatic deployment is created.
+- **Evidence lookup:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation.
 - **PR Author only:** Only the GitHub PR author can run `/request_deploy`.
-- **Authorization:** `/approve_deploy` requires the actor to be the selected machine owner OR a write/maintain/admin repo collaborator. `/record_test` requires the actor to be an owner of any actually deployed machine OR a write/maintain/admin repo collaborator. Self-approval is allowed if the actor satisfies the authorization rule.
+- **Authorization:** `/approve_deploy` requires the actor to be the selected machine owner OR a write/maintain/admin repo collaborator. `/record_test` requires the actor to be an owner of any actually deployed machine OR a write/maintain/admin repo collaborator. Self-approval is FORBIDDEN. PR author must not approve their own deployment. Numeric GitHub user ID is checked against fresh PR author ID at approval gates.
 - **Exact HEAD required:** GitHub HEAD is re-checked at each decision point; drift supersedes the deployment.
 - **Open-PR watcher boundary:** If an enumerated PR is merged or closed before command execution or before an unsafe deploy POST, the existing fresh PR gates reject it and Deploy Approval performs zero deploy POST. Post-merge release deployment is outside Deploy Approval.
 - **No rollback/reject/cancel/resume:** These commands are not supported.
-- **COS evidence:** Uploads a single gzip-compressed evidence.log.gz to private COS. Terminal evidence includes case result metadata and a one-shot snapshot of actual deployed runtime logs. GitHub persists only `object_key`, `sha256`, and `size`; secret values are redacted.
-- **Evidence download:** Terminal comments render **Download COS evidence** as a link to Deploy Approval at `https://<deploy-agent>/evidence/download?repo=...&pr=...&head=...`. The link uses GitHub App user OAuth with signed state and PKCE, then fresh PR/hidden-state authorization and server-side COS HEAD/GET. It returns only an exact-size, exact-SHA, <=10 MiB attachment; no COS presigned URL is persisted.
-- **OAuth callback:** The GitHub App callback is
-  `<DEPLOY_APPROVAL_PUBLIC_BASE_URL>/evidence/oauth/callback`.
-  GitHub App callback wildcard matching should be **DISABLED** unless there
-  is a demonstrated need. The deployed `redirect_uri` must exactly equal
-  the registered callback URL.
+- **COS evidence:** Uploads a single gzip-compressed evidence.log.gz to private COS. Terminal evidence includes case result metadata and a one-shot snapshot of actual deployed runtime logs. GitHub persists only `object_key`, `sha256`, and `size`; secret values are redacted. A 120-second HTTPS presigned GET URL is generated and rendered in the GitHub terminal comment as a temporary bearer link. The URL is not persisted in hidden state. No public Deploy Approval download endpoint, GitHub user OAuth, or PKCE is used.
+- **Evidence download:** Terminal comments render **Download COS evidence** as a link to a short-lived HTTPS presigned GET URL generated server-side from private COS credentials. The presigned URL expires after 120 seconds (2 minutes). Bucket remains private; the signed URL is temporary bearer access. The URL is not persisted in hidden state. No Deploy Approval public HTTPS endpoint is required for evidence. Only `object_key`, `sha256`, and `size` are stored in GitHub hidden state.
 
 ## Required GitHub App Permissions
 
@@ -103,7 +98,7 @@ the Contents API, that must be reviewed as a separate permission change.
 
 ## Review Agent Integration
 
-Deploy Approval does **NOT** call the Review Agent HTTP API (`/api/status`, `/api/jobs`, `/api/jobs/{id}`).
+Deploy Approval does **NOT** call any Review Agent HTTP API.
 Deploy Approval does **NOT** need:
 - Review Agent host / IP / port
 - Review Agent `GITHUB_TOKEN`
@@ -155,8 +150,6 @@ Reasons:
 - No cross-instance distributed deduplication exists.
 
 **Test Review Agent** must use:
-- `GITHUB_REPOS=Haohao-end/phanthymotus`
-- Paired with `DEPLOY_APPROVAL_FORK_TEST_MODE=true`
 - Must NEVER listen on production repos.
 
 `AUTHORITATIVE_REVIEW_AGENT_COUNT_FOR_PRODUCTION_REPOS=1` is an operational go/no-go gate.
@@ -239,7 +232,6 @@ It reuses the upstream existing keys below and fixed read-only files:
 | `GITHUB_INSTALLATION_ID` | upstream existing env |
 | `GITHUB_APP_PRIVATE_KEY_FILE` | upstream existing env (absolute path) |
 | `GITHUB_REPOS` | upstream existing env |
-| `DEPLOY_APPROVAL_FORK_TEST_MODE` | explicit local fork-only E2E mode; default `false` |
 | `POLL_ENABLED` | upstream existing env |
 | `POLL_INTERVAL_SECONDS` | upstream existing env |
 | `WEBHOOK_ENABLED` | upstream existing env |

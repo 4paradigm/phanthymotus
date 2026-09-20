@@ -8,9 +8,9 @@ No obsolete lifecycle states, no build_index, no dpl_x.
 from __future__ import annotations
 
 import datetime as _dt
-import urllib.parse
 from zoneinfo import ZoneInfo
 
+import urllib.parse
 from .models import BuildInfo
 
 BOT_MARKER = "<!-- deploy-approval-agent -->"
@@ -63,15 +63,33 @@ def _escape(text: str) -> str:
     return (text or "").replace("`", "").replace("\r", " ").replace("\n", " ")[:500]
 
 
-def build_evidence_download_url(
-    public_base_url: str,
-    repo: str,
-    pr_number: int,
-    head_sha: str,
-) -> str:
-    query = urllib.parse.urlencode({"repo": repo, "pr": pr_number, "head": head_sha})
-    return f"{public_base_url.rstrip('/')}/evidence/download?{query}"
+def _safe_download_url(url: str) -> str:
+    """Validate a COS presigned download URL without truncation.
 
+    Returns the original URL if valid, or empty string otherwise.
+    Never truncates or logs the URL.
+    """
+    if not isinstance(url, str):
+        return ""
+    if not url:
+        return ""
+    if len(url) > 8192:
+        return ""
+    if "\r" in url or "\n" in url:
+        return ""
+    for ch in url:
+        if ord(ch) < 0x20 and ch not in ("\t",):
+            return ""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https":
+        return ""
+    if not parsed.hostname:
+        return ""
+    if parsed.username is not None:
+        return ""
+    if parsed.password is not None:
+        return ""
+    return url
 
 
 
@@ -104,7 +122,9 @@ def _cos_evidence_block(
         return []
     lines = [""]
     if download_url:
-        lines.append(f"[Download COS evidence]({_escape(download_url)})")
+        safe_url = _safe_download_url(download_url)
+        if safe_url:
+            lines.append(f"[Download COS evidence]({safe_url})")
     text = f"COS: `{_escape(object_key)}`"
     if sha256:
         text += f" · `@sha256:{_escape(sha256[:12])}`"
@@ -536,6 +556,10 @@ def deploy_status_comment(
     status: str, head_sha: str, repo: str, pr_number: int,
     components: list | None = None,
     deployments: list | None = None,
+    cos_object_key: str = "",
+    cos_bundle_sha256: str = "",
+    cos_bundle_size: int = 0,
+    cos_download_url: str = "",
 
 ) -> str:
     lines = [
@@ -561,6 +585,9 @@ def deploy_status_comment(
             lines.append(f"- {_escape(machine)}: {comps}")
         lines.append("")
         lines.append("")
+    lines.extend(_cos_evidence_block(
+        cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url,
+    ))
     lines.append(last_checked_line())
     return "\n".join(lines)
 
@@ -577,7 +604,7 @@ def deploy_help_text(topic: str = "") -> str:
             "`/request_deploy`",
             "",
             "**Parameters:** None.",
-            "Binds the current PR HEAD's latest review_done Job and all deployable components.",
+            "Binds the current PR HEAD's latest complete current-HEAD trusted Review Agent GitHub comment evidence and all deployable components.",
             "",
             "**Who can run:** PR Author only.",
             "**When:** PR must be open and not merged.",

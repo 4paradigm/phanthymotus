@@ -129,20 +129,6 @@ print("GITHUB_APP_PRIVATE_KEY_OK")
 PY
 }
 
-require_public_base_url() {
-    [ -n "${DEPLOY_APPROVAL_PUBLIC_BASE_URL:-}" ] || die "DEPLOY_APPROVAL_PUBLIC_BASE_URL is required"
-    python3 - "$DEPLOY_APPROVAL_PUBLIC_BASE_URL" <<'PY'
-import sys
-import urllib.parse
-value = sys.argv[1]
-parsed = urllib.parse.urlsplit(value)
-if (parsed.scheme != "https" or not parsed.netloc or parsed.username is not None
-        or parsed.password is not None or parsed.query or parsed.fragment):
-    raise SystemExit("DEPLOY_APPROVAL_PUBLIC_BASE_URL must be an absolute HTTPS URL without query or fragment")
-print("DEPLOY_APPROVAL_PUBLIC_BASE_URL_OK")
-PY
-}
-
 
 
 require_private_local_inputs() {
@@ -326,13 +312,6 @@ for alias, token in tokens.items():
         raise SystemExit("agent_core_tokens keys must be non-empty strings")
     if not isinstance(token, str) or not token.strip():
         raise SystemExit(f"agent_core_tokens[{alias!r}] must be a non-empty string")
-oauth = data.get("github_oauth")
-if not isinstance(oauth, dict):
-    raise SystemExit("github_oauth must be a mapping")
-for key in ("client_id", "client_secret"):
-    value = oauth.get(key, "")
-    if not isinstance(value, str) or not value.strip():
-        raise SystemExit(f"github_oauth.{key} must be a non-empty string")
 print("SECRETS_OK")
 PY
 }
@@ -340,7 +319,6 @@ PY
 require_runtime_inputs() {
     require_runtime_user
     require_github_app_inputs
-    require_public_base_url
     require_private_local_inputs
     require_machine_policy
     require_secrets
@@ -352,8 +330,6 @@ build_env_file() {
     chmod 600 "$tmp"
     {        printf 'DEPLOY_APPROVAL_RUNTIME_UID=%s\n' "$RUNTIME_UID"
         printf 'DEPLOY_APPROVAL_RUNTIME_GID=%s\n' "$RUNTIME_GID"
-        fork_mode="${DEPLOY_APPROVAL_FORK_TEST_MODE:-false}"
-        printf 'DEPLOY_APPROVAL_FORK_TEST_MODE=%s\n' "$fork_mode"
         for key in GITHUB_REPOS POLL_ENABLED POLL_INTERVAL_SECONDS WEBHOOK_ENABLED GITHUB_WEBHOOK_SECRET REGISTRY REGISTRY_USER REGISTRY_PASSWORD; do
             value="${!key:-}"
             if [ -n "$value" ]; then

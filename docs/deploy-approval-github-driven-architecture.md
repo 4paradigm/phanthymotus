@@ -2,11 +2,11 @@
 
 本文是 Deploy Approval 的中文主文档，描述当前冻结的 stateless 合同。
 
-Deploy Controller 只负责部署审批与状态编排，**代码不修改**；代码构建与 Review 仍由 Review Agent 负责。生产模式只支持 `4paradigm/phanthymotus` 和 `4paradigm/phanthymotus-driver`；显式设置 `DEPLOY_APPROVAL_FORK_TEST_MODE=true` 时只支持 fork E2E 测试 repo：`Haohao-end/phanthymotus`当前不测试 driver fork。缺失、重复、official/fork 混用、第三方仓库或模式不匹配均必须 fail closed。
+Deploy Controller 只负责部署审批与状态编排，**代码不修改**；代码构建与 Review 仍由 Review Agent 负责。生产模式只支持 `4paradigm/phanthymotus`。缺失、重复或第三方仓库必须 fail closed。
 
 ## Review Agent 集成
 
-Deploy Approval **不调用** Review Agent HTTP API（`/api/status`、`PR Conversation comments`、`PR Conversation comments/{id}`）。
+Deploy Approval **不调用** Review Agent HTTP API，全部通过 GitHub PR Conversation 完成。
 Deploy Approval **不需要**：
 - Review Agent 主机 / IP / 端口
 - Review Agent `GITHUB_TOKEN`
@@ -56,8 +56,6 @@ review_comment_trust:
 - 不存在跨实例分布式去重。
 
 **测试 Review Agent** 必须使用：
-- `GITHUB_REPOS=Haohao-end/phanthymotus`
-- 配合 `DEPLOY_APPROVAL_FORK_TEST_MODE=true`
 - 绝不允许监听生产仓库。
 
 `AUTHORITATIVE_REVIEW_AGENT_COUNT_FOR_PRODUCTION_REPOS=1` 是上线人工门禁。
@@ -486,22 +484,22 @@ COS hidden state 只保存：
 GitHub 中只持久化 `object_key`、`sha256`、`size`。
 
 终态 lifecycle comment 在 COS 上传成功后显示稳定的 Deploy Approval 下载链接：
-
-```text
 GitHub PR comment
     ↓ [Download COS evidence]
-Deploy Approval /evidence/download?repo=...&pr=...&head=<FULL_HEAD_SHA>
-    ↓ GitHub App user OAuth + signed state + PKCE
-fresh PR / hidden state authorization
-    ↓ private COS HEAD + bounded GET
-exact size + SHA-256 verification
+120 秒 HTTPS COS presigned GET URL
     ↓
-attachment: evidence-<FULL_HEAD_SHA>.log.gz
-```
+private COS object
+    ↓
+evidence.log.gz
 
-下载 URL 只包含 `repo`、`pr`、`head`，不包含 object key、bucket、COS credential 或任何 presigned URL。OAuth callback 是外部 GitHub App 配置的：`<DEPLOY_APPROVAL_PUBLIC_BASE_URL>/evidence/oauth/callback`。
-GitHub App callback wildcard matching 应当 **DISABLED**，除非有明确需求。
-部署的 `redirect_uri` 必须与注册的回调 URL 完全一致。下载前必须重新验证 PR HEAD、terminal hidden state、PR author / deployed machine owner / collaborator authorization，并验证 compressed size、SHA-256 和 10 MiB 上限。COS runtime identity 需要 `cos:PutObject`、`cos:HeadObject`、`cos:GetObject`，范围为 `phanthymotus_pr/*`。
+COS presigned URL 由 Deploy Approval 在终端 COS 元数据重新绑定成功后生成，120 秒（2 分钟）短期有效。
+该 URL 为临时持有者访问链接，点击后浏览器直接请求 COS，不经过 Deploy Approval。
+COS 存储桶保持私有，不对外暴露公共 HTTPS 端点。
+无需 GitHub 用户 OAuth、无需 OAuth 回调、无需 PKCE、无需每次点击的 Deploy Approval 授权网关。
+不生成 /evidence/download 公共下载网关。
+presigned URL 不会持久化写入 hidden state。
+证据上传前已完成敏感信息脱敏、严格 UTF-8 处理、gzip 压缩、mtime=0、大小上限 10 MiB。
+
 
 ## restart / uncertain
 

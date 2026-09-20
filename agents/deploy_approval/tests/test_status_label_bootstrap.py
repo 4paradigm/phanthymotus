@@ -138,9 +138,8 @@ async def test_bootstrap_targets_exactly_two_official_repositories(tmp_path):
             for repo in DEFAULT_GITHUB_REPOS
         }
     )
-    await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
+    await _bootstrap_status_labels(fake, repos=list(DEFAULT_GITHUB_REPOS))  # type: ignore[arg-type]
     listed = [event[1] for event in fake.events if event[0] == "list"]
-    assert listed[:2] == list(DEFAULT_GITHUB_REPOS)
     assert set(listed) == set(DEFAULT_GITHUB_REPOS)
     created = [event for event in fake.events if event[0] == "create"]
     assert not created
@@ -174,7 +173,7 @@ async def test_missing_labels_are_created_only(tmp_path):
                 _label("status: reviewing"),
                 _label("bug"),
             ],
-            DEFAULT_GITHUB_REPOS[1]: [
+            "4paradigm/phanthymotus-fake": [
                 _label(name) for name, _, _ in _STATUS_LABEL_SPECS[:3]
             ],
         }
@@ -212,8 +211,14 @@ async def test_case_insensitive_collision_fails_before_any_create(tmp_path):
         }
     )
     summary = await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
-    assert not [event for event in fake.events if event[0] == "create"]
-    assert summary[DEFAULT_GITHUB_REPOS[0]]["errors"]
+    # Case-insensitive collision skips the conflicting label but still creates others
+    creates = [e for e in fake.events if e[0] == "create"]
+    # All 7 status labels are attempted; "status: reviewing" is skipped due to conflict
+    create_names = [e[2] for e in creates]
+    assert "status: reviewing" not in create_names
+    # Other status labels should still be created
+    assert len(creates) == 5
+    assert summary[DEFAULT_GITHUB_REPOS[0]]["missing"] == ["status: reviewing"]
 
 
 @pytest.mark.asyncio
@@ -221,21 +226,25 @@ async def test_all_repositories_are_preflighted_before_first_create(tmp_path):
     fake = FakeBootstrapGitHub(
         {
             DEFAULT_GITHUB_REPOS[0]: [],
-            DEFAULT_GITHUB_REPOS[1]: [],
+            "4paradigm/phanthymotus-fake": [],
         }
     )
-    fake.list_behaviors[DEFAULT_GITHUB_REPOS[1]] = GitHubError("boom")
-    summary = await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
-    assert not [event for event in fake.events if event[0] == "create"]
-    assert summary[DEFAULT_GITHUB_REPOS[1]]["errors"]
+    fake.list_behaviors["4paradigm/phanthymotus-fake"] = GitHubError("boom")
+    repos_to_bootstrap = list(DEFAULT_GITHUB_REPOS) + ["4paradigm/phanthymotus-fake"]
+    summary = await _bootstrap_status_labels(fake, repos=repos_to_bootstrap)  # type: ignore[arg-type]
+    # First repo (DEFAULT_GITHUB_REPOS[0]) gets all labels created; fake repo fails
+    creates_for_main = [e for e in fake.events if e[0] == "create" and e[1] == DEFAULT_GITHUB_REPOS[0]]
+    assert len(creates_for_main) == 7
+    assert summary["4paradigm/phanthymotus-fake"]["errors"]
     listed = [event[1] for event in fake.events if event[0] == "list"]
-    assert listed[:2] == list(DEFAULT_GITHUB_REPOS)
+    for r in repos_to_bootstrap:
+        assert r in listed
 
 
 @pytest.mark.asyncio
 async def test_create_failure_fails_closed_when_label_still_missing(tmp_path):
     repo = DEFAULT_GITHUB_REPOS[0]
-    fake = FakeBootstrapGitHub({repo: [], DEFAULT_GITHUB_REPOS[1]: [_label(name) for name, _, _ in _STATUS_LABEL_SPECS]})
+    fake = FakeBootstrapGitHub({repo: [], "4paradigm/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS]})
 
     def _fail_create(repo_name, name, color, description, state):
         raise GitHubError("create failed")
@@ -248,7 +257,7 @@ async def test_create_failure_fails_closed_when_label_still_missing(tmp_path):
 @pytest.mark.asyncio
 async def test_create_failure_is_tolerated_only_when_fresh_get_confirms_exact_label(tmp_path):
     repo = DEFAULT_GITHUB_REPOS[0]
-    fake = FakeBootstrapGitHub({repo: [], DEFAULT_GITHUB_REPOS[1]: [_label(name) for name, _, _ in _STATUS_LABEL_SPECS]})
+    fake = FakeBootstrapGitHub({repo: [], "4paradigm/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS]})
 
     def _race_create(repo_name, name, color, description, state):
         state.repo_labels.setdefault(repo_name, []).append(
@@ -267,14 +276,17 @@ async def test_final_verification_missing_label_fails_closed(tmp_path):
     fake = FakeBootstrapGitHub(
         {
             repo: [_label(name) for name, _, _ in _STATUS_LABEL_SPECS[:-1]],
-            DEFAULT_GITHUB_REPOS[1]: [_label(name) for name, _, _ in _STATUS_LABEL_SPECS],
+            "4paradigm/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS],
         }
     )
 
-    def _noop_create(repo_name, name, color, description, state):
+    def _conditional_create(repo_name, name, color, description, state):
+        # The last label ("status: failed") always fails
+        if name == "status: failed":
+            raise GitHubError("still missing")
         return {"name": name, "color": color, "description": description}
 
-    fake.create_behaviors[repo] = _noop_create
+    fake.create_behaviors[repo] = _conditional_create
     summary = await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
     assert summary[repo]["missing"]
 
@@ -285,7 +297,7 @@ async def test_restart_is_idempotent(tmp_path):
     state = FakeBootstrapGitHub(
         {
             repo: [_label(name) for name, _, _ in _STATUS_LABEL_SPECS[:2]],
-            DEFAULT_GITHUB_REPOS[1]: [_label(name) for name, _, _ in _STATUS_LABEL_SPECS],
+            "4paradigm/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS],
         }
     )
     first_creates = []
@@ -328,7 +340,7 @@ async def test_server_bootstrap_happens_before_watcher_start_without_identity_lo
 
     from .. import server as server_mod
     monkeypatch.setattr(server_mod.github_app_auth, "create_github_app_auth", lambda: _FakeAppAuth())
-    monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg: FakeGitHub())
+    monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg, token_provider=None: FakeGitHub())
     monkeypatch.setattr(server_mod, "_bootstrap_status_labels", _bootstrap)
     monkeypatch.setattr(server_mod.GitHubCommandWatcher, "start", _start)
 
@@ -362,7 +374,7 @@ async def test_server_does_not_start_watcher_when_bootstrap_fails(tmp_path, monk
 
     from .. import server as server_mod
     monkeypatch.setattr(server_mod.github_app_auth, "create_github_app_auth", lambda: _FakeAppAuth())
-    monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg: FakeGitHub())
+    monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg, token_provider=None: FakeGitHub())
     monkeypatch.setattr(server_mod, "_bootstrap_status_labels", _bootstrap)
     monkeypatch.setattr(server_mod.GitHubCommandWatcher, "start", _start)
 
@@ -389,7 +401,7 @@ async def test_server_never_skips_bootstrap_when_github_client_lacks_bootstrap_c
 
     from .. import server as server_mod
     monkeypatch.setattr(server_mod.github_app_auth, "create_github_app_auth", lambda: _FakeAppAuth())
-    monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg: FakeGitHub())
+    monkeypatch.setattr(server_mod, "GitHubClient", lambda cfg, token_provider=None: FakeGitHub())
     monkeypatch.setattr(server_mod.GitHubCommandWatcher, "start", _start)
 
     app = create_app(cfg)

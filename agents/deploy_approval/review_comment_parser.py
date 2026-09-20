@@ -33,8 +33,117 @@ BUILD_HEADING = "## PR Review Agent — Build Result"
 TEST_HEADING = "## PR Review Agent — Test Results"
 CODE_REVIEW_HEADING = "## PR Review Agent — Code Review"
 
+@dataclass
+class ReviewJobAnchor:
+    comment_id: int
+    commit_prefix: str
+    created_at: str
+    updated_at: str
+    state: str
+    body: str = field(default="", repr=False)
+
+
+def _extract_review_job_commit_prefix(body: str) -> str:
+    """Extract commit prefix from 'Commit: <sha>' or '| Commit | <sha> |'."""
+    for line in body.splitlines():
+        m = _COMMIT_PREFIX_RE.match(line.strip())
+        if m:
+            return m.group(1).strip().strip("`")
+        m2 = _TABLE_COMMIT_PREFIX_RE.match(line.strip())
+        if m2:
+            return m2.group(1).strip().strip("`")
+    return ""
+
+
+def extract_latest_review_job_anchor(
+    comments: list[dict],
+    trusted_author_id: str,
+    trusted_author_login: str = "",
+) -> ReviewJobAnchor | None:
+    """Scan ALL trusted comments with pr-review-agent marker.
+
+    Returns the latest ReviewJobAnchor by (created_at, comment_id) among
+    comments that contain a commit prefix.  Supports both
+    `Commit: sha` and `| Commit | sha |` formats.
+
+    LATEST RUN ALWAYS WINS.  Never falls back to an older completed run.
+    If the latest run is still Queued/Building/Generating review,
+    returns anchor with state="reviewing".
+    """
+    # Filter trusted comments
+    trusted: list[dict] = []
+    for c in comments:
+        user = c.get("user", {})
+        if not isinstance(user, dict):
+            continue
+        cid = str(user.get("id", ""))
+        if cid != trusted_author_id:
+            continue
+        login = str(user.get("login", ""))
+        if trusted_author_login and login != trusted_author_login:
+            continue
+        trusted.append(c)
+
+    if not trusted:
+        return None
+
+    # Build anchors from ALL trusted comments that have a marker and commit prefix.
+    # Progress comments (Queued/Building) that lack a Build Result table still form anchors.
+    anchors: list[ReviewJobAnchor] = []
+    for c in trusted:
+        body = str(c.get("body", "") or "")
+        if not _has_marker(body):
+            continue
+        commit_prefix = _extract_review_job_commit_prefix(body)
+        if not commit_prefix:
+            continue
+        # Determine anchor state based on comment content
+        anchor_state = "reviewing"
+        if BUILD_HEADING in body:
+            # This is a Build Result comment — parse rows for state determination
+            rows = _parse_build_table(body)
+            images = _parse_build_images(body)
+            if rows:
+                all_success = True
+                has_exact_image = True
+                for row in rows:
+                    status_raw = row.get("status", "")
+                    is_success = (
+                        ":white_check_mark:" in status_raw
+                        or status_raw.lower() == "success"
+                    )
+                    if not is_success:
+                        all_success = False
+                    target = row.get("target", "")
+                    if is_success and not images.get(target):
+                        has_exact_image = False
+                if all_success and has_exact_image:
+                    anchor_state = "build-succeeded"
+                elif not all_success:
+                    anchor_state = "terminal"
+            # If rows is empty for a BUILD_HEADING comment, state stays "reviewing"
+        # If BUILD_HEADING not in body (progress comment), state stays "reviewing"
+        anchors.append(ReviewJobAnchor(
+            comment_id=int(c.get("id", 0) or 0),
+            commit_prefix=commit_prefix,
+            created_at=str(c.get("created_at", "")),
+            updated_at=str(c.get("updated_at", "")),
+            state=anchor_state,
+            body=body,
+        ))
+
+    if not anchors:
+        return None
+
+    anchors.sort(key=lambda a: (a.created_at, a.comment_id))
+    return anchors[-1]
+
+
 _COMMIT_PREFIX_RE = re.compile(r"^Commit:\s*(.+)$")
 _TABLE_ROW_RE = re.compile(r"^\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$")
+_TEST_TABLE_ROW_RE = re.compile(
+    r"^\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$"
+)
 _IMAGE_SECTION_RE = re.compile(
     r"\*\*(.+?)\*\*\s*\n\s*```(?:\n|(.*?))\n\s*(.+?)\s*```",
     re.DOTALL,
@@ -43,6 +152,7 @@ _IMAGE_REF_RE = re.compile(
     r"^([^\s:/]+(?:/[^\s:/]+)+)/([^:\s]+(?::(.+))?)$"
 )
 _VERSION_RE = re.compile(r"^`(.+?)`$")
+_TABLE_COMMIT_PREFIX_RE = re.compile(r'^\|\s*(?:Commit|commit)\s*\|\s*(.+?)\s*\|')
 _SHORT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
@@ -79,11 +189,13 @@ class ReviewCommentEvidence:
     build_comment_updated_at: str = ""
     test_comment_id: int = 0
     test_comment_created_at: str = ""
+    test_comment_updated_at: str = ""
     test_passed: int = 0
     test_failed: int = 0
     test_skipped: bool = False
     code_review_comment_id: int = 0
     code_review_created_at: str = ""
+    code_review_comment_updated_at: str = ""
     code_review_text: str = ""
 
 
@@ -149,13 +261,37 @@ def _extract_commit_prefix(body: str) -> str:
 # ------------------------------------------------------------------
 
 def _parse_build_table(text: str) -> list[dict[str, str]]:
-    """Parse the target/status/version/took table from Build Result."""
+    """Parse the target/status/version/took table from Build Result.
+
+    Skips markdown table header rows (e.g. ``| Target | Status | Version |
+    Took |``) and separator rows (e.g. ``| --- | --- | --- | --- |``).
+    """
+
+    def _is_header_row(groups: re.Match) -> bool:
+        """Return True if the row is a table header (all cells alphabetic)."""
+        for g in (groups.group(1), groups.group(2), groups.group(3), groups.group(4)):
+            cell = g.strip()
+            if not cell or not cell.isalpha():
+                return False
+        return True
+
+    def _is_separator(target: str) -> bool:
+        """Return True if *target* looks like a markdown table separator."""
+        return bool(re.fullmatch(r"[- :	]+", target)) and len(target) > 2
+
     rows: list[dict[str, str]] = []
     for line in text.splitlines():
         m = _TABLE_ROW_RE.match(line.strip())
         if m:
+            # Skip header rows (all cells purely alphabetic)
+            if _is_header_row(m):
+                continue
+            target = m.group(1).strip()
+            # Skip markdown table separator rows
+            if _is_separator(target):
+                continue
             rows.append({
-                "target": m.group(1).strip(),
+                "target": target,
                 "status": m.group(2).strip(),
                 "version": m.group(3).strip(),
                 "took": m.group(4).strip(),
@@ -173,6 +309,9 @@ def _parse_build_images(text: str) -> dict[str, str]:
         target = m.group(1).strip()
         image_ref = m.group(2).strip()
         if target and image_ref:
+            if target in images:
+                # Duplicate target => conflicting images => fail closed
+                return {}
             images[target] = image_ref
     return images
 
@@ -242,9 +381,7 @@ def parse_build_result(
         if not image_ref and is_success:
             return None  # success without image => fail
 
-        image_tag = ""
-        if image_ref:
-            image_tag = image_ref.split("/")[-1] if "/" in image_ref else image_ref
+        image_tag = image_ref  # full mutable ref: registry.example/path/image:tag
 
         build = ReviewBuild(
             target=target,
@@ -315,7 +452,16 @@ def parse_all_build_results(
 
         version = row["version"]
         image_ref = images.get(target, "")
-        image_tag = image_ref.split("/")[-1] if "/" in image_ref and image_ref else ""
+
+        # Success build without an image reference => fail closed
+        if is_success and not is_failed and not is_killed and not image_ref:
+            return []
+
+        # Duplicate target in images section => fail closed
+        if is_success and image_ref and images.get(target, "") and images.get(target, "") != image_ref:
+            return []
+
+        image_tag = image_ref  # full mutable ref: registry.example/path/image:tag
 
         build = ReviewBuild(
             target=target,
@@ -343,6 +489,9 @@ def parse_test_results(
 
     Returns (passed, failed, skipped).
     Returns (0, 0, True) if no test suite ran.
+
+    Test table has 5 columns: Suite | Result | Passed | Failed | Took
+    Passed and failed counts are accumulated across all suites.
     """
     if not _has_marker(body) or TEST_HEADING not in body:
         return (0, 0, False)
@@ -373,17 +522,27 @@ def parse_test_results(
             return (0, 0, True)
         return (passed, failed, False)
 
-    # Parse table rows
+    # Parse table rows — 5-column regex: Suite | Result | Passed | Failed | Took
     passed = 0
     failed = 0
     for line in section.splitlines():
-        m = _TABLE_ROW_RE.match(line.strip())
+        m = _TEST_TABLE_ROW_RE.match(line.strip())
         if m:
+            # Skip table header/separator rows
+            target = m.group(1).strip()
+            if not target or re.fullmatch(r"[- :\t]+", target) and len(target) > 2:
+                continue
             result = m.group(2).strip().lower()
             if ":white_check_mark:" in result or result == "pass":
-                passed += 1
+                try:
+                    passed += int(m.group(3).strip())
+                except (ValueError, IndexError):
+                    passed += 1
             elif ":x:" in result or result in ("fail", "failure"):
-                failed += 1
+                try:
+                    failed += int(m.group(4).strip())
+                except (ValueError, IndexError):
+                    failed += 1
 
     return (passed, failed, False)
 
@@ -413,6 +572,11 @@ def parse_code_review(
     if not section:
         return None
 
+    # Treat lines that are only dashes/spaces (e.g. "---") as empty
+    cleaned = re.sub(r"[-*_\s]+", "", section)
+    if not cleaned:
+        return None
+
     return section
 
 
@@ -427,14 +591,8 @@ def extract_review_evidence(
 ) -> ReviewCommentEvidence | None:
     """Extract the latest complete, unambiguous review evidence from PR comments.
 
-    Arguments:
-        comments: List of PR comment dicts with keys: id, user, body,
-                  created_at, updated_at.
-        trusted_author_id: The GitHub user ID that must match comment.user.id.
-        trusted_author_login: Optional login for additional verification.
-
-    Returns:
-        ReviewCommentEvidence or None if no complete evidence found.
+    Latest review run wins: selects newest run by (created_at, comment_id).
+    Does NOT fall back to older runs.
     """
     # Filter comments by trusted author
     trusted_comments: list[dict] = []
@@ -453,12 +611,7 @@ def extract_review_evidence(
     if not trusted_comments:
         return None
 
-    # Sort by created_at for stable ordering
-    trusted_comments.sort(
-        key=lambda c: str(c.get("created_at", "")),
-    )
-
-    # Classify comments
+    # Classify comments into build, test, code review
     build_comments: list[dict] = []
     test_comments: list[dict] = []
     code_review_comments: list[dict] = []
@@ -475,107 +628,125 @@ def extract_review_evidence(
     if not build_comments:
         return None
 
-    # Find the latest build comment with valid content
-    latest_build: dict | None = None
-    latest_build_idx = -1
-
-    for idx, c in enumerate(build_comments):
-        body = str(c.get("body", "") or "")
-        builds = parse_all_build_results(body)
-        if not builds:
-            continue
-        # Check that at least one build succeeded
-        if not any(b.success for b in builds):
-            continue
-        latest_build = c
-        latest_build_idx = idx
-
-    if latest_build is None:
+    # Use canonical latest anchor selection — do not duplicate logic.
+    anchor = extract_latest_review_job_anchor(
+        trusted_comments,
+        trusted_author_id,
+        trusted_author_login,
+    )
+    if anchor is None:
         return None
 
-    build_body = str(latest_build.get("body", "") or "")
-    build_commit = _extract_commit_prefix(build_body)
-    build_created = str(latest_build.get("created_at", ""))
-    build_updated = str(latest_build.get("updated_at", ""))
-    build_builds = parse_all_build_results(build_body)
+    # If latest run is terminal/fail, never fall back
+    if anchor.state == "terminal":
+        return None
 
+    # If latest run is still reviewing (Queued/Building/incomplete),
+    # complete evidence is not yet available.
+    if anchor.state == "reviewing":
+        return None
+
+    # Parse builds from the selected anchor
+    build_builds = parse_all_build_results(anchor.body)
     if not build_builds:
         return None
 
-    # Check all builds succeeded
-    for b in build_builds:
-        if not b.success:
-            return None
+    # Build commit prefix must match fresh HEAD (checked later by caller)
+    build_commit = anchor.commit_prefix
 
-    # Find test results (after build)
-    test_evidence = (0, 0, False)
-    test_comment_id = 0
-    test_created = ""
+    # Select Test Results: trusted test comments created after selected Build
+    # Lower bound: selected Build Result anchor.updated_at
+    test_candidates: list[dict] = []
     for c in test_comments:
         c_created = str(c.get("created_at", ""))
-        if c_created >= build_created:
-            test_evidence = parse_test_results(str(c.get("body", "") or ""))
-            test_comment_id = int(c.get("id", 0) or 0)
-            test_created = c_created
+        if c_created < anchor.updated_at:
+            continue
+        c_body = str(c.get("body", "") or "")
+        test_commit = _extract_review_job_commit_prefix(c_body)
+        if test_commit and test_commit != build_commit:
+            return None  # commit mismatch => fail closed
+        if not test_commit:
+            return None  # commit missing => fail closed
+        test_candidates.append(c)
 
-    # Find code review (after build, unambiguous)
-    code_review_text = ""
-    code_review_comment_id = 0
-    code_review_created = ""
-
-    # Filter code reviews that come after the build
-    candidate_reviews = [
-        c for c in code_review_comments
-        if str(c.get("created_at", "")) >= build_updated
-    ]
-
-    if candidate_reviews:
-        # Check for overlapping jobs: if there's another build comment between
-        # this build and the code review, correlation is ambiguous
-        for cr in candidate_reviews:
-            cr_created = str(cr.get("created_at", ""))
-            # Check for intervening build comments
-            intervening = False
-            for bc in build_comments:
-                bc_created = str(bc.get("created_at", ""))
-                if bc_created > build_updated and bc_created < cr_created:
-                    intervening = True
-                    break
-            if not intervening:
-                review_body = str(cr.get("body", "") or "")
-                review_text = parse_code_review(review_body)
-                if review_text:
-                    code_review_text = review_text
-                    code_review_comment_id = int(cr.get("id", 0) or 0)
-                    code_review_created = cr_created
-                    break
-
-    if not code_review_text:
+    test_comment_id = 0
+    test_created = ""
+    test_updated = ""
+    if len(test_candidates) == 1:
+        tc = test_candidates[0]
+        test_comment_id = int(tc.get("id", 0) or 0)
+        test_created = str(tc.get("created_at", ""))
+        test_updated = str(tc.get("updated_at", ""))
+    elif len(test_candidates) > 1:
+        # Ambiguous => fail closed
         return None
+
+    # Select Code Review: trusted CR comments after the selected run
+    # Lower bound: latest of selected Build Result updated_at, selected Test updated_at
+    lb = anchor.updated_at
+    if test_comment_id > 0 and test_updated:
+        lb = test_updated
+
+    cr_candidates: list[dict] = []
+    for c in code_review_comments:
+        c_created = str(c.get("created_at", ""))
+        if c_created < lb:
+            continue
+        cr_candidates.append(c)
+
+    if len(cr_candidates) != 1:
+        return None  # 0 or >1 => fail closed
+
+    cr_body = str(cr_candidates[0].get("body", "") or "")
+    cr_text = parse_code_review(cr_body)
+    if cr_text is None:
+        return None
+
+    cr_comment = cr_candidates[0]
+    code_review_comment_id = int(cr_comment.get("id", 0) or 0)
+    code_review_created = str(cr_comment.get("created_at", ""))
+    code_review_updated = str(cr_comment.get("updated_at", ""))
+
+    # Test results from the selected test comment
+    test_evidence = (0, 0, False)
+    if test_comment_id > 0:
+        test_body = str(test_candidates[0].get("body", "") or "")
+        test_evidence = parse_test_results(test_body)
 
     # Gather successful build info
     successful_builds = [b for b in build_builds if b.success]
     if not successful_builds:
         return None
 
+    # Derive review_author_login from the selected trusted comment's user.login
+    selected_author_login = ""
+    for c in trusted_comments:
+        if int(c.get("id", 0) or 0) == anchor.comment_id:
+            user = c.get("user", {})
+            if isinstance(user, dict):
+                selected_author_login = str(user.get("login", ""))
+            break
+    if not selected_author_login:
+        selected_author_login = trusted_author_login  # fallback
+
     evidence = ReviewCommentEvidence(
         commit_prefix=build_commit,
         review_author_id=trusted_author_id,
-        review_author_login=str(
-            latest_build.get("user", {}).get("login", "")
-        ),
+        review_author_login=selected_author_login,
         builds=successful_builds,
-        build_comment_id=int(latest_build.get("id", 0) or 0),
-        build_comment_created_at=build_created,
-        build_comment_updated_at=build_updated,
+        build_comment_id=anchor.comment_id,
+        build_comment_created_at=anchor.created_at,
+        build_comment_updated_at=anchor.updated_at,
         test_comment_id=test_comment_id,
         test_comment_created_at=test_created,
+        test_comment_updated_at=test_updated,
         test_passed=test_evidence[0],
         test_failed=test_evidence[1],
         test_skipped=test_evidence[2],
         code_review_comment_id=code_review_comment_id,
         code_review_created_at=code_review_created,
-        code_review_text=code_review_text,
+        code_review_comment_updated_at=code_review_updated,
+        code_review_text=cr_text,
     )
 
     return evidence

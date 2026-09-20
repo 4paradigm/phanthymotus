@@ -4,10 +4,12 @@ Fail-closed, legacy commands unknown, per-machine owners, no duplicate POST.
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 import yaml
 
 from ..commands import parse_command
+from ..agent_core_client import AgentCoreClient, AgentCoreError
 from ..models import can_transition
 from ..policy import Policy, PolicyError, load_machines, MachineLoadError
 from .conftest import make_config
@@ -294,6 +296,7 @@ class TestAgentCoreClientSecurity:
             base_url="https://10.0.0.1:15678",
             node_host="10.0.0.1",
             tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+            access_token="secret-token-123",
         )
         headers = client._headers()
         assert headers.get("Authorization") == "Bearer secret-token-123"
@@ -305,6 +308,7 @@ class TestAgentCoreClientSecurity:
                     base_url="https://10.0.0.1:15678",
                     node_host="10.0.0.1",
                 tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+                    access_token="my-secret-token",
     )
             # The token is not stored directly on the instance
             assert not hasattr(client, "token_value")

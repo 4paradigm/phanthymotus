@@ -22,11 +22,14 @@ logger = logging.getLogger(__name__)
 COS_ROOT = "phanthymotus_pr/"
 EVIDENCE_MAX_ARCHIVE_BYTES = 10 * 1024 * 1024
 
+EVIDENCE_PRESIGNED_URL_TTL_SECONDS = 120
+
+
+
 # Repo directory mapping: full repo -> short directory name.
 _REPO_DIR_MAP = {
     "4paradigm/phanthymotus": "phanthymotus",
     "4paradigm/phanthymotus-driver": "phanthymotus-driver",
-    "Haohao-end/phanthymotus": "phanthymotus",
 }
 
 
@@ -57,6 +60,85 @@ class CosClient:
             isinstance(value, str) and bool(value.strip())
             for value in values
         )
+
+    def generate_evidence_download_url(
+        self,
+        object_key: str,
+    ) -> str:
+        """Generate a short-lived HTTPS presigned GET URL for an evidence object.
+
+        Returns empty string on failure (fail-closed).  Never leaks secrets.
+        """
+        if not object_key or not isinstance(object_key, str):
+            logger.warning(
+                "COS_EVIDENCE_PRESIGN=INVALID_KEY",
+            )
+            return ""
+        if object_key.startswith("/") or ".." in object_key or "\\" in object_key:
+            logger.warning(
+                "COS_EVIDENCE_PRESIGN=INVALID_KEY",
+            )
+            return ""
+        if not object_key.startswith(COS_ROOT):
+            logger.warning(
+                "COS_EVIDENCE_PRESIGN=INVALID_KEY",
+            )
+            return ""
+        if not self._has_credentials():
+            logger.warning(
+                "COS_EVIDENCE_PRESIGN=NO_CREDS",
+            )
+            return ""
+        try:
+            from qcloud_cos import CosConfig, CosS3Client  # type: ignore
+
+            sdk_config = CosConfig(
+                Region=self.config.cos_region,
+                SecretId=self.config.cos_secret_id,
+                SecretKey=self.config.cos_secret_key,
+                Token=None,
+            )
+            client = CosS3Client(sdk_config)
+            url = client.get_presigned_url(
+                Method="GET",
+                Bucket=self.config.cos_bucket,
+                Key=object_key,
+                Expired=EVIDENCE_PRESIGNED_URL_TTL_SECONDS,
+            )
+            if not url:
+                logger.warning(
+                    "COS_EVIDENCE_PRESIGN=EMPTY_URL",
+                )
+                return ""
+            if not url.startswith("https://"):
+                logger.warning(
+                    "COS_EVIDENCE_PRESIGN=NOT_HTTPS",
+                )
+                return ""
+            import urllib.parse as _urllib
+            _parsed = _urllib.urlparse(url)
+            if not _parsed.scheme or _parsed.scheme != "https":
+                logger.warning(
+                    "COS_EVIDENCE_PRESIGN=INVALID_SCHEME",
+                )
+                return ""
+            if not _parsed.hostname:
+                logger.warning(
+                    "COS_EVIDENCE_PRESIGN=NO_HOST",
+                )
+                return ""
+            if _parsed.username is not None or _parsed.password is not None:
+                logger.warning(
+                    "COS_EVIDENCE_PRESIGN=CREDENTIALS_IN_URL",
+                )
+                return ""
+            return url
+        except Exception as exc:
+            logger.warning(
+                "COS_EVIDENCE_PRESIGN=FAILED error=%s",
+                type(exc).__name__,
+            )
+            return ""
 
     def build_object_key(
         self,

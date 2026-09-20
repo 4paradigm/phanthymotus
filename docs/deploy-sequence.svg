@@ -265,8 +265,8 @@
     <text x="1004" y="2667" text-anchor="middle" class="mono msg">object_key + sha256 + size</text>
 
     <path d="M712 2722 L307 2722" class="green"/>
-    <text x="510" y="2713" text-anchor="middle" class="mono msgStrong">Download COS evidence → Deploy Approval OAuth/PKCE → private COS HEAD/GET → verified attachment</text>
-    <text x="510" y="2740" text-anchor="middle" class="mono small">Download URL carries only repo + PR + full HEAD; no presigned COS URL</text>
+    <text x="510" y="2713" text-anchor="middle" class="mono msgStrong">Download COS evidence -> 120-second HTTPS presigned GET URL -> private COS object</text>
+    <text x="510" y="2740" text-anchor="middle" class="mono small">Temporary bearer access; URL not persisted; bucket remains private</text>
   </g>
 
   <line x1="40" y1="2780" x2="1360" y2="2780" stroke="#E7E5E4"/>

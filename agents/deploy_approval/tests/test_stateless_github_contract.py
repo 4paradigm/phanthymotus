@@ -18,10 +18,7 @@ from ..service import DeployController, DeployControllerError
 def config():
     return Config(
 
-        github_repos=["repo"],
-        deploy_approval_public_base_url="https://deploy.example",
-        github_oauth_client_id="test-client",
-        github_oauth_client_secret="test-secret",
+        github_repos=["4paradigm/phanthymotus"],
         machine_owners_file="/dev/null",
         poll_interval_seconds=30,
         registry="registry.example",

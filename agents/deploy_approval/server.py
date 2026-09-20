@@ -21,7 +21,6 @@ from .github_command_watcher import GitHubCommandWatcher
 from .policy import Policy
 from .registry_client import RegistryClient
 from .router_webhook import router as webhook_router
-from .evidence_download import evidence_router
 from .service import DeployController
 
 logging.basicConfig(
@@ -268,7 +267,6 @@ def create_app(config: Config | None = None):
         return {"status": "ok"}
 
     app.include_router(webhook_router)
-    app.include_router(evidence_router)
     return app
 
 

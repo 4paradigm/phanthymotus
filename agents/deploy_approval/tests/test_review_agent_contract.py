@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 import textwrap
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -780,7 +780,7 @@ class TestShortSHAResolution:
             return await client.resolve_commit_sha("owner/repo", "abcdef1")
 
         import asyncio
-        resolved = asyncio.get_event_loop().run_until_complete(_run())
+        resolved = asyncio.run(_run())
         assert resolved == "abcdef1234567890abcdef1234567890abcdef12"
 
     def test_resolved_sha_must_equal_fresh_pr_head(self):
@@ -803,48 +803,42 @@ class TestShortSHAResolution:
 
     def test_short_sha_resolution_404_fails_closed(self):
         """GitHub returns 404 for ambiguous/missing short SHA => fail closed."""
-        from agents.deploy_approval.github_client import GitHubClient
+        import asyncio
+        from agents.deploy_approval.github_client import GitHubClient, GitHubError
 
         mock_config = MagicMock()
         mock_config.github_api_url = "https://api.github.com"
         client = GitHubClient(mock_config, token_provider=AsyncMock(return_value="token"))
-        client._http = MagicMock()
-
-        resp = MagicMock()
-        resp.status_code = 404
-        client._http.send.return_value = resp
 
         async def _run():
-            return await client.resolve_commit_sha("owner/repo", "badsha9")
-
-        import asyncio
-        from agents.deploy_approval.github_client import GitHubError
+            with patch.object(client, "_request", new=AsyncMock(side_effect=GitHubError("404"))):
+                return await client.resolve_commit_sha("owner/repo", "badsha9")
 
         with pytest.raises(GitHubError):
-            asyncio.get_event_loop().run_until_complete(_run())
+            asyncio.run(_run())
 
     def test_short_sha_resolution_malformed_fails_closed(self):
         """Malformed response from GitHub => fail closed."""
-        from agents.deploy_approval.github_client import GitHubClient
+        import asyncio
+        import httpx
+        from agents.deploy_approval.github_client import GitHubClient, GitHubError
 
         mock_config = MagicMock()
         mock_config.github_api_url = "https://api.github.com"
         client = GitHubClient(mock_config, token_provider=AsyncMock(return_value="token"))
-        client._http = MagicMock()
-
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.json.return_value = {"not_sha": "xyz"}
-        client._http.send.return_value = resp
 
         async def _run():
-            return await client.resolve_commit_sha("owner/repo", "abcdef1")
-
-        import asyncio
-        from agents.deploy_approval.github_client import GitHubError
+            fake_resp = MagicMock(spec=httpx.Response)
+            fake_resp.read = AsyncMock(return_value=b'{"not_sha": "xyz"}')
+            fake_resp.status_code = 200
+            async def araise_for_status():
+                pass
+            fake_resp.raise_for_status = araise_for_status
+            with patch.object(client, "_request", new=AsyncMock(return_value=fake_resp)):
+                return await client.resolve_commit_sha("owner/repo", "abcdef1")
 
         with pytest.raises(GitHubError):
-            asyncio.get_event_loop().run_until_complete(_run())
+            asyncio.run(_run())
 
     def test_old_head_build_comment_rejected(self):
         """Build comment for old HEAD is not selected."""

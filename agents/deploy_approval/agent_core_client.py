@@ -538,10 +538,7 @@ class AgentCoreClient:
             return result
         logs = inner.get("logs")
         if "status" in inner and isinstance(logs, str):
-            result: dict[str, Any] = {"running_image": ""}
-            if logs:
-                result["logs"] = logs
-            return result
+            return {"running_image": ""}
         raise AgentCoreError(
             "agent-core driver_status missing running_image for no-container shape"
         )

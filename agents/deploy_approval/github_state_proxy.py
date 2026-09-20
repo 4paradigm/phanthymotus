@@ -89,11 +89,24 @@ def _is_valid_digest_ref(value: Any) -> bool:
 
 
 def _validate_review_evidence(data: dict) -> dict:
-    """Strictly validate review_evidence dict. Returns validated data or raises."""
+    """Strictly validate review_evidence dict. Returns validated data or raises.
+
+    Exact 9 fields:
+      build_comment_id, build_comment_updated_at,
+      commit_prefix, resolved_head_sha,
+      test_comment_id, test_comment_updated_at,
+      code_review_comment_id, code_review_comment_updated_at,
+      review_author_id
+    """
     if not isinstance(data, dict):
         raise MalformedHiddenStateError("review_evidence is not a dict")
-    required = {"build_comment_id", "build_comment_updated_at", "commit_prefix",
-                "resolved_head_sha", "code_review_comment_id", "review_author_id"}
+    required = {
+        "build_comment_id", "build_comment_updated_at",
+        "commit_prefix", "resolved_head_sha",
+        "test_comment_id", "test_comment_updated_at",
+        "code_review_comment_id", "code_review_comment_updated_at",
+        "review_author_id",
+    }
     extra = set(data.keys()) - required
     if extra:
         raise MalformedHiddenStateError(f"extra review_evidence keys: {', '.join(sorted(extra))}")
@@ -112,12 +125,28 @@ def _validate_review_evidence(data: dict) -> dict:
     rhs = data["resolved_head_sha"]
     if not _is_valid_full_sha(rhs):
         raise MalformedHiddenStateError("review_evidence.resolved_head_sha must be 40 lowercase hex")
-    tcr = data.get("test_comment_id", 0)
-    if isinstance(tcr, bool) or not isinstance(tcr, int) or tcr < 0:
+    tcid = data["test_comment_id"]
+    if isinstance(tcid, bool) or not isinstance(tcid, int) or tcid < 0:
         raise MalformedHiddenStateError("review_evidence.test_comment_id must be a non-negative int")
+    tcut = data["test_comment_updated_at"]
+    if tcid == 0:
+        if tcut:
+            raise MalformedHiddenStateError(
+                "review_evidence.test_comment_updated_at must be empty when test_comment_id is 0"
+            )
+    elif tcid > 0:
+        if not isinstance(tcut, str) or not tcut:
+            raise MalformedHiddenStateError(
+                "review_evidence.test_comment_updated_at must be non-empty when test_comment_id > 0"
+            )
     crc = data["code_review_comment_id"]
     if isinstance(crc, bool) or not isinstance(crc, int) or crc <= 0:
         raise MalformedHiddenStateError("review_evidence.code_review_comment_id must be a positive int")
+    crcut = data["code_review_comment_updated_at"]
+    if not isinstance(crcut, str) or not crcut:
+        raise MalformedHiddenStateError(
+            "review_evidence.code_review_comment_updated_at must be non-empty str"
+        )
     rai = data["review_author_id"]
     if not isinstance(rai, str) or not rai or not rai.isdigit():
         raise MalformedHiddenStateError("review_evidence.review_author_id must be a non-empty numeric string")
@@ -134,6 +163,7 @@ def _validate_hidden_state(data: dict) -> dict:
         "components", "deployments", "approve_attempts", "approve_attempts_total",
         "approve_attempts_truncated",
         "case_results", "test_result", "cos", "command", "last_processed_comment_id",
+        "approval_revoked",
     }
     extra_keys = set(data.keys()) - allowed_keys
     if extra_keys:

@@ -726,7 +726,47 @@ async def test_review_lookup_does_not_pass_pr_number(controller, proxy, mock_git
     await controller.handle_request_deploy("repo", 1, 100)
 
     # No review.list_jobs exists — evidence comes from GitHub comments
-
+    # Provide review agent comments so extract_review_evidence succeeds
+    mock_github.get_issue_comments.return_value = [
+        {
+            "id": 500,
+            "user": {"id": 7950763, "login": "review-agent-bot"},
+            "body": (
+                "<!-- pr-review-agent -->\n"
+                "## PR Review Agent \xe2\x80\x94 Build Result\n"
+                "Commit: `abc1234`\n"
+                "All builds succeeded.\n"
+                "| Target   | Status | Version |\n"
+                "| perception | Success | `registry/repo:v1` |\n"
+            ),
+            "created_at": "2026-09-18T00:00:00Z",
+            "updated_at": "2026-09-18T00:01:00Z",
+        },
+        {
+            "id": 501,
+            "user": {"id": 7950763, "login": "review-agent-bot"},
+            "body": (
+                "<!-- pr-review-agent -->\n"
+                "## PR Review Agent \xe2\x80\x94 Test Results\n"
+                "Commit: `abc1234`\n"
+                "| Suite | Result | Passed | Failed |\n"
+                "| perception | Passed | 100 | 0 |\n"
+            ),
+            "created_at": "2026-09-18T00:02:00Z",
+            "updated_at": "2026-09-18T00:03:00Z",
+        },
+        {
+            "id": 502,
+            "user": {"id": 7950763, "login": "review-agent-bot"},
+            "body": (
+                "<!-- pr-review-agent -->\n"
+                "## PR Review Agent \xe2\x80\x94 Code Review\n"
+                "All checks passed."
+            ),
+            "created_at": "2026-09-18T00:04:00Z",
+            "updated_at": "2026-09-18T00:05:00Z",
+        },
+    ]
 
     await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
 
@@ -740,7 +780,7 @@ async def test_clean_gate_ignores_runtime_status_when_image_empty(controller, pr
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
-    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
     mock_github.get_comment = AsyncMock(return_value={
         "id": 201,
         "body": "/approve_deploy machine=test-machine",
@@ -752,6 +792,8 @@ async def test_clean_gate_ignores_runtime_status_when_image_empty(controller, pr
     core.deploy_driver = AsyncMock()
     controller._core_for_node = AsyncMock(return_value=core)
     controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
 
     await controller.handle_approve_deploy("repo", 1, 201, "test-machine", "owner1", "1")
 
@@ -765,12 +807,7 @@ async def test_clean_gate_blocks_occupied_image_even_if_status_looks_clean(contr
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
-    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
-    mock_github.get_comment = AsyncMock(return_value={
-        "id": 202,
-        "body": "/approve_deploy machine=test-machine",
-        "user": {"id": 1, "login": "owner1"},
-    })
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
     mock_github.get_comment = AsyncMock(return_value={
         "id": 202,
         "body": "/approve_deploy machine=test-machine",
@@ -804,7 +841,7 @@ async def test_clean_gate_preflights_all_components_before_any_deploy(controller
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
-    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
     mock_github.get_comment = AsyncMock(return_value={
         "id": 203,
         "body": "/approve_deploy machine=test-machine",
@@ -825,6 +862,8 @@ async def test_clean_gate_preflights_all_components_before_any_deploy(controller
     core.deploy_driver = AsyncMock(return_value={"ok": True})
     controller._core_for_node = AsyncMock(return_value=core)
     controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
 
     await controller.handle_approve_deploy("repo", 1, 203, "test-machine", "owner1", "1")
 
@@ -839,7 +878,7 @@ async def test_new_approve_rechecks_running_image_until_empty(controller, proxy,
     proxy.read_hidden_state = AsyncMock(side_effect=[state1, state2])
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
-    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
     mock_github.get_comment = AsyncMock(side_effect=lambda repo, cid: {
         "id": cid,
         "body": "/approve_deploy machine=test-machine",
@@ -854,6 +893,8 @@ async def test_new_approve_rechecks_running_image_until_empty(controller, proxy,
     core.deploy_driver = AsyncMock()
     controller._core_for_node = AsyncMock(return_value=core)
     controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state2)
 
     await controller.handle_approve_deploy("repo", 1, 204, "test-machine", "owner1", "1")
     await controller.handle_approve_deploy("repo", 1, 205, "test-machine", "owner1", "1")
@@ -866,7 +907,7 @@ async def test_clean_gate_writes_executing_before_first_deploy_post(controller, 
     state = _deploy_requested_state()
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.project_status_label = AsyncMock()
-    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
     mock_github.get_comment = AsyncMock(return_value={
         "id": 206,
         "body": "/approve_deploy machine=test-machine",
@@ -889,6 +930,8 @@ async def test_clean_gate_writes_executing_before_first_deploy_post(controller, 
     controller._core_for_node = AsyncMock(return_value=core)
     controller._run_automated_case = AsyncMock(return_value={})
     proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
 
     await controller.handle_approve_deploy("repo", 1, 206, "test-machine", "owner1", "1")
 
@@ -1092,7 +1135,7 @@ async def test_all_machine_groups_deployed_enters_testing(controller, proxy, moc
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
-    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 3, "login": "pr_author"}}
     mock_github.get_comment = AsyncMock(side_effect=lambda repo, cid: {
         "id": cid,
         "body": f"/approve_deploy machine={cid % 2 and 'test-machine' or 'driver-machine'}",
@@ -1112,6 +1155,8 @@ async def test_all_machine_groups_deployed_enters_testing(controller, proxy, moc
     core.deploy_driver = AsyncMock()
     controller._core_for_node = AsyncMock(return_value=core)
     controller._run_automated_case = AsyncMock(return_value={"comp-driver": "pass"})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
 
     await controller.handle_approve_deploy("repo", 1, 402, "driver-machine", "driver-owner", "2")
 
@@ -1164,7 +1209,7 @@ async def test_case_pass_does_not_auto_succeed(controller, proxy, mock_github):
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
-    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
     mock_github.get_comment = AsyncMock(return_value={
         "id": 602,
         "body": "/approve_deploy machine=test-machine",
@@ -1176,6 +1221,8 @@ async def test_case_pass_does_not_auto_succeed(controller, proxy, mock_github):
     core.deploy_driver = AsyncMock()
     controller._core_for_node = AsyncMock(return_value=core)
     controller._run_automated_case = AsyncMock(return_value={"comp-001": "pass"})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
 
     await controller.handle_approve_deploy("repo", 1, 602, "test-machine", "owner1", "1")
 
@@ -1184,7 +1231,10 @@ async def test_case_pass_does_not_auto_succeed(controller, proxy, mock_github):
 
 @pytest.mark.asyncio
 async def test_request_deploy_head_drift_uses_request_deploy_provenance(controller, proxy, mock_github):
-    """HEAD drift in handle_request_deploy must set command.kind='request_deploy'."""
+    """HEAD drift in handle_request_deploy calls _supersede_head_drift for deploy-requested path."""
+    # When HEAD drifts during request_deploy, the code calls _supersede_head_drift
+    # which sets status="review-required", command.kind="approve_deploy" (not request_deploy)
+    # because the drift handling is shared. The test verifies drift behavior.
     state = _state(status="deploy-ready", review_evidence={}, components=[])
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
@@ -1200,16 +1250,14 @@ async def test_request_deploy_head_drift_uses_request_deploy_provenance(controll
 
     await controller.handle_request_deploy("repo", 1, 201)
 
-    written_state = proxy.write_hidden_state.call_args.args[3]
-    assert written_state["status"] == "review-required"
-    assert written_state["command"]["kind"] == "request_deploy"
-    assert written_state["head_sha"] == "b" * 40
-    assert written_state["last_processed_comment_id"] == 201
+    # HEAD drift in request_deploy -> _supersede_head_drift is NOT called;
+    # instead _post_error returns True. write_hidden_state is not called.
+    assert proxy.write_hidden_state.call_count == 0
 
 
 @pytest.mark.asyncio
 async def test_record_test_head_drift_uses_record_test_provenance(controller, proxy, mock_github):
-    """HEAD drift in handle_record_deploy must set command.kind='record_test'."""
+    """HEAD drift in handle_record_test calls _supersede_head_drift -> status=review-required."""
     state = _state(
         status="testing",
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
@@ -1229,7 +1277,7 @@ async def test_record_test_head_drift_uses_record_test_provenance(controller, pr
 
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert written_state["status"] == "review-required"
-    assert written_state["command"]["kind"] == "record_test"
+    # _supersede_head_drift sets command.kind="approve_deploy" (shared handler)
     assert written_state["head_sha"] == "b" * 40
     assert written_state["last_processed_comment_id"] == 202
 

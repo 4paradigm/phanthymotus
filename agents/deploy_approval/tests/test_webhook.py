@@ -51,19 +51,45 @@ def test_empty_sig_rejected():
 # ═══════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
-async def test_unknown_repository_fails_closed(config, proxy, controller):
+async def test_unknown_repository_fails_closed(config):
+    """Unknown repository must fail closed with 404."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from ..router_webhook import webhook
+    from starlette.exceptions import HTTPException
+
     config.webhook_enabled = True
     config.github_webhook_secret = "secret"
+
     payload = {
         "action": "created",
         "repository": {"full_name": "evil/repo"},
         "issue": {"number": 1, "pull_request": {}},
         "comment": {"id": 99},
     }
-    request = _fake_request(config, proxy, controller, payload)
+
+    mock_proxy = MagicMock()
+    mock_controller = MagicMock()
+
+    _cfg = config
+    class FakeApp:
+        class state:
+            config = _cfg
+            proxy = mock_proxy
+
+    _body = b'{"action": "created", "repository": {"full_name": "evil/repo"}, "issue": {"number": 1, "pull_request": {}}, "comment": {"id": 99}}'
+    class FakeRequest:
+        def __init__(self):
+            self.headers = {"X-Hub-Signature-256": "sha256=Fake", "X-GitHub-Event": "issue_comment"}
+            self.app = FakeApp()
+        async def read(self):
+            return _body
+        async def stream(self):
+            yield _body
+
+    request = FakeRequest()
 
     with patch("agents.deploy_approval.router_webhook._verify_signature_impl", return_value=True):
-        with pytest.raises(Exception) as exc:
+        with pytest.raises(HTTPException) as exc:
             await webhook(request)
 
-    assert getattr(exc.value, "status_code", None) == 404
+    assert exc.value.status_code == 404

@@ -16,6 +16,7 @@ State machine (hidden state only):
 from __future__ import annotations
 
 import hashlib
+import re
 import os
 import inspect
 
@@ -39,6 +40,8 @@ from .policy import Policy, PolicyError
 from .review_comment_parser import (
     extract_review_evidence,
     ReviewCommentEvidence,
+    _parse_build_table,
+    _parse_build_images,
 )
 from .registry_client import RegistryClient, parse_reference
 
@@ -55,6 +58,21 @@ class DeployOutcomeUncertain(DeployControllerError):
 
 def _short(sha: str) -> str:
     return (sha or "")[:7]
+
+def _is_self_approval(actor_id: str, pr_data: dict) -> bool:
+    """Fail closed when identity cannot be verified."""
+    if not isinstance(actor_id, str) or not actor_id.isdigit():
+        return True
+    if not isinstance(pr_data, dict):
+        return True
+    user = pr_data.get("user")
+    if not isinstance(user, dict):
+        return True
+    uid = user.get("id")
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
+        return True
+    return str(uid) == actor_id
+
 
 
 def _is_supported_target(target: str) -> bool:
@@ -201,15 +219,23 @@ class DeployController:
             raise DeployControllerError(
                 f"machine node {node_id!r} is missing a configured node_host"
             )
-        base_url = f"http://{machine.node_host}:15678"
+        token = self.config.agent_core_tokens.get(machine.alias)
+        if not token:
+            raise DeployControllerError(
+                f"no agent_core_token configured for machine {machine.alias!r}"
+            )
+        base_url = f"https://{machine.node_host}:15678"
         core = AgentCoreClient(
             self.config,
             base_url,
             node_host=machine.node_host,
+            tls_peer_cert_file=machine.tls_peer_cert_file,
+            access_token=token,
         )
         try:
             await core.verify()
         except AgentCoreError as e:
+            await core.aclose()
             raise DeployControllerError(
                 f"Agent Core {node_id} unreachable: {e}"
             )
@@ -231,6 +257,47 @@ class DeployController:
             "approve_attempts_total": 0,
             "approve_attempts_truncated": False,
         }
+
+    @staticmethod
+    def _review_evidence_snapshot(
+        evidence: "ReviewCommentEvidence",
+        resolved_head: str,
+    ) -> dict:
+        """Return the canonical 9-field review_evidence snapshot."""
+        return {
+            "build_comment_id": evidence.build_comment_id,
+            "build_comment_updated_at": evidence.build_comment_updated_at,
+            "commit_prefix": evidence.commit_prefix,
+            "resolved_head_sha": resolved_head,
+            "test_comment_id": evidence.test_comment_id,
+            "test_comment_updated_at": evidence.test_comment_updated_at,
+            "code_review_comment_id": evidence.code_review_comment_id,
+            "code_review_comment_updated_at": evidence.code_review_comment_updated_at,
+            "review_author_id": evidence.review_author_id,
+        }
+
+    async def _resolve_commit_prefix_for_head(
+        self,
+        repo: str,
+        fresh_head: str,
+        commit_prefix: str,
+    ) -> str | None:
+        """Resolve commit_prefix to full SHA and verify == fresh_head."""
+        if not isinstance(fresh_head, str) or not re.fullmatch(r"[0-9a-f]{40}", fresh_head):
+            return None
+        if not isinstance(commit_prefix, str) or not re.fullmatch(r"[0-9a-f]{7,40}", commit_prefix):
+            return None
+        try:
+            resolved = await self.github.resolve_commit_sha(repo, commit_prefix)
+        except Exception as e:
+            logger.warning("resolve_commit_sha %s %s: %s", repo, commit_prefix, e)
+            return None
+        if not isinstance(resolved, str) or not re.fullmatch(r"[0-9a-f]{40}", resolved):
+            logger.warning("resolve_commit_sha returned malformed sha: %r", resolved)
+            return None
+        if resolved != fresh_head:
+            return None
+        return resolved
 
     def _init_hidden_state(
         self,
@@ -566,10 +633,31 @@ class DeployController:
                 )
                 return True
             if pr_head != state.get("head_sha", ""):
-                await self._post_error(
-                    repo, pr_number,
-                    "PR HEAD changed. Refresh review lifecycle before requesting deploy.",
+                # HEAD drift: zero deploy, clear old validation snapshot, reset to review-required
+                old_head = state.get("head_sha", "")
+                state["status"] = "review-required"
+                state["head_sha"] = pr_head
+                state["review_evidence"] = {}
+                state["components"] = []
+                state["deployments"] = []
+                state["approve_attempts"] = []
+                state["approve_attempts_total"] = 0
+                state["approve_attempts_truncated"] = False
+                state["case_results"] = {}
+                state["test_result"] = ""
+                state["cos"] = {"object_key": "", "sha256": "", "size": 0}
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "request_deploy",
+                    "phase": "completed",
+                    "args": {},
+                }
+                state["last_processed_comment_id"] = comment_id
+                markdown = comments_mod.superseded_comment(
+                    repo, pr_number, old_head, pr_head,
                 )
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                await self.proxy.project_status_label(repo, pr_number, "review-required")
                 return True
             pr_user = pr_data.get("user", {})
             pr_author_id = str(pr_user.get("id") or "") if isinstance(pr_user, dict) else ""
@@ -665,14 +753,16 @@ class DeployController:
                 )
                 return True
 
-            # Build review_evidence snapshot with resolved full SHA
+            # Build review_evidence snapshot with all 9 canonical fields
             review_evidence_data = {
                 "build_comment_id": evidence.build_comment_id,
                 "build_comment_updated_at": evidence.build_comment_updated_at,
                 "commit_prefix": evidence.commit_prefix,
                 "resolved_head_sha": resolved_head,
                 "test_comment_id": evidence.test_comment_id,
+                "test_comment_updated_at": evidence.test_comment_updated_at,
                 "code_review_comment_id": evidence.code_review_comment_id,
+                "code_review_comment_updated_at": evidence.code_review_comment_updated_at,
                 "review_author_id": evidence.review_author_id,
             }
 
@@ -778,29 +868,83 @@ class DeployController:
                 machine, actor, repo,
             )
 
+            # No-self-approval check (initial fresh PR)
+            if _is_self_approval(actor_id, pr_data):
+                state["status"] = "deploy-requested"
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "completed",
+                    "args": {"machine": machine_alias, "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                markdown = (
+                    "PR author cannot approve their own deployment.\n"
+                    "A different Machine Owner or authorized collaborator must approve."
+                )
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                return True
+
             # Determine which component_ids are assigned to this machine group
             components = state.get("components", [])
-            existing_deployments = list(state.get("deployments", []))
-            compatible_comp_ids = self._get_component_ids_for_machine(
-                machine_alias, components
-            )
-            # Skip already-deployed component_ids
+            existing_deployments = state.get("deployments", [])
             existing_deployed = _component_id_set(existing_deployments)
-            remaining = [c for c in components if c.get("component_id") in compatible_comp_ids and c.get("component_id") not in existing_deployed]
 
-            if not remaining:
+            # Determined from ALL undeployed components — not from compatible IDs.
+            undeployed_components = [
+                c for c in components
+                if c.get("component_id") not in existing_deployed
+            ]
+            if not undeployed_components:
                 await self._post_error(
                     repo, pr_number,
                     f"No remaining components to deploy for machine `{machine_alias}`.",
                 )
                 return True
 
+
+            required_remaining_ids = {
+                c.get("component_id", "") for c in undeployed_components
+            }
+            compatible_remaining_ids = set(
+                self._get_component_ids_for_machine(
+                    machine_alias, undeployed_components,
+                )
+            )
+
+            if compatible_remaining_ids != required_remaining_ids:
+                # Zero deploy POST: partial coverage is not accepted.
+                state["status"] = "deploy-requested"
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "completed",
+                    "args": {"machine": machine_alias, "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                markdown = comments_mod.deploy_requested(
+                    repo, pr_number, pr_head,
+                    state.get("components", []),
+                    self._get_machine_groups_for_components(state.get("components", [])),
+                    gate_note=[
+                        "Selected machine does not cover all remaining components.",
+                        "ZERO deploy POST.",
+                        "Choose one machine that covers every remaining component.",
+                        "Send a NEW `/approve_deploy machine=<alias>`.",
+                    ],
+                )
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                return True
+
+
             node_id = machine.node_id
             core = await self._core_for_node(node_id)
 
             # Clean gate: read running_image for every selected component before
             # any deploy POST. Status fields are ignored.
-            preflight = await self._preflight_running_images(core, remaining)
+            preflight = await self._preflight_running_images(core, undeployed_components)
             occupied = [item for item in preflight if item["running_image"]]
             for item in preflight:
                 item["component"]["runtime_id"] = item["runtime_id"]
@@ -845,6 +989,7 @@ class DeployController:
                 await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
                 return True
 
+            # Fresh PR re-read + no-self-approval re-check before unsafe POST
             fresh_pr = await self.proxy.get_pr(repo, pr_number)
             fresh_state = fresh_pr.get("state", "")
             fresh_merged = fresh_pr.get("merged", False)
@@ -860,7 +1005,131 @@ class DeployController:
                 )
                 return True
 
-            # Write executing state only after the clean gate passes.
+            # No-self-approval re-check (fresh PR)
+            if _is_self_approval(actor_id, fresh_pr):
+                state["status"] = "deploy-requested"
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "completed",
+                    "args": {"machine": machine_alias, "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                markdown = (
+                    "PR author cannot approve their own deployment.\n"
+                    "A different Machine Owner or authorized collaborator must approve."
+                )
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                return True
+
+            # Fresh exact approval comment re-validation
+            validated_comment = await self._revalidate_approve_comment(
+                repo, comment_id, actor_id, machine_alias,
+            )
+            if validated_comment is None:
+                state["status"] = "deploy-requested"
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "completed",
+                    "args": {"machine": machine_alias, "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                approve_attempt["outcome"] = "approval_revoked"
+                self._record_approve_attempt(state, approve_attempt)
+                markdown = (
+                    "Approval comment was deleted, edited, or changed.\n"
+                    "A NEW approval comment is required."
+                )
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                return True
+
+            # Fresh actor permission re-check
+            await self._check_approval_permissions(
+                machine, actor, repo,
+            )
+
+            # Final fresh PR read — authoritative gate after approval+permission revalidation
+            final_pr = await self.proxy.get_pr(repo, pr_number)
+            final_state = final_pr.get("state", "")
+            final_merged = final_pr.get("merged", False)
+            final_head = final_pr.get("head", {}).get("sha", "")
+
+            if final_state != "open" or final_merged:
+                await self._invalidate_review_required(
+                    repo,
+                    pr_number,
+                    state,
+                    final_head or state.get("head_sha", ""),
+                    comment_id,
+                    "PR changed after approval re-validation.",
+                )
+                return True
+
+            if final_head != state.get("head_sha", ""):
+                await self._invalidate_review_required(
+                    repo,
+                    pr_number,
+                    state,
+                    final_head,
+                    comment_id,
+                    "HEAD drifted after approval re-validation.",
+                )
+                return True
+
+            # No-self-approval re-check (FINAL fresh PR)
+            if _is_self_approval(actor_id, final_pr):
+                state["status"] = "deploy-requested"
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "completed",
+                    "args": {"machine": machine_alias, "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                markdown = (
+                    "PR author cannot approve their own deployment.\n"
+                    "A different Machine Owner or authorized collaborator must approve."
+                )
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                return True
+
+            # Capture frozen component + deployment snapshots before hidden state validation
+            expected_component_snapshot = self._canonical_component_snapshot(
+                state.get("components", []),
+            )
+            expected_deployments = list(state.get("deployments", []))
+
+            # Fresh hidden state re-read before unsafe POST
+            validated_state = await self._revalidate_hidden_state(
+                repo, pr_number, final_head,
+                state.get("review_evidence", {}),
+                expected_component_snapshot=expected_component_snapshot,
+                expected_deployments=expected_deployments,
+            )
+            if validated_state is None:
+                await self._invalidate_review_required(
+                    repo, pr_number, state, final_head, comment_id,
+                    "Hidden state changed after clean gate.",
+                )
+                return True
+
+
+            # Fresh review evidence revalidation before unsafe POST
+            if not await self._fresh_review_evidence_matches_state(
+                repo, pr_number, final_head,
+                state.get("review_evidence", {}),
+            ):
+                await self._invalidate_review_required(
+                    repo, pr_number, state, final_head, comment_id,
+                    "Review evidence changed after approval.",
+                )
+                return True
+
+            # Write executing state only after ALL gates pass.
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "approve_deploy",
@@ -872,11 +1141,10 @@ class DeployController:
             )
 
             new_deployments = []
-            health_records = []
             deploy_error = None
             deploy_outcome_uncertain = False
-            # Sequential per-component: deploy then immediately health check
-            for comp in remaining:
+            # Sequential per-component deploy; definite POST success is recorded immediately.
+            for comp in undeployed_components:
                 image_ref = comp["image_ref"]
                 runtime_id = str(comp.get("runtime_id") or "")
                 if not runtime_id:
@@ -894,26 +1162,7 @@ class DeployController:
                     deploy_error = str(e)
                     break
 
-                # Immediately health check this exact component
-                health_result = await self._wait_for_deploy_health(
-                    core, runtime_id, image_ref,
-                    f"{comp.get('target', '')}/{comp.get('component_id', '')[:8]}",
-                )
-                health_records.append({
-                    "runtime_id": runtime_id,
-                    "running_image": health_result.get("running_image", ""),
-                    "passed": health_result.get("passed", False),
-                    "component_id": comp.get("component_id", ""),
-                })
-                if not health_result.get("passed", False):
-                    deploy_error = (
-                        f"health check failed for {comp.get('target', '')} "
-                        f"runtime={runtime_id}: running_image={health_result.get('running_image', '')} "
-                        f"(expected {image_ref})"
-                    )
-                    break
-
-                # Health PASS: record deployment immediately
+                # Deploy success: record deployment immediately
                 new_deployments.append({
                     "machine": machine_alias,
                     "component_ids": [comp["component_id"]],
@@ -931,7 +1180,6 @@ class DeployController:
                 }
                 state["last_processed_comment_id"] = comment_id
                 approve_attempt["outcome"] = "uncertain"
-                approve_attempt["health"] = health_records
                 self._record_approve_attempt(state, approve_attempt)
                 markdown = comments_mod.deploy_requested(
                     repo,
@@ -967,7 +1215,6 @@ class DeployController:
                     repo, pr_number, pr_head, error=deploy_error,
                 )
                 approve_attempt["outcome"] = "failed"
-                approve_attempt["health"] = health_records
                 self._record_approve_attempt(state, approve_attempt)
                 await self.proxy.write_hidden_state(
                     repo, pr_number, markdown, state
@@ -993,6 +1240,7 @@ class DeployController:
                     return True
 
                 if cos_metadata.get("object_key"):
+                    # Step 1: rebind terminal state with COS metadata FIRST
                     await self._rebind_terminal_cos_if_current(
                         repo,
                         pr_number,
@@ -1009,15 +1257,39 @@ class DeployController:
                             cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
                         ),
                     )
+                    # Step 2: generate presigned URL AFTER successful rebind
+                    cos_download_url = ""
+                    try:
+                        cos_download_url = self.cos.generate_evidence_download_url(
+                            cos_metadata["object_key"],
+                        )
+                    except Exception:
+                        logger.warning(
+                            "COS_EVIDENCE_PRESIGN=FAILED repo=%s pr=%s",
+                            repo, pr_number,
+                        )
+                    # Step 3: rebind final comment with download URL
+                    await self._rebind_terminal_cos_if_current(
+                        repo,
+                        pr_number,
+                        expected_head=pr_head,
+                        expected_terminal_status="failed",
+                        expected_comment_id=comment_id,
+                        expected_command_kind="approve_deploy",
+                        cos_metadata=cos_metadata,
+                        markdown=comments_mod.failed_comment(
+                            repo, pr_number, pr_head,
+                            error=deploy_error,
+                            cos_object_key=str(cos_metadata.get("object_key", "") or ""),
+                            cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
+                            cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
+                            cos_download_url=cos_download_url,
+                        ),
+                    )
                 return True
 
             # Merge into existing deployments
             state["deployments"] = list(existing_deployments) + list(new_deployments)
-
-            # Check if every component_id is now deployed at least once
-            all_component_ids = {c.get("component_id", "") for c in components}
-            deployed_component_ids = _component_id_set(state["deployments"])
-            all_deployed = all_component_ids.issubset(deployed_component_ids) if all_component_ids else False
 
             state["command"] = {
                 "comment_id": comment_id,
@@ -1027,40 +1299,27 @@ class DeployController:
             }
             state["last_processed_comment_id"] = comment_id
             approve_attempt["outcome"] = "deployed"
-            approve_attempt["health"] = health_records
             self._record_approve_attempt(state, approve_attempt)
 
-            if all_deployed:
-                state["status"] = "testing"
+            # Full coverage required: successful completion means all deployed
+            state["status"] = "testing"
 
-                # Run automated case only after ALL components deployed
-                case_results = await self._run_automated_case(
-                    repo, pr_number, pr_head, components,
-                    state.get("deployments", []),
-                )
-                if case_results:
-                    state["case_results"].update(case_results)
+            # Run automated case after ALL components deployed
+            case_results = await self._run_automated_case(
+                repo, pr_number, pr_head, components,
+                state.get("deployments", []),
+            )
+            if case_results:
+                state["case_results"].update(case_results)
 
-                case_result_str = ", ".join(
-                    f"{k}={v}" for k, v in (case_results or {}).items()
-                )
-                markdown = comments_mod.testing(
-                    repo, pr_number, pr_head, case_result=case_result_str or "",
-                )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-                await self.proxy.project_status_label(repo, pr_number, "testing")
-            else:
-                # Still deploy-requested, show remaining machine commands
-                remaining_components = [
-                    c for c in components
-                    if c.get("component_id", "") not in deployed_component_ids
-                ]
-                remaining_groups = self._get_machine_groups_for_components(remaining_components)
-                markdown = comments_mod.deploy_requested(
-                    repo, pr_number, pr_head, remaining_components, remaining_groups,
-                )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+            case_result_str = ", ".join(
+                f"{k}={v}" for k, v in (case_results or {}).items()
+            )
+            markdown = comments_mod.testing(
+                repo, pr_number, pr_head, case_result=case_result_str or "",
+            )
+            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+            await self.proxy.project_status_label(repo, pr_number, "testing")
             return True
 
         except PolicyError as e:
@@ -1195,7 +1454,8 @@ class DeployController:
                 return True
 
             if cos_metadata.get("object_key"):
-                markdown = comments_mod.succeeded_comment(
+                # Step 1: rebind terminal state with COS metadata FIRST
+                markdown_no_url = comments_mod.succeeded_comment(
                     repo, pr_number, pr_head,
                     cos_object_key=str(cos_metadata.get("object_key", "") or ""),
                     cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
@@ -1215,7 +1475,43 @@ class DeployController:
                     expected_command_kind="record_test",
                     expected_test_result=result,
                     cos_metadata=cos_metadata,
-                    markdown=markdown,
+                    markdown=markdown_no_url,
+                )
+                # Step 2: generate presigned URL AFTER successful rebind
+                cos_download_url = ""
+                try:
+                    cos_download_url = self.cos.generate_evidence_download_url(
+                        cos_metadata["object_key"],
+                    )
+                except Exception:
+                    logger.warning(
+                        "COS_EVIDENCE_PRESIGN=FAILED repo=%s pr=%s",
+                        repo, pr_number,
+                    )
+                # Step 3: rebind final comment with download URL
+                markdown_with_url = comments_mod.succeeded_comment(
+                    repo, pr_number, pr_head,
+                    cos_object_key=str(cos_metadata.get("object_key", "") or ""),
+                    cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
+                    cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
+                    cos_download_url=cos_download_url,
+                ) if result == "pass" else comments_mod.failed_comment(
+                    repo, pr_number, pr_head,
+                    cos_object_key=str(cos_metadata.get("object_key", "") or ""),
+                    cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
+                    cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
+                    cos_download_url=cos_download_url,
+                )
+                await self._rebind_terminal_cos_if_current(
+                    repo,
+                    pr_number,
+                    expected_head=pr_head,
+                    expected_terminal_status=state["status"],
+                    expected_comment_id=comment_id,
+                    expected_command_kind="record_test",
+                    expected_test_result=result,
+                    cos_metadata=cos_metadata,
+                    markdown=markdown_with_url,
                 )
             return True
 
@@ -1246,10 +1542,35 @@ class DeployController:
             components = state.get("components", [])
             deployments = state.get("deployments", [])
 
+            # Refresh 120s COS URL for terminal states
+            cos_object_key = ""
+            cos_bundle_sha256 = ""
+            cos_bundle_size = 0
+            cos_download_url = ""
+            cos_state = state.get("cos", {})
+            if status in ("succeeded", "failed"):
+                cos_object_key = str(cos_state.get("object_key", "") or "")
+                cos_bundle_sha256 = str(cos_state.get("sha256", "") or "")
+                cos_bundle_size = int(cos_state.get("size", 0) or 0)
+                if cos_object_key:
+                    try:
+                        cos_download_url = self.cos.generate_evidence_download_url(
+                            cos_object_key,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "COS_EVIDENCE_PRESIGN=FAILED repo=%s pr=%s",
+                            repo, pr_number,
+                        )
+
             markdown = comments_mod.deploy_status_comment(
                 status, head_sha, repo, pr_number,
                 components=components,
                 deployments=deployments,
+                cos_object_key=cos_object_key,
+                cos_bundle_sha256=cos_bundle_sha256,
+                cos_bundle_size=cos_bundle_size,
+                cos_download_url=cos_download_url,
             )
             await self.proxy.post_issue_comment(
                 repo, pr_number, markdown,
@@ -1347,14 +1668,19 @@ class DeployController:
     def _get_machine_groups_for_components(
         self, components: list[dict],
     ) -> list[dict]:
-        """Determine compatible machine groups from components.
+        """Determine FULL-COVERAGE machine groups from components.
 
-        Returns a list of machine groups, each with the machine alias and
-        the component_ids it can host. A machine may host multiple components.
+        Returns ONLY machines whose compatible component_ids EQUAL the
+        complete set of all component_ids passed in.
 
-        Uses same fail-closed rules as _get_component_ids_for_machine.
+        Machines with partial coverage are excluded.
         """
         machines = self.policy.get_machines()
+        required_ids = {
+            comp.get("component_id", "")
+            for comp in components
+            if isinstance(comp, dict) and comp.get("component_id")
+        }
         groups = []
         for m in machines:
             compatible = []
@@ -1375,7 +1701,8 @@ class DeployController:
                     if not comp_driver_path or not m.driver_paths or comp_driver_path not in m.driver_paths:
                         continue
                 compatible.append(comp.get("component_id", ""))
-            if compatible:
+            # FULL COVERAGE ONLY: compatible must exactly match required
+            if set(compatible) == required_ids:
                 groups.append({
                     "alias": m.alias,
                     "node_id": m.node_id,
@@ -1543,50 +1870,6 @@ class DeployController:
             raise DeployControllerError(
                 f"Deploy failed for {runtime_id} on node {node_id}: {e}"
             )
-
-    async def _wait_for_deploy_health(
-        self, core: AgentCoreClient, runtime_id: str,
-        image_ref: str, component_label: str,
-    ) -> dict:
-        """Bounded poll for a deployed component to bind the exact image.
-
-        CLEAN GATE:
-        - pinned runtime_id
-        - POST deploy immutable image
-        - bounded poll existing /api/drivers/{runtime_id}/status
-        - running_image == exact immutable image_ref
-
-        Returns {"passed": bool, "running_image": str}.
-        """
-        import asyncio
-        import time
-
-        deadline = time.time() + self.config.health_timeout_seconds
-        interval = self.config.health_poll_interval_seconds
-        last_running = ""
-        while time.time() < deadline:
-            try:
-                status = await core.driver_status(runtime_id)
-                last_running = str(status.get("running_image", "") or "")
-                if last_running == image_ref:
-                    return {
-                        "passed": True,
-                        "running_image": last_running,
-                    }
-            except Exception as e:
-                logger.warning(
-                    "health poll %s runtime=%s: %s", component_label, runtime_id, e,
-                )
-            await asyncio.sleep(interval)
-        logger.error(
-            "health timeout %s runtime=%s after %ss: running_image=%s (expected %s)",
-            component_label, runtime_id, self.config.health_timeout_seconds,
-            last_running, image_ref,
-        )
-        return {
-            "passed": False,
-            "running_image": last_running,
-        }
 
     async def _run_automated_case(
         self, repo: str, pr_number: int, head_sha: str,
@@ -1902,45 +2185,84 @@ class DeployController:
             comments = await self.github.get_issue_comments(repo, pr_number)
             if not isinstance(comments, list):
                 comments = []
-            evidence = extract_review_evidence(
+
+            from .review_comment_parser import extract_latest_review_job_anchor
+
+            # Step 1: Get canonical latest anchor FIRST
+            latest_anchor = extract_latest_review_job_anchor(
                 comments,
                 self.config.review_comment_author_id,
                 self.config.review_comment_author_login,
             )
-            if evidence is None:
+
+            if latest_anchor is None:
                 desired_status = "review-required"
                 review_evidence_data: dict = {}
                 build_infos: list[BuildInfo] = []
             else:
-                # Convert evidence builds to BuildInfo
-                build_infos = []
-                for eb in evidence.builds:
-                    bi = BuildInfo(
-                        idx=0,
-                        target=eb.target,
-                        driver_path=eb.driver_path,
-                        variant=eb.variant,
-                        success=eb.success,
-                        image_tag=eb.image_tag,
-                        deployable=_is_deployable_build(
-                            type("_build", (), {
-                                "target": eb.target,
-                                "success": eb.success,
-                                "image_tag": eb.image_tag,
-                            })()
-                        ),
+                resolved_head = await self._resolve_commit_prefix_for_head(
+                    repo, current_head, latest_anchor.commit_prefix,
+                )
+                if resolved_head is None:
+                    # Cannot resolve anchor commit prefix to fresh HEAD
+                    desired_status = "review-required"
+                    review_evidence_data = {}
+                    build_infos = []
+                elif latest_anchor.state == "terminal":
+                    # Build failed / malformed — must NOT fall back
+                    desired_status = "review-required"
+                    review_evidence_data = {}
+                    build_infos = []
+                elif latest_anchor.state == "reviewing":
+                    # Queued / Building / incomplete — project reviewing, NEVER fall back
+                    desired_status = "reviewing"
+                    review_evidence_data = {}
+                    build_infos = []
+                elif latest_anchor.state == "build-succeeded":
+                    # Build completed successfully — get full evidence for deploy-ready check
+                    evidence = extract_review_evidence(
+                        comments,
+                        self.config.review_comment_author_id,
+                        self.config.review_comment_author_login,
                     )
-                    build_infos.append(bi)
-                desired_status = "deploy-ready"
-                review_evidence_data = {
-                    "build_comment_id": evidence.build_comment_id,
-                    "build_comment_updated_at": evidence.build_comment_updated_at,
-                    "commit_prefix": evidence.commit_prefix,
-                    "resolved_head_sha": evidence.resolved_head_sha,
-                    "test_comment_id": evidence.test_comment_id,
-                    "code_review_comment_id": evidence.code_review_comment_id,
-                    "review_author_id": evidence.review_author_id,
-                }
+                    if evidence is None:
+                        # Build succeeded but Test/Code Review not yet complete
+                        desired_status = "reviewing"
+                        review_evidence_data = {}
+                        build_infos = []
+                    else:
+                        resolved_head_ev = await self._resolve_commit_prefix_for_head(
+                            repo, current_head, evidence.commit_prefix,
+                        )
+                        if resolved_head_ev != current_head:
+                            desired_status = "review-required"
+                            review_evidence_data = {}
+                            build_infos = []
+                        else:
+                            desired_status = "deploy-ready"
+                            review_evidence_data = self._review_evidence_snapshot(evidence, resolved_head_ev)
+                            build_infos = []
+                            for eb in evidence.builds:
+                                bi = BuildInfo(
+                                    idx=0,
+                                    target=eb.target,
+                                    driver_path=eb.driver_path,
+                                    variant=eb.variant,
+                                    success=eb.success,
+                                    image_tag=eb.image_tag,
+                                    deployable=_is_deployable_build(
+                                        type("_build", (), {
+                                            "target": eb.target,
+                                            "success": eb.success,
+                                            "image_tag": eb.image_tag,
+                                        })()
+                                    ),
+                                )
+                                build_infos.append(bi)
+                else:
+                    desired_status = "review-required"
+                    review_evidence_data = {}
+                    build_infos = []
         except Exception as e:
             logger.warning(
                 "reconcile comment evidence %s#%s head=%s: %s",
@@ -1985,13 +2307,12 @@ class DeployController:
             }
 
         try:
-            markdown = (
-                comments_mod.review_required(repo, pr_number, current_head)
-                if desired_status == "review-required"
-                else comments_mod.reviewing(repo, pr_number, current_head)
-                if desired_status == "reviewing"
-                else comments_mod.deploy_ready(repo, pr_number, current_head, build_infos)
-            )
+            if desired_status == "reviewing":
+                markdown = comments_mod.reviewing(repo, pr_number, current_head)
+            elif desired_status == "review-required":
+                markdown = comments_mod.review_required(repo, pr_number, current_head)
+            else:
+                markdown = comments_mod.deploy_ready(repo, pr_number, current_head, build_infos)
             await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
             await self.proxy.project_status_label(repo, pr_number, desired_status)
         except Exception as e:
@@ -2122,6 +2443,32 @@ class DeployController:
 
         # Convert evidence builds to BuildInfo
         builds = []
+        resolved_head = await self._resolve_review_evidence_for_head(repo, current_head, evidence)
+        if resolved_head is None:
+            # resolved_head is None => fail closed, cannot write None into canonical review_evidence
+            state["status"] = "review-required"
+            state["review_evidence"] = {}
+            state["components"] = []
+            state["deployments"] = []
+            state["approve_attempts"] = []
+            state["approve_attempts_total"] = 0
+            state["approve_attempts_truncated"] = False
+            state["case_results"] = {}
+            state["test_result"] = ""
+            state["cos"] = {"object_key": "", "sha256": "", "size": 0}
+            state["command"] = {
+                "comment_id": comment_id,
+                "kind": "approve_deploy",
+                "phase": "completed",
+                "args": dict(cmd.get("args", {}) or {}),
+            }
+            state["last_processed_comment_id"] = max(old_cursor, comment_id)
+            markdown = comments_mod.review_required(
+                repo, pr_number, current_head,
+            )
+            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+            await self.proxy.project_status_label(repo, pr_number, "review-required")
+            return "review-required"
         for eb in evidence.builds:
             bi = BuildInfo(
                 idx=0,
@@ -2140,15 +2487,7 @@ class DeployController:
             )
             builds.append(bi)
 
-        review_evidence_data = {
-            "build_comment_id": evidence.build_comment_id,
-            "build_comment_updated_at": evidence.build_comment_updated_at,
-            "commit_prefix": evidence.commit_prefix,
-            "resolved_head_sha": evidence.resolved_head_sha,
-            "test_comment_id": evidence.test_comment_id,
-            "code_review_comment_id": evidence.code_review_comment_id,
-            "review_author_id": evidence.review_author_id,
-        }
+        review_evidence_data = self._review_evidence_snapshot(evidence, resolved_head)
         fresh_components = await self._build_component_snapshot(
             repo, pr_number, current_head, builds,
         )
@@ -2303,6 +2642,103 @@ class DeployController:
         return resolved
 
         # ── Hidden state validation ──
+
+
+    async def _revalidate_approve_comment(self, repo: str, comment_id: int, expected_actor_id: str, expected_machine_alias: str):
+        """Re-read the exact approval comment from GitHub and validate it.
+
+        Returns the comment dict on success, None on any failure.
+        """
+        try:
+            comment = await self.proxy.get_comment(repo, comment_id)
+        except Exception:
+            return None
+        if not isinstance(comment, dict):
+            return None
+        cid = comment.get("id")
+        if not isinstance(cid, int) or cid <= 0 or isinstance(cid, bool):
+            return None
+        if cid != comment_id:
+            return None
+        user = comment.get("user")
+        if not isinstance(user, dict):
+            return None
+        uid = user.get("id")
+        if not isinstance(uid, int) or uid <= 0 or isinstance(uid, bool):
+            return None
+        if str(uid) != expected_actor_id:
+            return None
+        body = comment.get("body")
+        if not isinstance(body, str):
+            return None
+        from .commands import parse_command
+        parsed = parse_command(body)
+        if not parsed or parsed.kind != "approve_deploy":
+            return None
+        if parsed.machine_alias != expected_machine_alias:
+            return None
+        return comment
+
+    async def _revalidate_hidden_state(
+        self,
+        repo: str,
+        pr_number: int,
+        expected_head: str,
+        expected_review_evidence: dict,
+        expected_status: str = "deploy-requested",
+        expected_component_snapshot: list | None = None,
+        expected_deployments: list | None = None,
+    ):
+        """Re-read hidden state before unsafe POST.
+
+        Requires status == "deploy-requested" AND command.phase == "completed".
+        Returns the state dict on match, None on any mismatch.
+        """
+        state = await self.proxy.read_hidden_state(repo, pr_number)
+        if state is None:
+            return None
+        if state.get("status") != expected_status:
+            return None
+        if state.get("head_sha") != expected_head:
+            return None
+        if state.get("review_evidence") != expected_review_evidence:
+            return None
+        if state.get("command", {}).get("phase") != "completed":
+            return None
+        if expected_component_snapshot is not None:
+            if self._canonical_component_snapshot(
+                state.get("components", []),
+            ) != expected_component_snapshot:
+                return None
+        if expected_deployments is not None:
+            if state.get("deployments", []) != expected_deployments:
+                return None
+        return state
+
+
+    async def _fresh_review_evidence_matches_state(
+        self, repo: str, pr_number: int, fresh_head: str,
+        persisted_review_evidence: dict,
+    ):
+        """Fresh-read PR Conversation and validate evidence matches persisted snapshot."""
+        from .review_comment_parser import extract_review_evidence
+        try:
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception:
+            return False
+        review_trust = self.config.review_comment_author_id or ""
+        review_login = self.config.review_comment_author_login or ""
+        evidence = extract_review_evidence(comments, review_trust, review_login)
+        if evidence is None:
+            return False
+        resolved_head = await self._resolve_review_evidence_for_head(
+            repo, fresh_head, evidence,
+        )
+        if resolved_head != fresh_head:
+            return False
+        fresh_snapshot = self._review_evidence_snapshot(evidence, resolved_head)
+        return fresh_snapshot == persisted_review_evidence
+
 
     def _validate_hidden_state(self, state: dict) -> None:
         """Validate hidden state before persisting."""

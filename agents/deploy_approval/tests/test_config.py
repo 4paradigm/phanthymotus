@@ -6,9 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from ..config import (
-    Config,
-    FORK_TEST_GITHUB_REPOS,
+from ..config import (Config,
     DEFAULT_GITHUB_REPOS,
     load_config,
     validate_config,
@@ -32,47 +30,36 @@ def test_validate_config_no_longer_requires_github_token():
         Config(
             github_repos=[
                 "4paradigm/phanthymotus",
-                "4paradigm/phanthymotus-driver",
             ],
-            deploy_approval_public_base_url="https://deploy.example",
-            github_oauth_client_id="test-client",
-            github_oauth_client_secret="test-secret",
             registry="ccr.ccs.tencentyun.com",
+            review_comment_author_id="7950763",
         )
     )
 
 
 def test_validate_config_default_repos():
-    """Default github_repos includes the two official repos."""
+    """Default github_repos is the single production repository."""
     c = Config(review_comment_author_id="7950763")
     assert "4paradigm/phanthymotus" in c.github_repos
-    assert "4paradigm/phanthymotus-driver" in c.github_repos
     # Explicit empty overrides defaults — must fail closed
     with pytest.raises(ValueError, match="GITHUB_REPOS is required"):
         validate_config(Config(github_repos=[], registry="ccr.ccs.tencentyun.com"))
 
 
 @pytest.mark.parametrize(
-    "repos,fork_test_mode,should_pass",
+    "repos,should_pass",
     [
-        (list(DEFAULT_GITHUB_REPOS), False, True),
-        (list(FORK_TEST_GITHUB_REPOS), True, True),
-        (list(FORK_TEST_GITHUB_REPOS), False, False),
-        (list(DEFAULT_GITHUB_REPOS), True, False),
-        ([DEFAULT_GITHUB_REPOS[0], "some/fork-repo"], False, False),
-        ([DEFAULT_GITHUB_REPOS[0], DEFAULT_GITHUB_REPOS[0]], False, False),
-        (["some/other"], False, False),
-        ([], False, False),
-        ([*DEFAULT_GITHUB_REPOS, "some/other"], False, False),
+        (list(DEFAULT_GITHUB_REPOS), True),
+        ([DEFAULT_GITHUB_REPOS[0], "some/fork-repo"], False),
+        ([DEFAULT_GITHUB_REPOS[0], DEFAULT_GITHUB_REPOS[0]], False),
+        (["some/other"], False),
+        ([], False),
+        ([*DEFAULT_GITHUB_REPOS, "some/other"], False),
     ],
 )
-def test_fork_test_mode_requires_exact_repo_pair(repos, fork_test_mode, should_pass):
+def test_github_repos_requires_exact_production_set(repos, should_pass):
     cfg = Config(
         github_repos=repos,
-        fork_test_mode=fork_test_mode,
-        deploy_approval_public_base_url="https://deploy.example",
-        github_oauth_client_id="test-client",
-        github_oauth_client_secret="test-secret",
         registry="ccr.ccs.tencentyun.com",
         review_comment_author_id="7950763",
     )
@@ -89,11 +76,7 @@ def test_validate_config_requires_webhook_secret():
             Config(
                 github_repos=[
                     "4paradigm/phanthymotus",
-                    "4paradigm/phanthymotus-driver",
                 ],
-                deploy_approval_public_base_url="https://deploy.example",
-                github_oauth_client_id="test-client",
-                github_oauth_client_secret="test-secret",
                 webhook_enabled=True,
                 review_comment_author_id="7950763",
             )
@@ -106,13 +89,9 @@ def test_validate_config_requires_polling():
             Config(
                 github_repos=[
                     "4paradigm/phanthymotus",
-                    "4paradigm/phanthymotus-driver",
                 ],
-                deploy_approval_public_base_url="https://deploy.example",
-                github_oauth_client_id="test-client",
-                github_oauth_client_secret="test-secret",
-                poll_enabled=False,
                 webhook_enabled=True,
+                poll_enabled=False,
                 github_webhook_secret="secret",
                 review_comment_author_id="7950763",
             )
@@ -148,23 +127,21 @@ def test_env_float():
     del os.environ["TEST_FLOAT"]
 
 
-def test_config_env_override(monkeypatch):
+def test_config_env_override(monkeypatch, tmp_path):
     """Explicit GITHUB_REPOS overrides the default."""
-    monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus,4paradigm/phanthymotus-driver")
+    monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus")
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "review-agent-bot"\n')
+    import agents.deploy_approval.config as config_mod
+    orig = config_mod._load_secrets_config
+    def patched(path):
+        return orig(str(secrets))
+    monkeypatch.setattr(config_mod, "_load_secrets_config", patched)
     cfg = load_config()
-    assert cfg.github_repos == ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    assert cfg.github_repos == ["4paradigm/phanthymotus"]
 
-
-def test_config_env_fork_test_mode_requires_fork_pair(monkeypatch):
-    """Fork test mode only allows exact Haohao-end/phanthymotus — no driver."""
-    monkeypatch.setenv("GITHUB_REPOS", "Haohao-end/phanthymotus")
-    monkeypatch.setenv("DEPLOY_APPROVAL_FORK_TEST_MODE", "true")
-    monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
-    cfg = load_config()
-    assert cfg.fork_test_mode is True
-    assert cfg.github_repos == ["Haohao-end/phanthymotus"]
 
 
 def test_config_env_empty_fails_closed(monkeypatch):
@@ -176,21 +153,28 @@ def test_config_env_empty_fails_closed(monkeypatch):
         load_config()
 
 
-def test_config_env_unset_uses_default(monkeypatch):
+def test_config_env_unset_uses_default(monkeypatch, tmp_path):
     """GITHUB_REPOS unset uses DEFAULT_GITHUB_REPOS."""
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
     monkeypatch.delenv("GITHUB_REPOS", raising=False)
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "review-agent-bot"\n')
+    import agents.deploy_approval.config as config_mod
+    orig = config_mod._load_secrets_config
+    def patched(path):
+        return orig(str(secrets))
+    monkeypatch.setattr(config_mod, "_load_secrets_config", patched)
     cfg = load_config()
     assert "4paradigm/phanthymotus" in cfg.github_repos
-    assert "4paradigm/phanthymotus-driver" in cfg.github_repos
+    assert "4paradigm/phanthymotus-driver" not in cfg.github_repos
 
 
 # ── migrated from test_v8_contract.py ──────────────────────────────────────
 
-def test_default_supported_repos_include_both_real_repositories():
+def test_default_supported_repo_is_production_phanthymotus():
     cfg = Config()
-    assert cfg.github_repos == ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    assert cfg.github_repos == ["4paradigm/phanthymotus"]
 
 
 def test_perception_review_variant_511_matches_canonical_machine_variant(tmp_path):
@@ -294,14 +278,15 @@ def test_driver_paths_required_for_driver_machine(config):
             targets: [driver]
             platforms: [linux/arm64]
     """))
-    p = Policy(config)
-    p.machines = {"m1": p._load_machine_info(str(tmp_path), "m1")}
-    with pytest.raises(ValueError, match="driver_paths"):
-        p.validate_machine_for_targets("m1", {"driver"})
+    # machine m1 has targets=[driver] but no driver_paths,
+    # so load_machines should raise MachineLoadError
+    from ..policy import MachineLoadError, load_machines
+    with pytest.raises(MachineLoadError, match="driver_paths"):
+        load_machines(str(machines_file))
 
 
 def test_driver_paths_reject_string_scalar(config):
-    from ..policy import Policy
+    from ..policy import MachineLoadError, load_machines
     import textwrap
     from pathlib import Path
     tmp_path = Path("/tmp/test_driver_paths_string")
@@ -319,13 +304,12 @@ def test_driver_paths_reject_string_scalar(config):
             platforms: [linux/arm64]
             driver_paths: "unitree/g1"
     """))
-    p = Policy(config)
-    with pytest.raises(ValueError, match="driver_paths"):
-        p.load_machines(str(machines_file))
+    with pytest.raises(MachineLoadError, match="driver_paths"):
+        load_machines(str(machines_file))
 
 
 def test_driver_paths_reject_absolute_parent_backslash_and_empty_segments(config):
-    from ..policy import Policy
+    from ..policy import MachineLoadError, load_machines
     import textwrap
     from pathlib import Path
     tmp_path = Path("/tmp/test_driver_paths_bad")
@@ -349,13 +333,12 @@ def test_driver_paths_reject_absolute_parent_backslash_and_empty_segments(config
               - "a//double"
               - ""
     """))
-    p = Policy(config)
-    with pytest.raises(ValueError, match="driver_paths"):
-        p.load_machines(str(machines_file))
+    with pytest.raises(MachineLoadError, match="driver_paths"):
+        load_machines(str(machines_file))
 
 
 def test_driver_paths_are_trimmed_deduped_and_exact_case_preserved(config):
-    from ..policy import Policy
+    from ..policy import load_machines
     import textwrap
     from pathlib import Path
     tmp_path = Path("/tmp/test_driver_paths_trim")
@@ -375,6 +358,5 @@ def test_driver_paths_are_trimmed_deduped_and_exact_case_preserved(config):
               - "  unitree/g1  "
               - "unitree/g1"
     """))
-    p = Policy(config)
-    p.load_machines(str(machines_file))
-    assert p.machines["m1"].driver_paths == ["unitree/g1"]
+    p = load_machines(str(machines_file))
+    assert p["m1"].driver_paths == ["unitree/g1"]

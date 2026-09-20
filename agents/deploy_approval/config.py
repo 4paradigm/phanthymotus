@@ -10,11 +10,11 @@ Deploy Approval reads Review Agent output from GitHub PR comments.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 import re
 import os
 import ipaddress
-import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,14 +25,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_GITHUB_REPOS = (
     "4paradigm/phanthymotus",
+)
+
+
+SUPPORTED_GITHUB_REPOS = frozenset({
+    "4paradigm/phanthymotus",
     "4paradigm/phanthymotus-driver",
-)
-
-FORK_TEST_GITHUB_REPOS = (
-    "Haohao-end/phanthymotus",
-)
-
-SUPPORTED_GITHUB_REPOS = frozenset(DEFAULT_GITHUB_REPOS + FORK_TEST_GITHUB_REPOS)
+})
 
 
 @dataclass
@@ -48,10 +47,6 @@ class Config:
     github_repos: list[str] = field(
         default_factory=lambda: list(DEFAULT_GITHUB_REPOS)
     )
-    deploy_approval_public_base_url: str = ""
-    github_oauth_client_id: str = ""
-    github_oauth_client_secret: str = field(default="", repr=False)
-    fork_test_mode: bool = False
     github_comment_max_pages: int = 20
     github_comment_max_comments: int = 500
     github_comment_max_bytes: int = 4 * 1024 * 1024
@@ -82,6 +77,12 @@ class Config:
     registry: str = ""
 
     registry_auth_host_allowlist: list[str] = field(default_factory=list)
+
+    # Agent Core access tokens keyed by machine alias
+    agent_core_tokens: dict[str, str] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
 
 def _env_int(name: str, default: int, *, min_val: int = 1, max_val: int | None = None) -> int:
@@ -181,7 +182,7 @@ def _load_secrets_config(path: str) -> dict:
         cos = {}
     if not isinstance(cos, dict):
         raise ValueError("secrets.yaml cos section must be a mapping")
-    result = {"cos": {}, "github_oauth": {}, "review_comment_trust": {}}
+    result = {"cos": {}, "review_comment_trust": {}}
 
     def _coerce_string(key: str, *, required: bool = False, allow_empty: bool = True) -> str:
         if key not in cos:
@@ -197,14 +198,6 @@ def _load_secrets_config(path: str) -> dict:
 
     for key in ("region", "bucket", "secret_id", "secret_key"):
         result["cos"][key] = _coerce_string(key)
-    oauth = data.get("github_oauth", {})
-    if not isinstance(oauth, dict):
-        raise ValueError("secrets.yaml github_oauth section must be a mapping")
-    for key in ("client_id", "client_secret"):
-        value = oauth.get(key, "")
-        if not isinstance(value, str):
-            raise ValueError(f"secrets.yaml github_oauth.{key} must be a string")
-        result["github_oauth"][key] = value
     # Review comment trust config
     rct = data.get("review_comment_trust", {})
     if rct is None:
@@ -216,13 +209,26 @@ def _load_secrets_config(path: str) -> dict:
         if not isinstance(value, str):
             raise ValueError(f"secrets.yaml review_comment_trust.{key} must be a string")
         result["review_comment_trust"][key] = value
+    # Agent Core tokens
+    act = data.get("agent_core_tokens")
+    if act is not None:
+        if not isinstance(act, dict):
+            raise ValueError("secrets.yaml agent_core_tokens must be a mapping")
+        result["agent_core_tokens"] = {}
+        for k, v in act.items():
+            if not isinstance(k, str) or not k.strip():
+                raise ValueError("secrets.yaml agent_core_tokens keys must be non-empty strings")
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError("secrets.yaml agent_core_tokens values must be non-empty strings")
+            result["agent_core_tokens"][k.strip()] = v.strip()
+    else:
+        result["agent_core_tokens"] = {}
     return result
 
 
 def load_config() -> Config:
     secrets = _load_secrets_config("/run/deploy-approval/secrets.yaml")
     cos = secrets.get("cos", {})
-    github_oauth = secrets.get("github_oauth", {})
     review_trust = secrets.get("review_comment_trust", {})
     cfg = Config(
         github_api_url="https://api.github.com",
@@ -234,10 +240,6 @@ def load_config() -> Config:
             DEFAULT_GITHUB_REPOS if os.getenv("GITHUB_REPOS") is None
             else _env_str_list("GITHUB_REPOS")
         ),
-        fork_test_mode=_env_bool("DEPLOY_APPROVAL_FORK_TEST_MODE", False),
-        deploy_approval_public_base_url=os.getenv("DEPLOY_APPROVAL_PUBLIC_BASE_URL", "").strip(),
-        github_oauth_client_id=github_oauth.get("client_id", ""),
-        github_oauth_client_secret=github_oauth.get("client_secret", ""),
         review_comment_author_id=review_trust.get("author_id", ""),
         review_comment_author_login=review_trust.get("author_login", ""),
         machine_owners_file="/run/deploy-approval/machines.yaml",
@@ -253,28 +255,13 @@ def load_config() -> Config:
         cos_secret_key=cos.get("secret_key", ""),
         registry=os.getenv("REGISTRY", "").strip(),
         registry_auth_host_allowlist=[],
+        agent_core_tokens=secrets.get("agent_core_tokens", {}),
     )
     validate_config(cfg)
     return cfg
 
 
 def validate_config(cfg: Config) -> None:
-    if not isinstance(cfg.deploy_approval_public_base_url, str):
-        raise ValueError("DEPLOY_APPROVAL_PUBLIC_BASE_URL must be a string")
-    parsed_public_url = urllib.parse.urlsplit(cfg.deploy_approval_public_base_url)
-    if (
-        not cfg.deploy_approval_public_base_url
-        or parsed_public_url.scheme != "https"
-        or not parsed_public_url.netloc
-        or parsed_public_url.username is not None
-        or parsed_public_url.password is not None
-        or parsed_public_url.query
-        or parsed_public_url.fragment
-    ):
-        raise ValueError("DEPLOY_APPROVAL_PUBLIC_BASE_URL must be an absolute HTTPS URL without query or fragment")
-    cfg.deploy_approval_public_base_url = cfg.deploy_approval_public_base_url.rstrip("/")
-    if not cfg.github_oauth_client_id.strip() or not cfg.github_oauth_client_secret.strip():
-        raise ValueError("secrets.yaml github_oauth client_id and client_secret are required")
     if not isinstance(cfg.github_repos, list):
         raise ValueError("GITHUB_REPOS must be a list")
     if not cfg.github_repos:
@@ -286,27 +273,19 @@ def validate_config(cfg: Config) -> None:
     for r in cfg.github_repos:
         if not isinstance(r, str):
             raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
-    # Mutually exclusive mode validation
-    _modes_active = int(cfg.fork_test_mode)
-    if _modes_active > 1:
+    if not isinstance(cfg.github_repos, list):
+        raise ValueError("GITHUB_REPOS must be a list")
+    if not cfg.github_repos:
+        raise ValueError("GITHUB_REPOS is required")
+    for r in cfg.github_repos:
+        if not isinstance(r, str):
+            raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
+    if len(cfg.github_repos) != len(set(cfg.github_repos)):
+        raise ValueError("GITHUB_REPOS must not contain duplicates")
+    if not set(cfg.github_repos).issubset(SUPPORTED_GITHUB_REPOS):
         raise ValueError(
-            "DEPLOY_APPROVAL_FORK_TEST_MODE "
-            "Deploy Approval fork test mode is the only test mode"
-        )
-
-    required_repos = (
-        set(FORK_TEST_GITHUB_REPOS)
-        if cfg.fork_test_mode
-        else set(DEFAULT_GITHUB_REPOS)
-    )
-    if cfg.fork_test_mode:
-        expected_repos = FORK_TEST_GITHUB_REPOS
-    else:
-        expected_repos = DEFAULT_GITHUB_REPOS
-    if len(cfg.github_repos) != len(expected_repos) or set(cfg.github_repos) != required_repos:
-        raise ValueError(
-            "GITHUB_REPOS must contain exactly: "
-            + ", ".join(expected_repos)
+            "GITHUB_REPOS contains unsupported repo; allowed: "
+            + ", ".join(sorted(SUPPORTED_GITHUB_REPOS))
         )
     if cfg.webhook_enabled and not cfg.github_webhook_secret:
         raise ValueError(
@@ -384,3 +363,14 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(
             "secrets.yaml review_comment_trust.author_id must be a positive integer"
         )
+    # Validate agent_core_tokens
+    act = cfg.agent_core_tokens
+    if not isinstance(act, Mapping):
+        raise ValueError("agent_core_tokens must be a mapping")
+    if not act:
+        raise ValueError("agent_core_tokens must be non-empty")
+    for k, v in act.items():
+        if not isinstance(k, str) or not k.strip():
+            raise ValueError("agent_core_tokens keys must be non-empty strings")
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("agent_core_tokens values must be non-empty strings")

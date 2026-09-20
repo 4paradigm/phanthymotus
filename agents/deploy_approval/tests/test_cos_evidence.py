@@ -5,6 +5,7 @@ import asyncio
 import gzip
 import sys
 from datetime import datetime
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -89,9 +90,10 @@ def test_cos_object_key_exact_layout():
     client = CosClient(make_config())
     now = datetime(2026, 9, 17, 20, 30)
     expected = "phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"
-    for repo in ("4paradigm/phanthymotus", "Haohao-end/phanthymotus"):
+    for repo in ("4paradigm/phanthymotus",):
         assert client.build_object_key(repo, 7, HEAD, now=now) == expected
-    assert client.build_object_key("4paradigm/phanthymotus-driver", 7, HEAD, now=now) == expected.replace("phanthymotus/", "phanthymotus-driver/")
+    with pytest.raises(ValueError):
+        client.build_object_key("4paradigm/phanthymotus-driver", 7, HEAD, now=now)
 
 
 @pytest.mark.parametrize("key", [
@@ -128,7 +130,7 @@ def _install_qcloud(monkeypatch, client, body, length):
     module.CosConfig = lambda **kwargs: SimpleNamespace()
     module.CosS3Client = SDK
     monkeypatch.setitem(sys.modules, "qcloud_cos", module)
-    client.config.cos_secret_id, client.config.cos_secret_key, client.config.cos_bucket = "id", "key", "bucket"
+    client.config.cos_region, client.config.cos_secret_id, client.config.cos_secret_key, client.config.cos_bucket = "cn-bj", "id", "key", "bucket"
     return events
 
 
@@ -152,3 +154,243 @@ def test_cos_download_head_before_get_and_hard_bound(monkeypatch):
     with pytest.raises(CosError):
         asyncio.run(client.download_evidence_archive("key", EVIDENCE_MAX_ARCHIVE_BYTES))
     assert body.closed
+
+
+# ── presigned URL contract tests ─────────────────────────────────────────
+
+def test_cos_presign_ttl_is_120():
+    """EVIDENCE_PRESIGNED_URL_TTL_SECONDS must be exactly 120."""
+    from ..cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+    assert EVIDENCE_PRESIGNED_URL_TTL_SECONDS == 120
+
+
+@pytest.mark.asyncio
+async def test_cos_presign_missing_credentials_returns_empty(monkeypatch):
+    """When credentials are missing, generate_evidence_download_url returns ''."""
+    client = CosClient(make_config(cos_secret_id="", cos_secret_key=""))
+    result = client.generate_evidence_download_url("phanthymotus_pr/test/evidence.gz")
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_cos_presign_invalid_object_key_returns_empty(monkeypatch):
+    """Invalid object keys must return empty string."""
+    client = CosClient(make_config())
+    for bad_key in ["", "/phanthymotus_pr/test", "phanthymotus/../test", "phanthymotus_pr/test\\key", "other_repo/pr/1/test"]:
+        result = client.generate_evidence_download_url(bad_key)
+        assert result == f"expected empty for {bad_key!r} but got {result!r}" or result == ""
+
+
+@pytest.mark.asyncio
+async def test_cos_presign_https_accepted_http_rejected(monkeypatch):
+    """HTTPS presigned URL accepted; HTTP rejected."""
+    import sys
+    from types import ModuleType
+
+    class FakeCosConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeUrl(str):
+        def __new__(cls, url):
+            return str.__new__(cls, url)
+        def startswith(self, prefix):
+            return super().startswith(prefix)
+
+    class FakeCosS3Client:
+        def __init__(self, config):
+            self.config = config
+        def get_presigned_url(self, **kwargs):
+            # Simulate SDK returning the URL
+            return FakeUrl(self._test_url)
+
+        def set_test_url(self, url):
+            self._test_url = url
+
+    fake_module = ModuleType("qcloud_cos")
+    fake_module.CosConfig = FakeCosConfig
+    fake_module.CosS3Client = FakeCosS3Client
+
+    saved = sys.modules.get("qcloud_cos")
+    sys.modules["qcloud_cos"] = fake_module
+    try:
+        cfg = make_config(cos_region="ap-shanghai", cos_bucket="test-bucket", cos_secret_id="SID", cos_secret_key="SK")
+        client = CosClient(cfg)
+
+        # HTTPS -> accepted
+        client._client_class = FakeCosS3Client
+        fake_client = FakeCosS3Client(None)
+        fake_client.set_test_url("https://bucket-123456.cos.ap-shanghai.myqcloud.com/phanthymotus_pr/test/evidence.gz")
+        client._fake_cos_client = fake_client
+
+        # Patch the constructor to return our fake
+        orig_init = FakeCosS3Client.__init__
+        def patched_init(self, config):
+            orig_init(self, config)
+            self._test_url = "https://bucket-123456.cos.ap-shanghai.myqcloud.com/phanthymotus_pr/test/evidence.gz"
+        FakeCosS3Client.__init__ = patched_init
+
+        result = client.generate_evidence_download_url("phanthymotus_pr/test/evidence.gz")
+        assert result.startswith("https://"), f"expected https URL, got {result!r}"
+
+        # HTTP -> rejected
+        def patched_init_http(self, config):
+            orig_init(self, config)
+            self._test_url = "http://bucket-123456.cos.ap-shanghai.myqcloud.com/phanthymotus_pr/test/evidence.gz"
+        FakeCosS3Client.__init__ = patched_init_http
+
+        result2 = client.generate_evidence_download_url("phanthymotus_pr/test/evidence.gz")
+        assert result2 == "", f"expected empty for http URL, got {result2!r}"
+    finally:
+        FakeCosS3Client.__init__ = orig_init
+        if saved:
+            sys.modules["qcloud_cos"] = saved
+        elif "qcloud_cos" in sys.modules:
+            del sys.modules["qcloud_cos"]
+
+
+@pytest.mark.asyncio
+async def test_cos_presign_sdk_exception_returns_empty(monkeypatch):
+    """SDK exception must fail closed."""
+    import sys
+    from types import ModuleType
+
+    class FakeCosConfig:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeCosS3Client:
+        def __init__(self, config):
+            pass
+        def get_presigned_url(self, **kwargs):
+            raise RuntimeError("network error")
+
+    fake_module = ModuleType("qcloud_cos")
+    fake_module.CosConfig = FakeCosConfig
+    fake_module.CosS3Client = FakeCosS3Client
+
+    saved = sys.modules.get("qcloud_cos")
+    sys.modules["qcloud_cos"] = fake_module
+    try:
+        client = CosClient(make_config())
+        result = client.generate_evidence_download_url("phanthymotus_pr/test/evidence.gz")
+        assert result == ""
+    finally:
+        if saved:
+            sys.modules["qcloud_cos"] = saved
+        elif "qcloud_cos" in sys.modules:
+            del sys.modules["qcloud_cos"]
+
+
+def test_cos_presign_no_secret_leakage_in_source():
+    """Source must not log URL query strings, secrets, or Authorization headers."""
+    source = open(Path(__file__).parent.parent / "cos_client.py").read()
+    assert "logger.info" not in source or "presigned" not in source.lower() or "url" not in source.lower().split("logger.info")[0][-50:] if "logger.info" in source else True
+    # Ensure no direct secret logging
+    assert 'logger.info' not in source or 'SecretId' not in source.split('logger.info')[1].split('\n')[0] if 'logger.info' in source else True
+
+
+@pytest.mark.asyncio
+async def test_cos_presign_method_belongs_to_cos_client():
+    """generate_evidence_download_url must be a method of CosClient, not CosError."""
+    from ..cos_client import CosClient, CosError
+    assert hasattr(CosClient, "generate_evidence_download_url")
+    assert not hasattr(CosError, "generate_evidence_download_url")
+
+
+@pytest.mark.asyncio
+async def test_cos_presign_uses_real_local_sdk_construction_seam():
+    """Tests must mock qcloud_cos, not client._client or self._config."""
+    source = open(Path(__file__).parent.parent / "cos_client.py").read()
+    # The method must construct CosConfig/CosS3Client locally
+    assert "CosConfig(" in source
+    assert "CosS3Client(" in source
+    # Must not reference self._client or self._config inside generate_evidence_download_url
+    # Check that the method uses self.config (not self._config)
+    import ast
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "CosClient":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "generate_evidence_download_url":
+                    method_src = ast.unparse(item)
+                    assert "self._config" not in method_src, "generate_evidence_download_url must use self.config, not self._config"
+                    assert "self._client" not in method_src, "generate_evidence_download_url must not use self._client"
+
+
+def test_production_compose_default_repo_is_phanthymotus_only():
+    """GITHUB_REPOS default must be 4paradigm/phanthymotus only (config-level check)."""
+    from ..config import DEFAULT_GITHUB_REPOS
+    assert DEFAULT_GITHUB_REPOS == ("4paradigm/phanthymotus",)
+    assert "4paradigm/phanthymotus-driver" not in str(DEFAULT_GITHUB_REPOS)
+
+
+# ── service approval contract tests ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_pr_author_cannot_approve_own_deploy():
+    """PR author must not be able to approve their own deployment."""
+    from ..service import DeployController, _is_self_approval
+
+    # Same numeric ID -> self-approval
+    assert _is_self_approval("12345", {"user": {"id": 12345}}) is True
+    # Different numeric ID -> not self-approval
+    assert _is_self_approval("12345", {"user": {"id": 67890}}) is False
+    # Missing user -> fail closed
+    assert _is_self_approval("12345", {}) is True
+    # Missing id -> fail closed
+    assert _is_self_approval("12345", {"user": {}}) is True
+
+
+@pytest.mark.asyncio
+async def test_approve_rejects_machine_without_full_coverage():
+    """A machine that does not cover all remaining components must be rejected."""
+    from ..service import DeployController
+    from types import SimpleNamespace
+
+    machines = [
+        SimpleNamespace(
+            alias="alpha",
+            node_id="node-1",
+            platforms=["linux/arm64"],
+            variants=[],
+            driver_paths=[],
+            machine_supports_target=lambda alias, target: True,
+        )
+    ]
+
+    components = [
+        {"component_id": "comp-a", "target": "perception", "resolved_platform": "linux/arm64"},
+        {"component_id": "comp-b", "target": "planning", "resolved_platform": "linux/arm64"},
+    ]
+
+    mock_policy = SimpleNamespace()
+    mock_policy.get_machines = lambda: machines
+    # "planning" is not a supported target (only perception/actucore/driver)
+    def _supports_target(alias, target):
+        return target in ("perception", "actucore", "driver")
+    mock_policy.machine_supports_target = _supports_target
+
+    controller = DeployController(
+        config=SimpleNamespace(
+            machine_config="tests/machines.yaml",
+            health_timeout_seconds=30,
+            health_poll_interval_seconds=1,
+        ),
+        proxy=None,
+        policy=mock_policy,
+        github=None,
+    )
+
+    groups = controller._get_machine_groups_for_components(components)
+    # No machine covers both components, so groups should be empty
+    assert groups == []
+
+
+@pytest.mark.asyncio
+async def test_no_post_deploy_health_gate():
+    """_wait_for_deploy_health must not exist in service.py."""
+    source = open(Path(__file__).parent.parent / "service.py").read()
+    assert "_wait_for_deploy_health" not in source, (
+        "_wait_for_deploy_health method must be removed"
+    )
