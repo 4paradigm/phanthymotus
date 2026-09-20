@@ -326,7 +326,7 @@ async function _save() {
     const saved = await response.json();
     if (!response.ok) throw new Error(saved.detail || '保存失败');
     _showProblems(saved.problems || []);
-    showToast((saved.problems || []).length ? '已保存，但还跑不了' : '已保存');
+    showToast((saved.problems || []).length ? '已保存，但暂时无法运行' : '已保存');
     _onSaved?.();
   } catch (e) {
     showToast(`保存失败：${e.message || e}`);

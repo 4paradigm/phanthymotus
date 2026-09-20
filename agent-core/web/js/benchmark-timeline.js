@@ -1,5 +1,5 @@
 /**
- * benchmark-timeline.js — 一次跑动的现场。
+ * benchmark-timeline.js — 一次运行的详情。
  *
  * 分数只回答「好不好」。要回答「哪儿坏了」，得看这一趟里说了什么、想了什么、调了
  * 什么工具、世界怎么回应的 —— 而且要能把它们对上：那句插话到底落在哪一段路上，
@@ -8,13 +8,13 @@
  * ## 两条轨道并排，不合成一条
  *
  * agent 那侧的时间是墙钟，世界那侧是仿真时钟。两个钟相减没有意义，所以各自归一到
- * 「从本轮开始起算的秒数」并排放。对齐基准两边都是跑动开始：世界的第一条事件是
+ * 「从本轮开始起算的秒数」并排放。对齐基准两边都是运行开始：世界的第一条事件是
  * reset 那一刻，agent 的第一轮是被初始指令唤醒的那一轮。编一个共同时间轴会更好看，
  * 也会在读的人最需要精确的时候骗他。
  *
  * ## 为什么这些数据存得下来
  *
- * 仿真器的世界下一次跑动一开始就被重置，会话历史会被压缩。所以事实在写入结果时就
+ * 仿真器的世界下一次运行一开始就被重置，会话历史会被压缩。所以事实在写入结果时就
  * 一起存进了 `benchmark_case.facts`。会话没了就说没了，不编。
  */
 
@@ -27,7 +27,7 @@ const CHECKS = {
   exactly_one_terminal_post: 'ACP 重复上报', max_wall_seconds: '超时',
 };
 
-// 一次跑动里最值钱的线索往往是「这里什么都没发生」—— 机器人卡住、LLM 空转、
+// 一次运行里最值钱的线索往往是「这里什么都没发生」—— 机器人卡住、LLM 空转、
 // barrier 等超时，长得都一样：一段静默。相邻两条事件挨着排，这段静默就看不见了。
 //
 // 门槛压到 1.5 秒：排查的时候要能看见**时间去哪儿了**，而不是只看见最刺眼的那一段。
@@ -69,7 +69,7 @@ export async function openTimeline(runId) {
     if (!response.ok) throw new Error((await response.json()).detail || '读不到');
     data = await response.json();
   } catch (e) {
-    body.innerHTML = `<div class="bm-empty">读不到这次跑动：${_esc(e.message || e)}</div>`;
+    body.innerHTML = `<div class="bm-empty">读不到这次运行：${_esc(e.message || e)}</div>`;
     return;
   }
   body.innerHTML = _render(data);
@@ -95,8 +95,8 @@ function _render(data) {
   const world = data.world || [];
   const agent = data.agent || [];
   if (!world.length && !agent.length) {
-    return head + `<div class="bm-empty">这次跑动的现场没有留下来。<br>
-      事实在跑完时才落盘，更早的跑动（或清过的会话）没有这份记录。</div>`;
+    return head + `<div class="bm-empty">这次运行没有留下记录。<br>
+      记录在运行结束时才落盘，更早的运行（或清过的会话）没有这一份。</div>`;
   }
 
   return `${head}
@@ -105,7 +105,7 @@ function _render(data) {
         <h5 class="bm-tl-h">Agent 做了什么</h5>
         ${agent.length
           ? withQuiet(agent).map((row) => (row.quiet ? _quietRow(row) : _turn(row))).join('')
-          : '<div class="bm-empty">这次跑动的对话记录已经没有了。</div>'}
+          : '<div class="bm-empty">这次运行的对话记录已经没有了。</div>'}
       </section>
       <section class="bm-tl-col">
         <h5 class="bm-tl-h">世界发生了什么</h5>
@@ -115,13 +115,18 @@ function _render(data) {
 }
 
 function _turn(t) {
+  // 每次调用配上它**真实发生**的时刻，这样左右两栏才对得上：右栏 +8.7s 开讲，
+  // 左栏那次 speak 也应该写着 +8.7s，而不是整轮写完的 +14.5s。
   const calls = (t.calls || []).map((c) => `
-    <div class="bm-tl-call"><b>${_esc(c.name)}</b>
+    <div class="bm-tl-call">${c.at == null ? '' : `<span class="bm-tl-callat">+${c.at}s</span>`}
+      <b>${_esc(c.name)}</b>
       <span class="bm-tl-args">${_esc(c.args)}</span></div>`).join('');
+  const when = t.at == null
+    ? '<i class="bm-tl-nowhen">时间不在本次运行内</i>　'
+    : `+${t.at}s${t.timing === 'written' ? '<i class="bm-tl-approx">写完时</i>' : ''}　`;
   return `
     <div class="bm-tl-turn">
-      <div class="bm-tl-when">${t.at == null
-        ? '<i class="bm-tl-nowhen">时间落在本轮之外</i>　' : `+${t.at}s　`}第 ${t.turn + 1} 轮${
+      <div class="bm-tl-when">${when}第 ${t.turn + 1} 轮${
         t.sessionTurn != null && t.sessionTurn !== t.turn
           ? `<span class="bm-tl-session">会话内第 ${t.sessionTurn + 1} 轮</span>` : ''}</div>
       ${t.trigger ? `<div class="bm-tl-trigger">“${_esc(t.trigger)}”</div>` : ''}

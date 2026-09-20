@@ -671,3 +671,77 @@ def test_marking_stale_runs_leaves_finished_ones_alone():
 
     assert benchmark_store.get_run(done)['status'] == 'done'
     assert benchmark_store.get_run(done)['score_total'] == 90.0
+
+
+# ── 两栏对齐 ──────────────────────────────────────────────────────────────────
+
+def _run_with_session(name='导览'):
+    run_id = benchmark_store.create_run(name)
+    stored = benchmark_store.get_run(run_id)
+    conn = benchmark_store._get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=?, ended_at=? WHERE id=?',
+                 ('s1', stored['started_at'] + 300, run_id))
+    conn.commit()
+    return run_id, stored['started_at']
+
+
+def test_a_turns_time_comes_from_the_spans_not_from_when_it_was_written(monkeypatch):
+    """真机上左栏 +14.5s 的那次讲解，右栏 +8.7s 就开讲了 —— 会话历史只记「这一轮
+    什么时候被写完」，而一轮里的动作发生在那之前，左栏整体晚一整轮的时长。"""
+    run_id, started = _run_with_session()
+
+    import chat_history
+    import perf_log
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': started, 'updated_at': started + 14.5, 'messages': [
+            {'role': 'user', 'content': '带我转一下展区'},
+            {'role': 'assistant', 'content': '好的',
+             'tool_calls': [{'function': {'name': 'mcp__m__tts', 'arguments': '{}'}}]}]}])
+    monkeypatch.setattr(perf_log, 'turns_between', lambda a, b: [{
+        'turn_id': 't1', 'trigger_text': '带我转一下展区',
+        'spans': [{'span': 'turn_total', 'start_ts': started + 5.0},
+                  {'span': 'tool:tts', 'start_ts': started + 8.7}]}])
+
+    turn = asyncio.run(benchmark.run_timeline(run_id))['agent'][0]
+
+    assert turn['at'] == 5.0 and turn['timing'] == 'exact'
+    assert turn['calls'][0]['at'] == 8.7
+
+
+def test_without_spans_the_time_is_marked_as_only_the_write_moment(monkeypatch):
+    """没有 spans 就只知道写完的时刻 —— 它比实际做事晚一整轮，界面要看得出区别。"""
+    run_id, started = _run_with_session()
+
+    import chat_history
+    import perf_log
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': started, 'updated_at': started + 14.5,
+        'messages': [{'role': 'user', 'content': '带我转一下展区'}]}])
+    monkeypatch.setattr(perf_log, 'turns_between', lambda a, b: [])
+
+    turn = asyncio.run(benchmark.run_timeline(run_id))['agent'][0]
+
+    assert turn['at'] == 14.5 and turn['timing'] == 'written'
+
+
+def test_a_call_whose_name_has_no_span_gets_no_time(monkeypatch):
+    """与其配错一个时刻，不如说不知道。"""
+    run_id, started = _run_with_session()
+
+    import chat_history
+    import perf_log
+    monkeypatch.setattr(chat_history, 'get_session_turns', lambda sid: [{
+        'started_at': started, 'updated_at': started + 10, 'messages': [
+            {'role': 'user', 'content': '带我转一下'},
+            {'role': 'assistant', 'content': '', 'tool_calls': [
+                {'function': {'name': 'mcp__m__tts', 'arguments': '{}'}},
+                {'function': {'name': 'mcp__m__loco', 'arguments': '{}'}}]}]}])
+    monkeypatch.setattr(perf_log, 'turns_between', lambda a, b: [{
+        'turn_id': 't1', 'trigger_text': '带我转一下',
+        'spans': [{'span': 'turn_total', 'start_ts': started + 1},
+                  {'span': 'tool:tts', 'start_ts': started + 3}]}])
+
+    calls = asyncio.run(benchmark.run_timeline(run_id))['agent'][0]['calls']
+
+    assert calls[0]['at'] == 3.0
+    assert 'at' not in calls[1]

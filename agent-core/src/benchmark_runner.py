@@ -21,7 +21,7 @@ collector、在合适的时刻追加插话、按用例的权重算分、把分�
 
 ## 一条安全闸，以及它管不到的地方
 
-注入的文本和真实指令无法区分。所以开跑之前检查画布：**只要有一张会动的卡片不属于
+注入的文本和真实指令无法区分。所以开始运行之前检查画布：**只要有一张会动的卡片不属于
 仿真器，就拒绝。**否则一句「带我转一下展区」会让真机器人走起来 —— 没有人确认过，
 也没有人在旁边。分类用 `peer.tools.is_read_only`，它按驱动申报的 type 和 layer 判，
 不猜名字（猜名字漏掉过 `loco`/`led`/`speaker`/`switch_mode`）。
@@ -57,7 +57,7 @@ REPORT_TOOL = 'sim_report'
 # 轮询事实的间隔。事实是驱动侧累积的，问快了只是白问。
 _POLL_SECONDS = 2.0
 
-# 跑动期间世界的持有者。`sim_scenario` 的 `load`/`reset` 是 LLM 可调用的 action ——
+# 运行期间世界的持有者。`sim_scenario` 的 `load`/`reset` 是 LLM 可调用的 action ——
 # 没有这把锁，被测的 agent 能重置正在测它的那次测量。
 OWNER = 'benchmark'
 
@@ -94,7 +94,7 @@ def unsafe_cards(simulator_mcp_id: str) -> list[dict]:
     return unsafe
 
 
-# ── 一次跑动 ──────────────────────────────────────────────────────────────────
+# ── 一次运行 ──────────────────────────────────────────────────────────────────
 
 class CaseRun:
     """一个用例的 N 次重复。同一时刻只允许有一个。"""
@@ -145,7 +145,7 @@ class CaseRun:
             self.error = str(exc)
         finally:
             # 把世界还给画布。不还，下一个人连 reset 都调不动，而错误信息会指向一次
-            # 早就结束的跑动。
+            # 早就结束的运行。
             await self._call(SCENARIO_TOOL, {'action': 'abort', 'owner': OWNER})
             await self._finish()
 
@@ -176,7 +176,7 @@ class CaseRun:
         """把一句话当作用户说的送进去 —— 用例的保真度就在这里。
 
         同时在世界的事件日志里留一条。判定用不着它（打断看的是 ACP 上报与
-        `nav_cancelled`），但**人**要看：`sim_report` 是事后复盘一次跑动的地方，
+        `nav_cancelled`），但**人**要看：`sim_report` 是事后复盘一次运行的地方，
         而一条「机器人好好走着突然掉头」的记录里，如果没有那句插话，读的人无从知道
         为什么。说话经由 collector，不经由仿真器，所以不补这一笔它就不在场。
         """
@@ -187,7 +187,7 @@ class CaseRun:
         try:
             await self._call(SCENARIO_TOOL, {'action': 'note', 'text': f'[用例{label}] {text}'})
         except Exception:
-            pass      # 记账失败不该让一次跑动停下来
+            pass      # 记账失败不该让一次运行停下来
 
     async def _watch(self, run: dict, started: float) -> dict:
         """边轮询事实边按触发条件追加插话，直到用例结束或超时。"""
@@ -274,9 +274,9 @@ class CaseRun:
     def _freeze_agent_track(self) -> list:
         """把 agent 这一侧也定格。
 
-        会话里的轮次是活的：跑动结束后 agent 接着工作，同一批行继续被改写。不定格，
+        会话里的轮次是活的：运行结束后 agent 接着工作，同一批行继续被改写。不定格，
         同一条记录过几分钟再打开就换了个样子 —— 真机上先显示 +32.8s，后来变成
-        「时间落在本轮之外」，而那次跑动一个字都没变。
+        「时间落在本轮之外」，而那次运行一个字都没变。
         """
         try:
             from api.benchmark import _agent_track
@@ -295,7 +295,7 @@ class CaseRun:
 # ── 触发与收尾判定 ────────────────────────────────────────────────────────────
 
 def _trigger_due(injection: dict, events: list, elapsed: float) -> Optional[float]:
-    """这条插话该在第几秒（跑动开始起算）发出；条件还没满足就返回 None。
+    """这条插话该在第几秒（运行开始起算）发出；条件还没满足就返回 None。
 
     两件事：
 
@@ -314,7 +314,7 @@ def _trigger_due(injection: dict, events: list, elapsed: float) -> Optional[floa
 
 
 def _finished(facts: dict, expect: dict) -> bool:
-    """所有期望到达的站点都到过了就算跑完，不必等满预算。"""
+    """所有期望到达的站点都到过了就算运行结束，不必等满预算。"""
     order = expect.get('waypoint_order') or []
     if not order:
         return False

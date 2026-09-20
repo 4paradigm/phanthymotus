@@ -8952,7 +8952,15 @@ html, body {
 /* 触发这一轮的那句话是人说的 —— 排成一句话，不排成一个字段。 */
 .bm-tl-trigger { margin: 3px 0; font-size: 12px; line-height: 1.5; color: var(--text); }
 .bm-tl-says { margin: 3px 0; font-size: 12px; line-height: 1.55; color: var(--text-muted); }
-.bm-tl-call { margin-top: 3px; font-size: 11px; font-family: var(--font-mono); }
+/* 每次调用自带真实时刻 —— 左右两栏就是靠这个对上的。 */
+.bm-tl-call {
+  margin-top: 3px; font-size: 11px; font-family: var(--font-mono);
+  display: flex; align-items: baseline; gap: 6px;
+}
+.bm-tl-callat { flex: 0 0 46px; text-align: right; color: var(--text-dim); }
+/* 没有 spans 时只知道「这一轮写完」的时刻，它比实际做事晚一整轮 —— 标出来，
+   否则读的人会拿它跟右栏逐秒对照。 */
+.bm-tl-approx { margin-left: 5px; color: var(--text-dim); font-style: normal; opacity: .8; }
 .bm-tl-call b { color: var(--accent); font-weight: 500; }
 .bm-tl-args {
   color: var(--text-dim); margin-left: 5px;

@@ -85,8 +85,8 @@ def _environment() -> dict:
 def _current_session() -> str:
     """主 agent 当前的会话 id。
 
-    跑动结束之后要回看「它当时怎么想的、调了什么」，而那份记录在 `chat_history` 里
-    按会话存。不在开跑时记下来，事后就只能靠时间去猜是哪一段对话。
+    运行结束之后要回看「它当时怎么想的、调了什么」，而那份记录在 `chat_history` 里
+    按会话存。不在开始运行时记下来，事后就只能靠时间去猜是哪一段对话。
     """
     try:
         import event
@@ -349,7 +349,7 @@ async def snapshot(request: fastapi.Request):
 
 @router.get('/snapshot')
 async def snapshot_info():
-    """存过的快照。**只报告，不自动还原** —— 跑完自动把画布换回去，会在用户正看着
+    """存过的快照。**只报告，不自动还原** —— 运行结束自动把画布换回去，会在用户正看着
     结果的时候把画布抽走；还原是用户的决定。"""
     import config
     stored = config.main.get(SNAPSHOT_KEY) or {}
@@ -468,15 +468,15 @@ async def run_detail(run_id: str):
 
 @router.get('/runs/{run_id}/timeline')
 async def run_timeline(run_id: str):
-    """一次跑动里到底发生了什么 —— 说了什么、想了什么、调了什么、世界怎么回应。
+    """一次运行里到底发生了什么 —— 说了什么、想了什么、调了什么、世界怎么回应。
 
-    分数只回答「好不好」，回答不了「哪儿坏了」。而这次跑动的现场**留不住**：仿真器
-    的世界下一次跑动一开始就被重置，会话历史会被压缩。所以事实在写入时就存进了
+    分数只回答「好不好」，回答不了「哪儿坏了」。而这次运行的详情**留不住**：仿真器
+    的世界下一次运行一开始就被重置，会话历史会被压缩。所以事实在写入时就存进了
     `benchmark_case.facts`，会话 id 存进了 `benchmark_run.session_id`。
 
     两条轨道**不强行合成一条**。agent 那侧的时间是墙钟，世界那侧是仿真时钟，两个钟
     相减没有意义 —— 各自归一到「从本轮开始起算的秒数」并排放，比编一个共同时间轴
-    诚实。对齐基准两边都是跑动开始：世界的第一条事件是 `scenario_load`（reset 那一刻），
+    诚实。对齐基准两边都是运行开始：世界的第一条事件是 `scenario_load`（reset 那一刻），
     agent 的第一轮是被那句初始指令唤醒的。
     """
     stored = benchmark_store.get_run(run_id)
@@ -506,11 +506,63 @@ async def run_timeline(run_id: str):
         'world': world,
         'transcript': facts.get('transcript') or [],
         'acp': facts.get('acp_posts') or [],
-        # 定格的那一份优先：会话里的轮次跑完之后还会被接着改写，现读一次，同一条
+        # 定格的那一份优先：会话里的轮次运行结束之后还会被接着改写，现读一次，同一条
         # 记录过几分钟就换了个样子。老记录没有定格，只能现读。
         'agent': stored.get('agent_track') or _agent_track(
             stored.get('session_id', ''), stored.get('started_at'), stored.get('ended_at')),
     }
+
+
+def _spans_by_trigger(started, ended) -> dict:
+    """这段时间里每一轮的**真实**起止与逐次工具调用时刻。
+
+    会话历史只记「这一轮是什么时候被写完的」，而一轮里的动作发生在那之前 —— 左栏
+    于是整体比右栏晚一整轮的时长，两条轨道看着就是对不上（真机上左栏 +14.5s 的那次
+    讲解，右栏在 +8.7s 就开讲了）。`perf_spans` 里有每次调用的真实起止，拿它对齐。
+
+    按 `trigger_text` 前缀配对，不按顺序配对：一次运行期间可能有别的来源插进来，
+    按顺序配会整体错位一格，而那种错位比没有时间更难发现。
+    """
+    if not started:
+        return {}
+    try:
+        import perf_log
+        turns = perf_log.turns_between(float(started) - 10, float(ended or started) + 600)
+    except Exception:
+        return {}
+    return {str(t.get('trigger_text') or '')[:60]: t for t in turns if t.get('trigger_text')}
+
+
+def _timing_from_spans(entry: dict, started: float) -> dict:
+    """把一轮的 spans 折算成「从本次运行开始起算」的秒数。"""
+    spans = entry.get('spans') or []
+    total = next((s for s in spans if s.get('span') == 'turn_total'), None)
+    begin = (total or {}).get('start_ts') or min(
+        (s.get('start_ts') for s in spans if s.get('start_ts')), default=None)
+    calls = [{'name': str(s['span'])[5:],
+              'at': round(float(s['start_ts']) - started, 1)}
+             for s in spans
+             if str(s.get('span', '')).startswith('tool:') and s.get('start_ts')]
+    return {
+        'at': round(float(begin) - started, 1) if begin else None,
+        'callTimes': calls,
+    }
+
+
+def _with_times(calls: list, times: list) -> list:
+    """给每次工具调用配上它真实发生的时刻。
+
+    按**名字顺序**配：spans 记的是调用名与时刻，会话记的是调用名与参数，两边同名
+    同序。名字对不上就不给时间 —— 与其配错一个，不如说不知道。
+    """
+    out, pool = [], list(times)
+    for call in calls:
+        match = next((i for i, t in enumerate(pool) if t['name'] == call['name']), None)
+        if match is None:
+            out.append(call)
+            continue
+        out.append({**call, 'at': pool.pop(match)['at']})
+    return out
 
 
 def _trigger_of(triggers: list) -> str:
@@ -526,11 +578,11 @@ def _trigger_of(triggers: list) -> str:
 
 
 def _agent_track(session_id: str, started, ended) -> list:
-    """这次跑动期间 agent 说了什么、调了什么。
+    """这次运行期间 agent 说了什么、调了什么。
 
     按**轮**取，不按消息取：一轮就是「被什么唤醒 → 想了什么 → 调了哪些工具」，而
     那正好是排查时要看的粒度。会话被清过或压缩掉就只能返回空 —— 与其编一段出来，
-    不如让前端说「这次跑动的对话记录已经没有了」。
+    不如让前端说「这次运行的对话记录已经没有了」。
     """
     if not session_id:
         return []
@@ -540,6 +592,7 @@ def _agent_track(session_id: str, started, ended) -> list:
     except Exception:
         return []
 
+    by_trigger = _spans_by_trigger(started, ended)
     window_from = float(started) - 5 if started else None
     window_to = float(ended) + 5 if ended else None
 
@@ -549,15 +602,15 @@ def _agent_track(session_id: str, started, ended) -> list:
         # 按**区间相交**判断，不按开始时刻。
         #
         # 一轮是被反复重写的：`save_turn` 在 turn_index 已存在时走 UPDATE，`created_at`
-        # 保持不变、`updated_at` 往后走。所以一轮可能在跑动**开始之前**就起了头，而
-        # 它的内容是在跑动**期间**写进去的。只看起始时刻，这一轮会被整个丢掉 ——
-        # Orin6 上就是如此：会话明明活跃在跑动窗口里（`ended_at` 落在窗口内），
+        # 保持不变、`updated_at` 往后走。所以一轮可能在运行**开始之前**就起了头，而
+        # 它的内容是在运行**期间**写进去的。只看起始时刻，这一轮会被整个丢掉 ——
+        # Orin6 上就是如此：会话明明活跃在运行窗口里（`ended_at` 落在窗口内），
         # 而每一轮的 `started_at` 都在窗口之前，于是 agent 那一栏是空的。
         until = turn.get('updated_at') or at
         if window_from is not None and until and until < window_from:
-            continue          # 整轮都结束在跑动之前
+            continue          # 整轮都结束在运行之前
         if window_to is not None and at and at > window_to:
-            continue          # 整轮都开始在跑动之后
+            continue          # 整轮都开始在运行之后
         says, calls, triggers = [], [], []
         for message in turn.get('messages') or []:
             role = message.get('role')
@@ -577,25 +630,33 @@ def _agent_track(session_id: str, started, ended) -> list:
         # 轮号从小往大重排，于是 `save_turn` 撞上几天前那一轮的行走了 UPDATE ——
         # `created_at` 留在几天前，内容却是刚刚写的。真机上因此排出了「第 11 轮
         # +-277189.7s」这种时间。最后写入的时刻才是这轮真正发生的时刻。
+        # 时间优先用 spans 里的真实起止 —— 会话历史只有「写完」那一刻。
+        spans_entry = by_trigger.get((triggers[0] if triggers else '')[:60])
+        timed = _timing_from_spans(spans_entry, float(started)) if (spans_entry and started) else {}
         written = turn.get('updated_at') or at
-        offset = round(written - float(started), 1) if (started and written) else None
-        # 落在本轮跑动窗口之外的时间**不显示**。
+        offset = timed.get('at') if timed.get('at') is not None else (
+            round(written - float(started), 1) if (started and written) else None)
+        # 落在本轮运行窗口之外的时间**不显示**。
         #
-        # 一轮可能在跑动之前起头、在跑动之后还在被追写（真机上见过一轮 `updated_at`
-        # 在跑动结束 26 分钟之后）。那种情况下两个时间戳都不在窗口里，排出来的
-        # 「+1980s」放在一次 7 分钟的跑动里，是个看起来精确的假数。宁可不给数。
+        # 一轮可能在运行之前起头、在运行之后还在被追写（真机上见过一轮 `updated_at`
+        # 在运行结束 26 分钟之后）。那种情况下两个时间戳都不在窗口里，排出来的
+        # 「+1980s」放在一次 7 分钟的运行里，是个看起来精确的假数。宁可不给数。
         duration = (float(ended) - float(started)) if (started and ended) else None
         outside = (offset is not None and duration is not None
                    and not (-5 <= offset <= duration + 5))
-        # 轮号从**这次跑动**数起，不用会话里的序号 —— 打开的是一次跑动的现场，
+        # 轮号从**这次运行**数起，不用会话里的序号 —— 打开的是一次运行的详情，
         # 第一轮却写着「第 11 轮」，读的人会以为前面漏了十轮。会话里的序号留在
         # `sessionTurn`，要和历史面板对照时还用得上。
         track.append({
             'turn': len(track),
             'sessionTurn': index,
             'at': None if outside else offset,
-            'timing': 'outside' if outside else 'exact',
-            'trigger': _trigger_of(triggers), 'says': says, 'calls': calls,
+            # `exact` = 来自 spans 的真实时刻；`written` = 只知道这一轮写完的时刻，
+            # 比它做的事晚一整轮。两者在界面上要看得出区别。
+            'timing': ('outside' if outside
+                       else ('exact' if timed.get('at') is not None else 'written')),
+            'trigger': _trigger_of(triggers), 'says': says,
+            'calls': _with_times(calls, timed.get('callTimes') or []),
         })
     return track
 

@@ -60,7 +60,7 @@ _SCHEMA = (
         artifacts_ref TEXT DEFAULT ''
     )
     ''',
-    # 本机用例库。表名**不是** benchmark_case —— 那个名字已经被「一次跑动里的一个
+    # 本机用例库。表名**不是** benchmark_case —— 那个名字已经被「一次运行里的一个
     # repeat」占了。同名不同义在这一轮已经坑过三次（kind / result / state），不再
     # 来第四次：这里存的是「要跑什么」，上面那张存的是「跑出了什么」。
     '''
@@ -136,7 +136,7 @@ def add_case(run_id: str, *, scenario: str, repeat_idx: int = 0, seed: int = 0,
     """记一次 repeat 的结果。
 
     `facts` 是驱动那一侧的完整事实（事件流、播报记录、ACP 上报）。存下来，是因为
-    仿真器的世界**下一次跑动一开始就被重置**了 —— 不在这里留一份，一次跑动结束之后
+    仿真器的世界**下一次运行一开始就被重置**了 —— 不在这里留一份，一次运行结束之后
     就再也没法回看它到底发生了什么，而「分数为什么是这个」恰恰只能从那里回答。
     """
     conn = _get_conn()
@@ -152,10 +152,10 @@ def add_case(run_id: str, *, scenario: str, repeat_idx: int = 0, seed: int = 0,
 def finish_run(run_id: str, *, status: str = 'done', score_total: float | None = None,
                score_stdev: float | None = None, scores_by_dim: dict | None = None,
                detail: str = '', agent_track: list | None = None) -> None:
-    """收尾一次跑动。
+    """收尾一次运行。
 
-    `agent_track` 在这里定格。会话里的轮次是**活的** —— 跑动结束之后 agent 继续工作，
-    同一批行还会被接着改写，`updated_at` 一路往后走。等到有人回头看这次跑动，读到的
+    `agent_track` 在这里定格。会话里的轮次是**活的** —— 运行结束之后 agent 继续工作，
+    同一批行还会被接着改写，`updated_at` 一路往后走。等到有人回头看这次运行，读到的
     就不是它当时的样子了：真机上先是排出了正确的 +32.8s，几分钟后同一条记录变成了
     「时间落在本轮之外」。驱动那侧的事实早就是这么存的，agent 这侧同理。
     """
@@ -169,15 +169,15 @@ def finish_run(run_id: str, *, status: str = 'done', score_total: float | None =
 
 
 def mark_stale_runs() -> int:
-    """启动时把还标着 `running` 的跑动记为中断。
+    """启动时把还标着 `running` 的运行记为中断。
 
     agent-core 重启会带走那个在跑的 asyncio task，而记录留在原地 —— 于是它永远停在
-    「进行中」，面板每次打开都报一次并不存在的跑动。
+    「进行中」，面板每次打开都报一次并不存在的运行。
     """
     conn = _get_conn()
     cursor = conn.execute(
         "UPDATE benchmark_run SET status='interrupted', ended_at=?, "
-        "detail='agent-core 重启，跑动被中断' WHERE status='running'",
+        "detail='agent-core 重启，运行被中断' WHERE status='running'",
         (time.time(),))
     conn.commit()
     return cursor.rowcount

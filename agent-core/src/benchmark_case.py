@@ -308,7 +308,7 @@ CHECKS = (check_waypoint_order, check_announce_after_arrive, check_never_occupie
 
 def evaluate(payload: dict, events: list[dict], acp_posts: list[dict] | None = None,
              facts: dict | None = None) -> list[dict]:
-    """判定一次跑动。`facts` 是驱动给出的整份事实，事件流之外还有些量只有它算得出。"""
+    """判定一次运行。`facts` 是驱动给出的整份事实，事件流之外还有些量只有它算得出。"""
     expect = ((test_block(payload) or {}).get('evaluate') or {}).get('expect') or {}
     return [check(expect, events or [], acp_posts=acp_posts or [], facts=facts or {})
             for check in CHECKS]

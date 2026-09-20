@@ -149,7 +149,7 @@ function _caseCard(c) {
     ? `<span class="bm-card-score">${c.last.score_total ?? '—'}${
         c.last.score_stdev != null ? ` ±${c.last.score_stdev}` : ''
       }<span class="bm-n">n=${c.last.n_repeats}</span></span>`
-    : '<span class="bm-card-score bm-card-score--none">还没跑过</span>';
+    : '<span class="bm-card-score bm-card-score--none">还没运行过</span>';
   return `
     <div class="bm-card${c.isLoaded ? ' bm-card--loaded' : ''}" data-id="${_esc(c.id)}">
       <div class="bm-card-head">
@@ -163,7 +163,7 @@ function _caseCard(c) {
         <span class="bm-card-actions">
           <button class="bm-linkbtn" data-edit="${_esc(c.id)}">编辑</button>
           <button class="bm-linkbtn" data-del="${_esc(c.id)}">删除</button>
-          <button class="bm-cardrun" data-run="${_esc(c.id)}">跑</button>
+          <button class="bm-cardrun" data-run="${_esc(c.id)}">运行</button>
         </span>
       </div>
       ${(c.problems || []).length ? `<ul class="bm-blockers">${
@@ -178,7 +178,7 @@ function _bindCaseCards(el) {
     'click', () => _startCase(b.dataset.run)));
   el.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
     const card = _cases.find((c) => c.id === b.dataset.del);
-    if (!window.confirm(`删掉用例「${card?.name || ''}」？跑过的分数会留在历史里。`)) return;
+    if (!window.confirm(`删掉用例「${card?.name || ''}」？运行过的分数会留在历史里。`)) return;
     await api(`/api/benchmark/cases/${b.dataset.del}`, { method: 'DELETE' });
     await _loadLibrary();
   }));
@@ -292,7 +292,7 @@ function _showBlockers(name, rows) {
   const el = document.getElementById('bm-progress');
   if (!el) return;
   el.innerHTML = `<div class="bm-blocked">
-    <b>${_esc(name)}</b> 还跑不了：
+    <b>${_esc(name)}</b> 暂时无法运行：
     <ul class="bm-blockers">${rows.map((r) => `<li>${r}</li>`).join('')}</ul>
   </div>`;
 }
@@ -303,13 +303,13 @@ function _confirmOverwrite(caseId, card, pre, repeats) {
   const mine = pre?.overwrite?.canvas?.cards ?? 0;
   el.innerHTML = `
     <div class="bm-overwrite">
-      <p class="bm-note">跑「${_esc(card?.name || '')}」要先把它自带的画布载入进来，
+      <p class="bm-note">运行「${_esc(card?.name || '')}」要先把它自带的画布载入进来，
         会替换掉画布上现在的 ${mine} 张卡片。</p>
       <button class="bm-linkbtn" id="bm-save-canvas">先把当前画布存成解决方案</button>
       <label class="bm-confirm"><input type="checkbox" id="bm-confirm-overwrite">
         我知道会覆盖当前画布</label>
       <div class="bm-case-actions">
-        <button class="btn-primary" id="bm-case-apply" disabled>载入并开跑</button>
+        <button class="btn-primary" id="bm-case-apply" disabled>载入并运行</button>
         <button class="bm-linkbtn" id="bm-case-cancel">取消</button>
       </div>
     </div>`;
@@ -341,7 +341,7 @@ export async function saveCanvasSnapshot() {
     link.download = `canvas-${new Date().toISOString().slice(0, 10)}.json`;
     link.click();
     URL.revokeObjectURL(link.href);
-    showToast(`已存下 ${result.cards} 张卡片，跑完可以还原`);
+    showToast(`已存下 ${result.cards} 张卡片，运行结束后可以还原`);
   } catch (e) {
     showToast(`存不下来：${e.message || e}`);
   }
@@ -387,7 +387,7 @@ async function _runCase(repeats) {
       method: 'POST', body: JSON.stringify({ repeats, seed: 0 }),
     });
     _runId = result.run_id;
-    showToast(`用例已开始 × ${repeats} 次`);
+    showToast(`用例开始运行 × ${repeats} 次`);
     _startPolling();
   } catch (e) {
     showToast(runRefusal(e));
@@ -397,20 +397,20 @@ async function _runCase(repeats) {
 /** 拒绝跑的理由要说成人话，尤其是安全那条 —— 它不是故障，是它该拦下来。 */
 export function runRefusal(error) {
   const detail = error?.detail || error?.message || error;
-  if (typeof detail === 'string') return `跑不了：${detail}`;
+  if (typeof detail === 'string') return `无法运行：${detail}`;
   if (detail?.unsafe?.length) {
     const names = detail.unsafe.map((u) => `${u.device} 的 ${u.tool}`).join('、');
     return `画布上有真设备会跟着动（${names}）。用例的指令和真指令分不出来 —— ` +
            `先把它们从画布上拿掉。`;
   }
   if (detail?.readiness) return '用例的依赖还不齐，看上面那几条。';
-  return `跑不了：${JSON.stringify(detail)}`;
+  return `无法运行：${JSON.stringify(detail)}`;
 }
 
 async function _abort() {
   try {
     await api('/api/benchmark/case/abort', { method: 'POST' });
-    showToast('已中止，已跑完的那几次留在历史里');
+    showToast('已中止，已运行结束的那几次留在历史里');
   } catch (e) {
     showToast(`中止失败：${e.message || e}`);
   }
@@ -419,7 +419,7 @@ async function _abort() {
 function _startPolling() {
   if (_pollTimer) return;      // 已经在轮询了，别把自己重置掉
   _stopPolling();
-  // 跑动在后台的 asyncio task 上推进，所以进度是轮询而不是推流。
+  // 运行在后台的 asyncio task 上推进，所以进度是轮询而不是推流。
   _pollTimer = setInterval(_poll, 3000);
 }
 
@@ -430,9 +430,9 @@ function _stopPolling() {
 /**
  * 进度该显示什么。
  *
- * 跑着但一次 repeat 都还没跑完，是长程用例的常态 —— 第一趟导览就是好几分钟。只按
+ * 跑着但一次 repeat 都还没运行结束，是长程用例的常态 —— 第一趟导览就是好几分钟。只按
  * 「有没有已完成的 case」判断，这段时间里刷新一下页面，面板会说「没有正在进行的
- * 跑动」，而机器人正在走。真机上就是这么露出来的。
+ * 运行」，而机器人正在走。真机上就是这么露出来的。
  */
 export function progressView(data) {
   const live = ['starting', 'running'].includes(data?.state);
@@ -458,7 +458,7 @@ async function _poll() {
 
   if (!view.show) {
     // 空闲时不报「0 / 0 个 case」——那是噪音，不是信息。
-    el.innerHTML = '<div class="bm-empty">没有正在进行的跑动。</div>';
+    el.innerHTML = '<div class="bm-empty">当前没有运行中的测试。</div>';
     return;
   }
   const cases = data.cases || [];
@@ -505,7 +505,7 @@ async function _offerRestore() {
   try {
     const info = await api('/api/benchmark/snapshot');
     if (!info.saved || !el) return;
-    // 提示，不自动还原：跑完把画布换回去，会在用户正看着结果的时候把画布抽走。
+    // 提示，不自动还原：运行结束把画布换回去，会在用户正看着结果的时候把画布抽走。
     const row = document.createElement('div');
     row.className = 'bm-restore';
     row.innerHTML = `画布还是用例自带的那张。
@@ -544,7 +544,7 @@ async function _loadRuns() {
     const config = [r.llm_model, Object.values(r.image_tags || {}).filter(Boolean).join(' ')]
       .filter(Boolean).join('  ');
     return `
-    <div class="bm-run-row" data-run="${_esc(r.id)}" title="点开看这次跑动的现场">
+    <div class="bm-run-row" data-run="${_esc(r.id)}" title="点开查看这次运行的详情">
       <div class="bm-run-id">
         <div class="bm-run-when">${_time(r.started_at)}　${_esc(r.suite)}</div>
         <span class="bm-run-config">${_esc(config) || '未记录配置'}</span>
