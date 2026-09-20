@@ -4167,6 +4167,13 @@ html, body {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   cursor: grab;
+  /* 表头要画在空状态遮罩之上。遮罩是 inset:0 的不透明层，只靠它自己的 49px
+     padding 把文字让开，背景照样盖住整条表头 —— 于是还没来数据的卡片是一块
+     没有标题、没有话题、没有格式标签的空白，光看它认不出是哪一路数据。
+     给表头自己的层级，遮罩多高都盖不住它。 */
+  position: relative;
+  z-index: 1;
+  background: var(--bg-card);
 }
 .monitor-card-header:active { cursor: grabbing; }
 
@@ -4283,6 +4290,7 @@ html, body {
      legible. Nothing is being hidden — this is only up while the card has no
      data, and `.has-data` removes it on the first real frame. */
   background: var(--bg-card);
+  z-index: 0;
 }
 .monitor-card.has-data .monitor-card-empty { display: none; }
 .monitor-card-empty-title {
