@@ -174,7 +174,7 @@ test('插话的延时空着按 0 算，不是 NaN', () => {
 
 // ── 跑动现场：静默是线索 ─────────────────────────────────────────────────────
 
-import { withQuiet, merge, scorecard, scoreItem, metricLine } from './benchmark-timeline.js';
+import { withQuiet, merge, scorecard, scoreItem, metricTable } from './benchmark-timeline.js';
 
 test('每一段静默都画出来，不只是最长的那段', () => {
   // 排查时要看的是「时间去哪儿了」。每行左边虽然有 +Xs，但那要人自己做减法 ——
@@ -391,12 +391,19 @@ test('原则分按权重算，和后端一致', () => {
   assert.match(html, />75</);
 });
 
-test('指标一直显示，不管那条原则判没判得了', () => {
-  // 判分会抖，「中位 8.4s」不会 —— 所以它要一直在。
-  const line = metricLine({ median_s: 8.4231, rounds: 12, note: '' });
+test('指标用人能读的名字，不是原始键名', () => {
+  // `spoke_before_arrival 1 left_while_speaking 0` 是给代码看的，读的人得先翻译一遍。
+  const html = metricTable({ median_s: 8.4231, rounds: 12, note: '' });
 
-  assert.match(line, /median_s 8.42/);
-  assert.match(line, /rounds 12/);
+  assert.match(html, /中位/);
+  assert.match(html, /8.42/);
+  assert.match(html, /轮数/);
+  assert.doesNotMatch(html, /median_s/);
+});
+
+test('带单位的指标把单位显示出来', () => {
+  assert.match(metricTable({ silence_max_s: 12.53 }), /最长静默/);
+  assert.match(metricTable({ silence_max_s: 12.53 }), /秒/);
 });
 
 test('老记录没有 results 时退回原来那行，不是空白', () => {
@@ -425,4 +432,15 @@ test('比例型显示分数本身，不是对勾', () => {
   assert.match(html, />88</);
   assert.match(html, /按比例计分/);
   assert.doesNotMatch(html, /✓/);
+});
+
+
+test('判定排成表：结论、项目、来源、权重各占一列', () => {
+  const html = scoreItem({ kind: 'target', ok: true, text: '讲完再走',
+                           detail: '0（目标 ≤0）', weight: 10 });
+
+  assert.match(html, /<tr/);
+  assert.match(html, /<td[^>]*>10<\/td>/);
+  // 理由另起一行、跨列，不挤在项目那一格里。
+  assert.match(html, /colspan="3"/);
 });

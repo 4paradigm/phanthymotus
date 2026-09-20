@@ -8771,32 +8771,42 @@ html, body {
 .bm-tl-tab.active { color: var(--text); border-bottom-color: var(--accent); }
 .bm-tl-pane { padding-top: 10px; }
 
-/* 「分数为什么是这个」。每条原则一块，块里是一项一项的判定。 */
-.bm-sc { margin: 10px 0 14px; }
-.bm-sc-dim { margin-bottom: 10px; padding-left: 9px; border-left: 2px solid var(--border); }
-.bm-sc-head { display: flex; align-items: baseline; gap: 9px; font-size: 12px; }
-.bm-sc-num { font-family: var(--font-mono); font-weight: 600; }
+/* 「分数为什么是这个」。每条原则一张表 —— 这一屏是用来**扫**的：七条原则十几项，
+   混在一行行散文里，眼睛找不到「哪一条没过、差多少」。列固定之后上下对齐。 */
+.bm-sc { margin: 4px 0 14px; }
+.bm-sc-dim { margin-bottom: 14px; }
+.bm-sc-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 5px; }
+.bm-sc-head b { font-size: 12px; }
+.bm-sc-num { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
 /* 「判不了」不着色也不加粗 —— 一个醒目的「判不了」会被当成一个分数。 */
-.bm-sc-num--none { font-weight: 400; color: var(--text-muted); }
-.bm-sc-metrics {
-  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  font-family: var(--font-mono); font-size: 10px; color: var(--text-muted);
+.bm-sc-num--none { font-size: 11px; font-weight: 400; color: var(--text-muted); }
+
+/* 指标：横排小格，名字在上、数在下。原先是一行原始键名，给代码看的。 */
+.bm-sc-ms { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.bm-sc-m {
+  padding: 3px 8px; border-radius: 3px; background: var(--bg-subtle, rgba(127,127,127,.08));
+  font-family: var(--font-mono); font-size: 11px; color: var(--text);
 }
-.bm-sc-item {
-  display: grid; grid-template-columns: 14px 1fr; gap: 2px 6px;
-  margin-top: 5px; font-size: 11px; line-height: 1.5;
-}
-.bm-sc-mark { font-weight: 600; }
+.bm-sc-m i { margin-right: 5px; font-style: normal; color: var(--text-muted); }
+.bm-sc-m u { margin-left: 1px; text-decoration: none; color: var(--text-muted); }
+
+.bm-sc-t { width: 100%; border-collapse: collapse; font-size: 11px; }
+.bm-sc-t td { padding: 4px 6px; border-top: 1px solid var(--border-subtle, rgba(127,127,127,.15)); }
+.bm-sc-mark { width: 26px; text-align: center; font-weight: 600; }
 .bm-sc-item--ok .bm-sc-mark { color: var(--green, #2E7D32); }
 .bm-sc-item--bad .bm-sc-mark { color: var(--red); }
 .bm-sc-item--none .bm-sc-mark { color: var(--text-muted); }
-/* 比例型的那一项显示的是分数本身，不是对勾 —— 88% 不是「通过」，它就是 88 分。 */
+/* 比例型显示的是分数本身，不是对勾 —— 88% 不是「通过」，它就是 88 分。 */
 .bm-sc-item--ratio .bm-sc-mark { font-family: var(--font-mono); color: var(--text); }
+.bm-sc-text { width: auto; }
 /* 「算出来的」和「裁判判的」要分得清：一个不会抖，一个会。 */
-.bm-sc-from { margin-left: 6px; font-size: 10px; font-style: normal; color: var(--text-muted); }
-.bm-sc-why, .bm-sc-steps { grid-column: 2; color: var(--text-muted); }
-.bm-sc-step { display: flex; gap: 7px; margin-top: 2px; font-size: 10px; }
-.bm-sc-step > span:first-child { flex: none; color: var(--green, #2E7D32); }
+.bm-sc-from { width: 76px; white-space: nowrap; color: var(--text-muted); }
+.bm-sc-w { width: 38px; text-align: right; font-family: var(--font-mono); color: var(--text-muted); }
+.bm-sc-extra td { border-top: none; padding-top: 0; }
+.bm-sc-why { color: var(--text-muted); line-height: 1.55; }
+.bm-sc-steps { margin-top: 3px; }
+.bm-sc-step { display: flex; gap: 8px; margin-top: 2px; line-height: 1.5; }
+.bm-sc-step > span:first-child { flex: none; width: 24px; color: var(--green, #2E7D32); }
 .bm-sc-step--off > span:first-child { color: var(--red); }
 .bm-compare { margin-bottom: 9px; font-size: 11px; line-height: 1.6; }
 .bm-compare b { font-weight: 600; }

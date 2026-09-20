@@ -37,11 +37,30 @@ const DIMS = {
   answer_quality: '回答效果', ux: '用户体验', physical_safety: '安全',
 };
 
-/** 「分数为什么是这个」—— 每一项的判定、理由，以及算出来的那些数。
+// 指标的名字与单位。原先直接把 `spoke_before_arrival 1 left_while_speaking 0` 这种
+// 原始键名摆在用户面前 —— 那是给代码看的，读的人得先在心里翻译一遍。
+const METRICS = {
+  spoke_before_arrival: ['到达前开讲', '次'], left_while_speaking: ['讲完前就走', '次'],
+  acp_contradictions: ['ACP 与事实矛盾', '条'], nav_legs: ['导航段数', '段'],
+  speak_turns: ['讲解次数', '次'],
+  total_seconds: ['总时长', '秒'], llm_seconds: ['推理耗时', '秒'],
+  tool_seconds: ['工具耗时', '秒'], tool_parallelism: ['工具并行度', ''],
+  idle_seconds: ['空档', '秒'], idle_ratio: ['空档占比', ''],
+  serialised_cross_channel: ['本可并行却串行', '次'],
+  rounds: ['轮数', ''], rounds_ok: ['成功轮数', ''], median_s: ['中位', '秒'],
+  p95_s: ['P95', '秒'], max_s: ['最慢', '秒'],
+  prompt_tokens: ['prompt', ''], cached_tokens: ['命中', ''], ratio: ['命中率', ''],
+  silence_avg_s: ['平均静默', '秒'], silence_max_s: ['最长静默', '秒'],
+  silence_total_s: ['静默总计', '秒'], silence_count: ['静默段数', '段'],
+  first_response_s: ['首次响应', '秒'], interrupt_response_s: ['打断后响应', '秒'],
+  incidents: ['事故', '次'], nav_failed: ['撞停', '次'],
+  trail_occupied: ['压占用格', '点'], first_reason: ['原因', ''],
+};
+
+/** 「分数为什么是这个」—— 每条原则一张表：结论、项目、来源、权重、数值或理由。
  *
- * 这一段原先不存在：跑完只留下失败项的名字，理由、裁判的逐步比对、七条原则的指标
- * 全都只活在内存里。于是这个弹窗能回答「好不好」，回答不了「哪儿坏了」，而后者才是
- * 打开它的理由。
+ * 排成表是因为这一屏是用来**扫**的：七条原则十几项，混在一行行散文里，眼睛找不到
+ * 「哪一条没过、差多少」。列固定之后，同一列上下对齐，扫一眼就知道。
  */
 export function scorecard(c) {
   const items = c.results || [];
@@ -57,55 +76,69 @@ export function scorecard(c) {
       const group = byDim[k] || [];
       const graded = group.filter((i) => i.measurable !== false);
       const score = graded.length
-        ? Math.round(100 * graded.filter((i) => i.ok).reduce((a, i) => a + (i.weight || 0), 0)
+        ? Math.round(100 * graded.reduce((a, i) => a + (i.weight || 0) * credit(i), 0)
             / (graded.reduce((a, i) => a + (i.weight || 0), 0) || 1))
         : null;
-      return `<div class="bm-sc-dim">
-        <div class="bm-sc-head">
+      return `<section class="bm-sc-dim">
+        <header class="bm-sc-head">
           <b>${_esc(DIMS[k])}</b>
           <span class="bm-sc-num${score == null ? ' bm-sc-num--none' : ''}">${
             score == null ? '判不了' : score}</span>
-          <span class="bm-sc-metrics">${_esc(metricLine(seen[k]))}</span>
-        </div>
-        ${group.map(scoreItem).join('')}
-      </div>`;
+        </header>
+        ${metricTable(seen[k])}
+        ${group.length ? `<table class="bm-sc-t"><tbody>${
+          group.map(scoreItem).join('')}</tbody></table>` : ''}
+      </section>`;
     }).join('')}</div>`;
 }
 
-/** 一条判定：结论、它是算出来的还是判出来的、以及理由。 */
+/** 这一项拿到多少分（0–1）。和后端 `benchmark_case._credit` 同一套规则。 */
+export function credit(i) {
+  if (i.credit != null) return Math.max(0, Math.min(1, Number(i.credit)));
+  return i.ok ? 1 : 0;
+}
+
+/** 那条原则算出来的几个数，横排成一行小格。判分会抖，这些不会。 */
+export function metricTable(block) {
+  const cells = Object.entries(block || {})
+    .filter(([, v]) => typeof v === 'number' || (typeof v === 'string' && v !== ''))
+    .map(([k, v]) => {
+      const [label, unit] = METRICS[k] || [k, ''];
+      const shown = typeof v === 'number' ? Math.round(v * 100) / 100 : v;
+      return `<span class="bm-sc-m"><i>${_esc(label)}</i>${_esc(shown)}${
+        unit ? `<u>${unit}</u>` : ''}</span>`;
+    });
+  return cells.length ? `<div class="bm-sc-ms">${cells.join('')}</div>` : '';
+}
+
+/** 一行：结论、项目、来源、权重、数值或理由。理由和逐步比对各占一整行。 */
 export function scoreItem(i) {
   const done = i.measurable !== false;
   const ratio = i.kind === 'ratio';
-  const mark = !done ? '—' : (ratio ? `${Math.round((i.credit ?? 0) * 100)}` : (i.ok ? '✓' : '✗'));
+  const mark = !done ? '—' : (ratio ? `${Math.round(credit(i) * 100)}` : (i.ok ? '✓' : '✗'));
   const cls = !done ? 'none' : (ratio ? 'ratio' : (i.ok ? 'ok' : 'bad'));
-  // **标签要说实际发生了什么，不是它属于哪一类。** 原先按 kind 打，于是一条没算成的
-  // 目标也写着「算出来的」—— 而它旁边正写着「判不了」的理由，两句直接打架。
+  // **来源说的是实际发生了什么，不是它属于哪一类。** 原先按 kind 打，于是一条没算成
+  // 的目标也写着「算出来的」—— 而它旁边正写着「判不了」的理由，两句直接打架。
   const from = !done ? '没算成'
     : ratio ? '按比例计分'
     : i.kind === 'target' ? '算出来的' : '裁判判的';
-  return `<div class="bm-sc-item bm-sc-item--${cls}">
-    <span class="bm-sc-mark">${mark}</span>
-    <span class="bm-sc-text">${_esc(i.text || '')}
-      <i class="bm-sc-from">${from}${i.weight ? ` · 权重 ${i.weight}` : ''}</i></span>
-    ${i.detail ? `<span class="bm-clip bm-sc-why">${_esc(i.detail)}</span>` : ''}
-    ${(i.steps || []).length ? `<div class="bm-sc-steps">${(i.steps || []).map((s) => `
+
+  const extra = [
+    i.detail ? `<div class="bm-clip bm-sc-why">${_esc(i.detail)}</div>` : '',
+    (i.steps || []).length ? `<div class="bm-sc-steps">${(i.steps || []).map((s) => `
       <div class="bm-sc-step${s.match ? '' : ' bm-sc-step--off'}">
         <span>${s.match ? '符合' : '偏离'}</span>
         <span>${_esc(s.step || '')}</span>
         <span class="bm-clip">${_esc(s.note || '')}</span>
-      </div>`).join('')}</div>` : ''}
-  </div>`;
-}
+      </div>`).join('')}</div>` : '',
+  ].filter(Boolean).join('');
 
-/** 那条原则算出来的几个数。判分会抖，这些不会 —— 所以它们要一直在。 */
-export function metricLine(block) {
-  if (!block || typeof block !== 'object') return '';
-  return Object.entries(block)
-    .filter(([, v]) => typeof v === 'number' || typeof v === 'string')
-    .filter(([, v]) => v !== '')
-    .slice(0, 5)
-    .map(([k, v]) => `${k} ${typeof v === 'number' ? Math.round(v * 100) / 100 : v}`)
-    .join('　');
+  return `<tr class="bm-sc-item bm-sc-item--${cls}">
+      <td class="bm-sc-mark">${mark}</td>
+      <td class="bm-sc-text">${_esc(i.text || '')}</td>
+      <td class="bm-sc-from">${from}</td>
+      <td class="bm-sc-w">${i.weight ?? ''}</td>
+    </tr>${extra ? `<tr class="bm-sc-extra"><td></td><td colspan="3">${extra}</td></tr>` : ''}`;
 }
 
 // 一次运行里最值钱的线索往往是「这里什么都没发生」—— 机器人卡住、LLM 空转、
