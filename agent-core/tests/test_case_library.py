@@ -182,6 +182,69 @@ def test_an_unreachable_market_is_an_empty_column_with_a_reason(monkeypatch):
     assert result['cases'] == [] and result['error']
 
 
+# ── 跑 = 当前画布 ─────────────────────────────────────────────────────────────
+
+def test_running_a_case_never_touches_the_canvas(monkeypatch):
+    """**这就是这一轮要修的那个 bug。**
+
+    原先想跑库里的用例，只能先「载入」它，而载入会把它自带的画布刷进来 —— 新建的用例
+    画布是空的，于是点一下「跑」，用户手上的画布就没了。
+
+    跑从来不该改画布：跑的永远是**当前**画布，用例提供的只是指令、插话和评判标准。
+    """
+    applied = []
+    from api import solutions
+    monkeypatch.setattr(solutions, 'apply', lambda *a, **k: applied.append(a))
+
+    case_id = benchmark_store.save_case(payload(cards=0), name='新用例')
+    got = benchmark._case_to_run(case_id)
+
+    assert got['run']['prompt'] == '带我转一下展区并给我介绍下'
+    assert applied == []          # 一次 apply 都没有
+
+
+def test_running_without_naming_a_case_uses_the_loaded_one(monkeypatch):
+    """不指名就跑当前方案自带的那个 —— 老行为，保留。"""
+    from api import solutions
+    monkeypatch.setattr(solutions, 'loaded_case', lambda: {'run': {'prompt': '当前的'}})
+
+    assert benchmark._case_to_run('')['run']['prompt'] == '当前的'
+
+
+def test_running_a_case_that_is_gone_is_a_404():
+    with pytest.raises(fastapi.HTTPException) as caught:
+        benchmark._case_to_run('nope')
+
+    assert caught.value.status_code == 404
+
+
+def test_an_old_format_case_is_migrated_on_its_way_to_the_runner():
+    """Orin6 上那个用例是旧格式。不转的话，跑起来一条要求都没有 —— 而且不报错。"""
+    legacy = {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [], 'test': {
+        'run': {'prompt': '带我转一下展厅'},
+        'evaluate': {'expect': {'waypoint_order': ['入口', '一号展区']}}}}
+    case_id = benchmark_store.save_case(legacy, name='旧的')
+
+    got = benchmark._case_to_run(case_id)
+
+    assert 'evaluate' not in got
+    assert any('入口' in r['text'] for r in benchmark_case.requirements({'test': got}))
+
+
+# ── 载入画布：唯一会覆盖的动作 ────────────────────────────────────────────────
+
+def test_loading_a_case_with_no_canvas_is_refused_rather_than_wiping_it():
+    """「没有可载入的东西」和「载入一张空画布」是两件完全不同的事，后者会毁掉用户
+    手上的工作。"""
+    case_id = benchmark_store.save_case(payload(cards=0), name='没画布')
+
+    with pytest.raises(fastapi.HTTPException) as caught:
+        asyncio.run(benchmark.apply_case(None, case_id))
+
+    assert caught.value.status_code == 409
+    assert '没有可载入' in caught.value.detail
+
+
 # ── summary / blank ───────────────────────────────────────────────────────────
 
 def test_summary_is_where_the_payload_shape_is_known():

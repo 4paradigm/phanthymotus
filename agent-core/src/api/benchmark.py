@@ -315,11 +315,23 @@ async def preflight_case(request: fastapi.Request, case_id: str, session_id: str
 
 @router.post('/cases/{case_id}/apply')
 async def apply_case(request: fastapi.Request, case_id: str, session_id: str = ''):
-    """把这个用例载入成当前方案（会覆盖画布）。"""
+    """把这个用例**自带的画布**载入成当前方案。
+
+    这是唯一会覆盖画布的入口，所以「画布会被覆盖」的确认属于这里 —— 跑用例不会走到
+    这条路。原先两件事是绑在一起的：想跑就得先载入，于是一个自带空画布的新用例，
+    点一下「跑」就把现场的画布清空了。
+
+    用例没有画布就拒绝，而不是载入一张空的。「没有可载入的东西」和「载入一张空画布」
+    是两件完全不同的事，后者会毁掉用户手上的工作。
+    """
     from api.solutions import LoadRequest, apply as apply_solution
     record = benchmark_store.get_case(case_id)
     if record is None:
         raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
+    if not ((record['payload'].get('canvas') or {}).get('cards') or []):
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='这个用例没有自带画布，没有可载入的东西 —— 直接在当前画布上跑就行')
     result = await apply_solution(request, LoadRequest(
         payload=record['payload'], includes=['canvas', 'test'],
         confirm=True, session_id=session_id))
@@ -395,6 +407,13 @@ async def snapshot_restore(request: fastapi.Request):
 class CaseRunRequest(BaseModel):
     repeats: int = 1
     seed: int = 0
+    # 要跑哪个用例。**空 = 跑当前方案自带的那个。**
+    #
+    # 这个字段是这一轮修的那个 bug 的解药：原先想跑库里的用例，只能先「载入」它，而
+    # 载入会把它自带的画布刷进来 —— 新建的用例画布是空的，于是点一下「跑」，当前画布
+    # 就没了。跑从来不该改画布：**跑的永远是当前画布**，用例提供的只是指令、插话和
+    # 评判标准。要把用例自带的画布搬进来，那是「载入」这个单独的动作。
+    case_id: str = ''
     # 真机确认。`moving_cards` 是前端弹窗里那个人**看到并同意**的那一组设备，
     # 形如 `["mcp-123:loco", ...]`。服务端会重算一遍再比对 —— 见 `_check_confirmation`。
     confirm_moving_cards: list[str] | None = None
@@ -427,6 +446,23 @@ def _check_confirmation(moving: list[dict], confirmed: list[str] | None) -> None
             'needs_confirmation': True, 'moving_cards': moving})
 
 
+def _case_to_run(case_id: str) -> dict | None:
+    """要跑的那个 `test` 段 —— **不碰画布**。
+
+    指名了就从本机用例库取，没指名就用当前方案自带的。两条路都只读 `test` 段：画布是
+    现场那一张，用例只贡献指令、插话和评判标准。
+    """
+    import benchmark_case
+    from api.solutions import loaded_case
+
+    if not case_id:
+        return loaded_case()
+    record = benchmark_store.get_case(case_id)
+    if record is None:
+        raise fastapi.HTTPException(status_code=404, detail='没有这个用例')
+    return benchmark_case.test_block(benchmark_case.migrate(record['payload']))
+
+
 @router.post('/case/run')
 async def run_case(request: CaseRunRequest):
     """跑当前方案带的用例。
@@ -441,10 +477,10 @@ async def run_case(request: CaseRunRequest):
     if benchmark_runner.is_busy():
         raise fastapi.HTTPException(status_code=409, detail='已经有一次基准测试在跑')
 
-    case = loaded_case()
+    case = _case_to_run(request.case_id)
     if not case:
         raise fastapi.HTTPException(
-            status_code=409, detail='当前方案里没有 test 段，先载入一个测试用例')
+            status_code=409, detail='没有可跑的用例：在左边挑一个，或者给当前方案加一段 test')
 
     # 智能控制没开，事件进不了 collector（`collector.project_running` 那道闸），
     # 初始指令送进去也不会有人处理 —— 跑完会记一个 0 分，而那是基准测试在撒谎。
