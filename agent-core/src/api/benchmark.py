@@ -609,7 +609,7 @@ def _trigger_of(triggers: list) -> str:
     """
     spoken = [t for t in triggers if not t.lstrip().startswith('<status')]
     if spoken:
-        return spoken[0][:200]
+        return spoken[0][:4000]
     return '（状态刷新）' if triggers else ''
 
 
@@ -659,7 +659,9 @@ def _agent_track(session_id: str, started, ended) -> list:
                 for call in message.get('tool_calls') or []:
                     fn = (call.get('function') or {})
                     calls.append({'name': str(fn.get('name', '')).split('__')[-1],
-                                  'args': str(fn.get('arguments', ''))[:200]})
+                                  # 不在这里截断：界面要能展开看全文，砍在后端就永远
+                                  # 看不到了。上限只挡住异常大的载荷。
+                                  'args': str(fn.get('arguments', ''))[:4000]})
         # 时间取 `updated_at`，不取 `created_at`。
         #
         # 一轮的行是会被**覆盖**的：agent-core 重启后 `_turns` 从上一个会话重新载入，

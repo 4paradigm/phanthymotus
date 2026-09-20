@@ -147,7 +147,7 @@ test('插话的延时空着按 0 算，不是 NaN', () => {
 
 // ── 跑动现场：静默是线索 ─────────────────────────────────────────────────────
 
-import { withQuiet } from './benchmark-timeline.js';
+import { withQuiet, merge } from './benchmark-timeline.js';
 
 test('每一段静默都画出来，不只是最长的那段', () => {
   // 排查时要看的是「时间去哪儿了」。每行左边虽然有 +Xs，但那要人自己做减法 ——
@@ -222,4 +222,53 @@ test('排队中的 repeat 不算已完成', () => {
 
   assert.equal(view.done, 1);
   assert.equal(view.total, 3);
+});
+
+
+// ── 合流：一条共享时间轴 ─────────────────────────────────────────────────────
+
+test('两侧按时间合成一条流', () => {
+  // 左右两栏各自排版时，同一秒在两边的高度不同 —— 时刻是对的，读的人却得拿眼睛
+  // 找数字，等于没对齐。
+  const rows = merge(
+    [{ turn: 0, at: 5, says: [], calls: [{ name: 'speak', at: 8.7, args: '{}' }] }],
+    [{ at: 0, kind: 'scenario_load' }, { at: 8.7, kind: 'speak_start' }]);
+
+  assert.deepEqual(rows.map((r) => [r.at, r.side]),
+                   [[0, 'world'], [5, 'agent'], [8.7, 'agent'], [8.7, 'world']]);
+});
+
+test('同一秒里各自原有的先后不被打乱', () => {
+  const rows = merge(
+    [{ turn: 0, at: 3, says: ['先说这句', '再说这句'], calls: [] }], []);
+
+  assert.deepEqual(rows.map((r) => r.kind), ['turn', 'say', 'say']);
+  assert.equal(rows[1].text, '先说这句');
+});
+
+test('时间不详的条目不跨侧去借时刻', () => {
+  // 跨侧借，等于在两条流之间编一个并不存在的对应关系 —— 这个视图里最容易被当真的
+  // 假象。一侧的第一条就没有时间，就让它保持没有。
+  const rows = merge(
+    [{ turn: 0, at: null, says: [], calls: [{ name: 'speak', args: '{}' }] }],
+    [{ at: 40, kind: 'arrive' }]);
+
+  assert.equal(rows[0].at, null);
+  assert.equal(rows[0].side, 'agent');
+});
+
+test('时间不详的条目跟着**自己这一侧**的上一条', () => {
+  const rows = merge([
+    { turn: 0, at: 12, says: [], calls: [] },
+    { turn: 1, at: null, says: ['配不上 spans 的那一轮'], calls: [] },
+  ], [{ at: 500, kind: 'arrive' }]);
+
+  assert.deepEqual(rows.filter((r) => r.side === 'agent').map((r) => r.at), [12, 12, 12]);
+});
+
+test('调用自带的时刻优先于所属轮次的时刻', () => {
+  const rows = merge(
+    [{ turn: 0, at: 5, says: [], calls: [{ name: 'speak', at: 30, args: '{}' }] }], []);
+
+  assert.deepEqual(rows.map((r) => r.at), [5, 30]);
 });
