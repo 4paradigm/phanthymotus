@@ -149,25 +149,41 @@ test('插话的延时空着按 0 算，不是 NaN', () => {
 
 import { withQuiet } from './benchmark-timeline.js';
 
-test('两条事件之间的长静默单独占一行', () => {
-  // 卡住、LLM 空转、barrier 等超时，在事件流里长得都一样：什么都没发生。
-  // 相邻两行挨着排，这段静默就看不见了 —— 而它通常就是答案。
-  const rows = withQuiet([{ at: 0, kind: 'arrive' }, { at: 300, kind: 'scenario_stop' }], 25);
+test('每一段静默都画出来，不只是最长的那段', () => {
+  // 排查时要看的是「时间去哪儿了」。每行左边虽然有 +Xs，但那要人自己做减法 ——
+  // 一屏十几行减下来，小停顿根本不会被注意到。
+  const rows = withQuiet([
+    { at: 0, kind: 'arrive' }, { at: 4, kind: 'speak_start' },
+    { at: 304, kind: 'scenario_stop' }]);
 
-  assert.equal(rows.length, 3);
-  assert.equal(rows[1].quiet, 300);
+  assert.deepEqual(rows.filter((r) => r.quiet).map((r) => r.quiet), ['4.0', 300]);
 });
 
-test('挨得近的事件之间不插静默行', () => {
-  const rows = withQuiet([{ at: 0, kind: 'arrive' }, { at: 4, kind: 'speak_start' }], 25);
+test('长静默和短停顿画得不一样', () => {
+  // 短停顿是节奏，长静默是事故。一个样子画，长的就淹在短的里面了。
+  const rows = withQuiet([{ at: 0 }, { at: 3 }, { at: 100 }]);
 
-  assert.equal(rows.length, 2);
-  assert.ok(rows.every((r) => !r.quiet));
+  assert.equal(rows.filter((r) => r.quiet)[0].loud, false);
+  assert.equal(rows.filter((r) => r.quiet)[1].loud, true);
+});
+
+test('1.5 秒以下当作连续', () => {
+  // 再往下，标注本身比它描述的停顿还长。
+  const rows = withQuiet([{ at: 0 }, { at: 1.2 }, { at: 2.0 }]);
+
+  assert.equal(rows.filter((r) => r.quiet).length, 0);
+});
+
+test('时间不详的行不参与静默计算', () => {
+  // 拿 null 当 0，会凭空算出一段跨越整场的静默 —— 这个视图里最容易被当真的假象。
+  const rows = withQuiet([{ at: null }, { at: 200 }, { at: 201 }]);
+
+  assert.equal(rows.filter((r) => r.quiet).length, 0);
 });
 
 test('第一条事件前面不算静默', () => {
   // 归一之后第一条就是 0 —— 拿它和「不存在的上一条」比，会凭空多出一行。
-  const rows = withQuiet([{ at: 40, kind: 'arrive' }], 25);
+  const rows = withQuiet([{ at: 40, kind: 'arrive' }]);
 
   assert.equal(rows.length, 1);
 });

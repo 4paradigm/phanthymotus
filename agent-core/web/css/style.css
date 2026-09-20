@@ -8965,9 +8965,13 @@ html, body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .bm-tl-detail i { color: var(--text-dim); font-style: normal; }
-/* 一段静默通常就是答案：卡住、空转、barrier 等超时，长得都一样。相邻两行挨着排，
-   它就看不见了。 */
+/* 每一段静默都画出来：排查时要看的就是时间去哪儿了。短停顿是节奏，安静地记一笔；
+   长静默是事故，得看得见。 */
 .bm-tl-quiet {
+  margin: 2px 0 2px 54px; padding-left: 10px; font-size: 10.5px; color: var(--text-dim);
+  border-left: 1px dashed var(--border);
+}
+.bm-tl-quiet--loud {
   margin: 4px 0 4px 54px; padding-left: 10px; font-size: 11px; color: var(--yellow);
   border-left: 2px dashed var(--border-med);
 }

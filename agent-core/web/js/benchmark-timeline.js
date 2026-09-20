@@ -29,7 +29,13 @@ const CHECKS = {
 
 // 一次跑动里最值钱的线索往往是「这里什么都没发生」—— 机器人卡住、LLM 空转、
 // barrier 等超时，长得都一样：一段静默。相邻两条事件挨着排，这段静默就看不见了。
-const QUIET_SECONDS = 25;
+//
+// 门槛压到 1.5 秒：排查的时候要能看见**时间去哪儿了**，而不是只看见最刺眼的那一段。
+// 每行左边虽然有 +Xs，但那要人自己做减法 —— 一屏十几行减下来，小停顿根本不会被注意到。
+// 1.5 秒以下当作连续，再往下标注本身就比它描述的停顿还长。
+const QUIET_SECONDS = 1.5;
+// 超过这个长度的静默换一种显眼的样子：短停顿是节奏，长静默是事故。
+const QUIET_LOUD = 10;
 
 // 这几类事件是读的时候真正在找的东西，其余的（led、note 之外的杂项）压成一行灰字。
 const KINDS = {
@@ -97,7 +103,8 @@ function _render(data) {
     <div class="bm-tl-cols">
       <section class="bm-tl-col">
         <h5 class="bm-tl-h">Agent 做了什么</h5>
-        ${agent.length ? agent.map(_turn).join('')
+        ${agent.length
+          ? withQuiet(agent).map((row) => (row.quiet ? _quietRow(row) : _turn(row))).join('')
           : '<div class="bm-empty">这次跑动的对话记录已经没有了。</div>'}
       </section>
       <section class="bm-tl-col">
@@ -120,21 +127,36 @@ function _turn(t) {
     </div>`;
 }
 
-/** 事件之间的长静默单独占一行 —— 它通常就是答案。 */
-export function withQuiet(world, quiet = QUIET_SECONDS) {
+/**
+ * 每一段静默都占一行 —— 排查时要看的就是时间去哪儿了。
+ *
+ * `at` 为 null 的行（时间不详）不参与计算：拿 null 当 0 会凭空算出一段跨越整场的
+ * 静默，而那是这个视图里最容易被当真的一种假象。
+ */
+export function withQuiet(rows, quiet = QUIET_SECONDS) {
   const out = [];
-  world.forEach((e, i) => {
-    const gap = i ? e.at - world[i - 1].at : 0;
-    if (gap >= quiet) out.push({ quiet: Math.round(gap) });
-    out.push(e);
+  let previous = null;
+  rows.forEach((row) => {
+    if (row.at != null && previous != null) {
+      const gap = row.at - previous;
+      if (gap >= quiet) {
+        out.push({ quiet: gap < 10 ? gap.toFixed(1) : Math.round(gap),
+                   loud: gap >= QUIET_LOUD });
+      }
+    }
+    if (row.at != null) previous = row.at;
+    out.push(row);
   });
   return out;
 }
 
+function _quietRow(row) {
+  return `<div class="bm-tl-quiet${row.loud ? ' bm-tl-quiet--loud' : ''}">静了 ${
+    row.quiet} 秒</div>`;
+}
+
 function _withQuiet(world) {
-  return withQuiet(world).map((row) => (row.quiet
-    ? `<div class="bm-tl-quiet">静了 ${row.quiet} 秒</div>`
-    : _event(row))).join('');
+  return withQuiet(world).map((row) => (row.quiet ? _quietRow(row) : _event(row))).join('');
 }
 
 function _event(e) {
