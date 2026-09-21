@@ -16,7 +16,17 @@
 
 相关文档：沿用 PR 已有真实部署验收 SOP，本次不改变功能范围；此文件记录设备部署差异与验证结果。
 
-## 最新修订版部署（2026-09-21）
+## 自声拒绝与服务选择版部署（2026-09-21 21:52）
+
+- 用户明确要求只重启 Core，且允许镜像测试通过后不等待 Bot 审查先实机测试。代码 `388e71b0`，镜像 `release.260921.9d717a6`，镜像内 Core 1397 通过、0 失败；部署时 Bot 仍待结论。
+- 切换前再次确认 Canvas 无编辑者、project_running=false、auto_start=false、任务为空、DDS isolated=true。Compose、SQLite 一致性备份及容器基线保存在核验后的个人目录、本次提交专用 0700 子目录。
+- 仅替换 Compose 的 Core image，再执行 `docker compose -f /opt/phanthy-motus/docker-compose.yml up -d --no-deps agent-core`。没有使用 remove-orphans；没有操作其他服务。
+- 实际镜像 ID `sha256:649bbd7c3374a284ad4935c482117d84ddea29031feebae93dc95462155bbf3e`，arm64；Core 13:52:25 UTC 启动，VERSION 匹配，重启计数 0。第一次接口探针在启动期连接拒绝，后续全部通过；最近 600 行日志确认启动完成，无 ERROR/Traceback。
+- 与备份比较 Compose 仅 Core image 改变；Driver、ActuCore、Perception 的容器 ID、镜像、启动时间及重启次数均未变化。
+- 部署后控制与自动启动仍关闭、无活动任务、DDS 隔离正常；Jev 开启、Key 已配置、identity 可读，上游无 KWS 警告。原设置保留为 TypeSafe，新 schema 已含两项 Base URL。切换 OpenRouter 需用户选择并填写对应 Key；未自动注入密钥、播放或启动控制。
+- 回滚镜像 `release.260921.557124c` 仍在本机，只恢复 Core image 并重建 Core。操作文档同步；不将部署健康或此前合成文本结果当成真实语音验收。
+
+## 上一修订版部署（2026-09-21 21:04）
 
 - 用户重新明确授权部署天轶测试，只更新 Core，不启动智能控制或动作。
 - 目标为 `release.260921.557124c`，提交 `d5064f42`，该镜像 Core 测试 1388 通过、0 失败；同提交 Bot 明确 No issues found（PR #254 评论 5760036957）。使用已测镜像，不选强制重审时跳过测试的新构建。
