@@ -16,9 +16,10 @@ import { MappingRenderer }   from './renderers/mapping.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
+import { CostmapRenderer, OdometryRenderer, PathRenderer } from './renderers/navigation.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, CostmapRenderer, OdometryRenderer, PathRenderer, LidarRenderer, SkeletonRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 // Column count by viewport width. Desktop used to be a flat 5 whatever the
 // window was, which is only right near 1080p: at 1280 a column is 237px and a
@@ -197,7 +198,20 @@ async function _fetchAndBuild() {
   syncConnectionTopics(canvasCards, connections);
 
   const topicSet = new Set();
+  const hiddenTopics = new Set();
   _topicMcpMap = {};  // reset
+  const addMonitorTopic = (item, mcpId) => {
+    if (!item?.topic) return;
+    if (item.monitor === false) {
+      hiddenTopics.add(item.topic);
+      topicSet.delete(item.topic);
+      return;
+    }
+    if (!hiddenTopics.has(item.topic)) {
+      topicSet.add(item.topic);
+      _topicMcpMap[item.topic] = mcpId;
+    }
+  };
   // First pass: collect all topic_out from static tool definitions (non-multiInstance)
   for (const mcp of mcps) {
     const mcpOnCanvas = canvasCards.some(c => c.mcpId === mcp.id);
@@ -205,7 +219,7 @@ async function _fetchAndBuild() {
     for (const tool of (mcp.tools || [])) {
       if (tool.multiInstance) continue;  // handled via card instances below
       if (!canvasTools.has(`${mcp.id}:${tool.name}`)) continue;
-      for (const t of (tool.topic_out || [])) { if (t.topic) { topicSet.add(t.topic); _topicMcpMap[t.topic] = mcp.id; } }
+      for (const t of (tool.topic_out || [])) addMonitorTopic(t, mcp.id);
     }
   }
   // Second pass: add topic_in from static tools only if not already covered
@@ -215,21 +229,17 @@ async function _fetchAndBuild() {
     for (const tool of (mcp.tools || [])) {
       if (tool.multiInstance) continue;
       if (!canvasTools.has(`${mcp.id}:${tool.name}`)) continue;
-      for (const t of (tool.topic_in || [])) { if (t.topic && !topicSet.has(t.topic)) { topicSet.add(t.topic); _topicMcpMap[t.topic] = mcp.id; } }
+      for (const t of (tool.topic_in || [])) addMonitorTopic(t, mcp.id);
     }
-  }
-  // Dynamic topics from canvas connections
-  for (const conn of connections) {
-    if (conn.fromTopic) topicSet.add(conn.fromTopic);
   }
   // Instance-specific topics from each canvas card (covers multiInstance tools like ASR/TTS)
   for (const card of canvasCards) {
-    for (const t of (card.topicOut || [])) {
-      if (t.topic && !topicSet.has(t.topic)) { topicSet.add(t.topic); _topicMcpMap[t.topic] = card.mcpId; }
-    }
-    for (const t of (card.topicIn || [])) {
-      if (t.topic && !topicSet.has(t.topic)) { topicSet.add(t.topic); _topicMcpMap[t.topic] = card.mcpId; }
-    }
+    for (const t of (card.topicOut || [])) addMonitorTopic(t, card.mcpId);
+    for (const t of (card.topicIn || [])) addMonitorTopic(t, card.mcpId);
+  }
+  // Dynamic connection topics remain visible unless either endpoint declares them hidden.
+  for (const conn of connections) {
+    if (conn.fromTopic && !hiddenTopics.has(conn.fromTopic)) topicSet.add(conn.fromTopic);
   }
 
   // Fallback: fill _topicMcpMap from /api/topics mcp_id for any topic not yet mapped

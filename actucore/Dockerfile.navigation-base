@@ -1,0 +1,596 @@
+# ── ActuCore navigation build base ──────────────────────────────────
+# Base: jetson-base:jp${JP_VERSION}-torch
+#   Ubuntu 20.04 / Python 3.8, ROS Humble 以**源码 install-space** 装在
+#   /opt/ros/humble/install（dustynv/ros:humble-desktop-l4t 血统），
+#   外加 JetPack 的 CUDA torch。
+#
+# 只包含稳定、昂贵的第三方导航依赖。它是日常 ActuCore 的编译输入，
+# 最终服务镜像从干净平台基线重新开始，只复制编译好的 install space。
+#
+# 为什么 Nav2 是源码编译：base 是 Focal，而 ros-humble-* 的 Debian 包只有
+# Jammy 的，apt 装不到 navigation2。所以 Nav2 连同它在 base 之外缺的几个 ROS
+# 依赖（BehaviorTree.CPP v3 / angles / bond_core / diagnostic_updater /
+# map_msgs / laser_geometry / perception_pcl）都按锁定 SHA 自己编。
+# navigation2 锁在 1.1.20 —— 和退役的 apt pin 是同一个上游 release。
+#
+# Build context: repo root (phanthymotus/).
+#
+# Usage (direct GitHub by default; opt in to a Git proxy when needed):
+#   GIT_MIRROR_PREFIX=https://ghfast.top/ ./deploy/build_actucore.sh --base --mirror tuna
+# ────────────────────────────────────────────────────────────────────
+
+ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG ACTUCORE_NAVIGATION_PARENT_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6
+FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_builder
+ARG PYPI_MIRROR APT_MIRROR
+
+# colcon 的 source / bash 数组都要 bash，pipefail 保证管道里的失败不被吞掉
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# 并行度：Orin 8 核 16G 上 -j4 是不 OOM 的上限（nav2_costmap_2d 最吃内存）
+ARG BUILD_JOBS=4
+
+# ── 源码锁（由 deploy/build_actucore.sh 从 *-source.lock 传入）───────
+ARG GIT_MIRROR_PREFIX=
+ARG FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git
+ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d
+ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb
+ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c
+ARG RPG_VIKIT_REPO=https://github.com/Rhymer-Lcy/rpg_vikit_ros2_fisheye.git
+ARG RPG_VIKIT_COMMIT=0b5548d9adab58128f3a59a507e96a83acfa8fdf
+ARG SOPHUS_REPO=https://github.com/strasdat/Sophus.git
+ARG SOPHUS_COMMIT=de0f8d3d92bf776271e16de56d1803940ebccab9
+ARG NAVIGATION2_REPO=https://github.com/ros-navigation/navigation2.git
+ARG NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db
+ARG NAVIGATION2_RUNTIME_PATCH_SHA256=ccf9b2d64ef9332aa1d3b9792c2ef1ae70cde87f3ef7c71ed467a8d5b4f06383
+ARG BEHAVIORTREE_CPP_REPO=https://github.com/BehaviorTree/BehaviorTree.CPP.git
+ARG BEHAVIORTREE_CPP_COMMIT=9d624dc7797b4752e5f8616793ffcee4b540a185
+ARG ANGLES_REPO=https://github.com/ros/angles.git
+ARG ANGLES_COMMIT=4b71a44dd2b3a24d7af30bf94b0ba34ece1d0558
+ARG BOND_CORE_REPO=https://github.com/ros/bond_core.git
+ARG BOND_CORE_COMMIT=1e589099eb383e488e6078154018cd382a792ea8
+ARG DIAGNOSTICS_REPO=https://github.com/ros/diagnostics.git
+ARG DIAGNOSTICS_COMMIT=de779cfd3bff7975f158971c58bedf0581148f9a
+ARG NAVIGATION_MSGS_REPO=https://github.com/ros-planning/navigation_msgs.git
+ARG NAVIGATION_MSGS_COMMIT=1d8683359734a2c829b5cdb6b5a4e015bbbcb6a5
+ARG LASER_GEOMETRY_REPO=https://github.com/ros-perception/laser_geometry.git
+ARG LASER_GEOMETRY_COMMIT=d53b925d25b4b5657261a44f4479365965cc2363
+ARG PCL_MSGS_REPO=https://github.com/ros-perception/pcl_msgs.git
+ARG PCL_MSGS_COMMIT=8a925a7c4626df52dba7ccc5bda5900d63678880
+ARG PERCEPTION_PCL_REPO=https://github.com/ros-perception/perception_pcl.git
+ARG PERCEPTION_PCL_COMMIT=67a5c2ba4c4de3ca21c5cd495812a01ced3fb69a
+ARG ROSBAG2_STORAGE_MCAP_REPO=https://github.com/ros-tooling/rosbag2_storage_mcap.git
+ARG ROSBAG2_STORAGE_MCAP_COMMIT=c1c2159679921a4f4392f370172c28e7b3b01452
+ARG MCAP_REPO=https://github.com/foxglove/mcap.git
+ARG MCAP_COMMIT=dc6561d9ba867901709e36526dcf7f7359861e9c
+ARG LZ4_REPO=https://github.com/lz4/lz4.git
+ARG LZ4_COMMIT=d44371841a2f1728a3f36839fd4b7e872d0927d3
+
+# 每个 revision 都必须是完整 40 位 SHA —— 分支名/短 SHA 会让镜像不可复现
+RUN for revision in \
+      "${FAST_LIVO2_COMMIT}" \
+      "${RPG_VIKIT_COMMIT}" \
+      "${SOPHUS_COMMIT}" \
+      "${NAVIGATION2_COMMIT}" \
+      "${BEHAVIORTREE_CPP_COMMIT}" \
+      "${ANGLES_COMMIT}" \
+      "${BOND_CORE_COMMIT}" \
+      "${DIAGNOSTICS_COMMIT}" \
+      "${NAVIGATION_MSGS_COMMIT}" \
+      "${LASER_GEOMETRY_COMMIT}" \
+      "${PCL_MSGS_COMMIT}" \
+      "${PERCEPTION_PCL_COMMIT}" \
+      "${ROSBAG2_STORAGE_MCAP_COMMIT}" \
+      "${MCAP_COMMIT}" \
+      "${LZ4_COMMIT}"; do \
+      [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] || { \
+        echo "source revision is not a full Git SHA: ${revision}" >&2; exit 2; \
+      }; \
+    done
+
+# The digest-pinned Jetson parent owns these ROS build tools. Verify that
+# contract before any expensive source checkout/build instead of reinstalling
+# them into the deployable image.
+RUN command -v colcon >/dev/null && \
+    python3 -c "import em; assert int(em.__version__.split('.')[0]) < 4, em.__version__"
+
+# ── APT 源 ────────────────────────────────────────────────────────
+# Ubuntu 源换镜像；ROS 的 apt 源整体删掉 —— 这个 base 是 Focal，
+# packages.ros.org 上没有对应的 humble 二进制包，留着只会让 apt-get update
+# 因为过期 key 而失败。ROS 侧的一切都来自源码编译。
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -E -i \
+          "s|https?://archive\\.ubuntu\\.com/ubuntu|https://${APT_MIRROR}/ubuntu|g; \
+           s|https?://ports\\.ubuntu\\.com/ubuntu-ports|https://${APT_MIRROR}/ubuntu-ports|g" \
+          /etc/apt/sources.list; \
+    fi && \
+    sed -i '\|packages\.ros\.org/ros2/ubuntu|d' /etc/apt/sources.list && \
+    for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+      [ -f "${source}" ] || continue; \
+      if grep -qE 'packages\.ros\.org/ros2/ubuntu' "${source}"; then \
+        rm -f "${source}"; \
+      fi; \
+    done && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* && \
+    if grep -R -E 'packages\.ros\.org/ros2/ubuntu' \
+         /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then \
+      echo 'ROS APT source remains; humble has no Focal binaries' >&2; exit 1; \
+    fi && \
+    if grep -R -E 'trusted=yes' \
+         /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then \
+      echo 'unauthenticated APT source is not allowed' >&2; exit 1; \
+    fi
+
+# ── 系统依赖 ────────────────────────────────────────────────────────
+# FAST-LIVO2: eigen / boost / pcl / fmt
+# Nav2:       boost-program-options
+# OpenCV 特意不装：base 里已经有 L4T 那份带 CUDA 的 4.5，apt 的 4.2 会抢赢
+# find_package 并和 python cv2 对不上；只在确实缺的时候才补。
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      git \
+      pkg-config \
+      libboost-all-dev \
+      libeigen3-dev \
+      libfmt-dev \
+      libpcl-dev && \
+    { pkg-config --exists opencv4 || \
+      apt-get install -y --no-install-recommends libopencv-dev; } && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Keep nested CMake/FetchContent GitHub downloads on the selected mirror until
+# every source build is complete. Direct clones also retain explicit prefixes.
+RUN git config --global \
+      "url.${GIT_MIRROR_PREFIX}https://github.com/.insteadOf" \
+      "https://github.com/"
+
+# ── base 之外缺的 ROS 依赖 ──────────────────────────────────────────
+# 全部克隆下来，但只编 base 里查不到的那些：重复 overlay 一个消息包会让
+# 同一份 typesupport 在 AMENT_PREFIX_PATH 里出现两次，不如让 ros2 pkg prefix
+# 说话。构建日志里会打印实际编了哪些，换 JetPack 版本时这段自动适配。
+WORKDIR /opt/ros_deps_ws/src
+
+RUN git init behaviortree_cpp_v3 && \
+    cd behaviortree_cpp_v3 && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${BEHAVIORTREE_CPP_REPO}" && \
+    git fetch --depth 1 origin "${BEHAVIORTREE_CPP_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${BEHAVIORTREE_CPP_COMMIT}"
+
+RUN git init angles && \
+    cd angles && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${ANGLES_REPO}" && \
+    git fetch --depth 1 origin "${ANGLES_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${ANGLES_COMMIT}"
+
+RUN git init bond_core && \
+    cd bond_core && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${BOND_CORE_REPO}" && \
+    git fetch --depth 1 origin "${BOND_CORE_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${BOND_CORE_COMMIT}"
+
+RUN git init diagnostics && \
+    cd diagnostics && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${DIAGNOSTICS_REPO}" && \
+    git fetch --depth 1 origin "${DIAGNOSTICS_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${DIAGNOSTICS_COMMIT}"
+
+RUN git init navigation_msgs && \
+    cd navigation_msgs && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${NAVIGATION_MSGS_REPO}" && \
+    git fetch --depth 1 origin "${NAVIGATION_MSGS_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${NAVIGATION_MSGS_COMMIT}"
+
+RUN git init laser_geometry && \
+    cd laser_geometry && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${LASER_GEOMETRY_REPO}" && \
+    git fetch --depth 1 origin "${LASER_GEOMETRY_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${LASER_GEOMETRY_COMMIT}"
+
+# pcl_msgs + perception_pcl(pcl_conversions/pcl_ros)：fast_livo 的 build_depend
+RUN git init pcl_msgs && \
+    cd pcl_msgs && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${PCL_MSGS_REPO}" && \
+    git fetch --depth 1 origin "${PCL_MSGS_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${PCL_MSGS_COMMIT}"
+
+RUN git init perception_pcl && \
+    cd perception_pcl && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${PERCEPTION_PCL_REPO}" && \
+    git fetch --depth 1 origin "${PERCEPTION_PCL_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${PERCEPTION_PCL_COMMIT}"
+
+# mcap 存储插件：录包用 `ros2 bag record -s mcap`，旧镜像是 apt 装的
+# ros-humble-rosbag2-storage-mcap，这里改源码。上游 mcap_vendor 还会通过
+# FetchContent 拉 mcap/lz4；先按同一 SHA 浅克隆，避免 CMake 再做全量嵌套 clone。
+RUN git init rosbag2_storage_mcap && \
+    cd rosbag2_storage_mcap && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${ROSBAG2_STORAGE_MCAP_REPO}" && \
+    git fetch --depth 1 origin "${ROSBAG2_STORAGE_MCAP_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${ROSBAG2_STORAGE_MCAP_COMMIT}" && \
+    touch rosbag2_storage_mcap_testdata/COLCON_IGNORE
+
+RUN git init /opt/ros_deps_ws/vendor/mcap && \
+    cd /opt/ros_deps_ws/vendor/mcap && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${MCAP_REPO}" && \
+    git fetch --depth 1 origin "${MCAP_COMMIT}" && \
+    GIT_LFS_SKIP_SMUDGE=1 git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${MCAP_COMMIT}" && \
+    git init /opt/ros_deps_ws/vendor/lz4 && \
+    cd /opt/ros_deps_ws/vendor/lz4 && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${LZ4_REPO}" && \
+    git fetch --depth 1 origin "${LZ4_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${LZ4_COMMIT}"
+
+WORKDIR /opt/ros_deps_ws
+RUN source /opt/ros/humble/install/setup.bash && \
+    missing=() && \
+    for package in \
+        behaviortree_cpp_v3 \
+        angles \
+        smclib \
+        bond \
+        bondcpp \
+        diagnostic_updater \
+        map_msgs \
+        laser_geometry \
+        pcl_msgs \
+        pcl_conversions \
+        pcl_ros \
+        mcap_vendor \
+        rosbag2_storage_mcap; do \
+      if ros2 pkg prefix "${package}" >/dev/null 2>&1; then \
+        echo "[ros-deps] already in base: ${package}"; \
+      else \
+        echo "[ros-deps] will build: ${package}"; \
+        missing+=("${package}"); \
+      fi; \
+    done && \
+    printf '%s\n' "${missing[@]}" > /opt/ros_deps_ws/built-packages.txt && \
+    if [ "${#missing[@]}" -gt 0 ]; then \
+      MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
+        --merge-install \
+        --executor sequential \
+        --packages-select "${missing[@]}" \
+        --cmake-args \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_UNIT_TESTS=OFF \
+          -DBUILD_TOOLS=OFF \
+          -DFETCHCONTENT_SOURCE_DIR_MCAP=/opt/ros_deps_ws/vendor/mcap \
+          -DFETCHCONTENT_SOURCE_DIR_LZ4=/opt/ros_deps_ws/vendor/lz4; \
+    else \
+      mkdir -p install && \
+      printf '%s\n' '#!/usr/bin/env bash' 'true' > install/setup.bash; \
+    fi
+
+# ── tf2 头文件后缀兼容 ─────────────────────────────────────────────
+# tf2 在 Humble 生命周期里把 include 从 .h 改名成 .hpp。base 的 ROS 是较早的
+# 源码快照（LinearMath/*.h、tf2/utils.h），而 FAST-LIVO2 和 Nav2 1.1.20 都按
+# 新名字 include —— 之前 apt 装的 Jammy 包已经是新名字，所以这个问题只在源码
+# base 上出现。这里给 tf2 家族每个 .h 补一个同名 .hpp 转发头：纯别名，不改
+# 任何实现，也不影响仍用 .h 的代码。
+RUN for header in $(find /opt/ros/humble/install/include -path '*tf2*' -name '*.h'); do \
+      alias_header="${header%.h}.hpp"; \
+      [ -e "${alias_header}" ] || \
+        printf '#include "%s"\n' "$(basename "${header}")" > "${alias_header}"; \
+    done && \
+    test -f /opt/ros/humble/install/include/tf2/tf2/LinearMath/Transform.hpp && \
+    test -f /opt/ros/humble/install/include/tf2/tf2/LinearMath/Quaternion.hpp && \
+    test -f /opt/ros/humble/install/include/tf2/tf2/utils.hpp
+
+# ── FAST-LIVO2 依赖图（锁定源码，三个运行时 patch 先验 sha256 再打）──────
+RUN git init /tmp/sophus && \
+    cd /tmp/sophus && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${SOPHUS_REPO}" && \
+    git fetch --depth 1 origin "${SOPHUS_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${SOPHUS_COMMIT}" && \
+    cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SOPHUS_TESTS=OFF && \
+    cmake --build build --parallel "${BUILD_JOBS}" && \
+    cmake --install build && \
+    rm -rf /tmp/sophus && \
+    ldconfig
+
+WORKDIR /opt/fast_livo_ws/src
+
+# 当前输入契约是标准 PointCloud2（lidar_type=7），不会启动 Livox Driver。
+# FAST-LIVO2 上游仍编译引用两条 CustomMsg 类型，因此只保留 message-only 接口，
+# 不再拉取或编译 Livox SDK2/Driver 实现。
+COPY actucore/plugins/navigation/runtime/livox_ros_driver2_msgs/ \
+     /opt/fast_livo_ws/src/livox_ros_driver2/
+
+RUN git init rpg_vikit_ros2_fisheye && \
+    cd rpg_vikit_ros2_fisheye && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${RPG_VIKIT_REPO}" && \
+    git fetch --depth 1 origin "${RPG_VIKIT_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${RPG_VIKIT_COMMIT}"
+
+RUN git init fast_livo && \
+    cd fast_livo && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${FAST_LIVO2_REPO}" && \
+    git fetch --depth 1 origin "${FAST_LIVO2_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${FAST_LIVO2_COMMIT}"
+
+COPY actucore/plugins/navigation/runtime/patches/fast-livo2-runtime.patch \
+     /tmp/fast-livo2-runtime.patch
+COPY actucore/plugins/navigation/runtime/patches/fast-livo2-pcd-save.patch \
+     /tmp/fast-livo2-pcd-save.patch
+COPY actucore/plugins/navigation/runtime/patches/fast-livo2-pcd-flush.patch \
+     /tmp/fast-livo2-pcd-flush.patch
+COPY actucore/plugins/navigation/runtime/navigation_lio.yaml \
+     /tmp/navigation_lio.yaml
+RUN [[ "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    [[ "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    [[ "${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    printf '%s  %s\n' \
+      "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" \
+      /tmp/fast-livo2-runtime.patch | sha256sum -c - && \
+    printf '%s  %s\n' \
+      "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" \
+      /tmp/fast-livo2-pcd-save.patch | sha256sum -c - && \
+    printf '%s  %s\n' \
+      "${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" \
+      /tmp/fast-livo2-pcd-flush.patch | sha256sum -c - && \
+    cd /opt/fast_livo_ws/src/fast_livo && \
+    git apply --check /tmp/fast-livo2-runtime.patch && \
+    git apply /tmp/fast-livo2-runtime.patch && \
+    git apply --check /tmp/fast-livo2-pcd-save.patch && \
+    git apply /tmp/fast-livo2-pcd-save.patch && \
+    patch --dry-run --batch --fuzz=0 --ignore-whitespace -p1 \
+      -i /tmp/fast-livo2-pcd-flush.patch && \
+    patch --batch --fuzz=0 --ignore-whitespace -p1 \
+      -i /tmp/fast-livo2-pcd-flush.patch && \
+    git diff --check
+
+WORKDIR /opt/fast_livo_ws
+RUN source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
+      --executor sequential \
+      --packages-select livox_ros_driver2 vikit_common vikit_ros \
+      --cmake-args \
+        -DROS_EDITION=ROS2 \
+        -DDISTRO_ROS=humble \
+        -DCMAKE_BUILD_TYPE=Release && \
+    source install/setup.bash && \
+    test -z "$(ros2 pkg executables livox_ros_driver2)" && \
+    MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
+      --executor sequential \
+      --packages-select fast_livo \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# 运行时 patches 是否真的进了二进制 —— 打错分支时这里就会红，而不是等到真机
+RUN strings /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
+      > /tmp/fastlivo_mapping.strings && \
+    grep -Fq "accepting current sample to resynchronize" \
+      /tmp/fastlivo_mapping.strings && \
+    grep -Fq "PCD checkpoint completed" /tmp/fastlivo_mapping.strings && \
+    grep -Fq "PCD finalization completed" /tmp/fastlivo_mapping.strings && \
+    grep -Fq "raw PCD flush failed" /tmp/fastlivo_mapping.strings && \
+    ! grep -Fq "imu time stamp Jumps" /tmp/fastlivo_mapping.strings && \
+    rm /tmp/fastlivo_mapping.strings
+
+# The upstream node automatically declares ROS parameter overrides. Launch
+# once with the same overrides used by the supervisor so duplicate declarations
+# fail during the base build instead of later appearing as an on-device SIGABRT.
+RUN source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    ulimit -c 0 && \
+    { status=0; \
+      timeout --signal=INT --kill-after=2s 2s \
+        /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
+        --ros-args \
+        --params-file /tmp/navigation_lio.yaml \
+        -p lidar_qos_depth:=2 \
+        -p imu_qos_depth:=400 \
+        -p runtime_diagnostics_topic:=/fast_livo2/runtime_diagnostics \
+        >/tmp/fastlivo_startup.log 2>&1 || status=$?; \
+      if [ "${status}" -ne 124 ]; then \
+        cat /tmp/fastlivo_startup.log; \
+        exit 1; \
+      fi; \
+      rm /tmp/fastlivo_startup.log; }
+
+# ── Nav2（最重的一层，放最后编）─────────────────────────────────────
+# 只编卡片真正会加载的那一档：navigation_launch.py 起的 planner/controller/
+# behavior/bt_navigator/waypoint_follower +
+# nav2_params.yaml 里点名的 navfn / costmap 三层。
+# 用不到的包直接放 COLCON_IGNORE：光靠 --packages-select 挡不住 colcon 顺着
+# test_depend 去要它们（nav2_rotation_shim_controller test-depend 了 RPP），
+# 而它们会把 ompl、ceres、xtensor、Qt5 拖进镜像。
+WORKDIR /opt/nav2_ws/src
+COPY actucore/plugins/navigation/runtime/patches/nav2-without-velocity-smoother.patch \
+     /tmp/nav2-without-velocity-smoother.patch
+RUN git init navigation2 && \
+    cd navigation2 && \
+    git remote add origin "${GIT_MIRROR_PREFIX}${NAVIGATION2_REPO}" && \
+    git fetch --depth 1 origin "${NAVIGATION2_COMMIT}" && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${NAVIGATION2_COMMIT}" && \
+    [[ "${NAVIGATION2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
+    printf '%s  %s\n' \
+      "${NAVIGATION2_RUNTIME_PATCH_SHA256}" \
+      /tmp/nav2-without-velocity-smoother.patch | sha256sum -c - && \
+    patch --dry-run --batch --fuzz=0 -p1 \
+      -i /tmp/nav2-without-velocity-smoother.patch && \
+    patch --batch --fuzz=0 -p1 \
+      -i /tmp/nav2-without-velocity-smoother.patch && \
+    for excluded in \
+        nav2_amcl \
+        nav2_collision_monitor \
+        nav2_constrained_smoother \
+        nav2_graceful_controller \
+        nav2_mppi_controller \
+        nav2_map_server \
+        nav2_regulated_pure_pursuit_controller \
+        nav2_rotation_shim_controller \
+        nav2_route \
+        nav2_rviz_plugins \
+        nav2_simple_commander \
+        nav2_smac_planner \
+        nav2_system_tests \
+        nav2_theta_star_planner \
+        nav2_velocity_smoother \
+        nav2_dwb_controller/dwb_core \
+        nav2_dwb_controller/dwb_critics \
+        nav2_dwb_controller/dwb_msgs \
+        nav2_dwb_controller/dwb_plugins \
+        nav2_dwb_controller/nav2_dwb_controller; do \
+      test -d "${excluded}" || { echo "missing excluded Nav2 package: ${excluded}" >&2; exit 4; }; \
+      touch "${excluded}/COLCON_IGNORE"; \
+    done
+
+WORKDIR /opt/nav2_ws
+RUN source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
+      --merge-install \
+      --executor sequential \
+      --packages-select \
+        nav2_common \
+        nav2_msgs \
+        nav2_util \
+        nav2_core \
+        nav2_voxel_grid \
+        nav2_costmap_2d \
+        nav2_behavior_tree \
+        nav2_behaviors \
+        nav2_bt_navigator \
+        nav2_controller \
+        nav2_planner \
+        nav2_navfn_planner \
+        nav2_smoother \
+        nav2_waypoint_follower \
+        nav2_lifecycle_manager \
+        nav_2d_msgs \
+        nav_2d_utils \
+        costmap_queue \
+        navigation2 \
+        nav2_bringup \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# 卡片依赖 nav2_bringup/launch/navigation_launch.py 与这批节点存在，缺一个都会
+# 在真机上变成"启动了但 lifecycle 不 active"，这里先拦住。用 ros2 pkg
+# executables 而不是 command -v：merge-install 的节点装在
+# install/lib/<pkg>/ 下（libexec），本来就不在 PATH 上，ros2 launch 靠
+# AMENT_PREFIX_PATH 找它们 —— 这条检查顺带证明了 ament 索引是通的。
+RUN source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    source /opt/nav2_ws/install/setup.bash && \
+    test -f "$(ros2 pkg prefix nav2_bringup)/share/nav2_bringup/launch/navigation_launch.py" && \
+    for entry in \
+        nav2_controller:controller_server \
+        nav2_planner:planner_server \
+        nav2_smoother:smoother_server \
+        nav2_behaviors:behavior_server \
+        nav2_bt_navigator:bt_navigator \
+        nav2_waypoint_follower:waypoint_follower \
+        nav2_lifecycle_manager:lifecycle_manager; do \
+      package="${entry%%:*}"; \
+      executable="${entry##*:}"; \
+      ros2 pkg executables "${package}" | grep -Fqx "${package} ${executable}" || { \
+        echo "nav2 executable missing after build: ${package}/${executable}" >&2; \
+        exit 3; \
+      }; \
+    done && \
+    ros2 pkg list | sort > /opt/actucore-ros-package-lock.txt && \
+    grep -Fqx nav2_bringup /opt/actucore-ros-package-lock.txt && \
+    ! grep -Fqx nav2_dwb_controller /opt/actucore-ros-package-lock.txt && \
+    { git config --global --remove-section \
+        "url.${GIT_MIRROR_PREFIX}https://github.com/" || true; }
+
+# The reusable build base starts again from the digest-pinned parent. Only
+# install spaces cross this boundary; source, build and log trees stay behind.
+FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_runtime
+ARG APT_MIRROR
+ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d
+ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb
+ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c
+ARG NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -E -i \
+          "s|https?://archive\\.ubuntu\\.com/ubuntu|https://${APT_MIRROR}/ubuntu|g; \
+           s|https?://ports\\.ubuntu\\.com/ubuntu-ports|https://${APT_MIRROR}/ubuntu-ports|g" \
+          /etc/apt/sources.list; \
+    fi && \
+    sed -i '\|packages\.ros\.org/ros2/ubuntu|d' /etc/apt/sources.list && \
+    for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+      [ -f "${source}" ] || continue; \
+      if grep -qE 'packages\.ros\.org/ros2/ubuntu' "${source}"; then \
+        rm -f "${source}"; \
+      fi; \
+    done && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# This is intentionally a build-only input for Dockerfile.jetson, so it carries
+# the headers and compiler used for the three repository-owned ROS packages.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      pkg-config \
+      libboost-all-dev \
+      libeigen3-dev \
+      libfmt-dev \
+      libpcl-dev && \
+    { pkg-config --exists opencv4 || \
+      apt-get install -y --no-install-recommends libopencv-dev; } && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Derived in the builder as well; the daily repository-owned packages compile
+# against the same Humble .hpp compatibility aliases.
+RUN for header in $(find /opt/ros/humble/install/include -path '*tf2*' -name '*.h'); do \
+      alias_header="${header%.h}.hpp"; \
+      [ -e "${alias_header}" ] || \
+        printf '#include "%s"\n' "$(basename "${header}")" > "${alias_header}"; \
+    done
+
+COPY --from=navigation_builder /opt/ros_deps_ws/install/ /opt/ros_deps_ws/install/
+COPY --from=navigation_builder /opt/fast_livo_ws/install/ /opt/fast_livo_ws/install/
+COPY --from=navigation_builder /opt/nav2_ws/install/ /opt/nav2_ws/install/
+COPY --from=navigation_builder /opt/actucore-ros-package-lock.txt /opt/actucore-ros-package-lock.txt
+
+RUN command -v colcon >/dev/null && \
+    python3 -c "import em; assert int(em.__version__.split('.')[0]) < 4, em.__version__" && \
+    source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    source /opt/nav2_ws/install/setup.bash && \
+    ros2 pkg prefix fast_livo >/dev/null && \
+    ros2 pkg prefix nav2_bringup >/dev/null && \
+    ! ldd /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping | grep -Fq 'not found' && \
+    ! ldd /opt/nav2_ws/install/lib/nav2_controller/controller_server | grep -Fq 'not found' && \
+    test ! -e /opt/ros_deps_ws/src && test ! -e /opt/ros_deps_ws/build && test ! -e /opt/ros_deps_ws/log && \
+    test ! -e /opt/fast_livo_ws/src && test ! -e /opt/fast_livo_ws/build && test ! -e /opt/fast_livo_ws/log && \
+    test ! -e /opt/nav2_ws/src && test ! -e /opt/nav2_ws/build && test ! -e /opt/nav2_ws/log
+
+LABEL org.opencontainers.image.title="Phanthy Motus ActuCore Navigation Build Base" \
+      org.opencontainers.image.description="Build-only input with locked FAST-LIVO2 and Nav2 install spaces" \
+      org.opencontainers.image.licenses="Apache-2.0 AND GPL-2.0-only AND GPL-3.0-only" \
+      org.opencontainers.image.fast-livo2-revision="${FAST_LIVO2_COMMIT}" \
+      org.opencontainers.image.fast-livo2-runtime-patch="${FAST_LIVO2_RUNTIME_PATCH_SHA256}" \
+      org.opencontainers.image.fast-livo2-pcd-save-patch="${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" \
+      org.opencontainers.image.fast-livo2-pcd-flush-patch="${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" \
+      org.opencontainers.image.navigation2-revision="${NAVIGATION2_COMMIT}"

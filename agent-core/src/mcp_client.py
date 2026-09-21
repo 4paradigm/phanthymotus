@@ -21,6 +21,7 @@ mcp_client.py — MCP HTTP transport 客户端。
 """
 
 import asyncio
+from collections import OrderedDict
 import collections
 import contextvars
 import json
@@ -38,15 +39,16 @@ registry: dict[str, dict] = {}   # mcp_id → info
 
 # ── ACP: 异步动作完成协议 ──────────────────────────────────────────────────────
 _pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on completion)
+_pending_results: OrderedDict[str, dict] = OrderedDict()  # includes early SSE results
 # action_id → 注册时刻。加它只为一件事：主动播报要说「已经等了多久」。
 #
 # 先前没有任何地方记这个，而播报的 prompt 里也没有「现在几点」—— 模型只能拿过程
 # 记录里几条历史时间戳凑，凑出来的「大约等了 25 秒」必然是错的。数要么给对的，
 # 要么不给，不能让它自己算。
 _pending_started: dict[str, float] = {}
-_pending_results: dict[str, dict] = {}            # action_id → completion payload
 _pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
 _pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
+_MAX_EARLY_COMPLETIONS = 1024
 _pending_resources: dict[str, frozenset | None] = {}  # action_id → 占用的物理通道
 _pending_owner: dict[str, str] = {}               # action_id → 发起它的 agent 上下文
 
@@ -120,6 +122,11 @@ def mark_action_complete(action_id: str, payload: dict) -> bool:
     读 _pending_results，回收是 barrier 的事（见 resource_actually_busy）。
     """
     if action_id not in _pending_actions:
+        _pending_results.pop(action_id, None)
+        _pending_results[action_id] = payload
+        early = [aid for aid in _pending_results if aid not in _pending_actions]
+        for aid in early[:-_MAX_EARLY_COMPLETIONS]:
+            _pending_results.pop(aid, None)
         return False
     _pending_results[action_id] = payload
     _pending_actions[action_id].set()
@@ -413,6 +420,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
     split_map:  dict[str, dict] = {}  # split_schema_name → {tool, action}
     tool_groups: dict[str, list] = {} # original_tool_name → [split_schema_names]
     input_schemas: dict[str, dict] = {}  # schema_name → 原始 MCP inputSchema（用于参数校验）
+    tool_definitions: list[dict] = []    # 原始定义（含 x-topic-actions 等扩展）
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
@@ -426,6 +434,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
             # 2. tools/list
             result = await _jrpc(session, url, 'tools/list', {})
             for tool in result.get('tools', []):
+                tool_definitions.append(tool)
                 tool_schemas = _to_openai_schema(mcp_id, tool)
                 tools.append(tool['name'])
 
@@ -482,6 +491,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
         'split_map':     split_map,
         'tool_groups':   tool_groups,
         'input_schemas': input_schemas,
+        'tool_definitions': tool_definitions,
         # "A full connect has happened for this device." The heartbeat in
         # api/mcp_manage.py reads this to decide whether to call us, because it
         # is the *connect* that matters, not any one key it leaves behind —
@@ -658,6 +668,7 @@ def _register_internal_mcps():
             'input_schemas': input_schemas,
             'tool_groups': {},
             'split_map': {},
+            'tool_definitions': tools,
         }
 
 
@@ -984,6 +995,8 @@ async def call_tool(full_name: str, args: dict) -> str:
                 else:
                     dynamic_timeout = default_timeout
                 _pending_timeouts[action_id] = dynamic_timeout
+                if action_id in _pending_results:
+                    mark_action_complete(action_id, _pending_results[action_id])
                 _res = _pending_resources.get(action_id)
                 _res_txt = ','.join(sorted(_res)) if _res else 'undeclared/exclusive'
                 print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
@@ -1487,6 +1500,8 @@ async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
                 default_timeout = completion_spec.get('timeout', 120)
                 dynamic_timeout = len(text_arg) / 3 + 10 if text_arg else default_timeout
                 _pending_timeouts[action_id] = dynamic_timeout
+                if action_id in _pending_results:
+                    mark_action_complete(action_id, _pending_results[action_id])
                 _res_txt = ','.join(sorted(resource)) if resource else 'undeclared/exclusive'
                 print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
                       f'timeout={dynamic_timeout:.0f}s, resource={_res_txt}) [via hook]')

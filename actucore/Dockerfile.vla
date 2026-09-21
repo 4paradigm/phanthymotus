@@ -1,0 +1,92 @@
+# ── Jetson GPU variant ──────────────────────────────────────────────
+# VLA-only runtime retained for JP6.1. JP5.11 navigation uses Dockerfile.jetson.
+#
+# Build context: repo root (phanthymotus/) so we can access both
+# actucore/ and deploy/ros-base/audio_msgs/
+#
+# Usage:
+#   ./deploy/build_actucore.sh --jp-version 6.1 --mirror tuna
+# ────────────────────────────────────────────────────────────────────
+
+ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
+# Defaults match the JP6.1 path in deploy/build_actucore.sh.
+# The script always passes both explicitly; these only apply to a bare
+# `docker build`, and having them disagree with the script would mean the same
+# command producing a different image depending on how it was invoked.
+ARG JP_VERSION=61
+# CUDA torch and lerobot support local and remote providers on this platform.
+# See deploy/prepare_actucore_base.sh for the separate inference base.
+ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base-actucore:jp61-torch
+FROM ${BASE_IMAGE}
+ARG PYPI_MIRROR
+
+# No APT consumer: keep the signed sources inherited from the platform base.
+
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
+
+# ── audio_msgs ROS2 package (Humble already in base) ──────────────
+# Built here so both variants expose the same ROS message set as ros-base does
+# — otherwise a card would work on CPU and fail to import on Jetson.
+COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
+RUN cd /ros_ws && \
+    . /opt/ros/humble/install/setup.bash && \
+    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# ── Python deps ────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    pyyaml requests
+
+# ── Application code ───────────────────────────────────────────────
+WORKDIR /work
+COPY actucore/main.py     /work/main.py
+COPY actucore/plugins/__init__.py /work/plugins/__init__.py
+COPY actucore/plugins/vla/ /work/plugins/vla/
+COPY actucore/utils/      /work/utils/
+COPY actucore/config.yaml /work/config.yaml
+# JP6.1 has no published navigation base; never advertise an unusable card.
+RUN python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"
+# Atomic-write stdout guard. The build context is the repo root, so this reuses
+# perception's copy instead of adding a fourth one to keep in sync — see the
+# DUPLICATION note in perception/utils/logsafe.py.
+COPY perception/utils/logsafe.py /work/logsafe.py
+# COS downloader with size/SHA256 pinning, for cards that fetch weights at
+# runtime (plugins/vla's smolvla provider). Same reasoning as logsafe above:
+# reuse perception's copy rather than keeping a second one in sync. It carries
+# the parts that are easy to get wrong — a check file that must not appear
+# until the model behind it is complete, a lock so concurrent starts fetch one
+# copy, archives staged before they are merged.
+COPY perception/utils/model_downloader.py /work/model_downloader.py
+# The status-line helper that turns that downloader's callbacks into the one
+# string a card shows. Same reuse rule again — and it must travel with the
+# downloader: smolvla imports both, so shipping one without the other fails at
+# card start, on a robot, with an ImportError nothing here would have caught.
+COPY perception/utils/model_progress.py /work/model_progress.py
+# Agent Core reads /deploy/service.yml out of the image to merge the compose
+# fragment — dropping this COPY silently falls back to the legacy docker-run path.
+COPY actucore/deploy/     /deploy/
+
+EXPOSE 15730
+
+# 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
+RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth
+
+# ROS2 shared libraries（audio_msgs .so 等）
+ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV ROS_DOMAIN_ID=42
+
+# Inspect the shipped bundle's public inventory without starting ROS, HTTP,
+# providers or any card. JP6.1 must neither import nor advertise navigation.
+RUN . /opt/ros/humble/install/setup.bash && \
+    . /ros_ws/install/setup.bash && \
+    python3 -c "import main, importlib.util; cfg=main._load_config(); assert cfg['plugins']['navigation']['enabled'] is False; assert importlib.util.find_spec('plugins.navigation') is None; bundle=main.ActuCoreBundle(cfg, None); assert {t['name'] for t in bundle.get_all_tools()} == {'vla'}; print('JP61_VLA_ONLY_INVENTORY=PASS')"
+
+CMD ["/bin/bash", "-c", \
+    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+     source /opt/ros/humble/install/setup.bash && \
+     source /ros_ws/install/setup.bash && \
+     python3 /work/main.py"]

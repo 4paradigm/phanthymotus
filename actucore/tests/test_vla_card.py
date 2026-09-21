@@ -1044,10 +1044,9 @@ def test_one_cards_broken_schema_does_not_empty_the_bundle():
     # laptop without ROS. Stubbed rather than skipped: the thing under test is
     # ten lines of pure Python, and a test that only runs on a robot is a test
     # that runs after the mistake has already shipped.
-    import types
-    for name in ("rclpy", "rclpy.executors"):
-        sys.modules.setdefault(name, types.ModuleType(name))
-    import main
+    from .test_actucore_executor import _load_main_module
+
+    main = _load_main_module()
 
     class Fine:
         PREFIX = "fine"

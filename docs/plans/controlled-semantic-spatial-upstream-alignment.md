@@ -1,0 +1,133 @@
+# ControlledSemanticSpatial 与上游对齐
+
+## 范围
+
+将 PR #141 的 feat/controlled_semantic_spatial（9f7461c）合并到上游 main 基线 bdeec4e，保留导航能力和上游 VLA、DDS、Canvas 生命周期及 ACP 资源仲裁。只修改本仓；不修改 Driver，不部署或操作机器人。雨强的最终审核为真机导航验收，本轮本地验证不能代替该验收。
+
+## 实施
+
+1. 核对干净工作树及 PR head，fetch 上游并使用 merge 保留分支历史。
+2. 按真实调用链解决构建、插件注册、端口绑定、地图预览与完成事件冲突；复用上游资源仲裁。
+3. 执行 Core、ActuCore 与前端现有测试，补充合并边界回归；构建脚本在隔离环境验证。
+4. 核对相关 README 与构建支持范围，范围化提交并推送当前 PR 分支；读回 PR head。
+
+## 验收与限制
+
+本轮交付为更新后的 PR 和可复现本地检查。镜像构建、北京部署、传感器与 Driver 兼容、连续导航及停车确认分别验证，不提前宣称通过。
+
+## 合并决策
+
+- Core 使用上游的物理资源与调用者顺序仲裁；保留导航暂停、恢复、等待、停止旁路和早到终态回放。导航未声明资源时保守互斥。
+- JP5.11 镜像包含导航与 VLA 远端/mock；JP6.1 保留上游 VLA 本地推理构建入口，导航禁用且不接受覆盖。两个平台不混用 ROS/CUDA install space。
+- DDS 使用上游主机隔离 profile。导航地图持久卷继续保留。
+- README、导航 ACP 说明与 CONTRIBUTING 同步上述契约；真机部署文档暂不新增，因本轮尚未构建/部署更新镜像。
+
+## 本地验证（2026-09-18）
+
+- Core：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q -k 'not test_progress_stream'`：988 passed，1 deselected，8 subtests passed。
+- ActuCore：`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ../agent-core/.venv/bin/python -m pytest tests -q`：394 passed，2 skipped，66 subtests passed；包含 6 个隔离执行真实构建 Shell 的场景，Docker 用记录参数的替身，未启动容器或发布镜像。
+- Web：`node --test 'agent-core/web/js/*.test.mjs'`：45 passed。
+- `bash -n deploy/build_actucore.sh`、`git diff --check` 通过。
+- Core 旧虚拟环境缺少上游 Peer 测试依赖 cryptography，已仅在该虚拟环境补齐，未修改项目依赖清单。
+- 排除的上游 `tests/test_deploy_progress.py::test_progress_stream` 文件相对 main 无差异。直接用 `asyncio.run` 执行后确认在第 122 行调用 `progress.update('com配置…')` 缺少必填 message，引发 TypeError；未为消除该既有失败修改无关实现。
+- README、CONTRIBUTING、导航 ACP 和 RViz DDS 说明已按合并结果复核。未构建新镜像，未部署，未执行真机运动；北京导航仍需配套 Driver 接口及现场验收。
+
+## BOT 复审与修复
+
+用户于 2026-09-18 要求重新发起 BOT review 并处理意见。对 `173084f` 请求 Core、ActuCore JP5.11、JP6.1 的 Build + Review；触发评论为 https://github.com/4paradigm/phanthymotus/pull/141#issuecomment-5724388958 。
+
+流程：等待构建/测试/审查结果 → 对意见核验真实调用链 → 修复成立问题并补最小回归 → 同次提交代码与本事项文档 → 推送并再次请求复审。对不成立意见提供证据，不为消除报告而改错语义。沿用本仓范围，不部署、不驱动硬件、不修改 Driver。
+
+第一轮：三个镜像构建成功，容器内 Core 988 / ActuCore 396 项通过。审查报告
+https://github.com/4paradigm/phanthymotus/pull/141#issuecomment-5724471763 指出两项 P1。
+
+- JP6.1 确认漏打包 `utils.security`：补齐目录复制、主入口导入检查和两个镜像的打包契约测试；Dockerfile 默认参数也与 JP6.1 构建入口一致。
+- JP5.11 最终镜像只验证 segmented_controller，FAST-LIVO2/Nav2 的检查原在 builder：补齐最终阶段所有运行节点的 ldd、BT 插件 dlopen 与 Python 入口检查。先用真实构建确认平台镜像的库闭包，若缺库再按具体缺失补运行依赖，避免无证据安装开发包。
+- Shell 检查在临时目录用替身 ldd 验证正常、缺库及命令失败三条路径；原生库检查仍以 BOT 实际构建为准。相关构建说明同步，不改 Driver 或真机部署步骤。
+
+第二轮 `d6d72a5`：三个镜像均构建成功，最终镜像加载检查通过；Core 988、
+ActuCore 401 项容器测试通过。报告新增 APT 签名、Core 无关源改写与体积证据意见。
+
+- 删除 JP6.1 没有 APT 消费者的两层源改写，不再引入 trusted=yes。
+- Core 恢复上游 APT 行为，仅保留导航 ROS 消息导入检查；删除随源改写引入的专用测试，因该行为已退出 PR 范围。
+- 目标路由测试直接使用真实导航声明，覆盖有效、重复、非法 goal ID 及私有 `_control_nav_id`。
+- 按 registry digest 测量平台/构建基线/最终镜像；证据见同目录 `controlled-semantic-spatial-image-size-evidence.md`。README 说明 JP6.1 是原有构建路径迁出，不新增其 pip/audio_msgs 依赖。无需改接口或部署步骤。
+- 本轮本地复验：Core 同前述命令 987 passed / 1 deselected / 8 subtests；数量减少 1 对应退出范围的镜像源专用测试。`test_topic_actions.py` 11 passed，`actucore/tests/test_build_actucore.py` 11 passed；`git diff --check` 通过。镜像由下一轮 BOT 重建确认。
+
+第三轮 `f676038`：三个镜像构建成功，Core 容器测试 987 项通过；ActuCore
+400 passed / 1 failed，暴露后处理完成状态早于日志写入的竞态。
+修复为先原子写入终态日志，再发布内存终态并清理重试次数；磁盘 I/O 不占状态锁。
+新增确定性回归在修复前复现成功/写入失败两条路径均提前可见 complete，修复后通过。
+本地后处理专项 9 passed / 1 skipped / 2 subtests；ActuCore 全量 400 passed /
+2 skipped / 68 subtests。README 同步终态持久化契约，无接口变更、无真机操作。
+
+第四轮 `9ca0422`：三个镜像构建成功，Core 987 / ActuCore 402 项容器测试通过。
+代码审查发现 inspection 在 ROS 订阅失败前已设置活跃标记，导致注册/页面重试
+永久跳过。改为 subscribe 成功后再设置标记；失败返回和异常都可在后续注册重试。
+新增经真实注册入口的两条回归，修复前均失败、修复后通过；相邻 ROS/topic 冲突
+检查共 17 项通过。它恢复既有订阅语义，不改变公开接口、消息类型或部署步骤，
+README 与 CONTRIBUTING 的数据流说明仍适用，无需新增用户操作。
+
+第五轮 `d936ee1`：三个镜像构建成功，Core 989 / ActuCore 402 项容器测试通过。
+代码审查因时间上限而部分完成；BASE_REGISTRY/BASE_NAMESPACE 无默认值的推断
+与真实 `${...:-default}` 及现有隔离 Shell 测试不符，不改平台选择逻辑。
+采用其可验证建议：JP6.1 仅复制 VLA 插件而非复制后删除导航；最终镜像构造未启动
+Bundle，检查公开工具恰为 vla、导航配置关闭、导航不可导入。保留共享配置生成
+平台变体，避免复制整套模型配置。README 同步打包契约；JP6.1 colcon/audio_msgs
+原有层和压缩/解压体积区别已有说明，不再扩展无关构建优化。
+
+第六轮 `154f8db`：三个镜像构建成功，Core 989 / ActuCore 402 项容器测试通过。
+补齐 Core 监控对 sensor-envelope 的 UInt8MultiArray 类型映射，沿用二进制透传，
+回归覆盖 bytes、list 和 ROS 常用 array 数据容器。ActuCore 的语义/采集消费者
+原本直接订阅 DDS，此缺口不等于业务消费者无法接收；不新增转发依赖。
+语义 navigate 返回展开 planner_result，保留 nav_id/action_id；完成回调使用
+同一 nav_id，已有语义调用及 planner 终态测试覆盖，不按错误推断改写任务身份。
+构建基线重复意见沿用固定 digest 与实际层增量证据。此轮只扩展 Core 内部格式
+识别，消息契约和用户操作不变，现有 README/接口说明无需变更；未部署或真机验收。
+
+## 2026-09-20 上游冲突处理
+
+从已验收代码 14578fd 合并 upstream/main 7be9332，更新现有 PR #141。
+冲突范围为 ActuCore main 的退出清理、Core mcp_manage 注册刷新和 mcp_client SSE 管理；
+保留导航 topic-actions、完成协议与宿主清理，同时保留上游 schema 隔离、心跳刷新、
+SSE task 去重和 spin join。检查自动合并的 ROS 桥及资源仲裁。
+执行 Core、ActuCore、Web 现有测试及合并边界验证，再提交并推送当前 PR 分支。
+不修改两项明确暂缓问题，不部署、不驱动机器人；上海验收仅覆盖原 14578fd。
+README 与操作说明按实际契约复核；本轮不改变公开接口和部署方式。
+
+验证结果：Core 1095 passed / 1 deselected / 11 subtests（临时 DB，沿用已确认的
+test_progress_stream 排除项，该文件本轮无改动）；ActuCore 435 passed / 2 skipped /
+70 subtests；Web 45 passed。新增真实心跳入口保留导航定义且不重复连接的测试、
+main 退出顺序正常/未确认停止两条测试。上游 schema 隔离测试复用现有 ROS 替身，
+避免漏掉 InvalidHandle 导入并隔离全局模块。git diff --check 通过。
+本轮未构建镜像、未部署、未进行更新后真机验收；README、CONTRIBUTING 与既有
+导航接口/操作说明不受本次内部生命周期合并影响，无需修改。
+
+## 2026-09-20 运行中布局写入保护
+
+针对 BOT 5749355469 的已复现后端缺口，在既有生命周期锁内拒绝运行中的
+Canvas 布局保存和 Solution 画布应用，返回 409 并保持运行、卡片、路由、配置不变。
+沿用前端先停止再编辑的交互，不引入自动重启；前端显示拒绝原因并重新读取布局。
+移除不再可达的运行中路由替换分支，保留停止状态下删除卡片的确认流程。
+回归覆盖同卡片改线、删除卡片、方案配置覆盖、停止后保存以及并发启动后拒绝。
+同步 CONTRIBUTING；测试通过后提交推送，重新请求 BOT review。两项暂缓问题不动。
+
+验证：布局生命周期专项 24 passed；Core 全量 1096 passed / 1 deselected /
+11 subtests（临时 DB，排除此前已确认的 test_progress_stream）；Web 46 passed，
+包括真实保存处理函数收到 409 后提示并恢复布局。未运行浏览器端到端或真机测试。
+CONTRIBUTING 已更新为停止后编辑契约；README 和导航输入/输出接口不变。
+
+复审排队期间上游又合入 b60a2a9（Benchmark 面板），PR 再次冲突。继续合并，
+唯一冲突为 ACP 注册状态声明：同时保留导航早到终态 OrderedDict 与上游
+_pending_started 计时。复核自动合并的 Solution test 段与运行中写入保护，
+重新执行 Core/Web 测试；最终复审须指向本次合并后的 head。
+
+合并后 Core 全量首次 7 项启动解析失败，独立运行该文件 18 项通过；测试依赖
+其他用例遗留的全局 services 配置。为模拟驱动 fixture 隔离 services/core 配置后，
+Core 1245 passed / 1 deselected / 11 subtests；Web 78 passed。未改运行逻辑
+掩盖失败。旧 head 0221694 的 BOT 因上游冲突终止，须以新 head 重新申请。
+
+87682b8 三镜像构建成功、ActuCore 容器 437 项通过；Core 容器 12 项失败均在
+上游新增 interrupt_all_fallback 测试的 patch 目标解析阶段，Python 3.10 将
+event.llm 解析为包导出的 Event 实例而非同名模块。改为 import_module 后
+patch.object 明确目标，保留全部断言，不修改运行代码；由后续容器复验确认。

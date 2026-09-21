@@ -1,0 +1,40 @@
+/ubuntu/navigation/lidar:
+  history: keep_last
+  depth: 2
+  reliability: best_effort
+  durability: volatile
+/ubuntu/navigation/imu:
+  history: keep_last
+  depth: 400
+  reliability: best_effort
+  durability: volatile
+/ubuntu/navigation/fast_livo2/raw/odom:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/ubuntu/navigation/fast_livo2/raw/imu_propagated_odom:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/ubuntu/navigation/fast_livo2/sensor_rejection:
+  history: keep_last
+  depth: 10
+  reliability: best_effort
+  durability: volatile
+/ubuntu/navigation/_bridge_status:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/ubuntu/navigation/fast_livo2/mapper_runtime:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/ubuntu/navigation/fast_livo2/diagnostics:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile

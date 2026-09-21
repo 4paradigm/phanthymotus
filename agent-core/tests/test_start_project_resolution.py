@@ -82,6 +82,9 @@ def driver(monkeypatch):
     input the card was started with, which is the whole point: an ASR that was
     never started, or started without an input, has no output topic to report.
     """
+    # These fake drivers have no persisted tool schemas. Isolate their config
+    # from other suites (notably Solution tests restoring services to None).
+    monkeypatch.setattr(config, 'main', {'services': {'mcp': []}, 'core': {}})
     starts, started_input = {}, {}
 
     async def _call(mcp_id, req):
@@ -399,3 +402,52 @@ def test_a_live_answer_beats_a_stale_persisted_one(driver):
     }
     assert _start(layout) is True
     assert driver.starts[CORE]['input_topic'] == '/ubuntu/mic/audio'
+
+
+def test_port_bindings_survive_dependency_order_and_use_live_topics(driver, monkeypatch):
+    import mcp_client
+    nav = _card('nav', 'ControlledSemanticSpatial')
+    nav['topicIn'] = [{'port': 'lidar'}, {'port': 'imu'}]
+    monkeypatch.setattr(mcp_client, 'registry', {'mcp-perception': {
+        'tool_definitions': [{'name': 'ControlledSemanticSpatial',
+            'inputSchema': {'properties': {'input_bindings': {'type': 'array'}}}}]}})
+    second = _conn(RM, 'nav', '/stale/imu')
+    second['toPortIdx'] = '1'
+    layout = {'cards': [nav, _card(MIC, 'mic'), _card(RM, 'remote_message')],
+              'connections': [_conn(MIC, 'nav', '/stale/lidar'), second]}
+    assert _start(layout) is True
+    assert driver.starts['nav']['input_bindings'] == [
+        {'port': 'lidar', 'topic': '/ubuntu/mic/audio'},
+        {'port': 'imu', 'topic': '/remote_control/message'},
+    ]
+    assert 'input_topics' not in driver.starts['nav']
+
+
+@pytest.mark.parametrize('live', [False, True])
+def test_navigation_selects_standard_outputs_of_consolidated_sensor_cards(live):
+    """Select the wired output, even when legacy outputs occupy slot zero."""
+    nav = _card('nav', 'ControlledSemanticSpatial')
+    ports = ['lidar', 'imu', 'rgb', 'depth_frame']
+    nav['topicIn'] = [{'port': port} for port in ports]
+    sources = [
+        ('lidar_cloud', ['/legacy/lidar', '/ubuntu/navigation/lidar'], 1),
+        ('lidar_imu', ['/ubuntu/navigation/imu'], 0),
+        ('camera_rgb', ['/legacy/jpeg', '/ubuntu/camera/rgb_frame'], 1),
+        ('camera_depth', ['/legacy/depth', '/ubuntu/camera/depth_frame'], 1),
+    ]
+    cards, connections, resolved, expected = [nav], [], {}, []
+    for target_idx, (name, topics, source_idx) in enumerate(sources):
+        outputs = [{'topic': topic} for topic in topics]
+        cards.append(_card(name, name, outputs if not live else [{'topic': '/stale'}]))
+        if live:
+            resolved[name] = outputs
+        connection = _conn(name, 'nav', '/stale/fallback')
+        connection.update(fromPortIdx=str(source_idx), toPortIdx=str(target_idx))
+        connections.append(connection)
+        expected.append({'port': ports[target_idx], 'topic': topics[source_idx]})
+    single, topics, bindings = config_api._resolve_processor_inputs(
+        nav, connections, cards, resolved,
+    )
+    assert single == ''
+    assert bindings == expected
+    assert topics == [item['topic'] for item in expected]

@@ -333,6 +333,13 @@ async def get_layout():
 @router.post('/layout')
 async def save_layout(layout: CanvasLayout):
     """Persist the canvas layout. Only the current editor can save."""
+    from api.config import layout_lifecycle_lock
+
+    async with layout_lifecycle_lock:
+        return await _save_layout_locked(layout)
+
+
+async def _save_layout_locked(layout: CanvasLayout):
     global _editor_session, _editor_last_seen
     _check_editor_expired()
 
@@ -346,12 +353,29 @@ async def save_layout(layout: CanvasLayout):
 
     save_data = layout.dict()
     save_data.pop('session_id', None)
-    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = save_data
-    # A card that leaves the layout is unreachable afterwards — stop-project only
-    # walks the saved cards — so its plugin instance would keep running forever.
+    old_layout = config.main.get('canvas_layout', {}) or {}
+    old_cards = old_layout.get('cards', [])
+    if config.main.get('core', {}).get('project_running', False):
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'code': 409, 'message': '请先停止智能控制后修改画布'},
+        )
     from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, save_data.get('cards', []))
+    _, stop_failures = await stop_removed_cards(
+        old_cards, save_data.get('cards', []))
+    if stop_failures:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={
+                'code': 409,
+                'message': (
+                    'Removed card stop was not confirmed; layout was not saved '
+                    'and the project remains stopped'
+                ),
+                'failures': stop_failures,
+            },
+        )
+    config.main['canvas_layout'] = save_data
     notify_layout_changed(session_id or '')
     return {'code': 200}
 
