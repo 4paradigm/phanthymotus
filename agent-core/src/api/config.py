@@ -762,10 +762,44 @@ async def _do_start_project_impl():
         # derived topic never resolved in a browser, empty.
         if not topic:
             topic = conn.get('fromTopic') or ''
+        from_card = next((c for c in cards if c.get('id') == from_card_id), None)
         if not topic:
-            from_card = next((c for c in cards if c.get('id') == from_card_id), None)
             topic = _port_topic((from_card or {}).get('topicOut') or [], port_idx)
+        # 最后一条：**设备此刻声称的** topic_out，从 MCP 注册表里按
+        # (mcpId, toolName) 取。放最后，因为前三条更贴近"操作者在画布上看到的那
+        # 条线"，而这一条是"设备现在说它往哪儿发"——两者不一致时应当以画布为准，
+        # 否则一次驱动改动会让一条画好的线悄悄指向别处。
+        #
+        # 但它必须存在，因为前三条在一种情况下**全部为空且都不是错的**：
+        #
+        #   * `resolved_topics` 只有已启动的卡片有 —— 而反馈环（vla → servo_eef
+        #     → vla）里，先启动的那张永远拿不到后启动那张的答案；
+        #   * `fromTopic` 与 `topicOut` 都是**浏览器**的快照，拍摄于画线/拖卡片
+        #     的那一刻。驱动后来补上了 `topic_out.topic`，快照里却没有。
+        #
+        # 真机实测 2026-09-21（G1）：`servo_eef` 补上 topic 之后，agent-core 的注册
+        # 表里已经是 `/ubuntu/servo_eef/state`，而画布快照仍是空的，于是启动失败并
+        # 报「连线缺少 topic: servo_eef → vla，请检查上游卡片是否能报出输出话题」
+        # —— 上游明明是对的，唯一新鲜且权威的那份数据根本没被查。
+        if not topic and from_card:
+            topic = _registry_port_topic(from_card, port_idx)
         return topic
+
+    def _registry_port_topic(from_card: dict, port_idx: int) -> str:
+        """源卡片对应的工具在 MCP 注册表里当前声明的 topic_out[port_idx]。"""
+        # 直接读 `config.main`，不走 `api.mcp_manage` —— 那是同一份数据，而少一个
+        # 跨模块依赖（注册表本来就存在 config 里，`_get_mcp_list` 只是它的读取器）。
+        mcp_id = from_card.get('mcpId') or ''
+        tool_name = from_card.get('toolName') or ''
+        if not mcp_id or not tool_name:
+            return ''
+        for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
+            if mcp.get('id') != mcp_id:
+                continue
+            for tool in mcp.get('tools') or []:
+                if isinstance(tool, dict) and tool.get('name') == tool_name:
+                    return _port_topic(tool.get('topic_out') or [], port_idx)
+        return ''
 
     def _resolve_input_topics(card_id: str) -> tuple[str, list, list]:
         """Resolve input_topic(s) for a card from its inbound connections.
