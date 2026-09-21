@@ -84,8 +84,14 @@ def driver(monkeypatch):
     """
     starts, started_input = {}, {}
 
-    async def _call(mcp_id, req):
+    async def _call(mcp_id, req, timeout_s=None):
+        # **`timeout_s` 要收下并断言，不能只是吞掉。** 一个把出问题的那个参数
+        # 悄悄丢掉的假件，正是这一类 bug 能活下来的原因（画布那个 qos 也是）。
+        # 只读的 `info()` 必须是有界的：无界时一个不回应的 MCP 会让整次启动永久
+        # 挂死，而"取消"按钮对后端无效。`start` 相反，它合法地可以很慢。
         args = dict(req.arguments)
+        if args.get('action') == 'info':
+            assert timeout_s, 'info() 必须带超时，否则轮询循环的 deadline 是摆设'
         action, card_id = args.get('action'), args.get('instance_id')
         if action == 'start':
             starts[card_id] = args
@@ -399,3 +405,68 @@ def test_a_live_answer_beats_a_stale_persisted_one(driver):
     }
     assert _start(layout) is True
     assert driver.starts[CORE]['input_topic'] == '/ubuntu/mic/audio'
+
+
+# ── 第四条回退：设备此刻声称的 topic_out ─────────────────────────────────────
+#
+# 前三条在一种情况下**全部为空，而且都不是错的**：
+#
+#   resolved_topics  只有已启动的卡片有 —— 反馈环（vla → servo_eef → vla）里，
+#                    先启动的那张永远拿不到后启动那张的答案
+#   fromTopic        浏览器画线那一刻的快照
+#   topicOut         浏览器拖卡片那一刻的快照
+#
+# 驱动后来补上 `topic_out.topic` 之后，两个快照都还是旧的，而 agent-core 的 MCP
+# 注册表里已经是新的 —— 唯一新鲜且权威的那份数据根本没被查。真机实测
+# 2026-09-21（G1）：`servo_eef → vla` 报「连线缺少 topic，请检查上游卡片是否能报出
+# 输出话题」，而上游明明是对的。
+
+
+def _registry_layout():
+    """一张源卡片的快照里**没有** topic，而注册表里有。"""
+    src = _card('card-src', 'servo_eef', topic_out=[{'format': 'state/joint'}])
+    src['mcpId'] = 'mcp-drv'
+    dst = _card('card-dst', 'vla')
+    dst['mcpId'] = 'mcp-act'
+    return {
+        'cards': [src, dst],
+        'connections': [{'fromCardId': 'card-src', 'toCardId': 'card-dst',
+                         'fromPortIdx': 0, 'fromTopic': ''}],
+    }
+
+
+def test_the_registry_answers_when_both_browser_snapshots_are_stale(driver, monkeypatch):
+    """注册表是最后一条，但它必须存在 —— 否则一次驱动改动会让画好的线连不上。"""
+    import config as _cfg
+    services = dict(_cfg.main.get('services') or {})
+    services['mcp'] = [{
+        'id': 'mcp-drv',
+        'tools': [{'name': 'servo_eef',
+                   'topic_out': [{'topic': '/ubuntu/servo_eef/state',
+                                  'format': 'state/joint'}]}],
+    }]
+    _cfg.main['services'] = services
+
+    assert _start(_registry_layout()) is True
+    assert driver.starts['card-dst'].get('input_topic') == '/ubuntu/servo_eef/state'
+
+
+def test_the_browser_snapshot_still_wins_over_the_registry(driver):
+    """顺序不能反：画布上那条线画的是什么，就该是什么。
+
+    反过来的话，一次驱动改动会让一条已经画好的线**悄悄指向别处** —— 而操作者
+    在画布上看到的还是原来那条。
+    """
+    import config as _cfg
+    services = dict(_cfg.main.get('services') or {})
+    services['mcp'] = [{
+        'id': 'mcp-drv',
+        'tools': [{'name': 'servo_eef',
+                   'topic_out': [{'topic': '/new/topic', 'format': 'state/joint'}]}],
+    }]
+    _cfg.main['services'] = services
+
+    layout = _registry_layout()
+    layout['connections'][0]['fromTopic'] = '/drawn/on/the/canvas'
+    assert _start(layout) is True
+    assert driver.starts['card-dst'].get('input_topic') == '/drawn/on/the/canvas'
