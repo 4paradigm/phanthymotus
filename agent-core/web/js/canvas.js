@@ -2009,21 +2009,53 @@ async function _startProject() {
   }
 }
 
-function _stopProject() {
+async function _stopProject() {
+  // **先请求，确认成功了再改状态** —— 和 _startProject 同一个形状。
+  //
+  // 此前是反过来的：先 _applyProjectState(false)，再做麦克风清理，最后
+  // `fetch(...).catch(() => {})`，然后**无条件**记一条「智能控制已停止」。
+  // 三处叠在一起，任何一种失败都长成"已经停了"：
+  //
+  //   * 清理那段抛异常 → fetch 那行根本执行不到，而状态已经翻了；
+  //   * `.catch()` 只接网络错误，**非 2xx 不会 reject** —— 后端返回 500 也算成功；
+  //   * 日志那行不看结果。
+  //
+  // 而状态一旦翻成 false，按钮就变回「开启智能控制」，再点走的是**启动**那一支
+  // —— 于是连重试的机会都没有。天轶实测 2026-09-21：后端 project_running 一直
+  // 是 true，20 分钟的访问日志里**一条 stop-project 都没有**，而界面显示已停止。
+  //
+  // 麦克风清理挪到请求之后，并且自己吞掉异常：它是收尾动作，不该挡住停止本身。
+  let ok = false;
+  try {
+    const res = await fetch('/api/config/stop-project', { method: 'POST' });
+    ok = res.ok;
+  } catch (err) {
+    ok = false;
+  }
+  if (!ok) {
+    // 不翻状态：按钮留在「停止智能控制」上，操作者能再点一次。谎报已停止是这个
+    // 函数此前唯一会做的事。
+    _logActivity('warn', '停止智能控制失败 —— 后端仍在运行，请重试');
+    return;
+  }
+
   _applyProjectState(false);
-  // Auto-stop mic stream
-  for (const card of _cards) {
-    if (card.toolName === 'remote_mic' && isMicActive()) {
-      toggleMicStream('', () => {}).catch(() => {});
-      const micBtn = card.el?.querySelector('.canvas-mic-btn');
-      if (micBtn) {
-        micBtn.textContent = '\uD83C\uDF99 开始录音';
-        micBtn.classList.remove('recording');
+  _logActivity('project', '智能控制已停止');
+
+  try {
+    for (const card of _cards) {
+      if (card.toolName === 'remote_mic' && isMicActive()) {
+        toggleMicStream('', () => {}).catch(() => {});
+        const micBtn = card.el?.querySelector('.canvas-mic-btn');
+        if (micBtn) {
+          micBtn.textContent = '\uD83C\uDF99 开始录音';
+          micBtn.classList.remove('recording');
+        }
       }
     }
+  } catch (err) {
+    _logActivity('warn', `麦克风收尾失败: ${err.message}`);
   }
-  fetch('/api/config/stop-project', { method: 'POST' }).catch(() => {});
-  _logActivity('project', '智能控制已停止');
 }
 
 function _syncProjectBtn() {
