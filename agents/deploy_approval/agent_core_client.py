@@ -4,13 +4,15 @@ Covers driver/perception/actucore deploy+status, the MCP ping health check and
 the core ``POST /api/system/update`` adapter. No sockets, no SSH, no shell.
 The runtime credential is a per-machine Agent Core Bearer token from
 ``secrets.yaml``.
+
+TLS verification is disabled: the controller connects over HTTPS directly to
+each machine's Agent Core without certificate pinning.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import ssl
 from typing import Any
 
 import httpx
@@ -70,50 +72,6 @@ class AgentCoreDeployOutcomeUncertain(AgentCoreError):
     pass
 
 
-def _validate_tls_peer_cert_logical_path(tls_peer_cert_file: str) -> str:
-    if not isinstance(tls_peer_cert_file, str) or not tls_peer_cert_file.strip():
-        raise AgentCoreError("Agent Core tls_peer_cert_file is required")
-    logical_path = str(tls_peer_cert_file).strip()
-    cert_dir = "/run/deploy-approval/certs"
-    if not logical_path.startswith(cert_dir + "/"):
-        raise AgentCoreError(
-            "Agent Core tls_peer_cert_file must be under /run/deploy-approval/certs/"
-        )
-    if "/../" in logical_path or logical_path.endswith("/.."):
-        raise AgentCoreError("Agent Core tls_peer_cert_file must not contain '..'")
-    if logical_path.rstrip("/") == cert_dir:
-        raise AgentCoreError("Agent Core tls_peer_cert_file must name a certificate file")
-    # Enforce direct child (no subdirectory)
-    remainder = logical_path[len(cert_dir) + 1:]
-    if "/" in remainder:
-        raise AgentCoreError(
-            "Agent Core tls_peer_cert_file must be a direct child of "
-            "/run/deploy-approval/certs/ (no subdirectories)"
-        )
-    if not remainder.endswith(".pem"):
-        raise AgentCoreError(
-            "Agent Core tls_peer_cert_file must end with .pem"
-        )
-    return logical_path
-
-
-def build_pinned_peer_context(tls_peer_cert_file: str) -> ssl.SSLContext:
-    logical_path = _validate_tls_peer_cert_logical_path(tls_peer_cert_file)
-    # Agent Core currently presents a per-robot self-signed leaf cert while the
-    # controller connects to an admin-whitelisted literal IPv4. Hostname checks
-    # are off only because this context trusts exactly the machine's pinned leaf
-    # certificate file; do not replace this with a broad CA bundle while leaving
-    # check_hostname disabled.
-    from .policy import _cert_filesystem_path
-
-    ctx = ssl.create_default_context(cafile=str(_cert_filesystem_path(logical_path)))
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.check_hostname = False
-    if hasattr(ssl, "TLSVersion"):
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    return ctx
-
-
 class AgentCoreClient:
     def __init__(
         self,
@@ -121,7 +79,6 @@ class AgentCoreClient:
         base_url: str,
         *,
         node_host: str,
-        tls_peer_cert_file: str,
         access_token: str = "",
         http: httpx.AsyncClient | None = None,
     ):
@@ -140,7 +97,6 @@ class AgentCoreClient:
         # literal IP address and confirm the URL scheme/host/port are exact.
         if not isinstance(node_host, str) or not node_host.strip():
             raise AgentCoreError("node_host is required")
-        tls_peer_cert_file = _validate_tls_peer_cert_logical_path(tls_peer_cert_file)
         try:
             parsed_ip = ipaddress.ip_address(node_host)
         except ValueError as e:
@@ -181,23 +137,22 @@ class AgentCoreClient:
             )
         self.base_url = base_url.rstrip("/")
         self.node_host = node_host
-        self.tls_peer_cert_file = tls_peer_cert_file
-        verify = True
         self._owns_http = http is None
         if http is None:
-            verify = build_pinned_peer_context(self.tls_peer_cert_file)
-        self.http = http or httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                config.total_timeout,
-                connect=config.connect_timeout,
-                read=config.read_timeout,
-                write=config.connect_timeout,
-                pool=config.connect_timeout,
-            ),
-            follow_redirects=False,
-            verify=verify,
-            trust_env=False,
-        )
+            self.http = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    config.total_timeout,
+                    connect=config.connect_timeout,
+                    read=config.read_timeout,
+                    write=config.connect_timeout,
+                    pool=config.connect_timeout,
+                ),
+                follow_redirects=False,
+                verify=False,
+                trust_env=False,
+            )
+        else:
+            self.http = http
 
     async def aclose(self) -> None:
         if self._owns_http:

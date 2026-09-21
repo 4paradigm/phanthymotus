@@ -449,58 +449,6 @@ def approve_deploy_revoked_comment(
     return "\n".join(lines)
 
 
-def approve_deploy_no_coverage_comment(
-    repo: str,
-    pr_number: int,
-    head_sha: str,
-    machine_alias: str,
-    components: list[dict],
-    all_component_ids: set,
-    covered_ids: set,
-    full_coverage_machines: list[dict],
-) -> str:
-    lines = [
-        BOT_MARKER,
-        lifecycle_marker(repo, pr_number),
-        "### Deploy Approval — Lifecycle",
-        "",
-        "**Status:** `deploy-requested`",
-        f"**Bound HEAD:** `{_short(head_sha)}`",
-        "",
-        f"Selected machine `{_escape(machine_alias)}` does not cover all required components.",
-        "ZERO deployment was performed.",
-        "",
-        "### Components to deploy",
-        "",
-    ]
-    for c in components:
-        target = _escape(str(c.get("target", "")))
-        cid = c.get("component_id", "")
-        covered = cid in covered_ids
-        prefix = "- " if covered else "- (not covered) "
-        lines.append(f"{prefix} {target} ({cid})")
-    lines.extend([
-        "",
-        "### Full-coverage compatible machines",
-        "",
-    ])
-    if full_coverage_machines:
-        for m in full_coverage_machines:
-            lines.append(f"- `{_escape(m['alias'])}`")
-    else:
-        lines.append("No single configured machine covers all required components.")
-        lines.append("Machine policy must be updated by the operator.")
-    lines.extend([
-        "",
-        "**Next action — Machine Owner**",
-        "",
-        "`/approve_deploy machine=<full-coverage-alias>`",
-        "",
-        last_checked_line(),
-    ])
-    return "\n".join(lines)
-
-
 def superseded_comment(repo: str, pr_number: int, old_head: str,
                        new_head: str) -> str:
     return "\n".join([

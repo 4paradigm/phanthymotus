@@ -37,7 +37,6 @@ def _bootstrap_config(tmp_path: Path, **overrides):
                 "  test-machine:",
                 "    node_id: node-1",
                 "    node_host: 127.0.0.1",
-                "    tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem",
                 "    owners:",
                 "      - owner1",
                 "    targets:",
@@ -478,3 +477,68 @@ async def test_create_repository_label_uses_repository_labels_post_only(tmp_path
             },
         )
     ]
+
+@pytest.mark.asyncio
+
+@pytest.mark.asyncio
+async def test_project_status_label_uses_canonical_space_after_colon():
+    """Prove that project_status_label exercises the real GitHub boundary
+    with exactly ``status: testing`` (with space) and NEVER ``status:testing``.
+
+    The fake exposes the same method names GitHubStateProxy calls:
+    get_issue_labels, create_repository_label, add_issue_label,
+    remove_issue_label.
+    """
+    from unittest.mock import AsyncMock
+
+    from ..config import DEFAULT_GITHUB_REPOS
+    from ..github_state_proxy import GitHubStateProxy
+    from ..github_state_proxy import STATUS_PREFIX, _ALLOWED_STATUS_LABELS
+
+    # -- sanity: prefix and contract ------------------------------------------------
+    assert STATUS_PREFIX == "status:"
+
+    # -- construct a minimal fake GitHub client --------------------------------------
+    github = AsyncMock(spec=[])
+    github.get_issue_labels = AsyncMock(
+        side_effect=[
+            ["bug"],  # initial read: desired status absent
+            ["bug"],  # fresh verify after ensure
+        ]
+    )
+    github.create_repository_label = AsyncMock(
+        return_value={"name": "status: testing"}
+    )
+    github.add_issue_label = AsyncMock()
+    github.remove_issue_label = AsyncMock()
+
+    # -- attach the fake through the real proxy boundary -----------------------------
+    from ..config import Config
+    cfg = Config(
+        github_repos=list(DEFAULT_GITHUB_REPOS),
+        registry="ccr.ccs.tencentyun.com",
+        agent_core_tokens={"test-machine": "token"},
+        poll_enabled=True,
+        github_webhook_secret="secret",
+        review_comment_author_id="7950763",
+    )
+
+    proxy = GitHubStateProxy(cfg, github, github_app_id="12345")
+
+    repo = DEFAULT_GITHUB_REPOS[0]
+    await proxy.project_status_label(repo, 1, "testing")
+
+    # -- prove create was attempted --------------------------------------------------
+    github.create_repository_label.assert_awaited_once()
+
+    # -- prove the REAL add boundary received exactly "status: testing" ---------------
+    github.add_issue_label.assert_awaited_once_with(repo, 1, "status: testing")
+
+    # -- prove the no-space variant was NEVER requested at the add boundary ----------
+    for call in github.add_issue_label.await_args_list:
+        assert call.args[2] != "status:testing", (
+            f"add_issue_label was called with no-space label: {call.args[2]}"
+        )
+
+    # -- sanity: no-space label is not in allowed set --------------------------------
+    assert "status:testing" not in _ALLOWED_STATUS_LABELS

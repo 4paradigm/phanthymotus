@@ -22,6 +22,7 @@ from ..models import MachineInfo
 from ..policy import Policy
 from ..registry_client import RegistryClient, RegistryError, ResolvedImage
 from ..service import DeployController
+from ..github_state_proxy import GitHubStateProxy
 from .conftest import make_config
 
 
@@ -34,7 +35,7 @@ def _request_state() -> dict:
         "version": 1,
         "head_sha": "a" * 40,
         "status": "deploy-ready",
-        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         "components": [],
         "deployments": [],
         "case_results": {},
@@ -297,7 +298,6 @@ def test_agent_core_client_rejects_unknown_constructor_kwargs():
             Config(),
             base_url="https://192.0.2.1:15678",
             node_host="192.0.2.1",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             typo_option="must-fail",
         )
 
@@ -427,15 +427,17 @@ async def test_phanthymotus_core_plus_perception_deploys_only_perception(control
         ],
         build_comment_id=1001,
         build_comment_updated_at="2026-09-18T03:55:54Z",
+        test_comment_id=1002,
+        test_comment_updated_at="2026-09-18T03:55:54Z",
         code_review_comment_id=1003,
-        code_review_created_at="2026-09-18T03:57:00Z",
+        code_review_comment_updated_at="2026-09-18T03:57:00Z",
         code_review_text="Review completed.",
     )
     proxy.read_hidden_state = AsyncMock(return_value={
         "version": 1,
         "head_sha": "a" * 40,
         "status": "deploy-ready",
-        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         "components": [],
         "deployments": [],
         "approve_attempts": [],
@@ -456,12 +458,13 @@ async def test_phanthymotus_core_plus_perception_deploys_only_perception(control
         )
         proxy.write_hidden_state = AsyncMock()
         proxy.project_status_label = AsyncMock()
+        mock_github.resolve_commit_sha.return_value = "a" * 40
 
         await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 100)
 
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert [c["target"] for c in written_state["components"]] == ["perception"]
-    assert written_state["review_evidence"].get("build_comment_id") == 1
+    assert written_state["review_evidence"].get("build_comment_id") == 1001
 
 
 
@@ -505,7 +508,6 @@ def policy(config):
             node_id="node-1",
             owners=["owner1"],
             node_host="10.0.0.1",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             targets=["perception", "actucore"],
             platforms=["linux/arm64"],
             variants=["5.11", "6.1"],
@@ -515,7 +517,6 @@ def policy(config):
             node_id="node-2",
             owners=["owner1"],
             node_host="10.0.0.2",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             targets=["driver"],
             platforms=["linux/arm64"],
             variants=["5.11"],
@@ -526,7 +527,6 @@ def policy(config):
             node_id="node-3",
             owners=["owner1"],
             node_host="10.0.0.3",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             targets=["perception", "actucore", "driver"],
             platforms=["linux/arm64"],
             variants=["5.11", ""],
@@ -563,7 +563,7 @@ def _state(**overrides):
         "version": 1,
         "head_sha": "a" * 40,
         "status": "testing",
-        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         "components": [_component()],
         "deployments": [{"machine": "perception-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         "case_results": {},

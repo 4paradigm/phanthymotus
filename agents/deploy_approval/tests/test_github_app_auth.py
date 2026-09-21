@@ -102,14 +102,15 @@ class TestGetInstallationTokenSingleFlight:
         auth.jwtBearerToken = lambda: "test-app-jwt"
 
         call_count = 0
-        block_event = asyncio.Event()
-        unblock_event = asyncio.Event()
+        entered_lock = asyncio.Event()
+        block_request = asyncio.Event()
 
         async def slow_mock_transport(request: httpx.Request) -> httpx.Response:
             nonlocal call_count
             if "/access_tokens" in str(request.url):
                 call_count += 1
-                await block_event.wait()
+                entered_lock.set()
+                await block_request.wait()
                 return httpx.Response(
                     200,
                     json={"token": "tok-slow", "expires_at": "2099-01-01T00:00:00Z"},
@@ -118,20 +119,15 @@ class TestGetInstallationTokenSingleFlight:
 
         auth._http = httpx.AsyncClient(transport=httpx.MockTransport(slow_mock_transport), trust_env=False)
 
-        async def first_caller():
-            task = asyncio.create_task(auth.get_installation_token())
-            # Wait until the first caller has entered the lock and blocked
-            await asyncio.sleep(0.05)
-            return task
-
         task1 = asyncio.create_task(auth.get_installation_token())
-        await asyncio.sleep(0.05)
-        # Now the first caller is inside the lock and blocked on mock transport
+        # Wait until task1 has entered the lock and blocked on the transport
+        await entered_lock.wait()
+        # Now task1 is inside the lock, blocked on block_request
         task2 = asyncio.create_task(auth.get_installation_token())
 
+        block_request.set()
         results = await asyncio.gather(task1, task2)
         assert all(r == "tok-slow" for r in results)
         assert call_count == 1, f"Expected 1 refresh, got {call_count}"
 
-        unblock_event.set()
         await auth.close()

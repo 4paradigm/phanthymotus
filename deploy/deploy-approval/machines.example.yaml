@@ -5,7 +5,6 @@
 #   <alias>:          # unique, non-empty, used in /approve_deploy machine=<alias>
 #     node_id: <id>   # unique, non-empty machine-policy identifier
 #     node_host: <ipv4>  # fake literal IPv4 used to reach Agent Core at https://<node_host>:15678
-#     tls_peer_cert_file: /run/deploy-approval/certs/<alias>.pem
 #     owners:         # non-empty list of GitHub logins (case-insensitive, deduped)
 #       - <github-login>
 #     targets:        # list of targets this machine can host
@@ -28,7 +27,6 @@ machines:
   sh-g1-01:
     node_id: node-g1-01
     node_host: 192.0.2.101
-    tls_peer_cert_file: /run/deploy-approval/certs/sh-g1-01.pem
     owners:
       - alice
       - bob
@@ -44,7 +42,6 @@ machines:
   sh-go2:
     node_id: node-go2
     node_host: 192.0.2.102
-    tls_peer_cert_file: /run/deploy-approval/certs/sh-go2.pem
     owners:
       - bob
       - charlie

@@ -89,11 +89,13 @@ def test_real_record_test_contains_test_section():
 def test_cos_object_key_exact_layout():
     client = CosClient(make_config())
     now = datetime(2026, 9, 17, 20, 30)
-    expected = "phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"
-    for repo in ("4paradigm/phanthymotus",):
+    for repo, expected in [
+        ("4paradigm/phanthymotus", "phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"),
+        ("4paradigm/phanthymotus-driver", "phanthymotus_pr/phanthymotus-driver/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"),
+    ]:
         assert client.build_object_key(repo, 7, HEAD, now=now) == expected
     with pytest.raises(ValueError):
-        client.build_object_key("4paradigm/phanthymotus-driver", 7, HEAD, now=now)
+        client.build_object_key("some/other-repo", 7, HEAD, now=now)
 
 
 @pytest.mark.parametrize("key", [

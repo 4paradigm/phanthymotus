@@ -2,7 +2,16 @@
 
 本文是 Deploy Approval 的中文主文档，描述当前冻结的 stateless 合同。
 
-Deploy Controller 只负责部署审批与状态编排，**代码不修改**；代码构建与 Review 仍由 Review Agent 负责。生产模式只支持 `4paradigm/phanthymotus`。缺失、重复或第三方仓库必须 fail closed。
+Deploy Controller 只负责部署审批与状态编排，**代码不修改**；代码构建与 Review 仍由 Review Agent 负责。
+
+生产环境能力与仓库合同：
+- 源/产品能力支持的仓库：`4paradigm/phanthymotus`、`4paradigm/phanthymotus-driver`
+- 当前生产发布 / 默认 `GITHUB_REPOS` 为 `4paradigm/phanthymotus`（main）单仓库
+- 当前 GitHub App 安装可能仅授权了 main
+- `4paradigm/phanthymotus-driver` 运行时授权延后（DEFERRED）
+- 一旦在同一安装中将 driver 加入选定仓库集合，仅扩展 `GITHUB_REPOS` 配置即可，无需修改 Deploy Approval 源码
+- 未知的 / 第三方的仓库必须 fail closed
+- 缺失、重复的仓库必须 fail closed。
 
 ## Review Agent 集成
 
@@ -103,7 +112,7 @@ Source matrix:
 - Agent Core: runtime identity / current `running_image` / MCP evidence
 - GitHub hidden JSON: restart-safe persistence snapshot
 
-`phanthymotus` 只部署 `perception` / `actucore`，`CORE` 不作为可部署组件；`phanthymotus-driver` 以 `driver_path` 作为机器策略身份，但 runtime id 必须通过 Agent Core 的精确 image repository 匹配得到，不能直接从 `driver_path` 拼接或模糊推导。Deploy Controller 通过本地管理员维护的 `machines.yaml` 中配置的 literal IPv4 `node_host` 连接到已存在的 Agent Core API，不做 Agent Core registration。Agent Core endpoint 固定为 `https://<node_host>:15678`，HTTP redirect 禁用。每台机器必须配置 `/run/deploy-approval/certs/` 下独享的 `tls_peer_cert_file`，作为管理员预置的 exact peer leaf certificate pin。Deploy Approval 不做 TOFU，不从 Robot 首次抓取证书，不允许 `verify=False`，也不允许 PR/comment 指定目标 IP 或证书路径。Registry 只作为 `/request_deploy` 内部的 exact Review Agent image 解析与 immutable verification 实现细节，不作为独立 actor 或独立控制面。
+`phanthymotus` 只部署 `perception` / `actucore`，`CORE` 不作为可部署组件；`phanthymotus-driver` 以 `driver_path` 作为机器策略身份，但 runtime id 必须通过 Agent Core 的精确 image repository 匹配得到，不能直接从 `driver_path` 拼接或模糊推导。Deploy Controller 通过本地管理员维护的 `machines.yaml` 中配置的 literal IPv4 `node_host` 连接到已存在的 Agent Core API，不做 Agent Core registration。Agent Core endpoint 固定为 `https://<node_host>:15678`，HTTP redirect 禁用。每台机器通过 Agent Core 的 `node_host` 直连 `https://<node_host>:15678`，不做 TLS peer certificate pin，允许 `verify=False`。Deploy Approval 不做 TOFU，不允许 PR/comment 指定目标 IP 或证书路径。Registry 只作为 `/request_deploy` 内部的 exact Review Agent image 解析与 immutable verification 实现细节，不作为独立 actor 或独立控制面。
 
 fresh Review Agent build_results + fresh Registry immutable resolution
 ↓
@@ -130,18 +139,18 @@ NEW approve only
 
 /approve_deploy 必须首先通过 full-coverage gate：
 
-1. 计算 ALL bound component_ids
+1. 计算 ALL REMAINING component_ids
 2. 计算 selected machine 实际能覆盖的 component_ids
-3. 只有 machine_compatible_component_ids >= all_component_ids 才允许继续
+3. 只有 machine_compatible_component_ids >= all_remaining_component_ids 才允许继续
 4. 如果 coverage 不足：ZERO deploy POST，status 保持 deploy-requested，comment 列出 full-coverage machines
 
 full-coverage gate 确保不再存在 partial machine-group 部署、不再跨机器轮询、不再等待剩余 component。
 
 full-coverage gate 必须在 CLEAN gate 之前执行。
 
-CLEAN 通过后：FULL-COVERAGE -> running_image-only CLEAN -> fresh exact approval comment -> final fresh PR/full HEAD -> persist command.phase=executing to GitHub FIRST -> deploy ALL components -> durable status: testing -> fixed Case (advisory only) -> Machine Owner /record_test -> succeeded | failed.
+CLEAN 通过后：FULL-COVERAGE -> running_image-only CLEAN -> fresh exact approval comment -> final fresh PR/full HEAD -> persist command.phase=executing to GitHub FIRST -> deploy ALL REMAINING components -> durable status: testing -> fixed Case (advisory only) -> Machine Owner /record_test -> succeeded | failed.
 
-不再检查 "所有 machine group 是否全部部署完毕"，因为 selected machine 已要求覆盖全部 components。
+不再检查 "所有 machine group 是否全部部署完毕"，因为 selected machine 已要求覆盖全部 REMAINING components。已 durably 成功的相同 snapshot 组件不会重新部署。
 
 **无 post-deploy health gate：** 每次 Agent Core deploy POST 返回正常即视为该组件部署成功，不额外调用 `driver_status` 轮询 `running_image` 来判定生命周期成功。终态证据上传前，对已部署 runtime 做一次性的 `driver_status` 日志快照；失败只写固定 marker，不改变已写入 GitHub 的终态。
 
@@ -218,7 +227,7 @@ hidden JSON 是唯一权威业务状态。至少包含：
 - `version`
 - `head_sha`
 - `status`
-- `review_job_id`
+- `review_evidence`
 - `components`
 - `deployments`
 - `case_results`
@@ -313,12 +322,12 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 
 ### Full-Coverage Machine Gate
 
-一条 `/approve_deploy` 命令只选择一台 machine。这台 machine 必须覆盖 ALL bound components。
+一条 `/approve_deploy` 命令只选择一台 machine。这台 machine 必须覆盖 ALL REMAINING components。
 
 - coverage 不完整 → ZERO deploy POST，status 保持 `deploy-requested`，提示用户选择 full-coverage machine
 - 不存在跨 machine partial success
 - 不存在"先部署一部分，再换另一台机器继续部署"的流程
-- 成功覆盖并部署全部 components 后直接进入 `testing`
+- 成功覆盖并部署全部 REMAINING components 后直接进入 `testing`
 
 ### CLEAN GATE
 
@@ -333,7 +342,7 @@ CLEAN GATE 只读取 `running_image`，不判断机器状态。禁止把下面�
 - node availability state
 - machine readiness state
 
-如果 selected machine 上的 ALL bound components 都满足：
+如果 selected machine 上的 ALL REMAINING components 都满足：
 
 ```text
 running_image == ""
@@ -362,10 +371,10 @@ running_image != ""
 
 ### 同一 machine 的多组件预检
 
-本次 approval 的 ALL bound components 必须在 ANY deploy POST 前全部 preflight：
+本次 approval 的 ALL REMAINING components 必须在 ANY deploy POST 前全部 preflight：
 
 ```text
-ALL bound components preflight
+ALL REMAINING components preflight
 BEFORE
 ANY deploy POST
 ```
@@ -591,11 +600,16 @@ Minimum repository permissions:
   status-label operations.
 - **Metadata: read** — needed for collaborator permission lookup.
 
-Do **not** request Administration, Actions, or Contents permission
-solely because an unused helper exists.
+Do **not** request Administration or Actions permission.
 
-If a future production path begins reading repository contents through
-the Contents API, that must be reviewed as a separate permission change.
+**Contents: read** — The current target repository
+`4paradigm/phanthymotus` is PUBLIC, so `resolve_commit_sha()` (which calls
+`GET /repos/{repo}/commits/{ref}`) operates without granting Contents: read.
+The current minimum deployment permissions therefore do not need to be
+broadened solely for this public rollout. If a future authorized target
+repository is private, the commit endpoint requires GitHub App `Contents:
+read`; permissions must be explicitly reviewed before private-repo
+enablement.
 
 ## 结论
 

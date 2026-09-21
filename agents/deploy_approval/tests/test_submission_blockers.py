@@ -126,7 +126,7 @@ def _review_state(**overrides):
 def _deploy_requested_state(**overrides):
     state = _review_state(
         status="deploy-requested",
-        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component()],
         deployments=[],
     )
@@ -137,7 +137,7 @@ def _deploy_requested_state(**overrides):
 def _testing_state(**overrides):
     state = _review_state(
         status="testing",
-        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
     )
@@ -350,7 +350,7 @@ def test_deploy_ready_hidden_state_requires_review_evidence():
 
 
 def test_deploy_ready_hidden_state_allows_empty_components_with_review_job():
-    state = _review_state(status="deploy-ready", review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"}, components=[])
+    state = _review_state(status="deploy-ready", review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"}, components=[])
 
     validated = _validate_hidden_state(state)
 
@@ -366,8 +366,8 @@ async def test_approve_rechecks_pr_after_clean_gate_before_executing(controller,
     proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events.append("write_hidden_state") or {})
     proxy.project_status_label = AsyncMock()
     events: list[str] = []
-    first_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
-    second_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
+    first_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 999, "login": "alice"}}
+    second_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 999, "login": "alice"}}
 
     get_pr_calls = 0
 
@@ -392,8 +392,32 @@ async def test_approve_rechecks_pr_after_clean_gate_before_executing(controller,
         "body": "/approve_deploy machine=test-machine",
         "user": {"id": 1, "login": "owner1"},
     }
+    # Add review evidence so _fresh_review_evidence_matches_state passes
+    fake_github.comments[1001] = {
+        "id": 1001,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent \u2014 Build Result\n\nCommit: `abc1234`\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+        "created_at": "2026-09-18T00:00:00Z",
+        "updated_at": "2026-09-18T00:01:00Z",
+    }
+    fake_github.comments[1002] = {
+        "id": 1002,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent \u2014 Test Results\n\nCommit: `abc1234`\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+        "created_at": "2026-09-18T00:02:00Z",
+        "updated_at": "2026-09-18T00:03:00Z",
+    }
+    fake_github.comments[1003] = {
+        "id": 1003,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent \u2014 Code Review\n\nAll checks passed.",
+        "created_at": "2026-09-18T00:04:00Z",
+        "updated_at": "2026-09-18T00:05:00Z",
+    }
 
-    await controller.handle_approve_deploy("repo", 1, 50, "test-machine", "owner1", "1")
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+
+    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "owner1", "1")
 
     assert proxy.get_pr.await_count >= 2
     assert events.index("list_drivers") < events.index("get_pr_2")
@@ -410,8 +434,8 @@ async def test_approve_head_changes_after_clean_gate_zero_deploy_post(controller
     proxy.comment_identity = AsyncMock(return_value=("1", "alice"))
     proxy.collaborator_permission = AsyncMock(return_value="admin")
     proxy.get_pr = AsyncMock(side_effect=[
-        {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}},
-        {"state": "open", "merged": False, "head": {"sha": "b" * 40}, "user": {"id": 1, "login": "alice"}},
+        {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 999, "login": "alice"}},
+        {"state": "open", "merged": False, "head": {"sha": "b" * 40}, "user": {"id": 999, "login": "alice"}},
     ])
     core = MagicMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
@@ -440,8 +464,8 @@ async def test_approve_pr_closes_after_clean_gate_zero_deploy_post(controller, p
     proxy.comment_identity = AsyncMock(return_value=("1", "alice"))
     proxy.collaborator_permission = AsyncMock(return_value="admin")
     proxy.get_pr = AsyncMock(side_effect=[
-        {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}},
-        {"state": "closed", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}},
+        {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 999, "login": "alice"}},
+        {"state": "closed", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 999, "login": "alice"}},
     ])
     core = MagicMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
@@ -465,7 +489,7 @@ async def test_approve_pr_closes_after_clean_gate_zero_deploy_post(controller, p
 
 @pytest.mark.asyncio
 async def test_reconcile_succeeded_old_head_becomes_review_required_on_new_head(controller, proxy, fake_github):
-    proxy.read_hidden_state = AsyncMock(return_value=_review_state(status="succeeded", head_sha="a" * 40, review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"}, components=[_component()], deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}], test_result="pass", cos={"object_key": "k", "sha256": "b" * 64, "size": 1}))
+    proxy.read_hidden_state = AsyncMock(return_value=_review_state(status="succeeded", head_sha="a" * 40, review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"}, components=[_component()], deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}], test_result="pass", cos={"object_key": "k", "sha256": "b" * 64, "size": 1}))
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "b" * 40}, "user": {"id": 1, "login": "alice"}}
@@ -517,7 +541,7 @@ async def test_reconcile_deploy_requested_old_head_clears_validation_snapshot(co
 async def test_record_test_cos_rebind_uses_fresh_terminal_state(controller, proxy):
     state = _review_state(
         status="succeeded",
-        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",
@@ -548,7 +572,7 @@ async def test_record_test_cos_rebind_skips_after_head_drift(controller, proxy):
     state = _review_state(
         head_sha="b" * 40,
         status="succeeded",
-        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",
@@ -577,7 +601,7 @@ async def test_record_test_cos_rebind_skips_after_head_drift(controller, proxy):
 async def test_record_test_cos_rebind_skips_after_command_changed(controller, proxy):
     state = _review_state(
         status="succeeded",
-        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",

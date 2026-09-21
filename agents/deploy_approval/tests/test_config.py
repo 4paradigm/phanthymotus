@@ -33,17 +33,18 @@ def test_validate_config_no_longer_requires_github_token():
             ],
             registry="ccr.ccs.tencentyun.com",
             review_comment_author_id="7950763",
+            agent_core_tokens={"test": "token"},
         )
     )
 
 
 def test_validate_config_default_repos():
     """Default github_repos is the single production repository."""
-    c = Config(review_comment_author_id="7950763")
+    c = Config(review_comment_author_id="7950763", agent_core_tokens={"test": "token"})
     assert "4paradigm/phanthymotus" in c.github_repos
     # Explicit empty overrides defaults — must fail closed
     with pytest.raises(ValueError, match="GITHUB_REPOS is required"):
-        validate_config(Config(github_repos=[], registry="ccr.ccs.tencentyun.com"))
+        validate_config(Config(github_repos=[], registry="ccr.ccs.tencentyun.com", agent_core_tokens={"test": "token"}))
 
 
 @pytest.mark.parametrize(
@@ -52,15 +53,18 @@ def test_validate_config_default_repos():
         (list(DEFAULT_GITHUB_REPOS), True),
         ([DEFAULT_GITHUB_REPOS[0], "some/fork-repo"], False),
         ([DEFAULT_GITHUB_REPOS[0], DEFAULT_GITHUB_REPOS[0]], False),
+        (["4paradigm/phanthymotus-driver"], False),
+        ([DEFAULT_GITHUB_REPOS[0], "4paradigm/phanthymotus-driver"], False),
         (["some/other"], False),
         ([], False),
         ([*DEFAULT_GITHUB_REPOS, "some/other"], False),
     ],
 )
-def test_github_repos_requires_exact_production_set(repos, should_pass):
+def test_github_repos_requires_exact_runtime_repo_set(repos, should_pass):
     cfg = Config(
         github_repos=repos,
         registry="ccr.ccs.tencentyun.com",
+        agent_core_tokens={"test": "token"},
         review_comment_author_id="7950763",
     )
     if should_pass:
@@ -79,6 +83,7 @@ def test_validate_config_requires_webhook_secret():
                 ],
                 webhook_enabled=True,
                 review_comment_author_id="7950763",
+                agent_core_tokens={"test-machine": "test-token"},
             )
         )
 
@@ -94,6 +99,7 @@ def test_validate_config_requires_polling():
                 poll_enabled=False,
                 github_webhook_secret="secret",
                 review_comment_author_id="7950763",
+                agent_core_tokens={"test-machine": "test-token"},
             )
         )
 
@@ -133,7 +139,7 @@ def test_config_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
     secrets = tmp_path / "secrets.yaml"
-    secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "review-agent-bot"\n')
+    secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "review-agent-bot"\nagent_core_tokens:\n  test-machine: test-token\n')
     import agents.deploy_approval.config as config_mod
     orig = config_mod._load_secrets_config
     def patched(path):
@@ -159,7 +165,7 @@ def test_config_env_unset_uses_default(monkeypatch, tmp_path):
     monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
     monkeypatch.delenv("GITHUB_REPOS", raising=False)
     secrets = tmp_path / "secrets.yaml"
-    secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "review-agent-bot"\n')
+    secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "review-agent-bot"\nagent_core_tokens:\n  test-machine: test-token\n')
     import agents.deploy_approval.config as config_mod
     orig = config_mod._load_secrets_config
     def patched(path):
@@ -187,7 +193,6 @@ def test_perception_review_variant_511_matches_canonical_machine_variant(tmp_pat
           m1:
             node_id: node-1
             node_host: 127.0.0.1
-            tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem
             owners: [owner1]
             targets: [perception]
             platforms: [linux/arm64]
@@ -207,7 +212,6 @@ def test_perception_review_variant_61_matches_canonical_machine_variant(tmp_path
           m1:
             node_id: node-1
             node_host: 127.0.0.1
-            tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem
             owners: [owner1]
             targets: [perception]
             platforms: [linux/arm64]
@@ -227,7 +231,6 @@ def test_legacy_jetson_variant_is_normalized_once_or_rejected_explicitly(tmp_pat
           m1:
             node_id: node-1
             node_host: 127.0.0.1
-            tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem
             owners: [owner1]
             targets: [perception]
             platforms: [linux/arm64]
@@ -235,29 +238,6 @@ def test_legacy_jetson_variant_is_normalized_once_or_rejected_explicitly(tmp_pat
     """))
     machines = load_machines(str(path))
     assert machines["m1"].variants == ["5.11"]
-
-
-def test_validate_hidden_state_accepts_approval_revoked():
-    from ..github_state_proxy import _validate_hidden_state
-    state = {
-        "version": 1,
-        "head_sha": "a" * 40,
-        "status": "review-required",
-        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
-        "components": [],
-        "deployments": [],
-        "approve_attempts": [],
-        "approve_attempts_total": 0,
-        "approve_attempts_truncated": False,
-        "case_results": {},
-        "test_result": "",
-        "cos": {"object_key": "", "sha256": "", "size": 0},
-        "command": {"comment_id": 1, "kind": "approve_deploy", "phase": "completed", "args": {"machine": "m1", "actor": "owner1"}},
-        "last_processed_comment_id": 1,
-        "approval_revoked": True,
-    }
-    result = _validate_hidden_state(state)
-    assert result["approval_revoked"] is True
 
 
 def test_driver_paths_required_for_driver_machine(config):
@@ -273,7 +253,6 @@ def test_driver_paths_required_for_driver_machine(config):
           m1:
             node_id: node-1
             node_host: 127.0.0.1
-            tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem
             owners: [owner1]
             targets: [driver]
             platforms: [linux/arm64]
@@ -298,7 +277,6 @@ def test_driver_paths_reject_string_scalar(config):
           m1:
             node_id: node-1
             node_host: 127.0.0.1
-            tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem
             owners: [owner1]
             targets: [driver]
             platforms: [linux/arm64]
@@ -321,7 +299,6 @@ def test_driver_paths_reject_absolute_parent_backslash_and_empty_segments(config
           m1:
             node_id: node-1
             node_host: 127.0.0.1
-            tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem
             owners: [owner1]
             targets: [driver]
             platforms: [linux/arm64]
@@ -350,7 +327,6 @@ def test_driver_paths_are_trimmed_deduped_and_exact_case_preserved(config):
           m1:
             node_id: node-1
             node_host: 127.0.0.1
-            tls_peer_cert_file: /run/deploy-approval/certs/test-agent-core.pem
             owners: [owner1]
             targets: [driver]
             platforms: [linux/arm64]

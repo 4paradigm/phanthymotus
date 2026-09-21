@@ -26,11 +26,9 @@ services:
       REGISTRY: "${REGISTRY:-}"
       REGISTRY_USER: "${REGISTRY_USER:-}"
       REGISTRY_PASSWORD: "${REGISTRY_PASSWORD:-}"
-    extra_hosts:
     volumes:
       - ./machines.yaml:/run/deploy-approval/machines.yaml:ro
       - ./secrets.yaml:/run/deploy-approval/secrets.yaml:ro
-      - ./certs:/run/deploy-approval/certs:ro
       - "${GITHUB_APP_PRIVATE_KEY_FILE}:${GITHUB_APP_PRIVATE_KEY_FILE}:ro"
     ports:
       - "25001:25001"

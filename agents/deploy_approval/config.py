@@ -273,19 +273,16 @@ def validate_config(cfg: Config) -> None:
     for r in cfg.github_repos:
         if not isinstance(r, str):
             raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
-    if not isinstance(cfg.github_repos, list):
-        raise ValueError("GITHUB_REPOS must be a list")
-    if not cfg.github_repos:
-        raise ValueError("GITHUB_REPOS is required")
-    for r in cfg.github_repos:
-        if not isinstance(r, str):
-            raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
     if len(cfg.github_repos) != len(set(cfg.github_repos)):
         raise ValueError("GITHUB_REPOS must not contain duplicates")
-    if not set(cfg.github_repos).issubset(SUPPORTED_GITHUB_REPOS):
+    required_repos = set(DEFAULT_GITHUB_REPOS)
+    if (
+        len(cfg.github_repos) != len(DEFAULT_GITHUB_REPOS)
+        or set(cfg.github_repos) != required_repos
+    ):
         raise ValueError(
-            "GITHUB_REPOS contains unsupported repo; allowed: "
-            + ", ".join(sorted(SUPPORTED_GITHUB_REPOS))
+            "GITHUB_REPOS must contain exactly: "
+            + ", ".join(DEFAULT_GITHUB_REPOS)
         )
     if cfg.webhook_enabled and not cfg.github_webhook_secret:
         raise ValueError(

@@ -81,7 +81,6 @@ class MachineInfo:
     node_id: str
     owners: list[str]  # GitHub logins (case-insensitive)
     node_host: str = ""
-    tls_peer_cert_file: str = ""
     targets: list[str] | None = None  # allowed targets (None = all)
     platforms: list[str] | None = None  # allowed platforms (None = all)
     variants: list[str] | None = None  # allowed variants (None = all)

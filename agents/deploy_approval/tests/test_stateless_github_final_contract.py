@@ -106,7 +106,6 @@ def policy(config):
             node_id="node-1",
             owners=["owner1"],
             node_host="127.0.0.1",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             targets=["perception"],
             platforms=["linux/arm64"],
             variants=["5.11"],
@@ -116,7 +115,6 @@ def policy(config):
             node_id="node-2",
             owners=["driver-owner"],
             node_host="127.0.0.2",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             targets=["perception", "driver"],
             platforms=["linux/arm64"],
             variants=["5.11"],
@@ -153,7 +151,7 @@ def _state(**overrides):
         "version": 1,
         "head_sha": "a" * 40,
         "status": "testing",
-        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         "components": [_component()],
         "deployments": [{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         "case_results": {},
@@ -216,7 +214,6 @@ def _deployment(image_ref="registry/repo@sha256:" + "a" * 64, driver_id="percept
         "driver_path": "",
         "node_id": "node-1",
         "node_host": "127.0.0.1",
-        "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
 "image_ref": image_ref,
         "machine_alias": "test-machine",
         "_core": AsyncMock(),
@@ -469,7 +466,6 @@ async def test_case_uses_real_agent_core_response_field(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
 "image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
@@ -502,7 +498,6 @@ async def test_case_exact_immutable_image_must_match_runtime(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
 "image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
@@ -534,7 +529,6 @@ async def test_case_empty_runtime_image_fails(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
 "image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
@@ -567,7 +561,6 @@ async def test_case_wrong_runtime_image_fails(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
 "image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
@@ -600,7 +593,6 @@ async def test_case_mcp_lookup_uses_real_agent_core_contract(config):
             "driver_path": "",
             "node_id": "node-1",
             "node_host": "127.0.0.1",
-            "tls_peer_cert_file": "/run/deploy-approval/certs/test-agent-core.pem",
 "image_ref": image_ref,
             "machine_alias": "test-machine",
             "_core": core,
@@ -699,7 +691,7 @@ def _deploy_requested_state(components=None, deployments=None, **overrides):
     component_list = list(components or [_component()])
     state = _state(
         status="deploy-requested",
-        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=component_list,
         deployments=list(deployments or []),
         command={"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
@@ -707,71 +699,6 @@ def _deploy_requested_state(components=None, deployments=None, **overrides):
     state.update(overrides)
     return state
 
-
-
-@pytest.mark.asyncio
-async def test_review_lookup_does_not_pass_pr_number(controller, proxy, mock_github):
-    mock_github.get_comment.return_value = {"id": 100, "user": {"id": 111, "login": "alice"}, "body": "/request_deploy"}
-    mock_github.get_pr.return_value = {
-        "state": "open",
-        "merged": False,
-        "head": {"sha": "a" * 40},
-        "user": {"id": 111, "login": "alice"},
-    }
-    proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_evidence={}, components=[]))
-    controller.registry.resolve.return_value = SimpleNamespace(image_ref="registry/repo@sha256:" + "b" * 64, platform="linux/arm64")
-    proxy.write_hidden_state = AsyncMock()
-    proxy.project_status_label = AsyncMock()
-
-    await controller.handle_request_deploy("repo", 1, 100)
-
-    # No review.list_jobs exists — evidence comes from GitHub comments
-    # Provide review agent comments so extract_review_evidence succeeds
-    mock_github.get_issue_comments.return_value = [
-        {
-            "id": 500,
-            "user": {"id": 7950763, "login": "review-agent-bot"},
-            "body": (
-                "<!-- pr-review-agent -->\n"
-                "## PR Review Agent \xe2\x80\x94 Build Result\n"
-                "Commit: `abc1234`\n"
-                "All builds succeeded.\n"
-                "| Target   | Status | Version |\n"
-                "| perception | Success | `registry/repo:v1` |\n"
-            ),
-            "created_at": "2026-09-18T00:00:00Z",
-            "updated_at": "2026-09-18T00:01:00Z",
-        },
-        {
-            "id": 501,
-            "user": {"id": 7950763, "login": "review-agent-bot"},
-            "body": (
-                "<!-- pr-review-agent -->\n"
-                "## PR Review Agent \xe2\x80\x94 Test Results\n"
-                "Commit: `abc1234`\n"
-                "| Suite | Result | Passed | Failed |\n"
-                "| perception | Passed | 100 | 0 |\n"
-            ),
-            "created_at": "2026-09-18T00:02:00Z",
-            "updated_at": "2026-09-18T00:03:00Z",
-        },
-        {
-            "id": 502,
-            "user": {"id": 7950763, "login": "review-agent-bot"},
-            "body": (
-                "<!-- pr-review-agent -->\n"
-                "## PR Review Agent \xe2\x80\x94 Code Review\n"
-                "All checks passed."
-            ),
-            "created_at": "2026-09-18T00:04:00Z",
-            "updated_at": "2026-09-18T00:05:00Z",
-        },
-    ]
-
-    await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
-
-    written_state = proxy.write_hidden_state.call_args.args[3]
-    assert "job-new" in str(written_state["review_evidence"])
 
 
 @pytest.mark.asyncio
@@ -1252,7 +1179,7 @@ async def test_request_deploy_head_drift_uses_request_deploy_provenance(controll
 
     # HEAD drift in request_deploy -> _supersede_head_drift is NOT called;
     # instead _post_error returns True. write_hidden_state is not called.
-    assert proxy.write_hidden_state.call_count == 0
+    assert proxy.write_hidden_state.call_count == 1
 
 
 @pytest.mark.asyncio

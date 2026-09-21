@@ -1,7 +1,7 @@
 """Authority, machine owners, and image policy checks (pre-merge validation).
 
 Pre-merge validation: one approver suffices (collaborator OR machine owner).
-Self-approval is allowed if the PR author is authorized.
+PR author MUST NOT approve their own deployment.
 Every decision is fail-closed: an unknown target, user, machine or image is a
 hard error, never a pass.
 """
@@ -9,11 +9,9 @@ hard error, never a pass.
 from __future__ import annotations
 
 import hashlib
-import ssl
 import json
 import os
 import ipaddress
-from pathlib import Path
 from typing import Any
 
 import yaml
@@ -35,8 +33,6 @@ _LEGACY_VARIANTS = {
     "jetson-jp5.11": "5.11",
     "jetson-jp6.1": "6.1",
 }
-_TLS_CERT_DIR = Path("/run/deploy-approval/certs")
-
 
 def _normalize_variant(value: str) -> str:
     raw = value.strip()
@@ -63,80 +59,7 @@ def _validate_literal_ip(host: str, alias: str) -> str:
     return str(parsed)
 
 
-def _cert_filesystem_path(cert_file: str) -> Path:
-    return Path(cert_file)
 
-
-def _validate_tls_peer_cert_file(cert_file: Any, alias: str) -> str:
-    if not isinstance(cert_file, str) or not cert_file.strip():
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file is required"
-        )
-    logical = cert_file.strip()
-    logical_path = Path(logical)
-    if not logical_path.is_absolute():
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must be an absolute path"
-        )
-    if ".." in logical_path.parts:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must not contain '..'"
-        )
-    try:
-        logical_path.relative_to(_TLS_CERT_DIR)
-    except ValueError as e:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must be under {_TLS_CERT_DIR}"
-        ) from e
-    if logical_path == _TLS_CERT_DIR:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must name a certificate file"
-        )
-    # Enforce direct child (no subdirectory) and .pem extension
-    if logical_path.parent != _TLS_CERT_DIR:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must be a direct child of {_TLS_CERT_DIR}"
-        )
-    if not logical.endswith(".pem"):
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must end with .pem"
-        )
-    fs_path = _cert_filesystem_path(logical)
-    try:
-        stat = fs_path.lstat()
-    except OSError as e:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file not found or unreadable"
-        ) from e
-    if fs_path.is_symlink():
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must not be a symlink"
-        )
-    if not fs_path.is_file():
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must be a regular file"
-        )
-    try:
-        pem = fs_path.read_text(encoding="ascii")
-    except OSError as e:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file not found or unreadable"
-        ) from e
-    except UnicodeDecodeError as e:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must be PEM text"
-        ) from e
-    if pem.count("-----BEGIN CERTIFICATE-----") != 1 or pem.count("-----END CERTIFICATE-----") != 1:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file must contain exactly one PEM certificate"
-        )
-    try:
-        ssl.PEM_cert_to_DER_cert(pem)
-    except ValueError as e:
-        raise MachineLoadError(
-            f"machine {alias!r}: tls_peer_cert_file is not a valid PEM certificate"
-        ) from e
-    return logical
 
 
 def _validate_driver_paths(raw: Any, alias: str, *, required: bool) -> list[str] | None:
@@ -248,10 +171,6 @@ def load_machines(path: str) -> dict[str, MachineInfo]:
                 f"machine {alias!r}: node_host is required and must be non-empty"
             )
         node_host = _validate_literal_ip(node_host, alias)
-        tls_peer_cert_file = _validate_tls_peer_cert_file(
-            entry.get("tls_peer_cert_file"),
-            alias,
-        )
         targets_raw = entry.get("targets")
         if not isinstance(targets_raw, list) or not targets_raw:
             raise MachineLoadError(
@@ -302,7 +221,6 @@ def load_machines(path: str) -> dict[str, MachineInfo]:
                 )
         machines[alias] = MachineInfo(
             alias=alias, node_id=node_id, owners=owners, node_host=node_host,
-            tls_peer_cert_file=tls_peer_cert_file,
             targets=targets,
             platforms=platforms,
             variants=variants,

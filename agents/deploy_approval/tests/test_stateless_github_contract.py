@@ -57,7 +57,7 @@ def policy(config):
             node_id="node-1",
             owners=["owner1"],
             node_host="127.0.0.1",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+
             targets=["perception"],
             platforms=["linux/arm64"],
             variants=["5.11"],
@@ -67,7 +67,7 @@ def policy(config):
             node_id="node-2",
             owners=["driver-owner"],
             node_host="127.0.0.2",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
+
             targets=["driver"],
             platforms=["linux/arm64"],
             variants=[""],
@@ -139,6 +139,10 @@ async def test_request_deploy_re_reads_command_identity_from_github(controller, 
 
 @pytest.mark.asyncio
 async def test_request_deploy_allows_current_pr_author_id(controller, proxy, mock_github):
+    """Narrow permission test: current PR author may execute /request_deploy when all gates valid."""
+    from unittest.mock import patch
+    from ..review_comment_parser import ReviewCommentEvidence, ReviewBuild
+
     mock_github.get_comment.return_value = {"id": 101, "user": {"id": 111, "login": "alice"}, "body": "/request_deploy"}
     mock_github.get_pr.return_value = {
         "state": "open",
@@ -147,9 +151,25 @@ async def test_request_deploy_allows_current_pr_author_id(controller, proxy, moc
         "user": {"id": 111, "login": "alice"},
     }
     proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"}, components=[]))
-    controller.registry.resolve.return_value = SimpleNamespace(image_ref="registry/repo@sha256:" + "b" * 64, platform="linux/arm64")
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
+    mock_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    # Patch narrow evidence boundary — do NOT test parser/registry/snapshot here
+    fake_evidence = ReviewCommentEvidence(
+        head_sha="a" * 40,
+        commit_prefix="abc1234",
+        build_comment_id=1001,
+        build_comment_updated_at="2026-09-18T00:01:00Z",
+        test_comment_id=1002,
+        test_comment_updated_at="2026-09-18T00:03:00Z",
+        code_review_comment_id=1003,
+        code_review_comment_updated_at="2026-09-18T00:05:00Z",
+        builds=[ReviewBuild(target="perception", driver_path="", variant="5.11", success=True, image_tag="registry/repo:v1", version="v1")],
+        review_author_id="7950763",
+    )
+    with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
+        controller._build_component_snapshot = AsyncMock(return_value=[_component()])
 
     result = await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
 

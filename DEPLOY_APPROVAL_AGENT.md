@@ -31,7 +31,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 
 **Removed states:** `waiting-approval`, `waiting-machine-clean`, `deploying`, `deploy-failed`, `test-failed`, `rejected`, `cancelled`, `expired`, `rolling_back`, `rolled_back`, `rollback_failed`, `waiting_cleanup`.
 
-**Removed partial deployment:** `/approve_deploy` requires the selected machine to cover ALL bound components. No partial machine-group deployment, no remaining components, no waiting for additional machine approvals. Selected machine must pass the full-coverage gate before the CLEAN gate.
+**Removed partial deployment:** `/approve_deploy` initially binds ALL deployable components, but operates on ALL REMAINING components only. A previously durably successful component for the exact same snapshot remains successful. Selected machine must cover ALL REMAINING components. No partial machine-group deployment, no waiting for additional machine approvals. Selected machine must pass the full-coverage gate before the CLEAN gate.
 
 ## Commands
 
@@ -58,14 +58,14 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **Top-level status labels:** only `review-required`, `reviewing`, `deploy-ready`, `deploy-requested`, `testing`, `succeeded`, `failed`.
 - **Status labels:** `status:*` labels are best-effort UI projection only. Label bootstrap/list/create failures are logged as warnings and never block startup or business operations. Label failure does not affect any gate or lifecycle transition.
 - **Review Agent authentication:** Review Agent uses a user-provided `GITHUB_TOKEN`, not the GitHub App. This is strictly separate from Deploy Approval's GitHub App credentials.
-- **Supported repos:** production capability supports main + driver; default/current rollout may configure main only; `GITHUB_REPOS` must be a non-empty duplicate-free subset of supported repos. Current installation may authorize only `main` initially. When driver is added to the same installation's selected repositories later, the same `GITHUB_INSTALLATION_ID` continues; only `GITHUB_REPOS` is extended. Deploy Approval source code does not change.
+- **Supported repos:** source capability supports main + driver. Current runtime `GITHUB_REPOS` must be exactly `4paradigm/phanthymotus`. `4paradigm/phanthymotus-driver` runtime authorization is DEFERRED and requires an explicit reviewed runtime-config contract change before enablement. Do not enable driver by changing only the environment variable. The same GitHub App installation may be reused later if that installation is explicitly authorized for driver.
 - **Evidence source:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation. Trusted Review Agent GitHub comments provide Build Result, Test Results, and Code Review. Build/Test commit short SHA resolves via GitHub to full SHA for exact equality with fresh PR HEAD. Image tag comes from the selected Build Result comment Images section (full mutable ref, not basename). Registry resolves to immutable digest. No Review Agent HTTP API.
-- **Full-coverage machine list:** `deploy_requested` lifecycle comment shows only machines that can cover ALL bound components. If no machine can cover all components, status stays deploy-requested and the operator must update machine policy.
+- **Full-coverage machine list:** `deploy_requested` lifecycle comment shows only machines that can cover ALL REMAINING components. If no machine can cover all remaining components, status stays deploy-requested and the operator must update machine policy.
 - **Source matrix:** GitHub PR comments are the source of Review Agent Build/Test/Code Review evidence and image:tag candidate facts; Registry only verifies/resolves that exact Review Agent image tag; Agent Core only supplies runtime identity, current `running_image`, and MCP evidence; GitHub persists the deployment snapshot.
 - **Deployability:** `phanthymotus` deploys `perception` and `actucore`, not `CORE`; `phanthymotus-driver` deploys exact driver paths.
 - **Variant contract:** perception variants are canonical `5.11` and `6.1`. Legacy `jetson-jp5.11` / `jetson-jp6.1` are normalized only at config load.
-- **Full-coverage gate:** `/approve_deploy` first checks that the selected machine covers ALL bound components. If coverage is partial, zero deploy POST is performed; the comment lists only full-coverage machines.
-- **CLEAN gate:** `/approve_deploy` reads `running_image` for all selected components before any deploy POST. If any `running_image` is non-empty, zero deployment is performed, cursor advances, and the owner must clear the occupied runtime image manually, then send a NEW `/approve_deploy`. Controller does not perform stop/remove/cleanup.
+- **Full-coverage gate:** `/approve_deploy` first checks that the selected machine covers ALL REMAINING components. If coverage is partial, zero deploy POST is performed; the comment lists only full-coverage machines.
+- **CLEAN gate:** `/approve_deploy` reads `running_image` for ALL REMAINING components before any deploy POST. If any `running_image` is non-empty, zero deployment is performed, cursor advances, and the owner must clear the occupied runtime image manually, then send a NEW `/approve_deploy`. Controller does not perform stop/remove/cleanup.
 - **Agent Core no-container response:** the current compatibility shape normalizes to `running_image=""` only when `running_image` and `error` are absent, `status` key exists, and `logs` is a string. The `status` VALUE has zero CLEAN/health/case business influence. Error or malformed shapes fail closed.
 - status VALUE has zero CLEAN/health/case business influence.
 - error/malformed shapes fail closed.
@@ -90,11 +90,16 @@ Minimum repository permissions:
   status-label operations.
 - **Metadata: read** — needed for collaborator permission lookup.
 
-Do **not** request Administration, Actions, or Contents permission
-solely because an unused helper exists.
+Do **not** request Administration or Actions permission.
 
-If a future production path begins reading repository contents through
-the Contents API, that must be reviewed as a separate permission change.
+**Contents: read** — The current target repository
+`4paradigm/phanthymotus` is PUBLIC, so `resolve_commit_sha()` (which calls
+`GET /repos/{repo}/commits/{ref}`) operates without granting Contents: read.
+The current minimum deployment permissions therefore do not need to be
+broadened solely for this public rollout. If a future authorized target
+repository is private, the commit endpoint requires GitHub App `Contents:
+read`; permissions must be explicitly reviewed before private-repo
+enablement.
 
 ## Review Agent Integration
 
@@ -164,7 +169,6 @@ machines:
   sh-g1-01:
     node_id: node-g1-01
     node_host: 192.0.2.101
-    tls_peer_cert_file: /run/deploy-approval/certs/sh-g1-01.pem
     owners:
       - alice
       - bob
@@ -179,7 +183,6 @@ machines:
   sh-go2:
     node_id: node-go2
     node_host: 192.0.2.102
-    tls_peer_cert_file: /run/deploy-approval/certs/sh-go2.pem
     owners:
       - bob
       - charlie
@@ -194,15 +197,14 @@ machines:
 - `alias`: top-level key under `machines`, used in `/approve_deploy machine=<alias>`
 - `node_id`: Deploy Approval machine-policy internal unique machine identifier
 - `node_host`: fake example literal IPv4; real values live only in the local gitignored `deploy/deploy-approval/machines.yaml`
-- `tls_peer_cert_file`: required absolute path under `/run/deploy-approval/certs/` for that machine's pinned Agent Core peer certificate
 - `owners`: GitHub login list (case-insensitive, deduplicated)
 - `targets`: explicit deployable targets for this machine
 - `platforms`: canonical platform allowlist
 - `variants`: canonical perception variants only (`5.11` / `6.1`)
 - `driver_paths`: required for driver targets
 - Missing/invalid file → startup fail closed
-- Agent Core is reached only at `https://<node_host>:15678` with redirects disabled. The peer certificate is an admin-provisioned, per-machine leaf certificate; Deploy Approval does not use TOFU, does not download certificates from robots, and must never use `verify=False`.
-- `deploy/deploy-approval/certs/` is local and gitignored. Do not place real machine IPs, passwords, tokens, or certificates in docs, examples, tests, or source code.
+- Agent Core uses HTTPS to exact literal IPv4:15678. TLS certificate identity verification is disabled by the selected no-PEM deployment contract. Access is restricted by exact configured literal IP, fixed port, HTTPS, and per-machine Bearer token.
+- Do not place real machine IPs, passwords, tokens, or certificates in docs, examples, tests, or source code.
 
 ## GitHub Installation Model
 
@@ -242,7 +244,6 @@ It reuses the upstream existing keys below and fixed read-only files:
 
 | `machines.yaml` | fixed read-only machine policy file |
 | `secrets.yaml` | fixed read-only COS secrets file |
-| `certs/` | fixed read-only local Agent Core peer certificate directory |
 
 ## Private Key Operational Contract
 

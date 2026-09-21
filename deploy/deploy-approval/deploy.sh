@@ -18,7 +18,6 @@ cd "$SCRIPT_DIR"
 COMPOSE="docker compose"
 MACHINES_FILE="./machines.yaml"
 SECRETS_FILE="./secrets.yaml"
-CERTS_DIR="./certs"
 TMP_ENV=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -132,16 +131,14 @@ PY
 
 
 require_private_local_inputs() {
-    python3 - "$MACHINES_FILE" "$SECRETS_FILE" "$CERTS_DIR" <<'PY'
+    python3 - "$MACHINES_FILE" "$SECRETS_FILE" <<'PY'
 import os
 import stat
-import ssl
 import sys
 from pathlib import Path
 
 machines_file = Path(sys.argv[1])
 secrets_file = Path(sys.argv[2])
-certs_dir = Path(sys.argv[3])
 expected_uid = os.getuid()
 
 
@@ -167,26 +164,6 @@ def _check_owned_private(path: Path, *, label: str, directory: bool) -> None:
 
 _check_owned_private(machines_file, label="machines.yaml", directory=False)
 _check_owned_private(secrets_file, label="secrets.yaml", directory=False)
-_check_owned_private(certs_dir, label="certs directory", directory=True)
-
-for cert in sorted(certs_dir.iterdir()):
-    if not cert.name.endswith(".pem"):
-        continue
-    if cert.parent != certs_dir:
-        raise SystemExit(f"TLS peer cert {cert.name} must be a direct child of certs directory")
-    _check_owned_private(cert, label=f"TLS peer cert {cert.name}", directory=False)
-    try:
-        pem = cert.read_text(encoding="ascii")
-    except OSError:
-        raise SystemExit(f"TLS peer cert {cert.name} is not readable")
-    except UnicodeDecodeError:
-        raise SystemExit(f"TLS peer cert {cert.name} must be PEM text")
-    if pem.count("-----BEGIN CERTIFICATE-----") != 1 or pem.count("-----END CERTIFICATE-----") != 1:
-        raise SystemExit(f"TLS peer cert {cert.name} must contain exactly one PEM certificate")
-    try:
-        ssl.PEM_cert_to_DER_cert(pem)
-    except ValueError:
-        raise SystemExit(f"TLS peer cert {cert.name} is not a valid PEM certificate")
 print("LOCAL_INPUT_PERMISSIONS_OK")
 PY
 }
@@ -223,63 +200,10 @@ for alias, machine in machines.items():
     for owner in owners:
         if not isinstance(owner, str) or not owner.strip():
             raise SystemExit(f"machine {alias!r} has an invalid owner entry")
-    cert_file = machine.get("tls_peer_cert_file")
-    if not isinstance(cert_file, str) or not cert_file.strip():
-        raise SystemExit(f"machine {alias!r} must define tls_peer_cert_file")
-    cert_val = cert_file.strip()
-    if not cert_val.endswith(".pem"):
-        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must end with .pem")
-    cert_path = Path(cert_val)
-    cert_root = Path("/run/deploy-approval/certs")
-    if not cert_path.is_absolute():
-        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must be absolute")
-    if ".." in cert_path.parts:
-        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must not contain '..'")
-    if cert_path.parent != cert_root:
-        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must be a direct child of {cert_root}")
+    node_host = machine.get("node_host")
+    if not isinstance(node_host, str) or not node_host.strip():
+        raise SystemExit(f"machine {alias!r} must define a non-empty node_host")
 print("MACHINE_POLICY_OK")
-PY
-    python3 - "$MACHINES_FILE" "$CERTS_DIR" <<'PY'
-import ssl
-import sys
-import yaml
-from pathlib import Path
-
-machines_file = Path(sys.argv[1])
-local_certs_dir = Path(sys.argv[2])
-with machines_file.open("r", encoding="utf-8") as fh:
-    data = yaml.safe_load(fh)
-machines = data.get("machines", {})
-cert_root = Path("/run/deploy-approval/certs")
-for alias, machine in machines.items():
-    cert_file_raw = str(machine.get("tls_peer_cert_file", "")).strip()
-    if not cert_file_raw.endswith(".pem"):
-        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must end with .pem")
-    logical = Path(cert_file_raw)
-    if logical.parent != cert_root:
-        raise SystemExit(f"machine {alias!r} tls_peer_cert_file must be a direct child of {cert_root}")
-    local = local_certs_dir / logical.name
-    try:
-        stat = local.lstat()
-    except OSError:
-        raise SystemExit(f"machine {alias!r} TLS peer cert is missing")
-    if local.is_symlink():
-        raise SystemExit(f"machine {alias!r} TLS peer cert must not be a symlink")
-    if not local.is_file():
-        raise SystemExit(f"machine {alias!r} TLS peer cert must be a regular file")
-    try:
-        pem = local.read_text(encoding="ascii")
-    except OSError:
-        raise SystemExit(f"machine {alias!r} TLS peer cert is not readable")
-    except UnicodeDecodeError:
-        raise SystemExit(f"machine {alias!r} TLS peer cert must be PEM text")
-    if pem.count("-----BEGIN CERTIFICATE-----") != 1 or pem.count("-----END CERTIFICATE-----") != 1:
-        raise SystemExit(f"machine {alias!r} TLS peer cert must contain exactly one PEM certificate")
-    try:
-        ssl.PEM_cert_to_DER_cert(pem)
-    except ValueError:
-        raise SystemExit(f"machine {alias!r} TLS peer cert is not a valid PEM certificate")
-print("MACHINE_TLS_CERTS_OK")
 PY
 }
 

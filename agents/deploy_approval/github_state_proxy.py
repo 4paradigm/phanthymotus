@@ -163,7 +163,6 @@ def _validate_hidden_state(data: dict) -> dict:
         "components", "deployments", "approve_attempts", "approve_attempts_total",
         "approve_attempts_truncated",
         "case_results", "test_result", "cos", "command", "last_processed_comment_id",
-        "approval_revoked",
     }
     extra_keys = set(data.keys()) - allowed_keys
     if extra_keys:
@@ -721,7 +720,7 @@ class GitHubStateProxy:
         Non-status labels (bug/documentation/enhancement, etc.) are never
         touched.
         """
-        desired_label = f"{STATUS_PREFIX}{hidden_status}"
+        desired_label = f"{STATUS_PREFIX} {hidden_status}"
         if desired_label not in _ALLOWED_STATUS_LABELS:
             logger.warning("unknown status label for %s: %s", hidden_status, desired_label)
             return

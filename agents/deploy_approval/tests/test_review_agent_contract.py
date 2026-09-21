@@ -75,7 +75,7 @@ def _make_comment(
     body: str,
     cid: int = 1001,
     created_at: str = "2026-09-18T03:55:00Z",
-    updated_at: str = "2026-09-18T03:55:30Z",
+    updated_at: str = "2026-09-18T03:56:00Z",
     author_id: str = TRUSTED_AUTHOR_ID,
     author_login: str = TRUSTED_AUTHOR_LOGIN,
     performed_via_github_app=None,
@@ -103,9 +103,9 @@ class TestTrustedPatAuthorCommentAccepted:
         )
 
         comments = [
-            _make_comment(_BUILD_COMMENT_BODY, cid=1001),
-            _make_comment(_TEST_COMMENT_BODY, cid=1002),
-            _make_comment(_CODE_REVIEW_BODY, cid=1003),
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:56:00Z"),
+            _make_comment(_TEST_COMMENT_BODY, cid=1002, created_at="2026-09-18T03:55:00Z"),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:55:30Z"),
         ]
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN
@@ -142,8 +142,8 @@ class TestTrustedPatAuthorCommentAccepted:
         )
 
         comments = [
-            _make_comment(_BUILD_COMMENT_BODY, cid=1001),
-            _make_comment(_CODE_REVIEW_BODY, cid=1003),
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:55:00Z"),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z"),
         ]
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, "wrong-login"
@@ -189,10 +189,11 @@ Commit: `abcdef1`
 
 All builds succeeded.
 
-| Target             | Status                     | Version                         | Took |
-| ------------------ | -------------------------- | ------------------------------- | ---- |
-| core               | :white_check_mark: Success | `release.260918.abcdef1`        | 45s  |
-| actucore           | :white_check_mark: Success | `release.260918.abcdef1`        | 7s   |
+| Target                   | Status                     | Version                         | Took |
+| ------------------------ | -------------------------- | ------------------------------- | ---- |
+| core                     | :white_check_mark: Success | `release.260918.abcdef1`        | 45s  |
+| actucore (jetson-jp5.11) | :white_check_mark: Success | `release.260918.abcdef1`        | 7s   |
+| perception (jetson-jp6.1)| :white_check_mark: Success | `release.260918.abcdef1`        | 10s  |
 
 ### Images
 
@@ -202,17 +203,35 @@ All builds succeeded.
 ccr.ccs.tencentyun.com/phanthy-motus/core:release.260918.abcdef1
 ```
 
-**actucore**
+**actucore (jetson-jp5.11)**
 
 ```
 ccr.ccs.tencentyun.com/phanthy-motus/actucore:release.260918.abcdef1
 ```
+
+**perception (jetson-jp6.1)**
+
+```
+ccr.ccs.tencentyun.com/phanthy-motus/perception:release.260918.abcdef1
+```
 """)
         builds = parse_all_build_results(body)
-        assert len(builds) == 2
-        targets = {b.target for b in builds}
-        assert "core" in targets
-        assert "actucore" in targets
+        assert len(builds) == 3
+        by_target = {b.target: b for b in builds}
+        # core
+        assert by_target["core"].target == "core"
+        assert by_target["core"].driver_path == ""
+        assert by_target["core"].variant == ""
+        # actucore
+        assert by_target["actucore"].target == "actucore"
+        assert by_target["actucore"].driver_path == ""
+        assert by_target["actucore"].variant == "5.11"
+        # perception
+        assert by_target["perception"].target == "perception"
+        assert by_target["perception"].driver_path == ""
+        assert by_target["perception"].variant == "6.1"
+        # Version stays as the literal version, NOT copied to variant
+        assert by_target["core"].version == "release.260918.abcdef1"
 
     def test_parse_official_driver_build_result(self):
         """Official driver-style build result."""
@@ -243,10 +262,52 @@ ccr.ccs.tencentyun.com/phanthy-motus/drivers/unitree/g1:release.260826.16430e7
 """)
         builds = parse_all_build_results(body)
         assert len(builds) == 1
-        assert builds[0].target == "unitree/g1"
+        assert builds[0].target == "driver"
+        assert builds[0].driver_path == "unitree/g1"
+        assert builds[0].variant == ""
         assert builds[0].success is True
 
-    def test_success_build_requires_image(self):
+    def test_multi_variant_phanthymotus_build_result(self):
+        """Two perception variants must produce TWO distinct ReviewBuild objects."""
+        from agents.deploy_approval.review_comment_parser import (
+            parse_all_build_results,
+        )
+
+        body = textwrap.dedent("""\
+<!-- pr-review-agent -->
+
+## PR Review Agent — Build Result
+
+Commit: `abcdef1`
+
+All builds succeeded.
+
+| Target                   | Status                     | Version                         | Took |
+| ------------------------ | -------------------------- | ------------------------------- | ---- |
+| perception (jetson-jp5.11) | :white_check_mark: Success | `release.260918.abcdef1`      | 10s  |
+| perception (jetson-jp6.1)  | :white_check_mark: Success | `release.260918.abcdef1`      | 12s  |
+
+### Images
+
+**perception (jetson-jp5.11)**
+
+```
+ccr.ccs.tencentyun.com/phanthy-motus/perception:release.260918.abcdef1
+```
+
+**perception (jetson-jp6.1)**
+
+```
+ccr.ccs.tencentyun.com/phanthy-motus/perception:release.260918.abcdef1
+```
+""")
+        builds = parse_all_build_results(body)
+        assert len(builds) == 2
+        by_key = {(b.target, b.variant): b for b in builds}
+        assert ("perception", "5.11") in by_key
+        assert ("perception", "6.1") in by_key
+        assert by_key[("perception", "5.11")].driver_path == ""
+        assert by_key[("perception", "6.1")].driver_path == ""
         """Success build row without image => fail closed."""
         from agents.deploy_approval.review_comment_parser import (
             parse_all_build_results,
@@ -438,7 +499,13 @@ class TestTestResults:
     """Test 7.4: Test Results"""
 
     def test_matching_head_test_result_accepted(self):
-        """Test Results comment after build with matching head is accepted."""
+        """Test Results comment after build with matching head is accepted.
+
+        Actual chronological order:
+          Build Result   03:55
+          Test Results   03:56
+          Code Review    03:57
+        """
         from agents.deploy_approval.review_comment_parser import (
             extract_review_evidence,
         )
@@ -452,7 +519,9 @@ class TestTestResults:
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN
         )
         assert evidence is not None
+        assert evidence.build_comment_id == 1001
         assert evidence.test_comment_id == 1002
+        assert evidence.code_review_comment_id == 1003
         assert evidence.test_passed == 402
 
     def test_old_head_test_result_rejected(self):
@@ -480,9 +549,8 @@ Commit: `1111111`
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN
         )
-        assert evidence is not None
-        # Test comment still parsed but for different commit prefix
-        assert evidence.test_comment_id == 0
+        # Old-head test result rejected: different commit => fail closed
+        assert evidence is None
 
     def test_skip_tests_can_have_no_test_comment(self):
         """If build succeeds and code review exists but no test comment, still valid."""
@@ -491,8 +559,8 @@ Commit: `1111111`
         )
 
         comments = [
-            _make_comment(_BUILD_COMMENT_BODY, cid=1001),
-            _make_comment(_CODE_REVIEW_BODY, cid=1003),
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:55:00Z"),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z"),
         ]
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN
@@ -510,8 +578,8 @@ class TestCodeReview:
         )
 
         comments = [
-            _make_comment(_BUILD_COMMENT_BODY, cid=1001),
-            _make_comment(_CODE_REVIEW_BODY, cid=1003),
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:55:00Z"),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z"),
         ]
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN
@@ -536,7 +604,7 @@ class TestCodeReview:
 <sub>Generated automatically by PR Review Agent.</sub>
 """)
         comments = [
-            _make_comment(_BUILD_COMMENT_BODY, cid=1001),
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:56:00Z"),
             _make_comment(empty_cr, cid=1003),
         ]
         evidence = extract_review_evidence(
@@ -583,13 +651,6 @@ All builds succeeded.
 | ------ | -------------------------- | ----------------------- | ---- |
 | core   | :white_check_mark: Success | `release.260918.def`    | 10s  |
 
-### Images
-
-**core**
-
-```
-ccr.ccs.tencentyun.com/phanthy-motus/core:release.260918.def
-```
 """)
         comments = [
             _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:55:00Z"),
@@ -792,8 +853,8 @@ class TestShortSHAResolution:
         # The parser extracts commit_prefix; the service layer resolves it.
         # This test confirms the evidence carries the prefix for resolution.
         comments = [
-            _make_comment(_BUILD_COMMENT_BODY, cid=1001),
-            _make_comment(_CODE_REVIEW_BODY, cid=1003),
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:55:00Z"),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z"),
         ]
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN
@@ -879,8 +940,8 @@ Old review.
 <sub>Generated automatically by PR Review Agent.</sub>
 """)
         comments = [
-            _make_comment(old_build, cid=1001),
-            _make_comment(old_cr, cid=1002),
+            _make_comment(old_build, cid=1001, created_at="2026-09-18T03:55:00Z"),
+            _make_comment(old_cr, cid=1002, created_at="2026-09-18T03:57:00Z"),
         ]
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN
@@ -899,9 +960,9 @@ class TestReviewEvidenceState:
         )
 
         comments = [
-            _make_comment(_BUILD_COMMENT_BODY, cid=1001),
-            _make_comment(_TEST_COMMENT_BODY, cid=1002),
-            _make_comment(_CODE_REVIEW_BODY, cid=1003),
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:55:00Z"),
+            _make_comment(_TEST_COMMENT_BODY, cid=1002, created_at="2026-09-18T03:56:00Z"),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z"),
         ]
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN

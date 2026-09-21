@@ -89,6 +89,7 @@ def extract_latest_review_job_anchor(
 
     # Build anchors from ALL trusted comments that have a marker and commit prefix.
     # Progress comments (Queued/Building) that lack a Build Result table still form anchors.
+    # Test Results and Code Review are FOLLOW-UP evidence, NOT run anchors.
     anchors: list[ReviewJobAnchor] = []
     for c in trusted:
         body = str(c.get("body", "") or "")
@@ -96,6 +97,9 @@ def extract_latest_review_job_anchor(
             continue
         commit_prefix = _extract_review_job_commit_prefix(body)
         if not commit_prefix:
+            continue
+        # Exclude follow-up evidence comments from anchor candidates
+        if TEST_HEADING in body or CODE_REVIEW_HEADING in body:
             continue
         # Determine anchor state based on comment content
         anchor_state = "reviewing"
@@ -225,6 +229,48 @@ def _normalize_variant(variant: str) -> str:
     return variant.strip()
 
 
+def _normalize_build_label(raw_label: str) -> dict | None:
+    """Normalize a raw Review Agent build display label into canonical fields.
+
+    Raw display labels and their canonical fields:
+        core                          -> target="core",          driver_path="",  variant=""
+        perception (jetson-jp5.11)   -> target="perception",    driver_path="",  variant="5.11"
+        perception (jetson-jp6.1)    -> target="perception",    driver_path="",  variant="6.1"
+        actucore (jetson-jp5.11)     -> target="actucore",      driver_path="",  variant="5.11"
+        actucore (jetson-jp6.1)      -> target="actucore",      driver_path="",  variant="6.1"
+        unitree/g1                   -> target="driver",         driver_path="unitree/g1", variant=""
+
+    Returns None for unknown or malformed labels (fail closed).
+    """
+    raw = raw_label.strip()
+    if not raw:
+        return None
+
+    # Driver: path-shaped label (contains '/')
+    if "/" in raw:
+        return {"target": "driver", "driver_path": raw, "variant": ""}
+
+    # Known targets with optional variant parenthesised suffix
+    known_targets = ("core", "perception", "actucore")
+    for target in known_targets:
+        prefix = target + " ("
+        if raw.startswith(prefix):
+            suffix = raw[len(prefix):]
+            if suffix.endswith(")"):
+                version_in_parens = suffix[:-1]
+                variant = _normalize_variant(version_in_parens)
+                if not variant:
+                    return None
+                return {"target": target, "driver_path": "", "variant": variant}
+
+    # Plain known target without variant suffix
+    if raw in known_targets:
+        return {"target": raw, "driver_path": "", "variant": ""}
+
+    # Unknown label => fail closed
+    return None
+
+
 # ------------------------------------------------------------------
 # Comment identification
 # ------------------------------------------------------------------
@@ -348,16 +394,22 @@ def parse_build_result(
     # Merge all rows into a single ReviewBuild per target
     # We collect per-target info and return list of ReviewBuild
     builds: list[ReviewBuild] = []
-    seen_targets: set[str] = set()
+    seen_keys: set[tuple[str, str, str]] = set()
 
     for row in table_rows:
-        target = row["target"]
-        if not target:
-            continue
-        # Skip duplicate targets
-        if target in seen_targets:
+        raw_label = row["target"]
+        normalized = _normalize_build_label(raw_label)
+        if normalized is None:
+            return None  # unknown/malformed => fail closed
+
+        target = normalized["target"]
+        driver_path = normalized["driver_path"]
+        variant = normalized["variant"]
+
+        dup_key = (target, driver_path, variant)
+        if dup_key in seen_keys:
             return None  # duplicate => fail
-        seen_targets.add(target)
+        seen_keys.add(dup_key)
 
         status_raw = row["status"]
         # Success indicators
@@ -376,8 +428,8 @@ def parse_build_result(
         version_raw = row["version"].strip("`")
         version = row["version"]
 
-        # Get image ref from Images section
-        image_ref = images.get(target, "")
+        # Use raw display label for image section lookup
+        image_ref = images.get(raw_label, "")
         if not image_ref and is_success:
             return None  # success without image => fail
 
@@ -385,13 +437,8 @@ def parse_build_result(
 
         build = ReviewBuild(
             target=target,
-            driver_path=target if "/" in target else "",
-            variant=_normalize_variant(
-                next(
-                    (r["version"] for r in table_rows if r["target"] == target),
-                    "",
-                )
-            ),
+            driver_path=driver_path,
+            variant=variant,
             success=is_success and not is_failed and not is_killed,
             version=version,
             image_tag=image_tag,
@@ -429,15 +476,22 @@ def parse_all_build_results(
     images = _parse_build_images(section)
 
     builds: list[ReviewBuild] = []
-    seen_targets: set[str] = set()
+    seen_keys: set[tuple[str, str, str]] = set()
 
     for row in table_rows:
-        target = row["target"]
-        if not target:
-            continue
-        if target in seen_targets:
+        raw_label = row["target"]
+        normalized = _normalize_build_label(raw_label)
+        if normalized is None:
+            return []  # unknown/malformed => fail closed
+
+        target = normalized["target"]
+        driver_path = normalized["driver_path"]
+        variant = normalized["variant"]
+
+        dup_key = (target, driver_path, variant)
+        if dup_key in seen_keys:
             return []  # duplicate => fail closed
-        seen_targets.add(target)
+        seen_keys.add(dup_key)
 
         status_raw = row["status"]
         is_success = (
@@ -451,22 +505,24 @@ def parse_all_build_results(
         is_killed = status_raw.lower() in ("killed",)
 
         version = row["version"]
-        image_ref = images.get(target, "")
+
+        # Use raw display label for image section lookup (labels must match exactly)
+        image_ref = images.get(raw_label, "")
 
         # Success build without an image reference => fail closed
         if is_success and not is_failed and not is_killed and not image_ref:
             return []
 
         # Duplicate target in images section => fail closed
-        if is_success and image_ref and images.get(target, "") and images.get(target, "") != image_ref:
+        if is_success and image_ref and images.get(raw_label, "") and images.get(raw_label, "") != image_ref:
             return []
 
         image_tag = image_ref  # full mutable ref: registry.example/path/image:tag
 
         build = ReviewBuild(
             target=target,
-            driver_path=target if "/" in target else "",
-            variant=_normalize_variant(version.strip("`")),
+            driver_path=driver_path,
+            variant=variant,
             success=is_success and not is_failed and not is_killed,
             version=version.strip("`"),
             image_tag=image_tag,

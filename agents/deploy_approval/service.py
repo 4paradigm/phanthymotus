@@ -112,7 +112,7 @@ def _normalize_variant(value: str) -> str:
     raise DeployControllerError(f"unsupported variant: {raw!r}")
 
 
-def _is_deployable_build(build) -> bool:
+def _is_deployable_build(repo: str, build) -> bool:
     target = str(build.target or "").strip()
     if not _is_supported_target(target):
         return False
@@ -120,8 +120,23 @@ def _is_deployable_build(build) -> bool:
         return False
     if not build.image_tag:
         return False
-    return True
-
+    # Repo-aware deployability matrix — exact known identities only
+    repo_lower = (repo or "").lower()
+    if repo_lower in ("4paradigm/phanthymotus-driver", "haohao-end/phanthymotus-driver"):
+        # Driver family: only driver with non-empty driver_path is deployable
+        if target != "driver":
+            return False
+        driver_path = getattr(build, "driver_path", "") or ""
+        if not driver_path.strip():
+            return False
+        return True
+    if repo_lower in ("4paradigm/phanthymotus", "haohao-end/phanthymotus"):
+        # Core family: perception and actucore are deployable; driver is NOT
+        if target != "driver":
+            return True
+        return False
+    # Unknown repository: nothing is deployable
+    return False
 
 def _trim_approve_attempts(
     state: dict,
@@ -229,7 +244,6 @@ class DeployController:
             self.config,
             base_url,
             node_host=machine.node_host,
-            tls_peer_cert_file=machine.tls_peer_cert_file,
             access_token=token,
         )
         try:
@@ -717,10 +731,12 @@ class DeployController:
                     success=eb.success,
                     image_tag=eb.image_tag,
                     deployable=_is_deployable_build(
+                        repo,
                         type("_build", (), {
                             "target": eb.target,
                             "success": eb.success,
                             "image_tag": eb.image_tag,
+                            "driver_path": eb.driver_path,
                         })()
                     ),
                 )
@@ -925,8 +941,8 @@ class DeployController:
                 state["last_processed_comment_id"] = comment_id
                 markdown = comments_mod.deploy_requested(
                     repo, pr_number, pr_head,
-                    state.get("components", []),
-                    self._get_machine_groups_for_components(state.get("components", [])),
+                    undeployed_components,
+                    self._get_machine_groups_for_components(undeployed_components),
                     gate_note=[
                         "Selected machine does not cover all remaining components.",
                         "ZERO deploy POST.",
@@ -1221,16 +1237,18 @@ class DeployController:
                 )
                 await self.proxy.project_status_label(repo, pr_number, "failed")
 
+                # One-shot runtime log snapshot for failed path
+                runtime_logs = await self._snapshot_terminal_runtime_logs(
+                    state.get("components", []),
+                    state.get("deployments", []),
+                )
+
                 # Best-effort evidence upload after failed
                 try:
                     cos_metadata = await self._upload_evidence(
                         repo, pr_number, pr_head, state, "fail",
-                        context={
-                            "approve_attempts": state.get("approve_attempts", []),
-                            "approve_attempts_total": state.get("approve_attempts_total", 0),
-                            "actor": actor,
-                            "comment_id": comment_id,
-                        },
+                        deploy_error=deploy_error,
+                        runtime_logs=runtime_logs,
                     )
                 except Exception as e:
                     logger.warning(
@@ -1301,25 +1319,63 @@ class DeployController:
             approve_attempt["outcome"] = "deployed"
             self._record_approve_attempt(state, approve_attempt)
 
-            # Full coverage required: successful completion means all deployed
+            # Full coverage required: durable testing state FIRST
             state["status"] = "testing"
 
-            # Run automated case after ALL components deployed
+            # Build testing markdown WITHOUT advisory case result
+            testing_markdown = comments_mod.testing(
+                repo, pr_number, pr_head, case_result="",
+            )
+            # Persist testing lifecycle state FIRST
+            await self.proxy.write_hidden_state(repo, pr_number, testing_markdown, state)
+            # Project status label "testing" SECOND
+            await self.proxy.project_status_label(repo, pr_number, "testing")
+
+            # NOW run advisory Case only after durable testing state exists
             case_results = await self._run_automated_case(
                 repo, pr_number, pr_head, components,
                 state.get("deployments", []),
             )
-            if case_results:
-                state["case_results"].update(case_results)
 
-            case_result_str = ", ".join(
-                f"{k}={v}" for k, v in (case_results or {}).items()
+            # Case is advisory only; always re-read fresh state before merging
+            fresh = await self.proxy.read_hidden_state(repo, pr_number)
+            fresh_command = (
+                fresh.get("command", {})
+                if isinstance(fresh, dict)
+                else {}
             )
-            markdown = comments_mod.testing(
-                repo, pr_number, pr_head, case_result=case_result_str or "",
+            if not isinstance(fresh_command, dict):
+                fresh_command = {}
+            fresh_args = fresh_command.get("args", {})
+            if not isinstance(fresh_args, dict):
+                fresh_args = {}
+            fresh_ok = (
+                isinstance(fresh, dict)
+                and fresh.get("head_sha") == pr_head
+                and fresh.get("status") == "testing"
+                and fresh_command.get("comment_id") == comment_id
+                and fresh_command.get("kind") == "approve_deploy"
+                and fresh_command.get("phase") == "completed"
+                and fresh_args.get("machine") == machine_alias
+                and fresh_args.get("actor") == actor
             )
-            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-            await self.proxy.project_status_label(repo, pr_number, "testing")
+            if case_results and fresh_ok:
+                fresh["case_results"] = fresh.get("case_results", {})
+                fresh["case_results"].update(case_results)
+                case_result_str = ", ".join(
+                    f"{k}={v}" for k, v in case_results.items()
+                )
+                case_markdown = comments_mod.testing(
+                    repo, pr_number, pr_head, case_result=case_result_str,
+                )
+                await self.proxy.write_hidden_state(repo, pr_number, case_markdown, fresh)
+            elif case_results:
+                logger.warning(
+                    "CASE_RESULT_DROPPED repo=%s pr=%s: fresh state mismatch, "
+                    "not overwriting newer GitHub state",
+                    repo, pr_number,
+                )
+
             return True
 
         except PolicyError as e:
@@ -1423,28 +1479,19 @@ class DeployController:
             )
             await self.proxy.project_status_label(repo, pr_number, state["status"])
 
+            # One-shot runtime log snapshot for record_test terminal evidence
+            runtime_logs = await self._snapshot_terminal_runtime_logs(
+                state.get("components", []),
+                state.get("deployments", []),
+            )
+
             # Upload COS evidence (failure does not roll back terminal state)
             state["cos"] = self._empty_cos()
             try:
                 cos_metadata = await self._upload_evidence(
                     repo, pr_number, pr_head, state, result, summary,
-                    context={
-                        "approve_attempts": state.get("approve_attempts", []),
-                        "approve_attempts_total": state.get("approve_attempts_total", 0),
-                        "actor": actor,
-                        "comment_id": comment_id,
-                        "case": [
-                            {
-                                "component_id": cid,
-                                "case_id": _case_id_for_target(
-                                    next((c.get("target", "") for c in components if c.get("component_id", "") == cid), "")
-                                ),
-                                "result": res,
-                                "advisory": True,
-                            }
-                            for cid, res in (state.get("case_results", {}) or {}).items()
-                        ],
-                    },
+                    deploy_error="",
+                    runtime_logs=runtime_logs,
                 )
             except Exception as e:
                 logger.warning(
@@ -1780,6 +1827,53 @@ class DeployController:
         ]
         return lines
 
+    async def _snapshot_terminal_runtime_logs(
+        self, components: list[dict], deployments: list[dict],
+    ) -> dict[str, str]:
+        """Snapshot terminal runtime logs for deployed components.
+
+        Executed AFTER durable terminal lifecycle state has been written.
+        Never used as a health gate; never changes lifecycle status.
+        Returns dict[source_key: log_text] where source_key is
+        "machine_alias/runtime_id" for each distinct deployed runtime.
+        """
+        result: dict[str, str] = {}
+        seen: set[tuple[str, str]] = set()
+        for dep in deployments:
+            if dep.get("phase") != "deployed":
+                continue
+            machine_alias = dep.get("machine", "")
+            for cid in dep.get("component_ids", []):
+                comp = next(
+                    (c for c in components if c.get("component_id", "") == cid),
+                    None,
+                )
+                if comp is None:
+                    continue
+                runtime_id = str(comp.get("runtime_id") or "")
+                if not runtime_id:
+                    continue
+                seen_key = (machine_alias, runtime_id)
+                if seen_key in seen:
+                    continue
+                seen.add(seen_key)
+                source_key = f"{machine_alias}/{runtime_id}"
+                machine = self.policy.get_machine(machine_alias)
+                if machine is None:
+                    result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
+                    continue
+                try:
+                    core = await self._core_for_node(machine.node_id)
+                    status = await core.driver_status(runtime_id)
+                    logs = status.get("logs", "") if isinstance(status, dict) else ""
+                    if isinstance(logs, str) and logs:
+                        result[source_key] = logs
+                    else:
+                        result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
+                except Exception:
+                    result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
+        return result
+
     async def _check_approval_permissions(
         self, machine, actor: str, repo: str,
     ) -> None:
@@ -1973,7 +2067,8 @@ class DeployController:
     async def _upload_evidence(
         self, repo: str, pr_number: int, head_sha: str,
         state: dict, result: str, summary: str = "",
-        context: dict | None = None,
+        deploy_error: str = "",
+        runtime_logs: dict | None = None,
     ) -> dict:
         """Upload COS evidence bundle. Returns metadata dict.
 
@@ -1983,7 +2078,6 @@ class DeployController:
         try:
             object_key = self.cos.build_object_key(
                 repo, pr_number, head_sha,
-                deployment_id=state.get("head_sha", ""),
             )
             archive_bytes = b""
             sha256 = ""
@@ -1999,7 +2093,8 @@ class DeployController:
                     state=state,
                     result=result,
                     summary=summary,
-                    context=context,
+                    deploy_error=deploy_error,
+                    runtime_logs=runtime_logs,
                 )
             except Exception as e:
                 logger.warning(
@@ -2251,10 +2346,12 @@ class DeployController:
                                     success=eb.success,
                                     image_tag=eb.image_tag,
                                     deployable=_is_deployable_build(
+                                        repo,
                                         type("_build", (), {
                                             "target": eb.target,
                                             "success": eb.success,
                                             "image_tag": eb.image_tag,
+                                            "driver_path": eb.driver_path,
                                         })()
                                     ),
                                 )
@@ -2478,10 +2575,12 @@ class DeployController:
                 success=eb.success,
                 image_tag=eb.image_tag,
                 deployable=_is_deployable_build(
+                    repo,
                     type("_build", (), {
                         "target": eb.target,
                         "success": eb.success,
                         "image_tag": eb.image_tag,
+                        "driver_path": eb.driver_path,
                     })()
                 ),
             )

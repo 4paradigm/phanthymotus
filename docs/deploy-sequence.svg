@@ -52,7 +52,7 @@
     <text x="505" y="122" text-anchor="middle" class="title" fill="#4F5C6B">Review Agent</text>
 
     <rect x="620" y="92" width="185" height="48" class="actor" fill="#FBF1EC" stroke="#C4673A"/>
-    <text x="712" y="122" text-anchor="middle" class="title" fill="#9A4F2F">Deploy Controller</text>
+    <text x="712" y="122" text-anchor="middle" class="title" fill="#9A4F2F">Deploy Approval</text>
 
     <rect x="840" y="92" width="160" height="48" class="actor" fill="#EEF4F1" stroke="#5C7A6A"/>
     <text x="920" y="122" text-anchor="middle" class="title" fill="#425A4B">Machine Owner</text>
@@ -119,6 +119,13 @@
     <rect x="228" y="722" width="158" height="24" class="statusWait"/>
     <text x="307" y="738" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
 
+    <!-- Registry resolution internal callout -->
+    <rect x="532" y="704" width="560" height="78" class="callout"/>
+    <text x="812" y="722" text-anchor="middle" class="mono msgStrong">Registry resolution (internal implementation detail)</text>
+    <text x="812" y="740" text-anchor="middle" class="mono small">GitHub PR Conversation · Review Agent Build Result</text>
+    <text x="812" y="756" text-anchor="middle" class="mono small">Commit + Target + full image:tag</text>
+    <text x="812" y="772" text-anchor="middle" class="mono small">image:tag → repo@sha256:digest</text>
+
     <line x1="40" y1="790" x2="1360" y2="790" stroke="#E7E5E4"/>
   </g>
 
@@ -137,7 +144,7 @@
     <!-- Decision box is visually isolated: branch arrows start below it. -->
     <rect x="557" y="936" width="310" height="58" class="gate"/>
     <text x="712" y="958" text-anchor="middle" class="mono statusText" fill="#9A6A32">MACHINE SUPPORT CHECK</text>
-    <text x="712" y="979" text-anchor="middle" class="mono small">selected machine supports every deploy target</text>
+    <text x="712" y="979" text-anchor="middle" class="mono small">selected machine supports every REMAINING deploy target</text>
 
     <path d="M712 1018 L307 1018" class="red"/>
     <text x="510" y="1009" text-anchor="middle" class="mono small">NOT SUPPORTED</text>
@@ -148,11 +155,11 @@
     <text x="728" y="1098" class="mono msgStrong">SUPPORTED ↓</text>
 
     <path d="M712 1124 L1115 1124" class="blue"/>
-    <text x="914" y="1107" text-anchor="middle" class="mono msg">check every deploy target on the selected machine</text>
+    <text x="914" y="1107" text-anchor="middle" class="mono msg">check every REMAINING deploy target on the selected machine</text>
     <text x="914" y="1120" text-anchor="middle" class="mono msg">+ read its current running image</text>
 
     <path d="M1115 1170 L712 1170" class="green"/>
-    <text x="914" y="1161" text-anchor="middle" class="mono msg">current running images for all deploy targets</text>
+    <text x="914" y="1161" text-anchor="middle" class="mono msg">current running images for all REMAINING deploy targets</text>
 
     <rect x="582" y="1202" width="260" height="60" class="gate"/>
     <text x="712" y="1224" text-anchor="middle" class="mono statusText" fill="#9A6A32">EMPTY-RUNTIME CHECK</text>
@@ -266,7 +273,7 @@
 
     <path d="M712 2722 L307 2722" class="green"/>
     <text x="510" y="2713" text-anchor="middle" class="mono msgStrong">Download COS evidence -> 120-second HTTPS presigned GET URL -> private COS object</text>
-    <text x="510" y="2740" text-anchor="middle" class="mono small">Temporary bearer access; URL not persisted; bucket remains private</text>
+    <text x="510" y="2740" text-anchor="middle" class="mono small">Temporary bearer access; URL not persisted in hidden state; bucket remains private</text>
   </g>
 
   <line x1="40" y1="2780" x2="1360" y2="2780" stroke="#E7E5E4"/>

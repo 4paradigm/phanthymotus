@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import ssl
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,7 +15,7 @@ from ..config import Config, DEFAULT_GITHUB_REPOS, validate_config
 from ..models import MachineInfo
 from ..policy import Policy
 from ..service import DeployController, DeployControllerError
-from .conftest import TEST_CERT_PEM, make_config
+from .conftest import make_config
 
 
 class _Transport(httpx.AsyncBaseTransport):
@@ -66,7 +65,6 @@ def _agent_core_client(
         _client(),
         base_url=base_url,
         node_host=node_host,
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
         http=httpx.AsyncClient(transport=transport),
     )
 
@@ -81,22 +79,23 @@ def _open_pr(number: int, updated_at: str, *, marker: str = "") -> dict:
 @pytest.mark.parametrize(
     "github_repos, should_pass, expected_error",
     [
-        ([], False, "GITHUB_REPOS is required"),
+        ([], False, "GITHUB_REPOS must contain exactly"),
         (["4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must not contain duplicates"),
         (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
         (["4paradigm/phanthymotus", "some/other-repo"], False, "GITHUB_REPOS must contain exactly"),
         (["example/unsupported-repo"], False, "GITHUB_REPOS must contain exactly"),
         (["4paradigm/phanthymotus"], True, ""),
     ],
 )
-def test_validate_config_requires_exact_supported_repo_set(github_repos, should_pass, expected_error):
+def test_validate_config_requires_exact_runtime_repo_set(github_repos, should_pass, expected_error):
     cfg = Config(
         github_repos=github_repos,
         poll_enabled=True,
         github_webhook_secret="secret",
         registry="ccr.ccs.tencentyun.com",
         review_comment_author_id="7950763",
+        agent_core_tokens={"test-machine": "test-token"},
     )
     if should_pass:
         validate_config(cfg)
@@ -107,12 +106,10 @@ def test_validate_config_requires_exact_supported_repo_set(github_repos, should_
 
 def test_agent_core_endpoint_policy_requires_https_exact_ipv4():
     cfg = _client()
-    cert = "/run/deploy-approval/certs/test-agent-core.pem"
     ok = AgentCoreClient(
         cfg,
         base_url="https://10.0.0.1:15678",
         node_host="10.0.0.1",
-        tls_peer_cert_file=cert,
         http=httpx.AsyncClient(transport=_Transport({"valid": True, "auth_required": True})),
     )
     assert ok.base_url == "https://10.0.0.1:15678"
@@ -134,7 +131,6 @@ def test_agent_core_endpoint_policy_requires_https_exact_ipv4():
                 cfg,
                 base_url=base_url,
                 node_host=node_host,
-                tls_peer_cert_file=cert,
                 http=httpx.AsyncClient(transport=_Transport({"valid": True, "auth_required": True})),
             )
 
@@ -145,7 +141,6 @@ def test_agent_core_constructor_requires_node_host():
         AgentCoreClient(
             cfg,
             base_url="https://192.0.2.1:15678",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             http=httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}})),
         )
     with pytest.raises(AgentCoreError, match="node_host is required"):
@@ -153,7 +148,6 @@ def test_agent_core_constructor_requires_node_host():
             cfg,
             base_url="https://192.0.2.1:15678",
             node_host="",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             http=httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}})),
         )
 
@@ -161,27 +155,6 @@ def test_agent_core_constructor_requires_node_host():
 def test_agent_core_constructor_has_no_ca_file_parameter():
     sig = inspect.signature(AgentCoreClient.__init__)
     assert "ca_file" not in sig.parameters
-    with pytest.raises(TypeError):
-        AgentCoreClient(
-            _client(),
-            base_url="https://192.0.2.1:15678",
-            node_host="192.0.2.1",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
-            ca_file="/run/deploy-approval/certs/test-agent-core.pem",
-            http=httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}})),
-        )
-
-
-def test_agent_core_pinned_certificate_context_constructed():
-    client = AgentCoreClient(
-        _client(),
-        base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
-    )
-    assert client.http._transport._pool._ssl_context.verify_mode == ssl.CERT_REQUIRED
-    assert client.http._transport._pool._ssl_context.check_hostname is False
-    assert client.http._transport._pool._ssl_context.minimum_version >= ssl.TLSVersion.TLSv1_2
 
 
 def test_agent_core_self_created_client_disables_proxy_env(monkeypatch):
@@ -190,30 +163,9 @@ def test_agent_core_self_created_client_disables_proxy_env(monkeypatch):
         _client(),
         base_url="https://192.0.2.1:15678",
         node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
     )
     assert client.http.trust_env is False
 
-
-@pytest.mark.parametrize(
-    "cert_file,match",
-    [
-        ("", "required"),
-        ("cert.pem", "under /run/deploy-approval/certs"),
-        ("/run/deploy-approval/certs/../peer.pem", "must not contain"),
-        ("/tmp/peer.pem", "under /run/deploy-approval/certs"),
-        ("/etc/ssl/certs/ca-certificates.crt", "under /run/deploy-approval/certs"),
-    ],
-)
-def test_agent_core_tls_peer_cert_logical_path_required(cert_file, match):
-    with pytest.raises(AgentCoreError, match=match):
-        AgentCoreClient(
-            _client(),
-            base_url="https://192.0.2.1:15678",
-            node_host="192.0.2.1",
-            tls_peer_cert_file=cert_file,
-            http=httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}})),
-        )
 
 
 def test_agent_core_aclose_owns_only_self_created_http():
@@ -221,7 +173,6 @@ def test_agent_core_aclose_owns_only_self_created_http():
         _client(),
         base_url="https://192.0.2.1:15678",
         node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
     )
     asyncio.run(owned.aclose())
     asyncio.run(owned.aclose())
@@ -232,7 +183,6 @@ def test_agent_core_aclose_owns_only_self_created_http():
         _client(),
         base_url="https://192.0.2.1:15678",
         node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
         http=external,
     )
     asyncio.run(injected.aclose())
@@ -259,7 +209,7 @@ class _FakeCore:
 
 
 def _controller_for_core_tests(core_factory=None) -> DeployController:
-    config = make_config()
+    config = make_config(agent_core_tokens={"m1": "m1-token"})
     policy = Policy(config)
     policy.machines = {
         "m1": MachineInfo(
@@ -267,7 +217,6 @@ def _controller_for_core_tests(core_factory=None) -> DeployController:
             node_id="node-1",
             owners=["owner"],
             node_host="192.0.2.1",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             targets=["driver"],
             platforms=["linux/arm64"],
             driver_paths=["vendor/driver"],
@@ -343,8 +292,7 @@ def test_agent_core_rejects_missing_running_image():
     tr = _Transport({"code": 200, "data": {"status": "running"}})
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.driver_status("driver"))
@@ -355,8 +303,7 @@ def test_agent_core_rejects_missing_data_envelope():
     tr = _Transport({"message": "boom", "data": None})
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.driver_status("driver"))
@@ -367,8 +314,7 @@ def test_agent_core_rejects_non_200_code():
     tr = _Transport({"code": 500, "message": "boom", "data": None})
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.driver_status("driver"))
@@ -381,8 +327,7 @@ def test_agent_core_auth_verify_accepts_raw_shape():
     tr = _Transport({"valid": True, "auth_required": True})
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     out = asyncio.run(c.verify())
     assert out.get("valid") is True
@@ -403,8 +348,7 @@ def test_agent_core_auth_disabled_fails_closed():
         tr = _Transport(payload)
         c = AgentCoreClient(
             cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
         )
         with pytest.raises(AgentCoreError):
             asyncio.run(c.verify())
@@ -415,8 +359,7 @@ def test_agent_core_rejects_http_401():
     tr = _Transport({"detail": "nope"}, status=401)
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.verify())
@@ -467,8 +410,7 @@ def test_agent_core_oversize_response_fails_closed():
     tr = _ChunkedTransport(b'{"code": 200, "data": "' + b"x" * 512 + b'"}')
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.driver_status("driver"))
@@ -603,8 +545,7 @@ def test_real_agent_core_list_envelopes_accept_list_data():
             tr = _Transport(payload)
             c = AgentCoreClient(
                 cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
             )
             if kind == "list_drivers":
                 got = await c.list_drivers()
@@ -659,8 +600,7 @@ def test_real_agent_core_registry_catalog_facets_contract():
         })
         c = AgentCoreClient(
             cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(
+        node_host="192.0.2.1", http=httpx.AsyncClient(
                 transport=_TransportFromScenarios({
                     "/api/registry/catalog": catalog_tr,
                     "/api/drivers": drivers_tr,
@@ -701,8 +641,7 @@ def test_registry_catalog_rejects_legacy_nested_facets_shape():
     })
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.registry_catalog())
@@ -719,8 +658,7 @@ def test_registry_catalog_rejects_missing_top_level_facets():
     })
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.registry_catalog())
@@ -738,8 +676,7 @@ def test_registry_catalog_rejects_non_dict_top_level_filter():
     })
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.registry_catalog())
@@ -756,8 +693,7 @@ def test_registry_catalog_rejects_missing_filter_fail_closed():
     })
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.registry_catalog())
@@ -775,8 +711,7 @@ def test_registry_catalog_rejects_empty_cpu_or_acc_arch():
         })
         c = AgentCoreClient(
             cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
         )
         with pytest.raises(AgentCoreError):
             asyncio.run(c.registry_catalog())
@@ -789,8 +724,7 @@ def test_list_drivers_rejects_object_data_fail_closed():
     tr = _Transport({"code": 200, "data": {"id": "perception"}})
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     with pytest.raises(AgentCoreError):
         asyncio.run(c.list_drivers())
@@ -807,8 +741,7 @@ def test_deploy_driver_requires_immutable_digest_form():
         tr = _Transport({"code": 200, "data": {"status": "starting"}})
         c = AgentCoreClient(
             cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
         )
         with pytest.raises(AgentCoreError):
             asyncio.run(c.deploy_driver("drv", bad))
@@ -825,8 +758,7 @@ def test_deploy_driver_requires_immutable_digest_form():
     tr = Capture()
     c = AgentCoreClient(
         cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
     good = "registry.example/repo/perception@sha256:" + "a" * 64
     asyncio.run(c.deploy_driver("drv", good))
@@ -847,8 +779,7 @@ def test_mcp_health_rejects_non_object_tools_without_coercion():
         })
         c = AgentCoreClient(
             cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1",
-        tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem", http=httpx.AsyncClient(transport=tr),
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
         )
         with pytest.raises(AgentCoreError):
             asyncio.run(c.mcp_ping("mcp1"))
@@ -956,7 +887,6 @@ class TestValidateApiPathSegment:
             make_config(allow_private_http=True),
             base_url="https://10.0.0.1:15678",
             node_host="10.0.0.1",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             http=httpx.AsyncClient(transport=transport),
         )
 
@@ -1102,7 +1032,6 @@ class TestValidateApiPathSegment:
             slow_cfg,
             base_url="https://10.0.0.1:15678",
             node_host="10.0.0.1",
-            tls_peer_cert_file="/run/deploy-approval/certs/test-agent-core.pem",
             http=httpx.AsyncClient(transport=SlowTransport()),
         )
         with pytest.raises(AgentCoreDeployOutcomeUncertain) as excinfo:
