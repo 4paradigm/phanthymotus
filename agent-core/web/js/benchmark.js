@@ -51,6 +51,9 @@ let _runId = null;
 // 正在跑的是哪个用例。列表里那张卡据此把「运行」换成「停止」，其余卡片置灰 ——
 // 同时跑两个会让两次跑动往同一个 agent 注入消息、同时重置世界。
 let _runningId = null;
+// 正在走手动刷新。`_load()` 会重画列表，而它调的 `_poll()` 也可能重画 —— 一次点击
+// 画两遍，眼睛看到的就是闪一下。
+let _refreshing = false;
 // 仿真器的 mcp_id，没有就是 null —— 也就是这次运行会驱动真实设备。
 let _simulator = null;
 
@@ -127,9 +130,11 @@ async function _refresh() {
   // 而「刷新一下看看有没有新的」之后要看的东西，往往就在刚才那个位置附近。
   const kept = ['bm-lib-local', 'bm-lib-market', 'bm-runs']
     .map((id) => [document.getElementById(id), document.getElementById(id)?.scrollTop ?? 0]);
+  _refreshing = true;
   try {
     await _load();
   } finally {
+    _refreshing = false;
     kept.forEach(([el, top]) => { if (el) el.scrollTop = top; });
     setTimeout(() => button?.classList.remove('bm-spin'), 400);
   }
@@ -228,7 +233,9 @@ function _bindCaseCards(el) {
 async function _loadMarketCases() {
   const el = document.getElementById('bm-lib-market');
   if (!el) return;
-  el.innerHTML = '<div class="bm-empty">加载中…</div>';
+  // 只在**真的还没有内容**时才写「加载中」。每次刷新都先清空再重画，就是一次可见的
+  // 闪动 —— 而刷新的全部意义是原地看看有没有新东西。
+  if (!el.querySelector('.bm-card')) el.innerHTML = '<div class="bm-empty">加载中…</div>';
   let data;
   try {
     data = await api('/api/benchmark/cases/market');
@@ -598,7 +605,9 @@ async function _poll() {
 
   _runningId = view.live ? (data.case_id || null) : null;
   // 跑动开始或结束了才重画列表 —— 每两秒重画一次会把用户正在点的按钮抽走。
-  if (_runningId !== previous) _loadLibrary();
+  // `_refreshing` 时也不重画：`_load()` 自己已经画过一遍了，这里再画一次就是
+  // 同一次刷新里的第二次重绘，看起来就是闪一下。
+  if (_runningId !== previous && !_refreshing) _loadLibrary();
 
   if (!view.show) {
     // 空闲时不报「0 / 0 个 case」——那是噪音，不是信息。

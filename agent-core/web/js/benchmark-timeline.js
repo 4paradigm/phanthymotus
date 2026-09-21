@@ -205,9 +205,14 @@ export async function openTimeline(runId) {
   // 的，所以这两样得自己接回去 —— 否则「刷新一下看看有没有新内容」的代价是丢掉
   // 当前位置，而新内容往往就在你刚才看的地方附近。
   const scrolled = body.scrollTop;
+  // 换整块 innerHTML 时高度会先塌到 0 再撑回来 —— 那一下就是看到的「闪动」。
+  // 先把当前高度按住，画完再放开。
+  const held = body.offsetHeight;
+  if (held) body.style.minHeight = `${held}px`;
   body.innerHTML = _render(data);
   _switchPane(_pane);
   body.scrollTop = scrolled;
+  body.style.minHeight = '';
 }
 
 /** 打开这一条时该停在哪个 tab。

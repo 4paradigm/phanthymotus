@@ -633,6 +633,11 @@ async def run_timeline(run_id: str):
 
     cases = stored.get('cases') or []
     facts = next((c.get('facts') for c in cases if c.get('facts')), {}) or {}
+    # 跑动还在进行时，事实**一条都还没落盘** —— 那是每次重复跑完才写的。于是详情页
+    # 的「世界真的做了什么」一直是空的，刷新也没用，看起来像世界什么都没做。
+    # 正在跑的那一次直接问活的世界要。
+    if not facts and (stored.get('status') or '') == 'running':
+        facts = await _live_facts(run_id)
     events = facts.get('events') or []
     base = events[0].get('t', 0) if events else 0
 
@@ -668,6 +673,18 @@ async def run_timeline(run_id: str):
     }
 
 
+async def _live_facts(run_id: str) -> dict:
+    """正在跑的那一次，此刻的事实。拿不到就空着 —— 详情页会照常说这次没有记录。"""
+    import benchmark_runner
+    run = benchmark_runner.current()
+    if run is None or run.run_id != run_id:
+        return {}
+    try:
+        return await run.world.facts() or {}
+    except Exception:
+        return {}
+
+
 def _perf_turns(started, ended) -> list:
     """这段时间里每一轮的**真实**起止与逐次工具调用时刻。
 
@@ -679,7 +696,10 @@ def _perf_turns(started, ended) -> list:
         return []
     try:
         import perf_log
-        return perf_log.turns_between(float(started) - 10, float(ended or started) + 600)
+        # 还没结束时用**现在**当上界，不是 `started`：一次跑了十分钟的运行，
+        # `started + 600` 刚好卡在边上，最后几轮会被悄悄截掉。
+        return perf_log.turns_between(float(started) - 10,
+                                      float(ended or time.time()) + 600)
     except Exception:
         return []
 
