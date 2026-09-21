@@ -463,6 +463,25 @@ class GitHubStateProxy:
     async def get_issue_labels(self, repo: str, issue_number: int) -> list[str]:
         return await self._github.get_issue_labels(repo, issue_number)
 
+    async def add_issue_label(
+        self,
+        repo: str,
+        issue_number: int,
+        label: str,
+    ) -> None:
+        await self._github.add_issue_label(
+            repo, issue_number, label,
+        )
+
+    async def remove_issue_label(
+        self,
+        repo: str,
+        issue_number: int,
+        label: str,
+    ) -> None:
+        await self._github.remove_issue_label(
+            repo, issue_number, label,
+        )
 
     async def comment_identity(self, repo: str,
                                comment_id: int) -> tuple[str, str]:

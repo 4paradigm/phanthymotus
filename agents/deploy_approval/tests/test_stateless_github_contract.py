@@ -104,7 +104,7 @@ def _state(**overrides):
         "version": 1,
         "head_sha": "a" * 40,
         "status": "deploy-requested",
-        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
+        "review_evidence": {"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         "components": [_component()],
         "deployments": [],
         "case_results": {},
@@ -150,7 +150,7 @@ async def test_request_deploy_allows_current_pr_author_id(controller, proxy, moc
         "head": {"sha": "a" * 40},
         "user": {"id": 111, "login": "alice"},
     }
-    proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"}, components=[]))
+    proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"}, components=[]))
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
@@ -170,8 +170,7 @@ async def test_request_deploy_allows_current_pr_author_id(controller, proxy, moc
     )
     with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
         controller._build_component_snapshot = AsyncMock(return_value=[_component()])
-
-    result = await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+        result = await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
 
     assert result is True
     proxy.write_hidden_state.assert_called_once()

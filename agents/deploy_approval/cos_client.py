@@ -184,11 +184,14 @@ class CosClient:
                 f"head_sha must be exactly 40 lowercase hex chars, got {head_sha!r}"
             )
 
-        if now is None:
-            now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        else:
-            now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+        tz = ZoneInfo("Asia/Shanghai")
 
+        if now is None:
+            now = datetime.now(tz)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=tz)
+        else:
+            now = now.astimezone(tz)
         month = now.strftime("%Y-%m")
         day = now.strftime("%Y-%m-%d")
 

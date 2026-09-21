@@ -103,9 +103,9 @@ class TestTrustedPatAuthorCommentAccepted:
         )
 
         comments = [
-            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:56:00Z"),
-            _make_comment(_TEST_COMMENT_BODY, cid=1002, created_at="2026-09-18T03:55:00Z"),
-            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:55:30Z"),
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, created_at="2026-09-18T03:55:00Z"),
+            _make_comment(_TEST_COMMENT_BODY, cid=1002, created_at="2026-09-18T03:56:00Z"),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z"),
         ]
         evidence = extract_review_evidence(
             comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN

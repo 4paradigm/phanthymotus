@@ -79,7 +79,7 @@ def _open_pr(number: int, updated_at: str, *, marker: str = "") -> dict:
 @pytest.mark.parametrize(
     "github_repos, should_pass, expected_error",
     [
-        ([], False, "GITHUB_REPOS must contain exactly"),
+        ([], False, "GITHUB_REPOS is required"),
         (["4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
         (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must not contain duplicates"),
         (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),

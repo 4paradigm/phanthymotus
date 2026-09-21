@@ -802,7 +802,7 @@ async def test_clean_gate_preflights_all_components_before_any_deploy(controller
 async def test_new_approve_rechecks_running_image_until_empty(controller, proxy, mock_github):
     state1 = _deploy_requested_state()
     state2 = _deploy_requested_state()
-    proxy.read_hidden_state = AsyncMock(side_effect=[state1, state2])
+    proxy.read_hidden_state = AsyncMock(side_effect=[state1, state2, state2])
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}

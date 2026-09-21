@@ -268,7 +268,7 @@ async def test_request_deploy_uses_canonical_component_snapshot_helper():
         {
             "id": 5001,
             "user": {"id": "7950763", "login": "review-agent-bot"},
-            "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abcdef1\n\n| target | status | version | took |\n| perception | :white_check_mark: | 5.11 | 10s |\n\n### Images\n\n**perception**\n```\nregistry.example/repo:v1\n```\n",
+            "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abcdef1\n\n| target | status | version | took |\n| perception (jetson-jp5.11) | :white_check_mark: | release.260918.abcdef1 | 10s |\n\n### Images\n\n**perception (jetson-jp5.11)**\n```\nregistry.example/repo:v1\n```\n",
             "created_at": "2026-09-03T09:00:00Z",
             "updated_at": "2026-09-03T10:00:00Z",
         },
@@ -992,7 +992,7 @@ async def test_uncertain_post_stops_later_components():
     )
     real_comps = await controller._build_component_snapshot(
         "4paradigm/phanthymotus", 1, "a" * 40,
-        [_build(), _build(target="actucore"), _build(target="driver")],
+        [_build(), _build(target="actucore"), _build(target="driver", driver_path="custom/driver")],
     )
     assert real_comps is not None
     state = _state(
@@ -1015,6 +1015,7 @@ async def test_uncertain_post_stops_later_components():
         return_value=[
             {"id": "perception", "target": "perception", "image": "registry.example/repo:v1"},
             {"id": "actucore", "target": "actucore", "image": "registry.example/repo:v1"},
+            {"id": "driver", "category": "driver", "image": "registry.example/repo:v1"},
         ]
     )
     status_order = []
@@ -1027,12 +1028,7 @@ async def test_uncertain_post_stops_later_components():
     controller._core_for_node = AsyncMock(return_value=core)
     deploy_calls = {"perception": 0, "actucore": 0, "driver": 0}
 
-    async def _deploy_component(*args, **kwargs):
-        runtime_id = args[1] if len(args) > 1 else ""
-        if not runtime_id:
-            for k in deploy_calls:
-                runtime_id = k
-                break
+    async def _deploy_component(_core, _node_id, _image_ref, runtime_id):
         deploy_calls[runtime_id] = deploy_calls.get(runtime_id, 0) + 1
         if runtime_id == "actucore":
             raise DeployOutcomeUncertain("network timeout")
@@ -1090,6 +1086,7 @@ async def test_uncertain_post_does_not_upload_failed_cos():
         return_value=[
             {"id": "perception", "target": "perception", "image": "registry.example/repo:v1"},
             {"id": "actucore", "target": "actucore", "image": "registry.example/repo:v1"},
+            {"id": "driver", "category": "driver", "image": "registry.example/repo:v1"},
         ]
     )
     core.driver_status = AsyncMock(
@@ -1358,7 +1355,7 @@ async def test_new_approve_deploys_only_remaining_components():
             "state": "open",
             "merged": False,
             "head": {"sha": "a" * 40},
-            "user": {"id": 222, "login": "owner1"},
+            "user": {"id": 333, "login": "pr-author"},
         }
     )
 
@@ -1375,7 +1372,24 @@ async def test_new_approve_deploys_only_remaining_components():
     proxy.collaborator_permission = AsyncMock(return_value="admin")
 
     # Patch unrelated boundaries
-    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+    async def _refresh_uncertain_state(repo, pr_number, state):
+        state["status"] = "deploy-requested"
+        old_command = state.get("command", {})
+        old_args = dict(old_command.get("args", {}) or {})
+        state["command"] = {
+            "comment_id": int(old_command.get("comment_id", 0) or 0),
+            "kind": "approve_deploy",
+            "phase": "completed",
+            "args": old_args,
+        }
+
+        # Persist the refreshed state so subsequent production reads see phase=completed.
+        current_state.clear()
+        current_state.update(copy.deepcopy(state))
+
+        return "deploy-requested"
+
+    controller._refresh_uncertain_state = AsyncMock(side_effect=_refresh_uncertain_state)
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
 
     # Mock _preflight for the REMAINING component (actucore) only
