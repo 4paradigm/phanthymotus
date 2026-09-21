@@ -1199,6 +1199,68 @@ def test_a_driver_group_without_a_mode_inherits_the_top_level_one():
     assert problems == []
 
 
+# ── advisory vs optional：丢维要双方都同意过 ────────────────────────────────
+#
+# 由来是一次真机实测：G1 的 1 自由度腰上，`unifolm-vla-g1` 的 25 步动作块一步都
+# 没通过，全数停在 `waist_roll outside [-0.02, 0.02]` —— 那个限位没错（腰确实动不
+# 了），但它把整条指令拒掉了，连同两条本可以执行的手臂。
+#
+# 解法不是放宽限位（那会让 IK 按一个机器人到不了的躯干姿态解手臂，每拍差同样一点
+# 而没有一处报错），而是两侧各声明一半：驱动说「我收下但不执行」（advisory），
+# 模型说「任务不要求执行」（optional）。**这个函数是它们相遇的地方**，也是让
+# 「静默丢掉几维」在这套协议里不可能发生的那道门。
+
+
+def _advisory_waist_descriptor():
+    groups = [dict(g) for g in MIXED_GROUPS]
+    groups[-1]["advisory"] = True
+    return _mixed_descriptor(groups)
+
+
+def test_a_dropped_segment_the_model_requires_is_refused():
+    """驱动不执行，而模型认为必须执行 —— 这不是可以两边各让一步的事。"""
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _advisory_waist_descriptor(),
+    )
+    assert problems
+    assert any("advisory" in p and "optional" in p for p in problems)
+
+
+def test_a_dropped_segment_the_model_allows_is_accepted():
+    """许可到位就放行。这是 unifolm-vla-g1 在 1 自由度腰 G1 上真正走的那条路。"""
+    allowed = [dict(g) for g in MIXED_GROUPS]
+    allowed[-1]["optional"] = True
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=allowed),
+        _advisory_waist_descriptor(),
+    ) == []
+
+
+def test_permission_alone_changes_nothing():
+    """模型说可丢、驱动说会执行 —— 那就执行，没有分歧。
+
+    反过来理解这个字段（「模型说可丢，所以别执行了」）会让一台**真能弯腰**的
+    29dof G1 从此不再弯腰，而没有任何一处报错。
+    """
+    allowed = [dict(g) for g in MIXED_GROUPS]
+    allowed[-1]["optional"] = True
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=allowed),
+        _mixed_descriptor(),
+    ) == []
+
+
+def test_neither_side_declaring_anything_is_todays_every_model():
+    """两个字段都缺省 false，所以这条检查对今天每一对声明都是透明的。"""
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _mixed_descriptor(),
+    ) == []
+
+
 def test_a_single_space_model_is_not_forced_to_declare_segments():
     """一边有段一边没有不算分歧 —— 今天每个模型都是单一空间，没有段是常态。"""
     assert negotiate.check(
