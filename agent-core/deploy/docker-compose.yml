@@ -9,13 +9,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
       - /opt/phanthy-motus/data:/work/resource
-      # Core produces/repairs dds-local.xml here before ROS starts (dds_isolation).
-      # Keep this parent writable; a read-only child file bind would block repair.
       - /opt/phanthy-motus:/opt/phanthy-motus
     environment:
       - DB_PATH=/work/resource/data.db
-      # Optional fallback credential; Jev's Canvas password field can also configure it.
-      - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}
       - COMPOSE_DIR=/opt/phanthy-motus
       - CONTAINER_NAME=phanthy-motus-agent-core-1
       # 所有机器人共用 domain 42：内部 DDS 被 dds-local.xml 锁在 loopback，

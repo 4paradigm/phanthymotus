@@ -60,9 +60,9 @@ PR 首轮镜像测试为 1330 通过、12 失败、1 跳过，不能用上述定
 
 外部判断使用 HTTPS 和默认服务端证书校验；不下载或执行模型代码。API 返回没有另行提供应用层签名，信任 TypeSafe 服务端及 TLS 链路；类型校验不构成对判断正确性的保证。
 
-部署模板中的 `TYPESAFE_API_KEY` 仍可传入可选服务端凭据；也可直接通过卡片密码框保存，无需改 Compose 或重启。不增加依赖或修改 Dockerfile。两处均无密钥时，保存启用 Jev 会报错并保留旧配置。
+默认部署通过卡片密码框配置凭据，无需改 Compose 或重启。`TYPESAFE_API_KEY` 回退仅适用于已显式注入 Core 进程环境的变量；宿主 `.env` 不会自动透传。本 PR 不修改部署模板、依赖或 Dockerfile。两处均无密钥时，保存启用 Jev 会报错并保留旧配置。
 
-DDS 挂载行为未修改：Core 是 profile 的生产/修复方，启动前由 `dds_isolation.ensure_profile()` 经可写 `/opt/phanthy-motus` 父目录挂载补齐或更新文件。不能为它叠加只读 `dds-local.xml` 子文件挂载，否则现有缺失文件修复与版本更新会被阻止；其他只读消费方的挂载示例不直接套用于 Core。
+DDS 启动与挂载沿用主干，本 PR 的 Compose 文件与基线逐字一致。Core 的现有 profile 生产/修复链路未变；DDS 部署机制重设计不混入 Jev 功能。现场更新仍须验证实际 loopback 隔离，不能仅凭服务存活放行。
 
 配置旁路修复后本地验证：Python 3.10 全量 1357 passed、8 subtests passed，42.12 秒；Jev/DDS 定向 62 passed；全部前端 Node 测试 93 passed，sidebar 语法检查及 diff whitespace 检查通过。新增覆盖实例字段拒绝、删除数据库失败及共享凭据保留、持久化后同步/异步下发失败和重试成功。此记录不代表新镜像已部署。
 
