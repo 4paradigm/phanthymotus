@@ -37,7 +37,7 @@ SCHEMA = {
     'jev_route_threshold': {'type': 'number', 'default': 0.5, 'minimum': 0, 'maximum': 1,
                            'description': '模式 confidence 阈值（不足时沿用当前默认模式）'},
     'jev_timeout_s': {'type': 'number', 'default': 2.0, 'minimum': 0.1, 'maximum': 5,
-                     'description': 'Jev 请求总超时（秒）'},
+                     'description': 'Jev 总判断预算（秒，包含排队与重试）'},
 }
 for _key, _spec in SCHEMA.items():
     if _key != 'jev_enabled':
@@ -341,6 +341,7 @@ _generation = 0
 _deliver_cancelled_text = False
 _invalidating = False
 _invalidate_lock = asyncio.Lock()
+_commit_lock = asyncio.Lock()
 _diagnostics = deque(maxlen=100)
 
 
@@ -354,18 +355,27 @@ def note(event, reason, **fields):
 
 async def commit(event, mode=None, version=None):
     from event_bus import enqueue_accepted
-    event['_semantic_route'] = {'mode': mode, 'version': version, 'generation': _generation}
-    # Accepted interactions cannot rely on the legacy source-name heuristic.
-    event['_semantic_interaction'] = True
-    if event_kind(event) == 'voice':
-        data = decode(event)
-        event['payload'] = {**data, 'duration_ms': data.get('audio_duration_ms', data.get('duration_ms', 0))}
-        event['_semantic_voice'] = True
-    await enqueue_accepted(event)
+    # Serialize competing fallbacks even when the accepted queue is full. The
+    # bus marks the event at insertion, without a cancellation point afterwards.
+    async with _commit_lock:
+        if event.get('_semantic_committed'):
+            return
+        event['_semantic_route'] = {'mode': mode, 'version': version, 'generation': _generation}
+        # Accepted interactions cannot rely on the legacy source-name heuristic.
+        event['_semantic_interaction'] = True
+        if event_kind(event) == 'voice':
+            data = decode(event)
+            event['payload'] = {**data, 'duration_ms': data.get('audio_duration_ms', data.get('duration_ms', 0))}
+            event['_semantic_voice'] = True
+        await enqueue_accepted(event)
 
 
 async def submit(event):
-    """Return True if taken over. Never wait for inference on the producer path."""
+    """Return True if taken over; never wait for inference or configuration I/O.
+
+    Settings publication is the cutover point. New bypass events may overtake
+    older text being drained by invalidation; there is no cross-cutover FIFO.
+    """
     global _worker
     if not settings()['jev_enabled']:
         return False
@@ -416,13 +426,15 @@ async def _judge(event, kind, received):
     voice = kind == 'voice'
     admitted = not voice
     generation = _generation
+    cfg = settings()
+    deadline = received + min(cfg['jev_timeout_s'], 5.0)
     for attempt in range(2):
-        remaining = 5 - (time.monotonic() - received)
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
+            admitted = not voice
             break
         if not running() or generation != _generation:
             return
-        cfg = settings()
         try:
             path, contents, digest = identity(cfg)
             snapshot = runtime_snapshot(event)
@@ -434,7 +446,13 @@ async def _judge(event, kind, received):
                                     ('sender_type', 'user_role', 'channel_id', 'chat_id', 'message_id')
                                     if k in decode(event)}}}
             began = time.monotonic()
-            body = await asyncio.wait_for(request_jev(state, voice, cfg), timeout=remaining)
+            remaining = deadline - began
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            body = await asyncio.wait_for(
+                request_jev(state, voice, {**cfg, 'jev_timeout_s': remaining}), timeout=remaining)
+            if time.monotonic() >= deadline:
+                raise asyncio.TimeoutError
             ok, mode, reason, p, confidence = parse_result(body, voice, cfg)
             admitted = ok
             elapsed = (time.monotonic() - began) * 1000
@@ -450,6 +468,8 @@ async def _judge(event, kind, received):
                 if attempt == 0:
                     continue
                 break
+            if time.monotonic() >= deadline:
+                raise asyncio.TimeoutError
             if not ok:
                 return
             event.setdefault('_perf_spans', []).append({
@@ -463,9 +483,16 @@ async def _judge(event, kind, received):
             admitted = not voice
             note(event, 'identity_unavailable', actual='default' if admitted else 'reject')
             break
+        except asyncio.TimeoutError:
+            admitted = not voice
+            note(event, 'budget_expired', actual='default' if admitted else 'reject')
+            break
         except Exception as exc:
+            admitted = not voice
             note(event, f'error:{type(exc).__name__}', actual='default' if admitted else 'reject')
             break
+    if voice and time.monotonic() >= deadline:
+        admitted = False
     if admitted and running() and generation == _generation:
         note(event, 'stale_or_failed_default')
         await commit(event)

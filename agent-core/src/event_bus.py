@@ -36,6 +36,11 @@ async def enqueue(source: str, text: str, payload: dict | None = None) -> None:
 async def enqueue_accepted(event: dict) -> None:
     """Internal commit after admission; never use an external 'approved' flag."""
     await _queue.put(event)
+    # No await between insertion and this marker: cancellation before insertion
+    # can retry, cancellation after insertion must not deliver a second copy.
+    # Only Core admission sets this top-level flag, never an external payload.
+    if event.get('_semantic_interaction'):
+        event['_semantic_committed'] = True
     _recent.append(event)
     if len(_recent) > 100:
         _recent.pop(0)

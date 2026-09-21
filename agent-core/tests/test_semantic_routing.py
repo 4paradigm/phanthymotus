@@ -53,6 +53,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                          patch.object(routing, '_saved_api_key', ''),
                          patch.object(routing, '_settings', self.cfg['semantic_routing']),
                          patch.object(routing, '_configure_lock', asyncio.Lock()),
+                         patch.object(routing, '_commit_lock', asyncio.Lock()),
                          patch.dict(os.environ, {'TYPESAFE_API_KEY': 'fake-test-key'}),
                          patch.object(routing, 'runtime_snapshot', side_effect=self.snapshot),
                          patch.object(routing, 'request_jev', new_callable=AsyncMock)]
@@ -276,6 +277,131 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         ev = await event_bus.dequeue()
         self.version = ('different', 1)
         self.assertEqual(routing.consume_mode(ev), 'steer')
+
+    async def test_retry_shares_absolute_budget_and_expired_voice_is_rejected(self):
+        for voice in (False, True):
+            with self.subTest(voice=voice):
+                self.cfg['semantic_routing']['jev_timeout_s'] = 0.2
+                budgets = []
+                cancelled = asyncio.Event()
+                async def changing(state, is_voice, cfg):
+                    budgets.append(cfg['jev_timeout_s'])
+                    if len(budgets) == 1:
+                        await asyncio.sleep(0.12)
+                        self.version = ('changed', self.version[1] + 1)
+                        return response('interrupt')
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cancelled.set()
+                self.api.side_effect = changing
+                await asyncio.wait_for(self.send(voice), 0.7)
+                self.assertEqual(len(budgets), 2)
+                self.assertLessEqual(budgets[0], 0.2)
+                self.assertLess(budgets[1], 0.1)
+                self.assertTrue(cancelled.is_set())
+                self.assertEqual(routing.settings()['jev_timeout_s'], 0.2)
+                self.assertEqual(event_bus._queue.qsize(), 0 if voice else 1)
+                if not voice:
+                    self.assertIsNone((await event_bus.dequeue())['_semantic_route']['mode'])
+
+    async def test_failed_rejudge_does_not_reuse_old_voice_acceptance(self):
+        calls = 0
+        async def changing(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                self.version = ('changed', 1)
+                return response('interrupt')
+            raise OSError('provider unavailable')
+        self.api.side_effect = changing
+        await self.send(True)
+        self.assertEqual(calls, 2)
+        self.assertTrue(event_bus._queue.empty())
+
+    async def test_queue_time_consumes_configured_budget(self):
+        self.cfg['semantic_routing']['jev_timeout_s'] = 0.1
+        for kind in ('voice', 'text'):
+            event = {'source': 'asr' if kind == 'voice' else 'message',
+                     'text': 'expired while queued', 'ts': time.time(), 'payload': {}}
+            await routing._judge(event, kind, time.monotonic() - 0.2)
+        self.api.assert_not_called()
+        self.assertEqual(event_bus._queue.qsize(), 1)
+        self.assertEqual((await event_bus.dequeue())['source'], 'message')
+
+    async def test_cancellation_after_real_commit_does_not_duplicate_fallback(self):
+        original = event_bus.enqueue_accepted
+        inserted = asyncio.Event()
+        async def pause_after_insertion(event):
+            await original(event)
+            inserted.set()
+            await asyncio.Event().wait()
+        with patch.object(event_bus, 'enqueue_accepted', side_effect=pause_after_insertion) as push:
+            await event_bus.enqueue('message', 'only once')
+            await asyncio.wait_for(inserted.wait(), 1)
+            await asyncio.wait_for(routing.invalidate(deliver_text=True), 1)
+            self.assertEqual(push.await_count, 1)
+        self.assertEqual(event_bus._queue.qsize(), 1)
+        self.assertEqual(len(event_bus.recent()), 1)
+
+    async def test_cancellation_before_insertion_retries_without_losing_text(self):
+        event_bus._queue = asyncio.Queue(maxsize=1)
+        event_bus._queue.put_nowait({'source': 'filler'})
+        entered = asyncio.Event()
+        original = event_bus.enqueue_accepted
+        calls = 0
+        async def observed(event):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await original(event)
+        with patch.object(event_bus, 'enqueue_accepted', side_effect=observed):
+            await event_bus.enqueue('message', 'survives cancellation')
+            await asyncio.wait_for(entered.wait(), 1)
+            entered.clear()
+            invalidation = asyncio.create_task(routing.invalidate(deliver_text=True))
+            await asyncio.wait_for(entered.wait(), 1)
+            self.assertEqual(calls, 2)
+            await event_bus.dequeue()
+            await asyncio.wait_for(invalidation, 1)
+        self.assertEqual(event_bus._queue.qsize(), 1)
+        self.assertEqual(len(event_bus.recent()), 1)
+
+    async def test_competing_commits_share_one_insertion(self):
+        event = {'source': 'message', 'text': 'one', 'ts': time.time(), 'payload': {}}
+        await asyncio.gather(routing.commit(event), routing.commit(event))
+        self.assertEqual(event_bus._queue.qsize(), 1)
+        self.assertEqual(len(event_bus.recent()), 1)
+
+    async def test_disable_cutover_allows_new_legacy_text_before_old_fallback(self):
+        started, cancelling, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def pending(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelling.set()
+                await release.wait()
+                raise
+        self.api.side_effect = pending
+        await event_bus.enqueue('message', 'old in-flight', {'user_role': 'viewer'})
+        await asyncio.wait_for(started.wait(), 1)
+        await event_bus.enqueue('message', 'old waiting')
+        change = asyncio.create_task(routing.configure({'jev_enabled': False}))
+        try:
+            await asyncio.wait_for(cancelling.wait(), 1)
+            await event_bus.enqueue('message', 'new legacy')
+            first = await asyncio.wait_for(event_bus.dequeue(), 1)
+            self.assertEqual(first['text'], 'new legacy')
+            self.assertNotIn('_semantic_route', first)
+        finally:
+            release.set()
+            await asyncio.wait_for(change, 1)
+        old = [await event_bus.dequeue(), await event_bus.dequeue()]
+        self.assertEqual([e['text'] for e in old], ['old in-flight', 'old waiting'])
+        self.assertEqual(old[0]['payload']['user_role'], 'viewer')
+        self.assertEqual(self.api.await_count, 1)
+        self.assertEqual(len(event_bus.recent()), 3)
 
     async def test_queue_full_text_survives_voice_dropped(self):
         started = asyncio.Event()
