@@ -21,6 +21,8 @@
 
 ## 验证与部署结果
 
+- Bot [审查意见](https://github.com/4paradigm/phanthymotus/pull/254#issuecomment-5762705548) 的外部 spans / 内部 _perf_spans 非列表导致 collector 退出问题均已先测试复现，再统一规范化并过滤非字典项；畸形外部 spans 视为缺失，可回退已有时间戳推导。覆盖 Jev 开/关、坏事件后继续接收、原 ASR/Jev spans 保留和两个拼接分支。补明真实 API 探针付费且仅显式运行，不进自动测试发现。
+- 此轮修复本地 Python 3.13.0 全量 1393 passed、1 skipped（缺 lark_oapi）、10 subtests passed，35.41 秒。修改仅容错与测试说明，README/操作接口无需变化；未重新部署，继续请求最新 head Bot。
 - PR 等待审查期间自查发现 Solution 实例字段校验遗漏隐藏旧阈值，补全 `CONFIG_KEYS` 一致性；先扩展现有测试到全部配置键并复现失败，再修复入口，保持“Jev 仅共享配置”的契约。此修复不改变实机路由策略，不再次部署。
 - 修复后本地 Python 3.13.0 Core 全量 1391 passed、1 skipped（缺 lark_oapi）、10 subtests passed，35.23 秒，diff 检查通过。此前 `66a18f6f` 镜像 `release.260921.c84895a` 全量 1405 passed、0 failed（4m08s）；新增修复需重新申请同 head 的 Bot，不沿用旧结果。README/操作文档原先已规定全部 Jev 字段仅共享配置，本修复恢复既有契约，无需改变用户操作步骤。
 - 本次提交前复测：临时独立 `DB_PATH`，`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/jev-core-routing-test-20260921/bin/python -m pytest agent-core/tests -q -ra`：1391 passed、1 skipped、10 subtests passed，37.30 秒；唯一跳过为本地缺少 `lark_oapi` 的 Feishu 测试。`git diff --check` 通过；最新 head 的镜像测试及 Bot 审查另待推送后确认。

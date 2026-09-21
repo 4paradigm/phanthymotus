@@ -1,6 +1,8 @@
 """Opt-in real Jev probe: synthetic text only; no ROS, tools or control loop.
 
 Set TYPESAFE_API_KEY and DB_PATH to an isolated database before running.
+This makes paid external API calls. Run explicitly; it is intentionally not
+named test_*.py and must not be added to automatic unit-test discovery.
 Timeouts are reported separately, never counted as successful classifications.
 """
 import asyncio

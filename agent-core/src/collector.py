@@ -94,6 +94,10 @@ def _extract_priority(ev: dict) -> int:
 
 def _extract_perf_timestamps(ev: dict):
     """从 ASR 事件 JSON 中提取性能 span 数据。"""
+    existing = ev.get('_perf_spans')
+    existing = [s for s in existing if isinstance(s, dict)] if isinstance(existing, list) else []
+    if '_perf_spans' in ev:
+        ev['_perf_spans'] = existing
     text = ev.get('text', '')
     if not text or not text.startswith('{'):
         return
@@ -101,8 +105,8 @@ def _extract_perf_timestamps(ev: dict):
         data = _json.loads(text)
     except (ValueError, TypeError):
         return
-    if 'spans' in data:
-        ev['_perf_spans'] = data['spans'] + ev.get('_perf_spans', [])
+    if isinstance(data.get('spans'), list):
+        ev['_perf_spans'] = [s for s in data['spans'] if isinstance(s, dict)] + existing
         return
     spans = []
     audio_start = data.get('audio_start_ts')
@@ -115,7 +119,7 @@ def _extract_perf_timestamps(ev: dict):
         spans.append({'span': 'asr_inference', 'start_ts': audio_end, 'end_ts': asr_complete,
                       'meta': {'text_length': data.get('text_length')}})
     if spans:
-        ev['_perf_spans'] = spans + ev.get('_perf_spans', [])
+        ev['_perf_spans'] = spans + existing
 
 
 def _extract_asr_text_field(ev: dict) -> str:

@@ -768,6 +768,45 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                    'text': json.dumps({'sender_type': 'bot', 'text': 'stop'})}
             self.assertEqual(llm.routing_snapshot(bot)['history'], [])
 
+    async def test_malformed_perf_spans_do_not_kill_collector(self):
+        self.consumer = asyncio.create_task(collector._drain_loop())
+        for enabled in (False, True):
+            self.cfg['semantic_routing']['jev_enabled'] = enabled
+            for n, spans in enumerate(({}, 'bad', None, 7, [None, 'bad', {'span': 'asr'}])):
+                await event_bus.enqueue('asr', json.dumps({
+                    'text': f'normal message {enabled} {n}', 'spans': spans,
+                    'audio_duration_ms': 1000, 'priority': 1}))
+                if routing._worker:
+                    await routing._worker
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                self.assertFalse(self.consumer.done())
+                trigger = await asyncio.wait_for(collector._output.get(), 1)
+                self.assertTrue(all(isinstance(s, dict) for s in trigger.get('_perf_spans', [])))
+            # Bad telemetry must not prevent a subsequent ordinary event.
+            await event_bus.enqueue('message', f'next message {enabled}')
+            if routing._worker:
+                await routing._worker
+            await asyncio.wait_for(collector._output.get(), 1)
+            self.assertFalse(self.consumer.done())
+
+    async def test_perf_span_merge_normalizes_internal_and_external_values(self):
+        derived = {'audio_start_ts': 1700000000, 'audio_end_ts': 1700000001,
+                   'asr_complete_ts': 1700000002}
+        for existing in ({}, 'bad', None, 7, [None, {'span': 'jev_route'}]):
+            for data in ({'spans': [{'span': 'asr'}, None, 'bad']}, derived,
+                         {**derived, 'spans': {}}, {}):
+                ev = {'text': json.dumps(data), '_perf_spans': existing}
+                collector._extract_perf_timestamps(ev)
+                spans = ev['_perf_spans']
+                self.assertIsInstance(spans, list)
+                self.assertTrue(all(isinstance(s, dict) for s in spans))
+                expected = ['asr'] if isinstance(data.get('spans'), list) else (
+                    ['vad_collect', 'asr_inference'] if 'audio_start_ts' in data else [])
+                if isinstance(existing, list):
+                    expected.append('jev_route')
+                self.assertEqual([s['span'] for s in spans], expected)
+
     async def test_short_semantically_admitted_interrupt_not_vetoed_by_duration(self):
         collector._busy = True
         self.consumer = asyncio.create_task(collector._drain_loop())
