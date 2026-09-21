@@ -1,5 +1,7 @@
 # Jev 单次接入与路由判断
 
+> 历史计划：其中保留本地精确回声拦截的条款已由 [移除本地回声拦截计划](remove-local-echo-filter.md) 取代。以下测试及部署记录保留原时间点含义，不作为移除过滤后的效果证据。
+
 ## 已确认范围
 
 - 将一次请求内的 audience、addressed、route 三题合并为一个 Choice：ignore / steer / interrupt / followup / uncertain。

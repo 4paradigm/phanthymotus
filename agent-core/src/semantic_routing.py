@@ -11,7 +11,6 @@ import os
 import pathlib
 import time
 import uuid
-import unicodedata
 from collections import deque
 
 import aiohttp
@@ -350,17 +349,6 @@ def recent_robot_speech(event):
             for r in _robot_speech if now <= r['expires'] and received >= r['sent']]
 
 
-def _speech_text(text):
-    return ''.join(c for c in unicodedata.normalize('NFKC', text).casefold() if c.isalnum())
-
-
-def is_robot_echo(event, references):
-    text = _speech_text(message_text(event))
-    # Only a complete candidate contained in dispatched speech is a hard reject.
-    # Short commands and mixed speech (extra words) go to the semantic gate.
-    return len(text) >= 6 and any(text in _speech_text(r['text']) for r in references)
-
-
 def default_mode():
     import collector
     return collector.get_interrupt_mode()
@@ -545,10 +533,6 @@ async def _judge(event, kind, received):
             return
         try:
             references = recent_robot_speech(event) if voice else []
-            if voice and is_robot_echo(event, references):
-                note(event, 'robot_echo', actual='reject', method='recent_speech_exact')
-                return
-            # Even expired queued speech must pass the local echo guard.
             if time.monotonic() >= deadline:
                 raise asyncio.TimeoutError
             path, contents, digest = identity(cfg)

@@ -54,7 +54,7 @@ async def main():
         }
         started = time.monotonic()
         try:
-            # Intentionally bypass exact-text shortcut to verify Jev itself.
+            # Model-only diagnostic; does not exercise the production queue/budget.
             body = await asyncio.wait_for(routing.request_jev(state, True, cfg), 5)
             accepted, mode, reason, _, _ = routing.parse_result(body, True, cfg)
             elapsed = round((time.monotonic() - started) * 1000)

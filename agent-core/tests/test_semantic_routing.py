@@ -179,23 +179,51 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             await self.send(True)
             self.assertTrue(event_bus._queue.empty())
 
-    async def test_exact_speech_fragment_rejected_before_jev_not_mixed_or_short(self):
+    async def test_speech_references_are_context_only_including_exact_repetition(self):
         import hooks
         with patch.object(hooks, 'list_hooks', return_value={'on_notify': [
                 {'mcp_id': 'local', 'tool': 'voice', 'action': 'say'}]}):
             ref = routing.begin_robot_speech('local', 'voice', {
                 'action': 'say', 'text': '我可以介绍展厅的机器人，还能帮你拍照。'})
         self.assertIsNotNone(ref)
-        await self.send(True, '介绍展厅的机器人。')
-        self.api.assert_not_called()
-        self.assertTrue(event_bus._queue.empty())
-        for text in ('停一下', '介绍展厅的机器人，先别讲了', '帮我联系小李'):
+        for text in (ref['text'], '介绍展厅的机器人。', '介绍展厅的机器仁',
+                     '停一下', '介绍展厅的机器人，先别讲了', '帮我联系小李'):
             await self.send(True, text)
+            self.assertEqual(self.api.call_args.args[0]['recent_robot_speech'][0]['text'], ref['text'])
             self.assertEqual((await event_bus.dequeue())['payload']['text'], text)
-        self.assertTrue(self.api.call_args.args[0]['recent_robot_speech'])
+        self.assertEqual(self.api.await_count, 6)
+        self.api.return_value = response('ignore')
+        await self.send(True, ref['text'])
+        self.assertEqual(self.api.await_count, 7)
+        self.assertTrue(event_bus._queue.empty())
+        self.assertEqual(routing._diagnostics[-1]['reason'], 'ignore')
+        self.api.return_value = response()
         ref['expires'] = time.monotonic() - 1
         await self.send(True, '介绍展厅的机器人。')
         self.assertEqual(event_bus._queue.qsize(), 1)
+        self.assertEqual(self.api.call_args.args[0]['recent_robot_speech'], [])
+
+    async def test_matching_speech_request_timeout_defaults(self):
+        self.api.side_effect = asyncio.TimeoutError
+        text = '我能介绍展厅的机器人'
+        with patch.object(routing, 'recent_robot_speech', return_value=[{'text': text}]):
+            await self.send(True, text)
+        self.api.assert_awaited_once()
+        ev = await event_bus.dequeue()
+        self.assertEqual(ev['payload']['text'], text)
+        self.assertIsNone(ev['_semantic_route']['mode'])
+
+    async def test_disabled_matching_speech_bypasses_judgment(self):
+        self.cfg['semantic_routing']['jev_enabled'] = False
+        text = '我能介绍展厅的机器人'
+        with patch.object(routing, 'recent_robot_speech', return_value=[{'text': text}]) as refs:
+            await self.send(True, text)
+        refs.assert_not_called()
+        self.api.assert_not_called()
+        ev = await event_bus.dequeue()
+        self.assertEqual(json.loads(ev['text'])['text'], text)
+        self.assertEqual(ev['payload'], {})
+        self.assertNotIn('_semantic_route', ev)
 
     async def test_speech_references_are_bounded_and_failed_calls_removed(self):
         import hooks
@@ -544,15 +572,17 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await event_bus.dequeue())['source'], 'asr')
         self.assertEqual((await event_bus.dequeue())['source'], 'message')
 
-    async def test_expired_queued_echo_still_rejected(self):
+    async def test_expired_queued_matching_speech_defaults(self):
         ev = {'source': 'asr', 'text': '我能介绍展厅的机器人',
               'ts': time.time(), 'payload': {}}
         with patch.object(routing, 'recent_robot_speech',
                           return_value=[{'text': ev['text']}]):
             await routing._judge(ev, 'voice', time.monotonic() - 6)
         self.api.assert_not_called()
-        self.assertTrue(event_bus._queue.empty())
-        self.assertEqual(routing._diagnostics[-1]['reason'], 'robot_echo')
+        accepted = await event_bus.dequeue()
+        self.assertEqual(accepted['text'], ev['text'])
+        self.assertIsNone(accepted['_semantic_route']['mode'])
+        self.assertTrue(any(d['reason'] == 'budget_expired' for d in routing._diagnostics))
 
     async def test_cancellation_after_real_commit_does_not_duplicate_fallback(self):
         original = event_bus.enqueue_accepted
