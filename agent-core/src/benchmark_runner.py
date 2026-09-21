@@ -176,24 +176,34 @@ class SimulatorWorld:
         return outcome
 
     async def _align(self) -> None:
-        """把记录器的零点搬到仿真世界的零点上。
+        """把记录器的零点搬到仿真世界的**事件时钟**上。
 
-        两边都用「相对秒数」，但相对的**不是同一个起点**：仿真器数的是本场景开始以来，
-        记录器数的是本次录制开始以来，而一个场景通常在这次运行之前就已经加载了。差值
-        只有十几秒，却足以让合并后排序把一条 `speak_start` 顶到最前面 —— 而运行详情的
-        右列拿最早那条事件当零点，于是整列前移，看起来像机器人在被要求之前就开了口。
+        两边都用「相对秒数」，但相对的**不是同一个起点**：仿真器的事件 `t` 数的是
+        它自己的进程时钟（一台跑了一个月的机器上就是三百多万秒），记录器数的是本次
+        录制开始以来。合并后一排序，记录器那些几秒的 `t` 全被顶到最前面，而运行详情
+        的右列拿最早那条事件当零点 —— 整列前移，看起来像机器人在被要求之前就开了口。
 
-        对不齐就不搬（offset 留 0）：宁可两列差十几秒，也不要搬一个瞎猜的量。
+        锚点用仿真器自己在重置时记下的 `scenario_load`：那一刻就是记录器的零点附近
+        （`start()` 紧挨着 `reset` 调用之前）。**不能用报告里的 `elapsed`** —— 它数的
+        是本场景秒数，和事件 `t` 在仿真器内部就不是一个基准，拿它算出来的 offset 约等于
+        0，于是这一列照样是错的，只是错得不那么显眼。
+
+        找不到锚点就不搬（offset 留 0）：宁可两列差十几秒，也不要搬一个瞎猜的量 ——
+        搬错了，「到了再讲」这类时序判定会拿错位的时间去比大小，而错位本身看不出来。
         """
-        recorder = self._recorder
-        if recorder is None:
+        if self._recorder is None:
             return
         report = await self._call(REPORT_TOOL, {'what': 'report'})
-        elapsed = report.get('elapsed') if isinstance(report, dict) else None
-        if elapsed is None:
+        events = report.get('events') if isinstance(report, dict) else None
+        if not events:
+            return
+        anchors = [e.get('t') for e in events if e.get('event') == 'scenario_load']
+        anchor = anchors[-1] if anchors else min(
+            (e.get('t') for e in events if e.get('t') is not None), default=None)
+        if anchor is None:
             return
         try:
-            self._t_offset = float(elapsed) - (time.time() - recorder.started)
+            self._t_offset = float(anchor)
         except (TypeError, ValueError):
             self._t_offset = 0.0
 

@@ -24,6 +24,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'runner-test.db'))
 
+import benchmark_facts  # noqa: E402
 import benchmark_runner  # noqa: E402
 import benchmark_store  # noqa: E402
 import config  # noqa: E402
@@ -642,3 +643,28 @@ def test_an_unalignable_world_shifts_nothing():
          'acp_posts': []})
 
     assert [e['t'] for e in merged['events']] == [1.0, 5.0]
+
+
+def test_alignment_anchors_on_scenario_load_not_on_elapsed():
+    """**`elapsed` 和事件 `t` 在仿真器内部就不是一个基准。**
+
+    前者数的是本场景秒数，后者数的是仿真器的进程时钟 —— 一台跑了一个月的机器上是
+    三百多万秒。拿 `elapsed` 算出来的 offset 约等于 0，于是这一列照样错，只是错得
+    不那么显眼。锚点必须取仿真器自己在重置时记下的 `scenario_load`。
+    """
+    import asyncio
+
+    world = benchmark_runner.SimulatorWorld('mcp-x')
+    world._recorder = benchmark_facts.Recorder()
+    calls = []
+
+    async def _fake(tool, args):
+        calls.append(tool)
+        return {'elapsed': 4.2,          # 本场景秒数 —— 用它就错了
+                'events': [{'event': 'scenario_load', 't': 3377718.5},
+                           {'event': 'led', 't': 3377719.0}]}
+
+    world._call = _fake
+    asyncio.run(world._align())
+
+    assert world._t_offset == 3377718.5
