@@ -166,12 +166,18 @@ def order_cards_by_dependency(cards, connections):
     return ordered, remaining
 
 
-_start_project_lock = False
 _project_lifecycle_epoch = 0
+# 正在进行中的那次启动。**是任务句柄，不是布尔标志** —— 见 `_do_start_project`。
+_start_project_task = None
+
+# 整次启动的兜底上限。不是"预期耗时"，是"再久就一定有问题"：`_settle_loading_item`
+# 是 create_task 发出去的，不占这条流程，所以正常情况下这里是秒级；留到 15 分钟是
+# 为了容忍一张卡片在 `start` 里冷下载几个 GB（actucore 的 VLA provider 会）。
+START_PROJECT_TIMEOUT_S = 900
 
 
 async def _do_start_project():
-    """Serializes concurrent callers behind a flag.
+    """Serializes concurrent callers behind the in-flight task.
 
     The frontend's start button used to accept a second click while the first
     start was still in flight (it only flips to "running" after the fetch
@@ -182,16 +188,62 @@ async def _do_start_project():
     *both* streams: extra modals, item updates applied against the wrong
     modal's index, and whichever run errored first called offMotusEvent() on
     both listeners, silently orphaning the other run's still-loading cards.
+
+    ── 为什么是任务句柄而不是一个布尔标志 ───────────────────────────────────
+
+    此前是 `_start_project_lock = True` 加 `try/finally`。那个 `finally` 防的是
+    **抛异常**；它防不住 `await` **挂住**，而挂住时 `finally` 永远轮不到执行，标志
+    位就永久为真 —— 之后每次点启动都是 409，"取消启动"只是前端的，后端纹丝不动，
+    **除了重启进程没有出路**。
+
+    真机实测 2026-09-21（G1）：perception 的 HTTP 服务线程被同进程一个空转线程
+    饿死（GIL 争用，accept 队列 Recv-Q 6 > backlog 5），一次 `tts.start` 再没回来，
+    整个项目启动就此锁死。撞上的是 TTS，但**任何一个 MCP 服务器变慢都走同一条路**。
+
+    换成任务句柄之后三件事同时成立，而且都不依赖"记得清标志位"：
+
+      * 并发判据变成 `task.done()` —— 一个挂住的任务仍然是任务，而超时/取消都会
+        让它 `done()`，所以这个状态**不可能泄漏**。
+      * `asyncio.wait_for` 给整次启动兜底：不管哪个 `await` 挂住都会被取消。
+        这比"给每一次 MCP 调用加超时"更对 —— 后者要逐个审计调用点，而且对
+        `start` 本来就该不限时。
+      * "取消启动"能真的取消：`_cancel_start_project()` 直接 cancel 这个任务。
     """
-    global _start_project_lock
-    if _start_project_lock:
+    global _start_project_task
+    import asyncio as _aio
+
+    task = _start_project_task
+    if task is not None and not task.done():
         print('[start-project] already in progress, ignoring concurrent call')
         return None
-    _start_project_lock = True
+
+    task = _aio.ensure_future(_do_start_project_impl())
+    _start_project_task = task
     try:
-        return await _do_start_project_impl()
-    finally:
-        _start_project_lock = False
+        # wait_for 超时会 cancel 掉 task，于是它变成 done —— 下一次点启动就能进来。
+        return await _aio.wait_for(task, timeout=START_PROJECT_TIMEOUT_S)
+    except _aio.TimeoutError:
+        print(f'[start-project] timed out after {START_PROJECT_TIMEOUT_S}s — '
+              '有 MCP 服务器不回应；已取消本次启动')
+        return False
+    except _aio.CancelledError:
+        # 被 `_cancel_start_project()` 取消。这是操作者的动作，不是失败。
+        print('[start-project] cancelled')
+        return False
+
+
+def _cancel_start_project() -> bool:
+    """取消正在进行中的启动。返回是否真的取消了一个。
+
+    `stop-project` 调它。此前"取消启动"按钮只调 `_do_stop_project()` 去停卡片，
+    而挂住的那个启动协程**继续挂着**，标志位也不清 —— 按钮按下去什么也没发生。
+    """
+    task = _start_project_task
+    if task is None or task.done():
+        return False
+    task.cancel()
+    print('[start-project] cancel requested')
+    return True
 
 
 def payload_of(result) -> dict:
@@ -357,6 +409,17 @@ async def _do_start_project_impl():
 
     LOADING_POLL_S = 3
     LOADING_TIMEOUT_S = 900
+    # `info()` 是只读查询，本该是毫秒级。给它一个短上限，理由不是省时间，是**让
+    # 循环里的 deadline 真的生效**：
+    #
+    #     deadline = time.time() + LOADING_TIMEOUT_S
+    #     while time.time() < deadline:
+    #         await _asyncio.sleep(LOADING_POLL_S)
+    #         info = await mcp_call_tool(...)      # ← 这里挂住
+    #
+    # 那个 `while` 看起来有 15 分钟的超时保护，实际上没有：内层 await 不返回，
+    # 循环就永远不会再判一次条件。**循环里的 deadline 挡不住循环内部的挂起。**
+    INFO_TIMEOUT_S = 10
 
     async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
                                    info_args: dict) -> dict:
@@ -371,7 +434,7 @@ async def _do_start_project_impl():
         info = await mcp_call_tool(mcp_id, MCPCallRequest(
             tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
                                        **info_args},
-        ))
+        ), timeout_s=INFO_TIMEOUT_S)
         data = payload_of(info)
         topic_out = data.get('topic_out') or []
         if topic_out:
@@ -399,7 +462,7 @@ async def _do_start_project_impl():
                 info = await mcp_call_tool(mcp_id, MCPCallRequest(
                     tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
                                                **info_args},
-                ))
+                ), timeout_s=INFO_TIMEOUT_S)
             except Exception as error:
                 print(f'[start-project] {tool_name} info during load failed: {error}')
                 continue
@@ -715,10 +778,44 @@ async def _do_start_project_impl():
         # derived topic never resolved in a browser, empty.
         if not topic:
             topic = conn.get('fromTopic') or ''
+        from_card = next((c for c in cards if c.get('id') == from_card_id), None)
         if not topic:
-            from_card = next((c for c in cards if c.get('id') == from_card_id), None)
             topic = _port_topic((from_card or {}).get('topicOut') or [], port_idx)
+        # 最后一条：**设备此刻声称的** topic_out，从 MCP 注册表里按
+        # (mcpId, toolName) 取。放最后，因为前三条更贴近"操作者在画布上看到的那
+        # 条线"，而这一条是"设备现在说它往哪儿发"——两者不一致时应当以画布为准，
+        # 否则一次驱动改动会让一条画好的线悄悄指向别处。
+        #
+        # 但它必须存在，因为前三条在一种情况下**全部为空且都不是错的**：
+        #
+        #   * `resolved_topics` 只有已启动的卡片有 —— 而反馈环（vla → servo_eef
+        #     → vla）里，先启动的那张永远拿不到后启动那张的答案；
+        #   * `fromTopic` 与 `topicOut` 都是**浏览器**的快照，拍摄于画线/拖卡片
+        #     的那一刻。驱动后来补上了 `topic_out.topic`，快照里却没有。
+        #
+        # 真机实测 2026-09-21（G1）：`servo_eef` 补上 topic 之后，agent-core 的注册
+        # 表里已经是 `/ubuntu/servo_eef/state`，而画布快照仍是空的，于是启动失败并
+        # 报「连线缺少 topic: servo_eef → vla，请检查上游卡片是否能报出输出话题」
+        # —— 上游明明是对的，唯一新鲜且权威的那份数据根本没被查。
+        if not topic and from_card:
+            topic = _registry_port_topic(from_card, port_idx)
         return topic
+
+    def _registry_port_topic(from_card: dict, port_idx: int) -> str:
+        """源卡片对应的工具在 MCP 注册表里当前声明的 topic_out[port_idx]。"""
+        # 直接读 `config.main`，不走 `api.mcp_manage` —— 那是同一份数据，而少一个
+        # 跨模块依赖（注册表本来就存在 config 里，`_get_mcp_list` 只是它的读取器）。
+        mcp_id = from_card.get('mcpId') or ''
+        tool_name = from_card.get('toolName') or ''
+        if not mcp_id or not tool_name:
+            return ''
+        for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
+            if mcp.get('id') != mcp_id:
+                continue
+            for tool in mcp.get('tools') or []:
+                if isinstance(tool, dict) and tool.get('name') == tool_name:
+                    return _port_topic(tool.get('topic_out') or [], port_idx)
+        return ''
 
     def _resolve_input_topics(card_id: str) -> tuple[str, list, list]:
         """Resolve input_topic(s) for a card from its inbound connections.
@@ -785,7 +882,7 @@ async def _do_start_project_impl():
                 info = await mcp_call_tool(mcp_id, MCPCallRequest(
                     tool=tool_name,
                     arguments={'action': 'info', 'instance_id': target.get('id', '')},
-                ))
+                ), timeout_s=INFO_TIMEOUT_S)
                 # Answering without a descriptor and not answering at all are
                 # different facts, and only the second is a fault: most cards
                 # have never heard of motus.control/1, and a control link to
@@ -973,7 +1070,8 @@ async def _do_stop_project():
 
 @router.post('/start-project')
 async def api_start_project():
-    if _start_project_lock:
+    task = _start_project_task
+    if task is not None and not task.done():
         return fastapi.responses.JSONResponse(
             status_code=409,
             content={'ok': False, 'detail': '启动已在进行中，请稍候'}
@@ -989,8 +1087,11 @@ async def api_start_project():
 
 @router.post('/stop-project')
 async def api_stop_project():
+    # **先取消在飞的那次启动，再停卡片。** 顺序是有意的：反过来的话被停掉的卡片
+    # 会被那次仍在继续的启动重新拉起来，而操作者看到的是"停了又自己起来了"。
+    cancelled = _cancel_start_project()
     await _do_stop_project()
-    return {'ok': True}
+    return {'ok': True, 'cancelled_start': cancelled}
 
 
 

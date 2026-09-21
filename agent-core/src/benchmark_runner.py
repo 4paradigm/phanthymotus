@@ -139,32 +139,108 @@ def unsafe_cards(simulator_mcp_id: str | None = None) -> list[dict]:
 
 
 class SimulatorWorld:
-    """仿真器持有的世界：可重置、可记账，事实由 `sim_report` 给出（含轨迹）。"""
+    """仿真器持有的世界：可重置、可记账，事实由 `sim_report` 给出（含轨迹）。
+
+    **但不是只由 `sim_report` 给出。** 这里原先把 `sim_report` 当作唯一来源，理由是
+    「仿真器看得见世界」—— 对，可它只看得见**仿真器自己那几张卡**。画布上一张卡若不是
+    仿真器的（最常见的就是 perception 的 `tts`：它合成真实音频、发到 `/perception/tts`），
+    仿真世界里不会留下任何痕迹。症状是运行日志左边 agent 明明在 `tts.speak`，右边
+    「世界真的做了什么」那一列一句播报都没有，而两边都没有任何报错。
+
+    所以两路都开：仿真器的事实为底（轨迹占用、到达这些只有它算得出），agent-core 自己
+    记的那份补上仿真器看不见的部分。同一个动作两边都记时按 `action_id` 去重 —— 卡片返回
+    给 agent-core 的 `action_id` 就是世界给这个动作的 id，两边对得上。
+    """
 
     kind = 'simulator'
     resettable = True
 
     def __init__(self, mcp_id: str):
         self.mcp_id = mcp_id
+        self._recorder = None
+        # 记录器的 `t` 是「本次录制开始以来」，仿真器的 `t` 是「本场景开始以来」——
+        # 两个零点不是一回事。合并前把前者搬到后者的时钟上，见 `_align`。
+        self._t_offset = 0.0
 
     async def _call(self, tool: str, args: dict) -> dict:
         result = await mcp_client.call_tool_direct(self.mcp_id, tool, args)
         return result if isinstance(result, dict) else {'error': str(result)}
 
     async def reset(self, run: dict, seed: int) -> dict:
+        self._recorder = benchmark_facts.start()
         world = run.get('world') or {}
-        return await self._call(SCENARIO_TOOL, {
+        outcome = await self._call(SCENARIO_TOOL, {
             'action': 'reset', 'map': world.get('map', ''),
             'spawn': world.get('spawn') or {}, 'seed': seed, 'owner': OWNER})
+        await self._align()
+        return outcome
+
+    async def _align(self) -> None:
+        """把记录器的零点搬到仿真世界的**事件时钟**上。
+
+        两边都用「相对秒数」，但相对的**不是同一个起点**：仿真器的事件 `t` 数的是
+        它自己的进程时钟（一台跑了一个月的机器上就是三百多万秒），记录器数的是本次
+        录制开始以来。合并后一排序，记录器那些几秒的 `t` 全被顶到最前面，而运行详情
+        的右列拿最早那条事件当零点 —— 整列前移，看起来像机器人在被要求之前就开了口。
+
+        锚点用仿真器自己在重置时记下的 `scenario_load`：那一刻就是记录器的零点附近
+        （`start()` 紧挨着 `reset` 调用之前）。**不能用报告里的 `elapsed`** —— 它数的
+        是本场景秒数，和事件 `t` 在仿真器内部就不是一个基准，拿它算出来的 offset 约等于
+        0，于是这一列照样是错的，只是错得不那么显眼。
+
+        找不到锚点就不搬（offset 留 0）：宁可两列差十几秒，也不要搬一个瞎猜的量 ——
+        搬错了，「到了再讲」这类时序判定会拿错位的时间去比大小，而错位本身看不出来。
+        """
+        if self._recorder is None:
+            return
+        report = await self._call(REPORT_TOOL, {'what': 'report'})
+        events = report.get('events') if isinstance(report, dict) else None
+        if not events:
+            return
+        anchors = [e.get('t') for e in events if e.get('event') == 'scenario_load']
+        anchor = anchors[-1] if anchors else min(
+            (e.get('t') for e in events if e.get('t') is not None), default=None)
+        if anchor is None:
+            return
+        try:
+            self._t_offset = float(anchor)
+        except (TypeError, ValueError):
+            self._t_offset = 0.0
 
     async def release(self) -> None:
+        benchmark_facts.stop()
+        self._recorder = None
         await self._call(SCENARIO_TOOL, {'action': 'abort', 'owner': OWNER})
 
     async def note(self, text: str) -> None:
         await self._call(SCENARIO_TOOL, {'action': 'note', 'text': text})
 
     async def facts(self) -> dict:
-        return await self._call(REPORT_TOOL, {'what': 'report'})
+        report = await self._call(REPORT_TOOL, {'what': 'report'})
+        recorder = self._recorder or benchmark_facts.current()
+        if recorder is None or not isinstance(report, dict):
+            return report
+        return _merge_facts(report, recorder.facts(), self._t_offset)
+
+
+def _merge_facts(report: dict, mine: dict, t_offset: float = 0.0) -> dict:
+    """仿真器的事实为底，补上它看不见的那些。
+
+    **只合事件，不合 `acp_posts`。** 后者是 `exactly_one_terminal_post` 用来数
+    「同一个动作上报了几次」的，按 `action_id` 去重会把真的重复上报一起抹掉 —— 那正是
+    它要抓的东西。仿真器那份已经完整。
+    """
+    seen = {str(e.get('action_id')) for e in (report.get('events') or [])
+            if e.get('action_id')}
+    extra = [{**e, 't': round(float(e.get('t') or 0.0) + t_offset, 3)}
+             for e in (mine.get('events') or [])
+             if str(e.get('action_id') or '') not in seen]
+    if not extra:
+        return report
+    events = sorted((report.get('events') or []) + extra,
+                    key=lambda e: float(e.get('t') or 0.0))
+    return {**report, 'events': events,
+            'source': 'simulator+agent-core'}
 
 
 class RealWorld:
@@ -204,8 +280,11 @@ class CaseRun:
     """一个用例的 N 次重复。同一时刻只允许有一个。"""
 
     def __init__(self, case: dict, mcp_id: str | None, repeats: int, seed: int,
-                 run_id: str, environment: dict, world=None):
+                 run_id: str, environment: dict, world=None, case_id: str = ''):
         self.case = case
+        # 哪个用例在跑。面板据此把那张卡的「运行」换成「停止」，其余置灰 —— 刷新页面
+        # 之后也要对，所以它得从服务端来，不能只活在前端的一个变量里。
+        self.case_id = case_id
         self.mcp_id = mcp_id
         # `mcp_id` 为空就是真机：没有仿真器持有世界。
         self.world = world or (SimulatorWorld(mcp_id) if mcp_id
@@ -290,11 +369,34 @@ class CaseRun:
                                'observations': seen, 'judge': verdict},
                               error=verdict['error'])
 
+    def _session_id(self, live: bool = False) -> str:
+        """这次运行对应哪一段对话，必要时现补。
+
+        **开跑那一刻 agent 可能还没有会话** —— agent-core 刚重启、这一轮之前没人说过
+        话，`event.llm._session_id` 就是空的，而会话恰恰是被这次运行的指令创建出来的。
+        记成空之后再没人回头补，于是运行详情左栏永远是「这次运行的对话记录已经没有
+        了」，尽管右栏的世界事实一条不少 —— 看起来像 agent 什么都没做。
+
+        只在**这次运行还活着**的时候补：跑完的那条记录若补上「现在」的会话，等于把
+        一段无关的对话安到一次历史运行上，而它看起来完全正常。
+        """
+        stored = benchmark_store.get_run(self.run_id) or {}
+        known = str(stored.get('session_id') or '')
+        if known or not (live or self.state in ('running', 'starting')):
+            return known
+        try:
+            from api.benchmark import _current_session
+            found = _current_session()
+        except Exception:
+            return ''
+        if found:
+            benchmark_store.set_session(self.run_id, found)
+        return found
+
     def _agent_track_now(self, window: tuple) -> list:
         try:
             from api.benchmark import _agent_track
-            stored = benchmark_store.get_run(self.run_id) or {}
-            return _agent_track(stored.get('session_id', ''), window[0], window[1])
+            return _agent_track(self._session_id(), window[0], window[1])
         except Exception:
             return []
 
@@ -428,13 +530,16 @@ class CaseRun:
         try:
             from api.benchmark import _agent_track
             stored = benchmark_store.get_run(self.run_id) or {}
-            return _agent_track(stored.get('session_id', ''),
+            # `live=True`：定格发生在收尾那一刻，`state` 已经翻成 done/aborted，但
+            # 「现在的会话」仍然就是这次运行的那段。这里不补，一次从头到尾没调过
+            # `_agent_track_now` 的运行会把左栏永久定格成空。
+            return _agent_track(self._session_id(live=True),
                                 stored.get('started_at'), time.time())
         except Exception:
             return []
 
     def snapshot(self) -> dict:
-        return {'state': self.state, 'run_id': self.run_id,
+        return {'state': self.state, 'run_id': self.run_id, 'case_id': self.case_id,
                 'repeat': self.repeat_idx, 'repeats': self.repeats,
                 'cases': self.cases, 'error': self.error}
 
@@ -488,16 +593,41 @@ def _stdev(values: list) -> Optional[float]:
 # ── 单例 ──────────────────────────────────────────────────────────────────────
 
 _current: Optional[CaseRun] = None
+# 「有人已经占上了，但 CaseRun 还没造出来」。
+#
+# 没有这一格的话，`is_busy()` 检查和 `set_current()` 之间隔着一个 await（依赖检查，
+# 还可能走 MCP 网络），两个并发请求会**双双通过**，于是两次跑动同时往同一个 agent
+# 注入用户消息、同时重置世界。两份事实流交织在一起，而分数看起来只是「莫名其妙地低」。
+_claimed = False
 
 
 def current() -> Optional[CaseRun]:
     return _current
 
 
+def claim() -> bool:
+    """占位。检查与占位必须是同一步 —— 这就是这个函数存在的全部理由。
+
+    占上了要么 `set_current` 接管，要么 `release()` 还回去；中途抛异常而不还，
+    面板会一直说「已经有一次基准测试在跑」，而实际上什么都没跑。
+    """
+    global _claimed
+    if is_busy():
+        return False
+    _claimed = True
+    return True
+
+
+def release() -> None:
+    global _claimed
+    _claimed = False
+
+
 def set_current(run: Optional[CaseRun]) -> None:
-    global _current
+    global _current, _claimed
     _current = run
+    _claimed = False              # 占位交棒给真正的跑动
 
 
 def is_busy() -> bool:
-    return _current is not None and _current.state in ('starting', 'running')
+    return _claimed or (_current is not None and _current.state in ('starting', 'running'))

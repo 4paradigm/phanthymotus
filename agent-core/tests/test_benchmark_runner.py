@@ -24,6 +24,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'runner-test.db'))
 
+import benchmark_facts  # noqa: E402
 import benchmark_runner  # noqa: E402
 import benchmark_store  # noqa: E402
 import config  # noqa: E402
@@ -190,6 +191,51 @@ def test_without_a_simulator_every_actuator_needs_confirming(canvas, registry):
     moving = benchmark_runner.unsafe_cards(None)
 
     assert sorted(u['tool'] for u in moving) == ['controlled_spatial', 'whatever']
+
+
+# ── 同一时刻只许一次跑动 ──────────────────────────────────────────────────────
+
+def test_claiming_is_atomic_so_two_requests_cannot_both_win():
+    """**检查与占位必须是同一步。**
+
+    `/case/run` 在检查之后、真正接管之前有一个 await（依赖检查，还可能走 MCP 网络）。
+    先查后占的话，两个并发请求会双双通过 —— 两次跑动同时往同一个 agent 注入用户消息、
+    同时重置世界，两份事实流交织在一起，而分数看起来只是「莫名其妙地低」。
+    """
+    assert benchmark_runner.claim() is True
+    assert benchmark_runner.claim() is False       # 第二个请求拿不到
+    assert benchmark_runner.is_busy() is True
+
+    benchmark_runner.release()
+
+    assert benchmark_runner.is_busy() is False
+    assert benchmark_runner.claim() is True
+    benchmark_runner.release()
+
+
+def test_a_failed_start_gives_the_slot_back():
+    """占上了却没跑成而不还，面板会一直说「已经有一次基准测试在跑」，
+    而实际上什么都没跑 —— 只能重启 agent-core 才能再跑。"""
+    import asyncio
+
+    from api import benchmark as bm_api
+
+    with pytest.raises(fastapi.HTTPException):
+        asyncio.run(bm_api.run_case(bm_api.CaseRunRequest(case_id='nope')))
+
+    assert benchmark_runner.is_busy() is False
+
+
+def test_handing_over_to_a_real_run_clears_the_claim():
+    benchmark_runner.claim()
+    run_id = benchmark_store.create_run('t')
+    run = benchmark_runner.CaseRun(CASE, 'mcp-sim', 1, 0, run_id, {}, case_id='c1')
+
+    benchmark_runner.set_current(run)
+
+    assert benchmark_runner.is_busy() is True      # 现在忙的是真正的跑动
+    assert benchmark_runner.current().snapshot()['case_id'] == 'c1'
+    benchmark_runner.set_current(None)
 
 
 # ── 开跑前的确认 ──────────────────────────────────────────────────────────────
@@ -521,3 +567,142 @@ def test_the_gate_announces_itself(capsys):
     assert '智能控制未启动' in first and first.count('智能控制未启动') == 1  # 只说一次
     assert 'dds:/camera/objects' in first
     assert '丢弃 2 条' in second
+
+
+# ── 仿真器看不见非仿真的卡 ───────────────────────────────────────────────────
+
+def test_simulator_world_merges_what_the_simulator_cannot_see():
+    """**`sim_report` 只看得见仿真器自己那几张卡。**
+
+    画布上绑的若是 perception 的 `tts`（它合成真实音频、发到 `/perception/tts`），
+    仿真世界里不会留下任何痕迹 —— 运行日志左边 agent 明明在 `tts.speak`，右边
+    「世界真的做了什么」一句播报都没有，两边都没有报错。Orin6 上就是这么现形的。
+    """
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'nav_start', 't': 1.0, 'action_id': 'a1'},
+                    {'event': 'arrive', 't': 9.0, 'action_id': 'a1'}],
+         'acp_posts': [{'action_id': 'a1'}], 'trail_occupied': 0},
+        {'events': [{'event': 'speak_start', 't': 4.0, 'action_id': 's1'},
+                    {'event': 'speak_end', 't': 7.0, 'action_id': 's1'}],
+         'acp_posts': [{'action_id': 's1'}]})
+
+    assert [e['event'] for e in merged['events']] == [
+        'nav_start', 'speak_start', 'speak_end', 'arrive']
+    assert merged['trail_occupied'] == 0          # 只有仿真器算得出的量原样留着
+
+
+def test_an_action_both_sides_saw_is_not_counted_twice():
+    """仿真器的卡两边都会记：卡片返回给 agent-core 的 `action_id` 就是世界给这个动作
+    的 id。不去重的话导航会被数成两次，而时序和并行度全是按这些事件算的。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'nav_start', 't': 1.0, 'action_id': 'a1'}],
+         'acp_posts': []},
+        {'events': [{'event': 'nav_start', 't': 1.1, 'action_id': 'a1'}],
+         'acp_posts': []})
+
+    assert len(merged['events']) == 1
+
+
+def test_acp_posts_are_never_merged():
+    """`exactly_one_terminal_post` 数的就是「同一个动作上报了几次」。把两侧的 posts
+    按 action_id 去重，会把它要抓的那种真重复一起抹掉。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [], 'acp_posts': [{'action_id': 'a1'}, {'action_id': 'a1'}]},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': [{'action_id': 's1'}]})
+
+    assert merged['acp_posts'] == [{'action_id': 'a1'}, {'action_id': 'a1'}]
+
+
+def test_the_two_fact_clocks_are_put_on_one_base():
+    """**两边都用「相对秒数」，但相对的不是同一个起点。**
+
+    仿真器数的是本场景开始以来，记录器数的是本次录制开始以来，而场景通常在这次运行
+    之前就已经加载了。差十几秒就够了：合并后一排序，一条 `speak_start` 被顶到最前面，
+    而运行详情的右列拿最早那条事件当零点 —— 整列前移，看起来像机器人在被要求之前就
+    开了口。Orin6 上那次「开讲出现在 tts 调用之前」就是这个。
+    """
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'scenario_load', 't': 13.0, 'action_id': 'x'}],
+         'acp_posts': []},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': []},
+        t_offset=13.2)
+
+    assert [(e['event'], e['t']) for e in merged['events']] == [
+        ('scenario_load', 13.0), ('speak_start', 14.2)]
+
+
+def test_an_unalignable_world_shifts_nothing():
+    """对不齐就不搬。宁可两列差十几秒，也不要搬一个瞎猜的量 —— 搬错了，时序判定
+    （「到了再讲」）会拿错位的时间去比大小，而错位是看不出来的。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'scenario_load', 't': 5.0, 'action_id': 'x'}],
+         'acp_posts': []},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': []})
+
+    assert [e['t'] for e in merged['events']] == [1.0, 5.0]
+
+
+def test_alignment_anchors_on_scenario_load_not_on_elapsed():
+    """**`elapsed` 和事件 `t` 在仿真器内部就不是一个基准。**
+
+    前者数的是本场景秒数，后者数的是仿真器的进程时钟 —— 一台跑了一个月的机器上是
+    三百多万秒。拿 `elapsed` 算出来的 offset 约等于 0，于是这一列照样错，只是错得
+    不那么显眼。锚点必须取仿真器自己在重置时记下的 `scenario_load`。
+    """
+    import asyncio
+
+    world = benchmark_runner.SimulatorWorld('mcp-x')
+    world._recorder = benchmark_facts.Recorder()
+    calls = []
+
+    async def _fake(tool, args):
+        calls.append(tool)
+        return {'elapsed': 4.2,          # 本场景秒数 —— 用它就错了
+                'events': [{'event': 'scenario_load', 't': 3377718.5},
+                           {'event': 'led', 't': 3377719.0}]}
+
+    world._call = _fake
+    asyncio.run(world._align())
+
+    assert world._t_offset == 3377718.5
+
+
+def test_a_run_started_before_any_conversation_backfills_its_session():
+    """**开跑那一刻 agent 可能还没有会话。**
+
+    agent-core 刚重启、这一轮之前没人说过话，`event.llm._session_id` 就是空的 ——
+    而会话恰恰是被这次运行的指令创建出来的。记成空之后再没人回头补，于是运行详情
+    左栏永远是「这次运行的对话记录已经没有了」，尽管右栏的世界事实一条不少，看起来
+    像 agent 什么都没做。Orin6 上就是这么现形的。
+    """
+    run_id = benchmark_store.create_run('没有会话就开跑')
+    run = benchmark_runner.CaseRun({}, None, 1, 0, run_id, {})
+    run.state = 'running'
+
+    import api.benchmark as api_benchmark
+    original, api_benchmark._current_session = api_benchmark._current_session, lambda: 'sess-1'
+    try:
+        assert run._session_id() == 'sess-1'
+        assert (benchmark_store.get_run(run_id) or {}).get('session_id') == 'sess-1'
+    finally:
+        api_benchmark._current_session = original
+        benchmark_store.delete_run(run_id)
+
+
+def test_a_finished_run_never_adopts_whatever_session_is_current():
+    """跑完的那条若补上「现在」的会话，等于把一段无关的对话安到一次历史运行上 ——
+    而它看起来完全正常：有轮次、有工具调用、时间也对得上窗口。"""
+    run_id = benchmark_store.create_run('跑完的')
+    run = benchmark_runner.CaseRun({}, None, 1, 0, run_id, {})
+    run.state = 'done'
+
+    import api.benchmark as api_benchmark
+    original, api_benchmark._current_session = api_benchmark._current_session, lambda: 'sess-9'
+    try:
+        assert run._session_id() == ''
+    finally:
+        api_benchmark._current_session = original
+        benchmark_store.delete_run(run_id)

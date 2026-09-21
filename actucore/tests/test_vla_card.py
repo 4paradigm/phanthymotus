@@ -31,7 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from plugins.vla import VLAPlugin  # noqa: E402
-from plugins.vla.plugin import Observation  # noqa: E402
+from plugins.vla.plugin import FORMATS, Observation  # noqa: E402
 from plugins.vla import negotiate  # noqa: E402
 from plugins.vla.message import build as build_message  # noqa: E402
 from plugins.vla.providers import discover, REQUIRED  # noqa: E402
@@ -747,6 +747,35 @@ def _stub_ros_messages():
     """
     import types as _types
 
+    # `_sensor_qos()` 要 rclpy.qos。真的装了就用真的 —— 那样这条断言在有 ROS 的
+    # 机器上比的是真枚举，而不是一个自己造的、怎么写都成立的替身。
+    try:
+        import rclpy.qos  # noqa: F401
+    except ImportError:
+        qos = _types.ModuleType("rclpy.qos")
+
+        class _Enum:
+            def __init__(self, name):
+                self.name = name
+
+            def __repr__(self):
+                return self.name
+
+        qos.ReliabilityPolicy = _types.SimpleNamespace(
+            BEST_EFFORT=_Enum("BEST_EFFORT"), RELIABLE=_Enum("RELIABLE"))
+        qos.HistoryPolicy = _types.SimpleNamespace(KEEP_LAST=_Enum("KEEP_LAST"))
+        qos.DurabilityPolicy = _types.SimpleNamespace(VOLATILE=_Enum("VOLATILE"))
+
+        class _Profile:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        qos.QoSProfile = _Profile
+        package = _types.ModuleType("rclpy")
+        package.qos = qos
+        sys.modules.setdefault("rclpy", package)
+        sys.modules["rclpy.qos"] = qos
+
     for name, members in (("sensor_msgs", ("CompressedImage", "Image")),
                           ("std_msgs", ("String",))):
         package = _types.ModuleType(name)
@@ -769,7 +798,9 @@ class _Graph:
         return list(self._topics.items())
 
     def create_subscription(self, message_type, topic, callback, qos):
-        self.subscribed.append((message_type.__name__, topic, callback))
+        # **qos 也要记下来。** 它此前被丢掉，而那正是订阅端 QoS 错了却没被任何
+        # 用例抓到的原因：这个假件把除了出问题的那一项之外的一切都记了下来。
+        self.subscribed.append((message_type.__name__, topic, callback, qos))
 
 
 def _caps(**over):
@@ -806,6 +837,91 @@ def test_roles_come_from_the_message_type_not_the_topic_name():
     assert problem == ""
     assert binding["state"] == "/st"
     assert list(binding["images"].values()) == ["/cam"]
+
+
+def test_observations_are_subscribed_best_effort():
+    """**这条是一次真机失败换来的。**
+
+    这个项目里每一个传感器发布者都是 BEST_EFFORT，而 rclpy 的默认 profile 是
+    RELIABLE —— 一个 RELIABLE 的订阅者收不到 BEST_EFFORT 的发布者，DDS 直接不
+    匹配。此前 `_bind_inputs` 传的是 `1`（展开成默认 profile），于是 vla_cloud 与
+    smolvla 在**任何一台真机上都拿不到观测**：卡片报 running、error 空、一条指令
+    都不发，而唯一的线索是 ROS stderr 里一行 "incompatible QoS"。
+
+    同一个文件里的 `_open_publisher` 一直是显式 BEST_EFFORT，还写了注释 —— 两边
+    不对称了很久没人发现，因为唯一能暴露它的地方（真 DDS 匹配）在用例里是假的。
+    """
+    from rclpy.qos import ReliabilityPolicy
+
+    _stub_ros_messages()
+    card = make_card()
+    node = _Graph({"/cam": ["sensor_msgs/msg/CompressedImage"],
+                   "/st": ["std_msgs/msg/String"]})
+
+    card._bind_inputs(node, ["/cam", "/st"], _caps(n_cameras=1, needs_state=True))
+
+    assert len(node.subscribed) == 2, "相机和状态都要订上"
+    for _type, topic, _cb, qos in node.subscribed:
+        assert qos.reliability == ReliabilityPolicy.BEST_EFFORT, topic
+        assert qos.depth == 1, f"{topic}：排队的观测就是过期的观测"
+
+
+def test_a_subscription_that_never_delivers_is_reported():
+    """订阅建立成功而一条消息都不来，是 DDS 里的常态，不是异常。
+
+    `_bind_inputs` 只能核对「话题连上了没」，核对不了「消息收到了没」。此前这三种
+    情况——QoS 不兼容、发布者没在发、域不同——表现完全一样：running / error 空 /
+    published 0。现在持续缺失会把**缺的是什么**写进 error。
+    """
+    card = make_card()
+    card._running = True
+    card._capabilities = _caps(n_cameras=2, needs_state=True)
+    card._publisher = object()
+
+    card._report_starvation(card._capabilities)
+    assert card._info()["error"] == "", "刚启动就报错会把所有正常启动也误伤"
+
+    card._starved_since -= card.STARVED_AFTER_S + 1
+    card._report_starvation(card._capabilities)
+
+    error = card._info()["error"]
+    assert "图像 0/2 路" in error and "本体状态" in error
+    assert "QoS" in error, "要说出最常见的那个原因，否则只是换个地方说「没收到」"
+
+
+def test_the_published_format_is_the_one_drivers_declare():
+    """**画布按严格字符串相等匹配端口。** 差一个字就连不上，而且是静默的。
+
+    真机上的表现：`vla` 的输出口怎么都拖不到 `servo_eef` 的输入口，没有提示、
+    没有日志。原因是这边发 `control/waypoint`、驱动收 `control/eef`。
+
+    `control/waypoint` 还不只是"另一个名字"——它在 agent-core 的格式表里是**导航**
+    语义（navigate_to / goto）。用它会让一张导航卡片和一张手臂卡片在画布上可以
+    互换着连。
+    """
+    assert FORMATS["eef_pose"] == "control/eef"
+    assert "waypoint" not in FORMATS.values(), "waypoint 是导航，不是末端位姿"
+
+
+def test_the_out_port_can_be_declared_before_anything_is_wired():
+    """**连线发生在 start 之前，而 descriptor 要 start 之后才有。**
+
+    不给这条路的话，末端位姿的驱动卡片永远连不上：要拿到 descriptor 得先连，要连
+    得先有 descriptor。而画布是严格字符串相等匹配，连不上时**静默** —— 拖放没反
+    应，没提示也没日志。真机上就卡在这里。
+    """
+    assert make_card()._format() == "control/joint", "默认必须是今天的行为"
+
+    eef = make_card(action_space="eef_pose")
+    assert eef._format() == "control/eef"
+    assert eef.get_tools()[0]["topic_out"][0]["format"] == "control/eef"
+
+
+def test_the_negotiated_descriptor_wins_over_the_configured_guess():
+    """配置只是连线时的占位。真值一到就该换掉它，否则填错会一直挂在那儿。"""
+    card = make_card(action_space="eef_pose")
+    card._descriptor = {"mode": "joint_position"}
+    assert card._format() == "control/joint"
 
 
 def test_a_model_that_needs_a_camera_refuses_to_start_without_one():
@@ -1197,6 +1313,68 @@ def test_a_driver_group_without_a_mode_inherits_the_top_level_one():
         _mixed_descriptor(inheriting),
     )
     assert problems == []
+
+
+# ── advisory vs optional：丢维要双方都同意过 ────────────────────────────────
+#
+# 由来是一次真机实测：G1 的 1 自由度腰上，`unifolm-vla-g1` 的 25 步动作块一步都
+# 没通过，全数停在 `waist_roll outside [-0.02, 0.02]` —— 那个限位没错（腰确实动不
+# 了），但它把整条指令拒掉了，连同两条本可以执行的手臂。
+#
+# 解法不是放宽限位（那会让 IK 按一个机器人到不了的躯干姿态解手臂，每拍差同样一点
+# 而没有一处报错），而是两侧各声明一半：驱动说「我收下但不执行」（advisory），
+# 模型说「任务不要求执行」（optional）。**这个函数是它们相遇的地方**，也是让
+# 「静默丢掉几维」在这套协议里不可能发生的那道门。
+
+
+def _advisory_waist_descriptor():
+    groups = [dict(g) for g in MIXED_GROUPS]
+    groups[-1]["advisory"] = True
+    return _mixed_descriptor(groups)
+
+
+def test_a_dropped_segment_the_model_requires_is_refused():
+    """驱动不执行，而模型认为必须执行 —— 这不是可以两边各让一步的事。"""
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _advisory_waist_descriptor(),
+    )
+    assert problems
+    assert any("advisory" in p and "optional" in p for p in problems)
+
+
+def test_a_dropped_segment_the_model_allows_is_accepted():
+    """许可到位就放行。这是 unifolm-vla-g1 在 1 自由度腰 G1 上真正走的那条路。"""
+    allowed = [dict(g) for g in MIXED_GROUPS]
+    allowed[-1]["optional"] = True
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=allowed),
+        _advisory_waist_descriptor(),
+    ) == []
+
+
+def test_permission_alone_changes_nothing():
+    """模型说可丢、驱动说会执行 —— 那就执行，没有分歧。
+
+    反过来理解这个字段（「模型说可丢，所以别执行了」）会让一台**真能弯腰**的
+    29dof G1 从此不再弯腰，而没有任何一处报错。
+    """
+    allowed = [dict(g) for g in MIXED_GROUPS]
+    allowed[-1]["optional"] = True
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=allowed),
+        _mixed_descriptor(),
+    ) == []
+
+
+def test_neither_side_declaring_anything_is_todays_every_model():
+    """两个字段都缺省 false，所以这条检查对今天每一对声明都是透明的。"""
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _mixed_descriptor(),
+    ) == []
 
 
 def test_a_single_space_model_is_not_forced_to_declare_segments():

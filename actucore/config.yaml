@@ -23,6 +23,12 @@ plugins:
     #   smolvla    LeRobot SmolVLA，本机推理（只有 jp6.1 的镜像有）
     #   vla_cloud  任何跑在别处的模型，只配 endpoint + key + model
     provider: mock
+    # 输出口在**连线时**长什么样。画布按严格字符串相等匹配端口，而连线发生在
+    # start 之前 —— 那时还没有 descriptor，所以这个空间只能由配置给出。
+    #   joint_position → control/joint   （servo 那类关节卡片）
+    #   eef_pose       → control/eef     （servo_eef 那类末端位姿卡片）
+    # 协商之后以下游 descriptor 的 mode 为准；填错会在协商处被响亮拒绝，不会静默。
+    action_space: joint_position
     topic: /actucore/vla/cmd
     # 留空则取 min(模型 control_hz, 下游 expected_hz)，再被下游 max_hz 夹住。
     rate_hz: null

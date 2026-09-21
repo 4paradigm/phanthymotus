@@ -21,6 +21,8 @@
 
 ## 验证与部署结果
 
+- 最新 head 审查先返回不完整的 provider-key 评论，澄清单份 Key 手动切换为用户明确选择后重审又耗尽工具预算；均不算通过。再次申请时发现上游 main 已更新且冲突，合入 `0922d699`：保留上游任务句柄取消/超时与 topic 回退，同时保留 Jev lifecycle epoch；两组新增测试都保留。新增 timeout_s 透传到本 PR 的测试包装器，首轮已复现遗漏导致的失败；不改变上游功能或重新部署。
+- 合并后 Core 全量 1411 passed、1 skipped（缺 lark_oapi）、10 subtests passed，37.30 秒；前端 Node 96 passed，diff 检查通过。复核操作文档启动/停止失效及运行时同步说明仍符合当前实现，README 入口未变，无需修改。推送合并后的新 head 后重新申请完整 Bot。
 - Bot [审查意见](https://github.com/4paradigm/phanthymotus/pull/254#issuecomment-5762705548) 的外部 spans / 内部 _perf_spans 非列表导致 collector 退出问题均已先测试复现，再统一规范化并过滤非字典项；畸形外部 spans 视为缺失，可回退已有时间戳推导。覆盖 Jev 开/关、坏事件后继续接收、原 ASR/Jev spans 保留和两个拼接分支。补明真实 API 探针付费且仅显式运行，不进自动测试发现。
 - 此轮修复本地 Python 3.13.0 全量 1393 passed、1 skipped（缺 lark_oapi）、10 subtests passed，35.41 秒。修改仅容错与测试说明，README/操作接口无需变化；未重新部署，继续请求最新 head Bot。
 - PR 等待审查期间自查发现 Solution 实例字段校验遗漏隐藏旧阈值，补全 `CONFIG_KEYS` 一致性；先扩展现有测试到全部配置键并复现失败，再修复入口，保持“Jev 仅共享配置”的契约。此修复不改变实机路由策略，不再次部署。
