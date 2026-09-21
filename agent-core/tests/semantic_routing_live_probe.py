@@ -16,9 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import semantic_routing as routing
 
 CASES = (
-    ('other_named', '小李，我想到一个问题。', False),
-    ('other_homophone', '晓李，你中午吃什么？', False),
-    ('other_unknown_name', '小张，我想到一个问题。', False),
+    # Recall-first policy: name-only ambiguity is forwarded, not a proven
+    # robot addressee. Do not report these as correctly filtered third parties.
+    ('ambiguous_name', '小李，我想到一个问题。', True),
+    ('ambiguous_homophone', '晓李，你中午吃什么？', True),
+    ('ambiguous_unknown_name', '小张，我想到一个问题。', True),
     ('other_explicit', '我在跟旁边的人说话，不是在问机器人。', False),
     ('echo', '我能介绍展厅的机器人，还可以帮你拍照。', False),
     ('echo_asr', '我能介绍展听的机器仁，还可以帮你拍照。', False),
@@ -27,6 +29,8 @@ CASES = (
     ('contact_other', '小范，帮我联系小李。', True),
     ('stop', '停一下，先别讲了。', True),
     ('mixed', '你刚说可以介绍展厅的机器人，先别讲了。', True),
+    ('continuation', '那你可以带我看看这里吗？', True),
+    ('hearing_complaint', '你怎么一直没有回应呀？', True),
 )
 
 

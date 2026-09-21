@@ -35,13 +35,10 @@ class MemoryConfig(dict):
         return removed
 
 
-def response(mode='steer', addressed=0.99, confidence=0.99, audience='human_to_robot'):
+def response(mode='steer', confidence=0.99):
     return {'model': 'jev-test', 'answers': {
-        'audience': {'type': 'choice', 'choice': audience, 'confidence': 0.99,
-                     'probabilities': {k: float(k == audience) for k in routing.AUDIENCES}},
-        'addressed': {'type': 'noul', 'noul': addressed},
         'route': {'type': 'choice', 'choice': mode, 'confidence': confidence,
-                  'probabilities': {k: float(k == mode) for k in (*routing.MODES, 'uncertain')}}}}
+                  'probabilities': {k: float(k == mode) for k in routing.DECISIONS}}}}
 
 
 class RoutingTest(unittest.IsolatedAsyncioTestCase):
@@ -163,23 +160,22 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(event_bus._queue.qsize(), 1)
             self.assertTrue(routing._diagnostics)
 
-    async def test_other_addressee_and_echo_cannot_steer_even_if_addressed_high(self):
+    async def test_ignore_does_not_enter_context_or_steering(self):
         collector._busy = True
-        for audience in ('human_to_other', 'robot_echo', 'uncertain'):
-            self.api.return_value = response('steer', addressed=0.99, audience=audience)
-            await self.send(True, '小李，我想到了一个问题')
+        for text in ('小李，我想到了一个问题', '我可以帮你拍照'):
+            self.api.return_value = response('ignore')
+            await self.send(True, text)
             self.assertTrue(event_bus._queue.empty())
             self.assertFalse(event_bus.recent())
             self.assertTrue(collector._steering_queue.empty())
-            self.assertTrue(any(d['reason'] == audience and d.get('actual') == 'reject'
+            self.assertTrue(any(d['reason'] == 'ignore' and d.get('actual') == 'reject'
                                 for d in routing._diagnostics))
 
-    async def test_audience_missing_malformed_or_uncertain_fails_closed(self):
-        for value in (None, {}, {'type': 'choice', 'choice': 'human_to_robot'},
-                      {**response()['answers']['audience'], 'confidence': 0.1},
-                      {**response()['answers']['audience'], 'confidence': float('nan')}):
+    async def test_route_missing_or_malformed_fails_closed_for_voice(self):
+        for value in (None, {}, {'type': 'choice', 'choice': 'steer'},
+                      {**response()['answers']['route'], 'confidence': float('nan')}):
             self.api.return_value = response()
-            self.api.return_value['answers']['audience'] = value
+            self.api.return_value['answers']['route'] = value
             await self.send(True)
             self.assertTrue(event_bus._queue.empty())
 
@@ -259,7 +255,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(event_bus.recent()), 1)
 
     async def test_voice_rejected_before_all_context(self):
-        self.api.return_value = response(addressed=0.1)
+        self.api.return_value = response('ignore')
         await self.send()
         self.assertTrue(event_bus._queue.empty())
         self.assertEqual(event_bus.recent(), [])
@@ -323,8 +319,8 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev['payload']['duration_ms'], 1000)
         self.assertEqual(ev['_semantic_route']['mode'], 'steer')
 
-    async def test_text_not_subject_to_addressed(self):
-        self.api.return_value = response('interrupt', addressed=0)
+    async def test_text_receives_single_route(self):
+        self.api.return_value = response('interrupt')
         await self.send(False, '取消当前任务')
         self.assertFalse(self.api.call_args.args[1])
         ev = await event_bus.dequeue()
@@ -339,24 +335,93 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             collector.set_interrupt_mode(mode)
             self.assertEqual(routing.consume_mode(ev), mode)
 
-    async def test_invalid_route_but_admitted_voice_falls_back(self):
+    async def test_single_choice_has_no_confidence_or_legacy_threshold_gate(self):
+        self.assertEqual(set(routing.QUESTIONS), {'route'})
+        self.assertEqual(set(routing.QUESTIONS['route']['criteria']), set(routing.DECISIONS))
+        self.assertNotIn('jev_addressed_threshold', routing.SCHEMA)
+        self.assertNotIn('jev_route_threshold', routing.SCHEMA)
+        cfg = {**routing.DEFAULTS, 'jev_addressed_threshold': 1, 'jev_route_threshold': 1}
+        for mode in routing.DECISIONS:
+            result = routing.parse_result(response(mode, confidence=0.01), True, cfg)
+            self.assertEqual(result[0], mode != 'ignore')
+            self.assertEqual(result[1], mode if mode in routing.MODES else None)
+        self.api.return_value = response('uncertain', confidence=0.01)
+        await self.send(True)
+        self.assertIsNone((await event_bus.dequeue())['_semantic_route']['mode'])
+
+    async def test_text_ignore_falls_back_without_losing_message(self):
+        self.api.return_value = response('ignore')
+        await self.send(False)
+        self.assertIsNone((await event_bus.dequeue())['_semantic_route']['mode'])
+
+    async def test_invalid_route_text_falls_back(self):
         self.api.return_value['answers']['route'] = {'type': 'choice'}
-        await self.send()
+        await self.send(False)
         ev = await event_bus.dequeue()
         self.assertIsNone(ev['_semantic_route']['mode'])
 
-    async def test_invalid_addressed_rejects(self):
+    async def test_invalid_confidence_rejects(self):
         for val in (True, float('nan'), 2, '0.9'):
-            self.api.return_value = response(addressed=val)
+            self.api.return_value = response(confidence=val)
             await self.send()
             self.assertTrue(event_bus._queue.empty())
 
     async def test_api_failure_voice_reject_text_fallback(self):
-        self.api.side_effect = TimeoutError()
+        self.api.side_effect = OSError('provider unavailable')
         await self.send()
         self.assertTrue(event_bus._queue.empty())
         await self.send(False)
         self.assertEqual(event_bus._queue.qsize(), 1)
+
+    async def test_timeout_uses_live_default_for_voice_and_text(self):
+        self.api.side_effect = TimeoutError()
+        for voice in (True, False):
+            await self.send(voice)
+            ev = await event_bus.dequeue()
+            self.assertIsNone(ev['_semantic_route']['mode'])
+            self.assertIsNone(ev['_semantic_route']['version'])
+            collector._busy = True
+            for mode in routing.MODES:
+                collector.set_interrupt_mode(mode)
+                self.assertEqual(routing.consume_mode(ev), mode)
+            self.assertTrue(event_bus._queue.empty())
+        self.assertFalse(any(d.get('actual') == 'reject' for d in routing._diagnostics))
+
+    async def test_timeout_does_not_cross_stop_or_generation_change(self):
+        for stop in (True, False):
+            self.cfg['core']['project_running'] = True
+            async def timeout(*args):
+                if stop:
+                    self.cfg['core']['project_running'] = False
+                else:
+                    routing._generation += 1
+                raise TimeoutError()
+            self.api.side_effect = timeout
+            await self.send()
+            self.assertTrue(event_bus._queue.empty())
+
+    async def test_preparation_timeout_defaults_without_api(self):
+        self.cfg['semantic_routing']['jev_timeout_s'] = 0.01
+        def slow_snapshot(*args):
+            time.sleep(0.02)
+            return self.snapshot()
+        with patch.object(routing, 'runtime_snapshot', side_effect=slow_snapshot):
+            await self.send()
+        self.api.assert_not_called()
+        self.assertIsNone((await event_bus.dequeue())['_semantic_route']['mode'])
+
+    async def test_late_result_cannot_override_timeout_default(self):
+        self.cfg['semantic_routing']['jev_timeout_s'] = 0.01
+        async def late(*args):
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                return response('interrupt')
+        self.api.side_effect = late
+        await self.send()
+        ev = await event_bus.dequeue()
+        self.assertIsNone(ev['_semantic_route']['mode'])
+        self.assertTrue(event_bus._queue.empty())
 
     async def test_missing_identity_voice_reject_text_fallback(self):
         self.identity.unlink()
@@ -428,7 +493,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.version = ('different', 1)
         self.assertEqual(routing.consume_mode(ev), 'steer')
 
-    async def test_retry_shares_absolute_budget_and_expired_voice_is_rejected(self):
+    async def test_retry_shares_absolute_budget_and_timeout_defaults(self):
         for voice in (False, True):
             with self.subTest(voice=voice):
                 self.cfg['semantic_routing']['jev_timeout_s'] = 0.2
@@ -451,9 +516,8 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(budgets[1], 0.1)
                 self.assertTrue(cancelled.is_set())
                 self.assertEqual(routing.settings()['jev_timeout_s'], 0.2)
-                self.assertEqual(event_bus._queue.qsize(), 0 if voice else 1)
-                if not voice:
-                    self.assertIsNone((await event_bus.dequeue())['_semantic_route']['mode'])
+                self.assertEqual(event_bus._queue.qsize(), 1)
+                self.assertIsNone((await event_bus.dequeue())['_semantic_route']['mode'])
 
     async def test_failed_rejudge_does_not_reuse_old_voice_acceptance(self):
         calls = 0
@@ -476,8 +540,19 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                      'text': 'expired while queued', 'ts': time.time(), 'payload': {}}
             await routing._judge(event, kind, time.monotonic() - 0.2)
         self.api.assert_not_called()
-        self.assertEqual(event_bus._queue.qsize(), 1)
+        self.assertEqual(event_bus._queue.qsize(), 2)
+        self.assertEqual((await event_bus.dequeue())['source'], 'asr')
         self.assertEqual((await event_bus.dequeue())['source'], 'message')
+
+    async def test_expired_queued_echo_still_rejected(self):
+        ev = {'source': 'asr', 'text': '我能介绍展厅的机器人',
+              'ts': time.time(), 'payload': {}}
+        with patch.object(routing, 'recent_robot_speech',
+                          return_value=[{'text': ev['text']}]):
+            await routing._judge(ev, 'voice', time.monotonic() - 6)
+        self.api.assert_not_called()
+        self.assertTrue(event_bus._queue.empty())
+        self.assertEqual(routing._diagnostics[-1]['reason'], 'robot_echo')
 
     async def test_cancellation_after_real_commit_does_not_duplicate_fallback(self):
         original = event_bus.enqueue_accepted
@@ -575,7 +650,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.api.assert_not_called()
 
     async def test_external_route_envelope_cannot_bypass(self):
-        self.api.return_value = response(addressed=0)
+        self.api.return_value = response('ignore')
         await event_bus.enqueue('asr', '旁人聊天', {'_semantic_route': {'mode': 'interrupt'}, 'approved': True})
         await routing._worker
         self.assertTrue(event_bus._queue.empty())
@@ -586,6 +661,23 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         for mode in routing.MODES:
             self.api.return_value = response(mode)
             await self.send(False, mode)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            if mode == 'steer':
+                self.assertEqual(collector._steering_queue.qsize(), 1)
+                self.assertTrue(collector._reconsider_event.is_set())
+            elif mode == 'interrupt':
+                self.assertTrue(collector._cancel_event.is_set())
+            else:
+                self.assertEqual(len(collector._priority_pending), 2)
+
+    async def test_timeout_voice_reaches_real_collector_default_modes(self):
+        collector._busy = True
+        self.consumer = asyncio.create_task(collector._drain_loop())
+        self.api.side_effect = TimeoutError()
+        for mode in routing.MODES:
+            collector.set_interrupt_mode(mode)
+            await self.send(True, mode)
             for _ in range(5):
                 await asyncio.sleep(0)
             if mode == 'steer':
@@ -1060,7 +1152,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event_bus._queue.empty())
 
     async def test_custom_asr_contract_cannot_bypass_admission(self):
-        self.api.return_value = response(addressed=0.01)
+        self.api.return_value = response('ignore')
         await event_bus.enqueue('mcp:custom', json.dumps({'text': '旁人聊天',
                                                         'audio_duration_ms': 1000, 'asr_complete_ts': time.time()}))
         await routing._worker

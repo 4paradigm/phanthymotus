@@ -12,8 +12,8 @@
 ## 实现与接口
 
 1. event_bus 正式入队前异步 admission；拒绝的语音不进入 recent、collector ring 或主 Loop。
-2. 独立队列最多 8 条，单 worker；默认 2 秒总判断预算（最多 5 秒），从收到候选开始，排队与重判共享唯一截止时间。语音无法确认或过期则拒绝；非语音失败回退原链路，至多交付一次。
-3. 一次 Jev 请求：语音 addressed Noul + 条件 route Choice；文字只 route。实验阈值均 0.5，模型 jev-latest，记录实际版本。
+2. 独立队列最多 8 条，单 worker；默认 2 秒总判断预算（最多 5 秒），从收到候选开始，排队与重判共享唯一截止时间。语音模型拒绝或非超时失败仍拒绝；请求超时及预算耗尽时语音和文字均回退当前默认模式，至多交付一次。此行为覆盖下方历史版本的过期拒绝策略，详见 [超时回退计划](jev-timeout-default-routing.md)。
+3. 当前采用单个 route Choice（ignore / steer / interrupt / followup / uncertain），移除 addressed/audience 多重门槛，旧阈值仅兼容存储；称呼歧义放行，召回优先。详见 [单次判断计划](jev-single-choice-routing.md)。模型 jev-latest，记录实际版本。
 4. collector 消费内部事件级路由，不修改全局模式；session/turn/身份/配置变化使旧结果失效，有限重判，不能中断新的 turn。
 5. Canvas 配置保存前验证；开启 Jev 后可在密码框填写 TypeSafe API Key，留空保留服务端密钥，未保存过时回退 TYPESAFE_API_KEY。密钥独立服务端存储，不进入卡片配置、读回或 Solution；配置及密钥在同一事务提交后才生效。移除配置页顶部诊断块，保留独立状态接口。默认身份路径自动填入。
 6. 保留 Canvas 停止智能控制后编辑与编辑锁要求；这是既有 UI 约束，不为新开关绕过。

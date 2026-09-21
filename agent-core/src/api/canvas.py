@@ -437,7 +437,7 @@ async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body
     if mcp_id == 'agentcore' and tool_name == 'decision_core':
         # Jev was already committed above. Replaying it through the deferred
         # MCP push could overwrite a newer save/delete with this stale body.
-        apply_body = {k: v for k, v in body.items() if k not in semantic_routing.SCHEMA}
+        apply_body = {k: v for k, v in body.items() if k not in semantic_routing.CONFIG_KEYS}
         try:
             await apply_tool_config(mcp_id, tool_name, apply_body, wait=True)
         except Exception:
@@ -492,7 +492,7 @@ async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, bo
         import semantic_routing
         if not isinstance(body, dict):
             raise fastapi.HTTPException(400, '配置必须为对象')
-        if any(k in body for k in semantic_routing.SCHEMA):
+        if any(k in body for k in semantic_routing.CONFIG_KEYS):
             raise fastapi.HTTPException(400, 'Jev 配置仅支持共享配置接口，不支持实例配置')
     config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
     apply_tool_config(mcp_id, tool_name, body, instance_id)

@@ -1105,7 +1105,7 @@ async def _reconcile_canvas_runtime():
         for mid, name, iid in pending.get('configs', []):
             value = config.main.get(tool_config_key(mid, name, iid), {}) or {}
             if mid == 'agentcore' and name == 'decision_core':
-                value = {k: v for k, v in value.items() if k not in semantic_routing.SCHEMA}
+                value = {k: v for k, v in value.items() if k not in semantic_routing.CONFIG_KEYS}
             await apply_tool_config(mid, name, value, iid, wait=True)
         await asyncio.to_thread(config.main.update_atomic, {}, delete_keys=('canvas_runtime_pending',))
         return True
