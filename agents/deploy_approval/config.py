@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_GITHUB_REPOS = (
     "4paradigm/phanthymotus",
+    "4paradigm/phanthymotus-driver",
 )
 
 

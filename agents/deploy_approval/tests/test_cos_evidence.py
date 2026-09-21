@@ -320,11 +320,14 @@ async def test_cos_presign_uses_real_local_sdk_construction_seam():
                     assert "self._client" not in method_src, "generate_evidence_download_url must not use self._client"
 
 
-def test_production_compose_default_repo_is_phanthymotus_only():
-    """GITHUB_REPOS default must be 4paradigm/phanthymotus only (config-level check)."""
+def test_production_compose_default_repos_are_main_and_driver():
+    """GITHUB_REPOS default must contain exactly the two production repositories."""
     from ..config import DEFAULT_GITHUB_REPOS
-    assert DEFAULT_GITHUB_REPOS == ("4paradigm/phanthymotus",)
-    assert "4paradigm/phanthymotus-driver" not in str(DEFAULT_GITHUB_REPOS)
+
+    assert DEFAULT_GITHUB_REPOS == (
+        "4paradigm/phanthymotus",
+        "4paradigm/phanthymotus-driver",
+    )
 
 
 # ── service approval contract tests ────────────────────────────────────────

@@ -80,12 +80,13 @@ def _open_pr(number: int, updated_at: str, *, marker: str = "") -> dict:
     "github_repos, should_pass, expected_error",
     [
         ([], False, "GITHUB_REPOS is required"),
+        (["4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
         (["4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
         (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must not contain duplicates"),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"], True, ""),
+        (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], True, ""),
         (["4paradigm/phanthymotus", "some/other-repo"], False, "GITHUB_REPOS must contain exactly"),
         (["example/unsupported-repo"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus"], True, ""),
     ],
 )
 def test_validate_config_requires_exact_runtime_repo_set(github_repos, should_pass, expected_error):

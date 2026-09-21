@@ -5,11 +5,10 @@
 Deploy Controller 只负责部署审批与状态编排，**代码不修改**；代码构建与 Review 仍由 Review Agent 负责。
 
 生产环境能力与仓库合同：
-- 源/产品能力支持的仓库：`4paradigm/phanthymotus`、`4paradigm/phanthymotus-driver`
-- 当前生产发布 / 默认 `GITHUB_REPOS` 为 `4paradigm/phanthymotus`（main）单仓库
-- 当前 GitHub App 安装可能仅授权了 main
-- `4paradigm/phanthymotus-driver` 运行时授权延后（DEFERRED）
-- 一旦在同一安装中将 driver 加入选定仓库集合，仅扩展 `GITHUB_REPOS` 配置即可，无需修改 Deploy Approval 源码
+- 生产运行仓库：`4paradigm/phanthymotus`、`4paradigm/phanthymotus-driver`
+- 默认及生产 `GITHUB_REPOS` 必须同时包含 main 与 driver 两个仓库
+- 当前同一个 GitHub App installation 已验证可访问 main 与 driver
+- 不需要为 driver 引入第二套 GitHub App / installation 路由
 - 未知的 / 第三方的仓库必须 fail closed
 - 缺失、重复的仓库必须 fail closed。
 
@@ -162,13 +161,13 @@ CLEAN 通过后：FULL-COVERAGE -> running_image-only CLEAN -> fresh exact appro
 account/organization; it is **not** inherently one ID per repository.
 A single installation can be configured for multiple selected repositories.
 
-Current production auth intentionally uses one installation ID.
-Current runtime validation target is `4paradigm/phanthymotus`.
-`4paradigm/phanthymotus-driver` runtime authorization is **DEFERRED**.
+Current production auth uses one installation ID.
+The same installation is authorized for both
+`4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver`.
+Runtime `GITHUB_REPOS` requires both repositories.
 
-When driver is enabled, prefer adding driver to the same installation's
-selected repository set. Only introduce repo-to-installation routing
-if GitHub later proves there are distinct installations.
+Only introduce repo-to-installation routing if GitHub later proves there are
+distinct installations.
 
 
 

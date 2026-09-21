@@ -58,7 +58,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **Top-level status labels:** only `review-required`, `reviewing`, `deploy-ready`, `deploy-requested`, `testing`, `succeeded`, `failed`.
 - **Status labels:** `status:*` labels are best-effort UI projection only. Label bootstrap/list/create failures are logged as warnings and never block startup or business operations. Label failure does not affect any gate or lifecycle transition.
 - **Review Agent authentication:** Review Agent uses a user-provided `GITHUB_TOKEN`, not the GitHub App. This is strictly separate from Deploy Approval's GitHub App credentials.
-- **Supported repos:** source capability supports main + driver. Current runtime `GITHUB_REPOS` must be exactly `4paradigm/phanthymotus`. `4paradigm/phanthymotus-driver` runtime authorization is DEFERRED and requires an explicit reviewed runtime-config contract change before enablement. Do not enable driver by changing only the environment variable. The same GitHub App installation may be reused later if that installation is explicitly authorized for driver.
+- **Supported repos:** production runtime `GITHUB_REPOS` contains exactly `4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver`. The same GitHub App installation is authorized for both repositories. Missing, duplicate, unknown, or third-party repository entries fail closed.
 - **Evidence source:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation. Trusted Review Agent GitHub comments provide Build Result, Test Results, and Code Review. Build/Test commit short SHA resolves via GitHub to full SHA for exact equality with fresh PR HEAD. Image tag comes from the selected Build Result comment Images section (full mutable ref, not basename). Registry resolves to immutable digest. No Review Agent HTTP API.
 - **Full-coverage machine list:** `deploy_requested` lifecycle comment shows only machines that can cover ALL REMAINING components. If no machine can cover all remaining components, status stays deploy-requested and the operator must update machine policy.
 - **Source matrix:** GitHub PR comments are the source of Review Agent Build/Test/Code Review evidence and image:tag candidate facts; Registry only verifies/resolves that exact Review Agent image tag; Agent Core only supplies runtime identity, current `running_image`, and MCP evidence; GitHub persists the deployment snapshot.
@@ -212,13 +212,13 @@ machines:
 account/organization; it is **not** inherently one ID per repository.
 A single installation can be configured for multiple selected repositories.
 
-Current production auth intentionally uses one installation ID.
-Current runtime validation target is `4paradigm/phanthymotus`.
-`4paradigm/phanthymotus-driver` runtime authorization is **DEFERRED**.
+Current production auth uses one installation ID.
+The same installation is authorized for both
+`4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver`.
+Runtime `GITHUB_REPOS` requires both repositories.
 
-When driver is enabled, prefer adding driver to the same installation's
-selected repository set. Only introduce repo-to-installation routing
-if GitHub later proves there are distinct installations.
+Only introduce repo-to-installation routing if GitHub later proves there are
+distinct installations.
 
 ## Environment Variables
 

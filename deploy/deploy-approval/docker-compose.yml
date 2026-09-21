@@ -18,7 +18,7 @@ services:
       GITHUB_APP_ID: "${GITHUB_APP_ID}"
       GITHUB_INSTALLATION_ID: "${GITHUB_INSTALLATION_ID}"
       GITHUB_APP_PRIVATE_KEY_FILE: "${GITHUB_APP_PRIVATE_KEY_FILE}"
-      GITHUB_REPOS: "${GITHUB_REPOS:-4paradigm/phanthymotus}"
+      GITHUB_REPOS: "${GITHUB_REPOS:-4paradigm/phanthymotus,4paradigm/phanthymotus-driver}"
       POLL_ENABLED: "${POLL_ENABLED:-true}"
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-30}"
       WEBHOOK_ENABLED: "${WEBHOOK_ENABLED:-false}"

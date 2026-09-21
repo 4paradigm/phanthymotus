@@ -164,26 +164,36 @@ async def test_existing_exact_labels_are_kept_without_create(tmp_path):
 
 @pytest.mark.asyncio
 async def test_missing_labels_are_created_only(tmp_path):
-    repo = DEFAULT_GITHUB_REPOS[0]
     fake = FakeBootstrapGitHub(
         {
             repo: [
                 _label("status: review-required"),
                 _label("status: reviewing"),
                 _label("bug"),
-            ],
-            "4paradigm/phanthymotus-fake": [
-                _label(name) for name, _, _ in _STATUS_LABEL_SPECS[:3]
-            ],
+            ]
+            for repo in DEFAULT_GITHUB_REPOS
         }
     )
     await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
-    created_names = [event[2] for event in fake.events if event[0] == "create"]
+
+    created_names = [
+        event[2]
+        for event in fake.events
+        if event[0] == "create"
+    ]
+
     assert "status: review-required" not in created_names
     assert "status: reviewing" not in created_names
     assert "bug" not in created_names
-    for name in _status_label_names():
-        assert name in [label["name"] for label in fake.repo_labels[repo]]
+
+    for repo in DEFAULT_GITHUB_REPOS:
+        repo_names = [
+            label["name"]
+            for label in fake.repo_labels[repo]
+        ]
+        for name in _status_label_names():
+            assert name in repo_names
+        assert "bug" in repo_names
 
 
 @pytest.mark.asyncio
@@ -205,19 +215,42 @@ async def test_non_status_labels_are_untouched(tmp_path):
 async def test_case_insensitive_collision_fails_before_any_create(tmp_path):
     fake = FakeBootstrapGitHub(
         {
-            repo: [_label("Status: reviewing"), _label("status: review-required")]
+            repo: [
+                _label("Status: reviewing"),
+                _label("status: review-required"),
+            ]
             for repo in DEFAULT_GITHUB_REPOS
         }
     )
+
     summary = await _bootstrap_status_labels(fake)  # type: ignore[arg-type]
-    # Case-insensitive collision skips the conflicting label but still creates others
-    creates = [e for e in fake.events if e[0] == "create"]
-    # All 7 status labels are attempted; "status: reviewing" is skipped due to conflict
-    create_names = [e[2] for e in creates]
+
+    creates = [
+        e
+        for e in fake.events
+        if e[0] == "create"
+    ]
+
+    create_names = [
+        e[2]
+        for e in creates
+    ]
+
     assert "status: reviewing" not in create_names
-    # Other status labels should still be created
-    assert len(creates) == 5
-    assert summary[DEFAULT_GITHUB_REPOS[0]]["missing"] == ["status: reviewing"]
+
+    for repo in DEFAULT_GITHUB_REPOS:
+        repo_creates = [
+            e
+            for e in creates
+            if e[1] == repo
+        ]
+
+        assert len(repo_creates) == 5
+        assert summary[repo]["missing"] == [
+            "status: reviewing"
+        ]
+
+    assert len(creates) == 5 * len(DEFAULT_GITHUB_REPOS)
 
 
 @pytest.mark.asyncio

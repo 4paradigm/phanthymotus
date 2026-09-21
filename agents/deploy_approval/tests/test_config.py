@@ -28,9 +28,7 @@ def test_validate_config_no_longer_requires_github_token():
     """GITHUB_TOKEN is no longer a config field; token comes from GitHub App provider."""
     validate_config(
         Config(
-            github_repos=[
-                "4paradigm/phanthymotus",
-            ],
+            github_repos=list(DEFAULT_GITHUB_REPOS),
             registry="ccr.ccs.tencentyun.com",
             review_comment_author_id="7950763",
             agent_core_tokens={"test": "token"},
@@ -39,9 +37,10 @@ def test_validate_config_no_longer_requires_github_token():
 
 
 def test_validate_config_default_repos():
-    """Default github_repos is the single production repository."""
+    """Default github_repos contains both production repositories."""
     c = Config(review_comment_author_id="7950763", agent_core_tokens={"test": "token"})
     assert "4paradigm/phanthymotus" in c.github_repos
+    assert "4paradigm/phanthymotus-driver" in c.github_repos
     # Explicit empty overrides defaults — must fail closed
     with pytest.raises(ValueError, match="GITHUB_REPOS is required"):
         validate_config(Config(github_repos=[], registry="ccr.ccs.tencentyun.com", agent_core_tokens={"test": "token"}))
@@ -51,10 +50,11 @@ def test_validate_config_default_repos():
     "repos,should_pass",
     [
         (list(DEFAULT_GITHUB_REPOS), True),
-        ([DEFAULT_GITHUB_REPOS[0], "some/fork-repo"], False),
-        ([DEFAULT_GITHUB_REPOS[0], DEFAULT_GITHUB_REPOS[0]], False),
+        (list(reversed(DEFAULT_GITHUB_REPOS)), True),
+        (["4paradigm/phanthymotus"], False),
         (["4paradigm/phanthymotus-driver"], False),
-        ([DEFAULT_GITHUB_REPOS[0], "4paradigm/phanthymotus-driver"], False),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False),
+        (["4paradigm/phanthymotus", "some/fork-repo"], False),
         (["some/other"], False),
         ([], False),
         ([*DEFAULT_GITHUB_REPOS, "some/other"], False),
@@ -78,9 +78,7 @@ def test_validate_config_requires_webhook_secret():
     with pytest.raises(ValueError, match="GITHUB_WEBHOOK_SECRET is empty"):
         validate_config(
             Config(
-                github_repos=[
-                    "4paradigm/phanthymotus",
-                ],
+                github_repos=list(DEFAULT_GITHUB_REPOS),
                 webhook_enabled=True,
                 review_comment_author_id="7950763",
                 agent_core_tokens={"test-machine": "test-token"},
@@ -92,9 +90,7 @@ def test_validate_config_requires_polling():
     with pytest.raises(ValueError, match="requires polling"):
         validate_config(
             Config(
-                github_repos=[
-                    "4paradigm/phanthymotus",
-                ],
+                github_repos=list(DEFAULT_GITHUB_REPOS),
                 webhook_enabled=True,
                 poll_enabled=False,
                 github_webhook_secret="secret",
@@ -135,7 +131,7 @@ def test_env_float():
 
 def test_config_env_override(monkeypatch, tmp_path):
     """Explicit GITHUB_REPOS overrides the default."""
-    monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus")
+    monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus,4paradigm/phanthymotus-driver")
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
     secrets = tmp_path / "secrets.yaml"
@@ -146,7 +142,7 @@ def test_config_env_override(monkeypatch, tmp_path):
         return orig(str(secrets))
     monkeypatch.setattr(config_mod, "_load_secrets_config", patched)
     cfg = load_config()
-    assert cfg.github_repos == ["4paradigm/phanthymotus"]
+    assert cfg.github_repos == list(DEFAULT_GITHUB_REPOS)
 
 
 
@@ -173,14 +169,14 @@ def test_config_env_unset_uses_default(monkeypatch, tmp_path):
     monkeypatch.setattr(config_mod, "_load_secrets_config", patched)
     cfg = load_config()
     assert "4paradigm/phanthymotus" in cfg.github_repos
-    assert "4paradigm/phanthymotus-driver" not in cfg.github_repos
+    assert "4paradigm/phanthymotus-driver" in cfg.github_repos
 
 
 # ── migrated from test_v8_contract.py ──────────────────────────────────────
 
-def test_default_supported_repo_is_production_phanthymotus():
+def test_default_supported_repos_are_production_main_and_driver():
     cfg = Config()
-    assert cfg.github_repos == ["4paradigm/phanthymotus"]
+    assert cfg.github_repos == list(DEFAULT_GITHUB_REPOS)
 
 
 def test_perception_review_variant_511_matches_canonical_machine_variant(tmp_path):
