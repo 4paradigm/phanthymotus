@@ -30,6 +30,8 @@ ACP 完成、传感器、调度器和子 Agent 回执不调用 Jev。Channel 权
 ## 排查与接口
 
 - Canvas 配置仍经 `PUT /api/canvas/tool-config/agentcore/decision_core` 保存；无效开关配置返回 HTTP 400，原配置不变。
+- Jev 字段只允许共享配置；实例配置和带 instance_id 的 MCP 配置调用会拒绝这些字段（400），包括 API Key。删除实例配置不重置共享设置或密钥，数据库失败返回 503。
+- 共享保存返回 `persisted` 与 `runtime_applied`。若持久化成功但后续运行时应用失败，HTTP 200 同时返回警告，页面提示重新保存重试；此时并非回滚，Jev 设置和密钥已保存。确认重试成功后再开始智能控制。
 - 配置校验/持久化在线程中执行，串行合并并以事务更新 Jev 与卡片配置；删除卡片配置时同时重置 Jev。数据库写入失败返回 HTTP 503，事务回滚，不把部分删除说成成功。配置请求取消不会取消已开始的数据库事务，重连后应刷新读取实际状态。
 - `GET /api/canvas/semantic-routing` 返回只读状态及最近 100 条诊断，不返回身份正文、历史或密钥。
 - `decision_core info` 同样提供 `semantic_routing` 状态。
@@ -61,6 +63,8 @@ PR 首轮镜像测试为 1330 通过、12 失败、1 跳过，不能用上述定
 部署模板中的 `TYPESAFE_API_KEY` 仍可传入可选服务端凭据；也可直接通过卡片密码框保存，无需改 Compose 或重启。不增加依赖或修改 Dockerfile。两处均无密钥时，保存启用 Jev 会报错并保留旧配置。
 
 DDS 挂载行为未修改：Core 是 profile 的生产/修复方，启动前由 `dds_isolation.ensure_profile()` 经可写 `/opt/phanthy-motus` 父目录挂载补齐或更新文件。不能为它叠加只读 `dds-local.xml` 子文件挂载，否则现有缺失文件修复与版本更新会被阻止；其他只读消费方的挂载示例不直接套用于 Core。
+
+配置旁路修复后本地验证：Python 3.10 全量 1357 passed、8 subtests passed，42.12 秒；Jev/DDS 定向 62 passed；全部前端 Node 测试 93 passed，sidebar 语法检查及 diff whitespace 检查通过。新增覆盖实例字段拒绝、删除数据库失败及共享凭据保留、持久化后同步/异步下发失败和重试成功。此记录不代表新镜像已部署。
 
 全量复测（Python 3.10、安装 Core 依赖和 pytest，从仓库根目录执行；先将 `DB_PATH` 设为本次创建的临时数据库）：
 

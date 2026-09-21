@@ -862,6 +862,8 @@ async def _handle_agentcore_call(req: MCPCallRequest):
     if req.tool == 'decision_core' and action == 'config':
         import semantic_routing
         if any(k in req.arguments for k in semantic_routing.SCHEMA):
+            if req.arguments.get('instance_id'):
+                return {'code': 400, 'message': 'Jev 配置仅支持共享配置，不支持实例配置'}
             try:
                 await semantic_routing.configure(req.arguments)
             except ValueError as exc:

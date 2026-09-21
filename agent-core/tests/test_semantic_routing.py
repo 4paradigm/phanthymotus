@@ -357,7 +357,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         app = fastapi.FastAPI()
         app.include_router(canvas.router, prefix='/api')
         transport = httpx.ASGITransport(app=app)
-        with patch.object(canvas, 'apply_tool_config') as apply:
+        with patch.object(canvas, 'apply_tool_config', new_callable=AsyncMock) as apply:
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as c:
                 url = '/api/canvas/tool-config/agentcore/decision_core'
                 bad = await c.put(url, json={'jev_enabled': True, 'jev_identity_path': '/missing'})
@@ -568,7 +568,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         secret = 'fixture-ui-private-key'
         url = '/api/canvas/tool-config/agentcore/decision_core'
         with patch.dict(os.environ, {'TYPESAFE_API_KEY': ''}), \
-                patch.object(canvas, 'apply_tool_config') as apply:
+                patch.object(canvas, 'apply_tool_config', new_callable=AsyncMock) as apply:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as c:
                 missing = await c.put(url, json={'jev_enabled': True})
                 self.assertEqual(missing.status_code, 400)
@@ -593,6 +593,79 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(failed.status_code, 503)
                 self.assertEqual(routing.api_key(), secret)
                 self.assertNotIn(secret, routing.text_only('secret=' + secret))
+
+    async def test_instance_jev_fields_rejected_before_any_write(self):
+        from api import canvas, mcp_manage
+        import fastapi
+        import httpx
+        app = fastapi.FastAPI()
+        app.include_router(canvas.router, prefix='/api')
+        before = copy.deepcopy(self.cfg)
+        url = '/api/canvas/tool-config/agentcore/decision_core/card-fixture'
+        with patch.object(canvas, 'apply_tool_config') as apply:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as c:
+                for field in routing.SCHEMA:
+                    result = await c.put(url, json={field: 'private-fixture'})
+                    self.assertEqual(result.status_code, 400, field)
+                    self.assertEqual(self.cfg, before)
+                    result = await mcp_manage._handle_agentcore_call(mcp_manage.MCPCallRequest(
+                        tool='decision_core', arguments={'action': 'config',
+                        'instance_id': 'card-fixture', field: 'private-fixture'}))
+                    self.assertEqual(result['code'], 400, field)
+                    self.assertEqual(self.cfg, before)
+                self.assertEqual((await c.put(url, json=[])).status_code, 400)
+                apply.assert_not_called()
+                for endpoint in (url, '/api/canvas/tool-configs'):
+                    self.assertNotIn('private-fixture', (await c.get(endpoint)).text)
+
+    async def test_instance_delete_is_atomic_and_preserves_shared_credentials(self):
+        from api import canvas
+        import fastapi
+        await routing.configure({'jev_api_key': 'machine-private-key'})
+        key = canvas.tool_config_key('agentcore', 'decision_core', 'fixture')
+        self.cfg[key] = {'trigger_interval_ms': 500}
+        before = copy.deepcopy(self.cfg)
+        with patch.object(self.cfg, 'update_atomic', side_effect=OSError('disk full')):
+            with self.assertRaises(fastapi.HTTPException) as error:
+                await canvas.delete_instance_config('agentcore', 'decision_core', 'fixture')
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertEqual(self.cfg, before)
+        await canvas.delete_instance_config('agentcore', 'decision_core', 'fixture')
+        before.pop(key)
+        self.assertEqual(self.cfg, before)
+        self.assertEqual(routing.api_key(), 'machine-private-key')
+
+    async def test_post_commit_apply_failure_is_explicit_and_retryable(self):
+        from api import canvas, mcp_manage
+        # Exercise real application helper, both synchronous preparation errors
+        # and asynchronous failures/error results, without touching hardware.
+        body = {'jev_api_key': 'private-retry-key', 'trigger_interval_ms': 700}
+        with patch('tool_config.find_tool', side_effect=RuntimeError('private-retry-key')):
+            result = await canvas.save_tool_config('agentcore', 'decision_core', body)
+        self.assertTrue(result['persisted'])
+        self.assertFalse(result['runtime_applied'])
+        self.assertNotIn('private-retry-key', json.dumps(result))
+        self.assertEqual(routing.api_key(), 'private-retry-key')
+        calls = [({'trigger_interval_ms': 700}, {})]
+        with patch('tool_config.find_tool'), patch('tool_config.plan_config_calls', return_value=calls), \
+                patch.object(mcp_manage, 'mcp_call_tool', new_callable=AsyncMock) as call:
+            call.side_effect = RuntimeError('private-retry-key')
+            failed = await canvas.save_tool_config('agentcore', 'decision_core', body)
+            self.assertFalse(failed['runtime_applied'])
+            self.assertNotIn('private-retry-key', json.dumps(failed))
+            call.side_effect = None
+            for error in ({'code': 503}, {'isError': True}):
+                call.return_value = error
+                failed = await canvas.save_tool_config('agentcore', 'decision_core', body)
+                self.assertFalse(failed['runtime_applied'])
+            call.return_value = {'code': 200}
+            success = await canvas.save_tool_config('agentcore', 'decision_core', body)
+            self.assertTrue(success['persisted'])
+            self.assertTrue(success['runtime_applied'])
+            self.assertNotIn('jev_api_key', call.call_args.args[1].arguments)
+        saved = self.cfg[canvas.tool_config_key('agentcore', 'decision_core')]
+        self.assertEqual(saved['trigger_interval_ms'], 700)
+        self.assertNotIn('jev_api_key', saved)
 
     async def test_key_validation_and_solution_cannot_replace_machine_key(self):
         from api import canvas, solutions

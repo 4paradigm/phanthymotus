@@ -860,6 +860,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         alert(`配置保存失败 (HTTP ${resp.status}): ${error.detail || error.message || ''}`);
         return;
       }
+      const result = await resp.json();
+      if (result.warning) alert(result.warning);
     } catch (err) {
       alert('配置保存失败: ' + err.message);
       console.error('[config] save failed:', err);
