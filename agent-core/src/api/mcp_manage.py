@@ -287,6 +287,7 @@ def _guess_data_type(tools: list, resources: list, name: str) -> str:
         ('control/joint-torque', ('torque_control', 'joint_torque')),
         ('control/joint-velocity', ('joint_velocity',)),
         ('control/joint',    ('joint', 'joint_position', 'arm', 'servo', 'actuator')),
+        ('control/eef',      ('eef', 'end_effector_pose', 'servo_eef', 'cartesian')),
         ('control/attitude', ('attitude', 'roll', 'pitch', 'yaw', 'setpoint')),
         ('control/waypoint', ('waypoint', 'navigate_to', 'goto')),
         ('control/velocity', ('velocity', 'cmd_vel', 'wheel', 'drive', 'locomotion', 'motion', 'motor')),
