@@ -354,7 +354,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         app = fastapi.FastAPI()
         app.include_router(canvas.router, prefix='/api')
         transport = httpx.ASGITransport(app=app)
-        with patch.object(canvas, 'apply_tool_config'):
+        with patch.object(canvas, 'apply_tool_config') as apply:
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as c:
                 url = '/api/canvas/tool-config/agentcore/decision_core'
                 bad = await c.put(url, json={'jev_enabled': True, 'jev_identity_path': '/missing'})
@@ -362,6 +362,8 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('tool_config:agentcore:decision_core', self.cfg)
                 good = await c.put(url, json={'jev_enabled': True, 'jev_identity_path': str(self.identity)})
                 self.assertEqual(good.status_code, 200)
+                self.assertFalse(set(apply.call_args.args[2]) & set(routing.DEFAULTS),
+                                 'deferred MCP push must not replay an already committed Jev config')
                 saved = (await c.get(url)).json()['data']
                 self.assertTrue(saved['jev_enabled'])
                 status = (await c.get('/api/canvas/semantic-routing')).json()['data']
