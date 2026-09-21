@@ -3,6 +3,8 @@ import json
 import time
 from typing import Optional
 
+import typing
+
 import aiohttp
 import fastapi
 from pydantic import BaseModel
@@ -1021,8 +1023,22 @@ async def _handle_agentcore_call(req: MCPCallRequest):
 
 
 @router.post('/{mcp_id}/call')
-async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
-    """Call a tool on an MCP server and return the result."""
+async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
+                        timeout_s: typing.Optional[float] = None):
+    """Call a tool on an MCP server and return the result.
+
+    `timeout_s` bounds the whole request. **默认仍然是不限时**，而那对 `start`
+    是对的：一张卡片的 `start` 合法地可能要几分钟（actucore 那张 VLA 卡片的
+    provider 构造会下载几个 GB）。
+
+    但对**轮询**类的调用（`info()`）它是错的：那些本该是毫秒级，而一个不回应的
+    MCP 服务器会让调用方永远等下去。真机实测 2026-09-21：perception 的 HTTP 线程
+    被同进程一个空转线程饿死（GIL），accept 队列堆满，于是
+    `_do_start_project_impl()` 挂在一次 `start` 上再不返回，`_start_project_lock`
+    永久为真，之后每次点启动都是 409 —— 除了重启进程没有出路。
+
+    所以超时是**调用方按用途给**的，不在这里定一个对两种用途都不对的默认值。
+    """
     # A paired peer's tool is reached over its signed link, not local HTTP, and this
     # handler builds JSON-RPC itself — so hand it to call_tool, which knows how to
     # route `transport: 'peer'` (peer/mcp_bridge.py). Without this the dashboard has
@@ -1196,7 +1212,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         raise fastapi.HTTPException(status_code=400, detail='MCP not reachable via HTTP')
 
     headers = {'Content-Type': 'application/json'}
-    timeout = aiohttp.ClientTimeout(total=None)
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Initialize first (required by MCP protocol)

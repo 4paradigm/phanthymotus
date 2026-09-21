@@ -84,8 +84,14 @@ def driver(monkeypatch):
     """
     starts, started_input = {}, {}
 
-    async def _call(mcp_id, req):
+    async def _call(mcp_id, req, timeout_s=None):
+        # **`timeout_s` 要收下并断言，不能只是吞掉。** 一个把出问题的那个参数
+        # 悄悄丢掉的假件，正是这一类 bug 能活下来的原因（画布那个 qos 也是）。
+        # 只读的 `info()` 必须是有界的：无界时一个不回应的 MCP 会让整次启动永久
+        # 挂死，而"取消"按钮对后端无效。`start` 相反，它合法地可以很慢。
         args = dict(req.arguments)
+        if args.get('action') == 'info':
+            assert timeout_s, 'info() 必须带超时，否则轮询循环的 deadline 是摆设'
         action, card_id = args.get('action'), args.get('instance_id')
         if action == 'start':
             starts[card_id] = args
