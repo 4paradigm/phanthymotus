@@ -936,7 +936,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             # 按 10 轮跑」这件事在接口和日志里可见，而不是停留在某个进程的内存里。
             'narration_effective': dict(zip(('rounds', 'seconds'),
                                             _narration_thresholds())),
-            'semantic_routing': __import__('semantic_routing').status(),
+            'semantic_routing': await asyncio.to_thread(__import__('semantic_routing').status),
         }}
 
     elif action == 'config':

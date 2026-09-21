@@ -392,7 +392,7 @@ def delete_all_tool_configs() -> int:
     import semantic_routing
     # Replacing a solution with an older one must not leave invisible Jev state
     # enabled. New solution configs can explicitly enable it after validation.
-    config.main['semantic_routing'] = dict(semantic_routing.DEFAULTS)
+    semantic_routing.reset_settings()
     try:
         asyncio.get_running_loop().create_task(semantic_routing.invalidate(deliver_text=True))
     except RuntimeError:
@@ -434,7 +434,7 @@ async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body
 
 
 @router.get('/semantic-routing')
-async def semantic_routing_status():
+def semantic_routing_status():
     import semantic_routing
     return {'code': 200, 'data': semantic_routing.status()}
 

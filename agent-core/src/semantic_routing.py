@@ -58,8 +58,24 @@ QUESTIONS = {
 }
 
 
+# Load once at process startup, before producers begin ingesting events. All
+# runtime writers below publish a new snapshot only after persistence succeeds.
+_settings = {**DEFAULTS, **config.main.get('semantic_routing', {})}
+
+
 def settings():
-    return {**DEFAULTS, **config.main.get('semantic_routing', {})}
+    return dict(_settings)
+
+
+def _save_settings(cfg):
+    global _settings
+    config.main['semantic_routing'] = cfg
+    _settings = dict(cfg)
+
+
+def reset_settings():
+    """Solution replacement must reset both persisted and effective settings."""
+    _save_settings(DEFAULTS)
 
 
 class IdentityUnavailable(ValueError):
@@ -105,7 +121,7 @@ def validate(values, *, preflight=True):
 async def configure(values):
     cfg = validate(values)
     if cfg != settings():
-        config.main['semantic_routing'] = cfg
+        _save_settings(cfg)
         await invalidate(deliver_text=True)
     return cfg
 

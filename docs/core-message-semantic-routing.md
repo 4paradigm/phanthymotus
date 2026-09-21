@@ -42,25 +42,23 @@ ACP 完成、传感器、调度器和子 Agent 回执不调用 Jev。Channel 权
 
 2026-09-21 验证记录：
 
-- 114 项 unittest：新增 semantic_routing，以及 LLM 配置、schema 条件、Channel 权限/历史、现有 interrupt 和 ACP 回归通过。
+- 初次 114 项 unittest：新增 semantic_routing，以及 LLM 配置、schema 条件、Channel 权限/历史、unittest 风格 interrupt 和 ACP 回归通过。此命令未执行 pytest 函数式的 `test_interrupt_all_fallback`，不能据此声称该文件通过。
 - 33 项 pytest：Canvas 编辑锁、Solution、项目启动解析通过。Python 3.13 退出时出现事件循环析构警告；现有 `test_start_project_resolution.py` 的 helper 创建 loop 后未 close，本任务未修改该测试。
 - 36 项 Node 测试通过（topic-derive、json-util），三个改动 JS 语法检查、10 个改动 Python 文件的 3.10 AST 检查及 `git diff --check` 通过。
 - 浏览器使用 `tests/semantic_routing_preview.py`：真实注册 schema、配置 API 与现有 Canvas 弹窗，验证默认关闭、开启显示字段、非法路径拒绝、空路径恢复默认、保存刷新保持、关闭隐藏。隔离临时数据库和假密钥，不启动 Core loop 或硬件。
 - 真实 TypeSafe API 仅使用合成身份/历史：直接称呼机器人通过接入（0.98）；停止讲解选择 interrupt（confidence 0.99）；讲完再做选择 followup（0.98）。返回模型 `jev-1.13.0`，单次 1236 / 952 / 984 ms；不是准确率或真机端到端时延评测。
 - 未做机上部署、ROS/DDS 联调、真实 TTS 停播或硬件验收。
 
-定向复测（从仓库根目录；先将 `DB_PATH` 设为本次创建的临时数据库）：
+PR 首轮镜像测试为 1330 通过、12 失败、1 跳过，不能用上述定向测试代替全量。审查修复增加配置内存快照（启动加载，保存成功/替换 Solution 时更新）、诊断工作线程及相关回归；12 项打断测试改为显式 patch 模块。全量执行还发现原先跳过的部署进度模拟测试参数错误，已修正并改成普通 pytest 可执行入口，不涉及真实部署。
+
+审查修复后本地 Python 3.10.20 / pytest 9.1.1 全量结果：1346 passed、8 subtests passed、零失败/跳过，41.53 秒，退出码 0；36 项 Node 测试通过。退出仍出现 event-loop 析构告警，未隐藏。镜像内结果与 Bot 审查结论以 PR 最新提交对应记录为准，不以本地结果替代。
+
+部署模板中的 `TYPESAFE_API_KEY` 仅用于向 Core 传入可选服务端凭据，不增加包、镜像层或复制数据；不需要修改 Dockerfile。没有配置密钥时，Canvas 无法成功启用 Jev。
+
+全量复测（Python 3.10、安装 Core 依赖和 pytest，从仓库根目录执行；先将 `DB_PATH` 设为本次创建的临时数据库）：
 
 ```sh
-PYTHONPATH=agent-core/src:agent-core/tests python -m unittest \
-  test_semantic_routing test_llm_config_sync test_config_schema_show_when \
-  test_channel_authorization test_channel_role_authorization test_channel_chat_history \
-  test_interrupt_fallback test_interrupt_all_fallback test_acp_barrier_finish \
-  test_acp_resource_barrier test_acp_ordering
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest \
-  agent-core/tests/test_canvas_editor_idle.py \
-  agent-core/tests/test_solution_test_block.py \
-  agent-core/tests/test_start_project_resolution.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest agent-core/tests -q -ra
 node --test agent-core/web/js/topic-derive.test.mjs agent-core/web/js/json-util.test.mjs
 python agent-core/tests/semantic_routing_preview.py
 ```

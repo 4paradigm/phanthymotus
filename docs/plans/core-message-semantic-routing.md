@@ -29,6 +29,16 @@
 
 ## 当前证据
 
+### PR 254 审查修复（进行中）
+
+- 缓存有效 Jev 配置，启动加载一次，配置保存成功和 Solution 替换时同步更新；关闭及非交互事件入口不得读取 SQLite。
+- 诊断 HTTP 路由及 MCP info 的阻塞读取转移到工作线程；修正 Python 3.10 打断回归测试的模块 mock 目标。
+- 新增无数据库热路径、缓存写失败/重启一致性、诊断线程隔离测试；使用 pytest 在 Python 3.10 运行 Core 全套，不再用 unittest 导入成功代替 pytest 测试执行。
+- 修正下述历史验证范围：原 114 项 unittest 不包含 pytest 函数式 `test_interrupt_all_fallback`；首轮 Bot 镜像结果为 1330 通过、12 失败、1 跳过。需要提交修复并重复镜像测试和 Bot Review，直到最新 head 明确 No issues found。
+- PR Demo 已改成实际部署后在 Canvas 连线、配置并开启智能控制的验收 SOP；隔离 UI fixture 仅作为辅助测试，未执行真机验收。
+- 全量测试发现原先缺少异步执行器而跳过的部署进度模拟测试参数错误；修正参数与普通 pytest 入口，范围仅测试基础设施，不执行部署。操作文档同步纠正原测试覆盖范围、提供 pytest 全量命令并说明凭据透传不增大镜像；README 的功能入口和接口契约不变，无需修改。
+- 修复后本地 Python 3.10.20 / pytest 9.1.1 全量 1346 passed、8 subtests passed，无失败/跳过，退出码 0；36 项 Node 测试通过。退出仍有 event-loop 析构告警，未隐藏；接下来等待新提交的镜像测试及 Bot 结论。
+
 2026-09-21 已实现。114 项 unittest、33 项 pytest、36 项 Node 测试通过；Python 3.10 AST、JS 语法及 diff 检查通过。pytest 退出有既有测试未关闭 event loop 的析构警告，未掩盖或修改该测试。
 
 浏览器已验证真实 Canvas 配置弹窗、路径错误、默认路径恢复和开关持久化；隔离 fixture 没有主 Loop/硬件。

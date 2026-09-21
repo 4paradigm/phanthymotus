@@ -36,6 +36,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                     'semantic_routing': {**routing.DEFAULTS, 'jev_enabled': True,
                                          'jev_identity_path': str(self.identity)}}
         self.patchers = [patch.object(config, 'main', self.cfg),
+                         patch.object(routing, '_settings', self.cfg['semantic_routing']),
                          patch.dict(os.environ, {'TYPESAFE_API_KEY': 'fake-test-key'}),
                          patch.object(routing, 'runtime_snapshot', side_effect=self.snapshot),
                          patch.object(routing, 'request_jev', new_callable=AsyncMock)]
@@ -96,6 +97,54 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event_bus._queue.empty())
         self.assertEqual(event_bus.recent(), [])
         self.assertEqual(collector._source_ring, {})
+
+    async def test_ingestion_bypass_never_reads_config_db(self):
+        from unittest.mock import Mock
+        db = Mock()
+        db.get.side_effect = AssertionError('event ingestion must not read SQLite')
+        with patch.object(config, 'main', db):
+            for enabled in (False, True):
+                routing._settings['jev_enabled'] = enabled
+                for _ in range(100):
+                    await event_bus.enqueue('dds:/sensor/imu', '{}')
+                if not enabled:
+                    await event_bus.enqueue('asr', 'hello')
+                    await event_bus.enqueue('message', 'hello')
+            snapshot = routing.settings()
+            snapshot['jev_enabled'] = False
+            self.assertTrue(routing.settings()['jev_enabled'])
+        db.get.assert_not_called()
+        self.api.assert_not_called()
+
+    async def test_failed_persistence_does_not_publish_settings(self):
+        from unittest.mock import MagicMock
+        db = MagicMock()
+        db.__setitem__.side_effect = OSError('disk unavailable')
+        before = routing.settings()
+        with patch.object(config, 'main', db):
+            with self.assertRaises(OSError):
+                await routing.configure({'jev_enabled': False})
+        self.assertEqual(routing.settings(), before)
+
+    async def test_status_file_io_runs_off_event_loop(self):
+        import fastapi
+        import httpx
+        import threading
+        from api import canvas
+        app = fastapi.FastAPI()
+        app.include_router(canvas.router, prefix='/api')
+        main_thread = threading.get_ident()
+        threads = []
+        original = routing.identity
+        def observed(cfg):
+            threads.append(threading.get_ident())
+            return original(cfg)
+        with patch.object(routing, 'identity', side_effect=observed):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+                result = await client.get('/api/canvas/semantic-routing')
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(threads)
+        self.assertNotIn(main_thread, threads)
 
     async def test_full_identity_history_and_audio_contract(self):
         await self.send()
@@ -357,11 +406,18 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_bus._queue.qsize(), 1)
 
     async def test_config_persists_in_isolated_sqlite(self):
-        with patch.object(config, 'main', config.ConfigDB()):
+        with patch.object(config, 'main', config.ConfigDB()), patch.object(routing, '_settings', dict(routing.DEFAULTS)):
             await routing.configure({'jev_enabled': True, 'jev_identity_path': str(self.identity)})
             self.assertTrue(config.ConfigDB()['semantic_routing']['jev_enabled'])
+            self.assertTrue(routing.settings()['jev_enabled'])
+            # Fresh module initialization simulates restart, not the live cache.
+            spec = importlib.util.spec_from_file_location('routing_restart', routing.__file__)
+            restarted = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(restarted)
+            self.assertEqual(restarted.settings(), routing.settings())
             await routing.configure({'jev_enabled': False})
             self.assertFalse(config.ConfigDB()['semantic_routing']['jev_enabled'])
+            self.assertFalse(routing.settings()['jev_enabled'])
 
     async def test_clear_identity_path_restores_default(self):
         with patch.object(routing, 'DEFAULT_IDENTITY_PATH', str(self.identity)):

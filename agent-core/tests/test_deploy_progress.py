@@ -90,7 +90,12 @@ def test_preflight_checks():
     print()
 
 
-async def test_progress_stream():
+def test_progress_stream():
+    """Run under plain pytest too; no async plugin or silent skip required."""
+    asyncio.run(_progress_stream())
+
+
+async def _progress_stream():
     """Test progress streaming (mock)."""
     print("\n=== Testing Progress Stream (Mock) ===\n")
 
@@ -119,7 +124,7 @@ async def test_progress_stream():
             )
             await asyncio.sleep(0.5)
 
-        await progress.update('com配置…')
+        await progress.update('compose', '生成配置…')
         await asyncio.sleep(0.5)
 
         await progress.update('start', '启动容器…')
@@ -162,7 +167,7 @@ async def main():
         test_preflight_checks()
 
         # Test 2: Progress streaming
-        await test_progress_stream()
+        await _progress_stream()
 
         # Test 3: Error messages
         test_error_messages()
