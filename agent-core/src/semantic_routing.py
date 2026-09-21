@@ -343,14 +343,41 @@ _invalidating = False
 _invalidate_lock = asyncio.Lock()
 _commit_lock = asyncio.Lock()
 _diagnostics = deque(maxlen=100)
+_ACTIVITY_INTERVAL_S = 1.0
+_activity_task = None
+_activity_pending = None
+_activity_count = 0
+_activity_next_at = 0.0
+
+
+async def _publish_activity():
+    """Best-effort latest-value sampling; one task and one pending item only."""
+    global _activity_pending, _activity_count, _activity_next_at
+    from api.motus_stream import push_event
+    while _activity_pending is not None:
+        delay = _activity_next_at - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        item = {**_activity_pending, 'coalesced': _activity_count - 1}
+        _activity_pending, _activity_count = None, 0
+        try:
+            await push_event({'type': 'semantic_routing', 'payload': item})
+        except Exception:
+            # Dashboard delivery must not affect routing or spawn retry/log
+            # storms. The bounded diagnostic ring still contains the evidence.
+            pass
+        _activity_next_at = time.monotonic() + _ACTIVITY_INTERVAL_S
 
 
 def note(event, reason, **fields):
+    global _activity_task, _activity_pending, _activity_count
     item = {'event_id': event.get('_routing_id'), 'source': event.get('source'),
             'reason': reason, 'ts': time.time(), **fields}
     _diagnostics.append(item)
-    from api.motus_stream import push_event
-    asyncio.create_task(push_event({'type': 'semantic_routing', 'payload': item}))
+    _activity_pending = item
+    _activity_count += 1
+    if _activity_task is None or _activity_task.done():
+        _activity_task = asyncio.create_task(_publish_activity())
 
 
 async def commit(event, mode=None, version=None):

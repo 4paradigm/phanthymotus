@@ -39,7 +39,7 @@ ACP 完成、传感器、调度器和子 Agent 回执不调用 Jev。Channel 权
 - 配置校验/持久化在线程中执行，串行合并并以事务更新 Jev 与卡片配置；删除卡片配置时同时重置 Jev。数据库写入失败返回 HTTP 503，事务回滚，不把部分删除说成成功。配置请求取消不会取消已开始的数据库事务，重连后应刷新读取实际状态。
 - `GET /api/canvas/semantic-routing` 返回只读状态及最近 100 条诊断，不返回身份正文、历史或密钥。
 - `decision_core info` 同样提供 `semantic_routing` 状态。
-- Activity 的 `semantic_routing` 区分判断结果与 `dispatch` 实际分流；可能出现 `not_addressed`、`uncertain_default`、`queue_full`、`project_stopped` 或错误类型。
+- Activity 的 `semantic_routing` 区分判断结果与 `dispatch` 实际分流；可能出现 `not_addressed`、`uncertain_default`、`queue_full`、`project_stopped` 或错误类型。实时推送全局最多每秒一次，突发期间合并为最新一条，`coalesced` 表示本次合并省略的条数；不是逐消息审计流。即使客户端很慢，也只保留一个推送任务和一个待发样本，不堆积任务。检查具体消息的判断/分流应读取上述接口的最近 100 条诊断；旧记录会被覆盖，需要现场留证时及时读取。
 - `api_ms` 只代表 Jev 调用，不是从说话到停播的时延。`queue_ms` 为 Core 判断队列等待。
 - 原 ASR 监视画面仍显示识别文本；显示出来不代表 Core 已接受。VAD `on_hearing` 也不是语义唤醒成功。
 

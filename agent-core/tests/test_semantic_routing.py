@@ -54,6 +54,10 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                          patch.object(routing, '_settings', self.cfg['semantic_routing']),
                          patch.object(routing, '_configure_lock', asyncio.Lock()),
                          patch.object(routing, '_commit_lock', asyncio.Lock()),
+                         patch.object(routing, '_activity_task', None),
+                         patch.object(routing, '_activity_pending', None),
+                         patch.object(routing, '_activity_count', 0),
+                         patch.object(routing, '_activity_next_at', 0.0),
                          patch.dict(os.environ, {'TYPESAFE_API_KEY': 'fake-test-key'}),
                          patch.object(routing, 'runtime_snapshot', side_effect=self.snapshot),
                          patch.object(routing, 'request_jev', new_callable=AsyncMock)]
@@ -80,6 +84,9 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.cfg['core']['project_running'] = False
         await routing.invalidate()
+        if routing._activity_task:
+            routing._activity_task.cancel()
+            await asyncio.gather(routing._activity_task, return_exceptions=True)
         if self.consumer:
             self.consumer.cancel()
             try:
@@ -99,6 +106,59 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                                             'priority': 1}) if voice else text)
         if routing._worker:
             await routing._worker
+
+    async def test_asr_burst_activity_is_rate_limited_with_bounded_diagnostics(self):
+        from api import motus_stream
+        self.cfg['core']['project_running'] = False
+        with patch.object(motus_stream, 'push_event', new_callable=AsyncMock) as push:
+            for _ in range(1000):
+                await event_bus.enqueue('asr', 'rejected burst')
+            first_task = routing._activity_task
+            await asyncio.wait_for(first_task, 1)
+            self.assertEqual(push.await_count, 1)
+            self.assertEqual(push.call_args.args[0]['payload']['coalesced'], 999)
+            self.assertEqual(len(routing._diagnostics), 100)
+            for _ in range(1000):
+                await event_bus.enqueue('asr', 'second burst')
+            await asyncio.sleep(0.02)
+            self.assertEqual(push.await_count, 1)  # global one-second cooldown
+            await asyncio.wait_for(routing._activity_task, 2)
+            self.assertEqual(push.await_count, 2)
+            self.assertEqual(push.call_args.args[0]['payload']['coalesced'], 999)
+            self.assertIsNone(routing._activity_pending)
+            self.assertEqual(len(routing._diagnostics), 100)
+        self.api.assert_not_called()
+
+    async def test_slow_activity_sink_keeps_only_one_pending_sample(self):
+        from api import motus_stream
+        started, release = asyncio.Event(), asyncio.Event()
+        async def slow(*args):
+            started.set()
+            await release.wait()
+        with patch.object(motus_stream, 'push_event', side_effect=slow) as push:
+            routing.note({'source': 'asr'}, 'first')
+            await asyncio.wait_for(started.wait(), 1)
+            task = routing._activity_task
+            for n in range(1000):
+                routing.note({'source': f'asr:{n}'}, 'dispatch', actual='followup')
+                self.assertIs(routing._activity_task, task)
+            self.assertEqual(push.await_count, 1)
+            self.assertEqual(routing._activity_pending['source'], 'asr:999')
+            self.assertEqual(routing._activity_count, 1000)
+            self.assertEqual(len(routing._diagnostics), 100)
+            release.set()
+            await asyncio.wait_for(task, 2)
+            self.assertEqual(push.await_count, 2)
+            self.assertEqual(push.call_args.args[0]['payload']['source'], 'asr:999')
+
+    async def test_activity_failure_does_not_break_routing_or_retry_forever(self):
+        from api import motus_stream
+        with patch.object(motus_stream, 'push_event', side_effect=OSError('offline')) as push:
+            await self.send(False)
+            await asyncio.wait_for(routing._activity_task, 1)
+            self.assertEqual(push.await_count, 1)
+            self.assertEqual(event_bus._queue.qsize(), 1)
+            self.assertTrue(routing._diagnostics)
 
     async def test_disabled_is_exact_passthrough(self):
         self.cfg['semantic_routing']['jev_enabled'] = False
