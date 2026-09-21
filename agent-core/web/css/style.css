@@ -9034,10 +9034,15 @@ html, body {
 .bm-tl-fail { margin-bottom: 8px; font-size: 12px; color: var(--yellow); }
 
 /* 时间列在正中间：两侧都贴着它，同一秒必然同一行。 */
+/* `minmax(0, 1fr)`，不是 `1fr`。后者等于 `minmax(auto, 1fr)`，而 `auto` 的最小尺寸
+   是内容尺寸 —— 一段长播报会把轨道整个撑开，文字跑出单元格压到邻行上。展开一条
+   长对话就能看到两行字叠在一起。 */
 .bm-tl-r {
-  display: grid; grid-template-columns: 1fr 64px 1fr; gap: 10px;
+  display: grid; grid-template-columns: minmax(0, 1fr) 64px minmax(0, 1fr); gap: 10px;
   align-items: baseline; padding: 2px 0;
 }
+/* 网格子项默认 `min-width: auto`，同一个道理：不让它缩，就只能溢出。 */
+.bm-tl-left, .bm-tl-right { min-width: 0; }
 .bm-tl-r--headrow {
   padding: 8px 0 6px; border-bottom: 1px solid var(--border); margin-bottom: 4px;
   font-size: 11px; font-weight: 600; color: var(--text-muted);
@@ -9071,7 +9076,13 @@ html, body {
   display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; vertical-align: bottom; cursor: pointer;
 }
-.bm-clip--open { white-space: pre-wrap; word-break: break-word; overflow: visible; }
+/* 展开之后是**块级**并且照常裁剪。原先是 `overflow: visible` 的 inline-block ——
+   内容溢出盒子，而盒子的高度还是收起时的一行，于是它盖在下一行上。块级 + 换行让
+   盒子自己长高，`hidden` 就不会裁到任何东西。 */
+.bm-clip--open {
+  display: block; white-space: pre-wrap; word-break: break-word;
+  overflow: hidden; max-width: 100%;
+}
 .bm-clip:hover { text-decoration: underline dotted var(--border-med); }
 
 /* 每一段静默都画出来：排查时要看的就是时间去哪儿了。短停顿是节奏，安静地记一笔；
