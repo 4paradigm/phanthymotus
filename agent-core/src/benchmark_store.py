@@ -186,6 +186,22 @@ def finish_run(run_id: str, *, status: str = 'done', score_total: float | None =
     conn.commit()
 
 
+def set_session(run_id: str, session_id: str) -> None:
+    """补记会话 id。
+
+    开跑那一刻 agent 可能还**没有**会话 —— agent-core 刚重启、这一轮之前没人说过话，
+    `event.llm._session_id` 就是空的，而会话正是被这次运行的指令创建出来的。记成空
+    之后再没人回头补，于是运行详情左栏永远是「这次运行的对话记录已经没有了」，尽管
+    右栏的世界事实一条不少。
+    """
+    if not session_id:
+        return
+    conn = _get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?',
+                 (session_id, run_id))
+    conn.commit()
+
+
 def mark_stale_runs() -> int:
     """启动时把还标着 `running` 的运行记为中断。
 

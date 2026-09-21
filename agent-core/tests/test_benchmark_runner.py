@@ -668,3 +668,41 @@ def test_alignment_anchors_on_scenario_load_not_on_elapsed():
     asyncio.run(world._align())
 
     assert world._t_offset == 3377718.5
+
+
+def test_a_run_started_before_any_conversation_backfills_its_session():
+    """**开跑那一刻 agent 可能还没有会话。**
+
+    agent-core 刚重启、这一轮之前没人说过话，`event.llm._session_id` 就是空的 ——
+    而会话恰恰是被这次运行的指令创建出来的。记成空之后再没人回头补，于是运行详情
+    左栏永远是「这次运行的对话记录已经没有了」，尽管右栏的世界事实一条不少，看起来
+    像 agent 什么都没做。Orin6 上就是这么现形的。
+    """
+    run_id = benchmark_store.create_run('没有会话就开跑')
+    run = benchmark_runner.CaseRun({}, None, 1, 0, run_id, {})
+    run.state = 'running'
+
+    import api.benchmark as api_benchmark
+    original, api_benchmark._current_session = api_benchmark._current_session, lambda: 'sess-1'
+    try:
+        assert run._session_id() == 'sess-1'
+        assert (benchmark_store.get_run(run_id) or {}).get('session_id') == 'sess-1'
+    finally:
+        api_benchmark._current_session = original
+        benchmark_store.delete_run(run_id)
+
+
+def test_a_finished_run_never_adopts_whatever_session_is_current():
+    """跑完的那条若补上「现在」的会话，等于把一段无关的对话安到一次历史运行上 ——
+    而它看起来完全正常：有轮次、有工具调用、时间也对得上窗口。"""
+    run_id = benchmark_store.create_run('跑完的')
+    run = benchmark_runner.CaseRun({}, None, 1, 0, run_id, {})
+    run.state = 'done'
+
+    import api.benchmark as api_benchmark
+    original, api_benchmark._current_session = api_benchmark._current_session, lambda: 'sess-9'
+    try:
+        assert run._session_id() == ''
+    finally:
+        api_benchmark._current_session = original
+        benchmark_store.delete_run(run_id)

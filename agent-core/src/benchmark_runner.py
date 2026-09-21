@@ -369,11 +369,34 @@ class CaseRun:
                                'observations': seen, 'judge': verdict},
                               error=verdict['error'])
 
+    def _session_id(self, live: bool = False) -> str:
+        """这次运行对应哪一段对话，必要时现补。
+
+        **开跑那一刻 agent 可能还没有会话** —— agent-core 刚重启、这一轮之前没人说过
+        话，`event.llm._session_id` 就是空的，而会话恰恰是被这次运行的指令创建出来的。
+        记成空之后再没人回头补，于是运行详情左栏永远是「这次运行的对话记录已经没有
+        了」，尽管右栏的世界事实一条不少 —— 看起来像 agent 什么都没做。
+
+        只在**这次运行还活着**的时候补：跑完的那条记录若补上「现在」的会话，等于把
+        一段无关的对话安到一次历史运行上，而它看起来完全正常。
+        """
+        stored = benchmark_store.get_run(self.run_id) or {}
+        known = str(stored.get('session_id') or '')
+        if known or not (live or self.state in ('running', 'starting')):
+            return known
+        try:
+            from api.benchmark import _current_session
+            found = _current_session()
+        except Exception:
+            return ''
+        if found:
+            benchmark_store.set_session(self.run_id, found)
+        return found
+
     def _agent_track_now(self, window: tuple) -> list:
         try:
             from api.benchmark import _agent_track
-            stored = benchmark_store.get_run(self.run_id) or {}
-            return _agent_track(stored.get('session_id', ''), window[0], window[1])
+            return _agent_track(self._session_id(), window[0], window[1])
         except Exception:
             return []
 
@@ -507,7 +530,10 @@ class CaseRun:
         try:
             from api.benchmark import _agent_track
             stored = benchmark_store.get_run(self.run_id) or {}
-            return _agent_track(stored.get('session_id', ''),
+            # `live=True`：定格发生在收尾那一刻，`state` 已经翻成 done/aborted，但
+            # 「现在的会话」仍然就是这次运行的那段。这里不补，一次从头到尾没调过
+            # `_agent_track_now` 的运行会把左栏永久定格成空。
+            return _agent_track(self._session_id(live=True),
                                 stored.get('started_at'), time.time())
         except Exception:
             return []
