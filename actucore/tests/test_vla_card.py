@@ -1504,3 +1504,68 @@ def test_the_provider_omits_the_field_entirely_when_there_is_no_pose():
 
     provider.infer(Observation(images={}, state=[0.0], eef_state=POSE))
     assert sent["eef_state"] == POSE
+
+
+# ── mock 要能验**任何**动作空间的通路，那是它存在的理由 ─────────────────────
+
+EEF_DESC = {
+    "control_interface": "motus.control/1", "mode": "eef_pose", "dof": 17,
+    "joint_names": [f"a{i}" for i in range(17)],
+    "units": {"length": "m"},
+    "limits": {"lower": [-0.6] * 17, "upper": [0.9] * 17},
+    "rate": {"max_hz": 50, "expected_hz": 30, "watchdog_ms": 200},
+    "force_torque": None,
+    "groups": [
+        {"name": "eef_l", "offset": 0, "count": 7, "mode": "eef_pose"},
+        {"name": "eef_r", "offset": 7, "count": 7, "mode": "eef_pose"},
+        {"name": "waist", "offset": 14, "count": 3, "mode": "joint_position"},
+    ],
+}
+
+
+def _mock_on(descriptor):
+    from plugins.vla.providers.mock import MockProvider
+    return MockProvider(descriptor, amplitude=0.05, period_s=8.0, chunk_size=5)
+
+
+def test_mock_reports_the_downstream_action_space_not_a_fixed_one():
+    """写死 `joint_position` 让 mock **验不了任何非关节空间的卡片**。
+
+    真机实测 2026-09-21（G1）：接到 `servo_eef` 上协商当场拒——「模型输出
+    'joint_position' 空间的动作，下游接受 'eef_pose'」。拒得对，但那说明这条通路
+    根本没法用 mock 验，而"验证通路"是 mock 存在的全部理由。
+
+    这个信号本来就照着下游的 limits 生成 —— 它没有自己的动作空间，只有下游那个。
+    """
+    assert _mock_on(EEF_DESC).capabilities()["control_mode"] == "eef_pose"
+
+
+def test_mock_still_defaults_to_joint_position_without_a_mode():
+    """今天每一个 descriptor 都带 mode，但缺了也不能变成空串——那会被协商拒。"""
+    d = dict(EEF_DESC)
+    d.pop("mode")
+    assert _mock_on(d).capabilities()["control_mode"] == "joint_position"
+
+
+def test_mock_emits_unit_quaternions_for_eef_segments():
+    """**逐分量的正弦对四元数是错的。**
+
+    四个分量各自摆一条正弦，合起来不是单位长度，`ControlSink._check_contract`
+    会把每一条都拒掉 —— 通路依然验不成，只是失败挪后了一道。修 control_mode 而
+    不修这个，等于把门从协商挪到契约检查。
+    """
+    import math
+    provider = _mock_on(EEF_DESC)
+    worst = 0.0
+    for _ in range(20):
+        for step in provider.infer(None):
+            for offset in (3, 10):
+                norm = math.sqrt(sum(v * v for v in step[offset:offset + 4]))
+                worst = max(worst, abs(norm - 1.0))
+    assert worst < 1e-6, f"最大偏离 {worst}"
+
+
+def test_mock_leaves_non_eef_segments_alone():
+    """腰那三维是关节角，照旧走逐分量的正弦。"""
+    step = _mock_on(EEF_DESC).infer(None)[-1]
+    assert any(abs(v) > 1e-9 for v in step[14:17]), "腰应当在动"
