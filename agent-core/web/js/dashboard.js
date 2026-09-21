@@ -558,6 +558,7 @@ function summarize(event) {
     case 'mcp_call':      return `${p.tool || ''}(${truncate(JSON.stringify(p.args || {}), 80)})`;
     case 'mcp_result':    return `← ${truncate(JSON.stringify(p.result), 100)}`;
     case 'agent_thought': return p.text || '';
+    case 'semantic_routing': return `Jev ${p.reason || ''}: ${p.proposed || '默认'} → ${p.actual || '待分流'}`;
     case 'render':        return `renderer=${p.renderer}`;
     case 'status':        return 'connected' in p
                             ? (p.connected ? '● 已连接' : '○ 断开')

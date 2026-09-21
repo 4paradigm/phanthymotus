@@ -1340,6 +1340,34 @@ async def _raw_input_info(
 _event_instance: 'Event | None' = None
 
 
+def routing_snapshot(candidate: dict | None = None) -> dict:
+    """Read-only view of exactly the main loop's retained conversation.
+
+    Do not use the short bg summaries: routing needs cross-channel context and
+    the live turn. The candidate itself has not entered history yet.
+    """
+    import copy
+    import collector
+    from semantic_routing import text_only
+    inst = _event_instance
+    restricted = bool(candidate and collector.has_bot_channel_event([candidate])
+                      and not collector.has_trusted_bot_channel_event([candidate]))
+    history = inst._build_history() if inst and not restricted else []
+    if inst and collector._busy and not restricted and not _last_turn_restricted:
+        history = history + _sanitize(_scrub(inst._current_turn))
+    session = inst._session_id if inst else None
+    return {
+        'version': (session, collector._turn_epoch),
+        'history': text_only(copy.deepcopy(history)),
+        'runtime': {
+            'main_loop_busy': collector._busy,
+            'pending_messages': bool(collector.has_steering() or not collector._output.empty()),
+            'actions_busy': mcp_client.resource_actually_busy(None),
+            'active_work': [] if restricted else _active_work_summary(),
+        },
+    }
+
+
 def get_recent_context(max_turns: int = 5) -> str:
     """返回最近 N 轮 main agent 的 assistant 输出摘要，供 bg subagent 同步上下文。"""
     if not _event_instance or not _event_instance._turns:

@@ -939,6 +939,8 @@ async def _do_stop_project():
     core = config.main.get('core', {})
     core['project_running'] = False
     config.main['core'] = core
+    import semantic_routing
+    await semantic_routing.invalidate()
     await push_event({'type': 'project_state', 'payload': {'running': False}})
     print('[stop-project] done')
 
@@ -1508,5 +1510,4 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
-
 

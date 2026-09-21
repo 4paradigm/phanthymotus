@@ -389,6 +389,14 @@ def delete_all_tool_configs() -> int:
     bring their own configs, and leftovers would keep pushing stale settings
     (old topics, old device paths) to plugins that the new canvas reuses.
     """
+    import semantic_routing
+    # Replacing a solution with an older one must not leave invisible Jev state
+    # enabled. New solution configs can explicitly enable it after validation.
+    config.main['semantic_routing'] = dict(semantic_routing.DEFAULTS)
+    try:
+        asyncio.get_running_loop().create_task(semantic_routing.invalidate(deliver_text=True))
+    except RuntimeError:
+        pass
     try:
         conn = config._get_conn()
         cur = conn.execute("DELETE FROM config WHERE key LIKE ?",
@@ -409,14 +417,34 @@ async def get_all_tool_configs():
 @router.put('/tool-config/{mcp_id}/{tool_name}')
 async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        import semantic_routing
+        if not isinstance(body, dict):
+            raise fastapi.HTTPException(400, '配置必须为对象')
+        try:
+            # Validate BEFORE persistence; the old fire-and-forget path hides
+            # plugin errors and would falsely report an invalid switch as saved.
+            cfg = await semantic_routing.configure(body)
+            body = {**body, **cfg}
+        except ValueError as exc:
+            raise fastapi.HTTPException(400, str(exc)) from exc
     config.main[tool_config_key(mcp_id, tool_name)] = body
     apply_tool_config(mcp_id, tool_name, body)
     return {'code': 200}
 
 
+@router.get('/semantic-routing')
+async def semantic_routing_status():
+    import semantic_routing
+    return {'code': 200, 'data': semantic_routing.status()}
+
+
 @router.delete('/tool-config/{mcp_id}/{tool_name}')
 async def delete_tool_config(mcp_id: str, tool_name: str):
     """Delete config for a tool."""
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        import semantic_routing
+        await semantic_routing.configure(semantic_routing.DEFAULTS)
     try:
         conn = config._get_conn()
         conn.execute("DELETE FROM config WHERE key = ?",

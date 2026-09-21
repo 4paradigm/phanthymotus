@@ -859,6 +859,13 @@ async def _handle_agentcore_call(req: MCPCallRequest):
     import topic_subscriber
 
     action = req.arguments.get('action', '')
+    if req.tool == 'decision_core' and action == 'config':
+        import semantic_routing
+        if any(k in req.arguments for k in semantic_routing.DEFAULTS):
+            try:
+                await semantic_routing.configure(req.arguments)
+            except ValueError as exc:
+                return {'code': 400, 'message': str(exc)}
     input_topic = req.arguments.get('input_topic', '')
     input_topics = req.arguments.get('input_topics', [])
     # Merge single + list params
@@ -929,6 +936,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             # 按 10 轮跑」这件事在接口和日志里可见，而不是停留在某个进程的内存里。
             'narration_effective': dict(zip(('rounds', 'seconds'),
                                             _narration_thresholds())),
+            'semantic_routing': __import__('semantic_routing').status(),
         }}
 
     elif action == 'config':

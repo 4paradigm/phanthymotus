@@ -12,6 +12,8 @@ services:
       - /opt/phanthy-motus:/opt/phanthy-motus
     environment:
       - DB_PATH=/work/resource/data.db
+      # Optional Core-only semantic routing; unset keeps the Canvas switch unavailable.
+      - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}
       - COMPOSE_DIR=/opt/phanthy-motus
       - CONTAINER_NAME=phanthy-motus-agent-core-1
       # 所有机器人共用 domain 42：内部 DDS 被 dds-local.xml 锁在 loopback，

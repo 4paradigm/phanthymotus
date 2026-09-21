@@ -34,6 +34,7 @@ _BG_THROTTLE_INTERVAL = 1.0
 
 # ── 共享状态 ──────────────────────────────────────────────────────────────────
 _busy: bool = False
+_turn_epoch: int = 0  # monotonic turn boundary for semantic-routing snapshots
 _cancel_event: asyncio.Event | None = None
 # 比 _cancel_event 窄：steer 模式下高优先级事件到达时置位，只打断"正在飞的 LLM
 # 请求"或"还没发出去、卡在排队里的 tool_call"，不像 _cancel_event 那样让整个 turn
@@ -53,6 +54,10 @@ _barge_in_threshold_ms: int = 500
 
 def _extract_priority(ev: dict) -> int:
     """从事件中解析 priority。JSON text 中的 priority 字段优先，否则按 source 匹配。"""
+    if ev.get('_semantic_interaction'):
+        # Internal-only metadata, never read this flag from untrusted payload.
+        original = {k: v for k, v in ev.items() if k != '_semantic_interaction'}
+        return max(1, _extract_priority(original))
     text = ev.get('text', '')
     if text and text.startswith('{'):
         try:
@@ -97,7 +102,7 @@ def _extract_perf_timestamps(ev: dict):
     except (ValueError, TypeError):
         return
     if 'spans' in data:
-        ev['_perf_spans'] = data['spans']
+        ev['_perf_spans'] = data['spans'] + ev.get('_perf_spans', [])
         return
     spans = []
     audio_start = data.get('audio_start_ts')
@@ -110,7 +115,7 @@ def _extract_perf_timestamps(ev: dict):
         spans.append({'span': 'asr_inference', 'start_ts': audio_end, 'end_ts': asr_complete,
                       'meta': {'text_length': data.get('text_length')}})
     if spans:
-        ev['_perf_spans'] = spans
+        ev['_perf_spans'] = spans + ev.get('_perf_spans', [])
 
 
 def _extract_asr_text_field(ev: dict) -> str:
@@ -139,7 +144,9 @@ def _pending_has_same_asr_text(asr_text: str) -> bool:
 
 def set_busy(busy: bool):
     """由 agent loop 调用：标记当前是否正在执行 turn。"""
-    global _busy
+    global _busy, _turn_epoch
+    if _busy != busy:
+        _turn_epoch += 1
     _busy = busy
     if not busy:
         # turn 结束时立即排空所有 pending 队列，避免消息跨 turn 滞留
@@ -697,11 +704,14 @@ async def _drain_loop():
 
         if priority > 0:
             # ── P>0: 送 main agent ──
+            import semantic_routing
             if not _busy:
+                semantic_routing.consume_mode(ev)
                 await _emit_batch([ev], urgent=True)
             else:
                 # Barge-in 检测：ASR 事件 duration 不足时视为 backchannel，丢弃
-                if 'asr' in source.lower() and _barge_in_threshold_ms > 0:
+                if ('asr' in source.lower() and _barge_in_threshold_ms > 0
+                        and not ev.get('_semantic_voice')):
                     duration_ms = ev.get('payload', {}).get('duration_ms', 0)
                     if 0 < duration_ms < _barge_in_threshold_ms:
                         continue  # backchannel，不打断
@@ -711,10 +721,13 @@ async def _drain_loop():
                     _asr_text = _extract_asr_text_field(ev)
                     if _asr_text and _pending_has_same_asr_text(_asr_text):
                         print(f'[collector] dedup: ASR text "{_asr_text[:30]}" already pending, skip')
+                        if ev.get('_semantic_route'):
+                            semantic_routing.note(ev, 'duplicate_pending', actual='reject')
                         continue
 
                 # 按模式处理
-                if _interrupt_mode == 'steer':
+                event_mode = semantic_routing.consume_mode(ev)
+                if event_mode == 'steer':
                     if has_bot_channel_event([ev]):
                         _priority_pending.append(ev)
                         continue
@@ -733,13 +746,15 @@ async def _drain_loop():
                     except asyncio.QueueFull:
                         # queue 满时退化为 followup
                         _priority_pending.append(ev)
+                        if ev.get('_semantic_route'):
+                            semantic_routing.note(ev, 'steering_full', actual='followup')
                     # 除了排队，还叫醒当前可能卡住的 LLM 请求/barrier 等待——不结束
                     # turn（那是 _cancel_event 的事），只是让主循环别等到自然结束才
                     # 看到这条消息。消息内容本身已经在 steering_queue 里了，这里只
                     # 是个"该回头看看了"的信号。
                     if _reconsider_event:
                         _reconsider_event.set()
-                elif _interrupt_mode == 'interrupt':
+                elif event_mode == 'interrupt':
                     # Interrupt: 缓存事件并触发 cancel
                     _priority_pending.append(ev)
                     if _cancel_event and not has_bot_channel_event([ev]):

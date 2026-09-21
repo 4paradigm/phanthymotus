@@ -27,6 +27,14 @@ async def enqueue(source: str, text: str, payload: dict | None = None) -> None:
         'payload': payload or {},
         'ts':      time.time(),
     }
+    import semantic_routing
+    if await semantic_routing.submit(event):
+        return
+    await enqueue_accepted(event)
+
+
+async def enqueue_accepted(event: dict) -> None:
+    """Internal commit after admission; never use an external 'approved' flag."""
     await _queue.put(event)
     _recent.append(event)
     if len(_recent) > 100:

@@ -138,6 +138,7 @@ function _summarize(event) {
     // 「静默undefined轮」。in_turn 区分"turn 还在跑"和"turn 结束后子代理还在干"。
     case 'narration':      return `📢 ${p.text || ''} (静默${p.silent_seconds}s${p.in_turn ? '' : '·后台'})`;
     case 'asr_result':     return `"${p.text || ''}"`;
+    case 'semantic_routing': return `Jev ${p.source || ''} · ${p.reason || ''} · 建议 ${p.proposed || '默认'} → ${p.actual || '待分流'}${p.api_ms != null ? ` · ${p.api_ms}ms` : ''}`;
     case 'trigger':        return p.text || _trunc(JSON.stringify(p), 60);
     case 'peer_pair_request': return `${p.display_name || p.peer_id?.slice(0, 12) || 'peer'} 请求配对 · 验证码 ${p.code}`;
     case 'peer_tool_call':   return `${p.peer || 'peer'} → ${p.tool}${p.action ? `(${p.action})` : ''}`;

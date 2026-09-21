@@ -606,6 +606,23 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   const configKey = `${mcpId}:${toolName}`;
   const savedValues = _toolConfigs[configKey] || {};
 
+  // Optional same-origin runtime diagnostics supplied by the tool schema.
+  const statusUrl = configSchema?.['x-status-url'];
+  if (typeof statusUrl === 'string' && statusUrl.startsWith('/api/') && !statusUrl.includes('..')) {
+    const statusEl = document.createElement('pre');
+    statusEl.className = 'tool-config-status';
+    statusEl.style.whiteSpace = 'pre-wrap';
+    statusEl.style.overflowWrap = 'anywhere';
+    statusEl.style.marginBottom = '16px';
+    statusEl.textContent = '读取运行配置状态…';
+    bodyEl.appendChild(statusEl);
+    fetch(statusUrl).then(async resp => {
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const {data} = await resp.json();
+      statusEl.textContent = data.summary || JSON.stringify(data, null, 2);
+    }).catch(err => { statusEl.textContent = `状态读取失败：${err.message}`; });
+  }
+
   // If all fields are instance-scope, show them here too (as shared defaults)
   const hasSharedFields = Object.values(props).some(d => d.scope !== 'instance');
 
@@ -810,7 +827,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     if (!(await ensureEdit())) return;
     const values = {};
     for (const input of bodyEl.querySelectorAll('[data-key]')) {
-      if (!input.value.trim()) continue;
+      if (!input.value.trim() && !props[input.dataset.key]?.['x-empty-default']) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
       if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
@@ -830,7 +847,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         body: JSON.stringify(values),
       });
       if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+        const error = await resp.json().catch(() => ({}));
+        alert(`配置保存失败 (HTTP ${resp.status}): ${error.detail || error.message || ''}`);
         return;
       }
     } catch (err) {

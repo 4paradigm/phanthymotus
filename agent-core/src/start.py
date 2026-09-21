@@ -24,6 +24,7 @@ import scheduler
 import daily_summary
 import topic_subscriber
 import mcp_client
+import semantic_routing
 from channel.manager import manager as channel_manager
 
 
@@ -119,6 +120,7 @@ def _register_core_mcp(silent=False):
                 }},
                 'configSchema': {
                     'type': 'object',
+                    'x-status-url': '/api/canvas/semantic-routing',
                     'properties': {
                         'llm_url':   {'type': 'string', 'description': 'LLM API URL'},
                         'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password'},
@@ -197,6 +199,8 @@ def _register_core_mcp(silent=False):
         'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}],
         'topic_in': [{'format': 'data/json'}],
     })
+
+    existing[-1]['tools'][0]['configSchema']['properties'].update(semantic_routing.SCHEMA)
 
     # Register Channel as independent internal MCP (no MCP-level topics)
     existing = [m for m in existing if m.get('id') != 'channel']
@@ -491,6 +495,7 @@ async def lifespan(app):
         try:
             yield
         finally:
+            await semantic_routing.invalidate()
             for t in tasks:
                 t.cancel()
             await channel_manager.stop()

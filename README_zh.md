@@ -34,6 +34,8 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 
 ## 特性
 
+Core 可选 [Jev 消息接入与智能路由](docs/core-message-semantic-routing.md)：Canvas 的 decision_core 开关默认关闭；启用后先过滤非面向机器人的语音，再为语音和文字交互选择 steer / interrupt / followup。
+
 - **可视化编排** — 拖拽式 Web Dashboard，在画布上连接设备、传感器和 AI 模型
 - **MCP 数据总线** — 统一的 [Model Context Protocol](https://modelcontextprotocol.io) 硬件接口
 - **事件驱动 Agent Loop** — LLM 驱动的推理引擎，支持多轮工具调用，由实时传感器事件触发

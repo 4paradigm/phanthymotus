@@ -15,7 +15,9 @@ import config
 router = fastapi.APIRouter(prefix='/agent', tags=['agent'])
 
 
-_IDENTITY_PATH = pathlib.Path('./resource/memory/identity.md')
+from semantic_routing import DEFAULT_IDENTITY_PATH
+
+_IDENTITY_PATH = pathlib.Path(DEFAULT_IDENTITY_PATH)
 _SYSTEM_PATH = pathlib.Path('./resource/memory/prompt_system.md')
 
 
