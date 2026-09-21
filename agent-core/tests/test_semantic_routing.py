@@ -21,6 +21,18 @@ import event_bus
 import semantic_routing as routing
 
 
+class MemoryConfig(dict):
+    def update_atomic(self, values, *, delete_keys=(), delete_prefix=None):
+        self.update(copy.deepcopy(values))
+        keys = set(delete_keys)
+        if delete_prefix is not None:
+            keys.update(k for k in self if k.startswith(delete_prefix))
+        removed = sum(k in self for k in keys)
+        for key in keys:
+            self.pop(key, None)
+        return removed
+
+
 def response(mode='steer', addressed=0.99, confidence=0.99):
     return {'model': 'jev-test', 'answers': {
         'addressed': {'type': 'noul', 'noul': addressed},
@@ -32,11 +44,12 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.identity = Path(_TEMP.name) / 'identity.md'
         self.identity.write_text('你是机器人小范。\n' * 300, encoding='utf-8')
-        self.cfg = {'core': {'project_running': True},
+        self.cfg = MemoryConfig({'core': {'project_running': True},
                     'semantic_routing': {**routing.DEFAULTS, 'jev_enabled': True,
-                                         'jev_identity_path': str(self.identity)}}
+                                         'jev_identity_path': str(self.identity)}})
         self.patchers = [patch.object(config, 'main', self.cfg),
                          patch.object(routing, '_settings', self.cfg['semantic_routing']),
+                         patch.object(routing, '_configure_lock', asyncio.Lock()),
                          patch.dict(os.environ, {'TYPESAFE_API_KEY': 'fake-test-key'}),
                          patch.object(routing, 'runtime_snapshot', side_effect=self.snapshot),
                          patch.object(routing, 'request_jev', new_callable=AsyncMock)]
@@ -119,7 +132,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
     async def test_failed_persistence_does_not_publish_settings(self):
         from unittest.mock import MagicMock
         db = MagicMock()
-        db.__setitem__.side_effect = OSError('disk unavailable')
+        db.update_atomic.side_effect = OSError('disk unavailable')
         before = routing.settings()
         with patch.object(config, 'main', db):
             with self.assertRaises(OSError):
@@ -360,7 +373,10 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(routing.settings()['jev_enabled'])
 
     async def test_real_history_snapshot_preserves_context_and_isolation(self):
-        llm = importlib.import_module('event.llm')
+        # Module initialization needs the normal seeded client config, even
+        # when this file runs alone rather than after other suite imports.
+        with patch.object(config, 'main', config.ConfigDB()):
+            llm = importlib.import_module('event.llm')
         inst = llm.Event()
         inst._turns = [[{'role': 'user', 'content': '网页里的问题'},
                         {'role': 'assistant', 'content': '网页里的回答'}]]
@@ -425,6 +441,93 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(routing.settings()['jev_identity_path'], '')
             self.assertEqual(routing.identity(routing.settings())[1], self.identity.read_text())
 
+    async def test_delete_failure_rolls_back_database_and_runtime(self):
+        import fastapi
+        import httpx
+        from api import canvas
+        db = config.ConfigDB()
+        before = routing.settings()
+        key = 'tool_config:agentcore:decision_core'
+        db.update_atomic({'semantic_routing': before, key: before})
+        conn = config._get_conn()
+        conn.execute("CREATE TRIGGER reject_core_delete BEFORE DELETE ON config "
+                     "WHEN OLD.key = 'tool_config:agentcore:decision_core' "
+                     "BEGIN SELECT RAISE(ABORT, 'test locked delete'); END")
+        conn.commit()
+        conn.close()
+        app = fastapi.FastAPI()
+        app.include_router(canvas.router, prefix='/api')
+        try:
+            with patch.object(config, 'main', db):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+                    result = await client.delete('/api/canvas/tool-config/agentcore/decision_core')
+                self.assertEqual(result.status_code, 503)
+                self.assertEqual(db[key], before)
+                self.assertEqual(db['semantic_routing'], before)
+                self.assertEqual(routing.settings(), before)
+        finally:
+            conn = config._get_conn()
+            conn.execute('DROP TRIGGER reject_core_delete')
+            conn.commit()
+            conn.close()
+        with patch.object(config, 'main', db):
+            await canvas.delete_tool_config('agentcore', 'decision_core')
+        self.assertNotIn(key, db)
+        self.assertEqual(db['semantic_routing'], routing.DEFAULTS)
+        self.assertEqual(routing.settings(), routing.DEFAULTS)
+
+    async def test_concurrent_writes_merge_without_blocking_ingestion(self):
+        import threading
+        started, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        main_thread = threading.get_ident()
+        threads = []
+        original = self.cfg.update_atomic
+        def delayed(*args, **kwargs):
+            threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(3):
+                raise TimeoutError('test worker release')
+            return original(*args, **kwargs)
+        with patch.object(self.cfg, 'update_atomic', side_effect=delayed):
+            first = asyncio.create_task(routing.configure({'jev_addressed_threshold': 0.8}))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                second = asyncio.create_task(routing.configure({'jev_route_threshold': 0.9}))
+                await event_bus.enqueue('dds:/sensor/imu', '{}')
+                self.assertEqual(event_bus._queue.qsize(), 1)
+                self.assertEqual(routing.settings()['jev_addressed_threshold'], 0.5)
+            finally:
+                release.set()
+            await asyncio.gather(first, second)
+        self.assertNotIn(main_thread, threads)
+        self.assertEqual(routing.settings()['jev_addressed_threshold'], 0.8)
+        self.assertEqual(routing.settings()['jev_route_threshold'], 0.9)
+        self.assertEqual(routing.settings(), self.cfg['semantic_routing'])
+
+    async def test_cancelled_request_finishes_committed_cache_publication(self):
+        import threading
+        started, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        original = self.cfg.update_atomic
+        def delayed(*args, **kwargs):
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(3):
+                raise TimeoutError('test worker release')
+            return original(*args, **kwargs)
+        with patch.object(self.cfg, 'update_atomic', side_effect=delayed):
+            request = asyncio.create_task(routing.configure({'jev_enabled': False}))
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                request.cancel()
+                await asyncio.sleep(0)
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+        self.assertEqual(routing.settings(), self.cfg['semantic_routing'])
+        self.assertFalse(routing.settings()['jev_enabled'])
+
     async def test_solution_marks_identity_path_local_secret_reference(self):
         from api.solutions import _must_clear_props
         sensitive, _ = _must_clear_props({'properties': routing.SCHEMA})
@@ -464,8 +567,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_solution_replace_disables_old_invisible_setting(self):
         from api.canvas import delete_all_tool_configs
-        delete_all_tool_configs()
-        await asyncio.sleep(0)
+        await delete_all_tool_configs()
         self.assertFalse(routing.settings()['jev_enabled'])
 
     async def test_candidate_arriving_during_invalidation_is_not_stranded(self):

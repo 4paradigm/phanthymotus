@@ -1120,7 +1120,7 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     notify_layout_changed()
 
     # 卡片配置：先清空旧的，再写包体里的
-    removed = delete_all_tool_configs()
+    removed = await delete_all_tool_configs()
     written = 0
     for key, value in (canvas.get('toolConfigs') or {}).items():
         parts = key.split(':')

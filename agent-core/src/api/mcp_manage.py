@@ -866,6 +866,8 @@ async def _handle_agentcore_call(req: MCPCallRequest):
                 await semantic_routing.configure(req.arguments)
             except ValueError as exc:
                 return {'code': 400, 'message': str(exc)}
+            except Exception:
+                return {'code': 503, 'message': '配置数据库写入失败，旧配置保留'}
     input_topic = req.arguments.get('input_topic', '')
     input_topics = req.arguments.get('input_topics', [])
     # Merge single + list params

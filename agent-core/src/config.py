@@ -3,6 +3,7 @@ import os
 import sqlite3
 import json
 import pathlib
+from contextlib import closing
 
 
 # ── .env 加载 ─────────────────────────────────────────────────────────────────
@@ -398,6 +399,20 @@ _migrate()
 
 
 class ConfigDB:
+    def update_atomic(self, values, *, delete_keys=(), delete_prefix=None):
+        """Commit related config rows together; any failure rolls back all rows."""
+        removed = 0
+        with closing(_get_conn()) as conn, conn:
+            for key, value in values.items():
+                conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
+                             (key, json.dumps(value)))
+            for key in delete_keys:
+                removed += conn.execute('DELETE FROM config WHERE key = ?', (key,)).rowcount
+            if delete_prefix is not None:
+                removed += conn.execute('DELETE FROM config WHERE substr(key, 1, ?) = ?',
+                                        (len(delete_prefix), delete_prefix)).rowcount
+        return removed
+
     def __getitem__(self, key: str):
         with _get_conn() as conn:
             row = conn.execute('SELECT value FROM config WHERE key = ?', (key,)).fetchone()

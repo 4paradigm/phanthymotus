@@ -382,7 +382,7 @@ def all_tool_configs() -> dict:
     return result
 
 
-def delete_all_tool_configs() -> int:
+async def delete_all_tool_configs() -> int:
     """Drop every saved tool config. Returns the number of rows removed.
 
     Only used when a solution replaces the whole canvas: the incoming cards
@@ -392,19 +392,10 @@ def delete_all_tool_configs() -> int:
     import semantic_routing
     # Replacing a solution with an older one must not leave invisible Jev state
     # enabled. New solution configs can explicitly enable it after validation.
-    semantic_routing.reset_settings()
     try:
-        asyncio.get_running_loop().create_task(semantic_routing.invalidate(deliver_text=True))
-    except RuntimeError:
-        pass
-    try:
-        conn = config._get_conn()
-        cur = conn.execute("DELETE FROM config WHERE key LIKE ?",
-                           (f'{_TOOL_CONFIG_PREFIX}%',))
-        conn.commit()
-        return cur.rowcount or 0
-    except Exception:
-        return 0
+        return await semantic_routing.reset_settings(delete_prefix=_TOOL_CONFIG_PREFIX)
+    except Exception as exc:
+        raise fastapi.HTTPException(503, '配置数据库写入失败，旧配置保留') from exc
 
 
 @router.get('/tool-configs')
@@ -424,11 +415,14 @@ async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body
         try:
             # Validate BEFORE persistence; the old fire-and-forget path hides
             # plugin errors and would falsely report an invalid switch as saved.
-            cfg = await semantic_routing.configure(body)
+            cfg = await semantic_routing.configure(body, tool_key=tool_config_key(mcp_id, tool_name))
             body = {**body, **cfg}
         except ValueError as exc:
             raise fastapi.HTTPException(400, str(exc)) from exc
-    config.main[tool_config_key(mcp_id, tool_name)] = body
+        except Exception as exc:
+            raise fastapi.HTTPException(503, '配置数据库写入失败，旧配置保留') from exc
+    else:
+        config.main[tool_config_key(mcp_id, tool_name)] = body
     apply_tool_config(mcp_id, tool_name, body)
     return {'code': 200}
 
@@ -444,7 +438,11 @@ async def delete_tool_config(mcp_id: str, tool_name: str):
     """Delete config for a tool."""
     if mcp_id == 'agentcore' and tool_name == 'decision_core':
         import semantic_routing
-        await semantic_routing.configure(semantic_routing.DEFAULTS)
+        try:
+            await semantic_routing.reset_settings(delete_keys=(tool_config_key(mcp_id, tool_name),))
+        except Exception as exc:
+            raise fastapi.HTTPException(503, '配置数据库写入失败，旧配置保留') from exc
+        return {'code': 200}
     try:
         conn = config._get_conn()
         conn.execute("DELETE FROM config WHERE key = ?",

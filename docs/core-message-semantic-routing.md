@@ -30,6 +30,7 @@ ACP 完成、传感器、调度器和子 Agent 回执不调用 Jev。Channel 权
 ## 排查与接口
 
 - Canvas 配置仍经 `PUT /api/canvas/tool-config/agentcore/decision_core` 保存；无效开关配置返回 HTTP 400，原配置不变。
+- 配置校验/持久化在线程中执行，串行合并并以事务更新 Jev 与卡片配置；删除卡片配置时同时重置 Jev。数据库写入失败返回 HTTP 503，事务回滚，不把部分删除说成成功。配置请求取消不会取消已开始的数据库事务，重连后应刷新读取实际状态。
 - `GET /api/canvas/semantic-routing` 返回只读状态及最近 100 条诊断，不返回身份正文、历史或密钥。
 - `decision_core info` 同样提供 `semantic_routing` 状态。
 - Activity 的 `semantic_routing` 区分判断结果与 `dispatch` 实际分流；可能出现 `not_addressed`、`uncertain_default`、`queue_full`、`project_stopped` 或错误类型。
@@ -52,6 +53,10 @@ ACP 完成、传感器、调度器和子 Agent 回执不调用 Jev。Channel 权
 PR 首轮镜像测试为 1330 通过、12 失败、1 跳过，不能用上述定向测试代替全量。审查修复增加配置内存快照（启动加载，保存成功/替换 Solution 时更新）、诊断工作线程及相关回归；12 项打断测试改为显式 patch 模块。全量执行还发现原先跳过的部署进度模拟测试参数错误，已修正并改成普通 pytest 可执行入口，不涉及真实部署。
 
 审查修复后本地 Python 3.10.20 / pytest 9.1.1 全量结果：1346 passed、8 subtests passed、零失败/跳过，41.53 秒，退出码 0；36 项 Node 测试通过。退出仍出现 event-loop 析构告警，未隐藏。镜像内结果与 Bot 审查结论以 PR 最新提交对应记录为准，不以本地结果替代。
+
+`f7118d0a` 镜像内全量 1346 通过、0 失败。第二轮针对异步配置写入/事务问题修复后，本地 Python 3.10 全量 1349 passed、8 subtests passed，35.07 秒，退出码 0，无失败/跳过，本次未出现析构告警；新增真实 SQLite 故障回滚、并发写入、取消请求一致性测试。
+
+外部判断使用 HTTPS 和默认服务端证书校验；不下载或执行模型代码。API 返回没有另行提供应用层签名，信任 TypeSafe 服务端及 TLS 链路；类型校验不构成对判断正确性的保证。
 
 部署模板中的 `TYPESAFE_API_KEY` 仅用于向 Core 传入可选服务端凭据，不增加包、镜像层或复制数据；不需要修改 Dockerfile。没有配置密钥时，Canvas 无法成功启用 Jev。
 

@@ -61,21 +61,11 @@ QUESTIONS = {
 # Load once at process startup, before producers begin ingesting events. All
 # runtime writers below publish a new snapshot only after persistence succeeds.
 _settings = {**DEFAULTS, **config.main.get('semantic_routing', {})}
+_configure_lock = asyncio.Lock()
 
 
 def settings():
     return dict(_settings)
-
-
-def _save_settings(cfg):
-    global _settings
-    config.main['semantic_routing'] = cfg
-    _settings = dict(cfg)
-
-
-def reset_settings():
-    """Solution replacement must reset both persisted and effective settings."""
-    _save_settings(DEFAULTS)
 
 
 class IdentityUnavailable(ValueError):
@@ -118,12 +108,44 @@ def validate(values, *, preflight=True):
     return cfg
 
 
-async def configure(values):
-    cfg = validate(values)
-    if cfg != settings():
-        _save_settings(cfg)
-        await invalidate(deliver_text=True)
+async def _change_settings(values, *, tool_key=None, delete_keys=(), delete_prefix=None):
+    async def change():
+        global _settings
+        # Serialize read/validate/write/publish, including concurrent HTTP/MCP
+        # calls. Thread workers do I/O only; runtime state stays on this loop.
+        async with _configure_lock:
+            cfg = await asyncio.to_thread(validate, values)
+            changed = cfg != settings()
+            rows = {'semantic_routing': cfg}
+            if tool_key is not None:
+                rows[tool_key] = {**values, **cfg}
+            removed = 0
+            if changed or tool_key is not None or delete_keys or delete_prefix is not None:
+                removed = await asyncio.to_thread(config.main.update_atomic, rows,
+                                                 delete_keys=delete_keys, delete_prefix=delete_prefix)
+                _settings = dict(cfg)
+                await invalidate(deliver_text=True)
+            return cfg, removed
+
+    # Cancelling an HTTP request cannot cancel an already running SQLite worker.
+    # Finish publication/invalidation before releasing the mutation lock.
+    task = asyncio.create_task(change())
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+async def configure(values, *, tool_key=None):
+    cfg, _ = await _change_settings(values, tool_key=tool_key)
     return cfg
+
+
+async def reset_settings(*, delete_keys=(), delete_prefix=None):
+    """Reset runtime and related persisted rows as one serialized operation."""
+    _, removed = await _change_settings(DEFAULTS, delete_keys=delete_keys, delete_prefix=delete_prefix)
+    return removed
 
 
 def decode(event):
