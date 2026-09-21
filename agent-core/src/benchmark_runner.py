@@ -139,32 +139,70 @@ def unsafe_cards(simulator_mcp_id: str | None = None) -> list[dict]:
 
 
 class SimulatorWorld:
-    """仿真器持有的世界：可重置、可记账，事实由 `sim_report` 给出（含轨迹）。"""
+    """仿真器持有的世界：可重置、可记账，事实由 `sim_report` 给出（含轨迹）。
+
+    **但不是只由 `sim_report` 给出。** 这里原先把 `sim_report` 当作唯一来源，理由是
+    「仿真器看得见世界」—— 对，可它只看得见**仿真器自己那几张卡**。画布上一张卡若不是
+    仿真器的（最常见的就是 perception 的 `tts`：它合成真实音频、发到 `/perception/tts`），
+    仿真世界里不会留下任何痕迹。症状是运行日志左边 agent 明明在 `tts.speak`，右边
+    「世界真的做了什么」那一列一句播报都没有，而两边都没有任何报错。
+
+    所以两路都开：仿真器的事实为底（轨迹占用、到达这些只有它算得出），agent-core 自己
+    记的那份补上仿真器看不见的部分。同一个动作两边都记时按 `action_id` 去重 —— 卡片返回
+    给 agent-core 的 `action_id` 就是世界给这个动作的 id，两边对得上。
+    """
 
     kind = 'simulator'
     resettable = True
 
     def __init__(self, mcp_id: str):
         self.mcp_id = mcp_id
+        self._recorder = None
 
     async def _call(self, tool: str, args: dict) -> dict:
         result = await mcp_client.call_tool_direct(self.mcp_id, tool, args)
         return result if isinstance(result, dict) else {'error': str(result)}
 
     async def reset(self, run: dict, seed: int) -> dict:
+        self._recorder = benchmark_facts.start()
         world = run.get('world') or {}
         return await self._call(SCENARIO_TOOL, {
             'action': 'reset', 'map': world.get('map', ''),
             'spawn': world.get('spawn') or {}, 'seed': seed, 'owner': OWNER})
 
     async def release(self) -> None:
+        benchmark_facts.stop()
+        self._recorder = None
         await self._call(SCENARIO_TOOL, {'action': 'abort', 'owner': OWNER})
 
     async def note(self, text: str) -> None:
         await self._call(SCENARIO_TOOL, {'action': 'note', 'text': text})
 
     async def facts(self) -> dict:
-        return await self._call(REPORT_TOOL, {'what': 'report'})
+        report = await self._call(REPORT_TOOL, {'what': 'report'})
+        recorder = self._recorder or benchmark_facts.current()
+        if recorder is None or not isinstance(report, dict):
+            return report
+        return _merge_facts(report, recorder.facts())
+
+
+def _merge_facts(report: dict, mine: dict) -> dict:
+    """仿真器的事实为底，补上它看不见的那些。
+
+    **只合事件，不合 `acp_posts`。** 后者是 `exactly_one_terminal_post` 用来数
+    「同一个动作上报了几次」的，按 `action_id` 去重会把真的重复上报一起抹掉 —— 那正是
+    它要抓的东西。仿真器那份已经完整。
+    """
+    seen = {str(e.get('action_id')) for e in (report.get('events') or [])
+            if e.get('action_id')}
+    extra = [e for e in (mine.get('events') or [])
+             if str(e.get('action_id') or '') not in seen]
+    if not extra:
+        return report
+    events = sorted((report.get('events') or []) + extra,
+                    key=lambda e: float(e.get('t') or 0.0))
+    return {**report, 'events': events,
+            'source': 'simulator+agent-core'}
 
 
 class RealWorld:

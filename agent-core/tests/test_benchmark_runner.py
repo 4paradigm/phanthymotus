@@ -566,3 +566,48 @@ def test_the_gate_announces_itself(capsys):
     assert '智能控制未启动' in first and first.count('智能控制未启动') == 1  # 只说一次
     assert 'dds:/camera/objects' in first
     assert '丢弃 2 条' in second
+
+
+# ── 仿真器看不见非仿真的卡 ───────────────────────────────────────────────────
+
+def test_simulator_world_merges_what_the_simulator_cannot_see():
+    """**`sim_report` 只看得见仿真器自己那几张卡。**
+
+    画布上绑的若是 perception 的 `tts`（它合成真实音频、发到 `/perception/tts`），
+    仿真世界里不会留下任何痕迹 —— 运行日志左边 agent 明明在 `tts.speak`，右边
+    「世界真的做了什么」一句播报都没有，两边都没有报错。Orin6 上就是这么现形的。
+    """
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'nav_start', 't': 1.0, 'action_id': 'a1'},
+                    {'event': 'arrive', 't': 9.0, 'action_id': 'a1'}],
+         'acp_posts': [{'action_id': 'a1'}], 'trail_occupied': 0},
+        {'events': [{'event': 'speak_start', 't': 4.0, 'action_id': 's1'},
+                    {'event': 'speak_end', 't': 7.0, 'action_id': 's1'}],
+         'acp_posts': [{'action_id': 's1'}]})
+
+    assert [e['event'] for e in merged['events']] == [
+        'nav_start', 'speak_start', 'speak_end', 'arrive']
+    assert merged['trail_occupied'] == 0          # 只有仿真器算得出的量原样留着
+
+
+def test_an_action_both_sides_saw_is_not_counted_twice():
+    """仿真器的卡两边都会记：卡片返回给 agent-core 的 `action_id` 就是世界给这个动作
+    的 id。不去重的话导航会被数成两次，而时序和并行度全是按这些事件算的。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'nav_start', 't': 1.0, 'action_id': 'a1'}],
+         'acp_posts': []},
+        {'events': [{'event': 'nav_start', 't': 1.1, 'action_id': 'a1'}],
+         'acp_posts': []})
+
+    assert len(merged['events']) == 1
+
+
+def test_acp_posts_are_never_merged():
+    """`exactly_one_terminal_post` 数的就是「同一个动作上报了几次」。把两侧的 posts
+    按 action_id 去重，会把它要抓的那种真重复一起抹掉。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [], 'acp_posts': [{'action_id': 'a1'}, {'action_id': 'a1'}]},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': [{'action_id': 's1'}]})
+
+    assert merged['acp_posts'] == [{'action_id': 'a1'}, {'action_id': 'a1'}]
