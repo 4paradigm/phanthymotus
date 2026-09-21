@@ -886,6 +886,8 @@ async def call_tool(full_name: str, args: dict) -> str:
             else:
                 return f'[{tool_name}] 尚未配置，请先在设备面板中完成配置（provider/url/key）后再启动。'
 
+    from semantic_routing import begin_robot_speech, finish_robot_speech
+    speech_ref = begin_robot_speech(mcp_id, tool_name, args)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             result = await _jrpc(session, url, 'tools/call', {
@@ -900,8 +902,10 @@ async def call_tool(full_name: str, args: dict) -> str:
     # The driver answered with a JSON-RPC error. Hand it to the model verbatim —
     # this is the difference between "the model retries correctly" and "the model
     # believes it moved the robot".
+    finish_robot_speech(speech_ref, result)
     jrpc_err = result.get(JRPC_ERROR_KEY)
     if jrpc_err is not None:
+        finish_robot_speech(speech_ref, {'error': True})
         code = jrpc_err.get('code') if isinstance(jrpc_err, dict) else None
         emsg = jrpc_err.get('message') if isinstance(jrpc_err, dict) else str(jrpc_err)
         print(f'[mcp] {full_name} → error {code}: {emsg}')
@@ -1389,13 +1393,17 @@ async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
         "method": "tools/call",
         "params": {"name": tool_name, "arguments": args},
     }
+    from semantic_routing import begin_robot_speech, finish_robot_speech
+    speech_ref = begin_robot_speech(mcp_id, tool_name, args)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 data = await resp.json()
                 if "error" in data:
+                    finish_robot_speech(speech_ref, {'error': True})
                     return {"error": data["error"]}
                 result = data.get("result", {})
+                finish_robot_speech(speech_ref, result)
                 # Extract text content from MCP response
                 content = result.get("content", [])
                 if content and isinstance(content, list):

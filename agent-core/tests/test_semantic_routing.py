@@ -35,8 +35,10 @@ class MemoryConfig(dict):
         return removed
 
 
-def response(mode='steer', addressed=0.99, confidence=0.99):
+def response(mode='steer', addressed=0.99, confidence=0.99, audience='human_to_robot'):
     return {'model': 'jev-test', 'answers': {
+        'audience': {'type': 'choice', 'choice': audience, 'confidence': 0.99,
+                     'probabilities': {k: float(k == audience) for k in routing.AUDIENCES}},
         'addressed': {'type': 'noul', 'noul': addressed},
         'route': {'type': 'choice', 'choice': mode, 'confidence': confidence,
                   'probabilities': {k: float(k == mode) for k in (*routing.MODES, 'uncertain')}}}}
@@ -68,6 +70,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         routing._queue.clear()
         routing._worker = None
         routing._diagnostics.clear()
+        routing._robot_speech.clear()
         event_bus._queue = asyncio.Queue(maxsize=1024)
         event_bus._recent.clear()
         collector._output = asyncio.Queue(maxsize=64)
@@ -159,6 +162,93 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(push.await_count, 1)
             self.assertEqual(event_bus._queue.qsize(), 1)
             self.assertTrue(routing._diagnostics)
+
+    async def test_other_addressee_and_echo_cannot_steer_even_if_addressed_high(self):
+        collector._busy = True
+        for audience in ('human_to_other', 'robot_echo', 'uncertain'):
+            self.api.return_value = response('steer', addressed=0.99, audience=audience)
+            await self.send(True, '小李，我想到了一个问题')
+            self.assertTrue(event_bus._queue.empty())
+            self.assertFalse(event_bus.recent())
+            self.assertTrue(collector._steering_queue.empty())
+            self.assertTrue(any(d['reason'] == audience and d.get('actual') == 'reject'
+                                for d in routing._diagnostics))
+
+    async def test_audience_missing_malformed_or_uncertain_fails_closed(self):
+        for value in (None, {}, {'type': 'choice', 'choice': 'human_to_robot'},
+                      {**response()['answers']['audience'], 'confidence': 0.1},
+                      {**response()['answers']['audience'], 'confidence': float('nan')}):
+            self.api.return_value = response()
+            self.api.return_value['answers']['audience'] = value
+            await self.send(True)
+            self.assertTrue(event_bus._queue.empty())
+
+    async def test_exact_speech_fragment_rejected_before_jev_not_mixed_or_short(self):
+        import hooks
+        with patch.object(hooks, 'list_hooks', return_value={'on_notify': [
+                {'mcp_id': 'local', 'tool': 'voice', 'action': 'say'}]}):
+            ref = routing.begin_robot_speech('local', 'voice', {
+                'action': 'say', 'text': '我可以介绍展厅的机器人，还能帮你拍照。'})
+        self.assertIsNotNone(ref)
+        await self.send(True, '介绍展厅的机器人。')
+        self.api.assert_not_called()
+        self.assertTrue(event_bus._queue.empty())
+        for text in ('停一下', '介绍展厅的机器人，先别讲了', '帮我联系小李'):
+            await self.send(True, text)
+            self.assertEqual((await event_bus.dequeue())['payload']['text'], text)
+        self.assertTrue(self.api.call_args.args[0]['recent_robot_speech'])
+        ref['expires'] = time.monotonic() - 1
+        await self.send(True, '介绍展厅的机器人。')
+        self.assertEqual(event_bus._queue.qsize(), 1)
+
+    async def test_speech_references_are_bounded_and_failed_calls_removed(self):
+        import hooks
+        with patch.object(hooks, 'list_hooks', return_value={'on_notify': [
+                {'mcp_id': 'local', 'tool': 'voice', 'action': 'say'}]}):
+            self.assertIsNone(routing.begin_robot_speech('local', 'search', {'text': '普通文本工具'}))
+            self.assertIsNone(routing.begin_robot_speech('peer', 'voice', {'action': 'say', 'text': '远程'}))
+            for n in range(40):
+                ref = routing.begin_robot_speech('local', 'voice', {'action': 'say', 'text': f'第{n}次播报'})
+            self.assertEqual(len(routing._robot_speech), 16)
+            routing.finish_robot_speech(ref, {'content': [{'text': '{"status":"error"}'}]})
+            self.assertEqual(len(routing._robot_speech), 15)
+            self.assertIsNone(routing.begin_robot_speech('local', 'voice', {'action': 'say', 'text': 'x' * 4097}))
+            self.cfg['semantic_routing']['jev_enabled'] = False
+            self.assertIsNone(routing.begin_robot_speech('local', 'voice', {'action': 'say', 'text': '关闭'}))
+
+    async def test_real_mcp_dispatch_records_reference_before_request_and_removes_failure(self):
+        import hooks, mcp_client
+        schema = {'mcp__local__voice__say': {'tool': 'voice', 'action': 'say'}}
+        entry = {'url': 'http://unused', 'online': True, 'tools': ['voice'], 'split_map': schema}
+        async def rpc(*args):
+            self.assertEqual(len(routing._robot_speech), 1)
+            return {'content': [{'type': 'text', 'text': '{"status":"error"}'}]}
+        with patch.object(hooks, 'list_hooks', return_value={'on_notify': [
+                {'mcp_id': 'local', 'tool': 'voice', 'action': 'say'}]}), \
+                patch.object(mcp_client, 'registry', {'local': entry}), \
+                patch.object(mcp_client, '_jrpc', side_effect=rpc):
+            await mcp_client.call_tool('mcp__local__voice__say', {'text': '播报工具返回失败'})
+        self.assertFalse(routing._robot_speech)
+
+    async def test_direct_hook_dispatch_records_reference(self):
+        import hooks, mcp_client
+        from unittest.mock import MagicMock
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        resp = MagicMock()
+        resp.__aenter__.return_value = resp
+        async def result():
+            self.assertEqual(len(routing._robot_speech), 1)
+            return {'result': {'content': [{'type': 'text', 'text': '{"status":"accepted"}'}]}}
+        resp.json = AsyncMock(side_effect=result)
+        session.post.return_value = resp
+        with patch.object(hooks, 'list_hooks', return_value={'on_notify': [
+                {'mcp_id': 'local', 'tool': 'voice', 'action': 'say'}]}), \
+                patch.object(mcp_client, 'registry', {'local': {'url': 'http://unused', 'online': True}}), \
+                patch.object(mcp_client.aiohttp, 'ClientSession', return_value=session):
+            result = await mcp_client.call_tool_hook('local', 'voice', {'action': 'say', 'text': '系统主动播报'})
+        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual(len(routing._robot_speech), 1)
 
     async def test_disabled_is_exact_passthrough(self):
         self.cfg['semantic_routing']['jev_enabled'] = False
@@ -897,6 +987,69 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             await _REAL_REQUEST_JEV({}, True, routing.settings())
         self.assertEqual(session.post.call_args.kwargs['headers']['Authorization'],
                          'Bearer persisted-fixture-key')
+
+    async def test_provider_presets_use_real_request_contract(self):
+        from unittest.mock import MagicMock
+        reply = MagicMock(status=200)
+        reply.json = AsyncMock(return_value=response())
+        session = MagicMock()
+        session.post.return_value.__aenter__ = AsyncMock(return_value=reply)
+        client = MagicMock()
+        client.return_value.__aenter__ = AsyncMock(return_value=session)
+        with patch.object(routing.aiohttp, 'ClientSession', client), patch.dict(os.environ, {
+                'TYPESAFE_API_KEY': 'typesafe-fixture', 'OPEN_ROUTER_KEY': 'router-fixture',
+                'OPENROUTER_API_KEY': ''}):
+            for base, suffix, model, key in (
+                    (routing.TYPESAFE_BASE_URL, '/systemone', 'jev-latest', 'typesafe-fixture'),
+                    (routing.OPENROUTER_BASE_URL, '/decisions', 'typesafe/jev-1.13', 'router-fixture')):
+                cfg = {**routing.DEFAULTS, 'jev_base_url': base}
+                await _REAL_REQUEST_JEV({'message': 'synthetic'}, True, cfg)
+                args = session.post.call_args
+                self.assertEqual(args.args[0], base + suffix)
+                self.assertEqual(args.kwargs['headers']['Authorization'], 'Bearer ' + key)
+                self.assertEqual(args.kwargs['json']['model'], model)
+                self.assertEqual(args.kwargs['json']['questions'], routing.QUESTIONS)
+                self.assertFalse(args.kwargs['allow_redirects'])
+                await _REAL_REQUEST_JEV({}, False, cfg)
+                self.assertEqual(set(session.post.call_args.kwargs['json']['questions']), {'route'})
+
+    async def test_provider_switch_reuses_one_key_and_persists(self):
+        await routing.configure({'jev_api_key': 'one-private-key'})
+        await routing.configure({'jev_base_url': routing.OPENROUTER_BASE_URL})
+        self.assertEqual(routing.api_key(), 'one-private-key')
+        await routing.configure({'jev_api_key': 'new-router-key'})
+        self.assertEqual(self.cfg[routing._CREDENTIAL_ROW], {'api_key': 'new-router-key'})
+        spec = importlib.util.spec_from_file_location('routing_provider_restart', routing.__file__)
+        restarted = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(restarted)
+        self.assertEqual(restarted.settings()['jev_base_url'], routing.OPENROUTER_BASE_URL)
+        self.assertEqual(restarted.api_key(), 'new-router-key')
+        await routing.configure({'jev_base_url': routing.TYPESAFE_BASE_URL, 'jev_api_key': ''})
+        self.assertEqual(routing.api_key(), 'new-router-key')  # user replaces key on switch
+        self.assertNotIn('new-router-key', routing.text_only('new-router-key'))
+
+    async def test_provider_canvas_save_refresh_and_failure_atomicity(self):
+        import fastapi, httpx
+        from api import canvas
+        app = fastapi.FastAPI()
+        app.include_router(canvas.router, prefix='/api')
+        url = '/api/canvas/tool-config/agentcore/decision_core'
+        with patch.object(canvas, 'apply_tool_config', new_callable=AsyncMock):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as c:
+                saved = await c.put(url, json={'jev_base_url': routing.OPENROUTER_BASE_URL,
+                                               'jev_api_key': 'private-router-fixture'})
+                self.assertEqual(saved.status_code, 200)
+                readback = await c.get(url)
+                self.assertIn(routing.OPENROUTER_BASE_URL, readback.text)
+                self.assertNotIn('private-router-fixture', readback.text)
+                before = copy.deepcopy(self.cfg)
+                with patch.object(self.cfg, 'update_atomic', side_effect=OSError('disk full')):
+                    failed = await c.put(url, json={'jev_base_url': routing.TYPESAFE_BASE_URL,
+                                                    'jev_api_key': 'replacement-key'})
+                self.assertEqual(failed.status_code, 503)
+                self.assertEqual(self.cfg, before)
+                self.assertEqual(routing.settings()['jev_base_url'], routing.OPENROUTER_BASE_URL)
+                self.assertEqual(routing.api_key(), 'private-router-fixture')
 
     async def test_identity_deleted_during_request_rejects_voice(self):
         async def deleted(*args):
