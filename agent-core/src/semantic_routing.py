@@ -172,15 +172,17 @@ async def reset_settings(*, delete_keys=(), delete_prefix=None):
 async def replace_canvas_settings(layout, tool_configs):
     """Validate Solution Jev fields before replacing any layout/config row."""
     key = 'tool_config:agentcore:decision_core'
+    # Validate the original instance fields, including credentials, before
+    # sanitizing shared imports. Otherwise key-only instances appear valid.
+    for name, value in tool_configs.items():
+        if name.startswith(key + ':') and isinstance(value, dict) and set(value) & set(SCHEMA):
+            raise ValueError('Solution 中 Jev 配置必须放在 decision_core 共享配置中')
     # A Solution never imports credentials, even if a hand-edited package
     # supplies one. Keep the machine's existing key across replacement.
     tool_configs = {name: ({k: v for k, v in value.items() if k != 'jev_api_key'}
                           if name == key or name.startswith(key + ':') else value)
                     if isinstance(value, dict) else value
                     for name, value in tool_configs.items()}
-    for name, value in tool_configs.items():
-        if name.startswith(key + ':') and isinstance(value, dict) and set(value) & set(DEFAULTS):
-            raise ValueError('Solution 中 Jev 配置必须放在 decision_core 共享配置中')
     incoming = tool_configs.get(key, {})
     if not isinstance(incoming, dict):
         raise ValueError('decision_core 配置必须为对象')
@@ -227,6 +229,9 @@ def event_kind(event):
 
 def message_text(event):
     data = decode(event)
+    if 'text' not in data and 'message' not in data and any(
+            data.get(key) for key in ('files', 'attachments', 'images')):
+        return ''  # attachment envelope is not the user's textual instruction
     text = data.get('text', data.get('message', event.get('text', '')))
     return text if isinstance(text, str) else ''
 

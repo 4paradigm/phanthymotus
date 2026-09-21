@@ -814,10 +814,43 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(collector._extract_priority(await event_bus.dequeue()), 3)
 
     async def test_attachment_only_message_is_not_dropped(self):
-        original = json.dumps({'text': '', 'files': [{'name': 'example.png'}]})
+        for payload in ({'text': '', 'files': [{'name': 'example.png'}]},
+                        {'files': [{'name': 'example.png'}]},
+                        {'attachments': [{'name': 'example.png'}]},
+                        {'images': ['fixture-image']}):
+            original = json.dumps(payload)
+            await event_bus.enqueue('dds:/channel/request/demo', original)
+            self.api.assert_not_called()
+            self.assertEqual((await event_bus.dequeue())['text'], original)
+
+    async def test_text_with_attachment_still_uses_jev(self):
+        original = json.dumps({'text': '解释一下这张图', 'files': [{'name': 'example.png'}]})
         await event_bus.enqueue('dds:/channel/request/demo', original)
-        self.api.assert_not_called()
+        await routing._worker
+        self.api.assert_awaited_once()
         self.assertEqual((await event_bus.dequeue())['text'], original)
+
+    async def test_solution_rejects_all_instance_jev_fields_before_changes(self):
+        from api import canvas, solutions
+        from api import config as config_api
+        import fastapi
+        await routing.configure({'jev_api_key': 'machine-fixture-key'})
+        before = copy.deepcopy(self.cfg)
+        with patch.object(canvas, 'apply_tool_config') as apply, \
+                patch.object(canvas, 'notify_layout_changed') as notify, \
+                patch.object(config_api, 'stop_removed_cards', new_callable=AsyncMock) as stop:
+            for field in routing.SCHEMA:
+                package = {'cards': [{'id': 'core', 'deviceRef': 'core', 'toolName': 'decision_core'}],
+                           'toolConfigs': {'core:decision_core:core': {field: 'injected-fixture'}}}
+                with self.assertRaises(fastapi.HTTPException) as error:
+                    await solutions._apply_canvas(package, {'core': 'agentcore'})
+                self.assertEqual(error.exception.status_code, 400, field)
+                self.assertEqual(self.cfg, before)
+                self.assertEqual(routing.api_key(), 'machine-fixture-key')
+                self.assertEqual(package['toolConfigs']['core:decision_core:core'][field], 'injected-fixture')
+            apply.assert_not_called()
+            stop.assert_not_called()
+            notify.assert_not_called()
 
 
 if __name__ == '__main__':
