@@ -19,7 +19,9 @@
  *  2. **分数旁边必须有被测配置。** 「换了模型 / 改了镜像之后分数动没动」才是真正
  *     有人问的问题；不显示 llm_model 和 tag，两行分数之间没有可比性。
  *
- * 面板只在检测到仿真器时出现 —— 出厂的机器人不该看到一个 Benchmark 标签。
+ * **「运行」跑的永远是当前画布。** 用例贡献指令、插话和评判标准；把它自带的画布搬进来
+ * 是另一个动作（「载入画布」），覆盖确认挂在那里。两件事原先绑在一起，于是一个自带空
+ * 画布的新用例，点一下「运行」就把用户手上的画布清空了。
  */
 
 import { showToast } from './toast.js';
@@ -46,6 +48,8 @@ async function api(path, opts) {
 
 let _pollTimer = null;
 let _runId = null;
+// 仿真器的 mcp_id，没有就是 null —— 也就是这次运行会驱动真实设备。
+let _simulator = null;
 
 export function initBenchmark() {
   initEditor(_loadLibrary);
@@ -66,11 +70,14 @@ export function initBenchmark() {
 async function _detect() {
   try {
     const info = await api('/api/benchmark/available');
-    // Absent simulator, the entry stays hidden rather than showing a tab that
-    // can only ever say "nothing here".
+    // 入口原先挂在「有没有仿真器」上，没装就整个消失 —— R1 上就是这样，一台装了最新
+    // agent-core 的机器人设置里没有这一项，也没有任何迹象说明为什么。基准测试测的是
+    // **解决方案**，真机上照样跑，所以入口恒在；仿真器在不在场只决定要不要走确认。
     document.querySelectorAll('[data-target="btn-benchmark"]').forEach((el) => {
       el.classList.toggle('hidden', !info.available);
     });
+    _simulator = info.simulator ?? info.mcp_id ?? null;
+    _renderHardwareNotice(info.moving_cards || []);
     // 被测配置常驻标题栏：分数属于某一次具体的模型与镜像，不该藏在某一行里。
     const env = info.environment || {};
     const meta = document.getElementById('bm-env');
@@ -112,8 +119,8 @@ async function _load() {
 // 主体是**看现有的方案**：本机一份可编辑的库，加上市场里带 `test` 段的方案。
 // 「导入文件」还在，但它是导入路径，不是入口。
 //
-// 用例自带画布，所以跑一个还没载入的用例会覆盖当前这张 —— 那条路照旧：先给退路
-// （把当前画布存下来），再要明确的勾选。
+// 用例**可以**自带画布，但那和「跑」无关：跑的是当前画布。要把用例的画布搬进来，
+// 点卡片上的「载入画布」—— 那条路照旧：先给退路（把当前画布存下来），再要明确的勾选。
 
 let _cases = [];
 let _tab = 'local';
@@ -140,7 +147,8 @@ function _caseCard(c) {
   // 地图名不进这一行 —— 扫列表时它不影响选哪个用例，而它一挤，站数和插话数就被
   // 省略号吃掉了。地图在编辑器里看。
   const bits = [
-    c.waypoints ? `${c.waypoints} 站` : '',
+    c.requirements ? `${c.requirements} 条要求` : '还没写要求',
+    c.has_procedure ? '有参考流程' : '',
     c.injections ? `${c.injections} 处插话` : '',
   ].filter(Boolean).join(' · ');
   // 分数贴着用例本身 ——「这个用例现在多少分」是打开面板的第一个问题，
@@ -162,8 +170,12 @@ function _caseCard(c) {
           c.isLoaded ? '<i class="bm-card-flag">已在画布上</i>' : ''}${_esc(bits)}</span>
         <span class="bm-card-actions">
           <button class="bm-linkbtn" data-edit="${_esc(c.id)}">编辑</button>
+          ${c.cards ? `<button class="bm-linkbtn" data-load="${_esc(c.id)}"
+            title="把这个用例自带的 ${c.cards} 张卡片载入画布，会覆盖当前画布"
+            >载入画布</button>` : ''}
           <button class="bm-linkbtn" data-del="${_esc(c.id)}">删除</button>
-          <button class="bm-cardrun" data-run="${_esc(c.id)}">运行</button>
+          <button class="bm-cardrun" data-run="${_esc(c.id)}"
+            title="在**当前画布**上跑这个用例">运行</button>
         </span>
       </div>
       ${(c.problems || []).length ? `<ul class="bm-blockers">${
@@ -176,6 +188,8 @@ function _bindCaseCards(el) {
     'click', () => openEditor(b.dataset.edit)));
   el.querySelectorAll('[data-run]').forEach((b) => b.addEventListener(
     'click', () => _startCase(b.dataset.run)));
+  el.querySelectorAll('[data-load]').forEach((b) => b.addEventListener(
+    'click', () => _loadCaseCanvas(b.dataset.load)));
   el.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
     const card = _cases.find((c) => c.id === b.dataset.del);
     if (!window.confirm(`删掉用例「${card?.name || ''}」？运行过的分数会留在历史里。`)) return;
@@ -264,12 +278,31 @@ export function blockerRows(problems = [], readiness = {}) {
   return rows;
 }
 
-// ── 跑一个用例：没载入就先过覆盖确认 ─────────────────────────────────────────
+// ── 跑一个用例：**在当前画布上跑** ───────────────────────────────────────────
+//
+// 这里原先是 `preflight → apply → run`：想跑库里的用例，先把它自带的画布载进来。
+// 新建的用例画布是空的，于是点一下「跑」，用户手上的画布就没了。
+//
+// 跑从来不该改画布。用例贡献的是指令、插话和评判标准；画布是现场那一张。把用例自带的
+// 画布搬进来是**另一个动作**（`_loadCaseCanvas`），覆盖确认属于那里。
 
 async function _startCase(caseId) {
   const card = _cases.find((c) => c.id === caseId);
   const repeats = Math.max(1, parseInt(document.getElementById('bm-repeats')?.value || '1', 10));
 
+  const rows = blockerRows(card?.problems || [], card?.readiness || {});
+  if (rows.length) { _showBlockers(card?.name || '这个用例', rows); return; }
+
+  await _runCase(repeats, null, caseId);
+}
+
+/** 把这个用例自带的画布载入进来 —— 唯一会覆盖画布的动作，所以确认挂在这儿。 */
+async function _loadCaseCanvas(caseId) {
+  const card = _cases.find((c) => c.id === caseId);
+  if (!card?.cards) {
+    showToast('这个用例没有自带画布，直接在当前画布上跑就行');
+    return;
+  }
   let pre;
   try {
     pre = (await api(`/api/benchmark/cases/${caseId}/preflight`, {
@@ -278,14 +311,7 @@ async function _startCase(caseId) {
   } catch (e) {
     showToast(`检查失败：${e.message || e}`); return;
   }
-
-  const rows = blockerRows(pre?.test?.problems || [], pre?.test?.readiness || {});
-  (pre?.devices?.missing || []).forEach((d) => rows.unshift(
-    `缺驱动 <b>${_esc(d.serverName || d.name || '')}</b>　先装上并启动它`));
-  if (rows.length) { _showBlockers(card?.name || '这个用例', rows); return; }
-
-  if (card?.isLoaded) { await _runCase(repeats); return; }
-  _confirmOverwrite(caseId, card, pre, repeats);
+  _confirmOverwrite(caseId, card, pre);
 }
 
 function _showBlockers(name, rows) {
@@ -297,19 +323,19 @@ function _showBlockers(name, rows) {
   </div>`;
 }
 
-function _confirmOverwrite(caseId, card, pre, repeats) {
+function _confirmOverwrite(caseId, card, pre) {
   const el = document.getElementById('bm-progress');
   if (!el) return;
   const mine = pre?.overwrite?.canvas?.cards ?? 0;
   el.innerHTML = `
     <div class="bm-overwrite">
-      <p class="bm-note">运行「${_esc(card?.name || '')}」要先把它自带的画布载入进来，
-        会替换掉画布上现在的 ${mine} 张卡片。</p>
+      <p class="bm-note">把「${_esc(card?.name || '')}」自带的 ${card?.cards ?? 0} 张卡片
+        载入进来，会替换掉画布上现在的 ${mine} 张。</p>
       <button class="bm-linkbtn" id="bm-save-canvas">先把当前画布存成解决方案</button>
       <label class="bm-confirm"><input type="checkbox" id="bm-confirm-overwrite">
         我知道会覆盖当前画布</label>
       <div class="bm-case-actions">
-        <button class="btn-primary" id="bm-case-apply" disabled>载入并运行</button>
+        <button class="btn-primary" id="bm-case-apply" disabled>载入画布</button>
         <button class="bm-linkbtn" id="bm-case-cancel">取消</button>
       </div>
     </div>`;
@@ -326,7 +352,10 @@ function _confirmOverwrite(caseId, card, pre, repeats) {
       });
     } catch (e) { showToast(`载入失败：${e.message || e}`); return; }
     await _loadLibrary();
-    await _runCase(repeats);
+    // **载入之后不自动开跑。** 两件事绑在一起正是这一轮要拆开的；而且载入完画布变了，
+    // 用户很可能想先看一眼再决定。
+    showToast('画布已载入');
+    _poll();
   });
 }
 
@@ -381,27 +410,105 @@ async function _newCase() {
   }
 }
 
-async function _runCase(repeats) {
+async function _runCase(repeats, confirmMovingCards = null, caseId = '') {
   try {
     const result = await api('/api/benchmark/case/run', {
-      method: 'POST', body: JSON.stringify({ repeats, seed: 0 }),
+      method: 'POST',
+      body: JSON.stringify({ repeats, seed: 0, case_id: caseId,
+                             confirm_moving_cards: confirmMovingCards }),
     });
     _runId = result.run_id;
     showToast(`用例开始运行 × ${repeats} 次`);
     _startPolling();
   } catch (e) {
+    // 服务端说「这次会驱动真实设备」—— 那不是错误，是要请现场的人拍板。
+    const moving = e?.detail?.needs_confirmation ? (e.detail.moving_cards || []) : null;
+    if (moving) { _confirmHardware(moving, repeats, caseId); return; }
     showToast(runRefusal(e));
   }
+}
+
+/** 面板顶上那句常驻提示：这张画布一跑起来，什么会真的动。 */
+export function hardwareNotice(movingCards = []) {
+  if (!movingCards.length) return '';
+  const names = movingCards.map((m) => `${m.device || m.mcpId} 的 ${m.tool}`).join('、');
+  return `这张画布上有会动的真实设备（${names}）。运行用例会让它们真的动起来，开跑前要确认。`;
+}
+
+function _renderHardwareNotice(movingCards) {
+  const el = document.getElementById('bm-hw-notice');
+  if (!el) return;
+  const text = hardwareNotice(movingCards);
+  el.textContent = text;
+  el.classList.toggle('hidden', !text);
+}
+
+/** 一张卡片在确认清单里的身份。必须和服务端的 `card_key` 一字不差。 */
+export function cardKey(card) {
+  return `${card.mcpId || ''}:${card.tool || ''}`;
+}
+
+/** 这次运行会发出的每一句话 —— 开场指令，以及每一条插话。 */
+export function plannedUtterances(testBlock) {
+  const run = testBlock?.run || {};
+  const lines = [];
+  if (run.prompt) lines.push({ label: '开场', text: run.prompt });
+  (run.injections || []).forEach((injection) => {
+    const when = injection.after_arrival
+      ? `到达 ${injection.after_arrival} 后 ${injection.delay || 0} 秒`
+      : `第 ${injection.at ?? '?'} 秒`;
+    lines.push({ label: `插话 · ${when}`, text: injection.text || '' });
+  });
+  return lines;
+}
+
+async function _confirmHardware(moving, repeats, caseId = '') {
+  const el = document.getElementById('bm-progress');
+  if (!el) return;
+  // 指令从**服务端当前载入的那个用例**读，不从列表卡片读 —— 会跑的是前者。
+  // 两者不一致的时候（刚改过、还没载入），照着列表念给人听就是念错了。
+  let lines = [];
+  try {
+    lines = plannedUtterances((await api('/api/benchmark/case')).case);
+  } catch { /* 读不到就明说，见下面那条占位 */ }
+  el.innerHTML = `
+    <div class="bm-overwrite bm-hardware">
+      <p class="bm-note"><b>这次运行会驱动真实设备。</b>用例的指令经由主 agent 变成
+        真实的工具调用 —— 和有人亲口说出来没有区别。</p>
+      <div class="bm-hw-group"><span class="bm-hw-title">会动的卡片</span>
+        <ul class="bm-blockers">${moving.map((m) =>
+          `<li>${_esc(m.device || m.mcpId)} · <b>${_esc(m.tool)}</b></li>`).join('')}</ul>
+      </div>
+      <div class="bm-hw-group"><span class="bm-hw-title">将发出的指令</span>
+        <ul class="bm-blockers">${lines.map((l) =>
+          `<li>[${_esc(l.label)}] ${_esc(l.text)}</li>`).join('') ||
+          '<li class="bm-dim">读不到用例内容 —— 不知道会发出什么，先别跑</li>'}</ul>
+      </div>
+      <label class="bm-confirm"><input type="checkbox" id="bm-confirm-hardware">
+        我确认现场有人，周围安全</label>
+      <div class="bm-case-actions">
+        <button class="btn-primary" id="bm-hw-go" disabled>开始运行</button>
+        <button class="bm-linkbtn" id="bm-hw-cancel">取消</button>
+      </div>
+    </div>`;
+  const confirm = document.getElementById('bm-confirm-hardware');
+  const go = document.getElementById('bm-hw-go');
+  // 默认不做的事：勾了才亮。和覆盖画布同一个形态。
+  confirm?.addEventListener('change', () => { go.disabled = !confirm.checked; });
+  document.getElementById('bm-hw-cancel')?.addEventListener('click', () => { _poll(); });
+  go?.addEventListener('click', () => _runCase(repeats, moving.map(cardKey), caseId));
 }
 
 /** 拒绝跑的理由要说成人话，尤其是安全那条 —— 它不是故障，是它该拦下来。 */
 export function runRefusal(error) {
   const detail = error?.detail || error?.message || error;
   if (typeof detail === 'string') return `无法运行：${detail}`;
+  // 画布在「弹窗弹出」和「点开始运行」之间被改了。重新算一遍再请人看一次，
+  // 而不是拿上一次的勾去为一组新设备背书。
+  if (detail?.needs_confirmation) return '画布变了，请重新确认会动的设备。';
   if (detail?.unsafe?.length) {
     const names = detail.unsafe.map((u) => `${u.device} 的 ${u.tool}`).join('、');
-    return `画布上有真设备会跟着动（${names}）。用例的指令和真指令分不出来 —— ` +
-           `先把它们从画布上拿掉。`;
+    return `画布上有真设备会跟着动（${names}）。`;
   }
   if (detail?.readiness) return '用例的依赖还不齐，看上面那几条。';
   return `无法运行：${JSON.stringify(detail)}`;
@@ -473,7 +580,9 @@ async function _poll() {
     ${cases.map((c) => {
       const score = c.score || {};
       const dims = score.by_dimension || {};
-      const order = ['orchestration', 'interruption', 'long_horizon', 'latency', 'safety'];
+      // 七条原则，顺序固定 —— 格子的位置本身就是信息，顺序一变，两次运行的条形图
+      // 就没法并排看了。和 `benchmark_case.DIMENSIONS` 同一份顺序。
+      const order = Object.keys(_DIMS);
       const bar = order.map((k) => {
         const v = dims[k];
         const cls = v == null ? '' : (v >= 100 ? ' bm-dim--ok' : ' bm-dim--bad');
@@ -484,7 +593,11 @@ async function _poll() {
       <div class="bm-case">
         <div class="bm-case-name">
           ${_esc(c.scenario)} <i>#${c.repeat + 1}</i>
-          ${(c.failures || []).length ? `<i>· ${(c.failures || []).map(_dimOrName).join('、')}</i>` : ''}
+          ${(c.failures || []).length ? `<i title="${_esc((c.failures || []).join('\n'))}">· 没过 ${
+            (c.failures || []).length} 条</i>` : ''}${
+            (score.unmeasured || []).length ? `<i class="bm-dim-none"
+              title="${_esc((score.unmeasured || []).join('\n'))}">· ${
+              (score.unmeasured || []).length} 条判不了</i>` : ''}
           <div class="bm-dims">${bar}</div>
         </div>
         <div class="bm-case-score">${score.total ?? '—'}</div>
@@ -565,22 +678,53 @@ async function _loadRuns() {
   el.querySelectorAll('[data-run]').forEach((row) => {
     row.addEventListener('click', () => openTimeline(row.dataset.run));
   });
+  _compareLatest(runs);
+}
+
+/** 最近两次同一个用例之间，分数的差异站不站得住。
+ *
+ * 只在**检验过得去**的时候说「更好/更差」。两个均值不同不等于有差别 —— LLM 是随机的，
+ * 一次运行的分数是分布里的一个样本。这块面板原先只有 mean ± stdev，照着它说「涨了」
+ * 是没有依据的。
+ */
+async function _compareLatest(runs) {
+  const el = document.getElementById('bm-compare');
+  if (!el) return;
+  const pair = runs.filter((r) => r.suite === runs[0]?.suite).slice(0, 2);
+  if (pair.length < 2) { el.classList.add('hidden'); return; }
+  let result;
+  try {
+    result = await api(`/api/benchmark/runs/${pair[0].id}/compare/${pair[1].id}`);
+  } catch { el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  el.innerHTML = compareNote(result, pair[0].suite);
+}
+
+/** 这句话说什么。不显著时**不给方向** —— 那正是这条检验存在的理由。 */
+export function compareNote(result, suite = '') {
+  const name = suite ? `「${_esc(suite)}」` : '';
+  if (!result?.available) {
+    return `<span class="bm-cmp-none">${name}最近两次还比不出来：${
+      _esc(result?.reason || '样本不够')}</span>`;
+  }
+  if (!result.significant) {
+    return `<span class="bm-cmp-none">${name}最近两次<b>测不出显著差异</b>（中位差 ${
+      result.median_delta?.toFixed?.(1) ?? '—'}，n=${result.paired}）</span>`;
+  }
+  const better = result.median_delta > 0;
+  return `<span class="bm-cmp ${better ? 'bm-cmp--up' : 'bm-cmp--down'}">${name}最近一次<b>${
+    better ? '更好' : '更差'}</b>　中位差 ${result.median_delta.toFixed(1)}　n=${result.paired}</span>`;
 }
 
 const _DIMS = {
-  orchestration: '编排', interruption: '打断', long_horizon: '长程',
-  latency: '时效', safety: '安全',
-};
-const _CHECK_DIM = {
-  waypoint_order: '编排', announce_after_arrive: '编排', exactly_one_terminal_post: '编排',
-  interrupted_leg: '打断', resume_correctness: '长程',
-  max_wall_seconds: '时效', never_occupied: '安全',
+  world_timing: '物理世界时序性', concurrency: '同步执行效率',
+  llm_latency: 'LLM 延时', cache_hit: 'cache 命中',
+  answer_quality: '回答效果', ux: '用户体验', physical_safety: '安全',
 };
 const _OUTCOMES = { ok: '通过', stalled: '卡住', timeout: '超时', error: '出错', pending: '排队中' };
 const _STATES = { idle: '空闲', loading: '准备中', running: '进行中', done: '已完成' };
 
 function _dimLabel(k) { return _DIMS[k] || k; }
-function _dimOrName(name) { return _CHECK_DIM[name] || name; }
 function _outcome(o) { return _OUTCOMES[o] || o; }
 function _stateLabel(s) { return _STATES[s] || s; }
 

@@ -35,6 +35,43 @@ def check(capabilities: dict, descriptor: dict) -> list:
         )
         return problems              # nothing else is meaningful without this
 
+    # ── 动作空间必须对上，而维度相同**不代表**空间相同 ──────────────────────
+    #
+    # 这是这个函数里最后补上的一条检查，补它的理由值得写下来：在它之前，比的只有
+    # `dof` 和 `control_hz`。于是一个 23 维的**末端位姿**模型（UnifoLM-VLA 的
+    # EE_R6_G1）连到一张 23 维的 `joint_position` 卡片上，两个数字完全吻合，协商
+    # 通过，然后把位姿当关节角发下去。
+    #
+    # （这里原本抄着一句「2 × [xyz(3) + R6(6) + 夹爪(1)] + 腰 rpy(3)」。那句话来自
+    # 上游的枚举注释，而上游自己的数据管线排的不是这个 —— 两个夹爪都在尾部，且右
+    # 在前左在后。真实布局记在 phanthymotus-cloud 的 runtimes/common/normalize.py。
+    # 这条检查不依赖那个布局，但抄错的注释会把下一个人送进两只手互换的坑。）
+    #
+    # 它不是个别现象。已经在用的模型里至少三种空间：
+    #
+    #     SmolVLA / mock           joint_position
+    #     π0.5 (DROID)             joint_velocity      ← 归一化关节速度
+    #     OpenVLA (bridge)         末端 delta 位姿 + 夹爪
+    #     UnifoLM-VLA (G1)         EE_R6_G1，motus.control/1 的 MODES 里**没有**这个
+    #
+    # **没声明也要拒。** 「不确定就拒绝，不要猜」在这里格外重要：猜错的代价不是报错，
+    # 是机械臂走到错误的地方。所以缺字段时报错里直接写出该去哪儿设。
+    declared = str(capabilities.get("control_mode") or "").strip()
+    mode = str(descriptor.get("mode") or "").strip()
+    if not declared:
+        problems.append(
+            "模型没有声明自己的动作空间（capabilities 里缺 control_mode）—— "
+            f"下游是 {mode or '未知'}，而维度对得上并不代表空间对得上。"
+            "远端模型在 phanthymotus-cloud 的模型声明里设 CONTROL_MODE，"
+            "本机 provider 在 capabilities() 里返回 control_mode"
+        )
+    elif mode and declared != mode:
+        problems.append(
+            f"模型输出 {declared!r} 空间的动作，下游接受 {mode!r} —— "
+            "两者维度可能相同，但含义不同，发下去就是让机械臂走到错误的地方"
+        )
+    problems.extend(_group_problems(capabilities, descriptor))
+
     action_dim = capabilities.get("action_dim")
     dof = descriptor.get("dof")
     if action_dim is not None and dof is not None and int(action_dim) != int(dof):
@@ -77,6 +114,71 @@ def check(capabilities: dict, descriptor: dict) -> list:
                 )
 
     return problems
+
+
+def _group_problems(capabilities: dict, descriptor: dict) -> list:
+    """逐段比动作空间，当两边都按段声明的时候。
+
+    顶层那一条 `control_mode` vs `descriptor.mode` 比的是整条向量，而规范化之后的
+    向量是**混的**：G1 的 19 维是两个末端位姿、两个归一化夹爪、三个腰关节角。这种
+    向量上「顶层 mode 相同」几乎什么都没保证 —— 两边都报 `eef_pose`，而一边的第
+    8 维是夹爪、另一边是腰，维度和顶层 mode 全都吻合，指令照发。
+
+    **只有两边都声明了段才逐段比。** 一边有一边没有不算错：今天每个模型都是单一
+    空间，没有段是常态，那时候顶层那条检查已经是完整的。这里要抓的是**都声明了却
+    对不上**，那是真的分歧。
+    """
+    model_groups = capabilities.get("control_groups")
+    driver_groups = descriptor.get("groups")
+    if not isinstance(model_groups, (list, tuple)) or not model_groups:
+        return []
+    if not isinstance(driver_groups, (list, tuple)) or not driver_groups:
+        return []
+
+    default_mode = str(descriptor.get("mode") or "").strip()
+    problems = []
+    if len(model_groups) != len(driver_groups):
+        problems.append(
+            f"模型把动作分成 {len(model_groups)} 段，下游卡片分成 "
+            f"{len(driver_groups)} 段 —— 分段不同就无从逐段核对，"
+            f"模型侧：{_shape(model_groups, '')}；"
+            f"下游：{_shape(driver_groups, default_mode)}"
+        )
+        return problems
+
+    for i, (mine, theirs) in enumerate(zip(model_groups, driver_groups)):
+        if not isinstance(mine, dict) or not isinstance(theirs, dict):
+            continue                    # 形状问题由下面那条 groups 检查报
+        # 段的 mode 留空表示继承顶层，和 `motus.control/1` 的驱动侧同一条规矩。
+        mine_mode = str(mine.get("mode") or "").strip()
+        theirs_mode = str(theirs.get("mode") or "").strip() or default_mode
+        if mine_mode and theirs_mode and mine_mode != theirs_mode:
+            problems.append(
+                f"第 {i} 段（模型叫 {mine.get('name')!r}，下游叫 "
+                f"{theirs.get('name')!r}）：模型输出 {mine_mode!r}，"
+                f"下游接受 {theirs_mode!r}"
+            )
+        if mine.get("offset") != theirs.get("offset") or \
+                mine.get("count") != theirs.get("count"):
+            problems.append(
+                f"第 {i} 段的位置对不上：模型 "
+                f"[{mine.get('offset')}, +{mine.get('count')})，下游 "
+                f"[{theirs.get('offset')}, +{theirs.get('count')}) —— "
+                "总维度相同而分段错位，是最难从症状看出来的一种：每一段都把邻段的"
+                "数字当成自己的"
+            )
+    return problems
+
+
+def _shape(groups, default_mode: str) -> str:
+    parts = []
+    for group in groups:
+        if not isinstance(group, dict):
+            parts.append("?")
+            continue
+        mode = str(group.get("mode") or "").strip() or default_mode or "?"
+        parts.append(f"{group.get('name')}×{group.get('count')}({mode})")
+    return " + ".join(parts)
 
 
 def effective_rate(capabilities: dict, descriptor: dict, requested_hz=None) -> float:

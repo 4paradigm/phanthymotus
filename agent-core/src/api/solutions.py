@@ -915,8 +915,14 @@ async def _test_preflight(payload: dict) -> Optional[dict]:
     if not block:
         return None
 
-    problems = benchmark_case.validate(payload) + benchmark_case.unmeasurable(payload)
+    # 只查结构，不再预判「这张画布产生不出某条断言要的事实」。
+    #
+    # 那件事原先由 `unmeasurable()` 在跑之前猜，靠的是「画布上有没有申报了嘴的卡片」
+    # 这类推断 —— 而推断会过时，也会因为查错注册表而误报（真发生过，每个打包用例都被
+    # 报成「没有讲解卡」）。现在指标缺席就是「判不了」，跑完由 `check_targets` 说出来，
+    # 而且说得出缺的是哪个指标。事后的实话比事前的猜测可靠。
     from api.benchmark import case_readiness
+    problems = benchmark_case.validate(payload)
     readiness = await case_readiness(benchmark_case.requires(payload))
     return {
         'isCase':    True,

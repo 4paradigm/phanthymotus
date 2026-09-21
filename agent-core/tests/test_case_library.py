@@ -27,10 +27,9 @@ TEST_BLOCK = {
     'name': '北京2F展厅 · 完整导览',
     'requires': {'drivers': ['simulator-generic'], 'assets': ['bj-2f']},
     'run': {'prompt': '带我转一下展区并给我介绍下',
-            'world': {'map': 'bj-2f'},
-            'injections': [{'after_arrival': 'P5', 'delay': 6.0, 'text': '先等一下'}]},
-    'evaluate': {'expect': {'waypoint_order': ['P3', 'P4']},
-                 'weights': {'orchestration': 100}},
+            'injections': [{'after_action': 2, 'delay': 6.0, 'text': '先等一下'}]},
+    'requirements': [{'text': '按我说的顺序依次到达每一站', 'weight': 30,
+                      'dimension': 'world_timing'}],
 }
 
 
@@ -113,7 +112,7 @@ def test_the_list_carries_what_a_card_needs_without_unpacking_the_payload():
     card = asyncio.run(benchmark.list_cases())['cases'][0]
 
     assert card['prompt'] == '带我转一下展区并给我介绍下'
-    assert card['injections'] == 1 and card['waypoints'] == 2
+    assert card['injections'] == 1 and card['requirements'] == 1
     assert card['problems'] == []
 
 
@@ -183,6 +182,116 @@ def test_an_unreachable_market_is_an_empty_column_with_a_reason(monkeypatch):
     assert result['cases'] == [] and result['error']
 
 
+# ── 跑 = 当前画布 ─────────────────────────────────────────────────────────────
+
+def test_running_a_case_never_touches_the_canvas(monkeypatch):
+    """**这就是这一轮要修的那个 bug。**
+
+    原先想跑库里的用例，只能先「载入」它，而载入会把它自带的画布刷进来 —— 新建的用例
+    画布是空的，于是点一下「跑」，用户手上的画布就没了。
+
+    跑从来不该改画布：跑的永远是**当前**画布，用例提供的只是指令、插话和评判标准。
+    """
+    applied = []
+    from api import solutions
+    monkeypatch.setattr(solutions, 'apply', lambda *a, **k: applied.append(a))
+
+    case_id = benchmark_store.save_case(payload(cards=0), name='新用例')
+    got = benchmark._case_to_run(case_id)
+
+    assert got['run']['prompt'] == '带我转一下展区并给我介绍下'
+    assert applied == []          # 一次 apply 都没有
+
+
+def test_running_without_naming_a_case_uses_the_loaded_one(monkeypatch):
+    """不指名就跑当前方案自带的那个 —— 老行为，保留。"""
+    from api import solutions
+    monkeypatch.setattr(solutions, 'loaded_case', lambda: {'run': {'prompt': '当前的'}})
+
+    assert benchmark._case_to_run('')['run']['prompt'] == '当前的'
+
+
+def test_running_a_case_that_is_gone_is_a_404():
+    with pytest.raises(fastapi.HTTPException) as caught:
+        benchmark._case_to_run('nope')
+
+    assert caught.value.status_code == 404
+
+
+def test_an_old_format_case_shows_its_requirements_in_the_list():
+    """**列表也要迁移，不只是跑的时候。**
+
+    Orin6 上现的形：库里那个旧格式用例，卡片上写着「0 条要求」。用户看到的是
+    「我的要求没了」，不是「格式换了」—— 而迁移其实是有的，只是没走到这条路上。
+    """
+    legacy = {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [], 'test': {
+        'run': {'prompt': '带我转一下展厅'},
+        'evaluate': {'expect': {'waypoint_order': ['入口', '一号展区'],
+                                'announce_after_arrive': True}}}}
+    benchmark_store.save_case(legacy, name='旧的')
+
+    card = next(c for c in asyncio.run(benchmark.list_cases())['cases']
+                if c['name'] == '旧的')
+
+    assert card['requirements'] == 2
+
+
+def test_the_name_in_the_library_wins_over_the_one_inside_the_test_block():
+    """库里存的名字是用户自己起的；`test.name` 常常是空的（从文件或市场收进来的用例
+    就没有）。展开顺序反过来，那些用例在列表里是一行没有标题的卡片。"""
+    nameless = {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [],
+                'test': {'run': {'prompt': '走'}}}
+    benchmark_store.save_case(nameless, name='我起的名字')
+
+    names = [c['name'] for c in asyncio.run(benchmark.list_cases())['cases']]
+
+    assert '我起的名字' in names and '' not in names
+
+
+def test_an_old_format_case_is_migrated_on_its_way_to_the_runner():
+    """Orin6 上那个用例是旧格式。不转的话，跑起来一条要求都没有 —— 而且不报错。"""
+    legacy = {'formatVersion': 1, 'canvas': {'cards': []}, 'devices': [], 'test': {
+        'run': {'prompt': '带我转一下展厅'},
+        'evaluate': {'expect': {'waypoint_order': ['入口', '一号展区']}}}}
+    case_id = benchmark_store.save_case(legacy, name='旧的')
+
+    got = benchmark._case_to_run(case_id)
+
+    assert 'evaluate' not in got
+    assert any('入口' in r['text'] for r in benchmark_case.requirements({'test': got}))
+
+
+def test_a_run_is_named_after_the_case_so_history_can_tell_them_apart():
+    """**不能退回一个通用名字。**
+
+    `compare_runs` 按名字分组去配对，于是所有叫 `case` 的运行会被归成一堆互相比分 ——
+    一个「这次比上次好了」的结论，比的其实是两个不同的用例。
+    """
+    nameless = {'formatVersion': 1, 'canvas': {}, 'devices': [],
+                'test': {'run': {'prompt': '走'}}}
+    case_id = benchmark_store.save_case(nameless, name='我的用例')
+
+    assert benchmark._run_name(case_id, {'run': {}}) == '我的用例'
+
+
+def test_a_run_with_no_name_anywhere_still_gets_something_readable():
+    assert benchmark._run_name('', {}) == '未命名用例'
+
+
+# ── 载入画布：唯一会覆盖的动作 ────────────────────────────────────────────────
+
+def test_loading_a_case_with_no_canvas_is_refused_rather_than_wiping_it():
+    """「没有可载入的东西」和「载入一张空画布」是两件完全不同的事，后者会毁掉用户
+    手上的工作。"""
+    case_id = benchmark_store.save_case(payload(cards=0), name='没画布')
+
+    with pytest.raises(fastapi.HTTPException) as caught:
+        asyncio.run(benchmark.apply_case(None, case_id))
+
+    assert caught.value.status_code == 409
+    assert '没有可载入' in caught.value.detail
+
+
 # ── summary / blank ───────────────────────────────────────────────────────────
 
 def test_summary_is_where_the_payload_shape_is_known():
@@ -191,7 +300,7 @@ def test_summary_is_where_the_payload_shape_is_known():
     view = benchmark_case.summary(payload(cards=4))
 
     assert view['name'] == '北京2F展厅 · 完整导览'
-    assert view['map'] == 'bj-2f' and view['cards'] == 4
+    assert view['requirements'] == 1 and view['cards'] == 4
 
 
 def test_summary_of_a_solution_that_is_not_a_case_is_empty_not_a_crash():

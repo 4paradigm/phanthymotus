@@ -4167,6 +4167,13 @@ html, body {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   cursor: grab;
+  /* 表头要画在空状态遮罩之上。遮罩是 inset:0 的不透明层，只靠它自己的 49px
+     padding 把文字让开，背景照样盖住整条表头 —— 于是还没来数据的卡片是一块
+     没有标题、没有话题、没有格式标签的空白，光看它认不出是哪一路数据。
+     给表头自己的层级，遮罩多高都盖不住它。 */
+  position: relative;
+  z-index: 1;
+  background: var(--bg-card);
 }
 .monitor-card-header:active { cursor: grabbing; }
 
@@ -4283,6 +4290,7 @@ html, body {
      legible. Nothing is being hidden — this is only up while the card has no
      data, and `.has-data` removes it on the first real frame. */
   background: var(--bg-card);
+  z-index: 0;
 }
 .monitor-card.has-data .monitor-card-empty { display: none; }
 .monitor-card-empty-title {
@@ -8750,6 +8758,78 @@ html, body {
   font-size: 12px; color: var(--text-muted); cursor: pointer;
 }
 .bm-confirm input { accent-color: var(--accent); }
+/* 常驻提示条：这张画布上有会动的真设备。挑用例之前就说，不等按了运行才拦。 */
+/* 「判不了」和「没过」要看得出区别 —— 一个是 agent 做错了，一个是这次测不到。 */
+.bm-dim-none { color: var(--text-muted); font-style: italic; }
+/* 打分细节 / 运行日志：两种查法，分两个 tab。叠成一条纵向流的话，日志动辄几十行，
+   打分细节就被推到看不见的地方。 */
+.bm-tl-tabs { display: flex; gap: 2px; margin: 10px 0 0; border-bottom: 1px solid var(--border); }
+.bm-tl-tab {
+  padding: 6px 13px; border: none; background: none; cursor: pointer;
+  font-size: 12px; color: var(--text-muted); border-bottom: 2px solid transparent;
+}
+.bm-tl-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.bm-tl-pane { padding-top: 10px; }
+
+/* 「分数为什么是这个」。每条原则一张表 —— 这一屏是用来**扫**的：七条原则十几项，
+   混在一行行散文里，眼睛找不到「哪一条没过、差多少」。列固定之后上下对齐。 */
+.bm-sc { margin: 4px 0 14px; }
+.bm-sc-dim { margin-bottom: 14px; }
+.bm-sc-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 5px; }
+.bm-sc-head b { font-size: 12px; }
+.bm-sc-num { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
+/* 「判不了」不着色也不加粗 —— 一个醒目的「判不了」会被当成一个分数。 */
+.bm-sc-num--none { font-size: 11px; font-weight: 400; color: var(--text-muted); }
+
+/* 指标：横排小格，名字在上、数在下。原先是一行原始键名，给代码看的。 */
+.bm-sc-ms { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.bm-sc-m {
+  padding: 3px 8px; border-radius: 3px; background: var(--bg-subtle, rgba(127,127,127,.08));
+  font-family: var(--font-mono); font-size: 11px; color: var(--text);
+}
+.bm-sc-m i { margin-right: 5px; font-style: normal; color: var(--text-muted); }
+.bm-sc-m u { margin-left: 1px; text-decoration: none; color: var(--text-muted); }
+
+.bm-sc-t { width: 100%; border-collapse: collapse; font-size: 11px; }
+.bm-sc-t td { padding: 4px 6px; border-top: 1px solid var(--border-subtle, rgba(127,127,127,.15)); }
+.bm-sc-mark { width: 26px; text-align: center; font-weight: 600; }
+.bm-sc-item--ok .bm-sc-mark { color: var(--green, #2E7D32); }
+.bm-sc-item--bad .bm-sc-mark { color: var(--red); }
+.bm-sc-item--none .bm-sc-mark { color: var(--text-muted); }
+/* 比例型显示的是分数本身，不是对勾 —— 88% 不是「通过」，它就是 88 分。 */
+.bm-sc-item--ratio .bm-sc-mark { font-family: var(--font-mono); color: var(--text); }
+.bm-sc-text { width: auto; }
+/* 「算出来的」和「裁判判的」要分得清：一个不会抖，一个会。 */
+.bm-sc-from { width: 76px; white-space: nowrap; color: var(--text-muted); }
+.bm-sc-w { width: 38px; text-align: right; font-family: var(--font-mono); color: var(--text-muted); }
+.bm-sc-extra td { border-top: none; padding-top: 0; }
+.bm-sc-why { color: var(--text-muted); line-height: 1.55; }
+.bm-sc-steps { margin-top: 3px; }
+.bm-sc-step { display: flex; gap: 8px; margin-top: 2px; line-height: 1.5; }
+.bm-sc-step > span:first-child { flex: none; width: 24px; color: var(--green, #2E7D32); }
+.bm-sc-step--off > span:first-child { color: var(--red); }
+.bm-compare { margin-bottom: 9px; font-size: 11px; line-height: 1.6; }
+.bm-compare b { font-weight: 600; }
+/* 不显著就不着色 —— 一个绿色的「测不出显著差异」仍然会被读成「变好了」。 */
+.bm-cmp-none { color: var(--text-muted); }
+.bm-cmp--up { color: var(--green, #2E7D32); }
+.bm-cmp--down { color: var(--red); }
+.bm-hw-notice {
+  margin: 0 18px; padding: 7px 11px;
+  border-left: 2px solid var(--red); background: var(--red-bg);
+  font-size: 11px; line-height: 1.5; color: var(--red);
+}
+/* 真机确认。比覆盖画布重一档：那个只是丢掉几张卡，这个会让一台真机器人动起来，
+   所以整块有红色左边框，两组信息（会动什么、会说什么）分开列。 */
+.bm-hardware { border-left: 2px solid var(--red, #e5484d); padding-left: 10px; }
+.bm-hardware .bm-note { color: var(--red, #e5484d); }
+.bm-hw-group { margin-top: 9px; }
+.bm-hw-title {
+  display: block; margin-bottom: 3px;
+  font-size: 11px; color: var(--text-muted);
+}
+.bm-hw-group .bm-blockers { margin: 0; }
+.bm-dim { color: var(--text-muted); font-style: italic; }
 .bm-case-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
 .bm-case-actions .btn-primary { flex: 1; }
 .bm-case-actions .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
@@ -8766,7 +8846,10 @@ html, body {
 .bm-block { padding: 14px 18px; border-bottom: 1px solid var(--border); min-height: 0; }
 .bm-block--grow { flex: 1; display: flex; flex-direction: column; border-bottom: none; }
 .bm-block > .bm-h { margin-bottom: 10px; }
-.bm-block--grow > div { flex: 1; min-height: 0; overflow-y: auto; }
+/* **只让列表增长。** 原先是 `> div`，对所有直接子元素生效 —— 加了「最近两次比较」
+   那一行之后，它和列表平分了高度，于是列表被压到底部，上面空出一大片。 */
+.bm-block--grow > div:not(.bm-compare) { flex: 1; min-height: 0; overflow-y: auto; }
+.bm-block--grow > .bm-compare { flex: none; }
 
 .bm-empty {
   padding: 18px 2px; font-size: 12.5px; line-height: 1.6; color: var(--text-muted);
@@ -8905,12 +8988,18 @@ html, body {
 .bm-ed-weight { display: flex; align-items: center; gap: 6px;
                 font-size: 11.5px; color: var(--text-dim); white-space: nowrap; }
 .bm-ed-unit { font-size: 11.5px; color: var(--text-dim); }
-.bm-ed-injection {
+.bm-ed-injection, .bm-ed-req {
   padding: 9px 11px; margin-bottom: 8px; border: 1px solid var(--border);
   border-radius: var(--radius-xs);
 }
-.bm-ed-injection label { font-size: 12px; color: var(--text-muted); }
-.bm-ed-injection textarea { margin-top: 7px; }
+.bm-ed-injection label, .bm-ed-req label { font-size: 12px; color: var(--text-muted); }
+.bm-ed-injection textarea, .bm-ed-req textarea { margin-top: 7px; }
+/* 「可选」贴在标签后面，小一号、淡一点 —— 参考流程不填也能跑，得让人一眼看出来。 */
+.bm-ed-opt {
+  margin-left: 6px; padding: 1px 5px; border-radius: 3px;
+  background: var(--bg-subtle, rgba(127,127,127,.12));
+  font-size: 10px; font-weight: 400; color: var(--text-muted);
+}
 /* 校验结果常驻在保存按钮旁边：编辑分几次做完，存一半不该被拒，
    但「还差什么」要随时看得见，而不是等点「跑」才说。 */
 .bm-editor-foot {

@@ -21,6 +21,7 @@ Run: cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/tes
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 
@@ -30,6 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from plugins.vla import VLAPlugin  # noqa: E402
+from plugins.vla.plugin import Observation  # noqa: E402
 from plugins.vla import negotiate  # noqa: E402
 from plugins.vla.message import build as build_message  # noqa: E402
 from plugins.vla.providers import discover, REQUIRED  # noqa: E402
@@ -46,6 +48,7 @@ DESCRIPTOR = {
     "rate": {"max_hz": 100, "expected_hz": 30, "watchdog_ms": 200},
     "force_torque": None,
 }
+
 
 
 def make_card(**cfg):
@@ -114,7 +117,7 @@ def test_matching_capabilities_pass():
 
 def test_action_dim_mismatch_names_both_numbers():
     """"shape mismatch" sends somebody to read code; this sends them to a wire."""
-    problems = negotiate.check({"action_dim": 32}, DESCRIPTOR)
+    problems = negotiate.check(_caps(action_dim=32), DESCRIPTOR)
     assert problems
     assert "32" in problems[0] and "7" in problems[0]
 
@@ -126,13 +129,13 @@ def test_a_downstream_that_is_not_a_control_card_is_caught_first():
 
 
 def test_a_model_faster_than_the_hardware_is_refused():
-    problems = negotiate.check({"action_dim": 7, "control_hz": 500}, DESCRIPTOR)
+    problems = negotiate.check(_caps(control_hz=500), DESCRIPTOR)
     assert any("500" in p for p in problems)
 
 
 def test_every_problem_is_reported_at_once():
     """An operator fixing a canvas should see the whole disagreement."""
-    problems = negotiate.check({"action_dim": 32, "control_hz": 500}, DESCRIPTOR)
+    problems = negotiate.check(_caps(action_dim=32, control_hz=500), DESCRIPTOR)
     assert len(problems) == 2
 
 
@@ -204,7 +207,7 @@ def test_chunk_indices_walk_the_chunk_then_refill():
 
 def test_an_empty_chunk_raises_rather_than_publishing_nothing_silently():
     class Empty:
-        def capabilities(self): return {"action_dim": 7}
+        def capabilities(self): return _caps()
         def infer(self, obs=None, inference_delay=0): return []
         def health(self): return True
         def close(self): return None
@@ -770,7 +773,19 @@ class _Graph:
 
 
 def _caps(**over):
-    base = {"n_cameras": 0, "needs_state": False}
+    """一份能通过协商的 capabilities。
+
+    `control_mode` 在这里，是因为 `negotiate.check()` **缺它就拒** —— 维度相同不代表
+    动作空间相同（一个 23 维的末端位姿模型和一张 23 维的关节卡片，数字完全吻合），
+    而猜错的代价是机械臂走到错误的地方。不测动作空间的用例用这个构造器拿到一份合法
+    的，才不会被那条检查抢先触发。
+
+    **文件里曾经有两个同名的 `_caps`**，后定义的把前面那个遮蔽掉了，于是「补了字段
+    却还是失败」。只留这一个。
+    """
+    base = {"control_mode": "joint_position", "action_dim": 7,
+            "chunk_size": 10, "control_hz": 30,
+            "n_cameras": 0, "needs_state": False}
     base.update(over)
     return base
 
@@ -997,7 +1012,7 @@ def test_the_downstream_label_survives_a_sparse_descriptor():
 
 def test_a_descriptor_whose_groups_are_not_objects_is_refused_at_start():
     from plugins.vla import negotiate
-    caps = {"action_dim": 7, "chunk_size": 10, "control_hz": 30}
+    caps = _caps(chunk_size=10)
     problems = negotiate.check(caps, {**DESCRIPTOR, "groups": ["arm_l", "arm_r"]})
     assert problems and "groups" in problems[0]
     # names the offending indices, so a 26-dof descriptor does not have to be
@@ -1048,3 +1063,265 @@ def test_one_cards_broken_schema_does_not_empty_the_bundle():
     bundle = object.__new__(main.ActuCoreBundle)
     bundle._plugins = [Broken(), Fine()]
     assert [t["name"] for t in bundle.get_all_tools()] == ["fine"]
+
+
+# ── 动作空间：维度相同不代表空间相同 ─────────────────────────────────────────
+
+
+def test_a_model_in_a_different_action_space_is_refused():
+    """这条检查补上之前，这一组输入是**协商通过**的。
+
+    UnifoLM-VLA 的 G1 checkpoint 输出 23 维 EE_R6_G1（2 × [xyz(3) + R6(6) + 夹爪(1)]
+    + 腰 rpy(3)），而天轶那类机器人的命令卡片是 23 维 joint_position。两个 23 完全
+    吻合，`dof` 和 `control_hz` 都挑不出毛病，于是位姿被当成关节角发下去。
+    """
+    problems = negotiate.check(
+        _caps(control_mode="eef_r6_g1", action_dim=7),
+        DESCRIPTOR,                                   # mode=joint_position, dof=7
+    )
+    assert problems
+    assert any("eef_r6_g1" in p and "joint_position" in p for p in problems)
+
+
+def test_a_model_that_declares_nothing_is_refused():
+    """「不确定就拒绝，不要猜」—— 猜错的代价不是报错，是机械臂走到错误的地方。"""
+    caps = _caps()
+    caps.pop("control_mode")
+    problems = negotiate.check(caps, DESCRIPTOR)
+    assert problems
+    # 报错要说清楚去哪儿设，两侧各一处。
+    assert any("CONTROL_MODE" in p and "control_mode" in p for p in problems)
+
+
+def test_a_matching_action_space_passes():
+    assert negotiate.check(_caps(control_mode="joint_position"), DESCRIPTOR) == []
+
+
+# ── 混合向量：顶层一个 mode 说不清的那些 ─────────────────────────────────────
+
+# 规范化之后的 G1 动作空间：两个末端位姿、两个归一化夹爪、三个腰关节角。
+MIXED_GROUPS = [
+    {"name": "eef_l", "offset": 0, "count": 7, "mode": "eef_pose"},
+    {"name": "gripper_l", "offset": 7, "count": 1, "mode": "joint_position"},
+    {"name": "eef_r", "offset": 8, "count": 7, "mode": "eef_pose"},
+    {"name": "gripper_r", "offset": 15, "count": 1, "mode": "joint_position"},
+    {"name": "waist", "offset": 16, "count": 3, "mode": "joint_position"},
+]
+
+
+def _mixed_descriptor(groups=None):
+    return {
+        "control_interface": "motus.control/1",
+        "mode": "eef_pose",
+        "dof": 19,
+        "joint_names": [f"a{i}" for i in range(19)],
+        "units": {"length": "m", "angle": "rad"},
+        "limits": {"lower": [-2.0] * 19, "upper": [2.0] * 19},
+        "rate": {"max_hz": 100, "expected_hz": 30, "watchdog_ms": 200},
+        "force_torque": None,
+        "groups": [dict(g) for g in (groups or MIXED_GROUPS)],
+    }
+
+
+def test_a_mixed_vector_that_agrees_segment_by_segment_passes():
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _mixed_descriptor(),
+    )
+    assert problems == []
+
+
+def test_segments_that_line_up_differently_are_refused():
+    """总维度相同、顶层 mode 相同，而分段错位 —— 每一段都把邻段的数字当成自己的。
+
+    这是顶层那条检查看不见的分歧：两边都报 19 维的 `eef_pose`，一边第 7 维是夹爪、
+    另一边第 7 维还是位姿的一部分。发下去不报错。
+    """
+    shifted = [
+        {"name": "eef_l", "offset": 0, "count": 8, "mode": "eef_pose"},
+        {"name": "gripper_l", "offset": 8, "count": 1, "mode": "joint_position"},
+        {"name": "eef_r", "offset": 9, "count": 7, "mode": "eef_pose"},
+        {"name": "gripper_r", "offset": 16, "count": 1, "mode": "joint_position"},
+        {"name": "waist", "offset": 17, "count": 2, "mode": "joint_position"},
+    ]
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=shifted),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("位置对不上" in p for p in problems)
+
+
+def test_a_segment_in_the_wrong_space_is_refused():
+    """腰那三个是关节角。一个把它们也当成笛卡尔量的模型，维度全对。"""
+    wrong = [dict(g) for g in MIXED_GROUPS]
+    wrong[-1] = {**wrong[-1], "mode": "eef_pose"}
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=wrong),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("waist" in p for p in problems)
+
+
+def test_different_numbers_of_segments_are_refused_rather_than_zipped():
+    """段数不同就无从逐段核对。按最短的那个 zip 过去会静默漏掉尾巴。"""
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[{"name": "all", "offset": 0, "count": 19,
+                               "mode": "eef_pose"}]),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("分成" in p for p in problems)
+
+
+def test_a_driver_group_without_a_mode_inherits_the_top_level_one():
+    """和 `motus.control/1` 驱动侧同一条规矩 —— 不写就是「和整体一样」。
+
+    今天每一个已有的驱动都不写段 mode，所以这条不成立的话，它们全都会在协商时被
+    判成和模型分歧。
+    """
+    inheriting = [
+        {"name": "a", "offset": 0, "count": 10},         # 不写 → eef_pose
+        {"name": "b", "offset": 10, "count": 9, "mode": "eef_pose"},
+    ]
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[{"name": "a", "offset": 0, "count": 10,
+                               "mode": "eef_pose"},
+                              {"name": "b", "offset": 10, "count": 9,
+                               "mode": "eef_pose"}]),
+        _mixed_descriptor(inheriting),
+    )
+    assert problems == []
+
+
+def test_a_single_space_model_is_not_forced_to_declare_segments():
+    """一边有段一边没有不算分歧 —— 今天每个模型都是单一空间，没有段是常态。"""
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19),
+        _mixed_descriptor(),
+    ) == []
+    # 而顶层 mode 真的不同时，仍然由上面那条检查抓住 —— 不是因为没有段就放行。
+    assert negotiate.check(
+        _caps(control_mode="joint_position", action_dim=19),
+        _mixed_descriptor(),
+    )
+
+
+def test_the_action_space_check_does_not_mask_the_others():
+    """空间不对、维度也不对时，两条都要报出来。
+
+    `check()` 收集全部理由而不是撞上第一条就返回 —— 在画布上改接线的人应该一次看到
+    全部分歧，而不是修好一个再发现下一个。
+    """
+    problems = negotiate.check(
+        _caps(control_mode="joint_velocity", action_dim=32), DESCRIPTOR
+    )
+    assert len(problems) == 2
+    assert any("joint_velocity" in p for p in problems)
+    assert any("32" in p and "7" in p for p in problems)
+
+
+def test_the_local_providers_declare_their_action_space():
+    """mock 和 smolvla 都发绝对关节角。
+
+    不声明的话，它们自己会被上面那条检查拦下 —— 这个用例钉的是「新增 provider 时
+    别忘了这个字段」，而不是某个具体的值。
+    """
+    from plugins.vla.providers import mock as mock_provider
+
+    provider = mock_provider.PROVIDER(DESCRIPTOR, {})
+    assert provider.capabilities()["control_mode"] in ("joint_position",)
+
+
+# ── eef_state：增量模型的基准位姿 ────────────────────────────────────────────
+
+
+class _Message:
+    def __init__(self, data):
+        self.data = data
+
+
+def _state_message(values, eef=None, stamp_ms=7_000):
+    payload = {"schema": "motus.control/1", "kind": "joint_state",
+               "values": list(values), "stamp_ms": stamp_ms}
+    if eef is not None:
+        payload["eef"] = list(eef)
+    return _Message(json.dumps(payload))
+
+
+POSE = [0.3, 0.1, 0.2, 0.0, 0.0, 0.0, 1.0]
+
+
+def test_the_end_effector_pose_rides_in_the_state_payload_not_a_second_topic():
+    """`_bind_inputs` 按 **ROS 消息类型**分派角色，两路 `String` 它分不开。
+
+    单开一路末端位姿话题会变成一个按连线顺序赌运气的绑定 —— 有时对，有时把本体
+    状态当成位姿。所以发布方（driver 的 servo_eef）把 `eef` 放进同一条载荷。
+    """
+    card = make_card()
+    card._capabilities = _caps(n_cameras=0, needs_state=True, needs_eef_state=True)
+    card._on_state(_state_message([0.1] * 17, eef=POSE + [0.0] * 12))
+
+    observation = card.observation()
+    assert observation.state == [0.1] * 17
+    assert observation.eef_state[:7] == POSE
+
+
+def test_a_state_payload_without_the_field_leaves_it_none():
+    """今天绝大多数驱动的状态载荷里没有 `eef`。多出来的这个字段不能让它们变成
+    「报了一个空位姿」。"""
+    card = make_card()
+    card._capabilities = _caps(n_cameras=0, needs_state=True)
+    card._on_state(_state_message([0.1] * 17))
+    assert card.observation().eef_state is None
+
+
+def test_a_delta_model_publishes_nothing_when_the_base_pose_is_missing():
+    """和 `needs_state` 同样的处理。
+
+    凑一个单位位姿上去，手臂会飞到原点附近一个看起来挺合理的地方，而上游每一道
+    检查都满意 —— 不发这一拍，驱动的看门狗保持，那是正确的状态。
+    """
+    card = make_card()
+    card._capabilities = _caps(n_cameras=0, needs_state=False, needs_eef_state=True)
+    card._on_state(_state_message([0.1] * 17))          # 有 values，没有 eef
+    assert card.observation() is None
+
+    card._on_state(_state_message([0.1] * 17, eef=POSE))
+    assert card.observation() is not None
+
+
+def test_binding_refuses_to_start_a_delta_model_with_no_state_topic():
+    """缺什么在**启动时**说清楚。不然卡片会报 running、一条指令都不发，而原因
+    只藏在 info().error 里。"""
+    _stub_ros_messages()
+    card = make_card()
+    node = _Graph({"/cam": ["sensor_msgs/msg/CompressedImage"]})
+
+    _, problem = card._bind_inputs(
+        node, ["/cam"], _caps(n_cameras=1, needs_state=False, needs_eef_state=True))
+
+    assert "末端位姿" in problem
+
+
+def test_the_provider_omits_the_field_entirely_when_there_is_no_pose():
+    """服务端把 None 和 [] 分开看：后者是「机器人报了，但它是空的」，那是个错误。"""
+    from plugins.vla.providers import vla_cloud
+
+    provider = vla_cloud.VLACloudProvider({}, {"endpoint": "https://vla.test"})
+    sent = {}
+
+    def _post(path, payload):
+        sent.update(payload)
+        return {"seq": payload["seq"], "actions": [[0.0]]}
+
+    provider._post = _post
+    provider.infer(Observation(images={}, state=[0.0], eef_state=None))
+    assert "eef_state" not in sent
+
+    provider.infer(Observation(images={}, state=[0.0], eef_state=POSE))
+    assert sent["eef_state"] == POSE
