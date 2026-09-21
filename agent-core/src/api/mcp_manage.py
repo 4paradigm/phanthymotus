@@ -881,9 +881,11 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         # Auto-apply saved config before start (same pattern as HTTP MCPs)
         saved_cfg = config.main.get(f'tool_config:agentcore:{req.tool}', None)
         if saved_cfg:
-            await _handle_agentcore_call(MCPCallRequest(
+            configured = await _handle_agentcore_call(MCPCallRequest(
                 tool=req.tool, arguments={'action': 'config', **saved_cfg}
             ))
+            if configured.get('code') != 200:
+                return configured
 
         # Subscribe to requested topics (additive — cleanup is done by prior 'stop' call)
         if all_topics:

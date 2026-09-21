@@ -209,8 +209,10 @@ def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
                 req = MCPCallRequest(tool=tool_name,
                                      arguments={'action': 'config', **cfg_body, **extra_args})
                 result = await mcp_call_tool(mcp_id, req)
+                from api.config import tool_state_of
                 if wait and isinstance(result, dict) and (
-                        result.get('code', 200) != 200 or result.get('isError')):
+                        result.get('code', 200) != 200 or result.get('isError')
+                        or tool_state_of(result)[0] == 'error'):
                     raise RuntimeError('配置下发未成功')
             except Exception:
                 if wait:

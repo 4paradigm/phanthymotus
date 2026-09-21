@@ -533,6 +533,7 @@ async function _confirmLoad() {
     _syncEntryBadge();
     _tabs[0].click();
     let msg = '解决方案已载入。';
+    if (json.data.applied?.canvas?.warning) msg += '\n' + json.data.applied.canvas.warning;
     if (_alignVersions) msg += '\n相关容器已对齐到方案记录的版本。';
     if (needs.length) msg += `\n有 ${needs.length} 个脱敏字段需要补填，见「当前方案」。`;
     if (failed.length) msg += `\n以下技能安装失败：${failed.map(f => f.slug).join('、')}`;

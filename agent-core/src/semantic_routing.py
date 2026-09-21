@@ -169,7 +169,7 @@ async def reset_settings(*, delete_keys=(), delete_prefix=None):
     return removed
 
 
-async def replace_canvas_settings(layout, tool_configs):
+async def replace_canvas_settings(layout, tool_configs, *, runtime_pending=None):
     """Validate Solution Jev fields before replacing any layout/config row."""
     key = 'tool_config:agentcore:decision_core'
     # Validate the original instance fields, including credentials, before
@@ -189,7 +189,9 @@ async def replace_canvas_settings(layout, tool_configs):
     return await _change_settings({**DEFAULTS, **incoming},
                                   tool_key=key if key in tool_configs else None,
                                   delete_prefix='tool_config:',
-                                  extra_rows={'canvas_layout': layout, **tool_configs})
+                                  extra_rows={'canvas_layout': layout, **tool_configs,
+                                              **({'canvas_runtime_pending': runtime_pending}
+                                                 if runtime_pending is not None else {})})
 
 
 def decode(event):

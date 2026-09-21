@@ -727,6 +727,35 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         await routing._worker
         self.assertTrue(event_bus._queue.empty())
 
+    async def test_core_start_rejects_failed_config_replay_before_subscribing(self):
+        from api import mcp_manage
+        import topic_subscriber
+        self.cfg['tool_config:agentcore:decision_core'] = {'jev_enabled': True}
+        before = copy.deepcopy(self.cfg)
+        with patch.object(routing, 'configure', new_callable=AsyncMock) as configure, \
+                patch.object(topic_subscriber, 'subscribe') as subscribe:
+            for error, code in ((ValueError('invalid identity'), 400), (OSError('disk'), 503)):
+                configure.side_effect = error
+                result = await mcp_manage._handle_agentcore_call(mcp_manage.MCPCallRequest(
+                    tool='decision_core', arguments={'action': 'start', 'input_topic': '/fixture/asr'}))
+                self.assertEqual(result['code'], code)
+                subscribe.assert_not_called()
+                self.assertEqual(self.cfg, before)
+
+    async def test_accepted_custom_asr_preserves_original_payload_metadata(self):
+        original = {'channel_id': 'fixture-channel', 'user_role': 'viewer',
+                    'routing': {'reply_to': 'fixture-message'}, 'producer_id': 'fixture-source'}
+        event = {'source': 'mcp:custom', 'text': json.dumps({
+            'text': '你好小范', 'audio_duration_ms': 800, 'asr_complete_ts': time.time()}),
+            'payload': copy.deepcopy(original)}
+        await event_bus.enqueue(event['source'], event['text'], event['payload'])
+        await routing._worker
+        accepted = await asyncio.wait_for(event_bus.dequeue(), timeout=1)
+        for key, value in original.items():
+            self.assertEqual(accepted['payload'][key], value)
+        self.assertEqual(accepted['payload']['duration_ms'], 800)
+        self.assertTrue(accepted['_semantic_voice'])
+
     async def test_solution_replace_disables_old_invisible_setting(self):
         from api.canvas import delete_all_tool_configs
         await delete_all_tool_configs()
@@ -829,6 +858,39 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         await routing._worker
         self.api.assert_awaited_once()
         self.assertEqual((await event_bus.dequeue())['text'], original)
+
+    async def test_solution_runtime_failures_keep_durable_retry_journal(self):
+        from api import canvas, solutions, mcp_manage
+        db = config.ConfigDB()
+        old_card = {'id': 'old-asr', 'mcpId': 'fixture-device', 'toolName': 'asr'}
+        db['canvas_layout'] = {'cards': [old_card]}
+        package = {'cards': [{'id': 'core', 'deviceRef': 'core', 'toolName': 'decision_core'}],
+                   'toolConfigs': {'core:decision_core': {'trigger_interval_ms': 600}}}
+        with patch.object(config, 'main', db), \
+                patch.object(solutions, '_canvas_runtime_lock', asyncio.Lock()), \
+                patch.object(canvas, 'notify_layout_changed'), \
+                patch.object(canvas, 'apply_tool_config', new_callable=AsyncMock) as apply, \
+                patch.object(mcp_manage, 'mcp_call_tool', new_callable=AsyncMock) as call:
+            call.return_value = {'code': 503}
+            result = await solutions._apply_canvas(package, {'core': 'agentcore'})
+            self.assertTrue(result['persisted'])
+            self.assertFalse(result['runtime_applied'])
+            apply.assert_not_called()
+            self.assertEqual(config.ConfigDB()['canvas_runtime_pending']['stop_cards'], [old_card])
+            call.return_value = {'code': 200, 'data': {'state': 'idle'}}
+            apply.side_effect = RuntimeError('private-fixture')
+            self.assertFalse(await solutions.reconcile_canvas_runtime())
+            self.assertIn('canvas_runtime_pending', db)
+            # Reapplying the same solution must not lose the now-removed card.
+            result = await solutions._apply_canvas(package, {'core': 'agentcore'})
+            self.assertFalse(result['runtime_applied'])
+            self.assertEqual(db['canvas_runtime_pending']['stop_cards'], [old_card])
+            self.assertNotIn('private-fixture', json.dumps(result))
+            apply.side_effect = None
+            self.assertTrue(await solutions.reconcile_canvas_runtime())
+            self.assertNotIn('canvas_runtime_pending', config.ConfigDB())
+            self.assertEqual(apply.call_args.args[2]['trigger_interval_ms'], 600)
+            self.assertTrue(apply.call_args.kwargs['wait'])
 
     async def test_solution_rejects_all_instance_jev_fields_before_changes(self):
         from api import canvas, solutions
