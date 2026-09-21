@@ -611,3 +611,34 @@ def test_acp_posts_are_never_merged():
          'acp_posts': [{'action_id': 's1'}]})
 
     assert merged['acp_posts'] == [{'action_id': 'a1'}, {'action_id': 'a1'}]
+
+
+def test_the_two_fact_clocks_are_put_on_one_base():
+    """**两边都用「相对秒数」，但相对的不是同一个起点。**
+
+    仿真器数的是本场景开始以来，记录器数的是本次录制开始以来，而场景通常在这次运行
+    之前就已经加载了。差十几秒就够了：合并后一排序，一条 `speak_start` 被顶到最前面，
+    而运行详情的右列拿最早那条事件当零点 —— 整列前移，看起来像机器人在被要求之前就
+    开了口。Orin6 上那次「开讲出现在 tts 调用之前」就是这个。
+    """
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'scenario_load', 't': 13.0, 'action_id': 'x'}],
+         'acp_posts': []},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': []},
+        t_offset=13.2)
+
+    assert [(e['event'], e['t']) for e in merged['events']] == [
+        ('scenario_load', 13.0), ('speak_start', 14.2)]
+
+
+def test_an_unalignable_world_shifts_nothing():
+    """对不齐就不搬。宁可两列差十几秒，也不要搬一个瞎猜的量 —— 搬错了，时序判定
+    （「到了再讲」）会拿错位的时间去比大小，而错位是看不出来的。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'scenario_load', 't': 5.0, 'action_id': 'x'}],
+         'acp_posts': []},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': []})
+
+    assert [e['t'] for e in merged['events']] == [1.0, 5.0]

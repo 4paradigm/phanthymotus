@@ -158,6 +158,9 @@ class SimulatorWorld:
     def __init__(self, mcp_id: str):
         self.mcp_id = mcp_id
         self._recorder = None
+        # 记录器的 `t` 是「本次录制开始以来」，仿真器的 `t` 是「本场景开始以来」——
+        # 两个零点不是一回事。合并前把前者搬到后者的时钟上，见 `_align`。
+        self._t_offset = 0.0
 
     async def _call(self, tool: str, args: dict) -> dict:
         result = await mcp_client.call_tool_direct(self.mcp_id, tool, args)
@@ -166,9 +169,33 @@ class SimulatorWorld:
     async def reset(self, run: dict, seed: int) -> dict:
         self._recorder = benchmark_facts.start()
         world = run.get('world') or {}
-        return await self._call(SCENARIO_TOOL, {
+        outcome = await self._call(SCENARIO_TOOL, {
             'action': 'reset', 'map': world.get('map', ''),
             'spawn': world.get('spawn') or {}, 'seed': seed, 'owner': OWNER})
+        await self._align()
+        return outcome
+
+    async def _align(self) -> None:
+        """把记录器的零点搬到仿真世界的零点上。
+
+        两边都用「相对秒数」，但相对的**不是同一个起点**：仿真器数的是本场景开始以来，
+        记录器数的是本次录制开始以来，而一个场景通常在这次运行之前就已经加载了。差值
+        只有十几秒，却足以让合并后排序把一条 `speak_start` 顶到最前面 —— 而运行详情的
+        右列拿最早那条事件当零点，于是整列前移，看起来像机器人在被要求之前就开了口。
+
+        对不齐就不搬（offset 留 0）：宁可两列差十几秒，也不要搬一个瞎猜的量。
+        """
+        recorder = self._recorder
+        if recorder is None:
+            return
+        report = await self._call(REPORT_TOOL, {'what': 'report'})
+        elapsed = report.get('elapsed') if isinstance(report, dict) else None
+        if elapsed is None:
+            return
+        try:
+            self._t_offset = float(elapsed) - (time.time() - recorder.started)
+        except (TypeError, ValueError):
+            self._t_offset = 0.0
 
     async def release(self) -> None:
         benchmark_facts.stop()
@@ -183,10 +210,10 @@ class SimulatorWorld:
         recorder = self._recorder or benchmark_facts.current()
         if recorder is None or not isinstance(report, dict):
             return report
-        return _merge_facts(report, recorder.facts())
+        return _merge_facts(report, recorder.facts(), self._t_offset)
 
 
-def _merge_facts(report: dict, mine: dict) -> dict:
+def _merge_facts(report: dict, mine: dict, t_offset: float = 0.0) -> dict:
     """仿真器的事实为底，补上它看不见的那些。
 
     **只合事件，不合 `acp_posts`。** 后者是 `exactly_one_terminal_post` 用来数
@@ -195,7 +222,8 @@ def _merge_facts(report: dict, mine: dict) -> dict:
     """
     seen = {str(e.get('action_id')) for e in (report.get('events') or [])
             if e.get('action_id')}
-    extra = [e for e in (mine.get('events') or [])
+    extra = [{**e, 't': round(float(e.get('t') or 0.0) + t_offset, 3)}
+             for e in (mine.get('events') or [])
              if str(e.get('action_id') or '') not in seen]
     if not extra:
         return report
