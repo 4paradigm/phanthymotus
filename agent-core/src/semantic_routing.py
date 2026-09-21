@@ -193,7 +193,7 @@ async def replace_canvas_settings(layout, tool_configs, *, runtime_pending=None)
     # Validate the original instance fields, including credentials, before
     # sanitizing shared imports. Otherwise key-only instances appear valid.
     for name, value in tool_configs.items():
-        if name.startswith(key + ':') and isinstance(value, dict) and set(value) & set(SCHEMA):
+        if name.startswith(key + ':') and isinstance(value, dict) and set(value) & CONFIG_KEYS:
             raise ValueError('Solution 中 Jev 配置必须放在 decision_core 共享配置中')
     # A Solution never imports credentials, even if a hand-edited package
     # supplies one. Keep the machine's existing key across replacement.

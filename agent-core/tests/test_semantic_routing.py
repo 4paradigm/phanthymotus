@@ -1332,7 +1332,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(canvas, 'apply_tool_config') as apply, \
                 patch.object(canvas, 'notify_layout_changed') as notify, \
                 patch.object(config_api, 'stop_removed_cards', new_callable=AsyncMock) as stop:
-            for field in routing.SCHEMA:
+            for field in sorted(routing.CONFIG_KEYS):
                 package = {'cards': [{'id': 'core', 'deviceRef': 'core', 'toolName': 'decision_core'}],
                            'toolConfigs': {'core:decision_core:core': {field: 'injected-fixture'}}}
                 with self.assertRaises(fastapi.HTTPException) as error:

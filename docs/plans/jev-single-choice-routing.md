@@ -21,6 +21,8 @@
 
 ## 验证与部署结果
 
+- PR 等待审查期间自查发现 Solution 实例字段校验遗漏隐藏旧阈值，补全 `CONFIG_KEYS` 一致性；先扩展现有测试到全部配置键并复现失败，再修复入口，保持“Jev 仅共享配置”的契约。此修复不改变实机路由策略，不再次部署。
+- 修复后本地 Python 3.13.0 Core 全量 1391 passed、1 skipped（缺 lark_oapi）、10 subtests passed，35.23 秒，diff 检查通过。此前 `66a18f6f` 镜像 `release.260921.c84895a` 全量 1405 passed、0 failed（4m08s）；新增修复需重新申请同 head 的 Bot，不沿用旧结果。README/操作文档原先已规定全部 Jev 字段仅共享配置，本修复恢复既有契约，无需改变用户操作步骤。
 - 本次提交前复测：临时独立 `DB_PATH`，`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/jev-core-routing-test-20260921/bin/python -m pytest agent-core/tests -q -ra`：1391 passed、1 skipped、10 subtests passed，37.30 秒；唯一跳过为本地缺少 `lark_oapi` 的 Feishu 测试。`git diff --check` 通过；最新 head 的镜像测试及 Bot 审查另待推送后确认。
 - 最终召回优先提示词：天轶 Core 内 TypeSafe 新旧各 20 次交替真实请求，使用 10 条现场 ASR 原句（7 人类问话、3 播报）及 10 条合成回归，实际 identity、固定构造上下文；不是当时完整历史快照重放。期望是当前接入策略，不是独立人工标注的真实对象准确率；逐字稿不入仓。
 - 新版 15 条应转交内容全部转交（包含 3 条称呼歧义），5 条明确自声/非对话全部拒绝；旧版按同一新策略少转交 5 条。两边 20/20 返回，无请求错误；中位数旧 847.5 ms、新 826.1 ms，最慢旧 3669.7 ms、新 3258.0 ms，各 2 次超过生产 2 秒预算。诊断用 8 秒观察模型结果，不修改线上预算；超预算负例不能算线上过滤成功，精确回声另有本地守卫。
