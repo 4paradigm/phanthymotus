@@ -8811,6 +8811,10 @@ html, body {
 /* 停止按钮:同一个位置换语义，颜色得跟着换，否则手会按惯性点下去。 */
 .bm-cardrun--stop { background: var(--red); border-color: var(--red); color: #fff; }
 .bm-cardrun:disabled { opacity: .4; cursor: not-allowed; }
+/* 刷新转一圈：数据没变时页面不会有任何动静，而「点了没反应」和「点了但数据就是
+   没变」在屏幕上长得一样。 */
+@keyframes bm-spin { to { transform: rotate(360deg); } }
+.bm-spin { animation: bm-spin .4s linear; }
 .bm-compare { margin-bottom: 9px; font-size: 11px; line-height: 1.6; }
 .bm-compare b { font-weight: 600; }
 /* 不显著就不着色 —— 一个绿色的「测不出显著差异」仍然会被读成「变好了」。 */

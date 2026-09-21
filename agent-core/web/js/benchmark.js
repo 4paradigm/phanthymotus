@@ -63,6 +63,7 @@ export function initBenchmark() {
     tab.addEventListener('click', () => _switchTab(tab.dataset.lib));
   });
   document.getElementById('benchmark-close')?.addEventListener('click', _close);
+  document.getElementById('bm-refresh')?.addEventListener('click', _refresh);
   document.getElementById('btn-benchmark')?.addEventListener('click', _open);
   document.getElementById('bm-abort')?.addEventListener('click', _abort);
   document.getElementById('bm-repeats')?.addEventListener('input', _repeatsNote);
@@ -115,6 +116,18 @@ function _close() {
 async function _load() {
   await Promise.all([_loadLibrary(), _loadRuns()]);
   await _poll();
+}
+
+/** 手动刷新。转一圈图标，让人知道它真的做了事 —— 数据没变时页面不会有任何动静，
+ *  而「点了没反应」和「点了但数据就是没变」在屏幕上长得一样。 */
+async function _refresh() {
+  const button = document.getElementById('bm-refresh');
+  button?.classList.add('bm-spin');
+  try {
+    await _load();
+  } finally {
+    setTimeout(() => button?.classList.remove('bm-spin'), 400);
+  }
 }
 
 // ── 用例库 ───────────────────────────────────────────────────────────────────

@@ -158,8 +158,14 @@ const KINDS = {
   speech_interrupt: '打断',
 };
 
+// 当前打开的是哪一次运行。详情是打开时取一次的快照，刷新要知道重取哪一条。
+let _openRunId = '';
+
 export function initTimeline() {
   document.getElementById('bm-timeline-close')?.addEventListener('click', close);
+  document.getElementById('bm-timeline-refresh')?.addEventListener('click', () => {
+    if (_openRunId) openTimeline(_openRunId);
+  });
   // 省略号里的东西常常正是要看的（完整的讲解词、整串参数）。点一下展开，
   // 不用跳去翻 docker logs。
   document.getElementById('bm-timeline-body')?.addEventListener('click', (event) => {
@@ -174,8 +180,13 @@ export async function openTimeline(runId) {
   const overlay = document.getElementById('bm-timeline-overlay');
   const body = document.getElementById('bm-timeline-body');
   if (!overlay || !body) return;
+  _openRunId = runId;
   overlay.classList.remove('hidden');
-  body.innerHTML = '<div class="bm-empty">读取中…</div>';
+  // 刷新时保留当前内容，只在真的还没有内容时才写「读取中」—— 每次刷新都把画面清空
+  // 再重画，读到一半的人会丢掉位置。
+  if (!body.querySelector('.bm-sc, .bm-tl-flow')) {
+    body.innerHTML = '<div class="bm-empty">读取中…</div>';
+  }
 
   let data;
   try {
@@ -198,6 +209,7 @@ function _switchPane(which) {
 
 function close() {
   document.getElementById('bm-timeline-overlay')?.classList.add('hidden');
+  _openRunId = '';
 }
 
 // ── 合流 ─────────────────────────────────────────────────────────────────────
