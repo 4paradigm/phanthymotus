@@ -20,6 +20,8 @@ import collector
 import event_bus
 import semantic_routing as routing
 
+_REAL_REQUEST_JEV = routing.request_jev
+
 
 class MemoryConfig(dict):
     def update_atomic(self, values, *, delete_keys=(), delete_prefix=None):
@@ -48,6 +50,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                     'semantic_routing': {**routing.DEFAULTS, 'jev_enabled': True,
                                          'jev_identity_path': str(self.identity)}})
         self.patchers = [patch.object(config, 'main', self.cfg),
+                         patch.object(routing, '_saved_api_key', ''),
                          patch.object(routing, '_settings', self.cfg['semantic_routing']),
                          patch.object(routing, '_configure_lock', asyncio.Lock()),
                          patch.dict(os.environ, {'TYPESAFE_API_KEY': 'fake-test-key'}),
@@ -534,6 +537,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         from api.solutions import _must_clear_props
         sensitive, _ = _must_clear_props({'properties': routing.SCHEMA})
         self.assertIn('jev_identity_path', sensitive)
+        self.assertIn('jev_api_key', sensitive)
         self.assertNotIn('TYPESAFE_API_KEY', routing.SCHEMA)
 
     async def test_schema_registration_real_function(self):
@@ -548,9 +552,92 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             ns['_register_core_mcp'](silent=True)
         core = next(m for m in save.call_args.args[0] if m['id'] == 'agentcore')
         schema = core['tools'][0]['configSchema']
+        self.assertNotIn('x-status-url', schema)
+        self.assertEqual(schema['properties']['jev_api_key']['format'], 'password')
+        self.assertTrue(schema['properties']['jev_api_key']['writeOnly'])
         self.assertEqual(schema['properties']['jev_enabled']['default'], False)
         self.assertEqual(schema['properties']['jev_model']['x-show-when'], {'jev_enabled': 'true'})
         self.assertIn('narration_silence_seconds', schema['properties'])
+
+    async def test_ui_key_is_private_atomic_and_blank_preserves_it(self):
+        from api import canvas
+        import fastapi
+        import httpx
+        app = fastapi.FastAPI()
+        app.include_router(canvas.router, prefix='/api')
+        secret = 'fixture-ui-private-key'
+        url = '/api/canvas/tool-config/agentcore/decision_core'
+        with patch.dict(os.environ, {'TYPESAFE_API_KEY': ''}), \
+                patch.object(canvas, 'apply_tool_config') as apply:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as c:
+                missing = await c.put(url, json={'jev_enabled': True})
+                self.assertEqual(missing.status_code, 400)
+                result = await c.put(url, json={'jev_enabled': True, 'jev_api_key': secret})
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(routing.api_key(), secret)
+                self.assertNotIn('jev_api_key', apply.call_args.args[2])
+                for endpoint in (url, '/api/canvas/tool-configs', '/api/canvas/semantic-routing'):
+                    self.assertNotIn(secret, (await c.get(endpoint)).text)
+                self.assertNotIn(secret, json.dumps(routing.settings()))
+                self.assertNotIn(secret, json.dumps(canvas.all_tool_configs()))
+                self.assertEqual(self.cfg[routing._CREDENTIAL_ROW]['api_key'], secret)
+                for preserved in ('', '****'):
+                    self.assertEqual((await c.put(url, json={'jev_api_key': preserved})).status_code, 200)
+                    self.assertEqual(routing.api_key(), secret)
+                before = copy.deepcopy(self.cfg)
+                bad = await c.put(url, json={'jev_api_key': 'replacement', 'jev_identity_path': '/missing'})
+                self.assertEqual(bad.status_code, 400)
+                self.assertEqual(self.cfg, before)
+                with patch.object(self.cfg, 'update_atomic', side_effect=OSError('disk full')):
+                    failed = await c.put(url, json={'jev_api_key': 'replacement'})
+                self.assertEqual(failed.status_code, 503)
+                self.assertEqual(routing.api_key(), secret)
+                self.assertNotIn(secret, routing.text_only('secret=' + secret))
+
+    async def test_key_validation_and_solution_cannot_replace_machine_key(self):
+        from api import canvas, solutions
+        from api import config as config_api
+        await routing.configure({'jev_api_key': 'machine-private-key'})
+        for value in (None, 12, 'invalid\nheader', 'x' * 4097, '中文'):
+            with self.assertRaises(ValueError):
+                await routing.configure({'jev_api_key': value})
+        package = {'cards': [{'id': 'core', 'deviceRef': 'core', 'toolName': 'decision_core'}],
+                   'toolConfigs': {'core:decision_core': {'jev_enabled': False, 'jev_api_key': 'injected-key'}}}
+        with patch.object(canvas, 'apply_tool_config') as apply, \
+                patch.object(canvas, 'notify_layout_changed'), \
+                patch.object(config_api, 'stop_removed_cards', new_callable=AsyncMock):
+            await solutions._apply_canvas(package, {'core': 'agentcore'})
+        self.assertEqual(routing.api_key(), 'machine-private-key')
+        self.assertNotIn('injected-key', json.dumps(self.cfg))
+        self.assertNotIn('jev_api_key', apply.call_args.args[2])
+        await routing.reset_settings(delete_prefix='tool_config:')
+        self.assertEqual(routing.api_key(), 'machine-private-key')
+
+    async def test_key_persisted_and_used_by_real_request_function(self):
+        # Exercise the production HTTP function with a local fake transport;
+        # no credentials or conversation leave the test process.
+        from unittest.mock import MagicMock
+        db = config.ConfigDB()
+        with patch.object(config, 'main', db):
+            await routing.configure({'jev_api_key': 'persisted-fixture-key'})
+            self.assertEqual(config.ConfigDB()[routing._CREDENTIAL_ROW]['api_key'], 'persisted-fixture-key')
+        import subprocess
+        env = {**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src'),
+               'DB_PATH': str(Path(config.DB_PATH).resolve()), 'TYPESAFE_API_KEY': ''}
+        subprocess.run([sys.executable, '-c',
+                        'import semantic_routing as r; assert r.api_key() == "persisted-fixture-key"'],
+                       env=env, check=True, capture_output=True, timeout=10)
+        http_response = MagicMock()
+        http_response.status = 200
+        http_response.json = AsyncMock(return_value=response())
+        session = MagicMock()
+        session.post.return_value.__aenter__ = AsyncMock(return_value=http_response)
+        client = MagicMock()
+        client.return_value.__aenter__ = AsyncMock(return_value=session)
+        with patch.object(routing.aiohttp, 'ClientSession', client):
+            await _REAL_REQUEST_JEV({}, True, routing.settings())
+        self.assertEqual(session.post.call_args.kwargs['headers']['Authorization'],
+                         'Bearer persisted-fixture-key')
 
     async def test_identity_deleted_during_request_rejects_voice(self):
         async def deleted(*args):

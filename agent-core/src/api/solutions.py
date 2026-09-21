@@ -1142,7 +1142,7 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     notify_layout_changed()
     for mcp_id, tool_name, instance_id, value in resolved:
         if mcp_id == 'agentcore' and tool_name == 'decision_core' and isinstance(value, dict):
-            value = {k: v for k, v in value.items() if k not in semantic_routing.DEFAULTS}
+            value = {k: v for k, v in value.items() if k not in semantic_routing.SCHEMA}
         apply_tool_config(mcp_id, tool_name, value, instance_id)
 
     return {'cards': len(cards),

@@ -2,10 +2,10 @@
 
 ## 开启方式
 
-1. 在 **Core 服务环境**配置 `TYPESAFE_API_KEY`。不要将密钥写进 Canvas、Solution 或 Git。
+1. 准备 TypeSafe API Key；可以在下面的卡片配置中填写，也兼容 **Core 服务环境**中的 `TYPESAFE_API_KEY`。不要将密钥写进 Solution 或 Git。
 2. 停止智能控制并取得 Canvas 编辑权，打开 `decision_core` 配置。
 3. 打开「启用 Jev 语义接入与消息路由」。默认关闭；旧项目不会自动启用。
-4. 默认读取 Core 内 `./resource/memory/identity.md` 的完整 UTF-8 正文。可修改为 Core 可读的文件路径，空值恢复默认。配置栏显示实际路径、可读性、密钥是否配置和当前默认模式；最近诊断见 Activity 或状态接口。
+4. 在出现的 TypeSafe API Key 密码框输入密钥。留空保留已配置密钥，保存后不回显；服务端独立保存值优先于环境变量，立即生效。密钥不进入卡片配置或 Solution；导入方案不会替换本机密钥。存储使用现有 SQLite（非加密保险库），应保护数据库及备份权限。默认读取 Core 内 `./resource/memory/identity.md` 的完整 UTF-8 正文；可修改为 Core 可读的路径，空值恢复默认。配置页不再显示诊断块，诊断见 Activity 或状态接口。
 5. 免唤醒词场景将上游 ASR 的 `trigger_mode` 设为 `vad`。保留 `asr_kws` 会先过滤掉没有唤醒词的语音；Core 不自动修改其他卡片。
 6. 保存后重新开始智能控制。卡片编辑锁和停止要求与现有 Canvas 一致。
 
@@ -48,7 +48,7 @@ ACP 完成、传感器、调度器和子 Agent 回执不调用 Jev。Channel 权
 - 36 项 Node 测试通过（topic-derive、json-util），三个改动 JS 语法检查、10 个改动 Python 文件的 3.10 AST 检查及 `git diff --check` 通过。
 - 浏览器使用 `tests/semantic_routing_preview.py`：真实注册 schema、配置 API 与现有 Canvas 弹窗，验证默认关闭、开启显示字段、非法路径拒绝、空路径恢复默认、保存刷新保持、关闭隐藏。隔离临时数据库和假密钥，不启动 Core loop 或硬件。
 - 真实 TypeSafe API 仅使用合成身份/历史：直接称呼机器人通过接入（0.98）；停止讲解选择 interrupt（confidence 0.99）；讲完再做选择 followup（0.98）。返回模型 `jev-1.13.0`，单次 1236 / 952 / 984 ms；不是准确率或真机端到端时延评测。
-- 未做机上部署、ROS/DDS 联调、真实 TTS 停播或硬件验收。
+- 2026-09-21 已仅更新天轶 Orin Core 为 `release.260921.7950a7d`；其他三个服务未更新/重启。只读验证启动、身份文件可读、DDS 隔离及智能控制关闭通过。机上 TypeSafe key 尚未配置，上游 ASR 仍需切换 vad；未做真实 Jev/语音链路联调、TTS 停播或硬件验收。详见 [部署记录](plans/tianyi-core-jev-deployment.md)。
 
 PR 首轮镜像测试为 1330 通过、12 失败、1 跳过，不能用上述定向测试代替全量。审查修复增加配置内存快照（启动加载，保存成功/替换 Solution 时更新）、诊断工作线程及相关回归；12 项打断测试改为显式 patch 模块。全量执行还发现原先跳过的部署进度模拟测试参数错误，已修正并改成普通 pytest 可执行入口，不涉及真实部署。
 
@@ -58,7 +58,7 @@ PR 首轮镜像测试为 1330 通过、12 失败、1 跳过，不能用上述定
 
 外部判断使用 HTTPS 和默认服务端证书校验；不下载或执行模型代码。API 返回没有另行提供应用层签名，信任 TypeSafe 服务端及 TLS 链路；类型校验不构成对判断正确性的保证。
 
-部署模板中的 `TYPESAFE_API_KEY` 仅用于向 Core 传入可选服务端凭据，不增加包、镜像层或复制数据；不需要修改 Dockerfile。没有配置密钥时，Canvas 无法成功启用 Jev。
+部署模板中的 `TYPESAFE_API_KEY` 仍可传入可选服务端凭据；也可直接通过卡片密码框保存，无需改 Compose 或重启。不增加依赖或修改 Dockerfile。两处均无密钥时，保存启用 Jev 会报错并保留旧配置。
 
 DDS 挂载行为未修改：Core 是 profile 的生产/修复方，启动前由 `dds_isolation.ensure_profile()` 经可写 `/opt/phanthy-motus` 父目录挂载补齐或更新文件。不能为它叠加只读 `dds-local.xml` 子文件挂载，否则现有缺失文件修复与版本更新会被阻止；其他只读消费方的挂载示例不直接套用于 Core。
 

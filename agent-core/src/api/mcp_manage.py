@@ -861,7 +861,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
     action = req.arguments.get('action', '')
     if req.tool == 'decision_core' and action == 'config':
         import semantic_routing
-        if any(k in req.arguments for k in semantic_routing.DEFAULTS):
+        if any(k in req.arguments for k in semantic_routing.SCHEMA):
             try:
                 await semantic_routing.configure(req.arguments)
             except ValueError as exc:

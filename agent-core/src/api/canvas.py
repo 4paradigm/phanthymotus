@@ -427,7 +427,7 @@ async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body
     if mcp_id == 'agentcore' and tool_name == 'decision_core':
         # Jev was already committed above. Replaying it through the deferred
         # MCP push could overwrite a newer save/delete with this stale body.
-        apply_body = {k: v for k, v in body.items() if k not in semantic_routing.DEFAULTS}
+        apply_body = {k: v for k, v in body.items() if k not in semantic_routing.SCHEMA}
     apply_tool_config(mcp_id, tool_name, apply_body)
     return {'code': 200}
 

@@ -770,6 +770,10 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       if (def.type === 'number' || def.type === 'integer') input.step = 'any';
       input.placeholder = def.default != null ? String(def.default) : '';
       input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
+      if (def.writeOnly) {
+        input.value = '';
+        input.autocomplete = 'new-password';
+      }
     }
 
     fieldWrapper.appendChild(label);
@@ -822,7 +826,12 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   _applyShowWhen();
 
   // Handlers
-  const close = () => { overlay.classList.add('hidden'); };
+  const close = () => {
+    for (const input of bodyEl.querySelectorAll('[data-key]')) {
+      if (props[input.dataset.key]?.writeOnly) input.value = '';
+    }
+    overlay.classList.add('hidden');
+  };
   const save = async () => {
     if (!(await ensureEdit())) return;
     const values = {};
@@ -858,6 +867,9 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     }
 
     // Update local cache
+    for (const [key, def] of Object.entries(props)) {
+      if (def.writeOnly) delete values[key];
+    }
     _toolConfigs[configKey] = values;
 
     // Update sidebar card status indicator

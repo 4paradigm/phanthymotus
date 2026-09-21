@@ -24,6 +24,9 @@ DEFAULTS = {'jev_enabled': False, 'jev_identity_path': '', 'jev_model': 'jev-lat
 SCHEMA = {
     'jev_enabled': {'type': 'boolean', 'default': False,
                     'description': '启用 Jev 语义接入与消息路由（身份及对话文本将发送到 TypeSafe）'},
+    'jev_api_key': {'type': 'string', 'format': 'password', 'writeOnly': True,
+                    'x-sensitive': True,
+                    'description': 'TypeSafe API Key（留空保留已配置密钥）'},
     'jev_identity_path': {'type': 'string', 'default': DEFAULT_IDENTITY_PATH,
                          'description': 'Identity 文件路径（Core 内路径，留空恢复默认）',
                          'x-empty-default': True,
@@ -61,7 +64,13 @@ QUESTIONS = {
 # Load once at process startup, before producers begin ingesting events. All
 # runtime writers below publish a new snapshot only after persistence succeeds.
 _settings = {**DEFAULTS, **config.main.get('semantic_routing', {})}
+_CREDENTIAL_ROW = 'semantic_routing_credentials'
+_saved_api_key = config.main.get(_CREDENTIAL_ROW, {}).get('api_key', '')
 _configure_lock = asyncio.Lock()
+
+
+def api_key():
+    return _saved_api_key or os.environ.get('TYPESAFE_API_KEY', '').strip()
 
 
 def settings():
@@ -84,7 +93,7 @@ def identity(cfg):
     return str(path.resolve()), content, hashlib.sha256(content.encode()).hexdigest()
 
 
-def validate(values, *, preflight=True):
+def validate(values, *, preflight=True, credential=None):
     cfg = {**settings(), **{k: v for k, v in values.items() if k in DEFAULTS}}
     if type(cfg['jev_enabled']) is not bool:
         raise ValueError('jev_enabled 必须为布尔值')
@@ -99,8 +108,8 @@ def validate(values, *, preflight=True):
         if type(v) not in (int, float) or not math.isfinite(v) or not low <= v <= high:
             raise ValueError(f'{key} 必须在 {low}–{high} 之间')
     if cfg['jev_enabled'] and preflight:
-        if not os.environ.get('TYPESAFE_API_KEY', '').strip():
-            raise ValueError('Core 未配置 TYPESAFE_API_KEY')
+        if not (api_key() if credential is None else credential):
+            raise ValueError('请填写 TypeSafe API Key，或在 Core 配置 TYPESAFE_API_KEY')
         try:
             identity(cfg)
         except (OSError, UnicodeError, ValueError) as exc:
@@ -110,20 +119,32 @@ def validate(values, *, preflight=True):
 
 async def _change_settings(values, *, tool_key=None, delete_keys=(), delete_prefix=None, extra_rows=None):
     async def change():
-        global _settings
+        global _settings, _saved_api_key
         # Serialize read/validate/write/publish, including concurrent HTTP/MCP
         # calls. Thread workers do I/O only; runtime state stays on this loop.
         async with _configure_lock:
-            cfg = await asyncio.to_thread(validate, values)
-            changed = cfg != settings()
+            incoming_key = values.get('jev_api_key', '')
+            if not isinstance(incoming_key, str):
+                raise ValueError('TypeSafe API Key 必须为字符串')
+            incoming_key = incoming_key.strip()
+            if incoming_key == '****':
+                incoming_key = ''
+            if len(incoming_key) > 4096 or any(ord(c) < 33 or ord(c) > 126 for c in incoming_key):
+                raise ValueError('TypeSafe API Key 格式无效')
+            cfg = await asyncio.to_thread(validate, values, credential=incoming_key or api_key())
+            changed = cfg != settings() or bool(incoming_key and incoming_key != _saved_api_key)
             rows = {**(extra_rows or {}), 'semantic_routing': cfg}
+            if incoming_key:
+                rows[_CREDENTIAL_ROW] = {'api_key': incoming_key}
             if tool_key is not None:
-                rows[tool_key] = {**values, **cfg}
+                rows[tool_key] = {**{k: v for k, v in values.items() if k != 'jev_api_key'}, **cfg}
             removed = 0
             if changed or tool_key is not None or delete_keys or delete_prefix is not None:
                 removed = await asyncio.to_thread(config.main.update_atomic, rows,
                                                  delete_keys=delete_keys, delete_prefix=delete_prefix)
                 _settings = dict(cfg)
+                if incoming_key:
+                    _saved_api_key = incoming_key
                 await invalidate(deliver_text=True)
             return cfg, removed
 
@@ -151,6 +172,12 @@ async def reset_settings(*, delete_keys=(), delete_prefix=None):
 async def replace_canvas_settings(layout, tool_configs):
     """Validate Solution Jev fields before replacing any layout/config row."""
     key = 'tool_config:agentcore:decision_core'
+    # A Solution never imports credentials, even if a hand-edited package
+    # supplies one. Keep the machine's existing key across replacement.
+    tool_configs = {name: ({k: v for k, v in value.items() if k != 'jev_api_key'}
+                          if name == key or name.startswith(key + ':') else value)
+                    if isinstance(value, dict) else value
+                    for name, value in tool_configs.items()}
     for name, value in tool_configs.items():
         if name.startswith(key + ':') and isinstance(value, dict) and set(value) & set(DEFAULTS):
             raise ValueError('Solution 中 Jev 配置必须放在 decision_core 共享配置中')
@@ -230,6 +257,8 @@ def text_only(value):
         for name, secret in os.environ.items():
             if len(secret) >= 8 and any(s in name for s in ('API_KEY', 'TOKEN', 'SECRET', 'PASSWORD')):
                 value = value.replace(secret, '[redacted]')
+        if _saved_api_key:
+            value = value.replace(_saved_api_key, '[redacted]')
         return value
     return value if value is None or isinstance(value, (bool, int, float)) else '[non-text omitted]'
 
@@ -249,7 +278,7 @@ def default_mode():
 
 
 async def request_jev(state, voice, cfg):
-    key = os.environ.get('TYPESAFE_API_KEY', '').strip()
+    key = api_key()
     if not key:
         raise ValueError('missing_api_key')
     questions = QUESTIONS if voice else {'route': QUESTIONS['route']}
@@ -498,7 +527,7 @@ def status():
         shared = config.main.get(f"tool_config:{card.get('mcpId')}:asr", {}) or {}
         if shared.get('trigger_mode', 'asr_kws') != 'vad':
             warnings.append(f"ASR 卡片 {card.get('id', '')} 仍可能由 KWS 过滤；免唤醒词需设为 vad")
-    key_configured = bool(os.environ.get('TYPESAFE_API_KEY', '').strip())
+    key_configured = bool(api_key())
     summary = (f"Jev：{'开启' if cfg['jev_enabled'] else '关闭'}\n"
                f"Identity：{path}\n文件：{'可读' if file_status == 'readable' else '不可读/为空'}\n"
                f"API Key：{'已配置' if key_configured else '未配置'}\n"

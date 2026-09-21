@@ -120,7 +120,6 @@ def _register_core_mcp(silent=False):
                 }},
                 'configSchema': {
                     'type': 'object',
-                    'x-status-url': '/api/canvas/semantic-routing',
                     'properties': {
                         'llm_url':   {'type': 'string', 'description': 'LLM API URL'},
                         'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password'},
