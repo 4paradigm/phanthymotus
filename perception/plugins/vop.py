@@ -88,6 +88,63 @@ _MODEL_ALIASES = {
 }
 
 
+_HUE_NAMES = (
+    # OpenCV hue is 0-179. Boundaries are the usual colour-wheel splits.
+    (10, "red"), (22, "orange"), (34, "yellow"), (78, "green"),
+    (100, "cyan"), (130, "blue"), (155, "purple"), (170, "pink"), (180, "red"),
+)
+
+
+def dominant_hue(h_mean: float, s_mean: float, v_mean: float) -> str:
+    """Name the colour a mean HSV triple lands on.
+
+    Low saturation means the hue is meaningless, so those go to
+    black/gray/white by value instead — a white wall reads as "white",
+    not as whatever hue the sensor noise happened to average to.
+    """
+    if s_mean < 40:
+        if v_mean < 50:
+            return "black"
+        if v_mean > 200:
+            return "white"
+        return "gray"
+    for upper, name in _HUE_NAMES:
+        if h_mean < upper:
+            return name
+    return "red"
+
+
+def color_stats(frame_bgr, bbox=None) -> dict:
+    """RGB/HSV mean and variance for a BGR frame or one box inside it.
+
+    Returns 12 numbers plus a colour name. The variances answer "is this a
+    flat patch or a busy one" (a lit ceiling panel is bright *and* flat);
+    ``hsv_mean[2]`` is the plain brightness number a lights-on check reads.
+    """
+    import cv2
+
+    region = frame_bgr
+    if bbox is not None:
+        height, width = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = (int(round(float(v))) for v in bbox)
+        x1, x2 = max(0, min(x1, width - 1)), max(0, min(x2, width))
+        y1, y2 = max(0, min(y1, height - 1)), max(0, min(y2, height))
+        if x2 <= x1 or y2 <= y1:
+            return {}
+        region = frame_bgr[y1:y2, x1:x2]
+    rgb = region[:, :, ::-1].reshape(-1, 3).astype(np.float32)
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
+    rgb_mean, rgb_var = rgb.mean(axis=0), rgb.var(axis=0)
+    hsv_mean, hsv_var = hsv.mean(axis=0), hsv.var(axis=0)
+    return {
+        "rgb_mean": [round(float(v), 1) for v in rgb_mean],
+        "rgb_var": [round(float(v), 1) for v in rgb_var],
+        "hsv_mean": [round(float(v), 1) for v in hsv_mean],
+        "hsv_var": [round(float(v), 1) for v in hsv_var],
+        "dominant_hue": dominant_hue(*(float(v) for v in hsv_mean)),
+    }
+
+
 def output_topic_for(input_topic: Optional[str]) -> str:
     """The one place the output topic is derived from the input.
 
@@ -306,7 +363,7 @@ class _VOPNode(Node):
                 boxes, scores, classes = decode_detections(
                     outputs, meta, self._confidence
                 )
-                objects = self._extract_objects(boxes, scores, classes, frame.shape)
+                objects = self._extract_objects(boxes, scores, classes, frame)
                 self._publish_objects(objects, started)
             except Exception as e:
                 log.error(f"[vop] inference error: {e}", exc_info=True)
@@ -322,20 +379,28 @@ class _VOPNode(Node):
             return self._vocabulary[cls_id]
         return str(cls_id)
 
-    def _extract_objects(self, boxes, scores, classes, shape) -> list:
-        H, W = shape[:2]
+    def _extract_objects(self, boxes, scores, classes, frame) -> list:
+        # `frame` is the decoded BGR array; a bare shape tuple is still
+        # accepted (older callers and tests) and just yields no colour.
+        pixels = frame if hasattr(frame, "shape") else None
+        H, W = (pixels.shape if pixels is not None else frame)[:2]
         half_w, half_h = W / 2.0, H / 2.0
         objects = []
         for (x1, y1, x2, y2), score, cls_id in zip(boxes, scores, classes):
             cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            objects.append({
+            obj = {
                 "name": self._class_name(int(cls_id)),
                 "position": [
                     round(float((cx - half_w) / half_w), 3),
                     round(float((cy - half_h) / half_h), 3),
                 ],
                 "confidence": round(float(score), 2),
-            })
+            }
+            if pixels is not None:
+                # Colour of the box, so "the red ball" is answerable without
+                # the model ever seeing pixels.
+                obj["color"] = color_stats(pixels, (x1, y1, x2, y2))
+            objects.append(obj)
         return objects
 
     def publish_objects(self, objects: list, started: Optional[float] = None):
@@ -629,6 +694,7 @@ class VideoObjectPerceptionPlugin:
                 ],
                 "confidence": round(float(score), 2),
                 "bbox": [round(float(v), 1) for v in (x1, y1, x2, y2)],
+                "color": color_stats(frame, (x1, y1, x2, y2)),
             })
 
         # Echo onto the card's output topic when one is running, so a topic-less
@@ -652,6 +718,9 @@ class VideoObjectPerceptionPlugin:
             # {topic}/objects cannot disagree about how long this took.
             "latency_ms": int((time.time() - started) * 1000),
             "objects": objects,
+            # Whole-frame statistics: an empty room has no boxes, but a
+            # lights-on check still needs a brightness number to read.
+            "frame_color": color_stats(frame),
         }
         return result
 
