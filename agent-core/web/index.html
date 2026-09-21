@@ -665,6 +665,9 @@
     <div class="modal-header">
       <span class="modal-title">基准测试</span>
       <div class="bm-header-meta" id="bm-env"></div>
+      <!-- 用例库和历史只在打开面板、以及跑动起止时重读。别处起的跑动、刚跑完的
+           那一条，不刷新就看不见 —— 而「关掉再打开」不该是刷新的办法。 -->
+      <button class="btn-icon" id="bm-refresh" title="刷新用例库与历史">&#8635;</button>
       <button class="btn-icon" id="benchmark-close">&#10005;</button>
     </div>
 
@@ -691,7 +694,7 @@
         <div class="bm-launch">
           <label class="bm-repeats-row" for="bm-repeats">
             <span>重复</span>
-            <input type="number" id="bm-repeats" value="3" min="1" max="20">
+            <input type="number" id="bm-repeats" value="1" min="1" max="20">
             <span>次</span>
           </label>
           <p class="bm-note" id="bm-repeats-note"></p>
@@ -725,6 +728,9 @@
   <div class="modal bm-timeline-modal">
     <div class="modal-header">
       <span class="modal-title">运行详情</span>
+      <!-- 详情是打开时取一次的静态快照。跑动还在进行时打开，看到的就是那一刻的
+           样子，后面再没有更新。 -->
+      <button class="btn-icon" id="bm-timeline-refresh" title="重新读取这次运行">&#8635;</button>
       <button class="btn-icon" id="bm-timeline-close">&#10005;</button>
     </div>
     <div class="modal-body bm-timeline-body" id="bm-timeline-body"></div>

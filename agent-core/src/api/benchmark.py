@@ -514,9 +514,20 @@ async def run_case(request: CaseRunRequest):
     import benchmark_runner
     from api.solutions import loaded_case
 
-    if benchmark_runner.is_busy():
+    # **占位要在第一个 await 之前。** 下面的依赖检查会 await（还可能走 MCP 网络），
+    # 先查后占的话两个并发请求会双双通过 —— 两次跑动同时注入用户消息、同时重置世界。
+    if not benchmark_runner.claim():
         raise fastapi.HTTPException(status_code=409, detail='已经有一次基准测试在跑')
+    try:
+        return await _start_run(request)
+    except BaseException:
+        benchmark_runner.release()      # 没跑成就把位子还回去
+        raise
 
+
+async def _start_run(request: CaseRunRequest):
+    import benchmark_case
+    import benchmark_runner
     case = _case_to_run(request.case_id)
     if not case:
         raise fastapi.HTTPException(
@@ -555,7 +566,7 @@ async def run_case(request: CaseRunRequest):
         session_id=_current_session())
 
     run = benchmark_runner.CaseRun(case, mcp_id, repeats, int(request.seed),
-                                   run_id, environment)
+                                   run_id, environment, case_id=request.case_id)
     benchmark_runner.set_current(run)
     run.start()
     return {'run_id': run_id, 'repeats': repeats, 'mcp_id': mcp_id}
@@ -622,6 +633,11 @@ async def run_timeline(run_id: str):
 
     cases = stored.get('cases') or []
     facts = next((c.get('facts') for c in cases if c.get('facts')), {}) or {}
+    # 跑动还在进行时，事实**一条都还没落盘** —— 那是每次重复跑完才写的。于是详情页
+    # 的「世界真的做了什么」一直是空的，刷新也没用，看起来像世界什么都没做。
+    # 正在跑的那一次直接问活的世界要。
+    if not facts and (stored.get('status') or '') == 'running':
+        facts = await _live_facts(run_id)
     events = facts.get('events') or []
     base = events[0].get('t', 0) if events else 0
 
@@ -657,6 +673,18 @@ async def run_timeline(run_id: str):
     }
 
 
+async def _live_facts(run_id: str) -> dict:
+    """正在跑的那一次，此刻的事实。拿不到就空着 —— 详情页会照常说这次没有记录。"""
+    import benchmark_runner
+    run = benchmark_runner.current()
+    if run is None or run.run_id != run_id:
+        return {}
+    try:
+        return await run.world.facts() or {}
+    except Exception:
+        return {}
+
+
 def _perf_turns(started, ended) -> list:
     """这段时间里每一轮的**真实**起止与逐次工具调用时刻。
 
@@ -668,7 +696,10 @@ def _perf_turns(started, ended) -> list:
         return []
     try:
         import perf_log
-        return perf_log.turns_between(float(started) - 10, float(ended or started) + 600)
+        # 还没结束时用**现在**当上界，不是 `started`：一次跑了十分钟的运行，
+        # `started + 600` 刚好卡在边上，最后几轮会被悄悄截掉。
+        return perf_log.turns_between(float(started) - 10,
+                                      float(ended or time.time()) + 600)
     except Exception:
         return []
 

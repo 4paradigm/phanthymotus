@@ -158,8 +158,17 @@ const KINDS = {
   speech_interrupt: '打断',
 };
 
+// 当前打开的是哪一次运行。详情是打开时取一次的快照，刷新要知道重取哪一条。
+let _openRunId = '';
+// 当前在哪个 tab。刷新会重建整块 HTML，不记住的话每次都弹回「打分细节」——
+// 而人按刷新往往正是因为在看运行日志、想看有没有新的一行。
+let _pane = 'score';
+
 export function initTimeline() {
   document.getElementById('bm-timeline-close')?.addEventListener('click', close);
+  document.getElementById('bm-timeline-refresh')?.addEventListener('click', () => {
+    if (_openRunId) openTimeline(_openRunId);
+  });
   // 省略号里的东西常常正是要看的（完整的讲解词、整串参数）。点一下展开，
   // 不用跳去翻 docker logs。
   document.getElementById('bm-timeline-body')?.addEventListener('click', (event) => {
@@ -174,8 +183,14 @@ export async function openTimeline(runId) {
   const overlay = document.getElementById('bm-timeline-overlay');
   const body = document.getElementById('bm-timeline-body');
   if (!overlay || !body) return;
+  _pane = paneFor(runId, _openRunId, _pane);
+  _openRunId = runId;
   overlay.classList.remove('hidden');
-  body.innerHTML = '<div class="bm-empty">读取中…</div>';
+  // 刷新时保留当前内容，只在真的还没有内容时才写「读取中」—— 每次刷新都把画面清空
+  // 再重画，读到一半的人会丢掉位置。
+  if (!body.querySelector('.bm-sc, .bm-tl-flow')) {
+    body.innerHTML = '<div class="bm-empty">读取中…</div>';
+  }
 
   let data;
   try {
@@ -186,10 +201,32 @@ export async function openTimeline(runId) {
     body.innerHTML = `<div class="bm-empty">读不到这次运行：${_esc(e.message || e)}</div>`;
     return;
   }
+  // 刷新是**原地更新**，不是重开：tab 停在原处，滚动位置也留着。整块 HTML 是重建
+  // 的，所以这两样得自己接回去 —— 否则「刷新一下看看有没有新内容」的代价是丢掉
+  // 当前位置，而新内容往往就在你刚才看的地方附近。
+  const scrolled = body.scrollTop;
+  // 换整块 innerHTML 时高度会先塌到 0 再撑回来 —— 那一下就是看到的「闪动」。
+  // 先把当前高度按住，画完再放开。
+  const held = body.offsetHeight;
+  if (held) body.style.minHeight = `${held}px`;
   body.innerHTML = _render(data);
+  _switchPane(_pane);
+  body.scrollTop = scrolled;
+  body.style.minHeight = '';
+}
+
+/** 打开这一条时该停在哪个 tab。
+ *
+ * 刷新（同一条）**保持原样** —— 人按刷新往往正是因为在看运行日志、想看有没有新的
+ * 一行，弹回「打分细节」等于每刷新一次就把他赶走一次。换一条看则从分数开始，那是
+ * 打开一条新记录的第一个问题。
+ */
+export function paneFor(runId, openRunId, current) {
+  return runId === openRunId ? current : 'score';
 }
 
 function _switchPane(which) {
+  _pane = which;
   document.querySelectorAll('.bm-tl-tab').forEach((t) => t.classList.toggle(
     'active', t.dataset.pane === which));
   document.querySelectorAll('.bm-tl-pane').forEach((p) => p.classList.toggle(
@@ -198,6 +235,7 @@ function _switchPane(which) {
 
 function close() {
   document.getElementById('bm-timeline-overlay')?.classList.add('hidden');
+  _openRunId = '';
 }
 
 // ── 合流 ─────────────────────────────────────────────────────────────────────

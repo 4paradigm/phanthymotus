@@ -48,6 +48,12 @@ async function api(path, opts) {
 
 let _pollTimer = null;
 let _runId = null;
+// 正在跑的是哪个用例。列表里那张卡据此把「运行」换成「停止」，其余卡片置灰 ——
+// 同时跑两个会让两次跑动往同一个 agent 注入消息、同时重置世界。
+let _runningId = null;
+// 正在走手动刷新。`_load()` 会重画列表，而它调的 `_poll()` 也可能重画 —— 一次点击
+// 画两遍，眼睛看到的就是闪一下。
+let _refreshing = false;
 // 仿真器的 mcp_id，没有就是 null —— 也就是这次运行会驱动真实设备。
 let _simulator = null;
 
@@ -60,6 +66,7 @@ export function initBenchmark() {
     tab.addEventListener('click', () => _switchTab(tab.dataset.lib));
   });
   document.getElementById('benchmark-close')?.addEventListener('click', _close);
+  document.getElementById('bm-refresh')?.addEventListener('click', _refresh);
   document.getElementById('btn-benchmark')?.addEventListener('click', _open);
   document.getElementById('bm-abort')?.addEventListener('click', _abort);
   document.getElementById('bm-repeats')?.addEventListener('input', _repeatsNote);
@@ -112,6 +119,25 @@ function _close() {
 async function _load() {
   await Promise.all([_loadLibrary(), _loadRuns()]);
   await _poll();
+}
+
+/** 手动刷新。转一圈图标，让人知道它真的做了事 —— 数据没变时页面不会有任何动静，
+ *  而「点了没反应」和「点了但数据就是没变」在屏幕上长得一样。 */
+async function _refresh() {
+  const button = document.getElementById('bm-refresh');
+  button?.classList.add('bm-spin');
+  // 原地更新：三块内容都是整块重建的，滚动位置不自己接回去就会弹回顶部 ——
+  // 而「刷新一下看看有没有新的」之后要看的东西，往往就在刚才那个位置附近。
+  const kept = ['bm-lib-local', 'bm-lib-market', 'bm-runs']
+    .map((id) => [document.getElementById(id), document.getElementById(id)?.scrollTop ?? 0]);
+  _refreshing = true;
+  try {
+    await _load();
+  } finally {
+    _refreshing = false;
+    kept.forEach(([el, top]) => { if (el) el.scrollTop = top; });
+    setTimeout(() => button?.classList.remove('bm-spin'), 400);
+  }
 }
 
 // ── 用例库 ───────────────────────────────────────────────────────────────────
@@ -174,8 +200,12 @@ function _caseCard(c) {
             title="把这个用例自带的 ${c.cards} 张卡片载入画布，会覆盖当前画布"
             >载入画布</button>` : ''}
           <button class="bm-linkbtn" data-del="${_esc(c.id)}">删除</button>
-          <button class="bm-cardrun" data-run="${_esc(c.id)}"
-            title="在**当前画布**上跑这个用例">运行</button>
+          ${_runningId === c.id
+            ? `<button class="bm-cardrun bm-cardrun--stop" data-stop="${_esc(c.id)}"
+                 title="停止这次运行；已跑完的几次留在历史里">停止</button>`
+            : `<button class="bm-cardrun" data-run="${_esc(c.id)}"
+                 ${_runningId ? 'disabled title="已经有一次基准测试在跑"' : 'title="在当前画布上跑这个用例"'}
+                 >运行</button>`}
         </span>
       </div>
       ${(c.problems || []).length ? `<ul class="bm-blockers">${
@@ -190,6 +220,8 @@ function _bindCaseCards(el) {
     'click', () => _startCase(b.dataset.run)));
   el.querySelectorAll('[data-load]').forEach((b) => b.addEventListener(
     'click', () => _loadCaseCanvas(b.dataset.load)));
+  el.querySelectorAll('[data-stop]').forEach((b) => b.addEventListener(
+    'click', () => _abort()));
   el.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
     const card = _cases.find((c) => c.id === b.dataset.del);
     if (!window.confirm(`删掉用例「${card?.name || ''}」？运行过的分数会留在历史里。`)) return;
@@ -201,7 +233,9 @@ function _bindCaseCards(el) {
 async function _loadMarketCases() {
   const el = document.getElementById('bm-lib-market');
   if (!el) return;
-  el.innerHTML = '<div class="bm-empty">加载中…</div>';
+  // 只在**真的还没有内容**时才写「加载中」。每次刷新都先清空再重画，就是一次可见的
+  // 闪动 —— 而刷新的全部意义是原地看看有没有新东西。
+  if (!el.querySelector('.bm-card')) el.innerHTML = '<div class="bm-empty">加载中…</div>';
   let data;
   try {
     data = await api('/api/benchmark/cases/market');
@@ -411,6 +445,7 @@ async function _newCase() {
 }
 
 async function _runCase(repeats, confirmMovingCards = null, caseId = '') {
+  _runningId = caseId || null;
   try {
     const result = await api('/api/benchmark/case/run', {
       method: 'POST',
@@ -418,9 +453,11 @@ async function _runCase(repeats, confirmMovingCards = null, caseId = '') {
                              confirm_moving_cards: confirmMovingCards }),
     });
     _runId = result.run_id;
-    showToast(`用例开始运行 × ${repeats} 次`);
+    showToast(repeats > 1 ? `用例开始运行 × ${repeats} 次` : '用例开始运行');
+    _loadLibrary();
     _startPolling();
   } catch (e) {
+    _runningId = null;
     // 服务端说「这次会驱动真实设备」—— 那不是错误，是要请现场的人拍板。
     const moving = e?.detail?.needs_confirmation ? (e.detail.moving_cards || []) : null;
     if (moving) { _confirmHardware(moving, repeats, caseId); return; }
@@ -553,6 +590,9 @@ export function progressView(data) {
 }
 
 async function _poll() {
+  // `_runningId` 由服务端说了算，不只由本次点击说了算 —— 刷新页面之后，或者别人
+  // 在另一个标签页起的跑动，这张列表也要显示对。
+  const previous = _runningId;
   const el = document.getElementById('bm-progress');
   if (!el) return;
   let data;
@@ -562,6 +602,12 @@ async function _poll() {
 
   const view = progressView(data);
   if (view.live) _startPolling();
+
+  _runningId = view.live ? (data.case_id || null) : null;
+  // 跑动开始或结束了才重画列表 —— 每两秒重画一次会把用户正在点的按钮抽走。
+  // `_refreshing` 时也不重画：`_load()` 自己已经画过一遍了，这里再画一次就是
+  // 同一次刷新里的第二次重绘，看起来就是闪一下。
+  if (_runningId !== previous && !_refreshing) _loadLibrary();
 
   if (!view.show) {
     // 空闲时不报「0 / 0 个 case」——那是噪音，不是信息。
