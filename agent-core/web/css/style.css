@@ -2953,6 +2953,10 @@ html, body {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+/* 刷新按钮贴着关闭按钮。`.modal-header` 是 `space-between`，三个子元素会被均分 ——
+   刷新就飘到了标题和 × 中间，看着像个装饰。 */
+.modal-header .btn-icon + .btn-icon { margin-left: 4px; }
+.modal-header #bm-refresh, .modal-header #bm-timeline-refresh { margin-left: auto; }
 .modal-title {
   font-size: 15px;
   font-weight: 700;

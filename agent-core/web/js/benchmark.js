@@ -123,9 +123,14 @@ async function _load() {
 async function _refresh() {
   const button = document.getElementById('bm-refresh');
   button?.classList.add('bm-spin');
+  // 原地更新：三块内容都是整块重建的，滚动位置不自己接回去就会弹回顶部 ——
+  // 而「刷新一下看看有没有新的」之后要看的东西，往往就在刚才那个位置附近。
+  const kept = ['bm-lib-local', 'bm-lib-market', 'bm-runs']
+    .map((id) => [document.getElementById(id), document.getElementById(id)?.scrollTop ?? 0]);
   try {
     await _load();
   } finally {
+    kept.forEach(([el, top]) => { if (el) el.scrollTop = top; });
     setTimeout(() => button?.classList.remove('bm-spin'), 400);
   }
 }
