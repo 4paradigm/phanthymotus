@@ -204,8 +204,11 @@ class CaseRun:
     """一个用例的 N 次重复。同一时刻只允许有一个。"""
 
     def __init__(self, case: dict, mcp_id: str | None, repeats: int, seed: int,
-                 run_id: str, environment: dict, world=None):
+                 run_id: str, environment: dict, world=None, case_id: str = ''):
         self.case = case
+        # 哪个用例在跑。面板据此把那张卡的「运行」换成「停止」，其余置灰 —— 刷新页面
+        # 之后也要对，所以它得从服务端来，不能只活在前端的一个变量里。
+        self.case_id = case_id
         self.mcp_id = mcp_id
         # `mcp_id` 为空就是真机：没有仿真器持有世界。
         self.world = world or (SimulatorWorld(mcp_id) if mcp_id
@@ -434,7 +437,7 @@ class CaseRun:
             return []
 
     def snapshot(self) -> dict:
-        return {'state': self.state, 'run_id': self.run_id,
+        return {'state': self.state, 'run_id': self.run_id, 'case_id': self.case_id,
                 'repeat': self.repeat_idx, 'repeats': self.repeats,
                 'cases': self.cases, 'error': self.error}
 
@@ -488,16 +491,41 @@ def _stdev(values: list) -> Optional[float]:
 # ── 单例 ──────────────────────────────────────────────────────────────────────
 
 _current: Optional[CaseRun] = None
+# 「有人已经占上了，但 CaseRun 还没造出来」。
+#
+# 没有这一格的话，`is_busy()` 检查和 `set_current()` 之间隔着一个 await（依赖检查，
+# 还可能走 MCP 网络），两个并发请求会**双双通过**，于是两次跑动同时往同一个 agent
+# 注入用户消息、同时重置世界。两份事实流交织在一起，而分数看起来只是「莫名其妙地低」。
+_claimed = False
 
 
 def current() -> Optional[CaseRun]:
     return _current
 
 
+def claim() -> bool:
+    """占位。检查与占位必须是同一步 —— 这就是这个函数存在的全部理由。
+
+    占上了要么 `set_current` 接管，要么 `release()` 还回去；中途抛异常而不还，
+    面板会一直说「已经有一次基准测试在跑」，而实际上什么都没跑。
+    """
+    global _claimed
+    if is_busy():
+        return False
+    _claimed = True
+    return True
+
+
+def release() -> None:
+    global _claimed
+    _claimed = False
+
+
 def set_current(run: Optional[CaseRun]) -> None:
-    global _current
+    global _current, _claimed
     _current = run
+    _claimed = False              # 占位交棒给真正的跑动
 
 
 def is_busy() -> bool:
-    return _current is not None and _current.state in ('starting', 'running')
+    return _claimed or (_current is not None and _current.state in ('starting', 'running'))

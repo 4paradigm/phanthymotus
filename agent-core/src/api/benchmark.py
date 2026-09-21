@@ -514,9 +514,20 @@ async def run_case(request: CaseRunRequest):
     import benchmark_runner
     from api.solutions import loaded_case
 
-    if benchmark_runner.is_busy():
+    # **占位要在第一个 await 之前。** 下面的依赖检查会 await（还可能走 MCP 网络），
+    # 先查后占的话两个并发请求会双双通过 —— 两次跑动同时注入用户消息、同时重置世界。
+    if not benchmark_runner.claim():
         raise fastapi.HTTPException(status_code=409, detail='已经有一次基准测试在跑')
+    try:
+        return await _start_run(request)
+    except BaseException:
+        benchmark_runner.release()      # 没跑成就把位子还回去
+        raise
 
+
+async def _start_run(request: CaseRunRequest):
+    import benchmark_case
+    import benchmark_runner
     case = _case_to_run(request.case_id)
     if not case:
         raise fastapi.HTTPException(
@@ -555,7 +566,7 @@ async def run_case(request: CaseRunRequest):
         session_id=_current_session())
 
     run = benchmark_runner.CaseRun(case, mcp_id, repeats, int(request.seed),
-                                   run_id, environment)
+                                   run_id, environment, case_id=request.case_id)
     benchmark_runner.set_current(run)
     run.start()
     return {'run_id': run_id, 'repeats': repeats, 'mcp_id': mcp_id}

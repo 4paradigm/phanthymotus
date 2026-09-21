@@ -192,6 +192,51 @@ def test_without_a_simulator_every_actuator_needs_confirming(canvas, registry):
     assert sorted(u['tool'] for u in moving) == ['controlled_spatial', 'whatever']
 
 
+# ── 同一时刻只许一次跑动 ──────────────────────────────────────────────────────
+
+def test_claiming_is_atomic_so_two_requests_cannot_both_win():
+    """**检查与占位必须是同一步。**
+
+    `/case/run` 在检查之后、真正接管之前有一个 await（依赖检查，还可能走 MCP 网络）。
+    先查后占的话，两个并发请求会双双通过 —— 两次跑动同时往同一个 agent 注入用户消息、
+    同时重置世界，两份事实流交织在一起，而分数看起来只是「莫名其妙地低」。
+    """
+    assert benchmark_runner.claim() is True
+    assert benchmark_runner.claim() is False       # 第二个请求拿不到
+    assert benchmark_runner.is_busy() is True
+
+    benchmark_runner.release()
+
+    assert benchmark_runner.is_busy() is False
+    assert benchmark_runner.claim() is True
+    benchmark_runner.release()
+
+
+def test_a_failed_start_gives_the_slot_back():
+    """占上了却没跑成而不还，面板会一直说「已经有一次基准测试在跑」，
+    而实际上什么都没跑 —— 只能重启 agent-core 才能再跑。"""
+    import asyncio
+
+    from api import benchmark as bm_api
+
+    with pytest.raises(fastapi.HTTPException):
+        asyncio.run(bm_api.run_case(bm_api.CaseRunRequest(case_id='nope')))
+
+    assert benchmark_runner.is_busy() is False
+
+
+def test_handing_over_to_a_real_run_clears_the_claim():
+    benchmark_runner.claim()
+    run_id = benchmark_store.create_run('t')
+    run = benchmark_runner.CaseRun(CASE, 'mcp-sim', 1, 0, run_id, {}, case_id='c1')
+
+    benchmark_runner.set_current(run)
+
+    assert benchmark_runner.is_busy() is True      # 现在忙的是真正的跑动
+    assert benchmark_runner.current().snapshot()['case_id'] == 'c1'
+    benchmark_runner.set_current(None)
+
+
 # ── 开跑前的确认 ──────────────────────────────────────────────────────────────
 #
 # 这一组盯的是端点，不是分类。分类改对了而端点放行，等于一台真机器人在没人确认的

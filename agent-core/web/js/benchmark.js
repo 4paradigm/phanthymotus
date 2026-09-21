@@ -48,6 +48,9 @@ async function api(path, opts) {
 
 let _pollTimer = null;
 let _runId = null;
+// 正在跑的是哪个用例。列表里那张卡据此把「运行」换成「停止」，其余卡片置灰 ——
+// 同时跑两个会让两次跑动往同一个 agent 注入消息、同时重置世界。
+let _runningId = null;
 // 仿真器的 mcp_id，没有就是 null —— 也就是这次运行会驱动真实设备。
 let _simulator = null;
 
@@ -174,8 +177,12 @@ function _caseCard(c) {
             title="把这个用例自带的 ${c.cards} 张卡片载入画布，会覆盖当前画布"
             >载入画布</button>` : ''}
           <button class="bm-linkbtn" data-del="${_esc(c.id)}">删除</button>
-          <button class="bm-cardrun" data-run="${_esc(c.id)}"
-            title="在**当前画布**上跑这个用例">运行</button>
+          ${_runningId === c.id
+            ? `<button class="bm-cardrun bm-cardrun--stop" data-stop="${_esc(c.id)}"
+                 title="停止这次运行；已跑完的几次留在历史里">停止</button>`
+            : `<button class="bm-cardrun" data-run="${_esc(c.id)}"
+                 ${_runningId ? 'disabled title="已经有一次基准测试在跑"' : 'title="在当前画布上跑这个用例"'}
+                 >运行</button>`}
         </span>
       </div>
       ${(c.problems || []).length ? `<ul class="bm-blockers">${
@@ -190,6 +197,8 @@ function _bindCaseCards(el) {
     'click', () => _startCase(b.dataset.run)));
   el.querySelectorAll('[data-load]').forEach((b) => b.addEventListener(
     'click', () => _loadCaseCanvas(b.dataset.load)));
+  el.querySelectorAll('[data-stop]').forEach((b) => b.addEventListener(
+    'click', () => _abort()));
   el.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
     const card = _cases.find((c) => c.id === b.dataset.del);
     if (!window.confirm(`删掉用例「${card?.name || ''}」？运行过的分数会留在历史里。`)) return;
@@ -411,6 +420,7 @@ async function _newCase() {
 }
 
 async function _runCase(repeats, confirmMovingCards = null, caseId = '') {
+  _runningId = caseId || null;
   try {
     const result = await api('/api/benchmark/case/run', {
       method: 'POST',
@@ -418,9 +428,11 @@ async function _runCase(repeats, confirmMovingCards = null, caseId = '') {
                              confirm_moving_cards: confirmMovingCards }),
     });
     _runId = result.run_id;
-    showToast(`用例开始运行 × ${repeats} 次`);
+    showToast(repeats > 1 ? `用例开始运行 × ${repeats} 次` : '用例开始运行');
+    _loadLibrary();
     _startPolling();
   } catch (e) {
+    _runningId = null;
     // 服务端说「这次会驱动真实设备」—— 那不是错误，是要请现场的人拍板。
     const moving = e?.detail?.needs_confirmation ? (e.detail.moving_cards || []) : null;
     if (moving) { _confirmHardware(moving, repeats, caseId); return; }
@@ -553,6 +565,9 @@ export function progressView(data) {
 }
 
 async function _poll() {
+  // `_runningId` 由服务端说了算，不只由本次点击说了算 —— 刷新页面之后，或者别人
+  // 在另一个标签页起的跑动，这张列表也要显示对。
+  const previous = _runningId;
   const el = document.getElementById('bm-progress');
   if (!el) return;
   let data;
@@ -562,6 +577,10 @@ async function _poll() {
 
   const view = progressView(data);
   if (view.live) _startPolling();
+
+  _runningId = view.live ? (data.case_id || null) : null;
+  // 跑动开始或结束了才重画列表 —— 每两秒重画一次会把用户正在点的按钮抽走。
+  if (_runningId !== previous) _loadLibrary();
 
   if (!view.show) {
     // 空闲时不报「0 / 0 个 case」——那是噪音，不是信息。
