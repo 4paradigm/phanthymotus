@@ -108,7 +108,7 @@ def validate(values, *, preflight=True):
     return cfg
 
 
-async def _change_settings(values, *, tool_key=None, delete_keys=(), delete_prefix=None):
+async def _change_settings(values, *, tool_key=None, delete_keys=(), delete_prefix=None, extra_rows=None):
     async def change():
         global _settings
         # Serialize read/validate/write/publish, including concurrent HTTP/MCP
@@ -116,7 +116,7 @@ async def _change_settings(values, *, tool_key=None, delete_keys=(), delete_pref
         async with _configure_lock:
             cfg = await asyncio.to_thread(validate, values)
             changed = cfg != settings()
-            rows = {'semantic_routing': cfg}
+            rows = {**(extra_rows or {}), 'semantic_routing': cfg}
             if tool_key is not None:
                 rows[tool_key] = {**values, **cfg}
             removed = 0
@@ -146,6 +146,21 @@ async def reset_settings(*, delete_keys=(), delete_prefix=None):
     """Reset runtime and related persisted rows as one serialized operation."""
     _, removed = await _change_settings(DEFAULTS, delete_keys=delete_keys, delete_prefix=delete_prefix)
     return removed
+
+
+async def replace_canvas_settings(layout, tool_configs):
+    """Validate Solution Jev fields before replacing any layout/config row."""
+    key = 'tool_config:agentcore:decision_core'
+    for name, value in tool_configs.items():
+        if name.startswith(key + ':') and isinstance(value, dict) and set(value) & set(DEFAULTS):
+            raise ValueError('Solution 中 Jev 配置必须放在 decision_core 共享配置中')
+    incoming = tool_configs.get(key, {})
+    if not isinstance(incoming, dict):
+        raise ValueError('decision_core 配置必须为对象')
+    return await _change_settings({**DEFAULTS, **incoming},
+                                  tool_key=key if key in tool_configs else None,
+                                  delete_prefix='tool_config:',
+                                  extra_rows={'canvas_layout': layout, **tool_configs})
 
 
 def decode(event):

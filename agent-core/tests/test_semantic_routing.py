@@ -23,13 +23,13 @@ import semantic_routing as routing
 
 class MemoryConfig(dict):
     def update_atomic(self, values, *, delete_keys=(), delete_prefix=None):
-        self.update(copy.deepcopy(values))
         keys = set(delete_keys)
         if delete_prefix is not None:
             keys.update(k for k in self if k.startswith(delete_prefix))
         removed = sum(k in self for k in keys)
         for key in keys:
             self.pop(key, None)
+        self.update(copy.deepcopy(values))
         return removed
 
 
@@ -571,6 +571,72 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         from api.canvas import delete_all_tool_configs
         await delete_all_tool_configs()
         self.assertFalse(routing.settings()['jev_enabled'])
+
+    async def test_solution_core_config_is_validated_and_applied_before_return(self):
+        from api import canvas, solutions
+        from api import config as config_api
+        import fastapi
+        db = config.ConfigDB()
+        old_layout = {'cards': [], 'marker': 'old'}
+        old = routing.settings()
+        old_key = 'tool_config:old:tts'
+        db.update_atomic({'canvas_layout': old_layout, 'semantic_routing': old, old_key: {}})
+        package = {'cards': [{'id': 'core-card', 'deviceRef': 'core', 'toolName': 'decision_core'}],
+                   'toolConfigs': {'core:decision_core': {'jev_enabled': True, 'jev_identity_path': '/missing'}}}
+        with patch.object(config, 'main', db), patch.object(canvas, 'apply_tool_config') as apply, \
+                patch.object(canvas, 'notify_layout_changed'), patch.object(config_api, 'stop_removed_cards', new_callable=AsyncMock) as stop:
+            with self.assertRaises(fastapi.HTTPException) as error:
+                await solutions._apply_canvas(package, {'core': 'agentcore'})
+            self.assertEqual(error.exception.status_code, 400)
+            self.assertEqual(db['canvas_layout'], old_layout)
+            self.assertIn(old_key, db)
+            self.assertEqual(routing.settings(), old)
+            apply.assert_not_called()
+            stop.assert_not_called()
+            package['toolConfigs']['core:decision_core']['jev_identity_path'] = str(self.identity)
+            result = await solutions._apply_canvas(package, {'core': 'agentcore'})
+            self.assertEqual(result['toolConfigsWritten'], 1)
+            self.assertNotIn(old_key, db)
+            self.assertTrue(routing.settings()['jev_enabled'])
+            self.assertEqual(db['semantic_routing'], routing.settings())
+            self.assertEqual(db['tool_config:agentcore:decision_core'], routing.settings())
+            self.assertFalse(set(apply.call_args.args[2]) & set(routing.DEFAULTS))
+            # A Solution without Jev config must synchronously turn it off.
+            await solutions._apply_canvas({'cards': [], 'toolConfigs': {}}, {})
+            self.assertEqual(routing.settings(), routing.DEFAULTS)
+
+    async def test_solution_database_failure_rolls_back_deleted_rows_and_layout(self):
+        from api import canvas, solutions
+        from api import config as config_api
+        import fastapi
+        db = config.ConfigDB()
+        old = routing.settings()
+        layout = {'cards': [], 'marker': 'must survive'}
+        key = 'tool_config:survivor:tts'
+        db.update_atomic({'semantic_routing': old, 'canvas_layout': layout, key: {'voice': 'old'}})
+        conn = config._get_conn()
+        conn.execute("CREATE TRIGGER reject_semantic_write BEFORE INSERT ON config "
+                     "WHEN NEW.key = 'semantic_routing' "
+                     "BEGIN SELECT RAISE(ABORT, 'test failed write after delete'); END")
+        conn.commit()
+        conn.close()
+        try:
+            with patch.object(config, 'main', db), patch.object(canvas, 'apply_tool_config') as apply, \
+                    patch.object(config_api, 'stop_removed_cards', new_callable=AsyncMock) as stop:
+                with self.assertRaises(fastapi.HTTPException) as error:
+                    await solutions._apply_canvas({'cards': [], 'toolConfigs': {}}, {})
+                self.assertEqual(error.exception.status_code, 503)
+                self.assertEqual(db[key], {'voice': 'old'})
+                self.assertEqual(db['canvas_layout'], layout)
+                self.assertEqual(db['semantic_routing'], old)
+                self.assertEqual(routing.settings(), old)
+                apply.assert_not_called()
+                stop.assert_not_called()
+        finally:
+            conn = config._get_conn()
+            conn.execute('DROP TRIGGER reject_semantic_write')
+            conn.commit()
+            conn.close()
 
     async def test_candidate_arriving_during_invalidation_is_not_stranded(self):
         routing._invalidating = True

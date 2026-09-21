@@ -1075,8 +1075,9 @@ async def apply(request: fastapi.Request, req: LoadRequest):
 
 async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     """写画布布局与卡片配置。"""
-    from api.canvas import (apply_tool_config, delete_all_tool_configs,
+    from api.canvas import (apply_tool_config,
                             notify_layout_changed, tool_config_key)
+    import semantic_routing
 
     cards = []
     for card in canvas.get('cards') or []:
@@ -1107,21 +1108,13 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
         exec_connections.append(c)
 
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = {
+    layout = {
         'cards':           cards,
         'connections':     connections,
         'execConnections': exec_connections,
         'transform':       canvas.get('transform') or {},
     }
-    # 方案里的卡片是整套替换的，被换掉的那些卡片的实例不会再有人来停它
-    from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, cards)
-    # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
-    notify_layout_changed()
-
-    # 卡片配置：先清空旧的，再写包体里的
-    removed = await delete_all_tool_configs()
-    written = 0
+    resolved = []
     for key, value in (canvas.get('toolConfigs') or {}).items():
         parts = key.split(':')
         if len(parts) < 2:
@@ -1133,13 +1126,28 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
             continue
         if instance_id and instance_id not in card_ids:
             continue
-        config.main[tool_config_key(mcp_id, tool_name, instance_id)] = value
+        resolved.append((mcp_id, tool_name, instance_id, value))
+    rows = {tool_config_key(mid, name, iid): value for mid, name, iid, value in resolved}
+    try:
+        _, removed = await semantic_routing.replace_canvas_settings(layout, rows)
+    except ValueError as exc:
+        raise fastapi.HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise fastapi.HTTPException(503, '画布配置数据库写入失败，旧配置保留') from exc
+
+    # Validation and the complete config transaction succeeded. Only now may
+    # replacement stop removed instances or push new settings to plugins.
+    from api.config import stop_removed_cards
+    await stop_removed_cards(old_cards, cards)
+    notify_layout_changed()
+    for mcp_id, tool_name, instance_id, value in resolved:
+        if mcp_id == 'agentcore' and tool_name == 'decision_core' and isinstance(value, dict):
+            value = {k: v for k, v in value.items() if k not in semantic_routing.DEFAULTS}
         apply_tool_config(mcp_id, tool_name, value, instance_id)
-        written += 1
 
     return {'cards': len(cards),
             'connections': len(connections) + len(exec_connections),
-            'toolConfigsWritten': written, 'toolConfigsRemoved': removed}
+            'toolConfigsWritten': len(rows), 'toolConfigsRemoved': removed}
 
 
 async def _apply_skills(skills: list, token: Optional[str]) -> dict:

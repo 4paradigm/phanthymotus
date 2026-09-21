@@ -403,14 +403,14 @@ class ConfigDB:
         """Commit related config rows together; any failure rolls back all rows."""
         removed = 0
         with closing(_get_conn()) as conn, conn:
-            for key, value in values.items():
-                conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
-                             (key, json.dumps(value)))
             for key in delete_keys:
                 removed += conn.execute('DELETE FROM config WHERE key = ?', (key,)).rowcount
             if delete_prefix is not None:
                 removed += conn.execute('DELETE FROM config WHERE substr(key, 1, ?) = ?',
                                         (len(delete_prefix), delete_prefix)).rowcount
+            for key, value in values.items():
+                conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
+                             (key, json.dumps(value)))
         return removed
 
     def __getitem__(self, key: str):

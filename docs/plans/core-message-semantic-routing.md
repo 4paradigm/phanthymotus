@@ -41,6 +41,8 @@
 - `f7118d0a` 的 Bot 镜像测试 1346 通过、0 失败；第二轮代码审查要求进一步修复异步配置写入和删除事务。现将校验与 SQLite 写入放到工作线程，配置变更串行化，运行时仅在事务提交后发布；Canvas 保存/删除及 Solution 清空通过同一事务入口，失败返回 503，不吞掉删除错误。调用方取消仍等待已开始的配置事务完成缓存同步。
 - 第二轮新增真实 SQLite 删除故障回滚、并发配置合并/事件入队不阻塞、取消请求后缓存一致性测试；Python 3.10 全量 1349 passed、8 subtests passed，35.07 秒，退出码 0，无失败/跳过，本次未出现析构告警。最新镜像测试与 Bot 结论应核对 PR 254 中对应 head 的记录。
 - 调用链复核进一步移除 Canvas 保存后经延迟 MCP 下发重复写入 Jev 的路径，避免旧保存覆盖后续保存/删除；其他卡片字段下发保持不变。补入 HTTP 配置回归断言，Python 3.10 全量再次 1349 passed、8 subtests passed（35.94 秒），退出有既有 event-loop 析构告警。API 和用户操作流程不变，README 无需更新。
+- Solution 导入改为同步校验 Jev 并在同一事务替换布局、卡片配置和 Jev 行，成功后才下发非 Jev 字段和停止被移除实例。新增真实 SQLite 故障回滚及有效/无效/缺省 Jev 的 Solution 回归；操作文档同步此行为。DDS 意见核实为 Core 生产方与只读消费方约束混淆：保留既有可写父目录，以免破坏 ensure_profile 修复；仅补充注释和说明，不改挂载行为。
+- Solution 修复后 Python 3.10 全量 1351 passed、8 subtests passed（36.60 秒，退出码 0，无失败/跳过）；退出仍有已记录的 event-loop 析构告警。最新 Bot 结果继续以 PR 对应 head 为准。
 
 2026-09-21 已实现。114 项 unittest、33 项 pytest、36 项 Node 测试通过；Python 3.10 AST、JS 语法及 diff 检查通过。pytest 退出有既有测试未关闭 event loop 的析构警告，未掩盖或修改该测试。
 
