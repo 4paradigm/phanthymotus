@@ -89,37 +89,64 @@ _MODEL_ALIASES = {
 
 
 _HUE_NAMES = (
-    # OpenCV hue is 0-179. Boundaries are the usual colour-wheel splits.
-    (10, "red"), (22, "orange"), (34, "yellow"), (78, "green"),
-    (100, "cyan"), (130, "blue"), (155, "purple"), (170, "pink"), (180, "red"),
+    # OpenCV hue is 0-179 (degrees / 2). Twelve bins around the colour wheel.
+    (8, "red"), (18, "orange"), (30, "yellow"), (42, "lime"), (70, "green"),
+    (85, "teal"), (97, "cyan"), (110, "azure"), (128, "blue"), (140, "violet"),
+    (155, "magenta"), (170, "pink"), (180, "red"),
 )
+_BRIGHTNESS_NAMES = (
+    (30, "black"), (70, "dark"), (110, "dim"), (150, "medium"), (200, "bright"),
+    (256, "white"),
+)
+_SATURATION_NAMES = ((25, "gray"), (80, "muted"), (256, "vivid"))
 
 
-def dominant_hue(h_mean: float, s_mean: float, v_mean: float) -> str:
-    """Name the colour a mean HSV triple lands on.
-
-    Low saturation means the hue is meaningless, so those go to
-    black/gray/white by value instead — a white wall reads as "white",
-    not as whatever hue the sensor noise happened to average to.
-    """
-    if s_mean < 40:
-        if v_mean < 50:
-            return "black"
-        if v_mean > 200:
-            return "white"
-        return "gray"
-    for upper, name in _HUE_NAMES:
-        if h_mean < upper:
+def _bucket(value: float, table) -> str:
+    for upper, name in table:
+        if value < upper:
             return name
-    return "red"
+    return table[-1][1]
+
+
+def dominant_hue(h_mean: float, s_mean: float, v_mean: float = 0.0) -> str:
+    """Name the hue a mean HSV triple lands on; "neutral" when saturation is
+    too low for the hue to mean anything (a white wall, a black chair)."""
+    if s_mean < _SATURATION_NAMES[0][0]:
+        return "neutral"
+    return _bucket(h_mean, _HUE_NAMES)
+
+
+def dominant_brightness(v_mean: float) -> str:
+    return _bucket(v_mean, _BRIGHTNESS_NAMES)
+
+
+def dominant_saturation(s_mean: float) -> str:
+    return _bucket(s_mean, _SATURATION_NAMES)
+
+
+def color_name(h_mean: float, s_mean: float, v_mean: float) -> str:
+    """One phrase an LLM can repeat verbatim: "dark red", "bright cyan",
+    "light gray". Neutral colours are named by brightness alone."""
+    brightness = dominant_brightness(v_mean)
+    hue = dominant_hue(h_mean, s_mean, v_mean)
+    if hue == "neutral":
+        return {"black": "black", "dark": "dark gray", "dim": "gray",
+                "medium": "gray", "bright": "light gray", "white": "white"}[brightness]
+    if brightness in ("black", "dark"):
+        return f"dark {hue}"
+    if brightness in ("bright", "white"):
+        return f"bright {hue}"
+    return hue
 
 
 def color_stats(frame_bgr, bbox=None) -> dict:
     """RGB/HSV mean and variance for a BGR frame or one box inside it.
 
-    Returns 12 numbers plus a colour name. The variances answer "is this a
-    flat patch or a busy one" (a lit ceiling panel is bright *and* flat);
-    ``hsv_mean[2]`` is the plain brightness number a lights-on check reads.
+    Returns 12 numbers plus four labels: hue, saturation and brightness on
+    separate axes, and a combined ``color_name`` an LLM can repeat. The
+    variances answer "is this a flat patch or a busy one" (a lit ceiling
+    panel is bright *and* flat); ``hsv_mean[2]`` is the raw brightness a
+    lights-on check reads.
     """
     import cv2
 
@@ -136,12 +163,16 @@ def color_stats(frame_bgr, bbox=None) -> dict:
     hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
     rgb_mean, rgb_var = rgb.mean(axis=0), rgb.var(axis=0)
     hsv_mean, hsv_var = hsv.mean(axis=0), hsv.var(axis=0)
+    h, sat, val = (float(v) for v in hsv_mean)
     return {
         "rgb_mean": [round(float(v), 1) for v in rgb_mean],
         "rgb_var": [round(float(v), 1) for v in rgb_var],
         "hsv_mean": [round(float(v), 1) for v in hsv_mean],
         "hsv_var": [round(float(v), 1) for v in hsv_var],
-        "dominant_hue": dominant_hue(*(float(v) for v in hsv_mean)),
+        "dominant_hue": dominant_hue(h, sat, val),
+        "dominant_saturation": dominant_saturation(sat),
+        "dominant_brightness": dominant_brightness(val),
+        "color_name": color_name(h, sat, val),
     }
 
 
