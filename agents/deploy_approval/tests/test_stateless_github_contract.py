@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from ..config import Config
 from ..github_state_proxy import GitHubStateProxy, MalformedHiddenStateError, _validate_hidden_state
-from ..models import MachineInfo
+from ..models import BuildInfo, MachineInfo
 from ..policy import Policy
 from ..service import DeployController, DeployControllerError
 
@@ -449,3 +449,158 @@ def test_unrelated_machine_hidden(controller, policy):
 
     assert "test-machine" in aliases
     assert "unrelated" not in aliases
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_ref_passes_linux_arm64_for_perception(controller, proxy, policy):
+    """A. perception target must call registry.resolve with platform="linux/arm64"."""
+    from dataclasses import replace
+    build = replace(
+        BuildInfo(
+            idx=0, target="perception", driver_path="", variant="5.11",
+            success=True, image_tag="registry.example/4paradigm/phanthymotus:release.v1-jetson-jp5.11",
+            deployable=True,
+        ),
+    )
+    result = await controller._resolve_image_ref(
+        "4paradigm/phanthymotus", 260, "a" * 40, build,
+    )
+    controller.registry.resolve.assert_awaited_once()
+    call_kwargs = controller.registry.resolve.await_args
+    assert call_kwargs.kwargs.get("platform") == "linux/arm64"
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_ref_passes_linux_arm64_for_actucore(controller, proxy, policy):
+    """B. actucore target must call registry.resolve with platform="linux/arm64"."""
+    from dataclasses import replace
+    build = replace(
+        BuildInfo(
+            idx=1, target="actucore", driver_path="", variant="6.1",
+            success=True, image_tag="registry.example/4paradigm/phanthymotus:release.v2-jetson-jp6.1",
+            deployable=True,
+        ),
+    )
+    result = await controller._resolve_image_ref(
+        "4paradigm/phanthymotus", 260, "a" * 40, build,
+    )
+    controller.registry.resolve.assert_awaited_once()
+    call_kwargs = controller.registry.resolve.await_args
+    assert call_kwargs.kwargs.get("platform") == "linux/arm64"
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_ref_passes_linux_arm64_for_driver(controller, proxy, policy):
+    """C. driver target must call registry.resolve with platform="linux/arm64"."""
+    from dataclasses import replace
+    build = replace(
+        BuildInfo(
+            idx=2, target="driver", driver_path="unitree/g1", variant="",
+            success=True, image_tag="registry.example/4paradigm/phanthymotus-driver:v1-jetson-jp5.11",
+            deployable=True,
+        ),
+    )
+    result = await controller._resolve_image_ref(
+        "4paradigm/phanthymotus-driver", 260, "a" * 40, build,
+    )
+    controller.registry.resolve.assert_awaited_once()
+    call_kwargs = controller.registry.resolve.await_args
+    assert call_kwargs.kwargs.get("platform") == "linux/arm64"
+
+
+@pytest.mark.asyncio
+async def test_resolve_image_ref_rejects_wrong_platform(controller, proxy, policy):
+    """D. registry returns linux/amd64 -> _resolve_image_ref returns None."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    controller.registry.resolve.return_value = SimpleNamespace(
+        image_ref="registry/repo@sha256:" + "c" * 64, platform="linux/amd64",
+    )
+    build = replace(
+        BuildInfo(
+            idx=0, target="perception", driver_path="", variant="5.11",
+            success=True, image_tag="registry.example/4paradigm/phanthymotus:release.v1-jetson-jp5.11",
+            deployable=True,
+        ),
+    )
+    result = await controller._resolve_image_ref(
+        "4paradigm/phanthymotus", 260, "a" * 40, build,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_request_deploy_component_snapshot_regression(controller, proxy, mock_github):
+    """E+F. Simulate real scenario: perception 5.11, perception 6.1, actucore 5.11, actucore 6.1.
+
+    registry returns digest-pinned refs with platform=linux/arm64.
+    /request_deploy succeeds, status=deploy-requested, 4 components.
+    """
+    from dataclasses import replace
+    from unittest.mock import patch
+    from ..review_comment_parser import ReviewCommentEvidence, ReviewBuild
+
+    mock_github.get_comment.return_value = {"id": 101, "user": {"id": 111, "login": "alice"}, "body": "/request_deploy"}
+    mock_github.get_pr.return_value = {
+        "state": "open",
+        "merged": False,
+        "head": {"sha": "a" * 40},
+        "user": {"id": 111, "login": "alice"},
+    }
+
+    def fake_resolve(tag, platform="", allowed_prefixes=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            image_ref="registry.example/repo@sha256:" + "d" * 64,
+            platform="linux/arm64",
+        )
+
+    controller.registry.resolve = AsyncMock(side_effect=fake_resolve)
+    proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_evidence={
+        "build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z",
+        "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40,
+        "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z",
+        "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z",
+        "review_author_id": "7950763",
+    }, components=[]))
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    builds = [
+        replace(BuildInfo(idx=0, target="perception", driver_path="", variant="5.11", success=True, image_tag="registry.example/4paradigm/phanthymotus:release.260922.4707deb-jetson-jp5.11", deployable=True)),
+        replace(BuildInfo(idx=1, target="perception", driver_path="", variant="6.1", success=True, image_tag="registry.example/4paradigm/phanthymotus:release.260922.4707deb-jetson-jp6.1", deployable=True)),
+        replace(BuildInfo(idx=2, target="actucore", driver_path="", variant="5.11", success=True, image_tag="registry.example/4paradigm/phanthymotus:release.260922.4707deb-jetson-jp5.11", deployable=True)),
+        replace(BuildInfo(idx=3, target="actucore", driver_path="", variant="6.1", success=True, image_tag="registry.example/4paradigm/phanthymotus:release.260922.4707deb-jetson-jp6.1", deployable=True)),
+    ]
+
+    fake_evidence = ReviewCommentEvidence(
+        head_sha="a" * 40,
+        commit_prefix="abc1234",
+        build_comment_id=1,
+        build_comment_updated_at="2026-09-18T00:00:00Z",
+        review_author_id="7950763",
+        review_author_login="kentcyq",
+        builds=builds,
+        test_comment_id=2,
+        test_comment_updated_at="2026-09-18T00:00:00Z",
+        code_review_comment_id=3,
+        code_review_comment_updated_at="2026-09-18T00:00:00Z",
+    )
+
+    with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
+        await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+
+    # Verify 4 components were built
+    write_call = proxy.write_hidden_state.await_args
+    written_state = write_call.args[3]
+    components = written_state.get("components", [])
+    assert len(components) == 4
+    for c in components:
+        assert c.get("resolved_platform") == "linux/arm64"
+        assert c.get("image_ref", "").startswith("registry.example/repo@sha256:")
+
+    # Verify status label was set
+    proxy.project_status_label.assert_called()
+    call_args = proxy.project_status_label.call_args
+    assert call_args.args[2] == "deploy-requested"

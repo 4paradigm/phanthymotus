@@ -1595,13 +1595,15 @@ class DeployController:
             family, _tag = parse_reference(review_image_tag)
             resolved = await self.registry.resolve(
                 review_image_tag,
-                platform="",
+                platform="linux/arm64",
                 allowed_prefixes=[family],
             )
             if resolved is None:
                 return None
             image_ref = resolved.image_ref or ""
             resolved_platform = resolved.platform or ""
+            if resolved_platform != "linux/arm64":
+                return None
             return (image_ref, resolved_platform)
         except Exception as e:
             logger.warning(
