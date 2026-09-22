@@ -15,33 +15,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Minimal ROS message stubs. `_bind_inputs` imports these only to hand a type to
-# create_subscription, and the point of these tests is the role assignment that
-# happens before that — installing the two names is cheaper, and far less
-# fragile, than requiring a ROS install to test a dictionary lookup.
-import types as _types  # noqa: E402
-
-for _mod, _name in (("sensor_msgs.msg", "CompressedImage"),
-                    ("std_msgs.msg", "String")):
-    _pkg = _mod.split(".")[0]
-    sys.modules.setdefault(_pkg, _types.ModuleType(_pkg))
-    _m = sys.modules.setdefault(_mod, _types.ModuleType(_mod))
-    setattr(_m, _name, type(_name, (), {}))
-    setattr(sys.modules[_pkg], "msg", _m)
-
-# rclpy.qos, for `_sensor_qos`. Stubbed rather than skipped because the profile
-# it builds is the whole point: a reliable subscriber silently receives nothing
-# from these best-effort publishers, so "which reliability" is worth asserting.
-_rclpy = sys.modules.setdefault("rclpy", _types.ModuleType("rclpy"))
-_qos = sys.modules.setdefault("rclpy.qos", _types.ModuleType("rclpy.qos"))
-for _enum in ("ReliabilityPolicy", "HistoryPolicy", "DurabilityPolicy"):
-    setattr(_qos, _enum, type(_enum, (), {"BEST_EFFORT": "best_effort",
-                                          "RELIABLE": "reliable",
-                                          "KEEP_LAST": "keep_last",
-                                          "VOLATILE": "volatile"}))
-setattr(_qos, "QoSProfile", lambda **kw: dict(kw))
-setattr(_rclpy, "qos", _qos)
-
+# ROS stubs live in conftest.py so every module in the suite shares one set —
+# two files installing their own let whichever is collected last win.
 from plugins.navi import NaviPlugin  # noqa: E402
 from plugins.navi import plugin as navi_plugin  # noqa: E402
 
