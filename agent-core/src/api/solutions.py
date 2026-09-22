@@ -1077,6 +1077,12 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     """写画布布局与卡片配置。"""
     from api.canvas import (apply_tool_config, delete_all_tool_configs,
                             notify_layout_changed, tool_config_key)
+    from teleop_project import TeleopProjectError, require_editable
+    try:
+        require_editable(config.main.get('core', {}) or {},
+                         config.main.get('canvas_layout', {}) or {}, canvas)
+    except TeleopProjectError as error:
+        raise fastapi.HTTPException(status_code=409, detail=str(error)) from error
 
     cards = []
     for card in canvas.get('cards') or []:
@@ -1107,7 +1113,7 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
         exec_connections.append(c)
 
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = {
+    new_layout = {
         'cards':           cards,
         'connections':     connections,
         'execConnections': exec_connections,
@@ -1115,7 +1121,11 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     }
     # 方案里的卡片是整套替换的，被换掉的那些卡片的实例不会再有人来停它
     from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, cards)
+    try:
+        await stop_removed_cards(old_cards, cards)
+    except TeleopProjectError as error:
+        raise fastapi.HTTPException(status_code=409, detail=str(error)) from error
+    config.main['canvas_layout'] = new_layout
     # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
     notify_layout_changed()
 

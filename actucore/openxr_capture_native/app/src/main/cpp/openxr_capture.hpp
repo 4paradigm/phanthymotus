@@ -29,10 +29,10 @@ class OpenXrCapture final {
 
   void Initialize(android_app* app);
   void PollEvents();
-  void SetOperatorPanel(bool enabled,const std::string& state,const std::string& mode,const std::string& error) {
-    panel_.enabled=enabled;panel_.state=state;panel_.mode=mode;panel_.error=error;
+  void SetOperatorPanel(bool enabled,bool armed,const std::string& state,const std::string& mode,const std::string& error) {
+    panel_.enabled=enabled;panel_.armed=armed;panel_.state=state;panel_.mode=mode;panel_.error=error;
   }
-  std::string TakeOperatorAction(){auto result=panel_.pending;panel_.pending.clear();return result;}
+  std::string TakeOperatorAction(){auto result=panel_.pending;panel_.pending.clear();return OperatorCommandAllowed(panel_.enabled,panel_.armed,result)?result:std::string{};}
   void SetVisualization(const IkVisualization& value) { visualization_ = value; }
 
   // Drives xrWaitFrame/xrBeginFrame/xrEndFrame and returns a controller sample

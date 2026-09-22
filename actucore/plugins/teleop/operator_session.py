@@ -18,6 +18,20 @@ class OperatorCommands:
         self.task = None
         self.cancel = threading.Event()
         self.status = {'state': 'idle', 'action': None, 'error': None}
+        self._status_epoch = 0
+        self._status_lock = threading.Lock()
+
+    def set_status(self, value):
+        with self._status_lock:
+            self._status_epoch += 1
+            self.status = dict(value)
+            return self._status_epoch
+
+    def _complete_status(self, epoch, value):
+        with self._status_lock:
+            if self._status_epoch == epoch:
+                self._status_epoch += 1
+                self.status = dict(value)
 
     def valid(self, connection):
         return (self.manager._connection is connection
@@ -50,19 +64,20 @@ class OperatorCommands:
         self.receipts[key] = receipt
         logging.getLogger(__name__).info('operator action=%s accepted request=%s', action, request_id)
         async def run():
+            status_epoch = self._status_epoch
             try:
                 if previous and not previous.done():await previous
                 if action != 'stop' and not self.valid(connection):
                     raise ValueError('operator_connection_changed')
-                self.status = {'state': {'finish':'returning','start':'starting','stop':'stopping'}[action],
-                               'action':action,'error':None}
+                status_epoch = self.set_status({'state': {'finish':'returning','start':'starting','stop':'stopping'}[action],
+                                 'action':action,'error':None})
                 result = await asyncio.to_thread(self.execute, action, self.cancel,
                     lambda:self.valid(connection))
                 receipt.update(state='completed', result=result)
-                self.status = {'state':result.get('state','idle'),'action':action,'error':None}
+                self._complete_status(status_epoch, {'state':result.get('state','idle'),'action':action,'error':None})
             except Exception as exc:
                 receipt.update(state='failed', error=str(exc))
-                self.status = {'state':'error','action':action,'error':str(exc)}
+                self._complete_status(status_epoch, {'state':'error','action':action,'error':str(exc)})
             logging.getLogger(__name__).info('operator action=%s result=%s error=%s', action, receipt['state'], receipt.get('error'))
             if self.valid(connection):await connection.events.put(dict(receipt))
         self.task = asyncio.create_task(run())
@@ -89,6 +104,31 @@ def return_arms(adapter, cancel, connected, *, timeout=45., clock=time.monotonic
         if not connected():raise ValueError('return_connection_lost')
         if clock()>=deadline:raise ValueError('return_timeout')
     try:
+        with adapter.lock:
+            check()
+            # A previous return may have physically finished while its release
+            # reply/feedback was lost. Reconcile only a fresh post-request
+            # receipt; never resume a lease the Driver has already released.
+            if getattr(link,'release_requested_ns',0):link.reconcile_release()
+        released_since=None
+        while not link.lease and not getattr(link,'management_request',None):
+            check()
+            with adapter.lock:
+                state=link.feedback();feedback=state.get('feedback',{})
+                q=np.asarray(feedback.get('q'),dtype=float)
+                dq=np.asarray(feedback.get('dq'),dtype=float)
+                age=time.monotonic_ns()-feedback.get('arm_ns',0)
+                neutral=(q.shape==(14,) and dq.shape==(14,)
+                    and np.isfinite(q).all() and np.isfinite(dq).all()
+                    and 0<=age<=100_000_000 and np.max(np.abs(q))<=.02
+                    and np.max(np.abs(dq))<=.02)
+                if not (neutral and state.get('state')=='idle'
+                        and state.get('ownership_held') is False
+                        and state.get('stop_confirmed') is True):break
+                released_since=clock() if released_since is None else released_since
+                if clock()-released_since>=.1:
+                    return {'state':'idle','return_completed':True,'max_error_rad':float(np.max(np.abs(q)))}
+            sleep(.02)
         with adapter.lock:
             check()
             link.prepare_transport()

@@ -114,6 +114,8 @@ let _mcpsPendingRefresh = false;
 // `_projectStateKnown` closes it by separating "stopped" from "not yet known"
 // and refusing edits for both.
 let _projectRunning = false;
+let _projectPhase = 'idle';
+let _projectError = '';
 let _projectStateKnown = false;
 
 export function isProjectRunning() { return _projectRunning; }
@@ -156,7 +158,7 @@ function _editsLocked() { return _editLockReason() !== ''; }
 function _syncProjectState(delay = 500) {
   return fetch('/api/config/project-running')
     .then(r => r.json())
-    .then(d => { _applyProjectState(d.running); return true; })
+    .then(d => { _applyProjectState(d.running, d.phase, d.error); return true; })
     .catch(() => {
       if (!_projectStateKnown) {
         setTimeout(() => _syncProjectState(Math.min(delay * 2, 5000)), delay);
@@ -166,12 +168,14 @@ function _syncProjectState(delay = 500) {
 }
 
 /** Record what the backend says about the run state, and unblock editing. */
-function _applyProjectState(running) {
+function _applyProjectState(running, phase = running ? 'running' : 'idle', error = '') {
   _projectRunning = !!running;
+  _projectPhase = phase || (running ? 'running' : 'idle');
+  _projectError = error || '';
   _projectStateKnown = true;
   _syncProjectBtn();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-    btn.classList.toggle('locked', !_projectRunning);
+    btn.classList.toggle('locked', !_projectRunning || ['stopping','stop_failed'].includes(_projectPhase));
   });
 }
 export function redrawCanvas() { _scheduleRedraw(); }
@@ -358,7 +362,7 @@ export async function initCanvas(initialMcps) {
       // Applied even when it matches what we hold: this is also the first
       // authoritative answer some page loads get, and it is what marks the
       // state known.
-      if (running !== _projectRunning || !_projectStateKnown) _applyProjectState(running);
+      _applyProjectState(running, event.payload?.phase, event.payload?.error);
     } else if (event.type === 'canvas_editor') {
       _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
     } else if (event.type === 'canvas_layout') {
@@ -788,7 +792,9 @@ async function _removeCard(id) {
   // leave it, so its ROS node, subscription and any CUDA context would live
   // until perception exits — publishing to a topic no card accounts for.
   // `stop` is idempotent, so doing this to a card that was never started is fine.
-  _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
+  // Teleop removal is confirmed by the backend's project_stop before the
+  // persisted graph is removed; a raw stop here would cancel its arm return.
+  if (removed.toolName !== 'teleop') _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
   removed.el.remove();
   _cards.splice(idx, 1);
   // Trigger stop for connections where this card was the source
@@ -1947,7 +1953,7 @@ function _autoStopOnDisconnect(cardId, portIdx, topic) {
 
 async function _startProject() {
   // Save canvas layout first (so backend reads latest topology)
-  await _saveLayout();
+  if (await _saveLayout() === false) return;
 
   // Import motus for event subscription
   const { onMotusEvent, offMotusEvent, whenMotusConnected } = await import('./motus-stream.js');
@@ -2053,32 +2059,23 @@ async function _startProject() {
 }
 
 async function _stopProject() {
-  // **先请求，确认成功了再改状态** —— 和 _startProject 同一个形状。
-  //
-  // 此前是反过来的：先 _applyProjectState(false)，再做麦克风清理，最后
-  // `fetch(...).catch(() => {})`，然后**无条件**记一条「智能控制已停止」。
-  // 三处叠在一起，任何一种失败都长成"已经停了"：
-  //
-  //   * 清理那段抛异常 → fetch 那行根本执行不到，而状态已经翻了；
-  //   * `.catch()` 只接网络错误，**非 2xx 不会 reject** —— 后端返回 500 也算成功；
-  //   * 日志那行不看结果。
-  //
-  // 而状态一旦翻成 false，按钮就变回「开启智能控制」，再点走的是**启动**那一支
-  // —— 于是连重试的机会都没有。天轶实测 2026-09-21：后端 project_running 一直
-  // 是 true，20 分钟的访问日志里**一条 stop-project 都没有**，而界面显示已停止。
-  //
-  // 麦克风清理挪到请求之后，并且自己吞掉异常：它是收尾动作，不该挡住停止本身。
-  let ok = false;
+  if (_projectPhase === 'stopping') return;
+  _applyProjectState(true, 'stopping');
+  _logActivity('project', '正在结束遥操并等待收臂，完成后停止其余卡片');
+  let failure = '';
   try {
-    const res = await fetch('/api/config/stop-project', { method: 'POST' });
-    ok = res.ok;
+    const res = await fetch('/api/config/stop-project', {
+      method: 'POST', signal: AbortSignal.timeout(65000),
+    });
+    const body = await res.json();
+    if (!res.ok || body.ok !== true) failure = body.detail || body.message || `HTTP ${res.status}`;
   } catch (err) {
-    ok = false;
+    failure = err.message || '无法确认停止结果';
   }
-  if (!ok) {
-    // 不翻状态：按钮留在「停止智能控制」上，操作者能再点一次。谎报已停止是这个
-    // 函数此前唯一会做的事。
-    _logActivity('warn', '停止智能控制失败 —— 后端仍在运行，请重试');
+  if (failure) {
+    _applyProjectState(true, 'stop_failed', failure);
+    _logActivity('error', `停止未完成：${failure}。Driver 保持可用，请排查后重试停止。`);
+    _showToast(`停止未完成：${failure}`);
     return;
   }
 
@@ -2104,8 +2101,10 @@ async function _stopProject() {
 function _syncProjectBtn() {
   const btn = document.getElementById('canvas-project-toggle');
   if (!btn) return;
-  btn.textContent = _projectRunning ? '停止智能控制' : '开启智能控制';
-  btn.title = _projectRunning ? '停止智能控制' : '开启智能控制';
+  btn.textContent = _projectPhase === 'stopping' ? '正在收臂并停止…' :
+    _projectPhase === 'stop_failed' ? '重试停止智能控制' : _projectRunning ? '停止智能控制' : '开启智能控制';
+  btn.title = _projectError || btn.textContent;
+  btn.disabled = _projectPhase === 'stopping';
   btn.classList.toggle('running', _projectRunning);
 }
 
@@ -2777,13 +2776,15 @@ async function _saveLayout() {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
     });
-    if (resp.status === 403) {
-      // Lost edit permission — reload layout from server
-      _isEditor = false;
-      _updateEditorUI();
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      if (resp.status === 403) { _isEditor = false; _updateEditorUI(); }
+      _showToast(body.detail || body.message || '画布未保存');
       await _reloadLayout();
+      return false;
     }
-  } catch { /* silent */ }
+    return true;
+  } catch (error) { _showToast(`画布未保存：${error.message}`); return false; }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

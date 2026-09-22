@@ -1,18 +1,19 @@
 /** Teleop controls use the registered MCP only. No robot addresses or secrets. */
-const STATES = {idle:'未开始',ready:'等待双握把',prepared:'等待双握把',prepared_shadow:'等待双握把',active:'遥操中',active_shadow:'模拟中',hold:'保持',fault:'故障',returning:'正在收臂',starting:'正在准备',stopping:'正在停止'};
+const STATES = {idle:'未开始',armed:'等待 PICO 开始',ready:'等待双握把',prepared:'等待双握把',prepared_shadow:'等待双握把',active:'遥操中',active_shadow:'模拟中',hold:'保持',fault:'故障',returning:'正在收臂',starting:'正在准备',stopping:'正在停止'};
 const REASONS = {deadman_released:'握把已松开',operator_pause:'已暂停',ik_target_unreachable:'目标不可达，保持最后有效位置',ik_timeout:'求解超时，等待有效输入',command_timeout:'指令中断，已保持',command_expired:'指令过期，已保持',power_ns_stale:'电源状态过期',arm_ns_stale:'关节反馈过期',stop_unconfirmed:'停止尚未确认',invalid_lease:'控制权失效',stop_confirmed:'已确认停止',operator_release:'会话已结束'};
-export function viewState(info, fresh=true) {
-  const d=info?.driver_feedback, op=info?.operator || {};
+export function viewState(info, fresh=true, projectManaged=false) {
+  const d=info?.driver_feedback, op=info?.operator || {}, project=info?.project || {};
+  const armed=project.armed ?? info?.armed ?? false;
   const driverFresh=fresh && info?.driver_feedback_fresh===true;
   const executing=driverFresh && d?.output_active===true;
-  const state=op.state==='error'?'fault':['starting','returning','stopping'].includes(op.state)?op.state:info?.state;
-  const reason=op.error || info?.host_error || (state==='fault'?d?.reason:null) || info?.reason || d?.reason;
-  return {state, executing, driverFresh, connected:fresh && info?.capture?.connected===true,
+  const state=project.stopping?'returning':project.error?'fault':op.state==='error'?'fault':['starting','returning','stopping'].includes(op.state)?op.state:armed && !info?.authority_valid?'armed':info?.state;
+  const reason=project.error || op.error || info?.host_error || (state==='fault'?d?.reason:null) || info?.reason || d?.reason;
+  return {state, armed, executing, driverFresh, connected:fresh && info?.capture?.connected===true,
     title:!fresh?'状态不可用':STATES[state] || state || '等待状态',
     mode:info?.mode==='live'?'Live · 真机':info?.mode==='shadow'?'Shadow · 模拟':'模式未知',
     execution:!driverFresh?'执行状态未知':executing?'硬件正在执行':d?.ownership_held?'持有控制权 · 未输出':'无硬件输出',
-    reason:!fresh?'状态读取失败，不能确认机器人是否停止':REASONS[reason] || reason || '先松开双握把，再开始遥操',
-    busy:['starting','returning','stopping'].includes(op.state)};
+    reason:!fresh?'状态读取失败，不能确认机器人是否停止':REASONS[reason] || reason || (projectManaged?(armed?'请在 PICO 点击开始遥操':'连好 Driver 并开启智能控制，之后在 PICO 点击开始'):'独立卡片模式：未支持项目托管收臂；先松开双握把再开始'),
+    busy:project.stopping===true || ['starting','returning','stopping'].includes(op.state)};
 }
 export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfig,saveConfig}) {
   const supported=new Set(actions), buttons=new Map();
@@ -25,17 +26,19 @@ export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfi
 </style><header><h3 data-field="title">读取状态…</h3><span class="tp-mode" data-field="mode"></span></header>
 <div class="tp-execution" data-field="execution"></div><div class="tp-reason" data-field="reason"></div>
 <div class="tp-actions"></div><div class="tp-error" role="alert"></div><div class="tp-notice" role="status"></div>
-<dl><dt>PICO 连接</dt><dd data-field="connected"></dd><dt>跟踪</dt><dd data-field="tracking"></dd><dt>输入时效</dt><dd data-field="age"></dd><dt>标定</dt><dd data-field="calibration"></dd></dl>
+<dl><dt>连接 Driver</dt><dd data-field="driver"></dd><dt>智能控制</dt><dd data-field="armed"></dd><dt>PICO 连接</dt><dd data-field="connected"></dd><dt>跟踪</dt><dd data-field="tracking"></dd><dt>输入时效</dt><dd data-field="age"></dd><dt>标定</dt><dd data-field="calibration"></dd></dl>
 <details class="tp-pair"><summary>连接与配对</summary><p data-field="pairing"></p><div class="tp-fingerprint"></div><div class="tp-pair-buttons"></div></details>
 <details class="tp-config"><summary>服务配置</summary><p>结束会话后保存并应用。保存不启动机器人；重新开始前需标定。</p><form><div class="tp-config-fields"></div><button type="submit">保存并应用配置</button><p class="tp-config-result" role="status"></p></form></details>
 <details><summary>诊断与维护</summary><div class="tp-maintenance tp-pair-buttons"></div><pre></pre></details>`;
   host.append(panel);
   const field=(key,value)=>{panel.querySelector(`[data-field="${key}"]`).textContent=value;};
   const has=a=>supported.has(a);
+  const projectManaged=has('project_start') && has('project_stop');
   const configFields=new Map(),configForm=panel.querySelector('.tp-config form');
   let configDirty=false,configLoaded=false,savedConfig={};
   const labels={mode:'运行模式',robot_profile:'机器人机型',mapping_version:'位姿映射',position_scale:'位移比例',shadow_feedback_source:'模拟反馈来源',namespace:'机器人命名空间',driver_mcp_url:'Driver MCP 地址',calibration_path:'标定文件路径'};
   for(const [key,def] of Object.entries(configSchema.properties||{})){
+    if(projectManaged && ['namespace','driver_mcp_url'].includes(key))continue;
     const label=document.createElement('label');label.style.display='block';label.textContent=labels[key]||def.title||key;
     const input=document.createElement(def.enum?'select':'input');input.dataset.configKey=key;input.style.cssText='display:block;width:100%;margin:4px 0 8px;color:inherit;background:transparent;border:1px solid #73839966;padding:6px';
     if(def.enum)for(const value of def.enum){const opt=document.createElement('option');opt.value=value;opt.textContent=value==='live'?'Live · 真机':value==='shadow'?'Shadow · 模拟':value;input.append(opt);}
@@ -58,11 +61,14 @@ export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfi
     finally{busy=false;await refresh();showConfig();}
   });
   function render(){
-    const v=viewState(info,fresh), d=info?.driver_feedback, pose=info?.pose, track=pose?.latest?.tracking;
-    const configDisabled=busy || v.busy || !!operationPending || !fresh || !configLoaded || !!info?.authority_valid || !!d?.ownership_held;
+    const v=viewState(info,fresh,projectManaged), d=info?.driver_feedback, pose=info?.pose, track=pose?.latest?.tracking;
+    const configDisabled=busy || v.busy || !!operationPending || !fresh || !configLoaded || !!info?.authority_valid || !!d?.ownership_held || v.armed===true;
     for(const el of configForm.querySelectorAll('input,select,button'))el.disabled=configDisabled;
     panel.dataset.live=info?.mode==='live';panel.dataset.executing=v.executing;
     for(const k of ['title','mode','execution','reason'])field(k,v[k]);
+    const binding=info?.project?.driver_binding || info?.driver_binding;
+    field('driver',binding?`${binding.robot_profile} · ${binding.mcp_id}`:'等待 Canvas 命令连线');
+    field('armed',!projectManaged?'未支持项目托管收臂':!fresh?'未知':v.armed?'已开启 · 等待或接受 PICO 操作':'未开启');
     field('connected',!fresh?'未知':v.connected?'已连接':'未连接');
     field('tracking',!fresh||!pose?.fresh?'无新鲜输入':track && Object.values(track).every(Boolean)?'头显与双手有效':'跟踪缺失');
     field('age',fresh && Number.isFinite(pose?.age_ms)?`${Math.round(pose.age_ms)} ms`:'—');
@@ -75,6 +81,7 @@ export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfi
     for(const [a,b] of buttons){
       let disabled=busy || v.busy || !!operationPending || !fresh;
       if(['start','resume','finish'].includes(a))disabled ||= !v.connected;
+      if(projectManaged && ['start','resume'].includes(a))disabled ||= !v.armed;
       if(a==='start')disabled ||= !!info?.authority_valid || !info?.calibrated;
       if(a==='resume')disabled ||= !['hold','fault'].includes(info?.state);
       if(a==='pause')disabled ||= !info?.authority_valid && !d?.ownership_held;
@@ -106,7 +113,7 @@ export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfi
     finally{if(!disposed&&generation===request){busy=false;await refresh();}}
   }
   for(const [label,action,group] of [['开始遥操','start','.tp-actions'],['暂停保持','pause','.tp-actions'],['恢复遥操','resume','.tp-actions'],['结束并收臂','finish','.tp-actions'],['立即停止','stop','.tp-actions'],['允许新设备配对','open_pairing','.tp-pair-buttons'],['指纹一致，批准','approve_pairing','.tp-pair-buttons'],['拒绝申请','reject_pairing','.tp-pair-buttons'],['断开头显','disconnect_headset','.tp-pair-buttons'],['撤销配对','revoke_headset','.tp-pair-buttons'],['重新标定','calibrate','.tp-maintenance'],['零输出自检','self_test','.tp-maintenance'],['切换模式','config','.tp-maintenance']]){
-    if(!has(action))continue;
+    if(!has(action) || (projectManaged && action==='start'))continue;
     const b=document.createElement('button');b.type='button';b.textContent=label;b.dataset.action=action;b.onclick=()=>execute(action);buttons.set(action,b);panel.querySelector(group).append(b);
   }
   panel.addEventListener('pointerdown',e=>e.stopPropagation());panel.addEventListener('click',e=>e.stopPropagation());

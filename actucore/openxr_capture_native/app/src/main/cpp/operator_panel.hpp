@@ -3,11 +3,16 @@
 #include <array>
 #include <cmath>
 #include <string>
+#include <string_view>
 
 namespace motus::openxr_capture {
+inline bool OperatorCommandAllowed(bool enabled, bool armed, std::string_view action) {
+  return enabled && (action == "stop" || action == "finish" || (action == "start" && armed));
+}
 // All coordinates are head-relative metres, matching the stereo overlay.
 struct OperatorPanel {
   bool enabled=false;
+  bool armed=false;
   std::string state, mode, error;
   int hover=-1;
   std::array<float,3> cursor{};
@@ -42,7 +47,7 @@ struct OperatorPanel {
         hover=j;cursor={x,h,z};pointing=true;
         // Finish explicitly ends input in android_main before sending another
         // frame. It must remain clickable while the operator holds a grip.
-        if(edge && (j!=0 || (!frame.left_input.squeeze_pressed && !frame.right_input.squeeze_pressed)))
+        if(edge && (j!=0 || (armed && !frame.left_input.squeeze_pressed && !frame.right_input.squeeze_pressed)))
           if(pending!="stop")pending=j==0?"start":j==1?"finish":"stop";
       }
     }

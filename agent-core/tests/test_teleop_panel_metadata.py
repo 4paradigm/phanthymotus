@@ -14,7 +14,7 @@ def test_discovery_keeps_connection_panel():
     ns={'aiohttp':aiohttp,'asyncio':asyncio,'json':json}
     exec(compile(ast.Module(body=[function],type_ignores=[]),str(source),'exec'),ns)
     async def run():
-        tool={'name':'teleop','type':'processor','x-connection-panel':'teleop-v1','untrusted-extra':'discard','inputSchema':{'properties':{'action':{'enum':['info','open_pairing']}}}}
+        tool={'name':'teleop','type':'processor','x-connection-panel':'teleop-v1','x-teleop-target':{'protocol_version':1,'robot_profile':'tianyi2'},'untrusted-extra':'discard','inputSchema':{'properties':{'action':{'enum':['info','open_pairing']}}}}
         async def handle(request):
             method=(await request.json())['method']
             result={'tools':[tool]} if method=='tools/list' else {'content':[{'type':'text','text':'{}'}]} if method=='tools/call' else {}
@@ -26,6 +26,7 @@ def test_discovery_keeps_connection_panel():
             port=server._server.sockets[0].getsockname()[1]
             result=await ns['_ping_mcp_http'](f'http://127.0.0.1:{port}/mcp')
             assert result['tools'][0]['x-connection-panel']=='teleop-v1'
+            assert result['tools'][0]['x-teleop-target']=={'protocol_version':1,'robot_profile':'tianyi2'}
             assert 'untrusted-extra' not in result['tools'][0]
         finally:await runner.cleanup()
     asyncio.run(run())
@@ -56,7 +57,7 @@ def test_teleop_lifecycle_does_not_reapply_saved_configuration():
             'plan_config_calls':lambda *a:[({'mode':'shadow'}, {})]}
         exec(compile(ast.Module(body=[fn],type_ignores=[]),str(source),'exec'),ns)
         try:
-            for action in ['start','pause','resume','finish','stop','open_pairing']:
+            for action in ['project_start','project_stop','start','pause','resume','finish','stop','open_pairing']:
                 calls.clear();result=await ns['mcp_call_tool']('local',SimpleNamespace(tool='teleop',arguments={'action':action}))
                 assert result['code']==200,result
                 assert calls==[{'action':action}]

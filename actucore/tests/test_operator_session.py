@@ -50,6 +50,52 @@ def test_queued_start_never_executes_after_disconnect():
         assert not calls and broker.status['error']=='operator_connection_changed'
     asyncio.run(run())
 
+
+@pytest.mark.parametrize('failed',[False,True])
+def test_old_pico_completion_cannot_overwrite_confirmed_project_stop(failed,monkeypatch):
+    from teleop.plugin import TeleopPlugin
+    async def run():
+        card=TeleopPlugin({'robot_profile':'tianyi2','mode':'shadow'},None)
+        card._project_armed=True
+        connection=SimpleNamespace(connection_id='pico',events=asyncio.Queue())
+        manager=SimpleNamespace(_connection=connection,presence_expired=lambda c:False)
+        broker=OperatorCommands(manager,card._operator_execute)
+        card.operator_commands=broker
+        entered=threading.Event();release=threading.Event();stopped=[]
+        def previous_start(*args):
+            entered.set();assert release.wait(2)
+            if failed:raise ValueError('operator_connection_changed')
+            return {'state':'ready','mode':'shadow'}
+        monkeypatch.setattr(card,'_operator_execute_locked',previous_start)
+        monkeypatch.setattr(card,'_finish_session',lambda *a,**kw:{
+            'state':'idle','return_completed':True,'authority_released':True})
+        message={'request_id':'old-start','connection_id':'pico','action':'start'}
+        assert (await broker.submit(connection,message))['state']=='accepted'
+        assert await asyncio.to_thread(entered.wait,1)
+        def stop_project():stopped.append(card._project_stop())
+        stop=threading.Thread(target=stop_project)
+        stop.start()
+        try:
+            # Deliberately keep this event loop occupied: the PICO worker exits
+            # its operation lock, Core completes stop, then the older to_thread
+            # continuation is allowed to deliver its receipt.
+            release.set();stop.join(2)
+            assert not stop.is_alive() and stopped[0]['return_completed']
+            expected={'state':'idle','action':'project_stop','error':None}
+            assert broker.status==expected
+            await broker.task
+            receipt=await broker.submit(connection,message)
+            assert receipt['state']==('failed' if failed else 'completed')
+            if failed:assert receipt['error']=='operator_connection_changed'
+            else:assert receipt['result']['state']=='ready'
+            assert broker.status==expected
+            assert not card._project_armed
+        finally:
+            release.set();stop.join(2)
+            if broker.task:await broker.task
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('failure',[None,'collision','disconnect','cancel','feedback','hold','management_retry','mid_cancel','mid_disconnect'])
 def test_return_uses_feedback_settling_and_confirms_hold_on_failure(failure):
     import numpy as np

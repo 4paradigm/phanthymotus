@@ -344,14 +344,23 @@ async def save_layout(layout: CanvasLayout):
 
     _editor_last_seen = time.monotonic()
 
+    from teleop_project import TeleopProjectError, require_editable
+    try:
+        require_editable(config.main.get('core', {}) or {},
+                         config.main.get('canvas_layout', {}) or {}, layout.model_dump())
+    except TeleopProjectError as error:
+        raise fastapi.HTTPException(status_code=409, detail=str(error)) from error
     save_data = layout.dict()
     save_data.pop('session_id', None)
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = save_data
     # A card that leaves the layout is unreachable afterwards — stop-project only
     # walks the saved cards — so its plugin instance would keep running forever.
     from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, save_data.get('cards', []))
+    try:
+        await stop_removed_cards(old_cards, save_data.get('cards', []))
+    except TeleopProjectError as error:
+        raise fastapi.HTTPException(status_code=409, detail=str(error)) from error
+    config.main['canvas_layout'] = save_data
     notify_layout_changed(session_id or '')
     return {'code': 200}
 

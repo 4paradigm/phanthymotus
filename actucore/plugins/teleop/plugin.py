@@ -18,7 +18,7 @@ from .protocol import TicketCodec, TicketVerifier
 from .rtc import RtcManager
 from .runtime import TeleopRuntime
 
-ACTIONS=['info','config','start','stop','finish','pair_headset','revoke_headset','calibrate','pause','resume','self_test','open_pairing','approve_pairing','reject_pairing','disconnect_headset','record_start','record_stop','record_status']
+ACTIONS=['info','config','project_start','project_stop','start','stop','finish','pair_headset','revoke_headset','calibrate','pause','resume','self_test','open_pairing','approve_pairing','reject_pairing','disconnect_headset','record_start','record_stop','record_status']
 
 
 class TeleopPlugin:
@@ -31,6 +31,15 @@ class TeleopPlugin:
         self.recorder=None
         self.operator_commands=None
         self._operator_cancel=threading.Event()
+        self._cancel_lock=threading.Lock();self._stop_generation=0
+        self._operation_lock=threading.RLock()
+        self._operation_action=None
+        # Project permission is volatile and deliberately absent from the saved
+        # configuration. Pairing and reconnecting never restore permission.
+        self._project_armed=False;self._project_stopping=False
+        self._project_binding=None;self._project_error=None
+        self._return_required=False
+        self._operator_session_prepared=False
         self.error=None;self._closing=False;self._instance=None;self._capture_status={};self._enrollment_status={}
         # Retain accepted Canvas settings even when Core misses a short restart.
         # Only configuration is restored: never a lease, session or start request.
@@ -48,7 +57,7 @@ class TeleopPlugin:
             self._config_error=self.error='saved_configuration_invalid'
 
     def _actions(self):
-        unsupported={'finish','record_start','record_stop','record_status'} if self.cfg.get('robot_profile')=='g1_23' else set()
+        unsupported={'project_start','project_stop','finish','record_start','record_stop','record_status'} if self.cfg.get('robot_profile')=='g1_23' else set()
         return [action for action in ACTIONS if action not in unsupported]
 
     def get_tools(self):
@@ -56,8 +65,9 @@ class TeleopPlugin:
         return [{'name':'teleop','type':'processor','multiInstance':False,'x-connection-panel':'teleop-v1',
             'description':'PICO 遥操：G1 双臂或天轶双臂与手开合。双握把使能；默认 Shadow；Driver 确认执行。',
             'inputSchema':{'type':'object','properties':{'action':{'type':'string','enum':actions},
-                'instance_id':{'type':'string'},'request_id':{'type':'string'},'fingerprint':{'type':'string'}},'required':['action'],'additionalProperties':False,
-                'x-action-params':{a:{'params':['request_id','fingerprint'] if a in ('approve_pairing','reject_pairing') else []} for a in actions},
+                'instance_id':{'type':'string'},'request_id':{'type':'string'},'fingerprint':{'type':'string'},
+                'driver_binding':{'type':'object'}},'required':['action'],'additionalProperties':False,
+                'x-action-params':{a:{'params':['request_id','fingerprint'] if a in ('approve_pairing','reject_pairing') else ['driver_binding'] if a=='project_start' else []} for a in actions},
                 'x-resource':(['arm_l','arm_r'] if self.cfg.get('robot_profile')=='g1_23' else ['arm_l','arm_r','hand_l','hand_r'])},
             'configSchema':{'type':'object','properties':{
                 'robot_profile':{'type':'string','enum':['tianyi2','g1_23'],'default':'tianyi2','scope':'shared'},
@@ -68,7 +78,8 @@ class TeleopPlugin:
                 'namespace':{'type':'string','scope':'shared','x-sensitive':True},
                 'driver_mcp_url':{'type':'string','scope':'shared','x-sensitive':True},
                 'calibration_path':{'type':'string','scope':'shared','x-sensitive':True}},'additionalProperties':False},
-            'topic_out':[{'topic':f"/{self.cfg.get('namespace','robot')}/teleop/status",'format':'data/json'}]}]
+            'topic_out':[{'topic':f"/{self.cfg.get('namespace','robot')}/motion/teleop/command",'format':'control/teleop'},
+                         {'topic':f"/{self.cfg.get('namespace','robot')}/teleop/status",'format':'data/json'}]}]
 
     def _run(self,coro,timeout=2):
         future=asyncio.run_coroutine_threadsafe(coro,self._loop)
@@ -144,7 +155,8 @@ class TeleopPlugin:
                         operation['state']={'submitted':'active','would_apply':'active',
                             'held':'hold','error':'hold','armed_waiting_input':'ready',
                             'waiting_driver_hold':'hold','waiting_driver_feedback':'hold'}.get(raw,operation.get('state','idle'))
-                result['operator']={**operation,'enabled':True,'mode':self.cfg.get('mode','shadow')}
+                result['operator']={**operation,'enabled':True,'armed':self._project_armed,
+                                    'mode':self.cfg.get('mode','shadow')}
             return result
         self.capture.visualization_provider=visual
         self.server=CaptureWssServer(self.capture,config)
@@ -164,12 +176,15 @@ class TeleopPlugin:
         properties=self.get_tools()[0]['configSchema']['properties']
         configuration={k:copy.deepcopy(self.cfg.get(k,v.get('default'))) for k,v in properties.items()
                        if k in self.cfg or 'default' in v}
+        project={'armed':self._project_armed,'stopping':self._project_stopping,
+                 'error':self._project_error,'driver_binding':copy.deepcopy(self._project_binding)}
         if not self.runtime:
             return {'state':'fault' if self.error else 'idle','reason':self.error,
                     'mode':self.cfg.get('mode','shadow'),'output_active':False,
-                    'topic_out':self.get_tools()[0]['topic_out'],'configuration':configuration}
+                    'topic_out':self.get_tools()[0]['topic_out'],'configuration':configuration,'project':project}
         result=self.runtime.status()
         result['configuration']=configuration
+        result['project']=project
         result['session_state']=result['state']
         result['state']={'prepared_shadow':'ready','prepared_live':'ready',
                          'active_shadow':'active','active_live':'active','released':'idle','paused':'hold'}.get(result['state'],result['state'])
@@ -178,7 +193,8 @@ class TeleopPlugin:
         result['host_error']=self.error
         result['enrollment']=copy.deepcopy(self._enrollment_status)
         result['calibrated']=self.adapter.solver is not None
-        result['operator']=dict(self.operator_commands.status) if self.operator_commands else {}
+        result['operator']={**(dict(self.operator_commands.status) if self.operator_commands else {}),
+                            'armed':self._project_armed}
         result['recording']=self.recorder.status() if self.recorder else {'state':'idle'}
         try:
             result['driver_feedback']=self.link.feedback()
@@ -228,8 +244,16 @@ class TeleopPlugin:
 
     def dispatch(self,name,args):
         action=args.get('action','info')
-        if action=='stop':self._operator_cancel.set()
+        if action=='stop' and self.cfg.get('robot_profile','tianyi2')!='tianyi2':self._cancel_operations()
         try:
+            # Long return operations must not hold the configuration/status lock
+            # or occupy the WSS loop. One operation lock serializes both origins.
+            if name=='teleop' and action in ('project_start','project_stop'):
+                if action not in self._actions():raise ValueError('unsupported_action')
+                return self._project_start(args.get('driver_binding')) if action=='project_start' else self._project_stop()
+            if (name=='teleop' and action in ('start','resume','stop')
+                    and self.cfg.get('robot_profile','tianyi2')=='tianyi2'):
+                return self._operator_execute(action,threading.Event(),self._headset_connected)
             with self._lock:
                 if name!='teleop':return None
                 if action not in self._actions():raise ValueError('unsupported_action')
@@ -243,6 +267,8 @@ class TeleopPlugin:
                     values={k:v for k,v in args.items() if k not in ('action','instance_id')}
                     updated=self._validate_configuration(values)
                     if updated==self.cfg and not self._config_error:return self.info()
+                    if self._project_armed or self._project_stopping or self._return_required:
+                        raise ValueError('project_stop_before_config')
                     if self.runtime and (self.runtime.status()['authority_valid'] or self.link.lease):
                         raise ValueError('release_before_config')
                     self.stop();self._save_configuration(updated)
@@ -325,46 +351,187 @@ class TeleopPlugin:
             self.error=str(exc)
             return {'state':'error','error':str(exc),'code':getattr(exc,'code','teleop_not_ready')}
 
+    def _headset_connected(self):
+        connection=self.capture._connection if self.capture else None
+        return bool(connection and not self.capture.presence_expired(connection))
+
+    def _project_start(self,binding):
+        from .project import validate_binding
+        binding=validate_binding(binding,self.cfg.get('robot_profile','tianyi2'))
+        with self._operation_lock,self._lock:
+            if self._project_stopping or self._project_error:raise ValueError('project_stop_required')
+            if self._project_armed:
+                if binding!=self._project_binding:raise ValueError('project_binding_changed')
+                return {'state':'ready','armed':True,'driver_binding':copy.deepcopy(binding)}
+            if self._return_required:raise ValueError('project_stop_required')
+            updated={**self.cfg,'namespace':binding['namespace'],'driver_mcp_url':binding['url']}
+            if updated!=self.cfg:
+                if self.runtime and (self.runtime.status()['authority_valid'] or self.link.lease):
+                    raise ValueError('release_before_binding')
+                self.stop();self.cfg=updated
+            self._ensure_host()
+            self._project_binding=binding
+            self._project_armed=True
+            self.error=None
+            return {'state':'ready','armed':True,'driver_binding':copy.deepcopy(binding)}
+
+    def _project_stop(self):
+        deadline=time.monotonic()+50
+        with self._cancel_lock:stop_generation=self._stop_generation
+        # Fence a calibration/start already holding _lock before waiting for
+        # it. That worker rechecks these flags immediately before prepare.
+        self._project_armed=False;self._project_stopping=True
+        if self._operation_action in ('start','resume'):self._operator_cancel.set()
+        with self._lock:
+            self._project_armed=False;self._project_stopping=True
+            self._operation_status('returning','project_stop')
+        try:
+            # A concurrent PICO finish may already be returning. Join it, then
+            # reuse its completion instead of sending a second return sequence.
+            if not self._operation_lock.acquire(timeout=max(0.,deadline-time.monotonic())):raise ValueError('project_stop_busy')
+            try:
+                result=self._finish_session(threading.Event(),lambda:True,deadline=deadline,
+                                            stop_generation=stop_generation)
+            finally:self._operation_lock.release()
+            self._project_error=None
+            self._operation_status('idle','project_stop')
+            return {**result,'armed':False}
+        except Exception as exc:
+            self._project_error=str(exc)
+            self._operation_status('error','project_stop',str(exc))
+            raise
+        finally:self._project_stopping=False;self._operation_action=None
+
+    def _finish_session(self,cancel,connected,*,deadline=None,stop_generation=None):
+        from .operator_session import return_arms
+        with self._lock:
+            self._install_cancel(cancel,stop_generation);self._operation_action='finish'
+            if self.runtime:
+                self.runtime.release_local()
+                self._run(self.capture.revoke_assignment('operator_finish'))
+                dispatch=self.runtime.status()['dispatch']
+                if dispatch.get('io_inflight') or dispatch.get('stop_queue_depth'):
+                    raise ValueError('return_waiting_for_adapter')
+            live=bool(self.adapter and self.adapter.hardware_output)
+            if not self._return_required or not live:
+                if self.adapter and not self._release_driver():raise ValueError('stop_unconfirmed')
+                result={'state':'idle','return_completed':True,'return_required':False,
+                        'authority_released':True,'mode':self.cfg.get('mode','shadow')}
+            else:result=None
+        if result is None:
+            if cancel.is_set():raise ValueError('return_cancelled')
+            remaining=45. if deadline is None else min(45.,deadline-time.monotonic()-2.)
+            if remaining<=0:raise ValueError('project_stop_timeout')
+            with self.adapter.lock:
+                if getattr(self.link,'release_requested_ns',0):self.link.reconcile_release()
+                if not self.link.lease and not getattr(self.link,'management_request',None):
+                    # Explicit stop clears the Driver's preparation as well as
+                    # its lease. A later explicit finish is a new bounded return
+                    # operation, not permission to reuse that cleared session.
+                    if self.cfg.get('operator_session_enabled') is not True:
+                        raise ValueError('operator_session_disabled')
+                    self.link.call('prepare_operator_session',time.monotonic()+.5)
+                    self._operator_session_prepared=True
+            result=return_arms(self.adapter,cancel,connected,timeout=remaining)
+            if not self._release_driver():raise ValueError('stop_unconfirmed')
+            result.update(authority_released=True,return_required=True)
+        if live and self._operator_session_prepared:
+            self.link.call('end_operator_session',time.monotonic()+.25)
+            self._operator_session_prepared=False
+        self._return_required=False;self._operation_action=None
+        self.error=None
+        return result
+
     def _operator_execute(self, action, cancel, connected):
         """Called on a worker; never occupies the WSS presence loop."""
+        if action=='stop':self._cancel_operations()
+        with self._cancel_lock:stop_generation=self._stop_generation
+        with self._operation_lock:
+            self._operation_action=action
+            self._operation_status({'finish':'returning','stop':'stopping'}.get(action,'starting'),action)
+            try:
+                result=self._operator_execute_locked(action,cancel,connected,stop_generation)
+                self.error=None
+                self._operation_status(result.get('state','idle'),action)
+                return result
+            except Exception as exc:
+                self._operation_status('error',action,str(exc))
+                raise
+            finally:self._operation_action=None
+
+    def _operation_status(self,state,action,error=None):
+        if self.operator_commands is not None:
+            self.operator_commands.set_status({'state':state,'action':action,'error':error})
+
+    def _cancel_operations(self):
+        with self._cancel_lock:
+            self._stop_generation+=1
+            self._operator_cancel.set()
+
+    def _install_cancel(self,cancel,generation):
+        with self._cancel_lock:
+            if generation is not None and generation!=self._stop_generation:cancel.set()
+            self._operator_cancel=cancel
+
+    def _operator_execute_locked(self, action, cancel, connected,stop_generation=None):
         if self.cfg.get('robot_profile','tianyi2')!='tianyi2':
             raise ValueError('operator_profile_unsupported')
         if action=='stop':
             self._operator_cancel.set()
-            result=self.dispatch('teleop',{'action':'stop'})
-        elif action=='start':
-            if not connected() or cancel.is_set():raise ValueError('operator_connection_changed')
-            if self.runtime.status()['dispatch'].get('fault_code'):
-                result=self.dispatch('teleop',{'action':'resume'})
-                if result.get('error'):raise ValueError(result['error'])
-                return {'state':result.get('state','idle'),'mode':self.cfg.get('mode','shadow')}
-            if self.runtime.status()['authority_valid']:
-                return {'state':'ready','mode':self.cfg.get('mode','shadow')}
-            self._operator_cancel=cancel
             with self._lock:
+                from .protocol import ProtocolError
+                if self.runtime:
+                    try:self.runtime.release_local()
+                    except ProtocolError as exc:
+                        if exc.code!='dispatch_stop_unconfirmed':raise
+                    self._run(self.capture.revoke_assignment('operator_stop'))
+                    if not self._release_driver():raise ValueError('stop_unconfirmed')
+                if self._operator_session_prepared:
+                    self.link.call('end_operator_session',time.monotonic()+.25)
+                    self._operator_session_prepared=False
+                self._instance=None
+                result={'state':'idle','authority_released':True,'mode':self.cfg.get('mode','shadow')}
+        elif action in ('start','resume'):
+            if not self._project_armed or self._project_stopping:raise ValueError('project_not_armed')
+            if not connected() or cancel.is_set():raise ValueError('operator_connection_changed')
+            if action=='start' and self.runtime.status()['authority_valid']:
+                return {'state':'ready','mode':self.cfg.get('mode','shadow')}
+            self._install_cancel(cancel,stop_generation)
+            if cancel.is_set():raise ValueError('operator_start_cancelled')
+            with self._lock:
+                if self.runtime.status()['dispatch'].get('fault_code'):
+                    self._recover_tianyi_host()
+                elif action=='resume':
+                    self.runtime.release_local()
+                    self._run(self.capture.revoke_assignment('operator_resume'))
+                    if not self._release_driver():raise ValueError('stop_unconfirmed')
                 if self.link.lease:raise ValueError('operator_requires_release')
                 self._calibrate_recovered_host()
                 if self.adapter.hardware_output:
                     if self.cfg.get('operator_session_enabled') is not True:
                         raise ValueError('operator_session_disabled')
                 if not connected() or cancel.is_set():raise ValueError('operator_connection_changed')
-                result=self.dispatch('teleop',{'action':'start'})
+                if not self._project_armed or self._project_stopping:raise ValueError('project_not_armed')
+                if self.adapter.hardware_output:
+                    self.link.call('prepare_operator_session',time.monotonic()+.5)
+                    self._operator_session_prepared=True
+                # project_stop can fence us while the management RPC is in
+                # flight. A successful preparation is not a surviving start.
+                if (cancel.is_set() or not connected() or not self._project_armed
+                        or self._project_stopping):
+                    if self._operator_session_prepared:
+                        self.link.call('end_operator_session',time.monotonic()+.25)
+                        self._operator_session_prepared=False
+                    raise ValueError('operator_start_cancelled')
+                self.runtime.prepare_local_session()
+                self._return_required=True
+                self._run(self.capture.issue_assignment_if_connected())
+                result=self.info()
         elif action=='finish':
-            from .operator_session import return_arms
-            self._operator_cancel=cancel
-            with self._lock:
-                if self.runtime is None:raise ValueError('operator_not_started')
-                self.runtime.release_local()
-                self._run(self.capture.revoke_assignment('operator_finish'))
-                if not self.adapter.hardware_output:
-                    return {'state':'idle','mode':'shadow','return_completed':False}
-            # Runtime has no authority now; only this worker can submit return
-            # steps. A stop cancels before acquiring plugin/adapter locks.
-            result=return_arms(self.adapter,cancel,connected)
-            self.link.call('end_operator_session',time.monotonic()+.25)
+            result=self._finish_session(cancel,connected,stop_generation=stop_generation)
         else:raise ValueError('operator_action_invalid')
         if result.get('error'):raise ValueError(result['error'])
-        return {k:result[k] for k in ('state','mode','return_completed','max_error_rad') if k in result}
+        return {k:result[k] for k in ('state','mode','return_completed','return_required','authority_released','max_error_rad') if k in result}
 
     def _release_driver(self):
         """Wait for actual release after the bounded stop request has returned."""
@@ -418,7 +585,7 @@ class TeleopPlugin:
                 time.sleep(.02)
 
     def stop(self):
-        self._operator_cancel.set()
+        self._cancel_operations()
         with self._lock:
             self._closing=True
             errors=[]

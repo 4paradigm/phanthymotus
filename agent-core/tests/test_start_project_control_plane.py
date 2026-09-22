@@ -247,9 +247,13 @@ def test_two_agreeing_action_spaces_are_fine(driver):
 # ── several publishers on one control topic ──────────────────────────────────
 
 def test_two_control_sources_on_one_topic_are_allowed(driver):
-    """A teleop pendant taking over from a policy is the intended shape."""
+    """A generic priority-controlled pendant shares the motus.control/1 sink.
+
+    The dedicated teleop tool now uses control/teleop and exclusive binding;
+    it is intentionally not this arbitrated generic control source.
+    """
     layout = {
-        'cards': [_card(VLA, 'vla'), _card(TELEOP, 'teleop'), _card(ARM, 'servo')],
+        'cards': [_card(VLA, 'vla'), _card(TELEOP, 'manual_pendant'), _card(ARM, 'servo')],
         'connections': [_conn(VLA, ARM), _conn(TELEOP, ARM)],
     }
     _run(layout)

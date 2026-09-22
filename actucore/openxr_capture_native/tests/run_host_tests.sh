@@ -105,6 +105,10 @@ done
 if [ -n "${NLOHMANN_JSON_INCLUDE:-}" ]; then
   "${CXX:-clang++}" -std=c++20 -Wall -Wextra -Werror -pedantic \
     -I"$project_dir/app/src/main/cpp" -I"$NLOHMANN_JSON_INCLUDE" \
+    "$project_dir/tests/operator_state_test.cpp" -o "$build_dir/operator_state_test"
+  "$build_dir/operator_state_test"
+  "${CXX:-clang++}" -std=c++20 -Wall -Wextra -Werror -pedantic \
+    -I"$project_dir/app/src/main/cpp" -I"$NLOHMANN_JSON_INCLUDE" \
     "$project_dir/tests/ik_visualization_test.cpp" -o "$build_dir/ik_visualization_test"
   "$build_dir/ik_visualization_test"
   if [ -n "${MOTUS_IK_REPLAY:-}" ]; then

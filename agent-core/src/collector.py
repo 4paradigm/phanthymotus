@@ -649,7 +649,8 @@ def project_running() -> bool:
     每批 spawn 一个后台 subagent —— 没人点过「开始」，机器人对着一台冰箱持续烧 token。
     天轶上一天 3668 个 turn 就是这么来的。
     """
-    return bool((config.main.get('core') or {}).get('project_running', False))
+    core = config.main.get('core') or {}
+    return bool(core.get('project_running', False)) and core.get('project_phase') not in ('stopping', 'stop_failed')
 
 
 async def _drain_loop():

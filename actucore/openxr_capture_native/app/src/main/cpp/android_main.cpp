@@ -429,7 +429,7 @@ void android_main(android_app* app) {
       }
       transport->Tick();
       xr.SetVisualization(transport->visualization());
-      xr.SetOperatorPanel(transport->operator_enabled(),transport->operator_state(),transport->operator_mode(),transport->operator_error());
+      xr.SetOperatorPanel(transport->operator_enabled(),transport->operator_armed(),transport->operator_state(),transport->operator_mode(),transport->operator_error());
       const auto link = transport->link_state();
       if (link == CaptureLinkState::kStandby || link == CaptureLinkState::kNegotiating ||
           link == CaptureLinkState::kStreaming) {
