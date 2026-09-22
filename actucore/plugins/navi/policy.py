@@ -456,19 +456,47 @@ def _stuck(odom, state: State, commanded_vx: float, dt: float,
 # 目标身份的键。名字之外还要带颜色，否则「两把椅子」在列表里是一个条目，而
 # navigate_to("chair") 永远指向其中随机的一把。颜色来自 vop 的三元组，它在
 # `publish_color: name` 下就是一个可直接比较的字符串。
+def hue_of(obj) -> str:
+    """色相，从 vop 的两种颜色形态里取，取不到返回 ""。
+
+    `publish_color` 有两档会带颜色，形态不同，而两档都是长期支持的：
+
+        name（默认）  "dim muted azure"      —— 三元组字符串，色相是最后一个词
+        full          {"dominant_hue": …, …} —— 完整的 12 数 + 4 标签
+
+    早先这里只认第一种，对字典直接做 `str(...).split(" ")[-1]`，于是从字典的
+    repr 尾巴上抠出了 `'green'}` 当色相。真机上表现为 list_visible_objects 给出
+    的 key 是 `person#'green'}`，照它填进 navigate_to 又对不上（字符会被 shell
+    或人手改掉一个），机器人转满一圈报「目标不在视野内」—— 而目标一直在画面正
+    中，10/10 帧都看得见。
+    """
+    colour = obj.get("color")
+    if isinstance(colour, dict):
+        return str(colour.get("dominant_hue") or "").strip()
+    text = str(colour or "").strip()
+    return text.split(" ")[-1] if text else ""
+
+
+def colour_text(obj) -> str:
+    """一句能读的颜色，同样两种形态都认。"""
+    colour = obj.get("color")
+    if isinstance(colour, dict):
+        return str(colour.get("color_name") or colour.get("dominant_hue") or "")
+    return str(colour or "")
+
+
 def object_key(obj) -> str:
     name = str(obj.get("name") or "?")
-    colour = str(obj.get("color") or "").strip()
-    # 只取色相那一段（三元组的最后一个词）：亮度会随光照在帧间跳动，把它算进
-    # 身份里会让同一把椅子在明暗之间变成两个条目。
-    hue = colour.split(" ")[-1] if colour else ""
+    # 只取色相：亮度会随光照在帧间跳动，把它算进身份里会让同一把椅子在明暗之间
+    # 变成两个条目，两边都够不到稳定阈值。
+    hue = hue_of(obj)
     return f"{name}#{hue}" if hue and hue != "neutral" else name
 
 
 def describe(obj, distance_m=None) -> str:
     """一句人（和 LLM）能读、也能原样回填给 navigate_to 的描述。"""
     parts = [str(obj.get("name") or "?")]
-    colour = str(obj.get("color") or "").strip()
+    colour = colour_text(obj)
     if colour:
         parts.append(colour)
     bearing = _bearing(obj)

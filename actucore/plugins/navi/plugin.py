@@ -36,6 +36,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
@@ -389,16 +390,52 @@ class NaviPlugin:
             # that is no longer being chased.
             self._state = policy_mod.State(target=target)
             self._paused = False
-            # agent-core passes this for any action declaring x-completion.
-            # Without storing it the card can never report back, which is the
-            # state this was in until it was noticed: `x-completion` declared,
-            # `_acp_notify` never assigned, so the promise was never kept and
-            # only the 300s ACP timeout ever closed the action.
-            self._acp_action_id = (args.get("action_id") or "").strip()
+            # **The card mints this, agent-core does not supply it.** The ACP
+            # contract runs the other way from what it looks like: an async tool
+            # returns an `action_id` in its reply, agent-core parses it out and
+            # registers the pending action (`mcp_client.py`, "ACP: 异步工具"),
+            # and the completion later refers back to it. Reading it out of
+            # `args` — which is what this did first — finds nothing, so no
+            # pending is ever registered and no completion can be matched.
+            self._acp_action_id = f"navi_{uuid.uuid4().hex[:12]}"
         log.info("navi navigate_to: target=%r", target)
-        return {"state": "running", "target": target, "topic": self._topic,
-                "stop_distance_m": self._config.stop_distance_m,
-                "degraded": self._degradations()}
+        out = {"state": "running", "target": target, "topic": self._topic,
+               # agent-core reads this back out to register the pending action.
+               # Without it in the reply the action completes instantly as far
+               # as the barrier is concerned, and the completion POST below
+               # later refers to an id nobody is waiting on.
+               "action_id": self._acp_action_id,
+               "stop_distance_m": self._config.stop_distance_m,
+               "degraded": self._degradations()}
+
+        # 立刻回答「这个目标现在看得见吗」。
+        #
+        # 不看得见**不拒绝** —— 「转过去找那把椅子」是正当用法，目标本来就可能
+        # 在视野外。但也不能只回一个 "running" 就完事：早先正是这样，一个拼错的
+        # key 换来一句「已开始」，然后机器人转满一圈、16 秒后才在 info().last 里
+        # 留下失败原因，而调用方那时早就不在看了。它在下指令的这一刻就能知道。
+        visible = self._visible_keys()
+        if visible and not self._matches_anything(target, visible):
+            out["warning"] = (f"目标 {target!r} 不在当前可见列表里，将转身搜索；"
+                              f"若它其实就在眼前，多半是 key 抄错了")
+            out["visible_now"] = visible
+        return out
+
+    def _visible_keys(self) -> list:
+        with self._obs_lock:
+            frames = list(self._recent)
+        if not frames:
+            return []
+        need = max(1, int(round(len(frames) * 0.6)))
+        return [o["key"] for o in policy_mod.stable_objects(
+            frames, min_frames=need, config=self._config)]
+
+    @staticmethod
+    def _matches_anything(target: str, keys) -> bool:
+        """和 select_target 同一套宽松度：key 全等，或名字部分匹配。"""
+        wanted = target.strip().lower()
+        return any(wanted == k.lower() or wanted in k.split("#")[0].lower()
+                   for k in keys)
 
     def _stop_navigation(self):
         with self._lock:

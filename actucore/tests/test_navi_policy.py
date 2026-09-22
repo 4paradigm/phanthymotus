@@ -570,3 +570,46 @@ def test_arriving_is_not_counted_as_idleness():
         decision = _step(detections=_detections(_obj(x=0.0)), depth=depth,
                          config=config, state=state, dt=0.1)
     assert decision.status == P.ARRIVED
+
+
+# ── colour comes in two shapes, and both are supported for good ──────────────
+
+_FULL_COLOUR = {"rgb_mean": [72.2, 62.8, 60.3], "rgb_var": [1624.0, 1178.6, 1030.5],
+                "hsv_mean": [54.1, 46.3, 72.9], "hsv_var": [4403.8, 1105.3, 1571.8],
+                "dominant_hue": "green", "dominant_saturation": "muted",
+                "dominant_brightness": "dim", "color_name": "green"}
+
+
+def test_the_hue_is_read_from_the_full_colour_dict():
+    """`publish_color: full` is a supported level, not a legacy accident.
+
+    Treating the dict as a string and splitting on spaces lifts `'green'}` off
+    the end of its repr — which on r1_sz produced the key `person#'green'}`,
+    unusable in navigate_to, and a robot that searched a full circle for
+    something sitting in the middle of its view.
+    """
+    assert P.hue_of({"color": _FULL_COLOUR}) == "green"
+    assert P.object_key({"name": "person", "color": _FULL_COLOUR}) == "person#green"
+
+
+def test_the_hue_is_read_from_the_triple_string():
+    assert P.hue_of({"color": "dim muted azure"}) == "azure"
+
+
+def test_a_missing_colour_yields_a_bare_name():
+    assert P.object_key({"name": "person"}) == "person"
+    assert P.hue_of({"color": None}) == ""
+
+
+def test_describe_never_embeds_a_dict_repr():
+    """The description is shown to a person and handed to an LLM; a pasted
+    dict repr makes it unreadable and unusable as a target."""
+    text = P.describe({"name": "person", "position": [0.0, 0.0],
+                       "color": _FULL_COLOUR}, 6.9)
+    assert "rgb_mean" not in text and "green" in text
+
+
+def test_both_colour_shapes_produce_the_same_key():
+    """So a card keeps working across a change of `publish_color`."""
+    assert (P.object_key({"name": "person", "color": _FULL_COLOUR})
+            == P.object_key({"name": "person", "color": "dim muted green"}))

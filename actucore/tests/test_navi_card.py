@@ -353,3 +353,59 @@ def test_subscriptions_use_best_effort_qos():
     profile = _sensor_qos()
     assert profile["reliability"] == "best_effort"
     assert profile["depth"] == 2      # only the newest sample is ever read
+
+
+def test_navigate_to_says_at_once_when_the_target_is_not_in_view():
+    """Not a refusal — "turn around and find the chair" is legitimate. But the
+    caller learns it now rather than from info().last sixteen seconds later,
+    which is when a mistyped key used to surface."""
+    card = _card()
+    card._running = True
+    card._recent.extend([{"objects": [{"name": "person", "confidence": 0.9,
+                                       "position": [0, 0],
+                                       "color": "dim muted green"}]}] * 10)
+    out = card.dispatch("navi", {"action": "navigate_to", "target": "person#'green"})
+    assert out["state"] == "running"          # still starts
+    assert "不在当前可见列表" in out["warning"]
+    assert out["visible_now"] == ["person#green"]
+
+
+def test_a_target_that_is_in_view_gets_no_warning():
+    card = _card()
+    card._running = True
+    card._recent.extend([{"objects": [{"name": "person", "confidence": 0.9,
+                                       "position": [0, 0],
+                                       "color": "dim muted green"}]}] * 10)
+    out = card.dispatch("navi", {"action": "navigate_to", "target": "person#green"})
+    assert "warning" not in out
+
+
+def test_a_bare_name_matching_a_keyed_object_is_not_warned_about():
+    card = _card()
+    card._running = True
+    card._recent.extend([{"objects": [{"name": "person", "confidence": 0.9,
+                                       "position": [0, 0],
+                                       "color": "dim muted green"}]}] * 10)
+    assert "warning" not in card.dispatch(
+        "navi", {"action": "navigate_to", "target": "person"})
+
+
+def test_navigate_to_returns_an_action_id():
+    """The ACP contract runs tool → agent-core, not the other way round:
+    `mcp_client` parses `action_id` out of the *reply* to register the pending
+    action. A reply without one leaves the completion referring to an id nobody
+    is waiting on — which is indistinguishable, from the outside, from a card
+    that never reports failure at all."""
+    card = _card()
+    card._running = True
+    out = card.dispatch("navi", {"action": "navigate_to", "target": "chair"})
+    assert out["action_id"].startswith("navi_")
+    assert card._acp_action_id == out["action_id"]
+
+
+def test_each_navigate_to_gets_a_fresh_action_id():
+    card = _card()
+    card._running = True
+    first = card.dispatch("navi", {"action": "navigate_to", "target": "chair"})
+    second = card.dispatch("navi", {"action": "navigate_to", "target": "tv"})
+    assert first["action_id"] != second["action_id"]
