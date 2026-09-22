@@ -13,6 +13,9 @@ POSE_KEYS = ('schema_version','mode','client_monotonic_ns','sequence','clutch_se
              'left_controller','right_controller','controllers')
 FEEDBACK_KEYS = ('monotonic_ns','state','reason','applied_sequence','commanded_q',
                  'output_active','ownership_held','stop_confirmed','calibration_sha256','last_vendor_command')
+SOLUTION_KEYS = ('input_sequence', 'clutch_sequence', 'input_received_ns', 'monotonic_ns',
+                 'ik_started_ns', 'ik_succeeded', 'ik_target_q', 'ik_reference_q',
+                 'target_diagnostics', 'output_state', 'published', 'failure')
 
 class PoseRecorder:
     def __init__(self, root, capacity=1024):
@@ -29,7 +32,8 @@ class PoseRecorder:
             self.queue=queue.Queue(self.capacity);self.done.clear()
             self.duration=duration;self.waiting=wait_for_deadman;self.prelude=None
             self.until=time.monotonic()+(120 if wait_for_deadman else duration)
-            self.result=dict(state='armed' if wait_for_deadman else 'recording',recording_id=name,frames=0,dropped=0,error=None,complete=False)
+            self.result=dict(state='armed' if wait_for_deadman else 'recording',recording_id=name,
+                             frames=0,dropped=0,solutions=0,solutions_dropped=0,error=None,complete=False)
             (self.path/'manifest.json').write_text(json.dumps({'schema':'motus.teleop.recording.v1',
                 'duration_s':duration,'started_monotonic_ns':time.monotonic_ns(),**metadata},allow_nan=False,indent=2)+'\n')
             self.thread=threading.Thread(target=self._write,name='teleop-recorder',daemon=True)
@@ -54,17 +58,33 @@ class PoseRecorder:
             try:self.queue.put_nowait(copy.deepcopy(row))
             except queue.Full:self.result['dropped']+=1
 
+    def capture_solution(self, event):
+        """Separate post-solve stream joined by input sequence, never by proximity.
+
+        Input observation happens before IK and can include frames overwritten by
+        latest-only dispatch. Do not attach a previous solve to a newer pose row.
+        """
+        with self.lock:
+            if self.result['state'] != 'recording' or self.done.is_set():return
+            if time.monotonic() >= self.until:self.done.set();return
+            row = {k:copy.deepcopy(event[k]) for k in SOLUTION_KEYS if k in event}
+            row['_kind'] = 'solution'
+            try:self.queue.put_nowait(row)
+            except queue.Full:self.result['solutions_dropped']+=1
+
     def _write(self):
         try:
-            with (self.path/'poses.jsonl').open('x') as f:
+            with (self.path/'poses.jsonl').open('x') as f, (self.path/'solutions.jsonl').open('x') as solutions:
                 while not (self.done.is_set() and self.queue.empty()):
                     if time.monotonic()>=self.until:self.done.set()
                     try:row=self.queue.get(timeout=.05)
                     except queue.Empty:continue
-                    f.write(json.dumps(row,allow_nan=False,separators=(',',':'))+'\n')
-                    with self.lock:self.result['frames']+=1
-                f.flush();os.fsync(f.fileno())
-            with self.lock:self.result.update(state='finished',complete=self.result['dropped']==0 and self.result['frames']>0)
+                    is_solution = row.pop('_kind', None) == 'solution'
+                    (solutions if is_solution else f).write(json.dumps(row,allow_nan=False,separators=(',',':'))+'\n')
+                    with self.lock:self.result['solutions' if is_solution else 'frames']+=1
+                for stream in (f, solutions):stream.flush();os.fsync(stream.fileno())
+            with self.lock:self.result.update(state='finished',complete=(self.result['dropped']==0
+                and self.result['solutions_dropped']==0 and self.result['frames']>0))
         except Exception as exc:
             with self.lock:self.result.update(state='failed',error=type(exc).__name__,complete=False)
         finally:

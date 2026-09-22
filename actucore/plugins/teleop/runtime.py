@@ -85,6 +85,8 @@ class TeleopRuntime:
         self._auto_retry_codes = (COLLISION_HOLD_CODES if self._auto_collision_recovery else frozenset())
         if getattr(adapter, "auto_ik_recovery", False) is True:
             self._auto_retry_codes |= IK_RETRY_CODES
+        if getattr(adapter, "auto_workspace_recovery", False) is True:
+            self._auto_retry_codes |= {"workspace_limit"}
         if mode == "shadow" and getattr(adapter, "auto_shadow_feedback_recovery", False) is True:
             self._auto_retry_codes |= {"feedback_unavailable"}
         if mode == "live" and getattr(adapter, "auto_live_transient_recovery", False) is True:

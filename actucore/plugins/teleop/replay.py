@@ -42,6 +42,7 @@ def analyze(recording, profile, destination):
     if len(rows)!=complete['frames']:raise ValueError('recording_frame_count')
     solver=TianyiIK(profile);scale=manifest['position_scale'];segments=[];diagnostics=[]
     for mode in ('recorded_feedback','continuous_solution'):
+        solver.reset_target_state()
         mapper=RelativeMapping(scale)
         mapper.controller_offsets={s:transform(solver.profile['controller_to_palm'][s]) for s in ('left','right')}
         key=None;previous=None;seed=None;segment=[]
@@ -58,6 +59,7 @@ def analyze(recording, profile, destination):
                 if key!=current_key:
                     if segment and mode=='continuous_solution':segments.append(segment)
                     segment=[];mapper.reset(f,solver.palms(measured));seed=measured;key=current_key
+                    solver.reset_target_state()
                 targets=mapper.targets(f);initial=measured if mode=='recorded_feedback' else seed
                 begin=time.monotonic();result=solver.solve(targets,initial)
                 entry.update(code='ok',elapsed_ms=(time.monotonic()-begin)*1000,
@@ -93,7 +95,7 @@ def analyze(recording, profile, destination):
     selected=[x for x in selected if x['source_ns']-selected[0]['source_ns']<=6_000_000_000]
     package={'schema':'motus.teleop.replay.v1','recording_sha256':digest(recording/'poses.jsonl'),
              'profile_sha256':digest(profile),'recorded_profile_sha256':manifest['profile_sha256'],'sources':manifest['sources'],'position_scale':scale,
-             'compiled_sources':{n:digest(Path(__file__).with_name(n)) for n in ('kinematics.py','workspace.py','replay.py','acceptance.py','adapter.py','tianyi.py','runtime.py','dispatch.py')},
+             'compiled_sources':{n:digest(Path(__file__).with_name(n)) for n in ('kinematics.py','workspace.py','reachability.py','replay.py','acceptance.py','adapter.py','tianyi.py','runtime.py','dispatch.py')},
              'waypoints':selected,'hardware_output':False}
     write_json(destination/'trajectory.json',package)
     write_json(destination/'analysis.json',{'passed':True,'rows':len(rows),'valid_segments':len(useful),

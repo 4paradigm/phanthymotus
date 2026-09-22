@@ -95,7 +95,9 @@ class TeleopPlugin:
         def record_frame(frame, received_at):
             with self.link.condition:feedback=dict(self.link.latest or {})
             self.recorder.capture(frame,received_at,feedback)
-        if profile=='tianyi2':self.runtime.pose_observer=record_frame
+        if profile=='tianyi2':
+            self.runtime.pose_observer=record_frame
+            self.adapter.result_observer=self.recorder.capture_solution
         self._loop=asyncio.new_event_loop()
         self._thread=threading.Thread(target=self._loop.run_forever,name='actucore-capture',daemon=True)
         self._thread.start()
@@ -204,11 +206,12 @@ class TeleopPlugin:
                 if action=='record_status':return self.recorder.status()
                 if action=='record_stop':return self.recorder.stop()
                 if action=='record_start':
-                    if self.cfg.get('robot_profile')!='tianyi2' or self.cfg.get('mode')!='shadow' or self.link.lease:
-                        raise ValueError('record_requires_tianyi_shadow')
+                    if self.cfg.get('robot_profile','tianyi2')!='tianyi2':
+                        raise ValueError('record_requires_tianyi')
                     profile=Path(self.cfg['calibration_path'])
-                    modules=('runtime.py','adapter.py','tianyi.py','kinematics.py','workspace.py','recording.py')
+                    modules=('runtime.py','adapter.py','tianyi.py','kinematics.py','workspace.py','reachability.py','recording.py')
                     metadata={'profile':json.loads(profile.read_text()),
+                        'mode':self.cfg.get('mode','shadow'),
                         'profile_sha256':hashlib.sha256(profile.read_bytes()).hexdigest(),
                         'position_scale':self.cfg.get('position_scale',.5),
                         'sources':{n:hashlib.sha256(Path(__file__).with_name(n).read_bytes()).hexdigest() for n in modules}}

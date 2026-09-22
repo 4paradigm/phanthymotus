@@ -12,6 +12,7 @@ class TianyiIntentAdapter(IntentAdapter):
     dispatch_io_timeout_ms = 150
     auto_collision_recovery = True
     auto_ik_recovery = True
+    auto_workspace_recovery = True
     auto_shadow_feedback_recovery = True
     auto_live_transient_recovery = True
 
@@ -22,6 +23,8 @@ class TianyiIntentAdapter(IntentAdapter):
         self._same_session_hold = False
         self._recoverable_hold_supported = False
         self.trace_sink = None
+        self.result_observer = None
+        self.recording_errors = 0
         self.last_failure = None
         self.last_apply = None
         self._feedback_wait_started = None
@@ -34,6 +37,7 @@ class TianyiIntentAdapter(IntentAdapter):
             value["diagnostics"]["last_failure"] = (dict(self.last_failure) if self.last_failure else None)
             value["diagnostics"]["last_send"] = getattr(self.link, "last_send", None)
             value["diagnostics"]["last_apply"] = self.last_apply
+            value["diagnostics"]["recording_errors"] = self.recording_errors
             value["diagnostics"]["transport_prepare_ms"] = getattr(self.link, "transport_prepare_ms", None)
             return value
 
@@ -125,6 +129,8 @@ class TianyiIntentAdapter(IntentAdapter):
                     if max(triggers) > .05:
                         raise ValueError('triggers_not_neutral')
                     self.mapper.reset(frame, self.solver.palms(q))
+                    if hasattr(self.solver, 'reset_target_state'):
+                        self.solver.reset_target_state()
                 if self.hardware_output and (fresh or self._resume_validated or getattr(self.link,'management_request',None)):
                     # A clutch establishes a measured reference and a lease.
                     # It never sends a target: solving here only throws the IK
@@ -178,6 +184,9 @@ class TianyiIntentAdapter(IntentAdapter):
                                    'publisher_present': False, 'output_active': False}
                 visual=getattr(self.solver,'last_valid_visualization',None)
                 self._feedback_wait_started = None
+                diagnostics = getattr(self.solver, 'target_diagnostics', None)
+                if diagnostics is not None:
+                    self.output['target_diagnostics'] = diagnostics
                 if visual is not None:
                     self.output['ik_reference_q']=[float(x) for x in visual['ik_q']]
                 self.chain_times.append((time.monotonic()-(intent.received_monotonic or intent.admitted_monotonic))*1000)
@@ -234,19 +243,24 @@ class TianyiIntentAdapter(IntentAdapter):
                                    'budget_at_start_ms':(deadline-started)*1000,
                                    'remaining_ms':(deadline-finished)*1000,
                                    'driver_call':getattr(self.link, 'last_call', None)}
-                if self.trace_sink is not None:
+                if self.trace_sink is not None or self.result_observer is not None:
                     failed=self.last_failure if self.last_failure and self.last_failure['sequence']==intent.sequence else None
                     published=getattr(self.link,'last_send',None) is not previous_send
-                    self.trace_sink({'event':'actucore_apply','monotonic_ns':time.monotonic_ns(),
+                    event = {'event':'actucore_apply','monotonic_ns':time.monotonic_ns(),
                         'input_sequence':intent.sequence,'clutch_sequence':intent.clutch_sequence,
                         'input_received_ns':int((intent.received_monotonic or intent.admitted_monotonic)*1e9),
                         'ik_started_ns':ik_started_ns,'ik_succeeded':solved_target is not None,
                         'ik_target_q':solved_target,'failure':dict(failed) if failed else None,
                         'ik_reference_q':self.output.get('ik_reference_q') if solved_target is not None else None,
+                        'target_diagnostics':getattr(self.solver, 'target_diagnostics', None) if ik_started_ns is not None else None,
                         'last_apply':dict(self.last_apply),
                         'output_state':self.output.get('state'),'published':published,
                         'publish':dict(self.link.last_send) if published and getattr(self.link,'last_send',None) else None,
-                        'session_id':self.link.lease.get('session_id') if self.link.lease else None})
+                        'session_id':self.link.lease.get('session_id') if self.link.lease else None}
+                    if self.result_observer is not None:
+                        try:self.result_observer(event)
+                        except Exception:self.recording_errors += 1
+                    if self.trace_sink is not None:self.trace_sink(event)
 
     def safe_stop(self, request):
         self._revoked_generation = max(self._revoked_generation, request.dispatch_generation-1)
@@ -257,7 +271,7 @@ class TianyiIntentAdapter(IntentAdapter):
             self._feedback_wait_started = None
             self._same_session_hold = bool(self.hardware_output and self._recoverable_hold_supported
                 and self.link.lease and not getattr(self.link,"management_request",None)
-                and request.reason in IK_RETRY_CODES)
+                and request.reason in IK_RETRY_CODES | {'workspace_limit'})
             operation = self.link.recoverable_hold if self._same_session_hold else self.link.pause
             try:
                 ok = self._confirm_stop(operation,request.deadline_monotonic) if self.hardware_output else True
@@ -269,7 +283,7 @@ class TianyiIntentAdapter(IntentAdapter):
                 # reopens continuation or assumes the previous stop succeeded.
                 self._same_session_hold = False
                 ok = self._confirm_stop(self.link.pause, request.deadline_monotonic)
-            retry_codes = COLLISION_HOLD_CODES | IK_RETRY_CODES
+            retry_codes = COLLISION_HOLD_CODES | IK_RETRY_CODES | {'workspace_limit'}
             if self.hardware_output:
                 retry_codes |= {"command_timeout", "driver_execution_ack_timeout", "feedback_unavailable", "arms_not_stationary"}
             else:

@@ -77,6 +77,7 @@ class RelativeMapping:
 
 
 from .workspace import ArmWorkspace, WorkspaceViolation
+from .reachability import ReachableTarget
 
 
 def arm_chain_xml(model_bytes, torso, names):
@@ -169,6 +170,13 @@ class TianyiIK(ArmWorkspace):
         self.last_ms=None
         self.visualization_sample=None
         self.last_valid_visualization=None
+        self.target_policy = ReachableTarget(self.profile.get('target_projection'), pin)
+        self.target_diagnostics = None
+
+    def reset_target_state(self):
+        with self.lock:
+            self.target_policy.reset()
+            self.target_diagnostics = None
 
     def _safe_advance(self, measured, previous, candidate, budget):
         """Shorten a fresh advance only after proving both entire joint boxes.
@@ -234,11 +242,15 @@ class TianyiIK(ArmWorkspace):
                 # Keep history only for rendering. Failed results never become commands.
                 self.visualization_sample={'monotonic_ns':time.monotonic_ns(),
                     'targets':[t.copy() for t in targets], 'ik_q':None, 'error':str(exc)}
+                self.target_diagnostics = {**(self.target_diagnostics or {}),
+                    'state': 'rejected', 'error': str(exc),
+                    'raw_targets': [t.tolist() for t in targets]}
                 raise
 
     def _solve(self,targets,measured,commanded=None,*,deadline_monotonic=None):
         with self.lock:
             begin=time.monotonic();measured=finite(measured,(14,))
+            self.target_diagnostics = None
             lower=self.model.lowerPositionLimit[self.indices];upper=self.model.upperPositionLimit[self.indices]
             measured_tolerance=min(MEASURED_LIMIT_TOLERANCE_RAD,self.velocity*.02)
             if np.any(measured<lower-measured_tolerance) or np.any(measured>upper+measured_tolerance):
@@ -256,15 +268,19 @@ class TianyiIK(ArmWorkspace):
             check_budget()
             targets=[finite(t,(4,4)) for t in targets]
             if len(targets)!=2:raise ValueError('dual_targets_required')
+            raw_targets = targets
+            targets, clipped = self.target_policy.targets(raw_targets, self.workspace)
+            solve_lower, solve_upper = self.target_policy.bounds(lower, upper, measured)
+            initial = np.clip(initial, solve_lower, solve_upper)
             previous_solution=self.last_valid_visualization
             if (previous_solution and 0<=time.monotonic_ns()-previous_solution['monotonic_ns']<=200_000_000
                     and all(np.linalg.norm(a[:3,3]-b[:3,3])<=.03
                             and np.linalg.norm(a[:3,:3]-b[:3,:3])<=.15
-                            for a,b in zip(targets,previous_solution['targets']))):
+                            for a,b in zip(targets,previous_solution.get('feasible_targets', previous_solution['targets'])))):
                 # Continuous small target changes can reuse the numerical seed.
                 # Residual regularization, rate limits and swept geometry still
                 # use CURRENT measured/commanded joints, never this old solution.
-                initial=np.clip(previous_solution['ik_q'],lower,upper)
+                initial=np.clip(previous_solution['ik_q'],solve_lower,solve_upper)
             cached_q=None;cached_value=None
             def evaluate(q):
                 nonlocal cached_q,cached_value
@@ -277,7 +293,7 @@ class TianyiIK(ArmWorkspace):
                 return cached_value
             result=self.least_squares(lambda q:evaluate(q)[0],initial,
                 jac=lambda q:evaluate(q)[1],
-                bounds=(lower,upper),
+                bounds=(solve_lower,solve_upper),
                 max_nfev=30,ftol=1e-5,xtol=1e-5,gtol=1e-5)
             # Budget exhaustion (status 0) is not itself geometric failure.
             # Accept only a finite result passing the same residual, bounds,
@@ -288,8 +304,24 @@ class TianyiIK(ArmWorkspace):
             q=finite(result.x,(14,))
             actual=self.palms(q)
             check_budget()
-            if any(np.linalg.norm(a[:3,3]-b[:3,3])>0.015 or np.linalg.norm(a[:3,:3]-b[:3,:3])>0.15 for a,b in zip(actual,targets)):
+            self.target_diagnostics = {'residuals': self.target_policy.residuals(actual, raw_targets),
+                                       'solver_status': int(result.status)}
+            if (not self.target_policy.enabled and any(
+                    np.linalg.norm(a[:3,3]-b[:3,3])>0.015 or np.linalg.norm(a[:3,:3]-b[:3,:3])>0.15
+                    for a,b in zip(actual,targets))):
                 raise ValueError('ik_target_unreachable')
+            clipped_fit = any(clipped) and all(
+                r['position_m'] <= self.target_policy.POSITION_TOLERANCE and
+                r['orientation_rad'] <= self.target_policy.ANGLE_TOLERANCE
+                for r in self.target_policy.residuals(actual, targets))
+            q, feasible_targets, boundary, diagnostics = self.target_policy.select(
+                raw_targets, q, actual, clipped, result.success or clipped_fit)
+            self.target_diagnostics.update(diagnostics)
+            if self.target_policy.enabled:
+                # A pose projection is intentional, not permission to use an
+                # unchecked IK result. Collisions never become boundary points.
+                self._safe_configuration(q)
+                check_budget()
             # Immutable display snapshot is the full IK result, before rate limiting.
             preview_q=q.copy()
             # Slew from the last command while bounding outstanding physical travel
@@ -303,8 +335,11 @@ class TianyiIK(ArmWorkspace):
             q,self.last_advance_scale=self._safe_advance(measured,previous,q,check_budget)
             self.last_ms=(time.monotonic()-begin)*1000
             if self.last_ms>100:raise ValueError('ik_timeout')
+            self.target_policy.boundary = boundary
             self.visualization_sample={'monotonic_ns':time.monotonic_ns(),
-                'targets':[t.copy() for t in targets], 'ik_q':preview_q}
+                'targets':[t.copy() for t in raw_targets], 'ik_q':preview_q,
+                'feasible_targets':[t.copy() for t in feasible_targets],
+                'target_state':diagnostics['state']}
             self.last_valid_visualization=self.visualization_sample
             return q.tolist()
 

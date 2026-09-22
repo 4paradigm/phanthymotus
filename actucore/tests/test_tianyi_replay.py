@@ -206,6 +206,7 @@ def test_offline_analysis_preserves_mapping_across_ik_failure(tmp_path,monkeypat
     class Solver(Geometry):
         profile={'controller_to_palm':{s:{'position':[0,0,0],'orientation':[0,0,0,1]} for s in ('left','right')}}
         def __init__(self,path):pass
+        def reset_target_state(self):pass
         def palms(self,q):
             values=[np.eye(4),np.eye(4)]
             for i,t in enumerate(values):t[0,3]=q[i*7]
