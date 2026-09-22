@@ -55,7 +55,9 @@ def test_failed_atomic_write_retains_old_config(cfg,monkeypatch):
     before=card._config_file.read_bytes()
     def fail(*args):raise OSError('disk full')
     monkeypatch.setattr('teleop.plugin.os.replace',fail)
-    assert card.dispatch('teleop',{'action':'config','position_scale':.7})['error']=='disk full'
+    reply=card.dispatch('teleop',{'action':'config','position_scale':.7})
+    assert reply['error']==reply['code']=='teleop_io_error'
+    assert 'disk full' not in json.dumps(reply)
     assert card.cfg['position_scale']==.65 and card._config_file.read_bytes()==before
 
 

@@ -7,6 +7,7 @@ import secrets
 import threading
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -17,12 +18,141 @@ from .capture_server import CaptureWssServer, capture_certificate_base64
 from .protocol import TicketCodec, TicketVerifier
 from .rtc import RtcManager
 from .runtime import TeleopRuntime
+from .dispatch import RECOVERABLE_HOLD_CODES
 
 ACTIONS=['info','config','project_start','project_stop','start','stop','finish','pair_headset','revoke_headset','calibrate','pause','resume','self_test','open_pairing','approve_pairing','reject_pairing','disconnect_headset','record_start','record_stop','record_status','installation_info','create_invitation','revoke_invitation']
 
 
 class TeleopPlugin:
     PREFIX='teleop'
+
+    # Existing protocol/capture and local validation codes are public. Unknown
+    # exception text is never a code: it may contain a site path or credential.
+    _PUBLIC_ERRORS = frozenset("""
+        absolute_path_required arm_chain_not_under_torso arm_feedback_clock arm_feedback_stale
+        arm_joint_mapping arm_ns_stale arm_publish_failed artifact_digest_mismatch binding_mismatch
+        boot_mismatch calibrate_before_start calibrated_body_joints_changed
+        calibration_changed_during_load calibration_missing calibration_model_changed
+        calibration_requires_idle calibration_schema calibration_while_owned capsule_calibration
+        capture_assignment_mismatch capture_assignment_stale capture_auth_timeout capture_busy
+        capture_client_unsupported capture_conflict capture_credential_invalid capture_lease_missing
+        capture_message_invalid capture_mismatch capture_pairing_invalid capture_presence_timeout
+        capture_protocol_unsupported capture_stale capture_state_unavailable card_not_isolated_shadow
+        collision_calibration_missing collision_check_timeout combined_baseline_missing
+        combined_deadline combined_dispatch_fault combined_feedback_timeout combined_recording_duration
+        combined_schedule_late_no_fresh_input command_expired command_too_large
+        configuration_requires_idle control_interface_unavailable controller_offsets_required
+        dispatch_fault dispatch_prepare_failed dispatch_revoked dispatch_stop_unconfirmed
+        driver_binding_invalid driver_binding_required driver_calibration_invalid
+        driver_calibration_mismatch driver_calibration_missing driver_call_deadline
+        driver_eef_snapshot_invalid driver_execution_ack_timeout driver_fault
+        driver_feedback_ack_timeout driver_feedback_missing driver_feedback_stale_or_different_clock
+        driver_feedback_timeout driver_holding driver_invalid_lease driver_invalid_preview
+        driver_joints_missing driver_joints_stale driver_lease_lost driver_lease_rebased
+        driver_management_conflict driver_management_pending driver_mcp_error
+        driver_mcp_must_be_loopback driver_not_bound driver_not_owned driver_not_released
+        driver_preflight driver_profile_mismatch driver_protocol_mismatch driver_refused
+        driver_restarted driver_restarted_stop_unconfirmed driver_session_changed driver_topic_mismatch
+        dual_grip_required dual_targets_required duplicate_command_field epoch_mismatch evidence_backlog
+        evidence_flush_timeout evidence_write_failed evidence_writer_closed execution_binding_mismatch
+        execution_binding_required executor_calibration_mismatch
+        executor_restart_requires_confirmed_release executor_thread_stop_unconfirmed
+        external_motion_publishers_present feedback_thread_stop_unconfirmed feedback_unavailable
+        fence_mismatch finish_requires_connected_headset first_acceptance_disabled
+        first_acceptance_prerequisites_missing first_acceptance_requires_idle
+        fixed_baseline_requires_idle fixed_feedback_incomplete fixed_ns_stale frame_protocol_unsupported
+        frame_too_large g1_calibration_schema g1_collision_frame_missing g1_collision_geometry_missing
+        g1_collision_geometry_unsupported g1_collision_links_missing g1_collision_mesh_changed
+        g1_hand_geometry_unverified g1_head_yaw_requires_unit_scale g1_joint_count g1_joint_index
+        g1_joint_nonfinite g1_joint_order g1_locked_joint_limit g1_locked_joint_mapping
+        g1_mapping_version g1_motion_control_not_migrated hand_limit hand_ns_stale hand_profile_limit
+        hand_publish_failed hands_enabled_boolean_required hardware_publishers_unavailable
+        hold_not_resumable hold_recovery_exhausted ik_motion_deadline ik_not_converged
+        ik_target_unreachable ik_timeout input_effector_binding_mismatch invalid_artifact
+        invalid_assignment_id invalid_audience invalid_capture_id invalid_command_fields
+        invalid_command_mac invalid_control invalid_control_descriptor invalid_control_interface
+        invalid_control_route invalid_control_route_payload invalid_deadline invalid_encoding
+        invalid_epoch invalid_execution_rounds invalid_fence invalid_finite_shape invalid_hands_enabled
+        invalid_hold_reason invalid_joint_limits invalid_json invalid_jti invalid_key invalid_lease
+        invalid_length invalid_management_deadline invalid_management_request invalid_mode
+        invalid_namespace invalid_negotiation_grace invalid_numeric_type invalid_pairing_id
+        invalid_quaternion invalid_release_reason invalid_report_round_count invalid_rtc_binding
+        invalid_sdp invalid_session_id invalid_shadow_feedback_source invalid_signaling_offer
+        invalid_signature invalid_target_ttl invalid_ticket_ttl invalid_torso_box invalid_type
+        invalid_value invitation_expired_or_invalid invitation_request_invalid
+        joint_feedback_out_of_bounds joint_limit joint_publish_failed joint_velocity_limit
+        joints_feedback_requires_g1_shadow lease_unresolved_do_not_restart legacy_motion_active
+        legacy_motion_pending live_acceptance_missing local_dds_profile_mismatch local_dds_unavailable
+        malformed_ticket management_cancel_queue_full management_cancelled management_key_missing
+        management_lease_released management_owner_changed management_release_unconfirmed
+        management_request_expired management_retry_exhausted mapping_baseline_missing
+        mapping_not_calibrated mapping_profile_mismatch message_too_large missing_field missing_identity
+        mode_not_configured motion_already_owned motion_control_execution_binding_mismatch
+        motion_control_input_topic_mismatch motion_control_requires_arms_only
+        motion_control_start_cancelled motion_control_stopped motion_control_thread_stop_unconfirmed
+        motion_deadline motion_not_armed motion_owned_by_teleop multiple_unresolved_journals
+        neutral_outside_limits no_continuous_visible_segment non_finite onboarding_endpoint_unavailable
+        operator_action_invalid operator_busy operator_cancelled operator_connection_changed
+        operator_profile_unsupported operator_request_conflict operator_request_history_full
+        operator_request_invalid operator_requires_release operator_session_disabled
+        operator_session_still_owned operator_start_cancelled origin_positioning_budget out_of_range
+        output_not_initialized pairing_busy pairing_fingerprint_mismatch pairing_request_changed
+        pairing_request_expired pairing_request_invalid pairing_window_closed pause_unconfirmed
+        position_scale power_ns_stale prepare_failed preview_cannot_execute preview_paused
+        preview_release_unconfirmed preview_requires_idle preview_revoked_by_execution
+        preview_while_owned project_binding_changed project_not_armed project_stop_before_config
+        project_stop_busy project_stop_required project_stop_timeout quaternion_not_unit record_duration
+        record_requires_tianyi_shadow recorded_feedback_stale recorded_origin_joint_limit
+        recorded_origin_missing recorded_origin_not_reached recorded_origin_stale recording_active
+        recording_changed recording_frame_count recording_geometry_changed recording_id_required
+        recording_incomplete recording_path recording_profile_changed recovery_feedback_not_ready
+        recovery_identity_missing recovery_requires_confirmed_idle recovery_stop_not_confirmed
+        recovery_waiting_for_adapter regular_file_required release_before_binding
+        release_before_calibrating release_before_config replay_cache_full
+        replay_recovery_journal_missing replay_release_unconfirmed return_cancelled
+        return_connection_lost return_driver_fault return_failed return_feedback_invalid
+        return_geometry_timeout return_hold_unconfirmed return_in_progress return_management_timeout
+        return_requires_calibrated_arms_only return_requires_live return_timeout
+        return_waiting_for_adapter revoke_existing_headset_first robot_not_stopped
+        robot_safety_not_ready round_deadline rtc_cannot_renew_lease rtc_control_requires_card
+        rtc_not_ready saved_configuration_invalid schema sdp_mismatch sequence_not_increasing
+        service_closed session_expired session_inactive session_mismatch session_paused
+        shadow_feedback_has_no_execution_authority stale_capture_generation stale_epoch
+        stale_rtc_generation stale_sequence stale_session starting_joint_limit starting_pose_changed
+        state_directory_required stop_not_confirmed stop_unconfirmed teleop_io_error teleop_not_ready
+        teleop_requires_domain_42 teleop_requires_robot_namespace teleop_session_active
+        teleop_single_instance teleop_stop_failed teleop_timeout tianyi_joint_order_mismatch tianyi_only
+        ticket_expired ticket_not_yet_valid ticket_replayed torso_frame_missing torso_sphere_calibration
+        trace_already_active trace_control_requires_idle tracking_mismatch trajectory_code_changed
+        trajectory_exceeds_round_budget trajectory_profile_changed trigger_binding_missing
+        triggers_not_neutral unexpected_movable_arm_joint unknown_action unknown_config unknown_field
+        unknown_finish_operation unknown_robot_profile unsupported_action unsupported_mode
+        unsupported_version urdf_required velocity velocity_limit_must_be_in_0_1_5
+        visualization_invalid_q visualization_unavailable waist_mapping_mismatch
+    """.split()) | RECOVERABLE_HOLD_CODES
+
+    def _public_error(self, error):
+        from .capture import CaptureError
+        from .protocol import ProtocolError
+        if error is None:
+            return None
+        candidate = error.code if isinstance(error, (ProtocolError, CaptureError)) else str(error)
+        if not isinstance(candidate, str):candidate=''
+        if candidate in self._PUBLIC_ERRORS:
+            return candidate
+        if candidate.startswith('invalid_config:'):
+            field = candidate.partition(':')[2]
+            if field in self.get_tools()[0]['configSchema']['properties']:
+                return 'invalid_config:' + field
+        code = ('teleop_timeout' if isinstance(error, TimeoutError) else
+                'teleop_io_error' if isinstance(error, OSError) else 'teleop_not_ready')
+        if isinstance(error, BaseException):
+            # Keep failure class/errno available locally without logging a URL,
+            # credential-bearing exception message, or site filename.
+            errno = getattr(error, 'errno', None)
+            logging.getLogger(__name__).warning('teleop failure code=%s type=%s errno=%s',
+                code, type(error).__name__, errno if type(errno) is int else None)
+        return code
 
     def __init__(self,plugin_cfg,executor):
         self.cfg=copy.deepcopy(plugin_cfg);self.executor=executor
@@ -197,7 +327,7 @@ class TeleopPlugin:
                     self._capture_status=await self.capture.status()
                     self._enrollment_status=self.server.enrollment.status()
                     self.link.show(self.info())
-                except Exception as exc:self.error=str(exc)
+                except Exception as exc:self.error=self._public_error(exc)
                 await asyncio.sleep(0.1)
         self._status_future=asyncio.run_coroutine_threadsafe(publish_status(),self._loop)
 
@@ -206,9 +336,9 @@ class TeleopPlugin:
         configuration={k:copy.deepcopy(self.cfg.get(k,v.get('default'))) for k,v in properties.items()
                        if k in self.cfg or 'default' in v}
         project={'armed':self._project_armed,'stopping':self._project_stopping,
-                 'error':self._project_error,'driver_binding':copy.deepcopy(self._project_binding)}
+                 'error':self._public_error(self._project_error),'driver_binding':copy.deepcopy(self._project_binding)}
         if not self.runtime:
-            return {'state':'fault' if self.error else 'idle','reason':self.error,
+            return {'state':'fault' if self.error else 'idle','reason':self._public_error(self.error),
                     'mode':self.cfg.get('mode','shadow'),'output_active':False,
                     'topic_out':self.get_tools()[0]['topic_out'],'configuration':configuration,'project':project}
         result=self.runtime.status()
@@ -219,11 +349,13 @@ class TeleopPlugin:
                          'active_shadow':'active','active_live':'active','released':'idle','paused':'hold'}.get(result['state'],result['state'])
         result['topic_out']=self.get_tools()[0]['topic_out']
         result['capture']=dict(self._capture_status)
-        result['host_error']=self.error
+        result['host_error']=self._public_error(self.error)
         result['enrollment']=copy.deepcopy(self._enrollment_status)
         result['calibrated']=self._calibrated()
         result['operator']={**(dict(self.operator_commands.status) if self.operator_commands else {}),
                             'armed':self._project_armed}
+        if result['operator'].get('error'):
+            result['operator']['error']=self._public_error(result['operator']['error'])
         result['recording']=self.recorder.status() if self.recorder else {'state':'idle'}
         try:
             result['driver_feedback']=self.link.feedback()
@@ -233,7 +365,7 @@ class TeleopPlugin:
         except ValueError as exc:
             result['driver_feedback']=None
             result['driver_feedback_fresh']=False
-            result['driver_feedback_error']=str(exc)
+            result['driver_feedback_error']=self._public_error(exc)
         return result
 
     def _validate_configuration(self,values):
@@ -393,8 +525,8 @@ class TeleopPlugin:
                 self.error=None
                 return self.info()
         except Exception as exc:
-            self.error=str(exc)
-            return {'state':'error','error':str(exc),'code':getattr(exc,'code','teleop_not_ready')}
+            self.error=self._public_error(exc)
+            return {'state':'error','error':self.error,'code':self.error}
 
     def _headset_connected(self):
         connection=self.capture._connection if self.capture else None
@@ -444,9 +576,10 @@ class TeleopPlugin:
             self._operation_status('idle','project_stop')
             return {**result,'armed':False}
         except Exception as exc:
-            self._project_error=str(exc)
-            self._operation_status('error','project_stop',str(exc))
-            raise
+            from .protocol import ProtocolError
+            self._project_error=self._public_error(exc)
+            self._operation_status('error','project_stop',self._project_error)
+            raise ProtocolError(self._project_error,self._project_error) from None
         finally:self._project_stopping=False;self._operation_action=None
 
     def _finish_session(self,cancel,connected,*,deadline=None,stop_generation=None):
@@ -504,13 +637,15 @@ class TeleopPlugin:
                 self._operation_status(result.get('state','idle'),action)
                 return result
             except Exception as exc:
-                self._operation_status('error',action,str(exc))
-                raise
+                from .protocol import ProtocolError
+                code=self._public_error(exc)
+                self._operation_status('error',action,code)
+                raise ProtocolError(code,code) from None
             finally:self._operation_action=None
 
     def _operation_status(self,state,action,error=None):
         if self.operator_commands is not None:
-            self.operator_commands.set_status({'state':state,'action':action,'error':error})
+            self.operator_commands.set_status({'state':state,'action':action,'error':self._public_error(error)})
 
     def _cancel_operations(self):
         with self._cancel_lock:
@@ -640,35 +775,49 @@ class TeleopPlugin:
                 time.sleep(.02)
 
     def stop(self):
+        from .protocol import ProtocolError
         self._cancel_operations()
         with self._lock:
             self._closing=True
             errors=[]
-            if self.recorder:self.recorder.stop()
+            def attempt(callback):
+                try:return callback()
+                except Exception as exc:
+                    errors.append(self._public_error(exc))
+                    return None
+            def reject_failed_close():
+                if not errors:return
+                self.error=next((code for code in errors
+                    if code not in ('teleop_not_ready','teleop_io_error')), 'teleop_stop_failed')
+                raise ProtocolError(self.error,self.error) from None
+
+            if self.recorder:attempt(self.recorder.stop)
             if self.runtime:
-                try:self.runtime.close()
-                except Exception as exc:errors.append(str(exc))
+                ack=attempt(self.runtime.close)
+                if ack is not None and not ack.ok:
+                    errors.append(self._public_error(ack.code))
+            # Runtime/recording cleanup and Driver release have independent
+            # failure paths. A close exception must never skip the release.
             if self.adapter and (self.link.lease or getattr(self.link,'management_request',None)):
-                if not self._release_driver():
-                    # Keep the link and lease available for a later stop retry.
+                if not attempt(self._release_driver):
                     self.error='stop_unconfirmed'
-                    raise ValueError(self.error)
+                    raise ProtocolError(self.error,self.error) from None
             if self._loop and self._loop.is_running():
-                if self.server:
-                    try:self._run(self.server.close())
-                    except Exception as exc:errors.append(str(exc))
-                if getattr(self,'rtc',None):
-                    try:self._run(self.rtc.close_all())
-                    except Exception as exc:errors.append(str(exc))
+                if self.server:attempt(lambda:self._run(self.server.close()))
+                if getattr(self,'rtc',None):attempt(lambda:self._run(self.rtc.close_all()))
+                # Keep the loop available to retry a server/RTC close failure.
+                reject_failed_close()
                 async def cancel_tasks():
                     tasks=[t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
                     for task in tasks:task.cancel()
                     await asyncio.gather(*tasks,return_exceptions=True)
-                self._run(cancel_tasks())
+                attempt(lambda:self._run(cancel_tasks()))
+                reject_failed_close()
                 self._loop.call_soon_threadsafe(self._loop.stop)
                 self._thread.join(timeout=2)
-                self._loop.close()
-            if self.link:self.link.close()
+                attempt(self._loop.close)
+            reject_failed_close()
+            if self.link:attempt(self.link.close)
+            reject_failed_close()
             self.runtime=self.adapter=self.link=self.capture=self.server=None
             self._loop=self._thread=None
-            if errors:self.error=';'.join(errors)

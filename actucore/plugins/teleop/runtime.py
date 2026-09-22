@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from .descriptor import CAPABILITIES, PROFILE_ID, capability_digest
-from .dispatch import FinalDispatchArbiter, OutputAdapter, StopHandle, RECOVERABLE_HOLD_CODES, COLLISION_HOLD_CODES, IK_RETRY_CODES
+from .dispatch import AdapterAck, FinalDispatchArbiter, OutputAdapter, StopHandle, RECOVERABLE_HOLD_CODES, COLLISION_HOLD_CODES, IK_RETRY_CODES
 from .protocol import (
     ProtocolError,
     bind_rtc_frame_v1,
@@ -158,15 +158,14 @@ class TeleopRuntime:
             )
             self._watchdog_thread.start()
 
-    def close(self) -> None:
+    def close(self) -> AdapterAck:
+        """Revoke input and return the actual, retryable dispatch close receipt."""
         self._stop_event.set()
         thread = self._watchdog_thread
         if thread and thread is not threading.current_thread():
             thread.join(timeout=max(1.0, self._watchdog_interval * 4))
         with self._transition_lock:
             with self._lock:
-                if self._closed:
-                    return
                 self._closed = True
                 if self._authority_valid:
                     self._generation += 1
@@ -179,6 +178,7 @@ class TeleopRuntime:
             if not ack.ok:
                 with self._lock:
                     self._latch_dispatch_fault_locked(ack.code)
+            return ack
 
     def prepare(
         self,

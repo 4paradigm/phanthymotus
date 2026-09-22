@@ -808,9 +808,27 @@ class FinalDispatchArbiter:
             return AdapterAck(False, "owner_cannot_self_close")
         with self._close_lock:
             unavailable_result: AdapterAck | None = None
+            retry_handle: StopHandle | None = None
             with self._condition:
                 if self._close_result is not None:
-                    return self._close_result
+                    if (self._close_result.ok or self._startup_thread.is_alive()
+                            or self._worker is not None and self._worker.is_alive()):
+                        return self._close_result
+                    # Failed cleanup may be retried only after its owner exits.
+                    # Keep input permanently closed; this owner can only stop
+                    # and close, never consume an old motion mailbox or re-arm.
+                    self._generation += 1
+                    request = StopRequest(self._generation, 'service_close_retry',
+                        self._clock(), self._clock() + self._stop_timeout)
+                    retry_handle = StopHandle(request,
+                        safety_deadline=self._safety_clock() + self._stop_timeout)
+                    self._mailbox = None
+                    self._authority_digest = self._session_generation = None
+                    self._adapter_close_ack = None
+                    self._stop_acknowledged = False
+                    self._state = 'closing'
+                    self._worker = threading.Thread(target=self._retry_close_owned,
+                        args=(retry_handle,), daemon=True, name='teleop-close-retry')
                 worker = self._worker
                 if worker is None:
                     code = self._fault_code or "dispatch_unavailable"
@@ -828,11 +846,15 @@ class FinalDispatchArbiter:
                     self._startup_owner_done.wait(timeout)
                 return unavailable_result
 
-            handle = self.trip(
-                "service_close",
-                target_state="closing",
-                retain_authority=False,
-            )
+            if retry_handle is not None:
+                handle = retry_handle
+                worker.start()
+            else:
+                handle = self.trip(
+                    "service_close",
+                    target_state="closing",
+                    retain_authority=False,
+                )
             stop_ack = self.wait_safe(handle, timeout)
             with self._condition:
                 self._closed = True
@@ -858,6 +880,12 @@ class FinalDispatchArbiter:
                     self._fault_code = self._fault_code or result.code
                     self._stop_acknowledged = False
                 return result
+
+    def _retry_close_owned(self, handle: StopHandle) -> None:
+        try:
+            self._perform_stop(handle)
+        finally:
+            self._close_adapter_owned()
 
     def _worker_loop(self) -> None:
         try:

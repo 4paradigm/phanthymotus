@@ -195,3 +195,23 @@ def test_stop_failure_keeps_retry_state_and_blocks_new_start(card,monkeypatch):
     assert c.dispatch('teleop',{'action':'project_stop'})['return_completed']
     assert c._project_error is None
     assert c.dispatch('teleop',{'action':'project_start','driver_binding':BINDING})['armed']
+
+
+def test_project_and_operator_failures_do_not_escape_into_public_status(card, monkeypatch):
+    c,_ = card
+    c.dispatch('teleop', {'action':'project_start', 'driver_binding':BINDING})
+    def fail(*args, **kwargs):raise OSError('private-site/path password=not-public')
+    monkeypatch.setattr(c, '_finish_session', fail)
+    reply = c.dispatch('teleop', {'action':'project_stop'})
+    assert reply['error'] == 'teleop_io_error' and not reply.get('authority_released')
+    assert c.info()['project']['error'] == 'teleop_io_error'
+    assert c.operator_commands.status['error'] == 'teleop_io_error'
+    monkeypatch.setattr(c, '_operator_execute_locked', fail)
+    from teleop.protocol import ProtocolError
+    with pytest.raises(ProtocolError, match='^teleop_io_error$'):
+        c._operator_execute('finish', threading.Event(), lambda:True)
+    assert c.operator_commands.status['error'] == 'teleop_io_error'
+    def bad_feedback():raise ValueError('http://user:secret@internal/path')
+    monkeypatch.setattr(c.link, 'feedback', bad_feedback)
+    assert c.info()['driver_feedback_error'] == 'teleop_not_ready'
+    assert c.info()['driver_feedback_fresh'] is False

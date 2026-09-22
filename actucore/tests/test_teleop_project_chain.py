@@ -315,9 +315,9 @@ def test_follow_release_regrip_and_end_waits_for_actual_neutral(project_chain, o
 def test_failed_return_is_not_success_and_same_project_stop_can_retry(project_chain):
     h = project_chain
     start_follow(h)
-    h.geometry_failure[0] = 'synthetic_return_collision'
+    h.geometry_failure[0] = 'torso_collision'
     failed = h.card.dispatch('teleop', {'action': 'project_stop'})
-    assert failed.get('error') == 'synthetic_return_collision', failed
+    assert failed.get('error') == 'torso_collision', failed
     assert failed.get('authority_released') is not True and failed.get('return_completed') is not True
     assert not h.card.info()['project']['armed']
     assert h.link.lease and h.gate.status()['hold_confirmed']
@@ -485,7 +485,7 @@ def test_real_core_project_orchestration_calls_real_plugin_and_driver(project_ch
         await asyncio.to_thread(start_follow, h)
         h.capture._connection = None
         if fail_return:
-            h.geometry_failure[0] = 'synthetic_return_collision'
+            h.geometry_failure[0] = 'torso_collision'
             assert await core_api._do_stop_project() is False
             assert core_config.main['core']['project_phase'] == 'stop_failed'
             assert ('teleop_executor', 'stop') not in calls

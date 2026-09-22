@@ -257,6 +257,7 @@ def test_host_failure_cleans_up_and_config_can_retry(monkeypatch,tmp_path):
     links=[]
     class HostLink(Link):
         def __init__(self,*args):super().__init__();self.closed=False;links.append(self)
+        def pause(self,deadline):raise AssertionError('Shadow must not call hardware pause')
         def close(self):self.closed=True
     monkeypatch.setattr(plugin,'DriverLink',HostLink)
     card=plugin.TeleopPlugin({'capture':{'state_file':str(tmp_path/'state'),
@@ -472,3 +473,111 @@ def test_card_configuration_readback_and_rejection_preserves_values():
         assert card.cfg['position_scale']==.5
     value=card.dispatch('teleop',{'action':'config','position_scale':.8})
     assert value['configuration']['position_scale']==.8
+
+
+def test_real_configuration_write_error_is_redacted_and_retryable(tmp_path):
+    from teleop.plugin import TeleopPlugin
+    blocked = tmp_path/'private-site-state'
+    blocked.write_text('not a directory')
+    card = TeleopPlugin({'mode':'shadow', 'position_scale':.5,
+        'capture':{'state_file':str(blocked/'capture.json')}}, None)
+    result = card.dispatch('teleop', {'action':'config', 'position_scale':.6})
+    assert result == {'state':'error', 'error':'teleop_io_error', 'code':'teleop_io_error'}
+    assert str(blocked) not in json.dumps(result) + json.dumps(card.info())
+    assert card.info()['reason'] == 'teleop_io_error' and card.cfg['position_scale'] == .5
+    assert card.runtime is None and not card._config_file.exists()
+    blocked.unlink();blocked.mkdir()
+    result = card.dispatch('teleop', {'action':'config', 'position_scale':.6})
+    assert result['state'] == 'idle' and result['configuration']['position_scale'] == .6
+    assert json.loads(card._config_file.read_text())['values']['position_scale'] == .6
+
+
+@pytest.mark.parametrize('kind, expected', [
+    ('protocol','session_inactive'), ('capture','invalid_capture_id'),
+    ('validation','calibrate_before_start'), ('timeout','teleop_timeout'),
+    ('io','teleop_io_error'), ('unexpected','teleop_not_ready'),
+    ('token_only','teleop_not_ready'), ('bad_code','teleop_not_ready'),
+    ('bad_code_type','teleop_not_ready'),
+])
+def test_public_errors_keep_known_codes_without_exception_details(monkeypatch, kind, expected):
+    from teleop.plugin import TeleopPlugin
+    from teleop.capture import CaptureError
+    detail = 'https://user:credential@private-host/private/path?token=secret'
+    errors = {'protocol':ProtocolError('session_inactive', detail),
+        'capture':CaptureError('invalid_capture_id'), 'validation':ValueError('calibrate_before_start'),
+        'timeout':TimeoutError(detail), 'io':OSError(detail), 'unexpected':RuntimeError(detail),
+        'token_only':ValueError('secret_token_0123456789'), 'bad_code':CaptureError(detail), 'bad_code_type':CaptureError(['secret'])}
+    card = TeleopPlugin({}, None)
+    def fail():raise errors[kind]
+    monkeypatch.setattr(card, '_ensure_host', fail)
+    reply = card.dispatch('teleop', {'action':'calibrate'})
+    assert reply == {'state':'error', 'error':expected, 'code':expected}
+    assert card.info()['reason'] == expected
+    assert 'credential' not in json.dumps(reply) + json.dumps(card.info())
+
+
+def test_close_failure_prevents_configuration_success_then_allows_retry(tmp_path):
+    from teleop.plugin import TeleopPlugin
+    card = TeleopPlugin({'mode':'shadow', 'position_scale':.5,
+        'capture':{'state_file':str(tmp_path/'capture.json')}}, None)
+    calls = []; failing = [True]
+    def fail_close():
+        calls.append('close')
+        if failing[0]:raise OSError('private-site-path credential=secret')
+    card.runtime = SimpleNamespace(status=lambda:{'authority_valid':False}, close=fail_close)
+    card.link = SimpleNamespace(lease=None, close=lambda:calls.append('link_close'))
+    reply = card.dispatch('teleop', {'action':'config', 'position_scale':.6})
+    assert reply == {'state':'error', 'error':'teleop_stop_failed', 'code':'teleop_stop_failed'}
+    assert calls == ['close'] and card.runtime is not None and card.link is not None
+    assert card.cfg['position_scale'] == .5 and not card._config_file.exists()
+    assert card.error == 'teleop_stop_failed'
+    # Retry closes the same failed resource; no lease or target is restored.
+    failing[0] = False
+    reply = card.dispatch('teleop', {'action':'config', 'position_scale':.6})
+    assert reply['state'] == 'idle' and reply['configuration']['position_scale'] == .6
+    assert card.runtime is None and card.link is None
+    assert calls == ['close','close','link_close']
+
+
+@pytest.mark.parametrize('code', ['arm_ns_stale','power_ns_stale','fixed_ns_stale','hand_ns_stale',
+    'hold_not_resumable','invalid_lease','robot_not_stopped','management_request_expired'])
+def test_driver_recovery_codes_survive_public_redaction(monkeypatch, code):
+    from teleop.plugin import TeleopPlugin
+    card=TeleopPlugin({}, None)
+    def fail():raise ValueError(code)
+    monkeypatch.setattr(card, '_ensure_host', fail)
+    result=card.dispatch('teleop', {'action':'calibrate'})
+    assert result['error']==result['code']==code
+    assert card.info()['reason']==code
+
+
+@pytest.mark.parametrize('error, code', [(TimeoutError('private password=secret'), 'teleop_timeout'),
+    (ProtocolError('dispatch_stop_unconfirmed','private path'), 'dispatch_stop_unconfirmed')])
+def test_close_failure_preserves_timeout_and_unconfirmed_receipts(error, code):
+    from teleop.plugin import TeleopPlugin
+    card=TeleopPlugin({}, None)
+    def fail():raise error
+    card.runtime=SimpleNamespace(close=fail)
+    with pytest.raises(ProtocolError) as result:card.stop()
+    assert result.value.code==str(result.value)==card.error==code
+    assert card.runtime is not None
+
+
+@pytest.mark.parametrize('failing_component', ['runtime','recorder'])
+@pytest.mark.parametrize('released', [True, False])
+def test_close_error_still_attempts_driver_release_and_keeps_retry_state(monkeypatch, failing_component, released):
+    from teleop.plugin import TeleopPlugin
+    card=TeleopPlugin({}, None)
+    calls=[]
+    def close(name):
+        calls.append(name)
+        if name==failing_component:raise OSError('private/site token=secret')
+    card.recorder=SimpleNamespace(stop=lambda:close('recorder'))
+    card.runtime=SimpleNamespace(close=lambda:close('runtime'))
+    card.adapter=object()
+    card.link=SimpleNamespace(lease={'test':'only'},close=lambda:close('link'))
+    monkeypatch.setattr(card,'_release_driver',lambda:(calls.append('release') or released))
+    with pytest.raises(ProtocolError) as result:card.stop()
+    assert result.value.code==('teleop_stop_failed' if released else 'stop_unconfirmed')
+    assert calls==['recorder','runtime','release']
+    assert card.runtime is not None and card.link is not None

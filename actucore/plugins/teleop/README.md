@@ -2,7 +2,7 @@
 
 `teleop` 是普通 ActuCore 内的一张卡片。天轶的日常流程是：**在 Canvas 建立 teleop → motion_control → arm 三卡连线 → 安装并配对 PICO → 开启智能控制 → 在 PICO 开始遥操 → 双握把控制 → 在 PICO 结束或关闭智能控制收臂**。Canvas 负责连线、配置和项目权限；PICO 提供双手柄输入、透视画面及就地操作按钮。日常使用不需要后端脚本。
 
-此前天轶双臂已完成实体 PICO 跟随、松握把保持、恢复与结束收臂的现场验证；这些是旧操作链路的证据。本轮三卡链、Driver IK/收臂、安装邀请和已配对自动连接已完成源码与离线验证，并在天轶禁执行部署下验证真实关节反馈、EEF 求解及 ActuCore 显示数据回传；尚未完成 PICO 浏览器安装、实体渲染或新版真机动作验收。灵巧手、其他机型及长期稳定性不因此视为通过；北京 G1 的展示与真实运动验收单独记录。
+此前天轶双臂已完成实体 PICO 跟随、松握把保持、恢复与结束收臂的现场验证；这些是旧操作链路的证据。本轮已验证真实关节反馈、EEF 求解、ActuCore 显示回传及 Canvas 三卡 Shadow 启停。2026-09-23 经用户批准，通过 ADB 将实体北京 PICO 迁移到 release 0.3.18，邀请预填、一键配对、冷启动自动重连，以及透视、按钮和静态模型显示通过；尚未完成 PICO 浏览器安装、手柄动态模型或新版真机动作验收。灵巧手、其他机型及长期稳定性不因此视为通过；北京 G1 的展示与真实运动验收单独记录。
 
 ## 先找到卡片
 
@@ -123,6 +123,8 @@ JetPack 6.1 的普通 ActuCore 镜像自动包含遥操依赖，沿用 `deploy/b
 将 [配置示例](config.example.yaml) 的 `plugins.teleop` 合入现有配置，保留其他插件。新路径把控制模型/标定挂到 Driver；ActuCore 仍须提供 TLS、配对状态、管理密钥与 DDS 文件的挂载；标准 service 片段尚未自动生成全部遥操挂载，不能只打开 `enabled` 就宣称部署完成。`/deploy/dds-local.xml` 必须和宿主挂载的 DDS profile 一致。Core 的 `TELEOP_MANAGEMENT_URL` 指向共享的本机 15730 MCP，管理凭据只由 Core／ActuCore 持有。
 
 ActuCore 启动时检查站点资料。缺少或无效时，不注册遥操工具，VLA 仍正常注册；`tools/list` 的 `_meta.required_site_config` 及直接 `teleop` 的 `info` 返回缺失字段和错误码，不暴露路径、密钥或证书内容。检查包含管理密钥、WSS 证书/域名/私钥、可写状态目录和必要依赖；legacy 另检查本地标定模型哈希。motion_control 后端缺少 Driver 模型时保留安装、配对和配置入口，Driver 拒绝标定/执行，不将其冒充就绪。Core 另行核对管理 URL 与共享密钥。补齐站点挂载后需要重启 ActuCore 重新注册；已就绪卡片的日常参数、配对和启停仍通过 Canvas/PICO 完成。站点检查不等于模型或停止行为的实物验收。
+
+运行异常只返回已知的协议与恢复错误码；底层文件、超时或未知异常分别归为 `teleop_io_error`、`teleop_timeout`、`teleop_not_ready`，不把路径、URL 或凭据带到页面和头显。本地日志保留异常类别与 errno。关闭时即使录制或运行时清理失败，仍尝试独立释放 Driver；释放未确认优先报告 `stop_unconfirmed`，其他清理失败保留资源供重试，不报告配置保存成功。 Runtime 的负向关闭回执同样视为失败；仅旧执行线程完全退出后重试停止和清理，不重放目标或重建运动会话。
 
 低频 MCP 操作包括 `info/config/project_start/project_stop/start/pause/resume/finish/stop`、配对、标定、自检及录制，按机型声明支持项。Core 将唯一连线解析出的 `driver_binding` 传给 `project_start`；它只设置内存权限，不直接调用 Driver 动作。`project_stop` 等待收臂及控制权释放，不将异步受理回执当作完成。
 
