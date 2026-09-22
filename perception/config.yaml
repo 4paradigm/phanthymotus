@@ -134,6 +134,26 @@ plugins:
     model: "yoloe-26s-seg"
     confidence: 0.3
     fps: 5
+    # ── 流式载荷的详略 ────────────────────────────────────────────────────
+    # 只管 topic 上那条流；一次性拍照识别（recognize / recognize_by_url）永远
+    # 发全量 —— 那个回复只被读一次，裁剪它省不下什么，而看不到画面的调用方
+    # 没有别的办法拿回像素框。
+    #
+    # 为什么值得裁：agent-core 把订阅话题的**整条消息**原样塞进 event_bus 当
+    # 事件文本（agent-core/src/topic_subscriber.py），所以发出去的每个字节都是
+    # 每一帧的 LLM 上下文字节。
+    #
+    # 像素框。关掉只剩中心点，下游想按目标区域去采样另一张对齐的图（典型是
+    # visual_depth 的深度图）就只能取中心一小块，也无从知道目标多大。33 B。
+    publish_bbox: true
+    # 颜色详略 off | name | full。
+    #   name（默认）  {"color": "dim muted azure", "brightness": 120.9}   27 B
+    #   full          原来那 12 个数 + 4 个标签，一字不差                 239 B
+    #   off           不发
+    # name 发的是**三元组**而不是 color_name：后者是前者的有损投影（它根本
+    # 不看饱和度，亮度 6 档也压成 3 档），而反过来可以无损还原。详见
+    # README.md § "vop 的流式载荷" 和 plugins/vop.py 的 color_triple 文档。
+    publish_color: name
     # NOTE: there is no `classes` key any more. The engine's open-vocabulary
     # class list is frozen when the engine is exported, so it cannot be changed
     # from here or at runtime; setting it makes the plugin refuse the config

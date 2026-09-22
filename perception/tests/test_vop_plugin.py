@@ -244,7 +244,45 @@ def test_objects_are_published_with_center_relative_coordinates():
 
     boxes = np.array([[100.0, 0.0, 200.0, 50.0]], dtype=np.float32)
     objects = node._extract_objects(boxes, np.array([0.9]), np.array([0]), (100, 200, 3))
+    # `bbox` rides along because publish_bbox defaults to on. No colour: this
+    # path is given a bare shape tuple rather than pixels.
+    assert objects == [{"name": "person", "position": [0.5, -0.5],
+                        "confidence": 0.9, "bbox": [100.0, 0.0, 200.0, 50.0]}]
+
+
+def test_bbox_can_be_switched_off():
+    plugin, executor = _plugin(model=_FakeModel())
+    node = _node_with(plugin, executor)
+    node._publish_bbox = False
+
+    boxes = np.array([[100.0, 0.0, 200.0, 50.0]], dtype=np.float32)
+    objects = node._extract_objects(boxes, np.array([0.9]), np.array([0]), (100, 200, 3))
     assert objects == [{"name": "person", "position": [0.5, -0.5], "confidence": 0.9}]
+
+
+def test_the_streamed_bbox_matches_the_one_shot_bbox():
+    """The two paths must not disagree about where the object is.
+
+    They compute the box from the same decode and round it the same way; this
+    pins that, because a consumer that samples a depth map by box has no way to
+    notice a half-pixel divergence and every way to be quietly wrong about it.
+    """
+    plugin, executor = _plugin(model=_FakeModel())
+    node = _node_with(plugin, executor)
+    boxes = np.array([[100.4, 0.0, 200.6, 50.0]], dtype=np.float32)
+    streamed = node._extract_objects(boxes, np.array([0.9]), np.array([0]), (100, 200, 3))
+    assert streamed[0]["bbox"] == [round(float(v), 1) for v in (100.4, 0.0, 200.6, 50.0)]
+
+
+def test_publish_settings_are_reported_by_info():
+    """An operator has to be able to see which level a card is actually on —
+    a trimmed payload and a broken detector look identical from downstream."""
+    plugin, executor = _plugin(model=_FakeModel())
+    _node_with(plugin, executor)
+    info = plugin.dispatch("vop", {"action": "info"})
+    instance = next(iter(info["instances"].values()))
+    assert instance["publish_bbox"] is True
+    assert instance["publish_color"] == "name"
 
 
 def test_class_ids_resolve_through_the_frozen_vocabulary():

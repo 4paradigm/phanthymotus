@@ -137,6 +137,11 @@ class ActuCoreBundle:
             self._plugins.append(VLAPlugin(plugins_cfg["vla"], executor))
             log.info("VLAPlugin loaded")
 
+        if plugins_cfg.get("navi", {}).get("enabled", False):
+            from plugins.navi import NaviPlugin
+            self._plugins.append(NaviPlugin(plugins_cfg["navi"], executor))
+            log.info("NaviPlugin loaded")
+
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 

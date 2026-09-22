@@ -448,13 +448,54 @@ def _slim_event_text(text: str) -> str:
         if key in data:
             del data[key]
             changed = True
-    # ACP 完成事件：去掉 result 中的冗余内容（LLM 已知自己发出了什么）
+    # ACP 完成事件：成功时 result 基本是回声（LLM 知道自己发出了什么），去掉；
+    # **失败时留着** —— 见 `_slim_acp_result`。
     if data.get('type') == 'action_complete' and 'result' in data:
-        del data['result']
+        slimmed = _slim_acp_result(data.get('status'), data['result'])
+        if slimmed is None:
+            del data['result']
+        else:
+            data['result'] = slimmed
         changed = True
     if not changed:
         return text
     return _json.dumps(data, ensure_ascii=False)
+
+
+# 一条失败原因能有多长。超了就截断并写明截了 —— 不写明，LLM 会把半句话当成全部。
+_ACP_RESULT_CHARS = 600
+
+# 成功时也值得留的那几个：它们是**量**，不是回声。LLM 发出的是「去 A」，回来的
+# 「走了 12.4 m、用了 31 秒」它猜不到，而下一步要不要调整节奏就看这个。
+_ACP_KEEP_ON_SUCCESS = ('elapsed_s', 'distance_m', 'duration_s')
+
+
+def _slim_acp_result(status, result):
+    """送进 LLM 的那份 `result`。返回 None 表示整块去掉。
+
+    **失败的那一份必须原样留下。** 原先这里无条件 `del data['result']`，理由写的是
+    「LLM 已知自己发出了什么」—— 对回声字段成立，对 `reason` 不成立，而 `reason` 恰恰
+    是它唯一不可能知道的东西。于是真机上一次导航失败送到 LLM 面前就只剩
+
+        {"type": "action_complete", "action_id": "navi_…", "status": "failed"}
+
+    「目标丢失」和「被挡住十几秒动不了」在这行字里长得一模一样，而这两件事该做的
+    下一步完全相反：前者要转头重新找，后者要换条路或者叫人。驱动一直把原因放在
+    `result.reason` 里，是这一步把它扔了。
+
+    不按字段名挑，因为每个驱动的 result 形状都不一样 —— 挑一份名单出来，等于把某一家
+    的 schema 焊进这里，而漏掉的那家会**静默**地少一条原因。只限长度。
+    """
+    if not isinstance(result, dict) or not result:
+        return None
+    if str(status or 'completed') == 'completed':
+        kept = {k: result[k] for k in _ACP_KEEP_ON_SUCCESS if k in result}
+        return kept or None
+    text = _json.dumps(result, ensure_ascii=False)
+    if len(text) <= _ACP_RESULT_CHARS:
+        return result
+    return {'truncated': f'result 超过 {_ACP_RESULT_CHARS} 字，以下为前半部分',
+            'head': text[:_ACP_RESULT_CHARS]}
 
 
 def _format_priority_batch(events: list[dict]) -> str:
