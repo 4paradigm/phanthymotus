@@ -50,10 +50,117 @@ def _state(target="chair", **over):
     return state
 
 
+class Sim:
+    """A world with one target in it, and a robot that does what it is told.
+
+    Hand-written sequences of bearings describe a target that teleports, and
+    since the tracker went in it **correctly refuses to believe them** — a jump
+    of 1 m in 100 ms is 10 m/s, which is not a chair. Several tests here were
+    quietly passing for that reason: the assertion held because the track had
+    coasted, not because the control law did anything.
+
+    So the target is placed in the world and the robot is integrated with the
+    twist the policy actually emitted. Two things follow that matter more than
+    the tidiness: rotation genuinely moves the target across the frame (which is
+    the whole premise of the ego-motion compensation), and the approach
+    converges or fails to for real reasons.
+
+    The kinematics here are written independently of `track._predict` — world
+    pose forward, rather than body-frame inverse — so a sign error in one does
+    not cancel against the other.
+    """
+
+    def __init__(self, range_m=3.0, bearing=0.0, config=None, velocity=(0.0, 0.0),
+                 confidence=0.9, name="chair"):
+        self.config = config or _cfg()
+        angle = bearing * self.config.half_fov_rad
+        # World frame starts aligned with the robot: x forward, y left.
+        self.target = np.array([range_m * np.cos(angle),
+                                -range_m * np.sin(angle)])
+        self.velocity = np.array(velocity, dtype=float)
+        self.pose = np.array([0.0, 0.0, 0.0])      # x, y, theta
+        self.confidence = confidence
+        self.name = name
+        self.visible = True
+
+    # ── what the robot can see ───────────────────────────────────────────────
+
+    def relative(self):
+        dx, dy = self.target - self.pose[:2]
+        theta = self.pose[2]
+        cos, sin = np.cos(-theta), np.sin(-theta)
+        bx = cos * dx - sin * dy
+        by = sin * dx + cos * dy
+        return float(np.hypot(bx, by)), float(np.arctan2(-by, bx))
+
+    def observe(self):
+        range_m, angle = self.relative()
+        depth = _depth(map_=_solid_depth(range_m))
+        if not self.visible:
+            return _detections(), depth
+        bearing = angle / self.config.half_fov_rad
+        return (_detections(_obj(name=self.name, x=bearing,
+                                 confidence=self.confidence)), depth)
+
+    # ── what the robot does about it ─────────────────────────────────────────
+
+    def apply(self, values, dt):
+        if values is not None:
+            theta = self.pose[2]
+            cos, sin = np.cos(theta), np.sin(theta)
+            vx, vy = values[0], values[1]
+            self.pose[0] += (cos * vx - sin * vy) * dt
+            self.pose[1] += (sin * vx + cos * vy) * dt
+            self.pose[2] += values[5] * dt
+        self.target += self.velocity * dt
+
+    def run(self, state, ticks, config=None, dt=0.1, odom=True):
+        """Closed loop. Returns the last decision."""
+        config = config or self.config
+        decision = None
+        for _ in range(ticks):
+            detections, depth = self.observe()
+            measured = None
+            if odom and decision is not None and decision.values is not None:
+                measured = {"vx": decision.values[0], "vy": decision.values[1],
+                            "wz": decision.values[5]}
+            elif odom:
+                measured = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+            decision = P.step(detections=detections, depth=depth, odom=measured,
+                              config=config, state=state, dt=dt)
+            self.apply(decision.values, dt)
+        return decision
+
+
+def seed(state, detections, depth=None, config=None, frames=None, dt=0.1):
+    """Give the tracker enough frames to confirm, without running the policy.
+
+    Almost every test in this file is about the **control law**, and the control
+    law only ever sees a confirmed track — a track needs `confirm_hits` frames
+    before it may move a robot at all. Seeding the tracker directly rather than
+    stepping the policy keeps every other piece of state (gates, arrival
+    patience, idle clock) untouched, so these stay single-tick tests of one
+    thing. Confirmation itself is tested in its own section below.
+    """
+    config = config or _cfg()
+    for _ in range(config.confirm_hits if frames is None else frames):
+        state.tracker.step(detections=detections, depth=depth,
+                           target=state.target, config=config,
+                           ego=(0.0, 0.0, 0.0), dt=dt)
+    return state
+
+
 def _step(detections=None, depth=None, odom=None, config=None, state=None,
           dt=0.1):
+    config = config or _cfg()
+    if state is None:
+        # Single-tick call: seed so the assertion is about the control law.
+        # A caller that supplies its own state is running a sequence and seeds
+        # it itself — seeding on every tick of a loop would keep resetting the
+        # very lifecycle the loop is exercising.
+        state = seed(_state(), detections, depth, config)
     return P.step(detections=detections, depth=depth, odom=odom,
-                  config=config or _cfg(), state=state or _state(), dt=dt)
+                  config=config, state=state, dt=dt)
 
 
 # ── silence is the safe answer ───────────────────────────────────────────────
@@ -164,10 +271,10 @@ def test_the_twist_is_six_wide_in_control_order():
 def test_arriving_emits_one_explicit_zero_then_goes_quiet():
     """Arriving is a success and should stop the chassis on a command, not on a
     watchdog timeout — the latter reads as a dropped link in the driver's log."""
-    state = _state()
     depth = _depth(map_=_solid_depth(0.8))
-    first = _step(detections=_detections(_obj(x=0.0, bbox=(0.4, 0.4, 0.6, 0.6))),
-                  depth=depth, state=state)
+    detections = _detections(_obj(x=0.0, bbox=(0.4, 0.4, 0.6, 0.6)))
+    state = seed(_state(), detections, depth)
+    first = _step(detections=detections, depth=depth, state=state)
     assert first.status == P.ARRIVED
     assert first.values == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
@@ -302,6 +409,7 @@ def test_the_search_falls_back_to_a_timeout_without_odometry():
 
 def test_seeing_the_target_again_resets_the_search():
     state = _state(missing_frames=20, searching_for_s=5.0, searched_rad=3.0)
+    seed(state, _detections(_obj(x=0.0)), _depth())
     _step(detections=_detections(_obj(x=0.0)), depth=_depth(), state=state)
     assert state.missing_frames == 0
     assert state.searching_for_s == 0.0
@@ -519,12 +627,11 @@ def test_the_three_distances_keep_their_ordering():
 def test_a_target_at_the_stop_distance_is_not_halted_by_itself():
     """The ordering above, exercised rather than asserted."""
     c = P.Config()
-    state = _state()
-    decision = _step(detections=_detections(_obj(x=0.0)),
-                     depth=_depth({"left": 5.0, "center": c.stop_distance_m,
-                                   "right": 5.0},
-                                  map_=_solid_depth(c.stop_distance_m)),
-                     config=c, state=state)
+    depth = _depth({"left": 5.0, "center": c.stop_distance_m, "right": 5.0},
+                   map_=_solid_depth(c.stop_distance_m))
+    detections = _detections(_obj(x=0.0))
+    state = seed(_state(), detections, depth, c)
+    decision = _step(detections=detections, depth=depth, config=c, state=state)
     assert decision.status == P.ARRIVED
 
 
@@ -570,7 +677,9 @@ def test_turning_counts_as_motion():
 
 def test_a_brief_blind_spell_does_not_fail():
     config = _cfg(idle_timeout_s=5.0)
-    state = _state()
+    state = seed(_state(), _detections(_obj(x=0.0)), _depth(), config)
+    # Shorter than max_coast_s: a brief blind spell is exactly what the coast
+    # is for, and the track has to survive it for this to test idleness at all.
     for _ in range(10):
         _step(detections=None, depth=_depth(), config=config, state=state, dt=0.1)
     decision = _step(detections=_detections(_obj(x=0.0)), depth=_depth(),
@@ -603,8 +712,8 @@ def test_failure_is_terminal_and_keeps_its_reason():
 def test_arriving_is_not_counted_as_idleness():
     """Arriving commands a zero on purpose; it is a success, not a stall."""
     config = _cfg(idle_timeout_s=0.2)
-    state = _state()
     depth = _depth(map_=_solid_depth(0.8))
+    state = seed(_state(), _detections(_obj(x=0.0)), depth, config)
     for _ in range(10):
         decision = _step(detections=_detections(_obj(x=0.0)), depth=depth,
                          config=config, state=state, dt=0.1)
@@ -666,9 +775,8 @@ def test_both_colour_shapes_produce_the_same_key():
 def test_a_target_straight_ahead_and_close_is_driven_towards_not_just_turned():
     """"I am right in front of it and all it does is turn." A hard gate on
     `align_tol` made vx zero for any wobble a standing person produces."""
-    state = _state()
     decision = _step(detections=_detections(_obj(x=0.18)),
-                     depth=_depth(map_=_solid_depth(4.0)), state=state)
+                     depth=_depth(map_=_solid_depth(4.0)))
     assert decision.status == P.APPROACHING
     assert decision.values[0] > 0
 
@@ -695,9 +803,8 @@ def test_a_target_near_the_edge_is_approached_more_slowly():
 def test_arrival_does_not_require_the_precision_the_drive_gate_does():
     """Arrival used to need |bearing| <= align_tol, which at 0.7 m asks a person
     to hold still. The position is what arriving is about."""
-    state = _state()
     decision = _step(detections=_detections(_obj(x=0.25)),
-                     depth=_depth(map_=_solid_depth(0.8)), state=state)
+                     depth=_depth(map_=_solid_depth(0.8)))
     assert decision.status == P.ARRIVED
 
 
@@ -718,14 +825,23 @@ def test_being_close_but_never_aligned_still_arrives_eventually():
 
 def test_leaving_the_stop_distance_resets_the_patience():
     """Otherwise a moment spent close early on would count towards arriving
-    much later, somewhere else entirely."""
-    config = _cfg(arrive_patience_s=1.0, arrive_align_tol=0.01)
-    state = _state()
-    _step(detections=_detections(_obj(x=0.3)), depth=_depth(map_=_solid_depth(0.8)),
-          config=config, state=state, dt=0.5)
-    assert state.close_for_s == 0.5
-    _step(detections=_detections(_obj(x=0.3)), depth=_depth(map_=_solid_depth(5.0)),
-          config=config, state=state, dt=0.5)
+    much later, somewhere else entirely.
+
+    The target walks away rather than teleporting: 1 m/s, which the tracker will
+    believe. At 8 m/s it would not, and rightly.
+    """
+    # No turning, so the heading never improves and arrival can only be decided
+    # by distance — which is what this test is about.
+    config = _cfg(arrive_patience_s=5.0, arrive_align_tol=0.01, wz_max=0.0)
+    sim = Sim(range_m=0.8, bearing=0.3, config=config, velocity=(1.0, 0.0))
+    state = seed(_state(), *sim.observe(), config)
+
+    sim.velocity = np.array([0.0, 0.0])
+    sim.run(state, ticks=5, dt=0.1)
+    assert state.close_for_s == pytest.approx(0.5)
+
+    sim.velocity = np.array([1.0, 0.0])
+    sim.run(state, ticks=15, dt=0.1)
     assert state.close_for_s == 0.0
 
 
@@ -856,19 +972,31 @@ def test_the_last_stretch_is_actually_walked():
     stop distance is genuinely reached."""
     config = _cfg()
     P.adopt_limits(config, _R1_DESC)
-    state = _state()
-    for distance in (3.0, 2.0, 1.6, 1.4, 1.25):
-        decision = P.step(detections=_detections(_obj(x=0.0)),
-                          depth=_depth(map_=_solid_depth(distance)),
-                          odom=None, config=config, state=state, dt=0.1)
-        assert decision.values[0] >= config.floor_vx, (
-            f"stalled at {distance} m, {config.floor_vx - decision.values[0]:.2f} "
-            "m/s below what the robot can execute")
+    sim = Sim(range_m=3.0, bearing=0.0, config=config)
+    state = seed(_state(), *sim.observe(), config)
 
-    arrival = P.step(detections=_detections(_obj(x=0.0)),
-                     depth=_depth(map_=_solid_depth(1.1)), odom=None,
-                     config=config, state=state, dt=0.1)
-    assert arrival.status == P.ARRIVED
+    stalls, last = [], None
+    for _ in range(80):
+        detections, depth = sim.observe()
+        # Odometry reports what the robot did last tick — feeding a constant
+        # zero here would trip the stuck detector on a robot that is walking.
+        odom = ({"vx": last[0], "vy": last[1], "wz": last[5]} if last
+                else {"vx": 0.0, "vy": 0.0, "wz": 0.0})
+        decision = P.step(detections=detections, depth=depth, odom=odom,
+                          config=config, state=state, dt=0.1)
+        last = decision.values
+        if state.arrived:
+            break
+        distance = sim.relative()[0]
+        if distance > config.stop_distance_m and (
+                decision.values is None or decision.values[0] < config.floor_vx):
+            stalls.append(round(distance, 2))
+        sim.apply(decision.values, 0.1)
+
+    assert state.arrived, f"never arrived; stopped at {sim.relative()[0]:.2f} m"
+    assert not stalls, (
+        f"commanded less than the robot can execute at {stalls} m — "
+        "the last stretch is exactly where k_fwd*(d-stop) falls under the floor")
 
 
 def test_the_yaw_axis_does_not_chatter_around_its_threshold():
@@ -877,16 +1005,20 @@ def test_the_yaw_axis_does_not_chatter_around_its_threshold():
     speed to nothing and back — the judder this branch is named for."""
     config = _cfg()
     P.adopt_limits(config, _R1_DESC)
-    state = _state()
+    # Parked on the threshold: the robot cannot turn, so the bearing stays put
+    # and the only thing that can move the gate is the gate itself.
+    config.wz_max = 0.0
+    config.floor_wz = 0.0
+    sim = Sim(range_m=3.0, bearing=config.align_tol, config=config)
+    state = seed(_state(), *sim.observe(), config)
 
-    # A bearing oscillating either side of align_tol, as a real detector does.
     turning = []
-    for tick in range(20):
-        bearing = config.align_tol + (0.01 if tick % 2 else -0.01)
-        decision = P.step(detections=_detections(_obj(x=bearing)),
-                          depth=_depth(map_=_solid_depth(3.0)), odom=None,
+    for _ in range(20):
+        detections, depth = sim.observe()
+        decision = P.step(detections=detections, depth=depth,
+                          odom={"vx": 0.0, "vy": 0.0, "wz": 0.0},
                           config=config, state=state, dt=0.1)
-        turning.append(decision.values[5] != 0.0)
+        turning.append(state.yaw_gate.on)
 
     switches = sum(1 for a, b in zip(turning, turning[1:]) if a != b)
     assert switches <= 1, f"the yaw axis toggled {switches} times in 2 seconds"
@@ -895,7 +1027,7 @@ def test_the_yaw_axis_does_not_chatter_around_its_threshold():
 def test_a_turn_ends_once_the_target_is_well_centred():
     """Hysteresis must not become a latch: the release threshold is real."""
     config = _cfg()
-    state = _state()
+    state = seed(_state(), _detections(_obj(x=0.5)), _depth(), config)
     P.step(detections=_detections(_obj(x=0.5)), depth=_depth(), odom=None,
            config=config, state=state, dt=0.1)
     assert state.yaw_gate.on

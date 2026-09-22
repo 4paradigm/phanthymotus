@@ -246,6 +246,14 @@ class NaviPlugin:
                                   "scope": "instance"},
                     "min_confidence": {"type": "number", "default": 0.35,
                                        "scope": "instance"},
+                    "sustain_confidence": {"type": "number", "default": 0.15,
+                                           "scope": "instance"},
+                    "confirm_hits": {"type": "integer", "default": 3,
+                                     "scope": "instance"},
+                    "confirm_window": {"type": "integer", "default": 5,
+                                       "scope": "instance"},
+                    "max_coast_s": {"type": "number", "default": 1.2,
+                                    "scope": "instance"},
                     "max_obs_age_ms": {"type": "number", "default": 500,
                                        "scope": "instance"},
                 },
@@ -420,7 +428,12 @@ class NaviPlugin:
                     "message": f"已订阅 {self._binding['objects']}，但还没收到任何"
                                f"检测结果 —— 确认 vop 卡片在运行且相机有画面"}
 
-        need = max(1, int(round(len(frames) * 0.6)))
+        # Same bar as the tracker's: something that would be *chased* after
+        # `confirm_hits` of `confirm_window` frames should be *listed* on the
+        # same evidence. The two used to disagree by an order of magnitude —
+        # ten frames to appear in this list, one frame to start driving a
+        # chassis — and the list was the strict one.
+        need = self._stability_bar(len(frames))
         items = policy_mod.stable_objects(frames, min_frames=need,
                                           config=self._config)
         out = []
@@ -498,14 +511,19 @@ class NaviPlugin:
             out["visible_now"] = visible
         return out
 
+    def _stability_bar(self, frames: int) -> int:
+        """How many of `frames` an object must appear in to count as really there."""
+        ratio = self._config.confirm_hits / max(1, self._config.confirm_window)
+        return max(1, min(frames, int(round(frames * ratio))))
+
     def _visible_keys(self) -> list:
         with self._obs_lock:
             frames = list(self._recent)
         if not frames:
             return []
-        need = max(1, int(round(len(frames) * 0.6)))
         return [o["key"] for o in policy_mod.stable_objects(
-            frames, min_frames=need, config=self._config)]
+            frames, min_frames=self._stability_bar(len(frames)),
+            config=self._config)]
 
     @staticmethod
     def _matches_anything(target: str, keys) -> bool:
@@ -566,7 +584,8 @@ class NaviPlugin:
             # Coerce to the field's own type. Blanket `float()` turned
             # `use_lateral` into 1.0 — truthy, so it worked, which is exactly
             # how a field ends up holding the wrong type for a year.
-            cast = bool if field.type in ("bool", bool) else float
+            cast = (bool if field.type in ("bool", bool)
+                    else int if field.type in ("int", int) else float)
             setattr(self._config, key, cast(value))
             changed[key] = getattr(self._config, key)
         return {"status": "configured", "config": changed}
@@ -601,6 +620,10 @@ class NaviPlugin:
                           "distance_m": decision.distance_m,
                           "bearing": decision.bearing}
                          if decision else None),
+                # **Coasting has to be visible here.** A robot walking towards a
+                # prediction and a robot walking towards something it can see
+                # produce identical commands, and only this says which is which.
+                "track": self._state.tracker.describe(),
                 "error": self._last_error,
             }
 
@@ -617,7 +640,9 @@ class NaviPlugin:
             out.append("只接了深度摘要，没有深度图 —— 距离按目标所在的三分之一"
                        "画面估计，精度明显变差")
         if not self._binding.get("odom"):
-            out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停")
+            out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停；"
+                       "且目标被遮挡时只能按**指令**（而非实测）推算它去了哪，"
+                       "dry_run、姿态被拒、死区归零都会让两者对不上")
         if self._running and not self._descriptor:
             out.append("没有接驱动的底盘命令卡片 —— 指令只发到话题上，"
                        "不会驱动任何硬件（想看它算什么的话，这是对的）")
@@ -753,9 +778,19 @@ class NaviPlugin:
                 self._depth_bands = depth_mod.bands_from_summary(payload)
                 self._depth_ms = now
             elif role == "odom":
+                # All three axes the policy uses, not just `vx`. The stuck
+                # detector only ever wanted forward speed, but the tracker
+                # compensates its prediction for the robot's whole twist —
+                # yaw most of all, since on a legged chassis turning is what
+                # moves a target across the frame fastest.
+                #
                 # `axis_of` returns None for an unmeasured axis rather than
-                # 0.0 — the stuck detector depends on the difference.
-                self._odom = {"vx": odom_mod.axis_of(payload, "vx")}
+                # 0.0, and both consumers depend on the difference: a robot
+                # that cannot answer "am I moving" must not look stopped, and
+                # one that cannot answer "am I turning" must not have its own
+                # rotation assumed to be zero.
+                self._odom = {axis: odom_mod.axis_of(payload, axis)
+                              for axis in ("vx", "vy", "wz")}
                 self._odom_ms = now
 
     def _on_depth_map(self, message):

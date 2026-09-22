@@ -8,6 +8,7 @@ opens a publisher, which is exactly the set of paths where a mistake produces
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -512,6 +513,13 @@ def _first_command(card):
     card._depth_bands = {"left": 5.0, "center": 5.0, "right": 5.0}
     card._depth_ms = 10 ** 13
     card._config.max_obs_age_ms = 10 ** 13
+    # The policy will not command anything from a track it has not confirmed,
+    # so the card has to tick a few times before there is a first command at
+    # all. Dropping the unconfirmed ticks keeps this about the descriptor echo.
+    for _ in range(card._config.confirm_hits):
+        message = card.next_command()
+        if message is not None:
+            return message
     return card.next_command()
 
 
@@ -538,6 +546,7 @@ def test_the_descriptor_is_not_echoed_on_every_command():
     card = _card()
     first = _first_command(card)
     assert "control_interface" in first
+    assert first["seq"] == 1, "the echo is keyed on the sequence number"
     assert "control_interface" not in card.next_command()
 
 
@@ -565,3 +574,46 @@ def test_a_clear_goal_does_not_have_to_list_first():
     params = _tool()["inputSchema"]["x-action-params"]
     assert "不必先" in params["navigate_to"]["description"]
     assert "甄别" in params["list_visible_objects"]["description"]
+
+
+# ── the tracker needs the whole twist, not just forward speed ────────────────
+
+def test_odometry_is_read_on_all_three_axes_the_policy_uses():
+    """`vx` alone was enough for the stuck detector, which is all there used to
+    be. The tracker compensates its prediction for the robot's whole twist, and
+    **yaw matters most**: on a legged chassis turning is what moves a target
+    across the frame fastest, and a yaw rate read as zero puts the prediction
+    the full rotation out within a few ticks."""
+    card = _card()
+
+    class _Message:
+        data = json.dumps({"schema": "motus.odom/1", "frame": "body",
+                           "stamp_ms": 1, "twist": [0.4, None, None, None, None, 1.0]})
+
+    card._on_string("odom", _Message())
+    assert card._odom == {"vx": 0.4, "vy": None, "wz": 1.0}
+
+
+def test_an_unmeasured_axis_stays_none_rather_than_zero():
+    """The whole reason motus.odom/1 forbids reporting 0.0 for an axis nobody
+    measured. A robot that cannot answer "am I turning" must not have its own
+    rotation assumed away — the tracker would then predict a stationary world
+    while the chassis spins."""
+    card = _card()
+
+    class _Message:
+        data = json.dumps({"schema": "motus.odom/1", "frame": "body",
+                           "stamp_ms": 1, "twist": [None] * 6})
+
+    card._on_string("odom", _Message())
+    assert card._odom == {"vx": None, "vy": None, "wz": None}
+
+
+def test_the_listing_bar_and_the_chasing_bar_agree():
+    """These used to disagree by an order of magnitude — ten frames to appear in
+    `list_visible_objects`, one frame to start driving a chassis — and the
+    *listing* was the strict one."""
+    card = _card()
+    ratio = card._config.confirm_hits / card._config.confirm_window
+    assert card._stability_bar(10) == round(10 * ratio)
+    assert card._stability_bar(1) == 1, "never ask for more frames than exist"

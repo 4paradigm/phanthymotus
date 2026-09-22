@@ -67,6 +67,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from .track import Tracker
+
 # Status values. `arrived` and `stuck` are terminal for one `navigate_to`;
 # the rest are things that happen on the way.
 APPROACHING = "approaching"
@@ -192,7 +194,65 @@ class Config:
     max_obs_age_ms: int = 500
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
+    # Confidence needed to **start** following something. Below this a
+    # detection may still sustain a track that already exists — see
+    # `sustain_confidence`.
     min_confidence: float = 0.35
+
+    # ── tracking (see track.py) ──────────────────────────────────────────
+    # A detection this dim may not create a track, but it may keep one alive if
+    # it lands inside the gate. Partial occlusion is exactly what makes a
+    # detector lose confidence, so throwing this band away throws away the
+    # frames the occlusion produced. ByteTrack's second association.
+    #
+    # It is only useful to the extent vop publishes that band at all. vop's own
+    # `confidence` defaults to 0.3, so the usable low band today is just
+    # [0.30, 0.35) — narrow but not empty. Widening it means lowering vop's
+    # threshold, which inflates the whole detection stream (vop has no
+    # `max_objects` cap and the payload reaches LLM context whole), so that is
+    # a measurement to take on hardware rather than a default to change here.
+    sustain_confidence: float = 0.15
+    # Three of the last five frames before a track may move the robot. The old
+    # behaviour was one frame to start and ten to give up — an asymmetry
+    # pointing the wrong way, since starting is the direction that moves a
+    # robot. (ByteTrack's default is two; this is deliberately stricter,
+    # because a wrong start here walks a humanoid at somebody.)
+    confirm_hits: int = 3
+    confirm_window: int = 5
+    # How long a confirmed track may be driven from prediction alone. A person
+    # walking across in front of the robot is under a second; past that the
+    # extrapolation is a guess, and OC-SORT measured how fast that guess rots —
+    # ten frames of coasting can accumulate an error the size of the object.
+    max_coast_s: float = 1.2
+    # Association gate, as a chi-square on 2 DOF. 9.21 is the 99% contour:
+    # generous, because there is only one track and the cost of dropping it is
+    # a spurious search.
+    gate_chi2: float = 9.21
+    # Added to the cost when a candidate's hue disagrees with the track's. A
+    # tie-break, never a rejection — see `_gate_cost`.
+    hue_mismatch_cost: float = 4.0
+    # What the *target* might do that the constant-velocity model does not
+    # cover. Our own motion is not in here: it is known, not guessed.
+    target_accel_std: float = 1.5      # m/s^2
+    range_std_m: float = 0.15
+    bearing_std_rad: float = 0.05
+    # Measurement noise multiplier when depth had no reading for the object and
+    # the track's own range had to stand in. Stops a bearing-only update from
+    # asserting a distance it never measured.
+    bearingless_std_factor: float = 6.0
+    initial_speed_std: float = 1.0     # m/s, before any velocity is observed
+    # Physical bound on what the *target* can be doing. See `_clamp_speed` —
+    # this is what stops a detection that jumped across the frame from being
+    # read as an object moving at 8 m/s.
+    max_target_speed: float = 2.5      # m/s
+    # How much less the tracker's predict step is trusted when our own motion
+    # is the command we sent rather than a measurement. See track._predict.
+    commanded_ego_noise_factor: float = 4.0
+    # Where to put a target the depth source has never measured, so that it can
+    # be tracked in bearing at all. Never used as a distance by the policy —
+    # `track.range_known` stays false and `distance` stays None, which is what
+    # keeps an assumed number out of the arrival test.
+    assumed_range_m: float = 3.0
 
     # Filled in at start from the downstream descriptor's `min_magnitude` — the
     # robot's own deadband, per axis, in its own units. Left at 0 there is no
@@ -244,6 +304,12 @@ class State:
     target: str = ""
     yaw_gate: Gate = field(default_factory=Gate)
     fwd_gate: Gate = field(default_factory=Gate)
+    tracker: Tracker = field(default_factory=Tracker)
+    # What we last asked the chassis to do. Stands in for odometry when none is
+    # wired: with a deadband the robot either does roughly the commanded speed
+    # or nothing at all, so the command is a serviceable proxy — much better
+    # than assuming we are stationary while turning at 1 rad/s.
+    commanded: tuple = (0.0, 0.0, 0.0)
     missing_frames: int = 0
     last_seen_side: float = 1.0          # +1 target was right, -1 it was left
     searching_for_s: float = 0.0
@@ -492,8 +558,42 @@ def _band_of(bearing: float) -> str:
 
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
-    return _account_idle(_decide(detections, depth, odom, config, state, dt),
-                         state, config, dt)
+    decision = _account_idle(_decide(detections, depth, odom, config, state, dt),
+                             state, config, dt)
+    # Remember what we asked for, so the tracker can compensate for our own
+    # motion on the next tick even with no odometry wired.
+    if decision.values is not None:
+        state.commanded = (decision.values[0], decision.values[1],
+                           decision.values[5])
+    else:
+        state.commanded = (0.0, 0.0, 0.0)
+    return decision
+
+
+def _ego_twist(odom, state: State):
+    """Our own motion, for the tracker's predict step. Returns (twist, measured).
+
+    Measured if odometry is wired, commanded otherwise. **Per axis**, because
+    `motus.odom/1` reports an unmeasured axis as `None` rather than 0 — a robot
+    that reports yaw rate but not lateral speed should have its yaw believed and
+    only its `vy` guessed.
+
+    `measured` is true only when **every** axis came from odometry. A partly
+    guessed twist is a guessed twist as far as the filter's confidence goes, and
+    erring towards "guessed" only makes it trust its own predictions less.
+    """
+    commanded = state.commanded
+    if not odom:
+        return commanded, False
+    out, measured = [], True
+    for index, name in enumerate(("vx", "vy", "wz")):
+        value = odom.get(name)
+        if value is None:
+            measured = False
+            out.append(commanded[index])
+        else:
+            out.append(float(value))
+    return tuple(out), measured
 
 
 def _decide(detections, depth, odom, config: Config, state: State,
@@ -502,10 +602,10 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     `detections` — vop's latest payload, or None if stale/absent.
     `depth`      — `{"map": ndarray|None, "bands": dict}`, or None.
-    `odom`       — `{"vx": float|None}` from motus.odom/1, or None if unwired.
-                   **`None` and `0.0` are different** and the stuck detector
-                   depends on it: a robot with no odometry must not look like a
-                   robot that has stopped.
+    `odom`       — `{"vx"|"vy"|"wz": float|None}` from motus.odom/1, or None if
+                   unwired. **`None` and `0.0` are different** and the stuck
+                   detector depends on it: a robot with no odometry must not
+                   look like a robot that has stopped.
     `dt`         — seconds since the previous tick.
     """
     if state.arrived:
@@ -518,6 +618,16 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if not state.target:
         return Decision(None, IDLE, "no navigation target")
 
+    # The tracker runs **before** the blind check, so a spell with no
+    # observation is a run of misses rather than time that did not happen. It
+    # is also the only way the coast clock advances while the card is blind —
+    # otherwise a camera that stopped publishing would leave a track coasting
+    # for ever, and the robot driving towards a prediction nobody is checking.
+    ego, ego_measured = _ego_twist(odom, state)
+    track = state.tracker.step(detections=detections, depth=depth,
+                               target=state.target, config=config,
+                               ego=ego, ego_measured=ego_measured, dt=dt)
+
     # No usable observation is not the same as "nothing is there". Emitting
     # nothing lets the watchdog stop the robot, which is the right resting
     # state for "this policy cannot see".
@@ -527,17 +637,25 @@ def _decide(detections, depth, odom, config: Config, state: State,
                         "leaving the stop to the downstream watchdog")
 
     bands = depth.get("bands") or {}
-    target = select_target(detections.get("objects"), state.target, config)
 
-    if target is None:
+    if track is None:
         return _search(config, state, dt)
 
     state.missing_frames = 0
     state.searching_for_s = 0.0
     state.searched_rad = 0.0
-    bearing = _bearing(target)
+    # Back to the normalised offset the rest of this file is written in.
+    # `track.py` works in metres and radians; every threshold here — align_tol,
+    # arrive_align_tol, lateral_max_bearing — is a fraction of the image half
+    # width, and converting them instead would change what every deployed
+    # config means.
+    bearing = _clamp(track.bearing_rad / max(1e-6, config.half_fov_rad), 1.0)
     state.last_seen_side = 1.0 if bearing >= 0 else -1.0
-    distance = target_distance(target, depth, config)
+    # None, not a number, when depth has never had a reading for this object.
+    # The summary-only path legitimately produces that, and the whole approach
+    # law below already handles an unknown distance — what it must not do is
+    # act on the placeholder the tracker needed in order to exist.
+    distance = track.range_m if track.range_known else None
 
     # Turn towards it. Positive bearing means the target is right of centre, and
     # `wz` is positive counter-clockwise, so the sign is inverted here.
