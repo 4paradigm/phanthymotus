@@ -347,9 +347,17 @@ def test_real_mcp_advertises_card_and_reports_operation_failure_without_ros(tmp_
 
 def test_core_management_key_stays_at_explicit_loopback_endpoint(tmp_path, monkeypatch):
     import ast
+    import importlib.util
     from types import SimpleNamespace
     class Denied(Exception): pass
     path=Path(__file__).parents[2]/'agent-core/src/api/mcp_manage.py'
+    # Load the real stdlib helper explicitly: the ActuCore image intentionally
+    # has no Core src on sys.path. Do not import FastAPI or leak a Core path into
+    # unrelated ActuCore tests; monkeypatch restores any existing module entry.
+    spec=importlib.util.spec_from_file_location('teleop_management',path.parents[1]/'teleop_management.py')
+    management=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(management)
+    monkeypatch.setitem(sys.modules,'teleop_management',management)
     node=next(n for n in ast.parse(path.read_text()).body if getattr(n,'name','')=='_teleop_management_headers')
     ns={'fastapi':SimpleNamespace(HTTPException=Denied)}
     exec(compile(ast.Module(body=[node],type_ignores=[]),str(path),'exec'),ns)

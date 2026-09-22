@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build an isolated CPU validation image only. Production teleop belongs inside
-# ordinary ActuCore (build_actucore.sh --jp-version 6.1 --with-teleop).
+# ordinary ActuCore (build_actucore.sh --jp-version 6.1).
 # No push, image transfer, Compose changes or service startup.
 set -euo pipefail
 if [[ $# != 1 ]]; then

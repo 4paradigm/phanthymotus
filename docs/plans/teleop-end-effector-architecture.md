@@ -72,11 +72,13 @@
 
 - 已实现三卡协议与端口绑定、Driver 解算/arm 流入口、自动反馈线、安装邀请、签名 APK 和配置表单。最终审查已补齐 Preview 身份释放和短暂丢反馈后保持握把的恢复握手；保留原映射，旧会话目标拒绝执行，真实故障不自动续动。新架构未部署。
 - 新 APK 0.3.18-onboarding1 已完成真实 release 构建、签名/许可检查；已发布固定构建制品，匿名读回、解压和 APK 哈希一致。未安装到实体 PICO。
-- Core 配置审计补齐 Driver 接受并读回后才保存，失败不持久化候选；未知字段提前拒绝、实例入口不能绕过确认，页面显示拒绝原因。加入配置确认及统一管理鉴权后，完整 Core 回归 1451 passed / 1 skipped / 8 subtests passed。真实本地 Chrome 卡片操作及新增 Node 保存失败交互通过。ActuCore 全套 665 passed / 46 skipped；跳过项分别为 G1 数值 ABI、私有录制和需显式运行的 ROS 集成入口，不能视为通过。
+- Core 配置审计补齐 Driver 接受并读回后才保存，失败不持久化候选；未知字段提前拒绝、实例入口不能绕过确认，页面显示拒绝原因。加入配置确认及统一管理鉴权后，完整 Core 回归 1451 passed / 1 skipped / 8 subtests passed。真实本地 Chrome 卡片操作及新增 Node 保存失败交互通过。ActuCore 全套 670 passed / 46 skipped；跳过项分别为 G1 数值 ABI、私有录制和需显式运行的 ROS 集成入口，不能视为通过。
 - Canvas 原管理鉴权保持，补齐 LLM 与 direct/hook 调用的同一精确本机 endpoint 限制、禁重定向及凭据校验；开始不自动重放配置。真实 localhost HTTP 守卫及失败路径测试通过。
 - JP6.1 与 CPU 验证镜像携带 APK；JP5.1.1 不下载、不准备遥操 APK。两份 NDK 大 NOTICE 改由固定 SDK 校验后生成；实际 Gradle 资源合并通过，生成内容与已发布 APK 字节一致，无需重发 APK。
 - JVM 中生产 Java 邀请解析和 TLS PairChannel 与 localhost Python Enrollment 实际互通，15 项检查通过；单次兑换及证书不匹配时不发送邀请均有验证。不运行 Android Activity，使用测试 JSON 库及 Base64 适配，不代替 PICO 安装/浏览器唤起实测。
 - 真实 ROS 集成已在本机 ARM64 禁网、只读容器单独运行：2 passed。使用真实 domain 42、Driver bus 子进程、EEF/joint/feedback topic、IK 与执行门；MCP HTTP 和本体反馈仍用有限速度模拟。Shadow 无 joint/厂商输出，Live 模拟执行及暂停确认通过；不是机器人验收。
 - 现有 10 秒录制 719 帧已做迁移数值对照：718 帧有效输入；旧 ActuCore 与新 Driver 均得到 523 个有效解、195 个不可达拒绝，分类分歧为 0；输出关节最大差 6.49e-13 rad。P95 求解耗时旧 10.68 ms、新 10.36 ms。使用双方同一已有本地标定、相同逐帧实测关节和独立初值，保留 100 ms 求解预算；未找到原录制精确匹配标定，因此仅证明该标定下逐帧迁移一致，不代表原现场动作、连续调度或物理验收。私有录制及逐帧结果不提交。
-- 主仓 5d0c104 的普通 Core 与 JetPack 6.1 ActuCore bot 镜像构建通过；镜像内 Core 1410、ActuCore 581 项通过。当前补丁会再次请求新 HEAD 复审，不沿用旧 HEAD 结果。Driver bot 的 rcutils 查库失败已定位到跨架构环境下 CMake 目录遍历错误码污染这一可复现机制；构建期修正的故障注入、完整本机 ARM64 构建和实际 bundle 隔离 smoke 通过，真实 EIO/缺库仍失败。Driver fc06778 已请求 bot 复验，尚未收到结果；未修改 bot 或放宽 100 ms IK 预算。
+- 主仓 5d0c104 的普通 Core 与 JetPack 6.1 ActuCore bot 镜像构建通过；镜像内 Core 1410、ActuCore 581 项通过。当前补丁会再次请求新 HEAD 复审，不沿用旧 HEAD 结果。Driver bot 的 rcutils 查库失败已定位到跨架构环境下 CMake 目录遍历错误码污染这一可复现机制；构建期修正的故障注入、完整本机 ARM64 构建和实际 bundle 隔离 smoke 通过，真实 EIO/缺库仍失败。Driver fc06778 已通过 bot/QEMU 完整构建（8m36s）；未修改 bot 或放宽 100 ms IK 预算。
+- 主仓 66d20a8 的普通 Core/JP6.1 ActuCore 镜像构建通过，Core 镜像内 1451 项通过；ActuCore 镜像内 585 项通过、1 项失败，原因为抽取 Core wrapper 的测试未加载拆出的 stdlib helper。已在无 Core 源码 PYTHONPATH 的环境复现，并只修复测试加载：专项 96 项、全套 670 项通过，生产鉴权和拒绝断言不变，待新 HEAD bot 复验。
+- 用户确认天轶空闲并开机后，已核验只读服务/目录/资源、Canvas 无编辑且项目停止；厂商双臂反馈连续、错误码为零。已上传固定 Driver 源码并开始机上原生构建，尚未切换服务、开放控制权或发送动作；完整 ROS 和设备时间证据独立记录，不以静态反馈代替验收。
 - 操作手册和架构文档已同步本轮职责、配置、安装、兼容及验收边界。原物理动作记录只作旧链路基线，不用于宣布新版通过。
