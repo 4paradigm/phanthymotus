@@ -246,6 +246,10 @@ class NaviPlugin:
                                   "scope": "instance"},
                     "min_confidence": {"type": "number", "default": 0.35,
                                        "scope": "instance"},
+                    "clearance_margin_m": {"type": "number", "default": 0.15,
+                                           "scope": "instance"},
+                    "coverage_min": {"type": "number", "default": 0.25,
+                                     "scope": "instance"},
                     "sustain_confidence": {"type": "number", "default": 0.15,
                                            "scope": "instance"},
                     "confirm_hits": {"type": "integer", "default": 3,
@@ -638,7 +642,11 @@ class NaviPlugin:
         out = []
         if not self._binding.get("depth_map"):
             out.append("只接了深度摘要，没有深度图 —— 距离按目标所在的三分之一"
-                       "画面估计，精度明显变差")
+                       "画面估计，精度明显变差；避障也退回按画面三等分判断，"
+                       "那是一个**角度**扇区，近处比机器人还窄（0.8 m 处只覆盖"
+                       "±0.16 m），肩膀会擦到判据之外的东西。摘要还无法表达"
+                       "「这一段有多少像素是有效的」，所以满是空洞的一段会被"
+                       "当成空旷")
         if not self._binding.get("odom"):
             out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停；"
                        "且目标被遮挡时只能按**指令**（而非实测）推算它去了哪，"

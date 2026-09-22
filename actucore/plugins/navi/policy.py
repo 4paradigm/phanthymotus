@@ -199,6 +199,29 @@ class Config:
     # `sustain_confidence`.
     min_confidence: float = 0.35
 
+    # ── the space the robot occupies (see depth.corridor) ────────────────
+    # Half the robot's width, in metres, **as the chassis declares it** — the
+    # `footprint` block of its descriptor, read by `adopt_limits`. The default
+    # here is deliberately wider than any humanoid in this project: a robot that
+    # does not say how wide it is must be assumed to be wide, because the error
+    # that hurts is believing it is narrow.
+    half_width_m: float = 0.35
+    # Added to the declared half-width before anything is checked. The footprint
+    # a chassis declares is its **static envelope with the arms at rest**, and
+    # what hits a doorframe is a swinging arm and a leg mid-stride. This is the
+    # difference between "the box the robot is" and "the space to keep clear".
+    clearance_margin_m: float = 0.15
+    # How much of the corridor has to carry a real depth reading before its
+    # clearance is believed. Below `coverage_min` the card stops going forward
+    # and says so; between the two it slows in proportion.
+    #
+    # **Unknown is not free.** A depth map has holes, and the things that make
+    # them — chair legs, table edges, glass — are exactly the things that catch
+    # a shoulder. Without this a corridor full of holes reads as an empty one,
+    # because every invalid pixel drops silently out of the minimum.
+    coverage_min: float = 0.25
+    coverage_full: float = 0.60
+
     # ── tracking (see track.py) ──────────────────────────────────────────
     # A detection this dim may not create a track, but it may keep one alive if
     # it lands inside the gate. Partial occlusion is exactly what makes a
@@ -421,6 +444,30 @@ def _lift(value: float, floor: float, ceiling: float) -> float:
 _CEILING_HEADROOM = 1.5
 
 
+def _adopt_footprint(config: Config, descriptor: dict) -> list[str]:
+    """Take the robot's own width from its descriptor, or stay wide.
+
+    Same move as `min_magnitude`: the chassis knows its dimensions and the
+    policy must not hard-code them. A missing declaration is not a reason to
+    guess narrow — the corridor simply stays at the conservative default and
+    says so, because every failure mode of this number is one-sided. Believing
+    the robot is wider than it is costs some unnecessary slowing; believing it
+    is narrower puts a shoulder into a doorframe.
+    """
+    footprint = (descriptor or {}).get("footprint") or {}
+    declared = footprint.get("half_width")
+    if not isinstance(declared, (int, float)) or declared <= 0:
+        if descriptor:
+            return [f"下游底盘没有声明 footprint —— 避障走廊按保守的 "
+                    f"±{config.half_width_m:g} m 算，可能比实际车宽保守很多"]
+        return []
+    config.half_width_m = float(declared)
+    if footprint.get("source") == "estimate":
+        return [f"底盘的 footprint 标注为 estimate（±{declared:g} m），"
+                "不是量出来的，避障余量按此理解"]
+    return []
+
+
 def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     """Fit the policy's ceilings to the robot that will execute them.
 
@@ -440,6 +487,7 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
       run.
     """
     notes: list[str] = []
+    notes.extend(_adopt_footprint(config, descriptor))
     limits = (descriptor or {}).get("limits") or {}
     floors = list(limits.get("min_magnitude") or [])
     lower = list(limits.get("lower") or [])
@@ -726,8 +774,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         remaining, engage=0.05, release=0.0,
         dt=dt, min_dwell_s=config.min_dwell_s)
 
-    vx, vy = _approach(speed if driving else 0.0, bearing, bands, config)
-    vx, vy, wz, status, reason = _avoid(vx, vy, wz, bands, config, status, reason)
+    vx, vy = _approach(speed if driving else 0.0, bearing, depth, config)
+    vx, vy, wz, status, reason = _avoid(vx, vy, wz, depth, config, status, reason)
 
     stuck = _stuck(odom, state, vx, dt, config)
     if stuck:
@@ -794,21 +842,60 @@ def _alignment_scale(bearing: float, config: Config) -> float:
     return floor + (1.0 - floor) * (config.align_full_stop - offset) / span
 
 
-def _may_strafe(towards_right: bool, bands, config: Config) -> bool:
+def _keepout_m(config: Config) -> float:
+    """The half-width to keep clear: the declared box plus a margin for the
+    parts of the robot the box does not describe."""
+    return config.half_width_m + config.clearance_margin_m
+
+
+def _clearance(depth, config: Config, lateral_offset_m: float = 0.0):
+    """`(nearest obstacle in the corridor, how much of it was measured)`.
+
+    With a depth map this is the metric corridor — the space the robot will
+    actually pass through. With only the summary it falls back to the angular
+    thirds, and **says so by reporting full coverage it has not earned**: the
+    summary has no way to express how much of a band was measured, so the
+    fallback cannot detect a band full of holes. That is one of the degradations
+    the card reports at start; it is not something this function can fix.
+    """
+    from . import depth as depth_mod
+
+    bands = (depth or {}).get("bands") or {}
+    if (depth or {}).get("map") is None:
+        band = ("center" if abs(lateral_offset_m) < 1e-6
+                else "right" if lateral_offset_m > 0 else "left")
+        return bands.get(band), 1.0
+    return depth_mod.corridor(depth["map"],
+                              half_width_m=_keepout_m(config),
+                              half_fov_rad=config.half_fov_rad,
+                              reference_m=config.obstacle_stop_m,
+                              lateral_offset_m=lateral_offset_m)
+
+
+def _may_strafe(towards_right: bool, depth, config: Config) -> bool:
     """Whether it is honest to put speed on `vy` right now.
 
-    Sideways is the direction a forward-facing depth map knows least about, so
-    the side band has to be **known and clear** — unknown blocks, rather than
-    defaulting to permission. That is the one place this policy is allowed to
-    move into space it cannot see, and it does not take it.
+    The question is not "is the right third of the picture empty" — that
+    describes what is ahead-and-to-the-right at a couple of metres, not what is
+    beside the shoulder. It is whether the corridor the robot would **move
+    into** is both measured and clear. An unmeasured one blocks: sideways is
+    the direction a forward-facing camera knows least about, and this is the one
+    place the policy could move into space it cannot see.
+
+    A sidestep whose corridor falls outside the lens gets zero coverage and is
+    refused on that alone, which is the correct answer rather than a special
+    case.
     """
     if not config.use_lateral or config.vy_max <= 0:
         return False
-    room = bands.get("right" if towards_right else "left")
-    return room is not None and room > config.slow_distance_m
+    offset = _keepout_m(config) * (1.0 if towards_right else -1.0)
+    room, coverage = _clearance(depth, config, lateral_offset_m=offset)
+    if coverage < config.coverage_min:
+        return False
+    return room is None or room > config.slow_distance_m
 
 
-def _approach(speed: float, bearing: float, bands, config: Config):
+def _approach(speed: float, bearing: float, depth, config: Config):
     """Split the approach speed between forward and sideways.
 
     The target sits at roughly `bearing * half_fov_rad` off the nose, so
@@ -831,12 +918,12 @@ def _approach(speed: float, bearing: float, bands, config: Config):
         # Too far off to trust either the bearing or the side band. Turn.
         return forward, 0.0
     lateral = -speed * math.sin(angle) * config.lateral_scale
-    if lateral == 0.0 or not _may_strafe(lateral < 0, bands, config):
+    if lateral == 0.0 or not _may_strafe(lateral < 0, depth, config):
         return forward, 0.0
     return forward, _lift(lateral, config.floor_vy, config.vy_max)
 
 
-def _avoid(vx, vy, wz, bands, config: Config, status, reason):
+def _avoid(vx, vy, wz, depth, config: Config, status, reason):
     """Slow for what is ahead, and move out from in front of it if it is close.
 
     Backing away is not available — the depth map covers what the camera sees
@@ -848,9 +935,28 @@ def _avoid(vx, vy, wz, bands, config: Config, status, reason):
     gets it out of the way, and doing both at once is one continuous motion
     rather than a pirouette followed by a walk.
     """
-    ahead = bands.get("center")
+    bands = (depth or {}).get("bands") or {}
+    ahead, coverage = _clearance(depth, config)
+
+    # Too little of the corridor measured to say anything about it. Not the same
+    # as "clear", and it used to be treated as such — an invalid pixel simply
+    # dropped out of the minimum, so a corridor full of holes and an empty one
+    # produced the same number. The objects that make holes are the ones that
+    # catch a shoulder.
+    if coverage < config.coverage_min:
+        return (0.0, 0.0, wz, AVOIDING,
+                f"正前方只有 {coverage * 100:.0f}% 的深度有效，看不清就不往前走"
+                f"（需要 {config.coverage_min * 100:.0f}%）")
+
+    # Between the two thresholds the clearance is believed, but less of it than
+    # we would like was measured, so it is approached more slowly.
+    trust = min(1.0, max(0.0, (coverage - config.coverage_min)
+                         / max(1e-6, config.coverage_full - config.coverage_min)))
+
     if ahead is None:
-        return vx, vy, wz, status, reason
+        return _scaled(vx, trust, config.floor_vx, config.vx_max), \
+                _scaled(vy, trust, config.floor_vy, config.vy_max), \
+                wz, status, reason
 
     if ahead <= config.obstacle_stop_m:
         left, right = bands.get("left"), bands.get("right")
@@ -863,24 +969,39 @@ def _avoid(vx, vy, wz, bands, config: Config, status, reason):
             vy = (_lift(-config.vy_max * config.lateral_scale if towards_right
                         else config.vy_max * config.lateral_scale,
                         config.floor_vy, config.vy_max)
-                  if _may_strafe(towards_right, bands, config) else 0.0)
+                  if _may_strafe(towards_right, depth, config) else 0.0)
         else:
             vy = 0.0
         return (0.0, vy, wz, AVOIDING,
-                f"obstacle {ahead:.2f} m straight ahead; stopping forward motion"
-                + (" and stepping aside" if vy else " and turning"))
+                f"走廊内 {ahead:.2f} m 处有障碍；停止前进"
+                + ("并向旁边让开" if vy else "并转向"))
 
     if ahead < config.slow_distance_m:
         span = max(1e-6, config.slow_distance_m - config.obstacle_stop_m)
         scale = max(0.0, (ahead - config.obstacle_stop_m) / span)
         # Both translation axes scale together, so slowing down does not also
         # change the direction of travel.
-        return (_lift(vx * scale, config.floor_vx, config.vx_max) if vx else 0.0,
-                _lift(vy * scale, config.floor_vy, config.vy_max) if vy else 0.0,
-                wz, AVOIDING,
-                f"{reason}; obstacle {ahead:.2f} m straight ahead, slowing down")
+        scale *= trust
+        return (_scaled(vx, scale, config.floor_vx, config.vx_max),
+                _scaled(vy, scale, config.floor_vy, config.vy_max), wz, AVOIDING,
+                f"{reason}；走廊内 {ahead:.2f} m 处有障碍，减速")
 
-    return vx, vy, wz, status, reason
+    return (_scaled(vx, trust, config.floor_vx, config.vx_max),
+            _scaled(vy, trust, config.floor_vy, config.vy_max), wz,
+            status, reason)
+
+
+def _scaled(value: float, factor: float, floor: float, ceiling: float) -> float:
+    """Slow an axis down, keeping it executable. Zero stays zero.
+
+    The lift is what makes this honest on a robot with a deadband: scaling 0.4
+    by 0.5 asks for a speed R1 does not have, and quietly produces no motion at
+    all. Here it produces the slowest motion that exists, and the caller can see
+    that it did.
+    """
+    if not value:
+        return 0.0
+    return _lift(value * factor, floor, ceiling)
 
 
 def _search(config: Config, state: State, dt: float) -> Decision:

@@ -245,10 +245,13 @@ def test_strafing_needs_the_side_it_moves_into_to_be_known_and_clear():
     so an unknown band **blocks** rather than defaulting to permission. This is
     the one place the policy could move into space it cannot see, and it does
     not take it."""
-    blocked = _depth(bands={"left": 5.0, "center": 5.0, "right": 0.9})
-    unknown = _depth(bands={"left": 5.0, "center": 5.0})
-    for bands in (blocked, unknown):
-        decision = _step(detections=_detections(_obj(x=0.5)), depth=bands)
+    # Something in the space a sidestep to the right would move into, and a
+    # frame where that space simply has no readings. Both must refuse.
+    blocked = _scene(5.0, [(0.55, 1.0, 0.5)])
+    unmeasured = {"map": _obstacle_map(5.0), "bands": {"left": 5.0, "center": 5.0}}
+    unmeasured["map"][:, 340:] = np.nan
+    for depth in (blocked, unmeasured):
+        decision = _step(detections=_detections(_obj(x=0.5)), depth=depth)
         assert decision.values[1] == 0.0
         assert decision.values[5] < 0, "it still turns towards the target"
 
@@ -301,33 +304,31 @@ def test_it_does_not_arrive_while_still_misaligned():
 # branch, which would otherwise both fire on the same number.
 
 def test_a_near_obstacle_ahead_slows_the_approach():
-    target_far = _solid_depth(4.0)
-    far = _step(detections=_detections(_obj(x=0.0)),
-                depth=_depth({"left": 5.0, "center": 5.0, "right": 5.0},
-                             map_=target_far))
+    far = _step(detections=_detections(_obj(x=0.0)), depth=_scene(4.0))
     near = _step(detections=_detections(_obj(x=0.0)),
-                 depth=_depth({"left": 5.0, "center": 1.0, "right": 5.0},
-                              map_=target_far))
+                 depth=_scene(4.0, [(0.0, 1.0, 0.6)]))
     assert 0 < near.values[0] < far.values[0]
     assert near.status == P.AVOIDING
 
 
 def test_an_obstacle_inside_the_stop_distance_halts_forward_motion():
     decision = _step(detections=_detections(_obj(x=0.0)),
-                     depth=_depth({"left": 5.0, "center": 0.4, "right": 1.0},
-                                  map_=_solid_depth(4.0)))
+                     depth=_scene(4.0, [(0.0, 0.4, 0.4)]))
     assert decision.values[0] == 0.0
     assert decision.status == P.AVOIDING
 
 
 def test_it_turns_towards_the_freer_side():
-    target_far = _solid_depth(4.0)
+    # The obstacle goes in the map (that is what the corridor reads) and the
+    # asymmetry in the bands (that is what picks the side). Setting them
+    # independently is what isolates the choice from the detection.
+    blocked = _obstacle_map(5.0, [(0.0, 0.6, 0.3)])
     left_free = _step(detections=_detections(_obj(x=0.0)),
-                      depth=_depth({"left": 5.0, "center": 0.4, "right": 1.0},
-                                   map_=target_far))
+                      depth=_depth({"left": 5.0, "center": 0.6, "right": 1.0},
+                                   map_=blocked))
     right_free = _step(detections=_detections(_obj(x=0.0)),
-                       depth=_depth({"left": 1.0, "center": 0.4, "right": 5.0},
-                                    map_=target_far))
+                       depth=_depth({"left": 1.0, "center": 0.6, "right": 5.0},
+                                    map_=blocked))
     assert left_free.values[5] > 0      # counter-clockwise, towards the left
     assert right_free.values[5] < 0
 
@@ -508,6 +509,44 @@ def test_an_empty_target_name_selects_nothing():
 def _solid_depth(metres):
     from plugins.navi import depth as D
     return np.full((D.HEIGHT, D.WIDTH), metres, dtype=np.float32)
+
+
+def _obstacle_map(background=5.0, patches=(), rows=(290, 400), config=None):
+    """A depth map with rectangular patches placed at a metric position.
+
+    `patches` are `(lateral_m, distance_m, width_m)`, lateral **right-positive**
+    at that distance — which is how the corridor thinks, and what turns "0.30 m
+    to the left, 0.7 m away" into a picture instead of a column index.
+
+    Rows default to the **lower** part of `OBSTACLE_ROW_SPAN` — inside what the
+    obstacle scan looks at, and clear of the centre window `sample_point` reads
+    the target's own distance from. Otherwise a scene cannot hold a target and
+    an obstacle at once: the thing in the corridor would simply be the target,
+    and the card would report arrival instead of avoidance. Physically this is
+    a low obstacle (a box on the floor) between the robot and a distant target.
+    """
+    from plugins.navi import depth as D
+
+    config = config or _cfg()
+    out = np.full((D.HEIGHT, D.WIDTH), float(background), dtype=np.float32)
+    tangent = ((np.arange(D.WIDTH) - (D.WIDTH - 1) / 2.0)
+               * (2.0 * np.tan(config.half_fov_rad) / D.WIDTH))
+    for lateral, distance, width in patches:
+        columns = np.abs(tangent * distance - lateral) <= width / 2.0
+        out[rows[0]:rows[1], columns] = distance
+    return out
+
+
+def _scene(background=5.0, patches=(), config=None):
+    """A depth map **and** the bands derived from it, the way the card sees them.
+
+    `_depth(bands=..., map_=...)` lets the two disagree, which is useful for
+    isolating one path; this is for tests that want the picture to be coherent.
+    """
+    from plugins.navi import depth as D
+
+    depth_map = _obstacle_map(background, patches, config=config)
+    return {"map": depth_map, "bands": D.nearest_by_band(depth_map)}
 
 
 # ── stable object list ───────────────────────────────────────────────────────
@@ -1043,11 +1082,12 @@ def test_an_obstacle_ahead_is_stepped_around_not_only_turned_from():
     """Turning alone changes where the robot points; on a base that can
     translate, the sidestep is what gets it out of the way — and doing both at
     once is one motion instead of a pirouette followed by a walk."""
-    # The map puts the target 4 m off; the bands put something in the way. A
-    # single source cannot express that — the target would *be* the obstacle.
+    # Slightly to the right, so a step to the **left** actually clears it — a
+    # sidestep is only available when there is somewhere to step to, and an
+    # obstacle dead centre and as wide as the robot is not that case.
     decision = _step(detections=_detections(_obj(x=0.0)),
-                     depth=_depth(bands={"left": 5.0, "center": 0.5, "right": 1.0},
-                                  map_=_solid_depth(4.0)))
+                     depth=_depth(bands={"left": 5.0, "center": 0.6, "right": 1.0},
+                                  map_=_obstacle_map(5.0, [(0.25, 0.6, 0.3)])))
     assert decision.status == P.AVOIDING
     assert decision.values[0] == 0.0, "no forward motion into it"
     assert decision.values[1] > 0, "stepping left, the side with room"
@@ -1056,6 +1096,90 @@ def test_an_obstacle_ahead_is_stepped_around_not_only_turned_from():
 
 def test_an_obstacle_with_no_room_either_side_is_not_stepped_into():
     decision = _step(detections=_detections(_obj(x=0.0)),
-                     depth=_depth(bands={"left": 1.0, "center": 0.5, "right": 0.9},
-                                  map_=_solid_depth(4.0)))
+                     depth=_scene(1.0, [(0.0, 0.5, 0.5)]))
     assert decision.values[1] == 0.0
+
+
+# ── the space the robot occupies ─────────────────────────────────────────────
+
+_R1_FOOTPRINT = {"shape": "box", "half_width": 0.179, "front": 0.095,
+                 "rear": 0.095, "height": 1.23, "source": "vendor-spec"}
+
+
+def test_the_chassis_declares_its_own_width():
+    """Same move as `min_magnitude`: the robot knows its dimensions and the
+    policy must not hard-code them."""
+    config = _cfg()
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    assert config.half_width_m == pytest.approx(0.179)
+
+
+def test_an_undeclared_footprint_stays_wide_and_says_so():
+    """Every failure mode of this number is one-sided. Believing the robot is
+    wider than it is costs some unnecessary slowing; believing it is narrower
+    puts a shoulder into a doorframe."""
+    config = _cfg()
+    notes = P.adopt_limits(config, _R1_DESC)
+    assert config.half_width_m >= 0.3
+    assert any("footprint" in note for note in notes)
+
+
+def test_a_footprint_that_is_only_an_estimate_is_reported_as_one():
+    config = _cfg()
+    notes = P.adopt_limits(config, dict(
+        _R1_DESC, footprint=dict(_R1_FOOTPRINT, source="estimate")))
+    assert any("estimate" in note for note in notes)
+
+
+def test_the_keepout_is_wider_than_the_declared_box():
+    """What a chassis declares is its static envelope with the arms at rest, and
+    what hits a doorframe is a swinging arm and a leg mid-stride."""
+    config = _cfg()
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    assert P._keepout_m(config) > config.half_width_m
+
+
+def test_an_obstacle_the_bands_call_left_now_stops_the_robot():
+    """End to end, the reason all of the above exists.
+
+    A doorframe 0.25 m off the axis at 0.7 m is inside a humanoid's width and
+    outside the centre third of the picture. The bands file it under "left",
+    and the left band has never stopped forward motion."""
+    config = _cfg()
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    depth = {"map": _obstacle_map(5.0, [(-0.25, 0.7, 0.1)], config=config),
+             "bands": {"left": 0.7, "center": 5.0, "right": 5.0}}
+    state = seed(_state(), _detections(_obj(x=0.0)), depth, config)
+    decision = P.step(detections=_detections(_obj(x=0.0)), depth=depth,
+                      odom=None, config=config, state=state, dt=0.1)
+    assert decision.status == P.AVOIDING
+    assert decision.values[0] == 0.0
+
+
+def test_a_corridor_it_cannot_measure_is_not_driven_into():
+    """Unknown is not free. This was the default: an invalid pixel dropped out
+    of the minimum, so a corridor full of holes and an empty one gave the same
+    answer — and the objects that make holes are the ones that catch a
+    shoulder."""
+    config = _cfg()
+    depth = {"map": np.full((480, 640), np.nan, dtype=np.float32),
+             "bands": {"left": 5.0, "center": 5.0, "right": 5.0}}
+    state = seed(_state(), _detections(_obj(x=0.0)),
+                 _depth(map_=_solid_depth(3.0)), config)
+    decision = P.step(detections=_detections(_obj(x=0.0)), depth=depth,
+                      odom=None, config=config, state=state, dt=0.1)
+    assert decision.status == P.AVOIDING
+    assert decision.values[0] == 0.0
+    assert "看不清" in decision.reason
+
+
+def test_the_summary_only_path_cannot_detect_a_corridor_full_of_holes():
+    """Pinned as a known limitation rather than discovered on a robot.
+
+    `visual_depth`'s summary is three numbers; it has no way to say how much of
+    a band was measured, so the fallback reports a coverage it has not earned.
+    That is one of the reasons the card calls the summary-only wiring degraded.
+    """
+    config = _cfg()
+    depth = {"map": None, "bands": {"left": None, "center": None, "right": None}}
+    assert P._clearance(depth, config) == (None, 1.0)
