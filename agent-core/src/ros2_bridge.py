@@ -223,7 +223,17 @@ def _resolve_msg_type(fmt: str):
         except ImportError:
             pass
         return None
-    if fmt in ('json', 'data/json') or fmt.startswith('sensor/') or fmt.startswith('data/'):
+    # `control/*` 是执行模型发给驱动的指令流（motus.control/1），`state/*` 是
+    # 驱动报出的本体状态（motus.odom/1 等）。两者都是 std_msgs/String 里的 JSON，
+    # 和感知那些卡片一样 —— 规范见 phanthymotus-driver/README_dev.md。
+    #
+    # 这两个前缀原先不在表里，而后果只有一行 stderr：格式解析不出来就直接放弃
+    # 订阅，于是话题在 inspection 里登记得好好的、发布方也在 10 Hz 地发，而画布
+    # 上的「查看数据流」和监控汇总永远是空的。r1_sz 上的 navi 就是这样 —— 用
+    # rclpy 直接订能收到指令，面板上什么都没有。
+    if (fmt in ('json', 'data/json') or fmt.startswith('sensor/')
+            or fmt.startswith('data/') or fmt.startswith('control/')
+            or fmt.startswith('state/')):
         try:
             from std_msgs.msg import String
             return String
