@@ -153,7 +153,7 @@ class NaviPlugin:
                                               "返回的 key（如 chair#azure）最准；"
                                               "也接受纯名字，但同名多个时挑哪一个不保证"},
                     "stop_distance_m": {"type": "number",
-                                        "description": "在目标前多远停下，默认 1.0 m"},
+                                        "description": "在目标前多远停下，默认 1.2 m"},
                     # Handed over by agent-core from the card wired downstream.
                     # Not operator-editable: it is a reading of another card,
                     # and a hand-typed copy is a copy that goes stale.
@@ -192,11 +192,11 @@ class NaviPlugin:
                                 "scope": "instance"},
                     "priority": {"type": "integer", "default": 50,
                                  "scope": "instance"},
-                    "stop_distance_m": {"type": "number", "default": 1.0,
+                    "stop_distance_m": {"type": "number", "default": 1.2,
                                         "scope": "instance"},
                     "slow_distance_m": {"type": "number", "default": 1.8,
                                         "scope": "instance"},
-                    "obstacle_stop_m": {"type": "number", "default": 0.6,
+                    "obstacle_stop_m": {"type": "number", "default": 0.8,
                                         "scope": "instance"},
                     "vx_max": {"type": "number", "default": 0.4,
                                "scope": "instance"},

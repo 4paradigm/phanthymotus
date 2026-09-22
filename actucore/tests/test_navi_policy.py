@@ -463,3 +463,27 @@ def test_the_latest_frames_bearing_is_used():
 def test_describe_mentions_name_colour_and_side():
     text = P.describe(dict(_obj(name="chair", x=0.5), color="dim muted azure"), 2.3)
     assert "chair" in text and "azure" in text and "偏右" in text and "2.3m" in text
+
+
+def test_the_three_distances_keep_their_ordering():
+    """obstacle_stop < stop_distance < slow_distance.
+
+    The target is itself an obstacle — it shows up in the same depth bands — so
+    if `obstacle_stop_m` ever reaches `stop_distance_m`, the robot is halted by
+    the very thing it is walking towards and never arrives. Raising one of these
+    without the others is the natural way to break it.
+    """
+    c = P.Config()
+    assert c.obstacle_stop_m < c.stop_distance_m < c.slow_distance_m
+
+
+def test_a_target_at_the_stop_distance_is_not_halted_by_itself():
+    """The ordering above, exercised rather than asserted."""
+    c = P.Config()
+    state = _state()
+    decision = _step(detections=_detections(_obj(x=0.0)),
+                     depth=_depth({"left": 5.0, "center": c.stop_distance_m,
+                                   "right": 5.0},
+                                  map_=_solid_depth(c.stop_distance_m)),
+                     config=c, state=state)
+    assert decision.status == P.ARRIVED

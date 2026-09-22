@@ -51,11 +51,28 @@ IDLE = "idle"
 
 @dataclass
 class Config:
-    """Everything an operator can turn. Defaults are for a walking humanoid."""
+    """Everything an operator can turn. Defaults are for a walking humanoid.
 
-    stop_distance_m: float = 1.0
+    The three distances are **not** independent, and the relation between them
+    is the one thing to preserve when tuning:
+
+        obstacle_stop_m  <  stop_distance_m  <  slow_distance_m
+
+    The target is itself an obstacle — it appears in the same depth bands — so
+    if `obstacle_stop_m` ever reaches `stop_distance_m` the robot is stopped by
+    the very thing it is walking towards, and never arrives.
+
+    They are also measured **from the camera**, not from the front of the robot.
+    On a walking humanoid the torso and a swinging leg are both ahead of the
+    lens, which is why `obstacle_stop_m` is not as small as the geometry alone
+    would suggest.
+
+    Still unvalidated on hardware — see docs/visual-navigation.md.
+    """
+
+    stop_distance_m: float = 1.2
     slow_distance_m: float = 1.8
-    obstacle_stop_m: float = 0.6
+    obstacle_stop_m: float = 0.8
     align_tol: float = 0.08
     k_yaw: float = 1.2
     k_fwd: float = 0.6
