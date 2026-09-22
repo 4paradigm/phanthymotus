@@ -564,3 +564,29 @@ def test_the_descriptor_is_not_echoed_on_every_command():
     first = _first_command(card)
     assert "control_interface" in first
     assert "control_interface" not in card.next_command()
+
+
+def test_navigate_to_tells_the_model_it_searches_on_its_own():
+    """Otherwise the model tries to help: it sees an empty
+    `list_visible_objects`, concludes the target is absent, and either gives up
+    or starts issuing its own turn commands — fighting a card that was about to
+    turn anyway, over a chassis they share."""
+    text = _tool()["inputSchema"]["x-action-params"]["navigate_to"]["description"]
+    assert "不必现在就看得见" in text and "转身搜索" in text
+
+
+def test_list_visible_objects_does_not_read_as_an_existence_check():
+    """It reports what is in frame right now. A model reading an empty list as
+    "there is no chair here" refuses a navigation that a quarter turn would
+    have satisfied."""
+    text = _tool()["inputSchema"]["x-action-params"]["list_visible_objects"]["description"]
+    assert "不代表目标不存在" in text
+
+
+def test_a_clear_goal_does_not_have_to_list_first():
+    """"Go to the sofa" needs no disambiguation. Telling the model to list
+    first costs a round trip on every navigation and invites it to treat an
+    empty list as a reason not to go."""
+    params = _tool()["inputSchema"]["x-action-params"]
+    assert "不必先" in params["navigate_to"]["description"]
+    assert "甄别" in params["list_visible_objects"]["description"]
