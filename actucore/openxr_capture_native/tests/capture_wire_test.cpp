@@ -1,10 +1,13 @@
 #include "motus/openxr_capture/capture_wire.hpp"
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <variant>
+
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -138,6 +141,75 @@ void SignalingAndPresenceUseExactPublicEnvelopes() {
         "answer SDP must parse for matching state-machine binding");
 }
 
+void EndEffectorCapabilitiesRemainStrict() {
+  auto wire = nlohmann::json::parse(AssignmentMessage());
+  auto& assignment = wire["assignment"];
+  assignment["profile_id"] = "relative_end_effectors_v1";
+  assignment["effectors"] = {"end_effectors"};
+  auto& capabilities = assignment["capabilities"];
+  capabilities["profile_id"] = assignment["profile_id"];
+  capabilities["effectors"] = assignment["effectors"];
+  capabilities["outputs"] = {{"end_effectors", {{"enabled", true}, {"mode", "eef_pose"}}}};
+  for (const auto* mode : {"live", "shadow"}) {
+    assignment["mode"] = mode;
+    const auto parsed = std::get<CaptureAssignmentMessage>(
+        ParseCaptureServerMessage(wire.dump())).assignment;
+    Check(parsed.profile_id == "relative_end_effectors_v1" &&
+              !parsed.frame_configuration.base_twist.has_value(),
+          "Cartesian outputs must not create a base input binding");
+  }
+  const auto valid = wire;
+  for (const auto& invalid : nlohmann::json::array({nullptr, true, 1, "joint_position", "unknown", {}})) {
+    wire = valid;
+    wire["assignment"]["capabilities"]["outputs"]["end_effectors"]["mode"] = invalid;
+    CheckInvalid([&wire] { ParseCaptureServerMessage(wire.dump()); },
+                 "unknown or incorrectly typed Cartesian mode must fail closed");
+  }
+  for (const auto* field : {"joint_count", "extra"}) {
+    wire = valid;
+    wire["assignment"]["capabilities"]["outputs"]["end_effectors"][field] = 14;
+    CheckInvalid([&wire] { ParseCaptureServerMessage(wire.dump()); },
+                 "Cartesian output must not accept extra or mixed joint fields");
+  }
+  wire = valid;
+  wire["assignment"]["capabilities"]["outputs"]["end_effectors"].erase("mode");
+  CheckInvalid([&wire] { ParseCaptureServerMessage(wire.dump()); },
+               "Cartesian output without mode must fail closed");
+  wire = valid;
+  wire["assignment"]["capabilities"]["outputs"]["end_effectors"]["enabled"] = "true";
+  CheckInvalid([&wire] { ParseCaptureServerMessage(wire.dump()); },
+               "Cartesian enabled field must be boolean");
+  wire = valid;
+  wire["assignment"]["capabilities"]["outputs"]["end_effectors"]["enabled"] = false;
+  CheckInvalid([&wire] { ParseCaptureServerMessage(wire.dump()); },
+               "declared effectors must match enabled Cartesian output");
+  wire = nlohmann::json::parse(AssignmentMessage());
+  wire["assignment"]["capabilities"]["outputs"]["dual_arm"] =
+      {{"enabled", true}, {"mode", "eef_pose"}};
+  CheckInvalid([&wire] { ParseCaptureServerMessage(wire.dump()); },
+               "legacy outputs must still reject unknown mode metadata");
+}
+
+void ProductionAssignments(const char* path) {
+  std::ifstream input(path);
+  Check(input.is_open(), "production assignment fixture must be readable");
+  std::string line;
+  std::size_t count = 0;
+  while (std::getline(input, line)) {
+    const auto expected = nlohmann::json::parse(line).at("assignment");
+    const auto parsed = std::get<CaptureAssignmentMessage>(
+        ParseCaptureServerMessage(line)).assignment;
+    Check(parsed.profile_id == expected.at("profile_id") &&
+              parsed.capability_digest == expected.at("capability_digest") &&
+              (parsed.mode == FrameMode::kLive) == (expected.at("mode") == "live") &&
+              !parsed.frame_configuration.base_twist.has_value(),
+          "production profile, binding digest and mode must survive native parsing");
+    ++count;
+  }
+  Check(count == 6, "all three production profiles in both modes must be exercised");
+  std::cout << "production capture assignments: " << count << " passed\n";
+}
+
 void AmbiguousOrContradictoryJsonFailsClosed() {
   CheckInvalid(
       [] {
@@ -166,11 +238,13 @@ void AmbiguousOrContradictoryJsonFailsClosed() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   AuthenticationNeverMovesSecretsIntoUrls();
   AuthAndAssignmentAreStrictlyProjected();
   SignalingAndPresenceUseExactPublicEnvelopes();
+  EndEffectorCapabilitiesRemainStrict();
   AmbiguousOrContradictoryJsonFailsClosed();
+  if (argc == 2) ProductionAssignments(argv[1]);
   std::cout << "openxr-capture wire: all host tests passed\n";
   return 0;
 }

@@ -244,8 +244,17 @@ FrameConfiguration ParseCapabilities(
     }
     for (const auto& [key, ignored] : output.items()) {
       static_cast<void>(ignored);
-      if (key != "enabled" && key != "joint_count") {
+      if (key != "enabled" && key != "joint_count" &&
+          !(name == "end_effectors" && key == "mode")) {
         Invalid("capabilities.outputs");
+      }
+    }
+    if (name == "end_effectors") {
+      // The robot-independent producer declares Cartesian output rather than
+      // a robot joint count. This describes downstream data, not XR axes.
+      ExactKeys(output, {"enabled", "mode"}, "capabilities.outputs.end_effectors");
+      if (!output.at("mode").is_string() || output.at("mode") != "eef_pose") {
+        Invalid("capabilities.outputs.mode");
       }
     }
     if (output.contains("joint_count")) {

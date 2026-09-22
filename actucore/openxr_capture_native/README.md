@@ -6,7 +6,7 @@
 
 ## 当前版本与设备范围
 
-当前源码的 Gradle 包版本与 Native 握手版本均为 `0.3.18-onboarding1`，`versionCode = 22`。本手册描述源码行为，不将版本号、宿主测试或 APK 构建视为本轮设备安装和真机验收的证据。
+当前源码的 Gradle 包版本与 Native 握手版本均为 `0.3.19-operator1-ikview2`，`versionCode = 23`。此版保留安装邀请，支持三卡架构的 `end_effectors / eef_pose` 任务分配。0.3.18 在配对后点击开始时会拒绝该能力字段并反复重连，需要升级客户端。本手册描述源码行为，不将版本号、宿主测试或 APK 构建视为本轮设备安装和真机验收的证据。
 
 | 构建目标 | 设备系列 | Application ID | Debug APK |
 |---|---|---|---|
@@ -153,10 +153,11 @@ Meta 改用 `--platform meta`。新的显式配对参数可替换旧凭据；`--
 ```sh
 ./tests/launch_capture_test.sh
 python3 tests/launcher_manifest_test.py
+PYTHON=/path/to/actucore-venv/bin/python \
 NLOHMANN_JSON_INCLUDE=/path/to/nlohmann/include ./tests/run_host_tests.sh
 ```
 
-[启动脚本测试](tests/launch_capture_test.sh)使用假 ADB；[宿主测试](tests/run_host_tests.sh)覆盖帧契约、配对、恢复、消息解析、按钮和可视化。完整协议与模型测试需要 C++20 编译器和 nlohmann/json 头文件；不设置 `NLOHMANN_JSON_INCLUDE` 会跳过相应检查。可另外设置 `MOTUS_IK_REPLAY=/path/to/visualizations.jsonl`，执行跨语言可视化回放。这些检查不需要头显和机器人，不代替 OpenXR 运行时或硬件执行验证。
+[启动脚本测试](tests/launch_capture_test.sh)使用假 ADB；[宿主测试](tests/run_host_tests.sh)覆盖帧契约、配对、恢复、消息解析、按钮和可视化。完整协议与模型测试需要 C++20 编译器和 nlohmann/json 头文件；`PYTHON` 指向已安装 ActuCore 依赖（包括 scipy、aiortc）的测试环境。生产 `CaptureManager` 生成旧天轶、G1 和通用末端三种配置的 Shadow/Live 任务分配，由同一原生解析器读取，避免手写样本遗漏服务端字段。不设置 `NLOHMANN_JSON_INCLUDE` 会跳过相应检查。可另外设置 `MOTUS_IK_REPLAY=/path/to/visualizations.jsonl`，执行跨语言可视化回放。这些检查不需要头显和机器人，不代替 OpenXR 运行时或硬件执行验证。
 
 [邀请跨语言测试](tests/invitation_contract_test.py)在 JVM 执行生产 `ConnectionInvitation` 解析和 `ConnectionActivity.PairChannel` TLS 传输，连接 localhost 上真实 Python Enrollment，覆盖单次兑换、重放、过期、撤销、轮换及证书不匹配时不发送邀请。需要 JDK 17、Android 35 编译桩、Python aiohttp/cryptography，以及仅测试用的 [org.json 20240303](https://repo.maven.apache.org/maven2/org/json/json/20240303/)。测试不下载依赖，不将该 jar 加入 APK；仅适配 Android Base64，JSON 运行库与 Android 自带实现并不完全等同。
 

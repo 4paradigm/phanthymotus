@@ -202,6 +202,7 @@ def test_shadow_real_ik_without_claim_joint_or_vendor_calls(chain):
 def test_live_eef_joint_vendor_and_measured_regrip_baseline(chain):
     adapter = prepare(chain, 'live')
     original_lease = dict(chain.link.lease)
+    measured_before = chain.p.q.copy()
     sent = apply(chain, adapter, 2, value=motion_frame(chain, adapter))
     assert chain.c.process_latest()
     joint = chain.commands[-1]
@@ -210,7 +211,13 @@ def test_live_eef_joint_vendor_and_measured_regrip_baseline(chain):
     assert joint['valid_until_ns'] <= chain.wire.eef_packets[-1]['valid_until_ns']
     assert 0 < joint['valid_until_ns']-joint['generated_ns'] <= 100_000_000
     wait_for(lambda: bool(chain.vendor_calls))
-    np.testing.assert_allclose(np.deg2rad(chain.vendor_calls[0]['left']+chain.vendor_calls[0]['right']), joint['values'])
+    first = np.deg2rad(chain.vendor_calls[0]['left']+chain.vendor_calls[0]['right'])
+    # The first tick may occur immediately after claim. The real gate slews
+    # toward IK at 1 rad/s; it must not jump directly to the final target.
+    assert np.max(np.abs(first-measured_before)) <= chain.e.gate.velocity*.02+1e-12
+    assert np.all(np.abs(first-joint['values']) <= np.abs(measured_before-joint['values'])+1e-12)
+    wait_for(lambda: np.allclose(np.deg2rad(
+        chain.vendor_calls[-1]['left']+chain.vendor_calls[-1]['right']), joint['values']))
     wait_for(lambda: np.max(np.abs(chain.p.q)) > 0)
     assert np.max(np.abs(chain.p.dq)) <= 1.
     assert chain.link.pause(time.monotonic()+1.)

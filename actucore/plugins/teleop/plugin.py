@@ -657,6 +657,34 @@ class TeleopPlugin:
             if generation is not None and generation!=self._stop_generation:cancel.set()
             self._operator_cancel=cancel
 
+    def _prepare_operator_session(self,cancel,connected,stop_generation):
+        """Retry transient sensor ages without granting motion or blocking stop."""
+        deadline=time.monotonic()+.5
+        stale=None
+        while True:
+            with self._lock:
+                if (cancel.is_set() or stop_generation!=self._stop_generation
+                        or not self._project_armed or self._project_stopping):
+                    raise ValueError('operator_start_cancelled')
+                if not connected():raise ValueError('operator_connection_changed')
+                if time.monotonic()>=deadline:
+                    raise ValueError(stale or 'driver_call_deadline')
+                try:
+                    self.link.call('prepare_operator_session',deadline)
+                except ValueError as exc:
+                    if str(exc) not in ('arm_ns_stale','power_ns_stale','fixed_ns_stale','hand_ns_stale'):
+                        raise
+                    stale=str(exc)
+                else:
+                    self._operator_session_prepared=True
+                    return
+            # A fresh callback may make the next attempt valid. Never refresh
+            # its timestamp ourselves, and release the status/config lock while
+            # waiting so PICO and Canvas stop can cancel this same operation.
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise ValueError(stale)
+            cancel.wait(min(.01,remaining))
+
     def _operator_execute_locked(self, action, cancel, connected,stop_generation=None):
         if self.cfg.get('robot_profile','tianyi2')!='tianyi2':
             raise ValueError('operator_profile_unsupported')
@@ -696,9 +724,10 @@ class TeleopPlugin:
                         raise ValueError('operator_session_disabled')
                 if not connected() or cancel.is_set():raise ValueError('operator_connection_changed')
                 if not self._project_armed or self._project_stopping:raise ValueError('project_not_armed')
-                if self.adapter.hardware_output:
-                    self.link.call('prepare_operator_session',time.monotonic()+.5)
-                    self._operator_session_prepared=True
+                prepare=self.adapter.hardware_output
+            if prepare:
+                self._prepare_operator_session(cancel,connected,stop_generation)
+            with self._lock:
                 # project_stop can fence us while the management RPC is in
                 # flight. A successful preparation is not a surviving start.
                 if (cancel.is_set() or not connected() or not self._project_armed

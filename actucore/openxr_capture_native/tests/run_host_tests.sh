@@ -131,7 +131,11 @@ if [ -n "${NLOHMANN_JSON_INCLUDE:-}" ]; then
     "$project_dir/tests/capture_wire_test.cpp" \
     -o "$build_dir/capture_wire_test"
 
-  "$build_dir/capture_wire_test"
+  # Feed real Python producer output to the native parser. Hand-written G1
+  # fixtures alone missed the Cartesian capability added for motion_control.
+  "${PYTHON:-python3}" "$project_dir/tests/emit_assignment_fixture.py" \
+    > "$build_dir/assignments.jsonl"
+  "$build_dir/capture_wire_test" "$build_dir/assignments.jsonl"
 else
   echo "capture_wire_test: SKIP (set NLOHMANN_JSON_INCLUDE)" >&2
 fi

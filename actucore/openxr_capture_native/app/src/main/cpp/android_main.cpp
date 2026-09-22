@@ -25,7 +25,7 @@ namespace {
 
 constexpr char kLogTag[] = "MotusOpenXrCapture";
 constexpr char kPreferencesName[] = "motus_capture";
-constexpr char kAppVersion[] = "0.3.18-onboarding1";
+constexpr char kAppVersion[] = "0.3.19-operator1-ikview2";
 
 struct AndroidLifecycle {
   bool resumed{false};
