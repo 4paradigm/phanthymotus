@@ -260,7 +260,7 @@ def test_the_search_falls_back_to_a_timeout_without_odometry():
         decision = _step(detections=_detections(), depth=_depth(),
                          config=config, state=state, dt=0.1)
     assert decision.publishes is False
-    assert "搜索" in decision.reason
+    assert "searched" in decision.reason
 
 
 def test_seeing_the_target_again_resets_the_search():
@@ -281,7 +281,7 @@ def test_commanded_but_not_moving_is_stuck():
                          odom={"vx": 0.0}, config=config, state=state, dt=0.1)
     # STUCK is a *reason*; the terminal status the caller sees is FAILED.
     assert decision.status == P.FAILED
-    assert "被挡住" in decision.reason
+    assert "blocked" in decision.reason
     assert decision.publishes is False
 
 
@@ -464,7 +464,7 @@ def test_the_latest_frames_bearing_is_used():
 
 def test_describe_mentions_name_colour_and_side():
     text = P.describe(dict(_obj(name="chair", x=0.5), color="dim muted azure"), 2.3)
-    assert "chair" in text and "azure" in text and "偏右" in text and "2.3m" in text
+    assert "chair" in text and "azure" in text and "right" in text and "2.3m" in text
 
 
 def test_the_three_distances_keep_their_ordering():
@@ -503,7 +503,7 @@ def test_idle_for_too_long_fails_the_task():
         decision = _step(detections=None, depth=_depth(),   # blind
                          config=config, state=state, dt=0.1)
     assert decision.status == P.FAILED
-    assert "没有发出任何运动指令" in decision.reason
+    assert "no motion command issued" in decision.reason
 
 
 def test_a_slow_but_moving_approach_never_times_out():

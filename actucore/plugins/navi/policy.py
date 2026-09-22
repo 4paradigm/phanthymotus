@@ -233,21 +233,22 @@ def _decide(detections, depth, odom, config: Config, state: State,
     `dt`         — seconds since the previous tick.
     """
     if state.arrived:
-        return Decision(None, ARRIVED, "已到达，等待下一条指令")
+        return Decision(None, ARRIVED, "arrived; waiting for the next instruction")
     if state.failed_reason:
         # Terminal too. A failed task must keep reporting the same reason
         # rather than quietly re-entering the loop on the next frame.
         return Decision(None, FAILED, state.failed_reason)
 
     if not state.target:
-        return Decision(None, IDLE, "没有导航目标")
+        return Decision(None, IDLE, "no navigation target")
 
     # No usable observation is not the same as "nothing is there". Emitting
     # nothing lets the watchdog stop the robot, which is the right resting
     # state for "this policy cannot see".
     if detections is None or depth is None:
         return Decision(None, BLIND,
-                        "观测过期或缺失（vop / 深度），停止发布，交给下游 watchdog")
+                        "observation stale or missing (vop / depth); publishing nothing, "
+                        "leaving the stop to the downstream watchdog")
 
     bands = depth.get("bands") or {}
     target = select_target(detections.get("objects"), state.target, config)
@@ -273,7 +274,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         # command rather than on a watchdog timeout — arriving is a success and
         # should not look like a dropped link in the driver's log.
         return Decision(_twist(0.0, 0.0), ARRIVED,
-                        f"目标在 {distance:.2f} m，已到达停止距离",
+                        f"target at {distance:.2f} m, stop distance reached",
                         distance_m=distance, bearing=bearing)
 
     if abs(bearing) > config.align_tol:
@@ -281,14 +282,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
         # into whatever is beside the target.
         state.commanded_vx = 0.0
         return Decision(_twist(0.0, wz), ALIGNING,
-                        f"目标偏 {bearing:+.2f}，先转正",
+                        f"target off-centre by {bearing:+.2f} rad, turning in place first",
                         distance_m=distance, bearing=bearing)
 
     vx = config.vx_max
-    status, reason = APPROACHING, "接近中"
+    status, reason = APPROACHING, "approaching"
     if distance is not None:
         vx = min(vx, max(0.0, config.k_fwd * (distance - config.stop_distance_m)))
-        reason = f"目标 {distance:.2f} m"
+        reason = f"target at {distance:.2f} m"
 
     vx, wz, status, reason = _avoid(vx, wz, bands, config, status, reason)
 
@@ -331,8 +332,8 @@ def _account_idle(decision: Decision, state: State, config: Config,
         return decision
 
     state.failed_reason = (
-        f"{config.idle_timeout_s:.0f} 秒内没有发出任何运动指令"
-        f"（最后状态：{decision.status} —— {decision.reason}），判定任务失败")
+        f"no motion command issued for {config.idle_timeout_s:.0f}s "
+        f"(last state: {decision.status} — {decision.reason}); giving up")
     return Decision(None, FAILED, state.failed_reason,
                     distance_m=decision.distance_m, bearing=decision.bearing)
 
@@ -355,12 +356,12 @@ def _avoid(vx, wz, bands, config: Config, status, reason):
         # target, and turning arbitrarily is not an improvement on that.
         if left is not None and right is not None:
             wz = config.wz_max * (1.0 if left > right else -1.0)
-        return 0.0, wz, AVOIDING, f"正前方 {ahead:.2f} m，停止前进并转向"
+        return 0.0, wz, AVOIDING, f"obstacle {ahead:.2f} m straight ahead; stopping forward motion and turning"
 
     if ahead < config.slow_distance_m:
         span = max(1e-6, config.slow_distance_m - config.obstacle_stop_m)
         scale = max(0.0, (ahead - config.obstacle_stop_m) / span)
-        return vx * scale, wz, AVOIDING, f"{reason}；正前方 {ahead:.2f} m，减速"
+        return vx * scale, wz, AVOIDING, f"{reason}; obstacle {ahead:.2f} m straight ahead, slowing down"
 
     return vx, wz, status, reason
 
@@ -380,7 +381,7 @@ def _search(config: Config, state: State, dt: float) -> Decision:
         # frames lets the watchdog hold rather than starting a search for
         # something that has not actually gone.
         return Decision(None, SEARCHING,
-                        f"目标暂时不可见（{state.missing_frames}/{config.lost_frames} 帧）")
+                        f"target briefly out of sight ({state.missing_frames}/{config.lost_frames} frames)")
 
     state.searching_for_s += dt
     # Negated, for the same reason the main loop negates its bearing:
@@ -397,16 +398,16 @@ def _search(config: Config, state: State, dt: float) -> Decision:
     # eventually noticed. "I turned all the way round and it is not here" is a
     # result, and the caller is owed it.
     if state.searched_rad >= config.search_sweep_rad:
-        state.failed_reason = (f"转过 {state.searched_rad:.1f} rad 仍未看到 "
-                               f"{state.target!r}，目标不在视野内")
+        state.failed_reason = (f"swept {state.searched_rad:.1f} rad without seeing "
+                               f"{state.target!r}: target lost")
         return Decision(None, FAILED, state.failed_reason)
     if state.searching_for_s >= config.search_timeout_s:
-        state.failed_reason = (f"搜索 {state.searching_for_s:.0f}s 未找到 "
+        state.failed_reason = (f"searched {state.searching_for_s:.0f}s without finding "
                                f"{state.target!r}")
         return Decision(None, FAILED, state.failed_reason)
 
     return Decision(_twist(0.0, wz), SEARCHING,
-                    f"目标丢失，朝最后出现的一侧转找")
+                    f"target lost; turning towards the side it was last seen")
 
 
 def _stuck(odom, state: State, commanded_vx: float, dt: float,
@@ -440,8 +441,8 @@ def _stuck(odom, state: State, commanded_vx: float, dt: float,
 
     state.moving_for_s += dt
     if state.moving_for_s >= config.stuck_window_s:
-        return (f"指令 {commanded_vx:.2f} m/s 已 {state.moving_for_s:.1f}s，"
-                f"实测 {measured:.2f} m/s —— 判定被挡住，停止")
+        return (f"commanded {commanded_vx:.2f} m/s for {state.moving_for_s:.1f}s but "
+                f"measured {measured:.2f} m/s: blocked, stopping")
     return ""
 
 # ── 稳定物体列表 ──────────────────────────────────────────────────────────────
@@ -500,9 +501,12 @@ def describe(obj, distance_m=None) -> str:
     if colour:
         parts.append(colour)
     bearing = _bearing(obj)
-    parts.append("正前方" if abs(bearing) <= 0.15
-                 else ("偏左" if bearing < 0 else "偏右")
-                 + ("很多" if abs(bearing) > 0.6 else ""))
+    if abs(bearing) <= 0.15:
+        where = "ahead"
+    else:
+        side = "left" if bearing < 0 else "right"
+        where = f"far {side}" if abs(bearing) > 0.6 else side
+    parts.append(where)
     if distance_m is not None:
         parts.append(f"{distance_m:.1f}m")
     return " · ".join(parts)
