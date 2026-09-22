@@ -1,0 +1,94 @@
+{
+  "schema": "motus.g1-calibration.v1",
+  "profile_id": "unitree_g1_23_dual_arm_relative_v1",
+  "version": "UNVERIFIED",
+  "arm_joint_names": [
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint"
+  ],
+  "urdf_path": "g1_body23.urdf",
+  "urdf_sha256": "b1af86fb023c0b6f8e52723d224be6cad70916eaff2778e7dbe09e6f91faa9b9",
+  "locked_joints": {
+    "left_hip_pitch_joint": null,
+    "left_hip_roll_joint": null,
+    "left_hip_yaw_joint": null,
+    "left_knee_joint": null,
+    "left_ankle_pitch_joint": null,
+    "left_ankle_roll_joint": null,
+    "right_hip_pitch_joint": null,
+    "right_hip_roll_joint": null,
+    "right_hip_yaw_joint": null,
+    "right_knee_joint": null,
+    "right_ankle_pitch_joint": null,
+    "right_ankle_roll_joint": null,
+    "waist_yaw_joint": null
+  },
+  "torso_frame": "pelvis",
+  "joint_velocity_rad_s": 0.2,
+  "feedforward_limit_nm": [
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0
+  ],
+  "palm_frames": {
+    "left": {
+      "position": null,
+      "orientation": null
+    },
+    "right": {
+      "position": null,
+      "orientation": null
+    }
+  },
+  "controller_to_palm": {
+    "left": {
+      "position": null,
+      "orientation": null
+    },
+    "right": {
+      "position": null,
+      "orientation": null
+    }
+  },
+  "workspace": {
+    "torso_box": null,
+    "left": null,
+    "right": null,
+    "capsules": []
+  },
+  "safety": {
+    "fsm_id": 500,
+    "voltage_range": [
+      20,
+      60
+    ],
+    "max_temperature_c": 60
+  },
+  "acceptance": {
+    "model_verified": false,
+    "workspace_verified": false,
+    "stop_verified": false,
+    "driver_crash_verified": false,
+    "pico_verified": false,
+    "external_control_excluded": false,
+    "safety_feedback_verified": false,
+    "operator": "",
+    "date": "",
+    "evidence_sha256": ""
+  }
+}
