@@ -110,6 +110,7 @@ def _load_config() -> dict:
 
 class ActuCoreBundle:
     def __init__(self, cfg: dict, executor):
+        self.server_name = cfg.get("name", "actucore-bundle")
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins") or {}
 
@@ -136,6 +137,11 @@ class ActuCoreBundle:
             from plugins.vla import VLAPlugin
             self._plugins.append(VLAPlugin(plugins_cfg["vla"], executor))
             log.info("VLAPlugin loaded")
+
+        if plugins_cfg.get("teleop", {}).get("enabled", False):
+            from plugins.teleop import TeleopPlugin
+            self._plugins.append(TeleopPlugin(plugins_cfg["teleop"], executor))
+            log.info("TeleopPlugin loaded")
 
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
@@ -267,23 +273,40 @@ def make_handler():
                 if method == "initialize":
                     log.debug(f"[mcp] initialize request from client")
                     ok({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "actucore-bundle", "version": "1.0.0"}})
+                        "serverInfo": {"name": _bundle.server_name, "version": "1.0.0"}})
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    if name.partition('_')[0] == 'teleop' and args.get('action', 'info') != 'info':
+                        import hmac
+                        import os
+                        from pathlib import Path
+                        try:
+                            key = Path(os.environ['TELEOP_MANAGEMENT_KEY_FILE']).read_text().strip()
+                        except (KeyError, OSError):
+                            key = ''
+                        if (len(key) < 32 or self.client_address[0] not in ('127.0.0.1', '::1')
+                            or self.headers.get('Origin')
+                            or not hmac.compare_digest(self.headers.get('X-Teleop-Management', ''), key)):
+                            ok({'isError': True, 'content': [{'type': 'text', 'text': json.dumps(
+                                {'state': 'error', 'error': 'teleop_management_unauthorized'})}]})
+                            return
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
-                    if not is_info:
+                    if not is_info and name != 'teleop':
                         log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        if not is_info:
+                        if not is_info and name != 'teleop':
                             log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        reply = {"content": [{"type": "text", "text": json.dumps(result)}]}
+                        if name == 'teleop' and isinstance(result, dict) and (result.get('error') or result.get('state') == 'error'):
+                            reply['isError'] = True
+                        ok(reply)
                 else:
                     err(-32601, f"Method not found: {method}")
             except BrokenPipeError:

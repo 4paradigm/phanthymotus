@@ -12,6 +12,7 @@
  */
 
 import { showToast } from './toast.js';
+import { mountTeleopPanel } from './teleop-panel.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -1272,7 +1273,49 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     });
   }
 
+  if (toolObj?.['x-connection-panel'] === 'teleop-v1') {
+    _mountTeleopConnectionPanel(el, mcpId, toolName);
+  }
   return el;
+}
+
+function _mountTeleopConnectionPanel(el, mcpId, toolName) {
+  const tool = (_allMcps.find(m => m.id === mcpId)?.tools || [])
+    .find(t => typeof t === 'object' && t.name === toolName);
+  const host = el.querySelector('.canvas-card-body-wrap');
+  if (!host) return;
+  // Dedicated controls replace the raw action/argument form for this card only.
+  host.querySelector('.canvas-card-body')?.remove();
+  host.querySelector('.canvas-exec-btn')?.remove();
+  host.querySelector('.canvas-footer-divider')?.remove();
+  mountTeleopPanel(host, {
+    actions: tool?.inputSchema?.properties?.action?.enum || ['info'],
+    configSchema: tool?.configSchema || {},
+    async loadConfig() {
+      const r=await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {signal:AbortSignal.timeout(4000)});
+      const body=await r.json();if(!r.ok || body.code!==200)throw new Error(body.message||'读取配置失败');
+      return body.data || {};
+    },
+    async saveConfig(values) {
+      if(_projectRunning)throw new Error('请先停止当前项目');
+      if(!(await _ensureEdit()))throw new Error('Canvas 正由其他人编辑');
+      const r=await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
+        method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values),signal:AbortSignal.timeout(10000)});
+      const body=await r.json();if(!r.ok || body.code!==200 || body.applied!==true)throw new Error(body.message||body.detail||'服务未确认应用配置');
+    },
+    async call(action, args = {}) {
+      const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tool: toolName, arguments: {action, ...args}}),
+        signal: AbortSignal.timeout(action === 'info' ? 4000 : 10000),
+      });
+      const body = await response.json();
+      const value = _parseMcpCallResult(body);
+      if (!response.ok || !value || value.error || value.isError)
+        throw new Error(value?.error || body.detail || body.message || '操作失败，未确认执行结果');
+      return value;
+    },
+  });
 }
 
 function _fmtColorClass(fmt) {

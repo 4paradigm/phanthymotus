@@ -1,0 +1,19 @@
+# Merge plugins.teleop into the existing ActuCore config; preserve other cards.
+mcp_port: 15730
+plugins:
+  teleop:
+    enabled: true
+    mode: shadow
+    position_scale: 0.5
+    namespace: REPLACE_WITH_ROBOT_NAMESPACE
+    driver_mcp_url: http://127.0.0.1:15707/mcp
+    calibration_path: /calibration/site.json
+    capture:
+      discovery_enabled: true
+      display_name: Tianyi Teleop
+      bind_host: 0.0.0.0
+      port: 15741
+      public_wss_url: wss://REPLACE_WITH_ROBOT_LAN_IP:15741/ws/teleop-capture
+      state_file: /var/lib/motus-teleop/capture.json
+      tls_cert_file: /etc/motus-teleop-capture-tls/cert.pem
+      tls_key_file: /etc/motus-teleop-capture-tls/key.pem
