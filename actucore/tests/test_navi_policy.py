@@ -95,11 +95,29 @@ def test_a_target_to_the_left_turns_counter_clockwise():
     assert _step(detections=_detections(_obj(x=-0.5)), depth=_depth()).values[5] > 0
 
 
-def test_it_turns_in_place_before_driving():
-    """Driving while badly misaligned traces an arc into whatever is beside
-    the target."""
+def test_a_misaligned_target_is_approached_and_turned_to_at_once():
+    """The point of the rewrite. Three axes on one tick.
+
+    The first version stopped dead (`vx = 0`) until the target was centred, then
+    walked — a stop-turn-go gait that on r1_sz read as a lurch at every bearing
+    correction. A base that can translate has no reason for it: the approach
+    velocity is decomposed along the bearing, so the robot walks the straight
+    line to the target *while* turning to face it.
+    """
     decision = _step(detections=_detections(_obj(x=0.5)), depth=_depth())
+    assert decision.values[0] > 0, "still walking"
+    assert decision.values[1] < 0, "and leaning right, towards the target"
+    assert decision.values[5] < 0, "and turning to face it, on the same tick"
+
+
+def test_a_base_that_cannot_strafe_falls_back_to_turning_first():
+    """`align_min_scale: 0` restores the original behaviour, for a chassis with
+    no lateral degree of freedom. The old gate is a configuration now, not a
+    law."""
+    decision = _step(detections=_detections(_obj(x=0.5)), depth=_depth(),
+                     config=_cfg(align_min_scale=0.0, use_lateral=False))
     assert decision.values[0] == 0.0
+    assert decision.values[1] == 0.0
     assert decision.status == P.ALIGNING
 
 
@@ -109,12 +127,31 @@ def test_an_aligned_target_is_approached():
     assert decision.status == P.APPROACHING
 
 
-def test_vy_is_always_zero():
-    """The depth map says nothing about what is beside the robot, so
-    sidestepping is moving blind. The axis stays open in the descriptor for a
-    future policy with a wider sensor."""
-    for x in (-0.5, 0.0, 0.5):
-        assert _step(detections=_detections(_obj(x=x)), depth=_depth()).values[1] == 0.0
+def test_vy_points_at_the_target_and_is_zero_dead_ahead():
+    assert _step(detections=_detections(_obj(x=0.0)), depth=_depth()).values[1] == 0.0
+    assert _step(detections=_detections(_obj(x=0.5)), depth=_depth()).values[1] < 0
+    assert _step(detections=_detections(_obj(x=-0.5)), depth=_depth()).values[1] > 0
+
+
+def test_strafing_needs_the_side_it_moves_into_to_be_known_and_clear():
+    """Sideways is the direction a forward-facing depth map knows least about,
+    so an unknown band **blocks** rather than defaulting to permission. This is
+    the one place the policy could move into space it cannot see, and it does
+    not take it."""
+    blocked = _depth(bands={"left": 5.0, "center": 5.0, "right": 0.9})
+    unknown = _depth(bands={"left": 5.0, "center": 5.0})
+    for bands in (blocked, unknown):
+        decision = _step(detections=_detections(_obj(x=0.5)), depth=bands)
+        assert decision.values[1] == 0.0
+        assert decision.values[5] < 0, "it still turns towards the target"
+
+
+def test_a_target_too_far_off_axis_is_turned_to_rather_than_strafed_at():
+    """At the frame edge the bearing is least trustworthy and so is the band
+    that would have to clear the sidestep."""
+    decision = _step(detections=_detections(_obj(x=0.95)), depth=_depth(),
+                     config=_cfg(lateral_max_bearing=0.7))
+    assert decision.values[1] == 0.0
 
 
 def test_the_twist_is_six_wide_in_control_order():
@@ -519,13 +556,15 @@ def test_a_slow_but_moving_approach_never_times_out():
 
 
 def test_turning_counts_as_motion():
-    """While aligning, vx is zero but the robot is moving."""
-    config = _cfg(idle_timeout_s=1.0)
+    """Turning in place is motion. A base configured not to strafe spends whole
+    seconds doing only that, and must not be failed for it."""
+    config = _cfg(idle_timeout_s=1.0, align_min_scale=0.0, use_lateral=False)
     state = _state()
     for _ in range(50):
         decision = _step(detections=_detections(_obj(x=0.9)), depth=_depth(),
                          config=config, state=state, dt=0.1)
     assert decision.status == P.ALIGNING
+    assert decision.values[0] == 0.0 and decision.values[5] != 0.0
     assert state.idle_for_s == 0.0
 
 
@@ -642,12 +681,15 @@ def test_forward_speed_scales_with_alignment_instead_of_switching():
     assert 0 < off < aligned
 
 
-def test_a_target_near_the_edge_is_still_turned_to_first():
-    """The intent of the old gate survives: driving at something almost out of
-    frame is driving somewhere else."""
-    decision = _step(detections=_detections(_obj(x=0.8)),
-                     depth=_depth(map_=_solid_depth(4.0)))
-    assert decision.status == P.ALIGNING and decision.values[0] == 0.0
+def test_a_target_near_the_edge_is_approached_more_slowly():
+    """The intent of the old gate survives as a speed reduction rather than a
+    stop: the bearing is least reliable at the frame edge, so the robot closes
+    on it carefully instead of refusing to move."""
+    centred = _step(detections=_detections(_obj(x=0.0)),
+                    depth=_depth(map_=_solid_depth(4.0))).values[0]
+    edge = _step(detections=_detections(_obj(x=0.8)),
+                 depth=_depth(map_=_solid_depth(4.0))).values[0]
+    assert 0 < edge < centred
 
 
 def test_arrival_does_not_require_the_precision_the_drive_gate_does():
@@ -739,3 +781,149 @@ def test_the_default_search_rate_clears_a_typical_deadband():
     deadband handling went in, with search_rate 0.4 against R1's 1.0 rad/s."""
     rate = P.Config().search_rate
     assert P.apply_deadband([0, 0, 0, 0, 0, -rate], _R1)[5] != 0.0
+
+
+# ── the robot cannot move slowly ─────────────────────────────────────────────
+#
+# Everything in this section exists because a legged base has a deadband: below
+# some speed it does not move at all, and the SDK accepts the command, returns
+# 0, and says nothing. Three separate bugs came out of that, and each one below
+# is one of them.
+
+# R1's, as `loco_servo.build_descriptor` declares them.
+_R1_DESC = {
+    "limits": {"lower": [-1.0, -1.0, 0.0, 0.0, 0.0, -2.0],
+               "upper": [1.0, 1.0, 0.0, 0.0, 0.0, 2.0],
+               "min_magnitude": [0.4, 0.4, 0.0, 0.0, 0.0, 1.0]},
+}
+
+
+def test_a_ceiling_below_the_floor_is_raised_off_it():
+    """The cause of the stutter, and the reason `adopt_limits` exists.
+
+    `wz_max` defaulted to 0.8 against a 1.0 rad/s floor, so the policy's entire
+    output range was unexecutable: every turn command snapped to 0 or ±1.0 and
+    the robot turned in a 10 Hz square wave. Nothing reported it — the SDK
+    accepted all of it.
+    """
+    config = _cfg()
+    assert config.wz_max < _R1_DESC["limits"]["min_magnitude"][5]
+    notes = P.adopt_limits(config, _R1_DESC)
+
+    assert config.wz_max > config.floor_wz, "there is somewhere to be proportional"
+    assert config.vx_max > config.floor_vx
+    assert any("wz_max" in note for note in notes), "and it says so out loud"
+
+
+def test_ceilings_are_also_pulled_down_into_the_descriptor():
+    """A ceiling above `limits.upper` is a command the sink rejects — at the
+    full command rate, for the whole run."""
+    config = _cfg(vx_max=9.0)
+    notes = P.adopt_limits(config, _R1_DESC)
+    assert config.vx_max == 1.0
+    assert any("超过下游允许" in note for note in notes)
+
+
+def test_an_axis_the_chassis_does_not_have_is_switched_off():
+    config = _cfg()
+    pinned = {"limits": dict(_R1_DESC["limits"],
+                             lower=[-1.0, 0.0, 0.0, 0.0, 0.0, -2.0],
+                             upper=[1.0, 0.0, 0.0, 0.0, 0.0, 2.0])}
+    notes = P.adopt_limits(config, pinned)
+    assert config.vy_max == 0.0
+    assert any("vy" in note for note in notes)
+
+    decision = _step(detections=_detections(_obj(x=0.5)), depth=_depth(),
+                     config=config)
+    assert decision.values[1] == 0.0
+
+
+def test_a_robot_with_no_deadband_keeps_plain_proportional_control():
+    """The floors are read from the descriptor, so a wheeled base — which can
+    creep — is unaffected by any of this."""
+    config = _cfg()
+    P.adopt_limits(config, {"limits": {"lower": [-1.0] * 6, "upper": [1.0] * 6}})
+    assert (config.floor_vx, config.floor_vy, config.floor_wz) == (0.0, 0.0, 0.0)
+    values = _step(detections=_detections(_obj(x=0.02)),
+                   depth=_depth(map_=_solid_depth(1.3)), config=config).values
+    assert 0 < values[0] < 0.1, "a small residual distance, commanded small"
+
+
+def test_the_last_stretch_is_actually_walked():
+    """`k_fwd * (d - stop)` falls under the floor 0.67 m before arriving, so the
+    robot used to stop short of a target it could see perfectly well and then
+    fail on the idle timeout. The forward gate holds the floor speed until the
+    stop distance is genuinely reached."""
+    config = _cfg()
+    P.adopt_limits(config, _R1_DESC)
+    state = _state()
+    for distance in (3.0, 2.0, 1.6, 1.4, 1.25):
+        decision = P.step(detections=_detections(_obj(x=0.0)),
+                          depth=_depth(map_=_solid_depth(distance)),
+                          odom=None, config=config, state=state, dt=0.1)
+        assert decision.values[0] >= config.floor_vx, (
+            f"stalled at {distance} m, {config.floor_vx - decision.values[0]:.2f} "
+            "m/s below what the robot can execute")
+
+    arrival = P.step(detections=_detections(_obj(x=0.0)),
+                     depth=_depth(map_=_solid_depth(1.1)), odom=None,
+                     config=config, state=state, dt=0.1)
+    assert arrival.status == P.ARRIVED
+
+
+def test_the_yaw_axis_does_not_chatter_around_its_threshold():
+    """Hysteresis plus a dwell. Without them an error sitting on `align_tol`
+    toggles the axis every tick, and on a deadbanded robot that toggle is full
+    speed to nothing and back — the judder this branch is named for."""
+    config = _cfg()
+    P.adopt_limits(config, _R1_DESC)
+    state = _state()
+
+    # A bearing oscillating either side of align_tol, as a real detector does.
+    turning = []
+    for tick in range(20):
+        bearing = config.align_tol + (0.01 if tick % 2 else -0.01)
+        decision = P.step(detections=_detections(_obj(x=bearing)),
+                          depth=_depth(map_=_solid_depth(3.0)), odom=None,
+                          config=config, state=state, dt=0.1)
+        turning.append(decision.values[5] != 0.0)
+
+    switches = sum(1 for a, b in zip(turning, turning[1:]) if a != b)
+    assert switches <= 1, f"the yaw axis toggled {switches} times in 2 seconds"
+
+
+def test_a_turn_ends_once_the_target_is_well_centred():
+    """Hysteresis must not become a latch: the release threshold is real."""
+    config = _cfg()
+    state = _state()
+    P.step(detections=_detections(_obj(x=0.5)), depth=_depth(), odom=None,
+           config=config, state=state, dt=0.1)
+    assert state.yaw_gate.on
+
+    for _ in range(10):
+        decision = P.step(detections=_detections(_obj(x=0.0)), depth=_depth(),
+                          odom=None, config=config, state=state, dt=0.1)
+    assert decision.values[5] == 0.0
+    assert state.yaw_gate.on is False
+
+
+def test_an_obstacle_ahead_is_stepped_around_not_only_turned_from():
+    """Turning alone changes where the robot points; on a base that can
+    translate, the sidestep is what gets it out of the way — and doing both at
+    once is one motion instead of a pirouette followed by a walk."""
+    # The map puts the target 4 m off; the bands put something in the way. A
+    # single source cannot express that — the target would *be* the obstacle.
+    decision = _step(detections=_detections(_obj(x=0.0)),
+                     depth=_depth(bands={"left": 5.0, "center": 0.5, "right": 1.0},
+                                  map_=_solid_depth(4.0)))
+    assert decision.status == P.AVOIDING
+    assert decision.values[0] == 0.0, "no forward motion into it"
+    assert decision.values[1] > 0, "stepping left, the side with room"
+    assert decision.values[5] > 0, "and turning that way too"
+
+
+def test_an_obstacle_with_no_room_either_side_is_not_stepped_into():
+    decision = _step(detections=_detections(_obj(x=0.0)),
+                     depth=_depth(bands={"left": 1.0, "center": 0.5, "right": 0.9},
+                                  map_=_solid_depth(4.0)))
+    assert decision.values[1] == 0.0

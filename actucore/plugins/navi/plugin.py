@@ -144,6 +144,7 @@ class NaviPlugin:
         self._odom_ms = 0
         self._binding = {}
         self._acp_action_id = ""
+        self._limit_notes: list = []
 
     # ── tool ─────────────────────────────────────────────────────────────────
 
@@ -229,8 +230,18 @@ class NaviPlugin:
                                         "scope": "instance"},
                     "vx_max": {"type": "number", "default": 0.4,
                                "scope": "instance"},
+                    "vy_max": {"type": "number", "default": 0.4,
+                               "scope": "instance"},
                     "wz_max": {"type": "number", "default": 0.8,
                                "scope": "instance"},
+                    "use_lateral": {"type": "boolean", "default": True,
+                                    "scope": "instance"},
+                    "lateral_scale": {"type": "number", "default": 1.0,
+                                      "scope": "instance"},
+                    "align_min_scale": {"type": "number", "default": 0.45,
+                                        "scope": "instance"},
+                    "half_fov_rad": {"type": "number", "default": 0.55,
+                                     "scope": "instance"},
                     "align_tol": {"type": "number", "default": 0.08,
                                   "scope": "instance"},
                     "min_confidence": {"type": "number", "default": 0.35,
@@ -317,6 +328,15 @@ class NaviPlugin:
                 return self._error(
                     f"下游 mode 是 {mode!r}，这张卡片只会产生 {CONTROL_MODE!r} —— "
                     "它输出的是底盘速度，不是关节角")
+
+        # Fit the policy's ceilings to the robot before the first tick.
+        #
+        # Without this the card happily runs a configuration the chassis cannot
+        # execute — a `wz_max` under the robot's own deadband means every turn
+        # command snaps to all-or-nothing, and nothing anywhere says so. The
+        # notes go into `degraded` so the adjustment is visible rather than
+        # merely correct.
+        self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
 
         rate = negotiate.effective_rate(capabilities, descriptor,
                                         self._cfg.get("rate_hz"))
@@ -540,9 +560,15 @@ class NaviPlugin:
     def _config_action(self, args: dict):
         changed = {}
         for key, value in (args or {}).items():
-            if key in policy_mod.Config.__dataclass_fields__ and value is not None:
-                setattr(self._config, key, float(value))
-                changed[key] = float(value)
+            field = policy_mod.Config.__dataclass_fields__.get(key)
+            if field is None or value is None:
+                continue
+            # Coerce to the field's own type. Blanket `float()` turned
+            # `use_lateral` into 1.0 — truthy, so it worked, which is exactly
+            # how a field ends up holding the wrong type for a year.
+            cast = bool if field.type in ("bool", bool) else float
+            setattr(self._config, key, cast(value))
+            changed[key] = getattr(self._config, key)
         return {"status": "configured", "config": changed}
 
     def _info(self):
@@ -595,6 +621,7 @@ class NaviPlugin:
         if self._running and not self._descriptor:
             out.append("没有接驱动的底盘命令卡片 —— 指令只发到话题上，"
                        "不会驱动任何硬件（想看它算什么的话，这是对的）")
+        out.extend(self._limit_notes)
         for hint in (self._binding.get("unknown") or []):
             out.append(f"有一路输入没有被使用：{hint}")
         return out

@@ -15,10 +15,39 @@ bundle is the other approach, and conflating the two gives something that is
 bad at both.
 
   1. pick the target out of what vop reports
-  2. turn to face it        wz from its horizontal offset
-  3. drive towards it       vx from its distance, zero until roughly aligned
-  4. slow and steer for obstacles the depth bands report
+  2. travel towards it      vx and vy, decomposed along its bearing
+  3. turn to face it        wz from the same bearing, at the same time
+  4. slow and sidestep for obstacles the depth bands report
   5. stop at `stop_distance_m`, and say so
+
+── all three axes move together, and that is the whole point ────────────────
+
+Steps 2 and 3 run on the same tick. The first version of this file ran them in
+sequence — `vx = 0` until the target was roughly centred — and a base that can
+translate sideways has no reason to do that: the approach velocity is simply
+decomposed along the target's bearing (`half_fov_rad`), so the robot walks the
+straight line to the thing while turning to face it. What that removes is the
+stop-turn-go gait, which on r1_sz read as a lurch at every bearing correction.
+
+── the robot cannot move slowly, and that shapes everything above ───────────
+
+A legged base has to assemble a whole gait cycle, so below some speed it does
+not move at all — R1 needs 0.4 m/s and 1.0 rad/s, and under that the SDK accepts
+the command, returns 0, and nothing happens. So a proportional law cannot make a
+small correction *slowly*; it can only make it *briefly*. Every axis is
+therefore a switch with hysteresis (`Gate`) whose magnitude, once on, is lifted
+to at least the floor (`_lift`).
+
+Two consequences that are not obvious and were both bugs here:
+
+* **A ceiling below the floor makes an axis bang-bang.** `wz_max` was 0.8 against
+  a 1.0 rad/s floor, so every turn command in the robot's entire reachable range
+  snapped to either 0 or 1.0 — a 10 Hz square wave, which is what "顿挫" was.
+  `adopt_limits` now raises the ceilings off the floor at start.
+* **Proportional control dies in the last stretch.** `k_fwd * (d - stop)` falls
+  under the floor 0.67 m before arriving, so the robot stopped short of a target
+  it could see and then failed on the idle timeout. The forward gate holds the
+  floor speed until the stop distance is genuinely reached.
 
 ── the safety property that matters more than any of the above ──────────────
 
@@ -35,6 +64,7 @@ it is being driven. Silence is the one signal a broken upstream cannot fake.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 # Status values. `arrived` and `stuck` are terminal for one `navigate_to`;
@@ -97,10 +127,45 @@ class Config:
     # far worse outcome than facing it a little off: the position is what
     # arriving means, the heading is a courtesy.
     arrive_patience_s: float = 3.0
+    # Speed retained when the target is at `align_full_stop` or further off.
+    # 0.0 restores the original behaviour — stop dead and turn in place — and is
+    # the right setting for a base that cannot translate sideways. Anything
+    # above 0 keeps the robot moving through the correction, which is what makes
+    # the path an arc instead of a sequence of stops.
+    align_min_scale: float = 0.45
     k_yaw: float = 1.2
     k_fwd: float = 0.6
     vx_max: float = 0.4
+    vy_max: float = 0.4
     wz_max: float = 0.8
+    # The one place a normalised bearing becomes an angle.
+    #
+    # `position[0]` from vop is a fraction of the image half-width, **not** a
+    # heading — which is why `align_tol` and friends are all in those same
+    # normalised units and must stay that way. The approach velocity is the only
+    # quantity that needs a real angle, to be split between vx and vy, and this
+    # is the camera's horizontal half-FOV (~63° full). Being 20% out only makes
+    # the arc slightly wide; the yaw loop closes it either way.
+    half_fov_rad: float = 0.55
+    # Sidestep while approaching, and to get out from in front of an obstacle.
+    # Turn it off for a base with no lateral degree of freedom — the descriptor
+    # pinning vy to zero does that on its own, but this says so in one place.
+    use_lateral: bool = True
+    # Scales the lateral component only. Below 1.0 the robot leans on turning
+    # more than on strafing, which is the conservative direction: the depth map
+    # is forward-facing, so sideways is the direction it knows least about.
+    lateral_scale: float = 1.0
+    # Past this offset, turn rather than strafe: the bearing estimate is worst at
+    # the frame edge, and so is the depth band that would have to clear it.
+    lateral_max_bearing: float = 0.7
+    # Hysteresis. An axis engages at its threshold and releases at this fraction
+    # of it — without the gap, an error hovering at the threshold toggles the
+    # axis at tick rate, and on a deadbanded robot that toggle is full speed to
+    # nothing and back.
+    release_frac: float = 0.4
+    # ...and stays engaged at least this long, so one noisy frame cannot end a
+    # turn that has only just started.
+    min_dwell_s: float = 0.25
     # Searching turns at this rate. It must clear the robot's deadband or the
     # search commands are snapped to zero and the robot simply stands there
     # while the card reports "searching" — which is what happened on r1_sz once
@@ -129,12 +194,56 @@ class Config:
     stuck_speed_ratio: float = 0.2
     min_confidence: float = 0.35
 
+    # Filled in at start from the downstream descriptor's `min_magnitude` — the
+    # robot's own deadband, per axis, in its own units. Left at 0 there is no
+    # deadband to work around and every axis is plain proportional control,
+    # which is the correct behaviour for a wheeled base.
+    #
+    # Not operator-editable: it is a reading of the hardware, and a hand-typed
+    # copy is a copy that goes stale. See `adopt_limits`.
+    floor_vx: float = 0.0
+    floor_vy: float = 0.0
+    floor_wz: float = 0.0
+
+
+@dataclass
+class Gate:
+    """Whether one axis is commanding motion right now.
+
+    A switch rather than a gain, because a robot with a deadband has no slow
+    regime to be proportional in. The error decides *whether* to move; `_lift`
+    decides how fast, and the answer is "at least the floor".
+
+    Hysteresis plus a minimum dwell, and both are load-bearing. Without the gap
+    between `engage` and `release`, an error sitting on the threshold turns the
+    axis on and off every tick; without the dwell, a single bad detection frame
+    ends a turn 100 ms after it started. Either one produces the same symptom —
+    a robot that judders instead of moving.
+    """
+
+    on: bool = False
+    held_s: float = 0.0
+
+    def update(self, error: float, *, engage: float, release: float,
+               dt: float, min_dwell_s: float) -> bool:
+        self.held_s += dt
+        if self.on:
+            if error <= release and self.held_s >= min_dwell_s:
+                self.on = False
+                self.held_s = 0.0
+        elif error >= engage:
+            self.on = True
+            self.held_s = 0.0
+        return self.on
+
 
 @dataclass
 class State:
     """What the policy remembers between ticks. Owned by the card, passed in."""
 
     target: str = ""
+    yaw_gate: Gate = field(default_factory=Gate)
+    fwd_gate: Gate = field(default_factory=Gate)
     missing_frames: int = 0
     last_seen_side: float = 1.0          # +1 target was right, -1 it was left
     searching_for_s: float = 0.0
@@ -201,18 +310,117 @@ def apply_deadband(values, min_magnitude) -> list:
     return out
 
 
-def _twist(vx: float, wz: float) -> list:
-    """A body twist in `motus.control/1` order.
+def _twist(vx: float, vy: float, wz: float) -> list:
+    """A body twist in `motus.control/1` order: [vx, vy, vz, wx, wy, wz].
 
-    `vy` stays 0: the depth map says nothing about what is beside the robot,
-    and sidestepping blind is worse than turning. The descriptor keeps the axis
-    open so a future policy with a wider sensor can use it.
+    All three are required. They used to be two, and a default on the middle one
+    would let the old two-argument calls keep compiling with the yaw rate landing
+    on the lateral axis — a robot that strafes when told to turn, from a diff
+    that looks harmless.
+
+    `vy` is left of forward, matching every other body frame in this project.
+    It is used, not pinned: a base that cannot strafe says so by pinning the
+    axis in its descriptor, and `adopt_limits` reads that and sets `vy_max` to
+    zero. The policy does not need to know which kind of robot it is on.
     """
-    return [vx, 0.0, 0.0, 0.0, 0.0, wz]
+    return [vx, vy, 0.0, 0.0, 0.0, wz]
 
 
 def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
+
+
+def _lift(value: float, floor: float, ceiling: float) -> float:
+    """Quantise one axis onto what the robot can actually execute.
+
+    Clamp to the ceiling, then round the magnitude **up** to the floor. Unlike
+    `apply_deadband` there is no "too small, drop it to zero" case, because by
+    the time a value reaches here a `Gate` has already decided this axis should
+    be moving. Splitting the decision from the magnitude is what keeps the two
+    from disagreeing — the old arrangement had the policy ask for 0.2 m/s and a
+    filter downstream silently answer 0.
+    """
+    value = _clamp(value, ceiling)
+    if not floor or value == 0.0:
+        return value
+    if abs(value) >= floor:
+        return value
+    return floor if value > 0 else -floor
+
+
+# Ceilings are raised to this multiple of the floor when they sit below it.
+# 1.5 rather than 1.0 because equality leaves a single commandable speed, which
+# is a switch, not a controller — the point is to have somewhere to be
+# proportional in.
+_CEILING_HEADROOM = 1.5
+
+
+def adopt_limits(config: Config, descriptor: dict) -> list[str]:
+    """Fit the policy's ceilings to the robot that will execute them.
+
+    Returns human-readable notes about anything it had to change, for the card
+    to surface in `info().degraded`. Silence would be wrong here: an operator
+    who set `vx_max: 0.2` is owed the news that this robot cannot go that slowly,
+    rather than a robot that ignores the setting.
+
+    Two directions, and both were real failures on r1_sz:
+
+    * **Up, off the deadband.** `wz_max` defaulted to 0.8 against a 1.0 rad/s
+      floor, so the policy's entire output range was unexecutable and every turn
+      command snapped to 0 or ±1.0. Nothing reported anything — the SDK accepted
+      all of it.
+    * **Down, into the descriptor's limits.** A ceiling above `limits.upper` is
+      a command `ControlSink` rejects, at the full command rate, for the whole
+      run.
+    """
+    notes: list[str] = []
+    limits = (descriptor or {}).get("limits") or {}
+    floors = list(limits.get("min_magnitude") or [])
+    lower = list(limits.get("lower") or [])
+    upper = list(limits.get("upper") or [])
+
+    def at(row, index):
+        try:
+            return abs(float(row[index]))
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    # The three twist axes this policy drives, by their index in the six-wide
+    # vector. vz/wx/wy are not here because nothing here produces them.
+    for index, name, ceiling_attr, floor_attr in (
+            (0, "vx", "vx_max", "floor_vx"),
+            (1, "vy", "vy_max", "floor_vy"),
+            (5, "wz", "wz_max", "floor_wz")):
+        floor = at(floors, index) or 0.0
+        setattr(config, floor_attr, floor)
+
+        # An axis the robot does not have. Pinned lower == upper == 0 is how a
+        # descriptor says so, and the policy has to stop asking for it — not
+        # because the sink would reject it (it would, loudly) but because the
+        # decomposition should put that speed on an axis that exists.
+        bound = at(upper, index)
+        if bound is not None and at(lower, index) == 0.0 and bound == 0.0:
+            if getattr(config, ceiling_attr) > 0:
+                notes.append(f"下游底盘没有 {name} 这个自由度，已停用该轴")
+            setattr(config, ceiling_attr, 0.0)
+            continue
+
+        ceiling = float(getattr(config, ceiling_attr))
+        if floor and ceiling < floor * _CEILING_HEADROOM:
+            raised = floor * _CEILING_HEADROOM
+            if bound is not None:
+                raised = min(raised, bound)
+            if raised > ceiling:
+                setattr(config, ceiling_attr, raised)
+                notes.append(
+                    f"{name}_max {ceiling:g} 低于机器人的最小可执行量 {floor:g}，"
+                    f"已提到 {raised:g} —— 否则该轴只有「0 或 {floor:g}」两个值，"
+                    f"表现为顿挫")
+        if bound is not None and float(getattr(config, ceiling_attr)) > bound:
+            notes.append(f"{name}_max 超过下游允许的 {bound:g}，已压回")
+            setattr(config, ceiling_attr, bound)
+
+    return notes
 
 
 def select_target(objects, name: str, config: Config):
@@ -333,7 +541,15 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     # Turn towards it. Positive bearing means the target is right of centre, and
     # `wz` is positive counter-clockwise, so the sign is inverted here.
-    wz = _clamp(-config.k_yaw * bearing, config.wz_max)
+    #
+    # Gated rather than continuous: see `Gate`. The gain still sets the *rate*
+    # once engaged, so a target far off to the side is chased faster.
+    turning = state.yaw_gate.update(
+        abs(bearing), engage=config.align_tol,
+        release=config.align_tol * config.release_frac,
+        dt=dt, min_dwell_s=config.min_dwell_s)
+    wz = (_lift(-config.k_yaw * bearing, config.floor_wz, config.wz_max)
+          if turning else 0.0)
 
     within = distance is not None and distance <= config.stop_distance_m
     if within:
@@ -349,7 +565,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         # One explicit zero before going quiet, so the chassis stops on a
         # command rather than on a watchdog timeout — arriving is a success and
         # should not look like a dropped link in the driver's log.
-        return Decision(_twist(0.0, 0.0), ARRIVED,
+        return Decision(_twist(0.0, 0.0, 0.0), ARRIVED,
                         f"target at {distance:.2f} m, stop distance reached"
                         + ("" if abs(bearing) <= config.arrive_align_tol else
                            f" (still {bearing:+.2f} off-centre after "
@@ -369,18 +585,31 @@ def _decide(detections, depth, odom, config: Config, state: State,
     align = _alignment_scale(bearing, config)
     if align <= 0.0:
         state.commanded_vx = 0.0
-        return Decision(_twist(0.0, wz), ALIGNING,
-                        f"target off-centre by {bearing:+.2f} rad, turning in place first",
+        return Decision(_twist(0.0, 0.0, wz), ALIGNING,
+                        f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
                         distance_m=distance, bearing=bearing)
 
-    vx = config.vx_max * align
+    speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
     if distance is not None:
-        vx = min(vx, max(0.0, config.k_fwd * (distance - config.stop_distance_m)
-                         * align))
+        speed = min(speed, max(0.0, config.k_fwd
+                               * (distance - config.stop_distance_m) * align))
         reason = f"target at {distance:.2f} m"
 
-    vx, wz, status, reason = _avoid(vx, wz, bands, config, status, reason)
+    # Keep walking until the stop distance is genuinely reached.
+    #
+    # `speed` falls below the robot's floor well before then — at R1's numbers,
+    # 0.67 m before — so without this gate the robot stopped short of a target
+    # it could see perfectly well and then failed on the idle timeout. The gate
+    # engages on metres remaining, and `_lift` supplies the only speed the robot
+    # has for the final stretch.
+    remaining = 99.0 if distance is None else distance - config.stop_distance_m
+    driving = state.fwd_gate.update(
+        remaining, engage=0.05, release=0.0,
+        dt=dt, min_dwell_s=config.min_dwell_s)
+
+    vx, vy = _approach(speed if driving else 0.0, bearing, bands, config)
+    vx, vy, wz, status, reason = _avoid(vx, vy, wz, bands, config, status, reason)
 
     stuck = _stuck(odom, state, vx, dt, config)
     if stuck:
@@ -388,7 +617,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         return Decision(None, FAILED, stuck, distance_m=distance, bearing=bearing)
 
     state.commanded_vx = vx
-    return Decision(_twist(vx, wz), status, reason,
+    return Decision(_twist(vx, vy, wz), status, reason,
                     distance_m=distance, bearing=bearing)
 
 
@@ -428,30 +657,82 @@ def _account_idle(decision: Decision, state: State, config: Config,
 
 
 def _alignment_scale(bearing: float, config: Config) -> float:
-    """前进速度乘的那个系数：对得越正走得越快，偏得厉害就只转不走。
+    """前进速度乘的那个系数：对得越正走得越快。
 
-    1.0 直到 align_tol，之后线性降到 align_full_stop 处的 0。返回 0 表示原地转 ——
-    目标几乎在视野边缘，直着走过去是走向别处。
+    1.0 直到 align_tol，之后线性降到 align_full_stop 处的 `align_min_scale`。
+
+    这个下限以前是硬 0 —— 目标一偏就完全停下先转正。对能横移的底盘没有理由这么
+    做：`_approach` 会把速度按方位角拆成 vx/vy，本来就是朝着目标走的，停下来只是
+    多一次起步。留 `align_min_scale: 0.0` 可以退回原来的走法，不能横移的底盘应该
+    这么配。
     """
     offset = abs(bearing)
     if offset <= config.align_tol:
         return 1.0
+    floor = max(0.0, min(1.0, config.align_min_scale))
     if offset >= config.align_full_stop:
-        return 0.0
+        return floor
     span = max(1e-6, config.align_full_stop - config.align_tol)
-    return (config.align_full_stop - offset) / span
+    return floor + (1.0 - floor) * (config.align_full_stop - offset) / span
 
 
-def _avoid(vx, wz, bands, config: Config, status, reason):
-    """Slow for what is ahead, and steer towards the freer side if it is close.
+def _may_strafe(towards_right: bool, bands, config: Config) -> bool:
+    """Whether it is honest to put speed on `vy` right now.
 
-    Only forward motion is affected. Backing away is not available — the depth
-    map covers what the camera sees and nothing behind the robot, so reversing
-    is moving blind.
+    Sideways is the direction a forward-facing depth map knows least about, so
+    the side band has to be **known and clear** — unknown blocks, rather than
+    defaulting to permission. That is the one place this policy is allowed to
+    move into space it cannot see, and it does not take it.
+    """
+    if not config.use_lateral or config.vy_max <= 0:
+        return False
+    room = bands.get("right" if towards_right else "left")
+    return room is not None and room > config.slow_distance_m
+
+
+def _approach(speed: float, bearing: float, bands, config: Config):
+    """Split the approach speed between forward and sideways.
+
+    The target sits at roughly `bearing * half_fov_rad` off the nose, so
+    travelling towards it is that speed rotated by that angle — which is a
+    straight line to the thing, walked while turning to face it, instead of a
+    turn followed by a walk.
+
+    The two floors quantise the result, so the realised direction is coarser
+    than the computed one. That is the robot, not the arithmetic: it cannot put
+    0.12 m/s on an axis. The yaw loop is closing the same error at the same
+    time, so a coarse arc still converges.
+    """
+    if speed <= 0.0:
+        return 0.0, 0.0
+
+    angle = bearing * config.half_fov_rad
+    forward = _lift(speed * math.cos(angle), config.floor_vx, config.vx_max)
+
+    if abs(bearing) > config.lateral_max_bearing:
+        # Too far off to trust either the bearing or the side band. Turn.
+        return forward, 0.0
+    lateral = -speed * math.sin(angle) * config.lateral_scale
+    if lateral == 0.0 or not _may_strafe(lateral < 0, bands, config):
+        return forward, 0.0
+    return forward, _lift(lateral, config.floor_vy, config.vy_max)
+
+
+def _avoid(vx, vy, wz, bands, config: Config, status, reason):
+    """Slow for what is ahead, and move out from in front of it if it is close.
+
+    Backing away is not available — the depth map covers what the camera sees
+    and nothing behind the robot, so reversing is moving blind.
+
+    When something is close enough to stop for, the robot both turns towards
+    the freer side **and** steps towards it. Turning alone only changes where it
+    is pointing; on a base that can translate, the sidestep is what actually
+    gets it out of the way, and doing both at once is one continuous motion
+    rather than a pirouette followed by a walk.
     """
     ahead = bands.get("center")
     if ahead is None:
-        return vx, wz, status, reason
+        return vx, vy, wz, status, reason
 
     if ahead <= config.obstacle_stop_m:
         left, right = bands.get("left"), bands.get("right")
@@ -459,15 +740,29 @@ def _avoid(vx, wz, bands, config: Config, status, reason):
         # anything, keep the bearing-derived wz — it is at least aimed at the
         # target, and turning arbitrarily is not an improvement on that.
         if left is not None and right is not None:
-            wz = config.wz_max * (1.0 if left > right else -1.0)
-        return 0.0, wz, AVOIDING, f"obstacle {ahead:.2f} m straight ahead; stopping forward motion and turning"
+            towards_right = right > left
+            wz = config.wz_max * (-1.0 if towards_right else 1.0)
+            vy = (_lift(-config.vy_max * config.lateral_scale if towards_right
+                        else config.vy_max * config.lateral_scale,
+                        config.floor_vy, config.vy_max)
+                  if _may_strafe(towards_right, bands, config) else 0.0)
+        else:
+            vy = 0.0
+        return (0.0, vy, wz, AVOIDING,
+                f"obstacle {ahead:.2f} m straight ahead; stopping forward motion"
+                + (" and stepping aside" if vy else " and turning"))
 
     if ahead < config.slow_distance_m:
         span = max(1e-6, config.slow_distance_m - config.obstacle_stop_m)
         scale = max(0.0, (ahead - config.obstacle_stop_m) / span)
-        return vx * scale, wz, AVOIDING, f"{reason}; obstacle {ahead:.2f} m straight ahead, slowing down"
+        # Both translation axes scale together, so slowing down does not also
+        # change the direction of travel.
+        return (_lift(vx * scale, config.floor_vx, config.vx_max) if vx else 0.0,
+                _lift(vy * scale, config.floor_vy, config.vy_max) if vy else 0.0,
+                wz, AVOIDING,
+                f"{reason}; obstacle {ahead:.2f} m straight ahead, slowing down")
 
-    return vx, wz, status, reason
+    return vx, vy, wz, status, reason
 
 
 def _search(config: Config, state: State, dt: float) -> Decision:
@@ -514,7 +809,7 @@ def _search(config: Config, state: State, dt: float) -> Decision:
                                f"{state.target!r}")
         return Decision(None, FAILED, state.failed_reason)
 
-    return Decision(_twist(0.0, wz), SEARCHING,
+    return Decision(_twist(0.0, 0.0, wz), SEARCHING,
                     f"target lost; turning towards the side it was last seen")
 
 
