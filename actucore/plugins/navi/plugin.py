@@ -53,6 +53,33 @@ ACTION_DIM = 6
 TOPIC_FORMAT = "control/velocity"
 
 
+def _sensor_qos():
+    """BEST_EFFORT, to match what every producer this card reads actually uses.
+
+    **A reliable subscriber does not match a best-effort publisher.** ROS2 treats
+    that as an incompatible QoS pair and simply never delivers — no error on
+    either side, no warning in any log, and `ros2 topic info` still shows one
+    publisher and one subscription. The card reports "还没有收到任何检测结果"
+    while vop is demonstrably publishing, which reads as a broken camera.
+
+    Passing a bare `1` for the depth argument is what produced that: the integer
+    form is shorthand for the *default* profile, and the default is RELIABLE.
+    Every producer here is best-effort and deliberately so — perception's vop and
+    visual_depth both use `_PUB_QOS`, the R1 driver's loco_state uses
+    `_LOW_LAT_QOS`, and all three would rather drop a frame than block on one.
+
+    Depth 2 rather than 10: this card only ever reads the newest sample, and a
+    deeper queue just means the frame it eventually processes is older.
+    """
+    from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                           ReliabilityPolicy)
+
+    return QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                      history=HistoryPolicy.KEEP_LAST,
+                      depth=2,
+                      durability=DurabilityPolicy.VOLATILE)
+
+
 class NaviPlugin:
     PREFIX = "navi"          # no underscore — dispatch routes on partition("_")
 
@@ -525,14 +552,15 @@ class NaviPlugin:
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
+        qos = _sensor_qos()
         if bound["depth_map"]:
             node.create_subscription(CompressedImage, bound["depth_map"],
-                                     self._on_depth_map, 1)
+                                     self._on_depth_map, qos)
         for role in ("objects", "depth_summary", "odom"):
             if bound[role]:
                 node.create_subscription(
                     String, bound[role],
-                    lambda message, r=role: self._on_string(r, message), 1)
+                    lambda message, r=role: self._on_string(r, message), qos)
         return bound, ""
 
     def _role_of(self, topic: str) -> str:

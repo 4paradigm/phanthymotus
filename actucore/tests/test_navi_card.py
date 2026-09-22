@@ -29,6 +29,19 @@ for _mod, _name in (("sensor_msgs.msg", "CompressedImage"),
     setattr(_m, _name, type(_name, (), {}))
     setattr(sys.modules[_pkg], "msg", _m)
 
+# rclpy.qos, for `_sensor_qos`. Stubbed rather than skipped because the profile
+# it builds is the whole point: a reliable subscriber silently receives nothing
+# from these best-effort publishers, so "which reliability" is worth asserting.
+_rclpy = sys.modules.setdefault("rclpy", _types.ModuleType("rclpy"))
+_qos = sys.modules.setdefault("rclpy.qos", _types.ModuleType("rclpy.qos"))
+for _enum in ("ReliabilityPolicy", "HistoryPolicy", "DurabilityPolicy"):
+    setattr(_qos, _enum, type(_enum, (), {"BEST_EFFORT": "best_effort",
+                                          "RELIABLE": "reliable",
+                                          "KEEP_LAST": "keep_last",
+                                          "VOLATILE": "volatile"}))
+setattr(_qos, "QoSProfile", lambda **kw: dict(kw))
+setattr(_rclpy, "qos", _qos)
+
 from plugins.navi import NaviPlugin  # noqa: E402
 from plugins.navi import plugin as navi_plugin  # noqa: E402
 
@@ -327,3 +340,16 @@ def test_subscriptions_are_actually_created():
     assert problem == ""
     assert set(node.subscriptions) == {"/cam/objects", "/cam/visual_depth",
                                        "/r1/state/odom"}
+
+
+def test_subscriptions_use_best_effort_qos():
+    """A reliable subscriber never matches a best-effort publisher, and ROS2
+    reports that as nothing at all — no error, no warning, and `ros2 topic info`
+    still shows both ends. Every producer this card reads (vop, visual_depth,
+    loco_state) publishes best-effort on purpose.
+    """
+    from plugins.navi.plugin import _sensor_qos
+
+    profile = _sensor_qos()
+    assert profile["reliability"] == "best_effort"
+    assert profile["depth"] == 2      # only the newest sample is ever read
