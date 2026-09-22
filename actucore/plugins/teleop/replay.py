@@ -95,7 +95,7 @@ def analyze(recording, profile, destination):
     selected=[x for x in selected if x['source_ns']-selected[0]['source_ns']<=6_000_000_000]
     package={'schema':'motus.teleop.replay.v1','recording_sha256':digest(recording/'poses.jsonl'),
              'profile_sha256':digest(profile),'recorded_profile_sha256':manifest['profile_sha256'],'sources':manifest['sources'],'position_scale':scale,
-             'compiled_sources':{n:digest(Path(__file__).with_name(n)) for n in ('kinematics.py','workspace.py','reachability.py','replay.py','acceptance.py','adapter.py','tianyi.py','runtime.py','dispatch.py')},
+             'compiled_sources':{n:digest(Path(__file__).with_name(n)) for n in ('kinematics.py','workspace.py','reachability.py','trajectory.py','replay.py','acceptance.py','adapter.py','tianyi.py','runtime.py','dispatch.py')},
              'waypoints':selected,'hardware_output':False}
     write_json(destination/'trajectory.json',package)
     write_json(destination/'analysis.json',{'passed':True,'rows':len(rows),'valid_segments':len(useful),
@@ -124,13 +124,19 @@ def schedule(package, solver, measured):
             dt=max(.02,float(np.max(np.abs(target-q)))/velocity,(w['source_ns']-last_source)/1e9)
             t+=dt;points.append({'t':t,'q':target.tolist(),'phase':phase});q=target;last_source=w['source_ns']
         t+=1.;points.append({'t':t,'q':q.tolist(),'phase':phase+'_plateau'})
-    if t>40:raise ValueError('trajectory_exceeds_round_budget')  # 5s reserved for pause/recovery.
+    if getattr(getattr(solver, 'trajectory', None), 'enabled', False):
+        from .trajectory import smooth_schedule
+        points = smooth_schedule(points, solver.trajectory, solver)
+    if points[-1]['t']>40:raise ValueError('trajectory_exceeds_round_budget')  # 5s reserved for pause/recovery.
     return points
 
 
 def target_at(points, elapsed):
     for a,b in zip(points,points[1:]):
         if elapsed<=b['t']:
+            if 'polynomial' in a:
+                local = max(0., min(elapsed-a['t'], b['t']-a['t']))
+                return np.polyval(np.asarray(a['polynomial']), local).tolist(), b['phase']
             u=max(0,min(1,(elapsed-a['t'])/(b['t']-a['t'])))
             return [x+(y-x)*u for x,y in zip(a['q'],b['q'])],b['phase']
     return points[-1]['q'],points[-1]['phase']
@@ -230,7 +236,10 @@ def execute(link, points, solver, sink, *, clock=time.monotonic, sleep=time.slee
                 if clock()>=geometry_deadline:raise ValueError('collision_check_timeout')
             try:
                 advance_scale=1.
-                if hasattr(solver,'_safe_advance'):
+                if getattr(getattr(solver, 'trajectory', None), 'enabled', False):
+                    from .trajectory import execution_state
+                    step = solver.command_step(target, measured, previous, geometry_budget, execution_state(state))
+                elif hasattr(solver,'_safe_advance'):
                     step,advance_scale=solver._safe_advance(measured,previous,step,geometry_budget)
                 elif hasattr(solver,'_safe_transition'):
                     solver._safe_transition(measured,step,geometry_budget)
@@ -242,7 +251,7 @@ def execute(link, points, solver, sink, *, clock=time.monotonic, sleep=time.slee
                       'measured_q':measured.tolist(),'previous_q':previous.tolist(),
                       'candidate_q':step.tolist(),'desired_q':target,'arm_ns':f['arm_ns'],
                       'error':str(exc),'hardware_target_sent':False,**geometry_metrics()})
-                if str(exc)=='collision_check_timeout':
+                if str(exc)=='collision_check_timeout' and not getattr(getattr(solver, 'trajectory', None), 'enabled', False):
                     geometry_timeouts+=1
                     if geometry_timeouts<3:
                         geometry_step_scale*=.5
@@ -269,6 +278,7 @@ def execute(link, points, solver, sink, *, clock=time.monotonic, sleep=time.slee
                 sink({'event':'waiting_driver_receipt','elapsed':elapsed,'hardware_target_sent':False})
                 sleep(.01);continue
             sink({'monotonic_ns':time.monotonic_ns(),'elapsed':elapsed,'phase':phase,'target_q':target,
+                  'trajectory_diagnostics':getattr(getattr(solver, 'trajectory', None), 'diagnostics', None),
                   'sent':sent,'sent_target_q':step.tolist(),'sequence':link.seq,
                   'publish':getattr(link,'last_send',None),
                   'session_id':link.lease.get('session_id') if link.lease else None,'driver':{k:state.get(k) for k in

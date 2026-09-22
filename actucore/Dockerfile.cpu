@@ -2,9 +2,18 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG INSTALL_TRAJECTORY=false
 COPY actucore/plugins/teleop/requirements.lock /tmp/teleop-requirements.lock
 RUN python3 -m pip install --no-cache-dir --require-hashes -i ${PYPI_MIRROR} -r /tmp/teleop-requirements.lock && \
     python3 -c 'import pinocchio, scipy, aiortc, yaml'
+COPY actucore/plugins/teleop/requirements.trajectory*.lock /tmp/
+RUN if [ "$INSTALL_TRAJECTORY" = true ]; then \
+      apt-get update && apt-get install -y --no-install-recommends build-essential cmake ninja-build && \
+      rm -rf /var/lib/apt/lists/* && \
+      python3 -m pip install --no-cache-dir --require-hashes -i ${PYPI_MIRROR} -r /tmp/requirements.trajectory-build.lock && \
+      python3 -m pip install --no-cache-dir --no-build-isolation --require-hashes -i ${PYPI_MIRROR} -r /tmp/requirements.trajectory.lock && \
+      python3 -c 'import ruckig; assert ruckig.__version__ == "0.19.4"'; \
+    elif [ "$INSTALL_TRAJECTORY" != false ]; then exit 2; fi
 WORKDIR /work
 COPY actucore/main.py actucore/config.yaml /work/
 COPY actucore/plugins/ /work/plugins/

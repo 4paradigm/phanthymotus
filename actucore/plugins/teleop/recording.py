@@ -12,10 +12,10 @@ import time
 POSE_KEYS = ('schema_version','mode','client_monotonic_ns','sequence','clutch_sequence','epoch','deadman','tracking','head',
              'left_controller','right_controller','controllers')
 FEEDBACK_KEYS = ('monotonic_ns','state','reason','applied_sequence','commanded_q',
-                 'output_active','ownership_held','stop_confirmed','calibration_sha256','last_vendor_command')
+                 'output_active','ownership_held','stop_confirmed','calibration_sha256','last_vendor_command','command_state')
 SOLUTION_KEYS = ('input_sequence', 'clutch_sequence', 'input_received_ns', 'monotonic_ns',
                  'ik_started_ns', 'ik_succeeded', 'ik_target_q', 'ik_reference_q',
-                 'target_diagnostics', 'output_state', 'published', 'failure')
+                 'target_diagnostics', 'trajectory_diagnostics', 'output_state', 'published', 'failure')
 
 class PoseRecorder:
     def __init__(self, root, capacity=1024):

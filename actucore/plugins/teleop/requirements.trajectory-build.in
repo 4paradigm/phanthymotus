@@ -1,0 +1,3 @@
+# Build tools for the optional aarch64 Ruckig extension, locked separately.
+scikit-build-core>=0.10,<0.12
+nanobind>=2,<3

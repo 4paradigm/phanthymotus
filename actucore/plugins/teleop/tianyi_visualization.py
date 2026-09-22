@@ -65,6 +65,7 @@ def snapshot(adapter):
                 'targets': [t[:3, 3].tolist() for t in preview['targets']] if preview else [],
                 'feasible_targets': [t[:3, 3].tolist() for t in preview.get('feasible_targets', [])] if preview else [],
                 'target_diagnostics': getattr(solver, 'target_diagnostics', None),
+                'trajectory_diagnostics': getattr(getattr(solver, 'trajectory', None), 'diagnostics', None),
                 # These calibrated boxes are safety bounds, NOT a claim that
                 # every enclosed pose is reachable.
                 'workspace_bounds': [solver.workspace[s] for s in ('left', 'right')],

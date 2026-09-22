@@ -150,8 +150,12 @@ class TianyiIntentAdapter(IntentAdapter):
                 targets = self.mapper.targets(frame)
                 phase = "ik"
                 ik_started_ns = time.monotonic_ns()
+                trajectory_options = {}
+                if getattr(getattr(self.solver, 'trajectory', None), 'enabled', False):
+                    from .trajectory import execution_state
+                    trajectory_options['command_state'] = execution_state(state, required=self.hardware_output)
                 target = self.solver.solve(targets, q, commanded=state.get('commanded_q'),
-                                           deadline_monotonic=deadline-.015)
+                                           deadline_monotonic=deadline-.015, **trajectory_options)
                 solved_target = list(target)
                 self.ik_times.append(self.solver.last_ms)
                 if time.monotonic() >= deadline:
@@ -187,6 +191,9 @@ class TianyiIntentAdapter(IntentAdapter):
                 diagnostics = getattr(self.solver, 'target_diagnostics', None)
                 if diagnostics is not None:
                     self.output['target_diagnostics'] = diagnostics
+                trajectory = getattr(self.solver, 'trajectory', None)
+                if trajectory is not None and trajectory.enabled:
+                    self.output['trajectory_diagnostics'] = trajectory.diagnostics
                 if visual is not None:
                     self.output['ik_reference_q']=[float(x) for x in visual['ik_q']]
                 self.chain_times.append((time.monotonic()-(intent.received_monotonic or intent.admitted_monotonic))*1000)
@@ -253,6 +260,7 @@ class TianyiIntentAdapter(IntentAdapter):
                         'ik_target_q':solved_target,'failure':dict(failed) if failed else None,
                         'ik_reference_q':self.output.get('ik_reference_q') if solved_target is not None else None,
                         'target_diagnostics':getattr(self.solver, 'target_diagnostics', None) if ik_started_ns is not None else None,
+                        'trajectory_diagnostics':getattr(getattr(self.solver, 'trajectory', None), 'diagnostics', None) if ik_started_ns is not None else None,
                         'last_apply':dict(self.last_apply),
                         'output_state':self.output.get('state'),'published':published,
                         'publish':dict(self.link.last_send) if published and getattr(self.link,'last_send',None) else None,

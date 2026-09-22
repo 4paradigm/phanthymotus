@@ -209,7 +209,7 @@ class TeleopPlugin:
                     if self.cfg.get('robot_profile','tianyi2')!='tianyi2':
                         raise ValueError('record_requires_tianyi')
                     profile=Path(self.cfg['calibration_path'])
-                    modules=('runtime.py','adapter.py','tianyi.py','kinematics.py','workspace.py','reachability.py','recording.py')
+                    modules=('runtime.py','adapter.py','tianyi.py','kinematics.py','workspace.py','reachability.py','trajectory.py','recording.py')
                     metadata={'profile':json.loads(profile.read_text()),
                         'mode':self.cfg.get('mode','shadow'),
                         'profile_sha256':hashlib.sha256(profile.read_bytes()).hexdigest(),

@@ -78,6 +78,7 @@ class RelativeMapping:
 
 from .workspace import ArmWorkspace, WorkspaceViolation
 from .reachability import ReachableTarget
+from .trajectory import JointTrajectory
 
 
 def arm_chain_xml(model_bytes, torso, names):
@@ -172,11 +173,39 @@ class TianyiIK(ArmWorkspace):
         self.last_valid_visualization=None
         self.target_policy = ReachableTarget(self.profile.get('target_projection'), pin)
         self.target_diagnostics = None
+        self.trajectory = JointTrajectory(self.profile.get('trajectory_smoothing'), self.velocity)
 
     def reset_target_state(self):
         with self.lock:
             self.target_policy.reset()
             self.target_diagnostics = None
+            self.trajectory.reset()
+
+    def command_step(self, goal, measured, previous, budget, command_state=None):
+        """Shared output path for live IK, replay and explicit arm return."""
+        with self.lock:
+            goal, measured, previous = (finite(q, (14,)) for q in (goal, measured, previous))
+            lower = self.model.lowerPositionLimit[self.indices]
+            upper = self.model.upperPositionLimit[self.indices]
+            if self.trajectory.enabled:
+                try:
+                    q, lo, hi, plan = self.trajectory.propose(
+                        goal, measured, previous, command_state, lower, upper, budget)
+                    self._safe_transition(lo, hi, budget)
+                    self._safe_transition(measured, q, budget)
+                    budget()
+                except Exception as exc:
+                    self.trajectory.diagnostics = {'state': 'rejected', 'reason': str(exc)}
+                    raise
+                # Never clip a generated curve after its derivative checks.
+                self.trajectory.commit(plan)
+                self.last_advance_scale = 1.
+                return q
+            q = previous+np.clip(goal-previous, -self.velocity*.02, self.velocity*.02)
+            q = np.clip(q, measured-self.velocity*POSITION_LEAD_SECONDS, measured+self.velocity*POSITION_LEAD_SECONDS)
+            q = np.clip(q, lower, upper)
+            q, self.last_advance_scale = self._safe_advance(measured, previous, q, budget)
+            return q
 
     def _safe_advance(self, measured, previous, candidate, budget):
         """Shorten a fresh advance only after proving both entire joint boxes.
@@ -233,11 +262,11 @@ class TianyiIK(ArmWorkspace):
         jacobian[12:]=.01*np.eye(14)
         return residual,jacobian
 
-    def solve(self,targets,measured,commanded=None,*,deadline_monotonic=None):
+    def solve(self,targets,measured,commanded=None,*,deadline_monotonic=None,command_state=None):
         with self.lock:
             targets=[finite(t,(4,4)) for t in targets]
             try:
-                return self._solve(targets,measured,commanded,deadline_monotonic=deadline_monotonic)
+                return self._solve(targets,measured,commanded,deadline_monotonic=deadline_monotonic,command_state=command_state)
             except Exception as exc:
                 # Keep history only for rendering. Failed results never become commands.
                 self.visualization_sample={'monotonic_ns':time.monotonic_ns(),
@@ -247,7 +276,7 @@ class TianyiIK(ArmWorkspace):
                     'raw_targets': [t.tolist() for t in targets]}
                 raise
 
-    def _solve(self,targets,measured,commanded=None,*,deadline_monotonic=None):
+    def _solve(self,targets,measured,commanded=None,*,deadline_monotonic=None,command_state=None):
         with self.lock:
             begin=time.monotonic();measured=finite(measured,(14,))
             self.target_diagnostics = None
@@ -329,10 +358,7 @@ class TianyiIK(ArmWorkspace):
             # Validate the entire independently interpolated joint box.
             previous=measured if commanded is None else finite(commanded,(14,))
             # Preserve the validated fixed 20 ms command increment.
-            q=previous+np.clip(q-previous,-self.velocity*.02,self.velocity*.02)
-            q=np.clip(q,measured-self.velocity*POSITION_LEAD_SECONDS,measured+self.velocity*POSITION_LEAD_SECONDS)
-            q=np.clip(q,lower,upper)
-            q,self.last_advance_scale=self._safe_advance(measured,previous,q,check_budget)
+            q = self.command_step(q, measured, previous, check_budget, command_state)
             self.last_ms=(time.monotonic()-begin)*1000
             if self.last_ms>100:raise ValueError('ik_timeout')
             self.target_policy.boundary = boundary

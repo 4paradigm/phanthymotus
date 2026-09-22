@@ -116,5 +116,10 @@
     "workspace_margin_m": 0.01,
     "joint_margin_rad": 0.03,
     "release_frames": 3
+  },
+  "trajectory_smoothing": {
+    "enabled": false,
+    "max_acceleration_rad_s2": null,
+    "max_jerk_rad_s3": null
   }
 }

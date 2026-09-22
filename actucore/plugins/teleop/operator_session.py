@@ -136,8 +136,12 @@ def return_arms(adapter, cancel, connected, *, timeout=45., clock=time.monotonic
                     check()
                     if clock()>=cycle_deadline:raise ValueError('return_geometry_timeout')
                 with solver.lock:
-                    solver._safe_transition(q,step,budget)
-                    solver._safe_transition(previous,step,budget)
+                    if getattr(getattr(solver, 'trajectory', None), 'enabled', False):
+                        from .trajectory import execution_state
+                        step = solver.command_step(zero, q, previous, budget, execution_state(state))
+                    else:
+                        solver._safe_transition(q,step,budget)
+                        solver._safe_transition(previous,step,budget)
                 check()
                 link.send(step.tolist(),[0.,0.],cycle_deadline,wait_for_execution=False,target_ttl_ms=100)
                 adapter.output={'state':'returning','target_q':step.tolist(),'output_active':True}

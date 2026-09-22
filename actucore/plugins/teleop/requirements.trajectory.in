@@ -1,0 +1,2 @@
+# Optional local OTG. aarch64 builds from source; no waypoint/cloud API is used.
+ruckig==0.19.4
