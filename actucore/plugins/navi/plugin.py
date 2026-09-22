@@ -502,6 +502,13 @@ class NaviPlugin:
                 "state": ("running" if self._running and not self._paused else
                           "paused" if self._running else "idle"),
                 "topic": self._topic,
+                # **agent-core 登记监控话题读的是这里，不是工具 schema。**
+                # api/config.py 在启动每张卡之后拿 info() 的 topic_out 去调
+                # register_topic_internal，inspection 据此订阅、仪表盘的「查看数
+                # 据流」才有东西可看。少了它，卡片一切正常、消息确实在总线上，
+                # 而面板永远是空的 —— 真机上就是这样：直接用 rclpy 订 
+                # /actucore/navi/cmd 能收到 10 Hz 的指令，画布上什么都没有。
+                "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT}],
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
                 "published": self._published,

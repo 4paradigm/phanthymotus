@@ -476,3 +476,21 @@ def test_negotiation_is_still_strict_when_a_downstream_is_present():
     out = _card().dispatch("navi", {"action": "start",
                                     "control_interface": _descriptor(mode="joint_position")})
     assert out["state"] == "error" and "twist" in out["message"]
+
+
+def test_info_returns_topic_out_so_the_dashboard_can_subscribe():
+    """agent-core registers monitored topics from `info()['topic_out']`, not
+    from the tool schema (`api/config.py`, after starting each card). Without
+    it the card runs correctly and the messages are genuinely on the bus, while
+    the canvas data-flow panel stays empty for ever — which reads as the card
+    producing nothing."""
+    out = _card().dispatch("navi", {"action": "info"})["topic_out"]
+    assert out == [{"topic": navi_plugin.DEFAULT_TOPIC,
+                    "format": "control/velocity"}]
+
+
+def test_info_and_the_schema_agree_about_the_output_topic():
+    """Two places name it; they must not drift."""
+    card = _card()
+    assert (card.dispatch("navi", {"action": "info"})["topic_out"][0]["topic"]
+            == card.get_tools()[0]["topic_out"][0]["topic"])
