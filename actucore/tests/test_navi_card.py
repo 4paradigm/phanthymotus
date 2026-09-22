@@ -67,10 +67,11 @@ def _card(**cfg):
 
 # ── refusing to start ────────────────────────────────────────────────────────
 
-def test_no_downstream_card_is_refused_with_the_wiring_to_fix():
+def test_no_downstream_card_is_not_a_reason_to_refuse():
+    """Superseded a check that demanded a chassis before the card would run.
+    See test_it_starts_without_a_downstream_card for what it does instead."""
     result = _card().dispatch("navi", {"action": "start"})
-    assert result["state"] == "error"
-    assert "control/velocity" in result["message"]
+    assert "没有拿到下游动作空间" not in (result.get("message") or "")
 
 
 def test_a_joint_card_downstream_is_refused():
@@ -432,3 +433,46 @@ def test_the_visible_list_stays_small_under_full_colour():
     text = json.dumps(out, ensure_ascii=False)
     assert "rgb_var" not in text
     assert len(text) < 2000, f"reply is {len(text)} chars"
+
+
+# ── a downstream is not required to start ────────────────────────────────────
+
+def test_it_starts_without_a_downstream_card():
+    """"Don't wire the chassis yet, I just want to see what it computes" is a
+    legitimate — and the most common — way to bring this card up. Refusing
+    demanded a robot that can move before its decisions could be observed."""
+    card = _card()
+    node = _FakeNode()
+    card._executor = object()
+    card._open_publisher = lambda: setattr(card, "_node", node)
+    out = card.dispatch("navi", {"action": "start",
+                                 "input_topics": ["/cam/objects",
+                                                  "/cam/visual_depth"]})
+    assert out["state"] == "running"
+    assert any("不会驱动任何硬件" in note for note in out["degraded"])
+
+
+def test_an_unbound_card_says_so_in_info():
+    """A card that looks running but drives nothing must be distinguishable
+    from one that is actually connected to a chassis."""
+    card = _card()
+    card._running = True
+    card._descriptor = {}
+    card._binding = {"objects": "/o", "depth_map": "/d", "odom": "/r1/state/odom"}
+    assert any("不会驱动任何硬件" in n for n in card._degradations())
+
+
+def test_a_connected_card_does_not_claim_to_be_unbound():
+    card = _card()
+    card._running = True
+    card._descriptor = _descriptor()
+    card._binding = {"objects": "/o", "depth_map": "/d", "odom": "/r1/state/odom"}
+    assert card._degradations() == []
+
+
+def test_negotiation_is_still_strict_when_a_downstream_is_present():
+    """Loosening the no-downstream case must not loosen the real one: that is
+    where hardware moves, and a mismatch has to be refused at start."""
+    out = _card().dispatch("navi", {"action": "start",
+                                    "control_interface": _descriptor(mode="joint_position")})
+    assert out["state"] == "error" and "twist" in out["message"]

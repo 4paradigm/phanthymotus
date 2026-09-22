@@ -265,24 +265,27 @@ class NaviPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict):
+        # 没接下游**不拒绝启动**。
+        #
+        # 「先不接底盘，就想看看它算出什么」是正当用法，而且是调这张卡片时最常
+        # 用的一种：指令照样发到话题上，接着看就是了，机器人一动不动。早先这里
+        # 直接拒绝，等于要求必须先有一台能动的机器人才能观察它的决策。
+        #
+        # 接了下游时协商一点没放松 —— 那才是会让硬件动起来的情况，动作空间对不
+        # 上就必须当场拒绝，而不是 10 Hz 地一条条失败。
         descriptor = args.get("control_interface") or {}
-        if not descriptor:
-            return self._error(
-                "没有拿到下游动作空间 —— 请把本卡片的输出连到一张驱动的底盘命令"
-                "卡片（control/velocity 端口），agent-core 会在启动时把它的 "
-                "descriptor 传过来")
-
         capabilities = self._capabilities()
-        problems = negotiate.check(capabilities, descriptor, label="策略")
-        if problems:
-            return self._error("导航策略与下游动作空间不匹配："
-                               + "；".join(problems))
 
-        mode = descriptor.get("mode")
-        if mode != CONTROL_MODE:
-            return self._error(
-                f"下游 mode 是 {mode!r}，这张卡片只会产生 {CONTROL_MODE!r} —— "
-                "它输出的是底盘速度，不是关节角")
+        if descriptor:
+            problems = negotiate.check(capabilities, descriptor, label="策略")
+            if problems:
+                return self._error("导航策略与下游动作空间不匹配："
+                                   + "；".join(problems))
+            mode = descriptor.get("mode")
+            if mode != CONTROL_MODE:
+                return self._error(
+                    f"下游 mode 是 {mode!r}，这张卡片只会产生 {CONTROL_MODE!r} —— "
+                    "它输出的是底盘速度，不是关节角")
 
         rate = negotiate.effective_rate(capabilities, descriptor,
                                         self._cfg.get("rate_hz"))
@@ -521,6 +524,9 @@ class NaviPlugin:
                        "画面估计，精度明显变差")
         if not self._binding.get("odom"):
             out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停")
+        if self._running and not self._descriptor:
+            out.append("没有接驱动的底盘命令卡片 —— 指令只发到话题上，"
+                       "不会驱动任何硬件（想看它算什么的话，这是对的）")
         for hint in (self._binding.get("unknown") or []):
             out.append(f"有一路输入没有被使用：{hint}")
         return out
