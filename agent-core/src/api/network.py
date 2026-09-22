@@ -23,6 +23,7 @@ if '/usr/lib/python3/dist-packages' not in sys.path:
 router = fastapi.APIRouter(prefix='/network', tags=['network'])
 
 _WIFI_STORE_KEY = 'wifi_saved'
+_UPLINK_KEY = 'preferred_uplink'
 
 # ── DB persistence ────────────────────────────────────────────────────────────
 
@@ -786,6 +787,15 @@ def _set_route_priority_sync(device: str, prefer: bool):
         nm_iface.ActivateConnection(
             dbus.ObjectPath(settings_path), dbus.ObjectPath(dev_path), dbus.ObjectPath('/'))
 
+    # Remember the choice, so a reboot does not undo it. This is the half that
+    # was missing: the metric itself lives in the NetworkManager profile and
+    # does persist, but netplan regenerates the *other* interface's static
+    # default route at boot, and on r1_sz that route came back with a lower
+    # metric and took the uplink with it. An operator who pressed this button
+    # once should not have to press it after every restart — see
+    # `ensure_preferred_uplink`.
+    config.main[_UPLINK_KEY] = device if prefer else ''
+
     # Report what actually happened rather than what was asked for: Reapply can
     # return cleanly and still leave the table unchanged, and "已设置" on a
     # machine that still cannot reach anything is the failure this whole change
@@ -797,6 +807,42 @@ def _set_route_priority_sync(device: str, prefer: bool):
         time.sleep(0.5)
     return {'device': device, 'carries_internet': _internet_device() == device,
             'routes': _default_routes()}
+
+
+def ensure_preferred_uplink() -> dict:
+    """Re-assert the operator's uplink choice at startup.
+
+    Called once from the lifespan. Does nothing unless somebody has actually
+    chosen a device, so a machine that never had this problem is untouched.
+
+    It exists because the choice does not survive a reboot on its own. The
+    metric written into the NetworkManager profile does persist — but netplan
+    regenerates the *other* interface's static default route at boot, and if
+    that one wins again the machine comes back with no way out. On r1_sz that
+    interface pointed at the robot's own body network, whose gateway answers
+    nothing, so the symptom was every LLM call timing out after 5 s while WiFi
+    showed as connected and healthy.
+
+    Failures are reported, never raised: this runs during startup, and a robot
+    that will not boot because its network could not be tidied up is a much
+    worse outcome than one with the wrong default route.
+    """
+    device = str(config.main.get(_UPLINK_KEY) or '').strip()
+    if not device:
+        return {'checked': False}
+    try:
+        current = _internet_device()
+        if current == device:
+            return {'checked': True, 'device': device, 'changed': False}
+        print(f'[network] uplink should be {device} but {current or "nothing"} '
+              f'holds the default route — re-applying')
+        _set_route_priority_sync(device, True)
+        ok = _internet_device() == device
+        print(f'[network] uplink re-applied: carries_internet={ok}')
+        return {'checked': True, 'device': device, 'changed': True, 'ok': ok}
+    except Exception as error:                      # noqa: BLE001
+        print(f'[network] could not re-apply uplink preference: {error}')
+        return {'checked': True, 'device': device, 'error': str(error)}
 
 
 def _get_saved_wifi_sync() -> list[dict]:

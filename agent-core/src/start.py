@@ -439,6 +439,19 @@ async def lifespan(app):
     from api import canvas as canvas_api
     canvas_api.start_editor_sweeper()
 
+    # 出网接口偏好。一次 netplan 重新生成就能把另一张网卡的静态默认路由放回来，
+    # 而它的 metric 可能更低 —— 于是重启之后机器又没有出口了，表现为每一次 LLM
+    # 调用 5 秒超时，而 WiFi 显示已连接、一切正常。在这里重新确立一次。
+    #
+    # 放在线程里跑：它要和 NetworkManager 做几次 D-Bus 往返，最坏情况下还要等一
+    # 次 Reapply，不该挡住启动。没人设置过偏好时它立刻返回。
+    try:
+        from api.network import ensure_preferred_uplink
+        await loop.run_in_executor(None, ensure_preferred_uplink)
+    except Exception as _uplink_error:      # noqa: BLE001
+        # 网络没理顺不该让机器人起不来，那是更坏的结果。
+        print(f'[network] uplink check skipped: {_uplink_error}')
+
     # 启动 DDS topic 订阅（依据 config event.subscribe_topics）
     topics = config.main.get('event', {}).get('subscribe_topics', [])
     topic_subscriber.start(topics, asyncio.get_event_loop())
