@@ -13,6 +13,6 @@ G1 `g1_ik.py` 和 `models/g1_body23.urdf` 迁移自上述 PR #152 的 `ik.py` �
 
 保留 G1_23 关节顺序、Pinocchio/CasADi 目标函数、滤波和 RNEA；新增实测锁定关节/手掌变换、求解期限、相对使能基准、位置残差和运动段包络检查。Driver 硬件代码单独保留来源说明。没有迁移 TeleVuer/Vuer、机器人视频或 PR 的独立 Driver 遥操宿主。
 
-原工作树的 `models/g1_collision/*.STL` 七个碰撞网格未修改复制自 Unitree Robotics `xr_teleoperate`，固定提交 `817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b` 的 `assets/g1/meshes/`，Apache-2.0，同提交许可证保存在该目录 `LICENSE`，文件哈希见 `sha256.json`。运行时从网格建立保守凸包，肩部圆柱体及其位姿直接读取上述已核验 G1 URDF；没有修改官方原始网格。
+`models/g1_collision/*.STL` 七个碰撞网格来自 Unitree Robotics `xr_teleoperate`，固定提交 `817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b` 的 `assets/g1/meshes/`，Apache-2.0。原始二进制不再纳入 Git；已镜像至项目 COS 的 `public/teleop/g1-collision/817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b/`，由 `deploy/fetch_g1_collision.py` 在构建前下载并逐文件核验 SHA256，字节保持不变。同提交许可证保存在该目录 `LICENSE`，文件哈希见 `sha256.json`，二者也随 COS 资产分发；`ADOPTED_SOURCE.json` 保留原始迁移时的来源记录。2026-09-22 已重新读取厂商源、发布 COS，并匿名下载核对所有文件哈希。运行时从网格建立保守凸包，肩部圆柱体及其位姿直接读取上述已核验 G1 URDF；运行时不下载，缺失或篡改文件会阻止初始化，不跳过碰撞检查。
 
 `g1_mapping.py` 的坐标矩阵与 G1ControllerPoseMapper 从上述 PR152 adapter.py 原样抽取（Apache-2.0），由 ActuCore 新映射版本使用。新版本恢复 0.02*q² 正则项；保留近零旋转数值修正和独立可达性/安全检查。

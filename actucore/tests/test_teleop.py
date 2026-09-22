@@ -293,10 +293,13 @@ def test_official_model_joint_mapping_matches_direct_fk(tmp_path):
         np.testing.assert_allclose(actual,expected,atol=1e-8)
 
 
-def test_real_mcp_advertises_card_and_reports_operation_failure_without_ros(tmp_path, monkeypatch):
+@pytest.mark.parametrize('site_ready', [True, False])
+def test_real_mcp_advertises_card_and_reports_operation_failure_without_ros(tmp_path, monkeypatch, site_ready):
     import ast,logging,urllib.request
-    key=tmp_path/'management-key';key.write_text('test-management-key-'+'a'*32)
-    monkeypatch.setenv('TELEOP_MANAGEMENT_KEY_FILE',str(key))
+    from test_teleop_site import site_configuration
+    teleop_cfg=site_configuration(tmp_path,monkeypatch)
+    key=tmp_path/'management-key'
+    if not site_ready:teleop_cfg.pop('capture')
     from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
     root=Path(__file__).parents[1];sys.path.insert(0,str(root))
     tree=ast.parse((root/'main.py').read_text())
@@ -304,7 +307,7 @@ def test_real_mcp_advertises_card_and_reports_operation_failure_without_ros(tmp_
     ns={'BaseHTTPRequestHandler':BaseHTTPRequestHandler,'json':json,'log':logging.getLogger('test'),
         '_brief':repr}
     exec(compile(ast.Module(body=nodes,type_ignores=[]),'main.py','exec'),ns)
-    bundle=ns['ActuCoreBundle']({'plugins':{'vla':{'enabled':True,'provider':'mock'},'teleop':{'enabled':True,'mode':'shadow'}}},None)
+    bundle=ns['ActuCoreBundle']({'plugins':{'vla':{'enabled':True,'provider':'mock'},'teleop':teleop_cfg}},None)
     ns['_bundle']=bundle
     server=ThreadingHTTPServer(('127.0.0.1',0),ns['make_handler']())
     thread=threading.Thread(target=server.serve_forever);thread.start()
@@ -321,10 +324,19 @@ def test_real_mcp_advertises_card_and_reports_operation_failure_without_ros(tmp_
         ns['_bundle']=dedicated
         assert rpc('initialize',{})['serverInfo']['name']=='ActuCore PICO Shadow'
         ns['_bundle']=bundle
-        tools={t['name']:t for t in rpc('tools/list',{})['tools']}
-        assert set(tools)=={'vla','teleop'} and tools['teleop']['type']=='processor'
+        catalog=rpc('tools/list',{})
+        tools={t['name']:t for t in catalog['tools']}
         ordinary=rpc('tools/call',{'name':'vla','arguments':{'action':'info'}},False)
         assert json.loads(ordinary['content'][0]['text'])['state']=='idle'
+        if not site_ready:
+            assert set(tools)=={'vla'}
+            assert catalog['_meta']['required_site_config']['teleop']
+            info=rpc('tools/call',{'name':'teleop','arguments':{'action':'info'}},False)
+            assert info['isError'] is True
+            assert json.loads(info['content'][0]['text'])['error']=='required_site_config'
+            return
+        assert set(tools)=={'vla','teleop'} and tools['teleop']['type']=='processor'
+        assert catalog['_meta']['required_site_config']=={}
         denied=rpc('tools/call',{'name':'teleop','arguments':{'action':'open_pairing'}},False)
         assert 'teleop_management_unauthorized' in denied['content'][0]['text']
         result=rpc('tools/call',{'name':'teleop','arguments':{'action':'config','mode':'invalid'}})

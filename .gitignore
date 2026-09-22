@@ -62,3 +62,6 @@ Thumbs.db
 
 # Docker
 .docker/
+
+# Verified upstream meshes are materialized by deploy/fetch_g1_collision.py.
+/actucore/plugins/teleop/models/g1_collision/*.STL

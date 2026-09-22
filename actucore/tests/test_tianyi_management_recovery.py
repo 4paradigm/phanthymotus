@@ -1,11 +1,10 @@
 """Real MCP JSON/Driver dispatch with lost replies; no network or hardware."""
 import io
 import json
-import os
 import time
 from types import MethodType, SimpleNamespace
 import pytest
-from test_tianyi_execution_chain import chain, intent, stop
+from test_tianyi_execution_chain import chain, intent, stop, tianyi_driver_source
 from teleop.adapter import DriverLink
 
 
@@ -40,7 +39,7 @@ def test_initial_stale_claim_is_retryable_and_cancel_does_not_invent_stop(manage
 
 @pytest.fixture
 def managed(chain,monkeypatch):
-    monkeypatch.syspath_prepend(os.environ['TIANYI_DRIVER_SOURCE'])
+    monkeypatch.syspath_prepend(str(tianyi_driver_source()))
     from teleop_executor import TeleopExecutor
     a,link,gate,writes=chain
     e=TeleopExecutor({},'isolated',None,SimpleNamespace(_pos_publisher=True),

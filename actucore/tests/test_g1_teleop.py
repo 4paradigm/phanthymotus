@@ -1,5 +1,10 @@
-"""PR152 real model/IK and ActuCore G1 contract; no robot I/O."""
+"""PR152 model/IK and G1 contracts; no robot I/O.
+
+Only tests using ``g1_numeric_abi`` need the G1 Pinocchio/CasADi environment.
+Pure mapping, metadata and Driver contracts also run in the Tianyi environment.
+"""
 import copy
+import importlib
 import json
 from pathlib import Path
 import sys
@@ -15,6 +20,22 @@ from teleop.dispatch import RecordingAdapter,MotionIntent
 from test_teleop import frame
 
 ROOT=Path(__file__).parents[1]/'plugins/teleop'
+
+
+@pytest.fixture(scope='module')
+def g1_numeric_abi():
+    # A plain Pinocchio import does not prove its optional symbolic ABI exists.
+    # Limit skipping to dependency imports; solver/model failures must still fail.
+    for module_name in ('casadi', 'pinocchio.casadi'):
+        try:
+            importlib.import_module(module_name)
+        except (ImportError, OSError) as exc:
+            pytest.skip(
+                'G1 numeric test requires the G1 Pinocchio/CasADi ABI; '
+                f'{module_name} is unavailable: {exc}. '
+                'The Tianyi numeric environment does not provide G1 IK.'
+            )
+
 
 @pytest.mark.parametrize('invalid',[None,'transport_timeout','old','session','unconfirmed','fault'])
 def test_pause_accepts_only_matching_post_request_hold_even_before_http_reply(invalid):
@@ -64,6 +85,7 @@ def calibration(tmp_path):
 
 
 @pytest.mark.parametrize('velocity',[.6,5.,5.001,float('inf')])
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_configured_speed_ceiling(tmp_path,velocity):
     path=calibration(tmp_path);p=json.loads(path.read_text());p['joint_velocity_rad_s']=velocity
     path.write_text(json.dumps(p))
@@ -72,6 +94,7 @@ def test_configured_speed_ceiling(tmp_path,velocity):
         with pytest.raises(ValueError,match='joint_velocity_limit'):G1IK(path)
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_reachable_step_is_not_rejected_for_filter_lag(tmp_path):
     solver=G1IK(calibration(tmp_path))
     q=np.array([.243,.297,-.079,.805,-.005,.246,-.298,.083,.777,.007])
@@ -87,6 +110,7 @@ def test_reachable_step_is_not_rejected_for_filter_lag(tmp_path):
         solver.solve(targets,q,dq=np.zeros(10))
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_rejected_target_snapshot_survives_hold_and_is_detached(tmp_path):
     solver=G1IK(calibration(tmp_path))
     q=np.array([.257,.297,-.080,.820,-.006,.250,-.303,.082,.780,.007])
@@ -120,6 +144,7 @@ def test_g1_capability_binding_has_no_hands():
     finally:runtime.close()
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_real_pr152_ik_bounded_targets_collision_and_unreachable(tmp_path):
     solver=G1IK(calibration(tmp_path));q=np.zeros(10)
     assert solver.self_test(q)['ready']
@@ -137,6 +162,7 @@ def test_real_pr152_ik_bounded_targets_collision_and_unreachable(tmp_path):
     with pytest.raises((ValueError,RuntimeError)):solver.solve(targets,q,dq=np.zeros(10))
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_fixed_hand_tip_collision_cannot_be_omitted_from_profile(tmp_path):
     solver=G1IK(calibration(tmp_path));q=np.zeros(10)
     solver._safe_configuration(q)
@@ -155,12 +181,14 @@ def test_fixed_hand_tip_collision_cannot_be_omitted_from_profile(tmp_path):
         solver._safe_configuration(q,np.full(10,.004))
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_automatic_hands_do_not_replace_missing_arm_calibration(tmp_path):
     path=calibration(tmp_path);p=json.loads(path.read_text())
     p['workspace']['capsules']=[];path.write_text(json.dumps(p))
     with pytest.raises(ValueError,match='collision_calibration_missing'):G1IK(path)
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_upper_arm_torso_and_swept_geometry_are_checked(tmp_path):
     from teleop.workspace import ArmWorkspace
     solver=G1IK(calibration(tmp_path));q=np.zeros(10)
@@ -191,6 +219,7 @@ def intent(f,seq=1):
     return SimpleNamespace(expires_monotonic=now+.1,received_monotonic=now,admitted_monotonic=now,dispatch_generation=seq,session_generation=1,clutch_sequence=seq,frame=f)
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_real_ik_shadow_has_zero_execution_calls_and_stale_feedback_fails(tmp_path):
     link=Link();adapter=G1IntentAdapter(link,'shadow');adapter.calibrate(calibration(tmp_path))
     assert adapter.apply(intent(frame(0,True,1))).ok
@@ -208,6 +237,7 @@ def test_model_digest_and_unknown_profile_rejected(tmp_path):
     with pytest.raises(ValueError,match='model_changed'):G1IK(path)
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_planning_rejections_never_reach_driver(tmp_path):
     from teleop.dispatch import IK_HOLD_CODES
     link=Link();adapter=G1IntentAdapter(link,'shadow');adapter.calibrate(calibration(tmp_path))
@@ -256,6 +286,7 @@ def test_latest_mailbox_runs_at_50hz_and_pause_preempts_wait():
     finally:runtime.close()
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_position_constraint_handles_captured_orientation_tradeoff(tmp_path):
     solver=G1IK(calibration(tmp_path))
     q=np.array([0.25462883710861206, 0.28413400053977966, -0.07780159264802933, 0.8147715330123901, -0.0055367122404277325, 0.253550261259079, -0.3016189932823181, 0.08356600254774094, 0.7790704965591431, 0.00672315014526248])
@@ -280,6 +311,7 @@ def test_position_constraint_handles_captured_orientation_tradeoff(tmp_path):
 
 @pytest.mark.parametrize('owned', [False, True])
 @pytest.mark.parametrize('reason', ['arms_not_stationary', 'external_arm_publisher', 'timed out'])
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_only_unowned_stationary_claim_refusal_is_recoverable(tmp_path, owned, reason):
     link=Link();adapter=G1IntentAdapter(link,'live');adapter.calibrate(calibration(tmp_path))
     link.sha=adapter.solver.profile_sha256
@@ -294,6 +326,7 @@ def test_only_unowned_stationary_claim_refusal_is_recoverable(tmp_path, owned, r
 
 
 @pytest.mark.parametrize('reason', ['arms_not_stationary','external_arm_publisher','timed out'])
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_owned_resume_settling_is_hold_without_sending(tmp_path,reason):
     link=Link();adapter=G1IntentAdapter(link,'live');adapter.calibrate(calibration(tmp_path))
     link.sha=adapter.solver.profile_sha256
@@ -406,6 +439,7 @@ def test_coalesced_execution_ack_tracks_progress_not_superseded_deadline(monkeyp
         link.send([0.]*10,None,10.19,wait_for_execution=False)
     assert len(sent)==2
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_g1_acquisition_does_not_send_aging_frame(tmp_path):
     link=Link();adapter=G1IntentAdapter(link,'live');adapter.calibrate(calibration(tmp_path))
     link.sha=adapter.solver.profile_sha256
@@ -429,6 +463,7 @@ def test_g1_acquisition_does_not_send_aging_frame(tmp_path):
     assert link.calls==['claim','send','resume','claim']
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_execution_ack_timeout_requires_confirmed_hold_and_new_clutch(tmp_path):
     link=Link();adapter=G1IntentAdapter(link,'live');adapter.calibrate(calibration(tmp_path))
     link.sha=adapter.solver.profile_sha256
@@ -454,6 +489,7 @@ def test_execution_ack_timeout_requires_confirmed_hold_and_new_clutch(tmp_path):
     ('fault','command_timeout','motion_rejected'),
     ('hold','motor_fault','motion_rejected'),
 ])
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_driver_holding_recovers_only_known_pause_reasons(tmp_path,state,reason,expected):
     link=Link();adapter=G1IntentAdapter(link,'live');adapter.calibrate(calibration(tmp_path))
     link.sha=adapter.solver.profile_sha256
@@ -466,6 +502,7 @@ def test_driver_holding_recovers_only_known_pause_reasons(tmp_path,state,reason,
     assert not ack.ok and ack.code==expected
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_zero_input_stays_put_and_small_input_advances_bounded_target(tmp_path):
     solver=G1IK(calibration(tmp_path))
     q=np.array([.2455,.2997,-.0784,.8066,-.016,.2507,-.2954,.0944,.774,-.0014])
@@ -523,6 +560,7 @@ def test_late_stop_feedback_reconciles_only_confirmed_requested_release(invalid)
     if invalid is not None:assert link.lease==lease
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_real_near_identity_pose_has_finite_ik_gradient():
     from teleop.g1_ik import G123PinocchioIk
     case=json.loads((Path(__file__).parent/'fixtures/g1_ik_near_identity.json').read_text())
@@ -557,6 +595,7 @@ def test_short_target_ttl_does_not_shorten_execution_ack_budget(monkeypatch):
     assert len(sent)==2
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_pr152_approximates_extended_pose_without_legacy_position_gate():
     from teleop.g1_ik import G123PinocchioIk
     ik=G123PinocchioIk(ROOT/'models/g1_body23.urdf',pr152_objective=True)
@@ -574,6 +613,7 @@ def test_pr152_approximates_extended_pose_without_legacy_position_gate():
     assert ik.snapshot()['last_solution']['position_error_m'][0]!=999
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_pr152_checks_actual_bounded_segment_before_output(tmp_path):
     solver=G1IK(calibration(tmp_path),pr152_objective=True)
     q=np.array([.243,.302,-.087,.817,-.005,.251,-.293,.081,.781,.007])
@@ -619,6 +659,7 @@ def test_operator_pause_waits_for_matching_physical_rest(invalid):
 
 @pytest.mark.parametrize('direction',[-1.,1.])
 @pytest.mark.parametrize('wrist',[-.005,-.9643329988281466])
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_large_tracking_gap_advances_without_fixed_budget(tmp_path,direction,wrist):
     solver=G1IK(calibration(tmp_path),pr152_objective=True)
     q=np.array([.243,.302,-.087,.817,-.005,.251,-.293,.081,.781,.007])
@@ -662,7 +703,7 @@ def test_clutch_relative_translation_and_head_invariance(axis,direction):
     assert np.allclose(mapper.map_frame(changed),palms)
 
 
-def test_clutch_relative_rotation_and_adapter_reclutch(tmp_path):
+def test_clutch_relative_rotation():
     from teleop.g1_mapping import G1ClutchRelativeMapper
     mapper=G1ClutchRelativeMapper();f=frame(0,True,1);palms=[np.eye(4),np.eye(4)]
     with pytest.raises(ValueError,match='baseline'):mapper.map_frame(f)
@@ -670,6 +711,12 @@ def test_clutch_relative_rotation_and_adapter_reclutch(tmp_path):
     target=mapper.map_frame(rotated)
     assert not np.allclose(target[0][:3,:3],palms[0][:3,:3])
     assert np.allclose(target[0][:3,3],palms[0][:3,3])
+
+
+@pytest.mark.usefixtures("g1_numeric_abi")
+def test_clutch_relative_adapter_reclutch(tmp_path):
+    f=frame(0,True,1)
+    rotated=copy.deepcopy(f);rotated['left_controller']['orientation']=[0.,0.,.38268343,.92387953]
     link=Link();adapter=G1IntentAdapter(link,'shadow',1,mapping_version='pr152_clutch_relative_v1')
     adapter.calibrate(calibration(tmp_path))
     assert adapter.apply(intent(f)).ok
@@ -679,6 +726,7 @@ def test_clutch_relative_rotation_and_adapter_reclutch(tmp_path):
 
 
 @pytest.mark.parametrize('mapping',['relative_v1','pr152_head_yaw_v1','pr152_clutch_relative_v1'])
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_torso_reference_requires_clutch_relative_mapping(tmp_path,mapping):
     path=calibration(tmp_path);profile=json.loads(path.read_text());profile['safety']['waist_reference']='torso';path.write_text(json.dumps(profile))
     adapter=G1IntentAdapter(Link(),'shadow',1,mapping_version=mapping)
@@ -687,6 +735,7 @@ def test_torso_reference_requires_clutch_relative_mapping(tmp_path,mapping):
         with pytest.raises(ValueError,match='waist_mapping_mismatch'):adapter.calibrate(path)
 
 @pytest.mark.parametrize('hardware',[False,True])
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_collision_hold_preserves_anchor_and_validates_before_resume(tmp_path,hardware):
     from teleop.dispatch import StopRequest
     link=Link();adapter=G1IntentAdapter(link,'shadow',mapping_version='pr152_clutch_relative_v1',scale=1.)
@@ -718,6 +767,7 @@ def test_collision_hold_preserves_anchor_and_validates_before_resume(tmp_path,ha
     for before,after in zip(anchored,adapter.head_mapper._anchor):np.testing.assert_array_equal(before,after)
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_collision_broadphase_matches_all_exact_pairs(tmp_path):
     import hppfcl as fcl
     solver=G1IK(calibration(tmp_path));geometry=solver.body_collision
@@ -746,6 +796,7 @@ def test_collision_broadphase_matches_all_exact_pairs(tmp_path):
     assert rejected>0 and accepted>0
 
 
+@pytest.mark.usefixtures("g1_numeric_abi")
 def test_submitted_diagnostics_match_display_solution_and_sent_target(tmp_path):
     link=Link();adapter=G1IntentAdapter(link,'shadow');adapter.calibrate(calibration(tmp_path))
     assert adapter.apply(intent(frame(0,True,1))).ok

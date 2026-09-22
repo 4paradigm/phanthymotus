@@ -1,7 +1,8 @@
 """Actual adapter + authenticated DriverLink serialization + Driver MotionGate.
 
 ROS publisher is replaced by an in-memory wire; plant feedback is synthetic.
-TIANYI_DRIVER_SOURCE must point at the matching Driver's tianyi2.0 directory.
+Set TIANYI_DRIVER_SOURCE to the matching Driver's tianyi2.0 directory to run the
+cross-repository cases. An unset variable skips those cases; invalid paths fail.
 This test sends no network traffic and cannot access physical hardware.
 """
 import copy
@@ -24,6 +25,21 @@ from teleop.tianyi import TianyiIntentAdapter
 from teleop.dispatch import MotionIntent, StopRequest
 
 
+def tianyi_driver_source():
+    value = os.environ.get('TIANYI_DRIVER_SOURCE')
+    if value is None:
+        pytest.skip('cross-repository Tianyi test requires TIANYI_DRIVER_SOURCE '
+                    'pointing to the matching Driver x-humanoid/tianyi2.0 directory')
+    if not value.strip():
+        pytest.fail('TIANYI_DRIVER_SOURCE is set but empty', pytrace=False)
+    root = Path(value).expanduser().resolve()
+    required = ('motion_stream.py', 'teleop_executor.py')
+    if not root.is_dir() or any(not (root / name).is_file() for name in required):
+        pytest.fail('TIANYI_DRIVER_SOURCE must be a Driver directory containing '
+                    f'{", ".join(required)}: {root}', pytrace=False)
+    return root
+
+
 @pytest.mark.parametrize('case',['temporary','persistent','fault'])
 def test_physical_stop_confirmation_retries_only_transient_feedback(monkeypatch,case):
     now=[100.];calls=[]
@@ -43,7 +59,7 @@ def test_physical_stop_confirmation_retries_only_transient_feedback(monkeypatch,
 
 @pytest.fixture
 def chain(monkeypatch):
-    root = Path(os.environ['TIANYI_DRIVER_SOURCE'])
+    root = tianyi_driver_source()
     spec = importlib.util.spec_from_file_location('tianyi_gate_under_test', root/'motion_stream.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -200,7 +216,7 @@ def test_arm_only_ignores_trigger_input(chain):
 
 
 def test_arm_only_profile_needs_no_hand_endpoints(tmp_path):
-    root = Path(os.environ['TIANYI_DRIVER_SOURCE'])
+    root = tianyi_driver_source()
     sys.path.insert(0, str(root))
     try:
         from teleop_executor import load_profile

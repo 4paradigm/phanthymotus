@@ -101,13 +101,17 @@ G1 与天轶的模型点数、历史显示及恢复实现有差异，不能将�
 
 北京 G1 可沿用独立 Shadow 路径展示卡片、输入和 IK，不经过上述智能控制收臂流程；将 G1 遥操卡片放入该项目生命周期会明确拒绝开启，不会伪装支持收臂。IK 仍需要带 `pinocchio.casadi` 的 G1 数值环境，不能直接复用天轶依赖锁。若要真实运动，还需要其配套执行 Driver、模型／碰撞标定和独立验收；仅修改 `robot_profile` 不足以完成适配。
 
+G1 的七个原始碰撞网格共 9,876,188 字节，以厂商固定提交为来源，保存在项目 COS，不存入 Git。源码开发/数值测试前执行 `python3 deploy/fetch_g1_collision.py`；用 `--check` 可以禁网核验本地缓存。遥操镜像构建会显式取得相同文件并验证 `models/g1_collision/sha256.json`，之后无需运行时网络。下载失败或哈希不符会使构建失败；运行时缺网格会拒绝初始化，不能关闭碰撞检查来绕过。网格来源与许可证见 [NOTICE.md](NOTICE.md)。
+
 ## 部署与接口
 
 生产结构是一套 ActuCore：VLA 与 `teleop` 共用进程、ROS executor 和 MCP **15730**。PICO WSS **15741** 是插件内部的输入与显示服务，不是第二个 ActuCore。旧独立 `actucore-teleop` 与 15740 现场布局不再作为新部署方案。
 
-JetPack 6.1 可使用仓库构建入口 `deploy/build_actucore.sh --jp-version 6.1 --with-teleop`。该发布脚本在配置远端仓库凭据时会推送镜像；仅本地构建须使用项目约定的 Dockerfile 构建方式。构建、挂载和配置恢复约束见 [ActuCore README](../../README.md#遥操与-vla-共用-actucore)。共享依赖锁是 `requirements.bundle.lock`；CPU 隔离验证镜像不构成另一套生产服务。
+JetPack 6.1 的普通 ActuCore 镜像自动包含遥操依赖，沿用 `deploy/build_actucore.sh --jp-version 6.1`；不要求特殊遥操构建开关或更新 bot。卡片仍默认关闭。该发布脚本在配置远端仓库凭据时会推送镜像；仅本地构建须使用项目约定的 Dockerfile 构建方式。构建、挂载和配置恢复约束见 [ActuCore README](../../README.md#遥操与-vla-共用-actucore)。共享依赖锁是 `requirements.bundle.lock`；CPU 隔离验证镜像不构成另一套生产服务，JP5.1.1 不声明遥操数值支持。
 
 将 [配置示例](config.example.yaml) 的 `plugins.teleop` 合入现有配置，保留其他插件。新部署还必须提供标定、TLS、配对状态、管理密钥与 DDS 文件的挂载；标准 service 片段尚未自动生成全部遥操挂载，不能只打开 `enabled` 就宣称部署完成。`/deploy/dds-local.xml` 必须和宿主挂载的 DDS profile 一致。Core 的 `TELEOP_MANAGEMENT_URL` 指向共享的本机 15730 MCP，管理凭据只由 Core／ActuCore 持有。
+
+ActuCore 启动时检查站点资料。缺少或无效时，不注册遥操工具，VLA 仍正常注册；`tools/list` 的 `_meta.required_site_config` 及直接 `teleop` 的 `info` 返回缺失字段和错误码，不暴露路径、密钥或证书内容。检查包含管理密钥、WSS 证书/域名/私钥、可写状态目录、标定模型哈希和必要依赖。Core 另行核对管理 URL 与共享密钥。补齐站点挂载后需要重启 ActuCore 重新注册；已就绪卡片的日常参数、配对和启停仍通过 Canvas/PICO 完成。站点检查不等于模型或停止行为的实物验收。
 
 低频 MCP 操作包括 `info/config/project_start/project_stop/start/pause/resume/finish/stop`、配对、标定、自检及录制，按机型声明支持项。Core 将唯一连线解析出的 `driver_binding` 传给 `project_start`；它只设置内存权限，不直接调用 Driver 动作。`project_stop` 等待收臂及控制权释放，不将异步受理回执当作完成。
 

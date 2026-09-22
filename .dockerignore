@@ -1,0 +1,2 @@
+# Fetched and hash-verified in JP6.1 / CPU build layers, not in COPY.
+actucore/plugins/teleop/models/g1_collision/*.STL

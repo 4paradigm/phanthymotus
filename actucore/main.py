@@ -7,7 +7,7 @@ ActuCore 把意图/目标变成运动指令。执行模型（VLA、导航、抓�
 whole-body control）以卡片（插件）的形式挂在这里，聚合成一个 MCP HTTP server
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-当前版本不带任何卡片 —— 这是骨架 + 全链路（注册、探活、部署）打通。
+当前提供 VLA 卡片及可选遥操卡片；遥操仅在站点配置检查通过后注册。
 新增卡片的完整步骤见 README.md。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
@@ -112,6 +112,7 @@ class ActuCoreBundle:
     def __init__(self, cfg: dict, executor):
         self.server_name = cfg.get("name", "actucore-bundle")
         self._plugins: list = []
+        self.required_site_config: dict = {}
         plugins_cfg = cfg.get("plugins") or {}
 
         # ── 卡片注册区 ────────────────────────────────────────────────────
@@ -139,9 +140,15 @@ class ActuCoreBundle:
             log.info("VLAPlugin loaded")
 
         if plugins_cfg.get("teleop", {}).get("enabled", False):
-            from plugins.teleop import TeleopPlugin
-            self._plugins.append(TeleopPlugin(plugins_cfg["teleop"], executor))
-            log.info("TeleopPlugin loaded")
+            from plugins.teleop.site import required_site_config
+            issues = required_site_config(plugins_cfg["teleop"])
+            if issues:
+                self.required_site_config['teleop'] = issues
+                log.error("teleop not advertised: required_site_config=%s", issues)
+            else:
+                from plugins.teleop import TeleopPlugin
+                self._plugins.append(TeleopPlugin(plugins_cfg["teleop"], executor))
+                log.info("TeleopPlugin loaded")
 
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
@@ -176,6 +183,10 @@ class ActuCoreBundle:
     def dispatch(self, full_name: str, args: dict) -> dict | None:
         prefix, sep, tool_name = full_name.partition("_")
         name = tool_name if sep else prefix
+        if prefix in self.required_site_config:
+            return {'state': 'unavailable', 'error': 'required_site_config',
+                    'required_site_config': self.required_site_config[prefix],
+                    'output_active': False}
         for p in self._plugins:
             if p.PREFIX == prefix:
                 return p.dispatch(name, args)
@@ -275,7 +286,8 @@ def make_handler():
                     ok({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                         "serverInfo": {"name": _bundle.server_name, "version": "1.0.0"}})
                 elif method == "tools/list":
-                    ok({"tools": _bundle.get_all_tools()})
+                    ok({"tools": _bundle.get_all_tools(),
+                        "_meta": {"required_site_config": _bundle.required_site_config}})
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}

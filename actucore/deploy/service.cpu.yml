@@ -1,0 +1,23 @@
+# Same card host and deployment identity; CPU builds require no NVIDIA runtime.
+# Teleop's TLS, pairing-state and configuration mounts remain site configuration.
+actucore:
+  image: __IMAGE__
+  container_name: embodied-actucore
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/embodied/models:/models
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always
