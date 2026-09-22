@@ -685,3 +685,57 @@ def test_leaving_the_stop_distance_resets_the_patience():
     _step(detections=_detections(_obj(x=0.3)), depth=_depth(map_=_solid_depth(5.0)),
           config=config, state=state, dt=0.5)
     assert state.close_for_s == 0.0
+
+
+# ── the robot's deadband ─────────────────────────────────────────────────────
+#
+# R1 does nothing below 0.4 m/s or 1.0 rad/s — measured on r1_sz one axis at a
+# time. The SDK accepts smaller commands, returns 0, and the robot stands still,
+# so a policy that does not know about this emits a smooth ramp and never moves
+# while every layer reports success.
+
+_R1 = [0.4, 0.4, 0.0, 0.0, 0.0, 1.0]
+
+
+def test_a_command_inside_the_deadband_is_lifted_out_of_it():
+    """The policy asked for motion; this is the slowest motion available."""
+    assert P.apply_deadband([0.0, 0, 0, 0, 0, -0.6], _R1)[5] == -1.0
+    assert P.apply_deadband([0.3, 0, 0, 0, 0, 0], _R1)[0] == 0.4
+
+
+def test_a_command_well_below_the_deadband_is_zeroed_rather_than_amplified():
+    """Snapping 0.02 up to 1.0 rad/s would turn a rounding error into a lurch.
+    Zero is at least honest, and the caller can see that it is zero."""
+    assert P.apply_deadband([0, 0, 0, 0, 0, -0.1], _R1)[5] == 0.0
+
+
+def test_a_command_above_the_deadband_is_untouched():
+    assert P.apply_deadband([0.7, 0, 0, 0, 0, -1.5], _R1) == [0.7, 0, 0, 0, 0, -1.5]
+
+
+def test_an_exact_zero_stays_zero():
+    """Stopping must never become the slowest possible motion."""
+    assert P.apply_deadband([0.0] * 6, _R1) == [0.0] * 6
+
+
+def test_axes_with_no_threshold_pass_through():
+    assert P.apply_deadband([0, 0, 0.01, 0, 0, 0], _R1)[2] == 0.01
+
+
+def test_no_declared_deadband_changes_nothing():
+    """A robot that never declared one — most of them — is unaffected."""
+    assert P.apply_deadband([0.01] * 6, None) == [0.01] * 6
+    assert P.apply_deadband([0.01] * 6, []) == [0.01] * 6
+
+
+def test_the_sign_survives():
+    assert P.apply_deadband([-0.3, 0, 0, 0, 0, 0.6], _R1)[:1] == [-0.4]
+    assert P.apply_deadband([-0.3, 0, 0, 0, 0, 0.6], _R1)[5] == 1.0
+
+
+def test_the_default_search_rate_clears_a_typical_deadband():
+    """A search that commands less than the robot can execute leaves the card
+    reporting "searching" beside a motionless robot — seen on r1_sz the moment
+    deadband handling went in, with search_rate 0.4 against R1's 1.0 rad/s."""
+    rate = P.Config().search_rate
+    assert P.apply_deadband([0, 0, 0, 0, 0, -rate], _R1)[5] != 0.0

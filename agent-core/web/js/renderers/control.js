@@ -34,6 +34,15 @@
 // AXIS_NAMES — three places name these, and they must not drift.
 const TWIST_AXES = ['vx', 'vy', 'vz', 'wx', 'wy', 'wz'];
 
+// `wz` 精确但不自明：它是**绕 z 轴**（竖直轴）的角速度，也就是原地转向，而不是
+// 「在 z 方向上转」。地面机器人恰好只有 vx/vy/wz 三个自由度是活的，其余三个描述
+// 的是上下、侧翻、俯仰 —— 底盘做不到，所以 descriptor 把它们钉死为 0。
+const TWIST_HINTS = {
+  vx: '前后（+ 前进）', vy: '左右平移（+ 左）', vz: '上下（底盘无此自由度）',
+  wx: '翻滚（底盘无此自由度）', wy: '俯仰（底盘无此自由度）',
+  wz: '转向，绕竖直轴（− 顺时针/右转）',
+};
+
 const BAR_COLOUR   = '#4D9EE8';
 const WARN_COLOUR  = '#D97757';
 // Within this fraction of a limit the bar turns warm. Not a threshold the sink
@@ -149,10 +158,15 @@ export const ControlRenderer = {
         'flex:1;height:10px;background:rgba(255,255,255,0.06);border-radius:5px;' +
         'position:relative;overflow:hidden';
 
+      // 零位刻度。原先是 rgba(255,255,255,0.18) —— 白色，在浅色主题上**完全看
+      // 不见**，于是以零为锚的条看起来像凭空浮着一块。用边框色跟着主题走。
+      //
+      // 位置也不能写死 50%：那只在量程对称时才是零位。[0, 1] 的量程里零在最左。
+      // 真实位置每帧在 _paint 里算。
       const zero = document.createElement('div');
       zero.style.cssText =
         'position:absolute;left:50%;top:0;bottom:0;width:1px;' +
-        'background:rgba(255,255,255,0.18)';
+        'background:var(--text-dim, rgba(0,0,0,0.35))';
       track.appendChild(zero);
 
       const fill = document.createElement('div');
@@ -165,7 +179,7 @@ export const ControlRenderer = {
 
       row.append(name, track, value);
       this._rows.appendChild(row);
-      this._bars.push({ row, fill, value, name, idx: i });
+      this._bars.push({ row, fill, value, name, zero, idx: i });
     }
   },
 
@@ -177,22 +191,42 @@ export const ControlRenderer = {
     msg.values.forEach((v, i) => {
       const bar = this._bars[i];
       if (!bar) return;
-      bar.name.textContent = (this._names && this._names[i]) || `joint${i + 1}`;
+      const label = (this._names && this._names[i]) || `joint${i + 1}`;
+      bar.name.textContent = label;
+      if (TWIST_HINTS[label]) bar.name.title = TWIST_HINTS[label];
       bar.value.textContent = Number(v).toFixed(3);
 
       const lo = lower[i];
       const hi = upper[i];
       // A bar needs both ends and a non-zero span; an inferred range starts
       // with neither, so the first frame draws no fill rather than a full one.
+      //
+      // 推断量程下这个退化情况会持续很久：一个轴只出现过一个取值时 lo === hi，
+      // 于是 0.4 这样明显非零的数字旁边一直是空的。画不出条是诚实的（没有量程
+      // 就没有比例可言），但要让人看出来是「还没有量程」而不是「值为零」。
       if (lo === undefined || hi === undefined || hi === lo) {
         bar.fill.style.width = '0';
+        bar.row.title = (v === 0)
+          ? ''
+          : '尚无量程：这个轴目前只出现过一个取值，按已见极值推断不出范围';
         return;
       }
+      bar.row.title = '';
+      // 条形以**零位**为锚，不是以左边缘 —— 轨道中间那条刻度线就是零位，而
+      // 从左边缘画会和它矛盾：wz 的量程是 [-2, 2] 时，v=0 算出 frac=0.5，于是
+      // 一个明明是零的值显示成半条 bar。真机上就是这样报上来的。
       const span = hi - lo;
-      const frac = Math.max(0, Math.min(1, (v - lo) / span));
-      bar.fill.style.left  = '0';
-      bar.fill.style.width = (frac * 100).toFixed(2) + '%';
-      const near = frac >= NEAR_LIMIT || frac <= 1 - NEAR_LIMIT;
+      const clamp = (x) => Math.max(0, Math.min(1, x));
+      const zeroFrac = clamp((0 - lo) / span);          // 零位在量程里的位置
+      const valFrac  = clamp((v - lo) / span);
+      const left  = Math.min(zeroFrac, valFrac);
+      const width = Math.abs(valFrac - zeroFrac);
+      if (bar.zero) bar.zero.style.left = (zeroFrac * 100).toFixed(2) + '%';
+      bar.fill.style.left  = (left * 100).toFixed(2) + '%';
+      bar.fill.style.width = (width * 100).toFixed(2) + '%';
+      // 接近量程两端才示警，按的是值在量程里的位置而不是条的长度 —— 一个以零
+      // 为锚的条，长度说的是离零多远，不是离限位多近。
+      const near = valFrac >= NEAR_LIMIT || valFrac <= 1 - NEAR_LIMIT;
       bar.fill.style.background = near ? WARN_COLOUR : BAR_COLOUR;
     });
 

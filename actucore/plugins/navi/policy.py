@@ -94,7 +94,14 @@ class Config:
     k_fwd: float = 0.6
     vx_max: float = 0.4
     wz_max: float = 0.8
-    search_rate: float = 0.4
+    # Searching turns at this rate. It must clear the robot's deadband or the
+    # search commands are snapped to zero and the robot simply stands there
+    # while the card reports "searching" — which is what happened on r1_sz once
+    # the deadband handling went in: R1 needs 1.0 rad/s and this was 0.4.
+    #
+    # Every speed in this file has to be read against `min_magnitude`; a value
+    # that looks conservatively slow may be one the robot cannot execute at all.
+    search_rate: float = 1.0
     # Backstop only. The sweep below is what normally ends a search, because it
     # is behavioural — "I have turned all the way round and it is not here" —
     # whereas a clock says nothing about what the robot did with the time.
@@ -148,6 +155,43 @@ class Decision:
     @property
     def publishes(self) -> bool:
         return self.values is not None
+
+
+def apply_deadband(values, min_magnitude) -> list:
+    """Lift each axis out of the robot's deadband, or drop it to zero.
+
+    Some robots do nothing at all below a threshold — a legged base has to
+    assemble a whole gait cycle, so there is no "creep slowly" regime. R1 needs
+    0.4 m/s and 1.0 rad/s. Below that the SDK accepts the command, returns 0,
+    and the robot stands still, so a policy emitting a smooth ramp towards zero
+    spends its entire life commanding motion and producing none — with every
+    layer in between reporting success. That is exactly how it presented on
+    r1_sz: 159 commands applied, no errors anywhere, a motionless robot.
+
+    The threshold is the robot's, declared in its descriptor, so this function
+    takes it as data rather than knowing any robot's numbers.
+
+    Anything at or above half the threshold is snapped **up**: the policy asked
+    for motion and this is the slowest motion available, so rounding down would
+    silently discard the request. Below half it is snapped to zero, which is at
+    least honest — and the caller can see it did, because the value is 0.
+
+    The cost is coarse control near zero. That is inherent to the robot, not
+    something a smoother policy can fix.
+    """
+    if not min_magnitude:
+        return list(values)
+    out = []
+    for value, floor in zip(values, list(min_magnitude) + [0.0] * len(values)):
+        if not floor or value == 0.0:
+            out.append(value)
+        elif abs(value) >= floor:
+            out.append(value)
+        elif abs(value) >= floor / 2.0:
+            out.append(floor if value > 0 else -floor)
+        else:
+            out.append(0.0)
+    return out
 
 
 def _twist(vx: float, wz: float) -> list:
@@ -440,6 +484,10 @@ def _search(config: Config, state: State, dt: float) -> Decision:
     # finds it eventually, by going all the way round, and so reads as "search
     # is just slow" rather than as a wrong sign.
     wz = -config.search_rate * state.last_seen_side
+    # Accumulated from the commanded rate, which is only the turn actually
+    # performed while `search_rate` clears the deadband — below it the command
+    # is zeroed downstream and this would count a rotation that never happened.
+    # Keeping search_rate above the threshold is what makes the two agree.
     state.searched_rad += abs(wz) * dt
 
     # Exhausted searches used to go quiet, which left the caller with no answer

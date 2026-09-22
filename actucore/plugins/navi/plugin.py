@@ -753,11 +753,18 @@ class NaviPlugin:
         if not decision.publishes:
             return None
 
+        # 把指令抬出机器人的死区，或者干脆归零。阈值来自下游 descriptor ——
+        # 这是机器人的属性，策略不该知道任何一台机器的具体数字。
+        values = policy_mod.apply_deadband(
+            decision.values,
+            ((self._descriptor.get("limits") or {}).get("min_magnitude")
+             if self._descriptor else None))
+
         self._seq += 1
         obs_ms = self._objects_ms or int(now * 1000)
         message = build_message(
             seq=self._seq,
-            values=decision.values,
+            values=values,
             mode=CONTROL_MODE,
             dof=ACTION_DIM,
             source=f"mcp__actucore__{self.PREFIX}",
