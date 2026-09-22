@@ -53,13 +53,15 @@ ACTION_DIM = 6
 # a body twist is the only thing this card knows how to produce.
 TOPIC_FORMAT = "control/velocity"
 
-# 每多少条指令回显一次 descriptor。见 next_command。
+# How often the descriptor is echoed back into the stream. See next_command.
 _DESCRIPTOR_EVERY = 50
 
-# twist 六个轴的名字。**轴序由协议定死**（motus.control/1 的 MODES 注释、驱动侧
-# loco_servo 的 AXIS_NAMES、motus.odom/1 的 AXES 都是这一组），所以一个 twist 生
-# 产者不需要下游就知道自己发的六个数叫什么 —— 没接底盘卡片时也能把名字带上，
-# 而不是把「按下标叫 joint1..joint6」的责任推给渲染器。
+# The six twist axes. **The order is fixed by the protocol** — motus.control/1's
+# MODES comment, loco_servo's AXIS_NAMES on the driver side and motus.odom/1's
+# AXES are all this same list — so a twist producer knows what its six numbers
+# are called without asking anything downstream. That is what lets this card
+# name them even with no chassis wired, instead of leaving the renderer to call
+# them joint1..joint6.
 TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 
 
@@ -129,9 +131,10 @@ class NaviPlugin:
         self._obs_lock = threading.RLock()
         self._objects = None
         self._objects_ms = 0
-        # 最近 N 帧的检测结果，给 list_visible_objects 求交集用。deque 而不是
-        # list：这是热路径上每帧都写的东西，而且必须有界 —— 一个跑了一小时的
-        # 卡片不该攒着三万帧检测结果。
+        # The last N detection payloads, for `list_visible_objects` to intersect.
+        # A deque rather than a list: this is written every frame on the hot
+        # path and has to be bounded — a card left running for an hour should
+        # not be holding thirty thousand frames of detections.
         from collections import deque
         self._recent = deque(maxlen=int(self._cfg.get("stable_frames", 10)))
         self._depth_map = None
@@ -238,7 +241,7 @@ class NaviPlugin:
                 "required": [],
             },
             # Declared rather than discovered after start — a card that names no
-            # topic until it runs leaves a downstream card with "连线缺少 topic"
+            # topic until it runs leaves a downstream card with "missing topic"
             # the moment this one fails to start, which reads like a wiring
             # problem on a canvas that is wired correctly.
             "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT,
@@ -290,14 +293,17 @@ class NaviPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict):
-        # 没接下游**不拒绝启动**。
+        # No downstream is **not** a reason to refuse starting.
         #
-        # 「先不接底盘，就想看看它算出什么」是正当用法，而且是调这张卡片时最常
-        # 用的一种：指令照样发到话题上，接着看就是了，机器人一动不动。早先这里
-        # 直接拒绝，等于要求必须先有一台能动的机器人才能观察它的决策。
+        # "Don't wire the chassis yet, I just want to see what it computes" is a
+        # legitimate way to bring this card up, and the most common one while
+        # tuning it: the commands still go out on the topic, you watch them, and
+        # the robot does not move. Refusing here demanded a robot that can move
+        # before its decisions could be observed at all.
         #
-        # 接了下游时协商一点没放松 —— 那才是会让硬件动起来的情况，动作空间对不
-        # 上就必须当场拒绝，而不是 10 Hz 地一条条失败。
+        # Nothing is relaxed when a downstream *is* present — that is the case
+        # where hardware moves, and a mismatched action space has to be refused
+        # at start rather than failing one command at a time at 10 Hz.
         descriptor = args.get("control_interface") or {}
         capabilities = self._capabilities()
 
@@ -377,9 +383,11 @@ class NaviPlugin:
             depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
                      if self._depth_ms else None)
         if not frames:
-            # 先说自己的状态，再谈别人的。卡片没在运行时它当然收不到检测结果，
-            # 而早先这里一律回「确认 vop 卡片在运行且相机有画面」—— 把人指向
-            # 上游去查一个没有问题的东西，而答案就在这张卡自己的 state 里。
+            # Report your own state before pointing at anyone else's. A card
+            # that is not running receives nothing, of course — and this used to
+            # answer "check that vop is running and the camera has a picture"
+            # regardless, sending people upstream to investigate something that
+            # was working, when the answer was in this card's own state.
             if not self._running:
                 return {"objects": [], "frames": 0,
                         "message": "本卡片未在运行（state=idle），因此没有订阅任何"
@@ -402,10 +410,12 @@ class NaviPlugin:
             out.append({
                 "key": item["key"],
                 "name": item["name"],
-                # 颜色发可读文本，不发原始字段。vop 在 `publish_color: full` 下
-                # 每个对象带 12 个数 —— 真机上这个回复到过 7356 字符，而它每次
-                # 都整份进 LLM 上下文，其中没有一个数字是调用方用得上的：它要的
-                # 是挑一个目标，而挑目标只需要 key 和一句描述。
+                # Colour as readable text, not raw fields. Under
+                # `publish_color: full` vop carries twelve numbers per object;
+                # on r1_sz this reply reached 7356 characters, and it goes into
+                # LLM context whole on every call. None of those numbers helps
+                # the caller, who is choosing a target and needs only the key
+                # and a description.
                 "color": policy_mod.colour_text(item["object"]),
                 "bearing": round(item["bearing"], 3),
                 "distance_m": distance,
@@ -415,8 +425,9 @@ class NaviPlugin:
             })
         return {"objects": out, "count": len(out),
                 "frames": len(frames), "min_frames": need,
-                # 降级说明一并带出来：距离是 None 还是个数，取决于接了哪种深度，
-                # 而只看列表是看不出差别的。
+                # Carry the degradations here too: whether `distance_m` is a
+                # number or None depends on which depth source is wired, and the
+                # list alone does not show the difference.
                 "degraded": self._degradations()}
 
     def _navigate_to(self, args: dict):
@@ -437,7 +448,7 @@ class NaviPlugin:
             # **The card mints this, agent-core does not supply it.** The ACP
             # contract runs the other way from what it looks like: an async tool
             # returns an `action_id` in its reply, agent-core parses it out and
-            # registers the pending action (`mcp_client.py`, "ACP: 异步工具"),
+            # registers the pending action (`mcp_client.py`, the ACP section),
             # and the completion later refers back to it. Reading it out of
             # `args` — which is what this did first — finds nothing, so no
             # pending is ever registered and no completion can be matched.
@@ -452,12 +463,14 @@ class NaviPlugin:
                "stop_distance_m": self._config.stop_distance_m,
                "degraded": self._degradations()}
 
-        # 立刻回答「这个目标现在看得见吗」。
+        # Answer "is this target visible right now" immediately.
         #
-        # 不看得见**不拒绝** —— 「转过去找那把椅子」是正当用法，目标本来就可能
-        # 在视野外。但也不能只回一个 "running" 就完事：早先正是这样，一个拼错的
-        # key 换来一句「已开始」，然后机器人转满一圈、16 秒后才在 info().last 里
-        # 留下失败原因，而调用方那时早就不在看了。它在下指令的这一刻就能知道。
+        # Not visible is **not** a refusal — "turn around and find the chair" is
+        # legitimate, and the target may well be out of frame. But replying only
+        # "running" is not enough either: that is what this did, so a mistyped
+        # key bought a cheerful "started", and the reason surfaced sixteen
+        # seconds later in info().last, after a full turn, long after the caller
+        # had stopped looking. It can be known at the moment of the call.
         visible = self._visible_keys()
         if visible and not self._matches_anything(target, visible):
             out["warning"] = (f"目标 {target!r} 不在当前可见列表里，将转身搜索；"
@@ -539,12 +552,16 @@ class NaviPlugin:
                 "state": ("running" if self._running and not self._paused else
                           "paused" if self._running else "idle"),
                 "topic": self._topic,
-                # **agent-core 登记监控话题读的是这里，不是工具 schema。**
-                # api/config.py 在启动每张卡之后拿 info() 的 topic_out 去调
-                # register_topic_internal，inspection 据此订阅、仪表盘的「查看数
-                # 据流」才有东西可看。少了它，卡片一切正常、消息确实在总线上，
-                # 而面板永远是空的 —— 真机上就是这样：直接用 rclpy 订 
-                # /actucore/navi/cmd 能收到 10 Hz 的指令，画布上什么都没有。
+                # **agent-core registers monitored topics from here, not from
+                # the tool schema.** After starting each card, api/config.py
+                # takes `topic_out` out of its `info()` reply and calls
+                # `register_topic_internal`; inspection subscribes off the back
+                # of that, and only then does the canvas data-flow panel have
+                # anything to show. Without it the card is entirely healthy, the
+                # messages really are on the bus, and the panel is empty for
+                # ever — which is exactly how it presented on r1_sz: subscribing
+                # to /actucore/navi/cmd with rclpy received commands at 10 Hz
+                # while the canvas showed nothing.
                 "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT}],
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
@@ -562,9 +579,11 @@ class NaviPlugin:
             }
 
     def _degradations(self) -> list:
-        # 未运行时不报降级。降级说的是「跑起来了，但少了点什么」；一张没启动的
-        # 卡片什么都没接是正常的，照旧报「只接了深度摘要」纯属无中生有 —— 真机
-        # 上它就在 inputs 为空时报过这一条。
+        # No degradations while not running. A degradation means "running, but
+        # missing something"; a card that has not started has nothing bound
+        # because it has not started, and reporting "only the depth summary is
+        # wired" there is inventing a fact — which it did on r1_sz, with
+        # `inputs` empty.
         if not self._running:
             return []
         out = []
@@ -588,12 +607,13 @@ class NaviPlugin:
 
     # ── wiring ───────────────────────────────────────────────────────────────
 
-    # perception 自己定义的输出话题后缀（plugins/vop.py::output_topic_for，
-    # plugins/visual_depth.py::output_topics_for）。角色由它们决定，而不是由
-    # 「这条话题上现在有没有发布者」决定 —— 见 _bind_inputs。
+    # The output-topic suffixes perception defines for itself
+    # (plugins/vop.py::output_topic_for, plugins/visual_depth.py::
+    # output_topics_for). Roles come from these, not from whether a topic
+    # currently has a publisher — see _bind_inputs.
     #
-    # 顺序有意义：visual_depth_summary 必须排在 visual_depth 前面，否则带
-    # `/visual_depth` 前缀的摘要话题会先被当成深度图。
+    # The order matters: visual_depth_summary has to precede visual_depth, or
+    # the summary topic is matched as a depth map by its shared prefix.
     _ROLE_SUFFIXES = (
         ("/visual_depth_summary", "depth_summary"),
         ("/visual_depth", "depth_map"),
@@ -629,8 +649,9 @@ class NaviPlugin:
                 if not role:
                     unknown.append(hint)
                     continue
-            # 同一角色接了多路时保留第一条：多接一路深度图是画布上的手误，
-            # 静默换成后接的那条只会让「为什么距离不对」更难查。
+            # First topic of a role wins. Two depth maps wired to one card is
+            # a slip on the canvas, and silently switching to whichever came
+            # last only makes "why is the distance wrong" harder to answer.
             if not bound[role]:
                 bound[role] = topic
 
@@ -646,9 +667,11 @@ class NaviPlugin:
                            + (f"（无法识别的输入：{'、'.join(unknown)}）"
                               if unknown else ""))
 
-        # 必需的都在，但还有认不出的连线：不拦启动（该有的观测都有了），却也不
-        # 能装作没看见 —— 操作员画那根线是有意图的，而被静默忽略的一路输入在画
-        # 布上和正常工作的一路长得一模一样。记进降级说明里。
+        # Everything required is present, but something else is wired and not
+        # recognised: do not block the start — the observations are all there —
+        # and do not pretend not to have noticed either. The operator drew that
+        # line on purpose, and an ignored input looks exactly like a working one
+        # on the canvas. It goes into the degradations.
         bound["unknown"] = unknown
 
         from sensor_msgs.msg import CompressedImage
@@ -681,8 +704,10 @@ class NaviPlugin:
         if any(n.endswith(("CompressedImage", "Image")) for n in types):
             return "depth_map", ""
         if any(n.endswith("String") for n in types):
-            # String 上三种载荷都可能，名字又认不出，猜错的代价是拿摘要当里程
-            # 计、或者反过来 —— 那会让机器人按完全错误的数字行动。不猜。
+            # Three different payloads ride on String and the name says
+            # nothing, so a wrong guess means reading a depth summary as
+            # odometry or the reverse — and the robot then acts on entirely the
+            # wrong numbers. Do not guess.
             return "", f"{topic}（String，但话题名不符合 perception 的命名约定，无法确定用途）"
         return "", f"{topic}（{'/'.join(types) or '暂无发布者，且话题名不符合命名约定'}）"
 
@@ -769,8 +794,9 @@ class NaviPlugin:
         if not decision.publishes:
             return None
 
-        # 把指令抬出机器人的死区，或者干脆归零。阈值来自下游 descriptor ——
-        # 这是机器人的属性，策略不该知道任何一台机器的具体数字。
+        # Lift the command out of the robot's deadband, or drop it to zero. The
+        # threshold comes from the downstream descriptor — it is a property of
+        # the robot, and this policy should not know any robot's numbers.
         values = policy_mod.apply_deadband(
             decision.values,
             ((self._descriptor.get("limits") or {}).get("min_magnitude")
@@ -793,19 +819,25 @@ class NaviPlugin:
             priority=int(self._cfg.get("priority", 50)),
         )
 
-        # 周期性回显下游的 descriptor，让这条流**自解释**。
+        # Echo the downstream descriptor periodically, so the stream describes
+        # itself.
         #
-        # 仪表盘的 control 渲染器会从 `control_interface` 里取 joint_names 和
-        # limits；拿不到就只能按下标叫 joint1..joint6，并且按见过的极值反推量程。
-        # twist 模式下那个命名尤其误导：唯一非零的那一项被标成 "joint6"，而它其
-        # 实是偏航角速度 —— 读的人会以为机器人在驱动六个关节。
+        # The dashboard's control renderer takes `joint_names` and `limits` out
+        # of `control_interface`; without them it can only label by index and
+        # infer a range from the extremes it has seen. Under `twist` that
+        # labelling actively misleads: the one non-zero entry is captioned
+        # "joint6" when it is the yaw rate, and the reader concludes the robot
+        # is driving six joints.
         #
-        # 每 N 条发一次而不是每条都发：descriptor 有上百个数字，10 Hz 全带等于把
-        # 指令流放大一个量级，而它是个常量 —— 协商一次之后就不会变。首条必带，
-        # 这样面板一打开就有名字，不用等一个周期。
+        # Every N commands rather than every one: the descriptor is a hundred
+        # numbers and a constant — it cannot change after negotiation — so
+        # carrying it at 10 Hz would multiply the command stream for nothing.
+        # The first command always carries it, so a panel opened at any time has
+        # names straight away instead of waiting out a cycle.
         if self._seq % _DESCRIPTOR_EVERY == 1:
-            # 接了下游就回显它那份（带真实限位，面板的量程条才有刻度）；没接
-            # 下游时至少把轴名带上 —— 轴序是协议定的，不需要问任何人。
+            # With a downstream, echo its descriptor — real limits are what
+            # give the panel's range bars a scale. Without one, still carry the
+            # axis names: the order is the protocol's, not anyone's to ask.
             message["control_interface"] = self._descriptor or {
                 "control_interface": negotiate.SCHEMA,
                 "mode": CONTROL_MODE,

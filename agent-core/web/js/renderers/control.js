@@ -34,9 +34,11 @@
 // AXIS_NAMES — three places name these, and they must not drift.
 const TWIST_AXES = ['vx', 'vy', 'vz', 'wx', 'wy', 'wz'];
 
-// `wz` 精确但不自明：它是**绕 z 轴**（竖直轴）的角速度，也就是原地转向，而不是
-// 「在 z 方向上转」。地面机器人恰好只有 vx/vy/wz 三个自由度是活的，其余三个描述
-// 的是上下、侧翻、俯仰 —— 底盘做不到，所以 descriptor 把它们钉死为 0。
+// `wz` is precise but not self-evident: it is angular velocity **about** the z
+// axis, which is vertical — so it is turning on the spot, not "rotating in the z
+// direction". A ground robot has exactly three live degrees of freedom, vx, vy
+// and wz; the other three describe rising, rolling and pitching, which a chassis
+// cannot do, which is why its descriptor pins them to zero.
 const TWIST_HINTS = {
   vx: '前后（+ 前进）', vy: '左右平移（+ 左）', vz: '上下（底盘无此自由度）',
   wx: '翻滚（底盘无此自由度）', wy: '俯仰（底盘无此自由度）',
@@ -158,11 +160,13 @@ export const ControlRenderer = {
         'flex:1;height:10px;background:rgba(255,255,255,0.06);border-radius:5px;' +
         'position:relative;overflow:hidden';
 
-      // 零位刻度。原先是 rgba(255,255,255,0.18) —— 白色，在浅色主题上**完全看
-      // 不见**，于是以零为锚的条看起来像凭空浮着一块。用边框色跟着主题走。
+      // The zero tick. It used to be rgba(255,255,255,0.18) — white, and so
+      // **entirely invisible** on a light theme, which left a bar anchored at
+      // zero looking like a block floating in space. Follows the theme now.
       //
-      // 位置也不能写死 50%：那只在量程对称时才是零位。[0, 1] 的量程里零在最左。
-      // 真实位置每帧在 _paint 里算。
+      // Its position cannot be hardcoded at 50% either: that is only where zero
+      // sits when the range is symmetric. In a [0, 1] range zero is at the left
+      // edge. The real position is computed per frame in _paint.
       const zero = document.createElement('div');
       zero.style.cssText =
         'position:absolute;left:50%;top:0;bottom:0;width:1px;' +
@@ -201,9 +205,11 @@ export const ControlRenderer = {
       // A bar needs both ends and a non-zero span; an inferred range starts
       // with neither, so the first frame draws no fill rather than a full one.
       //
-      // 推断量程下这个退化情况会持续很久：一个轴只出现过一个取值时 lo === hi，
-      // 于是 0.4 这样明显非零的数字旁边一直是空的。画不出条是诚实的（没有量程
-      // 就没有比例可言），但要让人看出来是「还没有量程」而不是「值为零」。
+      // With an inferred range this degenerate case lasts a long time: an axis
+      // that has only ever held one value has lo === hi, so a plainly non-zero
+      // 0.4 sits beside an empty track. Drawing nothing is honest — without a
+      // range there is no proportion to draw — but it has to read as "no range
+      // yet" rather than as "the value is zero".
       if (lo === undefined || hi === undefined || hi === lo) {
         bar.fill.style.width = '0';
         bar.row.title = (v === 0)
@@ -212,9 +218,11 @@ export const ControlRenderer = {
         return;
       }
       bar.row.title = '';
-      // 条形以**零位**为锚，不是以左边缘 —— 轨道中间那条刻度线就是零位，而
-      // 从左边缘画会和它矛盾：wz 的量程是 [-2, 2] 时，v=0 算出 frac=0.5，于是
-      // 一个明明是零的值显示成半条 bar。真机上就是这样报上来的。
+      // The bar is anchored at **zero**, not at the left edge. The tick in the
+      // track is zero, and drawing from the left contradicts it: with wz in
+      // [-2, 2] a value of 0 computes frac = 0.5, so a value that is plainly
+      // zero renders as a half-full bar. That is how it was reported from the
+      // robot.
       const span = hi - lo;
       const clamp = (x) => Math.max(0, Math.min(1, x));
       const zeroFrac = clamp((0 - lo) / span);          // 零位在量程里的位置
@@ -224,8 +232,9 @@ export const ControlRenderer = {
       if (bar.zero) bar.zero.style.left = (zeroFrac * 100).toFixed(2) + '%';
       bar.fill.style.left  = (left * 100).toFixed(2) + '%';
       bar.fill.style.width = (width * 100).toFixed(2) + '%';
-      // 接近量程两端才示警，按的是值在量程里的位置而不是条的长度 —— 一个以零
-      // 为锚的条，长度说的是离零多远，不是离限位多近。
+      // Warn only near the ends of the range, keyed on where the value sits in
+      // it rather than on the bar's length — for a zero-anchored bar, length
+      // says how far from zero, not how close to a limit.
       const near = valFrac >= NEAR_LIMIT || valFrac <= 1 - NEAR_LIMIT;
       bar.fill.style.background = near ? WARN_COLOUR : BAR_COLOUR;
     });

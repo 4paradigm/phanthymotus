@@ -223,14 +223,17 @@ def _resolve_msg_type(fmt: str):
         except ImportError:
             pass
         return None
-    # `control/*` 是执行模型发给驱动的指令流（motus.control/1），`state/*` 是
-    # 驱动报出的本体状态（motus.odom/1 等）。两者都是 std_msgs/String 里的 JSON，
-    # 和感知那些卡片一样 —— 规范见 phanthymotus-driver/README_dev.md。
+    # `control/*` is the command stream an execution model sends to a driver
+    # (motus.control/1); `state/*` is what a driver reports about itself
+    # (motus.odom/1 and friends). Both are JSON inside a std_msgs/String, like
+    # the perception cards — spec in phanthymotus-driver/README_dev.md.
     #
-    # 这两个前缀原先不在表里，而后果只有一行 stderr：格式解析不出来就直接放弃
-    # 订阅，于是话题在 inspection 里登记得好好的、发布方也在 10 Hz 地发，而画布
-    # 上的「查看数据流」和监控汇总永远是空的。r1_sz 上的 navi 就是这样 —— 用
-    # rclpy 直接订能收到指令，面板上什么都没有。
+    # Neither prefix used to be in this table, and the only consequence was one
+    # line on stderr: an unresolved format means the subscription is silently
+    # abandoned, so the topic stays registered in inspection, the producer keeps
+    # publishing at 10 Hz, and the canvas data-flow panel is empty for ever.
+    # That was navi on r1_sz — subscribing with rclpy received the commands
+    # while the panel showed nothing.
     if (fmt in ('json', 'data/json') or fmt.startswith('sensor/')
             or fmt.startswith('data/') or fmt.startswith('control/')
             or fmt.startswith('state/')):

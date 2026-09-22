@@ -74,21 +74,28 @@ class Config:
     stop_distance_m: float = 1.2
     slow_distance_m: float = 1.8
     obstacle_stop_m: float = 0.8
-    # 全速前进所允许的横向偏差。**不是一道硬门** —— 超过它只按比例减速，到
-    # align_full_stop 才完全不前进，见 `_alignment_scale`。
+    # Lateral offset that still allows full speed. **Not a gate** — past it the
+    # speed is scaled down, reaching zero at align_full_stop. See
+    # `_alignment_scale`.
     align_tol: float = 0.15
-    # 偏到这个程度就只转不走：目标几乎在视野边缘，直着走过去是走向别处。
+    # Turn only, no travel, past this: the target is near the edge of frame,
+    # and driving straight at it is driving somewhere else.
     align_full_stop: float = 0.45
-    # 判定到达时的对正容差，比上面那个**松得多**，而且必须松。
+    # Alignment tolerance for *arriving*, far looser than the one above — and
+    # it has to be.
     #
-    # bearing 是归一化的横向偏移，不是角度：同样的侧移，5 米外几乎不动画面，
-    # 0.7 米处能把它甩出好几倍容差。用 align_tol 当到达条件，就是要求一个站在
-    # 面前的人一动不动 —— 真机上表现为距离早就进了 0.73 m，卡片却一直在「先转
-    # 正」，永远不判到达。而「转向算运动」又让 idle 超时救不了它：原地摆动是不
-    # 会停滞的。
+    # `bearing` is a normalised lateral offset, not an angle: the same sideways
+    # step barely moves the frame at 5 m and swings it several tolerances wide
+    # at 0.7 m. Requiring `align_tol` to arrive therefore asks a person standing
+    # in front of the robot to hold still. On r1_sz the distance had long since
+    # reached 0.73 m while the card kept reporting "turning in place first" and
+    # never arrived — and `idle_timeout_s` could not catch it either, because
+    # turning counts as motion and an oscillating aligner never stalls.
     arrive_align_tol: float = 0.30
-    # 已进入停止距离、却迟迟对不正时，多久之后接受「到了」。站在目标面前却因为
-    # 对不正而无限打转，比朝向差一点糟得多 —— 位置已经到了，朝向是锦上添花。
+    # How long to keep trying to align, once inside the stop distance, before
+    # accepting arrival anyway. Spinning for ever in front of the target is a
+    # far worse outcome than facing it a little off: the position is what
+    # arriving means, the heading is a courtesy.
     arrive_patience_s: float = 3.0
     k_yaw: float = 1.2
     k_fwd: float = 0.6
@@ -222,9 +229,10 @@ def select_target(objects, name: str, config: Config):
 
     candidates = [o for o in (objects or [])
                   if float(o.get("confidence") or 0) >= config.min_confidence]
-    # `list_visible_objects` 给出的 key（`chair#azure`）优先于名字。它是那份列表
-    # 里唯一能区分「两把不同颜色的椅子」的东西，而让 LLM 从列表里挑一个、再把
-    # 它退化成名字来匹配，等于把刚做出来的区分又丢掉。
+    # A key from `list_visible_objects` (`chair#azure`) beats a bare name. It is
+    # the only thing in that list that separates two chairs of different
+    # colours, so letting the caller pick one and then matching on the name
+    # alone throws away the distinction that was just made for them.
     keyed = [o for o in candidates if object_key(o).lower() == wanted]
     if keyed:
         pool = keyed
@@ -333,8 +341,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     else:
         state.close_for_s = 0.0
 
-    # 到达：位置到了，且大致朝着它 —— 或者已经在原地转了够久。后半句是必须的，
-    # 见 `arrive_patience_s`。
+    # Arrived: in position and roughly facing it — or turning in place for long
+    # enough. The second clause is not optional; see `arrive_patience_s`.
     if within and (abs(bearing) <= config.arrive_align_tol
                    or state.close_for_s >= config.arrive_patience_s):
         state.arrived = True
@@ -349,12 +357,15 @@ def _decide(detections, depth, odom, config: Config, state: State,
                            f"align — see arrive_patience_s)"),
                         distance_m=distance, bearing=bearing)
 
-    # 对正程度连续地缩放前进速度，而不是一道开关。
+    # Forward speed scales continuously with alignment rather than switching.
     #
-    # 硬门（偏差 > align_tol 就 vx=0）在近处必然死锁：bearing 是归一化横向偏移，
-    # 同样的侧移在 0.7 m 处远大于在 5 m 处，于是站在机器人面前的人只要轻微移动，
-    # 卡片就永远跨不过那道门 —— 真机上表现为「人就在前面，动的却一直是 wz」。
-    # 连续缩放保留了「偏得厉害就先转」的意图，而没有那个门槛。
+    # A gate (vx = 0 whenever |bearing| > align_tol) deadlocks at close range:
+    # `bearing` is a normalised lateral offset, so the same sideways step is far
+    # larger at 0.7 m than at 5 m, and a person standing in front of the robot
+    # only has to shift slightly for the card never to clear it. On r1_sz that
+    # presented as "the person is right there and the only thing moving is wz".
+    # Scaling keeps the intent — turn first when badly off — without the
+    # threshold.
     align = _alignment_scale(bearing, config)
     if align <= 0.0:
         state.commanded_vx = 0.0
@@ -542,18 +553,22 @@ def _stuck(odom, state: State, commanded_vx: float, dt: float,
                 f"measured {measured:.2f} m/s: blocked, stopping")
     return ""
 
-# ── 稳定物体列表 ──────────────────────────────────────────────────────────────
+# ── The stable object list ───────────────────────────────────────────────────
 #
-# 单帧检测是会闪的：一把椅子在连续十帧里可能只出现在七帧，而某一帧会凭空多出
-# 一个 0.4 置信度的「backpack」。把单帧结果直接交给 LLM 去挑目标，它会挑到一个
-# 下一帧就不存在的东西，然后导航卡片立刻进入搜索模式 —— 表现为机器人朝一个从
-# 来没有过的方向转圈。
+# Single-frame detections flicker. A chair that is really there may appear in
+# seven of ten consecutive frames, and one frame will conjure a 0.4-confidence
+# "backpack" out of nothing. Hand a single frame to an LLM to choose a target
+# from and it will eventually choose something that does not exist in the next
+# one — after which the card goes straight into its search behaviour, which
+# looks like a robot turning towards a direction nothing was ever in.
 #
-# 所以对外暴露的是**最近若干帧的交集**：只有反复出现的才算数。
+# So what is exposed is the **intersection over the last N frames**: only what
+# keeps appearing counts.
 
-# 目标身份的键。名字之外还要带颜色，否则「两把椅子」在列表里是一个条目，而
-# navigate_to("chair") 永远指向其中随机的一把。颜色来自 vop 的三元组，它在
-# `publish_color: name` 下就是一个可直接比较的字符串。
+# Target identity. Colour belongs in the key as well as the name, or two chairs
+# collapse into one entry and `navigate_to("chair")` reaches whichever of them
+# happens to win — which is not a choice the caller made. The colour comes from
+# vop's triple, a directly comparable string under `publish_color: name`.
 def hue_of(obj) -> str:
     """色相，从 vop 的两种颜色形态里取，取不到返回 ""。
 
@@ -585,8 +600,9 @@ def colour_text(obj) -> str:
 
 def object_key(obj) -> str:
     name = str(obj.get("name") or "?")
-    # 只取色相：亮度会随光照在帧间跳动，把它算进身份里会让同一把椅子在明暗之间
-    # 变成两个条目，两边都够不到稳定阈值。
+    # Hue only: brightness swings frame to frame with the lighting, and putting
+    # it in the identity makes one chair flicker between two entries, neither of
+    # which reaches the stability threshold.
     hue = hue_of(obj)
     return f"{name}#{hue}" if hue and hue != "neutral" else name
 
@@ -628,8 +644,9 @@ def stable_objects(frames, *, min_frames: int = 6, config: Config = None) -> lis
             entry = seen.setdefault(key, {"frames": set(), "last": obj,
                                           "confidence": 0.0})
             entry["frames"].add(index)
-            # 留最新的一帧作为方位来源：物体和机器人都可能在动，旧帧的方位会把
-            # 目标指到它已经不在的地方。
+            # Keep the newest frame as the source of bearing: both the object
+            # and the robot may be moving, and an older bearing points at where
+            # the target no longer is.
             entry["last"] = obj
             entry["confidence"] = max(entry["confidence"],
                                       float(obj.get("confidence") or 0))
