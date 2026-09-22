@@ -62,7 +62,8 @@ _l1_cache: dict = {'mtime': 0.0, 'content': ''}
 def _system_definition() -> str:
     """读取 L1 base prompt（含 system prompt + 身份定义 + 长期记忆），带 mtime 缓存。"""
     system_path = pathlib.Path(config.main['event']['llm']['prompt_system'])
-    identity_path = pathlib.Path('./resource/memory/identity.md')
+    from semantic_routing import DEFAULT_IDENTITY_PATH
+    identity_path = pathlib.Path(DEFAULT_IDENTITY_PATH)
     memory_path = pathlib.Path(config.main['event']['llm']['prompt_memory'])
 
     # 检查文件修改时间

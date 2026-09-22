@@ -862,6 +862,17 @@ async def _handle_agentcore_call(req: MCPCallRequest):
     import topic_subscriber
 
     action = req.arguments.get('action', '')
+    if req.tool == 'decision_core' and action == 'config':
+        import semantic_routing
+        if any(k in req.arguments for k in semantic_routing.CONFIG_KEYS):
+            if req.arguments.get('instance_id'):
+                return {'code': 400, 'message': 'Jev 配置仅支持共享配置，不支持实例配置'}
+            try:
+                await semantic_routing.configure(req.arguments)
+            except ValueError as exc:
+                return {'code': 400, 'message': str(exc)}
+            except Exception:
+                return {'code': 503, 'message': '配置数据库写入失败，旧配置保留'}
     input_topic = req.arguments.get('input_topic', '')
     input_topics = req.arguments.get('input_topics', [])
     # Merge single + list params
@@ -873,9 +884,11 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         # Auto-apply saved config before start (same pattern as HTTP MCPs)
         saved_cfg = config.main.get(f'tool_config:agentcore:{req.tool}', None)
         if saved_cfg:
-            await _handle_agentcore_call(MCPCallRequest(
+            configured = await _handle_agentcore_call(MCPCallRequest(
                 tool=req.tool, arguments={'action': 'config', **saved_cfg}
             ))
+            if configured.get('code') != 200:
+                return configured
 
         # Subscribe to requested topics (additive — cleanup is done by prior 'stop' call)
         if all_topics:
@@ -932,6 +945,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             # 按 10 轮跑」这件事在接口和日志里可见，而不是停留在某个进程的内存里。
             'narration_effective': dict(zip(('rounds', 'seconds'),
                                             _narration_thresholds())),
+            'semantic_routing': await asyncio.to_thread(__import__('semantic_routing').status),
         }}
 
     elif action == 'config':

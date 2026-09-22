@@ -407,6 +407,80 @@ def test_a_live_answer_beats_a_stale_persisted_one(driver):
     assert driver.starts[CORE]['input_topic'] == '/ubuntu/mic/audio'
 
 
+def test_start_invalidates_inflight_decision_before_and_after_cards(driver, monkeypatch):
+    import semantic_routing as routing
+
+    async def scenario():
+        cancelled = asyncio.Event()
+
+        async def pending_request():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        monkeypatch.setattr(routing, '_invalidate_lock', asyncio.Lock())
+        old_generation = routing._generation
+        task = asyncio.create_task(pending_request())
+        monkeypatch.setattr(routing, '_worker', task)
+        await asyncio.sleep(0)
+        mcp = sys.modules['api.mcp_manage']
+        original_call = mcp.mcp_call_tool
+
+        async def checked_call(mid, req, timeout_s=None):
+            if req.arguments.get('action') == 'start':
+                assert not routing.running()
+                assert cancelled.is_set()
+                assert routing._generation > old_generation
+            return await original_call(mid, req, timeout_s=timeout_s)
+
+        monkeypatch.setattr(mcp, 'mcp_call_tool', checked_call)
+        config.main['canvas_layout'] = R1_LAYOUT
+        assert await config_api._do_start_project() is True
+        assert routing.running()
+        assert routing._generation >= old_generation + 2
+        assert task.cancelled()
+
+    asyncio.run(scenario())
+
+
+def test_stop_during_start_cannot_be_overwritten_by_start_success(driver, monkeypatch):
+    import semantic_routing as routing
+
+    async def scenario():
+        monkeypatch.setattr(routing, '_invalidate_lock', asyncio.Lock())
+        mcp = sys.modules['api.mcp_manage']
+        original_call = mcp.mcp_call_tool
+        stopped = False
+
+        async def stop_during_call(mid, req, timeout_s=None):
+            nonlocal stopped
+            if req.arguments.get('action') == 'start' and not stopped:
+                stopped = True
+                await config_api._do_stop_project()
+            return await original_call(mid, req, timeout_s=timeout_s)
+
+        monkeypatch.setattr(mcp, 'mcp_call_tool', stop_during_call)
+        config.main['canvas_layout'] = R1_LAYOUT
+        assert await config_api._do_start_project() is False
+        assert not routing.running()
+        assert not any(e.get('type') == 'project_state' and e['payload'].get('running')
+                       for e in driver.events)
+
+    asyncio.run(scenario())
+
+
+def test_pending_solution_failure_blocks_all_card_starts(driver, monkeypatch):
+    from api import solutions
+    from unittest.mock import AsyncMock
+    retry = AsyncMock(return_value=False)
+    monkeypatch.setattr(solutions, 'reconcile_canvas_runtime', retry)
+    assert _start(R1_LAYOUT) is False
+    assert not driver.starts
+    assert not config.main['core']['project_running']
+    retry.assert_awaited_once()
+
+
 # ── 第四条回退：设备此刻声称的 topic_out ─────────────────────────────────────
 #
 # 前三条在一种情况下**全部为空，而且都不是错的**：

@@ -45,6 +45,7 @@ deviceRef 指向 devices[]，devices 用 MCP initialize 返回的 server_name
 泄密而是根本指不到东西，载入方必须重选。
 """
 
+import asyncio
 import os
 import pathlib
 import time
@@ -1073,10 +1074,56 @@ async def apply(request: fastapi.Request, req: LoadRequest):
     return {'code': 200, 'data': {'applied': applied, 'needsConfig': needs_config}}
 
 
+_canvas_runtime_lock = asyncio.Lock()
+
+
+async def reconcile_canvas_runtime():
+    async with _canvas_runtime_lock:
+        return await _reconcile_canvas_runtime()
+
+
+async def _reconcile_canvas_runtime():
+    """Retry the durable Solution journal; leave it intact on any failure.
+
+    Config bodies stay in their normal sanitized rows, never in this journal.
+    Stops and config calls are idempotent and are awaited before clearing it.
+    """
+    import asyncio
+    from api.canvas import apply_tool_config, tool_config_key
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.config import tool_state_of
+    import semantic_routing
+    pending = config.main.get('canvas_runtime_pending', {}) or {}
+    if not pending:
+        return True
+    try:
+        for card in pending.get('stop_cards', []):
+            result = await mcp_call_tool(card['mcpId'], MCPCallRequest(
+                tool=card['toolName'], arguments={'action': 'stop', 'instance_id': card['id']}))
+            if result.get('code') != 200 or tool_state_of(result)[0] == 'error' or result.get('isError'):
+                return False
+        for mid, name, iid in pending.get('configs', []):
+            value = config.main.get(tool_config_key(mid, name, iid), {}) or {}
+            if mid == 'agentcore' and name == 'decision_core':
+                value = {k: v for k, v in value.items() if k not in semantic_routing.CONFIG_KEYS}
+            await apply_tool_config(mid, name, value, iid, wait=True)
+        await asyncio.to_thread(config.main.update_atomic, {}, delete_keys=('canvas_runtime_pending',))
+        return True
+    except Exception:
+        # Report a safe status, not device errors that might contain secrets.
+        return False
+
+
 async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
+    async with _canvas_runtime_lock:
+        return await _apply_canvas_impl(canvas, mapping)
+
+
+async def _apply_canvas_impl(canvas: dict, mapping: dict) -> dict:
     """写画布布局与卡片配置。"""
-    from api.canvas import (apply_tool_config, delete_all_tool_configs,
+    from api.canvas import (apply_tool_config,
                             notify_layout_changed, tool_config_key)
+    import semantic_routing
 
     cards = []
     for card in canvas.get('cards') or []:
@@ -1107,21 +1154,13 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
         exec_connections.append(c)
 
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = {
+    layout = {
         'cards':           cards,
         'connections':     connections,
         'execConnections': exec_connections,
         'transform':       canvas.get('transform') or {},
     }
-    # 方案里的卡片是整套替换的，被换掉的那些卡片的实例不会再有人来停它
-    from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, cards)
-    # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
-    notify_layout_changed()
-
-    # 卡片配置：先清空旧的，再写包体里的
-    removed = delete_all_tool_configs()
-    written = 0
+    resolved = []
     for key, value in (canvas.get('toolConfigs') or {}).items():
         parts = key.split(':')
         if len(parts) < 2:
@@ -1133,13 +1172,33 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
             continue
         if instance_id and instance_id not in card_ids:
             continue
-        config.main[tool_config_key(mcp_id, tool_name, instance_id)] = value
-        apply_tool_config(mcp_id, tool_name, value, instance_id)
-        written += 1
+        resolved.append((mcp_id, tool_name, instance_id, value))
+    rows = {tool_config_key(mid, name, iid): value for mid, name, iid, value in resolved}
+    previous = config.main.get('canvas_runtime_pending', {}) or {}
+    live = {(c['mcpId'], c['toolName'], c['id']) for c in cards}
+    obsolete = {(c.get('mcpId'), c.get('toolName'), c.get('id')): c
+                for c in [*previous.get('stop_cards', []), *old_cards]
+                if c.get('mcpId') and c.get('toolName') and c.get('id')
+                and (c['mcpId'], c['toolName'], c['id']) not in live}
+    pending = {'stop_cards': list(obsolete.values()),
+               'configs': [[mid, name, iid] for mid, name, iid, _ in resolved]}
+    try:
+        _, removed = await semantic_routing.replace_canvas_settings(layout, rows, runtime_pending=pending)
+    except ValueError as exc:
+        raise fastapi.HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise fastapi.HTTPException(503, '画布配置数据库写入失败，旧配置保留') from exc
+
+    # Validation and the complete config transaction succeeded. Only now may
+    # replacement stop removed instances or push new settings to plugins.
+    runtime_applied = await _reconcile_canvas_runtime()
+    notify_layout_changed()
 
     return {'cards': len(cards),
+            'persisted': True, 'runtime_applied': runtime_applied,
+            'warning': '' if runtime_applied else '方案已保存，但运行时同步未完成；启动前将重试，失败则禁止启动。',
             'connections': len(connections) + len(exec_connections),
-            'toolConfigsWritten': written, 'toolConfigsRemoved': removed}
+            'toolConfigsWritten': len(rows), 'toolConfigsRemoved': removed}
 
 
 async def _apply_skills(skills: list, token: Optional[str]) -> dict:

@@ -13,6 +13,7 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_interrupt_all
 """
 
 import asyncio
+import importlib
 import os
 import pathlib
 import sys
@@ -76,7 +77,9 @@ def bind_vla():
 
 def interrupt(reason=''):
     agent = DecisionLoop.__new__(DecisionLoop)
-    with mock.patch('event.llm._stop_countdown') as stop:
+    # event.__init__ exports an Event instance as `llm`; resolve the module
+    # explicitly so Python 3.10's mock resolver cannot patch the instance.
+    with mock.patch.object(importlib.import_module('event.llm'), '_stop_countdown') as stop:
         asyncio.run(DecisionLoop._interrupt_active_outputs(agent, reason=reason))
     return stop
 

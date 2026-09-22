@@ -166,6 +166,7 @@ def order_cards_by_dependency(cards, connections):
     return ordered, remaining
 
 
+_project_lifecycle_epoch = 0
 # 正在进行中的那次启动。**是任务句柄，不是布尔标志** —— 见 `_do_start_project`。
 _start_project_task = None
 
@@ -390,6 +391,21 @@ async def _do_start_project_impl():
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
     import asyncio as _asyncio
+    import semantic_routing
+
+    global _project_lifecycle_epoch
+    _project_lifecycle_epoch += 1
+    start_epoch = _project_lifecycle_epoch
+    core = dict(config.main.get('core', {}))
+    core['project_running'] = False
+    config.main['core'] = core
+    await semantic_routing.invalidate()
+
+    from api.solutions import reconcile_canvas_runtime
+    if not await reconcile_canvas_runtime():
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True, 'errors': ['方案运行时同步失败，请检查设备连接后重试']}})
+        return False
 
     LOADING_POLL_S = 3
     LOADING_TIMEOUT_S = 900
@@ -926,6 +942,9 @@ async def _do_start_project_impl():
     # answered info(), so a card with no inbound connection resolves to no
     # input_topic exactly as the old "sources first" phase gave it.
     for card in all_ordered:
+        if start_epoch != _project_lifecycle_epoch:
+            await _do_stop_project()
+            return False
         input_topic, input_topics, unresolved = _resolve_input_topics(card.get('id', ''))
         if unresolved:
             # Starting it anyway is what made this class of bug invisible: the
@@ -963,7 +982,13 @@ async def _do_start_project_impl():
         await _do_stop_project()
         return False
 
-    # 全部成功 → 标记 running
+    # Discard startup-era classifications before exposing the new run. A stop
+    # arriving while cards start must not be overwritten by this completion.
+    await semantic_routing.invalidate()
+    if start_epoch != _project_lifecycle_epoch:
+        await _do_stop_project()
+        return False
+    # 全部成功 → 标记 running (no await between epoch check and publication)
     core = config.main.get('core', {})
     core['project_running'] = True
     config.main['core'] = core
@@ -1030,12 +1055,15 @@ async def _do_stop_project():
     """停止所有 canvas cards。"""
     from api.motus_stream import push_event
 
-    layout = config.main.get('canvas_layout', {})
-    await _stop_cards(layout.get('cards', []))
-
-    core = config.main.get('core', {})
+    global _project_lifecycle_epoch
+    _project_lifecycle_epoch += 1
+    core = dict(config.main.get('core', {}))
     core['project_running'] = False
     config.main['core'] = core
+    import semantic_routing
+    await semantic_routing.invalidate()
+    layout = config.main.get('canvas_layout', {})
+    await _stop_cards(layout.get('cards', []))
     await push_event({'type': 'project_state', 'payload': {'running': False}})
     print('[stop-project] done')
 
@@ -1609,5 +1637,3 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
-
-

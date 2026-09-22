@@ -181,8 +181,8 @@ def current_editor() -> Optional[str]:
 
 
 def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
-                      instance_id: str = '') -> None:
-    """Push a saved config down to the MCP plugin (fire-and-forget).
+                      instance_id: str = '', *, wait: bool = False):
+    """Push saved config; wait=True returns an awaitable that exposes failures.
 
     Shared by the tool-config endpoints below and by api/solutions.py when a
     solution is applied, so both paths send the exact same `action: config`
@@ -208,18 +208,28 @@ def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
             try:
                 req = MCPCallRequest(tool=tool_name,
                                      arguments={'action': 'config', **cfg_body, **extra_args})
-                await mcp_call_tool(mcp_id, req)
+                result = await mcp_call_tool(mcp_id, req)
+                from api.config import tool_state_of
+                if wait and isinstance(result, dict) and (
+                        result.get('code', 200) != 200 or result.get('isError')
+                        or tool_state_of(result)[0] == 'error'):
+                    raise RuntimeError('配置下发未成功')
             except Exception:
-                pass
+                if wait:
+                    raise
+
+    if wait:
+        return _apply()
 
     try:
-        asyncio.create_task(_apply())
+        loop = asyncio.get_running_loop()
     except RuntimeError:
         # No running loop (called from a sync context outside a request). The
         # config row is already persisted, and mcp_manage._restore_saved_configs
         # re-sends it when the device next comes online — so skipping the live
         # push here degrades timing, not correctness.
-        pass
+        return
+    loop.create_task(_apply())
 
 
 def tool_config_key(mcp_id: str, tool_name: str, instance_id: str = '') -> str:
@@ -382,21 +392,20 @@ def all_tool_configs() -> dict:
     return result
 
 
-def delete_all_tool_configs() -> int:
+async def delete_all_tool_configs() -> int:
     """Drop every saved tool config. Returns the number of rows removed.
 
     Only used when a solution replaces the whole canvas: the incoming cards
     bring their own configs, and leftovers would keep pushing stale settings
     (old topics, old device paths) to plugins that the new canvas reuses.
     """
+    import semantic_routing
+    # Replacing a solution with an older one must not leave invisible Jev state
+    # enabled. New solution configs can explicitly enable it after validation.
     try:
-        conn = config._get_conn()
-        cur = conn.execute("DELETE FROM config WHERE key LIKE ?",
-                           (f'{_TOOL_CONFIG_PREFIX}%',))
-        conn.commit()
-        return cur.rowcount or 0
-    except Exception:
-        return 0
+        return await semantic_routing.reset_settings(delete_prefix=_TOOL_CONFIG_PREFIX)
+    except Exception as exc:
+        raise fastapi.HTTPException(503, '配置数据库写入失败，旧配置保留') from exc
 
 
 @router.get('/tool-configs')
@@ -409,14 +418,54 @@ async def get_all_tool_configs():
 @router.put('/tool-config/{mcp_id}/{tool_name}')
 async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
-    config.main[tool_config_key(mcp_id, tool_name)] = body
-    apply_tool_config(mcp_id, tool_name, body)
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        import semantic_routing
+        if not isinstance(body, dict):
+            raise fastapi.HTTPException(400, '配置必须为对象')
+        try:
+            # Validate BEFORE persistence; the old fire-and-forget path hides
+            # plugin errors and would falsely report an invalid switch as saved.
+            cfg = await semantic_routing.configure(body, tool_key=tool_config_key(mcp_id, tool_name))
+            body = {**body, **cfg}
+        except ValueError as exc:
+            raise fastapi.HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            raise fastapi.HTTPException(503, '配置数据库写入失败，旧配置保留') from exc
+    else:
+        config.main[tool_config_key(mcp_id, tool_name)] = body
+    apply_body = body
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        # Jev was already committed above. Replaying it through the deferred
+        # MCP push could overwrite a newer save/delete with this stale body.
+        apply_body = {k: v for k, v in body.items() if k not in semantic_routing.CONFIG_KEYS}
+        try:
+            await apply_tool_config(mcp_id, tool_name, apply_body, wait=True)
+        except Exception:
+            # The transaction above has committed; never imply a rollback.
+            # Do not expose plugin exceptions, which may contain credentials.
+            return {'code': 200, 'persisted': True, 'runtime_applied': False,
+                    'warning': '配置已保存，但运行时应用失败；请重新保存重试，确认成功后再开始智能控制。'}
+        return {'code': 200, 'persisted': True, 'runtime_applied': True}
+    apply_tool_config(mcp_id, tool_name, apply_body)
     return {'code': 200}
+
+
+@router.get('/semantic-routing')
+def semantic_routing_status():
+    import semantic_routing
+    return {'code': 200, 'data': semantic_routing.status()}
 
 
 @router.delete('/tool-config/{mcp_id}/{tool_name}')
 async def delete_tool_config(mcp_id: str, tool_name: str):
     """Delete config for a tool."""
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        import semantic_routing
+        try:
+            await semantic_routing.reset_settings(delete_keys=(tool_config_key(mcp_id, tool_name),))
+        except Exception as exc:
+            raise fastapi.HTTPException(503, '配置数据库写入失败，旧配置保留') from exc
+        return {'code': 200}
     try:
         conn = config._get_conn()
         conn.execute("DELETE FROM config WHERE key = ?",
@@ -439,6 +488,12 @@ async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
 @router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
     """Save config for a specific tool instance and apply it."""
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        import semantic_routing
+        if not isinstance(body, dict):
+            raise fastapi.HTTPException(400, '配置必须为对象')
+        if any(k in body for k in semantic_routing.CONFIG_KEYS):
+            raise fastapi.HTTPException(400, 'Jev 配置仅支持共享配置接口，不支持实例配置')
     config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
     apply_tool_config(mcp_id, tool_name, body, instance_id)
     return {'code': 200}
@@ -447,6 +502,13 @@ async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, bo
 @router.delete('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def delete_instance_config(mcp_id: str, tool_name: str, instance_id: str):
     """Delete config for a specific tool instance."""
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        try:
+            await asyncio.to_thread(config.main.update_atomic, {},
+                                    delete_keys=(tool_config_key(mcp_id, tool_name, instance_id),))
+        except Exception as exc:
+            raise fastapi.HTTPException(503, '配置数据库写入失败，旧配置保留') from exc
+        return {'code': 200}
     try:
         conn = config._get_conn()
         conn.execute("DELETE FROM config WHERE key = ?",
