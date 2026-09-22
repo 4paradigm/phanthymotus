@@ -15,6 +15,7 @@ from aiohttp import web
 from cryptography import x509
 
 from .enrollment import Enrollment
+from .onboarding import APK_DIRECTORY, APK_FILENAME, MIME_TYPE, package_metadata
 
 from .capture import (
     MAX_CAPTURE_CA_PEM_BYTES,
@@ -83,7 +84,7 @@ def capture_certificate_base64(config: dict) -> str:
 def build_capture_ssl_context(config: dict) -> ssl.SSLContext:
     """Validate SAN and load the independent Capture certificate/key pair."""
 
-    port = int(config.get("port", 15731))
+    port = int(config.get("port", 15741))
     public_wss_url = validated_capture_wss_url(
         config.get("public_wss_url"),
         expected_port=port,
@@ -258,11 +259,15 @@ async def capture_websocket_handler(request: web.Request) -> web.StreamResponse:
     try:
         first = capture_json(await _ws_text(websocket, timeout=5.0))
         connection, acknowledgement = await manager.connect(first)
-        if first.get('app_version','').endswith('-operator1-ikview2') and getattr(manager,'operator_commands',None) is not None:
+        version = first.get('app_version', '')
+        # This release changed its version label, not its existing wire features.
+        # Keep opt-in exact for unsuffixed releases: older clients reject extra messages.
+        onboarding_client = version == '0.3.18-onboarding1'
+        if (onboarding_client or version.endswith('-operator1-ikview2')) and getattr(manager,'operator_commands',None) is not None:
             acknowledgement['operator_control']={'version':1,'connection_id':connection.connection_id}
         await websocket.send_json(acknowledgement)
         provider = getattr(manager, 'visualization_provider', None)
-        if first.get('app_version', '').endswith('-ikview2') and provider is not None:
+        if (onboarding_client or version.endswith('-ikview2')) and provider is not None:
             visual_task = asyncio.create_task(visualization_stream(websocket, provider))
         receive_task = asyncio.create_task(_ws_text(websocket))
         event_task = asyncio.create_task(connection.events.get())
@@ -358,18 +363,35 @@ async def enrollment_handler(request):
             raise CaptureError('pairing_request_invalid')
         data = capture_json(await request.text())
         enrollment = request.app[ENROLLMENT_KEY]
-        result = await (enrollment.request(data) if request.match_info['operation'] == 'request' else enrollment.poll(data))
+        operation = request.match_info['operation']
+        method = {'request': enrollment.request, 'poll': enrollment.poll, 'invite': enrollment.redeem_invitation}[operation]
+        result = await method(data)
         return web.json_response(result, headers={'Cache-Control': 'no-store'})
     except CaptureError as exc:
         return web.json_response({'error': exc.code}, status=exc.status)
 
 
+async def package_handler(request):
+    if request.query_string:
+        raise web.HTTPBadRequest()
+    metadata = await asyncio.to_thread(package_metadata)
+    if request.path == '/onboarding/package':
+        return web.json_response(metadata, headers={'Cache-Control': 'no-store'})
+    if not metadata['available']:
+        return web.json_response(metadata, status=503, headers={'Cache-Control': 'no-store'})
+    return web.FileResponse(APK_DIRECTORY / APK_FILENAME, headers={
+        'Content-Type': MIME_TYPE, 'Content-Disposition': 'attachment; filename="pico.apk"',
+        'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+
+
 def create_capture_app(manager: CaptureManager, enrollment=None) -> web.Application:
     app = web.Application(client_max_size=MAX_CAPTURE_MESSAGE_BYTES)
     app[CAPTURE_KEY] = manager
+    app.router.add_get('/onboarding/package', package_handler)
+    app.router.add_get('/onboarding/apk', package_handler)
     if enrollment is not None:
         app[ENROLLMENT_KEY] = enrollment
-        app.router.add_post('/pairing/{operation:request|poll}', enrollment_handler)
+        app.router.add_post('/pairing/{operation:request|poll|invite}', enrollment_handler)
     app.router.add_get("/ws/teleop-capture", capture_websocket_handler)
     return app
 
@@ -381,10 +403,17 @@ class CaptureWssServer:
         self._manager = manager
         self._config = dict(config)
         self._ssl_context = build_capture_ssl_context(self._config)
-        self.enrollment = Enrollment(manager, capture_certificate_base64(config))
+        self.enrollment = Enrollment(manager, capture_certificate_base64(config), public_wss_url=config.get("public_wss_url"))
         self._discovery = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+
+    def installation_info(self):
+        parsed = urlsplit(self._config['public_wss_url'])
+        return {'capture_origin': 'https://'+parsed.netloc,
+            'certificate_sha256': self.enrollment.device_id,
+            'package_path': '/onboarding/package', 'apk_path': '/onboarding/apk',
+            'package': package_metadata()}
 
     async def start(self) -> None:
         if self._runner is not None:
@@ -395,7 +424,7 @@ class CaptureWssServer:
             site = web.TCPSite(
                 runner,
                 str(self._config.get("bind_host", "0.0.0.0")),
-                int(self._config.get("port", 15731)),
+                int(self._config.get("port", 15741)),
                 ssl_context=self._ssl_context,
             )
             await site.start()
@@ -410,7 +439,7 @@ class CaptureWssServer:
                 service_type = '_motus-teleop._tcp.local.'
                 self._advert = ServiceInfo(service_type,
                     self.enrollment.device_id[:24]+'.'+service_type,
-                    addresses=addresses, port=int(self._config.get('port',15731)),
+                    addresses=addresses, port=int(self._config.get('port',15741)),
                     properties={'id':self.enrollment.device_id,
                         'name':str(self._config.get('display_name','Tianyi Teleop'))[:64], 'version':'1'})
                 self._discovery = AsyncZeroconf()
@@ -428,6 +457,7 @@ class CaptureWssServer:
         runner = self._runner
         self._runner = None
         self._site = None
+        self.enrollment.revoke_invitation()
         self.enrollment.pending = None
         self.enrollment.deadline = 0
         if self._discovery:

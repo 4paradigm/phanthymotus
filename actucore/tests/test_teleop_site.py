@@ -98,6 +98,24 @@ def test_complete_site_registers_without_starting_or_requiring_core_client_url(t
     assert sorted(p.name for p in tmp_path.iterdir()) == before
 
 
+def test_remote_motion_control_registers_onboarding_without_robot_model(tmp_path,monkeypatch):
+    cfg=site_configuration(tmp_path,monkeypatch)
+    cfg.update(control_backend='motion_control',robot_profile='tianyi2')
+    Path(cfg.pop('calibration_path')).unlink()
+    (tmp_path/'synthetic.urdf').unlink()
+    original=site.importlib.import_module
+    def no_model_stack(name):
+        assert not name.startswith(('pinocchio','casadi'))
+        return original(name)
+    monkeypatch.setattr(site.importlib,'import_module',no_model_stack)
+    assert site.required_site_config(cfg)==[]
+    bundle=make_bundle(cfg)
+    tools=bundle.get_all_tools()
+    teleop=next(t for t in tools if t['name']=='teleop')
+    assert 'installation_info' in teleop['inputSchema']['properties']['action']['enum']
+    assert bundle._plugins[1].runtime is None
+
+
 def test_default_disabled_teleop_does_not_check_site_or_import_optional_stack(monkeypatch):
     def unexpected(*_):
         raise AssertionError('disabled card checked site')

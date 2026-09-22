@@ -1297,6 +1297,26 @@ function _mountTeleopConnectionPanel(el, mcpId, toolName) {
   mountTeleopPanel(host, {
     actions: tool?.inputSchema?.properties?.action?.enum || ['info'],
     configSchema: tool?.configSchema || {},
+    loadTargets: tool?.topic_out?.some(p=>p.format==='control/eef') ? async()=>{
+      const r=await fetch('/api/canvas/teleop-targets');const body=await r.json();if(!r.ok)throw Error(body.detail||'读取机器人失败');return body.data||[];
+    } : undefined,
+    async buildTemplate(driverMcpId) {
+      if(_projectRunning)throw Error('请先关闭智能控制并等待收臂完成');
+      if(!(await _ensureEdit()) || await _saveLayout()===false)throw Error('请先保存当前画布');
+      const r=await fetch('/api/canvas/teleop-template',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({teleop_card_id:el.dataset.cardId,driver_mcp_id:driverMcpId})});
+      const body=await r.json();if(!r.ok)throw Error(body.detail||'无法建立三段模板');
+      const save=await fetch('/api/canvas/layout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body.data,session_id:_sessionId})});
+      if(!save.ok){const failure=await save.json();throw Error(failure.detail||'画布未保存');}
+      await _reloadLayout();
+    },
+    async prepareInstallation(){
+      const r=await fetch(`/api/teleop-install/${encodeURIComponent(mcpId)}`,{method:'POST',signal:AbortSignal.timeout(20000)});
+      const body=await r.json();if(!r.ok)throw Error(body.detail||'安装包尚未就绪');return body.data;
+    },
+    async createInvitation(ticket){
+      const r=await fetch(`/api/teleop-install/${encodeURIComponent(mcpId)}/invitation/${encodeURIComponent(ticket)}`,{method:'POST',signal:AbortSignal.timeout(15000)});
+      const body=await r.json();if(!r.ok)throw Error(body.detail||'邀请未生成');return body.data;
+    },
     async loadConfig() {
       const r=await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {signal:AbortSignal.timeout(4000)});
       const body=await r.json();if(!r.ok || body.code!==200)throw new Error(body.message||'读取配置失败');
@@ -1753,7 +1773,7 @@ function _dropConnector(id) {
 
 function _removeTopicConnection(connId) {
   const conn = _connections.find(c => c.id === connId);
-  if (!conn) return;
+  if (!conn || conn.role === 'feedback') return;
   _connections = _connections.filter(c => c.id !== connId);
   _resolveAllTopics();
   _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
@@ -1800,6 +1820,9 @@ function _redrawConnections() {
     line.setAttribute('d', d);
     const fmtCls = _fmtColorClass(conn.format);
     line.setAttribute('class', `connector-line ${fmtCls}`);
+    line.style.strokeDasharray = conn.role === 'feedback' ? '5 5' : '';
+    btn.hidden = conn.role === 'feedback';
+    line.setAttribute('aria-label', conn.role === 'feedback' ? '自动反馈：求解结果与执行状态' : conn.format);
     line.setAttribute('marker-end', `url(#${_ARROW_BY_FMT[fmtCls] || 'conn-arrow'})`);
     btn.style.left = (x1 + x2) / 2 + 'px';
     btn.style.top  = (y1 + y2) / 2 + 'px';
@@ -1895,8 +1918,17 @@ function _resolveAllTopics() {
     inDegree[card.id] = 0;
   }
   for (const conn of _connections) {
+    if (conn.role === 'feedback') continue;
     if (outgoing[conn.fromCardId]) outgoing[conn.fromCardId].push(conn);
     inDegree[conn.toCardId] = (inDegree[conn.toCardId] || 0) + 1;
+  }
+
+  // Feedback is subscribed from the registered controller descriptor, not a
+  // startup dependency. Show its topic without feeding it through the DAG.
+  for (const conn of _connections.filter(c => c.role === 'feedback')) {
+    const card = _cards.find(c => c.id === conn.toCardId);
+    const port = card?.el.querySelector(`.canvas-port.in[data-idx="${conn.toPortIdx}"]`);
+    if (port) port.dataset.topic = conn.fromTopic || '';
   }
 
   // 3. BFS from sources (inDegree === 0)
@@ -2406,7 +2438,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
  */
 function _inputTopicsFor(card) {
   const topics = [];
-  for (const conn of _connections.filter(c => c.toCardId === card.id)) {
+  for (const conn of _connections.filter(c => c.toCardId === card.id && c.role !== 'feedback')) {
     const src = _cards.find(c => c.id === conn.fromCardId);
     const outPort = src?.el?.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
     const topic = outPort?.dataset.topic || '';
@@ -2782,6 +2814,19 @@ async function _saveLayout() {
       _showToast(body.detail || body.message || '画布未保存');
       await _reloadLayout();
       return false;
+    }
+    const saved = await resp.json();
+    if (saved.data?.connections) {
+      _connections = saved.data.connections;
+      for (const value of saved.data.cards || []) {
+        const card = _cards.find(c => c.id === value.id);
+        if (card && value.toolName === 'teleop') {
+          card.topicOut = value.topicOut || card.topicOut;
+          card.topicIn = value.topicIn || card.topicIn;
+        }
+      }
+      _resolveAllTopics();
+      _scheduleRedraw();
     }
     return true;
   } catch (error) { _showToast(`画布未保存：${error.message}`); return false; }

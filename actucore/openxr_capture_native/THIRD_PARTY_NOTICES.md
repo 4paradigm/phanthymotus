@@ -23,3 +23,7 @@ These are Git object IDs, not SHA256 archive checksums. The build uses Git rathe
 than unverified source archives; Gradle and the OpenXR AAR separately verify
 their downloaded archives with SHA256. No native dependency versions or source
 fetch mechanism were changed during this review.
+
+The APK now includes complete dependency license texts and immutable source links
+in `assets/licenses/`, including libjuice, usrsctp, plog and Android NDK notices.
+These files are copied from the pinned build inputs without altering their text.

@@ -1,5 +1,5 @@
 /**
- * control.js — motus.control/1 command streams.
+ * control.js — motus.control/1 and session-bound motus.control/2 streams.
  *
  * Without this, `control/joint` and `control/velocity` fall through to the KV
  * panel, which shows a `values` array as one long line of numbers. On a stream
@@ -90,6 +90,11 @@ export const ControlRenderer = {
     }
     if (msg.type === 'ping' || msg.type === 'meta') return;
     if (!Array.isArray(msg.values)) return;
+    if (msg.schema === 'motus.control/2') {
+      const identity = `${msg.boot_id}:${msg.session_id}:${msg.mapping_epoch}`;
+      if (identity !== this._session) { this._lastSeq = null; this._gap = null; }
+      this._session = identity;
+    }
 
     this._absorbDescriptor(msg);
     this._ensureRows(msg.values.length);
@@ -165,7 +170,8 @@ export const ControlRenderer = {
     msg.values.forEach((v, i) => {
       const bar = this._bars[i];
       if (!bar) return;
-      bar.name.textContent = (this._names && this._names[i]) || `joint${i + 1}`;
+      bar.name.textContent = (this._names && this._names[i]) || (msg.mode === 'eef_pose'
+        ? `末端${Math.floor(i / 7) + 1}.${['x','y','z','qx','qy','qz','qw'][i % 7]}` : `joint${i + 1}`);
       bar.value.textContent = Number(v).toFixed(3);
 
       const lo = lower[i];
@@ -194,6 +200,19 @@ export const ControlRenderer = {
       this._lastSeq = msg.seq;
     }
 
+    if (msg.schema === 'motus.control/2') {
+      // Browser and robot monotonic clocks have unrelated origins. Never
+      // subtract generated_ns from Date.now() or present a guessed packet age.
+      this._setHead([
+        ['会话', String(msg.session_id || '?')], ['mode', msg.mode || '?'],
+        ['时效', '机器人单调时钟；见 Driver 反馈'], ['坐标系', msg.frame || '?'],
+        ['seq / 输入', `${msg.seq ?? '?'} / ${msg.source_seq ?? '?'}`],
+        ['映射代次', String(msg.mapping_epoch ?? '?')],
+        ...(this._gap ? [['跳过序号', String(this._gap)]] : []),
+        ['范围', this._limits && this._limits.declared ? '来自 descriptor' : '按已见极值推断'],
+      ]);
+      return;
+    }
     this._setHead([
       ['source', `${msg.source || '?'}${Number.isFinite(msg.priority) ? ` (p${msg.priority})` : ''}`],
       ['mode', msg.mode || '?'],

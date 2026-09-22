@@ -100,15 +100,16 @@ def verify_apk(
     expected: dict[str, object],
     build_tools: Path,
     readelf: Path,
+    build_type: str = "debug",
 ) -> dict[str, object]:
-    apk = PROJECT / "app" / "build" / "outputs" / "apk" / flavor / "debug" / f"app-{flavor}-debug.apk"
+    apk = PROJECT / "app" / "build" / "outputs" / "apk" / flavor / build_type / f"app-{flavor}-{build_type}.apk"
     require(apk.is_file(), f"missing {flavor} APK: {apk}")
 
     badging = run(str(build_tools / "aapt2"), "dump", "badging", str(apk))
     for fragment in (
         f"package: name='{expected['package']}'",
-        "versionCode='20'",
-        "versionName='0.3.16-operator1-ikview2'",
+        "versionCode='22'",
+        "versionName='0.3.18-onboarding1'",
         "minSdkVersion:'29'",
         "targetSdkVersion:'35'",
         f"application-label:'{expected['label']}'",
@@ -116,6 +117,7 @@ def verify_apk(
     ):
         require(fragment in badging, f"{flavor} badging is missing {fragment!r}")
 
+    require(('application-debuggable' in badging) == (build_type == 'debug'), 'APK build type mismatch')
     permissions = run(str(build_tools / "aapt2"), "dump", "permissions", str(apk))
     actual_permissions = set(re.findall(r"uses-permission: name='([^']+)'", permissions))
     require(
@@ -131,6 +133,7 @@ def verify_apk(
         "AndroidManifest.xml",
         str(apk),
     )
+    require('="motus-teleop"' in manifest and '="android.intent.category.BROWSABLE"' in manifest, 'APK lacks invitation deep link')
     require('="com.phanthymotus.capture.ConnectionActivity"' in manifest, f"{flavor} lacks normal connection launcher")
     require('="android.app.lib_name"' in manifest, f"{flavor} lacks NativeActivity library metadata")
     require('="org.khronos.openxr.intent.category.IMMERSIVE_HMD"' in manifest, f"{flavor} lacks OpenXR launch category")
@@ -178,6 +181,12 @@ def verify_apk(
                 archive.extract(name, extracted)
                 verify_elf(readelf, extracted / name, packaged_names)
 
+    with zipfile.ZipFile(apk) as archive:
+        for license_name in ('SOURCE-NOTICES.txt', 'PhanthyMotus-LICENSE', 'OpenXR-LICENSE',
+                             'MbedTLS-LICENSE', 'libdatachannel-LICENSE', 'nlohmann-json-LICENSE',
+                             'plog-LICENSE', 'usrsctp-LICENSE', 'libjuice-LICENSE',
+                             'Android-NDK-NOTICE', 'Android-NDK-NOTICE.toolchain'):
+            require(len(archive.read('assets/licenses/'+license_name)) > 100, 'missing bundled license: '+license_name)
     digest = hashlib.sha256(apk.read_bytes()).hexdigest()
     return {
         "bytes": apk.stat().st_size,
@@ -191,10 +200,12 @@ def verify_apk(
 def main() -> None:
     parser=argparse.ArgumentParser()
     parser.add_argument('--platform',choices=['pico','meta','all'],default='all')
-    platform=parser.parse_args().platform
+    parser.add_argument('--build-type', choices=['debug','release'], default='debug')
+    args=parser.parse_args()
+    platform=args.platform
     build_tools, readelf = android_tools()
     results = {
-        flavor: verify_apk(flavor, expected, build_tools, readelf)
+        flavor: verify_apk(flavor, expected, build_tools, readelf, args.build_type)
         for flavor, expected in FLAVORS.items() if platform=='all' or flavor==platform
     }
     if platform=='all':

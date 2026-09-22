@@ -28,6 +28,27 @@ from teleop.runtime import TeleopRuntime
 from test_teleop import frame
 
 
+def test_omitted_capture_port_matches_public_contract_for_tls_and_listener(tmp_path,monkeypatch):
+    from test_teleop_site import site_configuration
+    import teleop.capture_server as server_module
+    config=site_configuration(tmp_path,monkeypatch)['capture']
+    config.pop('port')
+    requested=[]
+    class Site:
+        def __init__(self,runner,host,port,ssl_context):
+            assert isinstance(ssl_context,ssl.SSLContext)
+            requested.append(port)
+        async def start(self):pass
+        async def stop(self):pass
+    monkeypatch.setattr(server_module.web,'TCPSite',Site)
+    async def run():
+        server=CaptureWssServer(CaptureManager(None,None,None),config)
+        await server.start()
+        await server.close()
+    asyncio.run(run())
+    assert requested==[15741]
+
+
 @pytest.mark.parametrize('robot_profile',['tianyi2','g1_23'])
 @pytest.mark.parametrize('visualization',[False,True,'error','stream'])
 def test_real_wss_pair_rtc_pose_disconnect_and_credential_reconnect(tmp_path,robot_profile,visualization,monkeypatch):
@@ -74,6 +95,9 @@ def test_real_wss_pair_rtc_pose_disconnect_and_credential_reconnect(tmp_path,rob
             if visualization=='error':raise RuntimeError('display_only_failure')
             return {'schema':'motus.g1-visualization.v1','available':False,'reason':'calibration_missing'}
         manager.visualization_provider=visual
+        # The real released client must retain both display and operator controls.
+        # No commands are sent in this transport test; the sentinel enables negotiation.
+        manager.operator_commands=object()
         # Exercise the version actually sent by Android, not a synthetic opt-in.
         # V039 updated Gradle but left the native hello at a non-visual version.
         native_root=Path(__file__).parents[1]/'openxr_capture_native'
@@ -113,6 +137,8 @@ def test_real_wss_pair_rtc_pose_disconnect_and_credential_reconnect(tmp_path,rob
                     await ws.send_json(dict(type='pair',pairing_id=pairing['pairing_id'],pairing_code=pairing['pairing_code'],
                         capture_protocol=CAPTURE_PROTOCOL,frame_protocol=RTC_FRAME_PROTOCOL,client_kind='native_openxr',app_version=app_version))
                     paired=await control_message(ws, timeout=3);assert paired['type']=='paired',paired
+                    assert ('operator_control' in paired) == (visualization=='stream')
+                    if visualization=='stream': assert paired['operator_control']['version']==1
                     await ws.send_json(dict(type='presence',state='xr_standby',assignment_id=None))
                     assignment=None
                     for _ in range(3):

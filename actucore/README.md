@@ -96,7 +96,7 @@ MCP 与 SSE 共用 15730。启用 `teleop` 时，插件另在 15741 提供 PICO 
 
 ## 构建与运行
 
-普通部署使用 `Dockerfile.jetson`；VLA 的本机模型能力取决于基础镜像。遥操的 IK 与通信可在 CPU 上运行，仓库也提供 `Dockerfile.cpu` 用于隔离验证。CPU 验证镜像不提供完整本机 SmolVLA 环境，不能作为保留既有 GPU/VLA 能力的直接替代。
+普通部署使用 `Dockerfile.jetson`；VLA 的本机模型能力取决于基础镜像。天轶新链路的 IK 位于 Driver，ActuCore 负责 PICO 通信与相对末端映射；两侧均可使用 CPU。仓库也提供 `Dockerfile.cpu` 用于隔离验证。CPU 验证镜像不提供完整本机 SmolVLA 环境，不能作为保留既有 GPU/VLA 能力的直接替代。
 
 ```bash
 ./deploy/build_actucore.sh                    # JetPack 5.11（默认，与 build_perception.sh 一致）
@@ -107,6 +107,8 @@ MCP 与 SSE 共用 15730。启用 `teleop` 时，插件另在 15741 提供 PICO 
 标准 JP6.1 ActuCore 镜像直接包含 Pinocchio、SciPy、RTC 等遥操依赖，无需额外构建选项。Dockerfile 按既有 `JP_VERSION=61` 参数选择依赖；旧入口传入的 `WITH_TELEOP=0` 不会禁用 JP6.1 遥操。JP5.11 保持原 Python 环境，不安装遥操依赖；裸 Dockerfile 构建仍默认 JP5.11。依赖只安装到 ActuCore 应用镜像，不修改共享基础镜像。运行时 `plugins.teleop.enabled` 仍默认关闭。
 
 CPU 专用验证镜像也直接安装遥操依赖，可用 `docker build -f actucore/Dockerfile.cpu -t local/actucore:teleop-cpu .` 或 `deploy/build_tianyi_actucore.sh LOCAL_IMAGE_TAG` 构建；无需修改现有脚本。CPU 镜像不作为普通 GPU/VLA 部署的替代。
+
+普通 Jetson 与 CPU 镜像构建都按固定清单获取签名 PICO release APK，无需新增构建开关。构建制品以确定性 gzip 发布，下载器先验证压缩包 SHA256，再解压并验证原 APK 的 SHA256 和大小；容器只向 Core 提供原 APK。Canvas 通过当前已注册的 teleop 服务代理下载，不让头显访问制品仓库。旧 debug APK 与 release 的签名不兼容，需操作者明确迁移；不会静默卸载或删除配对。安装过程和浏览器 deep link 仍需在实体 PICO 验收。
 
 JP6.1 与 CPU 验证构建通过 `deploy/fetch_g1_collision.py` 从项目 COS 获取固定上游提交的 G1 碰撞网格并逐文件核对 SHA256；JP5.11 不下载这些模型。控制循环不联网下载，缺失或损坏资产时拒绝 G1 初始化。G1 求解器依赖仍需另外满足，包含网格不表示已支持完整 G1 IK。
 
@@ -123,7 +125,7 @@ jp6.1 的 base 由 `deploy/prepare_actucore_base.sh` 构建（只支持 6.1）�
 
 遥操构建有机型差异：
 
-- 天轶使用 Pinocchio + SciPy，普通 JP6.1 构建使用 `requirements.bundle.lock`，保留 VLA 兼容的 AV／NumPy 版本。
+- 天轶新链路由 Driver 使用 Pinocchio + SciPy 完成 IK。ActuCore 保留旧遥操路径的数值依赖；普通 JP6.1 构建使用 `requirements.bundle.lock`，保留 VLA 兼容的 AV／NumPy 版本。
 - G1 使用 Pinocchio 的 CasADi 符号绑定。`g1_ik.py` 同时需要 `casadi` 和 `pinocchio.casadi`；只有 `import pinocchio` 成功不足以证明 G1 可求解。历史 ARM64 数值环境锁在 `plugins/teleop/requirements.numeric-linux-aarch64.lock`，包含 Pinocchio 3.1.0、CasADi 3.6.7、NumPy 1.26.4；当前天轶 bundle 锁是 Pin 3.7.0／NumPy 2.2.6，未安装 CasADi。两套锁不能直接叠装并声称与 VLA 兼容。
 - 当前 `Dockerfile.cpu` 也没有消费 G1 数值锁。因此北京 G1 的完整 IK 展示需要单独核验并构建可用的符号绑定环境；切换 `robot_profile` 不是依赖安装。该工作仍应保留一套 ActuCore，不能另起第二服务来掩盖依赖冲突。
 
@@ -216,12 +218,18 @@ TOOLS = [
 
 遥操是 `plugins.teleop` 卡片，与 VLA 共用 `ActuCoreBundle`、ROS executor 和 MCP 15730。不要另建 `actucore-teleop` 服务或第二个注册心跳。PICO 的 WSS/RTC 由该插件内部提供，15741 不属于第二套 ActuCore。
 
+天轶推荐连接三张卡：`teleop → motion_control → arm`。teleop 负责配对、输入映射与使能；Driver 的 motion_control 负责模型、标定、IK、碰撞、速度与正常结束收臂；arm 通过共享执行权和安全门完成厂商位置下发。Canvas 自动展示反馈虚线，反馈不进入执行 DAG。仓库新配置选择 `control_backend: motion_control`，遥操仍默认关闭；旧配置与 G1 的 legacy 路径继续保留，不自动改绑。新链路首轮仅接双臂，不把旧手部能力扩展为新接口验收。
+
+日常操作在 Canvas 完成：建立三段连线，保存各卡配置，从 teleop 生成安装链接及 15 分钟一次性邀请；PICO 浏览器下载安装后点击 deep link 导入，确认并一键配对。已配对设备冷启动自动连接，仍需重新使能才能运动。Driver 的 `calibration_path` 是标定文件导入路径，`joint_velocity_rad_s` 默认 1.0、最大 1.5 且受 URDF 限制；卡片配置在空闲时经完整验证原子应用，不编辑 JSON 文件，变更后需重新标定。
+
 JetPack 6.1 构建使用 `deploy/build_actucore.sh --jp-version 6.1`（此脚本在配置远端凭据时会推送，现场仅构建应直接调用 Dockerfile 并传入对应 `JP_VERSION=61` 和基础镜像）。在同一 config.yaml 启用 `plugins.teleop`，保留已有 VLA 配置。共享依赖锁 `requirements.bundle.lock` 保留 VLA 的 AV 15.1 / NumPy 2.2.6；CPU 隔离回归仍可使用 Dockerfile.cpu，不是另开生产服务的部署方式。
 
 从历史独立服务迁移时，保留证书、配对状态、标定与管理密钥挂载；将 Core 的 `TELEOP_MANAGEMENT_URL` 指向 `http://localhost:15730/mcp`，保留原 MCP id 及所有卡片配置。先停止旧独立容器，再启用合并服务，验证通过后移除旧容器，避免配对端口和注册竞争。配置、开始、结束等日常操作继续在 Canvas/PICO 完成，无需后端脚本。
 
 镜像必须包含 `/deploy/dds-local.xml`，并与宿主只读挂载的 DDS profile 完全一致。不能只检查 `tools/list`：部署验收还需调用 teleop `info`，验证 ROS 节点及 WSS 真正初始化。
 
-启用配置不绕过站点检查。启动时如果管理密钥、TLS、状态目录、标定或依赖缺失，Bundle 不注册遥操工具，但保留其他卡片。可从 `tools/list._meta.required_site_config` 或直接 `teleop info` 读取字段级诊断；不公开密钥和站点路径。补齐文件/挂载后重启 ActuCore 重新注册。配置要求与日常 Canvas 操作见 [遥操说明](plugins/teleop/README.md#部署与接口)。
+启用配置不绕过站点检查。启动时如果管理密钥、TLS、状态目录或依赖缺失，Bundle 不注册遥操工具，但保留其他卡片。legacy 路径还检查本地模型与标定；新 motion_control 路径由 Driver 检查模型及标定，缺失时禁止运动，不阻止 teleop 展示配对和安装入口。可从 `tools/list._meta.required_site_config` 或直接 `teleop info` 读取字段级诊断；不公开密钥和站点路径。补齐文件/挂载后重启 ActuCore 重新注册。配置要求与日常 Canvas 操作见 [遥操说明](plugins/teleop/README.md#部署与接口)。
 
 Canvas 仍负责配置存储；teleop 将已接受的参数原子保存到配对状态文件旁的 `*.config.json`，用于 Core 未察觉短暂重启时恢复配置。此文件权限为 0600，只保存配置 schema 字段，不保存控制权、动作或会话；启动仍为空闲。部署配置改变后旧缓存不覆盖新配置；缓存损坏时拒绝初始化，可在卡片重新保存配置修复。迁移时保留整个状态目录。
+
+本轮新链路尚未部署到机器人。代码与离线回归、签名 APK 构建、目标架构镜像构建、设备部署与真机验收分别记录；任一前置结果不能代替低速跟随、暂停、故障停止和恢复的真实反馈证据。架构与协议见 [遥操架构](../docs/design/teleop-architecture.md)。

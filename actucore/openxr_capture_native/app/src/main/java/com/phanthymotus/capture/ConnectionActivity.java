@@ -33,6 +33,7 @@ public final class ConnectionActivity extends Activity {
     private EditText address;
     private LinearLayout devices;
     private Button confirm;
+    private JSONObject invitation;
     private NsdManager nsd;
     private NsdManager.DiscoveryListener discovery;
     private WifiManager.MulticastLock multicast;
@@ -57,7 +58,7 @@ public final class ConnectionActivity extends Activity {
         devices = new LinearLayout(this); devices.setOrientation(LinearLayout.VERTICAL); layout.addView(devices);
         button(layout, "刷新局域网机器人", this::discover);
         address = new EditText(this); address.setSingleLine(true); address.setHint("备用地址，例如 robot.local:15741"); layout.addView(address);
-        button(layout, "申请配对", () -> begin(address.getText().toString().trim()));
+        button(layout, "连接当前机器人", () -> { if (invitation != null) redeemInvitation(); else begin(address.getText().toString().trim()); });
         confirm = button(layout, "指纹一致，在头显确认", () -> { confirmed = true; confirm.setEnabled(false); });
         confirm.setEnabled(false);
         button(layout, "连接已配对机器人", () -> launch(null));
@@ -66,10 +67,11 @@ public final class ConnectionActivity extends Activity {
             .setPositiveButton("忘记", (d,w) -> { cancelled = true; credentials().edit().clear().commit(); message("已忘记设备"); })
             .setNegativeButton("取消", null).show());
         discover();
-        // A remembered identity must not hide connection management or enter XR.
-        // In particular, a headset moved to another robot must remain usable offline.
-        if (!credentials().getString("capture_credential", "").isEmpty())
-            message("已有配对记录。请确认机器人后点击连接；更换机器人请先忘记设备。");
+        // Cold launch reconnects only to the persisted, certificate-pinned identity.
+        // Returning from XR does not auto-launch again; connection management stays reachable.
+        if (getIntent().getData() != null) importInvitation(getIntent());
+        else if (state == null && !credentials().getString("capture_credential", "").isEmpty())
+            launch(null);
         savePreviousAnr();
     }
 
@@ -167,7 +169,8 @@ public final class ConnectionActivity extends Activity {
         final String origin;
         X509Certificate certificate;
         final SSLSocketFactory sockets;
-        PairChannel(String endpoint) throws Exception {
+        PairChannel(String endpoint) throws Exception { this(endpoint, null); }
+        PairChannel(String endpoint, String expectedCertificate) throws Exception {
             URL parsed = new URL("https://"+endpoint);
             if (parsed.getHost().isEmpty() || parsed.getUserInfo()!=null || parsed.getQuery()!=null || parsed.getRef()!=null || !parsed.getPath().isEmpty() || parsed.getPort()<1)
                 throw new IOException("请输入主机名或 IP 和端口");
@@ -179,6 +182,13 @@ public final class ConnectionActivity extends Activity {
                 public void checkServerTrusted(X509Certificate[] chain,String type) throws java.security.cert.CertificateException {
                     if (chain.length==0) throw new java.security.cert.CertificateException();
                     chain[0].checkValidity();
+                    if (expectedCertificate != null) {
+                        try {
+                            if (!hex(digest(chain[0].getEncoded())).equalsIgnoreCase(expectedCertificate))
+                                throw new java.security.cert.CertificateException("机器人证书与邀请不一致");
+                        } catch (java.security.cert.CertificateException e) { throw e; }
+                        catch (Exception e) { throw new java.security.cert.CertificateException(e); }
+                    }
                     if (certificate == null) certificate = chain[0];
                     else if (!Arrays.equals(certificate.getEncoded(),chain[0].getEncoded())) throw new java.security.cert.CertificateException("配对过程中证书变化");
                 }
@@ -186,7 +196,7 @@ public final class ConnectionActivity extends Activity {
             sockets = tls.getSocketFactory();
         }
         JSONObject post(String operation, JSONObject body) throws Exception {
-            if (!operation.equals("request") && !operation.equals("poll")) throw new IOException();
+            if (!operation.equals("request") && !operation.equals("poll") && !operation.equals("invite")) throw new IOException();
             HttpsURLConnection c = (HttpsURLConnection)new URL(origin+"/pairing/"+operation).openConnection();
             c.setSSLSocketFactory(sockets);
             // Enrollment only: both displays bind the actual TLS leaf certificate before trusting it.
@@ -211,6 +221,65 @@ public final class ConnectionActivity extends Activity {
     }
 
     private volatile boolean pairing;
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        importInvitation(intent);
+    }
+
+    private String pairedIdentity() throws Exception {
+        String pem = credentials().getString("ca_certificate_pem", "");
+        if (pem.isEmpty()) return "";
+        X509Certificate cert = (X509Certificate)java.security.cert.CertificateFactory.getInstance("X.509")
+            .generateCertificate(new ByteArrayInputStream(pem.getBytes(StandardCharsets.UTF_8)));
+        return hex(digest(cert.getEncoded())).toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private void importInvitation(Intent intent) {
+        if (pairing) { message("配对申请进行中，请先取消后重新打开邀请"); return; }
+        invitation = null;
+        try {
+            invitation = ConnectionInvitation.parse(intent.getDataString());
+            address.setText(invitation.getString("endpoint"));
+            message("已导入机器人 " + invitation.getString("device_id").substring(0,12)
+                + " 的一次性邀请。点击连接当前机器人；连接不会使能运动。");
+        } catch (Exception e) { message("连接邀请无效，请从当前机器人 Canvas 重新打开"); }
+        // Never retain the bearer token in the Activity's reusable launch Intent.
+        intent.setData(null);
+    }
+
+    private void redeemInvitation() {
+        final JSONObject selected = invitation;
+        if (selected == null || pairing) return;
+        try {
+            if (!credentials().getString("capture_credential", "").isEmpty()) {
+                if (!pairedIdentity().equals(selected.getString("device_id"))) {
+                    message("当前配对属于另一台机器人。请先明确断开并忘记旧设备，再导入邀请。"); return;
+                }
+                invitation = null;
+                launch(null); return;
+            }
+        } catch (Exception e) { message("本地配对身份无效，请先忘记设备后重新配对"); return; }
+        cancelled=false; pairing=true;
+        worker.execute(() -> {
+            try {
+                PairChannel channel = new PairChannel(selected.getString("endpoint"), selected.getString("certificate_sha256"));
+                JSONObject request = new JSONObject().put("invitation_id", selected.getString("invitation_id"))
+                    .put("token", selected.getString("token")).put("device_id", selected.getString("device_id"))
+                    .put("device_name", android.os.Build.MODEL);
+                JSONObject result = channel.post("invite", request);
+                byte[] pem = Base64.decode(result.getString("ca_certificate_base64"), Base64.DEFAULT);
+                X509Certificate cert = (X509Certificate)java.security.cert.CertificateFactory.getInstance("X.509")
+                    .generateCertificate(new ByteArrayInputStream(pem));
+                if (!Arrays.equals(cert.getEncoded(), channel.certificate.getEncoded())
+                        || !result.getString("wss_url").equals("wss://"+selected.getString("endpoint")+"/ws/teleop-capture"))
+                    throw new IOException("邀请响应身份不一致");
+                runOnUiThread(() -> { invitation=null; if (!cancelled) launch(result); });
+            } catch (Exception e) { message("邀请连接失败，请在 Canvas 重新生成邀请："+e.getMessage()); }
+            finally { pairing=false; }
+        });
+    }
+
     private void begin(String endpoint) {
         if (pairing) { message("已有配对申请，请先完成或取消后重试"); return; }
         if (!credentials().getString("capture_credential", "").isEmpty()) { message("已有配对，请先忘记设备并在卡片内撤销旧配对"); return; }

@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-build_dir=$(mktemp -d /tmp/motus-openxr-capture-host.XXXXXX)
+build_dir=$(mktemp -d "${TMPDIR:-/tmp}/motus-openxr-capture-host.XXXXXX")
 trap 'rm -r "$build_dir"' EXIT HUP INT TERM
 
 manifest="$project_dir/app/src/main/AndroidManifest.xml"

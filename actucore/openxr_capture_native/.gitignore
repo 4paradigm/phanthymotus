@@ -4,3 +4,9 @@ app/.cxx/
 app/build/
 build/
 local.properties
+
+# Locally staged, signature-verified distribution output. Never commit signing keys.
+artifacts/*.apk
+artifacts/package.json
+*.keystore
+*.jks

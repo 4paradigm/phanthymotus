@@ -322,11 +322,32 @@ async def edit_status(session_id: str = ''):
 
 # ── Layout Endpoints ─────────────────────────────────────────────────────────
 
+@router.get('/teleop-targets')
+async def get_teleop_targets():
+    from motion_project import motion_targets
+    return {'code': 200, 'data': motion_targets((config.main.get('services', {}) or {}).get('mcp', []))}
+
+
+@router.post('/teleop-template')
+async def prepare_teleop_template(body: dict = fastapi.Body(...)):
+    from teleop_project import TeleopProjectError, require_editable
+    from motion_project import build_motion_template
+    try:
+        layout = config.main.get('canvas_layout', {}) or {}
+        require_editable(config.main.get('core', {}) or {}, layout)
+        result = build_motion_template(layout, (config.main.get('services', {}) or {}).get('mcp', []),
+                                       body.get('teleop_card_id'), body.get('driver_mcp_id'))
+    except TeleopProjectError as error:
+        raise fastapi.HTTPException(409, str(error)) from error
+    return {'code': 200, 'data': result}
+
 @router.get('/layout')
 async def get_layout():
     """Return the saved canvas layout + current editor info."""
     _check_editor_expired()
     data = config.main.get('canvas_layout', {'cards': []})
+    from motion_project import with_feedback_edges
+    data = with_feedback_edges(data, (config.main.get('services', {}) or {}).get('mcp', []))
     return {'code': 200, 'data': data, 'editor': _editor_session, 'rev': _layout_rev}
 
 
@@ -352,6 +373,8 @@ async def save_layout(layout: CanvasLayout):
         raise fastapi.HTTPException(status_code=409, detail=str(error)) from error
     save_data = layout.dict()
     save_data.pop('session_id', None)
+    from motion_project import with_feedback_edges
+    save_data = with_feedback_edges(save_data, (config.main.get('services', {}) or {}).get('mcp', []))
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
     # A card that leaves the layout is unreachable afterwards — stop-project only
     # walks the saved cards — so its plugin instance would keep running forever.
@@ -362,7 +385,7 @@ async def save_layout(layout: CanvasLayout):
         raise fastapi.HTTPException(status_code=409, detail=str(error)) from error
     config.main['canvas_layout'] = save_data
     notify_layout_changed(session_id or '')
-    return {'code': 200}
+    return {'code': 200, 'data': save_data}
 
 
 # ── Per-tool config CRUD ─────────────────────────────────────────────────────

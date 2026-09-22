@@ -18,7 +18,7 @@ from .protocol import TicketCodec, TicketVerifier
 from .rtc import RtcManager
 from .runtime import TeleopRuntime
 
-ACTIONS=['info','config','project_start','project_stop','start','stop','finish','pair_headset','revoke_headset','calibrate','pause','resume','self_test','open_pairing','approve_pairing','reject_pairing','disconnect_headset','record_start','record_stop','record_status']
+ACTIONS=['info','config','project_start','project_stop','start','stop','finish','pair_headset','revoke_headset','calibrate','pause','resume','self_test','open_pairing','approve_pairing','reject_pairing','disconnect_headset','record_start','record_stop','record_status','installation_info','create_invitation','revoke_invitation']
 
 
 class TeleopPlugin:
@@ -60,9 +60,17 @@ class TeleopPlugin:
         unsupported={'project_start','project_stop','finish','record_start','record_stop','record_status'} if self.cfg.get('robot_profile')=='g1_23' else set()
         return [action for action in ACTIONS if action not in unsupported]
 
+    def _remote_control(self):
+        # Existing saved projects retain their legacy path until explicitly
+        # wired to motion_control. New installation config selects it directly.
+        return self.cfg.get('robot_profile','tianyi2') != 'g1_23' and self.cfg.get('control_backend','legacy') == 'motion_control'
+
+    def _calibrated(self):
+        return bool(self.adapter and (getattr(self.adapter,'calibrated',False) or self.adapter.solver is not None))
+
     def get_tools(self):
         actions=self._actions()
-        return [{'name':'teleop','type':'processor','multiInstance':False,'x-connection-panel':'teleop-v1',
+        tools=[{'name':'teleop','type':'processor','multiInstance':False,'x-connection-panel':'teleop-v1',
             'description':'PICO 遥操：G1 双臂或天轶双臂与手开合。双握把使能；默认 Shadow；Driver 确认执行。',
             'inputSchema':{'type':'object','properties':{'action':{'type':'string','enum':actions},
                 'instance_id':{'type':'string'},'request_id':{'type':'string'},'fingerprint':{'type':'string'},
@@ -71,6 +79,8 @@ class TeleopPlugin:
                 'x-resource':(['arm_l','arm_r'] if self.cfg.get('robot_profile')=='g1_23' else ['arm_l','arm_r','hand_l','hand_r'])},
             'configSchema':{'type':'object','properties':{
                 'robot_profile':{'type':'string','enum':['tianyi2','g1_23'],'default':'tianyi2','scope':'shared'},
+                'control_backend':{'type':'string','enum':['legacy','motion_control'],'default':'legacy','scope':'shared'},
+                'controller_to_palm':{'type':'object','scope':'shared'},
                 'mode':{'type':'string','enum':['shadow','live'],'default':'shadow','scope':'shared'},
                 'shadow_feedback_source':{'type':'string','enum':['teleop_executor','driver_joints'],'default':'teleop_executor','scope':'shared'},
                 'mapping_version':{'type':'string','enum':['relative_v1','pr152_head_yaw_v1','pr152_clutch_relative_v1'],'default':'relative_v1','scope':'shared'},
@@ -80,6 +90,13 @@ class TeleopPlugin:
                 'calibration_path':{'type':'string','scope':'shared','x-sensitive':True}},'additionalProperties':False},
             'topic_out':[{'topic':f"/{self.cfg.get('namespace','robot')}/motion/teleop/command",'format':'control/teleop'},
                          {'topic':f"/{self.cfg.get('namespace','robot')}/teleop/status",'format':'data/json'}]}]
+        if self._remote_control():
+            tool=tools[0]
+            tool['description']='通用 PICO 遥操输入：连接 Driver 运动控制卡，双握把使能；Driver 解算与执行。'
+            tool['topic_out'][0]={'id':'targets','topic':f"/{self.cfg.get('namespace','robot')}/motion/control/command",'format':'control/eef'}
+            tool['topic_in']=[{'id':'feedback','format':'data/json','role':'feedback'}]
+            tool['inputSchema']['x-resource']=['arm_l','arm_r']
+        return tools
 
     def _run(self,coro,timeout=2):
         future=asyncio.run_coroutine_threadsafe(coro,self._loop)
@@ -104,11 +121,17 @@ class TeleopPlugin:
         if source=='driver_joints':
             from .g1_shadow_feedback import G1ShadowFeedbackLink
             self.link=G1ShadowFeedbackLink(self.cfg,self.executor)
+        elif self._remote_control():
+            from .motion_control import MotionControlLink
+            self.link=MotionControlLink(self.cfg,self.executor)
         else:self.link=DriverLink(self.cfg,self.executor)
         profile=self.cfg.get('robot_profile','tianyi2')
         if profile not in ('tianyi2','g1_23'):raise ValueError('unknown_robot_profile')
         from .tianyi import TianyiIntentAdapter
         adapter=TianyiIntentAdapter;capabilities=None
+        if self._remote_control():
+            from .motion_control import EefIntentAdapter,CAPABILITIES_EEF
+            adapter=EefIntentAdapter;capabilities=CAPABILITIES_EEF
         if profile=='g1_23':
             from .g1 import G1IntentAdapter,CAPABILITIES_G1
             adapter=G1IntentAdapter;capabilities=CAPABILITIES_G1
@@ -117,6 +140,9 @@ class TeleopPlugin:
             raise ValueError('mapping_profile_mismatch')
         options={'mapping_version':mapping} if profile=='g1_23' else {}
         self.adapter=adapter(self.link,mode,self.cfg.get('position_scale',1 if mapping!='relative_v1' else .5),**options)
+        if self.cfg.get('controller_to_palm'):
+            from .mapping import transform
+            self.adapter.mapper.controller_offsets={s:transform(self.cfg['controller_to_palm'][s]) for s in ('left','right')}
         self.runtime=TeleopRuntime(mode=mode,adapter=self.adapter,
                                    pose_timeout_ms=getattr(self.adapter,'input_timeout_ms',100),
                                    dispatch_io_timeout_ms=getattr(self.adapter,'dispatch_io_timeout_ms',100),
@@ -140,6 +166,8 @@ class TeleopPlugin:
             ca_certificate_base64=capture_certificate_base64(config),presence_interval_ms=250,presence_timeout_ms=1000)
         if profile=='g1_23':
             from .g1_visualization import snapshot as visualization_snapshot
+        elif self._remote_control():
+            visualization_snapshot=lambda adapter:adapter.visualization()
         else:
             from .tianyi_visualization import snapshot as visualization_snapshot
         from .operator_session import OperatorCommands
@@ -152,8 +180,9 @@ class TeleopPlugin:
                 if operation.get('state') not in ('returning','starting','stopping','error'):
                     if operation.get('action')=='start':
                         raw=result.get('state','idle')
-                        operation['state']={'submitted':'active','would_apply':'active',
-                            'held':'hold','error':'hold','armed_waiting_input':'ready',
+                        operation['state']={'submitted':'active','would_apply':'active','preview_submitted':'active',
+                            'target_published':'active','preview':'active',
+                            'held':'hold','hold':'hold','error':'hold','armed_waiting_input':'ready',
                             'waiting_driver_hold':'hold','waiting_driver_feedback':'hold'}.get(raw,operation.get('state','idle'))
                 result['operator']={**operation,'enabled':True,'armed':self._project_armed,
                                     'mode':self.cfg.get('mode','shadow')}
@@ -192,7 +221,7 @@ class TeleopPlugin:
         result['capture']=dict(self._capture_status)
         result['host_error']=self.error
         result['enrollment']=copy.deepcopy(self._enrollment_status)
-        result['calibrated']=self.adapter.solver is not None
+        result['calibrated']=self._calibrated()
         result['operator']={**(dict(self.operator_commands.status) if self.operator_commands else {}),
                             'armed':self._project_armed}
         result['recording']=self.recorder.status() if self.recorder else {'state':'idle'}
@@ -216,6 +245,13 @@ class TeleopPlugin:
             if definition['type']=='string' and not isinstance(value,str):raise ValueError('invalid_config:'+key)
             if 'enum' in definition and value not in definition['enum']:raise ValueError('invalid_config:'+key)
         if updated.get('mode','shadow') not in ('live','shadow'):raise ValueError('invalid_mode')
+        if 'controller_to_palm' in values:
+            from .mapping import transform
+            offsets=values['controller_to_palm']
+            if not isinstance(offsets,dict) or set(offsets)!={'left','right'}:raise ValueError('controller_offsets_required')
+            for offset in offsets.values():transform(offset)
+        if updated.get('robot_profile')=='g1_23' and updated.get('control_backend','legacy')!='legacy':
+            raise ValueError('g1_motion_control_not_migrated')
         mapping=updated.get('mapping_version','relative_v1')
         if mapping not in ('relative_v1','pr152_head_yaw_v1','pr152_clutch_relative_v1') or (updated.get('robot_profile')!='g1_23' and mapping!='relative_v1'):
             raise ValueError('mapping_profile_mismatch')
@@ -285,13 +321,21 @@ class TeleopPlugin:
                 if action=='record_start':
                     if self.cfg.get('robot_profile')!='tianyi2' or self.cfg.get('mode')!='shadow' or self.link.lease:
                         raise ValueError('record_requires_tianyi_shadow')
-                    profile=Path(self.cfg['calibration_path'])
-                    modules=('runtime.py','adapter.py','tianyi.py','kinematics.py','workspace.py','recording.py')
-                    metadata={'profile':json.loads(profile.read_text()),
-                        'profile_sha256':hashlib.sha256(profile.read_bytes()).hexdigest(),
-                        'position_scale':self.cfg.get('position_scale',.5),
-                        'sources':{n:hashlib.sha256(Path(__file__).with_name(n).read_bytes()).hexdigest() for n in modules}}
+                    if self._remote_control():
+                        metadata={'control_interface':'motus.control/2',
+                            'calibration':copy.deepcopy(self.adapter.calibration),
+                            'position_scale':self.cfg.get('position_scale',.5)}
+                    else:
+                        profile=Path(self.cfg['calibration_path'])
+                        modules=('runtime.py','adapter.py','tianyi.py','kinematics.py','workspace.py','recording.py')
+                        metadata={'profile':json.loads(profile.read_text()),
+                            'profile_sha256':hashlib.sha256(profile.read_bytes()).hexdigest(),
+                            'position_scale':self.cfg.get('position_scale',.5),
+                            'sources':{n:hashlib.sha256(Path(__file__).with_name(n).read_bytes()).hexdigest() for n in modules}}
                     return self.recorder.start(metadata,duration=10,wait_for_deadman=True)
+                if action=='installation_info':return self.server.installation_info()
+                if action=='create_invitation':return self._run(self.server.enrollment.create_invitation())
+                if action=='revoke_invitation':return self.server.enrollment.revoke_invitation()
                 if action=='open_pairing':return self._run(self.server.enrollment.open())
                 if action in ('approve_pairing','reject_pairing'):
                     async def decide():
@@ -311,17 +355,18 @@ class TeleopPlugin:
                 if action=='revoke_headset':
                     self.runtime.release_local()
                     async def revoke():
+                        self.server.enrollment.revoke_invitation()
                         self.server.enrollment.pending=None
                         self.server.enrollment.deadline=0
                         return await self.capture.revoke_headset()
                     return self._run(revoke())
                 if action in ('calibrate','self_test'):
                     if self.runtime.status()['authority_valid']:raise ValueError('release_before_calibrating')
-                    return self.adapter.calibrate(self.cfg['calibration_path'])
+                    return self.adapter.calibrate(self.cfg.get('calibration_path'))
                 if action in ('start','resume'):
-                    if action=='resume' and self.cfg.get('robot_profile','tianyi2')=='tianyi2' and not self.adapter.solver:
+                    if action=='resume' and self.cfg.get('robot_profile','tianyi2')=='tianyi2' and not self._calibrated():
                         self._calibrate_recovered_host()
-                    if not self.adapter.solver:raise ValueError('calibrate_before_start')
+                    if not self._calibrated():raise ValueError('calibrate_before_start')
                     if action=='resume':
                         if self.cfg.get('robot_profile','tianyi2')=='tianyi2' and self.runtime.status()['dispatch'].get('fault_code'):
                             self._recover_tianyi_host()
@@ -365,6 +410,8 @@ class TeleopPlugin:
                 return {'state':'ready','armed':True,'driver_binding':copy.deepcopy(binding)}
             if self._return_required:raise ValueError('project_stop_required')
             updated={**self.cfg,'namespace':binding['namespace'],'driver_mcp_url':binding['url']}
+            if binding['protocol_version']==2:updated['control_backend']='motion_control'
+            elif self.cfg.get('control_backend')=='motion_control':updated['control_backend']='legacy'
             if updated!=self.cfg:
                 if self.runtime and (self.runtime.status()['authority_valid'] or self.link.lease):
                     raise ValueError('release_before_binding')
@@ -428,11 +475,13 @@ class TeleopPlugin:
                     # Explicit stop clears the Driver's preparation as well as
                     # its lease. A later explicit finish is a new bounded return
                     # operation, not permission to reuse that cleared session.
-                    if self.cfg.get('operator_session_enabled') is not True:
+                    if self.cfg.get('operator_session_enabled') is not True and not self._remote_control():
                         raise ValueError('operator_session_disabled')
                     self.link.call('prepare_operator_session',time.monotonic()+.5)
                     self._operator_session_prepared=True
-            result=return_arms(self.adapter,cancel,connected,timeout=remaining)
+            if getattr(self.adapter,'remote_motion_control',False):
+                result=self.adapter.finish(cancel,connected,timeout=remaining)
+            else:result=return_arms(self.adapter,cancel,connected,timeout=remaining)
             if not self._release_driver():raise ValueError('stop_unconfirmed')
             result.update(authority_released=True,return_required=True)
         if live and self._operator_session_prepared:
@@ -508,7 +557,7 @@ class TeleopPlugin:
                 if self.link.lease:raise ValueError('operator_requires_release')
                 self._calibrate_recovered_host()
                 if self.adapter.hardware_output:
-                    if self.cfg.get('operator_session_enabled') is not True:
+                    if self.cfg.get('operator_session_enabled') is not True and not self._remote_control():
                         raise ValueError('operator_session_disabled')
                 if not connected() or cancel.is_set():raise ValueError('operator_connection_changed')
                 if not self._project_armed or self._project_stopping:raise ValueError('project_not_armed')
@@ -535,6 +584,8 @@ class TeleopPlugin:
 
     def _release_driver(self):
         """Wait for actual release after the bounded stop request has returned."""
+        if getattr(self.link,'preview_lease',None):
+            if not self.link.release_preview(time.monotonic()+1.):return False
         if not self.link.lease and not getattr(self.link,'management_request',None):return True
         deadline=time.monotonic()+1.
         if self.adapter.close().ok:return True
@@ -556,14 +607,18 @@ class TeleopPlugin:
         # fresh, completed release before discarding any faulted component.
         if not self._release_driver():raise ValueError('stop_unconfirmed')
         state=self.link.feedback()
+        preview_only=bool(getattr(self.adapter,'remote_motion_control',False) and not self.adapter.hardware_output)
         if (state.get('state')!='idle' or state.get('ownership_held') is not False
-                or state.get('output_active') is not False or state.get('stop_confirmed') is not True):
+                or state.get('output_active') is not False
+                or (preview_only and (state.get('preview') is not False or self.link.lease))
+                or (not preview_only and state.get('stop_confirmed') is not True)):
             raise ValueError('recovery_requires_confirmed_idle')
         feedback=state.get('feedback',{})
         now=time.monotonic_ns()
-        if (any(not 0<=now-feedback.get(k,0)<=100_000_000 for k in ('arm_ns','power_ns','fixed_ns'))
-                or feedback.get('power_on') is not True or feedback.get('estop') is not False
-                or feedback.get('fault') is not False):
+        freshness=('arm_ns',) if preview_only else ('arm_ns','power_ns','fixed_ns')
+        if (any(not 0<=now-feedback.get(k,0)<=100_000_000 for k in freshness)
+                or (not preview_only and (feedback.get('power_on') is not True
+                    or feedback.get('estop') is not False or feedback.get('fault') is not False))):
             raise ValueError('recovery_feedback_not_ready')
         self.stop()
         self._ensure_host()
@@ -576,7 +631,7 @@ class TeleopPlugin:
         while True:
             try:
                 self.link.feedback()
-                self.adapter.calibrate(self.cfg['calibration_path'])
+                self.adapter.calibrate(self.cfg.get('calibration_path'))
                 return
             except ValueError as exc:
                 if str(exc) not in ('driver_feedback_missing','driver_feedback_stale_or_different_clock'):

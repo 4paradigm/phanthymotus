@@ -152,6 +152,8 @@ def order_cards_by_dependency(cards, connections):
     # card behind them, turning stale layout data into a total failure to start.
     deps = {}
     for conn in connections or []:
+        if conn.get('role') == 'feedback':
+            continue
         src, dst = conn.get('fromCardId'), conn.get('toCardId')
         if src in ids and dst in ids and src != dst:
             deps.setdefault(dst, set()).add(src)
@@ -342,6 +344,12 @@ def _descriptor_conflict(descriptors: list) -> bool:
     if len(descriptors) < 2:
         return False
     first = descriptors[0]
+    if any(d.get('control_interface', d.get('schema')) == 'motus.control/2' for d in descriptors):
+        import json
+        fields = ('control_interface', 'schema', 'mode', 'dof', 'joint_names', 'units',
+                  'frame', 'groups', 'model_version', 'calibration_version')
+        canonical = lambda d: json.dumps({k: d.get(k) for k in fields}, sort_keys=True)
+        return any(canonical(d) != canonical(first) for d in descriptors[1:])
     key = (first.get('mode'), first.get('dof'), tuple(first.get('joint_names') or []))
     return any(
         (d.get('mode'), d.get('dof'), tuple(d.get('joint_names') or [])) != key
@@ -436,7 +444,7 @@ async def _do_start_project_impl():
                           for t in m.get('tools', []) if t.get('name') == tool_name)
             topic_out = [dict(p) for p in (topic_out or source.get('topic_out', []))]
             for port in topic_out:
-                if port.get('format') == 'control/teleop':
+                if port.get('format') == ('control/eef' if bindings[card_id].get('protocol_version') == 2 else 'control/teleop'):
                     port['topic'] = bindings[card_id]['command_topic']
             data = {**data, 'topic_out': topic_out}
         if topic_out:
@@ -512,7 +520,9 @@ async def _do_start_project_impl():
         }})
         return False
 
-    layout = config.main.get('canvas_layout', {})
+    from motion_project import with_feedback_edges, validate_execution_target
+    layout = with_feedback_edges(config.main.get('canvas_layout', {}),
+                                 (config.main.get('services', {}) or {}).get('mcp', []) or [])
     cards = layout.get('cards', [])
     connections = layout.get('connections', [])
 
@@ -536,6 +546,13 @@ async def _do_start_project_impl():
             if target.get('code') != 200:
                 raise TeleopProjectError(target.get('message') or '遥操 Driver 未应答')
             validate_target(binding, payload_of(target))
+            if binding.get('protocol_version') == 2:
+                execution = binding['execution_binding']
+                response = await mcp_call_tool(execution['mcp_id'], MCPCallRequest(
+                    tool=execution['tool'], arguments={'action': 'info'}), timeout_s=INFO_TIMEOUT_S)
+                if response.get('code') != 200:
+                    raise TeleopProjectError(response.get('message') or '执行卡未应答')
+                validate_execution_target(execution, payload_of(response))
     except Exception as error:
         core = config.main.get('core', {})
         core['project_start_error'] = str(error)
@@ -563,6 +580,7 @@ async def _do_start_project_impl():
     errors = []
     # Resolved topic_out per card (populated after starting sources)
     resolved_topics: dict[str, list] = {}
+    negotiated_ports: dict[str, dict] = {}
 
     def _topic_clash(card_id: str, info: dict):
         """Another card already publishing a topic this one just claimed.
@@ -603,7 +621,11 @@ async def _do_start_project_impl():
             # Both sides have to say so. One card declaring `control/*` while
             # the other declares `data/json` is not a negotiated hand-over, it
             # is the original bug wearing a format string.
-            if shared <= control and shared <= _control_topics(out):
+            session_topics = {b[k] for b in bindings.values() if b.get('protocol_version') == 2
+                              for k in ('command_topic',)}
+            session_topics.update(b['execution_binding']['command_topic'] for b in bindings.values()
+                                  if b.get('protocol_version') == 2)
+            if shared <= control and shared <= _control_topics(out) and not shared & session_topics:
                 print(f'[start-project] {sorted(shared)} has multiple control '
                       f'sources ({card_id}, {other_id}) — arbitrated by priority')
                 continue
@@ -620,7 +642,7 @@ async def _do_start_project_impl():
             return {}
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
-                                 control_interface: dict = None):
+                                 control_interface: dict = None, control_interfaces: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -676,6 +698,12 @@ async def _do_start_project_impl():
             # producer can reconcile against it and refuse — not on `info`,
             # which must stay answerable by a card that has not been given one.
             args['control_interface'] = control_interface
+        if control_interfaces:
+            args['control_interfaces'] = control_interfaces
+        for binding in bindings.values():
+            if (binding.get('protocol_version') == 2 and binding['mcp_id'] == mcp_id
+                    and binding['tool'] == tool_name):
+                args['execution_binding'] = binding['execution_binding']
 
         if tool_name == 'teleop_executor':
             # Its fixed DDS endpoint is declared by x-teleop-target; the edge
@@ -882,7 +910,7 @@ async def _do_start_project_impl():
         driver differ between runs of an unchanged canvas.
         """
         topics, unresolved = [], []
-        for conn in [c for c in connections if c.get('toCardId') == card_id]:
+        for conn in [c for c in connections if c.get('toCardId') == card_id and c.get('role') != 'feedback']:
             topic = _topic_of_connection(conn)
             if not topic:
                 unresolved.append(conn)
@@ -917,10 +945,17 @@ async def _do_start_project_impl():
         without one.
         """
         descriptors, sources, unreachable = [], [], []
+        per_port = {}
+        registry = (config.main.get('services', {}) or {}).get('mcp', []) or []
+        producer = next((c for c in cards if c.get('id') == card_id), {})
+        producer_tool = next((t for m in registry if m.get('id') == producer.get('mcpId')
+                              for t in m.get('tools', []) if isinstance(t, dict)
+                              and t.get('name') == producer.get('toolName')), {})
+        producer_ports = producer_tool.get('topic_out', [])
         for conn in connections:
             if conn.get('fromCardId') != card_id:
                 continue
-            if (not str(conn.get('format') or '').startswith('control/')
+            if (conn.get('role') == 'feedback' or not str(conn.get('format') or '').startswith('control/')
                     or conn.get('format') == 'control/teleop'):
                 continue
             target = next((c for c in cards if c.get('id') == conn.get('toCardId')), None)
@@ -939,13 +974,29 @@ async def _do_start_project_impl():
                 # have never heard of motus.control/1, and a control link to
                 # one of those must not fail a start.
                 reachable = (info or {}).get('code') == 200
-                descriptor = (payload_of(info) or {}).get('control_interface')
+                data = payload_of(info) or {}
+                consumer_ports = data.get('topic_in', [])
+                try:
+                    consumer_port = consumer_ports[int(conn.get('toPortIdx', 0))]
+                except (IndexError, ValueError, TypeError):
+                    consumer_port = {}
+                consumer_key = consumer_port.get('port_id') or consumer_port.get('id') or str(conn.get('toPortIdx', 0))
+                descriptor = (data.get('control_interfaces') or {}).get(consumer_key)
+                if descriptor is None:
+                    descriptor = data.get('control_interface')
             except Exception as error:
                 print(f'[start-project] {tool_name} descriptor info() failed: {error}')
                 reachable, descriptor = False, None
             if isinstance(descriptor, dict) and descriptor:
                 descriptors.append(descriptor)
                 sources.append(tool_name)
+                index = str(conn.get('fromPortIdx', 0))
+                try:
+                    output = producer_ports[int(index)]
+                except (IndexError, ValueError, TypeError):
+                    output = {}
+                key = output.get('port_id') or output.get('id') or index
+                per_port.setdefault(key, []).append(descriptor)
             elif not reachable:
                 unreachable.append(tool_name)
 
@@ -961,11 +1012,18 @@ async def _do_start_project_impl():
                             f'动作空间。连线是对的 —— 请检查该卡片所在的设备是否'
                             f'在线、是否刚重启。')
             return {}, ''
-        if _descriptor_conflict(descriptors):
+        supports_ports = 'control_interfaces' in producer_tool.get('inputSchema', {}).get('properties', {})
+        if unreachable and (supports_ports or producer_tool.get('x-motion-control')):
+            return {}, f'下游卡片 {", ".join(unreachable)} 没有应答，不能完成端口协商'
+        if any(_descriptor_conflict(values) for values in per_port.values()):
             return {}, (f'{card_id} 的控制输出接到了动作空间不一致的卡片：'
                         f'{", ".join(sources)}。一路指令流无法同时满足两种动作空间，'
                         f'请分开连线')
-        return descriptors[0], ''
+        if len(per_port) > 1 and not supports_ports:
+            return {}, '生产者未声明多输出端口协商能力，不能把不同端口合并为一路控制'
+        if supports_ports:
+            negotiated_ports[card_id] = {key: values[0] for key, values in per_port.items()}
+        return (descriptors[0] if len(per_port) == 1 else {}), ''
 
     def _unresolved_message(card: dict, unresolved: list) -> str:
         """Name the upstream cards whose topic could not be found."""
@@ -1021,7 +1079,8 @@ async def _do_start_project_impl():
             continue
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
-                                 control_interface=descriptor)
+                                 control_interface=descriptor,
+                                 control_interfaces=negotiated_ports.get(card.get('id', '')))
 
     if not errors:
         for card in teleop_cards(layout):

@@ -14,8 +14,8 @@ android {
         applicationId = "com.phanthymotus.questcapture"
         minSdk = 29
         targetSdk = 35
-        versionCode = 21
-        versionName = "0.3.17-operator1-ikview2"
+        versionCode = 22
+        versionName = "0.3.18-onboarding1"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -63,11 +63,23 @@ android {
             version = "3.22.1"
         }
     }
+    signingConfigs {
+        create("distribution") {
+            val path = System.getenv("MOTUS_APK_KEYSTORE")
+            if (!path.isNullOrEmpty()) {
+                storeFile = file(path)
+                storePassword = System.getenv("MOTUS_APK_STORE_PASSWORD")
+                keyAlias = System.getenv("MOTUS_APK_KEY_ALIAS")
+                keyPassword = System.getenv("MOTUS_APK_KEY_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         debug {
             isJniDebuggable = true
         }
         release {
+            signingConfig = signingConfigs.getByName("distribution")
             isMinifyEnabled = false
         }
     }

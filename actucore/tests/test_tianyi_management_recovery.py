@@ -29,12 +29,30 @@ def test_initial_stale_claim_is_retryable_and_cancel_does_not_invent_stop(manage
             if action=='release' and mode=='wrong_boot':result['boot_id']='wrong'
             return result
         link.call=altered
-        assert link.stop(time.monotonic()+.025)==(mode=='cancel')
+        # A rejected cancellation may exhaust either the outer stop loop or
+        # its DDS wait. Both must preserve the request and never report success.
+        try:confirmed=link.stop(time.monotonic()+.025)
+        except ValueError as exc:
+            assert str(exc)=='driver_feedback_ack_timeout' and mode!='cancel'
+            confirmed=False
+        assert confirmed==(mode=='cancel')
         assert not gate.status()['stop_confirmed']  # Nothing moved; no physical stop fabricated.
         if mode!='cancel':
             assert link.management_request
             link.call=call;assert link.stop(time.monotonic()+.1)
         assert not link.management_request and not link.lease and not writes
+
+
+def test_release_feedback_deadline_retains_lease_and_reports_unconfirmed(managed,monkeypatch):
+    _,link,gate,_,_,_=managed
+    link.claim(time.monotonic()+.1)
+    token=dict(link.lease)
+    monkeypatch.setattr(link,'reconcile_release',lambda:False)
+    def expired(*_):raise ValueError('driver_feedback_ack_timeout')
+    monkeypatch.setattr(link,'feedback_after',expired)
+    with pytest.raises(ValueError,match='^driver_feedback_ack_timeout$'):
+        link.stop(time.monotonic()+.1)
+    assert link.lease==token and link.release_requested_ns
 
 
 @pytest.fixture

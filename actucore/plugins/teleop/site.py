@@ -73,32 +73,34 @@ def required_site_config(config: dict) -> list[dict[str, str]]:
     except ImportError:
         if not any(item['field'] == 'runtime' for item in issues):
             missing('runtime', 'teleop_dependencies_unavailable')
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, RuntimeError):
         missing('capture.state_file', 'writable_directory_and_valid_state_required')
 
-    try:
-        calibration = configured_path(config.get('calibration_path'))
-        profile = json.loads(calibration.read_text())
-        robot = config.get('robot_profile', 'tianyi2')
-        expected = {'tianyi2': 'motus.tianyi-calibration.v1',
-                    'g1_23': 'motus.g1-calibration.v1'}
-        if robot not in expected or not isinstance(profile, dict) or profile.get('schema') != expected[robot]:
-            raise ValueError('calibration_schema')
-        model = Path(profile['urdf_path'])
-        # Match the profile readers: only G1 resolves a relative model path
-        # against the calibration file. Tianyi uses the process working dir.
-        if robot == 'g1_23' and not model.is_absolute():
-            model = calibration.parent / model
-        model_bytes = model.read_bytes()
-        if hashlib.sha256(model_bytes).hexdigest() != profile['urdf_sha256']:
-            raise ValueError('calibration_model_changed')
-        if ET.fromstring(model_bytes).tag != 'robot':
-            raise ValueError('urdf_required')
-    except (OSError, ValueError, TypeError, KeyError, ET.ParseError):
-        missing('calibration_path', 'readable_profile_and_matching_model_required')
+    remote = config.get('control_backend') == 'motion_control' and config.get('robot_profile', 'tianyi2') != 'g1_23'
+    if not remote:
+        try:
+            calibration = configured_path(config.get('calibration_path'))
+            profile = json.loads(calibration.read_text())
+            robot = config.get('robot_profile', 'tianyi2')
+            expected = {'tianyi2': 'motus.tianyi-calibration.v1',
+                        'g1_23': 'motus.g1-calibration.v1'}
+            if robot not in expected or not isinstance(profile, dict) or profile.get('schema') != expected[robot]:
+                raise ValueError('calibration_schema')
+            model = Path(profile['urdf_path'])
+            # Match the profile readers: only G1 resolves a relative model path
+            # against the calibration file. Tianyi uses the process working dir.
+            if robot == 'g1_23' and not model.is_absolute():
+                model = calibration.parent / model
+            model_bytes = model.read_bytes()
+            if hashlib.sha256(model_bytes).hexdigest() != profile['urdf_sha256']:
+                raise ValueError('calibration_model_changed')
+            if ET.fromstring(model_bytes).tag != 'robot':
+                raise ValueError('urdf_required')
+        except (OSError, ValueError, TypeError, KeyError, ET.ParseError):
+            missing('calibration_path', 'readable_profile_and_matching_model_required')
     if not issues:
         try:
-            dependencies = ['pinocchio', 'scipy.optimize', 'aiortc']
+            dependencies = ['numpy', 'scipy.spatial.transform', 'aiortc'] if remote else ['pinocchio', 'scipy.optimize', 'aiortc']
             if capture.get('discovery_enabled', True):
                 dependencies.append('zeroconf')
             if config.get('robot_profile') == 'g1_23':

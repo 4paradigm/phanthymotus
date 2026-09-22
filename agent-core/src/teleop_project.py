@@ -29,7 +29,7 @@ def _registered(registry, card):
     return service, matches[0]
 
 
-def _port(tool, direction, index):
+def _port(tool, direction, index, fmt=FORMAT):
     try:
         if isinstance(index, bool):
             raise ValueError()
@@ -38,7 +38,7 @@ def _port(tool, direction, index):
         if i < 0 or str(i) != str(index):
             raise ValueError()
         port = ports[i]
-        if port.get('format') != FORMAT:
+        if port.get('format') != fmt:
             raise ValueError()
         return port
     except (ValueError, TypeError, IndexError, AttributeError):
@@ -65,10 +65,14 @@ def resolve_bindings(layout, registry):
         if not {'project_start', 'project_stop'} <= set(actions):
             raise TeleopProjectError('当前遥操机型未提供智能控制启停与收臂能力')
         outgoing = [c for c in connections if c.get('fromCardId') == source['id']
-                    and c.get('format') == FORMAT]
+                    and c.get('format') in (FORMAT, 'control/eef')]
         if len(outgoing) != 1:
             raise TeleopProjectError('遥操命令端口必须且只能连接一个对应 Driver 的 teleop_executor')
         edge = outgoing[0]
+        if edge.get('format') == 'control/eef':
+            from motion_project import resolve_motion_binding
+            result[source['id']] = resolve_motion_binding(layout, registry, source, source_tool, edge)
+            continue
         _port(source_tool, 'topic_out', edge.get('fromPortIdx'))
         targets = [c for c in cards if c.get('id') == edge.get('toCardId')]
         if len(targets) != 1 or targets[0].get('toolName') != 'teleop_executor':
@@ -114,6 +118,9 @@ def resolve_bindings(layout, registry):
 
 
 def validate_profile(binding, info):
+    if binding.get('protocol_version') == 2:
+        # Generic teleop has no robot model; the connected motion card owns it.
+        return
     profile = (info.get('configuration') or {}).get('robot_profile') or info.get('robot_profile')
     if profile != binding['robot_profile']:
         raise TeleopProjectError('遥操机型与连线 Driver 不一致，请先配置对应机型')
@@ -121,6 +128,9 @@ def validate_profile(binding, info):
 
 def validate_target(binding, info):
     """Require the current Driver response to agree with registered metadata."""
+    if binding.get('protocol_version') == 2:
+        from motion_project import validate_motion_target
+        return validate_motion_target(binding, info)
     meta = info.get('x-teleop-target')
     keys = ('protocol_version', 'robot_profile', 'namespace', 'command_topic', 'feedback_topic')
     if (not isinstance(meta, dict) or type(meta.get('protocol_version')) is not int

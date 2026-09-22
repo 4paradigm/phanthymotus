@@ -552,6 +552,9 @@ app_api.include_router(api.inspection.router)
 import api.canvas
 app_api.include_router(api.canvas.router)
 
+import api.teleop_install
+app_api.include_router(api.teleop_install.router)
+
 import api.agent_definition
 app_api.include_router(api.agent_definition.router)
 
@@ -590,6 +593,7 @@ import api.benchmark
 app_api.include_router(api.benchmark.router)
 
 app = fastapi.FastAPI(lifespan=lifespan)
+app.include_router(api.teleop_install.public_router)
 app.middleware('http')(auth.auth_middleware)
 app.mount('/api', app_api)
 

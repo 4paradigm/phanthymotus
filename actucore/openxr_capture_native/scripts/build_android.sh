@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   cat >&2 <<'EOF'
-Usage: build_android.sh [--platform meta|pico|all]
+Usage: build_android.sh [--platform meta|pico|all] [--build-type debug|release]
 
 Builds both Android OpenXR APKs by default. Select one platform to shorten an
 incremental build.
@@ -11,9 +11,15 @@ EOF
 }
 
 platform=all
+build_type=debug
 platform_seen=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --build-type)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      build_type=$2
+      shift 2
+      ;;
     --platform)
       if [ "$platform_seen" = true ] || [ "$#" -lt 2 ]; then
         usage
@@ -50,6 +56,20 @@ case "$platform" in
     echo "Unsupported platform: $platform (expected meta, pico, or all)" >&2
     exit 2
     ;;
+esac
+
+case "$build_type" in
+  debug) variant=Debug ;;
+  release)
+    variant=Release
+    for variable in MOTUS_APK_KEYSTORE MOTUS_APK_STORE_PASSWORD MOTUS_APK_KEY_ALIAS MOTUS_APK_KEY_PASSWORD; do
+      # Only print the variable name, never its signing secret.
+      value=$(printenv "$variable" || true)
+      [ -n "$value" ] || { echo "Release signing variable required: $variable" >&2; exit 2; }
+    done
+    [ -f "$MOTUS_APK_KEYSTORE" ] || { echo "Release keystore is missing" >&2; exit 2; }
+    ;;
+  *) echo "Unsupported build type" >&2; exit 2 ;;
 esac
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -117,19 +137,19 @@ case "$platform" in
     "$verified_gradle" \
       --no-daemon \
       --project-dir "$project_dir" \
-      :app:assembleMetaDebug
+      ":app:assembleMeta${variant}"
     ;;
   pico)
     "$verified_gradle" \
       --no-daemon \
       --project-dir "$project_dir" \
-      :app:assemblePicoDebug
+      ":app:assemblePico${variant}"
     ;;
   all)
     "$verified_gradle" \
       --no-daemon \
       --project-dir "$project_dir" \
-      :app:assembleMetaDebug \
-      :app:assemblePicoDebug
+      ":app:assembleMeta${variant}" \
+      ":app:assemblePico${variant}"
     ;;
 esac

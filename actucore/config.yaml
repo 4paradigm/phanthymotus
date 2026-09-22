@@ -6,10 +6,11 @@
 mcp_port: 15730
 
 plugins:
-  # One ActuCore / one MCP endpoint. Enable after building with --with-teleop;
-  # site TLS, calibration and pairing-state paths belong in this same config.
+  # One ActuCore / one MCP endpoint. Normal JP6.1 builds include teleop.
+  # Site identity/pairing stays here; the robot model belongs to its Driver.
   teleop:
     enabled: false
+    control_backend: motion_control
     mode: shadow
 
   vla:

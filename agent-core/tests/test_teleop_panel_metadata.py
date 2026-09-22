@@ -15,6 +15,8 @@ def test_discovery_keeps_connection_panel():
     exec(compile(ast.Module(body=[function],type_ignores=[]),str(source),'exec'),ns)
     async def run():
         tool={'name':'teleop','type':'processor','x-connection-panel':'teleop-v1','x-teleop-target':{'protocol_version':1,'robot_profile':'tianyi2'},'untrusted-extra':'discard','inputSchema':{'properties':{'action':{'enum':['info','open_pairing']}}}}
+        tool['x-motion-control']={'protocol_version':2,'execution_tool':'arm'}
+        tool['x-control-target']={'protocol_version':2,'resources':['arm_l','arm_r']}
         async def handle(request):
             method=(await request.json())['method']
             result={'tools':[tool]} if method=='tools/list' else {'content':[{'type':'text','text':'{}'}]} if method=='tools/call' else {}
@@ -27,6 +29,8 @@ def test_discovery_keeps_connection_panel():
             result=await ns['_ping_mcp_http'](f'http://127.0.0.1:{port}/mcp')
             assert result['tools'][0]['x-connection-panel']=='teleop-v1'
             assert result['tools'][0]['x-teleop-target']=={'protocol_version':1,'robot_profile':'tianyi2'}
+            assert result['tools'][0]['x-motion-control']==tool['x-motion-control']
+            assert result['tools'][0]['x-control-target']==tool['x-control-target']
             assert 'untrusted-extra' not in result['tools'][0]
         finally:await runner.cleanup()
     asyncio.run(run())

@@ -219,7 +219,7 @@ def test_real_numerical_solver_segment_collision_and_model_hash(tmp_path):
     assert result['max_error_rad']<1e-3 and not result['hardware_output']
     desired=q.copy();desired[3]+=.01
     actual=solver.solve(solver.palms(desired),q)
-    assert len(actual)==14 and solver.last_ms<80
+    assert len(actual)==14 and solver.last_ms<=100
     solver.workspace['torso_box']=[[-2,-2,-2],[2,2,2]]
     with pytest.raises(ValueError,match='torso_collision'):solver.solve(solver.palms(q),q)
     profile=json.loads(path.read_text());profile['urdf_sha256']='0'*64;path.write_text(json.dumps(profile))

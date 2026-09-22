@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from .dispatch import AdapterAck
-from .kinematics import RelativeMapping, transform
+from .mapping import RelativeMapping, transform
 
 
 def validate_driver_endpoint(cfg):
@@ -43,7 +43,7 @@ class DriverLink:
         if not profile.is_file() or not bundled.is_file() or profile.read_bytes()!=bundled.read_bytes():
             raise ValueError('local_dds_profile_mismatch')
         validate_driver_endpoint(cfg)
-        self.url=cfg['driver_mcp_url'];self.executor=executor
+        self.url=cfg.get('driver_mcp_url');self.executor=executor
         self.opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.condition=threading.Condition();self.latest=None
         self.lease=None;self.seq=0;self.publisher=None
@@ -56,7 +56,7 @@ class DriverLink:
         self.management_request = None
         self.node=Node('actucore_teleop',context=executor.context)
         executor.add_node(self.node)
-        ns=cfg['namespace']
+        ns=cfg.get('namespace','robot')
         self.topic=f'/{ns}/motion/teleop'
         self.qos=QoSProfile(depth=1,reliability=ReliabilityPolicy.BEST_EFFORT,
                            history=HistoryPolicy.KEEP_LAST,durability=DurabilityPolicy.VOLATILE)
@@ -107,10 +107,11 @@ class DriverLink:
                 self.condition.wait(min(.01,max(0,deadline-time.monotonic())))
         raise ValueError('driver_feedback_ack_timeout')
 
-    def call(self,action,deadline):
+    def call(self,action,deadline,**arguments):
         started=time.monotonic();ok=False
         try:
-            args={'action':action}
+            if not self.url:raise ValueError('driver_not_bound')
+            args={'action':action,**arguments}
             if action in ('pause','release','resume','recoverable_hold') and self.lease:
                 args.update(session_id=self.lease['session_id'],secret=self.lease['secret'])
             operation=getattr(self,'management_request',None)
@@ -118,8 +119,8 @@ class DriverLink:
                 args.update(request_id=operation['id'],request_valid_until_ns=operation['until_ns'])
                 args.pop('session_id',None);args.pop('secret',None)
                 args.update(operation['credentials'])
-            body={'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'teleop_executor','arguments':args}}
-            timeout=min(0.08,deadline-time.monotonic())
+            body={'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':getattr(self,'tool','teleop_executor'),'arguments':args}}
+            timeout=min(3. if action=='calibrate' else .08,deadline-time.monotonic())
             if timeout<=0:raise ValueError('driver_call_deadline')
             request=urllib.request.Request(self.url,json.dumps(body).encode(),{'Content-Type':'application/json'})
             with self.opener.open(request,timeout=timeout) as response:reply=json.load(response)
@@ -139,7 +140,7 @@ class DriverLink:
         if self.publisher is not None:return
         from std_msgs.msg import String
         started=time.monotonic()
-        self.publisher=self.node.create_publisher(String,self.topic+'/command',self.qos)
+        self.publisher=self.node.create_publisher(String,getattr(self,'command_topic',self.topic+'/command'),self.qos)
         self.transport_prepare_ms=(time.monotonic()-started)*1000
 
     def claim(self,deadline):

@@ -6,7 +6,7 @@
 
 ## 当前版本与设备范围
 
-当前源码的 Gradle 包版本与 Native 握手版本均为 `0.3.17-operator1-ikview2`，`versionCode = 21`。本手册描述源码行为，不将版本号、宿主测试或 APK 构建视为本轮设备安装和真机验收的证据。
+当前源码的 Gradle 包版本与 Native 握手版本均为 `0.3.18-onboarding1`，`versionCode = 22`。本手册描述源码行为，不将版本号、宿主测试或 APK 构建视为本轮设备安装和真机验收的证据。
 
 | 构建目标 | 设备系列 | Application ID | Debug APK |
 |---|---|---|---|
@@ -21,12 +21,23 @@ PICO APK 按运行时实际提供的扩展选择 `XR_BD_controller_interaction` 
 
 ## 连接与配对
 
+### 扫码安装与一键连接
+
+1. 在当前机器人 Canvas 的 teleop 卡片生成安装邀请，有效期 15 分钟。二维码指向 Core 安装页；页面从该机器人 ActuCore 容器代理下载固定 APK，显示版本与 SHA256。
+2. 使用 PICO 系统浏览器打开安装页，下载并完成系统安装确认。手机扫码只会打开手机网页，不能自动把 APK 安装到头显；PICO 系统扫码能力仍需现场验证，也可在头显浏览器输入安装页短地址。
+3. 安装后返回原安装页，点击“打开并连接”。`motus-teleop://connect#...` 把当前机器人的地址、证书指纹和一次性授权邀请导入连接页，点击“连接当前机器人”完成配对。安装器内直接点“打开”不会继承下载前 URL，此时从安装页再次打开，或用下方手动配对。
+4. 邀请单次兑换、可由 Canvas 撤销；生成新邀请自动使旧邀请失效。邀请仅授权配对，不获取运动控制权。兑换前客户端验证证书与邀请中的 SHA256 一致；邀请失效、身份不符或网络失败需重新生成，不能关闭验证绕过。
+
+邀请保存在当前页面/应用内存中，不写 APK 或持久化配置，不进入 HTTP 查询参数。首装仍须用户确认侧载安装、系统权限或安全边界，不承诺静默安装。安装页应保留在头显浏览器，不能仅依赖应用首次启动推断机器人。
+
+### 手动发现与双端确认（备用）
+
 1. 在机器人 Canvas 中添加或打开 **执行（ActuCore）→ teleop** 卡片，展开 **连接与配对**，点击 **允许新设备配对**，打开 120 秒配对窗口。
 2. 在 PICO 打开“连接机器人”。应用可发现局域网中的卡片，也可手动输入地址。
 3. 选择目标机器人，申请配对；核对 Canvas 和头显显示的指纹，一致后在卡片批准并在头显确认。
 4. 进入透视采集页。确认头显和左右手柄跟踪有效；配对成功不表示遥操已经开始。
 
-后续启动仍先显示连接页，点击已配对机器人后进入采集。连接失败会返回连接页，不自动开始 Live。忘记设备只删除头显本地信息；需要同时取消信任时，在 Canvas 撤销配对。ActuCore 配对状态或部署 CA 更换后，需要重新配对；普通 Driver 重建不应单独决定头显凭据是否失效。
+已配对应用冷启动自动连接保存的机器人身份并进入采集；普通网络中断使用已有退避重连。返回连接管理页不再次自动跳入采集，可取消、忘记或更换设备。证书变化、凭证撤销停止有效连接，不会自动重新配对或开始 Live。打开另一台机器人的邀请不会覆盖已有身份；必须明确忘记旧设备。忘记设备只删除头显本地信息；需要同时取消信任时，在 Canvas 撤销配对。ActuCore 配对状态或部署 CA 更换后，需要重新配对；普通 Driver 重建不应单独决定头显凭据是否失效。
 
 连接页是普通 Android Activity；采集页才创建 OpenXR 会话。首次启动时，系统权限、账号或 MR 安全边界提示需要在头显内完成。透视画面可见不代表应用已经取得 `FOCUSED` 输入状态；失焦、跟踪丢失、空间重置或透视不可用时，客户端停止发送可使能的输入，服务端另行处理保持和恢复。
 
@@ -92,7 +103,22 @@ export ANDROID_SDK_ROOT=/path/to/android-sdk
 adb install -r app/build/outputs/apk/pico/debug/app-pico-debug.apk
 ```
 
-Meta 使用表中对应 APK。安装会中断正在运行的应用；成功后应独立核对包版本、连接页、配对、透视、控制器输入和模型显示，不能仅以安装命令成功宣布设备验收完成。本轮文档整理只核对源码版本与入口，不声明重新构建 APK 或安装到设备。
+Meta 使用表中对应 APK。安装会中断正在运行的应用；成功后应独立核对包版本、连接页、配对、透视、控制器输入和模型显示，不能仅以安装命令成功宣布设备验收完成。APK 编译与签名校验记录单独交付，不声明安装到设备。
+
+## 固定发布制品与普通镜像构建
+
+正式 APK 构建使用稳定外部签名：设置 `MOTUS_APK_KEYSTORE`、`MOTUS_APK_STORE_PASSWORD`、`MOTUS_APK_KEY_ALIAS`、`MOTUS_APK_KEY_PASSWORD` 后运行 `./scripts/build_android.sh --platform pico --build-type release`。签名私钥和密码只存于受保护的本地/CI 目录，不写 Git、Docker context 或日志。未设置签名变量时 release 构建直接失败，不回退 debug。
+
+```sh
+python3 tests/verify_android_apks.py --platform pico --build-type release
+python3 scripts/stage_apk.py app/build/outputs/apk/pico/release/app-pico-release.apk
+```
+
+`stage_apk.py` 读取 APK 真正的签名、包版本、debuggable 标记和对齐结果，生成本地制品与清单。维护者发布到不可变地址后更新 [package-manifest.json](package-manifest.json)；这是制品更新流程，不是使用者每次构建镜像的额外步骤。普通 CPU / Jetson ActuCore Docker 构建自动通过 [fetch_apk.py](scripts/fetch_apk.py) 下载清单指定的确定性 gzip 制品，验证外层大小及 SHA256，解压后再验证原始 release APK 大小及 SHA256，最后内置到 `/work/onboarding/pico.apk`。Canvas/Core 向用户提供原 APK，无需用户解压；无额外 teleop 构建开关。
+
+ActuCore 的既有 TLS 监听提供固定 `/onboarding/package` 和 `/onboarding/apk`；Canvas/Core 固定代理该已注册服务，浏览器无需直接接受配对服务的自签名证书。制品缺失或损坏不提供下载。配对服务证书和 APK 发布签名是不同身份，不能相互替代。
+
+旧 debug APK 与新 release 签名不同，Android 不允许直接覆盖安装。保持运行中的旧应用，安排人工迁移窗口再由用户卸载/安装并重新配对；代码不自动卸载，不静默清空已有凭据。之后同一 release 签名的升级保留本地配对数据。更新 APK 不自动恢复运动。
 
 ## 开发用 ADB 配对入口
 

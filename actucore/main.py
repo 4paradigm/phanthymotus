@@ -141,14 +141,21 @@ class ActuCoreBundle:
 
         if plugins_cfg.get("teleop", {}).get("enabled", False):
             from plugins.teleop.site import required_site_config
-            issues = required_site_config(plugins_cfg["teleop"])
-            if issues:
-                self.required_site_config['teleop'] = issues
-                log.error("teleop not advertised: required_site_config=%s", issues)
-            else:
+            try:
                 from plugins.teleop import TeleopPlugin
-                self._plugins.append(TeleopPlugin(plugins_cfg["teleop"], executor))
-                log.info("TeleopPlugin loaded")
+                plugin = TeleopPlugin(plugins_cfg["teleop"], executor)
+                # Validate the accepted restored configuration, not an obsolete
+                # calibration path from the original deployment file.
+                issues = required_site_config(plugin.cfg)
+                if issues:
+                    self.required_site_config['teleop'] = issues
+                    log.error("teleop not advertised: required_site_config=%s", issues)
+                else:
+                    self._plugins.append(plugin)
+                    log.info("TeleopPlugin loaded")
+            except (ImportError, OSError, ValueError, RuntimeError):
+                self.required_site_config['teleop'] = [{'field': 'runtime', 'code': 'teleop_initialization_unavailable'}]
+                log.error("teleop unavailable; other cards retained")
 
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
