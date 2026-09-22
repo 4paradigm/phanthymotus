@@ -32,11 +32,14 @@
 | 接口 | 用途与权限 |
 |---|---|
 | `POST /api/teleop-install/{mcp_id}` | 经过 Dashboard 鉴权，从已注册遥操服务取得安装信息并生成十五分钟下载链接 |
+| `DELETE /api/teleop-install/{mcp_id}/{ticket}` | 经过 Dashboard 鉴权撤销本服务下载链接；重新生成也会撤销旧链接 |
 | `POST /api/teleop-install/{mcp_id}/invitation/{ticket}` | 经过 Dashboard 鉴权和遥操管理凭据调用一次性邀请；不授予运动权限 |
 | `GET /pico/{ticket}` | 有效下载链接的安装页；不提供控制 API |
-| `GET /pico/{ticket}/apk` | 固定 APK 路径代理，核验 TLS 证书指纹、大小和 SHA256 后发送 |
+| `GET /pico/{ticket}/apk` | 固定 APK 路径代理，核验 TLS 证书指纹、大小和 SHA256 后发送；最多三次（含重试），间隔至少两秒，单链接不并行下载 |
 
-连接邀请位于 URL fragment，浏览器不会将它发送给安装页的 HTTP 服务。Core 不把邀请写入下载票据、配置、日志或长期存储；链接重启后失效。公开短链接只提供 APK 下载，不代表配对成功，更不代表开始遥操。
+连接邀请位于 URL fragment，浏览器不会将它发送给安装页的 HTTP 服务。Core 不把邀请写入下载票据、配置、日志或长期存储。下载票据在现有 Core SQLite 独立表中仅保存 token 的 SHA256、公开安装信息和绝对期限，重启不重置十五分钟有效期；多 worker/容器须共享同一个 DB 卷，最多保留 128 条有效记录。邀请本身仍由 ActuCore 单次消费，随其进程重启失效。公开短链接只提供有限次 APK 下载，不代表配对成功，更不代表开始遥操。下载中到期或撤销会终止后续传输；进程崩溃的下载占位最多保留 240 秒，随后可在剩余期限和次数内重试。
+
+ActuCore 的 MCP `installation_info.package` 是摘要；Core 根据同时返回的固定路径和证书指纹，另取 HTTPS `/onboarding/package` 的扁平元数据并校验。不能把 MCP 外层对象直接当作包元数据。跨服务契约测试使用生产 Plugin dispatch、MCP handler 和真实 TLS package handler 覆盖此边界。
 
 二维码由锁定的 `qrcode==8.2` 在本机生成 SVG，不依赖外部二维码网站或 Pillow。依赖许可证为 [BSD-3-Clause，含继承的 MIT 说明](https://github.com/lincolnloop/python-qrcode/blob/v8.2/LICENSE)。生产依赖见 `pyproject.toml` 和 `uv.lock`。
 

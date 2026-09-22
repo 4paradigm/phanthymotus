@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # build_actucore.sh — 构建 actucore（执行模型层）镜像并推送
 #
-# 只有 Jetson GPU 版：执行模型（VLA / 抓取策略 / locomotion）都要 GPU，
-# 没有 CPU 变体。
+# 本入口构建普通 Jetson bundle；CPU 隔离验证使用 build_tianyi_actucore.sh。
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认，与 build_perception.sh 一致）
@@ -37,11 +36,9 @@ eval "$(parse_mirror_arg "$@")"
 
 # ── 解析参数 ─────────────────────────────────────────────────────────
 JP_VERSION="5.11"
-WITH_TELEOP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --jp-version) JP_VERSION="$2"; shift 2 ;;
-        --with-teleop) WITH_TELEOP=1; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -62,7 +59,7 @@ fi
 DATE="$(date +%y%m%d)"
 COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
 
-# ── Jetson-only：执行模型都要 GPU，没有 CPU 变体 ──────────────────────
+# ── 普通 Jetson bundle ───────────────────────────────────────────────
 DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
 BUILD_CONTEXT="${REPO_ROOT}"
 TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
@@ -72,12 +69,7 @@ TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 # 被当成第一个的值，静默不生效。build_perception.sh 至今只传一个参数，所以
 # 那个写法在它那里一直没露馅 —— 这里传两个，第一次构建 jp5.11 就拿到了
 # jp6.1 的 base（Python 3.10、带 lerobot 的 18.6 GB 镜像），构建本身还成功了。
-if [[ "$WITH_TELEOP" == 1 && "$JP_VERSION" != "6.1" ]]; then
-    echo "teleop bundle requires JetPack 6.1 / Python 3.10" >&2
-    exit 2
-fi
-if [[ "$WITH_TELEOP" == 1 ]]; then TAG="${TAG}-teleop"; fi
-BUILD_ARGS=("WITH_TELEOP=${WITH_TELEOP}")
+BUILD_ARGS=()
 # ── 根据 jp_version 选择 base image  ────────────────────────
 # 表在 build_common.sh 的 jetpack_vars 里，build_perception.sh 共用同一份。
 jetpack_vars "${JP_VERSION}" || exit 1

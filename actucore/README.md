@@ -94,6 +94,8 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 
 MCP 与 SSE 共用 15730。启用 `teleop` 时，插件另在 15741 提供 PICO WSS 配对、状态与信令，并通过协商的 WebRTC 数据通道接收输入；这些仍属于同一 ActuCore 进程。15731 不用于这条遥操链路。
 
+MCP POST 要求单一、合法的 `Content-Length`，请求体上限 16 MiB、完整读取期限 10 秒；不支持 chunked 请求。非法长度、超限和超时分别返回 400/413/408，未提供长度返回 411。正常 JSON-RPC 与管理鉴权不变；该上限不用于 PICO RTC 姿态流。
+
 ## 构建与运行
 
 普通部署使用 `Dockerfile.jetson`；VLA 的本机模型能力取决于基础镜像。天轶新链路的 IK 位于 Driver，ActuCore 负责 PICO 通信与相对末端映射；两侧均可使用 CPU。仓库也提供 `Dockerfile.cpu` 用于隔离验证。CPU 验证镜像不提供完整本机 SmolVLA 环境，不能作为保留既有 GPU/VLA 能力的直接替代。
@@ -104,13 +106,15 @@ MCP 与 SSE 共用 15730。启用 `teleop` 时，插件另在 15741 提供 PICO 
 ./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
 ```
 
-标准 JP6.1 ActuCore 镜像直接包含 Pinocchio、SciPy、RTC 等遥操依赖，无需额外构建选项。Dockerfile 按既有 `JP_VERSION=61` 参数选择依赖；旧入口传入的 `WITH_TELEOP=0` 不会禁用 JP6.1 遥操。JP5.11 保持原 Python 环境，不安装遥操依赖；裸 Dockerfile 构建仍默认 JP5.11。依赖只安装到 ActuCore 应用镜像，不修改共享基础镜像。运行时 `plugins.teleop.enabled` 仍默认关闭。
+标准 JP6.1 ActuCore 镜像直接包含 Pinocchio、SciPy、RTC 等遥操依赖，无需额外构建选项。Dockerfile 按既有 `JP_VERSION=61` 参数选择依赖，已移除不再生效的 `--with-teleop` / `WITH_TELEOP` 及独立标签变体。JP5.11 保持原 Python 环境，不安装遥操依赖；裸 Dockerfile 构建仍默认 JP5.11。依赖只安装到 ActuCore 应用镜像，不修改共享基础镜像。运行时 `plugins.teleop.enabled` 仍默认关闭。
 
 CPU 专用验证镜像也直接安装遥操依赖，可用 `docker build -f actucore/Dockerfile.cpu -t local/actucore:teleop-cpu .` 或 `deploy/build_tianyi_actucore.sh LOCAL_IMAGE_TAG` 构建；无需修改现有脚本。CPU 镜像不作为普通 GPU/VLA 部署的替代。
 
 普通 JP6.1 Jetson 与 CPU 验证镜像构建都按固定清单获取签名 PICO release APK，无需新增构建开关。构建制品以确定性 gzip 发布，下载器先验证压缩包 SHA256，再解压并验证原 APK 的 SHA256 和大小；容器只向 Core 提供原 APK。Canvas 通过当前已注册的 teleop 服务代理下载，不让头显访问制品仓库。旧 debug APK 与 release 的签名不兼容，需操作者明确迁移；不会静默卸载或删除配对。安装过程和浏览器 deep link 仍需在实体 PICO 验收。
 
 JP6.1 与 CPU 验证构建通过 `deploy/fetch_g1_collision.py` 从项目 COS 获取固定上游提交的 G1 碰撞网格并逐文件核对 SHA256；JP5.11 不下载这些模型。控制循环不联网下载，缺失或损坏资产时拒绝 G1 初始化。G1 求解器依赖仍需另外满足，包含网格不表示已支持完整 G1 IK。
+
+体积记录（2026-09-22 registry ARM64 manifest）：`release.260922.3e993b5-jetson-jp6.1` 压缩层合计 9,217,592,312 B，前 29 层与当次 `jp61-torch` 基础镜像一致，基础层合计 9,124,251,313 B；全部应用层共 93,340,999 B，不全部归因于遥操。遥操依赖层 85,810,339 B、APK 层 2,381,531 B、G1 网格层 4,438,722 B，均为压缩口径，不与下表未压缩体积混用。普通镜像随包携带能力满足无需另选镜像即可在卡片启用的要求；保留 G1 legacy 数值依赖是本轮不迁移 G1 的兼容成本。CPU 镜像使用固定 ROS base 做隔离验收，不复制 Jetson CUDA/VLA 基础层，不作为新增生产服务；未用旧 CPU 镜像体积冒充本次构建结果。
 
 **同一份 Jetson Dockerfile，两个 base**；卡片源码共用，基础环境和可选依赖不同：
 

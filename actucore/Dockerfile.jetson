@@ -61,9 +61,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests
 
 # Teleop is included on JP6.1 in this same process, using VLA-compatible pins.
-# Keep the old build argument accepted; JP_VERSION now selects the dependencies,
-# including when the existing build script passes WITH_TELEOP=0.
-ARG WITH_TELEOP=0
+# JP_VERSION selects dependencies; no separate teleop build variant is needed.
 COPY actucore/plugins/teleop/requirements.bundle.lock /tmp/teleop-bundle.lock
 # Fetch the fixed, signed PICO APK as part of the ordinary image build.
 COPY actucore/openxr_capture_native/package-manifest.json /tmp/pico-package.json

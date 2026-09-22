@@ -207,6 +207,10 @@ _bundle: ActuCoreBundle | None = None
 
 def make_handler():
     class Handler(BaseHTTPRequestHandler):
+        # Card configs may be large, but HTTP bodies are never unbounded.
+        max_request_bytes = 16 * 1024 * 1024
+        request_body_timeout_s = 10.0
+
         def log_message(self, fmt, *args):
             if args and "/sse" in str(args[0]):
                 return
@@ -264,8 +268,54 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(length)
+            def framing_error(status, message):
+                self.close_connection = True
+                self._send(status, json.dumps({"error": message}))
+
+            lengths = self.headers.get_all("Content-Length", [])
+            if self.headers.get("Transfer-Encoding") is not None:
+                framing_error(400, "Transfer-Encoding is not supported")
+                return
+            if not lengths:
+                framing_error(411, "Content-Length is required")
+                return
+            if (len(lengths) != 1 or not lengths[0].isascii()
+                    or not lengths[0].isdecimal()):
+                framing_error(400, "Invalid Content-Length")
+                return
+            digits = lengths[0].lstrip('0') or '0'
+            if len(digits) > len(str(self.max_request_bytes)):
+                framing_error(413, "Request body too large")
+                return
+            length = int(digits)
+            if length > self.max_request_bytes:
+                framing_error(413, "Request body too large")
+                return
+            previous_timeout = self.connection.gettimeout()
+            try:
+                import time
+                deadline = time.monotonic() + self.request_body_timeout_s
+                raw = bytearray()
+                while len(raw) < length:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    self.connection.settimeout(remaining)
+                    chunk = self.rfile.read1(min(65536, length - len(raw)))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+            except TimeoutError:
+                framing_error(408, "Request body timed out")
+                return
+            except OSError:
+                self.close_connection = True
+                return
+            finally:
+                self.connection.settimeout(previous_timeout)
+            if len(raw) != length:
+                framing_error(400, "Incomplete request body")
+                return
 
             try:
                 rpc = json.loads(raw)
@@ -274,6 +324,10 @@ def make_handler():
                                             "error": {"code": -32700, "message": f"Parse error: {e}"}}))
                 return
 
+            if not isinstance(rpc, dict):
+                self._send(200, json.dumps({"jsonrpc": "2.0", "id": None,
+                                            "error": {"code": -32600, "message": "Invalid Request"}}))
+                return
             rid    = rpc.get("id")
             method = rpc.get("method", "")
             params = rpc.get("params") or {}

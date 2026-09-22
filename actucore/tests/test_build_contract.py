@@ -53,24 +53,22 @@ def run_build(build_env, *args, script='build_actucore.sh'):
     return result, calls(log)
 
 
-@pytest.mark.parametrize('args,legacy_flag,jp', [([], False, '511'),
-    (['--jp-version', '6.1'], False, '61'),
-    (['--jp-version', '6.1', '--with-teleop'], True, '61')])
-def test_existing_jetson_build_selects_version_without_new_flags(build_env, args, legacy_flag, jp):
+@pytest.mark.parametrize('args,jp', [([], '511'), (['--jp-version', '6.1'], '61')])
+def test_existing_jetson_build_selects_version_without_new_flags(build_env, args, jp):
     result, recorded = run_build(build_env, *args)
     assert result.returncode == 0, result.stderr
     assert len(recorded) == 1 and recorded[0][:2] == ['docker', 'build']
     command = recorded[0]
-    assert f'WITH_TELEOP={int(legacy_flag)}' in command
+    assert not any('WITH_TELEOP' in arg for arg in command)
     assert f'JP_VERSION={jp}' in command
     tag = command[command.index('--tag') + 1]
-    assert tag.endswith('-teleop') is legacy_flag
+    assert not tag.endswith('-teleop')
     assert all(part not in command for part in ('push', 'login', 'run', 'compose'))
 
 
-def test_unsupported_jetpack_fails_before_docker(build_env):
+def test_obsolete_teleop_flag_fails_before_docker(build_env):
     result, recorded = run_build(build_env, '--with-teleop')
-    assert result.returncode != 0 and 'requires JetPack 6.1' in result.stderr
+    assert result.returncode != 0 and 'Unknown option: --with-teleop' in result.stdout
     assert recorded == []
 
 
