@@ -46,6 +46,7 @@ SEARCHING = "searching"
 ARRIVED = "arrived"
 STUCK = "stuck"
 BLIND = "blind"          # no usable observation — distinct from "nothing seen"
+FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
 
 
@@ -79,7 +80,19 @@ class Config:
     vx_max: float = 0.4
     wz_max: float = 0.8
     search_rate: float = 0.4
-    search_timeout_s: float = 8.0
+    # Backstop only. The sweep below is what normally ends a search, because it
+    # is behavioural — "I have turned all the way round and it is not here" —
+    # whereas a clock says nothing about what the robot did with the time.
+    search_timeout_s: float = 30.0
+    # **How long the card may go without commanding any motion before the task
+    # is declared failed.** This replaces a per-phase wall-clock timeout, and
+    # the difference matters: a robot walking steadily towards something far
+    # away must never fail for taking a while, while a robot that has emitted
+    # nothing for ten seconds has plainly stopped making progress whatever the
+    # reason — blind, occluded, refused downstream, deciding nothing.
+    #
+    # Turning counts as motion. Publishing an all-zero twist does not.
+    idle_timeout_s: float = 10.0
     search_sweep_rad: float = 6.4        # a bit over one full turn
     lost_frames: int = 10
     max_obs_age_ms: int = 500
@@ -99,7 +112,10 @@ class State:
     searched_rad: float = 0.0
     commanded_vx: float = 0.0
     moving_for_s: float = 0.0
+    idle_for_s: float = 0.0
     arrived: bool = False
+    # Set once, read forever after: failure is terminal for one navigate_to.
+    failed_reason: str = ""
     notes: list = field(default_factory=list)
 
 
@@ -200,6 +216,12 @@ def _band_of(bearing: float) -> str:
 
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
+    return _account_idle(_decide(detections, depth, odom, config, state, dt),
+                         state, config, dt)
+
+
+def _decide(detections, depth, odom, config: Config, state: State,
+            dt: float) -> Decision:
     """One tick.
 
     `detections` — vop's latest payload, or None if stale/absent.
@@ -212,6 +234,10 @@ def step(*, detections, depth, odom, config: Config, state: State,
     """
     if state.arrived:
         return Decision(None, ARRIVED, "已到达，等待下一条指令")
+    if state.failed_reason:
+        # Terminal too. A failed task must keep reporting the same reason
+        # rather than quietly re-entering the loop on the next frame.
+        return Decision(None, FAILED, state.failed_reason)
 
     if not state.target:
         return Decision(None, IDLE, "没有导航目标")
@@ -268,11 +294,47 @@ def step(*, detections, depth, odom, config: Config, state: State,
 
     stuck = _stuck(odom, state, vx, dt, config)
     if stuck:
-        return Decision(None, STUCK, stuck, distance_m=distance, bearing=bearing)
+        state.failed_reason = stuck
+        return Decision(None, FAILED, stuck, distance_m=distance, bearing=bearing)
 
     state.commanded_vx = vx
     return Decision(_twist(vx, wz), status, reason,
                     distance_m=distance, bearing=bearing)
+
+
+def _account_idle(decision: Decision, state: State, config: Config,
+                  dt: float) -> Decision:
+    """Turn "has not moved for a while" into a failure, and nothing else into one.
+
+    Deliberately not a per-phase wall clock. A robot walking steadily towards
+    something thirty metres away is working, and a timeout on "how long has this
+    navigate_to been running" would kill it for succeeding slowly. What actually
+    distinguishes a stuck task is that **no motion is being commanded** — and
+    that one test covers every way of getting there at once: blind, occluded,
+    refused downstream, or simply deciding nothing, without this function having
+    to enumerate them.
+
+    Turning counts as motion; an all-zero twist does not. Arriving is exempt —
+    it is a success that happens to command zero.
+    """
+    if decision.status in (ARRIVED, FAILED, IDLE):
+        return decision
+
+    moving = decision.values is not None and any(abs(v) > 1e-6
+                                                 for v in decision.values)
+    if moving:
+        state.idle_for_s = 0.0
+        return decision
+
+    state.idle_for_s += dt
+    if state.idle_for_s < config.idle_timeout_s:
+        return decision
+
+    state.failed_reason = (
+        f"{config.idle_timeout_s:.0f} 秒内没有发出任何运动指令"
+        f"（最后状态：{decision.status} —— {decision.reason}），判定任务失败")
+    return Decision(None, FAILED, state.failed_reason,
+                    distance_m=decision.distance_m, bearing=decision.bearing)
 
 
 def _avoid(vx, wz, bands, config: Config, status, reason):
@@ -330,12 +392,18 @@ def _search(config: Config, state: State, dt: float) -> Decision:
     wz = -config.search_rate * state.last_seen_side
     state.searched_rad += abs(wz) * dt
 
+    # Exhausted searches used to go quiet, which left the caller with no answer
+    # at all — the task neither succeeded nor failed, and only the ACP timeout
+    # eventually noticed. "I turned all the way round and it is not here" is a
+    # result, and the caller is owed it.
     if state.searched_rad >= config.search_sweep_rad:
-        return Decision(None, SEARCHING,
-                        f"转过 {state.searched_rad:.1f} rad 仍未看到目标，停止")
+        state.failed_reason = (f"转过 {state.searched_rad:.1f} rad 仍未看到 "
+                               f"{state.target!r}，目标不在视野内")
+        return Decision(None, FAILED, state.failed_reason)
     if state.searching_for_s >= config.search_timeout_s:
-        return Decision(None, SEARCHING,
-                        f"搜索 {state.searching_for_s:.1f}s 未果，停止")
+        state.failed_reason = (f"搜索 {state.searching_for_s:.0f}s 未找到 "
+                               f"{state.target!r}")
+        return Decision(None, FAILED, state.failed_reason)
 
     return Decision(_twist(0.0, wz), SEARCHING,
                     f"目标丢失，朝最后出现的一侧转找")

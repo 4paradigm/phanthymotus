@@ -130,7 +130,7 @@ class NaviPlugin:
         self._odom = None
         self._odom_ms = 0
         self._binding = {}
-        self._acp_notify = None
+        self._acp_action_id = ""
 
     # ── tool ─────────────────────────────────────────────────────────────────
 
@@ -389,6 +389,12 @@ class NaviPlugin:
             # that is no longer being chased.
             self._state = policy_mod.State(target=target)
             self._paused = False
+            # agent-core passes this for any action declaring x-completion.
+            # Without storing it the card can never report back, which is the
+            # state this was in until it was noticed: `x-completion` declared,
+            # `_acp_notify` never assigned, so the promise was never kept and
+            # only the 300s ACP timeout ever closed the action.
+            self._acp_action_id = (args.get("action_id") or "").strip()
         log.info("navi navigate_to: target=%r", target)
         return {"state": "running", "target": target, "topic": self._topic,
                 "stop_distance_m": self._config.stop_distance_m,
@@ -712,13 +718,57 @@ class NaviPlugin:
         self._maybe_complete()
 
     def _maybe_complete(self):
-        """Push the ACP completion once, when the target has been reached."""
+        """Report the outcome once, on arrival **or** failure.
+
+        Both are answers the caller is owed. Reporting only success is how an
+        action that failed sits open until the ACP timeout, holding the barrier
+        and telling nobody why.
+        """
         decision = self._last_decision
-        if decision is None or decision.status != policy_mod.ARRIVED:
+        if decision is None:
             return
-        notify, self._acp_notify = self._acp_notify, None
-        if notify is not None:
-            try:
-                notify(decision)
-            except Exception as error:                        # noqa: BLE001
-                log.warning("navi ACP callback failed: %s", error)
+        if decision.status == policy_mod.ARRIVED:
+            status = "completed"
+        elif decision.status == policy_mod.FAILED:
+            status = "failed"
+        else:
+            return
+
+        with self._lock:
+            action_id, self._acp_action_id = self._acp_action_id, ""
+        if not action_id:
+            return
+
+        result = {"status": decision.status, "reason": decision.reason,
+                  "target": self._state.target,
+                  "distance_m": decision.distance_m}
+        threading.Thread(target=self._post_acp, args=(action_id, status, result),
+                         daemon=True, name="navi_acp").start()
+
+    def _post_acp(self, action_id: str, status: str, result: dict):
+        """POST the completion to agent-core, off the timer thread.
+
+        On a thread because this runs from the publish tick: a slow or hanging
+        HTTP call here would stall the command stream, and a stalled stream is
+        a robot whose watchdog stops it — a network hiccup must not become a
+        motion fault.
+        """
+        import json as _json
+        import os as _os
+        import ssl as _ssl
+        import urllib.request as _urllib
+
+        url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+        context = _ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = _ssl.CERT_NONE
+        payload = _json.dumps({"action_id": action_id, "status": status,
+                               "result": result, "tool": "navi",
+                               "ts": time.time()}).encode()
+        request = _urllib.Request(f"{url}/api/acp/complete", data=payload,
+                                  headers={"Content-Type": "application/json"})
+        try:
+            _urllib.urlopen(request, timeout=10, context=context).read()
+            log.info("navi ACP %s: %s", status, result.get("reason"))
+        except Exception as error:                            # noqa: BLE001
+            log.warning("navi ACP callback failed: %s", error)

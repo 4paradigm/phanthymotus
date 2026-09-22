@@ -279,7 +279,9 @@ def test_commanded_but_not_moving_is_stuck():
     for _ in range(5):
         decision = _step(detections=_detections(_obj(x=0.0)), depth=_depth(),
                          odom={"vx": 0.0}, config=config, state=state, dt=0.1)
-    assert decision.status == P.STUCK
+    # STUCK is a *reason*; the terminal status the caller sees is FAILED.
+    assert decision.status == P.FAILED
+    assert "被挡住" in decision.reason
     assert decision.publishes is False
 
 
@@ -486,4 +488,85 @@ def test_a_target_at_the_stop_distance_is_not_halted_by_itself():
                                    "right": 5.0},
                                   map_=_solid_depth(c.stop_distance_m)),
                      config=c, state=state)
+    assert decision.status == P.ARRIVED
+
+
+# ── terminal conditions ──────────────────────────────────────────────────────
+
+def test_idle_for_too_long_fails_the_task():
+    """The replacement for a per-phase wall clock: no motion commanded for
+    `idle_timeout_s` means the task has stopped making progress, whatever the
+    reason — and one test covers blind, occluded and refused all at once."""
+    config = _cfg(idle_timeout_s=1.0)
+    state = _state()
+    for _ in range(12):
+        decision = _step(detections=None, depth=_depth(),   # blind
+                         config=config, state=state, dt=0.1)
+    assert decision.status == P.FAILED
+    assert "没有发出任何运动指令" in decision.reason
+
+
+def test_a_slow_but_moving_approach_never_times_out():
+    """A robot walking steadily towards something far away is working. A clock
+    on 'how long has this navigate_to run' would kill it for succeeding slowly."""
+    config = _cfg(idle_timeout_s=1.0)
+    state = _state()
+    for _ in range(200):
+        decision = _step(detections=_detections(_obj(x=0.0)), depth=_depth(),
+                         config=config, state=state, dt=0.1)
+    assert decision.status == P.APPROACHING
+    assert state.idle_for_s == 0.0
+
+
+def test_turning_counts_as_motion():
+    """While aligning, vx is zero but the robot is moving."""
+    config = _cfg(idle_timeout_s=1.0)
+    state = _state()
+    for _ in range(50):
+        decision = _step(detections=_detections(_obj(x=0.9)), depth=_depth(),
+                         config=config, state=state, dt=0.1)
+    assert decision.status == P.ALIGNING
+    assert state.idle_for_s == 0.0
+
+
+def test_a_brief_blind_spell_does_not_fail():
+    config = _cfg(idle_timeout_s=5.0)
+    state = _state()
+    for _ in range(10):
+        _step(detections=None, depth=_depth(), config=config, state=state, dt=0.1)
+    decision = _step(detections=_detections(_obj(x=0.0)), depth=_depth(),
+                     config=config, state=state, dt=0.1)
+    assert decision.status == P.APPROACHING
+    assert state.idle_for_s == 0.0
+
+
+def test_an_exhausted_search_fails_rather_than_going_quiet():
+    """It used to just stop emitting, leaving the caller with no answer at all
+    — neither success nor failure, only the ACP timeout eventually noticing."""
+    config = _cfg(search_sweep_rad=1.0, search_rate=1.0, idle_timeout_s=1e6)
+    state = _state(missing_frames=20)
+    for _ in range(15):
+        decision = _step(detections=_detections(), depth=_depth(),
+                         config=config, state=state, dt=0.1)
+    assert decision.status == P.FAILED
+    assert "chair" in decision.reason
+
+
+def test_failure_is_terminal_and_keeps_its_reason():
+    """A failed task must not quietly re-enter the loop on the next frame."""
+    state = _state(failed_reason="测试原因")
+    for _ in range(5):
+        decision = _step(detections=_detections(_obj(x=0.0)), depth=_depth(),
+                         state=state)
+        assert decision.status == P.FAILED and decision.reason == "测试原因"
+
+
+def test_arriving_is_not_counted_as_idleness():
+    """Arriving commands a zero on purpose; it is a success, not a stall."""
+    config = _cfg(idle_timeout_s=0.2)
+    state = _state()
+    depth = _depth(map_=_solid_depth(0.8))
+    for _ in range(10):
+        decision = _step(detections=_detections(_obj(x=0.0)), depth=depth,
+                         config=config, state=state, dt=0.1)
     assert decision.status == P.ARRIVED
