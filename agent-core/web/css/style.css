@@ -5723,6 +5723,39 @@ html, body {
   gap: 8px;
   padding: 3px 0;
 }
+.network-iface-uplink {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  /* Tinted, because "which interface is actually carrying traffic" is the one
+     row on this card that people scan for when nothing can reach the machine. */
+  background: color-mix(in srgb, var(--warn, #c98a2b) 12%, transparent);
+}
+.network-iface-uplink.is-active {
+  background: color-mix(in srgb, var(--ok, #3fa45b) 12%, transparent);
+}
+.network-iface-uplink .network-iface-label {
+  min-width: 0;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.network-prefer-uplink {
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated, transparent);
+  color: var(--text);
+  cursor: pointer;
+}
+.network-prefer-uplink:hover:not(:disabled) { border-color: var(--accent); }
+.network-prefer-uplink:disabled { opacity: 0.6; cursor: default; }
+
 .network-iface-policy-route {
   display: flex;
   align-items: center;

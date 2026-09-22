@@ -120,9 +120,63 @@ def _bytes_to_ssid(ssid_bytes) -> str:
     return bytes(ssid_bytes).decode('utf-8', errors='replace')
 
 
+def _default_routes() -> dict:
+    """`{interface: metric}` for every default route the kernel currently holds.
+
+    NetworkManager's per-device `Gateway` property says a device *has* a gateway
+    configured. It does not say that gateway is the one carrying traffic, and on
+    a robot those are routinely different things: the wired port goes to the
+    robot's own body network, which has a static gateway that routes nowhere,
+    while WiFi is the only way out. Both devices then report a gateway and look
+    equally healthy.
+
+    Which one wins is decided by metric, and the default metrics are against us:
+    NetworkManager gives Ethernet 100 and WiFi 600, so the body link beats the
+    office WiFi on every robot wired this way, and nothing in this API used to
+    say so. Measured on r1_sz: `default via 192.168.123.1 dev eth10 metric
+    20100` ahead of `default via 10.100.128.1 dev wlan0 metric 20600`, with
+    192.168.123.1 not answering so much as a ping — no DNS, no image pulls, and
+    a driver marketplace that reported "no drivers found".
+
+    Read from /proc/net/route rather than by running `ip`: agent-core runs with
+    `network_mode: host`, so this is the host's real table, and it needs no
+    binary that may not be in the image.
+    """
+    routes: dict = {}
+    try:
+        with open('/proc/net/route') as handle:
+            next(handle, None)                      # header
+            for line in handle:
+                fields = line.split()
+                if len(fields) < 7:
+                    continue
+                iface, destination, _gw, _flags, _rc, _use, metric = fields[:7]
+                # Destination 00000000 is 0.0.0.0/0 — a default route.
+                if destination != '00000000':
+                    continue
+                value = int(metric)
+                # Lowest metric wins, so a device with several keeps the best.
+                if iface not in routes or value < routes[iface]:
+                    routes[iface] = value
+    except Exception:
+        return {}
+    return routes
+
+
+def _internet_device() -> str:
+    """The interface that currently carries traffic to the internet, or ''."""
+    routes = _default_routes()
+    return min(routes, key=routes.get) if routes else ''
+
+
 def _get_devices_sync() -> list[dict]:
     """Get all network devices with status, including IP/mask/gateway/MAC."""
     bus = _get_bus()
+    # Read once, outside the loop: the table cannot change meaningfully within
+    # one enumeration, and re-reading per device would let two devices disagree
+    # about which of them holds the default route.
+    default_routes = _default_routes()
+    winner = min(default_routes, key=default_routes.get) if default_routes else ''
     devices_paths = _get_prop(bus, NM_PATH, NM_IFACE, 'Devices')
     results = []
     for dev_path in devices_paths:
@@ -200,6 +254,13 @@ def _get_devices_sync() -> list[dict]:
             'mask': mask,
             'gateway': gateway,
             'policy_route': policy_route,
+            # Which default route this device holds, and whether it is the one
+            # actually used. `gateway` alone cannot answer that, and on a
+            # multi-homed robot the difference is the whole question — see
+            # `_default_routes`.
+            'route_metric': default_routes.get(iface_name),
+            'default_route': iface_name in default_routes,
+            'carries_internet': bool(winner) and iface_name == winner,
         })
     return results
 
@@ -331,7 +392,56 @@ def _connect_wifi_sync(ssid: str, password: str, auto_connect: bool) -> str:
     nm_iface = dbus.Interface(nm_obj, NM_IFACE)
     nm_iface.AddAndActivateConnection(conn_settings, dbus.ObjectPath(wifi_path), dbus.ObjectPath(target_ap))
 
-    return f'已连接到 {ssid}'
+    wifi_name = str(_get_prop(bus, wifi_path, NM_DEVICE_IFACE, 'Interface') or '')
+    return f'已连接到 {ssid}' + _uplink_warning(wifi_name)
+
+
+def _uplink_warning(wifi_iface: str, settle_s: float = 6.0) -> str:
+    """Whether associating with this AP actually gave the machine a way out.
+
+    Associating and having internet are different facts, and reporting only the
+    first is how a machine ends up looking configured while nothing can reach
+    it. The wired port on a robot usually goes to the robot's own body network,
+    whose gateway routes nowhere; NetworkManager's default metrics (Ethernet
+    100, WiFi 600) hand that link the default route, so WiFi connects, reports
+    success, and changes nothing. Seen on r1_sz, where the symptom that finally
+    got noticed was an empty driver marketplace.
+
+    Returns '' when WiFi did win, so the ordinary case reads exactly as before.
+
+    Deliberately a **warning, not a repair**. Lowering the WiFi metric here
+    would silently demote the wired uplink, and on a robot that has a real
+    wired uplink that is the wrong answer — there is no way to tell the two
+    apart from inside this function. Naming the interface that holds the route
+    is enough for an operator to decide.
+    """
+    import time as _time
+
+    if not wifi_iface:
+        return ''
+    # DHCP has to finish before the route exists; polling beats one fixed sleep
+    # because the usual case resolves in well under a second.
+    # Read first, then poll — a do-while, not a while. With `settle_s` already
+    # elapsed the loop body would never run, and the function would report "no
+    # default route at all" no matter what the table says.
+    deadline = _time.monotonic() + settle_s
+    routes = _default_routes()
+    while wifi_iface not in routes and _time.monotonic() < deadline:
+        _time.sleep(0.5)
+        routes = _default_routes()
+
+    if not routes:
+        return '（注意：这台机器没有任何默认路由，仍然无法上网）'
+    winner = min(routes, key=routes.get)
+    if winner == wifi_iface:
+        return ''
+    if wifi_iface not in routes:
+        return (f'（注意：WiFi 已关联但没有拿到默认路由，出网仍然走 {winner}；'
+                f'如果 {winner} 接的是机器人本体，这台机器上不了网）')
+    return (f'（注意：出网仍然走 {winner}，它的路由优先级更高'
+            f'（metric {routes[winner]} < WiFi 的 {routes[wifi_iface]}）。'
+            f'如果 {winner} 接的是机器人本体，那条路由不通，'
+            f'请去掉它的默认网关或调高它的 metric）')
 
 
 def _disconnect_wifi_sync():
@@ -600,6 +710,95 @@ def _set_policy_route_sync(device: str, enable: bool):
 
 
 
+def _set_route_priority_sync(device: str, prefer: bool):
+    """Make `device` win (or stop winning) the race for the default route.
+
+    The repair for the situation `_uplink_warning` reports. It exists as a
+    button because the people who hit this are not the people who can edit
+    `/etc/netplan` over SSH: on r1_sz the wired port went to the robot's body
+    network, whose static gateway answers nothing, and NetworkManager's default
+    metrics (Ethernet 100, WiFi 600) handed that dead link every packet the
+    machine sent. WiFi was associated and healthy the whole time.
+
+    Implemented as `ipv4.route-metric` on **this** connection only — the
+    narrowest change that fixes it:
+
+    * it touches one profile, the one the operator is looking at;
+    * it is fully reversible (`prefer=False` restores NetworkManager's default,
+      `-1`), and reversible *without* knowing what the value used to be;
+    * it leaves the other interface's profile alone. Setting `never-default` on
+      the wired side would be the more correct statement about a body link, but
+      it requires being sure the wired port *is* a body link, and nothing here
+      can tell that apart from a real wired uplink.
+
+    Deliberately **not** automatic — see `_uplink_warning`. A robot with a
+    genuine wired uplink should keep it, and only a person knows which kind of
+    robot this is.
+
+    The new metric is taken below whatever currently wins rather than fixed at
+    some small constant, so this works regardless of what the other side is
+    using, and floors at 1 because 0 means "let the kernel decide".
+    """
+    import dbus
+    import time
+    bus = _get_bus()
+    dev_path = _find_device_path_sync(bus, device)
+    if not dev_path:
+        raise RuntimeError(f'未找到设备 "{device}"')
+
+    active_conn_path = str(_get_prop(bus, dev_path, NM_DEVICE_IFACE, 'ActiveConnection'))
+    if not active_conn_path or active_conn_path == '/':
+        raise RuntimeError(f'设备 "{device}" 当前没有活动连接')
+    settings_path = str(_get_prop(bus, active_conn_path, NM_ACTIVE_IFACE, 'Connection'))
+
+    conn_obj = bus.get_object(NM_IFACE, settings_path)
+    conn_iface = dbus.Interface(conn_obj, NM_CONN_IFACE)
+    settings = conn_iface.GetSettings()
+    ipv4 = settings.setdefault('ipv4', dbus.Dictionary({}, signature='sv'))
+
+    if prefer:
+        routes = _default_routes()
+        others = {k: v for k, v in routes.items() if k != device}
+        # Nothing else is competing: whatever NM chose is already fine, and
+        # writing a metric would be a change with no effect to undo later.
+        if not others:
+            raise RuntimeError(
+                f'没有别的接口在争默认路由，"{device}" 已经是出网接口了')
+        target = max(1, min(others.values()) - 50)
+        ipv4['route-metric'] = dbus.Int64(target)
+    else:
+        # -1 is NetworkManager's "use the built-in default for this device type",
+        # which is the state before anyone pressed this button. Removing the key
+        # would work too, but writing -1 says so explicitly in the profile.
+        ipv4['route-metric'] = dbus.Int64(-1)
+
+    conn_iface.Update(settings)
+
+    try:
+        dev_iface = dbus.Interface(bus.get_object(NM_IFACE, dev_path), NM_DEVICE_IFACE)
+        dev_iface.Reapply(dbus.Dictionary({}, signature='sa{sv}'), dbus.UInt64(0), dbus.UInt32(0))
+    except Exception:
+        # Older NM may not pick up route-metric from Reapply. Costs a brief link
+        # drop, which is acceptable for a button the operator just pressed.
+        nm_iface = dbus.Interface(bus.get_object(NM_IFACE, NM_PATH), NM_IFACE)
+        nm_iface.DeactivateConnection(dbus.ObjectPath(active_conn_path))
+        time.sleep(1)
+        nm_iface.ActivateConnection(
+            dbus.ObjectPath(settings_path), dbus.ObjectPath(dev_path), dbus.ObjectPath('/'))
+
+    # Report what actually happened rather than what was asked for: Reapply can
+    # return cleanly and still leave the table unchanged, and "已设置" on a
+    # machine that still cannot reach anything is the failure this whole change
+    # is about.
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        if (_internet_device() == device) == prefer:
+            break
+        time.sleep(0.5)
+    return {'device': device, 'carries_internet': _internet_device() == device,
+            'routes': _default_routes()}
+
+
 def _get_saved_wifi_sync() -> list[dict]:
     """List saved WiFi connections from NetworkManager."""
     import dbus
@@ -784,6 +983,29 @@ async def wifi_forget(name: str):
 class PolicyRouteRequest(BaseModel):
     device: str
     enable: bool
+
+
+class RoutePriorityRequest(BaseModel):
+    device: str
+    prefer: bool
+
+
+@router.post('/route-priority')
+async def set_route_priority(req: RoutePriorityRequest):
+    """让指定接口优先出网（prefer=true），或恢复系统默认优先级（false）。
+
+    多网口机器人上，接机器人本体的那张网卡常常带着一个不通的静态网关，而
+    NetworkManager 默认给以太网的 metric 比 WiFi 低，于是本体那条线赢走所有出
+    网流量 —— WiFi 显示已连接，机器却上不了网。这个接口就是那种情况的修复入口，
+    存在的理由是：碰到这个问题的人未必能去 SSH 改 netplan。
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            None, _set_route_priority_sync, req.device, req.prefer)
+        return {'code': 200, 'data': {'success': True, **(data or {})}}
+    except Exception as e:
+        return {'code': 500, 'data': {'error': str(e), 'success': False}}
 
 
 @router.post('/policy-route')
