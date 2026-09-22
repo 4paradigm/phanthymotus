@@ -232,9 +232,17 @@ async def stream_request(
                     )
                 chunks.append(chunk)
             body = b"".join(chunks)
+            # Rebuild headers without encoding/length that refer to the
+            # *compressed* wire body.  aiter_bytes() already content-decoded,
+            # so carrying Content-Encoding / Content-Length from the original
+            # response causes httpx to attempt a second decode (DecodingError).
+            new_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in ("content-encoding", "content-length")
+            }
             return httpx.Response(
                 status_code=resp.status_code,
-                headers=resp.headers,
+                headers=new_headers,
                 content=body,
                 request=resp.request,
             )

@@ -171,7 +171,7 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
                     if name in fresh_exact:
                         repo_summary["available"].append(name)
                         continue
-                except Exception:
+                except Exception as exc:
                     pass
                 logger.warning(
                     "label bootstrap create failed for %s %s: %s",
@@ -192,6 +192,73 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
         summary[repo] = repo_summary
 
     return summary
+
+
+async def _resolve_active_repos(
+    github: GitHubClient, desired_repos: list[str],
+) -> list[str]:
+    """Resolve ACTIVE_REPOS = desired ∩ installation repositories.
+
+    Required repo: 4paradigm/phanthymotus
+    Optional repo:  4paradigm/phanthymotus-driver
+
+    Fails startup if the required repo is not authorized.
+    """
+    authorized_names = await github.list_installation_repositories()
+    authorized_set = set(authorized_names)
+    active: list[str] = []
+    inactive: list[str] = []
+    for repo in desired_repos:
+        if repo in authorized_set:
+            active.append(repo)
+        else:
+            inactive.append(repo)
+    # Required repo check
+    required = "4paradigm/phanthymotus"
+    if required not in active:
+        raise RuntimeError(
+            f"required repo {required!r} is not authorized for this GitHub App "
+            f"installation. Active repos: {active}. Inactive desired repos: {inactive}."
+        )
+    logger.info("github desired repos: %s", desired_repos)
+    logger.info("github authorized desired repos: %s", active)
+    if inactive:
+        logger.info("github inactive desired repos: %s", inactive)
+    return active
+
+
+
+async def _lifespan_cleanup(watcher, controller, github, registry, github_auth):
+    """Best-effort cleanup for every lifespan exit path.
+
+    Each step is independently try/except so that a cleanup failure
+    never masks the original startup or shutdown exception.
+    """
+    try:
+        await watcher.stop()
+    except Exception as exc:
+        logger.warning("lifespan cleanup watcher.stop failed: %s", type(exc).__name__)
+
+    try:
+        close = getattr(controller, "aclose", None)
+        if close is not None:
+            await close()
+    except Exception as exc:
+        logger.warning("lifespan cleanup controller.aclose failed: %s", type(exc).__name__)
+
+    for name, client in (("github", github), ("registry", registry)):
+        try:
+            http = getattr(client, "http", None)
+            aclose = getattr(http, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        except Exception as exc:
+            logger.warning("lifespan cleanup %s http close failed: %s", name, type(exc).__name__)
+
+    try:
+        await github_auth.close()
+    except Exception as exc:
+        logger.warning("lifespan cleanup github_auth.close failed: %s", type(exc).__name__)
 
 
 def create_app(config: Config | None = None):
@@ -232,26 +299,32 @@ def create_app(config: Config | None = None):
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Resolve ACTIVE_REPOS at startup (fresh from installation) — must be inside
+        # lifespan so we can properly await the async function.
+        desired_repos = list(config.github_repos)
         try:
-            await _bootstrap_status_labels(github)
-        except Exception:
-            logger.warning(
-                "label bootstrap failed (best-effort); watcher starting without label projection",
-            )
-        watcher.start()
-        try:
+            active_repos = await _resolve_active_repos(github, desired_repos)
+            # config.github_repos now becomes ACTIVE_REPOS for all runtime code
+            config.github_repos = active_repos
+            try:
+                await _bootstrap_status_labels(github)
+            except Exception as exc:
+                logger.warning(
+                    "label bootstrap failed "
+                    "(best-effort); watcher starting "
+                    "without label projection: %s",
+                    type(exc).__name__,
+                )
+            watcher.start()
             yield
         finally:
-            await watcher.stop()
-            close = getattr(controller, "aclose", None)
-            if close is not None:
-                await close()
-            for client in (github, registry):
-                http = getattr(client, "http", None)
-                aclose = getattr(http, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-            await github_auth.close()
+            await _lifespan_cleanup(
+                watcher,
+                controller,
+                github,
+                registry,
+                github_auth,
+            )
 
     app = FastAPI(title="Deploy Approval Agent", lifespan=lifespan)
     app.state.config = config

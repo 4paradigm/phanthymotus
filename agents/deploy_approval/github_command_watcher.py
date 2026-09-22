@@ -34,6 +34,40 @@ class DeployCommandError(Exception):
     """Raised when a command cannot be processed."""
 
 
+def _needs_initial_comment_baseline(state: dict | None) -> bool:
+    """Determine if a PR needs an initial comment baseline cycle.
+
+    Returns True when:
+    1. state is None (never observed)
+    2. state exists but is the "empty reconcile" state:
+       last_processed_comment_id == 0
+       command.comment_id == 0
+       command.kind == ""
+       command.phase == "completed"
+       command.args == {}
+
+    This allows recovery when baseline persistence failed silently.
+    """
+    if state is None:
+        return True
+    if not isinstance(state, dict):
+        return False
+    if state.get("last_processed_comment_id") != 0:
+        return False
+    cmd = state.get("command")
+    if not isinstance(cmd, dict):
+        return False
+    if cmd.get("comment_id") != 0:
+        return False
+    if cmd.get("kind") != "":
+        return False
+    if cmd.get("phase") != "completed":
+        return False
+    if cmd.get("args") != {}:
+        return False
+    return True
+
+
 class GitHubCommandWatcher:
     """Polls PR comments using `POLL_INTERVAL_SECONDS` and dispatches commands.
 
@@ -107,7 +141,116 @@ class GitHubCommandWatcher:
 
         After one recognized command is dispatched, stops processing that PR
         for the current poll cycle.
+
+        First-observation safety: when no Deploy Approval hidden state exists
+        yet, baseline the cursor to the maximum comment id observed so GitHub
+        will not replay historical commands on a future restart.
+
+        Baseline-incomplete recovery: when hidden state exists but still
+        represents an un-consumed reconcile-initial state (cursor=0, empty
+        command), the watcher re-runs the baseline cycle.  This prevents
+        historical commands from being replayed after a transient
+        persist_cursor failure.
         """
+        initial_state = await self.proxy.read_hidden_state(repo, pr_number)
+
+        if _needs_initial_comment_baseline(initial_state):
+            # --- First-observation / baseline-incomplete path ---
+            pr_info = await self.proxy.get_pr(repo, pr_number)
+            if not pr_info or pr_info.get("state") != "open":
+                # Closed / merged PR without usable state — reconcile if
+                # appropriate but do NOT dispatch any commands.
+                if initial_state is None:
+                    await self.controller.reconcile_pr(repo, pr_number)
+                return
+
+            # BEFORE reconcile: snapshot current comments.
+            try:
+                comments_before = await self.proxy.get_issue_comments(repo, pr_number)
+            except Exception as e:
+                logger.warning(
+                    "watcher baseline snapshot-before %s#%s: %s — fail closed",
+                    repo, pr_number, e,
+                )
+                return
+
+            max_cid_before = 0
+            for c in comments_before:
+                cid = c.get("id")
+                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_before:
+                    max_cid_before = cid
+
+            # Reconcile (may create lifecycle hidden state).
+            try:
+                await self.controller.reconcile_pr(repo, pr_number)
+            except Exception as e:
+                logger.warning(
+                    "watcher reconcile %s#%s: %s — skip baseline this cycle",
+                    repo, pr_number, e,
+                )
+                return
+
+            # After reconcile: fresh read state.
+            state_after = await self.proxy.read_hidden_state(repo, pr_number)
+            if state_after is None:
+                # reconcile did not create state — abort this cycle
+                return
+
+            # AFTER reconcile: second snapshot to capture lifecycle bot
+            # comments created by reconcile, plus any race new comments.
+            try:
+                comments_after = await self.proxy.get_issue_comments(repo, pr_number)
+            except Exception as e:
+                logger.warning(
+                    "watcher baseline snapshot-after %s#%s: %s — fail closed",
+                    repo, pr_number, e,
+                )
+                return
+
+            max_cid_after = 0
+            for c in comments_after:
+                cid = c.get("id")
+                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_after:
+                    max_cid_after = cid
+
+            baseline_id = max(max_cid_before, max_cid_after)
+
+            # Persist baseline cursor.
+            try:
+                persisted = await self.proxy.persist_cursor(repo, pr_number, baseline_id)
+            except Exception as e:
+                logger.warning(
+                    "watcher persist baseline %s#%s: %s — fail closed",
+                    repo, pr_number, e,
+                )
+                return
+
+            # Verify persistence succeeded at least as far as requested.
+            if not isinstance(persisted, dict):
+                logger.warning(
+                    "watcher persist baseline %s#%s returned %s — fail closed",
+                    repo, pr_number, type(persisted).__name__,
+                )
+                return
+            persisted_cid = persisted.get("last_processed_comment_id")
+            if not isinstance(persisted_cid, int) or isinstance(persisted_cid, bool):
+                logger.warning(
+                    "watcher persist baseline %s#%s invalid cursor — fail closed",
+                    repo, pr_number,
+                )
+                return
+            if persisted_cid < baseline_id:
+                logger.warning(
+                    "watcher persist baseline %s#%s cursor %s < requested %s — fail closed",
+                    repo, pr_number, persisted_cid, baseline_id,
+                )
+                return
+
+            # Baseline persisted successfully — but DO NOT dispatch commands
+            # in this cycle. Next cycle will process comments > baseline_id.
+            return
+
+        # Existing state PR — normal processing path.
         await self.controller.reconcile_pr(repo, pr_number)
         state = await self.proxy.read_hidden_state(repo, pr_number)
         if state is None:

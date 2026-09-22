@@ -69,6 +69,9 @@ class GitHubClient:
 
         Each request obtains a fresh token from ``self._token_provider()``.
         No long-lived Authorization header is mutated on the client.
+
+        Accepts both relative paths (e.g. ``/repos/...``) and absolute URLs.
+        Absolute URLs are passed through verbatim (no double-prefixing).
         """
         if self._token_provider is not None:
             token = await self._token_provider()
@@ -78,11 +81,34 @@ class GitHubClient:
         headers["Authorization"] = "Bearer " + token
         headers.setdefault("Accept", "application/vnd.github+json")
         headers.setdefault("X-GitHub-Api-Version", "2026-03-10")
-        url = self.api(path.lstrip("/"))
+        url = self._resolve_api_url(path)
         require_http_policy(url, self.config, allow_private=self.config.allow_private_http)
         return await stream_request(
             self.http, method, url, self.config.max_response_bytes,
             headers=headers, **kwargs)
+
+    def _resolve_api_url(self, path: str) -> str:
+        """Resolve a path to a full URL without double-prefixing.
+
+        - Relative paths (starting with /) are joined with github_api_url.
+        - Absolute URLs are returned as-is after origin validation.
+        """
+        from urllib.parse import urlparse
+        parsed = urlparse(path)
+        if parsed.scheme and parsed.netloc:
+            # Absolute URL — validate origin
+            config_origin = self.config.github_api_url.rstrip("/")
+            url_origin = parsed.scheme + "://" + parsed.netloc.rstrip("/")
+            if url_origin != config_origin:
+                raise GitHubError(
+                    f"absolute URL origin {url_origin!r} does not match "
+                    f"configured github_api_url origin {config_origin!r}"
+                )
+            if parsed.username or parsed.password:
+                raise GitHubError("absolute URL must not contain userinfo")
+            return path
+        # Relative path — join with configured API URL
+        return self.api(path.lstrip("/"))
 
     def api(self, path: str) -> str:
         return self.config.github_api_url.rstrip("/") + "/" + path.lstrip("/")
@@ -118,7 +144,8 @@ class GitHubClient:
         (the raw response byte cap already applies per page). Beyond any cap the
         call is refused fail-closed (never an unlimited in-memory scan).
         """
-        url = self.api(f"/repos/{repo}/issues/{pr_number}/comments")
+        path = f"/repos/{repo}/issues/{pr_number}/comments"
+        url = self.api(path)
         require_http_policy(
             url, self.config, allow_private=self.config.allow_private_http
         )
@@ -167,13 +194,14 @@ class GitHubClient:
         seen: dict[int, dict] = {}
         page = 1
         while True:
-            url = self.api(f"/repos/{repo}/pulls")
+            path = f"/repos/{repo}/pulls"
+            url = self.api(path)
             require_http_policy(
                 url, self.config,
                 allow_private=self.config.allow_private_http
             )
             resp = await self._request(
-                "GET", url,
+                "GET", path,
                 params={
                     "state": "open",
                     "sort": "updated",
@@ -271,14 +299,14 @@ class GitHubClient:
         head_repo = (pr.get("head") or {}).get("repo") or {}
         head_full_name = head_repo.get("full_name", "") or repo
         # Read file from the exact head SHA
-        url = self.api(
-            f"/repos/{head_full_name}/contents/{path.lstrip('/')}"
-            f"?ref={head_sha}"
+        file_path = "/repos/%s/contents/%s?ref=%s" % (
+            head_full_name, path.lstrip("/"), head_sha
         )
+        url = self.api(file_path)
         require_http_policy(
             url, self.config, allow_private=self.config.allow_private_http
         )
-        resp = await self._request("GET", url, timeout=self.config.total_timeout)
+        resp = await self._request("GET", file_path, timeout=self.config.total_timeout)
         try:
             require_2xx(resp.status_code, "github get file contents")
         except SecurityError as e:
@@ -360,13 +388,74 @@ class GitHubClient:
         """
         if not ref or not str(ref).strip():
             raise GitHubError("resolve_commit_sha: ref is empty")
-        resp = await self._request("GET", self.api(f"repos/{repo}/commits/{ref}"))
+        resp = await self._request("GET", f"/repos/{repo}/commits/{ref}")
         data = await self._read_json(resp)
         sha = data.get("sha")
         if not isinstance(sha, str) or len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha.lower()):
             raise GitHubError(f"resolve_commit_sha: invalid sha {sha!r}")
         return sha.lower()
 
+
+    async def list_installation_repositories(self) -> list[str]:
+        """GET /installation/repositories with bounded pagination.
+
+        Returns a sorted, deduplicated list of repository full_names
+        authorized for the current GitHub App installation.
+
+        Raises GitHubError on non-2xx, malformed schema, or pagination limit.
+        """
+        url = "/installation/repositories"
+        repos: list[str] = []
+        seen: set[str] = set()
+        page = 1
+        max_pages = 10  # bounded pagination per spec
+        while page <= max_pages:
+            resp = await self._request(
+                "GET", url,
+                params={"page": page, "per_page": 100},
+                timeout=self.config.total_timeout,
+            )
+            try:
+                require_2xx(resp.status_code, "github list installation repositories")
+            except SecurityError as e:
+                raise GitHubError(str(e)) from e
+            data = await self._read_json(resp)
+            if not isinstance(data, dict):
+                raise GitHubError(
+                    "installation/repositories: expected top-level object"
+                )
+            total_count = data.get("total_count")
+            if not isinstance(total_count, int) or isinstance(total_count, bool) or total_count < 0:
+                raise GitHubError(
+                    "installation/repositories: invalid total_count"
+                )
+            repositories = data.get("repositories")
+            if not isinstance(repositories, list):
+                raise GitHubError(
+                    "installation/repositories: expected repositories list"
+                )
+            for item in repositories:
+                if not isinstance(item, dict):
+                    raise GitHubError(
+                        "installation/repositories: repository entry is not an object"
+                    )
+                full_name = item.get("full_name")
+                if not isinstance(full_name, str) or not full_name.strip():
+                    raise GitHubError(
+                        "installation/repositories: empty or invalid full_name"
+                    )
+                fn = full_name.strip()
+                if fn not in seen:
+                    repos.append(fn)
+                    seen.add(fn)
+            if len(repositories) < 100:
+                break
+            page += 1
+        if page > max_pages:
+            raise GitHubError(
+                f"installation repository pagination exceeded {max_pages} pages"
+            )
+        return sorted(repos)
 
     async def _get_token(self) -> str:
         """Get current installation token from the token provider."""

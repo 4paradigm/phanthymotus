@@ -58,7 +58,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **Top-level status labels:** only `review-required`, `reviewing`, `deploy-ready`, `deploy-requested`, `testing`, `succeeded`, `failed`.
 - **Status labels:** `status:*` labels are best-effort UI projection only. Label bootstrap/list/create failures are logged as warnings and never block startup or business operations. Label failure does not affect any gate or lifecycle transition.
 - **Review Agent authentication:** Review Agent uses a user-provided `GITHUB_TOKEN`, not the GitHub App. This is strictly separate from Deploy Approval's GitHub App credentials.
-- **Supported repos:** production runtime `GITHUB_REPOS` contains exactly `4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver`. The same GitHub App installation is authorized for both repositories. Missing, duplicate, unknown, or third-party repository entries fail closed.
+- **Supported repos (DESIRED_REPOS):** `4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver` are permanently declared as desired/supported repositories in source code.  Runtime `GITHUB_REPOS` is resolved at startup by a single fresh `GET /installation/repositories` call: `ACTIVE_REPOS = DESIRED_REPOS ∩ AUTHORIZED_REPOS`.  Missing, duplicate, unknown, or third-party repository entries fail closed.
 - **Evidence source:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation. Trusted Review Agent GitHub comments provide Build Result, Test Results, and Code Review. Build/Test commit short SHA resolves via GitHub to full SHA for exact equality with fresh PR HEAD. Image tag comes from the selected Build Result comment Images section (full mutable ref, not basename). Registry resolves to immutable digest. No Review Agent HTTP API.
 - **Full-coverage machine list:** `deploy_requested` lifecycle comment shows only machines that can cover ALL REMAINING components. If no machine can cover all remaining components, status stays deploy-requested and the operator must update machine policy.
 - **Source matrix:** GitHub PR comments are the source of Review Agent Build/Test/Code Review evidence and image:tag candidate facts; Registry only verifies/resolves that exact Review Agent image tag; Agent Core only supplies runtime identity, current `running_image`, and MCP evidence; GitHub persists the deployment snapshot.
@@ -206,19 +206,44 @@ machines:
 - Agent Core uses HTTPS to exact literal IPv4:15678. TLS certificate identity verification is disabled by the selected no-PEM deployment contract. Access is restricted by exact configured literal IP, fixed port, HTTPS, and per-machine Bearer token.
 - Do not place real machine IPs, passwords, tokens, or certificates in docs, examples, tests, or source code.
 
-## GitHub Installation Model
+## Repository Authorization Model
 
-`GITHUB_INSTALLATION_ID` identifies a GitHub App installation on an
-account/organization; it is **not** inherently one ID per repository.
-A single installation can be configured for multiple selected repositories.
+`DESIRED_REPOS` (permanently declared in source code):
 
-Current production auth uses one installation ID.
-The same installation is authorized for both
-`4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver`.
-Runtime `GITHUB_REPOS` requires both repositories.
+- `4paradigm/phanthymotus` — **required**.  If not present in the fresh
+  installation-repository list, startup **fails closed** and the watcher
+  does not start.
+- `4paradigm/phanthymotus-driver` — **optional / desired**.  If the current
+  GitHub App installation is not authorized for the driver repository, the
+  agent starts normally without the driver path; this is an informational
+  condition, not a startup failure.
 
-Only introduce repo-to-installation routing if GitHub later proves there are
-distinct installations.
+Startup resolves `ACTIVE_REPOS = DESIRED_REPOS ∩ AUTHORIZED_REPOS` via a
+single fresh `GET /installation/repositories` call at process startup.
+There is **no authorization cache**, no periodic refresh, and no second
+installation ID.
+
+When the administrator later adds the driver repository to the same GitHub App
+installation, a **restart** of the Deploy Approval process is sufficient:
+
+* no source code change
+* no `GITHUB_REPOS` change
+* no second installation ID
+* no rebuild required (permission change alone)
+* fresh startup discovery makes the driver active
+* `ACTIVE_REPOS` becomes `[main, driver]`
+
+Review Agent evidence is sourced exclusively from trusted GitHub PR
+conversation comments.  Deploy Approval does **not** access:
+
+* Review Agent HTTP API
+* Review Agent server
+* Review Agent `GITHUB_TOKEN`
+
+Registry remains an internal fresh-fact implementation detail: the exact
+`image:tag` from a Review Agent Build Result comment is resolved to an
+immutable `repository@sha256:digest`.  Registry is not exposed as a top-level
+actor in diagrams.
 
 ## Environment Variables
 

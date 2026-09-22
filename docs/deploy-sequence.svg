@@ -40,7 +40,7 @@
   <text x="40" y="42" class="mono title" fill="#425A4B">DEPLOY APPROVAL · GITHUB-DRIVEN SEQUENCE</text>
   <text x="40" y="62" class="mono small">GitHub PR status labels: best-effort UI projection (not a lifecycle gate). Lifecycle: review-required · reviewing · deploy-ready · deploy-requested · testing · succeeded · failed</text>
 
-  <!-- Actors: names only, no proxy/registry actor lanes -->
+  <!-- High-level actors only -->
   <g class="mono">
     <rect x="40" y="92" width="150" height="48" class="actor" fill="#EEF4F1" stroke="#5C7A6A"/>
     <text x="115" y="122" text-anchor="middle" class="title" fill="#425A4B">Developer</text>
@@ -119,12 +119,6 @@
     <rect x="228" y="722" width="158" height="24" class="statusWait"/>
     <text x="307" y="738" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
 
-    <!-- Registry resolution internal callout -->
-    <rect x="532" y="704" width="560" height="78" class="callout"/>
-    <text x="812" y="722" text-anchor="middle" class="mono msgStrong">Registry resolution (internal implementation detail)</text>
-    <text x="812" y="740" text-anchor="middle" class="mono small">GitHub PR Conversation · Review Agent Build Result</text>
-    <text x="812" y="756" text-anchor="middle" class="mono small">Commit + Target + full image:tag</text>
-    <text x="812" y="772" text-anchor="middle" class="mono small">image:tag → repo@sha256:digest</text>
 
     <line x1="40" y1="790" x2="1360" y2="790" stroke="#E7E5E4"/>
   </g>

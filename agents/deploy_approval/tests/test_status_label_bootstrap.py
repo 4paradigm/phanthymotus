@@ -364,6 +364,9 @@ async def test_server_bootstrap_happens_before_watcher_start_without_identity_lo
         async def create_repository_label(self, repo, name, color, description):
             return {"name": name, "color": color, "description": description}
 
+        async def list_installation_repositories(self):
+            return list(DEFAULT_GITHUB_REPOS)
+
     async def _bootstrap(_github):
         order.append("bootstrap")
 
@@ -398,6 +401,9 @@ async def test_server_does_not_start_watcher_when_bootstrap_fails(tmp_path, monk
         async def create_repository_label(self, repo, name, color, description):
             return {"name": name, "color": color, "description": description}
 
+        async def list_installation_repositories(self):
+            return list(DEFAULT_GITHUB_REPOS)
+
     async def _bootstrap(_github):
         raise RuntimeError("boom")
 
@@ -427,6 +433,9 @@ async def test_server_never_skips_bootstrap_when_github_client_lacks_bootstrap_c
     class FakeGitHub:
         async def get_current_user(self):
             return {"id": 222, "login": "bot"}
+
+        async def list_installation_repositories(self):
+            return list(DEFAULT_GITHUB_REPOS)
 
     def _start(self):
         started.append(True)

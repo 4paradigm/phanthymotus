@@ -5,10 +5,14 @@
 Deploy Controller 只负责部署审批与状态编排，**代码不修改**；代码构建与 Review 仍由 Review Agent 负责。
 
 生产环境能力与仓库合同：
-- 生产运行仓库：`4paradigm/phanthymotus`、`4paradigm/phanthymotus-driver`
-- 默认及生产 `GITHUB_REPOS` 必须同时包含 main 与 driver 两个仓库
-- 当前同一个 GitHub App installation 已验证可访问 main 与 driver
-- 不需要为 driver 引入第二套 GitHub App / installation 路由
+- 默认及生产 `GITHUB_REPOS` 永久声明两个期望仓库：`4paradigm/phanthymotus`、`4paradigm/phanthymotus-driver`
+- 启动时通过 `GET /installation/repositories` 一次性解析当前授权仓库：
+  `ACTIVE_REPOS = DESIRED_REPOS ∩ AUTHORIZED_REPOS`
+- `4paradigm/phanthymotus` 为 required，未授权则启动失败
+- `4paradigm/phanthymotus-driver` 为 optional/desired，未授权则跳过 driver 路径，不影响 main
+- 以后在 GitHub App installation 中添加 driver 仓库后，重启即可使 driver 生效：
+  不需要源码变更、不需要修改 GITHUB_REPOS、不需要第二套 installation ID
+- 无 authorization cache，无后台刷新
 - 未知的 / 第三方的仓库必须 fail closed
 - 缺失、重复的仓库必须 fail closed。
 
@@ -155,19 +159,36 @@ CLEAN 通过后：FULL-COVERAGE -> running_image-only CLEAN -> fresh exact appro
 
 ## Agent Authentication
 
-## GitHub Installation Model
+## 仓库授权模型
 
-`GITHUB_INSTALLATION_ID` identifies a GitHub App installation on an
-account/organization; it is **not** inherently one ID per repository.
-A single installation can be configured for multiple selected repositories.
+`DESIRED_REPOS`（源码永久声明）：
 
-Current production auth uses one installation ID.
-The same installation is authorized for both
-`4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver`.
-Runtime `GITHUB_REPOS` requires both repositories.
+- `4paradigm/phanthymotus` — **必需**。  如果启动时未在当前安装授权的仓库列表中发现该仓库，
+  启动 **fail closed**，watcher 不启动。
+- `4paradigm/phanthymotus-driver` — **期望/可选**。  如果当前 GitHub App installation
+  未获得 driver 仓库的授权，代理正常启动但不启用 driver 路径；此为信息性条件，非启动失败。
 
-Only introduce repo-to-installation routing if GitHub later proves there are
-distinct installations.
+启动时通过单次 `GET /installation/repositories` 调用解析 `ACTIVE_REPOS`：
+`ACTIVE_REPOS = DESIRED_REPOS ∩ AUTHORIZED_REPOS`。
+不存在 authorization cache、无周期性刷新、无第二套 installation ID。
+
+当管理员后续将 driver 仓库添加到同一 GitHub App installation 时，**重启** Deploy Approval 进程即可：
+
+* 无需源码变更
+* 无需修改 `GITHUB_REPOS`
+* 无需第二套 installation ID
+* 无需因权限变更重新构建
+* 启动时新鲜发现使 driver 生效
+* `ACTIVE_REPOS` 变为 `[main, driver]`
+
+Review Agent 证据仅来自可信的 GitHub PR 对话评论。Deploy Approval 不访问：
+
+* Review Agent HTTP API
+* Review Agent 服务器
+* Review Agent `GITHUB_TOKEN`
+
+Registry 仍为内部新鲜事实实现细节：Review Agent Build Result 评论中的精确
+`image:tag` 被解析为不可变的 `repository@sha256:digest`。Registry 不在时序图中作为独立 actor 展示。
 
 
 
