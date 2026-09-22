@@ -2197,6 +2197,67 @@ weights, so it cannot drift out of order or out of date — and falls back to th
 Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
 resolve — a card saved before the switch must not come back as `state: error`.
 
+### vop's streamed payload: `publish_bbox` and `publish_color`
+
+Two knobs govern what one detected object costs on the topic. **They affect the
+stream only** — `recognize` / `recognize_by_url` always answer in full, because
+that reply is asked for once and read once, and a caller who cannot see the
+frame has no other way to recover the pixel box.
+
+```yaml
+vop:
+  publish_bbox: true      # default
+  publish_color: name     # off | name | full — default name
+```
+
+| level | one object carries | bytes |
+|---|---|---|
+| `publish_bbox: true` | `+ "bbox": [x1,y1,x2,y2]` | +33 |
+| `publish_color: off` | — | 0 |
+| `publish_color: name` | `"color": "dim muted azure", "brightness": 120.9` | 27 |
+| `publish_color: full` | the twelve numbers and four labels of `color_stats` | 239 |
+
+Defaults give 118 B per object, against 329 B for everything.
+
+**Why trimming the stream is worth anything at all.** agent-core's topic
+subscriber enqueues a subscribed topic's **entire message** as an event's text
+(`agent-core/src/topic_subscriber.py`), so every published byte is a byte of LLM
+context, on every frame. At the time of writing, `rgb_mean`, `rgb_var`,
+`hsv_var` and the three `dominant_*` labels had **no reader anywhere in either
+repo** — they were 73% of the payload and nothing consumed them.
+
+**Why `name` sends the triple and not `color_name`.** This is the part that is
+easy to get backwards, and the expensive direction to get wrong.
+
+`color_name` is not a concatenation of the three labels, it is a **lossy
+projection** of them: it never calls `dominant_saturation` at all (saturation
+reaches it only through the `s < 25 → neutral` test inside `dominant_hue`, so
+muted/vivid disappears), and it collapses six brightness levels into three
+prefixes. Over the whole HSV space that is **150 distinct triples against 41
+distinct `color_name`s** — 73% of the distinctions gone.
+
+The other direction is lossless: `color_name` is a pure function of
+`dominant_brightness` and `dominant_hue`, both of which are in the triple, so
+any consumer can recompute it exactly. `test_color_name_is_recoverable_from_the_triple`
+pins that, and is the test to look at if this trade is ever questioned.
+
+So the triple strictly dominates, and costs **one byte more** (27 vs 26).
+
+Splitting is safe: every word in all three vocabularies is a single token, so
+`split(" ")` always yields exactly three. Keep that property if you add a label.
+Neutral colours always read `"<brightness> gray neutral"` — `neutral` and `gray`
+are the same `s < 25` test, so that pair is redundant by construction; it is
+emitted anyway rather than special-cased to two tokens, because four bytes buys
+every consumer a `split()` with no branch in it.
+
+`brightness` survives at the `name` level because it is the one *continuous*
+colour value anything reads — the lights-on check wants `hsv_mean[2]` itself,
+and six buckets cannot answer "is the room getting darker".
+
+`info()` reports both settings per instance. A card whose payload has been
+trimmed and a card whose detector has stopped working look identical from
+downstream, so the level has to be visible from outside.
+
 ### visual_depth outputs metres — this file used to say otherwise
 
 Every payload is in **metres**, with `"scale": "metric"` and `"unit": "m"`.
