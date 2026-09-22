@@ -236,6 +236,21 @@ for alias, token in tokens.items():
         raise SystemExit("agent_core_tokens keys must be non-empty strings")
     if not isinstance(token, str) or not token.strip():
         raise SystemExit(f"agent_core_tokens[{alias!r}] must be a non-empty string")
+rct = data.get("review_comment_trust")
+if rct is None:
+    raise SystemExit("review_comment_trust must be present in secrets.yaml")
+if not isinstance(rct, dict):
+    raise SystemExit("review_comment_trust must be a mapping")
+aid = rct.get("author_id", "")
+if aid is None or not isinstance(aid, str):
+    raise SystemExit("review_comment_trust.author_id must be a string")
+al = rct.get("author_login", "")
+if al is None or not isinstance(al, str):
+    raise SystemExit("review_comment_trust.author_login must be a string")
+if aid != "7950763":
+    raise SystemExit("review_comment_trust.author_id must be \"7950763\"")
+if al != "kentcyq":
+    raise SystemExit("review_comment_trust.author_login must be \"kentcyq\"")
 print("SECRETS_OK")
 PY
 }

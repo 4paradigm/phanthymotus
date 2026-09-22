@@ -22,7 +22,7 @@ import pytest
 # ── Parser tests (no import of removed review_client) ──────────────────
 
 TRUSTED_AUTHOR_ID = "7950763"
-TRUSTED_AUTHOR_LOGIN = "review-agent-bot"
+TRUSTED_AUTHOR_LOGIN = "kentcyq"
 
 _BUILD_COMMENT_BODY = textwrap.dedent("""\
 <!-- pr-review-agent -->

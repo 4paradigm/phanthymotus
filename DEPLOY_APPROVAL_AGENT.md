@@ -75,7 +75,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **Success goes directly to testing:** Full-coverage approval + clean pass + successful deploy = status: testing directly. No intermediate machine-group progress check.
 - **Evidence lookup:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation.
 - **PR Author only:** Only the GitHub PR author can run `/request_deploy`.
-- **Authorization:** `/approve_deploy` requires the actor to be the selected machine owner OR a write/maintain/admin repo collaborator. `/record_test` requires the actor to be an owner of any actually deployed machine OR a write/maintain/admin repo collaborator. Self-approval is FORBIDDEN. PR author must not approve their own deployment. Numeric GitHub user ID is checked against fresh PR author ID at approval gates.
+- **Authorization:** `/approve_deploy` requires the actor to be the selected machine owner OR a write/maintain/admin repo collaborator. `/record_test` requires the actor to be an owner of any actually deployed machine OR a write/maintain/admin repo collaborator. Self-approval is allowed when the actor satisfies one of the above authorization conditions (e.g. PR author is also a machine owner). Numeric GitHub user ID is checked against fresh PR author ID at approval gates only for collaborator permission resolution, not as an additional self-approval gate.
 - **Exact HEAD required:** GitHub HEAD is re-checked at each decision point; drift supersedes the deployment.
 - **Open-PR watcher boundary:** If an enumerated PR is merged or closed before command execution or before an unsafe deploy POST, the existing fresh PR gates reject it and Deploy Approval performs zero deploy POST. Post-merge release deployment is outside Deploy Approval.
 - **No rollback/reject/cancel/resume:** These commands are not supported.
@@ -134,12 +134,22 @@ configured in `secrets.yaml`:
 
 ```yaml
 review_comment_trust:
-  author_id: "<review-agent-github-user-id>"
-  author_login: "<review-agent-github-login>"
+  author_id: "7950763"
+  author_login: "kentcyq"
 ```
 
-- `author_id` is **required** and must be a positive integer.
-- `author_login` is optional but if configured must match `comment.user.login`.
+**Authoritative production Review Agent GitHub identity:**
+
+- GitHub user ID: `7950763`
+- GitHub login: `kentcyq`
+
+Configuration is read from `secrets.yaml` → `review_comment_trust`. It is **NOT**
+an environment variable. Startup/deploy validation enforces an exact match; a
+mismatch (for example `author_id=184792454` / `Haohao-end`) causes the process to
+**fail closed** at startup.
+
+- `author_id` must be exactly `"7950763"`.
+- `author_login` must be exactly `"kentcyq"`.
 - `performed_via_github_app` may be `null` (Review Agent uses a user PAT).
 - Comments from any other author are **rejected (fail closed)**.
 

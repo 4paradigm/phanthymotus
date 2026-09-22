@@ -34,6 +34,13 @@ SUPPORTED_GITHUB_REPOS = frozenset({
     "4paradigm/phanthymotus-driver",
 })
 
+# ── Authoritative production Review Agent GitHub identity ──────────────
+# This is the ONLY accepted identity for Review Agent PR comments.
+# It is NOT an env var. It is NOT configurable at runtime.
+# Secrets.yaml review_comment_trust MUST match these exact values.
+REVIEW_AGENT_GITHUB_USER_ID = "7950763"
+REVIEW_AGENT_GITHUB_LOGIN = "kentcyq"
+
 
 @dataclass
 class Config:
@@ -53,8 +60,10 @@ class Config:
     github_comment_max_bytes: int = 4 * 1024 * 1024
 
     # Review comment trust configuration
-    review_comment_author_id: str = ""
-    review_comment_author_login: str = ""
+    # Defaults align with authoritative production Review Agent identity.
+    # Production startup validate_config() enforces exact match.
+    review_comment_author_id: str = REVIEW_AGENT_GITHUB_USER_ID
+    review_comment_author_login: str = REVIEW_AGENT_GITHUB_LOGIN
 
     # Machine owners configuration
     machine_owners_file: str = "/run/deploy-approval/machines.yaml"
@@ -347,19 +356,26 @@ def validate_config(cfg: Config) -> None:
     host_part = registry.split(":")[0]
     if not host_part:
         raise ValueError(f"REGISTRY host must not be empty, got {registry!r}")
-    # Review comment trust: author_id is required
-    if not cfg.review_comment_author_id.strip():
+    # Review comment trust: strict canonical identity check.
+    # The authoritative production Review Agent identity is defined by
+    # REVIEW_AGENT_GITHUB_USER_ID / REVIEW_AGENT_GITHUB_LOGIN.
+    # Secrets.yaml review_comment_trust MUST match exactly.
+    # This prevents deploying with a wrong trust configuration (e.g. Haohao-end).
+    if cfg.review_comment_author_id != REVIEW_AGENT_GITHUB_USER_ID:
         raise ValueError(
-            "secrets.yaml review_comment_trust.author_id is required"
+            f"secrets.yaml review_comment_trust.author_id must be "
+            f"{REVIEW_AGENT_GITHUB_USER_ID!r} (authoritative production "
+            f"Review Agent GitHub user ID), got {cfg.review_comment_author_id!r}. "
+            "Deploy Approval refuses to trust a Review Agent comment author "
+            "that does not match the canonical identity."
         )
-    # Validate author_id is a positive integer
-    try:
-        aid = int(cfg.review_comment_author_id)
-        if aid <= 0:
-            raise ValueError
-    except (ValueError, TypeError):
+    if cfg.review_comment_author_login != REVIEW_AGENT_GITHUB_LOGIN:
         raise ValueError(
-            "secrets.yaml review_comment_trust.author_id must be a positive integer"
+            f"secrets.yaml review_comment_trust.author_login must be "
+            f"{REVIEW_AGENT_GITHUB_LOGIN!r} (authoritative production "
+            f"Review Agent GitHub login), got {cfg.review_comment_author_login!r}. "
+            "Deploy Approval refuses to trust a Review Agent comment author "
+            "that does not match the canonical identity."
         )
     # Validate agent_core_tokens
     act = cfg.agent_core_tokens

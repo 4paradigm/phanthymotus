@@ -47,12 +47,21 @@ Deploy Approval 验证 Review Agent 评论来自 `secrets.yaml` 中配置的可�
 
 ```yaml
 review_comment_trust:
-  author_id: "<review-agent-github-user-id>"
-  author_login: "<review-agent-github-login>"
+  author_id: "7950763"
+  author_login: "kentcyq"
 ```
 
-- `author_id` **必填**，必须是正整数。
-- `author_login` 可选，但如果配置必须与 `comment.user.login` 匹配。
+**权威生产 Review Agent GitHub 身份：**
+
+- GitHub user ID: `7950763`
+- GitHub login: `kentcyq`
+
+配置位置是 `secrets.yaml` → `review_comment_trust`，**不是环境变量**。
+启动/deploy 校验强制精确匹配；不匹配（例如 `author_id=184792454` / `Haohao-end`）
+会导致进程 **fail closed** 启动失败。
+
+- `author_id` 必须精确等于 `"7950763"`。
+- `author_login` 必须精确等于 `"kentcyq"`。
 - `performed_via_github_app` 可能为 `null`（Review Agent 使用用户 PAT）。
 - 来自其他作者的评论将被**拒绝（fail closed）**。
 
